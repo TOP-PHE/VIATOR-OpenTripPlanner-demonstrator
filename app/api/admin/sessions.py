@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -16,7 +16,6 @@ from ...db import get_db
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionState
 from ...security import CurrentUser, client_ip, require_platform_admin
-
 
 router = APIRouter(prefix="/api/sessions", tags=["admin", "sessions"])
 
@@ -52,7 +51,7 @@ class SessionResponse(BaseModel):
     archived_at: str | None
 
     @classmethod
-    def from_orm_session(cls, s: SessionRow) -> "SessionResponse":
+    def from_orm_session(cls, s: SessionRow) -> SessionResponse:
         return cls(
             id=s.id,
             name=s.name,
@@ -147,9 +146,12 @@ def patch_session(
 
     if changes:
         audit.record(
-            db, action="session.updated",
-            actor_user_id=actor.id, actor_ip=client_ip(request),
-            target_kind="session", target_id=sid,
+            db,
+            action="session.updated",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
             metadata={"changes": changes},
         )
     db.commit()
@@ -168,10 +170,13 @@ def archive_session(
         raise HTTPException(404, "Session not found")
     s.state = SessionState.ARCHIVED.value
     s.include_in_fanout = False
-    s.archived_at = datetime.now(timezone.utc)
+    s.archived_at = datetime.now(UTC)
     audit.record(
-        db, action="session.archived",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="session", target_id=sid,
+        db,
+        action="session.archived",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
     )
     db.commit()

@@ -2,11 +2,11 @@
 
 Detection is intentionally conservative: it returns one of the known kinds, or raises.
 """
+
 from __future__ import annotations
 
 import zipfile
 from pathlib import Path
-
 
 KNOWN_KINDS = {
     "GTFS",
@@ -72,7 +72,7 @@ def _detect_zip(path: Path) -> str:
 def _classify_netex(xml_head: str, files: list[str]) -> str:
     head_lower = xml_head.lower()
     # Heuristic: codespace prefixes
-    if "fr:" in xml_head or 'codespace="fr"' in head_lower or "participantref=\"fr" in head_lower:
+    if "fr:" in xml_head or 'codespace="fr"' in head_lower or 'participantref="fr' in head_lower:
         if any("arrets" in f.lower() or "stops" in f.lower() for f in files):
             return "NeTEx-FR-Arrets"
         return "NeTEx-FR-Horaires"

@@ -20,7 +20,6 @@ from sqlalchemy.orm import Session as DbSession
 from .models import Session as SessionRow
 from .models.sessions import SessionState
 
-
 log = logging.getLogger(__name__)
 
 COMPOSE_FRAGMENT = Path("/data/generated/docker-compose.sessions.yml")
@@ -64,8 +63,16 @@ def render_compose(sessions: list[SessionRow]) -> str:
         for s in sessions
         if s.state == SessionState.SERVING.value
     )
-    volumes = "".join(_VOLUME_TEMPLATE.format(sid=s.id) for s in sessions if s.state != SessionState.DELETED.value)
-    return _COMPOSE_HEADER + (services or "  # (no serving sessions)\n") + "\n" + _VOLUMES_HEADER + (volumes or "  {}\n")
+    volumes = "".join(
+        _VOLUME_TEMPLATE.format(sid=s.id) for s in sessions if s.state != SessionState.DELETED.value
+    )
+    return (
+        _COMPOSE_HEADER
+        + (services or "  # (no serving sessions)\n")
+        + "\n"
+        + _VOLUMES_HEADER
+        + (volumes or "  {}\n")
+    )
 
 
 def render_nginx(sessions: list[SessionRow]) -> str:
@@ -99,6 +106,8 @@ def regenerate(db: DbSession, *, output_dir: Path | None = None) -> dict[str, Pa
 
     log.info(
         "sessions orchestrator: wrote %s and %s for %d sessions",
-        out_compose, out_nginx, len(sessions),
+        out_compose,
+        out_nginx,
+        len(sessions),
     )
     return {"compose": out_compose, "nginx": out_nginx}

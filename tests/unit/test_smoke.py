@@ -56,7 +56,7 @@ EXPECTED_MODULES = [
     # (no new module names; templates are non-Python assets loaded at runtime).
     # step-5 — page (HTML) router
     "app.api.pages",
-    # steps 7–20 — sessions, master data, journey, reports, replay, retention
+    # steps 7-20 - sessions, master data, journey, reports, replay, retention
     "app.api.admin.sessions",
     "app.api.admin.replay",
     "app.api.master.stations",

@@ -66,9 +66,7 @@ class GraphSnapshot(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    session_id: Mapped[str] = mapped_column(
-        String, ForeignKey("sessions.id"), nullable=False
-    )
+    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), nullable=False)
     rebuild_job_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("rebuild_jobs.id")
     )
@@ -88,7 +86,5 @@ class GraphSnapshot(Base):
         String, nullable=False, server_default=text("'auto'")
     )
 
-    is_current: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("FALSE")
-    )
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

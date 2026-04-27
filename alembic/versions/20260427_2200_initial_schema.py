@@ -16,8 +16,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260427_2200_initial"
@@ -29,15 +30,17 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     # ---------- Postgres extensions ----------
     op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")  # gen_random_uuid()
-    op.execute("CREATE EXTENSION IF NOT EXISTS citext;")    # case-insensitive emails
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")   # autocomplete on station names
+    op.execute("CREATE EXTENSION IF NOT EXISTS citext;")  # case-insensitive emails
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")  # autocomplete on station names
 
     # ---------- Identity ----------
     op.create_table(
         "users",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column("email", postgresql.CITEXT(), nullable=False),
         sa.Column("name", sa.String(), nullable=False),
@@ -45,7 +48,9 @@ def upgrade() -> None:
         sa.Column("role", sa.String(), nullable=False),
         sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("TRUE")),
         sa.Column("last_login_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.UniqueConstraint("email", name="uq_users_email"),
         sa.CheckConstraint(
             "role IN ('platform_admin','content_manager','end_user')",
@@ -66,7 +71,8 @@ def upgrade() -> None:
         "password_reset_tokens",
         sa.Column("token_hash", sa.LargeBinary(), primary_key=True),
         sa.Column(
-            "user_id", postgresql.UUID(as_uuid=True),
+            "user_id",
+            postgresql.UUID(as_uuid=True),
             sa.ForeignKey("users.id", ondelete="CASCADE"),
             nullable=False,
         ),
@@ -81,13 +87,21 @@ def upgrade() -> None:
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("category", sa.String(), nullable=False),
         sa.Column("state", sa.String(), nullable=False),
-        sa.Column("config", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("include_in_fanout", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")),
         sa.Column(
-            "created_by", postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("users.id"), nullable=False,
+            "config", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")
         ),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "include_in_fanout", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")
+        ),
+        sa.Column(
+            "created_by",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id"),
+            nullable=False,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.Column("archived_at", sa.DateTime(timezone=True)),
         sa.CheckConstraint(
             "category IN ('NAP','MERITS','MANUAL','EXPERIMENTAL')",
@@ -100,7 +114,8 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
-        "ix_sessions_fanout", "sessions",
+        "ix_sessions_fanout",
+        "sessions",
         ["state", "include_in_fanout"],
         postgresql_where=sa.text("state = 'serving' AND include_in_fanout"),
     )
@@ -109,12 +124,16 @@ def upgrade() -> None:
     op.create_table(
         "uploads",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         # Nullable in Phase 1 — becomes NOT NULL in steps 3 (auth) and 7 (sessions).
         sa.Column("session_id", sa.String(), sa.ForeignKey("sessions.id"), nullable=True),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id"), nullable=True),
+        sa.Column(
+            "user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id"), nullable=True
+        ),
         sa.Column("filename", sa.String(), nullable=False),
         sa.Column("declared_kind", sa.String(), nullable=False),
         sa.Column("detected_kind", sa.String(), nullable=False),
@@ -122,16 +141,22 @@ def upgrade() -> None:
         sa.Column("size_bytes", sa.BigInteger(), nullable=False),
         sa.Column("stored_path", sa.String(), nullable=False),
         sa.Column("version_label", sa.String()),
-        sa.Column("triggered_rebuild", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "triggered_rebuild", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
     )
     op.create_index("ix_uploads_session_created", "uploads", ["session_id", "created_at"])
 
     op.create_table(
         "rebuild_jobs",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column("session_id", sa.String(), sa.ForeignKey("sessions.id"), nullable=True),
         sa.Column("status", sa.String(16), nullable=False, server_default=sa.text("'pending'")),
@@ -139,34 +164,42 @@ def upgrade() -> None:
         sa.Column("graph_path", sa.String()),
         sa.Column("started_at", sa.DateTime(timezone=True)),
         sa.Column("finished_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.CheckConstraint(
             "status IN ('pending','running','done','failed','cancelled')",
             name="ck_rebuild_jobs_status_valid",
         ),
     )
-    op.create_index(
-        "ix_rebuild_jobs_session_created", "rebuild_jobs", ["session_id", "created_at"]
-    )
+    op.create_index("ix_rebuild_jobs_session_created", "rebuild_jobs", ["session_id", "created_at"])
 
     # ---------- Graph snapshots (timetable versioning) ----------
     op.create_table(
         "graph_snapshots",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column("session_id", sa.String(), sa.ForeignKey("sessions.id"), nullable=False),
-        sa.Column("rebuild_job_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("rebuild_jobs.id")),
+        sa.Column(
+            "rebuild_job_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("rebuild_jobs.id")
+        ),
         sa.Column("built_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("graph_path", sa.String(), nullable=False),
         sa.Column("source_uploads", postgresql.JSONB(), nullable=False),
         sa.Column("feed_signature", sa.String(64), nullable=False),
         sa.Column("timetable_main_version", sa.String(), nullable=False),
-        sa.Column("timetable_update_version", sa.Integer(), nullable=False, server_default=sa.text("1")),
+        sa.Column(
+            "timetable_update_version", sa.Integer(), nullable=False, server_default=sa.text("1")
+        ),
         sa.Column("service_period_start", sa.Date(), nullable=False),
         sa.Column("service_period_end", sa.Date(), nullable=False),
-        sa.Column("main_version_source", sa.String(), nullable=False, server_default=sa.text("'auto'")),
+        sa.Column(
+            "main_version_source", sa.String(), nullable=False, server_default=sa.text("'auto'")
+        ),
         sa.Column("is_current", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")),
         sa.Column("archived_at", sa.DateTime(timezone=True)),
         sa.CheckConstraint(
@@ -174,7 +207,9 @@ def upgrade() -> None:
             name="ck_graph_snapshots_main_version_source_valid",
         ),
         sa.UniqueConstraint(
-            "session_id", "timetable_main_version", "timetable_update_version",
+            "session_id",
+            "timetable_main_version",
+            "timetable_update_version",
             name="uq_graph_snapshots_unique_update_within_main",
         ),
     )
@@ -182,12 +217,15 @@ def upgrade() -> None:
         "ix_graph_snapshots_session_built", "graph_snapshots", ["session_id", "built_at"]
     )
     op.create_index(
-        "ix_graph_snapshots_main_version", "graph_snapshots",
+        "ix_graph_snapshots_main_version",
+        "graph_snapshots",
         ["session_id", "timetable_main_version", "timetable_update_version"],
     )
     op.create_index(
-        "uq_graph_snapshots_one_current_per_session", "graph_snapshots",
-        ["session_id"], unique=True,
+        "uq_graph_snapshots_one_current_per_session",
+        "graph_snapshots",
+        ["session_id"],
+        unique=True,
         postgresql_where=sa.text("is_current"),
     )
 
@@ -209,10 +247,19 @@ def upgrade() -> None:
         sa.Column("trenitalia_code", sa.String()),
         sa.Column("renfe_code", sa.String()),
         sa.Column("atoc_code", sa.String()),
-        sa.Column("other_codes", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("name_translations", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "other_codes", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")
+        ),
+        sa.Column(
+            "name_translations",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
         sa.Column("source", sa.String(), nullable=False, server_default=sa.text("'trainline'")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.CheckConstraint(
             "source IN ('trainline','sncf','manual','merits','other')",
             name="ck_master_stations_source_valid",
@@ -229,8 +276,10 @@ def upgrade() -> None:
     op.create_table(
         "route_aliases",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column("canonical_name", sa.String(), nullable=False),
         sa.Column("alias", sa.String(), nullable=False),
@@ -240,9 +289,14 @@ def upgrade() -> None:
         sa.Column("scope_carrier", sa.String()),
         sa.Column("notes", sa.String()),
         sa.Column("created_by", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id")),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.UniqueConstraint(
-            "alias", "canonical_name", "scope_country", "scope_carrier",
+            "alias",
+            "canonical_name",
+            "scope_country",
+            "scope_carrier",
             name="uq_route_aliases_alias_canonical_scope_country_scope_carrier",
         ),
     )
@@ -253,33 +307,46 @@ def upgrade() -> None:
         sa.Column("short_name", sa.String(), nullable=False),
         sa.Column("full_name", sa.String()),
         sa.Column("country_iso", sa.CHAR(2)),
-        sa.Column("legacy_codes", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "legacy_codes",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
         sa.Column("source", sa.String(), nullable=False, server_default=sa.text("'uic'")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.CheckConstraint("source IN ('uic','manual')", name="ck_master_carriers_source_valid"),
     )
 
     op.create_table(
         "master_stations_pending_drift",
         sa.Column(
-            "uic", sa.String(),
+            "uic",
+            sa.String(),
             sa.ForeignKey("master_stations.uic", ondelete="CASCADE"),
             primary_key=True,
         ),
         sa.Column("trainline_snapshot", postgresql.JSONB(), nullable=False),
         sa.Column("fields_differing", postgresql.ARRAY(sa.String()), nullable=False),
-        sa.Column("detected_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "detected_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
     )
     op.create_table(
         "master_carriers_pending_drift",
         sa.Column(
-            "rics_code", sa.String(),
+            "rics_code",
+            sa.String(),
             sa.ForeignKey("master_carriers.rics_code", ondelete="CASCADE"),
             primary_key=True,
         ),
         sa.Column("upstream_snapshot", postgresql.JSONB(), nullable=False),
         sa.Column("fields_differing", postgresql.ARRAY(sa.String()), nullable=False),
-        sa.Column("detected_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "detected_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
     )
 
     # ---------- Runtime: MCT, stations xref ----------
@@ -306,10 +373,14 @@ def upgrade() -> None:
     op.create_table(
         "journey_searches",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
-        sa.Column("ts", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column(
+            "ts", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+        ),
         sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id")),
         sa.Column("ip", postgresql.INET()),
         sa.Column("endpoint", sa.String(), nullable=False),
@@ -325,8 +396,14 @@ def upgrade() -> None:
         sa.Column("total_response_ms", sa.Integer()),
         sa.Column("total_trips_unique", sa.Integer()),
         sa.Column("status", sa.String(), nullable=False),
-        sa.Column("replay_of_search_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("journey_searches.id")),
-        sa.CheckConstraint("endpoint IN ('plan','compare','fanout')", name="ck_journey_searches_endpoint_valid"),
+        sa.Column(
+            "replay_of_search_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("journey_searches.id"),
+        ),
+        sa.CheckConstraint(
+            "endpoint IN ('plan','compare','fanout')", name="ck_journey_searches_endpoint_valid"
+        ),
         sa.CheckConstraint(
             "requested_time_kind IN ('depart_at','arrive_by')",
             name="ck_journey_searches_requested_time_kind_valid",
@@ -342,17 +419,21 @@ def upgrade() -> None:
     op.create_table(
         "journey_search_executions",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column(
-            "search_id", postgresql.UUID(as_uuid=True),
+            "search_id",
+            postgresql.UUID(as_uuid=True),
             sa.ForeignKey("journey_searches.id", ondelete="CASCADE"),
             nullable=False,
         ),
         sa.Column("session_id", sa.String(), sa.ForeignKey("sessions.id"), nullable=False),
         sa.Column(
-            "graph_snapshot_id", postgresql.UUID(as_uuid=True),
+            "graph_snapshot_id",
+            postgresql.UUID(as_uuid=True),
             sa.ForeignKey("graph_snapshots.id"),
             nullable=False,
         ),
@@ -369,17 +450,21 @@ def upgrade() -> None:
     op.create_index("ix_journey_executions_search", "journey_search_executions", ["search_id"])
     op.create_index(
         "ix_journey_executions_session_snap",
-        "journey_search_executions", ["session_id", "graph_snapshot_id"],
+        "journey_search_executions",
+        ["session_id", "graph_snapshot_id"],
     )
 
     op.create_table(
         "journey_trips",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column(
-            "execution_id", postgresql.UUID(as_uuid=True),
+            "execution_id",
+            postgresql.UUID(as_uuid=True),
             sa.ForeignKey("journey_search_executions.id", ondelete="CASCADE"),
             nullable=False,
         ),
@@ -419,10 +504,14 @@ def upgrade() -> None:
     op.create_table(
         "audit_events",
         sa.Column(
-            "id", postgresql.UUID(as_uuid=True),
-            primary_key=True, server_default=sa.text("gen_random_uuid()"),
+            "id",
+            postgresql.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
         ),
-        sa.Column("ts", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column(
+            "ts", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+        ),
         sa.Column("actor_user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id")),
         sa.Column("actor_ip", postgresql.INET()),
         sa.Column("action", sa.String(), nullable=False),
@@ -438,7 +527,9 @@ def upgrade() -> None:
         "platform_config",
         sa.Column("key", sa.String(), primary_key=True),
         sa.Column("value", sa.String()),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
         sa.Column("updated_by", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id")),
     )
 

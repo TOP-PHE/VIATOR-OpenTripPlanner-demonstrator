@@ -17,10 +17,10 @@ from sqlalchemy.orm import Session as DbSession
 from .. import concurrency, config_service
 from ..db import get_db
 from ..journey import otp_client, recorder
-from ..models import GraphSnapshot, Session as SessionRow
+from ..models import GraphSnapshot
+from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from ..security import CurrentUser, client_ip, require_logged_in
-
 
 router = APIRouter(prefix="/api/journey", tags=["journey"])
 
@@ -66,31 +66,31 @@ async def _query_session(
     """Returns (status, raw, trips, response_ms)."""
     start = time.monotonic()
     try:
-        when_kind, when = _resolve_when(body)  # noqa: F841 (kind currently informational)
+        when_kind, when = _resolve_when(body)
         raw, trips = await otp_client.fetch_plan(
             session_id=session.id,
-            from_lat=body.from_.lat, from_lon=body.from_.lon,
-            to_lat=body.to.lat,     to_lon=body.to.lon,
-            when=when, timeout_ms=timeout_ms,
+            from_lat=body.from_.lat,
+            from_lon=body.from_.lon,
+            to_lat=body.to.lat,
+            to_lon=body.to.lon,
+            when=when,
+            timeout_ms=timeout_ms,
         )
         elapsed = int((time.monotonic() - start) * 1000)
         return ("ok" if trips else "no_route"), raw, trips, elapsed
-    except (httpx.TimeoutException, asyncio.TimeoutError):
+    except (TimeoutError, httpx.TimeoutException):
         return "timeout", {}, [], int((time.monotonic() - start) * 1000)
     except httpx.HTTPError:
         return "error", {}, [], int((time.monotonic() - start) * 1000)
 
 
 def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
-    return (
-        db.execute(
-            select(GraphSnapshot)
-            .where(GraphSnapshot.session_id == sid)
-            .where(GraphSnapshot.is_current.is_(True))
-            .limit(1)
-        )
-        .scalar_one_or_none()
-    )
+    return db.execute(
+        select(GraphSnapshot)
+        .where(GraphSnapshot.session_id == sid)
+        .where(GraphSnapshot.is_current.is_(True))
+        .limit(1)
+    ).scalar_one_or_none()
 
 
 def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
@@ -133,10 +133,17 @@ async def fanout(
         async with concurrency.semaphores.journey.acquire_or_fail():
             search = recorder.begin_search(
                 db,
-                user_id=user.id, ip=client_ip(request), endpoint="fanout",
-                origin_lat=body.from_.lat, origin_lon=body.from_.lon, origin_label=body.from_.label,
-                dest_lat=body.to.lat, dest_lon=body.to.lon, dest_label=body.to.label,
-                requested_time_kind=when_kind, requested_time=when,
+                user_id=user.id,
+                ip=client_ip(request),
+                endpoint="fanout",
+                origin_lat=body.from_.lat,
+                origin_lon=body.from_.lon,
+                origin_label=body.from_.label,
+                dest_lat=body.to.lat,
+                dest_lon=body.to.lon,
+                dest_label=body.to.label,
+                requested_time_kind=when_kind,
+                requested_time=when,
                 modes=",".join(body.modes),
             )
             timeout_ms = int(cfg["FANOUT_TIMEOUT_MS"])
@@ -173,22 +180,31 @@ async def fanout(
             error_message=None,
             trips=trips,
         )
-        executions_summary.append({
-            "session_id": session.id,
-            "graph_snapshot_id": str(exe.graph_snapshot_id),
-            "status": status,
-            "num_itineraries": exe.num_itineraries,
-            "response_ms": response_ms,
-        })
+        executions_summary.append(
+            {
+                "session_id": session.id,
+                "graph_snapshot_id": str(exe.graph_snapshot_id),
+                "status": status,
+                "num_itineraries": exe.num_itineraries,
+                "response_ms": response_ms,
+            }
+        )
 
         # Merge trips by signature for the response payload.
         for trip in trips:
             from .. import journey as journey_pkg  # noqa: F401  (keep package import explicit)
             from ..journey.signature import trip_signature
+
             sig = trip_signature(db, session_id=session.id, legs=trip.get("legs", []))
-            slot = by_signature.setdefault(sig, {
-                "signature": sig, "found_in_sessions": [], "by_session": {}, "best": trip,
-            })
+            slot = by_signature.setdefault(
+                sig,
+                {
+                    "signature": sig,
+                    "found_in_sessions": [],
+                    "by_session": {},
+                    "best": trip,
+                },
+            )
             slot["found_in_sessions"].append(session.id)
             slot["by_session"][session.id] = {
                 "duration_seconds": trip["duration_seconds"],
@@ -202,12 +218,12 @@ async def fanout(
 
     if any_ok and any_error:
         status = "partial"
-    elif any_ok:
+    elif any_ok or by_signature:
         status = "ok"
-    elif by_signature:
-        status = "ok"
+    elif not any_error:
+        status = "no_route"
     else:
-        status = "no_route" if not any_error else "error"
+        status = "error"
 
     recorder.finish_search(
         db,
@@ -220,10 +236,12 @@ async def fanout(
 
     merged_trips = []
     for slot in by_signature.values():
-        merged_trips.append({
-            **slot,
-            "origin_flag": _origin_flag(slot["found_in_sessions"], sids_in_fanout),
-        })
+        merged_trips.append(
+            {
+                **slot,
+                "origin_flag": _origin_flag(slot["found_in_sessions"], sids_in_fanout),
+            }
+        )
 
     return {
         "search_id": str(search.id),
@@ -251,10 +269,17 @@ async def plan(
         async with concurrency.semaphores.journey.acquire_or_fail():
             search = recorder.begin_search(
                 db,
-                user_id=user.id, ip=client_ip(request), endpoint="plan",
-                origin_lat=body.from_.lat, origin_lon=body.from_.lon, origin_label=body.from_.label,
-                dest_lat=body.to.lat, dest_lon=body.to.lon, dest_label=body.to.label,
-                requested_time_kind=when_kind, requested_time=when,
+                user_id=user.id,
+                ip=client_ip(request),
+                endpoint="plan",
+                origin_lat=body.from_.lat,
+                origin_lon=body.from_.lon,
+                origin_label=body.from_.label,
+                dest_lat=body.to.lat,
+                dest_lon=body.to.lon,
+                dest_label=body.to.label,
+                requested_time_kind=when_kind,
+                requested_time=when,
                 modes=",".join(body.modes),
             )
             status, raw, trips, response_ms = await _query_session(
@@ -267,14 +292,19 @@ async def plan(
     if snap is None:
         status = "error"
     recorder.record_execution(
-        db, search_id=search.id, session_id=s.id,
+        db,
+        search_id=search.id,
+        session_id=s.id,
         graph_snapshot_id=snap.id if snap else _placeholder_snapshot_id(),
-        status=status, response_ms=response_ms,
+        status=status,
+        response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
-        error_message=None, trips=trips,
+        error_message=None,
+        trips=trips,
     )
     recorder.finish_search(
-        db, search,
+        db,
+        search,
         total_response_ms=response_ms,
         total_trips_unique=len(trips),
         status=status,
@@ -311,28 +341,34 @@ def get_search(
     }
     for exe in execs:
         trips = (
-            db.execute(select(JourneyTrip).where(JourneyTrip.execution_id == exe.id).order_by(JourneyTrip.rank_in_response))
+            db.execute(
+                select(JourneyTrip)
+                .where(JourneyTrip.execution_id == exe.id)
+                .order_by(JourneyTrip.rank_in_response)
+            )
             .scalars()
             .all()
         )
-        out["executions"].append({
-            "session_id": exe.session_id,
-            "status": exe.status,
-            "num_itineraries": exe.num_itineraries,
-            "response_ms": exe.response_ms,
-            "trips": [
-                {
-                    "signature": t.trip_signature,
-                    "duration_seconds": t.duration_seconds,
-                    "num_transfers": t.num_transfers,
-                    "departure_at": t.departure_at.isoformat(),
-                    "arrival_at": t.arrival_at.isoformat(),
-                    "modes": t.modes,
-                    "legs": t.legs,
-                }
-                for t in trips
-            ],
-        })
+        out["executions"].append(
+            {
+                "session_id": exe.session_id,
+                "status": exe.status,
+                "num_itineraries": exe.num_itineraries,
+                "response_ms": exe.response_ms,
+                "trips": [
+                    {
+                        "signature": t.trip_signature,
+                        "duration_seconds": t.duration_seconds,
+                        "num_transfers": t.num_transfers,
+                        "departure_at": t.departure_at.isoformat(),
+                        "arrival_at": t.arrival_at.isoformat(),
+                        "modes": t.modes,
+                        "legs": t.legs,
+                    }
+                    for t in trips
+                ],
+            }
+        )
     return out
 
 

@@ -70,9 +70,7 @@ class MasterStation(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
-    source: Mapped[str] = mapped_column(
-        String, nullable=False, server_default=text("'trainline'")
-    )
+    source: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'trainline'"))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -105,9 +103,7 @@ class RouteAlias(Base):
     scope_country: Mapped[str | None] = mapped_column(String(2))
     scope_carrier: Mapped[str | None] = mapped_column(String)
     notes: Mapped[str | None] = mapped_column(String)
-    created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
-    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -117,9 +113,7 @@ class MasterCarrier(Base):
     """RICS code dictionary."""
 
     __tablename__ = "master_carriers"
-    __table_args__ = (
-        CheckConstraint("source IN ('uic','manual')", name="source_valid"),
-    )
+    __table_args__ = (CheckConstraint("source IN ('uic','manual')", name="source_valid"),)
 
     rics_code: Mapped[str] = mapped_column(String, primary_key=True)
     short_name: Mapped[str] = mapped_column(String, nullable=False)
@@ -128,9 +122,7 @@ class MasterCarrier(Base):
     legacy_codes: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
-    source: Mapped[str] = mapped_column(
-        String, nullable=False, server_default=text("'uic'")
-    )
+    source: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'uic'"))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -141,9 +133,7 @@ class MasterStationPendingDrift(Base):
 
     __tablename__ = "master_stations_pending_drift"
 
-    uic: Mapped[str] = mapped_column(
-        String, ForeignKey("master_stations.uic"), primary_key=True
-    )
+    uic: Mapped[str] = mapped_column(String, ForeignKey("master_stations.uic"), primary_key=True)
     trainline_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     fields_differing: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     detected_at: Mapped[datetime] = mapped_column(

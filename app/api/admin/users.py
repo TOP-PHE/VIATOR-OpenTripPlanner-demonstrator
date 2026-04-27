@@ -17,7 +17,6 @@ from ...models import User
 from ...models.identity import UserRole
 from ...security import CurrentUser, client_ip, require_platform_admin
 
-
 router = APIRouter(prefix="/api/users", tags=["admin", "users"])
 
 
@@ -34,7 +33,7 @@ class UserResponse(BaseModel):
     created_at: str
 
     @classmethod
-    def from_orm_user(cls, u: User) -> "UserResponse":
+    def from_orm_user(cls, u: User) -> UserResponse:
         return cls(
             id=str(u.id),
             email=u.email,

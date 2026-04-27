@@ -16,7 +16,6 @@ from ...master import trainline
 from ...models import MasterStation, MasterStationPendingDrift
 from ...security import CurrentUser, client_ip, require_content_manager
 
-
 router = APIRouter(prefix="/api/master/stations", tags=["master", "stations"])
 
 
@@ -34,13 +33,18 @@ class StationResponse(BaseModel):
     has_drift: bool
 
     @classmethod
-    def from_orm_with_drift(cls, s: MasterStation, drift_uics: set[str]) -> "StationResponse":
+    def from_orm_with_drift(cls, s: MasterStation, drift_uics: set[str]) -> StationResponse:
         return cls(
-            uic=s.uic, name=s.name, country_iso=s.country_iso,
-            latitude=s.latitude, longitude=s.longitude,
-            trigramme_sncf=s.trigramme_sncf, db_code=s.db_code,
+            uic=s.uic,
+            name=s.name,
+            country_iso=s.country_iso,
+            latitude=s.latitude,
+            longitude=s.longitude,
+            trigramme_sncf=s.trigramme_sncf,
+            db_code=s.db_code,
             trenitalia_code=s.trenitalia_code,
-            is_main_station=s.is_main_station, source=s.source,
+            is_main_station=s.is_main_station,
+            source=s.source,
             has_drift=s.uic in drift_uics,
         )
 
@@ -55,7 +59,7 @@ class StationPatch(BaseModel):
 
 
 class DriftResolveBody(BaseModel):
-    action: str   # 'keep_ours' | 'adopt_full' | 'adopt_fields'
+    action: str  # 'keep_ours' | 'adopt_full' | 'adopt_fields'
     fields: list[str] | None = None
 
 
@@ -77,12 +81,12 @@ def list_stations(
         stmt = stmt.where(or_(MasterStation.name.ilike(like), MasterStation.uic.ilike(like)))
     if country:
         stmt = stmt.where(MasterStation.country_iso == country.upper())
-    stmt = stmt.order_by(MasterStation.country_iso, MasterStation.name).offset(page * size).limit(size)
+    stmt = (
+        stmt.order_by(MasterStation.country_iso, MasterStation.name).offset(page * size).limit(size)
+    )
 
     rows = db.execute(stmt).scalars().all()
-    drift_uics = {
-        d.uic for d in db.execute(select(MasterStationPendingDrift)).scalars().all()
-    }
+    drift_uics = {d.uic for d in db.execute(select(MasterStationPendingDrift)).scalars().all()}
     return [StationResponse.from_orm_with_drift(s, drift_uics) for s in rows]
 
 
@@ -106,9 +110,12 @@ def patch_station(
         s.source = "manual"
         s.updated_at = datetime.utcnow()
         audit.record(
-            db, action="master_station.updated",
-            actor_user_id=actor.id, actor_ip=client_ip(request),
-            target_kind="master_station", target_id=uic,
+            db,
+            action="master_station.updated",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="master_station",
+            target_id=uic,
             metadata={"changes": changes},
         )
     db.commit()
@@ -126,8 +133,10 @@ async def refresh_trainline(
 ) -> dict[str, int]:
     counts = await trainline.refresh(db)
     audit.record(
-        db, action="master_stations.refresh.trainline",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
+        db,
+        action="master_stations.refresh.trainline",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
         metadata=counts,
     )
     db.commit()
@@ -181,9 +190,12 @@ def resolve_drift(
 
     db.delete(drift)
     audit.record(
-        db, action=f"master_station.drift.{body.action}",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="master_station", target_id=uic,
+        db,
+        action=f"master_station.drift.{body.action}",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="master_station",
+        target_id=uic,
         metadata={"fields": body.fields or list(snapshot.keys())},
     )
     db.commit()

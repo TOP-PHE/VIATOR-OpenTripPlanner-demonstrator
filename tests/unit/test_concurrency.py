@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from app.concurrency import ConcurrencyExceeded, ConcurrencyGate, semaphores
@@ -12,7 +10,8 @@ from app.concurrency import ConcurrencyExceeded, ConcurrencyGate, semaphores
 @pytest.mark.asyncio
 async def test_admits_within_limit() -> None:
     gate = ConcurrencyGate("test", limit=2)
-    async with gate.acquire_or_fail():
+    # Nesting is intentional — we want to assert the counter at the inner level.
+    async with gate.acquire_or_fail():  # noqa: SIM117
         async with gate.acquire_or_fail():
             assert gate.in_flight == 2
 
@@ -47,7 +46,8 @@ async def test_releases_on_exception() -> None:
 async def test_set_limit_hot_swap_does_not_evict() -> None:
     """Reducing the limit while requests are in flight does not evict them."""
     gate = ConcurrencyGate("test", limit=3)
-    async with gate.acquire_or_fail():
+    # Nesting is intentional — we hot-swap the limit while three are in flight.
+    async with gate.acquire_or_fail():  # noqa: SIM117
         async with gate.acquire_or_fail():
             async with gate.acquire_or_fail():
                 assert gate.in_flight == 3

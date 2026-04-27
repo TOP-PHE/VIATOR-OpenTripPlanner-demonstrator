@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
+
+from alembic import command
+from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
@@ -42,12 +43,13 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     command.upgrade(cfg, "head")
 
     from app import config_service
+
     config_service.invalidate_cache()
     return url
 
 
 @pytest.fixture
-def client(fresh_db: str):  # noqa: ARG001
+def client(fresh_db: str):
     from app.main import app
 
     with TestClient(app) as c:
@@ -103,7 +105,7 @@ def _confirmed_via_self_register(client: TestClient, email: str, name: str) -> s
                 token_hash=hashed,
                 email=email,
                 name=name,
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
         )
         db.commit()
@@ -127,9 +129,7 @@ def test_list_users(client: TestClient, admin: tuple[str, str]) -> None:
     assert {"admin@viator.test", "alice@example.org", "bob@example.org"}.issubset(set(emails))
 
 
-def test_promote_user_to_content_manager(
-    client: TestClient, admin: tuple[str, str]
-) -> None:
+def test_promote_user_to_content_manager(client: TestClient, admin: tuple[str, str]) -> None:
     jwt, _ = admin
     target_id = _seed_user("alice@example.org", "Alice")
 

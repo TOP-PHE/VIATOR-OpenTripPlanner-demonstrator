@@ -19,7 +19,6 @@ from .db import SessionLocal
 from .models import RebuildJob
 from .settings import settings
 
-
 log = logging.getLogger("worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -77,13 +76,21 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     graph_target.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "docker", "compose", "-p", "otp-merits",
-        "run", "--rm",
-        "-e", f"OTP_HEAP={settings.otp_build_heap}",
-        "-e", f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
+        "docker",
+        "compose",
+        "-p",
+        "otp-merits",
+        "run",
+        "--rm",
+        "-e",
+        f"OTP_HEAP={settings.otp_build_heap}",
+        "-e",
+        f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "otp-build",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # `cmd` is built from constants + the configured session_id slug only;
+    # nothing user-supplied. Bandit S603 does not apply.
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
     output = proc.stdout + "\n--- stderr ---\n" + proc.stderr
 
     if proc.returncode != 0:

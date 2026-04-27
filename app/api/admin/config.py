@@ -13,7 +13,6 @@ from ...auth import email as email_sender
 from ...db import get_db
 from ...security import CurrentUser, client_ip, require_platform_admin
 
-
 router = APIRouter(prefix="/api/admin/config", tags=["admin", "config"])
 
 

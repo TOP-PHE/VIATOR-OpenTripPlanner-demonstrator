@@ -18,7 +18,6 @@ from sqlalchemy.orm import Session as DbSession
 from .models import RebuildJob
 from .settings import settings
 
-
 # Which detected kinds get staged into OTP's build inbox vs. stored elsewhere.
 STAGE_INTO_OTP_INBOX: dict[str, str] = {
     "GTFS": "gtfs",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, Integer, String, ForeignKeyConstraint
+from sqlalchemy import ForeignKey, ForeignKeyConstraint, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -13,9 +13,7 @@ class McTOverride(Base):
 
     __tablename__ = "mct_overrides"
 
-    session_id: Mapped[str] = mapped_column(
-        String, ForeignKey("sessions.id"), primary_key=True
-    )
+    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), primary_key=True)
     station_code: Mapped[str] = mapped_column(String, primary_key=True)
     carrier_a: Mapped[str] = mapped_column(String, primary_key=True)
     carrier_b: Mapped[str] = mapped_column(String, primary_key=True)
@@ -26,13 +24,9 @@ class StationXref(Base):
     """Per-session bridge: feed-specific stop_id → master_stations.uic + extras."""
 
     __tablename__ = "stations_xref"
-    __table_args__ = (
-        ForeignKeyConstraint(["uic"], ["master_stations.uic"], name="fk_xref_uic"),
-    )
+    __table_args__ = (ForeignKeyConstraint(["uic"], ["master_stations.uic"], name="fk_xref_uic"),)
 
-    session_id: Mapped[str] = mapped_column(
-        String, ForeignKey("sessions.id"), primary_key=True
-    )
+    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), primary_key=True)
     stop_id: Mapped[str] = mapped_column(String, primary_key=True)
     uic: Mapped[str | None] = mapped_column(String)
     trigramme: Mapped[str | None] = mapped_column(String)

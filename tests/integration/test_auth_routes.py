@@ -6,13 +6,15 @@ Skips cleanly if Postgres is unreachable (same pattern as test_migrations.py).
 from __future__ import annotations
 
 import os
+from datetime import UTC
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
+
+from alembic import command
+from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
@@ -49,12 +51,13 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     command.upgrade(cfg, "head")
 
     from app import config_service
+
     config_service.invalidate_cache()
     return url
 
 
 @pytest.fixture
-def client(fresh_db: str):  # noqa: ARG001
+def client(fresh_db: str):
     from app.main import app
 
     with TestClient(app) as c:
@@ -219,9 +222,7 @@ def test_register_request_for_existing_user_is_silent(client: TestClient) -> Non
     with SessionLocal() as db:
         rows = (
             db.execute(
-                select(VerificationToken).where(
-                    VerificationToken.email == "admin@viator.test"
-                )
+                select(VerificationToken).where(VerificationToken.email == "admin@viator.test")
             )
             .scalars()
             .all()
@@ -231,10 +232,11 @@ def test_register_request_for_existing_user_is_silent(client: TestClient) -> Non
 
 def test_full_register_confirm_login_flow(client: TestClient) -> None:
     """Mint a verification token directly, then drive register-confirm + login."""
+    from datetime import datetime, timedelta
+
     from app.auth import tokens
     from app.db import SessionLocal
     from app.models import VerificationToken
-    from datetime import datetime, timedelta, timezone
 
     raw, hashed = tokens.make_verification_token()
     with SessionLocal() as db:
@@ -243,7 +245,7 @@ def test_full_register_confirm_login_flow(client: TestClient) -> None:
                 token_hash=hashed,
                 email="freshuser@example.org",
                 name="Fresh User",
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
         )
         db.commit()
@@ -296,7 +298,5 @@ def test_admin_config_requires_platform_admin_jwt(client: TestClient) -> None:
 def test_admin_config_accepts_platform_admin_jwt(client: TestClient) -> None:
     jwt, _ = _bootstrap(client)
     client.cookies.clear()
-    r = client.get(
-        "/api/admin/config", headers={"Authorization": f"Bearer {jwt}"}
-    )
+    r = client.get("/api/admin/config", headers={"Authorization": f"Bearer {jwt}"})
     assert r.status_code == 200, r.text

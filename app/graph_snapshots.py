@@ -14,7 +14,7 @@ import hashlib
 import io
 import logging
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
 from .models import GraphSnapshot, Upload
-
 
 log = logging.getLogger(__name__)
 
@@ -96,16 +95,13 @@ def feed_signature(upload_sha256s: list[str]) -> str:
 
 
 def next_update_version(db: DbSession, *, session_id: str, main_version: str) -> int:
-    last = (
-        db.execute(
-            select(GraphSnapshot)
-            .where(GraphSnapshot.session_id == session_id)
-            .where(GraphSnapshot.timetable_main_version == main_version)
-            .order_by(GraphSnapshot.timetable_update_version.desc())
-            .limit(1)
-        )
-        .scalar_one_or_none()
-    )
+    last = db.execute(
+        select(GraphSnapshot)
+        .where(GraphSnapshot.session_id == session_id)
+        .where(GraphSnapshot.timetable_main_version == main_version)
+        .order_by(GraphSnapshot.timetable_update_version.desc())
+        .limit(1)
+    ).scalar_one_or_none()
     return (last.timetable_update_version + 1) if last else 1
 
 
@@ -156,7 +152,7 @@ def record_snapshot(
     snap = GraphSnapshot(
         session_id=session_id,
         rebuild_job_id=rebuild_job_id,
-        built_at=datetime.now(timezone.utc),
+        built_at=datetime.now(UTC),
         graph_path=str(graph_path),
         source_uploads=[
             {

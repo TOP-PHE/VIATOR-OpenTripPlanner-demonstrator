@@ -28,10 +28,11 @@ from ...models import (
     GraphSnapshot,
     JourneySearch,
     JourneySearchExecution,
+)
+from ...models import (
     Session as SessionRow,
 )
 from ...security import CurrentUser, client_ip, require_platform_admin
-
 
 router = APIRouter(prefix="/api/admin/replay", tags=["admin", "replay"])
 
@@ -46,7 +47,9 @@ class ReplayFilter(BaseModel):
 class ReplayBody(BaseModel):
     filter: ReplayFilter
     against_graph_snapshot_id: uuid.UUID
-    dry_run: bool = Field(default=False, description="Plan and report what would run; don't execute")
+    dry_run: bool = Field(
+        default=False, description="Plan and report what would run; don't execute"
+    )
 
 
 @router.post("")
@@ -70,11 +73,13 @@ async def replay(
     # Find candidate searches.
     stmt = (
         select(JourneySearch)
-        .where(JourneySearch.id.in_(
-            db.query(JourneySearchExecution.search_id)
-            .filter(JourneySearchExecution.session_id == body.filter.session_id)
-            .scalar_subquery()
-        ))
+        .where(
+            JourneySearch.id.in_(
+                db.query(JourneySearchExecution.search_id)
+                .filter(JourneySearchExecution.session_id == body.filter.session_id)
+                .scalar_subquery()
+            )
+        )
         .where(JourneySearch.ts >= body.filter.since)
     )
     if body.filter.until:
@@ -92,20 +97,20 @@ async def replay(
     queued: list[JourneySearch] = []
     skipped_main_version: list[uuid.UUID] = []
     for s in candidates:
-        exe = (
-            db.execute(
-                select(JourneySearchExecution)
-                .where(JourneySearchExecution.search_id == s.id)
-                .where(JourneySearchExecution.session_id == body.filter.session_id)
-                .limit(1)
-            )
-            .scalar_one_or_none()
-        )
+        exe = db.execute(
+            select(JourneySearchExecution)
+            .where(JourneySearchExecution.search_id == s.id)
+            .where(JourneySearchExecution.session_id == body.filter.session_id)
+            .limit(1)
+        ).scalar_one_or_none()
         if exe is None:
             skipped_main_version.append(s.id)
             continue
         original_snap = db.get(GraphSnapshot, exe.graph_snapshot_id)
-        if original_snap is None or original_snap.timetable_main_version != target.timetable_main_version:
+        if (
+            original_snap is None
+            or original_snap.timetable_main_version != target.timetable_main_version
+        ):
             skipped_main_version.append(s.id)
             continue
         queued.append(s)
@@ -122,9 +127,12 @@ async def replay(
     delay = 1.0 / max(rps, 1)
     outcomes = {"now_ok": 0, "still_failing": 0, "different_result": 0, "errors": 0}
     audit.record(
-        db, action="replay.started",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="graph_snapshot", target_id=str(target.id),
+        db,
+        action="replay.started",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="graph_snapshot",
+        target_id=str(target.id),
         metadata={"queued": len(queued), "filter": body.filter.model_dump(mode="json")},
     )
     db.commit()
@@ -134,34 +142,51 @@ async def replay(
         try:
             replay_search = recorder.begin_search(
                 db,
-                user_id=s.user_id, ip=None, endpoint="plan",
-                origin_lat=s.origin_lat, origin_lon=s.origin_lon, origin_label=s.origin_label,
-                dest_lat=s.dest_lat, dest_lon=s.dest_lon, dest_label=s.dest_label,
-                requested_time_kind=s.requested_time_kind, requested_time=s.requested_time,
-                modes=s.modes, replay_of_search_id=s.id,
+                user_id=s.user_id,
+                ip=None,
+                endpoint="plan",
+                origin_lat=s.origin_lat,
+                origin_lon=s.origin_lon,
+                origin_label=s.origin_label,
+                dest_lat=s.dest_lat,
+                dest_lon=s.dest_lon,
+                dest_label=s.dest_label,
+                requested_time_kind=s.requested_time_kind,
+                requested_time=s.requested_time,
+                modes=s.modes,
+                replay_of_search_id=s.id,
             )
             t0 = time.monotonic()
             try:
                 _, trips = await otp_client.fetch_plan(
                     session_id=target.session_id,
-                    from_lat=s.origin_lat, from_lon=s.origin_lon,
-                    to_lat=s.dest_lat,     to_lon=s.dest_lon,
-                    when=s.requested_time, timeout_ms=timeout_ms,
+                    from_lat=s.origin_lat,
+                    from_lon=s.origin_lon,
+                    to_lat=s.dest_lat,
+                    to_lon=s.dest_lon,
+                    when=s.requested_time,
+                    timeout_ms=timeout_ms,
                 )
                 status = "ok" if trips else "no_route"
-            except Exception:  # noqa: BLE001
+            except Exception:
                 status = "error"
                 trips = []
             elapsed = int((time.monotonic() - t0) * 1000)
 
             recorder.record_execution(
-                db, search_id=replay_search.id, session_id=target.session_id,
-                graph_snapshot_id=target.id, status=status,
-                response_ms=elapsed, raw_response=None,
-                error_message=None, trips=trips,
+                db,
+                search_id=replay_search.id,
+                session_id=target.session_id,
+                graph_snapshot_id=target.id,
+                status=status,
+                response_ms=elapsed,
+                raw_response=None,
+                error_message=None,
+                trips=trips,
             )
             recorder.finish_search(
-                db, replay_search,
+                db,
+                replay_search,
                 total_response_ms=elapsed,
                 total_trips_unique=len(trips),
                 status=status,
@@ -177,14 +202,17 @@ async def replay(
                 outcomes["errors"] += 1
 
             db.commit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             outcomes["errors"] += 1
         await asyncio.sleep(delay)
 
     audit.record(
-        db, action="replay.finished",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="graph_snapshot", target_id=str(target.id),
+        db,
+        action="replay.finished",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="graph_snapshot",
+        target_id=str(target.id),
         metadata={"outcomes": outcomes},
     )
     db.commit()

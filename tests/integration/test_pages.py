@@ -7,13 +7,15 @@ actual UX is verified manually (screenshot review, browser smoke).
 from __future__ import annotations
 
 import os
+from datetime import UTC
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
+
+from alembic import command
+from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
@@ -45,12 +47,13 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     command.upgrade(cfg, "head")
 
     from app import config_service
+
     config_service.invalidate_cache()
     return url
 
 
 @pytest.fixture
-def client(fresh_db: str):  # noqa: ARG001
+def client(fresh_db: str):
     from app.main import app
 
     with TestClient(app, follow_redirects=False) as c:
@@ -148,7 +151,7 @@ def test_admin_users_forbidden_for_end_user(client: TestClient) -> None:
     _bootstrap_admin(client)
     client.cookies.clear()  # drop the admin cookie
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from app.auth import tokens
     from app.db import SessionLocal
@@ -161,7 +164,7 @@ def test_admin_users_forbidden_for_end_user(client: TestClient) -> None:
                 token_hash=hashed,
                 email="enduser@viator.test",
                 name="End User",
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
         )
         db.commit()

@@ -28,7 +28,6 @@ from ..security import (
     _extract_jwt,
 )
 
-
 router = APIRouter(tags=["pages"])
 templates = Jinja2Templates(directory="app/templates")
 
@@ -188,6 +187,4 @@ def journey_page(request: Request) -> Response:
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    return templates.TemplateResponse(
-        "journey.html", {"request": request, "current_user": user}
-    )
+    return templates.TemplateResponse("journey.html", {"request": request, "current_user": user})

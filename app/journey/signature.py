@@ -24,8 +24,9 @@ def _round_latlon(lat: float | None, lon: float | None) -> str:
     return f"{round(lat, 4):.4f},{round(lon, 4):.4f}"
 
 
-def _stop_token(db: DbSession, *, session_id: str, stop_id: str | None,
-                lat: float | None, lon: float | None) -> str:
+def _stop_token(
+    db: DbSession, *, session_id: str, stop_id: str | None, lat: float | None, lon: float | None
+) -> str:
     if not stop_id:
         return "@" + _round_latlon(lat, lon)
     xref = db.get(StationXref, (session_id, stop_id))
@@ -39,11 +40,7 @@ def _route_canonical(db: DbSession, name: str | None) -> str:
         return ""
     n = name.strip()
     # Look up an alias for `n` → use canonical_name if found.
-    row = (
-        db.query(RouteAlias)
-        .filter(RouteAlias.alias == n)
-        .first()
-    )
+    row = db.query(RouteAlias).filter(RouteAlias.alias == n).first()
     return row.canonical_name if row else n
 
 
@@ -66,14 +63,18 @@ def trip_signature(db: DbSession, *, session_id: str, legs: list[dict[str, Any]]
     for leg in legs:
         mode = (leg.get("mode") or "").upper()
         from_tok = _stop_token(
-            db, session_id=session_id,
+            db,
+            session_id=session_id,
             stop_id=leg.get("from_stop_id"),
-            lat=leg.get("from_lat"), lon=leg.get("from_lon"),
+            lat=leg.get("from_lat"),
+            lon=leg.get("from_lon"),
         )
         to_tok = _stop_token(
-            db, session_id=session_id,
+            db,
+            session_id=session_id,
             stop_id=leg.get("to_stop_id"),
-            lat=leg.get("to_lat"), lon=leg.get("to_lon"),
+            lat=leg.get("to_lat"),
+            lon=leg.get("to_lon"),
         )
         dep = _round_minute(leg.get("departure"))
         arr = _round_minute(leg.get("arrival"))

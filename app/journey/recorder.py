@@ -6,7 +6,7 @@ Used by the fanout endpoint (step 14) and the journey/plan endpoint.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session as DbSession
@@ -21,9 +21,14 @@ def begin_search(
     user_id: uuid.UUID | None,
     ip: str | None,
     endpoint: str,
-    origin_lat: float, origin_lon: float, origin_label: str | None,
-    dest_lat: float, dest_lon: float, dest_label: str | None,
-    requested_time_kind: str, requested_time: datetime,
+    origin_lat: float,
+    origin_lon: float,
+    origin_label: str | None,
+    dest_lat: float,
+    dest_lon: float,
+    dest_label: str | None,
+    requested_time_kind: str,
+    requested_time: datetime,
     modes: str,
     replay_of_search_id: uuid.UUID | None = None,
 ) -> JourneySearch:
@@ -33,13 +38,20 @@ def begin_search(
     fanout completes.
     """
     s = JourneySearch(
-        ts=datetime.now(timezone.utc),
-        user_id=user_id, ip=ip,
+        ts=datetime.now(UTC),
+        user_id=user_id,
+        ip=ip,
         endpoint=endpoint,
-        origin_lat=origin_lat, origin_lon=origin_lon, origin_label=origin_label,
-        dest_lat=dest_lat, dest_lon=dest_lon, dest_label=dest_label,
-        requested_time_kind=requested_time_kind, requested_time=requested_time,
-        modes=modes, status="ok",
+        origin_lat=origin_lat,
+        origin_lon=origin_lon,
+        origin_label=origin_label,
+        dest_lat=dest_lat,
+        dest_lon=dest_lon,
+        dest_label=dest_label,
+        requested_time_kind=requested_time_kind,
+        requested_time=requested_time,
+        modes=modes,
+        status="ok",
         replay_of_search_id=replay_of_search_id,
     )
     db.add(s)
@@ -59,7 +71,7 @@ def record_execution(
     error_message: str | None,
     trips: list[dict[str, Any]],
 ) -> JourneySearchExecution:
-    """Record one (search × session) execution + its trips."""
+    """Record one (search x session) execution + its trips."""
     exe = JourneySearchExecution(
         search_id=search_id,
         session_id=session_id,

@@ -19,7 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .base import Base, TimestampMixin
+from .base import Base
 
 
 class JourneySearch(Base):
@@ -27,9 +27,7 @@ class JourneySearch(Base):
 
     __tablename__ = "journey_searches"
     __table_args__ = (
-        CheckConstraint(
-            "endpoint IN ('plan','compare','fanout')", name="endpoint_valid"
-        ),
+        CheckConstraint("endpoint IN ('plan','compare','fanout')", name="endpoint_valid"),
         CheckConstraint(
             "requested_time_kind IN ('depart_at','arrive_by')",
             name="requested_time_kind_valid",
@@ -50,9 +48,7 @@ class JourneySearch(Base):
     ts: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id")
-    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     ip: Mapped[str | None] = mapped_column(INET)
     endpoint: Mapped[str] = mapped_column(String, nullable=False)
     origin_lat: Mapped[float] = mapped_column(Float, nullable=False)
@@ -62,9 +58,7 @@ class JourneySearch(Base):
     dest_lon: Mapped[float] = mapped_column(Float, nullable=False)
     dest_label: Mapped[str | None] = mapped_column(String)
     requested_time_kind: Mapped[str] = mapped_column(String, nullable=False)
-    requested_time: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    requested_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     modes: Mapped[str] = mapped_column(String, nullable=False)
     total_response_ms: Mapped[int | None] = mapped_column(Integer)
     total_trips_unique: Mapped[int | None] = mapped_column(Integer)
@@ -79,13 +73,9 @@ class JourneySearchExecution(Base):
 
     __tablename__ = "journey_search_executions"
     __table_args__ = (
-        CheckConstraint(
-            "status IN ('ok','no_route','error','timeout')", name="status_valid"
-        ),
+        CheckConstraint("status IN ('ok','no_route','error','timeout')", name="status_valid"),
         Index("ix_journey_executions_search", "search_id"),
-        Index(
-            "ix_journey_executions_session_snap", "session_id", "graph_snapshot_id"
-        ),
+        Index("ix_journey_executions_session_snap", "session_id", "graph_snapshot_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -98,16 +88,12 @@ class JourneySearchExecution(Base):
         ForeignKey("journey_searches.id", ondelete="CASCADE"),
         nullable=False,
     )
-    session_id: Mapped[str] = mapped_column(
-        String, ForeignKey("sessions.id"), nullable=False
-    )
+    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), nullable=False)
     graph_snapshot_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("graph_snapshots.id"), nullable=False
     )
     status: Mapped[str] = mapped_column(String, nullable=False)
-    num_itineraries: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    num_itineraries: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     response_ms: Mapped[int | None] = mapped_column(Integer)
     raw_response: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error_message: Mapped[str | None] = mapped_column(String)
@@ -136,12 +122,8 @@ class JourneyTrip(Base):
     rank_in_response: Mapped[int] = mapped_column(Integer, nullable=False)
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     num_transfers: Mapped[int] = mapped_column(Integer, nullable=False)
-    departure_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    arrival_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    departure_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    arrival_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     modes: Mapped[str] = mapped_column(String, nullable=False)
     legs: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     fare: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

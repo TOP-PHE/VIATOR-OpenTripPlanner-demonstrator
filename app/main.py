@@ -20,7 +20,6 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
@@ -40,7 +39,6 @@ from .models import RebuildJob, Upload
 from .rate_limit import limiter
 from .security import authed
 from .settings import settings
-
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +106,7 @@ def _startup() -> None:
 
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os
+
     if _os.environ.get("VIATOR_DISABLE_CRONS"):
         return
     try:
@@ -120,6 +119,7 @@ def _startup() -> None:
         sched = AsyncIOScheduler(timezone="UTC")
         # Daily retention prune at 03:00 UTC.
         sched.add_job(retention.prune_once, "cron", hour=3, minute=0, id="retention")
+
         # Trainline refresh — daily check, but only acts when the configured
         # MASTER_STATIONS_REFRESH_DAYS interval has elapsed (handled in trainline.refresh()).
         async def _master_stations_refresh() -> None:
@@ -129,7 +129,9 @@ def _startup() -> None:
                 except Exception:
                     log.exception("scheduled trainline refresh failed")
 
-        sched.add_job(_master_stations_refresh, "cron", hour=4, minute=0, id="master_stations_refresh")
+        sched.add_job(
+            _master_stations_refresh, "cron", hour=4, minute=0, id="master_stations_refresh"
+        )
         sched.start()
         _scheduler = sched
         log.info("APScheduler started: retention + master-data refresh")

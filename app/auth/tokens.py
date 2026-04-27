@@ -9,13 +9,12 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from jose import jwt as jose_jwt
 
 from ..settings import settings
-
 
 # ────────────────────────────── JWT ──────────────────────────────
 
@@ -28,7 +27,7 @@ def issue_jwt(
     ttl_seconds: int | None = None,
 ) -> str:
     """Mint a session JWT. Caller is responsible for setting it as a cookie."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ttl = ttl_seconds if ttl_seconds is not None else settings.jwt_ttl_seconds
     claims: dict[str, Any] = {
         "sub": str(user_id),

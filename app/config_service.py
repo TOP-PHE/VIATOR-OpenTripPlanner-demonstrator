@@ -31,7 +31,6 @@ from .config_schema import (
 )
 from .models import PlatformConfig
 
-
 # ────────────────────────────────── cache ──────────────────────────────────
 
 _lock = threading.RLock()
@@ -44,7 +43,7 @@ def _load_from_db(db: Session) -> dict[str, Any]:
     """Read every PlatformConfig row, fall back to schema defaults for missing keys."""
     stored = {row.key: row.value for row in db.execute(select(PlatformConfig)).scalars().all()}
     out: dict[str, Any] = {}
-    for key, spec in CONFIG_SCHEMA.items():
+    for key in CONFIG_SCHEMA:
         raw = stored.get(key)
         out[key] = coerce(key, raw) if raw is not None else default_for(key)
     return out
@@ -81,6 +80,7 @@ def invalidate_cache() -> None:
 
 # ──────────────────────────── response shaping ────────────────────────────
 
+
 def as_response(db: Session) -> dict[str, Any]:
     """GET /api/admin/config payload. Sensitive non-empty values are masked."""
     cfg = get_all(db)
@@ -94,6 +94,7 @@ def as_response(db: Session) -> dict[str, Any]:
 
 
 # ─────────────────────────────── write path ───────────────────────────────
+
 
 class ConfigValidationError(ValueError):
     """One or more PATCH values failed validation. Carries per-field errors."""
@@ -189,6 +190,6 @@ def apply_patch(
 
 def _safe(value: Any) -> Any:
     """Make a value JSON-safe for audit metadata."""
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)

@@ -16,7 +16,6 @@ from ...db import get_db
 from ...models import RouteAlias
 from ...security import CurrentUser, client_ip, require_content_manager
 
-
 router = APIRouter(prefix="/api/master/route-aliases", tags=["master", "aliases"])
 
 
@@ -43,10 +42,14 @@ class AliasResponse(BaseModel):
 
 def _to_response(r: RouteAlias) -> AliasResponse:
     return AliasResponse(
-        id=str(r.id), canonical_name=r.canonical_name, alias=r.alias,
+        id=str(r.id),
+        canonical_name=r.canonical_name,
+        alias=r.alias,
         applies_from=r.applies_from.isoformat() if r.applies_from else None,
         applies_until=r.applies_until.isoformat() if r.applies_until else None,
-        scope_country=r.scope_country, scope_carrier=r.scope_carrier, notes=r.notes,
+        scope_country=r.scope_country,
+        scope_carrier=r.scope_carrier,
+        notes=r.notes,
     )
 
 
@@ -70,9 +73,12 @@ def create_alias(
     db.add(row)
     db.flush()
     audit.record(
-        db, action="route_alias.created",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="route_alias", target_id=str(row.id),
+        db,
+        action="route_alias.created",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="route_alias",
+        target_id=str(row.id),
         metadata=body.model_dump(mode="json"),
     )
     db.commit()
@@ -91,8 +97,11 @@ def delete_alias(
         raise HTTPException(404, "Not found")
     db.delete(row)
     audit.record(
-        db, action="route_alias.deleted",
-        actor_user_id=actor.id, actor_ip=client_ip(request),
-        target_kind="route_alias", target_id=str(alias_id),
+        db,
+        action="route_alias.deleted",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="route_alias",
+        target_id=str(alias_id),
     )
     db.commit()

@@ -25,7 +25,9 @@ def test_jwt_tamper_detection() -> None:
     jwt = tokens.issue_jwt(uuid.uuid4(), "x@y.z", "end_user")
     # Flip a character in the payload section.
     head, payload, sig = jwt.split(".")
-    tampered = f"{head}.{payload[:-1]}A.{sig}" if payload[-1] != "A" else f"{head}.{payload[:-1]}B.{sig}"
+    tampered = (
+        f"{head}.{payload[:-1]}A.{sig}" if payload[-1] != "A" else f"{head}.{payload[:-1]}B.{sig}"
+    )
     with pytest.raises(JWTError):
         tokens.decode_jwt(tampered)
 

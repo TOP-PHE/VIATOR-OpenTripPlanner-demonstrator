@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+from alembic import context
 
 # Import every model module so Base.metadata is fully populated.
 # Importing app.models triggers the package __init__ which imports all submodules.
-from app.models import Base  # noqa: F401  (used as target_metadata)
+from app.models import Base
 from app.settings import settings
 
 config = context.config

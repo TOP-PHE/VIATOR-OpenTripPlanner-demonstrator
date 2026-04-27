@@ -31,9 +31,9 @@ class Settings(BaseSettings):
     # JWT-based auth (step 3+)
     jwt_secret: str = "change-me-in-prod-use-32-bytes-random"
     jwt_alg: str = "HS256"
-    jwt_ttl_seconds: int = 12 * 3600          # 12 h
+    jwt_ttl_seconds: int = 12 * 3600  # 12 h
     jwt_cookie_name: str = "viator_jwt"
-    jwt_cookie_secure: bool = False           # set True behind TLS
+    jwt_cookie_secure: bool = False  # set True behind TLS
 
     # First-platform-admin bootstrap. Empty disables the bootstrap endpoint.
     bootstrap_token: str = ""

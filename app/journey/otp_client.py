@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 
-
 log = logging.getLogger(__name__)
 
 
@@ -50,8 +49,10 @@ def _otp_base(session_id: str) -> str:
 async def fetch_plan(
     *,
     session_id: str,
-    from_lat: float, from_lon: float,
-    to_lat: float, to_lon: float,
+    from_lat: float,
+    from_lon: float,
+    to_lat: float,
+    to_lon: float,
     when: datetime,
     timeout_ms: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -87,26 +88,34 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
         for leg in it.get("legs", []):
             f = leg.get("from") or {}
             t = leg.get("to") or {}
-            legs_norm.append({
-                "mode": leg.get("mode"),
-                "departure": _ms_to_iso(leg.get("startTime")),
-                "arrival": _ms_to_iso(leg.get("endTime")),
-                "from_stop_id": ((f.get("stop") or {}).get("gtfsId")),
-                "to_stop_id":   ((t.get("stop") or {}).get("gtfsId")),
-                "from_lat": f.get("lat"),  "from_lon": f.get("lon"),
-                "to_lat":   t.get("lat"),  "to_lon":   t.get("lon"),
-                "route_short_name": (leg.get("route") or {}).get("shortName"),
-            })
+            legs_norm.append(
+                {
+                    "mode": leg.get("mode"),
+                    "departure": _ms_to_iso(leg.get("startTime")),
+                    "arrival": _ms_to_iso(leg.get("endTime")),
+                    "from_stop_id": ((f.get("stop") or {}).get("gtfsId")),
+                    "to_stop_id": ((t.get("stop") or {}).get("gtfsId")),
+                    "from_lat": f.get("lat"),
+                    "from_lon": f.get("lon"),
+                    "to_lat": t.get("lat"),
+                    "to_lon": t.get("lon"),
+                    "route_short_name": (leg.get("route") or {}).get("shortName"),
+                }
+            )
             if leg.get("mode"):
                 modes_set.append(leg["mode"])
-        out.append({
-            "duration_seconds": int(it.get("duration") or 0),
-            "num_transfers": max(0, len([l for l in legs_norm if l.get("mode") not in (None, "WALK")]) - 1),
-            "departure_at": _ms_to_iso(it.get("startTime")) or "",
-            "arrival_at":   _ms_to_iso(it.get("endTime")) or "",
-            "modes": ",".join(sorted(set(modes_set))),
-            "legs": legs_norm,
-        })
+        out.append(
+            {
+                "duration_seconds": int(it.get("duration") or 0),
+                "num_transfers": max(
+                    0, len([lg for lg in legs_norm if lg.get("mode") not in (None, "WALK")]) - 1
+                ),
+                "departure_at": _ms_to_iso(it.get("startTime")) or "",
+                "arrival_at": _ms_to_iso(it.get("endTime")) or "",
+                "modes": ",".join(sorted(set(modes_set))),
+                "legs": legs_norm,
+            }
+        )
     return out
 
 

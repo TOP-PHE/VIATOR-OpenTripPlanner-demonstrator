@@ -7,8 +7,8 @@ on this for autogenerate and migration validation.
 
 from __future__ import annotations
 
-from .base import Base
 from .audit import AuditEvent
+from .base import Base
 from .config import PlatformConfig
 from .graph import GraphSnapshot
 from .identity import PasswordResetToken, User, UserRole, VerificationToken

@@ -10,7 +10,7 @@ indistinguishable.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -26,7 +26,6 @@ from ...models import PasswordResetToken, User, VerificationToken
 from ...rate_limit import limiter
 from ...security import CurrentUser, client_ip, current_user_jwt
 from ...settings import settings
-
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -99,7 +98,7 @@ def _set_jwt_cookie(response: Response, jwt: str) -> None:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ────────────────────────── register ──────────────────────────
@@ -176,9 +175,7 @@ async def check_token(
         raise HTTPException(404, "Invalid or already-used token")
     if row.expires_at < _now():
         raise HTTPException(404, "Token expired")
-    return CheckTokenResponse(
-        email=row.email, name=row.name, expires_at=row.expires_at.isoformat()
-    )
+    return CheckTokenResponse(email=row.email, name=row.name, expires_at=row.expires_at.isoformat())
 
 
 @router.post("/register-confirm")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from passlib.context import CryptContext
 
-
 # 12 rounds is the OSCAR convention. Higher is slower; lower trades off attacker cost.
 _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 
@@ -27,6 +26,4 @@ def verify_password(plain: str, hashed: str) -> bool:
 def assert_strong_enough(plain: str) -> None:
     """Raise WeakPasswordError if the password violates policy."""
     if len(plain) < MIN_PASSWORD_LENGTH:
-        raise WeakPasswordError(
-            f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
-        )
+        raise WeakPasswordError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")

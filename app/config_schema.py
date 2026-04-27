@@ -10,15 +10,14 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-
 FieldType = Literal["str", "int", "bool", "secret"]
 
 
 class FieldSpec(TypedDict, total=False):
     type: FieldType
     default: Any
-    min: int        # for int fields
-    max: int        # for int fields
+    min: int  # for int fields
+    max: int  # for int fields
     choices: list[str]  # for str fields with enumerated values
     sensitive: bool
 
@@ -30,47 +29,44 @@ MASK_SENTINEL = "********"
 
 CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # ── SMTP ──────────────────────────────────────────────────────────
-    "SMTP_HOST":     {"type": "str",    "default": ""},
-    "SMTP_PORT":     {"type": "int",    "default": 587, "min": 1, "max": 65535},
-    "SMTP_SECURE":   {"type": "str",    "default": "starttls",
-                      "choices": ["none", "starttls", "tls"]},
-    "SMTP_USER":     {"type": "str",    "default": ""},
-    "SMTP_PASS":     {"type": "secret", "default": "", "sensitive": True},
-    "SMTP_FROM":     {"type": "str",    "default": "no-reply@viator.local"},
-
+    "SMTP_HOST": {"type": "str", "default": ""},
+    "SMTP_PORT": {"type": "int", "default": 587, "min": 1, "max": 65535},
+    "SMTP_SECURE": {"type": "str", "default": "starttls", "choices": ["none", "starttls", "tls"]},
+    "SMTP_USER": {"type": "str", "default": ""},
+    "SMTP_PASS": {"type": "secret", "default": "", "sensitive": True},
+    "SMTP_FROM": {"type": "str", "default": "no-reply@viator.local"},
     # ── Concurrency / server protection ───────────────────────────────
     "MAX_CONCURRENT_JOURNEYS": {"type": "int", "default": 20, "min": 1, "max": 200},
-    "MAX_CONCURRENT_REBUILDS": {"type": "int", "default": 1,  "min": 1, "max": 4},
-    "MAX_CONCURRENT_UPLOADS":  {"type": "int", "default": 3,  "min": 1, "max": 20},
-    "JOURNEY_TIMEOUT_MS":      {"type": "int", "default": 8000, "min": 1000, "max": 60000},
-
+    "MAX_CONCURRENT_REBUILDS": {"type": "int", "default": 1, "min": 1, "max": 4},
+    "MAX_CONCURRENT_UPLOADS": {"type": "int", "default": 3, "min": 1, "max": 20},
+    "JOURNEY_TIMEOUT_MS": {"type": "int", "default": 8000, "min": 1000, "max": 60000},
     # ── Fanout behaviour ──────────────────────────────────────────────
-    "FANOUT_TIMEOUT_MS":  {"type": "int",  "default": 10000, "min": 1000, "max": 60000},
-    "FANOUT_PARTIAL_OK":  {"type": "bool", "default": True},
+    "FANOUT_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
+    "FANOUT_PARTIAL_OK": {"type": "bool", "default": True},
     "STORE_RAW_RESPONSE": {"type": "bool", "default": True},
-
     # ── Master data refresh ───────────────────────────────────────────
     "MASTER_STATIONS_REFRESH_DAYS": {"type": "int", "default": 30, "min": 1, "max": 365},
     "MASTER_CARRIERS_REFRESH_DAYS": {"type": "int", "default": 90, "min": 1, "max": 365},
-
     # ── Replay safety caps ────────────────────────────────────────────
     "REPLAY_MAX_BATCH_SIZE": {"type": "int", "default": 1000, "min": 10, "max": 10000},
-    "REPLAY_MAX_RPS":        {"type": "int", "default": 5,    "min": 1,  "max": 50},
-
+    "REPLAY_MAX_RPS": {"type": "int", "default": 5, "min": 1, "max": 50},
     # ── Registration policy ───────────────────────────────────────────
-    "REGISTRATION_OPEN":         {"type": "bool", "default": True},
-    "REGISTRATION_DEFAULT_ROLE": {"type": "str",  "default": "end_user",
-                                  "choices": ["end_user", "content_manager"]},
-
+    "REGISTRATION_OPEN": {"type": "bool", "default": True},
+    "REGISTRATION_DEFAULT_ROLE": {
+        "type": "str",
+        "default": "end_user",
+        "choices": ["end_user", "content_manager"],
+    },
     # ── Retention (three tiers, see §11.1) ────────────────────────────
-    "AUDIT_RETENTION_DAYS":                {"type": "int", "default": 365, "min": 30, "max": 3650},
-    "JOURNEY_SEARCH_RETENTION_DAYS":       {"type": "int", "default": 365, "min": 30, "max": 3650},
-    "JOURNEY_TRIPS_RETENTION_DAYS":        {"type": "int", "default": 180, "min": 30, "max": 3650},
-    "JOURNEY_RAW_RESPONSE_RETENTION_DAYS": {"type": "int", "default": 30,  "min": 7,  "max": 365},
+    "AUDIT_RETENTION_DAYS": {"type": "int", "default": 365, "min": 30, "max": 3650},
+    "JOURNEY_SEARCH_RETENTION_DAYS": {"type": "int", "default": 365, "min": 30, "max": 3650},
+    "JOURNEY_TRIPS_RETENTION_DAYS": {"type": "int", "default": 180, "min": 30, "max": 3650},
+    "JOURNEY_RAW_RESPONSE_RETENTION_DAYS": {"type": "int", "default": 30, "min": 7, "max": 365},
 }
 
 
 # ────────────────────────────────── helpers ──────────────────────────────────
+
 
 def is_sensitive(key: str) -> bool:
     spec = CONFIG_SCHEMA[key]

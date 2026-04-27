@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy import DateTime, MetaData, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -23,7 +23,7 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
     # Convenience: every concrete model can opt in to created_at via TimestampMixin below.
 
-    type_annotation_map: dict[type, Any] = {}
+    type_annotation_map: ClassVar[dict[type, Any]] = {}
 
 
 class TimestampMixin:

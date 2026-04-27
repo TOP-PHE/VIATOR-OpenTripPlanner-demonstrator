@@ -15,15 +15,13 @@ trigger from CLI: `python -m app.retention`.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, update
-from sqlalchemy.orm import Session as DbSession
 
 from . import config_service
 from .db import SessionLocal
 from .models import AuditEvent, JourneySearch, JourneySearchExecution, JourneyTrip
-
 
 log = logging.getLogger(__name__)
 
@@ -34,19 +32,21 @@ def prune_once() -> dict[str, int]:
 
     with SessionLocal() as db:
         cfg = config_service.get_all(db)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # 1. raw_response (set NULL on old executions)
         cutoff_raw = now - timedelta(days=int(cfg["JOURNEY_RAW_RESPONSE_RETENTION_DAYS"]))
         result = db.execute(
             update(JourneySearchExecution)
             .where(JourneySearchExecution.raw_response.is_not(None))
-            .where(JourneySearchExecution.id.in_(
-                db.query(JourneySearchExecution.id)
-                .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
-                .filter(JourneySearch.ts < cutoff_raw)
-                .scalar_subquery()
-            ))
+            .where(
+                JourneySearchExecution.id.in_(
+                    db.query(JourneySearchExecution.id)
+                    .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
+                    .filter(JourneySearch.ts < cutoff_raw)
+                    .scalar_subquery()
+                )
+            )
             .values(raw_response=None)
         )
         counts["raw_response"] = result.rowcount or 0

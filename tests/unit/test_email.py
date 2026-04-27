@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from app.auth.email import _env, _tls_modes
 
-
 # ────────────────── Template rendering ──────────────────
 
 

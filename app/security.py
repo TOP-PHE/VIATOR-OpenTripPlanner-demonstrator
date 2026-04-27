@@ -30,7 +30,6 @@ from jose import JWTError
 from .auth import tokens
 from .settings import settings
 
-
 _basic = HTTPBasic(auto_error=False)
 
 
@@ -38,9 +37,9 @@ _basic = HTTPBasic(auto_error=False)
 class CurrentUser:
     """The authenticated principal for a request."""
 
-    id: uuid.UUID | None       # None for the basic-auth shadow user
-    username: str              # email for JWT users; basic-auth username otherwise
-    role: str                  # 'platform_admin' | 'content_manager' | 'end_user'
+    id: uuid.UUID | None  # None for the basic-auth shadow user
+    username: str  # email for JWT users; basic-auth username otherwise
+    role: str  # 'platform_admin' | 'content_manager' | 'end_user'
 
 
 # ────────────────────────── basic auth (Phase-1) ──────────────────────────

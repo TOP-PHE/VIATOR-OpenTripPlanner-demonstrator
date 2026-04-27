@@ -15,11 +15,12 @@ from unittest.mock import AsyncMock, patch
 
 import aiosmtplib
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
+
+from alembic import command
+from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
@@ -51,12 +52,13 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     command.upgrade(cfg, "head")
 
     from app import config_service
+
     config_service.invalidate_cache()
     return url
 
 
 @pytest.fixture
-def client(fresh_db: str):  # noqa: ARG001
+def client(fresh_db: str):
     from app.main import app
 
     with TestClient(app) as c:
@@ -96,9 +98,7 @@ def _set_smtp(client: TestClient, headers: dict[str, str]) -> None:
     ).raise_for_status()
 
 
-def test_unconfigured_returns_ok_false(
-    client: TestClient, admin_headers: dict[str, str]
-) -> None:
+def test_unconfigured_returns_ok_false(client: TestClient, admin_headers: dict[str, str]) -> None:
     """No SMTP_HOST set → graceful {ok: false, error}, NOT a 500."""
     r = client.post(
         "/api/admin/config/smtp/test",
@@ -123,9 +123,7 @@ def test_unconfigured_returns_ok_false(
     assert len(events) == 1
 
 
-def test_send_success_returns_ok_true(
-    client: TestClient, admin_headers: dict[str, str]
-) -> None:
+def test_send_success_returns_ok_true(client: TestClient, admin_headers: dict[str, str]) -> None:
     _set_smtp(client, admin_headers)
 
     with patch("app.auth.email.aiosmtplib.send", new=AsyncMock(return_value=None)):

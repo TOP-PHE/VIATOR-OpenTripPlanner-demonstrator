@@ -24,9 +24,9 @@ os.environ.setdefault("ADMIN_PASSWORD", "test-admin")
 os.environ.setdefault("VIATOR_DISABLE_CRONS", "1")
 # ────────────────────────────────────────────────────────────────────────────
 
-from pathlib import Path  # noqa: E402
+from pathlib import Path
 
-import pytest  # noqa: E402
+import pytest
 
 
 @pytest.fixture(autouse=True)

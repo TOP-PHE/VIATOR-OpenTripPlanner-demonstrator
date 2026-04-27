@@ -19,11 +19,12 @@ from __future__ import annotations
 import os
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
+
+from alembic import command
+from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
@@ -55,12 +56,13 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     command.upgrade(cfg, "head")
 
     from app import config_service
+
     config_service.invalidate_cache()
     return url
 
 
 @pytest.fixture
-def client(fresh_db: str):  # noqa: ARG001
+def client(fresh_db: str):
     from app.main import app
 
     with TestClient(app) as c:
@@ -129,9 +131,7 @@ def test_patch_with_masked_sentinel_does_not_overwrite(
         "/api/admin/config", headers=admin_headers, json={"SMTP_PASS": "real-pwd"}
     ).raise_for_status()
     # PATCH with the mask returned by GET — should be a no-op.
-    r = client.patch(
-        "/api/admin/config", headers=admin_headers, json={"SMTP_PASS": "********"}
-    )
+    r = client.patch("/api/admin/config", headers=admin_headers, json={"SMTP_PASS": "********"})
     assert r.status_code == 200
 
     from app.db import SessionLocal
@@ -144,12 +144,8 @@ def test_patch_with_masked_sentinel_does_not_overwrite(
         assert row.value == "real-pwd"
 
 
-def test_patch_with_unknown_key_400(
-    client: TestClient, admin_headers: dict[str, str]
-) -> None:
-    r = client.patch(
-        "/api/admin/config", headers=admin_headers, json={"NOT_A_KEY": "x"}
-    )
+def test_patch_with_unknown_key_400(client: TestClient, admin_headers: dict[str, str]) -> None:
+    r = client.patch("/api/admin/config", headers=admin_headers, json={"NOT_A_KEY": "x"})
     assert r.status_code == 400
     assert "NOT_A_KEY" in r.json()["detail"]["errors"]
 
@@ -164,9 +160,7 @@ def test_patch_with_out_of_bounds_int_400(
     assert "MAX_CONCURRENT_JOURNEYS" in r.json()["detail"]["errors"]
 
 
-def test_patch_writes_audit_event(
-    client: TestClient, admin_headers: dict[str, str]
-) -> None:
+def test_patch_writes_audit_event(client: TestClient, admin_headers: dict[str, str]) -> None:
     client.patch(
         "/api/admin/config",
         headers=admin_headers,

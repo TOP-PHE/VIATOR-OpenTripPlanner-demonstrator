@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import Integer as _INTEGER
+from sqlalchemy import Numeric as _NUMERIC
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session as DbSession
 
@@ -22,7 +24,6 @@ from ..models import (
 )
 from ..security import CurrentUser, require_platform_admin
 
-
 router = APIRouter(prefix="/api/reports", tags=["admin", "reports"])
 
 
@@ -32,7 +33,7 @@ def _since_dt(since: str | None, default_days: int = 30) -> datetime:
             return datetime.fromisoformat(since)
         except ValueError as exc:
             raise HTTPException(400, f"Invalid `since` ({since!r}); must be ISO-8601") from exc
-    return datetime.now(timezone.utc) - timedelta(days=default_days)
+    return datetime.now(UTC) - timedelta(days=default_days)
 
 
 # ────────────────────────── searches list ──────────────────────────
@@ -66,7 +67,8 @@ def list_searches(
     stmt = stmt.order_by(desc(JourneySearch.ts)).offset(page * size).limit(size)
     rows = db.execute(stmt).scalars().all()
     return {
-        "page": page, "size": size,
+        "page": page,
+        "size": size,
         "items": [_search_to_dict(s) for s in rows],
     }
 
@@ -78,7 +80,7 @@ def _search_to_dict(s: JourneySearch) -> dict[str, Any]:
         "user_id": str(s.user_id) if s.user_id else None,
         "endpoint": s.endpoint,
         "from": {"lat": s.origin_lat, "lon": s.origin_lon, "label": s.origin_label},
-        "to":   {"lat": s.dest_lat,   "lon": s.dest_lon,   "label": s.dest_label},
+        "to": {"lat": s.dest_lat, "lon": s.dest_lon, "label": s.dest_label},
         "requested": {"kind": s.requested_time_kind, "time": s.requested_time.isoformat()},
         "modes": s.modes,
         "status": s.status,
@@ -101,8 +103,8 @@ def od_pairs(
     cutoff = _since_dt(since)
     olat = func.round(JourneySearch.origin_lat.cast(_NUMERIC), precision)
     olon = func.round(JourneySearch.origin_lon.cast(_NUMERIC), precision)
-    dlat = func.round(JourneySearch.dest_lat.cast(_NUMERIC),   precision)
-    dlon = func.round(JourneySearch.dest_lon.cast(_NUMERIC),   precision)
+    dlat = func.round(JourneySearch.dest_lat.cast(_NUMERIC), precision)
+    dlon = func.round(JourneySearch.dest_lon.cast(_NUMERIC), precision)
 
     stmt = (
         select(
@@ -121,7 +123,7 @@ def od_pairs(
     return [
         {
             "origin": {"lat": float(r.olat), "lon": float(r.olon)},
-            "dest":   {"lat": float(r.dlat), "lon": float(r.dlon)},
+            "dest": {"lat": float(r.dlat), "lon": float(r.dlon)},
             "count": r.count,
             "avg_response_ms": float(r.avg_response_ms) if r.avg_response_ms else None,
         }
@@ -163,9 +165,15 @@ def volume_per_session(
         select(
             JourneySearchExecution.session_id,
             func.count().label("count"),
-            func.percentile_cont(0.50).within_group(JourneySearchExecution.response_ms).label("p50"),
-            func.percentile_cont(0.95).within_group(JourneySearchExecution.response_ms).label("p95"),
-            func.percentile_cont(0.99).within_group(JourneySearchExecution.response_ms).label("p99"),
+            func.percentile_cont(0.50)
+            .within_group(JourneySearchExecution.response_ms)
+            .label("p50"),
+            func.percentile_cont(0.95)
+            .within_group(JourneySearchExecution.response_ms)
+            .label("p95"),
+            func.percentile_cont(0.99)
+            .within_group(JourneySearchExecution.response_ms)
+            .label("p99"),
             func.sum((JourneySearchExecution.status != "ok").cast(_INTEGER)).label("error_count"),
         )
         .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
@@ -176,14 +184,16 @@ def volume_per_session(
     out = []
     for r in db.execute(stmt).all():
         total = r.count or 0
-        out.append({
-            "session_id": r.session_id,
-            "count": total,
-            "p50_ms": float(r.p50) if r.p50 is not None else None,
-            "p95_ms": float(r.p95) if r.p95 is not None else None,
-            "p99_ms": float(r.p99) if r.p99 is not None else None,
-            "error_rate": (float(r.error_count) / total) if total else 0.0,
-        })
+        out.append(
+            {
+                "session_id": r.session_id,
+                "count": total,
+                "p50_ms": float(r.p50) if r.p50 is not None else None,
+                "p95_ms": float(r.p95) if r.p95 is not None else None,
+                "p99_ms": float(r.p99) if r.p99 is not None else None,
+                "error_rate": (float(r.error_count) / total) if total else 0.0,
+            }
+        )
     return out
 
 
@@ -215,7 +225,10 @@ def trip_source_distribution(
         key = "+".join(sorted(sessions or []))
         buckets[key] = buckets.get(key, 0) + 1
     total = sum(buckets.values()) or 1
-    return [{"sessions": k, "count": v, "ratio": v / total} for k, v in sorted(buckets.items(), key=lambda x: -x[1])]
+    return [
+        {"sessions": k, "count": v, "ratio": v / total}
+        for k, v in sorted(buckets.items(), key=lambda x: -x[1])
+    ]
 
 
 # ────────────────────────── version-diff ──────────────────────────
@@ -244,7 +257,8 @@ def version_diff(
     sigs_a = _trip_signatures_for_snapshot(db, from_snapshot)
     sigs_b = _trip_signatures_for_snapshot(db, to_snapshot)
     return {
-        "from_snapshot": from_snapshot, "to_snapshot": to_snapshot,
+        "from_snapshot": from_snapshot,
+        "to_snapshot": to_snapshot,
         "main_version": sa.timetable_main_version,
         "new_in_b": sorted(sigs_b - sigs_a),
         "lost_in_b": sorted(sigs_a - sigs_b),
@@ -305,27 +319,59 @@ def searches_csv(
     since: str | None = Query(None),
 ) -> StreamingResponse:
     cutoff = _since_dt(since)
-    rows = db.execute(
-        select(JourneySearch).where(JourneySearch.ts >= cutoff).order_by(desc(JourneySearch.ts))
-    ).scalars().all()
+    rows = (
+        db.execute(
+            select(JourneySearch).where(JourneySearch.ts >= cutoff).order_by(desc(JourneySearch.ts))
+        )
+        .scalars()
+        .all()
+    )
 
     def gen():  # type: ignore[no-untyped-def]
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["id","ts","user_id","endpoint","from_lat","from_lon","to_lat","to_lon",
-                    "modes","status","total_response_ms","total_trips_unique"])
-        yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        w.writerow(
+            [
+                "id",
+                "ts",
+                "user_id",
+                "endpoint",
+                "from_lat",
+                "from_lon",
+                "to_lat",
+                "to_lon",
+                "modes",
+                "status",
+                "total_response_ms",
+                "total_trips_unique",
+            ]
+        )
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
         for s in rows:
-            w.writerow([str(s.id), s.ts.isoformat(), str(s.user_id) if s.user_id else "",
-                        s.endpoint, s.origin_lat, s.origin_lon, s.dest_lat, s.dest_lon,
-                        s.modes, s.status, s.total_response_ms or "", s.total_trips_unique or ""])
-            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+            w.writerow(
+                [
+                    str(s.id),
+                    s.ts.isoformat(),
+                    str(s.user_id) if s.user_id else "",
+                    s.endpoint,
+                    s.origin_lat,
+                    s.origin_lon,
+                    s.dest_lat,
+                    s.dest_lon,
+                    s.modes,
+                    s.status,
+                    s.total_response_ms or "",
+                    s.total_trips_unique or "",
+                ]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
 
     return StreamingResponse(
-        gen(), media_type="text/csv",
+        gen(),
+        media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="viator-searches.csv"'},
     )
-
-
-# Imported lazily to avoid pulling pg-specific types when models module loads.
-from sqlalchemy import Integer as _INTEGER, Numeric as _NUMERIC  # noqa: E402

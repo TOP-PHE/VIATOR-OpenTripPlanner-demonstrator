@@ -21,12 +21,9 @@ from sqlalchemy.orm import Session as DbSession
 
 from ..models import MasterStation, MasterStationPendingDrift
 
-
 log = logging.getLogger(__name__)
 
-TRAINLINE_CSV_URL = (
-    "https://raw.githubusercontent.com/trainline-eu/stations/master/stations.csv"
-)
+TRAINLINE_CSV_URL = "https://raw.githubusercontent.com/trainline-eu/stations/master/stations.csv"
 
 
 # Trainline column → MasterStation attribute.
@@ -94,10 +91,7 @@ def upsert_with_drift_protection(db: DbSession, parsed: list[dict[str, Any]]) ->
     """
     counts = {"added": 0, "updated": 0, "skipped_manual": 0, "pending_drift": 0}
 
-    existing_by_uic = {
-        row.uic: row
-        for row in db.execute(select(MasterStation)).scalars().all()
-    }
+    existing_by_uic = {row.uic: row for row in db.execute(select(MasterStation)).scalars().all()}
 
     for row in parsed:
         uic = row["uic"]
@@ -113,7 +107,9 @@ def upsert_with_drift_protection(db: DbSession, parsed: list[dict[str, Any]]) ->
                 if drift is None:
                     db.add(
                         MasterStationPendingDrift(
-                            uic=uic, trainline_snapshot=row, fields_differing=differing,
+                            uic=uic,
+                            trainline_snapshot=row,
+                            fields_differing=differing,
                         )
                     )
                 else:

@@ -13,7 +13,7 @@ rebranded with the VIATOR palette.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from typing import Any
 
@@ -22,7 +22,6 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .. import config_service
 from ..db import SessionLocal
-
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +80,7 @@ async def send_test_email(*, to_email: str) -> None:
     Unlike the magic-link helpers, this does NOT silently no-op when SMTP is
     unconfigured — it raises so the admin endpoint can surface the failure.
     """
-    sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    sent_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     html = _env.get_template("smtp_test.html").render(to=to_email, sent_at=sent_at)
     text = _env.get_template("smtp_test.txt").render(to=to_email, sent_at=sent_at)
 
@@ -125,7 +124,9 @@ async def _deliver(
         # if not present (e.g. SMTP test), just log the subject.
         log.warning(
             "[EMAIL DISABLED — SMTP_HOST not set] purpose=%s to=%s subject=%r",
-            purpose, to, subject,
+            purpose,
+            to,
+            subject,
         )
         log.info("[EMAIL BODY for %s — %s]\n%s", purpose, to, text)
         return
@@ -165,14 +166,18 @@ async def _send_via_smtp(
     except aiosmtplib.SMTPException as exc:
         log.error(
             "SMTP send failed: host=%s port=%s code=%s msg=%s",
-            cfg["SMTP_HOST"], cfg["SMTP_PORT"],
-            getattr(exc, "code", None), exc,
+            cfg["SMTP_HOST"],
+            cfg["SMTP_PORT"],
+            getattr(exc, "code", None),
+            exc,
         )
         raise EmailSendError(str(exc)) from exc
     except (ConnectionError, OSError, TimeoutError) as exc:
         log.error(
             "SMTP transport failed: host=%s port=%s err=%s",
-            cfg["SMTP_HOST"], cfg["SMTP_PORT"], exc,
+            cfg["SMTP_HOST"],
+            cfg["SMTP_PORT"],
+            exc,
         )
         raise EmailSendError(str(exc)) from exc
 
@@ -182,9 +187,9 @@ async def _send_via_smtp(
 def _tls_modes(secure: str) -> tuple[bool, bool]:
     """Map the SMTP_SECURE config string to aiosmtplib (use_tls, start_tls).
 
-      'none'     → no encryption
-      'starttls' → upgrade after EHLO (default for port 587)
-      'tls'      → SMTPS, implicit TLS from connection start (port 465)
+    'none'     → no encryption
+    'starttls' → upgrade after EHLO (default for port 587)
+    'tls'      → SMTPS, implicit TLS from connection start (port 465)
     """
     if secure == "tls":
         return True, False
