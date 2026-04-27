@@ -1,0 +1,24 @@
+{
+  "server": {
+    "apiProcessingTimeout": "10s"
+  },
+  "routingDefaults": {
+    "numItineraries": 5,
+    "transferSlack": "2m",
+    "walkSpeed": 1.3
+  },
+  "updaters": [
+    {
+      "type": "real-time-alerts",
+      "feedId": "SNCF",
+      "url": "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-alerts",
+      "frequency": "1m"
+    },
+    {
+      "type": "stop-time-updater",
+      "feedId": "SNCF",
+      "url": "https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-trip-updates",
+      "frequency": "1m"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "osmDefaults": {
+    "osmTagMapping": "default"
+  },
+  "transitFeeds": [
+    {
+      "type": "gtfs",
+      "feedId": "SNCF",
+      "source": "Export_OpenData_SNCF_GTFS_NewTripId.zip"
+    }
+  ],
+  "transitServiceStart": "-P1M",
+  "transitServiceEnd": "P5M",
+  "subwayAccessTime": 2.0,
+  "streetGraph": "streetGraph.obj",
+  "graph": "graph.obj"
+}

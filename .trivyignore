@@ -1,0 +1,13 @@
+# VIATOR — Trivy ignore list
+#
+# Format: one CVE ID per line. Comments start with '#'.
+# Add an entry only with a written justification, and re-evaluate
+# whenever the base image is bumped.
+#
+# DO NOT blanket-ignore by severity. The CI workflow already passes
+# `--ignore-unfixed` (suppress findings with no upstream fix yet) and
+# `--severity CRITICAL,HIGH` (ignore noise below HIGH). Anything fixable
+# at HIGH or CRITICAL must be addressed, not silenced here.
+#
+# ── Justified ignores ────────────────────────────────────────────────
+# (none yet)

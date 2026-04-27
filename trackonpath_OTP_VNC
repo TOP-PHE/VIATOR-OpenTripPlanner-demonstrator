@@ -1,0 +1,4 @@
+TigerVNC Configuration file Version 1.0
+
+ServerName=178.238.238.146
+SecurityTypes=None,VncAuth,RA2ne,RA2ne_256,Plain,DH,MSLogonII,TLSNone,TLSVnc,TLSPlain,X509None,X509Vnc,X509Plain,RA2,RA2_256

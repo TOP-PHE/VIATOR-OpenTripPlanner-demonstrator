@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="640" height="160" role="img" aria-label="VIATOR — UIC MERITS journey planner">
+  <title>VIATOR horizontal lockup</title>
+
+  <!-- Icon, scaled to 64x64 inside the 80-tall canvas, vertically centred -->
+  <g transform="translate(8 8)">
+    <g fill="none" stroke="#1F3B66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="8"  y1="8"  x2="32" y2="56"/>
+      <line x1="56" y1="8"  x2="32" y2="56"/>
+      <line x1="14" y1="20" x2="50" y2="20"/>
+      <line x1="20" y1="32" x2="44" y2="32"/>
+      <line x1="26" y1="44" x2="38" y2="44"/>
+    </g>
+  </g>
+
+  <!-- Wordmark: geometric sans, generous tracking, all-caps -->
+  <text x="92" y="48"
+        font-family="Helvetica Neue, Arial, sans-serif"
+        font-weight="700"
+        font-size="34"
+        letter-spacing="6"
+        fill="#1F3B66">VIATOR</text>
+
+  <!-- Tagline -->
+  <text x="92" y="68"
+        font-family="Helvetica Neue, Arial, sans-serif"
+        font-weight="400"
+        font-size="10"
+        letter-spacing="2.5"
+        fill="#1F3B66"
+        opacity="0.75">UIC · MERITS JOURNEY PLANNER</text>
+</svg>

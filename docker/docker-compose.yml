@@ -1,0 +1,96 @@
+name: otp-merits
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # - "443:443"   # enable once Let's Encrypt is wired
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - web
+      - otp
+
+  web:
+    build:
+      context: ..               # repo root (so app/ and requirements.txt are visible)
+      dockerfile: docker/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      INBOX_DIR: /data/inbox
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    volumes:
+      - inbox:/data/inbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/web/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      INBOX_DIR: /data/inbox
+      GRAPH_DIR: /data/graphs
+      OTP_BUILD_HEAP: ${OTP_BUILD_HEAP:-12g}
+      DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-1800}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - inbox:/data/inbox
+      - graphs:/data/graphs
+      - /var/run/docker.sock:/var/run/docker.sock   # so worker can launch the otp-build container
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  otp:
+    build: ./otp
+    restart: unless-stopped
+    environment:
+      OTP_MODE: serve
+      OTP_GRAPH_DIR: /var/otp/graph
+      OTP_HEAP: ${OTP_SERVE_HEAP:-16g}
+    volumes:
+      - graphs:/var/otp/graph:ro
+
+  # one-shot build container; the worker runs it via the docker socket
+  otp-build:
+    build: ./otp
+    profiles: ["build-only"]   # never started by `up`; only via `docker compose run`
+    environment:
+      OTP_MODE: build
+      OTP_INBOX_DIR: /var/otp/inbox
+      OTP_GRAPH_DIR: /var/otp/graph
+      OTP_HEAP: ${OTP_BUILD_HEAP:-12g}
+    volumes:
+      - inbox:/var/otp/inbox:ro
+      - graphs:/var/otp/graph
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  inbox:
+  graphs:
+  pgdata:

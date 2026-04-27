@@ -1,0 +1,96 @@
+# VIATOR — Python tooling configuration
+# This file holds config for ruff, black, mypy, pytest, coverage.
+# It is intentionally NOT a [project] section: VIATOR is a deployed application,
+# not a published Python package, so we avoid the setuptools/poetry build machinery.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["docker/otp", "**/migrations/versions/*"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",     # pycodestyle errors + warnings
+    "F",          # pyflakes
+    "I",          # isort
+    "B",          # bugbear
+    "C4",         # comprehensions
+    "UP",         # pyupgrade
+    "SIM",        # flake8-simplify
+    "RET",        # flake8-return
+    "PIE",        # flake8-pie
+    "S",          # flake8-bandit (security)
+    "PTH",        # use pathlib
+    "RUF",        # ruff-specific
+]
+ignore = [
+    "E501",       # line too long — black handles formatting
+    "S101",       # assert in tests is fine
+    "S104",       # FastAPI bind on 0.0.0.0 is intentional in containerised app
+    "B008",       # FastAPI Depends() in defaults is the framework idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106", "S311"]   # test fixtures may use fake passwords / non-crypto random
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+extend-exclude = '''
+(
+    /docker/otp
+  | /migrations/versions
+)
+'''
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_decorators = false       # FastAPI route decorators are dynamically typed
+plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+exclude = [
+    "tests/",                              # tests deliberately use fixtures with looser typing
+    "docker/",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = [
+    "-ra",                                 # show short summary for non-passing
+    "--strict-markers",
+    "--strict-config",
+    "--cov=app",
+    "--cov-report=term-missing",
+    "--cov-report=xml",                    # for SonarCloud / Codecov
+]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests requiring postgres + stub OTP",
+    "slow: long-running tests (skip in PR CI by default)",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    "app/templates/*",
+    "*/migrations/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

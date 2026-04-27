@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VIATOR — feed ingestion</title>
+
+  <!-- Inline SVG favicon (the VIATOR icon) — no extra HTTP request needed -->
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231F3B66' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
+
+  <style>
+    :root {
+      --uic-blue:   #1F3B66;
+      --rail-steel: #5B6B82;
+      --amber:      #E89B2C;
+      --paper:      #F5F7FB;
+      --sleeper:    #D4D9E2;
+    }
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #1c2330; }
+    h1, h2 { color: var(--uic-blue); }
+
+    /* ───── Header lockup ───── */
+    .lockup { display: flex; align-items: center; gap: 1rem; padding: 1rem 0 0.5rem; border-bottom: 1px solid var(--sleeper); margin-bottom: 1.5rem; }
+    .lockup .icon { width: 56px; height: 56px; flex: 0 0 56px; }
+    .lockup .text { line-height: 1.1; }
+    .lockup .wordmark { font-size: 1.9rem; font-weight: 700; letter-spacing: 0.35rem; color: var(--uic-blue); }
+    .lockup .tagline { font-size: 0.7rem; letter-spacing: 0.18rem; text-transform: uppercase; color: var(--rail-steel); margin-top: 0.2rem; }
+
+    form { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; }
+    label { display: block; margin: 0.6rem 0 0.2rem; font-weight: 600; }
+    input[type=text], select, input[type=file] { width: 100%; padding: 0.4rem; box-sizing: border-box; }
+    button { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--uic-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #163055; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--sleeper); }
+    th { background: #eef2f8; }
+
+    .ok      { color: #1a7e3c; font-weight: 600; }
+    .fail    { color: #b30021; font-weight: 600; }
+    .pending { color: var(--amber); font-weight: 600; }
+
+    footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--sleeper); font-size: 0.75rem; color: var(--rail-steel); }
+  </style>
+</head>
+<body>
+
+  <!-- ───── Header lockup: inline SVG icon + wordmark + tagline ───── -->
+  <header class="lockup">
+    <svg class="icon" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VIATOR">
+      <g fill="none" stroke="#1F3B66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="8"  y1="8"  x2="32" y2="56"/>
+        <line x1="56" y1="8"  x2="32" y2="56"/>
+        <line x1="14" y1="20" x2="50" y2="20"/>
+        <line x1="20" y1="32" x2="44" y2="32"/>
+        <line x1="26" y1="44" x2="38" y2="44"/>
+      </g>
+    </svg>
+    <div class="text">
+      <div class="wordmark">VIATOR</div>
+      <div class="tagline">UIC · MERITS Journey Planner — Feed ingestion</div>
+    </div>
+  </header>
+
+  <p>Logged in as <b>{{ user }}</b>. Upload a feed; the server will detect its format,
+     verify it matches your declaration, route it to the right place, and (for routing
+     data) queue an OTP rebuild.</p>
+
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <label for="declared_standard">Standard of the file</label>
+    <select id="declared_standard" name="declared_standard" required>
+      {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
+    </select>
+
+    <label for="version_label">Version label (free text)</label>
+    <input type="text" id="version_label" name="version_label" placeholder="e.g. 2026-04-26 SNCF daily" />
+
+    <label for="file">File (.zip, .csv, .pbf)</label>
+    <input type="file" id="file" name="file" required />
+
+    <button type="submit">Upload &amp; validate</button>
+  </form>
+
+  <h2>Recent uploads</h2>
+  <table>
+    <tr><th>When</th><th>By</th><th>Filename</th><th>Declared</th><th>Detected</th><th>Size</th><th>Triggered build</th></tr>
+    {% for u in uploads %}
+    <tr>
+      <td>{{ u.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td>{{ u.user }}</td>
+      <td>{{ u.filename }}</td>
+      <td>{{ u.declared_standard }}</td>
+      <td>{{ u.detected_kind }}</td>
+      <td>{{ "%.1f MB" % (u.size_bytes / 1024 / 1024) }}</td>
+      <td>{% if u.triggered_rebuild %}<span class="ok">yes</span>{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Recent rebuild jobs</h2>
+  <table>
+    <tr><th>Queued</th><th>Started</th><th>Finished</th><th>Status</th><th>Graph</th></tr>
+    {% for j in jobs %}
+    <tr>
+      <td>{{ j.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td>{{ j.started_at.strftime("%Y-%m-%d %H:%M") if j.started_at else "—" }}</td>
+      <td>{{ j.finished_at.strftime("%Y-%m-%d %H:%M") if j.finished_at else "—" }}</td>
+      <td class="{{ j.status }}">{{ j.status }}</td>
+      <td>{{ j.graph_path or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <footer>
+    VIATOR — TrackOnPath · OpenTripPlanner core · Feed sources: SNCF (Phase 1), MERITS (mid-term)
+  </footer>
+</body>
+</html>

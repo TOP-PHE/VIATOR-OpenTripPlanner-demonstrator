@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.so
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local secrets and overrides
+.env
+.env.local
+docker/.env
+*.pem
+*.key
+
+# Local volumes / runtime data
+/data/
+/var/
+
+# OTP graph artifacts (regenerable)
+graph.obj
+streetGraph.obj
+
+# JS (for the future journey-ui)
+node_modules/
+journey-ui/dist/
+journey-ui/coverage/
+
+# Generated configs
+docker/docker-compose.sessions.yml
+docker/nginx/sessions.conf
+
+# OneDrive cruft (in case the repo lives in a OneDrive folder)
+*.lnk
