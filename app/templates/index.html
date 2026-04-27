@@ -92,13 +92,12 @@
 
   <h2>Recent uploads</h2>
   <table>
-    <tr><th>When</th><th>By</th><th>Filename</th><th>Declared</th><th>Detected</th><th>Size</th><th>Triggered build</th></tr>
+    <tr><th>When</th><th>Filename</th><th>Declared</th><th>Detected</th><th>Size</th><th>Triggered build</th></tr>
     {% for u in uploads %}
     <tr>
       <td>{{ u.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
-      <td>{{ u.user }}</td>
       <td>{{ u.filename }}</td>
-      <td>{{ u.declared_standard }}</td>
+      <td>{{ u.declared_kind }}</td>
       <td>{{ u.detected_kind }}</td>
       <td>{{ "%.1f MB" % (u.size_bytes / 1024 / 1024) }}</td>
       <td>{% if u.triggered_rebuild %}<span class="ok">yes</span>{% else %}—{% endif %}</td>

@@ -1,0 +1,63 @@
+{% extends "_base.html" %}
+{% block title %}Login — VIATOR{% endblock %}
+
+{% block content %}
+<h1>Sign in</h1>
+<p style="color: var(--rail-steel)">Use the email and password you registered with.</p>
+
+<form id="login-form" class="card" autocomplete="on">
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required autocomplete="username" />
+
+  <label for="password">Password</label>
+  <input type="password" id="password" name="password" required minlength="12" autocomplete="current-password" />
+
+  <button type="submit" id="submit-btn">Sign in</button>
+
+  <div id="msg" class="msg"></div>
+  <p style="font-size: 0.85rem; margin-top: 1.5rem; color: var(--rail-steel)">
+    No account yet? <a href="/register">Register</a>.<br>
+    Forgot password? <a href="/reset">Reset it</a>.
+  </p>
+</form>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const form = document.getElementById('login-form');
+const msg = document.getElementById('msg');
+const btn = document.getElementById('submit-btn');
+
+function show(kind, text) {
+  msg.className = 'msg show ' + kind;
+  msg.textContent = text;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  msg.className = 'msg';
+  btn.disabled = true; btn.textContent = 'Signing in…';
+  try {
+    const data = Object.fromEntries(new FormData(form));
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      show('error', body.detail || `Sign-in failed (${r.status})`);
+      return;
+    }
+    const body = await r.json();
+    // Land on the most useful page for this role.
+    const dest = body.role === 'platform_admin' ? '/admin/users' : '/';
+    window.location.href = dest;
+  } catch (err) {
+    show('error', String(err));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Sign in';
+  }
+});
+</script>
+{% endblock %}

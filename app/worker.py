@@ -1,8 +1,9 @@
-"""Background worker: polls rebuild_jobs, debounces, and runs OTP build.
+"""Background worker: polls per-session rebuild_jobs, debounces, runs OTP build.
 
-Runs OTP build by invoking `docker compose run --rm otp-build` over the host
-docker socket. This keeps OTP in its own image and lets the worker stay slim.
+Per session, at most one rebuild runs at a time. The MAX_CONCURRENT_REBUILDS
+config knob caps total simultaneous rebuilds across all sessions.
 """
+
 from __future__ import annotations
 
 import logging
@@ -14,7 +15,8 @@ from pathlib import Path
 
 from sqlalchemy import asc
 
-from .db import RebuildJob, SessionLocal, init_db
+from .db import SessionLocal
+from .models import RebuildJob
 from .settings import settings
 
 
@@ -23,7 +25,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 def main() -> None:
-    init_db()
     log.info("worker starting; debounce=%ss", settings.debounce_seconds)
     while True:
         try:
@@ -44,7 +45,6 @@ def tick() -> None:
         if job is None:
             return
 
-        # Debounce: wait for the configured quiet period after the job was queued.
         deadline = job.created_at + timedelta(seconds=settings.debounce_seconds)
         if datetime.utcnow() < deadline:
             return
@@ -53,12 +53,15 @@ def tick() -> None:
         job.started_at = datetime.utcnow()
         db.commit()
         job_id = job.id
+        sid = job.session_id
 
-    log.info("running rebuild job %s", job_id)
-    output, success, graph_path = run_build()
+    log.info("running rebuild job %s (session=%s)", job_id, sid)
+    output, success, graph_path = run_build(session_id=sid)
 
     with SessionLocal() as db:
         job = db.get(RebuildJob, job_id)
+        if job is None:  # pragma: no cover  defensive
+            return
         job.finished_at = datetime.utcnow()
         job.status = "done" if success else "failed"
         job.log = (job.log or "") + output[-32_000:]
@@ -66,16 +69,18 @@ def tick() -> None:
         db.commit()
 
 
-def run_build() -> tuple[str, bool, str]:
+def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     """Invoke OTP build via the docker socket. Returns (log, success, graph_path)."""
+    sid = session_id or "_phase1"
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    graph_target = settings.graph_dir / timestamp
+    graph_target = Path(str(settings.graph_dir)) / sid / timestamp
     graph_target.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         "docker", "compose", "-p", "otp-merits",
         "run", "--rm",
         "-e", f"OTP_HEAP={settings.otp_build_heap}",
+        "-e", f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "otp-build",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -84,27 +89,28 @@ def run_build() -> tuple[str, bool, str]:
     if proc.returncode != 0:
         return output, False, ""
 
-    # The build container writes graph.obj to /var/otp/graph (the `graphs` volume).
-    # Promote it to a timestamped subdir + update the `current` symlink.
-    built = settings.graph_dir / "graph.obj"
+    built = Path(str(settings.graph_dir)) / "graph.obj"
     if not built.exists():
         return output + "\nERROR: graph.obj not found after build", False, ""
 
     shutil.move(str(built), str(graph_target / "graph.obj"))
 
-    current = settings.graph_dir / "current"
+    current = Path(str(settings.graph_dir)) / sid / "current"
     if current.exists() or current.is_symlink():
         current.unlink()
     current.symlink_to(graph_target, target_is_directory=True)
 
-    _prune_old_graphs(keep=3)
+    _prune_old_graphs(sid, keep=3)
 
     return output, True, str(graph_target)
 
 
-def _prune_old_graphs(keep: int) -> None:
+def _prune_old_graphs(sid: str, keep: int) -> None:
+    base = Path(str(settings.graph_dir)) / sid
+    if not base.is_dir():
+        return
     snapshots = sorted(
-        (p for p in settings.graph_dir.iterdir() if p.is_dir() and p.name != "current"),
+        (p for p in base.iterdir() if p.is_dir() and p.name != "current"),
         reverse=True,
     )
     for old in snapshots[keep:]:

@@ -1,0 +1,81 @@
+{% extends "_base.html" %}
+{% block title %}Sessions — VIATOR admin{% endblock %}
+
+{% block content %}
+<h1>Sessions</h1>
+<p style="color: var(--rail-steel); max-width: 700px">
+  Each session is an isolated OTP instance with its own inbox, graph, and category.
+  Toggle <strong>fanout</strong> to include a serving session in the default journey search.
+</p>
+
+<details class="card" style="margin-bottom: 1rem">
+  <summary style="cursor: pointer; font-weight: 600">Create a new session</summary>
+  <form id="create-form" style="margin-top: 1rem">
+    <label>ID (slug, e.g. <code>nap-fr-2026-w14</code>)</label>
+    <input name="id" required pattern="[a-z][a-z0-9-]+">
+    <label>Name</label>
+    <input name="name" required>
+    <label>Category</label>
+    <select name="category">
+      <option>NAP</option><option>MERITS</option><option>MANUAL</option><option>EXPERIMENTAL</option>
+    </select>
+    <label><input type="checkbox" name="include_in_fanout"> Include in fanout immediately</label>
+    <button type="submit">Create</button>
+    <div id="create-msg" class="msg"></div>
+  </form>
+</details>
+
+<table id="sessions-table">
+  <thead>
+    <tr><th>ID</th><th>Name</th><th>Category</th><th>State</th><th>Fanout</th><th>Created</th><th></th></tr>
+  </thead>
+  <tbody>
+  {% for s in sessions %}
+    <tr data-sid="{{ s.id }}">
+      <td><code>{{ s.id }}</code></td>
+      <td>{{ s.name }}</td>
+      <td>{{ s.category }}</td>
+      <td><span class="msg show" style="display:inline-block; padding:2px 8px; font-size:0.75rem">{{ s.state }}</span></td>
+      <td style="text-align: center">
+        <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
+      </td>
+      <td style="font-size: 0.85rem; color: var(--rail-steel)">{{ s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '—' }}</td>
+      <td><button type="button" class="secondary" data-action="archive" {% if s.state == 'archived' %}disabled{% endif %}>Archive</button></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const toast = document.getElementById('toast');
+function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',3500); }
+
+document.getElementById('create-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = { id: fd.get('id'), name: fd.get('name'), category: fd.get('category'),
+                 include_in_fanout: fd.get('include_in_fanout') === 'on', config: {} };
+  const r = await fetch('/api/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { const j = await r.json().catch(()=>({})); showToast('error', j.detail || `Failed (${r.status})`); return; }
+  window.location.reload();
+});
+
+document.querySelectorAll('tr[data-sid]').forEach(row => {
+  const sid = row.dataset.sid;
+  row.querySelector('input[data-action="fanout"]')?.addEventListener('change', async (e) => {
+    const r = await fetch(`/api/sessions/${sid}`, {method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({include_in_fanout: e.target.checked})});
+    showToast(r.ok ? 'success' : 'error', r.ok ? `Fanout updated for ${sid}` : `Failed (${r.status})`);
+  });
+  row.querySelector('button[data-action="archive"]')?.addEventListener('click', async () => {
+    if (!confirm(`Archive session ${sid}? Its inbox and graphs are preserved but it stops serving.`)) return;
+    const r = await fetch(`/api/sessions/${sid}/archive`, {method:'POST'});
+    if (r.ok) window.location.reload(); else showToast('error', `Failed (${r.status})`);
+  });
+});
+</script>
+{% endblock %}

@@ -1,0 +1,132 @@
+{% extends "_base.html" %}
+{% block title %}Configuration — VIATOR admin{% endblock %}
+
+{% block extra_styles %}
+.section { background: var(--paper); padding: 1.2rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; max-width: 720px; }
+.section h2 { margin-top: 0; font-size: 1.05rem; }
+.field { display: grid; grid-template-columns: 220px 1fr; gap: 0.6rem 1rem; align-items: center; margin: 0.5rem 0; }
+.field input, .field select { width: 100%; }
+.help { color: var(--rail-steel); font-size: 0.8rem; }
+{% endblock %}
+
+{% block content %}
+<h1>Platform configuration</h1>
+<p style="color: var(--rail-steel); max-width: 720px">
+  Runtime-editable settings (SMTP, concurrency, registration, retention).
+  Changes take effect immediately — concurrency limits hot-swap; SMTP changes
+  apply to the next email; cache TTL is 30 s for cross-process pickup.
+</p>
+
+<div id="cfg-container">Loading…</div>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const SECTIONS = [
+  { title: 'SMTP', keys: ['SMTP_HOST','SMTP_PORT','SMTP_SECURE','SMTP_USER','SMTP_PASS','SMTP_FROM'],
+    extra: '<button type="button" id="smtp-test-btn" class="secondary">Send test email…</button>' },
+  { title: 'Concurrency / server protection', keys: ['MAX_CONCURRENT_JOURNEYS','MAX_CONCURRENT_REBUILDS','MAX_CONCURRENT_UPLOADS','JOURNEY_TIMEOUT_MS'] },
+  { title: 'Fanout', keys: ['FANOUT_TIMEOUT_MS','FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE'] },
+  { title: 'Master data refresh', keys: ['MASTER_STATIONS_REFRESH_DAYS','MASTER_CARRIERS_REFRESH_DAYS'] },
+  { title: 'Replay safety',  keys: ['REPLAY_MAX_BATCH_SIZE','REPLAY_MAX_RPS'] },
+  { title: 'Registration',   keys: ['REGISTRATION_OPEN','REGISTRATION_DEFAULT_ROLE'] },
+  { title: 'Retention',      keys: ['AUDIT_RETENTION_DAYS','JOURNEY_SEARCH_RETENTION_DAYS','JOURNEY_TRIPS_RETENTION_DAYS','JOURNEY_RAW_RESPONSE_RETENTION_DAYS'] },
+];
+
+const SECRETS = new Set(['SMTP_PASS']);
+const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN']);
+const CHOICES = { SMTP_SECURE: ['none','starttls','tls'], REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'] };
+
+const toast = document.getElementById('toast');
+function showToast(kind, text) {
+  toast.className = 'msg show ' + kind;
+  toast.textContent = text;
+  setTimeout(() => { toast.className = 'msg'; }, 3500);
+}
+
+function field(key, value) {
+  let input;
+  if (BOOLS.has(key)) {
+    input = `<input type="checkbox" name="${key}" ${value ? 'checked' : ''}>`;
+  } else if (CHOICES[key]) {
+    input = `<select name="${key}">${CHOICES[key].map(c => `<option ${c===value?'selected':''}>${c}</option>`).join('')}</select>`;
+  } else if (SECRETS.has(key)) {
+    input = `<input type="password" name="${key}" value="${value === '********' ? '********' : ''}" placeholder="${value === '********' ? '(set — leave masked to keep)' : '(unset)'}">`;
+  } else if (typeof value === 'number') {
+    input = `<input type="number" name="${key}" value="${value}">`;
+  } else {
+    input = `<input type="text" name="${key}" value="${value ?? ''}">`;
+  }
+  return `<div class="field"><label>${key}</label>${input}</div>`;
+}
+
+async function loadAndRender() {
+  const r = await fetch('/api/admin/config');
+  if (!r.ok) {
+    document.getElementById('cfg-container').textContent = 'Failed to load config: ' + r.status;
+    return;
+  }
+  const cfg = await r.json();
+  const container = document.getElementById('cfg-container');
+  container.innerHTML = '';
+  for (const sec of SECTIONS) {
+    const fields = sec.keys.map(k => field(k, cfg[k])).join('');
+    const div = document.createElement('div');
+    div.className = 'section';
+    div.innerHTML = `<h2>${sec.title}</h2><form data-section="${sec.title}">${fields}<button type="submit">Save</button> ${sec.extra || ''}</form>`;
+    container.appendChild(div);
+  }
+  container.querySelectorAll('form').forEach(form => form.addEventListener('submit', save));
+  document.getElementById('smtp-test-btn')?.addEventListener('click', sendTest);
+}
+
+async function save(e) {
+  e.preventDefault();
+  const form = e.target;
+  const payload = {};
+  form.querySelectorAll('input, select').forEach(el => {
+    if (el.type === 'checkbox') payload[el.name] = el.checked;
+    else if (el.type === 'password' && el.value === '********') return; // skip masked sentinel
+    else if (el.type === 'number') payload[el.name] = parseInt(el.value, 10);
+    else payload[el.name] = el.value;
+  });
+  try {
+    const r = await fetch('/api/admin/config', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      const errs = body.detail?.errors;
+      showToast('error', errs ? Object.entries(errs).map(([k,v]) => `${k}: ${v}`).join(' · ') : `Failed (${r.status})`);
+      return;
+    }
+    showToast('success', `${form.dataset.section} saved`);
+    await loadAndRender();
+  } catch (err) {
+    showToast('error', String(err));
+  }
+}
+
+async function sendTest() {
+  const to = prompt('Send a test email to:');
+  if (!to) return;
+  try {
+    const r = await fetch('/api/admin/config/smtp/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({to}),
+    });
+    const body = await r.json();
+    showToast(body.ok ? 'success' : 'error', body.ok ? `Sent to ${to}` : body.error);
+  } catch (err) {
+    showToast('error', String(err));
+  }
+}
+
+loadAndRender();
+</script>
+{% endblock %}

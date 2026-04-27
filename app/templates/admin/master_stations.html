@@ -1,0 +1,108 @@
+{% extends "_base.html" %}
+{% block title %}Master stations — VIATOR admin{% endblock %}
+
+{% block content %}
+<h1>Master stations</h1>
+<p style="color: var(--rail-steel); max-width: 720px">
+  UIC-keyed registry of European passenger stations, seeded from the
+  <a href="https://github.com/trainline-eu/stations" target="_blank">Trainline open dataset</a> (ODbL).
+  Local edits flip the row's <code>source</code> to <code>manual</code> and prevail over future Trainline updates;
+  upstream changes to those rows are surfaced in the drift queue below.
+</p>
+
+<form id="search-form" style="margin-bottom: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
+  <input id="q" placeholder="search by name / UIC" style="flex: 1; min-width: 200px">
+  <input id="country" placeholder="country (FR, DE, IT…)" maxlength="2" style="width: 140px">
+  <button type="submit">Search</button>
+  <button type="button" id="refresh-btn" class="secondary">Refresh from Trainline</button>
+</form>
+
+<details class="card" style="margin-bottom: 1rem">
+  <summary style="cursor: pointer; font-weight: 600">Pending drift (<span id="drift-count">…</span>)</summary>
+  <div id="drift-list" style="margin-top: 0.5rem">Loading…</div>
+</details>
+
+<div id="results">Loading…</div>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const toast = document.getElementById('toast');
+function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',3500); }
+
+async function loadStations() {
+  const q = document.getElementById('q').value;
+  const c = document.getElementById('country').value;
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (c) params.set('country', c);
+  const r = await fetch('/api/master/stations?' + params.toString());
+  const rows = await r.json();
+  const head = '<tr><th>UIC</th><th>Name</th><th>Country</th><th>SNCF</th><th>DB</th><th>Trenitalia</th><th>Source</th><th></th></tr>';
+  const body = rows.map(s => `<tr data-uic="${s.uic}">
+    <td><code>${s.uic}</code></td>
+    <td>${s.name}${s.has_drift ? ' <span class="flag SUBSET" style="font-size:0.65rem">DRIFT</span>' : ''}</td>
+    <td>${s.country_iso || '—'}</td>
+    <td>${s.trigramme_sncf || '—'}</td>
+    <td>${s.db_code || '—'}</td>
+    <td>${s.trenitalia_code || '—'}</td>
+    <td><span style="font-size:0.75rem; color: var(--rail-steel)">${s.source}</span></td>
+    <td><button type="button" class="secondary" data-action="edit">Edit</button></td>
+  </tr>`).join('');
+  document.getElementById('results').innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  document.querySelectorAll('button[data-action="edit"]').forEach(b => b.addEventListener('click', editStation));
+}
+
+async function loadDrift() {
+  const r = await fetch('/api/master/stations/drift');
+  const rows = await r.json();
+  document.getElementById('drift-count').textContent = rows.length;
+  if (!rows.length) { document.getElementById('drift-list').innerHTML = '<em>No drift detected. Master data is up to date.</em>'; return; }
+  document.getElementById('drift-list').innerHTML = rows.map(d => `<div style="border-top: 1px solid var(--sleeper); padding: 0.6rem 0">
+    <strong>${d.uic}</strong> — fields differing: ${d.fields_differing.join(', ')}
+    <button type="button" class="secondary" data-uic="${d.uic}" data-action="keep">Keep ours</button>
+    <button type="button" class="secondary" data-uic="${d.uic}" data-action="adopt">Adopt Trainline</button>
+  </div>`).join('');
+  document.querySelectorAll('#drift-list button').forEach(b => b.addEventListener('click', resolveDrift));
+}
+
+async function resolveDrift(e) {
+  const uic = e.target.dataset.uic;
+  const action = e.target.dataset.action === 'keep' ? 'keep_ours' : 'adopt_full';
+  const r = await fetch(`/api/master/stations/${uic}/drift/resolve`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({action}),
+  });
+  if (r.ok) { showToast('success', `Resolved (${action}) for ${uic}`); loadDrift(); loadStations(); }
+  else showToast('error', 'Failed');
+}
+
+async function editStation(e) {
+  const row = e.target.closest('tr');
+  const uic = row.dataset.uic;
+  const name = prompt(`New name for ${uic}:`);
+  if (!name) return;
+  const r = await fetch(`/api/master/stations/${uic}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name}),
+  });
+  if (r.ok) { showToast('success', `Updated ${uic}`); loadStations(); }
+  else showToast('error', 'Failed');
+}
+
+document.getElementById('search-form').addEventListener('submit', e => { e.preventDefault(); loadStations(); });
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+  if (!confirm('Refresh master_stations from the latest Trainline CSV? Manual edits are preserved.')) return;
+  const r = await fetch('/api/master/stations/refresh-trainline', {method: 'POST'});
+  if (r.ok) {
+    const counts = await r.json();
+    showToast('success', `+${counts.added} added · ${counts.updated} updated · ${counts.skipped_manual} kept manual · ${counts.pending_drift} new drifts`);
+    loadStations(); loadDrift();
+  } else showToast('error', 'Refresh failed');
+});
+
+loadStations(); loadDrift();
+</script>
+{% endblock %}

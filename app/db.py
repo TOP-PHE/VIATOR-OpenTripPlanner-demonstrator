@@ -1,43 +1,37 @@
-from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, Text, create_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+"""Database engine + session factory.
+
+Models live in `app.models`. Schema management is owned by Alembic
+(`alembic upgrade head`), not by `Base.metadata.create_all()` — this avoids
+drift between the ORM definition and the migrations of record.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from .settings import settings
 
+engine = create_engine(
+    settings.database_url,
+    future=True,
+    pool_pre_ping=True,
+)
 
-engine = create_engine(settings.database_url, future=True, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class Upload(Base):
-    __tablename__ = "uploads"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    user: Mapped[str] = mapped_column(String(64))
-    filename: Mapped[str] = mapped_column(String(512))
-    declared_standard: Mapped[str] = mapped_column(String(64))
-    detected_kind: Mapped[str] = mapped_column(String(64))
-    sha256: Mapped[str] = mapped_column(String(64))
-    size_bytes: Mapped[int] = mapped_column(Integer)
-    stored_path: Mapped[str] = mapped_column(String(1024))
-    version_label: Mapped[str] = mapped_column(String(128), default="")
-    triggered_rebuild: Mapped[int] = mapped_column(Integer, default=0)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    future=True,
+)
 
 
-class RebuildJob(Base):
-    __tablename__ = "rebuild_jobs"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|running|done|failed
-    log: Mapped[str] = mapped_column(Text, default="")
-    graph_path: Mapped[str] = mapped_column(String(1024), default="")
-
-
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def get_db() -> Iterator[Session]:
+    """FastAPI dependency: yields a SQLAlchemy session and ensures it's closed."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

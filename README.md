@@ -56,6 +56,56 @@ docker compose up -d
 
 For VPS deployment, see [`docker/INSTALL.md`](docker/INSTALL.md).
 
+## First-platform-admin bootstrap
+
+After `docker compose up -d`, the database has no users. Create the first
+**platform admin** with a one-time bootstrap call:
+
+```bash
+# 1. In .env, set BOOTSTRAP_TOKEN to a random secret string.
+echo "BOOTSTRAP_TOKEN=$(openssl rand -hex 32)" >> docker/.env
+docker compose restart web
+
+# 2. Hit the bootstrap endpoint (replace TOKEN with the value from .env):
+curl -X POST http://VPS_IP/api/auth/bootstrap-platform-user \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token": "TOKEN",
+    "email": "you@example.org",
+    "name": "Your Name",
+    "password": "a-strong-passphrase-12+chars"
+  }'
+
+# 3. Visit http://VPS_IP/login and sign in.
+# 4. Optionally remove BOOTSTRAP_TOKEN from .env — the endpoint always 403s once
+#    a platform admin exists, so it's defence-in-depth.
+```
+
+## Admin surfaces
+
+After signing in as a platform admin, the nav exposes:
+
+- **`/journey`** — the public search UI (fanout-default, with origin badges per trip)
+- **`/admin/users`** — promote / deactivate users
+- **`/admin/sessions`** — create / archive sessions, toggle fanout
+- **`/admin/config`** — SMTP, concurrency limits, registration policy, retention; SMTP test button
+- **`/admin/master/stations`** — Trainline-seeded UIC station registry; refresh + drift queue
+- **`/admin/reports`** — search volume per session/user, top O&D pairs, trip-source distribution
+
+The **content_manager** role gets `/journey` + master-data write access.
+The **end_user** role only gets `/journey`.
+
+## Operational crons (in-process via APScheduler)
+
+Run automatically inside the `web` container:
+
+| Cron | Schedule (UTC) | What it does |
+|---|---|---|
+| `retention` | daily 03:00 | Three-tier prune of raw responses → trips → search summaries → audit per `JOURNEY_*_RETENTION_DAYS` |
+| `master_stations_refresh` | daily 04:00 | Pulls Trainline CSV; manual edits never overwritten — drift surfaced in admin UI |
+
+Set env var `VIATOR_DISABLE_CRONS=1` to disable (used in tests).
+
 ## License & attribution
 
 VIATOR is licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE).

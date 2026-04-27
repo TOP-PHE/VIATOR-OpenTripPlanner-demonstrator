@@ -1,0 +1,98 @@
+{% extends "_base.html" %}
+{% block title %}Reports — VIATOR admin{% endblock %}
+
+{% block extra_styles %}
+.report-card { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; }
+.report-card h2 { margin-top: 0; font-size: 1rem; }
+.bar { height: 14px; background: var(--uic-blue); display: inline-block; vertical-align: middle; }
+{% endblock %}
+
+{% block content %}
+<h1>Reports</h1>
+<p style="color: var(--rail-steel)">
+  Activity since the past 30 days. Use the date filter to widen the window or
+  download CSVs for offline analysis.
+</p>
+
+<form id="filter-form" style="margin-bottom: 1rem">
+  <label style="display:inline-block">Since (YYYY-MM-DD)
+    <input type="date" id="since" name="since" style="width: auto"></label>
+  <button type="submit">Refresh</button>
+  <a class="btn secondary" id="csv-btn" href="#">Download CSV</a>
+</form>
+
+<div class="report-card"><h2>Volume per session (p50/p95/p99 + error rate)</h2>
+  <div id="vol-session">Loading…</div>
+</div>
+
+<div class="report-card"><h2>Volume per user</h2>
+  <div id="vol-user">Loading…</div>
+</div>
+
+<div class="report-card"><h2>Top O&amp;D pairs (rounded to ~11 m)</h2>
+  <div id="od">Loading…</div>
+</div>
+
+<div class="report-card"><h2>Trip-source distribution</h2>
+  <p style="font-size: 0.8rem; color: var(--rail-steel); margin-top: 0">% of trips found in each session-set across all searches in the window.</p>
+  <div id="dist">Loading…</div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function qs(name) {
+  const since = document.getElementById('since').value;
+  return since ? `?since=${since}T00:00:00` : '';
+}
+
+async function load() {
+  const since = qs();
+  document.getElementById('csv-btn').href = '/api/reports/searches.csv' + since;
+
+  const renderTable = (id, rows, cols) => {
+    if (!rows.length) { document.getElementById(id).innerHTML = '<em>no data</em>'; return; }
+    const head = '<tr>' + cols.map(c => `<th>${c.label}</th>`).join('') + '</tr>';
+    const body = rows.map(r => '<tr>' + cols.map(c => `<td>${c.fmt ? c.fmt(r[c.key]) : (r[c.key] ?? '—')}</td>`).join('') + '</tr>').join('');
+    document.getElementById(id).innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  };
+
+  const [vs, vu, od, dist] = await Promise.all([
+    fetch('/api/reports/volume-per-session' + since).then(r => r.json()),
+    fetch('/api/reports/volume-per-user' + since).then(r => r.json()),
+    fetch('/api/reports/od-pairs' + since).then(r => r.json()),
+    fetch('/api/reports/trip-source-distribution' + since).then(r => r.json()),
+  ]);
+
+  renderTable('vol-session', vs, [
+    {key: 'session_id', label: 'Session'},
+    {key: 'count', label: 'Count'},
+    {key: 'p50_ms', label: 'p50 (ms)', fmt: v => v ? Math.round(v) : '—'},
+    {key: 'p95_ms', label: 'p95 (ms)', fmt: v => v ? Math.round(v) : '—'},
+    {key: 'p99_ms', label: 'p99 (ms)', fmt: v => v ? Math.round(v) : '—'},
+    {key: 'error_rate', label: 'Error rate', fmt: v => `${(v*100).toFixed(1)}%`},
+  ]);
+
+  renderTable('vol-user', vu, [
+    {key: 'email', label: 'Email'},
+    {key: 'count', label: 'Searches'},
+  ]);
+
+  renderTable('od', od, [
+    {key: 'origin', label: 'Origin', fmt: v => `${v.lat.toFixed(4)}, ${v.lon.toFixed(4)}`},
+    {key: 'dest',   label: 'Destination', fmt: v => `${v.lat.toFixed(4)}, ${v.lon.toFixed(4)}`},
+    {key: 'count',  label: 'Count'},
+    {key: 'avg_response_ms', label: 'Avg ms', fmt: v => v ? Math.round(v) : '—'},
+  ]);
+
+  renderTable('dist', dist, [
+    {key: 'sessions', label: 'Session set'},
+    {key: 'count',    label: 'Trip count'},
+    {key: 'ratio',    label: 'Share', fmt: v => `${(v*100).toFixed(1)}%`},
+  ]);
+}
+
+document.getElementById('filter-form').addEventListener('submit', e => { e.preventDefault(); load(); });
+load();
+</script>
+{% endblock %}

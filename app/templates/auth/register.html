@@ -1,0 +1,55 @@
+{% extends "_base.html" %}
+{% block title %}Register — VIATOR{% endblock %}
+
+{% block content %}
+<h1>Create an account</h1>
+<p style="color: var(--rail-steel)">
+  Self-registration is open to anyone for the journey-search role.
+  Content-manager and platform-admin roles are assigned by an administrator.
+</p>
+
+<form id="reg-form" class="card" autocomplete="on">
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required autocomplete="email" />
+
+  <label for="name">Name</label>
+  <input type="text" id="name" name="name" required minlength="1" maxlength="200" autocomplete="name" />
+
+  <button type="submit" id="submit-btn">Send confirmation link</button>
+
+  <div id="msg" class="msg"></div>
+  <p style="font-size: 0.85rem; margin-top: 1.5rem; color: var(--rail-steel)">
+    Already have an account? <a href="/login">Sign in</a>.
+  </p>
+</form>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const form = document.getElementById('reg-form');
+const msg = document.getElementById('msg');
+const btn = document.getElementById('submit-btn');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  msg.className = 'msg';
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const data = Object.fromEntries(new FormData(form));
+    const r = await fetch('/api/auth/register-request', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data),
+    });
+    // Always 204 (anti-enumeration) — show the same message regardless.
+    msg.className = 'msg show success';
+    msg.textContent = 'If the email is valid, a confirmation link is on its way. Check your inbox (and spam).';
+    btn.textContent = 'Sent';
+  } catch (err) {
+    msg.className = 'msg show error';
+    msg.textContent = String(err);
+    btn.disabled = false; btn.textContent = 'Send confirmation link';
+  }
+});
+</script>
+{% endblock %}

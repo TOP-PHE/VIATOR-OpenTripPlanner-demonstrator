@@ -1,0 +1,15 @@
+{% extends "_base.html" %}
+{% block content %}
+<h2 style="color:#1F3B66;font-size:20px;margin:0 0 12px">SMTP test successful</h2>
+<p style="color:#5B6B82;font-size:14px;line-height:1.6;margin:0 0 8px">
+  This is a test email from the VIATOR admin console at <strong>{{ sent_at }} UTC</strong>.
+</p>
+<p style="color:#5B6B82;font-size:14px;line-height:1.6;margin:0 0 28px">
+  If you can read this, your SMTP configuration is working correctly:
+  the server can sign in, send a multipart email, and the recipient address
+  <strong>{{ to }}</strong> is reachable.
+</p>
+<p style="color:#9aa6b8;font-size:12px;margin:0;line-height:1.5">
+  No action required. You can delete this message.
+</p>
+{% endblock %}

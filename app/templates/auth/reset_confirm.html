@@ -1,0 +1,60 @@
+{% extends "_base.html" %}
+{% block title %}Choose new password — VIATOR{% endblock %}
+
+{% block content %}
+<h1>Choose a new password</h1>
+
+<form id="reset-confirm-form" class="card" autocomplete="on">
+  <label for="password">New password (12 characters minimum)</label>
+  <input type="password" id="password" name="password" required minlength="12" autocomplete="new-password" />
+
+  <label for="password2">Confirm new password</label>
+  <input type="password" id="password2" required minlength="12" autocomplete="new-password" />
+
+  <button type="submit" id="submit-btn">Set new password</button>
+  <div id="msg" class="msg"></div>
+</form>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const token = {{ token | tojson }};
+const form = document.getElementById('reset-confirm-form');
+const msg  = document.getElementById('msg');
+const btn  = document.getElementById('submit-btn');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  msg.className = 'msg';
+  const pw  = document.getElementById('password').value;
+  const pw2 = document.getElementById('password2').value;
+  if (pw !== pw2) {
+    msg.className = 'msg show error';
+    msg.textContent = 'The two passwords do not match.';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/auth/password-reset-confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token, password: pw}),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      msg.className = 'msg show error';
+      msg.textContent = body.detail || `Failed (${r.status})`;
+      btn.disabled = false; btn.textContent = 'Set new password';
+      return;
+    }
+    msg.className = 'msg show success';
+    msg.textContent = 'Password updated. Redirecting to sign-in…';
+    setTimeout(() => { window.location.href = '/login'; }, 1500);
+  } catch (err) {
+    msg.className = 'msg show error';
+    msg.textContent = String(err);
+    btn.disabled = false; btn.textContent = 'Set new password';
+  }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,116 @@
+{% extends "_base.html" %}
+{% block title %}Users — VIATOR admin{% endblock %}
+
+{% block content %}
+<h1>Users</h1>
+<p style="color: var(--rail-steel); max-width: 700px">
+  Promote a user to <strong>content_manager</strong> to let them upload feeds and edit master data;
+  to <strong>platform_admin</strong> for full administrative access.
+  You cannot demote or deactivate yourself — ask another platform admin to do it.
+</p>
+
+<table id="users-table">
+  <thead>
+    <tr>
+      <th>Email</th>
+      <th>Name</th>
+      <th>Role</th>
+      <th>Active</th>
+      <th>Last login</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for u in users %}
+    <tr data-user-id="{{ u.id }}" data-self="{{ 'true' if current_user.id and u.id == current_user.id else 'false' }}">
+      <td>{{ u.email }}{% if current_user.id and u.id == current_user.id %} <span style="color: var(--amber); font-size: 0.75rem">(you)</span>{% endif %}</td>
+      <td>{{ u.name }}</td>
+      <td>
+        <select name="role">
+          {% for r in ('platform_admin', 'content_manager', 'end_user') %}
+            <option value="{{ r }}" {% if u.role == r %}selected{% endif %}>{{ r }}</option>
+          {% endfor %}
+        </select>
+      </td>
+      <td style="text-align: center">
+        <input type="checkbox" name="is_active" {% if u.is_active %}checked{% endif %} />
+      </td>
+      <td style="font-size: 0.85rem; color: var(--rail-steel)">
+        {{ u.last_login_at.strftime('%Y-%m-%d %H:%M') if u.last_login_at else '—' }}
+      </td>
+      <td>
+        <button type="button" class="secondary" data-action="save">Save</button>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 200px"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const toast = document.getElementById('toast');
+
+function showToast(kind, text) {
+  toast.className = 'msg show ' + kind;
+  toast.textContent = text;
+  setTimeout(() => { toast.className = 'msg'; }, 3500);
+}
+
+document.querySelectorAll('tr[data-user-id]').forEach((row) => {
+  const id     = row.dataset.userId;
+  const isSelf = row.dataset.self === 'true';
+  const role   = row.querySelector('select[name="role"]');
+  const active = row.querySelector('input[name="is_active"]');
+  const btn    = row.querySelector('button[data-action="save"]');
+
+  // Track initial values so we can mark the row "changed" on edit.
+  const initial = { role: role.value, is_active: active.checked };
+  function syncChanged() {
+    const changed = role.value !== initial.role || active.checked !== initial.is_active;
+    row.classList.toggle('changed', changed);
+    btn.disabled = !changed;
+  }
+  syncChanged();
+  role.addEventListener('change', syncChanged);
+  active.addEventListener('change', syncChanged);
+
+  btn.addEventListener('click', async () => {
+    if (isSelf && (role.value !== 'platform_admin' || !active.checked)) {
+      showToast('error', "You can't demote or deactivate yourself.");
+      role.value = initial.role;
+      active.checked = initial.is_active;
+      syncChanged();
+      return;
+    }
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const r = await fetch(`/api/users/${id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ role: role.value, is_active: active.checked }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        showToast('error', body.detail || `Failed (${r.status})`);
+        btn.disabled = false; btn.textContent = 'Save';
+        return;
+      }
+      const updated = await r.json();
+      initial.role = updated.role;
+      initial.is_active = updated.is_active;
+      role.value = updated.role;
+      active.checked = updated.is_active;
+      syncChanged();
+      showToast('success', `Updated ${updated.email}`);
+    } catch (err) {
+      showToast('error', String(err));
+    } finally {
+      btn.textContent = 'Save';
+    }
+  });
+});
+</script>
+{% endblock %}

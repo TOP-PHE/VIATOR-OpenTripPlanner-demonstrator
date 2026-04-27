@@ -1,0 +1,177 @@
+{% extends "_base.html" %}
+{% block title %}Search journey — VIATOR{% endblock %}
+
+{% block extra_styles %}
+.search-grid { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; gap: 1rem; }
+.search-form { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; }
+.results { min-height: 200px; }
+.trip-card { border: 1px solid var(--sleeper); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 0.6rem; background: #fff; cursor: pointer; }
+.trip-card:hover { border-color: var(--uic-blue); }
+.trip-card .top { display: flex; justify-content: space-between; align-items: center; }
+.flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
+.flag.ALL        { background: #e9f6ec; color: #1a7e3c; }
+.flag.NAP-ONLY   { background: #fdecef; color: #b30021; }
+.flag.MERITS-ONLY{ background: #e8f0fb; color: #1F3B66; }
+.flag.SUBSET     { background: #fff8e1; color: #b3760e; }
+.timing-strip { display:flex; gap: 1rem; flex-wrap: wrap; padding: 0.6rem; background: #eef2f8; border-radius: 4px; font-size: 0.8rem; color: var(--rail-steel); margin-bottom: 0.6rem; }
+.station-input { position: relative; }
+.suggestions { position: absolute; left: 0; right: 0; top: 100%; background: #fff; border: 1px solid var(--sleeper); border-top: none; max-height: 220px; overflow-y: auto; z-index: 10; display: none; }
+.suggestions.show { display: block; }
+.suggestion { padding: 0.4rem 0.6rem; cursor: pointer; }
+.suggestion:hover, .suggestion.active { background: #eef2f8; }
+{% endblock %}
+
+{% block content %}
+<h1>Search a journey</h1>
+<p style="color: var(--rail-steel)">
+  One search runs against every fanout-enabled session and merges the results.
+  Each itinerary is flagged by which sessions returned it.
+</p>
+
+<div class="search-grid">
+  <form class="search-form" id="journey-form" autocomplete="off">
+    <label>From</label>
+    <div class="station-input">
+      <input id="from-input" name="from" required autocomplete="off">
+      <input type="hidden" id="from-lat"><input type="hidden" id="from-lon"><input type="hidden" id="from-name">
+      <div class="suggestions" id="from-sug"></div>
+    </div>
+
+    <label>To</label>
+    <div class="station-input">
+      <input id="to-input" name="to" required autocomplete="off">
+      <input type="hidden" id="to-lat"><input type="hidden" id="to-lon"><input type="hidden" id="to-name">
+      <div class="suggestions" id="to-sug"></div>
+    </div>
+
+    <label>Depart</label>
+    <input type="datetime-local" id="depart" name="depart">
+
+    <button type="submit" id="go-btn">Search</button>
+    <div id="msg" class="msg"></div>
+  </form>
+
+  <div class="results" id="results">
+    <p style="color: var(--rail-steel)">Pick origin and destination, then Search.</p>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const SUGGEST_MIN = 2;
+
+function setupAutocomplete(prefix) {
+  const inp = document.getElementById(prefix + '-input');
+  const box = document.getElementById(prefix + '-sug');
+  const lat = document.getElementById(prefix + '-lat');
+  const lon = document.getElementById(prefix + '-lon');
+  const name = document.getElementById(prefix + '-name');
+  let active = -1; let items = [];
+
+  async function refresh() {
+    const q = inp.value.trim();
+    if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
+    const r = await fetch(`/api/master/stations?q=${encodeURIComponent(q)}&size=20`);
+    if (!r.ok) return;
+    items = await r.json();
+    if (!items.length) { box.classList.remove('show'); return; }
+    box.innerHTML = items.map((s, i) => `<div class="suggestion" data-i="${i}">${s.name}${s.country_iso ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>` : ''}</div>`).join('');
+    box.classList.add('show');
+    box.querySelectorAll('.suggestion').forEach(el => el.addEventListener('mousedown', e => {
+      e.preventDefault(); pick(parseInt(el.dataset.i, 10));
+    }));
+    active = -1;
+  }
+  function pick(i) {
+    if (i < 0 || i >= items.length) return;
+    const s = items[i];
+    inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
+    box.classList.remove('show');
+  }
+  let t; inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(refresh, 150); });
+  inp.addEventListener('blur', () => setTimeout(() => box.classList.remove('show'), 150));
+  inp.addEventListener('keydown', e => {
+    if (!box.classList.contains('show')) return;
+    if (e.key === 'ArrowDown') { active = Math.min(active+1, items.length-1); paint(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { active = Math.max(active-1, 0); paint(); e.preventDefault(); }
+    else if (e.key === 'Enter')   { if (active >= 0) { pick(active); e.preventDefault(); } }
+    function paint() { box.querySelectorAll('.suggestion').forEach((el, i) => el.classList.toggle('active', i === active)); }
+  });
+}
+
+setupAutocomplete('from');
+setupAutocomplete('to');
+
+// Default depart = now+10min
+const now = new Date(Date.now() + 10*60*1000);
+document.getElementById('depart').value = now.toISOString().slice(0,16);
+
+document.getElementById('journey-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fLat = parseFloat(document.getElementById('from-lat').value);
+  const fLon = parseFloat(document.getElementById('from-lon').value);
+  const tLat = parseFloat(document.getElementById('to-lat').value);
+  const tLon = parseFloat(document.getElementById('to-lon').value);
+  if (!fLat || !tLat) {
+    document.getElementById('msg').className = 'msg show error';
+    document.getElementById('msg').textContent = 'Please pick both stations from the suggestions.';
+    return;
+  }
+  const body = {
+    from: { lat: fLat, lon: fLon, label: document.getElementById('from-name').value },
+    to:   { lat: tLat, lon: tLon, label: document.getElementById('to-name').value },
+    depart_at: document.getElementById('depart').value + ':00',
+    modes: ['TRANSIT','WALK'],
+  };
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true; btn.textContent = 'Searching…';
+  try {
+    const r = await fetch('/api/journey/fanout', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      document.getElementById('results').innerHTML = `<p style="color: var(--fail)">Search failed: ${j.detail || r.status}</p>`;
+      return;
+    }
+    render(await r.json());
+  } finally {
+    btn.disabled = false; btn.textContent = 'Search';
+  }
+});
+
+function fmt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+function dur(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function render(payload) {
+  const el = document.getElementById('results');
+  const exec = payload.executions.map(e =>
+    `${e.session_id}: ${e.num_itineraries} trips in ${e.response_ms}ms (${e.status})`
+  ).join(' · ');
+  const cards = payload.trips.map(t => {
+    const flag = t.origin_flag.replace('_', '-');
+    return `<div class="trip-card">
+      <div class="top">
+        <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
+             <span style="color: var(--rail-steel)"> · ${dur(t.best.duration_seconds)}</span></div>
+        <span class="flag ${flag}">${t.origin_flag}</span>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+        ${t.best.modes || '—'} · ${t.best.legs.length} leg${t.best.legs.length===1?'':'s'} ·
+        Found in: ${t.found_in_sessions.join(', ')}
+      </div>
+    </div>`;
+  }).join('');
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${cards || '<p>No itineraries found.</p>'}`;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,90 @@
+{% extends "_base.html" %}
+{% block title %}Confirm — VIATOR{% endblock %}
+
+{% block content %}
+<h1>Set your password</h1>
+
+<div id="loading" class="card" style="color: var(--rail-steel)">Validating your link…</div>
+
+<form id="confirm-form" class="card" autocomplete="on" style="display: none">
+  <p>Hello <strong id="who">…</strong>. Choose a password to finish creating your account.</p>
+
+  <label for="password">Password (12 characters minimum)</label>
+  <input type="password" id="password" name="password" required minlength="12" autocomplete="new-password" />
+
+  <label for="password2">Confirm password</label>
+  <input type="password" id="password2" required minlength="12" autocomplete="new-password" />
+
+  <button type="submit" id="submit-btn">Create account &amp; sign in</button>
+
+  <div id="msg" class="msg"></div>
+</form>
+
+<div id="invalid" class="card" style="display: none">
+  <h2>Link no longer valid</h2>
+  <p style="color: var(--rail-steel)">
+    Your confirmation link has expired or has already been used. Please <a href="/register">request a new one</a>.
+  </p>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const token = {{ token | tojson }};
+const loading = document.getElementById('loading');
+const form = document.getElementById('confirm-form');
+const invalid = document.getElementById('invalid');
+const who = document.getElementById('who');
+const msg = document.getElementById('msg');
+const btn = document.getElementById('submit-btn');
+
+(async () => {
+  try {
+    const r = await fetch(`/api/auth/check-token?t=${encodeURIComponent(token)}`);
+    if (!r.ok) {
+      loading.style.display = 'none';
+      invalid.style.display = '';
+      return;
+    }
+    const body = await r.json();
+    who.textContent = body.name + ' (' + body.email + ')';
+    loading.style.display = 'none';
+    form.style.display = '';
+  } catch (err) {
+    loading.textContent = 'Could not reach the server: ' + err;
+  }
+})();
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  msg.className = 'msg';
+  const pw  = document.getElementById('password').value;
+  const pw2 = document.getElementById('password2').value;
+  if (pw !== pw2) {
+    msg.className = 'msg show error';
+    msg.textContent = 'The two passwords do not match.';
+    return;
+  }
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    const r = await fetch('/api/auth/register-confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token, password: pw}),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      msg.className = 'msg show error';
+      msg.textContent = body.detail || `Failed (${r.status})`;
+      btn.disabled = false; btn.textContent = 'Create account & sign in';
+      return;
+    }
+    window.location.href = '/';
+  } catch (err) {
+    msg.className = 'msg show error';
+    msg.textContent = String(err);
+    btn.disabled = false; btn.textContent = 'Create account & sign in';
+  }
+});
+</script>
+{% endblock %}

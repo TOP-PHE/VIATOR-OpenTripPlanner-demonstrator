@@ -1,14 +1,21 @@
-"""Routes a stored upload to the right inbox subfolder and decides whether
-to enqueue an OTP rebuild."""
+"""Per-session ingestion dispatcher.
+
+Routes uploaded files into the right per-session inbox subtree and decides
+whether an OTP rebuild is needed for that session.
+
+Layout:
+  /data/inbox/<session_id>/{gtfs,osm,netex,archive,runtime,_staging}/
+"""
+
 from __future__ import annotations
 
 import shutil
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session as DbSession
 
-from .db import RebuildJob
+from .models import RebuildJob
 from .settings import settings
 
 
@@ -20,47 +27,51 @@ STAGE_INTO_OTP_INBOX: dict[str, str] = {
     "OSM-PBF": "osm",
 }
 
-# Stored but does NOT trigger an OTP rebuild (Phase 1 — see strategy doc).
+# Stored but does NOT trigger an OTP rebuild (Phase 6 — see strategy doc).
 ARCHIVE_ONLY: set[str] = {
     "NeTEx-FR-Horaires",
     "NeTEx-FR-Arrets",
 }
 
-# Loaded into the database for runtime consumption by the OJP adapter.
+# Loaded into the database / staged for the OJP adapter (Phase 5).
 LOAD_TO_DB: set[str] = {
     "SNCF-MCT",
     "SNCF-Stations",
 }
 
 
-def dispatch(stored_path: Path, kind: str, db: Session) -> bool:
+def session_inbox(session_id: str | None) -> Path:
+    """Return the per-session inbox dir, falling back to a `_phase1` bucket
+    while the upload UI still lacks a session selector."""
+    sid = session_id or "_phase1"
+    return settings.inbox_dir / sid
+
+
+def dispatch(stored_path: Path, kind: str, db: DbSession, *, session_id: str | None = None) -> bool:
     """Move the stored file to its destination. Returns True if a rebuild was queued."""
+    base = session_inbox(session_id)
 
     if kind in STAGE_INTO_OTP_INBOX:
-        subdir = settings.inbox_dir / STAGE_INTO_OTP_INBOX[kind]
+        subdir = base / STAGE_INTO_OTP_INBOX[kind]
         subdir.mkdir(parents=True, exist_ok=True)
-        # In each subdir we keep only the latest artifact per kind. Old ones get an .old suffix.
         for existing in subdir.iterdir():
             if existing.is_file() and not existing.name.endswith(".old"):
                 existing.rename(existing.with_suffix(existing.suffix + ".old"))
         target = subdir / stored_path.name
         shutil.copy2(stored_path, target)
-        _enqueue_rebuild(db, reason=f"new {kind} uploaded")
+        _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
         return True
 
     if kind in ARCHIVE_ONLY:
-        archive = settings.inbox_dir / "archive" / kind
+        archive = base / "archive" / kind
         archive.mkdir(parents=True, exist_ok=True)
         shutil.copy2(stored_path, archive / stored_path.name)
         return False
 
     if kind in LOAD_TO_DB:
-        # The OJP adapter (Phase 2) reads directly from these files; we keep
-        # the latest copy in /data/inbox/runtime/<kind>/.
-        runtime = settings.inbox_dir / "runtime" / kind
+        runtime = base / "runtime" / kind
         runtime.mkdir(parents=True, exist_ok=True)
         target = runtime / f"latest{stored_path.suffix}"
-        # write atomically
         tmp = target.with_suffix(target.suffix + ".tmp")
         shutil.copy2(stored_path, tmp)
         tmp.replace(target)
@@ -69,11 +80,20 @@ def dispatch(stored_path: Path, kind: str, db: Session) -> bool:
     raise ValueError(f"No dispatch rule for kind={kind}")
 
 
-def _enqueue_rebuild(db: Session, reason: str) -> None:
-    # Coalesce: if a pending job already exists, do nothing.
-    pending = db.query(RebuildJob).filter(RebuildJob.status == "pending").first()
+def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> None:
+    """Coalesce: skip if a pending job for the same session already exists."""
+    pending = (
+        db.query(RebuildJob)
+        .filter(RebuildJob.status == "pending")
+        .filter(RebuildJob.session_id == session_id)
+        .first()
+    )
     if pending is not None:
         return
-    job = RebuildJob(status="pending", log=f"queued at {datetime.utcnow().isoformat()} — {reason}\n")
+    job = RebuildJob(
+        session_id=session_id,
+        status="pending",
+        log=f"queued at {datetime.utcnow().isoformat()} — {reason}\n",
+    )
     db.add(job)
     db.commit()

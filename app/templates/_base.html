@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{% block title %}VIATOR{% endblock %}</title>
+
+  {# Inline SVG favicon — same icon as the upload UI. #}
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231F3B66' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
+
+  <style>
+    :root {
+      --uic-blue:   #1F3B66;
+      --uic-blue-d: #163055;
+      --rail-steel: #5B6B82;
+      --amber:      #E89B2C;
+      --paper:      #F5F7FB;
+      --sleeper:    #D4D9E2;
+      --ok:         #1a7e3c;
+      --fail:       #b30021;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; color: #1c2330; background: #fff; }
+
+    /* ───── header ───── */
+    .top { background: var(--paper); border-bottom: 1px solid var(--sleeper); }
+    .top .inner { max-width: 1100px; margin: 0 auto; padding: 1rem; display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
+    .top .lockup { display: flex; align-items: center; gap: 0.7rem; text-decoration: none; }
+    .top .lockup .icon { width: 36px; height: 36px; }
+    .top .lockup .word { font-size: 1.3rem; font-weight: 700; letter-spacing: 0.3rem; color: var(--uic-blue); }
+    .top .lockup .tag  { font-size: 0.65rem; letter-spacing: 0.18rem; color: var(--rail-steel); text-transform: uppercase; line-height: 1; }
+    .top nav { display: flex; gap: 1rem; align-items: center; margin-left: auto; font-size: 0.9rem; }
+    .top nav a { color: var(--rail-steel); text-decoration: none; }
+    .top nav a:hover { color: var(--uic-blue); text-decoration: underline; }
+    .top nav .who { color: var(--uic-blue); font-weight: 600; }
+
+    /* ───── main ───── */
+    main { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+    h1, h2 { color: var(--uic-blue); }
+
+    /* ───── forms / cards ───── */
+    .card { background: var(--paper); padding: 1.5rem; border-radius: 8px; max-width: 480px; }
+    label { display: block; margin: 0.6rem 0 0.2rem; font-weight: 600; }
+    input[type=text], input[type=email], input[type=password], select, textarea {
+      width: 100%; padding: 0.5rem; border: 1px solid var(--sleeper); border-radius: 4px; font: inherit;
+    }
+    input:focus, select:focus { outline: 2px solid var(--uic-blue); outline-offset: 1px; }
+    button, .btn { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--uic-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; font: inherit; text-decoration: none; display: inline-block; }
+    button:hover, .btn:hover { background: var(--uic-blue-d); }
+    button.secondary { background: transparent; color: var(--uic-blue); border: 1px solid var(--uic-blue); }
+    button.secondary:hover { background: var(--paper); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .msg { margin-top: 1rem; padding: 0.6rem 0.9rem; border-radius: 4px; font-size: 0.9rem; display: none; }
+    .msg.show { display: block; }
+    .msg.error   { background: #fdecef; color: var(--fail); border: 1px solid #f3c4cc; }
+    .msg.success { background: #e9f6ec; color: var(--ok);   border: 1px solid #b6dbc1; }
+
+    /* ───── tables ───── */
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--sleeper); vertical-align: middle; }
+    th { background: #eef2f8; font-weight: 600; color: var(--uic-blue); }
+    tr.changed { background: #fffbe6; }
+
+    /* ───── footer ───── */
+    footer { margin-top: 4rem; padding: 1.2rem; border-top: 1px solid var(--sleeper); color: var(--rail-steel); font-size: 0.75rem; line-height: 1.6; }
+    footer .inner { max-width: 1100px; margin: 0 auto; }
+    footer .row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+    footer .row + .row { margin-top: 0.3rem; }
+    footer .top-logo { height: 26px; background: #fff; border-radius: 4px; padding: 3px 8px; opacity: 0.95; }
+    footer .uic-logo { height: 20px; opacity: 0.85; }
+    footer strong { color: var(--uic-blue); }
+    footer a { color: var(--rail-steel); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+    footer .copyright { font-style: italic; opacity: 0.85; }
+
+    {% block extra_styles %}{% endblock %}
+  </style>
+</head>
+<body>
+
+  <header class="top">
+    <div class="inner">
+      <a href="/" class="lockup" aria-label="VIATOR home">
+        <svg class="icon" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
+          <g fill="none" stroke="#1F3B66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="8"  y1="8"  x2="32" y2="56"/>
+            <line x1="56" y1="8"  x2="32" y2="56"/>
+            <line x1="14" y1="20" x2="50" y2="20"/>
+            <line x1="20" y1="32" x2="44" y2="32"/>
+            <line x1="26" y1="44" x2="38" y2="44"/>
+          </g>
+        </svg>
+        <span>
+          <span class="word">VIATOR</span><br>
+          <span class="tag">UIC · MERITS Journey Planner</span>
+        </span>
+      </a>
+      <nav>
+        {% block nav %}
+          {% if current_user %}
+            <a href="/journey">Search</a>
+            {% if current_user.role in ('platform_admin', 'content_manager') %}
+              <a href="/admin/master/stations">Stations</a>
+            {% endif %}
+            {% if current_user.role == 'platform_admin' %}
+              <a href="/admin/sessions">Sessions</a>
+              <a href="/admin/users">Users</a>
+              <a href="/admin/config">Config</a>
+              <a href="/admin/reports">Reports</a>
+            {% endif %}
+            <span class="who">{{ current_user.username }}</span>
+            <a href="#" id="logout-link">Logout</a>
+          {% else %}
+            <a href="/login">Login</a>
+            <a href="/register">Register</a>
+          {% endif %}
+        {% endblock %}
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer>
+    <div class="inner">
+      <div class="row">
+        <img src="/static/branding/trackonpath-logo.png" alt="TrackOnPath" class="top-logo">
+        <span>Powered by <strong>TrackOnPath SAS</strong> &middot; <a href="mailto:patrick.heuguet@trackonpath.com">patrick.heuguet@trackonpath.com</a></span>
+      </div>
+      <div class="row copyright">
+        <img src="/static/branding/uic-logo.svg" alt="UIC" class="uic-logo">
+        <span>&copy; UIC &mdash; International Union of Railways. 2026. All rights reserved.</span>
+      </div>
+    </div>
+  </footer>
+
+  {# Logout helper — wired even when current_user is None so the script is harmless. #}
+  <script>
+    document.getElementById('logout-link')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      try { await fetch('/api/auth/logout', {method: 'POST'}); } finally {
+        window.location.href = '/login';
+      }
+    });
+  </script>
+
+  {% block extra_scripts %}{% endblock %}
+</body>
+</html>

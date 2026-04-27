@@ -1,0 +1,47 @@
+{% extends "_base.html" %}
+{% block title %}Reset password — VIATOR{% endblock %}
+
+{% block content %}
+<h1>Reset your password</h1>
+<p style="color: var(--rail-steel)">
+  Enter the email you registered with. If we recognise it, we'll send a reset link.
+</p>
+
+<form id="reset-req-form" class="card" autocomplete="on">
+  <label for="email">Email</label>
+  <input type="email" id="email" name="email" required autocomplete="email" />
+
+  <button type="submit" id="submit-btn">Send reset link</button>
+  <div id="msg" class="msg"></div>
+  <p style="font-size: 0.85rem; margin-top: 1.5rem; color: var(--rail-steel)">
+    Remembered it after all? <a href="/login">Sign in</a>.
+  </p>
+</form>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const form = document.getElementById('reset-req-form');
+const msg  = document.getElementById('msg');
+const btn  = document.getElementById('submit-btn');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    await fetch('/api/auth/password-reset-request', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.fromEntries(new FormData(form))),
+    });
+    msg.className = 'msg show success';
+    msg.textContent = 'If that email is registered, a reset link has been sent. The link expires in 2 hours.';
+    btn.textContent = 'Sent';
+  } catch (err) {
+    msg.className = 'msg show error';
+    msg.textContent = String(err);
+    btn.disabled = false; btn.textContent = 'Send reset link';
+  }
+});
+</script>
+{% endblock %}

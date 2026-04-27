@@ -1,0 +1,13 @@
+VIATOR — SMTP test successful
+
+This is a test email from the VIATOR admin console at {{ sent_at }} UTC.
+
+If you can read this, your SMTP configuration is working correctly:
+the server can sign in, send a multipart email, and the recipient address
+{{ to }} is reachable.
+
+No action required. You can delete this message.
+
+—
+Powered by TrackOnPath SAS
+© UIC — International Union of Railways. 2026. All rights reserved.
