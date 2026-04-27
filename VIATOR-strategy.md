@@ -4,7 +4,8 @@ _UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner.
 
 _High-level strategy for an OpenTripPlanner-based journey planner that initially ingests SNCF open data via the French NAP (transport.data.gouv.fr), and is designed to migrate to ingesting the same dataset families directly from **MERITS** (the UIC central data platform) once available. Companion to `VIATOR-technical-spec.md`._
 
-_Author: Patrick Heuguet — TrackOnPath_
+_**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
+_**© 2026 UIC — International Union of Railways. All rights reserved.**_
 _Last updated: 2026-04-27_
 
 ---

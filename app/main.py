@@ -18,6 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import detect, ingestion
@@ -28,6 +29,13 @@ from .settings import settings
 app = FastAPI(title="VIATOR — feed ingestion")
 templates = Jinja2Templates(directory="app/templates")
 basic = HTTPBasic()
+
+# Brand assets (TrackOnPath logo, UIC logo, VIATOR icons) live in ./branding
+# at the repo root and are copied into the container by the Dockerfile.
+# Mounted at /static/branding so the UI can <img src="/static/branding/uic-logo.svg">.
+_branding_dir = Path("branding")
+if _branding_dir.is_dir():
+    app.mount("/static/branding", StaticFiles(directory=_branding_dir), name="branding")
 
 
 @app.on_event("startup")

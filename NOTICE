@@ -1,0 +1,28 @@
+VIATOR
+A MERITS-aligned OpenTripPlanner demonstrator.
+
+Copyright (c) 2026 UIC — International Union of Railways. All rights reserved.
+
+Powered by TrackOnPath SAS.
+Contact: patrick.heuguet@trackonpath.com
+
+This product includes software developed by third parties:
+
+  * OpenTripPlanner (https://github.com/opentripplanner/OpenTripPlanner)
+    Licensed under the GNU Lesser General Public License v3.0.
+
+  * FastAPI, SQLAlchemy, Pydantic, Uvicorn, and other Python packages
+    listed in requirements.txt — each under its own permissive licence.
+
+  * Trainline-eu/stations master station registry
+    (https://github.com/trainline-eu/stations)
+    Licensed under the Open Database License (ODbL).
+
+  * SNCF open data feeds (transport.data.gouv.fr)
+    Licensed under the Open Database License (ODbL).
+
+  * MapLibre GL JS (when wired in step 14 of the implementation order)
+    Licensed under the BSD-3-Clause License.
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full licence text.

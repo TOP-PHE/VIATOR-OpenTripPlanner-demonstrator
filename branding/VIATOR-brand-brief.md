@@ -2,7 +2,8 @@
 
 _Demonstrator brand for the UIC MERITS-based OpenTripPlanner stack._
 
-_Author: Patrick Heuguet — TrackOnPath_
+_**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
+_**© 2026 UIC — International Union of Railways. All rights reserved.**_
 _Last updated: 2026-04-27_
 
 ---
@@ -92,6 +93,10 @@ The tagline in the lockup uses **+2.5 tracking** at small sizes for that "engine
 |---|---|
 | `viator-icon.svg` | Square icon, 64×64 viewBox. Use for favicon, app icon, dark-mode adaptations. |
 | `viator-lockup.svg` | Horizontal lockup: icon + wordmark + tagline. Use for headers, slide deck title cards, README banners. |
+| `trackonpath-logo.png` | TrackOnPath SAS company logo. Used in the upload-UI footer's "Powered by" line and any user-facing surface. Lifted from OSCAR — keep in sync if the master logo changes. |
+| `uic-logo.svg` | UIC official logo. Used next to the copyright line. Lifted from OSCAR; do not modify — UIC's brand authority. |
+
+The Dockerfile copies `branding/` into the runtime image; FastAPI mounts it at **`/static/branding/`**, so the upload UI references e.g. `<img src="/static/branding/trackonpath-logo.png">`.
 
 Both are vector — scale freely. Both are single-colour `#1F3B66`; for dark-mode flip the stroke/fill to `#F5F7FB`.
 

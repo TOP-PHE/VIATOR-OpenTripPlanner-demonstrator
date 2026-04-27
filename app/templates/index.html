@@ -40,7 +40,16 @@
     .fail    { color: #b30021; font-weight: 600; }
     .pending { color: var(--amber); font-weight: 600; }
 
-    footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--sleeper); font-size: 0.75rem; color: var(--rail-steel); }
+    footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--sleeper); font-size: 0.75rem; color: var(--rail-steel); line-height: 1.6; }
+    footer .row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+    footer .row + .row { margin-top: 0.3rem; }
+    footer .top-logo { height: 28px; background: #fff; border-radius: 4px; padding: 3px 8px; opacity: 0.95; }
+    footer .uic-logo { height: 22px; opacity: 0.85; }
+    footer .powered-by strong { color: var(--uic-blue); }
+    footer .powered-by a { color: var(--rail-steel); text-decoration: none; }
+    footer .powered-by a:hover { text-decoration: underline; }
+    footer .copyright { font-style: italic; opacity: 0.85; }
+    footer .stack { opacity: 0.7; margin-top: 0.25rem; }
   </style>
 </head>
 <body>
@@ -112,7 +121,20 @@
   </table>
 
   <footer>
-    VIATOR — TrackOnPath · OpenTripPlanner core · Feed sources: SNCF (Phase 1), MERITS (mid-term)
+    <div class="row powered-by">
+      <img src="/static/branding/trackonpath-logo.png" alt="TrackOnPath" class="top-logo">
+      <span>
+        Powered by <strong>TrackOnPath SAS</strong> &nbsp;·&nbsp;
+        <a href="mailto:patrick.heuguet@trackonpath.com">patrick.heuguet@trackonpath.com</a>
+      </span>
+    </div>
+    <div class="row copyright">
+      <img src="/static/branding/uic-logo.svg" alt="UIC" class="uic-logo">
+      <span>&copy; UIC &mdash; International Union of Railways. 2026. All rights reserved.</span>
+    </div>
+    <div class="stack">
+      VIATOR &middot; OpenTripPlanner core &middot; Feed sources: SNCF (Phase&nbsp;1), MERITS (mid-term)
+    </div>
   </footer>
 </body>
 </html>

@@ -2,6 +2,11 @@
 
 UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner.
 
+> **Powered by TrackOnPath SAS** &nbsp;·&nbsp; Contact: [patrick.heuguet@trackonpath.com](mailto:patrick.heuguet@trackonpath.com)
+>
+> **© 2026 UIC — International Union of Railways. All rights reserved.**
+> Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
 | Document | What's inside |
 |---|---|
 | [`VIATOR-strategy.md`](VIATOR-strategy.md) | Why this exists, data sources, master data, multi-session strategy, roadmap |
@@ -51,6 +56,13 @@ docker compose up -d
 
 For VPS deployment, see [`docker/INSTALL.md`](docker/INSTALL.md).
 
-## License
+## License & attribution
 
-TBD (likely Apache-2.0 to match OSCAR).
+VIATOR is licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE).
+
+- **Copyright** © 2026 UIC — International Union of Railways. All rights reserved.
+- **Powered by** [TrackOnPath SAS](mailto:patrick.heuguet@trackonpath.com).
+- **Third-party software and data** acknowledged in [`NOTICE`](NOTICE).
+
+This attribution must be preserved in any redistribution and must appear in the
+footer of any user-facing surface (web UI, generated documents, exported reports).

@@ -4,7 +4,8 @@ _Detailed engineering specification for the VIATOR demonstrator: identity & RBAC
 
 _Companion to `VIATOR-strategy.md` — read the strategy first for the why._
 
-_Author: Patrick Heuguet — TrackOnPath_
+_**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
+_**© 2026 UIC — International Union of Railways. All rights reserved.**_
 _Last updated: 2026-04-27_
 
 ---
