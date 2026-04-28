@@ -105,17 +105,19 @@ nano .env
 At minimum set:
 
 ```
+VIATOR_VERSION=v0.1.0   # pin to a release tag for reproducible deploys
+
 POSTGRES_USER=viator
 POSTGRES_PASSWORD=<openssl rand -base64 32>
 POSTGRES_DB=viator
 
 JWT_SECRET=<openssl rand -base64 64>
+JWT_COOKIE_SECURE=false   # set to true after step 9 (HTTPS)
 BOOTSTRAP_TOKEN=<openssl rand -base64 32>
 
 PUBLIC_BASE_URL=https://viator.example.com
 
 OTP_BUILD_HEAP=24g     # 12g if you're only doing a regional bundle
-OTP_SERVE_HEAP=8g
 ```
 
 > **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for step 8. Once consumed, set it to empty in `.env` and `docker compose restart web`.
@@ -220,7 +222,23 @@ Once configured, the worker starts auto-pulling at the schedule you defined (or 
 
 > **Rebuild graph** — kicks off `otp-build` in a one-shot container; takes 30–60 min for national.
 
-After the build completes the session moves to `serving` and is automatically added to `docker-compose.generated.yml` and `nginx/conf.d/sessions.generated.conf`. The fanout endpoint starts including it.
+After the build completes the session moves to `graph_built`. The next step (going to `serving` with a live `otp-<sid>` container) requires regenerating the per-session compose + nginx fragments and reloading.
+
+> **Phase-A note (current):** the orchestrator that writes those fragments is implemented but not yet auto-triggered (Phase-B work). After a session reaches `graph_built`, run from the VPS:
+>
+> ```bash
+> cd /opt/viator/docker
+> docker compose exec web python -c "
+> from app import sessions_orchestrator
+> from app.db import SessionLocal
+> with SessionLocal() as db:
+>     sessions_orchestrator.regenerate(db)
+> "
+> docker compose up -d                           # picks up the new otp-<sid> service
+> docker compose exec nginx nginx -s reload      # picks up the new /otp/<sid>/ route
+> ```
+>
+> After this three-command dance, the session shows `serving` and the fanout endpoint includes it. Phase-B will hook this into the session state machine so it happens automatically.
 
 Smoke test from your laptop:
 

@@ -1318,6 +1318,8 @@ PA → eventually: Archive
    ↓ state='archived', removed from compose, kept for replay
 ```
 
+> **Phase-A vs Phase-B status (April 2026).** The `state='graph_built' → 'serving'` transition currently requires an operator to run three commands by hand (regenerate fragments, `docker compose up -d`, `nginx -s reload`) — see `docker/INSTALL.md` step 10. Phase-B will wire `app/sessions_orchestrator.regenerate()` into the admin sessions API state transitions, have the worker shell out to compose-up after fragment regeneration, and trigger nginx reload via the docker socket. Tracked as the first post-deploy task; ~half a day of work, validated against real traffic during Phase-A operation.
+
 ### 11.6 Day-2 operations
 
 #### 11.6.1 Updating the application
