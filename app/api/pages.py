@@ -49,8 +49,9 @@ def _redirect_to_login(next_path: str) -> RedirectResponse:
 
 def _forbidden_html(request: Request, message: str) -> HTMLResponse:
     return templates.TemplateResponse(
+        request,
         "_base.html",
-        {"request": request, "current_user": _maybe_user(request)},
+        {"current_user": _maybe_user(request)},
         status_code=403,
     )
 
@@ -66,8 +67,9 @@ def login_page(request: Request) -> Response:
         dest = "/admin/users" if user.role == "platform_admin" else "/"
         return RedirectResponse(dest, status_code=303)
     return templates.TemplateResponse(
+        request,
         "auth/login.html",
-        {"request": request, "current_user": None},
+        {"current_user": None},
     )
 
 
@@ -77,32 +79,36 @@ def register_page(request: Request) -> Response:
     if user is not None:
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(
+        request,
         "auth/register.html",
-        {"request": request, "current_user": None},
+        {"current_user": None},
     )
 
 
 @router.get("/confirm/{token}", response_class=HTMLResponse)
 def confirm_page(request: Request, token: str) -> HTMLResponse:
     return templates.TemplateResponse(
+        request,
         "auth/confirm.html",
-        {"request": request, "current_user": None, "token": token},
+        {"current_user": None, "token": token},
     )
 
 
 @router.get("/reset", response_class=HTMLResponse)
 def reset_request_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
+        request,
         "auth/reset_request.html",
-        {"request": request, "current_user": None},
+        {"current_user": None},
     )
 
 
 @router.get("/reset/{token}", response_class=HTMLResponse)
 def reset_confirm_page(request: Request, token: str) -> HTMLResponse:
     return templates.TemplateResponse(
+        request,
         "auth/reset_confirm.html",
-        {"request": request, "current_user": None, "token": token},
+        {"current_user": None, "token": token},
     )
 
 
@@ -122,8 +128,9 @@ def admin_users_page(
 
     users = db.execute(select(User).order_by(User.created_at)).scalars().all()
     return templates.TemplateResponse(
+        request,
         "admin/users.html",
-        {"request": request, "current_user": user, "users": users},
+        {"current_user": user, "users": users},
     )
 
 
@@ -135,8 +142,9 @@ def admin_config_page(request: Request) -> Response:
     if user.role != "platform_admin":
         return _forbidden_html(request, "Platform admin access required.")
     return templates.TemplateResponse(
+        request,
         "admin/config.html",
-        {"request": request, "current_user": user},
+        {"current_user": user},
     )
 
 
@@ -152,8 +160,9 @@ def admin_sessions_page(
         return _forbidden_html(request, "Platform admin access required.")
     sessions = db.execute(select(SessionRow).order_by(SessionRow.created_at)).scalars().all()
     return templates.TemplateResponse(
+        request,
         "admin/sessions.html",
-        {"request": request, "current_user": user, "sessions": sessions},
+        {"current_user": user, "sessions": sessions},
     )
 
 
@@ -164,9 +173,7 @@ def admin_reports_page(request: Request) -> Response:
         return _redirect_to_login("/admin/reports")
     if user.role != "platform_admin":
         return _forbidden_html(request, "Platform admin access required.")
-    return templates.TemplateResponse(
-        "admin/reports.html", {"request": request, "current_user": user}
-    )
+    return templates.TemplateResponse(request, "admin/reports.html", {"current_user": user})
 
 
 @router.get("/admin/master/stations", response_class=HTMLResponse)
@@ -177,8 +184,9 @@ def admin_master_stations_page(request: Request) -> Response:
     if user.role not in ("platform_admin", "content_manager"):
         return _forbidden_html(request, "Content-manager or platform-admin access required.")
     return templates.TemplateResponse(
+        request,
         "admin/master_stations.html",
-        {"request": request, "current_user": user},
+        {"current_user": user},
     )
 
 
@@ -187,4 +195,4 @@ def journey_page(request: Request) -> Response:
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    return templates.TemplateResponse("journey.html", {"request": request, "current_user": user})
+    return templates.TemplateResponse(request, "journey.html", {"current_user": user})

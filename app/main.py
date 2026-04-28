@@ -145,9 +145,9 @@ def index(request: Request, user: Annotated[str, Depends(authed)]) -> HTMLRespon
         uploads = db.query(Upload).order_by(Upload.created_at.desc()).limit(20).all()
         jobs = db.query(RebuildJob).order_by(RebuildJob.created_at.desc()).limit(10).all()
     return templates.TemplateResponse(
+        request,
         "index.html",
         {
-            "request": request,
             "user": user,
             "uploads": uploads,
             "jobs": jobs,

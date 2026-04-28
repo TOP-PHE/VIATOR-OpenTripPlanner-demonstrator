@@ -32,6 +32,11 @@ COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /srv
 
+# Upgrade pip first — the python:3.12-slim base ships pip 25.0.1 which has
+# CVE-2025-8869 (MEDIUM, tarfile symlink check) and CVE-2026-1703 (LOW, wheel
+# path traversal). Pin to a fixed version that's also new enough for our deps.
+RUN pip install --upgrade "pip>=26.0"
+
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
