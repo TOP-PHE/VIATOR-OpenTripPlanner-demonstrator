@@ -69,6 +69,28 @@ def authed(creds: Annotated[HTTPBasicCredentials | None, Depends(_basic)]) -> st
     return creds.username
 
 
+def authed_or_none(
+    creds: Annotated[HTTPBasicCredentials | None, Depends(_basic)],
+) -> str | None:
+    """Like `authed`, but returns None when admin_user is empty (Phase-2 mode).
+
+    Allows the root index route to redirect Phase-2 users to `/login`
+    instead of triggering the browser's native basic-auth challenge — the
+    main UX papercut on a fresh Phase-2 deployment where someone hits the
+    bare hostname out of habit.
+    """
+    if not settings.admin_user:
+        return None
+    if creds is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    _check_basic(creds)
+    return creds.username
+
+
 # ────────────────────────────── JWT decode ──────────────────────────────
 
 

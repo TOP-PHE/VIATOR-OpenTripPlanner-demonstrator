@@ -37,7 +37,7 @@ from .api.master import stations as master_stations
 from .db import SessionLocal
 from .models import RebuildJob, Upload
 from .rate_limit import limiter
-from .security import authed
+from .security import authed, authed_or_none
 from .settings import settings
 
 log = logging.getLogger(__name__)
@@ -140,7 +140,25 @@ def _startup() -> None:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, user: Annotated[str, Depends(authed)]) -> HTMLResponse:
+def index(
+    request: Request,
+    user: Annotated[str | None, Depends(authed_or_none)],
+) -> Response:
+    """Root page.
+
+    Two modes (driven by `.env` `ADMIN_USER`):
+
+    - **Phase-2 deployment** (`ADMIN_USER=` empty): `authed_or_none`
+      returns None, we redirect to `/login`. The Phase-1 upload UI is
+      unreachable here — avoids the browser's native basic-auth prompt
+      on a bare-hostname visit, which is otherwise confusing UX.
+    - **Phase-1 deployment** (`ADMIN_USER` set): basic-auth required;
+      `authed_or_none` returns the username and we render the legacy
+      upload dashboard.
+    """
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+
     with SessionLocal() as db:
         uploads = db.query(Upload).order_by(Upload.created_at.desc()).limit(20).all()
         jobs = db.query(RebuildJob).order_by(RebuildJob.created_at.desc()).limit(10).all()
