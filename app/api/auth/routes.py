@@ -269,9 +269,14 @@ async def login(
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(response: Response) -> Response:
+async def logout() -> Response:
+    # Build the response we'll actually return, then drop the cookie on *that*
+    # one. The auto-injected `response: Response` parameter pattern is a trap
+    # here: any cookies set on it are discarded the moment we return a fresh
+    # Response object instead of None.
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
     response.delete_cookie(settings.jwt_cookie_name, path="/")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return response
 
 
 @router.get("/me", response_model=MeResponse)

@@ -33,8 +33,12 @@ def test_jwt_tamper_detection() -> None:
 
 
 def test_jwt_expired_rejected() -> None:
+    # ttl_seconds=1 + sleep(2.5): generous margin past the int-truncated exp.
+    # python-jose treats `now == exp` as "still valid" (it uses strict <), and
+    # both iat/exp are stored as int(timestamp) so a 1.5s sleep can land
+    # exactly on `now == exp` after truncation. 2.5s is comfortably past that.
     jwt = tokens.issue_jwt(uuid.uuid4(), "x@y.z", "end_user", ttl_seconds=1)
-    time.sleep(1.5)
+    time.sleep(2.5)
     with pytest.raises(JWTError):
         tokens.decode_jwt(jwt)
 
