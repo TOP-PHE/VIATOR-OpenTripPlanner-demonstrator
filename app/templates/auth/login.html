@@ -51,7 +51,10 @@ form.addEventListener('submit', async (e) => {
     }
     const body = await r.json();
     // Land on the most useful page for this role.
-    const dest = body.role === 'platform_admin' ? '/admin/users' : '/';
+    // Phase-2 note: do NOT bounce to "/" — in Phase-2 mode that redirects
+    // back to /login, creating a redirect loop. Send non-admins to /journey
+    // (the journey planner UI, accessible to any logged-in user).
+    const dest = body.role === 'platform_admin' ? '/admin/users' : '/journey';
     window.location.href = dest;
   } catch (err) {
     show('error', String(err));

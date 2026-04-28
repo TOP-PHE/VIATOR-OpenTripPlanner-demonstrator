@@ -63,8 +63,10 @@ def _forbidden_html(request: Request, message: str) -> HTMLResponse:
 def login_page(request: Request) -> Response:
     user = _maybe_user(request)
     if user is not None:
-        # Already logged in — bounce to the most useful place.
-        dest = "/admin/users" if user.role == "platform_admin" else "/"
+        # Already logged in — bounce to the most useful page for this role.
+        # Phase-2 note: do NOT bounce non-admins to "/" — that redirects back
+        # to /login in Phase-2 mode, creating a loop. /journey is universal.
+        dest = "/admin/users" if user.role == "platform_admin" else "/journey"
         return RedirectResponse(dest, status_code=303)
     return templates.TemplateResponse(
         request,
