@@ -1101,41 +1101,425 @@ For Phase-7 MERITS credentials, a Postgres `secret_refs` table holds references;
 
 ---
 
-## 11. Operations
+## 11. Operations — runbook
 
-### 11.1 First-time admin bootstrap
+This chapter is the **runbook for operators** — the people SSH'd into the VPS, not the developers writing code. Read it top-to-bottom for a first install; jump to a sub-section when something needs fixing.
 
-On first deploy, the DB has no users. The platform admin is created by hitting `POST /api/auth/bootstrap-platform-user` with a one-time `BOOTSTRAP_TOKEN` from environment. After consumption, the token is invalidated and bootstrap is disabled.
+For the developer-facing tooling (CI, local lint/test, GHCR, branch protection), see §15. For first-platform-admin creation specifically, see §11.4.
 
-### 11.2 Session creation
+### 11.1 Runtime architecture (what runs where)
+
+The VPS hosts a single Docker Compose stack. The stack is generated, not hand-edited — every time a session is created or archived, the admin app rewrites `docker-compose.generated.yml` and `nginx/conf.d/sessions.generated.conf`, then runs `docker compose up -d`.
 
 ```
-PA → POST /api/sessions {id:'nap-fr-2026-q2', ...}
-  ↓ INSERT row, state='created'
-PA → PATCH /api/sessions/<id> { config: {sources:[...]} }
-  ↓ state='configured'
-CM → upload feeds (or auto-pull triggers)
-  ↓ state='populated'
-worker → run otp-build for that session
-  ↓ state='graph_built'
-admin app → regenerate compose & nginx, docker compose up -d otp-<id>
-  ↓ state='serving'
+                  ┌────────────────────────────────────────────────────┐
+   :443 (TLS) ───►│  nginx                                             │
+                  │  ─ /              → web (admin + journey UI)       │
+                  │  ─ /api/          → web                            │
+                  │  ─ /otp/<sid>/    → otp-<sid> (per-session)        │
+                  └─┬───────────┬─────────────┬─────────────┬──────────┘
+                    │           │             │             │
+              ┌─────▼─────┐ ┌───▼─────┐ ┌─────▼──────┐ ┌────▼─────┐
+              │  web      │ │ worker  │ │ otp-nap-q2 │ │ otp-…    │
+              │  FastAPI  │ │ APSched │ │ JRE 25     │ │ (one per │
+              │  Jinja UI │ │ +Docker │ │ +OTP 2.9   │ │  session)│
+              │  Pydantic │ │  socket │ │            │ │          │
+              └─┬─────────┘ └─┬───────┘ └─┬──────────┘ └─┬────────┘
+                │             │           │              │
+                ▼             ▼           ▼              ▼
+              ┌────────────────────────────────────────────────┐
+              │  postgres:16  (persisted volume: pgdata)       │
+              └────────────────────────────────────────────────┘
+
+              Persistent volumes per-session:
+              ─ inbox-<sid>     uploaded raw feeds
+              ─ graphs-<sid>    built OTP graphs (current = symlink)
 ```
 
-### 11.3 Backups
+Containers and what they do:
 
-| Volume | Strategy |
+| Container | Role | Restart policy |
+|---|---|---|
+| `nginx` | Public TLS termination + routing to web/OTP. | `unless-stopped` |
+| `web` | FastAPI admin app + journey UI + all `/api/*` routes. | `unless-stopped` |
+| `worker` | APScheduler crons (retention, master-data refresh) + on-demand OTP builds. Mounts `/var/run/docker.sock` to spawn `otp-build` jobs. | `unless-stopped` |
+| `postgres` | Single Postgres 16 with `pgcrypto`, `citext`, `pg_trgm`. | `unless-stopped` |
+| `otp-<sid>` | One per session in state `serving`. JRE 25 + `otp-shaded-2.9.0.jar`. | `unless-stopped` |
+
+### 11.2 First-time install on a fresh VPS
+
+This collapses what's in `docker/INSTALL.md` into the spec. For full step-by-step (with download URLs and example outputs), see that file.
+
+#### 11.2.1 VPS sizing
+
+| Resource | Pilot (Île-de-France only) | National (France-wide) |
+|---|---|---|
+| vCPU | 4 | 8 |
+| RAM | 16 GB | **32 GB** |
+| SSD | 60 GB | 100 GB |
+| OS | Ubuntu 24.04 LTS | Ubuntu 24.04 LTS |
+
+The 32 GB floor for national isn't optional — OTP graph build for the full SNCF GTFS + France OSM PBF needs ~24 GB heap. Cheaper hosts that fit: OVH, Scaleway, Hetzner, Infomaniak.
+
+Open inbound ports on the provider firewall: `22` (SSH, restricted to your IPs), `80` (HTTP, public during install), `443` (HTTPS, public after step 11.2.7).
+
+#### 11.2.2 OS hardening
+
+```bash
+# As root
+adduser viator && usermod -aG sudo viator
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+systemctl restart ssh
+ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+apt update && apt -y upgrade
+```
+
+Reconnect as `viator` for the rest.
+
+#### 11.2.3 Install Docker Engine + Compose plugin
+
+```bash
+sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER && newgrp docker
+docker version && docker compose version
+```
+
+#### 11.2.4 Get the stack onto the VPS
+
+```bash
+sudo mkdir -p /opt/viator && sudo chown $USER:$USER /opt/viator
+cd /opt/viator
+git clone https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator.git .
+cd docker
+```
+
+#### 11.2.5 Configure secrets
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+At minimum set:
+
+```
+POSTGRES_PASSWORD=<openssl rand -base64 32>
+JWT_SECRET=<openssl rand -base64 64>
+BOOTSTRAP_TOKEN=<openssl rand -base64 32>
+PUBLIC_BASE_URL=https://viator.example.com
+OTP_BUILD_HEAP=24g
+OTP_SERVE_HEAP=8g
+```
+
+> **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for §11.4. After consumption, set it to empty in `.env` and `docker compose restart web`.
+
+#### 11.2.6 Pull images and start
+
+If you've enabled GHCR pulls (15.7.4 made the packages public) and your `docker-compose.yml` references the GHCR image tags, pull instead of build:
+
+```bash
+docker compose pull web
+docker compose up -d postgres web worker nginx
+docker compose logs -f web        # Ctrl-C once you see "Application startup complete"
+```
+
+If you build locally instead:
+
+```bash
+docker compose build
+docker compose up -d postgres web worker nginx
+```
+
+#### 11.2.7 Wire HTTPS
+
+Once the domain is pointing at the VPS:
+
+```bash
+sudo apt install -y certbot
+sudo certbot certonly --standalone -d viator.example.com \
+  --pre-hook  "docker compose -f /opt/viator/docker/docker-compose.yml stop nginx" \
+  --post-hook "docker compose -f /opt/viator/docker/docker-compose.yml start nginx"
+```
+
+Mount the cert directory in `docker-compose.yml` (`./nginx/certs:/etc/nginx/certs:ro`), uncomment the `:443` server in `nginx/nginx.conf`, then `docker compose restart nginx`.
+
+Certbot installs a systemd timer for auto-renewal — verify with `systemctl list-timers | grep certbot`.
+
+### 11.3 Database initialisation
+
+Postgres comes up empty on first boot. The web container runs `alembic upgrade head` automatically at startup (entrypoint), so by the time the `web` container reports healthy, all 19 tables and the `journey_trip_provenance` view exist.
+
+If the migration ever needs to be re-run by hand:
+
+```bash
+docker compose exec web alembic upgrade head
+docker compose exec web alembic current   # confirm head
+```
+
+### 11.4 First-time platform-admin bootstrap
+
+On a fresh DB, no users exist — including no admin. The bootstrap endpoint creates the first one:
+
+```bash
+curl -X POST https://viator.example.com/api/auth/bootstrap-platform-user \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token":    "<the BOOTSTRAP_TOKEN you set in .env>",
+    "email":    "you@example.com",
+    "name":     "Patrick Heuguet",
+    "password": "<a strong password, ≥12 chars>"
+  }'
+```
+
+Response: `200 OK` with a JWT and a `viator_session` cookie set. The endpoint then refuses subsequent calls (returns 403) — it checks for any existing `platform_admin` user before allowing.
+
+**Immediately after** a successful bootstrap:
+
+1. Edit `.env` → set `BOOTSTRAP_TOKEN=` (empty).
+2. `docker compose restart web` so the empty value takes effect.
+3. Log into the admin UI at `https://viator.example.com/login`.
+
+You're now an authenticated platform admin and can invite the rest of the team via Admin → Users.
+
+### 11.5 Session lifecycle (creating a new comparison session)
+
+A "session" is one OTP instance with its own data, independent from any other session. The fanout endpoint queries all `serving` sessions in parallel and merges results.
+
+```
+PA → Admin → Sessions → New
+   POST /api/sessions {id:"nap-fr-2026-q2", label:"NAP Q2 2026", ...}
+   ↓ INSERT row, state='created'
+
+PA → Configure sources (URLs, schedules)
+   PATCH /api/sessions/<sid> {config: {...}}
+   ↓ state='configured'
+
+CM → Upload feeds (UI or via API)
+   POST /api/sessions/<sid>/uploads (multipart)
+   ↓ state='populated' once required artefacts present
+
+worker → otp-build job (debounced or manual trigger)
+   docker run --rm -v inbox-<sid>:/inbox -v graphs-<sid>:/graphs otp-build
+   ↓ state='graph_built'
+
+admin app → regenerate compose + nginx + reload
+   ↓ state='serving' (now in fanout pool)
+
+PA → eventually: Archive
+   POST /api/sessions/<sid>/archive
+   ↓ state='archived', removed from compose, kept for replay
+```
+
+### 11.6 Day-2 operations
+
+#### 11.6.1 Updating the application
+
+```bash
+cd /opt/viator
+git pull
+cd docker
+docker compose pull web                # if pulling from GHCR
+# OR: docker compose build web         # if building locally
+docker compose up -d web worker
+docker compose exec web alembic upgrade head   # apply any new migrations
+```
+
+The `nginx`/`postgres` containers don't restart unless their image changed.
+
+#### 11.6.2 Bumping the OTP version
+
+```bash
+nano docker/otp/Dockerfile          # change ARG OTP_VERSION=2.9.0 → newer
+docker compose build otp otp-build
+# For each session in 'serving' state, trigger a rebuild via the admin UI
+# (Admin → Sessions → <sid> → Rebuild graph). Worker rebuilds and promotes.
+```
+
+#### 11.6.3 Changing platform configuration
+
+All operational config (SMTP credentials, concurrency limits, retention windows, fanout timeouts) lives in the `platform_config` Postgres table — never in `.env`. See §12 for the schema.
+
+To change something:
+
+> Admin UI → Configuration → edit field → Save.
+
+Behind the scenes: validated against `CONFIG_SCHEMA`, persisted, audited, in-process cache invalidated, concurrency semaphores hot-swapped (no restart needed).
+
+If the UI is broken and you need an emergency override:
+
+```bash
+docker compose exec postgres psql -U viator -d viator -c \
+  "UPDATE platform_config SET value='\"60\"' WHERE key='FANOUT_TIMEOUT_MS';"
+docker compose restart web    # forces cache reload
+```
+
+#### 11.6.4 Inviting another user
+
+> Admin UI → Users → Invite — pick a role (`platform_admin`, `content_manager`, `end_user`).
+
+The invitee gets a magic-link email (sent through the SMTP credentials in `platform_config`). Token TTL is 24h.
+
+If SMTP isn't wired yet, you can manually fetch the verification token:
+
+```sql
+docker compose exec postgres psql -U viator -d viator -c \
+  "SELECT email, token_hash, expires_at FROM verification_tokens ORDER BY expires_at DESC LIMIT 5;"
+```
+
+…but the raw token is only known to the email; you can't reconstruct it from the hash. Easier: configure SMTP first (Admin → Configuration → SMTP_*), test with the "Send test email" button, then invite users.
+
+#### 11.6.5 Triggering a manual graph rebuild
+
+Three ways:
+
+1. **UI** — Admin → Sessions → `<sid>` → "Rebuild graph". Queues a worker job.
+2. **API** — `POST /api/sessions/<sid>/rebuild`.
+3. **Direct compose** (last resort, bypasses bookkeeping):
+   ```bash
+   docker compose run --rm \
+     -e SESSION_ID=<sid> \
+     -e OTP_HEAP=$(grep OTP_BUILD_HEAP .env | cut -d= -f2) \
+     otp-build
+   ```
+
+After the build, the worker promotes the new graph (`graphs-<sid>/<ts>/graph.obj` + symlink update) and triggers `docker compose up -d otp-<sid>`.
+
+#### 11.6.6 Replaying a historical search
+
+> Admin UI → Replay → pick a date range or search filter → "Replay against current `serving` sessions".
+
+Each replay records as a new `JourneySearch` with `replay_of_search_id` pointing at the original. The UI shows a side-by-side diff of original vs current trips, flagging stations/routes that have moved.
+
+If a session's `main_version` differs from the original search's `main_version`, replay is **skipped for that session** (not silently re-run on a different timetable) — the UI badges this clearly.
+
+### 11.7 Backups & disaster recovery
+
+#### 11.7.1 What to back up
+
+| Volume | Why | Strategy |
+|---|---|---|
+| `pgdata` | All identity, config, audit, search history, master data | **Mandatory.** Daily `pg_dump`, off-VPS storage. |
+| `inbox-<sid>` | Raw uploaded feeds | Optional — re-downloadable from upstream. Back up only if you accept manual uploads not re-fetchable from any URL. |
+| `graphs-<sid>` | Built OTP graphs | **Don't back up.** Regenerable from `inbox-<sid>` in 30–60 min. |
+| `nginx/certs` | Let's Encrypt certs | Optional — certbot will re-issue on a clean VPS in minutes. |
+
+#### 11.7.2 Daily Postgres dump
+
+```bash
+# Add to /etc/cron.daily/viator-pg-dump
+#!/bin/bash
+set -euo pipefail
+TS=$(date -u +%Y%m%d-%H%M%S)
+docker compose -f /opt/viator/docker/docker-compose.yml exec -T postgres \
+  pg_dump -U viator -d viator --format=custom --compress=9 \
+  > /opt/backups/viator-${TS}.pgdump
+# Push off-VPS:
+rclone copy /opt/backups/ remote:viator-backups/ --max-age 24h
+# Local rotation:
+find /opt/backups -name 'viator-*.pgdump' -mtime +30 -delete
+```
+
+Restore on a new VPS (after running 11.2.1–11.2.6 to bring up an empty stack, then **stopping web** so it doesn't run migrations on top of the restore):
+
+```bash
+docker compose stop web worker
+docker compose exec -T postgres pg_restore -U viator -d viator --clean --if-exists < /path/to/dump.pgdump
+docker compose start web worker
+```
+
+#### 11.7.3 Configuration drift protection
+
+Master-data rows with `source='manual'` are **never** overwritten by the Trainline CSV bootstrap or any automatic refresh. If you've curated the master_stations table by hand, those edits survive forever — no backup needed. Same rule for `route_aliases`: hand-entered rows are sacred.
+
+### 11.8 Observability
+
+#### 11.8.1 Health endpoints
+
+| Endpoint | What it reports |
 |---|---|
-| `pgdata` | Daily `pg_dump` to off-VPS storage |
-| `inbox` (per session) | Re-downloadable from upstream → optional |
-| `graphs` (per session) | Regenerable from inbox → no backup |
+| `GET /api/healthz` | Web liveness — returns `200 {"ok": true}` if the process is alive |
+| `GET /api/readyz` | Web + DB readiness — checks Postgres connectivity |
+| `GET /otp/<sid>/actuators/health` | Per-session OTP — `{"status":"UP"}` once graph loaded |
 
-### 11.4 Observability
+External monitoring (UptimeRobot, Better Stack, etc.) should hit `readyz`, not `healthz` — readyz fails closed if the DB is down, healthz only fails if the process crashed.
 
-- `/api/healthz` — admin app liveness.
-- `/otp/<id>/actuators/health` — per-session OTP liveness.
-- Structured JSON logs to stdout; aggregated by Docker's default driver.
-- Optional: Prometheus exporter on the admin app for `uploads_total`, `rebuilds_total`, `auth_failures_total`.
+#### 11.8.2 Logs
+
+All containers log structured JSON to stdout. Docker's default `json-file` driver retains them on disk:
+
+```bash
+docker compose logs -f web                  # tail
+docker compose logs --since 1h worker       # last hour
+docker compose logs --tail 200 otp-nap-q2   # last 200 lines from one session
+```
+
+For long-term log shipping, point Docker at a remote log driver (e.g. `loki` or `awslogs`) — out of scope here.
+
+#### 11.8.3 Optional Prometheus exporter
+
+The web container exposes `/api/metrics` (disabled by default). Enable with platform_config key `METRICS_ENABLED=true`. Exported counters:
+
+- `viator_uploads_total{session_id, format}`
+- `viator_rebuilds_total{session_id, status}`
+- `viator_auth_failures_total{reason}`
+- `viator_fanout_executions_total{session_id, status}`
+- `viator_fanout_latency_ms_bucket{session_id, le}`
+
+Scrape from a Prometheus running outside the VPS — don't run Prometheus on the same VPS, that defeats the alerting.
+
+### 11.9 Routine maintenance
+
+| Task | Cadence | How |
+|---|---|---|
+| OS security updates | Weekly | `sudo apt update && sudo apt upgrade -y && sudo reboot` (off-hours) |
+| Docker engine upgrade | Quarterly | `sudo apt upgrade docker-ce docker-ce-cli containerd.io` then `docker compose down && up -d` |
+| Postgres minor version | When Postgres releases a patch | `docker compose pull postgres && docker compose up -d postgres` (pgdata persists across minor versions) |
+| Postgres major version | Yearly | Manual: `pg_dump` from old, `pg_restore` into new. Don't trust Postgres to in-place upgrade across majors in a Docker volume. |
+| Let's Encrypt renewal | Auto every 60 days | `systemctl list-timers | grep certbot` to verify the timer is alive |
+| Retention pruning (raw 30d / trips 180d / searches 365d) | Daily, automatic | APScheduler in the `worker` container — see §6 |
+| Master-data refresh (Trainline pull) | Monthly | Same scheduler — adjustable via `MASTER_REFRESH_CRON` in platform_config |
+| Audit log archive | Yearly | `pg_dump audit_events` to cold storage, then `DELETE FROM audit_events WHERE ts < now() - interval '1 year'` |
+| Secret rotation (`JWT_SECRET`, `BOOTSTRAP_TOKEN`, SMTP password) | Annually or on staff change | Edit `.env` (for JWT) or platform_config (for SMTP), `docker compose restart web`. Rotating `JWT_SECRET` invalidates all sessions — users must log in again. |
+
+### 11.10 Incident triage runbook
+
+| Symptom | Likely cause | First-response fix |
+|---|---|---|
+| `web` container restart-loops | Migration failure on startup | `docker compose logs web` — look for alembic error. If "table already exists" mismatch, manually run `alembic stamp head` and investigate. |
+| `otp-<sid>` restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, `docker compose up -d otp-<sid>`. Long-term: that session's graph has grown — consider splitting it. |
+| `otp-build` killed by OOM-killer (exit 137) | VPS RAM too small for that bundle | Either upgrade VPS, use a regional GTFS only, or temporarily raise swap (`fallocate -l 16G /swapfile && mkswap /swapfile && swapon /swapfile`). |
+| First request to OTP returns 503 | Graph not loaded yet | Wait for `Grizzly server running.` in `docker compose logs otp-<sid>`. Cold load takes 30–90 s for national. |
+| All sessions return `partial` from fanout | One slow session pushing past `FANOUT_TIMEOUT_MS` | Check per-session p95 in Admin → Reports → Volume per session. Either raise the timeout in platform_config or investigate the slow session. |
+| `worker` can't run `otp-build` (`permission denied … docker.sock`) | Socket perms | `sudo chmod 666 /var/run/docker.sock` (or run worker as root). On Linux distros that drop suid, may need `setfacl -m u:<uid>:rw /var/run/docker.sock`. |
+| Login fails for everyone after a JWT secret rotation | Existing JWTs no longer valid (expected) | Tell users to log in again. If `BOOTSTRAP_TOKEN` is also empty, you can't bootstrap a new admin — restore old `JWT_SECRET` temporarily. |
+| `bootstrap-platform-user` returns 403 | A platform admin already exists, or `BOOTSTRAP_TOKEN` is empty | Both correct behaviours. To create another admin, log in as the existing one and use the Users UI. |
+| SMTP test email fails with auth error | Bad creds or expired app password | Re-enter in Admin → Configuration → SMTP_*. For Gmail/Workspace, generate a fresh app password. |
+| Disk filling up with old graphs | Failed rebuilds left orphan graph dirs | `find /var/lib/docker/volumes/viator_graphs-*/_data -mindepth 1 -maxdepth 1 -type d -mtime +30 -name '20*' | head`. Verify they're not the current symlink target before deleting. |
+| `pg_dump` fails with "out of memory" | Audit log too big | Run with `--exclude-table=audit_events` for the bulk dump, then a separate `--table=audit_events --jobs=4` dump. Or archive old audit rows first (see §11.9). |
+| TLS cert expired | Certbot timer broken | `sudo certbot renew --force-renewal` then `docker compose restart nginx`. Investigate the systemd timer afterwards. |
+| Trainline CSV refresh fails | Upstream URL changed or rate-limited | Admin → Master data → check last-refresh log. If URL changed, edit `app/master/trainline.py`. Manual rows (source='manual') are unaffected. |
+| Fanout returns no results from a known-good session | Session's OTP graph not loaded, or session toggled `include_in_fanout=false` | Check `GET /api/sessions/<sid>` for state + flag. Toggle back via Admin → Sessions. |
+
+### 11.11 Capacity planning thresholds
+
+Watch these numbers; act when crossed:
+
+| Metric | Yellow | Red | Action |
+|---|---|---|---|
+| pgdata size | 20 GB | 50 GB | Tighten retention windows (§12), or scale up disk |
+| postgres `audit_events` row count | 10M | 100M | Archive + delete old rows (§11.9) |
+| Per-session graph size | 6 GB | 12 GB | Raise `OTP_SERVE_HEAP`; consider splitting the session |
+| Fanout p95 latency | 1500 ms | 3000 ms | Raise `FANOUT_TIMEOUT_MS`; investigate slow session |
+| RAM headroom on VPS | 4 GB free | 1 GB free | Stop one session, or upgrade VPS |
+| Disk headroom | 20% free | 10% free | Prune old graph dirs, archive audit, upgrade disk |
 
 ---
 
