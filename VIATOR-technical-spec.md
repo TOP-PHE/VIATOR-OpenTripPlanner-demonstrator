@@ -1289,187 +1289,362 @@ These need real MERITS data to test.
 
 ---
 
-## 15. DevOps & CI/CD
+## 15. DevOps — operational user guide
 
-### 15.1 Tooling matrix
+This chapter is a **how-to**, not a design document: it tells you exactly what to install, what commands to run, and what to do when CI goes red. The pipeline is mostly hands-off — the manual interventions are documented at the end.
 
-| Concern | Python (admin app + worker) | JavaScript (journey UI) | Containers |
+### 15.1 What's automated end-to-end
+
+Every push to `main` (and every PR) runs the following without human action:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  GitHub push / PR                                                     │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+   ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+   │  CI workflow   │ │ Pre-commit job │ │ Docker workflow│
+   │  ────────────  │ │ ────────────── │ │ ────────────── │
+   │  • ruff        │ │  • runs all    │ │  • build web   │
+   │  • black       │ │    pre-commit  │ │  • build otp   │
+   │  • mypy strict │ │    hooks fresh │ │  • hadolint    │
+   │  • bandit      │ │    in CI to    │ │  • Trivy scan  │
+   │  • pytest      │ │    catch drift │ │  • push GHCR   │
+   │  • coverage.xml│ │                │ │                │
+   │  • SonarCloud* │ │                │ │                │
+   └────────────────┘ └────────────────┘ └────────────────┘
+                             │
+                             ▼
+              ┌────────────────────────────┐
+              │  Status checks on commit   │
+              │  PR cannot merge until ✅  │
+              └────────────────────────────┘
+```
+
+`*` SonarCloud only runs if the repository variable `SONARCLOUD_ENABLED=true` and the secret `SONAR_TOKEN` are set — see 15.7.
+
+The deploy workflow (`deploy.yml`) is **manual on purpose** — see 15.10.
+
+### 15.2 Local development environment — one-time setup
+
+#### 15.2.1 Required toolchain
+
+| Tool | Version | Why this version | Where to get it |
 |---|---|---|---|
-| Test runner | **pytest** + **pytest-asyncio** + **httpx** test client | **Vitest** (preferred over Jest — ESM-native, faster, drop-in API) | — |
-| Coverage | **coverage.py** → lcov export | **c8** (vitest default) → lcov export | — |
-| Lint / format | **ruff** (replaces flake8 + isort + pylint) + **black** | **eslint** + **prettier** | **hadolint** for Dockerfiles |
-| Type check | **mypy** in strict mode for `app/` | TypeScript optional (consider for v2) | — |
-| Security | **bandit** + **pip-audit** | **npm audit** + **eslint-plugin-security** | **Trivy** (image CVE scan) |
-| DB migrations | **Alembic** | — | — |
-| Pre-commit | **pre-commit** framework wrapping ruff, black, prettier, eslint, hadolint | — | — |
-| Dep updates | **Renovate** (richer than Dependabot, free for OSS) | same | same |
+| **Python** | **3.12.x** | CI uses 3.12; **3.14 has a known pip 26.1 incompatibility** (`AttributeError: module 'warnings' has no attribute '_add_filter'`). Stick to 3.12 locally. | https://www.python.org/downloads/release/python-3128/ |
+| Docker Desktop | latest | For local OTP + Postgres + the per-session compose stack | docker.com |
+| Git | 2.40+ | — | git-scm.com |
+| GitHub CLI (`gh`) | optional | Lets you tail CI logs without opening a browser. Useful but not required. | https://cli.github.com/ |
+| Node.js 22 | optional | Only if you'll touch the journey UI build (vanilla JS works fine without) | nodejs.org |
 
-The Python/JS split is a feature, not a bug: each language ecosystem has mature, focused tooling. Trying to force a single test runner across both languages produces worse outcomes than running both natively.
+> **Windows specific:** if the Python installer asks "Add Python to PATH", say yes. Otherwise the `Scripts/` folder containing `uvicorn.exe`, `black.exe`, etc. won't be reachable. You can fix it after the fact via System Properties → Environment Variables, adding `C:\Users\<you>\AppData\Local\Programs\Python\Python312\Scripts` to the user PATH.
 
-### 15.2 GitHub Actions workflows
+#### 15.2.2 Install the project deps
 
-Three workflows, kept independent so they can fail in isolation:
+From the repo root:
+
+```bash
+# Pick the right Python explicitly (Windows: py -3.12; macOS/Linux: python3.12)
+py -3.12 -m pip install -r requirements.txt          # runtime
+py -3.12 -m pip install -r requirements-dev.txt      # adds black, ruff, mypy, pytest, bandit, pre-commit
+```
+
+> **Don't upgrade pip if it warns you to.** The notice "A new release of pip is available: 24.3.1 -> 26.1" is **harmless on Python 3.12**, but pip 26.1 is broken on Python 3.14 — keep pip 24.x to be safe across machines.
+
+#### 15.2.3 Verify the install
+
+A 5-second smoke check that doesn't need a database:
+
+```bash
+py -3.12 -c "from app import main; print('OK')"
+```
+
+If this prints `OK`, the import chain is healthy. If it raises, paste the traceback and fix before going further — CI will hit the same import error.
+
+#### 15.2.4 Install pre-commit hooks (recommended)
+
+```bash
+py -3.12 -m pre_commit install
+```
+
+This wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff/black/mypy/hadolint run automatically on staged files at commit time. **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway.
+
+### 15.3 Local quality gates — the same checks CI runs
+
+Before you push, run these in order. Each takes seconds. CI will run identical commands.
+
+```bash
+# 1. Lint
+py -3.12 -m ruff check .
+
+# 2. Format check (do not auto-fix; just verify)
+py -3.12 -m black --check .
+
+# 3. Type check (strict — every function must be fully typed)
+py -3.12 -m mypy --strict app
+
+# 4. Security scan
+py -3.12 -m bandit -r app -ll
+
+# 5. Tests (needs a Postgres on localhost:5432, see 15.4)
+py -3.12 -m pytest --cov=app --cov-report=xml
+```
+
+If any of those fail, CI will fail in the same way. Fixing locally is faster than push-wait-fix-push loops.
+
+**Auto-fix shortcuts:**
+
+```bash
+py -3.12 -m ruff check . --fix      # fixes most lint issues automatically
+py -3.12 -m black .                 # rewrites files in place to satisfy black --check
+```
+
+### 15.4 Running tests against Postgres locally
+
+The integration tests need a real Postgres (the tests touch CITEXT, JSONB, GIN trigram indexes — sqlite isn't equivalent).
+
+```bash
+# Bring up the same image CI uses
+docker run --rm -d --name viator-pg \
+    -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=viator_ci \
+    -p 5432:5432 postgres:16
+
+# Run alembic migrations against it
+DATABASE_URL=postgresql+psycopg://postgres:ci@localhost:5432/viator_ci \
+    py -3.12 -m alembic upgrade head
+
+# Run tests
+DATABASE_URL=postgresql+psycopg://postgres:ci@localhost:5432/viator_ci \
+    py -3.12 -m pytest -v
+
+# Tear down when done
+docker rm -f viator-pg
+```
+
+### 15.5 Repository structure for CI
 
 ```
 .github/workflows/
-├── ci.yml              # on every PR: lint, type-check, unit + integration tests, coverage upload
-├── docker.yml          # on push to main: build images, scan with Trivy, push to GHCR
-└── deploy.yml          # manual or on tag: pull images on the VPS via SSH, docker compose up -d
+├── ci.yml              # ruff + black + mypy + bandit + pytest + coverage + (optional) SonarCloud
+└── docker.yml          # web + otp image build, hadolint, Trivy, GHCR push (matrix)
+
+.pre-commit-config.yaml # local + CI pre-commit hooks
+pyproject.toml          # ruff/black/mypy/pytest/coverage config (single source of truth)
+sonar-project.properties # SonarCloud project metadata
+.trivyignore            # CVE allow-list (see 15.8)
+ci/trivy-config-ignore.rego  # OPA policy for Trivy config-mode (Dockerfile) findings
 ```
 
-#### `ci.yml` shape
+### 15.6 GitHub Actions workflows — what each does
 
-```yaml
-name: CI
-on: [pull_request, push]
+#### 15.6.1 `ci.yml` — Python lint + type + test
 
-jobs:
-  python:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env: { POSTGRES_PASSWORD: ci, POSTGRES_DB: viator_ci }
-        ports: [5432:5432]
-        options: --health-cmd pg_isready
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12", cache: pip }
-      - run: pip install -r docker/web/requirements.txt -r requirements-dev.txt
-      - run: ruff check .
-      - run: black --check .
-      - run: mypy app/
-      - run: pytest --cov=app --cov-report=xml
-      - uses: codecov/codecov-action@v4   # or sonarcloud upload step
-        if: always()
+Triggers: every PR + every push to `main`.
 
-  js:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", cache: npm, cache-dependency-path: journey-ui/package-lock.json }
-      - run: npm ci
-        working-directory: journey-ui
-      - run: npm run lint
-        working-directory: journey-ui
-      - run: npm test -- --coverage
-        working-directory: journey-ui
+Two jobs run in parallel:
 
-  sonar:
-    needs: [python, js]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }   # SonarCloud needs full history for blame
-      - uses: SonarSource/sonarcloud-github-action@v2
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+1. **`python`** — installs Python 3.12, brings up a Postgres 16 service container, runs ruff → black --check → mypy --strict → bandit → pytest → uploads `coverage.xml` as an artifact. If `SONARCLOUD_ENABLED=true`, also runs the SonarCloud scanner.
+2. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`. This is the belt-and-braces job: it catches the case where `.pre-commit-config.yaml` and the standalone tool versions have drifted.
+
+A failure in either job makes the PR un-mergeable (assuming branch protection is enabled per 15.7.3).
+
+#### 15.6.2 `docker.yml` — image build + security scan + GHCR push
+
+Triggers: push to `main` and tags matching `v*`.
+
+Matrix build over `[web, otp]`:
+
+1. **hadolint** lints the Dockerfile (DL3008, DL3015, etc.).
+2. **`docker buildx build`** builds the image, with build cache stored in GitHub Actions cache.
+3. **Trivy** scans the built image for CVEs at severity CRITICAL,HIGH. Findings allowed to remain are listed in `.trivyignore` (see 15.8).
+4. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
+
+> The OTP image is downstream of `eclipse-temurin:25-jre-noble`. Trivy findings on the JRE base layer are **not actionable by us** — we depend on Temurin's own update cadence. Configure `--ignore-unfixed` (already on) to suppress unactionable noise.
+
+### 15.7 GitHub repository setup checklist
+
+This is the **once-per-repository** configuration. After this, everything is automatic.
+
+#### 15.7.1 Secrets (Settings → Secrets and variables → Actions → Secrets)
+
+| Secret | Required for | How to obtain |
+|---|---|---|
+| `SONAR_TOKEN` | SonarCloud upload | sonarcloud.io → My Account → Security → Generate Tokens |
+| `GITHUB_TOKEN` | GHCR push | **auto-provided by GitHub** — no action needed |
+
+#### 15.7.2 Variables (Settings → Secrets and variables → Actions → Variables)
+
+| Variable | Effect | Default if absent |
+|---|---|---|
+| `SONARCLOUD_ENABLED` | Set to `true` to enable the SonarCloud scanner step | scanner is skipped (CI still passes) |
+
+The `SONARCLOUD_ENABLED` gate exists so that contributors who fork the repo can run CI without needing a Sonar token of their own. Set it to `true` in the upstream repo only.
+
+#### 15.7.3 Branch protection (Settings → Branches → Add rule for `main`)
+
+Recommended:
+
+- ✅ Require a pull request before merging
+- ✅ Require status checks to pass — select `python`, `pre-commit`, and (if used) `sonar` and `docker`
+- ✅ Require branches to be up to date before merging
+- ✅ Require conversation resolution before merging
+- ✅ Do not allow bypassing the above settings
+
+#### 15.7.4 Packages (GHCR) visibility
+
+After the first successful `docker.yml` run, two packages appear under the repo:
+
+- `ghcr.io/<owner>/<repo>/web`
+- `ghcr.io/<owner>/<repo>/otp`
+
+Both are **private by default**. Make them public if you want the demonstrator pulls to be anonymous (recommended for an OSS demonstrator):
+
+> Repo → Packages → click each package → Package settings → Change visibility → Public.
+
+#### 15.7.5 SonarCloud project setup (optional but recommended)
+
+1. https://sonarcloud.io → log in with GitHub.
+2. **+** → Analyze new project → import the GitHub repo.
+3. Choose **GitHub Actions** as the analysis method.
+4. Copy the `SONAR_TOKEN` it generates → paste into repo Secrets (15.7.1).
+5. Set repo Variable `SONARCLOUD_ENABLED=true`.
+6. Verify `sonar-project.properties` has the right `sonar.projectKey` and `sonar.organization` (set during creation).
+7. Default "Sonar way" quality gate is appropriate: new-code coverage ≥ 80%, new-code maintainability A, no new security hotspots.
+
+### 15.8 Trivy & security scanning — what to do with findings
+
+The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that has a fix available upstream. Three escape hatches, in order of preference:
+
+1. **Update the base image.** If `eclipse-temurin:25-jre-noble` has a newer revision, pin to it.
+2. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
+   ```
+   # .trivyignore — one CVE per line, with a justifying comment above each
+   # CVE-2024-XXXXX: jdwp debug port flag — not enabled in our JRE config
+   CVE-2024-XXXXX
+   ```
+3. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
+
+**Never blanket-ignore severity HIGH.** Each suppression must have a comment explaining why it's safe.
+
+### 15.9 Pre-commit framework — what runs and when
+
+`.pre-commit-config.yaml` configures these hooks (versions match the standalone tools in `requirements-dev.txt`):
+
+| Hook | What it does | Auto-fix? |
+|---|---|---|
+| `ruff` | Lint | Yes (`--fix`) |
+| `ruff-format` | Equivalent of black, faster | Yes |
+| `black` | Format check | Yes (rewrites files) |
+| `mypy` (strict) | Type check on `app/` | No — manual fix required |
+| `hadolint` | Dockerfile lint | No |
+
+After installing hooks (see 15.2.4), they run on every `git commit`. A failed hook **aborts the commit** and prints the diff. Re-stage the auto-fixed files and commit again.
+
+To run them on the whole repo without committing:
+
+```bash
+py -3.12 -m pre_commit run --all-files
 ```
 
-#### `docker.yml` shape
+### 15.10 Deployment to the VPS — manual on purpose
 
-```yaml
-name: Docker
-on:
-  push:
-    branches: [main]
-    tags: ["v*"]
+There is **no auto-deploy on push to main**. The `deploy.yml` workflow exists as a workflow_dispatch (manual trigger) so you choose when production rolls forward.
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions: { packages: write, contents: read }
-    strategy:
-      matrix:
-        image: [web, otp]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
-      - uses: docker/build-push-action@v6
-        with:
-          context: docker/${{ matrix.image }}
-          push: true
-          tags: ghcr.io/${{ github.repository }}/${{ matrix.image }}:${{ github.sha }}
-      - uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.image }}:${{ github.sha }}
-          severity: CRITICAL,HIGH
-          exit-code: 1
-          ignore-unfixed: true
-```
+The deploy step is:
 
-### 15.3 SonarCloud configuration
+1. **Tag the release locally:**
+   ```bash
+   git tag -a v0.3.0 -m "Step-21 complete; first end-to-end demonstrator"
+   git push origin v0.3.0
+   ```
+   This triggers `docker.yml` to build images tagged `v0.3.0`.
+2. **SSH to the VPS:**
+   ```bash
+   ssh viator@vps.trackonpath.com
+   cd /opt/viator
+   ```
+3. **Pull the new images and restart:**
+   ```bash
+   docker compose pull web         # pulls ghcr.io/.../web:latest
+   docker compose up -d web worker # rolling restart
+   ```
+4. **Run any pending Alembic migrations:**
+   ```bash
+   docker compose exec web alembic upgrade head
+   ```
+5. **Smoke check:**
+   ```bash
+   curl -fsS https://viator.trackonpath.com/api/health | jq
+   ```
 
-`sonar-project.properties` at repo root:
+Full VPS bring-up (cold install on a new server) is documented separately in `docker/INSTALL.md`.
 
-```properties
-sonar.projectKey=trackonpath_viator
-sonar.organization=trackonpath
-sonar.sources=app,journey-ui/src
-sonar.tests=tests,journey-ui/tests
-sonar.python.version=3.12
-sonar.python.coverage.reportPaths=coverage.xml
-sonar.javascript.lcov.reportPaths=journey-ui/coverage/lcov.info
-sonar.coverage.exclusions=**/tests/**,**/migrations/**
-sonar.exclusions=docker/otp/**,**/__pycache__/**,**/node_modules/**
-```
+### 15.11 Manual interventions — when CI is red
 
-Quality gate: default SonarCloud "Sonar way" gate is fine for v1 (new-code coverage ≥ 80%, new-code maintainability A, no new security hotspots). Tighten later.
+This table captures every failure mode hit during initial bring-up. Use it as a triage runbook.
 
-### 15.4 Test layout
+| Failing step | Symptom | Fix |
+|---|---|---|
+| **`black --check`** | `would reformat path/to/file.py` | Run `py -3.12 -m black .` locally, commit, push. Black is opinionated by design — never argue with it. |
+| **`ruff check`** | Rule code + file:line + suggested fix | Most rules are auto-fixable: `py -3.12 -m ruff check . --fix`. For the rest, edit per the rule's docs at https://docs.astral.sh/ruff/rules/. |
+| **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-python-jose`). Add to `requirements-dev.txt`, reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
+| **`mypy --strict`** "Returning Any from function declared to return X" | A typed function calls an untyped one | Wrap the return in an explicit cast: `result: str = untyped_call(...); return result`. Don't blanket-ignore. |
+| **`mypy --strict`** "Function 'count' could always be true in boolean context" | SQLAlchemy Row attribute clashes with `tuple.count` / `tuple.index` method | Rename the column label: `func.count().label("count")` → `func.count().label("n_executions")` and update the consumer. |
+| **`mypy --strict`** "Unused 'type: ignore' comment" | Mypy got smarter and no longer needs the suppression | Just delete the `# type: ignore[...]` comment. |
+| **FastAPI startup** `AssertionError: Status code 204 must not have a response body` | Endpoint declared `status_code=204` with default JSON response class | Type the function as `-> Response` and return `Response(status_code=status.HTTP_204_NO_CONTENT)` explicitly. See the auth routes for the canonical pattern. |
+| **`pytest`** Postgres connection refused | No Postgres on `localhost:5432` | Start one per 15.4, set `DATABASE_URL`. |
+| **`bandit`** new MEDIUM/HIGH finding | A real security issue | Fix the code. If genuinely a false positive, mark the line with `# nosec BXXX` + a comment. |
+| **`Trivy`** CRITICAL on the OTP image | Almost always a JRE base CVE | Bump `eclipse-temurin:25-jre-noble` digest in `docker/otp/Dockerfile`. If no fix available, use `--ignore-unfixed` (already on) — the build still passes. |
+| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | You're on Python 3.14 with pip 26.1 | Install Python **3.12** alongside 3.14: download from python.org, then use `py -3.12 -m pip` everywhere. |
+| **`ruff` / `black` / `pytest` not found** after `pip install` | Scripts directory not on PATH | Either add `…\Python312\Scripts` to PATH (15.2.1), or always invoke as `py -3.12 -m <tool>`. |
+| **PowerShell** `&&` parser error | You're on Windows PowerShell 5.1 (no `&&` support) | Use `;` to chain unconditionally, or `; if ($?) { ... }` for "run B only if A succeeded". Or upgrade to PowerShell 7. |
+| **Git** "LF will be replaced by CRLF" warnings on Windows | Git's `core.autocrlf=true` rewriting line endings | **Harmless** — files in the repo stay LF, only the working copy gets CRLF. To silence: add a `.gitattributes` with `* text=auto eol=lf`. |
+| **GitHub Actions** "Node.js 20 actions are deprecated" | Composite action upgrade reminder | Not a failure — informational only. Will become an error in June 2026. Bump action versions then (`@v4` → `@v5+`). |
+| **Coverage upload** "No files were found with the provided path: coverage.xml" | pytest didn't run (an earlier step failed) | Look at the previous step's logs — fix the upstream failure and the artifact will appear. |
+| **GHCR push** "denied: permission_denied" | Workflow lacks `packages: write` permission | Already set in `docker.yml`. If you fork, you may need to enable Workflow permissions: Settings → Actions → General → Workflow permissions → "Read and write permissions". |
+| **SonarCloud** "Project not found" | Repo Variable `SONARCLOUD_ENABLED=true` but project not yet imported on sonarcloud.io | Either import the project (15.7.5) or unset the Variable to skip the step. |
 
-```
-tests/                                      # Python tests
-├── unit/
-│   ├── test_detect.py                      # format-detection rules
-│   ├── test_trip_signature.py              # canonicaliser + alias resolution
-│   ├── test_dispatch.py                    # ingestion routing
-│   └── test_config_schema.py               # platform_config validation + masking
-├── integration/
-│   ├── test_auth_flow.py                   # register → confirm → login → me
-│   ├── test_session_lifecycle.py           # create → upload → build → serve
-│   ├── test_fanout.py                      # twin-session: 100% BOTH expected
-│   └── test_replay.py                      # main-version mismatch handling
-└── conftest.py                             # pytest fixtures: db, client, sample feeds
+### 15.12 Tooling matrix (reference)
 
-journey-ui/tests/                           # JS tests
-├── unit/
-│   └── results-merging.test.js             # frontend dedup of fanout results
-└── e2e/                                    # optional Playwright later
-```
+| Concern | Tool | Pinned version | Config location |
+|---|---|---|---|
+| Test runner | pytest + pytest-asyncio + pytest-cov + httpx | 8.3.4 / 0.24.0 / 6.0.0 / 0.28.1 | `pyproject.toml` `[tool.pytest.ini_options]` |
+| Coverage | coverage.py (via pytest-cov) → `coverage.xml` | 7.13.5 | `pyproject.toml` `[tool.coverage.*]` |
+| Lint | ruff | 0.7.4 | `pyproject.toml` `[tool.ruff]` |
+| Format | black | 24.10.0 | `pyproject.toml` `[tool.black]` |
+| Type | mypy (strict) | 1.13.0 | `pyproject.toml` `[tool.mypy]` |
+| Security (code) | bandit | 1.7.10 | `pyproject.toml` `[tool.bandit]` |
+| Security (deps) | pip-audit | 2.7.3 | command-line flags |
+| Container scan | Trivy (via aquasecurity/trivy-action) | 0.28.1 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
+| Dockerfile lint | hadolint | 2.13.1-beta | command-line flags |
+| Pre-commit | pre-commit | 4.0.1 | `.pre-commit-config.yaml` |
+| Migrations | Alembic | 1.14.0 | `alembic.ini` + `alembic/env.py` |
+| Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
+| Type stubs | types-requests, types-passlib, types-python-jose, sqlalchemy[mypy] | various | `requirements-dev.txt` |
 
-Pytest fixtures use **testcontainers-python** for ephemeral Postgres and (for the integration tests that need it) a stub OTP container exposing canned GraphQL responses. This keeps integration tests hermetic and fast.
+### 15.13 What the JS toolchain looks like (when we add it)
 
-### 15.5 Pre-commit configuration
+The journey UI is currently vanilla HTML+JS+CSS served by FastAPI/Jinja — no build step. If/when it grows to need a bundler:
 
-`.pre-commit-config.yaml`:
+| Concern | Tool |
+|---|---|
+| Test runner | Vitest (preferred over Jest — ESM-native, faster) |
+| Coverage | c8 (vitest default) → lcov export |
+| Lint | eslint + prettier |
+| Type | TypeScript (optional) |
+| Security | npm audit + eslint-plugin-security |
 
-```yaml
-repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.4
-    hooks: [{id: ruff, args: [--fix]}, {id: ruff-format}]
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
-    hooks: [{id: mypy, additional_dependencies: [pydantic, sqlalchemy]}]
-  - repo: https://github.com/hadolint/hadolint
-    rev: v2.13.1-beta
-    hooks: [{id: hadolint-docker}]
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v4.0.0-alpha.8
-    hooks: [{id: prettier, types: [javascript, html, css]}]
-```
+A new job in `ci.yml` would mirror the `python` job: `npm ci → npm run lint → npm test -- --coverage → upload lcov.info → SonarCloud`.
 
-### 15.6 Architectural notes for CI
+### 15.14 Architectural notes
 
-- **Worker mounts `/var/run/docker.sock`** — Trivy will flag the worker container with high-severity findings related to root-equivalent host access. This is a **known accepted trade-off** documented in §10.1; CI suppresses it via a `trivy-ignore.rego` policy file. Don't blanket-ignore severity HIGH.
-- **OTP image** is a downstream rebuild of `eclipse-temurin:25-jre-noble` plus an OTP shaded jar. Trivy findings on the JRE base are not actionable by us — we depend on Temurin's own update cadence. Configure `--ignore-unfixed` to suppress unactionable noise.
-- **Multi-language coverage reports** — both `coverage.xml` (Python) and `lcov.info` (JS) must be uploaded **before** the SonarCloud job runs. The example workflow above has the right ordering.
-- **Postgres-as-a-service in CI** is sufficient for integration tests. No need for testcontainers in CI itself; testcontainers is the local-developer convenience for running tests outside CI.
+- **Worker mounts `/var/run/docker.sock`** — Trivy will flag the worker container with high-severity findings related to root-equivalent host access. This is a **known accepted trade-off** documented in §10.1; CI suppresses it via `ci/trivy-config-ignore.rego`. Do not blanket-ignore severity HIGH.
+- **OTP image** is a downstream rebuild of `eclipse-temurin:25-jre-noble` plus `otp-shaded-2.9.0.jar`. Trivy findings on the JRE base are not actionable by us — we depend on Temurin's update cadence. `--ignore-unfixed` is on.
+- **Postgres-as-a-service in CI** is sufficient for integration tests. No need for testcontainers in CI itself; testcontainers is a local-developer convenience for running tests outside CI.
+- **Coverage report ordering** — `coverage.xml` (Python) must exist on disk before the SonarCloud step runs. The `python` job emits it; the SonarCloud step `needs: python`.
+- **Pip cache** — `actions/setup-python@v5` with `cache: pip` keys on `requirements*.txt` hashes. Bumping a single dep invalidates the cache for that key only.
 
 ---
 
