@@ -1251,18 +1251,73 @@ docker compose up -d postgres web worker nginx
 
 #### 11.2.7 Wire HTTPS
 
-Once the domain is pointing at the VPS:
+`docker/nginx/nginx.conf` already includes the `:443` server block, the `:80 → :443` redirect, and a Mozilla "intermediate" TLS profile (TLS 1.2 + 1.3, no weak ciphers). `docker/docker-compose.yml` already mounts `/etc/letsencrypt:/etc/nginx/certs:ro` on nginx and exposes port 443. Wiring HTTPS is therefore: issue the cert, force-recreate nginx, flip the cookie/URL settings, set up renewal hooks. Full step-by-step in `docker/INSTALL.md` §9.
+
+**Prerequisites**
+- Public DNS resolves the chosen hostname to the VPS IP. Verify with `dig @8.8.8.8 +short <hostname>` (force a public resolver — local `dig` checks `/etc/hosts` first and returns `127.0.1.1` for the VPS's own name).
+- The Phase-A `nginx.conf` has `vmi3259514.contaboserver.net` hardcoded as both `server_name` and the cert path. **If your hostname differs**, edit `docker/nginx/nginx.conf` (search/replace) and commit before issuing the cert — otherwise nginx fails to start because the cert path doesn't exist. Templating via env var is Phase-B work (alongside the orchestrator auto-wire).
+
+**Issue the cert and bring up TLS**
 
 ```bash
 sudo apt install -y certbot
-sudo certbot certonly --standalone -d viator.example.com \
-  --pre-hook  "docker compose -f /opt/viator/docker/docker-compose.yml stop nginx" \
-  --post-hook "docker compose -f /opt/viator/docker/docker-compose.yml start nginx"
+cd /opt/viator/docker
+docker compose stop nginx                                          # free port 80 for the challenge
+sudo certbot certonly --standalone -d <hostname> \
+    --email <contact-email> --agree-tos --no-eff-email --non-interactive
+docker compose up -d --force-recreate nginx                         # picks up the cert + 443 mapping
 ```
 
-Mount the cert directory in `docker-compose.yml` (`./nginx/certs:/etc/nginx/certs:ro`), uncomment the `:443` server in `nginx/nginx.conf`, then `docker compose restart nginx`.
+The `ps` PORTS column should now show `0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp`. If only `:80` shows, the running container was started before the HTTPS-aware compose file landed locally — `git pull` and re-`force-recreate`.
 
-Certbot installs a systemd timer for auto-renewal — verify with `systemctl list-timers | grep certbot`.
+**Flip cookie + base URL to HTTPS**
+
+```bash
+sed -i 's/^JWT_COOKIE_SECURE=.*/JWT_COOKIE_SECURE=true/' /opt/viator/docker/.env
+sed -i 's|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=https://<hostname>|' /opt/viator/docker/.env
+docker compose up -d --force-recreate web                           # re-read .env (restart doesn't)
+```
+
+`JWT_COOKIE_SECURE=true` makes browsers drop the cookie on plain HTTP (intended). `PUBLIC_BASE_URL` builds absolute URLs in magic-link emails.
+
+**Verify**
+
+```bash
+curl -s https://<hostname>/healthz                                  # → {"status":"ok"}
+curl -sI -X GET http://<hostname>/healthz | head -3                 # → HTTP/1.1 301; location: https://<hostname>/healthz
+```
+
+In a browser: `https://<hostname>/login` → green padlock + Let's Encrypt cert.
+
+**Cert auto-renewal hooks**
+
+Certbot's apt-installed systemd timer runs `certbot renew` daily, which uses the original method (`--standalone`) — that conflicts with running nginx on port 80. Add per-cert hooks so renewal stops nginx, renews, and starts nginx automatically:
+
+```bash
+sudo python3 - <<'PYEOF'
+from pathlib import Path
+import re
+HOSTNAME = "<hostname>"          # substitute
+f = Path(f"/etc/letsencrypt/renewal/{HOSTNAME}.conf")
+text = f.read_text()
+parts = text.split('[renewalparams]')
+if len(parts) > 2:                              # de-duplicate any earlier mistakes
+    text = parts[0] + '[renewalparams]' + parts[1].rstrip() + '\n'
+text = re.sub(r'^pre_hook\s*=.*\n?',  '', text, flags=re.MULTILINE)
+text = re.sub(r'^post_hook\s*=.*\n?', '', text, flags=re.MULTILINE)
+text = text.rstrip() + (
+    '\npre_hook = docker compose -f /opt/viator/docker/docker-compose.yml stop nginx'
+    '\npost_hook = docker compose -f /opt/viator/docker/docker-compose.yml start nginx\n'
+)
+f.write_text(text)
+PYEOF
+
+sudo certbot renew --dry-run                                        # all simulated renewals should succeed
+```
+
+> **Don't use `tee -a [renewalparams]` for this.** Appending creates a duplicate `[renewalparams]` section, which Python's INI parser rejects with `parsefail`. The script above is idempotent and de-duplicates if you've already tried.
+
+The "ran with error output" lines that `--dry-run` prints around the hooks are misleading — `docker compose stop`/`start` writes progress to stderr; the hooks succeeded. Verify with `docker compose ps nginx` showing nginx back up.
 
 ### 11.3 Database initialisation
 
@@ -1496,7 +1551,7 @@ Scrape from a Prometheus running outside the VPS — don't run Prometheus on the
 | Docker engine upgrade | Quarterly | `sudo apt upgrade docker-ce docker-ce-cli containerd.io` then `docker compose down && up -d` |
 | Postgres minor version | When Postgres releases a patch | `docker compose pull postgres && docker compose up -d postgres` (pgdata persists across minor versions) |
 | Postgres major version | Yearly | Manual: `pg_dump` from old, `pg_restore` into new. Don't trust Postgres to in-place upgrade across majors in a Docker volume. |
-| Let's Encrypt renewal | Auto every 60 days | `systemctl list-timers | grep certbot` to verify the timer is alive |
+| Let's Encrypt renewal | Auto every 60 days | `systemctl list-timers \| grep certbot` to verify the timer is alive. **Hooks must be configured** (`pre_hook`/`post_hook` in `/etc/letsencrypt/renewal/<host>.conf` — see §11.2.7) or renewal will fail because nginx still owns port 80. Test once with `sudo certbot renew --dry-run`. |
 | Retention pruning (raw 30d / trips 180d / searches 365d) | Daily, automatic | APScheduler in the `worker` container — see §6 |
 | Master-data refresh (Trainline pull) | Monthly | Same scheduler — adjustable via `MASTER_REFRESH_CRON` in platform_config |
 | Audit log archive | Yearly | `pg_dump audit_events` to cold storage, then `DELETE FROM audit_events WHERE ts < now() - interval '1 year'` |
@@ -1517,7 +1572,7 @@ Scrape from a Prometheus running outside the VPS — don't run Prometheus on the
 | SMTP test email fails with auth error | Bad creds or expired app password | Re-enter in Admin → Configuration → SMTP_*. For Gmail/Workspace, generate a fresh app password. |
 | Disk filling up with old graphs | Failed rebuilds left orphan graph dirs | `find /var/lib/docker/volumes/viator_graphs-*/_data -mindepth 1 -maxdepth 1 -type d -mtime +30 -name '20*' | head`. Verify they're not the current symlink target before deleting. |
 | `pg_dump` fails with "out of memory" | Audit log too big | Run with `--exclude-table=audit_events` for the bulk dump, then a separate `--table=audit_events --jobs=4` dump. Or archive old audit rows first (see §11.9). |
-| TLS cert expired | Certbot timer broken | `sudo certbot renew --force-renewal` then `docker compose restart nginx`. Investigate the systemd timer afterwards. |
+| TLS cert expired | Certbot timer broken (often: `parsefail` on `/etc/letsencrypt/renewal/<host>.conf` from a duplicate `[renewalparams]` section, or missing `pre_hook`/`post_hook` so renewal can't free port 80) | `sudo certbot renew --force-renewal --pre-hook "..." --post-hook "..."` to recover the cert immediately, then fix the renewal config per §11.2.7 so the timer works unattended next time. Verify with `sudo certbot renew --dry-run`. |
 | Trainline CSV refresh fails | Upstream URL changed or rate-limited | Admin → Master data → check last-refresh log. If URL changed, edit `app/master/trainline.py`. Manual rows (source='manual') are unaffected. |
 | Fanout returns no results from a known-good session | Session's OTP graph not loaded, or session toggled `include_in_fanout=false` | Check `GET /api/sessions/<sid>` for state + flag. Toggle back via Admin → Sessions. |
 
@@ -2037,6 +2092,10 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **`upload-sarif`** "Resource not accessible by integration" | `github/codeql-action/upload-sarif` needs `actions: read` to fetch run metadata, in addition to `security-events: write`. The default `GITHUB_TOKEN` doesn't get this implicitly. | Add `actions: read` to the job's `permissions:` block. Already set in `docker.yml`. |
 | **Trivy** scan exits 1 on the OTP image with Java CVE findings | OTP's shaded jar bundles transitive Java deps that we don't control | The workflow scopes the OTP image scan to `vuln-type: os` (OS packages only) for this reason. If you see this failure, it means someone changed the matrix entry to `os,library`. Either revert, or address the upstream Java CVE per §15.8.1. |
 | **Trivy** scan exits 1 on **OS packages** (Ubuntu/Debian) | The base image is shipping with un-patched CVEs | First, check the diagnostic step's table output (immediately above the failed gating step) to see the CVE list. Then: (1) push an empty commit to force a fresh build that re-runs `apt-get upgrade`; (2) if that doesn't clear it, the patch isn't in the distro yet — bump the base image tag in `docker/<svc>/Dockerfile`; (3) if no fix exists upstream, add the CVE to `.trivyignore` with a one-line rationale. |
+| **`certbot renew --dry-run`** "Renewal configuration file is broken … (parsefail)" | A duplicate `[renewalparams]` section in `/etc/letsencrypt/renewal/<host>.conf`. Usually caused by `tee -a` appending the section instead of editing inside the existing one. | Run the idempotent fix script in spec §11.2.7 — splits on `[renewalparams]`, keeps only the first body, strips any prior `pre_hook`/`post_hook`, then appends fresh hooks inside the (single) section. `--dry-run` after that should show "all simulated renewals succeeded." |
+| **HTTPS** browser shows `ERR_TOO_MANY_REDIRECTS` | The login page redirects non-admins to `/`, and `/` redirects back to `/login` in Phase-2 mode. | Fixed in commit `7838f59` — login destination is now `/journey` for non-admins. Pull + rebuild web. If the issue persists, check `app/templates/auth/login.html` and `app/api/pages.py::login_page` — both should send non-admins to `/journey`. |
+| **HTTPS** "ERR_CONNECTION_REFUSED" on `:443` after wiring HTTPS | Nginx container started before the HTTPS compose changes were applied. `docker compose ps nginx` shows only `:80` mapped. | `docker compose up -d --force-recreate nginx` to apply the new ports + cert mount. Plain `restart` doesn't re-read the compose file. |
+| Browser shows native **basic-auth dialog** when hitting bare hostname | Phase-1 upload UI is reached at `/`. `ADMIN_USER` is set, or the redirect-to-login fix isn't deployed yet. | Two fixes: (1) `ADMIN_USER=` empty in `.env` puts you in Phase-2 mode where `/` redirects to `/login`; (2) ensure commit `f8706c6` or later is on the running web container (`docker compose ps web` should show recent `Up`). |
 | **`upload-sarif`** "Code scanning is not enabled for this repository" | Code Scanning hasn't been turned on in repo settings | Two options: (a) Enable Code Scanning per §15.7.5 — free for public repos, gives you the Security tab UI; (b) ignore — the `upload-sarif` step is `continue-on-error: true`, and SARIFs are still saved as 14-day workflow artifacts. |
 | **SonarCloud** "Project not found" | Repo Variable `SONARCLOUD_ENABLED=true` but project not yet imported on sonarcloud.io | Either import the project (15.7.5) or unset the Variable to skip the step. |
 

@@ -193,18 +193,142 @@ You can now invite the rest of the team via Admin → Users.
 
 ## 9. Add HTTPS
 
-Once the domain is pointing at the VPS:
+Let's Encrypt issues free certs for any hostname with public DNS. The repo ships with a Phase-A nginx config that already includes the `:443` server block and HTTP→HTTPS redirect (`docker/nginx/nginx.conf`); you just need to issue the cert and trigger nginx to re-read its config.
+
+### 9.1 Verify the public hostname resolves to your VPS
+
+The Contabo auto-assigned name (e.g. `vmi3259514.contaboserver.net`), an `sslip.io` derivative, or a domain you control — any will do. Verify against a public resolver, **not** the VPS's own DNS (which checks `/etc/hosts` first and returns `127.0.1.1` for the local hostname):
 
 ```bash
-sudo apt install -y certbot
-sudo certbot certonly --standalone -d viator.example.com \
-  --pre-hook  "docker compose -f /opt/viator/docker/docker-compose.yml stop nginx" \
-  --post-hook "docker compose -f /opt/viator/docker/docker-compose.yml start nginx"
+dig @8.8.8.8 +short <your-hostname>
+# Expected: <your-VPS-public-IP>
 ```
 
-Then in `nginx/nginx.conf`: uncomment the `:443` server, mount the cert directory in `docker-compose.yml` (`./nginx/certs:/etc/nginx/certs:ro`), and `docker compose restart nginx`.
+If it returns the wrong IP or nothing, fix DNS first. Let's Encrypt won't issue against IPs or unresolvable names.
 
-A renewal cron is auto-installed by certbot; verify with `systemctl list-timers | grep certbot`.
+### 9.2 Install certbot and issue the certificate
+
+The Phase-A nginx config has `vmi3259514.contaboserver.net` hardcoded as the `server_name` and cert path. **If your hostname is different**, edit `docker/nginx/nginx.conf` first (search/replace) and `git commit` before issuing the cert — otherwise nginx will fail to start because the cert path doesn't exist.
+
+```bash
+sudo apt update && sudo apt install -y certbot
+
+# Stop nginx so certbot's --standalone mode can grab port 80 for the
+# HTTP-01 challenge.
+cd /opt/viator/docker
+docker compose stop nginx
+
+# Issue the cert.
+sudo certbot certonly --standalone \
+  -d <your-hostname> \
+  --email <your-contact-email> \
+  --agree-tos --no-eff-email --non-interactive
+```
+
+Success leaves four symlinks at `/etc/letsencrypt/live/<hostname>/`:
+`cert.pem`, `chain.pem`, `fullchain.pem`, `privkey.pem`.
+
+### 9.3 Bring nginx back up with HTTPS
+
+The compose file already mounts `/etc/letsencrypt:/etc/nginx/certs:ro` on the nginx service, so the cert is reachable inside the container. Force-recreate so the new port mapping takes effect:
+
+```bash
+docker compose up -d --force-recreate nginx
+docker compose ps nginx
+```
+
+The `PORTS` column should now show `0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp`. If only `:80` is listed, the running container is on the pre-HTTPS config — `git pull` to be sure the local repo has the right `docker-compose.yml`, then re-run `--force-recreate`.
+
+### 9.4 Flip the cookie + base URL to HTTPS
+
+Edit `.env`:
+
+```bash
+sed -i 's/^JWT_COOKIE_SECURE=.*/JWT_COOKIE_SECURE=true/' /opt/viator/docker/.env
+sed -i 's|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=https://<your-hostname>|' /opt/viator/docker/.env
+
+# Force re-read of .env on web (restart doesn't pick up env changes)
+cd /opt/viator/docker
+docker compose up -d --force-recreate web
+```
+
+`JWT_COOKIE_SECURE=true` makes browsers drop the `viator_jwt` cookie on plain HTTP (intended). `PUBLIC_BASE_URL` is used to build absolute URLs in magic-link emails, so it must match the public HTTPS hostname.
+
+### 9.5 Verify the TLS surface
+
+```bash
+# 1. HTTPS direct (use GET, not HEAD — /healthz is GET-only)
+curl -s https://<your-hostname>/healthz
+# Expected: {"status":"ok"}
+
+# 2. HTTP redirects to HTTPS
+curl -sI -X GET http://<your-hostname>/healthz | head -3
+# Expected:
+#   HTTP/1.1 301 Moved Permanently
+#   location: https://<your-hostname>/healthz
+```
+
+In a browser: open `https://<your-hostname>/login` — green padlock, valid Let's Encrypt cert.
+
+### 9.6 Wire cert auto-renewal hooks
+
+Apt-installed certbot ships a systemd timer that runs `certbot renew` daily. Once the cert is within 30 days of expiry, the timer renews — but it uses the original method (`--standalone`), which conflicts with running nginx on port 80. Add `pre_hook` / `post_hook` to the per-cert renewal config so renewal stops nginx, renews, and starts nginx automatically:
+
+```bash
+sudo python3 - <<'PYEOF'
+from pathlib import Path
+import re
+
+# Substitute your hostname in the next line.
+HOSTNAME = "<your-hostname>"
+
+f = Path(f"/etc/letsencrypt/renewal/{HOSTNAME}.conf")
+text = f.read_text()
+
+# Drop any duplicate [renewalparams] sections from earlier mistakes.
+parts = text.split('[renewalparams]')
+if len(parts) > 2:
+    text = parts[0] + '[renewalparams]' + parts[1].rstrip() + '\n'
+
+# Strip any prior pre_hook / post_hook lines so re-running is idempotent.
+text = re.sub(r'^pre_hook\s*=.*\n?',  '', text, flags=re.MULTILINE)
+text = re.sub(r'^post_hook\s*=.*\n?', '', text, flags=re.MULTILINE)
+
+# Append the hooks inside the (single) [renewalparams] section.
+text = text.rstrip() + (
+    '\npre_hook = docker compose -f /opt/viator/docker/docker-compose.yml stop nginx'
+    '\npost_hook = docker compose -f /opt/viator/docker/docker-compose.yml start nginx\n'
+)
+
+f.write_text(text)
+print('Updated', f)
+PYEOF
+```
+
+> **Don't use `tee -a [renewalparams]` to do this.** Appending creates a *second* `[renewalparams]` section, which Python's INI parser rejects with `parsefail`. The script above handles deduplication + idempotency.
+
+Verify:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+Expected near the end:
+
+```
+Hook 'pre-hook' ran with error output:
+ Container viator-nginx-1 Stopping
+  Container viator-nginx-1 Stopped
+Simulating renewal of an existing certificate for <hostname>
+Congratulations, all simulated renewals succeeded:
+  /etc/letsencrypt/live/<hostname>/fullchain.pem (success)
+Hook 'post-hook' ran with error output:
+  Container viator-nginx-1 Started
+```
+
+The "ran with error output" lines are misleading — `docker compose stop/start` writes progress to stderr; the hooks succeeded. Verify with `docker compose ps nginx` showing nginx back up.
+
+After this, real renewals in ~60 days happen unattended.
 
 ---
 
