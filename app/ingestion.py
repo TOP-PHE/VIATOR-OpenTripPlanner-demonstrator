@@ -10,7 +10,7 @@ Layout:
 from __future__ import annotations
 
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session as DbSession
@@ -92,7 +92,7 @@ def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> N
     job = RebuildJob(
         session_id=session_id,
         status="pending",
-        log=f"queued at {datetime.utcnow().isoformat()} — {reason}\n",
+        log=f"queued at {datetime.now(UTC).isoformat()} — {reason}\n",
     )
     db.add(job)
     db.commit()

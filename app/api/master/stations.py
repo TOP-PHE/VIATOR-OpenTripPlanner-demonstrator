@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -108,7 +108,7 @@ def patch_station(
             setattr(s, f, v)
     if changes:
         s.source = "manual"
-        s.updated_at = datetime.utcnow()
+        s.updated_at = datetime.now(UTC)
         audit.record(
             db,
             action="master_station.updated",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -212,7 +212,7 @@ async def _do_upload(
     file: UploadFile,
 ) -> RedirectResponse:
     # Persist to a per-upload folder so concurrent uploads don't collide.
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     staging = settings.inbox_dir / "_staging" / f"{stamp}-{secrets.token_hex(4)}"
     staging.mkdir(parents=True, exist_ok=True)
     stored_path = staging / Path(file.filename or "upload.bin").name

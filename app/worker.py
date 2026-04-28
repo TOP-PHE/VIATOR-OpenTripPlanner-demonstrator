@@ -15,7 +15,7 @@ import logging
 import shutil
 import subprocess
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import asc
@@ -57,11 +57,11 @@ def tick() -> None:
             return
 
         deadline = job.created_at + timedelta(seconds=settings.debounce_seconds)
-        if datetime.utcnow() < deadline:
+        if datetime.now(UTC) < deadline:
             return
 
         job.status = "running"
-        job.started_at = datetime.utcnow()
+        job.started_at = datetime.now(UTC)
         db.commit()
         job_id = job.id
         sid = job.session_id
@@ -73,7 +73,7 @@ def tick() -> None:
         job = db.get(RebuildJob, job_id)
         if job is None:  # pragma: no cover  defensive
             return
-        job.finished_at = datetime.utcnow()
+        job.finished_at = datetime.now(UTC)
         job.status = "done" if success else "failed"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
@@ -151,7 +151,7 @@ def handle_reload_trigger() -> None:
 def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     """Invoke OTP build via the docker socket. Returns (log, success, graph_path)."""
     sid = session_id or "_phase1"
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     graph_target = Path(str(settings.graph_dir)) / sid / timestamp
     graph_target.mkdir(parents=True, exist_ok=True)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
@@ -54,7 +54,7 @@ class PlanBody(FanoutBody):
 def _resolve_when(body: FanoutBody) -> tuple[str, datetime]:
     if body.arrive_by is not None:
         return "arrive_by", body.arrive_by
-    return "depart_at", body.depart_at or datetime.utcnow()
+    return "depart_at", body.depart_at or datetime.now(UTC)
 
 
 async def _query_session(
