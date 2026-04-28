@@ -66,7 +66,7 @@ def admin(client: TestClient) -> dict[str, str]:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },
@@ -188,7 +188,7 @@ def test_admin_pages_render_for_admin(client: TestClient) -> None:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },

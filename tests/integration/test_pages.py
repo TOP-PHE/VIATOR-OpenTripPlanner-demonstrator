@@ -66,7 +66,7 @@ def _bootstrap_admin(client: TestClient) -> str:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },
@@ -137,7 +137,7 @@ def test_admin_users_renders_for_platform_admin(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.text
     # The bootstrapped admin is in the table.
-    assert "admin@viator.test" in body
+    assert "admin@viator.example" in body
     # The "you" marker appears next to the current user.
     assert "(you)" in body
     # The role select has the three valid values.
@@ -162,7 +162,7 @@ def test_admin_users_forbidden_for_end_user(client: TestClient) -> None:
         db.add(
             VerificationToken(
                 token_hash=hashed,
-                email="enduser@viator.test",
+                email="enduser@viator.example",
                 name="End User",
                 expires_at=datetime.now(UTC) + timedelta(hours=1),
             )

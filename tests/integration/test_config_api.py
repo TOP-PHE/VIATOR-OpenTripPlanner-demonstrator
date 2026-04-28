@@ -76,7 +76,7 @@ def admin_headers(client: TestClient) -> dict[str, str]:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },

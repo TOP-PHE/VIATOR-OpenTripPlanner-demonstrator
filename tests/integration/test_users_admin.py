@@ -63,7 +63,7 @@ def admin(client: TestClient) -> tuple[str, str]:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },
@@ -126,7 +126,7 @@ def test_list_users(client: TestClient, admin: tuple[str, str]) -> None:
     r = client.get("/api/users", headers={"Authorization": f"Bearer {jwt}"})
     assert r.status_code == 200
     emails = [u["email"] for u in r.json()]
-    assert {"admin@viator.test", "alice@example.org", "bob@example.org"}.issubset(set(emails))
+    assert {"admin@viator.example", "alice@example.org", "bob@example.org"}.issubset(set(emails))
 
 
 def test_promote_user_to_content_manager(client: TestClient, admin: tuple[str, str]) -> None:

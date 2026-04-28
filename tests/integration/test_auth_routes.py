@@ -132,13 +132,13 @@ def _bootstrap(client: TestClient) -> tuple[str, str]:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },
     )
     r.raise_for_status()
-    return r.json()["jwt"], "admin@viator.test"
+    return r.json()["jwt"], "admin@viator.example"
 
 
 def test_login_success_sets_cookie(client: TestClient) -> None:
@@ -149,7 +149,7 @@ def test_login_success_sets_cookie(client: TestClient) -> None:
 
     r = client.post(
         "/api/auth/login",
-        json={"email": "admin@viator.test", "password": "a-strong-admin-password"},
+        json={"email": "admin@viator.example", "password": "a-strong-admin-password"},
     )
     assert r.status_code == 200, r.text
     assert r.json()["role"] == "platform_admin"
@@ -161,7 +161,7 @@ def test_login_wrong_password_returns_401(client: TestClient) -> None:
     client.cookies.clear()
     r = client.post(
         "/api/auth/login",
-        json={"email": "admin@viator.test", "password": "wrong-passphrase-xx"},
+        json={"email": "admin@viator.example", "password": "wrong-passphrase-xx"},
     )
     assert r.status_code == 401
 
@@ -212,7 +212,7 @@ def test_register_request_for_existing_user_is_silent(client: TestClient) -> Non
     _bootstrap(client)
     r = client.post(
         "/api/auth/register-request",
-        json={"email": "admin@viator.test", "name": "Admin"},
+        json={"email": "admin@viator.example", "name": "Admin"},
     )
     assert r.status_code == 204
     # Verify no verification token was created for the existing user.
@@ -222,7 +222,7 @@ def test_register_request_for_existing_user_is_silent(client: TestClient) -> Non
     with SessionLocal() as db:
         rows = (
             db.execute(
-                select(VerificationToken).where(VerificationToken.email == "admin@viator.test")
+                select(VerificationToken).where(VerificationToken.email == "admin@viator.example")
             )
             .scalars()
             .all()

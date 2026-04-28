@@ -18,6 +18,7 @@ That signature is permanent — body changes between phases are invisible to cal
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -139,8 +140,27 @@ require_platform_admin = _require_role("platform_admin")
 
 
 def client_ip(request: Request) -> str | None:
-    """Best-effort client IP — respects X-Forwarded-For when present."""
+    """Best-effort client IP — respects X-Forwarded-For when present.
+
+    Returns None if the resolved value isn't a valid IP. This guards against
+    two things:
+
+    - FastAPI's TestClient sets `request.client.host` to the literal string
+      `"testclient"` (not an IP). Passing that to a Postgres `inet` column
+      raises `InvalidTextRepresentation`.
+    - Misconfigured proxies / WAFs that occasionally inject non-IP tokens
+      into X-Forwarded-For.
+
+    `audit_events.actor_ip` is `inet NULL`, so dropping a malformed value is
+    correct: better to omit the column than to crash the audit insert and
+    lose the event entirely.
+    """
     xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else None
+    raw = xff.split(",")[0].strip() if xff else (request.client.host if request.client else None)
+    if raw is None:
+        return None
+    try:
+        ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+    return raw

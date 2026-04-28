@@ -71,7 +71,7 @@ def admin_headers(client: TestClient) -> dict[str, str]:
         "/api/auth/bootstrap-platform-user",
         json={
             "token": "test-bootstrap-token",
-            "email": "admin@viator.test",
+            "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",
         },
@@ -93,7 +93,7 @@ def _set_smtp(client: TestClient, headers: dict[str, str]) -> None:
             "SMTP_SECURE": "starttls",
             "SMTP_USER": "viator",
             "SMTP_PASS": "supersecret",
-            "SMTP_FROM": "no-reply@viator.test",
+            "SMTP_FROM": "no-reply@viator.example",
         },
     ).raise_for_status()
 
@@ -103,7 +103,7 @@ def test_unconfigured_returns_ok_false(client: TestClient, admin_headers: dict[s
     r = client.post(
         "/api/admin/config/smtp/test",
         headers=admin_headers,
-        json={"to": "ops@viator.test"},
+        json={"to": "ops@viator.example"},
     )
     assert r.status_code == 200
     body = r.json()
@@ -130,7 +130,7 @@ def test_send_success_returns_ok_true(client: TestClient, admin_headers: dict[st
         r = client.post(
             "/api/admin/config/smtp/test",
             headers=admin_headers,
-            json={"to": "ops@viator.test"},
+            json={"to": "ops@viator.example"},
         )
 
     assert r.status_code == 200
@@ -146,7 +146,7 @@ def test_send_success_returns_ok_true(client: TestClient, admin_headers: dict[st
             .all()
         )
     assert len(events) == 1
-    assert (events[0].metadata_ or {}).get("to") == "ops@viator.test"
+    assert (events[0].metadata_ or {}).get("to") == "ops@viator.example"
 
 
 def test_send_failure_returns_ok_false_with_error(
@@ -159,7 +159,7 @@ def test_send_failure_returns_ok_false_with_error(
         r = client.post(
             "/api/admin/config/smtp/test",
             headers=admin_headers,
-            json={"to": "ops@viator.test"},
+            json={"to": "ops@viator.example"},
         )
 
     assert r.status_code == 200
@@ -182,6 +182,6 @@ def test_send_failure_returns_ok_false_with_error(
 def test_smtp_test_requires_platform_admin(client: TestClient) -> None:
     r = client.post(
         "/api/admin/config/smtp/test",
-        json={"to": "ops@viator.test"},
+        json={"to": "ops@viator.example"},
     )
     assert r.status_code == 401  # no JWT
