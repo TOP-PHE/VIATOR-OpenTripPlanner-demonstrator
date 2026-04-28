@@ -6,7 +6,7 @@ import re
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
@@ -158,13 +158,13 @@ def patch_session(
     return SessionResponse.from_orm_session(s)
 
 
-@router.post("/{sid}/archive", status_code=204)
+@router.post("/{sid}/archive", status_code=status.HTTP_204_NO_CONTENT)
 def archive_session(
     sid: str,
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
-) -> None:
+) -> Response:
     s = db.get(SessionRow, sid)
     if s is None:
         raise HTTPException(404, "Session not found")
@@ -180,3 +180,4 @@ def archive_session(
         target_id=sid,
     )
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

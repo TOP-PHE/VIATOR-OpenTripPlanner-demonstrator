@@ -6,7 +6,7 @@ import uuid
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
@@ -85,13 +85,13 @@ def create_alias(
     return _to_response(row)
 
 
-@router.delete("/{alias_id}", status_code=204)
+@router.delete("/{alias_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_alias(
     alias_id: uuid.UUID,
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
-) -> None:
+) -> Response:
     row = db.get(RouteAlias, alias_id)
     if row is None:
         raise HTTPException(404, "Not found")
@@ -105,3 +105,4 @@ def delete_alias(
         target_id=str(alias_id),
     )
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
