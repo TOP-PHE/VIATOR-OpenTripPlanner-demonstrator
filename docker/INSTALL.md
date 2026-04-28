@@ -1,13 +1,14 @@
-# Installation guide — OTP-MERITS stack on a fresh VPS
+# VIATOR — Installation guide for a fresh VPS
 
-Step-by-step procedure to bring the stack from "blank Linux VPS" to
-"OTP serving SNCF itineraries with an upload UI in front".
+Step-by-step procedure to bring the VIATOR stack from "blank Linux VPS" to "admin UI live with at least one OTP session serving SNCF itineraries."
 
-Estimated time: **45–90 minutes**, dominated by the first OTP graph build.
+This file is the long-form version. The same procedure is summarised in `../VIATOR-technical-spec.md` §11.2 — read whichever you prefer.
+
+Estimated time: **45–90 minutes**, dominated by the first OTP graph build (30–60 min on the national bundle).
 
 ---
 
-## 1. Choose and provision the VPS
+## 1. Provision the VPS
 
 | Resource | Pilot (Île-de-France only) | National (France-wide) |
 |---|---|---|
@@ -16,24 +17,24 @@ Estimated time: **45–90 minutes**, dominated by the first OTP graph build.
 | SSD | 60 GB | 100 GB |
 | OS | Ubuntu 24.04 LTS | Ubuntu 24.04 LTS |
 
-Providers that fit (any will do): OVH, Scaleway, Hetzner, Infomaniak, AWS Lightsail.
+The 32 GB floor is real: a France-wide OTP graph build needs ~24 GB heap. Hosts that fit: OVH, Scaleway, Hetzner, Infomaniak, AWS Lightsail.
 
-Open the following inbound ports on the provider's firewall:
+Open inbound ports on the provider firewall:
 
 - `22` (SSH) — restricted to your IPs.
 - `80` (HTTP) — public during install.
-- `443` (HTTPS) — public once TLS is wired (step 9).
+- `443` (HTTPS) — public after step 9.
 
 ---
 
-## 2. Initial OS hardening
+## 2. OS hardening
 
 SSH in as root, then:
 
 ```bash
 # Create a non-root user
-adduser otpadmin
-usermod -aG sudo otpadmin
+adduser viator
+usermod -aG sudo viator
 
 # Lock down SSH
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/'    /etc/ssh/sshd_config
@@ -50,7 +51,7 @@ ufw --force enable
 apt update && apt -y upgrade
 ```
 
-Reconnect as `otpadmin` for the rest.
+Reconnect as `viator` for the rest.
 
 ---
 
@@ -71,7 +72,7 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 sudo apt update
 sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Let otpadmin run docker without sudo
+# Let viator run docker without sudo
 sudo usermod -aG docker $USER
 newgrp docker
 
@@ -84,39 +85,12 @@ docker compose version
 
 ## 4. Get the stack onto the VPS
 
-You have three options; pick one.
-
-### Option A — git clone (preferred)
-
-If this `docker/` folder lives in a git repo:
-
 ```bash
-sudo mkdir -p /opt/otp-merits
-sudo chown $USER:$USER /opt/otp-merits
-cd /opt/otp-merits
-git clone <your-repo-url> .
+sudo mkdir -p /opt/viator
+sudo chown $USER:$USER /opt/viator
+cd /opt/viator
+git clone https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator.git .
 cd docker
-```
-
-### Option B — scp from your laptop
-
-From your Windows laptop in PowerShell:
-
-```powershell
-$src = "C:\Users\patri\OneDrive\Documents\TrackOnPath\Contract_execution\UIC_New_Revenue_Management project\projets\MERITS\Journey Planning\OpenJourneyPlanner\docker"
-scp -r $src otpadmin@<VPS_IP>:/opt/otp-merits/
-```
-
-Then on the VPS:
-
-```bash
-cd /opt/otp-merits/docker
-```
-
-### Option C — rsync (faster for re-deploys)
-
-```bash
-rsync -avz --delete ./docker/ otpadmin@<VPS_IP>:/opt/otp-merits/docker/
 ```
 
 ---
@@ -124,215 +98,151 @@ rsync -avz --delete ./docker/ otpadmin@<VPS_IP>:/opt/otp-merits/docker/
 ## 5. Configure secrets (`.env`)
 
 ```bash
-cd /opt/otp-merits/docker
 cp .env.example .env
 nano .env
 ```
 
-Set, at minimum:
+At minimum set:
 
 ```
-POSTGRES_PASSWORD=<long random string>
-ADMIN_PASSWORD=<long random string>
-OTP_BUILD_HEAP=12g     # or 24g for the national bundle
-OTP_SERVE_HEAP=16g
+POSTGRES_USER=viator
+POSTGRES_PASSWORD=<openssl rand -base64 32>
+POSTGRES_DB=viator
+
+JWT_SECRET=<openssl rand -base64 64>
+BOOTSTRAP_TOKEN=<openssl rand -base64 32>
+
+PUBLIC_BASE_URL=https://viator.example.com
+
+OTP_BUILD_HEAP=24g     # 12g if you're only doing a regional bundle
+OTP_SERVE_HEAP=8g
 ```
 
-Generate random passwords with `openssl rand -base64 32`.
+> **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for step 8. Once consumed, set it to empty in `.env` and `docker compose restart web`.
+
+> All other operational config (SMTP credentials, concurrency limits, retention windows, fanout timeouts) lives in the `platform_config` table inside Postgres — not in `.env`. You'll edit it from the admin UI after the bootstrap.
 
 ---
 
-## 6. Build the images
+## 6. Pull or build the images
+
+If you've enabled GHCR pulls (the Trivy gate already runs in CI, so the published images are scanned), pull instead of build:
+
+```bash
+docker compose pull web
+```
+
+Or build locally:
 
 ```bash
 docker compose build
 ```
 
-Two images are built:
+Two images are produced/pulled:
 
-- `otp-merits-web` (FastAPI + worker share this image; ~250 MB)
-- `otp-merits-otp` (Eclipse Temurin JRE 25 + OTP shaded jar; ~400 MB, includes a one-time download of OTP from Maven Central)
+- `viator-web` (FastAPI admin app + worker share this image; ~280 MB) — `python:3.12-slim` + the docker CLI from `docker:29-cli` (multi-stage) + `requirements.txt` + `app/`
+- `viator-otp` (Eclipse Temurin JRE 25 + OTP shaded jar; ~420 MB)
 
-If the OTP download fails, the version pin is in [otp/Dockerfile](otp/Dockerfile) (`ARG OTP_VERSION=2.6.0`) — bump to a version that exists on Maven Central.
+If the OTP image build fails on the Maven download, the version pin is in `otp/Dockerfile` (`ARG OTP_VERSION=2.9.0`) — bump to a version that exists on Maven Central.
 
 ---
 
 ## 7. Bring up the platform services
 
-We start everything **except** OTP itself, since OTP needs a graph first.
+We start everything **except** per-session OTP containers — those are spawned by the admin app on demand once a session is configured.
 
 ```bash
 docker compose up -d postgres web worker nginx
 docker compose ps
-docker compose logs -f web   # Ctrl-C to detach; check it boots cleanly
+docker compose logs -f web
+# wait for "Application startup complete." then Ctrl-C to detach
 ```
 
-The upload UI is now reachable at `http://<VPS_IP>/`. Log in with `ADMIN_USER` / `ADMIN_PASSWORD`.
+The web container's entrypoint runs `alembic upgrade head` automatically, so the schema is created on first start.
 
 ---
 
-## 8. Pre-seed the inbox (first graph build)
+## 8. Bootstrap the first platform admin
 
-You can either upload via the UI or drop files directly into the volume. Direct drop is faster for the first time.
-
-### 8a. Find the inbox path on the host
+The `platform_admin` role can do everything (create sessions, manage users, reconfigure SMTP, etc.). On a fresh DB no users exist, so we create the first one via the bootstrap endpoint:
 
 ```bash
-docker volume inspect otp-merits_inbox -f '{{ .Mountpoint }}'
-# typically: /var/lib/docker/volumes/otp-merits_inbox/_data
+curl -X POST https://viator.example.com/api/auth/bootstrap-platform-user \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token":    "<the BOOTSTRAP_TOKEN you set in .env>",
+    "email":    "you@example.com",
+    "name":     "Patrick Heuguet",
+    "password": "<a strong password, ≥12 chars>"
+  }'
 ```
 
-Export it for convenience:
+Response: `200 OK` with a JWT and a `viator_session` cookie set. The endpoint then refuses subsequent calls (returns 403) — it checks for any existing `platform_admin` user before allowing.
 
-```bash
-INBOX=$(docker volume inspect otp-merits_inbox -f '{{ .Mountpoint }}')
-sudo mkdir -p $INBOX/{gtfs,osm,netex,dem,archive,runtime,_staging}
-```
+**Immediately after** a successful bootstrap:
 
-### 8b. Download SNCF + OSM data
+1. Edit `.env` → set `BOOTSTRAP_TOKEN=` (empty).
+2. `docker compose restart web` so the empty value takes effect.
+3. Log in at `https://viator.example.com/login`.
 
-```bash
-# SNCF national GTFS
-sudo curl -L -o $INBOX/gtfs/sncf.zip \
-  https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip
-
-# France OSM PBF (~4 GB)
-sudo curl -L -o $INBOX/osm/france-latest.osm.pbf \
-  https://download.geofabrik.de/europe/france-latest.osm.pbf
-
-# (Optional, runtime data — does not affect the graph)
-sudo curl -L -o /tmp/mct.zip \
-  https://ressources.data.sncf.com/explore/dataset/temps-correspondance-minimaux/files/<id>/download/
-sudo curl -L -o /tmp/stations.csv \
-  https://ressources.data.sncf.com/explore/dataset/gares-de-voyageurs/download/?format=csv
-```
-
-(The MCT and Stations CSVs are best uploaded through the UI later, so they get logged and dispatched into `runtime/`.)
-
-### 8c. Run the first OTP build
-
-This is a one-shot, foreground command. France-wide build = 30–60 min, RAM-bound.
-
-```bash
-docker compose run --rm \
-  -e OTP_HEAP=$(grep OTP_BUILD_HEAP .env | cut -d= -f2) \
-  otp-build
-```
-
-Watch for `Graph written.` near the end. The graph lands in the `graphs` volume.
-
-### 8d. Promote the graph
-
-The host-side worker normally does this; for the very first build, do it by hand:
-
-```bash
-GRAPHS=$(docker volume inspect otp-merits_graphs -f '{{ .Mountpoint }}')
-TS=$(date -u +%Y%m%d-%H%M%S)
-sudo mkdir -p $GRAPHS/$TS
-sudo mv $GRAPHS/graph.obj $GRAPHS/$TS/graph.obj
-sudo ln -sfn $TS $GRAPHS/current
-ls -l $GRAPHS
-```
+You can now invite the rest of the team via Admin → Users.
 
 ---
 
-## 9. Start OTP and verify
+## 9. Add HTTPS
 
-```bash
-docker compose up -d otp
-docker compose logs -f otp
-# wait for: "Grizzly server running."
-```
-
-Smoke tests from your laptop:
-
-```bash
-# Health
-curl http://<VPS_IP>/otp/actuators/health
-
-# A simple GraphQL ping (GTFS schema)
-curl -s http://<VPS_IP>/otp/gtfs/v1/index/graphql \
-  -H 'content-type: application/json' \
-  -d '{"query":"{ feeds { feedId } }"}'
-```
-
-OTP debug map (interactive trip planning) at:
-
-```
-http://<VPS_IP>/otp/debug-client/
-```
-
----
-
-## 10. Add HTTPS (recommended)
-
-Once the stack is reachable on a domain (`otp.example.com`):
+Once the domain is pointing at the VPS:
 
 ```bash
 sudo apt install -y certbot
-sudo certbot certonly --standalone -d otp.example.com \
-  --pre-hook "docker compose -f /opt/otp-merits/docker/docker-compose.yml stop nginx" \
-  --post-hook "docker compose -f /opt/otp-merits/docker/docker-compose.yml start nginx"
+sudo certbot certonly --standalone -d viator.example.com \
+  --pre-hook  "docker compose -f /opt/viator/docker/docker-compose.yml stop nginx" \
+  --post-hook "docker compose -f /opt/viator/docker/docker-compose.yml start nginx"
 ```
 
-Then in [nginx/nginx.conf](nginx/nginx.conf): uncomment the `443` server, mount the cert
-directory in [docker-compose.yml](docker-compose.yml) (`./nginx/certs:/etc/nginx/certs:ro`),
-and `docker compose restart nginx`.
+Then in `nginx/nginx.conf`: uncomment the `:443` server, mount the cert directory in `docker-compose.yml` (`./nginx/certs:/etc/nginx/certs:ro`), and `docker compose restart nginx`.
 
 A renewal cron is auto-installed by certbot; verify with `systemctl list-timers | grep certbot`.
 
 ---
 
+## 10. Create the first OTP session
+
+From the admin UI:
+
+> **Admin → Sessions → New** → fill `id` (e.g. `nap-fr-2026-q2`), `category` (`NAP`), `label`, save.
+
+Then:
+
+> Click into the session → **Configure** → set source URLs (SNCF GTFS feed URL, France OSM PBF URL, optional MCT/Stations CSVs) → save.
+
+Once configured, the worker starts auto-pulling at the schedule you defined (or you can upload manually via the session's Uploads tab). When the inbox has the required files, the session moves to `populated` and you can:
+
+> **Rebuild graph** — kicks off `otp-build` in a one-shot container; takes 30–60 min for national.
+
+After the build completes the session moves to `serving` and is automatically added to `docker-compose.generated.yml` and `nginx/conf.d/sessions.generated.conf`. The fanout endpoint starts including it.
+
+Smoke test from your laptop:
+
+```bash
+# Web
+curl https://viator.example.com/api/readyz
+
+# Per-session OTP
+curl https://viator.example.com/otp/nap-fr-2026-q2/actuators/health
+```
+
+---
+
 ## 11. Day-2 operations
 
-### Update SNCF feeds
+For routine operations — updates, backups, capacity planning, incident triage — see **`../VIATOR-technical-spec.md` §11**. Brief pointers:
 
-Use the UI (`http://<VPS_IP>/`) — pick the file, declare the standard, submit. The dispatcher rules in [web/app/ingestion.py](web/app/ingestion.py) decide whether a rebuild is needed.
-
-The worker debounces uploads by `DEBOUNCE_SECONDS` (default 30 min) so multiple uploads in a short window cause only one rebuild.
-
-### Watch a rebuild in progress
-
-```bash
-docker compose logs -f worker
-```
-
-The home page also shows recent jobs with status `pending|running|done|failed`.
-
-### Update the stack itself
-
-```bash
-cd /opt/otp-merits
-git pull               # or rsync from your laptop
-cd docker
-docker compose build
-docker compose up -d
-```
-
-### Bump the OTP version
-
-Edit `ARG OTP_VERSION` in [otp/Dockerfile](otp/Dockerfile), then:
-
-```bash
-docker compose build otp otp-build
-docker compose run --rm otp-build      # rebuild graph with the new version
-docker compose up -d otp
-```
-
-### Backups
-
-Two volumes matter:
-
-- `pgdata` — uploads metadata + audit log. Daily `pg_dump` is plenty.
-- `inbox` — current input feeds. Re-downloadable from data.gouv.fr, so optional.
-
-The `graphs` volume is regenerated on every build; no need to back up.
-
-```bash
-# Daily pg_dump example
-docker compose exec -T postgres \
-  pg_dump -U otp otp | gzip > /opt/backups/otp-$(date +%F).sql.gz
-```
+- **Update the app**: `git pull` in `/opt/viator`, then `docker compose pull web && docker compose up -d web worker && docker compose exec web alembic upgrade head`. Spec §11.6.1.
+- **Bump OTP version**: edit `ARG OTP_VERSION` in `otp/Dockerfile`, `docker compose build otp`, then trigger rebuild for each session via the admin UI. Spec §11.6.2.
+- **Change platform config** (SMTP, concurrency, retention): Admin → Configuration. Spec §11.6.3.
+- **Daily Postgres backup**: cron with `pg_dump --format=custom`, push off-VPS via rclone. Spec §11.7.
+- **Capacity watermarks**: monitor `pgdata` size, fanout p95, RAM headroom. Spec §11.11.
 
 ---
 
@@ -340,25 +250,31 @@ docker compose exec -T postgres \
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `otp` container restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, `docker compose up -d otp` |
-| `otp-build` killed by OOM-killer (`exit code 137`) | VPS RAM too small | Upgrade VPS or use a regional GTFS only |
-| First request to OTP returns 503 | Graph not loaded yet | Wait for "Grizzly server running." in logs |
-| Upload returns "File looks like X but you declared Y" | Dropdown wrong, **or** SNCF changed their export schema | Check the file with `unzip -l file.zip`; update [web/app/detect.py](web/app/detect.py) if SNCF changed schema |
-| GTFS-RT updaters log 401/403 | transport.data.gouv.fr proxy expects an API key | Add header in [otp/router-config.json](otp/router-config.json) |
-| `docker compose run otp-build` says "no graph.obj written" | Inbox missing required files (no PBF, no GTFS) | Verify `$INBOX/gtfs/*.zip` and `$INBOX/osm/*.pbf` |
-| Worker can't run `otp-build` (`permission denied … docker.sock`) | Socket permissions | `sudo chmod 666 /var/run/docker.sock` (or run worker as root) |
+| `web` container restart-loops | Migration failure on startup | `docker compose logs web` — look for alembic error. If "table already exists", manually `alembic stamp head`. |
+| `otp-<sid>` restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, restart. |
+| `otp-build` killed by OOM-killer (exit 137) | VPS RAM too small | Upgrade VPS, use a regional GTFS, or raise swap. |
+| First request to OTP returns 503 | Graph not loaded yet | Wait for `Grizzly server running.` in `otp-<sid>` logs. |
+| `worker` can't run `otp-build` (`permission denied … docker.sock`) | Socket perms | `sudo chmod 666 /var/run/docker.sock` (or run worker as root). |
+| `bootstrap-platform-user` returns 403 | A platform admin already exists, or `BOOTSTRAP_TOKEN` is empty | Both correct. To create another admin, log in as the existing one and use the Users UI. |
+| SMTP test email fails | Bad creds in `platform_config` | Re-enter under Admin → Configuration → SMTP_*. For Gmail/Workspace, use an app password. |
+
+A wider runbook (13 incident types) lives in spec §11.10.
 
 ---
 
-## 13. What is NOT in this install
+## 13. What's NOT in this install
 
-This installs Phase 1 of the strategy in [../VIATOR-strategy.md](../VIATOR-strategy.md):
+This brings up VIATOR Phase-2 (multi-session NAP comparison, identity/RBAC, search history, master data, replay):
 
-- ✅ OTP routing engine fed by SNCF GTFS + France OSM
-- ✅ Upload UI with declared-standard validation and format dispatch
-- ✅ Real-time updates (GTFS-RT, SIRI Lite)
-- ⛔ OJP adapter in front of OTP (Phase 2)
-- ⛔ NeTEx-FR → Nordic converter (Phase 3) — NeTEx-FR uploads are accepted and archived but do not feed OTP
-- ⛔ MCT enforcement at the OJP layer (Phase 2) — MCT files are stored in `runtime/` waiting for the adapter
+- ✅ FastAPI admin app + JWT auth + admin UI
+- ✅ Multi-session OTP (one container per session)
+- ✅ Search recording + version-anchored fanout + replay
+- ✅ Master stations + route-aliases + Trainline bootstrap
+- ✅ Platform configuration (DB-managed, OSCAR pattern)
+- ✅ Three-tier retention pruning + APScheduler crons
+- ✅ Reports + CSV exports
+- ⛔ OJP adapter in front of OTP — Phase 3 milestone
+- ⛔ NeTEx-FR → Nordic profile converter — Phase 3 milestone (NeTEx-FR uploads are accepted and archived but don't feed OTP yet)
+- ⛔ MCT enforcement at the OJP layer — Phase 3 milestone (MCT files are stored under `runtime/` waiting for the adapter)
 
-The next milestone is the OJP adapter. Once it's in place, the same upload UI starts feeding it the MCT and Stations data automatically.
+The next milestone is the OJP adapter. Once it's in place, the same admin UI starts feeding it the MCT and Stations data automatically.

@@ -1,4 +1,4 @@
-name: otp-merits
+name: viator
 
 services:
   nginx:

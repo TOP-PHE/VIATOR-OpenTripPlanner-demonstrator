@@ -79,7 +79,7 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         "docker",
         "compose",
         "-p",
-        "otp-merits",
+        "viator",  # must match `name:` in docker/docker-compose.yml
         "run",
         "--rm",
         "-e",
