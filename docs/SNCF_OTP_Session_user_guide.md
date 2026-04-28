@@ -198,16 +198,50 @@ staging file, runs `ingestion.dispatch`, which:
 
 1. Verifies the detected file format matches what the config key implies
    (e.g. `gtfs` should produce a file detected as `GTFS`).
-2. Moves the staged file into the right per-kind inbox subfolder under
-   `inbox/<sid>/<kind>/`.
+2. Moves the staged file into the right per-kind inbox subfolder, **renamed
+   to a canonical name** so the OTP build config can reference it
+   predictably:
+
+   | Upstream URL filename | Stored as |
+   |---|---|
+   | `Export_OpenData_SNCF_GTFS_NewTripId.zip` | `inbox/<sid>/gtfs/gtfs.zip` |
+   | `ile-de-france-latest.osm.pbf` | `inbox/<sid>/osm/osm.pbf` |
+   | `france-latest.osm.pbf` | `inbox/<sid>/osm/osm.pbf` |
+   | (any NeTEx zip) | `inbox/<sid>/netex/netex.zip` |
+   | MCT/Stations CSVs | `inbox/<sid>/runtime/SNCF-{MCT,Stations}/latest.csv` |
+
+   The mapping is the `STAGE_INTO_OTP_INBOX_FILENAME` dict in
+   `app/ingestion.py` — kept in sync with `docker/otp/build-config.json`'s
+   `transitFeeds` and `osm` entries.
 3. Rotates any prior file of the same kind (`.old` suffix) so the new
-   build sees only the fresh one.
+   build sees only the fresh one. The entrypoint's `compgen -G "*.zip"`
+   glob excludes `.zip.old` / `.pbf.old` rotated copies.
 4. Enqueues a `RebuildJob` for kinds that warrant one (GTFS, OSM-PBF,
    NeTEx-Nordic, NeTEx-EPIP).
 
 **Upload** is the manual fallback: drag a file in via the per-session
 "Upload" form when you don't have a URL (e.g. a custom test feed or a
-file from a partner that isn't on a public CDN).
+file from a partner that isn't on a public CDN). The same canonical-
+rename happens — declared standard `GTFS` writes to
+`inbox/<sid>/gtfs/gtfs.zip`, no matter what the upload's original
+filename was.
+
+#### File reference — what each path is and who owns it
+
+| Path | Owner | Purpose |
+|---|---|---|
+| `inbox/<sid>/gtfs/gtfs.zip` | dispatcher | the GTFS feed OTP reads |
+| `inbox/<sid>/osm/osm.pbf` | dispatcher | the OSM PBF OTP reads |
+| `inbox/<sid>/netex/netex.zip` | dispatcher | NeTEx alternative (not used for SNCF) |
+| `inbox/<sid>/runtime/SNCF-MCT/latest.csv` | dispatcher | stored, not yet read by OTP (Phase-3) |
+| `inbox/<sid>/runtime/SNCF-Stations/latest.csv` | dispatcher | stored, not yet read by OTP (Phase-3) |
+| `inbox/<sid>/<kind>/*.old` | rotation | previous file, kept for one cycle |
+| `inbox/<sid>/_staging/` | refresh-sources | partial downloads in flight, cleaned up after dispatch |
+| `docker/otp/build-config.json` | repo | tells OTP which files to read by name |
+| `docker/otp/router-config.json` | repo | runtime config for the otp-`<sid>` serving container (timeouts, etc.) |
+| `docker/otp/entrypoint.sh` | repo | copies inbox → tmp build dir, runs `java -jar otp.jar --build`, moves graph.obj into the volume |
+| `app/ingestion.py` `STAGE_INTO_OTP_INBOX_FILENAME` | repo | the canonical-name map — the source of truth for filenames |
+| `graphs/<sid>/<timestamp>/graph.obj` | worker | a built graph snapshot; `current` symlink points at the most recent successful one |
 
 ### 3.2 The graph build (`otp-build` one-shot container)
 
@@ -269,6 +303,127 @@ queries it in parallel with every other `serving` session.
 There's a brief (≤15 s) window after promote where `state='serving'` but
 the otp container isn't routable yet. Phase-B will close this gap by
 having the worker watch DB state instead of the trigger file.
+
+### 3.4 Tracking build progress
+
+OTP graph builds run inside a one-shot `otp-build` container that the
+worker spawns via `docker compose run`. The worker captures stdout +
+stderr (via `subprocess.run(capture_output=True)`), so OTP's chatter
+**doesn't stream to `docker compose logs`** — it lands in the
+`rebuild_jobs.log` column once the process completes. During the
+build, you have to use external signals (CPU, memory, I/O) to track
+progress.
+
+#### Five ways to verify the build is alive
+
+```bash
+# 1. The otp-build container is currently up
+docker ps | grep otp-build
+# Expected line:
+#   <CID>  ghcr.io/top-phe/viator-otp:latest  ...  Up X minutes  ...
+#   viator-otp-build-run-XXX
+```
+
+```bash
+# 2. CPU + memory + I/O — most informative single command
+docker stats --no-stream
+# Healthy build: otp-build at 100-700% CPU + multi-GB MEM + several GB BLOCK I/O read
+```
+
+CPU >100% means OTP is using multiple cores (it parallelises OSM
+parsing and transit-graph construction). Memory should grow steadily
+through the build then plateau. Block-I/O *read* climbs as PBF + GTFS
+are streamed; block-I/O *write* spikes only at the very end when
+`graph.obj` is serialised.
+
+```bash
+# 3. Worker process state — confirms it's blocked on subprocess.run
+docker compose top worker
+# Expected: a single python -m app.worker process, sleeping
+```
+
+```bash
+# 4. Latest rebuild_jobs row — definitive "is it done yet?"
+docker compose exec postgres psql -U viator -d viator -c \
+  "SELECT id, status, started_at, finished_at,
+          EXTRACT(EPOCH FROM (COALESCE(finished_at, NOW()) - started_at)) AS seconds_elapsed,
+          length(log) AS log_chars
+   FROM rebuild_jobs ORDER BY created_at DESC LIMIT 1;"
+```
+
+| `status` | `finished_at` | meaning |
+|---|---|---|
+| `pending` | NULL | worker hasn't picked it up yet — debounce window not elapsed, or worker stopped |
+| `running` | NULL | OTP is actively building, `seconds_elapsed` keeps growing |
+| `done` | populated | success — graph.obj written, session auto-advanced to `graph_built` |
+| `failed` | populated | OTP crashed — read the `log` column for details |
+
+```bash
+# 5. Read the OTP build log after completion (success or failure)
+docker compose exec postgres psql -U viator -d viator -t -c \
+  "SELECT log FROM rebuild_jobs ORDER BY created_at DESC LIMIT 1;"
+```
+
+The log contains both stdout and stderr from the otp-build container
+(separated by `--- stderr ---`). It's truncated to the last ~32 KB
+to bound row size — sufficient for the OTP build's tail output.
+
+#### Phase timing — what to expect at each minute
+
+Numbers are rough but representative. Bigger bundles scale roughly
+linearly.
+
+| Phase | IDF (~250 MB PBF + ~50 MB GTFS) | France-wide (~4 GB PBF + ~50 MB GTFS) | What's happening |
+|---|---|---|---|
+| Staging | <30 s | <2 min | `entrypoint.sh` copies inbox files to a tmp build dir |
+| GTFS parsing | 1–3 min | 1–3 min | reading `agency.txt`, `routes.txt`, `stops.txt`, `trips.txt`, `stop_times.txt`, `calendar.txt` |
+| **OSM PBF parsing** | 3–5 min | **15–30 min** ← longest single phase | iterating every way + node in the PBF |
+| Street graph build | 1–2 min | 5–10 min | snapping stops to the nearest streets, building walk edges |
+| Transit graph | 1–2 min | 3–5 min | indexing trips by stop, computing departure tables |
+| Transfer computation | 1–3 min | 5–10 min | for each pair of nearby stops, compute the walking transfer |
+| Serialisation | <30 s | 1–2 min | binary-write `graph.obj` to disk; block-I/O write spikes |
+| **Total** | **~10–15 min** | **~30–60 min** | |
+
+#### Symptom-by-symptom progress reading
+
+| Observation | Likely phase | Healthy signal |
+|---|---|---|
+| CPU 200–700%, MEM growing fast (1→8 GB), I/O read climbing | OSM PBF parsing | yes — single most CPU-intensive phase |
+| CPU 100–200%, MEM growing slowly, I/O read flat | Transit graph or transfer computation | yes — less parallel, more memory churn |
+| CPU 100%, MEM plateaued, I/O write jumping from 0 to GB | Serialisation (final phase) | yes — almost done |
+| CPU drops to 0%, container still in `docker ps` | Container teardown / worker copying graph.obj into final volume | yes |
+| Container disappeared from `docker ps`, `rebuild_jobs.status` flips to `done` or `failed` | Build complete | check status to know which |
+| CPU 0%, MEM stuck, no disk I/O for >5 min | **Stuck** | unhealthy — see troubleshooting §6 |
+| `OutOfMemoryError: Java heap space` in logs | Heap too small | bump `OTP_BUILD_HEAP` in `.env` |
+| `OOM killed` (container exits with code 137) | Host RAM exhausted | upgrade VPS, raise swap, or use a smaller bundle |
+
+#### Reading the log live (best-effort)
+
+The worker doesn't stream output to host docker logs, but you can
+peek at the otp-build container's stderr/stdout via:
+
+```bash
+docker logs --follow $(docker ps --format '{{.Names}}' | grep otp-build)
+```
+
+(returns nothing if no otp-build container is currently up.) This works
+for the *currently-running* otp-build process. Once it exits and the
+worker captures+stores the log, this stream goes away — at that point
+you read the final log via the SQL query above.
+
+#### After the build finishes
+
+`rebuild_jobs.status='done'` triggers the worker to:
+
+1. Move `graph.obj` from the tmp build dir into
+   `graphs/<sid>/<timestamp>/graph.obj`
+2. Update the `current` symlink: `graphs/<sid>/current → <timestamp>/`
+3. Prune all but the most recent 3 timestamped graph dirs
+4. Auto-advance `session.state` from `populated` → `graph_built`
+
+The state badge on the admin Sessions page flips from amber `populated`
+to amber `graph_built`. Click **Promote to serving** to start the
+otp-`<sid>` container loading the graph and add it to the fanout pool.
 
 ---
 
@@ -515,6 +670,9 @@ session's origin flag.
 | Journey UI From/To autocomplete is empty | `master_stations` empty | Click "Refresh from Trainline" on `/admin/master/stations` (§4.5). |
 | Master stations refresh button does nothing or 401 | Your JWT cookie expired or you're not logged in as content_manager / platform_admin | Re-log in as a privileged user. |
 | Pending drift count keeps growing | Trainline's upstream is changing rows you've manually edited | Walk through the drift queue periodically — adopt or keep — to keep it manageable. Consider whether your manual edits should become canonical via PRs to trainline-eu/stations. |
+| Build appears stuck — no log output for >5 min | Normal during OSM parsing or transit-graph phase | See §3.4. Run `docker stats --no-stream` and check `otp-build` CPU. >100% CPU = healthy, just slow; <1% with no I/O = actually stuck (rare; check container status with `docker logs $(docker ps -q -f name=otp-build)`). |
+| `rebuild_jobs.log` shows OTP error like `java.io.FileNotFoundException` for a file you uploaded | File didn't get the canonical name (Phase-2 ingestion bug, or pre-`e526d95` deploy) | Verify `inbox/<sid>/gtfs/gtfs.zip` and `inbox/<sid>/osm/osm.pbf` exist. If they have the original upstream name (e.g. `Export_OpenData_SNCF_GTFS_NewTripId.zip`), pull the latest code, rebuild web+worker images, click "Refresh sources now" again. |
+| Toast says all sources "Skipped: ... [Errno -2] Name or service not known" | DNS failure inside the container, OR malformed URL in the config form | Check the URLs displayed in the Configure form — pasted URLs sometimes get concatenated (`https://rehttps://...`). Clear each field with Ctrl+A, paste fresh, click Save config, retry Refresh. If URLs look right, check `docker compose exec web getent hosts <hostname>`. If that fails, see the DNS pin in `docker-compose.yml` (8.8.8.8 / 1.1.1.1 on web + worker). |
 
 ---
 
@@ -525,18 +683,35 @@ After a successful refresh + build + promote on session id `nap-fr-sncf-idf`:
 ```
 /var/lib/docker/volumes/
 ├── viator_inbox/_data/nap-fr-sncf-idf/
-│   ├── gtfs/Export_OpenData_SNCF_GTFS_NewTripId.zip      # current
-│   ├── gtfs/Export_OpenData_SNCF_GTFS_NewTripId.zip.old  # rotated
-│   ├── osm/ile-de-france-latest.osm.pbf
-│   ├── runtime/SNCF-MCT/latest.zip                       # if configured
-│   └── runtime/SNCF-Stations/latest.csv                  # if configured
+│   ├── gtfs/gtfs.zip                              # current (canonical name — see §3.1)
+│   ├── gtfs/gtfs.zip.old                          # previous, rotated by dispatcher
+│   ├── osm/osm.pbf                                # current
+│   ├── osm/osm.pbf.old                            # previous
+│   ├── runtime/SNCF-MCT/latest.csv                # if configured
+│   └── runtime/SNCF-Stations/latest.csv           # if configured
 │
 └── viator_graphs/_data/nap-fr-sncf-idf/
-    ├── 20260429-103214/graph.obj                         # most recent build
-    ├── 20260427-091122/graph.obj                         # one back
-    ├── 20260424-152007/graph.obj                         # two back (kept N=3)
-    └── current → 20260429-103214/                        # symlink OTP serves from
+    ├── 20260429-103214/graph.obj                  # most recent build
+    ├── 20260427-091122/graph.obj                  # one back
+    ├── 20260424-152007/graph.obj                  # two back (worker keeps N=3)
+    └── current → 20260429-103214/                 # symlink the otp-<sid> container serves from
 ```
+
+The host paths above resolve to:
+
+| Volume name | Host path | Mounted in |
+|---|---|---|
+| `viator_inbox` | `/var/lib/docker/volumes/viator_inbox/_data/` | `web`, `worker` (rw), `otp-build` (ro), `otp-<sid>` (none — graphs only) |
+| `viator_graphs` | `/var/lib/docker/volumes/viator_graphs/_data/` | `worker` (rw), `otp-<sid>` (ro) |
+| `viator_pgdata` | `/var/lib/docker/volumes/viator_pgdata/_data/` | `postgres` (rw) |
+
+Inside containers the same files are at:
+
+| Container | Inbox path | Graphs path |
+|---|---|---|
+| `web`, `worker` | `/data/inbox/<sid>/` | `/data/graphs/<sid>/` |
+| `otp-build` | `/var/otp/inbox/<sid>/` (ro) | `/var/otp/graph/` (rw, written) |
+| `otp-<sid>` (per-session serving) | (none) | `/var/otp/graph/<sid>/current/` (ro) |
 
 `postgres` separately stores the metadata: `sessions`, `uploads`,
 `rebuild_jobs`, `master_stations`, `audit_events`, etc. Re-deploys can
