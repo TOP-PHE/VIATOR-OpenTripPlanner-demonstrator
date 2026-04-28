@@ -1988,7 +1988,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **GitHub Actions** "Node.js 20 actions are deprecated" | Composite action upgrade reminder | Not a failure — informational only. Will become an error in June 2026. Bump action versions then (`@v4` → `@v5+`). |
 | **Coverage upload** "No files were found with the provided path: coverage.xml" | pytest didn't run (an earlier step failed) | Look at the previous step's logs — fix the upstream failure and the artifact will appear. |
 | **GHCR push** "denied: permission_denied" | Workflow lacks `packages: write` permission | Already set in `docker.yml`. If you fork, you may need to enable Workflow permissions: Settings → Actions → General → Workflow permissions → "Read and write permissions". |
-| **GitHub Actions** "Unable to resolve action `<owner>/<repo>@<version>`" | The ref doesn't exist as a tag or branch on the action's repo. Common cause: tags use `v` prefix (`v0.29.0`) but the workflow pins without it (`0.29.0`). | Verify the actual tag: `curl -fsSL "https://api.github.com/repos/<owner>/<repo>/tags?per_page=20"` and pin to a real ref. For `aquasecurity/trivy-action` specifically, tags use `v` prefix — use `@v0.29.0`, not `@0.29.0`. |
+| **GitHub Actions** "Unable to resolve action `<owner>/<repo>@<version>`" | Three common causes: (1) the ref doesn't exist; (2) tags use `v` prefix but the pin omits it; (3) the action's tag is real, but its **internal** sub-action pin points at a deleted tag. | (1)+(2): `curl -fsSL "https://api.github.com/repos/<owner>/<repo>/tags?per_page=20"` and pick a real ref. For `aquasecurity/trivy-action`, tags use `v` prefix — `@v0.36.0`. (3) is sneakier: the failure message names the *sub*-action. Inspect `action.yaml` at the version you pinned (`curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<ref>/action.yaml | grep uses:`) — if you see another action pinned by tag, check that tag exists too. **Bumping to a recent action version usually fixes this** (modern releases pin sub-actions by SHA). For trivy-action, releases ≤ v0.29.0 pin `setup-trivy@v0.2.2` (deleted); v0.36.0 pins by SHA. |
 | **SonarCloud** "Project not found" | Repo Variable `SONARCLOUD_ENABLED=true` but project not yet imported on sonarcloud.io | Either import the project (15.7.5) or unset the Variable to skip the step. |
 
 ### 15.12 Tooling matrix (reference)
@@ -2002,7 +2002,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | Type | mypy (strict) | 1.13.0 | `pyproject.toml` `[tool.mypy]` |
 | Security (code) | bandit | 1.7.10 | `pyproject.toml` `[tool.bandit]` |
 | Security (deps) | pip-audit | 2.7.3 | command-line flags |
-| Container scan | Trivy (via aquasecurity/trivy-action) | v0.29.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
+| Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
 | Dockerfile lint | hadolint | 2.13.1-beta | command-line flags |
 | Pre-commit | pre-commit | 4.0.1 | `.pre-commit-config.yaml` |
 | Migrations | Alembic | 1.14.0 | `alembic.ini` + `alembic/env.py` |

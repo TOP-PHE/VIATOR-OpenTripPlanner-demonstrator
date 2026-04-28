@@ -84,10 +84,12 @@ jobs:
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
 
       - name: Trivy — vulnerability scan
-        # The action is tagged with a `v` prefix only — `@0.29.0` does not
-        # resolve, must be `@v0.29.0`.
+        # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
+        # Earlier releases (e.g. v0.29.0) internally pin `aquasecurity/setup-trivy@v0.2.2`
+        # which has been deleted from the registry, so they fail to download.
+        # v0.36.0 pins setup-trivy by SHA (3fb12ec1… = v0.2.6) — the right way.
         # https://github.com/aquasecurity/trivy-action/tags
-        uses: aquasecurity/trivy-action@v0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: viator-${{ matrix.image.name }}:scan
           severity: CRITICAL,HIGH
