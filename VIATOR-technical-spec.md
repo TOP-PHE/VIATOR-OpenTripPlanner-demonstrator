@@ -1842,12 +1842,11 @@ Matrix build over `[web, otp]`:
 
 1. **hadolint** lints the Dockerfile (DL3008, DL3015, etc.).
 2. **`docker buildx build`** builds the image, with build cache stored in GitHub Actions cache.
-3. **Trivy diagnostic pass** — prints findings as a table at severity CRITICAL,HIGH (with `list-all-pkgs: true` so the scanned-package list is also visible). Never fails (exit-code: 0). This is your window into "what's there" even when the gate passes. Also writes the table to `trivy-<image>.table.txt` for the artifact upload below.
-4. **Diagnostic table artifact upload** — saves `trivy-<image>.table.txt` as a 14-day workflow artifact. Useful when scrolling the job log is awkward, or when you want to grep findings offline.
-5. **Trivy gating pass** — same scan, fails on any unignored finding (exit-code: 1, SARIF output).
-6. **SARIF upload to GitHub Security tab** — `continue-on-error: true` so a repo without Code Scanning enabled doesn't break CI. **Also gated to `push` events on `main`** — fork PRs can't write security-events to the upstream repo anyway, so skipping there reduces noise. To enable Code Scanning: Settings → Code security and analysis → Code scanning → Set up → Default (free for public repos).
-7. **SARIF artifact upload** — always saves the scan result as a 14-day workflow artifact for offline grep, regardless of whether the Security-tab upload succeeded.
-8. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
+3. **Trivy diagnostic pass** — prints findings as a table to stdout at severity CRITICAL,HIGH. Never fails (exit-code: 0). This is your window into "what's there" even when the gate passes — the table appears inline in the job log. **Important:** do not configure `output:` on this step; that redirects the table to a file and the log goes silent.
+4. **Trivy gating pass** — same scan, fails on any unignored finding (exit-code: 1, SARIF output).
+5. **SARIF upload to GitHub Security tab** — `continue-on-error: true` so a repo without Code Scanning enabled doesn't break CI. **Also gated to `push` events on `main`** — fork PRs can't write security-events to the upstream repo anyway, so skipping there reduces noise. To enable Code Scanning: Settings → Code security and analysis → Code scanning → Set up → Default (free for public repos).
+6. **SARIF artifact upload** — always saves the scan result as a 14-day workflow artifact (`trivy-<image>-sarif`). Useful for offline grep with `jq` or for re-uploading to Code Scanning later if it's enabled after the run.
+7. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
 
 > **Per-image Trivy scope** — the matrix sets `vuln-type` differently for each image:
 > - **`web`** (FastAPI app): `os,library` — full scan, including all Python deps. We control everything in this image.

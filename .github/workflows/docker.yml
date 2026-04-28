@@ -89,9 +89,10 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
 
-      # Diagnostic pass — always prints findings as a table, never fails.
-      # Lets us see *what* Trivy found, even when the gating step below passes.
-      # When the gating step fails, this is the only window into the actual CVE list.
+      # Diagnostic pass — prints findings to stdout (visible inline in the job log).
+      # Never fails (exit-code 0). When the gating step below fails, this is your
+      # window into *which* CVEs are blocking. Do NOT pass `output:` here — it
+      # redirects the table to a file and silences the log.
       - name: Trivy — diagnostic scan (table, non-fatal)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -102,18 +103,6 @@ jobs:
           vuln-type: ${{ matrix.image.trivy_vuln_type }}
           trivyignores: ".trivyignore"
           format: table
-          list-all-pkgs: true                              # show every package scanned, not just vulnerable ones
-          output: trivy-${{ matrix.image.name }}.table.txt # also persist for the artifact upload below
-
-      # Persist the diagnostic table as an artifact so we always have the CVE list
-      # offline, even if scrolling the job log is awkward. 14-day retention.
-      - name: Upload Trivy diagnostic table as workflow artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-${{ matrix.image.name }}-table
-          path: trivy-${{ matrix.image.name }}.table.txt
-          retention-days: 14
 
       # Gating pass — fails the job on any unignored CRITICAL/HIGH finding.
       # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
