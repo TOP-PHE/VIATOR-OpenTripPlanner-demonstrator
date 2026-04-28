@@ -27,8 +27,20 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy just the docker CLI binary — single static go binary, no daemon, no apt deps.
+# Copy the docker CLI binary AND its plugin directory.
+#
+# `docker compose` is NOT a builtin subcommand — it's a CLI plugin that lives
+# at `/usr/local/libexec/docker/cli-plugins/docker-compose`. Without it,
+# `docker compose <args>` falls through to the bare `docker <args>` parser,
+# which fails on `-p` ("unknown shorthand flag: 'p' in -p"). The worker
+# uses `docker compose -p viator run --rm otp-build` to spawn one-shot OTP
+# builds, so we MUST copy the plugin directory in addition to the binary.
+#
+# Both are statically-linked Go binaries with no shared-library deps, so
+# they run cleanly in the python:3.12-slim runtime without any apt
+# installs.
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/docker/cli-plugins/
 
 WORKDIR /srv
 
