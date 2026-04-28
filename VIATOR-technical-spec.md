@@ -1845,7 +1845,11 @@ Matrix build over `[web, otp]`:
 3. **Trivy** scans the built image for CVEs at severity CRITICAL,HIGH. Findings allowed to remain are listed in `.trivyignore` (see 15.8).
 4. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
 
-> The OTP image is downstream of `eclipse-temurin:25-jre-noble`. Trivy findings on the JRE base layer are **not actionable by us** — we depend on Temurin's own update cadence. Configure `--ignore-unfixed` (already on) to suppress unactionable noise.
+> **Per-image Trivy scope** — the matrix sets `vuln-type` differently for each image:
+> - **`web`** (FastAPI app): `os,library` — full scan, including all Python deps. We control everything in this image.
+> - **`otp`** (`eclipse-temurin:25-jre-noble` + `otp-shaded-2.9.0.jar`): `os` only. The shaded jar bundles ~80 transitive Java deps that come from upstream OpenTripPlanner; we can't update them without forking OTP. Java CVEs are tracked at https://github.com/opentripplanner/OpenTripPlanner/issues, not blocked at our CI gate.
+>
+> Both images run with `--ignore-unfixed` so unactionable findings in base layers (no upstream fix yet) don't block the build.
 
 ### 15.7 GitHub repository setup checklist
 
@@ -1899,18 +1903,27 @@ Both are **private by default**. Make them public if you want the demonstrator p
 
 ### 15.8 Trivy & security scanning — what to do with findings
 
-The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that has a fix available upstream. Three escape hatches, in order of preference:
+The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that has a fix available upstream **and is in scope for that image** (see the per-image scope rules in §15.6.2). Four escape hatches, in order of preference:
 
-1. **Update the base image.** If `eclipse-temurin:25-jre-noble` has a newer revision, pin to it.
-2. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
+1. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
+2. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
+3. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
    ```
    # .trivyignore — one CVE per line, with a justifying comment above each
    # CVE-2024-XXXXX: jdwp debug port flag — not enabled in our JRE config
    CVE-2024-XXXXX
    ```
-3. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
+4. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
 
 **Never blanket-ignore severity HIGH.** Each suppression must have a comment explaining why it's safe.
+
+#### 15.8.1 Java CVEs in the OTP image — handled out-of-band
+
+Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **excluded from CI's Trivy gate** (see §15.6.2). Track them as follows:
+
+- **SARIF still uploads** — even though `vuln-type: os` skips library findings during the gate, GitHub's Security tab receives whatever Trivy did report. Findings on OS packages show up there for triage.
+- **For the Java-side**: file an upstream issue at https://github.com/opentripplanner/OpenTripPlanner/issues for any CRITICAL CVE in the shaded jar. When OTP releases a new version with the fix, bump `ARG OTP_VERSION` in `docker/otp/Dockerfile` (see §11.6.2).
+- **If a Java CVE is being actively exploited** and OTP hasn't released a fix: temporarily change `vuln-type: os` → `vuln-type: os,library` for the OTP image to gate on it, then revert once OTP ships the fix. Or fork OTP. Both are heavy actions — reserved for genuine emergencies.
 
 ### 15.9 Pre-commit framework — what runs and when
 
@@ -1989,6 +2002,8 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **Coverage upload** "No files were found with the provided path: coverage.xml" | pytest didn't run (an earlier step failed) | Look at the previous step's logs — fix the upstream failure and the artifact will appear. |
 | **GHCR push** "denied: permission_denied" | Workflow lacks `packages: write` permission | Already set in `docker.yml`. If you fork, you may need to enable Workflow permissions: Settings → Actions → General → Workflow permissions → "Read and write permissions". |
 | **GitHub Actions** "Unable to resolve action `<owner>/<repo>@<version>`" | Three common causes: (1) the ref doesn't exist; (2) tags use `v` prefix but the pin omits it; (3) the action's tag is real, but its **internal** sub-action pin points at a deleted tag. | (1)+(2): `curl -fsSL "https://api.github.com/repos/<owner>/<repo>/tags?per_page=20"` and pick a real ref. For `aquasecurity/trivy-action`, tags use `v` prefix — `@v0.36.0`. (3) is sneakier: the failure message names the *sub*-action. Inspect `action.yaml` at the version you pinned (`curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<ref>/action.yaml | grep uses:`) — if you see another action pinned by tag, check that tag exists too. **Bumping to a recent action version usually fixes this** (modern releases pin sub-actions by SHA). For trivy-action, releases ≤ v0.29.0 pin `setup-trivy@v0.2.2` (deleted); v0.36.0 pins by SHA. |
+| **`upload-sarif`** "Resource not accessible by integration" | `github/codeql-action/upload-sarif` needs `actions: read` to fetch run metadata, in addition to `security-events: write`. The default `GITHUB_TOKEN` doesn't get this implicitly. | Add `actions: read` to the job's `permissions:` block. Already set in `docker.yml`. |
+| **Trivy** scan exits 1 on the OTP image with Java CVE findings | OTP's shaded jar bundles transitive Java deps that we don't control | The workflow scopes the OTP image scan to `vuln-type: os` (OS packages only) for this reason. If you see this failure, it means someone changed the matrix entry to `os,library`. Either revert, or address the upstream Java CVE per §15.8.1. |
 | **SonarCloud** "Project not found" | Repo Variable `SONARCLOUD_ENABLED=true` but project not yet imported on sonarcloud.io | Either import the project (15.7.5) or unset the Variable to skip the step. |
 
 ### 15.12 Tooling matrix (reference)

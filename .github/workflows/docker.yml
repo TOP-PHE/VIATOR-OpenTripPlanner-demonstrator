@@ -30,6 +30,7 @@ jobs:
       contents: read
       packages: write           # push to GHCR
       security-events: write    # upload Trivy SARIF to the Security tab
+      actions: read             # required by github/codeql-action/upload-sarif to fetch run metadata
 
     strategy:
       fail-fast: false          # don't cancel the otp build because web fails (or vice versa)
@@ -38,9 +39,14 @@ jobs:
           - name: web
             context: .                            # repo root — Dockerfile copies app/ + requirements.txt
             dockerfile: docker/web/Dockerfile
+            trivy_vuln_type: "os,library"         # we own all deps in this image
           - name: otp
             context: docker/otp                   # local — no app code needed
             dockerfile: docker/otp/Dockerfile
+            # The OTP shaded jar bundles ~80 transitive Java deps we can't update
+            # without forking OpenTripPlanner. Scan OS packages only — Java CVEs
+            # are tracked upstream at https://github.com/opentripplanner/OpenTripPlanner/issues
+            trivy_vuln_type: "os"
 
     steps:
       - uses: actions/checkout@v4
@@ -94,7 +100,8 @@ jobs:
           image-ref: viator-${{ matrix.image.name }}:scan
           severity: CRITICAL,HIGH
           exit-code: 1
-          ignore-unfixed: true             # suppress unactionable findings in base images
+          ignore-unfixed: true                          # suppress unactionable findings in base images
+          vuln-type: ${{ matrix.image.trivy_vuln_type }}  # web: os,library  |  otp: os only (jar deps are upstream)
           trivyignores: ".trivyignore"
           format: sarif
           output: trivy-${{ matrix.image.name }}.sarif
