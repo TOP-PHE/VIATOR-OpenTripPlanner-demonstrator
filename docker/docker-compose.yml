@@ -38,6 +38,14 @@ services:
       context: ..               # repo root (so app/ and requirements.txt are visible)
       dockerfile: docker/web/Dockerfile
     restart: unless-stopped
+    # Pin DNS resolvers explicitly. Docker's default embedded DNS (127.0.0.11)
+    # forwards to the host's /etc/resolv.conf, which on Ubuntu 24.04 points
+    # at systemd-resolved (127.0.0.53) — that chain is fragile and breaks
+    # silently when systemd-resolved hiccups. The web container needs reliable
+    # DNS to httpx-download source URLs (data.gouv.fr, geofabrik.de, etc.).
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       INBOX_DIR: /data/inbox
@@ -69,6 +77,10 @@ services:
       dockerfile: docker/web/Dockerfile
     restart: unless-stopped
     command: ["python", "-m", "app.worker"]
+    # Same reasoning as web — see above.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       INBOX_DIR: /data/inbox
