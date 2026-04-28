@@ -16,11 +16,11 @@ class WeakPasswordError(ValueError):
 
 
 def hash_password(plain: str) -> str:
-    return _pwd.hash(plain)
+    return str(_pwd.hash(plain))
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd.verify(plain, hashed)
+    return bool(_pwd.verify(plain, hashed))
 
 
 def assert_strong_enough(plain: str) -> None:

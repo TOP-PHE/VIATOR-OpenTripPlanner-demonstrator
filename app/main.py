@@ -110,7 +110,7 @@ def _startup() -> None:
     if _os.environ.get("VIATOR_DISABLE_CRONS"):
         return
     try:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 
         from . import retention
         from .master import trainline

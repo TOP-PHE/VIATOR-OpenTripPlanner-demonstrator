@@ -36,12 +36,16 @@ def issue_jwt(
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
-    return jose_jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_alg)
+    encoded: str = jose_jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_alg)
+    return encoded
 
 
 def decode_jwt(token: str) -> dict[str, Any]:
     """Decode + verify signature + check expiry. Raises jose.JWTError on failure."""
-    return jose_jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
+    decoded: dict[str, Any] = jose_jwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_alg]
+    )
+    return decoded
 
 
 # ──────────────────── Verification tokens ────────────────────

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
@@ -164,7 +165,7 @@ def volume_per_session(
     stmt = (
         select(
             JourneySearchExecution.session_id,
-            func.count().label("count"),
+            func.count().label("n_executions"),
             func.percentile_cont(0.50)
             .within_group(JourneySearchExecution.response_ms)
             .label("p50"),
@@ -183,15 +184,15 @@ def volume_per_session(
     )
     out = []
     for r in db.execute(stmt).all():
-        total = r.count or 0
+        n = r.n_executions or 0
         out.append(
             {
                 "session_id": r.session_id,
-                "count": total,
+                "count": n,
                 "p50_ms": float(r.p50) if r.p50 is not None else None,
                 "p95_ms": float(r.p95) if r.p95 is not None else None,
                 "p99_ms": float(r.p99) if r.p99 is not None else None,
-                "error_rate": (float(r.error_count) / total) if total else 0.0,
+                "error_rate": (float(r.error_count) / n) if n else 0.0,
             }
         )
     return out
@@ -327,7 +328,7 @@ def searches_csv(
         .all()
     )
 
-    def gen():  # type: ignore[no-untyped-def]
+    def gen() -> Iterator[str]:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(

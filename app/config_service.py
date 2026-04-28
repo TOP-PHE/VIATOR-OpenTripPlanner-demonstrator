@@ -118,7 +118,7 @@ def apply_patch(
     - The masked sentinel `'********'` on a sensitive field → **skipped** (no-op).
     - Type/bound mismatches → 400 with all field errors collected.
     """
-    if not isinstance(payload, dict):  # type: ignore[unreachable]
+    if not isinstance(payload, dict):
         raise ConfigValidationError({"_": "request body must be a JSON object"})
 
     errors: dict[str, str] = {}
