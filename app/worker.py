@@ -112,8 +112,11 @@ def handle_reload_trigger() -> None:
     # `docker` is on PATH inside the worker image (multi-stage copy from
     # docker:29-cli — see docker/web/Dockerfile). Hardcoding /usr/local/bin/docker
     # would break if Docker's CLI image moves the binary.
+    # cwd=/srv/docker so docker compose finds docker-compose.yml + the
+    # generated/docker-compose.sessions.yml fragment via include.
     up = subprocess.run(  # noqa: S603
         ["docker", "compose", "-p", "viator", "up", "-d"],  # noqa: S607
+        cwd="/srv/docker",
         capture_output=True,
         text=True,
         check=False,
@@ -170,7 +173,15 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     ]
     # `cmd` is built from constants + the configured session_id slug only;
     # nothing user-supplied. Bandit S603 does not apply.
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+    # cwd=/srv/docker so `docker compose` finds docker-compose.yml + the
+    # generated/ include directory (mounted from the host's /opt/viator/docker/).
+    proc = subprocess.run(  # noqa: S603
+        cmd,
+        cwd="/srv/docker",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     output = proc.stdout + "\n--- stderr ---\n" + proc.stderr
 
     if proc.returncode != 0:

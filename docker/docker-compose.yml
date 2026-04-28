@@ -81,6 +81,12 @@ services:
       - inbox:/data/inbox
       - graphs:/data/graphs
       - ./generated:/data/generated
+      # Mount the host docker/ directory (this directory) into the worker so
+      # `docker compose -p viator <subcmd>` finds docker-compose.yml + the
+      # generated fragment via include. Read-only — the orchestrator writes
+      # via /data/generated above; this mount is for *reading* the compose
+      # graph during `compose run` and `compose up`.
+      - .:/srv/docker:ro
       # Worker spawns the otp-build container via the host docker socket.
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
