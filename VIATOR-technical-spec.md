@@ -985,7 +985,18 @@ CREATE INDEX audit_actor_ts ON audit_events(actor_user_id, ts DESC);
 | Method & path | Body | Returns | Roles |
 |---|---|---|---|
 | `GET /api/users` | — | `[ { id, email, name, role, is_active, last_login_at } ]` | platform_admin |
+| `POST /api/users` | `{ email, name, role, password }` | `201 { id, email, ... }` | platform_admin |
 | `PATCH /api/users/<id>` | `{ role?, is_active? }` | `200 { ... }` | platform_admin |
+
+`POST /api/users` is the **direct-creation** path: the platform admin sets the initial password and shares it out-of-band. Used while SMTP isn't yet configured (or for accounts that bypass email). The new user is `is_active=true` immediately and can log in with the supplied password; they're encouraged to rotate it via the password-reset flow. Failure modes:
+
+- `400` — `role` not in `{platform_admin, content_manager, end_user}`
+- `409` — email already exists
+- `422` — Pydantic validation: malformed email, password shorter than `MIN_PASSWORD_LENGTH` (12 chars)
+- `403` — caller isn't a platform admin
+- `401` — caller isn't authenticated
+
+The audit row records `action=user.created` with `metadata={email, role, name}` — never the password.
 
 ### 9.3 Sessions
 

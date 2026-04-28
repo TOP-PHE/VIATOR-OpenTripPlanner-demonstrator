@@ -9,6 +9,42 @@
   You cannot demote or deactivate yourself — ask another platform admin to do it.
 </p>
 
+<details id="create-user-section" style="margin: 1rem 0; max-width: 700px">
+  <summary style="cursor: pointer; padding: 0.5rem 0.75rem; background: var(--rail-bg, #f5f7fa); border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px">
+    <strong>＋ Create user</strong>
+  </summary>
+  <form id="create-user-form" style="margin-top: 0.75rem; padding: 1rem; border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; display: grid; gap: 0.75rem">
+    <p style="color: var(--rail-steel); font-size: 0.85rem; margin: 0">
+      Direct creation: the new user is active immediately with the password you set here.
+      Share the password with them out-of-band — they can change it via the password-reset flow.
+      Use this until SMTP-based invites are wired.
+    </p>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Email</span>
+      <input type="email" name="email" required autocomplete="off">
+    </label>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Full name</span>
+      <input type="text" name="name" required minlength="1" maxlength="200" autocomplete="off">
+    </label>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Role</span>
+      <select name="role" required>
+        <option value="end_user">end_user</option>
+        <option value="content_manager">content_manager</option>
+        <option value="platform_admin">platform_admin</option>
+      </select>
+    </label>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Initial password (≥ 12 characters)</span>
+      <input type="password" name="password" required minlength="12" maxlength="200" autocomplete="new-password">
+    </label>
+    <div>
+      <button type="submit">Create user</button>
+    </div>
+  </form>
+</details>
+
 <table id="users-table">
   <thead>
     <tr>
@@ -59,6 +95,46 @@ function showToast(kind, text) {
   setTimeout(() => { toast.className = 'msg'; }, 3500);
 }
 
+// ─── Create-user form ──────────────────────────────────────────────
+const createForm = document.getElementById('create-user-form');
+createForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const submitBtn = createForm.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Creating…';
+  const data = Object.fromEntries(new FormData(createForm));
+  try {
+    const r = await fetch('/api/users', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data),
+    });
+    if (!r.ok) {
+      let msg;
+      const body = await r.json().catch(() => ({}));
+      if (Array.isArray(body.detail)) {
+        // Pydantic validation errors come back as a list
+        msg = body.detail.map(e => `${e.loc?.slice(-1)?.[0] || 'field'}: ${e.msg}`).join('; ');
+      } else {
+        msg = body.detail || `Failed (${r.status})`;
+      }
+      showToast('error', msg);
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Create user';
+      return;
+    }
+    const u = await r.json();
+    showToast('success', `Created ${u.email} as ${u.role}`);
+    // Refresh so the new user appears in the table.
+    setTimeout(() => location.reload(), 700);
+  } catch (err) {
+    showToast('error', String(err));
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Create user';
+  }
+});
+
+// ─── Existing per-row save handlers ────────────────────────────────
 document.querySelectorAll('tr[data-user-id]').forEach((row) => {
   const id     = row.dataset.userId;
   const isSelf = row.dataset.self === 'true';

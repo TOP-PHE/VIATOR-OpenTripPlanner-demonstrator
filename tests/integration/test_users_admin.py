@@ -187,3 +187,150 @@ def test_non_admin_cannot_list_users(client: TestClient, admin: tuple[str, str])
 def test_list_users_unauthenticated_401(client: TestClient) -> None:
     r = client.get("/api/users")
     assert r.status_code == 401
+
+
+# ────────────────────────── POST /api/users (create) ──────────────────────────
+
+
+def test_create_user_succeeds(client: TestClient, admin: tuple[str, str]) -> None:
+    jwt, _ = admin
+    r = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={
+            "email": "newie@example.org",
+            "name": "Newie",
+            "role": "end_user",
+            "password": "an-equally-long-pw",
+        },
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["email"] == "newie@example.org"
+    assert body["name"] == "Newie"
+    assert body["role"] == "end_user"
+    assert body["is_active"] is True
+    assert "password" not in body  # never echo the password
+
+
+def test_create_user_then_login_works(client: TestClient, admin: tuple[str, str]) -> None:
+    """Round-trip: admin creates a user; that user can log in with the chosen password."""
+    jwt, _ = admin
+    r = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={
+            "email": "roundtrip@example.org",
+            "name": "Round Trip",
+            "role": "content_manager",
+            "password": "an-equally-long-pw",
+        },
+    )
+    r.raise_for_status()
+
+    client.cookies.clear()
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "roundtrip@example.org", "password": "an-equally-long-pw"},
+    )
+    assert login.status_code == 200, login.text
+    assert login.json()["role"] == "content_manager"
+
+
+def test_create_user_duplicate_email_409(client: TestClient, admin: tuple[str, str]) -> None:
+    jwt, _ = admin
+    payload = {
+        "email": "dup@example.org",
+        "name": "Dup",
+        "role": "end_user",
+        "password": "an-equally-long-pw",
+    }
+    r1 = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json=payload,
+    )
+    assert r1.status_code == 201
+    r2 = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json=payload,
+    )
+    assert r2.status_code == 409
+    assert "already exists" in r2.json()["detail"]
+
+
+def test_create_user_invalid_role_400(client: TestClient, admin: tuple[str, str]) -> None:
+    jwt, _ = admin
+    r = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={
+            "email": "x@example.org",
+            "name": "X",
+            "role": "super-admin",
+            "password": "an-equally-long-pw",
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_create_user_short_password_422(client: TestClient, admin: tuple[str, str]) -> None:
+    """Pydantic enforces MIN_PASSWORD_LENGTH=12 at the schema layer."""
+    jwt, _ = admin
+    r = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={
+            "email": "y@example.org",
+            "name": "Y",
+            "role": "end_user",
+            "password": "short",
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_create_user_malformed_email_422(client: TestClient, admin: tuple[str, str]) -> None:
+    jwt, _ = admin
+    r = client.post(
+        "/api/users",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={
+            "email": "not-an-email",
+            "name": "Z",
+            "role": "end_user",
+            "password": "an-equally-long-pw",
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_non_admin_cannot_create_user(client: TestClient, admin: tuple[str, str]) -> None:
+    """A registered end_user must NOT be able to create users."""
+    _ = admin  # bootstrap exists
+    _confirmed_via_self_register(client, "regular@example.org", "Regular")
+    # We're now logged in as the end_user via cookie set by register-confirm.
+    r = client.post(
+        "/api/users",
+        json={
+            "email": "shouldnt@example.org",
+            "name": "Nope",
+            "role": "platform_admin",
+            "password": "an-equally-long-pw",
+        },
+    )
+    assert r.status_code == 403
+
+
+def test_create_user_unauthenticated_401(client: TestClient) -> None:
+    r = client.post(
+        "/api/users",
+        json={
+            "email": "nope@example.org",
+            "name": "Nope",
+            "role": "end_user",
+            "password": "an-equally-long-pw",
+        },
+    )
+    assert r.status_code == 401
