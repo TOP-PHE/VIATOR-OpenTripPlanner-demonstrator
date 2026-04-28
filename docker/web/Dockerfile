@@ -4,7 +4,11 @@
 # daemon, swarm tools, containerd, etc. Pulling Debian's `docker.io` package
 # brought all of that and >50 transitive deps — a big CVE surface for nothing.
 # Solution: copy just the static CLI binary from Docker's official cli image.
-FROM docker:27-cli AS dockercli
+#
+# Track the major version (29-cli auto-resolves to the latest 29.x.y patch).
+# The CLI is a statically-linked Go binary; Trivy scans its bundled Go deps,
+# so an older docker:cli tag can ship CVEs even though the binary works fine.
+FROM docker:29-cli AS dockercli
 
 # ─────────────────────── stage 2: runtime image ───────────────────────────
 FROM python:3.12-slim
