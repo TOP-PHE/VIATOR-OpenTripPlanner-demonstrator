@@ -2,6 +2,11 @@
 
 Per session, at most one rebuild runs at a time. The MAX_CONCURRENT_REBUILDS
 config knob caps total simultaneous rebuilds across all sessions.
+
+The worker also watches for the reload-trigger file written by
+`POST /api/sessions/<sid>/promote` — when present, runs `docker compose up`
+and `nginx -s reload` so per-session OTP containers come online without
+the operator having to shell in.
 """
 
 from __future__ import annotations
@@ -17,10 +22,16 @@ from sqlalchemy import asc
 
 from .db import SessionLocal
 from .models import RebuildJob
+from .models import Session as SessionRow
+from .models.sessions import SessionState
 from .settings import settings
 
 log = logging.getLogger("worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+# Same path written by app/api/admin/sessions.py::promote_session.
+_RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 
 
 def main() -> None:
@@ -28,6 +39,7 @@ def main() -> None:
     while True:
         try:
             tick()
+            handle_reload_trigger()
         except Exception:
             log.exception("worker tick failed")
         time.sleep(15)
@@ -65,7 +77,75 @@ def tick() -> None:
         job.status = "done" if success else "failed"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
+
+        # Auto-advance the session's state on a successful build so the
+        # operator only has to click 'promote' to reach 'serving'.
+        if success and sid is not None:
+            s = db.get(SessionRow, sid)
+            if s is not None and s.state in (
+                SessionState.POPULATED.value,
+                SessionState.CONFIGURED.value,
+            ):
+                s.state = SessionState.GRAPH_BUILT.value
+
         db.commit()
+
+
+def handle_reload_trigger() -> None:
+    """If `/data/generated/.reload-trigger` exists, apply the current set of
+    per-session compose + nginx fragments to the running stack.
+
+    Steps:
+      1. `docker compose -p viator up -d` — picks up any new `otp-<sid>`
+         services from the regenerated `docker-compose.sessions.yml`.
+      2. `docker exec viator-nginx-1 nginx -s reload` — picks up any new
+         `location /otp/<sid>/ → otp-<sid>:8080` blocks.
+      3. Delete the trigger file.
+
+    Idempotent: running with no diffs is a no-op.
+    """
+    if not _RELOAD_TRIGGER.exists():
+        return
+    log.info("reload trigger seen at %s; applying compose + nginx reload", _RELOAD_TRIGGER)
+
+    # docker compose up -d (project-named "viator" — matches docker-compose.yml).
+    # `docker` is on PATH inside the worker image (multi-stage copy from
+    # docker:29-cli — see docker/web/Dockerfile). Hardcoding /usr/local/bin/docker
+    # would break if Docker's CLI image moves the binary.
+    up = subprocess.run(  # noqa: S603
+        ["docker", "compose", "-p", "viator", "up", "-d"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if up.returncode != 0:
+        log.error(
+            "compose up -d failed (exit %s):\nstdout: %s\nstderr: %s",
+            up.returncode,
+            up.stdout,
+            up.stderr,
+        )
+        # Don't delete the trigger — we'll try again on the next tick.
+        return
+
+    # nginx -s reload (target the compose-labeled container).
+    reload = subprocess.run(  # noqa: S603
+        ["docker", "exec", "viator-nginx-1", "nginx", "-s", "reload"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if reload.returncode != 0:
+        log.error(
+            "nginx reload failed (exit %s):\nstdout: %s\nstderr: %s",
+            reload.returncode,
+            reload.stdout,
+            reload.stderr,
+        )
+        return
+
+    _RELOAD_TRIGGER.unlink(missing_ok=True)
+    log.info("reload completed; trigger deleted")
 
 
 def run_build(*, session_id: str | None) -> tuple[str, bool, str]:

@@ -3,15 +3,17 @@
 
 {% block content %}
 <h1>Sessions</h1>
-<p style="color: var(--rail-steel); max-width: 700px">
+<p style="color: var(--rail-steel); max-width: 720px">
   Each session is an isolated OTP instance with its own inbox, graph, and category.
-  Toggle <strong>fanout</strong> to include a serving session in the default journey search.
+  Click a row to expand its <strong>Configure / Upload / Build / Promote</strong> controls.
+  A session's state advances:
+  <code>created</code> → <code>configured</code> → <code>populated</code> → <code>graph_built</code> → <code>serving</code>.
 </p>
 
 <details class="card" style="margin-bottom: 1rem">
-  <summary style="cursor: pointer; font-weight: 600">Create a new session</summary>
+  <summary style="cursor: pointer; font-weight: 600">＋ Create a new session</summary>
   <form id="create-form" style="margin-top: 1rem">
-    <label>ID (slug, e.g. <code>nap-fr-2026-w14</code>)</label>
+    <label>ID (slug, e.g. <code>nap-fr-2026-q2</code>)</label>
     <input name="id" required pattern="[a-z][a-z0-9-]+">
     <label>Name</label>
     <input name="name" required>
@@ -27,33 +29,122 @@
 
 <table id="sessions-table">
   <thead>
-    <tr><th>ID</th><th>Name</th><th>Category</th><th>State</th><th>Fanout</th><th>Created</th><th></th></tr>
+    <tr><th></th><th>ID</th><th>Name</th><th>Category</th><th>State</th><th>Fanout</th><th>Created</th><th></th></tr>
   </thead>
   <tbody>
   {% for s in sessions %}
-    <tr data-sid="{{ s.id }}">
+    <tr data-sid="{{ s.id }}" data-state="{{ s.state }}" data-config='{{ (s.config or {}) | tojson }}'>
+      <td><button type="button" class="secondary" data-action="expand" aria-expanded="false">▸</button></td>
       <td><code>{{ s.id }}</code></td>
       <td>{{ s.name }}</td>
       <td>{{ s.category }}</td>
-      <td><span class="msg show" style="display:inline-block; padding:2px 8px; font-size:0.75rem">{{ s.state }}</span></td>
+      <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span></td>
       <td style="text-align: center">
         <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
       </td>
       <td style="font-size: 0.85rem; color: var(--rail-steel)">{{ s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '—' }}</td>
       <td><button type="button" class="secondary" data-action="archive" {% if s.state == 'archived' %}disabled{% endif %}>Archive</button></td>
     </tr>
+    <tr class="detail-row" data-sid-detail="{{ s.id }}" hidden>
+      <td colspan="8" style="padding: 0">
+        <div class="detail-panel">
+          <!-- Configure: edit config.sources URLs -->
+          <section class="detail-section">
+            <h3>Configure sources</h3>
+            <p class="hint">URLs the worker downloads via <kbd>Refresh sources</kbd>. All optional. Only NAP/SNCF examples shown.</p>
+            <form data-form="config" data-sid="{{ s.id }}">
+              <label>GTFS URL <code>(.zip)</code></label>
+              <input type="url" name="gtfs" placeholder="https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip">
+              <label>OSM PBF URL <code>(.osm.pbf)</code></label>
+              <input type="url" name="osm_pbf" placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
+              <label>SNCF MCT URL <code>(.zip)</code> — optional, runtime data</label>
+              <input type="url" name="mct" placeholder="">
+              <label>SNCF Stations CSV URL — optional, runtime data</label>
+              <input type="url" name="stations" placeholder="">
+              <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
+                <button type="submit">Save config</button>
+                <button type="button" data-action="refresh-sources" class="secondary">Refresh sources now</button>
+              </div>
+            </form>
+          </section>
+
+          <!-- Upload: per-session multipart -->
+          <section class="detail-section">
+            <h3>Upload a file</h3>
+            <p class="hint">Manual alternative to <kbd>Refresh sources</kbd>. Files are dispatched into the right inbox subfolder.</p>
+            <form data-form="upload" data-sid="{{ s.id }}" enctype="multipart/form-data">
+              <label>Declared standard</label>
+              <select name="declared_standard">
+                <option>GTFS</option>
+                <option>OSM-PBF</option>
+                <option>NeTEx-Nordic</option>
+                <option>NeTEx-EPIP</option>
+                <option>NeTEx-FR-Horaires</option>
+                <option>NeTEx-FR-Arrets</option>
+                <option>SNCF-MCT</option>
+                <option>SNCF-Stations</option>
+              </select>
+              <label>File</label>
+              <input type="file" name="file" required>
+              <button type="submit">Upload</button>
+              <progress data-role="upload-progress" hidden max="100" value="0" style="width: 100%; margin-top: 0.5rem"></progress>
+            </form>
+          </section>
+
+          <!-- Build & Promote -->
+          <section class="detail-section">
+            <h3>Build &amp; Promote</h3>
+            <p class="hint">
+              <strong>Rebuild</strong> queues an OTP graph build. The worker picks up pending jobs every 15 s
+              after the debounce window. Build duration depends on the bundle: ~10 min for IDF, ~30–60 min for France-wide.
+              On success the session advances to <code>graph_built</code>.<br>
+              <strong>Promote</strong> moves <code>graph_built</code> → <code>serving</code> and asks the worker to
+              <code>docker compose up</code> + <code>nginx -s reload</code> so the new <code>otp-{{ s.id }}</code>
+              container becomes routable at <code>/otp/{{ s.id }}/</code>.
+            </p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap">
+              <button type="button" data-action="rebuild" data-sid="{{ s.id }}">Rebuild graph</button>
+              <button type="button" data-action="promote" data-sid="{{ s.id }}">Promote to serving</button>
+              <button type="button" data-action="refresh-jobs" data-sid="{{ s.id }}" class="secondary">Refresh job list</button>
+            </div>
+            <div data-role="jobs" data-sid="{{ s.id }}" style="margin-top: 0.75rem">
+              <em class="hint">Job list will load when this section is expanded.</em>
+            </div>
+          </section>
+        </div>
+      </td>
+    </tr>
   {% endfor %}
   </tbody>
 </table>
 
-<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 240px; max-width: 480px"></div>
+
+<style>
+  .state-badge { display: inline-block; padding: 2px 8px; font-size: 0.75rem; border-radius: 3px; background: var(--rail-bg, #eef); }
+  .state-serving      { background: #c8e6c9; color: #1b5e20; }
+  .state-graph_built  { background: #fff9c4; color: #6f6000; }
+  .state-populated    { background: #e1f5fe; color: #01579b; }
+  .state-configured,
+  .state-created      { background: #f5f5f5; color: #555; }
+  .state-archived     { background: #efebe9; color: #4e342e; }
+  .detail-row[hidden] { display: none; }
+  .detail-panel { padding: 1rem 1.5rem; background: #fafbfc; border-top: 1px solid var(--rail-border, #d0d7de); }
+  .detail-section { margin-bottom: 1.25rem; }
+  .detail-section h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+  .detail-section .hint { color: var(--rail-steel); font-size: 0.85rem; margin: 0 0 0.5rem; max-width: 720px; }
+  .jobs-table { width: 100%; font-size: 0.85rem; margin-top: 0.5rem; border-collapse: collapse; }
+  .jobs-table th, .jobs-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  .jobs-table pre { margin: 0; max-height: 240px; overflow: auto; font-size: 0.75rem; background: #1e1e1e; color: #ddd; padding: 0.5rem; border-radius: 3px; }
+</style>
 {% endblock %}
 
 {% block extra_scripts %}
 <script>
 const toast = document.getElementById('toast');
-function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',3500); }
+function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',5000); }
 
+// ─── Create-session form ─────────────────────────────────────────────
 document.getElementById('create-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -64,6 +155,7 @@ document.getElementById('create-form').addEventListener('submit', async (e) => {
   window.location.reload();
 });
 
+// ─── Per-row main actions: fanout toggle, archive ───────────────────
 document.querySelectorAll('tr[data-sid]').forEach(row => {
   const sid = row.dataset.sid;
   row.querySelector('input[data-action="fanout"]')?.addEventListener('change', async (e) => {
@@ -76,6 +168,147 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
     const r = await fetch(`/api/sessions/${sid}/archive`, {method:'POST'});
     if (r.ok) window.location.reload(); else showToast('error', `Failed (${r.status})`);
   });
+  row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
+    const detail = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
+    const expanded = e.target.getAttribute('aria-expanded') === 'true';
+    detail.hidden = expanded;
+    e.target.setAttribute('aria-expanded', String(!expanded));
+    e.target.textContent = expanded ? '▸' : '▾';
+    if (!expanded) {
+      // Pre-fill the configure form from the row's data-config attribute
+      const cfg = JSON.parse(row.dataset.config || '{}');
+      const sources = cfg.sources || {};
+      const cf = detail.querySelector('form[data-form="config"]');
+      ['gtfs','osm_pbf','mct','stations'].forEach(k => {
+        if (cf.elements[k]) cf.elements[k].value = sources[k] || '';
+      });
+      // Auto-load the jobs list on first expand
+      loadJobs(sid);
+    }
+  });
+});
+
+// ─── Configure (PATCH config.sources) ───────────────────────────────
+document.querySelectorAll('form[data-form="config"]').forEach(form => {
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const sid = form.dataset.sid;
+    const fd = new FormData(form);
+    const sources = {};
+    for (const k of ['gtfs','osm_pbf','mct','stations']) {
+      const v = (fd.get(k) || '').trim();
+      if (v) sources[k] = v;
+    }
+    // Merge into existing config — preserve other keys.
+    const row = document.querySelector(`tr[data-sid="${sid}"]`);
+    const cfg = { ...JSON.parse(row.dataset.config || '{}'), sources };
+    const r = await fetch(`/api/sessions/${sid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({config: cfg})});
+    if (!r.ok) { const j = await r.json().catch(()=>({})); showToast('error', j.detail || `Failed (${r.status})`); return; }
+    const updated = await r.json();
+    row.dataset.config = JSON.stringify(updated.config);
+    showToast('success', `Config saved for ${sid}`);
+  });
+});
+
+// ─── Refresh sources (httpx-download configured URLs) ───────────────
+document.querySelectorAll('button[data-action="refresh-sources"]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const form = btn.closest('form[data-form="config"]');
+    const sid = form.dataset.sid;
+    btn.disabled = true; const original = btn.textContent; btn.textContent = 'Downloading…';
+    try {
+      const r = await fetch(`/api/sessions/${sid}/sources/refresh`, {method:'POST'});
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
+      const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
+      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
+    } catch (err) { showToast('error', String(err)); }
+    finally { btn.disabled = false; btn.textContent = original; }
+  });
+});
+
+// ─── Upload (multipart, with progress) ──────────────────────────────
+document.querySelectorAll('form[data-form="upload"]').forEach(form => {
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const sid = form.dataset.sid;
+    const fd = new FormData(form);
+    const progress = form.querySelector('progress[data-role="upload-progress"]');
+    progress.hidden = false; progress.value = 0;
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/sessions/${sid}/uploads`);
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable) progress.value = (ev.loaded / ev.total) * 100;
+    };
+    xhr.onload = () => {
+      progress.hidden = true;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        showToast('success', `Uploaded — detected ${JSON.parse(xhr.responseText).detected_kind}`);
+        loadJobs(sid);
+      } else {
+        let detail = `Failed (${xhr.status})`;
+        try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
+        showToast('error', detail);
+      }
+    };
+    xhr.onerror = () => { progress.hidden = true; showToast('error', 'Upload failed (network)'); };
+    xhr.send(fd);
+  });
+});
+
+// ─── Rebuild ────────────────────────────────────────────────────────
+document.querySelectorAll('button[data-action="rebuild"]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const sid = btn.dataset.sid;
+    const r = await fetch(`/api/sessions/${sid}/rebuilds`, {method:'POST'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
+    showToast('success', `Rebuild queued for ${sid} (job ${body.id?.slice(0,8) ?? '—'})`);
+    loadJobs(sid);
+  });
+});
+
+// ─── Promote ────────────────────────────────────────────────────────
+document.querySelectorAll('button[data-action="promote"]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const sid = btn.dataset.sid;
+    if (!confirm(`Promote ${sid} to 'serving'? Worker will then bring up the otp-${sid} container and reload nginx.`)) return;
+    const r = await fetch(`/api/sessions/${sid}/promote`, {method:'POST'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
+    showToast('success', `Promoted ${sid} (state=${body.state}). Worker will reload within ~15 s.`);
+    setTimeout(() => location.reload(), 1500);
+  });
+});
+
+// ─── Job list ───────────────────────────────────────────────────────
+async function loadJobs(sid) {
+  const target = document.querySelector(`div[data-role="jobs"][data-sid="${sid}"]`);
+  if (!target) return;
+  target.innerHTML = '<em class="hint">Loading…</em>';
+  const r = await fetch(`/api/sessions/${sid}/rebuilds?limit=10`);
+  if (!r.ok) { target.innerHTML = `<em class="hint">Failed to load jobs (${r.status})</em>`; return; }
+  const jobs = await r.json();
+  if (!jobs.length) { target.innerHTML = '<em class="hint">No rebuild jobs yet.</em>'; return; }
+  let html = '<table class="jobs-table"><thead><tr><th>Status</th><th>Created</th><th>Started</th><th>Finished</th><th>Log (tail)</th></tr></thead><tbody>';
+  for (const j of jobs) {
+    const tail = (j.log || '').slice(-1500);
+    html += `<tr>
+      <td><span class="state-badge state-${j.status}">${j.status}</span></td>
+      <td>${j.created_at?.replace('T', ' ').slice(0,19) || '—'}</td>
+      <td>${j.started_at?.replace('T', ' ').slice(0,19) || '—'}</td>
+      <td>${j.finished_at?.replace('T', ' ').slice(0,19) || '—'}</td>
+      <td><pre>${tail.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  target.innerHTML = html;
+}
+
+document.querySelectorAll('button[data-action="refresh-jobs"]').forEach(btn => {
+  btn.addEventListener('click', () => loadJobs(btn.dataset.sid));
 });
 </script>
 {% endblock %}
