@@ -26,6 +26,17 @@ STAGE_INTO_OTP_INBOX: dict[str, str] = {
     "OSM-PBF": "osm",
 }
 
+# Canonical filename per kind so `docker/otp/build-config.json` can reference
+# stable paths regardless of the original upload/download filename. The
+# entrypoint's compgen still picks them up via the `*.zip` / `*.pbf` glob.
+# Multi-feed sessions are not in scope (would need numbered filenames).
+STAGE_INTO_OTP_INBOX_FILENAME: dict[str, str] = {
+    "GTFS": "gtfs.zip",
+    "NeTEx-Nordic": "netex.zip",
+    "NeTEx-EPIP": "netex.zip",
+    "OSM-PBF": "osm.pbf",
+}
+
 # Stored but does NOT trigger an OTP rebuild (Phase 6 — see strategy doc).
 ARCHIVE_ONLY: set[str] = {
     "NeTEx-FR-Horaires",
@@ -56,7 +67,9 @@ def dispatch(stored_path: Path, kind: str, db: DbSession, *, session_id: str | N
         for existing in subdir.iterdir():
             if existing.is_file() and not existing.name.endswith(".old"):
                 existing.rename(existing.with_suffix(existing.suffix + ".old"))
-        target = subdir / stored_path.name
+        # Use a canonical per-kind filename so build-config.json can reference
+        # `gtfs.zip` / `osm.pbf` instead of the upload's accidental name.
+        target = subdir / STAGE_INTO_OTP_INBOX_FILENAME[kind]
         shutil.copy2(stored_path, target)
         _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
         return True

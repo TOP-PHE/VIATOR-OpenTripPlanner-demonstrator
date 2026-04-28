@@ -2,11 +2,17 @@
   "osmDefaults": {
     "osmTagMapping": "default"
   },
+  "_comment": "Filenames here MUST match STAGE_INTO_OTP_INBOX_FILENAME in app/ingestion.py — gtfs.zip, osm.pbf, netex.zip. The entrypoint copies these from inbox/<sid>/{gtfs,osm,netex}/ into the build dir; OTP reads them by name from this config.",
   "transitFeeds": [
     {
       "type": "gtfs",
-      "feedId": "SNCF",
-      "source": "Export_OpenData_SNCF_GTFS_NewTripId.zip"
+      "feedId": "DEFAULT",
+      "source": "gtfs.zip"
+    }
+  ],
+  "osm": [
+    {
+      "source": "osm.pbf"
     }
   ],
   "transitServiceStart": "-P1M",
