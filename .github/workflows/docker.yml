@@ -89,12 +89,27 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
 
-      - name: Trivy — vulnerability scan
-        # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
-        # Earlier releases (e.g. v0.29.0) internally pin `aquasecurity/setup-trivy@v0.2.2`
-        # which has been deleted from the registry, so they fail to download.
-        # v0.36.0 pins setup-trivy by SHA (3fb12ec1… = v0.2.6) — the right way.
-        # https://github.com/aquasecurity/trivy-action/tags
+      # Diagnostic pass — always prints findings as a table, never fails.
+      # Lets us see *what* Trivy found, even when the gating step below passes.
+      # When the gating step fails, this is the only window into the actual CVE list.
+      - name: Trivy — diagnostic scan (table, non-fatal)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: viator-${{ matrix.image.name }}:scan
+          severity: CRITICAL,HIGH
+          exit-code: 0                                     # never fail the job here
+          ignore-unfixed: true
+          vuln-type: ${{ matrix.image.trivy_vuln_type }}
+          trivyignores: ".trivyignore"
+          format: table
+
+      # Gating pass — fails the job on any unignored CRITICAL/HIGH finding.
+      # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
+      # Earlier releases (e.g. v0.29.0) internally pin `aquasecurity/setup-trivy@v0.2.2`
+      # which has been deleted from the registry, so they fail to download.
+      # v0.36.0 pins setup-trivy by SHA (3fb12ec1… = v0.2.6) — the right way.
+      # https://github.com/aquasecurity/trivy-action/tags
+      - name: Trivy — vulnerability scan (sarif, gating)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: viator-${{ matrix.image.name }}:scan
@@ -106,12 +121,28 @@ jobs:
           format: sarif
           output: trivy-${{ matrix.image.name }}.sarif
 
-      - name: Upload Trivy SARIF to GitHub Security
+      # Upload to the Security tab — but don't fail CI if Code Scanning isn't
+      # enabled on the repo. The findings are still visible in the diagnostic
+      # step's table output above, and the SARIF artifact is uploaded below.
+      # To enable Code Scanning: Settings → Code security and analysis →
+      # Code scanning → Set up → Default. Free for public repos.
+      - name: Upload Trivy SARIF to GitHub Security tab
         if: always()
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-${{ matrix.image.name }}.sarif
           category: trivy-${{ matrix.image.name }}
+
+      # Always keep the SARIF as a downloadable artifact, even when the upload
+      # to Code Scanning is skipped. Lets you grep findings offline.
+      - name: Upload Trivy SARIF as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.image.name }}-sarif
+          path: trivy-${{ matrix.image.name }}.sarif
+          retention-days: 14
 
       # Only after Trivy passes do we push (pushed image is bit-identical thanks to BuildKit).
       - name: Build and push (multi-tag)

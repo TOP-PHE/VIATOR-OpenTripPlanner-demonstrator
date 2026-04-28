@@ -4,8 +4,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
+# Apply pending Debian security patches at build time. The python:3.12-slim
+# tag is rebuilt on Python's cadence, not Debian's, so it can lag behind
+# debian-security-announce. `apt-get upgrade` here closes that gap and keeps
+# Trivy's OS scan green between base-image refreshes.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl docker.io \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

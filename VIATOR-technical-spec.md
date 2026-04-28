@@ -1842,8 +1842,11 @@ Matrix build over `[web, otp]`:
 
 1. **hadolint** lints the Dockerfile (DL3008, DL3015, etc.).
 2. **`docker buildx build`** builds the image, with build cache stored in GitHub Actions cache.
-3. **Trivy** scans the built image for CVEs at severity CRITICAL,HIGH. Findings allowed to remain are listed in `.trivyignore` (see 15.8).
-4. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
+3. **Trivy diagnostic pass** — prints findings as a table at severity CRITICAL,HIGH. Never fails (exit-code: 0). This is your window into "what's there" even when the gate passes.
+4. **Trivy gating pass** — same scan, fails on any unignored finding (exit-code: 1, SARIF output).
+5. **SARIF upload to GitHub Security tab** — `continue-on-error: true` so a repo without Code Scanning enabled doesn't break CI. To enable: Settings → Code security and analysis → Code scanning → Set up → Default (free for public repos).
+6. **SARIF artifact upload** — always saves the scan result as a 14-day workflow artifact for offline grep, regardless of whether the Security-tab upload succeeded.
+7. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
 
 > **Per-image Trivy scope** — the matrix sets `vuln-type` differently for each image:
 > - **`web`** (FastAPI app): `os,library` — full scan, including all Python deps. We control everything in this image.
@@ -1891,7 +1894,17 @@ Both are **private by default**. Make them public if you want the demonstrator p
 
 > Repo → Packages → click each package → Package settings → Change visibility → Public.
 
-#### 15.7.5 SonarCloud project setup (optional but recommended)
+#### 15.7.5 Code Scanning (for Trivy SARIF uploads)
+
+The `docker.yml` workflow uploads Trivy SARIF reports to the repo's Security tab. This requires Code Scanning to be enabled. The upload step is `continue-on-error: true`, so CI will pass either way — but if you want the findings visible in the GitHub UI:
+
+> Repo → Settings → Code security and analysis → Code scanning → Set up → **Default**.
+
+Free for public repos. For private repos, requires GitHub Advanced Security ($).
+
+If you skip this, the SARIF reports are still uploaded as workflow artifacts (14-day retention) — download from the workflow run page if you need them.
+
+#### 15.7.6 SonarCloud project setup (optional but recommended)
 
 1. https://sonarcloud.io → log in with GitHub.
 2. **+** → Analyze new project → import the GitHub repo.
@@ -1903,17 +1916,22 @@ Both are **private by default**. Make them public if you want the demonstrator p
 
 ### 15.8 Trivy & security scanning — what to do with findings
 
-The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that has a fix available upstream **and is in scope for that image** (see the per-image scope rules in §15.6.2). Four escape hatches, in order of preference:
+The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that has a fix available upstream **and is in scope for that image** (see the per-image scope rules in §15.6.2).
 
-1. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
-2. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
-3. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
+**See findings even when the gate passes** — the workflow runs Trivy twice on each image: first as a non-fatal diagnostic pass (table output, exit-code 0) printed to the job log, then as a gating pass (SARIF, exit-code 1). The first pass means you always see the CVE list; the second pass enforces it.
+
+Five escape hatches, in order of preference:
+
+1. **Apply pending OS patches at build time.** Both Dockerfiles run `apt-get update && apt-get upgrade -y` because the base image tags (`eclipse-temurin:25-jre-noble`, `python:3.12-slim`) are rebuilt on a slower cadence than `debian-security-announce` / `ubuntu-security-announce` post fixes. **Most OS-package CVE findings clear with a clean rebuild** (no code change needed). If a build runs from cache and skips the apt steps, force a rebuild: in CI, push an empty commit; locally, `docker compose build --no-cache <service>`.
+2. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
+3. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
+4. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
    ```
    # .trivyignore — one CVE per line, with a justifying comment above each
    # CVE-2024-XXXXX: jdwp debug port flag — not enabled in our JRE config
    CVE-2024-XXXXX
    ```
-4. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
+5. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
 
 **Never blanket-ignore severity HIGH.** Each suppression must have a comment explaining why it's safe.
 
@@ -2004,6 +2022,8 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **GitHub Actions** "Unable to resolve action `<owner>/<repo>@<version>`" | Three common causes: (1) the ref doesn't exist; (2) tags use `v` prefix but the pin omits it; (3) the action's tag is real, but its **internal** sub-action pin points at a deleted tag. | (1)+(2): `curl -fsSL "https://api.github.com/repos/<owner>/<repo>/tags?per_page=20"` and pick a real ref. For `aquasecurity/trivy-action`, tags use `v` prefix — `@v0.36.0`. (3) is sneakier: the failure message names the *sub*-action. Inspect `action.yaml` at the version you pinned (`curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/<ref>/action.yaml | grep uses:`) — if you see another action pinned by tag, check that tag exists too. **Bumping to a recent action version usually fixes this** (modern releases pin sub-actions by SHA). For trivy-action, releases ≤ v0.29.0 pin `setup-trivy@v0.2.2` (deleted); v0.36.0 pins by SHA. |
 | **`upload-sarif`** "Resource not accessible by integration" | `github/codeql-action/upload-sarif` needs `actions: read` to fetch run metadata, in addition to `security-events: write`. The default `GITHUB_TOKEN` doesn't get this implicitly. | Add `actions: read` to the job's `permissions:` block. Already set in `docker.yml`. |
 | **Trivy** scan exits 1 on the OTP image with Java CVE findings | OTP's shaded jar bundles transitive Java deps that we don't control | The workflow scopes the OTP image scan to `vuln-type: os` (OS packages only) for this reason. If you see this failure, it means someone changed the matrix entry to `os,library`. Either revert, or address the upstream Java CVE per §15.8.1. |
+| **Trivy** scan exits 1 on **OS packages** (Ubuntu/Debian) | The base image is shipping with un-patched CVEs | First, check the diagnostic step's table output (immediately above the failed gating step) to see the CVE list. Then: (1) push an empty commit to force a fresh build that re-runs `apt-get upgrade`; (2) if that doesn't clear it, the patch isn't in the distro yet — bump the base image tag in `docker/<svc>/Dockerfile`; (3) if no fix exists upstream, add the CVE to `.trivyignore` with a one-line rationale. |
+| **`upload-sarif`** "Code scanning is not enabled for this repository" | Code Scanning hasn't been turned on in repo settings | Two options: (a) Enable Code Scanning per §15.7.5 — free for public repos, gives you the Security tab UI; (b) ignore — the `upload-sarif` step is `continue-on-error: true`, and SARIFs are still saved as 14-day workflow artifacts. |
 | **SonarCloud** "Project not found" | Repo Variable `SONARCLOUD_ENABLED=true` but project not yet imported on sonarcloud.io | Either import the project (15.7.5) or unset the Variable to skip the step. |
 
 ### 15.12 Tooling matrix (reference)

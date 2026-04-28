@@ -3,8 +3,14 @@ FROM eclipse-temurin:25-jre-noble
 ARG OTP_VERSION=2.9.0
 ENV OTP_VERSION=${OTP_VERSION}
 
+# Apply pending Ubuntu security patches at build time. The base image tag
+# (eclipse-temurin:25-jre-noble) is rebuilt on Temurin's cadence, not Ubuntu's,
+# so it can lag behind ubuntu-security-announce. `apt-get upgrade` here closes
+# that gap and keeps Trivy's OS scan green between base-image refreshes.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Note: starting with OTP 2.7.0 the Maven artifact ID was renamed from
