@@ -33,11 +33,11 @@ jobs:
       ADMIN_USER: ci
       ADMIN_PASSWORD: ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # SonarCloud needs full git history for blame
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -70,7 +70,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage-xml
           path: coverage.xml
@@ -87,15 +87,15 @@ jobs:
       && (github.event_name == 'push'
           || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: coverage-xml
 
-      - uses: SonarSource/sonarcloud-github-action@v3
+      - uses: SonarSource/sonarcloud-github-action@v5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -104,8 +104,8 @@ jobs:
     name: Pre-commit (belt-and-braces)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
