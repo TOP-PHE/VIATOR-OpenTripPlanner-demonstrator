@@ -1842,11 +1842,12 @@ Matrix build over `[web, otp]`:
 
 1. **hadolint** lints the Dockerfile (DL3008, DL3015, etc.).
 2. **`docker buildx build`** builds the image, with build cache stored in GitHub Actions cache.
-3. **Trivy diagnostic pass** — prints findings as a table at severity CRITICAL,HIGH. Never fails (exit-code: 0). This is your window into "what's there" even when the gate passes.
-4. **Trivy gating pass** — same scan, fails on any unignored finding (exit-code: 1, SARIF output).
-5. **SARIF upload to GitHub Security tab** — `continue-on-error: true` so a repo without Code Scanning enabled doesn't break CI. To enable: Settings → Code security and analysis → Code scanning → Set up → Default (free for public repos).
-6. **SARIF artifact upload** — always saves the scan result as a 14-day workflow artifact for offline grep, regardless of whether the Security-tab upload succeeded.
-7. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
+3. **Trivy diagnostic pass** — prints findings as a table at severity CRITICAL,HIGH (with `list-all-pkgs: true` so the scanned-package list is also visible). Never fails (exit-code: 0). This is your window into "what's there" even when the gate passes. Also writes the table to `trivy-<image>.table.txt` for the artifact upload below.
+4. **Diagnostic table artifact upload** — saves `trivy-<image>.table.txt` as a 14-day workflow artifact. Useful when scrolling the job log is awkward, or when you want to grep findings offline.
+5. **Trivy gating pass** — same scan, fails on any unignored finding (exit-code: 1, SARIF output).
+6. **SARIF upload to GitHub Security tab** — `continue-on-error: true` so a repo without Code Scanning enabled doesn't break CI. **Also gated to `push` events on `main`** — fork PRs can't write security-events to the upstream repo anyway, so skipping there reduces noise. To enable Code Scanning: Settings → Code security and analysis → Code scanning → Set up → Default (free for public repos).
+7. **SARIF artifact upload** — always saves the scan result as a 14-day workflow artifact for offline grep, regardless of whether the Security-tab upload succeeded.
+8. **Push** to `ghcr.io/<owner>/<repo>/<web|otp>:<sha>` and `:latest`.
 
 > **Per-image Trivy scope** — the matrix sets `vuln-type` differently for each image:
 > - **`web`** (FastAPI app): `os,library` — full scan, including all Python deps. We control everything in this image.
@@ -1920,18 +1921,19 @@ The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that h
 
 **See findings even when the gate passes** — the workflow runs Trivy twice on each image: first as a non-fatal diagnostic pass (table output, exit-code 0) printed to the job log, then as a gating pass (SARIF, exit-code 1). The first pass means you always see the CVE list; the second pass enforces it.
 
-Five escape hatches, in order of preference:
+Six escape hatches, in order of preference:
 
 1. **Apply pending OS patches at build time.** Both Dockerfiles run `apt-get update && apt-get upgrade -y` because the base image tags (`eclipse-temurin:25-jre-noble`, `python:3.12-slim`) are rebuilt on a slower cadence than `debian-security-announce` / `ubuntu-security-announce` post fixes. **Most OS-package CVE findings clear with a clean rebuild** (no code change needed). If a build runs from cache and skips the apt steps, force a rebuild: in CI, push an empty commit; locally, `docker compose build --no-cache <service>`.
-2. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
-3. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
-4. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
+2. **Reduce the dependency surface.** If a package brings transitive deps you don't need, swap to a leaner equivalent. Example: the web image previously installed Debian's `docker.io` (daemon + CLI + tools, ~50 transitive deps) just so the worker could shell out to `docker` to spawn otp-build jobs. Replaced with a multi-stage `COPY --from=docker:27-cli /usr/local/bin/docker` — single static go binary, no apt deps. Big CVE surface reduction for the same functionality.
+3. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
+4. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
+5. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
    ```
    # .trivyignore — one CVE per line, with a justifying comment above each
    # CVE-2024-XXXXX: jdwp debug port flag — not enabled in our JRE config
    CVE-2024-XXXXX
    ```
-5. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
+6. **For Dockerfile config findings** (e.g. "USER not set"), use `ci/trivy-config-ignore.rego` to suppress with rationale.
 
 **Never blanket-ignore severity HIGH.** Each suppression must have a comment explaining why it's safe.
 

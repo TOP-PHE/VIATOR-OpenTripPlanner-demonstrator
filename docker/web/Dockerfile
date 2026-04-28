@@ -1,3 +1,12 @@
+# ─────────────────────── stage 1: docker CLI binary ───────────────────────
+# We need just the `docker` CLI (the worker container shells out to it to
+# spawn otp-build jobs against the host's docker socket). We DO NOT need the
+# daemon, swarm tools, containerd, etc. Pulling Debian's `docker.io` package
+# brought all of that and >50 transitive deps — a big CVE surface for nothing.
+# Solution: copy just the static CLI binary from Docker's official cli image.
+FROM docker:27-cli AS dockercli
+
+# ─────────────────────── stage 2: runtime image ───────────────────────────
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -10,9 +19,12 @@ ENV PYTHONUNBUFFERED=1 \
 # Trivy's OS scan green between base-image refreshes.
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends curl docker.io \
+    && apt-get install -y --no-install-recommends curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy just the docker CLI binary — single static go binary, no daemon, no apt deps.
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /srv
 

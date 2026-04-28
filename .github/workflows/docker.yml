@@ -102,6 +102,18 @@ jobs:
           vuln-type: ${{ matrix.image.trivy_vuln_type }}
           trivyignores: ".trivyignore"
           format: table
+          list-all-pkgs: true                              # show every package scanned, not just vulnerable ones
+          output: trivy-${{ matrix.image.name }}.table.txt # also persist for the artifact upload below
+
+      # Persist the diagnostic table as an artifact so we always have the CVE list
+      # offline, even if scrolling the job log is awkward. 14-day retention.
+      - name: Upload Trivy diagnostic table as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.image.name }}-table
+          path: trivy-${{ matrix.image.name }}.table.txt
+          retention-days: 14
 
       # Gating pass — fails the job on any unignored CRITICAL/HIGH finding.
       # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
@@ -126,8 +138,12 @@ jobs:
       # step's table output above, and the SARIF artifact is uploaded below.
       # To enable Code Scanning: Settings → Code security and analysis →
       # Code scanning → Set up → Default. Free for public repos.
+      #
+      # Restricted to push events on main: PR runs from forks can't write to
+      # security-events anyway, and skipping the upload there avoids the
+      # "Resource not accessible by integration" warning noise.
       - name: Upload Trivy SARIF to GitHub Security tab
-        if: always()
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always()
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
