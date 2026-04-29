@@ -91,6 +91,13 @@ def tick() -> None:
         db.commit()
 
 
+def _list_serving_sessions() -> list[str]:
+    """Return the IDs of every session currently in 'serving' state."""
+    with SessionLocal() as db:
+        rows = db.query(SessionRow).filter(SessionRow.state == SessionState.SERVING.value).all()
+        return [r.id for r in rows]
+
+
 def handle_reload_trigger() -> None:
     """If `/data/generated/.reload-trigger` exists, apply the current set of
     per-session compose + nginx fragments to the running stack.
@@ -108,28 +115,46 @@ def handle_reload_trigger() -> None:
         return
     log.info("reload trigger seen at %s; applying compose + nginx reload", _RELOAD_TRIGGER)
 
-    # docker compose up -d (project-named "viator" — matches docker-compose.yml).
-    # `docker` is on PATH inside the worker image (multi-stage copy from
-    # docker:29-cli — see docker/web/Dockerfile). Hardcoding /usr/local/bin/docker
-    # would break if Docker's CLI image moves the binary.
-    # cwd=/srv/docker so docker compose finds docker-compose.yml + the
-    # generated/docker-compose.sessions.yml fragment via include.
-    up = subprocess.run(  # noqa: S603
-        ["docker", "compose", "-p", "viator", "up", "-d"],  # noqa: S607
-        cwd="/srv/docker",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if up.returncode != 0:
-        log.error(
-            "compose up -d failed (exit %s):\nstdout: %s\nstderr: %s",
-            up.returncode,
-            up.stdout,
-            up.stderr,
+    # Find which per-session OTP services we need to bring up. Targeting the
+    # specific service names keeps a broken include from triggering rebuilds
+    # of long-running services (web, nginx, postgres) on every retry.
+    serving_sids = _list_serving_sessions()
+    if not serving_sids:
+        log.info("reload trigger seen but no sessions in serving state; skipping compose up")
+    else:
+        otp_services = [f"otp-{sid}" for sid in serving_sids]
+        # docker compose up -d --no-deps <otp-services>:
+        # --no-deps prevents touching web/nginx/postgres even if the
+        #   generated fragment somehow references them
+        # explicit service names: only these services are created/updated
+        # cwd=/srv/docker so docker compose finds docker-compose.yml + the
+        #   generated/docker-compose.sessions.yml fragment via include.
+        up = subprocess.run(  # noqa: S603
+            [
+                "docker",
+                "compose",
+                "-p",
+                "viator",
+                "up",
+                "-d",
+                "--no-deps",
+                *otp_services,
+            ],  # noqa: S607
+            cwd="/srv/docker",
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        # Don't delete the trigger — we'll try again on the next tick.
-        return
+        if up.returncode != 0:
+            log.error(
+                "compose up -d for %s failed (exit %s):\nstdout: %s\nstderr: %s",
+                otp_services,
+                up.returncode,
+                up.stdout,
+                up.stderr,
+            )
+            # Don't delete the trigger — we'll try again on the next tick.
+            return
 
     # nginx -s reload (target the compose-labeled container).
     reload = subprocess.run(  # noqa: S603
