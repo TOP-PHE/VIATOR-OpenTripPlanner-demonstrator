@@ -27,6 +27,23 @@ TRAINLINE_CSV_URL = "https://raw.githubusercontent.com/trainline-eu/stations/mas
 
 
 # Trainline column → MasterStation attribute.
+#
+# NOTE on `parent_station_id` (deliberately omitted from this map):
+#   Trainline's CSV uses TWO different ID spaces. `id` is Trainline's own
+#   internal sequential integer (1, 2, …, ~5000). `uic` is the official UIC
+#   code (7-8 digits, e.g. 8775123). `parent_station_id` points at the
+#   PARENT row's *Trainline `id`*, NOT its UIC code.
+#
+#   Our master_stations.parent_uic column has a foreign key to
+#   master_stations.uic. Mapping `parent_station_id → parent_uic` directly
+#   inserts Trainline IDs (e.g. 1, 4, 5768) into a column that expects UIC
+#   codes, which are absent from master_stations → IntegrityError on commit.
+#
+#   To populate parent_uic correctly we'd need a two-pass load: first build
+#   a trainline_id → uic dict from the parsed rows, then translate each row's
+#   parent_station_id through that map. Worth doing if/when we actually use
+#   parent_uic (none of the current admin / journey UI / signature paths
+#   read it). For now: leave parent_uic NULL on all imported rows.
 _COL_MAP = {
     "uic": "uic",
     "uic8_sncf": "uic8_sncf",
@@ -35,7 +52,6 @@ _COL_MAP = {
     "country": "country_iso",
     "latitude": "latitude",
     "longitude": "longitude",
-    "parent_station_id": "parent_uic",
     "is_main_station": "is_main_station",
     "is_suggestable": "is_suggestable",
     "sncf_id": "trigramme_sncf",
