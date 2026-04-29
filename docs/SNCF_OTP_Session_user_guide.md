@@ -581,6 +581,27 @@ sources** form:
 
 Click **"Save config"** → toast: "Config saved for nap-fr-sncf-idf".
 
+> **⚠ Data-coverage caveat — read before picking sources.** OTP requires
+> the OSM PBF to cover *every* place the GTFS stop coordinates resolve to.
+> The "SNCF NAP Trains" GTFS contains nationwide intercity stops (TGV,
+> TER) reaching from Brest to Marseille. If you pair it with **IDF-only
+> OSM** (the URL above), coordinate searches whose origin OR destination
+> sits outside Île-de-France will return `LOCATION_NOT_FOUND` from OTP —
+> e.g. searching to "Lyon Part-Dieu" against an IDF graph fails because
+> Lyon's street network isn't loaded. The schedules are in the graph and
+> stop-to-stop routing via GraphQL `fromPlace`/`toPlace` works fine; only
+> coordinate snapping fails.
+>
+> **For an intercity demonstrator** (TGV Paris → Lyon, etc.) use a
+> France-wide PBF — `https://download.geofabrik.de/europe/france-latest.osm.pbf`
+> — and bump `OTP_BUILD_HEAP=48g` in `.env`. Build takes ~20 min; the
+> serving container then loads on ~12 GB.
+>
+> **For a Paris urban-transit demonstrator** (RER, Métro, Transilien)
+> swap the GTFS for IDFM's all-modes archive at
+> `https://eu.ftp.opendatasoft.com/stif/GTFS/IDFM-gtfs.zip` and keep the
+> IDF PBF; build runs in ~5 min on 8 GB.
+
 ### 5.4 — Refresh sources (download)
 
 Click **"Refresh sources now"**. The button shows "Downloading…" for
@@ -676,6 +697,8 @@ session's origin flag.
 | Build appears stuck — no log output for >5 min | Normal during OSM parsing or transit-graph phase | See §3.4. Run `docker stats --no-stream` and check `otp-build` CPU. >100% CPU = healthy, just slow; <1% with no I/O = actually stuck (rare; check container status with `docker logs $(docker ps -q -f name=otp-build)`). |
 | `rebuild_jobs.log` shows OTP error like `java.io.FileNotFoundException` for a file you uploaded | File didn't get the canonical name (Phase-2 ingestion bug, or pre-`e526d95` deploy) | Verify `inbox/<sid>/gtfs/gtfs.zip` and `inbox/<sid>/osm/osm.pbf` exist. If they have the original upstream name (e.g. `Export_OpenData_SNCF_GTFS_NewTripId.zip`), pull the latest code, rebuild web+worker images, click "Refresh sources now" again. |
 | Toast says all sources "Skipped: ... [Errno -2] Name or service not known" | DNS failure inside the container, OR malformed URL in the config form | Check the URLs displayed in the Configure form — pasted URLs sometimes get concatenated (`https://rehttps://...`). Clear each field with Ctrl+A, paste fresh, click Save config, retry Refresh. If URLs look right, check `docker compose exec web getent hosts <hostname>`. If that fails, see the DNS pin in `docker-compose.yml` (8.8.8.8 / 1.1.1.1 on web + worker). |
+| Journey UI search returns "no itinerary found"; direct GraphQL `plan(...)` returns `routingErrors: [{code: "LOCATION_NOT_FOUND"}]` | OSM PBF doesn't cover the lat/lon you're searching to/from — the GTFS may have a stop near that point but OTP can't snap a coordinate to a street network it doesn't know about | Either pick an origin AND destination both inside the OSM region you built with, OR rebuild with a wider PBF (see the "Data-coverage caveat" in §5.3). Stop-to-stop GraphQL queries via `fromPlace`/`toPlace` are unaffected. |
+| `plan(...)` returns one WALK-only itinerary with `routingErrors: [{code: "WALKING_BETTER_THAN_TRANSIT"}]` for two stations clearly served by transit | The GTFS you loaded doesn't contain the line that connects them (e.g. SNCF intercity GTFS for two Paris terminals — no SNCF mainline runs between Gare du Nord and Gare de Lyon) | This is correct behaviour for the dataset; for urban Paris routing add IDFM's GTFS (Transilien + RER + RATP) as either a second session or a replacement. |
 
 ---
 
