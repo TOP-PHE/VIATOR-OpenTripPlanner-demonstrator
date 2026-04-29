@@ -129,17 +129,18 @@ def handle_reload_trigger() -> None:
         # explicit service names: only these services are created/updated
         # cwd=/srv/docker so docker compose finds docker-compose.yml + the
         #   generated/docker-compose.sessions.yml fragment via include.
-        up = subprocess.run(  # noqa: S603
-            [
-                "docker",
-                "compose",
-                "-p",
-                "viator",
-                "up",
-                "-d",
-                "--no-deps",
-                *otp_services,
-            ],  # noqa: S607
+        up_cmd = [
+            "docker",
+            "compose",
+            "-p",
+            "viator",
+            "up",
+            "-d",
+            "--no-deps",
+            *otp_services,
+        ]
+        up = subprocess.run(  # noqa: S603, S607
+            up_cmd,
             cwd="/srv/docker",
             capture_output=True,
             text=True,
