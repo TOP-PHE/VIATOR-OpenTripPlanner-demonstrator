@@ -47,8 +47,50 @@ case "$MODE" in
             cp "$INBOX_DIR"/dem/*.tif "$BUILD_DIR/"
         fi
 
-        cp /opt/otp/build-config.json "$BUILD_DIR/"
         cp /opt/otp/router-config.json "$BUILD_DIR/"
+
+        # Generate build-config.json from the GTFS files that landed in
+        # BUILD_DIR. One transitFeeds entry per .zip; feedId derived from the
+        # filename stem, uppercased. Single-feed sessions stage at `gtfs.zip`
+        # and produce feedId=GTFS. Multi-feed sessions stage as `<feed_id_lower>.zip`
+        # (e.g. `sncf.zip`, `idfm.zip`, `trenitalia.zip`) and produce one
+        # feedId per file (SNCF, IDFM, TRENITALIA). The OSM section is fixed
+        # — exactly one PBF per session, staged as `osm.pbf`.
+        #
+        # The bundled `/opt/otp/build-config.json` from the image is only
+        # used as a fallback when no GTFS zips exist (keeps the entrypoint
+        # working for an OSM-only build, even though that's a degenerate
+        # case OTP itself rejects with "no transit data").
+        TRANSIT_FEEDS_JSON=""
+        for zip in "$BUILD_DIR"/*.zip; do
+            [ -f "$zip" ] || continue
+            stem="$(basename "$zip" .zip)"
+            feed_id="$(printf %s "$stem" | tr '[:lower:]' '[:upper:]')"
+            entry="{\"type\":\"gtfs\",\"feedId\":\"$feed_id\",\"source\":\"$stem.zip\"}"
+            if [ -n "$TRANSIT_FEEDS_JSON" ]; then
+                TRANSIT_FEEDS_JSON="$TRANSIT_FEEDS_JSON,$entry"
+            else
+                TRANSIT_FEEDS_JSON="$entry"
+            fi
+        done
+        if [ -n "$TRANSIT_FEEDS_JSON" ]; then
+            echo "Generating build-config.json with feeds: $TRANSIT_FEEDS_JSON"
+            cat > "$BUILD_DIR/build-config.json" <<JSON
+{
+  "osmDefaults": {"osmTagMapping": "default"},
+  "transitFeeds": [$TRANSIT_FEEDS_JSON],
+  "osm": [{"source": "osm.pbf"}],
+  "transitServiceStart": "-P1M",
+  "transitServiceEnd": "P5M",
+  "subwayAccessTime": 2.0,
+  "streetGraph": "streetGraph.obj",
+  "graph": "graph.obj"
+}
+JSON
+        else
+            echo "No GTFS zips found; falling back to baked build-config.json"
+            cp /opt/otp/build-config.json "$BUILD_DIR/"
+        fi
 
         case "$BUILD_PHASES" in
             two_phase)

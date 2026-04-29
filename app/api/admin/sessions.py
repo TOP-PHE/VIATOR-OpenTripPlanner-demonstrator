@@ -409,18 +409,46 @@ async def refresh_sources(
     fetched: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
+    # Flatten the sources dict into (key, url, feed_id_or_None, staged_filename)
+    # tuples. Multi-feed GTFS expands to one tuple per feed; everything else is
+    # a single tuple. Order is determined by dict-insertion order, which Python
+    # 3.7+ guarantees is stable, so SNCF before IDFM before TRENITALIA the way
+    # the operator typed them.
+    work: list[tuple[str, str, str | None, str | None]] = []
+    for key, value in sources.items():
+        if key == "gtfs":
+            try:
+                feeds = ingestion.normalize_gtfs_sources(value)
+            except ValueError as exc:
+                skipped.append({"key": "gtfs", "reason": f"invalid gtfs config: {exc}"})
+                continue
+            for feed in feeds:
+                fid = feed["id"]
+                work.append((f"gtfs[{fid}]", feed["url"], fid, ingestion.gtfs_staged_filename(fid)))
+            continue
+        # Non-GTFS keys: simple scalar URL.
+        if not isinstance(value, str):
+            skipped.append({"key": key, "reason": f"expected a URL string, got {type(value).__name__}"})
+            continue
+        work.append((key, value, None, None))
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for key, url in sources.items():
-            kind = _SOURCE_KEY_TO_KIND.get(key)
+        for key, url, feed_id, staged_filename in work:
+            # `key` here is the surface label used in the response payload —
+            # `gtfs[SNCF]` for multi-feed entries, `gtfs` / `osm_pbf` / etc.
+            # for single-source ones. The kind lookup uses the bracket-stripped
+            # form so every gtfs[*] entry resolves to GTFS.
+            base_key = key.split("[", 1)[0]
+            kind = _SOURCE_KEY_TO_KIND.get(base_key)
             if kind is None:
-                skipped.append({"key": key, "reason": f"unknown source key {key!r}"})
+                skipped.append({"key": key, "reason": f"unknown source key {base_key!r}"})
                 continue
             if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                 skipped.append({"key": key, "url": url, "reason": "not an http(s) URL"})
                 continue
 
             ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            staged_name = f"{ts}-{key}{_url_suffix(url)}"
+            staged_name = f"{ts}-{base_key}{('-' + feed_id) if feed_id else ''}{_url_suffix(url)}"
             staged_path = staging / staged_name
             try:
                 async with client.stream("GET", url) as response:
@@ -433,13 +461,22 @@ async def refresh_sources(
                 skipped.append({"key": key, "url": url, "reason": f"download failed: {exc}"})
                 continue
 
+            size_bytes = _stat_size(staged_path)
             # detect.detect can be slow on large OSM PBFs; we trust the
-            # configured key here since the operator picked it.
-            ingestion.dispatch(staged_path, kind, db, session_id=sid)
+            # configured key here since the operator picked it. `staged_filename`
+            # is None for everything except multi-feed GTFS — dispatch falls
+            # back to the canonical default per kind.
+            ingestion.dispatch(
+                staged_path,
+                kind,
+                db,
+                session_id=sid,
+                staged_filename=staged_filename,
+            )
             staged_path.unlink(missing_ok=True)
 
             fetched.append(
-                {"key": key, "kind": kind, "url": url, "size_bytes": _stat_size(staged_path)}
+                {"key": key, "kind": kind, "url": url, "size_bytes": size_bytes}
             )
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
