@@ -196,7 +196,14 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     current = Path(str(settings.graph_dir)) / sid / "current"
     if current.exists() or current.is_symlink():
         current.unlink()
-    current.symlink_to(graph_target, target_is_directory=True)
+    # IMPORTANT: relative target. The symlink lives inside a Docker volume
+    # that's mounted at different paths in different containers (worker:
+    # /data/graphs/<sid>/, otp-<sid>: /var/otp/graph/<sid>/). An absolute
+    # target would only resolve in the worker's namespace; the otp serving
+    # container would fail at startup with "graph.obj: No such file or
+    # directory". A relative target (`current -> 20260429-042955`) works in
+    # any container that mounts the volume.
+    current.symlink_to(graph_target.name, target_is_directory=True)
 
     _prune_old_graphs(sid, keep=3)
 
