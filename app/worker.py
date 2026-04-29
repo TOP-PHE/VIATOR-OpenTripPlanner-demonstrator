@@ -139,7 +139,7 @@ def handle_reload_trigger() -> None:
             "--no-deps",
             *otp_services,
         ]
-        up = subprocess.run(  # noqa: S603, S607
+        up = subprocess.run(  # noqa: S603
             up_cmd,
             cwd="/srv/docker",
             capture_output=True,
