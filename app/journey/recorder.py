@@ -64,7 +64,7 @@ def record_execution(
     *,
     search_id: uuid.UUID,
     session_id: str,
-    graph_snapshot_id: uuid.UUID,
+    graph_snapshot_id: uuid.UUID | None,
     status: str,
     response_ms: int,
     raw_response: dict[str, Any] | None,

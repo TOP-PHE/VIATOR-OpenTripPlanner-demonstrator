@@ -89,8 +89,12 @@ class JourneySearchExecution(Base):
         nullable=False,
     )
     session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), nullable=False)
-    graph_snapshot_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("graph_snapshots.id"), nullable=False
+    # NULL when no snapshot was recorded for this session at execution time
+    # (e.g. session has run a build but the worker hasn't written a
+    # graph_snapshots row yet — Phase-3 wiring). Proper non-NULL operation
+    # returns once the worker auto-creates snapshots on successful build.
+    graph_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("graph_snapshots.id"), nullable=True
     )
     status: Mapped[str] = mapped_column(String, nullable=False)
     num_itineraries: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))

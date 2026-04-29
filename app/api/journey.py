@@ -173,7 +173,7 @@ async def fanout(
             db,
             search_id=search.id,
             session_id=session.id,
-            graph_snapshot_id=snap.id if snap else _placeholder_snapshot_id(),
+            graph_snapshot_id=snap.id if snap else None,
             status=status,
             response_ms=response_ms,
             raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
@@ -183,7 +183,9 @@ async def fanout(
         executions_summary.append(
             {
                 "session_id": session.id,
-                "graph_snapshot_id": str(exe.graph_snapshot_id),
+                "graph_snapshot_id": (
+                    str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None
+                ),
                 "status": status,
                 "num_itineraries": exe.num_itineraries,
                 "response_ms": response_ms,
@@ -295,7 +297,7 @@ async def plan(
         db,
         search_id=search.id,
         session_id=s.id,
-        graph_snapshot_id=snap.id if snap else _placeholder_snapshot_id(),
+        graph_snapshot_id=snap.id if snap else None,
         status=status,
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
@@ -372,14 +374,11 @@ def get_search(
     return out
 
 
-# ────────────────────────── placeholder ──────────────────────────
-
-
-def _placeholder_snapshot_id() -> uuid.UUID:
-    """When a session has no snapshot yet, we still need a valid UUID for the FK.
-
-    NOTE: this is a deliberate violation that step 8 (real per-session OTP) will
-    fix by ensuring every serving session has at least one snapshot. Until then,
-    callers should expect occasional FK errors on uninitialised sessions.
-    """
-    return uuid.UUID(int=0)  # all-zero UUID, intentionally invalid as FK
+# Note: previously this module had `_placeholder_snapshot_id()` returning the
+# all-zero UUID for sessions without a recorded snapshot. That was a known
+# FK-violation footgun (the all-zero UUID isn't in graph_snapshots → every
+# fanout call against a freshly-built session crashed with IntegrityError).
+# Removed in favour of `graph_snapshot_id=None` on the model, with the
+# corresponding alembic migration `20260429_0700_exec_snap_nullable`. The
+# proper fix — having the worker write a graph_snapshots row after every
+# successful build — remains a Phase-3 milestone.
