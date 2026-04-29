@@ -6,6 +6,23 @@ CSV is semicolon-delimited UTF-8. Source:
 Conflict resolution: rows with `source='manual'` are NEVER overwritten by a
 refresh — instead, the upstream snapshot is recorded in the
 `master_stations_pending_drift` table and surfaced in the admin UI.
+
+Two ID spaces in the upstream CSV (frequent source of bugs):
+
+  - `id`              Trainline's internal sequential integer (1, 2, …, ~5000).
+                      Used internally by Trainline; not meaningful outside.
+  - `uic`             Official UIC code (7-8 digits, e.g. 8775123). Globally
+                      unique. This is master_stations.uic, our PK.
+  - `parent_station_id`  Points at the parent row's *Trainline `id`*, NOT
+                         its UIC. Translation requires a trainline_id → uic
+                         lookup built from the same CSV.
+
+We load parent relationships in two passes (to avoid FK-violation cascades
+when a child row is inserted before its parent):
+
+  Pass 1 — INSERT/UPDATE all rows with parent_uic=NULL.
+  Pass 2 — UPDATE each row to set parent_uic, where the parent has a UIC
+           AND we didn't skip the row in pass 1 (e.g. source='manual').
 """
 
 from __future__ import annotations
@@ -16,7 +33,7 @@ import logging
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DbSession
 
 from ..models import MasterStation, MasterStationPendingDrift
@@ -26,24 +43,9 @@ log = logging.getLogger(__name__)
 TRAINLINE_CSV_URL = "https://raw.githubusercontent.com/trainline-eu/stations/master/stations.csv"
 
 
-# Trainline column → MasterStation attribute.
-#
-# NOTE on `parent_station_id` (deliberately omitted from this map):
-#   Trainline's CSV uses TWO different ID spaces. `id` is Trainline's own
-#   internal sequential integer (1, 2, …, ~5000). `uic` is the official UIC
-#   code (7-8 digits, e.g. 8775123). `parent_station_id` points at the
-#   PARENT row's *Trainline `id`*, NOT its UIC code.
-#
-#   Our master_stations.parent_uic column has a foreign key to
-#   master_stations.uic. Mapping `parent_station_id → parent_uic` directly
-#   inserts Trainline IDs (e.g. 1, 4, 5768) into a column that expects UIC
-#   codes, which are absent from master_stations → IntegrityError on commit.
-#
-#   To populate parent_uic correctly we'd need a two-pass load: first build
-#   a trainline_id → uic dict from the parsed rows, then translate each row's
-#   parent_station_id through that map. Worth doing if/when we actually use
-#   parent_uic (none of the current admin / journey UI / signature paths
-#   read it). For now: leave parent_uic NULL on all imported rows.
+# Trainline column → MasterStation attribute. Excludes `parent_station_id`
+# because that's in Trainline's id-space, not UIC-space — handled separately
+# via the trainline_id → uic translation in parse_csv().
 _COL_MAP = {
     "uic": "uic",
     "uic8_sncf": "uic8_sncf",
@@ -62,11 +64,30 @@ _COL_MAP = {
 }
 
 
-def parse_csv(content: str) -> list[dict[str, Any]]:
-    """Parse the Trainline CSV into a list of master_stations-shaped dicts."""
+def parse_csv(content: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Parse the Trainline CSV into:
+
+    - list of master_stations-shaped row dicts (without parent_uic — set in
+      pass 2 of the upsert)
+    - mapping of `uic → parent_uic`, for every row whose parent itself
+      has a UIC. Self-references (uic == parent_uic) are dropped.
+    """
     reader = csv.DictReader(io.StringIO(content), delimiter=";")
+    raw_rows = list(reader)
+
+    # Build trainline_id → uic for the parent translation. Only rows that
+    # have BOTH an id and a uic can act as parents (we can't link to a
+    # parent that we won't be inserting).
+    id_to_uic: dict[str, str] = {
+        (raw["id"] or "").strip(): (raw["uic"] or "").strip()
+        for raw in raw_rows
+        if (raw.get("id") or "").strip() and (raw.get("uic") or "").strip()
+    }
+
     rows: list[dict[str, Any]] = []
-    for raw in reader:
+    parent_uic_map: dict[str, str] = {}
+
+    for raw in raw_rows:
         uic = (raw.get("uic") or "").strip()
         if not uic:
             continue  # Trainline has rows without UIC — we skip them
@@ -84,6 +105,15 @@ def parse_csv(content: str) -> list[dict[str, Any]]:
                 row[dst] = v.lower() in ("t", "true", "1", "yes")
             else:
                 row[dst] = v
+
+        # Translate parent_station_id (Trainline id) → parent_uic (UIC code).
+        # Skip if the parent doesn't have a UIC, or if the row points at itself.
+        parent_tid = (raw.get("parent_station_id") or "").strip()
+        if parent_tid and parent_tid in id_to_uic:
+            parent_uic = id_to_uic[parent_tid]
+            if parent_uic and parent_uic != uic:
+                parent_uic_map[uic] = parent_uic
+
         # Multilingual names (best-effort)
         translations = {}
         for code in ("fr", "en", "de", "it", "es", "nl"):
@@ -93,20 +123,37 @@ def parse_csv(content: str) -> list[dict[str, Any]]:
         if translations:
             row["name_translations"] = translations
         rows.append(row)
-    return rows
+    return rows, parent_uic_map
 
 
-def upsert_with_drift_protection(db: DbSession, parsed: list[dict[str, Any]]) -> dict[str, int]:
+def upsert_with_drift_protection(
+    db: DbSession,
+    parsed: list[dict[str, Any]],
+    parent_uic_map: dict[str, str] | None = None,
+) -> dict[str, int]:
     """Apply parsed rows to master_stations.
 
     - source='manual' rows: NEVER overwrite. Capture upstream diff in
       master_stations_pending_drift instead.
     - Other rows: upsert.
+    - parent_uic is populated in a second pass, AFTER all rows exist, to
+      avoid FK-violation cascades when a child row is inserted before
+      its parent. Manual rows preserve their existing parent_uic — the
+      parent-pass `WHERE source != 'manual'` keeps operator edits.
 
-    Returns a counts dict: {added, updated, skipped_manual, pending_drift}.
+    Returns a counts dict:
+      {added, updated, skipped_manual, pending_drift, parent_links_set}
     """
-    counts = {"added": 0, "updated": 0, "skipped_manual": 0, "pending_drift": 0}
+    counts = {
+        "added": 0,
+        "updated": 0,
+        "skipped_manual": 0,
+        "pending_drift": 0,
+        "parent_links_set": 0,
+    }
+    parent_uic_map = parent_uic_map or {}
 
+    # ────────────────────────── Pass 1 — rows ──────────────────────────
     existing_by_uic = {row.uic: row for row in db.execute(select(MasterStation)).scalars().all()}
 
     for row in parsed:
@@ -140,6 +187,26 @@ def upsert_with_drift_protection(db: DbSession, parsed: list[dict[str, Any]]) ->
         counts["updated"] += 1
 
     db.commit()
+
+    # ────────────────────── Pass 2 — parent_uic links ──────────────────────
+    # Now that every row exists, we can safely set parent_uic without
+    # tripping the FK. We only target rows whose source != 'manual', so
+    # manual-rebuilt parent relationships survive a Trainline refresh.
+    if parent_uic_map:
+        live_uics = {row[0] for row in db.execute(select(MasterStation.uic)).all()}
+        for child_uic, parent_uic in parent_uic_map.items():
+            if child_uic not in live_uics or parent_uic not in live_uics:
+                continue  # parent isn't in our table (no UIC, or skipped)
+            result = db.execute(
+                update(MasterStation)
+                .where(MasterStation.uic == child_uic)
+                .where(MasterStation.source != "manual")
+                .values(parent_uic=parent_uic)
+            )
+            if result.rowcount > 0:
+                counts["parent_links_set"] += 1
+        db.commit()
+
     return counts
 
 
@@ -164,6 +231,10 @@ async def fetch_csv() -> str:
 async def refresh(db: DbSession) -> dict[str, int]:
     """Fetch + parse + upsert. Used by the admin "refresh Trainline" button + cron."""
     content = await fetch_csv()
-    parsed = parse_csv(content)
-    log.info("Trainline CSV: parsed %d stations", len(parsed))
-    return upsert_with_drift_protection(db, parsed)
+    parsed, parent_uic_map = parse_csv(content)
+    log.info(
+        "Trainline CSV: parsed %d stations, %d parent links to resolve",
+        len(parsed),
+        len(parent_uic_map),
+    )
+    return upsert_with_drift_protection(db, parsed, parent_uic_map)
