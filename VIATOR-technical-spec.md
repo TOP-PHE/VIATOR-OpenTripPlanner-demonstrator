@@ -358,7 +358,7 @@ GET /api/journey/plan?session=<id>
     &modes=TRANSIT,WALK
 ```
 
-Implementation: the admin app proxies to `http://otp-<sid>:8080/otp/gtfs/v1/index/graphql` with a translated GraphQL query. Returns OTP's response, normalised into a stable VIATOR JSON envelope so the journey UI doesn't have to worry about OTP version drift.
+Implementation: the admin app proxies to `http://otp-<sid>:8080/otp/gtfs/v1` with a translated GraphQL query. Returns OTP's response, normalised into a stable VIATOR JSON envelope so the journey UI doesn't have to worry about OTP version drift. (OTP 2.x uses `/otp/gtfs/v1`, not the legacy `/otp/routers/default/index/graphql` from OTP 1.x.)
 
 ### 6.2 Comparison
 

@@ -69,7 +69,11 @@ async def fetch_plan(
             "time": when.strftime("%H:%M"),
         },
     }
-    url = f"{_otp_base(session_id)}/otp/gtfs/v1/index/graphql"
+    # OTP 2.9 GTFS GraphQL endpoint. Note: it is `/otp/gtfs/v1`, NOT
+    # `/otp/gtfs/v1/index/graphql` — the `/index/graphql` form was the
+    # legacy (Entur/HSL) path served at `/otp/routers/default/index/graphql`
+    # which OTP 2.x dropped. Mismatching this returns 404.
+    url = f"{_otp_base(session_id)}/otp/gtfs/v1"
     timeout = max(timeout_ms / 1000.0, 1.0)
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post(url, json=payload)

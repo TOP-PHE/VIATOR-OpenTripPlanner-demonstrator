@@ -628,7 +628,10 @@ curl https://<your-host>/otp/nap-fr-sncf-idf/actuators/health
 # Expected: {"status":"UP"}
 
 # Tiny GraphQL ping
-curl -s "https://<your-host>/otp/nap-fr-sncf-idf/gtfs/v1/index/graphql" \
+# Note: OTP 2.x exposes the GTFS GraphQL endpoint at /otp/gtfs/v1
+# (NOT /otp/gtfs/v1/index/graphql — that's the legacy OTP 1.x form
+# at /otp/routers/default/index/graphql).
+curl -s "https://<your-host>/otp/nap-fr-sncf-idf/gtfs/v1" \
   -H 'content-type: application/json' \
   -d '{"query":"{ feeds { feedId } }"}' | python3 -m json.tool
 
