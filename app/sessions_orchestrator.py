@@ -38,7 +38,11 @@ services:
 _OTP_SVC_TEMPLATE = """  otp-{sid}:
     image: ghcr.io/top-phe/viator-otp:${{VIATOR_VERSION:-latest}}
     build:
-      context: ../docker/otp
+      # Path is relative to THIS generated file's location
+      # (docker/generated/docker-compose.sessions.yml), so `../otp`
+      # resolves to docker/otp/ — the same source used by the main
+      # docker-compose.yml's otp-build service.
+      context: ../otp
     restart: unless-stopped
     environment:
       OTP_MODE: serve
