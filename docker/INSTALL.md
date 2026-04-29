@@ -117,7 +117,9 @@ BOOTSTRAP_TOKEN=<openssl rand -base64 32>
 
 PUBLIC_BASE_URL=https://viator.example.com
 
-OTP_BUILD_HEAP=24g     # 12g if you're only doing a regional bundle
+OTP_BUILD_HEAP=24g           # 8g for regional, 24g for France-wide
+OTP_BUILD_MEM_LIMIT=28g      # heap + ~4 GB native headroom; cgroup cap on otp-build
+OTP_BUILD_PHASES=two_phase   # 'one_shot' available as fallback (debug only)
 ```
 
 > **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for step 8. Once consumed, set it to empty in `.env` and `docker compose restart web`.
@@ -394,7 +396,7 @@ For routine operations — updates, backups, capacity planning, incident triage 
 |---|---|---|
 | `web` container restart-loops | Migration failure on startup | `docker compose logs web` — look for alembic error. If "table already exists", manually `alembic stamp head`. |
 | `otp-<sid>` restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, restart. |
-| `otp-build` killed by OOM-killer (exit 137) | VPS RAM too small | Upgrade VPS, use a regional GTFS, or raise swap. |
+| `otp-build` killed by OOM-killer (exit 137) | `OTP_BUILD_MEM_LIMIT` is tight relative to `-Xmx`, OR VPS RAM is genuinely too small | First check `OTP_BUILD_MEM_LIMIT ≥ OTP_BUILD_HEAP + 4 GB` in `.env`. If already correct, upgrade VPS, use a regional bundle, or raise swap. (Two-phase build, default since v0.1.3, already keeps peak ~30% lower than one-shot.) |
 | First request to OTP returns 503 | Graph not loaded yet | Wait for `Grizzly server running.` in `otp-<sid>` logs. |
 | `worker` can't run `otp-build` (`permission denied … docker.sock`) | Socket perms | `sudo chmod 666 /var/run/docker.sock` (or run worker as root). |
 | `bootstrap-platform-user` returns 403 | A platform admin already exists, or `BOOTSTRAP_TOKEN` is empty | Both correct. To create another admin, log in as the existing one and use the Users UI. |

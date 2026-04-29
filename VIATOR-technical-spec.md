@@ -1226,7 +1226,9 @@ POSTGRES_PASSWORD=<openssl rand -base64 32>
 JWT_SECRET=<openssl rand -base64 64>
 BOOTSTRAP_TOKEN=<openssl rand -base64 32>
 PUBLIC_BASE_URL=https://viator.example.com
-OTP_BUILD_HEAP=24g
+OTP_BUILD_HEAP=24g           # 8g for regional, 24g for France-wide
+OTP_BUILD_MEM_LIMIT=28g      # heap + ~4 GB native headroom; cgroup cap on otp-build
+OTP_BUILD_PHASES=two_phase   # 'one_shot' available as fallback (debug only)
 OTP_SERVE_HEAP=8g
 ```
 

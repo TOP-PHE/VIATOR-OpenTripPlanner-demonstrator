@@ -261,12 +261,39 @@ docker compose -p viator run --rm \
 shaded jar) that:
 
 1. Reads `gtfs/*.zip` and `osm/*.osm.pbf` from the inbox.
-2. Runs OTP's graph builder (`org.opentripplanner.standalone.OtpMain --build`).
+2. Runs OTP's graph builder — by default in **two phases** (see sidebar).
 3. Writes `graph.obj` to the graphs volume.
 
-Build time depends on bundle size — ~10 min for IDF, ~30–60 min for
+Build time depends on bundle size — ~10 min for IDF, ~20-30 min for
 France-wide. Tail the logs from the admin UI's "Refresh job list" button
 or `docker compose logs -f worker`.
+
+> **Sidebar — Two-phase build (`OTP_BUILD_PHASES`, default `two_phase`)**
+>
+> OTP's `--build` command does the whole thing in one JVM: parse OSM PBF,
+> construct the street graph, load GTFS, build transit patterns, link
+> stops to the street graph, serialize. At peak — when the linker working
+> set is in heap on top of the still-live OSM parser state — the heap
+> peak is ~30% larger than the steady state of either phase alone.
+>
+> The two-phase pipeline splits the work across two JVM invocations, with
+> a `streetGraph.obj` artifact passed between them:
+>
+>   - **Phase 1 — `--buildStreet --save`**: read OSM PBF, build the
+>     street graph, write `streetGraph.obj`, JVM exits — releasing the
+>     OSM-parse peak.
+>   - **Phase 2 — `--loadStreet --save`**: re-load `streetGraph.obj`
+>     (smaller than the raw OSM), read GTFS/NeTEx, link transit, write
+>     `graph.obj`, exit.
+>
+> The serialize-deserialize round-trip costs ~30-90 s of wall time, in
+> exchange for a peak-heap reduction that brings France-wide builds
+> within reach of a 24 GB heap (vs. ~32 GB needed for one-shot). The
+> resulting `graph.obj` is bit-identical to one-shot output — `--load
+> --serve` doesn't care which path produced it.
+>
+> Set `OTP_BUILD_PHASES=one_shot` in `.env` only as a debugging fallback;
+> the default is recommended for all sizes.
 
 On success the worker:
 - Moves `graph.obj` into a timestamped directory: `graphs/<sid>/<timestamp>/graph.obj`
@@ -594,8 +621,11 @@ Click **"Save config"** → toast: "Config saved for nap-fr-sncf-idf".
 >
 > **For an intercity demonstrator** (TGV Paris → Lyon, etc.) use a
 > France-wide PBF — `https://download.geofabrik.de/europe/france-latest.osm.pbf`
-> — and bump `OTP_BUILD_HEAP=48g` in `.env`. Build takes ~20 min; the
-> serving container then loads on ~12 GB.
+> — and set `OTP_BUILD_HEAP=24g` plus `OTP_BUILD_MEM_LIMIT=28g` in `.env`.
+> The default `OTP_BUILD_PHASES=two_phase` keeps peak heap manageable
+> (separate JVMs for OSM parse and transit overlay; see §3.2 sidebar
+> "Two-phase build"). Total wall time ~20 min; the serving container then
+> loads on ~12 GB.
 >
 > **For a Paris urban-transit demonstrator** (RER, Métro, Transilien)
 > swap the GTFS for IDFM's all-modes archive at
@@ -686,7 +716,9 @@ session's origin flag.
 |---|---|---|
 | "Refresh sources now" returns `{"skipped": [{"reason": "unknown source key 'foo'"}]}` | You configured a key not in the recognised list (`gtfs`, `osm_pbf`, `netex_nordic`, `netex_epip`, `mct`, `stations`) | Use one of the recognised keys |
 | Refresh succeeds for OSM PBF but build fails with "no GTFS found" | Inbox layout has `osm/` populated but `gtfs/` empty | Check the staging dir for the GTFS download. Was the URL right? Did the upstream server return a redirect to a login page? `curl -sIL <gtfs-url>` from the VPS to verify. |
-| OTP build crashes with `OutOfMemoryError` | `OTP_BUILD_HEAP` < what the bundle needs | Bump in `.env`: `OTP_BUILD_HEAP=24g` for France-wide, `OTP_BUILD_HEAP=4g` for IDF. `docker compose up -d --force-recreate worker`. |
+| OTP build crashes with `OutOfMemoryError` (with `OTP_BUILD_PHASES=two_phase`, default) | `OTP_BUILD_HEAP` < what the bundle needs even after splitting OSM-parse and transit-overlay phases | Bump both in `.env`: `OTP_BUILD_HEAP=24g` + `OTP_BUILD_MEM_LIMIT=28g` for France-wide, `OTP_BUILD_HEAP=8g` + `OTP_BUILD_MEM_LIMIT=12g` for IDF. `docker compose up -d --force-recreate worker`. |
+| Build OOMKilled (exit 137) without an OOM stack in the OTP log | Container `mem_limit` is tight relative to `-Xmx` | Raise `OTP_BUILD_MEM_LIMIT` in `.env` so `mem_limit ≥ Xmx + 4 GB` — JVM needs that headroom for Direct buffers, metaspace, threads, and GC. |
+| Build is slower than expected on a host with plenty of free RAM | `OTP_BUILD_PHASES=two_phase` adds one streetGraph.obj serialize + deserialize (~30-90 s for France-wide) | Acceptable for the heap savings. Set `OTP_BUILD_PHASES=one_shot` only if you've measured and confirmed the trade is wrong for your inputs. |
 | Build stuck at status `pending` for >30 min | Debounce window not yet elapsed | Check the worker debounce: `grep DEBOUNCE_SECONDS /opt/viator/docker/.env`. If too high, lower temporarily. |
 | Promote returns 400 "Session must be in state 'graph_built'" | Build hasn't completed (still `populated` or `running`) — or you tried to promote a session that was never built | Wait for state badge to hit `graph_built`. Check job logs in the Build & Promote section. |
 | `/otp/<sid>/actuators/health` returns 502 after promote | The worker hasn't run its tick yet | Wait ≤15 s. If still 502, check `docker compose ps` → is `otp-<sid>` Up? `docker compose logs otp-<sid>` will show OTP startup or its error. |

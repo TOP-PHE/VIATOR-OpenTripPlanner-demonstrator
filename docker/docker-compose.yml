@@ -115,11 +115,19 @@ services:
     image: ghcr.io/top-phe/viator-otp:${VIATOR_VERSION:-latest}
     build: ./otp
     profiles: ["build-only"]
+    # Hard cap so a runaway build OOMKills cleanly instead of slowly swapping
+    # the host. Should be `-Xmx` plus ~4 GB of native headroom (Direct
+    # buffers, metaspace, threads, GC). Default 12g pairs with the default
+    # 8g heap (IDF). For France-wide bump both: heap=24g, limit=28g.
+    mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
     environment:
       OTP_MODE: build
       OTP_INBOX_DIR: ${OTP_INBOX_DIR:-/var/otp/inbox}
       OTP_GRAPH_DIR: ${OTP_GRAPH_DIR:-/var/otp/graph}
-      OTP_HEAP: ${OTP_HEAP:-12g}
+      OTP_HEAP: ${OTP_HEAP:-8g}
+      # Build pipeline: 'two_phase' (default — lower peak heap) or 'one_shot'
+      # (legacy --build, debug only). See entrypoint.sh.
+      OTP_BUILD_PHASES: ${OTP_BUILD_PHASES:-two_phase}
     volumes:
       - inbox:/var/otp/inbox:ro
       - graphs:/var/otp/graph
