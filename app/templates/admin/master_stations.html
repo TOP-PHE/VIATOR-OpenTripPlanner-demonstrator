@@ -10,10 +10,15 @@
   upstream changes to those rows are surfaced in the drift queue below.
 </p>
 
-<form id="search-form" style="margin-bottom: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
+<form id="search-form" style="margin-bottom: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center">
   <input id="q" placeholder="search by name / UIC" style="flex: 1; min-width: 200px">
   <input id="country" placeholder="country (FR, DE, IT…)" maxlength="2" style="width: 140px">
+  <label class="hint" title="Context mode: jump to the page where matches appear, with neighbours visible. Filter mode: hide non-matching rows.">
+    <input type="checkbox" id="context-mode" checked>
+    show in context
+  </label>
   <button type="submit">Search</button>
+  <button type="button" id="clear-btn" class="secondary">Clear</button>
   <button type="button" id="refresh-btn" class="secondary">Refresh from Trainline</button>
 </form>
 
@@ -22,9 +27,31 @@
   <div id="drift-list" style="margin-top: 0.5rem">Loading…</div>
 </details>
 
-<div id="results">Loading…</div>
+<div id="results-meta" class="hint" style="margin-bottom: 0.4rem"></div>
+<div id="results-scroll" class="stations-scroll">
+  <div id="results">Loading…</div>
+</div>
+<div id="pagination" class="pagination-bar"></div>
 
 <div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+
+<style>
+  .stations-scroll { max-height: min(60vh, 640px); overflow-y: auto; border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; }
+  .stations-scroll table { margin: 0; }
+  .stations-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--rail-bg, #f6f8fa); box-shadow: inset 0 -1px 0 var(--rail-border, #d0d7de); }
+  tr.match-row { background: #fff8c4; }
+  tr.match-row.flash { animation: matchflash 1.4s ease-out; }
+  @keyframes matchflash {
+    0%   { background: #ffe066; box-shadow: 0 0 0 2px #ffd43b inset; }
+    60%  { background: #fff3b0; box-shadow: 0 0 0 2px transparent inset; }
+    100% { background: #fff8c4; }
+  }
+  .pagination-bar { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.6rem; font-size: 0.9rem; }
+  .pagination-bar button { padding: 0.25rem 0.6rem; }
+  .pagination-bar input.page-jump { width: 4.5rem; text-align: right; }
+  .pagination-bar .pos { color: var(--rail-steel); }
+  mark.q-hit { background: #ffe066; color: inherit; padding: 0 1px; border-radius: 2px; }
+</style>
 {% endblock %}
 
 {% block extra_scripts %}
@@ -32,27 +59,139 @@
 const toast = document.getElementById('toast');
 function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',3500); }
 
-async function loadStations() {
-  const q = document.getElementById('q').value;
-  const c = document.getElementById('country').value;
+// Pagination state — preserved across searches/page flips. Gets reset
+// when the search query changes (so a new search lands on its match
+// page rather than the page index from the previous query).
+const PAGE_SIZE = 50;
+let currentPage = 0;
+let lastQuery = null;
+let lastCountry = null;
+
+function escHTML(s) { return (s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function highlightSubstring(text, q) {
+  // Wrap occurrences of `q` in <mark> for visual scanning. Case-insensitive
+  // but preserves the original casing in the result. q is escaped before
+  // building the regex so things like "Saint-Étienne" don't blow up.
+  if (!q) return escHTML(text);
+  const safe = escHTML(text);
+  const qEsc = escHTML(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return safe.replace(new RegExp(qEsc, 'gi'), m => `<mark class="q-hit">${m}</mark>`);
+}
+
+async function loadStations({page = 0, flashMatches = true} = {}) {
+  const q = document.getElementById('q').value.trim();
+  const c = document.getElementById('country').value.trim();
+  const ctxMode = document.getElementById('context-mode').checked;
+
+  // Reset to page 0 if the query changed — gives the user "find this and
+  // jump to it" behaviour when they type something new.
+  if (q !== lastQuery || c !== lastCountry) page = 0;
+  lastQuery = q; lastCountry = c; currentPage = page;
+
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (c) params.set('country', c);
+  params.set('mode', ctxMode ? 'context' : 'filter');
+  params.set('page', String(page));
+  params.set('size', String(PAGE_SIZE));
+
   const r = await fetch('/api/master/stations?' + params.toString());
+  if (!r.ok) {
+    document.getElementById('results').innerHTML =
+      `<em class="hint">Failed to load stations (${r.status}). Try logging in again.</em>`;
+    return;
+  }
   const rows = await r.json();
+  const total = parseInt(r.headers.get('X-Total-Count') || '0', 10);
+  const matchCount = parseInt(r.headers.get('X-Match-Count') || '0', 10);
+  // Server tells us which page the first match is on — use it to align
+  // currentPage when we asked for page=0 and the server jumped us to a
+  // match page. (Otherwise the pagination footer would say "page 1"
+  // when we're actually viewing page 12.)
+  const matchPage = r.headers.get('X-Match-Page');
+  if (matchPage !== null && q && ctxMode && page === 0) {
+    currentPage = parseInt(matchPage, 10);
+  }
+
   const head = '<tr><th>UIC</th><th>Name</th><th>Country</th><th>SNCF</th><th>DB</th><th>Trenitalia</th><th>Source</th><th></th></tr>';
-  const body = rows.map(s => `<tr data-uic="${s.uic}">
-    <td><code>${s.uic}</code></td>
-    <td>${s.name}${s.has_drift ? ' <span class="flag SUBSET" style="font-size:0.65rem">DRIFT</span>' : ''}</td>
-    <td>${s.country_iso || '—'}</td>
-    <td>${s.trigramme_sncf || '—'}</td>
-    <td>${s.db_code || '—'}</td>
-    <td>${s.trenitalia_code || '—'}</td>
-    <td><span style="font-size:0.75rem; color: var(--rail-steel)">${s.source}</span></td>
+  const body = rows.map(s => `<tr data-uic="${escHTML(s.uic)}" class="${s.is_match ? 'match-row' : ''}">
+    <td><code>${highlightSubstring(s.uic, q)}</code></td>
+    <td>${highlightSubstring(s.name, q)}${s.has_drift ? ' <span class="flag SUBSET" style="font-size:0.65rem">DRIFT</span>' : ''}</td>
+    <td>${escHTML(s.country_iso) || '—'}</td>
+    <td>${escHTML(s.trigramme_sncf) || '—'}</td>
+    <td>${escHTML(s.db_code) || '—'}</td>
+    <td>${escHTML(s.trenitalia_code) || '—'}</td>
+    <td><span style="font-size:0.75rem; color: var(--rail-steel)">${escHTML(s.source)}</span></td>
     <td><button type="button" class="secondary" data-action="edit">Edit</button></td>
   </tr>`).join('');
   document.getElementById('results').innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
   document.querySelectorAll('button[data-action="edit"]').forEach(b => b.addEventListener('click', editStation));
+
+  // Header line: total count + match count + current page.
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageOneIndexed = currentPage + 1;
+  let meta = `${total.toLocaleString()} station${total === 1 ? '' : 's'} total`;
+  if (q) {
+    if (ctxMode) {
+      meta += ` · ${matchCount.toLocaleString()} match${matchCount === 1 ? '' : 'es'} for ${JSON.stringify(q)} (highlighted in yellow)`;
+    } else {
+      meta += ` · filtered to ${rows.length} on this page`;
+    }
+  }
+  meta += ` · page ${pageOneIndexed} of ${totalPages}`;
+  document.getElementById('results-meta').textContent = meta;
+
+  renderPagination(totalPages);
+
+  // If we jumped to a match page, scroll the first match into view inside
+  // the scroll container and flash it so the operator sees what got found.
+  if (flashMatches && q && ctxMode && rows.some(r => r.is_match)) {
+    requestAnimationFrame(() => {
+      const firstMatch = document.querySelector('tr.match-row');
+      if (firstMatch) {
+        firstMatch.scrollIntoView({block: 'center', behavior: 'smooth'});
+        firstMatch.classList.add('flash');
+        setTimeout(() => firstMatch.classList.remove('flash'), 1500);
+      }
+    });
+  } else {
+    // No match flash needed → scroll the table back to its top so the
+    // user sees the start of the new page.
+    document.getElementById('results-scroll').scrollTop = 0;
+  }
+}
+
+function renderPagination(totalPages) {
+  const p = document.getElementById('pagination');
+  const cur = currentPage;
+  const last = totalPages - 1;
+  const btn = (label, target, disabled = false, title = '') =>
+    `<button type="button" class="secondary" ${disabled ? 'disabled' : ''} data-page="${target}" title="${escHTML(title)}">${label}</button>`;
+  p.innerHTML = [
+    btn('« First', 0, cur === 0, 'first page'),
+    btn('‹ Prev', Math.max(0, cur - 1), cur === 0, 'previous page'),
+    `<span class="pos">page</span>`,
+    `<input class="page-jump" type="number" min="1" max="${totalPages}" value="${cur + 1}" aria-label="jump to page">`,
+    `<span class="pos">of ${totalPages}</span>`,
+    btn('Next ›', Math.min(last, cur + 1), cur === last, 'next page'),
+    btn('Last »', last, cur === last, 'last page'),
+  ].join(' ');
+  // Wire up nav buttons.
+  p.querySelectorAll('button[data-page]').forEach(b => b.addEventListener('click', () => {
+    loadStations({page: parseInt(b.dataset.page, 10), flashMatches: false});
+  }));
+  // Jump-to-page on Enter.
+  const jump = p.querySelector('input.page-jump');
+  jump.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      let n = parseInt(jump.value, 10);
+      if (Number.isNaN(n)) return;
+      n = Math.max(1, Math.min(totalPages, n)) - 1;
+      loadStations({page: n, flashMatches: false});
+    }
+  });
 }
 
 async function loadDrift() {
@@ -92,7 +231,17 @@ async function editStation(e) {
   else showToast('error', 'Failed');
 }
 
-document.getElementById('search-form').addEventListener('submit', e => { e.preventDefault(); loadStations(); });
+document.getElementById('search-form').addEventListener('submit', e => { e.preventDefault(); loadStations({page: 0}); });
+document.getElementById('clear-btn').addEventListener('click', () => {
+  document.getElementById('q').value = '';
+  document.getElementById('country').value = '';
+  loadStations({page: 0, flashMatches: false});
+});
+// Re-run the search when the operator toggles context/filter mode so the
+// table layout matches expectations immediately without a manual click.
+document.getElementById('context-mode').addEventListener('change', () => {
+  loadStations({page: 0});
+});
 document.getElementById('refresh-btn').addEventListener('click', async () => {
   if (!confirm('Refresh master_stations from the latest Trainline CSV? Manual edits are preserved.')) return;
   const r = await fetch('/api/master/stations/refresh-trainline', {method: 'POST'});

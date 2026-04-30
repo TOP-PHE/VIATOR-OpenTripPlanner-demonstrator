@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session as DbSession
 
 from ... import audit
@@ -31,9 +31,19 @@ class StationResponse(BaseModel):
     is_main_station: bool
     source: str
     has_drift: bool
+    # True when this row matches the search query (only meaningful in
+    # `context` mode — see list_stations). The UI uses this to highlight
+    # matching rows while keeping their alphabetical neighbours visible.
+    is_match: bool = False
 
     @classmethod
-    def from_orm_with_drift(cls, s: MasterStation, drift_uics: set[str]) -> StationResponse:
+    def from_orm_with_drift(
+        cls,
+        s: MasterStation,
+        drift_uics: set[str],
+        *,
+        is_match: bool = False,
+    ) -> StationResponse:
         return cls(
             uic=s.uic,
             name=s.name,
@@ -46,6 +56,7 @@ class StationResponse(BaseModel):
             is_main_station=s.is_main_station,
             source=s.source,
             has_drift=s.uic in drift_uics,
+            is_match=is_match,
         )
 
 
@@ -68,26 +79,129 @@ class DriftResolveBody(BaseModel):
 
 @router.get("", response_model=list[StationResponse])
 def list_stations(
+    response: Response,
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_content_manager)],
     q: str | None = Query(None, description="Substring of name (case-insensitive)"),
     country: str | None = Query(None, max_length=2),
     page: int = Query(0, ge=0),
     size: int = Query(50, ge=1, le=500),
+    mode: str = Query(
+        "filter",
+        pattern="^(filter|context)$",
+        description=(
+            "filter (default): hides non-matching rows. "
+            "context: returns the page containing the first alphabetical match "
+            "(or the requested `page` if no match), with `is_match` set on rows "
+            "that satisfy the query — lets the UI highlight matches in place "
+            "while keeping their alphabetical neighbours visible."
+        ),
+    ),
 ) -> list[StationResponse]:
-    stmt = select(MasterStation)
+    """List master stations with pagination.
+
+    Headers:
+        X-Total-Count: total rows matching the country filter (in `filter`
+                       mode this is also constrained by `q`; in `context`
+                       mode `q` doesn't shrink the universe — it only
+                       drives where the page lands and which rows are
+                       flagged is_match).
+        X-Match-Count: when `q` is set, how many rows match across the
+                       entire (country-filtered) universe. In `context`
+                       mode, useful for "N matches across all pages".
+        X-Match-Page:  when `q` is set in context mode, the page index
+                       containing the first match (the same `page` the
+                       endpoint navigated to unless overridden by the
+                       caller). Lets the UI present "showing matches on
+                       page X of Y" without a second round-trip.
+
+    Sorting is `(country_iso, name)`, stable across requests.
+    """
+    base_filter = select(MasterStation)
+    if country:
+        base_filter = base_filter.where(MasterStation.country_iso == country.upper())
+
+    match_clause = None
     if q:
         like = f"%{q}%"
-        stmt = stmt.where(or_(MasterStation.name.ilike(like), MasterStation.uic.ilike(like)))
-    if country:
-        stmt = stmt.where(MasterStation.country_iso == country.upper())
-    stmt = (
-        stmt.order_by(MasterStation.country_iso, MasterStation.name).offset(page * size).limit(size)
-    )
+        match_clause = or_(MasterStation.name.ilike(like), MasterStation.uic.ilike(like))
 
-    rows = db.execute(stmt).scalars().all()
+    # Universe = the alphabetical list the UI is paging through. In filter
+    # mode, the universe shrinks to matches; in context mode, it doesn't.
+    universe = base_filter
+    if mode == "filter" and match_clause is not None:
+        universe = universe.where(match_clause)
+
+    # Total for X-Total-Count — the full universe size, not just this page.
+    total = db.execute(select(func.count()).select_from(universe.subquery())).scalar_one()
+    response.headers["X-Total-Count"] = str(total)
+
+    match_count = 0
+    match_page = page
+    if q and match_clause is not None:
+        # How many matches across the (country-filtered) universe.
+        matches_universe = base_filter.where(match_clause)
+        match_count = db.execute(
+            select(func.count()).select_from(matches_universe.subquery())
+        ).scalar_one()
+        response.headers["X-Match-Count"] = str(match_count)
+
+        if mode == "context" and match_count > 0:
+            # Find the alphabetical position of the first match within the
+            # full base_filter universe, so we can compute which page to
+            # jump to. Postgres-side: count rows that come strictly before
+            # the first match in (country_iso, name) order.
+            first_match = db.execute(
+                base_filter.where(match_clause)
+                .order_by(MasterStation.country_iso, MasterStation.name)
+                .limit(1)
+            ).scalar_one_or_none()
+            if first_match is not None:
+                # Rows alphabetically before the first match.
+                before_filter = base_filter.where(
+                    or_(
+                        MasterStation.country_iso < first_match.country_iso,
+                        (MasterStation.country_iso == first_match.country_iso)
+                        & (MasterStation.name < first_match.name),
+                    )
+                )
+                before_count = db.execute(
+                    select(func.count()).select_from(before_filter.subquery())
+                ).scalar_one()
+                match_page = before_count // size
+        response.headers["X-Match-Page"] = str(match_page)
+
+    # When the caller didn't pin a page (page=0 default) and we've computed
+    # a context-mode jump page, navigate there. If they explicitly requested
+    # a page, respect it (lets the UI flip pages while keeping the search).
+    effective_page = match_page if (mode == "context" and page == 0 and q) else page
+
+    rows = (
+        db.execute(
+            universe.order_by(MasterStation.country_iso, MasterStation.name)
+            .offset(effective_page * size)
+            .limit(size)
+        )
+        .scalars()
+        .all()
+    )
     drift_uics = {d.uic for d in db.execute(select(MasterStationPendingDrift)).scalars().all()}
-    return [StationResponse.from_orm_with_drift(s, drift_uics) for s in rows]
+
+    # In context mode, flag rows that match the query so the UI can render
+    # a highlight class. In filter mode, every row is by definition a match,
+    # so we set is_match=True on all of them for consistency.
+    def _is_match(s: MasterStation) -> bool:
+        if not q:
+            return False
+        if mode == "filter":
+            return True
+        ql = q.lower()
+        return ql in (s.name or "").lower() or ql in (s.uic or "").lower()
+
+    return [
+        StationResponse.from_orm_with_drift(s, drift_uics, is_match=_is_match(s))
+        for s in rows
+    ]
 
 
 @router.patch("/{uic}", response_model=StationResponse)
