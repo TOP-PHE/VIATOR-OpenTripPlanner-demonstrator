@@ -17,6 +17,17 @@ log = logging.getLogger(__name__)
 
 
 # Minimal GraphQL query — the real query at step 14 will be richer.
+#
+# OTP 2.9 dropped Itinerary.walkTime / transitTime / waitingTime: those
+# values are trivially computable from legs[].duration grouped by mode,
+# so OTP simplified the schema. Asking for them returns
+# "Validation error (FieldUndefined@[plan/itineraries/transitTime])"
+# and no itineraries — so the journey UI shows "0 trips (error)" even
+# when OTP would otherwise have returned valid TGV/RER results.
+#
+# `routingErrors` is included explicitly so we can surface OTP's own
+# diagnostics (LOCATION_NOT_FOUND, WALKING_BETTER_THAN_TRANSIT, etc.)
+# back to the operator instead of treating them as silent empty results.
 _QUERY = """
 query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $time: String) {
   plan(from: $from, to: $to, date: $date, time: $time, numItineraries: 5) {
@@ -24,9 +35,6 @@ query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $tim
       duration
       startTime
       endTime
-      walkTime
-      transitTime
-      waitingTime
       legs {
         mode
         startTime
@@ -36,6 +44,7 @@ query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $tim
         route { shortName }
       }
     }
+    routingErrors { code description }
   }
 }
 """.strip()
