@@ -31,6 +31,19 @@ def test_empty_providers_omits_updaters_key():
     assert "routingDefaults" in cfg
 
 
+def test_routing_defaults_include_access_egress_bound():
+    """OTP routes "as close as it can" to the destination by default,
+    silently truncating when the destination is far from any transit
+    stop. Our default tightens this so trips are refused outright
+    (LOCATION_NOT_FOUND) instead of returning misleading partial routes."""
+    cfg = _render([])
+    bounds = cfg["routingDefaults"].get("maxAccessEgressDurationForMode")
+    assert bounds is not None, "routingDefaults must include access/egress bound"
+    assert bounds.get("WALK") == "20m", (
+        "WALK access/egress bound is the safety net against silent truncation"
+    )
+
+
 def test_provider_without_gtfs_rt_emits_no_updater():
     cfg = _render([
         {"id": "SNCF", "label": "SNCF", "country_iso": "FR",

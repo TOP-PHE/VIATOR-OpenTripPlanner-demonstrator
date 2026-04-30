@@ -36,6 +36,24 @@ _DEFAULT_SERVER = {"apiProcessingTimeout": "10s"}
 _DEFAULT_ROUTING_DEFAULTS = {
     "numItineraries": 5,
     "transferSlack": "2m",
+    # OTP 2.x: how far OTP will walk to reach the first / leave the last
+    # transit stop. Without a tight bound, OTP silently routes to the
+    # nearest transit-reachable place when the requested coordinate is
+    # far from any transit stop — e.g. asking "Paris → Cagnes-sur-Mer"
+    # against a TGV-only feed returns Paris→Marseille trips because
+    # Marseille is the closest reachable point and OTP fakes a (huge)
+    # walk to the destination. With this bound, OTP refuses the route
+    # and our journey API surfaces a clean LOCATION_NOT_FOUND through
+    # the routingErrors[] array instead — operators see the gap rather
+    # than a misleading partial result.
+    #
+    # 20 minutes ≈ 1.5 km walking. Covers ~every urban demonstrator
+    # (RER stations are dense in Paris, and stations are usually <1 km
+    # apart in city centres). Increase per-session via session.config
+    # routing overrides if the operator has a rural use case.
+    "maxAccessEgressDurationForMode": {
+        "WALK": "20m",
+    },
 }
 
 
