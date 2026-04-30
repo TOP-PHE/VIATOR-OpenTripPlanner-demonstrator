@@ -157,6 +157,48 @@ def handle_reload_trigger() -> None:
             # Don't delete the trigger — we'll try again on the next tick.
             return
 
+    # ── Orphan cleanup (v0.1.7) ─────────────────────────────────
+    # When a session was deleted (or archived out of `serving`), its
+    # `otp-<sid>` service is no longer in the regenerated compose
+    # fragment. `docker compose up -d --no-deps` leaves the orphaned
+    # container alive — it keeps running and consuming RAM despite
+    # nginx no longer routing to it. Detect and remove them.
+    expected_otp_services = {f"otp-{sid}" for sid in serving_sids}
+    ps = subprocess.run(  # noqa: S603, S607
+        ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
+        capture_output=True, text=True, check=False,
+    )
+    if ps.returncode == 0:
+        # Container names are like `viator-otp-nap-fr-sncf-2026-q2-1` — strip
+        # the project prefix and the compose-replica suffix to recover the
+        # service name `otp-nap-fr-sncf-2026-q2`.
+        running_otp_services: set[str] = set()
+        for line in ps.stdout.splitlines():
+            name = line.strip()
+            if not name.startswith("viator-"):
+                continue
+            # `viator-<service>-<replica>` — replica is a numeric suffix
+            inner = name[len("viator-"):]
+            # Drop trailing `-N` if numeric; otherwise leave whole.
+            stem, _, last = inner.rpartition("-")
+            if stem and last.isdigit():
+                running_otp_services.add(stem)
+            else:
+                running_otp_services.add(inner)
+        orphans = running_otp_services - expected_otp_services
+        for orphan in sorted(orphans):
+            log.info("removing orphan compose service %s", orphan)
+            rm = subprocess.run(  # noqa: S603, S607
+                ["docker", "compose", "-p", "viator", "rm", "-f", "-s", "-v", orphan],
+                cwd="/srv/docker",
+                capture_output=True, text=True, check=False,
+            )
+            if rm.returncode != 0:
+                log.warning(
+                    "rm of orphan %s failed (exit %s); next tick will retry. stderr: %s",
+                    orphan, rm.returncode, rm.stderr,
+                )
+
     # nginx -s reload (target the compose-labeled container).
     reload = subprocess.run(  # noqa: S603
         ["docker", "exec", "viator-nginx-1", "nginx", "-s", "reload"],  # noqa: S607
@@ -190,9 +232,10 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # defensive — bad strings raise here rather than at build time, so the
     # job's log shows a clear "unknown osm_scope" instead of a shell error
     # from the entrypoint.
-    from . import osm_filter
+    from . import ingestion, osm_filter, router_config
 
     osm_scope = osm_filter.DEFAULT_SCOPE
+    providers: list[dict] = []
     if session_id:
         with SessionLocal() as db:
             row = db.get(SessionRow, session_id)
@@ -201,6 +244,25 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                     osm_scope = osm_filter.validate_scope(row.config.get("osm_scope"))
                 except ValueError as exc:
                     log.warning("session %s has bad osm_scope: %s — using default", sid, exc)
+                try:
+                    providers = ingestion.normalize_providers(row.config)
+                except ValueError as exc:
+                    log.warning("session %s has bad provider config: %s — using empty list", sid, exc)
+
+    # Generate per-session router-config.json. The entrypoint copies it
+    # into BUILD_DIR (overriding the baked image default) before launching
+    # OTP, so each provider's GTFS-RT URLs become real-time updaters at
+    # graph load time.
+    if session_id:
+        try:
+            session_inbox = ingestion.session_inbox(session_id)
+            session_inbox.mkdir(parents=True, exist_ok=True)
+            (session_inbox / "router-config.json").write_text(
+                router_config.render_router_config(providers),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, log-and-continue
+            log.warning("session %s router-config.json write failed: %s", sid, exc)
 
     cmd = [
         "docker",
@@ -238,6 +300,14 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         return output + "\nERROR: graph.obj not found after build", False, ""
 
     shutil.move(str(built), str(graph_target / "graph.obj"))
+
+    # If the entrypoint emitted router-config.json alongside the graph
+    # (v0.1.7 — generated from session.config.sources.providers[*].gtfs_rt),
+    # move it next to graph.obj so the serving otp-<sid> container picks
+    # up the GTFS-RT updaters at load time.
+    built_router_cfg = Path(str(settings.graph_dir)) / "router-config.json"
+    if built_router_cfg.exists():
+        shutil.move(str(built_router_cfg), str(graph_target / "router-config.json"))
 
     current = Path(str(settings.graph_dir)) / sid / "current"
     if current.exists() or current.is_symlink():

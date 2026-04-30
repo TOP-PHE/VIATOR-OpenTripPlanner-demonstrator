@@ -122,7 +122,19 @@ case "$MODE" in
             cp "$INBOX_DIR"/dem/*.tif "$BUILD_DIR/"
         fi
 
-        cp /opt/otp/router-config.json "$BUILD_DIR/"
+        # Per-session router-config.json (v0.1.7): the worker generates it
+        # from `session.config.sources.providers[*].gtfs_rt` before each
+        # build and writes it to `inbox/<sid>/router-config.json`. Used for
+        # OTP's real-time updater plumbing — alerts / trip-updates / vehicle-
+        # positions URLs per provider, all in one config. We prefer it over
+        # the baked image default; falling back keeps the entrypoint
+        # working for sessions without GTFS-RT URLs configured.
+        if [ -f "$INBOX_DIR/router-config.json" ]; then
+            echo "Using per-session router-config.json from $INBOX_DIR"
+            cp "$INBOX_DIR/router-config.json" "$BUILD_DIR/"
+        else
+            cp /opt/otp/router-config.json "$BUILD_DIR/"
+        fi
 
         # Generate build-config.json from the transit feeds we staged above.
         # The TRANSIT_FEEDS_JSON variable was populated by the staging loops
@@ -152,13 +164,61 @@ JSON
             cp /opt/otp/build-config.json "$BUILD_DIR/"
         fi
 
+        # streetGraph.obj cache (v0.1.7) — phase 1 is the heaviest step and
+        # only depends on the OSM PBF + filter scope. If neither has changed
+        # since the last successful build, skip phase 1 and reuse the cached
+        # streetGraph.obj. Cache lives at INBOX_DIR/osm/.cache/ alongside a
+        # `.key` file containing `sha256(osm.pbf):<scope>`.
+        #
+        # Effect: adding a new GTFS provider to a France-wide session goes
+        # from ~30 min (full rebuild) → ~10-12 min (phase-2 only). OSM
+        # itself unchanged, only transit overlay re-runs.
+        OSM_INPUT="$BUILD_DIR/osm.pbf"
+        CACHE_DIR="$INBOX_DIR/osm/.cache"
+        CACHE_OBJ="$CACHE_DIR/streetGraph.obj"
+        CACHE_KEY="$CACHE_DIR/streetGraph.key"
+        CURRENT_KEY=""
+        if [ -f "$OSM_INPUT" ]; then
+            # sha256 takes ~1 min on a 5 GB PBF; we eat that cost only once
+            # per (PBF, scope) combo because we cache the streetGraph it
+            # produces. Key format: `<sha256>:<scope>` — both pieces invalidate
+            # the cache when they change.
+            OSM_SHA="$(sha256sum "$OSM_INPUT" | awk '{print $1}')"
+            CURRENT_KEY="${OSM_SHA}:${OSM_SCOPE}"
+        fi
+        CACHED_KEY=""
+        [ -f "$CACHE_KEY" ] && CACHED_KEY="$(cat "$CACHE_KEY")"
+        STREETGRAPH_FROM_CACHE=0
+        if [ -n "$CURRENT_KEY" ] && [ "$CURRENT_KEY" = "$CACHED_KEY" ] && [ -f "$CACHE_OBJ" ]; then
+            echo "streetGraph.obj cache hit (key=$CURRENT_KEY) — copying $CACHE_OBJ into BUILD_DIR"
+            cp "$CACHE_OBJ" "$BUILD_DIR/streetGraph.obj"
+            STREETGRAPH_FROM_CACHE=1
+        else
+            if [ -n "$CACHED_KEY" ]; then
+                echo "streetGraph.obj cache miss (key changed: $CACHED_KEY → $CURRENT_KEY) — rebuilding"
+            else
+                echo "streetGraph.obj cache empty — building from scratch"
+            fi
+        fi
+
         case "$BUILD_PHASES" in
             two_phase)
-                # Phase 1 — read OSM PBF, build street graph, save streetGraph.obj.
-                # JVM exits at the end of this command, releasing the OSM-parse peak.
-                echo "Phase 1/2 — building street graph (heap=$HEAP) ..."
-                # shellcheck disable=SC2086  # JVM_OPTS is intentionally word-split
-                java -Xmx"$HEAP" $JVM_OPTS -jar /opt/otp/otp.jar --buildStreet --save "$BUILD_DIR"
+                if [ "$STREETGRAPH_FROM_CACHE" = "1" ]; then
+                    echo "Phase 1/2 — SKIPPED (using cached streetGraph.obj)"
+                else
+                    # Phase 1 — read OSM PBF, build street graph, save streetGraph.obj.
+                    # JVM exits at the end of this command, releasing the OSM-parse peak.
+                    echo "Phase 1/2 — building street graph (heap=$HEAP) ..."
+                    # shellcheck disable=SC2086  # JVM_OPTS is intentionally word-split
+                    java -Xmx"$HEAP" $JVM_OPTS -jar /opt/otp/otp.jar --buildStreet --save "$BUILD_DIR"
+                    # Persist for next time, only after phase 1 succeeded.
+                    if [ -n "$CURRENT_KEY" ] && [ -f "$BUILD_DIR/streetGraph.obj" ]; then
+                        mkdir -p "$CACHE_DIR"
+                        cp "$BUILD_DIR/streetGraph.obj" "$CACHE_OBJ"
+                        printf '%s' "$CURRENT_KEY" > "$CACHE_KEY"
+                        echo "streetGraph.obj cache updated (key=$CURRENT_KEY)"
+                    fi
+                fi
 
                 # Phase 2 — load the saved streetGraph.obj, layer GTFS/NeTEx on top,
                 # save graph.obj. Peak heap is much lower than the combined
@@ -181,7 +241,15 @@ JSON
         echo "Promoting graph to $GRAPH_DIR ..."
         mkdir -p "$GRAPH_DIR"
         mv "$BUILD_DIR/graph.obj" "$GRAPH_DIR/graph.obj"
-        # The worker (host side) will move this into a timestamped subdir + flip the symlink.
+        # router-config.json travels with the graph — OTP's serve mode loads
+        # it from the same directory as graph.obj, and the per-session
+        # otp-<sid> serving container only has the graphs volume mounted
+        # (not inbox), so the file has to live alongside the graph rather
+        # than being read from inbox at serve time.
+        if [ -f "$BUILD_DIR/router-config.json" ]; then
+            cp "$BUILD_DIR/router-config.json" "$GRAPH_DIR/router-config.json"
+        fi
+        # The worker (host side) will move both into a timestamped subdir + flip the symlink.
         ;;
 
     serve)

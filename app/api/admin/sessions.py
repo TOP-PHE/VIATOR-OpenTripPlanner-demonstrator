@@ -15,6 +15,7 @@ Phase-A.5 wiring (this file):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -170,6 +171,7 @@ def patch_session(
     sid: str,
     body: SessionPatch,
     request: Request,
+    response: Response,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> SessionResponse:
@@ -234,6 +236,17 @@ def patch_session(
             # the normalised shape.
             body.config["sources"]["providers"] = providers
 
+            # Soft warning when the OSM PBF URL likely doesn't cover one
+            # of the declared provider countries (v0.1.7-D). Surfaced via
+            # `X-Warnings` response header — UI parses + toasts. Never
+            # blocks the save (per agreed design).
+            osm_warning = _osm_coverage_warning(
+                body.config["sources"].get("osm_pbf"),
+                declared_countries,
+            )
+            if osm_warning:
+                response.headers["X-Warnings"] = json.dumps([osm_warning])
+
         changes["config"] = {"from": s.config, "to": body.config}
         s.config = body.config
     if body.include_in_fanout is not None and body.include_in_fanout != s.include_in_fanout:
@@ -257,6 +270,129 @@ def patch_session(
         )
     db.commit()
     return SessionResponse.from_orm_session(s)
+
+
+@router.delete("/{sid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_session(
+    sid: str,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> Response:
+    """Permanently delete a session and all its data.
+
+    This is the irreversible "start from scratch" path — distinct from
+    `POST /{sid}/archive` which keeps the inbox/graphs and DB rows
+    around so they can be restored. Delete:
+
+      - Wipes session row + all FK-referenced child rows (rebuild_jobs,
+        uploads, graph_snapshots, journey_search_executions and their
+        trips, mct_overrides, stations_xref).
+      - Removes the session's filesystem trees (inbox/<sid>/,
+        graphs/<sid>/).
+      - Re-runs the sessions orchestrator so the per-session compose
+        and nginx fragments drop the deleted session, then touches the
+        reload-trigger so the worker tears down the otp-<sid> service
+        + reloads nginx.
+
+    NOT done by this endpoint:
+
+      - Audit events tagged with this session: kept (immutable record
+        of what once existed). Their `target_id` references a session
+        that no longer exists in `sessions`, but `audit_events.target_id`
+        is just a string column — no FK enforces it.
+      - Master-station rows: never owned by a session, untouched.
+
+    Cascade order matters because FK columns to sessions.id don't have
+    `ondelete=CASCADE` (an alembic migration to add cascade everywhere
+    would be cleaner long-term — tracked as Phase-3 cleanup).
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+
+    # Snapshot what we're about to delete for the audit row — useful when
+    # an operator deletes the wrong session and wants to know what was lost.
+    audit_metadata = {
+        "name": s.name,
+        "category": s.category,
+        "state": s.state,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "config_summary": {
+            "providers": [
+                p.get("id")
+                for p in (s.config or {}).get("sources", {}).get("providers", [])
+            ],
+            "had_osm_pbf": bool((s.config or {}).get("sources", {}).get("osm_pbf")),
+        },
+    }
+
+    # ── DB cascade — explicit because no FK has ondelete=CASCADE today ──
+    from ...models import (  # local imports keep top-of-file lean
+        GraphSnapshot,
+        JourneySearchExecution,
+        McTOverride,
+        StationXref,
+    )
+
+    # journey_search_executions has trips that cascade automatically because
+    # the trips→executions FK already has ondelete="CASCADE".
+    db.query(JourneySearchExecution).filter(JourneySearchExecution.session_id == sid).delete(
+        synchronize_session=False
+    )
+    db.query(McTOverride).filter(McTOverride.session_id == sid).delete(synchronize_session=False)
+    db.query(StationXref).filter(StationXref.session_id == sid).delete(synchronize_session=False)
+    db.query(GraphSnapshot).filter(GraphSnapshot.session_id == sid).delete(
+        synchronize_session=False
+    )
+    db.query(Upload).filter(Upload.session_id == sid).delete(synchronize_session=False)
+    db.query(RebuildJob).filter(RebuildJob.session_id == sid).delete(synchronize_session=False)
+    db.delete(s)
+
+    # Re-run the orchestrator so the deleted session drops out of the
+    # compose + nginx fragments. Done before commit so any DB-side
+    # constraint failure rolls back the orchestrator change too (the
+    # orchestrator queries the same DB, so a not-yet-committed delete
+    # is visible).
+    sessions_orchestrator.regenerate(db)
+
+    # ── Filesystem cleanup ─────────────────────────────────────────
+    # Done before commit so a permission failure surfaces as 500 rather
+    # than leaving the DB inconsistent with disk. Worker has rw on both
+    # inbox + graphs volumes; web has rw on inbox + ro on graphs (per
+    # current docker-compose), so this delete needs the worker — but
+    # we run it inline in web for simplicity. If web lacks permission,
+    # the cleanup is best-effort: log and continue.
+    import shutil  # local — only needed here
+
+    for tree in (settings.inbox_dir / sid, settings.graph_dir / sid):
+        if tree.exists():
+            try:
+                shutil.rmtree(tree)
+            except OSError as exc:
+                # Filesystem is reclaimable later via worker cleanup or
+                # operator SSH; don't block the API delete on it.
+                audit_metadata.setdefault("filesystem_warnings", []).append(
+                    {"path": str(tree), "error": str(exc)}
+                )
+
+    # Touch the reload trigger so the worker tears down the otp-<sid>
+    # container (if state was 'serving') and reloads nginx with the
+    # new fragments. Same mechanism as `promote`.
+    _RELOAD_TRIGGER.parent.mkdir(parents=True, exist_ok=True)
+    _RELOAD_TRIGGER.write_text(datetime.now(UTC).isoformat())
+
+    audit.record(
+        db,
+        action="session.deleted",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata=audit_metadata,
+    )
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{sid}/archive", status_code=status.HTTP_204_NO_CONTENT)
@@ -398,6 +534,75 @@ async def upload_to_session(
         detected_kind=upload.detected_kind,
         size_bytes=upload.size_bytes,
         triggered_rebuild=upload.triggered_rebuild,
+    )
+
+
+_COUNTRY_TO_OSM_HINTS: dict[str, set[str]] = {
+    # Country ISO → substrings the OSM URL might contain to suggest coverage.
+    # Geofabrik regional names are the common case; "europe" / "world" act
+    # as wildcard catch-alls. Heuristic only — false positives (claims an
+    # uncovered country) are tolerable; false negatives (claims a covered
+    # country isn't covered, surfacing a confusing warning) are not. So
+    # this list errs on the side of including more hint strings.
+    "FR": {"france", "europe", "world", "planet"},
+    "DE": {"germany", "deutschland", "europe", "world", "planet"},
+    "IT": {"italy", "italia", "europe", "world", "planet"},
+    "ES": {"spain", "espana", "europe", "world", "planet"},
+    "PT": {"portugal", "europe", "world", "planet"},
+    "NL": {"netherlands", "nederland", "europe", "world", "planet"},
+    "BE": {"belgium", "belgie", "europe", "world", "planet"},
+    "LU": {"luxembourg", "europe", "world", "planet"},
+    "CH": {"switzerland", "suisse", "schweiz", "europe", "world", "planet"},
+    "AT": {"austria", "oesterreich", "europe", "world", "planet"},
+    "GB": {"britain", "uk", "england", "scotland", "wales", "europe", "world", "planet"},
+    "IE": {"ireland", "europe", "world", "planet"},
+    "DK": {"denmark", "europe", "world", "planet", "nordic"},
+    "SE": {"sweden", "sverige", "europe", "world", "planet", "nordic"},
+    "NO": {"norway", "norge", "europe", "world", "planet", "nordic"},
+    "FI": {"finland", "europe", "world", "planet", "nordic"},
+    "PL": {"poland", "polska", "europe", "world", "planet"},
+    "CZ": {"czech", "europe", "world", "planet"},
+    "HU": {"hungary", "europe", "world", "planet"},
+    "GR": {"greece", "europe", "world", "planet"},
+    # Add more as the demonstrator's reach grows. Catch-all behaviour for
+    # countries not in this dict: no warning is emitted (we don't know
+    # what hints to look for).
+}
+
+
+def _osm_coverage_warning(osm_url: str | None, declared_countries: set[str]) -> str | None:
+    """Return a soft warning string when the OSM URL likely doesn't cover one
+    or more declared provider countries. Returns None when:
+
+      - osm_url is empty (operator hasn't set one yet — no false positive)
+      - declared_countries is empty (no providers, nothing to check)
+      - we don't have heuristic hints for any of the declared countries
+        (better to stay silent than emit a guess we can't justify)
+      - every declared country has at least one matching hint substring
+        in the URL
+
+    The warning is **soft** — it never blocks save (per agreed v0.1.6 design).
+    Operators sometimes know things our heuristic doesn't (e.g. they merged
+    multiple PBFs offline and uploaded the result manually); a hard block
+    would frustrate those legitimate cases.
+    """
+    if not osm_url or not declared_countries:
+        return None
+    url_lower = osm_url.lower()
+    uncovered: list[str] = []
+    for ci in sorted(declared_countries):
+        hints = _COUNTRY_TO_OSM_HINTS.get(ci)
+        if hints is None:
+            continue  # we don't know what to look for; stay silent
+        if not any(h in url_lower for h in hints):
+            uncovered.append(ci)
+    if not uncovered:
+        return None
+    return (
+        f"OSM URL doesn't appear to cover {uncovered}. Coordinate searches "
+        "outside the PBF's region will fail with LOCATION_NOT_FOUND. "
+        "If the URL is correct (e.g. you merged regions offline), ignore "
+        "this; otherwise switch to a wider PBF."
     )
 
 

@@ -43,7 +43,10 @@
         <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
       </td>
       <td style="font-size: 0.85rem; color: var(--rail-steel)">{{ s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '—' }}</td>
-      <td><button type="button" class="secondary" data-action="archive" {% if s.state == 'archived' %}disabled{% endif %}>Archive</button></td>
+      <td style="white-space: nowrap">
+        <button type="button" class="secondary" data-action="archive" {% if s.state == 'archived' %}disabled{% endif %}>Archive</button>
+        <button type="button" class="danger" data-action="delete" title="Permanently delete (irreversible)">Delete</button>
+      </td>
     </tr>
     <tr class="detail-row" data-sid-detail="{{ s.id }}" hidden>
       <td colspan="8" style="padding: 0">
@@ -156,6 +159,9 @@
   .detail-section { margin-bottom: 1.25rem; }
   .detail-section h3 { margin: 0 0 0.25rem; font-size: 1rem; }
   .detail-section .hint { color: var(--rail-steel); font-size: 0.85rem; margin: 0 0 0.5rem; max-width: 720px; }
+  button.danger { background: #c0392b; color: #fff; border-color: #a33323; }
+  button.danger:hover { background: #a33323; }
+  button.danger:disabled { background: #e0b6b1; border-color: #e0b6b1; color: #fff; cursor: not-allowed; }
   .feeds-fieldset, .providers-fieldset { border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; padding: 0.5rem 1rem 0.75rem; margin: 0 0 0.75rem; }
   .feeds-fieldset legend, .providers-fieldset legend { padding: 0 0.4rem; font-size: 0.85rem; color: var(--rail-steel); font-weight: 600; }
   .feed-row .feed-id { font-family: ui-monospace, Menlo, Consolas, monospace; }
@@ -210,6 +216,35 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
     if (!confirm(`Archive session ${sid}? Its inbox and graphs are preserved but it stops serving.`)) return;
     const r = await fetch(`/api/sessions/${sid}/archive`, {method:'POST'});
     if (r.ok) window.location.reload(); else showToast('error', `Failed (${r.status})`);
+  });
+  row.querySelector('button[data-action="delete"]')?.addEventListener('click', async () => {
+    // Two-step destructive confirm: a `confirm()` for the user's first
+    // decision, then a `prompt()` requiring them to type the session ID
+    // verbatim. Catches accidental clicks and forces a moment of intent —
+    // this delete is irreversible (DB rows + inbox + graphs all gone).
+    const ok = confirm(
+      `PERMANENTLY DELETE session ${sid}?\n\n` +
+      `This will remove:\n` +
+      `  • the session row + all its rebuild jobs / uploads / graph snapshots\n` +
+      `  • every journey search execution that referenced it\n` +
+      `  • the on-disk inbox/${sid}/ and graphs/${sid}/ directories\n` +
+      `  • the otp-${sid} container if it's currently serving\n\n` +
+      `Click OK to continue, then type the session ID to confirm.`
+    );
+    if (!ok) return;
+    const typed = prompt(`Type the session ID to confirm: ${sid}`);
+    if (typed !== sid) {
+      showToast('error', 'Confirmation text did not match — delete cancelled');
+      return;
+    }
+    const r = await fetch(`/api/sessions/${sid}`, {method: 'DELETE'});
+    if (r.status === 204) {
+      showToast('success', `Deleted ${sid}. The worker will tear down its container within ~15 s.`);
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      const j = await r.json().catch(() => ({}));
+      showToast('error', j.detail || `Delete failed (${r.status})`);
+    }
   });
   row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
     const detail = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
@@ -563,7 +598,22 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     }
     const updated = await r.json();
     row.dataset.config = JSON.stringify(updated.config);
+    // Server-side soft warnings (X-Warnings response header, JSON list).
+    // We toast the success first, then chain a warning toast if any. Same
+    // mechanism could carry future warnings — keep it general.
     showToast('success', `Config saved for ${sid} — ${providers.length} provider${providers.length === 1 ? '' : 's'}`);
+    const warningsHdr = r.headers.get('X-Warnings');
+    if (warningsHdr) {
+      try {
+        const warnings = JSON.parse(warningsHdr);
+        if (Array.isArray(warnings) && warnings.length) {
+          // Stagger so the success toast doesn't get clobbered immediately.
+          setTimeout(() => showToast('warning', warnings.join('\n')), 600);
+        }
+      } catch (_) {
+        // Malformed header; ignore.
+      }
+    }
   });
 });
 

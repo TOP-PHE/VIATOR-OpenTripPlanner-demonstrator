@@ -294,6 +294,17 @@ or `docker compose logs -f worker`.
 >
 > Set `OTP_BUILD_PHASES=one_shot` in `.env` only as a debugging fallback;
 > the default is recommended for all sizes.
+>
+> **Phase 1 cache (since v0.1.7).** The streetGraph.obj that phase 1
+> produces is cached at `inbox/<sid>/osm/.cache/streetGraph.obj`, keyed
+> by `sha256(osm.pbf):<scope>`. On the next rebuild, if the OSM input
+> and the OSM scope haven't changed, phase 1 is skipped entirely and
+> the cached file is copied into BUILD_DIR. Phase 2 (transit overlay)
+> always runs. Effect: adding a new GTFS provider to a France-wide
+> session goes from ~30 min (full rebuild) → ~10-12 min (phase 2 only).
+> The cache invalidates automatically when you change the OSM URL,
+> upload a new PBF, or change the OSM scope; you can also clear it by
+> deleting and recreating the session.
 
 On success the worker:
 - Moves `graph.obj` into a timestamped directory: `graphs/<sid>/<timestamp>/graph.obj`
@@ -773,6 +784,9 @@ session's origin flag.
 | Refresh sources skips a feed with `invalid gtfs config: feed id "X" appears twice` | Two rows in the GTFS feeds list have the same ID | Rename one — feed IDs must be unique within a session. The OTP graph build would otherwise refuse to start. |
 | Save config returns `409 missing_master_stations_for_countries` (since v0.1.6) | A provider declares `country_iso=X` but `master_stations` has zero rows for X | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline** (which covers most European countries). Wait for the toast confirming the import completed. Then retry **Save config**. |
 | Need to refresh just one provider's data without re-downloading the others (since v0.1.6) | Clicking "Refresh all sources" pulls every provider | Each provider card has a **⤴ Refresh this provider** button — downloads only that provider's timetable + MCT + stations CSV. OSM PBF stays untouched. |
+| Need to fully reset a session (e.g. wipe a half-built France-wide and start over) (since v0.1.7) | Archive only flips state to `archived` — preserves data | Click the **Delete** button next to Archive. Two-step confirmation: a yes/no dialog, then a prompt requiring you to type the session id verbatim. Removes the session row + all its rebuild jobs / uploads / graph snapshots / journey search executions, the on-disk `inbox/<sid>/` and `graphs/<sid>/`, and tears down the otp-`<sid>` container if it was serving. Audit row records what was deleted. |
+| Save config toast says "OSM URL doesn't appear to cover [IT]" (since v0.1.7) | A provider declares `country_iso=X` but the OSM URL doesn't mention X (heuristic check against country/region hint substrings) | Soft warning only — save still succeeds. If the URL is correct (e.g. you merged regions offline before uploading), ignore. Otherwise switch to a wider PBF (e.g. `europe-latest.osm.pbf`) or merge the country PBFs with `osmium merge` before upload. |
+| Real-time alerts / trip updates from a provider don't show in OTP (since v0.1.7) | GTFS-RT URLs configured but session hasn't rebuilt + been promoted yet | Click **Rebuild graph** then **Promote to serving**. The new graph carries the per-session `router-config.json` containing each provider's `real-time-alerts` / `stop-time-updater` / `vehicle-positions` updaters; the per-session `otp-<sid>` container picks them up at load time. |
 | Build log shows `Generating build-config.json with feeds: {…SNCF…}{…IDFM…}` and finishes ok, but a journey query returns no itineraries | Routing across feeds requires the connecting stops to be within OTP's `maxTransferDistance` (default ~200 m) — far enough apart and OTP doesn't generate the walking transfer | Check coordinates: e.g. SNCF and IDFM versions of "Paris Gare du Nord" must be in the same place. If the GTFS lat/lons disagree, OTP won't connect them. The fix is operator-side (correct GTFS data) or wait for v0.1.5 station-aliasing. |
 
 ---
