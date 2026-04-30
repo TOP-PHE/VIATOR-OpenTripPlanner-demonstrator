@@ -37,6 +37,25 @@ case "$MODE" in
         trap 'rm -rf "$BUILD_DIR"' EXIT
 
         echo "Staging build inputs from $INBOX_DIR ..."
+
+        # Pre-check: if there's no PBF or no transit feed, OTP fails ~30 s
+        # in with "no OSM data available" (or a similarly opaque error)
+        # after spinning up the JVM. Surface a clear message early instead
+        # — usually the operator forgot to click Refresh sources before
+        # Rebuild graph. The API also guards this at enqueue time (since
+        # v0.1.7); this check covers manual operator-driven invocations.
+        has_pbf=0
+        has_transit=0
+        compgen -G "$INBOX_DIR/osm/*.pbf"   > /dev/null && has_pbf=1
+        compgen -G "$INBOX_DIR/gtfs/*.zip"  > /dev/null && has_transit=1
+        compgen -G "$INBOX_DIR/netex/*.zip" > /dev/null && has_transit=1
+        if [ "$has_pbf" -eq 0 ] || [ "$has_transit" -eq 0 ]; then
+            echo "ERROR: missing inputs in $INBOX_DIR/" >&2
+            echo "  OSM PBF (osm/*.pbf):       $([ $has_pbf    -eq 1 ] && echo present || echo MISSING)" >&2
+            echo "  Transit feed (gtfs/netex): $([ $has_transit -eq 1 ] && echo present || echo MISSING)" >&2
+            echo "Did you click 'Refresh all sources' before 'Rebuild graph'?" >&2
+            exit 1
+        fi
         # Transit feeds — staged with per-format type tracking so the
         # build-config generator below picks the right OTP `transitFeeds.type`
         # value per file. GTFS files land in inbox/<sid>/gtfs/, NeTEx (Nordic

@@ -954,10 +954,38 @@ def enqueue_rebuild(
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RebuildJobResponse:
     """Manually enqueue a rebuild for this session. Idempotent — coalesces
-    with any existing pending job for the same session."""
+    with any existing pending job for the same session.
+
+    Refuses (400) when inputs aren't staged on disk. The OTP build itself
+    fails ~30 seconds in with "no OSM data available" if you skip the
+    Refresh-sources step; this guard saves operators that round-trip and
+    points them at the action they actually need.
+    """
     s = db.get(SessionRow, sid)
     if s is None:
         raise HTTPException(404, "Session not found")
+
+    # Guard: confirm the inputs OTP needs are actually on disk. The session
+    # state advances to `populated` when a refresh succeeds OR an upload
+    # lands, so checking state alone isn't enough — operators can be at
+    # `populated` from a GTFS upload while OSM is still missing. Inspect
+    # the filesystem directly.
+    sess_inbox = ingestion.session_inbox(sid)
+    gtfs_zips = sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
+    netex_zips = sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+    osm_pbfs = sorted((sess_inbox / "osm").glob("*.pbf")) if (sess_inbox / "osm").exists() else []
+    if not (gtfs_zips or netex_zips):
+        raise HTTPException(
+            400,
+            f"No transit feed staged for session {sid!r}. "
+            "Click 'Refresh all sources' (or use the Upload form) before Rebuild graph.",
+        )
+    if not osm_pbfs:
+        raise HTTPException(
+            400,
+            f"No OSM PBF staged for session {sid!r}. "
+            "Click 'Refresh all sources' (or upload one manually) before Rebuild graph.",
+        )
 
     # Reuse the same coalescing logic ingestion uses.
     pending = (
