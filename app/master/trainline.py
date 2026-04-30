@@ -63,6 +63,36 @@ _COL_MAP = {
     "atoc_id": "atoc_code",
 }
 
+# Trainline columns that map into `master_stations.other_codes` JSONB
+# instead of dedicated columns. Adding a new operator's identifier here
+# is the painless path — no DB migration required, just an entry in this
+# dict + a Trainline refresh. The UI reads `other_codes` and renders
+# whichever keys are populated.
+#
+# Why JSONB and not new columns? Trainline tracks 14+ operator-specific
+# IDs and grows over time (Westbahn was added in 2019, Trenord later). If
+# every new operator needed an alembic migration the schema would never
+# stabilise. Operators that are queried frequently in the UI (SNCF / DB /
+# Trenitalia / Renfe / ATOC) keep dedicated columns; everything else lives
+# in this JSONB and is rendered dynamically.
+#
+# Map keys are the Trainline CSV column names; values are the canonical
+# JSONB key we use internally (lowercased, terse).
+_OTHER_CODES_COL_MAP = {
+    "obb_id":         "obb",          # ÖBB / Austrian Federal Railways
+    "cff_id":         "sbb",          # SBB / CFF / FFS — Switzerland (Trainline calls it cff_id)
+    "entur_id":       "entur",        # Entur — Norway / Nordic transit hub
+    "ntv_id":         "ntv",          # NTV / Italo — Italian private high-speed
+    "trenord_id":     "trenord",      # Trenord — Lombardy regional
+    "cercanias_id":   "cercanias",    # Renfe Cercanías — Spanish regional
+    "benerail_id":    "benerail",     # Benerail — Belgium booking
+    "westbahn_id":    "westbahn",     # Westbahn — Austrian private
+    "flixbus_id":     "flixbus",      # Flixbus
+    "busbud_id":      "busbud",       # Busbud
+    "distribusion_id": "distribusion",  # Distribusion
+    "iata_airport_code": "iata",      # IATA airport code (when station is in/at an airport)
+}
+
 
 def parse_csv(content: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Parse the Trainline CSV into:
@@ -105,6 +135,19 @@ def parse_csv(content: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
                 row[dst] = v.lower() in ("t", "true", "1", "yes")
             else:
                 row[dst] = v
+
+        # Operator-specific identifiers that don't have dedicated columns
+        # (OBB, SBB, NTV, Trenord, Cercanías, Entur, etc.) — stored in the
+        # `other_codes` JSONB so the UI can render them dynamically. Only
+        # populated when at least one upstream value exists; otherwise we
+        # leave the column at its server_default of `'{}'::jsonb`.
+        other_codes: dict[str, str] = {}
+        for src, key in _OTHER_CODES_COL_MAP.items():
+            v = (raw.get(src) or "").strip()
+            if v:
+                other_codes[key] = v
+        if other_codes:
+            row["other_codes"] = other_codes
 
         # Translate parent_station_id (Trainline id) → parent_uic (UIC code).
         # Skip if the parent doesn't have a UIC, or if the row points at itself.
@@ -211,9 +254,23 @@ def upsert_with_drift_protection(
 
 
 def _diff_fields(existing: MasterStation, incoming: dict[str, Any]) -> list[str]:
-    diff = []
+    """Field-by-field diff between an existing manual row and the upstream
+    incoming row. Used to populate `master_stations_pending_drift.fields_differing`.
+
+    `other_codes` is decomposed into per-key entries so the drift queue tells
+    the operator *which* operator code changed (e.g. `other_codes.obb`)
+    rather than just listing the JSONB column wholesale.
+    """
+    diff: list[str] = []
     for key, value in incoming.items():
-        if key in ("source",):
+        if key == "source":
+            continue
+        if key == "other_codes":
+            existing_codes = getattr(existing, "other_codes", None) or {}
+            incoming_codes = value or {}
+            for code_key in set(existing_codes) | set(incoming_codes):
+                if existing_codes.get(code_key) != incoming_codes.get(code_key):
+                    diff.append(f"other_codes.{code_key}")
             continue
         if getattr(existing, key, None) != value:
             diff.append(key)

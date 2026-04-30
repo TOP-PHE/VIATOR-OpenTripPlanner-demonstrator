@@ -25,9 +25,17 @@ class StationResponse(BaseModel):
     country_iso: str | None
     latitude: float | None
     longitude: float | None
+    # Dedicated operator codes — frequently queried, displayed as columns
+    # in the admin UI's main station table.
     trigramme_sncf: str | None
     db_code: str | None
     trenitalia_code: str | None
+    renfe_code: str | None
+    atoc_code: str | None
+    # Catch-all JSONB for less common operator codes — OBB, SBB, NTV,
+    # Trenord, Cercanías, Entur, Westbahn, Flixbus, Benerail, etc. UI
+    # renders dynamically via small operator badges.
+    other_codes: dict[str, str]
     is_main_station: bool
     source: str
     has_drift: bool
@@ -53,6 +61,9 @@ class StationResponse(BaseModel):
             trigramme_sncf=s.trigramme_sncf,
             db_code=s.db_code,
             trenitalia_code=s.trenitalia_code,
+            renfe_code=s.renfe_code,
+            atoc_code=s.atoc_code,
+            other_codes=s.other_codes or {},
             is_main_station=s.is_main_station,
             source=s.source,
             has_drift=s.uic in drift_uics,

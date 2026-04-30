@@ -51,6 +51,12 @@
   .pagination-bar input.page-jump { width: 4.5rem; text-align: right; }
   .pagination-bar .pos { color: var(--rail-steel); }
   mark.q-hit { background: #ffe066; color: inherit; padding: 0 1px; border-radius: 2px; }
+  /* Operator code badges (one row in master_stations table). Dense, scannable.
+     Each badge is two pills joined: operator name (steel grey) + code value
+     (mono font, slightly highlighted). */
+  .op-code { display: inline-flex; align-items: stretch; margin: 1px 4px 1px 0; font-size: 0.72rem; font-family: ui-monospace, Menlo, Consolas, monospace; line-height: 1.2; border-radius: 3px; overflow: hidden; }
+  .op-code .op-name { background: #e7eaef; color: #4a5562; padding: 1px 5px; }
+  .op-code .op-val  { background: #f5f7f9; color: #1a2230; padding: 1px 6px; border: 1px solid #e7eaef; border-left: 0; }
 </style>
 {% endblock %}
 
@@ -68,6 +74,54 @@ let lastQuery = null;
 let lastCountry = null;
 
 function escHTML(s) { return (s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Operator-code label map — keeps the UI label decoupled from the
+// JSONB key name so we can rename underlying keys without churning the
+// display. Mirrors the values in app/master/trainline.py::_OTHER_CODES_COL_MAP.
+const OPERATOR_CODE_LABELS = {
+  // Dedicated columns
+  trigramme_sncf: 'SNCF',
+  db_code: 'DB',
+  trenitalia_code: 'Trenitalia',
+  renfe_code: 'Renfe',
+  atoc_code: 'ATOC',
+  // JSONB keys
+  obb: 'ÖBB',
+  sbb: 'SBB',
+  entur: 'Entur',
+  ntv: 'Italo (NTV)',
+  trenord: 'Trenord',
+  cercanias: 'Cercanías',
+  benerail: 'Benerail',
+  westbahn: 'Westbahn',
+  flixbus: 'Flixbus',
+  busbud: 'Busbud',
+  distribusion: 'Distribusion',
+  iata: 'IATA',
+};
+
+function operatorBadges(s) {
+  // Render every populated operator code as a small badge. Dedicated
+  // columns (trigramme_sncf etc.) and other_codes JSONB keys are merged
+  // into one display so the operator sees the full set without caring
+  // about storage layout.
+  const codes = [];
+  for (const [field, label] of Object.entries(OPERATOR_CODE_LABELS)) {
+    let val;
+    if (field in s) {
+      val = s[field];
+    } else if (s.other_codes && field in s.other_codes) {
+      val = s.other_codes[field];
+    }
+    if (val) codes.push({label, value: String(val)});
+  }
+  if (!codes.length) return '<span style="color: var(--rail-steel); font-size: 0.85rem">—</span>';
+  return codes.map(c =>
+    `<span class="op-code" title="${escAttr(c.label)}: ${escAttr(c.value)}"><span class="op-name">${escHTML(c.label)}</span><span class="op-val">${escHTML(c.value)}</span></span>`
+  ).join('');
+}
+
+function escAttr(s) { return (s || '').toString().replace(/"/g, '&quot;'); }
 
 function highlightSubstring(text, q) {
   // Wrap occurrences of `q` in <mark> for visual scanning. Case-insensitive
@@ -114,14 +168,12 @@ async function loadStations({page = 0, flashMatches = true} = {}) {
     currentPage = parseInt(matchPage, 10);
   }
 
-  const head = '<tr><th>UIC</th><th>Name</th><th>Country</th><th>SNCF</th><th>DB</th><th>Trenitalia</th><th>Source</th><th></th></tr>';
+  const head = '<tr><th>UIC</th><th>Name</th><th>Country</th><th>Operator codes</th><th>Source</th><th></th></tr>';
   const body = rows.map(s => `<tr data-uic="${escHTML(s.uic)}" class="${s.is_match ? 'match-row' : ''}">
     <td><code>${highlightSubstring(s.uic, q)}</code></td>
     <td>${highlightSubstring(s.name, q)}${s.has_drift ? ' <span class="flag SUBSET" style="font-size:0.65rem">DRIFT</span>' : ''}</td>
     <td>${escHTML(s.country_iso) || '—'}</td>
-    <td>${escHTML(s.trigramme_sncf) || '—'}</td>
-    <td>${escHTML(s.db_code) || '—'}</td>
-    <td>${escHTML(s.trenitalia_code) || '—'}</td>
+    <td>${operatorBadges(s)}</td>
     <td><span style="font-size:0.75rem; color: var(--rail-steel)">${escHTML(s.source)}</span></td>
     <td><button type="button" class="secondary" data-action="edit">Edit</button></td>
   </tr>`).join('');
