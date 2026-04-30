@@ -104,7 +104,19 @@ function setupAutocomplete(prefix) {
     inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
     box.classList.remove('show');
   }
-  let t; inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(refresh, 150); });
+  let t; inp.addEventListener('input', () => {
+    // CRITICAL: when the operator edits the input text, the previously-
+    // picked station's lat/lon become stale. Clear them so a submit
+    // refuses with "Please pick both stations from the suggestions"
+    // rather than silently routing to the OLD station's coordinates.
+    // Was a real bug: typing "Lyon Part-Dieu" → search → clearing and
+    // typing "cagnes sur mer" → search returned trips to Lyon because
+    // the hidden lat/lon never got cleared.
+    if (inp.value.trim() !== name.value) {
+      lat.value = ''; lon.value = ''; name.value = '';
+    }
+    clearTimeout(t); t = setTimeout(refresh, 150);
+  });
   inp.addEventListener('blur', () => setTimeout(() => box.classList.remove('show'), 150));
   inp.addEventListener('keydown', e => {
     if (!box.classList.contains('show')) return;
@@ -130,7 +142,9 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
   const tLon = parseFloat(document.getElementById('to-lon').value);
   if (!fLat || !tLat) {
     document.getElementById('msg').className = 'msg show error';
-    document.getElementById('msg').textContent = 'Please pick both stations from the suggestions.';
+    document.getElementById('msg').textContent =
+      'Please type a station name and pick it from the dropdown suggestions for both From and To. ' +
+      'Editing the text without picking a suggestion clears the underlying coordinates.';
     return;
   }
   const body = {
