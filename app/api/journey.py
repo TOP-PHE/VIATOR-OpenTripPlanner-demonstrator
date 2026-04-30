@@ -162,8 +162,13 @@ async def fanout(
 
     for session, (status, raw, trips, response_ms) in zip(sessions, results, strict=True):
         snap = _current_snapshot(db, session.id)
-        if snap is None:
-            status = "error"
+        # Note: a missing graph_snapshots row is NOT an error — it just
+        # means the worker hasn't written a snapshot record yet (Phase-3
+        # wiring). The OTP query itself succeeded. Pre-this-fix we forced
+        # status="error" whenever snap was None, which made every search
+        # render "(error)" in the journey UI even when the itineraries
+        # were perfect. Now we just leave snapshot_id NULL on the
+        # execution row and trust `status` from `_query_session`.
         if status == "ok":
             any_ok = True
         else:
@@ -291,8 +296,8 @@ async def plan(
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
     snap = _current_snapshot(db, s.id)
-    if snap is None:
-        status = "error"
+    # Same as the fanout path — missing graph_snapshots row isn't an error,
+    # just deferred Phase-3 wiring. Don't poison status with "error" here.
     recorder.record_execution(
         db,
         search_id=search.id,

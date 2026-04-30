@@ -5,9 +5,24 @@
 .search-grid { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; gap: 1rem; }
 .search-form { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; }
 .results { min-height: 200px; }
-.trip-card { border: 1px solid var(--sleeper); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 0.6rem; background: #fff; cursor: pointer; }
+.trip-card { border: 1px solid var(--sleeper); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 0.6rem; background: #fff; cursor: pointer; transition: border-color 0.15s; }
 .trip-card:hover { border-color: var(--uic-blue); }
+.trip-card.expanded { border-color: var(--uic-blue); }
 .trip-card .top { display: flex; justify-content: space-between; align-items: center; }
+.legs-detail { margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px dashed var(--sleeper); display: none; }
+.trip-card.expanded .legs-detail { display: block; }
+.leg-row { display: grid; grid-template-columns: 7rem auto auto 1fr auto; gap: 0.6rem 0.8rem; padding: 0.4rem 0; align-items: baseline; font-size: 0.85rem; border-bottom: 1px dotted #eee; }
+.leg-row:last-child { border-bottom: none; }
+.leg-mode { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; padding: 1px 6px; border-radius: 3px; align-self: start; white-space: nowrap; }
+.leg-mode.WALK { background: #f0eee9; color: #5a4a3a; }
+.leg-mode.RAIL, .leg-mode.TRAIN { background: #fdecef; color: #b30021; }
+.leg-mode.SUBWAY, .leg-mode.METRO { background: #e8f0fb; color: #1F3B66; }
+.leg-mode.TRAM { background: #fff8e1; color: #b3760e; }
+.leg-mode.BUS { background: #e9f6ec; color: #1a7e3c; }
+.leg-time { color: var(--rail-steel); font-family: ui-monospace, Menlo, Consolas, monospace; }
+.leg-route { font-weight: 600; }
+.leg-stops { color: #333; }
+.leg-meta { color: var(--rail-steel); font-size: 0.78rem; text-align: right; }
 .flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
 .flag.ALL        { background: #e9f6ec; color: #1a7e3c; }
 .flag.NAP-ONLY   { background: #fdecef; color: #b30021; }
@@ -152,26 +167,70 @@ function dur(s) {
   return h ? `${h}h ${m}m` : `${m}m`;
 }
 
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+}
+function escHTML(s) { return (s == null ? '' : String(s)).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function fmtDistance(m) {
+  if (!m || m < 1) return '';
+  if (m < 1000) return ` · ${Math.round(m)} m`;
+  return ` · ${(m/1000).toFixed(1)} km`;
+}
+
+function legsHTML(legs) {
+  // One row per leg. Walking is shown as a short hop; transit shows route name + stops.
+  return legs.map(lg => {
+    const mode = lg.mode || '?';
+    const route = lg.route_short_name
+      ? `${escHTML(lg.route_short_name)}${lg.route_long_name ? ' <span style="color:var(--rail-steel); font-weight: normal">' + escHTML(lg.route_long_name) + '</span>' : ''}`
+      : (mode === 'WALK' ? 'Walk' : escHTML(mode));
+    const stops = `${escHTML(lg.from_name || '—')} <span style="color:var(--rail-steel)">→</span> ${escHTML(lg.to_name || '—')}`;
+    return `<div class="leg-row">
+      <span class="leg-mode ${escHTML(mode)}">${escHTML(mode)}</span>
+      <span class="leg-time">${fmtTime(lg.departure)} → ${fmtTime(lg.arrival)}</span>
+      <span class="leg-route">${route}</span>
+      <span class="leg-stops">${stops}</span>
+      <span class="leg-meta">${dur(lg.duration_seconds)}${fmtDistance(lg.distance_meters)}</span>
+    </div>`;
+  }).join('');
+}
+
 function render(payload) {
   const el = document.getElementById('results');
   const exec = payload.executions.map(e =>
     `${e.session_id}: ${e.num_itineraries} trips in ${e.response_ms}ms (${e.status})`
   ).join(' · ');
-  const cards = payload.trips.map(t => {
+  const cards = payload.trips.map((t, i) => {
     const flag = t.origin_flag.replace('_', '-');
-    return `<div class="trip-card">
+    const legCount = t.best.legs.length;
+    return `<div class="trip-card" data-trip-index="${i}">
       <div class="top">
         <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
              <span style="color: var(--rail-steel)"> · ${dur(t.best.duration_seconds)}</span></div>
         <span class="flag ${flag}">${t.origin_flag}</span>
       </div>
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
-        ${t.best.modes || '—'} · ${t.best.legs.length} leg${t.best.legs.length===1?'':'s'} ·
-        Found in: ${t.found_in_sessions.join(', ')}
+        ${t.best.modes || '—'} · ${legCount} leg${legCount===1?'':'s'} ·
+        Found in: ${t.found_in_sessions.join(', ')} ·
+        <span style="color: var(--uic-blue)">▸ click for leg detail</span>
+      </div>
+      <div class="legs-detail">
+        ${legsHTML(t.best.legs)}
       </div>
     </div>`;
   }).join('');
   el.innerHTML = `<div class="timing-strip">${exec}</div>${cards || '<p>No itineraries found.</p>'}`;
+  // Wire click-to-expand on every card. Toggle on each click; only one
+  // open at a time keeps the scroll position predictable.
+  el.querySelectorAll('.trip-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const wasOpen = card.classList.contains('expanded');
+      el.querySelectorAll('.trip-card.expanded').forEach(c => c.classList.remove('expanded'));
+      if (!wasOpen) card.classList.add('expanded');
+    });
+  });
 }
 </script>
 {% endblock %}

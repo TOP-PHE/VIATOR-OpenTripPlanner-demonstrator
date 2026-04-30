@@ -28,9 +28,17 @@ log = logging.getLogger(__name__)
 # `routingErrors` is included explicitly so we can surface OTP's own
 # diagnostics (LOCATION_NOT_FOUND, WALKING_BETTER_THAN_TRANSIT, etc.)
 # back to the operator instead of treating them as silent empty results.
+#
+# numItineraries: 8 — operators usually want to see "next several trains"
+# not just the first match, especially for hourly TGV service.
+# searchWindow: 14400 (4 hours, in seconds) — OTP's default search window
+# adapts but tends to be ~1h on long-distance routes; explicitly widening
+# pulls more departures into the result set. Trade-off: slightly slower
+# queries (typically still <1 s for inter-city), but the demonstrator
+# value of seeing 6-8 alternatives outweighs it.
 _QUERY = """
 query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $time: String) {
-  plan(from: $from, to: $to, date: $date, time: $time, numItineraries: 5) {
+  plan(from: $from, to: $to, date: $date, time: $time, numItineraries: 8, searchWindow: 14400) {
     itineraries {
       duration
       startTime
@@ -41,7 +49,9 @@ query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $tim
         endTime
         from { name lat lon stop { gtfsId } }
         to   { name lat lon stop { gtfsId } }
-        route { shortName }
+        route { shortName longName }
+        duration
+        distance
       }
     }
     routingErrors { code description }
@@ -92,7 +102,22 @@ async def fetch_plan(
 
 
 def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Translate OTP's response into the recorder's `trips` format."""
+    """Translate OTP's response into the recorder's `trips` format.
+
+    Per-leg fields captured (all optional — defensively coerced):
+
+      mode               WALK / RAIL / SUBWAY / BUS / etc.
+      departure / arrival  ISO 8601 UTC; OTP gives epoch ms, we convert
+      duration_seconds   leg duration; useful for expandable detail UI
+      distance_meters    leg distance (walking only meaningful for WALK)
+      from_name/lat/lon/stop_id  origin endpoint
+      to_name/lat/lon/stop_id    destination endpoint
+      route_short_name / route_long_name  e.g. "601A" / "Paris - Lyon TGV"
+
+    The journey UI's expandable detail (v0.1.7.x) reads these directly.
+    Keep the field shapes stable — they're stored verbatim in
+    `journey_trips.legs` (JSONB) for replay / audit.
+    """
     its = (((raw or {}).get("data") or {}).get("plan") or {}).get("itineraries") or []
     out: list[dict[str, Any]] = []
     for it in its:
@@ -101,18 +126,24 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
         for leg in it.get("legs", []):
             f = leg.get("from") or {}
             t = leg.get("to") or {}
+            route = leg.get("route") or {}
             legs_norm.append(
                 {
                     "mode": leg.get("mode"),
                     "departure": _ms_to_iso(leg.get("startTime")),
                     "arrival": _ms_to_iso(leg.get("endTime")),
-                    "from_stop_id": ((f.get("stop") or {}).get("gtfsId")),
-                    "to_stop_id": ((t.get("stop") or {}).get("gtfsId")),
+                    "duration_seconds": int(leg.get("duration") or 0),
+                    "distance_meters": float(leg.get("distance") or 0.0),
+                    "from_name": f.get("name"),
                     "from_lat": f.get("lat"),
                     "from_lon": f.get("lon"),
+                    "from_stop_id": ((f.get("stop") or {}).get("gtfsId")),
+                    "to_name": t.get("name"),
                     "to_lat": t.get("lat"),
                     "to_lon": t.get("lon"),
-                    "route_short_name": (leg.get("route") or {}).get("shortName"),
+                    "to_stop_id": ((t.get("stop") or {}).get("gtfsId")),
+                    "route_short_name": route.get("shortName"),
+                    "route_long_name": route.get("longName"),
                 }
             )
             if leg.get("mode"):
