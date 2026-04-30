@@ -100,7 +100,14 @@ case "$MODE" in
                 case "$OSM_SCOPE" in
                     transit-focused)
                         echo "OSM filter: transit-focused — running osmium tags-filter on $(basename "$pbf_in")"
-                        osmium tags-filter --quiet --overwrite \
+                        # Note on flags: `--quiet` was tried in v0.1.5 but
+                        # osmium 1.16.x's `tags-filter` doesn't accept it
+                        # — only `--no-progress` exists, and even that's
+                        # noise-suppression we don't actually need (the
+                        # progress bar prints periodic %-done lines to
+                        # stderr that are useful for build observability).
+                        # Default verbosity is fine.
+                        osmium tags-filter --overwrite \
                             -o "$pbf_out" "$pbf_in" \
                             'highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,pedestrian,footway,path,steps,cycleway,road,motorway_link,trunk_link,primary_link,secondary_link,tertiary_link' \
                             'railway' \
@@ -110,7 +117,7 @@ case "$MODE" in
                         ;;
                     multi-modal)
                         echo "OSM filter: multi-modal — running osmium tags-filter on $(basename "$pbf_in")"
-                        osmium tags-filter --quiet --overwrite \
+                        osmium tags-filter --overwrite \
                             -o "$pbf_out" "$pbf_in" \
                             'highway' \
                             'railway' \
