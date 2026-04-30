@@ -362,12 +362,19 @@ def delete_session(
     db.query(Upload).filter(Upload.session_id == sid).delete(synchronize_session=False)
     db.query(RebuildJob).filter(RebuildJob.session_id == sid).delete(synchronize_session=False)
     db.delete(s)
+    # Force the unit-of-work to flush BEFORE the orchestrator queries
+    # SELECT * FROM sessions. Without this, the orchestrator sees the
+    # to-be-deleted session as still present (autoflush doesn't always
+    # fire reliably across `db.delete()` + a sibling SELECT in the
+    # same transaction, and the consequence is a generated
+    # nginx-sessions.conf that still references the dead `otp-<sid>`
+    # upstream — nginx then refuses to reload with "host not found in
+    # upstream" until someone wipes the file manually).
+    db.flush()
 
     # Re-run the orchestrator so the deleted session drops out of the
     # compose + nginx fragments. Done before commit so any DB-side
-    # constraint failure rolls back the orchestrator change too (the
-    # orchestrator queries the same DB, so a not-yet-committed delete
-    # is visible).
+    # constraint failure rolls back the orchestrator change too.
     sessions_orchestrator.regenerate(db)
 
     # ── Filesystem cleanup ─────────────────────────────────────────
