@@ -37,13 +37,37 @@ case "$MODE" in
         trap 'rm -rf "$BUILD_DIR"' EXIT
 
         echo "Staging build inputs from $INBOX_DIR ..."
-        # GTFS bundles
+        # Transit feeds — staged with per-format type tracking so the
+        # build-config generator below picks the right OTP `transitFeeds.type`
+        # value per file. GTFS files land in inbox/<sid>/gtfs/, NeTEx (Nordic
+        # / EPIP) in inbox/<sid>/netex/. NeTEx-FR is intentionally never
+        # plumbed into BUILD_DIR — it's archive-only because OTP can't read
+        # it; operators wanting NeTEx-FR for compliance use the manual
+        # upload path which dispatches to inbox/<sid>/archive/.
+        TRANSIT_FEEDS_JSON=""
+        _append_feed_entry() {
+            local entry="$1"
+            if [ -n "$TRANSIT_FEEDS_JSON" ]; then
+                TRANSIT_FEEDS_JSON="$TRANSIT_FEEDS_JSON,$entry"
+            else
+                TRANSIT_FEEDS_JSON="$entry"
+            fi
+        }
         if compgen -G "$INBOX_DIR/gtfs/*.zip" > /dev/null; then
-            cp "$INBOX_DIR"/gtfs/*.zip "$BUILD_DIR/"
+            for src in "$INBOX_DIR"/gtfs/*.zip; do
+                cp "$src" "$BUILD_DIR/"
+                stem="$(basename "$src" .zip)"
+                feed_id="$(printf %s "$stem" | tr '[:lower:]' '[:upper:]')"
+                _append_feed_entry "{\"type\":\"gtfs\",\"feedId\":\"$feed_id\",\"source\":\"$stem.zip\"}"
+            done
         fi
-        # NeTEx bundles (only Nordic / EPIP — never NeTEx-FR until a converter exists)
         if compgen -G "$INBOX_DIR/netex/*.zip" > /dev/null; then
-            cp "$INBOX_DIR"/netex/*.zip "$BUILD_DIR/"
+            for src in "$INBOX_DIR"/netex/*.zip; do
+                cp "$src" "$BUILD_DIR/"
+                stem="$(basename "$src" .zip)"
+                feed_id="$(printf %s "$stem" | tr '[:lower:]' '[:upper:]')"
+                _append_feed_entry "{\"type\":\"netex\",\"feedId\":\"$feed_id\",\"source\":\"$stem.zip\"}"
+            done
         fi
         # Street network — staged into BUILD_DIR. If the operator picked
         # an OSM scope other than 'comprehensive', we run osmium-tool
@@ -100,30 +124,15 @@ case "$MODE" in
 
         cp /opt/otp/router-config.json "$BUILD_DIR/"
 
-        # Generate build-config.json from the GTFS files that landed in
-        # BUILD_DIR. One transitFeeds entry per .zip; feedId derived from the
-        # filename stem, uppercased. Single-feed sessions stage at `gtfs.zip`
-        # and produce feedId=GTFS. Multi-feed sessions stage as `<feed_id_lower>.zip`
-        # (e.g. `sncf.zip`, `idfm.zip`, `trenitalia.zip`) and produce one
-        # feedId per file (SNCF, IDFM, TRENITALIA). The OSM section is fixed
-        # — exactly one PBF per session, staged as `osm.pbf`.
+        # Generate build-config.json from the transit feeds we staged above.
+        # The TRANSIT_FEEDS_JSON variable was populated by the staging loops
+        # — each `_append_feed_entry` call added one `{"type":..., "feedId":...,
+        # "source":...}` entry, with type="gtfs" or type="netex" depending on
+        # which inbox subdir the file came from. OTP merges them all into a
+        # single graph at build time.
         #
-        # The bundled `/opt/otp/build-config.json` from the image is only
-        # used as a fallback when no GTFS zips exist (keeps the entrypoint
-        # working for an OSM-only build, even though that's a degenerate
-        # case OTP itself rejects with "no transit data").
-        TRANSIT_FEEDS_JSON=""
-        for zip in "$BUILD_DIR"/*.zip; do
-            [ -f "$zip" ] || continue
-            stem="$(basename "$zip" .zip)"
-            feed_id="$(printf %s "$stem" | tr '[:lower:]' '[:upper:]')"
-            entry="{\"type\":\"gtfs\",\"feedId\":\"$feed_id\",\"source\":\"$stem.zip\"}"
-            if [ -n "$TRANSIT_FEEDS_JSON" ]; then
-                TRANSIT_FEEDS_JSON="$TRANSIT_FEEDS_JSON,$entry"
-            else
-                TRANSIT_FEEDS_JSON="$entry"
-            fi
-        done
+        # The bundled `/opt/otp/build-config.json` is the no-feeds fallback
+        # (degenerate case OTP itself rejects with "no transit data").
         if [ -n "$TRANSIT_FEEDS_JSON" ]; then
             echo "Generating build-config.json with feeds: $TRANSIT_FEEDS_JSON"
             cat > "$BUILD_DIR/build-config.json" <<JSON
@@ -139,7 +148,7 @@ case "$MODE" in
 }
 JSON
         else
-            echo "No GTFS zips found; falling back to baked build-config.json"
+            echo "No transit feeds found; falling back to baked build-config.json"
             cp /opt/otp/build-config.json "$BUILD_DIR/"
         fi
 

@@ -601,19 +601,28 @@ sources** form:
 
 | Field | Value |
 |---|---|
-| GTFS feeds | one row: `id=SNCF`, `url=https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip` |
+| Provider 1 — ID | `SNCF` |
+| Provider 1 — Label | `SNCF Trains` |
+| Provider 1 — Country | `FR` |
+| Provider 1 — Timetable format | `GTFS` |
+| Provider 1 — Timetable URL | `https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip` |
+| Provider 1 — GTFS-RT alerts URL | `https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-alerts` (optional) |
+| Provider 1 — GTFS-RT trip-updates URL | `https://proxy.transport.data.gouv.fr/resource/sncf-gtfs-rt-trip-updates` (optional) |
+| Provider 1 — MCT URL | leave blank |
+| Provider 1 — Stations CSV URL | leave blank |
 | OSM PBF URL | `https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf` |
-| MCT URL | (leave blank for now) |
-| Stations CSV URL | (leave blank for now) |
+| OSM scope | `Transit-focused (recommended)` |
 
-> **Multi-feed sessions** (since v0.1.4) — click **+ Add GTFS feed** to layer
-> additional providers into the same OTP graph. Each feed gets its own ID
+> **Multi-provider sessions** (since v0.1.6) — click **+ Add provider** to layer
+> additional railways into the same OTP graph. Each provider gets its own ID
 > (uppercase, A-Z 0-9 _ - , 2-16 chars — becomes the OTP `feedId` prefix
-> on stop_ids) and URL. OTP auto-generates walking transfers between stops
-> within ~200 m, so cross-operator continuations (TGV Paris-Lyon → IDFM
-> RER B → CDG, or TGV Paris → Trenitalia Milano via Bardonecchia) just
-> work — no extra configuration. The OSM PBF must cover every region your
-> feeds reach. Recommended starter combinations:
+> on stop_ids), label, country (ISO-2), timetable URL + format (GTFS or
+> NeTEx-Nordic / EPIP), plus optional GTFS-RT URLs, MCT, and stations CSV.
+> OTP auto-generates walking transfers between stops within ~200 m, so
+> cross-operator continuations (TGV Paris-Lyon → IDFM RER B → CDG, or
+> TGV Paris → Trenitalia Milano via Bardonecchia) just work — no extra
+> configuration. The OSM PBF must cover every region your providers reach.
+> Recommended starter combinations:
 >
 > | Goal | Feeds | OSM |
 > |---|---|---|
@@ -762,6 +771,8 @@ session's origin flag.
 | `plan(...)` returns one WALK-only itinerary with `routingErrors: [{code: "WALKING_BETTER_THAN_TRANSIT"}]` for two stations clearly served by transit | The GTFS you loaded doesn't contain the line that connects them (e.g. SNCF intercity GTFS for two Paris terminals — no SNCF mainline runs between Gare du Nord and Gare de Lyon) | This is correct behaviour for the dataset; for urban Paris routing add IDFM's GTFS as a second feed in the same session (multi-feed, since v0.1.4) or as a separate session. |
 | "Save config" toast says `Feed id "..." must be uppercase…` | Feed ID didn't match `^[A-Z][A-Z0-9_-]{1,15}$` | Use uppercase only, no spaces, 2-16 chars. `SNCF`, `IDFM`, `TRENITALIA`, `FR-SNCF`, `DB_FERN`. Becomes the OTP `feedId` namespace on every stop_id from that feed (e.g. `SNCF:OCETrain-87271007`). |
 | Refresh sources skips a feed with `invalid gtfs config: feed id "X" appears twice` | Two rows in the GTFS feeds list have the same ID | Rename one — feed IDs must be unique within a session. The OTP graph build would otherwise refuse to start. |
+| Save config returns `409 missing_master_stations_for_countries` (since v0.1.6) | A provider declares `country_iso=X` but `master_stations` has zero rows for X | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline** (which covers most European countries). Wait for the toast confirming the import completed. Then retry **Save config**. |
+| Need to refresh just one provider's data without re-downloading the others (since v0.1.6) | Clicking "Refresh all sources" pulls every provider | Each provider card has a **⤴ Refresh this provider** button — downloads only that provider's timetable + MCT + stations CSV. OSM PBF stays untouched. |
 | Build log shows `Generating build-config.json with feeds: {…SNCF…}{…IDFM…}` and finishes ok, but a journey query returns no itineraries | Routing across feeds requires the connecting stops to be within OTP's `maxTransferDistance` (default ~200 m) — far enough apart and OTP doesn't generate the walking transfer | Check coordinates: e.g. SNCF and IDFM versions of "Paris Gare du Nord" must be in the same place. If the GTFS lat/lons disagree, OTP won't connect them. The fix is operator-side (correct GTFS data) or wait for v0.1.5 station-aliasing. |
 
 ---

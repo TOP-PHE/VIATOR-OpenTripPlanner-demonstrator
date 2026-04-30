@@ -33,12 +33,12 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session as DbSession
 
 from ... import audit, detect, ingestion, sessions_orchestrator
 from ...db import get_db
-from ...models import RebuildJob, Upload
+from ...models import MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionState
 from ...security import (
@@ -192,6 +192,48 @@ def patch_session(
                 body.config["osm_scope"] = osm_filter.validate_scope(body.config["osm_scope"])
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
+
+        # Validate provider bundles (v0.1.6) on save. We accept the legacy
+        # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),
+        # but for save-time validation we only error on the v0.1.6-shaped
+        # providers list since that's what the v0.1.6 UI emits. Legacy
+        # shapes pass through unmodified (they'll be migrated on next
+        # PATCH that uses the new UI).
+        if isinstance(body.config.get("sources"), dict) and "providers" in body.config["sources"]:
+            try:
+                providers = ingestion.normalize_providers(body.config)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            # Country-gate: every provider that declares country_iso=X must
+            # have at least one master_stations row with country_iso=X.
+            # Operator-driven: fail save with a clear message that includes
+            # which countries are missing AND suggests the Trainline-import
+            # action. UI surfaces this as a prompt with a one-click button.
+            declared_countries = {
+                p["country_iso"] for p in providers if p["country_iso"]
+            }
+            if declared_countries:
+                missing = _countries_without_stations(db, declared_countries)
+                if missing:
+                    raise HTTPException(
+                        409,  # Conflict — semantically "preconditions not met"
+                        detail={
+                            "error": "missing_master_stations_for_countries",
+                            "missing_countries": sorted(missing),
+                            "message": (
+                                "Cannot save: no master_stations rows for "
+                                f"{sorted(missing)}. Import them from Trainline "
+                                "first (POST /api/master/stations/refresh-trainline), "
+                                "then retry this save."
+                            ),
+                        },
+                    )
+            # All checks passed — write back the canonicalised provider
+            # list (drops empty fields, normalises country to upper-case,
+            # etc.). Operator never sees the cleanup; the next GET returns
+            # the normalised shape.
+            body.config["sources"]["providers"] = providers
+
         changes["config"] = {"from": s.config, "to": body.config}
         s.config = body.config
     if body.include_in_fanout is not None and body.include_in_fanout != s.include_in_fanout:
@@ -359,6 +401,25 @@ async def upload_to_session(
     )
 
 
+def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
+    """Return the subset of `declared` ISO codes that have ZERO rows in
+    master_stations. Used by the country-gate at session-config-save time.
+
+    Empty input → empty output (cheap path; spares the round-trip).
+    Cheap-ish single SELECT GROUP BY query — covers the common case (all
+    countries already imported, returns no missing) at near-zero cost.
+    """
+    if not declared:
+        return set()
+    rows = db.execute(
+        select(MasterStation.country_iso, func.count())
+        .where(MasterStation.country_iso.in_(declared))
+        .group_by(MasterStation.country_iso)
+    ).all()
+    present = {ci for ci, count in rows if count > 0}
+    return declared - present
+
+
 def _safe_filename(name: str) -> str:
     """Strip path components and dodgy chars from an uploaded filename."""
     base = Path(name).name
@@ -419,75 +480,21 @@ async def refresh_sources(
     fetched: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    # Flatten the sources dict into (key, url, feed_id_or_None, staged_filename)
-    # tuples. Multi-feed GTFS expands to one tuple per feed; everything else is
-    # a single tuple. Order is determined by dict-insertion order, which Python
-    # 3.7+ guarantees is stable, so SNCF before IDFM before TRENITALIA the way
-    # the operator typed them.
-    work: list[tuple[str, str, str | None, str | None]] = []
-    for key, value in sources.items():
-        if key == "gtfs":
-            try:
-                feeds = ingestion.normalize_gtfs_sources(value)
-            except ValueError as exc:
-                skipped.append({"key": "gtfs", "reason": f"invalid gtfs config: {exc}"})
-                continue
-            for feed in feeds:
-                fid = feed["id"]
-                work.append((f"gtfs[{fid}]", feed["url"], fid, ingestion.gtfs_staged_filename(fid)))
-            continue
-        # Non-GTFS keys: simple scalar URL.
-        if not isinstance(value, str):
-            skipped.append({"key": key, "reason": f"expected a URL string, got {type(value).__name__}"})
-            continue
-        work.append((key, value, None, None))
+    # Build a flat list of download tasks from the session's sources.
+    # Each task: (response-key-label, kind, url, feed_id_or_None, staged_filename_or_None).
+    # Provider-bundle shape (v0.1.6) and legacy flat shapes (v0.1.4 / pre)
+    # both end up here; downstream handling is identical.
+    work = _build_refresh_tasks(s.config or {})
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for key, url, feed_id, staged_filename in work:
-            # `key` here is the surface label used in the response payload —
-            # `gtfs[SNCF]` for multi-feed entries, `gtfs` / `osm_pbf` / etc.
-            # for single-source ones. The kind lookup uses the bracket-stripped
-            # form so every gtfs[*] entry resolves to GTFS.
-            base_key = key.split("[", 1)[0]
-            kind = _SOURCE_KEY_TO_KIND.get(base_key)
-            if kind is None:
-                skipped.append({"key": key, "reason": f"unknown source key {base_key!r}"})
-                continue
-            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-                skipped.append({"key": key, "url": url, "reason": "not an http(s) URL"})
-                continue
-
-            ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            staged_name = f"{ts}-{base_key}{('-' + feed_id) if feed_id else ''}{_url_suffix(url)}"
-            staged_path = staging / staged_name
-            try:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
-                    with staged_path.open("wb") as out:
-                        async for chunk in response.aiter_bytes(1024 * 1024):
-                            out.write(chunk)
-            except httpx.HTTPError as exc:
-                staged_path.unlink(missing_ok=True)
-                skipped.append({"key": key, "url": url, "reason": f"download failed: {exc}"})
-                continue
-
-            size_bytes = _stat_size(staged_path)
-            # detect.detect can be slow on large OSM PBFs; we trust the
-            # configured key here since the operator picked it. `staged_filename`
-            # is None for everything except multi-feed GTFS — dispatch falls
-            # back to the canonical default per kind.
-            ingestion.dispatch(
-                staged_path,
-                kind,
-                db,
-                session_id=sid,
-                staged_filename=staged_filename,
+        for task in work:
+            outcome = await _refresh_one_task(
+                client, db, sid, staging, task,
             )
-            staged_path.unlink(missing_ok=True)
-
-            fetched.append(
-                {"key": key, "kind": kind, "url": url, "size_bytes": size_bytes}
-            )
+            if outcome.get("status") == "fetched":
+                fetched.append({k: v for k, v in outcome.items() if k != "status"})
+            else:
+                skipped.append({k: v for k, v in outcome.items() if k != "status"})
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
@@ -519,6 +526,205 @@ def _stat_size(p: Path) -> int:
         return p.stat().st_size
     except OSError:
         return 0
+
+
+# ──── refresh task model — used by both session-wide and per-provider ────
+
+
+# Per-task tuple shape: (label, kind, url, staged_filename_or_None).
+# `label` is what we surface in the API response — operators see things
+# like `gtfs[SNCF]` (multi-feed legacy) or `provider[SNCF].timetable`
+# (provider-bundle v0.1.6) or `provider[SNCF].mct` etc., not just bare keys.
+_RefreshTask = tuple[str, str, str, str | None]
+
+
+def _build_refresh_tasks(config: dict[str, Any], *, only_provider: str | None = None) -> list[_RefreshTask]:
+    """Flatten a session config into a list of download tasks.
+
+    `only_provider`, when set, filters to that provider's tasks only —
+    used by the per-provider refresh endpoint. None means "everything".
+    Session-level OSM PBF refresh is *only* included when only_provider
+    is None (per-provider refresh leaves OSM alone — different concern).
+
+    Two input shapes:
+      A. v0.1.6 native — `sources.providers = [{...}]` plus session-level
+         `sources.osm_pbf`. Each provider contributes 1-3 tasks (timetable,
+         mct, stations_csv) depending on what's set.
+      B. v0.1.4 / pre — flat `sources.gtfs/osm_pbf/mct/stations`. Lifted
+         into the same task tuples via normalize_providers.
+    """
+    sources = config.get("sources") or {}
+    if not isinstance(sources, dict):
+        return []
+
+    tasks: list[_RefreshTask] = []
+
+    # Provider tasks (multi-format timetable + optional mct/stations).
+    try:
+        providers = ingestion.normalize_providers(config)
+    except ValueError:
+        # Operator has saved a malformed shape via raw API — skip provider
+        # tasks rather than crash refresh. Country-gate / save-time
+        # validation is the right place to surface the error; here we
+        # just degrade gracefully.
+        providers = []
+
+    for p in providers:
+        if only_provider is not None and p["id"] != only_provider:
+            continue
+        pid = p["id"]
+        tt = p.get("timetable") or {}
+        tt_url = tt.get("url")
+        tt_fmt = tt.get("format", "gtfs")
+        if tt_url:
+            kind = ingestion.TIMETABLE_FORMAT_DETAILS[tt_fmt]["kind"]
+            tasks.append((
+                f"provider[{pid}].timetable({tt_fmt})",
+                kind,
+                tt_url,
+                ingestion.staged_filename_for_format(pid, tt_fmt),
+            ))
+        if p.get("mct_url"):
+            tasks.append((f"provider[{pid}].mct", "SNCF-MCT", p["mct_url"], None))
+        if p.get("stations_csv_url"):
+            tasks.append((
+                f"provider[{pid}].stations_csv",
+                "SNCF-Stations",
+                p["stations_csv_url"],
+                None,
+            ))
+
+    # Session-level OSM PBF (only on full refresh, not per-provider).
+    if only_provider is None and isinstance(sources.get("osm_pbf"), str) and sources["osm_pbf"]:
+        tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None))
+
+    return tasks
+
+
+async def _refresh_one_task(
+    client: httpx.AsyncClient,
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    task: _RefreshTask,
+) -> dict[str, Any]:
+    """Run one download+dispatch task. Returns a dict for the response —
+    `status: fetched` or `status: skipped`. Wrapped error handling so the
+    per-task failure doesn't abort the rest of the batch.
+    """
+    label, kind, url, staged_filename = task
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return {"status": "skipped", "key": label, "url": url, "reason": "not an http(s) URL"}
+
+    base_key = label.split("[", 1)[0]
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    staged_name = f"{ts}-{base_key}{_url_suffix(url)}"
+    staged_path = staging / staged_name
+    try:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with staged_path.open("wb") as out:
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    out.write(chunk)
+    except httpx.HTTPError as exc:
+        staged_path.unlink(missing_ok=True)
+        return {"status": "skipped", "key": label, "url": url, "reason": f"download failed: {exc}"}
+
+    size_bytes = _stat_size(staged_path)
+    try:
+        ingestion.dispatch(
+            staged_path, kind, db,
+            session_id=sid,
+            staged_filename=staged_filename,
+        )
+    except Exception as exc:
+        staged_path.unlink(missing_ok=True)
+        return {"status": "skipped", "key": label, "url": url, "reason": f"dispatch failed: {exc}"}
+
+    staged_path.unlink(missing_ok=True)
+    return {"status": "fetched", "key": label, "kind": kind, "url": url, "size_bytes": size_bytes}
+
+
+# ──── per-provider refresh endpoint (v0.1.6) ────
+
+
+@router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
+async def refresh_provider(
+    sid: str,
+    pid: str,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> RefreshSourcesResponse:
+    """Download just one provider's files (timetable + optional MCT + optional
+    stations CSV). Doesn't touch the session-level OSM PBF — different concern,
+    much heavier file.
+
+    Use case: operator just added IDFM to a session that already has SNCF
+    serving live. They click "Refresh" on IDFM's card and only IDFM's URLs
+    are fetched. SNCF stays live without unnecessary re-download.
+
+    Side effect: dispatch() queues a rebuild iff a routable kind landed
+    (GTFS or NeTEx). Worker debounces and runs phase-1-cached / phase-2 only
+    in v0.1.7 once streetGraph caching ships; today still runs both phases.
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    if actor.id is None:
+        raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
+
+    # Confirm the provider exists in this session's config — otherwise we'd
+    # silently no-op, which is a worse UX than 404.
+    try:
+        providers = ingestion.normalize_providers(s.config or {})
+    except ValueError as exc:
+        raise HTTPException(400, f"Session config is invalid: {exc}") from exc
+    if not any(p["id"] == pid for p in providers):
+        raise HTTPException(
+            404,
+            f"Provider {pid!r} not found in session {sid!r}. "
+            f"Known providers: {[p['id'] for p in providers]}",
+        )
+
+    staging = settings.inbox_dir / sid / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    work = _build_refresh_tasks(s.config or {}, only_provider=pid)
+    if not work:
+        raise HTTPException(
+            400,
+            f"Provider {pid!r} has no URLs to refresh "
+            "(no timetable, MCT, or stations CSV configured).",
+        )
+
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            outcome = await _refresh_one_task(client, db, sid, staging, task)
+            (fetched if outcome.get("status") == "fetched" else skipped).append(
+                {k: v for k, v in outcome.items() if k != "status"}
+            )
+
+    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        s.state = SessionState.POPULATED.value
+
+    audit.record(
+        db,
+        action="session.provider.refreshed",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "provider_id": pid,
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+        },
+    )
+    db.commit()
+    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
 
 
 # ───────────────────────── rebuilds ─────────────────────────

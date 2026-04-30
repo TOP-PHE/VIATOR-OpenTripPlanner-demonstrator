@@ -56,6 +56,24 @@ STAGE_INTO_OTP_INBOX_FILENAME: dict[str, str] = {
 # the lowercased form (case-insensitive filesystems on macOS/Windows would
 # otherwise collide on rename).
 _FEED_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]{1,15}$")
+_COUNTRY_ISO_RE = re.compile(r"^[A-Z]{2}$")
+
+# Timetable formats OTP can ingest natively. NeTEx-FR is intentionally not
+# in this set — OTP doesn't read it, so accepting it for routing would be
+# a footgun. Operators wanting NeTEx-FR archive-only (compliance) should
+# still use the manual upload path with `declared_standard=NeTEx-FR-…`,
+# which dispatches to `inbox/<sid>/archive/` and never touches OTP.
+_OTP_TIMETABLE_FORMATS: frozenset[str] = frozenset({"gtfs", "netex_nordic", "netex_epip"})
+
+# The OTP entrypoint's build-config generator reads each timetable file
+# from one of these subdirs (the v0.1.4 single-feed code already did this
+# for gtfs/; netex/ is now wired through the same path). Per-format inbox
+# subdir + per-format `transitFeeds.type` value for build-config.json.
+TIMETABLE_FORMAT_DETAILS: dict[str, dict[str, str]] = {
+    "gtfs":         {"subdir": "gtfs",  "otp_type": "gtfs",  "kind": "GTFS"},
+    "netex_nordic": {"subdir": "netex", "otp_type": "netex", "kind": "NeTEx-Nordic"},
+    "netex_epip":   {"subdir": "netex", "otp_type": "netex", "kind": "NeTEx-EPIP"},
+}
 
 # Stored but does NOT trigger an OTP rebuild (Phase 6 — see strategy doc).
 ARCHIVE_ONLY: set[str] = {
@@ -129,6 +147,200 @@ def gtfs_staged_filename(feed_id: str) -> str:
     the operator-facing feedId.
     """
     return f"{feed_id.lower()}.zip"
+
+
+def staged_filename_for_format(feed_id: str, fmt: str) -> str:
+    """Canonical inbox filename for any timetable format (GTFS or NeTEx).
+
+    Stem is the lowercased feed_id (case-insensitive FS safety); extension
+    is always .zip — both GTFS and NeTEx ship as ZIP archives. The dispatch
+    target subdir is determined by the format (`gtfs/` vs `netex/`), which
+    keeps the entrypoint's build-config generator able to assign the right
+    OTP `transitFeeds.type` value when scanning each subdir.
+    """
+    if fmt not in _OTP_TIMETABLE_FORMATS:
+        raise ValueError(
+            f"Unknown timetable format {fmt!r}. Valid: {sorted(_OTP_TIMETABLE_FORMATS)}"
+        )
+    return f"{feed_id.lower()}.zip"
+
+
+# ──────────────────── Provider-bundle schema (v0.1.6) ────────────────────
+
+
+def normalize_providers(raw_config: dict) -> list[dict]:
+    """Coerce `config.sources` into a canonical providers list.
+
+    Three input shapes accepted, in order of precedence:
+
+      A. v0.1.6 native — `sources.providers = [{...}, ...]`. Pass through
+         after validation.
+      B. v0.1.4 multi-feed — `sources.gtfs = [{id, url}, ...]` plus optional
+         `sources.mct`, `sources.stations`. Lifted into one provider per
+         GTFS entry; the first provider inherits any session-level mct /
+         stations URLs (operator can move them around afterwards).
+      C. Pre-v0.1.4 single-feed — `sources.gtfs = "<url>"`. Wrapped into a
+         single provider with id="GTFS".
+
+    Raises ValueError on schema problems with a UI-friendly message.
+
+    Each provider in the returned list has:
+      - id              str   /^[A-Z][A-Z0-9_-]{1,15}$/   — OTP feedId namespace
+      - label           str   operator-facing name (often the railway's brand)
+      - country_iso     str|None  uppercase 2-letter ISO; the country-gate
+                                  check at session-save time refuses save
+                                  when no master_stations rows exist for
+                                  the declared country (v0.1.6)
+      - timetable       dict   {format: gtfs|netex_nordic|netex_epip, url?: str}
+      - gtfs_rt         dict   {alerts_url?, trip_updates_url?, vehicle_positions_url?}
+      - mct_url         str|None
+      - stations_csv_url str|None
+
+    The reverse direction (legacy → canonical) does NOT mutate operator-
+    saved data — it's a runtime convenience. Saving a provider list back
+    via PATCH /api/sessions/{sid}/config writes the v0.1.6 shape.
+    """
+    sources = raw_config.get("sources") or {}
+    if not isinstance(sources, dict):
+        raise ValueError(f"config.sources must be an object, got {type(sources).__name__}")
+
+    # Path A — v0.1.6 native shape.
+    if "providers" in sources:
+        raw_providers = sources["providers"]
+        if not isinstance(raw_providers, list):
+            raise ValueError(
+                "config.sources.providers must be a list of provider objects"
+            )
+        seen_ids: set[str] = set()
+        out_providers: list[dict] = []
+        for i, p in enumerate(raw_providers):
+            cleaned = _validate_provider(p, i)
+            if cleaned["id"] in seen_ids:
+                raise ValueError(f"provider id {cleaned['id']!r} appears twice")
+            seen_ids.add(cleaned["id"])
+            out_providers.append(cleaned)
+        return out_providers
+
+    # Path B/C — legacy lift. Reuse normalize_gtfs_sources for the GTFS
+    # shape coercion (handles both list and string).
+    feeds = normalize_gtfs_sources(sources.get("gtfs"))
+    if not feeds:
+        return []
+    providers: list[dict] = []
+    for i, feed in enumerate(feeds):
+        provider: dict = {
+            "id": feed["id"],
+            "label": feed["id"],  # operator can rename via UI
+            "country_iso": None,
+            "timetable": {"format": "gtfs", "url": feed["url"]},
+            "gtfs_rt": {},
+            "mct_url": None,
+            "stations_csv_url": None,
+        }
+        # First provider inherits the session-level mct + stations CSV URLs
+        # so a v0.1.4 SNCF session migrates cleanly. Subsequent providers
+        # start empty (operator moves them around if they belong elsewhere).
+        if i == 0:
+            if isinstance(sources.get("mct"), str) and sources["mct"]:
+                provider["mct_url"] = sources["mct"]
+            if isinstance(sources.get("stations"), str) and sources["stations"]:
+                provider["stations_csv_url"] = sources["stations"]
+        providers.append(provider)
+    return providers
+
+
+def _validate_provider(raw: object, index: int) -> dict:
+    """Validate one provider entry, returning the cleaned dict.
+
+    Run on every save (via the session-config PATCH endpoint) and on
+    every read where the migration from legacy shape happens. Strict
+    enough to catch operator typos, lenient enough to keep optional
+    fields actually optional (gtfs_rt, mct_url, stations_csv_url).
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"providers[{index}] must be an object")
+
+    # ── id ────────────────────────────────────────────────────────────
+    feed_id = (raw.get("id") or "").strip()
+    if not feed_id or not _FEED_ID_RE.match(feed_id):
+        raise ValueError(
+            f"providers[{index}].id={feed_id!r} must match "
+            "/^[A-Z][A-Z0-9_-]{1,15}$/ (e.g. SNCF, IDFM, TRENITALIA, FR-SNCF)"
+        )
+
+    # ── label ─────────────────────────────────────────────────────────
+    label = str(raw.get("label") or feed_id).strip() or feed_id
+
+    # ── country_iso ──────────────────────────────────────────────────
+    country_iso_raw = raw.get("country_iso")
+    country_iso: str | None = None
+    if country_iso_raw not in (None, ""):
+        ci = str(country_iso_raw).strip().upper()
+        if not _COUNTRY_ISO_RE.match(ci):
+            raise ValueError(
+                f"providers[{index}].country_iso={country_iso_raw!r} must be "
+                "a 2-letter ISO code (FR, DE, IT, ...)"
+            )
+        country_iso = ci
+
+    # ── timetable ────────────────────────────────────────────────────
+    tt = raw.get("timetable")
+    if not isinstance(tt, dict):
+        raise ValueError(
+            f"providers[{index}].timetable must be an object with format + url"
+        )
+    fmt = (tt.get("format") or "").strip().lower()
+    if fmt not in _OTP_TIMETABLE_FORMATS:
+        raise ValueError(
+            f"providers[{index}].timetable.format={fmt!r} must be one of "
+            f"{sorted(_OTP_TIMETABLE_FORMATS)} "
+            "(NeTEx-FR is intentionally excluded — OTP doesn't read it)"
+        )
+    url = (tt.get("url") or "").strip()
+    if url and not url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"providers[{index}].timetable.url={url!r} must be an http(s) URL "
+            "(or empty if the operator will upload manually)"
+        )
+    timetable: dict = {"format": fmt}
+    if url:
+        timetable["url"] = url
+
+    # ── gtfs_rt (optional) ───────────────────────────────────────────
+    gtfs_rt_raw = raw.get("gtfs_rt") or {}
+    if not isinstance(gtfs_rt_raw, dict):
+        raise ValueError(
+            f"providers[{index}].gtfs_rt must be an object "
+            "with optional alerts_url / trip_updates_url / vehicle_positions_url"
+        )
+    gtfs_rt: dict = {}
+    for key in ("alerts_url", "trip_updates_url", "vehicle_positions_url"):
+        v = (gtfs_rt_raw.get(key) or "").strip()
+        if v:
+            if not v.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"providers[{index}].gtfs_rt.{key}={v!r} must be an http(s) URL"
+                )
+            gtfs_rt[key] = v
+
+    # ── mct_url, stations_csv_url (optional) ─────────────────────────
+    def _opt_url(key: str) -> str | None:
+        v = (raw.get(key) or "").strip()
+        if not v:
+            return None
+        if not v.startswith(("http://", "https://")):
+            raise ValueError(f"providers[{index}].{key}={v!r} must be an http(s) URL")
+        return v
+
+    return {
+        "id": feed_id,
+        "label": label,
+        "country_iso": country_iso,
+        "timetable": timetable,
+        "gtfs_rt": gtfs_rt,
+        "mct_url": _opt_url("mct_url"),
+        "stations_csv_url": _opt_url("stations_csv_url"),
+    }
 
 
 def dispatch(
