@@ -67,6 +67,7 @@ EXPECTED_MODULES = [
     "app.osm_filter",
     "app.router_config",
     "app.sessions_orchestrator",
+    "app.staleness",
     "app.graph_snapshots",
     "app.journey.signature",
     "app.journey.recorder",

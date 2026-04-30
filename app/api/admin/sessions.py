@@ -36,8 +36,9 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session as DbSession
+from sqlalchemy.orm.attributes import flag_modified
 
-from ... import audit, detect, ingestion, sessions_orchestrator
+from ... import audit, detect, ingestion, sessions_orchestrator, staleness
 from ...db import get_db
 from ...models import MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
@@ -99,6 +100,11 @@ class SessionResponse(BaseModel):
     include_in_fanout: bool
     created_at: str
     archived_at: str | None
+    # Soft staleness signal (v0.1.7.1): non-null when the operator has
+    # edited URLs since the last refresh. UI displays as a yellow banner
+    # and adds a confirm dialog before Rebuild graph. Never blocks rebuild
+    # by itself — that's handled by the harder input-presence check.
+    staleness_warning: str | None = None
 
     @classmethod
     def from_orm_session(cls, s: SessionRow) -> SessionResponse:
@@ -111,6 +117,7 @@ class SessionResponse(BaseModel):
             include_in_fanout=s.include_in_fanout,
             created_at=s.created_at.isoformat() if s.created_at else "",
             archived_at=s.archived_at.isoformat() if s.archived_at else None,
+            staleness_warning=staleness.staleness_warning(s.config or {}),
         )
 
 
@@ -246,6 +253,13 @@ def patch_session(
             )
             if osm_warning:
                 response.headers["X-Warnings"] = json.dumps([osm_warning])
+
+        # Track staleness: bump `sources_changed_at` if (and only if) the
+        # `sources` subtree actually changed. Edits that only touch
+        # osm_scope or other non-sources keys don't bump this — the
+        # downloaded data is still fresh w.r.t. URLs.
+        if not staleness.sources_subtree_equal(s.config, body.config):
+            staleness.mark_sources_changed(body.config)
 
         changes["config"] = {"from": s.config, "to": body.config}
         s.config = body.config
@@ -704,6 +718,16 @@ async def refresh_sources(
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
 
+    # Staleness tracking (v0.1.7.1): mark refresh completed so the next
+    # rebuild is no longer flagged stale. Done only when at least one
+    # task actually fetched — if every URL failed, the on-disk data is
+    # still stale and the operator needs to know.
+    if fetched:
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
+
     audit.record(
         db,
         action="session.sources.refreshed",
@@ -914,6 +938,16 @@ async def refresh_provider(
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
+
+    # Same staleness clear as the session-wide refresh — see refresh_sources
+    # for the lossy-by-design caveat (per-provider refresh clears the flag
+    # globally, even if other providers' URLs were also edited but not yet
+    # re-downloaded).
+    if fetched:
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
 
     audit.record(
         db,

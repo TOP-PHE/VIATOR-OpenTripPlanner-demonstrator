@@ -117,6 +117,11 @@
             </form>
           </section>
 
+          <!-- Staleness banner: shown when URLs were edited after the
+               last refresh, OR when sources are configured but never
+               refreshed. JS sets/clears via setStalenessBanner(sid). -->
+          <div data-role="staleness-banner" hidden style="margin: 0 0 0.75rem; padding: 0.6rem 0.9rem; background: #fff8e1; color: #6f5100; border: 1px solid #f0d77a; border-radius: 4px; font-size: 0.9rem"></div>
+
           <!-- Build & Promote -->
           <section class="detail-section">
             <h3>Build &amp; Promote</h3>
@@ -267,11 +272,51 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       if (cf.elements['osm_scope']) {
         cf.elements['osm_scope'].value = cfg.osm_scope || 'transit-focused';
       }
+      // Show / hide the staleness banner based on the persisted _meta.
+      setStalenessBanner(sid);
       // Auto-load the jobs list on first expand
       loadJobs(sid);
     }
   });
 });
+
+// ─── Staleness banner (v0.1.7.1) ────────────────────────────────────
+// A session is "stale" when sources_changed_at > last_refresh_completed_at
+// (URLs edited after last refresh) OR when sources are present but never
+// refreshed at all. Shown as a yellow banner above the Build & Promote
+// section, AND triggers a confirm dialog before Rebuild graph is sent.
+function staleSessionWarning(cfg) {
+  // Mirrors app/staleness.py::staleness_warning. Keep in sync.
+  const meta = (cfg && cfg._meta) || {};
+  const changedAt = meta.sources_changed_at;
+  const refreshedAt = meta.last_refresh_completed_at;
+  if (typeof changedAt !== 'string') return null;  // never-edited path
+  if (typeof refreshedAt !== 'string') {
+    return "Sources have been configured but never refreshed. Click 'Refresh all sources' to download the URLs before building.";
+  }
+  // ISO-8601 UTC strings → lex compare is correct.
+  if (changedAt > refreshedAt) {
+    return "URL(s) were edited after the last refresh. The on-disk files are stale relative to the current configuration. Click 'Refresh all sources' (or 'Refresh this provider' for the affected ones) before Rebuild graph, otherwise the build will use the old data.";
+  }
+  return null;
+}
+
+function setStalenessBanner(sid) {
+  const detail = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
+  const row = document.querySelector(`tr[data-sid="${sid}"]`);
+  if (!detail || !row) return;
+  const banner = detail.querySelector('[data-role="staleness-banner"]');
+  if (!banner) return;
+  const cfg = JSON.parse(row.dataset.config || '{}');
+  const warning = staleSessionWarning(cfg);
+  if (warning) {
+    banner.textContent = '⚠ ' + warning;
+    banner.hidden = false;
+  } else {
+    banner.textContent = '';
+    banner.hidden = true;
+  }
+}
 
 // ─── Provider-bundle editor helpers (v0.1.6) ────────────────────────
 // Feed-id rule mirrors the server-side regex in app/ingestion.py
@@ -532,6 +577,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
         const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
         const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
         showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
+        if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
       } catch (err) { showToast('error', String(err)); }
       finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
     }
@@ -598,6 +644,10 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     }
     const updated = await r.json();
     row.dataset.config = JSON.stringify(updated.config);
+    // Refresh the staleness banner — saving a URL change should make it
+    // appear; saving a non-sources change (osm_scope only) should leave
+    // it as-is (server only bumps sources_changed_at when sources change).
+    setStalenessBanner(sid);
     // Server-side soft warnings (X-Warnings response header, JSON list).
     // We toast the success first, then chain a warning toast if any. Same
     // mechanism could carry future warnings — keep it general.
@@ -630,10 +680,25 @@ document.querySelectorAll('button[data-action="refresh-sources"]').forEach(btn =
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
       const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
       showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
+      if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
     } catch (err) { showToast('error', String(err)); }
     finally { btn.disabled = false; btn.textContent = original; }
   });
 });
+
+// Mirror app/staleness.py::mark_refresh_completed on the client side so
+// the banner clears without a page reload. The server has the canonical
+// timestamp; this is just a UX bridge — next full page load reads the
+// server's value, which will be more recent than ours.
+function markRefreshCompletedLocally(sid) {
+  const row = document.querySelector(`tr[data-sid="${sid}"]`);
+  if (!row) return;
+  const cfg = JSON.parse(row.dataset.config || '{}');
+  cfg._meta = cfg._meta || {};
+  cfg._meta.last_refresh_completed_at = new Date().toISOString();
+  row.dataset.config = JSON.stringify(cfg);
+  setStalenessBanner(sid);
+}
 
 // ─── Upload (multipart, with progress) ──────────────────────────────
 document.querySelectorAll('form[data-form="upload"]').forEach(form => {
@@ -669,6 +734,21 @@ document.querySelectorAll('form[data-form="upload"]').forEach(form => {
 document.querySelectorAll('button[data-action="rebuild"]').forEach(btn => {
   btn.addEventListener('click', async () => {
     const sid = btn.dataset.sid;
+    // Staleness gate: if the on-disk data hasn't been refreshed since the
+    // last URL edit, ask the operator whether to proceed. The build will
+    // use the OLD data, which is rarely what they want — but operators
+    // sometimes know better (e.g. testing the build pipeline against
+    // a known-good cached PBF). Soft prompt, not a hard block.
+    const row = document.querySelector(`tr[data-sid="${sid}"]`);
+    const cfg = row ? JSON.parse(row.dataset.config || '{}') : {};
+    const stale = staleSessionWarning(cfg);
+    if (stale) {
+      const ok = confirm(
+        `${stale}\n\n` +
+        `Click OK to rebuild against the OLD on-disk data anyway, or Cancel to refresh sources first.`
+      );
+      if (!ok) return;
+    }
     const r = await fetch(`/api/sessions/${sid}/rebuilds`, {method:'POST'});
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
