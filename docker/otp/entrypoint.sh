@@ -193,14 +193,22 @@ JSON
         # streetGraph.obj cache (v0.1.7) — phase 1 is the heaviest step and
         # only depends on the OSM PBF + filter scope. If neither has changed
         # since the last successful build, skip phase 1 and reuse the cached
-        # streetGraph.obj. Cache lives at INBOX_DIR/osm/.cache/ alongside a
+        # streetGraph.obj. Cache lives at GRAPH_DIR/.cache/<sid>/ alongside a
         # `.key` file containing `sha256(osm.pbf):<scope>`.
+        #
+        # Why GRAPH_DIR and not INBOX_DIR? The inbox volume is mounted
+        # read-only in the otp-build container by design — protects staged
+        # GTFS files from a buggy build. The graphs volume is rw, and the
+        # cache logically belongs alongside the graph anyway. The session
+        # id comes from the OTP_INBOX_DIR's basename so the cache stays
+        # per-session even with shared GRAPH_DIR.
         #
         # Effect: adding a new GTFS provider to a France-wide session goes
         # from ~30 min (full rebuild) → ~10-12 min (phase-2 only). OSM
         # itself unchanged, only transit overlay re-runs.
         OSM_INPUT="$BUILD_DIR/osm.pbf"
-        CACHE_DIR="$INBOX_DIR/osm/.cache"
+        SID="$(basename "$INBOX_DIR")"
+        CACHE_DIR="$GRAPH_DIR/.cache/$SID"
         CACHE_OBJ="$CACHE_DIR/streetGraph.obj"
         CACHE_KEY="$CACHE_DIR/streetGraph.key"
         CURRENT_KEY=""
@@ -238,11 +246,20 @@ JSON
                     # shellcheck disable=SC2086  # JVM_OPTS is intentionally word-split
                     java -Xmx"$HEAP" $JVM_OPTS -jar /opt/otp/otp.jar --buildStreet --save "$BUILD_DIR"
                     # Persist for next time, only after phase 1 succeeded.
+                    # Best-effort: we'd rather log a warning and let phase 2
+                    # proceed than abort the entire build because the cache
+                    # write hit a permissions or disk-space issue. The cache
+                    # is purely a performance optimisation — its absence
+                    # means the next build re-does phase 1, not that today's
+                    # build is broken.
                     if [ -n "$CURRENT_KEY" ] && [ -f "$BUILD_DIR/streetGraph.obj" ]; then
-                        mkdir -p "$CACHE_DIR"
-                        cp "$BUILD_DIR/streetGraph.obj" "$CACHE_OBJ"
-                        printf '%s' "$CURRENT_KEY" > "$CACHE_KEY"
-                        echo "streetGraph.obj cache updated (key=$CURRENT_KEY)"
+                        if mkdir -p "$CACHE_DIR" 2>/dev/null \
+                           && cp "$BUILD_DIR/streetGraph.obj" "$CACHE_OBJ" 2>/dev/null \
+                           && printf '%s' "$CURRENT_KEY" > "$CACHE_KEY" 2>/dev/null; then
+                            echo "streetGraph.obj cache updated (key=$CURRENT_KEY) at $CACHE_DIR"
+                        else
+                            echo "WARNING: streetGraph.obj cache write to $CACHE_DIR failed — next build will redo phase 1. Continuing." >&2
+                        fi
                     fi
                 fi
 

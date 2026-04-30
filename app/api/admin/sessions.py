@@ -386,7 +386,16 @@ def delete_session(
     # the cleanup is best-effort: log and continue.
     import shutil  # local — only needed here
 
-    for tree in (settings.inbox_dir / sid, settings.graph_dir / sid):
+    # Trees to remove:
+    #   inbox/<sid>/                       — staged GTFS / OSM / etc.
+    #   graphs/<sid>/                      — built graph + timestamped history
+    #   graphs/.cache/<sid>/               — streetGraph.obj cache (v0.1.7).
+    #                                        Outlives a session otherwise.
+    for tree in (
+        settings.inbox_dir / sid,
+        settings.graph_dir / sid,
+        settings.graph_dir / ".cache" / sid,
+    ):
         if tree.exists():
             try:
                 shutil.rmtree(tree)

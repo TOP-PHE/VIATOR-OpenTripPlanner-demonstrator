@@ -296,15 +296,19 @@ or `docker compose logs -f worker`.
 > the default is recommended for all sizes.
 >
 > **Phase 1 cache (since v0.1.7).** The streetGraph.obj that phase 1
-> produces is cached at `inbox/<sid>/osm/.cache/streetGraph.obj`, keyed
-> by `sha256(osm.pbf):<scope>`. On the next rebuild, if the OSM input
-> and the OSM scope haven't changed, phase 1 is skipped entirely and
-> the cached file is copied into BUILD_DIR. Phase 2 (transit overlay)
-> always runs. Effect: adding a new GTFS provider to a France-wide
-> session goes from ~30 min (full rebuild) → ~10-12 min (phase 2 only).
-> The cache invalidates automatically when you change the OSM URL,
-> upload a new PBF, or change the OSM scope; you can also clear it by
-> deleting and recreating the session.
+> produces is cached at `graphs/.cache/<sid>/streetGraph.obj`, keyed
+> by `sha256(osm.pbf):<scope>`. (Lives on the graphs volume rather than
+> inbox because the otp-build container mounts inbox read-only — the
+> cache write would fail there, aborting phase 2.) On the next rebuild,
+> if the OSM input and the OSM scope haven't changed, phase 1 is
+> skipped entirely and the cached file is copied into BUILD_DIR.
+> Phase 2 (transit overlay) always runs. Effect: adding a new GTFS
+> provider to a France-wide session goes from ~30 min (full rebuild)
+> → ~10-12 min (phase 2 only). The cache invalidates automatically
+> when you change the OSM URL, upload a new PBF, or change the OSM
+> scope; you can also clear it by deleting and recreating the session
+> (the `graphs/<sid>/` tree gets rm-rf'd on session delete; the
+> `.cache/<sid>/` is also pruned).
 
 On success the worker:
 - Moves `graph.obj` into a timestamped directory: `graphs/<sid>/<timestamp>/graph.obj`
