@@ -128,6 +128,11 @@ services:
       # Build pipeline: 'two_phase' (default — lower peak heap) or 'one_shot'
       # (legacy --build, debug only). See entrypoint.sh.
       OTP_BUILD_PHASES: ${OTP_BUILD_PHASES:-two_phase}
+      # OSM filter scope. The worker overrides this per-session when invoking
+      # `docker compose run -e OTP_OSM_SCOPE=...` based on
+      # `session.config.osm_scope`. The default here is the fallback for
+      # sessions that don't have it set. See app/osm_filter.py.
+      OTP_OSM_SCOPE: ${OTP_OSM_SCOPE:-transit-focused}
     volumes:
       - inbox:/var/otp/inbox:ro
       - graphs:/var/otp/graph

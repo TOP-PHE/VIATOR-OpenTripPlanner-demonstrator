@@ -182,6 +182,16 @@ def patch_session(
         changes["name"] = {"from": s.name, "to": body.name}
         s.name = body.name
     if body.config is not None and body.config != s.config:
+        # Validate osm_scope if present — fail-fast at save time means the
+        # operator gets a clear UI error instead of an opaque build failure
+        # when osmium-tool errors out on an unknown scope name.
+        if "osm_scope" in body.config:
+            from ... import osm_filter
+
+            try:
+                body.config["osm_scope"] = osm_filter.validate_scope(body.config["osm_scope"])
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         changes["config"] = {"from": s.config, "to": body.config}
         s.config = body.config
     if body.include_in_fanout is not None and body.include_in_fanout != s.include_in_fanout:

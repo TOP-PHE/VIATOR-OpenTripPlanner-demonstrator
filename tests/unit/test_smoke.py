@@ -64,6 +64,7 @@ EXPECTED_MODULES = [
     "app.api.journey",
     "app.api.reports",
     "app.master.trainline",
+    "app.osm_filter",
     "app.sessions_orchestrator",
     "app.graph_snapshots",
     "app.journey.signature",

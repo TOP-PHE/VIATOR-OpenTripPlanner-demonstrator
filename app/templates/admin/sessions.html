@@ -71,6 +71,18 @@
                 Paris GTFS is fine; IDF-only PBF + nationwide SNCF GTFS will fail to snap
                 lat/lon coordinates outside Île-de-France.
               </p>
+              <label>OSM scope <span class="hint">(filter applied at build time)</span></label>
+              <select name="osm_scope">
+                <option value="transit-focused">Transit-focused (recommended) — drops driveways, agricultural, private. Saves ~40% memory.</option>
+                <option value="multi-modal">Multi-modal — keeps service roads + cycling/walking detail. ~10-20% saving.</option>
+                <option value="comprehensive">Comprehensive — original PBF, no filter. Memory-heavy: France-wide needs ≥40 GB heap.</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem">
+                Filter runs in the otp-build container via osmium-tool, before OTP parses
+                the PBF. It cuts the data OTP has to hold in heap, not the routing accuracy
+                — transit-focused keeps all roads + railways + public-transport amenities.
+                Default for new sessions: <code>transit-focused</code>.
+              </p>
               <label>SNCF MCT URL <code>(.zip)</code> — optional, runtime data</label>
               <input type="url" name="mct" placeholder="">
               <label>SNCF Stations CSV URL — optional, runtime data</label>
@@ -204,6 +216,12 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       });
       // GTFS multi-feed: normalise legacy string → single-row, array → N rows.
       populateFeedsList(cf, sources.gtfs);
+      // OSM scope: default to transit-focused for sessions that don't have
+      // it set yet (legacy / pre-v0.1.5). Stored at the top level of config,
+      // not under `sources`, because it's not a download URL.
+      if (cf.elements['osm_scope']) {
+        cf.elements['osm_scope'].value = cfg.osm_scope || 'transit-focused';
+      }
       // Auto-load the jobs list on first expand
       loadJobs(sid);
     }
@@ -299,6 +317,10 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // Merge into existing config — preserve other keys.
     const row = document.querySelector(`tr[data-sid="${sid}"]`);
     const cfg = { ...JSON.parse(row.dataset.config || '{}'), sources };
+    // OSM scope sits at the top level of config (it's a build-time
+    // setting, not a download URL).
+    const osmScope = (form.elements['osm_scope']?.value || '').trim();
+    if (osmScope) cfg.osm_scope = osmScope;
     const r = await fetch(`/api/sessions/${sid}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({config: cfg})});
     if (!r.ok) { const j = await r.json().catch(()=>({})); showToast('error', j.detail || `Failed (${r.status})`); return; }
     const updated = await r.json();

@@ -347,6 +347,14 @@ A session can declare an optional `sources` config — the operator-facing shape
 
 `sources.osm_pbf` is necessarily a single PBF (one street network per graph). It must cover every region the GTFS feeds reach. Mismatches surface as `LOCATION_NOT_FOUND` at journey-query time when a coordinate is outside the OSM coverage.
 
+**OSM scope (since v0.1.5):** `session.config.osm_scope` selects an osmium-tool tags-filter applied to the PBF in the otp-build container before OTP parses it. Three presets:
+
+  - `transit-focused` (default) — keeps highway= primary/secondary/tertiary/residential/pedestrian/footway/path/steps/cycleway, all railway, all public_transport, parking entrances. Drops driveways (highway=service), agricultural tracks, construction/abandoned. ~40 % size reduction.
+  - `multi-modal` — adds back highway=service. ~10-20 % size reduction.
+  - `comprehensive` — no filter. Use for car routing or OSM debugging.
+
+Single source of truth: `app/osm_filter.py` (Python) + `docker/otp/entrypoint.sh` (shell). Operator picks via the session UI's OSM-scope dropdown; worker plumbs through to the otp-build container as `OTP_OSM_SCOPE`.
+
 The build pipeline materializes this config:
 - The `refresh_sources` endpoint downloads each feed → `inbox/<sid>/gtfs/<id_lower>.zip`.
 - The `otp-build` entrypoint scans `gtfs/*.zip` and generates a `build-config.json` with one `transitFeeds` entry per file (feedId = filename stem, uppercased).

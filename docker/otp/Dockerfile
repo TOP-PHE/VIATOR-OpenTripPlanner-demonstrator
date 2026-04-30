@@ -9,9 +9,19 @@ ENV OTP_VERSION=${OTP_VERSION}
 # that gap and keeps Trivy's OS scan green between base-image refreshes.
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        osmium-tool \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+# osmium-tool (~5 MB installed, plus ~10 MB of libs) is the OSM-PBF
+# pre-filter. We run it in entrypoint.sh against the staged osm.pbf to
+# drop non-routing-relevant ways before OTP builds the graph. Lets us
+# fit France-wide builds in 24 GB heap instead of 40+. Source of preset
+# tag-filter expressions: app/osm_filter.py (Python is the single source
+# of truth; entrypoint.sh reads the chosen preset by env var).
 
 # Note: starting with OTP 2.7.0 the Maven artifact ID was renamed from
 # `otp` (with classifier `shaded`) to `otp-shaded` (no classifier — the

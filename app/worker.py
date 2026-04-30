@@ -184,6 +184,24 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     graph_target = Path(str(settings.graph_dir)) / sid / timestamp
     graph_target.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the operator's OSM-scope choice for this session and pass it
+    # through to the build container. Default (transit-focused) wins for
+    # legacy sessions whose config never set `osm_scope`. Validation is
+    # defensive — bad strings raise here rather than at build time, so the
+    # job's log shows a clear "unknown osm_scope" instead of a shell error
+    # from the entrypoint.
+    from . import osm_filter
+
+    osm_scope = osm_filter.DEFAULT_SCOPE
+    if session_id:
+        with SessionLocal() as db:
+            row = db.get(SessionRow, session_id)
+            if row is not None and row.config:
+                try:
+                    osm_scope = osm_filter.validate_scope(row.config.get("osm_scope"))
+                except ValueError as exc:
+                    log.warning("session %s has bad osm_scope: %s — using default", sid, exc)
+
     cmd = [
         "docker",
         "compose",
@@ -195,6 +213,8 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         f"OTP_HEAP={settings.otp_build_heap}",
         "-e",
         f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
+        "-e",
+        f"OTP_OSM_SCOPE={osm_scope}",
         "otp-build",
     ]
     # `cmd` is built from constants + the configured session_id slug only;

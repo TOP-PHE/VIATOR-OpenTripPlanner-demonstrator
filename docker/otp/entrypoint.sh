@@ -6,6 +6,13 @@ GRAPH_DIR="${OTP_GRAPH_DIR:-/var/otp/graph}"
 INBOX_DIR="${OTP_INBOX_DIR:-/var/otp/inbox}"
 HEAP="${OTP_HEAP:-12g}"
 
+# OSM filter scope (see app/osm_filter.py for the canonical preset
+# definitions — these tag-filter strings MUST stay in sync with the
+# Python `OSM_SCOPE_PRESETS` dict). At build time the operator's choice
+# arrives as `OTP_OSM_SCOPE`; the entrypoint runs osmium-tool tags-filter
+# accordingly. `comprehensive` skips filtering entirely.
+OSM_SCOPE="${OTP_OSM_SCOPE:-transit-focused}"
+
 # Build pipeline: 'two_phase' (default) builds the street graph and the transit
 # graph in two separate JVMs. Peak heap is dramatically lower than --build (one
 # shot) because raw OSM nodes are released between phases — France-wide PBF +
@@ -38,9 +45,53 @@ case "$MODE" in
         if compgen -G "$INBOX_DIR/netex/*.zip" > /dev/null; then
             cp "$INBOX_DIR"/netex/*.zip "$BUILD_DIR/"
         fi
-        # Street network
+        # Street network — staged into BUILD_DIR. If the operator picked
+        # an OSM scope other than 'comprehensive', we run osmium-tool
+        # tags-filter to drop non-routing-relevant ways before OTP sees
+        # the file. Cuts ~30-40% of OSM data for transit-focused, ~10-20%
+        # for multi-modal — bringing France-wide build heap from ~40 GB
+        # down to ~22-26 GB.
         if compgen -G "$INBOX_DIR/osm/*.pbf" > /dev/null; then
-            cp "$INBOX_DIR"/osm/*.pbf "$BUILD_DIR/"
+            for pbf_in in "$INBOX_DIR"/osm/*.pbf; do
+                pbf_out="$BUILD_DIR/$(basename "$pbf_in")"
+                case "$OSM_SCOPE" in
+                    transit-focused)
+                        echo "OSM filter: transit-focused — running osmium tags-filter on $(basename "$pbf_in")"
+                        osmium tags-filter --quiet --overwrite \
+                            -o "$pbf_out" "$pbf_in" \
+                            'highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,pedestrian,footway,path,steps,cycleway,road,motorway_link,trunk_link,primary_link,secondary_link,tertiary_link' \
+                            'railway' \
+                            'public_transport' \
+                            'amenity=parking,parking_entrance' \
+                            'highway=bus_stop'
+                        ;;
+                    multi-modal)
+                        echo "OSM filter: multi-modal — running osmium tags-filter on $(basename "$pbf_in")"
+                        osmium tags-filter --quiet --overwrite \
+                            -o "$pbf_out" "$pbf_in" \
+                            'highway' \
+                            'railway' \
+                            'public_transport' \
+                            'amenity=parking,parking_entrance'
+                        ;;
+                    comprehensive)
+                        echo "OSM filter: comprehensive — passing $(basename "$pbf_in") through unchanged"
+                        cp "$pbf_in" "$pbf_out"
+                        ;;
+                    *)
+                        echo "Unknown OTP_OSM_SCOPE='$OSM_SCOPE' (expected: transit-focused | multi-modal | comprehensive)" >&2
+                        exit 1
+                        ;;
+                esac
+                # Quick before/after summary so the build log shows the
+                # operator what got dropped.
+                in_sz=$(stat -c %s "$pbf_in")
+                out_sz=$(stat -c %s "$pbf_out")
+                if [ "$in_sz" -gt 0 ]; then
+                    pct=$(( (out_sz * 100) / in_sz ))
+                    echo "  $(basename "$pbf_in"): ${in_sz} → ${out_sz} bytes (${pct}% of original)"
+                fi
+            done
         fi
         # Optional elevation
         if compgen -G "$INBOX_DIR/dem/*.tif" > /dev/null; then
