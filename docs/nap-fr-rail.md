@@ -103,6 +103,31 @@ in the session detail with declared standard `NeTEx-FR-Horaires` or
 OTP. They're preserved for audit; routing uses GTFS / NeTEx-Nordic /
 NeTEx-EPIP.
 
+### 2.5 Bulk-import providers from a National Access Point (since v0.1.8)
+
+For a "France-wide every-rail-operator" demonstrator, manually adding
+each provider URL through the UI gets tedious quickly. The **⇪ Import
+from NAP** button on the Configure section opens a modal that:
+
+1. Fetches the chosen NAP catalogue (default: `https://transport.data.gouv.fr/api/datasets`)
+2. Filters by country + modes (rail / urban / bus / bike) + optional
+   publisher whitelist + optional dataset-id exclude list
+3. For each matching dataset, picks the best timetable resource:
+   - **GTFS preferred** (best for OTP)
+   - **NeTEx-Nordic / NeTEx-EPIP** when GTFS missing but a profile-tagged
+     NeTEx is available
+   - **NeTEx-FR datasets are surfaced as warnings** (OTP can't read them)
+4. **Preview first** — table of proposed providers shown for review
+5. **Confirm** — providers persisted to `session.config.sources.providers[]`,
+   country-gate runs, staleness banner appears
+
+Same machinery works against any DCAT-AP-style NAP — just paste the
+endpoint URL (e.g. German `mobilithek.info`, Trafiklab Sweden). API
+responses cached 5 min in-process to keep preview→confirm cycles snappy.
+
+After import: click **Refresh all sources** then **Rebuild graph** to
+materialise the new providers' files and rebuild the OTP graph.
+
 ---
 
 ## 3. Data sources for `nap-fr-rail`
@@ -419,10 +444,21 @@ Before any session work:
 
 Submit. Row appears with state `created`.
 
-### 6.3 Configure the SNCF provider
+### 6.3 Configure providers
 
-Click ▸ on the row → expand details → in **Configure sources**, click
-**+ Add provider**. The blank card opens; fill in:
+Two paths, pick one:
+
+**Manual** — click **+ Add provider** for each, fill in the fields.
+Useful when you want fine control or you only need 1-2 providers.
+
+**Bulk import (since v0.1.8)** — click **⇪ Import from NAP**, the
+modal pre-fills with `transport.data.gouv.fr/api/datasets`, country=FR,
+mode=rail. Click **▸ Preview** → table of ~5-15 rail providers detected
+on the French NAP. Review, untick anything you don't want via the
+publisher-whitelist field (e.g. `SNCF, IDFM, TRENITALIA` to limit to
+those three). Click **✓ Confirm import** → providers added in one shot.
+
+Either way, the SNCF provider needs at minimum:
 
 | Field | Value |
 |---|---|
@@ -680,6 +716,10 @@ state) for forensics.
 | Real-time alerts / trip updates don't show in OTP (since v0.1.7) | GTFS-RT URLs configured but session hasn't rebuilt + been promoted yet | Click **Rebuild graph** then **Promote to serving**. The new graph carries the per-session `router-config.json` containing each provider's updaters; the per-session `otp-<sid>` container picks them up at load time. |
 | Need to fully reset a session and start over | Archive only flips state to `archived` — preserves data | Click the red **Delete** button next to Archive (since v0.1.7). Two-step confirmation removes everything: DB rows, on-disk inbox/graphs, the otp container. |
 | Need to refresh just one provider's data without re-downloading the others (since v0.1.6) | Clicking "Refresh all sources" pulls every provider | Each provider card has a **⤴ Refresh this provider** button — downloads only that provider's timetable + MCT + stations CSV. OSM PBF stays untouched. |
+| Bulk-import preview returns 0 providers despite obvious matches existing on the NAP website (since v0.1.8) | Mode classifier didn't match — the NAP API doesn't expose modes structurally; the importer guesses from title/tags | Add the publisher name to the **Publishers (opt., comma-sep)** field in the import modal as a fallback whitelist. Or paste a wider mode set (rail + urban). The classifier is permissive but can miss novel naming — flag the operator name and we can add to `_MODE_KEYWORDS` in the importer. |
+| Bulk-import succeeds but `Confirm` fails with `409 missing_master_stations_for_countries` | An imported provider declares a country with no master_stations rows | Same as the manual save case: go to `/admin/master/stations` → **Refresh from Trainline** to import the missing country, then re-run the bulk-import (the dedupe pass means already-imported providers are silently skipped). |
+| NAP fetch fails with `502` from our API | NAP catalogue endpoint is down or unreachable from the web container | Check transport.data.gouv.fr's status page. The 5-min cache means the next preview also fails until the cache expires; you can force-clear by restarting the web container (`docker compose restart web`). |
+| NeTEx-FR-only datasets keep appearing as warnings on every re-import | OTP can't read NeTEx-FR (see §2.4); these datasets have no GTFS | Add their dataset IDs to the **Exclude IDs** field in the import modal to suppress the warning, OR find their GTFS-publishing alternative. Exclusion is per-import; for permanent suppression, add to a future operator-level exclude list (not yet wired). |
 | Staleness banner showing despite recent refresh | The refresh fetched zero files (every URL was 404 / network error) | `last_refresh_completed_at` is only bumped on at least one successful fetch. Inspect the most recent refresh response or web logs; fix the failing URL and re-refresh. |
 | Journey UI search returns trips ending at the wrong destination, e.g. shows "Lyon Part-Dieu" when To field said "Cagnes-sur-Mer" (since v0.1.7.1, this is fixed) | Operator typed a new station name in From/To without picking from the dropdown — the previous station's lat/lon were still in hidden form fields | Now refused at form-submit time with a yellow toast. Always **pick from the dropdown** so the lat/lon hidden fields update. |
 

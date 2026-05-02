@@ -63,6 +63,7 @@ EXPECTED_MODULES = [
     "app.api.master.aliases",
     "app.api.journey",
     "app.api.reports",
+    "app.master.nap_importer",
     "app.master.trainline",
     "app.osm_filter",
     "app.router_config",

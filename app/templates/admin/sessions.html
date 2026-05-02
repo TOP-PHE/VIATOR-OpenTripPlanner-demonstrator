@@ -65,7 +65,10 @@
               <fieldset class="providers-fieldset" data-role="providers">
                 <legend>Providers</legend>
                 <div data-role="providers-rows"></div>
-                <button type="button" class="secondary" data-action="add-provider" style="margin-top: 0.5rem">+ Add provider</button>
+                <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
+                  <button type="button" class="secondary" data-action="add-provider">+ Add provider</button>
+                  <button type="button" class="secondary" data-action="import-from-nap" title="Bulk-import providers from a National Access Point catalogue (e.g. transport.data.gouv.fr)">⇪ Import from NAP</button>
+                </div>
               </fieldset>
               <label>OSM PBF URL <code>(.osm.pbf)</code></label>
               <input type="url" name="osm_pbf" placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
@@ -149,6 +152,56 @@
   </tbody>
 </table>
 
+<!-- Bulk-import modal (v0.1.8). Shown by ⇪ Import from NAP button.
+     Two-stage UX: Preview → table of proposed providers → Confirm. -->
+<div id="nap-modal" class="nap-modal-backdrop" hidden>
+  <div class="nap-modal">
+    <div class="nap-modal-header">
+      <h3 style="margin: 0">Import providers from a National Access Point</h3>
+      <button type="button" class="secondary" data-action="nap-close" title="Close" style="padding: 0.2rem 0.6rem">×</button>
+    </div>
+    <div class="nap-modal-body">
+      <form id="nap-form">
+        <input type="hidden" id="nap-sid">
+
+        <label>NAP catalogue URL</label>
+        <input id="nap-url" type="url" required value="https://transport.data.gouv.fr/api/datasets">
+        <p class="hint" style="margin: 0.15rem 0 0.5rem">
+          Defaults to the French NAP. Other DCAT-compliant NAPs (German <code>mobilithek.info</code>,
+          Swedish Trafiklab, etc.) work too — paste their <code>/api/datasets</code> equivalent.
+        </p>
+
+        <div style="display: grid; grid-template-columns: 8rem 1fr; gap: 0.4rem 0.6rem; align-items: baseline">
+          <label style="margin: 0">Country (ISO-2)</label>
+          <input id="nap-country" type="text" maxlength="2" pattern="[A-Z]{2}" placeholder="FR" value="FR" style="width: 6rem; text-transform: uppercase">
+
+          <label style="margin: 0">Modes</label>
+          <div style="display: flex; gap: 0.8rem; flex-wrap: wrap; padding-top: 0.2rem">
+            <label style="display: inline-flex; gap: 0.3rem; align-items: center; font-weight: normal"><input type="checkbox" id="nap-mode-rail" checked> rail</label>
+            <label style="display: inline-flex; gap: 0.3rem; align-items: center; font-weight: normal"><input type="checkbox" id="nap-mode-urban"> urban</label>
+            <label style="display: inline-flex; gap: 0.3rem; align-items: center; font-weight: normal"><input type="checkbox" id="nap-mode-bus"> bus</label>
+            <label style="display: inline-flex; gap: 0.3rem; align-items: center; font-weight: normal"><input type="checkbox" id="nap-mode-bike"> bike</label>
+          </div>
+
+          <label style="margin: 0">Publishers <span class="hint">(opt., comma-sep)</span></label>
+          <input id="nap-publishers" type="text" placeholder="SNCF, IDFM, Trenitalia">
+
+          <label style="margin: 0">Exclude IDs <span class="hint">(opt., comma-sep)</span></label>
+          <input id="nap-exclude" type="text" placeholder="dataset-id-1, dataset-id-2">
+        </div>
+
+        <div style="margin-top: 0.8rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
+          <button type="button" data-action="nap-preview">▸ Preview</button>
+          <button type="button" data-action="nap-confirm" disabled>✓ Confirm import</button>
+          <span class="hint" style="margin-left: auto">Preview first; the Confirm button activates after a successful preview.</span>
+        </div>
+      </form>
+
+      <div id="nap-result" style="margin-top: 0.8rem"></div>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 240px; max-width: 480px"></div>
 
 <style>
@@ -187,6 +240,20 @@
   .prov-section legend { padding: 0 0.3rem; font-size: 0.78rem; color: var(--rail-steel); }
   .prov-id { font-family: ui-monospace, Menlo, Consolas, monospace; }
   .prov-id:invalid, .prov-country:invalid { border-color: #d32f2f; }
+  /* NAP-import modal (v0.1.8). Backdrop blocks page interaction;
+     centered card with a max-width keeps the form readable. */
+  .nap-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .nap-modal-backdrop[hidden] { display: none; }
+  .nap-modal { background: #fff; border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.18); width: min(720px, 92vw); max-height: 92vh; overflow-y: auto; padding: 1rem 1.4rem; }
+  .nap-modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--rail-border, #d0d7de); }
+  .nap-modal-body label { font-weight: 600; font-size: 0.85rem; }
+  .nap-result-table { width: 100%; font-size: 0.82rem; border-collapse: collapse; margin-top: 0.4rem; }
+  .nap-result-table th, .nap-result-table td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
+  .nap-result-table th { background: #f5f7f9; font-weight: 600; }
+  .nap-result-section { margin-top: 0.6rem; padding-top: 0.5rem; border-top: 1px dashed var(--rail-border, #d0d7de); }
+  .nap-result-section h4 { margin: 0 0 0.4rem; font-size: 0.92rem; }
+  .nap-skipped { color: var(--rail-steel); font-size: 0.82rem; }
+  .nap-warning { background: #fff8e1; color: #6f5100; border-left: 3px solid #f0d77a; padding: 0.4rem 0.6rem; font-size: 0.85rem; margin-top: 0.3rem; }
   .jobs-table { width: 100%; font-size: 0.85rem; margin-top: 0.5rem; border-collapse: collapse; }
   .jobs-table th, .jobs-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
   .jobs-table pre { margin: 0; max-height: 240px; overflow: auto; font-size: 0.75rem; background: #1e1e1e; color: #ddd; padding: 0.5rem; border-radius: 3px; }
@@ -548,6 +615,15 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       providerCardHTML({id: '', label: '', country_iso: null, timetable: {format: 'gtfs', url: ''}, gtfs_rt: {}}),
     );
   });
+
+  // Import-from-NAP button: open the modal pre-bound to this session.
+  form.querySelector('button[data-action="import-from-nap"]')?.addEventListener('click', () => {
+    const sid = form.dataset.sid;
+    document.getElementById('nap-sid').value = sid;
+    document.getElementById('nap-result').innerHTML = '';
+    document.querySelector('button[data-action="nap-confirm"]').disabled = true;
+    document.getElementById('nap-modal').hidden = false;
+  });
   // Event delegation: remove provider, refresh-this-provider, summary auto-update.
   form.addEventListener('click', async (e) => {
     const removeBtn = e.target.closest('button[data-action="remove-provider"]');
@@ -796,6 +872,153 @@ async function loadJobs(sid) {
 
 document.querySelectorAll('button[data-action="refresh-jobs"]').forEach(btn => {
   btn.addEventListener('click', () => loadJobs(btn.dataset.sid));
+});
+
+// ─── NAP bulk-import modal (v0.1.8) ─────────────────────────────────
+// Two-stage flow:
+//   1. Click ⇪ Import from NAP on a session → modal opens
+//   2. Click ▸ Preview → POST with preview=true → table of providers
+//      shown, Confirm button enables
+//   3. Click ✓ Confirm → POST with preview=false → providers persisted,
+//      modal closes, page reloads to show new cards
+//
+// The NAP fetch is server-side (CORS would block client-side); the
+// importer runs against the live `transport.data.gouv.fr/api/datasets`.
+function napCollectFilters() {
+  const modes = [];
+  for (const m of ['rail', 'urban', 'bus', 'bike']) {
+    if (document.getElementById('nap-mode-' + m)?.checked) modes.push(m);
+  }
+  const splitCsv = (s) => (s || '').split(',').map(x => x.trim()).filter(Boolean);
+  return {
+    nap_url: document.getElementById('nap-url').value.trim(),
+    country: (document.getElementById('nap-country').value.trim().toUpperCase() || null),
+    modes: modes.length ? modes : null,
+    include_publishers: splitCsv(document.getElementById('nap-publishers').value),
+    exclude_dataset_ids: splitCsv(document.getElementById('nap-exclude').value),
+  };
+}
+
+async function napCall(preview) {
+  const sid = document.getElementById('nap-sid').value;
+  const filters = napCollectFilters();
+  const body = {
+    ...filters,
+    include_publishers: filters.include_publishers.length ? filters.include_publishers : null,
+    exclude_dataset_ids: filters.exclude_dataset_ids.length ? filters.exclude_dataset_ids : null,
+    preview,
+  };
+  const r = await fetch(`/api/sessions/${sid}/providers/import-from-nap`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    // Country-gate failure is structured — surface the missing-countries hint.
+    if (r.status === 409 && out.detail && out.detail.error === 'missing_master_stations_for_countries') {
+      const missing = out.detail.missing_countries || [];
+      throw new Error(
+        `${out.detail.message}\nGo to /admin/master/stations and click "Refresh from Trainline" to import ${missing.join(', ')}.`
+      );
+    }
+    throw new Error(out.detail || `Failed (${r.status})`);
+  }
+  return out;
+}
+
+function napRenderResult(result, preview) {
+  const target = document.getElementById('nap-result');
+  const providers = result.providers || [];
+  const skipped = result.skipped || [];
+  const warnings = result.warnings || [];
+
+  let html = '';
+  if (preview) {
+    html += `<p class="hint">Preview only — nothing has been saved yet. Click <strong>✓ Confirm import</strong> to commit.</p>`;
+  } else {
+    html += `<p class="msg show success" style="margin: 0 0 0.5rem">✓ Imported ${providers.length} provider${providers.length === 1 ? '' : 's'}. Click <strong>Refresh all sources</strong> on the session to download their files, then <strong>Rebuild graph</strong>.</p>`;
+  }
+
+  if (providers.length) {
+    html += `<div class="nap-result-section"><h4>Providers to add (${providers.length})</h4>`;
+    html += '<table class="nap-result-table"><thead><tr><th>ID</th><th>Label</th><th>Country</th><th>Format</th><th>URL</th></tr></thead><tbody>';
+    for (const p of providers) {
+      const url = (p.timetable || {}).url || '';
+      html += `<tr>
+        <td><code>${escHTML(p.id)}</code></td>
+        <td>${escHTML(p.label || '')}</td>
+        <td>${escHTML(p.country_iso || '—')}</td>
+        <td>${escHTML((p.timetable || {}).format || '—')}</td>
+        <td style="word-break: break-all"><span style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.75rem">${escHTML(url)}</span></td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  } else {
+    html += `<p class="msg show error" style="margin: 0.4rem 0">No providers matched your filters. Adjust country / modes / publisher and Preview again.</p>`;
+  }
+
+  if (warnings.length) {
+    html += `<div class="nap-result-section"><h4>Warnings (${warnings.length})</h4>`;
+    for (const w of warnings) html += `<div class="nap-warning">${escHTML(w)}</div>`;
+    html += '</div>';
+  }
+
+  if (skipped.length) {
+    html += `<details class="nap-result-section"><summary><strong>Skipped (${skipped.length})</strong> — click to expand</summary>`;
+    html += '<table class="nap-result-table" style="margin-top: 0.4rem"><thead><tr><th>Dataset</th><th>Reason</th></tr></thead><tbody>';
+    for (const s of skipped) {
+      html += `<tr><td>${escHTML(s.dataset || '')}</td><td class="nap-skipped">${escHTML(s.reason || '')}</td></tr>`;
+    }
+    html += '</tbody></table></details>';
+  }
+
+  target.innerHTML = html;
+}
+
+document.querySelector('button[data-action="nap-close"]')?.addEventListener('click', () => {
+  document.getElementById('nap-modal').hidden = true;
+});
+
+document.querySelector('button[data-action="nap-preview"]')?.addEventListener('click', async (e) => {
+  const btn = e.target;
+  btn.disabled = true; const original = btn.textContent; btn.textContent = 'Fetching NAP…';
+  try {
+    const result = await napCall(true);
+    napRenderResult(result, true);
+    // Enable the Confirm button only when the preview yielded providers.
+    document.querySelector('button[data-action="nap-confirm"]').disabled = (result.providers || []).length === 0;
+  } catch (err) {
+    document.getElementById('nap-result').innerHTML =
+      `<p class="msg show error" style="margin: 0">${escHTML(err.message || String(err))}</p>`;
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
+});
+
+document.querySelector('button[data-action="nap-confirm"]')?.addEventListener('click', async (e) => {
+  const btn = e.target;
+  if (!confirm('Add these providers to the session config? You\'ll still need to Refresh sources + Rebuild graph afterwards.')) return;
+  btn.disabled = true; const original = btn.textContent; btn.textContent = 'Saving…';
+  try {
+    const result = await napCall(false);
+    napRenderResult(result, false);
+    showToast('success', `Imported ${(result.providers || []).length} provider(s) from NAP`);
+    // Brief delay so the operator sees the success message inside the modal too.
+    setTimeout(() => {
+      document.getElementById('nap-modal').hidden = true;
+      window.location.reload();
+    }, 1800);
+  } catch (err) {
+    document.getElementById('nap-result').innerHTML =
+      `<p class="msg show error" style="margin: 0">${escHTML(err.message || String(err))}</p>`;
+    btn.disabled = false; btn.textContent = original;
+  }
+});
+
+// Click on backdrop closes the modal (but not clicks inside the card).
+document.getElementById('nap-modal')?.addEventListener('click', (e) => {
+  if (e.target.id === 'nap-modal') document.getElementById('nap-modal').hidden = true;
 });
 </script>
 {% endblock %}

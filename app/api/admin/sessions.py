@@ -890,6 +890,188 @@ async def _refresh_one_task(
     return {"status": "fetched", "key": label, "kind": kind, "url": url, "size_bytes": size_bytes}
 
 
+# ──── bulk import providers from a National Access Point (v0.1.8) ────
+
+
+class ImportFromNapBody(BaseModel):
+    """Filters for bulk-importing providers from a NAP catalogue.
+
+    All filters are optional — omitting them imports every dataset whose
+    URL isn't already in the session. Practical use is to filter by
+    country + modes (e.g. country=FR, modes=["rail"]) for a focused
+    demonstrator session.
+
+    `preview=True` returns the proposed providers WITHOUT persisting,
+    so the UI can show a confirmation table before the operator commits.
+    """
+
+    nap_url: str = Field(
+        default="https://transport.data.gouv.fr/api/datasets",
+        description="NAP catalogue endpoint. Defaults to the French NAP.",
+    )
+    country: str | None = Field(default=None, max_length=2, description="ISO-2 country filter")
+    modes: list[str] | None = Field(
+        default=None,
+        description="Subset of {rail, urban, bus, bike}. None = no mode filter.",
+    )
+    include_publishers: list[str] | None = Field(
+        default=None,
+        description="Optional whitelist — substring match on publisher name.",
+    )
+    exclude_dataset_ids: list[str] | None = Field(
+        default=None,
+        description="Optional skip list of NAP dataset ids.",
+    )
+    preview: bool = Field(
+        default=False,
+        description="True = dry-run, return proposed providers without saving. "
+        "False = persist them to session.config.sources.providers[].",
+    )
+
+
+class ImportFromNapResponse(BaseModel):
+    providers: list[dict[str, Any]]
+    skipped: list[dict[str, Any]]
+    warnings: list[str]
+    preview: bool
+
+
+@router.post(
+    "/{sid}/providers/import-from-nap",
+    response_model=ImportFromNapResponse,
+    summary="Bulk-import providers from a NAP catalogue (preview or commit)",
+)
+async def import_providers_from_nap(
+    sid: str,
+    body: ImportFromNapBody,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> ImportFromNapResponse:
+    """Fetch a NAP catalogue, filter, and add new providers in one call.
+
+    Workflow:
+      1. Operator opens the Configure section, clicks "Import from NAP"
+      2. UI calls this endpoint with `preview=True` and the chosen filters
+      3. Endpoint returns a table of (proposed providers + skipped reasons
+         + warnings) — UI shows it as a confirmation modal
+      4. Operator clicks Confirm → UI calls again with `preview=False`
+      5. Endpoint persists the providers AND returns the same shape
+
+    Persisting also bumps `_meta.sources_changed_at` (v0.1.7.1 staleness
+    tracking) so the operator gets the "click Refresh sources before
+    Rebuild" reminder.
+
+    Country-gate (v0.1.6) runs on each new provider: if any declares a
+    country with no master_stations rows, the save fails with the same
+    409 the manual save uses. Operator imports master_stations first,
+    then re-runs the bulk import.
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    if actor.id is None:
+        raise HTTPException(400, "Bulk-import requires a JWT-authenticated actor")
+
+    from ...master import nap_importer
+
+    existing_providers = (s.config or {}).get("sources", {}).get("providers") or []
+
+    try:
+        result = await nap_importer.import_from_nap(
+            existing_providers=existing_providers,
+            nap_url=body.nap_url,
+            country=body.country.upper() if body.country else None,
+            modes=body.modes,
+            include_publishers=body.include_publishers,
+            exclude_dataset_ids=body.exclude_dataset_ids,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"NAP fetch failed: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if body.preview:
+        # Dry-run path: return proposal without touching session config.
+        return ImportFromNapResponse(
+            providers=result["providers"],
+            skipped=result["skipped"],
+            warnings=result["warnings"],
+            preview=True,
+        )
+
+    # Commit path: merge new providers into session config + run all the
+    # same validations that the regular PATCH endpoint runs (provider
+    # validation, country-gate). Reuses normalize_providers so the shape
+    # ends up canonical.
+    if result["providers"]:
+        new_config = dict(s.config or {})
+        sources = dict(new_config.get("sources") or {})
+        merged_providers = list(existing_providers) + list(result["providers"])
+        sources["providers"] = merged_providers
+        new_config["sources"] = sources
+
+        # Validate via the same path the manual save uses.
+        try:
+            providers_canon = ingestion.normalize_providers(new_config)
+        except ValueError as exc:
+            raise HTTPException(400, f"Imported providers failed validation: {exc}") from exc
+
+        # Country-gate.
+        declared_countries = {p["country_iso"] for p in providers_canon if p["country_iso"]}
+        if declared_countries:
+            missing = _countries_without_stations(db, declared_countries)
+            if missing:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "error": "missing_master_stations_for_countries",
+                        "missing_countries": sorted(missing),
+                        "message": (
+                            "Imported providers reference countries with no "
+                            f"master_stations rows: {sorted(missing)}. Import them "
+                            "from Trainline first, then retry the bulk-import."
+                        ),
+                    },
+                )
+
+        # Persist canonicalised providers + bump staleness.
+        sources["providers"] = providers_canon
+        new_config["sources"] = sources
+        staleness.mark_sources_changed(new_config)
+        s.config = new_config
+        flag_modified(s, "config")
+
+        audit.record(
+            db,
+            action="session.providers.bulk_imported",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
+            metadata={
+                "nap_url": body.nap_url,
+                "filters": {
+                    "country": body.country,
+                    "modes": body.modes,
+                    "include_publishers": body.include_publishers,
+                    "exclude_dataset_ids": body.exclude_dataset_ids,
+                },
+                "added_count": len(result["providers"]),
+                "added_ids": [p["id"] for p in result["providers"]],
+                "skipped_count": len(result["skipped"]),
+            },
+        )
+        db.commit()
+
+    return ImportFromNapResponse(
+        providers=result["providers"],
+        skipped=result["skipped"],
+        warnings=result["warnings"],
+        preview=False,
+    )
+
+
 # ──── per-provider refresh endpoint (v0.1.6) ────
 
 
