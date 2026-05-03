@@ -325,7 +325,10 @@ def delete_session(
 
     # Snapshot what we're about to delete for the audit row — useful when
     # an operator deletes the wrong session and wants to know what was lost.
-    audit_metadata = {
+    # Explicit dict[str, Any] type so the later `setdefault("filesystem_warnings", [])`
+    # below is allowed; without the annotation mypy narrows the value type to
+    # the union of the literal initialiser values and rejects appending a list.
+    audit_metadata: dict[str, Any] = {
         "name": s.name,
         "category": s.category,
         "state": s.state,

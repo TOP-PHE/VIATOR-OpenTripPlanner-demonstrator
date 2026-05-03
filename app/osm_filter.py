@@ -33,7 +33,7 @@ validates writes via `validate_scope()`.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 # Sentinel used by the shell to mean "no filter — copy the PBF as-is".
 SCOPE_COMPREHENSIVE = "comprehensive"
@@ -128,7 +128,14 @@ def osmium_args(scope: str) -> list[str] | None:
     informational logging; the entrypoint shell reads the same data via env.
     """
     scope = validate_scope(scope)
-    return OSM_SCOPE_PRESETS[scope]["tags"]
+    # OSM_SCOPE_PRESETS is dict[str, Any] (mixed value types per preset:
+    # str labels + Optional[list[str]] tag arrays), so ["tags"] is Any.
+    # Cast to satisfy --strict mypy; the preset table is the single source
+    # of truth and is statically defined, so the runtime shape is guaranteed.
+    tags = OSM_SCOPE_PRESETS[scope]["tags"]
+    if tags is None:
+        return None
+    return cast("list[str]", tags)
 
 
 def scope_label(scope: str) -> str:

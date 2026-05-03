@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -408,7 +408,9 @@ async def fetch_datasets(nap_url: str = DEFAULT_FR_NAP_URL) -> list[dict[str, An
         raise ValueError(f"NAP API at {nap_url} returned unexpected shape: {type(data).__name__}")
 
     _cache[nap_url] = (now, datasets)
-    return datasets
+    # Validated above (must be list of dicts); cast satisfies --strict mypy
+    # without an extra runtime walk over the (potentially large) catalogue.
+    return cast("list[dict[str, Any]]", datasets)
 
 
 # ───────────────────── top-level orchestrator ─────────────────────
@@ -454,10 +456,20 @@ async def import_from_nap(
     """
     datasets = await fetch_datasets(nap_url)
 
-    existing_urls = {
-        (p.get("timetable") or {}).get("url") for p in existing_providers if isinstance(p, dict)
+    existing_urls: set[str] = {
+        url
+        for p in existing_providers
+        if isinstance(p, dict)
+        for url in [(p.get("timetable") or {}).get("url")]
+        if isinstance(url, str) and url
     }
-    existing_ids = {p.get("id") for p in existing_providers if isinstance(p, dict) and p.get("id")}
+    existing_ids: set[str] = {
+        pid
+        for p in existing_providers
+        if isinstance(p, dict)
+        for pid in [p.get("id")]
+        if isinstance(pid, str) and pid
+    }
 
     new_providers: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []

@@ -38,7 +38,7 @@ on disk, regardless of timestamps).
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 
 def _now_iso() -> str:
@@ -53,7 +53,10 @@ def _meta(config: dict[str, Any]) -> dict[str, Any]:
         # Operator hand-edited via raw API to a non-dict — replace.
         config["_meta"] = {}
         meta = config["_meta"]
-    return meta
+    # `setdefault` is typed Any; the isinstance guard narrows to dict but
+    # mypy still can't infer the value type, so the explicit cast is the
+    # cheapest way to satisfy --strict. The runtime contract is unchanged.
+    return cast("dict[str, Any]", meta)
 
 
 def mark_sources_changed(config: dict[str, Any]) -> None:
@@ -114,7 +117,10 @@ def sources_subtree_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) ->
     changed (not for osm_scope edits, name renames, etc.). Sorts keys
     where order is irrelevant.
     """
-    return _normalize_sources(a) == _normalize_sources(b)
+    # Wrap in bool() — `_normalize_sources` returns Any (recursive structures
+    # don't have a tight type), and `Any == Any` is also Any, which mypy in
+    # --strict mode flags as a no-any-return on a function declared `-> bool`.
+    return bool(_normalize_sources(a) == _normalize_sources(b))
 
 
 def _normalize_sources(config: dict[str, Any] | None) -> Any:

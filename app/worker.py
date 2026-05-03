@@ -17,6 +17,7 @@ import subprocess
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import asc
 
@@ -248,7 +249,7 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     from . import ingestion, osm_filter, router_config
 
     osm_scope = osm_filter.DEFAULT_SCOPE
-    providers: list[dict] = []
+    providers: list[dict[str, Any]] = []
     if session_id:
         with SessionLocal() as db:
             row = db.get(SessionRow, session_id)

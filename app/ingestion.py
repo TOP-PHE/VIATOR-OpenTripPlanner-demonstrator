@@ -24,6 +24,7 @@ import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy.orm import Session as DbSession
 
@@ -166,7 +167,7 @@ def staged_filename_for_format(feed_id: str, fmt: str) -> str:
 # ──────────────────── Provider-bundle schema (v0.1.6) ────────────────────
 
 
-def normalize_providers(raw_config: dict) -> list[dict]:
+def normalize_providers(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
     """Coerce `config.sources` into a canonical providers list.
 
     Three input shapes accepted, in order of precedence:
@@ -208,7 +209,7 @@ def normalize_providers(raw_config: dict) -> list[dict]:
         if not isinstance(raw_providers, list):
             raise ValueError("config.sources.providers must be a list of provider objects")
         seen_ids: set[str] = set()
-        out_providers: list[dict] = []
+        out_providers: list[dict[str, Any]] = []
         for i, p in enumerate(raw_providers):
             cleaned = _validate_provider(p, i)
             if cleaned["id"] in seen_ids:
@@ -222,9 +223,9 @@ def normalize_providers(raw_config: dict) -> list[dict]:
     feeds = normalize_gtfs_sources(sources.get("gtfs"))
     if not feeds:
         return []
-    providers: list[dict] = []
+    providers: list[dict[str, Any]] = []
     for i, feed in enumerate(feeds):
-        provider: dict = {
+        provider: dict[str, Any] = {
             "id": feed["id"],
             "label": feed["id"],  # operator can rename via UI
             "country_iso": None,
@@ -245,7 +246,7 @@ def normalize_providers(raw_config: dict) -> list[dict]:
     return providers
 
 
-def _validate_provider(raw: object, index: int) -> dict:
+def _validate_provider(raw: object, index: int) -> dict[str, Any]:
     """Validate one provider entry, returning the cleaned dict.
 
     Run on every save (via the session-config PATCH endpoint) and on
@@ -296,7 +297,7 @@ def _validate_provider(raw: object, index: int) -> dict:
             f"providers[{index}].timetable.url={url!r} must be an http(s) URL "
             "(or empty if the operator will upload manually)"
         )
-    timetable: dict = {"format": fmt}
+    timetable: dict[str, Any] = {"format": fmt}
     if url:
         timetable["url"] = url
 
@@ -307,7 +308,7 @@ def _validate_provider(raw: object, index: int) -> dict:
             f"providers[{index}].gtfs_rt must be an object "
             "with optional alerts_url / trip_updates_url / vehicle_positions_url"
         )
-    gtfs_rt: dict = {}
+    gtfs_rt: dict[str, Any] = {}
     for key in ("alerts_url", "trip_updates_url", "vehicle_positions_url"):
         v = (gtfs_rt_raw.get(key) or "").strip()
         if v:
