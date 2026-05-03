@@ -44,14 +44,42 @@ _DOCKER = "/usr/local/bin/docker"
 
 
 def main() -> None:
-    log.info("worker starting; debounce=%ss", settings.debounce_seconds)
+    log.info("worker starting; debounce + tick are live-read from platform_config")
     while True:
         try:
             tick()
             handle_reload_trigger()
         except Exception:
             log.exception("worker tick failed")
-        time.sleep(15)
+        # Tick interval is admin-editable in Admin -> Configuration -> Worker
+        # timing (v0.1.11). config_service caches for 30 s so a save in the
+        # UI takes up to ~30 s + the previous tick's interval to take effect.
+        time.sleep(_tick_seconds())
+
+
+def _tick_seconds() -> int:
+    """Read WORKER_TICK_SECONDS from platform_config, fall back to 15 if the DB
+    is unreachable (so the worker keeps ticking even during a Postgres blip)."""
+    from . import config_service
+
+    try:
+        with SessionLocal() as db:
+            return int(config_service.get(db, "WORKER_TICK_SECONDS"))
+    except Exception:
+        return 15
+
+
+def _debounce_seconds() -> int:
+    """Read REBUILD_DEBOUNCE_SECONDS from platform_config (admin-editable
+    since v0.1.11). Falls back to settings.debounce_seconds (the .env
+    legacy value) if the DB is unreachable."""
+    from . import config_service
+
+    try:
+        with SessionLocal() as db:
+            return int(config_service.get(db, "REBUILD_DEBOUNCE_SECONDS"))
+    except Exception:
+        return settings.debounce_seconds
 
 
 def tick() -> None:
@@ -65,7 +93,7 @@ def tick() -> None:
         if job is None:
             return
 
-        deadline = job.created_at + timedelta(seconds=settings.debounce_seconds)
+        deadline = job.created_at + timedelta(seconds=_debounce_seconds())
         if datetime.now(UTC) < deadline:
             return
 

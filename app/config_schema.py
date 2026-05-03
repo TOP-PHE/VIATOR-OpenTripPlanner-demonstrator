@@ -47,6 +47,17 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # ── Master data refresh ───────────────────────────────────────────
     "MASTER_STATIONS_REFRESH_DAYS": {"type": "int", "default": 30, "min": 1, "max": 365},
     "MASTER_CARRIERS_REFRESH_DAYS": {"type": "int", "default": 90, "min": 1, "max": 365},
+    # ── Worker timing (v0.1.11) ───────────────────────────────────────
+    # How long the worker coalesces rebuild requests for one session in a
+    # window. Default 1800 = 30 min (matches the legacy `.env`
+    # DEBOUNCE_SECONDS the worker was reading from before v0.1.11).
+    # Set to 0 for "rebuild starts on click" (demo-friendly; no coalescing).
+    # The cache TTL is 30 s, so changes here take effect within 30 s.
+    "REBUILD_DEBOUNCE_SECONDS": {"type": "int", "default": 1800, "min": 0, "max": 7200},
+    # How often the worker polls the rebuild_jobs table. Lower = rebuilds
+    # start sooner after their debounce window expires; higher = less DB
+    # chatter. 15 was the hardcoded default before v0.1.11.
+    "WORKER_TICK_SECONDS": {"type": "int", "default": 15, "min": 5, "max": 300},
     # ── Replay safety caps ────────────────────────────────────────────
     "REPLAY_MAX_BATCH_SIZE": {"type": "int", "default": 1000, "min": 10, "max": 10000},
     "REPLAY_MAX_RPS": {"type": "int", "default": 5, "min": 1, "max": 50},
