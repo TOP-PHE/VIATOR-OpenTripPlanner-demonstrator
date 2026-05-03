@@ -30,6 +30,16 @@
     .top .lockup .icon { width: 36px; height: 36px; }
     .top .lockup .word { font-size: 1.3rem; font-weight: 700; letter-spacing: 0.3rem; color: var(--uic-blue); }
     .top .lockup .tag  { font-size: 0.65rem; letter-spacing: 0.18rem; color: var(--rail-steel); text-transform: uppercase; line-height: 1; }
+    /* Version badge — small, muted, sits inline with the VIATOR word so a
+       glance at the header tells the operator which build they're talking to.
+       Cursor stays default (it's not a link) but a tooltip shows the source. */
+    .top .lockup .ver  {
+      display: inline-block; margin-left: 0.6rem; padding: 0.05rem 0.4rem;
+      font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04rem;
+      color: var(--uic-blue); background: #fff;
+      border: 1px solid var(--sleeper); border-radius: 999px;
+      vertical-align: 0.2rem;
+    }
     .top nav { display: flex; gap: 1rem; align-items: center; margin-left: auto; font-size: 0.9rem; }
     .top nav a { color: var(--rail-steel); text-decoration: none; }
     .top nav a:hover { color: var(--uic-blue); text-decoration: underline; }
@@ -94,7 +104,7 @@
           </g>
         </svg>
         <span>
-          <span class="word">VIATOR</span><br>
+          <span class="word">VIATOR</span>{# Version badge: comes from app/templating.py global, baked into the image at build time. #}<span class="ver" title="Build version (baked into the web image at build time). Also at /healthz/version.">{{ viator_version }}</span><br>
           <span class="tag">UIC · MERITS Journey Planner</span>
         </span>
       </a>

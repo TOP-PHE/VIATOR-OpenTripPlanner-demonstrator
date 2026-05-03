@@ -15,7 +15,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -27,9 +26,9 @@ from ..security import (
     _decode_to_user,
     _extract_jwt,
 )
+from ..templating import templates  # shared Jinja env — version global lives here
 
 router = APIRouter(tags=["pages"])
-templates = Jinja2Templates(directory="app/templates")
 
 
 # ────────────────────────── helpers ──────────────────────────

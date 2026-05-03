@@ -79,6 +79,23 @@ jobs:
             org.opencontainers.image.vendor=TrackOnPath
             org.opencontainers.image.licenses=Apache-2.0
 
+      # Compute the version label baked into the web image. `metadata-action`
+      # publishes `outputs.version` as the canonical single tag for this build:
+      #   - tag push (e.g. `v0.1.8`)  → `0.1.8`           (semver pattern wins)
+      #   - main push                 → `main`
+      #   - PR build                  → `pr-NN`
+      # We reattach the leading `v` for tag pushes so the badge matches the
+      # human-facing release name (`v0.1.8`, not the bare semver). Falls back
+      # to the raw value for non-tag refs.
+      - name: Compute VIATOR_VERSION label
+        id: version_label
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "value=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ steps.meta.outputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
       # Build and load locally so Trivy can scan before pushing.
       - name: Build (load locally for scan)
         uses: docker/build-push-action@v7
@@ -89,6 +106,12 @@ jobs:
           tags: viator-${{ matrix.image.name }}:scan
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
+          # Stamp the web image with the release version so the UI badge +
+          # /healthz/version report what's actually running. The OTP image
+          # ignores this build-arg (no ARG declared in its Dockerfile —
+          # docker just discards unknown args, no warning).
+          build-args: |
+            VIATOR_VERSION=${{ steps.version_label.outputs.value }}
 
       # Diagnostic pass — prints findings to stdout (visible inline in the job log).
       # Never fails (exit-code 0). When the gating step below fails, this is your
@@ -151,6 +174,8 @@ jobs:
           retention-days: 14
 
       # Only after Trivy passes do we push (pushed image is bit-identical thanks to BuildKit).
+      # Same build-args as the scan step — must match or BuildKit re-runs the
+      # build instead of reusing the cached layers.
       - name: Build and push (multi-tag)
         if: env.PUSH == 'true'
         uses: docker/build-push-action@v7
@@ -162,6 +187,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
+          build-args: |
+            VIATOR_VERSION=${{ steps.version_label.outputs.value }}
 
   hadolint:
     name: Hadolint (Dockerfile lint)

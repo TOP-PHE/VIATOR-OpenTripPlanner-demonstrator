@@ -57,6 +57,23 @@ COPY branding ./branding
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
+# ─────────────────────── version stamp ───────────────────────
+# Burned-in version label, surfaced in the UI header (badge next to the
+# VIATOR lockup) and at /healthz/version. The CI workflow passes the git
+# tag here (e.g. `v0.1.8`); local `docker compose build` inherits the
+# default `dev` so you can tell at a glance the image isn't a release.
+#
+# Why ARG + ENV: the ARG is only set during build, but `Settings()` reads
+# the value from the process environment at runtime. Promoting it to ENV
+# is what makes it survive into the running container.
+#
+# Runtime override: docker-compose.yml passes `VIATOR_VERSION` from the
+# host `.env`, which wins over this baked value. That's deliberate — local
+# overrides for dev/debug work.
+ARG VIATOR_VERSION=dev
+ENV VIATOR_VERSION=${VIATOR_VERSION}
+LABEL org.opencontainers.image.version="${VIATOR_VERSION}"
+
 EXPOSE 8000
 
 # Web container: run pending migrations, then start uvicorn.

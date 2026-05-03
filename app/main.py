@@ -19,7 +19,6 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
@@ -39,12 +38,12 @@ from .models import RebuildJob, Upload
 from .rate_limit import limiter
 from .security import authed, authed_or_none
 from .settings import settings
+from .templating import templates  # shared Jinja env — version global lives here
 
 log = logging.getLogger(__name__)
 
 
 app = FastAPI(title="VIATOR — feed ingestion")
-templates = Jinja2Templates(directory="app/templates")
 
 
 # ────────────────────────── rate-limit wiring ──────────────────────────
@@ -265,3 +264,19 @@ async def _do_upload(
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/healthz/version")
+def healthz_version() -> dict[str, str]:
+    """Reports which build of VIATOR is actually running.
+
+    Use this to verify the deployed container without opening the UI:
+        curl -s https://your-host/healthz/version
+        → {"version": "v0.1.8"}
+
+    The value is whatever was baked into the image at build time via the
+    `VIATOR_VERSION` Docker ARG (set by the GHA workflow from the git tag),
+    overridable at runtime by the `VIATOR_VERSION` env var in compose.
+    Defaults to "dev" on local builds that didn't pass the build-arg.
+    """
+    return {"version": settings.viator_version}

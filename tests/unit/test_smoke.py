@@ -74,6 +74,8 @@ EXPECTED_MODULES = [
     "app.journey.recorder",
     "app.journey.otp_client",
     "app.retention",
+    # version badge — shared Jinja env that registers the viator_version global
+    "app.templating",
 ]
 
 

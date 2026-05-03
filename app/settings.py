@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     # Used to build magic-link URLs in confirmation / password-reset emails.
     public_base_url: str = "http://localhost:8000"
 
+    # Build/release version surfaced in the UI header and /healthz/version.
+    # Baked into the web image at build time via a Docker `ARG VIATOR_VERSION`
+    # promoted to ENV (see docker/web/Dockerfile). The GHA workflow sets it
+    # from the git tag (e.g. `v0.1.8`); local `docker compose build` passes
+    # the value of the host-side `.env` `VIATOR_VERSION` — see compose `args:`.
+    # If the env var is missing entirely (running tests, bare `python -m app`),
+    # default `"dev"` keeps the badge non-blank.
+    viator_version: str = "dev"
+
     class Config:
         env_file = ".env"
 

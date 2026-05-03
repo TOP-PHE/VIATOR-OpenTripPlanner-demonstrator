@@ -37,6 +37,12 @@ services:
     build:
       context: ..               # repo root (so app/ and requirements.txt are visible)
       dockerfile: docker/web/Dockerfile
+      args:
+        # Bake VIATOR_VERSION into the image (UI header badge + /healthz/version).
+        # Defaults to `dev` if .env doesn't set it. Pulled images from GHCR
+        # already carry the build-time stamp from CI; this only matters for
+        # `docker compose build` on local/VPS hosts.
+        VIATOR_VERSION: ${VIATOR_VERSION:-dev}
     restart: unless-stopped
     # Pin DNS resolvers explicitly. Docker's default embedded DNS (127.0.0.11)
     # forwards to the host's /etc/resolv.conf, which on Ubuntu 24.04 points
@@ -59,6 +65,12 @@ services:
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # NOTE: VIATOR_VERSION (UI header badge + /healthz/version) is intentionally
+      # NOT overridden here. The image's built-in `ENV VIATOR_VERSION=...` (set
+      # at build time from the git tag, see docker/web/Dockerfile) is the source
+      # of truth — that's what tells operators which build is *actually running*.
+      # Override the .env `VIATOR_VERSION` to pull a different image tag, not
+      # to relabel the UI of an image you've already pulled.
     volumes:
       - inbox:/data/inbox
       - graphs:/data/graphs
