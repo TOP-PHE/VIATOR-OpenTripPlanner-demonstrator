@@ -11,8 +11,10 @@ UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner.
 |---|---|
 | [`VIATOR-strategy.md`](VIATOR-strategy.md) | Why this exists, data sources, master data, multi-session strategy, roadmap |
 | [`VIATOR-technical-spec.md`](VIATOR-technical-spec.md) | Detailed engineering spec — data model, APIs, DevOps, implementation order |
-| [`docker/README.md`](docker/README.md) | Phase-1 container stack documentation |
-| [`docker/INSTALL.md`](docker/INSTALL.md) | VPS install procedure |
+| [`docs/admin-guide.md`](docs/admin-guide.md) | **Admin guide** — release workflow on GitHub, deploy to the VPS, day-2 maintenance, troubleshooting |
+| [`docs/nap-fr-rail.md`](docs/nap-fr-rail.md) | Operator walkthrough — building a France-wide rail demonstrator from the National Access Point |
+| [`docker/README.md`](docker/README.md) | Container stack reference (volumes, ports, generated files) |
+| [`docker/INSTALL.md`](docker/INSTALL.md) | First-time VPS install procedure (provisioning → bootstrap → HTTPS) |
 | [`branding/VIATOR-brand-brief.md`](branding/VIATOR-brand-brief.md) | Brand identity (icon, palette, typography) |
 
 ## Repository layout
