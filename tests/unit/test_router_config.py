@@ -97,3 +97,98 @@ def test_partial_rt_only_emits_present_keys():
     # Only alerts URL → only one updater entry
     assert len(cfg["updaters"]) == 1
     assert cfg["updaters"][0]["type"] == "real-time-alerts"
+
+
+# ─────────────────────── credentials integration (v0.1.10) ───────────────────────
+
+
+def _render_with_creds(providers, credentials):
+    from app.router_config import render_router_config
+
+    return json.loads(render_router_config(providers, credentials=credentials))
+
+
+def test_provider_without_credential_id_emits_no_headers():
+    """Pre-v0.1.10 sessions (no credential_id) must keep behaving exactly as before."""
+    cfg = _render_with_creds(
+        [{"id": "SNCF", "gtfs_rt": {"alerts_url": "https://a/alerts"}}],
+        credentials={"some-id": ("bearer", "token", None)},
+    )
+    updater = cfg["updaters"][0]
+    assert "headers" not in updater
+    assert updater["url"] == "https://a/alerts"
+
+
+def test_bearer_credential_adds_headers_on_updater():
+    cfg = _render_with_creds(
+        [
+            {
+                "id": "SNCF",
+                "gtfs_rt": {"alerts_url": "https://a/alerts"},
+                "gtfs_rt_credential_id": "cred-1",
+            },
+        ],
+        credentials={"cred-1": ("bearer", "my-token", None)},
+    )
+    updater = cfg["updaters"][0]
+    assert updater["headers"] == {"Authorization": "Bearer my-token"}
+    # URL unchanged for header-style auth.
+    assert updater["url"] == "https://a/alerts"
+
+
+def test_query_credential_appends_param_to_url():
+    cfg = _render_with_creds(
+        [
+            {
+                "id": "SNCF",
+                "gtfs_rt": {"alerts_url": "https://api.sncf.com/alerts"},
+                "gtfs_rt_credential_id": "cred-1",
+            },
+        ],
+        credentials={"cred-1": ("query", "MY_KEY", "apikey")},
+    )
+    updater = cfg["updaters"][0]
+    assert updater["url"] == "https://api.sncf.com/alerts?apikey=MY_KEY"
+    # Query auth never adds headers.
+    assert "headers" not in updater
+
+
+def test_one_credential_applied_to_all_three_rt_urls():
+    """gtfs_rt_credential_id covers alerts + trip_updates + vehicle_positions
+    on the same provider (they're virtually always on the same domain)."""
+    cfg = _render_with_creds(
+        [
+            {
+                "id": "SNCF",
+                "gtfs_rt": {
+                    "alerts_url": "https://a/alerts",
+                    "trip_updates_url": "https://a/trip",
+                    "vehicle_positions_url": "https://a/vehicle",
+                },
+                "gtfs_rt_credential_id": "cred-1",
+            },
+        ],
+        credentials={"cred-1": ("header", "secret-value", "X-API-Key")},
+    )
+    assert len(cfg["updaters"]) == 3
+    for u in cfg["updaters"]:
+        assert u["headers"] == {"X-API-Key": "secret-value"}
+
+
+def test_missing_credential_in_map_falls_back_to_anonymous():
+    """If the worker can't decrypt a credential (e.g. JWT_SECRET rotated),
+    it omits the entry from the map. Render then falls back to anonymous
+    rather than crashing or refusing to emit the updater."""
+    cfg = _render_with_creds(
+        [
+            {
+                "id": "SNCF",
+                "gtfs_rt": {"alerts_url": "https://a/alerts"},
+                "gtfs_rt_credential_id": "missing-cred",
+            },
+        ],
+        credentials={},  # the credential the provider points at isn't here
+    )
+    updater = cfg["updaters"][0]
+    assert updater["url"] == "https://a/alerts"
+    assert "headers" not in updater

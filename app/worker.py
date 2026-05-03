@@ -15,6 +15,7 @@ import logging
 import shutil
 import subprocess
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -250,6 +251,15 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
 
     osm_scope = osm_filter.DEFAULT_SCOPE
     providers: list[dict[str, Any]] = []
+    # Map of credential_id → (auth_type, plaintext, param_name) for any
+    # credentials referenced by GTFS-RT URLs in this session's providers.
+    # Resolved here (with DB session in scope) so router_config.py stays pure.
+    # Value tuple matches `app.router_config.ResolvedCredentials`'s schema —
+    # auth_type is one of the AuthType literals; we cast at insert time.
+    from .credentials import AuthType as _AuthType
+
+    rt_credentials: dict[str, tuple[_AuthType, str, str | None]] = {}
+
     if session_id:
         with SessionLocal() as db:
             row = db.get(SessionRow, session_id)
@@ -265,6 +275,66 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                         "session %s has bad provider config: %s — using empty list", sid, exc
                     )
 
+                # Materialise credentials for GTFS-RT URLs (v0.1.10). We
+                # only resolve `gtfs_rt_credential_id` here because OTP
+                # is the only consumer of this map; timetable/mct/stations
+                # credentials apply at refresh time (handled by
+                # `_refresh_one_task` in app/api/admin/sessions.py).
+                from . import credentials as crypto_module
+                from .models import UserCredential
+
+                # Set comprehension produces set[Any | None] under --strict;
+                # we narrow to set[str] explicitly so the loop variable is str
+                # (and the dict key type matches `rt_credentials`'s annotation).
+                referenced_ids: set[str] = {
+                    p["gtfs_rt_credential_id"]
+                    for p in providers
+                    if isinstance(p.get("gtfs_rt_credential_id"), str)
+                    and p["gtfs_rt_credential_id"]
+                }
+                for cid in referenced_ids:
+                    try:
+                        cred = db.get(UserCredential, uuid.UUID(cid))
+                    except (ValueError, TypeError):
+                        log.warning(
+                            "session %s references malformed credential id %r — skipping",
+                            sid,
+                            cid,
+                        )
+                        continue
+                    if cred is None:
+                        log.warning(
+                            "session %s references credential %s — not found, "
+                            "GTFS-RT for the affected provider will be unauthenticated",
+                            sid,
+                            cid,
+                        )
+                        continue
+                    try:
+                        plaintext = crypto_module.decrypt(
+                            cred.ciphertext, cred.nonce, settings.jwt_secret
+                        )
+                    except crypto_module.CredentialDecryptError as exc:
+                        log.error(
+                            "session %s credential %r cannot be decrypted: %s — "
+                            "GTFS-RT for the affected provider will be unauthenticated",
+                            sid,
+                            cred.name,
+                            exc,
+                        )
+                        continue
+                    # cred.auth_type is `str` in the ORM but the value is
+                    # constrained by the DB CHECK + app-side validate to one
+                    # of the AuthType literals. The cast is the cheapest way
+                    # to satisfy --strict mypy without runtime overhead.
+                    from typing import cast as _cast
+
+                    rt_credentials[cid] = (
+                        _cast("_AuthType", cred.auth_type),
+                        plaintext,
+                        cred.param_name,
+                    )
+
     # Generate per-session router-config.json. The entrypoint copies it
     # into BUILD_DIR (overriding the baked image default) before launching
     # OTP, so each provider's GTFS-RT URLs become real-time updaters at
@@ -274,7 +344,10 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
             session_inbox = ingestion.session_inbox(session_id)
             session_inbox.mkdir(parents=True, exist_ok=True)
             (session_inbox / "router-config.json").write_text(
-                router_config.render_router_config(providers),
+                router_config.render_router_config(
+                    providers,
+                    credentials=rt_credentials or None,
+                ),
                 encoding="utf-8",
             )
         except Exception as exc:

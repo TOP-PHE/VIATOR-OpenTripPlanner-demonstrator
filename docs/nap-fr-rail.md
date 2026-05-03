@@ -160,6 +160,16 @@ the graph rebuilds + promotes):
 | `IDFM` | (none — IDFM uses SIRI, requires a free PRIM account; not yet wired) | (none) |
 | `TRENITALIA` | (none yet) | `https://proxy.transport.data.gouv.fr/resource/trenitalia-gtfs-rt` |
 
+> **Authenticated GTFS-RT (v0.1.10):** if you'd rather use SNCF's
+> first-party `https://api.sncf.com/v1/coverage/...` endpoints (more
+> stable than the proxy and lets you set your own polling SLA), they
+> require an API key. Save it once at **Top nav → My credentials**
+> (auth scheme: `query`, param name: `apikey`), then pick that
+> credential from the dropdown next to the GTFS-RT URL on the SNCF
+> provider card. The same credential covers all three GTFS-RT URLs
+> (alerts + trip updates + vehicle positions). See `docs/admin-guide.md`
+> §9 for the full credential-management workflow.
+
 ### 3.2 Cross-border extensions
 
 Add when you want continuations into the UK, Spain, or Italy:

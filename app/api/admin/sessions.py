@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -50,6 +52,8 @@ from ...security import (
     require_platform_admin,
 )
 from ...settings import settings
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sessions", tags=["admin", "sessions"])
 
@@ -780,11 +784,14 @@ def _stat_size(p: Path) -> int:
 # ──── refresh task model — used by both session-wide and per-provider ────
 
 
-# Per-task tuple shape: (label, kind, url, staged_filename_or_None).
+# Per-task tuple shape: (label, kind, url, staged_filename_or_None, credential_id_or_None).
 # `label` is what we surface in the API response — operators see things
 # like `gtfs[SNCF]` (multi-feed legacy) or `provider[SNCF].timetable`
 # (provider-bundle v0.1.6) or `provider[SNCF].mct` etc., not just bare keys.
-_RefreshTask = tuple[str, str, str, str | None]
+# `credential_id` (v0.1.10) is the optional UUID of a user_credentials row
+# whose decrypted secret should be applied to the HTTP request. None means
+# anonymous fetch (the v0.1.6-v0.1.9 default behaviour).
+_RefreshTask = tuple[str, str, str, str | None, str | None]
 
 
 def _build_refresh_tasks(
@@ -835,10 +842,19 @@ def _build_refresh_tasks(
                     kind,
                     tt_url,
                     ingestion.staged_filename_for_format(pid, tt_fmt),
+                    p.get("timetable_credential_id"),
                 )
             )
         if p.get("mct_url"):
-            tasks.append((f"provider[{pid}].mct", "SNCF-MCT", p["mct_url"], None))
+            tasks.append(
+                (
+                    f"provider[{pid}].mct",
+                    "SNCF-MCT",
+                    p["mct_url"],
+                    None,
+                    p.get("mct_credential_id"),
+                )
+            )
         if p.get("stations_csv_url"):
             tasks.append(
                 (
@@ -846,12 +862,14 @@ def _build_refresh_tasks(
                     "SNCF-Stations",
                     p["stations_csv_url"],
                     None,
+                    p.get("stations_csv_credential_id"),
                 )
             )
 
     # Session-level OSM PBF (only on full refresh, not per-provider).
+    # Geofabrik-class hosts don't require auth, so no credential field today.
     if only_provider is None and isinstance(sources.get("osm_pbf"), str) and sources["osm_pbf"]:
-        tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None))
+        tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks
 
@@ -867,16 +885,50 @@ async def _refresh_one_task(
     `status: fetched` or `status: skipped`. Wrapped error handling so the
     per-task failure doesn't abort the rest of the batch.
     """
-    label, kind, url, staged_filename = task
+    label, kind, url, staged_filename, credential_id = task
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return {"status": "skipped", "key": label, "url": url, "reason": "not an http(s) URL"}
+
+    # Resolve credential (v0.1.10) — none → fetch anonymously, missing →
+    # skip with a clear reason so the operator knows to detach or pick a
+    # different one. Decryption failure (e.g. JWT_SECRET rotated) is
+    # surfaced the same way: this task fails, but other tasks proceed.
+    extra_headers: dict[str, str] = {}
+    fetch_url = url
+    cred = None
+    if credential_id:
+        # Triple-dot: this file is at app/api/admin/sessions.py; we need
+        # `app.credentials` (the crypto module) and `app.models`. Single-dot
+        # would resolve to `app.api.credentials` (the router we just added).
+        from ... import credentials as crypto_module
+        from ...models import UserCredential
+
+        cred = db.get(UserCredential, uuid.UUID(credential_id))
+        if cred is None:
+            return {
+                "status": "skipped",
+                "key": label,
+                "url": url,
+                "reason": f"credential {credential_id} not found (was it deleted?)",
+            }
+        try:
+            fetch_url, extra_headers = crypto_module.apply_credential(
+                cred, url, settings.jwt_secret
+            )
+        except crypto_module.CredentialDecryptError as exc:
+            return {
+                "status": "skipped",
+                "key": label,
+                "url": url,
+                "reason": f"credential {cred.name!r} cannot be decrypted: {exc}",
+            }
 
     base_key = label.split("[", 1)[0]
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     staged_name = f"{ts}-{base_key}{_url_suffix(url)}"
     staged_path = staging / staged_name
     try:
-        async with client.stream("GET", url) as response:
+        async with client.stream("GET", fetch_url, headers=extra_headers) as response:
             response.raise_for_status()
             with staged_path.open("wb") as out:
                 async for chunk in response.aiter_bytes(1024 * 1024):
@@ -884,6 +936,16 @@ async def _refresh_one_task(
     except httpx.HTTPError as exc:
         staged_path.unlink(missing_ok=True)
         return {"status": "skipped", "key": label, "url": url, "reason": f"download failed: {exc}"}
+
+    # Stamp last_used_at on the credential so users can see "this hasn't
+    # been used in months — maybe drop it." Best-effort; failures here
+    # don't fail the refresh.
+    if cred is not None:
+        try:
+            cred.last_used_at = datetime.now(UTC)
+            db.flush()
+        except Exception as exc:
+            log.warning("could not stamp last_used_at on credential %s: %s", cred.id, exc)
 
     size_bytes = _stat_size(staged_path)
     try:

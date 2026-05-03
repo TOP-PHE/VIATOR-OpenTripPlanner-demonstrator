@@ -1,4 +1,4 @@
-"""Per-session router-config.json generation (v0.1.7).
+"""Per-session router-config.json generation (v0.1.7, credentials in v0.1.10).
 
 OTP reads `router-config.json` at graph-load time and uses it to wire up
 real-time updaters, routing defaults, and the API server. Pre-v0.1.7 we
@@ -22,12 +22,25 @@ Updater types we generate:
 
 `feedId` on each updater MUST match the provider's id from build-config's
 `transitFeeds[i].feedId` so OTP knows which feed the updates apply to.
+
+**Credentials (v0.1.10):** when a provider declares `gtfs_rt_credential_id`,
+the caller passes a `credentials` mapping (id → (auth_type, plaintext,
+param_name)) and we apply it via `app.credentials.apply_to_request` to each
+URL. For `bearer/basic/header` auth, the resulting headers go in OTP's
+`headers` dict on the updater. For `query` auth, the param is appended to
+the URL — OTP fetches the auth-stamped URL transparently.
+
+This module stays pure (no DB, no crypto). The worker resolves DB +
+decrypts and passes the materialised mapping in.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
+
+from .credentials import AuthType, apply_to_request
 
 # Defaults baked into every per-session config. Mirrors the static
 # `docker/otp/router-config.json` to preserve behaviour for sessions
@@ -57,13 +70,54 @@ _DEFAULT_ROUTING_DEFAULTS = {
 }
 
 
-def render_router_config(providers: list[dict[str, Any]]) -> str:
+# Type alias for the credentials map the caller passes in.
+# Key:    credential_id (UUID as str, matches what's in provider config).
+# Value:  (auth_type, plaintext, param_name_or_None).
+# The caller is responsible for decryption; we just apply.
+ResolvedCredentials = Mapping[str, tuple[AuthType, str, str | None]]
+
+
+def _apply_url_auth(
+    url: str,
+    credential_id: str | None,
+    credentials: ResolvedCredentials | None,
+) -> tuple[str, dict[str, str]]:
+    """Return (final_url, headers) after applying optional credential.
+
+    If credential_id is None or not in the map (e.g. credential was
+    deleted between save and config-render), we silently fall back to
+    the bare URL with no headers. The refresh path will surface the
+    "credential not found" error separately.
+    """
+    if not credential_id or not credentials or credential_id not in credentials:
+        return url, {}
+    auth_type, plaintext, param_name = credentials[credential_id]
+    if auth_type == "none":
+        return url, {}
+    return apply_to_request(
+        url,
+        auth_type=auth_type,
+        plaintext=plaintext,
+        param_name=param_name,
+    )
+
+
+def render_router_config(
+    providers: list[dict[str, Any]],
+    *,
+    credentials: ResolvedCredentials | None = None,
+) -> str:
     """Build a router-config.json document for one session.
 
     `providers` is the canonical list returned by
     `app.ingestion.normalize_providers()`. Provider entries without any
     GTFS-RT URLs contribute zero updaters; the order of updaters in the
     output mirrors the operator-declared provider order.
+
+    `credentials` (v0.1.10) is optional. When provided, GTFS-RT updaters
+    whose provider declares `gtfs_rt_credential_id` get the credential
+    applied — query-style → URL gets the param appended; header/bearer/
+    basic → an OTP `headers` dict is emitted on the updater entry.
     """
     updaters = []
     for p in providers:
@@ -71,33 +125,29 @@ def render_router_config(providers: list[dict[str, Any]]) -> str:
         rt = p.get("gtfs_rt") or {}
         if not feed_id or not isinstance(rt, dict):
             continue
-        if rt.get("alerts_url"):
-            updaters.append(
-                {
-                    "type": "real-time-alerts",
-                    "feedId": feed_id,
-                    "url": rt["alerts_url"],
-                    "frequency": "1m",
-                }
-            )
-        if rt.get("trip_updates_url"):
-            updaters.append(
-                {
-                    "type": "stop-time-updater",
-                    "feedId": feed_id,
-                    "url": rt["trip_updates_url"],
-                    "frequency": "1m",
-                }
-            )
-        if rt.get("vehicle_positions_url"):
-            updaters.append(
-                {
-                    "type": "vehicle-positions",
-                    "feedId": feed_id,
-                    "url": rt["vehicle_positions_url"],
-                    "frequency": "1m",
-                }
-            )
+        cred_id = p.get("gtfs_rt_credential_id")
+
+        for url_key, otp_type in (
+            ("alerts_url", "real-time-alerts"),
+            ("trip_updates_url", "stop-time-updater"),
+            ("vehicle_positions_url", "vehicle-positions"),
+        ):
+            url = rt.get(url_key)
+            if not url:
+                continue
+            final_url, headers = _apply_url_auth(url, cred_id, credentials)
+            entry: dict[str, Any] = {
+                "type": otp_type,
+                "feedId": feed_id,
+                "url": final_url,
+                "frequency": "1m",
+            }
+            # OTP 2.x accepts `headers` on real-time updaters. Omit the
+            # key entirely when there are none (some OTP versions warn
+            # on empty objects).
+            if headers:
+                entry["headers"] = headers
+            updaters.append(entry)
 
     config: dict[str, Any] = {
         "server": _DEFAULT_SERVER,

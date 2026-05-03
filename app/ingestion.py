@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -325,14 +326,44 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
             raise ValueError(f"providers[{index}].{key}={v!r} must be an http(s) URL")
         return v
 
+    # ── credential ids (v0.1.10, optional) ───────────────────────────
+    # Each URL field can pair with a `<field>_credential_id` referencing
+    # a row in user_credentials. We don't validate the UUID exists here
+    # (that's the refresh-time concern; users delete credentials
+    # asynchronously). We do validate it's at least UUID-shaped to catch
+    # typos early.
+    def _opt_cred_id(key: str) -> str | None:
+        v = raw.get(key)
+        if v is None or v == "":
+            return None
+        s = str(v).strip()
+        # uuid.UUID() raises ValueError on bad input; we wrap it for a
+        # field-prefixed message.
+        try:
+            uuid.UUID(s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"providers[{index}].{key}={v!r} must be a UUID "
+                f"(referencing a row in user_credentials)"
+            ) from exc
+        return s
+
     return {
         "id": feed_id,
         "label": label,
         "country_iso": country_iso,
         "timetable": timetable,
+        "timetable_credential_id": _opt_cred_id("timetable_credential_id"),
         "gtfs_rt": gtfs_rt,
+        # One credential applies to all three GTFS-RT URLs (alerts,
+        # trip_updates, vehicle_positions) — they're virtually always on
+        # the same domain with the same auth scheme. Per-URL credentials
+        # would inflate the schema for negligible flexibility.
+        "gtfs_rt_credential_id": _opt_cred_id("gtfs_rt_credential_id"),
         "mct_url": _opt_url("mct_url"),
+        "mct_credential_id": _opt_cred_id("mct_credential_id"),
         "stations_csv_url": _opt_url("stations_csv_url"),
+        "stations_csv_credential_id": _opt_cred_id("stations_csv_credential_id"),
     }
 
 
