@@ -64,6 +64,15 @@
             <form data-form="config" data-sid="{{ s.id }}">
               <fieldset class="providers-fieldset" data-role="providers">
                 <legend>Providers</legend>
+                {# Accordion controls (v0.1.12): Expand/Collapse all toggles every
+                   provider's <details> at once. Useful when a session has 10+
+                   providers from a NAP bulk-import and you want to hunt one
+                   specific row without scrolling through expanded forms. #}
+                <div class="providers-toolbar" data-role="providers-toolbar" hidden>
+                  <button type="button" class="secondary" data-action="expand-all-providers" title="Open every provider card">▾ Expand all</button>
+                  <button type="button" class="secondary" data-action="collapse-all-providers" title="Close every provider card">▸ Collapse all</button>
+                  <span class="hint" data-role="providers-count" style="margin-left: auto; align-self: center"></span>
+                </div>
                 <div data-role="providers-rows"></div>
                 <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                   <button type="button" class="secondary" data-action="add-provider">+ Add provider</button>
@@ -164,11 +173,20 @@
       <form id="nap-form">
         <input type="hidden" id="nap-sid">
 
-        <label>NAP catalogue URL</label>
-        <input id="nap-url" type="url" required value="https://transport.data.gouv.fr/api/datasets">
-        <p class="hint" style="margin: 0.15rem 0 0.5rem">
-          Defaults to the French NAP. Other DCAT-compliant NAPs (German <code>mobilithek.info</code>,
-          Swedish Trafiklab, etc.) work too — paste their <code>/api/datasets</code> equivalent.
+        {# v0.1.12: catalogue dropdown replaces the free-text URL input.
+           Catalogues are managed at /admin/nap-catalogues (platform_admin
+           only). Selecting one auto-fills country + modes from the catalogue's
+           defaults so the operator doesn't re-pick on every import. The
+           credential (if any) is applied server-side; the operator never
+           sees the secret. #}
+        <label>Catalogue
+          <a href="/admin/nap-catalogues" target="_blank" rel="noopener" style="float: right; font-weight: normal; font-size: 0.8rem">manage catalogues ↗</a>
+        </label>
+        <select id="nap-catalogue" required>
+          <option value="">— Loading… —</option>
+        </select>
+        <p class="hint" id="nap-catalogue-detail" style="margin: 0.15rem 0 0.5rem; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem">
+          &nbsp;
         </p>
 
         <div style="display: grid; grid-template-columns: 8rem 1fr; gap: 0.4rem 0.6rem; align-items: baseline">
@@ -229,6 +247,11 @@
   .provider-card[open] { box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
   .provider-card > summary { padding: 0.5rem 0.8rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
   .provider-card > summary::-webkit-details-marker { color: var(--rail-steel); }
+  /* Accordion toolbar (v0.1.12). Hidden via [hidden] when there are no
+     providers; revealed via JS when populateProvidersList runs with N>=1. */
+  .providers-toolbar { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; align-items: center; }
+  .providers-toolbar[hidden] { display: none; }
+  .providers-toolbar button { padding: 0.2rem 0.6rem; font-size: 0.8rem; }
   .prov-summary-label { font-weight: 600; }
   .prov-summary-actions { display: flex; gap: 0.4rem; align-items: center; }
   .prov-summary-actions button { padding: 0.2rem 0.6rem; font-size: 0.8rem; }
@@ -399,17 +422,24 @@ const TIMETABLE_FORMAT_LABELS = {
 
 function escAttr(s) { return (s || '').toString().replace(/"/g, '&quot;'); }
 
-function providerCardHTML(p) {
-  // One <details> per provider — collapsed by default beyond the first
-  // (rendering decides; defaults set in populateProvidersList).
+function providerCardHTML(p, opts) {
+  // One <details> per provider. v0.1.12: cards are collapsed by default
+  // (operators were drowning in a sea of open forms when a session had
+  // 10+ providers from a NAP bulk-import). The first card stays open
+  // when populateProvidersList kicks off render — see `openByDefault`
+  // below — so a new operator on a fresh session immediately sees the
+  // form they're meant to fill in. Subsequent cards open only on click,
+  // or via the Expand-all toolbar button.
+  //
   // Field names are scoped via class= on inputs — the form-submit
   // handler walks `.provider-card` rows and reads each input by class.
   const tt = p.timetable || {};
   const rt = p.gtfs_rt || {};
   const summaryLabel = (p.label || p.id || '(unnamed)') +
     (p.country_iso ? ` — ${p.country_iso}` : '');
+  const openAttr = (opts && opts.openByDefault) ? ' open' : '';
   return `
-    <details class="provider-card" open>
+    <details class="provider-card"${openAttr}>
       <summary>
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
         <span class="prov-summary-actions">
@@ -602,18 +632,49 @@ function populateProvidersList(form, sources) {
     // Start with one blank card so the operator has something to fill.
     providers = [{id: '', label: '', country_iso: null, timetable: {format: 'gtfs', url: ''}, gtfs_rt: {}}];
   }
-  providers.forEach(p => rows.insertAdjacentHTML('beforeend', providerCardHTML(p)));
+  // v0.1.12 accordion: only the first card opens by default, the rest stay
+  // collapsed. With 10+ providers this is the difference between "I can
+  // see what I'm doing" and "wall of nested forms".
+  providers.forEach((p, i) =>
+    rows.insertAdjacentHTML('beforeend', providerCardHTML(p, {openByDefault: i === 0})),
+  );
+  syncProvidersToolbar(form);
+}
+
+// v0.1.12: show/hide the Expand-all/Collapse-all toolbar based on whether
+// there's anything to expand. Also surfaces the count.
+function syncProvidersToolbar(form) {
+  const toolbar = form.querySelector('[data-role="providers-toolbar"]');
+  const count = form.querySelectorAll('.provider-card').length;
+  if (!toolbar) return;
+  toolbar.hidden = count < 1;
+  const label = toolbar.querySelector('[data-role="providers-count"]');
+  if (label) label.textContent = count === 0 ? '' : `${count} provider${count === 1 ? '' : 's'}`;
 }
 
 // ─── Configure (PATCH config.sources) ───────────────────────────────
 document.querySelectorAll('form[data-form="config"]').forEach(form => {
-  // Add-provider button: append a blank card.
+  // Add-provider button: append a blank card. New cards open by default
+  // (the operator just clicked Add — they want to see the form right away),
+  // overriding the closed-by-default rule for bulk-loaded cards.
   form.querySelector('button[data-action="add-provider"]')?.addEventListener('click', () => {
     const rows = form.querySelector('div[data-role="providers-rows"]');
     rows.insertAdjacentHTML(
       'beforeend',
-      providerCardHTML({id: '', label: '', country_iso: null, timetable: {format: 'gtfs', url: ''}, gtfs_rt: {}}),
+      providerCardHTML(
+        {id: '', label: '', country_iso: null, timetable: {format: 'gtfs', url: ''}, gtfs_rt: {}},
+        {openByDefault: true},
+      ),
     );
+    syncProvidersToolbar(form);
+  });
+
+  // v0.1.12: Expand-all / Collapse-all accordion toolbar.
+  form.querySelector('button[data-action="expand-all-providers"]')?.addEventListener('click', () => {
+    form.querySelectorAll('.provider-card').forEach(c => c.open = true);
+  });
+  form.querySelector('button[data-action="collapse-all-providers"]')?.addEventListener('click', () => {
+    form.querySelectorAll('.provider-card').forEach(c => c.open = false);
   });
 
   // Import-from-NAP button: open the modal pre-bound to this session.
@@ -623,6 +684,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     document.getElementById('nap-result').innerHTML = '';
     document.querySelector('button[data-action="nap-confirm"]').disabled = true;
     document.getElementById('nap-modal').hidden = false;
+    // v0.1.12: fetch catalogues every time the modal opens so freshly-added
+    // catalogues are visible without a page reload. Cheap call (~<1KB).
+    napLoadCatalogues();
   });
   // Event delegation: remove provider, refresh-this-provider, summary auto-update.
   form.addEventListener('click', async (e) => {
@@ -631,6 +695,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       e.preventDefault();
       const card = removeBtn.closest('.provider-card');
       if (card) card.remove();
+      syncProvidersToolbar(form);
       return;
     }
     const refreshBtn = e.target.closest('button[data-action="refresh-provider"]');
@@ -884,6 +949,49 @@ document.querySelectorAll('button[data-action="refresh-jobs"]').forEach(btn => {
 //
 // The NAP fetch is server-side (CORS would block client-side); the
 // importer runs against the live `transport.data.gouv.fr/api/datasets`.
+// v0.1.12: catalogues loaded once, kept in module scope so the change
+// handler can pre-fill country/modes from the chosen catalogue.
+let NAP_CATALOGUES = [];
+
+async function napLoadCatalogues() {
+  try {
+    const r = await fetch('/api/admin/nap-catalogues');
+    if (!r.ok) return;
+    NAP_CATALOGUES = await r.json();
+  } catch { /* leave empty; selectors fall back to "no catalogues" message */ }
+  const sel = document.getElementById('nap-catalogue');
+  if (!sel) return;
+  if (!NAP_CATALOGUES.length) {
+    sel.innerHTML = '<option value="">— No catalogues defined; create one in /admin/nap-catalogues —</option>';
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  sel.innerHTML = NAP_CATALOGUES.map((c, i) =>
+    `<option value="${escAttr(c.id)}"${i === 0 ? ' selected' : ''}>${escHTML(c.name)}${c.credential_id ? ' 🔒' : ''}</option>`
+  ).join('');
+  napOnCatalogueChange();
+  sel.addEventListener('change', napOnCatalogueChange);
+}
+
+// Pre-fill country / modes from the selected catalogue's defaults.
+// Operator can still tweak them before previewing.
+function napOnCatalogueChange() {
+  const id = document.getElementById('nap-catalogue').value;
+  const cat = NAP_CATALOGUES.find(c => c.id === id);
+  if (!cat) return;
+  document.getElementById('nap-country').value = cat.default_country || '';
+  for (const m of ['rail', 'urban', 'bus', 'bike']) {
+    const cb = document.getElementById('nap-mode-' + m);
+    if (cb) cb.checked = (cat.default_modes || []).includes(m);
+  }
+  // Show URL + auth status as a hint so the operator knows what they're hitting.
+  const detail = document.getElementById('nap-catalogue-detail');
+  if (detail) {
+    detail.textContent = cat.url + (cat.credential_id ? `   🔒 auth: ${cat.credential_name || '(missing)'}` : '   (public)');
+  }
+}
+
 function napCollectFilters() {
   const modes = [];
   for (const m of ['rail', 'urban', 'bus', 'bike']) {
@@ -891,7 +999,9 @@ function napCollectFilters() {
   }
   const splitCsv = (s) => (s || '').split(',').map(x => x.trim()).filter(Boolean);
   return {
-    nap_url: document.getElementById('nap-url').value.trim(),
+    // v0.1.12: send the catalogue id instead of the URL. Server resolves
+    // URL + credential from nap_catalogues so secrets never round-trip.
+    nap_catalogue_id: document.getElementById('nap-catalogue').value,
     country: (document.getElementById('nap-country').value.trim().toUpperCase() || null),
     modes: modes.length ? modes : null,
     include_publishers: splitCsv(document.getElementById('nap-publishers').value),
@@ -899,13 +1009,16 @@ function napCollectFilters() {
   };
 }
 
-async function napCall(preview) {
+async function napCall(preview, includeDatasetIds) {
   const sid = document.getElementById('nap-sid').value;
   const filters = napCollectFilters();
   const body = {
     ...filters,
     include_publishers: filters.include_publishers.length ? filters.include_publishers : null,
     exclude_dataset_ids: filters.exclude_dataset_ids.length ? filters.exclude_dataset_ids : null,
+    // v0.1.12 picker: confirm sends only the ticked dataset_ids. Preview
+    // omits this filter (we want the full proposal so the operator can choose).
+    include_dataset_ids: includeDatasetIds && includeDatasetIds.length ? includeDatasetIds : null,
     preview,
   };
   const r = await fetch(`/api/sessions/${sid}/providers/import-from-nap`, {
@@ -941,11 +1054,23 @@ function napRenderResult(result, preview) {
   }
 
   if (providers.length) {
+    // v0.1.12: each row gets a checkbox; the operator picks which providers
+    // to actually import. Ticked-by-default = "import all", but they can
+    // uncheck individual rows (e.g. exclude regional networks they don't want).
+    // Header checkbox = select-all toggle. dataset_id is plumbed through
+    // from the importer (see make_provider_from_dataset's _nap_dataset_id).
     html += `<div class="nap-result-section"><h4>Providers to add (${providers.length})</h4>`;
-    html += '<table class="nap-result-table"><thead><tr><th>ID</th><th>Label</th><th>Country</th><th>Format</th><th>URL</th></tr></thead><tbody>';
+    html += `<p class="hint" style="margin: 0 0 0.4rem">
+      Tick the rows you want to import. Unticked rows are silently skipped on Confirm.
+    </p>`;
+    html += '<table class="nap-result-table"><thead><tr>';
+    html += '<th style="width: 2rem"><input type="checkbox" id="nap-pick-all" checked title="Select all / none"></th>';
+    html += '<th>ID</th><th>Label</th><th>Country</th><th>Format</th><th>URL</th></tr></thead><tbody>';
     for (const p of providers) {
       const url = (p.timetable || {}).url || '';
+      const datasetId = p._nap_dataset_id || '';
       html += `<tr>
+        <td><input type="checkbox" class="nap-pick" data-dataset-id="${escAttr(datasetId)}" checked></td>
         <td><code>${escHTML(p.id)}</code></td>
         <td>${escHTML(p.label || '')}</td>
         <td>${escHTML(p.country_iso || '—')}</td>
@@ -988,6 +1113,28 @@ document.querySelector('button[data-action="nap-preview"]')?.addEventListener('c
     napRenderResult(result, true);
     // Enable the Confirm button only when the preview yielded providers.
     document.querySelector('button[data-action="nap-confirm"]').disabled = (result.providers || []).length === 0;
+    // v0.1.12: wire the picker checkboxes — header tickbox toggles all rows;
+    // any change to a row updates the Confirm button's enabled state so the
+    // operator can't commit zero providers.
+    const target = document.getElementById('nap-result');
+    const all = target.querySelector('#nap-pick-all');
+    const rows = target.querySelectorAll('.nap-pick');
+    const confirmBtn = document.querySelector('button[data-action="nap-confirm"]');
+    function syncConfirmEnabled() {
+      const anyChecked = Array.from(rows).some(c => c.checked);
+      confirmBtn.disabled = !anyChecked;
+      // Header checkbox shows checked/indeterminate/unchecked tri-state.
+      const allChecked = Array.from(rows).every(c => c.checked);
+      all.checked = allChecked;
+      all.indeterminate = anyChecked && !allChecked;
+    }
+    if (all) {
+      all.addEventListener('change', () => {
+        rows.forEach(c => c.checked = all.checked);
+        syncConfirmEnabled();
+      });
+    }
+    rows.forEach(c => c.addEventListener('change', syncConfirmEnabled));
   } catch (err) {
     document.getElementById('nap-result').innerHTML =
       `<p class="msg show error" style="margin: 0">${escHTML(err.message || String(err))}</p>`;
@@ -998,10 +1145,19 @@ document.querySelector('button[data-action="nap-preview"]')?.addEventListener('c
 
 document.querySelector('button[data-action="nap-confirm"]')?.addEventListener('click', async (e) => {
   const btn = e.target;
-  if (!confirm('Add these providers to the session config? You\'ll still need to Refresh sources + Rebuild graph afterwards.')) return;
+  // v0.1.12: collect ticked dataset_ids — only those get imported. Empty list
+  // would mean "import everything" to the API, so we guard against it.
+  const picked = Array.from(document.querySelectorAll('#nap-result .nap-pick:checked'))
+    .map(c => c.dataset.datasetId)
+    .filter(Boolean);
+  if (picked.length === 0) {
+    showToast('error', 'Tick at least one provider to import.');
+    return;
+  }
+  if (!confirm(`Add ${picked.length} provider(s) to the session config? You'll still need to Refresh sources + Rebuild graph afterwards.`)) return;
   btn.disabled = true; const original = btn.textContent; btn.textContent = 'Saving…';
   try {
-    const result = await napCall(false);
+    const result = await napCall(false, picked);
     napRenderResult(result, false);
     showToast('success', `Imported ${(result.providers || []).length} provider(s) from NAP`);
     // Brief delay so the operator sees the success message inside the modal too.
