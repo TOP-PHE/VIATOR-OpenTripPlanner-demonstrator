@@ -21,6 +21,7 @@ from .master import (
     MasterStationPendingDrift,
     RouteAlias,
 )
+from .nap_catalogues import NapCatalogue
 from .runtime import McTOverride, StationXref
 from .search import JourneySearch, JourneySearchExecution, JourneyTrip
 from .sessions import Session, SessionCategory, SessionState
@@ -60,4 +61,6 @@ __all__ = [
     "PlatformConfig",
     # credentials (v0.1.10) — user-owned API keys for authenticated provider URLs
     "UserCredential",
+    # NAP catalogues (v0.1.12) — saved NAP endpoints for the import-from-NAP picker
+    "NapCatalogue",
 ]

@@ -80,6 +80,9 @@ EXPECTED_MODULES = [
     "app.credentials",
     "app.api.credentials",
     "app.models.credentials",
+    # v0.1.12 — saved NAP catalogues for the import-from-NAP picker
+    "app.models.nap_catalogues",
+    "app.api.admin.nap_catalogues",
 ]
 
 
@@ -135,6 +138,8 @@ def test_models_metadata_has_all_expected_tables() -> None:
         "platform_config",
         # v0.1.10 — per-user encrypted credentials for authenticated provider URLs
         "user_credentials",
+        # v0.1.12 — saved NAP endpoints for the import-from-NAP picker
+        "nap_catalogues",
     }
     missing = expected - table_names
     assert not missing, f"models package missing tables: {sorted(missing)}"
