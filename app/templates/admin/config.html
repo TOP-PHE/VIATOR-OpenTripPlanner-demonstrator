@@ -2,9 +2,14 @@
 {% block title %}Configuration — VIATOR admin{% endblock %}
 
 {% block extra_styles %}
-.section { background: var(--paper); padding: 1.2rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; max-width: 720px; }
+.section { background: var(--paper); padding: 1.2rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; max-width: 820px; }
 .section h2 { margin-top: 0; font-size: 1.05rem; }
-.field { display: grid; grid-template-columns: 220px 1fr; gap: 0.6rem 1rem; align-items: center; margin: 0.5rem 0; }
+/* `auto 1fr` lets the label column size to its longest label (no more
+   truncated "MASTER_STATIONS_REFRESH_DA…"). max-width on .section keeps
+   the row from sprawling on wide screens. white-space:nowrap on the
+   label is belt-and-braces so a stray space doesn't wrap. */
+.field { display: grid; grid-template-columns: auto 1fr; gap: 0.6rem 1.25rem; align-items: center; margin: 0.5rem 0; }
+.field label { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
 .field input, .field select { width: 100%; }
 .help { color: var(--rail-steel); font-size: 0.8rem; }
 {% endblock %}
@@ -30,6 +35,9 @@ const SECTIONS = [
   { title: 'Concurrency / server protection', keys: ['MAX_CONCURRENT_JOURNEYS','MAX_CONCURRENT_REBUILDS','MAX_CONCURRENT_UPLOADS','JOURNEY_TIMEOUT_MS'] },
   { title: 'Fanout', keys: ['FANOUT_TIMEOUT_MS','FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE'] },
   { title: 'Master data refresh', keys: ['MASTER_STATIONS_REFRESH_DAYS','MASTER_CARRIERS_REFRESH_DAYS'] },
+  // v0.1.11: previously hardcoded / .env-only.
+  // REBUILD_DEBOUNCE_SECONDS=0 means "rebuild starts on click" (demo).
+  { title: 'Worker timing', keys: ['REBUILD_DEBOUNCE_SECONDS','WORKER_TICK_SECONDS'] },
   { title: 'Replay safety',  keys: ['REPLAY_MAX_BATCH_SIZE','REPLAY_MAX_RPS'] },
   { title: 'Registration',   keys: ['REGISTRATION_OPEN','REGISTRATION_DEFAULT_ROLE'] },
   { title: 'Retention',      keys: ['AUDIT_RETENTION_DAYS','JOURNEY_SEARCH_RETENTION_DAYS','JOURNEY_TRIPS_RETENTION_DAYS','JOURNEY_RAW_RESPONSE_RETENTION_DAYS'] },
