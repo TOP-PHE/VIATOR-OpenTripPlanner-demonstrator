@@ -977,11 +977,23 @@ class ImportFromNapBody(BaseModel):
 
     `preview=True` returns the proposed providers WITHOUT persisting,
     so the UI can show a confirmation table before the operator commits.
+
+    v0.1.12: identifies the NAP via the catalogue's UUID instead of a free
+    URL. The legacy `nap_url` field is still accepted for back-compat (CLI
+    callers hitting the API directly) but the UI sends nap_catalogue_id.
+    Exactly one of the two must be set.
     """
 
-    nap_url: str = Field(
-        default="https://transport.data.gouv.fr/api/datasets",
-        description="NAP catalogue endpoint. Defaults to the French NAP.",
+    nap_catalogue_id: str | None = Field(
+        default=None,
+        description="UUID of a row in nap_catalogues. Server resolves URL + "
+        "credential at fetch time. Preferred over nap_url since v0.1.12.",
+    )
+    nap_url: str | None = Field(
+        default=None,
+        description="DIRECT NAP endpoint URL. Legacy escape hatch — operators "
+        "should use nap_catalogue_id (managed at /admin/nap-catalogues) so "
+        "credentials can be attached. Anonymous fetch only.",
     )
     country: str | None = Field(default=None, max_length=2, description="ISO-2 country filter")
     modes: list[str] | None = Field(
@@ -995,6 +1007,13 @@ class ImportFromNapBody(BaseModel):
     exclude_dataset_ids: list[str] | None = Field(
         default=None,
         description="Optional skip list of NAP dataset ids.",
+    )
+    include_dataset_ids: list[str] | None = Field(
+        default=None,
+        description="Optional positive list — when set, ONLY datasets whose id "
+        "is in the list are kept. Used by the picker UI: preview returns the "
+        "full filtered list with dataset_ids; on confirm the operator's "
+        "checked subset is sent here so only those get persisted. (v0.1.12)",
     )
     preview: bool = Field(
         default=False,
@@ -1047,18 +1066,72 @@ async def import_providers_from_nap(
     if actor.id is None:
         raise HTTPException(400, "Bulk-import requires a JWT-authenticated actor")
 
+    from ... import credentials as crypto_module
     from ...master import nap_importer
+    from ...models import NapCatalogue, UserCredential
+
+    # v0.1.12: resolve the catalogue → (url, credential). Legacy `nap_url`
+    # path stays as an anonymous-only escape hatch for CLI callers; UI
+    # always sends nap_catalogue_id.
+    nap_url: str
+    nap_auth: tuple[str, str, str | None] | None = None  # (auth_type, plaintext, param_name)
+    catalogue_name: str | None = None
+
+    if body.nap_catalogue_id:
+        try:
+            cat_uuid = uuid.UUID(body.nap_catalogue_id)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                400, f"nap_catalogue_id={body.nap_catalogue_id!r} is not a UUID"
+            ) from exc
+        cat = db.get(NapCatalogue, cat_uuid)
+        if cat is None:
+            raise HTTPException(404, f"NAP catalogue {body.nap_catalogue_id!r} not found")
+        nap_url = cat.url
+        catalogue_name = cat.name
+        if cat.credential_id is not None:
+            cred = db.get(UserCredential, cat.credential_id)
+            if cred is None:
+                # SET NULL cascade fired but the catalogue row hasn't been
+                # re-saved yet — fall back to anonymous + warn in audit.
+                log.warning(
+                    "catalogue %s references missing credential %s; "
+                    "falling back to anonymous NAP fetch",
+                    cat.name,
+                    cat.credential_id,
+                )
+            else:
+                try:
+                    plaintext = crypto_module.decrypt(
+                        cred.ciphertext, cred.nonce, settings.jwt_secret
+                    )
+                except crypto_module.CredentialDecryptError as exc:
+                    raise HTTPException(
+                        500,
+                        f"NAP credential {cred.name!r} cannot be decrypted: {exc}. "
+                        "Recreate the credential at /credentials.",
+                    ) from exc
+                nap_auth = (cred.auth_type, plaintext, cred.param_name)
+    elif body.nap_url:
+        nap_url = body.nap_url
+    else:
+        raise HTTPException(
+            400,
+            "Either nap_catalogue_id (preferred) or nap_url (legacy) must be set.",
+        )
 
     existing_providers = (s.config or {}).get("sources", {}).get("providers") or []
 
     try:
         result = await nap_importer.import_from_nap(
             existing_providers=existing_providers,
-            nap_url=body.nap_url,
+            nap_url=nap_url,
+            nap_auth=nap_auth,
             country=body.country.upper() if body.country else None,
             modes=body.modes,
             include_publishers=body.include_publishers,
             exclude_dataset_ids=body.exclude_dataset_ids,
+            include_dataset_ids=body.include_dataset_ids,
         )
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"NAP fetch failed: {exc}") from exc
@@ -1079,9 +1152,16 @@ async def import_providers_from_nap(
     # validation, country-gate). Reuses normalize_providers so the shape
     # ends up canonical.
     if result["providers"]:
+        # v0.1.12: strip the `_nap_dataset_id` bookkeeping field the importer
+        # attaches for the picker UI — it shouldn't leak into session.config.
+        # Easier to filter here than to thread "is this preview?" into the
+        # importer.
+        cleaned = [
+            {k: v for k, v in p.items() if not k.startswith("_")} for p in result["providers"]
+        ]
         new_config = dict(s.config or {})
         sources = dict(new_config.get("sources") or {})
-        merged_providers = list(existing_providers) + list(result["providers"])
+        merged_providers = list(existing_providers) + cleaned
         sources["providers"] = merged_providers
         new_config["sources"] = sources
 
@@ -1124,12 +1204,19 @@ async def import_providers_from_nap(
             target_kind="session",
             target_id=sid,
             metadata={
-                "nap_url": body.nap_url,
+                "nap_url": nap_url,
+                "nap_catalogue_id": body.nap_catalogue_id,
+                "nap_catalogue_name": catalogue_name,
+                "nap_authenticated": nap_auth is not None,
                 "filters": {
                     "country": body.country,
                     "modes": body.modes,
                     "include_publishers": body.include_publishers,
                     "exclude_dataset_ids": body.exclude_dataset_ids,
+                    # v0.1.12 picker: recorded so the audit row shows which
+                    # specific datasets the operator hand-picked (vs the
+                    # broader filters that were also applied).
+                    "include_dataset_ids": body.include_dataset_ids,
                 },
                 "added_count": len(result["providers"]),
                 "added_ids": [p["id"] for p in result["providers"]],

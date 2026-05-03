@@ -539,7 +539,27 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.11 (latest)**: worker timing knobs in the UI + header polish:
+**v0.1.12 (latest)**: NAP catalogue picker + accordion + import-time picker:
+
+- **NAP catalogues** (Top nav → **NAPs**, platform_admin only). A new
+  table holds pre-configured NAP endpoints — name, URL, default country,
+  default modes, optional credential reference. Comes seeded with the
+  France NAP. Add Germany Mobilithek / Swiss data.ch / Italian
+  trasportiamo.it as your demonstrator expands.
+- **Import modal: catalogue dropdown** replaces the old free-text URL
+  field. Selecting a catalogue auto-fills country + modes from its
+  defaults. Authenticated NAPs (🔒 in the dropdown) have their
+  credential applied server-side; the operator never sees the secret.
+- **Picker checkboxes in the Preview**. Each row has a tick — header
+  checkbox toggles all. Confirm sends only the ticked subset
+  (`include_dataset_ids` filter). No more all-or-nothing imports.
+- **Provider-card accordion**. Cards default to collapsed (only the
+  first one open) — no more wall-of-forms when a session has 10+
+  providers. New "Expand all / Collapse all" toolbar at the top of the
+  Providers list. Newly-added cards via "+ Add provider" open by
+  default (the operator just clicked Add — they want to see the form).
+
+**v0.1.11**: worker timing knobs in the UI + header polish:
 
 - **Worker timing** card in Admin → Configuration with two new editable knobs:
     - `REBUILD_DEBOUNCE_SECONDS` (default 1800 = 30 min). Was previously
