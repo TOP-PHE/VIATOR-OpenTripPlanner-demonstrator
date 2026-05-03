@@ -54,7 +54,11 @@ def isolated_inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from app import settings as settings_module
 
     inbox = tmp_path / "inbox"
-    inbox.mkdir()
+    # exist_ok=True: pytest's tmp_path is per-test on most filesystems but on
+    # the GHA Linux runner the dir occasionally pre-exists between class
+    # method invocations, surfacing FileExistsError. Idempotent mkdir keeps
+    # the fixture deterministic across runtimes.
+    inbox.mkdir(exist_ok=True)
     monkeypatch.setattr(settings_module.settings, "inbox_dir", inbox)
     return inbox
 

@@ -69,19 +69,23 @@ _MODE_KEYWORDS: dict[str, set[str]] = {
         "ave",
     },
     "urban": {
-        # Île-de-France
+        # Île-de-France — accent variants matter because str.lower() preserves
+        # combining marks ("Île-de-France" → "île-de-france", with î intact).
         "transilien",
         "rer ",
         "métro",
         "metro",
         "idfm",
-        "ile-de-france mobilités",
-        "ile-de-france mobilites",
-        # Generic urban transit
+        "île-de-france",  # accented form — what's actually in NAP titles
+        "ile-de-france",  # ASCII fallback (some publishers strip accents)
+        # Generic urban transit. "urbain" stem catches both "urbain" and
+        # "urbains" (plural). It would also match "interurbain" (bus), but
+        # that's fine — the bus keywords still tag it as bus too, so a
+        # mixed-mode dataset like "Réseaux urbains et interurbains" gets
+        # both modes, which is the desired behaviour.
         "tramway",
         "tram ",
-        "réseau urbain",
-        "reseau urbain",
+        "urbain",
         "ratp",
         "métropole",
         "metropole",
