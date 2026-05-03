@@ -121,6 +121,8 @@
               <a href="/admin/config">Config</a>
               <a href="/admin/reports">Reports</a>
             {% endif %}
+            {# Credentials are user-scoped, available to anyone logged-in. #}
+            <a href="/credentials">My credentials</a>
             <span class="who">{{ current_user.username }}</span>
             <a href="#" id="logout-link">Logout</a>
           {% else %}

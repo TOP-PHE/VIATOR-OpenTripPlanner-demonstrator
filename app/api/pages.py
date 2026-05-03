@@ -197,3 +197,19 @@ def journey_page(request: Request) -> Response:
     if user is None:
         return _redirect_to_login("/journey")
     return templates.TemplateResponse(request, "journey.html", {"current_user": user})
+
+
+@router.get("/credentials", response_class=HTMLResponse)
+def credentials_page(request: Request) -> Response:
+    """Per-user API-credential library (v0.1.10).
+
+    Available to any logged-in user — end_users won't have sessions to
+    attach credentials to, but a workflow where they prep their keys
+    before being promoted to content_manager is reasonable. The actual
+    list is fetched client-side via /api/credentials and is always
+    scoped to the calling user.
+    """
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login("/credentials")
+    return templates.TemplateResponse(request, "credentials.html", {"current_user": user})
