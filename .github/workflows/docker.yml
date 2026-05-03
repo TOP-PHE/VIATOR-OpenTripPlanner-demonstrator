@@ -113,6 +113,23 @@ jobs:
           build-args: |
             VIATOR_VERSION=${{ steps.version_label.outputs.value }}
 
+      # Skip-list: the docker CLI binary + its plugins (compose, buildx) we copy
+      # in from `docker:29-cli` (web Dockerfile stage 1). Trivy's gobinary scanner
+      # finds CVEs in the bundled Go modules inside these statically-linked exes,
+      # but we have no way to patch them — they're upstream's binary. The CVEs
+      # we ARE aware of (CVE-2026-34040, -35469, -39883, -32280, -32281, -32283)
+      # are listed in .trivyignore with per-CVE justifications; this skip-files
+      # is belt-and-suspenders so a NEW CVE published mid-week doesn't block a
+      # release on a finding we're already accepting the risk of by using the
+      # docker CLI as a subprocess against a local Unix socket only.
+      #
+      # Re-evaluate when we bump the docker:29-cli base or switch to apt-installed
+      # docker.io (rejected before for size/CVE reasons; see web Dockerfile).
+      #
+      # Path syntax is relative to image root, no leading slash. Comma-separated.
+      # Empty for the OTP image (those paths don't exist in OTP, no harm done,
+      # but we keep it explicit per-image so future changes are obvious).
+
       # Diagnostic pass — prints findings to stdout (visible inline in the job log).
       # Never fails (exit-code 0). When the gating step below fails, this is your
       # window into *which* CVEs are blocking. Do NOT pass `output:` here — it
@@ -126,6 +143,7 @@ jobs:
           ignore-unfixed: true
           vuln-type: ${{ matrix.image.trivy_vuln_type }}
           trivyignores: ".trivyignore"
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
           format: table
 
       # Gating pass — fails the job on any unignored CRITICAL/HIGH finding.
@@ -134,6 +152,12 @@ jobs:
       # which has been deleted from the registry, so they fail to download.
       # v0.36.0 pins setup-trivy by SHA (3fb12ec1… = v0.2.6) — the right way.
       # https://github.com/aquasecurity/trivy-action/tags
+      #
+      # NOTE: skip-files MUST match the diagnostic step exactly. We learned in
+      # v0.1.9 that the SARIF reporter doesn't always honor `.trivyignore` the
+      # way the table reporter does (diagnostic scan showed 0 vulns but SARIF
+      # gating still exited 1). Skipping the files outright sidesteps that
+      # discrepancy regardless of which Trivy reporter is in use.
       - name: Trivy — vulnerability scan (sarif, gating)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -143,6 +167,7 @@ jobs:
           ignore-unfixed: true                          # suppress unactionable findings in base images
           vuln-type: ${{ matrix.image.trivy_vuln_type }}  # web: os,library  |  otp: os only (jar deps are upstream)
           trivyignores: ".trivyignore"
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
           format: sarif
           output: trivy-${{ matrix.image.name }}.sarif
 
