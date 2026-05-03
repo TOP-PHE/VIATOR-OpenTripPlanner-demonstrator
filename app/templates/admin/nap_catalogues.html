@@ -1,0 +1,216 @@
+{% extends "_base.html" %}
+{% block title %}NAP catalogues — VIATOR admin{% endblock %}
+
+{% block content %}
+<h1>NAP catalogues</h1>
+<p style="color: var(--rail-steel); max-width: 720px">
+  Pre-configured National Access Point endpoints for the
+  <strong>Import providers from NAP</strong> picker on the Sessions page.
+  Each catalogue stores the API URL plus optional pre-fill defaults
+  (country, modes) and an optional credential for authenticated NAPs
+  (German <code>mobilithek.info</code>, etc.). The seed row is the public
+  French NAP at <code>transport.data.gouv.fr</code>.
+</p>
+
+<details id="create-cat-section" style="margin: 1rem 0; max-width: 720px">
+  <summary style="cursor: pointer; padding: 0.5rem 0.75rem; background: var(--rail-bg, #f5f7fa); border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px">
+    <strong>＋ New catalogue</strong>
+  </summary>
+  <form id="create-cat-form" style="margin-top: 0.75rem; padding: 1rem; border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; display: grid; gap: 0.75rem">
+    <label style="display: grid; gap: 0.25rem">
+      <span>Name <span style="color: var(--rail-steel); font-weight: normal">— picker label, must be unique</span></span>
+      <input type="text" name="name" required minlength="1" maxlength="80" autocomplete="off" placeholder="e.g. Germany Mobilithek">
+    </label>
+    <label style="display: grid; gap: 0.25rem">
+      <span>API URL <span style="color: var(--rail-steel); font-weight: normal">— DCAT-AP /datasets endpoint</span></span>
+      <input type="url" name="url" required maxlength="2048" autocomplete="off" placeholder="https://mobilithek.info/api/v1/datasets">
+    </label>
+    <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 0.75rem">
+      <label style="display: grid; gap: 0.25rem">
+        <span>Default country <span style="color: var(--rail-steel); font-weight: normal">(ISO-2)</span></span>
+        <input type="text" name="default_country" maxlength="2" autocomplete="off" placeholder="DE" style="text-transform: uppercase">
+      </label>
+      <label style="display: grid; gap: 0.25rem">
+        <span>Default modes <span style="color: var(--rail-steel); font-weight: normal">(any of: rail, urban, bus, bike)</span></span>
+        <div style="display: flex; gap: 0.6rem; padding-top: 0.4rem; flex-wrap: wrap">
+          <label style="font-weight: normal; display: inline-flex; gap: 0.25rem; align-items: center"><input type="checkbox" name="mode_rail"> rail</label>
+          <label style="font-weight: normal; display: inline-flex; gap: 0.25rem; align-items: center"><input type="checkbox" name="mode_urban"> urban</label>
+          <label style="font-weight: normal; display: inline-flex; gap: 0.25rem; align-items: center"><input type="checkbox" name="mode_bus"> bus</label>
+          <label style="font-weight: normal; display: inline-flex; gap: 0.25rem; align-items: center"><input type="checkbox" name="mode_bike"> bike</label>
+        </div>
+      </label>
+    </div>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Credential <span style="color: var(--rail-steel); font-weight: normal">(optional, for authenticated NAPs)</span></span>
+      <select name="credential_id">
+        <option value="">— No authentication —</option>
+        {# Populated by JS from /api/credentials. #}
+      </select>
+    </label>
+    <label style="display: grid; gap: 0.25rem">
+      <span>Note <span style="color: var(--rail-steel); font-weight: normal">(optional)</span></span>
+      <input type="text" name="note" maxlength="280" autocomplete="off" placeholder="rate-limited 60 req/h; key expires 2027-01">
+    </label>
+    <div>
+      <button type="submit">Create catalogue</button>
+    </div>
+  </form>
+</details>
+
+<table id="cats-table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>URL</th>
+      <th>Country</th>
+      <th>Modes</th>
+      <th>Credential</th>
+      <th>Note</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody id="cats-tbody">
+    <tr><td colspan="7" style="color: var(--rail-steel); text-align: center; padding: 1rem">Loading…</td></tr>
+  </tbody>
+</table>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const toast = document.getElementById('toast');
+const tbody = document.getElementById('cats-tbody');
+const form = document.getElementById('create-cat-form');
+
+function showToast(kind, text) {
+  toast.className = 'msg show ' + kind;
+  toast.textContent = text;
+  setTimeout(() => { toast.className = 'msg'; }, 3500);
+}
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+// ─── Populate the credential dropdown ──────────────────────────
+// Loaded once; kept in scope so the row "Edit credential" buttons can
+// re-open it. Operators with no credentials see a hint.
+let CRED_OPTIONS = [];
+async function loadCredentials() {
+  try {
+    const r = await fetch('/api/credentials');
+    if (!r.ok) return;
+    CRED_OPTIONS = await r.json();
+    const sel = form.querySelector('select[name="credential_id"]');
+    sel.innerHTML = '<option value="">— No authentication —</option>' +
+      CRED_OPTIONS.map(c =>
+        `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)} (${escapeHtml(c.auth_type)})</option>`
+      ).join('');
+  } catch { /* leave dropdown empty if creds endpoint hiccups */ }
+}
+
+// ─── List ──────────────────────────────────────────────────────
+async function loadCatalogues() {
+  try {
+    const r = await fetch('/api/admin/nap-catalogues');
+    if (!r.ok) {
+      tbody.innerHTML = `<tr><td colspan="7" class="msg error show">Failed (${r.status})</td></tr>`;
+      return;
+    }
+    const cats = await r.json();
+    if (!cats.length) {
+      tbody.innerHTML = `<tr><td colspan="7" style="color: var(--rail-steel); text-align: center; padding: 1rem">No catalogues yet. Use "＋ New catalogue" above.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = cats.map(c => `
+      <tr data-cat-id="${c.id}">
+        <td><strong>${escapeHtml(c.name)}</strong></td>
+        <td style="word-break: break-all"><span style="font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem">${escapeHtml(c.url)}</span></td>
+        <td>${escapeHtml(c.default_country) || '—'}</td>
+        <td>${(c.default_modes || []).map(escapeHtml).join(', ') || '—'}</td>
+        <td>${c.credential_id ? `🔒 ${escapeHtml(c.credential_name || '(missing)')}` : '<span style="color: var(--rail-steel)">— public —</span>'}</td>
+        <td style="font-size: 0.85rem; color: var(--rail-steel)">${escapeHtml(c.note) || '—'}</td>
+        <td style="white-space: nowrap">
+          <button type="button" class="secondary" data-action="delete" style="color: var(--fail); border-color: var(--fail)">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+    tbody.querySelectorAll('tr[data-cat-id]').forEach(row => {
+      const id = row.dataset.catId;
+      const name = row.querySelector('strong').textContent;
+      row.querySelector('[data-action="delete"]').addEventListener('click', () => deleteCat(id, name));
+    });
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="7" class="msg error show">${escapeHtml(String(err))}</td></tr>`;
+  }
+}
+
+// ─── Create ────────────────────────────────────────────────────
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const submitBtn = form.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Creating…';
+  const fd = new FormData(form);
+  const modes = ['rail','urban','bus','bike'].filter(m => fd.get(`mode_${m}`) === 'on');
+  const body = {
+    name: fd.get('name'),
+    url: fd.get('url'),
+    default_country: fd.get('default_country') || null,
+    default_modes: modes.length ? modes : null,
+    credential_id: fd.get('credential_id') || null,
+    note: fd.get('note') || null,
+  };
+  try {
+    const r = await fetch('/api/admin/nap-catalogues', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const b = await r.json().catch(() => ({}));
+      const msg = Array.isArray(b.detail)
+        ? b.detail.map(e => `${e.loc?.slice(-1)?.[0] || 'field'}: ${e.msg}`).join('; ')
+        : (b.detail || `Failed (${r.status})`);
+      showToast('error', msg);
+      return;
+    }
+    showToast('success', `Created ${body.name}`);
+    form.reset();
+    await loadCatalogues();
+    document.getElementById('create-cat-section').open = false;
+  } catch (err) {
+    showToast('error', String(err));
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Create catalogue';
+  }
+});
+
+// ─── Delete ────────────────────────────────────────────────────
+async function deleteCat(id, name) {
+  if (!window.confirm(
+    `Delete catalogue "${name}"?\n\n` +
+    `Sessions don't reference catalogues directly (they reference the resulting providers), ` +
+    `so this is safe — just removes it from the import picker.`
+  )) return;
+  try {
+    const r = await fetch(`/api/admin/nap-catalogues/${id}`, {method: 'DELETE'});
+    if (!r.ok && r.status !== 204) {
+      const b = await r.json().catch(() => ({}));
+      showToast('error', b.detail || `Failed (${r.status})`);
+      return;
+    }
+    showToast('success', `Deleted ${name}`);
+    await loadCatalogues();
+  } catch (err) { showToast('error', String(err)); }
+}
+
+// Initial load.
+loadCredentials();
+loadCatalogues();
+</script>
+{% endblock %}

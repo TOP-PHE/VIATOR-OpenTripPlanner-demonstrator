@@ -199,6 +199,22 @@ def journey_page(request: Request) -> Response:
     return templates.TemplateResponse(request, "journey.html", {"current_user": user})
 
 
+@router.get("/admin/nap-catalogues", response_class=HTMLResponse)
+def admin_nap_catalogues_page(request: Request) -> Response:
+    """NAP catalogue CRUD (v0.1.12). Platform-admin only — catalogues are
+    shared infrastructure consumed by the Import-from-NAP picker."""
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login("/admin/nap-catalogues")
+    if user.role != "platform_admin":
+        return _forbidden_html(request, "Platform admin access required.")
+    return templates.TemplateResponse(
+        request,
+        "admin/nap_catalogues.html",
+        {"current_user": user},
+    )
+
+
 @router.get("/credentials", response_class=HTMLResponse)
 def credentials_page(request: Request) -> Response:
     """Per-user API-credential library (v0.1.10).
