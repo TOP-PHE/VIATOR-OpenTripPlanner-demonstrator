@@ -10,6 +10,7 @@ from __future__ import annotations
 from .audit import AuditEvent
 from .base import Base
 from .config import PlatformConfig
+from .credentials import UserCredential
 from .graph import GraphSnapshot
 from .identity import PasswordResetToken, User, UserRole, VerificationToken
 from .ingestion import RebuildJob, Upload
@@ -57,4 +58,6 @@ __all__ = [
     "AuditEvent",
     # config
     "PlatformConfig",
+    # credentials (v0.1.10) — user-owned API keys for authenticated provider URLs
+    "UserCredential",
 ]

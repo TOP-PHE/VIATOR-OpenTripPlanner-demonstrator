@@ -76,6 +76,10 @@ EXPECTED_MODULES = [
     "app.retention",
     # version badge — shared Jinja env that registers the viator_version global
     "app.templating",
+    # v0.1.10 — user-credential AES-GCM crypto module + CRUD API + ORM model
+    "app.credentials",
+    "app.api.credentials",
+    "app.models.credentials",
 ]
 
 
@@ -129,6 +133,8 @@ def test_models_metadata_has_all_expected_tables() -> None:
         "journey_trips",
         "audit_events",
         "platform_config",
+        # v0.1.10 — per-user encrypted credentials for authenticated provider URLs
+        "user_credentials",
     }
     missing = expected - table_names
     assert not missing, f"models package missing tables: {sorted(missing)}"
