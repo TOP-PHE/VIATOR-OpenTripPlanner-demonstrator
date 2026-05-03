@@ -10,4 +10,30 @@
 # at HIGH or CRITICAL must be addressed, not silenced here.
 #
 # ── Justified ignores ────────────────────────────────────────────────
-# (none yet)
+#
+# The next 6 CVEs are all in Go modules bundled inside the docker CLI
+# binary we copy from `docker:29-cli` (see docker/web/Dockerfile stage 1).
+# Latest published image (`29.4.1-cli`, 2026-04-21) still ships these
+# older bundled deps; we can't patch upstream's binary, only wait for the
+# next image rebuild.
+#
+# Why they're not exploitable in our usage:
+#   - The CLI runs as a subprocess inside our `worker` container,
+#     invoked only via `docker compose run --rm otp-build` and similar.
+#   - It connects to /var/run/docker.sock (Unix socket, host docker
+#     daemon — see docker-compose.yml `worker.volumes`). Not network.
+#   - Nothing in our codebase exposes the CLI to remote callers, mounts
+#     it into untrusted containers, or accepts user input as CLI args.
+#   - Auth-bypass / TLS-handshake / DoS CVEs in bundled libs only
+#     matter if the binary speaks those protocols to untrusted peers.
+#     A subprocess talking to a local socket doesn't.
+#
+# Re-evaluate when the docker:29-cli image is rebuilt with patched deps,
+# or when we bump to docker:30-cli.
+#
+CVE-2026-34040   # github.com/docker/docker — Moby auth bypass (only matters for daemon, not CLI subprocess)
+CVE-2026-35469   # github.com/moby/spdystream — Kubelet/CRI-O issue, irrelevant in CLI
+CVE-2026-39883   # go.opentelemetry.io/otel/sdk — BSD kenv path; we don't run on BSD
+CVE-2026-32280   # Go stdlib crypto/x509 — DoS via crafted cert; CLI doesn't accept untrusted certs
+CVE-2026-32281   # Go stdlib crypto/x509 — same exposure profile as -32280
+CVE-2026-32283   # Go stdlib crypto/tls — multiple key-update DoS; same as -32280
