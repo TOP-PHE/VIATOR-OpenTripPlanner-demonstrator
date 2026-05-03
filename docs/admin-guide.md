@@ -537,33 +537,50 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ---
 
-## 8. v0.1.10 — what shipped, what's still queued
+## 8. Recent versions — what shipped, what's still queued
 
-**Shipped in v0.1.10**: per-user encrypted API credentials. See §10 below
-for the operator workflow. Three items still queued from the v0.1.9
-deployment lessons:
+**v0.1.11 (latest)**: worker timing knobs in the UI + header polish:
+
+- **Worker timing** card in Admin → Configuration with two new editable knobs:
+    - `REBUILD_DEBOUNCE_SECONDS` (default 1800 = 30 min). Was previously
+      `.env`-only as `DEBOUNCE_SECONDS`; the worker now live-reads from
+      `platform_config` (30 s cache TTL, no restart needed). **Set to 0
+      for "rebuild starts on click"** — main fix for the "I clicked
+      Rebuild and nothing happened for half an hour" complaint.
+    - `WORKER_TICK_SECONDS` (default 15). Previously hardcoded in
+      `app/worker.py`. Lower = rebuilds start sooner after their debounce
+      window expires; higher = less DB chatter.
+- **Header role badge** showing each user's current role (red =
+  platform_admin, amber = content_manager, steel = end_user) on the
+  right side of the nav.
+- **Version badge** capitalised: `V0.1.11` instead of `v0.1.11` in the UI
+  (the canonical lowercase form is preserved at /healthz/version and on
+  the OCI image label, so tooling that parses the version is unaffected).
+- **Config UI fix**: long parameter labels (e.g. `MASTER_STATIONS_REFRESH_DAYS`)
+  no longer truncate to `MASTER_STATIONS_REFRESH_DA…`.
+
+**v0.1.10**: per-user encrypted API credentials. See §9 below for the
+operator workflow.
+
+**Still queued** from the deployment lessons:
 
 1. **Decouple OSM refresh from provider add/remove.** Today, refreshing
    provider URLs re-fetches the OSM PBF, which invalidates the
    streetGraph.obj cache and forces a 30-min full rebuild. Should be:
    provider refresh ≠ OSM refresh; OSM gets its own button with a
-   "this will invalidate the cache" warning.
+   "this will invalidate the cache" warning. **This is the next thing
+   to ship.**
 2. **Keep N=3 generations of `osm.pbf.old.<n>`** so a mistaken OSM
    refresh can be rolled back with one `mv` command.
 3. **Fix `maxAccessEgressDurationForMode` field name** for OTP 2.9 —
    currently silently ignored, so the access/egress walking bound isn't
    enforced.
-4. **Timer admin UI** (deferred from v0.1.10) — three new keys in
-   Admin → Configuration so operators don't have to edit `.env` and
-   restart for routine tuning:
-     - `REBUILD_DEBOUNCE_SECONDS` (currently env, default 1800 = 30 min;
-       this is the main reason "I clicked Rebuild but nothing happened
-       for ages" — the worker coalesces rebuild requests in this window)
-     - `WORKER_TICK_SECONDS` (currently hardcoded 15s in `app/worker.py`)
-     - `OTP_BUILD_TIMEOUT_MINUTES` (currently no timeout; a stuck build
-       can block the next one indefinitely)
-   Setting `REBUILD_DEBOUNCE_SECONDS=0` makes rebuild start instantly
-   on click, useful for demos.
+4. **Credential picker dropdown in sessions.html** — completes the v0.1.10
+   credential UX. Today operators must PATCH the API directly to attach a
+   credential id to a provider URL.
+5. **`OTP_BUILD_TIMEOUT_MINUTES`** — currently no timeout; a stuck build
+   can block the next one indefinitely. Add as a third key in the Worker
+   timing card.
 
 When you tackle any of these, the release process is exactly §2.3.
 
