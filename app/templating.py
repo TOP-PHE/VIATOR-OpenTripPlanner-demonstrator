@@ -27,9 +27,22 @@ from .settings import settings
 
 templates = Jinja2Templates(directory="app/templates")
 
+
 # ── Globals ───────────────────────────────────────────────────────────────
 # Reachable from any template as bare `{{ viator_version }}`.
 # Baked into the web image at build time via `ARG VIATOR_VERSION` in
 # docker/web/Dockerfile; can be overridden at runtime via env var
 # (set in docker-compose.yml from the .env file).
-templates.env.globals["viator_version"] = settings.viator_version
+#
+# Display tweak (v0.1.11): capitalise the leading character so a git tag
+# like `v0.1.10` shows as `V0.1.10` in the UI badge — operators asked for
+# the capital V to match the brand wordmark `VIATOR`. Pure cosmetics; the
+# `/healthz/version` endpoint and OCI label keep the canonical lowercase
+# form so tooling-side parsers / docker tags aren't disturbed.
+def _display_version(raw: str) -> str:
+    if not raw:
+        return raw
+    return raw[0].upper() + raw[1:]
+
+
+templates.env.globals["viator_version"] = _display_version(settings.viator_version)

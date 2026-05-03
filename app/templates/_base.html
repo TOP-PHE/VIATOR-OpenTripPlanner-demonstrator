@@ -44,6 +44,18 @@
     .top nav a { color: var(--rail-steel); text-decoration: none; }
     .top nav a:hover { color: var(--uic-blue); text-decoration: underline; }
     .top nav .who { color: var(--uic-blue); font-weight: 600; }
+    /* Role badge (v0.1.11) — colour-codes the active session's privilege level
+       so operators see at a glance whether they're acting as platform-admin
+       (red, dangerous), content-manager (amber, write access), or end-user
+       (steel, read-only). Sits to the right of the username. */
+    .top nav .role {
+      display: inline-block; padding: 0.1rem 0.55rem;
+      font-size: 0.65rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase;
+      border-radius: 999px; border: 1px solid currentColor;
+    }
+    .top nav .role.platform_admin  { color: var(--fail);       background: #fdecef; }
+    .top nav .role.content_manager { color: var(--amber);      background: #fff8e1; }
+    .top nav .role.end_user        { color: var(--rail-steel); background: #fff;    }
 
     /* ───── main ───── */
     main { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
@@ -124,6 +136,10 @@
             {# Credentials are user-scoped, available to anyone logged-in. #}
             <a href="/credentials">My credentials</a>
             <span class="who">{{ current_user.username }}</span>
+            {# Role badge (v0.1.11): visual reminder of the session's privilege
+               level. CSS class matches the role string so colours follow the
+               three-role palette in the styleblock above. #}
+            <span class="role {{ current_user.role }}" title="Your role in this session">{{ current_user.role.replace('_', ' ') }}</span>
             <a href="#" id="logout-link">Logout</a>
           {% else %}
             <a href="/login">Login</a>
