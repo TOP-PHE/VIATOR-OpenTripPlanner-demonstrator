@@ -323,7 +323,7 @@ async def test_import_from_nap_filters_and_dedupes(monkeypatch):
         },
     ]
 
-    async def fake_fetch(_url):
+    async def fake_fetch(_url, *, nap_auth=None):
         return fake_datasets
 
     monkeypatch.setattr(nap_importer, "fetch_datasets", fake_fetch)
@@ -354,7 +354,7 @@ async def test_import_from_nap_dedupes_by_url(monkeypatch):
     """A re-import shouldn't duplicate providers already in the session."""
     from app.master import nap_importer
 
-    async def fake_fetch(_url):
+    async def fake_fetch(_url, *, nap_auth=None):
         return [
             {
                 "id": "horaires-sncf",
@@ -381,3 +381,131 @@ async def test_import_from_nap_dedupes_by_url(monkeypatch):
     )
     assert result["providers"] == []
     assert any(s["reason"] == "already in session (same URL)" for s in result["skipped"])
+
+
+# ─── v0.1.12 picker: dataset_id pass-through + include_dataset_ids filter ───
+
+
+def test_make_provider_attaches_nap_dataset_id():
+    """Picker UI needs the upstream dataset id to key its checkboxes by."""
+    from app.master.nap_importer import make_provider_from_dataset
+
+    ds = {
+        "id": "ds-abc-123",
+        "title": "Réseau X",
+        "publisher": {"name": "X"},
+        "covered_area": [{"insee": "FR", "nom": "France"}],
+        "resources": [
+            {"format": "GTFS", "url": "https://x/y.zip", "updated": "2026-04-30T12:00:00Z"},
+        ],
+    }
+    provider = make_provider_from_dataset(ds)
+    assert provider is not None
+    assert provider["_nap_dataset_id"] == "ds-abc-123"
+
+
+@pytest.mark.asyncio
+async def test_import_from_nap_include_dataset_ids_filters_to_picked(monkeypatch):
+    """When the operator's picker sends include_dataset_ids, only matching
+    datasets get imported. Non-matching are silently skipped (not in
+    `skipped` either — picker UX would be cluttered with the noise)."""
+    from app.master import nap_importer
+
+    async def fake_fetch(_url, *, nap_auth=None):
+        return [
+            {
+                "id": "ds-1",
+                "title": "Réseau A",
+                "publisher": {"name": "A"},
+                "covered_area": [{"insee": "FR", "nom": "France"}],
+                "resources": [
+                    {"format": "GTFS", "url": "https://x/a.zip", "updated": "2026-04-30T12:00:00Z"},
+                ],
+            },
+            {
+                "id": "ds-2",
+                "title": "Réseau B",
+                "publisher": {"name": "B"},
+                "covered_area": [{"insee": "FR", "nom": "France"}],
+                "resources": [
+                    {"format": "GTFS", "url": "https://x/b.zip", "updated": "2026-04-30T12:00:00Z"},
+                ],
+            },
+            {
+                "id": "ds-3",
+                "title": "Réseau C",
+                "publisher": {"name": "C"},
+                "covered_area": [{"insee": "FR", "nom": "France"}],
+                "resources": [
+                    {"format": "GTFS", "url": "https://x/c.zip", "updated": "2026-04-30T12:00:00Z"},
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(nap_importer, "fetch_datasets", fake_fetch)
+
+    # Operator picks ds-1 and ds-3 (skipping the middle B).
+    result = await nap_importer.import_from_nap(
+        existing_providers=[],
+        country="FR",
+        include_dataset_ids=["ds-1", "ds-3"],
+    )
+    ids = sorted(p["_nap_dataset_id"] for p in result["providers"])
+    assert ids == ["ds-1", "ds-3"]
+    # ds-2 was filtered silently — not in skipped (it wasn't a "couldn't
+    # use" reason, just operator's choice).
+    assert not any(s.get("dataset", "").startswith("Réseau B") for s in result["skipped"])
+
+
+@pytest.mark.asyncio
+async def test_import_from_nap_passes_auth_to_fetch(monkeypatch):
+    """v0.1.12: catalogues with credentials must thread auth through to
+    fetch_datasets so authenticated NAPs (mobilithek.info etc.) work."""
+    from app.master import nap_importer
+
+    captured: dict = {}
+
+    async def fake_fetch(_url, *, nap_auth=None):
+        captured["nap_auth"] = nap_auth
+        return []
+
+    monkeypatch.setattr(nap_importer, "fetch_datasets", fake_fetch)
+
+    auth = ("bearer", "secret-token-123", None)
+    await nap_importer.import_from_nap(
+        existing_providers=[],
+        nap_url="https://x/y",
+        nap_auth=auth,
+    )
+    assert captured["nap_auth"] == auth
+
+
+@pytest.mark.asyncio
+async def test_import_from_nap_empty_include_list_keeps_all(monkeypatch):
+    """Empty/None include_dataset_ids = no filter, keep all matching datasets.
+    Mirrors the `exclude_dataset_ids` semantics."""
+    from app.master import nap_importer
+
+    async def fake_fetch(_url, *, nap_auth=None):
+        return [
+            {
+                "id": "ds-1",
+                "title": "Réseau Test",
+                # 2+ uppercase chars — slug_to_provider_id requires that.
+                "publisher": {"name": "ACME"},
+                "covered_area": [{"insee": "FR", "nom": "France"}],
+                "resources": [
+                    {"format": "GTFS", "url": "https://x/x.zip", "updated": "2026-04-30T12:00:00Z"},
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(nap_importer, "fetch_datasets", fake_fetch)
+
+    for include in (None, []):
+        result = await nap_importer.import_from_nap(
+            existing_providers=[],
+            country="FR",
+            include_dataset_ids=include,
+        )
+        assert len(result["providers"]) == 1, f"include={include!r} should not filter"

@@ -368,6 +368,12 @@ def make_provider_from_dataset(
         "country_iso": country,
         "timetable": {"format": fmt, "url": resource.get("url") or ""},
         "gtfs_rt": select_gtfs_rt_urls(dataset),
+        # v0.1.12: stash the upstream NAP dataset id so the preview UI can
+        # surface a checkbox keyed by it. The picker then sends the chosen
+        # subset back as `include_dataset_ids` on confirm — only those get
+        # persisted. Stripped from the saved provider in `import_from_nap`
+        # (we don't pollute session.config with NAP-specific bookkeeping).
+        "_nap_dataset_id": dataset.get("id") or "",
     }
     return provider
 
@@ -382,24 +388,56 @@ _CACHE_TTL_SECONDS = 300
 _cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
-async def fetch_datasets(nap_url: str = DEFAULT_FR_NAP_URL) -> list[dict[str, Any]]:
+async def fetch_datasets(
+    nap_url: str = DEFAULT_FR_NAP_URL,
+    *,
+    nap_auth: tuple[str, str, str | None] | None = None,
+) -> list[dict[str, Any]]:
     """Fetch the NAP catalogue, with a 5-minute in-process cache.
 
     Returns the raw list of dataset dicts. No filtering happens here — the
     caller does it client-side via `classify_modes()` etc.
 
+    `nap_auth` (v0.1.12) is an optional `(auth_type, plaintext, param_name)`
+    tuple — same shape `app.credentials.apply_to_request` expects. Used for
+    authenticated NAPs (German Mobilithek's bearer token, etc.). The cache
+    key is composed of URL + auth_type so an authenticated and anonymous
+    fetch of the same URL don't share a cache entry.
+
     Raises httpx.HTTPError on network failure. The /api/datasets endpoint
     can return MB of JSON for a national NAP; cache prevents us hammering
     it on every preview-then-confirm cycle.
     """
+    # Late import to keep the module bootable without `app/credentials.py`
+    # (e.g. running just the unit tests for `select_resource` etc.).
+    from ..credentials import apply_to_request
+
+    # Cache key includes auth_type so we never accidentally serve
+    # cached-anonymous results to an authenticated call (or vice versa).
+    cache_key = nap_url if nap_auth is None else f"{nap_url}#{nap_auth[0]}"
+
     now = time.time()
-    cached = _cache.get(nap_url)
+    cached = _cache.get(cache_key)
     if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
         return cached[1]
 
-    log.info("fetching NAP catalogue from %s", nap_url)
+    fetch_url = nap_url
+    headers: dict[str, str] = {}
+    if nap_auth is not None and nap_auth[0] != "none":
+        fetch_url, headers = apply_to_request(
+            nap_url,
+            auth_type=nap_auth[0],  # type: ignore[arg-type]
+            plaintext=nap_auth[1],
+            param_name=nap_auth[2],
+        )
+
+    log.info(
+        "fetching NAP catalogue from %s%s",
+        nap_url,
+        " (authenticated)" if nap_auth is not None else "",
+    )
     async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-        r = await c.get(nap_url)
+        r = await c.get(fetch_url, headers=headers)
         r.raise_for_status()
         data = r.json()
 
@@ -411,7 +449,7 @@ async def fetch_datasets(nap_url: str = DEFAULT_FR_NAP_URL) -> list[dict[str, An
     else:
         raise ValueError(f"NAP API at {nap_url} returned unexpected shape: {type(data).__name__}")
 
-    _cache[nap_url] = (now, datasets)
+    _cache[cache_key] = (now, datasets)
     # Validated above (must be list of dicts); cast satisfies --strict mypy
     # without an extra runtime walk over the (potentially large) catalogue.
     return cast("list[dict[str, Any]]", datasets)
@@ -424,10 +462,12 @@ async def import_from_nap(
     *,
     existing_providers: list[dict[str, Any]],
     nap_url: str = DEFAULT_FR_NAP_URL,
+    nap_auth: tuple[str, str, str | None] | None = None,
     country: str | None = None,
     modes: list[str] | None = None,
     include_publishers: list[str] | None = None,
     exclude_dataset_ids: list[str] | None = None,
+    include_dataset_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Fetch the NAP catalogue, filter, build providers, dedupe against existing.
 
@@ -453,12 +493,21 @@ async def import_from_nap(
                     match, case-insensitive). Use to limit to specific
                     operators (e.g. ["SNCF", "IDFM"]).
         exclude_dataset_ids Optional skip list of dataset IDs.
+        include_dataset_ids Optional positive list — when set, ONLY datasets
+                    whose `id` is in the list are kept. Used by the v0.1.12
+                    picker UI: preview returns the full filtered list with
+                    dataset_ids; on confirm the operator's checked subset is
+                    sent back here so only those get persisted.
 
     The dedupe pass compares against existing_providers' timetable URLs +
     provider ids. A dataset whose URL is already in the session is silently
     skipped (no warning — that's the desired behaviour on re-imports).
+
+    `nap_auth` is forwarded to fetch_datasets — see that function's
+    docstring for the (auth_type, plaintext, param_name) shape. None
+    means anonymous fetch.
     """
-    datasets = await fetch_datasets(nap_url)
+    datasets = await fetch_datasets(nap_url, nap_auth=nap_auth)
 
     existing_urls: set[str] = {
         url
@@ -488,6 +537,13 @@ async def import_from_nap(
         # Filter: dataset id exclude list.
         if exclude_dataset_ids and ds_id in exclude_dataset_ids:
             skipped.append({"dataset": title, "reason": "explicitly excluded"})
+            continue
+
+        # Filter: dataset id include list (v0.1.12 picker UI). Silently skip
+        # — operators didn't tick this row, so they don't need a "skipped"
+        # entry cluttering the result. Only applied when the include list is
+        # non-empty (None / empty list = no filter, all matching kept).
+        if include_dataset_ids and ds_id not in include_dataset_ids:
             continue
 
         # Filter: country.
