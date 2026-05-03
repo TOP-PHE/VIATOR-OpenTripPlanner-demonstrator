@@ -70,9 +70,9 @@ _OTP_TIMETABLE_FORMATS: frozenset[str] = frozenset({"gtfs", "netex_nordic", "net
 # for gtfs/; netex/ is now wired through the same path). Per-format inbox
 # subdir + per-format `transitFeeds.type` value for build-config.json.
 TIMETABLE_FORMAT_DETAILS: dict[str, dict[str, str]] = {
-    "gtfs":         {"subdir": "gtfs",  "otp_type": "gtfs",  "kind": "GTFS"},
+    "gtfs": {"subdir": "gtfs", "otp_type": "gtfs", "kind": "GTFS"},
     "netex_nordic": {"subdir": "netex", "otp_type": "netex", "kind": "NeTEx-Nordic"},
-    "netex_epip":   {"subdir": "netex", "otp_type": "netex", "kind": "NeTEx-EPIP"},
+    "netex_epip": {"subdir": "netex", "otp_type": "netex", "kind": "NeTEx-EPIP"},
 }
 
 # Stored but does NOT trigger an OTP rebuild (Phase 6 — see strategy doc).
@@ -115,9 +115,7 @@ def normalize_gtfs_sources(raw: object) -> list[dict[str, str]]:
     if isinstance(raw, str):
         return [{"id": "GTFS", "url": raw}]
     if not isinstance(raw, list):
-        raise ValueError(
-            f"config.sources.gtfs must be a string or list, got {type(raw).__name__}"
-        )
+        raise ValueError(f"config.sources.gtfs must be a string or list, got {type(raw).__name__}")
     out: list[dict[str, str]] = []
     seen_ids: set[str] = set()
     for i, entry in enumerate(raw):
@@ -208,9 +206,7 @@ def normalize_providers(raw_config: dict) -> list[dict]:
     if "providers" in sources:
         raw_providers = sources["providers"]
         if not isinstance(raw_providers, list):
-            raise ValueError(
-                "config.sources.providers must be a list of provider objects"
-            )
+            raise ValueError("config.sources.providers must be a list of provider objects")
         seen_ids: set[str] = set()
         out_providers: list[dict] = []
         for i, p in enumerate(raw_providers):
@@ -286,9 +282,7 @@ def _validate_provider(raw: object, index: int) -> dict:
     # ── timetable ────────────────────────────────────────────────────
     tt = raw.get("timetable")
     if not isinstance(tt, dict):
-        raise ValueError(
-            f"providers[{index}].timetable must be an object with format + url"
-        )
+        raise ValueError(f"providers[{index}].timetable must be an object with format + url")
     fmt = (tt.get("format") or "").strip().lower()
     if fmt not in _OTP_TIMETABLE_FORMATS:
         raise ValueError(
@@ -318,9 +312,7 @@ def _validate_provider(raw: object, index: int) -> dict:
         v = (gtfs_rt_raw.get(key) or "").strip()
         if v:
             if not v.startswith(("http://", "https://")):
-                raise ValueError(
-                    f"providers[{index}].gtfs_rt.{key}={v!r} must be an http(s) URL"
-                )
+                raise ValueError(f"providers[{index}].gtfs_rt.{key}={v!r} must be an http(s) URL")
             gtfs_rt[key] = v
 
     # ── mct_url, stations_csv_url (optional) ─────────────────────────
@@ -380,9 +372,7 @@ def dispatch(
             # Multi-feed: rotate only the matching feed's prior file.
             existing_target = subdir / target_name
             if existing_target.exists():
-                existing_target.rename(
-                    existing_target.with_suffix(existing_target.suffix + ".old")
-                )
+                existing_target.rename(existing_target.with_suffix(existing_target.suffix + ".old"))
         target = subdir / target_name
         shutil.copy2(stored_path, target)
         _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")

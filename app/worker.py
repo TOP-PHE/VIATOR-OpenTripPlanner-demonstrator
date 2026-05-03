@@ -33,6 +33,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # Same path written by app/api/admin/sessions.py::promote_session.
 _RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 
+# Absolute path so Bandit (S607) doesn't flag our subprocess.run calls.
+# We copy the docker CLI binary here in docker/web/Dockerfile stage 2 — this
+# is the *only* docker we'll ever invoke from inside the worker container.
+# Hard-coding it (rather than `shutil.which`) also makes the security review
+# trivial: every subprocess invocation passes through this constant.
+_DOCKER = "/usr/local/bin/docker"
+
 
 def main() -> None:
     log.info("worker starting; debounce=%ss", settings.debounce_seconds)
@@ -164,9 +171,11 @@ def handle_reload_trigger() -> None:
     # container alive — it keeps running and consuming RAM despite
     # nginx no longer routing to it. Detect and remove them.
     expected_otp_services = {f"otp-{sid}" for sid in serving_sids}
-    ps = subprocess.run(  # noqa: S603, S607
-        ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
-        capture_output=True, text=True, check=False,
+    ps = subprocess.run(  # noqa: S603
+        [_DOCKER, "ps", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if ps.returncode == 0:
         # Container names are like `viator-otp-nap-fr-sncf-2026-q2-1` — strip
@@ -178,7 +187,7 @@ def handle_reload_trigger() -> None:
             if not name.startswith("viator-"):
                 continue
             # `viator-<service>-<replica>` — replica is a numeric suffix
-            inner = name[len("viator-"):]
+            inner = name[len("viator-") :]
             # Drop trailing `-N` if numeric; otherwise leave whole.
             stem, _, last = inner.rpartition("-")
             if stem and last.isdigit():
@@ -188,20 +197,24 @@ def handle_reload_trigger() -> None:
         orphans = running_otp_services - expected_otp_services
         for orphan in sorted(orphans):
             log.info("removing orphan compose service %s", orphan)
-            rm = subprocess.run(  # noqa: S603, S607
-                ["docker", "compose", "-p", "viator", "rm", "-f", "-s", "-v", orphan],
+            rm = subprocess.run(  # noqa: S603
+                [_DOCKER, "compose", "-p", "viator", "rm", "-f", "-s", "-v", orphan],
                 cwd="/srv/docker",
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             if rm.returncode != 0:
                 log.warning(
                     "rm of orphan %s failed (exit %s); next tick will retry. stderr: %s",
-                    orphan, rm.returncode, rm.stderr,
+                    orphan,
+                    rm.returncode,
+                    rm.stderr,
                 )
 
     # nginx -s reload (target the compose-labeled container).
     reload = subprocess.run(  # noqa: S603
-        ["docker", "exec", "viator-nginx-1", "nginx", "-s", "reload"],  # noqa: S607
+        [_DOCKER, "exec", "viator-nginx-1", "nginx", "-s", "reload"],
         capture_output=True,
         text=True,
         check=False,
@@ -247,7 +260,9 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                 try:
                     providers = ingestion.normalize_providers(row.config)
                 except ValueError as exc:
-                    log.warning("session %s has bad provider config: %s — using empty list", sid, exc)
+                    log.warning(
+                        "session %s has bad provider config: %s — using empty list", sid, exc
+                    )
 
     # Generate per-session router-config.json. The entrypoint copies it
     # into BUILD_DIR (overriding the baked image default) before launching
@@ -261,11 +276,11 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                 router_config.render_router_config(providers),
                 encoding="utf-8",
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log-and-continue
+        except Exception as exc:
             log.warning("session %s router-config.json write failed: %s", sid, exc)
 
     cmd = [
-        "docker",
+        _DOCKER,
         "compose",
         "-p",
         "viator",  # must match `name:` in docker/docker-compose.yml

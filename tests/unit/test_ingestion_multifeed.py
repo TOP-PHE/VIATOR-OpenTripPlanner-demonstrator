@@ -24,9 +24,9 @@ def fake_db():
     by passing a session whose .query() returns nothing."""
 
     class _DBStub:
-        def query(self, *a, **kw):  # noqa: ARG002
+        def query(self, *a, **kw):
             class _Q:
-                def filter(self, *a, **kw):  # noqa: ARG002
+                def filter(self, *a, **kw):
                     return self
 
                 def first(self):

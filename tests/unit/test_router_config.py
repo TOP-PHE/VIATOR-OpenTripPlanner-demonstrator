@@ -24,9 +24,7 @@ def _render(providers):
 
 def test_empty_providers_omits_updaters_key():
     cfg = _render([])
-    assert "updaters" not in cfg, (
-        "OTP rejects `updaters: []`; the key must be absent when empty"
-    )
+    assert "updaters" not in cfg, "OTP rejects `updaters: []`; the key must be absent when empty"
     assert "server" in cfg
     assert "routingDefaults" in cfg
 
@@ -39,30 +37,42 @@ def test_routing_defaults_include_access_egress_bound():
     cfg = _render([])
     bounds = cfg["routingDefaults"].get("maxAccessEgressDurationForMode")
     assert bounds is not None, "routingDefaults must include access/egress bound"
-    assert bounds.get("WALK") == "20m", (
-        "WALK access/egress bound is the safety net against silent truncation"
-    )
+    assert (
+        bounds.get("WALK") == "20m"
+    ), "WALK access/egress bound is the safety net against silent truncation"
 
 
 def test_provider_without_gtfs_rt_emits_no_updater():
-    cfg = _render([
-        {"id": "SNCF", "label": "SNCF", "country_iso": "FR",
-         "timetable": {"format": "gtfs", "url": "https://x"},
-         "gtfs_rt": {}}
-    ])
+    cfg = _render(
+        [
+            {
+                "id": "SNCF",
+                "label": "SNCF",
+                "country_iso": "FR",
+                "timetable": {"format": "gtfs", "url": "https://x"},
+                "gtfs_rt": {},
+            }
+        ]
+    )
     assert "updaters" not in cfg
 
 
 def test_one_provider_with_three_rt_urls_emits_three_updaters():
-    cfg = _render([
-        {"id": "SNCF", "label": "SNCF", "country_iso": "FR",
-         "timetable": {"format": "gtfs", "url": "https://x"},
-         "gtfs_rt": {
-             "alerts_url":            "https://a/alerts",
-             "trip_updates_url":      "https://a/trip",
-             "vehicle_positions_url": "https://a/vehicle",
-         }},
-    ])
+    cfg = _render(
+        [
+            {
+                "id": "SNCF",
+                "label": "SNCF",
+                "country_iso": "FR",
+                "timetable": {"format": "gtfs", "url": "https://x"},
+                "gtfs_rt": {
+                    "alerts_url": "https://a/alerts",
+                    "trip_updates_url": "https://a/trip",
+                    "vehicle_positions_url": "https://a/vehicle",
+                },
+            },
+        ]
+    )
     types = [u["type"] for u in cfg["updaters"]]
     assert types == ["real-time-alerts", "stop-time-updater", "vehicle-positions"]
     for u in cfg["updaters"]:
@@ -71,19 +81,19 @@ def test_one_provider_with_three_rt_urls_emits_three_updaters():
 
 
 def test_multiple_providers_emit_in_declared_order():
-    cfg = _render([
-        {"id": "SNCF", "gtfs_rt": {"alerts_url": "https://a/alerts"}},
-        {"id": "IDFM", "gtfs_rt": {"trip_updates_url": "https://b/trip"}},
-        {"id": "TRENITALIA", "gtfs_rt": {}},  # no RT, contributes 0
-    ])
+    cfg = _render(
+        [
+            {"id": "SNCF", "gtfs_rt": {"alerts_url": "https://a/alerts"}},
+            {"id": "IDFM", "gtfs_rt": {"trip_updates_url": "https://b/trip"}},
+            {"id": "TRENITALIA", "gtfs_rt": {}},  # no RT, contributes 0
+        ]
+    )
     feed_ids = [u["feedId"] for u in cfg["updaters"]]
     assert feed_ids == ["SNCF", "IDFM"], "provider order should be preserved; trenitalia has no RT"
 
 
 def test_partial_rt_only_emits_present_keys():
-    cfg = _render([
-        {"id": "SNCF", "gtfs_rt": {"alerts_url": "https://a"}}
-    ])
+    cfg = _render([{"id": "SNCF", "gtfs_rt": {"alerts_url": "https://a"}}])
     # Only alerts URL → only one updater entry
     assert len(cfg["updaters"]) == 1
     assert cfg["updaters"][0]["type"] == "real-time-alerts"

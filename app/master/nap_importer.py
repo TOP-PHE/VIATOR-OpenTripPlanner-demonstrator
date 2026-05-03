@@ -49,27 +49,59 @@ DEFAULT_FR_NAP_URL = "https://transport.data.gouv.fr/api/datasets"
 _MODE_KEYWORDS: dict[str, set[str]] = {
     "rail": {
         # SNCF brands
-        "tgv", "ouigo", "intercité", "intercite", "ter ",
+        "tgv",
+        "ouigo",
+        "intercité",
+        "intercite",
+        "ter ",
         # Operators (in French context)
-        "sncf", "trenitalia", "eurostar", "renfe", "thalys", "lyria",
+        "sncf",
+        "trenitalia",
+        "eurostar",
+        "renfe",
+        "thalys",
+        "lyria",
         # Generic French rail terms
-        "train", "ferré", "ferrov", "ferroviaire", "ave",
+        "train",
+        "ferré",
+        "ferrov",
+        "ferroviaire",
+        "ave",
     },
     "urban": {
         # Île-de-France
-        "transilien", "rer ", "métro", "metro",
-        "idfm", "ile-de-france mobilités", "ile-de-france mobilites",
+        "transilien",
+        "rer ",
+        "métro",
+        "metro",
+        "idfm",
+        "ile-de-france mobilités",
+        "ile-de-france mobilites",
         # Generic urban transit
-        "tramway", "tram ", "réseau urbain", "reseau urbain",
-        "ratp", "métropole", "metropole",
+        "tramway",
+        "tram ",
+        "réseau urbain",
+        "reseau urbain",
+        "ratp",
+        "métropole",
+        "metropole",
     },
     "bus": {
         # Bus / coach
-        "bus", "autocar", "interurbain", "flixbus", "blablabus",
-        "ouibus", "macron",
+        "bus",
+        "autocar",
+        "interurbain",
+        "flixbus",
+        "blablabus",
+        "ouibus",
+        "macron",
     },
     "bike": {
-        "vélo", "velo", "vae ", "bicycle", "vls",
+        "vélo",
+        "velo",
+        "vae ",
+        "bicycle",
+        "vls",
     },
 }
 
@@ -81,6 +113,7 @@ _FORMAT_PRIORITY: list[str] = [
     "GTFS",
     "NeTEx",  # Often actually Nordic / EPIP — distinguish by schema_name
 ]
+
 
 # Mapping of resource format → OTP-side timetable format. We coerce the
 # upstream's loose format strings ("GTFS", "gtfs", "GTFS-RT", etc.)
@@ -140,11 +173,13 @@ def classify_modes(dataset: dict[str, Any]) -> set[str]:
     `urban` mode filters. The empty set means no recognised mode — caller
     skips when filtering by mode.
     """
-    haystack = " ".join([
-        (dataset.get("title") or "").lower(),
-        (dataset.get("slug") or "").lower(),
-        " ".join((tag or "").lower() for tag in (dataset.get("tags") or [])),
-    ])
+    haystack = " ".join(
+        [
+            (dataset.get("title") or "").lower(),
+            (dataset.get("slug") or "").lower(),
+            " ".join((tag or "").lower() for tag in (dataset.get("tags") or [])),
+        ]
+    )
     modes: set[str] = set()
     for mode, keywords in _MODE_KEYWORDS.items():
         if any(kw in haystack for kw in keywords):
@@ -230,7 +265,9 @@ def select_gtfs_rt_urls(dataset: dict[str, Any]) -> dict[str, str]:
             out["alerts_url"] = url
         elif "trip" in url_lower and "trip_updates_url" not in out:
             out["trip_updates_url"] = url
-        elif ("vehicle" in url_lower or "position" in url_lower) and "vehicle_positions_url" not in out:
+        elif (
+            "vehicle" in url_lower or "position" in url_lower
+        ) and "vehicle_positions_url" not in out:
             out["vehicle_positions_url"] = url
     return out
 
@@ -313,8 +350,9 @@ def make_provider_from_dataset(
 
     publisher = (dataset.get("publisher") or {}).get("name") or ""
     title = dataset.get("title") or ""
-    pid = slug_to_provider_id(publisher, existing=existing_ids or set()) \
-        or slug_to_provider_id(title, existing=existing_ids or set())
+    pid = slug_to_provider_id(publisher, existing=existing_ids or set()) or slug_to_provider_id(
+        title, existing=existing_ids or set()
+    )
     if not pid:
         return None
 
@@ -417,13 +455,9 @@ async def import_from_nap(
     datasets = await fetch_datasets(nap_url)
 
     existing_urls = {
-        (p.get("timetable") or {}).get("url")
-        for p in existing_providers
-        if isinstance(p, dict)
+        (p.get("timetable") or {}).get("url") for p in existing_providers if isinstance(p, dict)
     }
-    existing_ids = {
-        p.get("id") for p in existing_providers if isinstance(p, dict) and p.get("id")
-    }
+    existing_ids = {p.get("id") for p in existing_providers if isinstance(p, dict) and p.get("id")}
 
     new_providers: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []

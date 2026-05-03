@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ─────────────────────── normalize_providers ───────────────────────
 
 
@@ -30,13 +29,15 @@ class TestNormalizeProviders:
         """Pre-v0.1.4 single-string config opens to one provider with id=GTFS."""
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "gtfs": "https://example.com/sncf.zip",
-                "mct": "https://example.com/mct.csv",
-                "stations": "https://example.com/st.csv",
+        out = normalize_providers(
+            {
+                "sources": {
+                    "gtfs": "https://example.com/sncf.zip",
+                    "mct": "https://example.com/mct.csv",
+                    "stations": "https://example.com/st.csv",
+                }
             }
-        })
+        )
         assert len(out) == 1
         p = out[0]
         assert p["id"] == "GTFS"
@@ -52,15 +53,17 @@ class TestNormalizeProviders:
         """v0.1.4 list lifts to N providers; first inherits session-level mct/stations."""
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "gtfs": [
-                    {"id": "SNCF", "url": "https://a/sncf.zip"},
-                    {"id": "IDFM", "url": "https://b/idfm.zip"},
-                ],
-                "mct": "https://c/mct.csv",
+        out = normalize_providers(
+            {
+                "sources": {
+                    "gtfs": [
+                        {"id": "SNCF", "url": "https://a/sncf.zip"},
+                        {"id": "IDFM", "url": "https://b/idfm.zip"},
+                    ],
+                    "mct": "https://c/mct.csv",
+                }
             }
-        })
+        )
         assert len(out) == 2
         assert out[0]["id"] == "SNCF"
         assert out[0]["mct_url"] == "https://c/mct.csv"
@@ -70,21 +73,23 @@ class TestNormalizeProviders:
     def test_v016_native_pass_through(self):
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "providers": [
-                    {
-                        "id": "SNCF",
-                        "label": "SNCF Trains",
-                        "country_iso": "FR",
-                        "timetable": {"format": "gtfs", "url": "https://a/sncf.zip"},
-                        "gtfs_rt": {"alerts_url": "https://x/alerts"},
-                        "mct_url": "https://m/mct.csv",
-                        "stations_csv_url": "https://s/st.csv",
-                    }
-                ]
+        out = normalize_providers(
+            {
+                "sources": {
+                    "providers": [
+                        {
+                            "id": "SNCF",
+                            "label": "SNCF Trains",
+                            "country_iso": "FR",
+                            "timetable": {"format": "gtfs", "url": "https://a/sncf.zip"},
+                            "gtfs_rt": {"alerts_url": "https://x/alerts"},
+                            "mct_url": "https://m/mct.csv",
+                            "stations_csv_url": "https://s/st.csv",
+                        }
+                    ]
+                }
             }
-        })
+        )
         assert len(out) == 1
         assert out[0]["country_iso"] == "FR"
         assert out[0]["gtfs_rt"]["alerts_url"] == "https://x/alerts"
@@ -93,44 +98,53 @@ class TestNormalizeProviders:
         from app.ingestion import normalize_providers
 
         with pytest.raises(ValueError, match="must match"):
-            normalize_providers({
-                "sources": {
-                    "providers": [
-                        {"id": "sncf", "timetable": {"format": "gtfs", "url": "https://a/x.zip"}}
-                    ]
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {
+                                "id": "sncf",
+                                "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
+                            }
+                        ]
+                    }
                 }
-            })
+            )
 
     def test_invalid_country_rejected(self):
         from app.ingestion import normalize_providers
 
         with pytest.raises(ValueError, match="2-letter ISO"):
-            normalize_providers({
-                "sources": {
-                    "providers": [
-                        {
-                            "id": "SNCF",
-                            "country_iso": "FRA",  # 3 letters
-                            "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
-                        }
-                    ]
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {
+                                "id": "SNCF",
+                                "country_iso": "FRA",  # 3 letters
+                                "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
+                            }
+                        ]
+                    }
                 }
-            })
+            )
 
     def test_country_iso_normalised_to_uppercase(self):
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "providers": [
-                    {
-                        "id": "SNCF",
-                        "country_iso": "fr",  # lowercase input
-                        "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
-                    }
-                ]
+        out = normalize_providers(
+            {
+                "sources": {
+                    "providers": [
+                        {
+                            "id": "SNCF",
+                            "country_iso": "fr",  # lowercase input
+                            "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
+                        }
+                    ]
+                }
             }
-        })
+        )
         assert out[0]["country_iso"] == "FR"
 
     def test_invalid_timetable_format_rejected(self):
@@ -138,37 +152,52 @@ class TestNormalizeProviders:
         from app.ingestion import normalize_providers
 
         with pytest.raises(ValueError, match="NeTEx-FR is intentionally excluded"):
-            normalize_providers({
-                "sources": {
-                    "providers": [
-                        {"id": "SNCF", "timetable": {"format": "netex_fr", "url": "https://a/x.zip"}}
-                    ]
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {
+                                "id": "SNCF",
+                                "timetable": {"format": "netex_fr", "url": "https://a/x.zip"},
+                            }
+                        ]
+                    }
                 }
-            })
+            )
 
     def test_duplicate_provider_id_rejected(self):
         from app.ingestion import normalize_providers
 
         with pytest.raises(ValueError, match="appears twice"):
-            normalize_providers({
-                "sources": {
-                    "providers": [
-                        {"id": "SNCF", "timetable": {"format": "gtfs", "url": "https://a/x.zip"}},
-                        {"id": "SNCF", "timetable": {"format": "gtfs", "url": "https://b/y.zip"}},
-                    ]
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {
+                                "id": "SNCF",
+                                "timetable": {"format": "gtfs", "url": "https://a/x.zip"},
+                            },
+                            {
+                                "id": "SNCF",
+                                "timetable": {"format": "gtfs", "url": "https://b/y.zip"},
+                            },
+                        ]
+                    }
                 }
-            })
+            )
 
     def test_optional_fields_default_to_empty(self):
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "providers": [
-                    {"id": "SNCF", "timetable": {"format": "gtfs", "url": "https://a/x.zip"}}
-                ]
+        out = normalize_providers(
+            {
+                "sources": {
+                    "providers": [
+                        {"id": "SNCF", "timetable": {"format": "gtfs", "url": "https://a/x.zip"}}
+                    ]
+                }
             }
-        })
+        )
         assert out[0]["gtfs_rt"] == {}
         assert out[0]["mct_url"] is None
         assert out[0]["stations_csv_url"] is None
@@ -176,30 +205,34 @@ class TestNormalizeProviders:
     def test_netex_nordic_format_accepted(self):
         from app.ingestion import normalize_providers
 
-        out = normalize_providers({
-            "sources": {
-                "providers": [
-                    {
-                        "id": "ENTUR",
-                        "country_iso": "NO",
-                        "timetable": {"format": "netex_nordic", "url": "https://a/no.zip"},
-                    }
-                ]
+        out = normalize_providers(
+            {
+                "sources": {
+                    "providers": [
+                        {
+                            "id": "ENTUR",
+                            "country_iso": "NO",
+                            "timetable": {"format": "netex_nordic", "url": "https://a/no.zip"},
+                        }
+                    ]
+                }
             }
-        })
+        )
         assert out[0]["timetable"]["format"] == "netex_nordic"
 
     def test_non_http_urls_rejected(self):
         from app.ingestion import normalize_providers
 
         with pytest.raises(ValueError, match="http"):
-            normalize_providers({
-                "sources": {
-                    "providers": [
-                        {"id": "SNCF", "timetable": {"format": "gtfs", "url": "ftp://a/x.zip"}}
-                    ]
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {"id": "SNCF", "timetable": {"format": "gtfs", "url": "ftp://a/x.zip"}}
+                        ]
+                    }
                 }
-            })
+            )
 
 
 def test_staged_filename_for_format():

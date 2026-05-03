@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ─────────────────── classify_modes ───────────────────
 
 
@@ -61,7 +60,11 @@ class TestSelectResource:
 
         ds = {
             "resources": [
-                {"format": "NeTEx", "url": "https://x/netex.zip", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "NeTEx",
+                    "url": "https://x/netex.zip",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
                 {"format": "GTFS", "url": "https://x/gtfs.zip", "updated": "2026-04-30T12:00:00Z"},
             ]
         }
@@ -74,7 +77,7 @@ class TestSelectResource:
 
         ds = {
             "resources": [
-                {"format": "GTFS", "url": "https://x/old.zip",   "updated": "2025-01-01T00:00:00Z"},
+                {"format": "GTFS", "url": "https://x/old.zip", "updated": "2025-01-01T00:00:00Z"},
                 {"format": "GTFS", "url": "https://x/fresh.zip", "updated": "2026-04-30T12:00:00Z"},
             ]
         }
@@ -88,7 +91,11 @@ class TestSelectResource:
 
         ds = {
             "resources": [
-                {"format": "NeTEx", "url": "https://x/netex.zip", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "NeTEx",
+                    "url": "https://x/netex.zip",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
             ]
         }
         resource, fmt = select_resource(ds)
@@ -118,7 +125,11 @@ class TestSelectResource:
 
         ds = {
             "resources": [
-                {"format": "gtfs-rt", "url": "https://x/rt-alerts", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "gtfs-rt",
+                    "url": "https://x/rt-alerts",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
             ]
         }
         resource, fmt = select_resource(ds)
@@ -140,7 +151,7 @@ def test_select_gtfs_rt_urls_partitions_by_keyword():
             {"format": "gtfs-rt", "url": "https://x/sncf-gtfs-rt-service-alerts"},
             {"format": "gtfs-rt", "url": "https://x/sncf-gtfs-rt-trip-updates"},
             {"format": "gtfs-rt", "url": "https://x/sncf-vehicle-positions"},
-            {"format": "GTFS",    "url": "https://x/timetable.zip"},  # ignored — not RT
+            {"format": "GTFS", "url": "https://x/timetable.zip"},  # ignored — not RT
         ]
     }
     rt = select_gtfs_rt_urls(ds)
@@ -196,7 +207,11 @@ class TestMakeProviderFromDataset:
             "publisher": {"name": "SNCF Voyageurs"},
             "covered_area": [{"insee": "FR", "nom": "France"}],
             "resources": [
-                {"format": "GTFS",    "url": "https://x/sncf-gtfs.zip", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "GTFS",
+                    "url": "https://x/sncf-gtfs.zip",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
                 {"format": "gtfs-rt", "url": "https://x/sncf-gtfs-rt-service-alerts"},
                 {"format": "gtfs-rt", "url": "https://x/sncf-gtfs-rt-trip-updates"},
             ],
@@ -222,7 +237,11 @@ class TestMakeProviderFromDataset:
             "publisher": {"name": "X"},
             "covered_area": [{"insee": "FR", "nom": "France"}],
             "resources": [
-                {"format": "NeTEx", "url": "https://x/netex-fr.zip", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "NeTEx",
+                    "url": "https://x/netex-fr.zip",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
             ],
         }
         assert make_provider_from_dataset(ds) is None
@@ -230,7 +249,10 @@ class TestMakeProviderFromDataset:
     def test_dataset_without_resources_returns_none(self):
         from app.master.nap_importer import make_provider_from_dataset
 
-        assert make_provider_from_dataset({"title": "X", "publisher": {"name": "X"}, "resources": []}) is None
+        assert (
+            make_provider_from_dataset({"title": "X", "publisher": {"name": "X"}, "resources": []})
+            is None
+        )
 
     def test_country_falls_back_to_default(self):
         from app.master.nap_importer import make_provider_from_dataset
@@ -238,7 +260,7 @@ class TestMakeProviderFromDataset:
         ds = {
             "title": "Provider X",
             "publisher": {"name": "PROV"},
-            "covered_area": [],   # empty, so country can't be determined from data
+            "covered_area": [],  # empty, so country can't be determined from data
             "resources": [
                 {"format": "GTFS", "url": "https://x/y.zip", "updated": "2026-04-30T12:00:00Z"},
             ],
@@ -283,7 +305,11 @@ async def test_import_from_nap_filters_and_dedupes(monkeypatch):
             "covered_area": [{"insee": "FR", "nom": "France"}],
             "resources": [
                 # Only NeTEx, no GTFS — should be skipped + warn
-                {"format": "NeTEx", "url": "https://x/trenitalia-netex.zip", "updated": "2026-04-30T12:00:00Z"},
+                {
+                    "format": "NeTEx",
+                    "url": "https://x/trenitalia-netex.zip",
+                    "updated": "2026-04-30T12:00:00Z",
+                },
             ],
         },
         {
@@ -336,7 +362,11 @@ async def test_import_from_nap_dedupes_by_url(monkeypatch):
                 "publisher": {"name": "SNCF Voyageurs"},
                 "covered_area": [{"insee": "FR", "nom": "France"}],
                 "resources": [
-                    {"format": "GTFS", "url": "https://x/sncf.zip", "updated": "2026-04-30T12:00:00Z"},
+                    {
+                        "format": "GTFS",
+                        "url": "https://x/sncf.zip",
+                        "updated": "2026-04-30T12:00:00Z",
+                    },
                 ],
             },
         ]

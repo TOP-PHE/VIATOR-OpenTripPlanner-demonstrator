@@ -97,10 +97,7 @@ class TestMarkers:
         mark_refresh_completed(cfg)
         # Both keys present; the one we just set is more recent.
         assert cfg["_meta"]["sources_changed_at"] == "2026-01-01T00:00:00+00:00"
-        assert (
-            cfg["_meta"]["last_refresh_completed_at"]
-            > cfg["_meta"]["sources_changed_at"]
-        )
+        assert cfg["_meta"]["last_refresh_completed_at"] > cfg["_meta"]["sources_changed_at"]
 
 
 # ─────────────────── sources_subtree_equal ───────────────────

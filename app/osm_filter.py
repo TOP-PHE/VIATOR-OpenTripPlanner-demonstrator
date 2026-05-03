@@ -117,8 +117,7 @@ def validate_scope(value: object | None) -> str:
         raise ValueError(f"osm_scope must be a string, got {type(value).__name__}")
     if value not in VALID_SCOPES:
         raise ValueError(
-            f"osm_scope={value!r} is not recognised. "
-            f"Valid options: {sorted(VALID_SCOPES)}"
+            f"osm_scope={value!r} is not recognised. " f"Valid options: {sorted(VALID_SCOPES)}"
         )
     return value
 

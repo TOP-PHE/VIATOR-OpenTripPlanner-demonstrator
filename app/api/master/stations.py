@@ -209,10 +209,7 @@ def list_stations(
         ql = q.lower()
         return ql in (s.name or "").lower() or ql in (s.uic or "").lower()
 
-    return [
-        StationResponse.from_orm_with_drift(s, drift_uics, is_match=_is_match(s))
-        for s in rows
-    ]
+    return [StationResponse.from_orm_with_drift(s, drift_uics, is_match=_is_match(s)) for s in rows]
 
 
 @router.patch("/{uic}", response_model=StationResponse)

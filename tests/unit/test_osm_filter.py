@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ─────────────────────── validate_scope ───────────────────────
 
 
@@ -87,9 +86,7 @@ class TestPresetShape:
         for scope in ("transit-focused", "multi-modal"):
             tags = OSM_SCOPE_PRESETS[scope]["tags"]
             assert any("railway" in t for t in tags), f"{scope} missing railway"
-            assert any("public_transport" in t for t in tags), (
-                f"{scope} missing public_transport"
-            )
+            assert any("public_transport" in t for t in tags), f"{scope} missing public_transport"
 
     def test_transit_focused_drops_service_roads(self):
         """transit-focused's headline saving is dropping highway=service.
@@ -106,12 +103,10 @@ class TestPresetShape:
         assert value_list is not None
         # Split into individual values: "highway=motorway,trunk,..." → set
         values = set(value_list.split("=", 1)[1].split(","))
-        assert "service" not in values, (
-            "transit-focused should drop highway=service for the memory win"
-        )
-        assert "track" not in values, (
-            "transit-focused should drop highway=track (agricultural)"
-        )
+        assert (
+            "service" not in values
+        ), "transit-focused should drop highway=service for the memory win"
+        assert "track" not in values, "transit-focused should drop highway=track (agricultural)"
         # Ensure we DO keep the things that matter.
         assert "footway" in values, "footway is needed for stop access"
         assert "residential" in values, "residential is needed for transit access"

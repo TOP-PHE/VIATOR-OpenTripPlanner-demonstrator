@@ -72,26 +72,32 @@ def render_router_config(providers: list[dict[str, Any]]) -> str:
         if not feed_id or not isinstance(rt, dict):
             continue
         if rt.get("alerts_url"):
-            updaters.append({
-                "type": "real-time-alerts",
-                "feedId": feed_id,
-                "url": rt["alerts_url"],
-                "frequency": "1m",
-            })
+            updaters.append(
+                {
+                    "type": "real-time-alerts",
+                    "feedId": feed_id,
+                    "url": rt["alerts_url"],
+                    "frequency": "1m",
+                }
+            )
         if rt.get("trip_updates_url"):
-            updaters.append({
-                "type": "stop-time-updater",
-                "feedId": feed_id,
-                "url": rt["trip_updates_url"],
-                "frequency": "1m",
-            })
+            updaters.append(
+                {
+                    "type": "stop-time-updater",
+                    "feedId": feed_id,
+                    "url": rt["trip_updates_url"],
+                    "frequency": "1m",
+                }
+            )
         if rt.get("vehicle_positions_url"):
-            updaters.append({
-                "type": "vehicle-positions",
-                "feedId": feed_id,
-                "url": rt["vehicle_positions_url"],
-                "frequency": "1m",
-            })
+            updaters.append(
+                {
+                    "type": "vehicle-positions",
+                    "feedId": feed_id,
+                    "url": rt["vehicle_positions_url"],
+                    "frequency": "1m",
+                }
+            )
 
     config: dict[str, Any] = {
         "server": _DEFAULT_SERVER,

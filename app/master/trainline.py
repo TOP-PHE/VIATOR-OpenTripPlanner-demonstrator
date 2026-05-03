@@ -79,18 +79,18 @@ _COL_MAP = {
 # Map keys are the Trainline CSV column names; values are the canonical
 # JSONB key we use internally (lowercased, terse).
 _OTHER_CODES_COL_MAP = {
-    "obb_id":         "obb",          # ÖBB / Austrian Federal Railways
-    "cff_id":         "sbb",          # SBB / CFF / FFS — Switzerland (Trainline calls it cff_id)
-    "entur_id":       "entur",        # Entur — Norway / Nordic transit hub
-    "ntv_id":         "ntv",          # NTV / Italo — Italian private high-speed
-    "trenord_id":     "trenord",      # Trenord — Lombardy regional
-    "cercanias_id":   "cercanias",    # Renfe Cercanías — Spanish regional
-    "benerail_id":    "benerail",     # Benerail — Belgium booking
-    "westbahn_id":    "westbahn",     # Westbahn — Austrian private
-    "flixbus_id":     "flixbus",      # Flixbus
-    "busbud_id":      "busbud",       # Busbud
+    "obb_id": "obb",  # ÖBB / Austrian Federal Railways
+    "cff_id": "sbb",  # SBB / CFF / FFS — Switzerland (Trainline calls it cff_id)
+    "entur_id": "entur",  # Entur — Norway / Nordic transit hub
+    "ntv_id": "ntv",  # NTV / Italo — Italian private high-speed
+    "trenord_id": "trenord",  # Trenord — Lombardy regional
+    "cercanias_id": "cercanias",  # Renfe Cercanías — Spanish regional
+    "benerail_id": "benerail",  # Benerail — Belgium booking
+    "westbahn_id": "westbahn",  # Westbahn — Austrian private
+    "flixbus_id": "flixbus",  # Flixbus
+    "busbud_id": "busbud",  # Busbud
     "distribusion_id": "distribusion",  # Distribusion
-    "iata_airport_code": "iata",      # IATA airport code (when station is in/at an airport)
+    "iata_airport_code": "iata",  # IATA airport code (when station is in/at an airport)
 }
 
 

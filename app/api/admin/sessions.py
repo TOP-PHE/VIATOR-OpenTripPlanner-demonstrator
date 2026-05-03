@@ -218,9 +218,7 @@ def patch_session(
             # Operator-driven: fail save with a clear message that includes
             # which countries are missing AND suggests the Trainline-import
             # action. UI surfaces this as a prompt with a one-click button.
-            declared_countries = {
-                p["country_iso"] for p in providers if p["country_iso"]
-            }
+            declared_countries = {p["country_iso"] for p in providers if p["country_iso"]}
             if declared_countries:
                 missing = _countries_without_stations(db, declared_countries)
                 if missing:
@@ -334,8 +332,7 @@ def delete_session(
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "config_summary": {
             "providers": [
-                p.get("id")
-                for p in (s.config or {}).get("sources", {}).get("providers", [])
+                p.get("id") for p in (s.config or {}).get("sources", {}).get("providers", [])
             ],
             "had_osm_pbf": bool((s.config or {}).get("sources", {}).get("osm_pbf")),
         },
@@ -724,7 +721,11 @@ async def refresh_sources(
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
             outcome = await _refresh_one_task(
-                client, db, sid, staging, task,
+                client,
+                db,
+                sid,
+                staging,
+                task,
             )
             if outcome.get("status") == "fetched":
                 fetched.append({k: v for k, v in outcome.items() if k != "status"})
@@ -783,7 +784,9 @@ def _stat_size(p: Path) -> int:
 _RefreshTask = tuple[str, str, str, str | None]
 
 
-def _build_refresh_tasks(config: dict[str, Any], *, only_provider: str | None = None) -> list[_RefreshTask]:
+def _build_refresh_tasks(
+    config: dict[str, Any], *, only_provider: str | None = None
+) -> list[_RefreshTask]:
     """Flatten a session config into a list of download tasks.
 
     `only_provider`, when set, filters to that provider's tasks only —
@@ -823,21 +826,25 @@ def _build_refresh_tasks(config: dict[str, Any], *, only_provider: str | None = 
         tt_fmt = tt.get("format", "gtfs")
         if tt_url:
             kind = ingestion.TIMETABLE_FORMAT_DETAILS[tt_fmt]["kind"]
-            tasks.append((
-                f"provider[{pid}].timetable({tt_fmt})",
-                kind,
-                tt_url,
-                ingestion.staged_filename_for_format(pid, tt_fmt),
-            ))
+            tasks.append(
+                (
+                    f"provider[{pid}].timetable({tt_fmt})",
+                    kind,
+                    tt_url,
+                    ingestion.staged_filename_for_format(pid, tt_fmt),
+                )
+            )
         if p.get("mct_url"):
             tasks.append((f"provider[{pid}].mct", "SNCF-MCT", p["mct_url"], None))
         if p.get("stations_csv_url"):
-            tasks.append((
-                f"provider[{pid}].stations_csv",
-                "SNCF-Stations",
-                p["stations_csv_url"],
-                None,
-            ))
+            tasks.append(
+                (
+                    f"provider[{pid}].stations_csv",
+                    "SNCF-Stations",
+                    p["stations_csv_url"],
+                    None,
+                )
+            )
 
     # Session-level OSM PBF (only on full refresh, not per-provider).
     if only_provider is None and isinstance(sources.get("osm_pbf"), str) and sources["osm_pbf"]:
@@ -878,7 +885,9 @@ async def _refresh_one_task(
     size_bytes = _stat_size(staged_path)
     try:
         ingestion.dispatch(
-            staged_path, kind, db,
+            staged_path,
+            kind,
+            db,
             session_id=sid,
             staged_filename=staged_filename,
         )
@@ -1203,8 +1212,12 @@ def enqueue_rebuild(
     # `populated` from a GTFS upload while OSM is still missing. Inspect
     # the filesystem directly.
     sess_inbox = ingestion.session_inbox(sid)
-    gtfs_zips = sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
-    netex_zips = sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+    gtfs_zips = (
+        sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
+    )
+    netex_zips = (
+        sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+    )
     osm_pbfs = sorted((sess_inbox / "osm").glob("*.pbf")) if (sess_inbox / "osm").exists() else []
     if not (gtfs_zips or netex_zips):
         raise HTTPException(

@@ -9,7 +9,6 @@ without a schema migration per operator.
 
 from __future__ import annotations
 
-
 CSV_HEADER = (
     "id;name;slug;uic;uic8_sncf;latitude;longitude;parent_station_id;hub_id;"
     "country;time_zone;is_city;is_main_station;is_airport;is_suggestable;"
@@ -31,14 +30,16 @@ def _row(uic="8011160", **overrides):
     """Build one CSV row with sane defaults; overrides keyed by column name."""
     cols = [c.strip() for c in CSV_HEADER.split(";")]
     values = {c: "" for c in cols}
-    values.update({
-        "id": "1",
-        "name": "Berlin Hbf",
-        "uic": uic,
-        "country": "DE",
-        "is_main_station": "t",
-        "is_suggestable": "t",
-    })
+    values.update(
+        {
+            "id": "1",
+            "name": "Berlin Hbf",
+            "uic": uic,
+            "country": "DE",
+            "is_main_station": "t",
+            "is_suggestable": "t",
+        }
+    )
     values.update(overrides)
     return ";".join(values[c] for c in cols)
 
@@ -107,9 +108,9 @@ def test_no_other_codes_means_no_key():
     """Stations with only dedicated codes shouldn't carry an empty other_codes
     key — the DB column has a server_default of '{}' that we let take over."""
     row = _parse_one(sncf_id="FRPNO")
-    assert "other_codes" not in row, (
-        "row should not include an empty other_codes dict — let the DB default fire"
-    )
+    assert (
+        "other_codes" not in row
+    ), "row should not include an empty other_codes dict — let the DB default fire"
 
 
 def test_iata_airport_code_when_present():
@@ -126,10 +127,23 @@ class _StubExisting:
     def __init__(self, **kw):
         for k, v in kw.items():
             setattr(self, k, v)
-        for k in ("source", "trigramme_sncf", "db_code", "trenitalia_code",
-                 "renfe_code", "atoc_code", "name", "country_iso",
-                 "latitude", "longitude", "is_main_station", "is_suggestable",
-                 "uic", "uic8_sncf", "slug"):
+        for k in (
+            "source",
+            "trigramme_sncf",
+            "db_code",
+            "trenitalia_code",
+            "renfe_code",
+            "atoc_code",
+            "name",
+            "country_iso",
+            "latitude",
+            "longitude",
+            "is_main_station",
+            "is_suggestable",
+            "uic",
+            "uic8_sncf",
+            "slug",
+        ):
             if not hasattr(self, k):
                 setattr(self, k, None)
         if not hasattr(self, "other_codes"):
@@ -146,9 +160,9 @@ def test_diff_decomposes_other_codes_per_key():
     incoming = {
         "name": "Berlin Hbf",
         "other_codes": {
-            "obb": "1190100",         # unchanged
-            "sbb": "8503001",          # changed
-            "trenord": "S99999",       # added
+            "obb": "1190100",  # unchanged
+            "sbb": "8503001",  # changed
+            "trenord": "S99999",  # added
         },
     }
     diff = _diff_fields(existing, incoming)
