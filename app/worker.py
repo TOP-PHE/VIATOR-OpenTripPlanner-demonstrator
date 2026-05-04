@@ -314,9 +314,14 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # defensive — bad strings raise here rather than at build time, so the
     # job's log shows a clear "unknown osm_scope" instead of a shell error
     # from the entrypoint.
-    from . import ingestion, osm_filter, router_config
+    from . import ingestion, osm_filter, otp_timezone, router_config
 
     osm_scope = osm_filter.DEFAULT_SCOPE
+    # v0.1.21 — explicit transitModelTimeZone, required by OTP 2.9 when
+    # the graph mixes agencies declaring different timezones (SNCF says
+    # Europe/Paris, Eurostar says Europe/Brussels, etc). Default keeps
+    # single-FR sessions working unchanged; UI lets operators override.
+    otp_tz = otp_timezone.DEFAULT_TIMEZONE
     providers: list[dict[str, Any]] = []
     # Map of credential_id → (auth_type, plaintext, param_name) for any
     # credentials referenced by GTFS-RT URLs in this session's providers.
@@ -335,6 +340,15 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                     osm_scope = osm_filter.validate_scope(row.config.get("osm_scope"))
                 except ValueError as exc:
                     log.warning("session %s has bad osm_scope: %s — using default", sid, exc)
+                try:
+                    otp_tz = otp_timezone.validate_timezone(row.config.get("otp_timezone"))
+                except ValueError as exc:
+                    log.warning(
+                        "session %s has bad otp_timezone: %s — using default %s",
+                        sid,
+                        exc,
+                        otp_timezone.DEFAULT_TIMEZONE,
+                    )
                 try:
                     providers = ingestion.normalize_providers(row.config)
                 except ValueError as exc:
@@ -433,6 +447,9 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "-e",
         f"OTP_OSM_SCOPE={osm_scope}",
+        # v0.1.21 — required by OTP 2.9 when the graph mixes agency tzs.
+        "-e",
+        f"OTP_TIMEZONE={otp_tz}",
         "otp-build",
     ]
     # `cmd` is built from constants + the configured session_id slug only;

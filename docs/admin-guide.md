@@ -539,7 +539,49 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.20 (latest)**: rebuild graph panel — current build card + history.
+**v0.1.21 (latest)**: per-session OTP timezone — fixes Eurostar / multi-tz rebuilds.
+
+OTP 2.9 refuses to build a graph that mixes agencies declaring different
+IANA timezones — SNCF's GTFS says `Europe/Paris`, Eurostar's says
+`Europe/Brussels`, Trenitalia France says `Europe/Rome`, etc. The build
+aborts with:
+
+> The graph contains agencies with different time zones:
+> Europe/Paris != Europe/Brussels. Please configure the one to be used
+> in the build-config.json
+
+v0.1.21 plumbs the `transitModelTimeZone` field through:
+
+- New session config field **`otp_timezone`** (default `Europe/Paris`).
+  Validated at save-time via stdlib `zoneinfo`; bad values rejected with
+  a 400 toast next to the dropdown.
+- New **Timezone dropdown** in the Configure form, sitting just below
+  OSM scope (both are build-time settings stored at the top level of
+  `config`). 17 curated entries covering every European country whose
+  rail data has appeared in a session — operators can also type any
+  IANA name for non-European demos.
+- Worker passes `OTP_TIMEZONE` as a docker `-e` to the otp-build
+  container (alongside the existing `OTP_HEAP`, `OTP_OSM_SCOPE`).
+- Entrypoint (`docker/otp/entrypoint.sh`) injects
+  `"transitModelTimeZone": "<value>"` into the generated
+  `build-config.json` whenever `OTP_TIMEZONE` is set.
+
+**Migration**: existing sessions that don't have `otp_timezone` set
+default to `Europe/Paris` — single-FR-rail sessions keep building
+unchanged, no operator action required. Sessions adding non-French
+agencies (Eurostar, Trenitalia FR, ICE) need to either keep
+`Europe/Paris` (recommended — most VIATOR demos are anchored to FR
+station search) or pick a different canonical tz for the graph via
+the dropdown.
+
+**Note about Eurostar**: their published GTFS declares
+`Europe/Brussels` even for London-side and Paris-side stops, because
+the operating company's admin entity is Belgian. Setting
+`transitModelTimeZone: Europe/Paris` is fine — OTP normalises all
+stop-time arithmetic to that tz at build time; the journey UI's
+displayed times are correct as long as you stay consistent.
+
+**v0.1.20**: rebuild graph panel — current build card + history.
 
 The "Rebuild graph" panel only showed a flat table of jobs with status,
 timestamps, and a 1500-char log tail. Operators couldn't tell what

@@ -99,6 +99,38 @@
                 — transit-focused keeps all roads + railways + public-transport amenities.
                 Default for new sessions: <code>transit-focused</code>.
               </p>
+              {# v0.1.21 — `transitModelTimeZone`. OTP 2.9 refuses to build a
+                 graph that mixes agencies with different declared timezones
+                 (SNCF says Europe/Paris, Eurostar says Europe/Brussels). The
+                 operator picks the canonical tz here; it's baked into the
+                 generated build-config.json. Default Europe/Paris keeps
+                 single-FR sessions building unchanged. #}
+              <label>Timezone <span class="hint">(<code>transitModelTimeZone</code> — required by OTP when agencies span multiple zones)</span></label>
+              <select name="otp_timezone">
+                <option value="Europe/Paris">Europe/Paris — France</option>
+                <option value="Europe/London">Europe/London — United Kingdom</option>
+                <option value="Europe/Brussels">Europe/Brussels — Belgium / Eurostar admin</option>
+                <option value="Europe/Amsterdam">Europe/Amsterdam — Netherlands</option>
+                <option value="Europe/Berlin">Europe/Berlin — Germany / Austria-DE</option>
+                <option value="Europe/Madrid">Europe/Madrid — Spain</option>
+                <option value="Europe/Rome">Europe/Rome — Italy</option>
+                <option value="Europe/Zurich">Europe/Zurich — Switzerland</option>
+                <option value="Europe/Vienna">Europe/Vienna — Austria</option>
+                <option value="Europe/Stockholm">Europe/Stockholm — Sweden</option>
+                <option value="Europe/Oslo">Europe/Oslo — Norway</option>
+                <option value="Europe/Copenhagen">Europe/Copenhagen — Denmark</option>
+                <option value="Europe/Helsinki">Europe/Helsinki — Finland</option>
+                <option value="Europe/Warsaw">Europe/Warsaw — Poland</option>
+                <option value="Europe/Prague">Europe/Prague — Czech Republic</option>
+                <option value="Europe/Lisbon">Europe/Lisbon — Portugal</option>
+                <option value="UTC">UTC — fallback</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem">
+                Pick the canonical timezone for the graph. All times in the graph (departure,
+                arrival, real-time updates) get stored in this zone. For mixed-country sessions
+                use the dominant operator's tz — typically the country whose stations operators
+                are searching from. Default: <code>Europe/Paris</code>.
+              </p>
               <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                 <button type="submit">Save config</button>
                 {# v0.1.14: split refresh into providers-only (cheap, frequent)
@@ -445,6 +477,12 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // not under `sources`, because it's not a download URL.
       if (cf.elements['osm_scope']) {
         cf.elements['osm_scope'].value = cfg.osm_scope || 'transit-focused';
+      }
+      // v0.1.21: OTP transitModelTimeZone — same top-level-of-config storage,
+      // same default-for-legacy pattern. Europe/Paris keeps existing FR-rail
+      // sessions building unchanged.
+      if (cf.elements['otp_timezone']) {
+        cf.elements['otp_timezone'].value = cfg.otp_timezone || 'Europe/Paris';
       }
       // Show / hide the staleness banner based on the persisted _meta.
       setStalenessBanner(sid);
@@ -949,6 +987,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // OSM scope sits at the top level of config (build-time setting).
     const osmScope = (form.elements['osm_scope']?.value || '').trim();
     if (osmScope) cfg.osm_scope = osmScope;
+    // v0.1.21: same for the OTP transitModelTimeZone.
+    const otpTz = (form.elements['otp_timezone']?.value || '').trim();
+    if (otpTz) cfg.otp_timezone = otpTz;
     // Drop legacy top-level gtfs/mct/stations once we've migrated to providers.
     if (providers.length) {
       delete cfg.sources.gtfs;

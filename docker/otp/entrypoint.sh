@@ -171,11 +171,24 @@ case "$MODE" in
         #
         # The bundled `/opt/otp/build-config.json` is the no-feeds fallback
         # (degenerate case OTP itself rejects with "no transit data").
+        # v0.1.21 — `transitModelTimeZone` is required by OTP 2.9 when the
+        # graph mixes agencies declaring different timezones (SNCF says
+        # Europe/Paris, Eurostar says Europe/Brussels — OTP refuses to pick
+        # for us and aborts with "agencies with different time zones"). The
+        # worker passes it as $OTP_TIMEZONE; default in app/otp_timezone.py
+        # is Europe/Paris so single-FR sessions keep building unchanged.
+        OTP_TIMEZONE_LINE=""
+        if [ -n "$OTP_TIMEZONE" ]; then
+            OTP_TIMEZONE_LINE="\"transitModelTimeZone\": \"$OTP_TIMEZONE\","
+        fi
+
         if [ -n "$TRANSIT_FEEDS_JSON" ]; then
             echo "Generating build-config.json with feeds: $TRANSIT_FEEDS_JSON"
+            echo "  transitModelTimeZone=$OTP_TIMEZONE"
             cat > "$BUILD_DIR/build-config.json" <<JSON
 {
   "osmDefaults": {"osmTagMapping": "default"},
+  $OTP_TIMEZONE_LINE
   "transitFeeds": [$TRANSIT_FEEDS_JSON],
   "osm": [{"source": "osm.pbf"}],
   "transitServiceStart": "-P1M",

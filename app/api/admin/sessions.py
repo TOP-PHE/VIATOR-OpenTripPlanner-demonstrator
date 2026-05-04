@@ -206,6 +206,21 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
+        # v0.1.21 — validate otp_timezone if present. Same fail-fast rationale:
+        # an invalid IANA tz here would cause OTP to refuse the build with
+        # "Cannot resolve zone id <bogus>". Catching at save time means the
+        # operator sees the error in a toast next to the dropdown instead of
+        # 5 minutes into a rebuild log.
+        if "otp_timezone" in body.config:
+            from ... import otp_timezone as _otp_tz
+
+            try:
+                body.config["otp_timezone"] = _otp_tz.validate_timezone(
+                    body.config["otp_timezone"]
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
         # Validate provider bundles (v0.1.6) on save. We accept the legacy
         # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),
         # but for save-time validation we only error on the v0.1.6-shaped
