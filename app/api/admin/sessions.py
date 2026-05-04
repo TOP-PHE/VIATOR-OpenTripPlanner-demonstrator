@@ -693,15 +693,17 @@ async def refresh_sources(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
-    """Download every URL in `config.sources` into the session's inbox.
+    """Download every PROVIDER URL in `config.sources` into the session's inbox.
 
-    `config.sources` is a flat dict of `{kind_key: url}`. Recognised keys:
+    Includes: each provider's timetable + GTFS-RT (handled by OTP at runtime,
+    not pre-fetched here) + MCT + stations CSV. Excludes the session-level
+    OSM PBF — that has its own POST /sources/osm/refresh endpoint
+    (v0.1.14) so a provider tweak doesn't accidentally invalidate the
+    streetGraph cache and add 30 min to the next build.
 
-      gtfs, osm_pbf, netex_nordic, netex_epip, mct, stations
-
-    Unknown keys are skipped. On success the file is dispatched via
-    `ingestion.dispatch`, which queues a rebuild for kinds that warrant one.
-    Existing files of the same kind are rotated (`.old` suffix) by dispatch.
+    On success the file is dispatched via `ingestion.dispatch`, which
+    queues a rebuild for kinds that warrant one. Existing files of the
+    same kind are rotated (`.old` suffix) by dispatch.
     """
     s = db.get(SessionRow, sid)
     if s is None:
@@ -719,11 +721,10 @@ async def refresh_sources(
     fetched: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    # Build a flat list of download tasks from the session's sources.
-    # Each task: (response-key-label, kind, url, feed_id_or_None, staged_filename_or_None).
-    # Provider-bundle shape (v0.1.6) and legacy flat shapes (v0.1.4 / pre)
-    # both end up here; downstream handling is identical.
-    work = _build_refresh_tasks(s.config or {})
+    # v0.1.14: providers-only by default. OSM PBF lives behind its own
+    # endpoint so refreshing a GTFS feed doesn't accidentally bust the
+    # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
+    work = _build_refresh_tasks(s.config or {}, include_osm=False)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
@@ -759,10 +760,167 @@ async def refresh_sources(
         actor_ip=client_ip(request),
         target_kind="session",
         target_id=sid,
-        metadata={"fetched": [f["key"] for f in fetched], "skipped": [s_["key"] for s_ in skipped]},
+        metadata={
+            "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+        },
     )
     db.commit()
     return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
+# ──── OSM-only refresh (v0.1.14) ────
+
+
+# Number of historical OSM PBFs to keep on rotation. Each refresh shifts
+# osm.pbf → osm.pbf.old.1 (and existing .old.1 → .old.2, etc.); anything
+# beyond this count is deleted. Reasonable budget on disk for France-wide:
+# ~5 GB x 3 = 15 GB. Operators on a tight VPS can manually delete .old.N
+# files between refreshes if disk pressure builds.
+_OSM_OLD_GENERATIONS_KEPT = 3
+
+
+def _rotate_osm_pbf(session_inbox: Path) -> list[str]:
+    """Shift osm.pbf → osm.pbf.old.1 → .old.2 → .old.N. Returns a list
+    of human-readable rotation events for the audit/UI response.
+
+    Idempotent on missing files — if there's no current osm.pbf yet, no-ops.
+    Best-effort on individual rename failures (logs and continues so the
+    rotation can still proceed; surfacing as a warning is more useful than
+    aborting the whole refresh).
+    """
+    osm_dir = session_inbox / "osm"
+    events: list[str] = []
+    if not osm_dir.is_dir():
+        return events
+
+    # 1. Drop the oldest generation if it would push us over budget.
+    oldest = osm_dir / f"osm.pbf.old.{_OSM_OLD_GENERATIONS_KEPT}"
+    if oldest.exists():
+        try:
+            oldest.unlink()
+            events.append(f"deleted oldest .old.{_OSM_OLD_GENERATIONS_KEPT}")
+        except OSError as exc:
+            log.warning("could not delete %s: %s", oldest, exc)
+
+    # 2. Shift .old.<N-1> → .old.<N>, .old.<N-2> → .old.<N-1>, etc.
+    for n in range(_OSM_OLD_GENERATIONS_KEPT - 1, 0, -1):
+        src = osm_dir / f"osm.pbf.old.{n}"
+        dst = osm_dir / f"osm.pbf.old.{n + 1}"
+        if src.exists():
+            try:
+                src.rename(dst)
+                events.append(f".old.{n} → .old.{n + 1}")
+            except OSError as exc:
+                log.warning("could not rotate %s → %s: %s", src, dst, exc)
+
+    # 3. Move the current osm.pbf → osm.pbf.old.1 (if it exists).
+    current = osm_dir / "osm.pbf"
+    if current.exists():
+        try:
+            current.rename(osm_dir / "osm.pbf.old.1")
+            events.append("osm.pbf → .old.1")
+        except OSError as exc:
+            log.warning("could not rotate %s → osm.pbf.old.1: %s", current, exc)
+
+    return events
+
+
+class RefreshOsmResponse(BaseModel):
+    fetched: list[dict[str, Any]]
+    skipped: list[dict[str, Any]]
+    rotated: list[str]
+
+
+@router.post("/{sid}/sources/osm/refresh", response_model=RefreshOsmResponse)
+async def refresh_osm(
+    sid: str,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> RefreshOsmResponse:
+    """Re-download the session's OSM PBF only.
+
+    **Side effect that operators MUST know about**: the streetGraph.obj
+    cache key is `sha256(osm.pbf):scope`. Geofabrik rolls the PBF nightly,
+    so any non-trivial gap between the cached fetch and this one will
+    invalidate the cache → the next rebuild includes a 25-min full OSM
+    parse + intersect step.
+
+    The UI's "Refresh OSM" button shows a confirm dialog with this
+    warning. CLI callers see it documented in this docstring.
+
+    Rotation: before overwriting, the current `osm.pbf` is shifted to
+    `osm.pbf.old.1` (existing `.old.1` → `.old.2`, etc., up to
+    _OSM_OLD_GENERATIONS_KEPT). This makes a manual rollback ("revert to
+    yesterday's OSM") a one-command `mv` away — useful when a fresh
+    Geofabrik PBF turns out to have a regression.
+
+    Returns:
+        `fetched`  — the OSM-PBF download outcome (one item, or zero on skip)
+        `skipped`  — non-empty only if the OSM URL is unset or download failed
+        `rotated`  — list of rotation events for the audit trail / UI display
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    if actor.id is None:
+        raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
+
+    sources: dict[str, Any] = (s.config or {}).get("sources", {})
+    osm_url = sources.get("osm_pbf")
+    if not isinstance(osm_url, str) or not osm_url:
+        raise HTTPException(400, "config.sources.osm_pbf is unset; nothing to refresh")
+
+    staging = settings.inbox_dir / sid / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    # Rotate BEFORE downloading so a failed fetch leaves the previous
+    # generation in place but recoverable from .old.1 (operator can mv it
+    # back to osm.pbf if they need it).
+    rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
+
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    # Pass staged_filename="osm.pbf" so dispatch uses the targeted-rotation
+    # branch (only rotates the exact file). The legacy "rotate everything
+    # not ending in .old" branch would re-rotate our .old.<N> generations,
+    # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
+    task: _RefreshTask = ("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        outcome = await _refresh_one_task(client, db, sid, staging, task)
+        if outcome.get("status") == "fetched":
+            fetched.append({k: v for k, v in outcome.items() if k != "status"})
+        else:
+            skipped.append({k: v for k, v in outcome.items() if k != "status"})
+
+    if fetched:
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
+
+    audit.record(
+        db,
+        action="session.osm.refreshed",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "url": osm_url,
+            "rotated": rotated,
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+            # Flagged so monitoring can alert on osm refreshes (they're rare
+            # by intent — every one invalidates the streetGraph cache).
+            "invalidates_street_graph_cache": bool(fetched),
+        },
+    )
+    db.commit()
+    return RefreshOsmResponse(fetched=fetched, skipped=skipped, rotated=rotated)
 
 
 def _url_suffix(url: str) -> str:
@@ -795,14 +953,26 @@ _RefreshTask = tuple[str, str, str, str | None, str | None]
 
 
 def _build_refresh_tasks(
-    config: dict[str, Any], *, only_provider: str | None = None
+    config: dict[str, Any],
+    *,
+    only_provider: str | None = None,
+    include_osm: bool = False,
 ) -> list[_RefreshTask]:
     """Flatten a session config into a list of download tasks.
 
     `only_provider`, when set, filters to that provider's tasks only —
     used by the per-provider refresh endpoint. None means "everything".
-    Session-level OSM PBF refresh is *only* included when only_provider
-    is None (per-provider refresh leaves OSM alone — different concern).
+
+    `include_osm` (v0.1.14): controls whether the session-level OSM PBF
+    is included. **Default False** — refreshing providers must NOT
+    re-fetch OSM, because Geofabrik rolls the PBF nightly, which would
+    invalidate the streetGraph.obj cache (sha256(osm.pbf):scope) and
+    force a 30-min full rebuild on what should have been a quick
+    transit-only swap. The dedicated POST /sources/osm/refresh endpoint
+    sets this to True.
+
+    Per-provider refresh (only_provider != None) ignores `include_osm`
+    entirely — it never refreshes OSM.
 
     Two input shapes:
       A. v0.1.6 native — `sources.providers = [{...}]` plus session-level
@@ -866,9 +1036,15 @@ def _build_refresh_tasks(
                 )
             )
 
-    # Session-level OSM PBF (only on full refresh, not per-provider).
-    # Geofabrik-class hosts don't require auth, so no credential field today.
-    if only_provider is None and isinstance(sources.get("osm_pbf"), str) and sources["osm_pbf"]:
+    # Session-level OSM PBF — opt-in via include_osm (v0.1.14). Per-provider
+    # refresh never includes OSM. Geofabrik-class hosts don't require auth,
+    # so no credential field today.
+    if (
+        only_provider is None
+        and include_osm
+        and isinstance(sources.get("osm_pbf"), str)
+        and sources["osm_pbf"]
+    ):
         tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks

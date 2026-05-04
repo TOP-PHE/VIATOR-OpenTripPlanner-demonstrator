@@ -396,9 +396,13 @@ def dispatch(
         subdir.mkdir(parents=True, exist_ok=True)
         target_name = staged_filename or STAGE_INTO_OTP_INBOX_FILENAME[kind]
         if staged_filename is None:
-            # Legacy: rotate everything (single-feed sessions).
+            # Legacy: rotate everything (single-feed sessions). Defensive
+            # match against `.old` AND `.old.N` (v0.1.14 introduced numeric
+            # OSM rotation generations) so we don't double-rotate already-
+            # archived files into `osm.pbf.old.1.old` etc.
+            _OLD_RE = re.compile(r"\.old(?:\.\d+)?$")
             for existing in subdir.iterdir():
-                if existing.is_file() and not existing.name.endswith(".old"):
+                if existing.is_file() and not _OLD_RE.search(existing.name):
                     existing.rename(existing.with_suffix(existing.suffix + ".old"))
         else:
             # Multi-feed: rotate only the matching feed's prior file.
