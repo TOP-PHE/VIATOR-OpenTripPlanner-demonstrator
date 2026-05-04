@@ -539,7 +539,66 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.19 (latest)**: per-provider status pills on each provider card.
+**v0.1.20 (latest)**: rebuild graph panel — current build card + history.
+
+The "Rebuild graph" panel only showed a flat table of jobs with status,
+timestamps, and a 1500-char log tail. Operators couldn't tell what
+*version* a build was, what *went into* it, whether it was the one
+*currently serving*, or whether it was a fast cache-hit build vs. a
+slow OSM-rebuild — even though `graph_snapshots` had been silently
+recording most of that information schema-wise since spec §6.6.
+
+Two changes:
+
+1. **Worker now writes `graph_snapshots` rows on successful build**
+   (`app/worker.py`). The `record_snapshot()` helper that has lived in
+   `app/graph_snapshots.py` for months wasn't actually being called —
+   v0.1.20 wires it up. Each successful build records:
+   - `built_at`, `graph_path`, `feed_signature`
+   - `timetable_main_version` / `timetable_update_version` (e.g.
+     `2026-W14_2026-W39 #3`) derived from GTFS calendar.txt
+   - `service_period_start` / `_end` (the calendar window the schedule
+     covers)
+   - `is_current` — auto-set to True; previous `is_current=true` row
+     for the same session is demoted in the same transaction
+     (partial unique index in Postgres enforces "at most one current
+     per session")
+   - `source_uploads` — list of files that went into the build
+     (filename, sha256, kind)
+
+2. **`GET /api/sessions/<sid>/rebuilds` joins the snapshot data** and
+   adds `duration_seconds` + `cache_hit` (parsed from log markers
+   emitted by the OTP entrypoint at lines 227-235). The admin UI's
+   "Rebuild graph" panel now renders:
+
+   - **Current build card** at the top — version label, status pill,
+     "✓ serving now" badge if `is_current`, ⚡ cache-hit / ⏰ cache-miss
+     pill, duration, full inputs list with feed_signature short-hash,
+     and an expandable full log.
+   - **History** below — every other rebuild as a collapsible
+     `<details>` row (same accordion pattern as the v0.1.19 provider
+     cards). Summary line is one row of pills + version + timestamp +
+     duration; expand to see inputs and full log.
+
+   Live polling: while any job is in `running` or `pending` state the
+   panel re-fetches every 5 s. Polling stops automatically when nothing
+   is running, or when the operator collapses the session row.
+
+**Limitation worth knowing**: today's `Upload` table only holds
+manually-uploaded files — refresh-from-URL doesn't write rows there.
+So a session built purely from refreshed providers (e.g. `nap-fr-rail`
+populated via NAP) will record an empty `source_uploads` list. The
+build still gets the rest of the snapshot fields (version, period,
+is_current, cache_hit). v0.1.21+ may extend the refresh path to
+record Upload rows so the inputs list is complete.
+
+**Backfill**: existing sessions that have successful builds from
+before v0.1.20 won't have snapshot rows, so the "Current build" card
+will fall back to the most recent successful job and label it
+`(no snapshot — legacy build)`. **One fresh Rebuild click after the
+deploy** populates the table going forward.
+
+**v0.1.19**: per-provider status pills on each provider card.
 
 After bulk-importing 12 providers from the NAP, the admin UI showed
 **zero state** on each card — operators couldn't tell which feeds had

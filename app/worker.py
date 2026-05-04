@@ -22,8 +22,9 @@ from typing import Any
 
 from sqlalchemy import asc
 
+from . import graph_snapshots
 from .db import SessionLocal
-from .models import RebuildJob
+from .models import RebuildJob, Upload
 from .models import Session as SessionRow
 from .models.sessions import SessionState
 from .settings import settings
@@ -124,6 +125,44 @@ def tick() -> None:
                 SessionState.CONFIGURED.value,
             ):
                 s.state = SessionState.GRAPH_BUILT.value
+
+        # v0.1.20 — record a graph_snapshots row so the admin UI can show
+        # what was rebuilt, when, what's in it, and which build is current.
+        # Without this row the rebuild table can only show timestamps + log
+        # tail (the pre-v0.1.20 state of affairs). The schema's been ready
+        # since spec §6.6 — this is just wiring it up.
+        #
+        # Best-effort: a snapshot write failure must never flip a successful
+        # build to "failed", because the graph file on disk is real and
+        # already wired into the symlink at this point. We log loudly so the
+        # operator can still find the build via job log even if the snapshot
+        # never materialised.
+        #
+        # Today the `Upload` table only carries manually-uploaded files —
+        # refresh-from-URL doesn't write rows there. So `source_uploads`
+        # here will be the manual-upload subset of the inputs OTP actually
+        # used; the operator still sees the rebuild + graph_path + version
+        # on the card, just with a possibly-incomplete inputs list. v0.1.21+
+        # may extend the refresh path to record Upload rows so this list is
+        # complete. Tracked in the v0.1.20 changelog.
+        if success and sid is not None and graph_path:
+            try:
+                uploads = (
+                    db.query(Upload).filter(Upload.session_id == sid).all()
+                )
+                graph_snapshots.record_snapshot(
+                    db,
+                    session_id=sid,
+                    rebuild_job_id=job_id,
+                    graph_path=Path(graph_path),
+                    source_uploads=uploads,
+                )
+            except Exception:
+                log.exception(
+                    "snapshot recording failed for job %s — build itself "
+                    "succeeded, graph is still on disk and symlinked",
+                    job_id,
+                )
 
         db.commit()
 

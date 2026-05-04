@@ -42,7 +42,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ... import audit, detect, ingestion, sessions_orchestrator, staleness
 from ...db import get_db
-from ...models import AuditEvent, MasterStation, RebuildJob, Upload
+from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionState
 from ...security import (
@@ -1698,6 +1698,28 @@ def get_providers_status(
 # ───────────────────────── rebuilds ─────────────────────────
 
 
+class SnapshotInfo(BaseModel):
+    """v0.1.20 — graph_snapshot data joined onto each rebuild job so the admin
+    UI can show "what was built, when, what's in it, is it the one currently
+    serving" without grovelling through logs.
+
+    Populated by the worker on successful build (see `app/worker.py` —
+    `record_snapshot` is called in the success path; older successful
+    builds done before v0.1.20 won't have a snapshot row and will surface
+    as `snapshot=None` in the response).
+    """
+
+    built_at: str
+    feed_signature: str  # 64-char sha256 — first 8 chars are shown in the UI
+    is_current: bool  # at most one per session has this True
+    timetable_main_version: str  # e.g. "2026-W14_2026-W39"
+    timetable_update_version: int  # 1, 2, 3... within the same main_version
+    service_period_start: str  # ISO date
+    service_period_end: str  # ISO date
+    source_uploads: list[dict[str, Any]]  # [{filename, sha256, kind, upload_id}]
+    main_version_source: str  # "auto" | "manual_override"
+
+
 class RebuildJobResponse(BaseModel):
     id: str
     session_id: str | None
@@ -1707,6 +1729,10 @@ class RebuildJobResponse(BaseModel):
     started_at: str | None
     finished_at: str | None
     graph_path: str | None
+    # v0.1.20 — derived / joined fields that make the rebuild table useful.
+    duration_seconds: int | None = None  # finished_at - started_at, when both exist
+    snapshot: SnapshotInfo | None = None  # joined from graph_snapshots by rebuild_job_id
+    cache_hit: bool | None = None  # parsed from log; None when not detectable
 
 
 @router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
@@ -1791,7 +1817,13 @@ def list_rebuilds(
     _: Annotated[CurrentUser, Depends(require_content_manager)],
     limit: int = 20,
 ) -> list[RebuildJobResponse]:
-    """Recent rebuild jobs for this session, newest first."""
+    """Recent rebuild jobs for this session, newest first.
+
+    v0.1.20: each row includes joined `graph_snapshots` data when available
+    (`snapshot` field), plus `duration_seconds` and a `cache_hit` flag
+    derived from the log. The UI uses these to render the new "Current
+    build / History" card layout.
+    """
     rows = (
         db.query(RebuildJob)
         .filter(RebuildJob.session_id == sid)
@@ -1799,10 +1831,79 @@ def list_rebuilds(
         .limit(limit)
         .all()
     )
-    return [_job_to_response(j) for j in rows]
+    return [_job_to_response(j, db=db) for j in rows]
 
 
-def _job_to_response(j: RebuildJob) -> RebuildJobResponse:
+def _classify_rebuild_log(log: str | None) -> dict[str, Any]:
+    """Pure: parse a rebuild log tail for human-actionable signals.
+
+    v0.1.20 detects the streetGraph.obj cache-hit / cache-miss markers
+    emitted by the OTP entrypoint (see `docker/otp/entrypoint.sh` lines
+    227-235). All three are emitted near the *start* of the build, so
+    they survive the 32k log truncation that grabs the tail.
+
+    Marker strings (must match the entrypoint exactly):
+      - "streetGraph.obj cache hit (key=..."           → cache_hit=True
+      - "streetGraph.obj cache miss (key changed: ..." → cache_hit=False
+      - "streetGraph.obj cache empty — building from scratch" → cache_hit=False
+      - none of the above                              → cache_hit=None
+
+    cache_hit=False is also surfaced as "first build / cache empty" by
+    the entrypoint; we don't distinguish miss-after-key-change from
+    first-build because operators see them the same way ("the slow path").
+
+    Tolerant of missing markers — old logs from pre-v0.1.7 builds, builds
+    that crashed before reaching the cache phase, and the 32k truncation
+    chopping off the relevant line all yield None. UI must handle None
+    gracefully (don't claim "cache miss" when we honestly don't know).
+    """
+    if not log:
+        return {"cache_hit": None}
+    if "streetGraph.obj cache hit" in log:
+        return {"cache_hit": True}
+    if "streetGraph.obj cache miss" in log or "streetGraph.obj cache empty" in log:
+        return {"cache_hit": False}
+    return {"cache_hit": None}
+
+
+def _snapshot_to_info(snap: GraphSnapshot) -> SnapshotInfo:
+    """Convert a GraphSnapshot ORM row into the wire-format SnapshotInfo."""
+    return SnapshotInfo(
+        built_at=snap.built_at.isoformat() if snap.built_at else "",
+        feed_signature=snap.feed_signature or "",
+        is_current=bool(snap.is_current),
+        timetable_main_version=snap.timetable_main_version or "",
+        timetable_update_version=int(snap.timetable_update_version or 0),
+        service_period_start=snap.service_period_start.isoformat()
+        if snap.service_period_start
+        else "",
+        service_period_end=snap.service_period_end.isoformat()
+        if snap.service_period_end
+        else "",
+        source_uploads=list(snap.source_uploads or []),
+        main_version_source=snap.main_version_source or "auto",
+    )
+
+
+def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobResponse:
+    # v0.1.20 — join graph_snapshots when a db handle is provided. Callers
+    # that don't have one (the POST /rebuilds endpoint that returns a freshly
+    # enqueued job, which obviously has no snapshot yet) pass db=None and
+    # get the bare-bones response. The list endpoint always passes db.
+    snapshot_info: SnapshotInfo | None = None
+    if db is not None:
+        snap = db.execute(
+            select(GraphSnapshot).where(GraphSnapshot.rebuild_job_id == j.id)
+        ).scalar_one_or_none()
+        if snap is not None:
+            snapshot_info = _snapshot_to_info(snap)
+
+    duration_seconds: int | None = None
+    if j.started_at and j.finished_at:
+        duration_seconds = int((j.finished_at - j.started_at).total_seconds())
+
+    classification = _classify_rebuild_log(j.log)
+
     return RebuildJobResponse(
         id=str(j.id),
         session_id=j.session_id,
@@ -1812,6 +1913,9 @@ def _job_to_response(j: RebuildJob) -> RebuildJobResponse:
         started_at=j.started_at.isoformat() if j.started_at else None,
         finished_at=j.finished_at.isoformat() if j.finished_at else None,
         graph_path=j.graph_path,
+        duration_seconds=duration_seconds,
+        snapshot=snapshot_info,
+        cache_hit=classification["cache_hit"],
     )
 
 

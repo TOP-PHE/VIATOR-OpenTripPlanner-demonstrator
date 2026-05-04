@@ -297,6 +297,51 @@
   .prov-status-pill[data-state="error"]   { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
   .prov-status-pill[data-state="pending"] { background: #f6f8fa; color: #57606a; border-color: #d0d7de; }
   .prov-status-pill[data-state="loading"] { background: #f6f8fa; color: #8c959f; border-color: #d0d7de; font-style: italic; }
+  /* v0.1.20 — Rebuild graph status panel (replaces the old jobs table).
+     Top "Current build" card is always-on; history below is a list of
+     <details> rows that mirror the provider-card accordion pattern so
+     operators don't have to learn two different shapes. */
+  .rebuild-current-card {
+    border: 1px solid var(--rail-border, #d0d7de);
+    border-radius: 6px;
+    padding: 0.7rem 1rem;
+    background: #fff;
+    margin: 0.5rem 0 0.6rem;
+  }
+  .rebuild-current-card.is-current { border-color: #aceebb; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+  .rebuild-current-card .rc-version {
+    font-size: 1.05rem; font-weight: 600; font-family: ui-monospace, Menlo, Consolas, monospace;
+    margin: 0 0 0.3rem;
+  }
+  .rebuild-current-card .rc-meta { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; font-size: 0.85rem; color: var(--rail-steel, #57606a); margin-bottom: 0.4rem; }
+  .rebuild-current-card .rc-inputs { font-size: 0.85rem; }
+  .rebuild-current-card .rc-inputs ul { margin: 0.2rem 0 0; padding-left: 1.2rem; }
+  .rebuild-current-card .rc-inputs li { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; }
+  .rebuild-no-snapshot { color: var(--rail-steel, #57606a); font-style: italic; font-size: 0.85rem; }
+  /* History section: a list of collapsible <details> for older jobs. */
+  .rebuild-history-list { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.4rem; }
+  .rebuild-history-item {
+    border: 1px solid var(--rail-border, #d0d7de);
+    border-radius: 4px;
+    background: #fff;
+  }
+  .rebuild-history-item > summary { padding: 0.4rem 0.7rem; cursor: pointer; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }
+  .rebuild-history-item > summary::-webkit-details-marker { color: var(--rail-steel); }
+  .rebuild-history-item-body { padding: 0.4rem 0.7rem 0.7rem; border-top: 1px solid var(--rail-border, #d0d7de); font-size: 0.83rem; }
+  .rebuild-history-item-body pre { margin: 0.4rem 0 0; max-height: 320px; overflow: auto; background: #f6f8fa; border-radius: 4px; padding: 0.5rem; font-size: 0.75rem; }
+  /* Status badges for build cards. The state-badge classes already exist
+     elsewhere in this template — these add cache-hit/miss + serving-now
+     pill flavours that didn't exist before v0.1.20. */
+  .rebuild-pill {
+    display: inline-flex; align-items: center; gap: 0.2rem;
+    padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.72rem; font-weight: 500;
+    background: #eef0f2; color: #57606a; border: 1px solid #d0d7de; white-space: nowrap;
+  }
+  .rebuild-pill[data-flavour="serving"]   { background: #dafbe1; color: #1a7f37; border-color: #aceebb; }
+  .rebuild-pill[data-flavour="cache-hit"] { background: #ddf4ff; color: #0969da; border-color: #b6e3ff; }
+  .rebuild-pill[data-flavour="cache-miss"]{ background: #fff4d6; color: #9a6700; border-color: #f5d56b; }
+  .rebuild-pill[data-flavour="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+  .rebuild-pill[data-flavour="running"]   { background: #fff8c5; color: #9a6700; border-color: #f5d56b; }
   /* NAP-import modal (v0.1.8). Backdrop blocks page interaction;
      centered card with a max-width keeps the form readable. */
   .nap-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
@@ -1114,27 +1159,213 @@ document.querySelectorAll('button[data-action="promote"]').forEach(btn => {
 });
 
 // ─── Job list ───────────────────────────────────────────────────────
+// v0.1.20 — rebuild status renderer.
+//
+// Two parts:
+//   1. "Current build" card  — newest job that has snapshot.is_current=true,
+//      OR the most recent successful job if no current snapshot exists yet
+//      (legacy sessions whose builds predate v0.1.20's worker wiring).
+//      Always-expanded; shows version label, duration, cache-hit pill, and
+//      the inputs list with feed_signature short-hash.
+//   2. History list           — every other job as a <details> row that
+//      starts collapsed. Mirrors the provider-card accordion so operators
+//      don't learn two patterns.
+//
+// Live polling: while ANY job is in `running` state we re-fetch every 5s.
+// Polling stops automatically when nothing is running (or the operator
+// collapses the session row, since we re-poll only the visible target).
+
+const _runningJobsPolls = new Map();  // sid -> interval handle
+
+function _formatDuration(seconds) {
+  if (seconds === null || seconds === undefined) return '';
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
+}
+
+function _formatBuiltAt(iso) {
+  // Same compact format used on the provider pills — keep visual rhythm.
+  if (!iso) return '—';
+  return iso.replace('T', ' ').slice(0, 19);
+}
+
+function _versionLabel(snapshot) {
+  if (!snapshot) return '(no snapshot — legacy build)';
+  return `${snapshot.timetable_main_version} #${snapshot.timetable_update_version}`;
+}
+
+function _renderInputsList(snapshot) {
+  if (!snapshot || !snapshot.source_uploads || !snapshot.source_uploads.length) {
+    return `<div class="rebuild-no-snapshot">
+      No tracked inputs. Builds before v0.1.20 didn't record their inputs;
+      run a fresh Rebuild to populate the inputs list for future cards.
+    </div>`;
+  }
+  const items = snapshot.source_uploads.map(u => {
+    const fname = escHTML(u.filename || u.upload_id || '?');
+    const kind  = escHTML(u.kind || '?');
+    const sha8  = (u.sha256 || '').slice(0, 8);
+    return `<li>${fname} <span class="hint">(${kind}${sha8 ? ', sha:' + sha8 : ''})</span></li>`;
+  }).join('');
+  const sigShort = (snapshot.feed_signature || '').slice(0, 12);
+  const count = snapshot.source_uploads.length;
+  return `
+    <div class="rc-inputs">
+      <strong>Inputs</strong> — ${count} file${count === 1 ? '' : 's'}, signature
+      <code>${escHTML(sigShort || '—')}…</code>
+      <ul>${items}</ul>
+    </div>
+  `;
+}
+
+function _renderCachePill(cache_hit) {
+  if (cache_hit === true)  return `<span class="rebuild-pill" data-flavour="cache-hit">⚡ cache hit</span>`;
+  if (cache_hit === false) return `<span class="rebuild-pill" data-flavour="cache-miss">cache miss</span>`;
+  return '';  // unknown → don't claim
+}
+
+function _renderStatusPill(status) {
+  if (status === 'running') return `<span class="rebuild-pill" data-flavour="running">⏳ running</span>`;
+  if (status === 'failed')  return `<span class="rebuild-pill" data-flavour="failed">✗ failed</span>`;
+  if (status === 'cancelled') return `<span class="rebuild-pill" data-flavour="failed">cancelled</span>`;
+  if (status === 'done')    return `<span class="rebuild-pill" data-flavour="cache-hit">✓ done</span>`;
+  // pending / unknown
+  return `<span class="rebuild-pill">${escHTML(status)}</span>`;
+}
+
+function _renderCurrentBuildCard(job) {
+  const snap = job.snapshot;
+  const isCurrent = !!(snap && snap.is_current);
+  const cardClass = `rebuild-current-card${isCurrent ? ' is-current' : ''}`;
+  const servingPill = isCurrent ? `<span class="rebuild-pill" data-flavour="serving">✓ serving now</span>` : '';
+  const builtAt = snap?.built_at || job.finished_at || job.created_at;
+  const duration = _formatDuration(job.duration_seconds);
+  const period = snap && snap.service_period_start
+    ? `<span class="hint">covers ${escHTML(snap.service_period_start)} → ${escHTML(snap.service_period_end)}</span>`
+    : '';
+  const logTail = (job.log || '').slice(-2000);
+  const cacheReason = job.cache_hit === true ? 'streetGraph reused — fast build'
+                    : job.cache_hit === false ? 'streetGraph rebuilt from OSM — slow build'
+                    : '';
+  return `
+    <div class="${cardClass}">
+      <p class="rc-version">${escHTML(_versionLabel(snap))}</p>
+      <div class="rc-meta">
+        ${_renderStatusPill(job.status)}
+        ${servingPill}
+        ${_renderCachePill(job.cache_hit)}
+        ${duration ? `<span>· ${escHTML(duration)}</span>` : ''}
+        <span>· built ${escHTML(_formatBuiltAt(builtAt))}</span>
+        ${period}
+      </div>
+      ${cacheReason ? `<p class="hint" style="margin: 0 0 0.4rem">${escHTML(cacheReason)}</p>` : ''}
+      ${_renderInputsList(snap)}
+      <details style="margin-top: 0.5rem">
+        <summary class="hint">▾ Show full log</summary>
+        <pre style="margin: 0.4rem 0 0; max-height: 360px; overflow: auto; background: #f6f8fa; border-radius: 4px; padding: 0.5rem; font-size: 0.75rem;">${escHTML(logTail)}</pre>
+      </details>
+    </div>
+  `;
+}
+
+function _renderHistoryItem(job) {
+  const snap = job.snapshot;
+  const versionLabel = _versionLabel(snap);
+  const builtAt = snap?.built_at || job.finished_at || job.created_at;
+  const duration = _formatDuration(job.duration_seconds);
+  const logTail = (job.log || '').slice(-3000);
+  return `
+    <details class="rebuild-history-item">
+      <summary>
+        ${_renderStatusPill(job.status)}
+        ${_renderCachePill(job.cache_hit)}
+        <code>${escHTML(versionLabel)}</code>
+        <span>${escHTML(_formatBuiltAt(builtAt))}</span>
+        ${duration ? `<span class="hint">· ${escHTML(duration)}</span>` : ''}
+      </summary>
+      <div class="rebuild-history-item-body">
+        ${_renderInputsList(snap)}
+        <p class="hint" style="margin: 0.4rem 0 0">
+          Job id: <code>${escHTML(job.id)}</code><br>
+          Created: ${escHTML(_formatBuiltAt(job.created_at))} ·
+          Started: ${escHTML(_formatBuiltAt(job.started_at))} ·
+          Finished: ${escHTML(_formatBuiltAt(job.finished_at))}
+        </p>
+        <pre>${escHTML(logTail)}</pre>
+      </div>
+    </details>
+  `;
+}
+
 async function loadJobs(sid) {
   const target = document.querySelector(`div[data-role="jobs"][data-sid="${sid}"]`);
-  if (!target) return;
-  target.innerHTML = '<em class="hint">Loading…</em>';
-  const r = await fetch(`/api/sessions/${sid}/rebuilds?limit=10`);
-  if (!r.ok) { target.innerHTML = `<em class="hint">Failed to load jobs (${r.status})</em>`; return; }
-  const jobs = await r.json();
-  if (!jobs.length) { target.innerHTML = '<em class="hint">No rebuild jobs yet.</em>'; return; }
-  let html = '<table class="jobs-table"><thead><tr><th>Status</th><th>Created</th><th>Started</th><th>Finished</th><th>Log (tail)</th></tr></thead><tbody>';
-  for (const j of jobs) {
-    const tail = (j.log || '').slice(-1500);
-    html += `<tr>
-      <td><span class="state-badge state-${j.status}">${j.status}</span></td>
-      <td>${j.created_at?.replace('T', ' ').slice(0,19) || '—'}</td>
-      <td>${j.started_at?.replace('T', ' ').slice(0,19) || '—'}</td>
-      <td>${j.finished_at?.replace('T', ' ').slice(0,19) || '—'}</td>
-      <td><pre>${tail.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre></td>
-    </tr>`;
+  if (!target) {
+    // Operator collapsed the row — stop polling.
+    if (_runningJobsPolls.has(sid)) {
+      clearInterval(_runningJobsPolls.get(sid));
+      _runningJobsPolls.delete(sid);
+    }
+    return;
   }
-  html += '</tbody></table>';
+  // Don't blank the panel on every poll — only on the first load. Reusing
+  // the previous render would flash empty repeatedly while polling.
+  if (!target.dataset.loaded) {
+    target.innerHTML = '<em class="hint">Loading…</em>';
+  }
+  let r;
+  try {
+    r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/rebuilds?limit=20`);
+  } catch (err) {
+    target.innerHTML = `<em class="hint">Failed to load jobs (${escHTML(String(err))})</em>`;
+    return;
+  }
+  if (!r.ok) {
+    target.innerHTML = `<em class="hint">Failed to load jobs (HTTP ${r.status})</em>`;
+    return;
+  }
+  const jobs = await r.json();
+  target.dataset.loaded = '1';
+  if (!jobs.length) {
+    target.innerHTML = '<em class="hint">No rebuild jobs yet. Click <kbd>Rebuild graph</kbd> above.</em>';
+    return;
+  }
+
+  // Pick the "current" job to feature in the top card. Priority:
+  //   1. Newest job with snapshot.is_current === true (post-v0.1.20)
+  //   2. Newest successful job (legacy fallback)
+  //   3. Just the newest job (failed / running session — show what's there)
+  let currentIdx = jobs.findIndex(j => j.snapshot && j.snapshot.is_current);
+  if (currentIdx < 0) currentIdx = jobs.findIndex(j => j.status === 'done');
+  if (currentIdx < 0) currentIdx = 0;
+  const current = jobs[currentIdx];
+  const rest = jobs.filter((_, i) => i !== currentIdx);
+
+  let html = '<h4 style="margin: 0 0 0.3rem; font-size: 0.95rem">Current build</h4>';
+  html += _renderCurrentBuildCard(current);
+  if (rest.length) {
+    html += `<h4 style="margin: 0.8rem 0 0.3rem; font-size: 0.9rem">History <span class="hint">(${rest.length} earlier rebuild${rest.length === 1 ? '' : 's'})</span></h4>`;
+    html += '<div class="rebuild-history-list">';
+    html += rest.map(_renderHistoryItem).join('');
+    html += '</div>';
+  }
   target.innerHTML = html;
+
+  // Polling: any job in `running` keeps the timer alive; otherwise stop.
+  const anyRunning = jobs.some(j => j.status === 'running' || j.status === 'pending');
+  if (anyRunning) {
+    if (!_runningJobsPolls.has(sid)) {
+      const handle = setInterval(() => loadJobs(sid), 5000);
+      _runningJobsPolls.set(sid, handle);
+    }
+  } else if (_runningJobsPolls.has(sid)) {
+    clearInterval(_runningJobsPolls.get(sid));
+    _runningJobsPolls.delete(sid);
+  }
 }
 
 document.querySelectorAll('button[data-action="refresh-jobs"]').forEach(btn => {
