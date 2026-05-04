@@ -186,9 +186,17 @@
            only). Selecting one auto-fills country + modes from the catalogue's
            defaults so the operator doesn't re-pick on every import. The
            credential (if any) is applied server-side; the operator never
-           sees the secret. #}
-        <label>Catalogue
-          <a href="/admin/nap-catalogues" target="_blank" rel="noopener" style="float: right; font-weight: normal; font-size: 0.8rem">manage catalogues ↗</a>
+           sees the secret.
+
+           v0.1.18: user-facing label renamed from "Catalogue" → "Available
+           NAP APIs" because operators kept asking "what's a catalogue?" —
+           the new wording matches the dropdown's actual content (a list of
+           available National Access Point APIs to pick from). The internal
+           ids (`nap-catalogue` element id, `/api/admin/nap-catalogues`
+           route, NAP_CATALOGUES module var) are deliberately *not* renamed
+           — that would be a much bigger change for zero operator benefit. #}
+        <label>Available NAP APIs
+          <a href="/admin/nap-catalogues" target="_blank" rel="noopener" style="float: right; font-weight: normal; font-size: 0.8rem">manage list ↗</a>
         </label>
         <select id="nap-catalogue" required>
           <option value="">— Loading… —</option>
@@ -429,6 +437,20 @@ const TIMETABLE_FORMAT_LABELS = {
 };
 
 function escAttr(s) { return (s || '').toString().replace(/"/g, '&quot;'); }
+
+// v0.1.16: full HTML-text escape (safe for inserting into element bodies).
+// Latent bug since v0.1.8: `napRenderResult` / `napLoadCatalogues` were calling
+// escHTML() but the function was never defined — the NAP catalogue dropdown
+// silently threw `ReferenceError: escHTML is not defined` and stayed stuck on
+// "Loading…". v0.1.13 happened to fix the *visible* spinner-stuck symptom in a
+// different path, which exposed this one. Keep this defined right next to
+// escAttr so the pair stays obvious to future readers.
+function escHTML(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+  });
+}
 
 function providerCardHTML(p, opts) {
   // One <details> per provider. v0.1.12: cards are collapsed by default
@@ -1030,10 +1052,11 @@ async function napLoadCatalogues() {
     return;
   }
   if (!NAP_CATALOGUES.length) {
-    sel.innerHTML = '<option value="">— No catalogues defined yet —</option>';
+    // v0.1.18: operator-visible copy follows the "Available NAP APIs" label.
+    sel.innerHTML = '<option value="">— No NAP APIs available yet —</option>';
     sel.disabled = true;
     if (detail) {
-      detail.innerHTML = `No catalogues yet — <a href="/admin/nap-catalogues" target="_blank" rel="noopener">add one</a> (e.g. France NAP at <code>https://transport.data.gouv.fr/api/datasets</code>).`;
+      detail.innerHTML = `No NAP APIs registered yet — <a href="/admin/nap-catalogues" target="_blank" rel="noopener">add one</a> (e.g. France NAP at <code>https://transport.data.gouv.fr/api/datasets</code>).`;
     }
     return;
   }

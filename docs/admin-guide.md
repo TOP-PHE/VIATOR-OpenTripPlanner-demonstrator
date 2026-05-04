@@ -539,7 +539,43 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.15 (latest)**: dynamic nginx upstream — fixes the 502-after-deploy bug.
+**v0.1.18 (latest)**: NAP-import dropdown — bug fix + label rename, bundled.
+
+Two operator-visible problems with the **Import from NAP** modal landed
+in one release:
+
+1. **Dropdown was stuck on "Loading…" forever.** Latent bug since v0.1.8:
+   `app/templates/admin/sessions.html` called an `escHTML()` helper in
+   `napLoadCatalogues` / `napRenderResult` that was **never defined** —
+   only its sibling `escAttr()` existed. The browser threw
+   `ReferenceError: escHTML is not defined` mid-render and the dropdown
+   never populated. v0.1.13's "show errors instead of spinning" fix was a
+   different code path, so it didn't catch this one.
+   - Fix: define `escHTML()` next to `escAttr()`. Standard HTML-text
+     escape (`&<>"'` → entities). No behaviour change for any other code
+     path — the function had simply never run before.
+   - Trip-wire: new `tests/unit/test_sessions_template_js.py` parses the
+     template and asserts every helper referenced in `JS_HELPERS` is
+     also defined. Catches the same class of bug at CI time.
+
+2. **Dropdown label said "Catalogue" — nobody knew what it meant.**
+   Renamed to **"Available NAP APIs"**. The corner link "manage
+   catalogues ↗" became "manage list ↗". Empty / error placeholders
+   follow the same vocabulary ("No NAP APIs available yet").
+   - **Internal names unchanged on purpose**: the `nap-catalogue` element
+     id, the `/api/admin/nap-catalogues` route, the `NAP_CATALOGUES` JS
+     module variable, the `/admin/nap-catalogues` admin page route, and
+     the `nap_catalogues` DB table all keep their existing names.
+     Renaming any of those would force every bookmark, audit-log search,
+     and direct-link shortcut to update for zero operator-visible benefit
+     beyond what the label change already gives.
+
+Verification after deploy: hard-refresh the **Import from NAP** modal.
+The first row should read **"Available NAP APIs"**, the dropdown should
+populate with your registered NAPs (e.g. *France NAP
+(transport.data.gouv.fr)*), and the DevTools console should be clean.
+
+**v0.1.15**: dynamic nginx upstream — fixes the 502-after-deploy bug.
 
 - nginx now uses Docker's embedded DNS (`127.0.0.11`) with a 10 s cache
   to re-resolve `web` and `otp-<sid>` hostnames at request time,
