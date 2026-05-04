@@ -539,7 +539,22 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.12 (latest)**: NAP catalogue picker + accordion + import-time picker:
+**v0.1.13 (latest)**: NAP UX polish + inline credential creation:
+
+- **Inline credential creation** in the NAP catalogue form — no more
+  alt-tabbing between `/credentials` and `/admin/nap-catalogues`.
+  The "+ Create new" button next to the credential dropdown opens a
+  sub-form; on save the new credential is created (owned by you,
+  reusable elsewhere) AND pre-selected in the catalogue form.
+- **Stuck "Loading…" bug fixed** in the Import-from-NAP modal.
+  Three terminal states now: error (with HTTP code + role hint),
+  empty (with link to add one), found N (populates dropdown).
+- **Help expander on /credentials** explains the connection between
+  credentials and the two places they get used (NAP catalogues +
+  provider URLs in sessions). Resolves the most common confusion
+  ("I made a credential, where do I use it?").
+
+**v0.1.12**: NAP catalogue picker + accordion + import-time picker:
 
 - **NAP catalogues** (Top nav → **NAPs**, platform_admin only). A new
   table holds pre-configured NAP endpoints — name, URL, default country,
