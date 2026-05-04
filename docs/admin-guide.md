@@ -539,7 +539,24 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.14 (latest)**: split provider refresh from OSM refresh — fixes the
+**v0.1.15 (latest)**: dynamic nginx upstream — fixes the 502-after-deploy bug.
+
+- nginx now uses Docker's embedded DNS (`127.0.0.11`) with a 10 s cache
+  to re-resolve `web` and `otp-<sid>` hostnames at request time,
+  instead of caching IPs at config-load time. Recreating the web
+  container (every `docker compose up -d web`) used to give it a new
+  internal IP that nginx kept missing → 502 Bad Gateway until you ran
+  `docker compose restart nginx`. With v0.1.15 you no longer need that
+  step — nginx picks up the new container within ~10 s on its own.
+- Per-session OTP upstreams (`/otp/<sid>/`) get the same treatment via
+  `app/sessions_orchestrator.py::render_nginx`. Restarting an OTP
+  container during a session swap stops 502'ing too.
+
+**Behaviour change for deploy procedure**: drop the `docker compose
+restart nginx` step from any post-deploy runbooks. The new pattern is
+self-healing.
+
+**v0.1.14**: split provider refresh from OSM refresh — fixes the
 recurring "I added a GTFS feed and now I'm waiting 30 min for OSM" pain.
 
 - **"Refresh providers"** (renamed from "Refresh all sources") downloads
