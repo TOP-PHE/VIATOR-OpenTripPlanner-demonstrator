@@ -279,6 +279,24 @@
   .prov-section legend { padding: 0 0.3rem; font-size: 0.78rem; color: var(--rail-steel); }
   .prov-id { font-family: ui-monospace, Menlo, Consolas, monospace; }
   .prov-id:invalid, .prov-country:invalid { border-color: #d32f2f; }
+  /* v0.1.19 — per-provider fetch status pill on the summary row.
+     Sits between the provider title and the action buttons. Colour
+     conveys urgency: green = fresh, amber = stale, red = errored,
+     grey = never fetched / not yet saved. Border-left strip is the
+     accent so the pill remains legible against the white card bg. */
+  .prov-status-pill {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    padding: 0.1rem 0.55rem; margin-left: 0.5rem;
+    border-radius: 999px; font-size: 0.75rem; font-weight: 500;
+    background: #eef0f2; color: #57606a;
+    border: 1px solid #d0d7de;
+    white-space: nowrap;
+  }
+  .prov-status-pill[data-state="ok"]      { background: #dafbe1; color: #1a7f37; border-color: #aceebb; }
+  .prov-status-pill[data-state="stale"]   { background: #fff4d6; color: #9a6700; border-color: #f5d56b; }
+  .prov-status-pill[data-state="error"]   { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+  .prov-status-pill[data-state="pending"] { background: #f6f8fa; color: #57606a; border-color: #d0d7de; }
+  .prov-status-pill[data-state="loading"] { background: #f6f8fa; color: #8c959f; border-color: #d0d7de; font-style: italic; }
   /* NAP-import modal (v0.1.8). Backdrop blocks page interaction;
      centered card with a max-width keeps the form readable. */
   .nap-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; }
@@ -372,6 +390,11 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       cf.elements['osm_pbf'].value = sources.osm_pbf || '';
       // Provider bundles: normalise legacy shapes to canonical providers.
       populateProvidersList(cf, sources);
+      // v0.1.19: stamp the just-rendered status pills with real data from
+      // the server. Async — pills start in "loading…" state and update
+      // once the response lands. We don't await here because the rest of
+      // the expand flow (staleness banner, jobs list) is independent.
+      loadProviderStatuses(sid, cf);
       // OSM scope: default to transit-focused for sessions that don't have
       // it set yet (legacy / pre-v0.1.5). Stored at the top level of config,
       // not under `sources`, because it's not a download URL.
@@ -468,10 +491,19 @@ function providerCardHTML(p, opts) {
   const summaryLabel = (p.label || p.id || '(unnamed)') +
     (p.country_iso ? ` — ${p.country_iso}` : '');
   const openAttr = (opts && opts.openByDefault) ? ' open' : '';
+  // v0.1.19: status pill in the summary row. The pill starts in "loading"
+  // state and gets stamped with real data by `loadProviderStatuses(sid, form)`
+  // once the per-provider status endpoint replies. Cards with no id yet
+  // (freshly added blank cards) skip the pill entirely — there's nothing
+  // to look up until the operator types an id and saves.
+  const statusPill = p.id
+    ? `<span class="prov-status-pill" data-feed-id="${escAttr(p.id)}" data-state="loading">…</span>`
+    : '';
   return `
     <details class="provider-card"${openAttr}>
       <summary>
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
+        ${statusPill}
         <span class="prov-summary-actions">
           <button type="button" class="secondary" data-action="refresh-provider"
                   title="Download just this provider's URLs (timetable + MCT + stations CSV)">
@@ -682,6 +714,82 @@ function syncProvidersToolbar(form) {
   if (label) label.textContent = count === 0 ? '' : `${count} provider${count === 1 ? '' : 's'}`;
 }
 
+// ─── v0.1.19: per-provider status pills ─────────────────────────────
+// The pills sit in the provider card summary and show one of four states:
+//   ok       — file present, fetched within the freshness window
+//   stale    — file present but older than the freshness window (24 h default)
+//   pending  — never fetched (freshly added provider, or no URL yet)
+//   error    — last refresh attempt failed; file may or may not exist
+//
+// Server endpoint `GET /api/sessions/<sid>/providers/status` returns the
+// status keyed by feed_id; we walk every `.prov-status-pill` in the form
+// and stamp it. Pills with feed ids the server doesn't know (e.g. a
+// freshly-typed id that hasn't been saved yet) get their state set to
+// "pending" and a hint nudging the operator to save first.
+
+function _humanSizeMB(bytes) {
+  if (bytes === null || bytes === undefined) return '';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 100) return `${mb.toFixed(0)} MB`;
+  if (mb >= 10)  return `${mb.toFixed(1)} MB`;
+  return `${mb.toFixed(2)} MB`;
+}
+
+function _relativeTimeShort(isoUtc) {
+  if (!isoUtc) return '';
+  const then = new Date(isoUtc).getTime();
+  if (Number.isNaN(then)) return '';
+  const seconds = Math.max(0, (Date.now() - then) / 1000);
+  if (seconds < 60)        return 'just now';
+  if (seconds < 3600)      return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400)     return `${Math.floor(seconds / 3600)} h ago`;
+  if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)} d ago`;
+  // 30+ days: show date so operators know if it's truly ancient.
+  return new Date(isoUtc).toISOString().slice(0, 10);
+}
+
+function _renderProviderStatusText(s) {
+  if (s.state === 'pending') return '⏳ Never fetched';
+  if (s.state === 'error')   return '⚠ Last refresh failed';
+  const size = _humanSizeMB(s.size_bytes);
+  const age  = _relativeTimeShort(s.fetched_at);
+  if (s.state === 'stale') return `⏰ Stale · ${size} · ${age}`.replace(/ · $/, '');
+  // ok
+  return `✓ ${size} · ${age}`.replace(/ · $/, '');
+}
+
+async function loadProviderStatuses(sid, formEl) {
+  if (!sid || !formEl) return;
+  let statuses = {};
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/providers/status`);
+    if (!r.ok) {
+      // 401/403/404 → leave pills as "loading…" silently rather than
+      // littering the toast UI. The provider cards still work without pills.
+      return;
+    }
+    statuses = await r.json();
+  } catch (err) {
+    return;
+  }
+  formEl.querySelectorAll('.prov-status-pill').forEach(pill => {
+    const fid = pill.dataset.feedId;
+    const s = statuses[fid];
+    if (!s) {
+      // The server doesn't know about this feed_id — usually because the
+      // operator just typed a new id and hasn't saved yet, or renamed an
+      // existing one. Surface that explicitly instead of leaving "…".
+      pill.dataset.state = 'pending';
+      pill.textContent = '⏳ Save the session to track status';
+      pill.title = '';
+      return;
+    }
+    pill.dataset.state = s.state;
+    pill.textContent = _renderProviderStatusText(s);
+    pill.title = s.error_hint || (s.fetched_at ? `Fetched ${s.fetched_at}` : '');
+  });
+}
+
 // ─── Configure (PATCH config.sources) ───────────────────────────────
 document.querySelectorAll('form[data-form="config"]').forEach(form => {
   // Add-provider button: append a blank card. New cards open by default
@@ -749,6 +857,10 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
         const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
         showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
         if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+        // v0.1.19: refresh the per-provider status pill so the operator
+        // sees the new mtime/size immediately instead of waiting for a
+        // full page reload.
+        loadProviderStatuses(sid, form);
       } catch (err) { showToast('error', String(err)); }
       finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
     }
@@ -819,6 +931,26 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // appear; saving a non-sources change (osm_scope only) should leave
     // it as-is (server only bumps sources_changed_at when sources change).
     setStalenessBanner(sid);
+    // v0.1.19: any provider card that was added blank (id typed in just
+    // now) won't have a status pill yet — providerCardHTML skips the pill
+    // when p.id is empty at render time. Now that the id is saved, inject
+    // a pill in those cards so loadProviderStatuses can stamp them.
+    form.querySelectorAll('.provider-card').forEach(card => {
+      const idEl = card.querySelector('.prov-id');
+      const fid = (idEl?.value || '').trim();
+      if (!fid) return;
+      if (card.querySelector('.prov-status-pill')) return;
+      const summary = card.querySelector('summary');
+      const labelEl = summary?.querySelector('.prov-summary-label');
+      if (!labelEl) return;
+      const pill = document.createElement('span');
+      pill.className = 'prov-status-pill';
+      pill.dataset.feedId = fid;
+      pill.dataset.state = 'loading';
+      pill.textContent = '…';
+      labelEl.insertAdjacentElement('afterend', pill);
+    });
+    loadProviderStatuses(sid, form);
     // Server-side soft warnings (X-Warnings response header, JSON list).
     // We toast the success first, then chain a warning toast if any. Same
     // mechanism could carry future warnings — keep it general.
@@ -856,6 +988,9 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
       showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
       if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+      // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
+      // mtimes / sizes are visible without a page reload.
+      loadProviderStatuses(sid, form);
     } catch (err) { showToast('error', String(err)); }
     finally { btn.disabled = false; btn.textContent = original; }
   });

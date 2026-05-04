@@ -42,7 +42,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ... import audit, detect, ingestion, sessions_orchestrator, staleness
 from ...db import get_db
-from ...models import MasterStation, RebuildJob, Upload
+from ...models import AuditEvent, MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionState
 from ...security import (
@@ -686,6 +686,27 @@ class RefreshSourcesResponse(BaseModel):
     skipped: list[dict[str, Any]]
 
 
+# v0.1.19 — per-provider fetch status, surfaced on the provider cards in the
+# admin UI. Read-only view derived from filesystem (inbox file mtime + size)
+# plus the latest refresh audit row. No new DB table; the audit log + inbox
+# already carry everything we need to disambiguate "never attempted" from
+# "fetched OK" from "last attempt failed".
+class ProviderStatus(BaseModel):
+    feed_id: str
+    state: str  # "ok" | "stale" | "pending" | "error"
+    fetched_at: datetime | None = None
+    size_bytes: int | None = None
+    error_hint: str | None = None  # short, UI-friendly explanation when state == "error"
+
+
+# How recently a provider's inbox file must have been refreshed before we
+# stop calling it "ok" and start calling it "stale". 24h is a sensible
+# default for daily-published GTFS / GTFS-RT-paired feeds. Operator-tunable
+# later if anyone asks; today there's no operator nudge to make it
+# session-specific so we keep it module-level and obvious.
+_PROVIDER_FRESHNESS_HOURS = 24
+
+
 @router.post("/{sid}/sources/refresh", response_model=RefreshSourcesResponse)
 async def refresh_sources(
     sid: str,
@@ -1048,6 +1069,105 @@ def _build_refresh_tasks(
         tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks
+
+
+# v0.1.19 — pure state-derivation helper. Lives alongside `_build_refresh_tasks`
+# because both translate the same provider-config shape into something the UI
+# cares about: that one tells you what *will* be fetched next, this one tells
+# you what *has* been fetched already and how that's going.
+#
+# Pure: takes only data the caller has already gathered (file metadata + audit
+# meta dict) and returns a ProviderStatus. No DB / FS access of its own —
+# makes it trivial to unit-test without TestClient or Postgres.
+def _derive_provider_status(
+    *,
+    feed_id: str,
+    timetable_format: str,
+    inbox_root: Path,
+    latest_audit_meta: dict[str, Any] | None,
+    now: datetime,
+    freshness_hours: int = _PROVIDER_FRESHNESS_HOURS,
+) -> ProviderStatus:
+    """Decide what to show on a provider card based on inbox + audit state.
+
+    State machine (priority order):
+      - file present, mtime within freshness window           → "ok"
+      - file present, mtime older than freshness window       → "stale"
+      - file missing, last refresh skipped this provider      → "error"
+      - file missing, no audit history (or audit didn't touch
+        this provider)                                        → "pending"
+
+    The audit metadata we accept is whatever the existing
+    `session.sources.refreshed` / `session.provider.refreshed` rows already
+    record — a `fetched: [task_key]` and `skipped: [task_key]` list, where
+    each task_key looks like `provider[SNCF].timetable(gtfs)` or
+    `provider[SNCF].mct`. We match by the `provider[<feed_id>].` prefix so
+    timetable / mct / stations_csv tasks all roll up to the same provider.
+
+    `inbox_root` is the per-session inbox dir (`/data/inbox/<sid>`). The file
+    we're looking for is at `<inbox_root>/<subdir>/<feed_id_lower>.zip` where
+    `<subdir>` is `gtfs/` or `netex/` per the timetable format — same
+    convention `dispatch()` uses to stage downloaded files.
+    """
+    fmt_details = ingestion.TIMETABLE_FORMAT_DETAILS.get(timetable_format)
+    if fmt_details is None:
+        # Unknown format on a saved provider — degrade to pending rather than
+        # crash the endpoint. The country-gate / save-time validation is the
+        # right place to refuse the bad value; here we just don't pretend to
+        # know where its file would live.
+        return ProviderStatus(feed_id=feed_id, state="pending")
+
+    file_path = inbox_root / fmt_details["subdir"] / ingestion.staged_filename_for_format(
+        feed_id, timetable_format
+    )
+
+    fetched_at: datetime | None = None
+    size_bytes: int | None = None
+    if file_path.is_file():
+        st = file_path.stat()
+        fetched_at = datetime.fromtimestamp(st.st_mtime, tz=UTC)
+        size_bytes = st.st_size
+
+    in_fetched = False
+    in_skipped = False
+    if latest_audit_meta:
+        marker = f"provider[{feed_id}]."
+        in_fetched = any(
+            isinstance(k, str) and k.startswith(marker)
+            for k in latest_audit_meta.get("fetched", [])
+        )
+        in_skipped = any(
+            isinstance(k, str) and k.startswith(marker)
+            for k in latest_audit_meta.get("skipped", [])
+        )
+
+    if fetched_at is not None:
+        age_h = (now - fetched_at).total_seconds() / 3600.0
+        state = "ok" if age_h <= freshness_hours else "stale"
+        # If the *latest* audit row has this provider only in skipped (no
+        # successful task), the file is from an earlier successful run but
+        # the most recent attempt failed. Surface that as a partial-error
+        # hint without flipping the whole state to "error" — the operator
+        # still has usable data, just stale-after-failed-refresh.
+        error_hint = None
+        if in_skipped and not in_fetched:
+            error_hint = "last refresh failed — using previous file"
+        return ProviderStatus(
+            feed_id=feed_id,
+            state=state,
+            fetched_at=fetched_at,
+            size_bytes=size_bytes,
+            error_hint=error_hint,
+        )
+
+    # File is missing — was it ever attempted?
+    if in_skipped and not in_fetched:
+        return ProviderStatus(
+            feed_id=feed_id,
+            state="error",
+            error_hint="last refresh attempt failed — click Refresh to see why",
+        )
+    return ProviderStatus(feed_id=feed_id, state="pending")
 
 
 async def _refresh_one_task(
@@ -1499,6 +1619,80 @@ async def refresh_provider(
     )
     db.commit()
     return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
+# ───────────────────────── per-provider status (v0.1.19) ─────────────────────
+
+
+@router.get("/{sid}/providers/status", response_model=dict[str, ProviderStatus])
+def get_providers_status(
+    sid: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> dict[str, ProviderStatus]:
+    """Per-provider fetch status — what's in the inbox, when, and whether the
+    last refresh attempt succeeded for each provider configured on this
+    session. Used by the admin UI to render status pills on each provider
+    card so operators can see at a glance which feeds need a refresh.
+
+    Source-of-truth strategy (v0.1.19, no new tables):
+      * **Inbox file** at `<inbox>/<subdir>/<feed_id_lower>.zip` — its
+        existence + mtime is the canonical "is this fetched, and when".
+      * **Latest refresh audit row** (`session.sources.refreshed` or
+        `session.provider.refreshed`) — disambiguates "never attempted"
+        from "attempted and failed". Audit metadata only stores task
+        keys, not full error reasons; the UI hint says "click Refresh to
+        see why" and the per-provider refresh endpoint returns the full
+        skip reason in its response on demand.
+
+    A future v0.1.20+ may move this to a dedicated `provider_fetch_status`
+    table written by ingestion, with sparkline-grade history. The
+    filesystem-derived view here is a deliberate "ship the obvious thing
+    first" — operators told us they need *some* visibility right now.
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+
+    try:
+        providers = ingestion.normalize_providers(s.config or {})
+    except ValueError:
+        # Same defensive degrade as `_build_refresh_tasks` — if config is
+        # somehow malformed, return an empty status map rather than 500.
+        # The Configure form will surface the validation error on save.
+        return {}
+
+    # Pull the most recent refresh audit row (either scope) for this session.
+    # We don't need any older history — only the *latest* attempt informs
+    # the "did the last refresh fail for this provider" question.
+    latest_audit = db.execute(
+        select(AuditEvent)
+        .where(
+            AuditEvent.target_kind == "session",
+            AuditEvent.target_id == sid,
+            AuditEvent.action.in_(
+                ["session.sources.refreshed", "session.provider.refreshed"]
+            ),
+        )
+        .order_by(desc(AuditEvent.ts))
+        .limit(1)
+    ).scalar_one_or_none()
+    latest_meta = latest_audit.metadata_ if latest_audit is not None else None
+
+    inbox_root = settings.inbox_dir / sid
+    now = datetime.now(UTC)
+
+    out: dict[str, ProviderStatus] = {}
+    for p in providers:
+        fmt = (p.get("timetable") or {}).get("format", "gtfs")
+        out[p["id"]] = _derive_provider_status(
+            feed_id=p["id"],
+            timetable_format=fmt,
+            inbox_root=inbox_root,
+            latest_audit_meta=latest_meta,
+            now=now,
+        )
+    return out
 
 
 # ───────────────────────── rebuilds ─────────────────────────

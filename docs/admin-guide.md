@@ -539,7 +539,43 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.18 (latest)**: NAP-import dropdown — bug fix + label rename, bundled.
+**v0.1.19 (latest)**: per-provider status pills on each provider card.
+
+After bulk-importing 12 providers from the NAP, the admin UI showed
+**zero state** on each card — operators couldn't tell which feeds had
+actually been pulled into the inbox vs. which were still pending the
+next "Refresh providers" click, nor whether previous attempts had
+succeeded or failed. v0.1.19 adds a status pill to every provider card's
+summary row.
+
+- **Four states**: `ok` (green ✓ + size + age), `stale` (amber ⏰, file
+  older than 24 h), `pending` (grey ⏳ "Never fetched"), `error` (red ⚠
+  "Last refresh failed").
+- **No new tables**: state is derived live from
+  `/data/inbox/<sid>/{gtfs,netex}/<feed_id_lower>.zip` (file exists +
+  mtime + size) plus the most recent
+  `session.sources.refreshed` / `session.provider.refreshed` audit row
+  (used to disambiguate "never attempted" from "attempted and failed").
+- **New endpoint**: `GET /api/sessions/<sid>/providers/status` returns
+  `{<feed_id>: {state, fetched_at, size_bytes, error_hint}}`. The UI
+  hits it on session-row expand and after every Refresh click.
+- **Freshness window**: 24 h, hard-coded in v0.1.19. Operator-tunable
+  later if there's a real ask — most use cases are "fetch daily, alert
+  if older."
+
+Pills update live after `Refresh providers` and per-provider
+`Refresh this provider` clicks — no page reload needed. Cards added
+mid-session via "+ Add provider" gain their pill on save.
+
+**Limitation worth knowing**: when a refresh attempt fails the audit
+log only stores task **keys**, not the error reason. The pill shows
+"Last refresh failed — click Refresh to see why"; clicking the
+per-provider Refresh button returns the actual reason in the toast.
+A future v0.1.20+ may move this to a dedicated `provider_fetch_status`
+table written by ingestion, with sparkline-grade history; v0.1.19 is
+the deliberate "ship the obvious thing first" version.
+
+**v0.1.18**: NAP-import dropdown — bug fix + label rename, bundled.
 
 Two operator-visible problems with the **Import from NAP** modal landed
 in one release:
