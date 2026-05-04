@@ -40,13 +40,52 @@
         </div>
       </label>
     </div>
-    <label style="display: grid; gap: 0.25rem">
-      <span>Credential <span style="color: var(--rail-steel); font-weight: normal">(optional, for authenticated NAPs)</span></span>
-      <select name="credential_id">
-        <option value="">— No authentication —</option>
-        {# Populated by JS from /api/credentials. #}
-      </select>
-    </label>
+    {# v0.1.13: inline credential creation. The "+ Create new" toggle reveals
+       a sub-form that POSTs to /api/credentials, then re-loads the dropdown
+       and pre-selects the new entry — operators no longer need to alt-tab to
+       /credentials, create a credential, come back, and refresh. #}
+    <fieldset style="border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; padding: 0.5rem 0.75rem 0.75rem; margin: 0">
+      <legend style="font-size: 0.85rem; font-weight: 600; padding: 0 0.3rem; color: var(--rail-steel)">Credential <span style="font-weight: normal">(optional, for authenticated NAPs)</span></legend>
+      <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap">
+        <select name="credential_id" id="nap-cred-select" style="flex: 1; min-width: 220px">
+          <option value="">— No authentication —</option>
+          {# Populated by JS from /api/credentials. #}
+        </select>
+        <button type="button" class="secondary" id="nap-cred-toggle" style="padding: 0.25rem 0.6rem">＋ Create new</button>
+      </div>
+
+      <div id="nap-cred-inline" hidden style="margin-top: 0.6rem; padding: 0.6rem 0.75rem; background: #f5f7fa; border: 1px dashed var(--rail-border, #d0d7de); border-radius: 4px; display: grid; gap: 0.55rem">
+        <p style="margin: 0; font-size: 0.8rem; color: var(--rail-steel)">
+          The new credential is owned by you and reusable elsewhere — same as if you'd
+          created it on <a href="/credentials" target="_blank" rel="noopener">/credentials</a>.
+        </p>
+        <label style="display: grid; gap: 0.2rem; font-weight: 600; font-size: 0.85rem">
+          <span>Friendly name</span>
+          <input type="text" id="nap-cred-name" placeholder="e.g. Mobilithek prod token" maxlength="80">
+        </label>
+        <label style="display: grid; gap: 0.2rem; font-weight: 600; font-size: 0.85rem">
+          <span>Auth scheme</span>
+          <select id="nap-cred-auth-type">
+            <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+            <option value="basic">Basic auth (user:pass)</option>
+            <option value="query">Query parameter (e.g. ?apikey=…)</option>
+            <option value="header">Custom header (e.g. X-API-Key: …)</option>
+          </select>
+        </label>
+        <label style="display: grid; gap: 0.2rem; font-weight: 600; font-size: 0.85rem" id="nap-cred-paramname-wrap" hidden>
+          <span><span data-label-for="query">URL parameter name</span><span data-label-for="header">Header name</span></span>
+          <input type="text" id="nap-cred-paramname" placeholder="apikey" maxlength="80">
+        </label>
+        <label style="display: grid; gap: 0.2rem; font-weight: 600; font-size: 0.85rem">
+          <span>Secret value</span>
+          <input type="password" id="nap-cred-secret" autocomplete="off" maxlength="2000">
+        </label>
+        <div style="display: flex; gap: 0.5rem">
+          <button type="button" id="nap-cred-create-btn">Save credential + select</button>
+          <button type="button" class="secondary" id="nap-cred-cancel">Cancel</button>
+        </div>
+      </div>
+    </fieldset>
     <label style="display: grid; gap: 0.25rem">
       <span>Note <span style="color: var(--rail-steel); font-weight: normal">(optional)</span></span>
       <input type="text" name="note" maxlength="280" autocomplete="off" placeholder="rate-limited 60 req/h; key expires 2027-01">
@@ -208,6 +247,93 @@ async function deleteCat(id, name) {
     await loadCatalogues();
   } catch (err) { showToast('error', String(err)); }
 }
+
+// ─── Inline credential creation (v0.1.13) ─────────────────────
+// Toggle the inline form, drive its conditional fields, POST to
+// /api/credentials, refresh the dropdown, pre-select the new entry.
+const credToggle = document.getElementById('nap-cred-toggle');
+const credInline = document.getElementById('nap-cred-inline');
+const credAuthType = document.getElementById('nap-cred-auth-type');
+const credParamWrap = document.getElementById('nap-cred-paramname-wrap');
+const credParamInput = document.getElementById('nap-cred-paramname');
+
+function syncInlineParamVisibility() {
+  const t = credAuthType.value;
+  const needs = t === 'query' || t === 'header';
+  credParamWrap.hidden = !needs;
+  credParamInput.required = needs;
+  // Show only the matching label hint (URL param name vs Header name).
+  credParamWrap.querySelectorAll('[data-label-for]').forEach(el => {
+    el.style.display = el.dataset.labelFor === t ? '' : 'none';
+  });
+}
+credAuthType.addEventListener('change', syncInlineParamVisibility);
+syncInlineParamVisibility();
+
+credToggle.addEventListener('click', () => {
+  credInline.hidden = !credInline.hidden;
+  credToggle.textContent = credInline.hidden ? '＋ Create new' : '× Cancel new';
+  if (!credInline.hidden) document.getElementById('nap-cred-name').focus();
+});
+
+document.getElementById('nap-cred-cancel').addEventListener('click', () => {
+  credInline.hidden = true;
+  credToggle.textContent = '＋ Create new';
+});
+
+document.getElementById('nap-cred-create-btn').addEventListener('click', async () => {
+  const name = document.getElementById('nap-cred-name').value.trim();
+  const authType = credAuthType.value;
+  const paramName = credParamInput.value.trim();
+  const secret = document.getElementById('nap-cred-secret').value;
+
+  if (!name) { showToast('error', 'Friendly name is required'); return; }
+  if (!secret) { showToast('error', 'Secret value is required'); return; }
+  if ((authType === 'query' || authType === 'header') && !paramName) {
+    showToast('error', `${authType} auth requires a ${authType === 'query' ? 'URL parameter' : 'header'} name`);
+    return;
+  }
+
+  const body = {name, auth_type: authType, secret};
+  if (paramName) body.param_name = paramName;
+
+  const btn = document.getElementById('nap-cred-create-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Saving…';
+
+  try {
+    const r = await fetch('/api/credentials', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const b = await r.json().catch(() => ({}));
+      const msg = Array.isArray(b.detail)
+        ? b.detail.map(e => `${e.loc?.slice(-1)?.[0] || 'field'}: ${e.msg}`).join('; ')
+        : (b.detail || `Failed (${r.status})`);
+      showToast('error', msg);
+      return;
+    }
+    const created = await r.json();
+    showToast('success', `Created credential "${name}"`);
+    // Reload + pre-select the new credential in the catalogue dropdown.
+    await loadCredentials();
+    document.querySelector('select[name="credential_id"]').value = created.id;
+    // Reset + collapse the inline form.
+    document.getElementById('nap-cred-name').value = '';
+    document.getElementById('nap-cred-secret').value = '';
+    credParamInput.value = '';
+    credInline.hidden = true;
+    credToggle.textContent = '＋ Create new';
+  } catch (err) {
+    showToast('error', String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
 
 // Initial load.
 loadCredentials();

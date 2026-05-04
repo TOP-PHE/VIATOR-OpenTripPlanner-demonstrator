@@ -954,16 +954,42 @@ document.querySelectorAll('button[data-action="refresh-jobs"]').forEach(btn => {
 let NAP_CATALOGUES = [];
 
 async function napLoadCatalogues() {
+  // v0.1.13: capture fetch errors so the dropdown surfaces them instead of
+  // sitting on "Loading…" forever (the v0.1.12 bug). Three terminal states:
+  //   - error   → show the error message + link to /admin/nap-catalogues
+  //   - empty   → show "no catalogues" + link to add one
+  //   - found N → populate normally
+  let fetchError = null;
+  NAP_CATALOGUES = [];
   try {
     const r = await fetch('/api/admin/nap-catalogues');
-    if (!r.ok) return;
-    NAP_CATALOGUES = await r.json();
-  } catch { /* leave empty; selectors fall back to "no catalogues" message */ }
+    if (!r.ok) {
+      fetchError = `HTTP ${r.status}` + (r.status === 403 ? ' — platform_admin role required' : '');
+    } else {
+      NAP_CATALOGUES = await r.json();
+    }
+  } catch (err) {
+    fetchError = String(err);
+  }
+
   const sel = document.getElementById('nap-catalogue');
+  const detail = document.getElementById('nap-catalogue-detail');
   if (!sel) return;
-  if (!NAP_CATALOGUES.length) {
-    sel.innerHTML = '<option value="">— No catalogues defined; create one in /admin/nap-catalogues —</option>';
+
+  if (fetchError) {
+    sel.innerHTML = `<option value="">— Failed to load (${escHTML(fetchError)}) —</option>`;
     sel.disabled = true;
+    if (detail) {
+      detail.innerHTML = `Couldn't fetch <code>/api/admin/nap-catalogues</code>. Check your role or try <a href="/admin/nap-catalogues" target="_blank">/admin/nap-catalogues</a> directly.`;
+    }
+    return;
+  }
+  if (!NAP_CATALOGUES.length) {
+    sel.innerHTML = '<option value="">— No catalogues defined yet —</option>';
+    sel.disabled = true;
+    if (detail) {
+      detail.innerHTML = `No catalogues yet — <a href="/admin/nap-catalogues" target="_blank" rel="noopener">add one</a> (e.g. France NAP at <code>https://transport.data.gouv.fr/api/datasets</code>).`;
+    }
     return;
   }
   sel.disabled = false;
