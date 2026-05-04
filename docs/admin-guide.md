@@ -574,12 +574,89 @@ agencies (Eurostar, Trenitalia FR, ICE) need to either keep
 station search) or pick a different canonical tz for the graph via
 the dropdown.
 
-**Note about Eurostar**: their published GTFS declares
-`Europe/Brussels` even for London-side and Paris-side stops, because
-the operating company's admin entity is Belgian. Setting
-`transitModelTimeZone: Europe/Paris` is fine — OTP normalises all
-stop-time arithmetic to that tz at build time; the journey UI's
-displayed times are correct as long as you stay consistent.
+#### How OTP handles the chosen tz — verified against OTP 2.9 docs and Entur
+
+Cross-checked our design against [OTP 2.9 BuildConfiguration §
+transitModelTimeZone](https://docs.opentripplanner.org/en/v2.9.0/BuildConfiguration/#transitModelTimeZone)
+and OTP issues [#2602 (How To Handle Time Zones?)](https://github.com/opentripplanner/OpenTripPlanner/issues/2602)
+and [#2290 (multi-tz routing not supported)](https://github.com/opentripplanner/OpenTripPlanner/issues/2290).
+Reference deployment: [Entur's national Norwegian OTP config](https://github.com/entur/otp2int-deployment-config/blob/main/helm/otp2int/templates/configmap-graph-builder.yaml)
+which uses exactly the same single-canonical-tz pattern with
+`transitModelTimeZone: Europe/Oslo` for cross-border NeTEx feeds. Our
+design (single canonical tz, default `Europe/Paris`, dropdown of
+European tz ids) is **the only OTP-supported approach** in 2.9 — no
+multi-tz routing in a single graph exists today, and the OTP team
+explicitly does not expect to ship one soon.
+
+**What the chosen tz actually does** (verbatim from OTP docs): "stores
+the timetables in the transit model, and **interprets times in incoming
+requests**." In practice this has five operationally-visible
+consequences operators need to understand:
+
+1. **All API times — in and out — are in `otp_timezone`.** A search for
+   "London → Paris on Eurostar leaving 08:01 local" with
+   `otp_timezone=Europe/Paris` is interpreted by OTP as 08:01
+   Europe/Paris (= 07:01 UTC). The St Pancras local-time 08:01
+   departure renders as **09:01 Europe/Paris** in the GraphQL
+   response. This is by design, not a bug — but it means the
+   journey UI's clock is the canonical zone, not the stop's
+   geographic zone. If you ever build a "local time at this stop"
+   feature you'll need a stop→tz lookup at the UI layer.
+
+2. **`agency.txt agency_timezone` becomes informational only** once
+   `transitModelTimeZone` is set. Don't write any downstream consumer
+   that reads it for time math — read `transitModelTimeZone` instead.
+
+3. **Changing this field requires a full graph rebuild.** It's a
+   build-time setting baked into the generated `streetGraph.obj` +
+   `graph.obj`. The v0.1.7 streetGraph cache key
+   (`sha256(osm.pbf):scope`) does NOT include the tz, so changing
+   `otp_timezone` invalidates only the transit graph (Phase 2,
+   ~5 min) — but NOT the streetGraph (Phase 1, ~25 min). So a tz
+   swap is a fast cache-hit rebuild.
+
+4. **GTFS-RT alignment**: real-time updaters interpret incoming
+   timestamps against `transitModelTimeZone`. A producer publishing
+   wall-clock-local timestamps in a different tz from the canonical
+   one will be silently re-anchored — usually fine inside continental
+   Europe (Paris/Brussels/Amsterdam/Berlin all share the same DST
+   rules), risky if the producer publishes UK-local or non-EU. When
+   onboarding a new GTFS-RT feed: confirm it publishes either UTC
+   epoch OR wall-clock matching the graph tz.
+
+5. **DST: safe inside Schengen rail today, risky if Eurostar London
+   segments come into scope.** Europe/London has different DST
+   transition dates from Europe/Paris during the spring/autumn
+   shoulder. Eurostar trips on those weekends would display times
+   with a 1-hour artificial offset for ~2 weeks per year. Today this
+   only matters on London-side stops, and only twice yearly. Flag
+   for any operator routing actual London journeys.
+
+**Note about Eurostar's GTFS specifically**: their published feed
+declares `Europe/Brussels` for ALL stops including London and Paris,
+because the operating company's admin entity is Belgian. Setting
+`transitModelTimeZone: Europe/Paris` is the right call for an
+SNCF-anchored deployment — OTP normalises every stop-time to Paris
+at build time; downstream times are consistent and correct so long
+as the UI labels them clearly.
+
+**Choosing the tz for a session** — quick rules:
+- Single-country session → use that country's tz (FR → Europe/Paris,
+  DE → Europe/Berlin, IT → Europe/Rome, etc.).
+- Multi-country session anchored to one dominant operator → use the
+  dominant operator's tz (e.g. SNCF + Eurostar + Trenitalia FR + ICE
+  routing from French stations → `Europe/Paris`).
+- Multi-country session with no dominant operator (a hypothetical
+  pan-European search demo) → pick the country where most operators'
+  passengers physically board, or `UTC` if you really want
+  zone-neutral. Operators searching from Brussels would then see
+  times labelled UTC; OK if your UI renders that clearly.
+
+If you change `otp_timezone` after a session is already serving,
+remember to click **Save config** AND **Rebuild graph** — the running
+otp-`<sid>` container won't pick up the new value until promoted, and
+the displayed times shift across the whole journey UI for that
+session.
 
 **v0.1.20**: rebuild graph panel — current build card + history.
 

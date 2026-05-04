@@ -126,10 +126,14 @@
                 <option value="UTC">UTC — fallback</option>
               </select>
               <p class="hint" style="margin-top: 0.25rem">
-                Pick the canonical timezone for the graph. All times in the graph (departure,
-                arrival, real-time updates) get stored in this zone. For mixed-country sessions
-                use the dominant operator's tz — typically the country whose stations operators
-                are searching from. Default: <code>Europe/Paris</code>.
+                <strong>All API times — in and out — are interpreted in this zone</strong>
+                (search inputs, timetables, GTFS-RT updates, displayed itineraries). Foreign-feed
+                times get re-rendered here: e.g. with <code>Europe/Paris</code>, an Eurostar
+                London 08:01 local becomes 09:01 in the response. By design, not a bug — see
+                <a href="https://docs.opentripplanner.org/en/v2.9.0/BuildConfiguration/#transitModelTimeZone" target="_blank" rel="noopener">OTP 2.9 docs</a>.
+                For a multi-country session, pick the dominant operator's tz (SNCF + Eurostar
+                + Trenitalia FR anchored to FR station search → <code>Europe/Paris</code>).
+                Changing this requires a Rebuild graph; the streetGraph cache stays valid.
               </p>
               <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                 <button type="submit">Save config</button>
