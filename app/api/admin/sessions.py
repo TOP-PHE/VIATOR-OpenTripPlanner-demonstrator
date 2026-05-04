@@ -221,6 +221,21 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
+        # v0.1.23 — validate otp_build_heap. Same fail-fast pattern. A bad
+        # value (e.g. "12 GB" with a space, or "12gb" with the wrong unit)
+        # would silently fall back to the env-var default at the worker —
+        # confusing because the operator's deliberate UI choice would be
+        # invisibly ignored. Reject up front.
+        if "otp_build_heap" in body.config:
+            from ... import otp_heap as _otp_heap
+
+            try:
+                body.config["otp_build_heap"] = _otp_heap.validate_heap(
+                    body.config["otp_build_heap"]
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
         # Validate provider bundles (v0.1.6) on save. We accept the legacy
         # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),
         # but for save-time validation we only error on the v0.1.6-shaped

@@ -24,7 +24,7 @@ from sqlalchemy import asc
 
 from . import graph_snapshots
 from .db import SessionLocal
-from .models import RebuildJob, Upload
+from .models import RebuildJob
 from .models import Session as SessionRow
 from .models.sessions import SessionState
 from .settings import settings
@@ -138,24 +138,27 @@ def tick() -> None:
         # operator can still find the build via job log even if the snapshot
         # never materialised.
         #
-        # Today the `Upload` table only carries manually-uploaded files —
-        # refresh-from-URL doesn't write rows there. So `source_uploads`
-        # here will be the manual-upload subset of the inputs OTP actually
-        # used; the operator still sees the rebuild + graph_path + version
-        # on the card, just with a possibly-incomplete inputs list. v0.1.21+
-        # may extend the refresh path to record Upload rows so this list is
-        # complete. Tracked in the v0.1.20 changelog.
+        # v0.1.23 — `enumerate_session_inputs` walks the inbox directly and
+        # captures every file OTP actually consumed (gtfs/, netex/, osm/),
+        # not just the Upload-table subset. Refresh-from-URL doesn't write
+        # Upload rows yet (separate v0.1.24+ work), so the v0.1.20 logic
+        # surfaced an empty inputs list on NAP-imported sessions. The inbox
+        # scan closes that gap by computing sha256 directly from disk; the
+        # `Upload` table is still consulted (for manually-uploaded files
+        # we record their upload_id and source: "uploaded") but no longer
+        # the sole source of truth.
         if success and sid is not None and graph_path:
             try:
-                uploads = (
-                    db.query(Upload).filter(Upload.session_id == sid).all()
+                inbox_root = settings.inbox_dir / sid
+                inputs = graph_snapshots.enumerate_session_inputs(
+                    db, sid, inbox_root
                 )
                 graph_snapshots.record_snapshot(
                     db,
                     session_id=sid,
                     rebuild_job_id=job_id,
                     graph_path=Path(graph_path),
-                    source_uploads=uploads,
+                    source_inputs=inputs,
                 )
             except Exception:
                 log.exception(
@@ -314,7 +317,7 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # defensive — bad strings raise here rather than at build time, so the
     # job's log shows a clear "unknown osm_scope" instead of a shell error
     # from the entrypoint.
-    from . import ingestion, osm_filter, otp_timezone, router_config
+    from . import ingestion, osm_filter, otp_heap, otp_timezone, router_config
 
     osm_scope = osm_filter.DEFAULT_SCOPE
     # v0.1.21 — explicit transitModelTimeZone, required by OTP 2.9 when
@@ -322,6 +325,13 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # Europe/Paris, Eurostar says Europe/Brussels, etc). Default keeps
     # single-FR sessions working unchanged; UI lets operators override.
     otp_tz = otp_timezone.DEFAULT_TIMEZONE
+    # v0.1.23 — per-session JVM heap. Default is the env-var-driven
+    # `settings.otp_build_heap` (12g unless overridden in .env), so
+    # legacy sessions keep building unchanged. Operators bumping a
+    # session past the heap ceiling on a NAP-bulk-import (12+ providers,
+    # France-wide) now do it via the UI dropdown instead of SSH-and-
+    # restart-worker.
+    otp_heap_value = settings.otp_build_heap
     providers: list[dict[str, Any]] = []
     # Map of credential_id → (auth_type, plaintext, param_name) for any
     # credentials referenced by GTFS-RT URLs in this session's providers.
@@ -348,6 +358,18 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                         sid,
                         exc,
                         otp_timezone.DEFAULT_TIMEZONE,
+                    )
+                try:
+                    otp_heap_value = otp_heap.validate_heap(
+                        row.config.get("otp_build_heap"),
+                        default=settings.otp_build_heap,
+                    )
+                except ValueError as exc:
+                    log.warning(
+                        "session %s has bad otp_build_heap: %s — using default %s",
+                        sid,
+                        exc,
+                        settings.otp_build_heap,
                     )
                 try:
                     providers = ingestion.normalize_providers(row.config)
@@ -442,7 +464,10 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         "run",
         "--rm",
         "-e",
-        f"OTP_HEAP={settings.otp_build_heap}",
+        # v0.1.23 — heap now resolved from session config (with the env-var
+        # default as fallback), not always from settings. Lets operators
+        # size memory per session via the Configure form.
+        f"OTP_HEAP={otp_heap_value}",
         "-e",
         f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "-e",

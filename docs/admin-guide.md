@@ -539,7 +539,64 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.21 (latest)**: per-session OTP timezone — fixes Eurostar / multi-tz rebuilds.
+**v0.1.23 (latest)**: complete rebuild inputs inventory + per-session heap + live elapsed ticker.
+
+Three improvements driven by feedback from the v0.1.20 rebuild panel
+landing in operator hands:
+
+1. **The Inputs list now shows every file OTP actually built from**, not
+   just the `Upload` table subset. Pre-v0.1.23, refresh-from-URL didn't
+   write `Upload` rows, so a NAP-imported session like `nap-fr-rail`
+   would record a wildly incomplete `source_uploads` list (operator saw
+   "2 files" when the build actually consumed 13). v0.1.23 walks the
+   inbox subdirs (`gtfs/`, `netex/`, `osm/`) at snapshot-write time and
+   computes SHA-256 of each file directly from disk. Cross-references
+   the `Upload` table by sha256 — manually-uploaded files keep their
+   `upload_id` and get a green `⤴ uploaded` pill; refresh-fetched files
+   get a `⤓ refreshed` pill. Each entry now also surfaces `size_bytes`
+   and `stored_path`.
+
+2. **Per-session `otp_build_heap` field** with a UI dropdown next to
+   OSM scope and Timezone. Same pattern as v0.1.21's `otp_timezone`:
+   top-level config, validated at save via `app/otp_heap.validate_heap`,
+   read by the worker each tick (no worker restart needed). Lifts the
+   "SSH and edit `.env` and restart worker" workaround that operators
+   hit on `nap-fr-rail` after the OOM-during-Phase-2.
+   Curated dropdown values: 12g / 16g / 20g / 24g / 28g / 32g / 36g
+   with labels indicating typical session shapes ("light: single
+   provider, regional OSM" → "heavy: 10+ providers, cross-border").
+   Default `12g` keeps legacy sessions building unchanged.
+   **Rule of thumb baked into the hint**: ~2 GB per provider on a
+   France-wide PBF + 6 GB for the street graph + ~10-15% JVM overhead;
+   stay under VPS RAM minus 8 GB headroom.
+
+3. **Live elapsed-time ticker** on the running rebuild card. Pre-v0.1.23
+   the card showed "Started 18:46 · Finished: —" with no indication of
+   elapsed time — operators couldn't tell a healthy 50-min build from a
+   stuck one. The new ticker updates every second client-side
+   (independent of the 5s job-list poll) so the duration cell counts
+   up smoothly: "running… · 56m 9s". Stops automatically when no
+   running jobs are visible to avoid burning CPU on idle pages.
+
+**Side observation surfaced during v0.1.23 testing**: the v0.1.20
+panel was reporting `2026-W19_2026-W19 #1` for the `nap-fr-rail`
+build — i.e. the GTFS calendars only declared service for ISO week 19
+(2026-05-04 → 2026-05-10). That's because the `source_uploads` list
+was incomplete: `derive_main_version_from_gtfs` was reading from the
+single ZOU GTFS that happened to be in the Upload table, not from
+SNCF's nation-wide calendar. v0.1.23 fixes this implicitly by
+including every GTFS in the snapshot — the next rebuild will derive
+the version from whatever GTFS is alphabetically first in the inbox
+(typically `sncf.zip` for FR sessions), so expect a much wider
+period like `2026-W14_2026-W39`. Worth a fresh Rebuild to repopulate.
+
+**Migration note**: existing `graph_snapshots` rows from v0.1.20-v0.1.22
+keep working; they just don't have `size_bytes` or `source` on their
+inputs. The renderer treats those fields as optional. To upgrade a
+session's snapshot data, click Rebuild graph once — the v0.1.23 worker
+records a fresh row with the complete inputs list.
+
+**v0.1.21**: per-session OTP timezone — fixes Eurostar / multi-tz rebuilds.
 
 OTP 2.9 refuses to build a graph that mixes agencies declaring different
 IANA timezones — SNCF's GTFS says `Europe/Paris`, Eurostar's says

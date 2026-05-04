@@ -135,6 +135,33 @@
                 + Trenitalia FR anchored to FR station search → <code>Europe/Paris</code>).
                 Changing this requires a Rebuild graph; the streetGraph cache stays valid.
               </p>
+              {# v0.1.23 — per-session OTP build heap. Until v0.1.23 the only
+                 way to bump heap was SSHing onto the VPS and editing .env;
+                 with 12-provider sessions hitting OOM during Phase 2, that
+                 was a real footgun. Same pattern as osm_scope and
+                 otp_timezone — top-level config field, validated at save,
+                 read by the worker each tick (no worker restart needed
+                 because the value is read fresh from session.config every
+                 build, not cached). #}
+              <label>OTP build heap <span class="hint">(JVM <code>-Xmx</code> for the otp-build container)</span></label>
+              <select name="otp_build_heap">
+                <option value="12g">12 GB — light: single provider, regional OSM</option>
+                <option value="16g">16 GB</option>
+                <option value="20g">20 GB</option>
+                <option value="24g">24 GB — standard: 3-8 providers, France-wide OSM</option>
+                <option value="28g">28 GB</option>
+                <option value="32g">32 GB</option>
+                <option value="36g">36 GB — heavy: 10+ providers, cross-border</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem">
+                JVM heap for the build container. <strong>Rule of thumb</strong>: ~2 GB per
+                provider on a France-wide PBF, plus 6 GB for the street graph + ~10-15% for JVM
+                overhead (metaspace + native). Don't request more than VPS RAM minus 8 GB headroom
+                for kernel + other containers — Linux without swap will OOM-kill instantly on
+                overshoot. Default <code>12g</code> works for SNCF-only; bump to 24-36g for
+                multi-NAP sessions. If the build OOM-kills at "Linking transit stops" Phase 2,
+                that's the signal to bump.
+              </p>
               <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                 <button type="submit">Save config</button>
                 {# v0.1.14: split refresh into providers-only (cheap, frequent)
@@ -487,6 +514,15 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // sessions building unchanged.
       if (cf.elements['otp_timezone']) {
         cf.elements['otp_timezone'].value = cfg.otp_timezone || 'Europe/Paris';
+      }
+      // v0.1.23: per-session OTP build heap. Default '12g' matches the
+      // env-var fallback in app/settings.py so legacy sessions keep their
+      // pre-v0.1.23 behaviour. If a session was previously built with a
+      // bumped .env value, the operator should explicitly Save here so
+      // the value is recorded in the session config (otherwise the
+      // worker reads None → falls back to .env → operator-invisible).
+      if (cf.elements['otp_build_heap']) {
+        cf.elements['otp_build_heap'].value = cfg.otp_build_heap || '12g';
       }
       // Show / hide the staleness banner based on the persisted _meta.
       setStalenessBanner(sid);
@@ -994,6 +1030,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // v0.1.21: same for the OTP transitModelTimeZone.
     const otpTz = (form.elements['otp_timezone']?.value || '').trim();
     if (otpTz) cfg.otp_timezone = otpTz;
+    // v0.1.23: same for the OTP build heap.
+    const otpHeap = (form.elements['otp_build_heap']?.value || '').trim();
+    if (otpHeap) cfg.otp_build_heap = otpHeap;
     // Drop legacy top-level gtfs/mct/stations once we've migrated to providers.
     if (providers.length) {
       delete cfg.sources.gtfs;
@@ -1251,18 +1290,37 @@ function _renderInputsList(snapshot) {
       run a fresh Rebuild to populate the inputs list for future cards.
     </div>`;
   }
+  // v0.1.23 — each entry now also has size_bytes + source ("uploaded" vs
+  // "refreshed"). Older v0.1.20 snapshots don't have these fields; we
+  // render them as optional so historical cards keep working.
   const items = snapshot.source_uploads.map(u => {
     const fname = escHTML(u.filename || u.upload_id || '?');
     const kind  = escHTML(u.kind || '?');
     const sha8  = (u.sha256 || '').slice(0, 8);
-    return `<li>${fname} <span class="hint">(${kind}${sha8 ? ', sha:' + sha8 : ''})</span></li>`;
+    const sizeMb = u.size_bytes
+      ? `, ${(u.size_bytes / 1048576).toFixed(u.size_bytes < 100 * 1048576 ? 1 : 0)} MB`
+      : '';
+    const sourcePill = u.source === 'uploaded'
+      ? ' <span class="rebuild-pill" data-flavour="cache-hit" style="font-size:0.65rem; padding: 0 0.3rem">⤴ uploaded</span>'
+      : u.source === 'refreshed'
+        ? ' <span class="rebuild-pill" style="font-size:0.65rem; padding: 0 0.3rem">⤓ refreshed</span>'
+        : '';
+    return `<li>${fname}${sourcePill} <span class="hint">(${kind}${sizeMb}${sha8 ? ', sha:' + sha8 : ''})</span></li>`;
   }).join('');
   const sigShort = (snapshot.feed_signature || '').slice(0, 12);
   const count = snapshot.source_uploads.length;
+  // v0.1.23 — break out a (uploaded vs refreshed) tally so operators can
+  // tell at a glance whether they're looking at an Upload-table-only
+  // snapshot (pre-v0.1.23) vs a complete inbox-scan one.
+  const uploadCount = snapshot.source_uploads.filter(u => u.source === 'uploaded').length;
+  const refreshCount = snapshot.source_uploads.filter(u => u.source === 'refreshed').length;
+  const tally = (uploadCount + refreshCount) > 0
+    ? ` <span class="hint">(${refreshCount} refreshed, ${uploadCount} uploaded)</span>`
+    : '';
   return `
     <div class="rc-inputs">
       <strong>Inputs</strong> — ${count} file${count === 1 ? '' : 's'}, signature
-      <code>${escHTML(sigShort || '—')}…</code>
+      <code>${escHTML(sigShort || '—')}…</code>${tally}
       <ul>${items}</ul>
     </div>
   `;
@@ -1289,7 +1347,16 @@ function _renderCurrentBuildCard(job) {
   const cardClass = `rebuild-current-card${isCurrent ? ' is-current' : ''}`;
   const servingPill = isCurrent ? `<span class="rebuild-pill" data-flavour="serving">✓ serving now</span>` : '';
   const builtAt = snap?.built_at || job.finished_at || job.created_at;
-  const duration = _formatDuration(job.duration_seconds);
+  // v0.1.23 — for `running` jobs we show a live elapsed counter instead
+  // of the static duration_seconds (which is null until finished_at lands).
+  // The `data-running-since` attribute is consumed by `_startElapsedTicker`,
+  // which updates every 1s independently of the 5s job-list poll.
+  const isRunning = job.status === 'running' && job.started_at;
+  const durationCell = isRunning
+    ? `<span class="rebuild-elapsed" data-running-since="${escAttr(job.started_at)}">running…</span>`
+    : (job.duration_seconds !== null && job.duration_seconds !== undefined
+        ? `<span>· ${escHTML(_formatDuration(job.duration_seconds))}</span>`
+        : '');
   const period = snap && snap.service_period_start
     ? `<span class="hint">covers ${escHTML(snap.service_period_start)} → ${escHTML(snap.service_period_end)}</span>`
     : '';
@@ -1304,8 +1371,8 @@ function _renderCurrentBuildCard(job) {
         ${_renderStatusPill(job.status)}
         ${servingPill}
         ${_renderCachePill(job.cache_hit)}
-        ${duration ? `<span>· ${escHTML(duration)}</span>` : ''}
-        <span>· built ${escHTML(_formatBuiltAt(builtAt))}</span>
+        ${durationCell}
+        <span>· ${isRunning ? 'started' : 'built'} ${escHTML(_formatBuiltAt(isRunning ? job.started_at : builtAt))}</span>
         ${period}
       </div>
       ${cacheReason ? `<p class="hint" style="margin: 0 0 0.4rem">${escHTML(cacheReason)}</p>` : ''}
@@ -1316,6 +1383,36 @@ function _renderCurrentBuildCard(job) {
       </details>
     </div>
   `;
+}
+
+// v0.1.23 — single global ticker that updates every visible
+// `.rebuild-elapsed[data-running-since]` element once per second. Cheaper
+// than a per-element setInterval and survives DOM re-renders (the next
+// loadJobs() poll re-emits the spans with the same data attribute).
+let _elapsedTickerHandle = null;
+
+function _startElapsedTicker() {
+  if (_elapsedTickerHandle !== null) return;
+  _elapsedTickerHandle = setInterval(() => {
+    const elements = document.querySelectorAll('.rebuild-elapsed[data-running-since]');
+    if (!elements.length) {
+      // No more running jobs visible — stop the timer to avoid burning
+      // CPU on idle pages. Will be restarted by the next loadJobs poll
+      // if a new job goes into running state.
+      clearInterval(_elapsedTickerHandle);
+      _elapsedTickerHandle = null;
+      return;
+    }
+    const now = Date.now();
+    elements.forEach(el => {
+      const since = el.dataset.runningSince;
+      if (!since) return;
+      const startedMs = new Date(since).getTime();
+      if (Number.isNaN(startedMs)) return;
+      const elapsedSec = Math.max(0, Math.floor((now - startedMs) / 1000));
+      el.textContent = '· ' + _formatDuration(elapsedSec);
+    });
+  }, 1000);
 }
 
 function _renderHistoryItem(job) {
@@ -1407,6 +1504,11 @@ async function loadJobs(sid) {
       const handle = setInterval(() => loadJobs(sid), 5000);
       _runningJobsPolls.set(sid, handle);
     }
+    // v0.1.23 — kick off the per-second elapsed-time ticker so the
+    // "running…" cell counts up smoothly between 5s job polls. Cheaper
+    // than re-fetching from the server and gives operators much better
+    // signal that the build is alive vs hung.
+    _startElapsedTicker();
   } else if (_runningJobsPolls.has(sid)) {
     clearInterval(_runningJobsPolls.get(sid));
     _runningJobsPolls.delete(sid);
