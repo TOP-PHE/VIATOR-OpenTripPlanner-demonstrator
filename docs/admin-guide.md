@@ -539,7 +539,31 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.13 (latest)**: NAP UX polish + inline credential creation:
+**v0.1.14 (latest)**: split provider refresh from OSM refresh — fixes the
+recurring "I added a GTFS feed and now I'm waiting 30 min for OSM" pain.
+
+- **"Refresh providers"** (renamed from "Refresh all sources") downloads
+  every provider URL — timetables, MCT, stations CSVs — but **never** the
+  OSM PBF. The streetGraph.obj cache stays valid → next rebuild finishes
+  in ~5 min instead of ~30.
+- **"⚠ Refresh OSM"** (new, amber-coloured button next to it) re-fetches
+  just the PBF. Shows a confirm dialog spelling out the cost ("≈25 min
+  added to next build"). You'll click this maybe quarterly when Geofabrik
+  ships an OSM with a relevant fix; otherwise leave it alone.
+- **Three-generation rotation**: before each OSM refresh, the previous
+  PBF is preserved as `osm.pbf.old.1` (existing `.old.1` → `.old.2`,
+  oldest dropped at `.old.3`). One-command rollback if a fresh PBF
+  regresses: `mv osm.pbf.old.1 osm.pbf` on the VPS, then click Rebuild.
+- **Audit trail**: provider and OSM refreshes write distinct audit rows
+  (`session.sources.refreshed` vs `session.osm.refreshed`); the OSM one
+  flags `invalidates_street_graph_cache: true` so monitoring can alert.
+
+**Behaviour change for CLI callers**: `POST /sources/refresh` no longer
+includes the OSM PBF (use the new `POST /sources/osm/refresh` instead).
+The UI button rename is the operator-visible part; the API change is
+documented in the endpoint docstrings.
+
+**v0.1.13**: NAP UX polish + inline credential creation:
 
 - **Inline credential creation** in the NAP catalogue form — no more
   alt-tabbing between `/credentials` and `/admin/nap-catalogues`.
@@ -597,23 +621,15 @@ the schema (`grep alembic /path/to/release-notes` or check
 **v0.1.10**: per-user encrypted API credentials. See §9 below for the
 operator workflow.
 
-**Still queued** from the deployment lessons:
+**Still queued**:
 
-1. **Decouple OSM refresh from provider add/remove.** Today, refreshing
-   provider URLs re-fetches the OSM PBF, which invalidates the
-   streetGraph.obj cache and forces a 30-min full rebuild. Should be:
-   provider refresh ≠ OSM refresh; OSM gets its own button with a
-   "this will invalidate the cache" warning. **This is the next thing
-   to ship.**
-2. **Keep N=3 generations of `osm.pbf.old.<n>`** so a mistaken OSM
-   refresh can be rolled back with one `mv` command.
-3. **Fix `maxAccessEgressDurationForMode` field name** for OTP 2.9 —
+1. **Fix `maxAccessEgressDurationForMode` field name** for OTP 2.9 —
    currently silently ignored, so the access/egress walking bound isn't
-   enforced.
-4. **Credential picker dropdown in sessions.html** — completes the v0.1.10
+   enforced. Hits when the destination is far from any transit stop.
+2. **Credential picker dropdown in sessions.html** — completes the v0.1.10
    credential UX. Today operators must PATCH the API directly to attach a
    credential id to a provider URL.
-5. **`OTP_BUILD_TIMEOUT_MINUTES`** — currently no timeout; a stuck build
+3. **`OTP_BUILD_TIMEOUT_MINUTES`** — currently no timeout; a stuck build
    can block the next one indefinitely. Add as a third key in the Worker
    timing card.
 

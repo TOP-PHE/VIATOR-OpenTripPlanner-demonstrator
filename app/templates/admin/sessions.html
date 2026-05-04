@@ -101,7 +101,15 @@
               </p>
               <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                 <button type="submit">Save config</button>
-                <button type="button" data-action="refresh-sources" class="secondary">Refresh all sources</button>
+                {# v0.1.14: split refresh into providers-only (cheap, frequent)
+                   and OSM (expensive, rare — invalidates streetGraph cache).
+                   The old "Refresh all sources" coupled them, which made every
+                   provider tweak cost a 30-min OSM rebuild. #}
+                <button type="button" data-action="refresh-providers" class="secondary"
+                        title="Download every provider's timetable / MCT / stations CSV. Does NOT touch OSM.">⤴ Refresh providers</button>
+                <button type="button" data-action="refresh-osm" class="secondary"
+                        title="Re-download just the OSM PBF. Invalidates the streetGraph cache and adds ~25 min to the next build."
+                        style="border-color: var(--amber); color: var(--amber)">⚠ Refresh OSM</button>
               </div>
             </form>
           </section>
@@ -109,7 +117,7 @@
           <!-- Upload: per-session multipart -->
           <section class="detail-section">
             <h3>Upload a file</h3>
-            <p class="hint">Manual alternative to <kbd>Refresh sources</kbd>. Files are dispatched into the right inbox subfolder.</p>
+            <p class="hint">Manual alternative to <kbd>Refresh providers</kbd> / <kbd>Refresh OSM</kbd>. Files are dispatched into the right inbox subfolder.</p>
             <form data-form="upload" data-sid="{{ s.id }}" enctype="multipart/form-data">
               <label>Declared standard</label>
               <select name="declared_standard">
@@ -382,11 +390,11 @@ function staleSessionWarning(cfg) {
   const refreshedAt = meta.last_refresh_completed_at;
   if (typeof changedAt !== 'string') return null;  // never-edited path
   if (typeof refreshedAt !== 'string') {
-    return "Sources have been configured but never refreshed. Click 'Refresh all sources' to download the URLs before building.";
+    return "Sources have been configured but never refreshed. Click 'Refresh providers' to download the URLs before building.";
   }
   // ISO-8601 UTC strings → lex compare is correct.
   if (changedAt > refreshedAt) {
-    return "URL(s) were edited after the last refresh. The on-disk files are stale relative to the current configuration. Click 'Refresh all sources' (or 'Refresh this provider' for the affected ones) before Rebuild graph, otherwise the build will use the old data.";
+    return "URL(s) were edited after the last refresh. The on-disk files are stale relative to the current configuration. Click 'Refresh providers' (or 'Refresh this provider' for the affected ones) before Rebuild graph, otherwise the build will use the old data.";
   }
   return null;
 }
@@ -808,8 +816,12 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
   });
 });
 
-// ─── Refresh ALL sources (httpx-download every URL) ─────────────────
-document.querySelectorAll('button[data-action="refresh-sources"]').forEach(btn => {
+// ─── Refresh providers (httpx-download every provider URL, NOT OSM) ──
+// v0.1.14: this used to be "Refresh all sources" and it included the OSM
+// PBF, which silently invalidated the streetGraph cache on every click —
+// turning a "I added a new GTFS feed" workflow into a 30-min OSM rebuild.
+// Now it's providers-only; OSM has its own ⚠ button below.
+document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn => {
   btn.addEventListener('click', async () => {
     const form = btn.closest('form[data-form="config"]');
     const sid = form.dataset.sid;
@@ -821,6 +833,39 @@ document.querySelectorAll('button[data-action="refresh-sources"]').forEach(btn =
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
       const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
       showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
+      if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+    } catch (err) { showToast('error', String(err)); }
+    finally { btn.disabled = false; btn.textContent = original; }
+  });
+});
+
+// ─── Refresh OSM only (v0.1.14) ─────────────────────────────────────
+// Confirm dialog spells out the cost — the operator should rarely click this.
+document.querySelectorAll('button[data-action="refresh-osm"]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const form = btn.closest('form[data-form="config"]');
+    const sid = form.dataset.sid;
+    if (!confirm(
+      'Re-download the OSM PBF for this session?\n\n' +
+      'WARNING: this will invalidate the streetGraph.obj cache. The next ' +
+      'rebuild will need to re-parse the OSM (≈25 min for France-wide on ' +
+      'transit-focused scope, longer on multi-modal/comprehensive).\n\n' +
+      'The previous PBF is preserved as osm.pbf.old.1 — you can restore it ' +
+      'with `mv osm.pbf.old.1 osm.pbf` on the VPS if the new one regresses.\n\n' +
+      'Proceed?'
+    )) return;
+    btn.disabled = true; const original = btn.textContent; btn.textContent = 'Downloading OSM…';
+    try {
+      const r = await fetch(`/api/sessions/${sid}/sources/osm/refresh`, {method:'POST'});
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
+      const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
+      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      const rotated = (body.rotated || []).join('; ');
+      const parts = [`Fetched: ${fetched}`];
+      if (skipped) parts.push(`Skipped: ${skipped}`);
+      if (rotated) parts.push(`Rotated: ${rotated}`);
+      showToast('success', parts.join(' | '));
       if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
     } catch (err) { showToast('error', String(err)); }
     finally { btn.disabled = false; btn.textContent = original; }
@@ -1076,7 +1121,7 @@ function napRenderResult(result, preview) {
   if (preview) {
     html += `<p class="hint">Preview only — nothing has been saved yet. Click <strong>✓ Confirm import</strong> to commit.</p>`;
   } else {
-    html += `<p class="msg show success" style="margin: 0 0 0.5rem">✓ Imported ${providers.length} provider${providers.length === 1 ? '' : 's'}. Click <strong>Refresh all sources</strong> on the session to download their files, then <strong>Rebuild graph</strong>.</p>`;
+    html += `<p class="msg show success" style="margin: 0 0 0.5rem">✓ Imported ${providers.length} provider${providers.length === 1 ? '' : 's'}. Click <strong>Refresh providers</strong> on the session to download their files, then <strong>Rebuild graph</strong>.</p>`;
   }
 
   if (providers.length) {
