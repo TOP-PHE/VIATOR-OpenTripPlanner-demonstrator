@@ -37,11 +37,12 @@ from sqlalchemy.orm import Session as DbSession
 from ..db import SessionLocal
 from ..journey import otp_client, recorder
 from ..models import (
+    NetworkCoverageHub,
     NetworkCoverageResult,
     NetworkCoverageRun,
 )
 from ..models import Session as SessionRow
-from .hubs import Hub, all_pairs, unordered_pairs
+from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,80 @@ _COVERAGE_NUM_ITINERARIES = 50
 _COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h — same as live UI baseline
 
 
+def _load_active_hubs(db: DbSession) -> list[Hub]:
+    """v0.1.31 — read the active hub list from `network_coverage_hubs`.
+
+    Falls back to the static `app/network_coverage/hubs.py` HUBS list
+    when the DB table is empty (fresh install pre-migration, or dev
+    environments). Logs a warning the first time the fallback fires
+    so it's visible in operator logs but doesn't crash the runner.
+
+    Hubs are returned in (country, sort_order, id) order — the same
+    sort the matrix UI uses, so result rows index cleanly to cells
+    without any client-side reordering.
+    """
+    rows = (
+        db.execute(
+            select(NetworkCoverageHub)
+            .where(NetworkCoverageHub.is_active.is_(True))
+            .order_by(
+                NetworkCoverageHub.country,
+                NetworkCoverageHub.sort_order,
+                NetworkCoverageHub.id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if rows:
+        return [
+            Hub(id=r.id, name=r.name, short=r.short, region=r.region or "", lat=r.lat, lon=r.lon)
+            for r in rows
+        ]
+    # Empty-table fallback — keeps the runner working in tests and
+    # the brief migration window before seed completes.
+    log.warning(
+        "network_coverage_hubs table empty; falling back to static "
+        "app/network_coverage/hubs.py — run alembic upgrade to seed the table"
+    )
+    from .hubs import HUBS  # local import to keep the module import graph small
+
+    return list(HUBS)
+
+
+def _hub_pairs(hubs: list[Hub], direction: str) -> list[tuple[Hub, Hub]]:
+    """Build the pair list from a runtime hub list (v0.1.31).
+
+    Mirrors the static `all_pairs()` / `unordered_pairs()` from
+    `hubs.py` but operates on a dynamic input — needed once the hub
+    list comes from the DB instead of a module-level constant.
+    """
+    if direction == "both":
+        return [(a, b) for a in hubs for b in hubs if a.id != b.id]
+    if direction == "single":
+        return [(a, b) for i, a in enumerate(hubs) for b in hubs[i + 1 :]]
+    raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
+
+
+def _hub_set_signature(hubs: list[Hub]) -> str:
+    """Generate a stable identifier for the hub set used at run time.
+
+    v0.1.27/28 baked the hub set into a string like 'fr-major-26'. With
+    DB-backed hubs (v0.1.31) the set isn't a fixed name — it's whatever
+    was active at run creation. We hash the slug list so historical
+    runs can be compared / grouped: two runs with the same hub composition
+    get the same signature, even if individual hubs were edited later.
+
+    Format: "live:<count>:<sha256[:8]>" — count is human-readable, hash
+    is the canonical equality marker.
+    """
+    import hashlib
+
+    slugs = sorted(h.id for h in hubs)
+    digest = hashlib.sha256(",".join(slugs).encode("utf-8")).hexdigest()[:8]
+    return f"live:{len(hubs)}:{digest}"
+
+
 def create_run(
     db: DbSession,
     *,
@@ -91,22 +166,25 @@ def create_run(
     """Create a pending coverage run and return it.
 
     Caller is responsible for kicking off the background task that
-    processes the run (see `start_run_background`).
+    processes the run (see `execute_run`).
+
+    v0.1.31 — hubs read from `network_coverage_hubs` (operator-editable)
+    instead of the static `hubs.py` constant. The hub_set signature
+    captures the active slug set at this moment so future re-runs of
+    the same matrix are comparable.
     """
     if direction not in ("both", "single"):
         raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
-    pairs = all_pairs() if direction == "both" else unordered_pairs()
+    hubs = _load_active_hubs(db)
+    if not hubs:
+        raise ValueError("No active hubs configured — add some via the manage-hubs UI")
+    pairs = _hub_pairs(hubs, direction)
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,
         session_id=session_id,
         session_label=session_id,
         depart_at=depart_at,
-        # v0.1.28: hub_set reflects how many hubs are in the curated
-        # list at run-creation time. v0.1.27 had 23; v0.1.28 added Paris
-        # Austerlitz, Paris Saint-Lazare, and Batz-sur-Mer = 26. Stored
-        # so the matrix view can refuse to render a v0.1.27 run with
-        # the v0.1.28 hub layout (which would mis-align cells).
-        hub_set="fr-major-26",
+        hub_set=_hub_set_signature(hubs),
         direction=direction,
         status="pending",
         total_pairs=len(pairs),
@@ -154,7 +232,17 @@ async def execute_run(run_id: uuid.UUID) -> None:
             return
         session_id_for_pairs = run.session_id
         depart_at_for_pairs = run.depart_at
-        pairs = all_pairs() if run.direction == "both" else unordered_pairs()
+        # v0.1.31 — re-read active hubs from the DB at execute time.
+        # We don't snapshot at create_run because the operator might
+        # edit the hub list between create and execute (rare but
+        # possible if the run was queued and processed minutes later);
+        # using the latest active set keeps results consistent with
+        # whatever the matrix UI is currently showing. total_pairs in
+        # the run row was set at create time; if the operator edited
+        # hubs in the meantime the actual count may differ — the
+        # runner's per-pair counter handles divergence gracefully.
+        hubs_now = _load_active_hubs(db)
+        pairs = _hub_pairs(hubs_now, run.direction)
 
     if not pairs or depart_at_for_pairs is None:
         log.error("run %s has no pairs to execute", run_id)

@@ -1,11 +1,19 @@
-"""Network-coverage admin API (v0.1.27 / hub-set bumped to 26 in v0.1.28).
+"""Network-coverage admin API (v0.1.27 / hub-set bumped to 26 in v0.1.28
+/ DB-backed hubs in v0.1.31).
 
 Endpoints:
 
-  GET  /api/admin/network-coverage/hubs        — return the curated 26-hub list
-  GET  /api/admin/network-coverage/runs        — list past runs (newest first)
-  POST /api/admin/network-coverage/runs        — start a new coverage run
-  GET  /api/admin/network-coverage/runs/{id}   — fetch a run + its results
+  GET    /api/admin/network-coverage/hubs              — list active hubs
+                                                         (v0.1.31: from DB
+                                                         instead of hubs.py)
+  POST   /api/admin/network-coverage/hubs              — v0.1.31: create hub
+  PATCH  /api/admin/network-coverage/hubs/{id}         — v0.1.31: edit hub
+  DELETE /api/admin/network-coverage/hubs/{id}         — v0.1.31: soft-delete
+
+  GET    /api/admin/network-coverage/runs              — list past runs
+                                                         (newest first)
+  POST   /api/admin/network-coverage/runs              — start new coverage run
+  GET    /api/admin/network-coverage/runs/{id}         — fetch run + results
 
 Authorization: platform_admin (the matrix consumes serious OTP capacity
 when running, and old runs persist forever — content-manager doesn't
@@ -25,13 +33,16 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
 from ...db import get_db
+from ...models import NetworkCoverageHub
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import runner
-from ...network_coverage.hubs import HUBS
+from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 
 router = APIRouter(
@@ -44,12 +55,51 @@ router = APIRouter(
 
 
 class HubInfo(BaseModel):
+    """One hub in the matrix axis. v0.1.31 added country/tier/sort_order/
+    is_active so the manage-hubs UI can group, sort, and soft-delete."""
+
     id: str
     name: str
     short: str
-    region: str
+    region: str | None = None
+    country: str = "FR"
+    tier: str = "main"
     lat: float
     lon: float
+    is_active: bool = True
+    sort_order: int = 100
+
+
+class HubCreate(BaseModel):
+    """v0.1.31 — POST /hubs body. id is the slug, mandatory and immutable
+    once created; any later edits use PATCH on the existing id."""
+
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(min_length=1, max_length=120)
+    short: str = Field(min_length=1, max_length=16)
+    country: str = Field(min_length=2, max_length=2, description="ISO 3166-1 alpha-2 (uppercase)")
+    region: str | None = Field(default=None, max_length=40)
+    tier: str = Field(default="main", pattern=r"^(main|regional)$")
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    sort_order: int = Field(default=100, ge=0, le=10_000)
+
+
+class HubUpdate(BaseModel):
+    """v0.1.31 — PATCH /hubs/{id} body. Every field is optional; missing
+    fields are not modified. id is immutable (use DELETE + POST to rename)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    short: str | None = Field(default=None, min_length=1, max_length=16)
+    country: str | None = Field(default=None, min_length=2, max_length=2)
+    region: str | None = Field(default=None, max_length=40)
+    tier: str | None = Field(default=None, pattern=r"^(main|regional)$")
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    sort_order: int | None = Field(default=None, ge=0, le=10_000)
+    # is_active separately so a soft-deleted hub can be restored
+    # without changing other fields.
+    is_active: bool | None = None
 
 
 class RunCreate(BaseModel):
@@ -103,14 +153,144 @@ class RunDetail(RunSummary):
 
 @router.get("/hubs", response_model=list[HubInfo])
 def list_hubs(
+    db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
+    include_inactive: bool = False,
 ) -> list[HubInfo]:
-    """The curated 23-hub list. Stable identifier set; UI uses these as
-    the matrix row + column headers."""
+    """List of hubs forming the matrix axis.
+
+    v0.1.31: reads from `network_coverage_hubs` table. By default returns
+    only is_active=True (matrix axis); pass `include_inactive=true` from
+    the manage-hubs UI to include soft-deleted entries for restoration.
+
+    Falls back to the static HUBS list from `app/network_coverage/hubs.py`
+    when the table is empty — handles the brief window between table
+    creation and migration seed during deploy, and dev environments
+    that haven't run migrations.
+    """
+    q = select(NetworkCoverageHub)
+    if not include_inactive:
+        q = q.where(NetworkCoverageHub.is_active.is_(True))
+    q = q.order_by(NetworkCoverageHub.country, NetworkCoverageHub.sort_order, NetworkCoverageHub.id)
+    rows = db.execute(q).scalars().all()
+    if rows:
+        return [
+            HubInfo(
+                id=r.id,
+                name=r.name,
+                short=r.short,
+                region=r.region,
+                country=r.country,
+                tier=r.tier,
+                lat=r.lat,
+                lon=r.lon,
+                is_active=r.is_active,
+                sort_order=r.sort_order,
+            )
+            for r in rows
+        ]
+    # Fallback for empty-table case — preserves behaviour for fresh
+    # installs and catches the brief migration window.
     return [
-        HubInfo(id=h.id, name=h.name, short=h.short, region=h.region, lat=h.lat, lon=h.lon)
-        for h in HUBS
+        HubInfo(
+            id=h.id,
+            name=h.name,
+            short=h.short,
+            region=h.region,
+            country="FR",
+            tier="regional" if h.id == "batz" else "main",
+            lat=h.lat,
+            lon=h.lon,
+            is_active=True,
+            sort_order=100,
+        )
+        for h in STATIC_HUBS
     ]
+
+
+@router.post("/hubs", response_model=HubInfo, status_code=201)
+def create_hub(
+    body: HubCreate,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HubInfo:
+    """v0.1.31 — create a new hub.
+
+    Slug must be unique (PK conflict → 409). Country normalised to
+    uppercase to keep ISO codes consistent regardless of operator
+    typing habits."""
+    hub = NetworkCoverageHub(
+        id=body.id,
+        name=body.name,
+        short=body.short,
+        country=body.country.upper(),
+        region=body.region,
+        tier=body.tier,
+        lat=body.lat,
+        lon=body.lon,
+        sort_order=body.sort_order,
+        is_active=True,
+    )
+    db.add(hub)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, f"Hub with id={body.id!r} already exists") from None
+    db.refresh(hub)
+    return _hub_to_info(hub)
+
+
+@router.patch("/hubs/{hub_id}", response_model=HubInfo)
+def update_hub(
+    hub_id: str,
+    body: HubUpdate,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HubInfo:
+    """v0.1.31 — edit an existing hub.
+
+    Sparse update: only fields present in the request body are modified.
+    The slug (id) is immutable — to rename, soft-delete and create new.
+    Country is uppercased on write.
+    """
+    hub = db.get(NetworkCoverageHub, hub_id)
+    if hub is None:
+        raise HTTPException(404, f"Hub {hub_id!r} not found")
+    data = body.model_dump(exclude_unset=True)
+    if "country" in data and data["country"] is not None:
+        data["country"] = data["country"].upper()
+    for key, value in data.items():
+        setattr(hub, key, value)
+    hub.updated_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(hub)
+    return _hub_to_info(hub)
+
+
+@router.delete("/hubs/{hub_id}", status_code=204)
+def delete_hub(
+    hub_id: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> None:
+    """v0.1.31 — soft-delete a hub (sets is_active=False).
+
+    Hard delete is intentionally not exposed: result rows from
+    historical coverage runs reference hub_id as a string and would
+    render as "unknown hub" if the row vanished. Soft-delete keeps old
+    matrices intact while removing the hub from new runs and from the
+    matrix axis on the current view.
+
+    Idempotent: deleting an already-inactive hub returns 204 silently.
+    To restore a hub, PATCH it with `{"is_active": true}`.
+    """
+    hub = db.get(NetworkCoverageHub, hub_id)
+    if hub is None:
+        raise HTTPException(404, f"Hub {hub_id!r} not found")
+    hub.is_active = False
+    hub.updated_at = datetime.now(UTC)
+    db.commit()
 
 
 @router.get("/runs", response_model=list[RunSummary])
@@ -206,6 +386,22 @@ def get_run(
 
 
 # ─────────────────────────── helpers ───────────────────────────
+
+
+def _hub_to_info(hub: NetworkCoverageHub) -> HubInfo:
+    """Shared shape converter for the v0.1.31 hub endpoints."""
+    return HubInfo(
+        id=hub.id,
+        name=hub.name,
+        short=hub.short,
+        region=hub.region,
+        country=hub.country,
+        tier=hub.tier,
+        lat=hub.lat,
+        lon=hub.lon,
+        is_active=hub.is_active,
+        sort_order=hub.sort_order,
+    )
 
 
 def _run_to_summary(run: Any) -> RunSummary:

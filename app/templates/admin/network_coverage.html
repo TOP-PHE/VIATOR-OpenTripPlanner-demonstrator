@@ -115,6 +115,39 @@
 .cov-modal { background: #fff; border-radius: 6px; width: min(720px, 92vw); max-height: 92vh; overflow: auto; padding: 1rem 1.4rem; }
 .cov-modal h3 { margin: 0 0 0.6rem; font-size: 1rem; }
 .cov-modal-meta { color: var(--rail-steel); font-size: 0.85rem; margin-bottom: 0.6rem; }
+
+/* v0.1.31 — manage-hubs panel. Collapsible to keep the sidebar tight
+   while still being one-click-away to add cross-border hubs. */
+.hubs-panel { margin-top: 1rem; border-top: 1px dotted var(--sleeper); padding-top: 0.5rem; }
+.hubs-panel summary { cursor: pointer; font-weight: 600; font-size: 0.95rem; padding: 0.2rem 0; }
+.hubs-panel summary:hover { color: var(--uic-blue); }
+.hubs-panel .hubs-tools { display: flex; justify-content: space-between; align-items: center; margin: 0.4rem 0; font-size: 0.8rem; }
+.hubs-panel .hubs-tools button { padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; }
+.hubs-country { margin-top: 0.4rem; padding: 0.3rem 0.4rem; background: #f6f8fa; border-radius: 4px; }
+.hubs-country .country-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 0.82rem; }
+.hubs-country .country-flag { color: var(--rail-steel); font-weight: 400; font-size: 0.75rem; }
+.hubs-country .add-hub-btn { padding: 0.05rem 0.4rem; font-size: 0.7rem; background: var(--uic-blue); color: #fff; border: none; border-radius: 3px; cursor: pointer; }
+.hubs-country .add-hub-btn:hover { background: #003a7a; }
+.hubs-tier { margin-top: 0.3rem; }
+.hubs-tier-label { font-size: 0.7rem; text-transform: uppercase; color: var(--rail-steel); margin-bottom: 0.15rem; letter-spacing: 0.04em; }
+.hub-row { display: flex; justify-content: space-between; align-items: center; padding: 0.15rem 0.3rem; border-bottom: 1px dotted #eaeef2; font-size: 0.78rem; }
+.hub-row:last-child { border-bottom: none; }
+.hub-row.inactive { opacity: 0.5; font-style: italic; }
+.hub-row .hub-info { flex: 1; min-width: 0; }
+.hub-row .hub-slug { color: var(--rail-steel); font-family: ui-monospace, monospace; font-size: 0.72rem; }
+.hub-row .hub-actions button { padding: 0.05rem 0.3rem; font-size: 0.7rem; cursor: pointer; background: none; border: 1px solid transparent; border-radius: 3px; }
+.hub-row .hub-actions button:hover { border-color: #d0d7de; }
+.hub-row .hub-actions .danger { color: #cf222e; }
+.hub-row .hub-actions .danger:hover { background: #ffebe9; border-color: #ffcecb; }
+
+/* Hub edit modal — reuses the cov-modal-backdrop / cov-modal aesthetic. */
+.hub-form label { display: block; font-size: 0.8rem; font-weight: 600; margin-top: 0.5rem; }
+.hub-form input, .hub-form select { width: 100%; padding: 0.35rem; font-size: 0.85rem; border: 1px solid #d0d7de; border-radius: 3px; }
+.hub-form .form-row { display: flex; gap: 0.5rem; }
+.hub-form .form-row > div { flex: 1; }
+.hub-form-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.8rem; }
+.hub-form-actions button { padding: 0.4rem 1rem; font-size: 0.85rem; cursor: pointer; }
+.hub-form-error { color: #cf222e; font-size: 0.8rem; margin-top: 0.4rem; min-height: 1.1em; }
 {% endblock %}
 
 {% block content %}
@@ -153,6 +186,26 @@
       </form>
     {% endif %}
 
+    {# v0.1.31 — manage-hubs panel. Collapsed by default; expanding loads
+       the full hub list grouped by country. Soft-delete preserves old
+       runs that referenced a hub by slug. #}
+    <details class="hubs-panel">
+      <summary>Manage hubs <span class="hint" id="hubs-summary-count" style="font-weight: normal"></span></summary>
+      <div class="hubs-tools">
+        <label style="font-size: 0.78rem; font-weight: normal">
+          <input type="checkbox" id="hubs-show-inactive"> show inactive
+        </label>
+        <button type="button" id="hubs-add-new">+ Add hub</button>
+      </div>
+      <div id="hubs-list">
+        <em class="hint">Loading…</em>
+      </div>
+      <p class="hint" style="margin-top: 0.5rem; font-size: 0.72rem">
+        Adding hubs grows the matrix — n hubs = n×(n−1) directional pairs.
+        100 hubs ≈ 9900 pairs ≈ 33 min wallclock at current parallelism.
+      </p>
+    </details>
+
     <h3 style="margin: 1rem 0 0.3rem; font-size: 1rem">Recent runs</h3>
     <div class="run-list" id="run-list">
       <em class="hint">Loading…</em>
@@ -172,6 +225,68 @@
     </div>
     <div class="cov-modal-meta" id="cov-modal-meta"></div>
     <div id="cov-modal-body"></div>
+  </div>
+</div>
+
+{# v0.1.31 — hub create/edit modal. Same backdrop class as the pair-detail
+   modal so the styling matches. id-mode determines whether we render the
+   "id" field (create) or hide it (edit, since slug is immutable). #}
+<div id="hub-modal" class="cov-modal-backdrop" hidden>
+  <div class="cov-modal" role="dialog" aria-modal="true">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h3 id="hub-modal-title">Add hub</h3>
+      <button type="button" class="secondary" data-action="hub-modal-close" style="padding: 0.2rem 0.6rem">×</button>
+    </div>
+    <form id="hub-form" class="hub-form">
+      <div id="hub-id-row">
+        <label>Slug <span class="hint" style="font-weight: normal">(lowercase, hyphens only — immutable)</span></label>
+        <input type="text" name="id" pattern="[a-z0-9][a-z0-9-]*" required>
+      </div>
+      <div class="form-row">
+        <div>
+          <label>Country <span class="hint" style="font-weight: normal">(ISO 2-letter)</span></label>
+          <input type="text" name="country" maxlength="2" pattern="[A-Za-z]{2}" required style="text-transform: uppercase">
+        </div>
+        <div>
+          <label>Tier</label>
+          <select name="tier">
+            <option value="main">main</option>
+            <option value="regional">regional</option>
+          </select>
+        </div>
+      </div>
+      <label>Name <span class="hint" style="font-weight: normal">(operator-facing label)</span></label>
+      <input type="text" name="name" maxlength="120" required>
+      <div class="form-row">
+        <div>
+          <label>Short <span class="hint" style="font-weight: normal">(matrix header — keep ≤12 chars)</span></label>
+          <input type="text" name="short" maxlength="16" required>
+        </div>
+        <div>
+          <label>Region <span class="hint" style="font-weight: normal">(optional, for header colour)</span></label>
+          <input type="text" name="region" maxlength="40">
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label>Latitude</label>
+          <input type="number" name="lat" step="0.0001" min="-90" max="90" required>
+        </div>
+        <div>
+          <label>Longitude</label>
+          <input type="number" name="lon" step="0.0001" min="-180" max="180" required>
+        </div>
+        <div>
+          <label>Sort order <span class="hint" style="font-weight: normal">(lower = earlier)</span></label>
+          <input type="number" name="sort_order" value="100" min="0" max="10000">
+        </div>
+      </div>
+      <p class="hub-form-error" id="hub-form-error"></p>
+      <div class="hub-form-actions">
+        <button type="button" data-action="hub-modal-close">Cancel</button>
+        <button type="submit" id="hub-form-submit">Save</button>
+      </div>
+    </form>
   </div>
 </div>
 {% endblock %}
@@ -483,6 +598,267 @@ document.addEventListener('keydown', (e) => {
     if (m && !m.hidden) m.hidden = true;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// v0.1.31 — Manage Hubs: load / render / add / edit / delete
+// ──────────────────────────────────────────────────────────────────
+
+// ISO country names for the headers. Add as the operator expands the
+// network — unknown codes fall back to the code itself, no error.
+const COUNTRY_NAMES = {
+  'FR': 'France', 'UK': 'United Kingdom', 'BE': 'Belgium',
+  'NL': 'Netherlands', 'LU': 'Luxembourg', 'DE': 'Germany',
+  'AT': 'Austria', 'CH': 'Switzerland', 'IT': 'Italy', 'ES': 'Spain',
+  'PT': 'Portugal', 'IE': 'Ireland', 'DK': 'Denmark', 'SE': 'Sweden',
+  'NO': 'Norway', 'FI': 'Finland', 'PL': 'Poland', 'CZ': 'Czechia',
+  'SK': 'Slovakia', 'HU': 'Hungary', 'SI': 'Slovenia', 'HR': 'Croatia',
+};
+
+let HUB_EDIT_MODE = 'create';   // 'create' | 'edit'
+let HUB_EDIT_ID = null;          // when 'edit', the slug being edited
+
+async function loadHubs() {
+  const showInactive = document.getElementById('hubs-show-inactive')?.checked || false;
+  const url = `/api/admin/network-coverage/hubs${showInactive ? '?include_inactive=true' : ''}`;
+  const r = await fetch(url);
+  if (!r.ok) {
+    document.getElementById('hubs-list').innerHTML =
+      '<em class="hint">Failed to load hubs.</em>';
+    return [];
+  }
+  const hubs = await r.json();
+  renderHubs(hubs);
+  // Update HUBS used by the matrix render so adding/deleting reflects
+  // immediately without a page reload.
+  HUBS = hubs.filter(h => h.is_active);
+  return hubs;
+}
+
+function renderHubs(hubs) {
+  const list = document.getElementById('hubs-list');
+  const summary = document.getElementById('hubs-summary-count');
+  const active = hubs.filter(h => h.is_active);
+  const countries = new Set(active.map(h => h.country));
+  if (summary) {
+    summary.textContent = `(${active.length} active · ${countries.size} ${countries.size === 1 ? 'country' : 'countries'})`;
+  }
+
+  // Group by country, then split main / regional inside each.
+  const byCountry = new Map();
+  for (const h of hubs) {
+    if (!byCountry.has(h.country)) byCountry.set(h.country, []);
+    byCountry.get(h.country).push(h);
+  }
+  // Sort countries alphabetically by ISO code — predictable, easy to scan.
+  const orderedCountries = Array.from(byCountry.keys()).sort();
+
+  if (!orderedCountries.length) {
+    list.innerHTML = '<em class="hint">No hubs configured.</em>';
+    return;
+  }
+
+  list.innerHTML = orderedCountries.map(cc => {
+    const inCountry = byCountry.get(cc);
+    const main = inCountry.filter(h => h.tier === 'main');
+    const regional = inCountry.filter(h => h.tier === 'regional');
+    const activeCount = inCountry.filter(h => h.is_active).length;
+    const country_name = COUNTRY_NAMES[cc] || cc;
+    return `
+      <div class="hubs-country">
+        <div class="country-head">
+          <span>${escHTML(cc)} · ${escHTML(country_name)}
+            <span class="country-flag">(${activeCount}${main.length || regional.length ? ` · ${main.filter(h => h.is_active).length} main / ${regional.filter(h => h.is_active).length} regional` : ''})</span>
+          </span>
+          <button type="button" class="add-hub-btn" data-add-country="${escHTML(cc)}">+ Add</button>
+        </div>
+        ${renderHubsTier('Main', main)}
+        ${renderHubsTier('Regional', regional)}
+      </div>
+    `;
+  }).join('');
+
+  // Wire row buttons.
+  list.querySelectorAll('[data-edit-hub]').forEach(b => {
+    b.addEventListener('click', () => openHubModal('edit', b.dataset.editHub));
+  });
+  list.querySelectorAll('[data-delete-hub]').forEach(b => {
+    b.addEventListener('click', () => deleteHub(b.dataset.deleteHub));
+  });
+  list.querySelectorAll('[data-restore-hub]').forEach(b => {
+    b.addEventListener('click', () => restoreHub(b.dataset.restoreHub));
+  });
+  list.querySelectorAll('[data-add-country]').forEach(b => {
+    b.addEventListener('click', () => openHubModal('create', null, b.dataset.addCountry));
+  });
+}
+
+function renderHubsTier(label, hubs) {
+  if (!hubs.length) return '';
+  return `
+    <div class="hubs-tier">
+      <div class="hubs-tier-label">${escHTML(label)}</div>
+      ${hubs.map(h => `
+        <div class="hub-row${h.is_active ? '' : ' inactive'}">
+          <div class="hub-info">
+            <strong>${escHTML(h.short)}</strong> · ${escHTML(h.name)}
+            ${h.region ? `<span class="hint" style="font-size: 0.7rem"> · ${escHTML(h.region)}</span>` : ''}
+            <div class="hub-slug">${escHTML(h.id)} · ${h.lat.toFixed(4)}, ${h.lon.toFixed(4)}</div>
+          </div>
+          <div class="hub-actions">
+            ${h.is_active
+              ? `<button data-edit-hub="${escHTML(h.id)}" title="Edit">✏️</button>
+                 <button class="danger" data-delete-hub="${escHTML(h.id)}" title="Soft-delete">🗑</button>`
+              : `<button data-restore-hub="${escHTML(h.id)}" title="Restore">↺</button>`
+            }
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+// Open the create/edit modal. mode='create' shows the slug field;
+// mode='edit' hides it (slug is immutable). prefillCountry only applies
+// to create-mode (clicked the "+ Add" button under a specific country
+// header, so we pre-select that country).
+function openHubModal(mode, hubId, prefillCountry) {
+  HUB_EDIT_MODE = mode;
+  HUB_EDIT_ID = hubId || null;
+  const modal = document.getElementById('hub-modal');
+  const form = document.getElementById('hub-form');
+  const title = document.getElementById('hub-modal-title');
+  const idRow = document.getElementById('hub-id-row');
+  const errEl = document.getElementById('hub-form-error');
+  errEl.textContent = '';
+  form.reset();
+
+  if (mode === 'create') {
+    title.textContent = prefillCountry ? `Add ${prefillCountry} hub` : 'Add hub';
+    idRow.style.display = '';
+    form.elements['id'].required = true;
+    form.elements['sort_order'].value = 100;
+    if (prefillCountry) form.elements['country'].value = prefillCountry;
+  } else {
+    title.textContent = `Edit hub · ${hubId}`;
+    idRow.style.display = 'none';
+    form.elements['id'].required = false;
+    // Fetch and prefill from the API.
+    fetch(`/api/admin/network-coverage/hubs?include_inactive=true`)
+      .then(r => r.json())
+      .then(hubs => {
+        const h = hubs.find(x => x.id === hubId);
+        if (!h) return;
+        form.elements['name'].value = h.name;
+        form.elements['short'].value = h.short;
+        form.elements['country'].value = h.country;
+        form.elements['region'].value = h.region || '';
+        form.elements['tier'].value = h.tier;
+        form.elements['lat'].value = h.lat;
+        form.elements['lon'].value = h.lon;
+        form.elements['sort_order'].value = h.sort_order;
+      });
+  }
+  modal.hidden = false;
+}
+
+document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const errEl = document.getElementById('hub-form-error');
+  const submitBtn = document.getElementById('hub-form-submit');
+  errEl.textContent = '';
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Saving…';
+  try {
+    const body = {
+      name: fd.get('name'),
+      short: fd.get('short'),
+      country: (fd.get('country') || '').toUpperCase(),
+      region: fd.get('region') || null,
+      tier: fd.get('tier') || 'main',
+      lat: parseFloat(fd.get('lat')),
+      lon: parseFloat(fd.get('lon')),
+      sort_order: parseInt(fd.get('sort_order') || '100', 10),
+    };
+    let url, method;
+    if (HUB_EDIT_MODE === 'create') {
+      body.id = fd.get('id');
+      url = '/api/admin/network-coverage/hubs';
+      method = 'POST';
+    } else {
+      url = `/api/admin/network-coverage/hubs/${encodeURIComponent(HUB_EDIT_ID)}`;
+      method = 'PATCH';
+    }
+    const r = await fetch(url, {
+      method, headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      errEl.textContent = j.detail || `Failed (${r.status})`;
+      return;
+    }
+    document.getElementById('hub-modal').hidden = true;
+    showToast('success', HUB_EDIT_MODE === 'create' ? 'Hub created' : 'Hub updated');
+    await loadHubs();
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Save';
+  }
+});
+
+async function deleteHub(hubId) {
+  if (!confirm(`Soft-delete hub "${hubId}"? It will be hidden from the matrix and new runs but historical runs that reference it will still render correctly.`)) return;
+  const r = await fetch(`/api/admin/network-coverage/hubs/${encodeURIComponent(hubId)}`, {method: 'DELETE'});
+  if (!r.ok) {
+    showToast('error', `Delete failed (${r.status})`);
+    return;
+  }
+  showToast('success', `Hub "${hubId}" removed from active set`);
+  await loadHubs();
+}
+
+async function restoreHub(hubId) {
+  const r = await fetch(`/api/admin/network-coverage/hubs/${encodeURIComponent(hubId)}`, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({is_active: true}),
+  });
+  if (!r.ok) {
+    showToast('error', `Restore failed (${r.status})`);
+    return;
+  }
+  showToast('success', `Hub "${hubId}" restored`);
+  await loadHubs();
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.matches('[data-action="hub-modal-close"]') ||
+      (e.target.classList.contains('cov-modal-backdrop') && e.target.id === 'hub-modal')) {
+    document.getElementById('hub-modal').hidden = true;
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const m = document.getElementById('hub-modal');
+    if (m && !m.hidden) m.hidden = true;
+  }
+});
+
+// Bootstrap: load hubs whenever the panel is expanded for the first
+// time, and toggle inactive view rebuilds the list.
+const _hubsPanel = document.querySelector('.hubs-panel');
+if (_hubsPanel) {
+  let _hubsLoaded = false;
+  _hubsPanel.addEventListener('toggle', () => {
+    if (_hubsPanel.open && !_hubsLoaded) {
+      _hubsLoaded = true;
+      loadHubs();
+    }
+  });
+}
+document.getElementById('hubs-show-inactive')?.addEventListener('change', loadHubs);
+document.getElementById('hubs-add-new')?.addEventListener('click', () => openHubModal('create'));
 
 // Reuse the toast plumbing from the rest of the admin pages — copy
 // the minimal version here so this template doesn't depend on

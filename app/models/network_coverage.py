@@ -1,6 +1,6 @@
 """ORM models for the v0.1.27 network-coverage feature.
 
-Two tables:
+Three tables:
 
   network_coverage_runs     — one row per "Run" click. Carries the
                               session_id, departure datetime, and overall
@@ -16,6 +16,17 @@ Two tables:
                               duration / response time / journey_search
                               FK for click-cell drilldown).
 
+  network_coverage_hubs     — v0.1.31: editable hub catalog. Was a
+                              hard-coded NamedTuple list in
+                              app/network_coverage/hubs.py through
+                              v0.1.30; that file remains as legacy
+                              fallback / seed source for the migration.
+                              The runner reads active hubs from this
+                              table at run-creation time so adding
+                              cross-border stations (London St Pancras,
+                              Brussels-Midi, ...) doesn't require a
+                              code release.
+
 The journey_search_id link reuses the existing journey_searches /
 journey_trips infrastructure — no duplication, and the v0.1.26 trip-
 card UI works as the click-cell drilldown out of the box.
@@ -28,7 +39,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -165,5 +179,80 @@ class NetworkCoverageResult(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+
+class NetworkCoverageHub(Base):
+    """v0.1.31 — operator-editable hub catalog.
+
+    Replaces the hard-coded NamedTuple list in
+    `app/network_coverage/hubs.py` (which remains as the seed source for
+    the alembic migration and a legacy fallback for environments that
+    haven't run the migration yet).
+
+    Why a table instead of a config-file constant: cross-border
+    expansion (v0.1.30 EU sessions) needs to add London St Pancras,
+    Brussels-Midi, Amsterdam Centraal, Cologne Hbf, Frankfurt Hbf,
+    Milano Centrale, Zurich HB, Madrid-Atocha, Vienna Hbf etc. as the
+    operator iterates — and waiting on a code release + Docker build
+    + tag push for every "I want to add Köln to the matrix" is a
+    velocity tax we don't need.
+
+    Soft-delete via `is_active`: deleted hubs stay in the table so old
+    coverage runs (whose result rows reference hub_id as a string)
+    continue to render correctly. The matrix UI filters to is_active
+    when fetching the current hub axis; old runs use the per-result
+    snapshot of hub coords on the row itself.
+
+    Country / region / tier are three independent metadata dimensions:
+      country  ISO 3166-1 alpha-2 (FR, UK, BE, NL, DE, IT, CH, ES, AT,
+               LU, ...). Used for grouping in the manage-hubs UI. The
+               editor convention is uppercase 2-letter; we don't enforce
+               via CHECK because future codes (e.g. "EU" for cross-
+               border placeholders) shouldn't break the schema.
+      region   free-form string. Used by the matrix CSS to colour
+               row/column headers — keep the existing
+               paris/NE/CE/SE/SW/W/Center vocabulary for FR hubs so
+               the historical matrix aesthetic is preserved.
+      tier     'main' | 'regional'. Operator-meaningful split: main =
+               TGV/IC headline city, regional = TER halt or smaller
+               commuter city used for stress-testing. Surfaces in the
+               UI as separate sections under each country header.
+    """
+
+    __tablename__ = "network_coverage_hubs"
+    __table_args__ = (
+        CheckConstraint("tier IN ('main','regional')", name="tier_valid"),
+        Index("ix_network_coverage_hubs_country_tier", "country", "tier", "is_active"),
+        Index("ix_network_coverage_hubs_active_sort", "is_active", "sort_order"),
+    )
+
+    # Slug as PK — same convention used by the existing
+    # network_coverage_results.origin_hub_id / dest_hub_id columns
+    # (which are intentionally not FK-constrained against this table
+    # so old runs survive a hub-deletion). Matching slug semantics
+    # means the matrix render works the same way for runs that pre-
+    # date this table.
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    short: Mapped[str] = mapped_column(String(16), nullable=False)
+    country: Mapped[str] = mapped_column(String(2), nullable=False)
+    region: Mapped[str | None] = mapped_column(String(40))
+    tier: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'main'"))
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lon: Mapped[float] = mapped_column(Float, nullable=False)
+    # Soft-delete flag. UI hides is_active=false by default; admin can
+    # toggle "show inactive" to restore one if it was removed by mistake.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # Lower number sorts first within (country, tier). Default 100 so
+    # new entries don't disrupt the curated FR ordering. Operator can
+    # override via the edit form to push a hub up/down the matrix axis.
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("100"))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
