@@ -110,9 +110,7 @@ async def fetch_plan(
     every pair (cured by going back to inline literals which OTP coerces
     correctly into the Long field).
     """
-    query = _QUERY.replace(
-        "__NUM_ITINERARIES__", str(int(num_itineraries))
-    ).replace(
+    query = _QUERY.replace("__NUM_ITINERARIES__", str(int(num_itineraries))).replace(
         "__SEARCH_WINDOW__", str(int(search_window_seconds))
     )
     payload = {
