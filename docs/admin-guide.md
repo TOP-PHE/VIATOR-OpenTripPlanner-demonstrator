@@ -539,7 +539,33 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.24 (latest)**: per-session OTP API timeout + OTP 2.9 schema fix.
+**v0.1.25 (latest)**: CI Trivy gate fix — unblocks v0.1.24 OTP image release.
+
+v0.1.24's CI ran into a `trivy-action@v0.36.0` bug: when both
+`format: sarif` and `severity: CRITICAL,HIGH` are set on the same step,
+the action correctly filters HIGH/CRITICAL for the SARIF output but
+applies the `exit-code: 1` to the **unfiltered** finding count. So a
+fresh batch of MEDIUM curl/libcurl/sed patches published on 2026-05-05
+caused the OTP build to fail the gate even though the diagnostic
+table (same image, same config, table format) reported 0 HIGH/CRITICAL
+findings. v0.1.24's web image successfully shipped to GHCR; the OTP
+image was blocked.
+
+v0.1.25 simplifies `.github/workflows/docker.yml` so the gating step
+uses **table format** (which honors severity for exit-code) and the
+SARIF generation moves to a separate non-fatal step that purely
+feeds the GitHub Security tab + downloadable artifact. The table
+output doubles as the human-readable diagnostic — when the gate
+fails, the blocking CVEs are visible right above the error in the
+job log.
+
+No app code changes; pure CI/build-system fix. Carries the full
+v0.1.24 payload (per-session `otp_api_timeout`, OTP 2.9
+`accessEgress.maxDurationForMode` schema fix) plus this workflow
+change. Deploy v0.1.25 instead of v0.1.24 — same operator-visible
+behaviour, plus a working OTP image on GHCR.
+
+**v0.1.24**: per-session OTP API timeout + OTP 2.9 schema fix.
 
 Two related fixes touching `router-config.json`:
 

@@ -130,42 +130,56 @@ jobs:
       # Empty for the OTP image (those paths don't exist in OTP, no harm done,
       # but we keep it explicit per-image so future changes are obvious).
 
-      # Diagnostic pass — prints findings to stdout (visible inline in the job log).
-      # Never fails (exit-code 0). When the gating step below fails, this is your
-      # window into *which* CVEs are blocking. Do NOT pass `output:` here — it
-      # redirects the table to a file and silences the log.
-      - name: Trivy — diagnostic scan (table, non-fatal)
+      # ────────────────────────────── v0.1.25 NOTE ──────────────────────────
+      # Pre-v0.1.25 we had two trivy-action calls — diagnostic (table, non-
+      # fatal) and gating (sarif, fatal-on-vulns). The gating step exited 1
+      # on v0.1.24 builds because trivy-action@v0.36.0 has a subtle bug:
+      # the `severity: CRITICAL,HIGH` filter is applied to the table
+      # reporter but NOT to the exit-code check when `format: sarif`. So
+      # the table showed "0 vulnerabilities" while the SARIF contained 15
+      # MEDIUM/LOW findings (curl/libcurl/sed routine patches), and exit-1
+      # fired regardless of severity.
+      #
+      # v0.1.25 unifies the two passes: ONE table-format step that both
+      # prints findings and gates the build (severity respected), plus a
+      # separate SARIF-format step (severity filter ignored, all severities
+      # emitted) that purely feeds the GitHub Security tab and the
+      # downloadable artifact. Neither blocks the build.
+      #
+      # If the gating step fails, look at the table output above — those
+      # ARE the CVEs that need attention. The SARIF artifact below shows
+      # everything Trivy found regardless of severity, useful for triage.
+
+      # Gating pass — table format honors `severity: CRITICAL,HIGH` for
+      # exit-code, and the table doubles as the diagnostic readout. Do NOT
+      # pass `output:` here — it would redirect the table to a file and
+      # silence the log, which defeats the diagnostic purpose.
+      - name: Trivy — vulnerability scan (table, gating)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: viator-${{ matrix.image.name }}:scan
           severity: CRITICAL,HIGH
-          exit-code: 0                                     # never fail the job here
-          ignore-unfixed: true
-          vuln-type: ${{ matrix.image.trivy_vuln_type }}
+          exit-code: 1                                       # fail on any HIGH/CRITICAL
+          ignore-unfixed: true                               # suppress unactionable findings
+          vuln-type: ${{ matrix.image.trivy_vuln_type }}      # web: os,library | otp: os only
           trivyignores: ".trivyignore"
           skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
           format: table
 
-      # Gating pass — fails the job on any unignored CRITICAL/HIGH finding.
-      # Tags use a `v` prefix — `@0.36.0` does NOT resolve, must be `@v0.36.0`.
-      # Earlier releases (e.g. v0.29.0) internally pin `aquasecurity/setup-trivy@v0.2.2`
-      # which has been deleted from the registry, so they fail to download.
-      # v0.36.0 pins setup-trivy by SHA (3fb12ec1… = v0.2.6) — the right way.
-      # https://github.com/aquasecurity/trivy-action/tags
-      #
-      # NOTE: skip-files MUST match the diagnostic step exactly. We learned in
-      # v0.1.9 that the SARIF reporter doesn't always honor `.trivyignore` the
-      # way the table reporter does (diagnostic scan showed 0 vulns but SARIF
-      # gating still exited 1). Skipping the files outright sidesteps that
-      # discrepancy regardless of which Trivy reporter is in use.
-      - name: Trivy — vulnerability scan (sarif, gating)
+      # SARIF pass — non-fatal, full severity range. Feeds the GitHub
+      # Security tab + downloadable artifact. We deliberately leave
+      # `severity` empty so the SARIF reflects everything Trivy found,
+      # not just HIGH/CRITICAL — useful for triage even when nothing
+      # blocks the gate. exit-code:0 means a fresh batch of MEDIUMs
+      # (the v0.1.24 footgun) can never block a release again.
+      - name: Trivy — SARIF for Security tab (non-fatal)
+        if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: viator-${{ matrix.image.name }}:scan
-          severity: CRITICAL,HIGH
-          exit-code: 1
-          ignore-unfixed: true                          # suppress unactionable findings in base images
-          vuln-type: ${{ matrix.image.trivy_vuln_type }}  # web: os,library  |  otp: os only (jar deps are upstream)
+          exit-code: 0                                       # never fail the build here
+          ignore-unfixed: true
+          vuln-type: ${{ matrix.image.trivy_vuln_type }}
           trivyignores: ".trivyignore"
           skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
           format: sarif
