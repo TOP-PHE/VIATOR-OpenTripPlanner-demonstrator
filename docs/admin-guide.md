@@ -793,7 +793,64 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.28 (latest)**: Network coverage hub-list expansion (23 → 26).
+**v0.1.29 (latest)**: Network coverage — full-day search + trip-count view.
+
+Two operator questions about v0.1.27/28's coverage matrix:
+
+**Q1 — can we test the full day instead of just one departure time?**
+**Yes.** Coverage runs now ask OTP for `numItineraries=50` over a
+`searchWindow=86400` (24h) per pair, instead of the live-UI's `8 / 4h`.
+RAPTOR returns the full day's worth of trains in a single call; we
+get every alternative OTP can find for that A→B on that day.
+
+Trade-off: per-call latency goes from ~0.5-1s up to ~2-5s (OTP runs
+its loop until the window or numItineraries is exhausted). At
+concurrency=5 the full 650-pair run grows from ~10-15min to
+**~25-35min**. Acceptable — coverage is a deliberate weekly /
+release-time tool, not interactive.
+
+The two new constants live in `app/network_coverage/runner.py`:
+`_COVERAGE_NUM_ITINERARIES` and `_COVERAGE_SEARCH_WINDOW_SECONDS`.
+Bump them per-deployment if your graphs are dense enough that 50
+trips truncate (Île-de-France RER pairs might).
+
+**Q2 — can we see trip count per day per cell, not just the shortest?**
+**Yes** — once Q1 is in, the count comes for free. Each result row
+already has `num_itineraries` from v0.1.27. The matrix now offers a
+**view toggle** (top-right of the result panel):
+
+  * **Min duration** — original v0.1.27 behaviour (3h12 per cell)
+  * **Trips/day** — count per cell, with a green heatmap that darkens
+    as the trip count grows (1-2 = light, 30+ = dark green)
+  * **Both** (default for new operators) — `3h12·25` per cell, the
+    best of both worlds
+
+The toggle persists in `localStorage` so it survives reloads. Tooltips
+always show both numbers + transfers + operators + response_ms,
+regardless of view.
+
+**Q3 — does the data support cross-session comparison later?**
+**Yes — already supported** via the existing schema chain that v0.1.27
+wired in:
+
+  * `network_coverage_results.journey_search_id` FK →
+  * `journey_searches.id` (one row per pair search) →
+  * `journey_search_executions.raw_response` (full OTP JSON, JSONB) +
+  * `journey_trips.legs` (per-itinerary v0.1.26 operator info)
+
+So when you have a second session populated by MERITS data, you can:
+1. Promote the new session
+2. Run the coverage matrix against it (same 26 hubs)
+3. Eyeball both matrices side-by-side via the sidebar (manual diff)
+
+A proper **side-by-side auto-diff view** — pick run A vs run B, render
+a delta matrix coloured by agreement (green = both ok / blue = B
+better / orange = A better / red = disagree fundamentally) with a
+click-cell for full per-itinerary diff — is queued for v0.1.30 once a
+second session exists to compare against. Building it before the test
+data arrives risks fitting the UI to the wrong comparison story.
+
+**v0.1.28**: Network coverage hub-list expansion (23 → 26).
 
 Operator review of the v0.1.27 hub list flagged two missing Paris
 terminals — **Gare d'Austerlitz** (gateway to south-central France via

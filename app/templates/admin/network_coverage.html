@@ -74,8 +74,19 @@
   pointer-events: none; max-width: 320px; line-height: 1.4;
 }
 
-.cov-summary { display: flex; gap: 0.6rem; flex-wrap: wrap; padding: 0.5rem 0.7rem; background: #eef2f8; border-radius: 4px; margin-bottom: 0.6rem; font-size: 0.85rem; }
+.cov-summary { display: flex; gap: 0.6rem; flex-wrap: wrap; padding: 0.5rem 0.7rem; background: #eef2f8; border-radius: 4px; margin-bottom: 0.6rem; font-size: 0.85rem; align-items: center; }
 .cov-summary > div { white-space: nowrap; }
+/* v0.1.29 — view toggle. Three modes change what each cell displays. */
+.cov-view-toggle { margin-left: auto; display: flex; gap: 0.2rem; }
+.cov-view-toggle button { padding: 0.15rem 0.5rem; font-size: 0.75rem; border: 1px solid #d0d7de; background: #fff; cursor: pointer; }
+.cov-view-toggle button.active { background: var(--uic-blue); color: #fff; border-color: var(--uic-blue); }
+.cov-view-toggle button:hover:not(.active) { background: #eef2f8; }
+/* Trip-count heatmap — denser greens for more trains. */
+.cov-matrix tbody td.s-ok.count-1   { background: #f0fdf4; }
+.cov-matrix tbody td.s-ok.count-3   { background: #d3f9d8; }
+.cov-matrix tbody td.s-ok.count-10  { background: #aceebb; }
+.cov-matrix tbody td.s-ok.count-20  { background: #6ddc7d; color: #fff; }
+.cov-matrix tbody td.s-ok.count-30  { background: #1a7f37; color: #fff; }
 
 /* Drilldown modal — reuse the v0.1.26 JSON inspector aesthetics. */
 .cov-modal-backdrop {
@@ -154,6 +165,11 @@
 let HUBS = [];           // populated from /api/admin/network-coverage/hubs on load
 let CURRENT_RUN_ID = null;
 let CURRENT_POLL_HANDLE = null;
+// v0.1.29 — matrix view mode. "duration" (best/min duration per cell, the
+// original v0.1.27 behaviour), "count" (trips/day per cell, heatmap by
+// count), or "hybrid" (both, as "3h12 ·25"). Persisted to localStorage so
+// the operator's choice survives page reloads.
+let CURRENT_VIEW = (typeof localStorage !== 'undefined' && localStorage.getItem('cov_view')) || 'hybrid';
 
 function escHTML(s) {
   if (s === null || s === undefined) return '';
@@ -290,8 +306,10 @@ function renderRun(run) {
   for (const r of (run.results || [])) {
     cell.set(`${r.origin_hub_id}|${r.dest_hub_id}`, r);
   }
-  // Summary strip.
+  // Summary strip + view toggle (v0.1.29).
   const pct = run.total_pairs ? Math.round(100 * run.completed_pairs / run.total_pairs) : 0;
+  const viewBtn = (mode, label) =>
+    `<button type="button" data-view="${mode}" class="${CURRENT_VIEW === mode ? 'active' : ''}" title="${label}">${label}</button>`;
   const summary = `<div class="cov-summary">
     <div><strong>${escHTML(run.session_label)}</strong></div>
     <div>· ${escHTML(run.depart_at.replace('T',' ').slice(0,16))}</div>
@@ -302,6 +320,11 @@ function renderRun(run) {
     ${run.error_pairs ? `<div>· <span style="color:#cf222e">${run.error_pairs} err</span></div>` : ''}
     ${run.summary && run.summary.median_response_ms ? `<div>· median ${run.summary.median_response_ms}ms</div>` : ''}
     ${run.summary && run.summary.elapsed_seconds ? `<div>· ${Math.round(run.summary.elapsed_seconds)}s wallclock</div>` : ''}
+    <div class="cov-view-toggle" role="group" aria-label="Cell display mode">
+      ${viewBtn('duration', 'Min duration')}
+      ${viewBtn('count', 'Trips/day')}
+      ${viewBtn('hybrid', 'Both')}
+    </div>
   </div>`;
 
   // Build the matrix. Rows = origin (read down), columns = destination.
@@ -313,18 +336,51 @@ function renderRun(run) {
       if (orig.id === dest.id) return '<td class="diag"></td>';
       const r = cell.get(`${orig.id}|${dest.id}`);
       if (!r) return '<td class="empty">·</td>';
-      const cls = `s-${r.status}`;
-      const inner = r.status === 'ok'
-        ? fmtDuration(r.best_duration_seconds)
-        : (r.status === 'no_route' ? '∅' : (r.status === 'timeout' ? '⏱' : '✗'));
+      // v0.1.29 — cell content varies by view mode. Heatmap class is
+      // only applied in "count" view; duration/hybrid keep the flat
+      // green from v0.1.27.
+      let cls = `s-${r.status}`;
+      let inner;
+      if (r.status === 'ok') {
+        const n = r.num_itineraries || 0;
+        const dur = fmtDuration(r.best_duration_seconds);
+        if (CURRENT_VIEW === 'count') {
+          inner = String(n);
+          // Bucket the heatmap classes; biggest class wins via CSS specificity.
+          if (n >= 30)      cls += ' count-30';
+          else if (n >= 20) cls += ' count-20';
+          else if (n >= 10) cls += ' count-10';
+          else if (n >= 3)  cls += ' count-3';
+          else              cls += ' count-1';
+        } else if (CURRENT_VIEW === 'hybrid') {
+          inner = n > 1 ? `${dur}<span style="opacity:0.7">·${n}</span>` : dur;
+        } else {
+          // duration (default v0.1.27 behaviour)
+          inner = dur;
+        }
+      } else if (r.status === 'no_route') inner = '∅';
+      else if (r.status === 'timeout')    inner = '⏱';
+      else                                 inner = '✗';
+      // Tooltip surfaces both numbers regardless of view, plus departure
+      // spread when available.
       const tip = r.status === 'ok'
-        ? `${orig.name} → ${dest.name}\n${fmtDuration(r.best_duration_seconds)}, ${r.best_num_transfers || 0} transfers\n${r.best_operators || '?'}\n${r.response_ms}ms`
+        ? `${orig.name} → ${dest.name}\n${fmtDuration(r.best_duration_seconds)} (best), ${r.num_itineraries || 0} trips/day\n${r.best_num_transfers || 0} transfers · ${r.best_operators || '?'}\n${r.response_ms}ms`
         : `${orig.name} → ${dest.name}\n${r.status}${r.error_message ? '\n' + r.error_message : ''}`;
       return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}" title="${escHTML(tip)}">${inner}</td>`;
     }).join('');
     return `<tr class="region-${escHTML(orig.region)}"><th title="${escHTML(orig.name)}">${escHTML(orig.short)}</th>${cells}</tr>`;
   }).join('');
 
+  // v0.1.29 — legend changes with the view mode so it explains what
+  // the operator is actually looking at.
+  const legendBody = CURRENT_VIEW === 'count'
+    ? `Cell content is the number of itineraries OTP returned for that pair (full-day search,
+       up to 50 trains). Heatmap shaded by count: light green = 1-2 trains, dark green = 30+.`
+    : CURRENT_VIEW === 'hybrid'
+      ? `Cell content is "shortest duration · trip count" (e.g. <code>3h12·25</code> means the
+         best itinerary is 3h12 and OTP found 25 trains/day on this pair).`
+      : `Cell content is the shortest itinerary's duration. Use the Trips/day or Both view above
+         for trip-count information.`;
   main.innerHTML = summary + `<div class="cov-matrix-wrap">
     <table class="cov-matrix">
       <thead>${headerRow}</thead>
@@ -332,7 +388,8 @@ function renderRun(run) {
     </table>
   </div>
   <p class="hint" style="margin-top: 0.6rem">
-    Rows = origin, columns = destination. Cell content is the shortest itinerary's duration.
+    Rows = origin, columns = destination. ${legendBody}
+    <br>
     <span style="background:#dafbe1;padding:0 4px;border-radius:2px">green</span> = itinerary returned;
     <span style="background:#fff4d6;padding:0 4px;border-radius:2px">amber ∅</span> = OTP found no route;
     <span style="background:#ffd6cc;padding:0 4px;border-radius:2px">red ⏱</span> = timeout;
@@ -346,6 +403,18 @@ function renderRun(run) {
       const [oId, dId] = td.dataset.pair.split('|');
       const r = cell.get(td.dataset.pair);
       openDetailModal(oId, dId, r);
+    });
+  });
+
+  // v0.1.29 — view-toggle clicks: switch CURRENT_VIEW + re-render
+  // (don't refetch from server, the data is already in `run`).
+  main.querySelectorAll('.cov-view-toggle button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const newView = btn.dataset.view;
+      if (newView === CURRENT_VIEW) return;
+      CURRENT_VIEW = newView;
+      try { localStorage.setItem('cov_view', newView); } catch (e) { /* private mode */ }
+      renderRun(run);
     });
   });
 }

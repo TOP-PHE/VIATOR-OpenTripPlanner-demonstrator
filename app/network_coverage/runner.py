@@ -56,6 +56,21 @@ _PARALLELISM = 5
 # valuable signal than a fast timeout.
 _PER_PAIR_TIMEOUT_MS = 60_000
 
+# v0.1.29 — full-day coverage mode. Bumped from the live-UI's 8/4h to
+# 50/24h so each pair returns ALL the trains running between A and B
+# on the chosen day in a single OTP call. The matrix's per-cell trip
+# count then reflects "how many alternatives does this session find for
+# this pair on this day" — the answer to the original question
+# operators ask of any new GTFS feed.
+#
+# Trade-off: per-call latency goes from ~0.5-1s up to ~2-5s (OTP runs
+# its RAPTOR loop until either numItineraries or the window is
+# exhausted). At concurrency=5 the full 650-pair run grows from
+# ~10-15min to ~25-35min. Acceptable — coverage matrix is a deliberate
+# weekly/release-time tool, not interactive.
+_COVERAGE_NUM_ITINERARIES = 50
+_COVERAGE_SEARCH_WINDOW_SECONDS = 86_400  # 24h
+
 
 def create_run(
     db: DbSession,
@@ -242,6 +257,9 @@ async def _execute_pair(
             to_lon=dest.lon,
             when=depart_at,
             timeout_ms=_PER_PAIR_TIMEOUT_MS,
+            # v0.1.29 — full-day coverage mode (see module-level constants).
+            num_itineraries=_COVERAGE_NUM_ITINERARIES,
+            search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
         )
         response_ms = int((time.monotonic() - started) * 1000)
         num_itineraries = len(trips)

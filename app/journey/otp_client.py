@@ -37,8 +37,13 @@ log = logging.getLogger(__name__)
 # queries (typically still <1 s for inter-city), but the demonstrator
 # value of seeing 6-8 alternatives outweighs it.
 _QUERY = """
-query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $time: String) {
-  plan(from: $from, to: $to, date: $date, time: $time, numItineraries: 8, searchWindow: 14400) {
+query Plan(
+    $from: InputCoordinates!, $to: InputCoordinates!,
+    $date: String, $time: String,
+    $numItineraries: Int = 8, $searchWindow: Int = 14400
+) {
+  plan(from: $from, to: $to, date: $date, time: $time,
+       numItineraries: $numItineraries, searchWindow: $searchWindow) {
     itineraries {
       duration
       startTime
@@ -88,10 +93,18 @@ async def fetch_plan(
     to_lon: float,
     when: datetime,
     timeout_ms: int,
+    num_itineraries: int = 8,
+    search_window_seconds: int = 14400,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Call OTP. Returns (raw_response, trips_for_recorder).
 
     Raises httpx.HTTPError on transport / HTTP failure (caller maps to 'error').
+
+    `num_itineraries` and `search_window_seconds` (v0.1.29) let the caller
+    widen OTP's search beyond the live-journey defaults — used by the
+    network-coverage runner to fetch the full day's worth of trains for
+    each pair in one call (50 itineraries / 24h window) instead of the
+    "next ~hour, top 8" the live UI wants.
     """
     payload = {
         "query": _QUERY,
@@ -100,6 +113,8 @@ async def fetch_plan(
             "to": {"lat": to_lat, "lon": to_lon},
             "date": when.strftime("%Y-%m-%d"),
             "time": when.strftime("%H:%M"),
+            "numItineraries": num_itineraries,
+            "searchWindow": search_window_seconds,
         },
     }
     # OTP 2.9 GTFS GraphQL endpoint. Note: it is `/otp/gtfs/v1`, NOT
