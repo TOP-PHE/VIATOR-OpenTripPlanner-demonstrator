@@ -91,12 +91,19 @@
               <select name="osm_scope">
                 <option value="transit-focused">Transit-focused (recommended) — drops driveways, agricultural, private. Saves ~40% memory.</option>
                 <option value="multi-modal">Multi-modal — keeps service roads + cycling/walking detail. ~10-20% saving.</option>
+                <option value="rail-focused">Rail-focused (multi-country / low-RAM) — drops ALL driving roads. Required for EU-scale builds on commodity VPS.</option>
                 <option value="comprehensive">Comprehensive — original PBF, no filter. Memory-heavy: France-wide needs ≥40 GB heap.</option>
               </select>
               <p class="hint" style="margin-top: 0.25rem">
                 Filter runs in the otp-build container via osmium-tool, before OTP parses
                 the PBF. It cuts the data OTP has to hold in heap, not the routing accuracy
                 — transit-focused keeps all roads + railways + public-transport amenities.
+                <code>rail-focused</code> goes further: drops every drivable road and keeps
+                only railways + walking-only paths + station amenities. ~80 % data
+                reduction; the only scope that fits a 10-country EU merge in 24-28 GB heap
+                on a 47 GB box. Trade-off: OTP can't compute walking from arbitrary
+                addresses (driveable roads are gone), so the journey UI's free-text address
+                search loses precision — fine for station-to-station rail demonstrators.
                 Default for new sessions: <code>transit-focused</code>.
               </p>
               {# v0.1.21 — `transitModelTimeZone`. OTP 2.9 refuses to build a
