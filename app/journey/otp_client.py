@@ -49,7 +49,21 @@ query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $tim
         endTime
         from { name lat lon stop { gtfsId } }
         to   { name lat lon stop { gtfsId } }
-        route { shortName longName }
+        route {
+          gtfsId
+          shortName
+          longName
+          # v0.1.26: surface the operator on each leg so the journey UI
+          # can show "SNCF" / "Trenitalia" / "Eurostar" instead of just
+          # the route number. agency.gtfsId comes back as "<feedId>:<id>"
+          # so we can also derive which session-level feed a leg came
+          # from (useful for "why isn't Trenitalia showing" diagnosis).
+          agency { gtfsId name url }
+        }
+        # trip.gtfsId is "<feedId>:<trip_id>" — the feedId prefix tells
+        # us which provider the trip came from regardless of whether
+        # agency.gtfsId is set (some feeds don't populate agency).
+        trip { gtfsId tripHeadsign }
         duration
         distance
       }
@@ -113,10 +127,24 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
       from_name/lat/lon/stop_id  origin endpoint
       to_name/lat/lon/stop_id    destination endpoint
       route_short_name / route_long_name  e.g. "601A" / "Paris - Lyon TGV"
+      route_id           "<feed>:<route>" — full namespaced GTFS id (v0.1.26)
+      agency_name        operator-facing name e.g. "SNCF", "Trenitalia" (v0.1.26)
+      agency_id          "<feed>:<agency_id>" full GTFS id (v0.1.26)
+      feed_id            extracted from trip.gtfsId prefix — answers
+                         "which session-level feed did this leg come from"
+                         even when agency.name is null (v0.1.26)
+      trip_headsign      e.g. "Marseille via Lyon" (v0.1.26)
+      trip_id            "<feed>:<trip>" — full namespaced GTFS trip id (v0.1.26)
 
     The journey UI's expandable detail (v0.1.7.x) reads these directly.
     Keep the field shapes stable — they're stored verbatim in
     `journey_trips.legs` (JSONB) for replay / audit.
+
+    v0.1.26 also attaches the raw OTP itinerary slice as `_raw_itinerary`
+    on each trip so the UI's JSON inspector can show OTP's exact reply
+    without an extra round-trip. The `_` prefix marks it as
+    presentation-layer-only — the recorder ignores fields starting with
+    underscore when persisting trips to journey_trips.legs.
     """
     its = (((raw or {}).get("data") or {}).get("plan") or {}).get("itineraries") or []
     out: list[dict[str, Any]] = []
@@ -127,6 +155,17 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
             f = leg.get("from") or {}
             t = leg.get("to") or {}
             route = leg.get("route") or {}
+            agency = route.get("agency") or {}
+            trip_obj = leg.get("trip") or {}
+            # Derive feed_id from trip.gtfsId. Format is "<feedId>:<localId>"
+            # — same convention OTP uses for stop_id, route_id, agency_id.
+            # When the feed itself doesn't populate agency, this gives us
+            # a reliable fallback indicator of which provider ingested
+            # this leg.
+            trip_gtfs_id = trip_obj.get("gtfsId") or ""
+            feed_id_from_trip = (
+                trip_gtfs_id.split(":", 1)[0] if ":" in trip_gtfs_id else None
+            )
             legs_norm.append(
                 {
                     "mode": leg.get("mode"),
@@ -144,6 +183,14 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
                     "to_stop_id": ((t.get("stop") or {}).get("gtfsId")),
                     "route_short_name": route.get("shortName"),
                     "route_long_name": route.get("longName"),
+                    "route_id": route.get("gtfsId"),
+                    # v0.1.26 — operator visibility on each leg.
+                    "agency_name": agency.get("name"),
+                    "agency_id": agency.get("gtfsId"),
+                    "agency_url": agency.get("url"),
+                    "feed_id": feed_id_from_trip,
+                    "trip_id": trip_gtfs_id or None,
+                    "trip_headsign": trip_obj.get("tripHeadsign"),
                 }
             )
             if leg.get("mode"):
@@ -158,6 +205,12 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
                 "arrival_at": _ms_to_iso(it.get("endTime")) or "",
                 "modes": ",".join(sorted(set(modes_set))),
                 "legs": legs_norm,
+                # v0.1.26 — raw OTP itinerary slice for the JSON inspector
+                # in the journey UI. Underscore prefix marks it as
+                # presentation-layer-only; recorder.persist_trip() drops
+                # any keys starting with underscore before INSERTing into
+                # journey_trips so the JSONB column stays stable.
+                "_raw_itinerary": it,
             }
         )
     return out

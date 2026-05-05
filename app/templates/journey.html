@@ -34,6 +34,56 @@
 .suggestions.show { display: block; }
 .suggestion { padding: 0.4rem 0.6rem; cursor: pointer; }
 .suggestion:hover, .suggestion.active { background: #eef2f8; }
+/* v0.1.26 — operator/agency badge on each leg. Color-coded per feed_id
+   prefix so SNCF / TRENITALIA / EUROSTAR / RENFE / IDFM show
+   distinctly at a glance. Falls back to a neutral grey for unknown
+   feeds. The same colour scheme applies to the per-trip operator
+   summary chip. */
+.op-badge {
+  display: inline-flex; align-items: center; gap: 0.2rem;
+  padding: 0.05rem 0.45rem; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.3px;
+  white-space: nowrap; vertical-align: middle;
+  background: #eef0f2; color: #57606a; border: 1px solid #d0d7de;
+}
+.op-badge[data-feed^="SNCF"]       { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
+.op-badge[data-feed^="TRENITALIA"] { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
+.op-badge[data-feed^="EUROSTAR"]   { background: #fff4d6; color: #9a6700; border-color: #f5d56b; }
+.op-badge[data-feed^="RENFE"]      { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
+.op-badge[data-feed^="IDFM"]       { background: #e8f0fb; color: #1F3B66; border-color: #c5d6f0; }
+.op-badge[data-feed^="ZENBUS"]     { background: #e9f6ec; color: #1a7e3c; border-color: #c0e6c8; }
+.op-badge[data-feed^="RGION"]      { background: #ddf4ff; color: #0969da; border-color: #b6e3ff; }
+.op-summary { margin-top: 0.3rem; display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; font-size: 0.78rem; color: var(--rail-steel); }
+/* JSON inspector button + modal — top-right of each trip card. */
+.trip-card .top-actions { display: flex; gap: 0.4rem; align-items: center; }
+.json-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.75rem; font-weight: 600;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid #d0d7de; background: #f6f8fa; color: #57606a;
+  border-radius: 4px; cursor: pointer;
+}
+.json-btn:hover { background: #eef2f8; color: var(--uic-blue); border-color: var(--uic-blue); }
+.json-modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center; z-index: 1000;
+}
+.json-modal-backdrop[hidden] { display: none; }
+.json-modal {
+  background: #fff; border-radius: 6px; width: min(900px, 92vw); max-height: 92vh;
+  overflow: hidden; display: flex; flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+}
+.json-modal-header { display: flex; justify-content: space-between; align-items: center;
+  padding: 0.7rem 1rem; border-bottom: 1px solid var(--sleeper); }
+.json-modal-header h3 { margin: 0; font-size: 1rem; }
+.json-modal-body { padding: 0; overflow: auto; flex: 1; }
+.json-modal-body pre {
+  margin: 0; padding: 1rem; font-size: 0.78rem; line-height: 1.4;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  background: #f6f8fa; color: #24292f;
+}
 {% endblock %}
 
 {% block content %}
@@ -68,6 +118,23 @@
 
   <div class="results" id="results">
     <p style="color: var(--rail-steel)">Pick origin and destination, then Search.</p>
+  </div>
+</div>
+
+{# v0.1.26 — JSON inspector modal. Renders the raw OTP itinerary for
+   the clicked trip card so operators can see exactly what OTP returned
+   (useful for "where did this leg get its operator from" / "why isn't
+   this trip showing the right route" / general debugging). The {}
+   button on each trip card opens this. Hidden by default. #}
+<div id="json-modal" class="json-modal-backdrop" hidden>
+  <div class="json-modal" role="dialog" aria-modal="true">
+    <div class="json-modal-header">
+      <h3 id="json-modal-title">OTP itinerary</h3>
+      <button type="button" class="secondary" data-action="json-modal-close" title="Close (Esc)" style="padding: 0.2rem 0.6rem">×</button>
+    </div>
+    <div class="json-modal-body">
+      <pre id="json-modal-pre"></pre>
+    </div>
   </div>
 </div>
 {% endblock %}
@@ -193,37 +260,95 @@ function fmtDistance(m) {
   return ` · ${(m/1000).toFixed(1)} km`;
 }
 
+// v0.1.26 — operator badge derived from feed_id (preferred) with
+// agency_name fallback when the GTFS publisher populated agency.txt.
+// Skips entirely for WALK legs (no operator).
+function operatorBadge(lg) {
+  if (lg.mode === 'WALK') return '';
+  const feed = lg.feed_id || '';
+  const display = lg.agency_name || lg.feed_id || '?';
+  return `<span class="op-badge" data-feed="${escHTML(feed)}" title="feed_id: ${escHTML(feed || '?')}${lg.agency_id ? ' · agency_id: ' + escHTML(lg.agency_id) : ''}">${escHTML(display)}</span>`;
+}
+
 function legsHTML(legs) {
-  // One row per leg. Walking is shown as a short hop; transit shows route name + stops.
+  // One row per leg. Walking is shown as a short hop; transit shows
+  // operator badge (v0.1.26) + route name + stops.
   return legs.map(lg => {
     const mode = lg.mode || '?';
     const route = lg.route_short_name
       ? `${escHTML(lg.route_short_name)}${lg.route_long_name ? ' <span style="color:var(--rail-steel); font-weight: normal">' + escHTML(lg.route_long_name) + '</span>' : ''}`
       : (mode === 'WALK' ? 'Walk' : escHTML(mode));
     const stops = `${escHTML(lg.from_name || '—')} <span style="color:var(--rail-steel)">→</span> ${escHTML(lg.to_name || '—')}`;
+    const op = operatorBadge(lg);
     return `<div class="leg-row">
       <span class="leg-mode ${escHTML(mode)}">${escHTML(mode)}</span>
       <span class="leg-time">${fmtTime(lg.departure)} → ${fmtTime(lg.arrival)}</span>
-      <span class="leg-route">${route}</span>
+      <span class="leg-route">${op}${op ? ' ' : ''}${route}</span>
       <span class="leg-stops">${stops}</span>
       <span class="leg-meta">${dur(lg.duration_seconds)}${fmtDistance(lg.distance_meters)}</span>
     </div>`;
   }).join('');
 }
 
+// v0.1.26 — collect distinct operators seen across all legs of an
+// itinerary, in order of first appearance, deduped. Surfaces at the
+// top of the trip card so the operator can answer "is Trenitalia in
+// my results?" at a glance without expanding every card.
+function operatorsForTrip(legs) {
+  const seen = new Map();  // feed_id → display name
+  for (const lg of legs || []) {
+    if (lg.mode === 'WALK') continue;
+    const feed = lg.feed_id || '?';
+    if (seen.has(feed)) continue;
+    seen.set(feed, lg.agency_name || feed);
+  }
+  return Array.from(seen.entries()).map(([feed, name]) =>
+    `<span class="op-badge" data-feed="${escHTML(feed)}">${escHTML(name)}</span>`
+  ).join(' ');
+}
+
+// v0.1.26 — JSON inspector. Stash the full payload globally so the
+// click handler can pull the matching trip's _raw_itinerary on demand.
+let _LAST_PAYLOAD = null;
+
 function render(payload) {
+  _LAST_PAYLOAD = payload;
   const el = document.getElementById('results');
   const exec = payload.executions.map(e =>
     `${e.session_id}: ${e.num_itineraries} trips in ${e.response_ms}ms (${e.status})`
   ).join(' · ');
+  // v0.1.26 — overall operator summary for the result set. Answers
+  // "is Trenitalia in my results?" without expanding every card.
+  const allFeeds = new Map();
+  for (const t of payload.trips) {
+    for (const lg of t.best.legs || []) {
+      if (lg.mode === 'WALK') continue;
+      const feed = lg.feed_id || '?';
+      allFeeds.set(feed, (allFeeds.get(feed) || 0) + 1);
+    }
+  }
+  const opSummary = allFeeds.size
+    ? `<div class="op-summary">Operators in results: ${
+        Array.from(allFeeds.entries())
+          .sort((a, b) => b[1] - a[1])
+          .map(([f, n]) => `<span class="op-badge" data-feed="${escHTML(f)}">${escHTML(f)} <span style="opacity:0.7; font-weight: normal">×${n}</span></span>`)
+          .join(' ')
+      }</div>`
+    : '';
   const cards = payload.trips.map((t, i) => {
     const flag = t.origin_flag.replace('_', '-');
     const legCount = t.best.legs.length;
+    const tripOps = operatorsForTrip(t.best.legs);
     return `<div class="trip-card" data-trip-index="${i}">
       <div class="top">
         <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
              <span style="color: var(--rail-steel)"> · ${dur(t.best.duration_seconds)}</span></div>
-        <span class="flag ${flag}">${t.origin_flag}</span>
+        <div class="top-actions">
+          ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
+          <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
+                  title="Show OTP JSON for this itinerary">{}</button>
+          <span class="flag ${flag}">${t.origin_flag}</span>
+        </div>
       </div>
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
         ${t.best.modes || '—'} · ${legCount} leg${legCount===1?'':'s'} ·
@@ -235,16 +360,57 @@ function render(payload) {
       </div>
     </div>`;
   }).join('');
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${cards || '<p>No itineraries found.</p>'}`;
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cards || '<p>No itineraries found.</p>'}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable.
   el.querySelectorAll('.trip-card').forEach(card => {
-    card.addEventListener('click', () => {
+    card.addEventListener('click', (e) => {
+      // v0.1.26 — JSON button click bubbles up through the card; suppress
+      // the expand-toggle so the button click only opens the modal.
+      if (e.target.closest('[data-action="show-json"]')) return;
       const wasOpen = card.classList.contains('expanded');
       el.querySelectorAll('.trip-card.expanded').forEach(c => c.classList.remove('expanded'));
       if (!wasOpen) card.classList.add('expanded');
     });
   });
+  // v0.1.26 — wire the {} buttons.
+  el.querySelectorAll('[data-action="show-json"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = parseInt(btn.dataset.tripIndex, 10);
+      showJsonInspector(idx);
+    });
+  });
 }
+
+// v0.1.26 — open the JSON inspector modal for a specific trip.
+function showJsonInspector(tripIndex) {
+  const payload = _LAST_PAYLOAD;
+  if (!payload) return;
+  const t = payload.trips[tripIndex];
+  if (!t) return;
+  // Prefer the raw OTP itinerary slice (v0.1.26 _raw_itinerary). Fall
+  // back to the normalised trip if missing — works for legacy snapshots
+  // pre-v0.1.26 that don't carry _raw_itinerary.
+  const raw = t.best._raw_itinerary || t.best;
+  const text = JSON.stringify(raw, null, 2);
+  document.getElementById('json-modal-title').textContent =
+    `OTP itinerary #${tripIndex + 1} — ${t.origin_flag} · found in: ${t.found_in_sessions.join(', ')}`;
+  document.getElementById('json-modal-pre').textContent = text;
+  document.getElementById('json-modal').hidden = false;
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.matches('[data-action="json-modal-close"]') ||
+      e.target.matches('.json-modal-backdrop')) {
+    document.getElementById('json-modal').hidden = true;
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const m = document.getElementById('json-modal');
+    if (m && !m.hidden) m.hidden = true;
+  }
+});
 </script>
 {% endblock %}

@@ -793,7 +793,69 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.25 (latest)**: CI Trivy gate fix — unblocks v0.1.24 OTP image release.
+**v0.1.26 (latest)**: operator visibility + JSON inspector on journey results.
+
+Operator feedback after v0.1.25's timeout fix unblocked Paris→Marseille
+searches: "I can see the route number `631B` and the long name
+`Paris-Marseille-Toulon TGV` but I can't tell at a glance whether each
+trip is SNCF, Trenitalia, Eurostar etc. — and I can't tell whether
+Trenitalia is even appearing in the result set."
+
+Three changes:
+
+1. **Operator/agency visible on every leg** — coloured pill next to
+   the route number. Derived from OTP's `route.agency.name` (when the
+   feed populates `agency.txt`) with a fallback to the feed_id prefix
+   extracted from `trip.gtfsId`. Walk legs skip the badge (no
+   operator). Pill colour-coded per feed: SNCF red, Trenitalia red,
+   Eurostar amber, RENFE red, IDFM blue, regional rails sky blue,
+   ZenBus green — matches operator brand conventions where reasonable.
+
+2. **Per-result-set operator summary** — at the top of the journey
+   results, a chip line "Operators in results: SNCF ×8 · TRENITALIA ×1
+   · IDFM ×3" (counts = legs, not trips). Answers "is Trenitalia in
+   my results?" without expanding every card. Hidden when no transit
+   legs are returned.
+
+3. **JSON inspector** — `{}` button top-right of every trip card →
+   modal with formatted JSON of the raw OTP itinerary slice. Useful
+   for "where did this leg get its operator from", "why is the
+   tripHeadsign weird", general transparency. ESC or click-outside
+   to close. The full multi-itinerary OTP response is also still
+   stored at the execution level in `journey_search_executions.
+   raw_response` for SQL-side audit (controlled by
+   `STORE_RAW_RESPONSE`).
+
+**Backend changes**: `app/journey/otp_client.py` GraphQL query now
+fetches `route { agency { gtfsId name url } gtfsId }` and
+`trip { gtfsId tripHeadsign }` in addition to existing fields.
+`_normalise` extracts these into per-leg keys: `agency_name`,
+`agency_id`, `agency_url`, `feed_id` (derived from `trip.gtfsId`
+prefix), `trip_id`, `trip_headsign`, `route_id`. Each trip also
+carries an `_raw_itinerary` slice for the JSON inspector — underscore-
+prefixed so the recorder skips it when persisting to
+`journey_trips.legs`.
+
+**Schema impact**: the new keys are added to `journey_trips.legs`
+JSONB on every successful search going forward. Existing rows in
+the table predate v0.1.26 and don't have these keys; the UI's leg
+renderer treats them all as optional so historical replay works.
+
+**Diagnostic value for the "Trenitalia missing" question**: with
+v0.1.26 in place, the result-set operator summary at the top
+immediately answers "is Trenitalia in my results?". If it's missing
+from the badge line, click `{}` on the closest-time trip card and
+look at the legs' `feed_id` / `agency_name` to confirm. If still
+missing, root cause is one of:
+  * Trenitalia GTFS service-calendar window doesn't cover the search
+    date (check the build log's `ServiceCalendar(s) removed` line for
+    TRENITALIA — see §6.7).
+  * No Paris→Marseille service in their feed (their
+    Paris-Lyon-Marseille extension may not be in the version on NAP).
+  * The feed's `route_type` is something OTP doesn't classify as RAIL
+    and the search modes filter cuts it out.
+
+**v0.1.25**: CI Trivy gate fix — unblocks v0.1.24 OTP image release.
 
 v0.1.24's CI ran into a `trivy-action@v0.36.0` bug: when both
 `format: sarif` and `severity: CRITICAL,HIGH` are set on the same step,
