@@ -17,12 +17,12 @@ d'intérêt national" tier in the legend. 23 stations chosen to give:
   * **Two non-LGV centers** (Clermont-Ferrand, Brest) to surface where
     TER coverage is weak
 
-23 x 22 / 2 = 253 ordered pairs (we run both directions to surface
+26 x 25 / 2 = 325 ordered pairs (we run both directions to surface
 asymmetric data — a Paris→Marseille that works while Marseille→Paris
 fails is a real bug we want to catch). Total pair count in the matrix
-= 23 x 23 = 529 cells minus 23 diagonal = 506 routed cells — but we
-only RUN the 253 unique unordered pairs and double-render in the
-matrix view. (Or, optionally, run all 506 — see runner.py.)
+= 26 x 26 = 676 cells minus 26 diagonal = 650 routed cells — but we
+only RUN the 325 unique unordered pairs and double-render in the
+matrix view. (Or, optionally, run all 650 — see runner.py.)
 
 Coordinates are approximate (within ~50 m, sufficient for OTP's
 location-resolver). They're hardcoded here rather than looked up from
@@ -59,10 +59,19 @@ class Hub(NamedTuple):
 # build up over time.
 HUBS: list[Hub] = [
     # ─── Paris terminals (radial heart of the network) ────────────────
+    # All six SNCF Paris termini except Bercy (which is a small TGV-Sud
+    # offshoot used mainly for night trains + Bourgogne services and
+    # adds little distinct routing signal vs Gare de Lyon).
     Hub("paris-gdl", "Paris Gare de Lyon", "P-GdL", "Paris", 48.8443, 2.3739),
     Hub("paris-nord", "Paris Gare du Nord", "P-Nord", "Paris", 48.8809, 2.3554),
     Hub("paris-est", "Paris Gare de l'Est", "P-Est", "Paris", 48.8767, 2.3593),
     Hub("paris-mont", "Paris Montparnasse", "P-Mtp", "Paris", 48.8410, 2.3219),
+    # v0.1.28: previously missed. Austerlitz is the gateway to south-
+    # central France (the historic POLT line — Paris-Orléans-Limoges-
+    # Toulouse). Saint-Lazare runs Normandie services (Caen, Rouen,
+    # Le Havre) and dense Île-de-France suburbs.
+    Hub("paris-aust", "Paris Gare d'Austerlitz", "P-Aust", "Paris", 48.8421, 2.3652),
+    Hub("paris-stl", "Paris Saint-Lazare", "P-StL", "Paris", 48.8757, 2.3252),
     # ─── North / North-East ──────────────────────────────────────────
     Hub("lille-flandres", "Lille Flandres", "Lille", "NE", 50.6357, 3.0712),
     Hub("reims", "Reims", "Reims", "NE", 49.2585, 4.0335),
@@ -87,6 +96,12 @@ HUBS: list[Hub] = [
     Hub("nantes", "Nantes", "Nantes", "W", 47.2173, -1.5424),
     Hub("rennes", "Rennes", "Rennes", "W", 48.1031, -1.6724),
     Hub("brest", "Brest", "Brest", "W", 48.3886, -4.4789),
+    # v0.1.28: a personal pick — small TER halt on the Le Croisic branch
+    # off the Saint-Nazaire / La Baule line, in the Guérande peninsula.
+    # Useful counterweight to the all-major-hub matrix because it forces
+    # the longer "Paris → big hub → small terminal" routing OTP often
+    # struggles with on regional GTFS calendars.
+    Hub("batz", "Batz-sur-Mer", "Batz", "W", 47.2774, -2.4844),
 ]
 
 

@@ -91,10 +91,11 @@
 {% block content %}
 <h1>Network coverage</h1>
 <p style="color: var(--rail-steel); max-width: 70ch">
-  Runs systematic A→B journey searches across {{ '23' }} major French rail hubs (4 Paris terminals + 19
-  regional capitals). 23×22 = 506 directional pairs per run; ~10–15 minutes wallclock with bounded parallelism.
-  Each Run is keyed to a session — run the same matrix against multiple sessions to compare coverage between
-  data sources (NAP vs MERITS vs experimental imports).
+  Runs systematic A→B journey searches across {{ '26' }} curated French rail hubs (6 Paris terminals
+  + 19 regional capitals + 1 small TER halt as a local-coverage stress test). 26×25 = 650 directional
+  pairs per run; ~13–18 minutes wallclock with bounded parallelism. Each Run is keyed to a session —
+  run the same matrix against multiple sessions to compare coverage between data sources (NAP vs
+  MERITS vs experimental imports).
 </p>
 
 <div class="cov-grid">
@@ -113,11 +114,11 @@
         <label>Departure</label>
         <input type="datetime-local" name="depart_at" id="cov-depart">
         <label>Direction
-          <span class="hint" style="font-weight: normal">(both = 506 pairs · single = 253)</span>
+          <span class="hint" style="font-weight: normal">(both = 650 pairs · single = 325)</span>
         </label>
         <select name="direction">
-          <option value="both" selected>Both directions (506 pairs)</option>
-          <option value="single">Single direction only (253 pairs)</option>
+          <option value="both" selected>Both directions (650 pairs)</option>
+          <option value="single">Single direction only (325 pairs)</option>
         </select>
         <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
       </form>

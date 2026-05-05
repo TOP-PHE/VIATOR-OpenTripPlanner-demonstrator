@@ -793,7 +793,36 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.27 (latest)**: Network coverage matrix admin page.
+**v0.1.28 (latest)**: Network coverage hub-list expansion (23 → 26).
+
+Operator review of the v0.1.27 hub list flagged two missing Paris
+terminals — **Gare d'Austerlitz** (gateway to south-central France via
+the historic POLT line, plus Orléans / Bordeaux historic-route services)
+and **Saint-Lazare** (Normandie services + dense Île-de-France suburbs).
+Both added.
+
+Also added **Batz-sur-Mer** as a small-TER-halt coverage stress test —
+it's a local stop on the Le Croisic branch in the Guérande peninsula,
+the kind of regional terminal where TGV-anchored sessions often fall
+back to "Paris transfer + 2h TER" itineraries that exercise different
+parts of the routing graph than direct big-hub pairs do.
+
+New totals:
+- **26 hubs** (up from 23): 6 Paris terminals + 19 regional capitals + 1
+  small TER halt
+- **650 directional pairs** (up from 506) — `n × (n-1)` matrix size
+- **325 unordered pairs** (single-direction mode) — `n × (n-1) / 2`
+- Wallclock estimate: **~13-18 min** for both-directions on a France-wide
+  multi-NAP session at parallelism=5 (up from ~10-15 min for 23 hubs)
+
+The `hub_set` field on each run is now stored as `"fr-major-26"` so
+v0.1.27 runs (`"fr-major-23"`) and v0.1.28+ runs are distinguishable in
+the database — important for cross-version comparison sanity. Older
+runs will still render in the matrix (the UI overlays cells onto
+whatever hub list the run was generated against), so no historical
+data is lost.
+
+**v0.1.27**: Network coverage matrix admin page.
 
 A new feature for systematically testing how well a session covers the
 French rail network. Runs all-pairs A→B journey searches across 23

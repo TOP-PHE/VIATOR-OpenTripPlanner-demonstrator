@@ -78,7 +78,12 @@ def create_run(
         session_id=session_id,
         session_label=session_id,
         depart_at=depart_at,
-        hub_set="fr-major-23",
+        # v0.1.28: hub_set reflects how many hubs are in the curated
+        # list at run-creation time. v0.1.27 had 23; v0.1.28 added Paris
+        # Austerlitz, Paris Saint-Lazare, and Batz-sur-Mer = 26. Stored
+        # so the matrix view can refuse to render a v0.1.27 run with
+        # the v0.1.28 hub layout (which would mis-align cells).
+        hub_set="fr-major-26",
         direction=direction,
         status="pending",
         total_pairs=len(pairs),

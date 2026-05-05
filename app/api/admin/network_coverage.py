@@ -1,8 +1,8 @@
-"""Network-coverage admin API (v0.1.27).
+"""Network-coverage admin API (v0.1.27 / hub-set bumped to 26 in v0.1.28).
 
 Endpoints:
 
-  GET  /api/admin/network-coverage/hubs        — return the curated 23-hub list
+  GET  /api/admin/network-coverage/hubs        — return the curated 26-hub list
   GET  /api/admin/network-coverage/runs        — list past runs (newest first)
   POST /api/admin/network-coverage/runs        — start a new coverage run
   GET  /api/admin/network-coverage/runs/{id}   — fetch a run + its results
@@ -14,7 +14,7 @@ need this surface).
 Background execution: POST /runs creates the row in pending state and
 schedules `runner.execute_run` via FastAPI's BackgroundTasks. The UI
 polls GET /runs/{id} every 5s to render progress; status flips to
-"completed" when all 506 (or 253) pairs have processed.
+"completed" when all 650 (or 325) pairs have processed.
 """
 
 from __future__ import annotations

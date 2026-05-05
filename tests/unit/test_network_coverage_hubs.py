@@ -11,10 +11,11 @@ from app.network_coverage.hubs import (
 
 
 def test_hub_count_matches_design():
-    """23 hubs is the v0.1.27 size budget. If this changes, the matrix
-    grows quadratically — check whether the runtime budget still works
-    (n=23 → 506 directional pairs → ~10 min wallclock at concurrency=5)."""
-    assert len(HUBS) == 23
+    """26 hubs as of v0.1.28 (added Paris Austerlitz + Saint-Lazare and
+    Batz-sur-Mer to the original 23). If this changes, the matrix grows
+    quadratically — check whether the runtime budget still works
+    (n=26 -> 650 directional pairs -> ~13 min wallclock at concurrency=5)."""
+    assert len(HUBS) == 26
 
 
 def test_all_hub_ids_unique():
@@ -51,18 +52,18 @@ def test_hubs_by_id_lookup():
 
 
 def test_all_pairs_is_n_times_n_minus_1():
-    """All-pairs (directional) = n x (n-1). For 23 hubs -> 506 pairs."""
+    """All-pairs (directional) = n x (n-1). For 26 hubs -> 650 pairs."""
     pairs = all_pairs()
-    assert len(pairs) == 23 * 22  # 506
+    assert len(pairs) == 26 * 25  # 650
     # No self-pairs.
     for a, b in pairs:
         assert a.id != b.id
 
 
 def test_unordered_pairs_is_n_choose_2():
-    """Unordered pairs = n x (n-1) / 2. For 23 hubs -> 253 pairs."""
+    """Unordered pairs = n x (n-1) / 2. For 26 hubs -> 325 pairs."""
     pairs = unordered_pairs()
-    assert len(pairs) == 23 * 22 // 2  # 253
+    assert len(pairs) == 26 * 25 // 2  # 325
     # No self-pairs.
     for a, b in pairs:
         assert a.id != b.id
@@ -80,17 +81,26 @@ def test_unordered_pairs_no_duplicates():
 
 
 def test_paris_terminals_all_present():
-    """Curated minimum: the four Paris terminals must always be in the
-    list — they're the radial heart of the network."""
+    """Curated minimum: the six Paris terminals (excluding tiny Bercy)
+    must always be in the list — they're the radial heart of the
+    network. v0.1.27 had four; v0.1.28 added Austerlitz + Saint-Lazare."""
     paris_ids = {h.id for h in HUBS if h.id.startswith("paris-")}
-    assert paris_ids == {"paris-gdl", "paris-nord", "paris-est", "paris-mont"}
+    assert paris_ids == {
+        "paris-gdl",
+        "paris-nord",
+        "paris-est",
+        "paris-mont",
+        "paris-aust",
+        "paris-stl",
+    }
 
 
 def test_user_explicit_additions_present():
-    """The operator explicitly asked for Brest, Clermont-Ferrand,
-    Narbonne to be included for v0.1.27. Pin so they don't get dropped
-    in a future hub-list refactor."""
-    must_be_in = {"brest", "clermont", "narbonne"}
+    """Operator-explicit additions across versions:
+      v0.1.27 → Brest, Clermont-Ferrand, Narbonne
+      v0.1.28 → Paris-Austerlitz, Paris-Saint-Lazare, Batz-sur-Mer
+    Pin so they don't get dropped in a future hub-list refactor."""
+    must_be_in = {"brest", "clermont", "narbonne", "paris-aust", "paris-stl", "batz"}
     actual = {h.id for h in HUBS}
     assert must_be_in.issubset(actual), f"missing: {must_be_in - actual}"
 
