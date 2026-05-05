@@ -37,13 +37,9 @@ log = logging.getLogger(__name__)
 # queries (typically still <1 s for inter-city), but the demonstrator
 # value of seeing 6-8 alternatives outweighs it.
 _QUERY = """
-query Plan(
-    $from: InputCoordinates!, $to: InputCoordinates!,
-    $date: String, $time: String,
-    $numItineraries: Int = 8, $searchWindow: Int = 14400
-) {
+query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $time: String) {
   plan(from: $from, to: $to, date: $date, time: $time,
-       numItineraries: $numItineraries, searchWindow: $searchWindow) {
+       numItineraries: __NUM_ITINERARIES__, searchWindow: __SEARCH_WINDOW__) {
     itineraries {
       duration
       startTime
@@ -105,16 +101,27 @@ async def fetch_plan(
     network-coverage runner to fetch the full day's worth of trains for
     each pair in one call (50 itineraries / 24h window) instead of the
     "next ~hour, top 8" the live UI wants.
+
+    v0.1.29.1: substituted into the query string at call time rather than
+    passed as GraphQL variables. The first attempt declared
+    `$searchWindow: Int` but OTP's GTFS schema has `searchWindow: Long` —
+    when fed via a typed Int variable, the field was silently dropped and
+    OTP fell back to a tiny search window, returning 0 itineraries on
+    every pair (cured by going back to inline literals which OTP coerces
+    correctly into the Long field).
     """
+    query = _QUERY.replace(
+        "__NUM_ITINERARIES__", str(int(num_itineraries))
+    ).replace(
+        "__SEARCH_WINDOW__", str(int(search_window_seconds))
+    )
     payload = {
-        "query": _QUERY,
+        "query": query,
         "variables": {
             "from": {"lat": from_lat, "lon": from_lon},
             "to": {"lat": to_lat, "lon": to_lon},
             "date": when.strftime("%Y-%m-%d"),
             "time": when.strftime("%H:%M"),
-            "numItineraries": num_itineraries,
-            "searchWindow": search_window_seconds,
         },
     }
     # OTP 2.9 GTFS GraphQL endpoint. Note: it is `/otp/gtfs/v1`, NOT
