@@ -160,10 +160,22 @@ def admin_sessions_page(
     if user.role != "platform_admin":
         return _forbidden_html(request, "Platform admin access required.")
     sessions = db.execute(select(SessionRow).order_by(SessionRow.created_at)).scalars().all()
+    # v0.1.32 — pass the canonical OSM scope presets through to the
+    # template so the dropdown auto-renders from the Python config
+    # instead of hardcoding the option rows. Eliminates the v0.1.30
+    # footgun where adding "rail-focused" worked at the API/runner
+    # layer but the UI dropdown didn't expose it (form was hand-written
+    # with three options and missed the new one).
+    from .. import osm_filter
+
     return templates.TemplateResponse(
         request,
         "admin/sessions.html",
-        {"current_user": user, "sessions": sessions},
+        {
+            "current_user": user,
+            "sessions": sessions,
+            "osm_scope_presets": osm_filter.OSM_SCOPE_PRESETS,
+        },
     )
 
 

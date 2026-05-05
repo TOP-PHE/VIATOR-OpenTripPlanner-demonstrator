@@ -68,6 +68,10 @@ DEFAULT_SCOPE = "transit-focused"
 OSM_SCOPE_PRESETS: dict[str, dict[str, Any]] = {
     "transit-focused": {
         "label": "Transit-focused (recommended)",
+        # v0.1.32 — short one-liner used in the session form's <select>
+        # dropdown. The longer `description` is kept as the operator-
+        # facing rationale we surface in tooltips / audit logs.
+        "dropdown_hint": "drops driveways, agricultural, private. Saves ~40% memory.",
         "description": (
             "Keeps walking, cycling, transit-relevant ways and rail. Drops "
             "driveways (highway=service), agricultural tracks, construction/"
@@ -87,6 +91,7 @@ OSM_SCOPE_PRESETS: dict[str, dict[str, Any]] = {
     },
     "multi-modal": {
         "label": "Multi-modal (transit + walking + cycling detail)",
+        "dropdown_hint": "keeps service roads + cycling/walking detail. ~10-20% saving.",
         "description": (
             "Keeps everything in transit-focused plus highway=service "
             "(driveways, parking lot internal roads). ~10-20 % savings vs. "
@@ -103,6 +108,7 @@ OSM_SCOPE_PRESETS: dict[str, dict[str, Any]] = {
     },
     "rail-focused": {
         "label": "Rail-focused (multi-country / low-RAM)",
+        "dropdown_hint": "drops ALL driving roads. Required for EU-scale builds on commodity VPS.",
         "description": (
             "Drops ALL driving infrastructure — no motorways, no residential, "
             "no service, no cycleway. Keeps only railways, public-transport "
@@ -137,6 +143,7 @@ OSM_SCOPE_PRESETS: dict[str, dict[str, Any]] = {
     },
     "comprehensive": {
         "label": "Comprehensive (no filter — original PBF)",
+        "dropdown_hint": "original PBF, no filter. Memory-heavy: France-wide needs ≥40 GB heap.",
         "description": (
             "Original PBF passes through unchanged. Required for car routing "
             "(motorways are kept by transit-focused too, but residential and "

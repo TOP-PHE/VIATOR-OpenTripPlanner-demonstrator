@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     admin_password: str = "admin"
     max_upload_mb: int = 2048
     debounce_seconds: int = 1800
-    otp_build_heap: str = "12g"
+    # v0.1.32 — default bumped 12g → 24g. The 12g default fit when VIATOR
+    # was France-only / single-provider (IDF-scale). With multi-NAP and
+    # EU-scale rail-focused sessions the standard case is now ~3-8
+    # providers, and 12g OOMs deep into "Intersecting unconnected areas".
+    # Operators on tight VPS dial down per-session via session.config.
+    # The .env's OTP_BUILD_HEAP override still wins; this only affects
+    # the fallback when neither env nor session config sets a value.
+    otp_build_heap: str = "24g"
 
     # JWT-based auth (step 3+)
     jwt_secret: str = "change-me-in-prod-use-32-bytes-random"

@@ -88,11 +88,20 @@
                 station names is in the journey UI — see v0.1.7.)
               </p>
               <label>OSM scope <span class="hint">(filter applied at build time)</span></label>
+              {# v0.1.32 — dropdown options auto-rendered from
+                 app/osm_filter.py's OSM_SCOPE_PRESETS dict. Adding a
+                 new preset (or relabelling one) is now a single Python
+                 edit; the form picks it up on next deploy with no
+                 template change needed. Through v0.1.30/30.1 the rows
+                 were hand-written here, which let "rail-focused" ship
+                 to the API layer in v0.1.30 without appearing in the
+                 form — a footgun caught only when the operator saved
+                 a multi-country session and the dropdown was missing
+                 the new option. #}
               <select name="osm_scope">
-                <option value="transit-focused">Transit-focused (recommended) — drops driveways, agricultural, private. Saves ~40% memory.</option>
-                <option value="multi-modal">Multi-modal — keeps service roads + cycling/walking detail. ~10-20% saving.</option>
-                <option value="rail-focused">Rail-focused (multi-country / low-RAM) — drops ALL driving roads. Required for EU-scale builds on commodity VPS.</option>
-                <option value="comprehensive">Comprehensive — original PBF, no filter. Memory-heavy: France-wide needs ≥40 GB heap.</option>
+                {% for slug, preset in osm_scope_presets.items() %}
+                  <option value="{{ slug }}">{{ preset.label }}{% if preset.dropdown_hint %} — {{ preset.dropdown_hint }}{% endif %}</option>
+                {% endfor %}
               </select>
               <p class="hint" style="margin-top: 0.25rem">
                 Filter runs in the otp-build container via osmium-tool, before OTP parses
@@ -151,15 +160,28 @@
                  because the value is read fresh from session.config every
                  build, not cached). #}
               <label>OTP build heap <span class="hint">(JVM <code>-Xmx</code> for the otp-build container)</span></label>
+              {# v0.1.32 — default bumped from 12g to 24g. The 12g default
+                 was right when VIATOR was France-only / single-provider,
+                 but with multi-NAP and EU-scale sessions the standard
+                 case is now ~3-8 providers and 24g handles that. The
+                 form's per-session save still lets operators dial down
+                 to 12g for IDF-only or up to 36g for 10+ providers /
+                 multi-country merges. #}
               <select name="otp_build_heap">
                 <option value="12g">12 GB — light: single provider, regional OSM</option>
                 <option value="16g">16 GB</option>
                 <option value="20g">20 GB</option>
-                <option value="24g">24 GB — standard: 3-8 providers, France-wide OSM</option>
-                <option value="28g">28 GB</option>
+                <option value="24g" selected>24 GB — standard (default): 3-8 providers, France-wide OSM</option>
+                <option value="28g">28 GB — multi-country / rail-focused merges</option>
                 <option value="32g">32 GB</option>
                 <option value="36g">36 GB — heavy: 10+ providers, cross-border</option>
               </select>
+              <p id="heap-warning" class="hint" style="margin-top: 0.25rem; color: #cf222e; display: none">
+                ⚠ Rail-focused multi-country sessions typically need ≥24 GB heap.
+                With the current ${selected} selection, the build is at risk of
+                OOM during the "Intersecting unconnected areas" phase. Consider
+                bumping heap before triggering Build.
+              </p>
               <p class="hint" style="margin-top: 0.25rem">
                 JVM heap for the build container. <strong>Rule of thumb</strong>: ~2 GB per
                 provider on a France-wide PBF, plus 6 GB for the street graph + ~10-15% for JVM
@@ -552,7 +574,11 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // the value is recorded in the session config (otherwise the
       // worker reads None → falls back to .env → operator-invisible).
       if (cf.elements['otp_build_heap']) {
-        cf.elements['otp_build_heap'].value = cfg.otp_build_heap || '12g';
+        // v0.1.32 — default bumped 12g → 24g to match the new sensible
+        // baseline for multi-NAP / EU-scale builds. Sessions saved with
+        // an explicit value (any version) keep their setting; only the
+        // "form opens with no value yet" path changes.
+        cf.elements['otp_build_heap'].value = cfg.otp_build_heap || '24g';
       }
       // v0.1.24: per-session OTP API processing timeout. Default '30s'
       // (bumped from the pre-v0.1.24 hardcoded 10s); legacy sessions
@@ -560,6 +586,33 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       if (cf.elements['otp_api_timeout']) {
         cf.elements['otp_api_timeout'].value = cfg.otp_api_timeout || '30s';
       }
+      // v0.1.32 — wire scope/heap watchers so the warning surfaces if
+      // the operator picks rail-focused with insufficient heap. Same
+      // event handlers re-evaluate on either field's change.
+      const _scopeEl = cf.elements['osm_scope'];
+      const _heapEl = cf.elements['otp_build_heap'];
+      const _warnEl = cf.querySelector('#heap-warning');
+      const _checkHeapWarning = () => {
+        if (!_warnEl || !_scopeEl || !_heapEl) return;
+        const scope = _scopeEl.value;
+        const heapStr = _heapEl.value || '';
+        const heapGb = parseInt(heapStr.replace(/g$/i, ''), 10) || 0;
+        // Rail-focused multi-country builds need ≥24g during the
+        // "Intersecting unconnected areas" phase. Below that the
+        // OTP/JVM either OOMs internally or the kernel oom-killer
+        // takes the JVM out (faster failure mode).
+        if (scope === 'rail-focused' && heapGb < 24) {
+          _warnEl.style.display = '';
+          _warnEl.textContent =
+            `⚠ Rail-focused needs ≥24 GB heap. Current ${heapStr} risks OOM during ` +
+            `"Intersecting unconnected areas" — bump heap before triggering Build.`;
+        } else {
+          _warnEl.style.display = 'none';
+        }
+      };
+      _scopeEl?.addEventListener('change', _checkHeapWarning);
+      _heapEl?.addEventListener('change', _checkHeapWarning);
+      _checkHeapWarning();   // run once on form open
       // Show / hide the staleness banner based on the persisted _meta.
       setStalenessBanner(sid);
       // Auto-load the jobs list on first expand

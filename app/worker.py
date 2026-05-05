@@ -44,8 +44,64 @@ _RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 _DOCKER = "/usr/local/bin/docker"
 
 
+def _mark_orphaned_rebuild_jobs() -> int:
+    """v0.1.32 — terminate rebuild_jobs left mid-flight by a worker restart.
+
+    Same shape as the v0.1.29.3 fix for network_coverage_runs. The worker
+    runs `docker compose run otp-build` synchronously per job and updates
+    rebuild_jobs.status as it progresses (pending → running → done|failed).
+    If the worker container is killed mid-build (deploy, OOM, manual
+    restart), the otp-build container also dies but the rebuild_jobs row
+    stays in `running` forever — operators see ghost "still building"
+    entries that never resolve, and the same session may try to queue
+    another rebuild but get blocked by the one-rebuild-per-session lock.
+
+    By the time the worker reaches its main loop, no `docker compose run`
+    invocation from a prior worker process can still be alive (subprocess
+    handles don't survive container restart), so anything in `running`
+    status at startup is by definition orphaned. Mark them `failed` with
+    a log line annotating the cleanup so post-hoc analysis is clear about
+    what happened.
+
+    Returns the number of rows marked. Caller is responsible for the
+    surrounding error handling — we don't want a startup hiccup here to
+    crash the worker.
+    """
+    from sqlalchemy import select
+
+    with SessionLocal() as db:
+        orphans = list(
+            db.execute(select(RebuildJob).where(RebuildJob.status == "running")).scalars().all()
+        )
+        if not orphans:
+            return 0
+        now = datetime.now(UTC)
+        for job in orphans:
+            existing_log = job.log or ""
+            note = (
+                f"\n--- [v0.1.32] worker startup: marked failed (orphaned by "
+                f"worker restart at {now.isoformat()}) ---\n"
+            )
+            job.log = existing_log + note
+            job.status = "failed"
+            job.finished_at = now
+        db.commit()
+        return len(orphans)
+
+
 def main() -> None:
     log.info("worker starting; debounce + tick are live-read from platform_config")
+
+    # v0.1.32 — clean up any rebuild_jobs left in `running` status by a
+    # previous worker process that died mid-build. Wrapped in try/except
+    # so a malformed row can't keep the worker from booting.
+    try:
+        n = _mark_orphaned_rebuild_jobs()
+        if n:
+            log.warning("marked %d orphaned rebuild_jobs as failed at startup", n)
+    except Exception:
+        log.exception("orphan rebuild_jobs cleanup failed at startup (non-fatal)")
+
     while True:
         try:
             tick()
