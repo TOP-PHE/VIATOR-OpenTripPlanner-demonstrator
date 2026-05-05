@@ -455,6 +455,58 @@ The "Intersecting unconnected areas..." OTP step is the single biggest
 heap moment in a France-wide build. If it survives that, the rest is
 downhill.
 
+#### 6.2.1 Multi-country sessions (v0.1.30 — `rail-focused` scope)
+
+For sessions covering more than one country (e.g. an "EU rail" session
+with FR + UK + BE + NL + DE + CH + AT + IT + ES merged into one PBF):
+the default `transit-focused` scope still keeps every drivable road in
+every country, which blows past commodity VPS heap budgets. A 10-country
+merge at `transit-focused` needs **60–80 GB heap** — too much for the
+47 GB Contabo box.
+
+**Use `OSM_SCOPE=rail-focused` instead.** It drops *all* driving
+infrastructure (motorway, primary, residential, service, cycleway) and
+keeps only:
+- All `railway=*` (tracks, stations, halts, tram stops, signals)
+- All `public_transport=*` (platforms, stop areas, station polygons)
+- Walking-only highway types: `footway / path / steps / pedestrian /
+  corridor / elevator`
+- `amenity=parking_entrance` (station forecourts — used by OTP to snap
+  city-centre coords onto a station entrance)
+
+Result: a 10-country merged PBF (~17 GB raw → ~3-4 GB filtered) builds
+comfortably at **24-28 GB heap** — the same heap your French build uses
+today.
+
+**Trade-off**: OTP can't compute walking from arbitrary addresses
+(driveable roads are gone). The journey UI's free-text address search
+loses precision; the city/station dropdown and the network-coverage
+matrix work normally because both submit station coordinates.
+
+**Sourcing the merged PBF (10-country EU example)**:
+
+```bash
+# On the VPS, in /opt/viator/inbox-staging/ (~22 GB free disk needed)
+for c in france great-britain belgium netherlands luxembourg \
+         germany austria italy switzerland spain ; do
+  wget "https://download.geofabrik.de/europe/${c}-latest.osm.pbf"
+done
+
+# Merge into one (osmium-tool handles overlaps cleanly)
+osmium merge \
+  france-latest.osm.pbf great-britain-latest.osm.pbf \
+  belgium-latest.osm.pbf netherlands-latest.osm.pbf \
+  luxembourg-latest.osm.pbf germany-latest.osm.pbf \
+  austria-latest.osm.pbf italy-latest.osm.pbf \
+  switzerland-latest.osm.pbf spain-latest.osm.pbf \
+  -o eu-rail-10c.osm.pbf
+```
+
+Then upload `eu-rail-10c.osm.pbf` to the new EU session via the
+session-creation UI with **OSM scope = Rail-focused (multi-country)**.
+The entrypoint runs the rail-focused tags-filter automatically before
+OTP sees the file.
+
 ### 6.3 Per-session OTP container 503s on first request
 
 Cause: graph not loaded yet. Check the logs:

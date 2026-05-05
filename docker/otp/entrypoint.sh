@@ -124,12 +124,27 @@ case "$MODE" in
                             'public_transport' \
                             'amenity=parking,parking_entrance'
                         ;;
+                    rail-focused)
+                        # v0.1.30 — drops ALL driving infrastructure (no
+                        # motorway/primary/residential/service/cycleway).
+                        # ~80 % smaller than raw PBF; the only scope that
+                        # lets a 10-country EU merge fit in ~24-28 GB build
+                        # heap on a 47 GB box. See app/osm_filter.py for
+                        # the rationale and trade-offs.
+                        echo "OSM filter: rail-focused — running osmium tags-filter on $(basename "$pbf_in")"
+                        osmium tags-filter --overwrite \
+                            -o "$pbf_out" "$pbf_in" \
+                            'railway' \
+                            'public_transport' \
+                            'highway=footway,path,steps,pedestrian,corridor,elevator' \
+                            'amenity=parking_entrance'
+                        ;;
                     comprehensive)
                         echo "OSM filter: comprehensive — passing $(basename "$pbf_in") through unchanged"
                         cp "$pbf_in" "$pbf_out"
                         ;;
                     *)
-                        echo "Unknown OTP_OSM_SCOPE='$OSM_SCOPE' (expected: transit-focused | multi-modal | comprehensive)" >&2
+                        echo "Unknown OTP_OSM_SCOPE='$OSM_SCOPE' (expected: transit-focused | multi-modal | rail-focused | comprehensive)" >&2
                         exit 1
                         ;;
                 esac

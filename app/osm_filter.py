@@ -7,7 +7,7 @@ Filtering out non-routing-relevant ways (driveways, agricultural tracks,
 private paths) cuts ~40 % of the data without affecting transit-station
 routing accuracy, bringing the same build comfortably into 24 GB heap.
 
-Three operator-facing scopes:
+Four operator-facing scopes:
 
   transit-focused   default. highway= primary/secondary/tertiary/residential/
                     pedestrian/footway/path/steps/cycleway, all railway, all
@@ -17,6 +17,19 @@ Three operator-facing scopes:
   multi-modal       same plus highway=service. Saves ~10-20% size. Use when
                     last-mile detail in dense city centers matters (parking
                     lots' internal lanes, service alleys).
+  rail-focused      v0.1.30 — drops *all* driving infrastructure (motorways,
+                    primary, residential, service, cycleway). Keeps railways,
+                    public_transport, and walking-only highway types
+                    (footway / path / steps / pedestrian) so OTP can still
+                    snap coords to a station entrance. ~80% smaller than the
+                    raw PBF — the only scope that lets a 10-country EU merge
+                    fit in a 24-30 GB build heap. Required for multi-country
+                    sessions on commodity VPS hardware (e.g. 47 GB RAM).
+                    Trade-off: OTP can't compute walking from arbitrary
+                    addresses to stations, so the journey-UI free-text
+                    address search loses precision — but the demonstrator's
+                    actual flows (city dropdown → station-to-station rail)
+                    are unaffected.
   comprehensive     no filter. Original PBF unchanged. Use when you need car
                     routing or are debugging OSM coverage issues.
 
@@ -86,6 +99,40 @@ OSM_SCOPE_PRESETS: dict[str, dict[str, Any]] = {
             "railway",
             "public_transport",
             "amenity=parking,parking_entrance",
+        ],
+    },
+    "rail-focused": {
+        "label": "Rail-focused (multi-country / low-RAM)",
+        "description": (
+            "Drops ALL driving infrastructure — no motorways, no residential, "
+            "no service, no cycleway. Keeps only railways, public-transport "
+            "polygons, walking-only highway types (footway/path/steps/"
+            "pedestrian) and station forecourts. ~80 % smaller than raw PBF; "
+            "the only scope that lets a 10-country European merge fit in "
+            "~24-28 GB build heap on a 47 GB box. Trade-off: OTP can't compute "
+            "walking from arbitrary addresses (no driveable roads in the graph) "
+            "— fine for station-to-station rail flows, breaks free-text address "
+            "search."
+        ),
+        "tags": [
+            # All rail infrastructure — tracks, stations, halts, tram stops,
+            # platforms-as-railway, level crossings, signals.
+            "railway",
+            # Platform / stop_area / station polygons. OTP uses these to
+            # snap GTFS stop coords onto the right physical structure.
+            "public_transport",
+            # Walking-only highway types. Just enough for OTP to compute a
+            # path from a station entrance polygon to its platform, and from
+            # one platform to another within an interchange. Crucially:
+            # NO motorway, NO primary/secondary/tertiary, NO residential,
+            # NO service. That's where the 80 % reduction comes from — the
+            # driveable street graph is the bulk of every OSM PBF and the
+            # main driver of OTP's heap explosion.
+            "highway=footway,path,steps,pedestrian,corridor,elevator",
+            # Station forecourt access points so OTP can snap city-centre
+            # coords onto a station entrance even when there's no
+            # walking footway directly under the coord.
+            "amenity=parking_entrance",
         ],
     },
     "comprehensive": {
