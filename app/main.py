@@ -29,6 +29,7 @@ from .api import pages as page_routes
 from .api import reports as reports_routes
 from .api.admin import config as admin_config
 from .api.admin import nap_catalogues as admin_nap_catalogues
+from .api.admin import network_coverage as admin_network_coverage
 from .api.admin import replay as admin_replay
 from .api.admin import sessions as admin_sessions
 from .api.admin import users as admin_users
@@ -79,6 +80,7 @@ app.include_router(admin_config.router)
 app.include_router(admin_users.router)
 app.include_router(admin_sessions.router)
 app.include_router(admin_nap_catalogues.router)
+app.include_router(admin_network_coverage.router)
 app.include_router(admin_replay.router)
 app.include_router(master_stations.router)
 app.include_router(master_aliases.router)

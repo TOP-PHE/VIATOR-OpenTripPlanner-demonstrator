@@ -22,6 +22,7 @@ from .master import (
     RouteAlias,
 )
 from .nap_catalogues import NapCatalogue
+from .network_coverage import NetworkCoverageResult, NetworkCoverageRun
 from .runtime import McTOverride, StationXref
 from .search import JourneySearch, JourneySearchExecution, JourneyTrip
 from .sessions import Session, SessionCategory, SessionState
@@ -63,4 +64,8 @@ __all__ = [
     "UserCredential",
     # NAP catalogues (v0.1.12) — saved NAP endpoints for the import-from-NAP picker
     "NapCatalogue",
+    # Network coverage (v0.1.27) — admin matrix runs for systematic
+    # all-pairs journey searches across major French rail hubs
+    "NetworkCoverageRun",
+    "NetworkCoverageResult",
 ]

@@ -793,7 +793,92 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.26 (latest)**: operator visibility + JSON inspector on journey results.
+**v0.1.27 (latest)**: Network coverage matrix admin page.
+
+A new feature for systematically testing how well a session covers the
+French rail network. Runs all-pairs A→B journey searches across 23
+curated major hubs (4 Paris terminals + 19 regional capitals chosen
+from SNCF's "Le Réseau Ferré en France" March-2026 map) and renders a
+colour-coded coverage matrix.
+
+**Curated 23-hub list** (in `app/network_coverage/hubs.py`):
+- **Paris terminals (4)**: Gare de Lyon, Nord, Est, Montparnasse
+- **North/NE (4)**: Lille Flandres, Reims, Strasbourg, Nancy
+- **Center-East (3)**: Dijon, Lyon Part-Dieu, Clermont-Ferrand
+- **Mediterranean / SE (6)**: Avignon TGV, Aix-en-Provence TGV,
+  Marseille Saint-Charles, Nice Ville, Montpellier Saint-Roch, Narbonne
+- **South-West (2)**: Toulouse Matabiau, Bordeaux Saint-Jean
+- **West / Atlantic (4)**: Le Mans, Nantes, Rennes, Brest
+
+23 × 22 = **506 directional pairs** per run (or 253 if "single-direction"
+mode is picked — half the work, but loses asymmetric-data detection).
+
+**Why directional matters**: SNCF declares Paris→Marseille TGV but not
+the return on some Sundays; Eurostar timetable order differs A→B vs B→A
+on some service days; GTFS-RT delays can affect one direction's
+connectivity but not the other. Running both directions surfaces these
+asymmetries which would otherwise be silent bugs.
+
+**Mechanism**:
+- New admin page at **`/admin/network-coverage`** (platform_admin only,
+  shows up in the top nav as "Coverage")
+- Operator picks: session, departure datetime (defaults to next Monday
+  08:00 — densest weekday TGV service), direction mode
+- POST `/api/admin/network-coverage/runs` creates the run, kicks off
+  `runner.execute_run` as a FastAPI BackgroundTask
+- Bounded parallelism — 5 pairs run simultaneously to keep wallclock
+  ~10-15 min for a full 506-pair run while staying gentle on OTP
+- UI polls `/api/admin/network-coverage/runs/<id>` every 5 s for live
+  progress; matrix renders incrementally as cells fill in
+
+**Schema** (alembic 20260505_1500_network_coverage):
+- `network_coverage_runs` — one row per Run click (session, depart_at,
+  state, counters, summary JSON)
+- `network_coverage_results` — one row per (run, origin, dest)
+  (status, response_ms, num_itineraries, best_duration, best_transfers,
+  best_operators, FK to journey_searches for click-cell drilldown)
+
+The journey_search FK reuses the existing infrastructure — every
+coverage pair also lands a row in `journey_searches` /
+`journey_search_executions` / `journey_trips`, so the v0.1.26 trip-card
+UI works as the click-cell drilldown for free.
+
+**Multi-session comparison** (the original use case): since every run
+is keyed to a session, running the same matrix against multiple
+sessions creates a comparison record. Sidebar shows past runs newest-
+first across ALL sessions; clicking any past run renders its matrix.
+v0.1.28+ will add side-by-side diff view ("which session finds more
+Marseille→Bordeaux trips") and time-of-day sweeps.
+
+**Visual conventions on the matrix**:
+- Rows = origin, columns = destination (read down then across)
+- Cell content = shortest itinerary's duration ("3h12") or status icon
+- Green = itinerary returned · amber ∅ = OTP found no route · red ⏱ =
+  timeout · red ✗ = error · grey diagonal = same-station no-op
+- Region-coloured row/column headers (Paris blue, NE amber, SE pink,
+  SW sky, Atlantic green) for visual grouping
+- Hover tooltip: "Origin → Destination · 3h12, 0 transfers · SNCF · 412ms"
+- Click any populated cell → modal with operator badges + JSON
+  inspector + link to re-run live in the journey UI
+
+**API endpoints** (under `/api/admin/network-coverage/`, platform_admin):
+- `GET /hubs` — return the 23-hub preset
+- `GET /runs?limit=N` — list past runs (for the sidebar)
+- `POST /runs` — start a new run (returns run id immediately, work
+  proceeds in background)
+- `GET /runs/{id}` — fetch run + all results (poll target for the UI)
+
+**Limitations / queued for v0.1.28+**:
+- Operator-editable hub list (add Eurostar London / Brussels / Frankfurt
+  for cross-border tests)
+- Side-by-side diff between two runs (the killer comparison feature)
+- Time-of-day sweep (run the same hub set at 06:00 / 08:00 / 14:00 /
+  18:00 / 22:00 to catch off-peak service gaps)
+- CSV export
+- Cancel-running-run button (today the operator has to wait or
+  restart the worker)
+
+**v0.1.26**: operator visibility + JSON inspector on journey results.
 
 Operator feedback after v0.1.25's timeout fix unblocked Paris→Marseille
 searches: "I can see the route number `631B` and the long name

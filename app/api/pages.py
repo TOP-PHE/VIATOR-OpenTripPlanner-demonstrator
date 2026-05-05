@@ -177,6 +177,32 @@ def admin_reports_page(request: Request) -> Response:
     return templates.TemplateResponse(request, "admin/reports.html", {"current_user": user})
 
 
+@router.get("/admin/network-coverage", response_class=HTMLResponse)
+def admin_network_coverage_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+) -> Response:
+    """v0.1.27 — Network coverage matrix page. Lists serving sessions
+    so the operator can pick which to run against."""
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login("/admin/network-coverage")
+    if user.role != "platform_admin":
+        return _forbidden_html(request, "Platform admin access required.")
+    serving = (
+        db.execute(
+            select(SessionRow).where(SessionRow.state == "serving").order_by(SessionRow.id)
+        )
+        .scalars()
+        .all()
+    )
+    return templates.TemplateResponse(
+        request,
+        "admin/network_coverage.html",
+        {"current_user": user, "serving_sessions": serving},
+    )
+
+
 @router.get("/admin/master/stations", response_class=HTMLResponse)
 def admin_master_stations_page(request: Request) -> Response:
     user = _maybe_user(request)

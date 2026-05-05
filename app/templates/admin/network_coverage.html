@@ -1,0 +1,414 @@
+{% extends "_base.html" %}
+{% block title %}Network Coverage — VIATOR{% endblock %}
+
+{% block extra_styles %}
+.cov-grid { display: grid; grid-template-columns: 280px 1fr; gap: 1rem; }
+.cov-side { background: var(--paper); padding: 1rem; border-radius: 8px; }
+.cov-main { min-height: 400px; }
+.cov-form label { font-weight: 600; font-size: 0.85rem; }
+.cov-form select, .cov-form input { width: 100%; padding: 0.4rem; margin: 0.2rem 0 0.6rem; }
+
+/* Run-list sidebar (recent runs). Click a row to load that run's matrix. */
+.run-list { margin-top: 0.6rem; }
+.run-row { padding: 0.4rem 0.5rem; border-bottom: 1px dotted var(--sleeper); cursor: pointer; font-size: 0.82rem; }
+.run-row:hover { background: #eef2f8; }
+.run-row.active { background: #dbe7f8; }
+.run-row .top { display: flex; justify-content: space-between; gap: 0.4rem; }
+.run-row .meta { color: var(--rail-steel); font-size: 0.75rem; margin-top: 0.15rem; }
+
+/* Status pills mirror the v0.1.20 palette. */
+.cov-pill {
+  display: inline-flex; align-items: center; gap: 0.2rem;
+  padding: 0.05rem 0.45rem; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 500; white-space: nowrap;
+  background: #eef0f2; color: #57606a; border: 1px solid #d0d7de;
+}
+.cov-pill[data-status="completed"] { background: #dafbe1; color: #1a7f37; border-color: #aceebb; }
+.cov-pill[data-status="running"]   { background: #fff8c5; color: #9a6700; border-color: #f5d56b; }
+.cov-pill[data-status="pending"]   { background: #f6f8fa; color: #57606a; }
+.cov-pill[data-status="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+
+/* Progress bar for a running run. */
+.cov-progress { background: #eef0f2; border-radius: 4px; height: 8px; margin-top: 0.4rem; overflow: hidden; }
+.cov-progress-bar { background: var(--uic-blue); height: 100%; transition: width 0.3s; }
+
+/* The matrix. Sticky first row + first column so headers stay visible
+   while scrolling 23×23 cells. Cell colour = status / duration. */
+.cov-matrix-wrap { overflow: auto; max-height: calc(100vh - 280px); border: 1px solid var(--sleeper); border-radius: 4px; }
+.cov-matrix { border-collapse: collapse; font-size: 0.72rem; }
+.cov-matrix th, .cov-matrix td {
+  border: 1px solid #eaeef2; padding: 0.15rem 0.3rem; min-width: 38px; text-align: center;
+  vertical-align: middle; white-space: nowrap;
+}
+.cov-matrix thead th {
+  position: sticky; top: 0; z-index: 2; background: #f6f8fa;
+  font-weight: 600; padding: 0.3rem 0.4rem;
+}
+.cov-matrix tbody th {
+  position: sticky; left: 0; z-index: 1; background: #f6f8fa;
+  text-align: right; font-weight: 600; padding: 0.3rem 0.5rem;
+}
+.cov-matrix thead th:first-child { z-index: 3; }
+.cov-matrix tbody td.diag { background: #d0d7de; }
+.cov-matrix tbody td.s-ok       { background: #dafbe1; cursor: pointer; }
+.cov-matrix tbody td.s-ok:hover { background: #aceebb; }
+.cov-matrix tbody td.s-no_route { background: #fff4d6; cursor: pointer; }
+.cov-matrix tbody td.s-no_route:hover { background: #f5d56b; }
+.cov-matrix tbody td.s-error    { background: #ffebe9; cursor: pointer; color: #cf222e; }
+.cov-matrix tbody td.s-error:hover { background: #ffcecb; }
+.cov-matrix tbody td.s-timeout  { background: #ffd6cc; cursor: pointer; color: #cf222e; }
+.cov-matrix tbody td.s-timeout:hover { background: #ffb4a3; }
+.cov-matrix tbody td.empty      { background: #fafbfc; color: #aaa; }
+.cov-matrix .region-paris  th { background: #e8f0fb !important; }
+.cov-matrix .region-NE     th { background: #fff8e1 !important; }
+.cov-matrix .region-CE     th { background: #f0eee9 !important; }
+.cov-matrix .region-Center th { background: #e9f6ec !important; }
+.cov-matrix .region-SE     th { background: #fdecef !important; }
+.cov-matrix .region-SW     th { background: #ddf4ff !important; }
+.cov-matrix .region-W      th { background: #ddebd0 !important; }
+
+/* Per-cell tooltip on hover — shows duration / transfers / operators. */
+.cov-cell-tip {
+  position: absolute; z-index: 100; background: #24292f; color: #fff;
+  padding: 0.4rem 0.6rem; border-radius: 4px; font-size: 0.78rem;
+  pointer-events: none; max-width: 320px; line-height: 1.4;
+}
+
+.cov-summary { display: flex; gap: 0.6rem; flex-wrap: wrap; padding: 0.5rem 0.7rem; background: #eef2f8; border-radius: 4px; margin-bottom: 0.6rem; font-size: 0.85rem; }
+.cov-summary > div { white-space: nowrap; }
+
+/* Drilldown modal — reuse the v0.1.26 JSON inspector aesthetics. */
+.cov-modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center; z-index: 1000;
+}
+.cov-modal-backdrop[hidden] { display: none; }
+.cov-modal { background: #fff; border-radius: 6px; width: min(720px, 92vw); max-height: 92vh; overflow: auto; padding: 1rem 1.4rem; }
+.cov-modal h3 { margin: 0 0 0.6rem; font-size: 1rem; }
+.cov-modal-meta { color: var(--rail-steel); font-size: 0.85rem; margin-bottom: 0.6rem; }
+{% endblock %}
+
+{% block content %}
+<h1>Network coverage</h1>
+<p style="color: var(--rail-steel); max-width: 70ch">
+  Runs systematic A→B journey searches across {{ '23' }} major French rail hubs (4 Paris terminals + 19
+  regional capitals). 23×22 = 506 directional pairs per run; ~10–15 minutes wallclock with bounded parallelism.
+  Each Run is keyed to a session — run the same matrix against multiple sessions to compare coverage between
+  data sources (NAP vs MERITS vs experimental imports).
+</p>
+
+<div class="cov-grid">
+  <aside class="cov-side">
+    <h3 style="margin: 0 0 0.5rem; font-size: 1rem">New run</h3>
+    {% if not serving_sessions %}
+      <p class="hint" style="color: var(--fail)">No serving sessions — promote a session first.</p>
+    {% else %}
+      <form id="cov-form" class="cov-form">
+        <label>Session</label>
+        <select name="session_id">
+          {% for s in serving_sessions %}
+            <option value="{{ s.id }}">{{ s.name }} ({{ s.id }})</option>
+          {% endfor %}
+        </select>
+        <label>Departure</label>
+        <input type="datetime-local" name="depart_at" id="cov-depart">
+        <label>Direction
+          <span class="hint" style="font-weight: normal">(both = 506 pairs · single = 253)</span>
+        </label>
+        <select name="direction">
+          <option value="both" selected>Both directions (506 pairs)</option>
+          <option value="single">Single direction only (253 pairs)</option>
+        </select>
+        <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
+      </form>
+    {% endif %}
+
+    <h3 style="margin: 1rem 0 0.3rem; font-size: 1rem">Recent runs</h3>
+    <div class="run-list" id="run-list">
+      <em class="hint">Loading…</em>
+    </div>
+  </aside>
+
+  <main class="cov-main" id="cov-main">
+    <p style="color: var(--rail-steel)">Pick a session and click Run, or select an existing run from the sidebar.</p>
+  </main>
+</div>
+
+<div id="cov-modal" class="cov-modal-backdrop" hidden>
+  <div class="cov-modal" role="dialog" aria-modal="true">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h3 id="cov-modal-title">Pair detail</h3>
+      <button type="button" class="secondary" data-action="cov-modal-close" style="padding: 0.2rem 0.6rem">×</button>
+    </div>
+    <div class="cov-modal-meta" id="cov-modal-meta"></div>
+    <div id="cov-modal-body"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+// v0.1.27 — Network coverage admin page.
+
+let HUBS = [];           // populated from /api/admin/network-coverage/hubs on load
+let CURRENT_RUN_ID = null;
+let CURRENT_POLL_HANDLE = null;
+
+function escHTML(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtDuration(secs) {
+  if (secs === null || secs === undefined) return '—';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h ? `${h}h${m.toString().padStart(2,'0')}` : `${m}m`;
+}
+
+// Default depart = next Monday 08:00 — Monday morning has the densest
+// weekday TGV service across the whole network. Operator can override.
+function nextMondayMorning() {
+  const d = new Date();
+  d.setHours(8, 0, 0, 0);
+  // 1=Mon, 0=Sun. Days to add to reach next Monday (or this Monday if
+  // it's Sunday/Mon-before-08 still in future).
+  const daysAhead = (1 + 7 - d.getDay()) % 7 || 7;
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().slice(0, 16);
+}
+const departInput = document.getElementById('cov-depart');
+if (departInput) departInput.value = nextMondayMorning();
+
+// ─── Bootstrap: fetch hubs + initial run list ───────────────────────
+(async () => {
+  try {
+    const r = await fetch('/api/admin/network-coverage/hubs');
+    if (r.ok) HUBS = await r.json();
+  } catch (err) { /* ignore */ }
+  await reloadRunList();
+})();
+
+async function reloadRunList(activeId) {
+  const el = document.getElementById('run-list');
+  try {
+    const r = await fetch('/api/admin/network-coverage/runs?limit=20');
+    if (!r.ok) { el.innerHTML = '<em class="hint">Failed to load runs.</em>'; return; }
+    const runs = await r.json();
+    if (!runs.length) {
+      el.innerHTML = '<em class="hint">No runs yet — kick one off with the form above.</em>';
+      return;
+    }
+    el.innerHTML = runs.map(r => {
+      const isActive = r.id === activeId;
+      const cls = isActive ? 'run-row active' : 'run-row';
+      const pct = r.total_pairs ? Math.round(100 * r.completed_pairs / r.total_pairs) : 0;
+      return `<div class="${cls}" data-run-id="${escHTML(r.id)}">
+        <div class="top">
+          <strong>${escHTML(r.session_label)}</strong>
+          <span class="cov-pill" data-status="${escHTML(r.status)}">${escHTML(r.status)}</span>
+        </div>
+        <div class="meta">
+          ${escHTML(r.depart_at.replace('T',' ').slice(0,16))} ·
+          ${r.completed_pairs}/${r.total_pairs} pairs ·
+          <span style="color:#1a7f37">${r.ok_pairs} ok</span>
+          ${r.no_route_pairs ? ` · <span style="color:#9a6700">${r.no_route_pairs} no-route</span>` : ''}
+          ${r.error_pairs ? ` · <span style="color:#cf222e">${r.error_pairs} err</span>` : ''}
+          ${r.status === 'running' ? `
+            <div class="cov-progress"><div class="cov-progress-bar" style="width:${pct}%"></div></div>
+          ` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    el.querySelectorAll('.run-row').forEach(row => {
+      row.addEventListener('click', () => loadRun(row.dataset.runId));
+    });
+  } catch (err) {
+    el.innerHTML = `<em class="hint">Error loading runs: ${escHTML(err.message)}</em>`;
+  }
+}
+
+// ─── Form submit: create a new run ──────────────────────────────────
+document.getElementById('cov-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    session_id: fd.get('session_id'),
+    depart_at: fd.get('depart_at') + ':00',
+    direction: fd.get('direction') || 'both',
+  };
+  const btn = document.getElementById('cov-go');
+  btn.disabled = true; const original = btn.textContent; btn.textContent = 'Starting…';
+  try {
+    const r = await fetch('/api/admin/network-coverage/runs', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      showToast('error', j.detail || `Failed (${r.status})`);
+      return;
+    }
+    showToast('success', `Run started · ${j.total_pairs} pairs queued`);
+    await reloadRunList(j.id);
+    loadRun(j.id);
+  } finally {
+    btn.disabled = false; btn.textContent = original;
+  }
+});
+
+// ─── Load + render a specific run ───────────────────────────────────
+async function loadRun(runId) {
+  if (CURRENT_POLL_HANDLE) { clearInterval(CURRENT_POLL_HANDLE); CURRENT_POLL_HANDLE = null; }
+  CURRENT_RUN_ID = runId;
+  await refreshRun();
+  // Poll every 5s while running.
+  CURRENT_POLL_HANDLE = setInterval(refreshRun, 5000);
+}
+
+async function refreshRun() {
+  if (!CURRENT_RUN_ID) return;
+  const r = await fetch(`/api/admin/network-coverage/runs/${CURRENT_RUN_ID}`);
+  if (!r.ok) return;
+  const run = await r.json();
+  renderRun(run);
+  if (run.status !== 'running' && run.status !== 'pending') {
+    if (CURRENT_POLL_HANDLE) { clearInterval(CURRENT_POLL_HANDLE); CURRENT_POLL_HANDLE = null; }
+    // Final reload of the side list to update the active run's counters.
+    reloadRunList(run.id);
+  } else {
+    // Keep the side list counters synced too.
+    reloadRunList(run.id);
+  }
+}
+
+function renderRun(run) {
+  const main = document.getElementById('cov-main');
+  // Build a Map: "originId|destId" → result (for fast cell lookup).
+  const cell = new Map();
+  for (const r of (run.results || [])) {
+    cell.set(`${r.origin_hub_id}|${r.dest_hub_id}`, r);
+  }
+  // Summary strip.
+  const pct = run.total_pairs ? Math.round(100 * run.completed_pairs / run.total_pairs) : 0;
+  const summary = `<div class="cov-summary">
+    <div><strong>${escHTML(run.session_label)}</strong></div>
+    <div>· ${escHTML(run.depart_at.replace('T',' ').slice(0,16))}</div>
+    <div>· <span class="cov-pill" data-status="${escHTML(run.status)}">${escHTML(run.status)}</span></div>
+    <div>· ${run.completed_pairs}/${run.total_pairs} pairs (${pct}%)</div>
+    <div>· <span style="color:#1a7f37">${run.ok_pairs} ok</span></div>
+    ${run.no_route_pairs ? `<div>· <span style="color:#9a6700">${run.no_route_pairs} no-route</span></div>` : ''}
+    ${run.error_pairs ? `<div>· <span style="color:#cf222e">${run.error_pairs} err</span></div>` : ''}
+    ${run.summary && run.summary.median_response_ms ? `<div>· median ${run.summary.median_response_ms}ms</div>` : ''}
+    ${run.summary && run.summary.elapsed_seconds ? `<div>· ${Math.round(run.summary.elapsed_seconds)}s wallclock</div>` : ''}
+  </div>`;
+
+  // Build the matrix. Rows = origin (read down), columns = destination.
+  const headerRow = '<tr><th></th>' + HUBS.map(h =>
+    `<th class="region-${escHTML(h.region)}" title="${escHTML(h.name)}">${escHTML(h.short)}</th>`
+  ).join('') + '</tr>';
+  const bodyRows = HUBS.map(orig => {
+    const cells = HUBS.map(dest => {
+      if (orig.id === dest.id) return '<td class="diag"></td>';
+      const r = cell.get(`${orig.id}|${dest.id}`);
+      if (!r) return '<td class="empty">·</td>';
+      const cls = `s-${r.status}`;
+      const inner = r.status === 'ok'
+        ? fmtDuration(r.best_duration_seconds)
+        : (r.status === 'no_route' ? '∅' : (r.status === 'timeout' ? '⏱' : '✗'));
+      const tip = r.status === 'ok'
+        ? `${orig.name} → ${dest.name}\n${fmtDuration(r.best_duration_seconds)}, ${r.best_num_transfers || 0} transfers\n${r.best_operators || '?'}\n${r.response_ms}ms`
+        : `${orig.name} → ${dest.name}\n${r.status}${r.error_message ? '\n' + r.error_message : ''}`;
+      return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}" title="${escHTML(tip)}">${inner}</td>`;
+    }).join('');
+    return `<tr class="region-${escHTML(orig.region)}"><th title="${escHTML(orig.name)}">${escHTML(orig.short)}</th>${cells}</tr>`;
+  }).join('');
+
+  main.innerHTML = summary + `<div class="cov-matrix-wrap">
+    <table class="cov-matrix">
+      <thead>${headerRow}</thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  </div>
+  <p class="hint" style="margin-top: 0.6rem">
+    Rows = origin, columns = destination. Cell content is the shortest itinerary's duration.
+    <span style="background:#dafbe1;padding:0 4px;border-radius:2px">green</span> = itinerary returned;
+    <span style="background:#fff4d6;padding:0 4px;border-radius:2px">amber ∅</span> = OTP found no route;
+    <span style="background:#ffd6cc;padding:0 4px;border-radius:2px">red ⏱</span> = timeout;
+    <span style="background:#ffebe9;padding:0 4px;border-radius:2px">red ✗</span> = error.
+    Click any cell for the detail.
+  </p>`;
+
+  // Wire click-to-drill on every populated cell.
+  main.querySelectorAll('td[data-pair]').forEach(td => {
+    td.addEventListener('click', () => {
+      const [oId, dId] = td.dataset.pair.split('|');
+      const r = cell.get(td.dataset.pair);
+      openDetailModal(oId, dId, r);
+    });
+  });
+}
+
+function openDetailModal(originId, destId, result) {
+  const orig = HUBS.find(h => h.id === originId);
+  const dest = HUBS.find(h => h.id === destId);
+  document.getElementById('cov-modal-title').textContent =
+    `${orig ? orig.name : originId} → ${dest ? dest.name : destId}`;
+  document.getElementById('cov-modal-meta').innerHTML = `
+    Status: <span class="cov-pill" data-status="${escHTML(result.status)}">${escHTML(result.status)}</span>
+    · ${result.response_ms || 0}ms
+    ${result.num_itineraries !== null ? '· ' + result.num_itineraries + ' itineraries' : ''}
+    ${result.best_duration_seconds ? '· best ' + fmtDuration(result.best_duration_seconds) : ''}
+    ${result.best_num_transfers !== null && result.best_num_transfers !== undefined
+        ? '· ' + result.best_num_transfers + ' transfer' + (result.best_num_transfers === 1 ? '' : 's')
+        : ''}
+    ${result.best_operators ? '<br>Operators: <code>' + escHTML(result.best_operators) + '</code>' : ''}
+    ${result.error_message ? '<br>Error: <code>' + escHTML(result.error_message) + '</code>' : ''}
+  `;
+  let body = '';
+  if (result.journey_search_id) {
+    body = `<p>Click below to open the full journey detail (uses the same trip-card UI as the Search page):</p>
+      <p><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}"
+            target="_blank">↗ Re-run live in the journey UI</a></p>
+      <p class="hint">journey_search id: <code>${escHTML(result.journey_search_id)}</code> — query
+      <code>journey_searches</code> + <code>journey_trips</code> tables for the full operator
+      breakdown / raw OTP response.</p>`;
+  } else {
+    body = '<p class="hint">No linked journey-search row (recorder write failed during the run, or status was set before the trip was persisted).</p>';
+  }
+  document.getElementById('cov-modal-body').innerHTML = body;
+  document.getElementById('cov-modal').hidden = false;
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target.matches('[data-action="cov-modal-close"]') ||
+      e.target.classList.contains('cov-modal-backdrop')) {
+    document.getElementById('cov-modal').hidden = true;
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const m = document.getElementById('cov-modal');
+    if (m && !m.hidden) m.hidden = true;
+  }
+});
+
+// Reuse the toast plumbing from the rest of the admin pages — copy
+// the minimal version here so this template doesn't depend on
+// sessions.html's setup.
+function showToast(level, msg) {
+  let t = document.getElementById('cov-toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'cov-toast';
+    t.style.cssText = 'position:fixed;top:1rem;right:1rem;padding:0.6rem 1rem;border-radius:4px;color:#fff;z-index:2000;max-width:420px;font-size:0.9rem';
+    document.body.appendChild(t);
+  }
+  t.style.background = level === 'error' ? '#cf222e' : '#1a7f37';
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.style.display = 'none'; }, 5000);
+}
+</script>
+{% endblock %}
