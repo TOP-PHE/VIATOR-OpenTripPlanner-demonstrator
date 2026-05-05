@@ -109,6 +109,24 @@ def _startup() -> None:
     except Exception:
         log.exception("could not load platform_config at startup; using defaults")
 
+    # v0.1.29.3 — mark any in-flight network-coverage runs as failed.
+    # FastAPI BackgroundTasks are in-process; a container restart kills
+    # them with no DB state cleanup, leaving runs in 'running' status
+    # forever. By the time we get here, no `execute_run` from a prior
+    # container instance is alive, so anything still 'running' or
+    # 'pending' is by definition orphaned. Done in its own try/except
+    # so a malformed run row can't keep VIATOR from booting.
+    try:
+        from .network_coverage import runner as _coverage_runner
+
+        with SessionLocal() as db:
+            n = _coverage_runner.mark_orphaned_runs_as_failed(db)
+            if n:
+                db.commit()
+                log.warning("marked %d orphaned network-coverage run(s) as failed", n)
+    except Exception:
+        log.exception("orphan coverage-run cleanup failed at startup (non-fatal)")
+
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os
 

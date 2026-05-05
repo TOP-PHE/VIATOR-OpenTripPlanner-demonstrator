@@ -431,3 +431,48 @@ def list_recent_runs(db: DbSession, *, limit: int = 20) -> list[NetworkCoverageR
         .scalars()
         .all()
     )
+
+
+def mark_orphaned_runs_as_failed(db: DbSession) -> int:
+    """v0.1.29.3 — terminate any runs left mid-flight by a web restart.
+
+    `execute_run` is scheduled via FastAPI BackgroundTasks, which are
+    strictly in-process to the web container. When the container
+    restarts (deploy, OOM, manual `docker compose up -d` after pulling
+    a new image) any currently-running coverage task dies with no DB
+    state cleanup — the row stays in `status='running'` forever, the
+    UI keeps showing it on the sidebar, and the operator has no signal
+    that the work was actually abandoned.
+
+    This helper is called from the FastAPI startup hook: by the time
+    uvicorn is accepting requests, no `execute_run` from a previous
+    container can still be alive, so anything in `running` or `pending`
+    status is by definition orphaned. We flip them to `failed` and
+    stamp `summary.orphaned_by_restart=true` so the matrix view can
+    explain the state instead of showing a phantom progress bar.
+
+    Returns the number of runs marked. Caller is responsible for the
+    txn boundary (commit/rollback) — keeps this composable with
+    startup-hook error handling.
+    """
+    orphans = list(
+        db.execute(
+            select(NetworkCoverageRun).where(NetworkCoverageRun.status.in_(("running", "pending")))
+        )
+        .scalars()
+        .all()
+    )
+    if not orphans:
+        return 0
+    now = datetime.now(UTC)
+    for run in orphans:
+        run.status = "failed"
+        run.finished_at = now
+        run.summary = {
+            **(run.summary or {}),
+            "orphaned_by_restart": True,
+            "orphaned_at": now.isoformat(),
+            "completed_pairs_at_restart": run.completed_pairs or 0,
+            "total_pairs_at_restart": run.total_pairs or 0,
+        }
+    return len(orphans)
