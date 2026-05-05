@@ -104,9 +104,9 @@
 <p style="color: var(--rail-steel); max-width: 70ch">
   Runs systematic A→B journey searches across {{ '26' }} curated French rail hubs (6 Paris terminals
   + 19 regional capitals + 1 small TER halt as a local-coverage stress test). 26×25 = 650 directional
-  pairs per run; ~13–18 minutes wallclock with bounded parallelism. Each Run is keyed to a session —
-  run the same matrix against multiple sessions to compare coverage between data sources (NAP vs
-  MERITS vs experimental imports).
+  pairs per run; each pair queries OTP for up to 50 alternatives in a 4-hour window from the chosen
+  depart time. ~13–18 minutes wallclock with bounded parallelism. Each Run is keyed to a session —
+  run the same matrix against multiple sessions (or at multiple times of day) to compare coverage.
 </p>
 
 <div class="cov-grid">

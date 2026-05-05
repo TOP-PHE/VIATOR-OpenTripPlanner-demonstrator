@@ -56,20 +56,28 @@ _PARALLELISM = 5
 # valuable signal than a fast timeout.
 _PER_PAIR_TIMEOUT_MS = 60_000
 
-# v0.1.29 — full-day coverage mode. Bumped from the live-UI's 8/4h to
-# 50/24h so each pair returns ALL the trains running between A and B
-# on the chosen day in a single OTP call. The matrix's per-cell trip
-# count then reflects "how many alternatives does this session find for
-# this pair on this day" — the answer to the original question
-# operators ask of any new GTFS feed.
+# v0.1.29.2 — coverage search parameters. Originally I shipped 50/24h
+# in v0.1.29 to give "full-day visibility per pair" but that exceeded
+# OTP's 60s apiProcessingTimeout for long-haul pairs on a France-wide
+# multi-NAP graph (Paris-Paris pairs worked fine because the routing
+# is local; Paris→Lille / Paris→Strasbourg / cross-cutting pairs all
+# timed out — RAPTOR's per-call work scales near-quadratically with
+# searchWindow on dense networks).
 #
-# Trade-off: per-call latency goes from ~0.5-1s up to ~2-5s (OTP runs
-# its RAPTOR loop until either numItineraries or the window is
-# exhausted). At concurrency=5 the full 650-pair run grows from
-# ~10-15min to ~25-35min. Acceptable — coverage matrix is a deliberate
-# weekly/release-time tool, not interactive.
+# v0.1.29.2 reduces the window to 4h (matching the v0.1.27 baseline
+# that completed cleanly) but keeps numItineraries at 50 — so we still
+# get ALL alternatives within a 4-hour departure window, just not the
+# whole 24h. For 08:00 depart that's 08:00-12:00, which catches the
+# bulk of weekday TGV service for any pair (Paris-Lyon has ~7-8 TGVs
+# in that window, Paris-Marseille ~3-4).
+#
+# For full-day visibility: queued for v0.1.30 — a "time-of-day sweep"
+# button that runs the matrix at 06:00 / 10:00 / 14:00 / 18:00 / 22:00
+# and stitches the per-pair counts. That's the right architecture for
+# 24h coverage on a heavy graph; jamming it into a single OTP call was
+# the v0.1.29 mistake.
 _COVERAGE_NUM_ITINERARIES = 50
-_COVERAGE_SEARCH_WINDOW_SECONDS = 86_400  # 24h
+_COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h — same as live UI baseline
 
 
 def create_run(
