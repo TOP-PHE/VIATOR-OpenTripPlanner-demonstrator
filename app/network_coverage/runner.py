@@ -257,11 +257,7 @@ async def _execute_pair(
         response_ms = int((time.monotonic() - started) * 1000)
         # Distinguish timeout from generic error for the matrix colouring.
         cls_name = type(exc).__name__
-        status = (
-            "timeout"
-            if "Timeout" in cls_name or "timeout" in cls_name.lower()
-            else "error"
-        )
+        status = "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
         error_message = f"{cls_name}: {exc}"[:500]
         log.warning(
             "coverage run %s pair %s→%s failed: %s",
