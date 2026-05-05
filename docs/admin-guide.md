@@ -503,6 +503,260 @@ pytest tests/unit/                  # integration tests need Postgres
 `docker/INSTALL.md` §12 has 13 incident types with diagnosis + fix.
 `VIATOR-technical-spec.md` §11.10 has the wider operational runbook.
 
+### 6.7 Journey search returns "0 trips in Xms (timeout)"
+
+This is **not** the same as "no service found". The search hit one of
+the timeout layers in the request stack — there are four, and which one
+fired determines the fix.
+
+**Step 1 — read X carefully.** The number tells you which timeout fired:
+
+| X is roughly | Fired | Fix |
+|---|---|---|
+| `~10 000 ms` | `FANOUT_TIMEOUT_MS` (web app's httpx → OTP) | Bump `FANOUT_TIMEOUT_MS` in `/admin/config` or platform_config (see §6.10) |
+| matches `otp_api_timeout` (e.g. 30 000, 60 000) | OTP's `server.apiProcessingTimeout` (per-session) | Bump `otp_api_timeout` in the session's Configure form, then Rebuild + Promote |
+| `< 5 000 ms` | Connection error / OTP container down | `docker compose ps`, `docker logs viator-otp-<sid>-1` |
+| `> 600 000 ms` | nginx `proxy_read_timeout` (very rare) | Edit `docker/nginx/nginx.conf`, `docker compose restart nginx` |
+
+**The most common case in v0.1.24-v0.1.25 deployments** is the first
+one: operator bumped `otp_api_timeout` to 30s/60s via the new UI
+dropdown but didn't realise `FANOUT_TIMEOUT_MS` (the web app's
+HTTP-client cap) defaults to 10 000 ms. The web app gives up before
+OTP returns, surfacing a 10 041 ms timeout regardless of how generous
+the OTP-side budget is. **Both must be aligned**: `FANOUT_TIMEOUT_MS ≥
+otp_api_timeout + 2 000 ms` (the +2 000 covers connection + transit).
+
+**Step 2 — diagnose by direct OTP query** to bypass the fanout layer:
+
+```bash
+# Substitute your actual stop ids from /admin/master/stations
+curl -s "https://vmi3259514.contaboserver.net/otp/nap-fr-rail/otp/gtfs/v1" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{plan(from:{lat:48.8443,lon:2.3739} to:{lat:43.3026,lon:5.3801} date:\"2026-05-19\" time:\"07:39\" numItineraries:5){itineraries{startTime endTime legs{mode startTime endTime}}}}"}' \
+  | head -50
+```
+
+If OTP returns itineraries directly: the layer above (web app) is the
+problem → bump `FANOUT_TIMEOUT_MS`. If OTP itself returns no
+itineraries or its own timeout: the per-session `otp_api_timeout`
+needs bumping (and a rebuild to apply).
+
+**Step 3 — track v0.1.26+** which is queued to make the two timeouts
+auto-coordinate (the fanout will inherit `max(default, session_otp_timeout
++ 2s)` so this footgun goes away).
+
+### 6.8 router-config.json edit doesn't take effect after `docker restart`
+
+Three things confuse this diagnosis. All three trip up the same way:
+
+**1. `docker logs --tail N | head` shows the OLDEST logs, not the newest.**
+Per-session OTP containers were created at the last Promote (often days
+or weeks ago) and their initial startup logs are at the *top* of the
+log stream. To see logs from a fresh `docker restart`, use:
+
+```bash
+docker logs --since=5m viator-otp-<sid>-1 2>&1 | head -50
+# or:
+docker logs --tail=100 viator-otp-<sid>-1 2>&1
+```
+
+If you see "OTP STARTING UP" with a timestamp from minutes ago (not
+hours/days), the restart took effect.
+
+**2. JVM startup is ~30 s for a 2.3 GB graph.** Searches issued during
+the reload return whatever-was-cached or 503. Wait for `Grizzly server
+running.` in the logs before retrying.
+
+**3. The fast-path recipe for in-place router-config edits without
+a 30-minute Rebuild + Promote cycle**:
+
+```bash
+# Identify the file (host-side path under the docker volume):
+ROUTER_CFG="/var/lib/docker/volumes/viator_graphs/_data/<sid>/current/router-config.json"
+sudo cat "$ROUTER_CFG"
+
+# Edit in place (e.g. bump the per-session timeout from 30s to 60s):
+sudo sed -i 's/"apiProcessingTimeout": "30s"/"apiProcessingTimeout": "60s"/' "$ROUTER_CFG"
+
+# Restart the serving container so OTP re-reads the file at JVM startup:
+docker restart viator-otp-<sid>-1
+
+# Watch the reload finish (~30s):
+docker logs --since=1m -f viator-otp-<sid>-1 2>&1 | grep -E "STARTING UP|Grizzly server|router-config"
+```
+
+**Important caveat**: this in-place edit **does not survive the next
+Promote**, because Promote regenerates `router-config.json` from the
+session's saved `config.otp_api_timeout`. To make the change permanent,
+also save the value in the UI's Configure form, OR set it via SQL on
+the `sessions` table's JSONB config column.
+
+### 6.9 CI Trivy gate fails on a release that should pass
+
+Lesson learned in v0.1.24 → v0.1.25.
+
+**Symptom**: Trivy diagnostic step shows `0 vulnerabilities` in its
+table, but the gating step exits 1 anyway with no findings printed.
+SARIF artifact uploads but contains MEDIUM/LOW findings only.
+
+**Root cause** (specific to `aquasecurity/trivy-action@v0.36.0`): when
+`format: sarif` and `severity: CRITICAL,HIGH` are both set on the same
+step, the action filters HIGH/CRITICAL for the SARIF *output* but
+applies `exit-code: 1` to the **unfiltered** finding count. So a fresh
+batch of MEDIUM curl/libcurl/sed CVEs blocks the gate even though our
+gate is supposed to be CRITICAL,HIGH only.
+
+**Diagnose**:
+
+```bash
+# 1. Identify which CVEs the gating SARIF actually contains:
+gh run download <RUN_ID> -n trivy-otp-sarif -D ./sarif-tmp
+python -c "
+import json
+data = json.loads(open('sarif-tmp/trivy-otp.sarif').read())
+for run in data.get('runs', []):
+    for r in run.get('results', []):
+        msg = r.get('message', {}).get('text', '')[:200]
+        print(f'  {r.get(\"level\"):8s} {r.get(\"ruleId\")}: {msg[:80]}')
+"
+```
+
+If all findings are `note` or `warning` (= LOW/MEDIUM), the gate fired
+on noise — see fix below. If anything is `error` (= HIGH/CRITICAL),
+that's a real CVE to address.
+
+**Fix** (in v0.1.25 onwards): the `.github/workflows/docker.yml` gating
+step uses `format: table` (which honours severity for exit-code) and a
+separate non-fatal step generates the SARIF for the GitHub Security
+tab. If a future workflow change reintroduces `format: sarif` on the
+gating step, expect this footgun to come back.
+
+### 6.10 Timeout stack — full reference
+
+Every timeout in the request and build paths, where it lives, and what
+it caps. Use this table when "0 trips in Xms (timeout)" or build-side
+hangs need diagnosing.
+
+| Timeout | Path / surface | Default | Tunable via | Caps |
+|---|---|---|---|---|
+| `proxy_read_timeout` | `docker/nginx/nginx.conf` | `600s` | edit + `docker compose restart nginx` | how long nginx waits for the web/otp upstream to respond |
+| `FANOUT_TIMEOUT_MS` | `platform_config` table | `10 000` ms | `/admin/config` UI (Fanout section) or SQL | the web app's httpx client when calling OTP from the journey-search endpoint |
+| `otp_api_timeout` → `server.apiProcessingTimeout` | session config (v0.1.24+) → `router-config.json` | `30s` | per-session Configure form | OTP's per-request compute budget |
+| `REBUILD_DEBOUNCE_SECONDS` | `platform_config` table | `1800s` | `/admin/config` or SQL | how long the worker waits between job-enqueue and pick-up |
+| `OTP_BUILD_TIMEOUT_MINUTES` | (queued, not yet implemented) | — | — | future: hard cap on a single build's wallclock |
+| JVM `-Xmx` (heap) | `OTP_HEAP` env passed to otp-build | session config `otp_build_heap` (v0.1.23+) | per-session Configure form | not a timeout, but related — OOM looks like a hang in logs |
+
+**The two coordination rules every operator should know**:
+
+1. **`FANOUT_TIMEOUT_MS ≥ otp_api_timeout + 2 000 ms`.** Otherwise the
+   web app gives up before OTP returns and the per-session
+   `otp_api_timeout` knob has no operator-visible effect. v0.1.26+ is
+   queued to auto-coordinate these.
+
+2. **Changing `otp_api_timeout` only affects future searches AFTER
+   Rebuild + Promote.** The running otp-`<sid>` container holds
+   `router-config.json` in JVM memory from when it was last loaded.
+   See §6.8 for a fast-path recipe that skips the 30-minute rebuild.
+
+### 6.11 Post-deploy verification checklist
+
+Run through this after every `docker compose pull && up -d`. Catches
+~80% of "deployed but didn't actually take effect" classes of bug
+documented in §6.7-§6.10.
+
+**1. Server-side: image actually picked up**
+
+```bash
+# /healthz/version returns the new tag (this hits FastAPI, not nginx cache)
+curl -fsS https://vmi3259514.contaboserver.net/healthz/version
+# → {"version":"v0.1.X"}
+
+# OCI label on the running container matches
+docker inspect viator-web-1 \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+# → 0.1.X
+
+# Worker is on the same version (it's the same image, different command)
+docker inspect viator-worker-1 \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+```
+
+If any of these show the old version, the `up -d` didn't recreate the
+container — usually because compose decided "no changes needed" when
+the image tag didn't actually shift. Force-recreate:
+`docker compose up -d --force-recreate web worker`.
+
+**2. Browser-side: hard-refresh required**
+
+```
+Ctrl+Shift+R   (or Cmd+Shift+R on Mac)
+```
+
+Without this, the cached JS bundle doesn't reload and new UI fields
+(post-v0.1.21 `otp_timezone` dropdown, post-v0.1.23 `otp_build_heap`,
+post-v0.1.24 `otp_api_timeout`, post-v0.1.20 rebuild panel) silently
+don't appear. The version badge in the page header is the cheapest
+sanity check — if it shows the new version, JS reloaded.
+
+**3. Per-session config: explicitly save the new defaults**
+
+Sessions don't auto-pick up new defaults — `worker.py` falls back to
+the module-level default only when `session.config.<field>` is None.
+After a release that adds a new config field:
+
+- Expand the session in `/admin/sessions`
+- Verify the new dropdown shows the expected default (e.g. `30s` for
+  `otp_api_timeout` post-v0.1.24)
+- **Click "Save config"** to persist the value into JSONB
+
+Without saving, two operators looking at the UI see the same dropdown
+value but one is "unset → falls back to default" and the other is
+"explicitly saved" — and a future release that changes the default
+will only affect the unsaved one. **Always Save explicitly.**
+
+**4. Running OTP serving containers don't auto-pick-up router-config
+changes**
+
+The orphan `otp-<sid>-1` containers from previous Promotes keep running
+with whatever `router-config.json` they loaded at JVM startup. New
+defaults / per-session knobs in v0.1.21+ only take effect after either:
+
+- **Full path**: Rebuild graph + Promote (regenerates router-config,
+  recreates the OTP container) — ~30 min for a France-wide multi-NAP
+  session.
+- **Fast path**: edit `router-config.json` in place + `docker restart
+  viator-otp-<sid>-1` — see §6.8. Doesn't survive next Promote.
+
+**5. Smoke-test a journey search**
+
+The integration test for "everything's wired up". For a France-anchored
+session:
+
+- Paris GdL → Lyon Part-Dieu (short-range, hits SNCF TGV directly)
+- Paris GdL → Marseille St-Charles (long-range, exercises
+  `apiProcessingTimeout` budget)
+- For multi-tz sessions: Paris GdN → London St Pancras (Eurostar,
+  exercises `transitModelTimeZone`)
+
+If any of these return `0 trips in Xms (timeout)`, jump to §6.7.
+If they return `No itineraries found.` without a timeout, suspect data
+quality (see also §8 v0.1.20's "service window" caveat).
+
+**6. Browser DevTools console clean**
+
+`F12` → Console tab. **No red errors.** Specific things that have
+broken at various releases and are worth verifying still work:
+
+- `escHTML is not defined` (v0.1.16 fix) — NAP catalogue dropdown
+- `Uncaught (in promise) ReferenceError` of any flavour
+- Any 4xx/5xx in the Network tab during page load (other than the
+  expected 404 on `/static/branding/sentry-logo.svg` which we don't
+  ship)
+
+A clean console + filled provider status pills (v0.1.19) + populated
+"Current build" card (v0.1.20) means the v0.1.X+ feature stack is
+working end-to-end.
+
 ---
 
 ## 7. Rollback
@@ -617,6 +871,17 @@ appear blank in the UI dropdown until the operator clicks Save (which
 records the explicit choice in `session.config.otp_api_timeout`).
 Existing graphs keep using whatever timeout was in their already-loaded
 router-config; click **Rebuild graph** to regenerate with the new value.
+
+**Footgun discovered post-release** (operator hit it 2026-05-05): the
+v0.1.24 `otp_api_timeout` knob has no operator-visible effect unless
+the web-app-side `FANOUT_TIMEOUT_MS` (default `10 000` ms in
+`platform_config`) is also bumped to ≥ `otp_api_timeout + 2 000 ms`.
+The web app's httpx client gives up before OTP returns, surfacing as
+`0 trips in 10 041 ms (timeout)` regardless of the OTP-side budget.
+Until v0.1.26 ships the auto-coordination fix, **operators bumping
+`otp_api_timeout` to 60s must also bump `FANOUT_TIMEOUT_MS` to 60000
+via `/admin/config`**. Full diagnostic flowchart in §6.7; reference
+table of every timeout in the system in §6.10.
 
 **v0.1.23**: complete rebuild inputs inventory + per-session heap + live elapsed ticker.
 
