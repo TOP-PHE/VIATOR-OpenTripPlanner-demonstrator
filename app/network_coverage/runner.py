@@ -300,20 +300,32 @@ async def _execute_pair(
 
     # Persist into journey_searches + journey_trips (best-effort, so the
     # click-cell drilldown can reuse the v0.1.26 trip-card UI).
+    #
+    # v0.1.29.4 — endpoint must be one of ('plan','compare','fanout') and
+    # requested_time_kind must be one of ('depart_at','arrive_by') per the
+    # CheckConstraints on journey_searches. v0.1.27 shipped with
+    # endpoint='network-coverage' / requested_time_kind='depart' which
+    # silently violated both constraints — every coverage row's INSERT
+    # rolled back, leaving journey_search_id NULL on every result and
+    # the modal forever showing "No linked journey-search row". The
+    # coverage-vs-live distinction is preserved via
+    # network_coverage_results.journey_search_id (the FK from the
+    # coverage row pins it back to its parent run), so flattening
+    # endpoint='plan' loses no analytical signal.
     with SessionLocal() as db:
         try:
             search = recorder.begin_search(
                 db,
                 user_id=None,  # ran from a background task
                 ip=None,
-                endpoint="network-coverage",
+                endpoint="plan",
                 origin_lat=origin.lat,
                 origin_lon=origin.lon,
                 origin_label=origin.name,
                 dest_lat=dest.lat,
                 dest_lon=dest.lon,
                 dest_label=dest.name,
-                requested_time_kind="depart",
+                requested_time_kind="depart_at",
                 requested_time=depart_at,
                 modes="TRANSIT,WALK",
             )
@@ -339,7 +351,7 @@ async def _execute_pair(
             )
             journey_search_id = search.id
             db.commit()
-        except Exception:
+        except Exception as recorder_exc:
             log.exception(
                 "coverage run %s pair %s→%s: recorder write failed (continuing)",
                 run_id,
@@ -347,6 +359,13 @@ async def _execute_pair(
                 dest.id,
             )
             db.rollback()
+            # v0.1.29.4 — surface the recorder failure into the matrix row
+            # so the operator can see *why* the drilldown link is missing
+            # (e.g. CheckConstraint violation) instead of the generic
+            # "recorder write failed" message in the modal. Don't clobber
+            # an existing OTP-side error_message; append/keep both.
+            recorder_msg = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+            error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
 
     # Always persist the coverage result, even when the recorder write
     # failed — the matrix is the canonical artifact.
