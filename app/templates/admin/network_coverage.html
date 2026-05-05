@@ -83,11 +83,20 @@
 
 .cov-summary { display: flex; gap: 0.6rem; flex-wrap: wrap; padding: 0.5rem 0.7rem; background: #eef2f8; border-radius: 4px; margin-bottom: 0.6rem; font-size: 0.85rem; align-items: center; }
 .cov-summary > div { white-space: nowrap; }
-/* v0.1.29 — view toggle. Three modes change what each cell displays. */
+/* v0.1.29 — view toggle. Three modes change what each cell displays.
+   v0.1.29.5 — pinned dark text on inactive buttons. The previous rule
+   only set a colour on .active (white on blue); the inactive state had
+   white background with no colour, so it inherited a pale grey from
+   the page that rendered the labels nearly invisible. */
 .cov-view-toggle { margin-left: auto; display: flex; gap: 0.2rem; }
-.cov-view-toggle button { padding: 0.15rem 0.5rem; font-size: 0.75rem; border: 1px solid #d0d7de; background: #fff; cursor: pointer; }
+.cov-view-toggle button {
+  padding: 0.15rem 0.5rem; font-size: 0.75rem;
+  border: 1px solid #d0d7de; background: #fff;
+  color: #1f2328; font-weight: 500;
+  cursor: pointer;
+}
 .cov-view-toggle button.active { background: var(--uic-blue); color: #fff; border-color: var(--uic-blue); }
-.cov-view-toggle button:hover:not(.active) { background: #eef2f8; }
+.cov-view-toggle button:hover:not(.active) { background: #eef2f8; color: #1f2328; }
 /* Trip-count heatmap — denser greens for more trains. v0.1.29.4 — pinned
    text colour at every step so the count number is readable across the
    whole gradient (was inheriting a medium grey at low counts). */
