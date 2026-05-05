@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     DateTime,
@@ -101,7 +102,7 @@ class NetworkCoverageRun(Base):
 
     # Catch-all for any post-run summary the runner wants to attach
     # (e.g. average response time, slowest pair, list of timed-out pairs).
-    summary: Mapped[dict | None] = mapped_column(JSONB)
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
 class NetworkCoverageResult(Base):
