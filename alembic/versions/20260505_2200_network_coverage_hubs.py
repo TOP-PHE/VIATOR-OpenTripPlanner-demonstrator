@@ -20,9 +20,18 @@ sort_order is assigned in the curated order from hubs.py — Paris first,
 then clockwise around France — so the matrix axis order doesn't change
 on first deploy.
 
-Revision ID: 20260505_2200_network_coverage_hubs
+Revision ID: 20260505_2200_coverage_hubs
 Revises: 20260505_1500_network_coverage
 Create Date: 2026-05-05 22:00:00.000000
+
+v0.1.32.1: revision ID shortened from `20260505_2200_network_coverage_hubs`
+(35 chars) to `20260505_2200_coverage_hubs` (27 chars). The default
+`alembic_version.version_num` column is VARCHAR(32) — the longer form
+fails to upgrade with `StringDataRightTruncation` and locks the web
+container in a restart loop. Other migrations in this repo cap at 30
+chars; this one is now 27 with margin. The filename is left at its
+original 35-char form because filenames aren't tracked anywhere — only
+the `revision` string inside is what alembic stores.
 """
 
 from __future__ import annotations
@@ -34,7 +43,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "20260505_2200_network_coverage_hubs"
+revision: str = "20260505_2200_coverage_hubs"
 down_revision: str | Sequence[str] | None = "20260505_1500_network_coverage"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
