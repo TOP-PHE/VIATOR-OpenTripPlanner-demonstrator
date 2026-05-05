@@ -45,12 +45,24 @@ from .credentials import AuthType, apply_to_request
 # Defaults baked into every per-session config. Mirrors the static
 # `docker/otp/router-config.json` to preserve behaviour for sessions
 # without GTFS-RT URLs configured.
-_DEFAULT_SERVER = {"apiProcessingTimeout": "10s"}
+#
+# v0.1.24: `apiProcessingTimeout` is now per-session (operator-tunable
+# via UI dropdown), default 30s — bumped from 10s because the original
+# value silently times out searches on multi-NAP graphs (Paris → Marseille
+# returned "0 trips in 10036ms (timeout)" once the session grew to 13
+# providers + 43k stops). Caller passes `api_timeout` to
+# render_router_config; we don't even need a default constant for it
+# any more, but keep the structural map for clarity:
 _DEFAULT_ROUTING_DEFAULTS = {
     "numItineraries": 5,
     "transferSlack": "2m",
-    # OTP 2.x: how far OTP will walk to reach the first / leave the last
-    # transit stop. Without a tight bound, OTP silently routes to the
+    # v0.1.24: OTP 2.9 renamed `maxAccessEgressDurationForMode` (flat,
+    # uppercase mode keys) to `accessEgress.maxDurationForMode` (nested,
+    # lowercase keys). The old form triggered a "Unexpected config
+    # parameter" warning at every build — silently fell back to the
+    # OTP-level default, which made our 20m bound a no-op.
+    #
+    # Why the bound matters: without it OTP silently routes to the
     # nearest transit-reachable place when the requested coordinate is
     # far from any transit stop — e.g. asking "Paris → Cagnes-sur-Mer"
     # against a TGV-only feed returns Paris→Marseille trips because
@@ -64,8 +76,13 @@ _DEFAULT_ROUTING_DEFAULTS = {
     # (RER stations are dense in Paris, and stations are usually <1 km
     # apart in city centres). Increase per-session via session.config
     # routing overrides if the operator has a rural use case.
-    "maxAccessEgressDurationForMode": {
-        "WALK": "20m",
+    #
+    # Mode keys are lowercase per OTP 2.9 schema — see
+    # https://docs.opentripplanner.org/en/v2.9.0/RouteRequest/#rd_accessEgress_maxDurationForMode
+    "accessEgress": {
+        "maxDurationForMode": {
+            "walk": "20m",
+        },
     },
 }
 
@@ -106,6 +123,7 @@ def render_router_config(
     providers: list[dict[str, Any]],
     *,
     credentials: ResolvedCredentials | None = None,
+    api_timeout: str = "30s",
 ) -> str:
     """Build a router-config.json document for one session.
 
@@ -118,6 +136,11 @@ def render_router_config(
     whose provider declares `gtfs_rt_credential_id` get the credential
     applied — query-style → URL gets the param appended; header/bearer/
     basic → an OTP `headers` dict is emitted on the updater entry.
+
+    `api_timeout` (v0.1.24) sets `server.apiProcessingTimeout`. Caller
+    is responsible for validating the value via
+    `app.otp_api_timeout.validate_timeout` before passing it; we don't
+    re-validate here so the function stays pure.
     """
     updaters = []
     for p in providers:
@@ -150,7 +173,7 @@ def render_router_config(
             updaters.append(entry)
 
     config: dict[str, Any] = {
-        "server": _DEFAULT_SERVER,
+        "server": {"apiProcessingTimeout": api_timeout},
         "routingDefaults": _DEFAULT_ROUTING_DEFAULTS,
     }
     # Only include the updaters key when we have at least one — keeps

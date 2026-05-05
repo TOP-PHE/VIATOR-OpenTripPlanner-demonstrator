@@ -317,7 +317,14 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # defensive — bad strings raise here rather than at build time, so the
     # job's log shows a clear "unknown osm_scope" instead of a shell error
     # from the entrypoint.
-    from . import ingestion, osm_filter, otp_heap, otp_timezone, router_config
+    from . import (
+        ingestion,
+        osm_filter,
+        otp_api_timeout,
+        otp_heap,
+        otp_timezone,
+        router_config,
+    )
 
     osm_scope = osm_filter.DEFAULT_SCOPE
     # v0.1.21 — explicit transitModelTimeZone, required by OTP 2.9 when
@@ -332,6 +339,11 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # France-wide) now do it via the UI dropdown instead of SSH-and-
     # restart-worker.
     otp_heap_value = settings.otp_build_heap
+    # v0.1.24 — per-session OTP API processing timeout. Default 30s
+    # (bumped from the pre-v0.1.24 hardcoded 10s); operator can dial up
+    # to 60s/120s for cross-border/multi-NAP graphs that explore many
+    # candidate paths before returning. Same read-from-config pattern.
+    api_timeout = otp_api_timeout.DEFAULT_TIMEOUT
     providers: list[dict[str, Any]] = []
     # Map of credential_id → (auth_type, plaintext, param_name) for any
     # credentials referenced by GTFS-RT URLs in this session's providers.
@@ -370,6 +382,17 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                         sid,
                         exc,
                         settings.otp_build_heap,
+                    )
+                try:
+                    api_timeout = otp_api_timeout.validate_timeout(
+                        row.config.get("otp_api_timeout")
+                    )
+                except ValueError as exc:
+                    log.warning(
+                        "session %s has bad otp_api_timeout: %s — using default %s",
+                        sid,
+                        exc,
+                        otp_api_timeout.DEFAULT_TIMEOUT,
                     )
                 try:
                     providers = ingestion.normalize_providers(row.config)
@@ -450,6 +473,7 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                 router_config.render_router_config(
                     providers,
                     credentials=rt_credentials or None,
+                    api_timeout=api_timeout,
                 ),
                 encoding="utf-8",
             )

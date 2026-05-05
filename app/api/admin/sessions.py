@@ -236,6 +236,21 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
+        # v0.1.24 — validate otp_api_timeout. Operator picks how long OTP
+        # is allowed to spend per journey-search request. Bad values
+        # (e.g. "30 s" with a space, "30sec", ISO-8601 "PT30S") would
+        # silently fall back to default; reject up front for the same
+        # reason as the other knobs.
+        if "otp_api_timeout" in body.config:
+            from ... import otp_api_timeout as _otp_api_timeout
+
+            try:
+                body.config["otp_api_timeout"] = _otp_api_timeout.validate_timeout(
+                    body.config["otp_api_timeout"]
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
         # Validate provider bundles (v0.1.6) on save. We accept the legacy
         # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),
         # but for save-time validation we only error on the v0.1.6-shaped

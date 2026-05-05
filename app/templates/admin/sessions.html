@@ -162,6 +162,29 @@
                 multi-NAP sessions. If the build OOM-kills at "Linking transit stops" Phase 2,
                 that's the signal to bump.
               </p>
+              {# v0.1.24 — per-session OTP API processing timeout. Caps how
+                 long a single journey-search request can run. Default 30s;
+                 bump to 60s/120s for multi-NAP graphs that timed out at
+                 the pre-v0.1.24 hardcoded 10s (Paris GdL → Marseille on
+                 a 13-provider France-wide graph hit this every time). #}
+              <label>OTP API timeout <span class="hint">(<code>server.apiProcessingTimeout</code> — per journey-search request)</span></label>
+              <select name="otp_api_timeout">
+                <option value="10s">10 s — small single-feed sessions</option>
+                <option value="20s">20 s</option>
+                <option value="30s">30 s — standard multi-NAP graphs (recommended)</option>
+                <option value="60s">60 s</option>
+                <option value="120s">120 s — last-resort cap for cross-border experiments</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem">
+                Cap on how long OTP can spend resolving a single search before returning
+                <em>"0 trips in Xms (timeout)"</em>. The pre-v0.1.24 hardcoded 10 s was too tight
+                for France-wide multi-NAP graphs (43k stops, 13 providers, 1.1M walk transfers):
+                Paris→Marseille ran out of budget exploring alternatives even though the direct
+                TGV exists. <strong>Bump to 60 s if you see timeout responses on routes you
+                expect to work.</strong> Effective on next graph rebuild (writes to
+                <code>router-config.json</code>); the running otp-{sid} container picks it up at
+                next Promote.
+              </p>
               <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem; flex-wrap: wrap">
                 <button type="submit">Save config</button>
                 {# v0.1.14: split refresh into providers-only (cheap, frequent)
@@ -523,6 +546,12 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // worker reads None → falls back to .env → operator-invisible).
       if (cf.elements['otp_build_heap']) {
         cf.elements['otp_build_heap'].value = cfg.otp_build_heap || '12g';
+      }
+      // v0.1.24: per-session OTP API processing timeout. Default '30s'
+      // (bumped from the pre-v0.1.24 hardcoded 10s); legacy sessions
+      // see the new default until they explicitly save.
+      if (cf.elements['otp_api_timeout']) {
+        cf.elements['otp_api_timeout'].value = cfg.otp_api_timeout || '30s';
       }
       // Show / hide the staleness banner based on the persisted _meta.
       setStalenessBanner(sid);
@@ -1033,6 +1062,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // v0.1.23: same for the OTP build heap.
     const otpHeap = (form.elements['otp_build_heap']?.value || '').trim();
     if (otpHeap) cfg.otp_build_heap = otpHeap;
+    // v0.1.24: same for the OTP API timeout.
+    const otpApiTimeout = (form.elements['otp_api_timeout']?.value || '').trim();
+    if (otpApiTimeout) cfg.otp_api_timeout = otpApiTimeout;
     // Drop legacy top-level gtfs/mct/stations once we've migrated to providers.
     if (providers.length) {
       delete cfg.sources.gtfs;

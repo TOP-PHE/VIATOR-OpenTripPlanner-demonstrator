@@ -539,7 +539,60 @@ the schema (`grep alembic /path/to/release-notes` or check
 
 ## 8. Recent versions — what shipped, what's still queued
 
-**v0.1.23 (latest)**: complete rebuild inputs inventory + per-session heap + live elapsed ticker.
+**v0.1.24 (latest)**: per-session OTP API timeout + OTP 2.9 schema fix.
+
+Two related fixes touching `router-config.json`:
+
+1. **Per-session `otp_api_timeout`** — same UI pattern as v0.1.21+
+   knobs (osm_scope / otp_timezone / otp_build_heap). Default bumped
+   from the pre-v0.1.24 hardcoded `10s` to `30s`. Operator can dial up
+   to `60s` / `120s` via the Configure form when bigger graphs need it.
+
+   Why: Paris GdL → Marseille on a 13-provider France-wide graph
+   (43,673 stops, 1.18M walk transfers) was returning `0 trips in
+   10036ms (timeout)` even though direct TGV exists. OTP wasn't failing
+   to find a route — it was running out of its 10s budget while
+   exploring TGV+TER+Trenitalia+Eurostar alternatives. 30s comfortably
+   accommodates that exploration on the largest sessions; 10s is
+   retained as a dropdown option for small single-feed sessions where
+   tighter feedback is preferred.
+
+   Caveat documented in OTP 2.9 docs and worth knowing: when the
+   `ParallelRouting` feature flag is on, OTP **bypasses
+   apiProcessingTimeout entirely**. We don't enable that flag; if a
+   future operator does, the knob becomes a no-op.
+
+2. **`maxAccessEgressDurationForMode` rename** — fixes the OTP 2.9
+   warning on every build:
+
+   ```
+   WARN (NodeAdapter.java:169) Unexpected config parameter:
+   'routingDefaults.maxAccessEgressDurationForMode:{"WALK":"20m"}'
+   ```
+
+   The field moved in OTP 2.9 (verified against
+   <https://docs.opentripplanner.org/en/v2.9.0/RouteRequest/#rd_accessEgress_maxDurationForMode>):
+
+   - **Old**: `routingDefaults.maxAccessEgressDurationForMode` (flat,
+     uppercase mode keys like `WALK`).
+   - **New**: `routingDefaults.accessEgress.maxDurationForMode` (nested,
+     lowercase mode keys like `walk`).
+
+   This wasn't just a cosmetic warning — OTP was silently falling back
+   to its **default** access/egress duration (45 min) instead of the
+   20 min we'd set. So the v0.1.7 commit message about
+   "Cagnes-sur-Mer-style misrouting" was technically not protecting
+   anything until v0.1.24. The bundled fallback
+   `docker/otp/router-config.json` is updated to match.
+
+**Migration**: existing sessions without `otp_api_timeout` set inherit
+the new 30s default — no operator action required, but the value will
+appear blank in the UI dropdown until the operator clicks Save (which
+records the explicit choice in `session.config.otp_api_timeout`).
+Existing graphs keep using whatever timeout was in their already-loaded
+router-config; click **Rebuild graph** to regenerate with the new value.
+
+**v0.1.23**: complete rebuild inputs inventory + per-session heap + live elapsed ticker.
 
 Three improvements driven by feedback from the v0.1.20 rebuild panel
 landing in operator hands:

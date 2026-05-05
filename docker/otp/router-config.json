@@ -1,13 +1,15 @@
 {
   "server": {
-    "apiProcessingTimeout": "10s"
+    "apiProcessingTimeout": "30s"
   },
   "routingDefaults": {
     "numItineraries": 5,
     "transferSlack": "2m",
     "walkSpeed": 1.3,
-    "maxAccessEgressDurationForMode": {
-      "WALK": "20m"
+    "accessEgress": {
+      "maxDurationForMode": {
+        "walk": "20m"
+      }
     }
   },
   "updaters": [
