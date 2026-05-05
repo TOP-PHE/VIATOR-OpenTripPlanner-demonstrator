@@ -60,9 +60,7 @@ def validate_heap(
     if value is None or value == "":
         return default
     if not isinstance(value, str):
-        raise ValueError(
-            f"otp_build_heap must be a string, got {type(value).__name__}"
-        )
+        raise ValueError(f"otp_build_heap must be a string, got {type(value).__name__}")
     stripped = value.strip()
     m = _HEAP_RE.match(stripped)
     if not m:

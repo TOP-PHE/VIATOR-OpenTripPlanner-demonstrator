@@ -190,9 +190,7 @@ def admin_network_coverage_page(
     if user.role != "platform_admin":
         return _forbidden_html(request, "Platform admin access required.")
     serving = (
-        db.execute(
-            select(SessionRow).where(SessionRow.state == "serving").order_by(SessionRow.id)
-        )
+        db.execute(select(SessionRow).where(SessionRow.state == "serving").order_by(SessionRow.id))
         .scalars()
         .all()
     )

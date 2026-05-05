@@ -13,7 +13,6 @@ import pytest
 
 from app.otp_heap import COMMON_HEAPS, DEFAULT_HEAP, validate_heap
 
-
 # ──────────────────────── happy path ────────────────────────
 
 
@@ -42,18 +41,21 @@ def test_explicit_default_arg_is_honoured():
     assert validate_heap("", default="36g") == "36g"
 
 
-@pytest.mark.parametrize("value,expected", [
-    ("12g", "12g"),
-    ("24g", "24g"),
-    ("36g", "36g"),
-    ("8192m", "8192m"),
-    # Case insensitivity at the unit position — JVM accepts both 'g' and 'G'.
-    ("12G", "12g"),
-    ("24G", "24g"),
-    # Whitespace gets trimmed.
-    ("  16g  ", "16g"),
-    ("16g\n", "16g"),
-])
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("12g", "12g"),
+        ("24g", "24g"),
+        ("36g", "36g"),
+        ("8192m", "8192m"),
+        # Case insensitivity at the unit position — JVM accepts both 'g' and 'G'.
+        ("12G", "12g"),
+        ("24G", "24g"),
+        # Whitespace gets trimmed.
+        ("  16g  ", "16g"),
+        ("16g\n", "16g"),
+    ],
+)
 def test_valid_values_normalize_to_lowercase_unit(value, expected):
     """Round-trip happy path: any well-formed value comes back lowercased."""
     assert validate_heap(value) == expected
@@ -69,18 +71,21 @@ def test_all_curated_dropdown_values_validate():
 # ──────────────────────── failure modes ────────────────────────
 
 
-@pytest.mark.parametrize("bad_value", [
-    "12 g",       # space between qty and unit
-    "12gb",       # 'gb' is two chars
-    "12gigs",     # nonsense suffix
-    "12.5g",      # JVM doesn't accept fractional heap
-    "g12",        # backwards
-    "12",         # missing unit (JVM defaults to bytes which is wrong)
-    "G",          # missing qty
-    "twelve_g",   # alphabet
-    "-12g",       # negative
-    "0x12g",      # hex
-])
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "12 g",  # space between qty and unit
+        "12gb",  # 'gb' is two chars
+        "12gigs",  # nonsense suffix
+        "12.5g",  # JVM doesn't accept fractional heap
+        "g12",  # backwards
+        "12",  # missing unit (JVM defaults to bytes which is wrong)
+        "G",  # missing qty
+        "twelve_g",  # alphabet
+        "-12g",  # negative
+        "0x12g",  # hex
+    ],
+)
 def test_malformed_strings_rejected(bad_value):
     """Pin a handful of plausible-but-wrong values that operators might
     type by accident. Each gets a clear 400 instead of silently falling

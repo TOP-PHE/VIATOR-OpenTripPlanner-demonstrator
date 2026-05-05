@@ -28,7 +28,7 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select, update
@@ -36,13 +36,12 @@ from sqlalchemy.orm import Session as DbSession
 
 from ..db import SessionLocal
 from ..journey import otp_client, recorder
-from ..journey.signature import trip_signature
 from ..models import (
     NetworkCoverageResult,
     NetworkCoverageRun,
 )
 from ..models import Session as SessionRow
-from .hubs import HUBS_BY_ID, Hub, all_pairs, unordered_pairs
+from .hubs import Hub, all_pairs, unordered_pairs
 
 log = logging.getLogger(__name__)
 
@@ -73,9 +72,7 @@ def create_run(
     """
     if direction not in ("both", "single"):
         raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
-    pairs = (
-        all_pairs() if direction == "both" else unordered_pairs()
-    )
+    pairs = all_pairs() if direction == "both" else unordered_pairs()
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,
         session_id=session_id,
@@ -119,19 +116,17 @@ async def execute_run(run_id: uuid.UUID) -> None:
             )
             return
         run.status = "running"
-        run.started_at = datetime.now(timezone.utc)
+        run.started_at = datetime.now(UTC)
         db.commit()
         if run.session_id is None:
             log.warning("run %s has no session_id — aborting", run_id)
             run.status = "failed"
-            run.finished_at = datetime.now(timezone.utc)
+            run.finished_at = datetime.now(UTC)
             db.commit()
             return
         session_id_for_pairs = run.session_id
         depart_at_for_pairs = run.depart_at
-        pairs = (
-            all_pairs() if run.direction == "both" else unordered_pairs()
-        )
+        pairs = all_pairs() if run.direction == "both" else unordered_pairs()
 
     if not pairs or depart_at_for_pairs is None:
         log.error("run %s has no pairs to execute", run_id)
@@ -163,7 +158,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
             db.execute(
                 update(NetworkCoverageRun)
                 .where(NetworkCoverageRun.id == run_id)
-                .values(status="failed", finished_at=datetime.now(timezone.utc))
+                .values(status="failed", finished_at=datetime.now(UTC))
             )
             db.commit()
         return
@@ -182,18 +177,18 @@ async def execute_run(run_id: uuid.UUID) -> None:
         if run is None:
             return
         run.status = "completed"
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         # Compute summary counters one last time — the per-pair updates
         # incremented these but a final SUM is bug-resistant.
-        rows = db.execute(
-            select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id)
-        ).scalars().all()
+        rows = (
+            db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
+            .scalars()
+            .all()
+        )
         run.completed_pairs = len(rows)
         run.ok_pairs = sum(1 for r in rows if r.status == "ok")
         run.no_route_pairs = sum(1 for r in rows if r.status == "no_route")
-        run.error_pairs = sum(
-            1 for r in rows if r.status not in ("ok", "no_route", "skipped")
-        )
+        run.error_pairs = sum(1 for r in rows if r.status not in ("ok", "no_route", "skipped"))
         run.summary = {
             "elapsed_seconds": elapsed_s,
             "median_response_ms": _median(
@@ -262,10 +257,11 @@ async def _execute_pair(
         response_ms = int((time.monotonic() - started) * 1000)
         # Distinguish timeout from generic error for the matrix colouring.
         cls_name = type(exc).__name__
-        if "Timeout" in cls_name or "timeout" in cls_name.lower():
-            status = "timeout"
-        else:
-            status = "error"
+        status = (
+            "timeout"
+            if "Timeout" in cls_name or "timeout" in cls_name.lower()
+            else "error"
+        )
         error_message = f"{cls_name}: {exc}"[:500]
         log.warning(
             "coverage run %s pair %s→%s failed: %s",
@@ -392,9 +388,7 @@ def get_run_with_results(
     if run is None:
         return None, []
     results = (
-        db.execute(
-            select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id)
-        )
+        db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
         .scalars()
         .all()
     )
@@ -405,9 +399,7 @@ def list_recent_runs(db: DbSession, *, limit: int = 20) -> list[NetworkCoverageR
     """Most-recent runs first — for the sidebar list on the admin page."""
     return list(
         db.execute(
-            select(NetworkCoverageRun)
-            .order_by(NetworkCoverageRun.started_at.desc())
-            .limit(limit)
+            select(NetworkCoverageRun).order_by(NetworkCoverageRun.started_at.desc()).limit(limit)
         )
         .scalars()
         .all()

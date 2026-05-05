@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.network_coverage.hubs import (
     HUBS,
     HUBS_BY_ID,
-    Hub,
     all_pairs,
     unordered_pairs,
 )
@@ -31,6 +28,7 @@ def test_all_hub_ids_url_safe():
     """IDs travel through URLs (the click-cell drilldown) and DB JSONB.
     Lowercase + digits + hyphens only keeps them safe."""
     import re
+
     pat = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
     for h in HUBS:
         assert pat.match(h.id), f"hub id {h.id!r} is not url-safe"
@@ -53,7 +51,7 @@ def test_hubs_by_id_lookup():
 
 
 def test_all_pairs_is_n_times_n_minus_1():
-    """All-pairs (directional) = n × (n-1). For 23 hubs → 506 pairs."""
+    """All-pairs (directional) = n x (n-1). For 23 hubs -> 506 pairs."""
     pairs = all_pairs()
     assert len(pairs) == 23 * 22  # 506
     # No self-pairs.
@@ -62,7 +60,7 @@ def test_all_pairs_is_n_times_n_minus_1():
 
 
 def test_unordered_pairs_is_n_choose_2():
-    """Unordered pairs = n × (n-1) / 2. For 23 hubs → 253 pairs."""
+    """Unordered pairs = n x (n-1) / 2. For 23 hubs -> 253 pairs."""
     pairs = unordered_pairs()
     assert len(pairs) == 23 * 22 // 2  # 253
     # No self-pairs.

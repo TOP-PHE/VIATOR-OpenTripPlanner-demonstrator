@@ -20,7 +20,7 @@ polls GET /runs/{id} every 5s to render progress; status flips to
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -108,9 +108,7 @@ def list_hubs(
     """The curated 23-hub list. Stable identifier set; UI uses these as
     the matrix row + column headers."""
     return [
-        HubInfo(
-            id=h.id, name=h.name, short=h.short, region=h.region, lat=h.lat, lon=h.lon
-        )
+        HubInfo(id=h.id, name=h.name, short=h.short, region=h.region, lat=h.lat, lon=h.lon)
         for h in HUBS
     ]
 
@@ -156,7 +154,7 @@ def create_run(
     # transitModelTimeZone; we keep our DB representation tz-aware.
     depart_at = body.depart_at
     if depart_at.tzinfo is None:
-        depart_at = depart_at.replace(tzinfo=timezone.utc)
+        depart_at = depart_at.replace(tzinfo=UTC)
 
     run = runner.create_run(
         db,

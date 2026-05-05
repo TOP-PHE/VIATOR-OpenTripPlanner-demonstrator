@@ -178,9 +178,7 @@ def enumerate_session_inputs(
             try:
                 sha = _sha256_file(f)
             except OSError as exc:
-                log.warning(
-                    "inbox enumeration: could not sha %s: %s — skipping", f, exc
-                )
+                log.warning("inbox enumeration: could not sha %s: %s — skipping", f, exc)
                 continue
             if sha in seen_sha:
                 # Same content under a different filename. Don't double-count;
@@ -237,9 +235,7 @@ def record_snapshot(
     we'd rather record the build with no inputs than crash here).
     """
     if source_inputs is not None and source_uploads is not None:
-        raise ValueError(
-            "record_snapshot: pass either source_uploads OR source_inputs, not both"
-        )
+        raise ValueError("record_snapshot: pass either source_uploads OR source_inputs, not both")
 
     # Normalise to the JSONB-shaped dict list regardless of input style.
     if source_inputs is not None:
@@ -274,9 +270,7 @@ def record_snapshot(
         # has stored_path but the dict above doesn't surface it for ORM
         # path because Upload.stored_path was already in the projection).
         if gtfs_path is None and source_uploads:
-            gtfs_upload = next(
-                (u for u in source_uploads if u.detected_kind == "GTFS"), None
-            )
+            gtfs_upload = next((u for u in source_uploads if u.detected_kind == "GTFS"), None)
             if gtfs_upload is not None:
                 gtfs_path = Path(gtfs_upload.stored_path)
 

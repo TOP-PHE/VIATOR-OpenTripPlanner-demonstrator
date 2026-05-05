@@ -215,9 +215,7 @@ def patch_session(
             from ... import otp_timezone as _otp_tz
 
             try:
-                body.config["otp_timezone"] = _otp_tz.validate_timezone(
-                    body.config["otp_timezone"]
-                )
+                body.config["otp_timezone"] = _otp_tz.validate_timezone(body.config["otp_timezone"])
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
@@ -1162,8 +1160,10 @@ def _derive_provider_status(
         # know where its file would live.
         return ProviderStatus(feed_id=feed_id, state="pending")
 
-    file_path = inbox_root / fmt_details["subdir"] / ingestion.staged_filename_for_format(
-        feed_id, timetable_format
+    file_path = (
+        inbox_root
+        / fmt_details["subdir"]
+        / ingestion.staged_filename_for_format(feed_id, timetable_format)
     )
 
     fetched_at: datetime | None = None
@@ -1715,9 +1715,7 @@ def get_providers_status(
         .where(
             AuditEvent.target_kind == "session",
             AuditEvent.target_id == sid,
-            AuditEvent.action.in_(
-                ["session.sources.refreshed", "session.provider.refreshed"]
-            ),
+            AuditEvent.action.in_(["session.sources.refreshed", "session.provider.refreshed"]),
         )
         .order_by(desc(AuditEvent.ts))
         .limit(1)
@@ -1919,12 +1917,10 @@ def _snapshot_to_info(snap: GraphSnapshot) -> SnapshotInfo:
         is_current=bool(snap.is_current),
         timetable_main_version=snap.timetable_main_version or "",
         timetable_update_version=int(snap.timetable_update_version or 0),
-        service_period_start=snap.service_period_start.isoformat()
-        if snap.service_period_start
-        else "",
-        service_period_end=snap.service_period_end.isoformat()
-        if snap.service_period_end
-        else "",
+        service_period_start=(
+            snap.service_period_start.isoformat() if snap.service_period_start else ""
+        ),
+        service_period_end=snap.service_period_end.isoformat() if snap.service_period_end else "",
         source_uploads=list(snap.source_uploads or []),
         main_version_source=snap.main_version_source or "auto",
     )

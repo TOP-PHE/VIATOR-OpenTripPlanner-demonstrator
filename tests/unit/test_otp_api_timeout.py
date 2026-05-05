@@ -13,7 +13,6 @@ import pytest
 
 from app.otp_api_timeout import COMMON_TIMEOUTS, DEFAULT_TIMEOUT, validate_timeout
 
-
 # ──────────────────────── happy path ────────────────────────
 
 
@@ -38,19 +37,22 @@ def test_explicit_default_arg_honoured():
     assert validate_timeout(None, default="60s") == "60s"
 
 
-@pytest.mark.parametrize("value,expected", [
-    ("10s", "10s"),
-    ("30s", "30s"),
-    ("60s", "60s"),
-    ("120s", "120s"),
-    ("2m", "2m"),
-    # Case insensitivity at the unit position.
-    ("30S", "30s"),
-    ("2M", "2m"),
-    # Whitespace gets trimmed.
-    ("  30s  ", "30s"),
-    ("60s\n", "60s"),
-])
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("10s", "10s"),
+        ("30s", "30s"),
+        ("60s", "60s"),
+        ("120s", "120s"),
+        ("2m", "2m"),
+        # Case insensitivity at the unit position.
+        ("30S", "30s"),
+        ("2M", "2m"),
+        # Whitespace gets trimmed.
+        ("  30s  ", "30s"),
+        ("60s\n", "60s"),
+    ],
+)
 def test_valid_values_normalize(value, expected):
     assert validate_timeout(value) == expected
 
@@ -64,18 +66,21 @@ def test_all_curated_dropdown_values_validate():
 # ──────────────────────── failure modes ────────────────────────
 
 
-@pytest.mark.parametrize("bad_value", [
-    "30 s",         # space between qty and unit
-    "30sec",        # 'sec' suffix
-    "30 seconds",   # spelled out
-    "PT30S",        # ISO-8601 (deliberately unsupported — keep dropdown simple)
-    "30",           # missing unit
-    "s",            # missing qty
-    "30.5s",        # OTP doesn't accept fractional in this form
-    "30000ms",      # 'ms' deliberately not in our regex
-    "-30s",         # negative
-    "thirty_s",     # alphabet
-])
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "30 s",  # space between qty and unit
+        "30sec",  # 'sec' suffix
+        "30 seconds",  # spelled out
+        "PT30S",  # ISO-8601 (deliberately unsupported — keep dropdown simple)
+        "30",  # missing unit
+        "s",  # missing qty
+        "30.5s",  # OTP doesn't accept fractional in this form
+        "30000ms",  # 'ms' deliberately not in our regex
+        "-30s",  # negative
+        "thirty_s",  # alphabet
+    ],
+)
 def test_malformed_strings_rejected(bad_value):
     with pytest.raises(ValueError, match="doesn't match the expected pattern"):
         validate_timeout(bad_value)

@@ -60,9 +60,7 @@ def validate_timezone(value: str | None) -> str:
     if value is None or value == "":
         return DEFAULT_TIMEZONE
     if not isinstance(value, str):
-        raise ValueError(
-            f"otp_timezone must be a string, got {type(value).__name__}"
-        )
+        raise ValueError(f"otp_timezone must be a string, got {type(value).__name__}")
     try:
         ZoneInfo(value)
     except ZoneInfoNotFoundError as exc:

@@ -23,7 +23,6 @@ from typing import Any
 
 from app.api.admin.sessions import _classify_rebuild_log, _snapshot_to_info
 
-
 # ───────────────────────── _classify_rebuild_log ───────────────────────
 
 
@@ -104,17 +103,21 @@ def test_hit_takes_precedence_when_both_strings_appear():
 class _StubSnapshot:
     """Just enough of GraphSnapshot to drive the converter without an ORM."""
 
-    built_at: datetime | None = field(default_factory=lambda: datetime(2026, 5, 4, 14, 30, 12, tzinfo=UTC))
+    built_at: datetime | None = field(
+        default_factory=lambda: datetime(2026, 5, 4, 14, 30, 12, tzinfo=UTC)
+    )
     feed_signature: str = "a3f8d09c0123456789abcdef0123456789abcdef0123456789abcdef01234567"
     is_current: bool = True
     timetable_main_version: str = "2026-W14_2026-W39"
     timetable_update_version: int = 3
     service_period_start: date | None = field(default_factory=lambda: date(2026, 4, 1))
     service_period_end: date | None = field(default_factory=lambda: date(2026, 9, 30))
-    source_uploads: list[dict[str, Any]] = field(default_factory=lambda: [
-        {"upload_id": "u1", "filename": "sncf.zip", "sha256": "aa11", "kind": "GTFS"},
-        {"upload_id": "u2", "filename": "france.osm.pbf", "sha256": "bb22", "kind": "OSM-PBF"},
-    ])
+    source_uploads: list[dict[str, Any]] = field(
+        default_factory=lambda: [
+            {"upload_id": "u1", "filename": "sncf.zip", "sha256": "aa11", "kind": "GTFS"},
+            {"upload_id": "u2", "filename": "france.osm.pbf", "sha256": "bb22", "kind": "OSM-PBF"},
+        ]
+    )
     main_version_source: str = "auto"
 
 

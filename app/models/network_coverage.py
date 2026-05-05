@@ -80,9 +80,7 @@ class NetworkCoverageRun(Base):
     )
     # Direction mode: "both" runs A→B and B→A separately; "single" only
     # runs A→B for A < B (half the work, loses asymmetry detection).
-    direction: Mapped[str] = mapped_column(
-        String, nullable=False, server_default=text("'both'")
-    )
+    direction: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'both'"))
 
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
@@ -90,24 +88,16 @@ class NetworkCoverageRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # State machine: pending → running → (completed | failed | cancelled)
-    status: Mapped[str] = mapped_column(
-        String, nullable=False, server_default=text("'pending'")
-    )
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'pending'"))
 
     # Counters updated by the runner as it progresses. The UI uses these
     # for the live progress bar without having to aggregate over the
     # results table.
     total_pairs: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    completed_pairs: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    completed_pairs: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     ok_pairs: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    no_route_pairs: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
-    error_pairs: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    no_route_pairs: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    error_pairs: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     # Catch-all for any post-run summary the runner wants to attach
     # (e.g. average response time, slowest pair, list of timed-out pairs).
@@ -118,7 +108,9 @@ class NetworkCoverageResult(Base):
     __tablename__ = "network_coverage_results"
     __table_args__ = (
         UniqueConstraint(
-            "run_id", "origin_hub_id", "dest_hub_id",
+            "run_id",
+            "origin_hub_id",
+            "dest_hub_id",
             name="unique_result_per_run_pair",
         ),
         Index("ix_network_coverage_results_run_id", "run_id"),

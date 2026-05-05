@@ -27,12 +27,12 @@ import pytest
 
 from app.api.admin.sessions import _derive_provider_status
 
-
 # ─────────────────────────── Helpers ────────────────────────────
 
 
-def _write_gtfs(inbox_root: Path, feed_id: str, *, mtime_offset_h: float = 0.0,
-                size_bytes: int = 1024) -> Path:
+def _write_gtfs(
+    inbox_root: Path, feed_id: str, *, mtime_offset_h: float = 0.0, size_bytes: int = 1024
+) -> Path:
     """Plant a fake GTFS zip at the canonical inbox path with a chosen mtime.
 
     The mtime offset is hours **into the past** from now — `mtime_offset_h=2`
@@ -44,6 +44,7 @@ def _write_gtfs(inbox_root: Path, feed_id: str, *, mtime_offset_h: float = 0.0,
     if mtime_offset_h > 0:
         ts = (datetime.now(UTC) - timedelta(hours=mtime_offset_h)).timestamp()
         import os
+
         os.utime(target, (ts, ts))
     return target
 

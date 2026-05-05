@@ -150,9 +150,7 @@ def tick() -> None:
         if success and sid is not None and graph_path:
             try:
                 inbox_root = settings.inbox_dir / sid
-                inputs = graph_snapshots.enumerate_session_inputs(
-                    db, sid, inbox_root
-                )
+                inputs = graph_snapshots.enumerate_session_inputs(db, sid, inbox_root)
                 graph_snapshots.record_snapshot(
                     db,
                     session_id=sid,

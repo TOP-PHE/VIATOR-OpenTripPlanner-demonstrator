@@ -19,7 +19,6 @@ from app.otp_timezone import (
     validate_timezone,
 )
 
-
 # ───────────────────────── happy path ─────────────────────────
 
 
@@ -43,24 +42,27 @@ def test_empty_string_returns_default():
     assert validate_timezone("") == DEFAULT_TIMEZONE
 
 
-@pytest.mark.parametrize("tz", [
-    "Europe/Paris",
-    "Europe/London",
-    "Europe/Brussels",
-    "Europe/Berlin",
-    "Europe/Madrid",
-    "Europe/Rome",
-    "Europe/Zurich",
-    "Europe/Vienna",
-    "Europe/Stockholm",
-    "Europe/Oslo",
-    "Europe/Copenhagen",
-    "Europe/Helsinki",
-    "Europe/Warsaw",
-    "Europe/Prague",
-    "Europe/Lisbon",
-    "UTC",
-])
+@pytest.mark.parametrize(
+    "tz",
+    [
+        "Europe/Paris",
+        "Europe/London",
+        "Europe/Brussels",
+        "Europe/Berlin",
+        "Europe/Madrid",
+        "Europe/Rome",
+        "Europe/Zurich",
+        "Europe/Vienna",
+        "Europe/Stockholm",
+        "Europe/Oslo",
+        "Europe/Copenhagen",
+        "Europe/Helsinki",
+        "Europe/Warsaw",
+        "Europe/Prague",
+        "Europe/Lisbon",
+        "UTC",
+    ],
+)
 def test_curated_dropdown_values_all_validate(tz):
     """Every value in the UI dropdown must validate. If a curated entry
     ever fails, the operator sees a 400 the moment they click Save —

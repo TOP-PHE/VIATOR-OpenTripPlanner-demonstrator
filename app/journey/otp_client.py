@@ -163,9 +163,7 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
             # a reliable fallback indicator of which provider ingested
             # this leg.
             trip_gtfs_id = trip_obj.get("gtfsId") or ""
-            feed_id_from_trip = (
-                trip_gtfs_id.split(":", 1)[0] if ":" in trip_gtfs_id else None
-            )
+            feed_id_from_trip = trip_gtfs_id.split(":", 1)[0] if ":" in trip_gtfs_id else None
             legs_norm.append(
                 {
                     "mode": leg.get("mode"),

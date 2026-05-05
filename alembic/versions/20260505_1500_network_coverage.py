@@ -88,13 +88,9 @@ def upgrade() -> None:
             server_default=sa.text("'pending'"),
         ),
         sa.Column("total_pairs", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column(
-            "completed_pairs", sa.Integer, nullable=False, server_default=sa.text("0")
-        ),
+        sa.Column("completed_pairs", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("ok_pairs", sa.Integer, nullable=False, server_default=sa.text("0")),
-        sa.Column(
-            "no_route_pairs", sa.Integer, nullable=False, server_default=sa.text("0")
-        ),
+        sa.Column("no_route_pairs", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("error_pairs", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("summary", postgresql.JSONB, nullable=True),
     )
@@ -145,7 +141,9 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
         ),
         sa.UniqueConstraint(
-            "run_id", "origin_hub_id", "dest_hub_id",
+            "run_id",
+            "origin_hub_id",
+            "dest_hub_id",
             name="unique_result_per_run_pair",
         ),
     )

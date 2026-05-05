@@ -17,10 +17,10 @@ d'intérêt national" tier in the legend. 23 stations chosen to give:
   * **Two non-LGV centers** (Clermont-Ferrand, Brest) to surface where
     TER coverage is weak
 
-23 × 22 / 2 = 253 ordered pairs (we run both directions to surface
+23 x 22 / 2 = 253 ordered pairs (we run both directions to surface
 asymmetric data — a Paris→Marseille that works while Marseille→Paris
 fails is a real bug we want to catch). Total pair count in the matrix
-= 23 × 23 = 529 cells minus 23 diagonal = 506 routed cells — but we
+= 23 x 23 = 529 cells minus 23 diagonal = 506 routed cells — but we
 only RUN the 253 unique unordered pairs and double-render in the
 matrix view. (Or, optionally, run all 506 — see runner.py.)
 
@@ -115,11 +115,11 @@ def all_pairs(hubs: list[Hub] | None = None) -> list[tuple[Hub, Hub]]:
 
 
 def unordered_pairs(hubs: list[Hub] | None = None) -> list[tuple[Hub, Hub]]:
-    """Generate unordered pairs — N×(N-1)/2.
+    """Generate unordered pairs — N x (N-1) / 2.
 
     Useful for a half-matrix view where A→B and B→A are aggregated,
     or for cutting run-time in half when the operator doesn't care
     about asymmetry.
     """
     h = hubs if hubs is not None else HUBS
-    return [(a, b) for i, a in enumerate(h) for b in h[i + 1:]]
+    return [(a, b) for i, a in enumerate(h) for b in h[i + 1 :]]
