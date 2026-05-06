@@ -457,6 +457,14 @@ downhill.
 
 #### 6.2.1 Multi-country sessions (v0.1.30 — `rail-focused` scope)
 
+> **For full operational runbook on multi-country builds — including
+> heap budgets, OSM scope selection, file-name contracts, build-phase
+> tracking, and problem determination — see
+> [multi-country-runbook.md](./multi-country-runbook.md).**
+>
+> The condensed summary below is the v0.1.30 quick-start. The runbook
+> covers everything we learned from the v0.1.30→v0.1.32.1 EU build.
+
 For sessions covering more than one country (e.g. an "EU rail" session
 with FR + UK + BE + NL + DE + CH + AT + IT + ES merged into one PBF):
 the default `transit-focused` scope still keeps every drivable road in

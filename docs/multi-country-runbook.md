@@ -1,0 +1,734 @@
+# Multi-country sessions — OSM integration runbook
+
+A condensed operator runbook for the cross-border use case (e.g. building a
+session that routes Eurostar from Paris to London, Brussels, Amsterdam,
+plus ICE / Lyria / TGV connections to Germany, Switzerland, etc.) on
+commodity VPS hardware.
+
+Captures the lessons learned during the v0.1.30–v0.1.32.1 EU session
+build — file-name contracts, heap budgets, OSM scope choices, build phases,
+common failure modes, and the per-session config precedence rules that
+caused most of the friction.
+
+**Audience**: platform admins. Some sections require Postgres + Docker
+shell access on the VPS host.
+
+**Prerequisites**: VIATOR ≥ v0.1.32.1, `osmium-tool` installed on the VPS
+(`sudo apt install osmium-tool`), at least 50 GB free disk in `/opt`,
+and a session at `serving` state (the FR baseline) you can reference for
+heap-sizing comparisons.
+
+---
+
+## 1. The four pillars
+
+Multi-country builds fail in only four ways, in roughly this order of
+likelihood:
+
+| Pillar | Symptom | Section |
+|---|---|---|
+| **OSM sizing** | Build OOMs in JVM (heap exhaustion) or kernel (OOM-kill) | §3 Heap budgets, §4 OSM scope |
+| **Filename contracts** | `Unable to build street graph, no OSM data available` | §5 File-name contracts |
+| **Per-session config drift** | Build succeeds but serving container restart-loops | §7 Config precedence |
+| **GTFS provider plumbing** | Refresh providers fails 404 / fetched none | §8 Adding cross-border feeds |
+
+Each section is structured: **what happens → how to diagnose → how to fix**.
+
+---
+
+## 2. Sourcing OSM PBFs
+
+### Geofabrik — the canonical source
+
+Country-level extracts at https://download.geofabrik.de/europe/. Sizes as
+of mid-2026:
+
+| Country | Size | Country | Size |
+|---|---|---|---|
+| France | ~4.8 GB | Italy | ~1.9 GB |
+| Germany | ~4.5 GB | UK (great-britain) | ~1.8 GB |
+| Spain | ~1.5 GB | Netherlands | ~1.2 GB |
+| Austria | ~0.7 GB | Switzerland | ~0.5 GB |
+| Belgium | ~0.4 GB | Luxembourg | ~0.04 GB |
+
+### Merge with `osmium-tool`
+
+Always merge inside `tmux` — the operation runs ~10–30 min and SSH drops
+will kill it:
+
+```bash
+tmux new -s eu-osm
+
+mkdir -p /opt/viator/inbox-staging/eu && cd /opt/viator/inbox-staging/eu
+
+# Download
+for c in france great-britain belgium netherlands luxembourg \
+         germany switzerland ; do
+  wget -c "https://download.geofabrik.de/europe/${c}-latest.osm.pbf"
+done
+
+# Merge (deterministic — same inputs = same output bytes)
+osmium merge \
+  france-latest.osm.pbf great-britain-latest.osm.pbf belgium-latest.osm.pbf \
+  netherlands-latest.osm.pbf luxembourg-latest.osm.pbf \
+  germany-latest.osm.pbf switzerland-latest.osm.pbf \
+  -o eu-rail-7c.osm.pbf
+
+ls -lh eu-rail-7c.osm.pbf
+```
+
+`Ctrl-b d` to detach. `tmux attach -t eu-osm` to come back.
+
+### Expected merged sizes
+
+Roughly the sum of the country files — `osmium merge` doesn't dedupe
+much across non-adjacent countries. Each country PBF was generated
+independently from the planet, so border ways / nodes appear in both
+neighbouring countries' extracts.
+
+| Countries | Raw merged size |
+|---|---|
+| FR alone (baseline) | ~5 GB |
+| FR + UK + BE + NL + LU + DE + CH (7-country EU rail) | ~13–14 GB |
+| Same + AT + IT + ES (10-country) | ~17–19 GB |
+| Western-Europe Geofabrik extract | ~10–12 GB |
+
+---
+
+## 3. Heap budgets — the two-heap model
+
+OTP uses **two separate JVM heap settings** that are easy to confuse:
+
+| Setting | Where | Used by | Default |
+|---|---|---|---|
+| `OTP_BUILD_HEAP` | `.env` + per-session `config.otp_build_heap` | The one-shot otp-build container during graph build | `24g` (was `12g` pre-v0.1.32) |
+| `OTP_HEAP` | per-session `config.otp_heap` (no UI yet) | The long-running serving container that answers journey queries | `4g` hardcoded in `app/sessions_orchestrator.py` |
+
+**These are different containers with different lifecycles.** Each phase
+peaks at different memory usage:
+
+```
+Build phase (otp-build):
+  osmium tags-filter        ████ <100 MiB (I/O bound)
+  --buildStreet load        ████ ~5-10 GB
+  Parse OSM Nodes           ████████████ peak ~24-32 GB
+  Build street graph        ██████ ~15-20 GB
+  PruneIslands              ████████████ ~30-36 GB (heaviest!)
+  --loadStreet --save       ██████████ ~25-30 GB
+  Transit graph build       ████████ ~10-15 GB
+  Save graph.obj            ██ ~5-8 GB
+
+Serving phase (otp-<sid>):
+  Graph load + indexing     ████████ ~8-12 GB
+  RAPTOR mapping            ████████████ peak ~14-18 GB
+  Steady-state serving      ██████ ~6-10 GB + per-query allocations
+```
+
+### Rule of thumb
+
+```
+build heap ≈ 5–6 × filtered PBF size
+serve heap ≈ 1.5–2 × graph.obj size
+```
+
+### Heap matrix by scope
+
+For a 47 GB host with one 13 GB FR session also running:
+
+| OSM scope | Filtered PBF | otp_build_heap | otp_heap (serve) | Peak host usage during build |
+|---|---|---|---|---|
+| FR `transit-focused` | ~3 GB | 24g | 8g | ~38 GB |
+| FR `comprehensive` | ~5 GB | 36g | 12g | ~50 GB ⚠️ |
+| 7-country EU `rail-focused` | ~1.1 GB | **32g** ✓ | **20g** ✓ | ~45 GB |
+| 7-country EU `transit-focused` | ~10 GB | 60-80g ❌ | 24-32g | won't fit |
+| 10-country EU `rail-focused` | ~1.4 GB | 36-40g | 24g | borderline (we OOMed at 32g) |
+
+⚠️ = needs FR session stopped during build.
+❌ = won't fit on this host without scope reduction.
+
+### Setting heap correctly
+
+```bash
+# Build heap — settable via UI: Sessions → <sid> → Edit → OTP build heap dropdown
+# Or via SQL:
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "UPDATE sessions SET config = jsonb_set(config, '{otp_build_heap}', '\"32g\"') WHERE id='<sid>';"
+
+# Serve heap — NO UI, must use SQL (until v0.1.33):
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "UPDATE sessions SET config = jsonb_set(config, '{otp_heap}', '\"20g\"') WHERE id='<sid>';"
+```
+
+After updating `otp_heap`, the **generated compose fragment also needs
+patching** — the orchestrator only regenerates on session create/delete:
+
+```bash
+sudo sed -i '/^  otp-<sid>:/,/^  [a-z]/ s/OTP_HEAP: "OLD"/OTP_HEAP: "NEW"/' \
+  /opt/viator/docker/generated/docker-compose.sessions.yml
+docker rm -f viator-otp-<sid>-1
+cd /opt/viator/docker && docker compose -p viator up -d otp-<sid>
+sleep 5
+docker exec viator-otp-<sid>-1 ps -ef | grep java | head -1
+# Should show: java -Xmx<NEW>g ...
+```
+
+---
+
+## 4. OSM scope selection
+
+Four presets in `app/osm_filter.py`. Pick based on country count +
+available RAM:
+
+| Scope | Drops | Keeps | Use when |
+|---|---|---|---|
+| `transit-focused` (default) | driveways, agricultural tracks, construction | all major roads + walking + railway | single-country, ≥40 GB RAM |
+| `multi-modal` | nothing significant | + service roads, parking lot detail | dense urban last-mile matters |
+| `rail-focused` (v0.1.30) | **all driving infrastructure** | only railway + footway/path/steps + station entrances | multi-country / RAM-constrained |
+| `comprehensive` | nothing | original PBF unchanged | OSM debugging |
+
+**`rail-focused` is the only scope that fits a 7+-country EU build on a
+47 GB box.** Other scopes either OOM during parse or pruning.
+
+### Trade-off you accept with `rail-focused`
+
+- ✅ Station-to-station rail routing works perfectly
+- ✅ City-centre dropdowns + matrix coverage runs work (they submit station coords)
+- ❌ Free-text address-to-station fails (no driveable streets in the graph for snap)
+- ❌ ~25-30% of GTFS stops won't link to walking graph (rural / disconnected stops)
+
+Acceptable for a station-to-station rail demonstrator. Wrong choice for
+last-mile / mobility-as-a-service.
+
+---
+
+## 5. File-name contracts
+
+OTP and the entrypoint expect specific filenames in the inbox. Direct
+file uploads must respect them.
+
+### OSM PBF
+
+The entrypoint generates a `build-config.json` that hardcodes:
+```json
+"osm": [{"source": "osm.pbf"}]
+```
+
+So **the filtered output must be named `osm.pbf`** in `BUILD_DIR`. The
+entrypoint preserves the input basename:
+```bash
+pbf_out="$BUILD_DIR/$(basename "$pbf_in")"
+```
+
+→ If you place a PBF named anything else (`eu-rail-10c.osm.pbf`, `france-latest.osm.pbf`)
+in `inbox/<sid>/osm/`, the build fails with:
+```
+Unable to build street graph, no OSM data available.
+```
+
+**Fix**: rename the file in the inbox before building:
+```bash
+INBOX=/var/lib/docker/volumes/viator_inbox/_data
+sudo mv "$INBOX/<sid>/osm/<your-name>.osm.pbf" \
+        "$INBOX/<sid>/osm/osm.pbf"
+```
+
+The UI's URL-based fetcher does this rename automatically. Only manual
+direct copies need the explicit rename.
+
+### GTFS feeds
+
+Files in `inbox/<sid>/gtfs/*.zip` are auto-discovered. Each becomes a
+feed with `feedId = uppercase(basename - .zip)`. So:
+
+- `sncf.zip` → `feedId=SNCF`
+- `eurostarinternat.zip` → `feedId=EUROSTARINTERNAT`
+- `gtfs.zip` → `feedId=GTFS` (the default name from the upload form — rename for cleaner labels)
+
+The UI's "Upload a file" form normalizes the saved name to `<format>.zip`
+(e.g. `gtfs.zip`). To match a specific provider entry's `id` for matrix
+labelling, rename after upload:
+
+```bash
+sudo mv $INBOX/<sid>/gtfs/gtfs.zip $INBOX/<sid>/gtfs/sbb.zip
+```
+
+### `.zip.old` backup files
+
+Whenever a provider is refreshed, the worker keeps the previous version
+as `<basename>.zip.old`. OTP only globs `*.zip` (without the trailing
+`.old`), so these are inert. Periodically clean if disk pressure:
+
+```bash
+sudo rm $INBOX/<sid>/gtfs/*.zip.old
+```
+
+---
+
+## 6. Build phases & expected log lines
+
+Phases in order, with the milestone log line for each — useful for
+"is the build stuck or just silent?" diagnosis. Approximate wallclock
+for a 7-country rail-focused EU build at 32g heap:
+
+| Phase | Marker line | Wallclock | Memory |
+|---|---|---|---|
+| **Stage GTFS into BUILD_DIR** | `Generating build-config.json with feeds:` | ~30 s | <100 MiB |
+| **osmium pass 1+2+3** | `OSM filter: rail-focused — running osmium tags-filter on osm.pbf` | ~25-35 min | <100 MiB |
+| osmium done | `osm.pbf: NNNN → NNNN bytes (~5-7% of original)` | (instant) | <100 MiB |
+| **OTP `--buildStreet` JVM start** | `OTP STARTING UP - Build Street Graph - Version: 2.9.0` | 5-10 s | climbs to 5-10 GB |
+| **Parse OSM Nodes** | `Parse OSM Nodes progress: NN MB of X.X GB (NN%)` | 3-5 min | peaks 24-32 GB |
+| Way / relation parse | `Parse OSM Ways progress` etc. | 1-2 min | drops |
+| **Build street graph** | `OsmModule.java:535 Build street graph progress: N of N` | 20-30 min | ~36 GB plateau |
+| **Index street vertex** | `StreetIndex.java:143 Index street vertex progress` | 2-3 min | ~36 GB |
+| **PruneIslands** | `PruneIslands.java:70 Pruning islands and areas isolated by nothru edges` | 60-90 min | ~36 GB |
+| BICYCLE pass | `Islands when BICYCLE noThruTraffic is considered: NN` | 5-15 min | ~36 GB |
+| WALK pass | `Islands when WALK noThruTraffic is considered: NN` | 35-45 min (heaviest) | ~36 GB |
+| CAR pass (rail-focused) | `Islands when CAR noThruTraffic is considered: NN` | 1-3 min | ~36 GB |
+| **streetGraph.obj save** | `streetGraph.obj cache updated (key=<sha>:rail-focused)` | <1 min | drops to ~5 GB |
+| **OTP `--loadStreet --save`** (phase 2) | `OTP STARTING UP - Build Street Graph - Version: 2.9.0` (again) | restarts JVM | new JVM |
+| GTFS reading | `GtfsModule.java:328 Reading entity: ...Stop` | 2-5 min per feed | ~10-15 GB |
+| Linking transit stops | `StreetLinkerModule.java:128 Linking transit stops to graph progress` | 30 s | flat |
+| Linking entrances + parks | `Linking transit entrances to graph` / `Linking vehicle parks` | 1 min | flat |
+| **PruneIslands again** | `PruneIslands.java:70 Pruning islands` | 60-90 min ⚠️ same as before | ~36 GB |
+| **Save graph.obj** | (silent — no log line; CPU drops to ~50%) | 5-15 min | ~5-8 GB |
+| **otp-build exits** | container disappears from `docker ps` | (instant) | – |
+| **Worker promotes graph** | worker log `promoted graph for <sid>` | <1 s | – |
+| **Serving container spawns** | `viator-otp-<sid>-1` appears | ~5 s | – |
+| Serving load | `Reading graph from .../graph.obj` | 2-3 min | climbs to 15-18 GB |
+| RAPTOR map | `RaptorTransitDataMapper.java:96 Mapping complete` | 30 s | peaks |
+| **Grizzly running** 🎉 | `Grizzly server running.` | (final marker) | drops to ~10 GB |
+
+**Total wallclock 7-country rail-focused: ~3 hours.**
+
+PruneIslands runs **twice** (once during `--buildStreet`, once during
+`--loadStreet --save` after GTFS load) — that's the biggest time sink
+and easy to mistake for a hang. CPU stays high (>200%) throughout.
+
+---
+
+## 7. Tracking progress on a running rebuild
+
+### Where the build container lives
+
+```bash
+docker ps | grep otp-build
+# viator-otp-build-run-<random>   ghcr.io/top-phe/viator-otp:<version>   Up XX
+```
+
+The `-run-<random>` suffix means it was spawned via `docker compose run`
+(one-shot semantics). It's NOT a regular service, so:
+
+- `docker compose logs otp-build` returns nothing (only follows services)
+- Use `docker logs -f viator-otp-build-run-<random>` directly
+
+### Tail log with milestone filter
+
+```bash
+docker logs -f $(docker ps -q --filter "name=otp-build-run") 2>&1 | \
+  grep --line-buffered -iE \
+    "OSM filter|→.*bytes|Build street|Build transit|Intersect|streetGraph|Grizzly|OutOfMemory|GC overhead|graph saved"
+```
+
+### Memory canary in another window
+
+```bash
+watch -n 30 'docker stats --no-stream | grep -E "otp|NAME"; echo; free -h'
+```
+
+What to watch:
+- `otp-build` mem **plateau** at expected heap (32-36 GB peak) — normal
+- Mem **climbing past container limit** (default `OTP_BUILD_MEM_LIMIT=42g`) — about to OOM
+- Host `available` < 3 GB AND swap usage > 5 GB — kernel oom-killer imminent
+- `viator-otp-<sid>-1` (existing FR/EU serving) staying steady — not affected
+
+### Inspect what's actually inside the build dir
+
+```bash
+# Worker spawns otp-build with a fresh /tmp/tmp.<random>/ as BUILD_DIR
+# To find the current one:
+docker top viator-otp-build-run-<random> | grep tmp.
+# Or from the cmdline:
+docker inspect viator-otp-build-run-<random> --format '{{.Config.Cmd}}'
+
+# Then ls inside
+docker exec viator-otp-build-run-<random> ls -lh /tmp/tmp.<random>/
+```
+
+Should show `osm.pbf` (filtered) + GTFS zips + `build-config.json` +
+later `streetGraph.obj` + `graph.obj`.
+
+### Confirm the build's actual JVM args
+
+```bash
+docker exec viator-otp-build-run-<random> ps -ef | grep java | head -1
+# Look at -Xmx<value>g — confirms which heap setting was actually applied
+```
+
+### Build container exits — where do the logs go?
+
+The container is started with `--rm`, so once it exits:
+
+- Container disappears from `docker ps -a` after a few seconds
+- Logs are GONE from the Docker daemon
+- **Persisted into `rebuild_jobs.log`** (last 32 KB tail) by the worker
+
+To retrieve the failed build's log post-mortem:
+
+```bash
+docker compose -p viator exec -T postgres psql -U viator -d viator -tA -c \
+  "SELECT log FROM rebuild_jobs WHERE session_id='<sid>' AND status='failed' ORDER BY created_at DESC LIMIT 1;" \
+  > /tmp/build.log
+
+less /tmp/build.log
+```
+
+### Verify the rebuild_jobs row's status
+
+```bash
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT id, status, started_at, finished_at,
+          extract(epoch from (finished_at - started_at))::int AS dur_s
+   FROM rebuild_jobs WHERE session_id='<sid>' ORDER BY created_at DESC LIMIT 5;"
+```
+
+States: `pending` → `running` → (`done` | `failed` | `cancelled`).
+
+If a row is stuck `running` but no otp-build container exists, the
+worker died mid-build. v0.1.32+ auto-cleans these on worker startup
+(see admin-guide §6.x).
+
+---
+
+## 8. Problem determination — symptom → cause → fix
+
+### A. JVM `OutOfMemoryError: Java heap space` mid-build
+
+**Symptom**: Build container exits with `Terminating due to java.lang.OutOfMemoryError`.
+
+**Diagnose**:
+```bash
+sudo dmesg -T | grep -iE "killed process.*java" | tail -3
+# If recent kernel-OOM entries: it's host-side, not JVM. Different fix (§B).
+# If no recent entries: it's a real JVM heap exhaustion.
+
+# What heap was actually used?
+grep -E "heap=|Xmx" /tmp/build.log | head -5
+```
+
+**Fix**: bump `otp_build_heap`. Also check the value actually propagated:
+```bash
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT id, config->>'otp_build_heap' FROM sessions WHERE id='<sid>';"
+```
+
+If the JVM is running with a smaller value than session config, the
+worker hasn't picked up the config — restart worker:
+```bash
+cd /opt/viator/docker && docker compose restart worker
+```
+
+### B. Kernel `Out of memory: Killed process (java)`
+
+**Symptom**: Build container vanishes silently, no `OutOfMemoryError` in
+log, but `dmesg` shows `Killed process XXXX (java) total-vm:XXG`.
+
+**Cause**: total memory pressure on the host (build + serving + FR session
++ web + postgres etc.) exceeded RAM, kernel OOM-killer chose the largest
+process (the build JVM) to terminate.
+
+**Fix options**:
+1. **Stop other containers during build**:
+   ```bash
+   docker stop viator-otp-nap-fr-rail-1   # frees ~13 GB
+   ```
+   Restart after build with `docker start viator-otp-nap-fr-rail-1`.
+2. **Add swap** (slow but rescues from edge cases):
+   ```bash
+   sudo fallocate -l 16G /swap2 && sudo chmod 600 /swap2
+   sudo mkswap /swap2 && sudo swapon /swap2
+   echo '/swap2 none swap sw 0 0' | sudo tee -a /etc/fstab
+   ```
+3. **Reduce OSM scope** (drop countries, use rail-focused, etc.)
+
+### C. `Unable to build street graph, no OSM data available`
+
+**Symptom**: OTP exits within 30 seconds of build start with this exact message.
+
+**Cause**: `build-config.json` declares `"osm": [{"source": "osm.pbf"}]`
+but the file in `BUILD_DIR` has a different name.
+
+**Fix**: §5 file-name contracts. Rename the inbox PBF to `osm.pbf`.
+
+### D. Serving container restart-loops post-build
+
+**Symptom**: Build succeeds, `viator-otp-<sid>-1` spawns, log shows
+`Mapping complete` then container exits and Docker's `restart: unless-stopped`
+loops it.
+
+**Cause**: serving heap (`OTP_HEAP`, not `OTP_BUILD_HEAP`) too small.
+Default is **4g hardcoded** in `sessions_orchestrator.py` — way too small
+for any session beyond IDF.
+
+**Diagnose**:
+```bash
+docker exec viator-otp-<sid>-1 ps -ef | grep java | head -1
+# Look at -Xmx — typically 4g if no per-session override
+```
+
+**Fix**: §3 heap budgets. Set `otp_heap` in session config + sed-edit the
+generated fragment (until v0.1.33 ships a UI for it).
+
+### E. `LOCATION_NOT_FOUND: Origin is unknown`
+
+**Symptom**: Search returns 0 itineraries with this routing-error code.
+
+**Cause**: OTP can't snap the requested lat/lon to a walkable street edge
+within ~250m radius. Two sub-causes:
+
+1. **Coordinates outside OSM extent** — e.g. searching for a Belgian
+   address in a France-only PBF. Solution: extend the OSM PBF to cover
+   the region (re-merge with the country added).
+
+2. **`rail-focused` dropped too many roads near urban centres** — coords
+   of a city-centre address might land on a residential street that no
+   longer exists in the filtered graph. Solution: switch to
+   `transit-focused` for that session, OR use stop-id routing (v0.1.33+
+   work — bypasses snap entirely).
+
+### F. `Provider 'X' not found in session`
+
+**Symptom**: Refresh providers fails immediately with this message.
+
+**Cause**: provider entry isn't in `session.config.sources.providers` —
+even though you tried to add it via UI. Possibly the form save failed,
+or you typed an `id` that doesn't exist in the configured NAP catalogue.
+
+**Fix**: add directly via SQL (template in §8 below).
+
+### G. Web container restart-loop after deploy
+
+**Symptom**: Deploy a new VIATOR_VERSION, web container restart-loops,
+journey UI returns 504.
+
+**Cause**: alembic migration failure on startup. Usually one of:
+- Migration revision ID > 32 chars (alembic_version VARCHAR(32) limit) — see v0.1.31 → v0.1.32.1
+- Migration tries to add a constraint that conflicts with existing data
+- DB connection issues
+
+**Diagnose**:
+```bash
+docker compose logs web --tail=50 | grep -B2 -A20 "alembic\|psycopg\|sqlalchemy"
+```
+
+**Fix**: depends on the specific alembic error. For revision-too-long,
+rename in the migration file's `revision: str = "..."` line to ≤30
+chars, redeploy.
+
+---
+
+## 9. Per-session config precedence
+
+When VIATOR resolves a config value, the order is:
+
+1. `session.config.<field>` — per-session override, set via UI form or SQL
+2. `OTP_<FIELD>` env var on the worker container (from `.env`)
+3. Hardcoded default in `app/settings.py` or `sessions_orchestrator.py`
+
+**Common gotcha**: bumping `OTP_BUILD_HEAP=36g` in `.env` does NOT
+override a session that has `otp_build_heap=12g` saved in its config.
+Per-session value wins.
+
+To check:
+```bash
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT id, config->>'otp_build_heap' AS build, config->>'otp_heap' AS serve,
+          config->>'osm_scope' AS scope, config->>'otp_timezone' AS tz
+   FROM sessions WHERE id='<sid>';"
+```
+
+If a field is `null` in the per-session view, the env-var fallback applies.
+
+### Field name conventions
+
+Field names are inconsistent (legacy of incremental development):
+
+| Purpose | Field name | UI exposes |
+|---|---|---|
+| Build heap | `otp_build_heap` | ✅ dropdown |
+| Serve heap | `otp_heap` | ❌ hidden — SQL only (until v0.1.33) |
+| OSM scope | `osm_scope` | ✅ dropdown |
+| Timezone | `otp_timezone` | ✅ dropdown |
+| API timeout | `otp_api_timeout` | ✅ dropdown |
+
+---
+
+## 10. Adding cross-border GTFS providers
+
+Two paths.
+
+### Via UI "Import from NAP"
+
+Works for NAPs that expose **DCAT-AP `/datasets` endpoint** in the same
+JSON shape as `transport.data.gouv.fr/api/datasets`. Tested with the
+French NAP. **Does not work** with opentransportdata.swiss (CKAN-based,
+different schema), German NAPs (DELFI), or most non-French NAPs.
+
+### Manual provider via SQL — fallback for everyone else
+
+```bash
+docker compose -p viator exec postgres psql -U viator -d viator <<'SQL'
+UPDATE sessions
+SET config = jsonb_set(
+  config,
+  '{sources,providers}',
+  (config->'sources'->'providers') || jsonb_build_array(jsonb_build_object(
+    'id', 'SBB',
+    'label', 'Swiss Federal Railways — full GTFS',
+    'country_iso', 'CH',
+    'timetable', jsonb_build_object(
+      'url', 'https://opentransportdata.swiss/dataset/.../resource/.../download/gtfs_fp2026_XXX.zip',
+      'format', 'gtfs'
+    ),
+    'gtfs_rt', '{}'::jsonb,
+    'mct_url', null,
+    'stations_csv_url', null,
+    'timetable_credential_id', null,
+    'gtfs_rt_credential_id', null,
+    'mct_credential_id', null,
+    'stations_csv_credential_id', null
+  ))
+)
+WHERE id='eu-nap-network';
+
+SELECT jsonb_array_elements(config->'sources'->'providers')->>'id' AS provider_id
+FROM sessions WHERE id='eu-nap-network';
+SQL
+```
+
+Then in UI: **Refresh providers** to fetch.
+
+### Manual upload — when the URL needs auth or the NAP is fussy
+
+If the URL fetch fails (auth, rate limits, format quirks), download
+locally via browser and ship to the VPS:
+
+```bash
+scp gtfs_fp2026_XXX.zip otpadmin@vps:/tmp/sbb.zip
+ssh otpadmin@vps
+sudo mv /tmp/sbb.zip /var/lib/docker/volumes/viator_inbox/_data/<sid>/gtfs/sbb.zip
+```
+
+Or use the **session UI's "Upload a file" form** with `Declared standard = GTFS`.
+The file lands as `gtfs.zip` (generic name) — rename to your provider
+slug for clean feedId labelling:
+
+```bash
+sudo mv $INBOX/<sid>/gtfs/gtfs.zip $INBOX/<sid>/gtfs/sbb.zip
+```
+
+**Caveat**: uploaded files don't auto-create a provider entry. They
+contribute to the build but aren't visible in the providers list. If
+you also added a SQL provider entry pointing at a (broken) URL, the UI
+will display "SBB" in the list but `Refresh providers` will fail —
+which is fine, the build still picks up the manually-staged zip.
+
+---
+
+## 11. Geographic gotchas
+
+### OSM coverage limits routing
+
+A session can only route between coords that are in its OSM PBF. The
+GTFS feeds may contain stops in countries the OSM doesn't cover (e.g.
+Eurostar GTFS includes London + Bruxelles + Amsterdam stops even in a
+France-only OSM session) — but OTP can't snap city-centre lat/lon to a
+walkable graph in those countries, so all such searches return
+`LOCATION_NOT_FOUND`.
+
+### To add a country to an existing session
+
+1. Re-merge OSM PBF including the new country
+2. Rename to `osm.pbf` and place in `inbox/<sid>/osm/`
+3. **streetGraph.obj cache is invalidated** because the input PBF SHA
+   changed → next build redoes the heavy 1+ hour street-build phase
+4. May exceed heap budget — check §3 sizing
+
+### Per-country GTFS feeds you'll likely want
+
+| Country | Feed | Notes |
+|---|---|---|
+| FR | `transport.data.gouv.fr/datasets` (NAP) | DCAT-AP, works with Import-from-NAP |
+| BE | SNCB at `gtfs.irail.be` or NAP DELFI | Direct download |
+| NL | `gtfs.ovapi.nl` | Direct, unauthenticated |
+| LU | included in DE/FR feeds (CFL is small) | Optional separate feed |
+| DE | `data.deutschebahn.com` (huge — DB Fernverkehr) | Heavy feed, dominates transit phase |
+| CH | `opentransportdata.swiss` (SKI Geschäftsstelle) | Bearer token for some endpoints; manual upload simplest |
+| AT | `mobilitaetsverbuende.at` | OAuth |
+| IT | `dati.trasporti.gov.it` | DCAT-AP |
+| ES | RENFE feeds via transport.data.gouv.fr (Eurostar partners) | Usually ships in Eurostar feed |
+| UK | ATOC / Rail Delivery Group | Auth-required, separate process |
+
+---
+
+## 12. Lessons learned (footguns we hit, fixes queued)
+
+These bit us during the v0.1.30–v0.1.32.1 EU build. Fixes are partly
+shipped, partly queued for future versions.
+
+| Footgun | Fixed in | Note |
+|---|---|---|
+| OSM scope dropdown hardcoded — `rail-focused` invisible | v0.1.30.1 → v0.1.32 (auto-renders) | Now reads from `OSM_SCOPE_PRESETS` |
+| `endpoint='network-coverage'` violated CHECK constraint | v0.1.29.4 | Was silent failure on every coverage row |
+| Coverage runs orphaned on web restart | v0.1.29.3 | Startup hook marks `running`→`failed` |
+| Rebuild jobs orphaned on worker restart | v0.1.32 | Same pattern as above |
+| Default heap too small for multi-NAP era | v0.1.32 (12g→24g default) | UI form's selected option also bumped |
+| Migration revision ID > 32 chars | v0.1.32.1 | alembic_version VARCHAR(32) — keep ≤30 |
+| Manual file upload renames to generic name | not yet | rename inbox file post-upload |
+| `otp_heap` (serve) has no UI control | not yet (v0.1.33) | SQL + sed-fragment workaround |
+| Generated fragment regenerates only on session events | not yet | Full reload trigger doesn't refresh generated yaml |
+| Provider list ≠ inbox files | by design | uploaded files don't auto-create entries |
+| OSM-PBF filename must match build-config.json | not yet (v0.1.33+) | entrypoint should rename to `osm.pbf` always |
+| OTP image not in `compose pull` | not yet | per-session containers spawned dynamically |
+
+---
+
+## Quick reference — common commands
+
+```bash
+# Session config view
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT id, state, config->>'osm_scope' AS scope, config->>'otp_build_heap' AS bh, config->>'otp_heap' AS sh FROM sessions;"
+
+# Inbox content
+sudo ls -lh /var/lib/docker/volumes/viator_inbox/_data/<sid>/{osm,gtfs}/
+
+# Active build container
+docker ps | grep otp-build
+
+# Build log tail (running)
+docker logs -f $(docker ps -q --filter "name=otp-build-run") 2>&1 | \
+  grep --line-buffered -iE "OSM filter|→.*bytes|Build|Intersect|Linking|streetGraph|Grizzly|OutOfMemory"
+
+# Failed build's persisted log
+docker compose -p viator exec -T postgres psql -U viator -d viator -tA -c \
+  "SELECT log FROM rebuild_jobs WHERE session_id='<sid>' AND status='failed' ORDER BY created_at DESC LIMIT 1;" > /tmp/build.log
+
+# Memory pressure
+docker stats --no-stream | grep -E "otp|NAME"; free -h
+
+# Kernel OOM check
+sudo dmesg -T | grep -iE "killed process.*java" | tail -3
+
+# Generated compose fragment
+sudo less /opt/viator/docker/generated/docker-compose.sessions.yml
+
+# Rebuild jobs history
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT id, status, started_at, finished_at FROM rebuild_jobs WHERE session_id='<sid>' ORDER BY created_at DESC LIMIT 5;"
+```
+
+---
+
+See also: [admin-guide.md §6](./admin-guide.md#6-troubleshooting) for general
+troubleshooting, [nap-fr-rail.md](./nap-fr-rail.md) for the single-country
+walkthrough.
