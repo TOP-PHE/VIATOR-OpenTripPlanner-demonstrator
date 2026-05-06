@@ -63,10 +63,32 @@ jobs:
         run: bandit -r app/ -ll
         continue-on-error: false
 
-      - name: Pytest with coverage
+      # Audit-2026-05 P0 #3. pip-audit is in requirements-dev.txt; this
+      # step gates the build on Python-layer CVEs (Trivy in docker.yml
+      # only catches OS-layer findings inside built images, not the
+      # wheel deps we pin in requirements.txt).
+      #
+      # OSV is the upstream vulnerability service — covers PyPI advisories
+      # with no API-key or rate-limit overhead. Failures exit non-zero;
+      # add `--ignore-vuln GHSA-xxxx` here per accepted CVE (mirror the
+      # justification in .trivyignore-style comments below).
+      - name: pip-audit (Python CVEs)
+        run: pip-audit --strict --vulnerability-service=osv
+        # Currently no accepted CVEs. As the dep tree grows, add ignores:
+        # run: pip-audit --strict --vulnerability-service=osv \
+        #   --ignore-vuln GHSA-xxxx-yyyy-zzzz   # <reason>, accepted YYYY-MM-DD
+        continue-on-error: false
+
+      # Audit-2026-05 P0 #4 (coverage floor — the L-effort test-writing
+      # campaign is a separate workstream). The floor below is set just
+      # under the v0.1.32.1 baseline (13.29% line) to lock in current
+      # coverage as a regression gate. Ratchet upward whenever a PR
+      # crosses the next round number — never lower it without an
+      # explicit audit-tracker note.
+      - name: Pytest with coverage (floor 12%)
         run: |
           mkdir -p "$INBOX_DIR"
-          pytest
+          pytest --cov-fail-under=12
 
       - name: Upload coverage report
         if: always()
