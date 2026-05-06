@@ -817,6 +817,77 @@ A clean console + filled provider status pills (v0.1.19) + populated
 "Current build" card (v0.1.20) means the v0.1.X+ feature stack is
 working end-to-end.
 
+### 6.12 Upgrading past the non-root-container migration
+
+Post-audit-2026-05 (P0 #1), both `viator-web` and `viator-otp` images run
+as UID/GID `1000:1000` instead of root. Existing deployments need a
+one-time host-side migration:
+
+**1. Set `DOCKER_GID` in `.env`**
+
+The worker container needs a supplementary group matching the host's
+`docker` group GID (so its non-root user can read `/var/run/docker.sock`):
+
+```bash
+ssh otpadmin@vmi3259514.contaboserver.net
+cd /opt/viator/docker
+DOCKER_GID="$(getent group docker | cut -d: -f3)"
+echo "DOCKER_GID=$DOCKER_GID" | sudo tee -a .env
+```
+
+If you skip this, `docker compose run otp-build` from the worker fails
+with `permission denied while trying to connect to the Docker daemon
+socket`.
+
+**2. Chown the `./generated/` bind mount to UID 1000**
+
+Named volumes (`inbox`, `graphs`, `pgdata`) inherit ownership from the
+image's pre-created mountpoints — no operator action needed. The
+`./generated/` host bind mount is the exception and must be made
+writable by UID 1000 on the host:
+
+```bash
+sudo chown -R 1000:1000 /opt/viator/docker/generated
+```
+
+If you skip this, the orchestrator's writes to
+`generated/docker-compose.sessions.yml` (and per-session nginx fragments)
+will fail with `Permission denied`. Symptom: sessions stick in
+`provisioning` state and the worker log shows `OSError: [Errno 13]`.
+
+**3. Recreate containers**
+
+```bash
+sudo docker compose pull web worker
+sudo docker compose up -d --force-recreate web worker
+```
+
+**4. Verify**
+
+```bash
+# Web + worker should both run as UID 1000.
+docker exec viator-web-1    id
+docker exec viator-worker-1 id
+# → uid=1000(appuser) gid=1000(appuser) groups=1000(appuser),<DOCKER_GID>(docker)
+#                                                            ^^^^^^^^^^^^
+#                                          worker only — appears via group_add
+
+# OTP per-session containers (when running):
+docker exec viator-otp-<sid>-1 id
+# → uid=1000(appuser) gid=1000(appuser)
+```
+
+**5. If something breaks**
+
+The audit-tracking entry for this work is `audit-2026-05.md` P0 #1.
+Per-component fallback to root is **not** the right rollback —
+re-introducing root in containers would re-open the security gap the
+audit closed. If you hit a permission error not covered above, add it
+to the audit doc's tracking table and triage from there.
+
+For all other audit findings and the prioritised action plan, see
+[`audit-2026-05.md`](audit-2026-05.md).
+
 ---
 
 ## 7. Rollback

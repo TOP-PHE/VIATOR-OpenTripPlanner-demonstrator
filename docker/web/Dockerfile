@@ -57,6 +57,25 @@ COPY branding ./branding
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 
+# ─────────────────────── non-root user ───────────────────────
+# Runtime UID/GID 1000:1000. Two services run from this image:
+#   - web    (uvicorn) — needs read access to /srv and rw on /data/*
+#   - worker (app.worker) — also rw on /var/run/docker.sock; the docker
+#                            socket GID is host-dependent, supplied at
+#                            runtime via `group_add` in compose. See
+#                            docker-compose.yml worker service + .env.example
+#                            DOCKER_GID.
+#
+# Volume mount points are pre-created here owned by appuser so that on
+# first `compose up` the named volumes (`inbox`, `graphs`) inherit
+# appuser ownership rather than the docker default of root:root. Bind
+# mounts (./generated) keep host perms — see admin-guide §6.12.
+RUN groupadd --system --gid 1000 appuser \
+    && useradd --system --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /data/inbox /data/graphs /data/generated /srv/docker \
+    && chown -R appuser:appuser /srv /data
+USER appuser:appuser
+
 # ─────────────────────── version stamp ───────────────────────
 # Burned-in version label, surfaced in the UI header (badge next to the
 # VIATOR lockup) and at /healthz/version. The CI workflow passes the git

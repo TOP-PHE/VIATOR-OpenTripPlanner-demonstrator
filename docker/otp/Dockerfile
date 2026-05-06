@@ -36,6 +36,18 @@ COPY router-config.json /opt/otp/router-config.json
 COPY entrypoint.sh /opt/otp/entrypoint.sh
 RUN chmod +x /opt/otp/entrypoint.sh
 
+# ─────────────────────── non-root user ───────────────────────
+# Runtime UID/GID 1000:1000 (matches the web image so a single host UID
+# owns both service trees and the shared `graphs` named volume). The
+# build container also writes /tmp/<random> via mktemp inside
+# entrypoint.sh and the cache dir at /var/otp/graph/.cache/<sid>/, both
+# under appuser ownership.
+RUN groupadd --system --gid 1000 appuser \
+    && useradd --system --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /var/otp/inbox /var/otp/graph \
+    && chown -R appuser:appuser /opt/otp /var/otp
+USER appuser:appuser
+
 EXPOSE 8080
 
 ENTRYPOINT ["/opt/otp/entrypoint.sh"]
