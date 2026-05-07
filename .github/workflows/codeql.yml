@@ -1,0 +1,89 @@
+# Audit-2026-05 P1 #7 — third-party actions are pinned to commit SHAs,
+# not floating tags. The trailing `# vN` comment is the human version
+# reference; Dependabot keeps both current. See ci.yml header for the
+# rationale + the `gh api` command for refreshing the SHA on each line.
+#
+# Audit-2026-05 P2 #15 — adds CodeQL static analysis (dataflow / taint
+# tracking) for the Python codebase. Pairs with `ci.yml`'s Bandit step:
+#   - Bandit catches single-statement smell patterns (hardcoded creds,
+#     subprocess shell=True, weak crypto algorithms).
+#   - CodeQL traces variable flow across function boundaries and finds
+#     classes of bugs Bandit can't see (taint reaching SQL/HTTP sinks,
+#     deserialization of untrusted data, path traversal, SSRF, etc.).
+# They're complementary, not duplicative.
+#
+# Findings appear in repo Settings → Code security → Code scanning.
+# Surfaced as PR comments on new alerts when CodeQL runs on a PR.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      # Run on Python source / config changes only — saves CI minutes
+      # on docs-only PRs. Doesn't introduce the path-filter-vs-required-
+      # check stall (see audit #26) because CodeQL isn't in the required
+      # checks list — yet. After ~2 weeks of clean runs the operator
+      # can promote it via branch protection.
+      - 'app/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'requirements*.txt'
+      - '.github/workflows/codeql.yml'
+  schedule:
+    # Weekly cron so we re-scan even on quiet weeks. Monday 06:30 UTC
+    # — 30 min after Dependabot's weekly run so any deps that bumped
+    # have already been resolved before the static analysis runs.
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required: CodeQL writes findings to the Security tab.
+      security-events: write
+      # Required for some action queries (e.g. matched workflow events).
+      actions: read
+      # Required when CodeQL pulls private packages during build (we
+      # don't, but keep for forward-compat with future polyglot scans).
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # `build-mode: none` means CodeQL extracts directly from source
+        # without running a build — works well for interpreted languages
+        # like Python. If we add Java / Go / C++ later, that's where
+        # build-mode=manual or autobuild comes in.
+        include:
+          - language: python
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@68bde559dea0fdcac2102bfdf6230c5f70eb485e  # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # `security-extended` enables the larger query set including
+          # dataflow checks for SQL injection, SSRF, deserialization,
+          # path traversal, etc. The default `security` set is too thin
+          # — Bandit already covers most of those simpler checks.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@68bde559dea0fdcac2102bfdf6230c5f70eb485e  # v4
+        with:
+          # Categorising by language is the convention so multi-language
+          # repos can browse Security-tab findings cleanly.
+          category: "/language:${{ matrix.language }}"
