@@ -16,12 +16,27 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
-from sqlalchemy import delete, update
+from sqlalchemy import CursorResult, delete, update
 
 from . import config_service
 from .db import SessionLocal
 from .models import AuditEvent, JourneySearch, JourneySearchExecution, JourneyTrip
+
+# `Session.execute()` returns `CursorResult[Any]` in sqlalchemy 2.0.36 and
+# the broader `Result[Any]` in 2.0.49+. The `.rowcount` attribute is only
+# typed on `CursorResult`, so we narrow at the call site for forward-compat.
+#
+# Two-error-code mypy suppression rationale (audit-2026-05 #23):
+#   - On 2.0.36 the cast is redundant (return is already CursorResult) →
+#     `redundant-cast` would fire, suppressed by the first ignore code.
+#   - On 2.0.49+ the cast is genuinely needed → no `redundant-cast` →
+#     the suppression itself becomes "unused", flagged by
+#     `warn_unused_ignores=true` (pyproject.toml). The second ignore
+#     code (`unused-ignore`) self-suppresses that meta-warning.
+#   - Net: line is mypy-clean on both stubs. When sqlalchemy is bumped
+#     past 2.0.49, this comment can be simplified to bare `cast(...)`.
 
 log = logging.getLogger(__name__)
 
@@ -36,55 +51,70 @@ def prune_once() -> dict[str, int]:
 
         # 1. raw_response (set NULL on old executions)
         cutoff_raw = now - timedelta(days=int(cfg["JOURNEY_RAW_RESPONSE_RETENTION_DAYS"]))
-        result = db.execute(
-            update(JourneySearchExecution)
-            .where(JourneySearchExecution.raw_response.is_not(None))
-            .where(
-                JourneySearchExecution.id.in_(
-                    db.query(JourneySearchExecution.id)
-                    .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
-                    .filter(JourneySearch.ts < cutoff_raw)
-                    .scalar_subquery()
+        result = cast(  # type: ignore[redundant-cast,unused-ignore]
+            CursorResult[Any],
+            db.execute(
+                update(JourneySearchExecution)
+                .where(JourneySearchExecution.raw_response.is_not(None))
+                .where(
+                    JourneySearchExecution.id.in_(
+                        db.query(JourneySearchExecution.id)
+                        .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
+                        .filter(JourneySearch.ts < cutoff_raw)
+                        .scalar_subquery()
+                    )
                 )
-            )
-            .values(raw_response=None)
+                .values(raw_response=None)
+            ),
         )
         counts["raw_response"] = result.rowcount or 0
 
         # 2. trips (delete old)
         cutoff_trips = now - timedelta(days=int(cfg["JOURNEY_TRIPS_RETENTION_DAYS"]))
-        result = db.execute(
-            delete(JourneyTrip).where(
-                JourneyTrip.execution_id.in_(
-                    db.query(JourneySearchExecution.id)
-                    .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
-                    .filter(JourneySearch.ts < cutoff_trips)
-                    .scalar_subquery()
+        result = cast(  # type: ignore[redundant-cast,unused-ignore]
+            CursorResult[Any],
+            db.execute(
+                delete(JourneyTrip).where(
+                    JourneyTrip.execution_id.in_(
+                        db.query(JourneySearchExecution.id)
+                        .join(JourneySearch, JourneySearch.id == JourneySearchExecution.search_id)
+                        .filter(JourneySearch.ts < cutoff_trips)
+                        .scalar_subquery()
+                    )
                 )
-            )
+            ),
         )
         counts["trips"] = result.rowcount or 0
 
         # 3. executions (delete old, after their trips are gone)
-        result = db.execute(
-            delete(JourneySearchExecution).where(
-                JourneySearchExecution.search_id.in_(
-                    db.query(JourneySearch.id)
-                    .filter(JourneySearch.ts < cutoff_trips)
-                    .scalar_subquery()
+        result = cast(  # type: ignore[redundant-cast,unused-ignore]
+            CursorResult[Any],
+            db.execute(
+                delete(JourneySearchExecution).where(
+                    JourneySearchExecution.search_id.in_(
+                        db.query(JourneySearch.id)
+                        .filter(JourneySearch.ts < cutoff_trips)
+                        .scalar_subquery()
+                    )
                 )
-            )
+            ),
         )
         counts["executions"] = result.rowcount or 0
 
         # 4. searches summaries
         cutoff_searches = now - timedelta(days=int(cfg["JOURNEY_SEARCH_RETENTION_DAYS"]))
-        result = db.execute(delete(JourneySearch).where(JourneySearch.ts < cutoff_searches))
+        result = cast(  # type: ignore[redundant-cast,unused-ignore]
+            CursorResult[Any],
+            db.execute(delete(JourneySearch).where(JourneySearch.ts < cutoff_searches)),
+        )
         counts["searches"] = result.rowcount or 0
 
         # 5. audit
         cutoff_audit = now - timedelta(days=int(cfg["AUDIT_RETENTION_DAYS"]))
-        result = db.execute(delete(AuditEvent).where(AuditEvent.ts < cutoff_audit))
+        result = cast(  # type: ignore[redundant-cast,unused-ignore]
+            CursorResult[Any],
+            db.execute(delete(AuditEvent).where(AuditEvent.ts < cutoff_audit)),
+        )
         counts["audit"] = result.rowcount or 0
 
         db.commit()
