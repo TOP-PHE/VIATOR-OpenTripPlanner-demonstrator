@@ -1,0 +1,34 @@
+# CODEOWNERS — review routing for VIATOR / OpenJourneyPlanner.
+#
+# Every PR needs at minimum the matching owner's review (per branch
+# protection on main). For a single-operator project today, that's
+# `@TOP-PHE` on everything. As the team grows, narrow these globs to
+# delegate by area.
+#
+# Audit-2026-05 #11. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+
+# ─────────────────────── default ───────────────────────
+*                                @TOP-PHE
+
+# ─────────────────────── high-trust paths ──────────────
+# Anything that affects security, supply chain, or runtime container
+# behaviour gets explicit attention even when the default owner is the
+# same — the explicit rule reminds reviewers to slow down on these.
+
+/.github/                        @TOP-PHE
+/.github/workflows/              @TOP-PHE
+/.github/dependabot.yml          @TOP-PHE
+/docker/                         @TOP-PHE
+/.trivyignore                    @TOP-PHE
+/sonar-project.properties        @TOP-PHE
+/.pre-commit-config.yaml         @TOP-PHE
+/pyproject.toml                  @TOP-PHE
+/requirements.txt                @TOP-PHE
+/requirements-dev.txt            @TOP-PHE
+/alembic/                        @TOP-PHE
+
+# ─────────────────────── audit & docs ──────────────────
+# Audit doc + admin-guide are operational source-of-truth; changes
+# should be deliberate and reviewed in the same PR as their code change.
+/docs/audit-2026-05.md           @TOP-PHE
+/docs/admin-guide.md             @TOP-PHE
