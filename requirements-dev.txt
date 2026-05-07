@@ -21,6 +21,6 @@ pre-commit==4.0.1
 
 # Stubs for mypy strict mode
 types-requests==2.32.0.20241016
-types-passlib==1.7.7.20241221
+types-passlib==1.7.7.20260211
 types-python-jose==3.3.4.20240106
 sqlalchemy[mypy]==2.0.36
