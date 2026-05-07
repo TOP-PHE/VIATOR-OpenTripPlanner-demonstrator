@@ -416,9 +416,7 @@ def _validate_safe_http_url(url: str) -> None:
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(
-            f"NAP URL scheme must be http or https; got {parsed.scheme!r} in {url!r}"
-        )
+        raise ValueError(f"NAP URL scheme must be http or https; got {parsed.scheme!r} in {url!r}")
     hostname = parsed.hostname
     if not hostname:
         raise ValueError(f"NAP URL has no hostname: {url!r}")
@@ -428,7 +426,7 @@ def _validate_safe_http_url(url: str) -> None:
     except socket.gaierror as exc:
         raise ValueError(f"Cannot resolve NAP hostname {hostname!r}: {exc}") from exc
 
-    for family, _socktype, _proto, _canonname, sockaddr in addr_info:
+    for _family, _socktype, _proto, _canonname, sockaddr in addr_info:
         ip_str = sockaddr[0]
         # Strip IPv6 zone-id ("fe80::1%eth0") which ip_address can't parse.
         ip_str = ip_str.split("%", 1)[0]
