@@ -11,7 +11,7 @@
 FROM docker:29-cli AS dockercli
 
 # ─────────────────────── stage 2: runtime image ───────────────────────────
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
