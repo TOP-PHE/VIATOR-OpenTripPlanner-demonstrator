@@ -1,3 +1,18 @@
+# Audit-2026-05 P1 #7 — third-party actions are pinned to commit SHAs,
+# not to floating tags (`@v5`, `@v6`, etc.). The `# vN` trailing comment
+# is the human-readable version reference; Dependabot reads it and keeps
+# both the SHA and the comment current via security/version-bump PRs.
+# Why: a tag can be force-updated by the action publisher (or a compromised
+# maintainer account); a SHA can't. For a release pipeline that pushes to
+# GHCR, the tag-mutation vector is the primary supply-chain risk.
+#
+# When updating manually:
+#   gh api repos/<owner>/<action>/commits/<tag> --jq '.sha'
+# replaces the SHA on the line, then update the trailing comment to match.
+#
+# Internal `actions/*` references stay tag-pinned to the floating major
+# (e.g. `@v5`) only when there is no version-comment after the SHA — never
+# in this file.
 name: CI
 
 on:
@@ -33,11 +48,11 @@ jobs:
       ADMIN_USER: ci
       ADMIN_PASSWORD: ci
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           fetch-depth: 0   # SonarCloud needs full git history for blame
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: "3.12"
           cache: pip
@@ -118,7 +133,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5
         with:
           name: coverage-xml
           path: coverage.xml
@@ -135,15 +150,15 @@ jobs:
       && (github.event_name == 'push'
           || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
         with:
           name: coverage-xml
 
-      - uses: SonarSource/sonarcloud-github-action@v5
+      - uses: SonarSource/sonarcloud-github-action@ffc3010689be73b8e5ae0c57ce35968afd7909e8  # v5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -152,8 +167,8 @@ jobs:
     name: Pre-commit (belt-and-braces)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: "3.12"
           cache: pip
