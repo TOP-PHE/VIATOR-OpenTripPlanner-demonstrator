@@ -231,6 +231,53 @@ def _list_serving_sessions() -> list[str]:
         return [r.id for r in rows]
 
 
+def _parse_otp_service_names(ps_output: str) -> set[str]:
+    """Extract per-session OTP compose service names from `docker ps` output.
+
+    Input is a `docker ps -a --format {{.Names}}` listing filtered to
+    `name=^viator-otp-`. We turn each container name back into its
+    compose service name so it can be compared against the set of
+    services the orchestrator currently wants to be running.
+
+    Container naming convention (compose project=`viator`, replica index
+    appended by compose):
+
+      viator-otp-<sid>-1                 → `otp-<sid>` (per-session serve)
+      viator-otp-build-run-<random hex>  → ephemeral build container,
+                                           skipped (always orphan-shaped
+                                           but never something we should
+                                           tear down — `docker compose
+                                           run --rm` cleans these itself)
+
+    Audit-2026-05 #25 surfaced the prior `docker ps` (running-only) form
+    of this code missed Exited (143) orphans. Tested via
+    tests/unit/test_worker_orphan_parse.py.
+    """
+    services: set[str] = set()
+    for line in ps_output.splitlines():
+        name = line.strip()
+        if not name.startswith("viator-"):
+            continue
+        inner = name[len("viator-") :]
+        # Skip ephemeral `docker compose run --rm` build containers.
+        # They match the name=^viator-otp- filter but aren't compose
+        # services we manage; trying to `compose rm` them produces
+        # noisy "no such service" errors.
+        if inner.startswith("otp-build-"):
+            continue
+        # `viator-<service>-<replica>`: replica is the numeric compose
+        # index. Strip it to recover the service name.
+        stem, _, last = inner.rpartition("-")
+        if stem and last.isdigit():
+            services.add(stem)
+        else:
+            # Unexpected name shape — keep the whole inner so the orphan
+            # cleanup sees it (and the eventual `compose rm` will surface
+            # the anomaly via a logged warning).
+            services.add(inner)
+    return services
+
+
 def handle_reload_trigger() -> None:
     """If `/data/generated/.reload-trigger` exists, apply the current set of
     per-session compose + nginx fragments to the running stack.
@@ -290,37 +337,30 @@ def handle_reload_trigger() -> None:
             # Don't delete the trigger — we'll try again on the next tick.
             return
 
-    # ── Orphan cleanup (v0.1.7) ─────────────────────────────────
+    # ── Orphan cleanup (v0.1.7, fixed audit-2026-05 #25) ─────────
     # When a session was deleted (or archived out of `serving`), its
     # `otp-<sid>` service is no longer in the regenerated compose
     # fragment. `docker compose up -d --no-deps` leaves the orphaned
     # container alive — it keeps running and consuming RAM despite
     # nginx no longer routing to it. Detect and remove them.
+    #
+    # Audit-2026-05 #25 — pre-this-fix this used `docker ps` (running
+    # only). Containers SIGTERMed during a previous deploy and left in
+    # `Exited (143)` state slipped through and accumulated indefinitely.
+    # The 2026-05-07 incident triage confirmed this: two stopped OTP
+    # containers from deleted sessions were lingering 21-25 hours after
+    # the deploy that stopped them. Use `ps -a` so stopped containers
+    # also count as orphans.
     expected_otp_services = {f"otp-{sid}" for sid in serving_sids}
     ps = subprocess.run(  # noqa: S603
-        [_DOCKER, "ps", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
+        [_DOCKER, "ps", "-a", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
         capture_output=True,
         text=True,
         check=False,
     )
     if ps.returncode == 0:
-        # Container names are like `viator-otp-nap-fr-sncf-2026-q2-1` — strip
-        # the project prefix and the compose-replica suffix to recover the
-        # service name `otp-nap-fr-sncf-2026-q2`.
-        running_otp_services: set[str] = set()
-        for line in ps.stdout.splitlines():
-            name = line.strip()
-            if not name.startswith("viator-"):
-                continue
-            # `viator-<service>-<replica>` — replica is a numeric suffix
-            inner = name[len("viator-") :]
-            # Drop trailing `-N` if numeric; otherwise leave whole.
-            stem, _, last = inner.rpartition("-")
-            if stem and last.isdigit():
-                running_otp_services.add(stem)
-            else:
-                running_otp_services.add(inner)
-        orphans = running_otp_services - expected_otp_services
+        existing_otp_services = _parse_otp_service_names(ps.stdout)
+        orphans = existing_otp_services - expected_otp_services
         for orphan in sorted(orphans):
             log.info("removing orphan compose service %s", orphan)
             rm = subprocess.run(  # noqa: S603
