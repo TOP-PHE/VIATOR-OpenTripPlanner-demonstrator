@@ -509,3 +509,117 @@ async def test_import_from_nap_empty_include_list_keeps_all(monkeypatch):
             include_dataset_ids=include,
         )
         assert len(result["providers"]) == 1, f"include={include!r} should not filter"
+
+
+# ─────────────────── URL safety + log sanitisation (audit 2026-05) ───────────────────
+
+
+class TestValidateSafeHttpUrl:
+    """SSRF defence — `_validate_safe_http_url` rejects URLs whose hostname
+    resolves to private/loopback/link-local IP space, or whose scheme isn't
+    http(s). Closes the SonarCloud finding at app/master/nap_importer.py."""
+
+    def test_public_https_url_passes(self):
+        from app.master.nap_importer import _validate_safe_http_url
+
+        # transport.data.gouv.fr is the canonical NAP URL — must keep working.
+        _validate_safe_http_url("https://transport.data.gouv.fr/api/datasets")
+
+    def test_non_http_scheme_rejected(self):
+        from app.master.nap_importer import _validate_safe_http_url
+
+        for bad in ("file:///etc/passwd", "gopher://x", "ldap://x", "ftp://x"):
+            with pytest.raises(ValueError, match="scheme must be http"):
+                _validate_safe_http_url(bad)
+
+    def test_missing_hostname_rejected(self):
+        from app.master.nap_importer import _validate_safe_http_url
+
+        with pytest.raises(ValueError, match="no hostname"):
+            _validate_safe_http_url("https:///path-only")
+
+    def test_localhost_rejected(self, monkeypatch):
+        # Resolve `localhost` to 127.0.0.1 deterministically. socket.getaddrinfo
+        # returns 5-tuples (family, socktype, proto, canonname, sockaddr).
+        from app.master import nap_importer
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            return [(2, 1, 6, "", ("127.0.0.1", 0))]
+
+        monkeypatch.setattr(nap_importer.socket, "getaddrinfo", fake_getaddrinfo)
+        with pytest.raises(ValueError, match="non-public address"):
+            nap_importer._validate_safe_http_url("https://attacker.example.com/redirect")
+
+    @pytest.mark.parametrize(
+        "private_ip",
+        [
+            "10.0.0.1",  # RFC1918
+            "192.168.1.1",  # RFC1918
+            "172.16.0.1",  # RFC1918
+            "169.254.169.254",  # AWS/GCP/Azure metadata
+            "127.0.0.1",  # loopback
+            "::1",  # IPv6 loopback
+            "fe80::1",  # IPv6 link-local
+            "fc00::1",  # IPv6 ULA (matches is_private)
+        ],
+    )
+    def test_private_ip_ranges_rejected(self, monkeypatch, private_ip):
+        from app.master import nap_importer
+
+        family = 30 if ":" in private_ip else 2  # AF_INET6 vs AF_INET (loose)
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            return [(family, 1, 6, "", (private_ip, 0))]
+
+        monkeypatch.setattr(nap_importer.socket, "getaddrinfo", fake_getaddrinfo)
+        with pytest.raises(ValueError, match="non-public address"):
+            nap_importer._validate_safe_http_url("https://attacker.example.com/x")
+
+    def test_unresolvable_hostname_rejected(self, monkeypatch):
+        from app.master import nap_importer
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            raise nap_importer.socket.gaierror("Name or service not known")
+
+        monkeypatch.setattr(nap_importer.socket, "getaddrinfo", fake_getaddrinfo)
+        with pytest.raises(ValueError, match="Cannot resolve"):
+            nap_importer._validate_safe_http_url("https://does-not-exist.invalid/x")
+
+
+class TestSanitizeForLog:
+    """Log-injection defence — `_sanitize_for_log` strips control characters
+    so an operator-supplied URL containing CR/LF can't split a log record."""
+
+    def test_printable_ascii_passes_through(self):
+        from app.master.nap_importer import _sanitize_for_log
+
+        assert _sanitize_for_log("https://example.com/foo") == "https://example.com/foo"
+
+    def test_crlf_escaped(self):
+        from app.master.nap_importer import _sanitize_for_log
+
+        # \r\n CRLF is the classic log-injection vector.
+        out = _sanitize_for_log("https://x.com/\r\nFAKE: log line")
+        assert "\r" not in out and "\n" not in out
+        assert "\\x0d" in out and "\\x0a" in out
+
+    def test_null_byte_escaped(self):
+        from app.master.nap_importer import _sanitize_for_log
+
+        out = _sanitize_for_log("https://x.com/\x00")
+        assert "\x00" not in out
+        assert "\\x00" in out
+
+    def test_long_value_truncated(self):
+        from app.master.nap_importer import _sanitize_for_log
+
+        long_url = "https://x.com/" + ("a" * 500)
+        out = _sanitize_for_log(long_url, max_len=100)
+        assert len(out) <= 100 + len("...(truncated)")
+        assert out.endswith("...(truncated)")
+
+    def test_unicode_letters_kept(self):
+        from app.master.nap_importer import _sanitize_for_log
+
+        # Accented characters are printable; the function must not strip them.
+        assert _sanitize_for_log("Île-de-France") == "Île-de-France"
