@@ -20,8 +20,18 @@ def test_per_session_serve_container_yields_service_name():
 def test_multiple_sessions_dedup_into_distinct_services():
     from app.worker import _parse_otp_service_names
 
-    out = (
-        "viator-otp-fr-rail-1\n" "viator-otp-eu-nap-network-1\n" "viator-otp-2026-W19_2026-W31-1\n"
+    # Explicit \n concatenation rather than three implicit-adjacent string
+    # literals — ruff-format collapses adjacent literals onto one line when
+    # they fit within line-length (here at ~95 chars), and SonarCloud's
+    # S5799 then flags the result as ambiguous (could be three strings the
+    # author forgot to comma-separate). Single literal sidesteps both.
+    out = "\n".join(
+        [
+            "viator-otp-fr-rail-1",
+            "viator-otp-eu-nap-network-1",
+            "viator-otp-2026-W19_2026-W31-1",
+            "",  # trailing newline to match docker ps's actual output shape
+        ]
     )
     assert _parse_otp_service_names(out) == {
         "otp-fr-rail",
