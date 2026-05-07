@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, text
@@ -14,14 +14,17 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base, TimestampMixin
 
 
-class SessionCategory(str, enum.Enum):
+# See `app/models/identity.py` for the rationale on the StrEnum migration
+# (audit-2026-05 #24 — ruff UP042). Behaviour-preserving for our usage:
+# the value is what `str(member)` returns in both forms.
+class SessionCategory(StrEnum):
     NAP = "NAP"
     MERITS = "MERITS"
     MANUAL = "MANUAL"
     EXPERIMENTAL = "EXPERIMENTAL"
 
 
-class SessionState(str, enum.Enum):
+class SessionState(StrEnum):
     CREATED = "created"
     CONFIGURED = "configured"
     POPULATED = "populated"
