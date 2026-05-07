@@ -30,10 +30,10 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from typing import Any
+from typing import Any, cast
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.orm import Session as DbSession
 
 from ..models import MasterStation, MasterStationPendingDrift
@@ -240,11 +240,16 @@ def upsert_with_drift_protection(
         for child_uic, parent_uic in parent_uic_map.items():
             if child_uic not in live_uics or parent_uic not in live_uics:
                 continue  # parent isn't in our table (no UIC, or skipped)
-            result = db.execute(
-                update(MasterStation)
-                .where(MasterStation.uic == child_uic)
-                .where(MasterStation.source != "manual")
-                .values(parent_uic=parent_uic)
+            # See app/retention.py for the rationale on the CursorResult cast
+            # (audit-2026-05 #23 — sqlalchemy 2.0.49+ tightened Result typing).
+            result = cast(  # type: ignore[redundant-cast,unused-ignore]
+                CursorResult[Any],
+                db.execute(
+                    update(MasterStation)
+                    .where(MasterStation.uic == child_uic)
+                    .where(MasterStation.source != "manual")
+                    .values(parent_uic=parent_uic)
+                ),
             )
             if result.rowcount > 0:
                 counts["parent_links_set"] += 1
