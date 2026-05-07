@@ -33,8 +33,13 @@ RUN mkdir -p /opt/otp \
 
 COPY build-config.json /opt/otp/build-config.json
 COPY router-config.json /opt/otp/router-config.json
-COPY entrypoint.sh /opt/otp/entrypoint.sh
-RUN chmod +x /opt/otp/entrypoint.sh
+# `--chmod=755` sets the executable bit at copy time (BuildKit feature).
+# Replaces a separate `RUN chmod +x …` step — saves one image layer and
+# silences SonarCloud rule "merge consecutive RUN instructions" (audit
+# 2026-05 SonarCloud finding). Requires BuildKit, which the GHA matrix
+# uses via docker/setup-buildx-action — `docker compose build` locally
+# also enables it by default since Docker Engine 23.
+COPY --chmod=755 entrypoint.sh /opt/otp/entrypoint.sh
 
 # ─────────────────────── non-root user ───────────────────────
 # Runtime UID/GID 1000:1000 (matches the web image so a single host UID
