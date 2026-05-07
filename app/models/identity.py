@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, LargeBinary, String, text
 from sqlalchemy.dialects.postgresql import CITEXT, UUID
@@ -13,7 +13,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base, TimestampMixin
 
 
-class UserRole(str, enum.Enum):
+# StrEnum (Python 3.11+) is the canonical replacement for the older
+# `class X(str, Enum)` mixin. Behaviour is identical for our usage:
+#   - Equality with raw strings still works (`UserRole.END_USER == "end_user"`)
+#   - `str(member)` and `f"{member}"` return the value (e.g. "end_user"),
+#     which is what templates, JS, and CSS class names already assume
+#     (see `app/templates/admin/users.html` + `_base.html`).
+# Audit-2026-05 #24 (ruff UP042).
+class UserRole(StrEnum):
     PLATFORM_ADMIN = "platform_admin"
     CONTENT_MANAGER = "content_manager"
     END_USER = "end_user"
