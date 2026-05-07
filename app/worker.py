@@ -259,10 +259,18 @@ def _parse_otp_service_names(ps_output: str) -> set[str]:
         if not name.startswith("viator-"):
             continue
         inner = name[len("viator-") :]
+        # Defensive: only process per-session OTP containers. The
+        # `name=^viator-otp-` docker filter upstream should already
+        # exclude `viator-web-1`, `viator-postgres-1`, etc., but this
+        # guard keeps the helper correct if a future caller drops or
+        # changes the filter — tested in
+        # test_unrelated_viator_containers_are_ignored.
+        if not inner.startswith("otp-"):
+            continue
         # Skip ephemeral `docker compose run --rm` build containers.
-        # They match the name=^viator-otp- filter but aren't compose
-        # services we manage; trying to `compose rm` them produces
-        # noisy "no such service" errors.
+        # They match `viator-otp-*` but aren't compose services we
+        # manage; trying to `compose rm` them produces noisy "no such
+        # service" errors.
         if inner.startswith("otp-build-"):
             continue
         # `viator-<service>-<replica>`: replica is the numeric compose
