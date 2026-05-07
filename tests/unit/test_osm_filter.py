@@ -51,12 +51,22 @@ class TestPresetShape:
     of truth for what the entrypoint shell does, so we want noisy CI
     failures if the structure ever drifts."""
 
-    def test_three_scopes_exist(self):
+    def test_all_known_scopes_exist(self):
+        # We compare against an enumerated literal set (not VALID_SCOPES,
+        # which would be tautological) so that adding or removing a scope
+        # forces a deliberate test update — the whole point of this
+        # "drift detector" check. Update both lines together.
+        #
+        # `rail-focused` was added in v0.1.30 (commit 12b37d8); the
+        # original `test_three_scopes_exist` was missed in that PR and
+        # only surfaced when the audit-2026-05 coverage gate enforced
+        # `pytest -ra` on every PR.
         from app.osm_filter import OSM_SCOPE_PRESETS
 
         assert set(OSM_SCOPE_PRESETS.keys()) == {
             "transit-focused",
             "multi-modal",
+            "rail-focused",
             "comprehensive",
         }
 

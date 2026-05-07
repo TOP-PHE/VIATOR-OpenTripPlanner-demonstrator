@@ -33,13 +33,23 @@ def test_routing_defaults_include_access_egress_bound():
     """OTP routes "as close as it can" to the destination by default,
     silently truncating when the destination is far from any transit
     stop. Our default tightens this so trips are refused outright
-    (LOCATION_NOT_FOUND) instead of returning misleading partial routes."""
+    (LOCATION_NOT_FOUND) instead of returning misleading partial routes.
+
+    v0.1.24: OTP 2.9 renamed `maxAccessEgressDurationForMode` (flat,
+    uppercase mode keys) to `accessEgress.maxDurationForMode` (nested,
+    lowercase keys). The source migrated in commit fa61df0; this test
+    was missed and asserted the old shape until the audit-2026-05
+    coverage gate caught it. Both shape AND key casing are part of
+    the contract — the old form silently fell back to OTP defaults.
+    """
     cfg = _render([])
-    bounds = cfg["routingDefaults"].get("maxAccessEgressDurationForMode")
-    assert bounds is not None, "routingDefaults must include access/egress bound"
+    access_egress = cfg["routingDefaults"].get("accessEgress")
+    assert access_egress is not None, "routingDefaults must declare accessEgress (OTP 2.9 schema)"
+    bounds = access_egress.get("maxDurationForMode")
+    assert bounds is not None, "accessEgress must include maxDurationForMode bound"
     assert (
-        bounds.get("WALK") == "20m"
-    ), "WALK access/egress bound is the safety net against silent truncation"
+        bounds.get("walk") == "20m"
+    ), "walk bound is the safety net against silent truncation (lowercase per OTP 2.9)"
 
 
 def test_provider_without_gtfs_rt_emits_no_updater():
