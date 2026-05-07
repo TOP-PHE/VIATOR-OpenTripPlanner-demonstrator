@@ -69,14 +69,40 @@ jobs:
       # wheel deps we pin in requirements.txt).
       #
       # OSV is the upstream vulnerability service — covers PyPI advisories
-      # with no API-key or rate-limit overhead. Failures exit non-zero;
-      # add `--ignore-vuln GHSA-xxxx` here per accepted CVE (mirror the
-      # justification in .trivyignore-style comments below).
+      # with no API-key or rate-limit overhead. Failures exit non-zero.
+      #
+      # ── Accepted CVEs ────────────────────────────────────────────────
+      # Mirror the .trivyignore convention: one CVE per line, written
+      # justification, re-evaluate when the underlying dep changes.
+      #
+      # GHSA-wj6h-64fc-37mp — ecdsa 0.19.2 (no fix available)
+      #   Transitive dep of python-jose[cryptography]==3.5.0. Vulnerability
+      #   is timing side-channels in ECDSA sign/verify; upstream maintainers
+      #   declined to fix (see https://github.com/tlsfuzzer/python-ecdsa/
+      #   security/advisories/GHSA-wj6h-64fc-37mp). We use python-jose
+      #   with the [cryptography] extra, which forces the cryptography
+      #   library as the JWS backend — the ecdsa wheel is installed but
+      #   not imported on our hot path. Re-evaluate if we ever switch JWT
+      #   to ES256/ES384 (we currently use HS256, see app/security.py).
+      #
+      # GHSA-3936-cmfr-pm3m — black 24.10.0 (fix in 26.3.1, dev-only)
+      #   Formatter ReDoS via crafted docstring. Black runs on our own
+      #   source code in CI and dev only; we never format untrusted input.
+      #   Bump deferred — 24.10 → 26.3 spans 18 months of style updates
+      #   and will produce diff churn that doesn't belong in the audit
+      #   PR. Tracked separately in audit-2026-05.md (P1 follow-up).
+      #
+      # GHSA-6w46-j5rx-g56g — pytest 8.3.4 (fix in 9.0.3, dev-only)
+      #   Test isolation issue. Pytest runs only on our test files in CI;
+      #   no production exposure. Bump deferred — 8 → 9 is a major bump
+      #   with potential fixture-API breakage; out of scope for the
+      #   security-floor audit PR. Tracked in audit-2026-05.md.
       - name: pip-audit (Python CVEs)
-        run: pip-audit --strict --vulnerability-service=osv
-        # Currently no accepted CVEs. As the dep tree grows, add ignores:
-        # run: pip-audit --strict --vulnerability-service=osv \
-        #   --ignore-vuln GHSA-xxxx-yyyy-zzzz   # <reason>, accepted YYYY-MM-DD
+        run: |
+          pip-audit --strict --vulnerability-service=osv \
+            --ignore-vuln GHSA-wj6h-64fc-37mp \
+            --ignore-vuln GHSA-3936-cmfr-pm3m \
+            --ignore-vuln GHSA-6w46-j5rx-g56g
         continue-on-error: false
 
       # Audit-2026-05 P0 #4 (coverage floor — the L-effort test-writing
