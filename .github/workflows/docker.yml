@@ -8,12 +8,15 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # Audit-2026-05 #26 — `pull_request:` always triggers (no path filter).
+  # The `detect-changes` job below runs `dorny/paths-filter` to set an
+  # output that the heavy jobs (`build-and-scan`, `hadolint`) gate on
+  # via `if:`. The terminal `docker-gate` job always reports — that's
+  # what branch-protection requires, instead of the matrix instances
+  # which are skipped on docs-only PRs (skipped ≠ success in branch
+  # protection's eyes, which is why required-but-skipped checks used
+  # to stall PR merges indefinitely).
   pull_request:
-    paths:
-      - "docker/**"
-      - "app/**"
-      - "requirements.txt"
-      - ".github/workflows/docker.yml"
   workflow_dispatch:
 
 concurrency:
@@ -27,8 +30,37 @@ env:
   PUSH: ${{ github.event_name != 'pull_request' }}
 
 jobs:
+  detect-changes:
+    name: Detect docker-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - id: filter
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
+        with:
+          # Same path set previously used as the `pull_request: paths:`
+          # trigger filter. The output bool drives the heavy jobs below.
+          # `push` and tag events skip this job's gating entirely (they
+          # always run the matrix) — see `if:` on each downstream job.
+          filters: |
+            docker:
+              - 'docker/**'
+              - 'app/**'
+              - 'requirements.txt'
+              - '.github/workflows/docker.yml'
+
   build-and-scan:
     name: Build, scan, push
+    needs: detect-changes
+    # Run on push/tag/manual unconditionally; on PRs only when relevant
+    # files changed. Skipping on docs-only PRs saves ~5 min of CI work
+    # and zero security loss (no docker change → no new attack surface
+    # to scan).
+    if: |
+      github.event_name != 'pull_request' ||
+      needs.detect-changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -235,6 +267,10 @@ jobs:
 
   hadolint:
     name: Hadolint (Dockerfile lint)
+    needs: detect-changes
+    if: |
+      github.event_name != 'pull_request' ||
+      needs.detect-changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
@@ -248,3 +284,62 @@ jobs:
         with:
           dockerfile: docker/otp/Dockerfile
           ignore: DL3008,DL3013
+
+  # ───────────────────────────── docker-gate ─────────────────────────────
+  # Audit-2026-05 #26 — pipeline gate that ALWAYS reports a status.
+  #
+  # Why: branch protection requires named status checks; a check that's
+  # `skipped` (because of `if:` evaluation) does NOT satisfy "required to
+  # pass". Pre-this-refactor, requiring `Build, scan, push (web)` /
+  # `(otp)` / `Hadolint (Dockerfile lint)` stalled docs-only PRs forever
+  # because the path-filter on `pull_request:` skipped the workflow
+  # entirely.
+  #
+  # Now `pull_request:` always triggers; `detect-changes` decides if
+  # the matrix is needed; `docker-gate` (this job) consumes the upstream
+  # results and reports success when:
+  #   - all upstream jobs succeeded, OR
+  #   - heavy jobs were correctly skipped (no docker change in PR)
+  # Failure of any upstream job fails the gate.
+  #
+  # Branch-protection should require `Docker pipeline gate` instead of
+  # the matrix instances. See PR description for the migration steps.
+  docker-gate:
+    name: Docker pipeline gate
+    needs: [detect-changes, build-and-scan, hadolint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify upstream results
+        env:
+          DETECT: ${{ needs.detect-changes.result }}
+          BUILD: ${{ needs.build-and-scan.result }}
+          HADOLINT: ${{ needs.hadolint.result }}
+        run: |
+          set -eu
+          fail=0
+          # detect-changes is a hard prerequisite — its failure means we
+          # don't actually know whether the PR touched docker, so we
+          # can't safely greenlight.
+          if [ "$DETECT" != "success" ]; then
+            echo "::error::detect-changes ended in: $DETECT"
+            fail=1
+          fi
+          # build-and-scan and hadolint may legitimately be `skipped` on
+          # docs-only PRs (no docker change, detect-changes.outputs.docker
+          # was 'false'). Treat skipped as pass; treat failure / cancelled
+          # / anything-else as block.
+          for var in BUILD HADOLINT; do
+            eval "val=\$$var"
+            case "$val" in
+              success|skipped) ;;
+              *)
+                echo "::error::${var} ended in: $val"
+                fail=1
+                ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "✅ docker pipeline gate passed (detect=$DETECT, build=$BUILD, hadolint=$HADOLINT)"
