@@ -409,10 +409,16 @@ def make_provider_from_dataset(
 _MAX_REDIRECTS = 5
 
 
-def _validate_safe_http_url(url: str) -> None:
-    """Pre-flight check: scheme must be http(s), hostname must resolve only
-    to public IPs. Raises ValueError with an operator-friendly message
-    on any rejection.
+def _validate_safe_http_url(url: str) -> str:
+    """Pre-flight SSRF check. Returns `url` unchanged on success so the
+    function reads as an inline sanitiser — `safe = _validate_safe_http_url(x)`
+    makes the data flow obvious to both human reviewers and static analysers.
+
+    Raises ValueError on:
+      - non-http(s) schemes (file://, gopher://, ldap://, ftp://)
+      - missing hostname
+      - hostname resolving to any private/loopback/link-local/multicast/
+        reserved/unspecified IP (IPv4 + IPv6).
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -443,6 +449,39 @@ def _validate_safe_http_url(url: str) -> None:
                 f"NAP URL hostname {hostname!r} resolves to non-public address {ip_str}; "
                 "NAP fetches are restricted to public internet (SSRF defence)."
             )
+    return url
+
+
+async def _fetch_with_redirect_validation(
+    client: httpx.AsyncClient,
+    initial_url: str,
+    headers: dict[str, str],
+) -> httpx.Response:
+    """GET `initial_url` and manually follow up to `_MAX_REDIRECTS` 30x hops,
+    re-validating each Location target via `_validate_safe_http_url`.
+
+    Extracted from `fetch_datasets` so its cognitive complexity stays under
+    SonarCloud's threshold and so the "validate → fetch" loop is independently
+    testable. `initial_url` is assumed to have been validated by the caller.
+    """
+    current_url = initial_url
+    for _ in range(_MAX_REDIRECTS + 1):
+        r = await client.get(current_url, headers=headers)
+        if r.status_code not in (301, 302, 303, 307, 308):
+            return r
+        location = r.headers.get("location")
+        if not location:
+            return r
+        # urljoin handles relative redirects against the current URL; the
+        # result is immediately fed back through the SSRF sanitiser before
+        # the next iteration's GET. Wrapping it as `current_url = sanitise(…)`
+        # makes the data-flow chain explicit (also satisfies SonarCloud
+        # rule S5144 — "URL constructed from user-controlled data" — by
+        # naming the validator as the obvious sanitiser).
+        current_url = _validate_safe_http_url(urljoin(current_url, location))
+    raise ValueError(
+        f"NAP fetch exceeded {_MAX_REDIRECTS} redirects starting from {initial_url!r}"
+    )
 
 
 def _sanitize_for_log(value: str, max_len: int = 200) -> str:
@@ -510,9 +549,10 @@ async def fetch_datasets(
             param_name=nap_auth[2],
         )
 
-    # Validate before logging: bad URLs that fail the safety check still
-    # appear in the exception, sanitised by `_sanitize_for_log` if needed.
-    _validate_safe_http_url(fetch_url)
+    # SSRF sanitiser at the entrypoint; the helper re-applies it per redirect
+    # hop. Returns the URL unchanged on success so subsequent uses of the
+    # value chain are obviously sanitised.
+    safe_url = _validate_safe_http_url(fetch_url)
 
     log.info(
         "fetching NAP catalogue from %s%s",
@@ -520,28 +560,12 @@ async def fetch_datasets(
         " (authenticated)" if nap_auth is not None else "",
     )
 
-    # Manually follow redirects with per-hop validation. follow_redirects=True
-    # would let an attacker bypass the SSRF check by hosting a public URL
-    # that 302s to http://localhost or http://169.254.169.254/. By disabling
-    # automatic redirects and re-validating each Location, we close that
-    # path. Cap at _MAX_REDIRECTS hops to bound work.
+    # follow_redirects=False forces the helper to do per-hop validation —
+    # see _fetch_with_redirect_validation. Cannot rely on httpx's automatic
+    # redirect following: it would happily chase a public URL into
+    # http://localhost or http://169.254.169.254/ via a 302.
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as c:
-        current_url = fetch_url
-        for _ in range(_MAX_REDIRECTS + 1):
-            r = await c.get(current_url, headers=headers)
-            if r.status_code not in (301, 302, 303, 307, 308):
-                break
-            location = r.headers.get("location")
-            if not location:
-                break
-            # Resolve relative redirects against the current URL.
-            current_url = urljoin(current_url, location)
-            _validate_safe_http_url(current_url)
-        else:
-            raise ValueError(
-                f"NAP fetch exceeded {_MAX_REDIRECTS} redirects starting from "
-                f"{_sanitize_for_log(nap_url)!r}"
-            )
+        r = await _fetch_with_redirect_validation(c, safe_url, headers)
         r.raise_for_status()
         data = r.json()
 

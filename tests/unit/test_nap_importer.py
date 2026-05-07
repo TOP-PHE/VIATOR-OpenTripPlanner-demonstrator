@@ -519,11 +519,14 @@ class TestValidateSafeHttpUrl:
     resolves to private/loopback/link-local IP space, or whose scheme isn't
     http(s). Closes the SonarCloud finding at app/master/nap_importer.py."""
 
-    def test_public_https_url_passes(self):
+    def test_public_https_url_passes_and_returns_url(self):
         from app.master.nap_importer import _validate_safe_http_url
 
         # transport.data.gouv.fr is the canonical NAP URL — must keep working.
-        _validate_safe_http_url("https://transport.data.gouv.fr/api/datasets")
+        # The function returns the URL unchanged (acts as inline sanitiser),
+        # so callers can write `safe = _validate_safe_http_url(x)`.
+        url = "https://transport.data.gouv.fr/api/datasets"
+        assert _validate_safe_http_url(url) == url
 
     def test_non_http_scheme_rejected(self):
         from app.master.nap_importer import _validate_safe_http_url
