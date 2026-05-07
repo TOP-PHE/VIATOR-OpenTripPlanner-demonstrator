@@ -27,7 +27,8 @@ services:
       # exists; create it with `sudo mkdir -p /etc/letsencrypt` before `up`.
       - /etc/letsencrypt:/etc/nginx/certs:ro
     depends_on:
-      - web
+      web:
+        condition: service_healthy   # audit-2026-05 #8: don't proxy until uvicorn is actually ready
 
   web:
     # Pull from GHCR by default; the `build:` stanza is the fallback for local
@@ -89,6 +90,13 @@ services:
       dockerfile: docker/web/Dockerfile
     restart: unless-stopped
     command: ["python", "-m", "app.worker"]
+    # The worker shares the web image but doesn't bind port 8000; the image's
+    # HEALTHCHECK (curl /healthz/version) would always fail here. Disable
+    # explicitly so `docker ps` doesn't show the worker as "unhealthy" (which
+    # would also block any future depends_on:service_healthy on this service).
+    # Audit-2026-05 #8.
+    healthcheck:
+      disable: true
     # The image runs as appuser (UID 1000), but reading /var/run/docker.sock
     # requires membership in the host's `docker` group. The GID is
     # distribution-dependent — see .env.example DOCKER_GID. Without this,
@@ -134,6 +142,13 @@ services:
     image: ghcr.io/top-phe/viator-otp:${VIATOR_VERSION:-latest}
     build: ./otp
     profiles: ["build-only"]
+    # The build-only profile runs OTP in `--build` mode, which doesn't bind
+    # port 8080 — the image's HEALTHCHECK would fail on a one-shot container
+    # that exits as soon as the graph is written. Disable explicitly so a
+    # transient "unhealthy" state doesn't trip parent-task error handling.
+    # Audit-2026-05 #8.
+    healthcheck:
+      disable: true
     # Hard cap so a runaway build OOMKills cleanly instead of slowly swapping
     # the host. Should be `-Xmx` plus ~4 GB of native headroom (Direct
     # buffers, metaspace, threads, GC). Default 12g pairs with the default
