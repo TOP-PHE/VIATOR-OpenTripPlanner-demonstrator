@@ -248,6 +248,37 @@ jobs:
           path: trivy-${{ matrix.image.name }}.sarif
           retention-days: 14
 
+      # Audit-2026-05 P2 #16 — Software Bill of Materials.
+      # Produces a CycloneDX-format SBOM per image listing every OS package
+      # (apt for web, eclipse-temurin base for otp) and every Python wheel
+      # (web only). Uploaded as workflow artifact + attached to GitHub
+      # releases when this workflow runs on a tag push (event_name=push,
+      # ref starts with refs/tags/v).
+      #
+      # Why CycloneDX (not SPDX): broader downstream tooling support
+      # (Dependency-Track, GitHub's dependency review, Sonatype IQ, etc.).
+      # Anchore's sbom-action wraps Syft under the hood and emits both
+      # formats; we pick CycloneDX for the artifact's primary form.
+      #
+      # Run AFTER the Trivy steps so Trivy gating still drives the
+      # success/failure of the matrix build — SBOM generation is purely
+      # additive metadata, not a gate.
+      - name: Generate CycloneDX SBOM
+        if: always()
+        # Don't fail the build on SBOM generation errors. The image is
+        # already Trivy-gated; an SBOM glitch shouldn't block a release.
+        continue-on-error: true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
+        with:
+          image: viator-${{ matrix.image.name }}:scan
+          format: cyclonedx-json
+          artifact-name: sbom-${{ matrix.image.name }}.cyclonedx.json
+          output-file: sbom-${{ matrix.image.name }}.cyclonedx.json
+          # Attach SBOM to GitHub releases automatically when the workflow
+          # runs on a release-tag push. For other events (PR, branch push,
+          # manual), the SBOM lives in the workflow artifact only.
+          upload-release-assets: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
       # Only after Trivy passes do we push (pushed image is bit-identical thanks to BuildKit).
       # Same build-args as the scan step — must match or BuildKit re-runs the
       # build instead of reusing the cached layers.
