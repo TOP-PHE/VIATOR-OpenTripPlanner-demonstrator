@@ -30,10 +30,13 @@ the API endpoint to surface in the UI.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 import time
 from typing import Any, cast
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -378,6 +381,127 @@ def make_provider_from_dataset(
     return provider
 
 
+# ───────────────────── URL safety helpers (audit 2026-05) ─────────────────────
+# SonarCloud findings on `app/master/nap_importer.py` (Major SSRF at the
+# httpx.AsyncClient.get call, Minor log-injection at the log.info call)
+# motivated these. The NAP URL is operator-supplied via the admin UI and
+# eventually flows to network I/O, so it has to be sanitised at the chokepoint.
+#
+# Defence-in-depth approach:
+#   1. Reject non-http(s) schemes (file://, gopher://, ldap://, etc.)
+#   2. Resolve hostname → IPs and reject any private/loopback/link-local/
+#      multicast/reserved ranges. Closes localhost / 169.254.169.254 (cloud
+#      metadata) / 10.x / 192.168.x exfiltration paths.
+#   3. Manually follow redirects with re-validation per hop, capped at 5,
+#      so an attacker can't bypass step 2 by setting a public URL that 302s
+#      to an internal one.
+#   4. Strip ASCII control characters (esp. CR/LF) from any value flowing
+#      to a log record — closes log-injection.
+#
+# Limitations:
+#   - DNS rebinding: between our resolve and the connect, DNS could change.
+#     Closing this requires a custom httpx transport that re-resolves and
+#     pins the IP. Out of scope for this fix; the practical risk is low for
+#     short-lived NAP fetches.
+#   - IPv6 ULAs (fc00::/7) and IPv6 link-local (fe80::/10) are caught via
+#     ipaddress.is_private/is_link_local. ULA matches `is_private`.
+
+_MAX_REDIRECTS = 5
+
+
+def _validate_safe_http_url(url: str) -> str:
+    """Pre-flight SSRF check. Returns `url` unchanged on success so the
+    function reads as an inline sanitiser — `safe = _validate_safe_http_url(x)`
+    makes the data flow obvious to both human reviewers and static analysers.
+
+    Raises ValueError on:
+      - non-http(s) schemes (file://, gopher://, ldap://, ftp://)
+      - missing hostname
+      - hostname resolving to any private/loopback/link-local/multicast/
+        reserved/unspecified IP (IPv4 + IPv6).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"NAP URL scheme must be http or https; got {parsed.scheme!r} in {url!r}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"NAP URL has no hostname: {url!r}")
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve NAP hostname {hostname!r}: {exc}") from exc
+
+    for _family, _socktype, _proto, _canonname, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        # Strip IPv6 zone-id ("fe80::1%eth0") which ip_address can't parse.
+        ip_str = ip_str.split("%", 1)[0]
+        ip = ipaddress.ip_address(ip_str)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"NAP URL hostname {hostname!r} resolves to non-public address {ip_str}; "
+                "NAP fetches are restricted to public internet (SSRF defence)."
+            )
+    return url
+
+
+async def _fetch_with_redirect_validation(
+    client: httpx.AsyncClient,
+    initial_url: str,
+    headers: dict[str, str],
+) -> httpx.Response:
+    """GET `initial_url` and manually follow up to `_MAX_REDIRECTS` 30x hops,
+    re-validating each Location target via `_validate_safe_http_url`.
+
+    Extracted from `fetch_datasets` so its cognitive complexity stays under
+    SonarCloud's threshold and so the "validate → fetch" loop is independently
+    testable. `initial_url` is assumed to have been validated by the caller.
+    """
+    current_url = initial_url
+    for _ in range(_MAX_REDIRECTS + 1):
+        # SSRF dimension is closed: `current_url` was validated by
+        # `_validate_safe_http_url` before this function was called (caller
+        # passes `safe_url`) AND is re-validated on every redirect hop below.
+        # SonarCloud's S7044 ("traversing attacks") is a false positive here:
+        # the rule targets path-traversal into local filesystem resources;
+        # this code makes a remote HTTP request whose path is interpreted by
+        # the NAP server, never touched as a local path. NOSONAR suppresses
+        # the data-flow alarm on this line only.
+        r = await client.get(current_url, headers=headers)  # NOSONAR
+        if r.status_code not in (301, 302, 303, 307, 308):
+            return r
+        location = r.headers.get("location")
+        if not location:
+            return r
+        # urljoin handles relative redirects against the current URL; the
+        # result is immediately fed back through the SSRF sanitiser before
+        # the next iteration's GET. Wrapping it as `current_url = sanitise(…)`
+        # makes the data-flow chain explicit (also satisfies SonarCloud
+        # rule S5144 — "URL constructed from user-controlled data" — by
+        # naming the validator as the obvious sanitiser).
+        current_url = _validate_safe_http_url(urljoin(current_url, location))
+    raise ValueError(f"NAP fetch exceeded {_MAX_REDIRECTS} redirects starting from {initial_url!r}")
+
+
+def _sanitize_for_log(value: str, max_len: int = 200) -> str:
+    """Strip ASCII control characters from `value` and cap length, for safe
+    logging of operator-supplied strings. Replaces non-printable chars
+    (CR, LF, NUL, DEL, etc.) with their `\\xNN` escape so the log record
+    can't be split or made to impersonate a different log level.
+    """
+    sanitized = "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in value)
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len] + "...(truncated)"
+    return sanitized
+
+
 # ───────────────────── module-level cache ─────────────────────
 # Keyed by NAP URL → (timestamp, list-of-datasets). 5-minute TTL keeps the
 # UI snappy (preview + actual import are usually <1 min apart) without
@@ -431,13 +555,23 @@ async def fetch_datasets(
             param_name=nap_auth[2],
         )
 
+    # SSRF sanitiser at the entrypoint; the helper re-applies it per redirect
+    # hop. Returns the URL unchanged on success so subsequent uses of the
+    # value chain are obviously sanitised.
+    safe_url = _validate_safe_http_url(fetch_url)
+
     log.info(
         "fetching NAP catalogue from %s%s",
-        nap_url,
+        _sanitize_for_log(nap_url),
         " (authenticated)" if nap_auth is not None else "",
     )
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-        r = await c.get(fetch_url, headers=headers)
+
+    # follow_redirects=False forces the helper to do per-hop validation —
+    # see _fetch_with_redirect_validation. Cannot rely on httpx's automatic
+    # redirect following: it would happily chase a public URL into
+    # http://localhost or http://169.254.169.254/ via a 302.
+    async with httpx.AsyncClient(timeout=60, follow_redirects=False) as c:
+        r = await _fetch_with_redirect_validation(c, safe_url, headers)
         r.raise_for_status()
         data = r.json()
 
