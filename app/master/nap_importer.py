@@ -479,9 +479,7 @@ async def _fetch_with_redirect_validation(
         # rule S5144 — "URL constructed from user-controlled data" — by
         # naming the validator as the obvious sanitiser).
         current_url = _validate_safe_http_url(urljoin(current_url, location))
-    raise ValueError(
-        f"NAP fetch exceeded {_MAX_REDIRECTS} redirects starting from {initial_url!r}"
-    )
+    raise ValueError(f"NAP fetch exceeded {_MAX_REDIRECTS} redirects starting from {initial_url!r}")
 
 
 def _sanitize_for_log(value: str, max_len: int = 200) -> str:
