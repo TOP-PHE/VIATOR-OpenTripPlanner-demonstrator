@@ -242,8 +242,8 @@ def upsert_with_drift_protection(
                 continue  # parent isn't in our table (no UIC, or skipped)
             # See app/retention.py for the rationale on the CursorResult cast
             # (audit-2026-05 #23 — sqlalchemy 2.0.49+ tightened Result typing).
-            result = cast(
-                CursorResult,
+            result = cast(  # type: ignore[redundant-cast,unused-ignore]
+                CursorResult[Any],
                 db.execute(
                     update(MasterStation)
                     .where(MasterStation.uic == child_uic)
