@@ -95,6 +95,21 @@ LABEL org.opencontainers.image.version="${VIATOR_VERSION}"
 
 EXPOSE 8000
 
+# Audit-2026-05 P1 #8 — orchestrator-truthful readiness signal.
+#
+# `/healthz/version` is the cheapest endpoint that proves uvicorn is running
+# AND the FastAPI router is wired (it returns the burned-in version label).
+# 60s start period covers the `alembic upgrade head` step in CMD on a fresh
+# DB; in steady state the check costs < 50 ms.
+#
+# This HEALTHCHECK applies to both `web` and `worker` services since they
+# share this image. The worker doesn't bind port 8000 — for that service,
+# `docker-compose.yml` overrides `healthcheck: disable: true`. See
+# `nginx.depends_on.web.condition: service_healthy` which is what makes
+# rolling deploys actually wait for uvicorn before swapping nginx upstreams.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -fsS http://localhost:8000/healthz/version || exit 1
+
 # Web container: run pending migrations, then start uvicorn.
 # The worker container overrides CMD (see docker-compose.yml) and skips the migrate step.
 CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
