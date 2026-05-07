@@ -289,6 +289,24 @@ When CI is green for `v0.1.x` and you want it on the VPS:
 
 ```bash
 ssh otpadmin@vmi3259514.contaboserver.net
+cd /opt/viator
+
+# 0a. Update the working tree to main BEFORE touching the .env or images
+#     (audit-2026-05 #29 — see "Why this matters" below). Critical:
+#     run as your USER, not via sudo. sudo doesn't have your SSH key.
+git fetch --all -v
+git status                  # if dirty (orchestrator-generated files), see §5.1.1
+git pull                    # fast-forward main
+
+# 0b. Verify the pull actually fetched. The most common silent-failure
+#     mode is "git pull says up-to-date but nothing fetched because sudo
+#     stripped the SSH agent". Confirm the new HEAD matches what you
+#     expect for this release:
+git log --oneline -3
+# Top line should be the merge-commit / tag commit you're deploying.
+# If it shows a much older commit, the pull silently failed — go back
+# to step 0a as your user and check `ssh -T git@github.com`.
+
 cd /opt/viator/docker
 
 # 1. Pin the .env (single source of truth for what version this VPS runs).
@@ -302,20 +320,69 @@ sudo docker compose pull web worker otp-build
 # 3. Recreate web + worker. Postgres and nginx stay up; running
 #    per-session OTP containers stay up too (they'll pick up the new
 #    OTP image only on their next graph rebuild).
-sudo docker compose up -d web worker
+sudo docker compose up -d --force-recreate web worker
+#                              ^^^^^^^^^^^^^^^^^
+# `--force-recreate` is needed when docker-compose.yml itself changed
+# in this release (e.g. a new env var, healthcheck override, or
+# group_add — the audit-2026-05 P0 #1 deploy bit operators that
+# skipped this flag). When in doubt, use it; the cost is one extra
+# container restart.
 
-# 4. Verify.
+# 4. Verify image version + container UID + supplementary groups.
 curl -s http://localhost/healthz/version    # should match VIATOR_VERSION
 sudo docker compose logs --tail 30 web      # no migration errors
 sudo docker compose logs --tail 30 worker   # picks up first tick
+docker exec viator-web-1    id              # uid=1000(appuser) since v0.1.32.3
+docker exec viator-worker-1 id              # uid=1000(appuser) groups=...,988(docker)
 
-# 5. Browser smoke: load /admin/sessions, confirm the badge says the new
+# 5. Per-session OTP containers (audit §6.11 step 7 — don't skip).
+docker exec viator-web-1 \
+  python -c "from app.worker import _list_serving_sessions; print(_list_serving_sessions())"
+docker ps --filter "name=^viator-otp-" --format "{{.Names}}\t{{.Status}}"
+# These two lists must match. Mismatch → §6.11 step 7's recovery paths.
+
+# 6. Browser smoke: load /admin/sessions, confirm the badge says the new
 #    version, click into a session and verify journey search works.
 ```
 
 If a release ships a database migration, the web container's entrypoint
 runs `alembic upgrade head` automatically on startup. Watch the logs to
 confirm it succeeded.
+
+#### 5.1.1 Stash / pop dance for orchestrator-modified files
+
+Step 0a's `git status` typically shows `docker/generated/docker-compose.sessions.yml`
+and `docker/generated/nginx-sessions.conf` as modified — those are
+orchestrator runtime state. The `.gitignore` patterns match the right
+paths (audit #29 fixed an earlier bug there) but the files were
+committed historically as empty stubs for first-install bootstrap, so
+modifications still show. Do the stash/pop:
+
+```bash
+git stash push -m "operator runtime state pre-pull"
+git pull
+git stash pop
+```
+
+The stub content on `main` rarely changes (it's just an empty `services: {}` /
+empty nginx block), so `git stash pop` should apply cleanly without
+conflicts. If a conflict appears, your local content is what should
+survive — `git checkout --theirs <file>` keeps the stash version.
+
+#### 5.1.2 Why pull-before-pull-image matters
+
+The image version (`VIATOR_VERSION` in `.env`) and the **on-disk
+docker-compose.yml** must stay in lockstep. New images sometimes need
+new compose features (env vars, healthcheck overrides, group_add for
+docker socket access, etc.). If `compose pull` brings a new image but
+`git pull` silently failed and the compose file is stale, the running
+container can be subtly broken — for example the v0.1.32.6 deploy
+incident (2026-05-07) where the new image had a non-root USER but the
+old compose file lacked `group_add`, so the worker couldn't read
+`/var/run/docker.sock` and the orphan-cleanup pass kept failing.
+
+The deploy procedure above puts `git pull` first and verifies it
+worked (step 0b's `git log --oneline -3`) precisely because of this.
 
 ### 5.2 Backups
 
