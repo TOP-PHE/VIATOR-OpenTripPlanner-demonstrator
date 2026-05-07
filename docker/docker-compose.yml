@@ -89,6 +89,13 @@ services:
       dockerfile: docker/web/Dockerfile
     restart: unless-stopped
     command: ["python", "-m", "app.worker"]
+    # The image runs as appuser (UID 1000), but reading /var/run/docker.sock
+    # requires membership in the host's `docker` group. The GID is
+    # distribution-dependent — see .env.example DOCKER_GID. Without this,
+    # `docker compose run otp-build` from inside the worker fails with
+    # "permission denied while trying to connect to the Docker daemon socket".
+    group_add:
+      - "${DOCKER_GID:-999}"
     # Same reasoning as web — see above.
     dns:
       - 8.8.8.8

@@ -1,0 +1,97 @@
+# Dependabot — automated dependency PRs.
+#
+# Three ecosystems covered:
+#   1. pip       — runtime + dev Python deps (requirements.txt, requirements-dev.txt)
+#   2. docker    — both Dockerfile base images (python:3.12-slim, eclipse-temurin:25-jre-noble, docker:29-cli)
+#   3. github-actions — pinned action versions in .github/workflows/*.yml
+#
+# Strategy: weekly cadence (Monday 06:00 UTC), grouped by patch-or-minor so
+# a normal week produces 3 PRs at most (one per ecosystem), not 30. Major
+# updates remain individual PRs because they need human review.
+#
+# Audit-2026-05 P0 #2.
+
+version: 2
+updates:
+  # ────────────────────────────── Python ────────────────────────────────
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    groups:
+      python-runtime-patch-minor:
+        applies-to: version-updates
+        dependency-type: production
+        update-types: [patch, minor]
+      python-dev-patch-minor:
+        applies-to: version-updates
+        dependency-type: development
+        update-types: [patch, minor]
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ────────────────────────────── Docker ────────────────────────────────
+  # One block per Dockerfile directory — Dependabot doesn't follow nested
+  # Dockerfiles automatically. Bump cadence is monthly because base-image
+  # updates are correlated (Debian / Ubuntu point releases land in batches)
+  # and per-week PRs would just be churn.
+  - package-ecosystem: docker
+    directory: /docker/web
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    groups:
+      web-base-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /docker/otp
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    groups:
+      otp-base-images:
+        patterns: ["*"]
+
+  # ─────────────────────────── GitHub Actions ───────────────────────────
+  # Pairs with audit-2026-05 P1 #7 (SHA-pinning): once actions are
+  # SHA-pinned, Dependabot keeps them current by opening PRs that bump
+  # both the SHA and the version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    open-pull-requests-limit: 5
+    labels: [dependencies, github-actions]
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
+    groups:
+      actions-patch-minor:
+        update-types: [patch, minor]

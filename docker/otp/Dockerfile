@@ -33,8 +33,34 @@ RUN mkdir -p /opt/otp \
 
 COPY build-config.json /opt/otp/build-config.json
 COPY router-config.json /opt/otp/router-config.json
-COPY entrypoint.sh /opt/otp/entrypoint.sh
-RUN chmod +x /opt/otp/entrypoint.sh
+# `--chmod=755` sets the executable bit at copy time (BuildKit feature).
+# Replaces a separate `RUN chmod +x …` step — saves one image layer and
+# silences SonarCloud rule "merge consecutive RUN instructions" (audit
+# 2026-05 SonarCloud finding). Requires BuildKit, which the GHA matrix
+# uses via docker/setup-buildx-action — `docker compose build` locally
+# also enables it by default since Docker Engine 23.
+COPY --chmod=755 entrypoint.sh /opt/otp/entrypoint.sh
+
+# ─────────────────────── non-root user ───────────────────────
+# Runtime UID/GID 1000:1000 (matches the web image so a single host UID
+# owns both service trees and the shared `graphs` named volume — using
+# different UIDs would break cross-container read/write on that volume).
+# The build container also writes /tmp/<random> via mktemp inside
+# entrypoint.sh and the cache dir at /var/otp/graph/.cache/<sid>/, both
+# under appuser ownership.
+#
+# `eclipse-temurin:25-jre-noble` is built on Ubuntu 24.04 (noble), which
+# ships with a default `ubuntu` user at UID/GID 1000:1000. We delete it
+# first so our `appuser` can own that slot. The `|| true` guards against
+# a future base-image rebuild that drops the default user — userdel
+# fails-noisy if the user doesn't exist, and we'd rather not break the
+# build on a benign upstream change.
+RUN userdel --remove ubuntu 2>/dev/null || true \
+    && groupadd --system --gid 1000 appuser \
+    && useradd --system --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /var/otp/inbox /var/otp/graph \
+    && chown -R appuser:appuser /opt/otp /var/otp
+USER appuser:appuser
 
 EXPOSE 8080
 
