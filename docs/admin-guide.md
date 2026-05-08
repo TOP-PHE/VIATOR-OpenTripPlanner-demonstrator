@@ -287,6 +287,11 @@ After the install completes:
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
+> **First-install only (audit-2026-05 #30)**: see §5.1.0 below. After
+> running the one-time `--skip-worktree` setup once per VPS, the
+> stash/pop dance described in §5.1.1 is no longer needed and `git
+> pull` works cleanly on every subsequent deploy.
+
 ```bash
 ssh otpadmin@vmi3259514.contaboserver.net
 cd /opt/viator
@@ -349,7 +354,51 @@ If a release ships a database migration, the web container's entrypoint
 runs `alembic upgrade head` automatically on startup. Watch the logs to
 confirm it succeeded.
 
-#### 5.1.1 Stash / pop dance for orchestrator-modified files
+#### 5.1.0 First-install only — `--skip-worktree` for orchestrator-modified files (audit #30)
+
+Run **once per VPS clone** to tell git "I'm taking responsibility for
+these files; ignore my local changes to them on `git pull`":
+
+```bash
+cd /opt/viator
+git update-index --skip-worktree docker/generated/docker-compose.sessions.yml
+git update-index --skip-worktree docker/generated/nginx-sessions.conf
+
+# Verify (S = skip-worktree set):
+git ls-files -v docker/generated/ | grep '^S'
+# S docker/generated/docker-compose.sessions.yml
+# S docker/generated/nginx-sessions.conf
+```
+
+After this, `git status` will no longer show those files as modified
+even though the orchestrator keeps rewriting them at runtime, and `git
+pull` will fast-forward without complaining about unstaged changes.
+You can throw away the §5.1.1 stash/pop dance.
+
+The flag is per-clone (it's stored in `.git/info/`, not in the repo
+tree), so this setup must be done on every machine where the
+orchestrator runs (typically just the prod VPS). Dev clones don't need
+it because they don't run the orchestrator against a real DB.
+
+**Reverse it** (rare — only if upstream changes the stub format and
+you need to take the new version):
+
+```bash
+git update-index --no-skip-worktree docker/generated/docker-compose.sessions.yml
+git update-index --no-skip-worktree docker/generated/nginx-sessions.conf
+git stash push -m "operator runtime state"
+git pull
+git stash pop
+# Re-set the flag if you want to suppress operator-modified status again:
+git update-index --skip-worktree docker/generated/docker-compose.sessions.yml
+git update-index --skip-worktree docker/generated/nginx-sessions.conf
+```
+
+#### 5.1.1 Stash / pop dance for orchestrator-modified files (legacy — superseded by §5.1.0)
+
+> **You can skip this section** if you've already run §5.1.0's
+> `--skip-worktree` setup. This section documents the workaround
+> for clones that haven't.
 
 Step 0a's `git status` typically shows `docker/generated/docker-compose.sessions.yml`
 and `docker/generated/nginx-sessions.conf` as modified — those are
