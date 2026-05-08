@@ -79,8 +79,14 @@ echo ">>> waiting 8 sec for web container readiness"
 sleep 8
 
 echo ">>> healthz/version"
-got=$(curl -sf http://localhost/healthz/version 2>/dev/null \
-       || curl -skf https://localhost/healthz/version 2>/dev/null \
+# Try HTTPS first (the production path — nginx redirects http→https
+# with 301, and `curl -sf` doesn't treat 3xx as failure, so without
+# -L we'd capture the redirect HTML body and miss the JSON. -k skips
+# cert verification because the cert is bound to the public hostname,
+# not localhost.). HTTP fallback is for early-install scenarios before
+# TLS is wired (INSTALL.md §9).
+got=$(curl -skfL https://localhost/healthz/version 2>/dev/null \
+       || curl -sfL  http://localhost/healthz/version 2>/dev/null \
        || echo "")
 echo "  $got"
 if ! echo "$got" | grep -q "\"version\":\"${VERSION}\""; then
