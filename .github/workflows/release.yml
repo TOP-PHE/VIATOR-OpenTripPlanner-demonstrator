@@ -125,7 +125,10 @@ jobs:
               chore*|build*|perf*|style*)     echo "- $line" >> _notes/chore.md ;;
               *)                              echo "- $line" >> _notes/other.md ;;
             esac
-          done < <(git log "$RANGE" --pretty=format:'%s' --reverse)
+          # tformat: (not format:) — adds a trailing newline after the last
+          # entry. Without it, `while read -r` silently drops the final
+          # commit when it hits EOF without a newline.
+          done < <(git log "$RANGE" --pretty=tformat:'%s' --reverse)
 
           {
             echo "$HEADER"
