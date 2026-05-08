@@ -66,38 +66,68 @@ jobs:
       - name: Verify both images exist on GHCR
         env:
           GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
           TAG: ${{ steps.validate.outputs.tag }}
         run: |
-          # Defence-in-depth: the deploy script also re-validates, but we
-          # fail fast here before involving the SSH credentials so a typo
-          # in version never reaches the VPS.
+          # Defence-in-depth: the deploy script also re-validates via
+          # `docker compose pull`, but we fail fast here before involving
+          # the SSH credentials so a typo in the version never reaches
+          # the VPS.
+          #
+          # We use the Docker Registry v2 HTTP API directly rather than
+          # `gh api /orgs|users/.../packages/...` because:
+          #   - the org/user endpoint split is brittle (TOP-PHE is a USER,
+          #     not an org; the original /orgs path 404'd);
+          #   - the registry API is owner-type-agnostic;
+          #   - exchanging GITHUB_TOKEN for a registry pull token works
+          #     for both user-owned and org-owned packages.
+          OWNER_LOWER=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           for img in viator-web viator-otp; do
-            echo "::group::Checking ghcr.io/top-phe/${img}:${TAG}"
-            tags=$(gh api "/orgs/TOP-PHE/packages/container/${img}/versions" \
-                    --paginate --jq '.[].metadata.container.tags[]' 2>&1)
-            if echo "$tags" | grep -qx "$TAG"; then
-              echo "  ✓ found"
+            REPO="${OWNER_LOWER}/${img}"
+            tok=$(curl -sf \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
+                    | jq -r .token)
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -H "Authorization: Bearer $tok" \
+                    -H "Accept: application/vnd.oci.image.index.v1+json" \
+                    -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                    -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+                    "https://ghcr.io/v2/${REPO}/manifests/${TAG}")
+            if [ "$code" = "200" ]; then
+              echo "  ✓ ghcr.io/${REPO}:${TAG} found"
             else
-              echo "::error::Image ${img}:${TAG} not on GHCR. Did docker.yml complete?"
+              echo "::error::Image ${img}:${TAG} not on GHCR (HTTP $code). Did docker.yml complete?"
               exit 1
             fi
-            echo "::endgroup::"
           done
 
       - name: Set up SSH key + pinned host key
         env:
-          DEPLOY_KEY: ${{ secrets.VIATOR_DEPLOY_SSH_KEY }}
+          DEPLOY_KEY_B64: ${{ secrets.VIATOR_DEPLOY_SSH_KEY }}
           HOST_KEY: ${{ secrets.VIATOR_HOST_KEY }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          # The deploy key is stored base64-encoded in the GitHub Secret
+          # to survive line-ending mangling that browser textareas apply
+          # to multi-line OpenSSH key blocks. Operator setup is in the
+          # admin-guide §2.4.1: `cat ~/.ssh/viator-deploy | base64 -w 0`
+          # pastes one long single-line value into the Secret form, no
+          # newlines for the browser to corrupt.
+          printf '%s' "$DEPLOY_KEY_B64" | tr -d '\r\n ' | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           # Pin the VPS host key so we never trust a man-in-the-middle.
           # StrictHostKeyChecking=yes (below) refuses to connect if the
-          # presented host key isn't already in known_hosts.
-          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+          # presented host key isn't already in known_hosts. Host key is
+          # single-line (ssh-keyscan output) so plain printf is fine,
+          # tr -d '\r' is just paranoid hygiene.
+          printf '%s\n' "$HOST_KEY" | tr -d '\r' > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
+          # Sanity: confirm the key parses, with a clearer error than the
+          # bare libcrypto failure that an incorrectly-stored secret produces.
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null \
+            || { echo "::error::deploy_key failed to parse — VIATOR_DEPLOY_SSH_KEY must be base64-encoded; see admin-guide §2.4.1"; exit 1; }
 
       - name: Run deploy on VPS
         env:
