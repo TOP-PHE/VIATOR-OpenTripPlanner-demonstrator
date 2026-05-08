@@ -29,10 +29,12 @@ if ! [[ "$ARG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 VERSION="$ARG"
 
-echo "============================================================"
+readonly SEPARATOR="============================================================"
+
+echo "$SEPARATOR"
 echo "VIATOR deploy — $VERSION"
 echo "started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "============================================================"
+echo "$SEPARATOR"
 
 # ─────────────────────────────── Update working tree ──────────────────────────
 cd /opt/viator
@@ -123,7 +125,7 @@ if [[ -n "$db_sessions" && "$db_sessions" != "[]" ]]; then
     done < <(echo "$db_sessions" | tr ',' '\n')
 fi
 
-echo "============================================================"
+echo "$SEPARATOR"
 echo "DEPLOY OK — $VERSION live on $(hostname)"
 echo "ended at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "============================================================"
+echo "$SEPARATOR"
