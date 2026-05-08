@@ -2,9 +2,9 @@
 
 This directory holds the compose + nginx fragments that
 `app/sessions_orchestrator.py` rewrites every time a session reaches
-`state='serving'` or is archived. It's the bridge between the database
-(which knows what sessions exist) and the running stack (which routes to
-`otp-<sid>:8080` per session).
+`state='serving'` or is archived, AND on every web-container boot. It's the
+bridge between the database (which knows what sessions exist) and the running
+stack (which routes to `otp-<sid>:8080` per session).
 
 ## Files
 
@@ -13,43 +13,58 @@ This directory holds the compose + nginx fragments that
 | `docker-compose.sessions.yml` | `./generated/docker-compose.sessions.yml` (host) — referenced via `include:` in `../docker-compose.yml` | `sessions_orchestrator.render_compose()` | One `otp-<sid>:` service per serving session |
 | `nginx-sessions.conf` | `/etc/nginx/conf.d/sessions/` (nginx container) | `sessions_orchestrator.render_nginx()` | One `location /otp/<sid>/ → otp-<sid>:8080` per serving session |
 
-## Initial state
+Neither file is tracked in git — they are pure runtime state, regenerated
+deterministically from the `sessions` table.
 
-Both files ship as **empty stubs** so `docker compose up` works on a clean
-install before any session has been created. The orchestrator overwrites
-them as soon as a session reaches `serving`.
+## When the orchestrator runs
 
-## Why these files are tracked in git
+1. **At web-container boot** (`app.main._startup` hook) — regenerates from
+   current DB state, closing any drift window between deploy and first
+   session edit.
+2. **On every session state change** — admin API calls
+   `sessions_orchestrator.regenerate(db)` after creating, archiving, or
+   deleting a session.
+3. **Manually**, for debugging:
+   ```bash
+   docker compose exec web python -c "
+   from app import sessions_orchestrator
+   from app.db import SessionLocal
+   with SessionLocal() as db:
+       sessions_orchestrator.regenerate(db)
+   "
+   ```
 
-Compose's `include:` errors hard if the referenced file is missing. nginx's
-`include` is forgiving (silently matches zero files in the glob), but the
-compose include rules require committed stubs. Once running, the orchestrator
-keeps both files in sync with the DB — but the very first `docker compose up`
-on a fresh checkout still needs the stubs to be present.
+## First install — bootstrap stubs
 
-## After regeneration, expect a dirty working tree
+Compose's `include:` directive (in `../docker-compose.yml`) is parse-time
+strict — `docker-compose.sessions.yml` must exist as valid YAML before any
+container can start, including the web container that would otherwise create
+it. On a fresh clone, the file doesn't exist yet.
 
-After the orchestrator runs (Phase-A: triggered manually; Phase-B: automatic
-after each session state change), `git status` in `docker/generated/` will
-show changes. **Don't commit them** — they're machine-output bound to your
-local DB state. On the production VPS, the working tree drifts from `origin/main`
-by design; that's expected.
+Solution: run `bin/viator-bootstrap-stubs.sh` once before the first
+`docker compose up` — it creates empty stubs (idempotent, no-op if files
+already exist). See `INSTALL.md` §5.5. After that, the orchestrator owns the
+files and operators never need to touch them again.
 
-## Phase-A vs Phase-B
+## After regeneration — `git status` is clean
 
-- **Phase-A (current):** the orchestrator is implemented but not auto-wired.
-  After creating a session that reaches `serving`, an operator manually runs:
-  ```bash
-  docker compose exec web python -c "
-  from app import sessions_orchestrator
-  from app.db import SessionLocal
-  with SessionLocal() as db:
-      sessions_orchestrator.regenerate(db)
-  "
-  docker compose up -d
-  docker compose exec nginx nginx -s reload
-  ```
-- **Phase-B (next milestone):** the admin sessions API calls
-  `sessions_orchestrator.regenerate()` on each state transition, the worker
-  shells out to `docker compose up -d`, and nginx reload happens automatically.
-  See spec §11.5 and §11.6.5 for the wiring plan.
+These files are fully untracked, so the orchestrator overwriting them never
+shows up as modified files in `git status`. No `--skip-worktree`, no
+stash/pop dance. Closes audit-2026-05 #30.
+
+## Migrating an existing VPS clone (one-time)
+
+If your VPS was provisioned before v0.1.32.10, the two files are still
+tracked locally. Run on the VPS once during/after the v0.1.32.10 deploy:
+
+```bash
+cd /opt/viator
+# Drop --skip-worktree if it was set (audit #30 superseded by this commit):
+git update-index --no-skip-worktree docker/generated/docker-compose.sessions.yml 2>/dev/null || true
+git update-index --no-skip-worktree docker/generated/nginx-sessions.conf 2>/dev/null || true
+# git pull will then update the index (the files are removed from tree-state
+# but remain on disk — operator-owned runtime state from here on).
+git pull
+```
+
+After this, `git status` is permanently clean for these paths.

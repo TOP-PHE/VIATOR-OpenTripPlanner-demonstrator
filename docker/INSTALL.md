@@ -128,6 +128,32 @@ OTP_BUILD_PHASES=two_phase   # 'one_shot' available as fallback (debug only)
 
 ---
 
+## 5.5 Bootstrap the runtime stub files (one-time, fresh-install only)
+
+The web container's `_startup` hook regenerates the per-session compose +
+nginx fragments in `docker/generated/` from current DB state on every boot.
+But compose's `include:` directive (in `docker-compose.yml`) is parse-time
+strict — `docker-compose.sessions.yml` must exist as valid YAML *before*
+the web container is started. On a fresh clone, neither file exists yet.
+
+Run from the repo root (`/opt/viator`, not `/opt/viator/docker`):
+
+```bash
+cd /opt/viator
+./bin/viator-bootstrap-stubs.sh
+```
+
+Output:
+```
+created /opt/viator/docker/generated/docker-compose.sessions.yml
+created /opt/viator/docker/generated/nginx-sessions.conf
+```
+
+The script is idempotent — running it twice is a no-op. See
+`docker/generated/README.md` for the full lifecycle.
+
+---
+
 ## 6. Pull or build the images
 
 If you've enabled GHCR pulls (the Trivy gate already runs in CI, so the published images are scanned), pull instead of build:
