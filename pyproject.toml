@@ -21,6 +21,8 @@ select = [
     "PIE",        # flake8-pie
     "S",          # flake8-bandit (security)
     "PTH",        # use pathlib
+    "G",          # flake8-logging-format — no f-string / .format() / + / `% on log args
+    "LOG",        # ruff logging — no log.WARN, no exception=False, no root logger
     "RUF",        # ruff-specific
 ]
 ignore = [
