@@ -196,7 +196,91 @@ Both workflows must complete green:
   security (bandit), test (pytest with coverage). This is the quality gate;
   it doesn't gate publishing but red CI on a release tag is technical debt.
 
-### 2.4 Recovering from a broken CI on a fresh tag
+### 2.4 Deploying via the automated workflow (audit #17 Part B, since v0.1.32.13)
+
+Once the GHCR image is published (cascading from §2.3.1), deploy with one
+button on the Actions tab:
+
+1. Repo → **Actions** → **Deploy** workflow → **Run workflow**.
+2. Fill in:
+   - **Version**: `0.1.32.13` (or `v0.1.32.13`)
+3. **Run workflow**.
+
+What it does:
+
+1. Validates the version pattern.
+2. Checks both `viator-web:vX.Y.Z.W` and `viator-otp:vX.Y.Z.W` exist on
+   GHCR — fails fast on a typo before involving SSH credentials.
+3. SSHs into the VPS using the deploy key.
+4. The VPS-side `~/.ssh/authorized_keys` forced-command pins what that
+   key can run to `/opt/viator/bin/viator-deploy.sh`. The version arrives
+   via `$SSH_ORIGINAL_COMMAND` and is re-validated by the script.
+5. The script runs `git pull → docker compose pull → up -d --force-recreate
+   web worker → /healthz/version → JSON-log assertions → orphan-OTP-container
+   sanity` — same procedure as §5.1.2 manual deploy, sourced from the same
+   admin-guide.
+6. Workflow then curls the public `https://<host>/healthz/version` to verify
+   the deploy is reachable from outside.
+
+Manual fallback: §5.1.2.
+
+#### 2.4.1 One-time setup (per VPS)
+
+Done once, before the first automated deploy. ~10 min.
+
+```bash
+# ── ON THE VPS ──────────────────────────────────────────────────────────────
+ssh otpadmin@<host>
+
+# 1. Generate an ed25519 keypair with NO passphrase (workflow can't enter one).
+ssh-keygen -t ed25519 -f ~/.ssh/viator-deploy -N "" -C "github-actions deploy"
+
+# 2. Pin the key to the deploy script via authorized_keys forced-command.
+#    The forced-command means: regardless of what the SSH client requests,
+#    only viator-deploy.sh runs. no-pty etc. block shell escapes.
+PUBKEY=$(cat ~/.ssh/viator-deploy.pub)
+echo 'command="/opt/viator/bin/viator-deploy.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty '"$PUBKEY" \
+  >> ~/.ssh/authorized_keys
+
+# 3. Capture the VPS host key so the workflow can pin it (prevents MITM).
+HOST=$(hostname -f)
+ssh-keyscan -t ed25519 -H "$HOST" 2>/dev/null
+
+# 4. Print the private key — copy this output (NOT the .pub) to GitHub Secrets.
+cat ~/.ssh/viator-deploy
+```
+
+```text
+# ── ON GITHUB (repo Settings) ───────────────────────────────────────────────
+Settings → Secrets and variables → Actions
+
+Secrets (encrypted, redacted in logs):
+  VIATOR_DEPLOY_SSH_KEY  ← contents of ~/.ssh/viator-deploy (private key)
+  VIATOR_HOST_KEY        ← output of `ssh-keyscan -t ed25519 -H <host>`
+
+Repository variables (visible in logs, not sensitive):
+  VIATOR_HOST  ← e.g. vmi3259514.contaboserver.net
+  VIATOR_USER  ← e.g. otpadmin
+```
+
+```bash
+# ── BACK ON THE VPS ─────────────────────────────────────────────────────────
+# 5. Make sure the deploy script is in place + executable. From v0.1.32.13
+#    onwards `bin/viator-deploy.sh` is in the repo, so a `git pull` populates
+#    it; for the v0.1.32.13 deploy itself (when the file isn't yet in the
+#    deployed working tree), `git pull` first then run the deploy MANUALLY one
+#    last time per §5.1.2 — *after* that, automation works.
+ls -l /opt/viator/bin/viator-deploy.sh   # should be -rwxr-xr-x
+```
+
+After this setup, every release is one click in the GitHub UI: §2.3.1
+(release) → §2.4 (deploy) → done.
+
+To require manual approval before each deploy: repo Settings →
+Environments → New environment "production" → enable "Required reviewers"
+→ uncomment the `environment:` block at the top of `.github/workflows/deploy.yml`.
+
+### 2.5 Recovering from a broken CI on a fresh tag
 
 The v0.1.9 release went through **five iterations** before landing.
 Every time CI fails on a tag, the procedure is:
@@ -225,7 +309,7 @@ This pattern (delete tag, re-create at new HEAD) is fine **as long as
 nobody has pulled the broken image**. Once a tag has been pulled in
 production, treat it as immutable and bump to the next patch.
 
-### 2.5 Hotfix workflow
+### 2.6 Hotfix workflow
 
 When something is broken in production and you need to ship NOW:
 
@@ -330,6 +414,9 @@ After the install completes:
 ## 5. Routine maintenance
 
 ### 5.1 Deploying a new version
+
+> **Recommended (since v0.1.32.13)**: use the automated **Deploy** workflow on
+> the GitHub Actions tab — see [§2.4](#24-deploying-via-the-automated-workflow-audit-17-part-b-since-v013213). The procedure below remains as the manual fallback (also useful for first-deploy where the deploy key isn't set up yet, and for one-off debug deploys from your dev machine).
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
