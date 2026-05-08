@@ -112,7 +112,47 @@ a PATCH.
 
 ### 2.3 Cutting a release
 
-The full procedure, with one real example you can replay any time:
+#### 2.3.1 Recommended — automated `release.yml` workflow (audit #17 Part A, since v0.1.32.11)
+
+One-button release via the GitHub Actions UI:
+
+1. Repo → **Actions** tab → **Release** workflow → **Run workflow** dropdown.
+2. Fill in:
+   - **Version**: `0.1.32.11` (or `v0.1.32.11` — leading `v` is accepted)
+   - **Dry run**: leave unchecked unless you want to preview release notes
+3. **Run workflow** → wait ~30s for the job to complete.
+
+What the workflow does (in order):
+
+1. Validates the version against the project's 4-part `vX.Y.Z.W` scheme.
+2. Refuses if the tag already exists.
+3. Finds the previous release tag and generates grouped release notes
+   (Features / Bug Fixes / Security / Refactoring / CI/CD / Documentation /
+   Tests / Chores / Other) from the conventional-commit log between the
+   two tags.
+4. Creates an annotated tag with the notes as the message.
+5. Pushes the tag — which cascades into `docker.yml` to build, Trivy-scan,
+   and publish the GHCR image.
+6. Creates the GitHub Release page with the same notes attached.
+
+After the workflow completes (~30 sec), watch `docker.yml` for the image
+build (~30 min on tagged releases):
+
+```bash
+gh run list --limit 3 --workflow=docker.yml
+gh run watch <run-id> --exit-status
+```
+
+Once the image is live on GHCR, deploy via §5.1.
+
+**Dry-run mode** is useful to preview release notes when the commit log
+is noisy or when you're not sure what bucket a commit will land in. The
+job logs print the rendered Markdown without creating any tag/release.
+
+#### 2.3.2 Fallback — manual procedure
+
+Use this when the workflow is unavailable (e.g. a release-time bug in
+release.yml itself), or when you need to tag a non-`main` branch:
 
 ```bash
 # 0. Make sure you're on main with everything committed.
