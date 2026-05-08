@@ -104,27 +104,30 @@ jobs:
 
       - name: Set up SSH key + pinned host key
         env:
-          DEPLOY_KEY: ${{ secrets.VIATOR_DEPLOY_SSH_KEY }}
+          DEPLOY_KEY_B64: ${{ secrets.VIATOR_DEPLOY_SSH_KEY }}
           HOST_KEY: ${{ secrets.VIATOR_HOST_KEY }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # `tr -d '\r'` strips carriage returns. Browsers (especially on
-          # Windows) sometimes inject CRLF line endings when the operator
-          # pastes the private key into the GitHub Secret form, which
-          # makes openssl fail to parse the key with `error in libcrypto`.
-          # Stripping \r is harmless on already-LF input.
-          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          # The deploy key is stored base64-encoded in the GitHub Secret
+          # to survive line-ending mangling that browser textareas apply
+          # to multi-line OpenSSH key blocks. Operator setup is in the
+          # admin-guide §2.4.1: `cat ~/.ssh/viator-deploy | base64 -w 0`
+          # pastes one long single-line value into the Secret form, no
+          # newlines for the browser to corrupt.
+          printf '%s' "$DEPLOY_KEY_B64" | tr -d '\r\n ' | base64 -d > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           # Pin the VPS host key so we never trust a man-in-the-middle.
           # StrictHostKeyChecking=yes (below) refuses to connect if the
-          # presented host key isn't already in known_hosts.
+          # presented host key isn't already in known_hosts. Host key is
+          # single-line (ssh-keyscan output) so plain printf is fine,
+          # tr -d '\r' is just paranoid hygiene.
           printf '%s\n' "$HOST_KEY" | tr -d '\r' > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
-          # Sanity: confirm the key parses (catches the CRLF / truncation
-          # case explicitly with a clearer error than the bare ssh failure).
+          # Sanity: confirm the key parses, with a clearer error than the
+          # bare libcrypto failure that an incorrectly-stored secret produces.
           ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null \
-            || { echo "::error::deploy_key failed to parse — re-paste the secret without CRLF"; exit 1; }
+            || { echo "::error::deploy_key failed to parse — VIATOR_DEPLOY_SSH_KEY must be base64-encoded; see admin-guide §2.4.1"; exit 1; }
 
       - name: Run deploy on VPS
         env:

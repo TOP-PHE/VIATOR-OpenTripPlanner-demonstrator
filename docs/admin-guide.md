@@ -246,8 +246,15 @@ echo 'command="/opt/viator/bin/viator-deploy.sh",no-port-forwarding,no-X11-forwa
 HOST=$(hostname -f)
 ssh-keyscan -t ed25519 -H "$HOST" 2>/dev/null
 
-# 4. Print the private key — copy this output (NOT the .pub) to GitHub Secrets.
-cat ~/.ssh/viator-deploy
+# 4. Print the private key as a SINGLE-LINE base64 blob.
+#    The base64 form is critical: pasting the multi-line OpenSSH block
+#    into the GitHub Secret form gets mangled (browsers/textareas
+#    sometimes inject CRLF or collapse internal newlines), and the
+#    workflow then can't parse the key (`error in libcrypto`).
+#    The deploy.yml decodes this base64 before writing the key to disk.
+cat ~/.ssh/viator-deploy | base64 -w 0 ; echo
+# Copy the long single-line output. Don't paste it back into chat —
+# go directly to the GitHub Secret form.
 ```
 
 ```text
@@ -255,8 +262,10 @@ cat ~/.ssh/viator-deploy
 Settings → Secrets and variables → Actions
 
 Secrets (encrypted, redacted in logs):
-  VIATOR_DEPLOY_SSH_KEY  ← contents of ~/.ssh/viator-deploy (private key)
+  VIATOR_DEPLOY_SSH_KEY  ← BASE64-ENCODED contents of ~/.ssh/viator-deploy
+                            (single-line output of `cat ~/.ssh/viator-deploy | base64 -w 0`)
   VIATOR_HOST_KEY        ← output of `ssh-keyscan -t ed25519 -H <host>`
+                            (single line, no base64 needed)
 
 Repository variables (visible in logs, not sensitive):
   VIATOR_HOST  ← e.g. vmi3259514.contaboserver.net
