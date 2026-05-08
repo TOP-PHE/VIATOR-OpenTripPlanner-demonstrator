@@ -116,9 +116,11 @@ def metrics_app() -> Iterator[FastAPI]:
     Unregisters any pre-existing _ViatorDbCollector before this test runs:
     otherwise side_effect from a prior test's mock factory is exhausted and
     this test's collector silently emits nothing."""
-    for c in list(REGISTRY._collector_to_names):
-        if isinstance(c, _ViatorDbCollector):
-            REGISTRY.unregister(c)
+    # Snapshot first, then iterate — REGISTRY.unregister mutates the
+    # underlying dict, so a direct iteration would `RuntimeError`.
+    stale = [c for c in REGISTRY._collector_to_names if isinstance(c, _ViatorDbCollector)]
+    for c in stale:
+        REGISTRY.unregister(c)
 
     app = FastAPI()
 
