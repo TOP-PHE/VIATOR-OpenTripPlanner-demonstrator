@@ -119,6 +119,23 @@ def _startup() -> None:
     except Exception:
         log.exception("concurrency.gates_init_failed", fallback="schema_defaults")
 
+    # Audit-2026-05 #30 — regenerate the docker/generated/ stubs from current
+    # DB state on every boot. The orchestrator already runs on every session
+    # state change; calling it here closes the drift window between "operator
+    # deployed v0.1.x" and "first session edit happens" — the stubs always
+    # reflect the live DB from the moment the container is reachable. The
+    # files themselves are no longer tracked in git (replaced by the
+    # bin/viator-bootstrap-stubs.sh first-install script that creates the
+    # parse-time-required empty stubs).
+    try:
+        from . import sessions_orchestrator
+
+        with SessionLocal() as db:
+            sessions_orchestrator.regenerate(db)
+            log.info("sessions_orchestrator.regenerated_at_boot")
+    except Exception:
+        log.exception("sessions_orchestrator.boot_regenerate_failed", fatal=False)
+
     # v0.1.29.3 — mark any in-flight network-coverage runs as failed.
     # FastAPI BackgroundTasks are in-process; a container restart kills
     # them with no DB state cleanup, leaving runs in 'running' status

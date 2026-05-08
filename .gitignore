@@ -59,18 +59,20 @@ journey-ui/coverage/
 # These paths must match `app/sessions_orchestrator.py`:
 #   COMPOSE_FRAGMENT = Path("/data/generated/docker-compose.sessions.yml")
 #   NGINX_FRAGMENT   = Path("/data/generated/nginx-sessions.conf")
-# which inside the worker container map to host paths via the bind
+# which inside the web/worker containers map to host paths via the bind
 # mount `./generated:/data/generated` in docker-compose.yml.
 #
 # Audit-2026-05 #29 — pre-this-fix the patterns below were
 # `docker/docker-compose.sessions.yml` and `docker/nginx/sessions.conf`,
 # which never matched anything. The operator-modified runtime state
-# leaked into `git status` and caused stash/pop dances during deploys
-# (see admin-guide §5.1 deploy procedure).
+# leaked into `git status` and caused stash/pop dances during deploys.
 #
-# Note: the *stubs* are tracked in git (so first `compose up` succeeds
-# on a fresh clone before any session exists). These ignore patterns
-# only prevent re-committing operator-modified versions back upstream.
+# Audit-2026-05 #30 — these files are now fully untracked (git rm --cached'd
+# in v0.1.32.10). On a fresh clone, `bin/viator-bootstrap-stubs.sh` writes
+# empty stubs so compose's parse-time `include:` succeeds; the web
+# container's _startup hook then regenerates them from current DB state.
+# These patterns are kept as belt-and-braces — the files should never come
+# back to the index even if someone forgets and runs `git add -A`.
 docker/generated/docker-compose.sessions.yml
 docker/generated/nginx-sessions.conf
 

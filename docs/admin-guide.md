@@ -354,51 +354,40 @@ If a release ships a database migration, the web container's entrypoint
 runs `alembic upgrade head` automatically on startup. Watch the logs to
 confirm it succeeded.
 
-#### 5.1.0 First-install only — `--skip-worktree` for orchestrator-modified files (audit #30)
+#### 5.1.0 Generated stubs — fully untracked since v0.1.32.10 (audit #30)
 
-Run **once per VPS clone** to tell git "I'm taking responsibility for
-these files; ignore my local changes to them on `git pull`":
+The `docker/generated/docker-compose.sessions.yml` and `nginx-sessions.conf`
+files are **no longer tracked in git** as of v0.1.32.10. The web
+container's `_startup` hook regenerates them from current DB state on every
+boot, and `bin/viator-bootstrap-stubs.sh` (idempotent) creates empty stubs
+on a fresh clone before the very first `docker compose up`.
+
+For **fresh installs**: see `docker/INSTALL.md` §5.5 — one-time bootstrap
+script, then operators never need to touch these files.
+
+For **existing VPS clones provisioned before v0.1.32.10** (one-time
+migration, run during the v0.1.32.10 deploy):
 
 ```bash
 cd /opt/viator
-git update-index --skip-worktree docker/generated/docker-compose.sessions.yml
-git update-index --skip-worktree docker/generated/nginx-sessions.conf
-
-# Verify (S = skip-worktree set):
-git ls-files -v docker/generated/ | grep '^S'
-# S docker/generated/docker-compose.sessions.yml
-# S docker/generated/nginx-sessions.conf
-```
-
-After this, `git status` will no longer show those files as modified
-even though the orchestrator keeps rewriting them at runtime, and `git
-pull` will fast-forward without complaining about unstaged changes.
-You can throw away the §5.1.1 stash/pop dance.
-
-The flag is per-clone (it's stored in `.git/info/`, not in the repo
-tree), so this setup must be done on every machine where the
-orchestrator runs (typically just the prod VPS). Dev clones don't need
-it because they don't run the orchestrator against a real DB.
-
-**Reverse it** (rare — only if upstream changes the stub format and
-you need to take the new version):
-
-```bash
-git update-index --no-skip-worktree docker/generated/docker-compose.sessions.yml
-git update-index --no-skip-worktree docker/generated/nginx-sessions.conf
-git stash push -m "operator runtime state"
+# Drop --skip-worktree if it was set on either file; ignore errors if not:
+git update-index --no-skip-worktree docker/generated/docker-compose.sessions.yml 2>/dev/null || true
+git update-index --no-skip-worktree docker/generated/nginx-sessions.conf 2>/dev/null || true
+# Pull the v0.1.32.10 commit. The `git rm --cached` in that commit removes
+# the files from the index — your working-tree copies stay (they're
+# operator-owned runtime state from now on).
 git pull
-git stash pop
-# Re-set the flag if you want to suppress operator-modified status again:
-git update-index --skip-worktree docker/generated/docker-compose.sessions.yml
-git update-index --skip-worktree docker/generated/nginx-sessions.conf
+git status   # should be clean for docker/generated/
 ```
 
-#### 5.1.1 Stash / pop dance for orchestrator-modified files (legacy — superseded by §5.1.0)
+After this one-time migration, `git status` is permanently clean for
+those paths and §5.1.1's stash/pop dance is **never** needed again.
 
-> **You can skip this section** if you've already run §5.1.0's
-> `--skip-worktree` setup. This section documents the workaround
-> for clones that haven't.
+#### 5.1.1 Stash / pop dance for orchestrator-modified files (deprecated — superseded by §5.1.0 untrack)
+
+> **You can skip this section** entirely on v0.1.32.10+. It's preserved
+> only to explain commits that reference it from before the audit-#30
+> proper fix landed.
 
 Step 0a's `git status` typically shows `docker/generated/docker-compose.sessions.yml`
 and `docker/generated/nginx-sessions.conf` as modified — those are
