@@ -507,6 +507,35 @@ df -h /var/lib/docker
 sudo du -sh /var/lib/docker/volumes/viator_*
 ```
 
+#### Structured JSON logs (v0.1.32.9+)
+
+Web + worker emit one JSON object per log line to stdout. Required keys:
+`timestamp` (ISO-8601 UTC), `level`, `logger`, `event`, plus event-specific
+fields and a `request_id` when the line was emitted in an HTTP request scope.
+
+```bash
+# Tail web container, pretty-print with jq
+docker compose -p viator logs -f web | jq -c .
+
+# Filter by level and request_id (correlate everything one request did)
+docker compose -p viator logs --since 10m web \
+  | jq -c 'select(.level=="error" or .level=="warning")'
+docker compose -p viator logs --since 10m web \
+  | jq -c 'select(.request_id=="abc123def456...")'
+
+# Find slow scheduler events
+docker compose -p viator logs --since 1h web \
+  | jq -c 'select(.event | startswith("scheduler."))'
+```
+
+Clients can pin a `X-Request-ID` request header (alphanumeric, `_-`, ≤64 chars)
+and it'll be echoed in the response and tagged on every log line for that
+request. Missing or malformed inbound IDs are replaced with a generated UUID.
+
+Switch to colored console output for local dev: set `LOG_FORMAT=console` in
+the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
+(`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) and defaults to `INFO`.
+
 ### 5.5 Capacity planning
 
 Three things to watch as you onboard more sessions:

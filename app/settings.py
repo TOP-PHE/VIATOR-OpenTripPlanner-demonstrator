@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # Used to build magic-link URLs in confirmation / password-reset emails.
     public_base_url: str = "http://localhost:8000"
 
+    # Structured logging — see app.logging_config.setup_logging.
+    # log_format=json emits JSON to stdout (production / containers);
+    # log_format=console emits human-readable colored output (local dev).
+    log_level: str = "INFO"
+    log_format: str = "json"
+
     # Build/release version surfaced in the UI header and /healthz/version.
     # Baked into the web image at build time via a Docker `ARG VIATOR_VERSION`
     # promoted to ENV (see docker/web/Dockerfile). The GHA workflow sets it

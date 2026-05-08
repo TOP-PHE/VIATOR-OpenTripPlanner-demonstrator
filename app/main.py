@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
+import structlog
 from fastapi import (
     Depends,
     FastAPI,
@@ -37,13 +37,19 @@ from .api.auth import routes as auth_routes
 from .api.master import aliases as master_aliases
 from .api.master import stations as master_stations
 from .db import SessionLocal
+from .logging_config import setup_logging
+from .middleware.request_id import RequestIdMiddleware
 from .models import RebuildJob, Upload
 from .rate_limit import limiter
 from .security import authed, authed_or_none
 from .settings import settings
 from .templating import templates  # shared Jinja env — version global lives here
 
-log = logging.getLogger(__name__)
+# Configure structured JSON logging before any module-level log calls fire.
+# Idempotent — safe even if uvicorn re-applies its default LOGGING_CONFIG.
+setup_logging()
+
+log = structlog.get_logger(__name__)
 
 
 app = FastAPI(title="VIATOR — feed ingestion")
@@ -65,6 +71,10 @@ def _rate_limit_handler(request: Request, exc: Exception) -> Response:
 
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 app.add_middleware(SlowAPIMiddleware)
+# Request-id middleware runs outermost (added last = called first per Starlette
+# semantics) so every log line — including from rate-limit rejections — carries
+# the request_id contextvar.
+app.add_middleware(RequestIdMiddleware)
 
 
 # Brand assets (TrackOnPath logo, UIC logo, VIATOR icons) live in ./branding
@@ -105,9 +115,9 @@ def _startup() -> None:
     try:
         with SessionLocal() as db:
             concurrency.semaphores.reload_from_config(config_service.get_all(db))
-            log.info("concurrency gates initialised from platform_config")
+            log.info("concurrency.gates_initialised", source="platform_config")
     except Exception:
-        log.exception("could not load platform_config at startup; using defaults")
+        log.exception("concurrency.gates_init_failed", fallback="schema_defaults")
 
     # v0.1.29.3 — mark any in-flight network-coverage runs as failed.
     # FastAPI BackgroundTasks are in-process; a container restart kills
@@ -123,9 +133,9 @@ def _startup() -> None:
             n = _coverage_runner.mark_orphaned_runs_as_failed(db)
             if n:
                 db.commit()
-                log.warning("marked %d orphaned network-coverage run(s) as failed", n)
+                log.warning("network_coverage.orphans_marked_failed", count=n)
     except Exception:
-        log.exception("orphan coverage-run cleanup failed at startup (non-fatal)")
+        log.exception("network_coverage.orphan_cleanup_failed", fatal=False)
 
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os
@@ -150,16 +160,18 @@ def _startup() -> None:
                 try:
                     await trainline.refresh(db)
                 except Exception:
-                    log.exception("scheduled trainline refresh failed")
+                    log.exception(
+                        "scheduler.trainline_refresh_failed", job="master_stations_refresh"
+                    )
 
         sched.add_job(
             _master_stations_refresh, "cron", hour=4, minute=0, id="master_stations_refresh"
         )
         sched.start()
         _scheduler = sched
-        log.info("APScheduler started: retention + master-data refresh")
+        log.info("scheduler.started", jobs=["retention", "master_stations_refresh"])
     except Exception:
-        log.exception("could not start scheduler — crons disabled this run")
+        log.exception("scheduler.startup_failed", crons_enabled=False)
 
 
 @app.get("/", response_class=HTMLResponse)
