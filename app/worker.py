@@ -286,6 +286,48 @@ def _parse_otp_service_names(ps_output: str) -> set[str]:
     return services
 
 
+# Audit-2026-05 #27 — non-compose OTP containers.
+# Anything running our viator-otp image but NOT under the compose project
+# (e.g. an operator's `docker run ghcr.io/top-phe/viator-otp:vX cat …` debug
+# container that lingered for 45h on 2026-05-07 as `wizardly_pasteur`).
+# We don't auto-remove (could be intentional) — just log a warning.
+_OTP_IMAGE_PREFIX = "ghcr.io/top-phe/viator-otp"
+
+
+def _find_non_compose_otp_containers(ps_output: str) -> list[tuple[str, str, str]]:
+    """Parse `docker ps -a --format '{{.Names}}\\t{{.Image}}\\t{{.Status}}'`
+    output and return rows for containers that:
+
+      - run our OTP image (`ghcr.io/top-phe/viator-otp:*`)
+      - are NOT under the compose project (name doesn't start with `viator-`)
+
+    Returns a list of `(name, image, status)` tuples for the warning logger.
+    Returns an empty list when input is empty / malformed / no matches —
+    callers should treat that as the success case.
+
+    Audit-2026-05 #27 — surfaced when `wizardly_pasteur` (image
+    `ghcr.io/top-phe/viator-otp:v0.1.30`) lingered 45h after a manual
+    `docker run … cat /opt/otp/entrypoint.sh` debug invocation. Tested
+    in `tests/unit/test_worker_orphan_parse.py`.
+    """
+    found: list[tuple[str, str, str]] = []
+    for line in ps_output.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) < 3:
+            continue
+        name, image, status = parts[0], parts[1], parts[2]
+        if not name or not image:
+            continue
+        if not image.startswith(_OTP_IMAGE_PREFIX):
+            continue
+        if name.startswith("viator-"):
+            # Compose-managed — handled by the existing orphan-cleanup
+            # path in handle_reload_trigger() (audit #25).
+            continue
+        found.append((name, image, status))
+    return found
+
+
 def handle_reload_trigger() -> None:
     """If `/data/generated/.reload-trigger` exists, apply the current set of
     per-session compose + nginx fragments to the running stack.
@@ -385,6 +427,31 @@ def handle_reload_trigger() -> None:
                     rm.returncode,
                     rm.stderr,
                 )
+
+    # ── Non-compose OTP containers (audit-2026-05 #27) ─────────────
+    # Catch operator-spawned `docker run` containers using our OTP
+    # image (e.g. `wizardly_pasteur` from a manual debug session).
+    # These slip past audit #25's `name=^viator-otp-` filter. Don't
+    # auto-remove (could be intentional debug); just log a clear
+    # warning so the operator sees it during routine log review.
+    ps_all = subprocess.run(  # noqa: S603
+        [_DOCKER, "ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ps_all.returncode == 0:
+        non_compose = _find_non_compose_otp_containers(ps_all.stdout)
+        for name, image, status in non_compose:
+            log.warning(
+                "non-compose OTP container detected: %s (image=%s status=%s) "
+                "— not managed by sessions_orchestrator. If intentional "
+                "(operator debug), ignore. Otherwise: docker rm -f %s",
+                name,
+                image,
+                status,
+                name,
+            )
 
     # nginx -s reload (target the compose-labeled container).
     reload = subprocess.run(  # noqa: S603
