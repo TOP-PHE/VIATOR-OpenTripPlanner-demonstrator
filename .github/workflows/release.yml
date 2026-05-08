@@ -56,8 +56,13 @@ jobs:
 
       - name: Validate version + tag uniqueness
         id: validate
+        env:
+          # SonarCloud S7630 — flow user-supplied input through an env var
+          # rather than direct ${{ }} interpolation into the run block, so
+          # any special chars in the value can't break shell quoting.
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="$INPUT_VERSION"
           VERSION="${VERSION#v}"   # strip leading v if present
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version must match X.Y.Z.W (got: $VERSION)"
