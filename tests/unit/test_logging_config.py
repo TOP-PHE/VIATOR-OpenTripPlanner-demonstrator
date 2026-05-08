@@ -68,14 +68,14 @@ def test_console_format_does_not_emit_json(capsys: pytest.CaptureFixture[str]) -
         json.loads(out.strip())
 
 
-def test_uvicorn_logger_propagates(capsys: pytest.CaptureFixture[str]) -> None:
-    """Uvicorn's loggers must be reset to propagate so their lines hit our root
-    JSON handler — otherwise they'd stay on uvicorn's own console formatter."""
+def test_uvicorn_loggers_configured_to_propagate() -> None:
+    """All four loggers we override (uvicorn / uvicorn.access / uvicorn.error /
+    fastapi) must have their per-logger handlers stripped and propagate=True
+    set — otherwise they'd stay on uvicorn's own console formatter and bypass
+    our JSON root handler. The actual stdlib→JSON round-trip is already
+    exercised by test_stdlib_logger_emits_json."""
     setup_logging(json=True)
-    uv = logging.getLogger("uvicorn.access")
-    assert uv.propagate is True
-    assert uv.handlers == []
-    uv.warning("uvicorn-style %s message", "test")
-    out = capsys.readouterr().out.strip()
-    payload = json.loads(out)
-    assert payload["logger"] == "uvicorn.access"
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):
+        lg = logging.getLogger(name)
+        assert lg.propagate is True, f"{name} must propagate to root"
+        assert lg.handlers == [], f"{name} must have no own handlers"
