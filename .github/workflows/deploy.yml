@@ -1,0 +1,139 @@
+# Audit-2026-05 #17 Part B — VPS deploy automation.
+#
+# Operator-triggered via the Actions tab (workflow_dispatch). Runs
+# `bin/viator-deploy.sh <tag>` on the prod VPS over SSH. The deploy
+# key on the VPS uses an authorized_keys forced-command to restrict it
+# to running ONLY this script — even if the secret leaks, an attacker
+# can't get a shell or run arbitrary commands. Closes the deploy half
+# of audit #17.
+#
+# One-time operator setup (admin-guide §2.4):
+#   1. Generate ed25519 keypair on the VPS, no passphrase.
+#   2. Add the pubkey to ~/.ssh/authorized_keys with a forced-command
+#      pinning it to /opt/viator/bin/viator-deploy.sh, plus
+#      no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty.
+#   3. Capture the VPS host key with `ssh-keyscan -t ed25519 <host>`.
+#   4. Store as repo secrets/vars:
+#        Secret  VIATOR_DEPLOY_SSH_KEY      (the private key)
+#        Secret  VIATOR_HOST_KEY            (output of ssh-keyscan)
+#        Var     VIATOR_HOST                (e.g. vmi3259514.contaboserver.net)
+#        Var     VIATOR_USER                (e.g. otpadmin)
+#   5. (Optional) protect the workflow with an environment + manual
+#      approval gate via repo Settings → Environments → production.
+#
+# Full step-by-step: admin-guide §2.4.1.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy — must already exist on GHCR (e.g. 0.1.32.11 or v0.1.32.11).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read   # to query GHCR for image existence pre-flight
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.version }} to prod VPS
+    runs-on: ubuntu-latest
+    # The `production` environment lets you require manual approval
+    # before this job starts (Settings → Environments → production →
+    # Required reviewers). Uncomment + set up to enable.
+    # environment:
+    #   name: production
+    #   url: https://${{ vars.VIATOR_HOST }}/admin/sessions
+    steps:
+      - name: Validate version
+        id: validate
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V="$INPUT_VERSION"
+          V="${V#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must match X.Y.Z.W (got: $V)"
+            exit 1
+          fi
+          TAG="v$V"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice::Will deploy tag $TAG"
+
+      - name: Verify both images exist on GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          # Defence-in-depth: the deploy script also re-validates, but we
+          # fail fast here before involving the SSH credentials so a typo
+          # in version never reaches the VPS.
+          for img in viator-web viator-otp; do
+            echo "::group::Checking ghcr.io/top-phe/${img}:${TAG}"
+            tags=$(gh api "/orgs/TOP-PHE/packages/container/${img}/versions" \
+                    --paginate --jq '.[].metadata.container.tags[]' 2>&1)
+            if echo "$tags" | grep -qx "$TAG"; then
+              echo "  ✓ found"
+            else
+              echo "::error::Image ${img}:${TAG} not on GHCR. Did docker.yml complete?"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Set up SSH key + pinned host key
+        env:
+          DEPLOY_KEY: ${{ secrets.VIATOR_DEPLOY_SSH_KEY }}
+          HOST_KEY: ${{ secrets.VIATOR_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pin the VPS host key so we never trust a man-in-the-middle.
+          # StrictHostKeyChecking=yes (below) refuses to connect if the
+          # presented host key isn't already in known_hosts.
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Run deploy on VPS
+        env:
+          VIATOR_HOST: ${{ vars.VIATOR_HOST }}
+          VIATOR_USER: ${{ vars.VIATOR_USER }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          # The "command" arg ($TAG) won't be executed verbatim — the
+          # VPS-side authorized_keys has a forced-command that runs
+          # /opt/viator/bin/viator-deploy.sh and reads $TAG from
+          # $SSH_ORIGINAL_COMMAND. So the worst a leaked key + injected
+          # arg can do is feed a string to that script, which validates
+          # ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ before doing anything.
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 \
+              "${VIATOR_USER}@${VIATOR_HOST}" \
+              "$TAG"
+
+      - name: Public-side post-deploy smoke
+        if: success()
+        env:
+          VIATOR_HOST: ${{ vars.VIATOR_HOST }}
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          # The deploy script already verified locally on the VPS; this
+          # checks the public-internet-facing surface (nginx / TLS / DNS).
+          got=$(curl -sk "https://${VIATOR_HOST}/healthz/version")
+          echo "Public /healthz/version: $got"
+          if ! echo "$got" | grep -q "\"version\":\"${TAG}\""; then
+            echo "::error::Public endpoint did not return ${TAG}"
+            exit 1
+          fi
+          echo "::notice::${TAG} live on https://${VIATOR_HOST}"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
