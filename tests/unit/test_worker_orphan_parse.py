@@ -113,3 +113,91 @@ def test_replica_suffix_is_stripped_only_when_numeric():
     out = "viator-otp-someweirdname-abc\n"  # `abc` not numeric
     # Parser keeps the whole inner so the unexpected shape surfaces in logs.
     assert _parse_otp_service_names(out) == {"otp-someweirdname-abc"}
+
+
+# ──────────────────── Non-compose OTP container detection (audit #27) ────────────────────
+
+
+def test_non_compose_otp_container_is_detected():
+    """The bug-of-record from audit #27: `wizardly_pasteur` ran our OTP
+    image (`ghcr.io/top-phe/viator-otp:v0.1.30`) for 45 hours after a
+    manual `docker run` debug invocation. Audit #25's `name=^viator-otp-`
+    filter missed it. This pass catches it and logs a warning."""
+    from app.worker import _find_non_compose_otp_containers
+
+    out = "wizardly_pasteur\tghcr.io/top-phe/viator-otp:v0.1.30\tUp 45 hours\n"
+    assert _find_non_compose_otp_containers(out) == [
+        ("wizardly_pasteur", "ghcr.io/top-phe/viator-otp:v0.1.30", "Up 45 hours"),
+    ]
+
+
+def test_compose_otp_containers_are_not_flagged():
+    """Compose-managed `viator-otp-<sid>-1` containers ARE running our OTP
+    image but should be handled by audit #25's cleanup, not flagged as
+    non-compose orphans. The non-compose check skips anything whose name
+    starts with `viator-`."""
+    from app.worker import _find_non_compose_otp_containers
+
+    out = (
+        "viator-otp-fr-rail-1\tghcr.io/top-phe/viator-otp:v0.1.32.7\tUp 2 hours\n"
+        "viator-otp-eu-nap-network-1\tghcr.io/top-phe/viator-otp:v0.1.32.7\tUp 5 minutes\n"
+    )
+    assert _find_non_compose_otp_containers(out) == []
+
+
+def test_other_images_are_not_flagged():
+    """Don't flag containers using other images (postgres, nginx, web)."""
+    from app.worker import _find_non_compose_otp_containers
+
+    out = (
+        "some-postgres\tpostgres:16-alpine\tUp 7 days\n"
+        "some-nginx\tnginx:1.27-alpine\tUp 3 days\n"
+        "viator-web-1\tghcr.io/top-phe/viator-web:v0.1.32.7\tUp 1 hour\n"
+    )
+    assert _find_non_compose_otp_containers(out) == []
+
+
+def test_mixed_input_only_flags_non_compose_otp():
+    """Realistic `docker ps -a` output: a mix of compose-managed services,
+    other infra, and a manual debug container. Only the last gets flagged."""
+    from app.worker import _find_non_compose_otp_containers
+
+    out = (
+        "viator-web-1\tghcr.io/top-phe/viator-web:v0.1.32.7\tUp 1 hour\n"
+        "viator-worker-1\tghcr.io/top-phe/viator-web:v0.1.32.7\tUp 1 hour\n"
+        "viator-otp-fr-rail-1\tghcr.io/top-phe/viator-otp:v0.1.32.7\tUp 1 hour\n"
+        "viator-postgres-1\tpostgres:16-alpine\tUp 7 days\n"
+        "wizardly_pasteur\tghcr.io/top-phe/viator-otp:v0.1.30\tExited (137) 45 hours ago\n"
+    )
+    assert _find_non_compose_otp_containers(out) == [
+        (
+            "wizardly_pasteur",
+            "ghcr.io/top-phe/viator-otp:v0.1.30",
+            "Exited (137) 45 hours ago",
+        ),
+    ]
+
+
+def test_empty_or_malformed_input_yields_empty_list():
+    from app.worker import _find_non_compose_otp_containers
+
+    assert _find_non_compose_otp_containers("") == []
+    assert _find_non_compose_otp_containers("\n\n   \n") == []
+    # Lines with fewer than 3 tab-separated fields are skipped silently.
+    assert _find_non_compose_otp_containers("partial-line\nname\timage\n") == []
+
+
+def test_old_otp_image_versions_still_flagged():
+    """The image-prefix check uses `ghcr.io/top-phe/viator-otp` (no
+    version), so any tag matches — including ancient ones from before
+    today's audit work. The 2026-05-07 incident's container was on
+    v0.1.30; today's would be v0.1.32.7. Both get flagged."""
+    from app.worker import _find_non_compose_otp_containers
+
+    out = (
+        "old-debug\tghcr.io/top-phe/viator-otp:v0.1.30\tUp 45 hours\n"
+        "older-debug\tghcr.io/top-phe/viator-otp:v0.1.5\tUp 100 hours\n"
+        "untagged-debug\tghcr.io/top-phe/viator-otp\tUp 10 hours\n"
+    )
+    result = _find_non_compose_otp_containers(out)
+    assert len(result) == 3
