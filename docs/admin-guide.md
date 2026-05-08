@@ -687,7 +687,71 @@ Switch to colored console output for local dev: set `LOG_FORMAT=console` in
 the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
 (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) and defaults to `INFO`.
 
-### 5.5 Capacity planning
+### 5.5 Prometheus metrics (audit #14, since v0.1.32.15+)
+
+The web container exposes `/metrics` in Prometheus exposition format. Two
+metric families:
+
+**HTTP metrics (auto-collected):**
+- `http_requests_total{method,handler,status}` — request count by route +
+  status code. `handler` is the route *template* (e.g. `/api/sessions/{sid}`),
+  not the rendered URL — keeps cardinality bounded.
+- `http_request_duration_seconds{method,handler}` — request latency
+  histogram, buckets from 5 ms to 30 s. p95/p99 dashboards work directly
+  off this.
+
+`/metrics`, `/healthz*`, and `/static/*` are excluded from the histogram
+so meta-traffic doesn't dilute application latency signals.
+
+**Application metrics (DB-derived, computed at scrape time):**
+- `viator_rebuild_queue_depth` — pending+running rebuild_jobs.
+- `viator_active_sessions_total` — sessions in `serving` state.
+- `viator_rebuilds_total` — lifetime count of rebuild_jobs rows
+  (`rate()` in PromQL gives builds-per-time-window).
+- `viator_rebuilds_failed_total` — lifetime count of failed builds.
+
+A scrape costs a few ms — four indexed COUNT(*) queries against small
+tables. Default Prometheus scrape interval (15 s) is fine.
+
+#### Securing the endpoint
+
+`/metrics` is unauthenticated inside the docker network. For external
+exposure, add an nginx location with basic-auth or an IP allowlist:
+
+```nginx
+location /metrics {
+    auth_basic "Prometheus";
+    auth_basic_user_file /etc/nginx/.htpasswd-metrics;
+    proxy_pass http://web:8000/metrics;
+}
+```
+
+Or restrict by IP if scrapes come from a known source:
+
+```nginx
+location /metrics {
+    allow 10.0.0.0/8;       # internal scrape network
+    allow 192.168.1.42;     # specific Prometheus host
+    deny all;
+    proxy_pass http://web:8000/metrics;
+}
+```
+
+VIATOR doesn't ship a Prometheus server in `docker-compose.yml` (Phase 2
+of audit #14, deferred until concretely needed). Operators bring their
+own Prometheus + Grafana and scrape against the protected `/metrics`
+endpoint.
+
+#### Build-duration metrics — not yet exposed
+
+The worker container runs separate from web, so its in-process metrics
+(OTP build duration, ingestion timing) aren't visible on web's
+`/metrics`. Adding a multiprocess shared-filesystem registry is filed
+as a Phase 1.5 follow-up. For now, build duration is observable via
+`rebuild_jobs.started_at`/`finished_at` columns — query directly or use
+`/api/sessions/<sid>/rebuilds` in the admin UI.
+
+### 5.6 Capacity planning
 
 Three things to watch as you onboard more sessions:
 

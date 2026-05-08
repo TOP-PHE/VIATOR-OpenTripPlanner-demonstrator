@@ -38,6 +38,7 @@ from .api.master import aliases as master_aliases
 from .api.master import stations as master_stations
 from .db import SessionLocal
 from .logging_config import setup_logging
+from .metrics import setup_metrics
 from .middleware.request_id import RequestIdMiddleware
 from .models import RebuildJob, Upload
 from .rate_limit import limiter
@@ -75,6 +76,14 @@ app.add_middleware(SlowAPIMiddleware)
 # semantics) so every log line — including from rate-limit rejections — carries
 # the request_id contextvar.
 app.add_middleware(RequestIdMiddleware)
+
+# Audit-2026-05 #14 — Prometheus instrumentation. Registers HTTP-metrics
+# middleware + the /metrics endpoint + our custom DB-derived collector.
+# Must come after middleware registration so the instrumentator's own
+# middleware sits *inside* the request-id binding — every metric labelled
+# request gets the same request_id contextvar that logs see, supporting
+# log-to-metric correlation in Grafana.
+setup_metrics(app)
 
 
 # Brand assets (TrackOnPath logo, UIC logo, VIATOR icons) live in ./branding
