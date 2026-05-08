@@ -1,0 +1,183 @@
+# Audit-2026-05 #17 Part A — release-tag automation.
+#
+# Operator-triggered via the Actions tab (workflow_dispatch). Replaces the
+# manual `git tag -a / git push origin v*` sequence documented in
+# admin-guide §2.3. The workflow:
+#
+#   1. Validates the supplied version against the project's vX.Y.Z.W
+#      4-part scheme (release-please was rejected for the same reason — see
+#      audit closing summary).
+#   2. Generates release notes by bucketing the conventional-commit log
+#      between the previous release tag and HEAD.
+#   3. Creates an annotated tag with the notes as the message.
+#   4. Pushes the tag — which cascades into the existing docker.yml
+#      workflow (already triggered on `push: tags: ['v*']`) to build,
+#      Trivy-scan, and publish the GHCR image. Same end state as the
+#      manual procedure; just one button instead of five commands.
+#   5. Creates the GitHub Release page with the same notes.
+#
+# A `dry_run` input is provided so operators can preview the generated
+# notes before committing to the tag — useful when the commit log is
+# noisy or the previous-tag detection might be wrong.
+#
+# This workflow does NOT auto-update docs/audit-2026-05.md or the deploy
+# procedure on the VPS — those remain manual on purpose so the operator
+# verifies prod-deploy success before promising "closed in vX.Y.Z" in
+# the tracker.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release — 4-part semver (e.g. 0.1.32.11). Leading "v" is accepted.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Preview release notes without creating the tag.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write   # create tag + GitHub Release
+
+jobs:
+  release:
+    name: Tag + release ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main with full history
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          fetch-depth: 0   # full history for release-notes range
+          ref: main        # release tags are always cut from main
+
+      - name: Validate version + tag uniqueness
+        id: validate
+        run: |
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"   # strip leading v if present
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must match X.Y.Z.W (got: $VERSION)"
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists; pick a higher version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice::Will create tag $TAG"
+
+      - name: Find previous release tag
+        id: prev
+        run: |
+          PREV=$(git tag --sort=-version:refname \
+                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+                 | head -1 || true)
+          if [ -z "$PREV" ]; then
+            echo "::warning::No previous release tag found; notes will span entire history."
+          else
+            echo "::notice::Previous release tag: $PREV"
+          fi
+          echo "previous=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: Generate grouped release notes
+        id: notes
+        run: |
+          TAG="${{ steps.validate.outputs.tag }}"
+          PREV="${{ steps.prev.outputs.previous }}"
+
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..HEAD"
+            HEADER="## $TAG — changes since $PREV"
+          else
+            RANGE="HEAD"
+            HEADER="## $TAG — initial release"
+          fi
+
+          # Bucket commits by conventional-commit type. Anything unrecognised
+          # lands under "Other".
+          mkdir -p _notes
+          for f in feat fix security docs ci refactor test chore other; do
+            : > "_notes/$f.md"
+          done
+
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+              feat\(security*|fix\(security*) echo "- $line" >> _notes/security.md ;;
+              ci\(security*)                  echo "- $line" >> _notes/security.md ;;
+              feat*)                          echo "- $line" >> _notes/feat.md ;;
+              fix*)                           echo "- $line" >> _notes/fix.md ;;
+              ci*)                            echo "- $line" >> _notes/ci.md ;;
+              docs*)                          echo "- $line" >> _notes/docs.md ;;
+              refactor*)                      echo "- $line" >> _notes/refactor.md ;;
+              test*)                          echo "- $line" >> _notes/test.md ;;
+              chore*|build*|perf*|style*)     echo "- $line" >> _notes/chore.md ;;
+              *)                              echo "- $line" >> _notes/other.md ;;
+            esac
+          done < <(git log "$RANGE" --pretty=format:'%s' --reverse)
+
+          {
+            echo "$HEADER"
+            echo
+            for spec in \
+              "Features|feat" \
+              "Bug Fixes|fix" \
+              "Security|security" \
+              "Refactoring|refactor" \
+              "CI/CD|ci" \
+              "Documentation|docs" \
+              "Tests|test" \
+              "Chores|chore" \
+              "Other|other"
+            do
+              title="${spec%%|*}"
+              file="_notes/${spec##*|}.md"
+              if [ -s "$file" ]; then
+                echo "### $title"
+                echo
+                cat "$file"
+                echo
+              fi
+            done
+          } > release-notes.md
+
+          echo "----- Generated release notes -----"
+          cat release-notes.md
+          echo "-----------------------------------"
+
+      - name: Bail (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "::notice::Dry run complete. Re-run with dry_run=false to create the tag."
+
+      - name: Configure git identity
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create + push annotated tag
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          TAG="${{ steps.validate.outputs.tag }}"
+          git tag -a "$TAG" -F release-notes.md
+          git push origin "$TAG"
+          echo "::notice::Tag $TAG pushed; docker.yml will now build + scan + publish the image."
+
+      - name: Create GitHub Release
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.validate.outputs.tag }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --verify-tag
+          echo "::notice::Release $TAG published. Watch docker.yml for the image build."
