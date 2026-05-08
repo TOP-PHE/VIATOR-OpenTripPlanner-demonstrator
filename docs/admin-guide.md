@@ -287,10 +287,9 @@ After the install completes:
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
-> **First-install only (audit-2026-05 #30)**: see §5.1.0 below. After
-> running the one-time `--skip-worktree` setup once per VPS, the
-> stash/pop dance described in §5.1.1 is no longer needed and `git
-> pull` works cleanly on every subsequent deploy.
+> **Fresh-install only**: see [`docker/INSTALL.md` §5.5](../docker/INSTALL.md) — run `bin/viator-bootstrap-stubs.sh` once before the first `docker compose up`. After that, the orchestrator regenerates `docker/generated/*` from DB state on every web-container boot.
+>
+> **Existing VPS clones provisioned before v0.1.32.10**: do the one-time migration in §5.1.0 below as part of the v0.1.32.10 deploy. After that migration, `git pull` works cleanly on every subsequent deploy and §5.1.1's stash/pop dance is permanently obsolete.
 
 ```bash
 ssh otpadmin@vmi3259514.contaboserver.net
@@ -300,7 +299,7 @@ cd /opt/viator
 #     (audit-2026-05 #29 — see "Why this matters" below). Critical:
 #     run as your USER, not via sudo. sudo doesn't have your SSH key.
 git fetch --all -v
-git status                  # if dirty (orchestrator-generated files), see §5.1.1
+git status                  # on v0.1.32.10+ this is permanently clean for docker/generated/
 git pull                    # fast-forward main
 
 # 0b. Verify the pull actually fetched. The most common silent-failure
@@ -368,44 +367,65 @@ script, then operators never need to touch these files.
 For **existing VPS clones provisioned before v0.1.32.10** (one-time
 migration, run during the v0.1.32.10 deploy):
 
+> **Note:** the simpler sequence "drop skip-worktree → `git pull`" you
+> might expect WILL NOT work if the orchestrator has modified the
+> working-tree copies (which on a live VPS it always has). Git refuses
+> with `error: Your local changes to the following files would be
+> overwritten by merge`, even with skip-worktree dropped, because the
+> v0.1.32.10 commit deletes the files from the index and git won't
+> silently apply that against modified working-tree content. The
+> sequence below works around it.
+
 ```bash
 cd /opt/viator
-# Drop --skip-worktree if it was set on either file; ignore errors if not:
+
+# 1. Drop the skip-worktree flag (safe: || true swallows the error if it
+#    wasn't set, e.g. on clones that never ran the v1 §5.1.0 setup).
 git update-index --no-skip-worktree docker/generated/docker-compose.sessions.yml 2>/dev/null || true
 git update-index --no-skip-worktree docker/generated/nginx-sessions.conf 2>/dev/null || true
-# Pull the v0.1.32.10 commit. The `git rm --cached` in that commit removes
-# the files from the index — your working-tree copies stay (they're
-# operator-owned runtime state from now on).
+
+# 2. Save the orchestrator-written content aside as a belt-and-braces
+#    backup. The web container's _startup hook will re-create the same
+#    content from current DB state in step 6, so this is just paranoia.
+cp docker/generated/docker-compose.sessions.yml /tmp/viator-bk-compose.yml
+cp docker/generated/nginx-sessions.conf       /tmp/viator-bk-nginx.conf
+
+# 3. Reset the working tree to HEAD so the pull's deletion can apply
+#    (without this, git refuses — see the note above).
+git checkout HEAD -- docker/generated/docker-compose.sessions.yml docker/generated/nginx-sessions.conf
+
+# 4. Pull. The pull deletes both files from the working tree as part of
+#    the merge — that's expected because they're untracked from now on.
 git pull
-git status   # should be clean for docker/generated/
+git log --oneline -3   # top should be the v0.1.32.10 commit
+
+# 5. Re-create empty stubs so compose's `include:` parses on the next
+#    `docker compose up`. The web container's _startup hook will overwrite
+#    them with real DB state seconds after starting.
+./bin/viator-bootstrap-stubs.sh
+
+# 6. Verify git is clean for these paths (untracked + .gitignore'd → invisible).
+git status   # should print nothing about docker/generated/
+
+# 7. After the deploy completes (steps 1-6 of §5.1) and the web container
+#    has restarted, confirm the boot regen fired:
+sudo docker compose logs --no-log-prefix --tail 200 web | grep regenerated_at_boot
+# Should print one line. After that, /tmp/viator-bk-* are safe to delete.
 ```
 
 After this one-time migration, `git status` is permanently clean for
 those paths and §5.1.1's stash/pop dance is **never** needed again.
 
-#### 5.1.1 Stash / pop dance for orchestrator-modified files (deprecated — superseded by §5.1.0 untrack)
+**Migration verified on prod 2026-05-08** — see audit-2026-05.md tracker
+item #30 v2 closing notes for the recovery sequence that surfaced the
+"step 3 reset is required" detail above.
 
-> **You can skip this section** entirely on v0.1.32.10+. It's preserved
-> only to explain commits that reference it from before the audit-#30
-> proper fix landed.
+#### 5.1.1 Stash / pop dance — fully obsolete since v0.1.32.10
 
-Step 0a's `git status` typically shows `docker/generated/docker-compose.sessions.yml`
-and `docker/generated/nginx-sessions.conf` as modified — those are
-orchestrator runtime state. The `.gitignore` patterns match the right
-paths (audit #29 fixed an earlier bug there) but the files were
-committed historically as empty stubs for first-install bootstrap, so
-modifications still show. Do the stash/pop:
-
-```bash
-git stash push -m "operator runtime state pre-pull"
-git pull
-git stash pop
-```
-
-The stub content on `main` rarely changes (it's just an empty `services: {}` /
-empty nginx block), so `git stash pop` should apply cleanly without
-conflicts. If a conflict appears, your local content is what should
-survive — `git checkout --theirs <file>` keeps the stash version.
+This section is preserved only to explain pre-v0.1.32.10 commit
+references. After running §5.1.0's one-time migration, the
+orchestrator-modified files are untracked and `git status` is
+permanently clean for `docker/generated/`. Skip to §5.1.2.
 
 #### 5.1.2 Why pull-before-pull-image matters
 
