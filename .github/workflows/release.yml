@@ -42,6 +42,7 @@ on:
 
 permissions:
   contents: write   # create tag + GitHub Release
+  actions: write    # trigger docker.yml via workflow_dispatch (final step)
 
 jobs:
   release:
@@ -176,7 +177,7 @@ jobs:
           TAG="${{ steps.validate.outputs.tag }}"
           git tag -a "$TAG" -F release-notes.md
           git push origin "$TAG"
-          echo "::notice::Tag $TAG pushed; docker.yml will now build + scan + publish the image."
+          echo "::notice::Tag $TAG pushed."
 
       - name: Create GitHub Release
         if: ${{ inputs.dry_run == false }}
@@ -188,4 +189,21 @@ jobs:
             --title "$TAG" \
             --notes-file release-notes.md \
             --verify-tag
-          echo "::notice::Release $TAG published. Watch docker.yml for the image build."
+          echo "::notice::Release $TAG published."
+
+      - name: Trigger docker.yml on the new tag
+        # GitHub safety rule: pushes authenticated with the default
+        # GITHUB_TOKEN do NOT trigger downstream workflows. The tag-push
+        # in the previous step therefore can't cascade-trigger docker.yml
+        # via its `push: tags: ['v*']` filter. workflow_dispatch IS on
+        # the exception list, so we re-trigger explicitly here. v0.1.32.11
+        # was released without this step and required a manual
+        # `gh workflow run docker.yml --ref v0.1.32.x` afterwards;
+        # v0.1.32.12+ get the build kicked off automatically.
+        if: ${{ inputs.dry_run == false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.validate.outputs.tag }}"
+          gh workflow run docker.yml --ref "$TAG"
+          echo "::notice::docker.yml dispatched on $TAG — image build + scan + GHCR push will run shortly (~30 min)."

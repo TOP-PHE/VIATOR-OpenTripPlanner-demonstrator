@@ -135,8 +135,9 @@ What the workflow does (in order):
    and publish the GHCR image.
 6. Creates the GitHub Release page with the same notes attached.
 
-After the workflow completes (~30 sec), watch `docker.yml` for the image
-build (~30 min on tagged releases):
+After the workflow completes (~30 sec), the final step automatically
+dispatches `docker.yml` on the new tag — watch it for the image build
+(~30 min on tagged releases):
 
 ```bash
 gh run list --limit 3 --workflow=docker.yml
@@ -144,6 +145,11 @@ gh run watch <run-id> --exit-status
 ```
 
 Once the image is live on GHCR, deploy via §5.1.
+
+> **v0.1.32.11 caveat**: that release used the manual workaround
+> `gh workflow run docker.yml --ref v0.1.32.11` because the cascade-gap
+> fix landed in v0.1.32.12. Releases from v0.1.32.12 onward dispatch
+> `docker.yml` automatically.
 
 **Dry-run mode** is useful to preview release notes when the commit log
 is noisy or when you're not sure what bucket a commit will land in. The
