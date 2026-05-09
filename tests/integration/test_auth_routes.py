@@ -179,6 +179,25 @@ def test_me_unauthorized_without_jwt(client: TestClient) -> None:
     assert r.status_code == 401
 
 
+# ─── Audit-2026-05 #14 Phase 2 — proxy-validate endpoint for nginx auth_request ───
+
+
+def test_proxy_validate_with_valid_jwt_returns_identity_headers(client: TestClient) -> None:
+    """nginx hits /api/auth/proxy-validate with the JWT cookie; on success the
+    response carries `X-Forwarded-User` + `X-Forwarded-Role` so nginx can
+    extract them via auth_request_set and forward to Grafana / Prometheus."""
+    jwt, email = _bootstrap(client)
+    r = client.get("/api/auth/proxy-validate", headers={"Authorization": f"Bearer {jwt}"})
+    assert r.status_code == 200
+    assert r.headers["X-Forwarded-User"] == email
+    assert r.headers["X-Forwarded-Role"] == "platform_admin"
+
+
+def test_proxy_validate_unauthorized_without_jwt(client: TestClient) -> None:
+    r = client.get("/api/auth/proxy-validate")
+    assert r.status_code == 401
+
+
 def test_logout_clears_cookie(client: TestClient) -> None:
     _bootstrap(client)
     r = client.post("/api/auth/logout")

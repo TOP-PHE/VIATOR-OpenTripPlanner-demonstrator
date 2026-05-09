@@ -1,0 +1,22 @@
+# Prometheus scrape config — audit-2026-05 #14 Phase 2.
+#
+# One scrape job: VIATOR's web container exposes /metrics with HTTP-request
+# metrics + DB-derived gauges (see app/metrics.py). The web service is
+# reachable on the docker network as `web:8000`.
+#
+# Operator-tunable knobs in `.env`:
+#   PROMETHEUS_RETENTION_DAYS  — TSDB retention window. Default 30d.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: viator-vps
+
+scrape_configs:
+  - job_name: viator-web
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['web:8000']
+        labels:
+          service: viator-web

@@ -1,0 +1,20 @@
+# Grafana datasource provisioning — audit-2026-05 #14 Phase 2.
+#
+# Pre-wires Prometheus as the default datasource. URL points to the
+# in-network Prometheus container; nginx routing isn't involved for
+# datasource queries (Grafana → Prometheus is direct). The route prefix
+# `/prometheus/` matches Prometheus's `--web.route-prefix` flag in
+# docker-compose.yml.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090/prometheus
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

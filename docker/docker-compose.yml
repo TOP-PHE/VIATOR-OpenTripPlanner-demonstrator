@@ -186,7 +186,75 @@ services:
       timeout: 5s
       retries: 10
 
+  # ─── Audit-2026-05 #14 Phase 2 — observability stack ─────────────────────
+  # Prometheus scrapes web:8000/metrics (configured in
+  # docker/prometheus/prometheus.yml). Grafana provides dashboards on top.
+  # Both are reverse-proxied through nginx with VIATOR's JWT-cookie auth
+  # (single sign-on with the admin UI — no separate Grafana login). See
+  # admin-guide §5.5 for operator setup + access patterns.
+  #
+  # Neither service binds host ports — both reachable only via nginx
+  # `/grafana/` and `/prometheus/` locations. Inter-container traffic
+  # uses the default compose network.
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_DAYS:-30}d"
+      # `--web.external-url` and `--web.route-prefix` make Prometheus
+      # serve its UI + API under `/prometheus/` so nginx can proxy
+      # `/prometheus/...` straight through without rewriting.
+      - "--web.external-url=/prometheus/"
+      - "--web.route-prefix=/prometheus/"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      web:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: ${PUBLIC_BASE_URL:-http://localhost}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # Reverse-proxy auth: nginx authenticates via VIATOR's JWT cookie
+      # (auth_request → /api/auth/proxy-validate) and forwards the user
+      # identity as `X-WEBAUTH-USER`. Grafana trusts the header because
+      # the only network path that can reach Grafana is via nginx (no
+      # host ports bound, whitelist below pins to docker bridge range).
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_HEADERS: "Email:X-Forwarded-User Role:X-Forwarded-Role"
+      # Trust X-WEBAUTH-USER only from docker bridge networks.
+      GF_AUTH_PROXY_WHITELIST: "172.16.0.0/12 192.168.0.0/16 10.0.0.0/8"
+      # First-cut role mapping: every auto-signed-up user gets Editor
+      # (can view + edit dashboards but not invite users / set up data
+      # sources). Per-role mapping (platform_admin → Admin etc.) is
+      # filed as a Phase 2.1 follow-up.
+      GF_USERS_AUTO_ASSIGN_ORG: "true"
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Editor
+      # Disable anonymous + login form — header is the only auth path.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+
 volumes:
   inbox:
   graphs:
   pgdata:
+  prometheus-data:
+  grafana-data:

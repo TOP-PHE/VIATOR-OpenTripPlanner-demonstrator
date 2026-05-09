@@ -1,0 +1,20 @@
+# Grafana dashboard provider — audit-2026-05 #14 Phase 2.
+#
+# Loads dashboard JSON files from /var/lib/grafana/dashboards (mounted
+# from docker/grafana/dashboards in the repo). Operators can add new
+# dashboards by dropping JSON next to the existing `viator-overview.json`
+# and `docker compose restart grafana`. UI-edited dashboards are stored in
+# the grafana-data volume separately, not overwritten on restart.
+
+apiVersion: 1
+
+providers:
+  - name: viator
+    folder: VIATOR
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
