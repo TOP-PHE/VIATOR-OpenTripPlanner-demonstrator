@@ -737,10 +737,51 @@ location /metrics {
 }
 ```
 
-VIATOR doesn't ship a Prometheus server in `docker-compose.yml` (Phase 2
-of audit #14, deferred until concretely needed). Operators bring their
-own Prometheus + Grafana and scrape against the protected `/metrics`
-endpoint.
+#### In-stack Prometheus + Grafana (Phase 2, since v0.1.32.16+)
+
+`docker-compose.yml` ships **`prometheus`** and **`grafana`** services;
+both are reverse-proxied through nginx with VIATOR's JWT cookie as the
+auth gate. There's no second login — opening `/grafana/` after signing
+into the admin UI just works.
+
+**How to use:**
+- `https://<host>/grafana/` — dashboards. Pre-provisioned starter
+  dashboard "VIATOR — Overview" shows active sessions, queue depth,
+  HTTP latency p95 by route, request rate by status code.
+- `https://<host>/prometheus/` — raw Prometheus UI for ad-hoc PromQL.
+
+**SSO mechanism:**
+- nginx's `/grafana/` and `/prometheus/` locations use `auth_request`
+  to call back to `/api/auth/proxy-validate` (an internal-only endpoint).
+- That endpoint re-uses the standard `current_user_jwt` dependency —
+  same logic as `/api/auth/me`, just with the user identity emitted as
+  response headers (`X-Forwarded-User`, `X-Forwarded-Role`).
+- nginx forwards those as `X-WEBAUTH-USER` to Grafana, which auto-creates
+  users on first sight (Editor role by default; manually upgrade to
+  Admin in Grafana's user management for power users).
+- 401 from the auth-request bounces the operator to `/login?next=...`
+  so the round-trip lands them back at the dashboard after sign-in.
+
+**Tunables (in `.env`):**
+
+```
+PROMETHEUS_RETENTION_DAYS=30   # TSDB retention. 30d default ≈ 5-10 GB disk.
+```
+
+**Operator setup is zero** beyond the existing `docker compose up -d` —
+the stack comes up with the rest of the platform. To customise:
+- New dashboards: drop JSON in `docker/grafana/dashboards/`,
+  `docker compose restart grafana`. UI-edited dashboards live in the
+  `grafana-data` volume separately and survive container recreation.
+- Different scrape interval / additional jobs: edit
+  `docker/prometheus/prometheus.yml`, `docker compose restart prometheus`.
+
+**What's NOT yet wired (Phase 2.1+ follow-ups):**
+- VIATOR-role → Grafana-role mapping (currently all auto-signed-up users
+  land as Editor). Audit follow-up.
+- Embedded dashboards inside the admin UI (iframe panel showing the
+  overview directly on `/admin/dashboard`). Worth doing once the
+  starter dashboard's settled.
 
 #### Build-duration metrics — not yet exposed
 

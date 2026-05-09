@@ -290,6 +290,38 @@ async def me(
     )
 
 
+# Audit-2026-05 #14 Phase 2 — endpoint dedicated to nginx `auth_request`
+# subrequests. Used to gate `/grafana/` and `/prometheus/` behind the same
+# JWT cookie that authenticates the admin UI, then forward the user
+# identity to Grafana via an `X-WEBAUTH-USER` header (Grafana's
+# reverse-proxy SSO pattern). nginx-side wiring is in
+# `docker/nginx/nginx.conf`.
+#
+# Why a separate endpoint from /me:
+#   - /me returns JSON; nginx auth_request only cares about the response
+#     status code and the response *headers* it can extract via
+#     `auth_request_set`. A dedicated endpoint keeps the response shape
+#     specifically shaped for nginx (empty body, headers carry the data).
+#   - /me is rate-limited; this endpoint isn't (nginx hits it on every
+#     downstream Grafana/Prometheus request, ~scrape-frequency volume).
+@router.get("/proxy-validate", include_in_schema=False)
+async def proxy_validate(
+    user: Annotated[CurrentUser, Depends(current_user_jwt)],
+) -> Response:
+    """nginx auth_request endpoint — returns 200 + identity headers if the
+    JWT cookie is valid, 401 otherwise (via the dependency). The Response
+    headers are picked up by nginx with `auth_request_set` and forwarded
+    to Grafana / Prometheus as `X-WEBAUTH-USER` / `X-Forwarded-User`.
+    """
+    return Response(
+        status_code=status.HTTP_200_OK,
+        headers={
+            "X-Forwarded-User": user.username,
+            "X-Forwarded-Role": user.role,
+        },
+    )
+
+
 # ────────────────────────── password reset ──────────────────────────
 
 
