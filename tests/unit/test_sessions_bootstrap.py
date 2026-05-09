@@ -29,6 +29,8 @@ def test_regenerate_with_zero_sessions_writes_valid_stubs(tmp_path: Path) -> Non
     """The boot-time call lands here right after a fresh install. Both files
     must be created with content compose / nginx accept as valid even when
     no sessions exist yet."""
+    import yaml
+
     db = MagicMock()
     db.execute.return_value.scalars.return_value.all.return_value = []
 
@@ -41,7 +43,20 @@ def test_regenerate_with_zero_sessions_writes_valid_stubs(tmp_path: Path) -> Non
     # parent `include:` parses without error.
     assert "services:" in compose_text
     assert "volumes: {}" in compose_text
-    assert "(no serving sessions)" in compose_text
+    assert "no serving sessions" in compose_text
+
+    # Regression guard for the empty-services bug: previously emitted
+    # `services:` followed only by a comment, which YAML parses as
+    # `services: null` and `docker compose up` then rejects with
+    # `services must be a mapping`. The fix emits an explicit empty
+    # flow-style mapping (`{}`) so YAML resolves `services` to {} not None.
+    parsed = yaml.safe_load(compose_text)
+    assert parsed["services"] == {}, (
+        f"services must parse as an empty mapping, got {parsed['services']!r}. "
+        "If this is None, the empty-services regression is back — see "
+        "render_compose() in app/sessions_orchestrator.py."
+    )
+    assert parsed["volumes"] == {}
 
     # Nginx file is created (empty content is fine — nginx tolerates an
     # included file with no location blocks).

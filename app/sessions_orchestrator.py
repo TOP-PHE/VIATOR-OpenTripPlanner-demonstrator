@@ -70,7 +70,15 @@ _VOLUMES_HEADER = "volumes: {}\n"
 
 
 def render_compose(sessions: list[SessionRow]) -> str:
-    """Render the per-session compose fragment for all serving sessions."""
+    """Render the per-session compose fragment for all serving sessions.
+
+    When there are zero serving sessions, we emit `services:\n  {}` (an
+    explicit empty flow-style mapping). A bare `services:` with only a
+    comment underneath parses as `services: null`, and `docker compose up`
+    then rejects the whole include with `services must be a mapping` —
+    breaking every fresh install on the second `docker compose up` after
+    the web container's _startup hook overwrites the bootstrap stub.
+    """
     services = "".join(
         _OTP_SVC_TEMPLATE.format(
             sid=s.id,
@@ -80,7 +88,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
         for s in sessions
         if s.state == SessionState.SERVING.value
     )
-    return _COMPOSE_HEADER + (services or "  # (no serving sessions)\n") + "\n" + _VOLUMES_HEADER
+    return _COMPOSE_HEADER + (services or "  {}  # no serving sessions\n") + "\n" + _VOLUMES_HEADER
 
 
 def render_nginx(sessions: list[SessionRow]) -> str:
