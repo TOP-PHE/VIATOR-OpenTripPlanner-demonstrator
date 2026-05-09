@@ -105,22 +105,34 @@ nano .env
 At minimum set:
 
 ```
-VIATOR_VERSION=v0.1.0   # pin to a release tag for reproducible deploys
+VIATOR_VERSION=v0.1.0       # pin to a release tag for reproducible deploys
 
 POSTGRES_USER=viator
 POSTGRES_PASSWORD=<openssl rand -base64 32>
 POSTGRES_DB=viator
 
 JWT_SECRET=<openssl rand -base64 64>
-JWT_COOKIE_SECURE=false   # set to true after step 9 (HTTPS)
+JWT_COOKIE_SECURE=false     # set to true after step 9 (HTTPS)
 BOOTSTRAP_TOKEN=<openssl rand -base64 32>
 
-PUBLIC_BASE_URL=https://viator.example.com
+PUBLIC_BASE_URL=https://<your-hostname>     # NOT viator.example.com — use your real hostname
 
-OTP_BUILD_HEAP=24g           # 8g for regional, 24g for France-wide
-OTP_BUILD_MEM_LIMIT=28g      # heap + ~4 GB native headroom; cgroup cap on otp-build
-OTP_BUILD_PHASES=two_phase   # 'one_shot' available as fallback (debug only)
+OTP_BUILD_HEAP=24g          # 8g for regional, 24g for France-wide
+OTP_BUILD_MEM_LIMIT=28g     # heap + ~4 GB native headroom; cgroup cap on otp-build
+OTP_BUILD_PHASES=two_phase  # 'one_shot' available as fallback (debug only)
+
+DOCKER_GID=<verify on host> # see note below — not always 999
 ```
+
+> **`DOCKER_GID` matters.** The worker container runs as a non-root user that needs read access to `/var/run/docker.sock` (it spawns per-session OTP containers). The host's `docker` group GID is distribution-dependent — don't trust the `999` default in `.env.example`. Verify on the host first:
+> ```bash
+> getent group docker | cut -d: -f3
+> ```
+> Mismatched GID = silent worker failure (`Unable to find group …: no matching entries in group file`) on first `docker compose up`. Common values: 999 (Debian/Ubuntu apt-installed), 998 (some RHEL variants), 988 (newer Ubuntu installs where 999 was already taken).
+
+> **`OTP_SERVE_HEAP` is NOT an `.env` variable.** Per-session OTP serve heap is configured per-session in the `platform_config` table (platform default) or in the session config (override). Don't try to set it in `.env` — it's a no-op. After step 8 (bootstrap), you'll set the platform default via `Admin → Configuration` in the UI, and override it per session via `Admin → Sessions → <session> → Edit`.
+
+> **`PUBLIC_BASE_URL` must match the hostname certbot will issue against.** It's used to build absolute URLs in magic-link emails (registration confirm, password reset). The placeholder `viator.example.com` will leak into emails and break click-through if you forget to change it.
 
 > **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for step 8. Once consumed, set it to empty in `.env` and `docker compose restart web`.
 
@@ -152,6 +164,27 @@ created /opt/viator/docker/generated/nginx-sessions.conf
 The script is idempotent — running it twice is a no-op. See
 `docker/generated/README.md` for the full lifecycle.
 
+> **Known issue (≤ v0.1.32.15) — orchestrator empty-services regression.**
+> With zero serving sessions, `app/sessions_orchestrator.render_compose`
+> writes `services:` followed only by a comment, which YAML parses as
+> `services: null` and compose then rejects with `services must be a
+> mapping` on the *next* `docker compose up`. The bug surfaces on a fresh
+> install on the second `up` (after web has booted once and overwritten
+> the bootstrap stub the script just wrote).
+>
+> **Workaround until the fix lands:** before *every* `docker compose up`,
+> overwrite the broken regen with valid YAML:
+> ```bash
+> cat > /opt/viator/docker/generated/docker-compose.sessions.yml <<'EOF'
+> services: {}
+> volumes: {}
+> EOF
+> ```
+> Once you have at least one session in `state='serving'`, the bug
+> becomes invisible — the renderer outputs real entries instead of the
+> bare comment. Day-2 operations are unaffected; only fresh-install /
+> empty-DB scenarios hit it.
+
 ---
 
 ## 6. Pull or build the images
@@ -177,12 +210,12 @@ If the OTP image build fails on the Maven download, the version pin is in `otp/D
 
 ---
 
-## 7. Bring up the platform services
+## 7. Bring up the DB-backed services
 
-We start everything **except** per-session OTP containers — those are spawned by the admin app on demand once a session is configured.
+We start everything **except** `nginx` and per-session OTP containers. nginx is held back because its HTTPS server block in `nginx.conf` references TLS cert files that don't exist yet on a fresh VPS — bringing it up now would crash-loop it on `cannot load certificate "/etc/nginx/certs/live/<hostname>/fullchain.pem"`. The cert is issued in step 9, after which nginx comes up cleanly.
 
 ```bash
-docker compose up -d postgres web worker nginx
+docker compose up -d postgres web worker          # NOT nginx — comes up in step 9
 docker compose ps
 docker compose logs -f web
 # wait for "Application startup complete." then Ctrl-C to detach
@@ -190,14 +223,19 @@ docker compose logs -f web
 
 The web container's entrypoint runs `alembic upgrade head` automatically, so the schema is created on first start.
 
+> If you accidentally start nginx alongside the others (e.g. by running `docker compose up -d` with no service list), you'll see it in a `Restarting` loop. Just `docker compose stop nginx` and continue with step 8 / 9 — no harm done.
+
 ---
 
 ## 8. Bootstrap the first platform admin
 
+> **Order of operations on a fresh VPS: do step 9 (HTTPS) first, then come back here.**
+> The bootstrap endpoint and the admin UI live behind nginx, which isn't running until step 9 issues the TLS cert. Trying the curl below before step 9 returns `Failed to connect … port 443: Couldn't connect to server`. Skip ahead to §9 now; this section assumes HTTPS is live.
+
 The `platform_admin` role can do everything (create sessions, manage users, reconfigure SMTP, etc.). On a fresh DB no users exist, so we create the first one via the bootstrap endpoint:
 
 ```bash
-curl -X POST https://viator.example.com/api/auth/bootstrap-platform-user \
+curl -X POST https://<your-hostname>/api/auth/bootstrap-platform-user \
   -H 'Content-Type: application/json' \
   -d '{
     "token":    "<the BOOTSTRAP_TOKEN you set in .env>",
@@ -213,7 +251,7 @@ Response: `200 OK` with a JWT and a `viator_session` cookie set. The endpoint th
 
 1. Edit `.env` → set `BOOTSTRAP_TOKEN=` (empty).
 2. `docker compose restart web` so the empty value takes effect.
-3. Log in at `https://viator.example.com/login`.
+3. Log in at `https://<your-hostname>/login`.
 
 You can now invite the rest of the team via Admin → Users.
 
@@ -241,8 +279,9 @@ The Phase-A nginx config has `vmi3259514.contaboserver.net` hardcoded as the `se
 ```bash
 sudo apt update && sudo apt install -y certbot
 
-# Stop nginx so certbot's --standalone mode can grab port 80 for the
-# HTTP-01 challenge.
+# Make sure nothing is bound to port 80 — certbot's --standalone mode
+# binds it itself for the HTTP-01 challenge. If you came from step 7
+# without starting nginx, port 80 is already free; the stop is a no-op.
 cd /opt/viator/docker
 docker compose stop nginx
 

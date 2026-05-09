@@ -6,7 +6,7 @@ _Companion to `VIATOR-strategy.md` — read the strategy first for the why._
 
 _**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
 _**© 2026 UIC — International Union of Railways. All rights reserved.**_
-_Last updated: 2026-04-27_
+_Last updated: 2026-05-09_
 
 ---
 
@@ -1270,31 +1270,64 @@ At minimum set:
 POSTGRES_PASSWORD=<openssl rand -base64 32>
 JWT_SECRET=<openssl rand -base64 64>
 BOOTSTRAP_TOKEN=<openssl rand -base64 32>
-PUBLIC_BASE_URL=https://viator.example.com
-OTP_BUILD_HEAP=24g           # 8g for regional, 24g for France-wide
-OTP_BUILD_MEM_LIMIT=28g      # heap + ~4 GB native headroom; cgroup cap on otp-build
-OTP_BUILD_PHASES=two_phase   # 'one_shot' available as fallback (debug only)
-OTP_SERVE_HEAP=8g
+PUBLIC_BASE_URL=https://<your-hostname>     # NOT viator.example.com — use the hostname certbot will issue against
+JWT_COOKIE_SECURE=false                     # flip to true in §11.2.7 once HTTPS is up
+OTP_BUILD_HEAP=24g                          # 8g for regional, 24g for France-wide
+OTP_BUILD_MEM_LIMIT=28g                     # heap + ~4 GB native headroom; cgroup cap on otp-build
+OTP_BUILD_PHASES=two_phase                  # 'one_shot' available as fallback (debug only)
+DOCKER_GID=<verify on host>                 # see note below — not always 999
 ```
+
+> **`DOCKER_GID` matters.** The worker runs as a non-root user that needs read access to `/var/run/docker.sock` (it spawns per-session OTP containers). The supplementary group it joins is set by this variable. Don't trust the `999` default in `.env.example` — verify on the host first:
+> ```bash
+> getent group docker | cut -d: -f3
+> ```
+> Mismatched GID = silent worker failure (`Unable to find group …: no matching entries in group file` on first `docker compose up`). Common values: 999 (Debian/Ubuntu apt-installed `docker.io`/`docker-ce`), 998 (some RHEL variants), 988 (newer Ubuntu installs where 999 was already taken).
+
+> **`OTP_SERVE_HEAP` is NOT an `.env` variable.** Per-session OTP serve heap is configured per-session in the `platform_config` table (platform default) or in the session config (override). Set it from the admin UI when you create the session, or via `Admin → Configuration` for the platform default. Putting it in `.env` is a no-op.
 
 > **Save the `BOOTSTRAP_TOKEN` somewhere outside the VPS** (password manager). You need it once for §11.4. After consumption, set it to empty in `.env` and `docker compose restart web`.
 
-#### 11.2.6 Pull images and start
+#### 11.2.5.5 Bootstrap the runtime stub files (one-time, fresh-install only)
+
+Compose's `include:` directive (in `docker-compose.yml`) is parse-time strict — `docker/generated/docker-compose.sessions.yml` must exist as valid YAML before any container starts, including the `web` container that would otherwise create it. On a fresh clone neither this file nor `docker/generated/nginx-sessions.conf` exist, so `docker compose up` aborts with `open … no such file or directory`.
+
+```bash
+cd /opt/viator
+./bin/viator-bootstrap-stubs.sh
+```
+
+The script writes empty placeholder stubs (idempotent, no-op if files already exist). On every subsequent web-container boot, `app/sessions_orchestrator._startup` regenerates them from current DB state. See `docker/generated/README.md` for the full lifecycle.
+
+> **Known issue (≤ v0.1.32.15) — orchestrator empty-services regression.** With zero serving sessions, `render_compose` writes `services:` followed by a comment, which YAML parses as `services: null` and compose rejects on the *next* `docker compose up` with `services must be a mapping`. Day-1 you'll hit this on the second `up` (after web has booted once and overwritten the bootstrap stub). Workaround until the fix lands:
+> ```bash
+> cat > /opt/viator/docker/generated/docker-compose.sessions.yml <<'EOF'
+> services: {}
+> volumes: {}
+> EOF
+> ```
+> Re-apply this each time before `docker compose up` until you upgrade to a release that includes the fix (PR pending — emits `services: {}` directly when sessions are empty). After at least one session reaches `serving`, the bug is invisible because the renderer outputs real entries.
+
+#### 11.2.6 Pull images and start the DB-backed services
+
+**Bring up everything except `nginx`** — nginx will crash-loop on a fresh VPS because the HTTPS server block in `nginx.conf` references cert files that don't exist yet (`/etc/nginx/certs/live/<hostname>/fullchain.pem`). The cert is issued in §11.2.7.
 
 If you've enabled GHCR pulls (15.7.4 made the packages public) and your `docker-compose.yml` references the GHCR image tags, pull instead of build:
 
 ```bash
 docker compose pull web
-docker compose up -d postgres web worker nginx
-docker compose logs -f web        # Ctrl-C once you see "Application startup complete"
+docker compose up -d postgres web worker          # NOT nginx — see §11.2.7
+docker compose logs -f web                        # Ctrl-C once you see "Application startup complete"
 ```
 
 If you build locally instead:
 
 ```bash
 docker compose build
-docker compose up -d postgres web worker nginx
+docker compose up -d postgres web worker          # NOT nginx — see §11.2.7
 ```
+
+> If you forget and start nginx alongside the others, you'll see it in a `Restarting` loop with `cannot load certificate` in the logs. Just `docker compose stop nginx` and continue with §11.2.7 — no harm done.
 
 #### 11.2.7 Wire HTTPS
 
