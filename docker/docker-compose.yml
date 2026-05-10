@@ -287,7 +287,16 @@ services:
       GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
       GF_AUTH_PROXY_HEADERS: "Email:X-Forwarded-User Role:X-Forwarded-Role"
       # Trust X-WEBAUTH-USER only from docker bridge networks.
-      GF_AUTH_PROXY_WHITELIST: "172.16.0.0/12 192.168.0.0/16 10.0.0.0/8"
+      # Format: comma-separated (Grafana's documented format). Space-separated
+      # fails silently on Grafana 11.4+ — the whole list parses as one
+      # invalid token, no entries match, and EVERY incoming auth.proxy
+      # request gets the X-WEBAUTH-USER header silently ignored.
+      # Symptom: `/grafana/` 302's to `/grafana/login` despite a valid
+      # JWT cookie + correct nginx forwarding (uname= empty in grafana
+      # logs). Diagnosed live during the v0.1.32.18 deploy on 2026-05-10 —
+      # the operator's previous workaround (commas added locally on the
+      # VPS) lost the divergence on every `git pull` until this fix.
+      GF_AUTH_PROXY_WHITELIST: "172.16.0.0/12, 192.168.0.0/16, 10.0.0.0/8"
       # First-cut role mapping: every auto-signed-up user gets Editor
       # (can view + edit dashboards but not invite users / set up data
       # sources). Per-role mapping (platform_admin → Admin etc.) is
