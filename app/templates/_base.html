@@ -240,9 +240,21 @@
                      title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">
                     Prometheus&nbsp;Query&nbsp;↗
                   </a>
-                  {# Slot for future items — `<div class="nav-dropdown-section">Operations</div>`
-                     plus links like /admin/logs, /admin/audit-events, etc. The dropdown
-                     auto-grows; no further CSS changes needed. #}
+                  {# Audit-2026-05 #31 (Phase 2.6) — log aggregation.
+                     Loki + promtail behind Grafana Explore. Uses the same
+                     JWT-cookie SSO; the link opens the pre-provisioned
+                     "VIATOR — Logs" dashboard with live tail + per-container
+                     filters + free-text session_id variable. #}
+                  <a href="/grafana/d/viator-logs/viator-logs"
+                     target="_blank" rel="noopener"
+                     role="menuitem"
+                     title="VIATOR — Logs — live tail of all containers with filter by container, level, and session-id. Opens in a new tab.">
+                    Live&nbsp;logs&nbsp;↗
+                  </a>
+                  {# Slot for future items — e.g. /admin/audit-events for a
+                     human-readable view of the audit_events DB table. The
+                     dropdown auto-grows; add another <div class="nav-dropdown-section">
+                     for a separate section header (e.g. "Operations"). #}
                 </div>
               </details>
             {% endif %}

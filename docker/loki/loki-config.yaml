@@ -1,0 +1,80 @@
+# Loki single-binary config — audit-2026-05 #31 (Phase 2.6 of audit #14).
+#
+# Local filesystem storage, single replica, in-memory ring. Sized for a
+# single-VPS demonstrator — not a production cluster. ~1-2 GB disk per 7d
+# at typical VIATOR log volumes.
+#
+# Operator-tunable knobs:
+#   - retention_period (limits_config) — default 168h (7 days)
+#   - per-stream rate limits (ingester / limits) — defaults are generous
+#     for our volume; bump if you start seeing "rate limit exceeded" in
+#     promtail logs
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ingester:
+  chunk_idle_period: 1h
+  max_chunk_age: 1h
+  chunk_target_size: 1048576    # 1 MB chunks
+  chunk_retain_period: 30s
+  wal:
+    enabled: true
+    dir: /loki/wal
+
+limits_config:
+  # Retention — 7 days. Compactor enforces this on disk.
+  retention_period: 168h
+  # Reject lines newer than 168h to bound storage during clock-skew incidents.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # Allow longer label values (structlog can emit 200+ char request_ids).
+  max_label_value_length: 4096
+  # Per-stream cardinality cap — guards against label explosions from
+  # accidentally-included high-cardinality fields. 100k is generous.
+  max_streams_per_user: 0       # 0 = no limit
+  # Per-tenant ingestion rate. 4MB/s, 6MB burst. Comfortable for VIATOR.
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 6
+
+# Compactor handles retention deletion + dedup of old chunks.
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+
+# Required as of Loki 2.8+ even when not using the ruler.
+ruler:
+  alertmanager_url: http://localhost:9093
+
+# Disable anonymous usage-stats reporting (operator privacy preference,
+# matches the convention from prometheus/grafana configs).
+analytics:
+  reporting_enabled: false
