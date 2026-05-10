@@ -57,6 +57,80 @@
     .top nav .role.content_manager { color: var(--amber);      background: #fff8e1; }
     .top nav .role.end_user        { color: var(--rail-steel); background: #fff;    }
 
+    /* ───── nav dropdown (Phase 2.2 — admin dashboard menu) ─────
+       Built on the native HTML `<details>/<summary>` disclosure widget so
+       it's keyboard-accessible (Enter/Space toggle), touch-accessible
+       (tap-to-open), and screen-reader-friendly without any ARIA
+       polyfilling or JavaScript. Hover and focus-within ALSO open the
+       panel for desktop mouse + tab navigation. The four open-conditions:
+         1. mouse hover on the wrapper                — `:hover`
+         2. native open-state from click/Enter/Space   — `[open]`
+         3. keyboard focus inside any panel item       — `:focus-within`
+
+       (Sonar S6819 / accessibility:S6845 satisfied — `<details>` is the
+       canonical interactive disclosure element; no `tabindex` or
+       `role="button"` polyfills needed.) */
+    .top nav .nav-group { position: relative; }
+    .top nav .nav-group > summary {
+      list-style: none;        /* hide the default ▸ marker (Firefox / Safari) */
+      cursor: pointer;
+      user-select: none;
+      color: var(--rail-steel);
+      padding: 0.1rem 0;
+    }
+    /* hide the default ▸ marker on Chrome / Edge */
+    .top nav .nav-group > summary::-webkit-details-marker { display: none; }
+    .top nav .nav-group > summary::after {
+      content: " ▾";
+      font-size: 0.7em;
+      vertical-align: middle;
+    }
+    .top nav .nav-group:hover > summary,
+    .top nav .nav-group:focus-within > summary,
+    .top nav .nav-group[open] > summary { color: var(--uic-blue); }
+    .top nav .nav-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 0.3rem;
+      min-width: 220px;
+      padding: 0.3rem 0;
+      background: #fff;
+      border: 1px solid var(--sleeper);
+      border-radius: 6px;
+      box-shadow: 0 6px 16px rgba(28, 35, 48, 0.12);
+      z-index: 50;
+    }
+    .top nav .nav-group:hover .nav-dropdown,
+    .top nav .nav-group:focus-within .nav-dropdown,
+    .top nav .nav-group[open] .nav-dropdown { display: block; }
+    .top nav .nav-dropdown a {
+      display: block;
+      padding: 0.5rem 1rem;
+      color: var(--rail-steel);
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .top nav .nav-dropdown a:hover {
+      background: var(--paper);
+      color: var(--uic-blue);
+      text-decoration: none;
+    }
+    .top nav .nav-dropdown .nav-dropdown-section {
+      padding: 0.3rem 1rem;
+      font-size: 0.7rem;
+      letter-spacing: 0.08rem;
+      text-transform: uppercase;
+      color: var(--rail-steel);
+      border-top: 1px solid var(--sleeper);
+      margin-top: 0.3rem;
+    }
+    .top nav .nav-dropdown .nav-dropdown-section:first-child {
+      border-top: 0;
+      margin-top: 0;
+    }
+
     /* ───── main ───── */
     main { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
     h1, h2 { color: var(--uic-blue); }
@@ -136,13 +210,41 @@
               {# v0.1.27: bulk-test journey searches across the major French rail hubs. #}
               <a href="/admin/network-coverage" title="Run all-pairs journey-search matrix across major French rail hubs">Coverage</a>
               <a href="/admin/reports">Reports</a>
-              {# Audit-2026-05 #14 Phase 2.2 — Grafana + Prometheus links.
-                 SSO via the JWT cookie (nginx auth_request → /api/auth/proxy-validate),
-                 so a click drops the operator straight onto the dashboard with no
-                 second login. `target="_blank"` because operators usually want to
-                 keep the admin UI open while watching metrics during a build. #}
-              <a href="/grafana/" target="_blank" rel="noopener" title="Grafana — dashboards (HTTP, sessions, rebuilds, CPU/RAM). Opens in a new tab.">Grafana&nbsp;↗</a>
-              <a href="/prometheus/" target="_blank" rel="noopener" title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">Prometheus&nbsp;↗</a>
+              {# Audit-2026-05 #14 Phase 2.2 — Admin dashboard dropdown.
+                 Built on `<details>/<summary>` (native HTML disclosure
+                 widget) so it's keyboard- and touch-accessible without
+                 JavaScript or aria polyfills. Click/Enter/Space toggles;
+                 mouse hover + keyboard focus also open via CSS.
+
+                 SSO via the JWT cookie (nginx auth_request →
+                 /api/auth/proxy-validate), so a click on a dropdown item
+                 drops the operator straight onto the target dashboard
+                 with no second login. `target="_blank"` because operators
+                 usually want to keep the admin UI open while watching
+                 metrics during a build.
+
+                 Future items (logs, audit-event browser, etc.) slot in
+                 cleanly — this hierarchy was set up so the menu doesn't
+                 need restructuring for the next observability addition. #}
+              <details class="nav-group">
+                <summary>Admin dashboard</summary>
+                <div class="nav-dropdown" role="menu">
+                  <div class="nav-dropdown-section">Observability</div>
+                  <a href="/grafana/" target="_blank" rel="noopener"
+                     role="menuitem"
+                     title="Grafana — VIATOR Overview + Resources dashboards (HTTP, sessions, rebuilds, CPU/RAM). Opens in a new tab.">
+                    Grafana&nbsp;Dashboard&nbsp;↗
+                  </a>
+                  <a href="/prometheus/" target="_blank" rel="noopener"
+                     role="menuitem"
+                     title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">
+                    Prometheus&nbsp;Query&nbsp;↗
+                  </a>
+                  {# Slot for future items — `<div class="nav-dropdown-section">Operations</div>`
+                     plus links like /admin/logs, /admin/audit-events, etc. The dropdown
+                     auto-grows; no further CSS changes needed. #}
+                </div>
+              </details>
             {% endif %}
             {# Credentials are user-scoped, available to anyone logged-in. #}
             <a href="/credentials">My credentials</a>
