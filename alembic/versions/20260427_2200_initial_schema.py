@@ -484,8 +484,7 @@ def upgrade() -> None:
     op.create_index("ix_journey_trips_signature", "journey_trips", ["trip_signature"])
 
     # ---------- Cross-session provenance VIEW ----------
-    op.execute(
-        """
+    op.execute("""
         CREATE OR REPLACE VIEW journey_trip_provenance AS
         SELECT
           e.search_id,
@@ -499,8 +498,7 @@ def upgrade() -> None:
         FROM journey_search_executions e
         JOIN journey_trips t ON t.execution_id = e.id
         GROUP BY e.search_id, t.trip_signature;
-    """
-    )
+    """)
 
     # ---------- Audit ----------
     op.create_table(
