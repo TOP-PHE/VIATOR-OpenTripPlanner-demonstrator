@@ -204,8 +204,8 @@
                  Empty value lets the orchestrator's smart-default kick
                  in (≈ build_heap / 3, floored at 4g). Audit-2026-05.md
                  follow-up to #14 Phase 2. #}
-              <label style="margin-top: 0.8rem">OTP serve heap <span class="hint">(JVM <code>-Xmx</code> for the per-session serving container)</span></label>
-              <select name="otp_heap">
+              <label for="otp_heap" style="margin-top: 0.8rem">OTP serve heap <span class="hint">(JVM <code>-Xmx</code> for the per-session serving container)</span></label>
+              <select id="otp_heap" name="otp_heap">
                 <option value="" selected>Auto (≈ build_heap / 3, floor 4 GB) — recommended</option>
                 <option value="4g">4 GB — IDF / single-region only</option>
                 <option value="8g">8 GB — France regional (one or two NAPs)</option>

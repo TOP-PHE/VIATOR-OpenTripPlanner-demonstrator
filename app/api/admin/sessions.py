@@ -177,7 +177,19 @@ def create_session(
     return SessionResponse.from_orm_session(s)
 
 
-@router.patch("/{sid}", response_model=SessionResponse)
+@router.patch(
+    "/{sid}",
+    response_model=SessionResponse,
+    responses={
+        # v0.1.32.21 — declare 400 in the OpenAPI spec for SonarCloud
+        # rule python:S6788. patch_session() raises HTTPException(400)
+        # from several config-field validators (otp_timezone,
+        # otp_build_heap, otp_heap, otp_api_timeout). The rule is
+        # satisfied at the decorator level — individual raise sites
+        # don't need per-line documentation.
+        400: {"description": "Config field failed validation (heap / timezone / timeout)."},
+    },
+)
 def patch_session(
     sid: str,
     body: SessionPatch,
@@ -246,6 +258,10 @@ def patch_session(
             try:
                 body.config["otp_heap"] = _otp_heap.validate_heap(body.config["otp_heap"])
             except ValueError as exc:
+                # 400 is already declared on the route decorator's `responses`
+                # parameter (set in v0.1.32.21 alongside this validation
+                # block); SonarCloud rule python:S6788 is satisfied at the
+                # decorator level, not per-raise.
                 raise HTTPException(400, str(exc)) from exc
 
         # v0.1.24 — validate otp_api_timeout. Operator picks how long OTP
