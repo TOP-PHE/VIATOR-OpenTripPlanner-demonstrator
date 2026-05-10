@@ -175,7 +175,17 @@
                 <option value="28g">28 GB — multi-country / rail-focused merges</option>
                 <option value="32g">32 GB</option>
                 <option value="36g">36 GB — heavy: 10+ providers, cross-border</option>
+                <option value="48g">48 GB — Europe-wide rail-focused</option>
+                <option value="56g">56 GB — Europe-wide rail-focused + multi-NAP overlay</option>
+                <option value="64g">64 GB — Europe-wide multi-modal (full street network)</option>
+                <option value="72g">72 GB — Europe-wide max (96 GB host only, no other serving sessions)</option>
               </select>
+              <p class="hint" style="margin-top: 0.25rem; color: var(--rail-steel)">
+                ⚙ Heap ≥48 GB also requires <code>OTP_BUILD_MEM_LIMIT</code> in <code>.env</code>
+                set to <em>heap + ~4-12 GB native overhead</em> (e.g. heap=64g → MEM_LIMIT=76g).
+                cgroup cap below the heap value triggers OOM-kill before <code>-Xmx</code> is hit.
+                See <code>.env.example</code> for the recommended pairings.
+              </p>
               <p id="heap-warning" class="hint" style="margin-top: 0.25rem; color: #cf222e; display: none">
                 ⚠ Rail-focused multi-country sessions typically need ≥24 GB heap.
                 With the current ${selected} selection, the build is at risk of
