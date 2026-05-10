@@ -136,6 +136,13 @@
               {# v0.1.27: bulk-test journey searches across the major French rail hubs. #}
               <a href="/admin/network-coverage" title="Run all-pairs journey-search matrix across major French rail hubs">Coverage</a>
               <a href="/admin/reports">Reports</a>
+              {# Audit-2026-05 #14 Phase 2.2 — Grafana + Prometheus links.
+                 SSO via the JWT cookie (nginx auth_request → /api/auth/proxy-validate),
+                 so a click drops the operator straight onto the dashboard with no
+                 second login. `target="_blank"` because operators usually want to
+                 keep the admin UI open while watching metrics during a build. #}
+              <a href="/grafana/" target="_blank" rel="noopener" title="Grafana — dashboards (HTTP, sessions, rebuilds, CPU/RAM). Opens in a new tab.">Grafana&nbsp;↗</a>
+              <a href="/prometheus/" target="_blank" rel="noopener" title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">Prometheus&nbsp;↗</a>
             {% endif %}
             {# Credentials are user-scoped, available to anyone logged-in. #}
             <a href="/credentials">My credentials</a>

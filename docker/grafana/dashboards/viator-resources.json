@@ -1,0 +1,252 @@
+{
+  "title": "VIATOR — Resources",
+  "uid": "viator-resources",
+  "tags": ["viator", "resources", "phase-2.5"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Host CPU usage",
+      "description": "Aggregate across all cores. 100% = every core fully busy.",
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 - (avg(irate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100)",
+          "legendFormat": "Total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Host RAM in use",
+      "description": "MemTotal − MemAvailable. Excludes page cache (Linux uses cache opportunistically; that's not 'used' for capacity purposes).",
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100",
+          "legendFormat": "RAM %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Host swap in use",
+      "description": "Swap should normally be 0 on a VPS sized for the workload. Non-zero = the host is dipping into disk and you'll feel it in latency.",
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes)",
+          "legendFormat": "Swap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 1073741824 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Host RAM — used vs available",
+      "description": "RED = used (anything but page cache). GREEN = available (free + reclaimable cache). The big climb during an OTP build is the JVM heap.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+          "legendFormat": "Used"
+        },
+        {
+          "refId": "B",
+          "expr": "node_memory_MemAvailable_bytes",
+          "legendFormat": "Available"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 25, "stacking": { "mode": "normal" } }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Host CPU usage by mode",
+      "description": "user/system/iowait/etc. iowait spike = disk-bound (often happens during OSM PBF reads). Stuck at user≈100% = CPU-bound (OTP graph compute).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (mode) (irate(node_cpu_seconds_total{mode!=\"idle\"}[2m])) / on() group_left() count(node_cpu_seconds_total{mode=\"idle\"}) * 100",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": { "drawStyle": "line", "fillOpacity": 25, "stacking": { "mode": "normal" } }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Container memory — by container",
+      "description": "Working-set memory per container. The `otp-build-<sid>` row is what you watch during a build — should plateau below its cgroup cap (`OTP_BUILD_MEM_LIMIT` in .env).",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "container_memory_working_set_bytes{name=~\"viator-.*|otp-build-.*\"}",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Container CPU — by container",
+      "description": "CPU usage per container, normalised to one core (so 200% = two cores fully busy). The OTP build container drives most of this during graph construction.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"viator-.*|otp-build-.*\"}[2m])) * 100",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "OTP build — % of cgroup memory cap used",
+      "description": "Per-container RSS as % of the cgroup hard cap. Watch this during a build — when it approaches 100%, OOM-kill is imminent. Bump `OTP_BUILD_MEM_LIMIT` in .env if you see this spike past 90%.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "container_memory_working_set_bytes{name=~\"viator-.*|otp-build-.*\"} / on(name) container_spec_memory_limit_bytes{name=~\"viator-.*|otp-build-.*\"} * 100",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Host disk — free space by mountpoint",
+      "description": "Watch / and any /data mount during builds — graphs.tar can be tens of GB, and Postgres WAL grows during heavy session activity.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_filesystem_avail_bytes{mountpoint!~\"/(boot|run|dev|sys|proc).*\"}",
+          "legendFormat": "{{mountpoint}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "min"] } }
+    }
+  ]
+}

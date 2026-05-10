@@ -1,8 +1,12 @@
-# Prometheus scrape config — audit-2026-05 #14 Phase 2.
+# Prometheus scrape config — audit-2026-05 #14 Phase 2 + 2.5.
 #
-# One scrape job: VIATOR's web container exposes /metrics with HTTP-request
-# metrics + DB-derived gauges (see app/metrics.py). The web service is
-# reachable on the docker network as `web:8000`.
+# Three scrape jobs:
+#   1. viator-web   — app-level metrics (HTTP, sessions, rebuild lifecycle,
+#                     latency). See app/metrics.py.
+#   2. cadvisor     — per-container CPU/memory/network/disk. Phase 2.5.
+#   3. node-exporter — host-level CPU/memory/swap/disk/load. Phase 2.5.
+#
+# All three reachable on the docker network only — no host port bindings.
 #
 # Operator-tunable knobs in `.env`:
 #   PROMETHEUS_RETENTION_DAYS  — TSDB retention window. Default 30d.
@@ -20,3 +24,24 @@ scrape_configs:
       - targets: ['web:8000']
         labels:
           service: viator-web
+
+  # Phase 2.5 — per-container resource metrics.
+  # cAdvisor exposes one metric series per container, labelled with
+  # `name` (e.g. `viator-web-1`, `viator-otp-build-nap-fr-rail-...`).
+  # The "VIATOR — Resources" dashboard groups by `name`.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          service: cadvisor
+
+  # Phase 2.5 — host-level metrics (CPU, RAM, swap, disk, load average).
+  # `node_memory_MemAvailable_bytes` is the canonical "free RAM that can
+  # actually be used by new processes" metric — use that for capacity
+  # alarms, not `node_memory_MemFree_bytes` (which excludes page cache
+  # and is therefore misleading).
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: node-exporter
