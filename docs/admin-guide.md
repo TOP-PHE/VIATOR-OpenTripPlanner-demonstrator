@@ -289,6 +289,78 @@ To require manual approval before each deploy: repo Settings →
 Environments → New environment "production" → enable "Required reviewers"
 → uncomment the `environment:` block at the top of `.github/workflows/deploy.yml`.
 
+#### 2.4.2 Recovering deploy automation after a VPS reinstall
+
+A VPS reinstall (e.g. resizing the box, reimaging from Contabo's panel) wipes
+**both** of the things deploy needs from the VPS side:
+
+- The host's SSH host key (the new box gets a fresh `/etc/ssh/ssh_host_ed25519_key`)
+- The deploy public key in `~/.ssh/authorized_keys` (whole `/home/<user>` gone)
+
+The two GitHub repo Secrets/Variables don't change automatically — they still
+point at the old (now-dead) host key and the old (now-missing) public key. So
+the first Deploy run after a reinstall fails with:
+
+```
+WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!
+...
+Host key verification failed.
+Error: Process completed with exit code 255.
+```
+
+…or, if you fixed the host key but not the pubkey:
+
+```
+Permission denied, please try again.
+otpadmin@<host>: Permission denied (publickey,password).
+```
+
+**Recovery procedure (~5 min):**
+
+```bash
+# ── ON THE NEW VPS ──────────────────────────────────────────────────────────
+# 1. Generate a fresh deploy keypair (or reuse if you saved it offline).
+ssh-keygen -t ed25519 -f ~/.ssh/viator-deploy -N "" -C "github-actions deploy"
+
+# 2. Re-add the public key to authorized_keys with the same forced-command.
+PUBKEY=$(cat ~/.ssh/viator-deploy.pub)
+echo 'command="/opt/viator/bin/viator-deploy.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty '"$PUBKEY" \
+  >> ~/.ssh/authorized_keys
+
+# 3. Read off the new host key + a single-line base64 of the new private key.
+HOST=$(hostname -f)
+echo "─── new host key (paste into VIATOR_HOST_KEY secret) ───"
+ssh-keyscan -t ed25519 "$HOST" 2>/dev/null
+echo
+echo "─── verify fingerprint matches the live server ───"
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+echo
+echo "─── new private key, base64 (paste into VIATOR_DEPLOY_SSH_KEY secret) ───"
+cat ~/.ssh/viator-deploy | base64 -w 0 ; echo
+```
+
+```text
+# ── ON GITHUB ───────────────────────────────────────────────────────────────
+Settings → Secrets and variables → Actions
+
+UPDATE these secrets (paste values from the script above):
+  VIATOR_HOST_KEY        ← new ssh-keyscan output
+  VIATOR_DEPLOY_SSH_KEY  ← new base64 private key
+
+UPDATE this variable if the username changed (e.g. old VPS used otpadmin,
+new VPS uses viator):
+  VIATOR_USER  ← whatever the working user on the new VPS is
+```
+
+Then re-run the failed Deploy from the Actions tab → Deploy → the failed run →
+**Re-run all jobs**. Or kick off a fresh dispatch with the version you wanted
+to deploy.
+
+> **Note on Windows ssh-keyscan:** Windows ships an older OpenSSH that may fail
+> against Ubuntu 24.04's OpenSSH 9.6 with `choose_kex: unsupported KEX method
+> sntrup761x25519-sha512@openssh.com`. Run the keyscan from the VPS itself (as
+> the procedure above does) or from a Linux host. The captured key is the same.
+
 ### 2.5 Recovering from a broken CI on a fresh tag
 
 The v0.1.9 release went through **five iterations** before landing.
@@ -777,11 +849,43 @@ the stack comes up with the rest of the platform. To customise:
   `docker/prometheus/prometheus.yml`, `docker compose restart prometheus`.
 
 **What's NOT yet wired (Phase 2.1+ follow-ups):**
-- VIATOR-role → Grafana-role mapping (currently all auto-signed-up users
-  land as Editor). Audit follow-up.
-- Embedded dashboards inside the admin UI (iframe panel showing the
-  overview directly on `/admin/dashboard`). Worth doing once the
-  starter dashboard's settled.
+- **Phase 2.1** — VIATOR-role → Grafana-role mapping (currently all
+  auto-signed-up users land as Editor). Audit follow-up.
+- **Phase 2.2** — Embedded dashboards inside the admin UI (iframe panel
+  showing the overview directly on `/admin/dashboard`, plus a left-nav
+  "Observability" link to `/grafana/`). Worth doing once the starter
+  dashboard's settled. Until then, operators reach Grafana by typing
+  `https://<host>/grafana/` directly — the JWT-cookie SSO makes it
+  one-click, but there's no visual link in the admin UI.
+- **Phase 2.5** — Container + host CPU/memory metrics. Phase 2 ships
+  app-level metrics only (HTTP, sessions, rebuilds). For per-container
+  CPU/memory and host RAM/swap/disk, two more services need wiring:
+  `cAdvisor` (container stats — Google's standard exporter) and
+  `node_exporter` (host stats — Prometheus's standard exporter). About
+  30 min of work: add both to `docker-compose.yml`, add scrape jobs to
+  `prometheus.yml`, drop two stock community dashboards (Grafana IDs
+  14282 + 1860) into `docker/grafana/dashboards/`. Until that's wired,
+  monitor heavy builds from the shell:
+  ```bash
+  # Per-container CPU + memory, refreshes every 5s
+  watch -n 5 'docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"'
+  # Host-level RAM + swap
+  watch -n 5 'free -h'
+  ```
+
+#### Troubleshooting Grafana SSO
+
+Symptoms and fixes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `/grafana/` shows Grafana's own login form (with logo + "Welcome to Grafana", maybe a hidden form) | `X-WEBAUTH-USER` arrived empty at Grafana — auth.proxy fell back to login | First check: are you logged into VIATOR? Visit `/api/auth/me` — if 401, log into the admin UI first, then `/grafana/` |
+| Same as above, but `/api/auth/me` returns your JSON identity | Grafana has stale in-memory state from earlier failed-auth attempts | `docker compose up -d --force-recreate grafana` — full container recreation clears the bad state. The "force-recreate hammer" |
+| `/grafana/` 502 Bad Gateway | Grafana container isn't running or just restarted | `docker compose ps grafana` — if not Up, check `docker compose logs grafana`. Often nginx caches the dead IP for ~10s after recreate |
+| Grafana logs show `uname=patrick.heuguet@trackonpath.com` but you still see login | Grafana's auto-sign-up failed on a stale user record | Inside Grafana: Administration → Users → delete the half-created row; re-visit `/grafana/` to recreate clean |
+| `/grafana/` works the first time, then breaks after redeploy | Same as the second row — recreate Grafana | `docker compose up -d --force-recreate grafana` |
+
+The `--force-recreate grafana` is the standard hammer. Doesn't lose any data — UI-edited dashboards, datasource configs, and user list all live in the `grafana-data` volume, which persists across recreations.
 
 #### Build-duration metrics — not yet exposed
 
