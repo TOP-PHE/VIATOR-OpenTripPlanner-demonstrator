@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,8 +53,34 @@ setup_logging()
 
 log = structlog.get_logger(__name__)
 
+# Audit-2026-05 #19 — OpenTelemetry tracing. Wires the SDK + OTLP exporter
+# + auto-instrumentation for httpx and stdlib-logging. Must run BEFORE
+# the FastAPI app is constructed AND before the SQLAlchemy engine is
+# touched, because the instrumentations wrap those objects. Idempotent +
+# no-op if OTEL_EXPORTER_OTLP_ENDPOINT isn't set (e.g. in tests).
+from .tracing import (  # noqa: E402  - imported after setup_logging on purpose
+    instrument_fastapi_app,
+    instrument_sqlalchemy_engine,
+    setup_tracing,
+)
+
+setup_tracing(service_name=os.environ.get("OTEL_SERVICE_NAME", "viator-web"))
+
 
 app = FastAPI(title="VIATOR — feed ingestion")
+
+# Wrap FastAPI's request lifecycle: every incoming HTTP request becomes
+# the root span of a new trace (or continues an existing one if a
+# traceparent header is present from an upstream proxy).
+instrument_fastapi_app(app)
+
+# Wrap the SQLAlchemy engine so every DB statement emits a span as a
+# child of the current request span. The engine is created at module-
+# import time in app.db; importing it here is safe because db.py has
+# no side effects beyond constructing the engine object.
+from .db import engine  # noqa: E402  - imported after tracing setup on purpose
+
+instrument_sqlalchemy_engine(engine)
 
 
 # ────────────────────────── rate-limit wiring ──────────────────────────
