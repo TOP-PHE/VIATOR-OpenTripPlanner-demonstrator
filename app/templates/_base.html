@@ -58,25 +58,36 @@
     .top nav .role.end_user        { color: var(--rail-steel); background: #fff;    }
 
     /* ───── nav dropdown (Phase 2.2 — admin dashboard menu) ─────
-       Hover OR keyboard focus opens the panel. `position: relative` on the
-       wrapper anchors the absolutely-positioned dropdown directly below the
-       trigger. The wrapper is `tabindex=0` so the trigger keeps focusability
-       even though it's a span (we don't want it to be a link — clicking it
-       does nothing, only hovering/keyboard-focus reveals children). */
+       Built on the native HTML `<details>/<summary>` disclosure widget so
+       it's keyboard-accessible (Enter/Space toggle), touch-accessible
+       (tap-to-open), and screen-reader-friendly without any ARIA
+       polyfilling or JavaScript. Hover and focus-within ALSO open the
+       panel for desktop mouse + tab navigation. The four open-conditions:
+         1. mouse hover on the wrapper                — `:hover`
+         2. native open-state from click/Enter/Space   — `[open]`
+         3. keyboard focus inside any panel item       — `:focus-within`
+
+       (Sonar S6819 / accessibility:S6845 satisfied — `<details>` is the
+       canonical interactive disclosure element; no `tabindex` or
+       `role="button"` polyfills needed.) */
     .top nav .nav-group { position: relative; }
-    .top nav .nav-group-trigger {
-      cursor: default;
+    .top nav .nav-group > summary {
+      list-style: none;        /* hide the default ▸ marker (Firefox / Safari) */
+      cursor: pointer;
       user-select: none;
       color: var(--rail-steel);
       padding: 0.1rem 0;
     }
-    .top nav .nav-group-trigger::after {
+    /* hide the default ▸ marker on Chrome / Edge */
+    .top nav .nav-group > summary::-webkit-details-marker { display: none; }
+    .top nav .nav-group > summary::after {
       content: " ▾";
       font-size: 0.7em;
       vertical-align: middle;
     }
-    .top nav .nav-group:hover .nav-group-trigger,
-    .top nav .nav-group:focus-within .nav-group-trigger { color: var(--uic-blue); }
+    .top nav .nav-group:hover > summary,
+    .top nav .nav-group:focus-within > summary,
+    .top nav .nav-group[open] > summary { color: var(--uic-blue); }
     .top nav .nav-dropdown {
       display: none;
       position: absolute;
@@ -92,7 +103,8 @@
       z-index: 50;
     }
     .top nav .nav-group:hover .nav-dropdown,
-    .top nav .nav-group:focus-within .nav-dropdown { display: block; }
+    .top nav .nav-group:focus-within .nav-dropdown,
+    .top nav .nav-group[open] .nav-dropdown { display: block; }
     .top nav .nav-dropdown a {
       display: block;
       padding: 0.5rem 1rem;
@@ -199,9 +211,14 @@
               <a href="/admin/network-coverage" title="Run all-pairs journey-search matrix across major French rail hubs">Coverage</a>
               <a href="/admin/reports">Reports</a>
               {# Audit-2026-05 #14 Phase 2.2 — Admin dashboard dropdown.
-                 Hover OR keyboard focus opens the panel. SSO via the JWT
-                 cookie (nginx auth_request → /api/auth/proxy-validate),
-                 so a click drops the operator straight onto the dashboard
+                 Built on `<details>/<summary>` (native HTML disclosure
+                 widget) so it's keyboard- and touch-accessible without
+                 JavaScript or aria polyfills. Click/Enter/Space toggles;
+                 mouse hover + keyboard focus also open via CSS.
+
+                 SSO via the JWT cookie (nginx auth_request →
+                 /api/auth/proxy-validate), so a click on a dropdown item
+                 drops the operator straight onto the target dashboard
                  with no second login. `target="_blank"` because operators
                  usually want to keep the admin UI open while watching
                  metrics during a build.
@@ -209,8 +226,8 @@
                  Future items (logs, audit-event browser, etc.) slot in
                  cleanly — this hierarchy was set up so the menu doesn't
                  need restructuring for the next observability addition. #}
-              <span class="nav-group" tabindex="0" role="button" aria-haspopup="menu" aria-label="Admin dashboard menu">
-                <span class="nav-group-trigger">Admin dashboard</span>
+              <details class="nav-group">
+                <summary>Admin dashboard</summary>
                 <div class="nav-dropdown" role="menu">
                   <div class="nav-dropdown-section">Observability</div>
                   <a href="/grafana/" target="_blank" rel="noopener"
@@ -227,7 +244,7 @@
                      plus links like /admin/logs, /admin/audit-events, etc. The dropdown
                      auto-grows; no further CSS changes needed. #}
                 </div>
-              </span>
+              </details>
             {% endif %}
             {# Credentials are user-scoped, available to anyone logged-in. #}
             <a href="/credentials">My credentials</a>
