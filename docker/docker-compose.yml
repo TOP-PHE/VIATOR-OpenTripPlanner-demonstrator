@@ -236,11 +236,28 @@ services:
     # Google's docs — without it cAdvisor can't read /sys/fs/cgroup on
     # Ubuntu 24.04 (cgroup v2 with stricter mount permissions).
     privileged: true
+    # cgroup-v2 visibility: by default, containers see only their own
+    # cgroup namespace, so cAdvisor in its own container can't enumerate
+    # other containers' memory/CPU. `cgroup: host` shares the host's
+    # cgroup namespace into the container, which is what cAdvisor's
+    # "see every container" mode needs. Without this, the
+    # `container_memory_working_set_bytes{name=...}` series for docker
+    # containers never appear — only the host-level cgroups (cron.service,
+    # ssh.service, etc.) show up. Diagnosed live 2026-05-10 when the
+    # `Container memory by container` panel of the Resources dashboard
+    # stayed empty during an OTP build despite all targets being UP.
+    cgroup: host
     devices:
       - /dev/kmsg
     volumes:
       - /:/rootfs:ro
-      - /var/run:/var/run:ro
+      # `:rw` is required, NOT `:ro`. cAdvisor talks to docker.sock to
+      # introspect container metadata (names, labels, image refs) — and
+      # Unix-domain-socket comms are bidirectional, so the mount must be
+      # writable even though we never modify files in /var/run. With :ro,
+      # the socket connection silently drops and cAdvisor falls back to
+      # cgroup-only metrics (no container `name=` label).
+      - /var/run:/var/run:rw
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
