@@ -24,11 +24,22 @@ import re
 # unchanged with no operator action required.
 DEFAULT_HEAP = "12g"
 
-# Common values for the UI dropdown — we expose 12/16/20/24/28/32/36 g
-# because that's the realistic range for VIATOR demos:
-#   12g — single-provider sessions, regional OSM
-#   24g — standard NAP-bulk-import sessions, France-wide OSM
-#   36g — multi-NAP cross-border with dense urban (IDFM + Paris regions)
+# Common values for the UI dropdown. Range covers the full spectrum from
+# single-provider regional demos up to all-Europe rail-focused builds on a
+# 96+ GB host:
+#   12g  — single-provider sessions, regional OSM
+#   24g  — standard NAP-bulk-import sessions, France-wide OSM
+#   36g  — multi-NAP cross-border with dense urban (IDFM + Paris regions)
+#   48g  — Europe-wide rail-focused (osm_filter strips drivable roads)
+#   56g  — Europe-wide rail-focused with multi-NAP transit overlay
+#   64g  — Europe-wide multi-modal (full street network + multi-country)
+#   72g  — Europe-wide max; only safe with no other serving sessions on a
+#          96 GB host (heap + ~12 GB native overhead ≈ 84 GB cgroup cap;
+#          leaves <12 GB for OS + Postgres + page cache)
+#
+# Operators picking ≥48g must verify .env's OTP_BUILD_MEM_LIMIT is set
+# proportionally (heap + ≥4-12 GB native overhead) — the cgroup cap will
+# OOM-kill the JVM before -Xmx if it's too tight. See `.env.example`.
 COMMON_HEAPS: list[tuple[str, str]] = [
     ("12g", "12 GB — light: single provider, regional OSM"),
     ("16g", "16 GB"),
@@ -37,6 +48,10 @@ COMMON_HEAPS: list[tuple[str, str]] = [
     ("28g", "28 GB"),
     ("32g", "32 GB"),
     ("36g", "36 GB — heavy: 10+ providers, cross-border"),
+    ("48g", "48 GB — Europe-wide rail-focused"),
+    ("56g", "56 GB — Europe-wide rail-focused + multi-NAP overlay"),
+    ("64g", "64 GB — Europe-wide multi-modal (full street network)"),
+    ("72g", "72 GB — Europe-wide max (96 GB host, no other serving sessions)"),
 ]
 
 # JVM -Xmx accepts integer + unit. We're strict (no float, no kilobytes)
