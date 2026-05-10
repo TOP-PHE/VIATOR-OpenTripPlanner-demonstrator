@@ -41,8 +41,36 @@ cd /opt/viator
 
 echo ">>> git fetch + pull"
 git fetch --all -v
-git pull --ff-only
+# `--autostash` automatically stashes any uncommitted local changes before
+# the pull and pops the stash afterwards. Eliminates the manual
+# `git checkout -- <file>` dance that operators kept hitting when
+# troubleshooting left local edits to docker-compose.yml / .env / nginx.conf
+# etc. on the VPS (the "Your local changes to the following files would be
+# overwritten by merge" failure mode, observed live on every v0.1.32.18 /
+# .19 deploy where the comma-whitelist hotfix lived locally on the VPS).
+#
+# If the auto-pop conflicts with incoming changes (operator's local edit
+# touched lines that main also changed), git keeps the stash in place
+# rather than dropping it — operator can inspect with `git stash list` /
+# `git stash show -p` after the deploy. The pull itself still succeeds,
+# the working tree gets main's version of the conflicted file, the deploy
+# continues with a clean tree.
+git pull --ff-only --autostash
 echo ""
+
+# Audit trail — surface whether autostash left anything around so the
+# operator sees it in the deploy log without needing to SSH in afterwards.
+if git stash list | grep -q "autostash"; then
+    echo ">>> NOTE: autostash left an unresolvable local-edit stash:"
+    git stash list | grep "autostash"
+    echo "  ⚠ Working tree is clean (main's version), but local edits are"
+    echo "  ⚠ preserved in the stash above. Inspect after deploy with:"
+    echo "  ⚠   git stash list"
+    echo "  ⚠   git stash show -p stash@{0}"
+    echo "  ⚠ Drop the stash if it's redundant: git stash drop stash@{0}"
+    echo ""
+fi
+
 echo ">>> repo state after pull:"
 git log --oneline -3
 echo ""
