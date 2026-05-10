@@ -192,6 +192,36 @@
                 OOM during the "Intersecting unconnected areas" phase. Consider
                 bumping heap before triggering Build.
               </p>
+
+              {# v0.1.32.21 — separate OTP serve heap. The build container
+                 dies after writing graph.obj; the per-session OTP SERVING
+                 container then loads the pre-built graph and answers
+                 journey-search requests. Loading + serving needs less
+                 memory than building (parse-time intermediates are gone)
+                 but still proportional to the loaded graph — France-wide
+                 ≈ 12-16 GB. The previous default of 4g silently OOM-loops
+                 a France-wide graph; this dropdown surfaces the choice.
+                 Empty value lets the orchestrator's smart-default kick
+                 in (≈ build_heap / 3, floored at 4g). Audit-2026-05.md
+                 follow-up to #14 Phase 2. #}
+              <label style="margin-top: 0.8rem">OTP serve heap <span class="hint">(JVM <code>-Xmx</code> for the per-session serving container)</span></label>
+              <select name="otp_heap">
+                <option value="" selected>Auto (≈ build_heap / 3, floor 4 GB) — recommended</option>
+                <option value="4g">4 GB — IDF / single-region only</option>
+                <option value="8g">8 GB — France regional (one or two NAPs)</option>
+                <option value="12g">12 GB — France-wide rail-focused</option>
+                <option value="16g">16 GB — France-wide standard (62k stops + street network)</option>
+                <option value="20g">20 GB</option>
+                <option value="24g">24 GB — France-wide multi-NAP cross-border</option>
+                <option value="32g">32 GB — Europe-wide rail-focused</option>
+                <option value="48g">48 GB — Europe-wide multi-modal</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem; color: var(--rail-steel)">
+                💡 Serve memory is ~⅓ of build memory because the parse-time
+                intermediates (OSM PBF buffers, GTFS staging, visibility-graph
+                construction) are gone after the build. Picking <em>Auto</em>
+                derives the value from your build-heap choice above.
+              </p>
               <p class="hint" style="margin-top: 0.25rem">
                 JVM heap for the build container. <strong>Rule of thumb</strong>: ~2 GB per
                 provider on a France-wide PBF, plus 6 GB for the street graph + ~10-15% for JVM

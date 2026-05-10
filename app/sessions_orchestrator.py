@@ -79,10 +79,21 @@ def render_compose(sessions: list[SessionRow]) -> str:
     breaking every fresh install on the second `docker compose up` after
     the web container's _startup hook overwrites the bootstrap stub.
     """
+    from . import otp_heap as _otp_heap
+
     services = "".join(
         _OTP_SVC_TEMPLATE.format(
             sid=s.id,
-            heap=(s.config or {}).get("otp_heap", "4g"),
+            # Serve heap: explicit operator choice from the session-edit form
+            # if set, otherwise a sensible default derived from the build
+            # heap (~1/3 of build heap, floored at 4g). This prevents the
+            # silent-4g-default trap that surfaced on 2026-05-10 — operator
+            # picks 64g build heap, build succeeds, OTP serve container
+            # crash-loops at the old hardcoded 4g default. Audit follow-up
+            # to #14 Phase 2 (the rest of the observability + operations
+            # arc that closed in v0.1.32.21).
+            heap=(s.config or {}).get("otp_heap")
+            or _otp_heap.default_serve_heap_for_build((s.config or {}).get("otp_build_heap")),
             category=s.category,
         )
         for s in sessions

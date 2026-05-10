@@ -54,6 +54,57 @@ COMMON_HEAPS: list[tuple[str, str]] = [
     ("72g", "72 GB — Europe-wide max (96 GB host, no other serving sessions)"),
 ]
 
+
+# ───────────────────────── Serve heap (audit-2026-05.md follow-up) ──────────
+# The SERVE-time JVM -Xmx, distinct from `otp_build_heap` above. After the
+# build completes, the per-session OTP serving container starts and loads
+# `streetGraph.obj` + the transit overlay from disk. Memory needed at serve
+# time is much smaller than at build time (parse-time intermediates are gone)
+# but still proportional to the loaded graph size — and the previous default
+# of 4g silently OOM-loops a France-wide graph (62k stops + street network).
+#
+# Surfaced 2026-05-10: operator picked 64g build heap, build succeeded, but
+# the serve container crash-looped at the hidden 4g default. Fix: a separate
+# UI dropdown so operators size serve heap explicitly + a `default_serve_heap`
+# helper that proposes a sensible default proportional to the build heap.
+COMMON_SERVE_HEAPS: list[tuple[str, str]] = [
+    ("4g", "4 GB — IDF / single-region only"),
+    ("8g", "8 GB — France regional (one or two NAPs)"),
+    ("12g", "12 GB — France-wide rail-focused"),
+    ("16g", "16 GB — France-wide standard (62k stops + street network)"),
+    ("20g", "20 GB"),
+    ("24g", "24 GB — France-wide multi-NAP cross-border"),
+    ("32g", "32 GB — Europe-wide rail-focused"),
+    ("48g", "48 GB — Europe-wide multi-modal"),
+]
+
+
+def default_serve_heap_for_build(build_heap: str | None) -> str:
+    """Suggest a reasonable serve heap based on the build heap.
+
+    Rule of thumb: serve memory is roughly 1/3 to 1/4 of build memory
+    because the parse-time intermediates (OSM PBF buffers, GTFS staging,
+    visibility-graph construction memory, etc.) are gone — only the
+    loaded graph data structures remain. Floor at 4g (anything below
+    that struggles even on tiny IDF graphs).
+
+    Used as the orchestrator's default when a session has `otp_build_heap`
+    set but no explicit `otp_heap`. Closes the silent-4g-default trap.
+    """
+    if not build_heap:
+        return "4g"
+    m = _HEAP_RE.match(build_heap.strip())
+    if not m:
+        return "4g"
+    qty, unit = int(m.group(1)), m.group(2).lower()
+    if unit == "m":
+        # Megabyte build heaps imply tiny graphs — keep serve at 4g floor.
+        return "4g"
+    # Round-up division: build_gb // 3, then floor at 4.
+    serve_gb = max(4, (qty + 2) // 3)
+    return f"{serve_gb}g"
+
+
 # JVM -Xmx accepts integer + unit. We're strict (no float, no kilobytes)
 # to keep the surface tiny and the UI dropdown matchable. Operators with
 # more exotic needs can override via `.env` instead.

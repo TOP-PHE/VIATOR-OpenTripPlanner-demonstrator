@@ -131,3 +131,79 @@ def test_common_heaps_monotonically_increasing():
     OOMs at the current pick."""
     sizes = [int(v.rstrip("gGmM")) for v, _ in COMMON_HEAPS if v.endswith(("g", "G"))]
     assert sizes == sorted(sizes), "COMMON_HEAPS not monotonically increasing"
+
+
+# ─── Audit-2026-05.md follow-up — serve heap (v0.1.32.21) ────────────────────
+
+
+def test_default_serve_heap_for_build_with_no_build_heap():
+    """When build heap is missing/None/empty, fall back to the 4g floor —
+    no way to derive a smarter default without knowing the build."""
+    from app.otp_heap import default_serve_heap_for_build
+
+    assert default_serve_heap_for_build(None) == "4g"
+    assert default_serve_heap_for_build("") == "4g"
+
+
+def test_default_serve_heap_for_build_proportional():
+    """Serve heap ≈ build_heap / 3, rounded up. Validates the headline
+    cases that operators are most likely to pick."""
+    from app.otp_heap import default_serve_heap_for_build
+
+    # 12g build → 4g serve (floored)
+    assert default_serve_heap_for_build("12g") == "4g"
+    # 24g build (France-wide standard) → 8g serve
+    assert default_serve_heap_for_build("24g") == "8g"
+    # 36g build → 12g serve
+    assert default_serve_heap_for_build("36g") == "12g"
+    # 48g build (Europe-wide rail) → 16g serve (rounded up from 16)
+    assert default_serve_heap_for_build("48g") == "16g"
+    # 64g build (Europe-wide multi-modal) → 22g serve
+    assert default_serve_heap_for_build("64g") == "22g"
+    # 72g build (max) → 24g+ serve (round-up)
+    assert default_serve_heap_for_build("72g") == "24g"
+
+
+def test_default_serve_heap_floor_is_4g():
+    """Anything below 12g build still gets 4g serve — never go below
+    the JVM minimum that an IDF graph needs."""
+    from app.otp_heap import default_serve_heap_for_build
+
+    assert default_serve_heap_for_build("4g") == "4g"
+    assert default_serve_heap_for_build("8g") == "4g"
+    assert default_serve_heap_for_build("11g") == "4g"
+
+
+def test_default_serve_heap_invalid_input_falls_back_to_4g():
+    """Defensive: bad strings shouldn't crash the orchestrator at boot.
+    They get the 4g floor, which is too small for a France-wide graph
+    but at least lets the container START so the operator sees the
+    OOM-loop and fixes the value via the UI."""
+    from app.otp_heap import default_serve_heap_for_build
+
+    assert default_serve_heap_for_build("not a heap") == "4g"
+    assert default_serve_heap_for_build("12 GB") == "4g"
+    assert default_serve_heap_for_build("12gb") == "4g"
+
+
+def test_default_serve_heap_megabytes_returns_floor():
+    """Megabyte-suffixed build heaps imply tiny graphs — 4g serve
+    floor still applies (no point computing m/3)."""
+    from app.otp_heap import default_serve_heap_for_build
+
+    assert default_serve_heap_for_build("8192m") == "4g"
+    assert default_serve_heap_for_build("4096m") == "4g"
+
+
+def test_common_serve_heaps_no_duplicates_and_sorted():
+    """Same invariants as COMMON_HEAPS — no duplicate values, ordered
+    low-to-high so the dropdown reads naturally."""
+    from app.otp_heap import COMMON_SERVE_HEAPS
+
+    seen = set()
+    for value, _label in COMMON_SERVE_HEAPS:
+        assert value not in seen, f"duplicate serve heap value: {value}"
+        seen.add(value)
+
+    sizes = [int(v.rstrip("gGmM")) for v, _ in COMMON_SERVE_HEAPS if v.endswith(("g", "G"))]
+    assert sizes == sorted(sizes), "COMMON_SERVE_HEAPS not monotonically increasing"
