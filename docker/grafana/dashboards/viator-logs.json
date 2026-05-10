@@ -26,15 +26,15 @@
         "name": "level",
         "label": "Log level",
         "type": "custom",
-        "query": "All,DEBUG,INFO,WARNING,ERROR,CRITICAL",
+        "query": "All,debug,info,warning,error,critical",
         "current": { "text": "All", "value": "" },
         "options": [
           { "text": "All",      "value": "",         "selected": true },
-          { "text": "DEBUG",    "value": "DEBUG" },
-          { "text": "INFO",     "value": "INFO" },
-          { "text": "WARNING",  "value": "WARNING" },
-          { "text": "ERROR",    "value": "ERROR" },
-          { "text": "CRITICAL", "value": "CRITICAL" }
+          { "text": "DEBUG",    "value": "debug" },
+          { "text": "INFO",     "value": "info" },
+          { "text": "WARNING",  "value": "warning" },
+          { "text": "ERROR",    "value": "error" },
+          { "text": "CRITICAL", "value": "critical" }
         ]
       },
       {
@@ -57,7 +57,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({container=~\"viator-.+\", level=~\"ERROR|CRITICAL\"}[$__range]))"
+          "expr": "sum(count_over_time({container=~\"viator-.+\", level=~\"(?i)error|critical\"}[$__range]))"
         }
       ],
       "fieldConfig": {
@@ -208,7 +208,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (container) (rate({container=~\"viator-.+\", level=~\"ERROR|CRITICAL\"}[1m]))",
+          "expr": "sum by (container) (rate({container=~\"viator-.+\", level=~\"(?i)error|critical\"}[1m]))",
           "legendFormat": "{{container}}"
         }
       ],
