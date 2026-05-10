@@ -315,9 +315,42 @@ services:
       prometheus:
         condition: service_started
 
+  # ───────────── Audit-2026-05 #31 — log aggregation (Phase 2.6) ─────────────
+  # Loki + promtail close the third leg of the observability triad alongside
+  # #13 (structlog source — JSON to stdout) and #14 (metrics — prometheus +
+  # grafana). Operators query logs via Grafana Explore (existing JWT-cookie
+  # SSO), no separate UI to learn. Both services are docker-network only —
+  # no host ports — same pattern as prometheus + grafana + cadvisor.
+  #
+  # Retention: 7 days (operator preference 2026-05-09; raw text is bulkier
+  # per byte than time-series, so 7d is a reasonable demonstrator window).
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      # Read raw container logs (JSON-per-line from docker's json-file driver)
+      # plus enumerate containers via the docker API for label-based filtering.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_started
+
 volumes:
   inbox:
   graphs:
   pgdata:
   prometheus-data:
   grafana-data:
+  loki-data:

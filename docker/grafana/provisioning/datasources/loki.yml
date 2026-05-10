@@ -1,0 +1,34 @@
+# Grafana datasource provisioning — audit-2026-05 #31 (Phase 2.6).
+#
+# Pre-wires Loki as a non-default datasource (Prometheus stays default).
+# Operators reach it via Grafana Explore (top-left magnifier icon →
+# Explore → datasource picker → Loki) or via the "VIATOR — Logs"
+# dashboard. URL points to the in-network Loki container; nginx routing
+# isn't involved for datasource queries (Grafana → Loki is direct).
+
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+    editable: false
+    jsonData:
+      # Match the tenant_id we configured in promtail-config.yaml.
+      # Loki single-tenant mode still requires this header.
+      httpHeaderName1: X-Scope-OrgID
+      # Maximum number of lines per query — UI-side cap to avoid
+      # accidentally fetching 1M lines into the browser.
+      maxLines: 5000
+      # Hint to Grafana about how to derive labels from log content.
+      derivedFields:
+        # Make `request_id` clickable in the log details panel so an
+        # operator can pivot from one slow request to all the events
+        # for that request (audit #13's request_id end-to-end trace).
+        - name: request_id
+          matcherRegex: '"request_id":"([^"]+)"'
+          url: '/explore?orgId=1&left=%5B%22now-1h%22,%22now%22,%22Loki%22,%7B%22expr%22:%22%7Bcontainer%3D~%5C%22viator-.*%5C%22%7D%20%7C%3D%20%5C%22$${__value.raw}%5C%22%22%7D%5D'
+    secureJsonData:
+      httpHeaderValue1: viator

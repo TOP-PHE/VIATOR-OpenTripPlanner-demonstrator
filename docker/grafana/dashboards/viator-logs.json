@@ -1,0 +1,225 @@
+{
+  "title": "VIATOR — Logs",
+  "uid": "viator-logs",
+  "tags": ["viator", "logs", "phase-2.6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "container",
+        "label": "Container",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "Loki" },
+        "query": "label_values(container)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "level",
+        "label": "Log level",
+        "type": "custom",
+        "query": "All,DEBUG,INFO,WARNING,ERROR,CRITICAL",
+        "current": { "text": "All", "value": "" },
+        "options": [
+          { "text": "All",      "value": "",         "selected": true },
+          { "text": "DEBUG",    "value": "DEBUG" },
+          { "text": "INFO",     "value": "INFO" },
+          { "text": "WARNING",  "value": "WARNING" },
+          { "text": "ERROR",    "value": "ERROR" },
+          { "text": "CRITICAL", "value": "CRITICAL" }
+        ]
+      },
+      {
+        "name": "session_id",
+        "label": "Session ID (free text)",
+        "type": "textbox",
+        "query": "",
+        "current": { "text": "", "value": "" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Errors (last 1h)",
+      "description": "Count of ERROR or CRITICAL log lines from VIATOR app containers in the selected time range.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=~\"viator-.+\", level=~\"ERROR|CRITICAL\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red",    "value": 10 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Failed logins (last 1h)",
+      "description": "Lines containing 'login' AND 'fail' in viator-web container — surfaces brute-force attempts and password issues.",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=\"viator-web-1\"} |~ \"(?i)login.*fail|invalid.credentials\" [$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red",    "value": 20 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "OTP build events (last 1h)",
+      "description": "Worker log lines mentioning 'rebuild job' (started, completed, failed). Useful sanity-check that builds are happening.",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=\"viator-worker-1\"} |~ \"rebuild job\" [$__range]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "OOM events (last 24h)",
+      "description": "Java OutOfMemoryError or cgroup OOMKilled detected in any container. The headline panel for build-failure triage.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(count_over_time({container=~\".+\"} |~ \"OutOfMemoryError|OOMKilled|Killed\" [24h]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red",    "value": 3 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Live tail — filtered by container + level + session_id",
+      "description": "Last 100 lines matching the dashboard variables. Set $session_id to trace a specific session's events end-to-end. Drag-select on the histogram above to zoom into a time window.",
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{container=~\"$container\"} | json | level=~\"$level.*\" |~ \"$session_id\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Log volume by container (lines / min)",
+      "description": "Spikes here indicate noisy components — e.g. a debug-level toggle accidentally left on in production, or a tight retry loop.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (container) (rate({container=~\"viator-.+\"}[1m]))",
+          "legendFormat": "{{container}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "logs/sec",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Error rate by container (errors / min)",
+      "description": "Per-container ERROR/CRITICAL rate. The headline 'something just broke' panel — anything spiking up out of zero deserves a look.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "loki", "uid": "Loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (container) (rate({container=~\"viator-.+\", level=~\"ERROR|CRITICAL\"}[1m]))",
+          "legendFormat": "{{container}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "logs/sec",
+          "custom": { "drawStyle": "line", "fillOpacity": 30 },
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    }
+  ]
+}

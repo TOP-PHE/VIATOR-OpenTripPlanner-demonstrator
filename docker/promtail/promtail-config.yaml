@@ -1,0 +1,101 @@
+# Promtail config — ships docker container logs to Loki.
+# Audit-2026-05 #31 (Phase 2.6).
+#
+# Discovery: docker_sd_configs auto-discovers every running container via
+# the docker socket. No per-container scrape config needed; new
+# `viator-otp-build-run-XXXX` ephemerals get picked up automatically.
+#
+# Labels emitted on every log stream:
+#   - container        : full docker container name (e.g. viator-web-1)
+#   - service          : compose service name (e.g. web, worker, otp-build)
+#   - stream           : stdout / stderr
+#   - viator_session_id: from the `viator.session_id` docker label set by
+#                        sessions_orchestrator on per-session containers
+#                        (only present on `viator-otp-<sid>` + ephemeral
+#                        `viator-otp-build-run-*` containers — empty on
+#                        web / worker / nginx)
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  # Track byte-offset per file so a promtail restart doesn't re-ingest
+  # everything. Stored on a tmpfs-backed path (lost on container recreate),
+  # which is fine — at-most-some-replay > complex stateful tracking.
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Tenant ID is mandatory in modern Loki — single-tenant mode uses
+    # `fake` (Grafana Labs convention).
+    tenant_id: viator
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+
+    # Promtail's docker discovery exposes container metadata as
+    # `__meta_docker_container_*` labels. Promote the useful ones to
+    # real labels and drop the rest (label cardinality matters in Loki).
+    relabel_configs:
+      # `__meta_docker_container_name` arrives with a leading slash
+      # (Docker convention: `/viator-web-1`). Strip it.
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      # Compose service name (e.g. `web`, `worker`, `nginx`). Empty for
+      # containers started outside compose (e.g. `docker run` ephemerals).
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+      # stdout vs stderr — useful for filtering "real" output from boot
+      # warnings on stderr.
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: stream
+      # Session ID — only present on per-session OTP containers
+      # (orchestrator sets `viator.session_id` label) + ephemeral
+      # otp-build-run-* containers (worker sets the same label).
+      - source_labels: ['__meta_docker_container_label_viator_session_id']
+        target_label: viator_session_id
+      # Category (rail-focused / transit-focused / etc.) — same source
+      # as session_id, lets dashboards group by graph type.
+      - source_labels: ['__meta_docker_container_label_viator_category']
+        target_label: viator_category
+
+    # Pipeline runs per log line — extract structured fields from
+    # structlog's JSON-per-line format (audit #13). Only applies to
+    # containers whose logs are JSON; non-JSON lines pass through with
+    # the raw line as the message.
+    pipeline_stages:
+      # Strip docker's json-file wrapper to expose the application's log line.
+      - cri: {}
+      # Parse the application log as JSON (structlog from web + worker).
+      # Failures (non-JSON lines from nginx, postgres, etc.) are tolerated:
+      # the line is still ingested, just without structured fields.
+      - json:
+          expressions:
+            level:       level
+            event:       event
+            request_id:  request_id
+            session_id:  session_id
+            duration_ms: duration_ms
+            timestamp:   timestamp
+      # Promote `level` to a label so LogQL filters like
+      # `{container="viator-web-1"} | level="ERROR"` work efficiently
+      # (label-based filtering is much faster than text scan).
+      - labels:
+          level:
+          # Don't promote request_id / session_id / duration_ms to labels
+          # — they're high-cardinality. Keep them as parsed JSON fields
+          # accessible via LogQL's `| json` filter.
+      # Use the application's own timestamp (from structlog) when available
+      # — otherwise promtail timestamps with ingestion time.
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
+          action_on_failure: skip
