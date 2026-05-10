@@ -8,8 +8,11 @@ pytest-cov==6.0.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.7.4
-black==26.3.1               # 25.x+ fixes ReDoS GHSA-3936-cmfr-pm3m. Audit-2026-05 #21.
+ruff==0.7.4                 # also our formatter — black was dropped in audit
+                            # #21 closure (drop-in replacement, eliminates
+                            # ruff-format ↔ black flip-flop on Alembic files).
+                            # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
+                            # once black is removed.
 mypy==1.13.0
 
 # Security
