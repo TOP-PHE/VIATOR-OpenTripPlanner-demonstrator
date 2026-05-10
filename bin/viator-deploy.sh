@@ -70,8 +70,47 @@ docker compose pull web worker otp-build
 echo ""
 
 # ─────────────────────────────── Recreate web + worker ────────────────────────
+# `--force-recreate web worker` ensures the image-pinned services pick up the
+# new $VERSION even when no compose-file fields changed (e.g. version-only
+# bumps). Force-recreate is needed here because plain `up -d` doesn't recreate
+# containers when only the env/.env-resolved image tag changed.
 echo ">>> docker compose up -d --force-recreate web worker"
 docker compose up -d --force-recreate web worker
+echo ""
+
+# ─── Bring up any new services declared in compose ─────────────────────────────
+# Plain `up -d` (no service names) starts services that are in
+# docker-compose.yml but not currently running, AND recreates services whose
+# compose-file definition changed since last `up`. Crucially, this is what
+# starts NEW services landing in a release — without this step, `prometheus`,
+# `grafana`, `cadvisor`, `node-exporter` (all added in audit #14 phases) would
+# stay un-started after deploy because the line above only touches `web` +
+# `worker`. Already-running containers with unchanged config are no-ops here.
+#
+# Diagnosed live during the v0.1.32.18 deploy on 2026-05-10 — operator's
+# Grafana "Resources" dashboard showed "No data" because cadvisor + node-
+# exporter had been merged in PR #43 but never got `up`'d by the deploy.
+echo ">>> docker compose up -d (start any new / changed services)"
+docker compose up -d
+echo ""
+
+# ─── Reload services that consume bind-mounted config files ────────────────────
+# Prometheus reads `./prometheus/prometheus.yml` at startup — but that file is
+# bind-mounted, so when a release modifies it (e.g. adding a new scrape job),
+# `compose up -d` doesn't notice (the compose-file definition is unchanged,
+# just the file's contents). Without this restart, prometheus stays on its
+# pre-deploy config until it's manually restarted.
+#
+# Same logic for grafana: provisioning yaml + dashboards JSON in
+# `./grafana/provisioning/` and `./grafana/dashboards/` are bind-mounted.
+# Provisioning is re-read on every container start, so a restart picks up
+# new datasources / dashboard panels.
+#
+# Diagnosed live during the v0.1.32.18 deploy on 2026-05-10 — operator's
+# Resources dashboard stayed empty because prometheus had been running 21h
+# without seeing the cadvisor + node-exporter scrape jobs added in PR #43.
+echo ">>> restart prometheus + grafana to pick up config-file changes"
+docker compose restart prometheus grafana
 echo ""
 
 # ─────────────────────────────── Verify ───────────────────────────────────────
