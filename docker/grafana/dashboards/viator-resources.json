@@ -160,7 +160,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "container_memory_working_set_bytes{name=~\"viator-.*|otp-build-.*\"}",
+          "expr": "container_memory_working_set_bytes{name=~\"/?viator-.+|/?otp-build-.+\"}",
           "legendFormat": "{{name}}"
         }
       ],
@@ -182,7 +182,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"viator-.*|otp-build-.*\"}[2m])) * 100",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"/?viator-.+|/?otp-build-.+\"}[2m])) * 100",
           "legendFormat": "{{name}}"
         }
       ],
@@ -204,7 +204,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "container_memory_working_set_bytes{name=~\"viator-.*|otp-build-.*\"} / on(name) container_spec_memory_limit_bytes{name=~\"viator-.*|otp-build-.*\"} * 100",
+          "expr": "container_memory_working_set_bytes{name=~\"/?viator-.+|/?otp-build-.+\"} / on(name) container_spec_memory_limit_bytes{name=~\"/?viator-.+|/?otp-build-.+\"} * 100",
           "legendFormat": "{{name}}"
         }
       ],
