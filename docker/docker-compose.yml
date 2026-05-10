@@ -216,6 +216,60 @@ services:
       web:
         condition: service_healthy
 
+  # ────────────── Audit-2026-05 #14 Phase 2.5 — resource exporters ─────────
+  # cAdvisor exposes per-container CPU/memory/network/disk metrics; node-
+  # exporter exposes host-level CPU/memory/swap/disk/load. Both are scraped
+  # by the prometheus service above (see prometheus.yml jobs `cadvisor` and
+  # `node-exporter`) and rendered in Grafana via the "VIATOR — Resources"
+  # dashboard. Closes the gap that Phase 2 left: app-level metrics only,
+  # operators had to use `docker stats` + `free -h` for memory/CPU during
+  # heavy OTP builds.
+  #
+  # Neither exporter binds host ports — both reachable only on the docker
+  # network from prometheus. That keeps the host's attack surface unchanged.
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    # cAdvisor needs read access to host paths to enumerate containers and
+    # their cgroup stats. `privileged: true` is the standard wiring per
+    # Google's docs — without it cAdvisor can't read /sys/fs/cgroup on
+    # Ubuntu 24.04 (cgroup v2 with stricter mount permissions).
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      # Limit which container labels cAdvisor exposes — without this it
+      # emits one metric per (container × every label), which on a
+      # multi-session VIATOR can be hundreds of useless time-series.
+      - "--store_container_labels=false"
+      - "--whitelisted_container_labels=com.docker.compose.service,viator.session_id,viator.category"
+      # Disable the on-disk WAL — we don't need historical metrics inside
+      # cAdvisor itself, prometheus is the long-term store.
+      - "--disable_metrics=disk,network,tcp,udp,advtcp,sched,process,hugetlb,referenced_memory,cpu_topology,resctrl"
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    # Sees the host's real PID namespace so its `/proc` reads aren't
+    # confined to the container's own processes.
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - "--path.rootfs=/host"
+      # Skip pseudo-filesystems that aren't real disks (would inflate the
+      # `node_filesystem_*` metric cardinality without any operational
+      # value — overlay, tmpfs, etc.).
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker)($$|/)"
+      - "--collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$$"
+
   grafana:
     image: grafana/grafana:11.4.0
     restart: unless-stopped
