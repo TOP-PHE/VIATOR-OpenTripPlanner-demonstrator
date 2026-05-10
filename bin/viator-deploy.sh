@@ -94,6 +94,25 @@ echo ">>> docker compose up -d (start any new / changed services)"
 docker compose up -d
 echo ""
 
+# ─── Reload services that consume bind-mounted config files ────────────────────
+# Prometheus reads `./prometheus/prometheus.yml` at startup — but that file is
+# bind-mounted, so when a release modifies it (e.g. adding a new scrape job),
+# `compose up -d` doesn't notice (the compose-file definition is unchanged,
+# just the file's contents). Without this restart, prometheus stays on its
+# pre-deploy config until it's manually restarted.
+#
+# Same logic for grafana: provisioning yaml + dashboards JSON in
+# `./grafana/provisioning/` and `./grafana/dashboards/` are bind-mounted.
+# Provisioning is re-read on every container start, so a restart picks up
+# new datasources / dashboard panels.
+#
+# Diagnosed live during the v0.1.32.18 deploy on 2026-05-10 — operator's
+# Resources dashboard stayed empty because prometheus had been running 21h
+# without seeing the cadvisor + node-exporter scrape jobs added in PR #43.
+echo ">>> restart prometheus + grafana to pick up config-file changes"
+docker compose restart prometheus grafana
+echo ""
+
 # ─────────────────────────────── Verify ───────────────────────────────────────
 echo ">>> waiting 8 sec for web container readiness"
 sleep 8
