@@ -1,0 +1,53 @@
+# Tempo single-binary config — audit-2026-05 #19 (Phase 2.7).
+#
+# Local filesystem storage, OTLP gRPC + HTTP receivers, 7-day retention.
+# Sized for a single-VPS demonstrator — not a production cluster.
+# ~500 MB disk per 7d at typical VIATOR span volumes.
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+# Distributor — accepts OTLP spans from the OTel SDK in the web container
+# and forwards them to the ingester. gRPC is the canonical OTel protocol
+# (lower overhead than HTTP/JSON); HTTP is enabled for ad-hoc curl tests
+# or if any future service prefers it.
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+# Ingester — buffers spans in memory then flushes to long-term storage.
+# Low flush thresholds because a demonstrator's span rate is far below
+# what would justify large batches.
+ingester:
+  max_block_duration: 5m
+  max_block_bytes: 100000000  # 100 MB
+
+compactor:
+  compaction:
+    # Drop blocks older than the retention window. 168h = 7 days.
+    block_retention: 168h
+    compacted_block_retention: 1h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Disable per-tenant authentication (single-tenant deployment behind
+# nginx + JWT auth in Grafana — Tempo itself is not exposed to operators
+# directly, so its own auth surface stays simple).
+multitenancy_enabled: false
+
+# Tempo's built-in usage analytics phone-home; matches the convention from
+# loki / prometheus / grafana configs (disabled for privacy).
+usage_report:
+  reporting_enabled: false
