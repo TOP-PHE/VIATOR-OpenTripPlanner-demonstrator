@@ -179,7 +179,11 @@ def create_session(
 
 @router.patch(
     "/{sid}",
-    response_model=SessionResponse,
+    # `response_model=` dropped in v0.1.32.21 — the function's
+    # `-> SessionResponse` return annotation already conveys the same
+    # info, and SonarCloud rule python:S6781 flags the duplication.
+    # FastAPI infers the response model from the return annotation
+    # since 0.95+ (we're on 0.136+).
     responses={
         # v0.1.32.21 — declare 400 in the OpenAPI spec for SonarCloud
         # rule python:S6788. patch_session() raises HTTPException(400)
