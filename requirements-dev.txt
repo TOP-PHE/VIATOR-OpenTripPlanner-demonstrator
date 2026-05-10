@@ -1,15 +1,22 @@
 # Dev / CI dependencies. Runtime deps live in requirements.txt.
 -r requirements.txt
 
-# Test runner
-pytest==8.3.4
-pytest-asyncio==0.24.0
-pytest-cov==6.0.0
+# Test runner — pytest 9.x for the test-isolation security fix
+# (GHSA-6w46-j5rx-g56g). Audit-2026-05 #22.
+# pytest-asyncio 1.x is the pytest-9-compatible line; we keep
+# `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
+# to be re-decorated with @pytest.mark.asyncio.
+pytest==9.0.3
+pytest-asyncio==1.3.0
+pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.7.4
-black==24.10.0
+ruff==0.7.4                 # also our formatter — black was dropped in audit
+                            # #21 closure (drop-in replacement, eliminates
+                            # ruff-format ↔ black flip-flop on Alembic files).
+                            # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
+                            # once black is removed.
 mypy==1.13.0
 
 # Security

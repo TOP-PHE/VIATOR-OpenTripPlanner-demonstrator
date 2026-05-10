@@ -60,8 +60,7 @@ def upgrade() -> None:
     # catalogue in the picker — operator can edit/delete if they want.
     # Other NAPs (German, Swiss, etc.) are added via the admin UI.
     op.execute(
-        sa.text(
-            """
+        sa.text("""
             INSERT INTO nap_catalogues (name, url, default_country, default_modes, note)
             VALUES (
                 'France NAP (transport.data.gouv.fr)',
@@ -70,8 +69,7 @@ def upgrade() -> None:
                 'rail',
                 'Public, no auth required. Default seed in v0.1.12.'
             )
-            """
-        )
+            """)
     )
 
 

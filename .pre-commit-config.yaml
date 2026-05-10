@@ -21,10 +21,11 @@ repos:
         args: ["--fix"]
       - id: ruff-format
 
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
-    hooks:
-      - id: black
+  # black removed in audit-2026-05 #21 closure. `ruff format` (the
+  # ruff-pre-commit hook above) replaces it — single formatter, no
+  # flip-flops between two tools with subtly different rules
+  # (specifically the multi-line-string `op.execute("""...""")` pattern
+  # in Alembic migrations where black 26 + ruff-format 0.7 disagree).
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.13.0

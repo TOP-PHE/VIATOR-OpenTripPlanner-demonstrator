@@ -1,0 +1,51 @@
+# Grafana datasource provisioning — audit-2026-05 #19 (Phase 2.7).
+#
+# Pre-wires Tempo as a non-default datasource. Operators reach it via
+# Grafana Explore (datasource picker → Tempo) or — more commonly — via
+# the Loki→Tempo trace_id derived field: any log line in the Logs
+# dashboard or Explore that has a `trace_id` field becomes a clickable
+# pivot straight to the trace timeline in Tempo.
+#
+# URL points to the in-network Tempo HTTP API; no nginx involvement
+# (Grafana → Tempo is direct on the docker bridge).
+
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: false
+    jsonData:
+      # Service map — visualises the call graph between services
+      # discovered from the spans. Uses our existing Prometheus
+      # datasource for the supporting metrics ("request rate", "error
+      # rate") drawn alongside the service map edges.
+      serviceMap:
+        datasourceUid: Prometheus
+      # Node graph view (Grafana's force-directed layout of the
+      # service-call graph).
+      nodeGraph:
+        enabled: true
+      # Trace-to-logs: in the trace timeline, clicking a span shows a
+      # "View logs" button that runs a LogQL query in the Loki
+      # datasource scoped to the span's container + trace_id. Closes
+      # the triad: jump from one slow trace to the log lines emitted
+      # during that exact span.
+      tracesToLogsV2:
+        datasourceUid: Loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        tags:
+          - key: service.name
+            value: container
+        filterByTraceID: true
+      # Trace-to-metrics: clicking a span exposes a "View metrics"
+      # button that runs the matching PromQL query (HTTP latency for
+      # the route, queue depth, etc.) at the time window of the trace.
+      tracesToMetrics:
+        datasourceUid: Prometheus
+        spanStartTimeShift: "-2m"
+        spanEndTimeShift: "2m"

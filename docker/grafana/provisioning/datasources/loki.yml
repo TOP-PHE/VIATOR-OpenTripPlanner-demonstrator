@@ -30,5 +30,15 @@ datasources:
         - name: request_id
           matcherRegex: '"request_id":"([^"]+)"'
           url: '/explore?orgId=1&left=%5B%22now-1h%22,%22now%22,%22Loki%22,%7B%22expr%22:%22%7Bcontainer%3D~%5C%22viator-.*%5C%22%7D%20%7C%3D%20%5C%22$${__value.raw}%5C%22%22%7D%5D'
+        # Audit-2026-05 #19 — trace_id pivot to Tempo. The OTel
+        # logging instrumentation injects `otelTraceID` into stdlib
+        # log records, which structlog passes through to JSON output,
+        # which promtail captures as a field. Grafana matches the
+        # JSON `"otelTraceID":"<hex>"` here and turns the value into
+        # a clickable button → opens the trace in Tempo.
+        - name: trace_id
+          matcherRegex: '"otelTraceID":"([0-9a-f]+)"'
+          datasourceUid: Tempo
+          url: '$${__value.raw}'
     secureJsonData:
       httpHeaderValue1: viator

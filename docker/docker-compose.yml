@@ -66,6 +66,13 @@ services:
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Audit-2026-05 #19 — OpenTelemetry tracing. The web SDK exports
+      # spans to Tempo over OTLP-gRPC. Setting the endpoint env var is
+      # what turns tracing ON; without it the SDK init in app/tracing.py
+      # short-circuits (deliberate so dev / test environments don't try
+      # to dial a nonexistent Tempo).
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
+      OTEL_SERVICE_NAME: viator-web
       # NOTE: VIATOR_VERSION (UI header badge + /healthz/version) is intentionally
       # NOT overridden here. The image's built-in `ENV VIATOR_VERSION=...` (set
       # at build time from the git tag, see docker/web/Dockerfile) is the source
@@ -380,6 +387,31 @@ services:
       loki:
         condition: service_started
 
+  # ───────────── Audit-2026-05 #19 — distributed tracing (Phase 2.7) ─────────
+  # Tempo closes the observability triad alongside #13 (structlog →
+  # Loki for logs) and #14 (Prometheus + Grafana for metrics). The web
+  # container's OTel SDK ships spans over OTLP-gRPC to tempo:4317;
+  # Grafana queries Tempo as a datasource via the HTTP API on :3200.
+  # Operators reach traces through Grafana Explore — clicking the
+  # `trace_id` derived field on any Loki log line jumps straight to the
+  # trace timeline. No separate Tempo UI to learn.
+  #
+  # Retention: 7 days (same as Loki, operator preference). Filesystem
+  # storage on a named volume — ~500 MB / 7d at typical VIATOR span
+  # volumes (sized for a single-VPS demonstrator).
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo-config.yaml"]
+    volumes:
+      - ./tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
+      - tempo-data:/var/tempo
+    # No port mappings — Tempo's OTLP receivers (4317 gRPC + 4318 HTTP)
+    # and HTTP API (3200) are reachable only on the docker bridge. The
+    # web container's OTLP exporter targets tempo:4317; Grafana
+    # datasource targets http://tempo:3200.
+
 volumes:
   inbox:
   graphs:
@@ -387,3 +419,4 @@ volumes:
   prometheus-data:
   grafana-data:
   loki-data:
+  tempo-data:

@@ -68,8 +68,12 @@ jobs:
           ruff check .
           ruff format --check .
 
-      - name: Black (format check)
-        run: black --check .
+      # Note: black was dropped in audit-#21 closure. `ruff format` is
+      # a drop-in replacement (https://docs.astral.sh/ruff/formatter/)
+      # and a single formatter eliminates formatter-war flip-flops where
+      # ruff-format and black disagreed on Alembic migration files. The
+      # ReDoS advisory GHSA-3936-cmfr-pm3m (the original motivation for
+      # #21) is moot once black is removed.
 
       - name: Mypy (strict type check)
         run: mypy app/
