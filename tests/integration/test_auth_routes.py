@@ -184,13 +184,20 @@ def test_me_unauthorized_without_jwt(client: TestClient) -> None:
 
 def test_proxy_validate_with_valid_jwt_returns_identity_headers(client: TestClient) -> None:
     """nginx hits /api/auth/proxy-validate with the JWT cookie; on success the
-    response carries `X-Forwarded-User` + `X-Forwarded-Role` so nginx can
-    extract them via auth_request_set and forward to Grafana / Prometheus."""
+    response carries `X-Forwarded-User` + `X-Forwarded-Role` (mapped to
+    Grafana's Admin/Editor/Viewer vocabulary) + `X-Viator-Role` (the
+    untranslated VIATOR role). nginx extracts them via auth_request_set
+    and forwards to Grafana / Prometheus."""
     jwt, email = _bootstrap(client)
     r = client.get("/api/auth/proxy-validate", headers={"Authorization": f"Bearer {jwt}"})
     assert r.status_code == 200
     assert r.headers["X-Forwarded-User"] == email
-    assert r.headers["X-Forwarded-Role"] == "platform_admin"
+    # platform_admin → Admin in Grafana's vocabulary (audit #14 Phase 2.1).
+    assert r.headers["X-Forwarded-Role"] == "Admin"
+    # Original VIATOR role available for future consumers that need the
+    # finer-grained 3-tier (platform_admin/content_manager/end_user)
+    # rather than Grafana's Admin/Editor/Viewer collapsed view.
+    assert r.headers["X-Viator-Role"] == "platform_admin"
 
 
 def test_proxy_validate_unauthorized_without_jwt(client: TestClient) -> None:
