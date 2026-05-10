@@ -177,7 +177,23 @@ def create_session(
     return SessionResponse.from_orm_session(s)
 
 
-@router.patch("/{sid}", response_model=SessionResponse)
+@router.patch(
+    "/{sid}",
+    # `response_model=` dropped in v0.1.32.21 — the function's
+    # `-> SessionResponse` return annotation already conveys the same
+    # info, and SonarCloud rule python:S6781 flags the duplication.
+    # FastAPI infers the response model from the return annotation
+    # since 0.95+ (we're on 0.136+).
+    responses={
+        # v0.1.32.21 — declare 400 in the OpenAPI spec for SonarCloud
+        # rule python:S6788. patch_session() raises HTTPException(400)
+        # from several config-field validators (otp_timezone,
+        # otp_build_heap, otp_heap, otp_api_timeout). The rule is
+        # satisfied at the decorator level — individual raise sites
+        # don't need per-line documentation.
+        400: {"description": "Config field failed validation (heap / timezone / timeout)."},
+    },
+)
 def patch_session(
     sid: str,
     body: SessionPatch,
@@ -232,6 +248,24 @@ def patch_session(
                     body.config["otp_build_heap"]
                 )
             except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
+        # v0.1.32.21 — validate otp_heap (the SERVE-time JVM -Xmx, distinct
+        # from otp_build_heap above). Used by the per-session OTP serving
+        # container after the build completes. Same fail-fast pattern as
+        # otp_build_heap. Surfaced 2026-05-10 when an operator picked a
+        # 64g build heap, the build succeeded, but the serving container
+        # crash-looped at the hidden 4g default — see audit-2026-05.md.
+        if "otp_heap" in body.config:
+            from ... import otp_heap as _otp_heap
+
+            try:
+                body.config["otp_heap"] = _otp_heap.validate_heap(body.config["otp_heap"])
+            except ValueError as exc:
+                # 400 is already declared on the route decorator's `responses`
+                # parameter (set in v0.1.32.21 alongside this validation
+                # block); SonarCloud rule python:S6788 is satisfied at the
+                # decorator level, not per-raise.
                 raise HTTPException(400, str(exc)) from exc
 
         # v0.1.24 — validate otp_api_timeout. Operator picks how long OTP
