@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from ... import audit, config_service
 from ...auth import email as email_sender
 from ...auth import passwords, tokens
+from ...auth.grafana_role_map import viator_role_to_grafana
 from ...db import get_db
 from ...models import PasswordResetToken, User, VerificationToken
 from ...rate_limit import limiter
@@ -312,12 +313,23 @@ async def proxy_validate(
     JWT cookie is valid, 401 otherwise (via the dependency). The Response
     headers are picked up by nginx with `auth_request_set` and forwarded
     to Grafana / Prometheus as `X-WEBAUTH-USER` / `X-Forwarded-User`.
+
+    `X-Forwarded-Role` is mapped to Grafana's vocabulary (Admin/Editor/
+    Viewer) via `app.auth.grafana_role_map.viator_role_to_grafana` so the
+    auth.proxy plugin assigns the right role on auto-sign-up. Unknown
+    VIATOR roles fall back to Viewer (least-privilege fallback). Audit
+    #14 Phase 2.1.
     """
     return Response(
         status_code=status.HTTP_200_OK,
         headers={
             "X-Forwarded-User": user.username,
-            "X-Forwarded-Role": user.role,
+            "X-Forwarded-Role": viator_role_to_grafana(user.role),
+            # Keep the original VIATOR role available too — useful if a
+            # future consumer needs to distinguish content_manager from
+            # platform_admin (Grafana flattens both to Editor/Admin in
+            # its 3-tier model).
+            "X-Viator-Role": user.role,
         },
     )
 

@@ -236,11 +236,28 @@ services:
     # Google's docs — without it cAdvisor can't read /sys/fs/cgroup on
     # Ubuntu 24.04 (cgroup v2 with stricter mount permissions).
     privileged: true
+    # cgroup-v2 visibility: by default, containers see only their own
+    # cgroup namespace, so cAdvisor in its own container can't enumerate
+    # other containers' memory/CPU. `cgroup: host` shares the host's
+    # cgroup namespace into the container, which is what cAdvisor's
+    # "see every container" mode needs. Without this, the
+    # `container_memory_working_set_bytes{name=...}` series for docker
+    # containers never appear — only the host-level cgroups (cron.service,
+    # ssh.service, etc.) show up. Diagnosed live 2026-05-10 when the
+    # `Container memory by container` panel of the Resources dashboard
+    # stayed empty during an OTP build despite all targets being UP.
+    cgroup: host
     devices:
       - /dev/kmsg
     volumes:
       - /:/rootfs:ro
-      - /var/run:/var/run:ro
+      # `:rw` is required, NOT `:ro`. cAdvisor talks to docker.sock to
+      # introspect container metadata (names, labels, image refs) — and
+      # Unix-domain-socket comms are bidirectional, so the mount must be
+      # writable even though we never modify files in /var/run. With :ro,
+      # the socket connection silently drops and cAdvisor falls back to
+      # cgroup-only metrics (no container `name=` label).
+      - /var/run:/var/run:rw
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
@@ -285,7 +302,19 @@ services:
       GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
       GF_AUTH_PROXY_HEADER_PROPERTY: username
       GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      # `Email:X-Forwarded-User` populates the user's email + login from
+      # the same header (we use email-as-login). `Role:X-Forwarded-Role`
+      # makes Grafana assign the user role from that header — values must
+      # be in Grafana's 3-tier vocabulary (Admin/Editor/Viewer). The
+      # mapping from VIATOR roles (platform_admin/content_manager/end_user)
+      # is in the proxy-validate endpoint (audit #14 Phase 2.1).
       GF_AUTH_PROXY_HEADERS: "Email:X-Forwarded-User Role:X-Forwarded-Role"
+      # Re-evaluate role on every login (instead of only on first sign-up).
+      # Without this, a user who's promoted from end_user → platform_admin
+      # in VIATOR would still see Viewer in Grafana until you manually
+      # delete + recreate them. With it: next request after the role
+      # change applies the new Grafana role automatically.
+      GF_AUTH_PROXY_SYNC_TTL: "60"
       # Trust X-WEBAUTH-USER only from docker bridge networks.
       # Format: comma-separated (Grafana's documented format). Space-separated
       # fails silently on Grafana 11.4+ — the whole list parses as one
@@ -297,12 +326,16 @@ services:
       # the operator's previous workaround (commas added locally on the
       # VPS) lost the divergence on every `git pull` until this fix.
       GF_AUTH_PROXY_WHITELIST: "172.16.0.0/12, 192.168.0.0/16, 10.0.0.0/8"
-      # First-cut role mapping: every auto-signed-up user gets Editor
-      # (can view + edit dashboards but not invite users / set up data
-      # sources). Per-role mapping (platform_admin → Admin etc.) is
-      # filed as a Phase 2.1 follow-up.
+      # Auto-assign new sign-ups to the default org (a Grafana convention
+      # — all users land in the "Main Org." unless you set up multi-org).
       GF_USERS_AUTO_ASSIGN_ORG: "true"
-      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Editor
+      # Fallback role for sign-ups that arrive WITHOUT a recognised role
+      # header — e.g. someone hits Grafana via a proxy path that doesn't
+      # set `X-Forwarded-Role`. Viewer is the safe default (read-only).
+      # Real users get their actual role via the auth.proxy `Role:X-Forwarded-Role`
+      # mapping above + the VIATOR-to-Grafana role lookup in
+      # `app/api/auth/routes.py:_VIATOR_TO_GRAFANA_ROLE` (audit #14 Phase 2.1).
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Viewer
       # Disable anonymous + login form — header is the only auth path.
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
