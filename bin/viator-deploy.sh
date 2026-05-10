@@ -70,8 +70,28 @@ docker compose pull web worker otp-build
 echo ""
 
 # ─────────────────────────────── Recreate web + worker ────────────────────────
+# `--force-recreate web worker` ensures the image-pinned services pick up the
+# new $VERSION even when no compose-file fields changed (e.g. version-only
+# bumps). Force-recreate is needed here because plain `up -d` doesn't recreate
+# containers when only the env/.env-resolved image tag changed.
 echo ">>> docker compose up -d --force-recreate web worker"
 docker compose up -d --force-recreate web worker
+echo ""
+
+# ─── Bring up any new services declared in compose ─────────────────────────────
+# Plain `up -d` (no service names) starts services that are in
+# docker-compose.yml but not currently running, AND recreates services whose
+# compose-file definition changed since last `up`. Crucially, this is what
+# starts NEW services landing in a release — without this step, `prometheus`,
+# `grafana`, `cadvisor`, `node-exporter` (all added in audit #14 phases) would
+# stay un-started after deploy because the line above only touches `web` +
+# `worker`. Already-running containers with unchanged config are no-ops here.
+#
+# Diagnosed live during the v0.1.32.18 deploy on 2026-05-10 — operator's
+# Grafana "Resources" dashboard showed "No data" because cadvisor + node-
+# exporter had been merged in PR #43 but never got `up`'d by the deploy.
+echo ">>> docker compose up -d (start any new / changed services)"
+docker compose up -d
 echo ""
 
 # ─────────────────────────────── Verify ───────────────────────────────────────
