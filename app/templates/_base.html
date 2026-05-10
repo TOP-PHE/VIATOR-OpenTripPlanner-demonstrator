@@ -57,6 +57,68 @@
     .top nav .role.content_manager { color: var(--amber);      background: #fff8e1; }
     .top nav .role.end_user        { color: var(--rail-steel); background: #fff;    }
 
+    /* ───── nav dropdown (Phase 2.2 — admin dashboard menu) ─────
+       Hover OR keyboard focus opens the panel. `position: relative` on the
+       wrapper anchors the absolutely-positioned dropdown directly below the
+       trigger. The wrapper is `tabindex=0` so the trigger keeps focusability
+       even though it's a span (we don't want it to be a link — clicking it
+       does nothing, only hovering/keyboard-focus reveals children). */
+    .top nav .nav-group { position: relative; }
+    .top nav .nav-group-trigger {
+      cursor: default;
+      user-select: none;
+      color: var(--rail-steel);
+      padding: 0.1rem 0;
+    }
+    .top nav .nav-group-trigger::after {
+      content: " ▾";
+      font-size: 0.7em;
+      vertical-align: middle;
+    }
+    .top nav .nav-group:hover .nav-group-trigger,
+    .top nav .nav-group:focus-within .nav-group-trigger { color: var(--uic-blue); }
+    .top nav .nav-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 0.3rem;
+      min-width: 220px;
+      padding: 0.3rem 0;
+      background: #fff;
+      border: 1px solid var(--sleeper);
+      border-radius: 6px;
+      box-shadow: 0 6px 16px rgba(28, 35, 48, 0.12);
+      z-index: 50;
+    }
+    .top nav .nav-group:hover .nav-dropdown,
+    .top nav .nav-group:focus-within .nav-dropdown { display: block; }
+    .top nav .nav-dropdown a {
+      display: block;
+      padding: 0.5rem 1rem;
+      color: var(--rail-steel);
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .top nav .nav-dropdown a:hover {
+      background: var(--paper);
+      color: var(--uic-blue);
+      text-decoration: none;
+    }
+    .top nav .nav-dropdown .nav-dropdown-section {
+      padding: 0.3rem 1rem;
+      font-size: 0.7rem;
+      letter-spacing: 0.08rem;
+      text-transform: uppercase;
+      color: var(--rail-steel);
+      border-top: 1px solid var(--sleeper);
+      margin-top: 0.3rem;
+    }
+    .top nav .nav-dropdown .nav-dropdown-section:first-child {
+      border-top: 0;
+      margin-top: 0;
+    }
+
     /* ───── main ───── */
     main { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
     h1, h2 { color: var(--uic-blue); }
@@ -136,13 +198,36 @@
               {# v0.1.27: bulk-test journey searches across the major French rail hubs. #}
               <a href="/admin/network-coverage" title="Run all-pairs journey-search matrix across major French rail hubs">Coverage</a>
               <a href="/admin/reports">Reports</a>
-              {# Audit-2026-05 #14 Phase 2.2 — Grafana + Prometheus links.
-                 SSO via the JWT cookie (nginx auth_request → /api/auth/proxy-validate),
-                 so a click drops the operator straight onto the dashboard with no
-                 second login. `target="_blank"` because operators usually want to
-                 keep the admin UI open while watching metrics during a build. #}
-              <a href="/grafana/" target="_blank" rel="noopener" title="Grafana — dashboards (HTTP, sessions, rebuilds, CPU/RAM). Opens in a new tab.">Grafana&nbsp;↗</a>
-              <a href="/prometheus/" target="_blank" rel="noopener" title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">Prometheus&nbsp;↗</a>
+              {# Audit-2026-05 #14 Phase 2.2 — Admin dashboard dropdown.
+                 Hover OR keyboard focus opens the panel. SSO via the JWT
+                 cookie (nginx auth_request → /api/auth/proxy-validate),
+                 so a click drops the operator straight onto the dashboard
+                 with no second login. `target="_blank"` because operators
+                 usually want to keep the admin UI open while watching
+                 metrics during a build.
+
+                 Future items (logs, audit-event browser, etc.) slot in
+                 cleanly — this hierarchy was set up so the menu doesn't
+                 need restructuring for the next observability addition. #}
+              <span class="nav-group" tabindex="0" aria-haspopup="menu" aria-label="Admin dashboard menu">
+                <span class="nav-group-trigger">Admin dashboard</span>
+                <div class="nav-dropdown" role="menu">
+                  <div class="nav-dropdown-section">Observability</div>
+                  <a href="/grafana/" target="_blank" rel="noopener"
+                     role="menuitem"
+                     title="Grafana — VIATOR Overview + Resources dashboards (HTTP, sessions, rebuilds, CPU/RAM). Opens in a new tab.">
+                    Grafana&nbsp;Dashboard&nbsp;↗
+                  </a>
+                  <a href="/prometheus/" target="_blank" rel="noopener"
+                     role="menuitem"
+                     title="Prometheus — raw query UI for ad-hoc PromQL. Opens in a new tab.">
+                    Prometheus&nbsp;Query&nbsp;↗
+                  </a>
+                  {# Slot for future items — `<div class="nav-dropdown-section">Operations</div>`
+                     plus links like /admin/logs, /admin/audit-events, etc. The dropdown
+                     auto-grows; no further CSS changes needed. #}
+                </div>
+              </span>
             {% endif %}
             {# Credentials are user-scoped, available to anyone logged-in. #}
             <a href="/credentials">My credentials</a>
