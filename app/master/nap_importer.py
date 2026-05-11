@@ -442,9 +442,9 @@ def _validate_safe_http_url(url: str) -> str:
         # optimises out asserts under -O, and we never run with -O).
         # Audit-2026-05 follow-up to dependency #69.
         ip_str_raw = sockaddr[0]
-        assert isinstance(
-            ip_str_raw, str
-        ), f"socket.getaddrinfo returned non-str sockaddr[0]: {type(ip_str_raw)}"
+        assert isinstance(ip_str_raw, str), (
+            f"socket.getaddrinfo returned non-str sockaddr[0]: {type(ip_str_raw)}"
+        )
         # Strip IPv6 zone-id ("fe80::1%eth0") which ip_address can't parse.
         ip_str = ip_str_raw.split("%", 1)[0]
         ip = ipaddress.ip_address(ip_str)
