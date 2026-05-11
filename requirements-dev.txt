@@ -17,7 +17,7 @@ ruff==0.15.12               # also our formatter — black was dropped in audit
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
                             # once black is removed.
-mypy==1.13.0
+mypy==2.0.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
 
 # Security
 bandit==1.7.10

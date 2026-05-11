@@ -28,13 +28,13 @@ repos:
   # in Alembic migrations where black 26 + ruff-format 0.7 disagree).
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
+    rev: v2.0.0
     hooks:
       - id: mypy
         additional_dependencies:
           - pydantic==2.10.3
           - pydantic-settings==2.6.1
-          - sqlalchemy==2.0.36
+          - sqlalchemy==2.0.49
           - fastapi==0.115.6
         args: ["--config-file=pyproject.toml"]
         # mypy is slow; skip on commit, run on push or in CI

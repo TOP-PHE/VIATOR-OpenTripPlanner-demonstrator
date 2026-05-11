@@ -157,7 +157,12 @@ def validate_auth_type(value: str) -> AuthType:
     v = (value or "").strip().lower()
     if v not in AUTH_TYPES:
         raise ValueError(f"auth_type={value!r} unknown. Must be one of {list(AUTH_TYPES)}.")
-    return v  # type: ignore[return-value]
+    # mypy 2.0 narrows `v` to AuthType via the membership check above
+    # (`not in AUTH_TYPES` followed by `raise`). The old explicit `cast()`
+    # / `# type: ignore[return-value]` was needed only on mypy 1.13.0
+    # which couldn't follow this narrowing. Audit-2026-05 follow-up to
+    # dependency bump #69.
+    return v
 
 
 def validate_param_name(auth_type: AuthType, raw: str | None) -> str | None:

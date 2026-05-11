@@ -433,9 +433,20 @@ def _validate_safe_http_url(url: str) -> str:
         raise ValueError(f"Cannot resolve NAP hostname {hostname!r}: {exc}") from exc
 
     for _family, _socktype, _proto, _canonname, sockaddr in addr_info:
-        ip_str = sockaddr[0]
+        # sockaddr is `tuple[str, int]` (IPv4) or `tuple[str, int, int, int]`
+        # (IPv6). socket.getaddrinfo's stdlib stubs type [0] as `str | int`
+        # because the tuple shape is union-typed at the call site. mypy 2.0
+        # enforces the union strictly, where 1.13 silently allowed `.split`.
+        # The first element IS always a str in both families — assert to
+        # narrow it for the linter without adding runtime cost (Python
+        # optimises out asserts under -O, and we never run with -O).
+        # Audit-2026-05 follow-up to dependency #69.
+        ip_str_raw = sockaddr[0]
+        assert isinstance(
+            ip_str_raw, str
+        ), f"socket.getaddrinfo returned non-str sockaddr[0]: {type(ip_str_raw)}"
         # Strip IPv6 zone-id ("fe80::1%eth0") which ip_address can't parse.
-        ip_str = ip_str.split("%", 1)[0]
+        ip_str = ip_str_raw.split("%", 1)[0]
         ip = ipaddress.ip_address(ip_str)
         if (
             ip.is_private
