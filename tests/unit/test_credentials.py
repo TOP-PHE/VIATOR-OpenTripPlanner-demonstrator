@@ -168,7 +168,7 @@ class TestApplyToRequest:
     def test_basic_b64_encodes_authorization_header(self):
         from app.credentials import apply_to_request
 
-        url, headers = apply_to_request(
+        _url, headers = apply_to_request(
             "https://api.example",
             auth_type="basic",
             plaintext="alice:s3cret",

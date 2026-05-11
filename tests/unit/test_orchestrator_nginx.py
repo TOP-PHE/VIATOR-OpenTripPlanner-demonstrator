@@ -39,9 +39,9 @@ def test_serving_session_uses_variable_proxy_pass():
         "container hostname on each request — the v0.1.15 fix"
     )
     # Belt-and-braces: the hardcoded form must NOT appear.
-    assert (
-        "proxy_pass http://otp-nap-fr-rail:8080" not in out
-    ), "regression: static-host proxy_pass would re-cache the upstream IP"
+    assert "proxy_pass http://otp-nap-fr-rail:8080" not in out, (
+        "regression: static-host proxy_pass would re-cache the upstream IP"
+    )
 
 
 def test_session_id_with_hyphens_is_sanitised_for_variable_name():

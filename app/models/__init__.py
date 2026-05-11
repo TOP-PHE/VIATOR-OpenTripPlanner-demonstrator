@@ -27,48 +27,36 @@ from .runtime import McTOverride, StationXref
 from .search import JourneySearch, JourneySearchExecution, JourneyTrip
 from .sessions import Session, SessionCategory, SessionState
 
+# Sorted alphabetically to satisfy RUF022. Domain grouping (identity / sessions /
+# ingestion / search / master / runtime / etc.) lives in the imports above —
+# the imports stay grouped by concern, only this re-export list is flat.
 __all__ = [
+    "AuditEvent",
     "Base",
-    # identity
-    "User",
-    "UserRole",
-    "VerificationToken",
-    "PasswordResetToken",
-    # sessions
-    "Session",
-    "SessionCategory",
-    "SessionState",
-    # ingestion
-    "Upload",
-    "RebuildJob",
-    # graph
     "GraphSnapshot",
-    # search
     "JourneySearch",
     "JourneySearchExecution",
     "JourneyTrip",
-    # master data
-    "MasterStation",
-    "MasterStationPendingDrift",
-    "RouteAlias",
     "MasterCarrier",
     "MasterCarrierPendingDrift",
-    # runtime
+    "MasterStation",
+    "MasterStationPendingDrift",
     "McTOverride",
-    "StationXref",
-    # audit
-    "AuditEvent",
-    # config
-    "PlatformConfig",
-    # credentials (v0.1.10) — user-owned API keys for authenticated provider URLs
-    "UserCredential",
-    # NAP catalogues (v0.1.12) — saved NAP endpoints for the import-from-NAP picker
     "NapCatalogue",
-    # Network coverage (v0.1.27) — admin matrix runs for systematic
-    # all-pairs journey searches across major French rail hubs
-    "NetworkCoverageRun",
-    "NetworkCoverageResult",
-    # Network coverage hubs (v0.1.31) — editable hub catalog (was a
-    # NamedTuple constant in app/network_coverage/hubs.py through v0.1.30).
     "NetworkCoverageHub",
+    "NetworkCoverageResult",
+    "NetworkCoverageRun",
+    "PasswordResetToken",
+    "PlatformConfig",
+    "RebuildJob",
+    "RouteAlias",
+    "Session",
+    "SessionCategory",
+    "SessionState",
+    "StationXref",
+    "Upload",
+    "User",
+    "UserCredential",
+    "UserRole",
+    "VerificationToken",
 ]

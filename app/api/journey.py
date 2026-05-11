@@ -66,7 +66,7 @@ async def _query_session(
     """Returns (status, raw, trips, response_ms)."""
     start = time.monotonic()
     try:
-        when_kind, when = _resolve_when(body)
+        _when_kind, when = _resolve_when(body)
         raw, trips = await otp_client.fetch_plan(
             session_id=session.id,
             from_lat=body.from_.lat,

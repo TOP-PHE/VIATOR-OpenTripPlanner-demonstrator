@@ -81,7 +81,7 @@ class TestSelectResource:
                 {"format": "GTFS", "url": "https://x/fresh.zip", "updated": "2026-04-30T12:00:00Z"},
             ]
         }
-        resource, fmt = select_resource(ds)
+        resource, _fmt = select_resource(ds)
         assert resource["url"] == "https://x/fresh.zip"
 
     def test_falls_back_to_netex_fr_when_no_gtfs(self):

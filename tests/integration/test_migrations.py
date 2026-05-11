@@ -14,11 +14,11 @@ from __future__ import annotations
 import os
 
 import pytest
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 
 from alembic import command
-from alembic.config import Config
 
 REQUIRED_TABLES = {
     "users",

@@ -47,9 +47,9 @@ def test_routing_defaults_include_access_egress_bound():
     assert access_egress is not None, "routingDefaults must declare accessEgress (OTP 2.9 schema)"
     bounds = access_egress.get("maxDurationForMode")
     assert bounds is not None, "accessEgress must include maxDurationForMode bound"
-    assert (
-        bounds.get("walk") == "20m"
-    ), "walk bound is the safety net against silent truncation (lowercase per OTP 2.9)"
+    assert bounds.get("walk") == "20m", (
+        "walk bound is the safety net against silent truncation (lowercase per OTP 2.9)"
+    )
 
 
 def test_provider_without_gtfs_rt_emits_no_updater():

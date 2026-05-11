@@ -19,12 +19,12 @@ from __future__ import annotations
 import os
 
 import pytest
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import OperationalError
 
 from alembic import command
-from alembic.config import Config
 
 
 def _postgres_or_skip() -> str:
