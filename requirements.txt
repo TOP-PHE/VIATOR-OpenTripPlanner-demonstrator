@@ -12,7 +12,7 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1                   # passlib 1.7.4 needs bcrypt < 4.1
 slowapi==0.1.9
 email-validator==2.3.0          # required by pydantic EmailStr
-aiosmtplib==3.0.2               # used for SMTP delivery in step 4
+aiosmtplib==5.1.0               # used for SMTP delivery in step 4
 httpx==0.28.1                   # async HTTP for Trainline pull + OTP fanout
 apscheduler==3.11.2             # in-process scheduler for retention + master-data refresh crons
 structlog==24.4.0               # JSON structured logging — config in app/logging_config.py; bridges stdlib logging + uvicorn/SQLAlchemy/APScheduler emitters into a single JSON stream
