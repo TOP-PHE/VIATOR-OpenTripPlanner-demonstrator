@@ -29,7 +29,7 @@ CSV_HEADER = (
 def _row(uic="8011160", **overrides):
     """Build one CSV row with sane defaults; overrides keyed by column name."""
     cols = [c.strip() for c in CSV_HEADER.split(";")]
-    values = {c: "" for c in cols}
+    values = dict.fromkeys(cols, "")
     values.update(
         {
             "id": "1",
@@ -108,9 +108,9 @@ def test_no_other_codes_means_no_key():
     """Stations with only dedicated codes shouldn't carry an empty other_codes
     key — the DB column has a server_default of '{}' that we let take over."""
     row = _parse_one(sncf_id="FRPNO")
-    assert (
-        "other_codes" not in row
-    ), "row should not include an empty other_codes dict — let the DB default fire"
+    assert "other_codes" not in row, (
+        "row should not include an empty other_codes dict — let the DB default fire"
+    )
 
 
 def test_iata_airport_code_when_present():

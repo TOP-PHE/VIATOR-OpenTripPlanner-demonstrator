@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     # Phase-1 upload UI (HTTP basic auth — kept until journey UI lands)
     admin_user: str = "admin"
-    admin_password: str = "admin"
+    admin_password: str = "admin"  # noqa: S105 — pydantic-settings default; operator MUST override via .env in prod
     max_upload_mb: int = 2048
     debounce_seconds: int = 1800
     # v0.1.32 — default bumped 12g → 24g. The 12g default fit when VIATOR
@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     otp_build_heap: str = "24g"
 
     # JWT-based auth (step 3+)
-    jwt_secret: str = "change-me-in-prod-use-32-bytes-random"
+    jwt_secret: str = "change-me-in-prod-use-32-bytes-random"  # noqa: S105 — placeholder default; .env JWT_SECRET MUST override in any non-dev environment
     jwt_alg: str = "HS256"
     jwt_ttl_seconds: int = 12 * 3600  # 12 h
     jwt_cookie_name: str = "viator_jwt"

@@ -47,9 +47,9 @@ def test_default_excludes_osm_from_provider_refresh():
 
     tasks = _build_refresh_tasks(_config_with_provider_and_osm())
     kinds = [t[1] for t in tasks]
-    assert (
-        "OSM-PBF" not in kinds
-    ), "include_osm defaults to False — OSM must NOT be in the provider-refresh task list"
+    assert "OSM-PBF" not in kinds, (
+        "include_osm defaults to False — OSM must NOT be in the provider-refresh task list"
+    )
     # And the SNCF provider task is still present (otherwise we've over-corrected).
     assert "GTFS" in kinds
 
@@ -74,9 +74,9 @@ def test_per_provider_refresh_ignores_include_osm():
         include_osm=True,
     )
     kinds = [t[1] for t in tasks]
-    assert (
-        "OSM-PBF" not in kinds
-    ), "per-provider refresh must never include OSM regardless of include_osm"
+    assert "OSM-PBF" not in kinds, (
+        "per-provider refresh must never include OSM regardless of include_osm"
+    )
     assert "GTFS" in kinds
 
 

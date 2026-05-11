@@ -93,8 +93,7 @@ def _derive_key(jwt_secret: str | bytes) -> bytes:
         jwt_secret = jwt_secret.encode("utf-8")
     if not jwt_secret:
         raise ValueError(
-            "JWT_SECRET is empty. Set it in .env before using credentials. "
-            "See docker/.env.example."
+            "JWT_SECRET is empty. Set it in .env before using credentials. See docker/.env.example."
         )
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
@@ -175,7 +174,7 @@ def validate_param_name(auth_type: AuthType, raw: str | None) -> str | None:
         )
     if not needs_name and name:
         raise ValueError(
-            f"auth_type={auth_type!r} must not set param_name " f"(only used for query / header)"
+            f"auth_type={auth_type!r} must not set param_name (only used for query / header)"
         )
     if name is not None and len(name) > 80:
         raise ValueError("param_name longer than 80 chars")
