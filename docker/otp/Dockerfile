@@ -65,19 +65,18 @@ USER appuser:appuser
 EXPOSE 8080
 
 # Audit-2026-05 P1 #8 — readiness signal for per-session OTP serve containers.
+# Audit-2026-05 #32 (PR #32) — moved the HEALTHCHECK to the per-session
+# generated compose fragment (app/sessions_orchestrator.py
+# `_OTP_SVC_TEMPLATE`). The hardcoded `--start-period=120s` here was too
+# tight for graphs that take >2 min to do their Raptor mapping — the OTP
+# serve container would be marked unhealthy mid-startup, killed by the
+# orchestration, restarted, never finish, repeat. Surfaced 2026-05-11 on
+# nap-fr-rail with SBB included. The new location lets the operator size
+# start_period per session via the admin UI.
 #
-# OTP loads the graph into JVM memory at startup; for France-wide graphs that
-# can take 90+ seconds. A 120s start-period covers most graph sizes; for
-# 10-country EU merges (per admin-guide §6.7) it may need to be bumped per-
-# session via a compose override. After startup, `/otp/` returns the OTP
-# index page (HTTP 200) and is the cheapest is-it-up check.
-#
-# This HEALTHCHECK applies to both the build-only `otp-build` service and
-# the long-running `otp-<sid>` per-session services. For build-only, the
-# container exits before any healthcheck runs, so the directive has no
-# effect. For serve, it lets compose / orchestrators distinguish "JVM
-# warming" from "ready to route".
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl -fsS http://localhost:8080/otp/ || exit 1
+# Build-only invocations of this image (`docker compose run --rm otp-build`)
+# never see a healthcheck because the container exits before docker would
+# evaluate one, so dropping the directive here is safe — build semantics
+# are unchanged.
 
 ENTRYPOINT ["/opt/otp/entrypoint.sh"]

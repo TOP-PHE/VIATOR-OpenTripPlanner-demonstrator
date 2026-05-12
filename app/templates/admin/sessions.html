@@ -231,6 +231,33 @@
                 multi-NAP sessions. If the build OOM-kills at "Linking transit stops" Phase 2,
                 that's the signal to bump.
               </p>
+
+              {# PR #32 — per-session healthcheck start_period. The docker
+                 Dockerfile previously baked --start-period=120s, which restart-
+                 looped the OTP serve container on graphs that take >2 min to
+                 load + do Raptor mapping (surfaced 2026-05-11 with nap-fr-rail
+                 + SBB at 4 min Raptor). Operators size this on the same screen
+                 as the heap so big-graph sessions don't trip the watchdog. #}
+              <label for="otp_serve_start_period" style="margin-top: 0.8rem">
+                OTP serve startup grace
+                <span class="hint">(healthcheck <code>start_period</code> — how long the JVM has to load + Raptor-map before unhealthy probes count)</span>
+              </label>
+              <select id="otp_serve_start_period" name="otp_serve_start_period">
+                <option value="" selected>Default (5 min — recommended)</option>
+                <option value="120">2 min — IDF / single-region</option>
+                <option value="180">3 min — France regional (1-2 NAPs)</option>
+                <option value="300">5 min — France-wide multi-NAP (recommended)</option>
+                <option value="480">8 min — Europe-wide rail-focused</option>
+                <option value="600">10 min — Europe-wide multi-modal</option>
+                <option value="900">15 min — last-resort cap</option>
+              </select>
+              <p class="hint" style="margin-top: 0.25rem">
+                If the serve container restart-loops with the log line stopping at
+                <code>RaptorTransitDataMapper... Mapping raptorTransitData from
+                TimetableRepository...</code>, the JVM is being killed by the healthcheck
+                before it can finish — bump this. A safe upper bound is your typical graph
+                load time + 2-3 min headroom.
+              </p>
               {# v0.1.24 — per-session OTP API processing timeout. Caps how
                  long a single journey-search request can run. Default 30s;
                  bump to 60s/120s for multi-NAP graphs that timed out at
@@ -625,6 +652,13 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // see the new default until they explicitly save.
       if (cf.elements['otp_api_timeout']) {
         cf.elements['otp_api_timeout'].value = cfg.otp_api_timeout || '30s';
+      }
+      // PR #32: per-session OTP serve healthcheck start_period.
+      // Empty value lets the orchestrator default (300s) kick in;
+      // legacy sessions see the new default until they explicitly save.
+      if (cf.elements['otp_serve_start_period']) {
+        cf.elements['otp_serve_start_period'].value =
+          cfg.otp_serve_start_period != null ? String(cfg.otp_serve_start_period) : '';
       }
       // v0.1.32 — wire scope/heap watchers so the warning surfaces if
       // the operator picks rail-focused with insufficient heap. Same
@@ -1165,6 +1199,15 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // v0.1.24: same for the OTP API timeout.
     const otpApiTimeout = (form.elements['otp_api_timeout']?.value || '').trim();
     if (otpApiTimeout) cfg.otp_api_timeout = otpApiTimeout;
+    // PR #32: per-session OTP serve healthcheck start_period (int seconds).
+    // Empty value = use orchestrator default (300s).
+    const otpStartPeriod = (form.elements['otp_serve_start_period']?.value || '').trim();
+    if (otpStartPeriod) {
+      const n = parseInt(otpStartPeriod, 10);
+      if (Number.isFinite(n) && n > 0) cfg.otp_serve_start_period = n;
+    } else {
+      delete cfg.otp_serve_start_period;
+    }
     // Drop legacy top-level gtfs/mct/stations once we've migrated to providers.
     if (providers.length) {
       delete cfg.sources.gtfs;
