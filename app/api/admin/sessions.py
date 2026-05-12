@@ -40,7 +40,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from ... import audit, detect, ingestion, sessions_orchestrator, staleness
+from ... import audit, detect, inbox_sweep, ingestion, sessions_orchestrator, staleness
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
@@ -761,6 +761,11 @@ def _reconstruct_dispatch_target(sid: str, kind: str, filename: str) -> Path:
 class RefreshSourcesResponse(BaseModel):
     fetched: list[dict[str, Any]]
     skipped: list[dict[str, Any]]
+    # PR #33: filenames renamed to `.orphaned` because their provider was
+    # removed from the session config but the inbox file lingered. Surfaced
+    # to the operator so they can verify the build picks up only the
+    # currently-configured providers.
+    orphaned: list[str] = []
 
 
 # v0.1.19 — per-provider fetch status, surfaced on the provider cards in the
@@ -851,6 +856,15 @@ async def refresh_sources(
         staleness.mark_refresh_completed(s.config)
         flag_modified(s, "config")
 
+    # PR #33 — sweep orphaned inbox files left behind by providers that
+    # used to be in `sources.providers` but no longer are. Without this,
+    # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
+    # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
+    # — operator thinks they removed BrittanyFerries, build still fails
+    # on BrittanyFerries' data. Surfaced 2026-05-11.
+    expected = inbox_sweep.expected_provider_filenames(s.config or {})
+    orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
+
     audit.record(
         db,
         action="session.sources.refreshed",
@@ -862,10 +876,11 @@ async def refresh_sources(
             "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
             "fetched": [f["key"] for f in fetched],
             "skipped": [s_["key"] for s_ in skipped],
+            "orphaned": orphaned,  # PR #33
         },
     )
     db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+    return RefreshSourcesResponse(fetched=fetched, skipped=skipped, orphaned=orphaned)
 
 
 # ──── OSM-only refresh (v0.1.14) ────
