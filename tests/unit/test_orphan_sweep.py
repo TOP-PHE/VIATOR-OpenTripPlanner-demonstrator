@@ -239,19 +239,20 @@ def test_sweep_handles_completely_missing_inbox(tmp_path):
 def test_sweep_continues_on_individual_rename_failure(monkeypatch, tmp_path):
     """One stuck file (locked, perm-denied, race) shouldn't abort the
     whole sweep — log and continue. Tested by patching Path.rename
-    to throw OSError on the second file only."""
+    to throw OSError on a specific named file (NOT on an Nth-call basis,
+    because Path.iterdir() order differs between OSes — alphabetical
+    on Windows NTFS but inode-order on Linux ext4)."""
     inbox = _make_session_inbox(
         tmp_path,
         gtfs_files=["orphan_a.zip", "orphan_b.zip", "orphan_c.zip"],
     )
 
-    # Track call count; fail on the second rename
-    state = {"count": 0}
+    # Fail specifically when orphan_b.zip is the source — works regardless
+    # of iteration order.
     real_rename = Path.rename
 
     def flaky_rename(self, target):
-        state["count"] += 1
-        if state["count"] == 2:
+        if self.name == "orphan_b.zip":
             raise OSError("simulated EACCES on orphan_b")
         return real_rename(self, target)
 
@@ -265,6 +266,7 @@ def test_sweep_continues_on_individual_rename_failure(monkeypatch, tmp_path):
     # Files A and C got renamed, B stayed unchanged
     assert (inbox / "gtfs" / "orphan_a.zip.orphaned").exists()
     assert (inbox / "gtfs" / "orphan_b.zip").exists()
+    assert not (inbox / "gtfs" / "orphan_b.zip.orphaned").exists()
     assert (inbox / "gtfs" / "orphan_c.zip.orphaned").exists()
 
 
