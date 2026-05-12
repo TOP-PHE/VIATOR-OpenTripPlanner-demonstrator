@@ -658,7 +658,7 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // legacy sessions see the new default until they explicitly save.
       if (cf.elements['otp_serve_start_period']) {
         cf.elements['otp_serve_start_period'].value =
-          cfg.otp_serve_start_period != null ? String(cfg.otp_serve_start_period) : '';
+          cfg.otp_serve_start_period == null ? '' : String(cfg.otp_serve_start_period);
       }
       // v0.1.32 — wire scope/heap watchers so the warning surfaces if
       // the operator picks rail-focused with insufficient heap. Same
@@ -1203,7 +1203,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // Empty value = use orchestrator default (300s).
     const otpStartPeriod = (form.elements['otp_serve_start_period']?.value || '').trim();
     if (otpStartPeriod) {
-      const n = parseInt(otpStartPeriod, 10);
+      const n = Number.parseInt(otpStartPeriod, 10);
       if (Number.isFinite(n) && n > 0) cfg.otp_serve_start_period = n;
     } else {
       delete cfg.otp_serve_start_period;
