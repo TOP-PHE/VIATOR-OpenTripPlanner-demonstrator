@@ -35,6 +35,15 @@ services:
 # NB: braces in env-var defaults need to be doubled in this Python format
 # string so str.format leaves them as `${VIATOR_VERSION:-latest}` literally
 # rather than interpreting them as a format spec.
+#
+# PR #32 (audit row #32): the `healthcheck` block is rendered per-session
+# so operators can pick a `start_period` matching their graph's actual
+# load-time. The pre-PR-#32 baked HEALTHCHECK in docker/otp/Dockerfile
+# was hardcoded to 120s, which restart-loops the container on graphs
+# that take >2 min to do their Raptor mapping (which is most multi-NAP
+# or Europe-wide sessions — surfaced 2026-05-11 on nap-fr-rail with SBB).
+# The Dockerfile's HEALTHCHECK directive is now dropped; this fragment
+# owns it.
 _OTP_SVC_TEMPLATE = """  otp-{sid}:
     image: ghcr.io/top-phe/viator-otp:${{VIATOR_VERSION:-latest}}
     build:
@@ -56,6 +65,16 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
       # with `current` symlinks (relative — see app/worker.py). The otp
       # serving container reads the same files via /var/otp/graph/<sid>/.
       - graphs:/var/otp/graph:ro
+    healthcheck:
+      # `start_period` is the grace window during which a failing
+      # /otp/ probe doesn't count as unhealthy. The default 300s (5 min)
+      # is comfortable for France-wide multi-NAP sessions; operators with
+      # bigger graphs override via session.config.otp_serve_start_period.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/otp/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: {start_period}s
+      retries: 3
     labels:
       viator.session_id: "{sid}"
       viator.category: "{category}"
@@ -80,6 +99,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
     the web container's _startup hook overwrites the bootstrap stub.
     """
     from . import otp_heap as _otp_heap
+    from . import otp_start_period as _otp_start_period
 
     services = "".join(
         _OTP_SVC_TEMPLATE.format(
@@ -94,6 +114,13 @@ def render_compose(sessions: list[SessionRow]) -> str:
             # arc that closed in v0.1.32.21).
             heap=(s.config or {}).get("otp_heap")
             or _otp_heap.default_serve_heap_for_build((s.config or {}).get("otp_build_heap")),
+            # Healthcheck start_period: explicit operator choice if set,
+            # otherwise 300s (5 min) — covers most graphs while keeping
+            # genuinely-stuck JVMs visible quickly. PR #32 fix for the
+            # 2026-05-11 restart-loop on nap-fr-rail with SBB included.
+            start_period=_otp_start_period.validate_start_period(
+                (s.config or {}).get("otp_serve_start_period")
+            ),
             category=s.category,
         )
         for s in sessions
