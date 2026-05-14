@@ -44,6 +44,21 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "FANOUT_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
     "FANOUT_PARTIAL_OK": {"type": "bool", "default": True},
     "STORE_RAW_RESPONSE": {"type": "bool", "default": True},
+    # ── Swiss OJP reference comparison ────────────────────────────────
+    # Opt-in journey-search comparison against an external reference OJP
+    # endpoint (opentransportdata.swiss OJP 2.0). See
+    # docs/ojp-reference-comparison-design.md. The feature stays dormant
+    # until OJP_COMPARISON_ENABLED is true AND OJP_API_TOKEN is set — the
+    # journey-UI toggle is hidden otherwise. The token is a platform-level
+    # secret, stored here like SMTP_PASS (not in the per-provider
+    # credential vault — it's not a provider feed credential).
+    "OJP_COMPARISON_ENABLED": {"type": "bool", "default": False},
+    "OJP_API_ENDPOINT": {
+        "type": "str",
+        "default": "https://api.opentransportdata.swiss/ojp20",
+    },
+    "OJP_API_TOKEN": {"type": "secret", "default": "", "sensitive": True},
+    "OJP_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
     # ── Master data refresh ───────────────────────────────────────────
     "MASTER_STATIONS_REFRESH_DAYS": {"type": "int", "default": 30, "min": 1, "max": 365},
     "MASTER_CARRIERS_REFRESH_DAYS": {"type": "int", "default": 90, "min": 1, "max": 365},
