@@ -34,6 +34,10 @@ const SECTIONS = [
     extra: '<button type="button" id="smtp-test-btn" class="secondary">Send test email…</button>' },
   { title: 'Concurrency / server protection', keys: ['MAX_CONCURRENT_JOURNEYS','MAX_CONCURRENT_REBUILDS','MAX_CONCURRENT_UPLOADS','JOURNEY_TIMEOUT_MS'] },
   { title: 'Fanout', keys: ['FANOUT_TIMEOUT_MS','FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE'] },
+  // Swiss OJP reference comparison — paste the bearer token from
+  // dev-dashboard.opentransportdata.swiss into OJP_API_TOKEN. The feature
+  // stays off until OJP_COMPARISON_ENABLED is ticked AND a token is set.
+  { title: 'Swiss OJP comparison', keys: ['OJP_COMPARISON_ENABLED','OJP_API_ENDPOINT','OJP_API_TOKEN','OJP_TIMEOUT_MS'] },
   { title: 'Master data refresh', keys: ['MASTER_STATIONS_REFRESH_DAYS','MASTER_CARRIERS_REFRESH_DAYS'] },
   // v0.1.11: previously hardcoded / .env-only.
   // REBUILD_DEBOUNCE_SECONDS=0 means "rebuild starts on click" (demo).
@@ -43,8 +47,8 @@ const SECTIONS = [
   { title: 'Retention',      keys: ['AUDIT_RETENTION_DAYS','JOURNEY_SEARCH_RETENTION_DAYS','JOURNEY_TRIPS_RETENTION_DAYS','JOURNEY_RAW_RESPONSE_RETENTION_DAYS'] },
 ];
 
-const SECRETS = new Set(['SMTP_PASS']);
-const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN']);
+const SECRETS = new Set(['SMTP_PASS','OJP_API_TOKEN']);
+const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN','OJP_COMPARISON_ENABLED']);
 const CHOICES = { SMTP_SECURE: ['none','starttls','tls'], REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'] };
 
 const toast = document.getElementById('toast');

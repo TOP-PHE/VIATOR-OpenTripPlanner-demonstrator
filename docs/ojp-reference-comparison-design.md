@@ -248,7 +248,7 @@ plain string, or (ii) seed a non-serving `ojp-reference` sessions row.
 | Concern | Handling |
 |---|---|
 | **50 req/min, 20K/day** | Opt-in per search makes this a non-issue for human operators (nobody ticks-and-searches 50×/min). The toggle being **unchecked by default** is the rate-limit safety design — do **not** auto-fire it on every fanout. |
-| **Latency** | Reference call gets its own timeout (proposal: reuse `FANOUT_TIMEOUT_MS`, or a dedicated `OJP_REFERENCE_TIMEOUT_MS`). On timeout, the reference panel shows "timed out"; VIATOR results render normally. |
+| **Latency** | Reference call gets its own timeout — `OJP_TIMEOUT_MS` (§7), default 10 s. On timeout, the reference panel shows "timed out"; VIATOR results render normally. |
 | **Endpoint down / 5xx** | Same — reference source reports `error`, VIATOR unaffected. Never blocks or fails the operator's actual search. |
 | **Rate-limit hit (429)** | Surface a specific "reference rate-limited — try again shortly" message rather than a generic error. Consider a short server-side cooldown. |
 | **Burst protection** | The existing `concurrency` semaphores already gate journey calls; the reference call participates in the same budget. |
@@ -257,20 +257,31 @@ plain string, or (ii) seed a non-serving `ojp-reference` sessions row.
 
 ## 7. Configuration & credentials
 
-Two existing VIATOR mechanisms, no new infrastructure:
+All of it goes through VIATOR's existing schema-driven platform config
+([app/config_schema.py](../app/config_schema.py) → `config_service` →
+the `/config` admin page) — no new infrastructure, no new storage, no
+new API. **Shipped ahead of the rest of the feature** (it's independent
+of the adapter and lets the operator stage the token safely instead of
+pasting it around):
 
-- **Platform feature toggle** — a `OJP_COMPARISON_ENABLED` boolean in
-  platform config ([app/config_schema.py](../app/config_schema.py) /
-  `config_service`, surfaced on the `/config` admin page). When off,
-  the UI toggle and the API branch don't exist. Off by default.
-- **The OJP bearer token** — stored in the existing credential vault
-  (`app/credentials.py`, the `/credentials` admin page), the same place
-  provider feed tokens live. The fanout reads it by id when
-  `compare_ojp` is set. Never in `.env`, never in session config plain.
+| Config key | Type | Default | Purpose |
+|---|---|---|---|
+| `OJP_COMPARISON_ENABLED` | bool | `false` | Feature toggle. While off, the journey-UI checkbox and the fanout branch don't exist. |
+| `OJP_API_ENDPOINT` | str | `https://api.opentransportdata.swiss/ojp20` | The reference OJP 2.0 endpoint. |
+| `OJP_API_TOKEN` | **secret** | `""` | The bearer token. A `secret` field — masked in GET responses with the `********` sentinel, never in audit metadata. Exactly the `SMTP_PASS` precedent: a *platform-level* secret, so it lives in `CONFIG_SCHEMA` — **not** the per-provider credential vault, which is for provider *feed* credentials referenced by `credential_id`. |
+| `OJP_TIMEOUT_MS` | int | `10000` | Timeout for the reference call (bounded 1000–60000). |
+
+These render under a **"Swiss OJP comparison"** section on `/config`
+automatically — the page is schema-driven (the section is registered
+in `config.html`'s `SECTIONS`/`SECRETS`/`BOOLS` arrays). The feature
+stays dormant until `OJP_COMPARISON_ENABLED` is `true` **and**
+`OJP_API_TOKEN` is non-empty.
 
 Optional later: a per-session "default this session's searches to
 include the OJP comparison" flag — but per-search opt-in is the
-Phase-1 model.
+Phase-1 model. A "Test connection" button on the config section (like
+the existing SMTP test) is a natural Phase-1 add once the adapter
+exists.
 
 ---
 
