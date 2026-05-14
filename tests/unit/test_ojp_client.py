@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import xml.etree.ElementTree as ET  # noqa: S405 — test-local parsing of our own fixtures
+import pytest
+from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 from app.journey.ojp_client import (
     _build_trip_request,
@@ -87,8 +88,9 @@ class TestSmallHelpers:
         assert _int_or_zero("two") == 0
 
     def test_float_or_none(self):
-        assert _float_or_none("24873.63") == 24873.63
-        assert _float_or_none(" 0 ") == 0.0
+        # pytest.approx — SonarCloud S1244: no bare == on floats.
+        assert _float_or_none("24873.63") == pytest.approx(24873.63)
+        assert _float_or_none(" 0 ") == pytest.approx(0.0)
         assert _float_or_none(None) is None
         assert _float_or_none("") is None
         assert _float_or_none("nope") is None
@@ -118,21 +120,21 @@ class TestReferenceDeparture:
 
 class TestBuildTripRequest:
     def _build(self, **kw):
-        defaults = dict(
-            from_lat=46.948832,
-            from_lon=7.439122,
-            to_lat=47.378177,
-            to_lon=8.540192,
-            when=datetime(2026, 5, 18, 8, 0, 0, tzinfo=UTC),
-            from_name="Bern",
-            to_name="Zürich HB",
-            num_results=5,
-        )
+        defaults = {
+            "from_lat": 46.948832,
+            "from_lon": 7.439122,
+            "to_lat": 47.378177,
+            "to_lon": 8.540192,
+            "when": datetime(2026, 5, 18, 8, 0, 0, tzinfo=UTC),
+            "from_name": "Bern",
+            "to_name": "Zürich HB",
+            "num_results": 5,
+        }
         defaults.update(kw)
         return _build_trip_request(**defaults)
 
     def test_is_well_formed_xml(self):
-        ET.fromstring(self._build())  # raises on malformed
+        _xml_fromstring(self._build())  # raises on malformed
 
     def test_carries_coordinates(self):
         xml = self._build()
@@ -143,7 +145,7 @@ class TestBuildTripRequest:
         xml = self._build(from_name="A <b> & 'c'", to_name="Zürich HB")
         # The raw '<' must not appear unescaped inside the Name text.
         assert "&lt;b&gt;" in xml and "&amp;" in xml
-        ET.fromstring(xml)  # still well-formed
+        _xml_fromstring(xml)  # still well-formed
 
     def test_missing_names_get_defaults(self):
         xml = self._build(from_name=None, to_name=None)
@@ -235,14 +237,15 @@ class TestNormalise:
         walk = _normalise(_OJP_RESPONSE)[0]["legs"][0]
         assert walk["mode"] == "WALK"
         assert walk["duration_seconds"] == 300
-        assert walk["distance_meters"] == 221.0
+        # pytest.approx on every float field — SonarCloud S1244.
+        assert walk["distance_meters"] == pytest.approx(221.0)
         assert walk["from_name"] == "Bern"
         # LegStart carried an inline GeoPosition.
-        assert walk["from_lat"] == 46.94884
-        assert walk["from_lon"] == 7.43912
+        assert walk["from_lat"] == pytest.approx(46.94884)
+        assert walk["from_lon"] == pytest.approx(7.43912)
         # LegEnd was a StopPointRef — name resolved, coords via Places.
         assert walk["to_name"] == "Bern"
-        assert walk["to_lat"] == 46.94864
+        assert walk["to_lat"] == pytest.approx(46.94864)
         assert walk["feed_id"] == "OJP"
 
     def test_timed_leg(self):
@@ -254,7 +257,7 @@ class TestNormalise:
         assert rail["from_name"] == "Bern"
         assert rail["from_stop_id"] == "ch:1:sloid:7000:4:8"
         assert rail["to_name"] == "Zürich HB"
-        assert rail["to_lat"] == 47.37852  # resolved via Places dict
+        assert rail["to_lat"] == pytest.approx(47.37852)  # resolved via Places dict
         assert rail["route_short_name"] == "IC1"  # PublishedServiceName
         assert rail["route_long_name"] == "InterCity"  # ProductCategory
         assert rail["route_id"] == "ojp:91001:D"  # siri:LineRef
@@ -270,7 +273,7 @@ class TestNormalise:
         assert transfer["duration_seconds"] == 180  # PT3M
         assert transfer["from_name"] == "Aarau"
         # StopPlaceRef "8502113" resolved via the Places dictionary.
-        assert transfer["from_lat"] == 47.39125
+        assert transfer["from_lat"] == pytest.approx(47.39125)
 
     def test_empty_and_malformed_degrade_to_empty_list(self):
         assert _normalise("") == []

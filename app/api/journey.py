@@ -288,11 +288,7 @@ async def fanout(
             # calls; awaited after. Only when the operator opted in AND
             # the platform has the feature enabled with a token set.
             ojp_task: asyncio.Task[dict[str, Any]] | None = None
-            if (
-                body.compare_ojp
-                and cfg.get("OJP_COMPARISON_ENABLED")
-                and cfg.get("OJP_API_TOKEN")
-            ):
+            if body.compare_ojp and cfg.get("OJP_COMPARISON_ENABLED") and cfg.get("OJP_API_TOKEN"):
                 ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
 
             results = await asyncio.gather(

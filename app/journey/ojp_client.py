@@ -28,22 +28,32 @@ from __future__ import annotations
 
 import logging
 import re
-import xml.etree.ElementTree as ET  # noqa: S405 — parsing our own request to a known API, not untrusted input
+import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from typing import Any
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 log = logging.getLogger(__name__)
 
 # OJP 2.0 namespaces. The default namespace carries the OJP elements;
 # the `siri:` prefix carries the SIRI-borrowed ones (StopPointRef, the
 # timestamp elements, OperatorRef, …). ElementTree needs the full URIs.
+#
+# `xml.etree.ElementTree` is imported only for the `Element` *type* and
+# for navigating already-parsed trees (`.find` / `.iter` — safe). The
+# one place untrusted bytes are *parsed* uses `defusedxml`'s hardened
+# `fromstring` (see `_normalise`) — stdlib parsing is XXE-vulnerable.
 _OJP = "http://www.vdv.de/ojp"
 _SIRI = "http://www.siri.org.uk/siri"
 _NS = {"ojp": _OJP, "siri": _SIRI}
+
+# `siri:StopPointRef` is pulled from several leg sub-elements; the
+# literal lives here once (SonarCloud S1192).
+_STOP_POINT_REF = "siri:StopPointRef"
 
 # The Swiss OJP endpoint interprets a bare DepArrTime as local Swiss
 # time. The journey UI's datetime-local input is naive (no offset), so a
@@ -214,9 +224,12 @@ def _normalise(xml_text: str) -> list[dict[str, Any]]:
     rather than raising.
     """
     try:
-        root = ET.fromstring(xml_text)  # noqa: S314 — response from a known API over TLS
-    except ET.ParseError:
-        log.warning("OJP response did not parse as XML (%d bytes)", len(xml_text))
+        root = _xml_fromstring(xml_text)
+    except (ET.ParseError, ValueError):
+        # ET.ParseError → malformed XML. defusedxml raises ValueError
+        # subclasses (EntitiesForbidden, …) if the payload attempts an
+        # XML attack — either way there are no usable trips.
+        log.warning("OJP response did not parse as safe XML (%d bytes)", len(xml_text))
         return []
 
     places = _index_places(root)
@@ -264,8 +277,16 @@ def _index_places(root: ET.Element) -> dict[str, dict[str, Any]]:
     for place in root.iter(f"{{{_OJP}}}Place"):
         name = place.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
         geo = place.find("ojp:GeoPosition", _NS)
-        lat = _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS)) if geo is not None else None
-        lon = _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS)) if geo is not None else None
+        lat = (
+            _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS))
+            if geo is not None
+            else None
+        )
+        lon = (
+            _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS))
+            if geo is not None
+            else None
+        )
         # A Place is one of StopPlace / StopPoint / TopographicPlace; the
         # first two carry the refs the legs use.
         for ref in (
@@ -277,9 +298,7 @@ def _index_places(root: ET.Element) -> dict[str, dict[str, Any]]:
     return index
 
 
-def _normalise_leg(
-    leg: ET.Element, places: dict[str, dict[str, Any]]
-) -> dict[str, Any] | None:
+def _normalise_leg(leg: ET.Element, places: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     """Normalise one `<Leg>` — a Leg wraps exactly one of ContinuousLeg /
     TimedLeg / TransferLeg."""
     leg_duration = _iso_duration_to_seconds(
@@ -342,28 +361,24 @@ def _normalise_timed_leg(
     svc = timed.find("ojp:Service", _NS)
 
     if board is not None:
-        ref = board.findtext("siri:StopPointRef", namespaces=_NS)
+        ref = board.findtext(_STOP_POINT_REF, namespaces=_NS)
         out["from_stop_id"] = ref
         out["from_name"] = board.findtext(
             "ojp:StopPointName/ojp:Text", default=None, namespaces=_NS
         ) or _place_name(places, ref)
         out["from_lat"], out["from_lon"] = _place_coords(places, ref)
         out["departure"] = _iso_to_utc_iso(
-            board.findtext(
-                "ojp:ServiceDeparture/ojp:TimetabledTime", default="", namespaces=_NS
-            )
+            board.findtext("ojp:ServiceDeparture/ojp:TimetabledTime", default="", namespaces=_NS)
         )
     if alight is not None:
-        ref = alight.findtext("siri:StopPointRef", namespaces=_NS)
+        ref = alight.findtext(_STOP_POINT_REF, namespaces=_NS)
         out["to_stop_id"] = ref
         out["to_name"] = alight.findtext(
             "ojp:StopPointName/ojp:Text", default=None, namespaces=_NS
         ) or _place_name(places, ref)
         out["to_lat"], out["to_lon"] = _place_coords(places, ref)
         out["arrival"] = _iso_to_utc_iso(
-            alight.findtext(
-                "ojp:ServiceArrival/ojp:TimetabledTime", default="", namespaces=_NS
-            )
+            alight.findtext("ojp:ServiceArrival/ojp:TimetabledTime", default="", namespaces=_NS)
         )
     if svc is not None:
         # PtMode is the canonical mode ("rail" / "bus" / "tram" …) — upper
@@ -424,7 +439,7 @@ def _leg_endpoint(
     """A LegStart/LegEnd is either an inline GeoPosition or a StopPointRef
     resolved via the Places dictionary. Returns (name, lat, lon, stop_ref)."""
     name = el.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
-    ref = el.findtext("siri:StopPointRef", default=None, namespaces=_NS)
+    ref = el.findtext(_STOP_POINT_REF, default=None, namespaces=_NS)
     geo = el.find("ojp:GeoPosition", _NS)
     if geo is not None:
         return (
@@ -462,15 +477,15 @@ def _iso_duration_to_seconds(value: str | None) -> int:
     m = _ISO_DURATION.match(value.strip())
     if not m:
         return 0
-    years, months, weeks, days, hours, minutes, seconds = m.groups()
+    # Years / months (groups 1–2) are calendar-ambiguous and never
+    # appear in a trip/leg duration — ignored rather than guessed.
+    _, _, weeks, days, hours, minutes, seconds = m.groups()
     total = 0.0
     total += int(days or 0) * 86400
     total += int(weeks or 0) * 604800
     total += int(hours or 0) * 3600
     total += int(minutes or 0) * 60
     total += float(seconds or 0)
-    # Years / months are calendar-ambiguous and never appear in a trip
-    # duration; ignore them rather than guess a length.
     return int(total)
 
 
