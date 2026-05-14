@@ -8,12 +8,34 @@ the response into the canonical 'trip' dicts our recorder expects.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Stop ids are `<feedId>:<localId>` — feedId matches OTP's
+# ^[A-Z][A-Z0-9_-]{1,15}$ and localId is GTFS-ish (alphanumerics plus
+# :_.- ). Anything outside that set in a value we're about to log is
+# stripped: the `uic` half originates from the journey request body, so
+# logging it raw would let a caller forge log lines via newline
+# injection (SonarCloud pythonsecurity:S5145).
+_LOG_TOKEN_DISALLOWED = re.compile(r"[^A-Za-z0-9:_.\-]")
+
+
+def _safe_log_token(value: str | None) -> str:
+    """Sanitise a user-influenced stop_id for safe logging.
+
+    Returns '-' for empty/None, otherwise the value with any character
+    outside the stop_id charset replaced by '?' and truncated to 64
+    chars. Neutralises log-forging without losing the diagnostic value
+    of seeing which feed/UIC pairing OTP rejected.
+    """
+    if not value:
+        return "-"
+    return _LOG_TOKEN_DISALLOWED.sub("?", value)[:64]
 
 
 # Minimal GraphQL query — the real query at step 14 will be richer.
@@ -198,8 +220,8 @@ async def fetch_plan(
                 "session=%s stop-id plan returned LOCATION_NOT_FOUND "
                 "(from_stop_id=%s to_stop_id=%s) — retrying with lat/lon",
                 session_id,
-                from_stop_id,
-                to_stop_id,
+                _safe_log_token(from_stop_id),
+                _safe_log_token(to_stop_id),
             )
             r = await c.post(url, json=_payload(use_stop_ids=False))
             r.raise_for_status()

@@ -163,3 +163,37 @@ class TestLocationNotFound:
             }
         }
         assert _location_not_found(raw) is True
+
+
+# ─────────────────── _safe_log_token ───────────────────
+
+
+class TestSafeLogToken:
+    def test_empty_and_none(self):
+        from app.journey.otp_client import _safe_log_token
+
+        assert _safe_log_token(None) == "-"
+        assert _safe_log_token("") == "-"
+
+    def test_clean_stop_id_passes_through(self):
+        from app.journey.otp_client import _safe_log_token
+
+        # A well-formed stop_id is all in-charset — unchanged.
+        assert _safe_log_token("SBB:8771500") == "SBB:8771500"
+        assert _safe_log_token("SNCF:OCETrain-87271007") == "SNCF:OCETrain-87271007"
+
+    def test_strips_newlines_and_control_chars(self):
+        from app.journey.otp_client import _safe_log_token
+
+        # The whole point: a caller-supplied uic carrying a newline must
+        # not be able to forge a second log line. Newlines, CR, tabs and
+        # other injection vectors collapse to '?'.
+        forged = "SBB:8771500\nINFO fake log line"
+        out = _safe_log_token(forged)
+        assert "\n" not in out
+        assert out == "SBB:8771500?INFO?fake?log?line"
+
+    def test_truncates_long_values(self):
+        from app.journey.otp_client import _safe_log_token
+
+        assert len(_safe_log_token("A" * 500)) == 64
