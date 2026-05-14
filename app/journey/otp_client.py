@@ -36,6 +36,16 @@ log = logging.getLogger(__name__)
 # pulls more departures into the result set. Trade-off: slightly slower
 # queries (typically still <1 s for inter-city), but the demonstrator
 # value of seeing 6-8 alternatives outweighs it.
+# The variables $from and $to are typed as `InputCoordinates!` which OTP
+# 2.9 accepts with EITHER `{lat, lon}` OR `{stopId}` (or both, in which
+# case stopId wins and the lat/lon is ignored). We choose between the
+# two encodings per-call in `fetch_plan` below — defaults to lat/lon for
+# back-compat with callers that don't pass stop_ids.
+#
+# Stop-id routing was added in v0.1.33 to bypass walk-graph snap-failures
+# for small/border stations whose walking neighbourhood was stripped by
+# rail-focused OSM filtering (e.g. Travers and Pontarlier in the CH
+# session — see docs/nap-ch-rail.md §9).
 _QUERY = """
 query Plan($from: InputCoordinates!, $to: InputCoordinates!, $date: String, $time: String) {
   plan(from: $from, to: $to, date: $date, time: $time,
@@ -80,6 +90,25 @@ def _otp_base(session_id: str) -> str:
     return f"http://otp-{session_id}:8080"
 
 
+def _location_not_found(raw: dict[str, Any]) -> bool:
+    """True iff OTP returned an empty itinerary list AND at least one
+    `LOCATION_NOT_FOUND` routing error.
+
+    Used to decide whether a first-attempt stop-id plan should be retried
+    with lat/lon. Other routingErrors (NO_TRANSIT_CONNECTION,
+    WALKING_BETTER_THAN_TRANSIT, etc.) are NOT triggers for retry — those
+    mean OTP routed but found no acceptable result, which a lat/lon
+    fallback wouldn't fix.
+    """
+    plan = ((raw or {}).get("data") or {}).get("plan") or {}
+    if plan.get("itineraries"):
+        return False
+    for err in plan.get("routingErrors") or []:
+        if (err or {}).get("code") == "LOCATION_NOT_FOUND":
+            return True
+    return False
+
+
 async def fetch_plan(
     *,
     session_id: str,
@@ -91,6 +120,8 @@ async def fetch_plan(
     timeout_ms: int,
     num_itineraries: int = 8,
     search_window_seconds: int = 14400,
+    from_stop_id: str | None = None,
+    to_stop_id: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Call OTP. Returns (raw_response, trips_for_recorder).
 
@@ -109,29 +140,77 @@ async def fetch_plan(
     OTP fell back to a tiny search window, returning 0 itineraries on
     every pair (cured by going back to inline literals which OTP coerces
     correctly into the Long field).
+
+    v0.1.33 — `from_stop_id` / `to_stop_id` (optional): when set, OTP's
+    plan is called with `{stopId: ...}` instead of `{lat, lon}` for that
+    endpoint, bypassing the walk-graph snap entirely. If the resulting
+    plan comes back empty with `LOCATION_NOT_FOUND` (= the stop_id isn't
+    in this session's graph, e.g. the caller guessed the feed prefix
+    wrong) we transparently retry once with lat/lon. The caller gets
+    whichever attempt produced results — or the LOCATION_NOT_FOUND
+    response from the lat/lon attempt if both fail.
+
+    Why retry inside the client and not in the API layer: the retry
+    decision is purely about OTP's response shape (matching
+    `LOCATION_NOT_FOUND` vs other errors), so it belongs next to the OTP
+    call. The API layer doesn't need to learn OTP's error codes.
     """
     query = _QUERY.replace("__NUM_ITINERARIES__", str(int(num_itineraries))).replace(
         "__SEARCH_WINDOW__", str(int(search_window_seconds))
     )
-    payload = {
-        "query": query,
-        "variables": {
-            "from": {"lat": from_lat, "lon": from_lon},
-            "to": {"lat": to_lat, "lon": to_lon},
-            "date": when.strftime("%Y-%m-%d"),
-            "time": when.strftime("%H:%M"),
-        },
-    }
+
+    def _build_endpoint(
+        stop_id: str | None, lat: float, lon: float
+    ) -> dict[str, Any]:
+        # OTP 2.9 InputCoordinates: stopId wins when both are present;
+        # we omit lat/lon when sending stopId to keep the variable shape
+        # minimal and unambiguous.
+        if stop_id:
+            return {"stopId": stop_id}
+        return {"lat": lat, "lon": lon}
+
+    def _payload(use_stop_ids: bool) -> dict[str, Any]:
+        return {
+            "query": query,
+            "variables": {
+                "from": _build_endpoint(
+                    from_stop_id if use_stop_ids else None, from_lat, from_lon
+                ),
+                "to": _build_endpoint(
+                    to_stop_id if use_stop_ids else None, to_lat, to_lon
+                ),
+                "date": when.strftime("%Y-%m-%d"),
+                "time": when.strftime("%H:%M"),
+            },
+        }
+
     # OTP 2.9 GTFS GraphQL endpoint. Note: it is `/otp/gtfs/v1`, NOT
     # `/otp/gtfs/v1/index/graphql` — the `/index/graphql` form was the
     # legacy (Entur/HSL) path served at `/otp/routers/default/index/graphql`
     # which OTP 2.x dropped. Mismatching this returns 404.
     url = f"{_otp_base(session_id)}/otp/gtfs/v1"
     timeout = max(timeout_ms / 1000.0, 1.0)
+    has_stop_ids = bool(from_stop_id or to_stop_id)
+
     async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(url, json=payload)
-    r.raise_for_status()
-    raw: dict[str, Any] = r.json()
+        r = await c.post(url, json=_payload(use_stop_ids=has_stop_ids))
+        r.raise_for_status()
+        raw: dict[str, Any] = r.json()
+        # Fallback: stop-id attempt rejected by OTP — caller probably
+        # supplied a feedId/UIC pairing that doesn't exist in this
+        # session's graph. Retry with lat/lon if we have it.
+        if has_stop_ids and _location_not_found(raw):
+            log.info(
+                "session=%s stop-id plan returned LOCATION_NOT_FOUND "
+                "(from_stop_id=%s to_stop_id=%s) — retrying with lat/lon",
+                session_id,
+                from_stop_id,
+                to_stop_id,
+            )
+            r = await c.post(url, json=_payload(use_stop_ids=False))
+            r.raise_for_status()
+            raw = r.json()
+
     return raw, _normalise(raw)
 
 
