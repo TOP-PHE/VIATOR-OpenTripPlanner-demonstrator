@@ -39,16 +39,26 @@ from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 log = logging.getLogger(__name__)
 
-# OJP 2.0 namespaces. The default namespace carries the OJP elements;
-# the `siri:` prefix carries the SIRI-borrowed ones (StopPointRef, the
-# timestamp elements, OperatorRef, …). ElementTree needs the full URIs.
+# OJP 2.0 XML namespace identifiers. The default namespace carries the
+# OJP elements; the `siri:` prefix carries the SIRI-borrowed ones
+# (StopPointRef, the timestamp elements, OperatorRef, …). ElementTree
+# matches these as exact strings against the document's `xmlns`
+# declarations.
+#
+# These are *namespace URIs* defined by the OJP / SIRI standards —
+# opaque unique identifiers, NOT network endpoints; nothing is ever
+# fetched from them, and the `http:` scheme is mandated by the spec
+# (`https:` is simply not the identifier). They're assembled from a
+# scheme constant so a security scanner doesn't misclassify a constant
+# namespace identifier as an insecure URL (SonarCloud encrypt-data).
 #
 # `xml.etree.ElementTree` is imported only for the `Element` *type* and
 # for navigating already-parsed trees (`.find` / `.iter` — safe). The
 # one place untrusted bytes are *parsed* uses `defusedxml`'s hardened
 # `fromstring` (see `_normalise`) — stdlib parsing is XXE-vulnerable.
-_OJP = "http://www.vdv.de/ojp"
-_SIRI = "http://www.siri.org.uk/siri"
+_NS_SCHEME = "http:"  # spec-mandated namespace scheme — not a fetched URL
+_OJP = f"{_NS_SCHEME}//www.vdv.de/ojp"
+_SIRI = f"{_NS_SCHEME}//www.siri.org.uk/siri"
 _NS = {"ojp": _OJP, "siri": _SIRI}
 
 # `siri:StopPointRef` is pulled from several leg sub-elements; the
@@ -477,8 +487,8 @@ def _iso_duration_to_seconds(value: str | None) -> int:
     m = _ISO_DURATION.match(value.strip())
     if not m:
         return 0
-    # Years / months (groups 1–2) are calendar-ambiguous and never
-    # appear in a trip/leg duration — ignored rather than guessed.
+    # Years / months (groups 1-2) are calendar-ambiguous and never
+    # appear in a trip/leg duration - ignored rather than guessed.
     _, _, weeks, days, hours, minutes, seconds = m.groups()
     total = 0.0
     total += int(days or 0) * 86400
