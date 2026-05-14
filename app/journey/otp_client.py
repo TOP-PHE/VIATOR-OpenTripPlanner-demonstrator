@@ -162,8 +162,7 @@ def _earliest_departure(when: datetime, session_timezone: str | None) -> str:
                 tz = ZoneInfo(session_timezone)
             except (ZoneInfoNotFoundError, ValueError):
                 log.warning(
-                    "unknown session timezone %r — falling back to UTC for "
-                    "earliestDeparture",
+                    "unknown session timezone %r — falling back to UTC for earliestDeparture",
                     session_timezone,
                 )
         when = when.replace(tzinfo=tz)
@@ -229,9 +228,9 @@ async def fetch_plan(
     # `searchWindow` is the Duration scalar — an ISO-8601 string literal,
     # so the inlined value must carry its own quotes. `first` is a plain
     # Int literal.
-    query = _QUERY.replace(
-        "__SEARCH_WINDOW__", f'"PT{int(search_window_seconds)}S"'
-    ).replace("__NUM_ITINERARIES__", str(int(num_itineraries)))
+    query = _QUERY.replace("__SEARCH_WINDOW__", f'"PT{int(search_window_seconds)}S"').replace(
+        "__NUM_ITINERARIES__", str(int(num_itineraries))
+    )
 
     dt_iso = _earliest_departure(when, session_timezone)
 
@@ -242,9 +241,7 @@ async def fetch_plan(
                 "origin": _plan_location(
                     from_stop_id if use_stop_ids else None, from_lat, from_lon
                 ),
-                "destination": _plan_location(
-                    to_stop_id if use_stop_ids else None, to_lat, to_lon
-                ),
+                "destination": _plan_location(to_stop_id if use_stop_ids else None, to_lat, to_lon),
                 "dateTime": {"earliestDeparture": dt_iso},
             },
         }
@@ -392,10 +389,7 @@ def _ms_to_iso(ms: Any) -> str | None:
     if ms is None:
         return None
     try:
-        return (
-            datetime.fromtimestamp(int(ms) / 1000, tz=UTC)
-            .strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        )
+        return datetime.fromtimestamp(int(ms) / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     except (TypeError, ValueError, OverflowError, OSError):  # pragma: no cover
         return None
 

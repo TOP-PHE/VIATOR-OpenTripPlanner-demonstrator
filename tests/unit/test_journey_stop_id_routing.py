@@ -27,6 +27,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 # ─────────────────── app.api.journey helpers ───────────────────
 
 
@@ -156,9 +158,7 @@ class TestLocationNotFound:
             "OUTSIDE_SERVICE_PERIOD",
             "SYSTEM_ERROR",
         ):
-            raw = {
-                "data": {"planConnection": {"edges": [], "routingErrors": [{"code": code}]}}
-            }
+            raw = {"data": {"planConnection": {"edges": [], "routingErrors": [{"code": code}]}}}
             assert _location_not_found(raw) is False, f"{code} should not retry"
 
     def test_mixed_errors_with_location_not_found_triggers_retry(self):
@@ -356,9 +356,10 @@ class TestNormalisePlanConnection:
         assert trip["arrival_at"] == "2026-05-18T09:28:00+00:00"
         assert trip["num_transfers"] == 0  # single RAIL leg
         assert trip["modes"] == "RAIL"
-        assert trip["_raw_itinerary"] == _VERIFIED_PLANCONNECTION["data"][
-            "planConnection"
-        ]["edges"][0]["node"]
+        assert (
+            trip["_raw_itinerary"]
+            == _VERIFIED_PLANCONNECTION["data"]["planConnection"]["edges"][0]["node"]
+        )
 
         # Single leg — leg times are epoch-ms, same as the legacy API.
         assert len(trip["legs"]) == 1
@@ -367,7 +368,9 @@ class TestNormalisePlanConnection:
         assert leg["departure"] == "2026-05-18T09:03:00+00:00"
         assert leg["arrival"] == "2026-05-18T09:28:00+00:00"
         assert leg["duration_seconds"] == 1500
-        assert leg["distance_meters"] == 24873.63
+        # distance_meters is a float — compare with tolerance (SonarCloud
+        # python:S1244: no direct == on floats).
+        assert leg["distance_meters"] == pytest.approx(24873.63)
         assert leg["from_name"] == "Pontarlier"
         assert leg["from_stop_id"] == "SBB:8771500"
         assert leg["to_name"] == "Travers"
