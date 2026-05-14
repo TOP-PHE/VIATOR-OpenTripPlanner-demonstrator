@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-
 # ─────────────────── _stop_id_for ───────────────────
 
 

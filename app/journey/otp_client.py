@@ -159,9 +159,7 @@ async def fetch_plan(
         "__SEARCH_WINDOW__", str(int(search_window_seconds))
     )
 
-    def _build_endpoint(
-        stop_id: str | None, lat: float, lon: float
-    ) -> dict[str, Any]:
+    def _build_endpoint(stop_id: str | None, lat: float, lon: float) -> dict[str, Any]:
         # OTP 2.9 InputCoordinates: stopId wins when both are present;
         # we omit lat/lon when sending stopId to keep the variable shape
         # minimal and unambiguous.
@@ -173,12 +171,8 @@ async def fetch_plan(
         return {
             "query": query,
             "variables": {
-                "from": _build_endpoint(
-                    from_stop_id if use_stop_ids else None, from_lat, from_lon
-                ),
-                "to": _build_endpoint(
-                    to_stop_id if use_stop_ids else None, to_lat, to_lon
-                ),
+                "from": _build_endpoint(from_stop_id if use_stop_ids else None, from_lat, from_lon),
+                "to": _build_endpoint(to_stop_id if use_stop_ids else None, to_lat, to_lon),
                 "date": when.strftime("%Y-%m-%d"),
                 "time": when.strftime("%H:%M"),
             },

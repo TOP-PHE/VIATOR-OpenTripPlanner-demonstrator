@@ -81,9 +81,7 @@ def _primary_feed_id(session: SessionRow) -> str | None:
     Out of scope for v0.1.33 — the fallback path is good enough for the
     demonstrator.
     """
-    providers = (
-        ((session.config or {}).get("sources") or {}).get("providers") or []
-    )
+    providers = ((session.config or {}).get("sources") or {}).get("providers") or []
     for p in providers:
         if isinstance(p, dict):
             fid = p.get("id")
