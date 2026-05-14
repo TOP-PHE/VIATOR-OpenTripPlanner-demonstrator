@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service
 from ..db import get_db
-from ..journey import otp_client, recorder
+from ..journey import ojp_client, otp_client, recorder
 from ..models import GraphSnapshot
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -49,6 +49,12 @@ class FanoutBody(BaseModel):
     depart_at: datetime | None = None
     arrive_by: datetime | None = None
     modes: list[str] = Field(default_factory=lambda: ["TRANSIT", "WALK"])
+    # When true AND the platform has OJP comparison configured
+    # (OJP_COMPARISON_ENABLED + OJP_API_TOKEN), the fanout also queries
+    # the external reference OJP endpoint and returns its itineraries
+    # under `ojp_reference` for side-by-side display. Off by default —
+    # opt-in per search, see docs/ojp-reference-comparison-design.md.
+    compare_ojp: bool = False
 
     model_config = {"populate_by_name": True}
 
@@ -152,6 +158,67 @@ async def _query_session(
         return "error", {}, [], int((time.monotonic() - start) * 1000)
 
 
+async def _query_ojp_reference(
+    cfg: dict[str, Any],
+    body: FanoutBody,
+    when: datetime,
+) -> dict[str, Any]:
+    """Query the external OJP reference endpoint for a side-by-side compare.
+
+    Returns a result dict shaped for the fanout response payload
+    (`{status, trips, response_ms, error?}`) and **never raises** — a
+    failing reference call must not affect VIATOR's own results. The
+    caller only invokes this once it has confirmed the feature is
+    enabled and a token is set.
+
+    The result is intentionally not persisted (see ojp_client's module
+    docstring — `journey_search_executions.session_id` is FK'd to
+    `sessions.id`; OJP isn't a session). Phase 1 is live display only.
+    """
+    start = time.monotonic()
+
+    def _ms() -> int:
+        return int((time.monotonic() - start) * 1000)
+
+    try:
+        _raw, trips = await ojp_client.fetch_reference(
+            from_lat=body.from_.lat,
+            from_lon=body.from_.lon,
+            to_lat=body.to.lat,
+            to_lon=body.to.lon,
+            when=when,
+            timeout_ms=int(cfg["OJP_TIMEOUT_MS"]),
+            endpoint=str(cfg["OJP_API_ENDPOINT"]),
+            token=str(cfg["OJP_API_TOKEN"]),
+            from_name=body.from_.label,
+            to_name=body.to.label,
+        )
+        return {
+            "status": "ok" if trips else "no_route",
+            "trips": trips,
+            "response_ms": _ms(),
+        }
+    except (TimeoutError, httpx.TimeoutException):
+        return {"status": "timeout", "trips": [], "response_ms": _ms()}
+    except httpx.HTTPStatusError as exc:
+        # 429 surfaced distinctly so the UI can say "rate-limited" rather
+        # than a flat error — the OJP free tier is 50 req/min.
+        code = exc.response.status_code
+        return {
+            "status": "rate_limited" if code == 429 else "error",
+            "trips": [],
+            "response_ms": _ms(),
+            "error": f"OJP endpoint returned HTTP {code}",
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "status": "error",
+            "trips": [],
+            "response_ms": _ms(),
+            "error": f"OJP request failed: {type(exc).__name__}",
+        }
+
+
 def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
     return db.execute(
         select(GraphSnapshot)
@@ -216,9 +283,23 @@ async def fanout(
             )
             timeout_ms = int(cfg["FANOUT_TIMEOUT_MS"])
 
+            # v0.1.35 — optional external OJP reference comparison. Kicked
+            # off as a task so it runs concurrently with the OTP session
+            # calls; awaited after. Only when the operator opted in AND
+            # the platform has the feature enabled with a token set.
+            ojp_task: asyncio.Task[dict[str, Any]] | None = None
+            if (
+                body.compare_ojp
+                and cfg.get("OJP_COMPARISON_ENABLED")
+                and cfg.get("OJP_API_TOKEN")
+            ):
+                ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
+
             results = await asyncio.gather(
                 *[_query_session(db, s, body, timeout_ms) for s in sessions]
             )
+            # `_query_ojp_reference` never raises — safe to await bare.
+            ojp_reference = await ojp_task if ojp_task is not None else None
     except concurrency.ConcurrencyExceeded as exc:
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
@@ -318,12 +399,19 @@ async def fanout(
             }
         )
 
-    return {
+    response: dict[str, Any] = {
         "search_id": str(search.id),
         "status": status,
         "trips": merged_trips,
         "executions": executions_summary,
     }
+    # Present only when the operator opted into the OJP comparison and the
+    # feature is configured — the journey UI renders it as a separate
+    # "Reference (Swiss OJP)" panel. Never merged into `trips`/`executions`
+    # and never persisted (Phase 1 — live display only).
+    if ojp_reference is not None:
+        response["ojp_reference"] = ojp_reference
+    return response
 
 
 @router.post("/plan", summary="Plan against a single explicit session")

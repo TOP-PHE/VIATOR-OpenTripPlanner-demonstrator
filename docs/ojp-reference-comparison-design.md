@@ -12,9 +12,10 @@ built from filtered GTFS + OSM. There's currently no oracle to answer
 "is that itinerary actually *right*?" The reference OJP endpoint is a
 sanctioned, standards-based answer key.
 
-**Status**: Design proposal — draft, 2026-05-14. Not yet scheduled.
-Written so the demonstrator product owners can decide whether it earns a
-roadmap slot.
+**Status**: Phase 0 (verification spike) ✅ done · Phase 1 (MVP)
+implemented — see the changelog. Phases 2–3 remain future work items.
+This doc started as a proposal and now also serves as the
+implementation reference.
 **Audience**: Platform admins, demonstrator product owners, future
 implementers.
 
@@ -229,17 +230,19 @@ timeout (§6).
 
 ### 5.4 Recording
 
-The reference result is recorded like any other source: a
-`journey_search_executions` row with a synthetic `session_id` —
-proposal: `ojp-reference` (reserved, never a real session id). Its
-trips land in `journey_trips` the same way. This keeps audit/replay
-uniform and means the existing `/api/journey/searches/<id>` endpoint
-shows the comparison for free.
+**Phase 1 does NOT persist the reference result** — it's returned live
+in the fanout response (`ojp_reference`) for display only, and dropped
+when the response is sent.
 
-*Schema check*: `journey_search_executions.session_id` is currently an
-FK to `sessions.id` (needs confirming). If so, either (i) relax it to a
-plain string, or (ii) seed a non-serving `ojp-reference` sessions row.
-(i) is cleaner; flagged in §10.
+Why: `journey_search_executions.session_id` **is** an FK to
+`sessions.id` (confirmed — `app/models/search.py`). Recording an
+`ojp-reference` execution row would need either an FK relaxation +
+migration or a seeded non-serving `sessions` row — both bigger than the
+MVP warrants. Live-only display is genuinely useful on its own (the
+operator gets the side-by-side), and persistence pairs naturally with
+the Phase 2 structured-diff work anyway (§9), where the schema question
+gets answered properly. So: Phase 1 = live compare; Phase 2 = persist +
+diff.
 
 ---
 
@@ -353,24 +356,24 @@ for trend analysis across many searches — analogous to the
 
 | # | Question | Status |
 |---|---|---|
-| 1 | Exact endpoint path — `ojp2020` vs `ojp20`? | **Mostly resolved** — cookbook + regression collection both use `/ojp20` for OJP 2.0. Phase 0 confirms against the live key. |
-| 2 | `openTdataCH/ojp-adapter` — Python-usable? | **Resolved** — it's **Java**. VIATOR hand-rolls the `TripRequest` XML and parses `TripResult` with `lxml` / `xml.etree`. The verified shapes are in Appendix A. |
-| 3 | OJP 2.0 `TripRequest` / `TripResult` exact shape. | **Resolved for design** — captured verbatim in Appendix A from `openTdataCH/ojp-tests-public`. **Still requires the Phase 0 live-call gate** (the #75/#77 lesson): a captured regression fixture is not the same as a confirmed live response against *our* token. |
-| 4 | `journey_search_executions.session_id` — FK to `sessions` or plain string? | Open — decides whether `ojp-reference` needs a seeded sessions row or an FK relaxation (§5.4). Resolve while implementing Phase 1. |
-| 5 | Results UI — separate "Reference" panel, or merged list with an `OJP_REFERENCE` origin flag? | Open — affects `journey.html` render code + `_origin_flag`. |
-| 6 | Send VIATOR's session-filtered view, or raw coords? | Resolved — coords (§8.1) for Phase 1; stop-ref mapping is Phase 3. |
-| 7 | Privacy — journey searches (coordinates + times) leave VIATOR for a third-party API. | Low sensitivity (public transport queries, no PII), but worth a line in the admin guide and the toggle's help text. |
+| 1 | Exact endpoint path — `ojp2020` vs `ojp20`? | **Resolved** — `/ojp20`. Confirmed live in Phase 0 (HTTP 200, real `TripResult`). It's the `OJP_API_ENDPOINT` default. |
+| 2 | `openTdataCH/ojp-adapter` — Python-usable? | **Resolved** — it's **Java**. `ojp_client.py` hand-rolls the `TripRequest` (string template) and parses `TripResult` with stdlib `xml.etree.ElementTree` — no new dependency. |
+| 3 | OJP 2.0 `TripRequest` / `TripResult` exact shape. | **Resolved** — verified live in Phase 0 against our own token; `ojp_client._normalise` and `tests/unit/test_ojp_client.py` are pinned against the captured response. |
+| 4 | `journey_search_executions.session_id` — FK to `sessions` or plain string? | **Resolved** — it *is* an FK to `sessions.id`. Phase 1 therefore does **not** persist the reference result (§5.4); persistence is Phase 2. |
+| 5 | Results UI — separate "Reference" panel, or merged list with an `OJP_REFERENCE` origin flag? | **Resolved** — separate **"Reference — Swiss OJP"** panel below VIATOR's own results. Cleaner than overloading `_origin_flag`, and the OJP trips reuse the normalised trip shape so the existing `legsHTML` / card rendering just works. |
+| 6 | Send VIATOR's session-filtered view, or raw coords? | **Resolved** — coords (§8.1) for Phase 1; stop-ref mapping is Phase 3. |
+| 7 | Privacy — journey searches (coordinates + times) leave VIATOR for a third-party API. | Low sensitivity (public-transport queries, no PII). Still worth a line in the admin guide + the toggle's help text — a Phase-1.x doc tidy. |
 
 ---
 
 ## 11. Phasing
 
-| Phase | Scope | Rough size |
+| Phase | Scope | Status |
 |---|---|---|
-| **0 — spike** | One manual `curl` against the live OJP endpoint with a hand-built `TripRequest`; confirm endpoint, auth, response shape. (The mandatory "verify before build" gate.) | hours |
-| **1 — MVP** | `ojp_client.py` adapter (coords-based), `compare_ojp` branch in `/api/journey/fanout`, the search-form toggle, feature flag + credential wiring, side-by-side render, recording. CH OJP only. | ~1 week |
-| **2 — structured diff** | Per-itinerary matching, similarity score, persisted comparison verdicts, trend view. | separate work item |
-| **3 — multi-NAP** | Same adapter pointed at other NAPs' OJP endpoints (DELFI, France, …) — per-endpoint config + token. | separate work item |
+| **0 — spike** | One manual `curl` against the live OJP endpoint with a hand-built `TripRequest`; confirm endpoint, auth, response shape. (The mandatory "verify before build" gate.) | ✅ **done** — HTTP 200, real `TripResult` captured |
+| **1 — MVP** | `ojp_client.py` adapter (coords-based), `compare_ojp` branch in `/api/journey/fanout`, the search-form toggle, config + secret wiring, side-by-side render. Live display only — no persistence (§5.4). CH OJP only. | ✅ **implemented** — this PR |
+| **2 — structured diff** | Per-itinerary matching, similarity score, **persisted** comparison verdicts (resolves the §5.4 FK question properly), trend view. | future work item |
+| **3 — multi-NAP** | Same adapter pointed at other NAPs' OJP endpoints (DELFI, France, …) — per-endpoint config + token. | future work item |
 
 ---
 
@@ -548,6 +551,14 @@ child element is present.
 
 ## Changelog
 
+- **2026-05-14** — Phase 1 implemented: `app/journey/ojp_client.py`
+  (TripRequest builder + TripResult parser), `compare_ojp` branch in
+  `/api/journey/fanout`, the gated search-form checkbox + reference
+  panel in `journey.html`, `tests/unit/test_ojp_client.py`. Phase 0
+  spike run against the live endpoint — HTTP 200, real `TripResult`
+  captured; the parser is pinned against it. Open questions 1–6
+  resolved (see §10); recording deferred to Phase 2 (§5.4 — the
+  `session_id` FK).
 - **2026-05-14** — Initial draft. Appendix A added the same day:
   verified OJP 2.0 request/response shapes from the official
   regression-test collection + a ready-to-run Phase 0 spike.
