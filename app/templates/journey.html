@@ -98,14 +98,14 @@
     <label>From</label>
     <div class="station-input">
       <input id="from-input" name="from" required autocomplete="off">
-      <input type="hidden" id="from-lat"><input type="hidden" id="from-lon"><input type="hidden" id="from-name"><input type="hidden" id="from-uic">
+      <input type="hidden" id="from-lat"><input type="hidden" id="from-lon"><input type="hidden" id="from-name">
       <div class="suggestions" id="from-sug"></div>
     </div>
 
     <label>To</label>
     <div class="station-input">
       <input id="to-input" name="to" required autocomplete="off">
-      <input type="hidden" id="to-lat"><input type="hidden" id="to-lon"><input type="hidden" id="to-name"><input type="hidden" id="to-uic">
+      <input type="hidden" id="to-lat"><input type="hidden" id="to-lon"><input type="hidden" id="to-name">
       <div class="suggestions" id="to-sug"></div>
     </div>
 
@@ -149,10 +149,6 @@ function setupAutocomplete(prefix) {
   const lat = document.getElementById(prefix + '-lat');
   const lon = document.getElementById(prefix + '-lon');
   const name = document.getElementById(prefix + '-name');
-  // v0.1.33 — capture master_stations.uic on pick so the server can
-  // try OTP stop-id routing (faster, bypasses walk-graph snap which
-  // fails for small stations after rail-focused OSM filtering).
-  const uic = document.getElementById(prefix + '-uic');
   let active = -1; let items = [];
 
   async function refresh() {
@@ -173,7 +169,6 @@ function setupAutocomplete(prefix) {
     if (i < 0 || i >= items.length) return;
     const s = items[i];
     inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
-    uic.value = s.uic || '';
     box.classList.remove('show');
   }
   let t; inp.addEventListener('input', () => {
@@ -183,9 +178,9 @@ function setupAutocomplete(prefix) {
     // rather than silently routing to the OLD station's coordinates.
     // Was a real bug: typing "Lyon Part-Dieu" → search → clearing and
     // typing "cagnes sur mer" → search returned trips to Lyon because
-    // the hidden lat/lon never got cleared. Same applies to uic.
+    // the hidden lat/lon never got cleared.
     if (inp.value.trim() !== name.value) {
-      lat.value = ''; lon.value = ''; name.value = ''; uic.value = '';
+      lat.value = ''; lon.value = ''; name.value = '';
     }
     clearTimeout(t); t = setTimeout(refresh, 150);
   });
@@ -219,15 +214,9 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
       'Editing the text without picking a suggestion clears the underlying coordinates.';
     return;
   }
-  // v0.1.33 — uic is optional. Empty when the operator typed a station
-  // not in master_stations (currently rejected upstream by the lat/lon
-  // null-check, but kept defensive in case future free-text addressing
-  // lands). Empty strings collapse to null server-side.
-  const fUic = document.getElementById('from-uic').value || null;
-  const tUic = document.getElementById('to-uic').value || null;
   const body = {
-    from: { lat: fLat, lon: fLon, label: document.getElementById('from-name').value, uic: fUic },
-    to:   { lat: tLat, lon: tLon, label: document.getElementById('to-name').value, uic: tUic },
+    from: { lat: fLat, lon: fLon, label: document.getElementById('from-name').value },
+    to:   { lat: tLat, lon: tLon, label: document.getElementById('to-name').value },
     depart_at: document.getElementById('depart').value + ':00',
     modes: ['TRANSIT','WALK'],
   };
