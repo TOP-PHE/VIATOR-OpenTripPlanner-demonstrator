@@ -32,14 +32,6 @@ class Coord(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     label: str | None = None
-    # UIC code from master_stations when the operator picked the station
-    # from the journey UI dropdown. When present, the server will try
-    # OTP stop-id routing first (using `<feedId>:<uic>`) and fall back to
-    # the lat/lon snap if the feed doesn't index stops by UIC or the
-    # stop_id isn't found in the session's graph. This bypasses
-    # PruneIslands snap-failures for small/border stations whose walking
-    # neighbourhood was stripped by rail-focused OSM filtering.
-    uic: str | None = None
 
 
 class FanoutBody(BaseModel):
@@ -65,50 +57,6 @@ def _resolve_when(body: FanoutBody) -> tuple[str, datetime]:
     return "depart_at", body.depart_at or datetime.now(UTC)
 
 
-def _primary_feed_id(session: SessionRow) -> str | None:
-    """Return the first provider's OTP feedId from session.config.
-
-    Per nap-fr-rail.md §2.1, each provider's `id` IS the OTP feedId
-    namespace prefix on every stop_id from that feed. For single-provider
-    sessions (the common case for the nap-*-rail demonstrators) this is
-    unambiguous. For multi-provider sessions we currently pick the first
-    one and rely on otp_client's lat/lon fallback for the cases where
-    the chosen feedId doesn't match the stop we're routing to.
-
-    A future improvement would be to build a per-session UIC→stop_id
-    index by querying OTP after each successful build (and on serving
-    state transitions), which would let us route exactly across feeds.
-    Out of scope for v0.1.33 — the fallback path is good enough for the
-    demonstrator.
-    """
-    providers = ((session.config or {}).get("sources") or {}).get("providers") or []
-    for p in providers:
-        if isinstance(p, dict):
-            fid = p.get("id")
-            if isinstance(fid, str) and fid:
-                return fid
-    return None
-
-
-def _stop_id_for(session: SessionRow, uic: str | None) -> str | None:
-    """Build an OTP stop_id of the form `<feedId>:<uic>` from a uic.
-
-    SBB's GTFS uses UIC codes as stop_ids directly, so `SBB:8771500`
-    resolves cleanly to Pontarlier without any feed-specific mapping.
-    Other feeds (notably SNCF, which uses `OCETrain-NNNNNNNN` style
-    stop_ids) won't resolve via this naive construction — the OTP plan
-    call will return LOCATION_NOT_FOUND for those and the client will
-    fall back to lat/lon. Net effect: SBB-style feeds get stop-id
-    routing; SNCF-style feeds keep existing lat/lon behaviour.
-    """
-    if not uic:
-        return None
-    feed_id = _primary_feed_id(session)
-    if not feed_id:
-        return None
-    return f"{feed_id}:{uic}"
-
-
 async def _query_session(
     db: DbSession,
     session: SessionRow,
@@ -127,8 +75,6 @@ async def _query_session(
             to_lon=body.to.lon,
             when=when,
             timeout_ms=timeout_ms,
-            from_stop_id=_stop_id_for(session, body.from_.uic),
-            to_stop_id=_stop_id_for(session, body.to.uic),
         )
         elapsed = int((time.monotonic() - start) * 1000)
         return ("ok" if trips else "no_route"), raw, trips, elapsed
