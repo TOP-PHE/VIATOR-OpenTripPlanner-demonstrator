@@ -418,9 +418,7 @@ def _normalise_walk_leg(
     out = _blank_leg()
     out["mode"] = mode
     out["duration_seconds"] = leg_duration
-    out["distance_meters"] = _float_or_none(
-        leg.findtext("ojp:Length", namespaces=_NS)
-    ) or 0.0
+    out["distance_meters"] = _float_or_none(leg.findtext("ojp:Length", namespaces=_NS)) or 0.0
 
     start = leg.find("ojp:LegStart", _NS)
     end = leg.find("ojp:LegEnd", _NS)
