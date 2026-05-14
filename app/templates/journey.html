@@ -84,6 +84,15 @@
   font-family: ui-monospace, Menlo, Consolas, monospace;
   background: #f6f8fa; color: #24292f;
 }
+/* v0.1.35 — Swiss OJP reference-comparison. The opt-in checkbox sits in
+   the search form; the results render in a panel below VIATOR's own,
+   with a left accent border so the operator can tell at a glance which
+   engine produced which itineraries. */
+.compare-ojp-field { display: flex; align-items: center; gap: 0.4rem; margin: 0.2rem 0 0.6rem; font-size: 0.9rem; cursor: pointer; }
+.compare-ojp-field input { width: auto; }
+.ojp-ref-panel { margin-top: 1.2rem; border-top: 2px solid var(--sleeper); padding-top: 0.8rem; }
+.ojp-ref-panel h3 { margin: 0 0 0.6rem; font-size: 1rem; }
+.ojp-ref-card { border-left: 3px solid var(--uic-blue); }
 {% endblock %}
 
 {% block content %}
@@ -111,6 +120,15 @@
 
     <label>Depart</label>
     <input type="datetime-local" id="depart" name="depart">
+
+    {# v0.1.35 — only rendered when OJP comparison is enabled AND a token
+       is configured (journey_page passes ojp_comparison_enabled). #}
+    {% if ojp_comparison_enabled %}
+    <label class="compare-ojp-field">
+      <input type="checkbox" id="compare-ojp">
+      Compare with Swiss OJP reference
+    </label>
+    {% endif %}
 
     <button type="submit" id="go-btn">Search</button>
     <div id="msg" class="msg"></div>
@@ -231,6 +249,10 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
     to:   { lat: tLat, lon: tLon, label: document.getElementById('to-name').value, uic: tUic },
     depart_at: document.getElementById('depart').value + ':00',
     modes: ['TRANSIT','WALK'],
+    // v0.1.35 — the checkbox only exists when OJP comparison is enabled;
+    // `?.` → undefined → false when it's not rendered. The server also
+    // gates on its own config, so a stale `true` here is harmless.
+    compare_ojp: !!document.getElementById('compare-ojp')?.checked,
   };
   const btn = document.getElementById('go-btn');
   btn.disabled = true; btn.textContent = 'Searching…';
@@ -319,6 +341,52 @@ function operatorsForTrip(legs) {
   ).join(' ');
 }
 
+// v0.1.35 — render the external Swiss OJP reference-comparison panel.
+// `ref` is payload.ojp_reference: {status, trips, response_ms, error?}.
+// Absent entirely when the operator didn't opt in or the feature is off
+// — return '' so nothing renders. OJP trips share the normalised trip
+// shape, so legsHTML / operatorsForTrip / fmt / dur all just work; the
+// cards carry class `trip-card` so render()'s expand-wiring catches
+// them too. No {} JSON button — OJP trips carry no _raw_itinerary.
+function renderOjpReference(ref) {
+  if (!ref) return '';
+  let head;
+  if (ref.status === 'ok') {
+    const n = ref.trips.length;
+    head = `${n} itiner${n === 1 ? 'y' : 'ies'} · ${ref.response_ms}ms`;
+  } else if (ref.status === 'no_route') {
+    head = `no itinerary found · ${ref.response_ms}ms`;
+  } else if (ref.status === 'rate_limited') {
+    head = `rate-limited — ${escHTML(ref.error || 'try again shortly')}`;
+  } else if (ref.status === 'timeout') {
+    head = `timed out · ${ref.response_ms}ms`;
+  } else {
+    head = `unavailable — ${escHTML(ref.error || 'error')}`;
+  }
+  const cards = (ref.trips || []).map(t => {
+    const legCount = t.legs.length;
+    const tripOps = operatorsForTrip(t.legs);
+    return `<div class="trip-card ojp-ref-card">
+      <div class="top">
+        <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
+             <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
+        <div class="top-actions">${tripOps || ''}</div>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+        ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
+        <span style="color: var(--uic-blue)">▸ click for leg detail</span>
+      </div>
+      <div class="legs-detail">${legsHTML(t.legs)}</div>
+    </div>`;
+  }).join('');
+  return `<div class="ojp-ref-panel">
+    <h3>Reference — Swiss OJP
+      <span style="font-weight:normal;color:var(--rail-steel);font-size:0.85rem">· ${head}</span>
+    </h3>
+    ${cards}
+  </div>`;
+}
+
 // v0.1.26 — JSON inspector. Stash the full payload globally so the
 // click handler can pull the matching trip's _raw_itinerary on demand.
 let _LAST_PAYLOAD = null;
@@ -372,7 +440,11 @@ function render(payload) {
       </div>
     </div>`;
   }).join('');
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cards || '<p>No itineraries found.</p>'}`;
+  // v0.1.35 — the Swiss OJP reference panel (if the operator opted in)
+  // renders below VIATOR's own results. Its cards carry class
+  // `trip-card`, so the expand-wiring below catches them for free.
+  const ojpPanel = renderOjpReference(payload.ojp_reference);
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cards || '<p>No itineraries found.</p>'}${ojpPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable.
   el.querySelectorAll('.trip-card').forEach(card => {

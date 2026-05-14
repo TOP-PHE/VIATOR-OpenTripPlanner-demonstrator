@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .. import config_service
 from ..db import get_db
 from ..models import Session as SessionRow
 from ..models import User
@@ -228,11 +229,28 @@ def admin_master_stations_page(request: Request) -> Response:
 
 
 @router.get("/journey", response_class=HTMLResponse)
-def journey_page(request: Request) -> Response:
+def journey_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+) -> Response:
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    return templates.TemplateResponse(request, "journey.html", {"current_user": user})
+    # The "Compare with Swiss OJP reference" checkbox is only rendered
+    # when the feature is both enabled AND has a token configured —
+    # mirroring the dormant-until-configured rule in config_schema.py.
+    cfg = config_service.get_all(db)
+    ojp_comparison_enabled = bool(cfg.get("OJP_COMPARISON_ENABLED")) and bool(
+        cfg.get("OJP_API_TOKEN")
+    )
+    return templates.TemplateResponse(
+        request,
+        "journey.html",
+        {
+            "current_user": user,
+            "ojp_comparison_enabled": ojp_comparison_enabled,
+        },
+    )
 
 
 @router.get("/admin/nap-catalogues", response_class=HTMLResponse)
