@@ -21,7 +21,25 @@ ENV PYTHONUNBUFFERED=1 \
 # tag is rebuilt on Python's cadence, not Debian's, so it can lag behind
 # debian-security-announce. `apt-get upgrade` here closes that gap and keeps
 # Trivy's OS scan green between base-image refreshes.
-RUN apt-get update \
+#
+# The `echo` line on the first step changes the RUN layer's cache-key
+# string so BuildKit re-runs apt-get update/upgrade on the next build
+# instead of reusing a stale cached layer. Without it, BuildKit happily
+# reuses the previous layer (same Dockerfile + same parent) and never
+# pulls fresh Debian fixes — exactly the failure mode behind PR #83's
+# Trivy block:
+#
+#   - libcap2       CVE-2026-4878   fixed in 1:2.75-10+deb13u1
+#   - libnghttp2-14 CVE-2026-27135  fixed in 1.64.0-1.1+deb13u1
+#   - libsystemd0   CVE-2026-29111  fixed in 257.13-1~deb13u1
+#   - (+1 of the same family)
+#
+# Bump the date on the echo whenever Trivy reports new HIGH/CRITICAL
+# fixed-upstream Debian CVEs to force the apt layer to re-evaluate. The
+# echo's stdout goes only to the build log; it does not affect the
+# runtime image.
+RUN echo "apt cache bust 2026-05-18 — refresh for libcap2/libnghttp2-14/libsystemd0 deb13u1 patches" \
+    && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl \
     && apt-get autoremove -y \
