@@ -180,6 +180,15 @@ function setupAutocomplete(prefix) {
     const r = await fetch(`/api/master/stations?q=${encodeURIComponent(q)}&size=20`);
     if (!r.ok) return;
     items = await r.json();
+    // Hide unroutable suggestions. master_stations was bootstrapped from
+    // Trainline-eu/stations (ODbL) which contains ~1,217 duplicate rows
+    // without coordinates — picking one yields null lat/lon and the
+    // submit then fires the "pick from the dropdown" error even though
+    // the operator DID pick from the dropdown. The classic symptom is
+    // two identical "Vallorbe [CH]" suggestions where only the second
+    // (UIC 8501103) has coords. Filtering client-side keeps the admin
+    // master_stations page able to see and manage those rows.
+    items = items.filter(s => s.latitude != null && s.longitude != null);
     if (!items.length) { box.classList.remove('show'); return; }
     box.innerHTML = items.map((s, i) => `<div class="suggestion" data-i="${i}">${s.name}${s.country_iso ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>` : ''}</div>`).join('');
     box.classList.add('show');
@@ -227,13 +236,22 @@ document.getElementById('depart').value = now.toISOString().slice(0,16);
 
 document.getElementById('journey-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  // v0.1.35 — reset the inline #msg at the start of every submit so a
+  // stale red validation error can't outlive a subsequent successful
+  // search. Previously the error stayed visible alongside fresh results,
+  // which was misleading ("the search said it failed but here are 5
+  // results below").
+  const msg = document.getElementById('msg');
+  msg.className = 'msg';
+  msg.textContent = '';
+
   const fLat = parseFloat(document.getElementById('from-lat').value);
   const fLon = parseFloat(document.getElementById('from-lon').value);
   const tLat = parseFloat(document.getElementById('to-lat').value);
   const tLon = parseFloat(document.getElementById('to-lon').value);
   if (!fLat || !tLat) {
-    document.getElementById('msg').className = 'msg show error';
-    document.getElementById('msg').textContent =
+    msg.className = 'msg show error';
+    msg.textContent =
       'Please type a station name and pick it from the dropdown suggestions for both From and To. ' +
       'Editing the text without picking a suggestion clears the underlying coordinates.';
     return;
@@ -256,6 +274,14 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
   };
   const btn = document.getElementById('go-btn');
   btn.disabled = true; btn.textContent = 'Searching…';
+  // v0.1.35 — reset the results pane right before the fetch fires. A
+  // previously-rendered result list must not survive a *failed* new
+  // search; without this, the operator saw old trip cards next to a
+  // fresh "Search failed" message and assumed they were the new result.
+  // The "Searching…" placeholder also gives immediate visual feedback
+  // while the fanout is in flight.
+  const results = document.getElementById('results');
+  results.innerHTML = '<p style="color: var(--rail-steel)">Searching…</p>';
   try {
     const r = await fetch('/api/journey/fanout', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -263,10 +289,16 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
     });
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));
-      document.getElementById('results').innerHTML = `<p style="color: var(--fail)">Search failed: ${j.detail || r.status}</p>`;
+      results.innerHTML = `<p style="color: var(--fail)">Search failed: ${j.detail || r.status}</p>`;
       return;
     }
     render(await r.json());
+  } catch (err) {
+    // Network / parse exceptions land here. Without this catch, a thrown
+    // error left the "Searching…" placeholder visible forever — and,
+    // before this PR, left the *previous* result list visible (since
+    // nothing had overwritten it). Surface the failure clearly.
+    results.innerHTML = `<p style="color: var(--fail)">Search failed: ${err}</p>`;
   } finally {
     btn.disabled = false; btn.textContent = 'Search';
   }
