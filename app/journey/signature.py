@@ -11,6 +11,7 @@ Rules of the canonical form:
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
 from sqlalchemy.orm import Session as DbSession
@@ -84,6 +85,71 @@ def trip_signature(db: DbSession, *, session_id: str, legs: list[dict[str, Any]]
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+# A 7-digit chunk of the stop_id is the UIC code (Swiss DiDok number).
+# Examples seen in the field:
+#   OTP:  "SBB:8501120"          → UIC 8501120 (Lausanne)
+#   OTP:  "SBB:8501120:0:5"      → same UIC, with platform suffix "0:5"
+#   OTP:  "SBB:8771500"          → UIC 8771500 (Pontarlier, French station
+#                                   present in the cross-border SBB feed)
+#   OJP:  "ch:1:sloid:8501120"          → UIC 8501120
+#   OJP:  "ch:1:sloid:8501120:0:5"      → same UIC + platform
+# Anchored on `(?<!\d)…(?!\d)` so we don't accidentally pick a longer run
+# of digits or a substring of one — the UIC is always exactly 7 digits.
+_UIC_RE = re.compile(r"(?<!\d)(\d{7})(?!\d)")
+
+
+def _uic_from_stop_id(stop_id: str | None) -> str | None:
+    """Parse the 7-digit UIC code out of an OTP or OJP stop_id.
+
+    Returns None for stop_ids that don't contain a 7-digit chunk
+    (non-Swiss feeds, synthetic ids, or `None`). The caller falls back
+    to lat/lon-based tokens in that case.
+    """
+    if not stop_id:
+        return None
+    m = _UIC_RE.search(stop_id)
+    return m.group(1) if m else None
+
+
+def _round_latlon_coarse(lat: float | None, lon: float | None) -> str:
+    """Same shape as `_round_latlon` but rounded to 3 decimals (~110 m).
+
+    Used by the cross-engine `transit_fingerprint` instead of the 4-dp
+    rounding the within-feed `trip_signature` uses. Rationale: OTP emits
+    *platform-precise* coordinates (e.g. Lausanne CFF platform 5 vs
+    platform 4 are 130 m apart and round to different 4-dp tokens within
+    the same itinerary); OJP typically emits a single station-centroid
+    coordinate. At 4-dp neither engine matches itself reliably, let
+    alone the other. 3-dp collapses both engines' platform/centroid
+    differences while still distinguishing genuinely-different rail
+    stations — Pontarlier and Frasne are 15 km apart, even Zürich HB and
+    Zürich Stadelhofen are 700 m apart, both well above 110 m.
+    """
+    if lat is None or lon is None:
+        return "?,?"
+    return f"{round(lat, 3):.3f},{round(lon, 3):.3f}"
+
+
+def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float | None) -> str:
+    """Return the per-endpoint stop token used by `transit_fingerprint`.
+
+    Strategy:
+      1. If the stop_id contains a 7-digit UIC chunk, return `UIC:NNNNNNN`.
+         This is the strongest cross-engine identifier — both OTP's
+         ``SBB:8501120:0:5`` and OJP's ``ch:1:sloid:8501120:0:5`` produce
+         ``UIC:8501120`` (and don't care about platform suffixes).
+      2. Otherwise fall back to ``lat,lon`` rounded to 3 decimals (~110 m).
+         Catches stations on non-Swiss feeds and the no-stop-id endpoints
+         of access/egress walks. Walks are stripped before this is called,
+         so the only callers are RAIL/BUS/TRANSIT legs which both engines
+         resolve to a stop with an id.
+    """
+    uic = _uic_from_stop_id(stop_id)
+    if uic:
+        return f"UIC:{uic}"
+    return _round_latlon_coarse(lat, lon)
+
+
 def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
     """16-hex stable fingerprint of an itinerary's *transit* leg spine.
 
@@ -95,16 +161,24 @@ def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
 
     Per-transit-leg fragment::
 
-        MODE:lat,lon-lat,lon@HH:MM-HH:MM#ROUTE
+        MODE:STOP-STOP@HH:MM-HH:MM#ROUTE
 
-    where coordinates are rounded to 4 decimals (~11 m). The rounding
-    is what makes cross-feed matching work: OTP emits a Bern stop as
-    ``SBB:8507000`` while OJP emits the same stop as
-    ``ch:1:sloid:7000:4:8`` — opaque, non-equal strings — but both
-    report the same physical lat/lon to within metres. The
-    `trip_signature` function above uses stations_xref + UIC for
-    *within-feed* matching; this function deliberately does not, because
-    `stations_xref` has no entries for the synthetic ``OJP`` feed.
+    where each STOP is either ``UIC:NNNNNNN`` (parsed from the stop_id)
+    or ``lat,lon`` rounded to 3 decimals (~110 m) when no UIC is
+    available. UIC matching is what makes a TGV→IC1 connection at
+    Lausanne fingerprint identically across engines: OTP returns
+    platform-precise coordinates (``SBB:8501120:0:5`` arr lat ≠
+    ``SBB:8501120:0:4`` dep lat by ~30 m even within one itinerary),
+    OJP returns the station centroid — but both stop_ids carry the same
+    UIC ``8501120`` so the token agrees. The 3-dp lat/lon fallback
+    handles non-Swiss feeds and absorbs typical cross-feed centroid
+    variance (~20-100 m).
+
+    Why 3-dp rather than 4-dp like the within-feed `trip_signature`:
+    OTP's platform precision is finer than 11 m, so two consecutive
+    legs at the same station get different 4-dp tokens even within one
+    engine. 110 m precision collapses platforms while still
+    distinguishing different stations.
 
     Times are rounded to the minute and the route name is uppercased /
     stripped. The fingerprint of an itinerary with no transit legs (all
@@ -122,8 +196,12 @@ def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
         mode = (leg.get("mode") or "").upper()
         if mode in ("", "WALK", "TRANSFER"):
             continue
-        from_tok = _round_latlon(leg.get("from_lat"), leg.get("from_lon"))
-        to_tok = _round_latlon(leg.get("to_lat"), leg.get("to_lon"))
+        from_tok = _fingerprint_stop_token(
+            leg.get("from_stop_id"), leg.get("from_lat"), leg.get("from_lon")
+        )
+        to_tok = _fingerprint_stop_token(
+            leg.get("to_stop_id"), leg.get("to_lat"), leg.get("to_lon")
+        )
         dep = _round_minute(leg.get("departure"))
         arr = _round_minute(leg.get("arrival"))
         route = (leg.get("route_short_name") or "").strip().upper()

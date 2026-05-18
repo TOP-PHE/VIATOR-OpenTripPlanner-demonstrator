@@ -450,7 +450,7 @@ function renderOjpReference(ref) {
   } else {
     head = `unavailable — ${escHTML(ref.error || 'error')}`;
   }
-  const cards = (ref.trips || []).map(t => {
+  const cards = (ref.trips || []).map((t, i) => {
     const legCount = t.legs.length;
     const tripOps = operatorsForTrip(t.legs);
     // v0.1.36 — comparison pill (Phase 2). t.comparison is one of
@@ -458,11 +458,21 @@ function renderOjpReference(ref) {
     // OJP_COMPARISON_ENABLED and the OJP call succeeded. Absent on
     // older Phase-1-only payloads.
     const cmp = comparisonPill(t.comparison);
-    return `<div class="trip-card ojp-ref-card">
+    // v0.1.35.02 — same {} JSON-inspector button OTP cards have, for
+    // OJP. Distinct data-action ('show-ojp-json') so the click handler
+    // can fetch from payload.ojp_reference.trips[i] instead of
+    // payload.trips[i]. Critical for diagnosing fingerprint mismatches
+    // (paste both engines' raw trip dicts side-by-side and compare).
+    return `<div class="trip-card ojp-ref-card" data-ojp-trip-index="${i}">
       <div class="top">
         <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
              <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
-        <div class="top-actions">${cmp}${tripOps || ''}</div>
+        <div class="top-actions">
+          ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
+          <button type="button" class="json-btn" data-action="show-ojp-json" data-ojp-trip-index="${i}"
+                  title="Show OJP JSON for this itinerary">{}</button>
+          ${cmp}
+        </div>
       </div>
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
         ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
@@ -548,12 +558,15 @@ function render(payload) {
   const ojpPanel = renderOjpReference(payload.ojp_reference);
   el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${cards || '<p>No itineraries found.</p>'}${ojpPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
-  // open at a time keeps the scroll position predictable.
+  // open at a time keeps the scroll position predictable. OJP cards
+  // also have class `trip-card` so this selector catches them too.
   el.querySelectorAll('.trip-card').forEach(card => {
     card.addEventListener('click', (e) => {
-      // v0.1.26 — JSON button click bubbles up through the card; suppress
-      // the expand-toggle so the button click only opens the modal.
+      // v0.1.26 / v0.1.35.02 — JSON button clicks bubble up through
+      // the card; suppress the expand-toggle on both OTP {} and OJP {}
+      // so a button click only opens the modal.
       if (e.target.closest('[data-action="show-json"]')) return;
+      if (e.target.closest('[data-action="show-ojp-json"]')) return;
       const wasOpen = card.classList.contains('expanded');
       el.querySelectorAll('.trip-card.expanded').forEach(c => c.classList.remove('expanded'));
       if (!wasOpen) card.classList.add('expanded');
@@ -565,6 +578,16 @@ function render(payload) {
       e.stopPropagation();
       const idx = parseInt(btn.dataset.tripIndex, 10);
       showJsonInspector(idx);
+    });
+  });
+  // v0.1.35.02 — wire OJP {} buttons. Separate data-action +
+  // separate handler that reads payload.ojp_reference.trips[i]
+  // instead of payload.trips[i].
+  el.querySelectorAll('[data-action="show-ojp-json"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = parseInt(btn.dataset.ojpTripIndex, 10);
+      showOjpJsonInspector(idx);
     });
   });
 }
@@ -582,6 +605,23 @@ function showJsonInspector(tripIndex) {
   const text = JSON.stringify(raw, null, 2);
   document.getElementById('json-modal-title').textContent =
     `OTP itinerary #${tripIndex + 1} — ${t.origin_flag} · found in: ${t.found_in_sessions.join(', ')}`;
+  document.getElementById('json-modal-pre').textContent = text;
+  document.getElementById('json-modal').hidden = false;
+}
+
+// v0.1.35.02 — same modal, OJP side. Pulls the normalised trip dict
+// from payload.ojp_reference.trips[i] (no _raw_itinerary on the OJP
+// side — the OJP adapter only stores the normalised shape, not the
+// raw TripResult XML). Comparison tag rides along so we can see at a
+// glance why this trip is in its bucket.
+function showOjpJsonInspector(tripIndex) {
+  const payload = _LAST_PAYLOAD;
+  if (!payload || !payload.ojp_reference) return;
+  const t = (payload.ojp_reference.trips || [])[tripIndex];
+  if (!t) return;
+  const text = JSON.stringify(t, null, 2);
+  document.getElementById('json-modal-title').textContent =
+    `OJP itinerary #${tripIndex + 1}${t.comparison ? ' — ' + t.comparison : ''}`;
   document.getElementById('json-modal-pre').textContent = text;
   document.getElementById('json-modal').hidden = false;
 }

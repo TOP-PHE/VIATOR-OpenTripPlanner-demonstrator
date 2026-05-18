@@ -112,20 +112,120 @@ class TestTransitFingerprintDiscrimination:
         assert eight != nine
 
     def test_coord_rounding_absorbs_sub_metre_noise(self):
-        # 4-decimal rounding (~11 m) means two reports of the same
-        # station with sub-decimetre wobble fingerprint to the same
-        # value. Real-world: OTP and OJP both report Bern station but
-        # may differ in the 5th decimal.
+        # 3-decimal rounding (~110 m) easily absorbs sub-metre wobble.
+        # Real-world: OTP and OJP both report Bern station but may
+        # differ in the 4th-5th decimal due to different source feeds
+        # (DiDok vs operator GTFS), and both legitimately disagree on
+        # which platform's centroid to publish.
         a = transit_fingerprint([_rail_leg(from_lat=46.948640, from_lon=7.436770)])
         b = transit_fingerprint([_rail_leg(from_lat=46.948643, from_lon=7.436771)])
         assert a == b
 
-    def test_coord_rounding_distinguishes_real_distance(self):
-        # ~50 m difference (4th decimal jump) → different fingerprint.
-        # Guards against the rounding being too aggressive.
+    def test_coord_rounding_absorbs_typical_cross_feed_offset(self):
+        # ~70 m difference (4th-decimal jump) is well within the
+        # cross-feed centroid variance we routinely see — must still
+        # fingerprint identically at 3 dp. This is the regression test
+        # for the v0.1.35.01 bug where 4-dp rounding made TGV→IC1
+        # connections at Lausanne false-mismatch.
         a = transit_fingerprint([_rail_leg(from_lat=46.948640, from_lon=7.436770)])
-        b = transit_fingerprint([_rail_leg(from_lat=46.949000, from_lon=7.437000)])
+        b = transit_fingerprint([_rail_leg(from_lat=46.948700, from_lon=7.436850)])
+        assert a == b
+
+    def test_coord_rounding_distinguishes_real_distance(self):
+        # ~250 m apart (3rd-decimal jump) → different fingerprint.
+        # Guards against the rounding being too aggressive — different
+        # rail stations are always >>110 m apart, so this remains
+        # discriminative for the real use case.
+        a = transit_fingerprint([_rail_leg(from_lat=46.948640, from_lon=7.436770)])
+        b = transit_fingerprint([_rail_leg(from_lat=46.951000, from_lon=7.439000)])
         assert a != b
+
+
+class TestUicTokenisation:
+    """v0.1.35.02 — UIC parsed from stop_id is the primary stop token.
+
+    The 7-digit DiDok number is consistent across OTP and OJP for the
+    same physical station; matching on UIC sidesteps every coordinate
+    headache (platform precision in OTP, centroid disagreement between
+    feeds, walk-graph snap offsets, etc.).
+    """
+
+    def test_otp_simple_stop_id_yields_uic_token(self):
+        # OTP without stop-id routing emits clean SBB:NNNNNNN. The token
+        # depends on the UIC, NOT on the lat/lon (which is the bug fix —
+        # before, the lat/lon was always primary).
+        a = transit_fingerprint([_rail_leg(from_stop_id="SBB:8501120", to_stop_id="SBB:8501008")])
+        # Same UICs, totally different lat/lon, still match: the stop_id
+        # wins.
+        b = transit_fingerprint(
+            [
+                _rail_leg(
+                    from_stop_id="SBB:8501120",
+                    to_stop_id="SBB:8501008",
+                    from_lat=0.0,
+                    from_lon=0.0,
+                    to_lat=0.0,
+                    to_lon=0.0,
+                )
+            ]
+        )
+        assert a == b
+
+    def test_otp_platform_suffix_does_not_affect_uic(self):
+        # OTP with stop-id routing emits SBB:NNNNNNN:0:P where P is the
+        # platform. The TGV arrives at platform 5; the IC1 departs from
+        # platform 4. Both must yield the same UIC token (8501120) so
+        # the within-itinerary connection is recognised as the same
+        # station — and the cross-engine match against OJP works too.
+        plat5 = transit_fingerprint([_rail_leg(to_stop_id="SBB:8501120:0:5")])
+        plat4 = transit_fingerprint([_rail_leg(to_stop_id="SBB:8501120:0:4")])
+        assert plat5 == plat4
+
+    def test_ojp_sloid_yields_same_uic_as_otp(self):
+        # The whole point of v0.1.35.02: OTP's "SBB:8501120:0:5" and
+        # OJP's "ch:1:sloid:8501120:0:5" describe the same physical
+        # Lausanne CFF platform; both must produce the UIC token
+        # "UIC:8501120" so the fingerprint matches across engines.
+        otp = transit_fingerprint([_rail_leg(from_stop_id="SBB:8501120:0:5")])
+        ojp = transit_fingerprint([_rail_leg(from_stop_id="ch:1:sloid:8501120:0:5")])
+        assert otp == ojp
+
+    def test_no_uic_falls_back_to_3dp_latlon(self):
+        # Non-Swiss feed (no 7-digit UIC chunk in the stop_id) falls
+        # back to lat/lon. Two synthetic ids with the same lat/lon must
+        # still match.
+        a = transit_fingerprint(
+            [
+                _rail_leg(
+                    from_stop_id="STIB:1234",
+                    to_stop_id="STIB:5678",
+                    from_lat=50.85,
+                    from_lon=4.35,
+                )
+            ]
+        )
+        b = transit_fingerprint(
+            [
+                _rail_leg(
+                    from_stop_id="MIVB:abc",
+                    to_stop_id="MIVB:def",
+                    from_lat=50.85,
+                    from_lon=4.35,
+                )
+            ]
+        )
+        assert a == b  # Different stop_ids, same coords → match via fallback
+
+    def test_pontarlier_french_station_in_sbb_feed(self):
+        # Pontarlier is a French SNCF station present in the cross-
+        # border SBB feed (route 91-P38). OTP emits it as
+        # "SBB:8771500"; OJP via opentransportdata.swiss emits it as
+        # "ch:1:sloid:8771500" or similar. Both yield UIC:8771500.
+        otp = transit_fingerprint([_rail_leg(from_stop_id="SBB:8771500", route_short_name="P38")])
+        ojp = transit_fingerprint(
+            [_rail_leg(from_stop_id="ch:1:sloid:8771500:0:1", route_short_name="P38")]
+        )
+        assert otp == ojp
 
 
 class TestCrossEngineMatching:
@@ -135,9 +235,11 @@ class TestCrossEngineMatching:
 
     def test_ojp_with_end_walks_matches_otp_without(self):
         # OJP shape: end-walks framing the transit leg, opaque stop ids
-        # (ch:1:sloid:…). OTP-with-stop-id-routing shape: just the
-        # transit leg, OTP-namespaced stop ids (SBB:…). Both report the
-        # same physical Bern→Zürich at 08:31→09:28.
+        # (ch:1:sloid:NNNNNNN:…). OTP-with-stop-id-routing shape: just
+        # the transit leg, OTP-namespaced stop ids (SBB:NNNNNNN). Both
+        # report the same physical Bern→Zürich at 08:31→09:28, and both
+        # ids carry the same UIC chunk (8507000 / 8503000) so the
+        # fingerprint matches via the UIC token.
         ojp_itin = [
             _walk_leg(  # Origin → Bern (the access walk OJP renders)
                 from_lat=46.94884,
@@ -146,8 +248,8 @@ class TestCrossEngineMatching:
                 to_lon=7.43677,
             ),
             _rail_leg(
-                from_stop_id="ch:1:sloid:7000:4:8",  # OJP stop reference
-                to_stop_id="ch:1:sloid:3000:501:33",
+                from_stop_id="ch:1:sloid:8507000:0:8",  # OJP stop reference
+                to_stop_id="ch:1:sloid:8503000:0:33",
             ),
             _walk_leg(  # Zürich → destination (egress walk)
                 from_lat=47.37852,
@@ -165,6 +267,68 @@ class TestCrossEngineMatching:
         assert transit_fingerprint(ojp_itin) == transit_fingerprint(otp_itin)
         # And not the empty fingerprint — both have a real transit spine.
         assert transit_fingerprint(ojp_itin) != ""
+
+    def test_lausanne_tgv_to_ic1_connection_matches_cross_engine(self):
+        # Regression test for the v0.1.35.01 bug observed live:
+        # Pontarlier → Geneva via Frasne (TGV) + Lausanne (IC1).
+        # OTP reports platform-precise lat/lon for each leg endpoint
+        # (TGV arrives Lausanne platform 5, IC1 leaves platform 4 —
+        # 130m apart, different at 4 dp). OJP reports station-centroid
+        # coords. Before v0.1.35.02 the fingerprints differed; after,
+        # both endpoints resolve to UIC:8501120 regardless of platform.
+        otp_itin = [
+            _rail_leg(  # TGV Frasne → Lausanne platform 5
+                from_stop_id="SBB:8771513",
+                to_stop_id="SBB:8501120:0:5",
+                from_lat=46.8577495,
+                from_lon=6.1578884,
+                to_lat=46.5165829,
+                to_lon=6.6290278,
+                route_short_name="TGV",
+                departure="2026-05-25T12:45:00+00:00",
+                arrival="2026-05-25T13:39:00+00:00",
+            ),
+            _rail_leg(  # IC1 Lausanne platform 4 → Geneva platform 3
+                from_stop_id="SBB:8501120:0:4",
+                to_stop_id="SBB:8501008:0:3",
+                from_lat=46.5166695,
+                from_lon=6.6290548,
+                to_lat=46.2105224,
+                to_lon=6.1424194,
+                route_short_name="IC1",
+                departure="2026-05-25T13:46:00+00:00",
+                arrival="2026-05-25T14:25:00+00:00",
+            ),
+        ]
+        ojp_itin = [
+            _walk_leg(),  # Origin → Frasne access walk
+            _rail_leg(  # TGV with OJP-namespaced ids + station-centroid coords
+                from_stop_id="ch:1:sloid:8771513:0:1",
+                to_stop_id="ch:1:sloid:8501120:0:5",
+                from_lat=46.8569,  # different centroid — OJP source
+                from_lon=6.1564,
+                to_lat=46.5167,
+                to_lon=6.6294,
+                route_short_name="TGV",
+                departure="2026-05-25T12:45:00+00:00",
+                arrival="2026-05-25T13:39:00+00:00",
+            ),
+            _walk_leg(),  # Lausanne platform-transfer walk
+            _rail_leg(  # IC1 from same Lausanne UIC, different platform suffix
+                from_stop_id="ch:1:sloid:8501120:0:4",
+                to_stop_id="ch:1:sloid:8501008:0:3",
+                from_lat=46.5167,
+                from_lon=6.6294,
+                to_lat=46.2103,
+                to_lon=6.1424,
+                route_short_name="IC1",
+                departure="2026-05-25T13:46:00+00:00",
+                arrival="2026-05-25T14:25:00+00:00",
+            ),
+            _walk_leg(),  # Geneva → destination egress walk
+        ]
+        assert transit_fingerprint(otp_itin) == transit_fingerprint(ojp_itin)
+        assert transit_fingerprint(otp_itin) != ""
 
 
 # ─────────────────── _build_comparison ───────────────────
@@ -222,18 +386,19 @@ class TestBuildComparison:
         assert summary == {"common": 0, "otp_only": 0, "ojp_only": 1}
         assert otp[0]["comparison"] == "uncomparable"
 
-    def test_cross_engine_match_via_lat_lon(self):
+    def test_cross_engine_match_via_uic(self):
         # The integration test: OJP renders end-walks and uses opaque
         # stop ids; OTP (stop-id routing) doesn't. _build_comparison
-        # should still bucket them as common because the transit-leg
-        # coordinates round to the same lat/lon.
+        # should still bucket them as common because both stop ids
+        # carry the same 7-digit UIC chunk (8507000 / 8503000) — the
+        # cross-engine matching mechanism v0.1.35.02 ships.
         otp = [_merged_trip([_rail_leg(from_stop_id="SBB:8507000", to_stop_id="SBB:8503000")])]
         ref = _ojp_ref(
             [
                 _walk_leg(),
                 _rail_leg(
-                    from_stop_id="ch:1:sloid:7000:4:8",
-                    to_stop_id="ch:1:sloid:3000:501:33",
+                    from_stop_id="ch:1:sloid:8507000:0:8",
+                    to_stop_id="ch:1:sloid:8503000:0:33",
                 ),
                 _walk_leg(),
             ]
