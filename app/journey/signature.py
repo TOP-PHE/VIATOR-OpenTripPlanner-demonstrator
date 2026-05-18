@@ -82,3 +82,52 @@ def trip_signature(db: DbSession, *, session_id: str, legs: list[dict[str, Any]]
         parts.append(f"{mode}:{from_tok}-{to_tok}@{dep}-{arr}#{route}")
     canonical = "|".join(parts)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
+    """16-hex stable fingerprint of an itinerary's *transit* leg spine.
+
+    Designed for **cross-engine** comparison — VIATOR's OTP results vs
+    the Swiss OJP reference. Walk and transfer legs are stripped, so an
+    OJP itinerary with an explicit `Origin → Pontarlier` access walk
+    still matches an OTP itinerary that started *at* the Pontarlier stop
+    directly (which is what stop-id routing emits — no end walks).
+
+    Per-transit-leg fragment::
+
+        MODE:lat,lon-lat,lon@HH:MM-HH:MM#ROUTE
+
+    where coordinates are rounded to 4 decimals (~11 m). The rounding
+    is what makes cross-feed matching work: OTP emits a Bern stop as
+    ``SBB:8507000`` while OJP emits the same stop as
+    ``ch:1:sloid:7000:4:8`` — opaque, non-equal strings — but both
+    report the same physical lat/lon to within metres. The
+    `trip_signature` function above uses stations_xref + UIC for
+    *within-feed* matching; this function deliberately does not, because
+    `stations_xref` has no entries for the synthetic ``OJP`` feed.
+
+    Times are rounded to the minute and the route name is uppercased /
+    stripped. The fingerprint of an itinerary with no transit legs (all
+    WALK / TRANSFER, or empty) is the empty string — callers treat that
+    as "no comparable spine" rather than letting empty-string-equals-
+    empty-string create false matches between two walk-only routes.
+
+    DB-free by design — same input data the journey UI consumes from
+    `/api/journey/fanout`, so it can be called both server-side
+    (`app/api/journey.py` Phase 2 bucketing) and in unit tests against
+    captured fixtures without setting up a database.
+    """
+    parts: list[str] = []
+    for leg in legs:
+        mode = (leg.get("mode") or "").upper()
+        if mode in ("", "WALK", "TRANSFER"):
+            continue
+        from_tok = _round_latlon(leg.get("from_lat"), leg.get("from_lon"))
+        to_tok = _round_latlon(leg.get("to_lat"), leg.get("to_lon"))
+        dep = _round_minute(leg.get("departure"))
+        arr = _round_minute(leg.get("arrival"))
+        route = (leg.get("route_short_name") or "").strip().upper()
+        parts.append(f"{mode}:{from_tok}-{to_tok}@{dep}-{arr}#{route}")
+    if not parts:
+        return ""
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]

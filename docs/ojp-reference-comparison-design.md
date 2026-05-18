@@ -337,7 +337,7 @@ path already uses.
 
 ## 9. Comparison semantics
 
-Phase 1 is **presentational** — show both, let the operator judge. The
+Phase 1 was **presentational** — show both, let the operator judge. The
 UI computes a few cheap cues:
 
 - **Δ duration** of each side's *best* (shortest) itinerary.
@@ -345,10 +345,58 @@ UI computes a few cheap cues:
 - **Route-shape hint**: do the best itineraries share their transit
   legs' route short-names in order? If not, flag "different route".
 
-Phase 2 (separate work item) would add a structured diff: per-itinerary
-matching, a similarity score, and persistence of the comparison verdict
-for trend analysis across many searches — analogous to the
-`network_coverage` matrix runs VIATOR already has.
+### 9.1 Phase 2 — structured diff *(shipped)*
+
+Phase 2 adds **per-itinerary matching** as a server-side step before the
+fanout response is rendered. Each trip — OTP-side and OJP-reference-side
+— gets a stable 16-hex **transit fingerprint** (`app.journey.signature.
+transit_fingerprint`), and the union of fingerprints is bucketed into
+`common` / `otp_only` / `ojp_only`.
+
+The fingerprint deliberately:
+
+- **Strips walk and transfer legs** before hashing. OJP renders an
+  explicit `Origin → access stop` walk in front of every transit leg
+  and an `egress stop → Destination` walk after the last; OTP with
+  stop-id routing emits the bare transit leg. Stripping walks is what
+  makes those two engines' views of "the 08:31 IC1 Bern → Zürich"
+  hash to the same value.
+- **Rounds coordinates to 4 decimals** (~11 m). OJP uses opaque stop
+  identifiers (`ch:1:sloid:7000:4:8`); OTP uses its own namespace
+  (`SBB:8507000`). Both engines report the same physical lat/lon to
+  within metres, so location-rounding bridges the namespace gap
+  without a DB lookup. (The within-feed `trip_signature` helper still
+  uses `stations_xref` + UIC; the cross-engine variant deliberately
+  doesn't, because `stations_xref` has no rows for the synthetic
+  `OJP` reference feed.)
+- **Returns `""` when the itinerary has no transit spine** (all-walk
+  result). The bucketer treats `""` as *uncomparable* — never matches
+  — so two walk-only trips from different engines don't accidentally
+  collide.
+
+The `_build_comparison` helper in `app/api/journey.py`:
+
+1. Computes the OTP-side and OJP-side fingerprint lists.
+2. Builds the set intersection (`common_set`) and the two
+   complements.
+3. Tags each merged trip dict in-place with a `"comparison"` field —
+   `"common"`, `"otp_only"`, `"ojp_only"`, or `"uncomparable"`.
+4. Returns `{"common": N, "otp_only": N, "ojp_only": N}` summary.
+
+The fanout response gains an optional `comparison_summary` field; the
+UI renders it as a strip above the cards (`{N} common · {N} OTP-only ·
+{N} OJP-only`) and a small pill on each trip card colour-matched to its
+bucket. The kebab-case mapping `tag.replace("_", "-")` between server
+tag and CSS class is asserted in
+`tests/unit/test_transit_fingerprint.py::test_comparison_tag_kebab_case_mapping`
+so the contract is hard to drift.
+
+**Out of scope for Phase 2:** persistence of the verdict for trend
+analysis (still blocked on §5.4's `session_id` FK question — the synthetic
+`OJP` session has no row in `sessions`). That's deferred to a follow-up
+that introduces a `comparison_verdicts` table keyed by
+`(otp_session_id, query_hash, fingerprint)` so the OJP side doesn't need
+its own session row.
 
 ---
 
@@ -372,7 +420,7 @@ for trend analysis across many searches — analogous to the
 |---|---|---|
 | **0 — spike** | One manual `curl` against the live OJP endpoint with a hand-built `TripRequest`; confirm endpoint, auth, response shape. (The mandatory "verify before build" gate.) | ✅ **done** — HTTP 200, real `TripResult` captured |
 | **1 — MVP** | `ojp_client.py` adapter (coords-based), `compare_ojp` branch in `/api/journey/fanout`, the search-form toggle, config + secret wiring, side-by-side render. Live display only — no persistence (§5.4). CH OJP only. | ✅ **implemented** — this PR |
-| **2 — structured diff** | Per-itinerary matching, similarity score, **persisted** comparison verdicts (resolves the §5.4 FK question properly), trend view. | future work item |
+| **2 — structured diff** | Per-itinerary matching via cross-engine transit fingerprint, `common`/`otp_only`/`ojp_only` bucketing, summary strip + per-card pills in the UI. Persistence deferred (still needs the §5.4 FK resolution). | ✅ **shipped** — `transit_fingerprint` + `_build_comparison` + `comparison_summary` in fanout response; tests in `tests/unit/test_transit_fingerprint.py` |
 | **3 — multi-NAP** | Same adapter pointed at other NAPs' OJP endpoints (DELFI, France, …) — per-endpoint config + token. | future work item |
 
 ---
@@ -551,6 +599,23 @@ child element is present.
 
 ## Changelog
 
+- **2026-05-18** — Phase 2 (structured diff) shipped: cross-engine
+  `transit_fingerprint(legs)` in `app/journey/signature.py` (walk/
+  transfer-stripped, lat/lon-rounded to ~11 m to bridge the `SBB:` ↔
+  `ch:1:sloid:` namespace gap, returns `""` for walk-only itineraries
+  so they're treated as uncomparable rather than collide). New
+  `_build_comparison(merged_trips, ojp_reference)` helper in
+  `app/api/journey.py` tags each trip with `comparison ∈ {common,
+  otp_only, ojp_only, uncomparable}` and emits a `comparison_summary`
+  object on the fanout response. `journey.html` renders the summary
+  strip + per-card pills (green = common, blue = OTP-only, amber =
+  OJP-only, grey = uncomparable). Tests in
+  `tests/unit/test_transit_fingerprint.py` — fingerprint basics,
+  discrimination, the cross-engine matching centrepiece, the
+  `_build_comparison` bucketing including the walk-only OTP edge case,
+  and a parametrized kebab-case mapping check that pins the server-tag
+  ↔ CSS-class contract. §9.1 documents the semantics; persistence still
+  Phase 3 (blocked on the §5.4 `OJP` session-FK question).
 - **2026-05-14** — Phase 1 implemented: `app/journey/ojp_client.py`
   (TripRequest builder + TripResult parser), `compare_ojp` branch in
   `/api/journey/fanout`, the gated search-form checkbox + reference

@@ -228,6 +228,63 @@ def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
     ).scalar_one_or_none()
 
 
+def _build_comparison(
+    merged_trips: list[dict[str, Any]], ojp_reference: dict[str, Any] | None
+) -> dict[str, int] | None:
+    """Bucket OTP and OJP itineraries into common / OTP-only / OJP-only.
+
+    Returns a `{common, otp_only, ojp_only}` count summary, or None when
+    there's nothing to compare (no OJP reference at all, or the OJP call
+    didn't succeed). **Mutates `merged_trips` and the trip dicts inside
+    `ojp_reference["trips"]`** by attaching a `comparison` key with one
+    of `'common' | 'otp_only' | 'ojp_only' | 'uncomparable'` — the
+    journey UI renders that as a per-card badge.
+
+    Why the per-itinerary tag *plus* the summary: the summary tells the
+    operator "the engines agree on N journeys" at a glance; the per-
+    itinerary tag answers "is THIS specific card one of those?". An
+    `'uncomparable'` tag is attached to any itinerary whose transit
+    fingerprint is empty (walk-only or no transit legs) so the UI can
+    grey it out instead of mis-classifying it.
+
+    Counts in the summary are of distinct fingerprints, not raw card
+    counts — within-engine duplicates collapse so "Common: 2" really
+    means "2 distinct trains both engines agree on".
+    """
+    if ojp_reference is None or ojp_reference.get("status") != "ok":
+        return None
+    # Imported here rather than at module scope so the journey.py
+    # import graph doesn't pull signature.py until a request actually
+    # exercises this path. Same pattern as the existing trip_signature
+    # import in the fanout body above.
+    from ..journey.signature import transit_fingerprint
+
+    ojp_trips: list[dict[str, Any]] = ojp_reference.get("trips") or []
+
+    otp_fps = [transit_fingerprint(mt["best"].get("legs") or []) for mt in merged_trips]
+    ojp_fps = [transit_fingerprint(ot.get("legs") or []) for ot in ojp_trips]
+
+    otp_set = {fp for fp in otp_fps if fp}
+    ojp_set = {fp for fp in ojp_fps if fp}
+    common_set = otp_set & ojp_set
+
+    def _tag(fp: str, only_label: str) -> str:
+        if not fp:
+            return "uncomparable"
+        return "common" if fp in common_set else only_label
+
+    for mt, fp in zip(merged_trips, otp_fps, strict=True):
+        mt["comparison"] = _tag(fp, "otp_only")
+    for ot, fp in zip(ojp_trips, ojp_fps, strict=True):
+        ot["comparison"] = _tag(fp, "ojp_only")
+
+    return {
+        "common": len(common_set),
+        "otp_only": len(otp_set - common_set),
+        "ojp_only": len(ojp_set - common_set),
+    }
+
+
 def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
     """ALL / NAP_ONLY / MERITS_ONLY / <session>_ONLY / SUBSET."""
     s = set(found_in)
@@ -395,6 +452,19 @@ async def fanout(
             }
         )
 
+    # v0.1.36 — Phase 2 structured comparison. When the OJP reference
+    # returned itineraries, fingerprint each itinerary's *transit* leg
+    # spine on both sides (walks stripped — coords rounded to ~11 m so
+    # OTP's `SBB:…` and OJP's `ch:1:sloid:…` stop references match by
+    # location). Bucket into common / OTP-only / OJP-only and attach
+    # both a per-trip tag and a summary count. The journey UI renders a
+    # one-line strip + a small badge on each card so the operator can
+    # see at a glance "VIATOR and the reference agree on N journeys,
+    # disagree on M+K". Phase 1 was the side-by-side display; Phase 2
+    # is the structured diff. Design: docs/ojp-reference-comparison-
+    # design.md §9.
+    comparison_summary = _build_comparison(merged_trips, ojp_reference)
+
     response: dict[str, Any] = {
         "search_id": str(search.id),
         "status": status,
@@ -407,6 +477,8 @@ async def fanout(
     # and never persisted (Phase 1 — live display only).
     if ojp_reference is not None:
         response["ojp_reference"] = ojp_reference
+    if comparison_summary is not None:
+        response["comparison_summary"] = comparison_summary
     return response
 
 
