@@ -400,7 +400,13 @@ function operatorsForTrip(legs) {
 // Phase-1-only payloads (no comparison) render unchanged.
 function comparisonStrip(summary) {
   if (!summary) return '';
-  const c = summary.common | 0, o = summary.otp_only | 0, j = summary.ojp_only | 0;
+  // Server emits integers; the `|| 0` keeps the JS readable if the
+  // field is ever absent on an older payload. Math.trunc is explicit
+  // about "treat as integer" without the bitwise-coercion `| 0`
+  // shortcut SonarCloud rule javascript:S7767 flags as cryptic.
+  const c = Math.trunc(summary.common || 0);
+  const o = Math.trunc(summary.otp_only || 0);
+  const j = Math.trunc(summary.ojp_only || 0);
   if (c === 0 && o === 0 && j === 0) return '';
   return `<div class="comparison-strip">
     <span class="cmp-label">Comparison vs Swiss OJP:</span>
