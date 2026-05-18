@@ -582,11 +582,13 @@ function render(payload) {
   });
   // v0.1.35.02 — wire OJP {} buttons. Separate data-action +
   // separate handler that reads payload.ojp_reference.trips[i]
-  // instead of payload.trips[i].
+  // instead of payload.trips[i]. Use Number.parseInt (not the global
+  // parseInt) per SonarCloud rule javascript:S7773 — explicit static
+  // member is unambiguous and tree-shakeable.
   el.querySelectorAll('[data-action="show-ojp-json"]').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const idx = parseInt(btn.dataset.ojpTripIndex, 10);
+      const idx = Number.parseInt(btn.dataset.ojpTripIndex, 10);
       showOjpJsonInspector(idx);
     });
   });
