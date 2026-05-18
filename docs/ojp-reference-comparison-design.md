@@ -361,18 +361,58 @@ The fingerprint deliberately:
   stop-id routing emits the bare transit leg. Stripping walks is what
   makes those two engines' views of "the 08:31 IC1 Bern → Zürich"
   hash to the same value.
-- **Rounds coordinates to 4 decimals** (~11 m). OJP uses opaque stop
-  identifiers (`ch:1:sloid:7000:4:8`); OTP uses its own namespace
-  (`SBB:8507000`). Both engines report the same physical lat/lon to
-  within metres, so location-rounding bridges the namespace gap
-  without a DB lookup. (The within-feed `trip_signature` helper still
-  uses `stations_xref` + UIC; the cross-engine variant deliberately
-  doesn't, because `stations_xref` has no rows for the synthetic
-  `OJP` reference feed.)
+- **Uses UIC (parsed from stop_id) as the primary stop token** (v0.1.35.02
+  on; v0.1.35.01 used lat/lon as primary — see §9.1.1). Both OTP and
+  OJP stop ids carry the 7-digit DiDok number for the same physical
+  station:
+  - OTP `SBB:8501120:0:5` → UIC `8501120`
+  - OJP `ch:1:sloid:8501120:0:5` → UIC `8501120`
+  Same UIC ⇒ same token, regardless of platform suffix or namespace
+  prefix. This is the strongest cross-engine identifier we have for
+  Swiss rail, and it sidesteps every coordinate-precision pitfall in
+  one go. (The within-feed `trip_signature` helper still uses
+  `stations_xref` + UIC via DB lookup; the cross-engine variant parses
+  UIC from the stop_id string directly because `stations_xref` has no
+  rows for the synthetic `OJP` reference feed.)
+- **Falls back to coordinates rounded to 3 decimals (~110 m)** when
+  the stop_id doesn't contain a 7-digit chunk (non-Swiss feeds,
+  synthetic ids). Coarser than the within-feed signature's 4-dp
+  precision because cross-feed centroid disagreement can reach
+  ~100 m; 3-dp absorbs it while still distinguishing genuinely-
+  different rail stations (Pontarlier vs Frasne are 15 km apart, even
+  Zürich HB vs Zürich Stadelhofen are 700 m).
 - **Returns `""` when the itinerary has no transit spine** (all-walk
   result). The bucketer treats `""` as *uncomparable* — never matches
   — so two walk-only trips from different engines don't accidentally
   collide.
+
+#### 9.1.1 The v0.1.35.01 → v0.1.35.02 regression
+
+v0.1.35.01 shipped Phase 2 using 4-decimal coordinate rounding (~11 m)
+as the primary stop token, with no special handling for stop ids. Live
+testing on a Pontarlier → Geneva search (via Frasne and Lausanne)
+revealed a structural false-mismatch: OTP and OJP both returned the
+same three trains (P38, TGV, IC1) at the same times, but the
+fingerprint classified them as `otp_only` + `ojp_only` instead of
+`common`.
+
+Root cause: OTP returns *platform-precise* coordinates. The TGV
+arrival at Lausanne CFF is bound to stop `SBB:8501120:0:5` (platform
+5, lat/lon `46.5165829, 6.6290278`) and the IC1 departure is bound to
+stop `SBB:8501120:0:4` (platform 4, lat/lon `46.5166695, 6.6290548`).
+Those two platforms are 130 m apart inside the same station — and at
+4-dp they round to **different** tokens (`46.5166, 6.6290` vs
+`46.5167, 6.6291`). OJP returns a single station-centroid coordinate
+for both legs that almost certainly doesn't match either of OTP's
+platform-precise readings at 4-dp. So one of the two transit-leg
+endpoints always differed, and the overall fingerprint diverged.
+
+v0.1.35.02 fixes this by switching to a UIC-primary token: both
+`SBB:8501120:0:5` and `SBB:8501120:0:4` and `ch:1:sloid:8501120:0:5`
+all parse to UIC `8501120` and produce the identical token. The lat/lon
+3-dp fallback only fires for endpoints without a parseable UIC chunk
+(non-Swiss feeds, the no-stop-id endpoints of access/egress walks —
+both of which are stripped before fingerprinting anyway).
 
 The `_build_comparison` helper in `app/api/journey.py`:
 
@@ -599,6 +639,18 @@ child element is present.
 
 ## Changelog
 
+- **2026-05-18 (v0.1.35.02)** — Fingerprint regression fix: UIC parsed
+  from stop_id is now the primary cross-engine stop token (was 4-dp
+  lat/lon in v0.1.35.01, which false-mismatched on real Pontarlier →
+  Geneva itineraries because OTP returns platform-precise coordinates
+  and OJP returns station centroids). Fallback to 3-dp lat/lon
+  (~110 m) absorbs cross-feed centroid variance for non-Swiss feeds.
+  Also adds a `{}` JSON-inspector button on OJP cards (was OTP-only)
+  so cross-engine mismatches can be debugged from the UI. New tests:
+  `TestUicTokenisation` class covering OTP simple/platform-suffixed
+  ids + OJP sloid + non-Swiss fallback + Pontarlier French-station
+  cross-engine match; plus a Lausanne-platform regression that pins
+  the v0.1.35.01 bug. §9.1.1 documents the regression and fix.
 - **2026-05-18** — Phase 2 (structured diff) shipped: cross-engine
   `transit_fingerprint(legs)` in `app/journey/signature.py` (walk/
   transfer-stripped, lat/lon-rounded to ~11 m to bridge the `SBB:` ↔
