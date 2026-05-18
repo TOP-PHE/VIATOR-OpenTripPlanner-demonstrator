@@ -1475,7 +1475,10 @@ Two operator questions about v0.1.27/28's coverage matrix:
 
 **Q1 — can we test the full day instead of just one departure time?**
 **Yes.** Coverage runs now ask OTP for `numItineraries=50` over a
-`searchWindow=86400` (24h) per pair, instead of the live-UI's `8 / 4h`.
+`searchWindow=86400` (24h) per pair, instead of the live-UI's `12 / 6h`
+(was `8 / 4h` before v0.1.35.04 — bumped so the OJP comparison surfaces
+1-2-transfer alternatives like Bern → Geneva via Neuchâtel that OTP's
+Pareto-optimal top-8 used to clip out).
 RAPTOR returns the full day's worth of trains in a single call; we
 get every alternative OTP can find for that A→B on that day.
 

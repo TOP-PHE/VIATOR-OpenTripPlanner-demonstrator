@@ -190,8 +190,8 @@ async def fetch_plan(
     to_lon: float,
     when: datetime,
     timeout_ms: int,
-    num_itineraries: int = 8,
-    search_window_seconds: int = 14400,
+    num_itineraries: int = 12,
+    search_window_seconds: int = 21600,
     from_stop_id: str | None = None,
     to_stop_id: str | None = None,
     session_timezone: str | None = None,
@@ -204,9 +204,23 @@ async def fetch_plan(
     widen OTP's search beyond the live-journey defaults — used by the
     network-coverage runner to fetch the full day's worth of trains for
     each pair in one call (50 itineraries / 24h window) instead of the
-    "next ~hour, top 8" the live UI wants. `num_itineraries` maps to the
+    "next 6 h, top 12" the live UI wants. `num_itineraries` maps to the
     connection's `first`; `search_window_seconds` is rendered as an
     ISO-8601 `Duration` literal (`PT<n>S`).
+
+    v0.1.35.04 — bumped live-UI defaults from 8/4 h to **12/6 h**. The
+    cross-engine OJP comparison was surfacing legitimate alternatives
+    (e.g. Bern → Geneva via Neuchâtel + Renens VD, IR66 → IC5 → IR90)
+    that OJP returned but OTP clipped because the 2-transfer route
+    ranked outside OTP's Pareto-optimal top 8. 12 itineraries widens
+    the slate enough to include 1-2-transfer alternatives in busy
+    corridors; 6 h widens the time band so the operator's chosen
+    departure time doesn't sit at the edge of the window. Cost: OTP
+    RAPTOR's near-quadratic scaling on `searchWindow` means each
+    fanout query takes ~1.5x the wall-time of the v0.1.29 defaults —
+    on SBB rail-only the difference is ~50 ms, well below the 5 s
+    `timeout_ms` ceiling. For dense national feeds (e.g. SNCF-FR) a
+    future operator-tunable override would be the right move.
 
     v0.1.34 — `from_stop_id` / `to_stop_id` (optional): when set, the
     corresponding endpoint is sent as a `stopLocation` instead of a
