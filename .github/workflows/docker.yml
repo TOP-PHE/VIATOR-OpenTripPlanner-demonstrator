@@ -63,7 +63,7 @@ jobs:
       needs.detect-changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write           # attach SBOM to GitHub releases on tag push (anchore/sbom-action)
       packages: write           # push to GHCR
       security-events: write    # upload Trivy SARIF to the Security tab
       actions: read             # required by github/codeql-action/upload-sarif to fetch run metadata
@@ -102,12 +102,20 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/viator-${{ matrix.image.name }}
+          # VIATOR uses a 4-part version scheme (vX.Y.Z.W) which strict
+          # SemVer rejects — `type=semver,pattern=...` extractors silently
+          # discard the tag and emit a "not a valid semver" warning per
+          # extractor per image (4 warnings per tag push). We use
+          # `type=match` instead to extract a bare-3-part-semver prefix
+          # for Docker consumers who want a moving `:0.1.35` pointer in
+          # addition to the canonical `:v0.1.35.04` tag from
+          # `type=ref,event=tag`. Major.minor matcher kept similarly.
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=v(\d+\.\d+\.\d+)\.\d+,group=1
+            type=match,pattern=v(\d+\.\d+)\.\d+\.\d+,group=1
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
           labels: |
