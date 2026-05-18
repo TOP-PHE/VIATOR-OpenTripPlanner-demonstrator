@@ -93,6 +93,22 @@
 .ojp-ref-panel { margin-top: 1.2rem; border-top: 2px solid var(--sleeper); padding-top: 0.8rem; }
 .ojp-ref-panel h3 { margin: 0 0 0.6rem; font-size: 1rem; }
 .ojp-ref-card { border-left: 3px solid var(--uic-blue); }
+/* v0.1.36 — Phase 2 structured comparison: a one-line summary strip
+   above the results showing how many itineraries the two engines agree
+   on, plus a small pill on each card tagging it as common / OTP-only /
+   OJP-only. Same palette as the .flag tokens above so the colour
+   semantics carry over (green = agreement, blue = OTP, amber = OJP). */
+.comparison-strip { display: flex; gap: 0.6rem; padding: 0.5rem 0.7rem; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; font-size: 0.82rem; margin-bottom: 0.6rem; align-items: center; flex-wrap: wrap; }
+.comparison-strip > .cmp-label { color: var(--rail-steel); font-weight: 600; margin-right: 0.2rem; }
+.cmp-count { padding: 0.05rem 0.5rem; border-radius: 999px; font-weight: 600; font-size: 0.78rem; }
+.cmp-count.common   { background: #e9f6ec; color: #1a7e3c; }
+.cmp-count.otp-only { background: #e8f0fb; color: #1F3B66; }
+.cmp-count.ojp-only { background: #fff8e1; color: #b3760e; }
+.cmp-pill { font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; font-weight: 600; letter-spacing: 0.3px; }
+.cmp-pill.common       { background: #e9f6ec; color: #1a7e3c; }
+.cmp-pill.otp-only     { background: #e8f0fb; color: #1F3B66; }
+.cmp-pill.ojp-only     { background: #fff8e1; color: #b3760e; }
+.cmp-pill.uncomparable { background: #eef0f2; color: #57606a; }
 {% endblock %}
 
 {% block content %}
@@ -373,6 +389,45 @@ function operatorsForTrip(legs) {
   ).join(' ');
 }
 
+// v0.1.36 — Phase 2 structured comparison.
+//
+// comparisonStrip(): the one-line summary above the result cards
+// (`Comparison: 2 common · 1 OTP-only · 1 OJP-only`). Returns '' when
+// no comparison ran (operator didn't opt in, or OJP didn't return).
+//
+// comparisonPill(): the per-card badge ('common' / 'otp-only' /
+// 'ojp-only' / 'uncomparable'). Returns '' when the field is absent so
+// Phase-1-only payloads (no comparison) render unchanged.
+function comparisonStrip(summary) {
+  if (!summary) return '';
+  // Server emits integers; the `|| 0` keeps the JS readable if the
+  // field is ever absent on an older payload. Math.trunc is explicit
+  // about "treat as integer" without the bitwise-coercion `| 0`
+  // shortcut SonarCloud rule javascript:S7767 flags as cryptic.
+  const c = Math.trunc(summary.common || 0);
+  const o = Math.trunc(summary.otp_only || 0);
+  const j = Math.trunc(summary.ojp_only || 0);
+  if (c === 0 && o === 0 && j === 0) return '';
+  return `<div class="comparison-strip">
+    <span class="cmp-label">Comparison vs Swiss OJP:</span>
+    <span class="cmp-count common">${c} common</span>
+    <span class="cmp-count otp-only">${o} OTP-only</span>
+    <span class="cmp-count ojp-only">${j} OJP-only</span>
+  </div>`;
+}
+function comparisonPill(tag) {
+  if (!tag) return '';
+  // Server emits snake_case ('otp_only'); the CSS class uses kebab-case.
+  const cls = tag.replace('_', '-');
+  const label = {
+    common: '✓ common',
+    'otp-only': 'OTP only',
+    'ojp-only': 'OJP only',
+    uncomparable: 'no transit',
+  }[cls] || tag;
+  return `<span class="cmp-pill ${cls}">${label}</span>`;
+}
+
 // v0.1.35 — render the external Swiss OJP reference-comparison panel.
 // `ref` is payload.ojp_reference: {status, trips, response_ms, error?}.
 // Absent entirely when the operator didn't opt in or the feature is off
@@ -398,11 +453,16 @@ function renderOjpReference(ref) {
   const cards = (ref.trips || []).map(t => {
     const legCount = t.legs.length;
     const tripOps = operatorsForTrip(t.legs);
+    // v0.1.36 — comparison pill (Phase 2). t.comparison is one of
+    // 'common' / 'ojp_only' / 'uncomparable', set by the server when
+    // OJP_COMPARISON_ENABLED and the OJP call succeeded. Absent on
+    // older Phase-1-only payloads.
+    const cmp = comparisonPill(t.comparison);
     return `<div class="trip-card ojp-ref-card">
       <div class="top">
         <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
              <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
-        <div class="top-actions">${tripOps || ''}</div>
+        <div class="top-actions">${cmp}${tripOps || ''}</div>
       </div>
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
         ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
@@ -451,6 +511,10 @@ function render(payload) {
     const flag = t.origin_flag.replace('_', '-');
     const legCount = t.best.legs.length;
     const tripOps = operatorsForTrip(t.best.legs);
+    // v0.1.36 — comparison pill (Phase 2). t.comparison is one of
+    // 'common' / 'otp_only' / 'uncomparable', set server-side. Empty
+    // string when comparison wasn't run (no OJP opt-in).
+    const cmp = comparisonPill(t.comparison);
     return `<div class="trip-card" data-trip-index="${i}">
       <div class="top">
         <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
@@ -459,6 +523,7 @@ function render(payload) {
           ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
           <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
                   title="Show OTP JSON for this itinerary">{}</button>
+          ${cmp}
           <span class="flag ${flag}">${t.origin_flag}</span>
         </div>
       </div>
@@ -472,11 +537,16 @@ function render(payload) {
       </div>
     </div>`;
   }).join('');
+  // v0.1.36 — Phase 2 comparison summary strip. Rendered above the
+  // result cards when OJP comparison was opted in AND succeeded. The
+  // three pills count distinct itinerary fingerprints (within-engine
+  // duplicates collapse).
+  const cmpStrip = comparisonStrip(payload.comparison_summary);
   // v0.1.35 — the Swiss OJP reference panel (if the operator opted in)
   // renders below VIATOR's own results. Its cards carry class
   // `trip-card`, so the expand-wiring below catches them for free.
   const ojpPanel = renderOjpReference(payload.ojp_reference);
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cards || '<p>No itineraries found.</p>'}${ojpPanel}`;
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${cards || '<p>No itineraries found.</p>'}${ojpPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable.
   el.querySelectorAll('.trip-card').forEach(card => {
