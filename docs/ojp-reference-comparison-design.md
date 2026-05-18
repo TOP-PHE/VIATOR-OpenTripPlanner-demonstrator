@@ -362,15 +362,18 @@ The fingerprint deliberately:
   makes those two engines' views of "the 08:31 IC1 Bern → Zürich"
   hash to the same value.
 - **Uses UIC (parsed from stop_id) as the primary stop token** (v0.1.35.02
-  on; v0.1.35.01 used lat/lon as primary — see §9.1.1). Both OTP and
-  OJP stop ids carry the 7-digit DiDok number for the same physical
-  station:
-  - OTP `SBB:8501120:0:5` → UIC `8501120`
-  - OJP `ch:1:sloid:8501120:0:5` → UIC `8501120`
-  Same UIC ⇒ same token, regardless of platform suffix or namespace
-  prefix. This is the strongest cross-engine identifier we have for
-  Swiss rail, and it sidesteps every coordinate-precision pitfall in
-  one go. (The within-feed `trip_signature` helper still uses
+  on; v0.1.35.01 used lat/lon as primary — see §9.1.1 + §9.1.2). OTP
+  embeds the full 7-digit UIC; OJP/opentransportdata.swiss uses the
+  4-digit Swiss DSN (DiDok-Nummer, the trailing 4 digits of the UIC)
+  which the parser reconstructs by prepending `850`:
+  - OTP `SBB:8507000:0:7` → UIC `8507000` (direct)
+  - OJP `ch:1:sloid:7000:4:7` → DSN 7000 → UIC `8507000` (reconstructed)
+  - OTP `SBB:8501120:0:5` → UIC `8501120` (direct)
+  - OJP `ch:1:sloid:1120:0:5` → DSN 1120 → UIC `8501120` (reconstructed)
+  Same UIC ⇒ same token, regardless of platform suffix, namespace
+  prefix, or the DSN/full-UIC distinction. This is the strongest
+  cross-engine identifier we have for Swiss rail, and it sidesteps
+  every coordinate-precision pitfall in one go. (The within-feed `trip_signature` helper still uses
   `stations_xref` + UIC via DB lookup; the cross-engine variant parses
   UIC from the stop_id string directly because `stations_xref` has no
   rows for the synthetic `OJP` reference feed.)
@@ -413,6 +416,42 @@ all parse to UIC `8501120` and produce the identical token. The lat/lon
 3-dp fallback only fires for endpoints without a parseable UIC chunk
 (non-Swiss feeds, the no-stop-id endpoints of access/egress walks —
 both of which are stripped before fingerprinting anyway).
+
+#### 9.1.2 The v0.1.35.02 → v0.1.35.03 SLOID-DSN regression
+
+v0.1.35.02 made an incorrect assumption about the OJP SLOID format. It
+was based on opentransportdata.swiss documentation that suggested the
+full UIC appears inside the SLOID (e.g. `ch:1:sloid:8501120:0:5`).
+Live OJP data captured via the new `{}` button on OJP cards (shipped
+in v0.1.35.02 specifically to debug these mismatches) showed the real
+format **drops the `850` Swiss country/DiDok prefix**:
+
+- Bern (UIC 8507000) → OJP SLOID `ch:1:sloid:7000:4:7`
+- Geneva (UIC 8501008) → OJP SLOID `ch:1:sloid:1008:2:3`
+- Lausanne (UIC 8501120) → OJP SLOID `ch:1:sloid:1120:0:5`
+
+The trailing 4 digits are the Swiss DSN (DiDok-Nummer). v0.1.35.02's
+regex required exactly 7 digits and silently fell through to the 3-dp
+lat/lon fallback for every Swiss OJP id. The OTP side still parsed
+cleanly to `UIC:8507000`, and the OJP side produced `46.949,7.437` —
+different tokens, no match.
+
+v0.1.35.03 extends `_uic_from_stop_id` to also recognise the 4-digit
+DSN when the id is in the Swiss `ch:1:…` namespace, prepending `850`
+to reconstruct the canonical UIC. Verified against Patrick's actual
+captured Bern → Geneva IR15 JSON: both sides fingerprint to the same
+16-hex token after the fix.
+
+The two-step parser strategy (7-digit first, then 4-digit-DSN-only-
+for-ch:1 namespace) handles all the formats seen in live data:
+
+| Source | Example stop_id | Parser path | Result |
+|---|---|---|---|
+| OTP (GTFS) | `SBB:8507000:0:7` | 7-digit regex | `UIC:8507000` |
+| OTP cross-border | `SBB:8771500` | 7-digit regex | `UIC:8771500` |
+| OJP Swiss | `ch:1:sloid:7000:4:7` | DSN regex + `850` prefix | `UIC:8507000` |
+| OJP cross-border | `ch:1:sloid:8771500:0:1` | 7-digit regex | `UIC:8771500` |
+| Non-Swiss feed | `STIB:1234` | (neither path matches) | None → lat/lon fallback |
 
 The `_build_comparison` helper in `app/api/journey.py`:
 
@@ -639,6 +678,22 @@ child element is present.
 
 ## Changelog
 
+- **2026-05-18 (v0.1.35.03)** — Swiss SLOID DSN reconstruction:
+  v0.1.35.02 assumed the OJP SLOID carried the full 7-digit UIC
+  (`ch:1:sloid:8507000:…`), but live data shows it uses the 4-digit
+  Swiss DSN (`ch:1:sloid:7000:…`, the trailing 4 digits of the UIC).
+  Without prefix reconstruction, the UIC regex couldn't match, so OJP
+  fell through to lat/lon while OTP cleanly produced `UIC:8507000` —
+  guaranteed mismatch. Fix: when the id is in the `ch:1:` Swiss
+  authority namespace and contains a 4-digit chunk, prepend `850` to
+  reconstruct the canonical UIC. Verified against Patrick's captured
+  Bern→Geneva IR15 JSON (the `{}` button shipped in v0.1.35.02 made
+  this debuggable in 60 seconds). New regression test pins the exact
+  Bern→Geneva scenario; `TestUicTokenisation` gains `test_ojp_sloid_
+  with_swiss_dsn_reconstructs_full_uic` and `test_dsn_prefix_only_
+  applied_for_swiss_namespace`. Cross-engine fixtures throughout the
+  test file updated to the real OJP SLOID format. §9.1.2 documents
+  the second regression and resolution.
 - **2026-05-18 (v0.1.35.02)** — Fingerprint regression fix: UIC parsed
   from stop_id is now the primary cross-engine stop token (was 4-dp
   lat/lon in v0.1.35.01, which false-mismatched on real Pontarlier →

@@ -181,24 +181,46 @@ class TestUicTokenisation:
         plat4 = transit_fingerprint([_rail_leg(to_stop_id="SBB:8501120:0:4")])
         assert plat5 == plat4
 
-    def test_ojp_sloid_yields_same_uic_as_otp(self):
-        # The whole point of v0.1.35.02: OTP's "SBB:8501120:0:5" and
-        # OJP's "ch:1:sloid:8501120:0:5" describe the same physical
-        # Lausanne CFF platform; both must produce the UIC token
-        # "UIC:8501120" so the fingerprint matches across engines.
+    def test_ojp_sloid_with_swiss_dsn_reconstructs_full_uic(self):
+        # v0.1.35.03 — opentransportdata.swiss SLOIDs use the 4-digit
+        # Swiss DSN (DiDok-Nummer), NOT the full UIC. Bern's UIC is
+        # 8507000; OJP emits "ch:1:sloid:7000:4:7" — just the trailing
+        # 4 digits. The parser must prepend "850" to reconstruct
+        # UIC:8507000, otherwise OTP's "SBB:8507000:0:7" and OJP's
+        # "ch:1:sloid:7000:4:7" produce different tokens and the
+        # fingerprint mismatches (the v0.1.35.02 regression Patrick
+        # caught on the Bern→Geneva IR15).
+        otp = transit_fingerprint([_rail_leg(from_stop_id="SBB:8507000:0:7")])
+        ojp = transit_fingerprint([_rail_leg(from_stop_id="ch:1:sloid:7000:4:7")])
+        assert otp == ojp
+
+    def test_ojp_sloid_full_uic_still_parses(self):
+        # Some OJP responses (non-Swiss stations, or older feeds) carry
+        # the full 7-digit UIC in the SLOID. The 7-digit search runs
+        # first and wins, so behaviour is identical to the OTP form.
         otp = transit_fingerprint([_rail_leg(from_stop_id="SBB:8501120:0:5")])
         ojp = transit_fingerprint([_rail_leg(from_stop_id="ch:1:sloid:8501120:0:5")])
         assert otp == ojp
 
+    def test_dsn_prefix_only_applied_for_swiss_namespace(self):
+        # A 4-digit chunk in a non-`ch:1:` id must NOT get the `850`
+        # prefix — it's not a Swiss DSN, just an arbitrary id. Falls
+        # through to lat/lon.
+        from app.journey.signature import _uic_from_stop_id
+
+        assert _uic_from_stop_id("ch:1:sloid:7000:4:7") == "8507000"
+        # Non-Swiss namespace: 4-digit chunk is NOT treated as a DSN.
+        assert _uic_from_stop_id("STIB:1234") is None
+        assert _uic_from_stop_id("BVG:5678:0:1") is None
+
     def test_no_uic_falls_back_to_3dp_latlon(self):
-        # Non-Swiss feed (no 7-digit UIC chunk in the stop_id) falls
-        # back to lat/lon. Two synthetic ids with the same lat/lon must
-        # still match.
+        # Non-Swiss feed (no parseable UIC chunk) falls back to lat/lon.
+        # Two synthetic ids with the same lat/lon must still match.
         a = transit_fingerprint(
             [
                 _rail_leg(
-                    from_stop_id="STIB:1234",
-                    to_stop_id="STIB:5678",
+                    from_stop_id="STIB:abcd",
+                    to_stop_id="STIB:efgh",
                     from_lat=50.85,
                     from_lon=4.35,
                 )
@@ -207,8 +229,8 @@ class TestUicTokenisation:
         b = transit_fingerprint(
             [
                 _rail_leg(
-                    from_stop_id="MIVB:abc",
-                    to_stop_id="MIVB:def",
+                    from_stop_id="MIVB:wxyz",
+                    to_stop_id="MIVB:1q2w",
                     from_lat=50.85,
                     from_lon=4.35,
                 )
@@ -219,8 +241,9 @@ class TestUicTokenisation:
     def test_pontarlier_french_station_in_sbb_feed(self):
         # Pontarlier is a French SNCF station present in the cross-
         # border SBB feed (route 91-P38). OTP emits it as
-        # "SBB:8771500"; OJP via opentransportdata.swiss emits it as
-        # "ch:1:sloid:8771500" or similar. Both yield UIC:8771500.
+        # "SBB:8771500"; OJP via opentransportdata.swiss may emit it
+        # with the full UIC (it's not a Swiss DSN, so no prefix to
+        # drop). Both yield UIC:8771500.
         otp = transit_fingerprint([_rail_leg(from_stop_id="SBB:8771500", route_short_name="P38")])
         ojp = transit_fingerprint(
             [_rail_leg(from_stop_id="ch:1:sloid:8771500:0:1", route_short_name="P38")]
@@ -234,12 +257,13 @@ class TestCrossEngineMatching:
     namespace and walk-leg presence."""
 
     def test_ojp_with_end_walks_matches_otp_without(self):
-        # OJP shape: end-walks framing the transit leg, opaque stop ids
-        # (ch:1:sloid:NNNNNNN:…). OTP-with-stop-id-routing shape: just
+        # OJP shape: end-walks framing the transit leg, opaque SLOID
+        # ids that use the 4-digit Swiss DSN (DiDok-Nummer, the trailing
+        # 4 digits of the UIC). OTP-with-stop-id-routing shape: just
         # the transit leg, OTP-namespaced stop ids (SBB:NNNNNNN). Both
-        # report the same physical Bern→Zürich at 08:31→09:28, and both
-        # ids carry the same UIC chunk (8507000 / 8503000) so the
-        # fingerprint matches via the UIC token.
+        # describe the same physical Bern→Zürich at 08:31→09:28: the
+        # parser reconstructs OJP "ch:1:sloid:7000" → UIC 8507000 to
+        # match OTP "SBB:8507000".
         ojp_itin = [
             _walk_leg(  # Origin → Bern (the access walk OJP renders)
                 from_lat=46.94884,
@@ -248,8 +272,8 @@ class TestCrossEngineMatching:
                 to_lon=7.43677,
             ),
             _rail_leg(
-                from_stop_id="ch:1:sloid:8507000:0:8",  # OJP stop reference
-                to_stop_id="ch:1:sloid:8503000:0:33",
+                from_stop_id="ch:1:sloid:7000:0:8",  # OJP DSN 7000 → UIC 8507000
+                to_stop_id="ch:1:sloid:3000:0:33",  # OJP DSN 3000 → UIC 8503000
             ),
             _walk_leg(  # Zürich → destination (egress walk)
                 from_lat=47.37852,
@@ -300,11 +324,18 @@ class TestCrossEngineMatching:
                 arrival="2026-05-25T14:25:00+00:00",
             ),
         ]
+        # OJP SLOIDs use the 4-digit Swiss DSN (the trailing 4 digits
+        # of the UIC) — Lausanne UIC 8501120 becomes ch:1:sloid:1120;
+        # Geneva UIC 8501008 becomes ch:1:sloid:1008. The parser
+        # reconstructs the full UIC by prepending `850`.
         ojp_itin = [
             _walk_leg(),  # Origin → Frasne access walk
             _rail_leg(  # TGV with OJP-namespaced ids + station-centroid coords
+                # Pontarlier is French (UIC starts with 87) — the test
+                # fixture uses a synthetic 8771513 for Frasne; both
+                # sides keep the full UIC since it's not a Swiss DSN.
                 from_stop_id="ch:1:sloid:8771513:0:1",
-                to_stop_id="ch:1:sloid:8501120:0:5",
+                to_stop_id="ch:1:sloid:1120:0:5",  # Lausanne DSN
                 from_lat=46.8569,  # different centroid — OJP source
                 from_lon=6.1564,
                 to_lat=46.5167,
@@ -315,8 +346,8 @@ class TestCrossEngineMatching:
             ),
             _walk_leg(),  # Lausanne platform-transfer walk
             _rail_leg(  # IC1 from same Lausanne UIC, different platform suffix
-                from_stop_id="ch:1:sloid:8501120:0:4",
-                to_stop_id="ch:1:sloid:8501008:0:3",
+                from_stop_id="ch:1:sloid:1120:0:4",  # Lausanne DSN, plat 4
+                to_stop_id="ch:1:sloid:1008:0:3",  # Geneva DSN
                 from_lat=46.5167,
                 from_lon=6.6294,
                 to_lat=46.2103,
@@ -326,6 +357,68 @@ class TestCrossEngineMatching:
                 arrival="2026-05-25T14:25:00+00:00",
             ),
             _walk_leg(),  # Geneva → destination egress walk
+        ]
+        assert transit_fingerprint(otp_itin) == transit_fingerprint(ojp_itin)
+
+    def test_bern_to_geneva_ir15_direct_matches_cross_engine(self):
+        # Regression test for the v0.1.35.02 bug: direct IR15 Bern→Geneva.
+        # OTP emits SBB:8507000:0:7 (Bern UIC 8507000 + platform 7) and
+        # SBB:8501008:0:3 (Geneva UIC 8501008 + platform 3). OJP emits
+        # ch:1:sloid:7000:4:7 and ch:1:sloid:1008:2:3 (Swiss DSNs).
+        # v0.1.35.02 only parsed 7-digit chunks, so OJP fell through to
+        # 3-dp lat/lon while OTP matched on UIC → different tokens. The
+        # v0.1.35.03 fix reconstructs the UIC by prepending `850`.
+        # Numbers transcribed from the live JSON Patrick captured via
+        # the {} button shipped in v0.1.35.02.
+        otp_itin = [
+            _walk_leg(  # Origin → Bern
+                from_lat=46.949113,
+                from_lon=7.438483,
+                to_lat=46.9485674,
+                to_lon=7.4368288,
+            ),
+            _rail_leg(  # IR15 Bern → Geneva (direct, 2h)
+                from_stop_id="SBB:8507000:0:7",
+                to_stop_id="SBB:8501008:0:3",
+                from_lat=46.9485674,
+                from_lon=7.4368288,
+                to_lat=46.2105224,
+                to_lon=6.1424194,
+                route_short_name="IR15",
+                departure="2026-05-20T05:04:00+00:00",
+                arrival="2026-05-20T07:05:00+00:00",
+            ),
+            _walk_leg(  # Geneva → Destination
+                from_lat=46.2105224,
+                from_lon=6.1424194,
+                to_lat=46.208942,
+                to_lon=6.145262,
+            ),
+        ]
+        ojp_itin = [
+            _walk_leg(  # OJP access walk Bern Hbf surface → platform
+                from_lat=46.94911,
+                from_lon=7.43848,
+                to_lat=46.94857,
+                to_lon=7.43683,
+            ),
+            _rail_leg(  # IR15 Bern → Geneva with OJP SLOID
+                from_stop_id="ch:1:sloid:7000:4:7",  # → UIC 8507000
+                to_stop_id="ch:1:sloid:1008:2:3",  # → UIC 8501008
+                from_lat=46.94857,
+                from_lon=7.43683,
+                to_lat=46.21052,
+                to_lon=6.14242,
+                route_short_name="IR15",
+                departure="2026-05-20T05:04:00+00:00",
+                arrival="2026-05-20T07:05:00+00:00",
+            ),
+            _walk_leg(  # OJP egress walk Geneva platform → Genève surface
+                from_lat=46.21052,
+                from_lon=6.14242,
+                to_lat=46.20894,
+                to_lon=6.14526,
+            ),
         ]
         assert transit_fingerprint(otp_itin) == transit_fingerprint(ojp_itin)
         assert transit_fingerprint(otp_itin) != ""
@@ -389,16 +482,18 @@ class TestBuildComparison:
     def test_cross_engine_match_via_uic(self):
         # The integration test: OJP renders end-walks and uses opaque
         # stop ids; OTP (stop-id routing) doesn't. _build_comparison
-        # should still bucket them as common because both stop ids
-        # carry the same 7-digit UIC chunk (8507000 / 8503000) — the
-        # cross-engine matching mechanism v0.1.35.02 ships.
+        # should still bucket them as common because the parser
+        # reconstructs OJP's 4-digit Swiss DSN (DiDok-Nummer) into the
+        # full 7-digit UIC by prepending `850`, so OJP "ch:1:sloid:7000"
+        # matches OTP "SBB:8507000" — both yield UIC:8507000. This is
+        # the v0.1.35.03 fix that closes the v0.1.35.02 regression.
         otp = [_merged_trip([_rail_leg(from_stop_id="SBB:8507000", to_stop_id="SBB:8503000")])]
         ref = _ojp_ref(
             [
                 _walk_leg(),
                 _rail_leg(
-                    from_stop_id="ch:1:sloid:8507000:0:8",
-                    to_stop_id="ch:1:sloid:8503000:0:33",
+                    from_stop_id="ch:1:sloid:7000:0:8",  # Bern DSN → 8507000
+                    to_stop_id="ch:1:sloid:3000:0:33",  # Zürich HB DSN → 8503000
                 ),
                 _walk_leg(),
             ]
