@@ -55,7 +55,16 @@ from .credentials import AuthType, apply_to_request
 # any more, but keep the structural map for clarity:
 _DEFAULT_ROUTING_DEFAULTS = {
     "numItineraries": 5,
-    "transferSlack": "2m",
+    # v0.1.35.05: bumped 2m -> 5m to compensate for TransferConstraints
+    # being disabled on the nap-ch-rail session (see docs/nap-ch-rail.md
+    # §5.3). With TransferConstraints off, OTP uses a single global
+    # transferSlack for every transfer; SBB's transfers.txt had 36K
+    # rows with station-specific min times of 4-7 min at major hubs.
+    # 5m gives 2-leg journeys at Bern / Zürich HB / Basel SBB realistic
+    # physical-feasibility headroom without bloating most itinerary
+    # durations (the 3 extra minutes only kick in when there's a tight
+    # connection to begin with).
+    "transferSlack": "5m",
     # v0.1.24: OTP 2.9 renamed `maxAccessEgressDurationForMode` (flat,
     # uppercase mode keys) to `accessEgress.maxDurationForMode` (nested,
     # lowercase keys). The old form triggered a "Unexpected config

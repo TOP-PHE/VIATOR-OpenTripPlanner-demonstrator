@@ -296,30 +296,34 @@ Must be owned by `1000:1000` (the `appuser` inside the OTP container).
 |---|---|---|
 | `OptimizeTransfers` | When RAPTOR finds multiple itineraries with the same arrival time, pick the transfer station/time optimal for non-time criteria (fewer transfers, less walking) | Negligible — 1- and 2-leg journeys (95% of demo queries) are unaffected. On 3+ leg journeys the displayed transfer station may be sub-optimal but the journey still works. |
 | `ConsiderPatternsForDirectTransfers` | Only generate walking-only direct transfers between stops actually served by useful patterns | Negligible — adds a few unused walking edges to the graph; doesn't affect computed itineraries. |
-| **`TransferConstraints`** | Read `transfers.txt` and enforce per-station, per-train minimum and maximum transfer times, including "transfer impossible" rows | **Real impact** — OTP now uses one generic `transferSlack` (default `2m`) for every transfer. SBB's `transfers.txt` encoded 36K rows of station-specific min transfer times (most 4–7 min at major hubs). Some computed itineraries will show physically-infeasible 2-min transfers at Zürich HB / Bern / Basel SBB. See §5.3 mitigation. |
+| **`TransferConstraints`** | Read `transfers.txt` and enforce per-station, per-train minimum and maximum transfer times, including "transfer impossible" rows | **Real impact** — OTP now uses one generic `transferSlack` (was `2m`, bumped to `5m` in v0.1.35.05 — see §5.3) for every transfer. SBB's `transfers.txt` encoded 36K rows of station-specific min transfer times (most 4–7 min at major hubs). With the 5m global slack the worst infeasible-2-minute transfers at Zürich HB / Bern / Basel SBB are gone; some technically-feasible 2-minute platform-adjacent transfers at smaller stations are now over-conservative, which is the acceptable side of the trade-off. |
 
-### 5.3 Mitigation for `TransferConstraints` off — raise `transferSlack`
+### 5.3 Mitigation for `TransferConstraints` off — `transferSlack` raised to 5m *(applied v0.1.35.05)*
 
-To compensate for the lost per-platform precision, bump the global
-transfer slack in [docker/otp/router-config.json](../docker/otp/router-config.json)
-from `2m` to `5m`:
+To compensate for the lost per-platform precision, the global transfer
+slack in [docker/otp/router-config.json](../docker/otp/router-config.json)
+is bumped from `2m` (OTP's default) to `5m`:
 
-```diff
-   "routingDefaults": {
-     "numItineraries": 5,
--    "transferSlack": "2m",
-+    "transferSlack": "5m",
-     "walkSpeed": 1.3,
+```json
+"routingDefaults": {
+  "numItineraries": 5,
+  "transferSlack": "5m",
+  ...
+}
 ```
 
-This is a global change — affects every session, not just CH. Acceptable
-trade-off because:
+The Python equivalent in `app/router_config.py::_DEFAULT_ROUTING_DEFAULTS`
+mirrors this so sessions built without an explicit router-config keep the
+same behaviour.
+
+Global change — affects every session, not just CH. Acceptable trade-off
+because:
 
 - For rail-rail transfers at major hubs (Paris Gare de Lyon, Zürich HB,
-  Frankfurt Hbf), 5 min is the operational reality anyway
+  Frankfurt Hbf), 5 min is the operational reality anyway.
 - For platform-adjacent transfers (e.g. cross-platform IR → S-Bahn at small
   Swiss stations), 5 min may be conservative — search will miss a few
-  technically-feasible 2-minute transfers but never propose an impossible one
+  technically-feasible 2-minute transfers but never propose an impossible one.
 
 If a session needs per-platform precision (e.g. a passenger-information
 deployment, not a demonstrator), build it with `TransferConstraints=true`
