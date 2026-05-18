@@ -85,30 +85,57 @@ def trip_signature(db: DbSession, *, session_id: str, legs: list[dict[str, Any]]
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-# A 7-digit chunk of the stop_id is the UIC code (Swiss DiDok number).
-# Examples seen in the field:
-#   OTP:  "SBB:8501120"          → UIC 8501120 (Lausanne)
-#   OTP:  "SBB:8501120:0:5"      → same UIC, with platform suffix "0:5"
-#   OTP:  "SBB:8771500"          → UIC 8771500 (Pontarlier, French station
-#                                   present in the cross-border SBB feed)
-#   OJP:  "ch:1:sloid:8501120"          → UIC 8501120
-#   OJP:  "ch:1:sloid:8501120:0:5"      → same UIC + platform
-# Anchored on `(?<!\d)…(?!\d)` so we don't accidentally pick a longer run
-# of digits or a substring of one — the UIC is always exactly 7 digits.
+# Stop-id formats observed in the field:
+#
+#   OTP — GTFS-derived, embeds the full 7-digit UIC:
+#     "SBB:8507000"          → UIC 8507000 (Bern)
+#     "SBB:8507000:0:7"      → same UIC + platform suffix
+#     "SBB:8501008:0:3"      → UIC 8501008 (Geneva)
+#
+#   OJP — opentransportdata.swiss SLOID, drops the `850` Swiss
+#   country/DiDok prefix and uses the 4-digit DSN (DiDok number):
+#     "ch:1:sloid:7000:4:7"  → DSN 7000, reconstructed UIC = 850+7000 = 8507000
+#     "ch:1:sloid:1008:2:3"  → DSN 1008, reconstructed UIC = 8501008
+#     "ch:1:sloid:1120:0:5"  → DSN 1120, reconstructed UIC = 8501120 (Lausanne)
+#
+# Both forms regex-anchored on `(?<!\d)…(?!\d)` so we don't pick a
+# substring of a longer run of digits or a sub-stop index that happens
+# to be the right length.
 _UIC_RE = re.compile(r"(?<!\d)(\d{7})(?!\d)")
+_SWISS_DSN_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+_SWISS_SLOID_PREFIX = "ch:1:"  # opentransportdata.swiss authority namespace
 
 
 def _uic_from_stop_id(stop_id: str | None) -> str | None:
-    """Parse the 7-digit UIC code out of an OTP or OJP stop_id.
+    """Parse the canonical 7-digit UIC out of an OTP or OJP stop_id.
 
-    Returns None for stop_ids that don't contain a 7-digit chunk
-    (non-Swiss feeds, synthetic ids, or `None`). The caller falls back
-    to lat/lon-based tokens in that case.
+    Strategy:
+      1. If the id contains a 7-digit chunk, take it directly. Covers OTP
+         GTFS ids (``SBB:8507000:0:7``) and any non-Swiss OJP stop refs
+         that happen to carry the full UIC.
+      2. If the id is in the Swiss OJP authority namespace
+         (``ch:1:…``) and contains a 4-digit chunk, treat that as a
+         Swiss DSN (DiDok-Nummer) and prepend ``850`` to reconstruct
+         the full UIC. ``ch:1:sloid:7000:4:7`` becomes ``8507000``.
+      3. Otherwise return None — the caller falls back to a lat/lon
+         token.
+
+    This is the v0.1.35.03 expansion. v0.1.35.02 only did step 1 and
+    fell through to lat/lon for every Swiss OJP id (because the SLOID
+    has no 7-digit chunk), which broke the cross-engine match. Live
+    OJP data (Patrick's Bern→Genève IR15 JSON dump, v0.1.35.02) showed
+    the DSN form is what opentransportdata.swiss actually emits.
     """
     if not stop_id:
         return None
     m = _UIC_RE.search(stop_id)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    if stop_id.startswith(_SWISS_SLOID_PREFIX):
+        m = _SWISS_DSN_RE.search(stop_id)
+        if m:
+            return "850" + m.group(1)
+    return None
 
 
 def _round_latlon_coarse(lat: float | None, lon: float | None) -> str:
