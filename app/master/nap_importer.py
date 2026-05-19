@@ -47,8 +47,31 @@ log = logging.getLogger(__name__)
 DEFAULT_FR_NAP_URL = "https://transport.data.gouv.fr/api/datasets"
 
 # Heuristic mode detection — the NAP API doesn't expose modes structurally,
-# so we substring-match dataset titles + tags. Lower-cased for case-insens.
-# Lists are intentionally permissive to catch operator naming variations.
+# so we match dataset titles + tags against per-mode keyword sets. Lists
+# are intentionally permissive to catch operator naming variations.
+#
+# v0.1.35.07 — switched from naive substring matching to a compiled regex
+# per mode, with **word-boundary anchors** on the ambiguous-short
+# keywords below. The previous substring match silently false-positive'd
+# 36 "Navette" (shuttle) datasets as rail because `"ave"` (Renfe AVE)
+# appears as a substring of `navette`. Same risk: "ter " (used to dodge
+# "interurbain", which actually doesn't contain "ter ") survived only
+# because the haystack-join added trailing spaces. Word-boundary makes
+# the intent explicit and removes the trailing-space hack.
+#
+# `_AMBIGUOUS_SHORT_KEYWORDS` are matched only with `\b` on both sides.
+# Other keywords are matched as substrings (faster, and longer/unique
+# enough that false positives are vanishingly rare).
+_AMBIGUOUS_SHORT_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "ave",  # Renfe AVE; substring matches "navette" (false positive on 36 datasets)
+        "ter",  # SNCF regional; substring matches "interurbain"
+        "rer",  # Île-de-France RER; substring matches "interurbain"
+        "tram",  # tramway; substring matches "trampoline"-style false positives
+        "vae",  # vélo à assistance électrique
+    }
+)
+
 _MODE_KEYWORDS: dict[str, set[str]] = {
     "rail": {
         # SNCF brands
@@ -56,7 +79,7 @@ _MODE_KEYWORDS: dict[str, set[str]] = {
         "ouigo",
         "intercité",
         "intercite",
-        "ter ",
+        "ter",
         # Operators (in French context)
         "sncf",
         "trenitalia",
@@ -75,7 +98,7 @@ _MODE_KEYWORDS: dict[str, set[str]] = {
         # Île-de-France — accent variants matter because str.lower() preserves
         # combining marks ("Île-de-France" → "île-de-france", with î intact).
         "transilien",
-        "rer ",
+        "rer",
         "métro",
         "metro",
         "idfm",
@@ -87,7 +110,7 @@ _MODE_KEYWORDS: dict[str, set[str]] = {
         # mixed-mode dataset like "Réseaux urbains et interurbains" gets
         # both modes, which is the desired behaviour.
         "tramway",
-        "tram ",
+        "tram",
         "urbain",
         "ratp",
         "métropole",
@@ -106,10 +129,34 @@ _MODE_KEYWORDS: dict[str, set[str]] = {
     "bike": {
         "vélo",
         "velo",
-        "vae ",
+        "vae",
         "bicycle",
         "vls",
     },
+}
+
+
+def _compile_mode_regex(keywords: set[str]) -> re.Pattern[str]:
+    """Build a compiled regex matching any keyword in this mode.
+
+    Ambiguous-short keywords get `\\b` word-boundary anchors; longer
+    keywords are matched as raw substrings (still inside the regex
+    alternation, but without `\\b` since false-positive risk is low).
+    Sorted longest-first so the alternation matches the most specific
+    keyword when several would apply (matters for matching priority,
+    not for the boolean result this function ultimately serves).
+    """
+    parts = []
+    for kw in sorted(keywords, key=len, reverse=True):
+        if kw in _AMBIGUOUS_SHORT_KEYWORDS:
+            parts.append(rf"\b{re.escape(kw)}\b")
+        else:
+            parts.append(re.escape(kw))
+    return re.compile("|".join(parts), re.IGNORECASE | re.UNICODE)
+
+
+_MODE_REGEXES: dict[str, re.Pattern[str]] = {
+    mode: _compile_mode_regex(kws) for mode, kws in _MODE_KEYWORDS.items()
 }
 
 # Format preference order for OTP routing. The first format on this list
@@ -187,11 +234,11 @@ def classify_modes(dataset: dict[str, Any]) -> set[str]:
             " ".join((tag or "").lower() for tag in (dataset.get("tags") or [])),
         ]
     )
-    modes: set[str] = set()
-    for mode, keywords in _MODE_KEYWORDS.items():
-        if any(kw in haystack for kw in keywords):
-            modes.add(mode)
-    return modes
+    # v0.1.35.07 — was: substring match (`kw in haystack`). Now: compiled
+    # regex per mode with `\b` anchors on ambiguous-short keywords. Fixes
+    # the "ave" inside "navette" false-positive that polluted rail-filtered
+    # NAP previews with 36 shuttle/airport-shuttle datasets.
+    return {mode for mode, regex in _MODE_REGEXES.items() if regex.search(haystack)}
 
 
 def select_resource(dataset: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
