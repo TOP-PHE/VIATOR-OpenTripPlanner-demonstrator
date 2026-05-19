@@ -220,6 +220,28 @@ on `"ave"` (Renfe AVE keyword) matched inside `"navette"` — fixed in
 v0.1.35.07 by switching `classify_modes()` to word-boundary regex on
 ambiguous-short keywords.
 
+**Important nuance — `urban`-tagged datasets can include rail.** IDFM,
+TCL (Lyon), and most large urban-network datasets bundle bus + tram +
+metro + RER + Transilien into one big multi-modal GTFS. They get tagged
+`urban` (sometimes also `bus`) by `classify_modes()` because that's the
+dominant mode by title. They do **not** get tagged `rail` even though
+they carry RER / Transilien / Metro trains. This is intentional:
+
+- The classifier reflects "dominant mode by title", not "all modes
+  present" (which would require parsing every GTFS during preview).
+- The `mode=rail` filter is meant to surface **intercity / regional
+  rail operators** for focused-purpose rail sessions, not all-modes
+  urban aggregates.
+- Once an operator picks IDFM (or any urban-tagged dataset), OTP routes
+  through every mode the GTFS contains — RER and Transilien included.
+  The tag doesn't gate routing capability; it only affects what shows
+  up in the preview UI.
+
+**So**: for Île-de-France rail, pick IDFM (under `mode=urban`) — its
+RER and Transilien come along automatically. For nation-wide rail, pick
+the SNCF national GTFS (under `mode=rail`). Together they cover all
+metropolitan rail in France.
+
 ### 3.4 Deliberately omitted — why
 
 | Source | Why we skip |
