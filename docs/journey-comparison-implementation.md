@@ -35,6 +35,8 @@ each finds alone.
 | v0.1.35.02 | [#86](https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/pull/86) | 2026-05-18 | **Fingerprint** — UIC-aware token (was lat/lon-only). Parses 7-digit UIC out of `SBB:NNNNNNN` ids. Added a `{}` debug button to OJP cards. (Fixed: Pontarlier → Geneva via Lausanne fingerprinted as ojp_only because OTP returns platform-precise coords. UIC sidesteps coord precision.) |
 | v0.1.35.03 | [#87](https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/pull/87) | 2026-05-18 | **Fingerprint** — Swiss SLOID DSN reconstruction. OJP emits `ch:1:sloid:7000:4:7` not `ch:1:sloid:8507000:0:7` — the `850` country prefix is dropped, only the 4-digit DSN survives. Parser now prepends `850` for `ch:1:` namespace ids. (Fixed: Bern → Geneva IR15 fingerprinted as ojp_only.) |
 | v0.1.35.04 | [#88](https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/pull/88) | 2026-05-18 | **OTP defaults** — `num_itineraries` 8 → 12, `searchWindow` 4 h → 6 h. Wider slate for 1–2-transfer alternatives. |
+| v0.1.35.05 | [#91](https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/pull/91) | 2026-05-18 | **transferSlack** — 2 m → 5 m. Applies the long-prescribed `nap-ch-rail.md §5.3` mitigation for `TransferConstraints` being disabled; eliminates physically-infeasible 2-min transfers at major hubs. |
+| v0.1.35.06 | (this release) | 2026-05-18 | **OJP pagination** — `fetch_reference_paginated` issues up to 4 sequential `TripRequest`s with successively-later anchor times until OJP's coverage catches up to OTP's 6 h window. Closes the structural alignment gap that left legitimate trains in OTP's tail bucketed as spurious `otp_only`. See §2.6 below. |
 
 ### 1.2 What the operator sees
 
@@ -172,6 +174,45 @@ The 3-dp fallback is intentional. The 4-dp precision the within-feed
 OTP and OJP report the same station's centroid with up to ~100 m
 disagreement (entrance vs platform vs ticket hall, depending on
 which source datafile each engine ingested).
+
+### 2.6 OJP anchor-time pagination *(v0.1.35.06)*
+
+**Why**: OTP's `planConnection` covers a *time window*
+(`searchWindow=21600s` = 6 h at the v0.1.35.04 default). OJP's
+`TripRequest` covers a *trip count* (~6 alternatives clustered around
+the requested time) with no `searchWindow` parameter. On a busy
+corridor like Bern ↔ Geneva, a single OJP request spans only ~2 h,
+so the comparison strip shows spurious `otp_only` itineraries for
+trains in the 2–6 h tail of OTP's range — trains OJP would happily
+return if asked, just not in *this* request.
+
+**What**: `fetch_reference_paginated` in `app/journey/ojp_client.py`
+issues **up to 4 sequential `TripRequest`s** with successively-later
+anchor times. Each follow-up request is anchored at `latest departure
+from the previous batch + 1 min`. Loops until any of:
+
+1. OJP returns an empty batch (exhausted at this anchor).
+2. All trips in a batch are duplicates of earlier pages
+   (`transit_fingerprint` match) → no forward progress.
+3. Latest trip's `departure_at` >= `when + 6 h` → OJP coverage caught up.
+4. `max_pages=4` reached (rate-limit safety cap).
+5. A page raises mid-flight → if we have partial data, return it with
+   a warning logged; otherwise propagate so the caller maps to
+   `error` / `rate_limited`.
+
+Boundary deduplication uses the same `transit_fingerprint` that
+powers `_build_comparison`. The fanout response gains a `pages` field
+on `ojp_reference` when pagination fired (>1), so the UI can show
+"OJP took N requests to cover the window" if desired.
+
+**Cost**: pages are sequential (next anchor unknown until previous
+batch returns). 4 pages × ~600 ms = ~2.4 s for OJP-side wall-time in
+the worst case. The fanout runs OJP and OTP in parallel
+(`asyncio.gather`), so user-visible wall-time is `max(otp, ojp)`, not
+the sum. Rate-limit math: a heavy operator running one search per
+second peaks at ~4 OJP calls/sec ≈ 240/min, well past the 50/min
+free-tier ceiling — the per-search opt-in toggle is the design safety
+net.
 
 ---
 
@@ -360,6 +401,14 @@ A quick reference for when the comparison strip surprises you.
 
 ## Changelog
 
+- **2026-05-18 (v0.1.35.06)** — New §2.6 describing OJP anchor-time
+  pagination. Closes the structural alignment gap between OTP's
+  time-window coverage (`searchWindow=6h`) and OJP's trip-count
+  coverage (~6 alternatives per request). Up to 4 sequential
+  `TripRequest`s per search, fingerprint-deduped at the boundary,
+  sequential not parallel (each anchor requires the previous batch's
+  latest departure). v0.1.35.05 also rolled in (transferSlack 2 m →
+  5 m); added to the version table.
 - **2026-05-18 (v0.1.35.04)** — Initial version of this doc.
   Consolidates the implementation history, OTP tuning decisions,
   divergence-is-expected position, and diagnostic checklist into one

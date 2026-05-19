@@ -181,7 +181,15 @@ async def _query_ojp_reference(
         return int((time.monotonic() - start) * 1000)
 
     try:
-        _raw, trips = await ojp_client.fetch_reference(
+        # v0.1.35.06 — anchor-time pagination. OJP's TripRequest caps by
+        # alternative count (~6), not by time window; OTP's planConnection
+        # covers `searchWindow` (currently 6h). Without pagination, the
+        # comparison strip shows spurious `otp_only` itineraries in OTP's
+        # tail. fetch_reference_paginated issues up to 4 sequential OJP
+        # requests, anchored at successively-later times, deduplicating
+        # boundary trips via transit_fingerprint. Target window matches
+        # OTP's fetch_plan default (6h = 21600s).
+        trips, _ojp_total_ms, pages = await ojp_client.fetch_reference_paginated(
             from_lat=body.from_.lat,
             from_lon=body.from_.lon,
             to_lat=body.to.lat,
@@ -192,12 +200,20 @@ async def _query_ojp_reference(
             token=str(cfg["OJP_API_TOKEN"]),
             from_name=body.from_.label,
             to_name=body.to.label,
+            target_window_seconds=21600,
+            max_pages=4,
         )
-        return {
+        result: dict[str, Any] = {
             "status": "ok" if trips else "no_route",
             "trips": trips,
             "response_ms": _ms(),
         }
+        # Surface page count so the UI / operator can see whether
+        # pagination actually fired. >1 = OJP needed multiple calls to
+        # catch up to OTP's window.
+        if pages > 1:
+            result["pages"] = pages
+        return result
     except (TimeoutError, httpx.TimeoutException):
         return {"status": "timeout", "trips": [], "response_ms": _ms()}
     except httpx.HTTPStatusError as exc:
