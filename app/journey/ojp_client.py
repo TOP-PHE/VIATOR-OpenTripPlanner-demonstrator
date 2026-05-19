@@ -277,106 +277,133 @@ async def fetch_reference_paginated(
     caller invokes this in parallel with the OTP fanout, not in
     series, so wall-time impact is the max of the two.
     """
-    from .signature import transit_fingerprint  # local import: avoids a
-    # cycle on module load (signature.py is DB-free but pulls SQLAlchemy
-    # for trip_signature; importing it lazily keeps ojp_client importable
-    # in environments that don't have SQLAlchemy on the path, e.g. the
-    # `network_coverage` runner stubs).
-
     target_end_ts = when.timestamp() + target_window_seconds
     anchor = when
     all_trips: list[dict[str, Any]] = []
     seen_fps: set[str] = set()
     total_ms = 0
     pages = 0
+    fetch_kwargs = {
+        "from_lat": from_lat,
+        "from_lon": from_lon,
+        "to_lat": to_lat,
+        "to_lon": to_lon,
+        "timeout_ms": timeout_ms,
+        "endpoint": endpoint,
+        "token": token,
+        "from_name": from_name,
+        "to_name": to_name,
+        "num_results": num_results,
+    }
 
     for _ in range(max_pages):
         pages += 1
-        try:
-            _raw, batch = await fetch_reference(
-                from_lat=from_lat,
-                from_lon=from_lon,
-                to_lat=to_lat,
-                to_lon=to_lon,
-                when=anchor,
-                timeout_ms=timeout_ms,
-                endpoint=endpoint,
-                token=token,
-                from_name=from_name,
-                to_name=to_name,
-                num_results=num_results,
-            )
-        except httpx.HTTPError:
-            # If page 1 failed, the caller needs the exception so it can
-            # map to error/rate_limited. If we already have partial data,
-            # swallow it and return what we got — beats nothing.
-            if not all_trips:
-                raise
-            log.warning(
-                "OJP pagination stopped mid-flight at page %d (kept %d trips so far)",
-                pages,
-                len(all_trips),
-            )
-            return all_trips, total_ms, pages
-
-        # Approximate per-page latency: we don't have access to the
-        # underlying response's elapsed time, so use ~timeout_ms / 12 as
-        # a rough order-of-magnitude estimate. Callers care about totals
-        # for surfacing in the UI, not per-page precision.
-        # In practice _query_ojp_reference times the WHOLE paginated
-        # call externally (monotonic clock around the await), so this
-        # field is informational only.
-        # NOTE: kept here so the return shape is self-contained.
+        batch, stop = await _fetch_one_page(anchor, fetch_kwargs, all_trips, pages)
+        # Approximate per-page latency (callers time the whole paginated
+        # call externally; this is informational only — see _query_
+        # ojp_reference which uses its own monotonic clock).
         total_ms += max(1, timeout_ms // 12)
-
+        if stop:
+            return all_trips, total_ms, pages
         if not batch:
-            break  # operator exhausted at this anchor
+            break  # OJP exhausted at this anchor
 
-        new_trips: list[dict[str, Any]] = []
-        latest_dep_ts: float | None = None
-        for t in batch:
-            fp = transit_fingerprint(t.get("legs") or [])
-            if fp and fp in seen_fps:
-                # Boundary dup — skip but still consider its departure
-                # for advancing the anchor (the dup itself proves OJP
-                # has caught up to where we left off).
-                pass
-            else:
-                if fp:
-                    seen_fps.add(fp)
-                new_trips.append(t)
-
-            dep_str = t.get("departure_at")
-            if dep_str:
-                try:
-                    dep_ts = datetime.fromisoformat(dep_str).timestamp()
-                    if latest_dep_ts is None or dep_ts > latest_dep_ts:
-                        latest_dep_ts = dep_ts
-                except ValueError:
-                    pass
-
+        new_trips, latest_dep_ts = _dedup_batch_and_track_latest_dep(batch, seen_fps)
         if not new_trips:
-            # All trips in this batch were dups → no forward progress,
-            # OJP isn't going to give us anything beyond what we have.
-            break
+            break  # all-dups → no forward progress
 
         all_trips.extend(new_trips)
-
-        if latest_dep_ts is None:
-            # Unusual: trips with no parseable departure_at. Can't
-            # advance the anchor; stop here.
-            break
-
-        if latest_dep_ts >= target_end_ts:
-            break  # caught up to OTP's window
-
-        # Next anchor: 1 minute past the latest departure in this batch.
-        # The +60 s nudge avoids OJP returning the same train as the
-        # leading edge of the next batch (it would just be a dup, but
-        # nudging slightly past is cheaper than handling it).
-        anchor = datetime.fromtimestamp(latest_dep_ts + 60.0, tz=UTC)
+        next_anchor = _next_anchor_or_none(latest_dep_ts, target_end_ts)
+        if next_anchor is None:
+            break  # caught up to OTP's window, or unparseable times
+        anchor = next_anchor
 
     return all_trips, total_ms, pages
+
+
+async def _fetch_one_page(
+    anchor: datetime,
+    fetch_kwargs: dict[str, Any],
+    partial: list[dict[str, Any]],
+    page_num: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Call fetch_reference once. Returns (batch, stop).
+
+    `stop=True` signals the paginator to return immediately with the
+    partial data already collected (used when an HTTP error fires
+    mid-flight after at least page 1 succeeded — better UX than
+    discarding the whole comparison). HTTP errors with no partial
+    data yet propagate so the caller maps to error / rate_limited.
+    """
+    try:
+        _raw, batch = await fetch_reference(when=anchor, **fetch_kwargs)
+    except httpx.HTTPError:
+        if not partial:
+            raise
+        log.warning(
+            "OJP pagination stopped mid-flight at page %d (kept %d trips so far)",
+            page_num,
+            len(partial),
+        )
+        return [], True
+    return batch, False
+
+
+def _dedup_batch_and_track_latest_dep(
+    batch: list[dict[str, Any]], seen_fps: set[str]
+) -> tuple[list[dict[str, Any]], float | None]:
+    """One page's bookkeeping: dedupe by transit_fingerprint, track the
+    latest departure across ALL trips (duplicates included — a boundary
+    dup still proves OJP advanced to that anchor).
+
+    Walk-only trips (empty fingerprint) are never deduplicated; they're
+    rare for any OD pair where pagination would even fire.
+    """
+    # Lazy import: signature.py pulls SQLAlchemy for trip_signature
+    # even though transit_fingerprint itself is DB-free. Importing at
+    # call time keeps ojp_client importable in lightweight environments
+    # that don't have SQLAlchemy on the path.
+    from .signature import transit_fingerprint
+
+    new_trips: list[dict[str, Any]] = []
+    latest_dep_ts: float | None = None
+    for t in batch:
+        fp = transit_fingerprint(t.get("legs") or [])
+        if not (fp and fp in seen_fps):
+            if fp:
+                seen_fps.add(fp)
+            new_trips.append(t)
+        latest_dep_ts = _max_dep_ts(latest_dep_ts, t.get("departure_at"))
+    return new_trips, latest_dep_ts
+
+
+def _max_dep_ts(current: float | None, dep_str: str | None) -> float | None:
+    """Return max(current, parse(dep_str)) ignoring unparseable entries."""
+    if not dep_str:
+        return current
+    try:
+        dep_ts = datetime.fromisoformat(dep_str).timestamp()
+    except ValueError:
+        return current
+    return dep_ts if current is None else max(current, dep_ts)
+
+
+def _next_anchor_or_none(latest_dep_ts: float | None, target_end_ts: float) -> datetime | None:
+    """Compute the next page's anchor, or None to stop.
+
+    Returns None when:
+    - latest_dep_ts is None (no parseable departures, can't advance), OR
+    - latest_dep_ts >= target window end (OJP caught up to OTP).
+
+    Otherwise returns `latest_dep_ts + 1 min` as a UTC datetime — the
+    +60 s nudge avoids OJP returning the same train as the leading
+    edge of the next batch.
+    """
+    if latest_dep_ts is None:
+        return None
+    if latest_dep_ts >= target_end_ts:
+        return None
+    return datetime.fromtimestamp(latest_dep_ts + 60.0, tz=UTC)
 
 
 # ───────────────────────────── response parse ───────────────────────────

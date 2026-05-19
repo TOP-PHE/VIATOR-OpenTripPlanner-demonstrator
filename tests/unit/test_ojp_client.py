@@ -14,6 +14,7 @@ parser is pinned against actual OJP output, not a guess at the shape.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -323,15 +324,14 @@ class TestFetchReferencePaginated:
 
     @pytest.mark.asyncio
     async def test_single_page_covers_window_no_pagination(self, monkeypatch):
-        # OJP's first batch already reaches the target window end →
-        # one call, return what came back.
+        # OJP's first batch already reaches the target window end -
+        # one call, return what came back. Trip set at depart+7h to
+        # ensure latest_dep >= target_end (6h) condition fires.
         from app.journey import ojp_client
 
-        async def fake(when, **kw):
-            # Single trip at depart+5h30m — past the 6h target window? No,
-            # 5h30m is just under 6h. But "latest_dep >= target_end" stops
-            # the loop because it's >= the 6h target window of 21600s? Let's
-            # set the trip at 7h to ensure stop.
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # yield so this is genuinely async (S7503)
+            when = kw["when"]
             return {}, [
                 _make_trip(
                     dep_iso=(when + timedelta(hours=7)).isoformat(),
@@ -340,9 +340,6 @@ class TestFetchReferencePaginated:
                     to_uic="8501008",
                 )
             ]
-
-        async def fake_fetch_reference(**kw):
-            return await fake(kw["when"])
 
         monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
 
@@ -370,6 +367,7 @@ class TestFetchReferencePaginated:
         calls: list[datetime] = []
 
         async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # yield (S7503)
             calls.append(kw["when"])
             base = kw["when"]
             return {}, [
@@ -420,6 +418,7 @@ class TestFetchReferencePaginated:
         page_calls = {"n": 0}
 
         async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # yield (S7503)
             page_calls["n"] += 1
             if page_calls["n"] == 1:
                 return {}, [
@@ -456,6 +455,7 @@ class TestFetchReferencePaginated:
         from app.journey import ojp_client
 
         async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # yield (S7503)
             return {}, [
                 _make_trip(
                     dep_iso="2026-05-25T06:10:00+00:00",
@@ -493,6 +493,7 @@ class TestFetchReferencePaginated:
         async def fake_fetch_reference(**kw):
             # Each call returns a trip just 5 min past its own anchor.
             # 4 pages x 5 min = 20 min - nowhere near the 6h target.
+            await asyncio.sleep(0)  # yield (S7503)
             base = kw["when"]
             uid = base.minute  # cheap unique-ish id per anchor
             return {}, [
@@ -538,6 +539,7 @@ class TestFetchReferencePaginated:
             )
 
         async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # yield (S7503)
             page_calls["n"] += 1
             if page_calls["n"] == 1:
                 return {}, [trip_a(kw["when"])]
@@ -590,6 +592,7 @@ class TestFetchReferencePaginated:
         from app.journey import ojp_client
 
         async def boom(**kw):
+            await asyncio.sleep(0)  # yield (S7503) before raising
             raise httpx.HTTPError("boom")
 
         monkeypatch.setattr(ojp_client, "fetch_reference", boom)
@@ -616,6 +619,7 @@ class TestFetchReferencePaginated:
         page_calls = {"n": 0}
 
         async def flaky(**kw):
+            await asyncio.sleep(0)  # yield (S7503)
             page_calls["n"] += 1
             if page_calls["n"] == 1:
                 return {}, [
