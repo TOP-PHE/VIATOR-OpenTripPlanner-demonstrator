@@ -14,7 +14,8 @@ parser is pinned against actual OJP output, not a guess at the shape.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from defusedxml.ElementTree import fromstring as _xml_fromstring
@@ -281,3 +282,369 @@ class TestNormalise:
         assert _normalise("this is not xml at all <") == []
         # An OJP error payload has no <TripResult> — also → [].
         assert _normalise("<OJP xmlns='http://www.vdv.de/ojp'><OJPResponse/></OJP>") == []
+
+
+# ─────────────────── fetch_reference_paginated ───────────────────
+
+
+def _make_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str) -> dict:
+    """A minimal trip dict whose transit_fingerprint is determined by
+    (route, from_uic, to_uic, dep_minute). Lets us craft batches that
+    are unique by these inputs without building real XML."""
+    return {
+        "duration_seconds": 1800,
+        "num_transfers": 0,
+        "departure_at": dep_iso,
+        "arrival_at": dep_iso,  # not used by fingerprint
+        "modes": "RAIL",
+        "legs": [
+            {
+                "mode": "RAIL",
+                "from_lat": 46.948,
+                "from_lon": 7.437,
+                "to_lat": 47.378,
+                "to_lon": 8.537,
+                "from_stop_id": f"SBB:{from_uic}",
+                "to_stop_id": f"SBB:{to_uic}",
+                "departure": dep_iso,
+                "arrival": dep_iso,
+                "route_short_name": route,
+                "feed_id": "OJP",
+            }
+        ],
+        "feed_id": "OJP",
+    }
+
+
+class TestFetchReferencePaginated:
+    """v0.1.35.06 anchor-time pagination: issue successive OJP TripRequests
+    until time-window coverage catches up to OTP's searchWindow, then
+    dedupe boundary trips via transit_fingerprint and return the union.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_page_covers_window_no_pagination(self, monkeypatch):
+        # OJP's first batch already reaches the target window end -
+        # one call, return what came back. Trip set at depart+7h to
+        # ensure latest_dep >= target_end (6h) condition fires.
+        from app.journey import ojp_client
+
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            when = kw["when"]
+            return {}, [
+                _make_trip(
+                    dep_iso=(when + timedelta(hours=7)).isoformat(),
+                    route="IR15",
+                    from_uic="8507000",
+                    to_uic="8501008",
+                )
+            ]
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert pages == 1
+        assert len(trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_paginates_until_window_covered(self, monkeypatch):
+        # Each batch's latest trip is +1h ahead of its anchor. Target
+        # window 4h → need 4 calls to walk past the 4h mark.
+        from app.journey import ojp_client
+
+        calls: list[datetime] = []
+
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            calls.append(kw["when"])
+            base = kw["when"]
+            return {}, [
+                _make_trip(
+                    dep_iso=(base + timedelta(minutes=30)).isoformat(),
+                    route="IR15",
+                    from_uic=f"850{1000 + len(calls)}",  # unique per call
+                    to_uic="8501008",
+                ),
+                _make_trip(
+                    dep_iso=(base + timedelta(minutes=60)).isoformat(),
+                    route="IC1",
+                    from_uic=f"850{2000 + len(calls)}",
+                    to_uic="8501008",
+                ),
+            ]
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        start = datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC)
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=start,
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=4 * 3600,
+            max_pages=8,  # well above what we expect
+        )
+        # 4h window / 1h forward progress per page = 4 pages to cover.
+        # Bookkeeping: page 1 anchored at +0h → latest +1h; page 2 at
+        # +1h01m → latest +2h01m; … page 4 anchored ~+3h03m → latest
+        # ~+4h03m, which crosses the 4h target → stop after page 4.
+        assert pages == 4
+        assert len(trips) == 8  # 2 unique trips per page
+        # Anchors should march forward in time.
+        for i in range(1, len(calls)):
+            assert calls[i] > calls[i - 1]
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_stops_pagination(self, monkeypatch):
+        # First page returns trips; second returns nothing → stop.
+        from app.journey import ojp_client
+
+        page_calls = {"n": 0}
+
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {}, [
+                    _make_trip(
+                        dep_iso=(kw["when"] + timedelta(minutes=10)).isoformat(),
+                        route="IR15",
+                        from_uic="8507000",
+                        to_uic="8501008",
+                    )
+                ]
+            return {}, []  # exhausted
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert pages == 2
+        assert len(trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_duplicate_batch_stops_pagination(self, monkeypatch):
+        # Same trip on every page → seen_fps already has it after page 1,
+        # page 2 yields no new trips → bail.
+        from app.journey import ojp_client
+
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            return {}, [
+                _make_trip(
+                    dep_iso="2026-05-25T06:10:00+00:00",
+                    route="IR15",
+                    from_uic="8507000",
+                    to_uic="8501008",
+                )
+            ]
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        # Page 1 collects the trip; page 2 returns the same dup → all_dups
+        # break → 2 pages total, 1 unique trip.
+        assert pages == 2
+        assert len(trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_max_pages_caps_pagination(self, monkeypatch):
+        # Infinite supply of new trips that never reach the window end —
+        # max_pages bounds the call count.
+        from app.journey import ojp_client
+
+        async def fake_fetch_reference(**kw):
+            # Each call returns a trip just 5 min past its own anchor.
+            # 4 pages x 5 min = 20 min - nowhere near the 6h target.
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            base = kw["when"]
+            uid = base.minute  # cheap unique-ish id per anchor
+            return {}, [
+                _make_trip(
+                    dep_iso=(base + timedelta(minutes=5)).isoformat(),
+                    route=f"IR{uid}",
+                    from_uic=f"850{7000 + uid % 100}",
+                    to_uic="8501008",
+                )
+            ]
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=3,
+        )
+        assert pages == 3  # capped exactly
+        assert len(trips) == 3
+
+    @pytest.mark.asyncio
+    async def test_boundary_dedup_via_fingerprint(self, monkeypatch):
+        # Page 1: trip A. Page 2: trip A (boundary dup) + trip B (new).
+        # Expect 2 unique trips, 2 pages, B preserved.
+        from app.journey import ojp_client
+
+        page_calls = {"n": 0}
+
+        def trip_a(when):
+            return _make_trip(
+                dep_iso=(when + timedelta(minutes=30)).isoformat(),
+                route="IR15",
+                from_uic="8507000",
+                to_uic="8501008",
+            )
+
+        async def fake_fetch_reference(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {}, [trip_a(kw["when"])]
+            # Page 2: dup A (same dep, route, UICs → same fingerprint)
+            # plus trip B (different route).
+            same_dep = "2026-05-25T06:30:00+00:00"
+            return {}, [
+                _make_trip(
+                    dep_iso=same_dep,
+                    route="IR15",
+                    from_uic="8507000",
+                    to_uic="8501008",
+                ),
+                _make_trip(
+                    dep_iso="2026-05-25T07:00:00+00:00",
+                    route="IC1",
+                    from_uic="8507000",
+                    to_uic="8501008",
+                ),
+            ]
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", fake_fetch_reference)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        # Page 1 → 1 trip (A). Page 2 → A is dup, B is new.
+        # Loop continues to page 3 (B's dep is 07:00, anchor for p3
+        # would be 07:01, still well inside 6h window), which returns
+        # the same response as page 2 → all dups → stop.
+        assert len(trips) == 2  # A + B, no duplicate A
+        routes = sorted(t["legs"][0]["route_short_name"] for t in trips)
+        assert routes == ["IC1", "IR15"]
+        assert pages >= 2  # at least the dedup-tested pages happened
+
+    @pytest.mark.asyncio
+    async def test_http_error_on_first_page_propagates(self, monkeypatch):
+        # No partial data yet → caller needs the exception to map status.
+        import httpx
+
+        from app.journey import ojp_client
+
+        async def boom(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async before raising
+            raise httpx.HTTPError("boom")
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", boom)
+
+        with pytest.raises(httpx.HTTPError):
+            await ojp_client.fetch_reference_paginated(
+                from_lat=0,
+                from_lon=0,
+                to_lat=0,
+                to_lon=0,
+                when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+                timeout_ms=5000,
+                endpoint="https://example/ojp",
+                token="x",
+            )
+
+    @pytest.mark.asyncio
+    async def test_http_error_on_later_page_returns_partial(self, monkeypatch):
+        # Page 1 succeeds, page 2 raises → swallow, return page-1 data.
+        import httpx
+
+        from app.journey import ojp_client
+
+        page_calls = {"n": 0}
+
+        async def flaky(**kw):
+            await asyncio.sleep(0)  # satisfy S7503: genuine async
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {}, [
+                    _make_trip(
+                        dep_iso=(kw["when"] + timedelta(minutes=10)).isoformat(),
+                        route="IR15",
+                        from_uic="8507000",
+                        to_uic="8501008",
+                    )
+                ]
+            raise httpx.HTTPError("boom on page 2")
+
+        monkeypatch.setattr(ojp_client, "fetch_reference", flaky)
+
+        trips, _ms, pages = await ojp_client.fetch_reference_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 5, 25, 6, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            endpoint="https://example/ojp",
+            token="x",
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert pages == 2  # we attempted page 2 (which raised)
+        assert len(trips) == 1  # page-1 data preserved

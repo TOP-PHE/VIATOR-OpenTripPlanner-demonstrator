@@ -250,11 +250,11 @@ diff.
 
 | Concern | Handling |
 |---|---|
-| **50 req/min, 20K/day** | Opt-in per search makes this a non-issue for human operators (nobody ticks-and-searches 50×/min). The toggle being **unchecked by default** is the rate-limit safety design — do **not** auto-fire it on every fanout. |
-| **Latency** | Reference call gets its own timeout — `OJP_TIMEOUT_MS` (§7), default 10 s. On timeout, the reference panel shows "timed out"; VIATOR results render normally. |
-| **Endpoint down / 5xx** | Same — reference source reports `error`, VIATOR unaffected. Never blocks or fails the operator's actual search. |
-| **Rate-limit hit (429)** | Surface a specific "reference rate-limited — try again shortly" message rather than a generic error. Consider a short server-side cooldown. |
-| **Burst protection** | The existing `concurrency` semaphores already gate journey calls; the reference call participates in the same budget. |
+| **50 req/min, 20K/day** | Opt-in per search keeps this manageable. Note: v0.1.35.06's anchor-time pagination (§9.2) issues **up to 4 OJP calls per search**, so an operator doing one search per second peaks at ~4 calls/sec ≈ 240/min — well past the limit. The 4-page cap + per-search opt-in is the design safety net. |
+| **Latency** | Reference call gets its own timeout — `OJP_TIMEOUT_MS` (§7), default 10 s, **per page**. With pagination, total wall-time can reach `4 × OJP_TIMEOUT_MS` worst-case; in practice each page is ~600 ms so a 4-page fetch lands in ~2.5 s. The fanout runs OJP and OTP in parallel so this is the max of the two, not the sum. |
+| **Endpoint down / 5xx** | Page 1 failure → propagate to caller, surface as `error`. Later-page failure → **swallow + return partial**, keep what we already have. |
+| **Rate-limit hit (429)** | Same model as endpoint-down. Page 1 hits → `rate_limited` status. Later page hits → return earlier pages' trips with a partial-data warning logged. |
+| **Burst protection** | The existing `concurrency` semaphores gate journey calls; each OJP page counts as one call against the same budget. |
 
 ---
 
@@ -477,6 +477,52 @@ that introduces a `comparison_verdicts` table keyed by
 `(otp_session_id, query_hash, fingerprint)` so the OJP side doesn't need
 its own session row.
 
+### 9.2 Anchor-time pagination *(v0.1.35.06)*
+
+v0.1.35.01–05 left a structural alignment gap. OTP's `planConnection`
+covers `searchWindow=21600s` (6 h at the v0.1.35.04 default), but OJP's
+`TripRequest` has no `searchWindow` parameter — it returns a fixed
+~6 alternative trips clustered around the requested time. On busy
+corridors a single OJP request covers only ~2 hours, so the
+comparison strip showed spurious `otp_only` itineraries for trains
+in the 2–6 h tail of OTP's range.
+
+v0.1.35.06 adds **anchor-time pagination** in
+`app/journey/ojp_client.py::fetch_reference_paginated`. After the
+first OJP response, if the latest `departure_at` is earlier than
+`when + target_window_seconds`, the helper issues another
+`TripRequest` anchored at `latest_dep + 1 min`. Repeats until any
+stop condition fires (in order):
+
+1. **Empty batch** — OJP exhausted at this anchor.
+2. **All trips are duplicates** of earlier pages (matched by
+   `transit_fingerprint`) — no forward progress.
+3. **Latest departure caught up to the target window end** — OJP
+   coverage matches OTP.
+4. **`max_pages` reached** (hard cap, default 4 — rate-limit safety).
+5. **`fetch_reference` raises** mid-flight — propagate if no partial
+   data yet, otherwise return the partial set with a warning logged.
+
+Dedup uses the same `transit_fingerprint` that powers
+`_build_comparison`: boundary trips appearing in consecutive
+batches (the last trip of batch N may equal the first trip of
+batch N+1, slightly earlier than the +1 min nudge can avoid)
+collapse to one fingerprint.
+
+The fanout response gains a `pages` field on `ojp_reference` when
+pagination fired (`pages > 1`), so the operator UI can show "OJP
+took N requests to cover the search window" if desired. Pages are
+**sequential** — the next anchor isn't known until the current
+batch returns — so per-search wall-time can grow up to
+`max_pages × per_page_latency`. The fanout still parallelises OJP
+against the OTP fanout (`asyncio.gather`), so the user-visible
+wall-time is `max(otp_total, ojp_paginated_total)`, not the sum.
+
+Rate-limit math: with `max_pages=4`, a heavy operator running one
+search per second hits ~4 OJP calls/sec ≈ 240/min, well past the
+50/min free-tier ceiling. The 4-page cap + per-search opt-in
+toggle is the design safety net. See §6.
+
 ---
 
 ## 10. Open questions
@@ -678,6 +724,18 @@ child element is present.
 
 ## Changelog
 
+- **2026-05-18 (v0.1.35.06)** — Anchor-time pagination for OJP.
+  `fetch_reference_paginated` issues up to 4 sequential `TripRequest`s
+  with successively-later anchor times until OJP's coverage catches
+  up to OTP's `searchWindow` (6 h). Dedupes boundary trips via
+  `transit_fingerprint`. Stops on empty batch, all-dups batch,
+  window-caught-up, max-pages, or mid-flight HTTP error (with partial
+  preservation when at least page 1 succeeded). New
+  `TestFetchReferencePaginated` covering all stop conditions. §9.2
+  documents the design; §6 rate-limit table updated to reflect the
+  worst-case 4× call multiplier and the per-search opt-in safety net.
+  Closes the structural alignment gap that left legitimate trains in
+  OTP's tail (2–6 h from the anchor) bucketed as spurious `otp_only`.
 - **2026-05-18 (v0.1.35.03)** — Swiss SLOID DSN reconstruction:
   v0.1.35.02 assumed the OJP SLOID carried the full 7-digit UIC
   (`ch:1:sloid:8507000:…`), but live data shows it uses the 4-digit
