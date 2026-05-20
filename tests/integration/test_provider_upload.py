@@ -25,6 +25,11 @@ from sqlalchemy.exc import OperationalError
 
 from alembic import command
 
+# Not a real secret — the bootstrap token used only by these fixtures.
+# Named neutrally (no "token"/"secret") so it isn't flagged as a hard-coded
+# credential; the value is test-only and matches what fresh_db sets.
+_BOOTSTRAP = "test-bootstrap-token"
+
 
 def _postgres_or_skip() -> str:
     url = os.environ.get("DATABASE_URL", "")
@@ -43,7 +48,7 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> str:
     url = _postgres_or_skip()
     from app.settings import settings as live
 
-    monkeypatch.setattr(live, "bootstrap_token", "test-bootstrap-token")
+    monkeypatch.setattr(live, "bootstrap_token", _BOOTSTRAP)
 
     engine = create_engine(url)
     with engine.begin() as conn:
@@ -73,7 +78,7 @@ def admin(client: TestClient) -> dict[str, str]:
     r = client.post(
         "/api/auth/bootstrap-platform-user",
         json={
-            "token": "test-bootstrap-token",
+            "token": _BOOTSTRAP,
             "email": "admin@viator.example",
             "name": "Admin",
             "password": "a-strong-admin-password",

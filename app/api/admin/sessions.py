@@ -544,7 +544,18 @@ class UploadResponse(BaseModel):
     provider_feed_id: str | None = None
 
 
-@router.post("/{sid}/uploads", response_model=UploadResponse, status_code=201)
+@router.post(
+    "/{sid}/uploads",
+    response_model=UploadResponse,
+    status_code=201,
+    responses={
+        400: {
+            "description": "Unknown standard, format/standard mismatch, "
+            "malformed config, or an unconfigured provider_id"
+        },
+        404: {"description": "Session not found"},
+    },
+)
 async def upload_to_session(
     sid: str,
     declared_standard: Annotated[str, Form()],
