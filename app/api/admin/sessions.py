@@ -835,6 +835,12 @@ class ProviderStatus(BaseModel):
     fetched_at: datetime | None = None
     size_bytes: int | None = None
     error_hint: str | None = None  # short, UI-friendly explanation when state == "error"
+    # v0.1.37 — content source ("url" | "upload"; "server_file" later) and,
+    # for upload-source providers, the original filename of the file
+    # currently attached to this provider. Lets the card show *which* file
+    # backs the provider, not just that one is present.
+    source: str | None = None
+    upload_filename: str | None = None
 
 
 # How recently a provider's inbox file must have been refreshed before we
@@ -1830,16 +1836,33 @@ def get_providers_status(
     inbox_root = settings.inbox_dir / sid
     now = datetime.now(UTC)
 
+    # v0.1.37 — latest uploaded filename per provider, so an upload-source
+    # card can show *which* file is attached. One query, newest-first;
+    # setdefault keeps the first (most recent) per feed id.
+    latest_upload_filename: dict[str, str] = {}
+    for feed_id_val, filename in db.execute(
+        select(Upload.provider_feed_id, Upload.filename)
+        .where(Upload.session_id == sid, Upload.provider_feed_id.is_not(None))
+        .order_by(desc(Upload.created_at))
+    ).all():
+        if feed_id_val is not None:
+            latest_upload_filename.setdefault(feed_id_val, filename)
+
     out: dict[str, ProviderStatus] = {}
     for p in providers:
-        fmt = (p.get("timetable") or {}).get("format", "gtfs")
-        out[p["id"]] = _derive_provider_status(
+        tt = p.get("timetable") or {}
+        fmt = tt.get("format", "gtfs")
+        status = _derive_provider_status(
             feed_id=p["id"],
             timetable_format=fmt,
             inbox_root=inbox_root,
             latest_audit_meta=latest_meta,
             now=now,
         )
+        status.source = tt.get("source")
+        if status.source == "upload":
+            status.upload_filename = latest_upload_filename.get(p["id"])
+        out[p["id"]] = status
     return out
 
 
