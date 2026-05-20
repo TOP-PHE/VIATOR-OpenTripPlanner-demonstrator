@@ -115,7 +115,7 @@ setup_metrics(app)
 
 # Brand assets (TrackOnPath logo, UIC logo, VIATOR icons) live in ./branding
 # at the repo root and are copied into the container by the Dockerfile.
-# Mounted at /static/branding so the UI can <img src="/static/branding/uic-logo.svg">.
+# Mounted at /static/branding so the UI can <img src="/static/branding/trackonpath-logo.png">.
 _branding_dir = Path("branding")
 if _branding_dir.is_dir():
     app.mount("/static/branding", StaticFiles(directory=_branding_dir), name="branding")
