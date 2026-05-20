@@ -279,7 +279,7 @@ class TestTimetableSource:
     def test_invalid_source_rejected(self):
         from app.ingestion import normalize_providers
 
-        with pytest.raises(ValueError, match="timetable.source"):
+        with pytest.raises(ValueError, match=r"timetable\.source"):
             normalize_providers(
                 {
                     "sources": {
@@ -295,7 +295,7 @@ class TestTimetableSource:
         # half-wired config can't slip through.
         from app.ingestion import normalize_providers
 
-        with pytest.raises(ValueError, match="timetable.source"):
+        with pytest.raises(ValueError, match=r"timetable\.source"):
             normalize_providers(
                 {
                     "sources": {
