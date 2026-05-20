@@ -919,6 +919,33 @@ function providerCardHTML(p, opts) {
     </details>`;
 }
 
+// v0.1.37 — extracted from readProviderCard (keeps its cognitive
+// complexity down). Validates a card's optional http(s) URL fields and
+// writes them into `provider`; returns false (after a toast) on the first
+// malformed URL, true otherwise.
+function collectProviderUrlFields(card, id, provider) {
+  for (const [cls, key] of [
+    ['.prov-rt-alerts', 'alerts_url'],
+    ['.prov-rt-trip', 'trip_updates_url'],
+    ['.prov-rt-vehicle', 'vehicle_positions_url'],
+  ]) {
+    const v = card.querySelector(cls).value.trim();
+    if (!v) continue;
+    if (!/^https?:\/\//.test(v)) { showToast('error', `${id}: ${key} must be http(s)`); return false; }
+    provider.gtfs_rt[key] = v;
+  }
+  for (const [cls, key] of [
+    ['.prov-mct', 'mct_url'],
+    ['.prov-stations', 'stations_csv_url'],
+  ]) {
+    const v = card.querySelector(cls).value.trim();
+    if (!v) continue;
+    if (!/^https?:\/\//.test(v)) { showToast('error', `${id}: ${key} must be http(s)`); return false; }
+    provider[key] = v;
+  }
+  return true;
+}
+
 function readProviderCard(card) {
   // Opposite of providerCardHTML — collect the form values back into a
   // canonical provider object. Returns null + shows a toast for invalid
@@ -958,31 +985,7 @@ function readProviderCard(card) {
     timetable,
     gtfs_rt: {},
   };
-  for (const [cls, key] of [
-    ['.prov-rt-alerts', 'alerts_url'],
-    ['.prov-rt-trip', 'trip_updates_url'],
-    ['.prov-rt-vehicle', 'vehicle_positions_url'],
-  ]) {
-    const v = card.querySelector(cls).value.trim();
-    if (!v) continue;
-    if (!/^https?:\/\//.test(v)) {
-      showToast('error', `${id}: ${key} must be http(s)`);
-      return null;
-    }
-    provider.gtfs_rt[key] = v;
-  }
-  for (const [cls, key] of [
-    ['.prov-mct', 'mct_url'],
-    ['.prov-stations', 'stations_csv_url'],
-  ]) {
-    const v = card.querySelector(cls).value.trim();
-    if (!v) continue;
-    if (!/^https?:\/\//.test(v)) {
-      showToast('error', `${id}: ${key} must be http(s)`);
-      return null;
-    }
-    provider[key] = v;
-  }
+  if (!collectProviderUrlFields(card, id, provider)) return null;
   return provider;
 }
 
@@ -1127,6 +1130,66 @@ async function loadProviderStatuses(sid, formEl) {
   });
 }
 
+// v0.1.37 — extracted from the config-form click delegation so that
+// handler stays a thin dispatcher (one branch per action) and each piece
+// keeps its cognitive complexity in check.
+async function refreshOneProvider(form, refreshBtn) {
+  const card = refreshBtn.closest('.provider-card');
+  const pid = card.querySelector('.prov-id').value.trim();
+  if (!pid) { showToast('error', 'Provider ID is required to refresh'); return; }
+  const sid = form.dataset.sid;
+  refreshBtn.disabled = true;
+  const original = refreshBtn.textContent;
+  refreshBtn.textContent = 'Downloading…';
+  try {
+    const r = await fetch(`/api/sessions/${sid}/providers/${encodeURIComponent(pid)}/refresh`, {method: 'POST'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
+      return;
+    }
+    const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
+    const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+    showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
+    if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+    loadProviderStatuses(sid, form);
+  } catch (err) { showToast('error', String(err)); }
+  finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
+}
+
+async function uploadToProvider(form, uploadBtn) {
+  const card = uploadBtn.closest('.provider-card');
+  const pid = card.querySelector('.prov-id').value.trim();
+  const fmt = card.querySelector('.prov-tt-format').value;
+  const fileInput = card.querySelector('.prov-tt-file');
+  const file = fileInput && fileInput.files && fileInput.files[0];
+  if (!pid) { showToast('error', 'Provider ID is required before uploading'); return; }
+  if (!file) { showToast('error', `${pid}: choose a file to upload first`); return; }
+  const sid = form.dataset.sid;
+  const fd2 = new FormData();
+  fd2.append('declared_standard', TIMETABLE_DECLARED_KIND[fmt] || 'GTFS');
+  fd2.append('provider_id', pid);
+  fd2.append('file', file);
+  uploadBtn.disabled = true;
+  const original = uploadBtn.textContent;
+  uploadBtn.textContent = 'Uploading…';
+  try {
+    const r = await fetch(`/api/sessions/${sid}/uploads`, {method: 'POST', body: fd2});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast('error', (body.detail && body.detail.message) || body.detail || `Upload failed (${r.status})`);
+      return;
+    }
+    showToast('success', `${pid}: attached ${body.filename} (${body.detected_kind})`);
+    const cf = card.querySelector('.prov-current-file');
+    if (cf) cf.textContent = `📎 ${body.filename} · just now`;
+    fileInput.value = '';
+    loadProviderStatuses(sid, form);
+    loadJobs(sid);
+  } catch (err) { showToast('error', String(err)); }
+  finally { uploadBtn.disabled = false; uploadBtn.textContent = original; }
+}
+
 // ─── Configure (PATCH config.sources) ───────────────────────────────
 document.querySelectorAll('form[data-form="config"]').forEach(form => {
   // Add-provider button: append a blank card. New cards open by default
@@ -1174,70 +1237,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       return;
     }
     const refreshBtn = e.target.closest('button[data-action="refresh-provider"]');
-    if (refreshBtn) {
-      e.preventDefault();
-      const card = refreshBtn.closest('.provider-card');
-      const pid = card.querySelector('.prov-id').value.trim();
-      if (!pid) { showToast('error', 'Provider ID is required to refresh'); return; }
-      const sid = form.dataset.sid;
-      refreshBtn.disabled = true;
-      const original = refreshBtn.textContent;
-      refreshBtn.textContent = 'Downloading…';
-      try {
-        const r = await fetch(`/api/sessions/${sid}/providers/${encodeURIComponent(pid)}/refresh`, {method: 'POST'});
-        const body = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
-          return;
-        }
-        const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-        const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
-        showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
-        if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
-        // v0.1.19: refresh the per-provider status pill so the operator
-        // sees the new mtime/size immediately instead of waiting for a
-        // full page reload.
-        loadProviderStatuses(sid, form);
-      } catch (err) { showToast('error', String(err)); }
-      finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
-      return;
-    }
-    // v0.1.37 — upload a file and attach it to this provider.
+    if (refreshBtn) { e.preventDefault(); await refreshOneProvider(form, refreshBtn); return; }
     const uploadBtn = e.target.closest('button[data-action="upload-provider"]');
-    if (uploadBtn) {
-      e.preventDefault();
-      const card = uploadBtn.closest('.provider-card');
-      const pid = card.querySelector('.prov-id').value.trim();
-      const fmt = card.querySelector('.prov-tt-format').value;
-      const fileInput = card.querySelector('.prov-tt-file');
-      const file = fileInput && fileInput.files && fileInput.files[0];
-      if (!pid) { showToast('error', 'Provider ID is required before uploading'); return; }
-      if (!file) { showToast('error', `${pid}: choose a file to upload first`); return; }
-      const sid = form.dataset.sid;
-      const fd2 = new FormData();
-      fd2.append('declared_standard', TIMETABLE_DECLARED_KIND[fmt] || 'GTFS');
-      fd2.append('provider_id', pid);
-      fd2.append('file', file);
-      uploadBtn.disabled = true;
-      const original = uploadBtn.textContent;
-      uploadBtn.textContent = 'Uploading…';
-      try {
-        const r = await fetch(`/api/sessions/${sid}/uploads`, {method: 'POST', body: fd2});
-        const body = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          showToast('error', (body.detail && body.detail.message) || body.detail || `Upload failed (${r.status})`);
-          return;
-        }
-        showToast('success', `${pid}: attached ${body.filename} (${body.detected_kind})`);
-        const cf = card.querySelector('.prov-current-file');
-        if (cf) cf.textContent = `📎 ${body.filename} · just now`;
-        fileInput.value = '';
-        loadProviderStatuses(sid, form);
-        loadJobs(sid);
-      } catch (err) { showToast('error', String(err)); }
-      finally { uploadBtn.disabled = false; uploadBtn.textContent = original; }
-      return;
-    }
+    if (uploadBtn) { e.preventDefault(); await uploadToProvider(form, uploadBtn); }
   });
   // v0.1.37 — source toggle: reveal the URL row or the Upload row.
   form.addEventListener('change', (e) => {
