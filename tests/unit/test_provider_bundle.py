@@ -43,7 +43,11 @@ class TestNormalizeProviders:
         assert p["id"] == "GTFS"
         assert p["label"] == "GTFS"
         assert p["country_iso"] is None
-        assert p["timetable"] == {"format": "gtfs", "url": "https://example.com/sncf.zip"}
+        assert p["timetable"] == {
+            "format": "gtfs",
+            "source": "url",
+            "url": "https://example.com/sncf.zip",
+        }
         # First provider inherits session-level mct/stations URLs
         assert p["mct_url"] == "https://example.com/mct.csv"
         assert p["stations_csv_url"] == "https://example.com/st.csv"
@@ -229,6 +233,74 @@ class TestNormalizeProviders:
                     "sources": {
                         "providers": [
                             {"id": "SNCF", "timetable": {"format": "gtfs", "url": "ftp://a/x.zip"}}
+                        ]
+                    }
+                }
+            )
+
+
+class TestTimetableSource:
+    """v0.1.37 — the `timetable.source` discriminator (url | upload)."""
+
+    @staticmethod
+    def _one(timetable: dict) -> dict:
+        from app.ingestion import normalize_providers
+
+        out = normalize_providers(
+            {"sources": {"providers": [{"id": "SNCF", "timetable": timetable}]}}
+        )
+        return out[0]["timetable"]
+
+    def test_inferred_url_when_url_present(self):
+        # Legacy config with no explicit source + a URL → "url".
+        tt = self._one({"format": "gtfs", "url": "https://a/x.zip"})
+        assert tt["source"] == "url"
+        assert tt["url"] == "https://a/x.zip"
+
+    def test_inferred_upload_when_no_url(self):
+        # No URL and no explicit source → "upload" (operator will attach a file).
+        tt = self._one({"format": "gtfs"})
+        assert tt["source"] == "upload"
+        assert "url" not in tt
+
+    def test_explicit_upload_preserved_without_url(self):
+        tt = self._one({"format": "gtfs", "source": "upload"})
+        assert tt["source"] == "upload"
+        assert "url" not in tt
+
+    def test_explicit_url_preserved(self):
+        tt = self._one({"format": "gtfs", "source": "url", "url": "https://a/x.zip"})
+        assert tt["source"] == "url"
+
+    def test_source_case_insensitive(self):
+        tt = self._one({"format": "gtfs", "source": "UPLOAD"})
+        assert tt["source"] == "upload"
+
+    def test_invalid_source_rejected(self):
+        from app.ingestion import normalize_providers
+
+        with pytest.raises(ValueError, match="timetable.source"):
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {"id": "SNCF", "timetable": {"format": "gtfs", "source": "ftp"}}
+                        ]
+                    }
+                }
+            )
+
+    def test_server_file_not_yet_a_valid_source(self):
+        # Phase 2 will add "server_file"; until then it's rejected so a
+        # half-wired config can't slip through.
+        from app.ingestion import normalize_providers
+
+        with pytest.raises(ValueError, match="timetable.source"):
+            normalize_providers(
+                {
+                    "sources": {
+                        "providers": [
+                            {"id": "SNCF", "timetable": {"format": "gtfs", "source": "server_file"}}
                         ]
                     }
                 }

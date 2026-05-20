@@ -24,7 +24,11 @@ from .base import Base, TimestampMixin
 
 class Upload(TimestampMixin, Base):
     __tablename__ = "uploads"
-    __table_args__ = (Index("ix_uploads_session_created", "session_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_uploads_session_created", "session_id", "created_at"),
+        # v0.1.37 — "latest file for this provider" lookup on the card.
+        Index("ix_uploads_session_provider", "session_id", "provider_feed_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -47,6 +51,11 @@ class Upload(TimestampMixin, Base):
     triggered_rebuild: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("FALSE")
     )
+    # v0.1.37 — the provider (OTP feedId, e.g. "SNCF-XB") this file was
+    # uploaded for, when the upload targeted a specific provider card.
+    # NULL for the generic per-session upload path. See
+    # docs/provider-source-modes-design.md.
+    provider_feed_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class RebuildJob(TimestampMixin, Base):
