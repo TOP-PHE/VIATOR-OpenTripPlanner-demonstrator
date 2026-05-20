@@ -58,7 +58,7 @@ import logging
 import re
 import zipfile
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -291,6 +291,47 @@ def _collect_stop_times(
     return fields, out_rows, kept_stop_ids
 
 
+def _maybe_write(
+    zout: zipfile.ZipFile, name: str, fields: list[str], rows: list[dict[str, str]]
+) -> None:
+    """Write a member only if it has a header (i.e. existed in the input)."""
+    if fields:
+        _write_csv(zout, name, fields, rows)
+
+
+def _read_filter_write(
+    zin: zipfile.ZipFile,
+    zout: zipfile.ZipFile,
+    name: str,
+    predicate: Callable[[dict[str, str]], bool],
+) -> None:
+    """Read a GTFS member, keep rows matching `predicate`, write it back.
+    No-op if the member is absent. Collapses the repetitive read→filter→
+    write block (SonarCloud S3776 cognitive-complexity)."""
+    fields, rows = _read_csv(zin, name)
+    if fields:
+        _write_csv(zout, name, fields, [r for r in rows if predicate(r)])
+
+
+def _write_agency(zin: zipfile.ZipFile, zout: zipfile.ZipFile, agency_ids: set[str]) -> None:
+    """agency.txt — keep referenced agencies; copy whole when the feed has
+    no agency_id column (single-agency feeds omit it)."""
+    fields, rows = _read_csv(zin, _AGENCY)
+    if not fields:
+        return
+    if "agency_id" in fields and agency_ids:
+        rows = [a for a in rows if a.get("agency_id", "") in agency_ids]
+    _write_csv(zout, _AGENCY, fields, rows)
+
+
+def _copy_passthrough(zin: zipfile.ZipFile, zout: zipfile.ZipFile) -> None:
+    """Copy any member we don't filter (feed_info.txt, fare_*.txt, …)."""
+    for name in zin.namelist():
+        if name in _FILTERABLE or name.endswith("/"):
+            continue
+        zout.writestr(name, zin.read(name))
+
+
 def _write_filtered_feed(
     zin: zipfile.ZipFile,
     zout: zipfile.ZipFile,
@@ -306,73 +347,37 @@ def _write_filtered_feed(
     st_rows: list[dict[str, str]],
 ) -> None:
     """Write every GTFS member, cascade-filtered against `kept`."""
-    if route_fields:
-        _write_csv(
-            zout,
-            _ROUTES,
-            route_fields,
-            [r for r in route_rows if r.get("route_id", "") in kept.route_ids],
-        )
-    if trip_fields:
-        _write_csv(
-            zout,
-            _TRIPS,
-            trip_fields,
-            [t for t in trip_rows if t.get("trip_id", "") in kept.trip_ids],
-        )
-    if st_fields:
-        _write_csv(zout, _STOP_TIMES, st_fields, st_rows)
-    if stop_fields:
-        _write_csv(
-            zout,
-            _STOPS,
-            stop_fields,
-            [s for s in stop_rows if s.get("stop_id", "") in kept.stop_ids],
-        )
-
-    # agency.txt — keep referenced agencies; if no agency_id column
-    # (single-agency feed), copy through whole.
-    agency_fields, agency_rows = _read_csv(zin, _AGENCY)
-    if agency_fields:
-        if "agency_id" in agency_fields and kept.agency_ids:
-            agency_rows = [a for a in agency_rows if a.get("agency_id", "") in kept.agency_ids]
-        _write_csv(zout, _AGENCY, agency_fields, agency_rows)
-
-    # calendar / calendar_dates — keep kept services
-    for cal_name in (_CALENDAR, _CALENDAR_DATES):
-        fields, rows = _read_csv(zin, cal_name)
-        if fields:
-            rows = [r for r in rows if r.get("service_id", "") in kept.service_ids]
-            _write_csv(zout, cal_name, fields, rows)
-
-    # shapes — keep kept shapes
-    shape_fields, shape_rows = _read_csv(zin, _SHAPES)
-    if shape_fields:
-        shape_rows = [r for r in shape_rows if r.get("shape_id", "") in kept.shape_ids]
-        _write_csv(zout, _SHAPES, shape_fields, shape_rows)
-
-    # transfers — keep transfers where BOTH stops survive
-    tr_fields, tr_rows = _read_csv(zin, _TRANSFERS)
-    if tr_fields:
-        tr_rows = [
-            r
-            for r in tr_rows
-            if r.get("from_stop_id", "") in kept.stop_ids
-            and r.get("to_stop_id", "") in kept.stop_ids
-        ]
-        _write_csv(zout, _TRANSFERS, tr_fields, tr_rows)
-
-    # frequencies — keep kept trips
-    fr_fields, fr_rows = _read_csv(zin, _FREQUENCIES)
-    if fr_fields:
-        fr_rows = [r for r in fr_rows if r.get("trip_id", "") in kept.trip_ids]
-        _write_csv(zout, _FREQUENCIES, fr_fields, fr_rows)
-
-    # Everything else (feed_info.txt, fare_*.txt, …) — copy verbatim.
-    for name in zin.namelist():
-        if name in _FILTERABLE or name.endswith("/"):
-            continue
-        zout.writestr(name, zin.read(name))
+    # Pre-loaded tables (already parsed in the caller).
+    _maybe_write(
+        zout,
+        _ROUTES,
+        route_fields,
+        [r for r in route_rows if r.get("route_id", "") in kept.route_ids],
+    )
+    _maybe_write(
+        zout, _TRIPS, trip_fields, [t for t in trip_rows if t.get("trip_id", "") in kept.trip_ids]
+    )
+    _maybe_write(zout, _STOP_TIMES, st_fields, st_rows)
+    _maybe_write(
+        zout, _STOPS, stop_fields, [s for s in stop_rows if s.get("stop_id", "") in kept.stop_ids]
+    )
+    # Members re-read from the input and filtered on the fly.
+    _write_agency(zin, zout, kept.agency_ids)
+    _read_filter_write(zin, zout, _CALENDAR, lambda r: r.get("service_id", "") in kept.service_ids)
+    _read_filter_write(
+        zin, zout, _CALENDAR_DATES, lambda r: r.get("service_id", "") in kept.service_ids
+    )
+    _read_filter_write(zin, zout, _SHAPES, lambda r: r.get("shape_id", "") in kept.shape_ids)
+    _read_filter_write(
+        zin,
+        zout,
+        _TRANSFERS,
+        lambda r: (
+            r.get("from_stop_id", "") in kept.stop_ids and r.get("to_stop_id", "") in kept.stop_ids
+        ),
+    )
+    _read_filter_write(zin, zout, _FREQUENCIES, lambda r: r.get("trip_id", "") in kept.trip_ids)
+    _copy_passthrough(zin, zout)
 
 
 def filter_to_cross_border(input_zip: Path, output_zip: Path) -> CrossBorderStats:
