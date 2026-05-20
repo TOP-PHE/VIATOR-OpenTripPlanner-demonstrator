@@ -1,5 +1,6 @@
 VIATOR
-A MERITS-aligned OpenTripPlanner demonstrator.
+A journey-planner demonstrator that checks results across timetable
+sources, built on OpenTripPlanner.
 
 Copyright (c) 2026 TrackOnPath SAS. All rights reserved.
 
@@ -26,3 +27,16 @@ This product includes software developed by third parties:
 
 This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for the full licence text.
+
+Attribution
+-----------
+Per the Apache License, Version 2.0 (sections 4(b)-(d)), any redistribution
+or derivative work MUST retain this NOTICE file and the copyright notice(s)
+above.
+
+Trademarks
+----------
+"TrackOnPath" and the TrackOnPath logo are registered trademarks of
+TrackOnPath SAS (registered with INPI, France). The Apache-2.0 licence
+applies to the source code only and grants NO right to use these marks.
+("VIATOR" is the project name, not a claimed trademark.)
