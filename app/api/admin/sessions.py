@@ -541,9 +541,20 @@ class UploadResponse(BaseModel):
     detected_kind: str
     size_bytes: int
     triggered_rebuild: bool
+    provider_feed_id: str | None = None
 
 
-@router.post("/{sid}/uploads", response_model=UploadResponse, status_code=201)
+@router.post(
+    "/{sid}/uploads",
+    status_code=201,
+    responses={
+        400: {
+            "description": "Unknown standard, format/standard mismatch, "
+            "malformed config, or an unconfigured provider_id"
+        },
+        404: {"description": "Session not found"},
+    },
+)
 async def upload_to_session(
     sid: str,
     declared_standard: Annotated[str, Form()],
@@ -551,6 +562,7 @@ async def upload_to_session(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    provider_id: Annotated[str | None, Form()] = None,
 ) -> UploadResponse:
     """Upload one file into this session's inbox.
 
@@ -565,6 +577,13 @@ async def upload_to_session(
 
     A new Upload row is persisted; the session state advances to
     `populated` if it was at `created` or `configured`.
+
+    `provider_id` (v0.1.37, optional): attach this upload to a configured
+    provider. The file then lands at that provider's own inbox slot
+    (`<feed_id>.zip`) instead of the generic `gtfs.zip`, the `Upload` row
+    records the link, and the detected format must match the provider's
+    declared timetable format. Omit it for the legacy per-session upload.
+    See docs/provider-source-modes-design.md.
     """
     s = db.get(SessionRow, sid)
     if s is None:
@@ -598,9 +617,43 @@ async def upload_to_session(
             f"File looks like {detected!r}, but declared as {declared_standard!r}",
         )
 
-    triggered = ingestion.dispatch(staged_path, detected, db, session_id=sid)
-    # Where did dispatch end up putting it? Reconstruct from the rules.
-    final_path = _reconstruct_dispatch_target(sid, detected, staged_path.name)
+    # Optional: attach this upload to a configured provider (v0.1.37). The
+    # file then lands at the provider's own slot (`<feed_id>.zip`) and the
+    # Upload row records the link, instead of the generic gtfs.zip.
+    staged_filename: str | None = None
+    provider_feed_id: str | None = None
+    if provider_id:
+        try:
+            providers = ingestion.normalize_providers(s.config)
+        except ValueError as exc:
+            staged_path.unlink(missing_ok=True)
+            raise HTTPException(400, f"session config is malformed: {exc}") from exc
+        match = next((p for p in providers if p["id"] == provider_id), None)
+        if match is None:
+            staged_path.unlink(missing_ok=True)
+            raise HTTPException(
+                400,
+                f"provider {provider_id!r} is not configured in this session "
+                "(add and save the provider card first)",
+            )
+        fmt = match["timetable"]["format"]
+        expected_kind = ingestion.TIMETABLE_FORMAT_DETAILS[fmt]["kind"]
+        if detected != expected_kind:
+            staged_path.unlink(missing_ok=True)
+            raise HTTPException(
+                400,
+                f"file detected as {detected!r}, but provider {provider_id!r} "
+                f"expects {expected_kind!r} ({fmt})",
+            )
+        staged_filename = ingestion.staged_filename_for_format(provider_id, fmt)
+        provider_feed_id = provider_id
+
+    triggered = ingestion.dispatch(
+        staged_path, detected, db, session_id=sid, staged_filename=staged_filename
+    )
+    # Where did dispatch end up putting it? Reconstruct from the rules. With
+    # a provider slot the name is `<feed_id>.zip`; otherwise the legacy name.
+    final_path = _reconstruct_dispatch_target(sid, detected, staged_filename or staged_path.name)
 
     # Best-effort cleanup of the staging file (dispatch copy2's into final).
     staged_path.unlink(missing_ok=True)
@@ -615,6 +668,7 @@ async def upload_to_session(
         size_bytes=size,
         stored_path=str(final_path),
         triggered_rebuild=triggered,
+        provider_feed_id=provider_feed_id,
     )
     db.add(upload)
 
@@ -634,6 +688,7 @@ async def upload_to_session(
             "declared": declared_standard,
             "size_bytes": size,
             "triggered_rebuild": triggered,
+            "provider_feed_id": provider_feed_id,
         },
     )
     db.commit()
@@ -645,6 +700,7 @@ async def upload_to_session(
         detected_kind=upload.detected_kind,
         size_bytes=upload.size_bytes,
         triggered_rebuild=upload.triggered_rebuild,
+        provider_feed_id=upload.provider_feed_id,
     )
 
 

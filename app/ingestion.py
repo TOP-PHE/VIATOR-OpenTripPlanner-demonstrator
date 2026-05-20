@@ -67,6 +67,15 @@ _COUNTRY_ISO_RE = re.compile(r"^[A-Z]{2}$")
 # which dispatches to `inbox/<sid>/archive/` and never touches OTP.
 _OTP_TIMETABLE_FORMATS: frozenset[str] = frozenset({"gtfs", "netex_nordic", "netex_epip"})
 
+# Where a provider's timetable content comes from (v0.1.37).
+#   "url"    — download from timetable.url (the original behaviour)
+#   "upload" — an operator file attached to this provider, landed at its
+#              inbox slot via POST /{sid}/uploads?provider_id=...
+# A third mode, "server_file" (reference a VIATOR-generated artifact such
+# as the cross-border GTFS), is planned for Phase 2 — see
+# docs/provider-source-modes-design.md — and is not yet a valid value.
+_TIMETABLE_SOURCES: frozenset[str] = frozenset({"url", "upload"})
+
 # The OTP entrypoint's build-config generator reads each timetable file
 # from one of these subdirs (the v0.1.4 single-feed code already did this
 # for gtfs/; netex/ is now wired through the same path). Per-format inbox
@@ -230,7 +239,9 @@ def normalize_providers(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
             "id": feed["id"],
             "label": feed["id"],  # operator can rename via UI
             "country_iso": None,
-            "timetable": {"format": "gtfs", "url": feed["url"]},
+            # Legacy feeds are always URL-sourced — set source explicitly so
+            # the canonical shape is uniform (v0.1.37).
+            "timetable": {"format": "gtfs", "source": "url", "url": feed["url"]},
             "gtfs_rt": {},
             "mct_url": None,
             "stations_csv_url": None,
@@ -298,7 +309,18 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
             f"providers[{index}].timetable.url={url!r} must be an http(s) URL "
             "(or empty if the operator will upload manually)"
         )
-    timetable: dict[str, Any] = {"format": fmt}
+    # source discriminator (v0.1.37). Inferred for legacy configs that
+    # predate the field: a URL present means "url", its absence means
+    # "upload" (the operator will attach a file). See
+    # docs/provider-source-modes-design.md.
+    source_raw = (tt.get("source") or "").strip().lower()
+    if source_raw and source_raw not in _TIMETABLE_SOURCES:
+        raise ValueError(
+            f"providers[{index}].timetable.source={source_raw!r} must be one of "
+            f"{sorted(_TIMETABLE_SOURCES)}"
+        )
+    source = source_raw or ("url" if url else "upload")
+    timetable: dict[str, Any] = {"format": fmt, "source": source}
     if url:
         timetable["url"] = url
 
