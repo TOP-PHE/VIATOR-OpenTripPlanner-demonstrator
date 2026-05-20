@@ -1,6 +1,6 @@
 # VIATOR — visual identity brief
 
-_Demonstrator brand for the UIC MERITS-based OpenTripPlanner stack._
+_Visual identity for VIATOR — a journey-planner demonstrator that checks results across timetable sources, built on OpenTripPlanner._
 
 _**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
 _**© 2026 TrackOnPath SAS. All rights reserved.**_
@@ -14,7 +14,7 @@ _Last updated: 2026-04-27_
 
 Tagline:
 
-> **VIATOR — From MERITS data to door-to-door rail journeys.**
+> **VIATOR — a journey-planner demonstrator that checks results across timetable sources.**
 
 ---
 
@@ -28,15 +28,15 @@ A symbol that simultaneously reads as:
 - two **rails converging in perspective** toward a vanishing point (the bottom apex), and
 - a **journey going forward** — the eye is pulled into the depth of the mark.
 
-Three perpendicular **railway sleepers** cross the rails, shrinking as they approach the apex. The combination immediately reads as "rail" without resorting to a literal train silhouette — which keeps it in the same iconographic family as the UIC pictogram set.
+Three perpendicular **railway sleepers** cross the rails, shrinking as they approach the apex. The combination immediately reads as "rail" without resorting to a literal train silhouette.
 
-### 2.2 How it fits the UIC visual register
+### 2.2 Visual register
 
-UIC iconography (station pictograms, accessibility marks, signage standards) is characterised by:
+The mark follows a clean transit-iconography register:
 
 - **Even-stroke line art** — no variable thickness.
 - **Geometric construction** on a square grid.
-- **Single colour** (UIC dark blue or black on white).
+- **Single colour** (TrackOnPath blue or black on white).
 - **Reading correctly at small sizes** (down to favicon).
 - **No decorative elements** — function over flourish.
 
@@ -63,7 +63,7 @@ The VIATOR mark respects all five.
 
 | Role | Name | HEX | Usage |
 |---|---|---|---|
-| Primary | UIC Blue | `#1F3B66` | Logo, headlines, primary buttons |
+| Primary | TrackOnPath Blue | `#1C75BC` | Logo, headlines, primary buttons |
 | Secondary | Rail Steel | `#5B6B82` | Body type on light backgrounds, secondary UI |
 | Accent | Signal Amber | `#E89B2C` | Sparingly — alerts, "real-time" badges, focus states |
 | Surface light | Paper | `#F5F7FB` | Page backgrounds, card surfaces |
@@ -83,7 +83,7 @@ The palette is deliberately monochrome-leaning. The accent amber is used **only*
 | Body | Inter Regular | 400, 16 px base |
 | Tabular / code | JetBrains Mono | For schedule timestamps, IDs, GraphQL queries |
 
-The tagline in the lockup uses **+2.5 tracking** at small sizes for that "engineered" UIC pictogram-caption feel.
+The tagline in the lockup uses **+2.5 tracking** at small sizes for that "engineered", transit-caption feel.
 
 ---
 
@@ -94,11 +94,10 @@ The tagline in the lockup uses **+2.5 tracking** at small sizes for that "engine
 | `viator-icon.svg` | Square icon, 64×64 viewBox. Use for favicon, app icon, dark-mode adaptations. |
 | `viator-lockup.svg` | Horizontal lockup: icon + wordmark + tagline. Use for headers, slide deck title cards, README banners. |
 | `trackonpath-logo.png` | TrackOnPath SAS company logo. Used in the upload-UI footer's "Powered by" line and any user-facing surface. Lifted from OSCAR — keep in sync if the master logo changes. |
-| `uic-logo.svg` | UIC official logo. Retained as an asset for project/sponsor context (UIC · MERITS demonstrator); no longer rendered next to the copyright line, which is now TrackOnPath SAS. Lifted from OSCAR; do not modify — UIC's brand authority. |
 
 The Dockerfile copies `branding/` into the runtime image; FastAPI mounts it at **`/static/branding/`**, so the upload UI references e.g. `<img src="/static/branding/trackonpath-logo.png">`.
 
-Both are vector — scale freely. Both are single-colour `#1F3B66`; for dark-mode flip the stroke/fill to `#F5F7FB`.
+Both are vector — scale freely. Both are single-colour `#1C75BC`; for dark-mode flip the stroke/fill to `#F5F7FB`.
 
 ### 5.1 Recommended exports (when needed)
 
@@ -141,7 +140,7 @@ convert favicon.png -define icon:auto-resize=64,48,32,16 favicon.ico
 | Upload UI (`docker/web/app/templates/index.html`) | Lockup at top-left of the header |
 | OTP debug client banner override | Icon-only at favicon scale |
 | README and strategy doc headers | Lockup as embedded SVG |
-| Slide decks for UIC presentation | Lockup on cover, icon-only on subsequent pages |
+| Slide decks for presentations | Lockup on cover, icon-only on subsequent pages |
 | Future OJP API responses | None — APIs stay neutral |
 
 If you want, I can wire the `viator-lockup.svg` into the upload UI header next.

@@ -115,6 +115,8 @@ VIATOR is licensed under the **Apache License, Version 2.0** — see [`LICENSE`]
 - **Copyright** © 2026 TrackOnPath SAS. All rights reserved.
 - **Powered by** [TrackOnPath SAS](mailto:patrick.heuguet@trackonpath.com).
 - **Third-party software and data** acknowledged in [`NOTICE`](NOTICE).
+- **Trademarks** — "TrackOnPath" and the TrackOnPath logo are registered trademarks of TrackOnPath SAS (INPI, France); the Apache-2.0 licence covers the source code only and grants no right to use these marks.
+- **Attribution** — redistributions and derivative works must retain the [`NOTICE`](NOTICE) file (Apache-2.0 §4).
 
 This attribution must be preserved in any redistribution and must appear in the
 footer of any user-facing surface (web UI, generated documents, exported reports).
