@@ -86,19 +86,18 @@ def admin(client: TestClient) -> dict[str, str]:
 
 
 @pytest.fixture
-def inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Pin the app's inbox to a known, writable tmp dir for this test.
+def inbox(_isolated_inbox: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the app's inbox singleton at the per-test isolated inbox.
 
-    settings is constructed at import, so we patch the live singleton's
-    attribute (read at request time by both the endpoint and ingestion)
-    rather than relying on the INBOX_DIR env var being picked up.
+    `_isolated_inbox` (autouse, tests/conftest.py) already creates the dir
+    and sets the INBOX_DIR env var — but settings is constructed at import,
+    so the env var is too late. We additionally pin the live singleton's
+    attribute, which both the endpoint and ingestion read at request time.
     """
     from app.settings import settings as live
 
-    root = tmp_path / "inbox"
-    root.mkdir()
-    monkeypatch.setattr(live, "inbox_dir", root)
-    return root
+    monkeypatch.setattr(live, "inbox_dir", _isolated_inbox)
+    return _isolated_inbox
 
 
 def _gtfs_zip_bytes() -> bytes:
