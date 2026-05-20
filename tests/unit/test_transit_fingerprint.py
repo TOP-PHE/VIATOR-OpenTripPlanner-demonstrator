@@ -251,6 +251,75 @@ class TestUicTokenisation:
         assert otp == ojp
 
 
+class TestUicCheckDigit:
+    """v0.1.36 — cross-NAP UIC normalisation. SNCF publishes 8-digit
+    station codes (7-digit UIC + a trailing check digit); SBB publishes
+    7-digit UICs. The parser reduces both to the same 7-digit core so a
+    SNCF leg and an SBB leg of the SAME cross-border train fingerprint
+    identically. Numbers transcribed from the live SNCF GTFS (TGV Lyria
+    9263, route 622E) compared against the SBB GTFS describing the same
+    train (the cross-NAP federation spike)."""
+
+    def test_sncf_eight_digit_reduces_to_seven(self):
+        from app.journey.signature import _uic_from_stop_id
+
+        # SNCF 8-digit "87686006" = UIC 8768600 + check digit 6.
+        assert _uic_from_stop_id("StopPoint:OCELyria-87686006") == "8768600"
+        # SBB 7-digit form of the same station.
+        assert _uic_from_stop_id("8768600") == "8768600"
+
+    def test_sncf_vs_sbb_same_station_match(self):
+        from app.journey.signature import _uic_from_stop_id
+
+        # The four Lyria 9263 stops, SNCF 8-digit vs SBB 7-digit.
+        pairs = [
+            ("87686006", "8768600"),  # Paris Gare de Lyon
+            ("87713040", "8771304"),  # Dijon
+            ("85011031", "8501103"),  # Vallorbe
+            ("85010082", "8501008"),  # Genève
+        ]
+        for sncf8, sbb7 in pairs:
+            assert _uic_from_stop_id(sncf8) == _uic_from_stop_id(sbb7) == sbb7
+
+    def test_lyria_9263_fingerprints_identically_across_nap(self):
+        # The dispositive cross-NAP case: TGV Lyria 9263 described by BOTH
+        # SNCF (8-digit UICs, route_short_name "622E") and SBB (7-digit
+        # UICs, route_short_name "622E"). Same times, same stops, same
+        # route name — only the UIC encoding differs. Must fingerprint
+        # identically once the check digit is normalised away.
+        sncf_leg = _rail_leg(
+            from_stop_id="StopPoint:OCELyria-87686006",  # Paris GdL, 8-digit
+            to_stop_id="StopPoint:OCELyria-85010082",  # Genève, 8-digit
+            route_short_name="622E",
+            departure="2026-08-16T05:56:00+00:00",
+            arrival="2026-08-16T10:25:00+00:00",
+        )
+        sbb_leg = _rail_leg(
+            from_stop_id="8768600",  # Paris GdL, 7-digit
+            to_stop_id="8501008",  # Genève, 7-digit
+            route_short_name="622E",
+            departure="2026-08-16T05:56:00+00:00",
+            arrival="2026-08-16T10:25:00+00:00",
+        )
+        assert transit_fingerprint([sncf_leg]) == transit_fingerprint([sbb_leg])
+        assert transit_fingerprint([sncf_leg]) != ""
+
+    def test_nine_digit_blob_not_treated_as_uic(self):
+        from app.journey.signature import _uic_from_stop_id
+
+        # A 9+ digit run is not a UIC — must not yield a bogus prefix.
+        assert _uic_from_stop_id("123456789") is None
+
+    def test_existing_seven_digit_behaviour_unchanged(self):
+        from app.journey.signature import _uic_from_stop_id
+
+        # Regression guard: the 7-or-8-digit widening must not change
+        # plain 7-digit parsing the OJP comparison relies on.
+        assert _uic_from_stop_id("SBB:8507000:0:7") == "8507000"
+        assert _uic_from_stop_id("ch:1:sloid:7000:4:7") == "8507000"
+        assert _uic_from_stop_id("STIB:1234") is None
+
+
 class TestCrossEngineMatching:
     """The centrepiece: OJP and OTP shapes of the *same train* must
     fingerprint identically, even though they differ in stop_id

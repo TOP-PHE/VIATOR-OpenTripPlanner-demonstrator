@@ -442,16 +442,41 @@ to reconstruct the canonical UIC. Verified against Patrick's actual
 captured Bern → Geneva IR15 JSON: both sides fingerprint to the same
 16-hex token after the fix.
 
-The two-step parser strategy (7-digit first, then 4-digit-DSN-only-
-for-ch:1 namespace) handles all the formats seen in live data:
+The parser strategy (7-or-8-digit first, then 4-digit-DSN-only-for-
+ch:1 namespace) handles all the formats seen in live data:
 
 | Source | Example stop_id | Parser path | Result |
 |---|---|---|---|
-| OTP (GTFS) | `SBB:8507000:0:7` | 7-digit regex | `UIC:8507000` |
-| OTP cross-border | `SBB:8771500` | 7-digit regex | `UIC:8771500` |
+| SBB / OTP (GTFS) | `SBB:8507000:0:7` | 7-digit regex | `UIC:8507000` |
+| SBB cross-border | `SBB:8771500` | 7-digit regex | `UIC:8771500` |
+| **SNCF (8-digit)** | `StopPoint:OCELyria-87686006` | 8-digit regex, drop check digit | `UIC:8768600` |
 | OJP Swiss | `ch:1:sloid:7000:4:7` | DSN regex + `850` prefix | `UIC:8507000` |
 | OJP cross-border | `ch:1:sloid:8771500:0:1` | 7-digit regex | `UIC:8771500` |
-| Non-Swiss feed | `STIB:1234` | (neither path matches) | None → lat/lon fallback |
+| Non-Swiss feed | `STIB:1234` | (no path matches) | None → lat/lon fallback |
+
+#### 9.1.3 The v0.1.36 SNCF 8-digit / check-digit normalisation
+
+The cross-NAP federation spike (comparing how SNCF and SBB each
+describe TGV Lyria 9263, Paris → Genève) surfaced a UIC-encoding
+mismatch that would break any SNCF↔SBB matching:
+
+- **SBB** publishes 7-digit UICs: Genève = `8501008`.
+- **SNCF** publishes the 8-digit form: Genève = `85010082` (the 7-digit
+  UIC `8501008` plus a trailing **check digit** `2`).
+
+So the same physical station appears as `85010082` (SNCF) and `8501008`
+(SBB). The v0.1.35.x parser matched exactly 7 digits, so SNCF's 8-digit
+codes fell through to the lat/lon fallback while SBB's matched on UIC —
+two encodings of one station producing different fingerprint tokens.
+
+v0.1.36 widens `_UIC_RE` to `\d{7,8}` and keeps the **first 7 digits**
+(the 8-digit form is always UIC + check digit). Verified against the
+live SNCF and SBB GTFS feeds: TGV Lyria 9263 — identical route name
+(`622E`), identical times, identical stop sequence, differing only in
+the UIC encoding — fingerprints to the same 16-hex token on both sides
+after the fix. This is the prerequisite for cross-NAP federation result
+dedup (the safety net beneath origin-country ownership; see
+`docs/cross-nap-federation-design.md`).
 
 The `_build_comparison` helper in `app/api/journey.py`:
 
