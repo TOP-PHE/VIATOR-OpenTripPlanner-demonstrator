@@ -546,7 +546,6 @@ class UploadResponse(BaseModel):
 
 @router.post(
     "/{sid}/uploads",
-    response_model=UploadResponse,
     status_code=201,
     responses={
         400: {
