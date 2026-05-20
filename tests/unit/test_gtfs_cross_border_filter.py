@@ -398,7 +398,8 @@ class TestFilterToCrossBorder:
         _build_synthetic_gtfs(src)
 
         stats = filter_to_cross_border(src, out)
-        # Lyria = FR+CH, Centovalli = CH+IT
+        # Lyria spans France and Switzerland; Centovalli spans Switzerland
+        # and Italy. Combo labels are ISO codes sorted alphabetically.
         assert stats.country_combos.get("CH+FR") == 1
         assert stats.country_combos.get("CH+IT") == 1
 
