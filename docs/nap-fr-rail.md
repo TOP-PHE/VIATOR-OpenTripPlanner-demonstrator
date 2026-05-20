@@ -190,7 +190,59 @@ demo cross-border coordinate searches you'd need a wider PBF
 italy + spain` with `osmium merge` before upload. Stop-id-based queries
 (via the GraphQL API directly) work either way.
 
-### 3.3 Deliberately omitted — why
+### 3.3 What you'll see in the "Import from NAP" preview *(reading the UI)*
+
+When you open a French session and use **Import from NAP** with the
+filter `country=FR` + `mode=rail`, the preview shows roughly **12
+rail-tagged datasets**. Not the per-region list of TER operators most
+people expect. Here's how to read it (v0.1.35.07+):
+
+| What appears | What to do |
+|---|---|
+| **Réseau SNCF TGV, Intercités et TER** | **Pick this.** It's the SNCF national GTFS containing TGV, Intercités, OUIGO, **AND every region's TER**. One provider covers all France-wide rail (see §3.1). |
+| Trains régionaux Hauts-de-France mobilités | Optional. Duplicates the Hauts-de-France TER already inside the SNCF national above. Pick only if you want higher-frequency regional updates. (See §3.4 — these are listed as "deliberately omitted" duplicates.) |
+| Trains régionaux ZOU! (+ Transdev Rail Sud) | Same — PACA region TER, duplicate of SNCF national. |
+| Réseau interurbain BreizhGo TER | Same — Bretagne region TER. Title is misleading ("interurbain" = bus-like) but it IS rail-tagged because of the trailing "TER". |
+| SNCF Transilien | Île-de-France suburban rail. Strict subset of IDFM (#3.3). Skip. |
+| Réseau européen AVE Renfe / Eurostar / Trenitalia France / FlixBus+FlixTrain | Cross-border operators — pick per §3.2. |
+| Gares + Passages à niveau du réseau ferré national | Station / level-crossing inventories. No timetable, no GTFS resource → automatically rejected by `select_resource` (you'll see them flagged "no usable format" in the skipped list). |
+
+**Key surprise**: there are no per-region "TER Auvergne", "TER Grand Est",
+"TER Nouvelle-Aquitaine", etc. as separate datasets. SNCF publishes
+**one consolidated GTFS** for all France, not per-region. The 3 regions
+that DO publish separately (Hauts-de-France, PACA via ZOU, Bretagne via
+BreizhGo) are exceptions, and their data is redundant with the SNCF
+national feed.
+
+**Side note**: pre-v0.1.35.07 the preview was polluted by ~36
+"Navette" (shuttle) datasets falsely tagged as rail. The substring match
+on `"ave"` (Renfe AVE keyword) matched inside `"navette"` — fixed in
+v0.1.35.07 by switching `classify_modes()` to word-boundary regex on
+ambiguous-short keywords.
+
+**Important nuance — `urban`-tagged datasets can include rail.** IDFM,
+TCL (Lyon), and most large urban-network datasets bundle bus + tram +
+metro + RER + Transilien into one big multi-modal GTFS. They get tagged
+`urban` (sometimes also `bus`) by `classify_modes()` because that's the
+dominant mode by title. They do **not** get tagged `rail` even though
+they carry RER / Transilien / Metro trains. This is intentional:
+
+- The classifier reflects "dominant mode by title", not "all modes
+  present" (which would require parsing every GTFS during preview).
+- The `mode=rail` filter is meant to surface **intercity / regional
+  rail operators** for focused-purpose rail sessions, not all-modes
+  urban aggregates.
+- Once an operator picks IDFM (or any urban-tagged dataset), OTP routes
+  through every mode the GTFS contains — RER and Transilien included.
+  The tag doesn't gate routing capability; it only affects what shows
+  up in the preview UI.
+
+**So**: for Île-de-France rail, pick IDFM (under `mode=urban`) — its
+RER and Transilien come along automatically. For nation-wide rail, pick
+the SNCF national GTFS (under `mode=rail`). Together they cover all
+metropolitan rail in France.
+
+### 3.4 Deliberately omitted — why
 
 | Source | Why we skip |
 |---|---|
@@ -199,7 +251,7 @@ italy + spain` with `osmium merge` before upload. Stop-id-based queries
 | **AURA OURA aggregator** | Mostly buses + duplicate TER. Not worth the noise for a rail demo. |
 | **Per-region TER feeds (Bretagne, Bourgogne, etc.)** | All covered by #3.1's SNCF national feed. |
 
-### 3.4 Master-stations countries to import before saving
+### 3.5 Master-stations countries to import before saving
 
 Each provider's `country_iso` triggers the country-gate. For the
 recommended-set sessions:

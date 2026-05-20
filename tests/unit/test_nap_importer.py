@@ -50,6 +50,77 @@ class TestClassifyModes:
         ds = {"title": "Réseau européen Eurostar", "tags": []}
         assert "rail" in classify_modes(ds)
 
+    # v0.1.35.07 — regression tests for the substring-to-word-boundary fix.
+    # Before the fix, 36 "Navette" datasets in the French NAP catalogue were
+    # incorrectly tagged as rail because "navette" contains "ave" (a rail
+    # keyword for Renfe AVE high-speed). Same family of false-positive
+    # eliminated by anchoring ambiguous-short keywords with \b.
+
+    def test_navette_title_does_not_match_rail(self):
+        """The original symptom: 'Navette' (shuttle) contains 'ave' which
+        was a rail keyword (Renfe AVE). Word-boundary fix eliminates this."""
+        from app.master.nap_importer import classify_modes
+
+        for title in (
+            "Navette estivale Andemu",
+            "Navettes Aéroport Paris Beauvais",
+            "Navette estivale Cortè - vallée de la Restonica",
+            "Navettes saisonnières Bourg-Saint-Maurice",
+            "Réseau urbain Navette Saint-Tropez",
+        ):
+            modes = classify_modes({"title": title, "tags": []})
+            assert "rail" not in modes, f"Navette title falsely matched rail: {title!r}"
+
+    def test_avenue_title_does_not_match_rail(self):
+        """Sibling check: 'Avenue' contains 'ave' but isn't rail."""
+        from app.master.nap_importer import classify_modes
+
+        modes = classify_modes({"title": "Bus Avenue de la République", "tags": []})
+        assert "rail" not in modes
+
+    def test_breizhgo_ter_still_matches_rail_after_boundary_fix(self):
+        """Positive regression: 'TER' at end of title used to need the
+        trailing-space hack to match (which only worked because the haystack
+        join added trailing spaces). The new \\bter\\b regex is the
+        explicit version of that same intent."""
+        from app.master.nap_importer import classify_modes
+
+        modes = classify_modes({"title": "Réseau interurbain BreizhGo TER", "tags": []})
+        assert "rail" in modes
+
+    def test_renfe_ave_still_matches_rail(self):
+        """The actual reason 'ave' is in the rail keyword list: Renfe AVE."""
+        from app.master.nap_importer import classify_modes
+
+        modes = classify_modes({"title": "Réseau européen AVE Renfe", "tags": []})
+        assert "rail" in modes
+
+    def test_ter_at_word_boundary_matches(self):
+        """`ter` matches as a word, not as a substring of 'interurbain'."""
+        from app.master.nap_importer import classify_modes
+
+        # Stand-alone 'TER' word → rail
+        assert "rail" in classify_modes({"title": "TER Hauts-de-France", "tags": []})
+        # 'TER' as substring of 'interurbain' → NOT rail (unless other
+        # rail keywords are present)
+        modes = classify_modes({"title": "Réseau interurbain bus Proximité", "tags": []})
+        assert "rail" not in modes
+
+    def test_rer_at_word_boundary_matches(self):
+        """`rer` is short — used to need trailing-space hack. Now matches
+        only as a stand-alone word."""
+        from app.master.nap_importer import classify_modes
+
+        # Stand-alone 'RER' → urban (Île-de-France suburban rail)
+        assert "urban" in classify_modes({"title": "RER A", "tags": []})
+        # `interurbain` legitimately matches the `urbain` substring keyword
+        # in urban-mode (intentional — see _MODE_KEYWORDS source comment:
+        # "Réseaux urbains et interurbains" gets both modes). What the
+        # word-boundary fix protects is rail — `rer` is rail-adjacent in
+        # IDFM context, here just confirming it stays out of rail.
+        modes = classify_modes({"title": "Réseau interurbain", "tags": []})
+        assert "rail" not in modes
+
 
 # ─────────────────── select_resource ───────────────────
 
