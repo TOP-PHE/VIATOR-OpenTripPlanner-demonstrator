@@ -37,17 +37,28 @@ in two passes:
 so memory stays bounded regardless of feed size.
 
 This is the in-app sibling of the manual rail-only filter documented in
-docs/nap-ch-rail.md §3.3. Where that one selects by `route_type`, this
-one selects by cross-border-ness.
+docs/nap-ch-rail.md §3.3. It combines TWO selectors — both needed on a
+full multimodal national feed like SBB's:
 
-Limitations (v1, strict mode):
-  - Stops whose stop_id carries no parseable UIC contribute "unknown
-    country" and don't count toward the 2+-country test. For the major
-    rail operators (SNCF/SBB/DB/Eurostar/Trenitalia) every stop carries a
-    UIC, so this is rarely an issue; non-UIC feeds (IDFM-style) simply
-    won't be detected as cross-border. Documented; a permissive mode
-    (also keep routes terminating at a known border interchange) is a
-    follow-up.
+  - rail_only (default True): keep only rail `route_type`s, so lake boats,
+    border buses, trams and funiculars can't masquerade as cross-border
+    rail. Pass rail_only=False to consider every mode.
+  - cross-border-ness: 2+ distinct UIC *country* prefixes among the stops.
+
+Limitations:
+  - Stops whose stop_id carries no parseable UIC — or whose 2-digit prefix
+    is not a recognised UIC country (UIC_COUNTRY_NAMES) — contribute
+    "unknown country" and don't count toward the 2+-country test. The
+    whitelist is what stops SBB's internal codes for local/foreign stops
+    (e.g. Evian = 1400001 -> "14") from faking a country. The flip side:
+    a cross-border service whose foreign leg is encoded ONLY with such an
+    internal code (no real foreign UIC anywhere on the route) won't be
+    detected. In practice major international stations carry real UICs, and
+    origin-country ownership takes those trains from the foreign NAP feed
+    anyway. A coordinate fallback (resolve a stop's country from its
+    lat/lon via the master_stations registry) is the planned follow-up for
+    full recall — deliberately out of scope here to keep this module
+    stdlib-only / DB-free.
 """
 
 from __future__ import annotations
@@ -72,28 +83,60 @@ log = logging.getLogger(__name__)
 # digits. `(?<!\d) … (?!\d)` ensures we match a whole code, not a slice.
 _UIC_RE = re.compile(r"(?<!\d)(\d{2})\d{5,6}(?!\d)")
 
-# ISO-2 ↔ UIC numeric country prefix, for human-readable stats / logs.
-# Not exhaustive — just the European rail countries VIATOR is likely to
-# touch. Unknown prefixes still work for the cross-border test (they're
-# distinct numbers); this map is only for labelling.
+# ISO-2 <-> UIC numeric country prefix (leading 2 digits of a UIC station
+# code). This map doubles as the **cross-border whitelist**: a stop whose
+# 2-digit prefix is not a key here is treated as "unknown country" and
+# does NOT contribute to the 2+-country test.
+#
+# Why a whitelist (audit follow-up, SBB multimodal feed): SBB's national
+# feed assigns *internal* 7-digit codes to some local / foreign stops
+# (e.g. Evian = 1400001, leading "14"). "14" is not a UIC country, but the
+# naive matcher counted it as a distinct one, so domestic Swiss services
+# touching such a stop looked "cross-border" -- 322 bogus routes. Counting
+# only real country codes kills those false positives.
+#
+# Europe-focused but generous, so a genuine cross-border service is never
+# dropped for want of a country label. (Fixed: 73 is Greece, not Denmark
+# -- Denmark is 86; the old map mislabelled 73 as DK.)
 UIC_COUNTRY_NAMES: dict[str, str] = {
-    "87": "FR",
-    "85": "CH",
-    "80": "DE",
-    "88": "BE",
-    "84": "NL",
-    "83": "IT",
-    "82": "LU",
-    "81": "AT",
-    "79": "SI",
-    "78": "HR",
-    "76": "NO",
-    "74": "SE",
-    "73": "DK",
-    "71": "ES",
-    "70": "GB",
-    "54": "CZ",
+    "10": "FI",
+    "20": "RU",
+    "21": "BY",
+    "22": "UA",
+    "23": "MD",
+    "24": "LT",
+    "25": "LV",
+    "26": "EE",
+    "41": "AL",
+    "50": "BA",
     "51": "PL",
+    "52": "BG",
+    "53": "RO",
+    "54": "CZ",
+    "55": "HU",
+    "56": "SK",
+    "60": "IE",
+    "62": "ME",
+    "65": "MK",
+    "70": "GB",
+    "71": "ES",
+    "72": "RS",
+    "73": "GR",
+    "74": "SE",
+    "75": "TR",
+    "76": "NO",
+    "78": "HR",
+    "79": "SI",
+    "80": "DE",
+    "81": "AT",
+    "82": "LU",
+    "83": "IT",
+    "84": "NL",
+    "85": "CH",
+    "86": "DK",
+    "87": "FR",
+    "88": "BE",
+    "94": "PT",
 }
 
 
@@ -115,11 +158,43 @@ def country_prefix(stop_id: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _country_of(stop_id: str | None) -> str | None:
+    """Country prefix of a stop, but only when it is a *recognised* UIC
+    country code (see UIC_COUNTRY_NAMES).
+
+    Returns None for codes whose leading 2 digits aren't a real country --
+    notably SBB's internal 7-digit codes for local/foreign stops (e.g.
+    Evian = 1400001 -> "14"), which must not be mistaken for a country in
+    the cross-border test. `country_prefix` stays a pure extractor; this
+    is the validity gate the classifier uses.
+    """
+    p = country_prefix(stop_id)
+    return p if p is not None and p in UIC_COUNTRY_NAMES else None
+
+
+def _is_rail_route_type(route_type: str | None) -> bool:
+    """True if a GTFS `route_type` denotes rail.
+
+    Basic GTFS: 2 = Rail. Google extended types: 100-117 are the rail
+    family (railway service, high-speed, long-distance, regional, ...).
+    Everything else -- bus (3 / 700s), ferry (4 / 1000s), tram (0 / 900s),
+    funicular (7 / 1400s), aerial lift (6 / 1300s), metro (1 / 400s) -- is
+    excluded. That multimodal tail is exactly what dragged Lake Geneva
+    boats and border buses into the SBB feed's "cross-border" set.
+    """
+    try:
+        rt = int((route_type or "").strip())
+    except ValueError:
+        return False
+    return rt == 2 or 100 <= rt <= 117
+
+
 @dataclass
 class CrossBorderStats:
     """Summary of a filter run — surfaced in logs and the operator UI."""
 
     routes_total: int = 0
+    routes_rail: int = 0
     routes_kept: int = 0
     trips_total: int = 0
     trips_kept: int = 0
@@ -134,7 +209,8 @@ class CrossBorderStats:
     def summary_line(self) -> str:
         combos = ", ".join(f"{k}:{v}" for k, v in sorted(self.country_combos.items()))
         return (
-            f"cross-border filter: kept {self.routes_kept}/{self.routes_total} routes, "
+            f"cross-border filter: kept {self.routes_kept}/{self.routes_rail} rail routes "
+            f"(of {self.routes_total} total), "
             f"{self.trips_kept}/{self.trips_total} trips, "
             f"{self.stops_kept}/{self.stops_total} stops "
             f"[{combos or 'none'}]"
@@ -229,16 +305,19 @@ class _KeptSets:
 def _stop_country_map(
     stop_rows: list[dict[str, str]],
 ) -> tuple[dict[str, str | None], dict[str, str]]:
-    """Build stop_id → country prefix and stop_id → parent_station maps.
+    """Build stop_id -> country prefix and stop_id -> parent_station maps.
 
-    A platform-level stop may carry no UIC of its own but a parent that
-    does (or vice versa); inherit a missing country from the parent.
+    Country is the *recognised* UIC country prefix (`_country_of`), so an
+    SBB-internal code like Evian's 1400001 resolves to None rather than a
+    bogus "14" country. A platform-level stop may carry no UIC of its own
+    but a parent that does (or vice versa); inherit a missing country from
+    the parent.
     """
     stop_country: dict[str, str | None] = {}
     stop_parent: dict[str, str] = {}
     for s in stop_rows:
         sid = s.get("stop_id", "")
-        stop_country[sid] = country_prefix(sid)
+        stop_country[sid] = _country_of(sid)
         parent = (s.get("parent_station") or "").strip()
         if parent:
             stop_parent[sid] = parent
@@ -380,12 +459,19 @@ def _write_filtered_feed(
     _copy_passthrough(zin, zout)
 
 
-def filter_to_cross_border(input_zip: Path, output_zip: Path) -> CrossBorderStats:
+def filter_to_cross_border(
+    input_zip: Path, output_zip: Path, *, rail_only: bool = True
+) -> CrossBorderStats:
     """Filter a GTFS feed to only cross-border routes. Returns run stats.
 
-    A route is kept iff its stops span 2+ UIC country prefixes (§ module
-    docstring). The dependent files are cascade-filtered so the output is
-    a valid, self-consistent GTFS containing only the kept routes' data.
+    A route is kept iff (a) it is a rail route -- when ``rail_only`` (the
+    default) -- and (b) its stops span 2+ recognised UIC country prefixes
+    (see module docstring). The dependent files are cascade-filtered so the
+    output is a valid, self-consistent GTFS containing only the kept
+    routes' data.
+
+    Set ``rail_only=False`` to classify every mode -- useful only for feeds
+    you already know are rail-only.
     """
     input_zip = Path(input_zip)
     output_zip = Path(output_zip)
@@ -396,16 +482,33 @@ def filter_to_cross_border(input_zip: Path, output_zip: Path) -> CrossBorderStat
         stats.stops_total = len(stop_rows)
         stop_country, stop_parent = _stop_country_map(stop_rows)
 
+        # Read routes up-front so classification can be restricted to rail.
+        route_fields, route_rows = _read_csv(zin, _ROUTES)
+        stats.routes_total = len(route_rows)
+        if rail_only:
+            rail_route_ids = {
+                r.get("route_id", "")
+                for r in route_rows
+                if _is_rail_route_type(r.get("route_type"))
+            }
+        else:
+            rail_route_ids = {r.get("route_id", "") for r in route_rows}
+        stats.routes_rail = len(rail_route_ids)
+
         trip_fields, trip_rows = _read_csv(zin, _TRIPS)
         stats.trips_total = len(trip_rows)
-        trip_route = {t.get("trip_id", ""): t.get("route_id", "") for t in trip_rows}
+        # Only rail routes' trips feed the cross-border classification; a
+        # non-rail trip maps to no route here and is skipped in pass 1.
+        trip_route = {
+            t.get("trip_id", ""): t.get("route_id", "")
+            for t in trip_rows
+            if t.get("route_id", "") in rail_route_ids
+        }
 
         cross_border_routes, route_countries = _classify_routes(
             zin, trip_route, stop_country, stats
         )
 
-        route_fields, route_rows = _read_csv(zin, _ROUTES)
-        stats.routes_total = len(route_rows)
         stats.routes_kept = len(cross_border_routes)
         for rid in cross_border_routes:
             # Sort by ISO name (not numeric prefix) so the label reads
@@ -477,10 +580,15 @@ def _main() -> int:
     )
     parser.add_argument("input", type=Path, help="input GTFS .zip")
     parser.add_argument("output", type=Path, help="output (filtered) GTFS .zip")
+    parser.add_argument(
+        "--all-modes",
+        action="store_true",
+        help="consider every route_type, not just rail (default: rail only)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    stats = filter_to_cross_border(args.input, args.output)
+    stats = filter_to_cross_border(args.input, args.output, rail_only=not args.all_modes)
     print(stats.summary_line())
     return 0 if stats.routes_kept > 0 else 1
 

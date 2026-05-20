@@ -23,6 +23,9 @@ import zipfile
 from pathlib import Path
 
 from app.gtfs_cross_border_filter import (
+    UIC_COUNTRY_NAMES,
+    _country_of,
+    _is_rail_route_type,
     country_prefix,
     filter_to_cross_border,
 )
@@ -424,3 +427,252 @@ class TestFilterToCrossBorder:
             members = set(zf.namelist())
         for mandatory in ("agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
             assert mandatory in members
+
+
+# ─────────────────── multimodal feed (SBB-style) ───────────────────
+
+
+def _build_multimodal_gtfs(path: Path) -> None:
+    """A small SBB-flavoured feed exercising the two contamination fixes.
+
+    R_RAIL_XB        rail (type 2)  Geneve (85) -> Annemasse (87)   KEEP
+    R_FERRY_XB       ferry (type 4) Lausanne (85) -> Evian (87)     DROP (not rail)
+    R_RAIL_INTERNAL  rail (type 2)  Lausanne (85) -> 1400001        DROP (the "14"
+                     SBB-internal code is not a UIC country, so the route is CH-only)
+    """
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "agency.txt",
+            _csv(
+                ["agency_id", "agency_name", "agency_url", "agency_timezone"],
+                [
+                    {
+                        "agency_id": "SBB",
+                        "agency_name": "SBB",
+                        "agency_url": "https://sbb.ch",
+                        "agency_timezone": "Europe/Zurich",
+                    }
+                ],
+            ),
+        )
+        stops = [
+            {
+                "stop_id": "8501008",
+                "stop_name": "Geneve",
+                "stop_lat": "46.210",
+                "stop_lon": "6.142",
+            },
+            {
+                "stop_id": "8501120",
+                "stop_name": "Lausanne",
+                "stop_lat": "46.517",
+                "stop_lon": "6.629",
+            },
+            {
+                "stop_id": "8718500",
+                "stop_name": "Annemasse",
+                "stop_lat": "46.193",
+                "stop_lon": "6.236",
+            },
+            {
+                "stop_id": "8748100",
+                "stop_name": "Evian-les-Bains",
+                "stop_lat": "46.401",
+                "stop_lon": "6.589",
+            },
+            # SBB-internal code for a French lakeshore stop: leading "14"
+            # is NOT a UIC country.
+            {
+                "stop_id": "1400001",
+                "stop_name": "Evian (SBB-internal)",
+                "stop_lat": "46.401",
+                "stop_lon": "6.589",
+            },
+        ]
+        zf.writestr(
+            "stops.txt",
+            _csv(["stop_id", "stop_name", "stop_lat", "stop_lon"], stops),
+        )
+        routes = [
+            {
+                "route_id": "R_RAIL_XB",
+                "agency_id": "SBB",
+                "route_short_name": "RE",
+                "route_type": "2",
+            },
+            {
+                "route_id": "R_FERRY_XB",
+                "agency_id": "SBB",
+                "route_short_name": "CGN",
+                "route_type": "4",
+            },
+            {
+                "route_id": "R_RAIL_INTERNAL",
+                "agency_id": "SBB",
+                "route_short_name": "RL",
+                "route_type": "2",
+            },
+        ]
+        zf.writestr(
+            "routes.txt",
+            _csv(["route_id", "agency_id", "route_short_name", "route_type"], routes),
+        )
+        trips = [
+            {"route_id": "R_RAIL_XB", "service_id": "WD", "trip_id": "T_RAIL_XB"},
+            {"route_id": "R_FERRY_XB", "service_id": "WD", "trip_id": "T_FERRY_XB"},
+            {"route_id": "R_RAIL_INTERNAL", "service_id": "WD", "trip_id": "T_RAIL_INT"},
+        ]
+        zf.writestr("trips.txt", _csv(["route_id", "service_id", "trip_id"], trips))
+        st: list[dict] = []
+
+        def _leg(trip, seq, stop, t):
+            st.append(
+                {
+                    "trip_id": trip,
+                    "stop_sequence": str(seq),
+                    "stop_id": stop,
+                    "arrival_time": t,
+                    "departure_time": t,
+                }
+            )
+
+        _leg("T_RAIL_XB", 1, "8501008", "08:00:00")
+        _leg("T_RAIL_XB", 2, "8718500", "08:30:00")
+        _leg("T_FERRY_XB", 1, "8501120", "09:00:00")
+        _leg("T_FERRY_XB", 2, "8748100", "09:45:00")
+        _leg("T_RAIL_INT", 1, "8501120", "10:00:00")
+        _leg("T_RAIL_INT", 2, "1400001", "10:40:00")
+        zf.writestr(
+            "stop_times.txt",
+            _csv(["trip_id", "stop_sequence", "stop_id", "arrival_time", "departure_time"], st),
+        )
+        zf.writestr(
+            "calendar.txt",
+            _csv(
+                [
+                    "service_id",
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                    "start_date",
+                    "end_date",
+                ],
+                [
+                    {
+                        "service_id": "WD",
+                        "monday": "1",
+                        "tuesday": "1",
+                        "wednesday": "1",
+                        "thursday": "1",
+                        "friday": "1",
+                        "saturday": "0",
+                        "sunday": "0",
+                        "start_date": "20260518",
+                        "end_date": "20260816",
+                    }
+                ],
+            ),
+        )
+
+
+class TestRailOnlyPreFilter:
+    def test_ferry_crossborder_dropped_by_default(self, tmp_path):
+        src = tmp_path / "sbb.zip"
+        out = tmp_path / "xb.zip"
+        _build_multimodal_gtfs(src)
+
+        stats = filter_to_cross_border(src, out)
+        kept = _read_ids(out, "routes.txt", "route_id")
+        # Only the rail cross-border route survives; the CH<->FR ferry is
+        # cross-border by country but dropped because it isn't rail.
+        assert kept == {"R_RAIL_XB"}
+        assert stats.routes_total == 3
+        assert stats.routes_rail == 2  # the two route_type=2 routes
+
+    def test_ferry_crossborder_kept_with_all_modes(self, tmp_path):
+        src = tmp_path / "sbb.zip"
+        out = tmp_path / "xb.zip"
+        _build_multimodal_gtfs(src)
+
+        stats = filter_to_cross_border(src, out, rail_only=False)
+        kept = _read_ids(out, "routes.txt", "route_id")
+        # rail_only=False lets the ferry back in (still 2 real countries).
+        assert kept == {"R_RAIL_XB", "R_FERRY_XB"}
+        assert stats.routes_rail == 3  # every route treated as a candidate
+
+
+class TestCountryWhitelist:
+    def test_internal_code_not_treated_as_country(self, tmp_path):
+        src = tmp_path / "sbb.zip"
+        out = tmp_path / "xb.zip"
+        _build_multimodal_gtfs(src)
+
+        # R_RAIL_INTERNAL is a rail route, so rail-only keeps it as a
+        # candidate — it's dropped solely because "14" isn't a UIC country.
+        filter_to_cross_border(src, out)
+        assert "R_RAIL_INTERNAL" not in _read_ids(out, "routes.txt", "route_id")
+        # ...and still dropped under all-modes: the whitelist is independent
+        # of the rail filter.
+        filter_to_cross_border(src, out, rail_only=False)
+        assert "R_RAIL_INTERNAL" not in _read_ids(out, "routes.txt", "route_id")
+
+    def test_no_bogus_country_combo(self, tmp_path):
+        src = tmp_path / "sbb.zip"
+        out = tmp_path / "xb.zip"
+        _build_multimodal_gtfs(src)
+
+        stats = filter_to_cross_border(src, out)
+        assert stats.country_combos.get("CH+FR") == 1
+        assert all("14" not in combo for combo in stats.country_combos)
+
+
+class TestCountryOf:
+    def test_recognised_country(self):
+        assert _country_of("8501008") == "85"
+        assert _country_of("8718500") == "87"
+
+    def test_internal_code_returns_none(self):
+        # The raw extractor still sees "14"; the validity gate rejects it.
+        assert country_prefix("1400001") == "14"
+        assert _country_of("1400001") is None
+
+    def test_none_and_unparseable(self):
+        assert _country_of(None) is None
+        assert _country_of("IDFM:monomodalStopPlace:43098") is None
+
+
+class TestRailRouteType:
+    def test_basic_rail(self):
+        assert _is_rail_route_type("2") is True
+
+    def test_extended_rail_range(self):
+        assert _is_rail_route_type("100") is True
+        assert _is_rail_route_type("109") is True
+        assert _is_rail_route_type("117") is True
+
+    def test_non_rail_modes(self):
+        # tram(0) metro(1) bus(3) ferry(4) cable(5) aerial(6) funicular(7)
+        # trolleybus(11) monorail(12), just-out-of-range(118), coach(700),
+        # water(1000).
+        for rt in ("0", "1", "3", "4", "5", "6", "7", "11", "12", "118", "700", "1000"):
+            assert _is_rail_route_type(rt) is False
+
+    def test_blank_and_invalid(self):
+        assert _is_rail_route_type("") is False
+        assert _is_rail_route_type(None) is False
+        assert _is_rail_route_type("rail") is False
+
+
+class TestCountryWhitelistTable:
+    def test_greece_not_denmark(self):
+        # Regression: UIC 73 = Greece (GR); Denmark is 86 (old map had 73->DK).
+        assert UIC_COUNTRY_NAMES["73"] == "GR"
+        assert UIC_COUNTRY_NAMES["86"] == "DK"
+
+    def test_sbb_internal_prefixes_excluded(self):
+        for bogus in ("11", "12", "13", "14"):
+            assert bogus not in UIC_COUNTRY_NAMES
