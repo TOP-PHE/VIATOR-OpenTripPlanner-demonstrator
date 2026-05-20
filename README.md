@@ -4,7 +4,7 @@ UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner.
 
 > **Powered by TrackOnPath SAS** &nbsp;·&nbsp; Contact: [patrick.heuguet@trackonpath.com](mailto:patrick.heuguet@trackonpath.com)
 >
-> **© 2026 UIC — International Union of Railways. All rights reserved.**
+> **© 2026 TrackOnPath SAS. All rights reserved.**
 > Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 | Document | What's inside |
@@ -112,7 +112,7 @@ Set env var `VIATOR_DISABLE_CRONS=1` to disable (used in tests).
 
 VIATOR is licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE).
 
-- **Copyright** © 2026 UIC — International Union of Railways. All rights reserved.
+- **Copyright** © 2026 TrackOnPath SAS. All rights reserved.
 - **Powered by** [TrackOnPath SAS](mailto:patrick.heuguet@trackonpath.com).
 - **Third-party software and data** acknowledged in [`NOTICE`](NOTICE).
 

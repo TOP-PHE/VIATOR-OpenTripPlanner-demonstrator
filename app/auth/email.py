@@ -6,7 +6,7 @@ the email is **logged but not sent** — useful for local dev so the magic link
 is still visible to the operator.
 
 Templates are Jinja2, loaded from `app/auth/email_templates/`. They were
-lifted from OSCAR's `mailer.js` (HTML structure + UIC copyright footer) and
+lifted from OSCAR's `mailer.js` (HTML structure + copyright footer) and
 rebranded with the VIATOR palette.
 """
 
