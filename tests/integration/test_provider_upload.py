@@ -176,6 +176,15 @@ def test_upload_attached_to_provider_lands_at_feed_slot(
         assert rows[0].provider_feed_id == "SNCF-XB"
         assert rows[0].stored_path.endswith("sncf-xb.zip")
 
+    # The provider-status endpoint surfaces source + the attached filename,
+    # so the card can show which file backs the provider (Phase 1b).
+    r = client.get(f"/api/sessions/{sid}/providers/status", headers=admin)
+    assert r.status_code == 200, r.text
+    st = r.json()["SNCF-XB"]
+    assert st["source"] == "upload"
+    assert st["upload_filename"] == "feed.zip"
+    assert st["state"] == "ok"  # file present at the slot
+
 
 def test_upload_for_unknown_provider_rejected(
     client: TestClient, admin: dict[str, str], inbox: Path
