@@ -816,7 +816,7 @@ def _safe_float(v: str | None) -> float | None:
         return None
 
 
-_GTFS_ZIP_GLOB = "*.zip"
+_ZIP_GLOB = "*.zip"
 
 
 def _read_gtfs_stops(zip_path: Path) -> list[tuple[str | None, float | None, float | None]]:
@@ -2010,7 +2010,7 @@ def suggest_osm_countries(
     stops: list[tuple[str | None, float | None, float | None]] = []
     gtfs_dir = ingestion.session_inbox(sid) / "gtfs"
     if gtfs_dir.exists():
-        for zip_path in sorted(gtfs_dir.glob(_GTFS_ZIP_GLOB)):
+        for zip_path in sorted(gtfs_dir.glob(_ZIP_GLOB)):
             stops.extend(_read_gtfs_stops(zip_path))
     counts = osm_geo.detect_from_stops(stops)
 
@@ -2067,10 +2067,10 @@ def enqueue_rebuild(
     # the filesystem directly.
     sess_inbox = ingestion.session_inbox(sid)
     gtfs_zips = (
-        sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
+        sorted((sess_inbox / "gtfs").glob(_ZIP_GLOB)) if (sess_inbox / "gtfs").exists() else []
     )
     netex_zips = (
-        sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+        sorted((sess_inbox / "netex").glob(_ZIP_GLOB)) if (sess_inbox / "netex").exists() else []
     )
     osm_pbfs = sorted((sess_inbox / "osm").glob("*.pbf")) if (sess_inbox / "osm").exists() else []
     if not (gtfs_zips or netex_zips):
