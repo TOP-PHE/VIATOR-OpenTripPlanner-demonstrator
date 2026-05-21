@@ -2,7 +2,7 @@ VIATOR — Confirm your account
 
 Hello {{ name }},
 
-You requested an account on the VIATOR demonstrator (UIC MERITS Journey Planner).
+You requested an account on the VIATOR journey-planner demonstrator.
 
 Confirm your email address and set your password by visiting:
 {{ magic_link }}

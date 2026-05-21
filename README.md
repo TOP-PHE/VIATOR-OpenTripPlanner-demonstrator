@@ -1,6 +1,6 @@
 # VIATOR
 
-UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner.
+Rail journey-planning demonstrator built on OpenTripPlanner — checks routing results across timetable sources.
 
 > **Powered by TrackOnPath SAS** &nbsp;·&nbsp; Contact: [patrick.heuguet@trackonpath.com](mailto:patrick.heuguet@trackonpath.com)
 >
