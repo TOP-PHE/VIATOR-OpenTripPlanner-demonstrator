@@ -241,13 +241,11 @@ def crop_geojson(countries: Iterable[str]) -> dict[str, Any]:
         if iso not in wanted:
             continue
         multi.extend(_iter_polygons(geom))
+    # A single Feature with a MultiPolygon geometry — the form `osmium extract
+    # --polygon` accepts most reliably across versions (a FeatureCollection is
+    # version-dependent).
     return {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "properties": {"name": "viator-osm-crop", "countries": wanted},
-                "geometry": {"type": "MultiPolygon", "coordinates": multi},
-            }
-        ],
+        "type": "Feature",
+        "properties": {"name": "viator-osm-crop", "countries": wanted},
+        "geometry": {"type": "MultiPolygon", "coordinates": multi},
     }

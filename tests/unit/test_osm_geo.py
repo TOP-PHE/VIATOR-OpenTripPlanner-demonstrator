@@ -120,12 +120,12 @@ def test_suggest_exactly_at_threshold_is_included():
 
 def test_crop_geojson_merges_selected_countries():
     cg = g.crop_geojson(["FR", "CH"])
-    assert cg["type"] == "FeatureCollection"
-    feat = cg["features"][0]
-    assert feat["geometry"]["type"] == "MultiPolygon"
+    # A single Feature with a MultiPolygon — the form osmium extract accepts.
+    assert cg["type"] == "Feature"
+    assert cg["geometry"]["type"] == "MultiPolygon"
     # FR (mainland + Corsica) + CH ⇒ several sub-polygons.
-    assert len(feat["geometry"]["coordinates"]) >= 2
-    assert feat["properties"]["countries"] == ["CH", "FR"]
+    assert len(cg["geometry"]["coordinates"]) >= 2
+    assert cg["properties"]["countries"] == ["CH", "FR"]
 
 
 def test_crop_geojson_rejects_unknown_country():
@@ -135,4 +135,4 @@ def test_crop_geojson_rejects_unknown_country():
 
 def test_crop_geojson_empty_selection_is_empty_multipolygon():
     cg = g.crop_geojson([])
-    assert cg["features"][0]["geometry"]["coordinates"] == []
+    assert cg["geometry"]["coordinates"] == []
