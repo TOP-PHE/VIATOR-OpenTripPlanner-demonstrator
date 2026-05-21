@@ -11,6 +11,7 @@ the operator having to shell in.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -614,6 +615,7 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
     from . import (
         ingestion,
         osm_filter,
+        osm_geo,
         otp_api_timeout,
         otp_heap,
         otp_timezone,
@@ -621,6 +623,10 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
     )
 
     osm_scope = osm_filter.DEFAULT_SCOPE
+    # v0.1.40 — geographic OSM scope: crop the street graph to these served
+    # countries (orthogonal to osm_scope's tag filter). Empty ⇒ no crop
+    # (legacy sessions build unchanged). See docs/osm-geographic-scope-design.md.
+    osm_countries: list[str] = []
     # v0.1.21 — explicit transitModelTimeZone, required by OTP 2.9 when
     # the graph mixes agencies declaring different timezones (SNCF says
     # Europe/Paris, Eurostar says Europe/Brussels, etc). Default keeps
@@ -656,6 +662,12 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
                     osm_scope = osm_filter.validate_scope(row.config.get("osm_scope"))
                 except ValueError as exc:
                     log.warning("session %s has bad osm_scope: %s — using default", sid, exc)
+                try:
+                    osm_countries = osm_geo.validate_countries(row.config.get("osm_countries"))
+                except ValueError as exc:
+                    log.warning(
+                        "session %s has bad osm_countries: %s — skipping geo-crop", sid, exc
+                    )
                 try:
                     otp_tz = otp_timezone.validate_timezone(row.config.get("otp_timezone"))
                 except ValueError as exc:
@@ -774,6 +786,28 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
         except Exception as exc:
             log.warning("session %s router-config.json write failed: %s", sid, exc)
 
+    # v0.1.40 — geographic OSM crop polygon. When the session selects
+    # `osm_countries`, write the merged country MultiPolygon to the inbox; the
+    # otp-build entrypoint runs `osmium extract --polygon` on it before the tag
+    # filter, so the street graph covers only the served countries. Written
+    # only when countries are set (else the entrypoint skips the crop). The
+    # inbox is mounted read-only into otp-build, so it lands here in the worker.
+    if session_id and osm_countries:
+        try:
+            session_inbox = ingestion.session_inbox(session_id)
+            session_inbox.mkdir(parents=True, exist_ok=True)
+            (session_inbox / "osm-crop.geojson").write_text(
+                json.dumps(osm_geo.crop_geojson(osm_countries)),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            log.warning("session %s osm-crop.geojson write failed: %s — no geo-crop", sid, exc)
+    elif session_id:
+        # No countries selected → ensure a stale crop file from a previous
+        # build doesn't silently keep cropping. Remove it if present.
+        stale = ingestion.session_inbox(session_id) / "osm-crop.geojson"
+        stale.unlink(missing_ok=True)
+
     # v0.1.38 — max-memory rebuild: free the box and size the heap to host RAM
     # before deriving the cap. The operator accepted stopping the journey-
     # planner sessions for this build; the `finally` at the end restarts them
@@ -840,6 +874,12 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
         f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "-e",
         f"OTP_OSM_SCOPE={osm_scope}",
+        # v0.1.40 — geographic crop scope (CSV of ISO codes). The entrypoint
+        # geo-crops via osm-crop.geojson (written above) when this is non-empty;
+        # it's also part of the streetGraph cache key so toggling countries
+        # invalidates the cache.
+        "-e",
+        f"OTP_OSM_COUNTRIES={','.join(osm_countries)}",
         # v0.1.21 — required by OTP 2.9 when the graph mixes agency tzs.
         "-e",
         f"OTP_TIMEZONE={otp_tz}",

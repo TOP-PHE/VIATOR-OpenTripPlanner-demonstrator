@@ -283,6 +283,21 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
+        # v0.1.40 — validate osm_countries (the GEOGRAPHIC scope: crop the OSM
+        # street graph to these served countries, orthogonal to osm_scope's
+        # tag filter). Same fail-fast pattern; an unknown ISO code 400s here
+        # rather than producing an empty crop polygon at build time. See
+        # docs/osm-geographic-scope-design.md.
+        if "osm_countries" in body.config:
+            from ... import osm_geo as _osm_geo
+
+            try:
+                body.config["osm_countries"] = _osm_geo.validate_countries(
+                    body.config["osm_countries"]
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
         # Validate provider bundles (v0.1.6) on save. We accept the legacy
         # gtfs[]/gtfs="..." shapes too (normalize_providers handles them),
         # but for save-time validation we only error on the v0.1.6-shaped
@@ -790,6 +805,46 @@ def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
     ).all()
     present = {ci for ci, count in rows if count > 0}
     return declared - present
+
+
+def _safe_float(v: str | None) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+_ZIP_GLOB = "*.zip"
+
+
+def _read_gtfs_stops(zip_path: Path) -> list[tuple[str | None, float | None, float | None]]:
+    """Read `(stop_id, stop_lat, stop_lon)` from a GTFS zip's stops.txt.
+
+    Best-effort for the osm-countries auto-detect: a missing / garbled
+    stops.txt yields `[]`, and unparseable coordinates become None (the
+    detector then leans on the UIC prefix). Never raises.
+    """
+    import csv
+    import io
+    import zipfile
+
+    out: list[tuple[str | None, float | None, float | None]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open("stops.txt") as fh:
+            reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig"))
+            for row in reader:
+                out.append(
+                    (
+                        row.get("stop_id"),
+                        _safe_float(row.get("stop_lat")),
+                        _safe_float(row.get("stop_lon")),
+                    )
+                )
+    except (KeyError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
+        return out
+    return out
 
 
 def _safe_filename(name: str) -> str:
@@ -1907,6 +1962,78 @@ class RebuildJobResponse(BaseModel):
     max_memory: bool = False  # v0.1.38 — job ran (or will run) in max-memory mode
 
 
+class OsmCountryRow(BaseModel):
+    iso: str
+    name: str
+    stops: int  # stops detected in this country (UIC prefix or coordinate)
+    declared: bool  # a provider declared country_iso = this
+    suggested: bool  # should be pre-ticked (declared OR ≥ threshold stops)
+    selected: bool  # currently saved in session.config.osm_countries
+
+
+class OsmCountriesResponse(BaseModel):
+    threshold: int  # min stops to auto-suggest (the UI shows the rule)
+    selected: list[str]  # currently-saved osm_countries
+    countries: list[OsmCountryRow]  # full v1 list, ordered for the checklist
+
+
+@router.get("/{sid}/osm-countries", responses={404: {"description": "Session not found"}})
+def suggest_osm_countries(
+    sid: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> OsmCountriesResponse:
+    """Geographic-scope suggestion for the session's Configure form.
+
+    Combines two signals: countries the providers **declare** (`country_iso`)
+    and countries **detected** from the staged GTFS stops (UIC prefix +
+    coordinate). Pre-ticks declared countries plus any with >= threshold
+    stops. The full v1 list is
+    returned with per-country stop counts so the operator sees *why* each box
+    is (un)ticked and can override — e.g. a 2-stop UK is a visible one-click
+    add. See docs/osm-geographic-scope-design.md.
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    from ... import osm_geo
+
+    cfg = s.config or {}
+    try:
+        providers = ingestion.normalize_providers(cfg)
+    except ValueError:
+        providers = []
+    declared = {
+        p["country_iso"] for p in providers if p.get("country_iso")
+    } & osm_geo.VALID_COUNTRIES
+
+    stops: list[tuple[str | None, float | None, float | None]] = []
+    gtfs_dir = ingestion.session_inbox(sid) / "gtfs"
+    if gtfs_dir.exists():
+        for zip_path in sorted(gtfs_dir.glob(_ZIP_GLOB)):
+            stops.extend(_read_gtfs_stops(zip_path))
+    counts = osm_geo.detect_from_stops(stops)
+
+    suggested = declared | set(osm_geo.suggested_countries(counts))
+    selected = set(osm_geo.validate_countries(cfg.get("osm_countries")))
+    rows = [
+        OsmCountryRow(
+            iso=iso,
+            name=name,
+            stops=counts.get(iso, 0),
+            declared=iso in declared,
+            suggested=iso in suggested,
+            selected=iso in selected,
+        )
+        for iso, name in osm_geo.COUNTRY_NAMES.items()
+    ]
+    return OsmCountriesResponse(
+        threshold=osm_geo.SUGGEST_MIN_STOPS,
+        selected=sorted(selected),
+        countries=rows,
+    )
+
+
 @router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
 def enqueue_rebuild(
     sid: str,
@@ -1940,10 +2067,10 @@ def enqueue_rebuild(
     # the filesystem directly.
     sess_inbox = ingestion.session_inbox(sid)
     gtfs_zips = (
-        sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
+        sorted((sess_inbox / "gtfs").glob(_ZIP_GLOB)) if (sess_inbox / "gtfs").exists() else []
     )
     netex_zips = (
-        sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+        sorted((sess_inbox / "netex").glob(_ZIP_GLOB)) if (sess_inbox / "netex").exists() else []
     )
     osm_pbfs = sorted((sess_inbox / "osm").glob("*.pbf")) if (sess_inbox / "osm").exists() else []
     if not (gtfs_zips or netex_zips):

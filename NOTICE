@@ -22,6 +22,11 @@ This product includes software developed by third parties:
   * SNCF open data feeds (transport.data.gouv.fr)
     Licensed under the Open Database License (ODbL).
 
+  * Natural Earth 1:50m Admin-0 country boundaries
+    (https://www.naturalearthdata.com) — bundled (simplified subset) as
+    app/data/country_borders.geojson for the OSM geographic-scope feature.
+    Public domain; no attribution required, credited here as a courtesy.
+
   * MapLibre GL JS (when wired in step 14 of the implementation order)
     Licensed under the BSD-3-Clause License.
 

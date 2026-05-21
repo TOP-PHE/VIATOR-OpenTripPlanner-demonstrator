@@ -115,6 +115,26 @@
                 search loses precision — fine for station-to-station rail demonstrators.
                 Default for new sessions: <code>transit-focused</code>.
               </p>
+              {# v0.1.40 — geographic OSM scope (orthogonal to the tag scope
+                 above): crop the street graph to the served countries via
+                 osmium extract, so build memory tracks the routed scope, not
+                 the PBF size. Populated by loadOsmCountries() from
+                 GET /api/sessions/<sid>/osm-countries when the section expands. #}
+              {# A <p> heading, not a <label>: it heads a group of checkboxes,
+                 not a single form control (Web:S6853). #}
+              <p style="margin: 0.6rem 0 0.2rem"><strong>Geographic scope</strong>
+                <span class="hint">(countries — crop the OSM street graph; orthogonal to OSM scope)</span>
+              </p>
+              <div data-role="osm-countries" data-sid="{{ s.id }}"
+                   style="border: 1px solid #d4d9e2; border-radius: 6px; padding: 0.5rem; max-height: 220px; overflow: auto">
+                <em class="hint">Loading countries…</em>
+              </div>
+              <p class="hint" style="margin-top: 0.25rem">
+                Pre-ticked = a provider declared the country, or ≥ 5 stops were detected
+                (the count is shown per country). Untick to shrink the build (less RAM/time);
+                tick a neighbour for a cross-border corridor. Leave all unticked = no crop
+                (whole PBF).
+              </p>
               {# v0.1.21 — `transitModelTimeZone`. OTP 2.9 refuses to build a
                  graph that mixes agencies with different declared timezones
                  (SNCF says Europe/Paris, Eurostar says Europe/Brussels). The
@@ -703,6 +723,16 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       loadJobs(sid);
     }
   });
+  // v0.1.40 — populate the geographic-scope country checklist on expand, in a
+  // *separate* listener so the (pre-existing, already-complex) expand handler
+  // above is left untouched. Registered after it, so aria-expanded is already
+  // flipped to the new state when this runs.
+  row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
+    if (e.target.getAttribute('aria-expanded') !== 'true') return;  // only on expand
+    const d = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
+    const el = d?.querySelector('div[data-role="osm-countries"]');
+    if (el) loadOsmCountries(sid, el);
+  });
 });
 
 // ─── Staleness banner (v0.1.7.1) ────────────────────────────────────
@@ -1206,6 +1236,40 @@ async function uploadToProvider(form, uploadBtn) {
   finally { uploadBtn.disabled = false; uploadBtn.textContent = original; }
 }
 
+// ─── Geographic OSM scope checklist (v0.1.40) ────────────────────────
+// Populate the country checklist from the suggestion endpoint. Ticks the
+// operator's saved selection if any; otherwise the suggested set (declared
+// providers + countries with >= threshold stops). Shows per-country stop
+// counts so the basis of the suggestion is visible (e.g. a 2-stop UK is a
+// one-click add). All values are server-controlled (fixed v1 country list),
+// so plain string interpolation is safe here.
+async function loadOsmCountries(sid, container) {
+  try {
+    const r = await fetch(`/api/sessions/${sid}/osm-countries`);
+    if (!r.ok) { container.innerHTML = '<em class="hint">Could not load countries.</em>'; return; }
+    const data = await r.json();
+    const hasSelection = (data.selected || []).length > 0;
+    const rows = (data.countries || []).map((c) => {
+      // Tick the saved selection if the operator has one; otherwise the
+      // suggestion. Extracted out of the attribute to avoid a nested ternary.
+      const tick = hasSelection ? c.selected : c.suggested;
+      const checked = tick ? ' checked' : '';
+      const bits = [];
+      if (c.stops > 0) bits.push(`${c.stops} stop${c.stops === 1 ? '' : 's'}`);
+      if (c.declared) bits.push('declared');
+      const note = bits.length ? ` <span class="hint">(${bits.join(', ')})</span>` : '';
+      return `<label style="display:block;padding:1px 0">` +
+        `<input type="checkbox" name="osm_country" value="${c.iso}"${checked}> ` +
+        `${c.iso} — ${c.name}${note}</label>`;
+    });
+    container.innerHTML = rows.join('') ||
+      '<em class="hint">No countries available.</em>';
+  } catch (e) {
+    console.error('osm-countries load failed', e);
+    container.innerHTML = '<em class="hint">Could not load countries.</em>';
+  }
+}
+
 // ─── Configure (PATCH config.sources) ───────────────────────────────
 document.querySelectorAll('form[data-form="config"]').forEach(form => {
   // Add-provider button: append a blank card. New cards open by default
@@ -1320,6 +1384,13 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // v0.1.24: same for the OTP API timeout.
     const otpApiTimeout = (form.elements['otp_api_timeout']?.value || '').trim();
     if (otpApiTimeout) cfg.otp_api_timeout = otpApiTimeout;
+    // v0.1.40: geographic OSM crop scope — collect the ticked country boxes.
+    // Empty = no crop (delete the key so the worker builds the whole PBF).
+    const osmCountries = Array.from(
+      form.querySelectorAll('input[name="osm_country"]:checked')
+    ).map((el) => el.value);
+    if (osmCountries.length) cfg.osm_countries = osmCountries;
+    else delete cfg.osm_countries;
     // PR #32: per-session OTP serve healthcheck start_period (int seconds).
     // Empty value = use orchestrator default (300s).
     const otpStartPeriod = (form.elements['otp_serve_start_period']?.value || '').trim();
