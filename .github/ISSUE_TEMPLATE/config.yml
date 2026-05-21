@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Operator runbook (admin-guide)
-    url: https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/blob/main/docs/admin-guide.md
+    url: https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator/blob/main/docs/admin-guide.md
     about: Common deploy / troubleshooting / recovery procedures (post-deploy verification, journey search 0-trips, retention, …) — check here first before opening an issue.
   - name: Audit tracker (audit-2026-05)
-    url: https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator/blob/main/docs/audit-2026-05.md
+    url: https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator/blob/main/docs/audit-2026-05.md
     about: Already-tracked improvements (security floor, CI gates, etc.) — your concern may already be on the backlog with a priority assigned.

@@ -85,14 +85,14 @@ The operator forms a judgement in seconds instead of alt-tabbing to
 
 | Option | Verdict |
 |---|---|
-| **opentransportdata.swiss OJP 2.0** | ✅ **Chosen.** Sanctioned public API, free tier, documented, open-source reference client to model from. It *is* the MERITS/OJP standard VIATOR exists to demonstrate. |
+| **opentransportdata.swiss OJP 2.0** | ✅ **Chosen.** Sanctioned public API, free tier, documented, open-source reference client to model from. It *is* the OJP standard VIATOR exists to demonstrate. |
 | `bahn.de` "vendo" endpoint | ❌ No official API — reverse-engineered endpoint behind the bahn.de frontend. Brittle, no SLA, ToS-grey. Acceptable only as a future best-effort add-on if DE-network coverage is specifically needed. |
 | Google Directions / Rome2Rio | ❌ Paid, restrictive ToS, not transit-standards-based. |
 | Other NAPs' OJP endpoints (DELFI / France / …) | ⏳ Phase 3 — same adapter, different endpoint + token. Out of scope for the first cut. |
 
 Choosing the OJP endpoint isn't a compromise — it's **on-mission**.
 "VIATOR (OTP) vs the reference OJP implementation" is a meaningful thing
-for a MERITS OJP demonstrator to show.
+for an OJP demonstrator to show.
 
 ---
 

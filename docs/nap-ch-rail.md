@@ -92,7 +92,7 @@ contributing useful itineraries.
 
 ### 3.1 What to keep
 
-GTFS route_type values, broken down. **Keep the bold rows** for a UIC/MERITS
+GTFS route_type values, broken down. **Keep the bold rows** for a
 rail demonstrator:
 
 | route_type | Mode | SBB count | Keep? |
@@ -253,7 +253,7 @@ paths + station entrances. Cuts the street graph from ~7.2M vertices
 - ❌ ~50% of non-rail GTFS stops won't link to walking graph — fine because
   we filtered those out anyway
 
-For a station-to-station MERITS demonstrator this is the right trade.
+For a station-to-station rail demonstrator this is the right trade.
 For mobility-as-a-service / last-mile use cases it isn't.
 
 ### 4.3 Heap sizes after both mitigations
@@ -571,7 +571,7 @@ A consolidated list of what this session **cannot do**, by design:
 | Limitation | Cause | Workaround |
 |---|---|---|
 | No address-to-station routing | `rail-focused` OSM strips driveable streets | Use station dropdowns; future: integrate a separate address-geocoder layer |
-| No bus / tram / cable car / boat / funicular | rail-only GTFS filter (§3) | Out of scope for a UIC/MERITS rail demonstrator; build a separate `nap-ch-multimodal` session if needed |
+| No bus / tram / cable car / boat / funicular | rail-only GTFS filter (§3) | Out of scope for a rail demonstrator; build a separate `nap-ch-multimodal` session if needed |
 | Some 2-minute transfers may appear infeasible | `TransferConstraints` disabled (§5.2) | Raise global `transferSlack` to `5m` (§5.3) |
 | 3+ leg journeys may show non-optimal transfer station | `OptimizeTransfers` disabled (§5.2) | Negligible for demo use; user sees a working itinerary, just not always the absolute best one |
 | Station names are German/French/Italian only | SBB GTFS convention | Tell users to type local-language names; consider a UI hint |
