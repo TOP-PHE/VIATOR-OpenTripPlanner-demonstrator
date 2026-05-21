@@ -736,3 +736,164 @@ class TestHomeCountryOwnership:
         _build_synthetic_gtfs(src)
         filter_to_cross_border(src, out)
         assert _read_ids(out, "routes.txt", "route_id") == {"R_LYRIA", "R_CENTO"}
+
+
+class TestTransferTripRefs:
+    """v0.1.40 — a transfers.txt row referencing a *trip* we filter out must be
+    dropped, even when both its stops survive. Otherwise OTP's strict GTFS
+    reader aborts the whole build with EntityReferenceNotFoundException on the
+    dangling trip (observed live on a 10-country corridors build)."""
+
+    @staticmethod
+    def _build(path: Path) -> None:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "agency.txt",
+                _csv(
+                    ["agency_id", "agency_name", "agency_url", "agency_timezone"],
+                    [
+                        {
+                            "agency_id": "A",
+                            "agency_name": "A",
+                            "agency_url": "https://a",
+                            "agency_timezone": "Europe/Paris",
+                        }
+                    ],
+                ),
+            )
+            zf.writestr(
+                "stops.txt",
+                _csv(
+                    ["stop_id", "stop_name", "stop_lat", "stop_lon"],
+                    [
+                        {
+                            "stop_id": "8700001",
+                            "stop_name": "FR-xb",
+                            "stop_lat": "48.8",
+                            "stop_lon": "2.3",
+                        },
+                        {
+                            "stop_id": "8500001",
+                            "stop_name": "CH-xb",
+                            "stop_lat": "47.3",
+                            "stop_lon": "8.5",
+                        },
+                        {
+                            "stop_id": "8700002",
+                            "stop_name": "FR-dom",
+                            "stop_lat": "48.0",
+                            "stop_lon": "2.0",
+                        },
+                    ],
+                ),
+            )
+            zf.writestr(
+                "routes.txt",
+                _csv(
+                    ["route_id", "agency_id", "route_short_name", "route_type"],
+                    [
+                        {
+                            "route_id": "R_XB",
+                            "agency_id": "A",
+                            "route_short_name": "XB",
+                            "route_type": "2",
+                        },
+                        {
+                            "route_id": "R_DOM",
+                            "agency_id": "A",
+                            "route_short_name": "DOM",
+                            "route_type": "2",
+                        },
+                    ],
+                ),
+            )
+            zf.writestr(
+                "trips.txt",
+                _csv(
+                    ["route_id", "service_id", "trip_id"],
+                    [
+                        {"route_id": "R_XB", "service_id": "WD", "trip_id": "T_XB"},
+                        {"route_id": "R_DOM", "service_id": "WD", "trip_id": "T_DOM"},
+                    ],
+                ),
+            )
+            zf.writestr(
+                "stop_times.txt",
+                _csv(
+                    ["trip_id", "stop_sequence", "stop_id", "arrival_time", "departure_time"],
+                    [
+                        {
+                            "trip_id": "T_XB",
+                            "stop_sequence": "1",
+                            "stop_id": "8700001",
+                            "arrival_time": "08:00:00",
+                            "departure_time": "08:00:00",
+                        },
+                        {
+                            "trip_id": "T_XB",
+                            "stop_sequence": "2",
+                            "stop_id": "8500001",
+                            "arrival_time": "10:00:00",
+                            "departure_time": "10:00:00",
+                        },
+                        {
+                            "trip_id": "T_DOM",
+                            "stop_sequence": "1",
+                            "stop_id": "8700001",
+                            "arrival_time": "09:00:00",
+                            "departure_time": "09:00:00",
+                        },
+                        {
+                            "trip_id": "T_DOM",
+                            "stop_sequence": "2",
+                            "stop_id": "8700002",
+                            "arrival_time": "09:30:00",
+                            "departure_time": "09:30:00",
+                        },
+                    ],
+                ),
+            )
+            zf.writestr(
+                "transfers.txt",
+                _csv(
+                    ["from_stop_id", "to_stop_id", "transfer_type", "from_trip_id", "to_trip_id"],
+                    [
+                        # plain stop-to-stop transfer at two kept cross-border stops → KEEP
+                        {
+                            "from_stop_id": "8700001",
+                            "to_stop_id": "8500001",
+                            "transfer_type": "2",
+                            "from_trip_id": "",
+                            "to_trip_id": "",
+                        },
+                        # trip-to-trip transfer referencing the DROPPED domestic trip,
+                        # at a kept stop → must be DROPPED (the dangling-ref bug).
+                        {
+                            "from_stop_id": "8700001",
+                            "to_stop_id": "8700001",
+                            "transfer_type": "4",
+                            "from_trip_id": "T_XB",
+                            "to_trip_id": "T_DOM",
+                        },
+                    ],
+                ),
+            )
+
+    def test_transfer_referencing_dropped_trip_is_removed(self, tmp_path):
+        src = tmp_path / "feed.zip"
+        out = tmp_path / "xb.zip"
+        self._build(src)
+        filter_to_cross_border(src, out)
+        # R_XB (FR+CH) kept; R_DOM (FR-only) dropped.
+        assert _read_ids(out, "routes.txt", "route_id") == {"R_XB"}
+        with zipfile.ZipFile(out) as zf, zf.open("transfers.txt") as f:
+            rows = list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
+        # No surviving transfer references the dropped trip…
+        assert all(
+            r.get("from_trip_id", "") != "T_DOM" and r.get("to_trip_id", "") != "T_DOM"
+            for r in rows
+        )
+        # …but the plain stop-to-stop transfer between kept stops survives.
+        assert len(rows) == 1
+        assert rows[0]["from_stop_id"] == "8700001"
+        assert rows[0]["to_stop_id"] == "8500001"
