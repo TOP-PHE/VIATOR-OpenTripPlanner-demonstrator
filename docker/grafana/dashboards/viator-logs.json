@@ -19,6 +19,7 @@
         "query": "label_values(container)",
         "refresh": 1,
         "includeAll": true,
+        "allValue": ".+",
         "multi": true,
         "current": { "text": "All", "value": "$__all" }
       },
@@ -26,10 +27,10 @@
         "name": "level",
         "label": "Log level",
         "type": "custom",
-        "query": "All,debug,info,warning,error,critical",
-        "current": { "text": "All", "value": "" },
+        "query": ".* : All, debug : DEBUG, info : INFO, warning : WARNING, error : ERROR, critical : CRITICAL",
+        "current": { "text": "All", "value": ".*" },
         "options": [
-          { "text": "All",      "value": "",         "selected": true },
+          { "text": "All",      "value": ".*",       "selected": true },
           { "text": "DEBUG",    "value": "debug" },
           { "text": "INFO",     "value": "info" },
           { "text": "WARNING",  "value": "warning" },
@@ -162,7 +163,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{container=~\"$container\"} | json | level=~\"$level.*\" |~ \"$session_id\""
+          "expr": "{container=~\"$container\"} | json | level=~\"$level\" |~ \"$session_id\""
         }
       ],
       "options": {
