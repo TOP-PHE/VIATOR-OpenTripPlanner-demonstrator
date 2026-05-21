@@ -6,30 +6,30 @@
 
   <!-- Inline SVG favicon (the VIATOR icon) — no extra HTTP request needed -->
   <link rel="icon" type="image/svg+xml"
-        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231F3B66' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
+        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231C75BC' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
 
   <style>
     :root {
-      --uic-blue:   #1F3B66;
+      --brand-blue:   #1C75BC;
       --rail-steel: #5B6B82;
       --amber:      #E89B2C;
       --paper:      #F5F7FB;
       --sleeper:    #D4D9E2;
     }
     body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #1c2330; }
-    h1, h2 { color: var(--uic-blue); }
+    h1, h2 { color: var(--brand-blue); }
 
     /* ───── Header lockup ───── */
     .lockup { display: flex; align-items: center; gap: 1rem; padding: 1rem 0 0.5rem; border-bottom: 1px solid var(--sleeper); margin-bottom: 1.5rem; }
     .lockup .icon { width: 56px; height: 56px; flex: 0 0 56px; }
     .lockup .text { line-height: 1.1; }
-    .lockup .wordmark { font-size: 1.9rem; font-weight: 700; letter-spacing: 0.35rem; color: var(--uic-blue); }
+    .lockup .wordmark { font-size: 1.9rem; font-weight: 700; letter-spacing: 0.35rem; color: var(--brand-blue); }
     .lockup .tagline { font-size: 0.7rem; letter-spacing: 0.18rem; text-transform: uppercase; color: var(--rail-steel); margin-top: 0.2rem; }
 
     form { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; }
     label { display: block; margin: 0.6rem 0 0.2rem; font-weight: 600; }
     input[type=text], select, input[type=file] { width: 100%; padding: 0.4rem; box-sizing: border-box; }
-    button { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--uic-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    button { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--brand-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; }
     button:hover { background: #163055; }
 
     table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.9rem; }
@@ -44,7 +44,7 @@
     footer .row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
     footer .row + .row { margin-top: 0.3rem; }
     footer .top-logo { height: 28px; background: #fff; border-radius: 4px; padding: 3px 8px; opacity: 0.95; }
-    footer .powered-by strong { color: var(--uic-blue); }
+    footer .powered-by strong { color: var(--brand-blue); }
     footer .powered-by a { color: var(--rail-steel); text-decoration: none; }
     footer .powered-by a:hover { text-decoration: underline; }
     footer .copyright { font-style: italic; opacity: 0.85; }
@@ -56,7 +56,7 @@
   <!-- ───── Header lockup: inline SVG icon + wordmark + tagline ───── -->
   <header class="lockup">
     <svg class="icon" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VIATOR">
-      <g fill="none" stroke="#1F3B66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+      <g fill="none" stroke="#1C75BC" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
         <line x1="8"  y1="8"  x2="32" y2="56"/>
         <line x1="56" y1="8"  x2="32" y2="56"/>
         <line x1="14" y1="20" x2="50" y2="20"/>
