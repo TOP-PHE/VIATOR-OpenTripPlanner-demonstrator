@@ -803,7 +803,8 @@ function providerCardHTML(p, opts) {
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
         ${statusPill}
         <span class="prov-summary-actions">
-          <button type="button" class="secondary" data-action="refresh-provider"
+          <button type="button" class="secondary prov-refresh-btn" data-action="refresh-provider"
+                  ${ttSource === 'upload' ? 'hidden' : ''}
                   title="Download just this provider's URLs (timetable + MCT + stations CSV)">
             ⤴ Refresh this provider
           </button>
@@ -1166,6 +1167,15 @@ async function uploadToProvider(form, uploadBtn) {
   if (!pid) { showToast('error', 'Provider ID is required before uploading'); return; }
   if (!file) { showToast('error', `${pid}: choose a file to upload first`); return; }
   const sid = form.dataset.sid;
+  // Upload-before-save guard: the backend lands the file at the provider's
+  // slot only if the provider exists in the *saved* config. Check the row's
+  // persisted config and nudge clearly instead of hitting a confusing 400.
+  const row = document.querySelector(`tr[data-sid="${sid}"]`);
+  const savedProviders = (row && JSON.parse(row.dataset.config || '{}').sources?.providers) || [];
+  if (!savedProviders.some(p => p.id === pid)) {
+    showToast('error', `Save the session first — provider ${pid} must exist before you can attach a file.`);
+    return;
+  }
   const fd2 = new FormData();
   fd2.append('declared_standard', TIMETABLE_DECLARED_KIND[fmt] || 'GTFS');
   fd2.append('provider_id', pid);
@@ -1251,6 +1261,10 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     const upRow = card.querySelector('.prov-tt-upload-row');
     if (urlRow) urlRow.hidden = isUpload;
     if (upRow) upRow.hidden = !isUpload;
+    // Upload-source providers have no URL to fetch — hide "Refresh this
+    // provider" so it can't error with "no URLs to refresh".
+    const refreshBtn = card.querySelector('.prov-refresh-btn');
+    if (refreshBtn) refreshBtn.hidden = isUpload;
   });
   // Live-update each provider card's summary as id/label/country change.
   form.addEventListener('input', (e) => {
