@@ -201,7 +201,9 @@ def country_of_stop(stop_id: str | None, lat: float | None, lon: float | None) -
         iso = UIC_COUNTRY_NAMES.get(prefix)
         if iso in VALID_COUNTRIES:
             return iso
-    if lat is not None and lon is not None and (lat != 0.0 or lon != 0.0):
+    # Skip the GTFS "null island" placeholder (0, 0); a tolerance avoids a
+    # float equality check (Sonar S1244).
+    if lat is not None and lon is not None and (abs(lat) > 1e-7 or abs(lon) > 1e-7):
         return country_for_point(lat, lon)
     return None
 

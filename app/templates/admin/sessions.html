@@ -120,9 +120,11 @@
                  osmium extract, so build memory tracks the routed scope, not
                  the PBF size. Populated by loadOsmCountries() from
                  GET /api/sessions/<sid>/osm-countries when the section expands. #}
-              <label style="margin-top: 0.6rem">Geographic scope
+              {# A <p> heading, not a <label>: it heads a group of checkboxes,
+                 not a single form control (Web:S6853). #}
+              <p style="margin: 0.6rem 0 0.2rem"><strong>Geographic scope</strong>
                 <span class="hint">(countries — crop the OSM street graph; orthogonal to OSM scope)</span>
-              </label>
+              </p>
               <div data-role="osm-countries" data-sid="{{ s.id }}"
                    style="border: 1px solid #d4d9e2; border-radius: 6px; padding: 0.5rem; max-height: 220px; overflow: auto">
                 <em class="hint">Loading countries…</em>
@@ -681,10 +683,6 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       if (cf.elements['otp_api_timeout']) {
         cf.elements['otp_api_timeout'].value = cfg.otp_api_timeout || '30s';
       }
-      // v0.1.40: populate the geographic-scope country checklist (async — it
-      // starts as "Loading…" and fills when the suggestion lands).
-      const _osmCountriesEl = detail.querySelector('div[data-role="osm-countries"]');
-      if (_osmCountriesEl) loadOsmCountries(sid, _osmCountriesEl);
       // PR #32: per-session OTP serve healthcheck start_period.
       // Empty value lets the orchestrator default (300s) kick in;
       // legacy sessions see the new default until they explicitly save.
@@ -724,6 +722,16 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // Auto-load the jobs list on first expand
       loadJobs(sid);
     }
+  });
+  // v0.1.40 — populate the geographic-scope country checklist on expand, in a
+  // *separate* listener so the (pre-existing, already-complex) expand handler
+  // above is left untouched. Registered after it, so aria-expanded is already
+  // flipped to the new state when this runs.
+  row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
+    if (e.target.getAttribute('aria-expanded') !== 'true') return;  // only on expand
+    const d = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
+    const el = d?.querySelector('div[data-role="osm-countries"]');
+    if (el) loadOsmCountries(sid, el);
   });
 });
 
@@ -1242,7 +1250,10 @@ async function loadOsmCountries(sid, container) {
     const data = await r.json();
     const hasSelection = (data.selected || []).length > 0;
     const rows = (data.countries || []).map((c) => {
-      const checked = (hasSelection ? c.selected : c.suggested) ? ' checked' : '';
+      // Tick the saved selection if the operator has one; otherwise the
+      // suggestion. Extracted out of the attribute to avoid a nested ternary.
+      const tick = hasSelection ? c.selected : c.suggested;
+      const checked = tick ? ' checked' : '';
       const bits = [];
       if (c.stops > 0) bits.push(`${c.stops} stop${c.stops === 1 ? '' : 's'}`);
       if (c.declared) bits.push('declared');
@@ -1253,7 +1264,8 @@ async function loadOsmCountries(sid, container) {
     });
     container.innerHTML = rows.join('') ||
       '<em class="hint">No countries available.</em>';
-  } catch (_e) {
+  } catch (e) {
+    console.error('osm-countries load failed', e);
     container.innerHTML = '<em class="hint">Could not load countries.</em>';
   }
 }

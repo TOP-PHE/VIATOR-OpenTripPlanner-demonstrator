@@ -816,6 +816,9 @@ def _safe_float(v: str | None) -> float | None:
         return None
 
 
+_GTFS_ZIP_GLOB = "*.zip"
+
+
 def _read_gtfs_stops(zip_path: Path) -> list[tuple[str | None, float | None, float | None]]:
     """Read `(stop_id, stop_lat, stop_lon)` from a GTFS zip's stops.txt.
 
@@ -1974,7 +1977,7 @@ class OsmCountriesResponse(BaseModel):
     countries: list[OsmCountryRow]  # full v1 list, ordered for the checklist
 
 
-@router.get("/{sid}/osm-countries", response_model=OsmCountriesResponse)
+@router.get("/{sid}/osm-countries", responses={404: {"description": "Session not found"}})
 def suggest_osm_countries(
     sid: str,
     db: Annotated[DbSession, Depends(get_db)],
@@ -2007,7 +2010,7 @@ def suggest_osm_countries(
     stops: list[tuple[str | None, float | None, float | None]] = []
     gtfs_dir = ingestion.session_inbox(sid) / "gtfs"
     if gtfs_dir.exists():
-        for zip_path in sorted(gtfs_dir.glob("*.zip")):
+        for zip_path in sorted(gtfs_dir.glob(_GTFS_ZIP_GLOB)):
             stops.extend(_read_gtfs_stops(zip_path))
     counts = osm_geo.detect_from_stops(stops)
 
