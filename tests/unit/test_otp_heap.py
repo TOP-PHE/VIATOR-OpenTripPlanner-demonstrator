@@ -282,3 +282,43 @@ def test_mem_limit_for_heap_none_empty_malformed_uses_default():
     # Caller-supplied default is honoured (worker passes settings.otp_build_heap).
     assert mem_limit_for_heap(None, default="24g") == "28g"  # type: ignore[arg-type]
     assert mem_limit_for_heap("bogus", default="48g") == "56g"
+
+
+# ─── v0.1.38 — max-memory rebuild auto heap sizing ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "host_gb,heap",
+    [
+        # (default reserve 8g) the derived cap must always fit host-reserve:
+        (96, "75g"),  # avail 88 → 75g (cap 87 ≤ 88)
+        (47, "33g"),  # avail 39 → 33g (cap 38 ≤ 39)
+        (32, "20g"),  # avail 24 → 20g (cap 24 ≤ 24, exact)
+        (24, "12g"),  # avail 16 → 12g (cap 16 ≤ 16; closed-form 13g would overshoot)
+    ],
+)
+def test_auto_build_heap_fits_host(host_gb, heap):
+    from app.otp_heap import auto_build_heap, heap_to_gb, mem_limit_for_heap
+
+    assert auto_build_heap(host_gb) == heap
+    # Invariant: the derived cgroup cap never exceeds host - reserve.
+    assert heap_to_gb(mem_limit_for_heap(heap)) <= host_gb - 8
+
+
+def test_auto_build_heap_returns_none_when_box_too_small():
+    """A box that can't fit even an 8g build after the reserve gets None —
+    the caller keeps the configured heap rather than shrinking it."""
+    from app.otp_heap import auto_build_heap
+
+    assert auto_build_heap(16) is None  # avail 8, 8g cap is 12 > 8
+    assert auto_build_heap(12) is None  # avail 4 < min 8
+    assert auto_build_heap(8) is None
+
+
+def test_auto_build_heap_custom_reserve():
+    from app.otp_heap import auto_build_heap, heap_to_gb, mem_limit_for_heap
+
+    heap = auto_build_heap(64, reserve_gb=16)
+    assert heap is not None
+    # Cap must fit 64 - 16 = 48.
+    assert heap_to_gb(mem_limit_for_heap(heap)) <= 48

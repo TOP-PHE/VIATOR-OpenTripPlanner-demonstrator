@@ -190,3 +190,41 @@ def mem_limit_for_heap(heap: str, *, default: str = DEFAULT_HEAP) -> str:
         gb = heap_to_gb(default)
     headroom = max(4, gb // 6)
     return f"{gb + headroom}g"
+
+
+# ───────────────────── Max-memory rebuild auto-sizing (v0.1.38) ─────────────
+# RAM left for the core stack (OS + Postgres + web + worker + nginx) when a
+# "max-memory rebuild" commandeers the box. ~8 GB is comfortable on a quiet
+# single-VPS demonstrator where the journey-planner sessions are stopped.
+MAX_MEMORY_RESERVE_GB = 8
+
+
+def auto_build_heap(
+    host_gb: int,
+    *,
+    reserve_gb: int = MAX_MEMORY_RESERVE_GB,
+    min_gb: int = 8,
+) -> str | None:
+    """Largest build heap whose derived cgroup cap still fits the host.
+
+    For the max-memory rebuild mode: the operator has stopped the serving
+    sessions, so the build can use almost the whole box. We want the derived
+    cap (`mem_limit_for_heap` = heap + native headroom) to fit in
+    `host_gb - reserve_gb`. Start from the large-heap approximation
+    (`avail * 6/7`, since the cap is ~heap*7/6 once headroom = heap//6
+    dominates) and trim down until the *actual* cap fits — the small-heap
+    flat-4g headroom floor means the closed form can overshoot by a GB or two.
+
+    Returns None when the box is too small to give even `min_gb` after the
+    reserve — the caller then keeps the session's configured heap rather than
+    shrinking it (max-memory mode can't help a tiny host).
+    """
+    avail = host_gb - reserve_gb
+    if avail < min_gb:
+        return None
+    heap = max(min_gb, (avail * 6) // 7)
+    while heap > min_gb and heap_to_gb(mem_limit_for_heap(f"{heap}g")) > avail:
+        heap -= 1
+    if heap_to_gb(mem_limit_for_heap(f"{heap}g")) > avail:
+        return None
+    return f"{heap}g"

@@ -79,3 +79,10 @@ class RebuildJob(TimestampMixin, Base):
     graph_path: Mapped[str | None] = mapped_column(String)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # v0.1.38 — operator opted into a "max-memory rebuild" for this job: the
+    # worker stops serving sessions + the observability stack to free the box,
+    # auto-sizes the build heap to host RAM, then restarts them when done.
+    # One-off per job (UI checkbox next to Rebuild), not a session default.
+    max_memory: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("FALSE")
+    )

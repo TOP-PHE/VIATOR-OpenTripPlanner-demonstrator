@@ -340,6 +340,12 @@
               <button type="button" data-action="promote" data-sid="{{ s.id }}">Promote to serving</button>
               <button type="button" data-action="refresh-jobs" data-sid="{{ s.id }}" class="secondary">Refresh job list</button>
             </div>
+            <label class="hint" style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem">
+              <input type="checkbox" data-role="maxmem" data-sid="{{ s.id }}">
+              <span><strong>Max-memory rebuild</strong> — stops the serving sessions + observability
+              stack and sizes the build heap to host RAM, then restarts them when done. For the
+              worst-case (e.g. all-Europe) build on a single box. Other sessions are briefly offline.</span>
+            </label>
             <div data-role="jobs" data-sid="{{ s.id }}" style="margin-top: 0.75rem">
               <em class="hint">Job list will load when this section is expanded.</em>
             </div>
@@ -1511,10 +1517,25 @@ document.querySelectorAll('button[data-action="rebuild"]').forEach(btn => {
       );
       if (!ok) return;
     }
-    const r = await fetch(`/api/sessions/${sid}/rebuilds`, {method:'POST'});
+    // Max-memory rebuild: stops the serving sessions + observability stack to
+    // free the box. Confirm explicitly since other sessions go briefly offline.
+    const maxmemBox = document.querySelector(`input[data-role="maxmem"][data-sid="${sid}"]`);
+    const maxmem = !!(maxmemBox && maxmemBox.checked);
+    if (maxmem) {
+      const ok = confirm(
+        `Max-memory rebuild for ${sid}:\n\n` +
+        `The worker will STOP all serving journey-planner sessions and the ` +
+        `observability stack (Grafana/Loki/Prometheus/…), build with a heap ` +
+        `sized to host RAM, then restart them automatically.\n\n` +
+        `Other sessions will be briefly unavailable. Continue?`
+      );
+      if (!ok) return;
+    }
+    const url = `/api/sessions/${sid}/rebuilds` + (maxmem ? '?max_memory=true' : '');
+    const r = await fetch(url, {method:'POST'});
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
-    showToast('success', `Rebuild queued for ${sid} (job ${body.id?.slice(0,8) ?? '—'})`);
+    showToast('success', `Rebuild queued for ${sid}${maxmem ? ' (max-memory)' : ''} (job ${body.id?.slice(0,8) ?? '—'})`);
     loadJobs(sid);
   });
 });
