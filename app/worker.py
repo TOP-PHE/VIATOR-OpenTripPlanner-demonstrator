@@ -12,6 +12,7 @@ the operator having to shell in.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -42,6 +43,24 @@ _RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 # Hard-coding it (rather than `shutil.which`) also makes the security review
 # trivial: every subprocess invocation passes through this constant.
 _DOCKER = "/usr/local/bin/docker"
+
+
+def _host_total_gb() -> int | None:
+    """Best-effort host RAM in whole GB, read from /proc/meminfo.
+
+    `MemTotal` reflects the *host's* physical memory even from inside a
+    container (it's not cgroup-scoped), so it's a sound basis for warning
+    when a requested build heap simply won't fit the box. Returns None if
+    the file is unreadable (non-Linux dev box, locked-down sandbox).
+    """
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def _mark_orphaned_rebuild_jobs() -> int:
@@ -649,6 +668,27 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         except Exception as exc:
             log.warning("session %s router-config.json write failed: %s", sid, exc)
 
+    # v0.1.38 — derive the build container's cgroup cap from the heap so a
+    # per-session heap bump can't silently exceed a stale OTP_BUILD_MEM_LIMIT
+    # and get OOM-killed (signal 9 `Killed`) mid-OSM-parse — the JVM never even
+    # reaches its own -Xmx. Injected via the subprocess environment so
+    # docker-compose's `mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}` interpolation
+    # picks it up (a process env var beats the project's .env file).
+    mem_limit_value = otp_heap.mem_limit_for_heap(otp_heap_value)
+    host_gb = _host_total_gb()
+    needed_gb = otp_heap.heap_to_gb(mem_limit_value)
+    if host_gb is not None and needed_gb > host_gb:
+        log.warning(
+            "session %s build needs ~%dGB (heap=%s + native headroom) but host "
+            "has only %dGB RAM — build will likely OOM-kill. Lower the session "
+            "heap, crop the OSM to the corridor, or use max-memory rebuild.",
+            sid,
+            needed_gb,
+            otp_heap_value,
+            host_gb,
+        )
+    build_env = {**os.environ, "OTP_BUILD_MEM_LIMIT": mem_limit_value}
+
     cmd = [
         _DOCKER,
         "compose",
@@ -674,14 +714,27 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # nothing user-supplied. Bandit S603 does not apply.
     # cwd=/srv/docker so `docker compose` finds docker-compose.yml + the
     # generated/ include directory (mounted from the host's /opt/viator/docker/).
+    log.info(
+        "session %s build: heap=%s mem_limit=%s (derived)",
+        sid,
+        otp_heap_value,
+        mem_limit_value,
+    )
     proc = subprocess.run(  # noqa: S603
         cmd,
         cwd="/srv/docker",
         capture_output=True,
         text=True,
         check=False,
+        env=build_env,
     )
-    output = proc.stdout + "\n--- stderr ---\n" + proc.stderr
+    output = (
+        f"[viator] build resources: OTP_HEAP={otp_heap_value} "
+        f"OTP_BUILD_MEM_LIMIT={mem_limit_value} (cgroup cap derived from heap)\n"
+        + proc.stdout
+        + "\n--- stderr ---\n"
+        + proc.stderr
+    )
 
     if proc.returncode != 0:
         return output, False, ""

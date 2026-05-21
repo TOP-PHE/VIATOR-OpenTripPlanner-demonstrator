@@ -137,3 +137,56 @@ def validate_heap(
     # Lowercase the unit so '24G' and '24g' both serialise the same way.
     qty, unit = m.group(1), m.group(2).lower()
     return f"{qty}{unit}"
+
+
+# ───────────────────── Build cgroup mem_limit derivation ────────────────────
+# v0.1.38 — the per-session build heap (`-Xmx`) was sized via the UI, but the
+# *container* cgroup cap (`mem_limit` in docker-compose.yml, env
+# `OTP_BUILD_MEM_LIMIT`) stayed a static `.env` value the worker never touched.
+# So bumping a session's heap to 24g while `.env` still capped the container at
+# 12g guaranteed a kernel OOM-kill (signal 9 `Killed`) mid-OSM-parse — the JVM
+# never even reached its own -Xmx. The worker now DERIVES the cap from the heap
+# so the two always move together.
+#
+# Native headroom on top of -Xmx (Direct buffers bounded at 2g by
+# MaxDirectMemorySize, plus metaspace, code cache, thread stacks, GC
+# structures). A flat 4g is right for small/medium heaps; larger heaps need
+# proportionally more (GC + off-heap working set grow). `max(4, heap // 6)`
+# reproduces every pairing documented in .env.example and this module:
+#   8g  -> 12g   (default IDF pairing)
+#   24g -> 28g   (.env France-wide example)
+#   36g -> 42g
+#   48g -> 56g
+#   64g -> 74g
+#   72g -> 84g   (the "≈84 GB cgroup cap on a 96 GB host" note above)
+def heap_to_gb(heap: str) -> int:
+    """Parse a `-Xmx`-style heap string to integer gigabytes (megabytes round up).
+
+    Raises ValueError on a malformed string — callers building a cgroup cap
+    want to fail loudly rather than silently default to a too-small limit.
+    """
+    m = _HEAP_RE.match(heap.strip())
+    if not m:
+        raise ValueError(
+            f"heap={heap!r} doesn't match the expected pattern (integer + 'g'/'m')"
+        )
+    qty, unit = int(m.group(1)), m.group(2).lower()
+    if unit == "g":
+        return qty
+    # Megabytes → ceil to whole GB (`-(-a // b)` is integer ceil-division).
+    return max(1, -(-qty // 1024))
+
+
+def mem_limit_for_heap(heap: str, *, default: str = DEFAULT_HEAP) -> str:
+    """Return the cgroup `mem_limit` (e.g. '28g') the build container needs for `heap`.
+
+    `mem_limit = heap_gb + max(4, heap_gb // 6)` — the JVM -Xmx plus native
+    headroom. None/empty/malformed falls back to deriving from `default` so a
+    legacy session with no heap configured still gets a sane, matched cap.
+    """
+    try:
+        gb = heap_to_gb(heap) if heap else heap_to_gb(default)
+    except ValueError:
+        gb = heap_to_gb(default)
+    headroom = max(4, gb // 6)
+    return f"{gb + headroom}g"

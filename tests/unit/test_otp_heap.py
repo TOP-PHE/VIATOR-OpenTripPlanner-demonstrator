@@ -207,3 +207,78 @@ def test_common_serve_heaps_no_duplicates_and_sorted():
 
     sizes = [int(v.rstrip("gGmM")) for v, _ in COMMON_SERVE_HEAPS if v.endswith(("g", "G"))]
     assert sizes == sorted(sizes), "COMMON_SERVE_HEAPS not monotonically increasing"
+
+
+# ─── v0.1.38 — build cgroup mem_limit derivation ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "heap,gb",
+    [
+        ("8g", 8),
+        ("12g", 12),
+        ("24g", 24),
+        ("72g", 72),
+        ("12G", 12),  # case-insensitive unit
+        ("  16g ", 16),  # trimmed
+        ("8192m", 8),  # exact MB→GB
+        ("4096m", 4),
+        ("512m", 1),  # sub-GB rounds UP (never 0 — a 0g cap is nonsense)
+        ("1536m", 2),  # 1.5 GB rounds up to 2
+        ("1024m", 1),
+    ],
+)
+def test_heap_to_gb(heap, gb):
+    from app.otp_heap import heap_to_gb
+
+    assert heap_to_gb(heap) == gb
+
+
+def test_heap_to_gb_rejects_malformed():
+    from app.otp_heap import heap_to_gb
+
+    with pytest.raises(ValueError, match="doesn't match"):
+        heap_to_gb("12gb")
+    with pytest.raises(ValueError, match="doesn't match"):
+        heap_to_gb("garbage")
+
+
+@pytest.mark.parametrize(
+    "heap,limit",
+    [
+        # Reproduces every pairing documented in .env.example + otp_heap.py:
+        ("8g", "12g"),  # default compose fallback (OTP_HEAP=8g / mem_limit=12g)
+        ("12g", "16g"),
+        ("24g", "28g"),  # .env France-wide example
+        ("36g", "42g"),
+        ("48g", "56g"),
+        ("64g", "74g"),
+        ("72g", "84g"),  # "≈84 GB cgroup cap on a 96 GB host" note
+        ("8192m", "12g"),  # MB heap → GB cap
+    ],
+)
+def test_mem_limit_for_heap(heap, limit):
+    from app.otp_heap import mem_limit_for_heap
+
+    assert mem_limit_for_heap(heap) == limit
+
+
+def test_mem_limit_headroom_is_at_least_4g():
+    """Small heaps still get the flat 4 GB native floor."""
+    from app.otp_heap import heap_to_gb, mem_limit_for_heap
+
+    for heap in ("4g", "8g", "12g", "20g"):
+        assert heap_to_gb(mem_limit_for_heap(heap)) - heap_to_gb(heap) >= 4
+
+
+def test_mem_limit_for_heap_none_empty_malformed_uses_default():
+    """A session with no/blank/garbage heap still gets a matched cap derived
+    from DEFAULT_HEAP (12g → 16g) rather than a too-small static value."""
+    from app.otp_heap import mem_limit_for_heap
+
+    assert mem_limit_for_heap(None) == "16g"  # type: ignore[arg-type]
+    assert mem_limit_for_heap("") == "16g"
+    assert mem_limit_for_heap("not-a-heap") == "16g"
+    # Caller-supplied default is honoured (worker passes settings.otp_build_heap).
+    assert mem_limit_for_heap(None, default="24g") == "28g"  # type: ignore[arg-type]
+    assert mem_limit_for_heap("bogus", default="48g") == "56g"
