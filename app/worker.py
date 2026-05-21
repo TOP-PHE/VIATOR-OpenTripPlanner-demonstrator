@@ -102,10 +102,20 @@ def _compose(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _log_safe(values: list[str]) -> str:
+    """Join service names with CR/LF stripped before logging.
+
+    These names trace back to the DB (session ids) and the recovery marker
+    file, so Sonar treats them as user-controlled; stripping line breaks
+    defeats log-forging via a crafted value (python S5145)."""
+    cleaned = [v.replace("\r\n", "").replace("\n", "").replace("\r", "") for v in values]
+    return " ".join(cleaned)
+
+
 def _stop_services(services: list[str]) -> None:
     if not services:
         return
-    log.info("max-memory rebuild: stopping %d containers: %s", len(services), " ".join(services))
+    log.info("max-memory rebuild: stopping %d containers: %s", len(services), _log_safe(services))
     r = _compose("stop", *services)
     if r.returncode != 0:
         log.warning("max-memory stop exit=%s: %s", r.returncode, r.stderr.strip())
@@ -114,7 +124,7 @@ def _stop_services(services: list[str]) -> None:
 def _start_services(services: list[str]) -> None:
     if not services:
         return
-    log.info("max-memory rebuild: restarting %d containers: %s", len(services), " ".join(services))
+    log.info("max-memory rebuild: restarting %d containers: %s", len(services), _log_safe(services))
     r = _compose("start", *services)
     if r.returncode != 0:
         # `start` only revives existing stopped containers; if any were pruned,
