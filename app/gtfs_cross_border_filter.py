@@ -482,7 +482,16 @@ def _write_filtered_feed(
         zout,
         _TRANSFERS,
         lambda r: (
-            r.get("from_stop_id", "") in kept.stop_ids and r.get("to_stop_id", "") in kept.stop_ids
+            r.get("from_stop_id", "") in kept.stop_ids
+            and r.get("to_stop_id", "") in kept.stop_ids
+            # Trip-to-trip transfers (in-seat / constrained — GTFS transfer_type
+            # 4/5) carry from_trip_id/to_trip_id. Drop the row if it references a
+            # trip we filtered out, even when both stops survived — otherwise
+            # OTP's strict GTFS reader aborts the whole build with
+            # EntityReferenceNotFoundException on the dangling trip. Absent trip
+            # fields ⇒ a plain stop-to-stop transfer, which is kept.
+            and (not r.get("from_trip_id") or r.get("from_trip_id", "") in kept.trip_ids)
+            and (not r.get("to_trip_id") or r.get("to_trip_id", "") in kept.trip_ids)
         ),
     )
     _read_filter_write(zin, zout, _FREQUENCIES, lambda r: r.get("trip_id", "") in kept.trip_ids)
