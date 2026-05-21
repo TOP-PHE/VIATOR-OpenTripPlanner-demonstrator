@@ -1904,6 +1904,7 @@ class RebuildJobResponse(BaseModel):
     duration_seconds: int | None = None  # finished_at - started_at, when both exist
     snapshot: SnapshotInfo | None = None  # joined from graph_snapshots by rebuild_job_id
     cache_hit: bool | None = None  # parsed from log; None when not detectable
+    max_memory: bool = False  # v0.1.38 — job ran (or will run) in max-memory mode
 
 
 @router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
@@ -1912,9 +1913,16 @@ def enqueue_rebuild(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    max_memory: bool = False,
 ) -> RebuildJobResponse:
     """Manually enqueue a rebuild for this session. Idempotent — coalesces
     with any existing pending job for the same session.
+
+    `max_memory=true` (UI checkbox) marks the job so the worker stops the
+    serving sessions + observability stack, sizes the build heap to host RAM,
+    runs the build, then restarts everything — the "worst-case build on a
+    single box" path. When coalescing into an existing pending job, the flag
+    only ever upgrades (a max-memory request wins over a plain one).
 
     Refuses (400) when inputs aren't staged on disk. The OTP build itself
     fails ~30 seconds in with "no OSM data available" if you skip the
@@ -1958,14 +1966,22 @@ def enqueue_rebuild(
         .filter(RebuildJob.session_id == sid)
         .first()
     )
+    suffix = " (max-memory)" if max_memory else ""
     if pending is None:
         pending = RebuildJob(
             session_id=sid,
             status="pending",
-            log=f"queued at {datetime.now(UTC).isoformat()} — manual trigger\n",
+            max_memory=max_memory,
+            log=f"queued at {datetime.now(UTC).isoformat()} — manual trigger{suffix}\n",
         )
         db.add(pending)
         db.flush()
+    elif max_memory and not pending.max_memory:
+        # Upgrade an already-pending plain rebuild to max-memory.
+        pending.max_memory = True
+        pending.log = (pending.log or "") + (
+            f"upgraded to max-memory at {datetime.now(UTC).isoformat()}\n"
+        )
 
     audit.record(
         db,
@@ -1974,7 +1990,7 @@ def enqueue_rebuild(
         actor_ip=client_ip(request),
         target_kind="session",
         target_id=sid,
-        metadata={"job_id": str(pending.id)},
+        metadata={"job_id": str(pending.id), "max_memory": max_memory},
     )
     db.commit()
     db.refresh(pending)
@@ -2085,6 +2101,7 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
         duration_seconds=duration_seconds,
         snapshot=snapshot_info,
         cache_hit=classification["cache_hit"],
+        max_memory=bool(j.max_memory),
     )
 
 

@@ -207,3 +207,118 @@ def test_common_serve_heaps_no_duplicates_and_sorted():
 
     sizes = [int(v.rstrip("gGmM")) for v, _ in COMMON_SERVE_HEAPS if v.endswith(("g", "G"))]
     assert sizes == sorted(sizes), "COMMON_SERVE_HEAPS not monotonically increasing"
+
+
+# ─── v0.1.38 — build cgroup mem_limit derivation ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "heap,gb",
+    [
+        ("8g", 8),
+        ("12g", 12),
+        ("24g", 24),
+        ("72g", 72),
+        ("12G", 12),  # case-insensitive unit
+        ("  16g ", 16),  # trimmed
+        ("8192m", 8),  # exact MB→GB
+        ("4096m", 4),
+        ("512m", 1),  # sub-GB rounds UP (never 0 — a 0g cap is nonsense)
+        ("1536m", 2),  # 1.5 GB rounds up to 2
+        ("1024m", 1),
+    ],
+)
+def test_heap_to_gb(heap, gb):
+    from app.otp_heap import heap_to_gb
+
+    assert heap_to_gb(heap) == gb
+
+
+def test_heap_to_gb_rejects_malformed():
+    from app.otp_heap import heap_to_gb
+
+    with pytest.raises(ValueError, match="doesn't match"):
+        heap_to_gb("12gb")
+    with pytest.raises(ValueError, match="doesn't match"):
+        heap_to_gb("garbage")
+
+
+@pytest.mark.parametrize(
+    "heap,limit",
+    [
+        # Reproduces every pairing documented in .env.example + otp_heap.py:
+        ("8g", "12g"),  # default compose fallback (OTP_HEAP=8g / mem_limit=12g)
+        ("12g", "16g"),
+        ("24g", "28g"),  # .env France-wide example
+        ("36g", "42g"),
+        ("48g", "56g"),
+        ("64g", "74g"),
+        ("72g", "84g"),  # "≈84 GB cgroup cap on a 96 GB host" note
+        ("8192m", "12g"),  # MB heap → GB cap
+    ],
+)
+def test_mem_limit_for_heap(heap, limit):
+    from app.otp_heap import mem_limit_for_heap
+
+    assert mem_limit_for_heap(heap) == limit
+
+
+def test_mem_limit_headroom_is_at_least_4g():
+    """Small heaps still get the flat 4 GB native floor."""
+    from app.otp_heap import heap_to_gb, mem_limit_for_heap
+
+    for heap in ("4g", "8g", "12g", "20g"):
+        assert heap_to_gb(mem_limit_for_heap(heap)) - heap_to_gb(heap) >= 4
+
+
+def test_mem_limit_for_heap_none_empty_malformed_uses_default():
+    """A session with no/blank/garbage heap still gets a matched cap derived
+    from DEFAULT_HEAP (12g → 16g) rather than a too-small static value."""
+    from app.otp_heap import mem_limit_for_heap
+
+    assert mem_limit_for_heap(None) == "16g"  # type: ignore[arg-type]
+    assert mem_limit_for_heap("") == "16g"
+    assert mem_limit_for_heap("not-a-heap") == "16g"
+    # Caller-supplied default is honoured (worker passes settings.otp_build_heap).
+    assert mem_limit_for_heap(None, default="24g") == "28g"  # type: ignore[arg-type]
+    assert mem_limit_for_heap("bogus", default="48g") == "56g"
+
+
+# ─── v0.1.38 — max-memory rebuild auto heap sizing ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "host_gb,heap",
+    [
+        # (default reserve 8g) the derived cap must always fit host-reserve:
+        (96, "75g"),  # avail 88 → 75g (cap 87 ≤ 88)
+        (47, "33g"),  # avail 39 → 33g (cap 38 ≤ 39)
+        (32, "20g"),  # avail 24 → 20g (cap 24 ≤ 24, exact)
+        (24, "12g"),  # avail 16 → 12g (cap 16 ≤ 16; closed-form 13g would overshoot)
+    ],
+)
+def test_auto_build_heap_fits_host(host_gb, heap):
+    from app.otp_heap import auto_build_heap, heap_to_gb, mem_limit_for_heap
+
+    assert auto_build_heap(host_gb) == heap
+    # Invariant: the derived cgroup cap never exceeds host - reserve.
+    assert heap_to_gb(mem_limit_for_heap(heap)) <= host_gb - 8
+
+
+def test_auto_build_heap_returns_none_when_box_too_small():
+    """A box that can't fit even an 8g build after the reserve gets None —
+    the caller keeps the configured heap rather than shrinking it."""
+    from app.otp_heap import auto_build_heap
+
+    assert auto_build_heap(16) is None  # avail 8, 8g cap is 12 > 8
+    assert auto_build_heap(12) is None  # avail 4 < min 8
+    assert auto_build_heap(8) is None
+
+
+def test_auto_build_heap_custom_reserve():
+    from app.otp_heap import auto_build_heap, heap_to_gb, mem_limit_for_heap
+
+    heap = auto_build_heap(64, reserve_gb=16)
+    assert heap is not None
+    # Cap must fit 64 - 16 = 48.
+    assert heap_to_gb(mem_limit_for_heap(heap)) <= 48
