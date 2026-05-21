@@ -80,7 +80,10 @@
                 </div>
               </fieldset>
               <label>OSM PBF URL <code>(.osm.pbf)</code></label>
-              <input type="url" name="osm_pbf" placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
+              {# Full-width so a long Geofabrik URL is readable without
+                 scrolling inside the field (UX, v0.1.40). #}
+              <input type="url" name="osm_pbf" style="width: 100%; box-sizing: border-box"
+                     placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
               <p class="hint" style="margin-top: 0.25rem">
                 Must cover every region your providers reach. France-wide PBF + IDFM
                 Paris GTFS is fine; IDF-only PBF + nationwide SNCF GTFS will fail to snap
@@ -1723,6 +1726,24 @@ function _renderStatusPill(status) {
   return `<span class="rebuild-pill">${escHTML(status)}</span>`;
 }
 
+// v0.1.40 — surface the memory option a build used, so it isn't lost once the
+// one-off "max-memory" checkbox is clicked. The badge comes from the persisted
+// max_memory flag (visible even while the build is running); the heap + cgroup
+// cap are parsed from the build log's "[viator] build resources:" line once it
+// lands (the worker prepends it when the build finishes).
+function _renderMemPill(job) {
+  const m = (job.log || '').match(/OTP_HEAP=(\S+)\s+OTP_BUILD_MEM_LIMIT=(\S+)/);
+  const res = m ? `heap ${escHTML(m[1])} / cap ${escHTML(m[2])}` : '';
+  if (job.max_memory) {
+    return `<span class="rebuild-pill" data-flavour="maxmem" style="background:#E89B2C;color:#fff" ` +
+      `title="Max-memory rebuild: stopped other sessions + observability and sized the heap to host RAM">` +
+      `🧠 max-memory${res ? ' · ' + res : ''}</span>`;
+  }
+  return res
+    ? `<span class="rebuild-pill" title="JVM heap and container cgroup cap used for this build">${res}</span>`
+    : '';
+}
+
 function _renderCurrentBuildCard(job) {
   const snap = job.snapshot;
   const isCurrent = !!(snap && snap.is_current);
@@ -1753,6 +1774,7 @@ function _renderCurrentBuildCard(job) {
         ${_renderStatusPill(job.status)}
         ${servingPill}
         ${_renderCachePill(job.cache_hit)}
+        ${_renderMemPill(job)}
         ${durationCell}
         <span>· ${isRunning ? 'started' : 'built'} ${escHTML(_formatBuiltAt(isRunning ? job.started_at : builtAt))}</span>
         ${period}
@@ -1808,6 +1830,7 @@ function _renderHistoryItem(job) {
       <summary>
         ${_renderStatusPill(job.status)}
         ${_renderCachePill(job.cache_hit)}
+        ${_renderMemPill(job)}
         <code>${escHTML(versionLabel)}</code>
         <span>${escHTML(_formatBuiltAt(builtAt))}</span>
         ${duration ? `<span class="hint">· ${escHTML(duration)}</span>` : ''}
