@@ -89,7 +89,7 @@ docker compose version
 sudo mkdir -p /opt/viator
 sudo chown $USER:$USER /opt/viator
 cd /opt/viator
-git clone https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator.git .
+git clone https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator.git .
 cd docker
 ```
 

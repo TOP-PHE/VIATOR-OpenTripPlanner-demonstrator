@@ -56,8 +56,8 @@ than as `cpu-cores × event-loop work`.
 - Mixing sync + async correctly in tests is harder than just being sync.
 - The 235-test suite, the 18 model files, the 12 API modules all currently
   use the sync API. Migration cost is non-trivial.
-- This codebase is a **single-operator demonstrator** for a UIC research
-  programme, not a high-concurrency production SaaS. Realistic concurrent
+- This codebase is a **single-operator demonstrator** for a rail
+  journey-planning research programme, not a high-concurrency production SaaS. Realistic concurrent
   user count: 1–5 admins, occasional public journey-search hits. The 40-
   thread ceiling is invisible at this scale.
 

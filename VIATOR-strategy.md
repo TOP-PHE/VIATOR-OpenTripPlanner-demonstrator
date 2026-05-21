@@ -1,8 +1,8 @@
 # VIATOR — Strategy
 
-_UIC MERITS-aligned rail journey-planning demonstrator built on OpenTripPlanner._
+_Rail journey-planning demonstrator built on OpenTripPlanner._
 
-_High-level strategy for an OpenTripPlanner-based journey planner that initially ingests SNCF open data via the French NAP (transport.data.gouv.fr), and is designed to migrate to ingesting the same dataset families directly from **MERITS** (the UIC central data platform) once available. Companion to `VIATOR-technical-spec.md`._
+_High-level strategy for an OpenTripPlanner-based journey planner that initially ingests SNCF open data via the French NAP (transport.data.gouv.fr), and is designed to migrate to ingesting the same dataset families directly from **MERITS** once available. Companion to `VIATOR-technical-spec.md`._
 
 _**Powered by TrackOnPath SAS** — patrick.heuguet@trackonpath.com_
 _**© 2026 TrackOnPath SAS. All rights reserved.**_
@@ -17,7 +17,7 @@ Build a single-VPS journey-planning stack made of:
 1. An **OpenTripPlanner** core, fed with **SNCF GTFS** as the production timetable source.
 2. A **web UI + ingestion service** that lets an operator upload new feeds (timetables, stations, MCT) by **declaring the standard** of the file. The backend validates, stores, and routes the file to the right downstream consumer.
 3. An **enrichment layer** holding station cross-references (UIC ↔ Trigramme ↔ INSEE ↔ RICS) and minimum connection times (MCT) — both consumed by the API façade, not by OTP itself.
-4. (Phase 2) An **OJP adapter** in front of OTP, so external consumers (MERITS, OSDM, UIC partners) can query the planner using the CEN OJP standard rather than OTP's GraphQL.
+4. (Phase 2) An **OJP adapter** in front of OTP, so external consumers (MERITS, OSDM) can query the planner using the CEN OJP standard rather than OTP's GraphQL.
 
 The NeTEx file SNCF publishes follows the **French profile (Profil France NeTEx v2.4)**, which OTP cannot ingest natively. The pragmatic path is **GTFS into OTP, NeTEx-FR kept aside** for richer stop and interchange semantics until a NeTEx-FR → Nordic converter is built.
 
@@ -78,7 +78,7 @@ By "legacy" we mean **GTFS**, since that is the format that actually loads into 
 
 - **Phase 1 (now):** ingest **GTFS** into OTP. It is production-ready and SNCF publishes it daily.
 - **Phase 2:** keep the **NeTEx-FR ZIP** archived; consume it only at the **OJP-output** layer for richer StopPlace/Interchange semantics that GTFS cannot express. The OJP adapter can read NeTEx-FR for stop metadata even though OTP doesn't.
-- **Phase 3 (optional):** invest in a NeTEx-FR → Nordic converter once cross-border, fare integration, or stricter UIC-aligned semantics demand it.
+- **Phase 3 (optional):** invest in a NeTEx-FR → Nordic converter once cross-border, fare integration, or stricter EU rail-standard semantics demand it.
 
 ---
 
@@ -421,10 +421,10 @@ Detail in `VIATOR-technical-spec.md` §12.
 | **3 — Multi-session** | Sessions become first-class; inbox, graph, OTP container per session; admin UI to create/destroy sessions; comparison endpoint | Run NAP and MERITS in parallel; compare planner outputs |
 | **3a — Master data foundation** | `master_stations` (Trainline-seeded), `route_aliases`, `master_carriers` (RICS); admin UI to edit; periodic refresh | Stable cross-source spine for trip-signature, OJP, MCT, geocoding |
 | **3b — Search analytics + versioning** | Multi-table recording (`journey_searches` + executions + trips), graph snapshots with two-level versioning (main + update), trip-signature provenance, fanout endpoint, replay & version-diff reports | Activity tracking + the report that proves running NAP+MERITS side-by-side is worth it + ability to prove timetable bug fixes |
-| **4 — Branded journey UI** | Static MapLibre + GraphQL frontend at `/`, session selector, side-by-side comparison view | Public-facing demonstrator surface for UIC presentations |
+| **4 — Branded journey UI** | Static MapLibre + GraphQL frontend at `/`, session selector, side-by-side comparison view | Public-facing demonstrator surface for stakeholder presentations |
 | **5 — OJP exposure** | OJP adapter in front of each session, MCT enforcement, UIC code translation via stations table | External consumers can query OJP `TripRequest` with PRR-correct connections |
 | **6 — NeTEx-FR ingestion** | NeTEx-FR → Nordic converter, OTP rebuild from NeTEx | Full alignment with French regulatory format; richer fare and interchange data |
-| **7 — MERITS as primary source** | Switch a "merits-prod" session to pull directly from MERITS (timetables, stations, MCT). Decommission direct NAP polling once coverage is sufficient. | Single, UIC-aligned upstream replaces N national NAPs |
+| **7 — MERITS as primary source** | Switch a "merits-prod" session to pull directly from MERITS (timetables, stations, MCT). Decommission direct NAP polling once coverage is sufficient. | Single, unified European upstream replaces N national NAPs |
 | **8 — Multi-feed / multi-region** | Add IDFM, regional TER, cross-border feeds (e.g. Trenitalia France); per-tenant config | Production-grade EU-facing planner |
 
 ---

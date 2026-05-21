@@ -1253,7 +1253,7 @@ docker version && docker compose version
 ```bash
 sudo mkdir -p /opt/viator && sudo chown $USER:$USER /opt/viator
 cd /opt/viator
-git clone https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator.git .
+git clone https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator.git .
 cd docker
 ```
 
@@ -1760,7 +1760,7 @@ When the admin PATCHes a limit, the semaphores are recreated atomically (existin
 2. ~~**Geocoder**~~ — **resolved 2026-04-27**: no external geocoder. The journey UI's From/To fields autocomplete against `master_stations` (returning UIC + lat/lon + multilingual names). VIATOR is a rail timetable demonstrator, not a multimodal door-to-door planner — station-to-station is the only mode in scope. Address-level geocoding (Nominatim/Photon) deferred until door-to-door enters scope.
 3. ~~**Domain whitelist on registration**~~ — **resolved 2026-04-27**: registration is **open**, with full search-history tracking as compensating control. Admin-driven role promotion only.
 4. **Session compose generation** — Pattern A (regenerate compose file) vs. Pattern B (Docker SDK) — confirm Pattern A is fine for ≤10 sessions.
-5. ~~**OJP adapter timing**~~ — **resolved 2026-04-27**: deferred. The comparison value (fanout + origin flags + replay) ships first; OJP is added as the export surface for UIC partners only after the journey-UI loop is stable and the twin-NAP validation has produced its mirror reports. Stays at Phase 5 in the roadmap; no stub in earlier phases.
+5. ~~**OJP adapter timing**~~ — **resolved 2026-04-27**: deferred. The comparison value (fanout + origin flags + replay) ships first; OJP is added as the export surface for external partners only after the journey-UI loop is stable and the twin-NAP validation has produced its mirror reports. Stays at Phase 5 in the roadmap; no stub in earlier phases.
 6. ~~**Comparison normalisation**~~ — **resolved 2026-04-27**: trip-signature based on UIC stops + route_short_name + minute-rounded times (see §6.4). Limitations acknowledged; aliases map can be added incrementally.
 7. ~~**Spatial index**~~ — **resolved 2026-04-27**: lat/lon rounded to 4 decimals for O&D grouping. PostGIS deferred unless we need geographic radius queries.
 8. ~~**Search retention**~~ — **resolved 2026-04-27**: three-tier retention (raw responses 30d, trips 180d, search summaries 365d). All editable from admin UI.
