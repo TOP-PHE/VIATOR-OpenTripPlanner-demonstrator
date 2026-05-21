@@ -83,6 +83,4 @@ class RebuildJob(TimestampMixin, Base):
     # worker stops serving sessions + the observability stack to free the box,
     # auto-sizes the build heap to host RAM, then restarts them when done.
     # One-off per job (UI checkbox next to Rebuild), not a session default.
-    max_memory: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("FALSE")
-    )
+    max_memory: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))

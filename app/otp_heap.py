@@ -167,9 +167,7 @@ def heap_to_gb(heap: str) -> int:
     """
     m = _HEAP_RE.match(heap.strip())
     if not m:
-        raise ValueError(
-            f"heap={heap!r} doesn't match the expected pattern (integer + 'g'/'m')"
-        )
+        raise ValueError(f"heap={heap!r} doesn't match the expected pattern (integer + 'g'/'m')")
     qty, unit = int(m.group(1)), m.group(2).lower()
     if unit == "g":
         return qty

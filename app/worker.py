@@ -139,8 +139,7 @@ def _recover_max_memory_stopped() -> None:
         services = [s for s in _MAXMEM_MARKER.read_text(encoding="utf-8").split() if s]
         if services:
             log.warning(
-                "recovering %d containers left stopped by an interrupted "
-                "max-memory rebuild",
+                "recovering %d containers left stopped by an interrupted max-memory rebuild",
                 len(services),
             )
             _start_services(services)
