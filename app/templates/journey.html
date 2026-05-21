@@ -6,8 +6,8 @@
 .search-form { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; }
 .results { min-height: 200px; }
 .trip-card { border: 1px solid var(--sleeper); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 0.6rem; background: #fff; cursor: pointer; transition: border-color 0.15s; }
-.trip-card:hover { border-color: var(--uic-blue); }
-.trip-card.expanded { border-color: var(--uic-blue); }
+.trip-card:hover { border-color: var(--brand-blue); }
+.trip-card.expanded { border-color: var(--brand-blue); }
 .trip-card .top { display: flex; justify-content: space-between; align-items: center; }
 .legs-detail { margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px dashed var(--sleeper); display: none; }
 .trip-card.expanded .legs-detail { display: block; }
@@ -16,7 +16,7 @@
 .leg-mode { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; padding: 1px 6px; border-radius: 3px; align-self: start; white-space: nowrap; }
 .leg-mode.WALK { background: #f0eee9; color: #5a4a3a; }
 .leg-mode.RAIL, .leg-mode.TRAIN { background: #fdecef; color: #b30021; }
-.leg-mode.SUBWAY, .leg-mode.METRO { background: #e8f0fb; color: #1F3B66; }
+.leg-mode.SUBWAY, .leg-mode.METRO { background: #e8f0fb; color: #1C75BC; }
 .leg-mode.TRAM { background: #fff8e1; color: #b3760e; }
 .leg-mode.BUS { background: #e9f6ec; color: #1a7e3c; }
 .leg-time { color: var(--rail-steel); font-family: ui-monospace, Menlo, Consolas, monospace; }
@@ -26,7 +26,7 @@
 .flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
 .flag.ALL        { background: #e9f6ec; color: #1a7e3c; }
 .flag.NAP-ONLY   { background: #fdecef; color: #b30021; }
-.flag.MERITS-ONLY{ background: #e8f0fb; color: #1F3B66; }
+.flag.MERITS-ONLY{ background: #e8f0fb; color: #1C75BC; }
 .flag.SUBSET     { background: #fff8e1; color: #b3760e; }
 .timing-strip { display:flex; gap: 1rem; flex-wrap: wrap; padding: 0.6rem; background: #eef2f8; border-radius: 4px; font-size: 0.8rem; color: var(--rail-steel); margin-bottom: 0.6rem; }
 .station-input { position: relative; }
@@ -50,7 +50,7 @@
 .op-badge[data-feed^="TRENITALIA"] { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
 .op-badge[data-feed^="EUROSTAR"]   { background: #fff4d6; color: #9a6700; border-color: #f5d56b; }
 .op-badge[data-feed^="RENFE"]      { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
-.op-badge[data-feed^="IDFM"]       { background: #e8f0fb; color: #1F3B66; border-color: #c5d6f0; }
+.op-badge[data-feed^="IDFM"]       { background: #e8f0fb; color: #1C75BC; border-color: #c5d6f0; }
 .op-badge[data-feed^="ZENBUS"]     { background: #e9f6ec; color: #1a7e3c; border-color: #c0e6c8; }
 .op-badge[data-feed^="RGION"]      { background: #ddf4ff; color: #0969da; border-color: #b6e3ff; }
 .op-summary { margin-top: 0.3rem; display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; font-size: 0.78rem; color: var(--rail-steel); }
@@ -64,7 +64,7 @@
   border: 1px solid #d0d7de; background: #f6f8fa; color: #57606a;
   border-radius: 4px; cursor: pointer;
 }
-.json-btn:hover { background: #eef2f8; color: var(--uic-blue); border-color: var(--uic-blue); }
+.json-btn:hover { background: #eef2f8; color: var(--brand-blue); border-color: var(--brand-blue); }
 .json-modal-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.45);
   display: flex; align-items: center; justify-content: center; z-index: 1000;
@@ -92,7 +92,7 @@
 .compare-ojp-field input { width: auto; }
 .ojp-ref-panel { margin-top: 1.2rem; border-top: 2px solid var(--sleeper); padding-top: 0.8rem; }
 .ojp-ref-panel h3 { margin: 0 0 0.6rem; font-size: 1rem; }
-.ojp-ref-card { border-left: 3px solid var(--uic-blue); }
+.ojp-ref-card { border-left: 3px solid var(--brand-blue); }
 /* v0.1.36 — Phase 2 structured comparison: a one-line summary strip
    above the results showing how many itineraries the two engines agree
    on, plus a small pill on each card tagging it as common / OTP-only /
@@ -102,11 +102,11 @@
 .comparison-strip > .cmp-label { color: var(--rail-steel); font-weight: 600; margin-right: 0.2rem; }
 .cmp-count { padding: 0.05rem 0.5rem; border-radius: 999px; font-weight: 600; font-size: 0.78rem; }
 .cmp-count.common   { background: #e9f6ec; color: #1a7e3c; }
-.cmp-count.otp-only { background: #e8f0fb; color: #1F3B66; }
+.cmp-count.otp-only { background: #e8f0fb; color: #1C75BC; }
 .cmp-count.ojp-only { background: #fff8e1; color: #b3760e; }
 .cmp-pill { font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; font-weight: 600; letter-spacing: 0.3px; }
 .cmp-pill.common       { background: #e9f6ec; color: #1a7e3c; }
-.cmp-pill.otp-only     { background: #e8f0fb; color: #1F3B66; }
+.cmp-pill.otp-only     { background: #e8f0fb; color: #1C75BC; }
 .cmp-pill.ojp-only     { background: #fff8e1; color: #b3760e; }
 .cmp-pill.uncomparable { background: #eef0f2; color: #57606a; }
 {% endblock %}
@@ -476,7 +476,7 @@ function renderOjpReference(ref) {
       </div>
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
         ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
-        <span style="color: var(--uic-blue)">▸ click for leg detail</span>
+        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
       </div>
       <div class="legs-detail">${legsHTML(t.legs)}</div>
     </div>`;
@@ -540,7 +540,7 @@ function render(payload) {
       <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
         ${t.best.modes || '—'} · ${legCount} leg${legCount===1?'':'s'} ·
         Found in: ${t.found_in_sessions.join(', ')} ·
-        <span style="color: var(--uic-blue)">▸ click for leg detail</span>
+        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
       </div>
       <div class="legs-detail">
         ${legsHTML(t.best.legs)}
