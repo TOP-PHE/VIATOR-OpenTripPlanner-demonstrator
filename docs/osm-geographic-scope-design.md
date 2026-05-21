@@ -168,8 +168,12 @@ the served set by reading each provider's staged GTFS:
    already has this prefix→country map in
    `app/gtfs_cross_border_filter.py` (`UIC_COUNTRY_NAMES`) and parses UIC out
    of stop ids in `app/journey/signature.py`.
-4. return the set of countries that have ≥ N stops (a small threshold avoids
-   a single mis-geocoded stop dragging in a whole country).
+4. **pre-tick** a country only if it has **≥ 5 stops** (flat threshold). This
+   is a *suggestion* the operator can override (§3.5) — e.g. a Eurostar
+   session with only St Pancras + Ebbsfleet (2 UK stops) won't auto-tick UK,
+   so the operator ticks it by hand. The flat 5 keeps a stray / `(0,0)`
+   coordinate from dragging in a whole country, while the UI still surfaces
+   **every** country that has *any* stops, so nothing is hidden.
 
 Surfaced via `GET /api/sessions/{sid}/osm-countries/suggest` →
 `{"detected": ["FR","CH"], "stops_by_country": {...}}`. Used only to
@@ -181,11 +185,17 @@ choice.
 The Configure form (`app/templates/admin/sessions.html`), next to the
 existing **OSM scope** dropdown, gains a **Countries** checklist:
 
-- grouped, ordered list: EU-27 + EFTA (CH, NO, IS, LI) + UK as v1 (see
-  open question 6.1).
-- **auto-detected countries pre-checked** (from §3.4), with a small badge
-  ("detected from N stops"); operator can tick neighbours for cross-border
-  corridors or untick to shrink further.
+- grouped, ordered list: **EU-27 + EFTA (CH, NO, IS, LI) + UK** (the v1 set).
+- **auto-detected countries pre-checked** (from §3.4).
+- **Show the basis for every suggestion** so the operator never loses *why* a
+  box is (un)ticked. Render the per-country stop count next to each country
+  that has any stops, e.g.:
+  - `☑ France — 4,200 stops (detected)`
+  - `☑ Germany — 30 stops (detected)`
+  - `☐ United Kingdom — 2 stops (below threshold — tick to include)`
+  - countries with zero stops sort to the bottom / collapse.
+  This makes the auto-detect **auditable** and turns the UK-2-stops case into
+  a one-click add instead of a mystery.
 - a hint showing the trade-off ("fewer countries → faster build, less RAM;
   add neighbours only if a route crosses them with a stop there").
 - posts `osm_countries` in the same `PATCH /api/sessions/{sid}` config save.
@@ -223,23 +233,31 @@ existing **OSM scope** dropdown, gains a **Countries** checklist:
 
 ---
 
-## 6. Open questions
+## 6. Resolved decisions + implementation notes
 
-1. **Country list scope.** v1 = EU-27 + EFTA + UK. Include Balkans / Turkey /
-   Ukraine / Morocco now, or add on demand? (Affects the shipped GeoJSON
-   size.)
-2. **Boundary polygon fidelity.** Simplified Natural Earth is fine for
-   cropping (a few km of slop at borders is harmless — we keep slightly more
-   than needed). Confirm the simplification doesn't drop small but served
-   territories (e.g. Monaco, Liechtenstein, Luxembourg).
-3. **Detection threshold.** How many stops in a country before it's
-   pre-checked? (Proposal: ≥ 1% of stops or ≥ 5 stops, whichever is larger.)
-4. **Interaction with `comprehensive` tag scope.** Geo-crop is orthogonal and
-   should still apply (crop a comprehensive PBF to the countries). Confirm
-   the entrypoint runs the crop even when `tags-filter` is skipped.
-5. **Per-stop coordinate trust.** Some feeds put `(0,0)` or imprecise coords
-   on a few stops; the threshold (Q3) and the UIC cross-check (§3.4) both
-   guard against a stray coordinate dragging in a country.
+**Resolved (review 2026-05-21):**
+
+1. **Country list (v1):** **EU-27 + EFTA (CH/NO/IS/LI) + UK.** Extend to
+   Balkans / Turkey / Ukraine / Morocco on demand later.
+2. **Detection threshold:** flat **5 stops** to pre-tick a country. It's a
+   suggestion only — the operator overrides via the checklist, and the UI
+   shows the per-country stop count (incl. below-threshold like UK=2) so the
+   basis is never hidden (§3.4, §3.5).
+3. **Phasing:** implement **Phase 1 + Phase 2 together** (geo-crop + manual
+   checklist + auto-detect from GTFS).
+
+**Implementation notes (to verify during build):**
+
+- **Boundary polygon fidelity.** Simplified Natural Earth is fine for cropping
+  (a few km of border slop is harmless — we keep slightly more than needed).
+  Verify the simplification doesn't drop small but served territories
+  (Monaco, Liechtenstein, Luxembourg).
+- **Interaction with `comprehensive` tag scope.** Geo-crop is orthogonal and
+  must still apply — the entrypoint runs the crop even when `tags-filter` is
+  skipped.
+- **Per-stop coordinate trust.** Some feeds put `(0,0)` or imprecise coords on
+  a few stops; the 5-stop threshold + the UIC prefix cross-check (§3.4) guard
+  against a stray coordinate dragging in a country.
 
 ---
 
