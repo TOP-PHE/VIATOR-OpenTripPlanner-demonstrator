@@ -19,7 +19,7 @@ def test_verification_template_contains_link_and_name() -> None:
     assert "https://test/confirm/abc123" in html
     assert "VIATOR" in html
     assert "TrackOnPath SAS" in html
-    assert "UIC" in html
+    assert "Journey-planner demonstrator" in html
 
 
 def test_verification_text_template_renders_cleanly() -> None:

@@ -87,7 +87,7 @@ def test_login_page_renders(client: TestClient) -> None:
     assert 'id="login-form"' in body
     # Footer attribution preserved on every page.
     assert "TrackOnPath SAS" in body
-    assert "UIC" in body
+    assert "Journey-planner demonstrator" in body
 
 
 def test_register_page_renders(client: TestClient) -> None:
