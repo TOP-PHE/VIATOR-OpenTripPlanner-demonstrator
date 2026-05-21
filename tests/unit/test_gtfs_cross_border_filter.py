@@ -22,6 +22,8 @@ import io
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from app.gtfs_cross_border_filter import (
     UIC_COUNTRY_NAMES,
     _country_of,
@@ -676,3 +678,61 @@ class TestCountryWhitelistTable:
     def test_sbb_internal_prefixes_excluded(self):
         for bogus in ("11", "12", "13", "14"):
             assert bogus not in UIC_COUNTRY_NAMES
+
+
+class TestHomeCountryOwnership:
+    """v0.1.38 — origin-ownership: keep only trips departing home_country.
+
+    In the synthetic feed, R_LYRIA (Paris Gare de Lyon -> Zürich HB) departs
+    FR, and R_CENTO (Brig -> ... -> Locarno) departs CH. So home_country
+    splits them by departure country — the dedup mechanism for federating
+    several national cross-border feeds.
+    """
+
+    def test_fr_keeps_only_fr_departing(self, tmp_path):
+        src = tmp_path / "national.zip"
+        out = tmp_path / "fr.zip"
+        _build_synthetic_gtfs(src)
+
+        stats = filter_to_cross_border(src, out, home_country="FR")
+        kept = _read_ids(out, "routes.txt", "route_id")
+        assert kept == {"R_LYRIA"}  # departs Paris (FR)
+        assert "R_CENTO" not in kept  # departs Brig (CH)
+        assert stats.home_country == "FR"
+        # Combos reflect only the kept route.
+        assert stats.country_combos.get("CH+FR") == 1
+        assert "CH+IT" not in stats.country_combos
+        # Cascade: the dropped CH-origin route's stops are gone.
+        assert "8300010" not in _read_ids(out, "stops.txt", "stop_id")  # Domodossola
+
+    def test_ch_keeps_only_ch_departing(self, tmp_path):
+        src = tmp_path / "national.zip"
+        out = tmp_path / "ch.zip"
+        _build_synthetic_gtfs(src)
+
+        filter_to_cross_border(src, out, home_country="CH")
+        kept = _read_ids(out, "routes.txt", "route_id")
+        assert kept == {"R_CENTO"}  # departs Brig (CH)
+        assert "R_LYRIA" not in kept
+
+    def test_iso_is_case_insensitive(self, tmp_path):
+        src = tmp_path / "national.zip"
+        out = tmp_path / "fr.zip"
+        _build_synthetic_gtfs(src)
+        filter_to_cross_border(src, out, home_country="fr")
+        assert _read_ids(out, "routes.txt", "route_id") == {"R_LYRIA"}
+
+    def test_unknown_country_rejected(self, tmp_path):
+        src = tmp_path / "national.zip"
+        out = tmp_path / "x.zip"
+        _build_synthetic_gtfs(src)
+        with pytest.raises(ValueError, match="home_country"):
+            filter_to_cross_border(src, out, home_country="XX")
+
+    def test_none_keeps_both_directions(self, tmp_path):
+        # Regression: default (no home_country) keeps both, as before.
+        src = tmp_path / "national.zip"
+        out = tmp_path / "both.zip"
+        _build_synthetic_gtfs(src)
+        filter_to_cross_border(src, out)
+        assert _read_ids(out, "routes.txt", "route_id") == {"R_LYRIA", "R_CENTO"}
