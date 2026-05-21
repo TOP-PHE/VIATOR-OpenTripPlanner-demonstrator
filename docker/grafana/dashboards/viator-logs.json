@@ -57,7 +57,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({container=~\"viator-.+\", level_extracted=~\"(?i)error|critical\"}[$__range]))"
+          "expr": "sum(count_over_time({container=~\"viator-.+\", level=~\"(?i)error|critical\"}[$__range]))"
         }
       ],
       "fieldConfig": {
@@ -162,7 +162,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{container=~\"$container\"} | json | level_extracted=~\"$level.*\" |~ \"$session_id\""
+          "expr": "{container=~\"$container\"} | json | level=~\"$level.*\" |~ \"$session_id\""
         }
       ],
       "options": {
@@ -208,7 +208,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (container) (rate({container=~\"viator-.+\", level_extracted=~\"(?i)error|critical\"}[1m]))",
+          "expr": "sum by (container) (rate({container=~\"viator-.+\", level=~\"(?i)error|critical\"}[1m]))",
           "legendFormat": "{{container}}"
         }
       ],
