@@ -86,32 +86,41 @@ def rank_hubs(
     origin_uic: str,
     dest_uic: str,
 ) -> list[str]:
-    """Order candidate hubs by how little they detour the origin->dest path.
+    """Order candidate hubs: destination-country hubs first, then by detour.
 
-    Score = great-circle (origin->hub) + (hub->dest) in km: a hub sitting on
-    the direct line scores near the direct distance, an off-route one scores
-    far more. Ascending, so the most "on the way" hubs come first; a hub with
-    no resolved coordinates is dropped (it can be neither scored nor routed).
+    Two signals, in priority order:
 
-    This replaces the original lexicographic-by-UIC ordering, which sorted the
-    Swiss `85...` gateways (e.g. Basel SBB `8500010`) behind every lower-numbered
-    code — so the per-pair hub cap dropped the one hub the cross-border spine
-    actually serves, and the corridors pair produced no stitch at all.
+    1. **Destination country first.** The spoke (the destination session's
+       hub->dest leg) is only dense *inside the destination country*. Cutting at
+       an origin- or third-country border station forces that network to claw
+       back across the border on sparse regional lines — which made
+       Paris->Fribourg stitch via Besancon (FR) over 12 regional legs instead of
+       via a Swiss gateway. A UIC's first two digits encode its country.
+    2. **Detour cost** within each tier: great-circle (origin->hub) + (hub->dest)
+       in km. A hub on the direct line scores near the direct distance, an
+       off-route one scores far more. Tie-broken by UIC for determinism.
+
+    A hub with no resolved coordinates is dropped (it can be neither scored nor
+    routed). If no hub is in the destination country, every hub lands in tier 2
+    and this degrades to pure proximity ranking. (Both signals replace the
+    original lexicographic-by-UIC order, which dropped Swiss `85...` gateways
+    behind every lower-numbered code.)
     """
     origin = coords.get(origin_uic)
     dest = coords.get(dest_uic)
     if origin is None or dest is None:
         return []
-    scored: list[tuple[float, str]] = []
+    dest_country = dest_uic[:2]
+    scored: list[tuple[int, float, str]] = []
     for uic in hub_uics:
         hub = coords.get(uic)
         if hub is None:
             continue
+        outside_dest_country = 0 if uic[:2] == dest_country else 1
         detour = _haversine_km(*origin, *hub) + _haversine_km(*hub, *dest)
-        scored.append((detour, uic))
-    # Tie-break on UIC so the ordering is deterministic across runs.
-    scored.sort(key=lambda item: (item[0], item[1]))
-    return [uic for _, uic in scored]
+        scored.append((outside_dest_country, detour, uic))
+    scored.sort()  # (tier, detour, uic) — tier first, then proximity, then uic
+    return [uic for _tier, _detour, uic in scored]
 
 
 def _parse_iso(value: str) -> datetime:
