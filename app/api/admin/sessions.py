@@ -1895,6 +1895,51 @@ async def import_providers_from_nap(
 # ──── per-provider refresh endpoint (v0.1.6) ────
 
 
+async def _refresh_derived_provider(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    provider: dict[str, Any],
+    staging: Path,
+) -> RefreshSourcesResponse:
+    """Per-provider 'Refresh' for a cross_border_filter provider: re-run the
+    filter on the linked national feed into this provider's slot (it owns no URL
+    to download). Mirrors refresh_provider's state/staleness/audit tail."""
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    outcome = await _materialise_derived_provider(db, sid, provider, staging)
+    if outcome is not None:
+        bucket = fetched if outcome.get("status") == "fetched" else skipped
+        bucket.append({k: v for k, v in outcome.items() if k != "status"})
+
+    if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        session.state = SessionState.POPULATED.value
+    if fetched:
+        if session.config is None:
+            session.config = {}
+        staleness.mark_refresh_completed(session.config)
+        flag_modified(session, "config")
+
+    audit.record(
+        db,
+        action="session.provider.refreshed",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "provider_id": provider["id"],
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+        },
+    )
+    db.commit()
+    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
 @router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
 async def refresh_provider(
     sid: str,
@@ -1936,6 +1981,16 @@ async def refresh_provider(
 
     staging = settings.inbox_dir / sid / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
+
+    # Derived (cross_border_filter) providers own no URL — "Refresh this
+    # provider" re-runs the filter on the linked national feed into this
+    # provider's slot. Without this branch the URL path below 400s with
+    # "no URLs to refresh" (the error the operator hit).
+    provider = next(p for p in providers if p["id"] == pid)
+    if (provider.get("timetable") or {}).get("source") == "cross_border_filter":
+        return await _refresh_derived_provider(
+            db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
+        )
 
     work = _build_refresh_tasks(s.config or {}, only_provider=pid)
     if not work:

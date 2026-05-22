@@ -279,3 +279,24 @@ def test_upload_to_national_cascades_to_derived(
         routes = z.read("routes.txt").decode()
     assert "AVE-XB" in routes
     assert "AVE-DOM" not in routes
+
+
+def test_per_provider_refresh_runs_filter_for_derived(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    # "Refresh this provider" on a derived provider must run the filter, not
+    # 400 with "no URLs to refresh" (the operator-reported bug).
+    _stage_national_feed(inbox, session_id="nap-es-rail", provider_id="RENFE")
+    sid = "eu-corridors-per-provider"
+    _make_corridors_session(
+        client, admin, sid, derived_from={"session_id": "nap-es-rail", "provider_id": "RENFE"}
+    )
+
+    r = client.post(f"/api/sessions/{sid}/providers/RENFE-XB/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    out_slot = inbox / sid / "gtfs" / "renfe-xb.zip"
+    assert out_slot.is_file()
+    fetched = {f["key"]: f for f in body["fetched"]}
+    assert "provider[RENFE-XB].cross_border_filter" in fetched
