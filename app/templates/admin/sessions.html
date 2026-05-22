@@ -836,13 +836,15 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
             <div class="prov-grid-3">
               <div>
                 <label>From session <span class="hint">(national feed)</span></label>
-                <input class="prov-derived-session" type="text" value="${escAttr(df.session_id)}"
-                       placeholder="nap-sp-rail">
+                <select class="prov-derived-session" data-value="${escAttr(df.session_id)}">
+                  <option value="${escAttr(df.session_id)}" selected>${escHTML(df.session_id || '— choose national session —')}</option>
+                </select>
               </div>
               <div>
                 <label>From provider <span class="hint">(its feedId)</span></label>
-                <input class="prov-derived-provider" type="text" value="${escAttr(df.provider_id)}"
-                       placeholder="RENFE" pattern="^[A-Z][A-Z0-9_-]{1,15}$">
+                <select class="prov-derived-provider" data-value="${escAttr(df.provider_id)}">
+                  <option value="${escAttr(df.provider_id)}" selected>${escHTML(df.provider_id || '— choose provider —')}</option>
+                </select>
               </div>
               <div>
                 <label>Home country <span class="hint">(ISO 2, optional)</span></label>
@@ -859,6 +861,58 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
               (re)build it. The national feed must already be loaded on its own session.
             </p>
           </div>`;
+}
+
+// §12 — derived-card pickers. The "From session / From provider" fields are
+// <select>s filled from the live session list (one cached fetch), so the link
+// can't be mistyped. The saved value is preserved even if it's no longer in the
+// list (renders as "<id> (not found)") so a bad/stale link is visible, not lost.
+let _derivedSessionsCache = null;
+async function derivedSessions() {
+  if (_derivedSessionsCache) return _derivedSessionsCache;
+  try {
+    const r = await fetch('/api/sessions');
+    _derivedSessionsCache = r.ok ? await r.json() : [];
+  } catch { _derivedSessionsCache = []; }
+  return _derivedSessionsCache;
+}
+
+function providersOfSession(session) {
+  const provs = session && session.config && session.config.sources
+    ? session.config.sources.providers : null;
+  return Array.isArray(provs) ? provs : [];
+}
+
+function _selectOptions(items, saved) {
+  // items: [{value, label}]. Keep `saved` selectable even when absent.
+  const opts = items.map(it => `<option value="${escAttr(it.value)}">${escHTML(it.label)}</option>`);
+  if (saved && !items.some(it => it.value === saved)) {
+    opts.push(`<option value="${escAttr(saved)}">${escHTML(saved + ' (not found)')}</option>`);
+  }
+  return opts.join('');
+}
+
+function fillDerivedProviderSelect(provSel, session, saved) {
+  const items = providersOfSession(session).map(p => ({
+    value: p.id, label: (p.label && p.label !== p.id) ? `${p.id} — ${p.label}` : p.id,
+  }));
+  provSel.innerHTML = `<option value="">— choose provider —</option>` + _selectOptions(items, saved);
+  provSel.value = saved || '';
+}
+
+async function populateDerivedCard(card) {
+  const sessSel = card.querySelector('.prov-derived-session');
+  const provSel = card.querySelector('.prov-derived-provider');
+  if (!sessSel || !provSel) return;
+  const savedSession = sessSel.dataset.value || '';
+  const savedProvider = provSel.dataset.value || '';
+  const sessions = await derivedSessions();
+  const items = sessions.map(s => ({
+    value: s.id, label: (s.name && s.name !== s.id) ? `${s.id} — ${s.name}` : s.id,
+  }));
+  sessSel.innerHTML = `<option value="">— choose national session —</option>` + _selectOptions(items, savedSession);
+  sessSel.value = savedSession;
+  fillDerivedProviderSelect(provSel, sessions.find(s => s.id === savedSession), savedProvider);
 }
 
 function providerCardHTML(p, opts) {
@@ -1139,6 +1193,10 @@ function populateProvidersList(form, sources) {
     rows.insertAdjacentHTML('beforeend', providerCardHTML(p, {openByDefault: i === 0})),
   );
   syncProvidersToolbar(form);
+  // §12 — fill any derived-card session/provider dropdowns from the live list.
+  rows.querySelectorAll('.provider-card').forEach((c) => {
+    if (c.querySelector('.prov-derived-session')) populateDerivedCard(c);
+  });
 }
 
 // v0.1.12: show/hide the Expand-all/Collapse-all toolbar based on whether
@@ -1406,10 +1464,24 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     if (urlRow) urlRow.hidden = src !== 'url';
     if (upRow) upRow.hidden = src !== 'upload';
     if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
+    // First switch to cross_border_filter on a card that hasn't been populated
+    // yet (e.g. a freshly-added provider) fills the session/provider dropdowns.
+    if (src === 'cross_border_filter') populateDerivedCard(card);
     // Only "upload" has nothing to fetch on refresh; "url" downloads and
     // "cross_border_filter" runs the filter, so both keep the refresh button.
     const refreshBtn = card.querySelector('.prov-refresh-btn');
     if (refreshBtn) refreshBtn.hidden = src === 'upload';
+  });
+  // §12 — cascade: choosing a national session refills its provider dropdown.
+  form.addEventListener('change', async (e) => {
+    if (!e.target.matches('.prov-derived-session')) return;
+    const card = e.target.closest('.provider-card');
+    const provSel = card && card.querySelector('.prov-derived-provider');
+    if (!provSel) return;
+    e.target.dataset.value = e.target.value;  // remember the new pick
+    provSel.dataset.value = '';
+    const sessions = await derivedSessions();
+    fillDerivedProviderSelect(provSel, sessions.find(s => s.id === e.target.value), '');
   });
   // Live-update each provider card's summary as id/label/country change.
   form.addEventListener('input', (e) => {
