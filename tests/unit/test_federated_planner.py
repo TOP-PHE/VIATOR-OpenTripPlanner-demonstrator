@@ -112,6 +112,32 @@ def test_rank_hubs_deterministic_tie_break_on_uic():
     assert fp.rank_hubs({"a", "b"}, coords, "o", "d") == ["a", "b"]
 
 
+def test_rank_hubs_prefers_destination_country_over_lower_detour():
+    # Paris (FR) -> Fribourg (CH). Besancon (FR, 87) is geometrically closer to
+    # the straight line (lower detour) than Basel (CH, 85), but cutting in France
+    # forces the Swiss spoke to backtrack — so the CH hub must rank first.
+    coords = {
+        "8768600": (48.844, 2.374),  # Paris (FR)
+        "8504200": (46.803, 7.151),  # Fribourg (CH)
+        "8730086": (47.308, 5.954),  # Besancon-Franche-Comte TGV (FR) — lower detour
+        "8500010": (47.547, 7.589),  # Basel SBB (CH) — higher detour
+    }
+    out = fp.rank_hubs({"8730086", "8500010"}, coords, "8768600", "8504200")
+    assert out == ["8500010", "8730086"]  # CH gateway first despite the longer detour
+
+
+def test_rank_hubs_within_dest_country_orders_by_detour():
+    # Both hubs are Swiss (85): the closer-to-route one wins.
+    coords = {
+        "8768600": (48.844, 2.374),  # Paris (FR)
+        "8504200": (46.803, 7.151),  # Fribourg (CH)
+        "8507000": (46.949, 7.439),  # Bern (CH) — ~30 km from Fribourg
+        "8501008": (46.210, 6.142),  # Geneve (CH) — farther
+    }
+    out = fp.rank_hubs({"8501008", "8507000"}, coords, "8768600", "8504200")
+    assert out == ["8507000", "8501008"]  # Bern (nearer the line) before Geneve
+
+
 # ──────────────────────── earliest_next_departure ────────────────────────
 
 
