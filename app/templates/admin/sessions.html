@@ -1259,7 +1259,7 @@ async function refreshOneProvider(form, refreshBtn) {
       return;
     }
     const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-    const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+    const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
     showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
     if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
@@ -1556,7 +1556,7 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       const body = await r.json().catch(() => ({}));
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
       showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
       if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
       // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
@@ -1588,7 +1588,7 @@ document.querySelectorAll('button[data-action="refresh-osm"]').forEach(btn => {
       const body = await r.json().catch(() => ({}));
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
       const rotated = (body.rotated || []).join('; ');
       const parts = [`Fetched: ${fetched}`];
       if (skipped) parts.push(`Skipped: ${skipped}`);
