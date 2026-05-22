@@ -14,6 +14,7 @@ Phase-A.5 wiring (this file):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -960,6 +961,17 @@ async def refresh_sources(
             else:
                 skipped.append({k: v for k, v in outcome.items() if k != "status"})
 
+    # Derived providers (source == "cross_border_filter"): no URL to download —
+    # instead run the cross-border filter on the linked national feed into this
+    # provider's slot. Done after the URL downloads so a same-session
+    # national+derived pair resolves in one refresh. See
+    # docs/provider-source-modes-design.md §12.
+    for outcome in await _run_derived_filters(db, sid, s.config or {}, staging):
+        if outcome.get("status") == "fetched":
+            fetched.append({k: v for k, v in outcome.items() if k != "status"})
+        else:
+            skipped.append({k: v for k, v in outcome.items() if k != "status"})
+
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
 
@@ -1278,6 +1290,82 @@ def _build_refresh_tasks(
         tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks
+
+
+async def _run_derived_filters(
+    db: DbSession, sid: str, config: dict[str, Any], staging: Path
+) -> list[dict[str, Any]]:
+    """Materialise every `cross_border_filter` provider in this session.
+
+    A derived provider owns no feed of its own: it links to a national
+    provider's slot in another session and runs the cross-border filter on it
+    into its own slot. The CPU/IO-bound filter runs in a worker thread (it
+    touches no DB); `dispatch` (which does touch the DB) runs on the event loop.
+    See docs/provider-source-modes-design.md §12.
+    """
+    from app import gtfs_cross_border_filter as xb
+
+    try:
+        providers = ingestion.normalize_providers(config)
+    except ValueError:
+        return []
+
+    gtfs_kind = ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"]
+    outcomes: list[dict[str, Any]] = []
+    for p in providers:
+        tt = p.get("timetable") or {}
+        if tt.get("source") != "cross_border_filter":
+            continue
+        pid = p["id"]
+        key = f"provider[{pid}].cross_border_filter"
+        df = tt.get("derived_from") or {}
+        src_session, src_provider = df.get("session_id"), df.get("provider_id")
+        src_slot = (
+            settings.inbox_dir
+            / str(src_session)
+            / "gtfs"
+            / ingestion.gtfs_staged_filename(str(src_provider))
+        )
+        if not src_slot.exists():
+            outcomes.append(
+                {
+                    "status": "skipped",
+                    "key": key,
+                    "error": f"source feed not found: {src_session}/{src_provider} "
+                    "(refresh that session first)",
+                }
+            )
+            continue
+        out_tmp = staging / f"{pid.lower()}-xb.zip"
+        try:
+            stats = await asyncio.to_thread(
+                xb.filter_to_cross_border,
+                src_slot,
+                out_tmp,
+                rail_only=bool(tt.get("rail_only", True)),
+                home_country=tt.get("home_country"),
+            )
+        except Exception as exc:  # a malformed source feed shouldn't 500 the refresh
+            log.warning("cross-border filter for %s/%s failed: %s", sid, pid, exc)
+            outcomes.append({"status": "skipped", "key": key, "error": f"filter failed: {exc}"})
+            continue
+        ingestion.dispatch(
+            out_tmp,
+            gtfs_kind,
+            db,
+            session_id=sid,
+            staged_filename=ingestion.gtfs_staged_filename(pid),
+        )
+        outcomes.append(
+            {
+                "status": "fetched",
+                "key": key,
+                "routes_kept": stats.routes_kept,
+                "trips_kept": stats.trips_kept,
+                "summary": stats.summary_line(),
+            }
+        )
+    return outcomes
 
 
 # v0.1.19 — pure state-derivation helper. Lives alongside `_build_refresh_tasks`

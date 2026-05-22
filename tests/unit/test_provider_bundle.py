@@ -307,6 +307,93 @@ class TestTimetableSource:
             )
 
 
+class TestCrossBorderFilterSource:
+    """§12 — the `cross_border_filter` derived-provider source (single source
+    of truth: a link to a national provider + filter params, no feed of its own)."""
+
+    @staticmethod
+    def _one(timetable: dict) -> dict:
+        from app.ingestion import normalize_providers
+
+        out = normalize_providers(
+            {"sources": {"providers": [{"id": "RENFE-XB", "timetable": timetable}]}}
+        )
+        return out[0]["timetable"]
+
+    def test_valid_link_and_params_preserved(self):
+        tt = self._one(
+            {
+                "format": "gtfs",
+                "source": "cross_border_filter",
+                "derived_from": {"session_id": "nap-sp-rail", "provider_id": "RENFE"},
+                "home_country": "es",  # lower-cased on input
+                "rail_only": True,
+            }
+        )
+        assert tt["source"] == "cross_border_filter"
+        assert tt["derived_from"] == {"session_id": "nap-sp-rail", "provider_id": "RENFE"}
+        assert tt["home_country"] == "ES"  # normalised upper
+        assert tt["rail_only"] is True
+        assert "url" not in tt
+
+    def test_rail_only_defaults_true(self):
+        tt = self._one(
+            {
+                "format": "gtfs",
+                "source": "cross_border_filter",
+                "derived_from": {"session_id": "nap-sp-rail", "provider_id": "RENFE"},
+            }
+        )
+        assert tt["rail_only"] is True
+        assert "home_country" not in tt  # optional — both directions kept
+
+    def test_missing_derived_from_rejected(self):
+        with pytest.raises(ValueError, match=r"derived_from"):
+            self._one({"format": "gtfs", "source": "cross_border_filter"})
+
+    def test_missing_source_session_rejected(self):
+        with pytest.raises(ValueError, match=r"derived_from\.session_id"):
+            self._one(
+                {
+                    "format": "gtfs",
+                    "source": "cross_border_filter",
+                    "derived_from": {"provider_id": "RENFE"},
+                }
+            )
+
+    def test_bad_provider_id_rejected(self):
+        with pytest.raises(ValueError, match=r"derived_from\.provider_id"):
+            self._one(
+                {
+                    "format": "gtfs",
+                    "source": "cross_border_filter",
+                    "derived_from": {"session_id": "nap-sp-rail", "provider_id": "not a feed id"},
+                }
+            )
+
+    def test_bad_home_country_rejected(self):
+        with pytest.raises(ValueError, match=r"home_country"):
+            self._one(
+                {
+                    "format": "gtfs",
+                    "source": "cross_border_filter",
+                    "derived_from": {"session_id": "nap-sp-rail", "provider_id": "RENFE"},
+                    "home_country": "Spain",
+                }
+            )
+
+    def test_non_bool_rail_only_rejected(self):
+        with pytest.raises(ValueError, match=r"rail_only"):
+            self._one(
+                {
+                    "format": "gtfs",
+                    "source": "cross_border_filter",
+                    "derived_from": {"session_id": "nap-sp-rail", "provider_id": "RENFE"},
+                    "rail_only": "yes",
+                }
+            )
+
+
 def test_staged_filename_for_format():
     from app.ingestion import staged_filename_for_format
 
