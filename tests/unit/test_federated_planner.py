@@ -251,6 +251,71 @@ def _otp_leg(frm, to, route, dep, arr):
     }
 
 
+# ──────────────────────── feed-id / stop-id helpers ────────────────────────
+
+
+def test_primary_feed_id_reads_first_provider():
+    s = types.SimpleNamespace(config={"sources": {"providers": [{"id": "SBB"}, {"id": "DB"}]}})
+    assert fp._primary_feed_id(s) == "SBB"
+
+
+def test_primary_feed_id_none_when_missing():
+    assert fp._primary_feed_id(types.SimpleNamespace(config={})) is None
+    assert fp._primary_feed_id(types.SimpleNamespace()) is None  # no config attr at all
+
+
+def test_stop_id_builds_namespaced_or_none():
+    assert fp._stop_id("SBB", "8500010") == "SBB:8500010"
+    assert fp._stop_id(None, "8500010") is None
+
+
+async def test_plan_federated_forwards_namespaced_stop_ids(monkeypatch):
+    """Each leg should route by `<feedId>:<uic>` for its own session's feed."""
+    origin, hub, dest = "8768600", "8500010", "8504200"
+    corr = types.SimpleNamespace(id="corr", config={"sources": {"providers": [{"id": "SNCF"}]}})
+    ch = types.SimpleNamespace(id="ch", config={"sources": {"providers": [{"id": "SBB"}]}})
+    monkeypatch.setattr(
+        fp, "_session_served_uics", lambda s: {"corr": {origin, hub}, "ch": {hub, dest}}[s.id]
+    )
+    rows = [
+        types.SimpleNamespace(uic=origin, latitude=48.84, longitude=2.37),
+        types.SimpleNamespace(uic=hub, latitude=47.55, longitude=7.59),
+        types.SimpleNamespace(uic=dest, latitude=46.80, longitude=7.15),
+    ]
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    from app.journey import otp_client
+
+    async def _fake(*, session_id, from_stop_id=None, to_stop_id=None, **_kw):
+        seen.append((session_id, from_stop_id, to_stop_id))
+        return (
+            {},
+            [
+                {
+                    "departure_at": "2026-05-22T08:00:00Z",
+                    "arrival_at": "2026-05-22T09:00:00Z",
+                    "num_transfers": 0,
+                    "modes": "RAIL",
+                    "legs": [
+                        _otp_leg("a", "b", "R", "2026-05-22T08:00:00Z", "2026-05-22T09:00:00Z")
+                    ],
+                }
+            ],
+        )
+
+    monkeypatch.setattr(otp_client, "fetch_plan", _fake)
+    await fp.plan_federated(
+        _FakeDb(rows),
+        origin_uic=origin,
+        dest_uic=dest,
+        when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+        sessions=[corr, ch],
+        timeout_ms=5000,
+    )
+    assert ("corr", "SNCF:8768600", "SNCF:8500010") in seen  # leg1 on corridors feed
+    assert ("ch", "SBB:8500010", "SBB:8504200") in seen  # leg2 on Swiss feed
+
+
 async def test_plan_federated_stitches_paris_fribourg(monkeypatch):
     origin, hub, dest = "8768600", "8500010", "8504200"  # Paris, Basel, Fribourg
     corr = types.SimpleNamespace(id="nap-eu-corridors")
