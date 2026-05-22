@@ -64,6 +64,54 @@ def test_connection_hubs_is_intersection():
     assert fp.connection_hubs({"a"}, {"b"}) == set()
 
 
+# ──────────────────────── rank_hubs (proximity) ────────────────────────
+
+
+# Paris Gare de Lyon, Basel SBB, Bern, Zürich HB, Prague hl.n. — real-ish coords.
+_PARIS = (48.844, 2.374)
+_FRIBOURG = (46.803, 7.151)
+_BASEL = (47.547, 7.589)  # on the Paris->Fribourg line
+_ZURICH = (47.378, 8.540)  # east of the line
+_PRAGUE = (50.083, 14.435)  # far off-route (the 5457076-style junk hub)
+_COORDS = {
+    "paris": _PARIS,
+    "frib": _FRIBOURG,
+    "8500010": _BASEL,
+    "zurich": _ZURICH,
+    "prague": _PRAGUE,
+}
+
+
+def test_haversine_km_known_distance():
+    # Paris -> Basel great-circle is ~412 km; allow a few km of slack.
+    d = fp._haversine_km(*_PARIS, *_BASEL)
+    assert 405 < d < 420
+
+
+def test_rank_hubs_orders_by_detour_basel_first():
+    # Basel sits on the Paris->Fribourg line; Zürich detours east; Prague is
+    # way off-route. Proximity ranking must surface Basel first and Prague last.
+    out = fp.rank_hubs({"8500010", "zurich", "prague"}, _COORDS, "paris", "frib")
+    assert out[0] == "8500010"
+    assert out[-1] == "prague"
+
+
+def test_rank_hubs_drops_hubs_without_coords():
+    out = fp.rank_hubs({"8500010", "no-coords"}, _COORDS, "paris", "frib")
+    assert out == ["8500010"]
+
+
+def test_rank_hubs_empty_when_endpoints_lack_coords():
+    assert fp.rank_hubs({"8500010"}, _COORDS, "missing-origin", "frib") == []
+    assert fp.rank_hubs({"8500010"}, _COORDS, "paris", "missing-dest") == []
+
+
+def test_rank_hubs_deterministic_tie_break_on_uic():
+    # Two hubs at the same point ⇒ identical detour ⇒ sorted by UIC string.
+    coords = {"o": (0.0, 0.0), "d": (0.0, 2.0), "b": (0.0, 1.0), "a": (0.0, 1.0)}
+    assert fp.rank_hubs({"a", "b"}, coords, "o", "d") == ["a", "b"]
+
+
 # ──────────────────────── earliest_next_departure ────────────────────────
 
 
