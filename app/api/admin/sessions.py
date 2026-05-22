@@ -1895,6 +1895,47 @@ async def import_providers_from_nap(
 # ──── per-provider refresh endpoint (v0.1.6) ────
 
 
+_AUDIT_ACTION_PROVIDER_REFRESHED = "session.provider.refreshed"
+
+
+def _finalise_provider_refresh(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    pid: str,
+    fetched: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> RefreshSourcesResponse:
+    """Shared tail for both per-provider refresh paths: advance state, clear the
+    staleness flag (lossy-by-design — see refresh_sources), audit, commit."""
+    if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        session.state = SessionState.POPULATED.value
+    if fetched:
+        if session.config is None:
+            session.config = {}
+        staleness.mark_refresh_completed(session.config)
+        flag_modified(session, "config")
+
+    audit.record(
+        db,
+        action=_AUDIT_ACTION_PROVIDER_REFRESHED,
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "provider_id": pid,
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+        },
+    )
+    db.commit()
+    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
 async def _refresh_derived_provider(
     db: DbSession,
     *,
@@ -1907,37 +1948,62 @@ async def _refresh_derived_provider(
 ) -> RefreshSourcesResponse:
     """Per-provider 'Refresh' for a cross_border_filter provider: re-run the
     filter on the linked national feed into this provider's slot (it owns no URL
-    to download). Mirrors refresh_provider's state/staleness/audit tail."""
+    to download)."""
     fetched: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     outcome = await _materialise_derived_provider(db, sid, provider, staging)
     if outcome is not None:
         bucket = fetched if outcome.get("status") == "fetched" else skipped
         bucket.append({k: v for k, v in outcome.items() if k != "status"})
-
-    if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-        session.state = SessionState.POPULATED.value
-    if fetched:
-        if session.config is None:
-            session.config = {}
-        staleness.mark_refresh_completed(session.config)
-        flag_modified(session, "config")
-
-    audit.record(
+    return _finalise_provider_refresh(
         db,
-        action="session.provider.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "provider_id": provider["id"],
-            "fetched": [f["key"] for f in fetched],
-            "skipped": [s_["key"] for s_ in skipped],
-        },
+        request=request,
+        actor=actor,
+        session=session,
+        sid=sid,
+        pid=provider["id"],
+        fetched=fetched,
+        skipped=skipped,
     )
-    db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
+async def _refresh_provider_urls(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    pid: str,
+    staging: Path,
+) -> RefreshSourcesResponse:
+    """Per-provider 'Refresh' for a url-source provider: download its timetable +
+    optional MCT + stations CSV into the slot."""
+    work = _build_refresh_tasks(session.config or {}, only_provider=pid)
+    if not work:
+        raise HTTPException(
+            400,
+            f"Provider {pid!r} has no URLs to refresh "
+            "(no timetable, MCT, or stations CSV configured).",
+        )
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            outcome = await _refresh_one_task(client, db, sid, staging, task)
+            (fetched if outcome.get("status") == "fetched" else skipped).append(
+                {k: v for k, v in outcome.items() if k != "status"}
+            )
+    return _finalise_provider_refresh(
+        db,
+        request=request,
+        actor=actor,
+        session=session,
+        sid=sid,
+        pid=pid,
+        fetched=fetched,
+        skipped=skipped,
+    )
 
 
 @router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
@@ -1948,17 +2014,13 @@ async def refresh_provider(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
-    """Download just one provider's files (timetable + optional MCT + optional
-    stations CSV). Doesn't touch the session-level OSM PBF — different concern,
-    much heavier file.
+    """Refresh one provider. URL-source providers download their files; a
+    cross_border_filter (derived) provider re-runs the filter on its linked
+    national feed. Doesn't touch the session-level OSM PBF — different, heavier
+    concern.
 
     Use case: operator just added IDFM to a session that already has SNCF
-    serving live. They click "Refresh" on IDFM's card and only IDFM's URLs
-    are fetched. SNCF stays live without unnecessary re-download.
-
-    Side effect: dispatch() queues a rebuild iff a routable kind landed
-    (GTFS or NeTEx). Worker debounces and runs phase-1-cached / phase-2 only
-    in v0.1.7 once streetGraph caching ships; today still runs both phases.
+    serving live. They click "Refresh" on IDFM's card and only IDFM is touched.
     """
     s = db.get(SessionRow, sid)
     if s is None:
@@ -1972,7 +2034,8 @@ async def refresh_provider(
         providers = ingestion.normalize_providers(s.config or {})
     except ValueError as exc:
         raise HTTPException(400, f"Session config is invalid: {exc}") from exc
-    if not any(p["id"] == pid for p in providers):
+    provider = next((p for p in providers if p["id"] == pid), None)
+    if provider is None:
         raise HTTPException(
             404,
             f"Provider {pid!r} not found in session {sid!r}. "
@@ -1982,61 +2045,15 @@ async def refresh_provider(
     staging = settings.inbox_dir / sid / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
 
-    # Derived (cross_border_filter) providers own no URL — "Refresh this
-    # provider" re-runs the filter on the linked national feed into this
-    # provider's slot. Without this branch the URL path below 400s with
-    # "no URLs to refresh" (the error the operator hit).
-    provider = next(p for p in providers if p["id"] == pid)
+    # Derived providers own no URL — "Refresh this provider" re-runs the filter
+    # instead of downloading (without this the URL path 400s "no URLs to refresh").
     if (provider.get("timetable") or {}).get("source") == "cross_border_filter":
         return await _refresh_derived_provider(
             db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
         )
-
-    work = _build_refresh_tasks(s.config or {}, only_provider=pid)
-    if not work:
-        raise HTTPException(
-            400,
-            f"Provider {pid!r} has no URLs to refresh "
-            "(no timetable, MCT, or stations CSV configured).",
-        )
-
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            outcome = await _refresh_one_task(client, db, sid, staging, task)
-            (fetched if outcome.get("status") == "fetched" else skipped).append(
-                {k: v for k, v in outcome.items() if k != "status"}
-            )
-
-    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-        s.state = SessionState.POPULATED.value
-
-    # Same staleness clear as the session-wide refresh — see refresh_sources
-    # for the lossy-by-design caveat (per-provider refresh clears the flag
-    # globally, even if other providers' URLs were also edited but not yet
-    # re-downloaded).
-    if fetched:
-        if s.config is None:
-            s.config = {}
-        staleness.mark_refresh_completed(s.config)
-        flag_modified(s, "config")
-
-    audit.record(
-        db,
-        action="session.provider.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "provider_id": pid,
-            "fetched": [f["key"] for f in fetched],
-            "skipped": [s_["key"] for s_ in skipped],
-        },
+    return await _refresh_provider_urls(
+        db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
-    db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
 
 
 # ───────────────────────── per-provider status (v0.1.19) ─────────────────────
@@ -2088,7 +2105,7 @@ def get_providers_status(
         .where(
             AuditEvent.target_kind == "session",
             AuditEvent.target_id == sid,
-            AuditEvent.action.in_(["session.sources.refreshed", "session.provider.refreshed"]),
+            AuditEvent.action.in_(["session.sources.refreshed", _AUDIT_ACTION_PROVIDER_REFRESHED]),
         )
         .order_by(desc(AuditEvent.ts))
         .limit(1)
