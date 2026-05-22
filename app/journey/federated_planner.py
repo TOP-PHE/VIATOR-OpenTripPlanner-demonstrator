@@ -24,6 +24,7 @@ The pure helpers (`served_uics`, `connection_hubs`, `assemble_stitch`,
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -193,6 +194,129 @@ def invalidate_served_uics_cache(session_id: str | None = None) -> None:
 
 
 # ───────────────────────────── orchestration ───────────────────────────────
+@dataclass(frozen=True)
+class _LegContext:
+    """Shared inputs for the per-leg OTP calls (passed down so the helpers stay
+    free of closures and each keeps a low, independently-measured complexity)."""
+
+    coords: dict[str, tuple[float, float]]
+    timeout_ms: int
+    tz_for: dict[str, str | None]
+
+
+def _candidate_hubs(
+    origin_sessions: list[SessionRow],
+    dest_sessions: list[SessionRow],
+    served: dict[str, set[str]],
+) -> set[str]:
+    """Union of connection hubs across every (origin-session, dest-session) pair."""
+    hubs: set[str] = set()
+    for so in origin_sessions:
+        for sd in dest_sessions:
+            if so.id != sd.id:
+                hubs |= connection_hubs(served[so.id], served[sd.id])
+    return hubs
+
+
+def _resolve_coords(db: DbSession, wanted_uics: set[str]) -> dict[str, tuple[float, float]]:
+    """`(lat, lon)` for each requested UIC, from MasterStation.
+
+    We query OTP by coordinate (robust across a session's multiple providers,
+    whose feed-id prefixes differ from the hub's home feed).
+    """
+    from ..models import MasterStation
+
+    coords: dict[str, tuple[float, float]] = {}
+    for ms in db.query(MasterStation).filter(MasterStation.uic.in_(wanted_uics)).all():
+        if ms.latitude is not None and ms.longitude is not None:
+            coords[ms.uic] = (ms.latitude, ms.longitude)
+    return coords
+
+
+async def _fetch_leg(
+    ctx: _LegContext, session: SessionRow, frm: str, to: str, dep: datetime
+) -> list[dict[str, Any]]:
+    """One per-session OTP query by coordinate; `[]` on a missing endpoint or error."""
+    if frm not in ctx.coords or to not in ctx.coords:
+        return []
+    from . import otp_client
+
+    (flat, flon), (tlat, tlon) = ctx.coords[frm], ctx.coords[to]
+    try:
+        _raw, trips = await otp_client.fetch_plan(
+            session_id=session.id,
+            from_lat=flat,
+            from_lon=flon,
+            to_lat=tlat,
+            to_lon=tlon,
+            when=dep,
+            timeout_ms=ctx.timeout_ms,
+            session_timezone=ctx.tz_for.get(session.id),
+        )
+    except Exception as exc:  # network/OTP error on one leg shouldn't 500 the query
+        log.warning("federated leg %s %s->%s failed: %s", session.id, frm, to, exc)
+        return []
+    return trips
+
+
+async def _stitch_pair(
+    ctx: _LegContext,
+    so: SessionRow,
+    sd: SessionRow,
+    hubs: list[str],
+    *,
+    origin_uic: str,
+    dest_uic: str,
+    when: datetime,
+    mct_seconds: int,
+) -> list[dict[str, Any]]:
+    """Stitches for one session pair: origin->hub (so) then hub->dest (sd), per hub."""
+    out: list[dict[str, Any]] = []
+    for hub in hubs:
+        leg1 = await _fetch_leg(ctx, so, origin_uic, hub, when)
+        for t1 in leg1[:MAX_LEG1_OPTIONS]:
+            nxt = earliest_next_departure(t1["arrival_at"], mct_seconds)
+            leg2 = await _fetch_leg(ctx, sd, hub, dest_uic, nxt)
+            if leg2:
+                out.append(
+                    assemble_stitch([t1, leg2[0]], via_hubs=[hub], session_ids=[so.id, sd.id])
+                )
+    return out
+
+
+async def _collect_stitches(
+    ctx: _LegContext,
+    origin_sessions: list[SessionRow],
+    dest_sessions: list[SessionRow],
+    served: dict[str, set[str]],
+    *,
+    origin_uic: str,
+    dest_uic: str,
+    when: datetime,
+    mct_seconds: int,
+) -> list[dict[str, Any]]:
+    """Drive every distinct session pair through `_stitch_pair`, capped at MAX_HUBS."""
+    stitches: list[dict[str, Any]] = []
+    for so in origin_sessions:
+        for sd in dest_sessions:
+            if so.id == sd.id:
+                continue
+            hubs = sorted(connection_hubs(served[so.id], served[sd.id]) & ctx.coords.keys())
+            stitches.extend(
+                await _stitch_pair(
+                    ctx,
+                    so,
+                    sd,
+                    hubs[:MAX_HUBS],
+                    origin_uic=origin_uic,
+                    dest_uic=dest_uic,
+                    when=when,
+                    mct_seconds=mct_seconds,
+                )
+            )
+    return stitches
+
+
 async def plan_federated(
     db: DbSession,
     *,
@@ -214,75 +338,29 @@ async def plan_federated(
     if not origin_uic or not dest_uic or origin_uic == dest_uic:
         return []
 
-    from ..models import MasterStation
-
     served = {s.id: _session_served_uics(s) for s in sessions}
     origin_sessions = [s for s in sessions if origin_uic in served[s.id]]
     dest_sessions = [s for s in sessions if dest_uic in served[s.id]]
     if not origin_sessions or not dest_sessions:
         return []
 
-    # Resolve coordinates once for origin, destination, and all candidate hubs —
-    # we query OTP by coordinate (robust across a session's multiple providers,
-    # whose feed-id prefixes differ from the hub's home feed).
-    candidate_hubs: set[str] = set()
-    for so in origin_sessions:
-        for sd in dest_sessions:
-            if so.id != sd.id:
-                candidate_hubs |= connection_hubs(served[so.id], served[sd.id])
+    candidate_hubs = _candidate_hubs(origin_sessions, dest_sessions, served)
     if not candidate_hubs:
         return []
 
-    wanted_uics = {origin_uic, dest_uic} | candidate_hubs
-    coords: dict[str, tuple[float, float]] = {}
-    for ms in db.query(MasterStation).filter(MasterStation.uic.in_(wanted_uics)).all():
-        if ms.latitude is not None and ms.longitude is not None:
-            coords[ms.uic] = (ms.latitude, ms.longitude)
+    coords = _resolve_coords(db, {origin_uic, dest_uic} | candidate_hubs)
     if origin_uic not in coords or dest_uic not in coords:
         return []  # can't query OTP without endpoint coordinates
 
-    from . import otp_client
-
-    tz_for = session_timezone_for or {}
-
-    async def _leg(session: SessionRow, frm: str, to: str, dep: datetime) -> list[dict[str, Any]]:
-        if frm not in coords or to not in coords:
-            return []
-        (flat, flon), (tlat, tlon) = coords[frm], coords[to]
-        try:
-            _raw, trips = await otp_client.fetch_plan(
-                session_id=session.id,
-                from_lat=flat,
-                from_lon=flon,
-                to_lat=tlat,
-                to_lon=tlon,
-                when=dep,
-                timeout_ms=timeout_ms,
-                session_timezone=tz_for.get(session.id),
-            )
-        except Exception as exc:  # network/OTP error on one leg shouldn't 500 the query
-            log.warning("federated leg %s %s→%s failed: %s", session.id, frm, to, exc)
-            return []
-        return trips
-
-    stitches: list[dict[str, Any]] = []
-    for so in origin_sessions:
-        for sd in dest_sessions:
-            if so.id == sd.id:
-                continue
-            hubs = sorted(connection_hubs(served[so.id], served[sd.id]) & coords.keys())[:MAX_HUBS]
-            for hub in hubs:
-                leg1 = await _leg(so, origin_uic, hub, when)
-                for t1 in leg1[:MAX_LEG1_OPTIONS]:
-                    nxt = earliest_next_departure(t1["arrival_at"], mct_seconds)
-                    leg2 = await _leg(sd, hub, dest_uic, nxt)
-                    if leg2:
-                        stitches.append(
-                            assemble_stitch(
-                                [t1, leg2[0]],
-                                via_hubs=[hub],
-                                session_ids=[so.id, sd.id],
-                            )
-                        )
-
+    ctx = _LegContext(coords=coords, timeout_ms=timeout_ms, tz_for=session_timezone_for or {})
+    stitches = await _collect_stitches(
+        ctx,
+        origin_sessions,
+        dest_sessions,
+        served,
+        origin_uic=origin_uic,
+        dest_uic=dest_uic,
+        when=when,
+        mct_seconds=mct_seconds,
+    )
     return dedup_and_rank(stitches, existing_fingerprints=existing_fingerprints)
