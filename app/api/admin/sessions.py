@@ -691,6 +691,11 @@ async def upload_to_session(
     if s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
 
+    # §12 — uploading a national feed cascades to any cross-border views derived
+    # from it (same single-source-of-truth rule as refresh). The scan is cheap and
+    # finds nothing when this upload wasn't a provider feed something links to.
+    cascaded = await _cascade_derived_refresh(db, sid)
+
     audit.record(
         db,
         action="session.upload",
@@ -705,6 +710,7 @@ async def upload_to_session(
             "size_bytes": size,
             "triggered_rebuild": triggered,
             "provider_feed_id": provider_feed_id,
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
@@ -878,6 +884,10 @@ class RefreshSourcesResponse(BaseModel):
     # to the operator so they can verify the build picks up only the
     # currently-configured providers.
     orphaned: list[str] = []
+    # §12 — derived cross-border feeds in *other* sessions that were rebuilt
+    # because they link to a provider in this (national) session. Empty unless
+    # this refresh actually changed a national feed something derives from.
+    cascaded: list[dict[str, Any]] = []
 
 
 # v0.1.19 — per-provider fetch status, surfaced on the provider cards in the
@@ -958,6 +968,13 @@ async def refresh_sources(
         staleness.mark_refresh_completed(s.config)
         flag_modified(s, "config")
 
+    # §12 — single-source-of-truth cascade. When this session's feeds actually
+    # changed, re-derive every cross_border_filter provider (in other sessions)
+    # that's linked to a provider here. So refreshing the Renfe national feed
+    # automatically rebuilds the corridors cross-border view — no human has to
+    # remember the second one.
+    cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
+
     # PR #33 — sweep orphaned inbox files left behind by providers that
     # used to be in `sources.providers` but no longer are. Without this,
     # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
@@ -979,10 +996,13 @@ async def refresh_sources(
             "fetched": [f["key"] for f in fetched],
             "skipped": [s_["key"] for s_ in skipped],
             "orphaned": orphaned,  # PR #33
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped, orphaned=orphaned)
+    return RefreshSourcesResponse(
+        fetched=fetched, skipped=skipped, orphaned=orphaned, cascaded=cascaded
+    )
 
 
 # ──── OSM-only refresh (v0.1.14) ────
@@ -1265,82 +1285,122 @@ def _build_refresh_tasks(
     return tasks
 
 
-async def _run_derived_filters(
-    db: DbSession, sid: str, config: dict[str, Any], staging: Path
-) -> list[dict[str, Any]]:
-    """Materialise every `cross_border_filter` provider in this session.
+async def _materialise_derived_provider(
+    db: DbSession, target_sid: str, provider: dict[str, Any], staging: Path
+) -> dict[str, Any] | None:
+    """Run the cross-border filter for one derived provider into `target_sid`'s slot.
 
-    A derived provider owns no feed of its own: it links to a national
-    provider's slot in another session and runs the cross-border filter on it
-    into its own slot. The CPU/IO-bound filter runs in a worker thread (it
-    touches no DB); `dispatch` (which does touch the DB) runs on the event loop.
-    See docs/provider-source-modes-design.md §12.
+    Returns an outcome dict (fetched/skipped), or None when `provider` isn't a
+    `cross_border_filter` provider. The CPU/IO filter runs in a worker thread (it
+    touches no DB); `dispatch` (which does) runs on the event loop. See
+    docs/provider-source-modes-design.md §12.
     """
     from app import gtfs_cross_border_filter as xb
 
+    tt = provider.get("timetable") or {}
+    if tt.get("source") != "cross_border_filter":
+        return None
+    pid = provider["id"]
+    key = f"provider[{pid}].cross_border_filter"
+    df = tt.get("derived_from") or {}
+    src_session, src_provider = df.get("session_id"), df.get("provider_id")
+    src_slot = (
+        settings.inbox_dir
+        / str(src_session)
+        / "gtfs"
+        / ingestion.gtfs_staged_filename(str(src_provider))
+    )
+    if not src_slot.exists():
+        return {
+            "status": "skipped",
+            "key": key,
+            "error": f"source feed not found: {src_session}/{src_provider} (refresh that session first)",
+        }
+    out_tmp = staging / f"{pid.lower()}-xb.zip"
+    try:
+        stats = await asyncio.to_thread(
+            xb.filter_to_cross_border,
+            src_slot,
+            out_tmp,
+            rail_only=bool(tt.get("rail_only", True)),
+            home_country=tt.get("home_country"),
+        )
+    except Exception as exc:  # a malformed source feed shouldn't 500 the refresh
+        # Log only the exception type — session/provider ids + exc are operator-
+        # controlled (path/config/feed) so they don't belong raw in a log line
+        # (S5145). The full hint goes to the API response.
+        log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
+        return {"status": "skipped", "key": key, "error": f"filter failed: {exc}"}
+    ingestion.dispatch(
+        out_tmp,
+        ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
+        db,
+        session_id=target_sid,
+        staged_filename=ingestion.gtfs_staged_filename(pid),
+    )
+    return {
+        "status": "fetched",
+        "key": key,
+        "routes_kept": stats.routes_kept,
+        "trips_kept": stats.trips_kept,
+        "summary": stats.summary_line(),
+    }
+
+
+async def _run_derived_filters(
+    db: DbSession, sid: str, config: dict[str, Any], staging: Path
+) -> list[dict[str, Any]]:
+    """Materialise every `cross_border_filter` provider declared in this session."""
     try:
         providers = ingestion.normalize_providers(config)
     except ValueError:
         return []
-
-    gtfs_kind = ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"]
     outcomes: list[dict[str, Any]] = []
     for p in providers:
-        tt = p.get("timetable") or {}
-        if tt.get("source") != "cross_border_filter":
+        outcome = await _materialise_derived_provider(db, sid, p, staging)
+        if outcome is not None:
+            outcomes.append(outcome)
+    return outcomes
+
+
+def _is_derived_from(provider: dict[str, Any], source_session_id: str) -> bool:
+    """True if `provider` is a cross_border_filter feed linked to source_session_id."""
+    tt = provider.get("timetable") or {}
+    if tt.get("source") != "cross_border_filter":
+        return False
+    return (tt.get("derived_from") or {}).get("session_id") == source_session_id
+
+
+def _cascade_keys(cascaded: list[dict[str, Any]]) -> list[str]:
+    """Compact `target_session:key` labels for audit metadata."""
+    return [f"{c['target_session']}:{c['key']}" for c in cascaded]
+
+
+async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> list[dict[str, Any]]:
+    """Re-derive every `cross_border_filter` provider (in any *other* session)
+    linked to `source_session_id`.
+
+    The single-source-of-truth cascade: when a national feed refreshes, the
+    cross-border views derived from it rebuild automatically — no operator has
+    to remember to refresh the second feed. See provider-source-modes-design.md §12.
+    """
+    outcomes: list[dict[str, Any]] = []
+    for target in db.execute(select(SessionRow)).scalars().all():
+        if target.id == source_session_id:
             continue
-        pid = p["id"]
-        key = f"provider[{pid}].cross_border_filter"
-        df = tt.get("derived_from") or {}
-        src_session, src_provider = df.get("session_id"), df.get("provider_id")
-        src_slot = (
-            settings.inbox_dir
-            / str(src_session)
-            / "gtfs"
-            / ingestion.gtfs_staged_filename(str(src_provider))
-        )
-        if not src_slot.exists():
-            outcomes.append(
-                {
-                    "status": "skipped",
-                    "key": key,
-                    "error": f"source feed not found: {src_session}/{src_provider} "
-                    "(refresh that session first)",
-                }
-            )
-            continue
-        out_tmp = staging / f"{pid.lower()}-xb.zip"
         try:
-            stats = await asyncio.to_thread(
-                xb.filter_to_cross_border,
-                src_slot,
-                out_tmp,
-                rail_only=bool(tt.get("rail_only", True)),
-                home_country=tt.get("home_country"),
-            )
-        except Exception as exc:  # a malformed source feed shouldn't 500 the refresh
-            # Log only the exception type — sid/pid/exc are operator-controlled
-            # (path param + config + feed-derived) so they don't belong raw in a
-            # log line (S5145). The full hint goes to the API response below.
-            log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
-            outcomes.append({"status": "skipped", "key": key, "error": f"filter failed: {exc}"})
+            providers = ingestion.normalize_providers(target.config or {})
+        except ValueError:
             continue
-        ingestion.dispatch(
-            out_tmp,
-            gtfs_kind,
-            db,
-            session_id=sid,
-            staged_filename=ingestion.gtfs_staged_filename(pid),
-        )
-        outcomes.append(
-            {
-                "status": "fetched",
-                "key": key,
-                "routes_kept": stats.routes_kept,
-                "trips_kept": stats.trips_kept,
-                "summary": stats.summary_line(),
-            }
-        )
+        linked = [p for p in providers if _is_derived_from(p, source_session_id)]
+        if not linked:
+            continue
+        staging = settings.inbox_dir / target.id / "_staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        for p in linked:
+            outcome = await _materialise_derived_provider(db, target.id, p, staging)
+            if outcome is not None:
+                outcomes.append({**outcome, "target_session": target.id})
     return outcomes
 
 

@@ -221,3 +221,61 @@ def test_refresh_skips_when_source_feed_missing(
     key = "provider[RENFE-XB].cross_border_filter"
     assert key in skipped
     assert "source feed not found" in skipped[key]["error"]
+
+
+def _make_national_session(
+    client: TestClient, admin: dict[str, str], sid: str, provider_id: str
+) -> None:
+    r = client.post(
+        "/api/sessions",
+        headers=admin,
+        json={"id": sid, "name": "ES national", "category": "NAP", "config": {}},
+    )
+    assert r.status_code == 201, r.text
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    with SessionLocal() as db:
+        s = db.get(SessionRow, sid)
+        assert s is not None
+        s.config = {
+            "sources": {
+                "providers": [
+                    {"id": provider_id, "timetable": {"format": "gtfs", "source": "upload"}}
+                ]
+            }
+        }
+        flag_modified(s, "config")
+        db.commit()
+
+
+def test_upload_to_national_cascades_to_derived(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    # §12 single-source-of-truth cascade: uploading the national feed should
+    # auto-rebuild the cross-border view derived from it in another session.
+    _make_national_session(client, admin, "nap-es-rail", "RENFE")
+    sid = "eu-corridors-cascade"
+    _make_corridors_session(
+        client, admin, sid, derived_from={"session_id": "nap-es-rail", "provider_id": "RENFE"}
+    )
+
+    r = client.post(
+        "/api/sessions/nap-es-rail/uploads",
+        headers=admin,
+        data={"declared_standard": "GTFS", "provider_id": "RENFE"},
+        files={"file": ("renfe.zip", _cross_border_gtfs_bytes(), "application/zip")},
+    )
+    assert r.status_code == 201, r.text
+
+    # The cascade materialised the corridors cross-border subset — no separate
+    # refresh of the corridors session needed.
+    out_slot = inbox / sid / "gtfs" / "renfe-xb.zip"
+    assert out_slot.is_file()
+    with zipfile.ZipFile(out_slot) as z:
+        routes = z.read("routes.txt").decode()
+    assert "AVE-XB" in routes
+    assert "AVE-DOM" not in routes
