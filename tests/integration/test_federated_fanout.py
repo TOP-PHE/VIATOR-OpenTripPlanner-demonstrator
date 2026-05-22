@@ -82,9 +82,14 @@ def admin(client: TestClient) -> dict[str, str]:
 def _make_serving_session(sid: str) -> None:
     from app.db import SessionLocal
     from app.models import Session as SessionRow
+    from app.models.identity import User
     from app.models.sessions import SessionState
 
     with SessionLocal() as db:
+        # `created_by` is NOT NULL → reuse the bootstrapped platform user
+        # (the `admin` fixture runs before the test body, so one exists).
+        creator = db.query(User).first()
+        assert creator is not None, "admin fixture must bootstrap a user first"
         db.add(
             SessionRow(
                 id=sid,
@@ -92,6 +97,7 @@ def _make_serving_session(sid: str) -> None:
                 category="NAP",
                 state=SessionState.SERVING.value,
                 include_in_fanout=True,
+                created_by=creator.id,
                 config={"sources": {"providers": [{"id": "SNCF-XB"}]}},
             )
         )
