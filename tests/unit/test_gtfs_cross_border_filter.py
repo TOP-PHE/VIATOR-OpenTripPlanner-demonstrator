@@ -897,3 +897,172 @@ class TestTransferTripRefs:
         assert len(rows) == 1
         assert rows[0]["from_stop_id"] == "8700001"
         assert rows[0]["to_stop_id"] == "8500001"
+
+
+def _build_renfe_style_gtfs(path: Path) -> None:
+    """A Renfe-flavoured feed: 5-digit *non-UIC* stop_ids (the codes Renfe
+    actually publishes), but real coordinates that span ES + FR. The UIC
+    detector sees nothing — only point-in-polygon on the coordinates reveals the
+    crossing. Barcelona->Lyon (ES->FR) must be kept; Barcelona->Madrid dropped.
+    """
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "agency.txt",
+            _csv(
+                ["agency_id", "agency_name", "agency_url", "agency_timezone"],
+                [
+                    {
+                        "agency_id": "RENFE",
+                        "agency_name": "Renfe",
+                        "agency_url": "https://renfe.es",
+                        "agency_timezone": "Europe/Madrid",
+                    }
+                ],
+            ),
+        )
+        stops = [
+            # 5-digit codes — none parse as a UIC country prefix (need 7-8 digits)
+            {
+                "stop_id": "17000",
+                "stop_name": "Barcelona Sants",
+                "stop_lat": "41.379",
+                "stop_lon": "2.140",
+            },
+            {
+                "stop_id": "30000",
+                "stop_name": "Madrid Atocha",
+                "stop_lat": "40.406",
+                "stop_lon": "-3.690",
+            },
+            {
+                "stop_id": "87303",
+                "stop_name": "Lyon Part Dieu",
+                "stop_lat": "45.760",
+                "stop_lon": "4.860",
+            },
+        ]
+        zf.writestr("stops.txt", _csv(["stop_id", "stop_name", "stop_lat", "stop_lon"], stops))
+        zf.writestr(
+            "routes.txt",
+            _csv(
+                ["route_id", "agency_id", "route_short_name", "route_type"],
+                [
+                    {
+                        "route_id": "R_AVE_XB",
+                        "agency_id": "RENFE",
+                        "route_short_name": "AVE",
+                        "route_type": "2",
+                    },
+                    {
+                        "route_id": "R_AVE_DOM",
+                        "agency_id": "RENFE",
+                        "route_short_name": "AVE",
+                        "route_type": "2",
+                    },
+                ],
+            ),
+        )
+        zf.writestr(
+            "trips.txt",
+            _csv(
+                ["route_id", "service_id", "trip_id"],
+                [
+                    {"route_id": "R_AVE_XB", "service_id": "WD", "trip_id": "T_XB"},
+                    {"route_id": "R_AVE_DOM", "service_id": "WD", "trip_id": "T_DOM"},
+                ],
+            ),
+        )
+        zf.writestr(
+            "stop_times.txt",
+            _csv(
+                ["trip_id", "stop_sequence", "stop_id", "arrival_time", "departure_time"],
+                [
+                    {
+                        "trip_id": "T_XB",
+                        "stop_sequence": "1",
+                        "stop_id": "17000",
+                        "arrival_time": "08:00:00",
+                        "departure_time": "08:00:00",
+                    },
+                    {
+                        "trip_id": "T_XB",
+                        "stop_sequence": "2",
+                        "stop_id": "87303",
+                        "arrival_time": "13:00:00",
+                        "departure_time": "13:00:00",
+                    },
+                    {
+                        "trip_id": "T_DOM",
+                        "stop_sequence": "1",
+                        "stop_id": "17000",
+                        "arrival_time": "09:00:00",
+                        "departure_time": "09:00:00",
+                    },
+                    {
+                        "trip_id": "T_DOM",
+                        "stop_sequence": "2",
+                        "stop_id": "30000",
+                        "arrival_time": "12:00:00",
+                        "departure_time": "12:00:00",
+                    },
+                ],
+            ),
+        )
+        zf.writestr(
+            "calendar.txt",
+            _csv(
+                [
+                    "service_id",
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                    "sunday",
+                    "start_date",
+                    "end_date",
+                ],
+                [
+                    {
+                        "service_id": "WD",
+                        "monday": "1",
+                        "tuesday": "1",
+                        "wednesday": "1",
+                        "thursday": "1",
+                        "friday": "1",
+                        "saturday": "0",
+                        "sunday": "0",
+                        "start_date": "20260518",
+                        "end_date": "20260816",
+                    }
+                ],
+            ),
+        )
+
+
+class TestCoordinateFallbackDetection:
+    """v0.1.42 — feeds whose stop_ids aren't UIC-keyed (Renfe) are classified by
+    point-in-polygon on the stop coordinates, so their cross-border routes are
+    still detected. Without this every stop is 'unknown country' → 0 kept."""
+
+    def test_non_uic_stop_ids_classified_by_coordinates(self, tmp_path):
+        src = tmp_path / "renfe.zip"
+        out = tmp_path / "xb.zip"
+        _build_renfe_style_gtfs(src)
+
+        stats = filter_to_cross_border(src, out)
+        kept = _read_ids(out, "routes.txt", "route_id")
+        assert kept == {"R_AVE_XB"}  # Barcelona (ES) -> Lyon (FR), via coordinates
+        assert "R_AVE_DOM" not in kept  # Barcelona -> Madrid, both ES
+        assert stats.routes_kept == 1
+        assert stats.country_combos.get("ES+FR") == 1
+
+    def test_home_country_origin_ownership_via_coordinates(self, tmp_path):
+        # home_country=ES keeps the ES-departing crossing (origin resolved by
+        # coordinates too).
+        src = tmp_path / "renfe.zip"
+        out = tmp_path / "xb.zip"
+        _build_renfe_style_gtfs(src)
+        filter_to_cross_border(src, out, home_country="ES")
+        assert _read_ids(out, "routes.txt", "route_id") == {"R_AVE_XB"}

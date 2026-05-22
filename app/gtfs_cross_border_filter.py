@@ -176,6 +176,48 @@ def _country_of(stop_id: str | None) -> str | None:
     return p if p is not None and p in UIC_COUNTRY_NAMES else None
 
 
+def _parse_coord(value: str | None) -> float | None:
+    """Parse a GTFS lat/lon cell to float, or None when blank/malformed."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _country_of_stop(stop_row: dict[str, str]) -> str | None:
+    """Country prefix for a stop: the UIC prefix in its stop_id, else a
+    point-in-polygon lookup on its coordinates.
+
+    The UIC path stays primary and exact (SNCF/SBB feeds key stops by UIC). The
+    coordinate fallback only fires for stop_ids that carry **no UIC-shaped code
+    at all** -- e.g. Renfe's 5-digit codes (`17000`, `37606`), where every stop
+    would otherwise resolve to "unknown country" and no route looks cross-border.
+
+    A code that *has* a UIC-shaped prefix which merely isn't a whitelisted country
+    (notably SBB-internal 7-digit codes like Evian = `1400001` -> "14") is left
+    "unknown" on purpose -- that is the #15 whitelist guard against internal codes
+    faking a crossing, and we don't override it with a coordinate guess.
+    """
+    sid = stop_row.get("stop_id")
+    prefix = _country_of(sid)
+    if prefix is not None:
+        return prefix
+    if country_prefix(sid) is not None:
+        # Has a UIC-shaped code, just not a whitelisted country → leave unknown.
+        return None
+    lat = _parse_coord(stop_row.get("stop_lat"))
+    lon = _parse_coord(stop_row.get("stop_lon"))
+    if lat is None or lon is None:
+        return None
+    # Lazy import: osm_geo imports this module, so a top-level import would cycle.
+    from . import osm_geo
+
+    iso = osm_geo.country_for_point(lat, lon)
+    return _UIC_PREFIX_BY_ISO.get(iso) if iso else None
+
+
 def _is_rail_route_type(route_type: str | None) -> bool:
     """True if a GTFS `route_type` denotes rail.
 
@@ -325,7 +367,7 @@ def _stop_country_map(
     stop_parent: dict[str, str] = {}
     for s in stop_rows:
         sid = s.get("stop_id", "")
-        stop_country[sid] = _country_of(sid)
+        stop_country[sid] = _country_of_stop(s)
         parent = (s.get("parent_station") or "").strip()
         if parent:
             stop_parent[sid] = parent
