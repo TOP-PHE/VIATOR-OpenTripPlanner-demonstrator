@@ -300,3 +300,51 @@ def test_per_provider_refresh_runs_filter_for_derived(
     assert out_slot.is_file()
     fetched = {f["key"]: f for f in body["fetched"]}
     assert "provider[RENFE-XB].cross_border_filter" in fetched
+
+
+def test_per_provider_refresh_url_source_downloads(
+    client: TestClient, admin: dict[str, str], inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The url-source per-provider path still works (the refactor split it into
+    # its own helper). Download is mocked — we assert the helper drives it.
+    sid = "url-source-refresh"
+    r = client.post(
+        "/api/sessions",
+        headers=admin,
+        json={"id": sid, "name": "URL provider", "category": "NAP", "config": {}},
+    )
+    assert r.status_code == 201, r.text
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    with SessionLocal() as db:
+        s = db.get(SessionRow, sid)
+        assert s is not None
+        s.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "SNCF",
+                        "timetable": {
+                            "format": "gtfs",
+                            "source": "url",
+                            "url": "https://example.test/feed.zip",
+                        },
+                    }
+                ]
+            }
+        }
+        flag_modified(s, "config")
+        db.commit()
+
+    async def _fake_task(_client, _db, _sid, _staging, _task):
+        return {"status": "fetched", "key": "provider[SNCF].timetable"}
+
+    monkeypatch.setattr("app.api.admin.sessions._refresh_one_task", _fake_task)
+
+    r = client.post(f"/api/sessions/{sid}/providers/SNCF/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    assert any(f["key"] == "provider[SNCF].timetable" for f in r.json()["fetched"])
