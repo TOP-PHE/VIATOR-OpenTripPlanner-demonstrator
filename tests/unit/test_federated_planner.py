@@ -190,6 +190,43 @@ def test_assemble_stitch_two_legs():
     assert s["federated"] is True
 
 
+def test_assemble_stitch_drops_phantom_hub_walks():
+    # Each per-leg OTP search wraps its ride in access/egress walks. Once
+    # stitched, the egress of leg-1 and the access of leg-2 are the two halves of
+    # one platform change at the hub — they must be dropped, but the genuine
+    # origin-access and destination-egress walks kept.
+    def _walk(frm, to, dep, arr):
+        return _leg(frm, to, "", dep, arr, mode="WALK")
+
+    t1 = _trip(
+        "2026-05-22T07:49:00Z",
+        "2026-05-22T11:41:00Z",
+        0,
+        [
+            _walk("ORIG", "GDL", "2026-05-22T07:49:00Z", "2026-05-22T07:55:00Z"),  # kept
+            _leg("GDL", "8501120", "TGV", "2026-05-22T07:56:00Z", "2026-05-22T11:39:00Z"),
+            _walk("8501120", "DEST", "2026-05-22T11:39:00Z", "2026-05-22T11:41:00Z"),  # dropped
+        ],
+        modes="WALK,RAIL",
+    )
+    t2 = _trip(
+        "2026-05-22T12:13:00Z",
+        "2026-05-22T13:08:00Z",
+        0,
+        [
+            _walk("ORIG", "8501120", "2026-05-22T12:13:00Z", "2026-05-22T12:17:00Z"),  # dropped
+            _leg("8501120", "8504200", "IC", "2026-05-22T12:17:00Z", "2026-05-22T13:02:00Z"),
+            _walk("8504200", "DEST", "2026-05-22T13:02:00Z", "2026-05-22T13:08:00Z"),  # kept
+        ],
+        modes="WALK,RAIL",
+    )
+    s = fp.assemble_stitch([t1, t2], via_hubs=["8501120"], session_ids=["fr", "ch"])
+    assert [leg["mode"] for leg in s["legs"]] == ["WALK", "RAIL", "RAIL", "WALK"]
+    assert s["departure_at"] == "2026-05-22T07:49:00Z"  # endpoints unchanged
+    assert s["arrival_at"] == "2026-05-22T13:08:00Z"
+    assert s["num_transfers"] == 1  # 0 internal + 1 per stitch (the hub change)
+
+
 # ──────────────────────── dedup_and_rank ────────────────────────
 
 
@@ -205,6 +242,7 @@ def _stitch(arr: str, route: str, dur_h: int = 4, transfers: int = 1) -> dict:
 
 
 def test_dedup_and_rank_orders_by_arrival():
+    # Equal duration + transfers ⇒ same generalized time ⇒ earliest arrival wins.
     late = _stitch("2026-05-22T13:00:00Z", "A")
     early = _stitch("2026-05-22T12:00:00Z", "B")
     out = fp.dedup_and_rank([late, early])
@@ -212,6 +250,16 @@ def test_dedup_and_rank_orders_by_arrival():
         "2026-05-22T12:00:00Z",
         "2026-05-22T13:00:00Z",
     ]
+
+
+def test_dedup_and_rank_prefers_fewer_changes_over_earliest_arrival():
+    # A clean 1-change journey arriving a little later must beat a 3-change slog
+    # that merely arrives earlier — that was the "6h29/3-transfer ranked above
+    # 5h19/1-transfer" bug. dur+penalty: clean 5h17+20m=5h37 < slog 6h30+60m=7h30.
+    slog = _stitch("2026-05-22T12:30:00Z", "SLOG", dur_h=6, transfers=3)
+    clean = _stitch("2026-05-22T13:00:00Z", "CLEAN", dur_h=5, transfers=1)
+    out = fp.dedup_and_rank([slog, clean])
+    assert [s["num_transfers"] for s in out] == [1, 3]  # clean first despite later arrival
 
 
 def test_dedup_and_rank_collapses_identical_itineraries():
