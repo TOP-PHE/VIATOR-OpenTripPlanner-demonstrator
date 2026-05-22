@@ -266,8 +266,8 @@ def _candidate_hubs(
 def _resolve_coords(db: DbSession, wanted_uics: set[str]) -> dict[str, tuple[float, float]]:
     """`(lat, lon)` for each requested UIC, from MasterStation.
 
-    We query OTP by coordinate (robust across a session's multiple providers,
-    whose feed-id prefixes differ from the hub's home feed).
+    Coordinates are needed both to rank hubs (see `rank_hubs`) and as OTP's
+    routing fallback when a feed doesn't key its stops by UIC.
     """
     from ..models import MasterStation
 
@@ -278,15 +278,40 @@ def _resolve_coords(db: DbSession, wanted_uics: set[str]) -> dict[str, tuple[flo
     return coords
 
 
+def _primary_feed_id(session: SessionRow) -> str | None:
+    """First provider's OTP feedId (== the stop_id namespace prefix on that
+    feed). Mirrors `app.api.journey._primary_feed_id`; kept local so this
+    module needn't import the API layer. `getattr` tolerates the lightweight
+    session stand-ins used in unit tests (which carry no `config`)."""
+    config = getattr(session, "config", None) or {}
+    providers = (config.get("sources") or {}).get("providers") or []
+    for p in providers:
+        if isinstance(p, dict):
+            fid = p.get("id")
+            if isinstance(fid, str) and fid:
+                return fid
+    return None
+
+
+def _stop_id(feed_id: str | None, uic: str) -> str | None:
+    """`<feedId>:<uic>` so a UIC-keyed feed (e.g. SBB) routes by the exact
+    station. Feeds that don't key by UIC (e.g. SNCF's `OCETrain-…`) won't
+    resolve and otp_client falls back to coordinate routing — so this is a
+    strict improvement: precise where it can be, unchanged where it can't."""
+    return f"{feed_id}:{uic}" if feed_id else None
+
+
 async def _fetch_leg(
     ctx: _LegContext, session: SessionRow, frm: str, to: str, dep: datetime
 ) -> list[dict[str, Any]]:
-    """One per-session OTP query by coordinate; `[]` on a missing endpoint or error."""
+    """One per-session OTP query (by stop-id with coordinate fallback); `[]` on
+    a missing endpoint or error."""
     if frm not in ctx.coords or to not in ctx.coords:
         return []
     from . import otp_client
 
     (flat, flon), (tlat, tlon) = ctx.coords[frm], ctx.coords[to]
+    feed_id = _primary_feed_id(session)
     try:
         _raw, trips = await otp_client.fetch_plan(
             session_id=session.id,
@@ -296,6 +321,8 @@ async def _fetch_leg(
             to_lon=tlon,
             when=dep,
             timeout_ms=ctx.timeout_ms,
+            from_stop_id=_stop_id(feed_id, frm),
+            to_stop_id=_stop_id(feed_id, to),
             session_timezone=ctx.tz_for.get(session.id),
         )
     except Exception as exc:  # network/OTP error on one leg shouldn't 500 the query
