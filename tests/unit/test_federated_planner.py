@@ -7,6 +7,7 @@ intersection, MCT arithmetic, stitch assembly, and dedup/rank.
 
 from __future__ import annotations
 
+import types
 from datetime import UTC, datetime
 
 from app.journey import federated_planner as fp
@@ -163,3 +164,183 @@ def test_dedup_and_rank_respects_limit():
         "2026-05-22T11:00:00Z",
         "2026-05-22T12:00:00Z",
     ]
+
+
+# ──────────────────────── plan_federated (orchestration, mocked IO) ───────────
+
+
+class _FakeQuery:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def filter(self, *_a, **_k):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _FakeDb:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def query(self, _model):
+        return _FakeQuery(self._rows)
+
+
+def _otp_leg(frm, to, route, dep, arr):
+    return {
+        "mode": "RAIL",
+        "from_stop_id": f"X:{frm}",
+        "to_stop_id": f"X:{to}",
+        "from_lat": 0.0,
+        "from_lon": 0.0,
+        "to_lat": 0.0,
+        "to_lon": 0.0,
+        "route_short_name": route,
+        "departure": dep,
+        "arrival": arr,
+    }
+
+
+async def test_plan_federated_stitches_paris_fribourg(monkeypatch):
+    origin, hub, dest = "8768600", "8500010", "8504200"  # Paris, Basel, Fribourg
+    corr = types.SimpleNamespace(id="nap-eu-corridors")
+    ch = types.SimpleNamespace(id="nap-ch-rail")
+
+    served = {"nap-eu-corridors": {origin, hub}, "nap-ch-rail": {hub, dest}}
+    monkeypatch.setattr(fp, "_session_served_uics", lambda s: served[s.id])
+
+    rows = [
+        types.SimpleNamespace(uic=origin, latitude=48.84, longitude=2.37),
+        types.SimpleNamespace(uic=hub, latitude=47.55, longitude=7.59),
+        types.SimpleNamespace(uic=dest, latitude=46.80, longitude=7.15),
+    ]
+
+    from app.journey import otp_client
+
+    async def _fake_fetch_plan(*, session_id, **_kw):
+        if session_id == "nap-eu-corridors":
+            return (
+                {},
+                [
+                    {
+                        "departure_at": "2026-05-22T08:00:00Z",
+                        "arrival_at": "2026-05-22T11:00:00Z",
+                        "num_transfers": 0,
+                        "modes": "RAIL",
+                        "legs": [
+                            _otp_leg(
+                                origin, hub, "TGV", "2026-05-22T08:00:00Z", "2026-05-22T11:00:00Z"
+                            )
+                        ],
+                    }
+                ],
+            )
+        if session_id == "nap-ch-rail":
+            return (
+                {},
+                [
+                    {
+                        "departure_at": "2026-05-22T11:15:00Z",
+                        "arrival_at": "2026-05-22T12:00:00Z",
+                        "num_transfers": 0,
+                        "modes": "RAIL",
+                        "legs": [
+                            _otp_leg(
+                                hub, dest, "IC", "2026-05-22T11:15:00Z", "2026-05-22T12:00:00Z"
+                            )
+                        ],
+                    }
+                ],
+            )
+        return ({}, [])
+
+    monkeypatch.setattr(otp_client, "fetch_plan", _fake_fetch_plan)
+
+    out = await fp.plan_federated(
+        _FakeDb(rows),
+        origin_uic=origin,
+        dest_uic=dest,
+        when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+        sessions=[corr, ch],
+        timeout_ms=5000,
+    )
+    assert len(out) == 1
+    s = out[0]
+    assert s["departure_at"] == "2026-05-22T08:00:00Z"
+    assert s["arrival_at"] == "2026-05-22T12:00:00Z"
+    assert s["via_hubs"] == [hub]
+    assert s["stitched_from_sessions"] == ["nap-eu-corridors", "nap-ch-rail"]
+    assert len(s["legs"]) == 2
+    assert s["federated"] is True
+
+
+async def test_plan_federated_no_uic_returns_empty():
+    out = await fp.plan_federated(
+        _FakeDb([]),
+        origin_uic=None,
+        dest_uic="8500010",
+        when=datetime.now(UTC),
+        sessions=[],
+        timeout_ms=1000,
+    )
+    assert out == []
+
+
+async def test_plan_federated_no_shared_hub_returns_empty(monkeypatch):
+    a = types.SimpleNamespace(id="a")
+    b = types.SimpleNamespace(id="b")
+    served = {"a": {"1", "2"}, "b": {"3", "4"}}
+    monkeypatch.setattr(fp, "_session_served_uics", lambda s: served[s.id])
+    out = await fp.plan_federated(
+        _FakeDb([]),
+        origin_uic="1",  # served by a
+        dest_uic="3",  # served by b
+        when=datetime.now(UTC),
+        sessions=[a, b],
+        timeout_ms=1000,
+    )
+    assert out == []  # a and b share no hub
+
+
+# ──────────────────────── served-uics IO + cache ────────────────────────
+
+
+def _write_gtfs(gtfs_dir, stop_ids):
+    import csv  # noqa: F401  (kept local; stdlib)
+    import io
+    import zipfile
+
+    gtfs_dir.mkdir(parents=True, exist_ok=True)
+    rows = "".join(f"{s},Stop {s},47.0,7.0\n" for s in stop_ids)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\n" + rows)
+    (gtfs_dir / "feed.zip").write_bytes(buf.getvalue())
+
+
+def test_session_served_uics_reads_caches_and_invalidates(tmp_path, monkeypatch):
+    from app.settings import settings
+
+    sid = "ch-rail-uics-test"
+    gtfs_dir = tmp_path / sid / "gtfs"
+    _write_gtfs(gtfs_dir, ["8500010", "8504200", "IDFM:no-uic"])
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    fp.invalidate_served_uics_cache()
+
+    session = types.SimpleNamespace(id=sid)
+    assert fp._session_served_uics(session) == {"8500010", "8504200"}  # junk id dropped
+
+    # cache hit: deleting the feed doesn't change the cached answer
+    (gtfs_dir / "feed.zip").unlink()
+    assert fp._session_served_uics(session) == {"8500010", "8504200"}
+
+    # invalidate → re-read (feed now gone ⇒ empty)
+    fp.invalidate_served_uics_cache(sid)
+    assert fp._session_served_uics(session) == set()
+    fp.invalidate_served_uics_cache()  # cleanup (don't leak into other tests)
+
+
+def test_read_stop_ids_missing_dir(tmp_path):
+    assert fp._read_stop_ids(tmp_path / "does-not-exist") == []

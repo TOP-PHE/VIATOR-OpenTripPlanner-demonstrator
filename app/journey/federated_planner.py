@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .signature import _uic_from_stop_id, transit_fingerprint
@@ -145,20 +146,40 @@ def dedup_and_rank(
 _SERVED_UICS_CACHE: dict[str, set[str]] = {}
 
 
+def _read_stop_ids(gtfs_dir: Path) -> list[str]:
+    """Every `stop_id` across the GTFS zips in a directory (best-effort).
+
+    Stdlib only — kept here rather than importing the admin API (which pulls
+    the DB layer) so this module stays light and unit-testable.
+    """
+    import csv
+    import io
+    import zipfile
+
+    out: list[str] = []
+    if not gtfs_dir.exists():
+        return out
+    for zip_path in sorted(gtfs_dir.glob("*.zip")):
+        try:
+            with zipfile.ZipFile(zip_path) as zf, zf.open("stops.txt") as fh:
+                for row in csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig")):
+                    sid = row.get("stop_id")
+                    if sid:
+                        out.append(sid)
+        except (KeyError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
+            continue
+    return out
+
+
 def _session_served_uics(session: SessionRow) -> set[str]:
     """Served-UIC set for a session, read from its staged GTFS (cached)."""
     cached = _SERVED_UICS_CACHE.get(session.id)
     if cached is not None:
         return cached
-    from .. import ingestion
-    from ..api.admin.sessions import _read_gtfs_stops
+    from ..settings import settings
 
-    stops: list[tuple[str | None, float | None, float | None]] = []
-    gtfs_dir = ingestion.session_inbox(session.id) / "gtfs"
-    if gtfs_dir.exists():
-        for zip_path in sorted(gtfs_dir.glob("*.zip")):
-            stops.extend(_read_gtfs_stops(zip_path))
-    uics = served_uics(stops)
+    gtfs_dir = Path(str(settings.inbox_dir)) / session.id / "gtfs"
+    uics = served_uics([(sid, None, None) for sid in _read_stop_ids(gtfs_dir)])
     _SERVED_UICS_CACHE[session.id] = uics
     return uics
 
