@@ -692,9 +692,9 @@ async def upload_to_session(
         s.state = SessionState.POPULATED.value
 
     # §12 — uploading a national feed cascades to any cross-border views derived
-    # from it (same single-source-of-truth rule as refresh). Only when the upload
-    # was attached to a provider (otherwise nothing can derive from it).
-    cascaded = await _cascade_derived_refresh(db, sid) if provider_feed_id else []
+    # from it (same single-source-of-truth rule as refresh). The scan is cheap and
+    # finds nothing when this upload wasn't a provider feed something links to.
+    cascaded = await _cascade_derived_refresh(db, sid)
 
     audit.record(
         db,
@@ -710,7 +710,7 @@ async def upload_to_session(
             "size_bytes": size,
             "triggered_rebuild": triggered,
             "provider_feed_id": provider_feed_id,
-            "cascaded": [f"{c['target_session']}:{c['key']}" for c in cascaded],
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
@@ -996,7 +996,7 @@ async def refresh_sources(
             "fetched": [f["key"] for f in fetched],
             "skipped": [s_["key"] for s_ in skipped],
             "orphaned": orphaned,  # PR #33
-            "cascaded": [f"{c['target_session']}:{c['key']}" for c in cascaded],
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
@@ -1369,6 +1369,11 @@ def _is_derived_from(provider: dict[str, Any], source_session_id: str) -> bool:
     if tt.get("source") != "cross_border_filter":
         return False
     return (tt.get("derived_from") or {}).get("session_id") == source_session_id
+
+
+def _cascade_keys(cascaded: list[dict[str, Any]]) -> list[str]:
+    """Compact `target_session:key` labels for audit metadata."""
+    return [f"{c['target_session']}:{c['key']}" for c in cascaded]
 
 
 async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> list[dict[str, Any]]:
