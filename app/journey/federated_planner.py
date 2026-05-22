@@ -43,9 +43,12 @@ log = logging.getLogger(__name__)
 # MCT comes later from the enrichment layer. The fan-out bounds cap how many OTP
 # calls one federated query can make (hubs x leg-1 options).
 DEFAULT_MCT_SECONDS = 600  # 10 min
-MAX_HUBS = 8  # per session pair; hubs are proximity-ranked first (see _rank_hubs)
+MAX_HUBS = 8  # per session pair; hubs are proximity-ranked first (see rank_hubs)
 MAX_LEG1_OPTIONS = 3
 MAX_RESULTS = 5
+# A change is "worth" this much ride time when ranking: a clean 1-change journey
+# should beat a 3-change slog that merely arrives a few minutes earlier.
+TRANSFER_PENALTY_SECONDS = 1200  # 20 min
 
 
 # ───────────────────────────── pure helpers ────────────────────────────────
@@ -136,6 +139,30 @@ def earliest_next_departure(
     return _parse_iso(prev_arrival_iso) + timedelta(seconds=mct_seconds)
 
 
+def _join_legs_dropping_hub_walks(leg_trips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Concatenate the per-leg trips' legs, dropping the phantom walks at each
+    stitch boundary.
+
+    Each non-final trip's trailing WALK (egress to the hub) and each non-first
+    trip's leading WALK (access from the hub) are the two halves of a single
+    platform change — real inside OTP's per-leg search, but doubled and
+    mislabelled ("-> Destination" / "Origin ->") once stitched, since each leg
+    treats the hub as its own endpoint. The genuine origin-access and
+    destination-egress walks (first trip's first leg, last trip's last leg) are
+    kept. The hub change itself still counts as one transfer (see assemble_stitch).
+    """
+    last_index = len(leg_trips) - 1
+    joined: list[dict[str, Any]] = []
+    for i, trip in enumerate(leg_trips):
+        legs = list(trip.get("legs", []))
+        if i > 0 and legs and legs[0].get("mode") == "WALK":
+            legs = legs[1:]
+        if i < last_index and legs and legs[-1].get("mode") == "WALK":
+            legs = legs[:-1]
+        joined.extend(legs)
+    return joined
+
+
 def assemble_stitch(
     leg_trips: list[dict[str, Any]],
     *,
@@ -145,12 +172,14 @@ def assemble_stitch(
     """Join a chain of per-leg trips into a single stitched itinerary.
 
     Total duration is wall-clock (last arrival minus first departure, so transfer
-    wait is counted); transfers = the sum within each leg plus one per stitch.
+    wait is counted); transfers = the sum within each leg plus one per stitch. The
+    phantom egress/access walks at each hub are dropped (see
+    `_join_legs_dropping_hub_walks`) so the change reads as one platform change.
     """
     first, last = leg_trips[0], leg_trips[-1]
     departure_at = first["departure_at"]
     arrival_at = last["arrival_at"]
-    legs = [leg for t in leg_trips for leg in t.get("legs", [])]
+    legs = _join_legs_dropping_hub_walks(leg_trips)
     modes = sorted({m for t in leg_trips for m in (t.get("modes") or "").split(",") if m})
     internal_transfers = sum(int(t.get("num_transfers", 0)) for t in leg_trips)
     return {
@@ -168,21 +197,28 @@ def assemble_stitch(
     }
 
 
+def _rank_key(stitch: dict[str, Any]) -> tuple[int, str]:
+    """Sort key: generalized time (ride seconds + a penalty per change), then
+    earliest arrival as the tie-break. A clean 1-change journey thus outranks a
+    transfer-heavy one that merely arrives a little earlier."""
+    transfers = int(stitch.get("num_transfers", 0))
+    generalized = int(stitch.get("duration_seconds", 0)) + TRANSFER_PENALTY_SECONDS * transfers
+    return (generalized, stitch.get("arrival_at", ""))
+
+
 def dedup_and_rank(
     stitches: list[dict[str, Any]],
     *,
     existing_fingerprints: set[str] | None = None,
     limit: int = MAX_RESULTS,
 ) -> list[dict[str, Any]]:
-    """Rank stitched itineraries (earliest arrival, then shortest, then fewest
-    transfers) and drop any that duplicate each other or an itinerary a session
-    already returned (by `transit_fingerprint`)."""
+    """Rank stitched itineraries by generalized time (ride time plus a fixed
+    penalty per change, so a clean journey beats a transfer-heavy one that merely
+    arrives a touch earlier), then drop any that duplicate each other or an
+    itinerary a session already returned (by `transit_fingerprint`)."""
     seen = set(existing_fingerprints or set())
     out: list[dict[str, Any]] = []
-    for s in sorted(
-        stitches,
-        key=lambda s: (s["arrival_at"], s["duration_seconds"], s["num_transfers"]),
-    ):
+    for s in sorted(stitches, key=_rank_key):
         fp = transit_fingerprint(s.get("legs", []))
         if fp and fp in seen:
             continue
