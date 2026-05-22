@@ -939,38 +939,11 @@ async def refresh_sources(
     staging = settings.inbox_dir / sid / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
 
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-
     # v0.1.14: providers-only by default. OSM PBF lives behind its own
     # endpoint so refreshing a GTFS feed doesn't accidentally bust the
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(s.config or {}, include_osm=False)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            outcome = await _refresh_one_task(
-                client,
-                db,
-                sid,
-                staging,
-                task,
-            )
-            if outcome.get("status") == "fetched":
-                fetched.append({k: v for k, v in outcome.items() if k != "status"})
-            else:
-                skipped.append({k: v for k, v in outcome.items() if k != "status"})
-
-    # Derived providers (source == "cross_border_filter"): no URL to download —
-    # instead run the cross-border filter on the linked national feed into this
-    # provider's slot. Done after the URL downloads so a same-session
-    # national+derived pair resolves in one refresh. See
-    # docs/provider-source-modes-design.md §12.
-    for outcome in await _run_derived_filters(db, sid, s.config or {}, staging):
-        if outcome.get("status") == "fetched":
-            fetched.append({k: v for k, v in outcome.items() if k != "status"})
-        else:
-            skipped.append({k: v for k, v in outcome.items() if k != "status"})
+    fetched, skipped = await _gather_refresh_outcomes(db, sid, staging, s.config or {}, work)
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
@@ -1346,7 +1319,10 @@ async def _run_derived_filters(
                 home_country=tt.get("home_country"),
             )
         except Exception as exc:  # a malformed source feed shouldn't 500 the refresh
-            log.warning("cross-border filter for %s/%s failed: %s", sid, pid, exc)
+            # Log only the exception type — sid/pid/exc are operator-controlled
+            # (path param + config + feed-derived) so they don't belong raw in a
+            # log line (S5145). The full hint goes to the API response below.
+            log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
             outcomes.append({"status": "skipped", "key": key, "error": f"filter failed: {exc}"})
             continue
         ingestion.dispatch(
@@ -1366,6 +1342,34 @@ async def _run_derived_filters(
             }
         )
     return outcomes
+
+
+async def _gather_refresh_outcomes(
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    config: dict[str, Any],
+    work: list[_RefreshTask],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run the URL-download tasks then the derived (cross_border_filter)
+    providers, partitioning every outcome into (fetched, skipped).
+
+    Derived providers are materialised after the URL downloads so a same-session
+    national+derived pair resolves in one refresh (see
+    docs/provider-source-modes-design.md §12)."""
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def _record(outcome: dict[str, Any]) -> None:
+        bucket = fetched if outcome.get("status") == "fetched" else skipped
+        bucket.append({k: v for k, v in outcome.items() if k != "status"})
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            _record(await _refresh_one_task(client, db, sid, staging, task))
+    for outcome in await _run_derived_filters(db, sid, config, staging):
+        _record(outcome)
+    return fetched, skipped
 
 
 # v0.1.19 — pure state-derivation helper. Lives alongside `_build_refresh_tasks`
