@@ -493,6 +493,39 @@ function renderOjpReference(ref) {
 // click handler can pull the matching trip's _raw_itinerary on demand.
 let _LAST_PAYLOAD = null;
 
+// v0.1.41 — cross-session (federated) itineraries: stitched from 2+ sessions
+// at a connection hub when no single network serves the O→D end-to-end. Cards
+// carry class `trip-card`, so the expand-wiring below catches them for free.
+function renderFederated(trips) {
+  if (!trips || !trips.length) return '';
+  const cards = trips.map((t) => {
+    const legCount = (t.legs || []).length;
+    const hubs = (t.via_hubs || []).join(', ');
+    const sess = (t.stitched_from_sessions || []).join(' + ');
+    const nt = t.num_transfers;
+    return `<div class="trip-card">
+      <div class="top">
+        <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
+             <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
+        <div class="top-actions">
+          <span class="flag" style="background: var(--signal-amber); color: #fff">FEDERATED</span>
+        </div>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+        ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
+        ${nt} transfer${nt === 1 ? '' : 's'} ·
+        via <strong>${escHTML(hubs)}</strong> · ${escHTML(sess)} ·
+        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
+      </div>
+      <div class="legs-detail">${legsHTML(t.legs)}</div>
+    </div>`;
+  }).join('');
+  return `<div class="federated-section">
+    <h3 style="margin: 1rem 0 0.4rem; font-size: 0.95rem">Cross-session journeys
+      <span class="hint" style="font-weight: normal">(stitched at a connection hub — no single network serves this end-to-end)</span>
+    </h3>${cards}</div>`;
+}
+
 function render(payload) {
   _LAST_PAYLOAD = payload;
   const el = document.getElementById('results');
@@ -556,7 +589,11 @@ function render(payload) {
   // renders below VIATOR's own results. Its cards carry class
   // `trip-card`, so the expand-wiring below catches them for free.
   const ojpPanel = renderOjpReference(payload.ojp_reference);
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${cards || '<p>No itineraries found.</p>'}${ojpPanel}`;
+  // v0.1.41 — federated (cross-session) itineraries render in their own group;
+  // suppress "No itineraries found" when only federated results exist.
+  const federatedSection = renderFederated(payload.federated_trips);
+  const noResults = (cards || federatedSection) ? '' : '<p>No itineraries found.</p>';
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${cards}${noResults}${federatedSection}${ojpPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable. OJP cards
   // also have class `trip-card` so this selector catches them too.
