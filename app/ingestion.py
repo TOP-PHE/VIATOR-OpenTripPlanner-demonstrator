@@ -71,10 +71,15 @@ _OTP_TIMETABLE_FORMATS: frozenset[str] = frozenset({"gtfs", "netex_nordic", "net
 #   "url"    — download from timetable.url (the original behaviour)
 #   "upload" — an operator file attached to this provider, landed at its
 #              inbox slot via POST /{sid}/uploads?provider_id=...
-# A third mode, "server_file" (reference a VIATOR-generated artifact such
-# as the cross-border GTFS), is planned for Phase 2 — see
-# docs/provider-source-modes-design.md — and is not yet a valid value.
-_TIMETABLE_SOURCES: frozenset[str] = frozenset({"url", "upload"})
+#   "cross_border_filter" — a *derived* provider: it owns no feed of its own,
+#              only a link (`derived_from`) to a national provider's slot in
+#              another session plus filter params. Build/refresh runs
+#              app.gtfs_cross_border_filter.filter_to_cross_border on the
+#              linked national feed into this provider's slot. One source of
+#              truth, no drift. See docs/provider-source-modes-design.md §12.
+# A "server_file" mode (reference a pre-generated artifact) is still planned
+# (§9 Phase 2) and is not yet a valid value.
+_TIMETABLE_SOURCES: frozenset[str] = frozenset({"url", "upload", "cross_border_filter"})
 
 # The OTP entrypoint's build-config generator reads each timetable file
 # from one of these subdirs (the v0.1.4 single-feed code already did this
@@ -258,6 +263,53 @@ def normalize_providers(raw_config: dict[str, Any]) -> list[dict[str, Any]]:
     return providers
 
 
+def _validate_cross_border_filter(tt: dict[str, Any], index: int) -> dict[str, Any]:
+    """Validate the extra fields a `cross_border_filter` provider carries.
+
+    A derived provider owns no feed: it links to a national provider's slot
+    (`derived_from = {session_id, provider_id}`) and stores the filter params.
+    Build/refresh runs `filter_to_cross_border` on the linked national feed.
+    See docs/provider-source-modes-design.md §12.
+    """
+    df = tt.get("derived_from")
+    if not isinstance(df, dict):
+        raise ValueError(
+            f"providers[{index}].timetable.derived_from must be an object with "
+            "session_id + provider_id (the national feed this is filtered from)"
+        )
+    src_session = str(df.get("session_id") or "").strip()
+    src_provider = str(df.get("provider_id") or "").strip()
+    if not src_session:
+        raise ValueError(
+            f"providers[{index}].timetable.derived_from.session_id is required "
+            "(the session whose national feed is filtered)"
+        )
+    if not _FEED_ID_RE.match(src_provider):
+        raise ValueError(
+            f"providers[{index}].timetable.derived_from.provider_id={src_provider!r} "
+            "must be a provider id (e.g. RENFE) in the source session"
+        )
+
+    out: dict[str, Any] = {"derived_from": {"session_id": src_session, "provider_id": src_provider}}
+
+    home_raw = tt.get("home_country")
+    if home_raw not in (None, ""):
+        home = str(home_raw).strip().upper()
+        if not _COUNTRY_ISO_RE.match(home):
+            raise ValueError(
+                f"providers[{index}].timetable.home_country={home_raw!r} must be a "
+                "2-letter ISO code (ES, FR, ...) — origin-country ownership for the filter"
+            )
+        out["home_country"] = home
+
+    # rail_only defaults True (rail-only cross-border subset); accept explicit bool.
+    rail_only = tt.get("rail_only", True)
+    if not isinstance(rail_only, bool):
+        raise ValueError(f"providers[{index}].timetable.rail_only must be true or false")
+    out["rail_only"] = rail_only
+    return out
+
+
 def _validate_provider(raw: object, index: int) -> dict[str, Any]:
     """Validate one provider entry, returning the cleaned dict.
 
@@ -323,6 +375,8 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
     timetable: dict[str, Any] = {"format": fmt, "source": source}
     if url:
         timetable["url"] = url
+    if source == "cross_border_filter":
+        timetable.update(_validate_cross_border_filter(tt, index))
 
     # ── gtfs_rt (optional) ───────────────────────────────────────────
     gtfs_rt_raw = raw.get("gtfs_rt") or {}

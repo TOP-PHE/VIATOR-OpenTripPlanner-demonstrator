@@ -253,3 +253,79 @@ norm), gated by CI + a release tag.
 - Tightening `Upload.session_id` to NOT NULL (separate clean-up).
 - Any change to the OTP build-config generator (the inbox slot contract is
   unchanged).
+
+---
+
+## 12. Addendum — derived providers (single source of truth)
+
+**Decision (2026-05-22).** For cross-border feeds the operator wants **one
+source of truth**: the national feed is loaded once on its domestic session,
+and the cross-border feed is **derived** from it automatically. The two can
+never drift, and no one can forget to refresh the second file. This supersedes
+the part of §8 that assumed the cross-border GTFS is produced *offline* and
+referenced via `server_file` — the filter now runs **in-app**, driven by a link.
+
+### 12.1 Model: a fourth source — `cross_border_filter`
+
+A corridors-session provider stores a **link, not a copy**:
+
+```json
+{
+  "id": "RENFE-XB",
+  "timetable": {
+    "format": "gtfs",
+    "source": "cross_border_filter",
+    "derived_from": { "session_id": "nap-sp-rail", "provider_id": "RENFE" },
+    "home_country": "ES",
+    "rail_only": true
+  }
+}
+```
+
+- `derived_from` points at the national provider whose inbox slot holds the
+  global feed — the single source of truth.
+- `home_country` / `rail_only` are the `filter_to_cross_border` parameters.
+- The derived provider owns **no feed of its own**: its inbox slot holds only
+  the *filtered output*, regenerated from the source. `cross_border_filter` is
+  added to `_TIMETABLE_SOURCES`; no URL/upload is required for it.
+
+### 12.2 When the filter runs
+
+- **On the corridors session's build/refresh:** resolve the source slot
+  `inbox/<derived_from.session_id>/gtfs/<derived_from.provider_id>.zip`, run
+  `filter_to_cross_border` into the corridors slot, persist `CrossBorderStats`.
+- **Cascade on the national refresh** (the "no human error" property): when the
+  national provider's feed is (re)downloaded/uploaded, find every
+  `cross_border_filter` provider whose `derived_from` matches and re-run its
+  filter. Refresh once on the national side → every derived view updates itself.
+
+### 12.3 Lifecycle / failure modes
+
+- Source slot missing (national session not yet refreshed, archived, or
+  deleted) → derived provider shows an `error` pill ("source feed not found —
+  refresh `<session>/<provider>`"); the build **skips** it rather than failing
+  the whole graph.
+- Filter keeps zero routes → `warn`/`error` carrying the stats (e.g. "0
+  cross-border routes — wrong `home_country`?").
+
+### 12.4 Why a link, not a copy or a shared dir
+
+Storing the global feed once on its national session and *referencing* it (vs
+re-uploading to the corridors provider, or staging into `data/generated/`) is
+the truest single source of truth: exactly one global feed exists on disk,
+owned by the national session, and the cross-border feed is a pure derived
+view. Trade-off accepted: a cross-session dependency + a post-refresh cascade
+hook (new machinery) in exchange for the no-drift / no-forgotten-refresh
+guarantee.
+
+### 12.5 Phasing
+
+- **P1 — backend core.** `cross_border_filter` source value + validation
+  (§3.1 extension); resolve the linked national slot and run the filter into
+  the derived slot on the corridors session's build/refresh; persist stats.
+  Testable with hand-edited config.
+- **P2 — cascade.** National refresh auto re-derives every linked
+  `cross_border_filter` provider.
+- **P3 — UI.** Source toggle gains "Cross-border filter" → pick national
+  session + provider, home country, rail-only; show last-run stats + a
+  stale/error pill.
