@@ -16,7 +16,7 @@ This is a **fallback**: `fanout()` calls it only when every session failed to
 return an end-to-end itinerary, so through-trains and single-session results
 always win and the common path stays fast.
 
-The pure helpers (`served_uics`, `connection_hubs`, `assemble_stitch`,
+The pure helpers (`served_uics`, `connection_hubs`, `rank_hubs`, `assemble_stitch`,
 `earliest_next_departure`, `dedup_and_rank`) carry the logic and are unit-tested;
 `plan_federated` is the async orchestration that drives per-session OTP queries.
 """
@@ -24,6 +24,7 @@ The pure helpers (`served_uics`, `connection_hubs`, `assemble_stitch`,
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -42,7 +43,7 @@ log = logging.getLogger(__name__)
 # MCT comes later from the enrichment layer. The fan-out bounds cap how many OTP
 # calls one federated query can make (hubs x leg-1 options).
 DEFAULT_MCT_SECONDS = 600  # 10 min
-MAX_HUBS = 6
+MAX_HUBS = 8  # per session pair; hubs are proximity-ranked first (see _rank_hubs)
 MAX_LEG1_OPTIONS = 3
 MAX_RESULTS = 5
 
@@ -67,6 +68,50 @@ def served_uics(stops: list[tuple[str | None, float | None, float | None]]) -> s
 def connection_hubs(served_a: set[str], served_b: set[str]) -> set[str]:
     """The connection hubs between two sessions = the stations both serve (UIC)."""
     return served_a & served_b
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in kilometres."""
+    radius_km = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius_km * math.asin(math.sqrt(a))
+
+
+def rank_hubs(
+    hub_uics: set[str],
+    coords: dict[str, tuple[float, float]],
+    origin_uic: str,
+    dest_uic: str,
+) -> list[str]:
+    """Order candidate hubs by how little they detour the origin->dest path.
+
+    Score = great-circle (origin->hub) + (hub->dest) in km: a hub sitting on
+    the direct line scores near the direct distance, an off-route one scores
+    far more. Ascending, so the most "on the way" hubs come first; a hub with
+    no resolved coordinates is dropped (it can be neither scored nor routed).
+
+    This replaces the original lexicographic-by-UIC ordering, which sorted the
+    Swiss `85...` gateways (e.g. Basel SBB `8500010`) behind every lower-numbered
+    code — so the per-pair hub cap dropped the one hub the cross-border spine
+    actually serves, and the corridors pair produced no stitch at all.
+    """
+    origin = coords.get(origin_uic)
+    dest = coords.get(dest_uic)
+    if origin is None or dest is None:
+        return []
+    scored: list[tuple[float, str]] = []
+    for uic in hub_uics:
+        hub = coords.get(uic)
+        if hub is None:
+            continue
+        detour = _haversine_km(*origin, *hub) + _haversine_km(*hub, *dest)
+        scored.append((detour, uic))
+    # Tie-break on UIC so the ordering is deterministic across runs.
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [uic for _, uic in scored]
 
 
 def _parse_iso(value: str) -> datetime:
@@ -295,19 +340,26 @@ async def _collect_stitches(
     when: datetime,
     mct_seconds: int,
 ) -> list[dict[str, Any]]:
-    """Drive every distinct session pair through `_stitch_pair`, capped at MAX_HUBS."""
+    """Drive each distinct session pair through `_stitch_pair`, trying the
+    MAX_HUBS most on-route shared hubs (proximity-ranked, so the natural
+    gateway — e.g. Basel SBB on Paris->Fribourg — is always among them)."""
     stitches: list[dict[str, Any]] = []
     for so in origin_sessions:
         for sd in dest_sessions:
             if so.id == sd.id:
                 continue
-            hubs = sorted(connection_hubs(served[so.id], served[sd.id]) & ctx.coords.keys())
+            hubs = rank_hubs(
+                connection_hubs(served[so.id], served[sd.id]),
+                ctx.coords,
+                origin_uic,
+                dest_uic,
+            )[:MAX_HUBS]
             stitches.extend(
                 await _stitch_pair(
                     ctx,
                     so,
                     sd,
-                    hubs[:MAX_HUBS],
+                    hubs,
                     origin_uic=origin_uic,
                     dest_uic=dest_uic,
                     when=when,
