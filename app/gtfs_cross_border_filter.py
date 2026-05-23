@@ -45,20 +45,22 @@ full multimodal national feed like SBB's:
     rail. Pass rail_only=False to consider every mode.
   - cross-border-ness: 2+ distinct UIC *country* prefixes among the stops.
 
-Limitations:
-  - Stops whose stop_id carries no parseable UIC — or whose 2-digit prefix
-    is not a recognised UIC country (UIC_COUNTRY_NAMES) — contribute
-    "unknown country" and don't count toward the 2+-country test. The
-    whitelist is what stops SBB's internal codes for local/foreign stops
-    (e.g. Evian = 1400001 -> "14") from faking a country. The flip side:
-    a cross-border service whose foreign leg is encoded ONLY with such an
-    internal code (no real foreign UIC anywhere on the route) won't be
-    detected. In practice major international stations carry real UICs, and
-    origin-country ownership takes those trains from the foreign NAP feed
-    anyway. A coordinate fallback (resolve a stop's country from its
-    lat/lon via the master_stations registry) is the planned follow-up for
-    full recall — deliberately out of scope here to keep this module
-    stdlib-only / DB-free.
+Country detection (two methods, in order):
+  1. The UIC country prefix in the stop_id (primary, exact). A 2-digit prefix
+     that isn't a recognised UIC country (UIC_COUNTRY_NAMES) is rejected — the
+     whitelist that stops SBB's internal codes for local/foreign stops
+     (e.g. Evian = 1400001 -> "14") from faking a country.
+  2. Point-in-polygon on the stop's coordinates (`osm_geo.country_for_point`,
+     bundled country-borders GeoJSON) — fired ONLY when the stop_id carries no
+     UIC-shaped code at all. This is what lets the filter work on feeds whose
+     stop_ids are internal codes, not UIC — notably Renfe's 5-digit codes
+     (17000, 37606), where every stop would otherwise be "unknown country" and
+     no route would look cross-border. Still stdlib-only / DB-free (the GeoJSON
+     ships in app/data/). See docs/cross-border-routing-as-built.md §1.3.
+
+     The fallback is deliberately surgical: a code that *has* a UIC-shaped
+     prefix which merely isn't whitelisted (1400001 -> "14") is still left
+     "unknown" — method 2 does not override the method-1 whitelist guard.
 """
 
 from __future__ import annotations
