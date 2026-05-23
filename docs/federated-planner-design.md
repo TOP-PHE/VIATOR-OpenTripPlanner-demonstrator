@@ -7,9 +7,12 @@ Motivating case: **Paris → Fribourg (CH)** — *Paris →(corridors: TGV Lyria
 Basel →(nap-ch-rail: SBB IC)→ Fribourg* — which no single graph can route
 because Paris and Fribourg never co-exist in one session.
 
-**Status**: Design proposal (no code). The query-time stitching layer — the
-deeper end of `cross-nap-federation-design.md`, which only covered a single
-cross-border *through-train* (dedup, no transfer).
+**Status**: **Phase 1 SHIPPED** (v0.1.41.01–v0.1.41.05). This doc is the design
+intent; the **as-built behaviour and the tuning adjustments that brought results
+close to SBB/OJP** are recorded in
+[cross-border-routing-as-built.md](cross-border-routing-as-built.md) — read that
+for what actually ships (it refines §4.2 hub ranking and supersedes the §4.5
+ranking criterion below).
 **Audience**: Platform admins, demonstrator product owners, implementers.
 
 > Pairs with:
@@ -179,7 +182,15 @@ interchange ≠ a country halt).
 
 - A stitched journey = the legs joined by transfers at the hub(s); total
   duration = last arrival − first departure; transfers summed + one per stitch.
-- **Rank** by arrival, then duration, then transfers.
+  The phantom egress/access walks at each hub are dropped (as-built §2.5).
+- **Rank** — **as-built (v0.1.41.05) ranks by *generalized time*** =
+  `duration + 20 min × changes`, tie-broken by arrival, so a clean 1-change
+  journey beats a transfer-heavy one that merely arrives a touch earlier. (The
+  original "arrival, then duration, then transfers" surfaced slow-but-early
+  options on top — see cross-border-routing-as-built.md §2.5.)
+- **Hub selection — as-built (v0.1.41.02/04)** ranks candidates by
+  destination-country first, then great-circle detour (not the §4.2
+  degree/tier sketch). See as-built §2.2 and §2.4.
 - **Dedup** with `transit_fingerprint`: drop a stitch that's equivalent to a
   through-itinerary a session already returned, and collapse stitches that
   differ only by hub but ride the same trains.
