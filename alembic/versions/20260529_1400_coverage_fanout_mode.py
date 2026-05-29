@@ -27,7 +27,7 @@ we validate the combination at write time in the API layer instead.
 See docs/audit-2026-05.md row #36.
 
 Revision ID: 20260529_1400_coverage_fanout
-Revises: 20260520_1300_upload_provider
+Revises: 20260521_1200_rebuild_maxmem
 Create Date: 2026-05-29 14:00:00.000000
 """
 
@@ -41,7 +41,12 @@ from alembic import op
 
 # revision identifiers
 revision: str = "20260529_1400_coverage_fanout"
-down_revision: str | Sequence[str] | None = "20260520_1300_upload_provider"
+# Chains AFTER the worker-rebuild-max-memory migration which landed on
+# main between PR #36 being drafted and rebased. Both had originally
+# targeted 20260520_1300_upload_provider as their parent, creating two
+# alembic heads — re-parent this one onto the now-merged sibling so the
+# revision graph stays linear.
+down_revision: str | Sequence[str] | None = "20260521_1200_rebuild_maxmem"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
