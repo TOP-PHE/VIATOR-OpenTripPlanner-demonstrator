@@ -7,12 +7,12 @@
 
   {# Inline SVG favicon — same icon as the upload UI. #}
   <link rel="icon" type="image/svg+xml"
-        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231F3B66' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
+        href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='none' stroke='%231C75BC' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'><line x1='8' y1='8' x2='32' y2='56'/><line x1='56' y1='8' x2='32' y2='56'/><line x1='14' y1='20' x2='50' y2='20'/><line x1='20' y1='32' x2='44' y2='32'/><line x1='26' y1='44' x2='38' y2='44'/></g></svg>" />
 
   <style>
     :root {
-      --uic-blue:   #1F3B66;
-      --uic-blue-d: #163055;
+      --brand-blue:   #1C75BC;
+      --brand-blue-d: #163055;
       --rail-steel: #5B6B82;
       --amber:      #E89B2C;
       --paper:      #F5F7FB;
@@ -28,7 +28,7 @@
     .top .inner { max-width: 1100px; margin: 0 auto; padding: 1rem; display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
     .top .lockup { display: flex; align-items: center; gap: 0.7rem; text-decoration: none; }
     .top .lockup .icon { width: 36px; height: 36px; }
-    .top .lockup .word { font-size: 1.3rem; font-weight: 700; letter-spacing: 0.3rem; color: var(--uic-blue); }
+    .top .lockup .word { font-size: 1.3rem; font-weight: 700; letter-spacing: 0.3rem; color: var(--brand-blue); }
     .top .lockup .tag  { font-size: 0.65rem; letter-spacing: 0.18rem; color: var(--rail-steel); text-transform: uppercase; line-height: 1; }
     /* Version badge — small, muted, sits inline with the VIATOR word so a
        glance at the header tells the operator which build they're talking to.
@@ -36,14 +36,14 @@
     .top .lockup .ver  {
       display: inline-block; margin-left: 0.6rem; padding: 0.05rem 0.4rem;
       font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04rem;
-      color: var(--uic-blue); background: #fff;
+      color: var(--brand-blue); background: #fff;
       border: 1px solid var(--sleeper); border-radius: 999px;
       vertical-align: 0.2rem;
     }
     .top nav { display: flex; gap: 1rem; align-items: center; margin-left: auto; font-size: 0.9rem; }
     .top nav a { color: var(--rail-steel); text-decoration: none; }
-    .top nav a:hover { color: var(--uic-blue); text-decoration: underline; }
-    .top nav .who { color: var(--uic-blue); font-weight: 600; }
+    .top nav a:hover { color: var(--brand-blue); text-decoration: underline; }
+    .top nav .who { color: var(--brand-blue); font-weight: 600; }
     /* Role badge (v0.1.11) — colour-codes the active session's privilege level
        so operators see at a glance whether they're acting as platform-admin
        (red, dangerous), content-manager (amber, write access), or end-user
@@ -87,7 +87,7 @@
     }
     .top nav .nav-group:hover > summary,
     .top nav .nav-group:focus-within > summary,
-    .top nav .nav-group[open] > summary { color: var(--uic-blue); }
+    .top nav .nav-group[open] > summary { color: var(--brand-blue); }
     .top nav .nav-dropdown {
       display: none;
       position: absolute;
@@ -114,7 +114,7 @@
     }
     .top nav .nav-dropdown a:hover {
       background: var(--paper);
-      color: var(--uic-blue);
+      color: var(--brand-blue);
       text-decoration: none;
     }
     .top nav .nav-dropdown .nav-dropdown-section {
@@ -133,7 +133,7 @@
 
     /* ───── main ───── */
     main { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
-    h1, h2 { color: var(--uic-blue); }
+    h1, h2 { color: var(--brand-blue); }
 
     /* ───── forms / cards ───── */
     .card { background: var(--paper); padding: 1.5rem; border-radius: 8px; max-width: 480px; }
@@ -141,10 +141,10 @@
     input[type=text], input[type=email], input[type=password], select, textarea {
       width: 100%; padding: 0.5rem; border: 1px solid var(--sleeper); border-radius: 4px; font: inherit;
     }
-    input:focus, select:focus { outline: 2px solid var(--uic-blue); outline-offset: 1px; }
-    button, .btn { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--uic-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; font: inherit; text-decoration: none; display: inline-block; }
-    button:hover, .btn:hover { background: var(--uic-blue-d); }
-    button.secondary { background: transparent; color: var(--uic-blue); border: 1px solid var(--uic-blue); }
+    input:focus, select:focus { outline: 2px solid var(--brand-blue); outline-offset: 1px; }
+    button, .btn { margin-top: 1rem; padding: 0.6rem 1.2rem; background: var(--brand-blue); color: white; border: 0; border-radius: 4px; cursor: pointer; font-weight: 600; font: inherit; text-decoration: none; display: inline-block; }
+    button:hover, .btn:hover { background: var(--brand-blue-d); }
+    button.secondary { background: transparent; color: var(--brand-blue); border: 1px solid var(--brand-blue); }
     button.secondary:hover { background: var(--paper); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
 
@@ -157,7 +157,7 @@
     /* ───── tables ───── */
     table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.9rem; }
     th, td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--sleeper); vertical-align: middle; }
-    th { background: #eef2f8; font-weight: 600; color: var(--uic-blue); }
+    th { background: #eef2f8; font-weight: 600; color: var(--brand-blue); }
     tr.changed { background: #fffbe6; }
 
     /* ───── footer ───── */
@@ -166,7 +166,7 @@
     footer .row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
     footer .row + .row { margin-top: 0.3rem; }
     footer .top-logo { height: 26px; background: #fff; border-radius: 4px; padding: 3px 8px; opacity: 0.95; }
-    footer strong { color: var(--uic-blue); }
+    footer strong { color: var(--brand-blue); }
     footer a { color: var(--rail-steel); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
     footer .copyright { font-style: italic; opacity: 0.85; }
@@ -180,7 +180,7 @@
     <div class="inner">
       <a href="/" class="lockup" aria-label="VIATOR home">
         <svg class="icon" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
-          <g fill="none" stroke="#1F3B66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+          <g fill="none" stroke="#1C75BC" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="8"  y1="8"  x2="32" y2="56"/>
             <line x1="56" y1="8"  x2="32" y2="56"/>
             <line x1="14" y1="20" x2="50" y2="20"/>
@@ -190,7 +190,7 @@
         </svg>
         <span>
           <span class="word">VIATOR</span>{# Version badge: comes from app/templating.py global, baked into the image at build time. #}<span class="ver" title="Build version (baked into the web image at build time). Also at /healthz/version.">{{ viator_version }}</span><br>
-          <span class="tag">UIC · MERITS Journey Planner</span>
+          <span class="tag">Journey-planner demonstrator</span>
         </span>
       </a>
       <nav>

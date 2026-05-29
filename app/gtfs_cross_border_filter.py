@@ -45,20 +45,22 @@ full multimodal national feed like SBB's:
     rail. Pass rail_only=False to consider every mode.
   - cross-border-ness: 2+ distinct UIC *country* prefixes among the stops.
 
-Limitations:
-  - Stops whose stop_id carries no parseable UIC — or whose 2-digit prefix
-    is not a recognised UIC country (UIC_COUNTRY_NAMES) — contribute
-    "unknown country" and don't count toward the 2+-country test. The
-    whitelist is what stops SBB's internal codes for local/foreign stops
-    (e.g. Evian = 1400001 -> "14") from faking a country. The flip side:
-    a cross-border service whose foreign leg is encoded ONLY with such an
-    internal code (no real foreign UIC anywhere on the route) won't be
-    detected. In practice major international stations carry real UICs, and
-    origin-country ownership takes those trains from the foreign NAP feed
-    anyway. A coordinate fallback (resolve a stop's country from its
-    lat/lon via the master_stations registry) is the planned follow-up for
-    full recall — deliberately out of scope here to keep this module
-    stdlib-only / DB-free.
+Country detection (two methods, in order):
+  1. The UIC country prefix in the stop_id (primary, exact). A 2-digit prefix
+     that isn't a recognised UIC country (UIC_COUNTRY_NAMES) is rejected — the
+     whitelist that stops SBB's internal codes for local/foreign stops
+     (e.g. Evian = 1400001 -> "14") from faking a country.
+  2. Point-in-polygon on the stop's coordinates (`osm_geo.country_for_point`,
+     bundled country-borders GeoJSON) — fired ONLY when the stop_id carries no
+     UIC-shaped code at all. This is what lets the filter work on feeds whose
+     stop_ids are internal codes, not UIC — notably Renfe's 5-digit codes
+     (17000, 37606), where every stop would otherwise be "unknown country" and
+     no route would look cross-border. Still stdlib-only / DB-free (the GeoJSON
+     ships in app/data/). See docs/cross-border-routing-as-built.md §1.3.
+
+     The fallback is deliberately surgical: a code that *has* a UIC-shaped
+     prefix which merely isn't whitelisted (1400001 -> "14") is still left
+     "unknown" — method 2 does not override the method-1 whitelist guard.
 """
 
 from __future__ import annotations
@@ -139,6 +141,10 @@ UIC_COUNTRY_NAMES: dict[str, str] = {
     "94": "PT",
 }
 
+# Reverse of UIC_COUNTRY_NAMES (ISO-2 -> UIC numeric prefix) for the
+# home_country origin-ownership gate.
+_UIC_PREFIX_BY_ISO: dict[str, str] = {iso: prefix for prefix, iso in UIC_COUNTRY_NAMES.items()}
+
 
 def country_prefix(stop_id: str | None) -> str | None:
     """Return the 2-digit UIC country prefix embedded in a stop_id, or None.
@@ -170,6 +176,48 @@ def _country_of(stop_id: str | None) -> str | None:
     """
     p = country_prefix(stop_id)
     return p if p is not None and p in UIC_COUNTRY_NAMES else None
+
+
+def _parse_coord(value: str | None) -> float | None:
+    """Parse a GTFS lat/lon cell to float, or None when blank/malformed."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _country_of_stop(stop_row: dict[str, str]) -> str | None:
+    """Country prefix for a stop: the UIC prefix in its stop_id, else a
+    point-in-polygon lookup on its coordinates.
+
+    The UIC path stays primary and exact (SNCF/SBB feeds key stops by UIC). The
+    coordinate fallback only fires for stop_ids that carry **no UIC-shaped code
+    at all** -- e.g. Renfe's 5-digit codes (`17000`, `37606`), where every stop
+    would otherwise resolve to "unknown country" and no route looks cross-border.
+
+    A code that *has* a UIC-shaped prefix which merely isn't a whitelisted country
+    (notably SBB-internal 7-digit codes like Evian = `1400001` -> "14") is left
+    "unknown" on purpose -- that is the #15 whitelist guard against internal codes
+    faking a crossing, and we don't override it with a coordinate guess.
+    """
+    sid = stop_row.get("stop_id")
+    prefix = _country_of(sid)
+    if prefix is not None:
+        return prefix
+    if country_prefix(sid) is not None:
+        # Has a UIC-shaped code, just not a whitelisted country → leave unknown.
+        return None
+    lat = _parse_coord(stop_row.get("stop_lat"))
+    lon = _parse_coord(stop_row.get("stop_lon"))
+    if lat is None or lon is None:
+        return None
+    # Lazy import: osm_geo imports this module, so a top-level import would cycle.
+    from . import osm_geo
+
+    iso = osm_geo.country_for_point(lat, lon)
+    return _UIC_PREFIX_BY_ISO.get(iso) if iso else None
 
 
 def _is_rail_route_type(route_type: str | None) -> bool:
@@ -205,11 +253,15 @@ class CrossBorderStats:
     # Which country pairs/sets appeared in kept routes, for a human sanity
     # read ("did we actually pick up FR↔CH, FR↔DE, …?").
     country_combos: dict[str, int] = field(default_factory=dict)
+    # v0.1.38 — origin-ownership home country (ISO-2). When set, only trips
+    # departing this country were kept; None = both directions kept.
+    home_country: str | None = None
 
     def summary_line(self) -> str:
         combos = ", ".join(f"{k}:{v}" for k, v in sorted(self.country_combos.items()))
+        home = f" home={self.home_country}" if self.home_country else ""
         return (
-            f"cross-border filter: kept {self.routes_kept}/{self.routes_rail} rail routes "
+            f"cross-border filter:{home} kept {self.routes_kept}/{self.routes_rail} rail routes "
             f"(of {self.routes_total} total), "
             f"{self.trips_kept}/{self.trips_total} trips, "
             f"{self.stops_kept}/{self.stops_total} stops "
@@ -317,7 +369,7 @@ def _stop_country_map(
     stop_parent: dict[str, str] = {}
     for s in stop_rows:
         sid = s.get("stop_id", "")
-        stop_country[sid] = _country_of(sid)
+        stop_country[sid] = _country_of_stop(s)
         parent = (s.get("parent_station") or "").strip()
         if parent:
             stop_parent[sid] = parent
@@ -327,29 +379,51 @@ def _stop_country_map(
     return stop_country, stop_parent
 
 
+def _stop_sequence(value: str | None) -> int:
+    """Parse a GTFS stop_sequence to int; an unparseable value returns a
+    large sentinel so that row is never mistaken for a trip's origin (the
+    lowest stop_sequence)."""
+    try:
+        return int((value or "").strip())
+    except ValueError:
+        return 1 << 30
+
+
 def _classify_routes(
     zin: zipfile.ZipFile,
     trip_route: dict[str, str],
     stop_country: dict[str, str | None],
     stats: CrossBorderStats,
-) -> tuple[set[str], dict[str, set[str]]]:
-    """Pass 1 over stop_times: accumulate route → {country prefixes}, then
-    return the set of routes spanning 2+ countries (plus the per-route
-    country sets for stats labelling)."""
+) -> tuple[set[str], dict[str, set[str]], dict[str, str | None]]:
+    """Pass 1 over stop_times. Returns:
+
+    - the set of routes whose stops span 2+ UIC countries (cross-border),
+    - the per-route country sets (for stats labelling),
+    - per-trip *origin* country: the country of the trip's lowest
+      stop_sequence stop, used by the home_country ownership gate.
+    """
     route_countries: dict[str, set[str]] = defaultdict(set)
+    # trip_id -> (lowest stop_sequence seen so far, country at that stop)
+    trip_origin_seq: dict[str, tuple[int, str | None]] = {}
     if _STOP_TIMES in zin.namelist():
         gen = _stream_csv(zin, _STOP_TIMES)
         _ = next(gen)  # fieldnames (unused in pass 1)
         for row in gen:
             stats.stop_times_total += 1
-            route_id = trip_route.get(row.get("trip_id", ""))
+            tid = row.get("trip_id", "")
+            route_id = trip_route.get(tid)
             if route_id is None:
                 continue
             ctry = stop_country.get(row.get("stop_id", ""))
             if ctry:
                 route_countries[route_id].add(ctry)
+            seq = _stop_sequence(row.get("stop_sequence"))
+            prev = trip_origin_seq.get(tid)
+            if prev is None or seq < prev[0]:
+                trip_origin_seq[tid] = (seq, ctry)
     cross_border = {rid for rid, ctrys in route_countries.items() if len(ctrys) >= 2}
-    return cross_border, route_countries
+    trip_origin = {tid: ctry for tid, (_seq, ctry) in trip_origin_seq.items()}
+    return cross_border, route_countries, trip_origin
 
 
 def _collect_stop_times(
@@ -452,7 +526,16 @@ def _write_filtered_feed(
         zout,
         _TRANSFERS,
         lambda r: (
-            r.get("from_stop_id", "") in kept.stop_ids and r.get("to_stop_id", "") in kept.stop_ids
+            r.get("from_stop_id", "") in kept.stop_ids
+            and r.get("to_stop_id", "") in kept.stop_ids
+            # Trip-to-trip transfers (in-seat / constrained — GTFS transfer_type
+            # 4/5) carry from_trip_id/to_trip_id. Drop the row if it references a
+            # trip we filtered out, even when both stops survived — otherwise
+            # OTP's strict GTFS reader aborts the whole build with
+            # EntityReferenceNotFoundException on the dangling trip. Absent trip
+            # fields ⇒ a plain stop-to-stop transfer, which is kept.
+            and (not r.get("from_trip_id") or r.get("from_trip_id", "") in kept.trip_ids)
+            and (not r.get("to_trip_id") or r.get("to_trip_id", "") in kept.trip_ids)
         ),
     )
     _read_filter_write(zin, zout, _FREQUENCIES, lambda r: r.get("trip_id", "") in kept.trip_ids)
@@ -460,7 +543,11 @@ def _write_filtered_feed(
 
 
 def filter_to_cross_border(
-    input_zip: Path, output_zip: Path, *, rail_only: bool = True
+    input_zip: Path,
+    output_zip: Path,
+    *,
+    rail_only: bool = True,
+    home_country: str | None = None,
 ) -> CrossBorderStats:
     """Filter a GTFS feed to only cross-border routes. Returns run stats.
 
@@ -472,10 +559,30 @@ def filter_to_cross_border(
 
     Set ``rail_only=False`` to classify every mode -- useful only for feeds
     you already know are rail-only.
+
+    ``home_country`` (ISO-2, e.g. ``"FR"``) enables *origin-country
+    ownership* for cross-NAP federation: only trips that **depart** that
+    country (their lowest-stop_sequence stop is in it) are kept, so the same
+    physical train isn't loaded twice when several national feeds are
+    federated. Each direction is owned by its departure country -- run the
+    SNCF feed with ``home_country="FR"`` and the SBB feed with ``"CH"`` and
+    Paris->Geneve comes from one feed, Geneve->Paris from the other, with no
+    overlap. ``None`` (default) keeps both directions.
     """
     input_zip = Path(input_zip)
     output_zip = Path(output_zip)
     stats = CrossBorderStats()
+
+    home_prefix: str | None = None
+    if home_country:
+        iso = home_country.strip().upper()
+        home_prefix = _UIC_PREFIX_BY_ISO.get(iso)
+        if home_prefix is None:
+            raise ValueError(
+                f"home_country={iso!r} is not a known UIC country ISO; "
+                f"valid: {sorted(_UIC_PREFIX_BY_ISO)}"
+            )
+        stats.home_country = iso
 
     with zipfile.ZipFile(input_zip) as zin:
         stop_fields, stop_rows = _read_csv(zin, _STOPS)
@@ -505,24 +612,34 @@ def filter_to_cross_border(
             if t.get("route_id", "") in rail_route_ids
         }
 
-        cross_border_routes, route_countries = _classify_routes(
+        cross_border_routes, route_countries, trip_origin = _classify_routes(
             zin, trip_route, stop_country, stats
         )
 
-        stats.routes_kept = len(cross_border_routes)
-        for rid in cross_border_routes:
+        # Trip-level keep set: on a cross-border route and -- when
+        # home_country is set -- *departing* the home country (origin gate).
+        kept_trip_ids = {
+            t.get("trip_id", "")
+            for t in trip_rows
+            if t.get("route_id", "") in cross_border_routes
+            and (home_prefix is None or trip_origin.get(t.get("trip_id", "")) == home_prefix)
+        }
+        # A route survives only if at least one of its trips did; the
+        # home_country gate can empty a route entirely.
+        kept_route_ids = {
+            t.get("route_id", "") for t in trip_rows if t.get("trip_id", "") in kept_trip_ids
+        }
+
+        stats.routes_kept = len(kept_route_ids)
+        for rid in kept_route_ids:
             # Sort by ISO name (not numeric prefix) so the label reads
             # alphabetically: "CH+IT", not "IT+CH".
             combo = "+".join(sorted(UIC_COUNTRY_NAMES.get(c, c) for c in route_countries[rid]))
             stats.country_combos[combo] = stats.country_combos.get(combo, 0) + 1
 
         kept = _KeptSets(
-            route_ids=cross_border_routes,
-            trip_ids={
-                t.get("trip_id", "")
-                for t in trip_rows
-                if t.get("route_id", "") in cross_border_routes
-            },
+            route_ids=kept_route_ids,
+            trip_ids=kept_trip_ids,
             service_ids=set(),
             shape_ids=set(),
             agency_ids=set(),
@@ -541,7 +658,7 @@ def filter_to_cross_border(
         kept.agency_ids = {
             r.get("agency_id", "")
             for r in route_rows
-            if r.get("route_id", "") in cross_border_routes and r.get("agency_id")
+            if r.get("route_id", "") in kept.route_ids and r.get("agency_id")
         }
 
         st_fields, st_rows, kept_stop_ids = _collect_stop_times(zin, kept.trip_ids, stats)
@@ -585,10 +702,19 @@ def _main() -> int:
         action="store_true",
         help="consider every route_type, not just rail (default: rail only)",
     )
+    parser.add_argument(
+        "--home-country",
+        metavar="ISO2",
+        default=None,
+        help="origin-ownership: keep only trips departing this ISO-2 country "
+        "(e.g. FR, CH) so federated national feeds don't duplicate trains",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    stats = filter_to_cross_border(args.input, args.output, rail_only=not args.all_modes)
+    stats = filter_to_cross_border(
+        args.input, args.output, rail_only=not args.all_modes, home_country=args.home_country
+    )
     print(stats.summary_line())
     return 0 if stats.routes_kept > 0 else 1
 

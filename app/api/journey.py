@@ -468,6 +468,34 @@ async def fanout(
             }
         )
 
+    # v0.1.41 — federated fallback (hub-and-spoke). When no single session
+    # returned an end-to-end itinerary, try stitching a domestic leg onto the
+    # cross-border spine at a data-derived hub (a stop both sessions serve).
+    # Only when the form sent UIC endpoints — the planner queries stations by
+    # UIC. Best-effort: a failure here never 500s the whole search.
+    # See docs/federated-planner-design.md.
+    federated_trips: list[dict[str, Any]] = []
+    if not merged_trips and body.from_.uic and body.to.uic:
+        import logging
+
+        from ..journey import federated_planner
+
+        try:
+            federated_trips = await federated_planner.plan_federated(
+                db,
+                origin_uic=body.from_.uic,
+                dest_uic=body.to.uic,
+                when=when,
+                sessions=list(sessions),
+                timeout_ms=timeout_ms,
+                session_timezone_for={s.id: _session_timezone(s) for s in sessions},
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("federated planner failed (non-fatal)")
+            federated_trips = []
+        if federated_trips and status != "error":
+            status = "ok"
+
     # v0.1.36 — Phase 2 structured comparison. When the OJP reference
     # returned itineraries, fingerprint each itinerary's *transit* leg
     # spine on both sides (walks stripped — coords rounded to ~11 m so
@@ -495,6 +523,11 @@ async def fanout(
         response["ojp_reference"] = ojp_reference
     if comparison_summary is not None:
         response["comparison_summary"] = comparison_summary
+    # Stitched cross-session itineraries (hub-and-spoke fallback). Rendered as a
+    # separate "Federated (via hub)" group in the journey UI — never merged into
+    # `trips`, since each spans 2+ sessions and a hub.
+    if federated_trips:
+        response["federated_trips"] = federated_trips
     return response
 
 

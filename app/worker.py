@@ -11,7 +11,9 @@ the operator having to shell in.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -42,6 +44,119 @@ _RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 # Hard-coding it (rather than `shutil.which`) also makes the security review
 # trivial: every subprocess invocation passes through this constant.
 _DOCKER = "/usr/local/bin/docker"
+
+
+def _host_total_gb() -> int | None:
+    """Best-effort host RAM in whole GB, read from /proc/meminfo.
+
+    `MemTotal` reflects the *host's* physical memory even from inside a
+    container (it's not cgroup-scoped), so it's a sound basis for warning
+    when a requested build heap simply won't fit the box. Returns None if
+    the file is unreadable (non-Linux dev box, locked-down sandbox).
+    """
+    try:
+        with Path("/proc/meminfo").open(encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+# ───────────────────── Max-memory rebuild (v0.1.38) ─────────────────────────
+# Observability containers stopped during a max-memory rebuild and restarted
+# afterward. Service names come from docker/docker-compose.yml. The core stack
+# (postgres / web / worker / nginx) is never touched — the build itself needs
+# the worker + DB, and the operator needs the UI. Serving OTP session
+# containers (otp-<sid>) are added dynamically from the DB.
+_OBSERVABILITY_SERVICES: tuple[str, ...] = (
+    "grafana",
+    "loki",
+    "promtail",
+    "prometheus",
+    "cadvisor",
+    "node-exporter",
+    "tempo",
+)
+
+# Records the services stopped for an in-flight max-memory rebuild so a worker
+# that dies mid-build can restart them on next boot (the normal restart runs in
+# run_build's `finally`; this is the crash-safety net).
+_MAXMEM_MARKER = Path("/data/generated/.max-mem-stopped")
+
+
+def _max_memory_stop_targets(serving_sids: list[str]) -> list[str]:
+    """Compose service names to stop for a max-memory rebuild: every serving
+    OTP session plus the observability stack. Pure — unit-tested."""
+    return [f"otp-{sid}" for sid in serving_sids] + list(_OBSERVABILITY_SERVICES)
+
+
+def _compose(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run `docker compose -p viator <args>` from the compose dir."""
+    return subprocess.run(  # noqa: S603
+        [_DOCKER, "compose", "-p", "viator", *args],
+        cwd="/srv/docker",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _log_safe(values: list[str]) -> str:
+    """Join service names with CR/LF stripped before logging.
+
+    These names trace back to the DB (session ids) and the recovery marker
+    file, so Sonar treats them as user-controlled; stripping line breaks
+    defeats log-forging via a crafted value (python S5145)."""
+    cleaned = [v.replace("\r\n", "").replace("\n", "").replace("\r", "") for v in values]
+    return " ".join(cleaned)
+
+
+def _stop_services(services: list[str]) -> None:
+    if not services:
+        return
+    log.info("max-memory rebuild: stopping %d containers: %s", len(services), _log_safe(services))
+    r = _compose("stop", *services)
+    if r.returncode != 0:
+        log.warning("max-memory stop exit=%s: %s", r.returncode, r.stderr.strip())
+
+
+def _start_services(services: list[str]) -> None:
+    if not services:
+        return
+    log.info("max-memory rebuild: restarting %d containers: %s", len(services), _log_safe(services))
+    r = _compose("start", *services)
+    if r.returncode != 0:
+        # `start` only revives existing stopped containers; if any were pruned,
+        # recreate them from config. `up -d` is the robust fallback.
+        log.warning(
+            "max-memory restart exit=%s (%s) — falling back to `up -d`",
+            r.returncode,
+            r.stderr.strip(),
+        )
+        _compose("up", "-d", "--no-deps", *services)
+
+
+def _recover_max_memory_stopped() -> None:
+    """Restart anything an interrupted max-memory rebuild left stopped.
+
+    The happy path restarts in run_build's `finally`; this covers the worker
+    being killed mid-build (after stopping containers, before the finally ran).
+    Best-effort: a failure here must never keep the worker from booting."""
+    try:
+        if not _MAXMEM_MARKER.exists():
+            return
+        services = [s for s in _MAXMEM_MARKER.read_text(encoding="utf-8").split() if s]
+        if services:
+            log.warning(
+                "recovering %d containers left stopped by an interrupted max-memory rebuild",
+                len(services),
+            )
+            _start_services(services)
+        _MAXMEM_MARKER.unlink(missing_ok=True)
+    except Exception:
+        log.exception("max-memory recovery failed at startup (non-fatal)")
 
 
 def _mark_orphaned_rebuild_jobs() -> int:
@@ -102,6 +217,10 @@ def main() -> None:
     except Exception:
         log.exception("orphan rebuild_jobs cleanup failed at startup (non-fatal)")
 
+    # v0.1.38 — restart any containers a max-memory rebuild left stopped if the
+    # previous worker died mid-build before its `finally` could run.
+    _recover_max_memory_stopped()
+
     while True:
         try:
             tick()
@@ -159,9 +278,10 @@ def tick() -> None:
         db.commit()
         job_id = job.id
         sid = job.session_id
+        max_memory = bool(job.max_memory)
 
-    log.info("running rebuild job %s (session=%s)", job_id, sid)
-    output, success, graph_path = run_build(session_id=sid)
+    log.info("running rebuild job %s (session=%s max_memory=%s)", job_id, sid, max_memory)
+    output, success, graph_path = run_build(session_id=sid, max_memory=max_memory)
 
     with SessionLocal() as db:
         job = db.get(RebuildJob, job_id)
@@ -473,8 +593,14 @@ def handle_reload_trigger() -> None:
     log.info("reload completed; trigger deleted")
 
 
-def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
-    """Invoke OTP build via the docker socket. Returns (log, success, graph_path)."""
+def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
+    """Invoke OTP build via the docker socket. Returns (log, success, graph_path).
+
+    When `max_memory` is set, the worker first stops the serving sessions +
+    observability stack to free the box, sizes the build heap to host RAM, runs
+    the build, then restarts everything (in a `finally`, so a build failure
+    still revives them). For the worst-case all-Europe build on a single VPS.
+    """
     sid = session_id or "_phase1"
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     graph_target = Path(str(settings.graph_dir)) / sid / timestamp
@@ -489,6 +615,7 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     from . import (
         ingestion,
         osm_filter,
+        osm_geo,
         otp_api_timeout,
         otp_heap,
         otp_timezone,
@@ -496,6 +623,10 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     )
 
     osm_scope = osm_filter.DEFAULT_SCOPE
+    # v0.1.40 — geographic OSM scope: crop the street graph to these served
+    # countries (orthogonal to osm_scope's tag filter). Empty ⇒ no crop
+    # (legacy sessions build unchanged). See docs/osm-geographic-scope-design.md.
+    osm_countries: list[str] = []
     # v0.1.21 — explicit transitModelTimeZone, required by OTP 2.9 when
     # the graph mixes agencies declaring different timezones (SNCF says
     # Europe/Paris, Eurostar says Europe/Brussels, etc). Default keeps
@@ -531,6 +662,12 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
                     osm_scope = osm_filter.validate_scope(row.config.get("osm_scope"))
                 except ValueError as exc:
                     log.warning("session %s has bad osm_scope: %s — using default", sid, exc)
+                try:
+                    osm_countries = osm_geo.validate_countries(row.config.get("osm_countries"))
+                except ValueError as exc:
+                    log.warning(
+                        "session %s has bad osm_countries: %s — skipping geo-crop", sid, exc
+                    )
                 try:
                     otp_tz = otp_timezone.validate_timezone(row.config.get("otp_timezone"))
                 except ValueError as exc:
@@ -649,6 +786,78 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         except Exception as exc:
             log.warning("session %s router-config.json write failed: %s", sid, exc)
 
+    # v0.1.40 — geographic OSM crop polygon. When the session selects
+    # `osm_countries`, write the merged country MultiPolygon to the inbox; the
+    # otp-build entrypoint runs `osmium extract --polygon` on it before the tag
+    # filter, so the street graph covers only the served countries. Written
+    # only when countries are set (else the entrypoint skips the crop). The
+    # inbox is mounted read-only into otp-build, so it lands here in the worker.
+    if session_id and osm_countries:
+        try:
+            session_inbox = ingestion.session_inbox(session_id)
+            session_inbox.mkdir(parents=True, exist_ok=True)
+            (session_inbox / "osm-crop.geojson").write_text(
+                json.dumps(osm_geo.crop_geojson(osm_countries)),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            log.warning("session %s osm-crop.geojson write failed: %s — no geo-crop", sid, exc)
+    elif session_id:
+        # No countries selected → ensure a stale crop file from a previous
+        # build doesn't silently keep cropping. Remove it if present.
+        stale = ingestion.session_inbox(session_id) / "osm-crop.geojson"
+        stale.unlink(missing_ok=True)
+
+    # v0.1.38 — max-memory rebuild: free the box and size the heap to host RAM
+    # before deriving the cap. The operator accepted stopping the journey-
+    # planner sessions for this build; the `finally` at the end restarts them
+    # (+ observability) so a build failure still revives the stack.
+    host_gb = _host_total_gb()
+    stopped_services: list[str] = []
+    if max_memory:
+        auto = otp_heap.auto_build_heap(host_gb) if host_gb is not None else None
+        if auto is not None:
+            log.info(
+                "max-memory rebuild: host=%dGB → auto build heap %s (was %s)",
+                host_gb,
+                auto,
+                otp_heap_value,
+            )
+            otp_heap_value = auto
+        else:
+            log.warning(
+                "max-memory rebuild requested but host RAM is unknown or too "
+                "small to auto-size — keeping configured heap %s",
+                otp_heap_value,
+            )
+        stopped_services = _max_memory_stop_targets(_list_serving_sessions())
+        try:
+            _MAXMEM_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            _MAXMEM_MARKER.write_text("\n".join(stopped_services), encoding="utf-8")
+        except OSError as exc:
+            log.warning("max-memory marker write failed (%s) — crash recovery off", exc)
+        _stop_services(stopped_services)
+
+    # Derive the build container's cgroup cap from the (possibly auto-sized)
+    # heap so a per-session heap bump can't silently exceed a stale
+    # OTP_BUILD_MEM_LIMIT and get OOM-killed (signal 9 `Killed`) mid-OSM-parse —
+    # the JVM never even reaches its own -Xmx. Injected via the subprocess
+    # environment so docker-compose's `mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}`
+    # interpolation picks it up (a process env var beats the project's .env).
+    mem_limit_value = otp_heap.mem_limit_for_heap(otp_heap_value)
+    needed_gb = otp_heap.heap_to_gb(mem_limit_value)
+    if host_gb is not None and needed_gb > host_gb:
+        log.warning(
+            "session %s build needs ~%dGB (heap=%s + native headroom) but host "
+            "has only %dGB RAM — build will likely OOM-kill. Lower the session "
+            "heap, crop the OSM to the corridor, or use max-memory rebuild.",
+            sid,
+            needed_gb,
+            otp_heap_value,
+            host_gb,
+        )
+    build_env = {**os.environ, "OTP_BUILD_MEM_LIMIT": mem_limit_value}
+
     cmd = [
         _DOCKER,
         "compose",
@@ -665,6 +874,12 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
         f"OTP_INBOX_DIR=/var/otp/inbox/{sid}",
         "-e",
         f"OTP_OSM_SCOPE={osm_scope}",
+        # v0.1.40 — geographic crop scope (CSV of ISO codes). The entrypoint
+        # geo-crops via osm-crop.geojson (written above) when this is non-empty;
+        # it's also part of the streetGraph cache key so toggling countries
+        # invalidates the cache.
+        "-e",
+        f"OTP_OSM_COUNTRIES={','.join(osm_countries)}",
         # v0.1.21 — required by OTP 2.9 when the graph mixes agency tzs.
         "-e",
         f"OTP_TIMEZONE={otp_tz}",
@@ -674,47 +889,69 @@ def run_build(*, session_id: str | None) -> tuple[str, bool, str]:
     # nothing user-supplied. Bandit S603 does not apply.
     # cwd=/srv/docker so `docker compose` finds docker-compose.yml + the
     # generated/ include directory (mounted from the host's /opt/viator/docker/).
-    proc = subprocess.run(  # noqa: S603
-        cmd,
-        cwd="/srv/docker",
-        capture_output=True,
-        text=True,
-        check=False,
+    log.info(
+        "session %s build: heap=%s mem_limit=%s (derived)",
+        sid,
+        otp_heap_value,
+        mem_limit_value,
     )
-    output = proc.stdout + "\n--- stderr ---\n" + proc.stderr
+    try:
+        proc = subprocess.run(  # noqa: S603
+            cmd,
+            cwd="/srv/docker",
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_env,
+        )
+        output = (
+            f"[viator] build resources: OTP_HEAP={otp_heap_value} "
+            f"OTP_BUILD_MEM_LIMIT={mem_limit_value} (cgroup cap derived from heap)\n"
+            + proc.stdout
+            + "\n--- stderr ---\n"
+            + proc.stderr
+        )
 
-    if proc.returncode != 0:
-        return output, False, ""
+        if proc.returncode != 0:
+            return output, False, ""
 
-    built = Path(str(settings.graph_dir)) / "graph.obj"
-    if not built.exists():
-        return output + "\nERROR: graph.obj not found after build", False, ""
+        built = Path(str(settings.graph_dir)) / "graph.obj"
+        if not built.exists():
+            return output + "\nERROR: graph.obj not found after build", False, ""
 
-    shutil.move(str(built), str(graph_target / "graph.obj"))
+        shutil.move(str(built), str(graph_target / "graph.obj"))
 
-    # If the entrypoint emitted router-config.json alongside the graph
-    # (v0.1.7 — generated from session.config.sources.providers[*].gtfs_rt),
-    # move it next to graph.obj so the serving otp-<sid> container picks
-    # up the GTFS-RT updaters at load time.
-    built_router_cfg = Path(str(settings.graph_dir)) / "router-config.json"
-    if built_router_cfg.exists():
-        shutil.move(str(built_router_cfg), str(graph_target / "router-config.json"))
+        # If the entrypoint emitted router-config.json alongside the graph
+        # (v0.1.7 — generated from session.config.sources.providers[*].gtfs_rt),
+        # move it next to graph.obj so the serving otp-<sid> container picks
+        # up the GTFS-RT updaters at load time.
+        built_router_cfg = Path(str(settings.graph_dir)) / "router-config.json"
+        if built_router_cfg.exists():
+            shutil.move(str(built_router_cfg), str(graph_target / "router-config.json"))
 
-    current = Path(str(settings.graph_dir)) / sid / "current"
-    if current.exists() or current.is_symlink():
-        current.unlink()
-    # IMPORTANT: relative target. The symlink lives inside a Docker volume
-    # that's mounted at different paths in different containers (worker:
-    # /data/graphs/<sid>/, otp-<sid>: /var/otp/graph/<sid>/). An absolute
-    # target would only resolve in the worker's namespace; the otp serving
-    # container would fail at startup with "graph.obj: No such file or
-    # directory". A relative target (`current -> 20260429-042955`) works in
-    # any container that mounts the volume.
-    current.symlink_to(graph_target.name, target_is_directory=True)
+        current = Path(str(settings.graph_dir)) / sid / "current"
+        if current.exists() or current.is_symlink():
+            current.unlink()
+        # IMPORTANT: relative target. The symlink lives inside a Docker volume
+        # that's mounted at different paths in different containers (worker:
+        # /data/graphs/<sid>/, otp-<sid>: /var/otp/graph/<sid>/). An absolute
+        # target would only resolve in the worker's namespace; the otp serving
+        # container would fail at startup with "graph.obj: No such file or
+        # directory". A relative target (`current -> 20260429-042955`) works in
+        # any container that mounts the volume.
+        current.symlink_to(graph_target.name, target_is_directory=True)
 
-    _prune_old_graphs(sid, keep=3)
+        _prune_old_graphs(sid, keep=3)
 
-    return output, True, str(graph_target)
+        return output, True, str(graph_target)
+    finally:
+        # Always revive what a max-memory rebuild stopped — even on build
+        # failure or an exception promoting the graph. The serving containers
+        # re-read their `current` symlink, so a rebuilt session comes back on
+        # the fresh graph.
+        if max_memory and stopped_services:
+            _start_services(stopped_services)
+            _MAXMEM_MARKER.unlink(missing_ok=True)
 
 
 def _prune_old_graphs(sid: str, keep: int) -> None:

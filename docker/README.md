@@ -38,7 +38,7 @@ The complete VPS install runbook lives in **`./INSTALL.md`** (URLs, sizing, hard
 
 ```bash
 # Clone + configure
-git clone https://github.com/TOP-PHE/VIATOR-a-MERITS-OpenTrip-Planner-demonstrator.git /opt/viator
+git clone https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator.git /opt/viator
 cd /opt/viator/docker
 cp .env.example .env && nano .env
 

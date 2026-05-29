@@ -14,6 +14,7 @@ Phase-A.5 wiring (this file):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -279,6 +280,21 @@ def patch_session(
             try:
                 body.config["otp_api_timeout"] = _otp_api_timeout.validate_timeout(
                     body.config["otp_api_timeout"]
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+
+        # v0.1.40 — validate osm_countries (the GEOGRAPHIC scope: crop the OSM
+        # street graph to these served countries, orthogonal to osm_scope's
+        # tag filter). Same fail-fast pattern; an unknown ISO code 400s here
+        # rather than producing an empty crop polygon at build time. See
+        # docs/osm-geographic-scope-design.md.
+        if "osm_countries" in body.config:
+            from ... import osm_geo as _osm_geo
+
+            try:
+                body.config["osm_countries"] = _osm_geo.validate_countries(
+                    body.config["osm_countries"]
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -675,6 +691,11 @@ async def upload_to_session(
     if s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
 
+    # §12 — uploading a national feed cascades to any cross-border views derived
+    # from it (same single-source-of-truth rule as refresh). The scan is cheap and
+    # finds nothing when this upload wasn't a provider feed something links to.
+    cascaded = await _cascade_derived_refresh(db, sid)
+
     audit.record(
         db,
         action="session.upload",
@@ -689,6 +710,7 @@ async def upload_to_session(
             "size_bytes": size,
             "triggered_rebuild": triggered,
             "provider_feed_id": provider_feed_id,
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
@@ -792,6 +814,46 @@ def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
     return declared - present
 
 
+def _safe_float(v: str | None) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+_ZIP_GLOB = "*.zip"
+
+
+def _read_gtfs_stops(zip_path: Path) -> list[tuple[str | None, float | None, float | None]]:
+    """Read `(stop_id, stop_lat, stop_lon)` from a GTFS zip's stops.txt.
+
+    Best-effort for the osm-countries auto-detect: a missing / garbled
+    stops.txt yields `[]`, and unparseable coordinates become None (the
+    detector then leans on the UIC prefix). Never raises.
+    """
+    import csv
+    import io
+    import zipfile
+
+    out: list[tuple[str | None, float | None, float | None]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open("stops.txt") as fh:
+            reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig"))
+            for row in reader:
+                out.append(
+                    (
+                        row.get("stop_id"),
+                        _safe_float(row.get("stop_lat")),
+                        _safe_float(row.get("stop_lon")),
+                    )
+                )
+    except (KeyError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
+        return out
+    return out
+
+
 def _safe_filename(name: str) -> str:
     """Strip path components and dodgy chars from an uploaded filename."""
     base = Path(name).name
@@ -822,6 +884,10 @@ class RefreshSourcesResponse(BaseModel):
     # to the operator so they can verify the build picks up only the
     # currently-configured providers.
     orphaned: list[str] = []
+    # §12 — derived cross-border feeds in *other* sessions that were rebuilt
+    # because they link to a provider in this (national) session. Empty unless
+    # this refresh actually changed a national feed something derives from.
+    cascaded: list[dict[str, Any]] = []
 
 
 # v0.1.19 — per-provider fetch status, surfaced on the provider cards in the
@@ -883,27 +949,11 @@ async def refresh_sources(
     staging = settings.inbox_dir / sid / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
 
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-
     # v0.1.14: providers-only by default. OSM PBF lives behind its own
     # endpoint so refreshing a GTFS feed doesn't accidentally bust the
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(s.config or {}, include_osm=False)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            outcome = await _refresh_one_task(
-                client,
-                db,
-                sid,
-                staging,
-                task,
-            )
-            if outcome.get("status") == "fetched":
-                fetched.append({k: v for k, v in outcome.items() if k != "status"})
-            else:
-                skipped.append({k: v for k, v in outcome.items() if k != "status"})
+    fetched, skipped = await _gather_refresh_outcomes(db, sid, staging, s.config or {}, work)
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
@@ -917,6 +967,13 @@ async def refresh_sources(
             s.config = {}
         staleness.mark_refresh_completed(s.config)
         flag_modified(s, "config")
+
+    # §12 — single-source-of-truth cascade. When this session's feeds actually
+    # changed, re-derive every cross_border_filter provider (in other sessions)
+    # that's linked to a provider here. So refreshing the Renfe national feed
+    # automatically rebuilds the corridors cross-border view — no human has to
+    # remember the second one.
+    cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
 
     # PR #33 — sweep orphaned inbox files left behind by providers that
     # used to be in `sources.providers` but no longer are. Without this,
@@ -939,10 +996,13 @@ async def refresh_sources(
             "fetched": [f["key"] for f in fetched],
             "skipped": [s_["key"] for s_ in skipped],
             "orphaned": orphaned,  # PR #33
+            "cascaded": _cascade_keys(cascaded),
         },
     )
     db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped, orphaned=orphaned)
+    return RefreshSourcesResponse(
+        fetched=fetched, skipped=skipped, orphaned=orphaned, cascaded=cascaded
+    )
 
 
 # ──── OSM-only refresh (v0.1.14) ────
@@ -1223,6 +1283,153 @@ def _build_refresh_tasks(
         tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks
+
+
+async def _materialise_derived_provider(
+    db: DbSession, target_sid: str, provider: dict[str, Any], staging: Path
+) -> dict[str, Any] | None:
+    """Run the cross-border filter for one derived provider into `target_sid`'s slot.
+
+    Returns an outcome dict (fetched/skipped), or None when `provider` isn't a
+    `cross_border_filter` provider. The CPU/IO filter runs in a worker thread (it
+    touches no DB); `dispatch` (which does) runs on the event loop. See
+    docs/provider-source-modes-design.md §12.
+    """
+    from app import gtfs_cross_border_filter as xb
+
+    tt = provider.get("timetable") or {}
+    if tt.get("source") != "cross_border_filter":
+        return None
+    pid = provider["id"]
+    key = f"provider[{pid}].cross_border_filter"
+    df = tt.get("derived_from") or {}
+    src_session, src_provider = df.get("session_id"), df.get("provider_id")
+    src_slot = (
+        settings.inbox_dir
+        / str(src_session)
+        / "gtfs"
+        / ingestion.gtfs_staged_filename(str(src_provider))
+    )
+    if not src_slot.exists():
+        return {
+            "status": "skipped",
+            "key": key,
+            "error": f"source feed not found: {src_session}/{src_provider} (refresh that session first)",
+        }
+    out_tmp = staging / f"{pid.lower()}-xb.zip"
+    try:
+        stats = await asyncio.to_thread(
+            xb.filter_to_cross_border,
+            src_slot,
+            out_tmp,
+            rail_only=bool(tt.get("rail_only", True)),
+            home_country=tt.get("home_country"),
+        )
+    except Exception as exc:  # a malformed source feed shouldn't 500 the refresh
+        # Log only the exception type — session/provider ids + exc are operator-
+        # controlled (path/config/feed) so they don't belong raw in a log line
+        # (S5145). The full hint goes to the API response.
+        log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
+        return {"status": "skipped", "key": key, "error": f"filter failed: {exc}"}
+    ingestion.dispatch(
+        out_tmp,
+        ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
+        db,
+        session_id=target_sid,
+        staged_filename=ingestion.gtfs_staged_filename(pid),
+    )
+    return {
+        "status": "fetched",
+        "key": key,
+        "routes_kept": stats.routes_kept,
+        "trips_kept": stats.trips_kept,
+        "summary": stats.summary_line(),
+    }
+
+
+async def _run_derived_filters(
+    db: DbSession, sid: str, config: dict[str, Any], staging: Path
+) -> list[dict[str, Any]]:
+    """Materialise every `cross_border_filter` provider declared in this session."""
+    try:
+        providers = ingestion.normalize_providers(config)
+    except ValueError:
+        return []
+    outcomes: list[dict[str, Any]] = []
+    for p in providers:
+        outcome = await _materialise_derived_provider(db, sid, p, staging)
+        if outcome is not None:
+            outcomes.append(outcome)
+    return outcomes
+
+
+def _is_derived_from(provider: dict[str, Any], source_session_id: str) -> bool:
+    """True if `provider` is a cross_border_filter feed linked to source_session_id."""
+    tt = provider.get("timetable") or {}
+    if tt.get("source") != "cross_border_filter":
+        return False
+    return (tt.get("derived_from") or {}).get("session_id") == source_session_id
+
+
+def _cascade_keys(cascaded: list[dict[str, Any]]) -> list[str]:
+    """Compact `target_session:key` labels for audit metadata."""
+    return [f"{c['target_session']}:{c['key']}" for c in cascaded]
+
+
+async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> list[dict[str, Any]]:
+    """Re-derive every `cross_border_filter` provider (in any *other* session)
+    linked to `source_session_id`.
+
+    The single-source-of-truth cascade: when a national feed refreshes, the
+    cross-border views derived from it rebuild automatically — no operator has
+    to remember to refresh the second feed. See provider-source-modes-design.md §12.
+    """
+    outcomes: list[dict[str, Any]] = []
+    for target in db.execute(select(SessionRow)).scalars().all():
+        if target.id == source_session_id:
+            continue
+        try:
+            providers = ingestion.normalize_providers(target.config or {})
+        except ValueError:
+            continue
+        linked = [p for p in providers if _is_derived_from(p, source_session_id)]
+        if not linked:
+            continue
+        staging = settings.inbox_dir / target.id / "_staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        for p in linked:
+            outcome = await _materialise_derived_provider(db, target.id, p, staging)
+            if outcome is not None:
+                outcomes.append({**outcome, "target_session": target.id})
+    return outcomes
+
+
+async def _gather_refresh_outcomes(
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    config: dict[str, Any],
+    work: list[_RefreshTask],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run the URL-download tasks then the derived (cross_border_filter)
+    providers, partitioning every outcome into (fetched, skipped).
+
+    Derived providers are materialised after the URL downloads so a same-session
+    national+derived pair resolves in one refresh (see
+    docs/provider-source-modes-design.md §12)."""
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    def _record(outcome: dict[str, Any]) -> None:
+        bucket = fetched if outcome.get("status") == "fetched" else skipped
+        bucket.append({k: v for k, v in outcome.items() if k != "status"})
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            _record(await _refresh_one_task(client, db, sid, staging, task))
+    for outcome in await _run_derived_filters(db, sid, config, staging):
+        _record(outcome)
+    return fetched, skipped
 
 
 # v0.1.19 — pure state-derivation helper. Lives alongside `_build_refresh_tasks`
@@ -1688,6 +1895,117 @@ async def import_providers_from_nap(
 # ──── per-provider refresh endpoint (v0.1.6) ────
 
 
+_AUDIT_ACTION_PROVIDER_REFRESHED = "session.provider.refreshed"
+
+
+def _finalise_provider_refresh(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    pid: str,
+    fetched: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> RefreshSourcesResponse:
+    """Shared tail for both per-provider refresh paths: advance state, clear the
+    staleness flag (lossy-by-design — see refresh_sources), audit, commit."""
+    if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        session.state = SessionState.POPULATED.value
+    if fetched:
+        if session.config is None:
+            session.config = {}
+        staleness.mark_refresh_completed(session.config)
+        flag_modified(session, "config")
+
+    audit.record(
+        db,
+        action=_AUDIT_ACTION_PROVIDER_REFRESHED,
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "provider_id": pid,
+            "fetched": [f["key"] for f in fetched],
+            "skipped": [s_["key"] for s_ in skipped],
+        },
+    )
+    db.commit()
+    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+
+
+async def _refresh_derived_provider(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    provider: dict[str, Any],
+    staging: Path,
+) -> RefreshSourcesResponse:
+    """Per-provider 'Refresh' for a cross_border_filter provider: re-run the
+    filter on the linked national feed into this provider's slot (it owns no URL
+    to download)."""
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    outcome = await _materialise_derived_provider(db, sid, provider, staging)
+    if outcome is not None:
+        bucket = fetched if outcome.get("status") == "fetched" else skipped
+        bucket.append({k: v for k, v in outcome.items() if k != "status"})
+    return _finalise_provider_refresh(
+        db,
+        request=request,
+        actor=actor,
+        session=session,
+        sid=sid,
+        pid=provider["id"],
+        fetched=fetched,
+        skipped=skipped,
+    )
+
+
+async def _refresh_provider_urls(
+    db: DbSession,
+    *,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    pid: str,
+    staging: Path,
+) -> RefreshSourcesResponse:
+    """Per-provider 'Refresh' for a url-source provider: download its timetable +
+    optional MCT + stations CSV into the slot."""
+    work = _build_refresh_tasks(session.config or {}, only_provider=pid)
+    if not work:
+        raise HTTPException(
+            400,
+            f"Provider {pid!r} has no URLs to refresh "
+            "(no timetable, MCT, or stations CSV configured).",
+        )
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            outcome = await _refresh_one_task(client, db, sid, staging, task)
+            (fetched if outcome.get("status") == "fetched" else skipped).append(
+                {k: v for k, v in outcome.items() if k != "status"}
+            )
+    return _finalise_provider_refresh(
+        db,
+        request=request,
+        actor=actor,
+        session=session,
+        sid=sid,
+        pid=pid,
+        fetched=fetched,
+        skipped=skipped,
+    )
+
+
 @router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
 async def refresh_provider(
     sid: str,
@@ -1696,17 +2014,13 @@ async def refresh_provider(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
-    """Download just one provider's files (timetable + optional MCT + optional
-    stations CSV). Doesn't touch the session-level OSM PBF — different concern,
-    much heavier file.
+    """Refresh one provider. URL-source providers download their files; a
+    cross_border_filter (derived) provider re-runs the filter on its linked
+    national feed. Doesn't touch the session-level OSM PBF — different, heavier
+    concern.
 
     Use case: operator just added IDFM to a session that already has SNCF
-    serving live. They click "Refresh" on IDFM's card and only IDFM's URLs
-    are fetched. SNCF stays live without unnecessary re-download.
-
-    Side effect: dispatch() queues a rebuild iff a routable kind landed
-    (GTFS or NeTEx). Worker debounces and runs phase-1-cached / phase-2 only
-    in v0.1.7 once streetGraph caching ships; today still runs both phases.
+    serving live. They click "Refresh" on IDFM's card and only IDFM is touched.
     """
     s = db.get(SessionRow, sid)
     if s is None:
@@ -1720,7 +2034,8 @@ async def refresh_provider(
         providers = ingestion.normalize_providers(s.config or {})
     except ValueError as exc:
         raise HTTPException(400, f"Session config is invalid: {exc}") from exc
-    if not any(p["id"] == pid for p in providers):
+    provider = next((p for p in providers if p["id"] == pid), None)
+    if provider is None:
         raise HTTPException(
             404,
             f"Provider {pid!r} not found in session {sid!r}. "
@@ -1730,51 +2045,15 @@ async def refresh_provider(
     staging = settings.inbox_dir / sid / "_staging"
     staging.mkdir(parents=True, exist_ok=True)
 
-    work = _build_refresh_tasks(s.config or {}, only_provider=pid)
-    if not work:
-        raise HTTPException(
-            400,
-            f"Provider {pid!r} has no URLs to refresh "
-            "(no timetable, MCT, or stations CSV configured).",
+    # Derived providers own no URL — "Refresh this provider" re-runs the filter
+    # instead of downloading (without this the URL path 400s "no URLs to refresh").
+    if (provider.get("timetable") or {}).get("source") == "cross_border_filter":
+        return await _refresh_derived_provider(
+            db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
         )
-
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            outcome = await _refresh_one_task(client, db, sid, staging, task)
-            (fetched if outcome.get("status") == "fetched" else skipped).append(
-                {k: v for k, v in outcome.items() if k != "status"}
-            )
-
-    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-        s.state = SessionState.POPULATED.value
-
-    # Same staleness clear as the session-wide refresh — see refresh_sources
-    # for the lossy-by-design caveat (per-provider refresh clears the flag
-    # globally, even if other providers' URLs were also edited but not yet
-    # re-downloaded).
-    if fetched:
-        if s.config is None:
-            s.config = {}
-        staleness.mark_refresh_completed(s.config)
-        flag_modified(s, "config")
-
-    audit.record(
-        db,
-        action="session.provider.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "provider_id": pid,
-            "fetched": [f["key"] for f in fetched],
-            "skipped": [s_["key"] for s_ in skipped],
-        },
+    return await _refresh_provider_urls(
+        db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
-    db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
 
 
 # ───────────────────────── per-provider status (v0.1.19) ─────────────────────
@@ -1826,7 +2105,7 @@ def get_providers_status(
         .where(
             AuditEvent.target_kind == "session",
             AuditEvent.target_id == sid,
-            AuditEvent.action.in_(["session.sources.refreshed", "session.provider.refreshed"]),
+            AuditEvent.action.in_(["session.sources.refreshed", _AUDIT_ACTION_PROVIDER_REFRESHED]),
         )
         .order_by(desc(AuditEvent.ts))
         .limit(1)
@@ -1904,6 +2183,79 @@ class RebuildJobResponse(BaseModel):
     duration_seconds: int | None = None  # finished_at - started_at, when both exist
     snapshot: SnapshotInfo | None = None  # joined from graph_snapshots by rebuild_job_id
     cache_hit: bool | None = None  # parsed from log; None when not detectable
+    max_memory: bool = False  # v0.1.38 — job ran (or will run) in max-memory mode
+
+
+class OsmCountryRow(BaseModel):
+    iso: str
+    name: str
+    stops: int  # stops detected in this country (UIC prefix or coordinate)
+    declared: bool  # a provider declared country_iso = this
+    suggested: bool  # should be pre-ticked (declared OR ≥ threshold stops)
+    selected: bool  # currently saved in session.config.osm_countries
+
+
+class OsmCountriesResponse(BaseModel):
+    threshold: int  # min stops to auto-suggest (the UI shows the rule)
+    selected: list[str]  # currently-saved osm_countries
+    countries: list[OsmCountryRow]  # full v1 list, ordered for the checklist
+
+
+@router.get("/{sid}/osm-countries", responses={404: {"description": "Session not found"}})
+def suggest_osm_countries(
+    sid: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> OsmCountriesResponse:
+    """Geographic-scope suggestion for the session's Configure form.
+
+    Combines two signals: countries the providers **declare** (`country_iso`)
+    and countries **detected** from the staged GTFS stops (UIC prefix +
+    coordinate). Pre-ticks declared countries plus any with >= threshold
+    stops. The full v1 list is
+    returned with per-country stop counts so the operator sees *why* each box
+    is (un)ticked and can override — e.g. a 2-stop UK is a visible one-click
+    add. See docs/osm-geographic-scope-design.md.
+    """
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    from ... import osm_geo
+
+    cfg = s.config or {}
+    try:
+        providers = ingestion.normalize_providers(cfg)
+    except ValueError:
+        providers = []
+    declared = {
+        p["country_iso"] for p in providers if p.get("country_iso")
+    } & osm_geo.VALID_COUNTRIES
+
+    stops: list[tuple[str | None, float | None, float | None]] = []
+    gtfs_dir = ingestion.session_inbox(sid) / "gtfs"
+    if gtfs_dir.exists():
+        for zip_path in sorted(gtfs_dir.glob(_ZIP_GLOB)):
+            stops.extend(_read_gtfs_stops(zip_path))
+    counts = osm_geo.detect_from_stops(stops)
+
+    suggested = declared | set(osm_geo.suggested_countries(counts))
+    selected = set(osm_geo.validate_countries(cfg.get("osm_countries")))
+    rows = [
+        OsmCountryRow(
+            iso=iso,
+            name=name,
+            stops=counts.get(iso, 0),
+            declared=iso in declared,
+            suggested=iso in suggested,
+            selected=iso in selected,
+        )
+        for iso, name in osm_geo.COUNTRY_NAMES.items()
+    ]
+    return OsmCountriesResponse(
+        threshold=osm_geo.SUGGEST_MIN_STOPS,
+        selected=sorted(selected),
+        countries=rows,
+    )
 
 
 @router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
@@ -1912,9 +2264,16 @@ def enqueue_rebuild(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    max_memory: bool = False,
 ) -> RebuildJobResponse:
     """Manually enqueue a rebuild for this session. Idempotent — coalesces
     with any existing pending job for the same session.
+
+    `max_memory=true` (UI checkbox) marks the job so the worker stops the
+    serving sessions + observability stack, sizes the build heap to host RAM,
+    runs the build, then restarts everything — the "worst-case build on a
+    single box" path. When coalescing into an existing pending job, the flag
+    only ever upgrades (a max-memory request wins over a plain one).
 
     Refuses (400) when inputs aren't staged on disk. The OTP build itself
     fails ~30 seconds in with "no OSM data available" if you skip the
@@ -1932,10 +2291,10 @@ def enqueue_rebuild(
     # the filesystem directly.
     sess_inbox = ingestion.session_inbox(sid)
     gtfs_zips = (
-        sorted((sess_inbox / "gtfs").glob("*.zip")) if (sess_inbox / "gtfs").exists() else []
+        sorted((sess_inbox / "gtfs").glob(_ZIP_GLOB)) if (sess_inbox / "gtfs").exists() else []
     )
     netex_zips = (
-        sorted((sess_inbox / "netex").glob("*.zip")) if (sess_inbox / "netex").exists() else []
+        sorted((sess_inbox / "netex").glob(_ZIP_GLOB)) if (sess_inbox / "netex").exists() else []
     )
     osm_pbfs = sorted((sess_inbox / "osm").glob("*.pbf")) if (sess_inbox / "osm").exists() else []
     if not (gtfs_zips or netex_zips):
@@ -1958,14 +2317,22 @@ def enqueue_rebuild(
         .filter(RebuildJob.session_id == sid)
         .first()
     )
+    suffix = " (max-memory)" if max_memory else ""
     if pending is None:
         pending = RebuildJob(
             session_id=sid,
             status="pending",
-            log=f"queued at {datetime.now(UTC).isoformat()} — manual trigger\n",
+            max_memory=max_memory,
+            log=f"queued at {datetime.now(UTC).isoformat()} — manual trigger{suffix}\n",
         )
         db.add(pending)
         db.flush()
+    elif max_memory and not pending.max_memory:
+        # Upgrade an already-pending plain rebuild to max-memory.
+        pending.max_memory = True
+        pending.log = (pending.log or "") + (
+            f"upgraded to max-memory at {datetime.now(UTC).isoformat()}\n"
+        )
 
     audit.record(
         db,
@@ -1974,7 +2341,7 @@ def enqueue_rebuild(
         actor_ip=client_ip(request),
         target_kind="session",
         target_id=sid,
-        metadata={"job_id": str(pending.id)},
+        metadata={"job_id": str(pending.id), "max_memory": max_memory},
     )
     db.commit()
     db.refresh(pending)
@@ -2085,6 +2452,7 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
         duration_seconds=duration_seconds,
         snapshot=snapshot_info,
         cache_hit=classification["cache_hit"],
+        max_memory=bool(j.max_memory),
     )
 
 

@@ -80,7 +80,10 @@
                 </div>
               </fieldset>
               <label>OSM PBF URL <code>(.osm.pbf)</code></label>
-              <input type="url" name="osm_pbf" placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
+              {# Full-width so a long Geofabrik URL is readable without
+                 scrolling inside the field (UX, v0.1.40). #}
+              <input type="url" name="osm_pbf" style="width: 100%; box-sizing: border-box"
+                     placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
               <p class="hint" style="margin-top: 0.25rem">
                 Must cover every region your providers reach. France-wide PBF + IDFM
                 Paris GTFS is fine; IDF-only PBF + nationwide SNCF GTFS will fail to snap
@@ -114,6 +117,26 @@
                 addresses (driveable roads are gone), so the journey UI's free-text address
                 search loses precision — fine for station-to-station rail demonstrators.
                 Default for new sessions: <code>transit-focused</code>.
+              </p>
+              {# v0.1.40 — geographic OSM scope (orthogonal to the tag scope
+                 above): crop the street graph to the served countries via
+                 osmium extract, so build memory tracks the routed scope, not
+                 the PBF size. Populated by loadOsmCountries() from
+                 GET /api/sessions/<sid>/osm-countries when the section expands. #}
+              {# A <p> heading, not a <label>: it heads a group of checkboxes,
+                 not a single form control (Web:S6853). #}
+              <p style="margin: 0.6rem 0 0.2rem"><strong>Geographic scope</strong>
+                <span class="hint">(countries — crop the OSM street graph; orthogonal to OSM scope)</span>
+              </p>
+              <div data-role="osm-countries" data-sid="{{ s.id }}"
+                   style="border: 1px solid #d4d9e2; border-radius: 6px; padding: 0.5rem; max-height: 220px; overflow: auto">
+                <em class="hint">Loading countries…</em>
+              </div>
+              <p class="hint" style="margin-top: 0.25rem">
+                Pre-ticked = a provider declared the country, or ≥ 5 stops were detected
+                (the count is shown per country). Untick to shrink the build (less RAM/time);
+                tick a neighbour for a cross-border corridor. Leave all unticked = no crop
+                (whole PBF).
               </p>
               {# v0.1.21 — `transitModelTimeZone`. OTP 2.9 refuses to build a
                  graph that mixes agencies with different declared timezones
@@ -340,6 +363,12 @@
               <button type="button" data-action="promote" data-sid="{{ s.id }}">Promote to serving</button>
               <button type="button" data-action="refresh-jobs" data-sid="{{ s.id }}" class="secondary">Refresh job list</button>
             </div>
+            <label class="hint" style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem">
+              <input type="checkbox" data-role="maxmem" data-sid="{{ s.id }}">
+              <span><strong>Max-memory rebuild</strong> — stops the serving sessions + observability
+              stack and sizes the build heap to host RAM, then restarts them when done. For the
+              worst-case (e.g. all-Europe) build on a single box. Other sessions are briefly offline.</span>
+            </label>
             <div data-role="jobs" data-sid="{{ s.id }}" style="margin-top: 0.75rem">
               <em class="hint">Job list will load when this section is expanded.</em>
             </div>
@@ -697,6 +726,16 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       loadJobs(sid);
     }
   });
+  // v0.1.40 — populate the geographic-scope country checklist on expand, in a
+  // *separate* listener so the (pre-existing, already-complex) expand handler
+  // above is left untouched. Registered after it, so aria-expanded is already
+  // flipped to the new state when this runs.
+  row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
+    if (e.target.getAttribute('aria-expanded') !== 'true') return;  // only on expand
+    const d = document.querySelector(`tr.detail-row[data-sid-detail="${sid}"]`);
+    const el = d?.querySelector('div[data-role="osm-countries"]');
+    if (el) loadOsmCountries(sid, el);
+  });
 });
 
 // ─── Staleness banner (v0.1.7.1) ────────────────────────────────────
@@ -770,6 +809,112 @@ function escHTML(s) {
 // correctly (it must match the provider's declared format server-side).
 const TIMETABLE_DECLARED_KIND = {gtfs: 'GTFS', netex_nordic: 'NeTEx-Nordic', netex_epip: 'NeTEx-EPIP'};
 
+// Timetable content-source rows (URL / Upload / Cross-border-filter). Extracted
+// from providerCardHTML so each function's cognitive complexity stays under the
+// limit — these three rows carry most of the per-source ternaries.
+function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
+  return `
+          <div class="prov-tt-url-row" ${ttSource === 'url' ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <label>URL <code>(.zip)</code></label>
+            <input class="prov-tt-url" type="url" value="${escAttr(tt.url)}"
+                   placeholder="https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip">
+          </div>
+          <div class="prov-tt-upload-row" ${ttSource === 'upload' ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <label>File <code>(.zip)</code></label>
+            <div class="prov-upload-controls">
+              <input class="prov-tt-file" type="file" accept=".zip,.xml">
+              <button type="button" class="secondary" data-action="upload-provider"
+                      title="Upload this file and attach it to this provider (save the session first)">⤴ Upload to this provider</button>
+            </div>
+            <p class="prov-current-file hint" style="margin: 0.3rem 0 0">No file attached yet.</p>
+            <p class="hint" style="margin: 0.15rem 0 0">
+              The file lands at this provider's own slot (<code>&lt;feed_id&gt;.zip</code>).
+              Save the session first so the provider exists, then upload.
+            </p>
+          </div>
+          <div class="prov-tt-derived-row" ${ttSource === 'cross_border_filter' ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <div class="prov-grid-3">
+              <div>
+                <label>From session <span class="hint">(national feed)</span></label>
+                <select class="prov-derived-session" data-value="${escAttr(df.session_id)}">
+                  <option value="${escAttr(df.session_id)}" selected>${escHTML(df.session_id || '— choose national session —')}</option>
+                </select>
+              </div>
+              <div>
+                <label>From provider <span class="hint">(its feedId)</span></label>
+                <select class="prov-derived-provider" data-value="${escAttr(df.provider_id)}">
+                  <option value="${escAttr(df.provider_id)}" selected>${escHTML(df.provider_id || '— choose provider —')}</option>
+                </select>
+              </div>
+              <div>
+                <label>Home country <span class="hint">(ISO 2, optional)</span></label>
+                <input class="prov-derived-home" type="text" value="${escAttr(tt.home_country)}"
+                       placeholder="ES" maxlength="2" pattern="^[A-Z]{2}$">
+              </div>
+            </div>
+            <label style="display:inline-flex;align-items:center;gap:.4rem;margin-top:.45rem">
+              <input class="prov-derived-rail-only" type="checkbox" ${railOnly ? 'checked' : ''}> Rail routes only
+            </label>
+            <p class="hint" style="margin: 0.25rem 0 0">
+              Derives this feed by running the cross-border filter on the linked national feed —
+              one source of truth, no drift. Refresh this provider (or the national session) to
+              (re)build it. The national feed must already be loaded on its own session.
+            </p>
+          </div>`;
+}
+
+// §12 — derived-card pickers. The "From session / From provider" fields are
+// <select>s filled from the live session list (one cached fetch), so the link
+// can't be mistyped. The saved value is preserved even if it's no longer in the
+// list (renders as "<id> (not found)") so a bad/stale link is visible, not lost.
+let _derivedSessionsCache = null;
+async function derivedSessions() {
+  if (_derivedSessionsCache) return _derivedSessionsCache;
+  try {
+    const r = await fetch('/api/sessions');
+    _derivedSessionsCache = r.ok ? await r.json() : [];
+  } catch { _derivedSessionsCache = []; }
+  return _derivedSessionsCache;
+}
+
+function providersOfSession(session) {
+  const provs = session && session.config && session.config.sources
+    ? session.config.sources.providers : null;
+  return Array.isArray(provs) ? provs : [];
+}
+
+function _selectOptions(items, saved) {
+  // items: [{value, label}]. Keep `saved` selectable even when absent.
+  const opts = items.map(it => `<option value="${escAttr(it.value)}">${escHTML(it.label)}</option>`);
+  if (saved && !items.some(it => it.value === saved)) {
+    opts.push(`<option value="${escAttr(saved)}">${escHTML(saved + ' (not found)')}</option>`);
+  }
+  return opts.join('');
+}
+
+function fillDerivedProviderSelect(provSel, session, saved) {
+  const items = providersOfSession(session).map(p => ({
+    value: p.id, label: (p.label && p.label !== p.id) ? `${p.id} — ${p.label}` : p.id,
+  }));
+  provSel.innerHTML = `<option value="">— choose provider —</option>` + _selectOptions(items, saved);
+  provSel.value = saved || '';
+}
+
+async function populateDerivedCard(card) {
+  const sessSel = card.querySelector('.prov-derived-session');
+  const provSel = card.querySelector('.prov-derived-provider');
+  if (!sessSel || !provSel) return;
+  const savedSession = sessSel.dataset.value || '';
+  const savedProvider = provSel.dataset.value || '';
+  const sessions = await derivedSessions();
+  const items = sessions.map(s => ({
+    value: s.id, label: (s.name && s.name !== s.id) ? `${s.id} — ${s.name}` : s.id,
+  }));
+  sessSel.innerHTML = `<option value="">— choose national session —</option>` + _selectOptions(items, savedSession);
+  sessSel.value = savedSession;
+  fillDerivedProviderSelect(provSel, sessions.find(s => s.id === savedSession), savedProvider);
+}
+
 function providerCardHTML(p, opts) {
   // One <details> per provider. v0.1.12: cards are collapsed by default
   // (operators were drowning in a sea of open forms when a session had
@@ -786,6 +931,10 @@ function providerCardHTML(p, opts) {
   // v0.1.37 — content-source toggle. Legacy/blank cards infer: a URL means
   // "url", its absence means "upload".
   const ttSource = tt.source || (tt.url ? 'url' : 'upload');
+  // §12 — derived (cross_border_filter) provider: a link to a national feed
+  // + filter params. rail_only defaults true.
+  const df = tt.derived_from || {};
+  const railOnly = tt.rail_only !== false;
   const summaryLabel = (p.label || p.id || '(unnamed)') +
     (p.country_iso ? ` — ${p.country_iso}` : '');
   const openAttr = (opts && opts.openByDefault) ? ' open' : '';
@@ -803,7 +952,8 @@ function providerCardHTML(p, opts) {
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
         ${statusPill}
         <span class="prov-summary-actions">
-          <button type="button" class="secondary" data-action="refresh-provider"
+          <button type="button" class="secondary prov-refresh-btn" data-action="refresh-provider"
+                  ${ttSource === 'upload' ? 'hidden' : ''}
                   title="Download just this provider's URLs (timetable + MCT + stations CSV)">
             ⤴ Refresh this provider
           </button>
@@ -847,27 +997,11 @@ function providerCardHTML(p, opts) {
               <select class="prov-tt-source">
                 <option value="url"    ${ttSource === 'url' ? 'selected' : ''}>Download from URL</option>
                 <option value="upload" ${ttSource === 'upload' ? 'selected' : ''}>Upload a file</option>
+                <option value="cross_border_filter" ${ttSource === 'cross_border_filter' ? 'selected' : ''}>Cross-border filter (derived)</option>
               </select>
             </div>
           </div>
-          <div class="prov-tt-url-row" ${ttSource === 'upload' ? 'hidden' : ''} style="margin-top: 0.4rem">
-            <label>URL <code>(.zip)</code></label>
-            <input class="prov-tt-url" type="url" value="${escAttr(tt.url)}"
-                   placeholder="https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip">
-          </div>
-          <div class="prov-tt-upload-row" ${ttSource === 'url' ? 'hidden' : ''} style="margin-top: 0.4rem">
-            <label>File <code>(.zip)</code></label>
-            <div class="prov-upload-controls">
-              <input class="prov-tt-file" type="file" accept=".zip,.xml">
-              <button type="button" class="secondary" data-action="upload-provider"
-                      title="Upload this file and attach it to this provider (save the session first)">⤴ Upload to this provider</button>
-            </div>
-            <p class="prov-current-file hint" style="margin: 0.3rem 0 0">No file attached yet.</p>
-            <p class="hint" style="margin: 0.15rem 0 0">
-              The file lands at this provider's own slot (<code>&lt;feed_id&gt;.zip</code>).
-              Save the session first so the provider exists, then upload.
-            </p>
-          </div>
+          ${timetableSourceRowsHTML(tt, ttSource, df, railOnly)}
           <p class="hint" style="margin: 0.25rem 0 0">
             NeTEx-FR is intentionally absent — OTP can't read it. For NeTEx-FR archive-only
             (compliance), use the <em>Upload a file</em> form below with declared standard
@@ -946,6 +1080,33 @@ function collectProviderUrlFields(card, id, provider) {
   return true;
 }
 
+// §12 — read the cross_border_filter (derived) fields into `timetable`.
+// Kept separate (like collectProviderUrlFields) so readProviderCard's
+// cognitive complexity stays low. Returns false (after a toast) on the
+// first invalid field, true otherwise.
+function collectDerivedFields(card, id, timetable) {
+  const dSession = (card.querySelector('.prov-derived-session')?.value || '').trim();
+  const dProvider = (card.querySelector('.prov-derived-provider')?.value || '').trim();
+  const dHome = (card.querySelector('.prov-derived-home')?.value || '').trim().toUpperCase();
+  const railOnlyEl = card.querySelector('.prov-derived-rail-only');
+  if (!dSession || !dProvider) {
+    showToast('error', `${id}: cross-border filter needs a source session and provider`);
+    return false;
+  }
+  if (!FEED_ID_RE.test(dProvider)) {
+    showToast('error', `${id}: source provider ${JSON.stringify(dProvider)} must be a provider id`);
+    return false;
+  }
+  if (dHome && !COUNTRY_ISO_RE.test(dHome)) {
+    showToast('error', `${id}: home country ${JSON.stringify(dHome)} must be 2 letters`);
+    return false;
+  }
+  timetable.derived_from = {session_id: dSession, provider_id: dProvider};
+  if (dHome) timetable.home_country = dHome;
+  timetable.rail_only = railOnlyEl ? railOnlyEl.checked : true;
+  return true;
+}
+
 function readProviderCard(card) {
   // Opposite of providerCardHTML — collect the form values back into a
   // canonical provider object. Returns null + shows a toast for invalid
@@ -965,7 +1126,8 @@ function readProviderCard(card) {
     return null;
   }
   // v0.1.37 — source-aware: URL mode requires an http(s) URL; Upload mode
-  // requires no URL (the operator attaches a file via the upload button).
+  // requires no URL (the operator attaches a file via the upload button);
+  // cross_border_filter (§12) needs a link to a national feed, no URL.
   const timetable = {format: ttFormat, source: ttSource};
   if (ttSource === 'url') {
     if (!ttUrl) {
@@ -977,6 +1139,8 @@ function readProviderCard(card) {
       return null;
     }
     timetable.url = ttUrl;
+  } else if (ttSource === 'cross_border_filter') {
+    if (!collectDerivedFields(card, id, timetable)) return null;
   }
   const provider = {
     id,
@@ -1029,6 +1193,10 @@ function populateProvidersList(form, sources) {
     rows.insertAdjacentHTML('beforeend', providerCardHTML(p, {openByDefault: i === 0})),
   );
   syncProvidersToolbar(form);
+  // §12 — fill any derived-card session/provider dropdowns from the live list.
+  rows.querySelectorAll('.provider-card').forEach((c) => {
+    if (c.querySelector('.prov-derived-session')) populateDerivedCard(c);
+  });
 }
 
 // v0.1.12: show/hide the Expand-all/Collapse-all toolbar based on whether
@@ -1149,7 +1317,7 @@ async function refreshOneProvider(form, refreshBtn) {
       return;
     }
     const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-    const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+    const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
     showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
     if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
@@ -1166,6 +1334,15 @@ async function uploadToProvider(form, uploadBtn) {
   if (!pid) { showToast('error', 'Provider ID is required before uploading'); return; }
   if (!file) { showToast('error', `${pid}: choose a file to upload first`); return; }
   const sid = form.dataset.sid;
+  // Upload-before-save guard: the backend lands the file at the provider's
+  // slot only if the provider exists in the *saved* config. Check the row's
+  // persisted config and nudge clearly instead of hitting a confusing 400.
+  const row = document.querySelector(`tr[data-sid="${sid}"]`);
+  const savedProviders = (row && JSON.parse(row.dataset.config || '{}').sources?.providers) || [];
+  if (!savedProviders.some(p => p.id === pid)) {
+    showToast('error', `Save the session first — provider ${pid} must exist before you can attach a file.`);
+    return;
+  }
   const fd2 = new FormData();
   fd2.append('declared_standard', TIMETABLE_DECLARED_KIND[fmt] || 'GTFS');
   fd2.append('provider_id', pid);
@@ -1188,6 +1365,40 @@ async function uploadToProvider(form, uploadBtn) {
     loadJobs(sid);
   } catch (err) { showToast('error', String(err)); }
   finally { uploadBtn.disabled = false; uploadBtn.textContent = original; }
+}
+
+// ─── Geographic OSM scope checklist (v0.1.40) ────────────────────────
+// Populate the country checklist from the suggestion endpoint. Ticks the
+// operator's saved selection if any; otherwise the suggested set (declared
+// providers + countries with >= threshold stops). Shows per-country stop
+// counts so the basis of the suggestion is visible (e.g. a 2-stop UK is a
+// one-click add). All values are server-controlled (fixed v1 country list),
+// so plain string interpolation is safe here.
+async function loadOsmCountries(sid, container) {
+  try {
+    const r = await fetch(`/api/sessions/${sid}/osm-countries`);
+    if (!r.ok) { container.innerHTML = '<em class="hint">Could not load countries.</em>'; return; }
+    const data = await r.json();
+    const hasSelection = (data.selected || []).length > 0;
+    const rows = (data.countries || []).map((c) => {
+      // Tick the saved selection if the operator has one; otherwise the
+      // suggestion. Extracted out of the attribute to avoid a nested ternary.
+      const tick = hasSelection ? c.selected : c.suggested;
+      const checked = tick ? ' checked' : '';
+      const bits = [];
+      if (c.stops > 0) bits.push(`${c.stops} stop${c.stops === 1 ? '' : 's'}`);
+      if (c.declared) bits.push('declared');
+      const note = bits.length ? ` <span class="hint">(${bits.join(', ')})</span>` : '';
+      return `<label style="display:block;padding:1px 0">` +
+        `<input type="checkbox" name="osm_country" value="${c.iso}"${checked}> ` +
+        `${c.iso} — ${c.name}${note}</label>`;
+    });
+    container.innerHTML = rows.join('') ||
+      '<em class="hint">No countries available.</em>';
+  } catch (e) {
+    console.error('osm-countries load failed', e);
+    container.innerHTML = '<em class="hint">Could not load countries.</em>';
+  }
 }
 
 // ─── Configure (PATCH config.sources) ───────────────────────────────
@@ -1241,16 +1452,36 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     const uploadBtn = e.target.closest('button[data-action="upload-provider"]');
     if (uploadBtn) { e.preventDefault(); await uploadToProvider(form, uploadBtn); }
   });
-  // v0.1.37 — source toggle: reveal the URL row or the Upload row.
+  // v0.1.37 — source toggle: reveal URL / Upload / Cross-border-filter rows.
   form.addEventListener('change', (e) => {
     if (!e.target.matches('.prov-tt-source')) return;
     const card = e.target.closest('.provider-card');
     if (!card) return;
-    const isUpload = e.target.value === 'upload';
+    const src = e.target.value;
     const urlRow = card.querySelector('.prov-tt-url-row');
     const upRow = card.querySelector('.prov-tt-upload-row');
-    if (urlRow) urlRow.hidden = isUpload;
-    if (upRow) upRow.hidden = !isUpload;
+    const derivedRow = card.querySelector('.prov-tt-derived-row');
+    if (urlRow) urlRow.hidden = src !== 'url';
+    if (upRow) upRow.hidden = src !== 'upload';
+    if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
+    // First switch to cross_border_filter on a card that hasn't been populated
+    // yet (e.g. a freshly-added provider) fills the session/provider dropdowns.
+    if (src === 'cross_border_filter') populateDerivedCard(card);
+    // Only "upload" has nothing to fetch on refresh; "url" downloads and
+    // "cross_border_filter" runs the filter, so both keep the refresh button.
+    const refreshBtn = card.querySelector('.prov-refresh-btn');
+    if (refreshBtn) refreshBtn.hidden = src === 'upload';
+  });
+  // §12 — cascade: choosing a national session refills its provider dropdown.
+  form.addEventListener('change', async (e) => {
+    if (!e.target.matches('.prov-derived-session')) return;
+    const card = e.target.closest('.provider-card');
+    const provSel = card && card.querySelector('.prov-derived-provider');
+    if (!provSel) return;
+    e.target.dataset.value = e.target.value;  // remember the new pick
+    provSel.dataset.value = '';
+    const sessions = await derivedSessions();
+    fillDerivedProviderSelect(provSel, sessions.find(s => s.id === e.target.value), '');
   });
   // Live-update each provider card's summary as id/label/country change.
   form.addEventListener('input', (e) => {
@@ -1300,6 +1531,13 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     // v0.1.24: same for the OTP API timeout.
     const otpApiTimeout = (form.elements['otp_api_timeout']?.value || '').trim();
     if (otpApiTimeout) cfg.otp_api_timeout = otpApiTimeout;
+    // v0.1.40: geographic OSM crop scope — collect the ticked country boxes.
+    // Empty = no crop (delete the key so the worker builds the whole PBF).
+    const osmCountries = Array.from(
+      form.querySelectorAll('input[name="osm_country"]:checked')
+    ).map((el) => el.value);
+    if (osmCountries.length) cfg.osm_countries = osmCountries;
+    else delete cfg.osm_countries;
     // PR #32: per-session OTP serve healthcheck start_period (int seconds).
     // Empty value = use orchestrator default (300s).
     const otpStartPeriod = (form.elements['otp_serve_start_period']?.value || '').trim();
@@ -1390,7 +1628,7 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       const body = await r.json().catch(() => ({}));
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
       showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
       if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
       // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
@@ -1422,7 +1660,7 @@ document.querySelectorAll('button[data-action="refresh-osm"]').forEach(btn => {
       const body = await r.json().catch(() => ({}));
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-      const skipped = (body.skipped || []).map(s => s.key + (s.reason ? ` (${s.reason})` : '')).join(', ');
+      const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
       const rotated = (body.rotated || []).join('; ');
       const parts = [`Fetched: ${fetched}`];
       if (skipped) parts.push(`Skipped: ${skipped}`);
@@ -1497,10 +1735,25 @@ document.querySelectorAll('button[data-action="rebuild"]').forEach(btn => {
       );
       if (!ok) return;
     }
-    const r = await fetch(`/api/sessions/${sid}/rebuilds`, {method:'POST'});
+    // Max-memory rebuild: stops the serving sessions + observability stack to
+    // free the box. Confirm explicitly since other sessions go briefly offline.
+    const maxmemBox = document.querySelector(`input[data-role="maxmem"][data-sid="${sid}"]`);
+    const maxmem = !!(maxmemBox && maxmemBox.checked);
+    if (maxmem) {
+      const ok = confirm(
+        `Max-memory rebuild for ${sid}:\n\n` +
+        `The worker will STOP all serving journey-planner sessions and the ` +
+        `observability stack (Grafana/Loki/Prometheus/…), build with a heap ` +
+        `sized to host RAM, then restart them automatically.\n\n` +
+        `Other sessions will be briefly unavailable. Continue?`
+      );
+      if (!ok) return;
+    }
+    const url = `/api/sessions/${sid}/rebuilds` + (maxmem ? '?max_memory=true' : '');
+    const r = await fetch(url, {method:'POST'});
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
-    showToast('success', `Rebuild queued for ${sid} (job ${body.id?.slice(0,8) ?? '—'})`);
+    showToast('success', `Rebuild queued for ${sid}${maxmem ? ' (max-memory)' : ''} (job ${body.id?.slice(0,8) ?? '—'})`);
     loadJobs(sid);
   });
 });
@@ -1617,6 +1870,24 @@ function _renderStatusPill(status) {
   return `<span class="rebuild-pill">${escHTML(status)}</span>`;
 }
 
+// v0.1.40 — surface the memory option a build used, so it isn't lost once the
+// one-off "max-memory" checkbox is clicked. The badge comes from the persisted
+// max_memory flag (visible even while the build is running); the heap + cgroup
+// cap are parsed from the build log's "[viator] build resources:" line once it
+// lands (the worker prepends it when the build finishes).
+function _renderMemPill(job) {
+  const m = (job.log || '').match(/OTP_HEAP=(\S+)\s+OTP_BUILD_MEM_LIMIT=(\S+)/);
+  const res = m ? `heap ${escHTML(m[1])} / cap ${escHTML(m[2])}` : '';
+  if (job.max_memory) {
+    return `<span class="rebuild-pill" data-flavour="maxmem" style="background:#E89B2C;color:#fff" ` +
+      `title="Max-memory rebuild: stopped other sessions + observability and sized the heap to host RAM">` +
+      `🧠 max-memory${res ? ' · ' + res : ''}</span>`;
+  }
+  return res
+    ? `<span class="rebuild-pill" title="JVM heap and container cgroup cap used for this build">${res}</span>`
+    : '';
+}
+
 function _renderCurrentBuildCard(job) {
   const snap = job.snapshot;
   const isCurrent = !!(snap && snap.is_current);
@@ -1647,6 +1918,7 @@ function _renderCurrentBuildCard(job) {
         ${_renderStatusPill(job.status)}
         ${servingPill}
         ${_renderCachePill(job.cache_hit)}
+        ${_renderMemPill(job)}
         ${durationCell}
         <span>· ${isRunning ? 'started' : 'built'} ${escHTML(_formatBuiltAt(isRunning ? job.started_at : builtAt))}</span>
         ${period}
@@ -1702,6 +1974,7 @@ function _renderHistoryItem(job) {
       <summary>
         ${_renderStatusPill(job.status)}
         ${_renderCachePill(job.cache_hit)}
+        ${_renderMemPill(job)}
         <code>${escHTML(versionLabel)}</code>
         <span>${escHTML(_formatBuiltAt(builtAt))}</span>
         ${duration ? `<span class="hint">· ${escHTML(duration)}</span>` : ''}

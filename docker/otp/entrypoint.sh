@@ -13,6 +13,13 @@ HEAP="${OTP_HEAP:-12g}"
 # accordingly. `comprehensive` skips filtering entirely.
 OSM_SCOPE="${OTP_OSM_SCOPE:-transit-focused}"
 
+# Geographic OSM scope (v0.1.40) — CSV of ISO country codes the worker chose
+# for this session (e.g. "FR,CH"). When non-empty AND inbox/osm-crop.geojson
+# is present, the OSM staging step crops the PBF to that polygon (osmium
+# extract) before the tag filter. Empty ⇒ no crop. The polygon file is written
+# by app/worker.py from app/osm_geo.py. See docs/osm-geographic-scope-design.md.
+OSM_COUNTRIES="${OTP_OSM_COUNTRIES:-}"
+
 # Build pipeline: 'two_phase' (default) builds the street graph and the transit
 # graph in two separate JVMs. Peak heap is dramatically lower than --build (one
 # shot) because raw OSM nodes are released between phases — France-wide PBF +
@@ -97,6 +104,30 @@ case "$MODE" in
         if compgen -G "$INBOX_DIR/osm/*.pbf" > /dev/null; then
             for pbf_in in "$INBOX_DIR"/osm/*.pbf; do
                 pbf_out="$BUILD_DIR/$(basename "$pbf_in")"
+
+                # v0.1.40 — geographic crop. When the session selected
+                # countries, the worker wrote inbox/<sid>/osm-crop.geojson (a
+                # MultiPolygon of those countries). Crop the raw PBF to it
+                # *before* the tag filter — the big memory win for multi-country
+                # feeds (all-Europe → just the served countries). `-s smart`
+                # keeps ways crossing the boundary, so border stations aren't
+                # clipped. No countries selected ⇒ src stays the raw PBF.
+                src="$pbf_in"
+                if [ -n "$OSM_COUNTRIES" ] && [ -f "$INBOX_DIR/osm-crop.geojson" ]; then
+                    cropped="$BUILD_DIR/cropped-$(basename "$pbf_in")"
+                    echo "OSM geo-crop: extracting [$OSM_COUNTRIES] from $(basename "$pbf_in")"
+                    osmium extract --overwrite -s smart \
+                        --polygon "$INBOX_DIR/osm-crop.geojson" \
+                        -o "$cropped" "$pbf_in"
+                    crop_in=$(stat -c %s "$pbf_in")
+                    crop_out=$(stat -c %s "$cropped")
+                    if [ "$crop_in" -gt 0 ]; then
+                        cpct=$(( (crop_out * 100) / crop_in ))
+                        echo "  geo-crop $(basename "$pbf_in"): ${crop_in} → ${crop_out} bytes (${cpct}% of original)"
+                    fi
+                    src="$cropped"
+                fi
+
                 case "$OSM_SCOPE" in
                     transit-focused)
                         echo "OSM filter: transit-focused — running osmium tags-filter on $(basename "$pbf_in")"
@@ -108,7 +139,7 @@ case "$MODE" in
                         # stderr that are useful for build observability).
                         # Default verbosity is fine.
                         osmium tags-filter --overwrite \
-                            -o "$pbf_out" "$pbf_in" \
+                            -o "$pbf_out" "$src" \
                             'highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,pedestrian,footway,path,steps,cycleway,road,motorway_link,trunk_link,primary_link,secondary_link,tertiary_link' \
                             'railway' \
                             'public_transport' \
@@ -118,7 +149,7 @@ case "$MODE" in
                     multi-modal)
                         echo "OSM filter: multi-modal — running osmium tags-filter on $(basename "$pbf_in")"
                         osmium tags-filter --overwrite \
-                            -o "$pbf_out" "$pbf_in" \
+                            -o "$pbf_out" "$src" \
                             'highway' \
                             'railway' \
                             'public_transport' \
@@ -133,15 +164,15 @@ case "$MODE" in
                         # the rationale and trade-offs.
                         echo "OSM filter: rail-focused — running osmium tags-filter on $(basename "$pbf_in")"
                         osmium tags-filter --overwrite \
-                            -o "$pbf_out" "$pbf_in" \
+                            -o "$pbf_out" "$src" \
                             'railway' \
                             'public_transport' \
                             'highway=footway,path,steps,pedestrian,corridor,elevator' \
                             'amenity=parking_entrance'
                         ;;
                     comprehensive)
-                        echo "OSM filter: comprehensive — passing $(basename "$pbf_in") through unchanged"
-                        cp "$pbf_in" "$pbf_out"
+                        echo "OSM filter: comprehensive — passing $(basename "$pbf_in") through (geo-crop only, if any)"
+                        cp "$src" "$pbf_out"
                         ;;
                     *)
                         echo "Unknown OTP_OSM_SCOPE='$OSM_SCOPE' (expected: transit-focused | multi-modal | rail-focused | comprehensive)" >&2
@@ -243,10 +274,12 @@ JSON
         if [ -f "$OSM_INPUT" ]; then
             # sha256 takes ~1 min on a 5 GB PBF; we eat that cost only once
             # per (PBF, scope) combo because we cache the streetGraph it
-            # produces. Key format: `<sha256>:<scope>` — both pieces invalidate
-            # the cache when they change.
+            # produces. Key format: `<sha256>:<scope>:<countries>` — each piece
+            # invalidates the cache when it changes. (The sha is of the already
+            # geo-cropped + tag-filtered osm.pbf, so the crop is captured too;
+            # the explicit country suffix is belt-and-braces / readable.)
             OSM_SHA="$(sha256sum "$OSM_INPUT" | awk '{print $1}')"
-            CURRENT_KEY="${OSM_SHA}:${OSM_SCOPE}"
+            CURRENT_KEY="${OSM_SHA}:${OSM_SCOPE}:${OSM_COUNTRIES}"
         fi
         CACHED_KEY=""
         [ -f "$CACHE_KEY" ] && CACHED_KEY="$(cat "$CACHE_KEY")"
