@@ -259,6 +259,346 @@ def test_fanout_status_is_ok_when_any_session_returns_trips(monkeypatch):
     assert row.session_ids == ["session-ok"]
 
 
+# ─────────────────────── extracted-helper tests ───────────────────────
+#
+# These tests target the four helpers extracted from `_execute_pair_fanout`
+# (PR #36 follow-up to drop Sonar S3776 cognitive complexity). Each is
+# independently testable now, so each gets its own focused test.
+
+
+def test_derive_fanout_status_priority():
+    """Status priority is ok > error/timeout > no_route. The whole point
+    of fanout is "ok wins as soon as one session returned trips", so
+    any_ok must trump any_error_or_timeout."""
+    assert runner._derive_fanout_status(any_ok=True, any_error_or_timeout=False) == "ok"
+    assert runner._derive_fanout_status(any_ok=True, any_error_or_timeout=True) == "ok"
+    assert runner._derive_fanout_status(any_ok=False, any_error_or_timeout=True) == "error"
+    assert runner._derive_fanout_status(any_ok=False, any_error_or_timeout=False) == "no_route"
+
+
+def test_merge_one_trip_into_signatures_first_trip_creates_slot():
+    """A signature seen for the first time creates a new slot with the
+    trip as the 'best' and the session in session_ids."""
+    by_sig: dict[str, dict[str, object]] = {}
+    ops: list[str] = []
+    trip = {
+        "duration_seconds": 6000,
+        "num_transfers": 0,
+        "legs": [{"feed_id": "SNCF"}],
+    }
+    runner._merge_one_trip_into_signatures(
+        sid="session-a",
+        trip=trip,
+        sig="sig-1",
+        by_signature=by_sig,
+        operators_union=ops,
+    )
+    assert "sig-1" in by_sig
+    assert by_sig["sig-1"]["session_ids"] == ["session-a"]
+    assert by_sig["sig-1"]["best"] is trip
+    assert ops == ["SNCF"]
+
+
+def test_merge_one_trip_into_signatures_shorter_wins_best():
+    """A second trip with same signature but shorter duration replaces
+    'best'; the session id list grows but no duplicates."""
+    by_sig: dict[str, dict[str, object]] = {}
+    ops: list[str] = []
+    long_trip = {"duration_seconds": 8000, "num_transfers": 1, "legs": [{"feed_id": "DB"}]}
+    short_trip = {"duration_seconds": 5000, "num_transfers": 0, "legs": [{"feed_id": "SBB"}]}
+
+    runner._merge_one_trip_into_signatures(
+        sid="session-a", trip=long_trip, sig="sig-x", by_signature=by_sig, operators_union=ops
+    )
+    runner._merge_one_trip_into_signatures(
+        sid="session-b", trip=short_trip, sig="sig-x", by_signature=by_sig, operators_union=ops
+    )
+    # Same-signature trips collapse; shortest wins.
+    assert by_sig["sig-x"]["best"] is short_trip
+    assert sorted(by_sig["sig-x"]["session_ids"]) == ["session-a", "session-b"]
+    # Operators union is order-preserving and dedup'd.
+    assert ops == ["DB", "SBB"]
+
+
+def test_merge_one_trip_into_signatures_no_duplicate_session_id():
+    """Same session contributing two trips for the same signature must
+    not show up twice in session_ids."""
+    by_sig: dict[str, dict[str, object]] = {}
+    ops: list[str] = []
+    trip1 = {"duration_seconds": 7000, "num_transfers": 0, "legs": []}
+    trip2 = {"duration_seconds": 7500, "num_transfers": 0, "legs": []}
+
+    runner._merge_one_trip_into_signatures(
+        sid="session-a", trip=trip1, sig="s", by_signature=by_sig, operators_union=ops
+    )
+    runner._merge_one_trip_into_signatures(
+        sid="session-a", trip=trip2, sig="s", by_signature=by_sig, operators_union=ops
+    )
+    assert by_sig["s"]["session_ids"] == ["session-a"]
+
+
+def test_merge_fanout_results_no_trips_returns_no_route(monkeypatch):
+    """All sessions return empty trip lists → status='no_route', empty
+    by_signature, empty sessions_with_trips, empty operators_union."""
+    monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal({}))
+    per_session: list[runner._FanoutSub] = [
+        ("session-a", "no_route", {}, [], 100),
+        ("session-b", "no_route", {}, [], 110),
+    ]
+    status, by_sig, with_trips, ops = runner._merge_fanout_results(per_session)
+    assert status == "no_route"
+    assert by_sig == {}
+    assert with_trips == []
+    assert ops == []
+
+
+def test_merge_fanout_results_error_only_returns_error(monkeypatch):
+    """All sessions timed out / errored → status='error'."""
+    monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal({}))
+    per_session: list[runner._FanoutSub] = [
+        ("session-a", "timeout", {}, [], 5000),
+        ("session-b", "error", {}, [], 200),
+    ]
+    status, _by_sig, with_trips, _ops = runner._merge_fanout_results(per_session)
+    assert status == "error"
+    assert with_trips == []
+
+
+# ─────────────────────── API endpoint tests ───────────────────────
+#
+# These exercise the `POST /api/admin/network-coverage/runs` route
+# function directly (bypassing FastAPI's DI), validating each branch of
+# the (mode, session_id) gate added in PR #36. The route delegates to
+# `runner.create_run` after validation, so we mock the runner and the DB
+# get/execute calls — the route's job is to translate (mode, session_id)
+# into the right 400/404/409/201 outcome before calling the runner.
+
+
+def _make_run_create_body(**overrides):
+    """A minimal RunCreate body suitable for the POST /runs endpoint."""
+    from app.api.admin.network_coverage import RunCreate
+
+    body = {
+        "session_id": "nap-fr-rail",
+        "depart_at": _naive_depart(),
+        "direction": "both",
+        "mode": "single_session",
+    }
+    body.update(overrides)
+    return RunCreate(**body)
+
+
+def _fake_actor():
+    a = MagicMock()
+    a.id = _uuid()
+    return a
+
+
+def _fake_run_row(**overrides):
+    """A NetworkCoverageRun stand-in that satisfies `_run_to_summary`."""
+    from datetime import UTC, datetime
+
+    r = MagicMock()
+    r.id = _uuid()
+    r.session_id = overrides.get("session_id", "nap-fr-rail")
+    r.session_label = overrides.get("session_label", "FR rail")
+    r.depart_at = datetime(2026, 5, 18, 8, 0, 0, tzinfo=UTC)
+    r.started_at = datetime(2026, 5, 18, 8, 0, 0, tzinfo=UTC)
+    r.finished_at = None
+    r.status = overrides.get("status", "pending")
+    r.direction = overrides.get("direction", "both")
+    r.mode = overrides.get("mode", "single_session")
+    r.total_pairs = 650
+    r.completed_pairs = 0
+    r.ok_pairs = 0
+    r.no_route_pairs = 0
+    r.error_pairs = 0
+    return r
+
+
+def test_api_post_runs_rejects_invalid_direction():
+    """The route checks direction BEFORE any DB lookups, so a bad value
+    fast-fails with 400 and no session_id resolution."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(direction="sideways"),
+            bg=BackgroundTasks(),
+            db=MagicMock(),
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 400
+    assert "direction" in str(exc.value.detail).lower()
+
+
+def test_api_post_runs_single_session_missing_session_id_400():
+    """mode=single_session with no session_id → 400 from the API
+    layer (before the runner sees it)."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(session_id=None),
+            bg=BackgroundTasks(),
+            db=MagicMock(),
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 400
+    assert "session_id" in str(exc.value.detail).lower()
+
+
+def test_api_post_runs_single_session_unknown_session_404():
+    """db.get(SessionRow, ...) returns None → 404."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    db = MagicMock()
+    db.get.return_value = None
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(session_id="missing-session"),
+            bg=BackgroundTasks(),
+            db=db,
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 404
+
+
+def test_api_post_runs_single_session_not_serving_400():
+    """Session exists but its state isn't 'serving' → 400 with explanation."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    db = MagicMock()
+    session_row = MagicMock()
+    session_row.state = "building"
+    db.get.return_value = session_row
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(),
+            bg=BackgroundTasks(),
+            db=db,
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 400
+    assert "serving" in str(exc.value.detail).lower()
+
+
+def test_api_post_runs_fanout_with_session_id_400():
+    """mode=fanout MUST NOT carry a session_id."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(mode="fanout", session_id="nap-fr-rail"),
+            bg=BackgroundTasks(),
+            db=MagicMock(),
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 400
+    assert "fanout" in str(exc.value.detail).lower()
+
+
+def test_api_post_runs_fanout_no_eligible_session_409(monkeypatch):
+    """mode=fanout with zero serving+include_in_fanout sessions → 409.
+    The route runs the SELECT for an eligible session at create time so
+    the UI gets a meaningful "you have no fanout sessions" failure
+    instead of a 'failed' run row in the sidebar."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    from app.api.admin import network_coverage as api
+
+    db = MagicMock()
+    # Simulate "no eligible session" — db.execute(...).scalars().first() == None
+    eligible_chain = MagicMock()
+    eligible_chain.scalars.return_value.first.return_value = None
+    db.execute.return_value = eligible_chain
+    with pytest.raises(HTTPException) as exc:
+        api.create_run(
+            body=_make_run_create_body(mode="fanout", session_id=None),
+            bg=BackgroundTasks(),
+            db=db,
+            actor=_fake_actor(),
+        )
+    assert exc.value.status_code == 409
+
+
+def test_api_post_runs_single_session_happy_path_returns_summary(monkeypatch):
+    """All gates pass → runner.create_run is called and the response
+    summary echoes the run row's mode and session_id."""
+    from fastapi import BackgroundTasks
+
+    from app.api.admin import network_coverage as api
+    from app.models.sessions import SessionState
+
+    db = MagicMock()
+    session_row = MagicMock()
+    session_row.state = SessionState.SERVING.value
+    db.get.return_value = session_row
+
+    fake_run = _fake_run_row(mode="single_session")
+    monkeypatch.setattr(api.runner, "create_run", lambda *_a, **_k: fake_run)
+    monkeypatch.setattr(api.runner, "execute_run", lambda *_a, **_k: None)
+
+    summary = api.create_run(
+        body=_make_run_create_body(),
+        bg=BackgroundTasks(),
+        db=db,
+        actor=_fake_actor(),
+    )
+    assert summary.mode == "single_session"
+    assert summary.session_id == "nap-fr-rail"
+
+
+def test_api_post_runs_fanout_happy_path_returns_summary(monkeypatch):
+    """mode=fanout, eligible session exists → runner.create_run gets the
+    fanout mode and the response carries mode='fanout'."""
+    from fastapi import BackgroundTasks
+
+    from app.api.admin import network_coverage as api
+
+    db = MagicMock()
+    eligible_chain = MagicMock()
+    eligible_chain.scalars.return_value.first.return_value = MagicMock(id="nap-eu-corridors")
+    db.execute.return_value = eligible_chain
+
+    fake_run = _fake_run_row(session_id=None, session_label="fanout", mode="fanout")
+    monkeypatch.setattr(api.runner, "create_run", lambda *_a, **_k: fake_run)
+    monkeypatch.setattr(api.runner, "execute_run", lambda *_a, **_k: None)
+
+    summary = api.create_run(
+        body=_make_run_create_body(mode="fanout", session_id=None),
+        bg=BackgroundTasks(),
+        db=db,
+        actor=_fake_actor(),
+    )
+    assert summary.mode == "fanout"
+    assert summary.session_id is None
+
+
+def test_api_run_to_summary_back_compat_with_missing_mode():
+    """Legacy test-fixture rows without a `mode` attribute must
+    serialise as 'single_session' (the alembic server_default). Guards
+    against the getattr(run, 'mode', ...) safety net being dropped."""
+    from app.api.admin.network_coverage import _run_to_summary
+
+    legacy_run = _fake_run_row()
+    # Strip the attribute the way an unmigrated fixture would.
+    del legacy_run.mode
+
+    summary = _run_to_summary(legacy_run)
+    assert summary.mode == "single_session"
+
+
 # ─────────────────────── helpers ───────────────────────
 
 

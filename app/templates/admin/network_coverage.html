@@ -169,9 +169,17 @@
       <form id="cov-form" class="cov-form">
         {# PR #36 — mode toggle: single-session (legacy) vs fanout
            (cross-session, queries every serving + include_in_fanout
-           session in parallel and merges by trip signature). #}
-        <label style="margin-top: 0">Mode</label>
-        <div class="cov-mode" style="display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
+           session in parallel and merges by trip signature).
+
+           Sonar Web:S6853 — the "Mode" caption above is a group-level
+           heading, not a control label, so we render it as a styled
+           <div role="group"> with aria-labelledby pointing at the
+           caption span. Each individual radio is labelled by its own
+           wrapping <label>. The Session select gets an explicit
+           for=id pair so screen readers announce the caption when the
+           dropdown receives focus. #}
+        <div id="cov-mode-caption" style="margin-top: 0; font-weight: 600; font-size: 0.85rem">Mode</div>
+        <div class="cov-mode" role="group" aria-labelledby="cov-mode-caption" style="display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
           <label style="display: flex; align-items: center; gap: 0.4rem; font-weight: normal">
             <input type="radio" name="mode" value="single_session" checked id="cov-mode-single">
             Single session
@@ -181,7 +189,7 @@
             All fanout-enabled sessions (cross-session matrix)
           </label>
         </div>
-        <label>Session
+        <label for="cov-session-select">Session
           <span class="hint" style="font-weight: normal" id="cov-session-hint"></span>
         </label>
         <select name="session_id" id="cov-session-select">

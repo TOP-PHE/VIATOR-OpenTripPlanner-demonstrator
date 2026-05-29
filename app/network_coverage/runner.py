@@ -530,133 +530,133 @@ async def _execute_pair(
             error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
 
     # Always persist the coverage result, even when the recorder write
-    # failed — the matrix is the canonical artifact.
-    with SessionLocal() as db:
-        try:
-            db.add(
-                NetworkCoverageResult(
-                    run_id=run_id,
-                    origin_hub_id=origin.id,
-                    dest_hub_id=dest.id,
-                    status=status,
-                    response_ms=response_ms,
-                    num_itineraries=num_itineraries,
-                    best_duration_seconds=best_duration_seconds,
-                    best_num_transfers=best_num_transfers,
-                    best_operators=best_operators,
-                    error_message=error_message,
-                    journey_search_id=journey_search_id,
-                )
-            )
-            # Increment run-level counters atomically so the UI's progress
-            # bar updates even before the run completes.
-            db.execute(
-                update(NetworkCoverageRun)
-                .where(NetworkCoverageRun.id == run_id)
-                .values(
-                    completed_pairs=NetworkCoverageRun.completed_pairs + 1,
-                    ok_pairs=NetworkCoverageRun.ok_pairs + (1 if status == "ok" else 0),
-                    no_route_pairs=NetworkCoverageRun.no_route_pairs
-                    + (1 if status == "no_route" else 0),
-                    error_pairs=NetworkCoverageRun.error_pairs
-                    + (1 if status not in ("ok", "no_route", "skipped") else 0),
-                )
-            )
-            db.commit()
-        except Exception:
-            log.exception(
-                "coverage run %s pair %s→%s: result write failed",
-                run_id,
-                origin.id,
-                dest.id,
-            )
-            db.rollback()
+    # failed — the matrix is the canonical artifact. Shared with the
+    # fanout path so both modes write the result row + counters update
+    # via exactly one code path (Sonar duplication metric was flagging
+    # the previous copy-paste).
+    _persist_pair_coverage_result(
+        run_id=run_id,
+        origin=origin,
+        dest=dest,
+        status=status,
+        response_ms=response_ms,
+        num_itineraries=num_itineraries,
+        best_duration_seconds=best_duration_seconds,
+        best_num_transfers=best_num_transfers,
+        best_operators=best_operators,
+        error_message=error_message,
+        journey_search_id=journey_search_id,
+    )
 
 
-async def _execute_pair_fanout(
+# ─────────────────── fanout helpers (PR #36) ───────────────────
+#
+# `_execute_pair_fanout` is intentionally a thin orchestrator that calls
+# these four helpers in sequence. Sonar's cognitive-complexity rule was
+# (rightly) screaming at the original 230-line body — extracting the
+# four phases (query / merge / record / persist) makes each phase
+# testable in isolation and brings the orchestrator under the rule's
+# threshold. The persistence helper is shared with `_execute_pair`
+# (single-session) to also kill the structural duplication that Sonar
+# flagged at 3.1% on this PR.
+
+# Type alias for the per-session tuple — keeps signatures readable.
+_FanoutSub = tuple[str, str, dict[str, Any], list[dict[str, Any]], int]
+
+
+async def _query_one_session_for_pair(
     *,
-    run_id: uuid.UUID,
-    session_ids: list[str],
+    sid: str,
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
+    run_id: uuid.UUID,
+) -> _FanoutSub:
+    """One fetch_plan call for one (session, pair). Tolerates its own
+    exception so an OTP container being down doesn't poison the pair —
+    the caller treats the returned status as "this session contributed
+    nothing useful" and moves on."""
+    sub_start = time.monotonic()
+    try:
+        raw, trips = await otp_client.fetch_plan(
+            session_id=sid,
+            from_lat=origin.lat,
+            from_lon=origin.lon,
+            to_lat=dest.lat,
+            to_lon=dest.lon,
+            when=depart_at,
+            timeout_ms=_PER_PAIR_TIMEOUT_MS,
+            num_itineraries=_COVERAGE_NUM_ITINERARIES,
+            search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
+        )
+        response_ms = int((time.monotonic() - sub_start) * 1000)
+        sub_status = "ok" if trips else "no_route"
+        return sid, sub_status, raw, trips, response_ms
+    except Exception as exc:
+        response_ms = int((time.monotonic() - sub_start) * 1000)
+        cls_name = type(exc).__name__
+        sub_status = (
+            "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
+        )
+        log.warning(
+            "coverage run %s pair %s→%s session %s failed: %s: %s",
+            run_id,
+            origin.id,
+            dest.id,
+            sid,
+            cls_name,
+            exc,
+        )
+        return sid, sub_status, {}, [], response_ms
+
+
+def _derive_fanout_status(*, any_ok: bool, any_error_or_timeout: bool) -> str:
+    """Pair-level status from the per-session outcomes. Priority is
+    ok > error/timeout > no_route — "ok" wins as soon as any session
+    returned itineraries (the whole point of fanout)."""
+    if any_ok:
+        return "ok"
+    if any_error_or_timeout:
+        return "error"
+    return "no_route"
+
+
+def _merge_one_trip_into_signatures(
+    *,
+    sid: str,
+    trip: dict[str, Any],
+    sig: str,
+    by_signature: dict[str, dict[str, Any]],
+    operators_union: list[str],
 ) -> None:
-    """PR #36 — run an A→B search against EVERY fanout-enabled session and
-    persist one merged result row.
+    """Merge one trip into the by-signature map and update the operator
+    union. Same-signature trips collapse; the shortest-duration wins the
+    'best' slot for that signature."""
+    slot = by_signature.setdefault(sig, {"signature": sig, "session_ids": [], "best": trip})
+    if sid not in slot["session_ids"]:
+        slot["session_ids"].append(sid)
+    if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
+        slot["best"] = trip
+    for lg in trip.get("legs", []):
+        feed = lg.get("feed_id")
+        if feed and feed not in operators_union:
+            operators_union.append(feed)
 
-    Mirrors the shape of `_execute_pair` (single-session) but:
 
-      1. Calls `otp_client.fetch_plan` once per session, in parallel via
-         `asyncio.gather`. Each call is independent and tolerates
-         per-session failures (timeout, no_route) — only when EVERY
-         session errors does the row's `status` end up as 'error'.
+def _merge_fanout_results(
+    per_session: list[_FanoutSub],
+) -> tuple[str, dict[str, dict[str, Any]], list[str], list[str]]:
+    """Aggregate the per-session outputs into one pair-level result.
 
-      2. Trips are merged by `trip_signature` so the same itinerary
-         surfaced by multiple sessions counts once. The shortest-duration
-         trip wins the "best" slot used for the matrix cell colouring
-         (best_duration_seconds, best_num_transfers, best_operators).
-
-      3. `session_ids` on the result row records WHICH sessions returned
-         at least one trip — that's the per-cell coverage signal PR #36
-         is built around. NULL when no session returned anything
-         (vs. the run's `session_id` which is NULL for the whole run).
-
-    Same recorder integration as the single-session path: one
-    journey_searches row + one journey_search_execution row per session
-    (so the click-cell drilldown shows the per-session split). The
-    result row's `journey_search_id` points at the umbrella search.
+    Returns ``(status, by_signature, sessions_with_trips, operators_union)``.
+    Mirrors the live `/api/journey/fanout` endpoint's merge pattern.
     """
-    pair_start = time.monotonic()
-
-    # Fire one fetch per session in parallel. Each individual fetch
-    # tolerates its own per-session exception — that's how a single
-    # OTP container being down doesn't poison the whole pair.
-    async def _query_one(sid: str) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], int]:
-        sub_start = time.monotonic()
-        try:
-            raw, trips = await otp_client.fetch_plan(
-                session_id=sid,
-                from_lat=origin.lat,
-                from_lon=origin.lon,
-                to_lat=dest.lat,
-                to_lon=dest.lon,
-                when=depart_at,
-                timeout_ms=_PER_PAIR_TIMEOUT_MS,
-                num_itineraries=_COVERAGE_NUM_ITINERARIES,
-                search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
-            )
-            response_ms = int((time.monotonic() - sub_start) * 1000)
-            sub_status = "ok" if trips else "no_route"
-            return sid, sub_status, raw, trips, response_ms
-        except Exception as exc:
-            response_ms = int((time.monotonic() - sub_start) * 1000)
-            cls_name = type(exc).__name__
-            sub_status = (
-                "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
-            )
-            log.warning(
-                "coverage run %s pair %s→%s session %s failed: %s: %s",
-                run_id,
-                origin.id,
-                dest.id,
-                sid,
-                cls_name,
-                exc,
-            )
-            return sid, sub_status, {}, [], response_ms
-
-    per_session = await asyncio.gather(*(_query_one(sid) for sid in session_ids))
-
-    # Aggregate. Per the live fanout endpoint pattern: merge trips by
-    # signature, track which sessions returned each one, pick the best.
     sessions_with_trips: list[str] = []
     any_ok = False
     any_error_or_timeout = False
     by_signature: dict[str, dict[str, Any]] = {}
-    operators_union: list[str] = []  # ordered, deduped
+    operators_union: list[str] = []
 
-    # Open one DB session for trip_signature lookups; trip_signature is
-    # pure-DB-read (route aliases + station xref) so this is fine.
     with SessionLocal() as db:
         from ..journey.signature import trip_signature
 
@@ -669,46 +669,39 @@ async def _execute_pair_fanout(
 
             for trip in trips:
                 sig = trip_signature(db, session_id=sid, legs=trip.get("legs", []))
-                slot = by_signature.setdefault(
-                    sig, {"signature": sig, "session_ids": [], "best": trip}
+                _merge_one_trip_into_signatures(
+                    sid=sid,
+                    trip=trip,
+                    sig=sig,
+                    by_signature=by_signature,
+                    operators_union=operators_union,
                 )
-                if sid not in slot["session_ids"]:
-                    slot["session_ids"].append(sid)
-                # Best = shortest-duration trip across all sessions for this signature.
-                if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
-                    slot["best"] = trip
-                # Build operator union from the best trip's legs for the cell tooltip.
-                for lg in trip.get("legs", []):
-                    feed = lg.get("feed_id")
-                    if feed and feed not in operators_union:
-                        operators_union.append(feed)
 
-    # Now choose the overall best trip (shortest duration) to fill the
-    # matrix cell's best_* fields.
-    best_trip: dict[str, Any] | None = None
-    if by_signature:
-        best_trip = min(
-            (slot["best"] for slot in by_signature.values()),
-            key=lambda t: t.get("duration_seconds") or 1 << 30,
-        )
+    status = _derive_fanout_status(any_ok=any_ok, any_error_or_timeout=any_error_or_timeout)
+    return status, by_signature, sessions_with_trips, operators_union
 
-    response_ms = int((time.monotonic() - pair_start) * 1000)
 
-    # Derive the pair-level status: same vocabulary as the single-session
-    # path so the matrix render logic stays unchanged. Priority:
-    # ok > no_route > timeout > error. "ok" wins as soon as any session
-    # returned itineraries — fanout's whole point.
-    if any_ok:
-        status = "ok"
-    elif any_error_or_timeout:
-        status = "error"
-    else:
-        status = "no_route"
+def _record_fanout_journey_search(
+    *,
+    run_id: uuid.UUID,
+    per_session: list[_FanoutSub],
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+    response_ms: int,
+    status: str,
+    total_trips_unique: int,
+) -> tuple[uuid.UUID | None, str | None]:
+    """Persist the journey_searches umbrella row + per-session executions
+    so the matrix click-cell drilldown can reuse the v0.1.26 trip-card UI.
 
-    # Persist the journey_searches umbrella row + per-session executions.
-    # Mirrors the live `/api/journey/fanout` recorder pattern.
-    journey_search_id: uuid.UUID | None = None
-    error_message: str | None = None
+    Best-effort: if the recorder write fails the pair still gets a
+    coverage_results row, with the recorder error surfaced in
+    `error_message` so the operator can see *why* the modal link is
+    missing instead of the generic "recorder write failed" message.
+
+    Returns ``(journey_search_id, error_message_or_None)``.
+    """
     with SessionLocal() as db:
         try:
             search = recorder.begin_search(
@@ -745,11 +738,12 @@ async def _execute_pair_fanout(
                 db,
                 search,
                 total_response_ms=response_ms,
-                total_trips_unique=len(by_signature),
+                total_trips_unique=total_trips_unique,
                 status=status,
             )
             journey_search_id = search.id
             db.commit()
+            return journey_search_id, None
         except Exception as recorder_exc:
             log.exception(
                 "coverage run %s pair %s→%s: recorder write failed (continuing)",
@@ -758,9 +752,33 @@ async def _execute_pair_fanout(
                 dest.id,
             )
             db.rollback()
-            error_message = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+            return None, f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
 
-    # Persist the coverage result row.
+
+def _persist_pair_coverage_result(
+    *,
+    run_id: uuid.UUID,
+    origin: Hub,
+    dest: Hub,
+    status: str,
+    response_ms: int,
+    num_itineraries: int | None,
+    best_duration_seconds: int | None,
+    best_num_transfers: int | None,
+    best_operators: str | None,
+    error_message: str | None,
+    journey_search_id: uuid.UUID | None,
+    session_ids: list[str] | None = None,
+) -> None:
+    """Write one NetworkCoverageResult row and increment the run-level
+    counters. Shared by `_execute_pair` (single-session) and
+    `_execute_pair_fanout` so the matrix wire-format stays bit-equivalent
+    across both code paths and the counter updates are written in exactly
+    one place.
+
+    `session_ids` is fanout-only (list of sessions that returned ≥1 trip);
+    `_execute_pair` passes None.
+    """
     with SessionLocal() as db:
         try:
             db.add(
@@ -770,15 +788,11 @@ async def _execute_pair_fanout(
                     dest_hub_id=dest.id,
                     status=status,
                     response_ms=response_ms,
-                    num_itineraries=len(by_signature) if by_signature else 0,
-                    best_duration_seconds=(
-                        int(best_trip.get("duration_seconds") or 0) if best_trip else None
-                    ),
-                    best_num_transfers=(
-                        int(best_trip.get("num_transfers") or 0) if best_trip else None
-                    ),
-                    best_operators=",".join(operators_union) if operators_union else None,
-                    session_ids=sessions_with_trips or None,
+                    num_itineraries=num_itineraries,
+                    best_duration_seconds=best_duration_seconds,
+                    best_num_transfers=best_num_transfers,
+                    best_operators=best_operators,
+                    session_ids=session_ids,
                     error_message=error_message,
                     journey_search_id=journey_search_id,
                 )
@@ -804,6 +818,81 @@ async def _execute_pair_fanout(
                 dest.id,
             )
             db.rollback()
+
+
+async def _execute_pair_fanout(
+    *,
+    run_id: uuid.UUID,
+    session_ids: list[str],
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+) -> None:
+    """PR #36 — run an A→B search against EVERY fanout-enabled session and
+    persist one merged result row.
+
+    Thin orchestrator: delegates to four helpers (query / merge / record /
+    persist). The orchestration is the only thing here; each phase is
+    independently testable.
+
+    Behaviour vs `_execute_pair`:
+      1. Calls `otp_client.fetch_plan` once per session in parallel via
+         `asyncio.gather`. Each call is independent.
+      2. Trips merge by `trip_signature` so the same itinerary surfaced
+         by multiple sessions counts once; shortest-duration wins the
+         "best" slot.
+      3. `session_ids` on the result row records WHICH sessions returned
+         ≥1 trip — that's the per-cell coverage signal PR #36 is built
+         around.
+    """
+    pair_start = time.monotonic()
+
+    per_session = await asyncio.gather(
+        *(
+            _query_one_session_for_pair(
+                sid=sid, origin=origin, dest=dest, depart_at=depart_at, run_id=run_id
+            )
+            for sid in session_ids
+        )
+    )
+
+    status, by_signature, sessions_with_trips, operators_union = _merge_fanout_results(per_session)
+
+    best_trip: dict[str, Any] | None = (
+        min(
+            (slot["best"] for slot in by_signature.values()),
+            key=lambda t: t.get("duration_seconds") or 1 << 30,
+        )
+        if by_signature
+        else None
+    )
+    response_ms = int((time.monotonic() - pair_start) * 1000)
+
+    journey_search_id, error_message = _record_fanout_journey_search(
+        run_id=run_id,
+        per_session=per_session,
+        origin=origin,
+        dest=dest,
+        depart_at=depart_at,
+        response_ms=response_ms,
+        status=status,
+        total_trips_unique=len(by_signature),
+    )
+
+    _persist_pair_coverage_result(
+        run_id=run_id,
+        origin=origin,
+        dest=dest,
+        status=status,
+        response_ms=response_ms,
+        num_itineraries=len(by_signature) if by_signature else 0,
+        best_duration_seconds=(int(best_trip.get("duration_seconds") or 0) if best_trip else None),
+        best_num_transfers=(int(best_trip.get("num_transfers") or 0) if best_trip else None),
+        best_operators=",".join(operators_union) if operators_union else None,
+        session_ids=sessions_with_trips or None,
+        error_message=error_message,
+        journey_search_id=journey_search_id,
+    )
 
 
 def _median(values: list[int]) -> int | None:

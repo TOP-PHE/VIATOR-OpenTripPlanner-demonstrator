@@ -331,7 +331,28 @@ def list_runs(
     return [_run_to_summary(r) for r in rows]
 
 
-@router.post("/runs", response_model=RunSummary, status_code=201)
+@router.post(
+    "/runs",
+    response_model=RunSummary,
+    status_code=201,
+    responses={
+        # Sonar S8415 — declare the HTTPException response codes the
+        # body can raise so the generated OpenAPI spec is truthful and
+        # downstream clients can build matching error-handling.
+        400: {
+            "description": (
+                "Invalid mode/session_id pairing, invalid direction, or "
+                "the requested session is not in 'serving' state."
+            )
+        },
+        404: {"description": "session_id refers to a session that does not exist"},
+        409: {
+            "description": (
+                "mode='fanout' requested but no session is both 'serving' and 'include_in_fanout'"
+            )
+        },
+    },
+)
 def create_run(
     body: RunCreate,
     bg: BackgroundTasks,
