@@ -39,6 +39,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -61,6 +62,14 @@ class NetworkCoverageRun(Base):
     __table_args__ = (
         Index("ix_network_coverage_runs_started_at", "started_at"),
         Index("ix_network_coverage_runs_session_id", "session_id"),
+        # PR #36 — mode controls whether each pair is queried against one
+        # session (the run's session_id) or fanned out across every
+        # fanout-enabled session at execute time. The validity of the
+        # (mode, session_id) pair at WRITE time is enforced by the API
+        # layer — keeping the DB constraint loose lets historical
+        # single-session rows survive a `ON DELETE SET NULL` of their
+        # session FK without violating a NOT-NULL.
+        CheckConstraint("mode IN ('single_session','fanout')", name="coverage_run_mode_valid"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -81,7 +90,17 @@ class NetworkCoverageRun(Base):
     # Snapshot of the session id at run time, for human display when the
     # FK has gone NULL (so the operator still sees "ran against
     # nap-fr-rail-experimental" even after deleting that session).
+    # For fanout-mode runs the label is the placeholder "fanout" so the
+    # sidebar / matrix UI can distinguish them at a glance.
     session_label: Mapped[str] = mapped_column(String, nullable=False)
+
+    # PR #36 — 'single_session' (the legacy behaviour) or 'fanout' (run
+    # each pair against every serving + include_in_fanout session, merge
+    # results by trip_signature). Default mirrors the pre-PR-#36 shape so
+    # existing rows after the alembic backfill stay correct.
+    mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'single_session'")
+    )
 
     # Departure datetime the run is searching from. Stored timezone-aware;
     # OTP interprets it in the session's transitModelTimeZone (v0.1.21+).
@@ -169,6 +188,13 @@ class NetworkCoverageResult(Base):
     # legs (e.g. "SNCF,IDFM"). Lets the matrix tooltip show "SNCF + 2
     # transfers" without having to load the full journey_trip row.
     best_operators: Mapped[str | None] = mapped_column(String)
+
+    # PR #36 — the session ids that returned at least one itinerary for
+    # this pair in fanout mode. NULL on single-session rows (the run's
+    # session_id is the unique answer there). Matrix UI uses this to
+    # badge each cell with which network covered it (e.g. "nap-fr-rail
+    # + nap-eu-corridors" for Paris→Madrid).
+    session_ids: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
 
     error_message: Mapped[str | None] = mapped_column(String)
 

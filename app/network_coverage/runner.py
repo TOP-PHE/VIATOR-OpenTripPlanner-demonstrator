@@ -42,7 +42,19 @@ from ..models import (
     NetworkCoverageRun,
 )
 from ..models import Session as SessionRow
+from ..models.sessions import SessionState
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
+
+# PR #36 — valid coverage-run modes.
+MODE_SINGLE_SESSION = "single_session"
+MODE_FANOUT = "fanout"
+VALID_MODES = (MODE_SINGLE_SESSION, MODE_FANOUT)
+
+# Placeholder label stored on `network_coverage_runs.session_label` for
+# fanout runs (which have no single session to label). The sidebar /
+# matrix UI renders this verbatim, so it doubles as a "this is a fanout
+# run" badge.
+FANOUT_SESSION_LABEL = "fanout"
 
 log = logging.getLogger(__name__)
 
@@ -159,9 +171,10 @@ def create_run(
     db: DbSession,
     *,
     actor_user_id: uuid.UUID | None,
-    session_id: str,
+    session_id: str | None,
     depart_at: datetime,
     direction: str = "both",
+    mode: str = MODE_SINGLE_SESSION,
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
@@ -169,25 +182,47 @@ def create_run(
     processes the run (see `execute_run`).
 
     v0.1.31 — hubs read from `network_coverage_hubs` (operator-editable)
-    instead of the static `hubs.py` constant. The hub_set signature
-    captures the active slug set at this moment so future re-runs of
-    the same matrix are comparable.
+    instead of the static `hubs.py` constant.
+
+    PR #36 — `mode` controls per-pair query distribution:
+      'single_session'  — query the run's `session_id` (legacy behaviour;
+                          `session_id` is required and is stored verbatim
+                          as the `session_label`)
+      'fanout'          — query every serving + include_in_fanout session
+                          at execute time, merge results by trip_signature
+                          (the live `/api/journey/fanout` pattern). The
+                          API layer enforces `session_id is None` for
+                          fanout-mode runs.
     """
     if direction not in ("both", "single"):
         raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
+    if mode not in VALID_MODES:
+        raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
+    if mode == MODE_SINGLE_SESSION and not session_id:
+        raise ValueError("mode='single_session' requires a non-empty session_id")
+    if mode == MODE_FANOUT and session_id is not None:
+        raise ValueError("mode='fanout' must not specify a session_id")
+
     hubs = _load_active_hubs(db)
     if not hubs:
         raise ValueError("No active hubs configured — add some via the manage-hubs UI")
     pairs = _hub_pairs(hubs, direction)
+
+    # session_label is the per-row UI hint. Fanout runs use a fixed
+    # placeholder so the sidebar can badge them distinctly.
+    label = session_id if mode == MODE_SINGLE_SESSION else FANOUT_SESSION_LABEL
+    assert label is not None  # narrowing for mypy — guaranteed by mode validation above
+
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,
         session_id=session_id,
-        session_label=session_id,
+        session_label=label,
         depart_at=depart_at,
         hub_set=_hub_set_signature(hubs),
         direction=direction,
         status="pending",
         total_pairs=len(pairs),
+        mode=mode,
     )
     db.add(run)
     db.flush()
@@ -205,8 +240,10 @@ async def execute_run(run_id: uuid.UUID) -> None:
     log.info("network-coverage run %s starting", run_id)
     started = time.monotonic()
     pairs: list[tuple[Hub, Hub]] = []
-    session_id_for_pairs: str = ""
+    session_id_for_pairs: str | None = None
     depart_at_for_pairs: datetime | None = None
+    run_mode: str = MODE_SINGLE_SESSION
+    fanout_session_ids: list[str] = []
 
     # Phase 1: snapshot the run inputs and flip to "running" in a short txn.
     with SessionLocal() as db:
@@ -224,13 +261,40 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run.status = "running"
         run.started_at = datetime.now(UTC)
         db.commit()
-        if run.session_id is None:
-            log.warning("run %s has no session_id — aborting", run_id)
-            run.status = "failed"
-            run.finished_at = datetime.now(UTC)
-            db.commit()
-            return
-        session_id_for_pairs = run.session_id
+        run_mode = run.mode
+        if run_mode == MODE_SINGLE_SESSION:
+            if run.session_id is None:
+                log.warning("run %s mode=single_session has no session_id — aborting", run_id)
+                run.status = "failed"
+                run.finished_at = datetime.now(UTC)
+                db.commit()
+                return
+            session_id_for_pairs = run.session_id
+        else:
+            # Fanout — read the eligible sessions NOW so a session
+            # going down mid-run doesn't change the pair load partway
+            # through. Snapshot the ids only; per-pair DB lookups use
+            # the live sessions list.
+            fanout_session_ids = [
+                s.id
+                for s in db.execute(
+                    select(SessionRow)
+                    .where(SessionRow.state == SessionState.SERVING.value)
+                    .where(SessionRow.include_in_fanout.is_(True))
+                    .order_by(SessionRow.id)
+                )
+                .scalars()
+                .all()
+            ]
+            if not fanout_session_ids:
+                log.warning(
+                    "run %s mode=fanout has no serving fanout-enabled sessions — aborting",
+                    run_id,
+                )
+                run.status = "failed"
+                run.finished_at = datetime.now(UTC)
+                db.commit()
+                return
         depart_at_for_pairs = run.depart_at
         # v0.1.31 — re-read active hubs from the DB at execute time.
         # We don't snapshot at create_run because the operator might
@@ -255,13 +319,23 @@ async def execute_run(run_id: uuid.UUID) -> None:
 
     async def _one_pair(origin: Hub, dest: Hub) -> None:
         async with semaphore:
-            await _execute_pair(
-                run_id=run_id,
-                session_id=session_id_for_pairs,
-                origin=origin,
-                dest=dest,
-                depart_at=depart_at_for_pairs,
-            )
+            if run_mode == MODE_FANOUT:
+                await _execute_pair_fanout(
+                    run_id=run_id,
+                    session_ids=fanout_session_ids,
+                    origin=origin,
+                    dest=dest,
+                    depart_at=depart_at_for_pairs,
+                )
+            else:
+                assert session_id_for_pairs is not None  # narrowed at Phase 1
+                await _execute_pair(
+                    run_id=run_id,
+                    session_id=session_id_for_pairs,
+                    origin=origin,
+                    dest=dest,
+                    depart_at=depart_at_for_pairs,
+                )
 
     try:
         await asyncio.gather(
@@ -476,6 +550,239 @@ async def _execute_pair(
             )
             # Increment run-level counters atomically so the UI's progress
             # bar updates even before the run completes.
+            db.execute(
+                update(NetworkCoverageRun)
+                .where(NetworkCoverageRun.id == run_id)
+                .values(
+                    completed_pairs=NetworkCoverageRun.completed_pairs + 1,
+                    ok_pairs=NetworkCoverageRun.ok_pairs + (1 if status == "ok" else 0),
+                    no_route_pairs=NetworkCoverageRun.no_route_pairs
+                    + (1 if status == "no_route" else 0),
+                    error_pairs=NetworkCoverageRun.error_pairs
+                    + (1 if status not in ("ok", "no_route", "skipped") else 0),
+                )
+            )
+            db.commit()
+        except Exception:
+            log.exception(
+                "coverage run %s pair %s→%s: result write failed",
+                run_id,
+                origin.id,
+                dest.id,
+            )
+            db.rollback()
+
+
+async def _execute_pair_fanout(
+    *,
+    run_id: uuid.UUID,
+    session_ids: list[str],
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+) -> None:
+    """PR #36 — run an A→B search against EVERY fanout-enabled session and
+    persist one merged result row.
+
+    Mirrors the shape of `_execute_pair` (single-session) but:
+
+      1. Calls `otp_client.fetch_plan` once per session, in parallel via
+         `asyncio.gather`. Each call is independent and tolerates
+         per-session failures (timeout, no_route) — only when EVERY
+         session errors does the row's `status` end up as 'error'.
+
+      2. Trips are merged by `trip_signature` so the same itinerary
+         surfaced by multiple sessions counts once. The shortest-duration
+         trip wins the "best" slot used for the matrix cell colouring
+         (best_duration_seconds, best_num_transfers, best_operators).
+
+      3. `session_ids` on the result row records WHICH sessions returned
+         at least one trip — that's the per-cell coverage signal PR #36
+         is built around. NULL when no session returned anything
+         (vs. the run's `session_id` which is NULL for the whole run).
+
+    Same recorder integration as the single-session path: one
+    journey_searches row + one journey_search_execution row per session
+    (so the click-cell drilldown shows the per-session split). The
+    result row's `journey_search_id` points at the umbrella search.
+    """
+    pair_start = time.monotonic()
+
+    # Fire one fetch per session in parallel. Each individual fetch
+    # tolerates its own per-session exception — that's how a single
+    # OTP container being down doesn't poison the whole pair.
+    async def _query_one(sid: str) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], int]:
+        sub_start = time.monotonic()
+        try:
+            raw, trips = await otp_client.fetch_plan(
+                session_id=sid,
+                from_lat=origin.lat,
+                from_lon=origin.lon,
+                to_lat=dest.lat,
+                to_lon=dest.lon,
+                when=depart_at,
+                timeout_ms=_PER_PAIR_TIMEOUT_MS,
+                num_itineraries=_COVERAGE_NUM_ITINERARIES,
+                search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
+            )
+            response_ms = int((time.monotonic() - sub_start) * 1000)
+            sub_status = "ok" if trips else "no_route"
+            return sid, sub_status, raw, trips, response_ms
+        except Exception as exc:
+            response_ms = int((time.monotonic() - sub_start) * 1000)
+            cls_name = type(exc).__name__
+            sub_status = (
+                "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
+            )
+            log.warning(
+                "coverage run %s pair %s→%s session %s failed: %s: %s",
+                run_id,
+                origin.id,
+                dest.id,
+                sid,
+                cls_name,
+                exc,
+            )
+            return sid, sub_status, {}, [], response_ms
+
+    per_session = await asyncio.gather(*(_query_one(sid) for sid in session_ids))
+
+    # Aggregate. Per the live fanout endpoint pattern: merge trips by
+    # signature, track which sessions returned each one, pick the best.
+    sessions_with_trips: list[str] = []
+    any_ok = False
+    any_error_or_timeout = False
+    by_signature: dict[str, dict[str, Any]] = {}
+    operators_union: list[str] = []  # ordered, deduped
+
+    # Open one DB session for trip_signature lookups; trip_signature is
+    # pure-DB-read (route aliases + station xref) so this is fine.
+    with SessionLocal() as db:
+        from ..journey.signature import trip_signature
+
+        for sid, sub_status, _raw, trips, _ms in per_session:
+            if sub_status == "ok":
+                any_ok = True
+                sessions_with_trips.append(sid)
+            elif sub_status in ("error", "timeout"):
+                any_error_or_timeout = True
+
+            for trip in trips:
+                sig = trip_signature(db, session_id=sid, legs=trip.get("legs", []))
+                slot = by_signature.setdefault(
+                    sig, {"signature": sig, "session_ids": [], "best": trip}
+                )
+                if sid not in slot["session_ids"]:
+                    slot["session_ids"].append(sid)
+                # Best = shortest-duration trip across all sessions for this signature.
+                if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
+                    slot["best"] = trip
+                # Build operator union from the best trip's legs for the cell tooltip.
+                for lg in trip.get("legs", []):
+                    feed = lg.get("feed_id")
+                    if feed and feed not in operators_union:
+                        operators_union.append(feed)
+
+    # Now choose the overall best trip (shortest duration) to fill the
+    # matrix cell's best_* fields.
+    best_trip: dict[str, Any] | None = None
+    if by_signature:
+        best_trip = min(
+            (slot["best"] for slot in by_signature.values()),
+            key=lambda t: t.get("duration_seconds") or 1 << 30,
+        )
+
+    response_ms = int((time.monotonic() - pair_start) * 1000)
+
+    # Derive the pair-level status: same vocabulary as the single-session
+    # path so the matrix render logic stays unchanged. Priority:
+    # ok > no_route > timeout > error. "ok" wins as soon as any session
+    # returned itineraries — fanout's whole point.
+    if any_ok:
+        status = "ok"
+    elif any_error_or_timeout:
+        status = "error"
+    else:
+        status = "no_route"
+
+    # Persist the journey_searches umbrella row + per-session executions.
+    # Mirrors the live `/api/journey/fanout` recorder pattern.
+    journey_search_id: uuid.UUID | None = None
+    error_message: str | None = None
+    with SessionLocal() as db:
+        try:
+            search = recorder.begin_search(
+                db,
+                user_id=None,
+                ip=None,
+                endpoint="fanout",
+                origin_lat=origin.lat,
+                origin_lon=origin.lon,
+                origin_label=origin.name,
+                dest_lat=dest.lat,
+                dest_lon=dest.lon,
+                dest_label=dest.name,
+                requested_time_kind="depart_at",
+                requested_time=depart_at,
+                modes="TRANSIT,WALK",
+            )
+            for sid, sub_status, raw, trips, _ms in per_session:
+                session_row = db.get(SessionRow, sid)
+                if session_row is None:
+                    continue
+                recorder.record_execution(
+                    db,
+                    search_id=search.id,
+                    session_id=sid,
+                    graph_snapshot_id=None,
+                    status=sub_status,
+                    response_ms=_ms,
+                    raw_response=raw or None,
+                    error_message=None,
+                    trips=trips,
+                )
+            recorder.finish_search(
+                db,
+                search,
+                total_response_ms=response_ms,
+                total_trips_unique=len(by_signature),
+                status=status,
+            )
+            journey_search_id = search.id
+            db.commit()
+        except Exception as recorder_exc:
+            log.exception(
+                "coverage run %s pair %s→%s: recorder write failed (continuing)",
+                run_id,
+                origin.id,
+                dest.id,
+            )
+            db.rollback()
+            error_message = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+
+    # Persist the coverage result row.
+    with SessionLocal() as db:
+        try:
+            db.add(
+                NetworkCoverageResult(
+                    run_id=run_id,
+                    origin_hub_id=origin.id,
+                    dest_hub_id=dest.id,
+                    status=status,
+                    response_ms=response_ms,
+                    num_itineraries=len(by_signature) if by_signature else 0,
+                    best_duration_seconds=(
+                        int(best_trip.get("duration_seconds") or 0) if best_trip else None
+                    ),
+                    best_num_transfers=(
+                        int(best_trip.get("num_transfers") or 0) if best_trip else None
+                    ),
+                    best_operators=",".join(operators_union) if operators_union else None,
+                    session_ids=sessions_with_trips or None,
+                    error_message=error_message,
+                    journey_search_id=journey_search_id,
+                )
+            )
             db.execute(
                 update(NetworkCoverageRun)
                 .where(NetworkCoverageRun.id == run_id)
