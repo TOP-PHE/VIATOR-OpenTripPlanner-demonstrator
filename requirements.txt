@@ -1,8 +1,8 @@
-fastapi==0.136.1                # 0.116+ pulls starlette>=0.46 (we need >=0.49.1 for CVE-2025-62727); 0.136 pulls starlette 1.0.0
-uvicorn[standard]==0.47.0
+fastapi==0.136.3                # 0.116+ pulls starlette>=0.46 (we need >=0.49.1 for CVE-2025-62727); 0.136 pulls starlette 1.0.0
+uvicorn[standard]==0.48.0
 python-multipart==0.0.29        # 0.0.22+ fixes CVE-2026-24486 (HIGH path traversal); 0.0.26 added CVE-2026-40347 (MEDIUM DoS) fix; 0.0.27 fixes GHSA-pp6c-gr5w-3c5g (multipart parser DoS)
 jinja2==3.1.6                   # 3.1.5+ fixes CVE-2025-27516 (sandbox escape via attr filter)
-sqlalchemy==2.0.49             # 2.0.49 broadens Session.execute() return type to Result[Any] — handled in app/retention.py + app/master/trainline.py via cast (audit-2026-05 #23)
+sqlalchemy==2.0.50             # 2.0.49 broadens Session.execute() return type to Result[Any] — handled in app/retention.py + app/master/trainline.py via cast (audit-2026-05 #23)
 psycopg[binary]==3.3.4
 pydantic==2.13.4
 pydantic-settings==2.14.1
@@ -28,10 +28,10 @@ prometheus-client==0.25.0       # Prometheus exposition format + custom collecto
 # Beta-tagged versions (0.62b1) are the production line — OTel uses the
 # `bN` suffix even for stable instrumentation releases. Pin with `==` so
 # pip accepts the pre-release without `--pre`.
-opentelemetry-api==1.41.1
-opentelemetry-sdk==1.41.1
-opentelemetry-exporter-otlp-proto-grpc==1.41.1
-opentelemetry-instrumentation-fastapi==0.62b1
-opentelemetry-instrumentation-sqlalchemy==0.62b1
-opentelemetry-instrumentation-httpx==0.62b1
-opentelemetry-instrumentation-logging==0.62b1
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
+opentelemetry-exporter-otlp-proto-grpc==1.42.1
+opentelemetry-instrumentation-fastapi==0.63b1
+opentelemetry-instrumentation-sqlalchemy==0.63b1
+opentelemetry-instrumentation-httpx==0.63b1
+opentelemetry-instrumentation-logging==0.63b1
