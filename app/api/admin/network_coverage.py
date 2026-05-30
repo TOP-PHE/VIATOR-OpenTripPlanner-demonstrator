@@ -103,9 +103,28 @@ class HubUpdate(BaseModel):
 
 
 class RunCreate(BaseModel):
-    session_id: str = Field(min_length=1, description="Target session — must be serving")
+    """Body of POST /api/admin/network-coverage/runs.
+
+    Two valid shapes:
+      - mode='single_session' + session_id='<sid>'  (the legacy default)
+      - mode='fanout' + session_id=None              (PR #36)
+
+    The combination is enforced at endpoint time — invalid pairings get
+    a 400 with a descriptive error rather than silently falling through.
+    """
+
+    # Optional in fanout mode; required in single-session mode.
+    session_id: str | None = Field(
+        default=None, description="Target session — required when mode='single_session'"
+    )
     depart_at: datetime = Field(description="Departure datetime (timezone-aware preferred)")
     direction: str = Field(default="both", description="'both' | 'single'")
+    # PR #36 — see runner.MODE_SINGLE_SESSION / MODE_FANOUT.
+    mode: str = Field(
+        default="single_session",
+        pattern=r"^(single_session|fanout)$",
+        description="'single_session' (legacy) | 'fanout' (cross-session matrix)",
+    )
 
 
 class RunSummary(BaseModel):
@@ -119,6 +138,9 @@ class RunSummary(BaseModel):
     finished_at: str | None
     status: str
     direction: str
+    # PR #36 — 'single_session' (legacy) | 'fanout' (cross-session matrix).
+    # Sidebar uses this to render a distinct icon/badge for fanout runs.
+    mode: str = "single_session"
     total_pairs: int
     completed_pairs: int
     ok_pairs: int
@@ -139,6 +161,11 @@ class ResultEntry(BaseModel):
     best_operators: str | None
     error_message: str | None
     journey_search_id: str | None
+    # PR #36 — list of sessions that returned trips for this pair in a
+    # fanout-mode run. NULL for single-session runs (the run's session_id
+    # is the answer). The matrix UI badges each cell with "fr + eu"
+    # style markers using this field.
+    session_ids: list[str] | None = None
 
 
 class RunDetail(RunSummary):
@@ -304,7 +331,31 @@ def list_runs(
     return [_run_to_summary(r) for r in rows]
 
 
-@router.post("/runs", response_model=RunSummary, status_code=201)
+@router.post(
+    "/runs",
+    # response_model intentionally omitted — Sonar S7191 flags it as
+    # redundant with the `-> RunSummary` return annotation, which
+    # FastAPI uses verbatim as the response schema. Behaviour is
+    # bit-equivalent (same OpenAPI spec, same serialisation filter).
+    status_code=201,
+    responses={
+        # Sonar S8415 — declare the HTTPException response codes the
+        # body can raise so the generated OpenAPI spec is truthful and
+        # downstream clients can build matching error-handling.
+        400: {
+            "description": (
+                "Invalid mode/session_id pairing, invalid direction, or "
+                "the requested session is not in 'serving' state."
+            )
+        },
+        404: {"description": "session_id refers to a session that does not exist"},
+        409: {
+            "description": (
+                "mode='fanout' requested but no session is both 'serving' and 'include_in_fanout'"
+            )
+        },
+    },
+)
 def create_run(
     body: RunCreate,
     bg: BackgroundTasks,
@@ -313,22 +364,66 @@ def create_run(
 ) -> RunSummary:
     """Start a new coverage run.
 
-    Validates the session is currently serving (no point routing against
-    a graph that isn't loaded), creates the run row in pending state,
-    schedules `execute_run` as a background task, and returns the
-    summary so the UI can start polling immediately.
+    Two modes (PR #36):
+      - 'single_session' (legacy): queries every pair against `session_id`.
+                                   `session_id` is required and must be
+                                   in 'serving' state.
+      - 'fanout':                  queries every pair against every
+                                   serving + include_in_fanout session in
+                                   parallel and merges results by trip
+                                   signature. `session_id` must be omitted.
+                                   At least one serving + fanout-enabled
+                                   session must exist.
+
+    Validates pre-flight, creates the run row in pending state, schedules
+    `execute_run` as a background task, and returns the summary so the
+    UI can start polling immediately.
     """
     if body.direction not in ("both", "single"):
         raise HTTPException(400, "direction must be 'both' or 'single'")
-    s = db.get(SessionRow, body.session_id)
-    if s is None:
-        raise HTTPException(404, f"Session {body.session_id!r} not found")
-    if s.state != SessionState.SERVING.value:
-        raise HTTPException(
-            400,
-            f"Session {body.session_id!r} is in state {s.state!r} — must be 'serving' "
-            "for coverage runs (the OTP container has to be live to receive queries)",
+
+    if body.mode == runner.MODE_SINGLE_SESSION:
+        if not body.session_id:
+            raise HTTPException(400, "mode='single_session' requires a session_id")
+        s = db.get(SessionRow, body.session_id)
+        if s is None:
+            raise HTTPException(404, f"Session {body.session_id!r} not found")
+        if s.state != SessionState.SERVING.value:
+            raise HTTPException(
+                400,
+                f"Session {body.session_id!r} is in state {s.state!r} — must be 'serving' "
+                "for coverage runs (the OTP container has to be live to receive queries)",
+            )
+    elif body.mode == runner.MODE_FANOUT:
+        if body.session_id:
+            raise HTTPException(
+                400,
+                "mode='fanout' must not specify a session_id — every fanout-enabled "
+                "session is queried at execute time",
+            )
+        # At least one serving + fanout-enabled session must exist; otherwise
+        # the run would have nothing to query against. The runner re-checks
+        # at execute time (in case a session drops between create and run)
+        # but failing fast at create gives the UI a meaningful 400 instead
+        # of a 'failed' status row in the sidebar.
+        eligible = (
+            db.execute(
+                select(SessionRow)
+                .where(SessionRow.state == SessionState.SERVING.value)
+                .where(SessionRow.include_in_fanout.is_(True))
+                .limit(1)
+            )
+            .scalars()
+            .first()
         )
+        if eligible is None:
+            raise HTTPException(
+                409,
+                "mode='fanout' requires at least one serving + include_in_fanout session; "
+                "none found",
+            )
+    else:  # pragma: no cover — pydantic pattern already gates the values
+        raise HTTPException(400, f"unknown mode {body.mode!r}")
 
     # Normalise depart_at to UTC if naive — OTP interprets this in
     # transitModelTimeZone; we keep our DB representation tz-aware.
@@ -342,6 +437,7 @@ def create_run(
         session_id=body.session_id,
         depart_at=depart_at,
         direction=body.direction,
+        mode=body.mode,
     )
     db.commit()
     db.refresh(run)
@@ -379,6 +475,9 @@ def get_run(
                 best_operators=r.best_operators,
                 error_message=r.error_message,
                 journey_search_id=str(r.journey_search_id) if r.journey_search_id else None,
+                # PR #36 — only fanout-mode rows populate this; getattr
+                # so test fixtures without the column survive
+                session_ids=getattr(r, "session_ids", None),
             )
             for r in results
         ],
@@ -414,6 +513,11 @@ def _run_to_summary(run: Any) -> RunSummary:
         finished_at=run.finished_at.isoformat() if run.finished_at else None,
         status=run.status,
         direction=run.direction,
+        # PR #36 — pre-migration rows (which lack the column at SELECT
+        # time only in test fixtures that bypass alembic) get the
+        # legacy default. In production every row has it populated by
+        # the server_default on insert.
+        mode=getattr(run, "mode", "single_session") or "single_session",
         total_pairs=run.total_pairs or 0,
         completed_pairs=run.completed_pairs or 0,
         ok_pairs=run.ok_pairs or 0,

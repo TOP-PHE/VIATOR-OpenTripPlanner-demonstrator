@@ -167,8 +167,32 @@
       <p class="hint" style="color: var(--fail)">No serving sessions — promote a session first.</p>
     {% else %}
       <form id="cov-form" class="cov-form">
-        <label>Session</label>
-        <select name="session_id">
+        {# PR #36 — mode toggle: single-session (legacy) vs fanout
+           (cross-session, queries every serving + include_in_fanout
+           session in parallel and merges by trip signature).
+
+           Sonar Web:S6853 / S6859 — radio groups use the native
+           fieldset + legend pair rather than a generic container with
+           an ARIA grouping role. Browsers expose fieldset with the
+           right semantics out of the box and screen readers announce
+           the legend when any radio inside receives focus. Reset the
+           default border/padding so the visual matches the rest of
+           the sidebar form. #}
+        <fieldset class="cov-mode" style="border: 0; margin: 0 0 0.6rem; padding: 0; display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
+          <legend style="margin-top: 0; padding: 0; font-weight: 600; font-size: 0.85rem">Mode</legend>
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-weight: normal">
+            <input type="radio" name="mode" value="single_session" checked id="cov-mode-single">
+            Single session
+          </label>
+          <label style="display: flex; align-items: center; gap: 0.4rem; font-weight: normal">
+            <input type="radio" name="mode" value="fanout" id="cov-mode-fanout">
+            All fanout-enabled sessions (cross-session matrix)
+          </label>
+        </fieldset>
+        <label for="cov-session-select">Session
+          <span class="hint" style="font-weight: normal" id="cov-session-hint"></span>
+        </label>
+        <select name="session_id" id="cov-session-select">
           {% for s in serving_sessions %}
             <option value="{{ s.id }}">{{ s.name }} ({{ s.id }})</option>
           {% endfor %}
@@ -378,15 +402,44 @@ async function reloadRunList(activeId) {
   }
 }
 
+// PR #36 — wire the single-session / fanout radio toggle. When 'fanout'
+// is chosen the per-session select is disabled (visually + functionally)
+// since the API rejects mode='fanout' with a session_id.
+function _refreshModeUI() {
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || 'single_session';
+  const sel = document.getElementById('cov-session-select');
+  const hint = document.getElementById('cov-session-hint');
+  if (!sel) return;
+  if (mode === 'fanout') {
+    sel.disabled = true;
+    sel.style.opacity = '0.4';
+    if (hint) hint.textContent = '(ignored in fanout mode — queries all serving + fanout-enabled sessions)';
+  } else {
+    sel.disabled = false;
+    sel.style.opacity = '1';
+    if (hint) hint.textContent = '';
+  }
+}
+document.querySelectorAll('input[name="mode"]').forEach(r => {
+  r.addEventListener('change', _refreshModeUI);
+});
+_refreshModeUI();
+
 // ─── Form submit: create a new run ──────────────────────────────────
 document.getElementById('cov-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
+  // PR #36 — only send session_id when running in single-session mode.
+  // Sending it with mode='fanout' triggers a 400 from the API.
+  const mode = fd.get('mode') || 'single_session';
   const body = {
-    session_id: fd.get('session_id'),
+    mode: mode,
     depart_at: fd.get('depart_at') + ':00',
     direction: fd.get('direction') || 'both',
   };
+  if (mode === 'single_session') {
+    body.session_id = fd.get('session_id');
+  }
   const btn = document.getElementById('cov-go');
   btn.disabled = true; const original = btn.textContent; btn.textContent = 'Starting…';
   try {

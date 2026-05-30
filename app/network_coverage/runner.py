@@ -42,7 +42,19 @@ from ..models import (
     NetworkCoverageRun,
 )
 from ..models import Session as SessionRow
+from ..models.sessions import SessionState
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
+
+# PR #36 — valid coverage-run modes.
+MODE_SINGLE_SESSION = "single_session"
+MODE_FANOUT = "fanout"
+VALID_MODES = (MODE_SINGLE_SESSION, MODE_FANOUT)
+
+# Placeholder label stored on `network_coverage_runs.session_label` for
+# fanout runs (which have no single session to label). The sidebar /
+# matrix UI renders this verbatim, so it doubles as a "this is a fanout
+# run" badge.
+FANOUT_SESSION_LABEL = "fanout"
 
 log = logging.getLogger(__name__)
 
@@ -159,9 +171,10 @@ def create_run(
     db: DbSession,
     *,
     actor_user_id: uuid.UUID | None,
-    session_id: str,
+    session_id: str | None,
     depart_at: datetime,
     direction: str = "both",
+    mode: str = MODE_SINGLE_SESSION,
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
@@ -169,25 +182,47 @@ def create_run(
     processes the run (see `execute_run`).
 
     v0.1.31 — hubs read from `network_coverage_hubs` (operator-editable)
-    instead of the static `hubs.py` constant. The hub_set signature
-    captures the active slug set at this moment so future re-runs of
-    the same matrix are comparable.
+    instead of the static `hubs.py` constant.
+
+    PR #36 — `mode` controls per-pair query distribution:
+      'single_session'  — query the run's `session_id` (legacy behaviour;
+                          `session_id` is required and is stored verbatim
+                          as the `session_label`)
+      'fanout'          — query every serving + include_in_fanout session
+                          at execute time, merge results by trip_signature
+                          (the live `/api/journey/fanout` pattern). The
+                          API layer enforces `session_id is None` for
+                          fanout-mode runs.
     """
     if direction not in ("both", "single"):
         raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
+    if mode not in VALID_MODES:
+        raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
+    if mode == MODE_SINGLE_SESSION and not session_id:
+        raise ValueError("mode='single_session' requires a non-empty session_id")
+    if mode == MODE_FANOUT and session_id is not None:
+        raise ValueError("mode='fanout' must not specify a session_id")
+
     hubs = _load_active_hubs(db)
     if not hubs:
         raise ValueError("No active hubs configured — add some via the manage-hubs UI")
     pairs = _hub_pairs(hubs, direction)
+
+    # session_label is the per-row UI hint. Fanout runs use a fixed
+    # placeholder so the sidebar can badge them distinctly.
+    label = session_id if mode == MODE_SINGLE_SESSION else FANOUT_SESSION_LABEL
+    assert label is not None  # narrowing for mypy — guaranteed by mode validation above
+
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,
         session_id=session_id,
-        session_label=session_id,
+        session_label=label,
         depart_at=depart_at,
         hub_set=_hub_set_signature(hubs),
         direction=direction,
         status="pending",
         total_pairs=len(pairs),
+        mode=mode,
     )
     db.add(run)
     db.flush()
@@ -205,8 +240,10 @@ async def execute_run(run_id: uuid.UUID) -> None:
     log.info("network-coverage run %s starting", run_id)
     started = time.monotonic()
     pairs: list[tuple[Hub, Hub]] = []
-    session_id_for_pairs: str = ""
+    session_id_for_pairs: str | None = None
     depart_at_for_pairs: datetime | None = None
+    run_mode: str = MODE_SINGLE_SESSION
+    fanout_session_ids: list[str] = []
 
     # Phase 1: snapshot the run inputs and flip to "running" in a short txn.
     with SessionLocal() as db:
@@ -224,13 +261,40 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run.status = "running"
         run.started_at = datetime.now(UTC)
         db.commit()
-        if run.session_id is None:
-            log.warning("run %s has no session_id — aborting", run_id)
-            run.status = "failed"
-            run.finished_at = datetime.now(UTC)
-            db.commit()
-            return
-        session_id_for_pairs = run.session_id
+        run_mode = run.mode
+        if run_mode == MODE_SINGLE_SESSION:
+            if run.session_id is None:
+                log.warning("run %s mode=single_session has no session_id — aborting", run_id)
+                run.status = "failed"
+                run.finished_at = datetime.now(UTC)
+                db.commit()
+                return
+            session_id_for_pairs = run.session_id
+        else:
+            # Fanout — read the eligible sessions NOW so a session
+            # going down mid-run doesn't change the pair load partway
+            # through. Snapshot the ids only; per-pair DB lookups use
+            # the live sessions list.
+            fanout_session_ids = [
+                s.id
+                for s in db.execute(
+                    select(SessionRow)
+                    .where(SessionRow.state == SessionState.SERVING.value)
+                    .where(SessionRow.include_in_fanout.is_(True))
+                    .order_by(SessionRow.id)
+                )
+                .scalars()
+                .all()
+            ]
+            if not fanout_session_ids:
+                log.warning(
+                    "run %s mode=fanout has no serving fanout-enabled sessions — aborting",
+                    run_id,
+                )
+                run.status = "failed"
+                run.finished_at = datetime.now(UTC)
+                db.commit()
+                return
         depart_at_for_pairs = run.depart_at
         # v0.1.31 — re-read active hubs from the DB at execute time.
         # We don't snapshot at create_run because the operator might
@@ -255,13 +319,23 @@ async def execute_run(run_id: uuid.UUID) -> None:
 
     async def _one_pair(origin: Hub, dest: Hub) -> None:
         async with semaphore:
-            await _execute_pair(
-                run_id=run_id,
-                session_id=session_id_for_pairs,
-                origin=origin,
-                dest=dest,
-                depart_at=depart_at_for_pairs,
-            )
+            if run_mode == MODE_FANOUT:
+                await _execute_pair_fanout(
+                    run_id=run_id,
+                    session_ids=fanout_session_ids,
+                    origin=origin,
+                    dest=dest,
+                    depart_at=depart_at_for_pairs,
+                )
+            else:
+                assert session_id_for_pairs is not None  # narrowed at Phase 1
+                await _execute_pair(
+                    run_id=run_id,
+                    session_id=session_id_for_pairs,
+                    origin=origin,
+                    dest=dest,
+                    depart_at=depart_at_for_pairs,
+                )
 
     try:
         await asyncio.gather(
@@ -456,7 +530,255 @@ async def _execute_pair(
             error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
 
     # Always persist the coverage result, even when the recorder write
-    # failed — the matrix is the canonical artifact.
+    # failed — the matrix is the canonical artifact. Shared with the
+    # fanout path so both modes write the result row + counters update
+    # via exactly one code path (Sonar duplication metric was flagging
+    # the previous copy-paste).
+    _persist_pair_coverage_result(
+        run_id=run_id,
+        origin=origin,
+        dest=dest,
+        status=status,
+        response_ms=response_ms,
+        num_itineraries=num_itineraries,
+        best_duration_seconds=best_duration_seconds,
+        best_num_transfers=best_num_transfers,
+        best_operators=best_operators,
+        error_message=error_message,
+        journey_search_id=journey_search_id,
+    )
+
+
+# ─────────────────── fanout helpers (PR #36) ───────────────────
+#
+# `_execute_pair_fanout` is intentionally a thin orchestrator that calls
+# these four helpers in sequence. Sonar's cognitive-complexity rule was
+# (rightly) screaming at the original 230-line body — extracting the
+# four phases (query / merge / record / persist) makes each phase
+# testable in isolation and brings the orchestrator under the rule's
+# threshold. The persistence helper is shared with `_execute_pair`
+# (single-session) to also kill the structural duplication that Sonar
+# flagged at 3.1% on this PR.
+
+# Type alias for the per-session tuple — keeps signatures readable.
+_FanoutSub = tuple[str, str, dict[str, Any], list[dict[str, Any]], int]
+
+
+async def _query_one_session_for_pair(
+    *,
+    sid: str,
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+    run_id: uuid.UUID,
+) -> _FanoutSub:
+    """One fetch_plan call for one (session, pair). Tolerates its own
+    exception so an OTP container being down doesn't poison the pair —
+    the caller treats the returned status as "this session contributed
+    nothing useful" and moves on."""
+    sub_start = time.monotonic()
+    try:
+        raw, trips = await otp_client.fetch_plan(
+            session_id=sid,
+            from_lat=origin.lat,
+            from_lon=origin.lon,
+            to_lat=dest.lat,
+            to_lon=dest.lon,
+            when=depart_at,
+            timeout_ms=_PER_PAIR_TIMEOUT_MS,
+            num_itineraries=_COVERAGE_NUM_ITINERARIES,
+            search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
+        )
+        response_ms = int((time.monotonic() - sub_start) * 1000)
+        sub_status = "ok" if trips else "no_route"
+        return sid, sub_status, raw, trips, response_ms
+    except Exception as exc:
+        response_ms = int((time.monotonic() - sub_start) * 1000)
+        cls_name = type(exc).__name__
+        sub_status = (
+            "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
+        )
+        log.warning(
+            "coverage run %s pair %s→%s session %s failed: %s: %s",
+            run_id,
+            origin.id,
+            dest.id,
+            sid,
+            cls_name,
+            exc,
+        )
+        return sid, sub_status, {}, [], response_ms
+
+
+def _derive_fanout_status(*, any_ok: bool, any_error_or_timeout: bool) -> str:
+    """Pair-level status from the per-session outcomes. Priority is
+    ok > error/timeout > no_route — "ok" wins as soon as any session
+    returned itineraries (the whole point of fanout)."""
+    if any_ok:
+        return "ok"
+    if any_error_or_timeout:
+        return "error"
+    return "no_route"
+
+
+def _merge_one_trip_into_signatures(
+    *,
+    sid: str,
+    trip: dict[str, Any],
+    sig: str,
+    by_signature: dict[str, dict[str, Any]],
+    operators_union: list[str],
+) -> None:
+    """Merge one trip into the by-signature map and update the operator
+    union. Same-signature trips collapse; the shortest-duration wins the
+    'best' slot for that signature."""
+    slot = by_signature.setdefault(sig, {"signature": sig, "session_ids": [], "best": trip})
+    if sid not in slot["session_ids"]:
+        slot["session_ids"].append(sid)
+    if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
+        slot["best"] = trip
+    for lg in trip.get("legs", []):
+        feed = lg.get("feed_id")
+        if feed and feed not in operators_union:
+            operators_union.append(feed)
+
+
+def _merge_fanout_results(
+    per_session: list[_FanoutSub],
+) -> tuple[str, dict[str, dict[str, Any]], list[str], list[str]]:
+    """Aggregate the per-session outputs into one pair-level result.
+
+    Returns ``(status, by_signature, sessions_with_trips, operators_union)``.
+    Mirrors the live `/api/journey/fanout` endpoint's merge pattern.
+    """
+    sessions_with_trips: list[str] = []
+    any_ok = False
+    any_error_or_timeout = False
+    by_signature: dict[str, dict[str, Any]] = {}
+    operators_union: list[str] = []
+
+    with SessionLocal() as db:
+        from ..journey.signature import trip_signature
+
+        for sid, sub_status, _raw, trips, _ms in per_session:
+            if sub_status == "ok":
+                any_ok = True
+                sessions_with_trips.append(sid)
+            elif sub_status in ("error", "timeout"):
+                any_error_or_timeout = True
+
+            for trip in trips:
+                sig = trip_signature(db, session_id=sid, legs=trip.get("legs", []))
+                _merge_one_trip_into_signatures(
+                    sid=sid,
+                    trip=trip,
+                    sig=sig,
+                    by_signature=by_signature,
+                    operators_union=operators_union,
+                )
+
+    status = _derive_fanout_status(any_ok=any_ok, any_error_or_timeout=any_error_or_timeout)
+    return status, by_signature, sessions_with_trips, operators_union
+
+
+def _record_fanout_journey_search(
+    *,
+    run_id: uuid.UUID,
+    per_session: list[_FanoutSub],
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+    response_ms: int,
+    status: str,
+    total_trips_unique: int,
+) -> tuple[uuid.UUID | None, str | None]:
+    """Persist the journey_searches umbrella row + per-session executions
+    so the matrix click-cell drilldown can reuse the v0.1.26 trip-card UI.
+
+    Best-effort: if the recorder write fails the pair still gets a
+    coverage_results row, with the recorder error surfaced in
+    `error_message` so the operator can see *why* the modal link is
+    missing instead of the generic "recorder write failed" message.
+
+    Returns ``(journey_search_id, error_message_or_None)``.
+    """
+    with SessionLocal() as db:
+        try:
+            search = recorder.begin_search(
+                db,
+                user_id=None,
+                ip=None,
+                endpoint="fanout",
+                origin_lat=origin.lat,
+                origin_lon=origin.lon,
+                origin_label=origin.name,
+                dest_lat=dest.lat,
+                dest_lon=dest.lon,
+                dest_label=dest.name,
+                requested_time_kind="depart_at",
+                requested_time=depart_at,
+                modes="TRANSIT,WALK",
+            )
+            for sid, sub_status, raw, trips, _ms in per_session:
+                session_row = db.get(SessionRow, sid)
+                if session_row is None:
+                    continue
+                recorder.record_execution(
+                    db,
+                    search_id=search.id,
+                    session_id=sid,
+                    graph_snapshot_id=None,
+                    status=sub_status,
+                    response_ms=_ms,
+                    raw_response=raw or None,
+                    error_message=None,
+                    trips=trips,
+                )
+            recorder.finish_search(
+                db,
+                search,
+                total_response_ms=response_ms,
+                total_trips_unique=total_trips_unique,
+                status=status,
+            )
+            journey_search_id = search.id
+            db.commit()
+            return journey_search_id, None
+        except Exception as recorder_exc:
+            log.exception(
+                "coverage run %s pair %s→%s: recorder write failed (continuing)",
+                run_id,
+                origin.id,
+                dest.id,
+            )
+            db.rollback()
+            return None, f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+
+
+def _persist_pair_coverage_result(
+    *,
+    run_id: uuid.UUID,
+    origin: Hub,
+    dest: Hub,
+    status: str,
+    response_ms: int,
+    num_itineraries: int | None,
+    best_duration_seconds: int | None,
+    best_num_transfers: int | None,
+    best_operators: str | None,
+    error_message: str | None,
+    journey_search_id: uuid.UUID | None,
+    session_ids: list[str] | None = None,
+) -> None:
+    """Write one NetworkCoverageResult row and increment the run-level
+    counters. Shared by `_execute_pair` (single-session) and
+    `_execute_pair_fanout` so the matrix wire-format stays bit-equivalent
+    across both code paths and the counter updates are written in exactly
+    one place.
+
+    `session_ids` is fanout-only (list of sessions that returned ≥1 trip);
+    `_execute_pair` passes None.
+    """
     with SessionLocal() as db:
         try:
             db.add(
@@ -470,12 +792,11 @@ async def _execute_pair(
                     best_duration_seconds=best_duration_seconds,
                     best_num_transfers=best_num_transfers,
                     best_operators=best_operators,
+                    session_ids=session_ids,
                     error_message=error_message,
                     journey_search_id=journey_search_id,
                 )
             )
-            # Increment run-level counters atomically so the UI's progress
-            # bar updates even before the run completes.
             db.execute(
                 update(NetworkCoverageRun)
                 .where(NetworkCoverageRun.id == run_id)
@@ -497,6 +818,81 @@ async def _execute_pair(
                 dest.id,
             )
             db.rollback()
+
+
+async def _execute_pair_fanout(
+    *,
+    run_id: uuid.UUID,
+    session_ids: list[str],
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+) -> None:
+    """PR #36 — run an A→B search against EVERY fanout-enabled session and
+    persist one merged result row.
+
+    Thin orchestrator: delegates to four helpers (query / merge / record /
+    persist). The orchestration is the only thing here; each phase is
+    independently testable.
+
+    Behaviour vs `_execute_pair`:
+      1. Calls `otp_client.fetch_plan` once per session in parallel via
+         `asyncio.gather`. Each call is independent.
+      2. Trips merge by `trip_signature` so the same itinerary surfaced
+         by multiple sessions counts once; shortest-duration wins the
+         "best" slot.
+      3. `session_ids` on the result row records WHICH sessions returned
+         ≥1 trip — that's the per-cell coverage signal PR #36 is built
+         around.
+    """
+    pair_start = time.monotonic()
+
+    per_session = await asyncio.gather(
+        *(
+            _query_one_session_for_pair(
+                sid=sid, origin=origin, dest=dest, depart_at=depart_at, run_id=run_id
+            )
+            for sid in session_ids
+        )
+    )
+
+    status, by_signature, sessions_with_trips, operators_union = _merge_fanout_results(per_session)
+
+    best_trip: dict[str, Any] | None = (
+        min(
+            (slot["best"] for slot in by_signature.values()),
+            key=lambda t: t.get("duration_seconds") or 1 << 30,
+        )
+        if by_signature
+        else None
+    )
+    response_ms = int((time.monotonic() - pair_start) * 1000)
+
+    journey_search_id, error_message = _record_fanout_journey_search(
+        run_id=run_id,
+        per_session=per_session,
+        origin=origin,
+        dest=dest,
+        depart_at=depart_at,
+        response_ms=response_ms,
+        status=status,
+        total_trips_unique=len(by_signature),
+    )
+
+    _persist_pair_coverage_result(
+        run_id=run_id,
+        origin=origin,
+        dest=dest,
+        status=status,
+        response_ms=response_ms,
+        num_itineraries=len(by_signature) if by_signature else 0,
+        best_duration_seconds=(int(best_trip.get("duration_seconds") or 0) if best_trip else None),
+        best_num_transfers=(int(best_trip.get("num_transfers") or 0) if best_trip else None),
+        best_operators=",".join(operators_union) if operators_union else None,
+        session_ids=sessions_with_trips or None,
+        error_message=error_message,
+        journey_search_id=journey_search_id,
+    )
 
 
 def _median(values: list[int]) -> int | None:
