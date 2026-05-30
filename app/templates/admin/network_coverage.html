@@ -171,11 +171,11 @@
            (cross-session, queries every serving + include_in_fanout
            session in parallel and merges by trip signature).
 
-           Sonar Web:S6853 / S6859 — radio groups should use the native
-           <fieldset>/<legend> pair rather than <div role="group"> + a
-           caption span. Browsers expose <fieldset> with the right
-           semantics out of the box and screen readers announce the
-           <legend> when any radio inside receives focus. Reset the
+           Sonar Web:S6853 / S6859 — radio groups use the native
+           fieldset + legend pair rather than a generic container with
+           an ARIA grouping role. Browsers expose fieldset with the
+           right semantics out of the box and screen readers announce
+           the legend when any radio inside receives focus. Reset the
            default border/padding so the visual matches the rest of
            the sidebar form. #}
         <fieldset class="cov-mode" style="border: 0; margin: 0 0 0.6rem; padding: 0; display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
