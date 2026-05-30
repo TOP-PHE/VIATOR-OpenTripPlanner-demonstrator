@@ -27,7 +27,7 @@ pip-audit==2.10.0
 pre-commit==4.6.0
 
 # Stubs for mypy strict mode
-types-requests==2.33.0.20260513
+types-requests==2.33.0.20260518
 types-passlib==1.7.7.20260211
 types-python-jose==3.5.0.20260408
 types-defusedxml==0.7.0.20260504   # defusedxml ships no inline types — needed for app/journey/ojp_client.py under mypy strict
