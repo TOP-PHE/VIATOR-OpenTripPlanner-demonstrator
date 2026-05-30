@@ -333,7 +333,10 @@ def list_runs(
 
 @router.post(
     "/runs",
-    response_model=RunSummary,
+    # response_model intentionally omitted — Sonar S7191 flags it as
+    # redundant with the `-> RunSummary` return annotation, which
+    # FastAPI uses verbatim as the response schema. Behaviour is
+    # bit-equivalent (same OpenAPI spec, same serialisation filter).
     status_code=201,
     responses={
         # Sonar S8415 — declare the HTTPException response codes the

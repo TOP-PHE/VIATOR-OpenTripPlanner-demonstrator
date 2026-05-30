@@ -171,15 +171,15 @@
            (cross-session, queries every serving + include_in_fanout
            session in parallel and merges by trip signature).
 
-           Sonar Web:S6853 — the "Mode" caption above is a group-level
-           heading, not a control label, so we render it as a styled
-           <div role="group"> with aria-labelledby pointing at the
-           caption span. Each individual radio is labelled by its own
-           wrapping <label>. The Session select gets an explicit
-           for=id pair so screen readers announce the caption when the
-           dropdown receives focus. #}
-        <div id="cov-mode-caption" style="margin-top: 0; font-weight: 600; font-size: 0.85rem">Mode</div>
-        <div class="cov-mode" role="group" aria-labelledby="cov-mode-caption" style="display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
+           Sonar Web:S6853 / S6859 — radio groups should use the native
+           <fieldset>/<legend> pair rather than <div role="group"> + a
+           caption span. Browsers expose <fieldset> with the right
+           semantics out of the box and screen readers announce the
+           <legend> when any radio inside receives focus. Reset the
+           default border/padding so the visual matches the rest of
+           the sidebar form. #}
+        <fieldset class="cov-mode" style="border: 0; margin: 0 0 0.6rem; padding: 0; display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem">
+          <legend style="margin-top: 0; padding: 0; font-weight: 600; font-size: 0.85rem">Mode</legend>
           <label style="display: flex; align-items: center; gap: 0.4rem; font-weight: normal">
             <input type="radio" name="mode" value="single_session" checked id="cov-mode-single">
             Single session
@@ -188,7 +188,7 @@
             <input type="radio" name="mode" value="fanout" id="cov-mode-fanout">
             All fanout-enabled sessions (cross-session matrix)
           </label>
-        </div>
+        </fieldset>
         <label for="cov-session-select">Session
           <span class="hint" style="font-weight: normal" id="cov-session-hint"></span>
         </label>
