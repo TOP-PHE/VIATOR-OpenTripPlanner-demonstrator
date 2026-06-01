@@ -1,6 +1,6 @@
 fastapi==0.136.3                # 0.116+ pulls starlette>=0.46 (we need >=0.49.1 for CVE-2025-62727); 0.136 pulls starlette 1.0.0
 uvicorn[standard]==0.48.0
-python-multipart==0.0.29        # 0.0.22+ fixes CVE-2026-24486 (HIGH path traversal); 0.0.26 added CVE-2026-40347 (MEDIUM DoS) fix; 0.0.27 fixes GHSA-pp6c-gr5w-3c5g (multipart parser DoS)
+python-multipart==0.0.30        # 0.0.22+ fixes CVE-2026-24486 (HIGH path traversal); 0.0.26 added CVE-2026-40347 (MEDIUM DoS) fix; 0.0.27 fixes GHSA-pp6c-gr5w-3c5g (multipart parser DoS)
 jinja2==3.1.6                   # 3.1.5+ fixes CVE-2025-27516 (sandbox escape via attr filter)
 sqlalchemy==2.0.50             # 2.0.49 broadens Session.execute() return type to Result[Any] — handled in app/retention.py + app/master/trainline.py via cast (audit-2026-05 #23)
 psycopg[binary]==3.3.4
@@ -12,7 +12,7 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1                   # passlib 1.7.4 needs bcrypt < 4.1
 slowapi==0.1.9
 email-validator==2.3.0          # required by pydantic EmailStr
-aiosmtplib==5.1.0               # used for SMTP delivery in step 4
+aiosmtplib==5.1.1               # used for SMTP delivery in step 4
 httpx==0.28.1                   # async HTTP for Trainline pull + OTP fanout
 defusedxml==0.7.1               # hardened XML parsing for the OJP reference adapter (app/journey/ojp_client.py) — opentransportdata.swiss returns OJP 2.0 XML; stdlib xml.etree is XXE-vulnerable (ruff S314 / bandit B314)
 apscheduler==3.11.2             # in-process scheduler for retention + master-data refresh crons
