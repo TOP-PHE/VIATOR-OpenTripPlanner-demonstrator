@@ -1,0 +1,47 @@
+# MOTIS config — reference / annotated example.
+#
+# In practice you don't write this by hand: `motis config osm.pbf gtfs.zip`
+# generates a config.yml that matches your inputs. This file is here so you
+# can see what knobs exist when you want to tweak the generated one.
+#
+# Authoritative source: https://github.com/motis-project/motis (see openapi.yaml
+# and the README quick-start).
+
+server:
+  # MOTIS listens on 8080 inside the container; docker-compose maps it to 8081
+  # on the host.
+  port: 8080
+  # Bind on all interfaces inside the container so the published port is
+  # reachable.
+  host: "0.0.0.0"
+
+# Street network — single OSM PBF. For a multi-country spike, use a planet
+# extract or a Geofabrik regional extract (e.g. europe-latest.osm.pbf).
+osm: /data/osm.pbf
+
+# Transit feeds — one or more GTFS / NeTEx zips. MOTIS merges them into one
+# routable graph (so per-NAP isolation, which VIATOR's session model gives
+# you out-of-the-box, is NOT free here — you'd run one MOTIS container per
+# session to match).
+timetable:
+  datasets:
+    - path: /data/sncf.gtfs.zip
+      # Optional human label; surfaces in API responses + the tile server.
+      # tag: SNCF
+    # - path: /data/sbb.gtfs.zip
+    #   tag: SBB
+
+# Geocoder — built-in; reads OSM + stop names. Spike doesn't need it; we
+# query by lat,lon. Disable to shave a few seconds off import if you want.
+# geocoder: true
+
+# Tile server — also built-in. Off for the spike to keep things lean.
+# tiles: false
+
+# --- Real-time (left commented; consume in Phase 2) ----------------------
+# gtfsrt:
+#   - url: https://example.com/sncf.gtfsrt.pb
+#     dataset: SNCF
+# siri:
+#   - url: https://example.com/sbb.siri
+#     dataset: SBB

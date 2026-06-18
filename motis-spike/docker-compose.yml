@@ -1,0 +1,25 @@
+# MOTIS Phase-0 spike — one container, port 8081 (no clash with OTP on 8080).
+# Workflow:
+#   docker compose run --rm motis config /data/osm.pbf /data/<feed>.gtfs.zip
+#   docker compose run --rm motis import
+#   docker compose up -d
+# See ./README.md for the rest.
+
+services:
+  motis:
+    # Bump to a release tag (e.g. v1.0.x) once you want reproducibility.
+    image: ghcr.io/motis-project/motis:latest
+    container_name: motis-spike
+    # MOTIS HTTP API listens on 8080 inside the container. We expose it on
+    # 8081 on the host so the local dev OTP (typical on 8080) keeps working.
+    ports:
+      - "8081:8080"
+    # All MOTIS state — inputs (osm.pbf, gtfs.zip), generated config.yml,
+    # imported data dir — lives under ./data, which is gitignored.
+    volumes:
+      - ./data:/data
+    working_dir: /data
+    # Default command is the server. The `config` and `import` sub-commands
+    # are invoked via `docker compose run --rm motis <subcommand> …`.
+    command: ["server"]
+    restart: "no"
