@@ -54,7 +54,7 @@ def _base_url_for(session_id: str, base_url: str | None) -> str:
     """
     if base_url is not None:
         return base_url.rstrip("/")
-    return f"http://motis-{session_id}:8080"  # NOSONAR: internal docker DNS, not public
+    return f"http://motis-{session_id}:8080"  # NOSONAR(python:S5332)
 
 
 async def fetch_plan(
