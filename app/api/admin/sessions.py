@@ -147,13 +147,14 @@ def list_sessions(
 
 @router.post(
     "",
-    response_model=SessionResponse,
     status_code=201,
     summary="Create a session",
     responses={
         # Declared at the decorator level so Sonar's S8415 is satisfied
         # for every HTTPException(400) in the body (slug / category /
         # engine / actor validation). Same pattern as patch_session.
+        # `response_model=` dropped (S8409): FastAPI infers it from the
+        # `-> SessionResponse` return annotation since 0.95+.
         400: {"description": "Slug / category / engine validation failed."},
     },
 )
