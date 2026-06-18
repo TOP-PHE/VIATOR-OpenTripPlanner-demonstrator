@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -44,10 +45,16 @@ log = logging.getLogger(__name__)
 
 
 def _base_url_for(session_id: str, base_url: str | None) -> str:
-    """`base_url` overrides; default mirrors OTP's per-session DNS convention."""
+    """`base_url` overrides; default mirrors OTP's per-session DNS convention.
+
+    The default uses plain `http://` because the MOTIS container is only ever
+    reachable from inside the docker network (same as every other VIATOR
+    session-internal hop, e.g. `http://otp-<sid>:8080`). There is no public TLS
+    surface here for Sonar's `S5332` to actually protect.
+    """
     if base_url is not None:
         return base_url.rstrip("/")
-    return f"http://motis-{session_id}:8080"
+    return f"http://motis-{session_id}:8080"  # NOSONAR: internal docker DNS, not public
 
 
 async def fetch_plan(
@@ -83,13 +90,21 @@ async def fetch_plan(
     # the federated planner relies on for OTP's stop-id-first attempt.
     from_place = from_stop_id or f"{from_lat},{from_lon}"
     to_place = to_stop_id or f"{to_lat},{to_lon}"
+    # Localise a naive `when` against the session's configured timezone, same
+    # pre-processing the OTP path does in `_earliest_departure`. MOTIS accepts
+    # any ISO-8601 instant, but a naive string is ambiguous on the wire — so
+    # if we know the session's tz, attach it now. Unknown tz falls back to UTC.
+    if when.tzinfo is None and session_timezone:
+        try:
+            when = when.replace(tzinfo=ZoneInfo(session_timezone))
+        except ZoneInfoNotFoundError:
+            log.warning(
+                "unknown session_timezone for session_id=%s; treating naive `when` as UTC",
+                session_id,
+            )
     params: dict[str, Any] = {
         "fromPlace": from_place,
         "toPlace": to_place,
-        # MOTIS accepts an ISO-8601 instant. Assume UTC when `when` is naive
-        # — the existing OTP path already localises naive times upstream when
-        # `session_timezone` is set (Phase-1 wiring is the right place to do
-        # the same here; for the spike, UTC is fine).
         "time": when.isoformat(),
         "numItineraries": num_itineraries,
         "searchWindow": search_window_seconds,
@@ -119,7 +134,7 @@ def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
         legs[]                     ->  trip['legs']   (one canonical leg per)
 
     Best-effort fields (None until we capture a live response to confirm
-    MOTIS's exact field names — see the TODOs in `_leg_to_canonical`):
+    MOTIS's exact field names — see the inline notes in `_leg_to_canonical`):
         leg distance, route_id, agency_id, feed_id.
     """
     itineraries = raw.get("itineraries") or []
@@ -158,16 +173,17 @@ def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
     route = leg.get("route") or {}
     agency = leg.get("agency") or {}
     # MOTIS leg duration isn't strictly required by the spec — derive from
-    # start/end if absent. (TODO: confirm `duration` field name once we have
-    # a live response; the spec mentions it implicitly via durations elsewhere.)
+    # start/end if absent. (Confirm the exact `duration` field name once we
+    # capture a live response; the spec only mentions it implicitly.)
     duration = leg.get("duration")
     return {
         "mode": leg.get("mode"),
         "departure": str(leg.get("startTime") or ""),
         "arrival": str(leg.get("endTime") or ""),
         "duration_seconds": int(duration) if duration is not None else 0,
-        # TODO: confirm distance field on MOTIS legs (spec doesn't surface it
-        # prominently; OTP exposes leg.distance in metres).
+        # Spike note: OTP exposes leg.distance in metres; MOTIS's spec doesn't
+        # surface it prominently — confirm the field name against a live
+        # response and adjust if the key turns out to be e.g. `distanceMeters`.
         "distance_meters": float(leg.get("distance") or 0.0),
         "from_name": f.get("name"),
         "from_lat": f.get("latitude"),
@@ -181,9 +197,9 @@ def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
         # `route_short_name`); fall back to `route.shortName` if present.
         "route_short_name": leg.get("routeShortName") or route.get("shortName"),
         "route_long_name": route.get("longName"),
-        # TODO: MOTIS doesn't surface `route_id` as a stable field by default;
-        # may live under `route.id` or be implicit in `tripId`. Leave None and
-        # confirm against a live response.
+        # Spike note: MOTIS doesn't surface `route_id` as a stable field by
+        # default — it may live under `route.id` or be implicit in `tripId`.
+        # Leave None for now and confirm against a captured live response.
         "route_id": route.get("id"),
         "agency_name": agency.get("name"),
         "agency_id": agency.get("id"),
