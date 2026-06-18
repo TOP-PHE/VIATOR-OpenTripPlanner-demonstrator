@@ -81,6 +81,41 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
 
 """
 
+# P1 MOTIS — per-session MOTIS service. Same shape as the OTP block so
+# the rest of the orchestration (regenerate trigger, nginx routing,
+# reload sentinel) is unchanged. MOTIS data lives under the SAME shared
+# `graphs` volume but at a separate per-session subtree (`motis/<sid>/`
+# vs `<sid>/` for OTP) so a single session never has both. The worker's
+# motis-build step writes `graphs/motis/<sid>/current/` and the serve
+# container reads `MOTIS_DATA_DIR=/data` which the volume mount points
+# at. Healthcheck pings the same /api/v6/plan root the dispatcher uses.
+_MOTIS_SVC_TEMPLATE = """  motis-{sid}:
+    image: ghcr.io/motis-project/motis:${{MOTIS_VERSION:-latest}}
+    restart: unless-stopped
+    environment:
+      MOTIS_DATA_DIR: /data
+    volumes:
+      # Shared graphs volume — the worker writes per-session MOTIS
+      # imported data under graphs/motis/<sid>/current/; this mount
+      # surfaces it at /data inside the container.
+      - graphs:/var/motis-graphs:ro
+    command: ["server", "--config", "/var/motis-graphs/motis/{sid}/current/config.yml"]
+    healthcheck:
+      # MOTIS exposes the planning API at /api/v6/plan; a HEAD against the
+      # endpoint root is the cheapest readiness signal. start_period mirrors
+      # the OTP knob so operators can tune big-feed import times the same way.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/api/v6/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: {start_period}s
+      retries: 3
+    labels:
+      viator.session_id: "{sid}"
+      viator.category: "{category}"
+      viator.engine: "motis"
+
+"""
+
 # No per-session volumes are declared — sessions share the `graphs` and
 # `inbox` volumes already declared in the main docker-compose.yml.
 # The empty `volumes: {}` mapping below keeps the rendered fragment
@@ -97,68 +132,103 @@ def render_compose(sessions: list[SessionRow]) -> str:
     then rejects the whole include with `services must be a mapping` —
     breaking every fresh install on the second `docker compose up` after
     the web container's _startup hook overwrites the bootstrap stub.
+
+    P1 MOTIS — sessions with `engine='motis'` render a `motis-<sid>`
+    service from the parallel template; everything else renders the
+    legacy `otp-<sid>` block.
     """
     from . import otp_heap as _otp_heap
     from . import otp_start_period as _otp_start_period
 
-    services = "".join(
-        _OTP_SVC_TEMPLATE.format(
-            sid=s.id,
-            # Serve heap: explicit operator choice from the session-edit form
-            # if set, otherwise a sensible default derived from the build
-            # heap (~1/3 of build heap, floored at 4g). This prevents the
-            # silent-4g-default trap that surfaced on 2026-05-10 — operator
-            # picks 64g build heap, build succeeds, OTP serve container
-            # crash-loops at the old hardcoded 4g default. Audit follow-up
-            # to #14 Phase 2 (the rest of the observability + operations
-            # arc that closed in v0.1.32.21).
-            heap=(s.config or {}).get("otp_heap")
-            or _otp_heap.default_serve_heap_for_build((s.config or {}).get("otp_build_heap")),
-            # Healthcheck start_period: explicit operator choice if set,
-            # otherwise 300s (5 min) — covers most graphs while keeping
-            # genuinely-stuck JVMs visible quickly. PR #32 fix for the
-            # 2026-05-11 restart-loop on nap-fr-rail with SBB included.
-            start_period=_otp_start_period.validate_start_period(
-                (s.config or {}).get("otp_serve_start_period")
-            ),
-            category=s.category,
-        )
-        for s in sessions
-        if s.state == SessionState.SERVING.value
-    )
+    parts: list[str] = []
+    for s in sessions:
+        if s.state != SessionState.SERVING.value:
+            continue
+        engine = getattr(s, "engine", "otp") or "otp"
+        if engine == "motis":
+            parts.append(
+                _MOTIS_SVC_TEMPLATE.format(
+                    sid=s.id,
+                    # MOTIS imports the full year up front; cold-start is
+                    # dominated by data-mmap, not query warmup. Reuse the
+                    # OTP knob so operators tune both planners the same way.
+                    start_period=_otp_start_period.validate_start_period(
+                        (s.config or {}).get("otp_serve_start_period")
+                    ),
+                    category=s.category,
+                )
+            )
+        else:
+            parts.append(
+                _OTP_SVC_TEMPLATE.format(
+                    sid=s.id,
+                    # Serve heap: explicit operator choice from the session-edit form
+                    # if set, otherwise a sensible default derived from the build
+                    # heap (~1/3 of build heap, floored at 4g). This prevents the
+                    # silent-4g-default trap that surfaced on 2026-05-10 — operator
+                    # picks 64g build heap, build succeeds, OTP serve container
+                    # crash-loops at the old hardcoded 4g default. Audit follow-up
+                    # to #14 Phase 2 (the rest of the observability + operations
+                    # arc that closed in v0.1.32.21).
+                    heap=(s.config or {}).get("otp_heap")
+                    or _otp_heap.default_serve_heap_for_build(
+                        (s.config or {}).get("otp_build_heap")
+                    ),
+                    # Healthcheck start_period: explicit operator choice if set,
+                    # otherwise 300s (5 min) — covers most graphs while keeping
+                    # genuinely-stuck JVMs visible quickly. PR #32 fix for the
+                    # 2026-05-11 restart-loop on nap-fr-rail with SBB included.
+                    start_period=_otp_start_period.validate_start_period(
+                        (s.config or {}).get("otp_serve_start_period")
+                    ),
+                    category=s.category,
+                )
+            )
+    services = "".join(parts)
     return _COMPOSE_HEADER + (services or "  {}  # no serving sessions\n") + "\n" + _VOLUMES_HEADER
 
 
 def render_nginx(sessions: list[SessionRow]) -> str:
-    """nginx location blocks proxying /otp/<sid>/ to otp-<sid>:8080.
+    """nginx location blocks for serving sessions, routed by engine.
 
     v0.1.15 dynamic upstream: each block uses the variable-based
-    `proxy_pass` pattern so nginx re-resolves the otp-<sid> hostname on
-    every request via Docker's embedded DNS (configured at the http
-    level in `docker/nginx/nginx.conf`). This means a per-session OTP
-    container restart no longer needs an explicit `nginx -s reload`
-    to start being routable again — same fix as the web upstream.
+    `proxy_pass` pattern so nginx re-resolves the hostname on every
+    request via Docker's embedded DNS (configured at the http level
+    in `docker/nginx/nginx.conf`). This means a per-session container
+    restart no longer needs an explicit `nginx -s reload` to start
+    being routable again — same fix as the web upstream.
 
     The `rewrite ... break` is needed because the variable-based
     `proxy_pass http://$var` doesn't accept a trailing URI; we have to
     transform the request URI ourselves before nginx forwards it.
-    Static-form equivalent (pre-v0.1.15):
-        proxy_pass http://otp-<sid>:8080/otp/;
-    Maps `/otp/<sid>/foo` → upstream `/otp/foo` (strips the SID prefix,
-    routes everything else to OTP under its own /otp/ namespace).
+
+    Engine-specific routing:
+      - OTP sessions   → `/otp/<sid>/foo`   → `otp-<sid>:8080/otp/foo`
+      - MOTIS sessions → `/motis/<sid>/foo` → `motis-<sid>:8080/foo`
     """
     parts = ["# Generated by VIATOR sessions orchestrator. DO NOT EDIT BY HAND.\n"]
     for s in sessions:
         if s.state != SessionState.SERVING.value:
             continue
-        parts.append(
-            f"location /otp/{s.id}/ {{\n"
-            f'    set $otp_upstream_{_safe_var(s.id)} "otp-{s.id}:8080";\n'
-            f"    rewrite ^/otp/{s.id}/(.*)$ /otp/$1 break;\n"
-            f"    proxy_pass http://$otp_upstream_{_safe_var(s.id)};\n"
-            f"    proxy_set_header Host $host;\n"
-            f"}}\n"
-        )
+        engine = getattr(s, "engine", "otp") or "otp"
+        if engine == "motis":
+            parts.append(
+                f"location /motis/{s.id}/ {{\n"
+                f'    set $motis_upstream_{_safe_var(s.id)} "motis-{s.id}:8080";\n'
+                f"    rewrite ^/motis/{s.id}/(.*)$ /$1 break;\n"
+                f"    proxy_pass http://$motis_upstream_{_safe_var(s.id)};\n"
+                f"    proxy_set_header Host $host;\n"
+                f"}}\n"
+            )
+        else:
+            parts.append(
+                f"location /otp/{s.id}/ {{\n"
+                f'    set $otp_upstream_{_safe_var(s.id)} "otp-{s.id}:8080";\n'
+                f"    rewrite ^/otp/{s.id}/(.*)$ /otp/$1 break;\n"
+                f"    proxy_pass http://$otp_upstream_{_safe_var(s.id)};\n"
+                f"    proxy_set_header Host $host;\n"
+                f"}}\n"
+            )
     return "".join(parts)
 
 

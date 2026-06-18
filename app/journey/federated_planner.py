@@ -353,12 +353,12 @@ async def _fetch_leg(
     a missing endpoint or error."""
     if frm not in ctx.coords or to not in ctx.coords:
         return []
-    from . import otp_client
+    from . import planner_dispatch
 
     (flat, flon), (tlat, tlon) = ctx.coords[frm], ctx.coords[to]
     feed_id = _primary_feed_id(session)
     try:
-        _raw, trips = await otp_client.fetch_plan(
+        _raw, trips = await planner_dispatch.get_planner(session).fetch_plan(
             session_id=session.id,
             from_lat=flat,
             from_lon=flon,

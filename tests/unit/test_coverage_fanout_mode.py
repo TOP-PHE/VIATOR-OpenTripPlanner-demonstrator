@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.journey import otp_client
 from app.network_coverage import runner
 
 # ─────────────────────── create_run validation ───────────────────────
@@ -142,7 +143,7 @@ def test_fanout_merges_same_signature_across_sessions(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(runner.otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
 
     # Trip signature stub: ignore the legs, return a fixed signature
@@ -160,6 +161,7 @@ def test_fanout_merges_same_signature_across_sessions(monkeypatch):
         runner._execute_pair_fanout(
             run_id=_uuid(),
             session_ids=["session-a", "session-b", "session-c"],
+            engine_by_session={},  # all sessions default to OTP via planner_dispatch
             origin=_make_hub("paris-gdl"),
             dest=_make_hub("milano-centrale"),
             depart_at=_naive_depart(),
@@ -190,7 +192,7 @@ def test_fanout_status_is_no_route_when_no_session_returns_trips(monkeypatch):
     async def fake_fetch_plan(**_kwargs):
         return {}, []
 
-    monkeypatch.setattr(runner.otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
     _stub_recorder(monkeypatch)
 
@@ -200,6 +202,7 @@ def test_fanout_status_is_no_route_when_no_session_returns_trips(monkeypatch):
         runner._execute_pair_fanout(
             run_id=_uuid(),
             session_ids=["session-a", "session-b"],
+            engine_by_session={},
             origin=_make_hub("paris-gdl"),
             dest=_make_hub("bern"),
             depart_at=_naive_depart(),
@@ -231,7 +234,7 @@ def test_fanout_status_is_ok_when_any_session_returns_trips(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(runner.otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
 
     import app.journey.signature as sig_module
@@ -245,6 +248,7 @@ def test_fanout_status_is_ok_when_any_session_returns_trips(monkeypatch):
         runner._execute_pair_fanout(
             run_id=_uuid(),
             session_ids=["session-error", "session-ok"],
+            engine_by_session={},
             origin=_make_hub("zurich-hb"),
             dest=_make_hub("bern"),
             depart_at=_naive_depart(),

@@ -8,8 +8,9 @@ internal queue depth and our `MAX_CONCURRENT_REBUILDS` semaphore (which
 isn't on the journey path, but we want to leave headroom for live
 journey searches submitted by operators in parallel).
 
-The runner reuses `app.journey.otp_client.fetch_plan` directly — same
-plumbing the live journey UI uses. Each pair is recorded into the
+The runner reuses `app.journey.planner_dispatch` to call the engine-
+appropriate `fetch_plan` (OTP or MOTIS) — same plumbing the live journey
+UI uses. Each pair is recorded into the
 existing `journey_searches` + `journey_search_executions` +
 `journey_trips` infrastructure so the v0.1.26 trip-card UI works as the
 click-cell drilldown out of the box.
@@ -35,7 +36,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DbSession
 
 from ..db import SessionLocal
-from ..journey import otp_client, recorder
+from ..journey import planner_dispatch, recorder
 from ..models import (
     NetworkCoverageHub,
     NetworkCoverageResult,
@@ -229,6 +230,39 @@ def create_run(
     return run
 
 
+def _resolve_session_engine(db: DbSession, session_id: str | None) -> str:
+    """Read a session's engine in a fresh DB query. 'otp' default for
+    rows the operator deleted between coverage-run create and execute."""
+    if session_id is None:
+        return "otp"
+    row = db.get(SessionRow, session_id)
+    if row is None:
+        return "otp"
+    return getattr(row, "engine", "otp") or "otp"
+
+
+def _snapshot_fanout_sessions(db: DbSession) -> tuple[list[str], dict[str, str]]:
+    """Snapshot the eligible-for-fanout session ids + their engines.
+
+    Done once at run start so a session going down mid-run doesn't change
+    the pair load partway through; per-pair execution consults this
+    instead of the live DB."""
+    sessions = list(
+        db.execute(
+            select(SessionRow)
+            .where(SessionRow.state == SessionState.SERVING.value)
+            .where(SessionRow.include_in_fanout.is_(True))
+            .order_by(SessionRow.id)
+        )
+        .scalars()
+        .all()
+    )
+    return (
+        [s.id for s in sessions],
+        {s.id: (getattr(s, "engine", "otp") or "otp") for s in sessions},
+    )
+
+
 async def execute_run(run_id: uuid.UUID) -> None:
     """Drive a pending coverage run to completion.
 
@@ -244,6 +278,12 @@ async def execute_run(run_id: uuid.UUID) -> None:
     depart_at_for_pairs: datetime | None = None
     run_mode: str = MODE_SINGLE_SESSION
     fanout_session_ids: list[str] = []
+    # P1 MOTIS — engine snapshot read once at Phase 1 (alongside the session
+    # ids). Per-pair helpers consult this instead of doing a DB lookup per
+    # fetch_plan call. Single_session mode populates `engine_for_pairs`;
+    # fanout mode populates `engine_by_session`.
+    engine_for_pairs: str = "otp"
+    engine_by_session: dict[str, str] = {}
 
     # Phase 1: snapshot the run inputs and flip to "running" in a short txn.
     with SessionLocal() as db:
@@ -270,22 +310,11 @@ async def execute_run(run_id: uuid.UUID) -> None:
                 db.commit()
                 return
             session_id_for_pairs = run.session_id
+            engine_for_pairs = _resolve_session_engine(db, run.session_id)
         else:
-            # Fanout — read the eligible sessions NOW so a session
-            # going down mid-run doesn't change the pair load partway
-            # through. Snapshot the ids only; per-pair DB lookups use
-            # the live sessions list.
-            fanout_session_ids = [
-                s.id
-                for s in db.execute(
-                    select(SessionRow)
-                    .where(SessionRow.state == SessionState.SERVING.value)
-                    .where(SessionRow.include_in_fanout.is_(True))
-                    .order_by(SessionRow.id)
-                )
-                .scalars()
-                .all()
-            ]
+            # Fanout — snapshot the eligible sessions (and their engines)
+            # NOW; per-pair execution uses these without further DB lookups.
+            fanout_session_ids, engine_by_session = _snapshot_fanout_sessions(db)
             if not fanout_session_ids:
                 log.warning(
                     "run %s mode=fanout has no serving fanout-enabled sessions — aborting",
@@ -323,6 +352,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
                 await _execute_pair_fanout(
                     run_id=run_id,
                     session_ids=fanout_session_ids,
+                    engine_by_session=engine_by_session,
                     origin=origin,
                     dest=dest,
                     depart_at=depart_at_for_pairs,
@@ -332,6 +362,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
                 await _execute_pair(
                     run_id=run_id,
                     session_id=session_id_for_pairs,
+                    engine=engine_for_pairs,
                     origin=origin,
                     dest=dest,
                     depart_at=depart_at_for_pairs,
@@ -395,16 +426,19 @@ async def _execute_pair(
     *,
     run_id: uuid.UUID,
     session_id: str,
+    engine: str,
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
 ) -> None:
     """Run a single A→B search and persist the result row.
 
-    Wraps `otp_client.fetch_plan` (the same call the live journey UI
-    makes) so coverage results are bit-equivalent to what an operator
-    would see via the Search page — modulo the lat/lon coords which
-    come from the hub preset rather than master_stations geocoding.
+    Wraps the engine-appropriate `fetch_plan` (the same call the live
+    journey UI makes) so coverage results are bit-equivalent to what an
+    operator would see via the Search page — modulo the lat/lon coords
+    which come from the hub preset rather than master_stations geocoding.
+    `engine` is passed in (snapshotted at Phase 1) so this hot per-pair
+    function doesn't pay a DB lookup; see `execute_run`.
     """
     started = time.monotonic()
     status = "error"
@@ -419,7 +453,7 @@ async def _execute_pair(
     trips: list[dict[str, Any]] = []
 
     try:
-        raw, trips = await otp_client.fetch_plan(
+        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
             session_id=session_id,
             from_lat=origin.lat,
             from_lon=origin.lon,
@@ -567,18 +601,20 @@ _FanoutSub = tuple[str, str, dict[str, Any], list[dict[str, Any]], int]
 async def _query_one_session_for_pair(
     *,
     sid: str,
+    engine: str,
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
     run_id: uuid.UUID,
 ) -> _FanoutSub:
     """One fetch_plan call for one (session, pair). Tolerates its own
-    exception so an OTP container being down doesn't poison the pair —
+    exception so a planner container being down doesn't poison the pair —
     the caller treats the returned status as "this session contributed
-    nothing useful" and moves on."""
+    nothing useful" and moves on. `engine` is the snapshotted backend
+    for this session (see `execute_run`)."""
     sub_start = time.monotonic()
     try:
-        raw, trips = await otp_client.fetch_plan(
+        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
             session_id=sid,
             from_lat=origin.lat,
             from_lon=origin.lon,
@@ -824,6 +860,7 @@ async def _execute_pair_fanout(
     *,
     run_id: uuid.UUID,
     session_ids: list[str],
+    engine_by_session: dict[str, str],
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
@@ -836,8 +873,8 @@ async def _execute_pair_fanout(
     independently testable.
 
     Behaviour vs `_execute_pair`:
-      1. Calls `otp_client.fetch_plan` once per session in parallel via
-         `asyncio.gather`. Each call is independent.
+      1. Calls the engine-appropriate `fetch_plan` once per session in
+         parallel via `asyncio.gather`. Each call is independent.
       2. Trips merge by `trip_signature` so the same itinerary surfaced
          by multiple sessions counts once; shortest-duration wins the
          "best" slot.
@@ -850,7 +887,12 @@ async def _execute_pair_fanout(
     per_session = await asyncio.gather(
         *(
             _query_one_session_for_pair(
-                sid=sid, origin=origin, dest=dest, depart_at=depart_at, run_id=run_id
+                sid=sid,
+                engine=engine_by_session.get(sid, "otp"),
+                origin=origin,
+                dest=dest,
+                depart_at=depart_at,
+                run_id=run_id,
             )
             for sid in session_ids
         )
