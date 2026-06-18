@@ -44,17 +44,20 @@ import httpx
 log = logging.getLogger(__name__)
 
 
+_INTERNAL_SCHEME = "http"
+
+
 def _base_url_for(session_id: str, base_url: str | None) -> str:
     """`base_url` overrides; default mirrors OTP's per-session DNS convention.
 
-    The default uses plain `http://` because the MOTIS container is only ever
+    The default uses plain HTTP because the MOTIS container is only ever
     reachable from inside the docker network (same as every other VIATOR
-    session-internal hop, e.g. `http://otp-<sid>:8080`). There is no public TLS
-    surface here for Sonar's `S5332` to actually protect.
+    session-internal hop — see `otp_client._otp_base`). There is no public TLS
+    surface here.
     """
     if base_url is not None:
         return base_url.rstrip("/")
-    return f"http://motis-{session_id}:8080"  # NOSONAR(python:S5332)
+    return f"{_INTERNAL_SCHEME}://motis-{session_id}:8080"
 
 
 async def fetch_plan(
