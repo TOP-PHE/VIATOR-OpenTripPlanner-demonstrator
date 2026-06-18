@@ -230,6 +230,39 @@ def create_run(
     return run
 
 
+def _resolve_session_engine(db: DbSession, session_id: str | None) -> str:
+    """Read a session's engine in a fresh DB query. 'otp' default for
+    rows the operator deleted between coverage-run create and execute."""
+    if session_id is None:
+        return "otp"
+    row = db.get(SessionRow, session_id)
+    if row is None:
+        return "otp"
+    return getattr(row, "engine", "otp") or "otp"
+
+
+def _snapshot_fanout_sessions(db: DbSession) -> tuple[list[str], dict[str, str]]:
+    """Snapshot the eligible-for-fanout session ids + their engines.
+
+    Done once at run start so a session going down mid-run doesn't change
+    the pair load partway through; per-pair execution consults this
+    instead of the live DB."""
+    sessions = list(
+        db.execute(
+            select(SessionRow)
+            .where(SessionRow.state == SessionState.SERVING.value)
+            .where(SessionRow.include_in_fanout.is_(True))
+            .order_by(SessionRow.id)
+        )
+        .scalars()
+        .all()
+    )
+    return (
+        [s.id for s in sessions],
+        {s.id: (getattr(s, "engine", "otp") or "otp") for s in sessions},
+    )
+
+
 async def execute_run(run_id: uuid.UUID) -> None:
     """Drive a pending coverage run to completion.
 
@@ -277,28 +310,11 @@ async def execute_run(run_id: uuid.UUID) -> None:
                 db.commit()
                 return
             session_id_for_pairs = run.session_id
-            single_session = db.get(SessionRow, run.session_id)
-            if single_session is not None:
-                engine_for_pairs = getattr(single_session, "engine", "otp") or "otp"
+            engine_for_pairs = _resolve_session_engine(db, run.session_id)
         else:
-            # Fanout — read the eligible sessions NOW so a session
-            # going down mid-run doesn't change the pair load partway
-            # through. Snapshot the ids (and engine) only; per-pair DB
-            # lookups use the live sessions list.
-            fanout_sessions = list(
-                db.execute(
-                    select(SessionRow)
-                    .where(SessionRow.state == SessionState.SERVING.value)
-                    .where(SessionRow.include_in_fanout.is_(True))
-                    .order_by(SessionRow.id)
-                )
-                .scalars()
-                .all()
-            )
-            fanout_session_ids = [s.id for s in fanout_sessions]
-            engine_by_session = {
-                s.id: (getattr(s, "engine", "otp") or "otp") for s in fanout_sessions
-            }
+            # Fanout — snapshot the eligible sessions (and their engines)
+            # NOW; per-pair execution uses these without further DB lookups.
+            fanout_session_ids, engine_by_session = _snapshot_fanout_sessions(db)
             if not fanout_session_ids:
                 log.warning(
                     "run %s mode=fanout has no serving fanout-enabled sessions — aborting",

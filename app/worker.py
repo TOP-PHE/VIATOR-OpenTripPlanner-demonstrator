@@ -921,7 +921,7 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
             f"[viator] build resources: OTP_HEAP={otp_heap_value} "
             f"OTP_BUILD_MEM_LIMIT={mem_limit_value} (cgroup cap derived from heap)\n"
             + proc.stdout
-            + "\n--- stderr ---\n"
+            + _STDERR_SEP
             + proc.stderr
         )
 
@@ -968,6 +968,11 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
 
 
 _MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"
+
+# Separator the rebuild-log emits between captured stdout and stderr from
+# any docker subprocess. Module-level constant so Sonar's S1192 isn't
+# tripped by the OTP + MOTIS builders both reaching for the same string.
+_STDERR_SEP = "\n--- stderr ---\n"
 
 
 def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
@@ -1068,7 +1073,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
                 (
                     f"[viator] motis config failed (exit {config_proc.returncode})\n"
                     + (config_proc.stdout or "")
-                    + "\n--- stderr ---\n"
+                    + _STDERR_SEP
                     + (config_proc.stderr or "")
                 ),
                 False,
@@ -1089,7 +1094,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"
             + (import_proc.stdout or "")
-            + "\n--- stderr ---\n"
+            + _STDERR_SEP
             + (import_proc.stderr or "")
         )
 
