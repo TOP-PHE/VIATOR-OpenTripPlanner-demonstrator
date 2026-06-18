@@ -35,8 +35,8 @@ def test_run_build_motis_fails_when_osm_pbf_missing(
     NOT halfway through `motis config` with an opaque docker error."""
     inbox = tmp_path / "inbox"
     graphs = tmp_path / "graphs"
-    inbox.mkdir()
-    graphs.mkdir()
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
     from app.settings import settings
 
     monkeypatch.setattr(settings, "inbox_dir", inbox)
@@ -59,8 +59,8 @@ def test_run_build_motis_fails_when_no_gtfs_files(tmp_path: Path, monkeypatch: p
     fast with a clear message."""
     inbox = tmp_path / "inbox"
     graphs = tmp_path / "graphs"
-    inbox.mkdir()
-    graphs.mkdir()
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
     from app.settings import settings
 
     monkeypatch.setattr(settings, "inbox_dir", inbox)
@@ -85,8 +85,8 @@ def test_run_build_motis_invokes_config_then_import(
     if a refactor combined them or skipped one, this would catch it."""
     inbox = tmp_path / "inbox"
     graphs = tmp_path / "graphs"
-    inbox.mkdir()
-    graphs.mkdir()
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
     from app.settings import settings
 
     monkeypatch.setattr(settings, "inbox_dir", inbox)
@@ -142,8 +142,8 @@ def test_run_build_motis_surfaces_subprocess_failure_in_log(
     the rebuild log (operator-facing) — not silently swallowed."""
     inbox = tmp_path / "inbox"
     graphs = tmp_path / "graphs"
-    inbox.mkdir()
-    graphs.mkdir()
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
     from app.settings import settings
 
     monkeypatch.setattr(settings, "inbox_dir", inbox)
