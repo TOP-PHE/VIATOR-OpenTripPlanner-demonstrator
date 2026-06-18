@@ -6,13 +6,13 @@
 # pytest-asyncio 1.x is the pytest-9-compatible line; we keep
 # `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
 # to be re-decorated with @pytest.mark.asyncio.
-pytest==9.0.3
+pytest==9.1.0
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.15.15               # also our formatter — black was dropped in audit
+ruff==0.15.17               # also our formatter — black was dropped in audit
                             # #21 closure (drop-in replacement, eliminates
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
@@ -21,7 +21,7 @@ mypy==2.1.0                 # major bump — 2.0 narrows `str | int` more strict
 
 # Security
 bandit==1.9.4
-pip-audit==2.10.0
+pip-audit==2.10.1
 
 # Pre-commit framework (also used in CI)
 pre-commit==4.6.0
