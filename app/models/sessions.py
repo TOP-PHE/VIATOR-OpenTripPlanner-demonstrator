@@ -34,6 +34,11 @@ class SessionState(StrEnum):
     DELETED = "deleted"
 
 
+class SessionEngine(StrEnum):
+    OTP = "otp"
+    MOTIS = "motis"
+
+
 class Session(TimestampMixin, Base):
     __tablename__ = "sessions"
     __table_args__ = (
@@ -45,6 +50,10 @@ class Session(TimestampMixin, Base):
             "state IN ('created','configured','populated','graph_built',"
             "'serving','archived','deleted')",
             name="state_valid",
+        ),
+        CheckConstraint(
+            "engine IN ('otp','motis')",
+            name="engine_valid",
         ),
         # Partial index: only currently-serving fanout sessions need fast lookup.
         Index(
@@ -59,6 +68,10 @@ class Session(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     category: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
+    # P1 MOTIS — which planner backend serves this session. Existing rows
+    # backfill to 'otp' via the alembic server_default; new sessions pick
+    # explicitly via the admin form. See app/journey/planner_dispatch.py.
+    engine: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'otp'"))
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )

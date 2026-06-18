@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from ... import audit, config_service
 from ...db import get_db
-from ...journey import otp_client, recorder
+from ...journey import planner_dispatch, recorder
 from ...models import (
     GraphSnapshot,
     JourneySearch,
@@ -158,7 +158,7 @@ async def replay(
             )
             t0 = time.monotonic()
             try:
-                _, trips = await otp_client.fetch_plan(
+                _, trips = await planner_dispatch.get_planner(target_session).fetch_plan(
                     session_id=target.session_id,
                     from_lat=s.origin_lat,
                     from_lon=s.origin_lon,

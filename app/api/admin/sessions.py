@@ -45,7 +45,7 @@ from ... import audit, detect, inbox_sweep, ingestion, sessions_orchestrator, st
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
-from ...models.sessions import SessionCategory, SessionState
+from ...models.sessions import SessionCategory, SessionEngine, SessionState
 from ...security import (
     CurrentUser,
     client_ip,
@@ -78,6 +78,7 @@ _SOURCE_KEY_TO_KIND: dict[str, str] = {
 
 _VALID_CATEGORIES = {c.value for c in SessionCategory}
 _VALID_STATES = {s.value for s in SessionState}
+_VALID_ENGINES = {e.value for e in SessionEngine}
 _SLUG = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 
 
@@ -87,6 +88,10 @@ class SessionCreate(BaseModel):
     category: str = Field(description="NAP | MERITS | MANUAL | EXPERIMENTAL")
     config: dict[str, Any] = Field(default_factory=dict)
     include_in_fanout: bool = False
+    # P1 MOTIS — planner backend for this session. Default 'otp' keeps
+    # legacy create-form payloads (which don't send `engine`) working
+    # bit-identical to pre-P1 behaviour.
+    engine: str = Field(default="otp", description="otp | motis")
 
 
 class SessionPatch(BaseModel):
@@ -101,6 +106,7 @@ class SessionResponse(BaseModel):
     name: str
     category: str
     state: str
+    engine: str
     config: dict[str, Any]
     include_in_fanout: bool
     created_at: str
@@ -118,6 +124,7 @@ class SessionResponse(BaseModel):
             name=s.name,
             category=s.category,
             state=s.state,
+            engine=getattr(s, "engine", "otp") or "otp",
             config=s.config or {},
             include_in_fanout=s.include_in_fanout,
             created_at=s.created_at.isoformat() if s.created_at else "",
@@ -149,6 +156,8 @@ def create_session(
         raise HTTPException(400, "Session id must be a slug: ^[a-z][a-z0-9-]+$")
     if body.category not in _VALID_CATEGORIES:
         raise HTTPException(400, f"Invalid category. Must be one of {sorted(_VALID_CATEGORIES)}")
+    if body.engine not in _VALID_ENGINES:
+        raise HTTPException(400, f"Invalid engine. Must be one of {sorted(_VALID_ENGINES)}")
     if db.get(SessionRow, body.id) is not None:
         raise HTTPException(409, f"Session {body.id!r} already exists")
 
@@ -160,6 +169,7 @@ def create_session(
         name=body.name,
         category=body.category,
         state=SessionState.CREATED.value,
+        engine=body.engine,
         config=body.config,
         include_in_fanout=body.include_in_fanout,
         created_by=actor.id,
@@ -172,7 +182,7 @@ def create_session(
         actor_ip=client_ip(request),
         target_kind="session",
         target_id=body.id,
-        metadata={"category": body.category, "name": body.name},
+        metadata={"category": body.category, "name": body.name, "engine": body.engine},
     )
     db.commit()
     return SessionResponse.from_orm_session(s)

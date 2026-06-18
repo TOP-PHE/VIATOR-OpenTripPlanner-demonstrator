@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service
 from ..db import get_db
-from ..journey import ojp_client, otp_client, recorder
+from ..journey import ojp_client, planner_dispatch, recorder
 from ..models import GraphSnapshot
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -138,7 +138,7 @@ async def _query_session(
     start = time.monotonic()
     try:
         _when_kind, when = _resolve_when(body)
-        raw, trips = await otp_client.fetch_plan(
+        raw, trips = await planner_dispatch.get_planner(session).fetch_plan(
             session_id=session.id,
             from_lat=body.from_.lat,
             from_lon=body.from_.lon,

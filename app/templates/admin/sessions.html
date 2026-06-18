@@ -21,6 +21,13 @@
     <select name="category">
       <option>NAP</option><option>MERITS</option><option>MANUAL</option><option>EXPERIMENTAL</option>
     </select>
+    <label>Journey planner engine
+      <span class="hint" style="font-weight: normal">— MOTIS is opt-in (Phase 1); OTP is the default.</span>
+    </label>
+    <select name="engine">
+      <option value="otp" selected>OTP</option>
+      <option value="motis">MOTIS</option>
+    </select>
     <label><input type="checkbox" name="include_in_fanout"> Include in fanout immediately</label>
     <button type="submit">Create</button>
     <div id="create-msg" class="msg"></div>
@@ -29,7 +36,7 @@
 
 <table id="sessions-table">
   <thead>
-    <tr><th></th><th>ID</th><th>Name</th><th>Category</th><th>State</th><th>Fanout</th><th>Created</th><th></th></tr>
+    <tr><th></th><th>ID</th><th>Name</th><th>Category</th><th>Engine</th><th>State</th><th>Fanout</th><th>Created</th><th></th></tr>
   </thead>
   <tbody>
   {% for s in sessions %}
@@ -38,6 +45,7 @@
       <td><code>{{ s.id }}</code></td>
       <td>{{ s.name }}</td>
       <td>{{ s.category }}</td>
+      <td><span class="engine-badge engine-{{ s.engine or 'otp' }}">{{ (s.engine or 'otp') | upper }}</span></td>
       <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span></td>
       <td style="text-align: center">
         <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
@@ -49,7 +57,7 @@
       </td>
     </tr>
     <tr class="detail-row" data-sid-detail="{{ s.id }}" hidden>
-      <td colspan="8" style="padding: 0">
+      <td colspan="9" style="padding: 0">
         <div class="detail-panel">
           <!-- Configure: edit config.sources URLs -->
           <section class="detail-section">
@@ -587,6 +595,7 @@ document.getElementById('create-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const body = { id: fd.get('id'), name: fd.get('name'), category: fd.get('category'),
+                 engine: fd.get('engine') || 'otp',
                  include_in_fanout: fd.get('include_in_fanout') === 'on', config: {} };
   const r = await fetch('/api/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (!r.ok) { const j = await r.json().catch(()=>({})); showToast('error', j.detail || `Failed (${r.status})`); return; }

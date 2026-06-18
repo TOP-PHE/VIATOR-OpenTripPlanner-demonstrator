@@ -1,12 +1,13 @@
-"""Background worker: polls per-session rebuild_jobs, debounces, runs OTP build.
+"""Background worker: polls per-session rebuild_jobs, debounces, runs the
+session's engine-specific build (OTP or MOTIS).
 
 Per session, at most one rebuild runs at a time. The MAX_CONCURRENT_REBUILDS
 config knob caps total simultaneous rebuilds across all sessions.
 
 The worker also watches for the reload-trigger file written by
 `POST /api/sessions/<sid>/promote` — when present, runs `docker compose up`
-and `nginx -s reload` so per-session OTP containers come online without
-the operator having to shell in.
+and `nginx -s reload` so per-session planner containers (otp-<sid> /
+motis-<sid>) come online without the operator having to shell in.
 """
 
 from __future__ import annotations
@@ -281,7 +282,19 @@ def tick() -> None:
         max_memory = bool(job.max_memory)
 
     log.info("running rebuild job %s (session=%s max_memory=%s)", job_id, sid, max_memory)
-    output, success, graph_path = run_build(session_id=sid, max_memory=max_memory)
+    # P1 MOTIS — dispatch to the engine-appropriate builder. We resolve
+    # engine in its own short txn so the row's session field is fresh
+    # (operator may have edited it between job-enqueue and tick).
+    engine = "otp"
+    if sid is not None:
+        with SessionLocal() as db:
+            row = db.get(SessionRow, sid)
+            if row is not None:
+                engine = getattr(row, "engine", "otp") or "otp"
+    if engine == "motis":
+        output, success, graph_path = run_build_motis(session_id=sid, max_memory=max_memory)
+    else:
+        output, success, graph_path = run_build(session_id=sid, max_memory=max_memory)
 
     with SessionLocal() as db:
         job = db.get(RebuildJob, job_id)
@@ -952,6 +965,168 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
         if max_memory and stopped_services:
             _start_services(stopped_services)
             _MAXMEM_MARKER.unlink(missing_ok=True)
+
+
+_MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"
+
+
+def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
+    """P1 MOTIS — invoke `motis config` + `motis import` via the docker socket.
+
+    Returns the same `(log, success, data_path)` triple as the OTP builder
+    so the `tick()` loop can stay engine-agnostic past the dispatch point.
+
+    Lifecycle (mirrors motis-spike/README.md):
+      1. Read inbox/<sid>/osm/osm.pbf and inbox/<sid>/gtfs/*.zip — same
+         inputs operators already prepare for OTP.
+      2. `motis config <pbf> <gtfs...>` writes `config.yml` into a fresh
+         per-session staging dir under graphs/motis/<sid>/<timestamp>/.
+      3. `motis import` (run with cwd=staging) reads the generated
+         config.yml and produces the imported data dir alongside it.
+      4. Promote the staging dir to `graphs/motis/<sid>/current` (relative
+         symlink) so the serving `motis-<sid>` container's mount picks
+         it up at /var/motis-graphs/motis/<sid>/current/.
+
+    `max_memory` is wired through for parity with the OTP builder but
+    has no MOTIS-specific tuning yet — MOTIS's RAM footprint is dominated
+    by data mmap, not heap. Operators who need to stop sibling services
+    for big imports can flip it; the same `_stop_services` / `_start_services`
+    plumbing runs.
+    """
+    if session_id is None:
+        return "ERROR: MOTIS build requires a session_id (no phase1 path)", False, ""
+    sid = session_id
+
+    inbox_root = settings.inbox_dir / sid
+    pbf = inbox_root / "osm" / "osm.pbf"
+    gtfs_dir = inbox_root / "gtfs"
+    gtfs_files = sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []
+
+    if not pbf.exists():
+        return f"ERROR: no osm.pbf at {pbf} — upload or refresh first", False, ""
+    if not gtfs_files:
+        return f"ERROR: no GTFS files under {gtfs_dir} — upload or refresh first", False, ""
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    # MOTIS data lives under graphs/motis/<sid>/<timestamp>/ so the OTP
+    # session subtree (graphs/<sid>/...) is never mixed with MOTIS data —
+    # makes the orchestrator's per-engine mount path unambiguous.
+    motis_root = Path(str(settings.graph_dir)) / "motis" / sid
+    staging = motis_root / timestamp
+    staging.mkdir(parents=True, exist_ok=True)
+
+    stopped_services: list[str] = []
+    if max_memory:
+        # Mirrors the OTP path's recovery contract: the marker holds the
+        # service names (one per line) so a worker crash mid-build lets the
+        # next start-up revive what got stopped. A bare timestamp would
+        # leave the recovery path with nothing to restart.
+        stopped_services = _max_memory_stop_targets(_list_serving_sessions())
+        try:
+            _MAXMEM_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            _MAXMEM_MARKER.write_text("\n".join(stopped_services), encoding="utf-8")
+        except OSError as exc:
+            log.warning("max-memory marker write failed (%s) — crash recovery off", exc)
+        _stop_services(stopped_services)
+
+    try:
+        # MOTIS reads/writes everything under /data inside the container; the
+        # staging dir is mounted there. Inbox is mounted read-only — the
+        # config + import commands only need to enumerate inputs from it.
+        common_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "viator_default",
+            "-v",
+            f"{staging}:/data",
+            "-v",
+            f"{inbox_root}:/inbox:ro",
+            "-w",
+            "/data",
+        ]
+
+        # `motis config <pbf> <gtfs...>` writes /data/config.yml. The
+        # container-side paths are /inbox/... because we mounted the
+        # session's inbox there read-only.
+        in_container_pbf = f"/inbox/osm/{pbf.name}"
+        in_container_gtfs = [f"/inbox/gtfs/{g.name}" for g in gtfs_files]
+        config_cmd = [*common_cmd, _MOTIS_IMAGE, "config", in_container_pbf, *in_container_gtfs]
+
+        log.info("session %s MOTIS build: motis config (gtfs=%d feeds)", sid, len(gtfs_files))
+        # `config_cmd` is built from constants + filesystem-derived names; nothing
+        # operator-supplied flows untrimmed into the argv. Bandit S603 doesn't apply.
+        config_proc = subprocess.run(  # noqa: S603
+            config_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if config_proc.returncode != 0:
+            return (
+                (
+                    f"[viator] motis config failed (exit {config_proc.returncode})\n"
+                    + (config_proc.stdout or "")
+                    + "\n--- stderr ---\n"
+                    + (config_proc.stderr or "")
+                ),
+                False,
+                "",
+            )
+
+        # `motis import` reads /data/config.yml and writes the rest of /data.
+        import_cmd = [*common_cmd, _MOTIS_IMAGE, "import"]
+        log.info("session %s MOTIS build: motis import", sid)
+        import_proc = subprocess.run(  # noqa: S603
+            import_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = (
+            "[viator] motis config OK\n"
+            + (config_proc.stdout or "")
+            + "\n--- motis import ---\n"
+            + (import_proc.stdout or "")
+            + "\n--- stderr ---\n"
+            + (import_proc.stderr or "")
+        )
+
+        if import_proc.returncode != 0:
+            return output, False, ""
+
+        # Sanity check: config.yml must exist post-import (it's the file the
+        # serve container points its --config flag at).
+        if not (staging / "config.yml").exists():
+            return output + "\nERROR: config.yml not found in data dir after import", False, ""
+
+        current = motis_root / "current"
+        if current.exists() or current.is_symlink():
+            current.unlink()
+        # Relative target — see the rationale in run_build's symlink section
+        # (volume mount paths differ between worker and serve containers).
+        current.symlink_to(staging.name, target_is_directory=True)
+
+        _prune_old_motis_imports(sid, keep=3)
+
+        return output, True, str(staging)
+    finally:
+        if max_memory and stopped_services:
+            _start_services(stopped_services)
+            _MAXMEM_MARKER.unlink(missing_ok=True)
+
+
+def _prune_old_motis_imports(sid: str, keep: int) -> None:
+    base = Path(str(settings.graph_dir)) / "motis" / sid
+    if not base.is_dir():
+        return
+    snapshots = sorted(
+        (p for p in base.iterdir() if p.is_dir() and p.name != "current"),
+        reverse=True,
+    )
+    for old in snapshots[keep:]:
+        shutil.rmtree(old, ignore_errors=True)
 
 
 def _prune_old_graphs(sid: str, keep: int) -> None:
