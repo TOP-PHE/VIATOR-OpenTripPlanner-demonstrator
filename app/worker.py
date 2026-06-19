@@ -1013,7 +1013,7 @@ def _strip_tiles_block(config_yml: Path) -> None:
     # reaching a rebuild job, so it cannot contain `..`, `/`, or any other
     # path-traversal char. Every other path component is a constant or a
     # `strftime`-formatted timestamp. Sonar's taint analysis can't follow
-    # this validation chain, hence the suppression. NOSONAR
+    # this validation chain — pythonsecurity:S2083 suppressed on next line.
     config_yml.write_text("".join(out), encoding="utf-8")  # NOSONAR
 
 
