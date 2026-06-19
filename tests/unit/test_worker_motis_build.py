@@ -299,7 +299,21 @@ def test_run_build_motis_surfaces_subprocess_failure_in_log(
 
     def _fake_run(cmd, **_kwargs):
         call_count["n"] += 1
-        return _OkProc() if "config" in cmd else _FailProc()
+        # Phase-0.5: the worker checks `config.yml` exists post-config so it
+        # can strip the `tiles:` block before invoking import. The mock must
+        # write the file when config runs, otherwise the import-failure path
+        # we're testing is never reached.
+        if "config" in cmd:
+            for i, arg in enumerate(cmd):
+                if arg == "-v" and i + 1 < len(cmd):
+                    host_path = cmd[i + 1].split(":", 1)[0]
+                    if host_path.startswith(str(graphs)):
+                        Path(host_path).joinpath("config.yml").write_text(
+                            "osm: /inbox/osm/osm.pbf\n"
+                        )
+                        break
+            return _OkProc()
+        return _FailProc()
 
     monkeypatch.setattr(worker.subprocess, "run", _fake_run)
 
