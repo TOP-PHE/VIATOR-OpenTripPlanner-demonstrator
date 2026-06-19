@@ -975,22 +975,66 @@ _MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"
 _STDERR_SEP = "\n--- stderr ---\n"
 
 
+def _strip_tiles_block(config_yml: Path) -> None:
+    """Remove the top-level `tiles:` block from a MOTIS-generated config.yml.
+
+    MOTIS's `config` subcommand always emits a `tiles:` section referencing
+    `tiles-profiles/full.lua`, which is a built-in container asset that
+    *doesn't* land in the data directory. At import time MOTIS verifies the
+    file's presence and aborts with `[VERIFY FAIL] tiles profile
+    tiles-profiles/full.lua does not exist`. VIATOR doesn't surface map
+    tiles, so the cleanest mitigation is to delete the block here, between
+    `config` and `import`.
+
+    The YAML written by MOTIS is plain (no anchors, no folding, top-level
+    keys flush to column 0). A simple state machine over lines is
+    sufficient and avoids pulling PyYAML for one operation in the worker.
+    """
+    out: list[str] = []
+    in_tiles = False
+    for line in config_yml.read_text(encoding="utf-8").splitlines(keepends=True):
+        if line.startswith("tiles:"):
+            in_tiles = True
+            continue
+        if in_tiles:
+            # Indented lines belong to the tiles: block; the first un-indented
+            # line that doesn't start with whitespace ends it. Empty lines
+            # mid-block stay in the block.
+            stripped = line.lstrip(" \t")
+            if line and line[0] not in (" ", "\t") and stripped:
+                in_tiles = False
+                out.append(line)
+            continue
+        out.append(line)
+    config_yml.write_text("".join(out), encoding="utf-8")
+
+
 def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
-    """P1 MOTIS — invoke `motis config` + `motis import` via the docker socket.
+    """P1 MOTIS — invoke `/motis config` + `/motis import` via the docker socket.
 
     Returns the same `(log, success, data_path)` triple as the OTP builder
     so the `tick()` loop can stay engine-agnostic past the dispatch point.
 
-    Lifecycle (mirrors motis-spike/README.md):
+    Lifecycle (mirrors motis-spike/README.md, post Phase-0.5 spike fixes):
       1. Read inbox/<sid>/osm/osm.pbf and inbox/<sid>/gtfs/*.zip — same
          inputs operators already prepare for OTP.
-      2. `motis config <pbf> <gtfs...>` writes `config.yml` into a fresh
+      2. `/motis config <pbf> <gtfs...>` writes `config.yml` into a fresh
          per-session staging dir under graphs/motis/<sid>/<timestamp>/.
-      3. `motis import` (run with cwd=staging) reads the generated
-         config.yml and produces the imported data dir alongside it.
-      4. Promote the staging dir to `graphs/motis/<sid>/current` (relative
+      3. Strip the `tiles:` block from the generated config.yml. MOTIS
+         bakes in a `tiles-profiles/full.lua` reference that lives inside
+         the container image; the verify step at import time fails because
+         the file isn't in the data dir. VIATOR doesn't surface map tiles,
+         so dropping the block is the cleanest fix.
+      4. `/motis import --data /data` reads the (now-edited) config and
+         writes the preprocessed data flat into /data (without --data it
+         defaults to /data/data/ which trips up the serve container).
+      5. Promote the staging dir to `graphs/motis/<sid>/current` (relative
          symlink) so the serving `motis-<sid>` container's mount picks
          it up at /var/motis-graphs/motis/<sid>/current/.
+
+    All `docker run` invocations use `--user 0:0` because the MOTIS image
+    runs as a `motis` user by default which can't write to host-owned mount
+    dirs. The serve container in `_MOTIS_SVC_TEMPLATE` uses the same override.
 
     `max_memory` is wired through for parity with the OTP builder but
     has no MOTIS-specific tuning yet — MOTIS's RAM footprint is dominated
@@ -1038,10 +1082,16 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         # MOTIS reads/writes everything under /data inside the container; the
         # staging dir is mounted there. Inbox is mounted read-only — the
         # config + import commands only need to enumerate inputs from it.
+        # `--user 0:0` overrides the image's default `motis` user so the
+        # container can write to the host-owned staging dir (Phase-0.5
+        # spike finding — without this, motis exits 0 silently after
+        # writing nothing).
         common_cmd = [
             "docker",
             "run",
             "--rm",
+            "--user",
+            "0:0",
             "--network",
             "viator_default",
             "-v",
@@ -1052,14 +1102,22 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             "/data",
         ]
 
-        # `motis config <pbf> <gtfs...>` writes /data/config.yml. The
-        # container-side paths are /inbox/... because we mounted the
-        # session's inbox there read-only.
+        # `/motis config <pbf> <gtfs...>` writes /data/config.yml. The
+        # container has no ENTRYPOINT, so the absolute binary path `/motis`
+        # is required (not just `motis`). Container paths are /inbox/...
+        # because we mounted the session's inbox there read-only.
         in_container_pbf = f"/inbox/osm/{pbf.name}"
         in_container_gtfs = [f"/inbox/gtfs/{g.name}" for g in gtfs_files]
-        config_cmd = [*common_cmd, _MOTIS_IMAGE, "config", in_container_pbf, *in_container_gtfs]
+        config_cmd = [
+            *common_cmd,
+            _MOTIS_IMAGE,
+            "/motis",
+            "config",
+            in_container_pbf,
+            *in_container_gtfs,
+        ]
 
-        log.info("session %s MOTIS build: motis config (gtfs=%d feeds)", sid, len(gtfs_files))
+        log.info("session %s MOTIS build: /motis config (gtfs=%d feeds)", sid, len(gtfs_files))
         # `config_cmd` is built from constants + filesystem-derived names; nothing
         # operator-supplied flows untrimmed into the argv. Bandit S603 doesn't apply.
         config_proc = subprocess.run(  # noqa: S603
@@ -1080,9 +1138,28 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
                 "",
             )
 
-        # `motis import` reads /data/config.yml and writes the rest of /data.
-        import_cmd = [*common_cmd, _MOTIS_IMAGE, "import"]
-        log.info("session %s MOTIS build: motis import", sid)
+        # `motis config` references `tiles-profiles/full.lua` (a built-in
+        # asset inside the container image). At import time MOTIS verifies
+        # that file exists in the data dir and aborts if not. VIATOR has
+        # no use for map tiles, so we strip the `tiles:` block from the
+        # generated config.yml here, between `config` and `import`. See
+        # Phase-0.5 spike findings (2026-06-19).
+        config_yml = staging / "config.yml"
+        if not config_yml.exists():
+            return (
+                f"[viator] motis config produced no config.yml at {config_yml}",
+                False,
+                "",
+            )
+        _strip_tiles_block(config_yml)
+
+        # `/motis import --data /data` reads /data/config.yml and writes
+        # preprocessed data flat into /data. Without `--data /data` it
+        # defaults to creating /data/data/ as the output dir, which then
+        # doesn't match the serve container's `--data /var/motis-graphs/...`
+        # mount path.
+        import_cmd = [*common_cmd, _MOTIS_IMAGE, "/motis", "import", "--data", "/data"]
+        log.info("session %s MOTIS build: /motis import", sid)
         import_proc = subprocess.run(  # noqa: S603
             import_cmd,
             capture_output=True,
@@ -1090,7 +1167,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             check=False,
         )
         output = (
-            "[viator] motis config OK\n"
+            "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"
             + (import_proc.stdout or "")
@@ -1101,10 +1178,16 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         if import_proc.returncode != 0:
             return output, False, ""
 
-        # Sanity check: config.yml must exist post-import (it's the file the
-        # serve container points its --config flag at).
-        if not (staging / "config.yml").exists():
-            return output + "\nERROR: config.yml not found in data dir after import", False, ""
+        # Sanity check: config.yml must still exist post-import. MOTIS's
+        # `tt.bin` is the actual proof of successful timetable indexing
+        # (Phase-0.5 confirmed `nigiri/` is NOT a directory — Nigiri keeps
+        # the timetable as flat files alongside config.yml).
+        if not (staging / "config.yml").exists() or not (staging / "tt.bin").exists():
+            return (
+                output + "\nERROR: post-import data dir missing config.yml or tt.bin",
+                False,
+                "",
+            )
 
         current = motis_root / "current"
         if current.exists() or current.is_symlink():
