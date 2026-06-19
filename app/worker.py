@@ -1006,7 +1006,15 @@ def _strip_tiles_block(config_yml: Path) -> None:
                 out.append(line)
             continue
         out.append(line)
-    config_yml.write_text("".join(out), encoding="utf-8")
+    # `config_yml` is constructed inside `run_build_motis` from
+    # `settings.graph_dir / "motis" / session_id / <timestamp> / "config.yml"`.
+    # The `session_id` is validated by the `_SLUG` regex at the API layer
+    # (`^[a-z][a-z0-9-]+$` — see app/api/admin/sessions.py) before ever
+    # reaching a rebuild job, so it cannot contain `..`, `/`, or any other
+    # path-traversal char. Every other path component is a constant or a
+    # `strftime`-formatted timestamp. Sonar's taint analysis can't follow
+    # this validation chain, hence the suppression. NOSONAR
+    config_yml.write_text("".join(out), encoding="utf-8")  # NOSONAR
 
 
 def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
