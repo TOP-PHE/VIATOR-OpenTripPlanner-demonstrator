@@ -1087,13 +1087,18 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         _stop_services(stopped_services)
 
     try:
-        # MOTIS reads/writes everything under /data inside the container; the
-        # staging dir is mounted there. Inbox is mounted read-only — the
-        # config + import commands only need to enumerate inputs from it.
+        # The MOTIS container is spawned via the *host's* docker daemon (the
+        # worker has /var/run/docker.sock mounted). Bind-mounting the worker's
+        # own path (e.g. /data/inbox/<sid>) would NOT work: the daemon
+        # resolves those paths against the host filesystem, not the worker's
+        # view, so a bind would silently create an empty host directory and
+        # mount that — motis would then see no osm.pbf and fail with
+        # `[VERIFY FAIL] path /inbox/osm/osm.pbf does not exist`. The fix is
+        # to mount by *named volume* instead — both volume names match the
+        # worker's own mount sources (`viator inspect` confirms).
         # `--user 0:0` overrides the image's default `motis` user so the
-        # container can write to the host-owned staging dir (Phase-0.5
-        # spike finding — without this, motis exits 0 silently after
-        # writing nothing).
+        # container can write to volume-owned staging dirs (Phase-0.5 spike
+        # finding — without it, motis exits 0 silently after writing nothing).
         common_cmd = [
             "docker",
             "run",
@@ -1102,20 +1107,29 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             "0:0",
             "--network",
             "viator_default",
+            # Inbox volume mounted read-only — config & import only read.
+            # All sessions' inboxes are visible at /inbox/<sid>/... in the
+            # container; we always reference the current sid's subtree.
             "-v",
-            f"{staging}:/data",
+            "viator_inbox:/inbox:ro",
+            # Graphs volume mounted read-write — staging dir lives at
+            # /graphs/motis/<sid>/<timestamp>/. The worker already mkdir'd
+            # this dir against its own /data/graphs mount, so it's visible
+            # to the new container at the parallel path under /graphs.
             "-v",
-            f"{inbox_root}:/inbox:ro",
+            "viator_graphs:/graphs",
             "-w",
-            "/data",
+            f"/graphs/motis/{sid}/{timestamp}",
         ]
 
-        # `/motis config <pbf> <gtfs...>` writes /data/config.yml. The
+        # `/motis config <pbf> <gtfs...>` writes config.yml to cwd. The
         # container has no ENTRYPOINT, so the absolute binary path `/motis`
-        # is required (not just `motis`). Container paths are /inbox/...
-        # because we mounted the session's inbox there read-only.
-        in_container_pbf = f"/inbox/osm/{pbf.name}"
-        in_container_gtfs = [f"/inbox/gtfs/{g.name}" for g in gtfs_files]
+        # is required (not just `motis`). Container input paths reach into
+        # the inbox volume at /inbox/<sid>/... (matching the host's
+        # `viator_inbox` volume layout — the worker reads/writes the same
+        # tree at /data/inbox/<sid>/...).
+        in_container_pbf = f"/inbox/{sid}/osm/{pbf.name}"
+        in_container_gtfs = [f"/inbox/{sid}/gtfs/{g.name}" for g in gtfs_files]
         config_cmd = [
             *common_cmd,
             _MOTIS_IMAGE,
@@ -1161,12 +1175,21 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             )
         _strip_tiles_block(config_yml)
 
-        # `/motis import --data /data` reads /data/config.yml and writes
-        # preprocessed data flat into /data. Without `--data /data` it
-        # defaults to creating /data/data/ as the output dir, which then
-        # doesn't match the serve container's `--data /var/motis-graphs/...`
-        # mount path.
-        import_cmd = [*common_cmd, _MOTIS_IMAGE, "/motis", "import", "--data", "/data"]
+        # `/motis import --data <dir>` reads <dir>/config.yml and writes
+        # preprocessed data flat into <dir>. Without `--data` it defaults to
+        # creating `data/` under cwd as the output dir, which then doesn't
+        # match the serve container's `--data /var/motis-graphs/...` mount
+        # path. cwd already IS the staging dir (set via -w on common_cmd),
+        # so we pass the same path here.
+        in_container_data = f"/graphs/motis/{sid}/{timestamp}"
+        import_cmd = [
+            *common_cmd,
+            _MOTIS_IMAGE,
+            "/motis",
+            "import",
+            "--data",
+            in_container_data,
+        ]
         log.info("session %s MOTIS build: /motis import", sid)
         import_proc = subprocess.run(  # noqa: S603
             import_cmd,
