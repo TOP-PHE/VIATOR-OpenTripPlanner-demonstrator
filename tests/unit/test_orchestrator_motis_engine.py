@@ -46,17 +46,40 @@ def test_motis_session_renders_motis_service_not_otp():
 def test_motis_service_points_at_engine_specific_data_dir():
     """The MOTIS serve container reads from the per-engine subtree
     (`graphs/motis/<sid>/current/`) so an OTP session and a MOTIS session
-    with the same id can't accidentally cross-read each other's data."""
+    with the same id can't accidentally cross-read each other's data.
+
+    Post Phase-0.5: `motis server` takes `--data <dir>`, NOT `--config <file>`.
+    The dir is the import output path; config.yml lives inside it."""
     out = render_compose([_StubSession(id="x", engine="motis")])
-    assert "/var/motis-graphs/motis/x/current/config.yml" in out
+    assert "--data" in out
+    assert "/var/motis-graphs/motis/x/current" in out
+    # Verify we're NOT passing the wrong flag (caught by Phase-0.5 spike).
+    assert "--config" not in out.split("motis-x:")[1].split("\n\n")[0]
 
 
-def test_motis_healthcheck_probes_motis_api_root():
-    """Sonar/runtime correctness: the healthcheck must NOT use OTP's
-    `/otp/` probe (returns 404 on MOTIS and would crash-loop the container)."""
+def test_motis_healthcheck_uses_root_endpoint_not_api_v6():
+    """Phase-0.5 spike: `GET /api/v6/` returns 400 (the endpoint exists but
+    rejects empty params). `curl -f` would treat that as failure and
+    crash-loop the container. `GET /` returns 200 (the splash page MOTIS
+    prints on boot) — that's the cheapest healthcheck signal."""
     out = render_compose([_StubSession(id="x", engine="motis")])
-    assert "/api/v6/" in out
-    assert "localhost:8080/otp/" not in out.split("motis-x:")[1].split("\n\n")[0]
+    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    # Right endpoint is `/`. Wrong endpoint is `/api/v6/` (would 400).
+    assert "localhost:8080/ " in motis_block or "localhost:8080/ " in motis_block.replace(
+        "|| exit 1", ""
+    )
+    assert "localhost:8080/api/v6/" not in motis_block
+    assert "localhost:8080/otp/" not in motis_block
+
+
+def test_motis_service_overrides_container_user_to_root():
+    """Phase-0.5 spike: the MOTIS image runs as `User: motis` by default.
+    Without `user: "0:0"`, the serve container can't map the read-only
+    data dir cleanly (silent failures + permission quirks). The worker's
+    build runs already pass `--user 0:0`; the serve template mirrors it."""
+    out = render_compose([_StubSession(id="x", engine="motis")])
+    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    assert 'user: "0:0"' in motis_block
 
 
 def test_motis_healthcheck_start_period_respects_session_config():

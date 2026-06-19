@@ -35,44 +35,60 @@ def test_base_url_override_wins_and_strips_trailing_slash():
 
 
 def test_leg_canonical_maps_motis_fields_to_otp_shape():
+    """Pinned against a real Renfe AVE response captured in the Phase-0.5
+    spike (Madrid Atocha → Barcelona Sants, 2026-06-19). MOTIS field names
+    differ from OTP: `lat`/`lon` (not latitude/longitude), top-level
+    route/agency fields (not nested objects), `_` (not `:`) in stop ids."""
     leg = {
-        "mode": "RAIL",
-        "startTime": "2026-06-01T08:00:00+00:00",
-        "endTime": "2026-06-01T11:00:00+00:00",
-        "duration": 10800,
+        "mode": "HIGHSPEED_RAIL",
+        "startTime": "2026-06-20T09:27:00Z",
+        "endTime": "2026-06-20T13:11:00Z",
+        "duration": 13440,
         "from": {
-            "name": "Paris Gare de Lyon",
-            "latitude": 48.844,
-            "longitude": 2.374,
-            "stopId": "FR:StopPlace:8768600",
+            "name": "Madrid-Puerta de Atocha-Almudena Grandes",
+            "lat": 40.406442,
+            "lon": -3.690886,
+            "stopId": "renfe-ld_60000",
         },
         "to": {
-            "name": "Lyon Part-Dieu",
-            "latitude": 45.760,
-            "longitude": 4.860,
-            "stopId": "FR:StopPlace:8772319",
+            "name": "Barcelona-Sants",
+            "lat": 41.379863,
+            "lon": 2.141017,
+            "stopId": "renfe-ld_71801",
         },
-        "routeShortName": "TGV",
-        "agency": {"name": "SNCF Voyageurs", "url": "https://sncf.com"},
-        "headsign": "Lyon Part-Dieu",
-        "tripId": "TGV6603",
+        "routeShortName": "AVE",
+        "routeLongName": "Madrid - Barcelona",
+        "routeId": "renfe-ld_R1",
+        "agencyId": "renfe-ld_renfe",
+        "agencyName": "Renfe Operadora",
+        "agencyUrl": "https://www.renfe.com",
+        "headsign": "Barcelona-Sants",
+        "tripId": "renfe-ld_AVE03162",
     }
     out = _leg_to_canonical(leg)
-    # Time + space + transit identity make the round-trip into the canonical
-    # leg dict the federated planner already consumes.
-    assert out["mode"] == "RAIL"
-    assert out["departure"] == "2026-06-01T08:00:00+00:00"
-    assert out["arrival"] == "2026-06-01T11:00:00+00:00"
-    assert out["duration_seconds"] == 10800
-    assert out["from_name"] == "Paris Gare de Lyon"
-    assert out["from_lat"] == 48.844
-    assert out["from_lon"] == 2.374
-    assert out["from_stop_id"] == "FR:StopPlace:8768600"
-    assert out["to_stop_id"] == "FR:StopPlace:8772319"
-    assert out["route_short_name"] == "TGV"
-    assert out["agency_name"] == "SNCF Voyageurs"
-    assert out["trip_id"] == "TGV6603"
-    assert out["trip_headsign"] == "Lyon Part-Dieu"
+    assert out["mode"] == "HIGHSPEED_RAIL"
+    assert out["departure"] == "2026-06-20T09:27:00Z"
+    assert out["arrival"] == "2026-06-20T13:11:00Z"
+    assert out["duration_seconds"] == 13440
+    assert out["from_name"] == "Madrid-Puerta de Atocha-Almudena Grandes"
+    assert out["from_lat"] == 40.406442
+    assert out["from_lon"] == -3.690886
+    assert out["from_stop_id"] == "renfe-ld_60000"
+    assert out["to_stop_id"] == "renfe-ld_71801"
+    assert out["route_short_name"] == "AVE"
+    assert out["route_long_name"] == "Madrid - Barcelona"
+    assert out["route_id"] == "renfe-ld_R1"
+    assert out["agency_name"] == "Renfe Operadora"
+    assert out["agency_id"] == "renfe-ld_renfe"
+    assert out["agency_url"] == "https://www.renfe.com"
+    # Feed id is derived from the underscore-encoded stop id — needed for
+    # federated_planner dedup.
+    assert out["feed_id"] == "renfe-ld"
+    assert out["trip_id"] == "renfe-ld_AVE03162"
+    assert out["trip_headsign"] == "Barcelona-Sants"
+    # MOTIS doesn't expose leg distance; we surface a stable 0.0 so the
+    # canonical dict shape stays consistent.
+    assert out["distance_meters"] == 0.0
 
 
 def test_leg_canonical_tolerates_missing_optional_fields():
@@ -86,6 +102,24 @@ def test_leg_canonical_tolerates_missing_optional_fields():
     assert out["trip_id"] is None
     # Duration absent -> 0 (consistent with the OTP path's int(... or 0)).
     assert out["duration_seconds"] == 0
+    # No stopId on a WALK leg → feed_id should be None too, not crash.
+    assert out["feed_id"] is None
+
+
+def test_feed_id_extraction_handles_edge_cases():
+    """Stop ids without `_` (synthetic legs, malformed feeds) must not raise."""
+    from app.journey.motis_client import _feed_id_from_motis_id
+
+    assert _feed_id_from_motis_id("renfe-ld_60000") == "renfe-ld"
+    # Multi-underscore feed id: only the LAST `_` splits feed from local.
+    assert _feed_id_from_motis_id("eu_corridors_TGV6603") == "eu_corridors"
+    # No underscore → no feed id, return None rather than guess.
+    assert _feed_id_from_motis_id("standalone-id") is None
+    # Empty / None.
+    assert _feed_id_from_motis_id("") is None
+    assert _feed_id_from_motis_id(None) is None
+    # Edge: leading underscore (would imply empty feed) → still None.
+    assert _feed_id_from_motis_id("_60000") is None
 
 
 # ─────────────────────── _itineraries_to_trips ────────────────────────

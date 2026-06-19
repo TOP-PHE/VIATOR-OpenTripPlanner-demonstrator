@@ -87,24 +87,35 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
 # `graphs` volume but at a separate per-session subtree (`motis/<sid>/`
 # vs `<sid>/` for OTP) so a single session never has both. The worker's
 # motis-build step writes `graphs/motis/<sid>/current/` and the serve
-# container reads `MOTIS_DATA_DIR=/data` which the volume mount points
-# at. Healthcheck pings the same /api/v6/plan root the dispatcher uses.
+# container reads it via the `--data` flag (NOT `--config` — `motis server`
+# takes a data directory, not a config file).
+#
+# Phase-0.5 spike findings (run 2026-06-19, nap-sp-rail on the VPS) that
+# shaped this template:
+#   * Healthcheck targets `GET /` which returns 200 (the splash page MOTIS
+#     prints on boot). `/api/v6/` returns 400 — `curl -f` would treat that
+#     as a failure and crash-loop the container.
+#   * Container's default user is `motis`; the `user: "0:0"` override is
+#     needed so the serve process can map the read-only data dir without
+#     uid-mismatch quirks (the worker writes the data dir as root via its
+#     own `--user 0:0` runs).
 _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
     image: ghcr.io/motis-project/motis:${{MOTIS_VERSION:-latest}}
     restart: unless-stopped
-    environment:
-      MOTIS_DATA_DIR: /data
+    user: "0:0"
     volumes:
       # Shared graphs volume — the worker writes per-session MOTIS
       # imported data under graphs/motis/<sid>/current/; this mount
-      # surfaces it at /data inside the container.
+      # surfaces it at /var/motis-graphs inside the container, read-only.
       - graphs:/var/motis-graphs:ro
-    command: ["server", "--config", "/var/motis-graphs/motis/{sid}/current/config.yml"]
+    command: ["/motis", "server", "--data", "/var/motis-graphs/motis/{sid}/current"]
     healthcheck:
-      # MOTIS exposes the planning API at /api/v6/plan; a HEAD against the
-      # endpoint root is the cheapest readiness signal. start_period mirrors
-      # the OTP knob so operators can tune big-feed import times the same way.
-      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/api/v6/ || exit 1"]
+      # GET / is the cheapest 200 — Phase-0.5 spike confirmed /api/v6/* all
+      # return 400 with empty params (the endpoint is alive but demanding),
+      # so a curl -f probe against them would mark the container unhealthy.
+      # start_period mirrors the OTP knob so operators tune big-feed import
+      # times the same way for both engines.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/ || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: {start_period}s

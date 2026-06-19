@@ -169,48 +169,71 @@ def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _feed_id_from_motis_id(motis_id: str | None) -> str | None:
+    """Extract the feed id from a MOTIS-formatted stop or trip id.
+
+    MOTIS encodes both feed and local id into one string with `_` as the
+    separator (e.g. `renfe-ld_60000`). OTP uses `:` (e.g. `renfe-ld:60000`).
+    Phase-1 federated planner dedup keys on feed_id, so we surface it here
+    rather than make the dispatcher engine-aware.
+
+    Returns None on inputs that don't carry the `<feed>_<local>` shape —
+    the federated planner already tolerates missing feed_id by falling
+    back to coordinate-based stitching.
+    """
+    if not motis_id or "_" not in motis_id:
+        return None
+    return motis_id.rsplit("_", 1)[0] or None
+
+
 def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
-    """One MOTIS leg -> one canonical leg dict (matching otp_client's shape)."""
+    """One MOTIS leg -> one canonical leg dict (matching otp_client's shape).
+
+    Field names verified against a real Renfe AVE response in the Phase-0.5
+    spike (Madrid Atocha → Barcelona Sants, 2026-06-19). Key MOTIS-isms vs
+    OTP that surfaced there:
+      * Place coords are `lat` / `lon`, not `latitude` / `longitude`.
+      * Route + agency fields are TOP-LEVEL on the leg (e.g. `routeShortName`,
+        `agencyName`) — there is no nested `route: {}` / `agency: {}` object.
+      * `routeId` carries the GTFS route id; we surface it verbatim.
+      * No `distance` field; if downstream consumers care about leg distance
+        they'll need to derive it from `legGeometry` (out of scope for P1).
+      * `stopId` uses underscore: `<feed>_<local>` not OTP's `<feed>:<local>`.
+        Feed id is extracted via _feed_id_from_motis_id so the federated
+        planner's dedup keys still work.
+    """
     f = leg.get("from") or {}
     t = leg.get("to") or {}
-    route = leg.get("route") or {}
-    agency = leg.get("agency") or {}
-    # MOTIS leg duration isn't strictly required by the spec — derive from
-    # start/end if absent. (Confirm the exact `duration` field name once we
-    # capture a live response; the spec only mentions it implicitly.)
     duration = leg.get("duration")
+    from_stop_id = f.get("stopId")
+    to_stop_id = t.get("stopId")
     return {
         "mode": leg.get("mode"),
         "departure": str(leg.get("startTime") or ""),
         "arrival": str(leg.get("endTime") or ""),
         "duration_seconds": int(duration) if duration is not None else 0,
-        # Spike note: OTP exposes leg.distance in metres; MOTIS's spec doesn't
-        # surface it prominently — confirm the field name against a live
-        # response and adjust if the key turns out to be e.g. `distanceMeters`.
-        "distance_meters": float(leg.get("distance") or 0.0),
+        # MOTIS doesn't expose a leg distance field. Recorded as 0.0 to keep
+        # the canonical shape stable; consumers that need distance can
+        # derive it from `legGeometry` on _raw_itinerary.
+        "distance_meters": 0.0,
         "from_name": f.get("name"),
-        "from_lat": f.get("latitude"),
-        "from_lon": f.get("longitude"),
-        "from_stop_id": f.get("stopId"),
+        "from_lat": f.get("lat"),
+        "from_lon": f.get("lon"),
+        "from_stop_id": from_stop_id,
         "to_name": t.get("name"),
-        "to_lat": t.get("latitude"),
-        "to_lon": t.get("longitude"),
-        "to_stop_id": t.get("stopId"),
-        # `routeShortName` is a top-level on the leg in MOTIS (mirrors GTFS
-        # `route_short_name`); fall back to `route.shortName` if present.
-        "route_short_name": leg.get("routeShortName") or route.get("shortName"),
-        "route_long_name": route.get("longName"),
-        # Spike note: MOTIS doesn't surface `route_id` as a stable field by
-        # default — it may live under `route.id` or be implicit in `tripId`.
-        # Leave None for now and confirm against a captured live response.
-        "route_id": route.get("id"),
-        "agency_name": agency.get("name"),
-        "agency_id": agency.get("id"),
-        "agency_url": agency.get("url"),
-        # MOTIS doesn't carry a `feed_id` per leg; in OTP we derive it from the
-        # `<feedId>:<localId>` shape of tripId. MOTIS's tripId may be plain
-        # GTFS — leave None until confirmed.
-        "feed_id": None,
+        "to_lat": t.get("lat"),
+        "to_lon": t.get("lon"),
+        "to_stop_id": to_stop_id,
+        "route_short_name": leg.get("routeShortName"),
+        "route_long_name": leg.get("routeLongName"),
+        "route_id": leg.get("routeId"),
+        "agency_name": leg.get("agencyName"),
+        "agency_id": leg.get("agencyId"),
+        "agency_url": leg.get("agencyUrl"),
+        # Both stops should share a feed id (transit legs don't cross feeds);
+        # prefer the origin's so the value is stable when MOTIS adds the
+        # trailing-stop entry to multi-stop intermediate hops.
+        "feed_id": _feed_id_from_motis_id(from_stop_id),
         "trip_id": leg.get("tripId"),
         "trip_headsign": leg.get("headsign"),
     }
