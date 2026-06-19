@@ -149,15 +149,21 @@ def test_run_build_motis_invokes_config_then_import(
 
     def _fake_run(cmd, **_kwargs):
         seen_cmds.append(list(cmd))
-        # Resolve the staging dir from the `-v <host>:/data` mount the
-        # caller passed — used by BOTH the config step (writes config.yml
-        # with a tiles block) and the import step (writes tt.bin).
+        # The worker mkdir's the staging dir against its own /data/graphs
+        # mount before invoking docker run; the new container then reaches
+        # the same dir via the `viator_graphs` named volume. In the test,
+        # the host equivalent of the worker's `staging` Path is where the
+        # fake subprocess should drop its artifacts.
         staging: Path | None = None
         for i, arg in enumerate(cmd):
-            if arg == "-v" and i + 1 < len(cmd):
-                host_path = cmd[i + 1].split(":", 1)[0]
-                if host_path.startswith(str(graphs)):
-                    staging = Path(host_path)
+            if arg == "-w" and i + 1 < len(cmd):
+                # Working dir inside the container looks like
+                # /graphs/motis/<sid>/<timestamp>; map to the worker's
+                # local path under the test's graphs tmp_path.
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                candidate = graphs / rel
+                if candidate.exists():
+                    staging = candidate
                     break
         if staging is None:
             return _FakeProc()
@@ -166,7 +172,7 @@ def test_run_build_motis_invokes_config_then_import(
             # the in-container Lua profile. _strip_tiles_block must clean
             # it before import sees it.
             staging.joinpath("config.yml").write_text(
-                "osm: /inbox/osm/osm.pbf\n"
+                "osm: /inbox/nap-de-rail/osm/osm.pbf\n"
                 "tiles:\n"
                 "  profile: tiles-profiles/full.lua\n"
                 "  db_size: 274877906944\n"
@@ -195,14 +201,24 @@ def test_run_build_motis_invokes_config_then_import(
     # Both runs invoke the binary by absolute path (no ENTRYPOINT in the image).
     assert "/motis" in seen_cmds[0]
     assert "/motis" in seen_cmds[1]
-    # Import must pin --data /data so preprocessed output lands flat next
-    # to config.yml (without --data, MOTIS writes to /data/data/).
-    assert "--data" in seen_cmds[1]
-    assert seen_cmds[1][seen_cmds[1].index("--data") + 1] == "/data"
-    # The PBF and GTFS feed are passed to `config`, mounted under /inbox.
+    # Both runs mount by NAMED VOLUME, not by bind path. The classic DinD
+    # trap is passing a worker-local path as `-v <src>:<dst>` — the host
+    # docker daemon then resolves <src> against the host filesystem, not
+    # the worker's view. Named volumes are unambiguous.
+    for c in seen_cmds:
+        assert "viator_inbox:/inbox:ro" in c
+        assert "viator_graphs:/graphs" in c
+    # Import must pin --data <staging-dir>. The container's view of the
+    # staging dir lives under /graphs/motis/<sid>/<timestamp>.
+    import_cmd = seen_cmds[1]
+    assert "--data" in import_cmd
+    data_arg = import_cmd[import_cmd.index("--data") + 1]
+    assert data_arg.startswith(f"/graphs/motis/{sid}/")
+    # The PBF and GTFS feed are passed to `config` at their in-container
+    # paths under /inbox/<sid>/... (named-volume mount layout).
     config_cmd = seen_cmds[0]
-    assert any("/inbox/osm/osm.pbf" in a for a in config_cmd)
-    assert any("/inbox/gtfs/renfe.zip" in a for a in config_cmd)
+    assert any(f"/inbox/{sid}/osm/osm.pbf" in a for a in config_cmd)
+    assert any(f"/inbox/{sid}/gtfs/renfe.zip" in a for a in config_cmd)
     # The tiles: block MUST have been stripped from the staged config.yml
     # before import ran — its presence at import time aborts with a
     # `[VERIFY FAIL] tiles profile ... does not exist` error.
@@ -242,19 +258,17 @@ def test_run_build_motis_requires_tt_bin_for_success(
         returncode = 0
 
     def _fake_run(cmd, **_kwargs):
-        # Discover the staging dir.
+        # The container's working dir is `-w /graphs/motis/<sid>/<timestamp>`;
+        # mapping the tail to the worker-side path under graphs/.
         for i, arg in enumerate(cmd):
-            if arg == "-v" and i + 1 < len(cmd):
-                host_path = cmd[i + 1].split(":", 1)[0]
-                if host_path.startswith(str(graphs)):
-                    if "config" in cmd:
-                        # Minimal valid post-strip config.
-                        Path(host_path).joinpath("config.yml").write_text(
-                            "osm: /inbox/osm/osm.pbf\n"
-                        )
-                    # Critically: import does NOT write tt.bin (simulates the
-                    # silent-no-output failure mode).
-                    break
+            if arg == "-w" and i + 1 < len(cmd):
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                candidate = graphs / rel
+                if candidate.exists() and "config" in cmd:
+                    candidate.joinpath("config.yml").write_text(f"osm: /inbox/{sid}/osm/osm.pbf\n")
+                # Critically: import does NOT write tt.bin (simulates the
+                # silent-no-output failure mode).
+                break
         return _FakeProc()
 
     monkeypatch.setattr(worker.subprocess, "run", _fake_run)
@@ -302,14 +316,16 @@ def test_run_build_motis_surfaces_subprocess_failure_in_log(
         # Phase-0.5: the worker checks `config.yml` exists post-config so it
         # can strip the `tiles:` block before invoking import. The mock must
         # write the file when config runs, otherwise the import-failure path
-        # we're testing is never reached.
+        # we're testing is never reached. Staging is derived from the
+        # container's working dir (`-w /graphs/motis/<sid>/<timestamp>`).
         if "config" in cmd:
             for i, arg in enumerate(cmd):
-                if arg == "-v" and i + 1 < len(cmd):
-                    host_path = cmd[i + 1].split(":", 1)[0]
-                    if host_path.startswith(str(graphs)):
-                        Path(host_path).joinpath("config.yml").write_text(
-                            "osm: /inbox/osm/osm.pbf\n"
+                if arg == "-w" and i + 1 < len(cmd):
+                    _, _, rel = cmd[i + 1].partition("/graphs/")
+                    candidate = graphs / rel
+                    if candidate.exists():
+                        candidate.joinpath("config.yml").write_text(
+                            f"osm: /inbox/{sid}/osm/osm.pbf\n"
                         )
                         break
             return _OkProc()
