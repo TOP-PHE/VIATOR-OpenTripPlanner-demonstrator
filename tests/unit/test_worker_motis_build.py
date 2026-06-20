@@ -194,10 +194,20 @@ def test_run_build_motis_invokes_config_then_import(
     assert len(seen_cmds) == 2
     assert "config" in seen_cmds[0]
     assert "import" in seen_cmds[1]
-    # Both runs must pass `--user 0:0` (Phase-0.5 silent-write-failure fix).
+    # Both runs must pass `--user <uid>:<gid>` matching the WORKER's own uid
+    # (not root). v0.1.43.02 used `0:0` and then `_strip_tiles_block` crashed
+    # with PermissionError because the rewrite ran as the non-root worker
+    # against a root-owned file. Matching uids closes that loop and also
+    # means the MOTIS container can write the staging dir the worker
+    # mkdir'd (which is owned by the worker's uid via the named volume).
+    import os as _os
+
+    expected_user = f"{_os.getuid()}:{_os.getgid()}"
     for c in seen_cmds:
         assert "--user" in c
-        assert c[c.index("--user") + 1] == "0:0"
+        assert c[c.index("--user") + 1] == expected_user
+        # And we should NOT be back at the broken 0:0:
+        assert c[c.index("--user") + 1] != "0:0" or expected_user == "0:0"
     # Both runs invoke the binary by absolute path (no ENTRYPOINT in the image).
     assert "/motis" in seen_cmds[0]
     assert "/motis" in seen_cmds[1]

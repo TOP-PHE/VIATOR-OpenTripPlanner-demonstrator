@@ -1096,15 +1096,22 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         # `[VERIFY FAIL] path /inbox/osm/osm.pbf does not exist`. The fix is
         # to mount by *named volume* instead — both volume names match the
         # worker's own mount sources (`viator inspect` confirms).
-        # `--user 0:0` overrides the image's default `motis` user so the
-        # container can write to volume-owned staging dirs (Phase-0.5 spike
-        # finding — without it, motis exits 0 silently after writing nothing).
+        #
+        # `--user` matches the WORKER's uid/gid (not the image's default
+        # `motis` user, not `0:0`). The worker created the staging dir
+        # under viator_graphs, so the dir is owned by the worker's uid;
+        # MOTIS using the same uid can write to it. `0:0` (root) was an
+        # earlier fix from the Phase-0.5 spike, but it left config.yml
+        # root-owned — then `_strip_tiles_block` (running as the worker)
+        # crashed with PermissionError on its rewrite. Matching uids
+        # closes that loop.
+        worker_user = f"{os.getuid()}:{os.getgid()}"
         common_cmd = [
             "docker",
             "run",
             "--rm",
             "--user",
-            "0:0",
+            worker_user,
             "--network",
             "viator_default",
             # Inbox volume mounted read-only — config & import only read.
