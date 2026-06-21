@@ -336,13 +336,8 @@ def _validate_engine_filter(engine: str | None) -> None:
     from ..models.sessions import SessionEngine
 
     if engine is not None and engine not in {e.value for e in SessionEngine}:
-        raise HTTPException(
-            400,
-            (
-                f"Invalid engine {engine!r}. "
-                f"Must be one of {sorted(e.value for e in SessionEngine)}"
-            ),
-        )
+        valid = sorted(e.value for e in SessionEngine)
+        raise HTTPException(400, f"Invalid engine {engine!r}. Must be one of {valid}")
 
 
 def _no_serving_sessions_message(engine: str | None) -> str:
@@ -379,13 +374,8 @@ def _select_fanout_sessions(db: DbSession, engine: str | None) -> list[SessionRo
         # P2 MOTIS — declared so SonarPython S8415 is satisfied at the
         # decorator level (rule asks for OpenAPI doc on every status code
         # the handler may raise).
-        400: {"description": "Invalid engine filter value (not one of 'otp'/'motis')."},
-        409: {
-            "description": (
-                "No serving fanout-enabled sessions found — either zero sessions "
-                "are eligible at all, or the engine filter matched none."
-            )
-        },
+        400: {"description": "Invalid engine filter value."},
+        409: {"description": "No serving fanout-enabled sessions matched the query."},
     },
 )
 async def fanout(
