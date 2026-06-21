@@ -55,6 +55,11 @@ class FanoutBody(BaseModel):
     # under `ojp_reference` for side-by-side display. Off by default —
     # opt-in per search, see docs/ojp-reference-comparison-design.md.
     compare_ojp: bool = False
+    # P2 MOTIS — optional engine filter. None = no filter (default, fan out
+    # across every fanout-enabled session regardless of engine). When set,
+    # the fanout restricts to sessions whose `engine` column matches.
+    # Used by the search form's engine dropdown to compare planner outputs.
+    engine: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -322,17 +327,33 @@ async def fanout(
     user: Annotated[CurrentUser, Depends(require_logged_in)],
 ) -> dict[str, Any]:
     cfg = config_service.get_all(db)
-    sessions = (
-        db.execute(
-            select(SessionRow)
-            .where(SessionRow.state == SessionState.SERVING.value)
-            .where(SessionRow.include_in_fanout.is_(True))
+    # P2 MOTIS — optional engine filter narrows which sessions participate.
+    # Validated against the SessionEngine enum here (rather than as a
+    # Pydantic constraint) so an unknown value surfaces as a 400 with a
+    # human-readable message rather than a 422 with Pydantic's validator
+    # noise. None = no filter (legacy behaviour, fan out across all).
+    from ..models.sessions import SessionEngine
+
+    if body.engine is not None and body.engine not in {e.value for e in SessionEngine}:
+        raise HTTPException(
+            400,
+            f"Invalid engine {body.engine!r}. Must be one of {sorted(e.value for e in SessionEngine)}",
         )
-        .scalars()
-        .all()
+
+    stmt = (
+        select(SessionRow)
+        .where(SessionRow.state == SessionState.SERVING.value)
+        .where(SessionRow.include_in_fanout.is_(True))
     )
+    if body.engine is not None:
+        stmt = stmt.where(SessionRow.engine == body.engine)
+
+    sessions = db.execute(stmt).scalars().all()
     if not sessions:
-        raise HTTPException(409, "No serving sessions are enabled for fanout")
+        msg = "No serving sessions are enabled for fanout"
+        if body.engine is not None:
+            msg = f"No serving fanout-enabled sessions with engine={body.engine!r}"
+        raise HTTPException(409, msg)
 
     when_kind, when = _resolve_when(body)
     overall_start = time.monotonic()
