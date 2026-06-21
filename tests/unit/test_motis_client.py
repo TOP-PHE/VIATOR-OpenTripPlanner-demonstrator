@@ -254,7 +254,11 @@ async def test_fetch_plan_hits_motis_endpoint_with_canonical_params(monkeypatch)
     assert trips == []
 
 
-async def test_fetch_plan_prefers_stop_id_over_coords(monkeypatch):
+async def test_fetch_plan_ignores_otp_style_stop_ids_and_uses_coords(monkeypatch):
+    """Phase-1 fix (2026-06-21): OTP-style stop ids (`<provider>:<UIC>`) do
+    not match MOTIS's index format (`<gtfs_feed_id>_<localId>`), so passing
+    them produces 404 Not Found. Until we have a session-level feed_id map
+    we deliberately ignore stop_id kwargs and always use coordinates."""
     seen: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -264,19 +268,23 @@ async def test_fetch_plan_prefers_stop_id_over_coords(monkeypatch):
     _install_mock(monkeypatch, handler)
     await motis_client.fetch_plan(
         session_id="x",
-        from_lat=0.0,
-        from_lon=0.0,
-        to_lat=0.0,
-        to_lon=0.0,
+        from_lat=48.844,
+        from_lon=2.374,
+        to_lat=45.760,
+        to_lon=4.860,
         when=datetime(2026, 6, 1, 8, 0, tzinfo=UTC),
         timeout_ms=5000,
-        from_stop_id="FR:StopPlace:8768600",
-        to_stop_id="FR:StopPlace:8772319",
+        # OTP-shaped stop ids the dispatcher will inevitably pass in:
+        from_stop_id="RENFE-CERCA:7160000",
+        to_stop_id="RENFE-CERCA:7171801",
         base_url="http://localhost:8081",
     )
-    # Stop ids win over the coordinate fallback (mirrors OTP's precedence).
-    assert seen["params"]["fromPlace"] == "FR:StopPlace:8768600"
-    assert seen["params"]["toPlace"] == "FR:StopPlace:8772319"
+    # Coords win — stop_ids are accepted (signature parity) but ignored.
+    assert seen["params"]["fromPlace"] == "48.844,2.374"
+    assert seen["params"]["toPlace"] == "45.76,4.86"
+    # And NOT the OTP-form ids, which MOTIS would 404 on.
+    assert seen["params"]["fromPlace"] != "RENFE-CERCA:7160000"
+    assert seen["params"]["toPlace"] != "RENFE-CERCA:7171801"
 
 
 async def test_fetch_plan_localises_naive_when_with_session_timezone(monkeypatch):
