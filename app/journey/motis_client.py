@@ -88,11 +88,29 @@ async def fetch_plan(
     `'error'`, same contract as OTP).
     """
     url = f"{_base_url_for(session_id, base_url)}/api/v6/plan"
-    # MOTIS accepts a stop id in the same slot as the coord ("lat,lon" or a
-    # stop id), so when the caller hands us one we prefer it — same precedence
-    # the federated planner relies on for OTP's stop-id-first attempt.
-    from_place = from_stop_id or f"{from_lat},{from_lon}"
-    to_place = to_stop_id or f"{to_lat},{to_lon}"
+    # MOTIS's `fromPlace`/`toPlace` accept either a coord string or a stop id,
+    # BUT the stop id has to match MOTIS's own index format
+    # (`<gtfs_feed_id>_<localId>`, e.g. `renfe_60000`) — NOT OTP's
+    # `<provider_id>:<UIC>` (e.g. `RENFE-CERCA:7160000`). VIATOR's
+    # `_stop_id_for` builds the OTP form because every existing session uses
+    # OTP; passing it through to MOTIS produced `404 Not Found` for every
+    # query (surfaced 2026-06-21 on sp-rail-motis).
+    #
+    # Since we can't reliably translate OTP-style ids → MOTIS-style ids at
+    # call time (the GTFS `feed_id` MOTIS uses is determined at import time
+    # and may not match the provider's session config id at all), we
+    # *ignore* the stop-id kwargs and always use coordinates. MOTIS does a
+    # short geo-walk from the coord to the nearest transit stop, which the
+    # Phase-0.5 spike confirmed produces clean Madrid Atocha → Barcelona
+    # Sants AVE itineraries.
+    #
+    # A Phase-2 follow-up could add a session-level feed_id map so we CAN
+    # pass MOTIS-shaped stop ids when the caller knows them; for now
+    # `from_stop_id` / `to_stop_id` are accepted for signature parity with
+    # `otp_client.fetch_plan` but deliberately unused.
+    _ = from_stop_id, to_stop_id  # signature-parity; see comment above
+    from_place = f"{from_lat},{from_lon}"
+    to_place = f"{to_lat},{to_lon}"
     # Localise a naive `when` against the session's configured timezone, same
     # pre-processing the OTP path does in `_earliest_departure`. MOTIS accepts
     # any ISO-8601 instant, but a naive string is ambiguous on the wire — so
