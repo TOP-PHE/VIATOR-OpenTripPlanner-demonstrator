@@ -41,6 +41,16 @@ COMPARISON_HELPERS = [
     # rule — if any of these is undefined, the toggle silently breaks.
     "_trainOnlySignature",
     "_railOnlyDurationSec",
+    # Sonar refactor: cognitive-complexity split of renderComparisonGrid
+    # into pure helpers (S3776). Each one is named here so a future
+    # refactor that inlines them back into a monolithic function will
+    # at least notice the test breaking.
+    "_usableTrips",
+    "_pairKey",
+    "_assignBestToBucket",
+    "_bucketsForGrid",
+    "_cellForBucket",
+    "_renderToggleControls",
 ]
 
 

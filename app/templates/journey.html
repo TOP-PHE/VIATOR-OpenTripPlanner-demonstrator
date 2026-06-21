@@ -703,80 +703,93 @@ function _renderComparisonCell(trip, engine, tripIndex) {
   </div>`;
 }
 
-function renderComparisonGrid(payload) {
-  const engineMap = _engineForSession(payload);
-  // Each trip is pre-tagged with which engines found it. Filter out
-  // trips that participated under no recognised engine (defensive —
-  // shouldn't happen in practice but defends against by_session having
-  // sids not in executions).
-  const usable = payload.trips
-    .map((t, originalIndex) => {
-      const engines = _enginesForTrip(t, engineMap);
-      return { t, originalIndex, engines };
-    })
-    .filter(({ engines }) => engines.has('otp') || engines.has('motis'));
+// P2 MOTIS — comparison-grid helpers. Each one is pure (no DOM, no
+// global state read except `_COMPARE_TRAINS_ONLY`), so they're trivial
+// to reason about in isolation and keep `renderComparisonGrid` under
+// SonarJS's S3776 cognitive-complexity limit (15).
 
+function _usableTrips(payload, engineMap) {
+  return payload.trips
+    .map((t, originalIndex) => ({
+      t,
+      originalIndex,
+      engines: _enginesForTrip(t, engineMap),
+    }))
+    .filter(({ engines }) => engines.has('otp') || engines.has('motis'));
+}
+
+function _pairKey(trip) {
   // The toggle's whole job is to change the pairing key. OFF (default):
   // each trip is its own row, pairing happens only when the server-side
   // `transit_fingerprint` matched both engines into the same `by_session`
-  // entry — so an OTP trip and a MOTIS trip with different walks always
-  // show as separate rows. ON: we re-pair on the client by a rail-only
-  // signature (no WALK legs, no seconds, coords rounded to ~11m). Same
-  // train → same row, even when access/egress walks differ.
+  // entry. ON: we re-pair on the client by a rail-only signature so the
+  // same train collapses into one row even when walks differ.
+  return _COMPARE_TRAINS_ONLY ? _trainOnlySignature(trip) : trip.signature;
+}
+
+function _assignBestToBucket(bucket, engine, item) {
+  // Within a pair-key bucket, the same engine could appear from two
+  // sessions (e.g. nap-fr-rail + nap-eu-corridors both found the
+  // train); pick whichever has the shorter best-trip duration as the
+  // representative — matches what _renderComparisonCell does anyway.
+  const slot = engine === 'otp' ? 'otpItem' : 'motisItem';
+  const prev = bucket[slot];
+  if (!prev || item.t.best.duration_seconds < prev.t.best.duration_seconds) {
+    bucket[slot] = item;
+  }
+}
+
+function _bucketsForGrid(usable) {
   const grouped = new Map();  // pairKey → {otpItem?, motisItem?, sortKey}
   for (const item of usable) {
-    const pairKey = _COMPARE_TRAINS_ONLY ? _trainOnlySignature(item.t) : item.t.signature;
-    let bucket = grouped.get(pairKey);
+    const key = _pairKey(item.t);
+    let bucket = grouped.get(key);
     if (!bucket) {
       bucket = { otpItem: null, motisItem: null, sortKey: String(item.t.best.departure_at) };
-      grouped.set(pairKey, bucket);
+      grouped.set(key, bucket);
     }
-    // Within a pair-key bucket, the same engine could appear from two
-    // sessions (e.g. nap-fr-rail + nap-eu-corridors both found the
-    // train); pick whichever has the shorter best-trip duration as the
-    // representative — matches what _renderComparisonCell does anyway.
-    for (const engine of ['otp', 'motis']) {
-      if (!item.engines.has(engine)) continue;
-      const slot = engine === 'otp' ? 'otpItem' : 'motisItem';
-      const prev = bucket[slot];
-      if (!prev || (item.t.best.duration_seconds < prev.t.best.duration_seconds)) {
-        bucket[slot] = item;
-      }
-    }
-    // Track the earliest departure time across either engine for sort.
-    if (String(item.t.best.departure_at) < bucket.sortKey) {
-      bucket.sortKey = String(item.t.best.departure_at);
-    }
+    if (item.engines.has('otp')) _assignBestToBucket(bucket, 'otp', item);
+    if (item.engines.has('motis')) _assignBestToBucket(bucket, 'motis', item);
+    // Track earliest departure across either engine for the sort.
+    const dep = String(item.t.best.departure_at);
+    if (dep < bucket.sortKey) bucket.sortKey = dep;
   }
+  return Array.from(grouped.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+}
 
-  // Chronological by best departure — easier to scan than by-signature.
-  const buckets = Array.from(grouped.values()).sort((a, b) =>
-    a.sortKey.localeCompare(b.sortKey)
-  );
-  const cells = buckets.flatMap((b) => [
-    b.otpItem
-      ? _renderComparisonCell(b.otpItem.t, 'otp', b.otpItem.originalIndex)
-      : `<div class="compare-cell missing">— not found by OTP</div>`,
-    b.motisItem
-      ? _renderComparisonCell(b.motisItem.t, 'motis', b.motisItem.originalIndex)
-      : `<div class="compare-cell missing">— not found by MOTIS</div>`,
-  ]);
-  if (!cells.length) return '';
+function _cellForBucket(bucketItem, engine) {
+  if (bucketItem) {
+    return _renderComparisonCell(bucketItem.t, engine, bucketItem.originalIndex);
+  }
+  return `<div class="compare-cell missing">— not found by ${engine.toUpperCase()}</div>`;
+}
 
+function _renderToggleControls() {
   // Toggle lives at the top of the grid — operator can flip without
   // re-firing the search. `_COMPARE_TRAINS_ONLY` is the source of
   // truth; the change handler at the bottom of `render()` flips it
   // and calls render(_LAST_PAYLOAD) to rebuild.
-  const toggleChecked = _COMPARE_TRAINS_ONLY ? 'checked' : '';
-  const toggleHint = _COMPARE_TRAINS_ONLY
+  const checked = _COMPARE_TRAINS_ONLY ? 'checked' : '';
+  const hint = _COMPARE_TRAINS_ONLY
     ? 'pairing by rail-only signature (walks ignored)'
     : 'pairing by full-trip signature (today\'s default)';
   return `<div class="compare-controls">
     <label class="compare-toggle">
-      <input type="checkbox" id="compare-trains-only" ${toggleChecked}>
-      Compare trains only <span class="hint">— ${toggleHint}</span>
+      <input type="checkbox" id="compare-trains-only" ${checked}>
+      Compare trains only <span class="hint">— ${hint}</span>
     </label>
-  </div>
+  </div>`;
+}
+
+function renderComparisonGrid(payload) {
+  const usable = _usableTrips(payload, _engineForSession(payload));
+  const buckets = _bucketsForGrid(usable);
+  const cells = buckets.flatMap((b) => [
+    _cellForBucket(b.otpItem, 'otp'),
+    _cellForBucket(b.motisItem, 'motis'),
+  ]);
+  if (!cells.length) return '';
+  return `${_renderToggleControls()}
   <div class="compare-grid">
     <div class="compare-header"><span class="engine-pill">OTP</span> sessions</div>
     <div class="compare-header"><span class="engine-pill motis">MOTIS</span> sessions</div>
