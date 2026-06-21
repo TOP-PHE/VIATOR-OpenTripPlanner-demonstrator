@@ -102,6 +102,13 @@
 .compare-grid > .compare-header .engine-pill.motis { background: var(--brand-blue); }
 .compare-grid .compare-cell { min-height: 4.6rem; }
 .compare-grid .compare-cell .trip-card { margin-bottom: 0; }
+/* P2 MOTIS — "Compare trains only" toggle, rendered just above the grid
+   when both engines are present. Single checkbox + hint; flipping it
+   re-runs the client-side pairing (no fetch). */
+.compare-controls { margin: 0.4rem 0 0.2rem; padding: 0.4rem 0.6rem; background: #f6f8fa; border-left: 3px solid var(--brand-blue); border-radius: 3px; font-size: 0.9rem; }
+.compare-toggle { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none; }
+.compare-toggle input { width: auto; margin: 0; }
+.compare-toggle .hint { color: var(--rail-steel); font-weight: normal; }
 .compare-grid .compare-cell.missing { background: #f8f9fa; border: 1px dashed var(--sleeper); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--rail-steel); font-size: 0.85rem; font-style: italic; padding: 0.6rem; }
 .compare-grid .compare-cell.present { position: relative; }
 .compare-grid .compare-cell.present::before { content: "✓"; position: absolute; top: -0.4rem; right: -0.4rem; width: 1.2rem; height: 1.2rem; border-radius: 50%; background: #22863a; color: white; font-size: 0.75rem; display: flex; align-items: center; justify-content: center; font-weight: 700; z-index: 1; }
@@ -597,6 +604,50 @@ function _enginesForTrip(trip, engineMap) {
   return present;
 }
 
+// P2 MOTIS — "Compare trains only" toggle state. When ON, the comparison
+// grid pairs rows by a fingerprint that ignores WALK legs so same-train
+// trips collapse into one row regardless of access/egress walk-time
+// differences (a real-world finding: OTP and MOTIS often disagree on
+// the walking-routing distance from origin coord to the station and
+// from the destination station to dest coord — they're using different
+// OSM walking profiles. The TRAIN portion is identical and that's the
+// useful comparison). Default OFF preserves the existing per-trip-
+// signature pairing.
+let _COMPARE_TRAINS_ONLY = false;
+
+function _trainOnlySignature(trip) {
+  // Stable, deterministic key built from the rail-only legs. Departure +
+  // arrival times are pinned to the minute (no seconds) because OTP and
+  // MOTIS sometimes differ by a few seconds even on the same trip.
+  // stopId differences between engines (OTP's `feed:UIC` vs MOTIS's
+  // `feed_local`) make stop-id-based keys brittle, so we use lat/lon
+  // rounded to ~11 m (4 decimal places) instead.
+  const legs = (trip.best && trip.best.legs) || [];
+  const parts = [];
+  for (const lg of legs) {
+    if (!lg || lg.mode === 'WALK') continue;
+    const dep = String(lg.departure || '').slice(0, 16);  // YYYY-MM-DDTHH:MM
+    const arr = String(lg.arrival || '').slice(0, 16);
+    const flat = Number(lg.from_lat || 0).toFixed(4);
+    const flon = Number(lg.from_lon || 0).toFixed(4);
+    const tlat = Number(lg.to_lat || 0).toFixed(4);
+    const tlon = Number(lg.to_lon || 0).toFixed(4);
+    parts.push(`${lg.mode || '?'}|${flat},${flon}@${dep}|${tlat},${tlon}@${arr}`);
+  }
+  return parts.join('||');
+}
+
+function _railOnlyDurationSec(legs) {
+  // Sum of non-WALK leg durations. Used when the toggle is ON to
+  // display "X rail" alongside or instead of the total trip duration.
+  let total = 0;
+  for (const lg of (legs || [])) {
+    if (!lg || lg.mode === 'WALK') continue;
+    total += Number(lg.duration_seconds || 0);
+  }
+  return total;
+}
+
 function _renderComparisonCell(trip, engine, tripIndex) {
   // Pick the per-session row for this engine — when multiple sessions of
   // the same engine found the trip, pick the one with the shortest
@@ -618,6 +669,14 @@ function _renderComparisonCell(trip, engine, tripIndex) {
     return `<div class="compare-cell missing">— not found by ${engine.toUpperCase()}</div>`;
   }
   const legCount = (trip.best.legs || []).length;
+  // When the "Compare trains only" toggle is ON, show "rail-only" time
+  // alongside the total so the operator can see at a glance that the
+  // engines agree on the train portion (3h 48m) and only differ on the
+  // walks (which produce the ±N min gap in the total).
+  const railSec = _railOnlyDurationSec(trip.best.legs);
+  const durBlock = _COMPARE_TRAINS_ONLY
+    ? `<span style="color: var(--rail-steel)"> · ${dur(railSec)} rail · ${dur(bestRow.duration_seconds)} total</span>`
+    : `<span style="color: var(--rail-steel)"> · ${dur(bestRow.duration_seconds)}</span>`;
   // Cards in the grid use the same trip-card class so the click-to-
   // expand wiring at the bottom of render() catches them for free.
   return `<div class="compare-cell present">
@@ -625,7 +684,7 @@ function _renderComparisonCell(trip, engine, tripIndex) {
       <div class="top">
         <div>
           <strong>${fmt(bestRow.departure_at)} → ${fmt(bestRow.arrival_at)}</strong>
-          <span style="color: var(--rail-steel)"> · ${dur(bestRow.duration_seconds)}</span>
+          ${durBlock}
         </div>
         <div class="top-actions">
           <button type="button" class="json-btn" data-action="show-json"
@@ -646,23 +705,79 @@ function _renderComparisonCell(trip, engine, tripIndex) {
 
 function renderComparisonGrid(payload) {
   const engineMap = _engineForSession(payload);
-  // Sort by best departure_at across all sessions so the columns align
-  // chronologically — easier to scan than the by-signature order.
-  const rows = payload.trips
-    .map((t, originalIndex) => ({ t, originalIndex }))
-    .sort((a, b) => String(a.t.best.departure_at).localeCompare(String(b.t.best.departure_at)));
-  const cells = rows.flatMap(({ t, originalIndex }) => {
-    const engines = _enginesForTrip(t, engineMap);
-    // Skip trips that participated under no engine — defensive; would
-    // mean we have a trip in `by_session` with sids not in `executions`.
-    if (!engines.has('otp') && !engines.has('motis')) return [];
-    return [
-      _renderComparisonCell(t, 'otp', originalIndex),
-      _renderComparisonCell(t, 'motis', originalIndex),
-    ];
-  });
+  // Each trip is pre-tagged with which engines found it. Filter out
+  // trips that participated under no recognised engine (defensive —
+  // shouldn't happen in practice but defends against by_session having
+  // sids not in executions).
+  const usable = payload.trips
+    .map((t, originalIndex) => {
+      const engines = _enginesForTrip(t, engineMap);
+      return { t, originalIndex, engines };
+    })
+    .filter(({ engines }) => engines.has('otp') || engines.has('motis'));
+
+  // The toggle's whole job is to change the pairing key. OFF (default):
+  // each trip is its own row, pairing happens only when the server-side
+  // `transit_fingerprint` matched both engines into the same `by_session`
+  // entry — so an OTP trip and a MOTIS trip with different walks always
+  // show as separate rows. ON: we re-pair on the client by a rail-only
+  // signature (no WALK legs, no seconds, coords rounded to ~11m). Same
+  // train → same row, even when access/egress walks differ.
+  const grouped = new Map();  // pairKey → {otpItem?, motisItem?, sortKey}
+  for (const item of usable) {
+    const pairKey = _COMPARE_TRAINS_ONLY ? _trainOnlySignature(item.t) : item.t.signature;
+    let bucket = grouped.get(pairKey);
+    if (!bucket) {
+      bucket = { otpItem: null, motisItem: null, sortKey: String(item.t.best.departure_at) };
+      grouped.set(pairKey, bucket);
+    }
+    // Within a pair-key bucket, the same engine could appear from two
+    // sessions (e.g. nap-fr-rail + nap-eu-corridors both found the
+    // train); pick whichever has the shorter best-trip duration as the
+    // representative — matches what _renderComparisonCell does anyway.
+    for (const engine of ['otp', 'motis']) {
+      if (!item.engines.has(engine)) continue;
+      const slot = engine === 'otp' ? 'otpItem' : 'motisItem';
+      const prev = bucket[slot];
+      if (!prev || (item.t.best.duration_seconds < prev.t.best.duration_seconds)) {
+        bucket[slot] = item;
+      }
+    }
+    // Track the earliest departure time across either engine for sort.
+    if (String(item.t.best.departure_at) < bucket.sortKey) {
+      bucket.sortKey = String(item.t.best.departure_at);
+    }
+  }
+
+  // Chronological by best departure — easier to scan than by-signature.
+  const buckets = Array.from(grouped.values()).sort((a, b) =>
+    a.sortKey.localeCompare(b.sortKey)
+  );
+  const cells = buckets.flatMap((b) => [
+    b.otpItem
+      ? _renderComparisonCell(b.otpItem.t, 'otp', b.otpItem.originalIndex)
+      : `<div class="compare-cell missing">— not found by OTP</div>`,
+    b.motisItem
+      ? _renderComparisonCell(b.motisItem.t, 'motis', b.motisItem.originalIndex)
+      : `<div class="compare-cell missing">— not found by MOTIS</div>`,
+  ]);
   if (!cells.length) return '';
-  return `<div class="compare-grid">
+
+  // Toggle lives at the top of the grid — operator can flip without
+  // re-firing the search. `_COMPARE_TRAINS_ONLY` is the source of
+  // truth; the change handler at the bottom of `render()` flips it
+  // and calls render(_LAST_PAYLOAD) to rebuild.
+  const toggleChecked = _COMPARE_TRAINS_ONLY ? 'checked' : '';
+  const toggleHint = _COMPARE_TRAINS_ONLY
+    ? 'pairing by rail-only signature (walks ignored)'
+    : 'pairing by full-trip signature (today\'s default)';
+  return `<div class="compare-controls">
+    <label class="compare-toggle">
+      <input type="checkbox" id="compare-trains-only" ${toggleChecked}>
+      Compare trains only <span class="hint">— ${toggleHint}</span>
+    </label>
+  </div>
+  <div class="compare-grid">
     <div class="compare-header"><span class="engine-pill">OTP</span> sessions</div>
     <div class="compare-header"><span class="engine-pill motis">MOTIS</span> sessions</div>
     ${cells.join('')}
@@ -785,6 +900,18 @@ function render(payload) {
       showOjpJsonInspector(idx);
     });
   });
+  // P2 MOTIS — wire the "Compare trains only" toggle. Only present when
+  // the comparison grid is rendered; flipping it re-runs the client-side
+  // pairing (no fetch). Stays at this level — getElementById walks the
+  // whole document so it catches the checkbox whether it lives inside
+  // `el` or moved to a sibling later.
+  const cmpToggle = document.getElementById('compare-trains-only');
+  if (cmpToggle) {
+    cmpToggle.addEventListener('change', () => {
+      _COMPARE_TRAINS_ONLY = !!cmpToggle.checked;
+      if (_LAST_PAYLOAD) render(_LAST_PAYLOAD);
+    });
+  }
 }
 
 // v0.1.26 — open the JSON inspector modal for a specific trip.
