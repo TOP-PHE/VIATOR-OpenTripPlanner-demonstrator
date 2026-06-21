@@ -87,10 +87,14 @@ _OBSERVABILITY_SERVICES: tuple[str, ...] = (
 _MAXMEM_MARKER = Path("/data/generated/.max-mem-stopped")
 
 
-def _max_memory_stop_targets(serving_sids: list[str]) -> list[str]:
+def _max_memory_stop_targets(serving_services: list[str]) -> list[str]:
     """Compose service names to stop for a max-memory rebuild: every serving
-    OTP session plus the observability stack. Pure — unit-tested."""
-    return [f"otp-{sid}" for sid in serving_sids] + list(_OBSERVABILITY_SERVICES)
+    session's per-engine service plus the observability stack. Caller passes
+    in the already-resolved service names (via `_serving_session_services`),
+    so MOTIS sessions resolve as `motis-<sid>` and OTP as `otp-<sid>` —
+    pre-Phase-1 this helper hard-coded the `otp-` prefix.
+    Pure — unit-tested."""
+    return list(serving_services) + list(_OBSERVABILITY_SERVICES)
 
 
 def _compose(*args: str) -> subprocess.CompletedProcess[str]:
@@ -364,6 +368,28 @@ def _list_serving_sessions() -> list[str]:
         return [r.id for r in rows]
 
 
+def _service_name_for(session: SessionRow) -> str:
+    """Per-session compose service name, engine-aware.
+
+    Matches the per-engine templates emitted by `app/sessions_orchestrator.py`:
+    OTP sessions render as `otp-<sid>`, MOTIS sessions as `motis-<sid>`.
+    Pre-Phase-1, every serve container was OTP so the prefix was hard-coded
+    everywhere that targeted serving sessions by name. Now the engine
+    column drives the choice."""
+    engine = getattr(session, "engine", "otp") or "otp"
+    return f"{engine}-{session.id}"
+
+
+def _serving_session_services() -> list[str]:
+    """Per-session compose service names for every session currently in
+    'serving' state, engine-aware. Used by the reload-trigger handler and
+    the max-memory rebuild stop list — both of which previously assumed
+    every serving session was OTP."""
+    with SessionLocal() as db:
+        rows = db.query(SessionRow).filter(SessionRow.state == SessionState.SERVING.value).all()
+        return [_service_name_for(r) for r in rows]
+
+
 def _parse_otp_service_names(ps_output: str) -> set[str]:
     """Extract per-session OTP compose service names from `docker ps` output.
 
@@ -478,15 +504,16 @@ def handle_reload_trigger() -> None:
         return
     log.info("reload trigger seen at %s; applying compose + nginx reload", _RELOAD_TRIGGER)
 
-    # Find which per-session OTP services we need to bring up. Targeting the
+    # Find which per-session services we need to bring up. Engine-aware:
+    # OTP sessions resolve as `otp-<sid>`, MOTIS as `motis-<sid>` — matching
+    # the per-engine templates in app/sessions_orchestrator.py. Targeting
     # specific service names keeps a broken include from triggering rebuilds
     # of long-running services (web, nginx, postgres) on every retry.
-    serving_sids = _list_serving_sessions()
-    if not serving_sids:
+    serving_services = _serving_session_services()
+    if not serving_services:
         log.info("reload trigger seen but no sessions in serving state; skipping compose up")
     else:
-        otp_services = [f"otp-{sid}" for sid in serving_sids]
-        # docker compose up -d --no-deps <otp-services>:
+        # docker compose up -d --no-deps <services>:
         # --no-deps prevents touching web/nginx/postgres even if the
         #   generated fragment somehow references them
         # explicit service names: only these services are created/updated
@@ -500,7 +527,7 @@ def handle_reload_trigger() -> None:
             "up",
             "-d",
             "--no-deps",
-            *otp_services,
+            *serving_services,
         ]
         up = subprocess.run(  # noqa: S603
             up_cmd,
@@ -512,7 +539,7 @@ def handle_reload_trigger() -> None:
         if up.returncode != 0:
             log.error(
                 "compose up -d for %s failed (exit %s):\nstdout: %s\nstderr: %s",
-                otp_services,
+                serving_services,
                 up.returncode,
                 up.stdout,
                 up.stderr,
@@ -534,7 +561,14 @@ def handle_reload_trigger() -> None:
     # containers from deleted sessions were lingering 21-25 hours after
     # the deploy that stopped them. Use `ps -a` so stopped containers
     # also count as orphans.
-    expected_otp_services = {f"otp-{sid}" for sid in serving_sids}
+    #
+    # Phase-1 (v0.1.43.04): this block stays OTP-only by design — the
+    # `docker ps` filter below is `name=^viator-otp-`, and `motis-` services
+    # would need their own pass. Filter the serving service names down to
+    # the otp- prefix before computing what's "expected", so a MOTIS service
+    # name doesn't accidentally inflate the OTP expected set and a removed
+    # OTP session escapes orphan detection.
+    expected_otp_services = {s for s in serving_services if s.startswith("otp-")}
     ps = subprocess.run(  # noqa: S603
         [_DOCKER, "ps", "-a", "--format", "{{.Names}}", "--filter", "name=^viator-otp-"],
         capture_output=True,
@@ -843,7 +877,7 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
                 "small to auto-size — keeping configured heap %s",
                 otp_heap_value,
             )
-        stopped_services = _max_memory_stop_targets(_list_serving_sessions())
+        stopped_services = _max_memory_stop_targets(_serving_session_services())
         try:
             _MAXMEM_MARKER.parent.mkdir(parents=True, exist_ok=True)
             _MAXMEM_MARKER.write_text("\n".join(stopped_services), encoding="utf-8")
@@ -1078,7 +1112,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         # service names (one per line) so a worker crash mid-build lets the
         # next start-up revive what got stopped. A bare timestamp would
         # leave the recovery path with nothing to restart.
-        stopped_services = _max_memory_stop_targets(_list_serving_sessions())
+        stopped_services = _max_memory_stop_targets(_serving_session_services())
         try:
             _MAXMEM_MARKER.parent.mkdir(parents=True, exist_ok=True)
             _MAXMEM_MARKER.write_text("\n".join(stopped_services), encoding="utf-8")
