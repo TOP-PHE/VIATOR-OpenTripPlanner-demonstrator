@@ -37,6 +37,20 @@ COMPARISON_HELPERS = [
     "_enginesForTrip",
     "_renderComparisonCell",
     "renderComparisonGrid",
+    # P2 follow-up: "Compare trains only" toggle helpers. Same trip-wire
+    # rule — if any of these is undefined, the toggle silently breaks.
+    "_trainOnlySignature",
+    "_railOnlyDurationSec",
+    # Sonar refactor: cognitive-complexity split of renderComparisonGrid
+    # into pure helpers (S3776). Each one is named here so a future
+    # refactor that inlines them back into a monolithic function will
+    # at least notice the test breaking.
+    "_usableTrips",
+    "_pairKey",
+    "_assignBestToBucket",
+    "_bucketsForGrid",
+    "_cellForBucket",
+    "_renderToggleControls",
 ]
 
 
@@ -84,3 +98,23 @@ def test_engine_dropdown_is_present_in_form(template_text: str):
     assert 'id="engine"' in template_text
     # And the JS payload-builder reads it:
     assert "document.getElementById('engine')" in template_text
+
+
+def test_compare_trains_only_toggle_is_wired(template_text: str):
+    """The 'Compare trains only' toggle and its state variable must
+    both exist, and the change handler must call render() so the grid
+    rebuilds on flip without a fresh fetch."""
+    # State variable that the cell + grid helpers read:
+    assert "_COMPARE_TRAINS_ONLY" in template_text
+    # Toggle HTML id (rendered inside the comparison grid):
+    assert 'id="compare-trains-only"' in template_text
+    # The change handler must flip the state AND re-render:
+    assert "document.getElementById('compare-trains-only')" in template_text
+    assert "render(_LAST_PAYLOAD)" in template_text
+
+
+def test_compare_controls_css_present(template_text: str):
+    """The toggle's container styling must be defined — without it the
+    checkbox renders as a bare unstyled input inside the results pane."""
+    for css_class in (".compare-controls", ".compare-toggle"):
+        assert css_class in template_text, f"Missing CSS rule for {css_class}"
