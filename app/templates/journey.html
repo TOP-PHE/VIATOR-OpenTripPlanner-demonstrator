@@ -137,6 +137,18 @@
     <label>Depart</label>
     <input type="datetime-local" id="depart" name="depart">
 
+    {# P2 MOTIS — engine filter. Default "All engines" preserves the legacy
+       fan-out-everywhere behaviour. Picking OTP or MOTIS restricts the
+       fanout to sessions whose `engine` column matches; useful for
+       isolating one planner's output or running a planner-to-planner
+       comparison on the same query. #}
+    <label for="engine">Engine</label>
+    <select id="engine" name="engine">
+      <option value="">All engines</option>
+      <option value="otp">OTP only</option>
+      <option value="motis">MOTIS only</option>
+    </select>
+
     {# v0.1.35 — only rendered when OJP comparison is enabled AND a token
        is configured (journey_page passes ojp_comparison_enabled). #}
     {% if ojp_comparison_enabled %}
@@ -278,6 +290,11 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
   // search falls through to coordinate routing.
   const fUic = document.getElementById('from-uic').value || null;
   const tUic = document.getElementById('to-uic').value || null;
+  // P2 MOTIS — engine filter from the dropdown. Empty string = "All engines"
+  // → omit the field entirely so the server falls through to its legacy
+  // no-filter path (any value, even null, would skip the filter, but
+  // omitting keeps the wire format clean for tcpdump/log readers).
+  const engineSel = document.getElementById('engine')?.value;
   const body = {
     from: { lat: fLat, lon: fLon, label: document.getElementById('from-name').value, uic: fUic },
     to:   { lat: tLat, lon: tLon, label: document.getElementById('to-name').value, uic: tUic },
@@ -287,6 +304,7 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
     // `?.` → undefined → false when it's not rendered. The server also
     // gates on its own config, so a stale `true` here is harmless.
     compare_ojp: !!document.getElementById('compare-ojp')?.checked,
+    ...(engineSel ? { engine: engineSel } : {}),
   };
   const btn = document.getElementById('go-btn');
   btn.disabled = true; btn.textContent = 'Searching…';

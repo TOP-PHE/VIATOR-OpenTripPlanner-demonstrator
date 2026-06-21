@@ -55,6 +55,11 @@ class FanoutBody(BaseModel):
     # under `ojp_reference` for side-by-side display. Off by default —
     # opt-in per search, see docs/ojp-reference-comparison-design.md.
     compare_ojp: bool = False
+    # P2 MOTIS — optional engine filter. None = no filter (default, fan out
+    # across every fanout-enabled session regardless of engine). When set,
+    # the fanout restricts to sessions whose `engine` column matches.
+    # Used by the search form's engine dropdown to compare planner outputs.
+    engine: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -311,10 +316,68 @@ def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
     return "SUBSET"
 
 
+# ────────────────────── P2 MOTIS — engine filter helpers ──────────────────────
+#
+# Extracted as pure helpers (rather than inline in the route) so they're
+# unit-testable without spinning up the full FastAPI + Postgres + auth
+# stack. The actual SQL execution stays in the route — the helpers cover
+# the validation and SQL-builder shape, which is where Phase-2 review focus
+# lives.
+
+
+def _validate_engine_filter(engine: str | None) -> None:
+    """Raise HTTPException(400) when `engine` is set but not a known
+    SessionEngine value. None = no filter (legacy behaviour) — never raises.
+
+    Validated here (rather than as a Pydantic constraint) so unknown values
+    surface as a 400 with a human-readable message rather than as a 422
+    with Pydantic's validator-noise envelope.
+    """
+    from ..models.sessions import SessionEngine
+
+    if engine is not None and engine not in {e.value for e in SessionEngine}:
+        valid = sorted(e.value for e in SessionEngine)
+        raise HTTPException(400, f"Invalid engine {engine!r}. Must be one of {valid}")
+
+
+def _no_serving_sessions_message(engine: str | None) -> str:
+    """409 message body. Differentiates the no-sessions-at-all case from the
+    no-sessions-with-this-engine case so operators can spot which filter
+    they need to relax."""
+    if engine is None:
+        return "No serving sessions are enabled for fanout"
+    return f"No serving fanout-enabled sessions with engine={engine!r}"
+
+
+def _select_fanout_sessions(db: DbSession, engine: str | None) -> list[SessionRow]:
+    """Resolve the serving + fanout-enabled session list, optionally
+    restricted by engine. Pulled out of the route so the SQL shape is
+    obvious from one place — but kept thin (no caching, no extra joins)
+    so the route's flow stays linear."""
+    stmt = (
+        select(SessionRow)
+        .where(SessionRow.state == SessionState.SERVING.value)
+        .where(SessionRow.include_in_fanout.is_(True))
+    )
+    if engine is not None:
+        stmt = stmt.where(SessionRow.engine == engine)
+    return list(db.execute(stmt).scalars().all())
+
+
 # ────────────────────────── routes ──────────────────────────
 
 
-@router.post("/fanout", summary="Run a search across every fanout-enabled session")
+@router.post(
+    "/fanout",
+    summary="Run a search across every fanout-enabled session",
+    responses={
+        # P2 MOTIS — declared so SonarPython S8415 is satisfied at the
+        # decorator level (rule asks for OpenAPI doc on every status code
+        # the handler may raise).
+        400: {"description": "Invalid engine filter value."},
+        409: {"description": "No serving fanout-enabled sessions matched the query."},
+    },
+)
 async def fanout(
     body: FanoutBody,
     request: Request,
@@ -322,17 +385,10 @@ async def fanout(
     user: Annotated[CurrentUser, Depends(require_logged_in)],
 ) -> dict[str, Any]:
     cfg = config_service.get_all(db)
-    sessions = (
-        db.execute(
-            select(SessionRow)
-            .where(SessionRow.state == SessionState.SERVING.value)
-            .where(SessionRow.include_in_fanout.is_(True))
-        )
-        .scalars()
-        .all()
-    )
+    _validate_engine_filter(body.engine)
+    sessions = _select_fanout_sessions(db, body.engine)
     if not sessions:
-        raise HTTPException(409, "No serving sessions are enabled for fanout")
+        raise HTTPException(409, _no_serving_sessions_message(body.engine))
 
     when_kind, when = _resolve_when(body)
     overall_start = time.monotonic()
