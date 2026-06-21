@@ -462,6 +462,11 @@ async def fanout(
         executions_summary.append(
             {
                 "session_id": session.id,
+                # P2 MOTIS — engine surfaced so the journey UI can switch
+                # into the OTP-vs-MOTIS comparison view when both engines
+                # actually participated in the fanout (rather than guessing
+                # from session id naming conventions).
+                "engine": getattr(session, "engine", "otp") or "otp",
                 "graph_snapshot_id": (
                     str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None
                 ),
