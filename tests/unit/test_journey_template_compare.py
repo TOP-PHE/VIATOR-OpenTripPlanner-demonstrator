@@ -41,6 +41,11 @@ COMPARISON_HELPERS = [
     # rule — if any of these is undefined, the toggle silently breaks.
     "_trainOnlySignature",
     "_railOnlyDurationSec",
+    # P2 follow-up #2 (2026-06-21): mode normaliser. OTP says `RAIL`,
+    # MOTIS says `REGIONAL_RAIL`/`HIGHSPEED_RAIL` — same train, different
+    # GTFS route_type. The pairing key MUST collapse these together or
+    # the toggle does nothing visible.
+    "_normalizeMode",
     # Sonar refactor: cognitive-complexity split of renderComparisonGrid
     # into pure helpers (S3776). Each one is named here so a future
     # refactor that inlines them back into a monolithic function will

@@ -615,24 +615,49 @@ function _enginesForTrip(trip, engineMap) {
 // signature pairing.
 let _COMPARE_TRAINS_ONLY = false;
 
+function _normalizeMode(mode) {
+  // Engines bucket "train" differently — OTP collapses every passenger
+  // rail service into a single `RAIL`, while MOTIS surfaces GTFS
+  // route_type sub-categories (`HIGHSPEED_RAIL`, `REGIONAL_RAIL`,
+  // `LONG_DISTANCE_RAIL`, `COMMUTER_RAIL`, `RAILWAY_SERVICE`...). For
+  // train-only pairing the operator cares about "is it the same train",
+  // not "what GTFS route_type does each feed pick", so the suffix is
+  // noise. Same for the other common transit families. Anything we
+  // don't recognise (CABLE_CAR, FUNICULAR, AERIAL_LIFT, GONDOLA) passes
+  // through as-is; their categories are stable enough already.
+  const m = String(mode || '').toUpperCase();
+  if (m === 'RAIL' || m.endsWith('_RAIL')) return 'RAIL';
+  if (m === 'BUS' || m.endsWith('_BUS')) return 'BUS';
+  if (m === 'FERRY' || m.endsWith('_FERRY') || m === 'WATERWAY') return 'FERRY';
+  if (m === 'TRAM' || m.endsWith('_TRAM') || m === 'STREETCAR') return 'TRAM';
+  if (m === 'SUBWAY' || m === 'METRO' || m.endsWith('_SUBWAY')) return 'SUBWAY';
+  return m;
+}
+
 function _trainOnlySignature(trip) {
   // Stable, deterministic key built from the rail-only legs. Departure +
   // arrival times are pinned to the minute (no seconds) because OTP and
   // MOTIS sometimes differ by a few seconds even on the same trip.
   // stopId differences between engines (OTP's `feed:UIC` vs MOTIS's
   // `feed_local`) make stop-id-based keys brittle, so we use lat/lon
-  // rounded to ~11 m (4 decimal places) instead.
+  // rounded to ~110 m (3 decimal places) — tight enough to distinguish
+  // neighbouring stations but tolerant of per-feed coordinate variance
+  // (platform vs. station-centre vs. main entrance). Mode normalised via
+  // `_normalizeMode` so OTP's `RAIL` and MOTIS's `HIGHSPEED_RAIL` /
+  // `REGIONAL_RAIL` end up in the same bucket (real-world finding from
+  // sp-rail-motis, 2026-06-21).
   const legs = (trip.best && trip.best.legs) || [];
   const parts = [];
   for (const lg of legs) {
     if (!lg || lg.mode === 'WALK') continue;
+    const mode = _normalizeMode(lg.mode);
     const dep = String(lg.departure || '').slice(0, 16);  // YYYY-MM-DDTHH:MM
     const arr = String(lg.arrival || '').slice(0, 16);
-    const flat = Number(lg.from_lat || 0).toFixed(4);
-    const flon = Number(lg.from_lon || 0).toFixed(4);
-    const tlat = Number(lg.to_lat || 0).toFixed(4);
-    const tlon = Number(lg.to_lon || 0).toFixed(4);
-    parts.push(`${lg.mode || '?'}|${flat},${flon}@${dep}|${tlat},${tlon}@${arr}`);
+    const flat = Number(lg.from_lat || 0).toFixed(3);
+    const flon = Number(lg.from_lon || 0).toFixed(3);
+    const tlat = Number(lg.to_lat || 0).toFixed(3);
+    const tlon = Number(lg.to_lon || 0).toFixed(3);
+    parts.push(`${mode}|${flat},${flon}@${dep}|${tlat},${tlon}@${arr}`);
   }
   return parts.join('||');
 }
