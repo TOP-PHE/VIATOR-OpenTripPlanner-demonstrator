@@ -6,13 +6,13 @@
 # pytest-asyncio 1.x is the pytest-9-compatible line; we keep
 # `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
 # to be re-decorated with @pytest.mark.asyncio.
-pytest==9.1.0
+pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.15.17               # also our formatter — black was dropped in audit
+ruff==0.15.18               # also our formatter — black was dropped in audit
                             # #21 closure (drop-in replacement, eliminates
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
@@ -31,4 +31,4 @@ types-requests==2.33.0.20260518
 types-passlib==1.7.7.20260211
 types-python-jose==3.5.0.20260408
 types-defusedxml==0.7.0.20260504   # defusedxml ships no inline types — needed for app/journey/ojp_client.py under mypy strict
-sqlalchemy[mypy]==2.0.50      # MUST match the pin in requirements.txt — pip rejects on conflict (audit-2026-05 #23)
+sqlalchemy[mypy]==2.0.51      # MUST match the pin in requirements.txt — pip rejects on conflict (audit-2026-05 #23)
