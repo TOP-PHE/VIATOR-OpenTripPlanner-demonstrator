@@ -250,6 +250,20 @@ function _suggestionHtml(s, i) {
   return `<div class="suggestion" data-i="${i}">${s.name}${country}${transit}</div>`;
 }
 
+// Tolerant fetch — typeahead must never reject the keystroke handler with
+// an uncaught error. Returns [] on any failure mode (network, non-2xx,
+// non-JSON body). The console.warn keeps a breadcrumb in devtools so a
+// silent 500 from one source doesn't get lost.
+async function _fetchJson(url) {
+  try {
+    const r = await fetch(url);
+    return r.ok ? await r.json() : [];
+  } catch (err) {
+    console.warn('typeahead fetch failed:', url, err);
+    return [];
+  }
+}
+
 function setupAutocomplete(prefix) {
   const inp = document.getElementById(prefix + '-input');
   const box = document.getElementById(prefix + '-sug');
@@ -262,15 +276,6 @@ function setupAutocomplete(prefix) {
   // OSM filtering.
   const uic = document.getElementById(prefix + '-uic');
   let active = -1; let items = [];
-
-  async function _fetchJson(url) {
-    try {
-      const r = await fetch(url);
-      return r.ok ? await r.json() : [];
-    } catch (_) {
-      return [];
-    }
-  }
 
   async function refresh() {
     const q = inp.value.trim();
