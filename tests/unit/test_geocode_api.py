@@ -45,10 +45,7 @@ def test_normalize_hit_drops_missing_coords():
 
 
 def test_normalize_hit_drops_non_numeric_coords():
-    assert (
-        _normalize_hit({"type": "STOP", "name": "x", "lat": "47.5", "lon": "7.5"})
-        is None
-    )
+    assert _normalize_hit({"type": "STOP", "name": "x", "lat": "47.5", "lon": "7.5"}) is None
 
 
 def test_normalize_hit_drops_empty_name():
