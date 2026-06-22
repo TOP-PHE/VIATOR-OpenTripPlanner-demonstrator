@@ -16,7 +16,7 @@ aiosmtplib==5.1.1               # used for SMTP delivery in step 4
 httpx==0.28.1                   # async HTTP for Trainline pull + OTP fanout
 defusedxml==0.7.1               # hardened XML parsing for the OJP reference adapter (app/journey/ojp_client.py) — opentransportdata.swiss returns OJP 2.0 XML; stdlib xml.etree is XXE-vulnerable (ruff S314 / bandit B314)
 apscheduler==3.11.2             # in-process scheduler for retention + master-data refresh crons
-structlog==25.5.0               # JSON structured logging — config in app/logging_config.py; bridges stdlib logging + uvicorn/SQLAlchemy/APScheduler emitters into a single JSON stream
+structlog==26.1.0               # JSON structured logging — config in app/logging_config.py; bridges stdlib logging + uvicorn/SQLAlchemy/APScheduler emitters into a single JSON stream
 prometheus-client==0.25.0       # Prometheus exposition format + custom collectors (audit #14 — observability triad). HTTP middleware is hand-rolled in app/metrics.py instead of prometheus-fastapi-instrumentator (which pins starlette<1.0.0 and would conflict with our starlette==1.0.0 floor for CVE-2025-62727).
 
 # ────── OpenTelemetry distributed tracing (audit #19 — observability triad / Phase 2.7) ──────
