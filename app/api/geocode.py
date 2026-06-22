@@ -97,7 +97,7 @@ def _normalize_hit(item: Any) -> dict[str, Any] | None:
     }
 
 
-@router.get("", response_model=list[dict[str, Any]])
+@router.get("")
 async def geocode(
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_logged_in)],
@@ -116,7 +116,9 @@ async def geocode(
     if motis is None:
         return []
 
-    url = f"http://motis-{motis.id}:8080/api/v1/geocode"
+    # In-cluster docker-network URL — MOTIS doesn't terminate TLS, so http is
+    # both correct and the only option. Same pattern as motis_client.fetch_plan.
+    url = f"http://motis-{motis.id}:8080/api/v1/geocode"  # NOSONAR python:S5332
     try:
         async with httpx.AsyncClient(timeout=_GEOCODE_TIMEOUT_S) as c:
             r = await c.get(url, params={"text": q})
