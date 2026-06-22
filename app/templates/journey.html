@@ -232,20 +232,41 @@ function setupAutocomplete(prefix) {
   async function refresh() {
     const q = inp.value.trim();
     if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
-    const r = await fetch(`/api/master/stations?q=${encodeURIComponent(q)}&size=20`);
-    if (!r.ok) return;
-    items = await r.json();
-    // Hide unroutable suggestions. master_stations was bootstrapped from
-    // Trainline-eu/stations (ODbL) which contains ~1,217 duplicate rows
-    // without coordinates — picking one yields null lat/lon and the
-    // submit then fires the "pick from the dropdown" error even though
-    // the operator DID pick from the dropdown. The classic symptom is
-    // two identical "Vallorbe [CH]" suggestions where only the second
-    // (UIC 8501103) has coords. Filtering client-side keeps the admin
-    // master_stations page able to see and manage those rows.
-    items = items.filter(s => s.latitude != null && s.longitude != null);
+    // Two parallel sources:
+    //   /api/master/stations — curated rail stations (Trainline ODbL).
+    //   /api/geocode — MOTIS geocoder of the first serving MOTIS session,
+    //                  unlocks urban-transit stops (BVB Basel trams,
+    //                  Saint-Louis cross-border tram, etc.) that aren't
+    //                  in master_stations. Returns [] if no MOTIS session
+    //                  is serving, so behaviour degrades to "stations only".
+    const [rA, rB] = await Promise.allSettled([
+      fetch(`/api/master/stations?q=${encodeURIComponent(q)}&size=20`),
+      fetch(`/api/geocode?q=${encodeURIComponent(q)}&size=20`),
+    ]);
+    const fromStations = (rA.status === 'fulfilled' && rA.value.ok) ? await rA.value.json() : [];
+    const fromMotis    = (rB.status === 'fulfilled' && rB.value.ok) ? await rB.value.json() : [];
+    // Merge, prefer curated rail entries (they carry UIC + dedicated
+    // operator codes), then append MOTIS-only entries by case-insensitive
+    // name. Drop unroutable rows (no coords) the way we did before — see
+    // the "Vallorbe [CH]" duplicate-without-coords bug fix.
+    const seen = new Set();
+    items = [];
+    for (const s of fromStations) {
+      if (s.latitude == null || s.longitude == null) continue;
+      const key = (s.name || '').toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(s);
+    }
+    for (const s of fromMotis) {
+      if (s.latitude == null || s.longitude == null) continue;
+      const key = (s.name || '').toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(s);
+    }
     if (!items.length) { box.classList.remove('show'); return; }
-    box.innerHTML = items.map((s, i) => `<div class="suggestion" data-i="${i}">${s.name}${s.country_iso ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>` : ''}</div>`).join('');
+    box.innerHTML = items.map((s, i) => `<div class="suggestion" data-i="${i}">${s.name}${s.country_iso ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>` : ''}${s.source === 'motis' ? ' <span style="color:var(--rail-steel);font-size:0.75em">(transit)</span>' : ''}</div>`).join('');
     box.classList.add('show');
     box.querySelectorAll('.suggestion').forEach(el => el.addEventListener('mousedown', e => {
       e.preventDefault(); pick(parseInt(el.dataset.i, 10));
