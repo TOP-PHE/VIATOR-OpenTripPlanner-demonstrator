@@ -88,3 +88,33 @@ def test_default_for() -> None:
 def test_mask_sentinel_constant() -> None:
     # Some routes round-trip this string; make sure it's stable.
     assert MASK_SENTINEL == "********"
+
+
+def test_otp_query_depth_keys_present() -> None:
+    """OTP_NUM_ITINERARIES + OTP_SEARCH_WINDOW_SECONDS expose the two
+    knobs the fanout reads to size each engine's per-query search.
+    If these get dropped, the journey API will KeyError at runtime."""
+    assert "OTP_NUM_ITINERARIES" in CONFIG_SCHEMA
+    assert "OTP_SEARCH_WINDOW_SECONDS" in CONFIG_SCHEMA
+
+
+def test_otp_num_itineraries_bounds() -> None:
+    assert default_for("OTP_NUM_ITINERARIES") == 12
+    assert coerce("OTP_NUM_ITINERARIES", "20") == 20
+    with pytest.raises(ValueError, match="below minimum"):
+        coerce("OTP_NUM_ITINERARIES", 0)
+    with pytest.raises(ValueError, match="above maximum"):
+        coerce("OTP_NUM_ITINERARIES", 100)
+
+
+def test_otp_search_window_seconds_bounds() -> None:
+    # Default 21600 = 6 hours (the OTP live-UI historical value).
+    assert default_for("OTP_SEARCH_WINDOW_SECONDS") == 21600
+    assert coerce("OTP_SEARCH_WINDOW_SECONDS", "43200") == 43200
+    # Below 600s (10 min) refuses — too tight for any useful fanout.
+    with pytest.raises(ValueError, match="below minimum"):
+        coerce("OTP_SEARCH_WINDOW_SECONDS", 60)
+    # Above 86400s (24h) refuses — OTP RAPTOR's near-quadratic scaling
+    # makes anything beyond a day unusable on dense national feeds.
+    with pytest.raises(ValueError, match="above maximum"):
+        coerce("OTP_SEARCH_WINDOW_SECONDS", 999999)

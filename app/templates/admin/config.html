@@ -34,6 +34,11 @@ const SECTIONS = [
     extra: '<button type="button" id="smtp-test-btn" class="secondary">Send test email…</button>' },
   { title: 'Concurrency / server protection', keys: ['MAX_CONCURRENT_JOURNEYS','MAX_CONCURRENT_REBUILDS','MAX_CONCURRENT_UPLOADS','JOURNEY_TIMEOUT_MS'] },
   { title: 'Fanout', keys: ['FANOUT_TIMEOUT_MS','FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE'] },
+  // How wide each engine searches per fanout query. Both OTP and MOTIS
+  // accept these knobs — used to make the comparison view show the same
+  // time window on each side. Cost: OTP RAPTOR scales near-quadratically
+  // on searchWindow.
+  { title: 'Journey query depth', keys: ['OTP_NUM_ITINERARIES','OTP_SEARCH_WINDOW_SECONDS'] },
   // Swiss OJP reference comparison — paste the bearer token from
   // dev-dashboard.opentransportdata.swiss into OJP_API_TOKEN. The feature
   // stays off until OJP_COMPARISON_ENABLED is ticked AND a token is set.
