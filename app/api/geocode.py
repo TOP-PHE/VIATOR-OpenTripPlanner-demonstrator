@@ -97,6 +97,52 @@ def _normalize_hit(item: Any) -> dict[str, Any] | None:
     }
 
 
+def _extract_stops(payload: Any, size: int) -> list[dict[str, Any]]:
+    """Filter and normalise MOTIS geocode raw hits into typeahead rows.
+
+    Pure function — takes whatever JSON the geocoder returned (could be
+    not-a-list, mixed types, etc.) and yields up to `size` STOP rows in
+    the master_stations row shape. Easy to unit-test without HTTP.
+    """
+    if not isinstance(payload, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in payload:
+        row = _normalize_hit(item)
+        if row is None:
+            continue
+        out.append(row)
+        if len(out) >= size:
+            break
+    return out
+
+
+async def _fetch_motis_geocode(session_id: str, q: str) -> Any:
+    """HTTP fetch of MOTIS's geocoder. Returns the parsed JSON payload, or
+    `[]` on any failure mode (network error, non-2xx, non-JSON body).
+
+    Kept separate from the endpoint so unit tests can substitute a fake
+    httpx via MockTransport — see tests/unit/test_geocode_api.py.
+    """
+    # In-cluster docker-network URL — MOTIS doesn't terminate TLS, so http is
+    # both correct and the only option. Same pattern as motis_client.fetch_plan.
+    url = f"http://motis-{session_id}:8080/api/v1/geocode"  # NOSONAR python:S5332
+    try:
+        async with httpx.AsyncClient(timeout=_GEOCODE_TIMEOUT_S) as c:
+            r = await c.get(url, params={"text": q})
+    except httpx.HTTPError as exc:
+        log.warning("MOTIS geocoder unreachable for session %s: %s", session_id, exc)
+        return []
+    if r.status_code != 200:
+        log.warning("MOTIS geocoder returned %s for session %s", r.status_code, session_id)
+        return []
+    try:
+        return r.json()
+    except ValueError:
+        log.warning("MOTIS geocoder returned non-JSON for session %s", session_id)
+        return []
+
+
 @router.get("")
 async def geocode(
     db: Annotated[DbSession, Depends(get_db)],
@@ -115,34 +161,5 @@ async def geocode(
     motis = _pick_motis_session(db)
     if motis is None:
         return []
-
-    # In-cluster docker-network URL — MOTIS doesn't terminate TLS, so http is
-    # both correct and the only option. Same pattern as motis_client.fetch_plan.
-    url = f"http://motis-{motis.id}:8080/api/v1/geocode"  # NOSONAR python:S5332
-    try:
-        async with httpx.AsyncClient(timeout=_GEOCODE_TIMEOUT_S) as c:
-            r = await c.get(url, params={"text": q})
-    except httpx.HTTPError as exc:
-        log.warning("MOTIS geocoder unreachable for session %s: %s", motis.id, exc)
-        return []
-    if r.status_code != 200:
-        log.warning("MOTIS geocoder returned %s for session %s", r.status_code, motis.id)
-        return []
-
-    try:
-        payload = r.json()
-    except ValueError:
-        log.warning("MOTIS geocoder returned non-JSON for session %s", motis.id)
-        return []
-    if not isinstance(payload, list):
-        return []
-
-    out: list[dict[str, Any]] = []
-    for item in payload:
-        row = _normalize_hit(item)
-        if row is None:
-            continue
-        out.append(row)
-        if len(out) >= size:
-            break
-    return out
+    payload = await _fetch_motis_geocode(motis.id, q)
+    return _extract_stops(payload, size)
