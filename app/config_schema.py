@@ -44,6 +44,15 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "FANOUT_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
     "FANOUT_PARTIAL_OK": {"type": "bool", "default": True},
     "STORE_RAW_RESPONSE": {"type": "bool", "default": True},
+    # ── Journey query depth ───────────────────────────────────────────
+    # How wide each engine searches per fanout call. Both OTP and MOTIS
+    # accept these knobs (their fetch_plan signatures match). Defaults
+    # are OTP's live-UI historical values (12/6h); operators tune up for
+    # apples-to-apples engine comparison on dense corridors. Cost is OTP
+    # RAPTOR's near-quadratic searchWindow scaling — bumping window to
+    # 12h roughly triples wall-time per query on dense national feeds.
+    "OTP_NUM_ITINERARIES": {"type": "int", "default": 12, "min": 1, "max": 50},
+    "OTP_SEARCH_WINDOW_SECONDS": {"type": "int", "default": 21600, "min": 600, "max": 86400},
     # ── Swiss OJP reference comparison ────────────────────────────────
     # Opt-in journey-search comparison against an external reference OJP
     # endpoint (opentransportdata.swiss OJP 2.0). See

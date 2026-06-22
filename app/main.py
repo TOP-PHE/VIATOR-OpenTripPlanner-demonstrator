@@ -25,6 +25,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from . import concurrency, config_service, detect, ingestion
 from .api import credentials as credentials_routes
+from .api import geocode as geocode_routes
 from .api import journey as journey_routes
 from .api import pages as page_routes
 from .api import reports as reports_routes
@@ -132,6 +133,7 @@ app.include_router(master_stations.router)
 app.include_router(master_aliases.router)
 app.include_router(reports_routes.router)
 app.include_router(journey_routes.router)
+app.include_router(geocode_routes.router)
 app.include_router(credentials_routes.router)
 app.include_router(page_routes.router)
 

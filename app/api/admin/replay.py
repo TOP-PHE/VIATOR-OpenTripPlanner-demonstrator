@@ -138,6 +138,8 @@ async def replay(
     db.commit()
 
     timeout_ms = int(cfg["JOURNEY_TIMEOUT_MS"])
+    num_itineraries = int(cfg["OTP_NUM_ITINERARIES"])
+    search_window_seconds = int(cfg["OTP_SEARCH_WINDOW_SECONDS"])
     for s in queued:
         try:
             replay_search = recorder.begin_search(
@@ -166,6 +168,8 @@ async def replay(
                     to_lon=s.dest_lon,
                     when=s.requested_time,
                     timeout_ms=timeout_ms,
+                    num_itineraries=num_itineraries,
+                    search_window_seconds=search_window_seconds,
                 )
                 status = "ok" if trips else "no_route"
             except Exception:

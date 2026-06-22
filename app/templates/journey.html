@@ -216,6 +216,54 @@
 <script>
 const SUGGEST_MIN = 2;
 
+// Helpers used by the From/To typeahead. Extracted from setupAutocomplete
+// to keep the keystroke handler's cognitive complexity below Sonar's S3776
+// threshold (was 16, needs ≤ 15), and to keep the suggestion-HTML chips
+// outside a nested template literal (S4624).
+
+function _mergeSuggestions(fromStations, fromMotis) {
+  // Master_stations entries win on lowercased-name conflict (they carry
+  // UIC + dedicated operator codes); MOTIS-only entries are appended.
+  // Rows without coords are dropped — see the "Vallorbe [CH]"
+  // duplicate-without-coords bug fix.
+  const seen = new Set();
+  const out = [];
+  function tryAdd(s) {
+    if (s.latitude == null || s.longitude == null) return;
+    const key = (s.name || '').toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s);
+  }
+  for (const s of fromStations) tryAdd(s);
+  for (const s of fromMotis) tryAdd(s);
+  return out;
+}
+
+function _suggestionHtml(s, i) {
+  const country = s.country_iso
+    ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>`
+    : '';
+  const transit = s.source === 'motis'
+    ? ' <span style="color:var(--rail-steel);font-size:0.75em">(transit)</span>'
+    : '';
+  return `<div class="suggestion" data-i="${i}">${s.name}${country}${transit}</div>`;
+}
+
+// Tolerant fetch — typeahead must never reject the keystroke handler with
+// an uncaught error. Returns [] on any failure mode (network, non-2xx,
+// non-JSON body). The console.warn keeps a breadcrumb in devtools so a
+// silent 500 from one source doesn't get lost.
+async function _fetchJson(url) {
+  try {
+    const r = await fetch(url);
+    return r.ok ? await r.json() : [];
+  } catch (err) {
+    console.warn('typeahead fetch failed:', url, err);
+    return [];
+  }
+}
+
 function setupAutocomplete(prefix) {
   const inp = document.getElementById(prefix + '-input');
   const box = document.getElementById(prefix + '-sug');
@@ -232,20 +280,21 @@ function setupAutocomplete(prefix) {
   async function refresh() {
     const q = inp.value.trim();
     if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
-    const r = await fetch(`/api/master/stations?q=${encodeURIComponent(q)}&size=20`);
-    if (!r.ok) return;
-    items = await r.json();
-    // Hide unroutable suggestions. master_stations was bootstrapped from
-    // Trainline-eu/stations (ODbL) which contains ~1,217 duplicate rows
-    // without coordinates — picking one yields null lat/lon and the
-    // submit then fires the "pick from the dropdown" error even though
-    // the operator DID pick from the dropdown. The classic symptom is
-    // two identical "Vallorbe [CH]" suggestions where only the second
-    // (UIC 8501103) has coords. Filtering client-side keeps the admin
-    // master_stations page able to see and manage those rows.
-    items = items.filter(s => s.latitude != null && s.longitude != null);
+    // Two parallel sources:
+    //   /api/master/stations — curated rail stations (Trainline ODbL).
+    //   /api/geocode — MOTIS geocoder of the first serving MOTIS session,
+    //                  unlocks urban-transit stops (BVB Basel trams,
+    //                  Saint-Louis cross-border tram, etc.) that aren't
+    //                  in master_stations. Returns [] if no MOTIS session
+    //                  is serving, so behaviour degrades to "stations only".
+    const qs = encodeURIComponent(q);
+    const [fromStations, fromMotis] = await Promise.all([
+      _fetchJson(`/api/master/stations?q=${qs}&size=20`),
+      _fetchJson(`/api/geocode?q=${qs}&size=20`),
+    ]);
+    items = _mergeSuggestions(fromStations, fromMotis);
     if (!items.length) { box.classList.remove('show'); return; }
-    box.innerHTML = items.map((s, i) => `<div class="suggestion" data-i="${i}">${s.name}${s.country_iso ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>` : ''}</div>`).join('');
+    box.innerHTML = items.map(_suggestionHtml).join('');
     box.classList.add('show');
     box.querySelectorAll('.suggestion').forEach(el => el.addEventListener('mousedown', e => {
       e.preventDefault(); pick(parseInt(el.dataset.i, 10));

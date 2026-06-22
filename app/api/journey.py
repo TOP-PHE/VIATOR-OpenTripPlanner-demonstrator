@@ -138,8 +138,17 @@ async def _query_session(
     session: SessionRow,
     body: FanoutBody,
     timeout_ms: int,
+    *,
+    num_itineraries: int,
+    search_window_seconds: int,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], int]:
-    """Returns (status, raw, trips, response_ms)."""
+    """Returns (status, raw, trips, response_ms).
+
+    `num_itineraries` / `search_window_seconds` come from platform_config
+    (OTP_NUM_ITINERARIES / OTP_SEARCH_WINDOW_SECONDS, both runtime-editable).
+    Both engines accept the knobs (motis_client.fetch_plan mirrors otp_client's
+    signature) so the comparison view can show the same time window on each side.
+    """
     start = time.monotonic()
     try:
         _when_kind, when = _resolve_when(body)
@@ -151,6 +160,8 @@ async def _query_session(
             to_lon=body.to.lon,
             when=when,
             timeout_ms=timeout_ms,
+            num_itineraries=num_itineraries,
+            search_window_seconds=search_window_seconds,
             from_stop_id=_stop_id_for(session, body.from_.uic),
             to_stop_id=_stop_id_for(session, body.to.uic),
             session_timezone=_session_timezone(session),
@@ -411,6 +422,8 @@ async def fanout(
                 modes=",".join(body.modes),
             )
             timeout_ms = int(cfg["FANOUT_TIMEOUT_MS"])
+            num_itineraries = int(cfg["OTP_NUM_ITINERARIES"])
+            search_window_seconds = int(cfg["OTP_SEARCH_WINDOW_SECONDS"])
 
             # v0.1.35 — optional external OJP reference comparison. Kicked
             # off as a task so it runs concurrently with the OTP session
@@ -421,7 +434,17 @@ async def fanout(
                 ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
 
             results = await asyncio.gather(
-                *[_query_session(db, s, body, timeout_ms) for s in sessions]
+                *[
+                    _query_session(
+                        db,
+                        s,
+                        body,
+                        timeout_ms,
+                        num_itineraries=num_itineraries,
+                        search_window_seconds=search_window_seconds,
+                    )
+                    for s in sessions
+                ]
             )
             # `_query_ojp_reference` never raises — safe to await bare.
             ojp_reference = await ojp_task if ojp_task is not None else None
@@ -624,7 +647,12 @@ async def plan(
                 modes=",".join(body.modes),
             )
             status, raw, trips, response_ms = await _query_session(
-                db, s, body, int(cfg["JOURNEY_TIMEOUT_MS"])
+                db,
+                s,
+                body,
+                int(cfg["JOURNEY_TIMEOUT_MS"]),
+                num_itineraries=int(cfg["OTP_NUM_ITINERARIES"]),
+                search_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
             )
     except concurrency.ConcurrencyExceeded as exc:
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
