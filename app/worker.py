@@ -1058,10 +1058,13 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
     so the `tick()` loop can stay engine-agnostic past the dispatch point.
 
     Lifecycle (mirrors motis-spike/README.md, post Phase-0.5 spike fixes):
-      1. Read inbox/<sid>/osm/osm.pbf and inbox/<sid>/gtfs/*.zip — same
-         inputs operators already prepare for OTP.
-      2. `/motis config <pbf> <gtfs...>` writes `config.yml` into a fresh
-         per-session staging dir under graphs/motis/<sid>/<timestamp>/.
+      1. Read inbox/<sid>/osm/osm.pbf, inbox/<sid>/gtfs/*.zip and
+         inbox/<sid>/netex/*.zip — same inputs operators already prepare
+         for OTP plus the NeTEx slot the upload endpoint routes by format.
+         MOTIS auto-detects each timetable file by content (the README
+         lists GTFS + NeTEx + GTFS Flex + GTFS Fares v2 as supported).
+      2. `/motis config <pbf> <timetable...>` writes `config.yml` into
+         a fresh per-session staging dir under graphs/motis/<sid>/<timestamp>/.
       3. Strip the `tiles:` block from the generated config.yml. MOTIS
          bakes in a `tiles-profiles/full.lua` reference that lives inside
          the container image; the verify step at import time fails because
@@ -1090,13 +1093,28 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
 
     inbox_root = settings.inbox_dir / sid
     pbf = inbox_root / "osm" / "osm.pbf"
+    # MOTIS auto-detects timetable format by file content — its README
+    # explicitly lists GTFS + NeTEx as supported static timetables. VIATOR
+    # writes uploaded NeTEx zips to `inbox/<sid>/netex/` and GTFS zips to
+    # `inbox/<sid>/gtfs/` (the upload endpoint routes by Format field);
+    # we feed both directories into `motis config` and let MOTIS decide
+    # what each file is. Sorted independently then concatenated so the
+    # ordering across rebuilds stays deterministic.
     gtfs_dir = inbox_root / "gtfs"
-    gtfs_files = sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []
+    netex_dir = inbox_root / "netex"
+    timetable_files = (
+        sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []
+    ) + (sorted(netex_dir.glob("*.zip")) if netex_dir.is_dir() else [])
 
     if not pbf.exists():
         return f"ERROR: no osm.pbf at {pbf} — upload or refresh first", False, ""
-    if not gtfs_files:
-        return f"ERROR: no GTFS files under {gtfs_dir} — upload or refresh first", False, ""
+    if not timetable_files:
+        return (
+            f"ERROR: no timetable files under {gtfs_dir} or {netex_dir} — "
+            "upload or refresh first",
+            False,
+            "",
+        )
 
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     # MOTIS data lives under graphs/motis/<sid>/<timestamp>/ so the OTP
@@ -1170,17 +1188,26 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         # `viator_inbox` volume layout — the worker reads/writes the same
         # tree at /data/inbox/<sid>/...).
         in_container_pbf = f"/inbox/{sid}/osm/{pbf.name}"
-        in_container_gtfs = [f"/inbox/{sid}/gtfs/{g.name}" for g in gtfs_files]
+        # Preserve each file's source subdir (gtfs/ or netex/) in the
+        # in-container path so MOTIS auto-detects the right loader per
+        # file. f.parent.name is "gtfs" or "netex" from the glob above.
+        in_container_timetables = [
+            f"/inbox/{sid}/{f.parent.name}/{f.name}" for f in timetable_files
+        ]
         config_cmd = [
             *common_cmd,
             _MOTIS_IMAGE,
             "/motis",
             "config",
             in_container_pbf,
-            *in_container_gtfs,
+            *in_container_timetables,
         ]
 
-        log.info("session %s MOTIS build: /motis config (gtfs=%d feeds)", sid, len(gtfs_files))
+        log.info(
+            "session %s MOTIS build: /motis config (timetable=%d feeds)",
+            sid,
+            len(timetable_files),
+        )
         # `config_cmd` is built from constants + filesystem-derived names; nothing
         # operator-supplied flows untrimmed into the argv. Bandit S603 doesn't apply.
         config_proc = subprocess.run(  # noqa: S603
