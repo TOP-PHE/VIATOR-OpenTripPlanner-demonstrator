@@ -1102,16 +1102,15 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
     # ordering across rebuilds stays deterministic.
     gtfs_dir = inbox_root / "gtfs"
     netex_dir = inbox_root / "netex"
-    timetable_files = (
-        sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []
-    ) + (sorted(netex_dir.glob("*.zip")) if netex_dir.is_dir() else [])
+    timetable_files = (sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []) + (
+        sorted(netex_dir.glob("*.zip")) if netex_dir.is_dir() else []
+    )
 
     if not pbf.exists():
         return f"ERROR: no osm.pbf at {pbf} — upload or refresh first", False, ""
     if not timetable_files:
         return (
-            f"ERROR: no timetable files under {gtfs_dir} or {netex_dir} — "
-            "upload or refresh first",
+            f"ERROR: no timetable files under {gtfs_dir} or {netex_dir} — upload or refresh first",
             False,
             "",
         )
