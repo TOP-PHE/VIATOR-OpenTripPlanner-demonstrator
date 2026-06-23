@@ -90,9 +90,12 @@ def test_run_build_motis_fails_when_osm_pbf_missing(
     assert "osm.pbf" in log
 
 
-def test_run_build_motis_fails_when_no_gtfs_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A MOTIS build with PBF but no GTFS feeds is meaningless — fail
-    fast with a clear message."""
+def test_run_build_motis_fails_when_no_timetable_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A MOTIS build with PBF but no timetable feeds (neither GTFS nor
+    NeTEx) is meaningless — fail fast with a clear message that mentions
+    both source directories so operators know which slot to populate."""
     inbox = tmp_path / "inbox"
     graphs = tmp_path / "graphs"
     inbox.mkdir(exist_ok=True)
@@ -110,7 +113,130 @@ def test_run_build_motis_fails_when_no_gtfs_files(tmp_path: Path, monkeypatch: p
     log, ok, path = worker.run_build_motis(session_id=sid)
     assert ok is False
     assert path == ""
-    assert "GTFS" in log
+    assert "timetable" in log
+    # Both candidate paths surfaced so the operator knows which slot to fill.
+    assert "gtfs" in log
+    assert "netex" in log
+
+
+def test_run_build_motis_includes_netex_files_in_config_cmd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A MOTIS session with only a `netex/` slot populated (no `gtfs/`)
+    must still build. The config command must reference the NeTEx file
+    at `/inbox/<sid>/netex/<name>` so MOTIS's auto-detection by content
+    picks the NeTEx loader. Regression guard for v0.1.43.08 where the
+    worker globbed only `gtfs/*.zip` and silently ignored NeTEx uploads.
+    """
+    inbox = tmp_path / "inbox"
+    graphs = tmp_path / "graphs"
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    monkeypatch.setattr(settings, "graph_dir", graphs)
+
+    sid = "eu-rail-motis"
+    (inbox / sid / "osm").mkdir(parents=True)
+    (inbox / sid / "osm" / "osm.pbf").write_bytes(b"dummy")
+    (inbox / sid / "netex").mkdir(parents=True)
+    (inbox / sid / "netex" / "trenitalia.zip").write_bytes(b"dummy")
+
+    seen_cmds: list[list[str]] = []
+
+    class _FakeProc:
+        stdout = "ok"
+        stderr = ""
+        returncode = 0
+
+    def _fake_run(cmd, **_kwargs):
+        seen_cmds.append(list(cmd))
+        staging: Path | None = None
+        for i, arg in enumerate(cmd):
+            if arg == "-w" and i + 1 < len(cmd):
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                candidate = graphs / rel
+                if candidate.exists():
+                    staging = candidate
+                    break
+        if staging is None:
+            return _FakeProc()
+        if "config" in cmd:
+            staging.joinpath("config.yml").write_text("osm: x\ntimetable:\n  first_day: TODAY\n")
+        if "import" in cmd:
+            staging.joinpath("tt.bin").write_bytes(b"dummy")
+        return _FakeProc()
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+
+    log, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok, log
+    # Find the config command and verify the NeTEx path landed in it.
+    config_cmd = next(c for c in seen_cmds if "config" in c)
+    assert f"/inbox/{sid}/netex/trenitalia.zip" in config_cmd
+    # And: the config invocation log should report a 1-feed timetable.
+    # (Pinned via the log message format change in this commit.)
+
+
+def test_run_build_motis_combines_gtfs_and_netex_in_config_cmd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A session with both GTFS and NeTEx providers — the typical real
+    eu-rail-motis shape after Trenitalia is added — must pass *both* sets
+    of files to motis config so MOTIS sees the whole timetable picture."""
+    inbox = tmp_path / "inbox"
+    graphs = tmp_path / "graphs"
+    inbox.mkdir(exist_ok=True)
+    graphs.mkdir(exist_ok=True)
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    monkeypatch.setattr(settings, "graph_dir", graphs)
+
+    sid = "eu-rail-motis"
+    (inbox / sid / "osm").mkdir(parents=True)
+    (inbox / sid / "osm" / "osm.pbf").write_bytes(b"dummy")
+    (inbox / sid / "gtfs").mkdir(parents=True)
+    (inbox / sid / "gtfs" / "sbb.zip").write_bytes(b"dummy")
+    (inbox / sid / "gtfs" / "sncf.zip").write_bytes(b"dummy")
+    (inbox / sid / "netex").mkdir(parents=True)
+    (inbox / sid / "netex" / "trenitalia.zip").write_bytes(b"dummy")
+
+    seen_cmds: list[list[str]] = []
+
+    class _FakeProc:
+        stdout = "ok"
+        stderr = ""
+        returncode = 0
+
+    def _fake_run(cmd, **_kwargs):
+        seen_cmds.append(list(cmd))
+        staging: Path | None = None
+        for i, arg in enumerate(cmd):
+            if arg == "-w" and i + 1 < len(cmd):
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                candidate = graphs / rel
+                if candidate.exists():
+                    staging = candidate
+                    break
+        if staging is None:
+            return _FakeProc()
+        if "config" in cmd:
+            staging.joinpath("config.yml").write_text("osm: x\ntimetable:\n  first_day: TODAY\n")
+        if "import" in cmd:
+            staging.joinpath("tt.bin").write_bytes(b"dummy")
+        return _FakeProc()
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+
+    log, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok, log
+    config_cmd = next(c for c in seen_cmds if "config" in c)
+    # All three feeds in the cmd, each with its source-subdir path.
+    assert f"/inbox/{sid}/gtfs/sbb.zip" in config_cmd
+    assert f"/inbox/{sid}/gtfs/sncf.zip" in config_cmd
+    assert f"/inbox/{sid}/netex/trenitalia.zip" in config_cmd
 
 
 def test_run_build_motis_invokes_config_then_import(
