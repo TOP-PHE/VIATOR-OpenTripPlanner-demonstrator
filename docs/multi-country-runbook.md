@@ -79,6 +79,132 @@ ls -lh eu-rail-7c.osm.pbf
 
 `Ctrl-b d` to detach. `tmux attach -t eu-osm` to come back.
 
+### Automated alternative: `scripts/merge_osm_eurostar_corridor.sh`
+
+The repo ships a self-contained merge script that does the download + merge
++ UK-bbox-clip in one shot, with no host-installed dependencies (uses a
+~150 MB Docker helper image built on the fly from Ubuntu + osmium-tool).
+Useful when:
+
+- The host doesn't have `osmium-tool` installed and the operator can't
+  `sudo apt install` (e.g. the SSH user isn't in sudoers).
+- You want the merge re-runnable / idempotent — downloads resume, the
+  merge is rerun only when inputs change.
+- You're building the canonical "Eurostar corridor" multi-country session
+  (ES + FR + BE + LU + NL + DE + AT + IT + LI + CH + UK-rail-subset).
+
+Run on the VPS, inside tmux:
+
+```bash
+# From your local machine — copy the script up:
+scp OpenJourneyPlanner/scripts/merge_osm_eurostar_corridor.sh viator@<vps>:/tmp/
+
+# Then on the VPS:
+chmod +x /tmp/merge_osm_eurostar_corridor.sh
+tmux new -d -s osm-merge '/tmp/merge_osm_eurostar_corridor.sh 2>&1 | tee /tmp/osm-merge.log'
+
+# Check progress without attaching:
+tmux ls
+tail -f /tmp/osm-merge.log
+```
+
+What it does (in order):
+
+1. Builds a tiny `viator-osmium-helper:latest` image (Ubuntu + osmium-tool).
+   ~20 s first run, cached thereafter.
+2. Downloads 10 Geofabrik regionals into `${WORK_DIR}/raw/` (default
+   `/tmp/osm-merge/raw/`). `curl --continue-at -` so reruns resume
+   partial downloads. Validates each downloaded file is ≥ 5 MB so an
+   HTML stub from a retired Geofabrik URL can't be silently cached as
+   a "PBF" (see Benelux gotcha below).
+3. Clips great-britain to the Eurostar HS1 corridor bbox (see next
+   subsection). All other regions stage verbatim.
+4. `osmium merge` everything into one PBF at `${OUTPUT_PATH}` (default
+   `/tmp/osm-merge/eurostar-corridor.osm.pbf`).
+5. Runs `osmium fileinfo --extended` on the output for a sanity check.
+
+Tunable env vars at the top of the script:
+
+| Env var | Default | Notes |
+|---|---|---|
+| `WORK_DIR` | `/tmp/osm-merge` | Working directory; needs ~25 GB free for the full 11-country merge |
+| `OUTPUT_PATH` | `${WORK_DIR}/eurostar-corridor.osm.pbf` | Final merged PBF location |
+| `OSMIUM_IMAGE` | `viator-osmium-helper:latest` | Docker image with osmium-tool — built locally if missing |
+| `REGIONS` | (10-region list, see script) | Edit the array to change country coverage |
+| `MIN_PBF_BYTES` | `5 MB` | Minimum size before a cached/downloaded "PBF" is trusted (Luxembourg is the smallest legit Geofabrik regional at ~40 MB) |
+| `UK_BBOX` | `-0.5,50.8,1.5,51.8` | bbox-clip applied to great-britain — only |
+
+Plug the merged file into a session via either of:
+
+```bash
+# (a) Serve via nginx and set sources.osm_pbf=<URL> in the session config:
+sudo cp /tmp/osm-merge/eurostar-corridor.osm.pbf \
+        /opt/viator/docker/nginx/static/osm/
+# (then add an nginx route for /static/osm/ and update the session URL)
+
+# (b) Drop straight into the new session's inbox (skips refresh):
+sudo cp /tmp/osm-merge/eurostar-corridor.osm.pbf \
+        /opt/viator/data/inbox/<sid>/osm/osm.pbf
+# (then trigger Rebuild graph in the UI — no Refresh sources needed)
+```
+
+The script is idempotent: rerun safely if interrupted. Raw downloads
+under `raw/` are kept across runs so partial downloads resume rather than
+restart. Delete `${WORK_DIR}` to force a full re-fetch.
+
+#### Gotcha: Geofabrik discontinues composite extracts silently
+
+Hit during the 2026-06 build: the Benelux composite extract
+(`benelux-latest.osm.pbf`) was removed by Geofabrik but the URL still
+returns **HTTP 200** with their homepage HTML (~10 KB) instead of a
+404. `curl --fail` doesn't catch this — only the size sanity-check
+does. If `osmium merge` later complains
+`PBF error: invalid BlobHeader size (> max_blob_header_size)`, that's
+the signature: run `scripts/check_osm_merge_files.sh` to find the
+under-sized file, fix the `REGIONS=` array (likely by splitting a
+composite into per-country URLs), delete the bad raw file, re-run.
+The Benelux composite was replaced with three separate extracts
+(belgium-latest / netherlands-latest / luxembourg-latest); if you're
+forking this script for a different corridor, expect the same
+treatment for other discontinued composites (e.g. "iberian-peninsula"
+or "balkans" may go the same way).
+
+### Reducing UK footprint to the Eurostar corridor
+
+The UK in OTP is interesting: you don't actually need most of Britain —
+the only routable destination for a Eurostar GTFS is **London St Pancras
+International** (and historically Ashford / Ebbsfleet / Stratford
+International). Including the full GB extract (~1.8 GB) costs you ~100 MB
+of post-filter graph for ways you'll never route on.
+
+The script clips great-britain to a bbox covering just the HS1 corridor
+before merging:
+
+```
+UK_BBOX = -0.5,50.8,1.5,51.8        # min_lon, min_lat, max_lon, max_lat
+```
+
+That box contains:
+
+| Eurostar UK terminus | Lat | Lon |
+|---|---|---|
+| London St Pancras International | 51.532 | -0.126 |
+| Stratford International | 51.545 | +0.009 |
+| Ebbsfleet International | 51.443 | +0.323 |
+| Ashford International | 51.143 | +0.876 |
+
+Plus the HS1 line itself and a comfortable margin around each station for
+walking-network coverage. Post-clip GB contribution: ~50-80 MB raw,
+~10-20 MB after the build's `osm_scope=rail-focused` filter.
+
+The clip uses `osmium extract -s smart` so railway ways crossing the
+bbox boundary aren't truncated mid-segment — important for the HS1 line
+running south to the channel tunnel portal.
+
+To extend the technique to other countries where you only need a subset
+(e.g. ES only the Madrid–Barcelona AVE corridor), copy the great-britain
+branch in the script's Phase 2 loop and add another bbox-clip entry.
+
 ### Expected merged sizes
 
 Roughly the sum of the country files — `osmium merge` doesn't dedupe
@@ -689,6 +815,197 @@ shipped, partly queued for future versions.
 | Provider list ≠ inbox files | by design | uploaded files don't auto-create entries |
 | OSM-PBF filename must match build-config.json | not yet (v0.1.33+) | entrypoint should rename to `osm.pbf` always |
 | OTP image not in `compose pull` | not yet | per-session containers spawned dynamically |
+| Geofabrik composite extracts (e.g. `benelux-latest.osm.pbf`) silently 410'd as HTTP-200 HTML stubs | v2026-06 merge script | `--fail` can't see it; only the `MIN_PBF_BYTES ≥ 5 MB` check catches; split into per-country URLs |
+
+---
+
+## 13. NAP timetable feeds — findings, formats, and limits
+
+A field log from the 2026-06 "Eurostar corridor" session build, where we
+gathered timetable files from 11 national access points (ES, FR, BE, LU,
+NL, DE, AT, IT, LI, CH, GB) and uncovered enough format weirdness to be
+worth writing down. The take-away: **trust file contents, not filenames;
+trust filenames, not portal labels**. Both can lie.
+
+### 13.1 File-format gotchas
+
+What the filename says vs what's actually inside:
+
+| Source filename | Says | Actually is | How we detected |
+|---|---|---|---|
+| `NL-NAP_NeTEx lastes.zip` | NeTEx | **IFF** (`.dat` files: stations.dat, timetbls_new.dat, company.dat, …) | `zipfile.namelist()` — no XML, only `.dat` |
+| `ES-NAP-*.zip` | (no format hint in name) | **GTFS** (stops.txt + routes.txt + …) | GTFS canonical files present |
+| `BE-NAP-SNCB-epip.zip` | NeTEx-EPIP | NeTEx (works as EPIP) | Confirmed by namespace |
+| `FR-NAP_gtfs_Region-Sud_ZOU.zip` (mid-2026) | GTFS | Was NeTEx-FR-Arrets (`version="…FR-NETEX_ARRET-…"`) | Confirmed by version-string + ID namespace |
+| `AT-NAP_netex_evu_2026.zip` | NeTEx | NeTEx with `at:obb:` codespace (no profile marker) | xmlns + ID prefix inspection |
+| `CH-NAP_netex_*.zip` | NeTEx | NeTEx with `ch:1:` codespace, **482 operators in one bundle** | xmlns + operator enumeration |
+| `DE-NAP-fahrplaene_gesamtdeutschland.zip` | NeTEx | NeTEx with `DE::` codespace, 27,937 XMLs (whole country) | xmlns + operator enumeration |
+| `LU-NAP-netex-*.zip` | NeTEx | NeTEx with `LU::` codespace, AVL Bus + CdT authority (bus-heavy) | xmlns + authority enumeration |
+| `IT-TRENITALIA-NeTEx_L1.zip` | NeTEx-EPIP | NeTEx-EPIP, Trenitalia-only | EPIP profile marker in head |
+
+Lesson: when adding a new NAP feed, **don't trust the filename**. Open
+the zip and sniff the contents. The `scripts/` folder has the one-liner
+we use:
+```bash
+python -c "
+import zipfile, sys
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+print(f'{len(names)} entries')
+for n in names[:8]: print(f'  {n}')
+"  '<path-to.zip>'
+```
+
+### 13.2 The `_classify_netex` substring bug (2026-06)
+
+The original `_classify_netex` in `app/detect.py` matched the bare
+substring `"ent:"` (in lower-cased head) to flag NeTEx-Nordic. That
+substring appears in *every* non-trivial NeTEx file via element names
+like `<Component>`, `<Document>`, `<Element>`, and inside schema URIs.
+Effect: AT, BE, DE, LU national feeds all got false-flagged as
+NeTEx-Nordic. The CH feed was rejected outright ("profile could not be
+identified") because the `ch:1:` codespace matches none of the four
+recognised markers (FR / Nordic / EPIP / fallback).
+
+Fix shipped in detect.py 2026-06:
+- **Nordic** now requires `xmlns:nsr=` or `codespace="nsr"` (real signals,
+  not the loose `"ent:"` substring).
+- **FR** now also matches the `FR-NETEX` literal in the head — needed for
+  feeds (like ZOU pre-mid-2026) that omit the `xmlns:fr=` declaration and
+  only carry the codespace in IDs + version strings.
+- **Unrecognised national profiles** (CH, AT, DE, LU, …) now default to
+  NeTEx-EPIP rather than raise. EPIP is the EU-wide passenger-info
+  profile and OTP can read it; a true incompatibility surfaces at build
+  time with a clearer error than rejecting upfront on a heuristic.
+
+Tests pinned in [tests/unit/test_detect.py](../tests/unit/test_detect.py)
+so the regression can't sneak back. Add a test there if you encounter a
+new national feed that needs handling.
+
+### 13.3 National bundles are usually multi-operator
+
+Most "NAP-*.zip" files we tested are multi-operator regardless of what
+the filename suggests. Don't pretend they're single-operator in the
+provider list — give them country-scoped feed_ids:
+
+| File | Filename hint | Reality |
+|---|---|---|
+| AT-NAP | OBB (legacy assumption) | OBB + Westbahn + private RUs + Montafonerbahn |
+| CH-NAP | (no hint) | SBB + BLS + RhB + MOB + 482 unique operators incl. funiculars |
+| DE-NAP | "gesamtdeutschland" | DB + Flixtrain + every regional concession |
+| LU-NAP | (no hint) | Mostly AVL bus authority; CFL likely included in unsampled XMLs |
+| BE-NAP | "SNCB" | SNCB-only (filename matches) |
+| IT-TRENITALIA | "TRENITALIA" | Trenitalia-only (filename matches) |
+| NL-NAP (IFF) | (no hint) | NS-only (IFF is the legacy NS-specific format) |
+
+The convention we landed on: country-scoped `feed_id` for NAP bundles
+(`AT-RAIL`, `CH-RAIL`, `DE-RAIL`, `LU-RAIL`), single-operator
+`feed_id` only when filename + contents agree (NMBS, TRENITALIA, NS).
+
+### 13.4 NL: IFF is not NeTEx — use OpenOV instead
+
+The Dutch NAP (NDOV Loket) historically publishes NS timetables in **IFF**,
+a legacy NS-specific format (the `.dat`-suffixed contents). VIATOR can't
+ingest IFF — there's no conversion step in the build pipeline, and
+adding one isn't worth the effort because:
+
+- IFF is NS-only — no European Sleeper, Eurostar NL leg, Arriva, Keolis,
+  ICE International, etc.
+- A higher-quality multi-operator alternative already exists.
+
+**Use OpenOV's national GTFS instead**:
+
+```
+http://gtfs.ovapi.nl/nl/gtfs-nl.zip
+```
+
+Maintained by OV-NL Open Data, converted from IFF + KV1, covers every
+Dutch public-transport operator. Wire it as a `source: url` provider —
+no local file needed.
+
+### 13.5 Italo (NTV) is not in any NAP
+
+Italo / Nuovo Trasporto Viaggiatori is a **private** open-access operator
+competing with Trenitalia on Italian high-speed lines. Unlike Trenitalia
+they publish **no public GTFS or NeTEx feed** anywhere — not on the
+Italian NAP (`nap.mit.gov.it`), not on `dati.mit.gov.it`, not on
+MobilityDatabase, not on transit.land, not on `eu.data.public-transport.earth`.
+
+Data is exposed only via:
+
+- Italo's own booking site (`italotreno.it`) and undocumented internal API
+- Commercial reseller agreements (Trainline et al.)
+
+The DATA4PT-project NeTEx Italian profile rollout *may* eventually force
+publication, but as of mid-2026 there is no file to plug in. Document
+this in any session that needs full Italian high-speed coverage as a
+known gap; for journey planning UI, Italo trips are intentionally
+absent.
+
+### 13.6 Italian regional rail — Trenord only, in rail-focused scope
+
+For the rail-focused-OSM corridor session, only Trenord is worth wiring:
+
+| Operator | Feed URL | Useful in rail-focused scope? |
+|---|---|---|
+| Trenord (Lombardy regional rail, Malpensa Express) | `https://www.dati.lombardia.it/download/3z4k-mxz9/application/zip` | ✅ genuine rail |
+| GTT (Turin / Piedmont) | aperTO portal (manual click) | ⚠️ license is non-commercial-only — VIATOR usage may not qualify; also mostly urban |
+| TPER (Bologna / Emilia-Romagna) | `solweb.tper.it/web/tools/open-data/` | ❌ mostly urban bus |
+| ATAC (Rome / Lazio) | `https://romamobilita.it/sites/default/files/rome_static_gtfs.zip` | ❌ entirely urban — stops will load but won't route on rail-focused OSM |
+
+The rail-focused OSM scope (`osm_scope=rail-focused`) strips driving
+roads. Loading urban bus/tram feeds against a rail-focused street graph
+means OTP can't walk anywhere outside footways — urban operators show
+up empty in journey results. Either keep the session rail-focused and
+skip them, or fork a transit-focused-scope session for urban modes.
+
+### 13.7 License watch-outs
+
+- **GTT (Turin)**: GTFS license is **non-commercial only** — academic /
+  research / civic-tech use. VIATOR's demonstrator status is ambiguous;
+  contact GTT before enabling for any commercial use.
+- **Trenord, ATAC, TPER**: CC-BY (3.0 or 4.0) — fine for our purposes
+  with attribution.
+- **OV-NL / OpenOV GTFS**: CC-BY 4.0.
+- **NDOV Loket IFF**: free for any use including commercial.
+- **Geofabrik OSM PBFs**: ODbL — share-alike, requires attribution.
+- The NAP feeds themselves are typically CC-BY or equivalent under the
+  EU NAP-data-sharing directive (Reg. 2017/1926 + 2024/490), but
+  individual operators can attach stricter terms (GTT is the cautionary
+  example).
+
+### 13.8 What to do when a feed surprises you
+
+1. **Open the zip.** `zipfile.namelist()` + read the first XML head.
+   File extension and filename are not authoritative.
+2. **Don't add ad-hoc workarounds to `app/detect.py`.** If a feed is
+   genuinely NeTEx but classifies wrong, the fix belongs in
+   `_classify_netex` with a test in [tests/unit/test_detect.py](../tests/unit/test_detect.py).
+3. **If the file is in an unsupported format (IFF, KV1, …)**, look for
+   an alternative converted feed (OpenOV-style) rather than building a
+   converter into VIATOR.
+4. **If a single-operator session-level feed_id label turns out to be a
+   multi-operator bundle**, switch to a country-scoped name (`XX-RAIL`)
+   to avoid confusing operators reading the session UI.
+
+### 13.9 Per-country at-a-glance (2026-06)
+
+| Country | Best feed source | Format | Single- or multi-operator | Special notes |
+|---|---|---|---|---|
+| ES | Per-operator zips from NAP (FGC, Euskotren, Ouigo-ES, Renfe AVLD, Renfe Cerca) | GTFS | Per-operator | Filename says `NeTEx`, contents are GTFS |
+| FR | `transport.data.gouv.fr` per-region zips, including Eurostar, Renfe-on-FR, Trenitalia-on-FR | GTFS (most) + NeTEx-FR (ZOU mid-2026) | Per-region / per-operator | NeTEx-FR variants are archive-only (OTP can't read them) |
+| BE | NMBS/SNCB NAP zip | NeTEx-EPIP | Single (SNCB) | Filename matches contents |
+| LU | LU NAP NeTEx bundle | NeTEx-EPIP (via EPIP fallback) | Multi (AVL + likely CFL) | Bus-heavy; check CFL coverage if rail is the priority |
+| NL | `gtfs.ovapi.nl/nl/gtfs-nl.zip` (OpenOV) | GTFS | **Multi-operator** (NS + Eurosleeper + Eurostar NL + Arriva + ICE Intl + …) | Skip the IFF on NDOV — use OpenOV |
+| DE | DE NAP gesamtdeutschland NeTEx | NeTEx-EPIP (via EPIP fallback) | Multi (DB + Flixtrain + all regional) | 1.5 GB+ file, 27k+ XMLs — heavy |
+| AT | AT NAP NeTEx EVU bundle | NeTEx-EPIP (via EPIP fallback) | Multi (OBB + Westbahn + private RUs) | — |
+| IT | Trenitalia NAP NeTEx + Trenord regional GTFS | NeTEx-EPIP + GTFS | Per-operator | **Italo not available** (no public feed) |
+| LI | (folded into CH extract) | — | — | LI ≈ 5 MB; CH covers it |
+| CH | CH NAP NeTEx (single bundle of every operator) | NeTEx-EPIP (via EPIP fallback) | **Multi (482 operators!)** | Codespace is `ch:1:` — was being rejected pre-2026-06 detect fix |
+| GB | UK Rail Delivery Group / ATOC, plus Eurostar GTFS for the cross-channel side | (auth-required) | — | We use just the Eurostar GTFS — Eurostar's UK service is the only thing the corridor needs |
+
+This table goes stale fast — NAP rollouts shift quarterly under Reg.
+2017/1926. Verify against the source before adding a new country.
 
 ---
 
