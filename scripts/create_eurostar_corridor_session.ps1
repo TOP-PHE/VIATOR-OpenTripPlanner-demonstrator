@@ -54,8 +54,8 @@
 param(
     [string]$BaseUrl = "https://vmi3259514.contaboserver.net",
     [string]$AdminEmail = "patrick.heuguet@trackonpath.com",
-    [string]$SessionId = "eurostar-corridor",
-    [string]$SessionName = "Eurostar Corridor",
+    [string]$SessionId = "eu11-transit-motis",
+    [string]$SessionName = "EU11 Transit (MOTIS) - ES FR BE LU NL DE AT IT LI CH GB",
     [string]$FilesDir = "C:\Users\patri\OneDrive\Documents\TrackOnPath\Development\VIATOR-Journey Planning\European NAP TimeTables"
 )
 
@@ -230,7 +230,7 @@ function Send-VIATOR-Upload {
 # ───────────────────── main ─────────────────────
 
 Write-Host ""
-Write-Host "VIATOR Eurostar Corridor session bootstrap"
+Write-Host "VIATOR multi-country MOTIS session bootstrap"
 Write-Host "──────────────────────────────────────────"
 Write-Host "  base url      : $BaseUrl"
 Write-Host "  admin email   : $AdminEmail"
@@ -274,6 +274,12 @@ $createBody = @{
     id                 = $SessionId
     name               = $SessionName
     category           = "MANUAL"
+    # MOTIS engine — OTP cannot fit an 11-country transit-focused graph
+    # in ~47 GB RAM (PruneIslands phase peaks at 60-80g for this scope).
+    # MOTIS handles the same data with a fraction of the heap footprint
+    # and natively reads both GTFS and NeTEx, so the platform's
+    # planner_dispatch routes journey queries to MOTIS for this session.
+    engine             = "motis"
     include_in_fanout  = $false
     config             = @{
         # transit-focused (not rail-focused) — needed so the urban street
@@ -281,9 +287,9 @@ $createBody = @{
         # Saint-Louis (FR) <-> Basel (CH) tram, Aachen DE/Vaals NL bus,
         # Geneva tram, Strasbourg Kehl tram, etc. rail-focused strips
         # driving roads which kills walk-to-stop on those urban modes.
-        # Memory cost: ~10 GB filtered PBF on 7+ countries; pair with
-        # max-memory rebuild mode if heap is tight (§3 of multi-country
-        # runbook).
+        # Memory cost: ~10 GB filtered PBF on 7+ countries; with MOTIS
+        # this fits the box. With OTP the same scope OOMs in PruneIslands
+        # — see runbook §3 heap matrix.
         osm_scope     = "transit-focused"
         osm_countries = @("AT","BE","CH","DE","ES","FR","GB","IT","LI","LU","NL")
         sources       = @{
