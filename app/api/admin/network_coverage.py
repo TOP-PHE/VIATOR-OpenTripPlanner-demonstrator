@@ -31,19 +31,21 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
 from ...db import get_db
-from ...models import NetworkCoverageHub
+from ...models import JourneyTrip, NetworkCoverageHub
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
+from ...templating import templates
 
 router = APIRouter(
     prefix="/api/admin/network-coverage",
@@ -446,6 +448,191 @@ def create_run(
     # the UI starts polling.
     bg.add_task(runner.execute_run, run.id)
     return _run_to_summary(run)
+
+
+def _resolve_hubs(db: DbSession) -> list[HubInfo]:
+    """List of active hubs for the matrix axis, DB-backed with the same
+    static-list fallback as `list_hubs()` for fresh installs / dev envs."""
+    hub_rows = (
+        db.execute(
+            select(NetworkCoverageHub)
+            .where(NetworkCoverageHub.is_active.is_(True))
+            .order_by(
+                NetworkCoverageHub.country,
+                NetworkCoverageHub.sort_order,
+                NetworkCoverageHub.id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if hub_rows:
+        return [_hub_to_info(h) for h in hub_rows]
+    return [
+        HubInfo(
+            id=h.id,
+            name=h.name,
+            short=h.short,
+            region=h.region,
+            country="FR",
+            tier="regional" if h.id == "batz" else "main",
+            lat=h.lat,
+            lon=h.lon,
+            is_active=True,
+            sort_order=0,
+        )
+        for h in STATIC_HUBS
+    ]
+
+
+def _fetch_trips_by_exec(
+    db: DbSession, exec_ids: list[uuid.UUID]
+) -> dict[str, list[dict[str, Any]]]:
+    """Bulk-fetch every JourneyTrip linked to the given execution ids.
+
+    One query regardless of how many cells the run has — keeps the export
+    endpoint O(1) DB round-trips even on a full 26x25 fanout matrix.
+    Returns a dict keyed by execution_id (stringified) so the cell-builder
+    can look trips up by `journey_search_id` in constant time.
+    """
+    if not exec_ids:
+        return {}
+    trip_rows = (
+        db.execute(
+            select(JourneyTrip)
+            .where(JourneyTrip.execution_id.in_(exec_ids))
+            .order_by(JourneyTrip.execution_id, JourneyTrip.rank_in_response)
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[str, list[dict[str, Any]]] = {}
+    for t in trip_rows:
+        out.setdefault(str(t.execution_id), []).append(
+            {
+                "rank": t.rank_in_response,
+                "duration_seconds": t.duration_seconds,
+                "num_transfers": t.num_transfers,
+                "departure_at": t.departure_at.isoformat() if t.departure_at else None,
+                "arrival_at": t.arrival_at.isoformat() if t.arrival_at else None,
+                "modes": t.modes,
+                "legs": t.legs,
+            }
+        )
+    return out
+
+
+def _build_export_context(
+    *,
+    run: Any,
+    results: list[Any],
+    hubs: list[HubInfo],
+    trips_by_exec: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Pure data-shaping from DB rows → template context dict.
+
+    Extracted so unit tests can exercise the marshalling (run-meta keys,
+    cell keying, trip attachment, status passthrough) without touching
+    the DB or the FastAPI request pipeline. The endpoint itself becomes
+    thin orchestration: query → marshal → render.
+
+    Cells are keyed by `"<origin_id>:<dest_id>"` so the Jinja template can
+    index by string concat — cleaner than nested loops with tuple keys.
+    """
+    cells: dict[str, dict[str, Any]] = {}
+    for r in results:
+        key = f"{r.origin_hub_id}:{r.dest_hub_id}"
+        cells[key] = {
+            "status": r.status,
+            "response_ms": r.response_ms,
+            "num_itineraries": r.num_itineraries,
+            "best_duration_seconds": r.best_duration_seconds,
+            "best_num_transfers": r.best_num_transfers,
+            "best_operators": r.best_operators,
+            "error_message": r.error_message,
+            "session_ids": getattr(r, "session_ids", None),
+            "trips": trips_by_exec.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+        }
+    run_meta = {
+        "id": str(run.id),
+        "session_id": run.session_id,
+        "mode": getattr(run, "mode", "single_session"),
+        "direction": run.direction,
+        "depart_at": run.depart_at.isoformat() if run.depart_at else None,
+        "status": run.status,
+        "total_pairs": run.total_pairs,
+        "completed_pairs": run.completed_pairs,
+        "ok_pairs": run.ok_pairs,
+        "no_route_pairs": run.no_route_pairs,
+        "error_pairs": run.error_pairs,
+        "created_at": run.started_at.isoformat() if run.started_at else None,
+    }
+    return {
+        "run": run_meta,
+        "hubs": [h.model_dump() for h in hubs],
+        "cells": cells,
+    }
+
+
+def _export_filename(run: Any) -> str:
+    """`coverage-<sid-or-fanout>-<YYYYMMDD-HHMM>.html`.
+
+    Operators tend to grab several reports at a time when comparing
+    sessions or dates, so the timestamp prefix keeps the downloads sorted
+    naturally in Finder / Explorer. Slashes in session ids are flattened
+    to hyphens so the filename stays portable across OSes.
+    """
+    label = (run.session_id or "fanout").replace("/", "-")
+    timestamp = run.started_at.strftime("%Y%m%d-%H%M") if run.started_at else "unknown"
+    return f"coverage-{label}-{timestamp}.html"
+
+
+@router.get(
+    "/runs/{run_id}/export.html",
+    response_class=HTMLResponse,
+    responses={
+        404: {"description": "Coverage run not found."},
+    },
+)
+def export_run_html(
+    run_id: uuid.UUID,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HTMLResponse:
+    """Render a self-contained HTML report for one coverage run.
+
+    The downloaded file embeds the matrix view AND every cell's full
+    itinerary detail (legs, operators, train numbers, departure / arrival
+    times). Recipient doesn't need platform access — opens in any browser
+    offline, click any cell to drill into the routes for that pair.
+
+    Designed for sharing coverage results with stakeholders outside the
+    platform (e.g. via email or upload to a shared drive). All assets
+    are inlined: no external CDN, no API round-trips after download.
+
+    Works on runs in any status (pending / running / completed): partial
+    data renders as far as it goes; cells without results show their
+    in-flight state. Recipients viewing a 'running' export see the matrix
+    as of the snapshot moment.
+
+    Implementation: data-shaping lives in `_build_export_context` so it's
+    unit-testable without DB. This function is thin orchestration:
+    query → marshal → render → set download header.
+    """
+    run, results = runner.get_run_with_results(db, run_id)
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    exec_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
+    context = _build_export_context(
+        run=run,
+        results=results,
+        hubs=_resolve_hubs(db),
+        trips_by_exec=_fetch_trips_by_exec(db, exec_ids),
+    )
+    response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
+    response.headers["Content-Disposition"] = f'attachment; filename="{_export_filename(run)}"'
+    return response
 
 
 @router.get("/runs/{run_id}", response_model=RunDetail)

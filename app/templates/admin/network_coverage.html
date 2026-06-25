@@ -97,6 +97,13 @@
 }
 .cov-view-toggle button.active { background: var(--brand-blue); color: #fff; border-color: var(--brand-blue); }
 .cov-view-toggle button:hover:not(.active) { background: #eef2f8; color: #1f2328; }
+.cov-download {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  padding: 0.25rem 0.6rem; border: 1px solid var(--brand-blue);
+  border-radius: 4px; color: var(--brand-blue); text-decoration: none;
+  font-size: 0.78rem; font-weight: 500; background: #fff;
+}
+.cov-download:hover { background: var(--brand-blue); color: #fff; }
 /* Trip-count heatmap — denser greens for more trains. v0.1.29.4 — pinned
    text colour at every step so the count number is readable across the
    whole gradient (was inheriting a medium grey at low counts). */
@@ -511,6 +518,10 @@ function renderRun(run) {
       ${viewBtn('count', 'Trips/day')}
       ${viewBtn('hybrid', 'Both')}
     </div>
+    <a class="cov-download"
+       href="/api/admin/network-coverage/runs/${escHTML(run.id)}/export.html"
+       download
+       title="Download a self-contained HTML report of this run. The file embeds every cell's full itinerary detail (legs, operators, train numbers) so it opens offline and you can share it by email.">⬇ Download HTML report</a>
   </div>`;
 
   // Build the matrix. Rows = origin (read down), columns = destination.
