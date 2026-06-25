@@ -52,6 +52,30 @@
 .op-badge[data-feed^="RENFE"]      { background: #fdecef; color: #b30021; border-color: #f7c0cc; }
 .op-badge[data-feed^="IDFM"]       { background: #e8f0fb; color: #1C75BC; border-color: #c5d6f0; }
 .op-badge[data-feed^="ZENBUS"]     { background: #e9f6ec; color: #1a7e3c; border-color: #c0e6c8; }
+/* Promote-to-Hub button — small affordance next to each station name on
+   a leg row. Visible only when the operator is a platform_admin (the
+   parent <script> bakes a `window.IS_PLATFORM_ADMIN` flag the render
+   path reads at click time). The button is intentionally subtle so it
+   doesn't crowd the station label for regular users; the colour comes
+   alive on hover. */
+.hub-add-btn {
+  display: inline-block; vertical-align: middle;
+  margin-left: 0.2rem; padding: 0 0.35rem;
+  border: 1px solid #c5d6f0; border-radius: 3px;
+  background: #f7faff; color: #1C75BC;
+  font-size: 0.68rem; font-weight: 500; line-height: 1.3;
+  cursor: pointer; user-select: none;
+}
+.hub-add-btn:hover { background: #1C75BC; color: #fff; border-color: #1C75BC; }
+.hub-form-grid {
+  display: grid; gap: 0.6rem 0.8rem; margin-top: 0.6rem;
+  grid-template-columns: 2fr 1fr;
+}
+.hub-form-grid label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem; }
+.hub-form-grid input, .hub-form-grid select {
+  padding: 0.3rem 0.4rem; border: 1px solid var(--sleeper); border-radius: 3px;
+}
+.hub-form-grid .hint { font-size: 0.72rem; color: var(--rail-steel); font-weight: normal; }
 .op-badge[data-feed^="RGION"]      { background: #ddf4ff; color: #0969da; border-color: #b6e3ff; }
 .op-summary { margin-top: 0.3rem; display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; font-size: 0.78rem; color: var(--rail-steel); }
 /* JSON inspector button + modal — top-right of each trip card. */
@@ -210,6 +234,69 @@
     </div>
   </div>
 </div>
+
+{# Promote-to-hub modal: only used by platform_admin operators clicking
+   `+ Hub` on a station name in a leg row. The form is server-pre-filled
+   by POST /api/admin/network-coverage/hubs/derive when the modal opens;
+   on Save it POSTs to /api/admin/network-coverage/hubs (the same endpoint
+   the standalone Manage Hubs page uses). Closed via the × button, the
+   backdrop click, or Esc. #}
+{% if current_user and current_user.role == "platform_admin" %}
+<div id="hub-modal" class="json-modal-backdrop" hidden>
+  <div class="json-modal" role="dialog" aria-modal="true" style="width: min(640px, 96vw)">
+    <div class="json-modal-header">
+      <h3 id="hub-modal-title">Promote to hub</h3>
+      <button type="button" class="secondary" data-action="hub-modal-close" title="Close (Esc)" aria-label="Close" style="padding: 0.2rem 0.6rem">×</button>
+    </div>
+    <div class="json-modal-body">
+      <p class="hint" style="margin-top:0">
+        Pre-filled from the leg you clicked. Coordinates come from the
+        verified journey result, so the matrix will route to this station.
+        Adjust the slug or short label if the auto-derived values are awkward.
+      </p>
+      <form id="hub-form" autocomplete="off">
+        <div class="hub-form-grid">
+          <label>Slug <span class="hint">(immutable, lowercase, hyphens)</span>
+            <input type="text" id="hub-slug" required pattern="^[a-z0-9][a-z0-9-]*$" maxlength="64">
+          </label>
+          <label>Country <span class="hint">(ISO 2-letter)</span>
+            <input type="text" id="hub-country" required maxlength="2" style="text-transform:uppercase">
+          </label>
+          <label>Name <span class="hint">(operator-facing)</span>
+            <input type="text" id="hub-name" required maxlength="120">
+          </label>
+          <label>Short <span class="hint">(matrix header — ≤ 12 chars)</span>
+            <input type="text" id="hub-short" required maxlength="16">
+          </label>
+          <label>Latitude
+            <input type="number" step="0.000001" id="hub-lat" required>
+          </label>
+          <label>Longitude
+            <input type="number" step="0.000001" id="hub-lon" required>
+          </label>
+          <label>Tier
+            <select id="hub-tier">
+              <option value="main">main</option>
+              <option value="regional">regional</option>
+            </select>
+          </label>
+          <label>Sort order <span class="hint">(lower = earlier)</span>
+            <input type="number" id="hub-sort" value="100" min="0" max="10000">
+          </label>
+        </div>
+        <div id="hub-error" class="hint" style="color:#cf222e; min-height: 1.2rem; margin-top: 0.6rem"></div>
+        <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top: 0.4rem">
+          <button type="button" data-action="hub-modal-close">Cancel</button>
+          <button type="submit" id="hub-save-btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<script>window.IS_PLATFORM_ADMIN = true;</script>
+{% else %}
+<script>window.IS_PLATFORM_ADMIN = false;</script>
+{% endif %}
 {% endblock %}
 
 {% block extra_scripts %}
@@ -446,15 +533,38 @@ function operatorBadge(lg) {
   return `<span class="op-badge" data-feed="${escHTML(feed)}" title="feed_id: ${escHTML(feed || '?')}${lg.agency_id ? ' · agency_id: ' + escHTML(lg.agency_id) : ''}">${escHTML(display)}</span>`;
 }
 
+// Per-station `+ Hub` button — visible only when the operator is a
+// platform_admin (the Jinja block at the bottom of the template bakes
+// the flag). Clicking it opens the Promote-to-Hub modal pre-filled by
+// POST /api/admin/network-coverage/hubs/derive (single source of truth
+// for slug / short / country derivation, server-side). No-op for WALK
+// legs whose from/to are the user's free-text origin/destination rather
+// than a real stop. We require both name + coords; without coords the
+// matrix can't route to it anyway.
+function hubAddBtn(name, lat, lon, stopId) {
+  if (!window.IS_PLATFORM_ADMIN) return '';
+  if (!name || lat == null || lon == null) return '';
+  return ` <button type="button" class="hub-add-btn"
+    data-action="open-hub-modal"
+    data-name="${escHTML(name)}"
+    data-lat="${lat}"
+    data-lon="${lon}"
+    data-stop-id="${escHTML(stopId || '')}"
+    title="Add this station as a hub on the Network Coverage matrix">+ Hub</button>`;
+}
+
 function legsHTML(legs) {
   // One row per leg. Walking is shown as a short hop; transit shows
-  // operator badge (v0.1.26) + route name + stops.
+  // operator badge (v0.1.26) + route name + stops. Admins see a small
+  // `+ Hub` button next to each station name (Promote-to-Hub flow).
   return legs.map(lg => {
     const mode = lg.mode || '?';
     const route = lg.route_short_name
       ? `${escHTML(lg.route_short_name)}${lg.route_long_name ? ' <span style="color:var(--rail-steel); font-weight: normal">' + escHTML(lg.route_long_name) + '</span>' : ''}`
       : (mode === 'WALK' ? 'Walk' : escHTML(mode));
-    const stops = `${escHTML(lg.from_name || '—')} <span style="color:var(--rail-steel)">→</span> ${escHTML(lg.to_name || '—')}`;
+    const fromBtn = hubAddBtn(lg.from_name, lg.from_lat, lg.from_lon, lg.from_stop_id);
+    const toBtn = hubAddBtn(lg.to_name, lg.to_lat, lg.to_lon, lg.to_stop_id);
+    const stops = `${escHTML(lg.from_name || '—')}${fromBtn} <span style="color:var(--rail-steel)">→</span> ${escHTML(lg.to_name || '—')}${toBtn}`;
     const op = operatorBadge(lg);
     return `<div class="leg-row">
       <span class="leg-mode ${escHTML(mode)}">${escHTML(mode)}</span>
@@ -1047,5 +1157,125 @@ document.addEventListener('keydown', (e) => {
     if (m && !m.hidden) m.hidden = true;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────
+// Promote-to-Hub flow — admin-only. Click a `+ Hub` button next to
+// any station name in a leg result; the modal opens pre-filled by
+// /api/admin/network-coverage/hubs/derive (server-side slug/short/
+// country derivation) and saves via /hubs (the same endpoint the
+// Manage Hubs page uses).
+//
+// The whole subsystem no-ops gracefully when window.IS_PLATFORM_ADMIN
+// is false (the buttons never render in that case anyway).
+// ──────────────────────────────────────────────────────────────────
+
+function hubModalEl() { return document.getElementById('hub-modal'); }
+function hubModalIsOpen() { const m = hubModalEl(); return m && !m.hidden; }
+
+async function openHubModal(payload) {
+  const modal = hubModalEl();
+  if (!modal) return;  // template didn't render the modal (non-admin)
+  // Reset any prior error / state.
+  document.getElementById('hub-error').textContent = '';
+  document.getElementById('hub-save-btn').disabled = false;
+  // Pre-fill from the server's derivation so slug / short / country
+  // match the same logic the Manage Hubs page validates against.
+  let derived;
+  try {
+    const r = await fetch('/api/admin/network-coverage/hubs/derive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        name: payload.name,
+        lat: payload.lat,
+        lon: payload.lon,
+        stop_id: payload.stopId || null,
+      }),
+    });
+    if (!r.ok) throw new Error(`derive failed: ${r.status}`);
+    derived = await r.json();
+  } catch (err) {
+    // Fall back to coords-only pre-fill so the operator can still save
+    // manually — beats blocking the flow on a transient API hiccup.
+    derived = {
+      name: payload.name, slug: '', short: '',
+      country: '', lat: payload.lat, lon: payload.lon,
+      tier: 'main', region: null, sort_order: 100,
+    };
+    document.getElementById('hub-error').textContent =
+      'Auto-fill failed (' + err.message + ') — fill the remaining fields manually.';
+  }
+  document.getElementById('hub-name').value    = derived.name || '';
+  document.getElementById('hub-slug').value    = derived.slug || '';
+  document.getElementById('hub-short').value   = derived.short || '';
+  document.getElementById('hub-country').value = (derived.country || '').toUpperCase();
+  document.getElementById('hub-lat').value     = derived.lat;
+  document.getElementById('hub-lon').value     = derived.lon;
+  document.getElementById('hub-tier').value    = derived.tier || 'main';
+  document.getElementById('hub-sort').value    = derived.sort_order != null ? derived.sort_order : 100;
+  modal.hidden = false;
+  // Focus the slug field first — it's the one operators most often
+  // want to rename (auto-derived slugs from long names get unwieldy).
+  setTimeout(() => document.getElementById('hub-slug').focus(), 50);
+}
+
+async function saveHub(e) {
+  e.preventDefault();
+  const errBox = document.getElementById('hub-error');
+  errBox.textContent = '';
+  const btn = document.getElementById('hub-save-btn');
+  btn.disabled = true;
+  const body = {
+    id:     document.getElementById('hub-slug').value.trim().toLowerCase(),
+    name:   document.getElementById('hub-name').value.trim(),
+    short:  document.getElementById('hub-short').value.trim(),
+    country: document.getElementById('hub-country').value.trim().toUpperCase(),
+    tier:   document.getElementById('hub-tier').value,
+    lat:    parseFloat(document.getElementById('hub-lat').value),
+    lon:    parseFloat(document.getElementById('hub-lon').value),
+    sort_order: parseInt(document.getElementById('hub-sort').value, 10) || 100,
+  };
+  try {
+    const r = await fetch('/api/admin/network-coverage/hubs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(`HTTP ${r.status}: ${txt}`);
+    }
+    // Success — close the modal. We don't refresh the page; the hub
+    // shows up next time the operator opens Network Coverage.
+    hubModalEl().hidden = true;
+  } catch (err) {
+    errBox.textContent = err.message;
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const opener = e.target.closest('[data-action="open-hub-modal"]');
+  if (opener) {
+    e.preventDefault();
+    openHubModal({
+      name: opener.dataset.name,
+      lat: parseFloat(opener.dataset.lat),
+      lon: parseFloat(opener.dataset.lon),
+      stopId: opener.dataset.stopId,
+    });
+    return;
+  }
+  if (e.target.matches('[data-action="hub-modal-close"]') ||
+      (e.target.matches('.json-modal-backdrop') && e.target.id === 'hub-modal')) {
+    if (hubModalEl()) hubModalEl().hidden = true;
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && hubModalIsOpen()) hubModalEl().hidden = true;
+});
+// `submit` handler only attaches when the form actually exists (admin path).
+const _hubForm = document.getElementById('hub-form');
+if (_hubForm) _hubForm.addEventListener('submit', saveHub);
 </script>
 {% endblock %}

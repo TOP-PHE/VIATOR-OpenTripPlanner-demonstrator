@@ -42,7 +42,7 @@ from ...db import get_db
 from ...models import JourneyTrip, NetworkCoverageHub
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
-from ...network_coverage import runner
+from ...network_coverage import hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
@@ -585,6 +585,59 @@ def _export_filename(run: Any) -> str:
     label = (run.session_id or "fanout").replace("/", "-")
     timestamp = run.started_at.strftime("%Y%m%d-%H%M") if run.started_at else "unknown"
     return f"coverage-{label}-{timestamp}.html"
+
+
+class HubDeriveRequest(BaseModel):
+    """Body of POST /hubs/derive — fields available when an operator
+    clicks `+ Hub` in the journey results. name + coords are mandatory
+    (the click is gated on them in the UI); stop_id is reserved for a
+    future UIC-prefix country lookup."""
+
+    name: str = Field(min_length=1, max_length=120)
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    stop_id: str | None = Field(default=None, max_length=120)
+
+
+class HubDeriveResponse(BaseModel):
+    """Pre-filled form data for the AddHub modal. Country may be empty
+    when the point falls outside the v1 country boundaries — the modal
+    then prompts the operator to pick manually."""
+
+    name: str
+    slug: str
+    short: str
+    country: str
+    lat: float
+    lon: float
+    tier: str = "main"
+    region: str | None = None
+    sort_order: int = 100
+
+
+@router.post(
+    "/hubs/derive",
+    # `response_model=` dropped per Sonar python:S6781 — the function's
+    # `-> HubDeriveResponse` return annotation already conveys the same
+    # info, FastAPI infers the response model from it since 0.95+. Same
+    # pattern as the v0.1.32.21 PATCH /{sid} endpoint above.
+    responses={400: {"description": "name/lat/lon validation failed."}},
+)
+def derive_hub_fields(
+    body: HubDeriveRequest,
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HubDeriveResponse:
+    """Server-side derivation of slug / short / country from a station
+    name + coordinates. Powers the "Promote to hub" flow in the journey
+    UI: an operator clicks `+ Hub` next to a station that just returned
+    itineraries, and the AddHub modal opens pre-filled by this endpoint.
+
+    Single source of truth — the JS modal just renders what we return,
+    so the slug regex + the country-detection logic stay testable in
+    Python without a JS/Python drift risk.
+    """
+    out = hub_derive.derive(body.name, body.lat, body.lon, body.stop_id)
+    return HubDeriveResponse(**out)
 
 
 @router.get(
