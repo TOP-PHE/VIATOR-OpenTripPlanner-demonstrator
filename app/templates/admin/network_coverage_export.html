@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>VIATOR coverage report — {{ run.session_id or "fanout" }} · {{ run.depart_at or "" }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* Self-contained: NO external CSS / fonts / JS. Stays viewable
+       offline forever, opens in any browser, can be emailed as a
+       single .html attachment. */
+    :root {
+      --ink: #1f2933;
+      --muted: #6b7785;
+      --line: #d8dde3;
+      --bg: #fbfbfd;
+      --ok: #2f9e44;
+      --ok-bg: #e8f6ec;
+      --no-route: #f59f00;
+      --no-route-bg: #fff4d6;
+      --error: #e03131;
+      --error-bg: #ffe3e3;
+      --self: #f0f0f0;
+      --pending: #adb5bd;
+      --link: #1c7ed6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      margin: 0; padding: 1.5rem 2rem;
+      color: var(--ink); background: var(--bg);
+      font-size: 14px; line-height: 1.45;
+    }
+    header.report {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 1rem; margin-bottom: 1.4rem;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.35rem; }
+    h2 { font-size: 1.05rem; margin: 1.6rem 0 0.8rem; color: var(--ink); }
+    .meta { color: var(--muted); font-size: 0.85rem; }
+    .meta strong { color: var(--ink); font-weight: 600; }
+    .totals { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .totals span { padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; }
+    .totals .t-ok { background: var(--ok-bg); color: var(--ok); }
+    .totals .t-no-route { background: var(--no-route-bg); color: var(--no-route); }
+    .totals .t-error { background: var(--error-bg); color: var(--error); }
+    .totals .t-pending { background: #eef2f5; color: var(--muted); }
+
+    /* Matrix */
+    .matrix-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+    table.matrix {
+      border-collapse: collapse; font-size: 11px; min-width: 100%;
+    }
+    table.matrix th, table.matrix td {
+      border: 1px solid var(--line); padding: 4px 6px; white-space: nowrap;
+      text-align: center; vertical-align: middle;
+    }
+    table.matrix th { background: #f5f7fa; font-weight: 600; }
+    table.matrix th.axis-row { text-align: right; position: sticky; left: 0; z-index: 1; background: #f5f7fa; }
+    table.matrix th.country { font-size: 0.7rem; color: var(--muted); font-weight: 500; background: #fafbfc; }
+    .cell-ok { background: var(--ok-bg); cursor: pointer; }
+    .cell-ok:hover { background: #d4ecdb; }
+    .cell-no-route { background: var(--no-route-bg); color: var(--no-route); cursor: pointer; }
+    .cell-no-route:hover { background: #ffe9b3; }
+    .cell-timeout { background: var(--error-bg); color: var(--error); cursor: pointer; }
+    .cell-error { background: var(--error-bg); color: var(--error); cursor: pointer; font-weight: 600; }
+    .cell-pending { background: #fff; color: var(--pending); }
+    .cell-self { background: var(--self); color: var(--pending); }
+
+    /* Drilldown modal */
+    .modal-back {
+      position: fixed; inset: 0; background: rgba(15, 25, 40, 0.55);
+      display: flex; align-items: flex-start; justify-content: center;
+      padding: 4vh 2vw; z-index: 100;
+    }
+    .modal-back[hidden] { display: none; }
+    .modal {
+      background: #fff; border-radius: 6px; width: min(820px, 100%);
+      max-height: 92vh; overflow: auto; padding: 1.2rem 1.4rem;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+    }
+    .modal header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; border: 0; padding: 0; }
+    .modal h3 { font-size: 1.05rem; margin: 0; }
+    .modal-close {
+      background: transparent; border: 1px solid var(--line); border-radius: 4px;
+      padding: 0.2rem 0.55rem; font-size: 1rem; cursor: pointer; color: var(--muted);
+    }
+    .modal-close:hover { background: #f0f0f0; color: var(--ink); }
+    .summary-line { color: var(--muted); font-size: 0.85rem; margin-bottom: 1rem; }
+    .summary-line .pill {
+      display: inline-block; padding: 0.05rem 0.45rem; border-radius: 999px;
+      font-size: 0.72rem; margin-right: 0.4rem;
+    }
+
+    /* Itinerary cards */
+    .trip {
+      border: 1px solid var(--line); border-radius: 4px; margin-bottom: 0.7rem; overflow: hidden;
+    }
+    .trip-head {
+      padding: 0.5rem 0.7rem; background: #f7f9fb;
+      display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: baseline;
+      border-bottom: 1px solid var(--line);
+    }
+    .trip-head .rank { color: var(--muted); font-size: 0.78rem; }
+    .trip-head .when { font-weight: 600; }
+    .trip-head .duration { color: var(--muted); font-size: 0.85rem; }
+    .trip-head .transfers { color: var(--muted); font-size: 0.85rem; }
+    .legs { padding: 0.4rem 0.7rem; }
+    .leg {
+      display: grid; grid-template-columns: 60px 90px 1fr 1fr 100px;
+      gap: 0.5rem; padding: 0.3rem 0;
+      border-top: 1px dashed #e7eaee; font-size: 0.85rem;
+    }
+    .leg:first-child { border-top: 0; }
+    .leg .mode { font-weight: 600; font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 3px; text-align: center; }
+    .leg .mode.RAIL, .leg .mode.SUBWAY, .leg .mode.TRAM { background: #dbe9fa; color: #0c4a6e; }
+    .leg .mode.BUS, .leg .mode.COACH { background: #fbe2c2; color: #8b4d00; }
+    .leg .mode.WALK, .leg .mode.FOOT { background: #e9ecef; color: var(--muted); }
+    .leg .when { color: var(--muted); }
+    .leg .stops { color: var(--ink); }
+    .leg .stops .arrow { color: var(--muted); margin: 0 0.3rem; }
+    .leg .service { font-family: ui-monospace, "Courier New", monospace; font-size: 0.78rem; color: var(--muted); }
+    .leg .agency { font-size: 0.78rem; color: var(--muted); }
+    .empty-trips { color: var(--muted); font-style: italic; padding: 1rem 0; }
+
+    /* JSON appendix */
+    details.raw {
+      margin-top: 2rem; border-top: 1px solid var(--line); padding-top: 1rem;
+    }
+    details.raw summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+    details.raw pre {
+      background: #1f2933; color: #e6edf3; padding: 0.8rem; border-radius: 4px;
+      font-size: 0.72rem; overflow: auto; max-height: 50vh;
+    }
+    footer.report {
+      margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line);
+      color: var(--muted); font-size: 0.78rem; text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<header class="report">
+  <h1>Coverage report — <span style="color: var(--link)">{{ run.session_id or "fanout" }}</span></h1>
+  <div class="meta">
+    <strong>Run id:</strong> {{ run.id }} ·
+    <strong>Mode:</strong> {{ run.mode }} ·
+    <strong>Direction:</strong> {{ run.direction }} ·
+    <strong>Depart:</strong> {{ run.depart_at or "—" }} ·
+    <strong>Created:</strong> {{ run.created_at or "—" }}
+  </div>
+  <div class="totals">
+    <span class="t-ok">{{ run.ok_pairs }} ok</span>
+    <span class="t-no-route">{{ run.no_route_pairs }} no-route</span>
+    <span class="t-error">{{ run.error_pairs }} err</span>
+    <span class="t-pending">{{ run.completed_pairs }}/{{ run.total_pairs }} pairs · status {{ run.status }}</span>
+  </div>
+</header>
+
+<h2>Matrix — rows are origins, columns are destinations</h2>
+<p class="meta">
+  Click any non-empty cell to see the full itineraries it returned.
+  Colour key: <strong style="color: var(--ok)">green</strong> = trips returned,
+  <strong style="color: var(--no-route)">amber</strong> = no route found,
+  <strong style="color: var(--error)">red</strong> = timeout / error.
+  Diagonal cells (origin = destination) are intentionally skipped.
+</p>
+
+<div class="matrix-wrap">
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th class="axis-row">&nbsp;</th>
+        {% for h in hubs %}
+        <th title="{{ h.name }} ({{ h.country }})">{{ h.short or h.id }}</th>
+        {% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for orig in hubs %}
+      <tr>
+        <th class="axis-row" title="{{ orig.name }} ({{ orig.country }})">{{ orig.short or orig.id }}</th>
+        {% for dest in hubs %}
+          {% if orig.id == dest.id %}
+            <td class="cell-self">·</td>
+          {% else %}
+            {% set cell = cells.get(orig.id ~ ":" ~ dest.id) %}
+            {% if not cell %}
+              <td class="cell-pending" title="No result yet (run may still be in progress)">…</td>
+            {% elif cell.status == "ok" %}
+              {% set hours = (cell.best_duration_seconds // 3600) if cell.best_duration_seconds else 0 %}
+              {% set mins = ((cell.best_duration_seconds % 3600) // 60) if cell.best_duration_seconds else 0 %}
+              <td class="cell-ok" data-pair="{{ orig.id }}:{{ dest.id }}"
+                  title="{{ orig.name }} → {{ dest.name }} · {{ cell.num_itineraries }} itineraries · {{ cell.best_operators or '' }}">
+                {{ "%dh%02d"|format(hours, mins) }}·{{ cell.num_itineraries }}
+              </td>
+            {% elif cell.status == "no_route" %}
+              <td class="cell-no-route" data-pair="{{ orig.id }}:{{ dest.id }}"
+                  title="{{ orig.name }} → {{ dest.name }} · no route found ({{ cell.response_ms or 0 }} ms)">∅</td>
+            {% elif cell.status == "timeout" %}
+              <td class="cell-timeout" data-pair="{{ orig.id }}:{{ dest.id }}"
+                  title="{{ orig.name }} → {{ dest.name }} · query timed out ({{ cell.response_ms or 0 }} ms)">⧗</td>
+            {% elif cell.status == "error" %}
+              <td class="cell-error" data-pair="{{ orig.id }}:{{ dest.id }}"
+                  title="{{ orig.name }} → {{ dest.name }} · error: {{ cell.error_message or '?' }}">✕</td>
+            {% else %}
+              <td class="cell-pending" data-pair="{{ orig.id }}:{{ dest.id }}">?</td>
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Modal for drill-down — populated by clickHandler from embedded JSON -->
+<div id="modal" class="modal-back" hidden>
+  <div class="modal">
+    <header>
+      <h3 id="modal-title">Pair detail</h3>
+      <button type="button" class="modal-close" data-close aria-label="Close">×</button>
+    </header>
+    <div class="summary-line" id="modal-summary"></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<!-- All data embedded so the file is self-contained. Both the hubs map and
+     the cells map are needed by the click handler to format the modal. -->
+<script id="cov-hubs" type="application/json">{{ hubs|tojson }}</script>
+<script id="cov-cells" type="application/json">{{ cells|tojson }}</script>
+
+<script>
+(function () {
+  const HUBS = JSON.parse(document.getElementById('cov-hubs').textContent);
+  const CELLS = JSON.parse(document.getElementById('cov-cells').textContent);
+  const HUBS_BY_ID = Object.fromEntries(HUBS.map(h => [h.id, h]));
+
+  function fmtDuration(s) {
+    if (!s && s !== 0) return '—';
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h ? `${h}h${String(m).padStart(2, '0')}` : `${m}m`;
+  }
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    // No try/catch — `new Date(invalid)` doesn't throw, it returns a Date
+    // whose getTime() is NaN. Check for that explicitly and fall back to
+    // the raw string. (Sonar S2486 dislikes silent swallowing in catch.)
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+  function fmtDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
+  }
+  function escapeHTML(s) {
+    // Use replaceAll() (literal strings) instead of replace(/.../g, ...)
+    // — Sonar S6595 prefers it for readability and the regex form has
+    // no perf advantage here.
+    return String(s == null ? '' : s)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function renderLeg(leg) {
+    const mode = leg.mode || 'TRANSIT';
+    const dep = fmtTime(leg.departure);
+    const arr = fmtTime(leg.arrival);
+    const stops = `<span class="stops">${escapeHTML(leg.from_name || '?')}<span class="arrow">→</span>${escapeHTML(leg.to_name || '?')}</span>`;
+    const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
+    const headsign = leg.trip_headsign ? ` (${escapeHTML(leg.trip_headsign)})` : '';
+    const agency = leg.agency_name || leg.feed_id || '';
+    return `
+      <div class="leg">
+        <div class="mode ${escapeHTML(mode)}">${escapeHTML(mode)}</div>
+        <div class="when">${dep} → ${arr}</div>
+        <div>${stops}</div>
+        <div class="service">${escapeHTML(service)}${headsign}</div>
+        <div class="agency">${escapeHTML(agency)}</div>
+      </div>
+    `;
+  }
+
+  function renderTrip(trip) {
+    const dep = fmtTime(trip.departure_at);
+    const arr = fmtTime(trip.arrival_at);
+    const day = fmtDate(trip.departure_at);
+    const legs = (trip.legs || []).map(renderLeg).join('');
+    return `
+      <div class="trip">
+        <div class="trip-head">
+          <span class="rank">#${trip.rank + 1}</span>
+          <span class="when">${day} ${dep} → ${arr}</span>
+          <span class="duration">${fmtDuration(trip.duration_seconds)}</span>
+          <span class="transfers">${trip.num_transfers} transfer${trip.num_transfers === 1 ? '' : 's'}</span>
+          <span class="rank">${escapeHTML(trip.modes || '')}</span>
+        </div>
+        <div class="legs">${legs || '<div class="empty-trips">No legs recorded for this trip.</div>'}</div>
+      </div>
+    `;
+  }
+
+  function statusPill(status) {
+    const map = {
+      ok: { bg: 'var(--ok-bg)', fg: 'var(--ok)' },
+      no_route: { bg: 'var(--no-route-bg)', fg: 'var(--no-route)' },
+      timeout: { bg: 'var(--error-bg)', fg: 'var(--error)' },
+      error: { bg: 'var(--error-bg)', fg: 'var(--error)' },
+    };
+    const c = map[status] || { bg: '#eef2f5', fg: 'var(--muted)' };
+    return `<span class="pill" style="background:${c.bg};color:${c.fg}">${escapeHTML(status)}</span>`;
+  }
+
+  function openModal(pairKey) {
+    const [orig, dest] = pairKey.split(':');
+    const cell = CELLS[pairKey];
+    if (!cell) return;
+    const o = HUBS_BY_ID[orig], d = HUBS_BY_ID[dest];
+    const title = `${o ? o.name : orig} → ${d ? d.name : dest}`;
+    document.getElementById('modal-title').textContent = title;
+    const parts = [
+      statusPill(cell.status),
+      `${cell.response_ms || 0} ms`,
+    ];
+    if (cell.num_itineraries != null) parts.push(`${cell.num_itineraries} itineraries`);
+    if (cell.best_duration_seconds) parts.push(`best ${fmtDuration(cell.best_duration_seconds)}`);
+    if (cell.best_num_transfers != null) parts.push(`${cell.best_num_transfers} transfer${cell.best_num_transfers === 1 ? '' : 's'}`);
+    if (cell.best_operators) parts.push(`operators: <code>${escapeHTML(cell.best_operators)}</code>`);
+    if (cell.session_ids && cell.session_ids.length) parts.push(`sessions: <code>${escapeHTML(cell.session_ids.join(', '))}</code>`);
+    if (cell.error_message) parts.push(`error: <code>${escapeHTML(cell.error_message)}</code>`);
+    document.getElementById('modal-summary').innerHTML = parts.join(' · ');
+    const body = (cell.trips && cell.trips.length)
+      ? cell.trips.map(renderTrip).join('')
+      : '<div class="empty-trips">No itineraries recorded for this cell.</div>';
+    document.getElementById('modal-body').innerHTML = body;
+    document.getElementById('modal').hidden = false;
+  }
+
+  function closeModal() { document.getElementById('modal').hidden = true; }
+
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-pair]');
+    if (t) { openModal(t.dataset.pair); return; }
+    if (e.target.matches('[data-close]') || e.target.classList.contains('modal-back')) {
+      closeModal();
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeModal();
+  });
+})();
+</script>
+
+<details class="raw">
+  <summary>Raw export data (JSON) — for re-processing or import into other tools</summary>
+  <pre>{
+  "run": {{ run|tojson(indent=2) }},
+  "hubs": {{ hubs|tojson(indent=2) }},
+  "cells": {{ cells|tojson(indent=2) }}
+}</pre>
+</details>
+
+<footer class="report">
+  Generated by VIATOR · Network Coverage export · {{ run.created_at or "" }}
+</footer>
+
+</body>
+</html>
