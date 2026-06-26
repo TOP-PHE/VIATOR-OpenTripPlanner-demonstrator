@@ -385,7 +385,7 @@ def test_build_export_context_keys_cells_by_origin_dest() -> None:
         run=_stub_run(),
         results=results,
         hubs=[_stub_hub_info()],
-        trips_by_exec={},
+        trips_by_search={},
     )
     assert "p-nord:bxl-mid" in ctx["cells"]
     assert ctx["cells"]["p-nord:bxl-mid"]["status"] == "ok"
@@ -393,7 +393,7 @@ def test_build_export_context_keys_cells_by_origin_dest() -> None:
 
 
 def test_build_export_context_attaches_trips_by_journey_search_id() -> None:
-    """The cell's `trips` array should come from trips_by_exec keyed by
+    """The cell's `trips` array should come from trips_by_search keyed by
     journey_search_id. When a cell has no journey_search_id (a no-route
     or pending row), its trips list must be empty — not crash on missing
     key."""
@@ -437,7 +437,7 @@ def test_build_export_context_attaches_trips_by_journey_search_id() -> None:
         run=_stub_run(),
         results=results,
         hubs=[_stub_hub_info()],
-        trips_by_exec=trips,
+        trips_by_search=trips,
     )
     assert len(ctx["cells"]["p-nord:bxl-mid"]["trips"]) == 1
     assert ctx["cells"]["p-nord:bxl-mid"]["trips"][0]["duration_seconds"] == 4980
@@ -455,7 +455,7 @@ def test_build_export_context_run_meta_uses_started_at_not_created_at() -> None:
         run=_stub_run(),
         results=[],
         hubs=[_stub_hub_info()],
-        trips_by_exec={},
+        trips_by_search={},
     )
     # Template reads it as run.created_at — so the dict key stays "created_at"
     # but the value comes from run.started_at.
@@ -475,7 +475,7 @@ def test_build_export_context_serializes_hubs_via_pydantic() -> None:
             _stub_hub_info(),
             _stub_hub_info(id="bxl-mid", name="Bruxelles-Midi", short="BXL-MID"),
         ],
-        trips_by_exec={},
+        trips_by_search={},
     )
     assert isinstance(ctx["hubs"], list)
     assert all(isinstance(h, dict) for h in ctx["hubs"])
@@ -521,7 +521,7 @@ def test_build_export_context_handles_fanout_session_ids() -> None:
         run=_stub_run(),
         results=[r_fanout, r_legacy],
         hubs=[_stub_hub_info()],
-        trips_by_exec={},
+        trips_by_search={},
     )
     assert ctx["cells"]["p-nord:bxl-mid"]["session_ids"] == ["eu11-transit-motis", "eu-rail-motis"]
     assert ctx["cells"]["bxl-mid:p-nord"]["session_ids"] is None
@@ -570,7 +570,7 @@ def test_export_filename_handles_missing_started_at() -> None:
 
 # ─────────────────────── DB-touching helpers (mocked) ───────────────────────
 #
-# `_fetch_trips_by_exec` and `_resolve_hubs` issue real SQLAlchemy queries.
+# `_fetch_trips_by_search` and `_resolve_hubs` issue real SQLAlchemy queries.
 # Rather than spin up Postgres, mock the DB session's execute() chain —
 # enough to prove the queries are constructed and shaped correctly. The
 # integration tests in tests/integration/ exercise the real query path
@@ -586,11 +586,18 @@ class _MockScalars:
 
 
 class _MockExecuteResult:
+    """Supports both `.scalars().all()` (used by _resolve_hubs) and
+    `.all()` (used by _fetch_trips_by_search after the JOIN). Tests
+    feed the rows they expect each helper to receive."""
+
     def __init__(self, rows: list) -> None:
         self._rows = rows
 
     def scalars(self) -> _MockScalars:
         return _MockScalars(self._rows)
+
+    def all(self) -> list:
+        return self._rows
 
 
 class _MockDb:
@@ -608,97 +615,117 @@ class _MockDb:
         return _MockExecuteResult(self._rows)
 
 
-def test_fetch_trips_by_exec_returns_empty_when_no_exec_ids() -> None:
-    """If no result row has a journey_search_id, skip the DB query
-    entirely — saves a useless `WHERE execution_id IN ()` round-trip
+def _trip_stub(execution_id, rank=0, **overrides):
+    """Build a JourneyTrip-shaped row stub with sensible defaults so the
+    individual tests stay focused on what they're actually asserting."""
+    from datetime import datetime
+
+    base = {
+        "execution_id": execution_id,
+        "rank_in_response": rank,
+        "duration_seconds": 4980,
+        "num_transfers": 0,
+        "departure_at": datetime(2026, 6, 29, 6, 25),
+        "arrival_at": datetime(2026, 6, 29, 7, 48),
+        "modes": "RAIL",
+        "legs": [{"mode": "RAIL"}],
+    }
+    base.update(overrides)
+    return _StubResult(**base)
+
+
+def test_fetch_trips_by_search_returns_empty_when_no_search_ids() -> None:
+    """If no coverage_result row has a journey_search_id, skip the DB
+    query entirely — saves a useless `WHERE search_id IN ()` round-trip
     that some DBs (Postgres included) error on."""
-    from app.api.admin.network_coverage import _fetch_trips_by_exec
+    from app.api.admin.network_coverage import _fetch_trips_by_search
 
     db = _MockDb(rows=[])
-    out = _fetch_trips_by_exec(db, exec_ids=[])
+    out = _fetch_trips_by_search(db, search_ids=[])
     assert out == {}
     assert db.execute_call_count == 0
 
 
-def test_fetch_trips_by_exec_groups_rows_by_execution_id() -> None:
-    """Multiple trips can share an execution_id (OTP/MOTIS often returns
-    several itineraries for one query). They should be grouped into the
-    same list so the template's `cells[...].trips` is the right shape."""
-    from datetime import datetime
+def test_fetch_trips_by_search_groups_rows_by_search_id() -> None:
+    """Multiple trips can share a search_id (one search → one execution
+    → many trips in single-session mode; one search → many executions →
+    many trips in fanout mode). All trips for the same search must group
+    under one key — the template's `cells[...].trips` is keyed by
+    `journey_search_id` which IS the search_id."""
     from uuid import uuid4
 
-    from app.api.admin.network_coverage import _fetch_trips_by_exec
+    from app.api.admin.network_coverage import _fetch_trips_by_search
 
-    exec_a = uuid4()
-    exec_b = uuid4()
+    search_a = uuid4()
+    search_b = uuid4()
+    exec_a1 = uuid4()
+    exec_b1 = uuid4()
+    # The JOIN'd query returns (search_id, trip) tuples — the test mock
+    # passes them through as the `.all()` return value.
     rows = [
-        _StubResult(
-            execution_id=exec_a,
-            rank_in_response=0,
-            duration_seconds=4980,
-            num_transfers=0,
-            departure_at=datetime(2026, 6, 29, 6, 25),
-            arrival_at=datetime(2026, 6, 29, 7, 48),
-            modes="RAIL",
-            legs=[{"mode": "RAIL"}],
+        (search_a, _trip_stub(exec_a1, rank=0, legs=[{"mode": "RAIL"}])),
+        (
+            search_a,
+            _trip_stub(exec_a1, rank=1, num_transfers=1, legs=[{"mode": "RAIL"}, {"mode": "WALK"}]),
         ),
-        _StubResult(
-            execution_id=exec_a,
-            rank_in_response=1,
-            duration_seconds=5340,
-            num_transfers=1,
-            departure_at=datetime(2026, 6, 29, 7, 0),
-            arrival_at=datetime(2026, 6, 29, 8, 29),
-            modes="RAIL",
-            legs=[{"mode": "RAIL"}, {"mode": "WALK"}],
-        ),
-        _StubResult(
-            execution_id=exec_b,
-            rank_in_response=0,
-            duration_seconds=3600,
-            num_transfers=0,
-            departure_at=datetime(2026, 6, 29, 8, 0),
-            arrival_at=datetime(2026, 6, 29, 9, 0),
-            modes="RAIL",
-            legs=[{"mode": "RAIL"}],
-        ),
+        (search_b, _trip_stub(exec_b1, rank=0, duration_seconds=3600)),
     ]
     db = _MockDb(rows=rows)
-    out = _fetch_trips_by_exec(db, exec_ids=[exec_a, exec_b])
+    out = _fetch_trips_by_search(db, search_ids=[search_a, search_b])
     assert db.execute_call_count == 1
-    assert len(out[str(exec_a)]) == 2
-    assert len(out[str(exec_b)]) == 1
-    assert out[str(exec_a)][0]["rank"] == 0
-    assert out[str(exec_a)][0]["legs"] == [{"mode": "RAIL"}]
-    assert out[str(exec_a)][1]["num_transfers"] == 1
+    assert len(out[str(search_a)]) == 2
+    assert len(out[str(search_b)]) == 1
+    assert out[str(search_a)][0]["rank"] == 0
+    assert out[str(search_a)][0]["legs"] == [{"mode": "RAIL"}]
+    assert out[str(search_a)][1]["num_transfers"] == 1
 
 
-def test_fetch_trips_by_exec_isoformats_datetimes() -> None:
+def test_fetch_trips_by_search_isoformats_datetimes() -> None:
     """The Jinja template + browser JSON.parse expects ISO-formatted
     strings, not datetime objects (which the JSON encoder can't handle
     by default)."""
-    from datetime import datetime
     from uuid import uuid4
 
-    from app.api.admin.network_coverage import _fetch_trips_by_exec
+    from app.api.admin.network_coverage import _fetch_trips_by_search
 
+    search_id = uuid4()
     exec_id = uuid4()
+    db = _MockDb(rows=[(search_id, _trip_stub(exec_id, legs=[]))])
+    out = _fetch_trips_by_search(db, search_ids=[search_id])
+    assert isinstance(out[str(search_id)][0]["departure_at"], str)
+    assert out[str(search_id)][0]["departure_at"].startswith("2026-06-29T06:25")
+
+
+def test_fetch_trips_by_search_unions_fanout_executions() -> None:
+    """In fanout-mode runs, one search has multiple executions (one per
+    targeted session). The helper must UNION trips across all those
+    executions under the same search_id key — that's what the matrix
+    cell's `"X itineraries across N sessions"` summary depends on.
+
+    Regression lock for the bug fixed 2026-06-25: the original helper
+    keyed by execution_id, which silently returned empty trips for every
+    production cell because coverage_results stores the SEARCH id, not
+    the execution id. The JOIN through JourneySearchExecution is what
+    makes the keying right.
+    """
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _fetch_trips_by_search
+
+    search_id = uuid4()  # one search
+    exec_otp = uuid4()  # OTP engine produced this execution
+    exec_motis = uuid4()  # MOTIS engine produced this one
     rows = [
-        _StubResult(
-            execution_id=exec_id,
-            rank_in_response=0,
-            duration_seconds=4980,
-            num_transfers=0,
-            departure_at=datetime(2026, 6, 29, 6, 25),
-            arrival_at=datetime(2026, 6, 29, 7, 48),
-            modes="RAIL",
-            legs=[],
-        ),
+        # Both executions hang off the same search_id; the JOIN flattens
+        # them to (search_id, trip) tuples for the helper.
+        (search_id, _trip_stub(exec_otp, rank=0, modes="RAIL")),
+        (search_id, _trip_stub(exec_motis, rank=0, modes="RAIL,TRAM")),
+        (search_id, _trip_stub(exec_motis, rank=1, modes="RAIL")),
     ]
     db = _MockDb(rows=rows)
-    out = _fetch_trips_by_exec(db, exec_ids=[exec_id])
-    assert isinstance(out[str(exec_id)][0]["departure_at"], str)
-    assert out[str(exec_id)][0]["departure_at"].startswith("2026-06-29T06:25")
+    out = _fetch_trips_by_search(db, search_ids=[search_id])
+    assert len(out) == 1  # one key, not two — both executions union under it
+    assert len(out[str(search_id)]) == 3
 
 
 def test_resolve_hubs_returns_db_rows_when_present() -> None:

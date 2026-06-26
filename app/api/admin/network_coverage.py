@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
 from ...db import get_db
-from ...models import JourneyTrip, NetworkCoverageHub
+from ...models import JourneySearchExecution, JourneyTrip, NetworkCoverageHub
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import hub_derive, runner
@@ -485,30 +485,40 @@ def _resolve_hubs(db: DbSession) -> list[HubInfo]:
     ]
 
 
-def _fetch_trips_by_exec(
-    db: DbSession, exec_ids: list[uuid.UUID]
+def _fetch_trips_by_search(
+    db: DbSession, search_ids: list[uuid.UUID]
 ) -> dict[str, list[dict[str, Any]]]:
-    """Bulk-fetch every JourneyTrip linked to the given execution ids.
+    """Bulk-fetch every JourneyTrip linked (via JourneySearchExecution) to
+    the given JourneySearch ids.
 
-    One query regardless of how many cells the run has — keeps the export
-    endpoint O(1) DB round-trips even on a full 26x25 fanout matrix.
-    Returns a dict keyed by execution_id (stringified) so the cell-builder
-    can look trips up by `journey_search_id` in constant time.
+    Why the JOIN: `coverage_results.journey_search_id` is a FK to
+    `JourneySearch.id` (the parent search), not to `JourneySearchExecution.id`
+    (per-engine execution rows hung off it). Trips live under executions, so
+    the chain is search -> executions -> trips. One execution per session in
+    fanout mode; a single execution per search in single-session mode.
+
+    Keys the result by `str(search_id)` so the cell-builder can index
+    directly via `coverage_results.journey_search_id` without any further
+    translation. When a search has multiple executions (fanout), their
+    trips are unioned under the same key — matches what the operator sees
+    in the matrix cell ("X itineraries across N sessions").
+
+    Was previously `_fetch_trips_by_exec` keying off `execution_id`; that
+    looked correct in tests with synthetic data but failed in production
+    because real coverage rows store the *search_id*, not the execution_id.
+    Fixed 2026-06-25 after every exported cell came back trip-less.
     """
-    if not exec_ids:
+    if not search_ids:
         return {}
-    trip_rows = (
-        db.execute(
-            select(JourneyTrip)
-            .where(JourneyTrip.execution_id.in_(exec_ids))
-            .order_by(JourneyTrip.execution_id, JourneyTrip.rank_in_response)
-        )
-        .scalars()
-        .all()
-    )
+    rows = db.execute(
+        select(JourneySearchExecution.search_id, JourneyTrip)
+        .join(JourneyTrip, JourneyTrip.execution_id == JourneySearchExecution.id)
+        .where(JourneySearchExecution.search_id.in_(search_ids))
+        .order_by(JourneySearchExecution.search_id, JourneyTrip.rank_in_response)
+    ).all()
     out: dict[str, list[dict[str, Any]]] = {}
-    for t in trip_rows:
-        out.setdefault(str(t.execution_id), []).append(
+    for search_id, t in rows:
+        out.setdefault(str(search_id), []).append(
             {
                 "rank": t.rank_in_response,
                 "duration_seconds": t.duration_seconds,
@@ -527,7 +537,7 @@ def _build_export_context(
     run: Any,
     results: list[Any],
     hubs: list[HubInfo],
-    trips_by_exec: dict[str, list[dict[str, Any]]],
+    trips_by_search: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
     """Pure data-shaping from DB rows → template context dict.
 
@@ -551,7 +561,9 @@ def _build_export_context(
             "best_operators": r.best_operators,
             "error_message": r.error_message,
             "session_ids": getattr(r, "session_ids", None),
-            "trips": trips_by_exec.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+            "trips": trips_by_search.get(str(r.journey_search_id), [])
+            if r.journey_search_id
+            else [],
         }
     run_meta = {
         "id": str(run.id),
@@ -676,12 +688,12 @@ def export_run_html(
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
         raise HTTPException(404, "Run not found")
-    exec_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
+    search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
     context = _build_export_context(
         run=run,
         results=results,
         hubs=_resolve_hubs(db),
-        trips_by_exec=_fetch_trips_by_exec(db, exec_ids),
+        trips_by_search=_fetch_trips_by_search(db, search_ids),
     )
     response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
     response.headers["Content-Disposition"] = f'attachment; filename="{_export_filename(run)}"'
