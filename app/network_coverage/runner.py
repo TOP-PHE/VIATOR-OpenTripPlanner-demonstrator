@@ -94,7 +94,7 @@ _COVERAGE_NUM_ITINERARIES = 50
 _COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h — same as live UI baseline
 
 
-def _load_active_hubs(db: DbSession) -> list[Hub]:
+def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
     """v0.1.31 — read the active hub list from `network_coverage_hubs`.
 
     Falls back to the static `app/network_coverage/hubs.py` HUBS list
@@ -106,24 +106,30 @@ def _load_active_hubs(db: DbSession) -> list[Hub]:
     sort the matrix UI uses, so result rows index cleanly to cells
     without any client-side reordering.
     """
-    rows = (
-        db.execute(
-            select(NetworkCoverageHub)
-            .where(NetworkCoverageHub.is_active.is_(True))
-            .order_by(
-                NetworkCoverageHub.country,
-                NetworkCoverageHub.sort_order,
-                NetworkCoverageHub.id,
-            )
-        )
-        .scalars()
-        .all()
+    q = select(NetworkCoverageHub).where(NetworkCoverageHub.is_active.is_(True))
+    if countries:
+        # Country codes are stored uppercase on insert (see HubCreate
+        # normalisation); we uppercase the filter list here so an operator
+        # who types lowercase 'fr' in the form still matches.
+        q = q.where(NetworkCoverageHub.country.in_([c.upper() for c in countries]))
+    q = q.order_by(
+        NetworkCoverageHub.country,
+        NetworkCoverageHub.sort_order,
+        NetworkCoverageHub.id,
     )
+    rows = db.execute(q).scalars().all()
     if rows:
         return [
             Hub(id=r.id, name=r.name, short=r.short, region=r.region or "", lat=r.lat, lon=r.lon)
             for r in rows
         ]
+    # Country filter that returns nothing is a programming/UI error — the
+    # caller should have validated the codes before creating the run. We
+    # do NOT silently fall back to the static HUBS in that case (that
+    # would build the matrix against the wrong country set and confuse
+    # the operator).
+    if countries:
+        return []
     # Empty-table fallback — keeps the runner working in tests and
     # the brief migration window before seed completes.
     log.warning(
@@ -176,6 +182,7 @@ def create_run(
     depart_at: datetime,
     direction: str = "both",
     mode: str = MODE_SINGLE_SESSION,
+    countries: list[str] | None = None,
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
@@ -204,8 +211,17 @@ def create_run(
     if mode == MODE_FANOUT and session_id is not None:
         raise ValueError("mode='fanout' must not specify a session_id")
 
-    hubs = _load_active_hubs(db)
+    # Normalise countries to uppercase + drop empty list — empty means
+    # "no filter" so the run row stores NULL rather than [], keeping
+    # post-hoc "did this run filter?" checks simple (`countries is None`).
+    norm_countries = [c.upper() for c in countries] if countries else None
+    hubs = _load_active_hubs(db, countries=norm_countries)
     if not hubs:
+        if norm_countries:
+            raise ValueError(
+                f"No active hubs match countries={norm_countries!r} — "
+                "add hubs with those country codes or relax the filter"
+            )
         raise ValueError("No active hubs configured — add some via the manage-hubs UI")
     pairs = _hub_pairs(hubs, direction)
 
@@ -224,6 +240,7 @@ def create_run(
         status="pending",
         total_pairs=len(pairs),
         mode=mode,
+        countries=norm_countries,
     )
     db.add(run)
     db.flush()

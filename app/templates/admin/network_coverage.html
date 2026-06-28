@@ -204,15 +204,32 @@
             <option value="{{ s.id }}">{{ s.name }} ({{ s.id }})</option>
           {% endfor %}
         </select>
-        <label>Departure</label>
+        <label for="cov-depart">Departure</label>
         <input type="datetime-local" name="depart_at" id="cov-depart">
-        <label>Direction
+        <label for="cov-direction">Direction
           <span class="hint" style="font-weight: normal">(both = 650 pairs · single = 325)</span>
         </label>
-        <select name="direction">
+        <select name="direction" id="cov-direction">
           <option value="both" selected>Both directions (650 pairs)</option>
           <option value="single">Single direction only (325 pairs)</option>
         </select>
+        {# Country subset — restricts both matrix axes to hubs in the
+           checked countries. Default = none checked = full matrix
+           (legacy behaviour). The checkbox list is populated on bootstrap
+           from /hubs so a newly-added country shows up without a code
+           release. #}
+        <fieldset class="cov-countries" style="border: 0; margin: 0.6rem 0 0; padding: 0; font-size: 0.85rem">
+          <legend style="margin-top: 0; padding: 0; font-weight: 600; font-size: 0.85rem">
+            Countries <span class="hint" style="font-weight: normal" id="cov-countries-hint">(all)</span>
+          </legend>
+          <div id="cov-countries-list" style="display: flex; flex-wrap: wrap; gap: 0.35rem 0.6rem; margin-top: 0.25rem">
+            <em class="hint">Loading…</em>
+          </div>
+          <p class="hint" style="margin: 0.3rem 0 0; font-size: 0.72rem">
+            None checked = all countries (full matrix). Pick {FR} for a single-country smoke,
+            or {FR, CH} for a fast cross-border probe.
+          </p>
+        </fieldset>
         <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
       </form>
     {% endif %}
@@ -367,8 +384,57 @@ if (departInput) departInput.value = nextMondayMorning();
     const r = await fetch('/api/admin/network-coverage/hubs');
     if (r.ok) HUBS = await r.json();
   } catch (err) { /* ignore */ }
+  renderCountryCheckboxes();
   await reloadRunList();
 })();
+
+// Build the country-checkbox row from the live HUBS list. None checked =
+// no filter (full matrix). Each toggle recomputes the pair-count hint
+// next to the direction picker so the operator can preview "how big is
+// the slice I just picked".
+function renderCountryCheckboxes() {
+  const list = document.getElementById('cov-countries-list');
+  if (!list) return;
+  const codes = [...new Set(HUBS.map(h => (h.country || '').toUpperCase()).filter(Boolean))].sort();
+  if (!codes.length) {
+    list.innerHTML = '<em class="hint">No hubs configured.</em>';
+    return;
+  }
+  list.innerHTML = codes.map(c =>
+    `<label style="display: inline-flex; align-items: center; gap: 0.25rem; font-weight: normal">
+      <input type="checkbox" name="countries" value="${escHTML(c)}"> ${escHTML(c)}
+    </label>`
+  ).join('');
+  list.querySelectorAll('input[name="countries"]').forEach(cb => {
+    cb.addEventListener('change', updateCoveragePairHint);
+  });
+  updateCoveragePairHint();
+}
+
+// Recompute "n×(n−1) directional pairs / n×(n−1)/2 unordered" from the
+// currently-checked country set (or all hubs when nothing is checked).
+// Updates both the Direction <option> labels and the small countries hint.
+function updateCoveragePairHint() {
+  const checked = [...document.querySelectorAll('input[name="countries"]:checked')].map(i => i.value);
+  const subset = checked.length === 0
+    ? HUBS
+    : HUBS.filter(h => checked.includes((h.country || '').toUpperCase()));
+  const n = subset.length;
+  const both = n * (n - 1);
+  const single = Math.floor(both / 2);
+  const dirSel = document.getElementById('cov-direction');
+  if (dirSel) {
+    const opts = dirSel.options;
+    if (opts[0]) opts[0].textContent = `Both directions (${both} pairs)`;
+    if (opts[1]) opts[1].textContent = `Single direction only (${single} pairs)`;
+  }
+  const hint = document.getElementById('cov-countries-hint');
+  if (hint) {
+    hint.textContent = checked.length === 0
+      ? `(all · ${n} hubs)`
+      : `(${checked.join('+')} · ${n} hubs)`;
+  }
+}
 
 async function reloadRunList(activeId) {
   const el = document.getElementById('run-list');
@@ -384,9 +450,16 @@ async function reloadRunList(activeId) {
       const isActive = r.id === activeId;
       const cls = isActive ? 'run-row active' : 'run-row';
       const pct = r.total_pairs ? Math.round(100 * r.completed_pairs / r.total_pairs) : 0;
+      // Country-filter badge ("FR+CH") for runs that were restricted to
+      // a subset of countries; full-matrix runs get no badge so the row
+      // stays uncluttered.
+      const countryBadge = (Array.isArray(r.countries) && r.countries.length)
+        ? `<span class="cov-pill" data-status="filtered" title="Filtered to ${escHTML(r.countries.join(', '))}">${escHTML(r.countries.join('+'))}</span>`
+        : '';
       return `<div class="${cls}" data-run-id="${escHTML(r.id)}">
         <div class="top">
           <strong>${escHTML(r.session_label)}</strong>
+          ${countryBadge}
           <span class="cov-pill" data-status="${escHTML(r.status)}">${escHTML(r.status)}</span>
         </div>
         <div class="meta">
@@ -446,6 +519,13 @@ document.getElementById('cov-form')?.addEventListener('submit', async (e) => {
   };
   if (mode === 'single_session') {
     body.session_id = fd.get('session_id');
+  }
+  // Country filter — FormData.getAll on the 'countries' checkbox group
+  // returns every checked value; empty array means "no filter" which we
+  // omit from the body so the API treats it the same as a legacy submit.
+  const checkedCountries = fd.getAll('countries');
+  if (checkedCountries.length > 0) {
+    body.countries = checkedCountries;
   }
   const btn = document.getElementById('cov-go');
   btn.disabled = true; const original = btn.textContent; btn.textContent = 'Starting…';

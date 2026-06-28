@@ -137,6 +137,14 @@ class NetworkCoverageRun(Base):
     # (e.g. average response time, slowest pair, list of timed-out pairs).
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
+    # Optional country-subset filter (ISO 3166-1 alpha-2 codes). NULL =
+    # no filter, the whole active hub list participates (legacy behaviour).
+    # When set, both matrix axes are restricted to hubs whose `country`
+    # is in the list — drops a 50-hub by 50-hub by 2-direction matrix
+    # down to a ~100-pair smoke test for cross-border work without
+    # having to tag hubs into named groups.
+    countries: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
 
 class NetworkCoverageResult(Base):
     __tablename__ = "network_coverage_results"
