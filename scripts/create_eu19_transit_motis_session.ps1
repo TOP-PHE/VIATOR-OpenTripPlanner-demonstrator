@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Create the VIATOR "eu19-transit-motis" 19-country session via API,
     upload existing eu11 NAP timetable files, and pre-wire URL providers
