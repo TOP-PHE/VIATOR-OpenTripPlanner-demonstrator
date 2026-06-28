@@ -425,6 +425,46 @@ setupAutocomplete('to');
 const now = new Date(Date.now() + 10*60*1000);
 document.getElementById('depart').value = now.toISOString().slice(0,16);
 
+// v0.1.44 — pre-fill from URL query params so the "Re-run live in journey
+// UI" link from the network-coverage cell modal can hand off the exact
+// origin/dest/datetime that produced a no_route. Accepted params:
+//   from_lat, from_lon, from_name, from_uic
+//   to_lat,   to_lon,   to_name,   to_uic
+//   depart_at  (ISO 8601, e.g. 2026-06-29T06:00:00 — second portion ignored
+//               by the datetime-local input)
+// Each missing param leaves its corresponding default in place; passing
+// from_lat without from_lon would silently fail the search at submit (the
+// validator below requires both), so we treat coords as a pair: only
+// populate when both are present.
+(function prefillFromQuery() {
+  const qs = new URLSearchParams(window.location.search);
+  function setPair(prefix) {
+    const lat = qs.get(prefix + '_lat');
+    const lon = qs.get(prefix + '_lon');
+    if (!lat || !lon) return;
+    document.getElementById(prefix + '-lat').value = lat;
+    document.getElementById(prefix + '-lon').value = lon;
+    const name = qs.get(prefix + '_name') || '';
+    const uic = qs.get(prefix + '_uic') || '';
+    document.getElementById(prefix + '-name').value = name;
+    document.getElementById(prefix + '-uic').value = uic;
+    // The visible <input id="from"|"to"> shown to the user (the
+    // autocomplete textbox) lives separately from the hidden coord
+    // fields. Set it so the operator sees what they're searching for.
+    const visible = document.getElementById(prefix);
+    if (visible && name) visible.value = name;
+  }
+  setPair('from');
+  setPair('to');
+  // datetime-local wants YYYY-MM-DDTHH:MM (no seconds, no TZ). Strip
+  // both — any tz suffix would be silently dropped by the input but
+  // the slice keeps the field's `.value` stable for the submit handler.
+  const depart = qs.get('depart_at');
+  if (depart) {
+    document.getElementById('depart').value = depart.slice(0, 16);
+  }
+})();
+
 document.getElementById('journey-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   // v0.1.35 — reset the inline #msg at the start of every submit so a

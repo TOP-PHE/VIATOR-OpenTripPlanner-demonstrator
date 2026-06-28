@@ -386,6 +386,7 @@
 
 let HUBS = [];           // populated from /api/admin/network-coverage/hubs on load
 let CURRENT_RUN_ID = null;
+let CURRENT_RUN_DEPART_AT = null;  // ISO string from the loaded run row; used to deep-link the journey UI with the same datetime that produced the cell
 let CURRENT_POLL_HANDLE = null;
 // v0.1.29 — matrix view mode. "duration" (best/min duration per cell, the
 // original v0.1.27 behaviour), "count" (trips/day per cell, heatmap by
@@ -602,6 +603,7 @@ async function refreshRun() {
   const r = await fetch(`/api/admin/network-coverage/runs/${CURRENT_RUN_ID}`);
   if (!r.ok) return;
   const run = await r.json();
+  CURRENT_RUN_DEPART_AT = run.depart_at || null;
   renderRun(run);
   if (run.status !== 'running' && run.status !== 'pending') {
     if (CURRENT_POLL_HANDLE) { clearInterval(CURRENT_POLL_HANDLE); CURRENT_POLL_HANDLE = null; }
@@ -746,9 +748,16 @@ async function openDetailModal(originId, destId, result) {
   document.getElementById('cov-modal-title').textContent =
     `${orig ? orig.name : originId} → ${dest ? dest.name : destId}`;
   document.getElementById('cov-modal-meta').innerHTML = renderModalMeta(result);
-  // Re-run link stays as a fallback below the inline trip render.
+  // Re-run link stays as a fallback below the inline trip render. We
+  // include `depart_at` (from the loaded run) so the journey UI lands
+  // with the exact origin / dest / datetime that produced this cell —
+  // not the page's default depart of "now + 10 min", which would skew
+  // any comparison against this cell's result.
+  const departParam = CURRENT_RUN_DEPART_AT
+    ? '&depart_at=' + encodeURIComponent(CURRENT_RUN_DEPART_AT)
+    : '';
   const rerunLink = (orig && dest)
-    ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}" target="_blank">↗ Re-run live in the journey UI</a></p>`
+    ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}${departParam}" target="_blank">↗ Re-run live in the journey UI</a></p>`
     : '';
   const modalBody = document.getElementById('cov-modal-body');
   modalBody.innerHTML = '<p class="hint">Loading itineraries…</p>' + rerunLink;
