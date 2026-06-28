@@ -48,7 +48,7 @@ from ...models import (
 )
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
-from ...network_coverage import hub_derive, runner
+from ...network_coverage import external_verify, hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
@@ -62,6 +62,14 @@ router = APIRouter(
 # and the cell-trips endpoints. Constant so a future rename / i18n only
 # touches one site (Sonar S1192).
 _RUN_NOT_FOUND = "Run not found"
+
+# Shared 404 detail for cell lookups within a run — used by the
+# verify-external endpoint. Mirrors the _RUN_NOT_FOUND pattern.
+_CELL_NOT_FOUND = "Cell (origin,dest) not found in this run"
+
+# Shared 404 detail for hub lookups by id — both the verify-external
+# endpoint and any future per-hub action surfaces use this.
+_HUB_NOT_FOUND = "Hub not found"
 
 
 # ─────────────────────────── pydantic shapes ────────────────────────────
@@ -887,6 +895,68 @@ def get_cell_trips(
         direction=run.direction,
         outbound=_row_to_direction(outbound_row),
         return_=return_direction,
+    )
+
+
+@router.get(
+    "/runs/{run_id}/cells/{origin_id}/{dest_id}/verify-external",
+    responses={
+        404: {"description": f"{_RUN_NOT_FOUND} / {_CELL_NOT_FOUND} / {_HUB_NOT_FOUND}"},
+    },
+)
+async def verify_cell_external(
+    run_id: uuid.UUID,
+    origin_id: str,
+    dest_id: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> external_verify.VerifyResult:
+    """Ask an external journey planner (DB's HAFAS backend) whether
+    this specific pair has a route at the run's depart_at, so the
+    operator can disambiguate "VIATOR's data is missing a service" from
+    "there is genuinely no service on this date".
+
+    Designed for click-to-verify on `no_route` cells in the matrix
+    modal. Operator-driven (rate cap is implicit in click cadence), no
+    persistence — purely a live check that runs once per click.
+
+    Implementation: looks up the run for depart_at, the cell row to
+    confirm it exists (and bind the pair to a real coverage cell, not
+    a typed-in URL), the two hub rows for coordinates, then calls
+    `external_verify.verify_via_db_hafas` and returns its result
+    verbatim.
+    """
+    run = db.get(NetworkCoverageRun, run_id)
+    if run is None:
+        raise HTTPException(404, _RUN_NOT_FOUND)
+    # Confirm the cell exists in this run — prevents the endpoint from
+    # being used as a "verify any pair" oracle bypass of the matrix.
+    cell = (
+        db.execute(
+            select(NetworkCoverageResult)
+            .where(NetworkCoverageResult.run_id == run_id)
+            .where(NetworkCoverageResult.origin_hub_id == origin_id)
+            .where(NetworkCoverageResult.dest_hub_id == dest_id)
+        )
+        .scalars()
+        .first()
+    )
+    if cell is None:
+        raise HTTPException(404, _CELL_NOT_FOUND)
+    origin_hub = db.get(NetworkCoverageHub, origin_id)
+    dest_hub = db.get(NetworkCoverageHub, dest_id)
+    if origin_hub is None or dest_hub is None:
+        # Hub may have been soft-deleted since the run; the cell row
+        # carries the slug as a denormalised string so we'd lose the
+        # coords. Surface as 404 — operator restores the hub if they
+        # want this verifiable.
+        raise HTTPException(404, _HUB_NOT_FOUND)
+    return await external_verify.verify_via_db_hafas(
+        from_lat=origin_hub.lat,
+        from_lon=origin_hub.lon,
+        to_lat=dest_hub.lat,
+        to_lon=dest_hub.lon,
+        depart_at=run.depart_at,
     )
 
 
