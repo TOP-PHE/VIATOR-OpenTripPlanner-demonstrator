@@ -51,7 +51,7 @@ def test_coord_to_micro_rounds_correctly(lat_or_lon: float, expected_micro: int)
     [
         ("040000", 4 * 3600),  # 4h
         ("000130", 90),  # 1m30s
-        ("0102030000", 24 * 3600 + 2 * 3600 + 3 * 60),  # 1d 02:03:00
+        ("01020300", 24 * 3600 + 2 * 3600 + 3 * 60),  # 1d 02:03:00 (DDHHMMSS)
         ("000000", 0),
         ("999999", 99 * 3600 + 99 * 60 + 99),  # malformed but parses
     ],
