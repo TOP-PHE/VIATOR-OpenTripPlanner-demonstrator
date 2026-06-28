@@ -763,7 +763,6 @@ def export_run_html(
 
 @router.get(
     "/runs/{run_id}",
-    response_model=RunDetail,
     responses={404: {"description": _RUN_NOT_FOUND}},
 )
 def get_run(
