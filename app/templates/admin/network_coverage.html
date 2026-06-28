@@ -861,21 +861,19 @@ function renderDirectionSection(label, subtitle, dir) {
     const body = trips.length
       ? trips.map(renderTripCard).join('')
       : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
-    // External-verify button — only for no_route cells. Disambiguates
-    // "our data is missing a service" from "no service exists" by
-    // asking DB's HAFAS backend the same question. Each direction gets
-    // its own button + placeholder so Outbound and Return verdicts can
-    // be displayed independently.
-    const verifyBlock = dir.status === 'no_route'
-      ? `<div class="cov-verify-block" data-direction="${escHTML(label)}">
-          <button type="button" class="cov-verify-btn"
-            data-origin="${escHTML(dir.origin_hub_id)}"
-            data-dest="${escHTML(dir.dest_hub_id)}">
-            Verify externally (DB / HAFAS)
-          </button>
-          <div class="cov-verify-result"></div>
-        </div>`
-      : '';
+    // External-verify button — DISABLED while the upstream DB HAFAS
+    // endpoint is dead (DNS for reiseauskunft.bahn.de fails platform-
+    // wide, and the community proxies that wrap it return 503 because
+    // they can't reach it either). Resurrect this block (and the
+    // GET /verify-external endpoint behind it) once we either:
+    //   - swap the adapter to a working source (e.g. transport.opendata.ch
+    //     for CH-touching pairs, iRail for BE, NS for NL), OR
+    //   - DB stabilises the new backend and the public HAFAS proxies
+    //     pick up the new URL.
+    // The backend module `app/network_coverage/external_verify.py` and
+    // the API endpoint stay in place so resurrection is a one-line
+    // template change once the source works again.
+    const verifyBlock = '';
     // Outbound starts open, return stays collapsed by default — keeps the
     // initial modal height manageable while still being one click away.
     const isOpen = label === 'Outbound' ? 'open' : '';
