@@ -58,6 +58,11 @@ router = APIRouter(
     tags=["admin", "network-coverage"],
 )
 
+# Shared 404 detail for runs lookups — used by the export, the run-detail,
+# and the cell-trips endpoints. Constant so a future rename / i18n only
+# touches one site (Sonar S1192).
+_RUN_NOT_FOUND = "Run not found"
+
 
 # ─────────────────────────── pydantic shapes ────────────────────────────
 
@@ -743,7 +748,7 @@ def export_run_html(
     """
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
-        raise HTTPException(404, "Run not found")
+        raise HTTPException(404, _RUN_NOT_FOUND)
     search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
     context = _build_export_context(
         run=run,
@@ -766,7 +771,7 @@ def get_run(
     the run is in 'running' status; static once 'completed'."""
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
-        raise HTTPException(404, "Run not found")
+        raise HTTPException(404, _RUN_NOT_FOUND)
     summary = _run_to_summary(run)
     return RunDetail(
         **summary.model_dump(),
@@ -792,7 +797,10 @@ def get_run(
     )
 
 
-@router.get("/runs/{run_id}/cells/{origin_id}/{dest_id}/trips")
+@router.get(
+    "/runs/{run_id}/cells/{origin_id}/{dest_id}/trips",
+    responses={404: {"description": _RUN_NOT_FOUND}},
+)
 def get_cell_trips(
     run_id: uuid.UUID,
     origin_id: str,
@@ -815,7 +823,7 @@ def get_cell_trips(
     """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
-        raise HTTPException(404, "Run not found")
+        raise HTTPException(404, _RUN_NOT_FOUND)
 
     # Fetch both result rows in one round-trip. The UNIQUE constraint
     # `(run_id, origin, dest)` means we get at most 2 rows here.

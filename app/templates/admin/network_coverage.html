@@ -727,42 +727,57 @@ async function openDetailModal(originId, destId, result) {
   const dest = HUBS.find(h => h.id === destId);
   document.getElementById('cov-modal-title').textContent =
     `${orig ? orig.name : originId} → ${dest ? dest.name : destId}`;
-  document.getElementById('cov-modal-meta').innerHTML = `
-    Status: <span class="cov-pill" data-status="${escHTML(result.status)}">${escHTML(result.status)}</span>
-    · ${result.response_ms || 0}ms
-    ${result.num_itineraries !== null ? '· ' + result.num_itineraries + ' itineraries' : ''}
-    ${result.best_duration_seconds ? '· best ' + fmtDuration(result.best_duration_seconds) : ''}
-    ${result.best_num_transfers !== null && result.best_num_transfers !== undefined
-        ? '· ' + result.best_num_transfers + ' transfer' + (result.best_num_transfers === 1 ? '' : 's')
-        : ''}
-    ${result.best_operators ? '<br>Operators: <code>' + escHTML(result.best_operators) + '</code>' : ''}
-    ${result.error_message ? '<br>Error: <code>' + escHTML(result.error_message) + '</code>' : ''}
-  `;
-  // Re-run link stays as a fallback even when the inline trips render.
+  document.getElementById('cov-modal-meta').innerHTML = renderModalMeta(result);
+  // Re-run link stays as a fallback below the inline trip render.
   const rerunLink = (orig && dest)
     ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}" target="_blank">↗ Re-run live in the journey UI</a></p>`
     : '';
   const modalBody = document.getElementById('cov-modal-body');
   modalBody.innerHTML = '<p class="hint">Loading itineraries…</p>' + rerunLink;
   document.getElementById('cov-modal').hidden = false;
+  const tripsHtml = await fetchCellTripsHtml(originId, destId, orig, dest);
+  modalBody.innerHTML = tripsHtml + rerunLink;
+}
 
-  if (!CURRENT_RUN_ID) {
-    modalBody.innerHTML = '<p class="hint">No active run — cannot fetch trips.</p>' + rerunLink;
-    return;
-  }
-  try {
-    const url = `/api/admin/network-coverage/runs/${encodeURIComponent(CURRENT_RUN_ID)}`
-              + `/cells/${encodeURIComponent(originId)}/${encodeURIComponent(destId)}/trips`;
-    const r = await fetch(url);
-    if (!r.ok) {
-      modalBody.innerHTML = `<p class="hint">Failed to load itineraries (${r.status}).</p>` + rerunLink;
-      return;
+// Render the modal's top "Status · 775ms · 3 itineraries …" meta strip.
+// Extracted so the nested-transfers ternary (was inside another ternary)
+// lives in `fmtTransfers` — Sonar S3358 dislikes ternary-in-ternary.
+function renderModalMeta(result) {
+  return `
+    Status: <span class="cov-pill" data-status="${escHTML(result.status)}">${escHTML(result.status)}</span>
+    · ${result.response_ms || 0}ms
+    ${result.num_itineraries !== null ? '· ' + result.num_itineraries + ' itineraries' : ''}
+    ${result.best_duration_seconds ? '· best ' + fmtDuration(result.best_duration_seconds) : ''}
+    ${fmtTransfers(result.best_num_transfers)}
+    ${result.best_operators ? '<br>Operators: <code>' + escHTML(result.best_operators) + '</code>' : ''}
+    ${result.error_message ? '<br>Error: <code>' + escHTML(result.error_message) + '</code>' : ''}
+  `;
+}
+
+function fmtTransfers(n) {
+  if (n === null || n === undefined) return '';
+  return '· ' + n + ' transfer' + (n === 1 ? '' : 's');
+}
+
+// Fetch the cell-trips endpoint and produce the inline trip-sections HTML.
+// Positive-condition structure throughout (no `if (!x)` patterns) — keeps
+// SonarJS S6644 happy and reads as "happy path first, fallback last".
+async function fetchCellTripsHtml(originId, destId, orig, dest) {
+  if (CURRENT_RUN_ID) {
+    try {
+      const url = `/api/admin/network-coverage/runs/${encodeURIComponent(CURRENT_RUN_ID)}`
+                + `/cells/${encodeURIComponent(originId)}/${encodeURIComponent(destId)}/trips`;
+      const r = await fetch(url);
+      if (r.ok) {
+        const payload = await r.json();
+        return renderCellTrips(payload, orig, dest);
+      }
+      return `<p class="hint">Failed to load itineraries (${r.status}).</p>`;
+    } catch (err) {
+      return `<p class="hint">Failed to load itineraries: ${escHTML(err.message)}</p>`;
     }
-    const payload = await r.json();
-    modalBody.innerHTML = renderCellTrips(payload, orig, dest) + rerunLink;
-  } catch (err) {
-    modalBody.innerHTML = `<p class="hint">Failed to load itineraries: ${escHTML(err.message)}</p>` + rerunLink;
   }
+  return '<p class="hint">No active run — cannot fetch trips.</p>';
 }
 
 // Render the two-section payload from
@@ -786,30 +801,31 @@ function renderCellTrips(payload, orig, dest) {
 }
 
 function renderDirectionSection(label, subtitle, dir) {
-  if (!dir) {
-    // Either the row was missing (data gap) or — for direction='single'
-    // — we won't even get here because the caller suppresses it. This
-    // branch only fires on a true data gap.
-    return `<details class="cov-trip-section" open>
-      <summary><strong>${escHTML(label)}</strong> <span class="hint">(${escHTML(subtitle)})</span></summary>
-      <p class="hint" style="padding: 0.4rem 0">No coverage row recorded for this direction.</p>
-    </details>`;
+  // Positive-condition first (S6644). The missing-row branch — either
+  // the recorder write crashed or direction='single' suppressed the
+  // reverse pair, though the caller pre-filters direction='single' so
+  // this only fires on a true data gap — falls through to the bottom.
+  if (dir) {
+    const trips = dir.trips || [];
+    const head = `<summary>
+        <strong>${escHTML(label)}</strong>
+        <span class="hint">(${escHTML(subtitle)})</span>
+        <span class="cov-pill" data-status="${escHTML(dir.status)}">${escHTML(dir.status)}</span>
+        ${dir.num_itineraries != null ? '· ' + dir.num_itineraries + ' itineraries' : ''}
+        ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
+      </summary>`;
+    const body = trips.length
+      ? trips.map(renderTripCard).join('')
+      : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
+    // Outbound starts open, return stays collapsed by default — keeps the
+    // initial modal height manageable while still being one click away.
+    const isOpen = label === 'Outbound' ? 'open' : '';
+    return `<details class="cov-trip-section" ${isOpen}>${head}${body}</details>`;
   }
-  const trips = dir.trips || [];
-  const head = `<summary>
-      <strong>${escHTML(label)}</strong>
-      <span class="hint">(${escHTML(subtitle)})</span>
-      <span class="cov-pill" data-status="${escHTML(dir.status)}">${escHTML(dir.status)}</span>
-      ${dir.num_itineraries != null ? '· ' + dir.num_itineraries + ' itineraries' : ''}
-      ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
-    </summary>`;
-  const body = trips.length
-    ? trips.map(renderTripCard).join('')
-    : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
-  // Outbound starts open, return stays collapsed by default — keeps the
-  // initial modal height manageable while still being one click away.
-  const isOpen = label === 'Outbound' ? 'open' : '';
-  return `<details class="cov-trip-section" ${isOpen}>${head}${body}</details>`;
+  return `<details class="cov-trip-section" open>
+    <summary><strong>${escHTML(label)}</strong> <span class="hint">(${escHTML(subtitle)})</span></summary>
+    <p class="hint" style="padding: 0.4rem 0">No coverage row recorded for this direction.</p>
+  </details>`;
 }
 
 function fmtTime(iso) {
