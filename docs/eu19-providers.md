@@ -276,21 +276,46 @@ URL before bootstrap.
 - **Important — separate stop place file**: The NO NAP ALSO publishes a dedicated **Stop Place Register (NSR — Nasjonalt Stoppestedsregister)** as a distinct dataset, referenced from https://developer.entur.org/pages-intro-files. This contains the authoritative national stop register that all NO transit operators reference. See the cross-cutting "Stop-point identification" section below for why this matters for the eu19 corridor as a whole.
 - **Verdict**: ✅ Ready to onboard — operator has confirmed the canonical URLs
 
-### 🇵🇱 PL — Poland · ⚠ NAP probe needed + operator scope decision
+### 🇵🇱 PL — Poland · ✅ Inventoried via NAP API (2026-06-29) — much better than expected
 
-- **Official MMTIS NAP**: **https://dane.gov.pl/en/dataset/1739,NAP** (dane.gov.pl is Poland's main open-data portal; dataset 1739 is the NAP-specific one)
-- **Operator probe action**:
-  1. Visit https://dane.gov.pl/en/dataset/1739,NAP
-  2. Inventory what rail / urban transit feeds are catalogued
-  3. **Critical question**: is PKP Intercity catalogued? If yes, the previous "no public PKP IC feed" concern goes away — that would be a game-changer.
-  4. If PKP IC absent, list which operators ARE published (likely just regional + city operators)
-- **Previously suggested** (WRONG approach): I listed fragmented city URLs (Warsaw, Kraków, Gdańsk SKM) without checking whether dane.gov.pl/1739 already references them.
-- **Auth**: dane.gov.pl is no-key for browsing; per-dataset auth may vary.
-- **Refresh**: Per-dataset
-- **Operator scope decision (post-probe)**:
-  - **If PKP IC is in NAP** → full PL onboarding, removes the "Warsaw → Berlin" gap
-  - **If only city/regional feeds** → operator decides: ship those with documented PKP IC gap, or skip until PKP publishes
-- **Verdict**: ⚠ Probe results determine scope
+- **Official MMTIS NAP**: https://dane.gov.pl/en/dataset/1739,NAP — dataset 1739 contains resource 2126144 which catalogues 215 multimodal data sources.
+- **Catalogue download** (CSV, NAP-published, refreshed 2026-06-22): `https://api.dane.gov.pl/media/resources/20260622/Tabela_KPD_2026_aktualizacja22062026_do_publikacji.csv` — operator-facing portal at https://dane.gov.pl/en/dataset/1739,NAP/resource/2126144/table
+- **CSV columns**: Lp (row) | Podmiot (Operator) | Link do danych | Kontakt | Format danych | API
+
+**Rail operators in the catalogue** (rows extracted from the live CSV):
+
+| Row | Operator | URL | Format | Access |
+|---|---|---|---|---|
+| 28 | Koleje Dolnośląskie S.A. | https://kolejedolnoslaskie.pl/ | GTFS static + GTFS-RT + PDF + OSDM | Open, API yes |
+| 29 | Koleje Małopolskie | https://kolejemalopolskie.com.pl/rozklady_jazdy/kml-ska-gtfs.zip + .../ald-gtfs.zip | GTFS static | Open, direct .zip |
+| 30 | Koleje Mazowieckie | www.mazowieckie.com.pl | **XML, PDF** (no GTFS) | Open, API yes |
+| 31 | Koleje Śląskie | https://www.kolejeslaskie.pl/ | XML + GTFS static + PDF | Open, API yes |
+| 32 | Koleje Wielkopolskie | www.koleje-wielkopolskie.com.pl | **PDF only** | Open but unusable as-is |
+| 44 | Łódzka Kolej Aglomeracyjna (ŁKA) | https://kolej-lka.pl/pliki/rskqx9axcc2i8932/gtfs-2025-2026/zip/ | GTFS | Open, direct .zip |
+| **90** | **PKP Intercity SA** | **ftp.intercity.pl** | **CSV** | **Login/password required (contact via NAP)** |
+| 91 | PKP SKM Trójmiasto | https://bip.skm.pkp.pl/c60/rozklad-jazdy | GTFS static | Open |
+| 173 | Warszawska Kolej Dojazdowa (WKD) | http://wkd.com.pl | Format unclear (bd) | Open |
+| **197** | **POLREGIO S.A.** | https://polregio.pl/pl/rozklad-jazdy-i-mapa-polaczen/rozklad-jazdy/ | **PDF + GTFS Static** | Open |
+| 212 | PKP Polskie Linie Kolejowe (PLK) | https://pdp-api.plk-sa.pl/ | JSON | API, infrastructure (not timetables) |
+
+**Two findings that reverse my earlier doc**:
+
+1. **PKP Intercity IS published via the NAP** — earlier I said "no public feed". It's there as CSV via authenticated FTP. Operator can request credentials. **But**: CSV isn't GTFS — would need format conversion (PKP IC internal timetable format). Days of work to onboard. Defer or commit explicitly.
+
+2. **POLREGIO publishes GTFS Static** — earlier I said they withdrew it in 2022. Live NAP says otherwise. Just need to navigate polregio.pl/rozklad-jazdy to find the .zip URL.
+
+**Practical PL scope for eu19 (6 directly-onboardable + 1 gated)**:
+
+- ✅ **Direct GTFS onboarding**: Koleje Dolnośląskie, Koleje Małopolskie (direct .zip × 2), Koleje Śląskie, ŁKA (direct .zip), SKM Trójmiasto, Polregio (need to find .zip on polregio.pl)
+- ⚠ **Format investigation needed**: Koleje Mazowieckie (XML — would need converter), WKD (format unspecified)
+- ❌ **Skip**: Koleje Wielkopolskie (PDF only, no machine-readable timetable)
+- 🔐 **Operator decision**: PKP Intercity — request FTP credentials + write CSV-to-GTFS converter (~3-5 days work), OR defer to follow-up release
+
+**With Polregio + 5 regional operators we cover most daily intra-PL rail traffic** (the Polish rail network is dominated by Polregio for regional service and PKP IC for long-distance). Cross-border `Warsaw → Berlin` still won't route without PKP IC, but `Wrocław → regional destinations` will. Significantly better than my prior "city-only with PKP gap" position.
+
+**Auth**: Most direct downloads no-key. PKP IC requires per-operator FTP credentials obtained via the NAP contact field.
+**Refresh**: Per-operator; CSV catalogue itself refreshed monthly.
+**Verdict**: ✅ Ready to onboard 5-6 GTFS feeds. PKP IC and Mazowieckie deferred to follow-up.
 
 ### 🇨🇿 CZ — Czech Republic · ⚠ NAP probe needed
 
