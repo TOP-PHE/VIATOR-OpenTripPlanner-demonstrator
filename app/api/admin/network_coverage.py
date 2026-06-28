@@ -33,7 +33,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
@@ -127,6 +127,40 @@ class RunCreate(BaseModel):
         pattern=r"^(single_session|fanout)$",
         description="'single_session' (legacy) | 'fanout' (cross-session matrix)",
     )
+    # Optional ISO 3166-1 alpha-2 country filter. None / [] = no filter
+    # (full active hub list, legacy behaviour). When set, both matrix
+    # axes are restricted to hubs whose `country` is in the list — turns
+    # a 50-hub by 50-hub matrix into a ~100-pair smoke test for fast
+    # single-country or cross-border probes.
+    countries: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional ISO 3166-1 alpha-2 country codes (e.g. ['FR','CH']). "
+            "When set, both matrix axes are filtered to hubs in those "
+            "countries. None / [] = no filter."
+        ),
+        max_length=20,
+    )
+
+    @field_validator("countries")
+    @classmethod
+    def _validate_country_codes(cls, v: list[str] | None) -> list[str] | None:
+        """Each entry must be 2 alpha chars; empty list normalises to None
+        so the API + DB store 'no filter' the same way."""
+        if v is None or len(v) == 0:
+            return None
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in v:
+            if not isinstance(c, str) or len(c) != 2 or not c.isalpha():
+                raise ValueError(
+                    f"country codes must be 2-letter alpha (ISO 3166-1 alpha-2); got {c!r}"
+                )
+            up = c.upper()
+            if up not in seen:
+                out.append(up)
+                seen.add(up)
+        return out
 
 
 class RunSummary(BaseModel):
@@ -148,6 +182,11 @@ class RunSummary(BaseModel):
     ok_pairs: int
     no_route_pairs: int
     error_pairs: int
+    # Country subset filter (ISO 3166-1 alpha-2) — None when the run used
+    # the full active hub list. The sidebar renders a small badge like
+    # "FR+CH" when this is set so operators can tell at a glance which
+    # runs were full vs subset.
+    countries: list[str] | None = None
 
 
 class ResultEntry(BaseModel):
@@ -433,14 +472,22 @@ def create_run(
     if depart_at.tzinfo is None:
         depart_at = depart_at.replace(tzinfo=UTC)
 
-    run = runner.create_run(
-        db,
-        actor_user_id=actor.id,
-        session_id=body.session_id,
-        depart_at=depart_at,
-        direction=body.direction,
-        mode=body.mode,
-    )
+    try:
+        run = runner.create_run(
+            db,
+            actor_user_id=actor.id,
+            session_id=body.session_id,
+            depart_at=depart_at,
+            direction=body.direction,
+            mode=body.mode,
+            countries=body.countries,
+        )
+    except ValueError as e:
+        # `runner.create_run` raises ValueError when the country filter
+        # matches zero hubs (e.g. operator picked AT but never added an
+        # AT hub). Surface as 400 with the runner's message so the UI
+        # can show it directly under the country picker.
+        raise HTTPException(400, str(e)) from e
     db.commit()
     db.refresh(run)
     # Schedule the actual work. FastAPI BackgroundTasks runs after the
@@ -775,4 +822,8 @@ def _run_to_summary(run: Any) -> RunSummary:
         ok_pairs=run.ok_pairs or 0,
         no_route_pairs=run.no_route_pairs or 0,
         error_pairs=run.error_pairs or 0,
+        # Country-filter snapshot — None on pre-this-migration rows and
+        # on full-matrix runs. The sidebar uses presence/absence to
+        # render the "FR+CH" badge.
+        countries=getattr(run, "countries", None),
     )
