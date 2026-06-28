@@ -45,6 +45,39 @@ rather than the official MMTIS NAPs. Corrected below.
 | FR | https://transport.data.gouv.fr/ | ✅ Same — IS the NAP |
 | CH | www.opentransportdata.swiss | ✅ Same — IS the NAP |
 
+## Live NAP probe findings (2026-06-29)
+
+I attempted to verify each official NAP URL with a non-interactive
+HTTP fetch + content extraction. **Mixed results — the modern NAP
+portals are JavaScript-rendered single-page apps that don't expose
+their catalogues to programmatic probes.** Operator browser-based
+navigation will see what's there; my static probes can't.
+
+What I actually confirmed:
+
+| Country | NAP URL | Live probe verdict |
+|---|---|---|
+| 🇨🇿 CZ | registr.dopravniinfo.cz/en/ | ✅ Confirmed: portal lists "NeTEx - Timetable information" as a published source category (`sources/cz-mdcr_NeTEx-timetables-v1.0/`). Specific operator coverage requires browser navigation into that sub-page. |
+| 🇸🇪 SE | trafficdata.se | ⚠ **Concerning**: catalogue has 49 datasets but is dominated by Trafikverket **road data** (38 datasets); only ~10 transit-related (Public Transport 4, Bus 3, Train 3). The Trafiklab GTFS Sverige bundle is **NOT** referenced. Suggests the SE MMTIS NAP per the PDF is actually a road-traffic-focused portal, with transit feeds living separately under Trafiklab. |
+| 🇭🇺 HU | napportal.kozut.hu | ⚠ **Concerning**: portal's own title in Hungarian is `Közúti közlekedés nemzeti adathozzáférési pontja` = "**Road traffic** National Access Point". This is operated by Magyar Közút (Hungarian Road Administration). The /datasets sub-URL returned 404. Strongly suggests rail/MMTIS data is on a different portal that the PDF doesn't list. |
+| 🇳🇴 NO | transportportal.atlas.vegvesen.no | ⚠ SPA — portal exists ("Felles datakatalog" / Shared Data Catalogue) but the dataset list requires JavaScript to render. Couldn't programmatically inventory. Catalogue is at `data.transportportal.no/datasets` (per the landing page text) which redirects to the SPA shell. |
+| 🇵🇱 PL | dane.gov.pl/dataset/1739 | ⚠ SPA — dataset page returns "Otwarte Dane" header only; resources behind JS render. Couldn't confirm whether PKP IC / Polregio are catalogued. |
+| 🇩🇰 DK | nap.vd.dk | Not probed (operator confirmed it's the right NAP) |
+| 🇸🇮 SI | (no URL in PDF) | Cannot probe — URL unknown |
+| 🇸🇰 SK | aplikacie.zsr.sk/MapaVylukZsr | Not probed; portal name ("disruption map") makes it unlikely to host timetables |
+
+**What this means**:
+
+1. **The PDF MMTIS column may be misleading for SE and HU.** Both URLs appear to be road-traffic NAPs operated by road administrations, not multimodal/transit portals. Sweden's actual transit-data hub is widely understood to be **Trafiklab** (Samtrafiken-operated) and Hungary's is **MÁV's NAP** or one of the ministry-level portals — but neither is in the EU Commission's official list. This is a **real EU enforcement gap**: multiple member states have published "NAP" URLs that don't comply with the multimodal scope of Regulation 2017/1926. If we strictly follow the PDF for SE/HU, we get road data only and effectively no transit. If we use Trafiklab/MÁV directly, we're compliant in spirit (the data is public per the regulation's intent) but not anchored to the formally-listed NAP.
+
+2. **NO is probably fine** — Entur is state-owned and operates as Norway's de-facto MMTIS data hub. The transportportal almost certainly references Entur's bundle URLs once the operator can navigate into the catalogue. Browser confirmation should be quick.
+
+3. **PL is unknowable until browser probe** — the PKP IC question (the headline blocker for PL coverage) can't be answered from a static fetch. Operator needs to visit dane.gov.pl/dataset/1739 in a browser.
+
+4. **CZ looks solid** — the NeTEx-timetables source category is referenced on the landing page; navigating into it should yield the canonical download URL.
+
+**Practical recommendation**: when the operator does the NAP probes (action items at the bottom), screen-capture or paste the dataset listings into a follow-up so we can record the exact compliant URLs. For SE and HU specifically, document why we use Trafiklab and MÁV-direct respectively (if we do), citing the formal-NAP-is-road-only gap.
+
 ## Capacity verification (VPS probe, 2026-06-28)
 
 Probed against the running prod VPS:
