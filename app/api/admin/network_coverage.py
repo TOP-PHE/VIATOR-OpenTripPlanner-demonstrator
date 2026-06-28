@@ -39,7 +39,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
 from ...db import get_db
-from ...models import JourneySearchExecution, JourneyTrip, NetworkCoverageHub
+from ...models import (
+    JourneySearchExecution,
+    JourneyTrip,
+    NetworkCoverageHub,
+    NetworkCoverageResult,
+    NetworkCoverageRun,
+)
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import hub_derive, runner
@@ -51,6 +57,11 @@ router = APIRouter(
     prefix="/api/admin/network-coverage",
     tags=["admin", "network-coverage"],
 )
+
+# Shared 404 detail for runs lookups — used by the export, the run-detail,
+# and the cell-trips endpoints. Constant so a future rename / i18n only
+# touches one site (Sonar S1192).
+_RUN_NOT_FOUND = "Run not found"
 
 
 # ─────────────────────────── pydantic shapes ────────────────────────────
@@ -214,6 +225,50 @@ class RunDetail(RunSummary):
 
     summary: dict[str, Any] | None = None
     results: list[ResultEntry] = []
+
+
+class CellTripsDirection(BaseModel):
+    """One side of the cell-trips response (outbound A→B or return B→A).
+
+    Mirrors the per-cell summary the matrix already has in memory PLUS
+    the materialised trip list — the modal can render the same trip-card
+    UI used by the export and by the live journey page without a second
+    round-trip.
+    """
+
+    origin_hub_id: str
+    dest_hub_id: str
+    status: str
+    response_ms: int | None = None
+    num_itineraries: int | None = None
+    best_duration_seconds: int | None = None
+    best_num_transfers: int | None = None
+    best_operators: str | None = None
+    error_message: str | None = None
+    # journey_trips rows materialised through the
+    # search → executions → trips chain. Each entry mirrors the shape
+    # produced by `_fetch_trips_by_search` (rank, duration_seconds,
+    # num_transfers, departure_at, arrival_at, modes, legs).
+    trips: list[dict[str, Any]] = []
+
+
+class CellTripsResponse(BaseModel):
+    """Trip breakdown for one matrix cell, split into outbound and return.
+
+    `return_` is None when the run was created with direction='single'
+    (B→A wasn't queried) or when no result row exists for the reverse
+    pair (data gap). The UI hides the section entirely in the first case
+    and shows a "not queried" hint in the second.
+    """
+
+    direction: str  # 'both' | 'single' — copied from the run row
+    outbound: CellTripsDirection | None = None
+    # `return` is a Python keyword — alias maps the wire name to a safe
+    # attribute name. Pydantic v2 serialises by alias by default when
+    # `populate_by_name=True` isn't set, so the JSON key is "return".
+    return_: CellTripsDirection | None = Field(default=None, alias="return")
+
+    model_config = {"populate_by_name": True}
 
 
 # ─────────────────────────── endpoints ───────────────────────────
@@ -693,7 +748,7 @@ def export_run_html(
     """
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
-        raise HTTPException(404, "Run not found")
+        raise HTTPException(404, _RUN_NOT_FOUND)
     search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
     context = _build_export_context(
         run=run,
@@ -706,7 +761,10 @@ def export_run_html(
     return response
 
 
-@router.get("/runs/{run_id}", response_model=RunDetail)
+@router.get(
+    "/runs/{run_id}",
+    responses={404: {"description": _RUN_NOT_FOUND}},
+)
 def get_run(
     run_id: uuid.UUID,
     db: Annotated[DbSession, Depends(get_db)],
@@ -716,7 +774,7 @@ def get_run(
     the run is in 'running' status; static once 'completed'."""
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
-        raise HTTPException(404, "Run not found")
+        raise HTTPException(404, _RUN_NOT_FOUND)
     summary = _run_to_summary(run)
     return RunDetail(
         **summary.model_dump(),
@@ -739,6 +797,96 @@ def get_run(
             )
             for r in results
         ],
+    )
+
+
+@router.get(
+    "/runs/{run_id}/cells/{origin_id}/{dest_id}/trips",
+    responses={404: {"description": _RUN_NOT_FOUND}},
+)
+def get_cell_trips(
+    run_id: uuid.UUID,
+    origin_id: str,
+    dest_id: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> CellTripsResponse:
+    """Return the trip breakdown for one matrix cell, split into outbound
+    (A→B) and return (B→A).
+
+    The matrix UI's click-cell modal calls this on open. The same query
+    chain powers the HTML export — we just split it per direction here
+    and surface BOTH directions in one response so the modal can render
+    them as two collapsible sections without a second round-trip.
+
+    For direction='single' runs, B→A wasn't queried; we still set
+    response.direction='single' so the JS can hide the return section
+    entirely (vs rendering "not found" which would look like a data
+    quality issue).
+    """
+    run = db.get(NetworkCoverageRun, run_id)
+    if run is None:
+        raise HTTPException(404, _RUN_NOT_FOUND)
+
+    # Fetch both result rows in one round-trip. The UNIQUE constraint
+    # `(run_id, origin, dest)` means we get at most 2 rows here.
+    rows = (
+        db.execute(
+            select(NetworkCoverageResult)
+            .where(NetworkCoverageResult.run_id == run_id)
+            .where(
+                (
+                    (NetworkCoverageResult.origin_hub_id == origin_id)
+                    & (NetworkCoverageResult.dest_hub_id == dest_id)
+                )
+                | (
+                    (NetworkCoverageResult.origin_hub_id == dest_id)
+                    & (NetworkCoverageResult.dest_hub_id == origin_id)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_pair: dict[tuple[str, str], NetworkCoverageResult] = {
+        (r.origin_hub_id, r.dest_hub_id): r for r in rows
+    }
+    outbound_row = by_pair.get((origin_id, dest_id))
+    return_row = by_pair.get((dest_id, origin_id))
+
+    # Materialise trips for both rows in one query — cheap when both
+    # journey_search_ids are present, no-op when both are NULL.
+    search_ids: list[uuid.UUID] = [
+        r.journey_search_id
+        for r in (outbound_row, return_row)
+        if r is not None and r.journey_search_id is not None
+    ]
+    trips_by_search = _fetch_trips_by_search(db, search_ids)
+
+    def _row_to_direction(r: NetworkCoverageResult | None) -> CellTripsDirection | None:
+        if r is None:
+            return None
+        return CellTripsDirection(
+            origin_hub_id=r.origin_hub_id,
+            dest_hub_id=r.dest_hub_id,
+            status=r.status,
+            response_ms=r.response_ms,
+            num_itineraries=r.num_itineraries,
+            best_duration_seconds=r.best_duration_seconds,
+            best_num_transfers=r.best_num_transfers,
+            best_operators=r.best_operators,
+            error_message=r.error_message,
+            trips=trips_by_search.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+        )
+
+    # direction='single' runs intentionally have no return row — collapse
+    # to None so the JS can hide the section cleanly.
+    return_direction = _row_to_direction(return_row) if run.direction == "both" else None
+
+    return CellTripsResponse(
+        direction=run.direction,
+        outbound=_row_to_direction(outbound_row),
+        return_=return_direction,
     )
 
 

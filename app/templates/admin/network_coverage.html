@@ -123,6 +123,29 @@
 .cov-modal h3 { margin: 0 0 0.6rem; font-size: 1rem; }
 .cov-modal-meta { color: var(--rail-steel); font-size: 0.85rem; margin-bottom: 0.6rem; }
 
+/* Inline trip sections (Outbound / Return) inside the drilldown modal.
+   Collapsible <details> so the modal stays compact when both directions
+   are populated; outbound starts open, return collapsed. */
+.cov-trip-section { margin: 0.5rem 0; border: 1px solid #eaeef2; border-radius: 4px; padding: 0.4rem 0.6rem; background: #fafbfc; }
+.cov-trip-section[open] { background: #fff; }
+.cov-trip-section summary { cursor: pointer; font-size: 0.85rem; padding: 0.15rem 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.cov-trip-section summary > .hint { font-weight: normal; color: var(--rail-steel); }
+.cov-trip { border-top: 1px dotted #eaeef2; padding: 0.4rem 0; }
+.cov-trip:first-child { border-top: 0; }
+.cov-trip-head { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; margin-bottom: 0.25rem; }
+.cov-trip-rank { font-weight: 600; color: var(--brand-blue); min-width: 1.8rem; }
+.cov-trip-duration { font-weight: 600; }
+.cov-trip-legs { padding-left: 0.5rem; border-left: 2px solid #d0d7de; margin-left: 0.4rem; }
+.cov-leg { display: grid; grid-template-columns: 60px 90px 1fr 1fr auto; gap: 0.4rem; font-size: 0.78rem; padding: 0.15rem 0; color: #24292f; }
+.cov-leg-mode { font-weight: 600; font-size: 0.7rem; padding: 0 4px; background: #eef0f2; border-radius: 2px; text-align: center; align-self: center; }
+.cov-leg-when { color: var(--rail-steel); font-variant-numeric: tabular-nums; }
+.cov-leg-stops { color: #1f2328; }
+.cov-leg-service { color: #57606a; font-style: italic; }
+.cov-leg-agency { color: #8a939d; font-size: 0.72rem; }
+/* Filter-badge pill colour — distinct from the run-status pills so the
+   sidebar can show both side-by-side without conflicting colours. */
+.cov-pill[data-status="filtered"] { background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }
+
 /* v0.1.31 — manage-hubs panel. Collapsible to keep the sidebar tight
    while still being one-click-away to add cross-border hubs. */
 .hubs-panel { margin-top: 1rem; border-top: 1px dotted var(--sleeper); padding-top: 0.5rem; }
@@ -699,35 +722,162 @@ function renderRun(run) {
   });
 }
 
-function openDetailModal(originId, destId, result) {
+async function openDetailModal(originId, destId, result) {
   const orig = HUBS.find(h => h.id === originId);
   const dest = HUBS.find(h => h.id === destId);
   document.getElementById('cov-modal-title').textContent =
     `${orig ? orig.name : originId} → ${dest ? dest.name : destId}`;
-  document.getElementById('cov-modal-meta').innerHTML = `
+  document.getElementById('cov-modal-meta').innerHTML = renderModalMeta(result);
+  // Re-run link stays as a fallback below the inline trip render.
+  const rerunLink = (orig && dest)
+    ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}" target="_blank">↗ Re-run live in the journey UI</a></p>`
+    : '';
+  const modalBody = document.getElementById('cov-modal-body');
+  modalBody.innerHTML = '<p class="hint">Loading itineraries…</p>' + rerunLink;
+  document.getElementById('cov-modal').hidden = false;
+  const tripsHtml = await fetchCellTripsHtml(originId, destId, orig, dest);
+  modalBody.innerHTML = tripsHtml + rerunLink;
+}
+
+// Render the modal's top "Status · 775ms · 3 itineraries …" meta strip.
+// Extracted so the nested-transfers ternary (was inside another ternary)
+// lives in `fmtTransfers` — Sonar S3358 dislikes ternary-in-ternary.
+function renderModalMeta(result) {
+  return `
     Status: <span class="cov-pill" data-status="${escHTML(result.status)}">${escHTML(result.status)}</span>
     · ${result.response_ms || 0}ms
     ${result.num_itineraries !== null ? '· ' + result.num_itineraries + ' itineraries' : ''}
     ${result.best_duration_seconds ? '· best ' + fmtDuration(result.best_duration_seconds) : ''}
-    ${result.best_num_transfers !== null && result.best_num_transfers !== undefined
-        ? '· ' + result.best_num_transfers + ' transfer' + (result.best_num_transfers === 1 ? '' : 's')
-        : ''}
+    ${fmtTransfers(result.best_num_transfers)}
     ${result.best_operators ? '<br>Operators: <code>' + escHTML(result.best_operators) + '</code>' : ''}
     ${result.error_message ? '<br>Error: <code>' + escHTML(result.error_message) + '</code>' : ''}
   `;
-  let body = '';
-  if (result.journey_search_id) {
-    body = `<p>Click below to open the full journey detail (uses the same trip-card UI as the Search page):</p>
-      <p><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}"
-            target="_blank">↗ Re-run live in the journey UI</a></p>
-      <p class="hint">journey_search id: <code>${escHTML(result.journey_search_id)}</code> — query
-      <code>journey_searches</code> + <code>journey_trips</code> tables for the full operator
-      breakdown / raw OTP response.</p>`;
-  } else {
-    body = '<p class="hint">No linked journey-search row (recorder write failed during the run, or status was set before the trip was persisted).</p>';
+}
+
+// Pluralisation helper — single, leaf-level ternary (S3358 prefers ternaries
+// not to nest). Centralising it kills the "n transfer + (n===1 ? '' : 's')"
+// nested-ternary pattern Sonar flagged in renderTripCard.
+function pluralize(n, singular) {
+  return n === 1 ? singular : singular + 's';
+}
+
+// Format a possibly-null count as "n thing(s)". null/undefined → empty
+// string. We can't use a truthy check (`if (n)`) because `num_itineraries`
+// and `num_transfers` can legitimately be 0 ("query ran, returned zero").
+// Guard-clause form (no else) avoids SonarJS S6644's negated-ternary trip.
+function fmtCount(n, singular) {
+  if (n === null || n === undefined) return '';
+  return n + ' ' + pluralize(n, singular);
+}
+
+function fmtTransfers(n) {
+  const c = fmtCount(n, 'transfer');
+  return c ? '· ' + c : '';
+}
+
+// Fetch the cell-trips endpoint and produce the inline trip-sections HTML.
+// Positive-condition structure throughout (no `if (!x)` patterns) — keeps
+// SonarJS S6644 happy and reads as "happy path first, fallback last".
+async function fetchCellTripsHtml(originId, destId, orig, dest) {
+  if (CURRENT_RUN_ID) {
+    try {
+      const url = `/api/admin/network-coverage/runs/${encodeURIComponent(CURRENT_RUN_ID)}`
+                + `/cells/${encodeURIComponent(originId)}/${encodeURIComponent(destId)}/trips`;
+      const r = await fetch(url);
+      if (r.ok) {
+        const payload = await r.json();
+        return renderCellTrips(payload, orig, dest);
+      }
+      return `<p class="hint">Failed to load itineraries (${r.status}).</p>`;
+    } catch (err) {
+      return `<p class="hint">Failed to load itineraries: ${escHTML(err.message)}</p>`;
+    }
   }
-  document.getElementById('cov-modal-body').innerHTML = body;
-  document.getElementById('cov-modal').hidden = false;
+  return '<p class="hint">No active run — cannot fetch trips.</p>';
+}
+
+// Render the two-section payload from
+// `GET /runs/{id}/cells/{o}/{d}/trips`. The Return section is hidden
+// when the run was created with direction='single' (B→A never queried).
+function renderCellTrips(payload, orig, dest) {
+  const sections = [];
+  sections.push(renderDirectionSection(
+    'Outbound',
+    `${orig ? orig.short || orig.name : ''} → ${dest ? dest.short || dest.name : ''}`,
+    payload.outbound,
+  ));
+  if (payload.direction === 'both') {
+    sections.push(renderDirectionSection(
+      'Return',
+      `${dest ? dest.short || dest.name : ''} → ${orig ? orig.short || orig.name : ''}`,
+      payload.return,
+    ));
+  }
+  return sections.join('');
+}
+
+function renderDirectionSection(label, subtitle, dir) {
+  // Positive-condition first (S6644). The missing-row branch — either
+  // the recorder write crashed or direction='single' suppressed the
+  // reverse pair, though the caller pre-filters direction='single' so
+  // this only fires on a true data gap — falls through to the bottom.
+  if (dir) {
+    const trips = dir.trips || [];
+    const itinSuffix = fmtCount(dir.num_itineraries, 'itinerary');
+    const head = `<summary>
+        <strong>${escHTML(label)}</strong>
+        <span class="hint">(${escHTML(subtitle)})</span>
+        <span class="cov-pill" data-status="${escHTML(dir.status)}">${escHTML(dir.status)}</span>
+        ${itinSuffix ? '· ' + itinSuffix : ''}
+        ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
+      </summary>`;
+    const body = trips.length
+      ? trips.map(renderTripCard).join('')
+      : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
+    // Outbound starts open, return stays collapsed by default — keeps the
+    // initial modal height manageable while still being one click away.
+    const isOpen = label === 'Outbound' ? 'open' : '';
+    return `<details class="cov-trip-section" ${isOpen}>${head}${body}</details>`;
+  }
+  return `<details class="cov-trip-section" open>
+    <summary><strong>${escHTML(label)}</strong> <span class="hint">(${escHTML(subtitle)})</span></summary>
+    <p class="hint" style="padding: 0.4rem 0">No coverage row recorded for this direction.</p>
+  </details>`;
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function renderLeg(leg) {
+  const mode = leg.mode || 'TRANSIT';
+  const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
+  const headsign = leg.trip_headsign ? ' (' + escHTML(leg.trip_headsign) + ')' : '';
+  const agency = leg.agency_name || leg.feed_id || '';
+  return `<div class="cov-leg">
+    <span class="cov-leg-mode">${escHTML(mode)}</span>
+    <span class="cov-leg-when">${fmtTime(leg.departure)} → ${fmtTime(leg.arrival)}</span>
+    <span class="cov-leg-stops">${escHTML(leg.from_name || '?')} → ${escHTML(leg.to_name || '?')}</span>
+    <span class="cov-leg-service">${escHTML(service)}${headsign}</span>
+    ${agency ? '<span class="cov-leg-agency">' + escHTML(agency) + '</span>' : ''}
+  </div>`;
+}
+
+function renderTripCard(trip) {
+  const legs = (trip.legs || []).map(renderLeg).join('');
+  const transfers = fmtCount(trip.num_transfers, 'transfer');
+  return `<div class="cov-trip">
+    <div class="cov-trip-head">
+      <span class="cov-trip-rank">#${(trip.rank || 0) + 1}</span>
+      <span>${fmtTime(trip.departure_at)} → ${fmtTime(trip.arrival_at)}</span>
+      <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
+      <span class="hint">${escHTML(transfers)}</span>
+    </div>
+    <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
+  </div>`;
 }
 
 document.addEventListener('click', (e) => {
