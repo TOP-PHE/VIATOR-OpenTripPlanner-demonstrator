@@ -1,16 +1,17 @@
-# eu19-transit-motis — provider research
+# eu19-transit-motis — provider research (all 19 countries)
 
-Research deliverable preceding the eu19 session bootstrap. Extends the
-existing eu11 corridor (ES/FR/BE/LU/NL/DE/AT/IT/LI/CH/GB) with 8
-additional countries: **DK, SE, NO, PL, CZ, SK, SI, HU**.
+Complete provider reference for the eu19-transit-motis session.
+Combines the **11 countries already onboarded in eu11** (URLs + format
++ verdicts pulled from the existing bootstrap script and ops docs) plus
+the **8 new countries** added in the eu19 extension.
 
-Every row below is "as best I know from training + public open-data
-portals". Rows marked **⚠ needs operator probe** are ones where the
-landing-page URL is solid but the exact bulk-feed URL has moved often
-enough that we should confirm it resolves + downloads before scripting
-the bootstrap. Spot-checking these is ~2 hours of operator work and
-should happen before PR #2 (the OSM merge script update) so we don't
-script around a dead URL.
+Every row below is "as best I know from the existing eu11 work +
+training + public open-data portals". Rows marked **⚠ needs operator
+probe** are ones where the landing-page URL is solid but the exact
+bulk-feed URL has moved often enough that we should confirm it
+resolves + downloads before scripting the bootstrap. Spot-checking
+these is ~2 hours of operator work and should happen before PR #2 (the
+OSM merge script update) so we don't script around a dead URL.
 
 ## Capacity verification (VPS probe, 2026-06-28)
 
@@ -26,20 +27,151 @@ Probed against the running prod VPS:
 `rebuild-max-memory` mode for eu19, restart paused sessions after the
 serve container handoff. Total wallclock estimate: 4-6 hours.
 
-## Per-country summary
+## All-19 verdict summary
 
-| Country | Format | Auth | Coverage | Verdict |
+The eu11 column distinguishes feeds we already run from new ones to
+onboard. The "Action" column is what changes for eu19 specifically.
+
+| # | Country | Status today | Action for eu19 | Verdict |
 |---|---|---|---|---|
-| DK | GTFS | None | DSB + Metro + regional rail + bus + ferry | ✅ Ready |
-| SE | GTFS | Free key (Trafiklab) | SJ + 21 regional operators (SL, Skånetrafiken, …) | ✅ Ready |
-| NO | NeTEx-Nordic + GTFS | None | Vy + Go-Ahead Nordic + SJ Nord + Flytoget + bus + ferry | ✅ Ready |
-| PL | GTFS (fragmented) | None per source | City transit (Warsaw, Kraków, …) — **no PKP Intercity** | ⚠ Partial — see notes |
-| CZ | GTFS | None | ČD + Leo Express + RegioJet + ARRIVA + PID Prague | ✅ Ready |
-| SK | GTFS (Bratislava only) | None | DPB Bratislava city transit only — **no ZSSK national rail** | ❌ Skip until ZSSK publishes |
-| SI | NeTEx (EPIP) | None | SŽ + regional bus | ⚠ Needs operator probe |
-| HU | GTFS | None | MÁV + GySEV + Volánbusz + BKV | ✅ Ready |
+| 1 | 🇪🇸 ES | In eu11 (5 GTFS providers) | None — already onboarded | ✅ Keep |
+| 2 | 🇫🇷 FR | In eu11 (15 GTFS providers) | None — already onboarded | ✅ Keep |
+| 3 | 🇧🇪 BE | In eu11 (NeTEx-EPIP) | None — already onboarded | ✅ Keep |
+| 4 | 🇱🇺 LU | In eu11 (NeTEx-EPIP) | None — already onboarded | ✅ Keep |
+| 5 | 🇳🇱 NL | In eu11 (URL provider, OpenOV GTFS) | None — already onboarded | ✅ Keep |
+| 6 | 🇩🇪 DE | In eu11 (NeTEx-EPIP Gesamtdeutschland) | None — already onboarded | ✅ Keep |
+| 7 | 🇦🇹 AT | In eu11 (NeTEx-EPIP) | None — already onboarded | ✅ Keep |
+| 8 | 🇮🇹 IT | In eu11 (Trenitalia NeTEx + Trenord/ATAC URL) | None — already onboarded | ✅ Keep |
+| 9 | 🇱🇮 LI | In eu11 (covered transitively by CH + AT) | None | ✅ Keep |
+| 10 | 🇨🇭 CH | In eu11 (NeTEx-EPIP SBB) | None — already onboarded | ✅ Keep |
+| 11 | 🇬🇧 GB | In eu11 (Eurostar via FR NAP + OSM clip) | None — already onboarded | ✅ Keep |
+| 12 | 🇩🇰 DK | **NEW** | Onboard Rejseplanen GTFS (URL provider) | ✅ Ready |
+| 13 | 🇸🇪 SE | **NEW** | Operator generates Trafiklab key → onboard sweden.zip | ✅ Ready (free key) |
+| 14 | 🇳🇴 NO | **NEW** | Onboard Entur GTFS bundle (URL provider) | ✅ Ready |
+| 15 | 🇵🇱 PL | **NEW** | **OPERATOR DECISION**: ship city-only with documented PKP gap, OR skip | ⚠ Partial |
+| 16 | 🇨🇿 CZ | **NEW** | Onboard CIS national bundle (URL provider) | ✅ Ready |
+| 17 | 🇸🇰 SK | **NEW** | Skip — covered indirectly via CZ feed | ❌ Skip |
+| 18 | 🇸🇮 SI | **NEW** | Probe nap.gov.si first, then onboard | ⚠ Needs operator probe |
+| 19 | 🇭🇺 HU | **NEW** | Onboard MÁV-Start + GySEV (2 URL providers) | ✅ Ready |
 
-## Detailed per-country findings
+# Part 1 — eu11 existing providers (reference)
+
+These are already running in eu11. Documented here for completeness so
+the eu19 reference is self-contained. Detailed onboarding history lives
+in `docs/nap-fr-rail.md`, `docs/nap-ch-rail.md`, and the bootstrap
+script `scripts/create_eurostar_corridor_session.ps1`.
+
+### 🇪🇸 ES — Spain · ✅ In eu11
+
+- **Provider**: NAP España (https://nap.transportes.gob.es/)
+- **Onboarded feeds** (all GTFS despite NeTEx-prefixed filenames):
+  - `ES-NAP-FGC_Catalunya.zip` — FGC Catalunya regional rail
+  - `ES-NAP-_Euskadi_Euskotren.zip` — Euskotren Basque Country
+  - `ES-NAP-_Ouigo.zip` — Ouigo Spain low-cost HSR
+  - `ES-NAP-_RENFE_AVLD.zip` — Renfe AV / Long-distance
+  - `ES-NAP-_RENFE_CERCA.zip` — Renfe Cercanías commuter
+- **Auth**: None for downloads (registration needed for portal)
+- **Refresh**: Per-operator, typically weekly
+- **Gotchas**: Filenames misleadingly carry "NeTEx" prefix but contents are GTFS — `detect.py` classifies by content, not filename.
+
+### 🇫🇷 FR — France · ✅ In eu11
+
+- **Provider**: transport.data.gouv.fr (national OAP)
+- **Onboarded feeds** (15 GTFS):
+  - **SNCF national**: TGV + Intercités + TER + Transilien (2 separate feeds)
+  - **Regional TERs**: BreizhGo (Bretagne), Fluo (Grand Est), Hauts-de-France, LiO (Occitanie), Atoumod (Normandie), Nouvelle-Aquitaine, Oura (Auvergne-Rhône-Alpes), Aleop (Pays de la Loire), ZOU (Région Sud), IDFM (Île-de-France)
+  - **International on FR territory**: Eurostar v2, Renfe AVE Int (Madrid-Marseille HSR), Trenitalia FR (Paris-Lyon-Milan)
+- **Auth**: None
+- **Refresh**: Daily/weekly per operator
+- **Gotchas**: cross_border_filter applied (rail-only pre-filter, UIC country whitelist) per `docs/cross-border-routing-as-built.md`.
+
+### 🇧🇪 BE — Belgium · ✅ In eu11
+
+- **Provider**: NAP Belgium (https://www.belgianmobilitydataportal.be/)
+- **Onboarded feed**: `BE-NAP-SNCB-epip.zip` (NeTEx-EPIP) — SNCB/NMBS national rail
+- **Auth**: None
+- **Refresh**: Weekly
+- **Gotchas**: NeTEx-EPIP profile; cross-border services to NL/FR/DE/LU all wire up via UIC codes
+
+### 🇱🇺 LU — Luxembourg · ✅ In eu11
+
+- **Provider**: NAP Luxembourg (mobiliteit.lu)
+- **Onboarded feed**: `LU-NAP-netex-20260618-20260823.zip` (NeTEx-EPIP) — CFL national rail + bus
+- **Auth**: None
+- **Refresh**: Quarterly (date range in filename — operator must re-download every ~2 months)
+- **Gotchas**: Tiny country, single feed covers everything (rail, bus, tram in Luxembourg City)
+
+### 🇳🇱 NL — Netherlands · ✅ In eu11 (URL provider)
+
+- **Provider**: OpenOV (community aggregator, gov-tolerated)
+- **Onboarded feed URL**: http://gtfs.ovapi.nl/nl/gtfs-nl.zip (URL-mode, not file upload)
+- **Format**: GTFS (multi-operator national bundle)
+- **Auth**: None
+- **Refresh**: Daily, sometimes intra-day
+- **Operator coverage**: NS (rail) + European Sleeper + Eurostar NL leg + ICE International + Arriva + Keolis + all NL urban transit
+- **Gotchas**: The official NL-NAP `_NeTEx` file is actually IFF format (.dat files, NS-only) — VIATOR can't ingest IFF, so we use OpenOV as the primary instead. Documented in `scripts/create_eurostar_corridor_session.ps1` lines 103-109.
+
+### 🇩🇪 DE — Germany · ✅ In eu11
+
+- **Provider**: DELFI Gesamtdeutschland (https://www.delfi.de/)
+- **Onboarded feed**: `DE-NAP-fahrplaene_gesamtdeutschland.zip` (NeTEx-EPIP) — national multimodal bundle
+- **Auth**: None
+- **Refresh**: Weekly
+- **Operator coverage**: DB Fernverkehr + DB Regio + S-Bahnen + private operators (FlixTrain, ÖBB Nightjet German legs, etc.) + ~250 regional transit authorities
+- **Gotchas**: Large NeTEx feed (~1 GB). Cross-border filter applied.
+
+### 🇦🇹 AT — Austria · ✅ In eu11
+
+- **Provider**: NAP Austria (https://www.mobilitaetsverbuende.at/)
+- **Onboarded feed**: `AT-NAP_netex_evu_2026.zip` (NeTEx-EPIP) — ÖBB + WESTbahn + regional Verkehrsverbünde
+- **Auth**: None
+- **Refresh**: Annual major + weekly minor
+- **Operator coverage**: ÖBB long-distance + ÖBB Postbus + 9 Verkehrsverbünde (Wien VOR, Salzburg SVV, Tirol VVT, etc.)
+- **Gotchas**: Nightjet runs are in the ÖBB feed, including international legs
+
+### 🇮🇹 IT — Italy · ✅ In eu11
+
+- **Provider**: Multiple — no single NAP for IT national
+- **Onboarded feeds**:
+  - `IT-TRENITALIA-NeTEx_L1.zip` (NeTEx-EPIP) — Trenitalia national rail
+  - Trenord (URL): https://www.dati.lombardia.it/download/3z4k-mxz9/application/zip — Lombardy regional + Malpensa Express
+  - ATAC Roma (URL): https://romamobilita.it/sites/default/files/rome_static_gtfs.zip — Rome urban
+- **Auth**: None
+- **Refresh**: Trenitalia weekly, regionals varies
+- **Gotchas**:
+  - **Italo (NTV)**: private HSR competitor, **no public GTFS/NeTEx** — only via their booking API or Trainline. Missing from our matrix; cells like `Roma → Milano via Italo` won't appear.
+  - GTT (Turin) + TPER (Bologna) not onboarded — see script comments at lines 147-160.
+
+### 🇱🇮 LI — Liechtenstein · ✅ In eu11 (transitive)
+
+- **Provider**: None — covered transitively by CH (SBB serves CH↔LI buses through PostBus) and AT (ÖBB Vorarlberg services include Schaan-Vaduz bus stops)
+- **Onboarded feed**: N/A — no LI-specific provider exists
+- **Gotchas**: Vaduz has no rail; coverage is exclusively bus. Matrix queries through LI will route via CH/AT bus services.
+
+### 🇨🇭 CH — Switzerland · ✅ In eu11
+
+- **Provider**: opentransportdata.swiss (federal open data portal)
+- **Onboarded feed**: `CH-NAP_netex_202606200406.zip` (NeTEx-EPIP) — SBB + all CH operators
+- **Auth**: None
+- **Refresh**: Quarterly (date in filename)
+- **Operator coverage**: SBB CFF FFS + BLS + PostBus + every regional Verkehrsverbund (ZVV, TPG, etc.) + funicular operators
+- **Gotchas**: This is the multimodal SBB feed — cross-border filter applied per `docs/cross-border-routing-as-built.md`. SBB's HAFAS instance (different from this static NeTEx) is also available as a runtime verification source via transport.opendata.ch (PR #173 context).
+
+### 🇬🇧 GB — United Kingdom · ✅ In eu11
+
+- **Provider**: Eurostar feed in FR NAP + GB OSM clip
+- **Onboarded feed**: `FR-NAP_gtfs_Eurostar_v2.zip` (already counted under FR — provides the GB termini at St Pancras + Ashford + Ebbsfleet)
+- **OSM scope**: GB clipped to HS1/Eurostar corridor (bbox `-0.5,50.8,1.5,51.8`)
+- **Gotchas**:
+  - **National Rail (ATOC)** GTFS is not onboarded — would require parsing the ATOC CIF format or using a community converter
+  - Domestic GB rail (LNER, Avanti, GWR, etc.) is **NOT in eu11** — matrix queries like `London → Edinburgh` will return `no_route`
+  - Operator can extend later via Network Rail open data (https://datafeeds.networkrail.co.uk/) which publishes CIF — needs a CIF→GTFS converter step
+
+# Part 2 — eu19 NEW providers (8 countries to onboard)
+
+These are the additions for the eu19 extension. Detailed format per
+country: provider URL, feed URL, auth, refresh, operator coverage,
+gotchas, verdict.
 
 ### 🇩🇰 DK — Denmark · ✅ Ready
 
@@ -59,7 +191,7 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
   - **Midttrafik / Sydtrafik / FynBus / NT** (Jutland bus operators)
   - **Færger** (ferries — Mols-Linien, etc.)
 - **Gotchas**: Multimodal bundle. Cross-border filter (`gtfs_cross_border_filter.py`) needs rail-only pre-filter as we already do for SBB. The DSB Øresund cross-border trains (København → Malmö) will route through if SE feed is also present.
-- **Verdict**: ✅ Onboard as upload-mode provider (one zip per refresh)
+- **Verdict**: ✅ Onboard as URL-mode provider (use the direct .zip URL above)
 
 ### 🇸🇪 SE — Sweden · ✅ Ready (needs free API key)
 
@@ -80,7 +212,7 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
   - **Västtrafik** (Göteborg region all-modes)
   - **UL, Östgötatrafiken, Värmlandstrafik**, … (12 more regional)
 - **Gotchas**: API key in URL → store in platform_config not in version control. Multimodal. Schema version drift: Trafiklab occasionally adds GTFS-Plus fields (block_id, etc.) — should pass through `gtfs_cross_border_filter` cleanly but worth a sanity import.
-- **Verdict**: ✅ Onboard as URL-mode provider once operator generates a key
+- **Verdict**: ✅ Onboard as URL-mode provider once operator generates a key. Key registration: https://www.trafiklab.se/login/ (5 min, free, no commercial use restriction)
 
 ### 🇳🇴 NO — Norway · ✅ Ready (gold standard)
 
@@ -107,7 +239,7 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
 - **Gotchas**: NeTEx-Nordic profile detection — `detect.py` already classifies it (verified during the eu11 work). NeTEx feed is ~2x larger than GTFS bundle; if memory is tight, prefer GTFS. The "rb_" prefix means "regional bundle" — there's no national bundle separately; rb_norway-aggregated IS the national.
 - **Verdict**: ✅ Onboard as URL-mode provider. Pick GTFS to keep memory tight.
 
-### 🇵🇱 PL — Poland · ⚠ Partial coverage
+### 🇵🇱 PL — Poland · ⚠ Partial coverage (operator decision needed)
 
 - **Provider**: No single national NAP. Polish open-data landscape for rail is fragmented:
   - **PKP Intercity** (state long-distance — the trains you'd actually care about for cross-border Berlin↔Warsaw, Vienna↔Warsaw): **NO free public GTFS**. Only available via partner contracts with PKP Group.
@@ -116,16 +248,20 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
   - **Warsaw ZTM** (city transit): GTFS at https://api.um.warszawa.pl/
   - **Kraków MPK**: GTFS at https://gtfs.ztp.krakow.pl/
   - **OpenMobilityData** (community aggregator): hosts mirrors of the city feeds but no PKP IC
+- **Feed URLs** to consider (if shipping city-only):
+  - Warsaw ZTM: https://www.wtp.waw.pl/feed/ (registration needed for key)
+  - Kraków MPK: https://gtfs.ztp.krakow.pl/GTFS_KRK_A.zip + `_M.zip` + `_T.zip` (autobus, metro, tram — separate)
+  - SKM Trójmiasto: https://mkuran.pl/gtfs/skm.zip (community mirror)
 - **Format**: GTFS where available
-- **Auth**: Most city feeds are no-key; some require registration
+- **Auth**: Most city feeds are no-key; Warsaw needs registration
 - **Refresh**: Varies per city (daily to weekly)
 - **Operator coverage**:
-  - With city feeds only: Warsaw metro/bus/tram, Kraków city, Gdańsk SKM, Wrocław MPK
+  - With city feeds only: Warsaw metro/bus/tram, Kraków city, Gdańsk SKM
   - **Missing**: PKP Intercity (the ONLY long-distance rail in Poland), all of Silesia's regional rail (Koleje Śląskie), Pomerania (Polregio), Małopolska regional (Koleje Małopolskie)
 - **Gotchas**:
   - **The headline gap**: without PKP IC, a coverage matrix cell `Warsaw → Berlin` will return `no_route` — the train exists but our data doesn't have it. This is fundamentally a data-availability problem, not a VIATOR/MOTIS bug.
   - Community Transportoid (transportoid.eu) used to mirror PKP IC by scraping; legally grey and the mirror has been intermittent.
-  - Polregio has briefly published GTFS in 2022 then withdrew it; worth re-checking quarterly.
+  - Polregio briefly published GTFS in 2022 then withdrew it; worth re-checking quarterly.
 - **Verdict**: ⚠ Partial — onboard the 3-4 best city feeds (Warsaw, Kraków, Gdańsk SKM, Koleje Mazowieckie if accessible). Document the PKP IC gap clearly in the operator-facing session notes. **Operator decision needed**: ship with city-only coverage, or skip PL until PKP publishes.
 
 ### 🇨🇿 CZ — Czech Republic · ✅ Ready
@@ -156,7 +292,7 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
 - **Status**: ZSSK (state rail) publishes timetables via cp.zsr.sk but **not as bulk GTFS**. The cp.zsr.sk interface is an HTML journey planner only.
 - **Available open data**:
   - **DPB Bratislava** (city transit — metro, tram, bus): https://opendata.bratislava.sk/ — has GTFS
-  - **MHD Košice**: city transit GTFS available
+  - **MHD Košice**: city transit GTFS available via https://www.kosice.sk/clanok/otvorene-data
 - **What's missing**: National rail (ZSSK, RegioJet SK, Leo Express SK Bratislava-Žilina-Košice corridor), national bus (SAD Bratislava, SAD Žilina, …)
 - **Workaround**:
   - The CZ CIS feed includes some cross-border services into SK (mainly Bratislava-area RegioJet/Leo Express) since they're Czech-registered carriers crossing the border. This gives partial SK rail coverage as a side effect of onboarding CZ.
@@ -202,31 +338,34 @@ serve container handoff. Total wallclock estimate: 4-6 hours.
 - **Gotchas**: HU NAP publishes each operator as a separate feed, not a national bundle. So onboarding is 3-4 URL providers, not one. MÁV-HÉV vs MÁV-Start naming confusion — both go through Budapest but different services.
 - **Verdict**: ✅ Onboard MÁV-Start + GySEV as primary rail providers. BKV + Volánbusz optional depending on whether intra-Hungary city/bus coverage matters.
 
-## Summary recommendation
+# Part 3 — Action items & decisions before PR #2
 
-**Onboard in PR #2 (OSM merge) + PR #3 (session bootstrap):**
+**Operator action items (block the OSM merge script + bootstrap PRs):**
+1. **Generate a Trafiklab API key** for SE (https://www.trafiklab.se/login/) — ~5 min
+2. **Probe https://nap.gov.si/** and capture the SŽ feed URL — ~30 min
+3. **Decide PL scope**:
+   - Option A: ship city-only (Warsaw + Kraków + Gdańsk SKM) with documented "no PKP IC long-distance" gap
+   - Option B: skip PL entirely until PKP publishes a public feed
+4. (Optional) Verify the **HU MÁV-Start + GySEV** specific feed URLs at https://nap.gov.hu/ — should be straightforward but the per-operator URLs aren't stable
 
-| Country | Action |
-|---|---|
-| DK | Onboard Rejseplanen GTFS (URL provider) |
-| SE | Operator generates Trafiklab key, then onboard sweden.zip (URL provider) |
-| NO | Onboard Entur GTFS bundle (URL provider) |
-| PL | **OPERATOR DECISION**: ship 3-4 city feeds with documented PKP IC gap, OR skip until PKP improves |
-| CZ | Onboard CIS national bundle (URL provider) |
-| SK | **Skip** — covered indirectly via CZ feed |
-| SI | **Probe first** — capture SŽ feed URL from nap.gov.si, then onboard |
-| HU | Onboard MÁV-Start + GySEV (2 URL providers) |
+**Once those four are confirmed**:
+- PR #2: `scripts/merge_osm_eu19_corridor.sh` — extends the eurostar corridor PBF merger with denmark + sweden + norway + (poland) + czech-republic + (slovakia) + slovenia + hungary
+- PR #3: `scripts/create_eu19_transit_motis_session.ps1` — bootstraps the new MOTIS session with all confirmed providers
+- PR #4: Alembic migration adding ~25 new hubs (Copenhagen, Stockholm, Oslo, Bergen, Trondheim, Warsaw, Kraków, Prague, Brno, Bratislava-via-CZ, Ljubljana, Budapest, etc.) so the coverage matrix can verify the new corridor
 
-**Operator action items before PR #2:**
-1. Generate a Trafiklab API key (https://www.trafiklab.se/login/) for SE — takes 5 min
-2. Probe https://nap.gov.si/ and capture the SŽ feed URL — 30 min
-3. Decide PL scope (city-only ⚠ or skip ❌) — informed by your willingness to live with the Warsaw↔Berlin coverage gap
+## Out of scope (Phase C, not in eu19)
 
-Once those are confirmed, PR #2 (OSM merge script `scripts/merge_osm_eu19_corridor.sh`) and PR #3 (session bootstrap PowerShell) can land with a complete provider list.
+- 🇭🇷 **HR** Croatia — HŽ has no national NAP, no public GTFS. Zagreb ZET city transit only available.
+- 🇷🇸 **RS** Serbia — ŽS no open data. Belgrade GSP has community GTFS but no national rail.
+- 🇷🇴 **RO** Romania — CFR Călători no open feed. No EU NAP compliance yet.
+- 🇧🇬 **BG** Bulgaria — BDŽ no open feed.
+- 🇬🇷 **GR** Greece — Hellenic Train (FS-owned) no open feed. OASA Athens partial.
+
+These could be added as **OSM-only** in a future Phase C session (operator-facing matrix would show `no_route` on every cell — misleading without clear UX hints). Not recommended without operator-side filtering ("hide cells for unsupported countries").
 
 ## Open questions / things to revisit
 
-- **PKP Intercity**: any chance of a partner agreement with PKP? Would unlock the entire Polish long-distance rail network for the matrix.
-- **Eurostar**: already in eu11 via the GB clip. No change for eu19.
-- **Nightjet / Eurocity overnight trains**: covered indirectly via ÖBB (in eu11) and DB (in eu11). HU MÁV → ÖBB Sopron handover should work once HU is onboarded.
-- **Future Phase C** (Balkans, Greece): explicitly out of scope for eu19. The Croatia / Serbia / Romania / Bulgaria / Greece rail data landscape is so sparse that even OSM-only coverage would be misleading (operator clicks coverage cells expecting trains, sees `no_route` everywhere).
+- **PKP Intercity partnership**: any chance of negotiating a partner agreement with PKP? Would unlock the entire Polish long-distance rail network for the matrix.
+- **ATOC GB national rail**: integrating CIF → GTFS converter for full UK rail (LNER, Avanti, GWR, ScotRail) — currently only Eurostar termini covered. Half-day effort to onboard once we want it.
+- **Italo Italy**: still no public feed. Italy's NeTEx Italian profile rollout (data4pt-project) may add them — watch for 2026 updates.
+- **Quarterly refresh sweep**: PL (Polregio, PKP), SK (ZSSK), GR (OASA national) all could become available over time. Worth a quarterly check.
