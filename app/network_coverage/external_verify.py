@@ -51,6 +51,10 @@ log = logging.getLogger(__name__)
 
 _DB_ENDPOINT = "https://reiseauskunft.bahn.de/bin/mgate.exe"
 _DB_AID = "n91dB8Z77MLdoR0K"
+# Source label propagated on every VerifyResult. Single constant so the
+# UI verdict-colour logic can equality-check it (and Sonar S1192 is happy
+# with the literal not duplicated 9 times across the error branches).
+_SOURCE_DB_HAFAS = "db.hafas.de"
 _DB_CLIENT = {
     "id": "DB",
     "v": "20100000",
@@ -184,7 +188,7 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
     (HAFAS doesn't guarantee they're sorted shortest-first; ranking
     differs between profiles)."""
     if not connections:
-        return VerifyResult(source="db.hafas.de", ok=False, num_connections=0)
+        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, num_connections=0)
     parsed_durations: list[int] = []
     parsed_transfers: list[int] = []
     for c in connections:
@@ -200,7 +204,7 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
         else None
     )
     return VerifyResult(
-        source="db.hafas.de",
+        source=_SOURCE_DB_HAFAS,
         ok=True,
         num_connections=len(connections),
         best_duration_seconds=parsed_durations[best_idx] if best_idx is not None else None,
@@ -249,17 +253,17 @@ async def verify_via_db_hafas(
             response = await c.post(_DB_ENDPOINT, json=body, headers=headers)
         except httpx.HTTPError as e:
             log.warning("HAFAS request failed: %s", e)
-            return VerifyResult(source="db.hafas.de", ok=False, error=f"http: {e}")
+            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"http: {e}")
         if response.status_code != 200:
             return VerifyResult(
-                source="db.hafas.de",
+                source=_SOURCE_DB_HAFAS,
                 ok=False,
                 error=f"HTTP {response.status_code}",
             )
         try:
             payload = response.json()
         except ValueError as e:
-            return VerifyResult(source="db.hafas.de", ok=False, error=f"json: {e}")
+            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"json: {e}")
         return _parse_hafas_response(payload)
 
     if client is not None:
@@ -275,18 +279,18 @@ def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
     means no usable connections returned."""
     if payload.get("err") and payload["err"] != "OK":
         return VerifyResult(
-            source="db.hafas.de", ok=False, error=f"hafas envelope: {payload['err']}"
+            source=_SOURCE_DB_HAFAS, ok=False, error=f"hafas envelope: {payload['err']}"
         )
     svc_res = payload.get("svcResL") or []
     if not svc_res:
-        return VerifyResult(source="db.hafas.de", ok=False, error="no svcResL")
+        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error="no svcResL")
     svc = svc_res[0]
     if svc.get("err") and svc["err"] != "OK":
         # `H890` is HAFAS's "no connections found" code — meaningful
         # negative answer, not a transport error.
         if svc["err"] == "H890":
-            return VerifyResult(source="db.hafas.de", ok=False, num_connections=0)
-        return VerifyResult(source="db.hafas.de", ok=False, error=f"hafas svc: {svc['err']}")
+            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, num_connections=0)
+        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"hafas svc: {svc['err']}")
     res = svc.get("res") or {}
     connections = res.get("outConL") or []
     return _summarise_connections(connections)
