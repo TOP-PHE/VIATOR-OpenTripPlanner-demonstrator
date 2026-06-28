@@ -146,6 +146,24 @@
    sidebar can show both side-by-side without conflicting colours. */
 .cov-pill[data-status="filtered"] { background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }
 
+/* External-verify block (DB / HAFAS check on no_route cells). The
+   button + result render below the inline trip cards in the same
+   <details> section; visually subdued unless a verdict has landed. */
+.cov-verify-block { margin: 0.5rem 0 0; padding: 0.4rem 0; border-top: 1px dotted #d0d7de; }
+.cov-verify-btn {
+  font-size: 0.78rem; padding: 0.25rem 0.6rem;
+  background: #fff; color: var(--brand-blue);
+  border: 1px solid var(--brand-blue); border-radius: 4px;
+  cursor: pointer;
+}
+.cov-verify-btn:hover:not(:disabled) { background: var(--brand-blue); color: #fff; }
+.cov-verify-btn:disabled { opacity: 0.6; cursor: progress; }
+.cov-verify-result { margin-top: 0.4rem; font-size: 0.82rem; }
+.cov-verify-verdict { margin: 0; padding: 0.4rem 0.6rem; border-radius: 4px; }
+.cov-verify-found { background: #dafbe1; color: #0d3b1d; border: 1px solid #aceebb; }
+.cov-verify-empty { background: #eef2f8; color: #1f2328; border: 1px solid #d0d7de; }
+.cov-verify-warn  { background: #fff8c5; color: #4a3500; border: 1px solid #f5d56b; }
+
 /* v0.1.31 — manage-hubs panel. Collapsible to keep the sidebar tight
    while still being one-click-away to add cross-border hubs. */
 .hubs-panel { margin-top: 1rem; border-top: 1px dotted var(--sleeper); padding-top: 0.5rem; }
@@ -843,10 +861,25 @@ function renderDirectionSection(label, subtitle, dir) {
     const body = trips.length
       ? trips.map(renderTripCard).join('')
       : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
+    // External-verify button — only for no_route cells. Disambiguates
+    // "our data is missing a service" from "no service exists" by
+    // asking DB's HAFAS backend the same question. Each direction gets
+    // its own button + placeholder so Outbound and Return verdicts can
+    // be displayed independently.
+    const verifyBlock = dir.status === 'no_route'
+      ? `<div class="cov-verify-block" data-direction="${escHTML(label)}">
+          <button type="button" class="cov-verify-btn"
+            data-origin="${escHTML(dir.origin_hub_id)}"
+            data-dest="${escHTML(dir.dest_hub_id)}">
+            Verify externally (DB / HAFAS)
+          </button>
+          <div class="cov-verify-result"></div>
+        </div>`
+      : '';
     // Outbound starts open, return stays collapsed by default — keeps the
     // initial modal height manageable while still being one click away.
     const isOpen = label === 'Outbound' ? 'open' : '';
-    return `<details class="cov-trip-section" ${isOpen}>${head}${body}</details>`;
+    return `<details class="cov-trip-section" ${isOpen}>${head}${body}${verifyBlock}</details>`;
   }
   return `<details class="cov-trip-section" open>
     <summary><strong>${escHTML(label)}</strong> <span class="hint">(${escHTML(subtitle)})</span></summary>
@@ -894,7 +927,70 @@ document.addEventListener('click', (e) => {
       e.target.classList.contains('cov-modal-backdrop')) {
     document.getElementById('cov-modal').hidden = true;
   }
+  if (e.target.matches('.cov-verify-btn')) {
+    handleVerifyExternal(e.target);
+  }
 });
+
+// Fire the verify-external endpoint and render the verdict next to the
+// button. Disables the button while in-flight; replaces with the next
+// verdict if the operator clicks again.
+async function handleVerifyExternal(btn) {
+  const block = btn.closest('.cov-verify-block');
+  const resultEl = block.querySelector('.cov-verify-result');
+  const originId = btn.dataset.origin;
+  const destId = btn.dataset.dest;
+  if (!CURRENT_RUN_ID) {
+    resultEl.innerHTML = '<p class="hint">No active run — cannot verify.</p>';
+    return;
+  }
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Querying DB / HAFAS…';
+  resultEl.innerHTML = '';
+  try {
+    const url = `/api/admin/network-coverage/runs/${encodeURIComponent(CURRENT_RUN_ID)}`
+              + `/cells/${encodeURIComponent(originId)}/${encodeURIComponent(destId)}/verify-external`;
+    const r = await fetch(url);
+    if (r.ok) {
+      const payload = await r.json();
+      resultEl.innerHTML = renderVerifyVerdict(payload);
+    } else {
+      const detail = await r.text();
+      resultEl.innerHTML = `<p class="hint cov-verify-warn">Verify request failed (${r.status}): ${escHTML(detail.slice(0, 200))}</p>`;
+    }
+  } catch (err) {
+    resultEl.innerHTML = `<p class="hint cov-verify-warn">Verify request failed: ${escHTML(err.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+// Render one VerifyResult inline. Three visual states:
+//   - error set         → yellow "unknown" verdict (couldn't reach backend)
+//   - ok=true           → green "external found N routes" (likely our gap)
+//   - ok=false, no err  → blue/grey "external also found 0" (likely real gap)
+function renderVerifyVerdict(v) {
+  if (v.error) {
+    return `<p class="cov-verify-verdict cov-verify-warn">
+      <strong>Unknown</strong> — ${escHTML(v.source)} couldn't answer: <code>${escHTML(v.error)}</code>
+    </p>`;
+  }
+  if (v.ok) {
+    const dur = v.best_duration_seconds ? ', best ' + fmtDuration(v.best_duration_seconds) : '';
+    const tr = fmtCount(v.best_transfers, 'transfer');
+    const trBit = tr ? ', ' + tr : '';
+    return `<p class="cov-verify-verdict cov-verify-found">
+      <strong>${escHTML(v.source)} found ${v.num_connections} connection${v.num_connections === 1 ? '' : 's'}</strong>${dur}${trBit}.
+      Likely a gap in our NAP feeds — investigate the destination operator's data.
+    </p>`;
+  }
+  return `<p class="cov-verify-verdict cov-verify-empty">
+    <strong>${escHTML(v.source)} also found 0 connections.</strong>
+    Likely a real "no service at this depart time" — not a VIATOR data gap.
+  </p>`;
+}
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     const m = document.getElementById('cov-modal');
