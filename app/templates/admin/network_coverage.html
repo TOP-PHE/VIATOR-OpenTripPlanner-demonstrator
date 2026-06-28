@@ -754,9 +754,25 @@ function renderModalMeta(result) {
   `;
 }
 
-function fmtTransfers(n) {
+// Pluralisation helper — single, leaf-level ternary (S3358 prefers ternaries
+// not to nest). Centralising it kills the "n transfer + (n===1 ? '' : 's')"
+// nested-ternary pattern Sonar flagged in renderTripCard.
+function pluralize(n, singular) {
+  return n === 1 ? singular : singular + 's';
+}
+
+// Format a possibly-null count as "n thing(s)". null/undefined → empty
+// string. We can't use a truthy check (`if (n)`) because `num_itineraries`
+// and `num_transfers` can legitimately be 0 ("query ran, returned zero").
+// Guard-clause form (no else) avoids SonarJS S6644's negated-ternary trip.
+function fmtCount(n, singular) {
   if (n === null || n === undefined) return '';
-  return '· ' + n + ' transfer' + (n === 1 ? '' : 's');
+  return n + ' ' + pluralize(n, singular);
+}
+
+function fmtTransfers(n) {
+  const c = fmtCount(n, 'transfer');
+  return c ? '· ' + c : '';
 }
 
 // Fetch the cell-trips endpoint and produce the inline trip-sections HTML.
@@ -807,11 +823,12 @@ function renderDirectionSection(label, subtitle, dir) {
   // this only fires on a true data gap — falls through to the bottom.
   if (dir) {
     const trips = dir.trips || [];
+    const itinSuffix = fmtCount(dir.num_itineraries, 'itinerary');
     const head = `<summary>
         <strong>${escHTML(label)}</strong>
         <span class="hint">(${escHTML(subtitle)})</span>
         <span class="cov-pill" data-status="${escHTML(dir.status)}">${escHTML(dir.status)}</span>
-        ${dir.num_itineraries != null ? '· ' + dir.num_itineraries + ' itineraries' : ''}
+        ${itinSuffix ? '· ' + itinSuffix : ''}
         ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
       </summary>`;
     const body = trips.length
@@ -851,9 +868,7 @@ function renderLeg(leg) {
 
 function renderTripCard(trip) {
   const legs = (trip.legs || []).map(renderLeg).join('');
-  const transfers = (trip.num_transfers != null)
-    ? trip.num_transfers + ' transfer' + (trip.num_transfers === 1 ? '' : 's')
-    : '';
+  const transfers = fmtCount(trip.num_transfers, 'transfer');
   return `<div class="cov-trip">
     <div class="cov-trip-head">
       <span class="cov-trip-rank">#${(trip.rank || 0) + 1}</span>

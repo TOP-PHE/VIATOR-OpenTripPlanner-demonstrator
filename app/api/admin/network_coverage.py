@@ -761,7 +761,11 @@ def export_run_html(
     return response
 
 
-@router.get("/runs/{run_id}", response_model=RunDetail)
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunDetail,
+    responses={404: {"description": _RUN_NOT_FOUND}},
+)
 def get_run(
     run_id: uuid.UUID,
     db: Annotated[DbSession, Depends(get_db)],
