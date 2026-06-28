@@ -19,6 +19,78 @@ Authoritative NAP list: extracted from the European Commission
 `its-national-access-points.pdf` (updated October 2025), MMTIS column.
 Stored in `European NAP TimeTables/` outside the repo.
 
+## eu11 NAP-compliance sanity check (2026-06-29)
+
+Per operator request, audited each eu11 country's *currently-ingested* data
+source against its *official MMTIS NAP* from the PDF, asking: "if we knew
+nothing and only had the NAP URL, could we discover and download the same
+data we're using today?" Findings ranked by severity below.
+
+### 🚨 Critical warnings
+
+**🇮🇹 IT — CCISS is a SPID-login road-safety portal, NOT a multimodal data catalogue**
+
+- Live probe (2026-06-29) confirms: cciss.it landing page is the public road-traffic info portal; cciss.it/dataset returns a SPID authentication wall ("As of October 1, 2021, citizens can no longer access the CCISS portal using their previous credentials").
+- No multimodal/transit datasets visible. Italy's listed MMTIS NAP per Delegated Regulation 2017/1926 **does not actually publish open transit data**.
+- Same pattern as 🇸🇰 SK — the listed NAP is non-compliant with the multimodal scope.
+- **Our currently-ingested IT sources** (`IT-TRENITALIA-NeTEx_L1.zip`, Trenord URL, ATAC URL) are **NOT NAP-attested via CCISS**. The Trenitalia NeTEx file was provided directly; Trenord comes from `dati.lombardia.it`; ATAC from `romamobilita.it`. None of these are catalogued through CCISS.
+- **Workaround in place** (worth documenting): FR transport.data.gouv.fr *does* catalogue "Réseau national Trenitalia France" (GTFS + GTFS-RT, Licence Ouverte) — so the cross-border Trenitalia France presence in our matrix IS NAP-attested via FR. But IT-internal Trenitalia services are not.
+- **Action**: Document the IT NAP non-compliance explicitly. Possible mitigations (in order of effort): (a) accept the gap, document it for any compliance audit; (b) probe whether data.gov.it or a Ministry-level Italian portal hosts a real MMTIS NAP that CCISS doesn't reference; (c) escalate to Italian Ministero per chiarification.
+
+**🇱🇺 LU — current source not discoverable through the official NAP**
+
+- Live probe of data.public.lu search for "CFL" returned **3 datasets only**: FLEX car-sharing, P+R parking, hiking trails. **NO transit timetable** visible. Searches for "horaire", "transports publics" hit the SPA shell (couldn't enumerate).
+- Our currently-ingested `LU-NAP-netex-20260618-20260823.zip` (CFL national rail + bus, NeTEx-EPIP) cannot be traced back to data.public.lu through the public search.
+- The actual source is likely `mobiliteit.lu` (CFL/AVL operator portal) directly — which is the Luxembourg national mobility platform but **may or may not be NAP-referenced**.
+- **Action**: Operator probe of data.public.lu directly (the search SPA needs JS to render). If the CFL NeTEx-EPIP is genuinely not in data.public.lu, document the gap; the data is open per CC0 anyway so legal use isn't questioned, but the NAP-referencing claim isn't supportable.
+
+### ⚠ Warnings (verified but with caveats)
+
+**🇧🇪 BE — verified compliant BUT non-commercial license flag**
+
+- ✅ SNCB Netex (the file we use) IS catalogued via the official NAP — CKAN search confirmed at `belgiantrain.be/en/3rd-party-services/mobility-service-providers/public-data`.
+- ⚠ **License is "Other (Non-Commercial)"** — relevant for VIATOR's commercial use scope. Operator should verify with SNCB whether the VIATOR product context qualifies. Discovered bonus: 3 other Belgian NeTEx feeds (TEC Wallonia CC0, STIB-MIVB Brussels fee-required, De Lijn Flanders Open Data Commons) — we don't currently ingest these but could expand BE coverage if needed.
+
+**🇦🇹 AT — likely OK but not verified within probe budget**
+
+- mobilitydata.gv.at has 102 datasets across 9 pages. First page showed ÖBB Verkaufsstelleninformation API, ÖBB Fahrplanbilder, Wiener Linien Delay, GIP.at infrastructure — but NOT our `AT-NAP_netex_evu_2026.zip` directly.
+- Query-with-NeTEx and query-with-GTFS hit timeouts/connection errors.
+- **Action**: Operator browser probe — search for "EVU" or "ÖBB NeTEx" on the portal. The 102 total datasets suggests the EPIP bundle IS there, just not on page 1.
+
+### ⚠ Inconclusive (couldn't verify via static fetch)
+
+**🇪🇸 ES** — `nap.mitma.es` → 301 → `nap.transportes.gob.es`. CKAN API returns **401 Unauthorized** — auth-walled. Operator needs to log in via the portal to enumerate. Likely OK but unverified.
+
+**🇳🇱 NL** — ntm.ndw.nu doesn't expose CKAN at expected paths. OpenOV (`gtfs.ovapi.nl/nl/gtfs-nl.zip`) NAP-reference status remains unverified. Operator should browser-probe ntm.ndw.nu's search to see if OpenOV is referenced as canonical, or whether NDW publishes its own multimodal feed separately.
+
+**🇩🇪 DE** — Mobilithek.info SPA returned title only via static fetch. The `mobilithek.info/offers` and `/api/v1/search` paths gave 404. Operator should browser-probe to confirm DELFI Gesamtdeutschland NeTEx-EPIP is catalogued.
+
+**🇬🇧 GB** — data.gov.uk dataset search with my query parameters returned 404. Operator should probe `data.gov.uk/dataset/national-rail-timetables` or similar canonical paths.
+
+### ✅ Verified compliant
+
+**🇫🇷 FR** — transport.data.gouv.fr IS the NAP. All ingested feeds are direct from the catalogue. Bonus confirmation today: the Trenitalia France GTFS we use IS catalogued there (`/datasets/horaires-des-trains-trenitalia-france`, Licence Ouverte).
+
+**🇨🇭 CH** — opentransportdata.swiss IS the NAP. All ingested SBB data is direct from the catalogue.
+
+### 🇱🇮 LI — no NAP (not bound by EU Reg 2017/1926)
+
+EEA but not EU. Coverage transitive via CH (SBB PostBus) and AT (ÖBB Vorarlberg). No compliance concern.
+
+## Stop registers & minimum connection times (per operator request)
+
+The audit also looked for whether each NAP separately publishes:
+1. **A stop place register** (cf. Norway's NSR — authoritative national stop register with stable IDs)
+2. **Minimum connection time / transfer time files** (typically embedded in NeTEx connection_link elements or GTFS-extended `transfers.txt`)
+
+Findings on these dimensions:
+
+- **NeTEx feeds inherently include stops with stable IDs + connection times** (NeTEx 1.2 model has `StopPlace` + `Connection`/`SiteConnection` elements). So for any country we ingest as NeTEx-EPIP (BE, LU current, CH, DE, AT, IT), MOTIS gets stops + connection times for free.
+- **GTFS feeds include `stops.txt` (stop register) but `transfers.txt` (min connection times) is optional** — usually present for major operators (SBB, NS, DB, ÖBB include it; many regional operators don't).
+- **Separately-published national stop registers** are rare. Norway's NSR (via Entur) is the gold standard. France's stop_area registry on transport.data.gouv.fr is similar. Most other countries embed stops in the timetable feed only.
+
+**Recommendation for eu19**: rely on the embedded stops + transfers in each NeTEx/GTFS feed for v0. Layer the NO NSR file separately (as already planned). Only invest in per-country stop register ingestion if we see specific cross-border `no_route` failures attributable to stop-matching gaps.
+
 ## Compliance audit of the previous draft
 
 The first version of this doc (commit `94ae9a5`) used community URLs
