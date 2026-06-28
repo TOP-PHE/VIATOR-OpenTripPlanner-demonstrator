@@ -59,7 +59,7 @@ What I actually confirmed:
 |---|---|---|
 | 🇨🇿 CZ | registr.dopravniinfo.cz/en/ | ✅ Confirmed: portal lists "NeTEx - Timetable information" as a published source category (`sources/cz-mdcr_NeTEx-timetables-v1.0/`). Specific operator coverage requires browser navigation into that sub-page. |
 | 🇸🇪 SE | trafficdata.se | ⚠ **Concerning**: catalogue has 49 datasets but is dominated by Trafikverket **road data** (38 datasets); only ~10 transit-related (Public Transport 4, Bus 3, Train 3). The Trafiklab GTFS Sverige bundle is **NOT** referenced. Suggests the SE MMTIS NAP per the PDF is actually a road-traffic-focused portal, with transit feeds living separately under Trafiklab. |
-| 🇭🇺 HU | napportal.kozut.hu | ⚠ **Concerning**: portal's own title in Hungarian is `Közúti közlekedés nemzeti adathozzáférési pontja` = "**Road traffic** National Access Point". This is operated by Magyar Közút (Hungarian Road Administration). The /datasets sub-URL returned 404. Strongly suggests rail/MMTIS data is on a different portal that the PDF doesn't list. |
+| 🇭🇺 HU | napportal.kozut.hu | ✅ **CONFIRMED** via operator's browser-DevTools-captured API call (2026-06-29): the portal IS multimodal despite its road-focused title. 70 entries total, 16 transit-related. MÁV+GYSEV rail bundled in profile id 5 (GTFS, request-form access). BKK Budapest open at opendata.bkk.hu. **Earlier "road-only" concern was wrong** — both road AND transit live under the same portal. API endpoint: `POST /napp-portal-proxy/api/MetadataSearch`. |
 | 🇳🇴 NO | transportportal.atlas.vegvesen.no | ⚠ SPA — portal exists ("Felles datakatalog" / Shared Data Catalogue) but the dataset list requires JavaScript to render. Couldn't programmatically inventory. Catalogue is at `data.transportportal.no/datasets` (per the landing page text) which redirects to the SPA shell. |
 | 🇵🇱 PL | dane.gov.pl/dataset/1739 | ⚠ SPA — dataset page returns "Otwarte Dane" header only; resources behind JS render. Couldn't confirm whether PKP IC / Polregio are catalogued. |
 | 🇩🇰 DK | nap.vd.dk | Not probed (operator confirmed it's the right NAP) |
@@ -351,23 +351,54 @@ URL before bootstrap.
 - **Previously suggested** (WRONG): `https://nap.gov.si/` — I guessed this domain; the PDF doesn't reference it. May or may not exist.
 - **Verdict**: ❌ Blocked — cannot onboard SI without a working NAP URL. Defer to Phase B follow-up once URL discovered.
 
-### 🇭🇺 HU — Hungary · ⚠ NAP probe needed
+### 🇭🇺 HU — Hungary · ✅ Inventoried via NAP API (2026-06-29) — multimodal IS present
 
-- **Official MMTIS NAP**: **https://napportal.kozut.hu/** (Magyar Közút — Hungarian Public Road Non-profit Company)
-- **Operator probe action**:
-  1. Visit https://napportal.kozut.hu/
-  2. Inventory rail / city / bus timetable feeds
-  3. Confirm MÁV-Start + GySEV are present, capture exact URLs
-- **Previously suggested** (WRONG): `https://nap.gov.hu/` and `https://kif.gov.hu/` — both wrong, the official NAP is napportal.kozut.hu.
-- **Auth**: TBD per probe
-- **Refresh**: TBD per probe (MÁV historically weekly)
-- **Operator coverage** (expected):
-  - MÁV-Start (long-distance + regional rail)
-  - GySEV / Raaberbahn (HU↔AT cross-border)
-  - MÁV-HÉV (Budapest suburban)
-  - Volánbusz (national bus)
-  - BKV (Budapest metro/tram/bus/HÉV)
-- **Verdict**: ⚠ Onboard pending napportal.kozut.hu probe
+- **Official MMTIS NAP**: https://napportal.kozut.hu/ (Magyar Közút)
+- **Catalogue API** (operator-discovered via browser DevTools):
+  ```
+  POST https://napportal.kozut.hu/napp-portal-proxy/api/MetadataSearch
+  Content-Type: application/json-patch+json
+  Body: all-null filter object returns all ~70 entries
+  ```
+  Filter `isMultimodal: true` in body for transit-only.
+- **Important context correction**: portal landing page title is `Közúti közlekedés nemzeti adathozzáférési pontja` ("Road Traffic National Access Point") which is misleading — the same portal hosts BOTH road traffic AND multimodal data. My earlier "road-only" concern was wrong; multimodal is fully there.
+
+**Verified rail + transit operators in the catalogue** (subset of full 70-entry response, transit only):
+
+| id | Operator | Profile name | Format | URL / Access |
+|---|---|---|---|---|
+| 5 | **MÁV + GYSEV** (combined) | helyközi vasúti menetrendje | **GTFS** | `https://www.mavcsoport.hu/gtfs-igenybejelento` — **request form** |
+| 4 | **MÁV / Volánbusz** | helyközi és helyi autóbusz menetrendje | GTFS | same gtfs-igenybejelento form |
+| 6 | MÁV bus RT | RT vehicle positions | GTFS-RT | email `nap.volanbusz@mav-szk.hu` |
+| 7 | MÁV train RT | RT train positions | GTFS-RT | email `nap.volanbusz@mav-szk.hu` |
+| 13 | BKK Budapest | Planned schedules | GTFS | `https://opendata.bkk.hu/data-sources` (open) |
+| 14 | BKK Budapest | Real-time + vehicle positions | GTFS-RT | `https://opendata.bkk.hu/data-sources` |
+| 15 | BKK Budapest | FUTÁR system | other | `https://opendata.bkk.hu/data-sources` |
+| 11 | SZKT Szeged | Tram + trolleybus | GTFS | `http://gtfs.szkt.hu/zipstore/szkt-szeged-hu.zip` (direct) |
+| 16 | Kecskemét (KeKo) | Local bus | GTFS | `https://keko.hu/gtfs-letoltesi-igenybejelento` (form) |
+| 17 | V-Busz Veszprém | Local bus | GTFS | `vbusz.hu/gtfs` |
+| 18 | Kaposvár Közlekedési | Local bus | GTFS | `https://www.kaposbusz.hu/letoltheto-menetrend` |
+| 19 | Blaguss Szombathely | Local bus | GTFS | `https://szombathely.utas.hu/api/static/v1/gtfs-google/gtfs-google.zip` (direct) |
+| 21 | Paks ebus | Local bus | GTFS | direct .zip with token |
+| 10 | Velencei-tavi | Lake Velence boat | GTFS | `https://velenceitohajozas.hu/menetrendek/` |
+| 22 | BAHART | Lake Balaton boat | GTFS | `https://nap.bahart.hu/` |
+| 8 | Mecsekerdő | Forest railway (heritage) | other | niche |
+| 9 | Gemenc | Forest railway (heritage) | other | niche |
+
+**Corrections to my earlier doc**:
+
+1. **GySEV is NOT a separate feed** — it's bundled with MÁV in profile id 5. One combined GTFS for both operators.
+2. **BKV is now BKK** (rebranded). Listed as ids 13-15 with open direct download at opendata.bkk.hu.
+3. **Volánbusz is under MÁV** now (entry id 4 contact email is `nap.volanbusz@mav-szk.hu`).
+4. **MÁV-HÉV (Budapest suburban rail) is NOT in the NAP** — that's a gap, no public feed available.
+
+**Critical access concern**: The MÁV+GYSEV rail feed and MÁV bus feed both go through a **request form** at https://www.mavcsoport.hu/gtfs-igenybejelento (`igénybejelentő` = "request form"). NOT direct download — the operator must register and request access per-organisation. Likely results in a per-requester download URL or scheduled email delivery. Expect 1-5 business days for Hungarian gov-process turnaround.
+
+**Freshness concern**: MÁV+GYSEV metadata last saved 2024-11-15 (over a year old in the catalogue). The underlying GTFS file at the request endpoint may be fresher than the metadata record, but worth confirming during the access request.
+
+- **Auth**: BKK + 4 regional cities are open. MÁV (rail + bus) requires form submission.
+- **Refresh**: TBD per operator (likely weekly for MÁV, more frequent for BKK).
+- **Verdict for eu19**: ✅ Onboard **MÁV+GYSEV rail (id 5)** as primary HU feed once form access is granted. BKK optional if Budapest urban coverage matters. Regional cities skip unless those become coverage hubs.
 
 # Part 2.5 — Cross-cutting: stop-point identification across 19 countries
 
