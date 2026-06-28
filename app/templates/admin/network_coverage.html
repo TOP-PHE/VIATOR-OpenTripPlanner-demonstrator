@@ -204,9 +204,9 @@
             <option value="{{ s.id }}">{{ s.name }} ({{ s.id }})</option>
           {% endfor %}
         </select>
-        <label>Departure</label>
+        <label for="cov-depart">Departure</label>
         <input type="datetime-local" name="depart_at" id="cov-depart">
-        <label>Direction
+        <label for="cov-direction">Direction
           <span class="hint" style="font-weight: normal">(both = 650 pairs · single = 325)</span>
         </label>
         <select name="direction" id="cov-direction">

@@ -423,48 +423,7 @@ def create_run(
     if body.direction not in ("both", "single"):
         raise HTTPException(400, "direction must be 'both' or 'single'")
 
-    if body.mode == runner.MODE_SINGLE_SESSION:
-        if not body.session_id:
-            raise HTTPException(400, "mode='single_session' requires a session_id")
-        s = db.get(SessionRow, body.session_id)
-        if s is None:
-            raise HTTPException(404, f"Session {body.session_id!r} not found")
-        if s.state != SessionState.SERVING.value:
-            raise HTTPException(
-                400,
-                f"Session {body.session_id!r} is in state {s.state!r} — must be 'serving' "
-                "for coverage runs (the OTP container has to be live to receive queries)",
-            )
-    elif body.mode == runner.MODE_FANOUT:
-        if body.session_id:
-            raise HTTPException(
-                400,
-                "mode='fanout' must not specify a session_id — every fanout-enabled "
-                "session is queried at execute time",
-            )
-        # At least one serving + fanout-enabled session must exist; otherwise
-        # the run would have nothing to query against. The runner re-checks
-        # at execute time (in case a session drops between create and run)
-        # but failing fast at create gives the UI a meaningful 400 instead
-        # of a 'failed' status row in the sidebar.
-        eligible = (
-            db.execute(
-                select(SessionRow)
-                .where(SessionRow.state == SessionState.SERVING.value)
-                .where(SessionRow.include_in_fanout.is_(True))
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
-        if eligible is None:
-            raise HTTPException(
-                409,
-                "mode='fanout' requires at least one serving + include_in_fanout session; "
-                "none found",
-            )
-    else:  # pragma: no cover — pydantic pattern already gates the values
-        raise HTTPException(400, f"unknown mode {body.mode!r}")
+    _validate_run_create_mode(body, db)
 
     # Normalise depart_at to UTC if naive — OTP interprets this in
     # transitModelTimeZone; we keep our DB representation tz-aware.
@@ -800,6 +759,71 @@ def _hub_to_info(hub: NetworkCoverageHub) -> HubInfo:
         is_active=hub.is_active,
         sort_order=hub.sort_order,
     )
+
+
+def _validate_run_create_mode(body: RunCreate, db: DbSession) -> None:
+    """Validate the (mode, session_id) preconditions before a coverage run
+    is created. Raises HTTPException with the appropriate status code on
+    failure; returns None on success.
+
+    Extracted from `create_run` to keep that endpoint's cognitive
+    complexity below SonarCloud's threshold of 15 — the nested mode →
+    session_id → state checks were the main contributor.
+    """
+    if body.mode == runner.MODE_SINGLE_SESSION:
+        _validate_single_session_mode(body, db)
+    elif body.mode == runner.MODE_FANOUT:
+        _validate_fanout_mode(body, db)
+    else:  # pragma: no cover — pydantic pattern already gates the values
+        raise HTTPException(400, f"unknown mode {body.mode!r}")
+
+
+def _validate_single_session_mode(body: RunCreate, db: DbSession) -> None:
+    """`mode='single_session'` requires an existing serving session.
+
+    400 when session_id is missing or the session isn't in SERVING state;
+    404 when the session id doesn't exist."""
+    if not body.session_id:
+        raise HTTPException(400, "mode='single_session' requires a session_id")
+    s = db.get(SessionRow, body.session_id)
+    if s is None:
+        raise HTTPException(404, f"Session {body.session_id!r} not found")
+    if s.state != SessionState.SERVING.value:
+        raise HTTPException(
+            400,
+            f"Session {body.session_id!r} is in state {s.state!r} — must be 'serving' "
+            "for coverage runs (the OTP container has to be live to receive queries)",
+        )
+
+
+def _validate_fanout_mode(body: RunCreate, db: DbSession) -> None:
+    """`mode='fanout'` rejects an explicit session_id and requires at
+    least one eligible (serving + include_in_fanout) session to exist.
+
+    400 when session_id was supplied; 409 when no eligible session
+    exists at create time. The runner re-checks at execute time in case
+    a session drops between create and run."""
+    if body.session_id:
+        raise HTTPException(
+            400,
+            "mode='fanout' must not specify a session_id — every fanout-enabled "
+            "session is queried at execute time",
+        )
+    eligible = (
+        db.execute(
+            select(SessionRow)
+            .where(SessionRow.state == SessionState.SERVING.value)
+            .where(SessionRow.include_in_fanout.is_(True))
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if eligible is None:
+        raise HTTPException(
+            409,
+            "mode='fanout' requires at least one serving + include_in_fanout session; none found",
+        )
 
 
 def _run_to_summary(run: Any) -> RunSummary:
