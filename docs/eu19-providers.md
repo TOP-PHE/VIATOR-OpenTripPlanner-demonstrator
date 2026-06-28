@@ -265,20 +265,16 @@ URL before bootstrap.
   - SJ + MTR + Snälltåget + Tågkompaniet/Vy + Pågatågen + Öresundståg + SL + Skånetrafiken + Västtrafik + 12 more regional
 - **Verdict**: ⚠ Onboard pending trafficdata.se probe
 
-### 🇳🇴 NO — Norway · ⚠ NAP probe needed
+### 🇳🇴 NO — Norway · ✅ Confirmed by operator probe (2026-06-29)
 
-- **Official MMTIS NAP**: **https://transportportal.atlas.vegvesen.no/no/** (Statens Vegvesen — Norwegian Public Roads Administration; secondary listing: www.data.norge.no)
-- **Operator probe action**:
-  1. Visit https://transportportal.atlas.vegvesen.no/no/
-  2. Find the kollektivtrafikk / public-transport timetable catalogue
-  3. Verify whether Entur's national bundle (`rb_norway-aggregated`) is referenced as the canonical source OR if a separate URL is provided
-- **Previously suggested** (WRONG, internal storage URL): `https://storage.googleapis.com/marduk-production/outbound/...` — that's Entur's internal Google Cloud Storage bucket. Even though Entur is state-owned and that's the canonical bulk download in practice, the NAP-compliant entry point is via transportportal.atlas.vegvesen.no.
-- **NO is special**: Entur is a state agency producing the data on behalf of Vegvesen; both organisations work together. The transportportal almost certainly references Entur's bundle URLs. Once confirmed via probe, the marduk-production URL becomes the NAP-referenced canonical source.
-- **Format**: NeTEx (Nordic profile) + GTFS both published
-- **Auth**: None
+- **Official MMTIS NAP**: **https://transportportal.atlas.vegvesen.no/no/** (Statens Vegvesen)
+- **Confirmed canonical timetable dataset URL** (operator-verified): https://transportportal.no/datasets/c7960768-96a0-3cf0-8692-8af4afe8c423
+- **Format**: NeTEx Nordic profile + GTFS both published (per Entur's standard practice)
+- **Auth**: None (Entur open data)
 - **Refresh**: Daily
 - **Operator coverage** (expected): Vy + Go-Ahead Nordic + SJ Nord + Flytoget + Ruter + AtB + Skyss + Kolumbus + Kystverket coastal ferries + Nor-way Bussekspress
-- **Verdict**: ⚠ Onboard pending transportportal probe (likely just NAP-confirmation of marduk URLs)
+- **Important — separate stop place file**: The NO NAP ALSO publishes a dedicated **Stop Place Register (NSR — Nasjonalt Stoppestedsregister)** as a distinct dataset, referenced from https://developer.entur.org/pages-intro-files. This contains the authoritative national stop register that all NO transit operators reference. See the cross-cutting "Stop-point identification" section below for why this matters for the eu19 corridor as a whole.
+- **Verdict**: ✅ Ready to onboard — operator has confirmed the canonical URLs
 
 ### 🇵🇱 PL — Poland · ⚠ NAP probe needed + operator scope decision
 
@@ -348,19 +344,148 @@ URL before bootstrap.
   - BKV (Budapest metro/tram/bus/HÉV)
 - **Verdict**: ⚠ Onboard pending napportal.kozut.hu probe
 
+# Part 2.5 — Cross-cutting: stop-point identification across 19 countries
+
+**Raised by the operator during the NO probe (2026-06-29). This may be
+the single most important architectural concern of the whole eu19
+effort, not just for NO.**
+
+## The problem
+
+Every country's transit feed identifies stop places with its OWN
+identifier scheme:
+
+| Country | Stop ID scheme | Example (Oslo S / equivalent) |
+|---|---|---|
+| NO | NSR (Nasjonalt Stoppestedsregister) | `NSR:StopPlace:59872` |
+| SE | RKR / Samtrafiken stops | typically `9022001020000001` or similar |
+| DK | Rejseplan stop IDs | `00088002` style |
+| DE | DELFI Globale Haltestellen (de:08111…) | `de:09162:6:1:1` |
+| CH | DiDok / SBB stop IDs | `8503000` (also valid UIC) |
+| FR | StopArea:OCE… (SNCF) or numeric UIC | `StopArea:OCE87739000` |
+| BE | iRail / NMBS stop_id | `008811007` (numeric UIC) |
+| NL | KV15 / CHB stops | `stoparea:560000…` |
+| AT | DIVA stop numbers + UIC | `at:43:300` |
+| IT | RFI / Trenitalia stop IDs | `S07207` style |
+| GB | NaPTAN ATCO + CRS | `9100KNGX` (CRS) |
+| HU | MÁV stop IDs (TBD) | unknown |
+| CZ | CIS station numbers | unknown |
+| PL | PLK stop IDs / city-system specific | varies wildly |
+| LU | CFL stop_id | unknown |
+| SI | SŽ stop_id | unknown |
+| SK | ZSSK stop_id | unknown |
+
+**The cross-border lingua franca is the UIC 7-digit station code**
+(prefix 70-99 by country: 76 NO, 74 SE, 86 DK, 80 DE, 87 FR, 88 BE,
+84 NL, 81 AT, 83 IT, 70 GB, 85 CH, 55 HU, 54 CZ, 51 PL, 82 LU, 79 SI,
+56 SK). But UIC codes are present **only for stations that operate
+internationally** — typically major rail termini, not every regional
+halt. Bus stops effectively never have UIC codes.
+
+## Why this matters for the matrix
+
+When the operator queries `Oslo → Stockholm`, MOTIS needs:
+
+1. Find Oslo S in the NO feed (NSR:StopPlace:59872, lat/lon ~59.91,10.75)
+2. Find Oslo S in the SE feed too (probably a different ID, same coords)
+3. Decide whether these are "the same stop" so the SJ overnight train
+   that departs Oslo and arrives in Stockholm appears as one
+   continuous journey
+
+**MOTIS's default behaviour**: cluster stops by coordinate proximity
+(~10m default radius) and name similarity. Works well for major
+stations (coords differ by <5m between feeds, names roughly match).
+Fails for:
+
+- **Border-adjacent stations** where each operator's feed places the
+  stop centroid in a slightly different location (>10m apart)
+- **Multilingual names** — e.g. Brussel-Zuid vs Bruxelles-Midi vs
+  Brussels-South, or Genève vs Geneva vs Ginevra
+- **Bus / tram interchanges** where the coordinate is approximate but
+  the platform-level interchange is the real point
+
+## What the dedicated stop-place registers give us
+
+Each country with a national stop-place register (NSR equivalent)
+publishes:
+
+- A canonical list of stops with stable identifiers
+- Hierarchy: StopPlace (the station) → Quay (the platform/track)
+- Multi-modal codes: rail UIC, IATA where applicable, local bus codes
+- Stable coordinates (the operator's surveyed position, not whatever
+  individual operators happen to plot)
+
+For NO: NSR (Entur)
+For DK: published alongside Rejseplan
+For DE: DELFI Globale Haltestellen
+For FR: BANO / IRVE / stop_area registry
+For CH: DiDok
+For NL: CHB (Centraal Haltebestand)
+
+**Most NAPs publish their stop register as a separate file from the
+timetable feed.** Currently in eu11 we ingest the timetables but NOT
+the registers, relying on coordinate clustering.
+
+## Recommendation for eu19
+
+**Three options, ranked by ambition:**
+
+**A. Status quo — coordinate clustering only (default MOTIS behaviour)**
+Don't ingest stop registers; rely on coordinate proximity + name
+matching. Works for ~95% of major stations. Risks: occasional missed
+cross-border connections at border-adjacent or multi-platform sites.
+Zero extra work for eu19 onboarding.
+
+**B. Ingest national stop registers per country, no cross-country mapping**
+For each country where a register is available, ingest it as an
+authoritative stop reference. Internal-to-country queries become
+more reliable; cross-country still relies on coordinate clustering.
+~½ day per country (varies by format complexity).
+
+**C. Build a cross-country UIC stop-mapping table**
+Author a master `stop_equivalences.json` (or similar) that explicitly
+maps NSR:StopPlace:59872 ↔ SE:Stop:1234 ↔ UIC:7600103 etc. for every
+international station in our hub set (~50 stops). MOTIS gets perfect
+cross-border interop on those stops. Manual effort: ~1 day to populate
+the table from UIC code lookups + ad-hoc verification.
+
+**My recommendation**: **A for the initial eu19 build, then C for the
+~50 hubs we actually use in the coverage matrix.** B is interesting in
+theory but the per-country effort doesn't pay for itself unless we're
+running per-country coverage too, which the country-filter (PR #168)
+makes less pressing.
+
+The eu19 bootstrap should include the NO NSR file as a separate
+ingest (since we now know it's published as a distinct dataset on the
+NAP). For other countries, defer until we see actual cross-border
+matching failures in the coverage matrix.
+
+## Operator action items added for stop-point handling
+
+- During each NAP probe, ALSO inventory whether the country publishes
+  a dedicated stop-place register file (separate from the timetable).
+  Record its URL alongside the timetable URL.
+- Once eu19 is running, audit the coverage matrix for cross-border
+  `no_route` cells that should clearly have routes (e.g. Oslo →
+  Stockholm at 22:00 — there's a known SJ Nattåg). If we get
+  `no_route` there, it's likely a stop-matching failure and we should
+  pursue Option C for those stops specifically.
+
 # Part 3 — Action items & decisions before PR #2
 
 **Operator action items (block the OSM merge script + bootstrap PRs):**
 
-**Critical NAP probes (must be done before bootstrap)**:
-1. **DK**: Visit https://nap.vd.dk/ → capture rail timetable dataset URL
-2. **SE**: Visit www.trafficdata.se → determine whether to use Trafiklab feed (with NAP attestation) or a separate NAP-hosted one; if Trafiklab, register for key
-3. **NO**: Visit https://transportportal.atlas.vegvesen.no/no/ → confirm Entur bundle is NAP-referenced canonical source
-4. **PL**: Visit https://dane.gov.pl/en/dataset/1739,NAP → critical: is PKP IC present? Determines scope
-5. **CZ**: Visit http://registr.dopravniinfo.cz/en/ → confirm CIS JŘ GTFS catalogued
+**Critical NAP probes (must be done before bootstrap)** — for each, capture BOTH the timetable URL AND any separate stop-place register file:
+1. **DK**: Visit https://nap.vd.dk/ → capture (a) rail timetable URL, (b) DK stop-place register URL if separate
+2. **SE**: Visit www.trafficdata.se → determine whether to use Trafiklab feed (with NAP attestation) or a separate NAP-hosted one; if Trafiklab, register for key. Inventory whether SE stop register is separate
+3. **NO**: ✅ Operator confirmed (2026-06-29):
+   - Timetable: https://transportportal.no/datasets/c7960768-96a0-3cf0-8692-8af4afe8c423
+   - Stop Place Register (NSR) is a separate file referenced via developer.entur.org
+4. **PL**: Visit https://dane.gov.pl/en/dataset/1739,NAP → critical: is PKP IC present? Determines scope. Inventory PL stop register
+5. **CZ**: Visit http://registr.dopravniinfo.cz/en/ → confirm CIS JŘ GTFS catalogued + CZ stop register
 6. **SK**: Visit https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx → confirm or refute that timetable feeds are catalogued
 7. **SI**: Discover SI's working NAP URL (Ministry of Infrastructure inquiry if needed)
-8. **HU**: Visit https://napportal.kozut.hu/ → capture MÁV-Start + GySEV URLs
+8. **HU**: Visit https://napportal.kozut.hu/ → capture MÁV-Start + GySEV URLs + HU stop register
 
 **Compliance verification for existing eu11 feeds (lower priority but should be done in same sweep)**:
 1. **NL**: Visit https://ntm.ndw.nu → confirm OpenOV is NAP-referenced (highest risk of compliance gap)
