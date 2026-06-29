@@ -467,9 +467,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # the opt-in check, candidate filtering, logging, and zero-fill
         # counters in one place. ORM mutations on the rows are flushed
         # by the single db.commit() below, atomic with status='completed'.
-        verify_counters = await _maybe_run_external_verify_sweep(
-            db=db, run=run, rows=rows
-        )
+        verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows)
 
         run.summary = {
             "elapsed_seconds": elapsed_s,
