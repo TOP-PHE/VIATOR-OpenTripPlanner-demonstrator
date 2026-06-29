@@ -531,44 +531,83 @@ function buildFilterToggleHTML(run) {
   </label>`;
 }
 
-// PR-E — build one matrix cell <td>. Status switch + view-mode switch
-// + tooltip + external-verify dot used to live inline in renderRun(),
-// which pushed it over Sonar's CC=15 ceiling. Pulling the cell logic
-// out leaves renderRun as a thin orchestrator (build header, map
-// rows, glue legend) and isolates the per-cell branching here.
+// PR-E — Sonar follow-up: the per-cell `inner` glyph for non-ok
+// statuses. Pulled out of buildMatrixCellTd so its status-chain
+// branching doesn't count against that function's cognitive
+// complexity. Extending to new statuses (e.g. 'rate_limited') is a
+// one-line addition here without touching the cell builder.
+function statusGlyph(status) {
+  if (status === 'no_route') return '∅';
+  if (status === 'timeout') return '⏱';
+  return '✗';  // error / cancelled / any future unknown status
+}
+
+// PR-E — Sonar follow-up: visible content + heatmap class for a
+// status='ok' cell. Owns the view-mode switch (count / hybrid /
+// duration) AND the count-bucket if/else-if chain (n >= 30/20/10/3,
+// default count-1). That cluster was 11 CC inside buildMatrixCellTd
+// and dominated Sonar's CC=23 reading; relocated here it sits on a
+// flat function under the 15 ceiling.
+function buildOkCellPresentation(r) {
+  const n = r.num_itineraries || 0;
+  const dur = fmtDuration(r.best_duration_seconds);
+  if (CURRENT_VIEW === 'count') {
+    let bucket = ' count-1';
+    if (n >= 30)      bucket = ' count-30';
+    else if (n >= 20) bucket = ' count-20';
+    else if (n >= 10) bucket = ' count-10';
+    else if (n >= 3)  bucket = ' count-3';
+    return { inner: String(n), extraCls: bucket };
+  }
+  if (CURRENT_VIEW === 'hybrid') {
+    // v0.1.29.4 — was opacity:0.7 inline; nearly invisible on
+    // light-green cells. Now uses .cov-count-suffix CSS class for
+    // a muted-but-readable green.
+    const inner = n > 1 ? `${dur}<span class="cov-count-suffix">·${n}</span>` : dur;
+    return { inner, extraCls: '' };
+  }
+  // duration view (default v0.1.27 behaviour)
+  return { inner: dur, extraCls: '' };
+}
+
+// PR-E — Sonar follow-up: the multi-line tooltip string for one cell.
+// Two distinct format paths (status='ok' vs everything else) plus an
+// optional error_message tail. Pulled out of buildMatrixCellTd so its
+// nested ternary doesn't count against that function. Caller still
+// wraps the result in escHTML at the interpolation site.
+function buildCellTooltip(orig, dest, r) {
+  const header = `${orig.name} → ${dest.name}`;
+  if (r.status === 'ok') {
+    const n = r.num_itineraries || 0;
+    const t = r.best_num_transfers || 0;
+    const ops = r.best_operators || '?';
+    return `${header}\n${fmtDuration(r.best_duration_seconds)} (best), ${n} trips/day\n${t} transfers · ${ops}\n${r.response_ms}ms`;
+  }
+  const errTail = r.error_message ? `\n${r.error_message}` : '';
+  return `${header}\n${r.status}${errTail}`;
+}
+
+// PR-E — build one matrix cell <td>. Status + view-mode + tooltip +
+// external-verify dot used to live inline in renderRun(); they then
+// followed when this helper was first extracted and pushed the helper
+// itself over Sonar's CC=15 ceiling. Sonar follow-up splits the per-
+// status presentation (`buildOkCellPresentation` + `statusGlyph`) and
+// the tooltip (`buildCellTooltip`) into their own helpers so this
+// function stays a thin orchestrator (two early returns, one branch
+// on status='ok', glue the pieces into the <td>).
 function buildMatrixCellTd(orig, dest, r) {
   if (orig.id === dest.id) return '<td class="diag"></td>';
   if (!r) return '<td class="empty">·</td>';
   let cls = `s-${r.status}`;
   let inner;
   if (r.status === 'ok') {
-    const n = r.num_itineraries || 0;
-    const dur = fmtDuration(r.best_duration_seconds);
-    if (CURRENT_VIEW === 'count') {
-      inner = String(n);
-      // Bucket the heatmap classes; biggest class wins via CSS specificity.
-      if (n >= 30)      cls += ' count-30';
-      else if (n >= 20) cls += ' count-20';
-      else if (n >= 10) cls += ' count-10';
-      else if (n >= 3)  cls += ' count-3';
-      else              cls += ' count-1';
-    } else if (CURRENT_VIEW === 'hybrid') {
-      // v0.1.29.4 — was opacity:0.7 inline; nearly invisible on
-      // light-green cells. Now uses .cov-count-suffix CSS class for
-      // a muted-but-readable green.
-      inner = n > 1 ? `${dur}<span class="cov-count-suffix">·${n}</span>` : dur;
-    } else {
-      // duration (default v0.1.27 behaviour)
-      inner = dur;
-    }
-  } else if (r.status === 'no_route') inner = '∅';
-  else if (r.status === 'timeout')    inner = '⏱';
-  else                                 inner = '✗';
-  // Tooltip surfaces both numbers regardless of view, plus departure
-  // spread when available.
-  const tip = r.status === 'ok'
-    ? `${orig.name} → ${dest.name}\n${fmtDuration(r.best_duration_seconds)} (best), ${r.num_itineraries || 0} trips/day\n${r.best_num_transfers || 0} transfers · ${r.best_operators || '?'}\n${r.response_ms}ms`
-    : `${orig.name} → ${dest.name}\n${r.status}${r.error_message ? '\n' + r.error_message : ''}`;
+    const { inner: okInner, extraCls } = buildOkCellPresentation(r);
+    inner = okInner;
+    cls += extraCls;
+  } else {
+    inner = statusGlyph(r.status);
+  }
+  const tip = buildCellTooltip(orig, dest, r);
   // PR-E — external-verify dot + data-external-ok attribute. Three
   // visual colours match the click-verify modal palette (see
   // externalDotHTML); the attribute drives the "show only disagrees"
