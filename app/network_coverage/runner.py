@@ -29,6 +29,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -461,37 +462,14 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run.no_route_pairs = sum(1 for r in rows if r.status == "no_route")
         run.error_pairs = sum(1 for r in rows if r.status not in ("ok", "no_route", "skipped"))
 
-        # PR-E — external-verify sweep. Runs INSIDE the Phase-3 session
-        # so external_* mutations on the ORM rows are flushed by the
-        # single db.commit() below, atomic with status='completed'. Opt-
-        # in via run.verify_externally; best-effort per-cell (one bad
-        # cell can't abort the run). Skipped entirely if the flag is
-        # off or no cells qualify, so this branch is a no-op for runs
-        # that don't tick the new run-form checkbox.
-        verify_counters: dict[str, int] = {
-            "verified": 0,
-            "ok": 0,
-            "no_route": 0,
-            "error": 0,
-        }
-        if getattr(run, "verify_externally", False):
-            candidate_rows = [r for r in rows if r.status in _VERIFY_STATUSES]
-            log.info(
-                "PR-E external-verify sweep starting for run %s — %d candidate cells",
-                run_id,
-                len(candidate_rows),
-            )
-            if candidate_rows:
-                verify_counters = await _run_external_verify_sweep(
-                    db=db,
-                    run=run,
-                    rows=candidate_rows,
-                )
-            log.info(
-                "PR-E external-verify sweep done for run %s — %s",
-                run_id,
-                verify_counters,
-            )
+        # PR-E — external-verify sweep dispatch. Extracted to keep
+        # execute_run under Sonar's CC=15 ceiling; the helper handles
+        # the opt-in check, candidate filtering, logging, and zero-fill
+        # counters in one place. ORM mutations on the rows are flushed
+        # by the single db.commit() below, atomic with status='completed'.
+        verify_counters = await _maybe_run_external_verify_sweep(
+            db=db, run=run, rows=rows
+        )
 
         run.summary = {
             "elapsed_seconds": elapsed_s,
@@ -516,6 +494,36 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # will catch it at next startup.
         run.status = "completed"
         db.commit()
+
+
+async def _maybe_run_external_verify_sweep(
+    *,
+    db: DbSession,
+    run: NetworkCoverageRun,
+    rows: Sequence[NetworkCoverageResult],
+) -> dict[str, int]:
+    """PR-E — opt-in entry point for the external-verify sweep. Returns
+    the zero-fill counters if the run didn't opt in or has no candidate
+    cells, otherwise dispatches to `_run_external_verify_sweep` and
+    returns its counters.
+
+    Extracted from `execute_run` so that function stays under Sonar's
+    cognitive-complexity ceiling — the verify-sweep dispatch alone
+    introduced multiple branches that pushed Phase-3 over the limit."""
+    zero = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    if not getattr(run, "verify_externally", False):
+        return zero
+    candidate_rows = [r for r in rows if r.status in _VERIFY_STATUSES]
+    log.info(
+        "PR-E external-verify sweep starting for run %s - %d candidate cells",
+        run.id,
+        len(candidate_rows),
+    )
+    if not candidate_rows:
+        return zero
+    counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows)
+    log.info("PR-E external-verify sweep done for run %s - %s", run.id, counters)
+    return counters
 
 
 async def _run_external_verify_sweep(
