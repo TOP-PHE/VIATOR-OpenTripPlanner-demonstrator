@@ -1,0 +1,697 @@
+# eu19-transit-motis — provider research (all 19 countries)
+
+Complete provider reference for the eu19-transit-motis session, with
+sources anchored to the **official National Access Points (NAPs)** per
+EU Delegated Regulation 2017/1926 (action 'a' — Multimodal Travel
+Information Services).
+
+> **Compliance principle (added 2026-06-29 after operator review):**
+> Every dataset onboarded into VIATOR MUST be discoverable through the
+> destination country's official MMTIS NAP. Community mirrors (e.g.
+> Rejseplanen labs, Entur's marduk bucket, Trafiklab, OpenOV) MAY be
+> used as the download mechanism — they're often faster / more
+> convenient than the NAP portal's catalogue indirection — but ONLY
+> when the same dataset is also published through the NAP. If a
+> community URL exists but the NAP doesn't reference the dataset, we
+> don't onboard it.
+
+Authoritative NAP list: extracted from the European Commission
+`its-national-access-points.pdf` (updated October 2025), MMTIS column.
+Stored in `European NAP TimeTables/` outside the repo.
+
+## eu11 NAP-compliance sanity check (2026-06-29)
+
+Per operator request, audited each eu11 country's *currently-ingested* data
+source against its *official MMTIS NAP* from the PDF, asking: "if we knew
+nothing and only had the NAP URL, could we discover and download the same
+data we're using today?" Findings ranked by severity below.
+
+### 🚨 Critical warnings
+
+**🇮🇹 IT — CCISS is a SPID-login road-safety portal, NOT a multimodal data catalogue**
+
+- Live probe (2026-06-29) confirms: cciss.it landing page is the public road-traffic info portal; cciss.it/dataset returns a SPID authentication wall ("As of October 1, 2021, citizens can no longer access the CCISS portal using their previous credentials").
+- No multimodal/transit datasets visible. Italy's listed MMTIS NAP per Delegated Regulation 2017/1926 **does not actually publish open transit data**.
+- Same pattern as 🇸🇰 SK — the listed NAP is non-compliant with the multimodal scope.
+- **Our currently-ingested IT sources** (`IT-TRENITALIA-NeTEx_L1.zip`, Trenord URL, ATAC URL) are **NOT NAP-attested via CCISS**. The Trenitalia NeTEx file was provided directly; Trenord comes from `dati.lombardia.it`; ATAC from `romamobilita.it`. None of these are catalogued through CCISS.
+- **Workaround in place** (worth documenting): FR transport.data.gouv.fr *does* catalogue "Réseau national Trenitalia France" (GTFS + GTFS-RT, Licence Ouverte) — so the cross-border Trenitalia France presence in our matrix IS NAP-attested via FR. But IT-internal Trenitalia services are not.
+- **Action**: Document the IT NAP non-compliance explicitly. Possible mitigations (in order of effort): (a) accept the gap, document it for any compliance audit; (b) probe whether data.gov.it or a Ministry-level Italian portal hosts a real MMTIS NAP that CCISS doesn't reference; (c) escalate to Italian Ministero per chiarification.
+
+**🇱🇺 LU — current source not discoverable through the official NAP**
+
+- Live probe of data.public.lu search for "CFL" returned **3 datasets only**: FLEX car-sharing, P+R parking, hiking trails. **NO transit timetable** visible. Searches for "horaire", "transports publics" hit the SPA shell (couldn't enumerate).
+- Our currently-ingested `LU-NAP-netex-20260618-20260823.zip` (CFL national rail + bus, NeTEx-EPIP) cannot be traced back to data.public.lu through the public search.
+- The actual source is likely `mobiliteit.lu` (CFL/AVL operator portal) directly — which is the Luxembourg national mobility platform but **may or may not be NAP-referenced**.
+- **Action**: Operator probe of data.public.lu directly (the search SPA needs JS to render). If the CFL NeTEx-EPIP is genuinely not in data.public.lu, document the gap; the data is open per CC0 anyway so legal use isn't questioned, but the NAP-referencing claim isn't supportable.
+
+### ⚠ Warnings (verified but with caveats)
+
+**🇧🇪 BE — verified compliant BUT non-commercial license flag**
+
+- ✅ SNCB Netex (the file we use) IS catalogued via the official NAP — CKAN search confirmed at `belgiantrain.be/en/3rd-party-services/mobility-service-providers/public-data`.
+- ⚠ **License is "Other (Non-Commercial)"** — relevant for VIATOR's commercial use scope. Operator should verify with SNCB whether the VIATOR product context qualifies. Discovered bonus: 3 other Belgian NeTEx feeds (TEC Wallonia CC0, STIB-MIVB Brussels fee-required, De Lijn Flanders Open Data Commons) — we don't currently ingest these but could expand BE coverage if needed.
+
+**🇦🇹 AT — likely OK but not verified within probe budget**
+
+- mobilitydata.gv.at has 102 datasets across 9 pages. First page showed ÖBB Verkaufsstelleninformation API, ÖBB Fahrplanbilder, Wiener Linien Delay, GIP.at infrastructure — but NOT our `AT-NAP_netex_evu_2026.zip` directly.
+- Query-with-NeTEx and query-with-GTFS hit timeouts/connection errors.
+- **Action**: Operator browser probe — search for "EVU" or "ÖBB NeTEx" on the portal. The 102 total datasets suggests the EPIP bundle IS there, just not on page 1.
+
+### ⚠ Inconclusive (couldn't verify via static fetch)
+
+**🇪🇸 ES** — `nap.mitma.es` → 301 → `nap.transportes.gob.es`. CKAN API returns **401 Unauthorized** — auth-walled. Operator needs to log in via the portal to enumerate. Likely OK but unverified.
+
+**🇳🇱 NL** — ntm.ndw.nu doesn't expose CKAN at expected paths. OpenOV (`gtfs.ovapi.nl/nl/gtfs-nl.zip`) NAP-reference status remains unverified. Operator should browser-probe ntm.ndw.nu's search to see if OpenOV is referenced as canonical, or whether NDW publishes its own multimodal feed separately.
+
+**🇩🇪 DE** — Mobilithek.info SPA returned title only via static fetch. The `mobilithek.info/offers` and `/api/v1/search` paths gave 404. Operator should browser-probe to confirm DELFI Gesamtdeutschland NeTEx-EPIP is catalogued.
+
+**🇬🇧 GB** — data.gov.uk dataset search with my query parameters returned 404. Operator should probe `data.gov.uk/dataset/national-rail-timetables` or similar canonical paths.
+
+### ✅ Verified compliant
+
+**🇫🇷 FR** — transport.data.gouv.fr IS the NAP. All ingested feeds are direct from the catalogue. Bonus confirmation today: the Trenitalia France GTFS we use IS catalogued there (`/datasets/horaires-des-trains-trenitalia-france`, Licence Ouverte).
+
+**🇨🇭 CH** — opentransportdata.swiss IS the NAP. All ingested SBB data is direct from the catalogue.
+
+### 🇱🇮 LI — no NAP (not bound by EU Reg 2017/1926)
+
+EEA but not EU. Coverage transitive via CH (SBB PostBus) and AT (ÖBB Vorarlberg). No compliance concern.
+
+## Stop registers & minimum connection times (per operator request)
+
+The audit also looked for whether each NAP separately publishes:
+1. **A stop place register** (cf. Norway's NSR — authoritative national stop register with stable IDs)
+2. **Minimum connection time / transfer time files** (typically embedded in NeTEx connection_link elements or GTFS-extended `transfers.txt`)
+
+Findings on these dimensions:
+
+- **NeTEx feeds inherently include stops with stable IDs + connection times** (NeTEx 1.2 model has `StopPlace` + `Connection`/`SiteConnection` elements). So for any country we ingest as NeTEx-EPIP (BE, LU current, CH, DE, AT, IT), MOTIS gets stops + connection times for free.
+- **GTFS feeds include `stops.txt` (stop register) but `transfers.txt` (min connection times) is optional** — usually present for major operators (SBB, NS, DB, ÖBB include it; many regional operators don't).
+- **Separately-published national stop registers** are rare. Norway's NSR (via Entur) is the gold standard. France's stop_area registry on transport.data.gouv.fr is similar. Most other countries embed stops in the timetable feed only.
+
+**Recommendation for eu19**: rely on the embedded stops + transfers in each NeTEx/GTFS feed for v0. Layer the NO NSR file separately (as already planned). Only invest in per-country stop register ingestion if we see specific cross-border `no_route` failures attributable to stop-matching gaps.
+
+## Compliance audit of the previous draft
+
+The first version of this doc (commit `94ae9a5`) used community URLs
+rather than the official MMTIS NAPs. Corrected below.
+
+| Country | Previous (wrong) URL | Official MMTIS NAP (per PDF) |
+|---|---|---|
+| DK | `rejseplanen.info/labs/GTFS.zip` (community) | https://nap.vd.dk/ |
+| SE | `trafiklab.se` (community) | www.trafficdata.se |
+| NO | `storage.googleapis.com/marduk-production` (Entur internal) | https://transportportal.atlas.vegvesen.no/no/ |
+| PL | Fragmented city URLs | https://dane.gov.pl/en/dataset/1739,NAP |
+| CZ | `portal.cisjr.cz` (CIS — provider, not NAP) | http://registr.dopravniinfo.cz/en/ |
+| SK | "no NAP exists" — wrong | https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx |
+| SI | `nap.gov.si` — wrong domain | "NAP - National Traffic Management Centre" (PDF gives no working URL) |
+| HU | `nap.gov.hu` — wrong | https://napportal.kozut.hu/ |
+| ES | `nap.transportes.gob.es` (works via redirect) | https://nap.mitma.es/ |
+| BE | `belgianmobilitydataportal.be` (works via redirect) | https://www.transportdata.be/en/ |
+| LU | `mobiliteit.lu` (provider) | https://data.public.lu/en/ |
+| NL | `gtfs.ovapi.nl` (community OpenOV) | https://ntm.ndw.nu |
+| DE | `delfi.de` (provider behind portal) | https://mobilithek.info/ |
+| AT | `mobilitaetsverbuende.at` (provider portal) | http://www.mobilitydata.gv.at/ |
+| IT | "no single NAP" — wrong | https://www.cciss.it/ |
+| GB | "no NAP listed" — wrong | https://data.gov.uk/ |
+| FR | https://transport.data.gouv.fr/ | ✅ Same — IS the NAP |
+| CH | www.opentransportdata.swiss | ✅ Same — IS the NAP |
+
+## Live NAP probe findings (2026-06-29)
+
+I attempted to verify each official NAP URL with a non-interactive
+HTTP fetch + content extraction. **Mixed results — the modern NAP
+portals are JavaScript-rendered single-page apps that don't expose
+their catalogues to programmatic probes.** Operator browser-based
+navigation will see what's there; my static probes can't.
+
+What I actually confirmed:
+
+| Country | NAP URL | Live probe verdict |
+|---|---|---|
+| 🇨🇿 CZ | registr.dopravniinfo.cz/en/ | ✅ Confirmed: portal lists "NeTEx - Timetable information" as a published source category (`sources/cz-mdcr_NeTEx-timetables-v1.0/`). Specific operator coverage requires browser navigation into that sub-page. |
+| 🇸🇪 SE | trafficdata.se | ✅ **RESOLVED (2026-06-29 round 3)**: CKAN API at `/api/3/action/package_search` returned the full catalogue. 4 Trafiklab transit datasets ARE referenced from the NAP (GTFS Regional, GTFS Sverige 2 national, Trafiklab portal, NeTEx Regional — all CC0). Earlier "road-only" concern was wrong; Trafiklab IS NAP-canonical for SE transit. |
+| 🇭🇺 HU | napportal.kozut.hu | ✅ **CONFIRMED** via operator's browser-DevTools-captured API call (2026-06-29): the portal IS multimodal despite its road-focused title. 70 entries total, 16 transit-related. MÁV+GYSEV rail bundled in profile id 5 (GTFS, request-form access). BKK Budapest open at opendata.bkk.hu. **Earlier "road-only" concern was wrong** — both road AND transit live under the same portal. API endpoint: `POST /napp-portal-proxy/api/MetadataSearch`. |
+| 🇳🇴 NO | transportportal.atlas.vegvesen.no | ⚠ SPA — portal exists ("Felles datakatalog" / Shared Data Catalogue) but the dataset list requires JavaScript to render. Couldn't programmatically inventory. Catalogue is at `data.transportportal.no/datasets` (per the landing page text) which redirects to the SPA shell. |
+| 🇵🇱 PL | dane.gov.pl/dataset/1739 | ⚠ SPA — dataset page returns "Otwarte Dane" header only; resources behind JS render. Couldn't confirm whether PKP IC / Polregio are catalogued. |
+| 🇩🇰 DK | nap.vd.dk | Not probed (operator confirmed it's the right NAP) |
+| 🇸🇮 SI | (no URL in PDF) | Cannot probe — URL unknown |
+| 🇸🇰 SK | aplikacie.zsr.sk/MapaVylukZsr | Not probed; portal name ("disruption map") makes it unlikely to host timetables |
+
+**What this means**:
+
+1. **The PDF MMTIS column may be misleading for SE and HU.** Both URLs appear to be road-traffic NAPs operated by road administrations, not multimodal/transit portals. Sweden's actual transit-data hub is widely understood to be **Trafiklab** (Samtrafiken-operated) and Hungary's is **MÁV's NAP** or one of the ministry-level portals — but neither is in the EU Commission's official list. This is a **real EU enforcement gap**: multiple member states have published "NAP" URLs that don't comply with the multimodal scope of Regulation 2017/1926. If we strictly follow the PDF for SE/HU, we get road data only and effectively no transit. If we use Trafiklab/MÁV directly, we're compliant in spirit (the data is public per the regulation's intent) but not anchored to the formally-listed NAP.
+
+2. **NO is probably fine** — Entur is state-owned and operates as Norway's de-facto MMTIS data hub. The transportportal almost certainly references Entur's bundle URLs once the operator can navigate into the catalogue. Browser confirmation should be quick.
+
+3. **PL is unknowable until browser probe** — the PKP IC question (the headline blocker for PL coverage) can't be answered from a static fetch. Operator needs to visit dane.gov.pl/dataset/1739 in a browser.
+
+4. **CZ looks solid** — the NeTEx-timetables source category is referenced on the landing page; navigating into it should yield the canonical download URL.
+
+**Practical recommendation**: when the operator does the NAP probes (action items at the bottom), screen-capture or paste the dataset listings into a follow-up so we can record the exact compliant URLs. For SE and HU specifically, document why we use Trafiklab and MÁV-direct respectively (if we do), citing the formal-NAP-is-road-only gap.
+
+## Capacity verification (VPS probe, 2026-06-28)
+
+Probed against the running prod VPS:
+
+| Resource | Current | Headroom available | eu19 estimate | Verdict |
+|---|---|---|---|---|
+| RAM | 94 GiB total, 21 GiB free | +38 GiB by pausing top 2 sessions | ~36 GiB serve, ~65 GiB peak build | ✅ Feasible |
+| Disk | 678 GB, 255 GB free | — | +30-35 GB OSM, +5 GB feeds, +50 GB build buffer | ✅ Feasible |
+| MOTIS heap | No hard limit | Uses host RAM | Auto-sized per `rebuild-max-memory` (PR #19) | ✅ Existing mechanism |
+
+**Build path**: pause the 21 GiB and 17 GiB session containers, run
+`rebuild-max-memory` mode for eu19, restart paused sessions after the
+serve container handoff. Total wallclock estimate: 4-6 hours.
+
+## All-19 verdict summary
+
+The "Action for eu19" column is the operator-facing decision: keep
+existing eu11 feed, onboard via official NAP, or skip.
+
+| # | Country | Official MMTIS NAP | In eu11? | Action for eu19 | Verdict |
+|---|---|---|---|---|---|
+| 1 | 🇪🇸 ES | https://nap.mitma.es/ | Yes (5 GTFS) | Confirm existing feeds also catalogued in nap.mitma.es | ✅ Keep, verify compliance |
+| 2 | 🇫🇷 FR | https://transport.data.gouv.fr/ | Yes (15 GTFS) | None — current source IS the NAP | ✅ Compliant |
+| 3 | 🇧🇪 BE | https://www.transportdata.be/en/ | Yes (NeTEx-EPIP) | Verify SNCB feed catalogued via transportdata.be | ✅ Keep, verify compliance |
+| 4 | 🇱🇺 LU | https://data.public.lu/en/ | Yes (NeTEx-EPIP) | Verify CFL feed catalogued via data.public.lu | ✅ Keep, verify compliance |
+| 5 | 🇳🇱 NL | https://ntm.ndw.nu | Partial (OpenOV community URL) | **Verify OpenOV referenced from ntm.ndw.nu**, otherwise switch source | ⚠ Compliance check needed |
+| 6 | 🇩🇪 DE | https://mobilithek.info/ | Yes (NeTEx-EPIP from DELFI) | Verify DELFI feed catalogued via mobilithek.info | ✅ Keep, verify compliance |
+| 7 | 🇦🇹 AT | http://www.mobilitydata.gv.at/ | Yes (NeTEx-EPIP) | Verify NAP feed catalogued via mobilitydata.gv.at | ✅ Keep, verify compliance |
+| 8 | 🇮🇹 IT | https://www.cciss.it/ | Yes (Trenitalia NeTEx) | **Verify Trenitalia + Trenord + ATAC all catalogued via cciss.it**, switch URLs if needed | ⚠ Compliance check needed |
+| 9 | 🇱🇮 LI | n/a (EEA, no MMTIS NAP) | Yes (transitive via CH/AT) | None | ✅ Keep |
+| 10 | 🇨🇭 CH | www.opentransportdata.swiss | Yes (NeTEx-EPIP) | None — current source IS the NAP | ✅ Compliant |
+| 11 | 🇬🇧 GB | https://data.gov.uk/ | Yes (only Eurostar via FR NAP) | None — coverage is via FR NAP | ✅ Keep |
+| 12 | 🇩🇰 DK | **https://nap.vd.dk/** | No | **Operator probe** — navigate nap.vd.dk to find DSB / Rejseplan datasets, capture exact feed URLs | ⚠ NAP probe needed |
+| 13 | 🇸🇪 SE | www.trafficdata.se | No | **Operator probe** — navigate trafficdata.se, confirm whether Trafiklab feeds are catalogued there OR find the official NAP-published feed | ⚠ NAP probe needed |
+| 14 | 🇳🇴 NO | https://transportportal.atlas.vegvesen.no/no/ | No | **Operator probe** — confirm Entur GTFS bundle is catalogued via the Vegvesen transportportal; if so, that URL is the legitimate download | ⚠ NAP probe needed |
+| 15 | 🇵🇱 PL | https://dane.gov.pl/en/dataset/1739,NAP | No | **Operator probe** — visit dataset 1739 on dane.gov.pl, see what rail / city transit feeds are listed | ⚠ NAP probe needed (+ operator scope decision) |
+| 16 | 🇨🇿 CZ | http://registr.dopravniinfo.cz/en/ | No | **Operator probe** — confirm CIS JŘ GTFS is catalogued via registr.dopravniinfo.cz | ⚠ NAP probe needed |
+| 17 | 🇸🇰 SK | https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx | No | **Operator probe** — verify if this ZSR portal exposes timetable feeds (NAP is listed but it's a "Mapa výluk" / disruption map portal, may not include schedules) | ❌ Skip likely, probe to confirm |
+| 18 | 🇸🇮 SI | "NAP - National Traffic Management Centre" (no URL in PDF) | No | **Operator action: find the working URL for SI's NAP**, then probe | ❌ Blocked until NAP URL discovered |
+| 19 | 🇭🇺 HU | https://napportal.kozut.hu/ | No | **Operator probe** — confirm MÁV / GySEV / Volánbusz feeds catalogued via napportal.kozut.hu | ⚠ NAP probe needed |
+
+# Part 1 — eu11 existing providers (compliance verification needed)
+
+These are already running in eu11. The action for eu19 is to verify
+each existing feed source is also catalogued in the official NAP, NOT
+to re-onboard from scratch.
+
+### 🇪🇸 ES — Spain · ✅ Keep, verify
+
+- **Official NAP**: https://nap.mitma.es/ (MITMA — Ministerio de Transportes y Movilidad Sostenible)
+- **Currently onboarded** (all GTFS despite NeTEx-prefixed filenames):
+  - FGC Catalunya, Euskotren, Ouigo, Renfe AVLD, Renfe Cercanías
+- **Compliance check**: Visit nap.mitma.es, search for each of the above operators, confirm the dataset is catalogued. If yes → current setup is compliant. If a dataset isn't listed in the NAP, raise with the operator before next refresh.
+- **Auth**: None for downloads
+- **Refresh**: Per-operator, typically weekly
+- **Gotchas**: Filenames misleadingly carry "NeTEx" prefix but contents are GTFS — `detect.py` classifies by content, not filename.
+
+### 🇫🇷 FR — France · ✅ Compliant (current source IS the NAP)
+
+- **Official NAP**: https://transport.data.gouv.fr/ — same as currently used. No action needed.
+- **Currently onboarded** (15 GTFS):
+  - SNCF national: TGV + Intercités + TER + Transilien (2 separate feeds)
+  - Regional TERs: BreizhGo, Fluo, HDF, LiO, Atoumod, Nouvelle-Aquitaine, Oura, Aleop, ZOU, IDFM
+  - International on FR territory: Eurostar v2, Renfe AVE Int, Trenitalia FR
+- **Refresh**: Daily/weekly per operator
+- **Gotchas**: cross_border_filter applied per `docs/cross-border-routing-as-built.md`.
+
+### 🇧🇪 BE — Belgium · ✅ Keep, verify
+
+- **Official NAP**: https://www.transportdata.be/en/ (Vlaamse Mobiliteitscentrale + SPF Mobilité)
+- **Currently onboarded**: `BE-NAP-SNCB-epip.zip` (NeTEx-EPIP) — SNCB/NMBS national rail
+- **Compliance check**: Confirm the SNCB-EPIP feed is catalogued in transportdata.be. Belgian NAP federates Flemish + Walloon + federal data; the SNCB feed should appear under federal-level catalog.
+- **Auth**: None
+- **Refresh**: Weekly
+
+### 🇱🇺 LU — Luxembourg · ✅ Keep, verify
+
+- **Official NAP**: https://data.public.lu/en/ (general gov open-data portal — NAP listed under "organizations/administration-des-ponts-et-chaussees")
+- **Currently onboarded**: `LU-NAP-netex-20260618-20260823.zip` (NeTEx-EPIP) — CFL national rail + bus
+- **Compliance check**: Find the dataset under the Ponts-et-Chaussées organisation on data.public.lu, confirm it's the same feed currently in use.
+- **Auth**: None
+- **Refresh**: Quarterly (date range in filename)
+- **Gotchas**: Tiny country, single feed covers everything (rail, bus, tram in Luxembourg City)
+
+### 🇳🇱 NL — Netherlands · ⚠ Compliance check needed
+
+- **Official NAP**: https://ntm.ndw.nu (NDW — Nationaal Dataportaal Wegverkeer; "NTM" = Nationaal Toegangspunt Mobiliteit)
+- **Currently onboarded**: OpenOV community GTFS at `http://gtfs.ovapi.nl/nl/gtfs-nl.zip` (URL-mode)
+- **Compliance check**: Visit ntm.ndw.nu, search for the multimodal GTFS / NeTEx feed catalogued there. Two possibilities:
+  - **Best case**: OpenOV (gtfs.ovapi.nl) is officially referenced from ntm.ndw.nu as the canonical bulk download → current setup is compliant
+  - **Worst case**: ntm.ndw.nu points at a different feed (perhaps the IFF-format one we previously rejected, or a separate NeTEx published by NDW itself) → we'd need to switch sources, document the OpenOV-vs-NAP gap, or argue for a derogation
+- **Refresh**: Daily (current OpenOV)
+- **Operator coverage**: NS + European Sleeper + Eurostar NL + ICE International + Arriva + Keolis + all NL urban transit (current OpenOV bundle)
+- **Action**: Operator probes ntm.ndw.nu and confirms; PR if a source switch is needed.
+
+### 🇩🇪 DE — Germany · ✅ Keep, verify
+
+- **Official NAP**: https://mobilithek.info/ (the merger of Mobilitäts Daten Marktplatz + ÖPNV-Datenmarktplatz; replaces the old MDM)
+- **Currently onboarded**: `DE-NAP-fahrplaene_gesamtdeutschland.zip` (NeTEx-EPIP) from DELFI — national multimodal bundle
+- **Compliance check**: DELFI publishes its Gesamtdeutschland bundle THROUGH mobilithek.info — should be discoverable as a dataset there. Confirm and document the mobilithek.info dataset URL.
+- **Auth**: None
+- **Refresh**: Weekly
+- **Operator coverage**: DB Fernverkehr + DB Regio + S-Bahnen + private operators (FlixTrain, ÖBB Nightjet German legs) + ~250 regional transit authorities
+
+### 🇦🇹 AT — Austria · ✅ Keep, verify
+
+- **Official NAP**: http://www.mobilitydata.gv.at/ (note: HTTP not HTTPS in PDF — operator should verify whether it redirects to HTTPS)
+- **Currently onboarded**: `AT-NAP_netex_evu_2026.zip` (NeTEx-EPIP) — ÖBB + WESTbahn + regional Verkehrsverbünde
+- **Compliance check**: Confirm the AT-NAP bundle on mobilitydata.gv.at. AT also has a separate `mobilitaetsdaten.gv.at` (with the 's') — those are the two faces of the same federal NAP.
+- **Auth**: None
+- **Refresh**: Annual major + weekly minor
+
+### 🇮🇹 IT — Italy · ⚠ Compliance check needed
+
+- **Official NAP**: https://www.cciss.it/ (Centro di Coordinamento Informazioni Sicurezza Stradale; Ministero delle Infrastrutture)
+- **Currently onboarded**:
+  - `IT-TRENITALIA-NeTEx_L1.zip` (NeTEx-EPIP) — Trenitalia national rail
+  - Trenord (URL): `https://www.dati.lombardia.it/...` — Lombardy regional
+  - ATAC Roma (URL): `https://romamobilita.it/...` — Rome urban
+- **Compliance check**: Visit cciss.it, search for each onboarded feed:
+  - Trenitalia NeTEx — likely catalogued, confirm exact URL
+  - Trenord — Lombardy regional data may be on cciss.it OR may live on dati.lombardia.it only (regional NAP rather than national); if dati.lombardia.it is referenced FROM cciss.it, compliant
+  - ATAC — similar; check whether romamobilita.it is referenced from cciss.it
+- **If any non-NAP source is unreferenced**: document the gap, operator decides whether to retain (with rationale) or switch.
+- **Gotchas**:
+  - **Italo (NTV)**: private HSR competitor, no public GTFS/NeTEx — neither on cciss.it nor anywhere else. Missing from our matrix; out-of-scope until NTV publishes.
+  - GTT (Turin) + TPER (Bologna) not onboarded — per existing script comments.
+
+### 🇱🇮 LI — Liechtenstein · ✅ No action (transitive)
+
+- **Official NAP**: Not listed in the PDF (LI is EEA but not EU; not bound by Delegated Regulation 2017/1926)
+- **Coverage**: Transitive via CH (SBB PostBus services into LI) and AT (ÖBB Vorarlberg services). Schaan-Vaduz buses appear via SBB feed.
+- **Gotchas**: Vaduz has no rail.
+
+### 🇨🇭 CH — Switzerland · ✅ Compliant (current source IS the NAP)
+
+- **Official NAP**: www.opentransportdata.swiss — same as currently used. No action needed.
+- **Currently onboarded**: `CH-NAP_netex_202606200406.zip` (NeTEx-EPIP) — SBB + all CH operators
+- **Note**: CH is in the PDF despite being non-EU (Switzerland is in the EFTA NAP framework via bilateral agreement).
+- **Operator coverage**: SBB CFF FFS + BLS + PostBus + every regional Verkehrsverbund (ZVV, TPG, etc.) + funicular operators
+- **Refresh**: Quarterly
+
+### 🇬🇧 GB — United Kingdom · ✅ Keep
+
+- **Official NAP**: https://data.gov.uk/ (UK retained the NAP post-Brexit via WA + EU agreements)
+- **Currently onboarded**: Eurostar feed in FR NAP + GB OSM clip (HS1 corridor only). NO native UK rail data.
+- **Compliance check**: data.gov.uk catalogues ATOC / National Rail timetables in CIF format under https://datafeeds.networkrail.co.uk. NOT currently onboarded into eu19 (out of scope for transit-MOTIS unless we add a CIF→GTFS converter — separate future work).
+- **Gotchas**: Eurostar termini covered; domestic UK (LNER, Avanti, GWR, ScotRail) NOT covered. Matrix `London → Edinburgh` will return `no_route`.
+
+# Part 2 — eu19 NEW providers (8 countries, NAP-anchored)
+
+All new providers MUST be discovered through the official MMTIS NAP per
+the compliance principle. Every row marked **⚠ NAP probe needed** means
+the operator should visit the NAP portal and capture the exact dataset
+URL before bootstrap.
+
+### 🇩🇰 DK — Denmark · ⚠ Still needs operator DevTools probe (2026-06-29)
+
+**Live probe findings**: nap.vd.dk issues a 301 redirect to `du-portal-ui.dataudveksler.app.vd.dk` (Vejdirektoratet's data-exchange portal, branded "The data exchanger"). The portal is a JS-rendered SPA — landing page title is the only visible content via static fetch. Common API patterns (`/api/datasets`, `/api/v1/metadata`, `/datasets`) all returned the same SPA shell with no data.
+
+**To unblock**: operator opens DevTools Network tab on the portal, performs a search, captures the XHR/fetch URL (same pattern as HU's `MetadataSearch` discovery). The canonical Rejseplanen GTFS is almost certainly referenced from there.
+
+- **Official MMTIS NAP**: **https://nap.vd.dk/** (Vejdirektoratet — Danish Road Directorate hosts the multimodal NAP)
+- **Operator probe action**:
+  1. Visit https://nap.vd.dk/
+  2. Locate the public-transport timetable dataset (likely under "MMTIS" or "kollektiv trafik" categories)
+  3. Find the dataset for Rejseplanen / DSB / national bundle — capture the canonical download URL
+  4. Note the format (likely GTFS based on Danish practice; possibly NeTEx-EPIP per EU mandate from 2025)
+- **Previously suggested** (WRONG, community URL): `https://www.rejseplanen.info/labs/GTFS.zip` — this is Rejseplanen's developer-labs URL and is NOT the official NAP-published canonical source. May contain the same data; may not be referenced from nap.vd.dk.
+- **If nap.vd.dk references rejseplanen.info as the canonical download**: we can use it (with the rationale documented as "NAP-referenced community mirror"). Otherwise, use whatever URL nap.vd.dk catalogues.
+- **Auth**: Unknown until probed; EU NAP regulation requires public access without barriers.
+- **Refresh**: Unknown until probed (Rejseplanen has historically been weekly).
+- **Operator coverage** (expected, from Rejseplanen's known scope):
+  - DSB (long-distance + S-tog) + DSB Øresund + Lokaltog (regional) + Arriva Tog DK + Metro København + Movia bus + Midttrafik / Sydtrafik / FynBus / NT + ferries
+- **Verdict**: ⚠ Onboard pending nap.vd.dk probe
+
+### 🇸🇪 SE — Sweden · ✅ CKAN-verified — Trafiklab IS NAP-referenced (2026-06-29)
+
+**Live probe findings**: trafficdata.se runs a CKAN API at `/api/3/action/package_search`. 45 packages total, road-heavy BUT explicitly references **4 Trafiklab transit datasets** as canonical NAP-published resources:
+
+| Dataset | Org | Format | License |
+|---|---|---|---|
+| GTFS Regional | Trafiklab | GTFS | CC0 |
+| **GTFS Sverige 2** (national bundle) | Trafiklab | GTFS | CC0 |
+| Trafiklab: Public Transport Data in Sweden | Trafiklab (community portal) | various | CC0 |
+| NeTEx Regional | Trafiklab | NeTEx XML | CC0 |
+
+This **resolves the compliance question**: Trafiklab IS the official NAP-referenced canonical source for Swedish transit data. The trafficdata.se CKAN catalogue points to `https://www.trafiklab.se/api/trafiklab-apis/gtfs-sverige-2/` and `.../netex-regional/` as the data delivery endpoints, so using Trafiklab is fully NAP-compliant.
+
+**Note on previous heading**: ⚠ NAP probe — now superseded by CKAN-verified result above.
+
+- **Official MMTIS NAP**: **www.trafficdata.se** (Trafikverket — Swedish Transport Administration)
+- **Operator probe action**:
+  1. Visit www.trafficdata.se
+  2. Find the multimodal timetable catalogue
+  3. Determine whether the Trafiklab "GTFS Sverige" feed is referenced as the canonical source OR whether trafficdata.se hosts/proxies its own NAP feed
+- **Previously suggested** (WRONG, community URL): `https://opendata.samtrafiken.se/gtfs-sweden/sweden.zip?key={API_KEY}` — Trafiklab is operated by Samtrafiken (industry consortium), not by Trafikverket. The trafficdata.se NAP may catalogue Trafiklab's feed as the canonical source (in which case the Trafiklab key path is compliant) or may have its own.
+- **Key complication**: if trafficdata.se requires the operator to register for a separate key (different from Trafiklab), we'd need a new key. Probe will tell.
+- **Auth**: TBD per probe
+- **Refresh**: TBD per probe (Trafiklab is daily)
+- **Operator coverage** (expected, from Trafiklab's known scope):
+  - SJ + MTR + Snälltåget + Tågkompaniet/Vy + Pågatågen + Öresundståg + SL + Skånetrafiken + Västtrafik + 12 more regional
+- **Verdict**: ⚠ Onboard pending trafficdata.se probe
+
+### 🇳🇴 NO — Norway · ✅ Confirmed by operator probe (2026-06-29)
+
+- **Official MMTIS NAP**: **https://transportportal.atlas.vegvesen.no/no/** (Statens Vegvesen)
+- **Confirmed canonical timetable dataset URL** (operator-verified): https://transportportal.no/datasets/c7960768-96a0-3cf0-8692-8af4afe8c423
+- **Format**: NeTEx Nordic profile + GTFS both published (per Entur's standard practice)
+- **Auth**: None (Entur open data)
+- **Refresh**: Daily
+- **Operator coverage** (expected): Vy + Go-Ahead Nordic + SJ Nord + Flytoget + Ruter + AtB + Skyss + Kolumbus + Kystverket coastal ferries + Nor-way Bussekspress
+- **Important — separate stop place file**: The NO NAP ALSO publishes a dedicated **Stop Place Register (NSR — Nasjonalt Stoppestedsregister)** as a distinct dataset, referenced from https://developer.entur.org/pages-intro-files. This contains the authoritative national stop register that all NO transit operators reference. See the cross-cutting "Stop-point identification" section below for why this matters for the eu19 corridor as a whole.
+- **Verdict**: ✅ Ready to onboard — operator has confirmed the canonical URLs
+
+### 🇵🇱 PL — Poland · ✅ Inventoried via NAP API (2026-06-29) — much better than expected
+
+- **Official MMTIS NAP**: https://dane.gov.pl/en/dataset/1739,NAP — dataset 1739 contains resource 2126144 which catalogues 215 multimodal data sources.
+- **Catalogue download** (CSV, NAP-published, refreshed 2026-06-22): `https://api.dane.gov.pl/media/resources/20260622/Tabela_KPD_2026_aktualizacja22062026_do_publikacji.csv` — operator-facing portal at https://dane.gov.pl/en/dataset/1739,NAP/resource/2126144/table
+- **CSV columns**: Lp (row) | Podmiot (Operator) | Link do danych | Kontakt | Format danych | API
+
+**Rail operators in the catalogue** (rows extracted from the live CSV):
+
+| Row | Operator | URL | Format | Access |
+|---|---|---|---|---|
+| 28 | Koleje Dolnośląskie S.A. | https://kolejedolnoslaskie.pl/ | GTFS static + GTFS-RT + PDF + OSDM | Open, API yes |
+| 29 | Koleje Małopolskie | https://kolejemalopolskie.com.pl/rozklady_jazdy/kml-ska-gtfs.zip + .../ald-gtfs.zip | GTFS static | Open, direct .zip |
+| 30 | Koleje Mazowieckie | www.mazowieckie.com.pl | **XML, PDF** (no GTFS) | Open, API yes |
+| 31 | Koleje Śląskie | https://www.kolejeslaskie.pl/ | XML + GTFS static + PDF | Open, API yes |
+| 32 | Koleje Wielkopolskie | www.koleje-wielkopolskie.com.pl | **PDF only** | Open but unusable as-is |
+| 44 | Łódzka Kolej Aglomeracyjna (ŁKA) | https://kolej-lka.pl/pliki/rskqx9axcc2i8932/gtfs-2025-2026/zip/ | GTFS | Open, direct .zip |
+| **90** | **PKP Intercity SA** | **ftp.intercity.pl** | **CSV** | **Login/password required (contact via NAP)** |
+| 91 | PKP SKM Trójmiasto | https://bip.skm.pkp.pl/c60/rozklad-jazdy | GTFS static | Open |
+| 173 | Warszawska Kolej Dojazdowa (WKD) | http://wkd.com.pl | Format unclear (bd) | Open |
+| **197** | **POLREGIO S.A.** | https://polregio.pl/pl/rozklad-jazdy-i-mapa-polaczen/rozklad-jazdy/ | **PDF + GTFS Static** | Open |
+| 212 | PKP Polskie Linie Kolejowe (PLK) | https://pdp-api.plk-sa.pl/ | JSON | API, infrastructure (not timetables) |
+
+**Two findings that reverse my earlier doc**:
+
+1. **PKP Intercity IS published via the NAP** — earlier I said "no public feed". It's there as CSV via authenticated FTP. Operator can request credentials. **But**: CSV isn't GTFS — would need format conversion (PKP IC internal timetable format). Days of work to onboard. Defer or commit explicitly.
+
+2. **POLREGIO publishes GTFS Static** — earlier I said they withdrew it in 2022. Live NAP says otherwise. Just need to navigate polregio.pl/rozklad-jazdy to find the .zip URL.
+
+**Practical PL scope for eu19 (6 directly-onboardable + 1 gated)**:
+
+- ✅ **Direct GTFS onboarding**: Koleje Dolnośląskie, Koleje Małopolskie (direct .zip × 2), Koleje Śląskie, ŁKA (direct .zip), SKM Trójmiasto, Polregio (need to find .zip on polregio.pl)
+- ⚠ **Format investigation needed**: Koleje Mazowieckie (XML — would need converter), WKD (format unspecified)
+- ❌ **Skip**: Koleje Wielkopolskie (PDF only, no machine-readable timetable)
+- 🔐 **Operator decision**: PKP Intercity — request FTP credentials + write CSV-to-GTFS converter (~3-5 days work), OR defer to follow-up release
+
+**With Polregio + 5 regional operators we cover most daily intra-PL rail traffic** (the Polish rail network is dominated by Polregio for regional service and PKP IC for long-distance). Cross-border `Warsaw → Berlin` still won't route without PKP IC, but `Wrocław → regional destinations` will. Significantly better than my prior "city-only with PKP gap" position.
+
+**Auth**: Most direct downloads no-key. PKP IC requires per-operator FTP credentials obtained via the NAP contact field.
+**Refresh**: Per-operator; CSV catalogue itself refreshed monthly.
+**Verdict**: ✅ Ready to onboard 5-6 GTFS feeds. PKP IC and Mazowieckie deferred to follow-up.
+
+### 🇨🇿 CZ — Czech Republic · ✅ Single timetable source confirmed (2026-06-29)
+
+**Live probe findings**: registr.dopravniinfo.cz/en/ catalogue lists exactly **one** timetable-related source — `cz-mdcr_NeTEx-timetables-v1.0` provided by MD ČR (Ministerstvo dopravy České republiky = Ministry of Transport). Every other catalogued source is road/traffic/DATEX-II data.
+
+The specific source sub-page (`/sources/cz-mdcr_NeTEx-timetables-v1.0/`) returned 404 via my static probe — it's likely behind authentication or a JS-rendered detail view. Operator browser navigation will reveal the actual download URL.
+
+**Almost certainly the source points to portal.cisjr.cz** (CIS JŘ — Centrální informační systém jízdních řádů) which is the public-facing CZ timetable system. So:
+- Operator action: browse to the source sub-page to confirm the canonical download URL
+- Likely format: NeTEx (per the source name) rather than the GTFS the CIS JŘ portal also exposes
+- Likely covers: ČD + Leo Express + RegioJet + ARRIVA + regional bus operators registered with CIS
+
+- **Official MMTIS NAP**: **http://registr.dopravniinfo.cz/en/** (Ministerstvo dopravy — Czech Ministry of Transport)
+- **Operator probe action**:
+  1. Visit http://registr.dopravniinfo.cz/en/
+  2. Confirm CIS JŘ GTFS bundle (`https://portal.cisjr.cz/static/jdf/JDF-GTFS.zip`) is the NAP-referenced canonical source
+- **Previously suggested**: CIS JŘ portal directly — this is the operator-side data publisher, not the NAP. The NAP catalogue at registr.dopravniinfo.cz almost certainly references CIS JŘ as the canonical source, in which case our previous URL is compliant once attested via the NAP.
+- **Auth**: None
+- **Refresh**: Weekly
+- **Operator coverage** (expected from CIS):
+  - ČD (national rail) + Leo Express + RegioJet + ARRIVA vlaky + GW Train Regio + ~30 regional bus operators
+- **Verdict**: ⚠ Onboard pending NAP probe (likely just confirms CIS as canonical)
+
+### 🇸🇰 SK — Slovakia · ❌ CONFIRMED SKIP (2026-06-29) — NAP is non-compliant
+
+**Live probe findings**: aplikacie.zsr.sk/MapaVylukZsr/index.aspx is **a real-time disruption viewer only**. Page renders an interactive map with filters for railway closure types ("Výluky" = service disruptions). Current status text confirmed: "V aktuálnom týždni nie je plánovaná žiadna významná výluka" (no major closures this week). Page also carries a "legal disclaimer restricting automated data downloading".
+
+**Zero timetable data accessible.** This is a known EU compliance gap — Slovakia's listed MMTIS NAP per Delegated Regulation 2017/1926 doesn't actually publish multimodal data. Bratislava DPB (city transit) has a separate GTFS feed at opendata.bratislava.sk but it's not referenced from the official NAP.
+
+**Final verdict**: SK skipped from eu19 transit onboarding. Partial cross-border coverage comes via CZ feed (RegioJet/Leo Express Slovak services) and AT feed (GySEV/Raaberbahn HU↔AT↔SK corridor).
+
+- **Official MMTIS NAP** (per PDF): **https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx** (ŽSR — Železnice Slovenskej republiky, infrastructure manager)
+- **Concern**: The PDF lists this URL but "MapaVylukZsr" translates to "Map of Disruption Exclusions" — it's a disruption map, NOT a timetable catalogue. SK may have listed an inappropriate URL as their MMTIS NAP. EU enforcement on NAP compliance is patchy in Slovakia.
+- **Operator probe action**:
+  1. Visit https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx
+  2. Verify whether timetable feeds (GTFS / NeTEx) are catalogued there at all
+  3. If not → SK is non-compliant with the Delegated Regulation, and onboarding becomes "skip until SK publishes a proper MMTIS NAP"
+- **Workaround**: CZ CIS feed includes some cross-border services into SK (Bratislava-area RegioJet/Leo Express). Partial SK rail coverage as a side effect of onboarding CZ.
+- **Verdict**: ❌ Skip likely; probe to confirm
+
+### 🇸🇮 SI — Slovenia · ⚠ NAP exists (nap.si) but feed URLs not discoverable (2026-06-29)
+
+**Live probe findings**:
+
+- **https://nap.si/ exists** and is the real SI NAP, operated by the National Traffic Management Centre (NTMC) under the Ministry of Infrastructure. Landing page mentions:
+  - "Access and review the digital timetables of buses and passenger trains in Slovenia" (IPPT system)
+  - PROMET.SI for traffic conditions
+  - SiMO.si for multimodal route planning
+- **podatki.gov.si has VERY limited transit data**: search for "SŽ" returned 15 datasets, all unrelated (housing, surnames, social services). Search for "vozni red" (timetable) returned 44 results — mostly Maribor municipality bus stops/lines and unrelated infrastructure. **NO national SŽ railway feed visible.**
+- nap.si/datasets, nap.si/ippt, simo.si all returned 404 or empty.
+
+**Conclusion**: SI has a NAP and claims IPPT-based timetable access, but the public-facing data feeds aren't openly catalogued. SŽ railway data appears to NOT be openly published, despite the EU mandate.
+
+**Operator action required**: email `mzi.ncup@gov.si` (the NTMC contact from nap.si) directly requesting access to the SŽ NeTEx/GTFS feed. Likely a per-organization access agreement, similar to PKP IC and MÁV.
+
+**Risk**: this is the same pattern as HU MÁV (request-based access). 1-2 week turnaround expected for the Ministry response. May result in zero usable feed → SI defers to follow-up release.
+
+**Final verdict**: ❌ DEFER to follow-up. Build eu19 without SI in v0; add later if Ministry outreach yields a feed.
+
+- **Official MMTIS NAP** (per PDF): "NAP - National Traffic Management Centre" — **PDF lists no working URL**
+- **Operator action**:
+  1. Search the Slovenian Ministry of Infrastructure (gov.si/drzavni-organi/ministrstva/ministrstvo-za-infrastrukturo/) for the NAP URL
+  2. SI has historically used promet.si but that's the live traffic portal, not the MMTIS NAP
+  3. May need to email the Ministry directly for the NAP entry point — EU NAPs are sometimes published only after operator inquiry
+- **Previously suggested** (WRONG): `https://nap.gov.si/` — I guessed this domain; the PDF doesn't reference it. May or may not exist.
+- **Verdict**: ❌ Blocked — cannot onboard SI without a working NAP URL. Defer to Phase B follow-up once URL discovered.
+
+### 🇭🇺 HU — Hungary · ✅ Inventoried via NAP API (2026-06-29) — multimodal IS present
+
+- **Official MMTIS NAP**: https://napportal.kozut.hu/ (Magyar Közút)
+- **Catalogue API** (operator-discovered via browser DevTools):
+  ```
+  POST https://napportal.kozut.hu/napp-portal-proxy/api/MetadataSearch
+  Content-Type: application/json-patch+json
+  Body: all-null filter object returns all ~70 entries
+  ```
+  Filter `isMultimodal: true` in body for transit-only.
+- **Important context correction**: portal landing page title is `Közúti közlekedés nemzeti adathozzáférési pontja` ("Road Traffic National Access Point") which is misleading — the same portal hosts BOTH road traffic AND multimodal data. My earlier "road-only" concern was wrong; multimodal is fully there.
+
+**Verified rail + transit operators in the catalogue** (subset of full 70-entry response, transit only):
+
+| id | Operator | Profile name | Format | URL / Access |
+|---|---|---|---|---|
+| 5 | **MÁV + GYSEV** (combined) | helyközi vasúti menetrendje | **GTFS** | `https://www.mavcsoport.hu/gtfs-igenybejelento` — **request form** |
+| 4 | **MÁV / Volánbusz** | helyközi és helyi autóbusz menetrendje | GTFS | same gtfs-igenybejelento form |
+| 6 | MÁV bus RT | RT vehicle positions | GTFS-RT | email `nap.volanbusz@mav-szk.hu` |
+| 7 | MÁV train RT | RT train positions | GTFS-RT | email `nap.volanbusz@mav-szk.hu` |
+| 13 | BKK Budapest | Planned schedules | GTFS | `https://opendata.bkk.hu/data-sources` (open) |
+| 14 | BKK Budapest | Real-time + vehicle positions | GTFS-RT | `https://opendata.bkk.hu/data-sources` |
+| 15 | BKK Budapest | FUTÁR system | other | `https://opendata.bkk.hu/data-sources` |
+| 11 | SZKT Szeged | Tram + trolleybus | GTFS | `http://gtfs.szkt.hu/zipstore/szkt-szeged-hu.zip` (direct) |
+| 16 | Kecskemét (KeKo) | Local bus | GTFS | `https://keko.hu/gtfs-letoltesi-igenybejelento` (form) |
+| 17 | V-Busz Veszprém | Local bus | GTFS | `vbusz.hu/gtfs` |
+| 18 | Kaposvár Közlekedési | Local bus | GTFS | `https://www.kaposbusz.hu/letoltheto-menetrend` |
+| 19 | Blaguss Szombathely | Local bus | GTFS | `https://szombathely.utas.hu/api/static/v1/gtfs-google/gtfs-google.zip` (direct) |
+| 21 | Paks ebus | Local bus | GTFS | direct .zip with token |
+| 10 | Velencei-tavi | Lake Velence boat | GTFS | `https://velenceitohajozas.hu/menetrendek/` |
+| 22 | BAHART | Lake Balaton boat | GTFS | `https://nap.bahart.hu/` |
+| 8 | Mecsekerdő | Forest railway (heritage) | other | niche |
+| 9 | Gemenc | Forest railway (heritage) | other | niche |
+
+**Corrections to my earlier doc**:
+
+1. **GySEV is NOT a separate feed** — it's bundled with MÁV in profile id 5. One combined GTFS for both operators.
+2. **BKV is now BKK** (rebranded). Listed as ids 13-15 with open direct download at opendata.bkk.hu.
+3. **Volánbusz is under MÁV** now (entry id 4 contact email is `nap.volanbusz@mav-szk.hu`).
+4. **MÁV-HÉV (Budapest suburban rail) is NOT in the NAP** — that's a gap, no public feed available.
+
+**Critical access concern**: The MÁV+GYSEV rail feed and MÁV bus feed both go through a **request form** at https://www.mavcsoport.hu/gtfs-igenybejelento (`igénybejelentő` = "request form"). NOT direct download — the operator must register and request access per-organisation. Likely results in a per-requester download URL or scheduled email delivery. Expect 1-5 business days for Hungarian gov-process turnaround.
+
+**Freshness concern**: MÁV+GYSEV metadata last saved 2024-11-15 (over a year old in the catalogue). The underlying GTFS file at the request endpoint may be fresher than the metadata record, but worth confirming during the access request.
+
+- **Auth**: BKK + 4 regional cities are open. MÁV (rail + bus) requires form submission.
+- **Refresh**: TBD per operator (likely weekly for MÁV, more frequent for BKK).
+- **Verdict for eu19**: ✅ Onboard **MÁV+GYSEV rail (id 5)** as primary HU feed once form access is granted. BKK optional if Budapest urban coverage matters. Regional cities skip unless those become coverage hubs.
+
+# Part 2.5 — Cross-cutting: stop-point identification across 19 countries
+
+**Raised by the operator during the NO probe (2026-06-29). This may be
+the single most important architectural concern of the whole eu19
+effort, not just for NO.**
+
+## The problem
+
+Every country's transit feed identifies stop places with its OWN
+identifier scheme:
+
+| Country | Stop ID scheme | Example (Oslo S / equivalent) |
+|---|---|---|
+| NO | NSR (Nasjonalt Stoppestedsregister) | `NSR:StopPlace:59872` |
+| SE | RKR / Samtrafiken stops | typically `9022001020000001` or similar |
+| DK | Rejseplan stop IDs | `00088002` style |
+| DE | DELFI Globale Haltestellen (de:08111…) | `de:09162:6:1:1` |
+| CH | DiDok / SBB stop IDs | `8503000` (also valid UIC) |
+| FR | StopArea:OCE… (SNCF) or numeric UIC | `StopArea:OCE87739000` |
+| BE | iRail / NMBS stop_id | `008811007` (numeric UIC) |
+| NL | KV15 / CHB stops | `stoparea:560000…` |
+| AT | DIVA stop numbers + UIC | `at:43:300` |
+| IT | RFI / Trenitalia stop IDs | `S07207` style |
+| GB | NaPTAN ATCO + CRS | `9100KNGX` (CRS) |
+| HU | MÁV stop IDs (TBD) | unknown |
+| CZ | CIS station numbers | unknown |
+| PL | PLK stop IDs / city-system specific | varies wildly |
+| LU | CFL stop_id | unknown |
+| SI | SŽ stop_id | unknown |
+| SK | ZSSK stop_id | unknown |
+
+**The cross-border lingua franca is the UIC 7-digit station code**
+(prefix 70-99 by country: 76 NO, 74 SE, 86 DK, 80 DE, 87 FR, 88 BE,
+84 NL, 81 AT, 83 IT, 70 GB, 85 CH, 55 HU, 54 CZ, 51 PL, 82 LU, 79 SI,
+56 SK). But UIC codes are present **only for stations that operate
+internationally** — typically major rail termini, not every regional
+halt. Bus stops effectively never have UIC codes.
+
+## Why this matters for the matrix
+
+When the operator queries `Oslo → Stockholm`, MOTIS needs:
+
+1. Find Oslo S in the NO feed (NSR:StopPlace:59872, lat/lon ~59.91,10.75)
+2. Find Oslo S in the SE feed too (probably a different ID, same coords)
+3. Decide whether these are "the same stop" so the SJ overnight train
+   that departs Oslo and arrives in Stockholm appears as one
+   continuous journey
+
+**MOTIS's default behaviour**: cluster stops by coordinate proximity
+(~10m default radius) and name similarity. Works well for major
+stations (coords differ by <5m between feeds, names roughly match).
+Fails for:
+
+- **Border-adjacent stations** where each operator's feed places the
+  stop centroid in a slightly different location (>10m apart)
+- **Multilingual names** — e.g. Brussel-Zuid vs Bruxelles-Midi vs
+  Brussels-South, or Genève vs Geneva vs Ginevra
+- **Bus / tram interchanges** where the coordinate is approximate but
+  the platform-level interchange is the real point
+
+## What the dedicated stop-place registers give us
+
+Each country with a national stop-place register (NSR equivalent)
+publishes:
+
+- A canonical list of stops with stable identifiers
+- Hierarchy: StopPlace (the station) → Quay (the platform/track)
+- Multi-modal codes: rail UIC, IATA where applicable, local bus codes
+- Stable coordinates (the operator's surveyed position, not whatever
+  individual operators happen to plot)
+
+For NO: NSR (Entur)
+For DK: published alongside Rejseplan
+For DE: DELFI Globale Haltestellen
+For FR: BANO / IRVE / stop_area registry
+For CH: DiDok
+For NL: CHB (Centraal Haltebestand)
+
+**Most NAPs publish their stop register as a separate file from the
+timetable feed.** Currently in eu11 we ingest the timetables but NOT
+the registers, relying on coordinate clustering.
+
+## Recommendation for eu19
+
+**Three options, ranked by ambition:**
+
+**A. Status quo — coordinate clustering only (default MOTIS behaviour)**
+Don't ingest stop registers; rely on coordinate proximity + name
+matching. Works for ~95% of major stations. Risks: occasional missed
+cross-border connections at border-adjacent or multi-platform sites.
+Zero extra work for eu19 onboarding.
+
+**B. Ingest national stop registers per country, no cross-country mapping**
+For each country where a register is available, ingest it as an
+authoritative stop reference. Internal-to-country queries become
+more reliable; cross-country still relies on coordinate clustering.
+~½ day per country (varies by format complexity).
+
+**C. Build a cross-country UIC stop-mapping table**
+Author a master `stop_equivalences.json` (or similar) that explicitly
+maps NSR:StopPlace:59872 ↔ SE:Stop:1234 ↔ UIC:7600103 etc. for every
+international station in our hub set (~50 stops). MOTIS gets perfect
+cross-border interop on those stops. Manual effort: ~1 day to populate
+the table from UIC code lookups + ad-hoc verification.
+
+**My recommendation**: **A for the initial eu19 build, then C for the
+~50 hubs we actually use in the coverage matrix.** B is interesting in
+theory but the per-country effort doesn't pay for itself unless we're
+running per-country coverage too, which the country-filter (PR #168)
+makes less pressing.
+
+The eu19 bootstrap should include the NO NSR file as a separate
+ingest (since we now know it's published as a distinct dataset on the
+NAP). For other countries, defer until we see actual cross-border
+matching failures in the coverage matrix.
+
+## Operator action items added for stop-point handling
+
+- During each NAP probe, ALSO inventory whether the country publishes
+  a dedicated stop-place register file (separate from the timetable).
+  Record its URL alongside the timetable URL.
+- Once eu19 is running, audit the coverage matrix for cross-border
+  `no_route` cells that should clearly have routes (e.g. Oslo →
+  Stockholm at 22:00 — there's a known SJ Nattåg). If we get
+  `no_route` there, it's likely a stop-matching failure and we should
+  pursue Option C for those stops specifically.
+
+# Part 3 — Action items & decisions before PR #2
+
+**Operator action items (block the OSM merge script + bootstrap PRs):**
+
+**Critical NAP probes (must be done before bootstrap)** — for each, capture BOTH the timetable URL AND any separate stop-place register file:
+1. **DK**: Visit https://nap.vd.dk/ → capture (a) rail timetable URL, (b) DK stop-place register URL if separate
+2. **SE**: Visit www.trafficdata.se → determine whether to use Trafiklab feed (with NAP attestation) or a separate NAP-hosted one; if Trafiklab, register for key. Inventory whether SE stop register is separate
+3. **NO**: ✅ Operator confirmed (2026-06-29):
+   - Timetable: https://transportportal.no/datasets/c7960768-96a0-3cf0-8692-8af4afe8c423
+   - Stop Place Register (NSR) is a separate file referenced via developer.entur.org
+4. **PL**: Visit https://dane.gov.pl/en/dataset/1739,NAP → critical: is PKP IC present? Determines scope. Inventory PL stop register
+5. **CZ**: Visit http://registr.dopravniinfo.cz/en/ → confirm CIS JŘ GTFS catalogued + CZ stop register
+6. **SK**: Visit https://aplikacie.zsr.sk/MapaVylukZsr/index.aspx → confirm or refute that timetable feeds are catalogued
+7. **SI**: Discover SI's working NAP URL (Ministry of Infrastructure inquiry if needed)
+8. **HU**: Visit https://napportal.kozut.hu/ → capture MÁV-Start + GySEV URLs + HU stop register
+
+**Compliance verification for existing eu11 feeds (lower priority but should be done in same sweep)**:
+1. **NL**: Visit https://ntm.ndw.nu → confirm OpenOV is NAP-referenced (highest risk of compliance gap)
+2. **IT**: Visit https://www.cciss.it/ → confirm Trenitalia + Trenord + ATAC referenced
+3. ES/BE/LU/DE/AT: lower-risk confirmations — current sources are likely NAP-published
+
+**Once probes return**:
+- PR #2: `scripts/merge_osm_eu19_corridor.sh` — extends the eurostar corridor PBF merger
+- PR #3: `scripts/create_eu19_transit_motis_session.ps1` — bootstraps the new MOTIS session with **only NAP-attested providers**
+- PR #4: Alembic migration adding new hubs
+
+## Out of scope (Phase C, not in eu19)
+
+For reference, the Balkans + GR NAPs per the same PDF:
+
+- 🇭🇷 **HR** Croatia — https://www.promet-info.hr/ (live traffic-focused; rail timetable coverage TBD)
+- 🇷🇸 **RS** Serbia — NOT in the PDF (Serbia is EU candidate, not member; no NAP obligation yet)
+- 🇷🇴 **RO** Romania — pna.cestrin.ro/ (NAP exists but rail coverage TBD)
+- 🇧🇬 **BG** Bulgaria — https://www.mtitc.government.bg/en/category/294/national-access-points-transport-related-data
+- 🇬🇷 **GR** Greece — www.nap.gov.gr
+
+If Phase C is ever revisited, each of these should follow the same
+NAP-first principle — probe the official portal, capture the canonical
+dataset URLs.
+
+## Open questions / things to revisit
+
+- **PKP Intercity** in PL NAP: critical question for the matrix's PL coverage. The probe should answer.
+- **CIF→GTFS converter** for GB national rail: integrating ATOC/Network Rail timetables — half-day effort to onboard once we want it.
+- **Italo Italy**: still no public feed via cciss.it or anywhere. Watch the data4pt-project rollout.
+- **SI NAP**: needs proactive operator outreach to the Slovenian Ministry of Infrastructure.
+- **Quarterly NAP sweep**: PL, SK, SI feeds may improve over time. Re-probe each NAP quarterly to catch new datasets.
