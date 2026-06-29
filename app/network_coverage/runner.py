@@ -29,9 +29,11 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DbSession
 
@@ -44,6 +46,7 @@ from ..models import (
 )
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
+from . import external_verify  # PR-E — auto-verify-on-completion sweep
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
 # PR #36 — valid coverage-run modes.
@@ -92,6 +95,31 @@ _PER_PAIR_TIMEOUT_MS = 60_000
 # the v0.1.29 mistake.
 _COVERAGE_NUM_ITINERARIES = 50
 _COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h — same as live UI baseline
+
+# PR-E — external-verify sweep tunables.
+#
+# Parallelism stays low (2) because ÖBB HAFAS has an implicit ~1-2
+# req/s/IP soft cap. Each verify is TWO round-trips (LocGeoPos +
+# TripSearch) so the wall-time is ~3-5s per cell. With 200 no_route
+# cells at parallelism=2 the sweep is ~5-10 min, which is acceptable
+# for an operator-opt-in feature. Drop to 1 if HAFAS pushes back.
+_VERIFY_PARALLELISM = 2
+# Inter-call sleep inside each semaphore slot — additional cushion
+# on top of parallelism so we don't burst-saturate HAFAS at startup.
+# 500ms x parallelism=2 ~= 1 verify/s effective rate, matching the
+# documented tolerance ceiling.
+_VERIFY_SLEEP_BETWEEN_MS = 500
+# Per-verify HTTP timeout. HAFAS responses are usually < 2s but we
+# allow generous headroom for slow round-trips and the two-step
+# LocGeoPos + TripSearch chain.
+_VERIFY_TIMEOUT_SECONDS = 30.0
+# Cell statuses that trigger an external-verify pass. 'ok' is
+# excluded because we don't need ÖBB to confirm a route VIATOR
+# already returned. 'skipped' is excluded because those cells never
+# actually got queried — no signal in asking ÖBB. 'no_route' is the
+# canonical click-to-verify case; 'timeout' and 'error' are added
+# in PR-E so a flaky OTP run can be disambiguated from real gaps.
+_VERIFY_STATUSES = ("no_route", "timeout", "error")
 
 
 def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
@@ -183,6 +211,7 @@ def create_run(
     direction: str = "both",
     mode: str = MODE_SINGLE_SESSION,
     countries: list[str] | None = None,
+    verify_externally: bool = False,
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
@@ -201,6 +230,11 @@ def create_run(
                           (the live `/api/journey/fanout` pattern). The
                           API layer enforces `session_id is None` for
                           fanout-mode runs.
+
+    PR-E — `verify_externally`, when True, triggers a Phase-3 sweep that
+    asks ÖBB HAFAS about every `no_route`/`timeout`/`error` cell and
+    persists the verdict to the result row's `external_*` columns. Default
+    False keeps the legacy click-to-verify behaviour.
     """
     if direction not in ("both", "single"):
         raise ValueError(f"direction must be 'both' or 'single', got {direction!r}")
@@ -241,6 +275,7 @@ def create_run(
         total_pairs=len(pairs),
         mode=mode,
         countries=norm_countries,
+        verify_externally=verify_externally,
     )
     db.add(run)
     db.flush()
@@ -414,7 +449,6 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
             return
-        run.status = "completed"
         run.finished_at = datetime.now(UTC)
         # Compute summary counters one last time — the per-pair updates
         # incremented these but a final SUM is bug-resistant.
@@ -427,6 +461,14 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run.ok_pairs = sum(1 for r in rows if r.status == "ok")
         run.no_route_pairs = sum(1 for r in rows if r.status == "no_route")
         run.error_pairs = sum(1 for r in rows if r.status not in ("ok", "no_route", "skipped"))
+
+        # PR-E — external-verify sweep dispatch. Extracted to keep
+        # execute_run under Sonar's CC=15 ceiling; the helper handles
+        # the opt-in check, candidate filtering, logging, and zero-fill
+        # counters in one place. ORM mutations on the rows are flushed
+        # by the single db.commit() below, atomic with status='completed'.
+        verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows)
+
         run.summary = {
             "elapsed_seconds": elapsed_s,
             "median_response_ms": _median(
@@ -435,8 +477,146 @@ async def execute_run(run_id: uuid.UUID) -> None:
             "p95_response_ms": _percentile(
                 [r.response_ms for r in rows if r.response_ms is not None], 0.95
             ),
+            # PR-E — rollup of the external-verify sweep so the sidebar
+            # / matrix can show "verified N of M cells; K disagreements"
+            # without re-scanning result rows. All zeros when the flag
+            # is off or no candidate cells existed.
+            "external_verified_count": verify_counters["verified"],
+            "external_ok_count": verify_counters["ok"],
+            "external_no_route_count": verify_counters["no_route"],
+            "external_error_count": verify_counters["error"],
         }
+        # Flip status LAST so a partially-completed sweep that exits
+        # via an unexpected exception (above the broad-except in the
+        # helper) leaves the run in 'running' and mark_orphaned_runs
+        # will catch it at next startup.
+        run.status = "completed"
         db.commit()
+
+
+async def _maybe_run_external_verify_sweep(
+    *,
+    db: DbSession,
+    run: NetworkCoverageRun,
+    rows: Sequence[NetworkCoverageResult],
+) -> dict[str, int]:
+    """PR-E — opt-in entry point for the external-verify sweep. Returns
+    the zero-fill counters if the run didn't opt in or has no candidate
+    cells, otherwise dispatches to `_run_external_verify_sweep` and
+    returns its counters.
+
+    Extracted from `execute_run` so that function stays under Sonar's
+    cognitive-complexity ceiling — the verify-sweep dispatch alone
+    introduced multiple branches that pushed Phase-3 over the limit."""
+    zero = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    if not getattr(run, "verify_externally", False):
+        return zero
+    candidate_rows = [r for r in rows if r.status in _VERIFY_STATUSES]
+    log.info(
+        "PR-E external-verify sweep starting for run %s - %d candidate cells",
+        run.id,
+        len(candidate_rows),
+    )
+    if not candidate_rows:
+        return zero
+    counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows)
+    log.info("PR-E external-verify sweep done for run %s - %s", run.id, counters)
+    return counters
+
+
+async def _run_external_verify_sweep(
+    *,
+    db: DbSession,
+    run: NetworkCoverageRun,
+    rows: list[NetworkCoverageResult],
+) -> dict[str, int]:
+    """PR-E — sweep `rows` through ÖBB HAFAS and mutate each row's
+    external_* columns in place on the attached ORM objects. Caller's
+    db.commit() flushes everything in the same txn as status='completed'.
+
+    Best-effort per cell: any exception is caught + logged and the cell
+    is marked with external_error='sweep_exception' so one bad cell
+    can't abort the run. Bounded concurrency via Semaphore + a short
+    sleep inside each slot keeps us under ÖBB's documented soft cap.
+
+    Returns rollup counters for run.summary."""
+    counters: dict[str, int] = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    semaphore = asyncio.Semaphore(_VERIFY_PARALLELISM)
+    sleep_seconds = _VERIFY_SLEEP_BETWEEN_MS / 1000.0
+
+    async with httpx.AsyncClient(timeout=_VERIFY_TIMEOUT_SECONDS) as client:
+
+        async def _verify_one(row: NetworkCoverageResult) -> None:
+            async with semaphore:
+                try:
+                    origin_hub = db.get(NetworkCoverageHub, row.origin_hub_id)
+                    dest_hub = db.get(NetworkCoverageHub, row.dest_hub_id)
+                    if origin_hub is None or dest_hub is None:
+                        # Hub was soft-deleted (or never existed) between
+                        # the original run and the verify sweep — same
+                        # surface as the click-verify endpoint's 404 path
+                        # but persisted so the matrix UI can render it
+                        # rather than the operator hitting a stale state.
+                        row.external_source = external_verify._SOURCE_OEBB_HAFAS
+                        row.external_error = "hub_missing"
+                        row.external_verified_at = datetime.now(UTC)
+                        counters["error"] += 1
+                        counters["verified"] += 1
+                        return
+                    verdict = await external_verify.verify_via_oebb_hafas(
+                        from_lat=origin_hub.lat,
+                        from_lon=origin_hub.lon,
+                        to_lat=dest_hub.lat,
+                        to_lon=dest_hub.lon,
+                        depart_at=run.depart_at,
+                        client=client,
+                    )
+                    row.external_source = verdict.source
+                    row.external_ok = verdict.ok
+                    row.external_num_connections = verdict.num_connections
+                    row.external_best_duration_seconds = verdict.best_duration_seconds
+                    row.external_best_transfers = verdict.best_transfers
+                    row.external_error = verdict.error
+                    row.external_verified_at = datetime.now(UTC)
+                    counters["verified"] += 1
+                    if verdict.error is not None:
+                        counters["error"] += 1
+                    elif verdict.ok:
+                        counters["ok"] += 1
+                    else:
+                        counters["no_route"] += 1
+                except Exception:
+                    # Broad-except mirrors the recorder-write-failure
+                    # escape valve elsewhere in this file — one bad
+                    # cell never aborts the run. The exception is
+                    # captured + persisted so operators can see WHICH
+                    # cell broke and why in the matrix UI.
+                    log.exception(
+                        "PR-E external verify failed for cell %s->%s in run %s",
+                        row.origin_hub_id,
+                        row.dest_hub_id,
+                        run.id,
+                    )
+                    row.external_source = external_verify._SOURCE_OEBB_HAFAS
+                    row.external_error = "sweep_exception"
+                    row.external_verified_at = datetime.now(UTC)
+                    counters["error"] += 1
+                    counters["verified"] += 1
+                # Throttle inside the slot so concurrent slots don't
+                # burst-saturate HAFAS at startup. Effective rate
+                # ≈ parallelism / sleep_seconds = 2 / 0.5 = 4 req/s
+                # ceiling, but each verify is two round-trips so wall
+                # time per slot is closer to 3-5s, yielding ~0.6-1
+                # verify/s observed. Comfortably under ÖBB's tolerance.
+                await asyncio.sleep(sleep_seconds)
+
+        # return_exceptions=False is safe because _verify_one swallows
+        # everything internally; a bug that escapes is genuinely
+        # exceptional and SHOULD bubble up to the Phase-3 commit-or-
+        # abort logic above.
+        await asyncio.gather(*(_verify_one(r) for r in rows), return_exceptions=False)
+
+    return counters
 
 
 async def _execute_pair(
