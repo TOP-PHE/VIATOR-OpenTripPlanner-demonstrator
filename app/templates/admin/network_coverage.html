@@ -146,7 +146,7 @@
    sidebar can show both side-by-side without conflicting colours. */
 .cov-pill[data-status="filtered"] { background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }
 
-/* External-verify block (DB / HAFAS check on no_route cells). The
+/* External-verify block (ÖBB / HAFAS check on no_route cells). The
    button + result render below the inline trip cards in the same
    <details> section; visually subdued unless a verdict has landed. */
 .cov-verify-block { margin: 0.5rem 0 0; padding: 0.4rem 0; border-top: 1px dotted #d0d7de; }
@@ -863,7 +863,7 @@ function renderDirectionSection(label, subtitle, dir) {
       : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
     // External-verify button — only for no_route cells. Disambiguates
     // "our data is missing a service" from "no service exists" by
-    // asking DB's HAFAS backend the same question. Each direction gets
+    // asking ÖBB's HAFAS backend the same question. Each direction gets
     // its own button + placeholder so Outbound and Return verdicts can
     // be displayed independently.
     const verifyBlock = dir.status === 'no_route'
@@ -871,7 +871,7 @@ function renderDirectionSection(label, subtitle, dir) {
           <button type="button" class="cov-verify-btn"
             data-origin="${escHTML(dir.origin_hub_id)}"
             data-dest="${escHTML(dir.dest_hub_id)}">
-            Verify externally (DB / HAFAS)
+            Verify externally (ÖBB / HAFAS)
           </button>
           <div class="cov-verify-result"></div>
         </div>`
@@ -946,7 +946,7 @@ async function handleVerifyExternal(btn) {
   }
   btn.disabled = true;
   const originalLabel = btn.textContent;
-  btn.textContent = 'Querying DB / HAFAS…';
+  btn.textContent = 'Querying ÖBB / HAFAS…';
   resultEl.innerHTML = '';
   try {
     const url = `/api/admin/network-coverage/runs/${encodeURIComponent(CURRENT_RUN_ID)}`
