@@ -39,6 +39,10 @@
 .cov-matrix th, .cov-matrix td {
   border: 1px solid #eaeef2; padding: 0.15rem 0.3rem; min-width: 38px; text-align: center;
   vertical-align: middle; white-space: nowrap;
+  /* PR-E — anchors the absolutely-positioned external-verify dot to
+     the cell's top-right corner without disrupting the existing
+     status-glyph layout. */
+  position: relative;
 }
 .cov-matrix thead th {
   position: sticky; top: 0; z-index: 2; background: #f6f8fa;
@@ -164,6 +168,42 @@
 .cov-verify-empty { background: #eef2f8; color: #1f2328; border: 1px solid #d0d7de; }
 .cov-verify-warn  { background: #fff8c5; color: #4a3500; border: 1px solid #f5d56b; }
 
+/* PR-E — per-cell external-verify verdict dot, rendered as a small
+   coloured circle in the top-right of each verifiable cell. Three
+   colours mirror the existing cov-verify-* palette so operator muscle
+   memory carries over from the click-verify modal.
+     green  — ÖBB found a connection ⇒ likely VIATOR data gap
+     blue   — ÖBB also returned zero ⇒ real "no service" gap
+     yellow — ÖBB couldn't answer    ⇒ unknown (timeout / auth / etc)
+   The dot uses absolute positioning so it doesn't push the cell's
+   primary number/glyph around. */
+.cov-ext-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.cov-ext-green  { background: #1a7f37; }
+.cov-ext-blue   { background: #1d4ed8; }
+.cov-ext-yellow { background: #d97706; }
+/* Filter mode — hide every cell whose external_ok isn't true. CSS does
+   the heavy lifting; the toggle handler just adds/removes the class on
+   <body> so it survives the matrix re-render every 5 s. */
+body.cov-filter-ext-disagrees .cov-matrix td:not([data-external-ok="true"]):not(.diag):not(.empty) {
+  visibility: hidden;
+}
+.cov-filter-toggle {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  font-size: 0.8rem;
+  margin-left: 0.6rem;
+  cursor: pointer;
+}
+
 /* v0.1.31 — manage-hubs panel. Collapsible to keep the sidebar tight
    while still being one-click-away to add cross-border hubs. */
 .hubs-panel { margin-top: 1rem; border-top: 1px dotted var(--sleeper); padding-top: 0.5rem; }
@@ -271,6 +311,20 @@
             or {FR, CH} for a fast cross-border probe.
           </p>
         </fieldset>
+        {# PR-E — opt-in checkbox: after the run flips to 'completed' the
+           worker calls ÖBB HAFAS for every no_route / timeout / error cell
+           and persists the verdict on the cell row. The matrix then shows
+           a coloured dot per cell. Adds ~5-10 min wall-clock for a
+           ~200-cell matrix; default off keeps legacy behaviour. #}
+        <label style="display: flex; gap: 0.4rem; align-items: center; margin-top: 0.6rem; font-size: 0.85rem">
+          <input type="checkbox" name="verify_externally" id="cov-verify-externally" />
+          <span>
+            Verify externally on completion
+            <span class="hint" style="font-weight: normal; display: block; font-size: 0.72rem">
+              (calls ÖBB HAFAS for every no_route / timeout / error cell — adds ~1–5&nbsp;min)
+            </span>
+          </span>
+        </label>
         <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
       </form>
     {% endif %}
@@ -394,6 +448,13 @@ let CURRENT_POLL_HANDLE = null;
 // the operator's choice survives page reloads.
 let CURRENT_VIEW = (typeof localStorage !== 'undefined' && localStorage.getItem('cov_view')) || 'hybrid';
 
+// PR-E — module-level state for the "Show only where ÖBB disagrees"
+// filter. Lives outside renderRun() so the toggle survives the 5s
+// matrix re-render (renderRun() rebuilds the whole grid on every
+// poll; the body-class drives the CSS visibility filter so we just
+// re-apply on each render to keep the operator's selection sticky).
+let EXT_DISAGREES_FILTER = false;
+
 function escHTML(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -404,6 +465,26 @@ function fmtDuration(secs) {
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   return h ? `${h}h${m.toString().padStart(2,'0')}` : `${m}m`;
+}
+
+// PR-E — render the external-verify dot for one matrix cell. Returns
+// an empty string when the cell has no persisted verdict (legacy rows
+// + runs created with verify_externally=False). Three colours mirror
+// the click-verify modal palette.
+function externalDotHTML(r) {
+  if (r.external_ok == null && r.external_error == null) return '';
+  let cls = 'cov-ext-yellow';
+  let title = 'External: could not answer';
+  if (r.external_error == null && r.external_ok === true) {
+    cls = 'cov-ext-green';
+    title = `ÖBB found ${r.external_num_connections || '?'} connection(s) — likely VIATOR data gap`;
+  } else if (r.external_error == null && r.external_ok === false) {
+    cls = 'cov-ext-blue';
+    title = 'ÖBB also empty — real gap';
+  } else if (r.external_error) {
+    title = `ÖBB couldn't answer: ${r.external_error}`;
+  }
+  return `<span class="cov-ext-dot ${cls}" title="${escHTML(title)}"></span>`;
 }
 
 // Default depart = next Monday 08:00 — Monday morning has the densest
@@ -569,6 +650,12 @@ document.getElementById('cov-form')?.addEventListener('submit', async (e) => {
   if (checkedCountries.length > 0) {
     body.countries = checkedCountries;
   }
+  // PR-E — opt the run into auto external verification at completion.
+  // Omit the field when unchecked to match the countries pattern; the
+  // API field defaults to False so legacy submits are unaffected.
+  if (fd.get('verify_externally') === 'on') {
+    body.verify_externally = true;
+  }
   const btn = document.getElementById('cov-go');
   btn.disabled = true; const original = btn.textContent; btn.textContent = 'Starting…';
   try {
@@ -617,6 +704,14 @@ async function refreshRun() {
 
 function renderRun(run) {
   const main = document.getElementById('cov-main');
+  // PR-E — clear the "show only where ÖBB disagrees" filter state when
+  // loading a run that didn't run the external-verify sweep. The toggle
+  // UI vanishes, so the filter would be impossible to un-tick and the
+  // operator would see an empty matrix until they reload.
+  if (!run.verify_externally) {
+    EXT_DISAGREES_FILTER = false;
+    document.body.classList.remove('cov-filter-ext-disagrees');
+  }
   // Build a Map: "originId|destId" → result (for fast cell lookup).
   const cell = new Map();
   for (const r of (run.results || [])) {
@@ -641,6 +736,14 @@ function renderRun(run) {
       ${viewBtn('count', 'Trips/day')}
       ${viewBtn('hybrid', 'Both')}
     </div>
+    ${run.verify_externally ? `
+      <label class="cov-filter-toggle" title="Hide every cell except those where ÖBB found a connection — focuses the matrix on likely VIATOR data gaps.">
+        <input type="checkbox" id="cov-filter-disagrees" ${EXT_DISAGREES_FILTER ? 'checked' : ''} />
+        <span>Show only where ÖBB disagrees</span>
+        ${run.summary && run.summary.external_ok_count
+            ? `<span class="hint" style="font-weight: normal">(${run.summary.external_ok_count} gaps)</span>`
+            : ''}
+      </label>` : ''}
     <a class="cov-download"
        href="/api/admin/network-coverage/runs/${escHTML(run.id)}/export.html"
        download
@@ -689,7 +792,19 @@ function renderRun(run) {
       const tip = r.status === 'ok'
         ? `${orig.name} → ${dest.name}\n${fmtDuration(r.best_duration_seconds)} (best), ${r.num_itineraries || 0} trips/day\n${r.best_num_transfers || 0} transfers · ${r.best_operators || '?'}\n${r.response_ms}ms`
         : `${orig.name} → ${dest.name}\n${r.status}${r.error_message ? '\n' + r.error_message : ''}`;
-      return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}" title="${escHTML(tip)}">${inner}</td>`;
+      // PR-E — external-verify dot. Only present when the cell has a
+      // persisted verdict (external_ok or external_error non-null).
+      // Three colours match the click-verify modal palette:
+      //   green = ÖBB found (data gap), blue = ÖBB also empty (real
+      //   gap), yellow = unknown (timeout / station-not-found / etc).
+      // data-external-ok attribute drives the "show only disagrees"
+      // filter via CSS without re-rendering.
+      const extOk = (r.external_ok === true || r.external_ok === false) ? r.external_ok : null;
+      const extDot = externalDotHTML(r);
+      const extAttr = extOk === true ? ' data-external-ok="true"'
+                    : extOk === false ? ' data-external-ok="false"'
+                    : '';
+      return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}"${extAttr} title="${escHTML(tip)}">${inner}${extDot}</td>`;
     }).join('');
     return `<tr class="region-${escHTML(orig.region)}"><th title="${escHTML(orig.name)}">${escHTML(orig.short)}</th>${cells}</tr>`;
   }).join('');
@@ -861,21 +976,43 @@ function renderDirectionSection(label, subtitle, dir) {
     const body = trips.length
       ? trips.map(renderTripCard).join('')
       : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
-    // External-verify button — only for no_route cells. Disambiguates
-    // "our data is missing a service" from "no service exists" by
-    // asking ÖBB's HAFAS backend the same question. Each direction gets
-    // its own button + placeholder so Outbound and Return verdicts can
-    // be displayed independently.
-    const verifyBlock = dir.status === 'no_route'
-      ? `<div class="cov-verify-block" data-direction="${escHTML(label)}">
-          <button type="button" class="cov-verify-btn"
-            data-origin="${escHTML(dir.origin_hub_id)}"
-            data-dest="${escHTML(dir.dest_hub_id)}">
-            Verify externally (ÖBB / HAFAS)
-          </button>
-          <div class="cov-verify-result"></div>
-        </div>`
-      : '';
+    // External-verify button — Disambiguates "our data is missing a
+    // service" from "no service exists" by asking ÖBB's HAFAS backend
+    // the same question. Each direction gets its own button + placeholder
+    // so Outbound and Return verdicts can be displayed independently.
+    //
+    // PR-E — the button now appears for any verifiable status (no_route,
+    // timeout, error) AND for any cell with a persisted verdict (so a
+    // re-check is always available on previously-verified cells). The
+    // persisted verdict from the auto-sweep is pre-rendered into the
+    // .cov-verify-result placeholder so the operator sees ÖBB's answer
+    // on modal-open without an extra click. Manual click then becomes
+    // a transient re-check (replaces the placeholder content but does
+    // NOT write back to the cell row).
+    const hasPersistedVerdict = dir.external_source != null || dir.external_error != null;
+    const verifiableStatus = ['no_route', 'timeout', 'error'].includes(dir.status);
+    let verifyBlock = '';
+    if (verifiableStatus || hasPersistedVerdict) {
+      const buttonLabel = hasPersistedVerdict
+        ? 'Re-verify externally (ÖBB / HAFAS)'
+        : 'Verify externally (ÖBB / HAFAS)';
+      const prerendered = hasPersistedVerdict ? renderVerifyVerdict({
+        source: dir.external_source,
+        ok: dir.external_ok,
+        num_connections: dir.external_num_connections,
+        best_duration_seconds: dir.external_best_duration_seconds,
+        best_transfers: dir.external_best_transfers,
+        error: dir.external_error,
+      }) : '';
+      verifyBlock = `<div class="cov-verify-block" data-direction="${escHTML(label)}">
+        <button type="button" class="cov-verify-btn"
+          data-origin="${escHTML(dir.origin_hub_id)}"
+          data-dest="${escHTML(dir.dest_hub_id)}">
+          ${buttonLabel}
+        </button>
+        <div class="cov-verify-result">${prerendered}</div>
+      </div>`;
+    }
     // Outbound starts open, return stays collapsed by default — keeps the
     // initial modal height manageable while still being one click away.
     const isOpen = label === 'Outbound' ? 'open' : '';
@@ -929,6 +1066,18 @@ document.addEventListener('click', (e) => {
   }
   if (e.target.matches('.cov-verify-btn')) {
     handleVerifyExternal(e.target);
+  }
+});
+
+// PR-E — delegated change handler for the "Show only where ÖBB
+// disagrees" filter toggle. The toggle is rendered inside renderRun()
+// so we delegate from document to survive the 5s matrix re-render.
+// The body-class drives the CSS visibility (see cov-filter-ext-
+// disagrees rules), so a single line of state flip is all we need.
+document.addEventListener('change', (e) => {
+  if (e.target && e.target.id === 'cov-filter-disagrees') {
+    EXT_DISAGREES_FILTER = !!e.target.checked;
+    document.body.classList.toggle('cov-filter-ext-disagrees', EXT_DISAGREES_FILTER);
   }
 });
 

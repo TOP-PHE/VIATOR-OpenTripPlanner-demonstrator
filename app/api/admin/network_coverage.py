@@ -160,6 +160,19 @@ class RunCreate(BaseModel):
         ),
         max_length=20,
     )
+    # PR-E — opt the run into running external-planner verification on
+    # every no_route / timeout / error cell at run-completion time.
+    # Default False keeps the legacy single-button-per-cell behaviour
+    # intact for runs that don't tick the new run-form checkbox.
+    verify_externally: bool = Field(
+        default=False,
+        description=(
+            "If true, after the run flips to 'completed' the worker calls "
+            "ÖBB HAFAS for every cell whose status is in (no_route, "
+            "timeout, error) and persists the verdict to "
+            "NetworkCoverageResult.external_* columns."
+        ),
+    )
 
     @field_validator("countries")
     @classmethod
@@ -206,6 +219,10 @@ class RunSummary(BaseModel):
     # "FR+CH" when this is set so operators can tell at a glance which
     # runs were full vs subset.
     countries: list[str] | None = None
+    # PR-E — surfaces the run-level flag so the sidebar can show which
+    # runs auto-verified. Default False handles legacy / pre-migration
+    # rows gracefully via the `_run_to_summary` getattr fallback.
+    verify_externally: bool = False
 
 
 class ResultEntry(BaseModel):
@@ -226,6 +243,20 @@ class ResultEntry(BaseModel):
     # is the answer). The matrix UI badges each cell with "fr + eu"
     # style markers using this field.
     session_ids: list[str] | None = None
+    # PR-E — persisted external-verify verdict for this cell. All NULL on
+    # legacy rows or on runs created with verify_externally=False. The
+    # matrix UI reads these to render the per-cell coloured dot without
+    # making an extra fetch. Semantics:
+    #   external_ok=True, external_error=None  → ÖBB found (green dot)
+    #   external_ok=False, external_error=None → ÖBB also empty (blue)
+    #   external_error non-NULL                → unknown (yellow)
+    external_ok: bool | None = None
+    external_num_connections: int | None = None
+    external_best_duration_seconds: int | None = None
+    external_best_transfers: int | None = None
+    external_source: str | None = None
+    external_error: str | None = None
+    external_verified_at: datetime | None = None
 
 
 class RunDetail(RunSummary):
@@ -258,6 +289,17 @@ class CellTripsDirection(BaseModel):
     # produced by `_fetch_trips_by_search` (rank, duration_seconds,
     # num_transfers, departure_at, arrival_at, modes, legs).
     trips: list[dict[str, Any]] = []
+    # PR-E — pre-rendered external-verify verdict so the modal can show
+    # ÖBB's answer on open without an extra click. The manual "Verify
+    # externally" button stays for re-check (transient overlay, doesn't
+    # mutate the persisted row).
+    external_ok: bool | None = None
+    external_num_connections: int | None = None
+    external_best_duration_seconds: int | None = None
+    external_best_transfers: int | None = None
+    external_source: str | None = None
+    external_error: str | None = None
+    external_verified_at: datetime | None = None
 
 
 class CellTripsResponse(BaseModel):
@@ -503,6 +545,7 @@ def create_run(
             direction=body.direction,
             mode=body.mode,
             countries=body.countries,
+            verify_externally=body.verify_externally,
         )
     except ValueError as e:
         # `runner.create_run` raises ValueError when the country filter
@@ -633,6 +676,19 @@ def _build_export_context(
             "trips": trips_by_search.get(str(r.journey_search_id), [])
             if r.journey_search_id
             else [],
+            # PR-E — persisted external-verify verdict so offline HTML
+            # exports show the same per-cell dot the live matrix renders.
+            "external_ok": getattr(r, "external_ok", None),
+            "external_num_connections": getattr(r, "external_num_connections", None),
+            "external_best_duration_seconds": getattr(r, "external_best_duration_seconds", None),
+            "external_best_transfers": getattr(r, "external_best_transfers", None),
+            "external_source": getattr(r, "external_source", None),
+            "external_error": getattr(r, "external_error", None),
+            "external_verified_at": (
+                r.external_verified_at.isoformat()
+                if getattr(r, "external_verified_at", None)
+                else None
+            ),
         }
     run_meta = {
         "id": str(run.id),
@@ -802,6 +858,16 @@ def get_run(
                 # PR #36 — only fanout-mode rows populate this; getattr
                 # so test fixtures without the column survive
                 session_ids=getattr(r, "session_ids", None),
+                # PR-E — persisted external-verify verdict; NULL on
+                # legacy/un-verified rows. getattr fallback for pre-
+                # migration fixtures.
+                external_ok=getattr(r, "external_ok", None),
+                external_num_connections=getattr(r, "external_num_connections", None),
+                external_best_duration_seconds=getattr(r, "external_best_duration_seconds", None),
+                external_best_transfers=getattr(r, "external_best_transfers", None),
+                external_source=getattr(r, "external_source", None),
+                external_error=getattr(r, "external_error", None),
+                external_verified_at=getattr(r, "external_verified_at", None),
             )
             for r in results
         ],
@@ -885,6 +951,15 @@ def get_cell_trips(
             best_operators=r.best_operators,
             error_message=r.error_message,
             trips=trips_by_search.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+            # PR-E — pre-rendered external-verify verdict so the modal
+            # opens with ÖBB's answer already populated.
+            external_ok=r.external_ok,
+            external_num_connections=r.external_num_connections,
+            external_best_duration_seconds=r.external_best_duration_seconds,
+            external_best_transfers=r.external_best_transfers,
+            external_source=r.external_source,
+            external_error=r.external_error,
+            external_verified_at=r.external_verified_at,
         )
 
     # direction='single' runs intentionally have no return row — collapse
@@ -1068,4 +1143,9 @@ def _run_to_summary(run: Any) -> RunSummary:
         # on full-matrix runs. The sidebar uses presence/absence to
         # render the "FR+CH" badge.
         countries=getattr(run, "countries", None),
+        # PR-E — opt-in flag for auto external-verify on completion.
+        # getattr fallback handles fixtures / pre-migration test rows
+        # that lack the column. In production every row carries it
+        # via the server_default='false'.
+        verify_externally=bool(getattr(run, "verify_externally", False)),
     )

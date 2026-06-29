@@ -145,6 +145,16 @@ class NetworkCoverageRun(Base):
     # having to tag hubs into named groups.
     countries: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
+    # PR-E — operator opt-in to run external-planner verification (ÖBB
+    # HAFAS) automatically at run-completion time on every no_route /
+    # timeout / error cell. Default False keeps legacy behaviour. The
+    # Phase-3 sweep in `runner.execute_run` reads this flag and, if true,
+    # populates the `NetworkCoverageResult.external_*` columns inside the
+    # same txn that flips `run.status='completed'`.
+    verify_externally: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+
 
 class NetworkCoverageResult(Base):
     __tablename__ = "network_coverage_results"
@@ -215,6 +225,28 @@ class NetworkCoverageResult(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
+
+    # PR-E — external-planner verdict for this cell. NULL on every
+    # legacy row and on any row whose owning run had verify_externally
+    # = False. When populated, the matrix UI renders a coloured dot:
+    #   external_ok=True (green)  — ÖBB found a connection, likely a
+    #                               VIATOR data gap to investigate.
+    #   external_ok=False, error=None (blue) — ÖBB also returned zero,
+    #                                          real "no service" gap.
+    #   external_error non-NULL (yellow) — ÖBB couldn't answer (timeout,
+    #                                      auth, station-not-found etc).
+    # See `app/network_coverage/external_verify.py` for the verdict
+    # semantics and `runner._run_external_verify_sweep` for the worker
+    # loop that writes these columns.
+    external_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    external_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    external_num_connections: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_best_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_best_transfers: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    external_error: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class NetworkCoverageHub(Base):
