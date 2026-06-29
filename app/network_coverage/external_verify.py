@@ -24,6 +24,15 @@ AVE/Iberian and Nordic-cross-border services — broader than DB ever
 did. The one confirmed gap is Norwegian domestic (Vy/NSB Bergensbanen)
 which isn't in ÖBB's data pool.
 
+Two-step lookup: ÖBB rejects coord-only `TripSearch` (type:"C") with
+H9220 ("no stop near coords") even for canonical hubs like Köln Hbf
+and Frankfurt (Main) Hbf — its coord-snap is stricter than DB's was.
+Hubs in our DB carry good coords (within ~25m of the real station),
+but ÖBB still won't snap. So we resolve in two steps: first a
+`LocGeoPos` to convert coords to station lids, then a `TripSearch`
+with `type:"S"` station-based lookup. This is the path hafas-client
+uses universally.
+
 What this is NOT:
   - A scraper of oebb.at's HTML — ÖBB's ToS prohibits automated access
     to the website. The HAFAS backend path used here is the legitimate
@@ -36,7 +45,9 @@ What this is NOT:
 Rate limit: HAFAS doesn't publish one, but the practical safe ceiling
 is ~1 request/second per origin IP. We don't enforce that here because
 this surface is operator-driven (click-to-verify on individual cells);
-the cap is implicit in how fast a human clicks.
+the cap is implicit in how fast a human clicks. Note that one verify
+now costs 2 HTTP round-trips (LocGeoPos + TripSearch) — still well
+under any sane rate cap.
 """
 
 from __future__ import annotations
@@ -82,6 +93,27 @@ _USER_AGENT = (
 # the modal, so cap at 30s to fail fast on a hung backend.
 _HTTP_TIMEOUT_SECONDS = 30.0
 
+# LocGeoPos search radius for coord→station resolution. 5 km is
+# generous: our hubs are typically within 25 m of the real station,
+# but very-rural origins (e.g. a future hub at an obscure stop)
+# might be hundreds of meters off. 5 km still safely picks the
+# *intended* station rather than a wrong one in metropolitan areas
+# (no two mainline stations are this close).
+_OEBB_RESOLVE_RADIUS_METERS = 5000
+
+# Friendly translations for the HAFAS error codes operators are
+# most likely to see. Anything not in this table falls through to
+# the raw "hafas svc: <code>" form — an escape hatch for new codes
+# we haven't catalogued yet. H890 is special-cased earlier as the
+# "real no-route" answer (ok=False, error=None).
+_HAFAS_ERROR_MESSAGES: dict[str, str] = {
+    "H9220": "no station found near the supplied coordinates",
+    "H9230": "ÖBB backend internal error",
+    "H9240": "ÖBB backend search timeout",
+    "H9250": "the combination of train products is not allowed",
+    "H9300": "internal error during address search",
+}
+
 
 class VerifyResult(BaseModel):
     """Outcome of one external-planner check for one coverage cell.
@@ -115,20 +147,91 @@ def _coord_to_micro(value: float) -> int:
     return round(value * 1_000_000)
 
 
+def _translate_hafas_error(code: str) -> str:
+    """Translate a HAFAS service-level error code into a friendly
+    message. Falls back to the raw code so new ones still surface."""
+    friendly = _HAFAS_ERROR_MESSAGES.get(code)
+    if friendly:
+        return friendly
+    return f"hafas svc: {code}"
+
+
+def _build_locgeopos_body(coord_pairs: list[tuple[float, float]]) -> dict[str, Any]:
+    """Build a HAFAS `LocGeoPos` envelope that resolves N coordinate
+    pairs to their nearest stations in one POST.
+
+    Each coord is converted to integer micro-degrees and wrapped in a
+    `ring` with `maxDist=5000` metres. `getStops=true, getPOIs=false`
+    constrains the response to railway stops only (not addresses or
+    POIs that share the area). `maxLoc=1` says "give me the single
+    closest stop" — anything beyond that we'd just ignore."""
+    return {
+        "auth": {"type": "AID", "aid": _OEBB_AID},
+        "client": _OEBB_CLIENT,
+        "ver": _OEBB_VER,
+        "lang": "eng",
+        "formatted": False,
+        "svcReqL": [
+            {
+                "meth": "LocGeoPos",
+                "req": {
+                    "ring": {
+                        "cCrd": {
+                            "x": _coord_to_micro(lon),
+                            "y": _coord_to_micro(lat),
+                        },
+                        "maxDist": _OEBB_RESOLVE_RADIUS_METERS,
+                        "minDist": 0,
+                    },
+                    "maxLoc": 1,
+                    "getStops": True,
+                    "getPOIs": False,
+                },
+            }
+            for (lat, lon) in coord_pairs
+        ],
+    }
+
+
+def _extract_lids_from_locgeopos(payload: dict[str, Any], count: int) -> list[str | None]:
+    """Extract the lid (HAFAS location identifier) of the nearest stop
+    from each `LocGeoPos` result in the payload.
+
+    Returns one entry per expected svcResL slot. A slot's value is None
+    if that LocGeoPos either failed at the service level (svc.err != OK)
+    or returned an empty locL (no stop within radius). The caller decides
+    how to handle a None — typically by returning a friendly "no station
+    found" VerifyResult."""
+    out: list[str | None] = []
+    svc_res = payload.get("svcResL") or []
+    for i in range(count):
+        if i >= len(svc_res):
+            out.append(None)
+            continue
+        svc = svc_res[i]
+        if svc.get("err") and svc["err"] != "OK":
+            out.append(None)
+            continue
+        loc_l = (svc.get("res") or {}).get("locL") or []
+        if not loc_l:
+            out.append(None)
+            continue
+        lid = loc_l[0].get("lid")
+        out.append(lid if isinstance(lid, str) and lid else None)
+    return out
+
+
 def _build_trip_search_body(
     *,
-    from_lat: float,
-    from_lon: float,
-    to_lat: float,
-    to_lon: float,
+    from_lid: str,
+    to_lid: str,
     depart_at: datetime,
 ) -> dict[str, Any]:
     """Construct the JSON envelope HAFAS expects for a TripSearch.
 
-    Coords are passed as `crd: {x: lon, y: lat}` (note the swap — HAFAS
-    convention is x=longitude, y=latitude, not the lat/lon order most
-    transport tools use). Date and time are local-tz strings (HAFAS
-    interprets in the operator's TZ, which is Europe/Vienna for ÖBB)."""
+    Uses `type:"S"` (station) with the pre-resolved lids from
+    LocGeoPos. Date and time are local-tz strings (HAFAS interprets in
+    the operator's TZ, which is Europe/Vienna for ÖBB)."""
     return {
         "auth": {"type": "AID", "aid": _OEBB_AID},
         "client": _OEBB_CLIENT,
@@ -139,24 +242,8 @@ def _build_trip_search_body(
             {
                 "meth": "TripSearch",
                 "req": {
-                    "depLocL": [
-                        {
-                            "type": "C",
-                            "crd": {
-                                "x": _coord_to_micro(from_lon),
-                                "y": _coord_to_micro(from_lat),
-                            },
-                        }
-                    ],
-                    "arrLocL": [
-                        {
-                            "type": "C",
-                            "crd": {
-                                "x": _coord_to_micro(to_lon),
-                                "y": _coord_to_micro(to_lat),
-                            },
-                        }
-                    ],
+                    "depLocL": [{"type": "S", "lid": from_lid}],
+                    "arrLocL": [{"type": "S", "lid": to_lid}],
                     "outDate": depart_at.strftime("%Y%m%d"),
                     "outTime": depart_at.strftime("%H%M%S"),
                     "numF": 5,
@@ -242,6 +329,40 @@ def _decode_response_body(raw: bytes) -> Any:
 # ─────────────────────── public API ───────────────────────
 
 
+_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Content-Type": "application/json;charset=UTF-8",
+    "Accept": "application/json",
+}
+
+
+async def _post_hafas(
+    client: httpx.AsyncClient, body: dict[str, Any]
+) -> tuple[dict[str, Any] | None, VerifyResult | None]:
+    """POST a HAFAS request envelope. Returns `(payload, None)` on
+    success or `(None, error-VerifyResult)` on transport / parse
+    failure — never raises to the caller."""
+    try:
+        response = await client.post(_OEBB_ENDPOINT, json=body, headers=_HEADERS)
+    except httpx.HTTPError as e:
+        log.warning("HAFAS request failed: %s", e)
+        return None, VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"http: {e}")
+    if response.status_code != 200:
+        return None, VerifyResult(
+            source=_SOURCE_OEBB_HAFAS,
+            ok=False,
+            error=f"HTTP {response.status_code}",
+        )
+    try:
+        payload = _decode_response_body(response.content)
+    except ValueError as e:
+        # json.JSONDecodeError is a subclass of ValueError, so this
+        # catches both the parse failure and any future ValueError
+        # raised by _decode_response_body.
+        return None, VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"json: {e}")
+    return payload, None
+
+
 async def verify_via_oebb_hafas(
     *,
     from_lat: float,
@@ -253,49 +374,58 @@ async def verify_via_oebb_hafas(
 ) -> VerifyResult:
     """Ask ÖBB's HAFAS backend whether it can route this pair.
 
+    Two-step internally: first resolve both coords to station lids via
+    LocGeoPos, then run TripSearch with `type:"S"`. Returns a single
+    VerifyResult either way — the two-POST shape is invisible to the
+    caller.
+
     `client` is injected for tests; production callers pass None and
     we manage a one-shot AsyncClient internally. Network / parse
     failures produce a VerifyResult with `ok=False` and `error` set —
     never raises to the caller, since the UI surface treats "unknown"
     as a distinct visual state from "external said no"."""
-    body = _build_trip_search_body(
-        from_lat=from_lat,
-        from_lon=from_lon,
-        to_lat=to_lat,
-        to_lon=to_lon,
-        depart_at=depart_at,
-    )
-    headers = {
-        "User-Agent": _USER_AGENT,
-        "Content-Type": "application/json;charset=UTF-8",
-        "Accept": "application/json",
-    }
+    resolve_body = _build_locgeopos_body([(from_lat, from_lon), (to_lat, to_lon)])
 
-    async def _do_request(c: httpx.AsyncClient) -> VerifyResult:
-        try:
-            response = await c.post(_OEBB_ENDPOINT, json=body, headers=headers)
-        except httpx.HTTPError as e:
-            log.warning("HAFAS request failed: %s", e)
-            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"http: {e}")
-        if response.status_code != 200:
+    async def _run(c: httpx.AsyncClient) -> VerifyResult:
+        # Step 1: coord → station lid resolution.
+        resolve_payload, err = await _post_hafas(c, resolve_body)
+        if err is not None:
+            return err
+        if resolve_payload is None:  # pragma: no cover — defensive
+            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no resolve payload")
+        if resolve_payload.get("err") and resolve_payload["err"] != "OK":
             return VerifyResult(
                 source=_SOURCE_OEBB_HAFAS,
                 ok=False,
-                error=f"HTTP {response.status_code}",
+                error=f"hafas envelope: {resolve_payload['err']}",
             )
-        try:
-            payload = _decode_response_body(response.content)
-        except ValueError as e:
-            # json.JSONDecodeError is a subclass of ValueError, so this
-            # catches both the parse failure and any future ValueError
-            # raised by _decode_response_body.
-            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"json: {e}")
-        return _parse_hafas_response(payload)
+        lids = _extract_lids_from_locgeopos(resolve_payload, count=2)
+        from_lid, to_lid = lids[0], lids[1]
+        if not from_lid or not to_lid:
+            # One or both endpoints don't snap to an ÖBB station. This
+            # is informative ("ÖBB doesn't have this stop in its
+            # catalogue") rather than a true backend failure — but
+            # we can't route without IDs, so surface as yellow with
+            # the friendly H9220-equivalent message.
+            return VerifyResult(
+                source=_SOURCE_OEBB_HAFAS,
+                ok=False,
+                error=_HAFAS_ERROR_MESSAGES["H9220"],
+            )
+
+        # Step 2: trip search using the resolved station lids.
+        trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
+        trip_payload, err2 = await _post_hafas(c, trip_body)
+        if err2 is not None:
+            return err2
+        if trip_payload is None:  # pragma: no cover — defensive
+            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no trip payload")
+        return _parse_hafas_response(trip_payload)
 
     if client is not None:
-        return await _do_request(client)
+        return await _run(client)
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as c:
-        return await _do_request(c)
+        return await _run(c)
 
 
 def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
@@ -316,7 +446,9 @@ def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
         # negative answer, not a transport error.
         if svc["err"] == "H890":
             return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, num_connections=0)
-        return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"hafas svc: {svc['err']}")
+        return VerifyResult(
+            source=_SOURCE_OEBB_HAFAS, ok=False, error=_translate_hafas_error(svc["err"])
+        )
     res = svc.get("res") or {}
     connections = res.get("outConL") or []
     return _summarise_connections(connections)
