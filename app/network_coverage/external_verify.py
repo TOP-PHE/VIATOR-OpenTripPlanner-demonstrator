@@ -285,7 +285,10 @@ async def verify_via_oebb_hafas(
             )
         try:
             payload = _decode_response_body(response.content)
-        except (ValueError, json.JSONDecodeError) as e:
+        except ValueError as e:
+            # json.JSONDecodeError is a subclass of ValueError, so this
+            # catches both the parse failure and any future ValueError
+            # raised by _decode_response_body.
             return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"json: {e}")
         return _parse_hafas_response(payload)
 
