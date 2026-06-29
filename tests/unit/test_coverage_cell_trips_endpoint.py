@@ -47,6 +47,18 @@ def _result_row(origin, dest, status="ok", journey_search_id=None, **extra):
     r.best_operators = extra.get("best_operators", "SNCF")
     r.error_message = extra.get("error_message")
     r.journey_search_id = journey_search_id if journey_search_id is not None else uuid.uuid4()
+    # PR-E — explicit None for the external-verify verdict columns.
+    # Without this MagicMock auto-creates child mocks on attribute access,
+    # which then trip CellTripsDirection's `str | None` validators with
+    # "Input should be a valid string" — pre-PR-E rows naturally have
+    # NULL across the board, so None is the canonical fixture value.
+    r.external_ok = extra.get("external_ok")
+    r.external_num_connections = extra.get("external_num_connections")
+    r.external_best_duration_seconds = extra.get("external_best_duration_seconds")
+    r.external_best_transfers = extra.get("external_best_transfers")
+    r.external_source = extra.get("external_source")
+    r.external_error = extra.get("external_error")
+    r.external_verified_at = extra.get("external_verified_at")
     return r
 
 
