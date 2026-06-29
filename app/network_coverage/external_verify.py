@@ -1,25 +1,33 @@
 """External-planner verification for coverage cells.
 
 Lets an operator click a `no_route` cell in the matrix and ask "does
-Deutsche Bahn's own planner also fail this pair, or does it return a
-route we're missing in our NAP feeds?" If DB finds a route too, our
-data is the gap; if DB also fails, the gap is real (no scheduled
-service at that depart-time).
+ÖBB's own planner also fail this pair, or does it return a route we're
+missing in our NAP feeds?" If ÖBB finds a route too, our data is the
+gap; if ÖBB also fails, the gap is real (no scheduled service at that
+depart-time).
 
-We talk to DB's HAFAS endpoint directly — the same `mgate.exe` JSON
-service that powers the DB Navigator mobile app and the bahn.de UI.
-This is what the `hafas-client` JS library (https://github.com/public-
-transport/hafas-client) has been doing for ~10 years; the protocol is
-proprietary but well-understood and the credentials below are the
-publicly-published DB Navigator app id used by every install. We pass
-a polite identifying User-Agent rather than masquerading as the mobile
-app, since the goal is comparison data and we're not trying to evade
+We talk to ÖBB's HAFAS endpoint directly — the same `mgate.exe` JSON
+service that powers the ÖBB Scotty mobile app. This is what the
+`hafas-client` JS library (https://github.com/public-transport/hafas-
+client) has been doing for ~10 years; the protocol is proprietary but
+well-understood and the credentials below are the publicly-published
+Scotty app id used by every hafas-client install. We pass a polite
+identifying User-Agent rather than masquerading as the mobile app,
+since the goal is comparison data and we're not trying to evade
 detection.
 
+Why ÖBB and not DB: DB's `reiseauskunft.bahn.de/bin/mgate.exe` was
+silently retired in mid-2026. ÖBB's instance is alive, uses the same
+HAFAS protocol family, and (verified empirically on 43 EU rail
+corridor pairs) covers DACH + cross-border partners + Eurostar/TGV/
+AVE/Iberian and Nordic-cross-border services — broader than DB ever
+did. The one confirmed gap is Norwegian domestic (Vy/NSB Bergensbanen)
+which isn't in ÖBB's data pool.
+
 What this is NOT:
-  - A scraper of bahn.de's HTML — DB's ToS prohibits automated access
-    to the website and Cloudflare blocks it within tens of requests.
-    The HAFAS backend path used here is the legitimate alternative.
+  - A scraper of oebb.at's HTML — ÖBB's ToS prohibits automated access
+    to the website. The HAFAS backend path used here is the legitimate
+    alternative.
   - A replacement for HACON's paid partner API. For high-volume use
     (millions/day) the partner API is the right answer; for operator-
     driven verification of a handful of coverage gaps, the public
@@ -33,6 +41,7 @@ the cap is implicit in how fast a human clicks.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -45,26 +54,25 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────── HAFAS profile ───────────────────────
 #
-# DB Navigator mobile-app credentials. Public — extracted from the
-# Android app years ago, used by every hafas-client install on the
-# planet. DB hasn't rotated them since at least 2017.
+# ÖBB Scotty mobile-app credentials. Public — used by every hafas-
+# client install on the planet. ÖBB hasn't rotated them since at least
+# 2019.
 
-_DB_ENDPOINT = "https://reiseauskunft.bahn.de/bin/mgate.exe"
-_DB_AID = "n91dB8Z77MLdoR0K"
+_OEBB_ENDPOINT = "https://fahrplan.oebb.at/bin/mgate.exe"
+_OEBB_AID = "OWDL4fE4ixNiPBBm"
 # Source label propagated on every VerifyResult. Single constant so the
 # UI verdict-colour logic can equality-check it (and Sonar S1192 is happy
 # with the literal not duplicated 9 times across the error branches).
-_SOURCE_DB_HAFAS = "db.hafas.de"
-_DB_CLIENT = {
-    "id": "DB",
-    "v": "20100000",
+_SOURCE_OEBB_HAFAS = "fahrplan.oebb.at"
+_OEBB_CLIENT = {
+    "id": "OEBB",
+    "v": "6030600",
     "type": "AND",
-    "name": "DB Navigator",
+    "name": "oebb",
 }
-_DB_EXT = "DB.R21.12.a"
-_DB_VER = "1.45"
+_OEBB_VER = "1.42"
 
-# Identify ourselves rather than masquerading — DB tolerates known
+# Identify ourselves rather than masquerading — ÖBB tolerates known
 # clients, and "VIATOR-coverage-verify" is honest about why we're here.
 _USER_AGENT = (
     "VIATOR-coverage-verify/1.0 (+https://github.com/TOP-PHE/VIATOR-OpenTripPlanner-demonstrator)"
@@ -120,12 +128,11 @@ def _build_trip_search_body(
     Coords are passed as `crd: {x: lon, y: lat}` (note the swap — HAFAS
     convention is x=longitude, y=latitude, not the lat/lon order most
     transport tools use). Date and time are local-tz strings (HAFAS
-    interprets in the operator's TZ, which is Europe/Berlin for DB)."""
+    interprets in the operator's TZ, which is Europe/Vienna for ÖBB)."""
     return {
-        "auth": {"type": "AID", "aid": _DB_AID},
-        "client": _DB_CLIENT,
-        "ext": _DB_EXT,
-        "ver": _DB_VER,
+        "auth": {"type": "AID", "aid": _OEBB_AID},
+        "client": _OEBB_CLIENT,
+        "ver": _OEBB_VER,
         "lang": "eng",
         "formatted": False,
         "svcReqL": [
@@ -188,7 +195,7 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
     (HAFAS doesn't guarantee they're sorted shortest-first; ranking
     differs between profiles)."""
     if not connections:
-        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, num_connections=0)
+        return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, num_connections=0)
     parsed_durations: list[int] = []
     parsed_transfers: list[int] = []
     for c in connections:
@@ -204,7 +211,7 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
         else None
     )
     return VerifyResult(
-        source=_SOURCE_DB_HAFAS,
+        source=_SOURCE_OEBB_HAFAS,
         ok=True,
         num_connections=len(connections),
         best_duration_seconds=parsed_durations[best_idx] if best_idx is not None else None,
@@ -216,10 +223,26 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
     )
 
 
+def _decode_response_body(raw: bytes) -> Any:
+    """Decode a HAFAS response body to a parsed JSON object.
+
+    ÖBB's mgate returns UTF-8 in practice, but the sibling ajax-getstop
+    endpoint returns Latin-1, and we've seen field-level Latin-1 leak
+    into mgate during outages. Try UTF-8 first; fall back to Latin-1
+    (which never raises on any byte sequence) so a transient encoding
+    quirk doesn't trip an `error` verdict on otherwise-valid responses.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    return json.loads(text)
+
+
 # ─────────────────────── public API ───────────────────────
 
 
-async def verify_via_db_hafas(
+async def verify_via_oebb_hafas(
     *,
     from_lat: float,
     from_lon: float,
@@ -228,7 +251,7 @@ async def verify_via_db_hafas(
     depart_at: datetime,
     client: httpx.AsyncClient | None = None,
 ) -> VerifyResult:
-    """Ask DB's HAFAS backend whether it can route this pair.
+    """Ask ÖBB's HAFAS backend whether it can route this pair.
 
     `client` is injected for tests; production callers pass None and
     we manage a one-shot AsyncClient internally. Network / parse
@@ -250,20 +273,20 @@ async def verify_via_db_hafas(
 
     async def _do_request(c: httpx.AsyncClient) -> VerifyResult:
         try:
-            response = await c.post(_DB_ENDPOINT, json=body, headers=headers)
+            response = await c.post(_OEBB_ENDPOINT, json=body, headers=headers)
         except httpx.HTTPError as e:
             log.warning("HAFAS request failed: %s", e)
-            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"http: {e}")
+            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"http: {e}")
         if response.status_code != 200:
             return VerifyResult(
-                source=_SOURCE_DB_HAFAS,
+                source=_SOURCE_OEBB_HAFAS,
                 ok=False,
                 error=f"HTTP {response.status_code}",
             )
         try:
-            payload = response.json()
-        except ValueError as e:
-            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"json: {e}")
+            payload = _decode_response_body(response.content)
+        except (ValueError, json.JSONDecodeError) as e:
+            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"json: {e}")
         return _parse_hafas_response(payload)
 
     if client is not None:
@@ -279,18 +302,18 @@ def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
     means no usable connections returned."""
     if payload.get("err") and payload["err"] != "OK":
         return VerifyResult(
-            source=_SOURCE_DB_HAFAS, ok=False, error=f"hafas envelope: {payload['err']}"
+            source=_SOURCE_OEBB_HAFAS, ok=False, error=f"hafas envelope: {payload['err']}"
         )
     svc_res = payload.get("svcResL") or []
     if not svc_res:
-        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error="no svcResL")
+        return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no svcResL")
     svc = svc_res[0]
     if svc.get("err") and svc["err"] != "OK":
         # `H890` is HAFAS's "no connections found" code — meaningful
         # negative answer, not a transport error.
         if svc["err"] == "H890":
-            return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, num_connections=0)
-        return VerifyResult(source=_SOURCE_DB_HAFAS, ok=False, error=f"hafas svc: {svc['err']}")
+            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, num_connections=0)
+        return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"hafas svc: {svc['err']}")
     res = svc.get("res") or {}
     connections = res.get("outConL") or []
     return _summarise_connections(connections)

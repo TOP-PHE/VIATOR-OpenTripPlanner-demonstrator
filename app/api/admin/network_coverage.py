@@ -911,7 +911,7 @@ async def verify_cell_external(
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> external_verify.VerifyResult:
-    """Ask an external journey planner (DB's HAFAS backend) whether
+    """Ask an external journey planner (ÖBB's HAFAS backend) whether
     this specific pair has a route at the run's depart_at, so the
     operator can disambiguate "VIATOR's data is missing a service" from
     "there is genuinely no service on this date".
@@ -923,7 +923,7 @@ async def verify_cell_external(
     Implementation: looks up the run for depart_at, the cell row to
     confirm it exists (and bind the pair to a real coverage cell, not
     a typed-in URL), the two hub rows for coordinates, then calls
-    `external_verify.verify_via_db_hafas` and returns its result
+    `external_verify.verify_via_oebb_hafas` and returns its result
     verbatim.
     """
     run = db.get(NetworkCoverageRun, run_id)
@@ -951,7 +951,7 @@ async def verify_cell_external(
         # coords. Surface as 404 — operator restores the hub if they
         # want this verifiable.
         raise HTTPException(404, _HUB_NOT_FOUND)
-    return await external_verify.verify_via_db_hafas(
+    return await external_verify.verify_via_oebb_hafas(
         from_lat=origin_hub.lat,
         from_lon=origin_hub.lon,
         to_lat=dest_hub.lat,

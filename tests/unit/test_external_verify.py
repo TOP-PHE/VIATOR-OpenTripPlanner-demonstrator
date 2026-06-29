@@ -5,10 +5,11 @@ Two layers:
 
   1. Pure-function bits (`_coord_to_micro`, `_parse_hafas_duration`,
      `_build_trip_search_body`, `_parse_hafas_response`,
-     `_summarise_connections`) — no network, deterministic.
-  2. `verify_via_db_hafas` itself, exercised through httpx's
+     `_summarise_connections`, `_decode_response_body`) — no network,
+     deterministic.
+  2. `verify_via_oebb_hafas` itself, exercised through httpx's
      `MockTransport` so we can simulate HAFAS responses without actually
-     hitting db.hafas.de from CI.
+     hitting fahrplan.oebb.at from CI.
 
 We deliberately exercise the three observable verdict states the UI
 distinguishes:
@@ -19,6 +20,7 @@ distinguishes:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 import httpx
@@ -107,11 +109,11 @@ def test_build_trip_search_body_formats_date_and_time() -> None:
     assert req["outTime"] == "083015"
 
 
-def test_build_trip_search_body_carries_db_navigator_credentials() -> None:
-    """The body MUST identify as DB Navigator — that's the credential
-    HAFAS accepts. A typo in the aid silently turns every request into
-    a 401-equivalent and the operator gets `error` verdicts for every
-    cell."""
+def test_build_trip_search_body_carries_oebb_credentials() -> None:
+    """The body MUST identify as ÖBB Scotty — that's the credential
+    ÖBB's mgate.exe accepts. A typo in the aid silently turns every
+    request into a 401-equivalent and the operator gets `error`
+    verdicts for every cell."""
     body = external_verify._build_trip_search_body(
         from_lat=0.0,
         from_lon=0.0,
@@ -119,11 +121,15 @@ def test_build_trip_search_body_carries_db_navigator_credentials() -> None:
         to_lon=0.0,
         depart_at=datetime(2026, 6, 28, 8, 0, 0),
     )
-    assert body["auth"] == {"type": "AID", "aid": "n91dB8Z77MLdoR0K"}
-    assert body["client"]["id"] == "DB"
-    assert body["client"]["name"] == "DB Navigator"
-    assert body["ver"] == "1.45"
+    assert body["auth"] == {"type": "AID", "aid": "OWDL4fE4ixNiPBBm"}
+    assert body["client"]["id"] == "OEBB"
+    assert body["client"]["name"] == "oebb"
+    assert body["ver"] == "1.42"
     assert body["svcReqL"][0]["meth"] == "TripSearch"
+    # ÖBB profile doesn't carry an `ext` field (DB did) — verify it's
+    # absent so a future paste-in from a DB profile doesn't sneak it
+    # back and break the auth handshake.
+    assert "ext" not in body
 
 
 # ─────────────────────── response parsing ───────────────────────
@@ -154,6 +160,7 @@ def test_parse_hafas_response_summarises_connections() -> None:
         ]
     )
     result = external_verify._parse_hafas_response(resp)
+    assert result.source == "fahrplan.oebb.at"
     assert result.ok is True
     assert result.num_connections == 3
     assert result.best_duration_seconds == 4 * 3600 + 15 * 60
@@ -218,11 +225,48 @@ def test_parse_hafas_response_missing_svc_res_is_error() -> None:
     assert result.error is not None
 
 
-# ─────────────────────── verify_via_db_hafas (end-to-end with mocked HTTP) ───────────────────────
+# ─────────────────────── body decoding (UTF-8 / Latin-1 fallback) ───────────────────────
+
+
+def test_decode_response_body_utf8() -> None:
+    """The common path: ÖBB's mgate returns UTF-8 JSON. Standard utf-8
+    decode succeeds and we parse normally."""
+    raw = '{"err": "OK", "svcResL": [{"name": "München Hbf"}]}'.encode()
+    payload = external_verify._decode_response_body(raw)
+    assert payload["err"] == "OK"
+    assert payload["svcResL"][0]["name"] == "München Hbf"
+
+
+def test_decode_response_body_latin1_fallback() -> None:
+    """Sibling ÖBB endpoint (ajax-getstop) returns Latin-1; during
+    outages we've seen Latin-1 leak into mgate responses too. Decoding
+    bytes that fail UTF-8 (e.g. 0xfc which is `ü` in Latin-1, invalid
+    as a UTF-8 lead byte) must fall back to Latin-1 rather than
+    crashing the modal with a UnicodeDecodeError."""
+    # 0xfc is `ü` in Latin-1; on its own it's NOT a valid UTF-8 byte.
+    raw = b'{"err": "OK", "svcResL": [{"name": "M\xfcnchen Hbf"}]}'
+    # Confirm the precondition: utf-8 decode fails on this byte stream.
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+    # The adapter must handle it without raising.
+    payload = external_verify._decode_response_body(raw)
+    assert payload["err"] == "OK"
+    assert payload["svcResL"][0]["name"] == "München Hbf"
+
+
+def test_decode_response_body_invalid_json_raises() -> None:
+    """Decode falls back to Latin-1 for byte issues but JSON parse
+    errors still propagate (the caller catches and converts to a
+    VerifyResult with `error` set)."""
+    with pytest.raises(json.JSONDecodeError):
+        external_verify._decode_response_body(b"<html>maintenance</html>")
+
+
+# ─────────────────────── verify_via_oebb_hafas (end-to-end with mocked HTTP) ───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_verify_via_db_hafas_success_round_trip() -> None:
+async def test_verify_via_oebb_hafas_success_round_trip() -> None:
     """Inject a mocked transport that returns a 3-connection response;
     assert the VerifyResult mirrors the summary correctly."""
 
@@ -231,6 +275,7 @@ async def test_verify_via_db_hafas_success_round_trip() -> None:
         # round-trip — if a future refactor breaks the body shape the
         # MockTransport assertion catches it.
         assert request.method == "POST"
+        assert request.url.host == "fahrplan.oebb.at"
         assert request.url.path == "/bin/mgate.exe"
         return httpx.Response(
             200,
@@ -244,7 +289,7 @@ async def test_verify_via_db_hafas_success_round_trip() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_db_hafas(
+        result = await external_verify.verify_via_oebb_hafas(
             from_lat=47.5876,
             from_lon=7.5571,
             to_lat=46.2044,
@@ -252,19 +297,20 @@ async def test_verify_via_db_hafas_success_round_trip() -> None:
             depart_at=datetime(2026, 6, 28, 8, 0, 0),
             client=client,
         )
+    assert result.source == "fahrplan.oebb.at"
     assert result.ok is True
     assert result.num_connections == 2
     assert result.best_duration_seconds == 4 * 3600 + 15 * 60
 
 
 @pytest.mark.asyncio
-async def test_verify_via_db_hafas_http_500_is_error_not_ok_false() -> None:
+async def test_verify_via_oebb_hafas_http_500_is_error_not_ok_false() -> None:
     """HTTP 500 from HAFAS → `error` set so the UI yellow-warns. Critical
     that we DON'T silently return ok=False (which would look like
     "external confirmed no service")."""
     transport = httpx.MockTransport(lambda _req: httpx.Response(500, text="internal error"))
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_db_hafas(
+        result = await external_verify.verify_via_oebb_hafas(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -278,7 +324,7 @@ async def test_verify_via_db_hafas_http_500_is_error_not_ok_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_db_hafas_connection_error_does_not_raise() -> None:
+async def test_verify_via_oebb_hafas_connection_error_does_not_raise() -> None:
     """Network errors (DNS, refused, timeout) must surface as
     VerifyResult.error rather than propagating to the FastAPI endpoint.
     The endpoint is operator-facing — a 500 from a third-party
@@ -289,7 +335,7 @@ async def test_verify_via_db_hafas_connection_error_does_not_raise() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_db_hafas(
+        result = await external_verify.verify_via_oebb_hafas(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -303,7 +349,7 @@ async def test_verify_via_db_hafas_connection_error_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_db_hafas_non_json_response_is_error() -> None:
+async def test_verify_via_oebb_hafas_non_json_response_is_error() -> None:
     """HAFAS occasionally returns an HTML interstitial when behind a
     maintenance page. The parser must catch the JSON decode failure
     rather than crashing the endpoint."""
@@ -311,7 +357,7 @@ async def test_verify_via_db_hafas_non_json_response_is_error() -> None:
         lambda _req: httpx.Response(200, text="<html>maintenance</html>")
     )
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_db_hafas(
+        result = await external_verify.verify_via_oebb_hafas(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -325,7 +371,7 @@ async def test_verify_via_db_hafas_non_json_response_is_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_db_hafas_h890_returns_real_no_route() -> None:
+async def test_verify_via_oebb_hafas_h890_returns_real_no_route() -> None:
     """End-to-end check that the H890 branch flows through the full
     function and lands as ok=False with no error (the 'external also
     found 0' verdict). Pinning the user-visible behaviour, not just
@@ -336,7 +382,7 @@ async def test_verify_via_db_hafas_h890_returns_real_no_route() -> None:
     }
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json=resp))
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_db_hafas(
+        result = await external_verify.verify_via_oebb_hafas(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -347,3 +393,43 @@ async def test_verify_via_db_hafas_h890_returns_real_no_route() -> None:
     assert result.ok is False
     assert result.error is None
     assert result.num_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_verify_via_oebb_hafas_latin1_body_does_not_crash() -> None:
+    """ÖBB occasionally returns Latin-1-encoded bytes in mgate responses
+    (especially in `common.locL` station names). The adapter must
+    decode without raising — the modal can't display a UnicodeDecodeError
+    traceback to the operator."""
+    # Build a HAFAS-shaped response that contains 0xfc (Latin-1 `ü`)
+    # inside a station name. utf-8 decode fails on this byte; Latin-1
+    # succeeds.
+    raw_body = (
+        b'{"err": "OK", "svcResL": [{"meth": "TripSearch", "err": "OK", '
+        b'"res": {"common": {"locL": [{"name": "M\xfcnchen Hbf"}]}, '
+        b'"outConL": [{"dur": "041500", "chg": 1}]}}]}'
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=raw_body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await external_verify.verify_via_oebb_hafas(
+            from_lat=0.0,
+            from_lon=0.0,
+            to_lat=0.0,
+            to_lon=0.0,
+            depart_at=datetime(2026, 6, 28, 8, 0, 0),
+            client=client,
+        )
+    # Either ok=True with the connection counted (preferred), or at
+    # minimum ok=False with `error` set — what's NOT acceptable is an
+    # uncaught UnicodeDecodeError raised to the FastAPI endpoint.
+    assert result.ok is True
+    assert result.num_connections == 1
+    assert result.best_duration_seconds == 4 * 3600 + 15 * 60

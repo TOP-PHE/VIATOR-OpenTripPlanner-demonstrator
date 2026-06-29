@@ -184,14 +184,14 @@ async def test_verify_external_forwards_coords_and_depart_at_to_adapter(monkeypa
     async def fake_verify(**kwargs):
         captured.update(kwargs)
         return external_verify.VerifyResult(
-            source="db.hafas.de",
+            source="fahrplan.oebb.at",
             ok=True,
             num_connections=3,
             best_duration_seconds=4 * 3600 + 15 * 60,
             best_transfers=1,
         )
 
-    monkeypatch.setattr(external_verify, "verify_via_db_hafas", fake_verify)
+    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", fake_verify)
 
     result = await api.verify_cell_external(
         run_id=run.id,
@@ -206,7 +206,7 @@ async def test_verify_external_forwards_coords_and_depart_at_to_adapter(monkeypa
     assert captured["to_lat"] == 46.2104
     assert captured["to_lon"] == 6.1424
     assert captured["depart_at"] == run.depart_at
-    assert result.source == "db.hafas.de"
+    assert result.source == "fahrplan.oebb.at"
     assert result.ok is True
     assert result.num_connections == 3
 
@@ -229,7 +229,7 @@ async def test_verify_external_returns_adapter_result_verbatim(monkeypatch):
     )
 
     expected = external_verify.VerifyResult(
-        source="db.hafas.de",
+        source="fahrplan.oebb.at",
         ok=False,
         num_connections=0,
         error=None,
@@ -238,7 +238,7 @@ async def test_verify_external_returns_adapter_result_verbatim(monkeypatch):
     async def fake_verify(**_kwargs):
         return expected
 
-    monkeypatch.setattr(external_verify, "verify_via_db_hafas", fake_verify)
+    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", fake_verify)
 
     result = await api.verify_cell_external(
         run_id=run.id,
