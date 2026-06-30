@@ -35,19 +35,21 @@ card UI works as the click-cell drilldown out of the box.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Any
 
 from sqlalchemy import (
     ARRAY,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
     String,
+    Time,
     UniqueConstraint,
     text,
 )
@@ -154,6 +156,31 @@ class NetworkCoverageRun(Base):
     verify_externally: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+
+    # PR-3 — per-run day-window override (origin-local time-of-day slice).
+    # NULL means "use COVERAGE_DEFAULT_WINDOW_START/END from platform
+    # config at execute time". Stored as TIME (no date / no tz); the
+    # runner combines (reference_date, window_*_local, window_timezone)
+    # into the K-slot UTC grid.
+    #
+    # `window_end_local` accepts "24:00" on the API as a sentinel for
+    # end-of-day; the API layer stores it as 00:00 (i.e. midnight of the
+    # NEXT day) so the DB-side TIME constraint isn't violated. The
+    # runner detects the "end == start" round-trip case and adds a day.
+    window_start_local: Mapped[time | None] = mapped_column(Time(), nullable=True)
+    window_end_local: Mapped[time | None] = mapped_column(Time(), nullable=True)
+
+    # IANA timezone name (e.g. "Europe/Vienna", "UTC"). NULL = fall back
+    # to COVERAGE_DEFAULT_TIMEZONE. Free-form TEXT in the DB so a future
+    # operator-typed zone doesn't require a migration; the create-run
+    # API gates against the COVERAGE_DEFAULT_TIMEZONE choices list.
+    window_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Calendar day (in window_timezone) on which the K time-slots are
+    # anchored. NULL = "tomorrow at run-create time in window_timezone"
+    # — resolved by `runner.create_run` so the persisted depart_at and
+    # the reference_date stay consistent on the row.
+    reference_date: Mapped[date | None] = mapped_column(Date(), nullable=True)
 
 
 class NetworkCoverageResult(Base):

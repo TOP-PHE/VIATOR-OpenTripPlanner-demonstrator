@@ -96,6 +96,66 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "COVERAGE_VERIFY_PARALLELISM": {"type": "int", "default": 2, "min": 1, "max": 10},
     "COVERAGE_VERIFY_TIMEOUT_S": {"type": "int", "default": 30, "min": 5, "max": 300},
     "COVERAGE_VERIFY_SLEEP_MS": {"type": "int", "default": 500, "min": 0, "max": 10000},
+    # ── Coverage K-slot time-slicing (PR-3) ───────────────────────────
+    # The legacy per-pair coverage call was one numItineraries=50,
+    # window=4h request. That worked for the 08:00 "morning peak"
+    # baseline but threw away the apples-to-apples comparison surface
+    # across MOTIS/OTP/OJP — each planner had its own preferred
+    # internal anchor, so two engines could return a similar count but
+    # cover wildly different time bands.
+    #
+    # PR-3 replaces that with K time-slot calls per pair: each slot is
+    # `window/K` seconds wide (default K=6, window=86400 = 4h slots),
+    # all engines see the same time grid, and the runner filters every
+    # returned trip on whether its FIRST TRANSIT LEG's scheduled
+    # departure falls in [day_start, day_end) of the origin's local
+    # timezone. K=1 preserves the legacy single-call behaviour — this
+    # IS the rollback flag.
+    #
+    # `_NUM_ITINERARIES_PER_SLOT` is intentionally lower than the
+    # legacy `COVERAGE_NUM_ITINERARIES` (10 vs 50) because we're now
+    # querying K times — 6 * 10 = 60 max trips/pair instead of 50, but
+    # spread evenly across the day instead of clustered at one anchor.
+    # Each slot's per-call timeout (20s) is well under OTP's 60s
+    # apiProcessingTimeout default.
+    #
+    # `_WITHIN_PAIR_PARALLELISM` bounds the slot fan-out per pair so we
+    # don't multiplicatively saturate OTP when combined with
+    # `COVERAGE_PAIR_PARALLELISM`. Effective concurrency ceiling is
+    # PAIR_PARALLELISM * WITHIN_PAIR_PARALLELISM = 3*3 = 9 simultaneous
+    # fetch_plan calls (vs PR-2's 5 single calls).
+    "COVERAGE_SLOT_COUNT": {"type": "int", "default": 6, "min": 1, "max": 24},
+    "COVERAGE_NUM_ITINERARIES_PER_SLOT": {"type": "int", "default": 10, "min": 1, "max": 50},
+    "COVERAGE_SLOT_TIMEOUT_MS": {"type": "int", "default": 20000, "min": 5000, "max": 120000},
+    "COVERAGE_WITHIN_PAIR_PARALLELISM": {"type": "int", "default": 3, "min": 1, "max": 10},
+    # Day-window defaults (per-run overridable via the create-run form).
+    # The string-time format is "HH:MM" 24-hour; "24:00" is special-cased
+    # server-side to mean "end of day" so 00:00-24:00 = full day. Per-
+    # run window/timezone columns on `network_coverage_runs` default to
+    # NULL = "use the platform_config defaults here".
+    "COVERAGE_DEFAULT_WINDOW_START": {"type": "str", "default": "00:00"},
+    "COVERAGE_DEFAULT_WINDOW_END": {"type": "str", "default": "24:00"},
+    "COVERAGE_DEFAULT_TIMEZONE": {
+        "type": "str",
+        "default": "UTC",
+        "choices": [
+            "UTC",
+            "Europe/Berlin",
+            "Europe/Vienna",
+            "Europe/Paris",
+            "Europe/Madrid",
+            "Europe/Stockholm",
+            "Europe/Warsaw",
+            "Europe/Budapest",
+            "Europe/Prague",
+            "Europe/Helsinki",
+            "Europe/Athens",
+            "Europe/Brussels",
+            "Europe/Amsterdam",
+            "Europe/Lisbon",
+            "Europe/Rome",
+        ],
+    },
     # ── Master data refresh ───────────────────────────────────────────
     "MASTER_STATIONS_REFRESH_DAYS": {"type": "int", "default": 30, "min": 1, "max": 365},
     "MASTER_CARRIERS_REFRESH_DAYS": {"type": "int", "default": 90, "min": 1, "max": 365},

@@ -37,6 +37,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+
 log = logging.getLogger(__name__)
 
 # OJP 2.0 XML namespace identifiers. The default namespace carries the
@@ -460,6 +462,12 @@ def _normalise(xml_text: str) -> list[dict[str, Any]]:
                 or "",
                 "modes": ",".join(sorted(set(modes_set))),
                 "legs": legs_norm,
+                # PR-3 — first transit-leg boarding time in UTC ISO.
+                # Same contract as OTP / MOTIS — the coverage runner
+                # filters trips on this field, not on `departure_at`
+                # (which is the itinerary START, often a walking
+                # ContinuousLeg). See app/journey/trip_normalize.py.
+                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
             }
         )
     return out

@@ -196,7 +196,12 @@ def admin_network_coverage_page(
     db: Annotated[Session, Depends(get_db)],
 ) -> Response:
     """v0.1.27 — Network coverage matrix page. Lists serving sessions
-    so the operator can pick which to run against."""
+    so the operator can pick which to run against.
+
+    PR-3 — also passes the COVERAGE_DEFAULT_TIMEZONE choices + the
+    three day-window defaults into the template so the Advanced section
+    of the run-create form pre-fills (and a `<select>` lists the same
+    zones the API accepts)."""
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/admin/network-coverage")
@@ -207,10 +212,25 @@ def admin_network_coverage_page(
         .scalars()
         .all()
     )
+    # PR-3 — Advanced section defaults. Read live so an operator edit
+    # to /admin/config is reflected on next page load without a redeploy.
+    cov_cfg = config_service.get_all(db)
+    from ..config_schema import CONFIG_SCHEMA  # local import keeps top-of-file tidy
+
+    tz_spec = CONFIG_SCHEMA.get("COVERAGE_DEFAULT_TIMEZONE", {})
     return templates.TemplateResponse(
         request,
         "admin/network_coverage.html",
-        {"current_user": user, "serving_sessions": serving},
+        {
+            "current_user": user,
+            "serving_sessions": serving,
+            # PR-3 — pass-through for the Advanced section in the run-
+            # create form. tz_choices populates the timezone <select>.
+            "coverage_window_start_default": cov_cfg.get("COVERAGE_DEFAULT_WINDOW_START", "00:00"),
+            "coverage_window_end_default": cov_cfg.get("COVERAGE_DEFAULT_WINDOW_END", "24:00"),
+            "coverage_timezone_default": cov_cfg.get("COVERAGE_DEFAULT_TIMEZONE", "UTC"),
+            "coverage_timezone_choices": tz_spec.get("choices", ["UTC"]),
+        },
     )
 
 
