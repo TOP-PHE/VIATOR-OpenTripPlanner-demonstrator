@@ -108,6 +108,18 @@
 
 .cov-summary { display: flex; gap: 0.6rem; flex-wrap: wrap; padding: 0.5rem 0.7rem; background: #eef2f8; border-radius: 4px; margin-bottom: 0.6rem; font-size: 0.85rem; align-items: center; }
 .cov-summary > div { white-space: nowrap; }
+/* PR-190 — second-row subline under the existing run-meta strip. Shows
+   start timestamp, elapsed duration, and per-cell response_ms min/avg/
+   max so operators watching a long run can see "how long has it been
+   running" and "how fast is the runner" at a glance. Wraps under the
+   primary strip on narrow viewports; rendered only when stats exist. */
+.cov-summary-subline {
+  width: 100%; flex-basis: 100%;
+  margin-top: 0.15rem;
+  font-size: 0.78rem;
+  color: var(--rail-steel);
+  font-variant-numeric: tabular-nums;
+}
 /* v0.1.29 — view toggle. Three modes change what each cell displays.
    v0.1.29.5 — pinned dark text on inactive buttons. The previous rule
    only set a colour on .active (white on blue); the inactive state had
@@ -592,6 +604,62 @@ function buildFilterToggleHTML(run) {
   </label>`;
 }
 
+// PR-190 — duration formatter for the run-banner subline. Renders
+//   < 60s   → "42s"
+//   < 1h    → "5m12s"   (drop seconds when over the minute boundary
+//                        looks visually cleaner: "5m12s" not "5m12.4s")
+//   >= 1h   → "1h05m"   (zero-pad minutes so "1h5m" doesn't look like a typo)
+// Mirrored by tests in test_coverage_banner_run_stats.py so JS + Python
+// renderers stay in sync; if you change the rules update both.
+function fmtRunDuration(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${m}m${String(rem).padStart(2, '0')}s`;
+  }
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}h${String(m).padStart(2, '0')}m`;
+}
+
+// PR-190 — milliseconds → "0.4s" / "12.8s". One decimal so a 410ms cell
+// reads as "0.4s" rather than "0s"; mirrors the Python `_fmt_ms_to_s`
+// helper used in the export render path.
+function fmtMsToS(ms) {
+  if (ms === null || ms === undefined) return null;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// PR-190 — second-row banner subline. Renders nothing (empty string) on
+// pre-start runs and on runs where no cell has finished — the existing
+// primary strip stays unchanged, the subline simply doesn't appear.
+// "Started <ts> · <dur> · per-cell min X · avg Y · max Z".
+function buildRunStatsSubline(run) {
+  const parts = [];
+  // Start timestamp — strip the "T" and seconds, identical to the
+  // primary strip's depart_at formatting so the two lines line up
+  // visually for an operator scanning the banner.
+  if (run.started_at) {
+    parts.push(`Started ${escHTML(run.started_at.replace('T', ' ').slice(0, 16))}`);
+  }
+  const dur = fmtRunDuration(run.duration_seconds);
+  if (dur !== null) parts.push(escHTML(dur));
+  // All three per-cell stats are gated on the existence of at least one
+  // — avg is the most reliable indicator since min/max can be 0 on a
+  // single-cell run with response_ms=0.
+  if (run.response_ms_avg !== null && run.response_ms_avg !== undefined) {
+    const minS = fmtMsToS(run.response_ms_min);
+    const avgS = fmtMsToS(run.response_ms_avg);
+    const maxS = fmtMsToS(run.response_ms_max);
+    parts.push(`per-cell min ${escHTML(minS)} · avg ${escHTML(avgS)} · max ${escHTML(maxS)}`);
+  }
+  if (parts.length === 0) return '';
+  return `<div class="cov-summary-subline">${parts.join(' · ')}</div>`;
+}
+
 // PR-E — Sonar follow-up: the per-cell `inner` glyph for non-ok
 // statuses. Pulled out of buildMatrixCellTd so its status-chain
 // branching doesn't count against that function's cognitive
@@ -1030,6 +1098,7 @@ function renderRun(run) {
        href="/api/admin/network-coverage/runs/${escHTML(run.id)}/export.html"
        download
        title="Download a self-contained HTML report of this run. The file embeds every cell's full itinerary detail (legs, operators, train numbers) so it opens offline and you can share it by email.">⬇ Download HTML report</a>
+    ${buildRunStatsSubline(run)}
   </div>`;
 
   // Build the matrix. Rows = origin (read down), columns = destination.
