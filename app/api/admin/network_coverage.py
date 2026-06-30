@@ -825,6 +825,64 @@ def export_run_html(
     return response
 
 
+@router.post(
+    "/runs/{run_id}/stop",
+    responses={
+        404: {"description": _RUN_NOT_FOUND},
+        409: {
+            "description": (
+                "Run is not in 'running' state — stop is only meaningful for "
+                "in-flight runs. Terminal-state runs (completed / failed / "
+                "cancelled) return 409 unchanged."
+            )
+        },
+    },
+)
+def stop_run(
+    run_id: uuid.UUID,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> RunSummary:
+    """PR-1 — operator-driven cancel for an in-flight coverage run.
+
+    Today there's no way to abort a coverage matrix once started —
+    operators who realise a 33h run was queued by mistake have to wait
+    or bounce the worker container (which orphans the row without a
+    clean terminal state). This endpoint fires a cooperative cancel
+    signal that the runner checks between each pair; the worker exits
+    the per-pair loop cleanly, persists the cells already processed,
+    and flips the row to status='cancelled' with a `cancelled_by_operator`
+    marker on `summary`.
+
+    Returns the updated run summary (status will read 'running' on the
+    initial response — the runner observes the signal a beat later when
+    the next pair-check fires). The UI polls /runs/{id} every 5s so the
+    'cancelled' flip surfaces within one polling tick.
+
+    Status codes:
+      200 — signal accepted, runner is in-flight and will stop
+      404 — run id unknown
+      409 — run is not in 'running' state (terminal already, or never
+            started — POST /runs+the runner schedule are the only
+            transitions into 'running')
+    """
+    run = db.get(NetworkCoverageRun, run_id)
+    if run is None:
+        raise HTTPException(404, _RUN_NOT_FOUND)
+    if run.status != "running":
+        raise HTTPException(
+            409,
+            f"Run is in state {run.status!r} — stop is only valid for 'running' runs",
+        )
+    # Fire-and-forget — the runner's per-pair cooperative check picks
+    # this up between the in-flight pair's persist and the next pair's
+    # fetch_plan call. The DB write to status='cancelled' happens in the
+    # runner, NOT here, so the row's terminal-state guarantee holds
+    # (status='running' until the worker confirms it has stopped).
+    runner.request_cancel(run_id)
+    return _run_to_summary(run)
+
+
 @router.get(
     "/runs/{run_id}",
     responses={404: {"description": _RUN_NOT_FOUND}},

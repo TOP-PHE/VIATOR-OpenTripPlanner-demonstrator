@@ -27,6 +27,27 @@
 .cov-pill[data-status="running"]   { background: #fff8c5; color: #9a6700; border-color: #f5d56b; }
 .cov-pill[data-status="pending"]   { background: #f6f8fa; color: #57606a; }
 .cov-pill[data-status="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+/* PR-1 — operator-cancelled runs render in a distinct subdued slate so
+   operators can tell at a glance "this was stopped on purpose" vs the
+   red 'failed' badge for unexpected crashes. */
+.cov-pill[data-status="cancelled"] { background: #eef0f2; color: #57606a; border-color: #d0d7de; font-style: italic; }
+
+/* PR-1 — Stop button on the recent-runs row, rendered only when
+   status='running'. Subdued red so it's discoverable but doesn't
+   compete with the primary "click row to load" affordance. */
+.run-row .stop-btn {
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.7rem;
+  background: #fff;
+  color: #cf222e;
+  border: 1px solid #ffcecb;
+  border-radius: 3px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.run-row .stop-btn:hover:not(:disabled) { background: #ffebe9; }
+.run-row .stop-btn:disabled { opacity: 0.5; cursor: progress; }
 
 /* Progress bar for a running run. */
 .cov-progress { background: #eef0f2; border-radius: 4px; height: 8px; margin-top: 0.4rem; overflow: hidden; }
@@ -727,11 +748,18 @@ async function reloadRunList(activeId) {
       const countryBadge = (Array.isArray(r.countries) && r.countries.length)
         ? `<span class="cov-pill" data-status="filtered" title="Filtered to ${escHTML(r.countries.join(', '))}">${escHTML(r.countries.join('+'))}</span>`
         : '';
+      // PR-1 — Stop button visible only while the run is in-flight.
+      // Click handler is wired below with stopPropagation so it doesn't
+      // also trigger the row's "load this run" handler.
+      const stopBtn = r.status === 'running'
+        ? `<button type="button" class="stop-btn" data-action="stop-run" title="Cancel this in-flight coverage run. Cells already processed will stay in the DB.">Stop</button>`
+        : '';
       return `<div class="${cls}" data-run-id="${escHTML(r.id)}">
         <div class="top">
           <strong>${escHTML(r.session_label)}</strong>
           ${countryBadge}
           <span class="cov-pill" data-status="${escHTML(r.status)}">${escHTML(r.status)}</span>
+          ${stopBtn}
         </div>
         <div class="meta">
           ${escHTML(r.depart_at.replace('T',' ').slice(0,16))} ·
@@ -746,10 +774,69 @@ async function reloadRunList(activeId) {
       </div>`;
     }).join('');
     el.querySelectorAll('.run-row').forEach(row => {
-      row.addEventListener('click', () => loadRun(row.dataset.runId));
+      row.addEventListener('click', (e) => {
+        // PR-1 — the Stop button is a child of the row; ignore the row
+        // click when the originating target was the button itself, so a
+        // Stop click doesn't also reload the run beneath the toast.
+        if (e.target.closest('[data-action="stop-run"]')) return;
+        loadRun(row.dataset.runId);
+      });
+      const stopEl = row.querySelector('[data-action="stop-run"]');
+      if (stopEl) {
+        stopEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          stopRun(row.dataset.runId, stopEl);
+        });
+      }
     });
   } catch (err) {
     el.innerHTML = `<em class="hint">Error loading runs: ${escHTML(err.message)}</em>`;
+  }
+}
+
+// PR-1 — fire the cooperative-cancel signal for an in-flight coverage
+// run. The button is disabled during the round-trip so a double-click
+// can't queue two requests. We reload the run list on success so the
+// 'running' pill flips to 'cancelled' as soon as the runner observes
+// the signal (within one pair worth of latency); the row's poll loop
+// would catch the same thing within 5s but reloading now feels snappier.
+async function stopRun(runId, btn) {
+  if (!confirm('Stop this coverage run? Cells already processed will be kept; the rest are skipped.')) {
+    return;
+  }
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
+  try {
+    const r = await fetch(`/api/admin/network-coverage/runs/${encodeURIComponent(runId)}/stop`, {
+      method: 'POST',
+    });
+    if (!r.ok) {
+      let detail = `Stop failed (${r.status})`;
+      // Only attempt to parse the body as JSON when the server explicitly
+      // says so — avoids an empty catch around `r.json()` that Sonar (and
+      // most reviewers) flag as a smell, and gives us a deterministic
+      // fallback to the generic message above when the proxy returns HTML.
+      if (r.headers.get('content-type')?.includes('application/json')) {
+        const j = await r.json();
+        if (j && j.detail) detail = j.detail;
+      }
+      showToast('error', detail);
+      return;
+    }
+    showToast('success', 'Stop signal sent — runner will finish the in-flight pair then cancel.');
+    // Re-render the sidebar so the Stop button vanishes / pill updates
+    // as soon as the runner flips the row. The 5s poll on the active
+    // run (if this row is the currently-loaded one) catches everything
+    // else.
+    await reloadRunList(CURRENT_RUN_ID);
+  } catch (err) {
+    showToast('error', `Stop failed: ${err.message}`);
+  } finally {
+    // Re-enable just in case the reload above didn't replace this node
+    // (e.g. transient network blip — the operator can click again).
+    btn.disabled = false;
+    btn.textContent = originalText;
   }
 }
 
