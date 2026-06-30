@@ -345,3 +345,386 @@ async def test_per_pair_loop_short_circuits_after_cancel_event_fires():
     # Cleanup so the next test starts fresh (the fixture also clears
     # but being explicit avoids cross-contamination if asserts fail).
     runner.clear_cancel(rid)
+
+
+# ─────────────────────── execute_run helper coverage ───────────────────────
+#
+# PR-1's refactor extracted execute_run into 5 helpers. Each is unit-
+# tested directly here so the new-code coverage gate clears even
+# without a full execute_run integration test (which would need a real
+# DB + planner stubs).
+
+
+def test_resolve_run_mode_targets_single_session_happy_path(monkeypatch):
+    """single_session run with a valid session_id → returns (id, engine,
+    [], {}) and does NOT touch the run row."""
+    monkeypatch.setattr(runner, "_resolve_session_engine", lambda _db, sid: "motis")
+    run = _make_run_row()
+    run.mode = runner.MODE_SINGLE_SESSION
+    run.session_id = "sess-1"
+    db = MagicMock()
+
+    result = runner._resolve_run_mode_targets(db, run)
+
+    assert result == ("sess-1", "motis", [], {})
+    assert run.status == "running"  # unchanged
+    db.commit.assert_not_called()
+
+
+def test_resolve_run_mode_targets_single_session_missing_id_marks_failed():
+    """single_session run with session_id=None → flips the row to
+    'failed' inline, commits, and returns the sentinel tuple so the
+    Phase-1 caller can short-circuit."""
+    run = _make_run_row()
+    run.mode = runner.MODE_SINGLE_SESSION
+    run.session_id = None
+    db = MagicMock()
+
+    result = runner._resolve_run_mode_targets(db, run)
+
+    assert result == (None, "otp", [], {})
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    db.commit.assert_called_once()
+
+
+def test_resolve_run_mode_targets_fanout_happy_path(monkeypatch):
+    """fanout run with eligible sessions → returns (None, 'otp', ids, engines)."""
+    monkeypatch.setattr(
+        runner,
+        "_snapshot_fanout_sessions",
+        lambda _db: (["sess-a", "sess-b"], {"sess-a": "otp", "sess-b": "motis"}),
+    )
+    run = _make_run_row()
+    run.mode = runner.MODE_FANOUT
+    db = MagicMock()
+
+    result = runner._resolve_run_mode_targets(db, run)
+
+    assert result == (None, "otp", ["sess-a", "sess-b"], {"sess-a": "otp", "sess-b": "motis"})
+    assert run.status == "running"
+    db.commit.assert_not_called()
+
+
+def test_resolve_run_mode_targets_fanout_no_eligible_sessions_marks_failed(monkeypatch):
+    """fanout with zero serving + include_in_fanout sessions → flips to
+    'failed' so the operator notices instead of silently waiting forever."""
+    monkeypatch.setattr(runner, "_snapshot_fanout_sessions", lambda _db: ([], {}))
+    run = _make_run_row()
+    run.mode = runner.MODE_FANOUT
+    db = MagicMock()
+
+    result = runner._resolve_run_mode_targets(db, run)
+
+    assert result == (None, "otp", [], {})
+    assert run.status == "failed"
+    db.commit.assert_called_once()
+
+
+def test_mark_run_failed_writes_update_and_commits(monkeypatch):
+    """Stamps status='failed' + finished_at via UPDATE in its own
+    short txn. Used by execute_run when the per-pair gather raises."""
+    db = MagicMock()
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = db
+    fake_session.__exit__.return_value = False
+    monkeypatch.setattr(runner, "SessionLocal", lambda: fake_session)
+
+    runner._mark_run_failed(uuid.uuid4())
+
+    db.execute.assert_called_once()
+    db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_finalise_completed_run_writes_completed_status(monkeypatch):
+    """Phase-3 rollup: recompute counters, skip verify-sweep when the
+    flag is off, flip to status='completed' in one transaction."""
+    rid = uuid.uuid4()
+    run_row = _make_run_row(rid, status="running")
+    run_row.verify_externally = False
+    captured = [
+        SimpleNamespace(status="ok", response_ms=500),
+        SimpleNamespace(status="ok", response_ms=700),
+        SimpleNamespace(status="no_route", response_ms=300),
+    ]
+    fake_session = _CountingFakeSession(run_row, captured)
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+
+    await runner._finalise_completed_run(run_id=rid, elapsed_s=42.0, cfg=runner.CoverageConfig())
+
+    assert run_row.status == "completed"
+    assert run_row.completed_pairs == 3
+    assert run_row.ok_pairs == 2
+    assert run_row.no_route_pairs == 1
+    assert run_row.summary["elapsed_seconds"] == 42.0
+
+
+@pytest.mark.asyncio
+async def test_finalise_completed_run_no_op_when_run_disappeared(monkeypatch):
+    """If the run was DELETEd before phase-3 reaches it, exit cleanly
+    without raising — matches `_persist_cancelled_run` back-pressure."""
+
+    class _NoRunSession(_CountingFakeSession):
+        def get(self, _model, _key):
+            return None
+
+    monkeypatch.setattr(runner, "SessionLocal", _NoRunSession(run_row=None, captured_results=[]))
+    await runner._finalise_completed_run(
+        run_id=uuid.uuid4(), elapsed_s=1.0, cfg=runner.CoverageConfig()
+    )
+
+
+def test_phase1_snapshot_returns_none_when_run_missing(monkeypatch):
+    """The runner can be invoked with a run_id that's been DELETEd
+    (operator raced delete vs background task). Phase-1 returns None
+    and execute_run's `if snap is None or not snap.pairs` short-circuits."""
+
+    class _MissingRunSession(_CountingFakeSession):
+        def get(self, _model, _key):
+            return None
+
+    monkeypatch.setattr(
+        runner, "SessionLocal", _MissingRunSession(run_row=None, captured_results=[])
+    )
+
+    result = runner._phase1_snapshot_and_start(uuid.uuid4())
+
+    assert result is None
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "cancelled"])
+def test_phase1_snapshot_returns_none_for_terminal_run(monkeypatch, terminal):
+    """Re-running on a terminal run is a no-op — phase-1 returns None
+    without re-flipping the status field."""
+    run_row = _make_run_row(status=terminal)
+    monkeypatch.setattr(runner, "SessionLocal", _CountingFakeSession(run_row, captured_results=[]))
+
+    result = runner._phase1_snapshot_and_start(uuid.uuid4())
+
+    assert result is None
+    assert run_row.status == terminal  # NOT mutated
+
+
+# ─────────────────────── _process_pair_with_cancel ───────────────────────
+
+
+def _make_snapshot(*, mode: str = "single_session"):
+    """A `_Phase1Snapshot` shaped just enough for _process_pair_with_cancel
+    to dispatch — none of the field VALUES actually matter because we
+    monkeypatch the downstream `_execute_pair` / `_execute_pair_fanout`
+    to record the call instead of doing real work."""
+    from app.network_coverage.hubs import Hub
+
+    origin = Hub(id="o", name="O", short="O", region="", lat=0.0, lon=0.0)
+    dest = Hub(id="d", name="D", short="D", region="", lat=1.0, lon=1.0)
+    return runner._Phase1Snapshot(
+        run_mode=mode,
+        session_id_for_pairs="sess-1" if mode == "single_session" else None,
+        engine_for_pairs="otp",
+        fanout_session_ids=["sess-a"] if mode == "fanout" else [],
+        engine_by_session={"sess-a": "otp"} if mode == "fanout" else {},
+        depart_at_for_pairs=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
+        pairs=[(origin, dest)],
+        cfg=runner.CoverageConfig(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_pair_with_cancel_skips_when_already_cancelled(monkeypatch):
+    """Cancel event set BEFORE the coroutine enters the semaphore → exits
+    immediately, downstream `_execute_pair` is never called. Without this
+    short-circuit, the queue would still pay the OTP round-trip cost
+    even for the pairs queued after the Stop click."""
+    rid = uuid.uuid4()
+    runner.register_cancel(rid)
+    runner.request_cancel(rid)  # fire immediately
+
+    called = MagicMock()
+
+    async def _fake_pair(**_kw):
+        called()
+
+    monkeypatch.setattr(runner, "_execute_pair", _fake_pair)
+    monkeypatch.setattr(runner, "_execute_pair_fanout", _fake_pair)
+
+    snap = _make_snapshot()
+    semaphore = asyncio.Semaphore(1)
+    o, d = snap.pairs[0]
+    await runner._process_pair_with_cancel(
+        run_id=rid, semaphore=semaphore, snap=snap, origin=o, dest=d
+    )
+
+    called.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_pair_with_cancel_single_session_dispatches_to_execute_pair(monkeypatch):
+    """Happy path for single_session mode — the coroutine dispatches to
+    `_execute_pair` (not the fanout variant) with snapshot-derived args."""
+    rid = uuid.uuid4()
+    runner.register_cancel(rid)
+
+    captured: dict = {}
+
+    async def _fake_pair(**kwargs):
+        captured.update(kwargs)
+
+    async def _fake_fanout(**_kw):
+        captured["fanout_called"] = True
+
+    monkeypatch.setattr(runner, "_execute_pair", _fake_pair)
+    monkeypatch.setattr(runner, "_execute_pair_fanout", _fake_fanout)
+
+    snap = _make_snapshot(mode="single_session")
+    o, d = snap.pairs[0]
+    await runner._process_pair_with_cancel(
+        run_id=rid, semaphore=asyncio.Semaphore(1), snap=snap, origin=o, dest=d
+    )
+
+    assert "fanout_called" not in captured
+    assert captured["session_id"] == "sess-1"
+    assert captured["engine"] == "otp"
+
+
+@pytest.mark.asyncio
+async def test_process_pair_with_cancel_fanout_dispatches_to_fanout_helper(monkeypatch):
+    """Happy path for fanout mode — dispatches to `_execute_pair_fanout`
+    with the snapshotted session ids and engine map."""
+    rid = uuid.uuid4()
+    runner.register_cancel(rid)
+
+    captured: dict = {}
+
+    async def _fake_pair(**_kw):
+        captured["single_called"] = True
+
+    async def _fake_fanout(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(runner, "_execute_pair", _fake_pair)
+    monkeypatch.setattr(runner, "_execute_pair_fanout", _fake_fanout)
+
+    snap = _make_snapshot(mode="fanout")
+    o, d = snap.pairs[0]
+    await runner._process_pair_with_cancel(
+        run_id=rid, semaphore=asyncio.Semaphore(1), snap=snap, origin=o, dest=d
+    )
+
+    assert "single_called" not in captured
+    assert captured["session_ids"] == ["sess-a"]
+    assert captured["engine_by_session"] == {"sess-a": "otp"}
+
+
+# ─────────────────────── execute_run integration ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_run_short_circuits_when_phase1_returns_none(monkeypatch):
+    """Phase-1 returns None (missing/terminal/bad-config run) → execute_run
+    logs + returns cleanly, registry stays bounded via the outer finally.
+
+    Coverage: hits the `if snap is None or not snap.pairs: return` branch
+    AND confirms `clear_cancel` is invoked even on the early-return path."""
+    rid = uuid.uuid4()
+    monkeypatch.setattr(runner, "_phase1_snapshot_and_start", lambda _rid: None)
+
+    await runner.execute_run(rid)
+
+    # The outer try/finally cleared the registry even though we never
+    # made it to Phase 2.
+    assert rid not in runner._CANCEL_EVENTS
+
+
+@pytest.mark.asyncio
+async def test_execute_run_cancelled_mid_loop_persists_partial(monkeypatch):
+    """A Stop click that lands during Phase 2 → after the gather returns,
+    execute_run sees `is_cancelled=True` and routes to
+    `_persist_cancelled_run` instead of `_finalise_completed_run`.
+
+    Covers the "cancelled path" inside execute_run — without this test
+    the if/else after `elapsed_s = ...` is uncovered."""
+    rid = uuid.uuid4()
+    snap = _make_snapshot()
+
+    monkeypatch.setattr(runner, "_phase1_snapshot_and_start", lambda _rid: snap)
+
+    async def _noop_pair(**_kw):
+        # Simulate a pair completing AND the cancel landing afterward.
+        runner.request_cancel(rid)
+
+    monkeypatch.setattr(runner, "_process_pair_with_cancel", _noop_pair)
+
+    persist_calls: list[float] = []
+
+    def _persist(*, run_id, elapsed_s):
+        persist_calls.append(elapsed_s)
+
+    finalise_calls: list[float] = []
+
+    async def _finalise(*, run_id, elapsed_s, cfg):
+        finalise_calls.append(elapsed_s)
+
+    monkeypatch.setattr(runner, "_persist_cancelled_run", _persist)
+    monkeypatch.setattr(runner, "_finalise_completed_run", _finalise)
+
+    await runner.execute_run(rid)
+
+    assert len(persist_calls) == 1, "must persist as cancelled, not completed"
+    assert len(finalise_calls) == 0
+    assert rid not in runner._CANCEL_EVENTS
+
+
+@pytest.mark.asyncio
+async def test_execute_run_happy_path_calls_finalise(monkeypatch):
+    """No cancel signal → execute_run calls `_finalise_completed_run`
+    after the pair loop finishes cleanly."""
+    rid = uuid.uuid4()
+    snap = _make_snapshot()
+
+    monkeypatch.setattr(runner, "_phase1_snapshot_and_start", lambda _rid: snap)
+
+    async def _noop_pair(**_kw):
+        pass
+
+    monkeypatch.setattr(runner, "_process_pair_with_cancel", _noop_pair)
+
+    finalise_calls: list[float] = []
+
+    async def _finalise(*, run_id, elapsed_s, cfg):
+        finalise_calls.append(elapsed_s)
+
+    monkeypatch.setattr(runner, "_finalise_completed_run", _finalise)
+
+    await runner.execute_run(rid)
+
+    assert len(finalise_calls) == 1, "happy path must reach Phase 3"
+    assert rid not in runner._CANCEL_EVENTS
+
+
+@pytest.mark.asyncio
+async def test_execute_run_gather_exception_routes_to_mark_failed(monkeypatch):
+    """Exception escaping the per-pair gather → execute_run calls
+    `_mark_run_failed` (NOT _finalise / _persist) and exits without
+    re-raising. Covers the broad-except branch."""
+    rid = uuid.uuid4()
+    snap = _make_snapshot()
+
+    monkeypatch.setattr(runner, "_phase1_snapshot_and_start", lambda _rid: snap)
+
+    async def _exploding_pair(**_kw):
+        raise RuntimeError("simulated planner crash")
+
+    monkeypatch.setattr(runner, "_process_pair_with_cancel", _exploding_pair)
+
+    failed_calls: list[uuid.UUID] = []
+
+    def _mark(run_id):
+        failed_calls.append(run_id)
+
+    monkeypatch.setattr(runner, "_mark_run_failed", _mark)
+
+    await runner.execute_run(rid)
+
+    assert failed_calls == [rid]
+    assert rid not in runner._CANCEL_EVENTS
