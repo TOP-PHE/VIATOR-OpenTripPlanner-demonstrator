@@ -82,9 +82,11 @@ def test_comparison_grid_appears_in_innerhtml_template(template_text: str):
     """The innerHTML template literal must interpolate the grid into the
     output, otherwise the grid is built but never shown."""
     # Quick check: somewhere after `el.innerHTML = ` the literal must
-    # reference `${comparisonGrid}`. Not pinning exact position, just
-    # presence — the v0.1.41 federated section did the same.
-    assert "${comparisonGrid}" in template_text
+    # reference the comparison-grid slot. PR-194 introduced the
+    # `comparisonGridSlot` indirection (so the side-by-side fork can
+    # blank the slot when it owns the layout) — either name is OK as
+    # long as the grid is woven into the innerHTML somewhere.
+    assert "${comparisonGrid}" in template_text or "${comparisonGridSlot}" in template_text
 
 
 def test_comparison_grid_css_present(template_text: str):
@@ -175,3 +177,65 @@ def test_coverage_tooltip_icons_present_for_both_engines(template_text: str):
     # Both engines have a tooltip string in their data-tooltip attr:
     assert "Swiss OJP covers:" in template_text
     assert "ÖBB HAFAS covers:" in template_text
+
+
+# ───────────────────────────── PR-194 ─────────────────────────────────
+# Trip-wire tests for the two journey-search UI changes bundled in PR-194:
+# (1) honest labels on the trains-only toggle, and (2) opt-in side-by-side
+# comparison columns. Pure template-string assertions — no rendering or
+# JS execution, just pin the strings the operator + the JS handlers
+# depend on so a careless refactor that deletes one is caught at CI.
+
+
+def test_pr194_honest_label_replaces_trains_only(template_text: str):
+    """The 'Compare trains only' label was misleading — the underlying
+    filter only skipped WALK legs and kept bus/tram/coach. PR-194
+    renames it to 'Compare excluding walk legs' so the UI string
+    matches what the code does."""
+    assert "Compare excluding walk legs" in template_text
+    # The old misleading label must NOT survive — operators saw
+    # bus-included results under a 'trains only' header for months.
+    assert "Compare trains only" not in template_text
+
+
+def test_pr194_rail_duration_label_renamed_to_transit(template_text: str):
+    """Inside the comparison cell the per-itinerary duration label
+    was 'X rail' (summed all non-walk legs, not just rail). Renamed
+    to 'X transit' so the displayed quantity matches the function
+    that computes it."""
+    # Belt-and-braces: the literal `rail · ${dur(` substring is what
+    # used to render in the cell — it should be gone.
+    assert "rail · ${dur(bestRow.duration_seconds)} total" not in template_text
+    assert "transit · ${dur(bestRow.duration_seconds)} total" in template_text
+
+
+def test_pr194_side_by_side_checkbox_present(template_text: str):
+    """The opt-in toggle for the new N-column layout must be rendered
+    in the form. id is the contract between the JS init hook and the
+    label hook, so both the user-visible label AND the id are pinned."""
+    assert "Side-by-side comparison" in template_text
+    assert 'id="compare-side-by-side"' in template_text
+
+
+def test_pr194_side_by_side_wired_to_render(template_text: str):
+    """The checkbox's change handler must persist the new state to
+    localStorage AND call render(_LAST_PAYLOAD) so the layout flips
+    without re-fetching. The fork point in render() must read the
+    `_shouldRenderSideBySide` predicate."""
+    assert "_COMPARE_SIDE_BY_SIDE" in template_text
+    assert "_shouldRenderSideBySide" in template_text
+    assert "renderSideBySideGrid" in template_text
+    assert "viator.compareSideBySide" in template_text  # localStorage key
+
+
+def test_pr194_side_by_side_grid_css_present(template_text: str):
+    """CSS for the side-by-side column grid must be defined — without
+    it the columns wrap, the empty-column placeholder is unstyled,
+    and the per-source pill accent colours fall back to grey."""
+    assert "compare-grid-refs" in template_text
+    # Per-source pill accents (new in PR-194):
+    assert ".engine-pill.viator" in template_text
+    assert ".engine-pill.ojp" in template_text
+    assert ".engine-pill.hafas" in template_text
+    # CSS variable that scales the grid to N columns:
+    assert "--compare-cols" in template_text
