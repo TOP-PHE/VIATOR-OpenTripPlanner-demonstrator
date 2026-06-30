@@ -896,3 +896,81 @@ def test_create_run_countries_filter_with_no_matches_raises(monkeypatch):
             depart_at=datetime(2026, 7, 1, 8, 0),
             countries=["XX"],
         )
+
+
+# ─────────────────── tiny utility helpers ───────────────────
+
+
+def test_parse_hhmm_end_of_day_sentinel():
+    """'24:00' is the special end-of-day sentinel — must return (1440,
+    True) so the runner can detect "midnight next day" semantics that
+    Postgres TIME can't natively store."""
+    minutes, is_eod = runner._parse_hhmm("24:00", "00:00")
+    assert minutes == 24 * 60
+    assert is_eod is True
+
+
+def test_parse_hhmm_invalid_falls_back_to_default():
+    """Bogus value with a valid default → re-parses the default. Defence
+    in depth — the API layer normally catches this, but if a malformed
+    row sneaks through (manual DB edit, migration glitch), the runner
+    stays alive."""
+    minutes, is_eod = runner._parse_hhmm("not-a-time", "06:00")
+    assert minutes == 6 * 60
+    assert is_eod is False
+
+
+def test_parse_hhmm_invalid_with_same_default_falls_back_to_zero():
+    """Bogus value AND bogus default → return (0, False) rather than
+    infinite-recursing. The last-line-of-defence path."""
+    minutes, is_eod = runner._parse_hhmm("nope", "nope")
+    assert minutes == 0
+    assert is_eod is False
+
+
+def test_parse_hhmm_out_of_range_falls_back_to_default():
+    """'25:00' fails the 0-23 hour check → falls through to default."""
+    minutes, _is_eod = runner._parse_hhmm("25:00", "08:00")
+    assert minutes == 8 * 60
+
+
+def test_normalise_stop_id_strips_otp_feed_prefix():
+    """OTP form `<feed>:<local>` → returns the local portion. Matches
+    MOTIS's equivalent stop so cross-engine dedup collapses them."""
+    assert runner._normalise_stop_id("SBB:Parent8501120") == "Parent8501120"
+
+
+def test_normalise_stop_id_strips_motis_feed_prefix():
+    """MOTIS form `<feed>_<local>` → returns the local portion."""
+    assert runner._normalise_stop_id("sbb_8501120") == "8501120"
+
+
+def test_normalise_stop_id_empty_or_none_returns_empty_string():
+    """Missing / falsy input → "" so the dedup tuple stays a plain string
+    and never accidentally introduces a None in the key."""
+    assert runner._normalise_stop_id(None) == ""
+    assert runner._normalise_stop_id("") == ""
+
+
+def test_normalise_stop_id_no_separator_returns_unchanged():
+    """A bare local id with no feed prefix passes through unchanged."""
+    assert runner._normalise_stop_id("8501120") == "8501120"
+
+
+def test_truncate_iso_to_minute_drops_seconds():
+    """Standard happy path — `:SS+00:00` chopped to minute precision so
+    boundary timestamps from adjacent slots dedup despite second-level
+    jitter from RAPTOR's per-call rounding."""
+    assert runner._truncate_iso_to_minute("2026-07-01T08:00:42+00:00") == "2026-07-01T08:00+0000"
+
+
+def test_truncate_iso_to_minute_missing_T_passes_through():
+    """No "T" separator → return as-is. Operator-malformed input
+    shouldn't crash the dedup."""
+    assert runner._truncate_iso_to_minute("not-a-timestamp") == "not-a-timestamp"
+    assert runner._truncate_iso_to_minute("") == ""
+
+
+def test_truncate_iso_to_minute_unparseable_passes_through():
+    """Has a "T" but isoformat parse fails → defensive return as-is."""
+    assert runner._truncate_iso_to_minute("2026-13-99T99:99:99") == "2026-13-99T99:99:99"
