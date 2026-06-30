@@ -509,6 +509,30 @@ function setupAutocomplete(prefix) {
 setupAutocomplete('from');
 setupAutocomplete('to');
 
+// PR-194 — module-level state for the side-by-side comparison toggle.
+// MUST be declared before the wireSideBySideToggle IIFE below: that
+// IIFE reads both bindings synchronously at module evaluation, and
+// `let`/`const` stay in their temporal dead zone until the declaration
+// line is reached. Hoisting the declarations here avoids a
+// ReferenceError that would abort the rest of the <script> and leave
+// the journey-form submit handler unregistered — symptom on
+// v0.1.43.25 was: click "Search" → page reloads with empty inputs,
+// no fetch dispatched.
+//
+// State is read from localStorage at module-load so the operator's
+// last choice survives a full page reload. The same key is written
+// back from the checkbox change handler below.
+const _SIDE_BY_SIDE_STORAGE_KEY = 'viator.compareSideBySide';
+let _COMPARE_SIDE_BY_SIDE = (function () {
+  try {
+    return window.localStorage.getItem(_SIDE_BY_SIDE_STORAGE_KEY) === '1';
+  } catch (_e) {
+    // localStorage can throw in private-browsing or sandboxed iframes;
+    // default to OFF and keep going.
+    return false;
+  }
+})();
+
 // PR-194 — wire the side-by-side comparison checkbox. Init state from
 // the module-level `_COMPARE_SIDE_BY_SIDE` (read from localStorage at
 // module load). On change we persist to localStorage AND re-render the
@@ -1214,19 +1238,10 @@ function renderComparisonGrid(payload) {
 // results instead of stacked below them. Default OFF preserves the
 // existing layout for every workspace that hasn't opted in.
 //
-// State is read from localStorage at module-load so the operator's
-// last choice survives a full page reload. The same key is written
-// back from the change handler at the bottom of `render()`.
-const _SIDE_BY_SIDE_STORAGE_KEY = 'viator.compareSideBySide';
-let _COMPARE_SIDE_BY_SIDE = (function () {
-  try {
-    return window.localStorage.getItem(_SIDE_BY_SIDE_STORAGE_KEY) === '1';
-  } catch (_e) {
-    // localStorage can throw in private-browsing or sandboxed iframes;
-    // default to OFF and keep going.
-    return false;
-  }
-})();
+// `_SIDE_BY_SIDE_STORAGE_KEY` + `_COMPARE_SIDE_BY_SIDE` are declared
+// near `setupAutocomplete('to')` above — they need to be initialised
+// BEFORE the wireSideBySideToggle IIFE that consumes them. See the
+// hoist comment near the declarations for the TDZ rationale.
 
 function _refColumnDescriptors(payload) {
   // List of reference-engine column descriptors that should appear in
