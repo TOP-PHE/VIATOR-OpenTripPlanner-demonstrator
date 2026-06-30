@@ -323,8 +323,12 @@ def _normalise_section(
     if not dep or not arr:
         return None
 
-    dep_loc = locations.get(dep.get("locX")) if isinstance(dep.get("locX"), int) else None
-    arr_loc = locations.get(arr.get("locX")) if isinstance(arr.get("locX"), int) else None
+    # Extract locX once so mypy can narrow through isinstance — calling
+    # dep.get("locX") twice returns Any|None each time, defeating the narrow.
+    dep_locx = dep.get("locX")
+    arr_locx = arr.get("locX")
+    dep_loc = locations.get(dep_locx) if isinstance(dep_locx, int) else None
+    arr_loc = locations.get(arr_locx) if isinstance(arr_locx, int) else None
     dep_loc = dep_loc or {}
     arr_loc = arr_loc or {}
 
