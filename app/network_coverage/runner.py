@@ -162,6 +162,71 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
     )
 
 
+# ─────────────────────── cooperative-cancel registry ───────────────────────
+#
+# PR-1 — Stop button. Each in-flight `execute_run` registers an
+# `asyncio.Event` keyed by run_id in `_CANCEL_EVENTS`. The
+# POST /runs/{id}/stop endpoint sets that event; the per-pair loop checks
+# it before each pair and exits cleanly when set. Cells that already
+# processed before the click stay in the DB — partial results are
+# valuable. The endpoint NEVER touches `network_coverage_runs.status`
+# directly; that write happens in `execute_run`'s post-loop branch once
+# the runner has observed the signal, so the DB row's terminal-state
+# guarantee (status='running' until the worker says otherwise) holds.
+#
+# Module-level dict because:
+#  - FastAPI BackgroundTasks runs in the same process as the API,
+#  - all coverage runs are single-process (no celery / no multi-worker
+#    scheduling for this feature),
+#  - swapping in a Redis-backed signal later is a one-helper change if
+#    we ever go multi-process.
+_CANCEL_EVENTS: dict[uuid.UUID, asyncio.Event] = {}
+
+
+def register_cancel(run_id: uuid.UUID) -> asyncio.Event:
+    """Register (or reuse) the cancel event for `run_id`.
+
+    Idempotent: if a previous registration is still present (e.g. the
+    worker died and is being relaunched on the same run id — unlikely
+    in practice but defensive), the existing event is returned so a
+    Stop click in the meantime still fires for the new worker."""
+    ev = _CANCEL_EVENTS.get(run_id)
+    if ev is None:
+        ev = asyncio.Event()
+        _CANCEL_EVENTS[run_id] = ev
+    return ev
+
+
+def clear_cancel(run_id: uuid.UUID) -> None:
+    """Drop the cancel event from the registry. Safe to call multiple
+    times — used in `execute_run`'s `finally` to keep the dict bounded."""
+    _CANCEL_EVENTS.pop(run_id, None)
+
+
+def is_cancelled(run_id: uuid.UUID) -> bool:
+    """True when the cancel event for `run_id` is set. Cheap O(1) dict
+    lookup — called from inside the per-pair hot loop."""
+    ev = _CANCEL_EVENTS.get(run_id)
+    return ev is not None and ev.is_set()
+
+
+def request_cancel(run_id: uuid.UUID) -> bool:
+    """Public entry point for the POST /stop endpoint. Returns True when
+    a live cancel event was found and set, False when no event was
+    registered (i.e. the run isn't actually being processed in this
+    worker — caller should re-check the DB row state and 409 if needed).
+
+    Does NOT flip `status='cancelled'` on the row — that's the runner's
+    job once it has observed the signal and finished the in-flight
+    write, so we don't end up with status='cancelled' but the runner
+    still mid-pair persisting a fresh row."""
+    ev = _CANCEL_EVENTS.get(run_id)
+    if ev is None:
+        return False
+    ev.set()
+    return True
+
+
 def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
     """v0.1.31 — read the active hub list from `network_coverage_hubs`.
 
@@ -355,151 +420,222 @@ def _snapshot_fanout_sessions(db: DbSession) -> tuple[list[str], dict[str, str]]
     )
 
 
-async def execute_run(run_id: uuid.UUID) -> None:
-    """Drive a pending coverage run to completion.
+@dataclass(frozen=True)
+class _Phase1Snapshot:
+    """Frozen result of Phase-1 setup: everything the per-pair loop needs.
 
-    Designed to be called from a FastAPI BackgroundTask. Manages its own
-    DB session lifecycle so the request's transaction can commit + return
-    immediately. Idempotent in the loose sense: re-running on a completed
-    run is a no-op.
+    Extracted from `execute_run` so the outer function stays under Sonar's
+    cognitive-complexity ceiling. Per-pair execution reads everything it
+    needs from this snapshot (no further DB lookups during Phase 2).
     """
-    log.info("network-coverage run %s starting", run_id)
-    started = time.monotonic()
-    pairs: list[tuple[Hub, Hub]] = []
-    session_id_for_pairs: str | None = None
-    depart_at_for_pairs: datetime | None = None
-    run_mode: str = MODE_SINGLE_SESSION
-    fanout_session_ids: list[str] = []
-    # P1 MOTIS — engine snapshot read once at Phase 1 (alongside the session
-    # ids). Per-pair helpers consult this instead of doing a DB lookup per
-    # fetch_plan call. Single_session mode populates `engine_for_pairs`;
-    # fanout mode populates `engine_by_session`.
-    engine_for_pairs: str = "otp"
-    engine_by_session: dict[str, str] = {}
-    # PR-2 — snapshot the seven operator-tunable knobs from platform_config
-    # at run start and freeze them for the duration. See CoverageConfig.
-    cfg: CoverageConfig = CoverageConfig()
 
-    # Phase 1: snapshot the run inputs and flip to "running" in a short txn.
+    run_mode: str
+    session_id_for_pairs: str | None
+    engine_for_pairs: str
+    fanout_session_ids: list[str]
+    engine_by_session: dict[str, str]
+    depart_at_for_pairs: datetime
+    pairs: list[tuple[Hub, Hub]]
+    cfg: CoverageConfig
+
+
+def _resolve_run_mode_targets(
+    db: DbSession, run: NetworkCoverageRun
+) -> tuple[str | None, str, list[str], dict[str, str]]:
+    """Resolve the session(s) and engine(s) the runner will call into.
+
+    Mutates `run.status='failed'` (and stamps `finished_at`, commits) when
+    the run's mode is unsatisfiable so the outer Phase-1 helper can short-
+    circuit cleanly. Returns
+    (session_id_for_pairs, engine_for_pairs, fanout_session_ids, engine_by_session)
+    — single_session populates the first two, fanout the last two.
+    """
+    if run.mode == MODE_SINGLE_SESSION:
+        if run.session_id is None:
+            log.warning("run %s mode=single_session has no session_id — aborting", run.id)
+            run.status = "failed"
+            run.finished_at = datetime.now(UTC)
+            db.commit()
+            return (None, "otp", [], {})
+        return (run.session_id, _resolve_session_engine(db, run.session_id), [], {})
+    fanout_ids, engines = _snapshot_fanout_sessions(db)
+    if not fanout_ids:
+        log.warning(
+            "run %s mode=fanout has no serving fanout-enabled sessions — aborting",
+            run.id,
+        )
+        run.status = "failed"
+        run.finished_at = datetime.now(UTC)
+        db.commit()
+        return (None, "otp", [], {})
+    return (None, "otp", fanout_ids, engines)
+
+
+def _phase1_snapshot_and_start(run_id: uuid.UUID) -> _Phase1Snapshot | None:
+    """Phase-1 of `execute_run` — validate the run, flip to running, snapshot
+    the inputs the per-pair loop needs (incl. the frozen CoverageConfig).
+
+    Returns None when the run is unprocessable (missing, already terminal,
+    single_session-with-no-session_id, fanout-with-no-eligible-sessions).
+    The caller's `finally` will still drop the cancel-event registration.
+
+    v0.1.31 — hubs are re-read at execute time (not snapshotted at
+    create_run), so operators who edit the hub list between create and
+    execute see results consistent with the live matrix UI.
+    """
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
             log.warning("network-coverage run %s not found — aborting", run_id)
-            return
+            return None
         if run.status not in ("pending", "running"):
             log.info(
                 "network-coverage run %s already in terminal state %s — skipping",
                 run_id,
                 run.status,
             )
-            return
+            return None
         run.status = "running"
         run.started_at = datetime.now(UTC)
         db.commit()
-        # Freeze the tunables NOW — see CoverageConfig docstring for why
-        # editing /admin/config mid-run must not perturb the in-flight job.
+        # PR-2 — freeze the tunables NOW. Editing /admin/config mid-run
+        # must not perturb the in-flight job.
         cfg = _load_coverage_config(db)
-        run_mode = run.mode
-        if run_mode == MODE_SINGLE_SESSION:
-            if run.session_id is None:
-                log.warning("run %s mode=single_session has no session_id — aborting", run_id)
-                run.status = "failed"
-                run.finished_at = datetime.now(UTC)
-                db.commit()
-                return
-            session_id_for_pairs = run.session_id
-            engine_for_pairs = _resolve_session_engine(db, run.session_id)
-        else:
-            # Fanout — snapshot the eligible sessions (and their engines)
-            # NOW; per-pair execution uses these without further DB lookups.
-            fanout_session_ids, engine_by_session = _snapshot_fanout_sessions(db)
-            if not fanout_session_ids:
-                log.warning(
-                    "run %s mode=fanout has no serving fanout-enabled sessions — aborting",
-                    run_id,
-                )
-                run.status = "failed"
-                run.finished_at = datetime.now(UTC)
-                db.commit()
-                return
-        depart_at_for_pairs = run.depart_at
-        # v0.1.31 — re-read active hubs from the DB at execute time.
-        # We don't snapshot at create_run because the operator might
-        # edit the hub list between create and execute (rare but
-        # possible if the run was queued and processed minutes later);
-        # using the latest active set keeps results consistent with
-        # whatever the matrix UI is currently showing. total_pairs in
-        # the run row was set at create time; if the operator edited
-        # hubs in the meantime the actual count may differ — the
-        # runner's per-pair counter handles divergence gracefully.
+        session_id_for_pairs, engine_for_pairs, fanout_session_ids, engine_by_session = (
+            _resolve_run_mode_targets(db, run)
+        )
+        if run.status == "failed":
+            return None
         hubs_now = _load_active_hubs(db)
         pairs = _hub_pairs(hubs_now, run.direction)
-
-    if not pairs or depart_at_for_pairs is None:
-        log.error("run %s has no pairs to execute", run_id)
-        return
-
-    # Phase 2: process pairs with bounded concurrency. Each pair gets
-    # its own short-lived DB session — no transaction stays open
-    # across the network call to OTP.
-    semaphore = asyncio.Semaphore(cfg.pair_parallelism)
-
-    async def _one_pair(origin: Hub, dest: Hub) -> None:
-        async with semaphore:
-            if run_mode == MODE_FANOUT:
-                await _execute_pair_fanout(
-                    run_id=run_id,
-                    session_ids=fanout_session_ids,
-                    engine_by_session=engine_by_session,
-                    origin=origin,
-                    dest=dest,
-                    depart_at=depart_at_for_pairs,
-                    cfg=cfg,
-                )
-            else:
-                assert session_id_for_pairs is not None  # narrowed at Phase 1
-                await _execute_pair(
-                    run_id=run_id,
-                    session_id=session_id_for_pairs,
-                    engine=engine_for_pairs,
-                    origin=origin,
-                    dest=dest,
-                    depart_at=depart_at_for_pairs,
-                    cfg=cfg,
-                )
-
-    try:
-        await asyncio.gather(
-            *(_one_pair(o, d) for o, d in pairs),
-            return_exceptions=False,
+        return _Phase1Snapshot(
+            run_mode=run.mode,
+            session_id_for_pairs=session_id_for_pairs,
+            engine_for_pairs=engine_for_pairs,
+            fanout_session_ids=fanout_session_ids,
+            engine_by_session=engine_by_session,
+            depart_at_for_pairs=run.depart_at,
+            pairs=pairs,
+            cfg=cfg,
         )
-    except Exception:
-        log.exception("network-coverage run %s failed mid-loop", run_id)
-        with SessionLocal() as db:
-            db.execute(
-                update(NetworkCoverageRun)
-                .where(NetworkCoverageRun.id == run_id)
-                .values(status="failed", finished_at=datetime.now(UTC))
-            )
-            db.commit()
+
+
+async def _process_pair_with_cancel(
+    *,
+    run_id: uuid.UUID,
+    semaphore: asyncio.Semaphore,
+    snap: _Phase1Snapshot,
+    origin: Hub,
+    dest: Hub,
+) -> None:
+    """PR-1 — per-pair coroutine with cooperative cancel.
+
+    Checked at the top (after the semaphore wait so the operator's Stop
+    click propagates to queued-but-not-running pairs) AND once more inside
+    the slot so a click that lands while we're waiting for the semaphore
+    short-circuits the actual OTP/MOTIS call. Cells that already wrote
+    their result rows before the click stay in the DB.
+
+    Extracted from `execute_run`'s inner closure so the parent function's
+    cognitive complexity stays under Sonar's ceiling.
+    """
+    if is_cancelled(run_id):
         return
+    async with semaphore:
+        if is_cancelled(run_id):
+            return
+        if snap.run_mode == MODE_FANOUT:
+            await _execute_pair_fanout(
+                run_id=run_id,
+                session_ids=snap.fanout_session_ids,
+                engine_by_session=snap.engine_by_session,
+                origin=origin,
+                dest=dest,
+                depart_at=snap.depart_at_for_pairs,
+                cfg=snap.cfg,
+            )
+            return
+        assert snap.session_id_for_pairs is not None  # narrowed at Phase 1
+        await _execute_pair(
+            run_id=run_id,
+            session_id=snap.session_id_for_pairs,
+            engine=snap.engine_for_pairs,
+            origin=origin,
+            dest=dest,
+            depart_at=snap.depart_at_for_pairs,
+            cfg=snap.cfg,
+        )
 
-    elapsed_s = time.monotonic() - started
-    log.info(
-        "network-coverage run %s completed in %.1fs (%d pairs)",
-        run_id,
-        elapsed_s,
-        len(pairs),
-    )
 
-    # Phase 3: aggregate summary + flip to completed.
+def _mark_run_failed(run_id: uuid.UUID) -> None:
+    """Stamp `status='failed' + finished_at=now()` in its own short txn.
+
+    Used by `execute_run` when the per-pair `asyncio.gather` raises — we
+    keep the failure-write isolated from the in-flight pair-loop session
+    so a transactional collision can't double-fault.
+    """
+    with SessionLocal() as db:
+        db.execute(
+            update(NetworkCoverageRun)
+            .where(NetworkCoverageRun.id == run_id)
+            .values(status="failed", finished_at=datetime.now(UTC))
+        )
+        db.commit()
+
+
+def _persist_cancelled_run(*, run_id: uuid.UUID, elapsed_s: float) -> None:
+    """PR-1 — terminal-state writer for an operator-cancelled run.
+
+    Recomputes counter rollups from whatever cells made it into the
+    results table (some pairs may have been mid-flight when the Stop
+    click landed; those that completed their persist before the cancel-
+    check fires keep their row). Stamps `finished_at`, attaches a
+    `cancelled_by_operator` marker on `summary`, and flips status to
+    'cancelled'. Single transaction so the matrix UI flips atomically.
+
+    Mirrors the structure of `_finalise_completed_run` minus the verify
+    sweep — running ÖBB HAFAS over the partial cell set when the
+    operator just asked us to stop would be wrong.
+    """
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
             return
         run.finished_at = datetime.now(UTC)
-        # Compute summary counters one last time — the per-pair updates
-        # incremented these but a final SUM is bug-resistant.
+        rows = (
+            db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
+            .scalars()
+            .all()
+        )
+        run.completed_pairs = len(rows)
+        run.ok_pairs = sum(1 for r in rows if r.status == "ok")
+        run.no_route_pairs = sum(1 for r in rows if r.status == "no_route")
+        run.error_pairs = sum(1 for r in rows if r.status not in ("ok", "no_route", "skipped"))
+        run.summary = {
+            **(run.summary or {}),
+            "elapsed_seconds": elapsed_s,
+            "cancelled_by_operator": True,
+            "cancelled_at": datetime.now(UTC).isoformat(),
+        }
+        run.status = "cancelled"
+        db.commit()
+
+
+async def _finalise_completed_run(
+    *, run_id: uuid.UUID, elapsed_s: float, cfg: CoverageConfig
+) -> None:
+    """Phase-3 of `execute_run` — recompute summary counters, optionally
+    run the PR-E external-verify sweep, and flip the run to 'completed'
+    in a single transaction.
+
+    Extracted from `execute_run` so the parent function stays under
+    Sonar's cognitive-complexity ceiling.
+    """
+    with SessionLocal() as db:
+        run = db.get(NetworkCoverageRun, run_id)
+        if run is None:
+            return
+        run.finished_at = datetime.now(UTC)
         rows = (
             db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
             .scalars()
@@ -525,10 +661,6 @@ async def execute_run(run_id: uuid.UUID) -> None:
             "p95_response_ms": _percentile(
                 [r.response_ms for r in rows if r.response_ms is not None], 0.95
             ),
-            # PR-E — rollup of the external-verify sweep so the sidebar
-            # / matrix can show "verified N of M cells; K disagreements"
-            # without re-scanning result rows. All zeros when the flag
-            # is off or no candidate cells existed.
             "external_verified_count": verify_counters["verified"],
             "external_ok_count": verify_counters["ok"],
             "external_no_route_count": verify_counters["no_route"],
@@ -540,6 +672,80 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # will catch it at next startup.
         run.status = "completed"
         db.commit()
+
+
+async def execute_run(run_id: uuid.UUID) -> None:
+    """Drive a pending coverage run to completion.
+
+    Designed to be called from a FastAPI BackgroundTask. Manages its own
+    DB session lifecycle so the request's transaction can commit + return
+    immediately. Idempotent in the loose sense: re-running on a completed
+    run is a no-op.
+
+    PR-1 — wraps the whole body in try/finally so the cancel-event
+    registration set by `register_cancel(run_id)` is always cleared, even
+    when execute_run exits via an exception, early-return, or terminal-
+    state short-circuit. Phase-1 setup, the per-pair coroutine, and the
+    failed/cancelled/completed terminal writes all live in dedicated
+    helpers so this function stays under Sonar's cognitive-complexity
+    ceiling.
+    """
+    log.info("network-coverage run %s starting", run_id)
+    started = time.monotonic()
+    register_cancel(run_id)
+    try:
+        snap = _phase1_snapshot_and_start(run_id)
+        if snap is None or not snap.pairs:
+            log.error("run %s has no pairs to execute", run_id)
+            return
+
+        # Phase 2: process pairs with bounded concurrency. Each pair gets
+        # its own short-lived DB session — no transaction stays open
+        # across the network call to OTP.
+        semaphore = asyncio.Semaphore(snap.cfg.pair_parallelism)
+        try:
+            await asyncio.gather(
+                *(
+                    _process_pair_with_cancel(
+                        run_id=run_id,
+                        semaphore=semaphore,
+                        snap=snap,
+                        origin=o,
+                        dest=d,
+                    )
+                    for o, d in snap.pairs
+                ),
+                return_exceptions=False,
+            )
+        except Exception:
+            log.exception("network-coverage run %s failed mid-loop", run_id)
+            _mark_run_failed(run_id)
+            return
+
+        elapsed_s = time.monotonic() - started
+
+        # PR-1 — if a Stop click set the cancel event at any point during
+        # Phase 2, persist the partial state under status='cancelled'
+        # instead of running Phase 3 (the verify sweep + status='completed'
+        # write). The cells already processed survive.
+        if is_cancelled(run_id):
+            _persist_cancelled_run(run_id=run_id, elapsed_s=elapsed_s)
+            log.info(
+                "network-coverage run %s cancelled by operator after %.1fs",
+                run_id,
+                elapsed_s,
+            )
+            return
+
+        log.info(
+            "network-coverage run %s completed in %.1fs (%d pairs)",
+            run_id,
+            elapsed_s,
+            len(snap.pairs),
+        )
+        await _finalise_completed_run(run_id=run_id, elapsed_s=elapsed_s, cfg=snap.cfg)
+    finally:
+        clear_cancel(run_id)
 
 
 async def _maybe_run_external_verify_sweep(
