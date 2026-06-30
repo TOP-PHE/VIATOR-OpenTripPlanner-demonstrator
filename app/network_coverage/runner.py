@@ -248,6 +248,62 @@ def request_cancel(run_id: uuid.UUID) -> bool:
     return True
 
 
+# ────────────────────── PR-187 — DB-status cancel check ──────────────────────
+#
+# `_CANCEL_EVENTS` is a module-local dict, so it is PROCESS-local. A SQL
+# `UPDATE network_coverage_runs SET status='cancelled'` issued by an operator
+# (via psql), an orphan-cleanup script, or a sibling uvicorn worker has ZERO
+# effect on the in-memory event the runner consults. In one incident this
+# caused the runner to keep hammering MOTIS for 4+ hours after operators
+# believed the run was cancelled.
+#
+# `_is_cancelled_in_db` does a cheap `SELECT status FROM network_coverage_runs
+# WHERE id=:rid` and treats any non-'running'/'pending' state as a cancel
+# signal (covers operator UPDATEs to 'cancelled', orphan-cleanup writes of
+# 'failed', etc.). To keep the per-pair hot loop from hammering the DB, each
+# run gets a small TTL cache of the last DB result that survives 3 seconds —
+# plenty short to honour an operator click within one full pair's wall time,
+# long enough to amortise the SELECT across the K within-pair slot calls.
+
+_DB_CANCEL_CACHE_TTL_SECONDS = 3.0
+_DB_CANCEL_TERMINAL_STATUSES = frozenset(("cancelled", "failed", "completed"))
+
+
+def _is_cancelled_in_db(
+    run_id: uuid.UUID,
+    cache: dict[uuid.UUID, tuple[float, bool]],
+) -> bool:
+    """True iff the run's DB status is a non-running terminal state
+    ('cancelled', 'failed', 'completed').
+
+    Uses a per-run 3s TTL cache (`cache` is owned by the caller and lives
+    for the duration of `execute_run`) to avoid hammering the DB inside
+    the per-pair hot loop. The cache entry is `(expires_at_monotonic, value)`.
+    A cache miss / expiry opens a short-lived `SessionLocal()` session,
+    fetches the row's `status`, and stores the result.
+
+    Defensive: any exception (DB down, schema drift) returns False — we'd
+    rather keep running than crash the runner on a check that's meant to
+    be cheap and best-effort. The in-memory `_CANCEL_EVENTS` path remains
+    the primary signal; this is a backstop for cross-process cancels.
+    """
+    now = time.monotonic()
+    hit = cache.get(run_id)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    try:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(NetworkCoverageRun.status).where(NetworkCoverageRun.id == run_id)
+            ).scalar_one_or_none()
+    except Exception:
+        log.debug("PR-187 DB cancel check failed for run %s; assuming not cancelled", run_id)
+        return False
+    cancelled = row is not None and row in _DB_CANCEL_TERMINAL_STATUSES
+    cache[run_id] = (now + _DB_CANCEL_CACHE_TTL_SECONDS, cancelled)
+    return cancelled
+
+
 # ─────────────────── PR-3 — day window + K-slot helpers ────────────────────
 #
 # The runner now slices each pair into K time-slots covering a per-run
@@ -973,14 +1029,27 @@ async def _process_pair_with_cancel(
     snap: _Phase1Snapshot,
     origin: Hub,
     dest: Hub,
+    cancel_cache: dict[uuid.UUID, tuple[float, bool]] | None = None,
 ) -> None:
     """PR-1 — per-pair coroutine with cooperative cancel. Checked before
     AND inside the semaphore so a Stop click propagates to both queued
-    and in-flight pairs."""
-    if is_cancelled(run_id):
+    and in-flight pairs.
+
+    PR-187 — also consults the DB status (with a 3s per-run TTL cache)
+    so a SQL `UPDATE network_coverage_runs SET status='cancelled'` from
+    an operator / orphan-cleanup / sibling uvicorn worker is honoured.
+    Without this, the in-memory `_CANCEL_EVENTS` is process-local and
+    cross-process cancels are invisible to the runner.
+
+    `cancel_cache` is owned by the caller (`execute_run` allocates a
+    fresh empty dict for each run) so a stale cache entry can never leak
+    across runs. Default `None` keeps direct unit-test callers working
+    without threading a cache through every call site."""
+    cache = cancel_cache if cancel_cache is not None else {}
+    if is_cancelled(run_id) or _is_cancelled_in_db(run_id, cache):
         return
     async with semaphore:
-        if is_cancelled(run_id):
+        if is_cancelled(run_id) or _is_cancelled_in_db(run_id, cache):
             return
         if snap.run_mode == MODE_FANOUT:
             await _execute_pair_fanout(
@@ -1114,6 +1183,11 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # Phase 2: process pairs with bounded concurrency. Each pair gets
         # its own short-lived DB session.
         semaphore = asyncio.Semaphore(snap.cfg.pair_parallelism)
+        # PR-187 — per-run TTL cache for the DB-status cancel check.
+        # Lives only for the duration of this execute_run call (no leak
+        # across runs); shared across every pair coroutine so the cheap
+        # SELECT is amortised.
+        cancel_cache: dict[uuid.UUID, tuple[float, bool]] = {}
         try:
             await asyncio.gather(
                 *(
@@ -1123,6 +1197,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
                         snap=snap,
                         origin=o,
                         dest=d,
+                        cancel_cache=cancel_cache,
                     )
                     for o, d in snap.pairs
                 ),
