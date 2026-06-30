@@ -1294,6 +1294,23 @@ function _refColumnBodyHtml(descriptor) {
   return `<div class="compare-cell empty">${why}</div>`;
 }
 
+// Derive the VIATOR-column label for the side-by-side grid from the
+// engines that actually executed for this payload. Mirrors the
+// `_shouldRenderComparison` / `_hasBothEngines` iteration on
+// `payload.executions` so an Engine="MOTIS only" dropdown selection
+// produces a header that reads "VIATOR · MOTIS" instead of the
+// misleading static "VIATOR · MOTIS / OTP". When BOTH engines ran (or
+// when zero engines have a usable execution — rare, all-errored
+// payload), we fall back to the combined label.
+function _viatorColumnLabel(payload) {
+  const engines = new Set();
+  for (const e of (payload && payload.executions) || []) {
+    if (e && e.status !== 'error') engines.add(e.engine || 'otp');
+  }
+  if (engines.size === 1) return `VIATOR · ${[...engines][0].toUpperCase()}`;
+  return 'VIATOR · MOTIS / OTP';
+}
+
 function renderSideBySideGrid(payload, viatorCardsHtml) {
   // Build an N-column grid: column 1 is VIATOR's own cards, columns
   // 2..N are the reference panels (OJP, HAFAS, ...). Each column body
@@ -1301,7 +1318,7 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   // canonical (no drift between stacked and side-by-side layouts).
   const refs = _refColumnDescriptors(payload);
   const cols = [
-    { key: 'viator', label: 'VIATOR · MOTIS / OTP', pillClass: 'viator', body: viatorCardsHtml || '<div class="compare-cell empty">no itineraries found</div>' },
+    { key: 'viator', label: _viatorColumnLabel(payload), pillClass: 'viator', body: viatorCardsHtml || '<div class="compare-cell empty">no itineraries found</div>' },
     ...refs.map((r) => ({ ...r, body: _refColumnBodyHtml(r) })),
   ];
   const headerRow = cols.map((c) =>
@@ -1311,7 +1328,15 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   // grid-template-columns is driven by --compare-cols inline so the
   // grid scales 1/2/3 columns without a per-N CSS class. Mobile
   // collapse via the existing @720px rule still fires (single column).
-  return `<div class="compare-grid compare-grid-refs" style="--compare-cols: repeat(${cols.length}, 1fr)">
+  //
+  // The "Compare excluding walk legs" toggle is prepended HERE rather
+  // than left to `renderComparisonGrid` (its previous-only host) so it
+  // survives single-engine SBS — when the user picks Engine="MOTIS only"
+  // `_shouldRenderComparison` returns false (it needs both engines),
+  // and previously the toggle disappeared from the page entirely. The
+  // walk-leg filter is global, so a single top-level toggle covers
+  // every column.
+  return `${_renderToggleControls()}<div class="compare-grid compare-grid-refs" style="--compare-cols: repeat(${cols.length}, 1fr)">
     ${headerRow}
     ${bodyRow}
   </div>`;
@@ -1402,8 +1427,18 @@ function render(payload) {
   // PR-194: build the side-by-side grid AFTER `cards` is computed so we
   // can hand the existing VIATOR-cards HTML to the first column verbatim
   // — keeps the per-trip markup canonical between layouts.
+  //
+  // Hand only plain `cards` (never `comparisonGrid`) to the SBS first
+  // column. The walk-leg toggle now lives on the SBS wrapper itself
+  // (see `renderSideBySideGrid`), so re-using `comparisonGrid` here
+  // would inject a SECOND toggle nested inside column 1 whenever both
+  // engines ran. Trade-off: the both-engine SBS case loses the inline
+  // OTP/MOTIS pairing inside column 1, but the per-trip cards still
+  // carry their engine pills so the operator can tell them apart;
+  // pairing-inside-SBS was a grid-inside-a-grid that read poorly
+  // anyway.
   const sideBySideGrid = sideBySide
-    ? renderSideBySideGrid(payload, comparisonGrid || cards)
+    ? renderSideBySideGrid(payload, cards)
     : '';
   // When the side-by-side grid renders it OWNS the layout slot —
   // suppress the standalone `cards` / `comparisonGrid` strings so they

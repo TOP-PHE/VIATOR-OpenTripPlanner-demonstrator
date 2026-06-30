@@ -310,3 +310,110 @@ def test_side_by_side_state_initialised_only_once(template_text: str):
         f"found {state_decls}. A duplicate `let`/`const` in the same "
         f"scope is a SyntaxError; remove the duplicate."
     )
+
+
+# ───────────────────── v0.1.43.26 SBS regression guards ─────────────────────
+# Two PR-194 regressions surfaced on the v0.1.43.26 release once the TDZ
+# hotfix (PR #196) restored the Search button: (1) the SBS VIATOR column
+# always read "VIATOR · MOTIS / OTP" regardless of the engine filter the
+# operator picked, and (2) the "Compare excluding walk legs" toggle
+# disappeared entirely in SBS mode when the operator picked a single
+# engine — `_shouldRenderComparison` requires BOTH engines and was the
+# toggle's only host. These tests pin the fix so a future refactor of
+# `renderSideBySideGrid` or the dispatch site can't silently bring the
+# bugs back.
+
+
+def test_sbs_viator_column_label_resolved_via_helper(template_text: str):
+    """The VIATOR column label inside `renderSideBySideGrid` must come
+    from the `_viatorColumnLabel(payload)` helper, NOT a hardcoded
+    literal — otherwise picking `Engine=MOTIS only` still reads
+    `VIATOR · MOTIS / OTP` in the column header even though only MOTIS
+    sessions executed. The helper inspects `payload.executions` so it
+    stays accurate to what the server actually ran."""
+    # The helper must be defined.
+    assert "function _viatorColumnLabel(" in template_text, (
+        "Missing `_viatorColumnLabel` helper — needed to derive the SBS "
+        "VIATOR column label from `payload.executions` so the header "
+        "reflects the engine filter the operator actually picked."
+    )
+    # And invoked inside renderSideBySideGrid, specifically for the
+    # 'viator' column descriptor's `label`. We're checking the exact
+    # call shape so a future refactor that drops the helper invocation
+    # would fail this test.
+    assert "label: _viatorColumnLabel(payload)" in template_text, (
+        "Regression: the VIATOR column label in renderSideBySideGrid "
+        "is no longer using `_viatorColumnLabel(payload)`. The static "
+        "literal `'VIATOR · MOTIS / OTP'` misleads the operator when "
+        "they picked Engine=MOTIS-only or Engine=OTP-only — the column "
+        "header reads MOTIS/OTP even though only one engine ran."
+    )
+    # Belt-and-braces: the literal `'VIATOR · MOTIS / OTP'` should still
+    # exist (it is the helper's fallback label for the both-engines /
+    # zero-engines case), but it must NOT appear in the same column-
+    # descriptor object as `pillClass: 'viator'`. A simple proxy: the
+    # literal should NOT be on the same line as `pillClass: 'viator'`.
+    for line in template_text.splitlines():
+        if "pillClass: 'viator'" in line:
+            assert "'VIATOR · MOTIS / OTP'" not in line, (
+                f"Regression: VIATOR column descriptor hardcodes the "
+                f"combined label. Use `_viatorColumnLabel(payload)` "
+                f"instead. Offending line: {line.strip()!r}"
+            )
+
+
+def test_sbs_render_includes_walk_legs_toggle(template_text: str):
+    """The walk-leg toggle (`_renderToggleControls()`) must be invoked
+    from `renderSideBySideGrid` so the toggle appears in SBS mode even
+    when the operator picked a single engine.
+
+    Before this fix, `_renderToggleControls` was called only from
+    `renderComparisonGrid`, which `_shouldRenderComparison` gates on
+    BOTH engines being present. Single-engine SBS therefore had no
+    toggle anywhere on the page — the operator lost the ability to
+    filter walk legs out of the comparison entirely."""
+    # Find renderSideBySideGrid + the next function definition; assert
+    # `_renderToggleControls()` appears between them. We can't trivially
+    # parse JS in Python, but a substring search within the function's
+    # source range is a reliable enough pin.
+    sbs_start = template_text.find("function renderSideBySideGrid(")
+    assert sbs_start != -1, "renderSideBySideGrid function missing"
+    # Look for the next top-level `function ` definition after the SBS
+    # body's body (skip past the function's own header).
+    next_fn = template_text.find("\nfunction ", sbs_start + len("function renderSideBySideGrid("))
+    assert next_fn != -1, "Could not bound renderSideBySideGrid body"
+    sbs_body = template_text[sbs_start:next_fn]
+    assert "_renderToggleControls()" in sbs_body, (
+        "Regression: renderSideBySideGrid no longer injects the walk-"
+        "leg toggle. Single-engine SBS would lose the 'Compare "
+        "excluding walk legs' checkbox entirely (it used to live only "
+        "in renderComparisonGrid, which requires both engines). The "
+        "toggle must be prepended in the SBS wrapper so it covers "
+        "every column regardless of which engine ran."
+    )
+
+
+def test_sbs_dispatch_does_not_double_inject_walk_toggle(template_text: str):
+    """Belt-and-braces: the `render()` dispatch site must hand plain
+    `cards` (not `comparisonGrid || cards`) into `renderSideBySideGrid`.
+
+    If the dispatch passes `comparisonGrid` the SBS first column
+    re-embeds the entire comparison grid — which itself starts with the
+    walk-leg toggle — producing TWO `compare-trains-only` checkboxes
+    on the page. The change handler at `document.getElementById(
+    'compare-trains-only')` only sees the first one, so the second
+    silently no-ops. Pinning the dispatch shape keeps the invariant
+    'exactly one toggle in SBS mode' visible at the test layer."""
+    # The dispatch line we care about appears exactly once in the file.
+    bad = "renderSideBySideGrid(payload, comparisonGrid || cards)"
+    good = "renderSideBySideGrid(payload, cards)"
+    assert bad not in template_text, (
+        "Regression: dispatch re-embeds the comparison grid into the "
+        "SBS first column, which duplicates the walk-leg toggle. Use "
+        "`renderSideBySideGrid(payload, cards)` instead."
+    )
+    assert good in template_text, (
+        "Dispatch must call `renderSideBySideGrid(payload, cards)` so "
+        "the SBS wrapper owns the single walk-leg toggle without "
+        "competing nested copies from comparisonGrid."
+    )
