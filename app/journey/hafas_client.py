@@ -49,6 +49,8 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
+
 from ..network_coverage import external_verify
 from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
 
@@ -109,13 +111,20 @@ async def fetch_plan(
     _ = num_itineraries, from_name, to_name
 
     depart_at = _localise_when(when)
-    out = await external_verify.fetch_oebb_two_step(
-        from_lat=from_lat,
-        from_lon=from_lon,
-        to_lat=to_lat,
-        to_lon=to_lon,
-        depart_at=depart_at,
-    )
+    # Honour the operator-provided timeout (config_schema HAFAS_TIMEOUT_MS,
+    # default 10s) — construct a client with that ceiling and hand it to the
+    # two-step adapter. Without this the adapter falls back to its module-
+    # local 30s constant, which is fine for coverage verification but too
+    # generous for live-UI journey comparison.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_ms / 1000.0)) as client:
+        out = await external_verify.fetch_oebb_two_step(
+            from_lat=from_lat,
+            from_lon=from_lon,
+            to_lat=to_lat,
+            to_lon=to_lon,
+            depart_at=depart_at,
+            client=client,
+        )
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     raw: dict[str, Any] = {
