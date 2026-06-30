@@ -247,6 +247,56 @@ main {
 .cov-verify-empty { background: #eef2f8; color: #1f2328; border: 1px solid #d0d7de; }
 .cov-verify-warn  { background: #fff8c5; color: #4a3500; border: 1px solid #f5d56b; }
 
+/* PR-196b — modal-only "Show walk legs" toggle. DISPLAY-ONLY: hides
+   walk legs from the rendered itinerary cards in the modal but does
+   NOT recompute the alignment score (which stays canonical from the
+   sweep). Persisted to localStorage so the operator's choice survives
+   page reloads. */
+.cov-modal-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.4rem 0 0.6rem;
+  padding: 0.4rem 0.6rem;
+  background: #f6f8fa;
+  border-left: 3px solid var(--brand-blue);
+  border-radius: 3px;
+  font-size: 0.85rem;
+}
+.cov-modal-controls .alignment-tier-pill { margin-right: auto; }
+.cov-modal-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  user-select: none;
+  font-weight: normal;
+}
+.cov-modal-controls label input { width: auto; margin: 0; }
+
+/* Trip card variant used inside the modal compare-grid columns. Same
+   look as the existing cov-trip-card but sized for the two-column
+   layout (slightly tighter padding so a 4-leg ÖBB itinerary still
+   fits without horizontal-scrolling). */
+.cov-cell-trip {
+  border: 1px solid #eaeef2;
+  border-radius: 4px;
+  padding: 0.4rem 0.55rem;
+  margin-bottom: 0.4rem;
+  background: #fff;
+  font-size: 0.78rem;
+}
+.cov-cell-trip:last-child { margin-bottom: 0; }
+.cov-cell-trip .cov-trip-head { font-size: 0.78rem; }
+.cov-cell-trip .cov-trip-legs { padding-left: 0.4rem; margin-left: 0.3rem; }
+.cov-cell-trip .cov-leg { font-size: 0.72rem; grid-template-columns: 48px 80px 1fr; }
+.cov-cell-trip .cov-leg.walk-leg[hidden] { display: none; }
+/* Subtle left-accent so the operator can tell the columns apart at a
+   glance, matching the engine-pill colours in the compare-grid header. */
+.cov-cell-trip.viator { border-left: 3px solid #57606a; }
+.cov-cell-trip.oebb   { border-left: 3px solid #b3760e; }
+
 /* PR-E — per-cell external-verify verdict dot, rendered as a small
    coloured circle in the top-right of each verifiable cell. Three
    colours mirror the existing cov-verify-* palette so operator muscle
@@ -614,6 +664,14 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 {% endblock %}
 
 {% block extra_scripts %}
+{# PR-196b — shared compare-grid primitive (CSS + JS) lifted out of
+   journey.html so the cell-detail modal below can render VIATOR
+   itineraries and ÖBB itineraries as paired columns using the exact
+   same grid mark-up the journey-search side-by-side comparison uses.
+   The shared module exposes window.CompareGrid.{renderGrid, tierPill,
+   escHTML}; see app/static/js/compare_grid.js for the contract. #}
+<link rel="stylesheet" href="/static/app/css/compare_grid.css">
+<script src="/static/app/js/compare_grid.js"></script>
 <script>
 // v0.1.27 — Network coverage admin page.
 
@@ -1416,13 +1474,186 @@ function renderCellTrips(payload, orig, dest) {
   return sections.join('');
 }
 
+// PR-196b — module-level state for the modal "Show walk legs" toggle.
+// DISPLAY-ONLY: hides walk-leg rows from the rendered itineraries but
+// does NOT recompute the alignment score (which stays canonical from
+// the PR-196a sweep). localStorage-persisted so the operator's choice
+// survives a page reload, identical pattern to _COMPARE_SIDE_BY_SIDE
+// in journey.html.
+const _MODAL_SHOW_WALKS_KEY = 'viator.modalShowWalks';
+let MODAL_SHOW_WALKS = (function () {
+  try {
+    return window.localStorage.getItem(_MODAL_SHOW_WALKS_KEY) === '1';
+  } catch (_e) {
+    // localStorage can throw in private-browsing / sandboxed iframes;
+    // default to OFF so the modal opens cleanly even then.
+    return false;
+  }
+})();
+
+// PR-196b — apply or remove the modal-only "show walks" class on the
+// rendered <body>. Cheap CSS toggle (`.cov-cell-trip .cov-leg.walk-leg`
+// is hidden by default; this class flips the [hidden] attr on every
+// walk row). Called from the change handler so the operator's flip is
+// instant — no re-render needed.
+function applyModalShowWalks() {
+  const modalBody = document.getElementById('cov-modal-body');
+  if (!modalBody) return;
+  modalBody.querySelectorAll('.cov-leg.walk-leg').forEach((row) => {
+    row.hidden = !MODAL_SHOW_WALKS;
+  });
+}
+
+// PR-196b — render the modal-only control strip: alignment-tier pill +
+// "show walk legs" toggle. The pill consumes the persisted tier/score
+// from PR-196a (no recompute, no extra ÖBB call). The toggle is
+// display-only — flipping it does NOT recompute the alignment score.
+function renderModalControls(dir) {
+  const pill = CompareGrid.tierPill(
+    dir.external_alignment_tier,
+    dir.external_alignment_score,
+  );
+  const checked = MODAL_SHOW_WALKS ? 'checked' : '';
+  return `<div class="cov-modal-controls">
+    ${pill || '<span class="hint" style="font-style:italic">No alignment data recorded for this cell.</span>'}
+    <label title="Display-only — does NOT recompute the alignment score (which stays canonical from the sweep).">
+      <input type="checkbox" data-action="modal-show-walks" id="modal-show-walks" ${checked}>
+      Show walk legs
+    </label>
+  </div>`;
+}
+
+// PR-196b — VIATOR column body for the side-by-side modal grid. Each
+// trip renders as a `cov-cell-trip` card (variant of the existing
+// renderTripCard). The shared CompareGrid.renderGrid primitive
+// supplies the surrounding column markup.
+function renderModalViatorColumn(trips) {
+  if (!trips || !trips.length) return '';
+  return trips.map(renderModalViatorTripCard).join('');
+}
+
+// PR-196b — ÖBB HAFAS column body. Reads the persisted
+// external_itineraries (PR-196a JSONB column) so there's no extra
+// HAFAS HTTP call at modal-open time — the same data the alignment
+// scorer used renders the column.
+function renderModalOebbColumn(itineraries) {
+  if (!itineraries || !itineraries.length) return '';
+  return itineraries.map(renderModalOebbTripCard).join('');
+}
+
+// PR-196b — VIATOR trip card variant for the compare-grid cell. Same
+// shape as the legacy renderTripCard but `.cov-cell-trip.viator`
+// styling sits tighter for the two-column layout. WALK legs carry the
+// `walk-leg` class so the modal-only toggle can hide them in-place.
+function renderModalViatorTripCard(trip) {
+  const legs = (trip.legs || []).map(renderModalLeg).join('');
+  const transfers = fmtCount(trip.num_transfers, 'transfer');
+  return `<div class="cov-trip cov-cell-trip viator">
+    <div class="cov-trip-head">
+      <span class="cov-trip-rank">#${(trip.rank || 0) + 1}</span>
+      <span>${fmtTime(trip.departure_at)} → ${fmtTime(trip.arrival_at)}</span>
+      <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
+      <span class="hint">${escHTML(transfers)}</span>
+    </div>
+    <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
+  </div>`;
+}
+
+// PR-196b — ÖBB itinerary card. The persisted VerifyItinerary shape is
+// narrower than the VIATOR trip shape (no rank, no
+// route_short_name / route_long_name — just `route_name`). We render
+// what's there and elide the rest so the column stays compact.
+function renderModalOebbTripCard(it) {
+  // Per-leg walk-hiding is set by renderModalOebbLeg using the current
+  // MODAL_SHOW_WALKS state, so the initial render honours the
+  // operator's persisted preference without a flicker. Subsequent
+  // flips of the toggle go through applyModalShowWalks() which mutates
+  // the `hidden` attr in place.
+  const legs = (it.legs || []).map(renderModalOebbLeg).join('');
+  const transfers = fmtCount(it.num_transfers, 'transfer');
+  return `<div class="cov-trip cov-cell-trip oebb">
+    <div class="cov-trip-head">
+      <span>${fmtTime(it.departure_at)} → ${fmtTime(it.arrival_at)}</span>
+      <span class="cov-trip-duration">${fmtDuration(it.duration_seconds)}</span>
+      <span class="hint">${escHTML(transfers)}</span>
+    </div>
+    <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
+  </div>`;
+}
+
+// PR-196b — VIATOR-side leg row. Same shape as the legacy renderLeg
+// but adds the `walk-leg` class on WALK rows so the modal-only "Show
+// walk legs" toggle can hide them via [hidden]. The initial hidden
+// state is set by the `hidden` attribute on first render so the
+// operator's persisted preference takes effect without a JS flicker.
+function renderModalLeg(leg) {
+  const mode = leg.mode || 'TRANSIT';
+  const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
+  const headsign = leg.trip_headsign ? ' (' + escHTML(leg.trip_headsign) + ')' : '';
+  const agency = leg.agency_name || leg.feed_id || '';
+  const isWalk = mode === 'WALK';
+  const walkClass = isWalk ? ' walk-leg' : '';
+  const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
+  return `<div class="cov-leg${walkClass}"${hiddenAttr}>
+    <span class="cov-leg-mode">${escHTML(mode)}</span>
+    <span class="cov-leg-when">${fmtTime(leg.departure)} → ${fmtTime(leg.arrival)}</span>
+    <span class="cov-leg-stops">${escHTML(leg.from_name || '?')} → ${escHTML(leg.to_name || '?')}</span>
+    <span class="cov-leg-service">${escHTML(service)}${headsign}</span>
+    ${agency ? '<span class="cov-leg-agency">' + escHTML(agency) + '</span>' : ''}
+  </div>`;
+}
+
+// PR-196b — ÖBB-side leg row. VerifyLeg carries (mode, from_uic,
+// to_uic, dep_utc, arr_utc, route_name) — narrower than VIATOR's leg
+// shape, so the column body shows UIC tokens where VIATOR shows
+// station names. Walk legs honour the same modal-only toggle.
+function renderModalOebbLeg(leg) {
+  const mode = leg.mode || 'TRANSIT';
+  const service = leg.route_name || (mode === 'WALK' ? 'walk' : '');
+  const isWalk = mode === 'WALK';
+  const walkClass = isWalk ? ' walk-leg' : '';
+  const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
+  const fromTok = leg.from_uic || '?';
+  const toTok = leg.to_uic || '?';
+  return `<div class="cov-leg${walkClass}"${hiddenAttr}>
+    <span class="cov-leg-mode">${escHTML(mode)}</span>
+    <span class="cov-leg-when">${fmtTime(leg.dep_utc)} → ${fmtTime(leg.arr_utc)}</span>
+    <span class="cov-leg-stops">${escHTML(fromTok)} → ${escHTML(toTok)}</span>
+    <span class="cov-leg-service">${escHTML(service)}</span>
+  </div>`;
+}
+
+// PR-196b — build the side-by-side VIATOR vs ÖBB grid for one
+// direction. The CompareGrid.renderGrid primitive (shared with
+// journey.html) supplies the two-column wrapper; each column body is
+// the per-source trip cards (or a styled "no itineraries found"
+// placeholder when one side is empty so the operator can tell which
+// engine returned what).
+function renderDirectionCompareGrid(dir) {
+  const viatorBody = renderModalViatorColumn(dir.trips || []);
+  const oebbBody = renderModalOebbColumn(dir.external_itineraries || []);
+  const cols = [
+    { key: 'viator', label: 'VIATOR · MOTIS / OTP', pillClass: 'viator', body: viatorBody },
+    { key: 'oebb',   label: 'ÖBB HAFAS',            pillClass: 'oebb',   body: oebbBody },
+  ];
+  return CompareGrid.renderGrid(cols, { variant: 'refs' });
+}
+
 function renderDirectionSection(label, subtitle, dir) {
+  // PR-196b — modal layout flip: instead of stacking the VIATOR trips
+  // above the verify-block, we render a two-column compare-grid with
+  // VIATOR on the left and ÖBB HAFAS on the right (using
+  // external_itineraries persisted by PR-196a). Above the grid sits a
+  // control strip with the alignment-tier pill + the display-only
+  // "Show walk legs" toggle. The Re-verify button is preserved below
+  // the grid for one-click re-query (and updates the modal in-place
+  // on success).
+  //
   // Positive-condition first (S6644). The missing-row branch — either
   // the recorder write crashed or direction='single' suppressed the
   // reverse pair, though the caller pre-filters direction='single' so
   // this only fires on a true data gap — falls through to the bottom.
   if (dir) {
-    const trips = dir.trips || [];
     const itinSuffix = fmtCount(dir.num_itineraries, 'itinerary');
     const head = `<summary>
         <strong>${escHTML(label)}</strong>
@@ -1431,18 +1662,20 @@ function renderDirectionSection(label, subtitle, dir) {
         ${itinSuffix ? '· ' + itinSuffix : ''}
         ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
       </summary>`;
-    const body = trips.length
-      ? trips.map(renderTripCard).join('')
-      : '<p class="hint" style="padding: 0.4rem 0">No itineraries recorded for this direction.</p>';
+    const controls = renderModalControls(dir);
+    const grid = renderDirectionCompareGrid(dir);
     // External-verify button — extracted to `buildVerifyBlock` so this
-    // function stays under Sonar's CC ceiling. The button now appears
-    // for any verifiable status (no_route, timeout, error) AND any cell
-    // with a persisted PR-E verdict (so re-check is always one click).
+    // function stays under Sonar's CC ceiling. Updated in-place by the
+    // re-verify handler so the operator can refresh the ÖBB side
+    // without closing/re-opening the modal.
     const verifyBlock = buildVerifyBlock(dir, label);
     // Outbound starts open, return stays collapsed by default — keeps the
     // initial modal height manageable while still being one click away.
     const isOpen = label === 'Outbound' ? 'open' : '';
-    return `<details class="cov-trip-section" ${isOpen}>${head}${body}${verifyBlock}</details>`;
+    return `<details class="cov-trip-section" ${isOpen}
+                     data-direction-section="${escHTML(label)}">
+      ${head}${controls}${grid}${verifyBlock}
+    </details>`;
   }
   return `<details class="cov-trip-section" open>
     <summary><strong>${escHTML(label)}</strong> <span class="hint">(${escHTML(subtitle)})</span></summary>
@@ -1500,16 +1733,40 @@ document.addEventListener('click', (e) => {
 // bug). The dropdown is rendered inside renderRun() so we delegate
 // from document to survive the 5s matrix re-render. Body-class drives
 // the CSS heatmap + filter rules; flipping is instant (no re-render).
+//
+// PR-196b — extended to also wire the modal-only "Show walk legs"
+// toggle. Display-only: flipping hides walk-leg rows in-place and
+// persists the choice to localStorage, but does NOT recompute the
+// alignment score (which stays canonical from the sweep).
 document.addEventListener('change', (e) => {
   if (e.target && e.target.matches('[data-action="alignment-filter"]')) {
     ALIGNMENT_MODE = e.target.value;
     applyAlignmentModeToBody();
+  }
+  if (e.target && e.target.matches('[data-action="modal-show-walks"]')) {
+    MODAL_SHOW_WALKS = !!e.target.checked;
+    try { window.localStorage.setItem(_MODAL_SHOW_WALKS_KEY, MODAL_SHOW_WALKS ? '1' : '0'); }
+    catch (_e) { /* private-browsing / sandboxed iframe — fall through. */ }
+    applyModalShowWalks();
   }
 });
 
 // Fire the verify-external endpoint and render the verdict next to the
 // button. Disables the button while in-flight; replaces with the next
 // verdict if the operator clicks again.
+//
+// PR-196b — on success, also refresh the ÖBB column of the surrounding
+// compare-grid in place using the live-query .itineraries (which the
+// PR-196a VerifyResult now carries). The page-level matrix cell row is
+// NOT mutated by the live endpoint — that's intentional, the sweep
+// stays the canonical source of truth. The transient overlay just
+// gives the operator an at-a-glance "did the picture change?" view.
+//
+// PR-196b TODO: persisting the live re-verify back to
+// external_itineraries + recomputing alignment_score would require a
+// backend change to the verify-external endpoint (write through to
+// the cell row, recompute via compute_alignment). Out of scope for
+// PR-196b — file a follow-up before shipping if operators ask for it.
 async function handleVerifyExternal(btn) {
   const block = btn.closest('.cov-verify-block');
   const resultEl = block.querySelector('.cov-verify-result');
@@ -1530,6 +1787,13 @@ async function handleVerifyExternal(btn) {
     if (r.ok) {
       const payload = await r.json();
       resultEl.innerHTML = renderVerifyVerdict(payload);
+      // PR-196b — refresh the ÖBB compare-grid column in place with
+      // the live-query itineraries. Locates the parent direction
+      // section via the data-direction-section attribute so the
+      // outbound + return sections stay independent. No-op if the
+      // section isn't a compare-grid (legacy "no coverage row"
+      // branch) or if the live result carried zero itineraries.
+      refreshModalOebbColumn(block, payload.itineraries || []);
     } else {
       const detail = await r.text();
       resultEl.innerHTML = `<p class="hint cov-verify-warn">Verify request failed (${r.status}): ${escHTML(detail.slice(0, 200))}</p>`;
@@ -1540,6 +1804,31 @@ async function handleVerifyExternal(btn) {
     btn.disabled = false;
     btn.textContent = originalLabel;
   }
+}
+
+// PR-196b — replace the ÖBB column body inside the surrounding
+// compare-grid with a fresh render from the live-query itineraries.
+// Locates the column body by walking up to the direction section
+// and selecting the second .compare-cell (column 1 is VIATOR, column
+// 2 is ÖBB — see renderDirectionCompareGrid). Safe no-op for the
+// legacy "no coverage row" branch which has no compare-grid.
+function refreshModalOebbColumn(verifyBlock, liveItineraries) {
+  const section = verifyBlock.closest('[data-direction-section]');
+  if (!section) return;
+  const cells = section.querySelectorAll('.compare-grid > .compare-cell');
+  // Headers come first, then bodies; cells.length === 4 (2 headers + 2
+  // bodies) when the grid is the standard two-column VIATOR/ÖBB
+  // layout. Body index for ÖBB is 3 (0=viator hdr, 1=oebb hdr,
+  // 2=viator body, 3=oebb body). Defensive: fall through if shape
+  // differs (older render or no-grid section).
+  if (cells.length < 4) return;
+  const oebbBody = cells[3];
+  const fresh = renderModalOebbColumn(liveItineraries);
+  oebbBody.innerHTML = fresh || '<div class="compare-cell empty">no itineraries found</div>';
+  // Honour the current "show walks" toggle on the freshly-rendered
+  // rows (renderModalOebbLeg sets the initial hidden attr from
+  // MODAL_SHOW_WALKS, so this is belt-and-braces).
+  applyModalShowWalks();
 }
 
 // Render one VerifyResult inline. Three visual states:

@@ -121,6 +121,18 @@ _branding_dir = Path("branding")
 if _branding_dir.is_dir():
     app.mount("/static/branding", StaticFiles(directory=_branding_dir), name="branding")
 
+# PR-196b — shared front-end assets (compare-grid CSS + JS extracted out
+# of journey.html so the network-coverage cell modal can re-use the same
+# side-by-side column primitive without duplicating ~110 LOC of template
+# strings). Lives at app/static/ inside the python package so the
+# existing Dockerfile `COPY app ./app` step ships it without any
+# Dockerfile change. The mount is conditional so the test suite (which
+# instantiates `app` without the on-disk tree present in CI image layers)
+# stays green even if the directory hasn't been copied in yet.
+_app_static_dir = Path(__file__).resolve().parent / "static"
+if _app_static_dir.is_dir():
+    app.mount("/static/app", StaticFiles(directory=_app_static_dir), name="app-static")
+
 # Routers
 app.include_router(auth_routes.router)
 app.include_router(admin_config.router)

@@ -153,50 +153,16 @@
    fanout pool returned results from both an OTP-engine session and a
    MOTIS-engine session. One trip signature per row; each cell is a
    slim trip card or a greyed "not found" placeholder. Stacks to one
-   column under ~720px so it doesn't horizontal-scroll on mobile. */
-/* PR-194: grid-template-columns is now driven by --compare-cols (defaults
-   to the legacy "1fr 1fr" two-column layout for OTP-vs-MOTIS). The
-   side-by-side reference panel re-uses this primitive and sets
-   --compare-cols inline to repeat(N,1fr) where N = 1 (VIATOR) +
-   count(active reference engines). Mobile collapse rule below stays
-   unchanged. */
-.compare-grid { display: grid; grid-template-columns: var(--compare-cols, 1fr 1fr); gap: 0.6rem 1rem; margin-top: 0.4rem; }
-.compare-grid > .compare-header { font-weight: 600; padding: 0.3rem 0.1rem; border-bottom: 2px solid var(--sleeper); display: flex; align-items: center; gap: 0.4rem; }
-.compare-grid > .compare-header .engine-pill { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 3px; background: var(--sleeper); color: white; }
-.compare-grid > .compare-header .engine-pill.motis { background: var(--brand-blue); }
-/* PR-194: per-source accent on the column headers in the side-by-side
-   layout — matches the existing left-accent borders on the OJP /
-   HAFAS panels so the visual cue carries between the two layouts. */
-.compare-grid > .compare-header .engine-pill.viator { background: #57606a; }
-.compare-grid > .compare-header .engine-pill.ojp    { background: var(--brand-blue); }
-.compare-grid > .compare-header .engine-pill.hafas  { background: #b3760e; }
-/* PR-194: side-by-side reference grid wraps the OJP / HAFAS panels into
-   a column-grid alongside the VIATOR cards. The column body uses the
-   same .compare-cell primitive as the OTP-vs-MOTIS grid; "empty"
-   cells (a reference engine that returned 0 trips) render with a
-   muted body so the source-query state stays visible — operator
-   needs to see the column was queried and returned nothing. */
-.compare-grid.compare-grid-refs > .compare-cell { background: transparent; padding: 0; }
-.compare-grid.compare-grid-refs > .compare-cell.empty { background: #f8f9fa; border: 1px dashed var(--sleeper); border-radius: 4px; min-height: 4.6rem; display: flex; align-items: center; justify-content: center; color: var(--rail-steel); font-size: 0.85rem; font-style: italic; padding: 0.6rem; }
-.compare-grid.compare-grid-refs .compare-cell::before { content: none; }
-.compare-grid .compare-cell { min-height: 4.6rem; }
-.compare-grid .compare-cell .trip-card { margin-bottom: 0; }
-/* P2 MOTIS — "Compare excluding walk legs" toggle (PR-194 renamed from
-   the original misleading "Compare trains-only"), rendered just above the grid
-   when both engines are present. Single checkbox + hint; flipping it
-   re-runs the client-side pairing (no fetch). */
-.compare-controls { margin: 0.4rem 0 0.2rem; padding: 0.4rem 0.6rem; background: #f6f8fa; border-left: 3px solid var(--brand-blue); border-radius: 3px; font-size: 0.9rem; }
-.compare-toggle { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none; }
-.compare-toggle input { width: auto; margin: 0; }
-.compare-toggle .hint { color: var(--rail-steel); font-weight: normal; }
-.compare-grid .compare-cell.missing { background: #f8f9fa; border: 1px dashed var(--sleeper); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--rail-steel); font-size: 0.85rem; font-style: italic; padding: 0.6rem; }
-.compare-grid .compare-cell.present { position: relative; }
-.compare-grid .compare-cell.present::before { content: "✓"; position: absolute; top: -0.4rem; right: -0.4rem; width: 1.2rem; height: 1.2rem; border-radius: 50%; background: #22863a; color: white; font-size: 0.75rem; display: flex; align-items: center; justify-content: center; font-weight: 700; z-index: 1; }
-@media (max-width: 720px) {
-  .compare-grid { grid-template-columns: 1fr; }
-  .compare-grid > .compare-header { border-bottom: none; padding: 0.6rem 0.1rem 0.2rem; }
-  .compare-grid .compare-cell.missing { min-height: auto; padding: 0.3rem; font-size: 0.75rem; }
-}
+   column under ~720px so it doesn't horizontal-scroll on mobile.
+
+   PR-196b — the .compare-grid / .compare-cell / .compare-header /
+   .compare-controls / .engine-pill rules have moved to the shared
+   stylesheet (loaded via <link> in extra_scripts below) so the
+   network-coverage cell-detail modal can re-use the exact same
+   primitive without copy-pasting ~30 LOC of CSS. The shared file is
+   served from /static/app/css/compare_grid.css (mounted in main.py).
+   Both consumer templates link to it once at the top of their style
+   block. */
 .ojp-ref-panel { margin-top: 1.2rem; border-top: 2px solid var(--sleeper); padding-top: 0.8rem; }
 .ojp-ref-panel h3 { margin: 0 0 0.6rem; font-size: 1rem; }
 .ojp-ref-card { border-left: 3px solid var(--brand-blue); }
@@ -388,6 +354,15 @@
 {% endblock %}
 
 {% block extra_scripts %}
+{# PR-196b — shared compare-grid primitive. The CSS rules powering
+   .compare-grid / .compare-cell / .compare-header / .compare-controls /
+   .engine-pill (and the .alignment-tier-pill used by the network-coverage
+   modal) live in app/static/css/compare_grid.css. The JS exposes
+   window.CompareGrid.{renderGrid, tierPill, escHTML} so renderSideBySideGrid
+   below and the new VIATOR-vs-ÖBB modal in network_coverage.html both
+   consume one source of truth. #}
+<link rel="stylesheet" href="/static/app/css/compare_grid.css">
+<script src="/static/app/js/compare_grid.js"></script>
 <script>
 const SUGGEST_MIN = 2;
 
@@ -1316,30 +1291,32 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   // 2..N are the reference panels (OJP, HAFAS, ...). Each column body
   // re-uses an existing renderer so the per-engine card markup stays
   // canonical (no drift between stacked and side-by-side layouts).
+  //
+  // PR-196b — the actual grid markup is now produced by the shared
+  // `CompareGrid.renderGrid` primitive (app/static/js/compare_grid.js)
+  // so the network-coverage cell modal can re-use the exact same
+  // primitive. The per-column body strings (viatorCardsHtml,
+  // _refColumnBodyHtml(...)) are built here unchanged.
+  // PR-198 — the VIATOR column label comes from `_viatorColumnLabel`
+  // so single-engine SBS reads "VIATOR · MOTIS" / "VIATOR · OTP"
+  // instead of the misleading combined "VIATOR · MOTIS / OTP" when only
+  // one engine actually ran.
+  //
+  // PR-198 — the "Compare excluding walk legs" toggle is prepended
+  // HERE rather than left to `renderComparisonGrid` (its previous-only
+  // host) so it survives single-engine SBS. `_shouldRenderComparison`
+  // requires both engines, so picking Engine="MOTIS only" used to drop
+  // the toggle from the page entirely. The walk-leg filter is global,
+  // so a single top-level toggle above the CompareGrid covers every
+  // column. CompareGrid handles the empty-body fallback itself, so we
+  // pass `viatorCardsHtml || ''` and let the primitive render the
+  // "no itineraries found" placeholder when needed.
   const refs = _refColumnDescriptors(payload);
   const cols = [
-    { key: 'viator', label: _viatorColumnLabel(payload), pillClass: 'viator', body: viatorCardsHtml || '<div class="compare-cell empty">no itineraries found</div>' },
+    { key: 'viator', label: _viatorColumnLabel(payload), pillClass: 'viator', body: viatorCardsHtml || '' },
     ...refs.map((r) => ({ ...r, body: _refColumnBodyHtml(r) })),
   ];
-  const headerRow = cols.map((c) =>
-    `<div class="compare-header"><span class="engine-pill ${c.pillClass}">${escHTML(c.label)}</span></div>`
-  ).join('');
-  const bodyRow = cols.map((c) => `<div class="compare-cell">${c.body}</div>`).join('');
-  // grid-template-columns is driven by --compare-cols inline so the
-  // grid scales 1/2/3 columns without a per-N CSS class. Mobile
-  // collapse via the existing @720px rule still fires (single column).
-  //
-  // The "Compare excluding walk legs" toggle is prepended HERE rather
-  // than left to `renderComparisonGrid` (its previous-only host) so it
-  // survives single-engine SBS — when the user picks Engine="MOTIS only"
-  // `_shouldRenderComparison` returns false (it needs both engines),
-  // and previously the toggle disappeared from the page entirely. The
-  // walk-leg filter is global, so a single top-level toggle covers
-  // every column.
-  return `${_renderToggleControls()}<div class="compare-grid compare-grid-refs" style="--compare-cols: repeat(${cols.length}, 1fr)">
-    ${headerRow}
-    ${bodyRow}
-  </div>`;
+  return `${_renderToggleControls()}${CompareGrid.renderGrid(cols, { variant: 'refs' })}`;
 }
 
 function render(payload) {
