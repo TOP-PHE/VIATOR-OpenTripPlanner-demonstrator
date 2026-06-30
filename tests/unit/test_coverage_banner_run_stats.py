@@ -76,10 +76,7 @@ def test_compute_duration_none_when_started_at_is_none():
     up) have no started_at yet. Banner must render no duration rather
     than crash on `None - None`."""
     assert api._compute_duration_seconds(None, None) is None
-    assert (
-        api._compute_duration_seconds(None, datetime(2026, 6, 28, 9, 0, tzinfo=UTC))
-        is None
-    )
+    assert api._compute_duration_seconds(None, datetime(2026, 6, 28, 9, 0, tzinfo=UTC)) is None
 
 
 def test_compute_duration_for_running_run_uses_now():
@@ -239,9 +236,9 @@ def test_aggregate_response_ms_marshals_rows_into_dict():
 
 def _fmt_run_duration_py(seconds: float | None) -> str | None:
     """Python mirror of the JS `fmtRunDuration` helper. Same rules:
-       < 60s   → "Ns"
-       < 1h    → "Nm0Ms"   (zero-pad seconds)
-       >= 1h   → "NhMMm"   (zero-pad minutes)
+    < 60s   → "Ns"
+    < 1h    → "Nm0Ms"   (zero-pad seconds)
+    >= 1h   → "NhMMm"   (zero-pad minutes)
     """
     if seconds is None:
         return None
