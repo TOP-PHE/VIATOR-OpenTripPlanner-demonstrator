@@ -115,7 +115,12 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
       # so a curl -f probe against them would mark the container unhealthy.
       # start_period mirrors the OTP knob so operators tune big-feed import
       # times the same way for both engines.
-      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/ || exit 1"]
+      # Use wget (ships in the Alpine-based motis image) instead of curl —
+      # the upstream ghcr.io/motis-project/motis image doesn't include curl,
+      # so the previous curl-based probe always failed and every MOTIS
+      # container reported (unhealthy), preventing docker from auto-
+      # restarting MOTIS when the HTTP server actually died.
+      test: ["CMD", "wget", "--spider", "-q", "--timeout=5", "http://localhost:8080/"]
       interval: 30s
       timeout: 10s
       start_period: {start_period}s

@@ -59,17 +59,36 @@ def test_motis_service_points_at_engine_specific_data_dir():
 
 def test_motis_healthcheck_uses_root_endpoint_not_api_v6():
     """Phase-0.5 spike: `GET /api/v6/` returns 400 (the endpoint exists but
-    rejects empty params). `curl -f` would treat that as failure and
+    rejects empty params). A failing probe would treat that as failure and
     crash-loop the container. `GET /` returns 200 (the splash page MOTIS
     prints on boot) — that's the cheapest healthcheck signal."""
     out = render_compose([_StubSession(id="x", engine="motis")])
     motis_block = out.split("motis-x:")[1].split("\n\n")[0]
     # Right endpoint is `/`. Wrong endpoint is `/api/v6/` (would 400).
-    assert "localhost:8080/ " in motis_block or "localhost:8080/ " in motis_block.replace(
-        "|| exit 1", ""
-    )
+    assert "http://localhost:8080/" in motis_block
     assert "localhost:8080/api/v6/" not in motis_block
     assert "localhost:8080/otp/" not in motis_block
+
+
+def test_motis_healthcheck_uses_wget_not_curl():
+    """The upstream ghcr.io/motis-project/motis image is Alpine-based and
+    ships wget but NOT curl. The previous `curl -fsS …` probe therefore
+    failed on every run, so every MOTIS container reported (unhealthy)
+    and docker could not auto-restart MOTIS when it actually hung.
+    `wget --spider` issues a HEAD-like request, ships in the base image,
+    and exits non-zero on HTTP error — exactly what docker's healthcheck
+    contract needs."""
+    out = render_compose([_StubSession(id="x", engine="motis")])
+    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    # Pull out the `test:` line — the actual healthcheck command — so the
+    # negative `curl` assertion isn't tripped by explanatory YAML comments
+    # that mention curl in passing.
+    test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))
+    # The MOTIS image has no curl — the probe must use wget.
+    assert "wget" in test_line
+    assert "--spider" in test_line
+    # Negative assertion: no leftover curl invocation in the actual probe.
+    assert "curl" not in test_line
 
 
 def test_motis_service_overrides_container_user_to_root():
