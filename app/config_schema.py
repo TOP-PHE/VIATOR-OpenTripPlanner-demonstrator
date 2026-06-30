@@ -68,6 +68,20 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     },
     "OJP_API_TOKEN": {"type": "secret", "default": "", "sensitive": True},
     "OJP_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
+    # ── ÖBB HAFAS reference comparison ────────────────────────────────
+    # Opt-in journey-search comparison against ÖBB's public HAFAS
+    # backend (fahrplan.oebb.at/bin/mgate.exe). Unlike OJP, this engine
+    # needs no API token — the Scotty mobile-app credentials embedded
+    # in `app/network_coverage/external_verify.py` are public and have
+    # been stable since 2019. HAFAS_COMPARISON_ENABLED therefore
+    # defaults to True (the journey-UI toggle is rendered as soon as
+    # this is on); the operator still has to tick the per-search
+    # checkbox to actually run it. Coverage is empirically broader
+    # than Swiss OJP — DACH + cross-border partners + Eurostar/TGV/
+    # AVE/Iberian and Nordic-cross-border — see the module docstring
+    # on `external_verify.py` for the 43-pair validation note.
+    "HAFAS_COMPARISON_ENABLED": {"type": "bool", "default": True},
+    "HAFAS_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
     # ── Network coverage matrix ───────────────────────────────────────
     # Tunables for the background coverage runner (app/network_coverage/
     # runner.py). Defaults are bit-identical to the prior hardcoded

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service
 from ..db import get_db
-from ..journey import ojp_client, planner_dispatch, recorder
+from ..journey import hafas_client, ojp_client, planner_dispatch, recorder
 from ..models import GraphSnapshot
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -55,6 +55,16 @@ class FanoutBody(BaseModel):
     # under `ojp_reference` for side-by-side display. Off by default —
     # opt-in per search, see docs/ojp-reference-comparison-design.md.
     compare_ojp: bool = False
+    # When true AND HAFAS_COMPARISON_ENABLED is set, the fanout also
+    # queries ÖBB's public HAFAS backend (`fahrplan.oebb.at/bin/
+    # mgate.exe`) and returns its itineraries under `hafas_reference`.
+    # HAFAS needs no API token (the embedded Scotty app id is public),
+    # so the feature is enabled by default at the platform level and
+    # the operator-side checkbox is the only gate. Covers DACH +
+    # cross-border + Eurostar/TGV/AVE/Iberian + Nordic-cross-border —
+    # see app/network_coverage/external_verify.py for the empirical
+    # 43-pair validation.
+    compare_hafas: bool = False
     # P2 MOTIS — optional engine filter. None = no filter (default, fan out
     # across every fanout-enabled session regardless of engine). When set,
     # the fanout restricts to sessions whose `engine` column matches.
@@ -251,6 +261,67 @@ async def _query_ojp_reference(
         }
 
 
+async def _query_hafas_reference(
+    cfg: dict[str, Any],
+    body: FanoutBody,
+    when: datetime,
+) -> dict[str, Any]:
+    """Query ÖBB's public HAFAS backend for a side-by-side compare.
+
+    Sibling of `_query_ojp_reference` — same return-shape contract
+    (`{status, trips, response_ms, error?}`), same never-raises
+    discipline (a failing reference call must not affect VIATOR's
+    own results). Caller invokes this only after confirming the
+    feature is enabled at the platform level.
+
+    Unlike OJP, HAFAS needs no API token (the embedded Scotty app
+    id is public — see external_verify module docstring); the only
+    gate is `HAFAS_COMPARISON_ENABLED` + the per-search checkbox.
+
+    HAFAS adapters return errors via `raw.status` / `raw.error`
+    rather than raising, so the exception fan-out below is mostly
+    defensive — catches any future regression in the underlying
+    client that lets an httpx exception escape."""
+    start = time.monotonic()
+
+    def _ms() -> int:
+        return int((time.monotonic() - start) * 1000)
+
+    try:
+        raw, trips = await hafas_client.fetch_plan(
+            from_lat=body.from_.lat,
+            from_lon=body.from_.lon,
+            to_lat=body.to.lat,
+            to_lon=body.to.lon,
+            when=when,
+            timeout_ms=int(cfg.get("HAFAS_TIMEOUT_MS", 10_000)),
+            from_name=body.from_.label,
+            to_name=body.to.label,
+        )
+        # `raw.status` is the engine-level verdict ("ok" / "no_route" /
+        # "error"). Lift it into the response so the journey UI's
+        # comparison panel can colour-code it without re-deriving from
+        # `trips` length.
+        status = str(raw.get("status") or ("ok" if trips else "no_route"))
+        result: dict[str, Any] = {
+            "status": status,
+            "trips": trips,
+            "response_ms": _ms(),
+        }
+        if raw.get("error"):
+            result["error"] = str(raw["error"])
+        return result
+    except (TimeoutError, httpx.TimeoutException):
+        return {"status": "timeout", "trips": [], "response_ms": _ms()}
+    except httpx.HTTPError as exc:
+        return {
+            "status": "error",
+            "trips": [],
+            "response_ms": _ms(),
+            "error": f"HAFAS request failed: {type(exc).__name__}",
+        }
+
+
 def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
     return db.execute(
         select(GraphSnapshot)
@@ -433,6 +504,14 @@ async def fanout(
             if body.compare_ojp and cfg.get("OJP_COMPARISON_ENABLED") and cfg.get("OJP_API_TOKEN"):
                 ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
 
+            # Sibling — ÖBB HAFAS comparison. Same concurrent-task model
+            # as OJP. No API-token gate (HAFAS credentials embedded in
+            # external_verify are public), so only the per-search opt-in
+            # + the platform-level enabled flag govern whether it runs.
+            hafas_task: asyncio.Task[dict[str, Any]] | None = None
+            if body.compare_hafas and cfg.get("HAFAS_COMPARISON_ENABLED"):
+                hafas_task = asyncio.create_task(_query_hafas_reference(cfg, body, when))
+
             results = await asyncio.gather(
                 *[
                     _query_session(
@@ -446,8 +525,11 @@ async def fanout(
                     for s in sessions
                 ]
             )
-            # `_query_ojp_reference` never raises — safe to await bare.
+            # Neither `_query_ojp_reference` nor `_query_hafas_reference`
+            # raises — both convert errors into status fields — so safe
+            # to await bare without exception handling here.
             ojp_reference = await ojp_task if ojp_task is not None else None
+            hafas_reference = await hafas_task if hafas_task is not None else None
     except concurrency.ConcurrencyExceeded as exc:
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
@@ -605,6 +687,11 @@ async def fanout(
     # and never persisted (Phase 1 — live display only).
     if ojp_reference is not None:
         response["ojp_reference"] = ojp_reference
+    # Same shape, separate panel — ÖBB HAFAS as a second comparison
+    # engine alongside OJP. Operators can toggle either or both per
+    # search; the UI renders one panel per reference.
+    if hafas_reference is not None:
+        response["hafas_reference"] = hafas_reference
     if comparison_summary is not None:
         response["comparison_summary"] = comparison_summary
     # Stitched cross-session itineraries (hub-and-spoke fallback). Rendered as a

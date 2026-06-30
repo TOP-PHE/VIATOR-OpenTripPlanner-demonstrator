@@ -259,16 +259,21 @@ def journey_page(
     # The "Compare with Swiss OJP reference" checkbox is only rendered
     # when the feature is both enabled AND has a token configured —
     # mirroring the dormant-until-configured rule in config_schema.py.
+    # HAFAS has no token gate (the embedded credentials are public),
+    # so just the boolean enable-flag governs whether the second
+    # checkbox renders.
     cfg = config_service.get_all(db)
     ojp_comparison_enabled = bool(cfg.get("OJP_COMPARISON_ENABLED")) and bool(
         cfg.get("OJP_API_TOKEN")
     )
+    hafas_comparison_enabled = bool(cfg.get("HAFAS_COMPARISON_ENABLED"))
     return templates.TemplateResponse(
         request,
         "journey.html",
         {
             "current_user": user,
             "ojp_comparison_enabled": ojp_comparison_enabled,
+            "hafas_comparison_enabled": hafas_comparison_enabled,
         },
     )
 

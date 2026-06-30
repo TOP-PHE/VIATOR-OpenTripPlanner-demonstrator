@@ -123,3 +123,55 @@ def test_compare_controls_css_present(template_text: str):
     checkbox renders as a bare unstyled input inside the results pane."""
     for css_class in (".compare-controls", ".compare-toggle"):
         assert css_class in template_text, f"Missing CSS rule for {css_class}"
+
+
+# ──────────────────── feat/hafas-journey-comparison ────────────────────
+# Trip-wire tests for the second reference-comparison engine. Same
+# template-pin pattern as the OJP block above — if any of these
+# checkboxes / panels / JS helpers gets renamed or dropped, the
+# HAFAS comparison silently breaks in the browser.
+
+
+def test_hafas_checkbox_gated_by_jinja_flag(template_text: str):
+    """The HAFAS checkbox MUST sit inside a Jinja `if hafas_comparison_enabled`
+    block — without that gate the input renders even when the platform
+    has the feature disabled, leading to confusing "this did nothing"
+    moments for operators."""
+    assert 'id="compare-hafas"' in template_text
+    assert "if hafas_comparison_enabled" in template_text
+
+
+def test_hafas_checkbox_included_in_search_body(template_text: str):
+    """The submit handler must read the checkbox state into the JSON
+    fanout body as `compare_hafas`. Without this the server never
+    learns the operator opted in and the panel never renders."""
+    assert "compare_hafas:" in template_text
+    assert "document.getElementById('compare-hafas')" in template_text
+
+
+def test_hafas_render_function_and_panel_wired(template_text: str):
+    """The render function must exist AND be called from the main
+    render() flow, AND the panel must land in the innerHTML output —
+    skipping any link in the chain produces a payload-with-trips that
+    silently renders blank below VIATOR's results."""
+    assert "function renderHafasReference" in template_text
+    assert "renderHafasReference(payload.hafas_reference)" in template_text
+    assert "${hafasPanel}" in template_text
+
+
+def test_hafas_panel_css_present(template_text: str):
+    """The hafas-ref-panel + hafas-ref-card classes must have CSS
+    rules — without them the panel renders as un-bordered chaos
+    visually indistinguishable from VIATOR's native cards."""
+    assert ".hafas-ref-panel" in template_text
+    assert ".hafas-ref-card" in template_text
+
+
+def test_coverage_tooltip_icons_present_for_both_engines(template_text: str):
+    """Both comparison checkboxes carry a "?" tooltip icon so operators
+    can see scope at a glance. The icons use the `.compare-ref-info`
+    class with a `data-tooltip` attribute (CSS-only hover reveal)."""
+    assert ".compare-ref-info" in template_text  # CSS rule
+    # Both engines have a tooltip string in their data-tooltip attr:
+    assert "Swiss OJP covers:" in template_text
+    assert "ÖBB HAFAS covers:" in template_text
