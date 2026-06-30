@@ -412,6 +412,67 @@ def _hafas_cat_to_mode(cat: str | None) -> str:
     return "RAIL"
 
 
+def _lookup_indexed(idx: Any, table: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """`table[idx]` when `idx` is an int and present, else `{}`. Keeps
+    the HAFAS parsing helpers branchless on the index typing — HAFAS
+    occasionally returns null/missing `locX` / `prodX` indices and we
+    want a uniform empty-dict fallback rather than a sprinkle of
+    isinstance() checks at every call site."""
+    if not isinstance(idx, int):
+        return {}
+    return table.get(idx) or {}
+
+
+def _resolve_section_mode_and_route(
+    sec_type: str,
+    jny: dict[str, Any] | None,
+    products: dict[int, dict[str, Any]],
+) -> tuple[str, str | None]:
+    """`(mode, route_name)` for one HAFAS `secL` section.
+
+    - ``JNY``: mode comes from the product category, route_name is the
+      train number ("RJ 1141") with `line` (short code) as fallback for
+      regional carriers that don't populate `name`.
+    - ``WALK`` / ``TRSF``: ``("WALK", None)`` so the alignment scorer
+      strips it uniformly across HAFAS / MOTIS / VIATOR.
+    - anything else: ``("TRANSIT", None)`` — unknown sections aren't
+      walks (scorer keeps them) but aren't over-claimed as RAIL either.
+    """
+    if sec_type == "JNY":
+        prod = _lookup_indexed((jny or {}).get("prodX"), products)
+        return _hafas_cat_to_mode(prod.get("cat")), prod.get("name") or prod.get("line")
+    if sec_type in ("WALK", "TRSF"):
+        return "WALK", None
+    return "TRANSIT", None
+
+
+def _build_leg_from_section(
+    sec: dict[str, Any],
+    date: str | None,
+    locations: dict[int, dict[str, Any]],
+    products: dict[int, dict[str, Any]],
+) -> VerifyLeg | None:
+    """One HAFAS `secL` entry → one VerifyLeg, or None when the section
+    has no valid dep/arr endpoints (skip rather than emit a half-
+    populated leg the scorer would have to special-case)."""
+    sec_type = (sec.get("type") or "").upper()
+    dep = sec.get("dep") or {}
+    arr = sec.get("arr") or {}
+    if not dep or not arr:
+        return None
+    dep_loc = _lookup_indexed(dep.get("locX"), locations)
+    arr_loc = _lookup_indexed(arr.get("locX"), locations)
+    mode, route_name = _resolve_section_mode_and_route(sec_type, sec.get("jny"), products)
+    return VerifyLeg(
+        mode=mode,
+        from_uic=extract_uic(dep_loc.get("lid")),
+        to_uic=extract_uic(arr_loc.get("lid")),
+        dep_utc=_hafas_time_to_utc_iso(date, dep.get("dTimeS")),
+        arr_utc=_hafas_time_to_utc_iso(date, arr.get("aTimeS")),
+        route_name=route_name,
+    )
+
+
 def _build_itinerary_from_connection(
     conn: dict[str, Any],
     locations: dict[int, dict[str, Any]],
@@ -419,51 +480,20 @@ def _build_itinerary_from_connection(
 ) -> VerifyItinerary:
     """PR-196a — one HAFAS `outConL` entry → one persisted VerifyItinerary.
 
-    Walks every `secL` section: JNY → transit leg with product line as
-    `route_name` + RAIL/BUS/... mode mapped from the product category,
-    WALK/TRSF → mode='WALK' so the alignment scorer can strip uniformly
-    across HAFAS / MOTIS / VIATOR. Endpoints are UIC tokens when the
-    HAFAS lid carries one (the common case for mainline rail) or None
-    otherwise (rare — small bus stops the journey UI never reaches
-    anyway).
+    Walks every `secL` section via `_build_leg_from_section`. JNY → transit
+    leg with product line as `route_name` + RAIL/BUS/... mode mapped from
+    the product category, WALK/TRSF → mode='WALK' so the alignment scorer
+    can strip uniformly across HAFAS / MOTIS / VIATOR. Endpoints are UIC
+    tokens when the HAFAS lid carries one (the common case for mainline
+    rail) or None otherwise (rare — small bus stops the journey UI never
+    reaches anyway).
     """
     date = conn.get("date")
     legs: list[VerifyLeg] = []
     for sec in conn.get("secL") or []:
-        sec_type = (sec.get("type") or "").upper()
-        dep = sec.get("dep") or {}
-        arr = sec.get("arr") or {}
-        if not dep or not arr:
-            continue
-        dep_locx = dep.get("locX")
-        arr_locx = arr.get("locX")
-        dep_loc = locations.get(dep_locx) if isinstance(dep_locx, int) else {}
-        arr_loc = locations.get(arr_locx) if isinstance(arr_locx, int) else {}
-        mode = "WALK"
-        route_name: str | None = None
-        if sec_type == "JNY":
-            jny = sec.get("jny") or {}
-            prod_x = jny.get("prodX")
-            prod = products.get(prod_x) if isinstance(prod_x, int) else {}
-            # `name` is the train number ("RJ 1141"); fall back to the
-            # short line code when name is missing (rare, regional carriers).
-            route_name = (prod or {}).get("name") or (prod or {}).get("line")
-            mode = _hafas_cat_to_mode((prod or {}).get("cat"))
-        elif sec_type not in ("WALK", "TRSF"):
-            # Unknown section type — treat as a generic TRANSIT leg so
-            # the scorer doesn't strip it (it isn't a walk) but doesn't
-            # over-claim it as RAIL either.
-            mode = "TRANSIT"
-        legs.append(
-            VerifyLeg(
-                mode=mode,
-                from_uic=extract_uic((dep_loc or {}).get("lid")),
-                to_uic=extract_uic((arr_loc or {}).get("lid")),
-                dep_utc=_hafas_time_to_utc_iso(date, dep.get("dTimeS")),
-                arr_utc=_hafas_time_to_utc_iso(date, arr.get("aTimeS")),
-                route_name=route_name,
-            )
-        )
+        leg = _build_leg_from_section(sec, date, locations, products)
+        if leg is not None:
+            legs.append(leg)
     dep_node = conn.get("dep") or {}
     arr_node = conn.get("arr") or {}
     chg = conn.get("chg")

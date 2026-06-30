@@ -155,6 +155,29 @@ def _first_transit_dep_dt(transit_legs: list[dict[str, Any]]) -> datetime | None
     return _parse_iso_minute(transit_legs[0].get("departure"))
 
 
+def _is_fuzzy_candidate(
+    o_legs: list[dict[str, Any]],
+    v_first: str,
+    v_last: str,
+    v_train: str,
+    v_dep: datetime,
+) -> bool:
+    """True iff `o_legs` matches the VIATOR side on (first_UIC, last_UIC)
+    endpoints AND first-transit-leg train number AND first-leg departure
+    within ±5 min. Extracted from `_fuzzy_match` so the outer function
+    stays under Sonar's cognitive-complexity ceiling — the cascade of
+    five `continue` checks was the bulk of its complexity."""
+    o_first, o_last = _endpoint_uics(o_legs)
+    if o_first != v_first or o_last != v_last:
+        return False
+    if _first_train_number(o_legs) != v_train:
+        return False
+    o_dep = _first_transit_dep_dt(o_legs)
+    if o_dep is None:
+        return False
+    return abs((v_dep - o_dep).total_seconds()) <= _FUZZY_DEP_TOLERANCE_SECONDS
+
+
 def _fuzzy_match(
     viator_legs: list[dict[str, Any]],
     oebb_candidates: list[tuple[int, list[dict[str, Any]]]],
@@ -171,28 +194,15 @@ def _fuzzy_match(
     risk).
     """
     v_first, v_last = _endpoint_uics(viator_legs)
-    if v_first is None or v_last is None:
-        return None
     v_train = _first_train_number(viator_legs)
-    if v_train is None:
-        return None
     v_dep = _first_transit_dep_dt(viator_legs)
-    if v_dep is None:
+    if v_first is None or v_last is None or v_train is None or v_dep is None:
         return None
     for idx, o_legs in oebb_candidates:
         if idx in already_matched_oebb:
             continue
-        o_first, o_last = _endpoint_uics(o_legs)
-        if o_first != v_first or o_last != v_last:
-            continue
-        if _first_train_number(o_legs) != v_train:
-            continue
-        o_dep = _first_transit_dep_dt(o_legs)
-        if o_dep is None:
-            continue
-        if abs((v_dep - o_dep).total_seconds()) > _FUZZY_DEP_TOLERANCE_SECONDS:
-            continue
-        return idx
+        if _is_fuzzy_candidate(o_legs, v_first, v_last, v_train, v_dep):
+            return idx
     return None
 
 
@@ -218,6 +228,41 @@ def _classify_score(score: float | None, v_n: int, o_n: int) -> str:
     if score > 0.0:
         return "disagree"
     return "no_overlap"
+
+
+def _find_first_fp_match(v_fp: str, oebb_fps: list[str], already_matched: set[int]) -> int | None:
+    """First unmatched ÖBB index whose fingerprint equals `v_fp`, or None.
+    Empty (`""`) ÖBB fingerprints are never matchable — they mean "no
+    comparable transit spine"."""
+    for o_idx, o_fp in enumerate(oebb_fps):
+        if o_idx in already_matched or not o_fp:
+            continue
+        if v_fp == o_fp:
+            return o_idx
+    return None
+
+
+def _exact_pass(viator_fps: list[str], oebb_fps: list[str]) -> tuple[set[int], list[int], float]:
+    """Pair each non-empty VIATOR fingerprint to the first unmatched ÖBB
+    fingerprint that equals it. Returns
+    ``(matched_oebb_indices, unmatched_viator_indices, total_credits)``.
+    Extracted from `compute_alignment` so that function stays under
+    Sonar's cognitive-complexity ceiling — the nested-loop + branch
+    cluster here was the bulk of its complexity."""
+    matched_oebb: set[int] = set()
+    unmatched_viator: list[int] = []
+    score_credits = 0.0
+    for v_idx, v_fp in enumerate(viator_fps):
+        if not v_fp:
+            unmatched_viator.append(v_idx)
+            continue
+        hit = _find_first_fp_match(v_fp, oebb_fps, matched_oebb)
+        if hit is None:
+            unmatched_viator.append(v_idx)
+            continue
+        matched_oebb.add(hit)
+        score_credits += _EXACT_CREDIT
+    return matched_oebb, unmatched_viator, score_credits
 
 
 def compute_alignment(
@@ -252,29 +297,8 @@ def compute_alignment(
     viator_fps = [transit_fingerprint(legs) for legs in viator_spines]
     oebb_fps = [transit_fingerprint(legs) for legs in oebb_legs_lists]
 
-    # Exact pass: every non-empty fingerprint match scores 1.0. An empty
-    # fingerprint on either side means "no comparable transit spine" —
-    # never matches (transit_fingerprint returns "" for walk-only or
-    # empty itineraries).
-    matched_oebb: set[int] = set()
-    unmatched_viator: list[int] = []
-    credits = 0.0
-    for v_idx, v_fp in enumerate(viator_fps):
-        if not v_fp:
-            unmatched_viator.append(v_idx)
-            continue
-        hit: int | None = None
-        for o_idx, o_fp in enumerate(oebb_fps):
-            if o_idx in matched_oebb or not o_fp:
-                continue
-            if v_fp == o_fp:
-                hit = o_idx
-                break
-        if hit is not None:
-            matched_oebb.add(hit)
-            credits += _EXACT_CREDIT
-        else:
-            unmatched_viator.append(v_idx)
+    # Exact pass: every non-empty fingerprint match scores 1.0.
+    matched_oebb, unmatched_viator, score_credits = _exact_pass(viator_fps, oebb_fps)
 
     # Fuzzy fallback: each VIATOR trip the exact pass missed gets one
     # shot at the ÖBB candidates that are still unmatched. Same-
@@ -285,10 +309,10 @@ def compute_alignment(
         matched_idx = _fuzzy_match(viator_spines[v_idx], oebb_candidates, matched_oebb)
         if matched_idx is not None:
             matched_oebb.add(matched_idx)
-            credits += _FUZZY_CREDIT
+            score_credits += _FUZZY_CREDIT
 
     denominator = max(min(v_n, _SCORE_CAP_PER_SIDE), min(o_n, _SCORE_CAP_PER_SIDE))
-    score = round(credits / denominator, 2) if denominator > 0 else 0.0
+    score = round(score_credits / denominator, 2) if denominator > 0 else 0.0
     # Cap at 1.0 — possible to overshoot when ÖBB returns 1 trip and
     # VIATOR returns 3 matches against it (each scored 1.0). The
     # operator question is "do we agree?", not "how many?", so saturate.
