@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
@@ -303,6 +303,19 @@ class RunSummary(BaseModel):
     window_end_local: str | None = None
     window_timezone: str | None = None
     reference_date: str | None = None
+    # PR-190 — banner stats so operators watching a long run can see
+    # "how long has it been running" and "how fast is the runner". All
+    # four fields are NULL until at least one cell has finished:
+    #   duration_seconds — wall-clock since started_at; uses `now` while
+    #     in-flight, finished_at once the run is terminal. Clamped >=0
+    #     to avoid negative values on clock skew between writers.
+    #   response_ms_(min|avg|max) — aggregated from
+    #     NetworkCoverageResult.response_ms across this run's cells
+    #     (per-cell wall-clock OTP took to answer). NULL on a 0-cell run.
+    duration_seconds: float | None = None
+    response_ms_min: int | None = None
+    response_ms_avg: float | None = None
+    response_ms_max: int | None = None
 
 
 class ResultEntry(BaseModel):
@@ -552,9 +565,15 @@ def list_runs(
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
     limit: int = 20,
 ) -> list[RunSummary]:
-    """Recent coverage runs, newest first. The admin page sidebar."""
+    """Recent coverage runs, newest first. The admin page sidebar.
+
+    PR-190 — surfaces per-cell response_ms min/avg/max in the banner.
+    Aggregated in one batched query so a 20-run sidebar still costs
+    exactly one extra round-trip.
+    """
     rows = runner.list_recent_runs(db, limit=limit)
-    return [_run_to_summary(r) for r in rows]
+    stats_by_run = _aggregate_response_ms(db, [r.id for r in rows])
+    return [_run_to_summary(r, response_ms_stats=stats_by_run.get(r.id)) for r in rows]
 
 
 @router.post(
@@ -982,7 +1001,9 @@ def get_run(
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
-    summary = _run_to_summary(run)
+    # PR-190 — compute response_ms stats from the in-memory results we
+    # already loaded; a second DB round-trip would be wasteful here.
+    summary = _run_to_summary(run, response_ms_stats=_stats_from_results(results))
     return RunDetail(
         **summary.model_dump(),
         summary=run.summary,
@@ -1294,7 +1315,106 @@ def _validate_fanout_mode(body: RunCreate, db: DbSession) -> None:
         )
 
 
-def _run_to_summary(run: Any) -> RunSummary:
+def _stats_from_results(
+    results: list[Any],
+) -> tuple[int | None, float | None, int | None] | None:
+    """PR-190 — compute (min, avg, max) of `response_ms` over an in-memory
+    list of NetworkCoverageResult rows. Used by the per-run detail
+    endpoint which already loaded the full result set; avoids a second
+    aggregation round-trip.
+
+    Returns None when no row has a non-NULL `response_ms` so the
+    template's `{% if duration_seconds %}` style guards collapse cleanly.
+    """
+    timings = [r.response_ms for r in results if getattr(r, "response_ms", None) is not None]
+    if not timings:
+        return None
+    return (min(timings), sum(timings) / len(timings), max(timings))
+
+
+def _compute_duration_seconds(
+    started_at: datetime | None,
+    finished_at: datetime | None,
+) -> float | None:
+    """PR-190 — wall-clock duration of a coverage run, in seconds.
+
+    - In-flight runs (`finished_at is None`): "now - started_at"
+    - Terminal runs: "finished_at - started_at"
+    - Pre-start rows (`started_at is None`): None — nothing to time yet.
+
+    Clamped >=0 so two writers with clock skew can never surface a
+    negative number in the banner.
+
+    Uses UTC `now` because every timestamp in the row is stored
+    `DateTime(timezone=True)`. We normalise naive timestamps to UTC
+    defensively in case a MagicMock-shaped test fixture leaves the
+    tzinfo unset — datetime arithmetic on a naive + aware pair raises
+    TypeError, which would surface as a 500 from the banner.
+    """
+    if started_at is None:
+        return None
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    end = finished_at if finished_at is not None else datetime.now(UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    delta = (end - started_at).total_seconds()
+    return max(delta, 0.0)
+
+
+def _aggregate_response_ms(
+    db: DbSession, run_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, tuple[int | None, float | None, int | None]]:
+    """PR-190 — single batched MIN / AVG / MAX query over
+    NetworkCoverageResult.response_ms grouped by run_id.
+
+    Used by the sidebar list (many runs at once) so a 20-run sidebar
+    doesn't trigger 20 round-trips. Returns a dict keyed by run_id with
+    `(min_ms, avg_ms, max_ms)` tuples; missing keys mean "no cells with
+    response_ms set in that run" — the caller should treat those as the
+    NULL/NULL/NULL banner case.
+
+    Empty `run_ids` short-circuits to an empty dict so the caller doesn't
+    have to special-case the no-runs sidebar.
+    """
+    if not run_ids:
+        return {}
+    rows = db.execute(
+        select(
+            NetworkCoverageResult.run_id,
+            func.min(NetworkCoverageResult.response_ms),
+            func.avg(NetworkCoverageResult.response_ms),
+            func.max(NetworkCoverageResult.response_ms),
+        )
+        .where(NetworkCoverageResult.run_id.in_(run_ids))
+        .where(NetworkCoverageResult.response_ms.is_not(None))
+        .group_by(NetworkCoverageResult.run_id)
+    ).all()
+    out: dict[uuid.UUID, tuple[int | None, float | None, int | None]] = {}
+    for run_id, min_ms, avg_ms, max_ms in rows:
+        out[run_id] = (
+            int(min_ms) if min_ms is not None else None,
+            float(avg_ms) if avg_ms is not None else None,
+            int(max_ms) if max_ms is not None else None,
+        )
+    return out
+
+
+def _run_to_summary(
+    run: Any,
+    *,
+    response_ms_stats: tuple[int | None, float | None, int | None] | None = None,
+) -> RunSummary:
+    duration_seconds = _compute_duration_seconds(
+        getattr(run, "started_at", None),
+        getattr(run, "finished_at", None),
+    )
+    if response_ms_stats is None:
+        rmin: int | None = None
+        ravg: float | None = None
+        rmax: int | None = None
+    else:
+        rmin, ravg, rmax = response_ms_stats
     return RunSummary(
         id=str(run.id),
         session_id=run.session_id,
@@ -1331,6 +1451,14 @@ def _run_to_summary(run: Any) -> RunSummary:
         window_end_local=_time_to_hhmm(getattr(run, "window_end_local", None)),
         window_timezone=_safe_str(getattr(run, "window_timezone", None)),
         reference_date=_safe_iso_date(getattr(run, "reference_date", None)),
+        # PR-190 — banner stats. duration is always computable when
+        # started_at is set; per-cell response stats need to be passed
+        # in by the caller (a single batched query handles the sidebar
+        # list; the per-run endpoint runs its own query).
+        duration_seconds=duration_seconds,
+        response_ms_min=rmin,
+        response_ms_avg=ravg,
+        response_ms_max=rmax,
     )
 
 
