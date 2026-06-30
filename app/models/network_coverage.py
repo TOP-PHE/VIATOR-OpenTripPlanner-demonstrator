@@ -275,6 +275,20 @@ class NetworkCoverageResult(Base):
     external_source: Mapped[str | None] = mapped_column(String, nullable=True)
     external_error: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # PR-196a — per-cell ÖBB itinerary capture + alignment heatmap. The
+    # sweep persists the full normalised itinerary list so the cell-
+    # trips modal can render the ÖBB side-by-side against VIATOR
+    # without re-querying HAFAS. `external_alignment_score` is 0.0-1.0
+    # (NULL when not computable: one or both sides empty in the no_data
+    # tier). `external_alignment_tier` is the human-readable bucket the
+    # matrix uses to colour cells: agree / mostly_agree / partial /
+    # disagree / no_overlap / one_sided_viator / one_sided_oebb /
+    # no_service / no_data. See app/network_coverage/alignment.py for
+    # the scoring rules.
+    external_itineraries: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    external_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    external_alignment_tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
 
 class NetworkCoverageHub(Base):
     """v0.1.31 — operator-editable hub catalog.

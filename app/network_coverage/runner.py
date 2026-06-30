@@ -44,6 +44,8 @@ from .. import config_service
 from ..db import SessionLocal
 from ..journey import planner_dispatch, recorder
 from ..models import (
+    JourneySearchExecution,
+    JourneyTrip,
     NetworkCoverageHub,
     NetworkCoverageResult,
     NetworkCoverageRun,
@@ -51,6 +53,7 @@ from ..models import (
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from . import external_verify  # PR-E — auto-verify-on-completion sweep
+from .alignment import compute_alignment  # PR-196a — graduated heatmap scorer
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
 # PR #36 — valid coverage-run modes.
@@ -1251,22 +1254,92 @@ async def _maybe_run_external_verify_sweep(
 
     `cfg` is PR-2's operator-tunable knob bundle. Defaults to a fresh
     `CoverageConfig()` (= prior hardcoded constants) when called from a
-    test that doesn't thread one in."""
+    test that doesn't thread one in.
+
+    PR-196a — the candidate filter (no_route / timeout / error only) was
+    REMOVED. Today's "Show only where ÖBB disagrees" UI broke on every
+    status='ok' cell because PR-E left their `external_ok` NULL, the
+    binary filter hid every NULL, and the operator saw a white matrix.
+    The graduated heatmap shipped here needs every cell scored to colour
+    it, so we sweep them all. Rate limiting stays in
+    `_run_external_verify_sweep` via the existing Semaphore + sleep —
+    sweeping a full 650-pair run takes longer but stays under ÖBB's
+    courtesy cap (~1 req/s) by construction.
+    """
     cfg = cfg or CoverageConfig()
     zero = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
     if not getattr(run, "verify_externally", False):
         return zero
-    candidate_rows = [r for r in rows if r.status in _VERIFY_STATUSES]
+    # PR-196a — sweep every non-skipped row so the heatmap can score
+    # ok-cells too (the bug being fixed). 'skipped' rows stay out
+    # because they never got a real VIATOR answer to compare against.
+    candidate_rows = [r for r in rows if r.status != "skipped"]
     log.info(
-        "PR-E external-verify sweep starting for run %s - %d candidate cells",
+        "PR-196a external-verify sweep starting for run %s - %d candidate cells",
         run.id,
         len(candidate_rows),
     )
     if not candidate_rows:
         return zero
     counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows, cfg=cfg)
-    log.info("PR-E external-verify sweep done for run %s - %s", run.id, counters)
+    log.info("PR-196a external-verify sweep done for run %s - %s", run.id, counters)
     return counters
+
+
+def _fetch_viator_trips_for_search(
+    db: DbSession, search_id: uuid.UUID | None
+) -> list[dict[str, Any]]:
+    """PR-196a — pull the VIATOR-side trip dicts for one search_id.
+
+    Used by the alignment scorer to compare against ÖBB's itineraries.
+    Returns the canonical (legs[], duration_seconds, num_transfers,
+    departure_at, arrival_at, modes) shape `_fetch_trips_by_search`
+    emits in the admin API — the alignment scorer only reads `legs`,
+    but threading the full dict keeps the data contract identical to
+    what the modal renders. Empty list when search_id is NULL or the
+    JOIN finds no rows (status='ok' but no trips = the alignment
+    treats VIATOR as one-sided empty)."""
+    if search_id is None:
+        return []
+    rows = (
+        db.execute(
+            select(JourneyTrip)
+            .join(JourneySearchExecution, JourneyTrip.execution_id == JourneySearchExecution.id)
+            .where(JourneySearchExecution.search_id == search_id)
+            .order_by(JourneyTrip.rank_in_response)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "duration_seconds": t.duration_seconds,
+            "num_transfers": t.num_transfers,
+            "departure_at": t.departure_at.isoformat() if t.departure_at else None,
+            "arrival_at": t.arrival_at.isoformat() if t.arrival_at else None,
+            "modes": t.modes,
+            "legs": t.legs or [],
+        }
+        for t in rows
+    ]
+
+
+def _persist_alignment_on_row(
+    row: NetworkCoverageResult,
+    viator_trips: list[dict[str, Any]],
+    itineraries: list[external_verify.VerifyItinerary],
+) -> None:
+    """PR-196a — score the (VIATOR, ÖBB) pair, persist itineraries +
+    score + tier onto the row in-place. Extracted from the per-cell
+    coroutine so the sweep stays under Sonar's cognitive-complexity
+    ceiling."""
+    score, tier = compute_alignment(viator_trips, itineraries)
+    # JSONB column — Pydantic dump keeps the shape stable across
+    # writes / reads. `mode="json"` resolves any datetime / UUID
+    # fields to ISO strings so the column round-trips losslessly.
+    row.external_itineraries = [it.model_dump(mode="json") for it in itineraries]
+    row.external_alignment_score = score
+    row.external_alignment_tier = tier
 
 
 async def _run_external_verify_sweep(
@@ -1288,6 +1361,12 @@ async def _run_external_verify_sweep(
     `cfg` is PR-2's operator-tunable knob bundle (verify_parallelism,
     verify_timeout_s, verify_sleep_ms). Defaults to `CoverageConfig()`
     when called directly from a test that doesn't supply one.
+
+    PR-196a — additionally fetches VIATOR-side trips per cell, computes
+    a graduated alignment score + tier via `compute_alignment`, and
+    persists those (plus the per-itinerary ÖBB detail) onto the same
+    row so the matrix UI's viridis heatmap renders without a second
+    round-trip.
 
     Returns rollup counters for run.summary."""
     cfg = cfg or CoverageConfig()
@@ -1329,6 +1408,13 @@ async def _run_external_verify_sweep(
                     row.external_best_transfers = verdict.best_transfers
                     row.external_error = verdict.error
                     row.external_verified_at = datetime.now(UTC)
+                    # PR-196a — score the (VIATOR, ÖBB) overlap + persist
+                    # itineraries / score / tier for the heatmap. Errored
+                    # verdicts get an empty ÖBB side ("we couldn't ask")
+                    # which the scorer maps to no_service / one_sided
+                    # based on whether VIATOR returned anything.
+                    viator_trips = _fetch_viator_trips_for_search(db, row.journey_search_id)
+                    _persist_alignment_on_row(row, viator_trips, verdict.itineraries)
                     counters["verified"] += 1
                     if verdict.error is not None:
                         counters["error"] += 1

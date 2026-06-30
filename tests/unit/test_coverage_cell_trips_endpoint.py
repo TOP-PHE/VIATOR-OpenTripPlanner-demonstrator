@@ -59,6 +59,13 @@ def _result_row(origin, dest, status="ok", journey_search_id=None, **extra):
     r.external_source = extra.get("external_source")
     r.external_error = extra.get("external_error")
     r.external_verified_at = extra.get("external_verified_at")
+    # PR-196a — same NULL-defaults rule for the alignment heatmap columns.
+    # Pydantic validators on CellTripsDirection reject the auto-mocked
+    # child MagicMock; explicit None matches the legacy / un-swept row
+    # shape.
+    r.external_itineraries = extra.get("external_itineraries")
+    r.external_alignment_score = extra.get("external_alignment_score")
+    r.external_alignment_tier = extra.get("external_alignment_tier")
     return r
 
 
@@ -271,6 +278,91 @@ def test_get_cell_trips_passes_only_non_null_search_ids_to_fetcher(monkeypatch):
 
     # Only the outbound row's search id should reach the fetcher.
     assert captured_ids == [out_row.journey_search_id]
+
+
+def test_get_cell_trips_round_trips_alignment_fields_into_response(monkeypatch):
+    """PR-196a — when the sweep has populated alignment fields on the
+    row, the cell-trips response must surface them verbatim so the
+    matrix heatmap and the future side-by-side modal don't have to
+    refetch. Pinning so a refactor that drops one of the three fields
+    from `_row_to_direction` doesn't silently degrade the heatmap to
+    grey for cells that have a tier."""
+    from app.api.admin import network_coverage as api
+
+    run = _run_row(direction="single")
+    fake_itinerary = {
+        "legs": [
+            {
+                "mode": "RAIL",
+                "from_uic": "UIC:8014441",
+                "to_uic": "UIC:8503000",
+                "dep_utc": "2026-06-28T08:00",
+                "arr_utc": "2026-06-28T12:30",
+                "route_name": "ICE 24",
+            }
+        ],
+        "departure_at": "2026-06-28T08:00",
+        "arrival_at": "2026-06-28T12:30",
+        "duration_seconds": 4 * 3600 + 30 * 60,
+        "num_transfers": 0,
+    }
+    out_row = _result_row(
+        "bxl-mid",
+        "gva-c",
+        status="ok",
+        external_itineraries=[fake_itinerary],
+        external_alignment_score=0.7,
+        external_alignment_tier="mostly_agree",
+    )
+    db = _db_returning(run=run, rows=[out_row])
+
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+
+    resp = api.get_cell_trips(
+        run_id=run.id,
+        origin_id="bxl-mid",
+        dest_id="gva-c",
+        db=db,
+        _=_fake_actor(),
+    )
+
+    assert resp.outbound is not None
+    assert resp.outbound.external_alignment_score == 0.7
+    assert resp.outbound.external_alignment_tier == "mostly_agree"
+    assert resp.outbound.external_itineraries == [fake_itinerary]
+
+
+def test_get_cell_trips_rejects_unknown_alignment_tier(monkeypatch):
+    """PR-196a — the Pydantic `AlignmentTier` Literal on CellTripsDirection
+    must reject a tier label the JS palette doesn't know about. Catches
+    scorer-vs-UI drift at the API boundary instead of silently shipping
+    a CSS-unmapped tier that renders as a transparent cell."""
+    from pydantic import ValidationError
+
+    from app.api.admin import network_coverage as api
+
+    run = _run_row(direction="single")
+    # Deliberately corrupt tier value — what a buggy future scorer
+    # might emit if a new tier was added without coordinating with the
+    # API Literal + CSS palette.
+    out_row = _result_row(
+        "bxl-mid",
+        "gva-c",
+        status="ok",
+        external_alignment_tier="some_new_tier_we_forgot_to_register",
+    )
+    db = _db_returning(run=run, rows=[out_row])
+
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+
+    with pytest.raises(ValidationError):
+        api.get_cell_trips(
+            run_id=run.id,
+            origin_id="bxl-mid",
+            dest_id="gva-c",
+            db=db,
+            _=_fake_actor(),
+        )
 
 
 def test_get_cell_trips_response_serialises_return_under_return_key():

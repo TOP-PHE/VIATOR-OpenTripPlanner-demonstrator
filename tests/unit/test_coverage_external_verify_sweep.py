@@ -130,6 +130,17 @@ def _make_row(origin="bxl-mid", dest="gva-c", status="no_route"):
     r.external_source = None
     r.external_error = None
     r.external_verified_at = None
+    # PR-196a — alignment-heatmap fields. The sweep writes these even
+    # when the VIATOR side is empty (one-sided tiers), so the stub has
+    # to leave them as plain `None` rather than the auto-MagicMock
+    # default that would confuse equality assertions in tests.
+    r.external_itineraries = None
+    r.external_alignment_score = None
+    r.external_alignment_tier = None
+    # PR-196a — the sweep fetches VIATOR trips by journey_search_id;
+    # None bypasses the fetch (returns []), matching every legacy test
+    # that pre-dated the alignment hook.
+    r.journey_search_id = None
     return r
 
 
@@ -302,6 +313,134 @@ async def test_sweep_handles_soft_deleted_hub():
     assert row.external_source == "fahrplan.oebb.at"
     assert row.external_verified_at is not None
     assert counters == {"verified": 1, "ok": 0, "no_route": 0, "error": 1}
+
+
+@pytest.mark.asyncio
+async def test_sweep_writes_alignment_fields_on_successful_verify():
+    """PR-196a — after a successful verify the sweep MUST also persist
+    the alignment trio (external_itineraries / score / tier) so the
+    heatmap has something to render. Without this assertion a refactor
+    that drops the `_persist_alignment_on_row` call would silently leave
+    the matrix grey on rows that have a verdict but no tier."""
+    hubs = {
+        "bxl-mid": _make_hub("bxl-mid", 50.8358, 4.3361),
+        "gva-c": _make_hub("gva-c", 46.2104, 6.1424),
+    }
+    db = _make_db_with_hubs(hubs)
+    run = _make_run()
+    row = _make_row()
+    rows = [row]
+
+    # ÖBB returns one itinerary; the scorer would normally pull VIATOR
+    # trips via the search_id JOIN — we stub _fetch_viator_trips_for_search
+    # to skip the DB hop, and compute_alignment to pin the (score, tier)
+    # output independent of the actual scoring algorithm.
+    fake_itinerary = external_verify.VerifyItinerary(
+        legs=[
+            external_verify.VerifyLeg(
+                mode="RAIL",
+                from_uic="UIC:8014441",
+                to_uic="UIC:8503000",
+                dep_utc="2026-06-28T08:00",
+                arr_utc="2026-06-28T12:30",
+                route_name="ICE 24",
+            )
+        ],
+        departure_at="2026-06-28T08:00",
+        arrival_at="2026-06-28T12:30",
+        duration_seconds=4 * 3600 + 30 * 60,
+        num_transfers=0,
+    )
+    fake_verify = AsyncMock(
+        return_value=external_verify.VerifyResult(
+            source="fahrplan.oebb.at",
+            ok=True,
+            num_connections=1,
+            best_duration_seconds=4 * 3600 + 30 * 60,
+            best_transfers=0,
+            itineraries=[fake_itinerary],
+        )
+    )
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with (
+        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
+        patch.object(runner, "_fetch_viator_trips_for_search", return_value=[]),
+        patch.object(runner, "compute_alignment", return_value=(0.7, "mostly_agree")),
+    ):
+        await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
+
+    assert row.external_alignment_score == 0.7
+    assert row.external_alignment_tier == "mostly_agree"
+    # JSONB column was populated with the dumped itinerary list — pin the
+    # length, not the exact shape, so a future field addition doesn't
+    # break the test.
+    assert isinstance(row.external_itineraries, list)
+    assert len(row.external_itineraries) == 1
+
+
+# ─────────────────────── _maybe_run_external_verify_sweep candidate filter ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_sweep_verifies_status_ok_cells_not_just_failures():
+    """PR-196a regression guard: the candidate filter used to be
+    (status in {no_route, timeout, error}) — which left every status='ok'
+    cell with NULL external_ok and broke the 'Show only where ÖBB
+    disagrees' filter (the whole matrix went white). The new filter
+    sweeps every non-skipped row so the heatmap can score ok-cells too.
+
+    This test asserts the new behaviour by passing rows in all the
+    relevant statuses and capturing the rows actually dispatched to
+    `_run_external_verify_sweep`."""
+    captured: list = []
+
+    async def _capture_sweep(*, db, run, rows, cfg):
+        captured.extend(rows)
+        return {"verified": len(rows), "ok": 0, "no_route": 0, "error": 0}
+
+    rows = [
+        _make_row("a", "b", status="ok"),
+        _make_row("c", "d", status="no_route"),
+        _make_row("e", "f", status="timeout"),
+        _make_row("g", "h", status="error"),
+        _make_row("i", "j", status="skipped"),  # only status that must NOT sweep
+    ]
+    db = MagicMock()
+    run = _make_run(verify_externally=True)
+
+    with patch.object(runner, "_run_external_verify_sweep", side_effect=_capture_sweep):
+        await runner._maybe_run_external_verify_sweep(db=db, run=run, rows=rows)
+
+    captured_statuses = sorted(r.status for r in captured)
+    assert captured_statuses == ["error", "no_route", "ok", "timeout"]
+    # 'skipped' rows are never swept — there's no VIATOR answer to score
+    # against and they exist for legitimate exclusion reasons (e.g.
+    # same-hub diagonal, configured exclusion).
+    assert all(r.status != "skipped" for r in captured)
+
+
+@pytest.mark.asyncio
+async def test_maybe_sweep_returns_zero_when_run_did_not_opt_in():
+    """Opt-out path: a run with verify_externally=False short-circuits
+    before any candidate filter — no rows are dispatched even if every
+    row has a status that would qualify. Pinned so a refactor that
+    moves the verify_externally check inside the filter doesn't
+    accidentally start sweeping every legacy run."""
+    captured: list = []
+
+    async def _capture_sweep(*, db, run, rows, cfg):
+        captured.extend(rows)
+        return {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+
+    rows = [_make_row("a", "b", status="no_route")]
+    db = MagicMock()
+    run = _make_run(verify_externally=False)
+
+    with patch.object(runner, "_run_external_verify_sweep", side_effect=_capture_sweep):
+        counters = await runner._maybe_run_external_verify_sweep(db=db, run=run, rows=rows)
+
+    assert captured == []
+    assert counters == {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
 
 
 @pytest.mark.asyncio

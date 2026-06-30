@@ -268,18 +268,78 @@ main {
 .cov-ext-green  { background: #1a7f37; }
 .cov-ext-blue   { background: #1d4ed8; }
 .cov-ext-yellow { background: #d97706; }
-/* Filter mode — hide every cell whose external_ok isn't true. CSS does
-   the heavy lifting; the toggle handler just adds/removes the class on
-   <body> so it survives the matrix re-render every 5 s. */
-body.cov-filter-ext-disagrees .cov-matrix td:not([data-external-ok="true"]):not(.diag):not(.empty) {
-  visibility: hidden;
+/* PR-196a — graduated alignment heatmap. Replaces the binary
+   "Show only where ÖBB disagrees" filter (which hid every cell whose
+   external_ok wasn't true and produced the white-matrix bug when
+   status='ok' cells had NULL external_ok). The new dropdown gates
+   visibility via body.cov-align-mode-* classes; the cells themselves
+   carry data-alignment-tier so the colour swatch always renders
+   regardless of filter state.
+
+   Palette: viridis-inspired, colourblind-safe. Agree = deep purple
+   (the "I'm confident" anchor), mostly = teal, partial = green-yellow,
+   disagree = bright yellow (high attention), no_overlap = orange
+   (you have data but it doesn't match), one_sided / no_service =
+   greys (informational, not action-required), no_data = lightest
+   grey (rows that pre-date the sweep). */
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="agree"]            { background: #440154; color: #fff; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="mostly_agree"]     { background: #31688e; color: #fff; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="partial"]          { background: #35b779; color: #0d2616; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="disagree"]         { background: #fde725; color: #4a3500; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="no_overlap"]       { background: #e76f51; color: #fff; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="one_sided_viator"] { background: #b8b8b8; color: #1c1c1c; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="one_sided_oebb"]   { background: #8a8a8a; color: #fff; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="no_service"]       { background: #d8d8d8; color: #4a4a4a; }
+body.cov-align-mode-colors .cov-matrix td[data-alignment-tier="no_data"]          { background: #f0f0f0; color: #8a939d; }
+
+/* "Disagrees only" — keep the agree / mostly_agree / partial / one_sided /
+   no_service / no_data cells but render them washed-out so the
+   disagree + no_overlap cells stand out without losing matrix
+   context. Same body-class wins over the colour mode if both apply. */
+body.cov-align-mode-disagrees .cov-matrix td:not([data-alignment-tier="disagree"]):not([data-alignment-tier="no_overlap"]):not(.diag):not(.empty) {
+  opacity: 0.18;
 }
+body.cov-align-mode-disagrees .cov-matrix td[data-alignment-tier="disagree"],
+body.cov-align-mode-disagrees .cov-matrix td[data-alignment-tier="no_overlap"] {
+  outline: 2px solid #cf222e;
+  outline-offset: -2px;
+}
+/* "Mostly disagrees" — yellow + orange + red surface; partial gets
+   soft-faded but still readable. */
+body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):not([data-alignment-tier="no_overlap"]):not([data-alignment-tier="partial"]):not(.diag):not(.empty) {
+  opacity: 0.3;
+}
+
+/* Small numeric badge in the corner of each scored cell — the operator
+   sees the actual score (0.0-1.0) without having to hover. Two
+   characters max ("0.7", "1.0") so it fits without crowding the
+   cell content. */
+.cov-matrix td .cov-align-badge {
+  position: absolute;
+  bottom: 1px;
+  right: 2px;
+  font-size: 0.6rem;
+  font-weight: 600;
+  color: inherit;
+  opacity: 0.7;
+  pointer-events: none;
+  line-height: 1;
+}
+.cov-matrix td { position: relative; }
+
 .cov-filter-toggle {
   display: inline-flex;
   gap: 0.4rem;
   align-items: center;
   font-size: 0.8rem;
   margin-left: 0.6rem;
+  cursor: pointer;
+}
+.cov-filter-toggle select {
+  font-size: 0.8rem;
+  padding: 0.1rem 0.3rem;
+  border: 1px solid #d0d7de;
+  border-radius: 3px;
   cursor: pointer;
 }
 
@@ -567,12 +627,16 @@ let CURRENT_POLL_HANDLE = null;
 // the operator's choice survives page reloads.
 let CURRENT_VIEW = (typeof localStorage !== 'undefined' && localStorage.getItem('cov_view')) || 'hybrid';
 
-// PR-E — module-level state for the "Show only where ÖBB disagrees"
-// filter. Lives outside renderRun() so the toggle survives the 5s
-// matrix re-render (renderRun() rebuilds the whole grid on every
-// poll; the body-class drives the CSS visibility filter so we just
-// re-apply on each render to keep the operator's selection sticky).
-let EXT_DISAGREES_FILTER = false;
+// PR-196a — module-level state for the alignment-mode dropdown.
+// Replaces the PR-E binary EXT_DISAGREES_FILTER (which had the
+// white-matrix bug — hid every NULL external_ok cell, i.e. every
+// status='ok' cell in pre-PR-196a runs). Four modes:
+//   'off'        — no heatmap (legacy status-colour render)
+//   'colors'     — full viridis tier heatmap
+//   'disagrees'  — fade everything except disagree + no_overlap
+//   'mostly'     — fade everything except disagree + no_overlap + partial
+// Lives outside renderRun() so the dropdown survives the 5s re-render.
+let ALIGNMENT_MODE = 'off';
 
 function escHTML(s) {
   if (s === null || s === undefined) return '';
@@ -621,33 +685,68 @@ function buildVerifyBlock(dir, label) {
   </div>`;
 }
 
-// PR-E — `data-external-ok` attribute for a matrix cell <td>. Drives
-// the "Show only where ÖBB disagrees" CSS filter via three branches
-// (true | false | absent). Returns the entire attribute fragment so
-// the cell template can interpolate it without a ternary chain.
+// PR-E — `data-external-ok` attribute for a matrix cell <td>. PR-196a
+// extends this to also emit `data-alignment-tier` + `data-alignment-score`
+// for the graduated viridis heatmap. Returns the full attribute
+// fragment so the cell template interpolates without ternary chains.
+//
+// Tier defaults to 'no_data' when the row pre-dates the sweep (NULL
+// tier) — the CSS maps that to light grey, so the operator sees "we
+// don't know" instead of an unstyled cell that looks broken.
 function externalOkAttr(r) {
-  if (r.external_ok === true) return ' data-external-ok="true"';
-  if (r.external_ok === false) return ' data-external-ok="false"';
-  return '';
+  let parts = '';
+  if (r.external_ok === true) parts += ' data-external-ok="true"';
+  else if (r.external_ok === false) parts += ' data-external-ok="false"';
+  const tier = r.external_alignment_tier || 'no_data';
+  parts += ` data-alignment-tier="${escHTML(tier)}"`;
+  if (r.external_alignment_score !== null && r.external_alignment_score !== undefined) {
+    parts += ` data-alignment-score="${escHTML(r.external_alignment_score.toFixed(2))}"`;
+  }
+  return parts;
 }
 
-// PR-E — render the matrix filter toggle ("Show only where ÖBB
-// disagrees") inline next to the view-mode buttons. Conditional on
-// run.verify_externally so the toggle vanishes for non-verified runs.
-// Extracted from renderRun() to keep that function under Sonar's
-// cognitive-complexity ceiling (was 18, limit 15).
+// PR-196a — small numeric badge in the corner of every scored cell
+// (e.g. "0.7"). Renders nothing when score is missing — the operator
+// sees the tier colour but no number, matching the no_data convention.
+function alignmentBadgeHTML(r) {
+  if (r.external_alignment_score === null || r.external_alignment_score === undefined) return '';
+  return `<span class="cov-align-badge">${escHTML(r.external_alignment_score.toFixed(1))}</span>`;
+}
+
+// PR-196a — render the alignment-mode dropdown inline next to the
+// view-mode buttons. Replaces the PR-E binary checkbox (which had the
+// white-matrix bug). Four modes feed a body-class that drives CSS
+// visibility + colouring; the data-alignment-tier on each cell is
+// always present so flipping modes is instant (no re-render needed).
+// Conditional on run.verify_externally so the dropdown vanishes for
+// runs that didn't do the sweep.
 function buildFilterToggleHTML(run) {
   if (!run.verify_externally) return '';
-  const okCount = run.summary && run.summary.external_ok_count;
-  const gapsSuffix = okCount
-    ? `<span class="hint" style="font-weight: normal">(${okCount} gaps)</span>`
-    : '';
-  const checked = EXT_DISAGREES_FILTER ? 'checked' : '';
-  return `<label class="cov-filter-toggle" title="Hide every cell except those where ÖBB found a connection — focuses the matrix on likely VIATOR data gaps.">
-    <input type="checkbox" id="cov-filter-disagrees" ${checked} />
-    <span>Show only where ÖBB disagrees</span>
-    ${gapsSuffix}
+  const sel = (val, label) => {
+    const selected = ALIGNMENT_MODE === val ? 'selected' : '';
+    return `<option value="${val}" ${selected}>${escHTML(label)}</option>`;
+  };
+  return `<label class="cov-filter-toggle" title="Pick how the matrix highlights ÖBB-vs-VIATOR agreement. Heatmap colours every cell by alignment tier (viridis palette); Disagrees-only fades the rest so you focus on the real gaps.">
+    <span>Alignment</span>
+    <select data-action="alignment-filter">
+      ${sel('off', 'Off (status colours)')}
+      ${sel('colors', 'Show alignment colours')}
+      ${sel('mostly', 'Mostly disagrees (yellow + orange + red)')}
+      ${sel('disagrees', 'Disagrees only (red + orange)')}
+    </select>
   </label>`;
+}
+
+// PR-196a — sync the body classes that drive the alignment CSS to the
+// current ALIGNMENT_MODE. Called from renderRun() so each 5s re-render
+// re-applies the operator's selection, and from the dropdown change
+// handler for instant feedback without a re-render.
+function applyAlignmentModeToBody() {
+  const cls = document.body.classList;
+  cls.remove('cov-align-mode-colors', 'cov-align-mode-disagrees', 'cov-align-mode-mostly');
+  if (ALIGNMENT_MODE === 'colors')    cls.add('cov-align-mode-colors');
+  else if (ALIGNMENT_MODE === 'disagrees') cls.add('cov-align-mode-disagrees');
+  else if (ALIGNMENT_MODE === 'mostly')    cls.add('cov-align-mode-mostly');
 }
 
 // PR-190 — duration formatter for the run-banner subline. Renders
@@ -785,9 +884,15 @@ function buildMatrixCellTd(orig, dest, r) {
   const tip = buildCellTooltip(orig, dest, r);
   // PR-E — external-verify dot + data-external-ok attribute. Three
   // visual colours match the click-verify modal palette (see
-  // externalDotHTML); the attribute drives the "show only disagrees"
-  // filter via CSS without re-rendering.
-  return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}"${externalOkAttr(r)} title="${escHTML(tip)}">${inner}${externalDotHTML(r)}</td>`;
+  // externalDotHTML); the attribute drives the legacy "show only
+  // disagrees" filter via CSS without re-rendering.
+  // PR-196a — also emits data-alignment-tier + data-alignment-score
+  // (driven by `externalOkAttr` now) for the graduated viridis
+  // heatmap, plus a corner badge with the numeric score.
+  const fullTip = r.external_alignment_score !== null && r.external_alignment_score !== undefined
+    ? `${tip}\nAlignment ${r.external_alignment_tier || 'n/a'} (${r.external_alignment_score.toFixed(2)})`
+    : tip;
+  return `<td class="${cls}" data-pair="${escHTML(orig.id)}|${escHTML(dest.id)}"${externalOkAttr(r)} title="${escHTML(fullTip)}">${inner}${externalDotHTML(r)}${alignmentBadgeHTML(r)}</td>`;
 }
 
 // PR-E — render the external-verify dot for one matrix cell. Returns
@@ -1107,14 +1212,15 @@ async function refreshRun() {
 
 function renderRun(run) {
   const main = document.getElementById('cov-main');
-  // PR-E — clear the "show only where ÖBB disagrees" filter state when
-  // loading a run that didn't run the external-verify sweep. The toggle
-  // UI vanishes, so the filter would be impossible to un-tick and the
-  // operator would see an empty matrix until they reload.
+  // PR-196a — clear the alignment-mode body class when loading a run
+  // that didn't do the verify sweep. The dropdown UI vanishes for those
+  // runs, so leaving 'colors' or 'disagrees' active would make the
+  // legacy status-colour matrix look broken (every cell would render
+  // as no_data grey).
   if (!run.verify_externally) {
-    EXT_DISAGREES_FILTER = false;
-    document.body.classList.remove('cov-filter-ext-disagrees');
+    ALIGNMENT_MODE = 'off';
   }
+  applyAlignmentModeToBody();
   // Build a Map: "originId|destId" → result (for fast cell lookup).
   const cell = new Map();
   for (const r of (run.results || [])) {
@@ -1389,15 +1495,15 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// PR-E — delegated change handler for the "Show only where ÖBB
-// disagrees" filter toggle. The toggle is rendered inside renderRun()
-// so we delegate from document to survive the 5s matrix re-render.
-// The body-class drives the CSS visibility (see cov-filter-ext-
-// disagrees rules), so a single line of state flip is all we need.
+// PR-196a — delegated change handler for the alignment-mode dropdown.
+// Replaces the PR-E binary-checkbox handler (which had the white-matrix
+// bug). The dropdown is rendered inside renderRun() so we delegate
+// from document to survive the 5s matrix re-render. Body-class drives
+// the CSS heatmap + filter rules; flipping is instant (no re-render).
 document.addEventListener('change', (e) => {
-  if (e.target && e.target.id === 'cov-filter-disagrees') {
-    EXT_DISAGREES_FILTER = !!e.target.checked;
-    document.body.classList.toggle('cov-filter-ext-disagrees', EXT_DISAGREES_FILTER);
+  if (e.target && e.target.matches('[data-action="alignment-filter"]')) {
+    ALIGNMENT_MODE = e.target.value;
+    applyAlignmentModeToBody();
   }
 });
 
