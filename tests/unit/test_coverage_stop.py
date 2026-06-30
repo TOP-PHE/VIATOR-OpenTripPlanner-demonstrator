@@ -707,6 +707,86 @@ async def test_execute_run_happy_path_calls_finalise(monkeypatch):
     assert rid not in runner._CANCEL_EVENTS
 
 
+# ─────────────────────── PR-187 — DB-status cancel check ───────────────────────
+#
+# Regression coverage for the multi-hour incident where a SQL
+# `UPDATE network_coverage_runs SET status='cancelled'` had no effect on
+# the in-flight runner (which only consulted the process-local
+# `_CANCEL_EVENTS` dict). `_is_cancelled_in_db` is the cheap
+# DB-status backstop with a 3s per-run TTL cache.
+
+
+class _StatusFakeSession:
+    """SessionLocal stand-in that returns a configurable status string
+    from the `SELECT status FROM network_coverage_runs WHERE id=:rid`
+    query, and counts how many times `.execute()` is called so the
+    cache-TTL test can assert hit/miss behaviour."""
+
+    def __init__(self, status: str | None):
+        self.status = status
+        self.execute_call_count = 0
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, _stmt):
+        self.execute_call_count += 1
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = self.status
+        return result
+
+
+def test_is_cancelled_in_db_returns_true_for_cancelled_status(monkeypatch):
+    """SQL `UPDATE ... SET status='cancelled'` must surface as a cancel
+    signal to the runner — without this the operator's psql cancel is
+    invisible and the runner keeps hammering MOTIS."""
+    fake_session = _StatusFakeSession(status="cancelled")
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+
+    cache: dict = {}
+    rid = uuid.uuid4()
+    assert runner._is_cancelled_in_db(rid, cache) is True
+
+
+def test_is_cancelled_in_db_returns_false_for_running_status(monkeypatch):
+    """Happy path — the run is still 'running' in the DB, the helper
+    returns False and the runner continues processing pairs."""
+    fake_session = _StatusFakeSession(status="running")
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+
+    cache: dict = {}
+    rid = uuid.uuid4()
+    assert runner._is_cancelled_in_db(rid, cache) is False
+
+
+def test_is_cancelled_in_db_caches_within_ttl_window(monkeypatch):
+    """The per-pair hot loop calls this helper on every pair — without
+    the TTL cache that's one SELECT per pair x N pairs, which gets
+    expensive on dense matrices. Two calls within 3s for the same run
+    should hit the cache (single SELECT) and return the same answer."""
+    fake_session = _StatusFakeSession(status="running")
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+
+    cache: dict = {}
+    rid = uuid.uuid4()
+
+    # First call: cache miss → one SELECT.
+    assert runner._is_cancelled_in_db(rid, cache) is False
+    assert fake_session.execute_call_count == 1
+
+    # Second call within the 3s TTL: cache hit → no new SELECT.
+    assert runner._is_cancelled_in_db(rid, cache) is False
+    assert fake_session.execute_call_count == 1, (
+        "second call within TTL must reuse cached value, not re-query the DB"
+    )
+
+
 @pytest.mark.asyncio
 async def test_execute_run_gather_exception_routes_to_mark_failed(monkeypatch):
     """Exception escaping the per-pair gather → execute_run calls
