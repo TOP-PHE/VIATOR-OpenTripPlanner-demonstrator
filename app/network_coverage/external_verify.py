@@ -54,13 +54,25 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
+
+
+# PR-196a — UIC extraction regex shared between the leg builder and the
+# alignment scorer. Matches a 7- or 8-digit run, prefers the first 7
+# digits as the canonical UIC (8-digit form is UIC + check digit, e.g.
+# SNCF's `OCELyria-87686006` carries UIC 8768600 + check 6). The
+# (?<!\d) / (?!\d) anchors avoid picking a substring of a longer digit
+# run or a sub-stop index of the right length — mirrors the rule in
+# app/journey/signature.py::_UIC_RE so both modules agree on which
+# digit run "is" the UIC.
+_UIC_RE = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
 
 
 # ─────────────────────── HAFAS profile ───────────────────────
@@ -115,6 +127,46 @@ _HAFAS_ERROR_MESSAGES: dict[str, str] = {
 }
 
 
+class VerifyLeg(BaseModel):
+    """PR-196a — one transit-leg fragment of an ÖBB-side itinerary.
+
+    Lean enough to be persisted as JSONB on every coverage cell without
+    blowing up row size — only the fields the alignment scorer needs
+    (mode for WALK-strip + leg identity) and the modal renderer wants
+    (route_name for the operator-readable train number). Walk legs
+    carry mode='WALK' so the alignment scorer can drop them with the
+    same predicate that handles VIATOR-side trips."""
+
+    mode: str
+    from_uic: str | None = None
+    to_uic: str | None = None
+    dep_utc: str | None = None
+    arr_utc: str | None = None
+    route_name: str | None = None
+
+
+class VerifyItinerary(BaseModel):
+    """PR-196a — one ÖBB-side itinerary captured during the verify sweep.
+
+    Lives on the coverage cell row (in `external_itineraries` JSONB) so
+    the matrix-cell modal can render the ÖBB side without re-querying
+    HAFAS. Shape kept narrow — just enough for alignment scoring (legs
+    list) and human display (departure / arrival / duration). Anything
+    fancier (fares, stop-list polylines) belongs on the live verify
+    endpoint, not in the persisted matrix.
+
+    `legs` is ordered start→end and includes WALK / TRANSFER entries;
+    the alignment scorer strips those before fingerprinting so a HAFAS
+    response that wraps a transfer in an explicit walk leg still
+    fingerprints identically to a VIATOR trip that doesn't."""
+
+    legs: list[VerifyLeg] = Field(default_factory=list)
+    departure_at: str | None = None
+    arrival_at: str | None = None
+    duration_seconds: int | None = None
+    num_transfers: int | None = None
+
+
 class VerifyResult(BaseModel):
     """Outcome of one external-planner check for one coverage cell.
 
@@ -124,6 +176,12 @@ class VerifyResult(BaseModel):
     cleanly returned zero connections (a real "no service" answer).
     `ok=False` with `error` set means we couldn't reach the external
     backend; the verdict is "unknown" not "no route".
+
+    PR-196a — `itineraries` carries the per-trip detail extracted from
+    HAFAS's outConL. Empty on every error branch and on a clean
+    no-route answer (HAFAS H890); populated to the same `num_connections`
+    on ok=True so the alignment scorer + modal renderer have the same
+    data the verdict was summarised from.
     """
 
     source: str
@@ -135,9 +193,39 @@ class VerifyResult(BaseModel):
     # "external said no". UI renders this as a yellow warning, not a
     # red/green verdict.
     error: str | None = None
+    # PR-196a — per-itinerary breakdown for the alignment heatmap. Empty
+    # on every error / no-route branch; populated to len == num_connections
+    # on ok=True.
+    itineraries: list[VerifyItinerary] = Field(default_factory=list)
 
 
 # ─────────────────────── HAFAS protocol bits ───────────────────────
+
+
+def extract_uic(stop_id: str | None) -> str | None:
+    """PR-196a — extract a canonical `UIC:NNNNNNN` token from any stop_id
+    a HAFAS or MOTIS / VIATOR leg might carry, or None if none present.
+
+    Handles three observed forms:
+      - HAFAS lid (`A=1@L=8503000@…`)               → `UIC:8503000`
+      - MOTIS / GTFS-flavoured (`ScheduledStopPoint:8503000`) → `UIC:8503000`
+      - SNCF 8-digit (`OCELyria-87686006`)          → `UIC:8768600`
+        (the trailing digit is a Luhn-style check, dropped to align with
+        SBB's 7-digit UICs of the SAME train)
+
+    Returns None on any other shape — caller treats that as "non-UIC
+    endpoint, fall back to lat/lon for matching". Mirrors the
+    `_uic_from_stop_id` regex in app/journey/signature.py so the
+    alignment scorer's UIC tokens agree with the within-engine
+    fingerprint tokens.
+    """
+    if not stop_id:
+        return None
+    m = _UIC_RE.search(stop_id)
+    if not m:
+        return None
+    # 8-digit = 7-digit UIC + trailing check digit → keep first 7.
+    return f"UIC:{m.group(1)[:7]}"
 
 
 def _coord_to_micro(value: float) -> int:
@@ -275,12 +363,187 @@ def _parse_hafas_duration(value: str | None) -> int | None:
         return None
 
 
-def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
+def _hafas_time_to_utc_iso(date: str | None, time_hhmm: str | None) -> str | None:
+    """PR-196a — coarse HAFAS time → ISO string for the alignment scorer.
+
+    HAFAS encodes dep/arr times as HHMM strings hung off a YYYYMMDD
+    service-date anchor. The alignment scorer only needs the time-of-day
+    for the ±5min fuzzy fallback, so this returns a naive
+    `YYYY-MM-DDTHH:MM` string rather than threading the
+    Europe/Vienna→UTC conversion the hafas_client does for the journey
+    UI. Returns None on garbage so the alignment scorer treats the leg
+    as unmatchable rather than panic-attributing it to midnight.
+    """
+    if not date or not time_hhmm or len(date) < 8:
+        return None
+    t = time_hhmm.zfill(4)
+    if len(t) < 4:
+        return None
+    try:
+        return f"{date[0:4]}-{date[4:6]}-{date[6:8]}T{t[0:2]}:{t[2:4]}"
+    except (ValueError, IndexError):  # pragma: no cover — guarded above
+        return None
+
+
+def _hafas_cat_to_mode(cat: str | None) -> str:
+    """PR-196a — map HAFAS product category ("ICE", "RJ", "S", "Bus")
+    to the same RAIL/BUS/TRAM/SUBWAY/FERRY vocabulary VIATOR's OTP /
+    MOTIS clients emit. Matches `app.journey.hafas_client._map_cat_to_mode`
+    intentionally — the alignment scorer's fingerprint includes the
+    mode in its hash, so any divergence here would silently break the
+    exact-match path on every RAIL pair.
+
+    Mirroring the production mapper rather than importing it keeps the
+    coverage subpackage free of a journey-package import (cyclic risk —
+    journey already imports `external_verify` for the HAFAS adapter).
+    """
+    cat_upper = (cat or "").upper()
+    if not cat_upper:
+        return "TRANSIT"
+    if "BUS" in cat_upper:
+        return "BUS"
+    if "TRAM" in cat_upper or cat_upper == "STR":
+        return "TRAM"
+    if "METRO" in cat_upper or "SUBWAY" in cat_upper or cat_upper in ("U", "U-BAHN"):
+        return "SUBWAY"
+    if "FERRY" in cat_upper or cat_upper in ("SHIP", "BOAT"):
+        return "FERRY"
+    # Big rail bucket — anything that looks like a train.
+    return "RAIL"
+
+
+def _lookup_indexed(idx: Any, table: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """`table[idx]` when `idx` is an int and present, else `{}`. Keeps
+    the HAFAS parsing helpers branchless on the index typing — HAFAS
+    occasionally returns null/missing `locX` / `prodX` indices and we
+    want a uniform empty-dict fallback rather than a sprinkle of
+    isinstance() checks at every call site."""
+    if not isinstance(idx, int):
+        return {}
+    return table.get(idx) or {}
+
+
+def _resolve_section_mode_and_route(
+    sec_type: str,
+    jny: dict[str, Any] | None,
+    products: dict[int, dict[str, Any]],
+) -> tuple[str, str | None]:
+    """`(mode, route_name)` for one HAFAS `secL` section.
+
+    - ``JNY``: mode comes from the product category, route_name is the
+      train number ("RJ 1141") with `line` (short code) as fallback for
+      regional carriers that don't populate `name`.
+    - ``WALK`` / ``TRSF``: ``("WALK", None)`` so the alignment scorer
+      strips it uniformly across HAFAS / MOTIS / VIATOR.
+    - anything else: ``("TRANSIT", None)`` — unknown sections aren't
+      walks (scorer keeps them) but aren't over-claimed as RAIL either.
+    """
+    if sec_type == "JNY":
+        prod = _lookup_indexed((jny or {}).get("prodX"), products)
+        return _hafas_cat_to_mode(prod.get("cat")), prod.get("name") or prod.get("line")
+    if sec_type in ("WALK", "TRSF"):
+        return "WALK", None
+    return "TRANSIT", None
+
+
+def _build_leg_from_section(
+    sec: dict[str, Any],
+    date: str | None,
+    locations: dict[int, dict[str, Any]],
+    products: dict[int, dict[str, Any]],
+) -> VerifyLeg | None:
+    """One HAFAS `secL` entry → one VerifyLeg, or None when the section
+    has no valid dep/arr endpoints (skip rather than emit a half-
+    populated leg the scorer would have to special-case)."""
+    sec_type = (sec.get("type") or "").upper()
+    dep = sec.get("dep") or {}
+    arr = sec.get("arr") or {}
+    if not dep or not arr:
+        return None
+    dep_loc = _lookup_indexed(dep.get("locX"), locations)
+    arr_loc = _lookup_indexed(arr.get("locX"), locations)
+    mode, route_name = _resolve_section_mode_and_route(sec_type, sec.get("jny"), products)
+    return VerifyLeg(
+        mode=mode,
+        from_uic=extract_uic(dep_loc.get("lid")),
+        to_uic=extract_uic(arr_loc.get("lid")),
+        dep_utc=_hafas_time_to_utc_iso(date, dep.get("dTimeS")),
+        arr_utc=_hafas_time_to_utc_iso(date, arr.get("aTimeS")),
+        route_name=route_name,
+    )
+
+
+def _build_itinerary_from_connection(
+    conn: dict[str, Any],
+    locations: dict[int, dict[str, Any]],
+    products: dict[int, dict[str, Any]],
+) -> VerifyItinerary:
+    """PR-196a — one HAFAS `outConL` entry → one persisted VerifyItinerary.
+
+    Walks every `secL` section via `_build_leg_from_section`. JNY → transit
+    leg with product line as `route_name` + RAIL/BUS/... mode mapped from
+    the product category, WALK/TRSF → mode='WALK' so the alignment scorer
+    can strip uniformly across HAFAS / MOTIS / VIATOR. Endpoints are UIC
+    tokens when the HAFAS lid carries one (the common case for mainline
+    rail) or None otherwise (rare — small bus stops the journey UI never
+    reaches anyway).
+    """
+    date = conn.get("date")
+    legs: list[VerifyLeg] = []
+    for sec in conn.get("secL") or []:
+        leg = _build_leg_from_section(sec, date, locations, products)
+        if leg is not None:
+            legs.append(leg)
+    dep_node = conn.get("dep") or {}
+    arr_node = conn.get("arr") or {}
+    chg = conn.get("chg")
+    return VerifyItinerary(
+        legs=legs,
+        departure_at=_hafas_time_to_utc_iso(date, dep_node.get("dTimeS")),
+        arrival_at=_hafas_time_to_utc_iso(date, arr_node.get("aTimeS")),
+        duration_seconds=_parse_hafas_duration(conn.get("dur")),
+        num_transfers=chg if isinstance(chg, int) else None,
+    )
+
+
+def _index_hafas_locations(loc_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """PR-196a — `{idx: {lid, name}}` from `common.locL`. Subset of the
+    hafas_client.py index — the alignment scorer only needs the lid for
+    UIC extraction, not the coords."""
+    return {i: {"lid": loc.get("lid"), "name": loc.get("name")} for i, loc in enumerate(loc_l)}
+
+
+def _index_hafas_products(prod_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """PR-196a — `{idx: {name, line, cat}}` from `common.prodL`. Subset of
+    the hafas_client.py index — the alignment scorer needs name + line
+    (= the train-number-guarded fuzzy fallback key) plus cat (the
+    operator-product category that drives RAIL/BUS/... mode mapping)."""
+    return {
+        i: {
+            "name": prod.get("name"),
+            "line": prod.get("addName") or prod.get("nameS"),
+            "cat": (prod.get("prodCtx") or {}).get("catOut") or prod.get("cls"),
+        }
+        for i, prod in enumerate(prod_l)
+    }
+
+
+def _summarise_connections(
+    connections: list[dict[str, Any]], common: dict[str, Any] | None = None
+) -> VerifyResult:
     """Reduce a HAFAS `outConL` list to a single VerifyResult.
 
     `best_duration_seconds` is the minimum of the returned connections
     (HAFAS doesn't guarantee they're sorted shortest-first; ranking
-    differs between profiles)."""
+    differs between profiles).
+
+    PR-196a — when `common` (the HAFAS `res.common` block carrying
+    `locL` + `prodL`) is supplied, each connection is also normalised
+    into a VerifyItinerary so the alignment scorer + the matrix-cell
+    modal renderer have the per-trip detail. `common` is None on legacy
+    callers; the itineraries list stays empty and the cell renders as
+    `no_data` in the heatmap (compatible with PR-E rows).
+    """
     if not connections:
         return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, num_connections=0)
     parsed_durations: list[int] = []
@@ -297,6 +560,12 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
         if parsed_durations
         else None
     )
+    itineraries: list[VerifyItinerary] = []
+    if common is not None:
+        locations = _index_hafas_locations(common.get("locL") or [])
+        products = _index_hafas_products(common.get("prodL") or [])
+        for c in connections:
+            itineraries.append(_build_itinerary_from_connection(c, locations, products))
     return VerifyResult(
         source=_SOURCE_OEBB_HAFAS,
         ok=True,
@@ -307,6 +576,7 @@ def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
             if best_idx is not None and best_idx < len(parsed_transfers)
             else None
         ),
+        itineraries=itineraries,
     )
 
 
@@ -527,4 +797,6 @@ def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
         )
     res = svc.get("res") or {}
     connections = res.get("outConL") or []
-    return _summarise_connections(connections)
+    # PR-196a — thread `common` (locL + prodL indices) so the per-
+    # itinerary detail is captured for the alignment heatmap + modal.
+    return _summarise_connections(connections, res.get("common") or {})

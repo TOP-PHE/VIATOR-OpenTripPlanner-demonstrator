@@ -31,7 +31,7 @@ import re
 import uuid
 from datetime import UTC, date, datetime
 from datetime import time as dtime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -318,6 +318,26 @@ class RunSummary(BaseModel):
     response_ms_max: int | None = None
 
 
+# PR-196a — the alignment-tier vocabulary the scorer in
+# app/network_coverage/alignment.py emits. Pinning this as a Literal at
+# the API boundary catches scorer drift (e.g. a typo or a new tier
+# added without UI palette work) at FastAPI's response-model validation
+# step rather than silently shipping an unmapped tier to the heatmap
+# CSS. Keep in sync with app/network_coverage/alignment.py and the
+# CSS palette in app/templates/admin/network_coverage.html.
+AlignmentTier = Literal[
+    "agree",
+    "mostly_agree",
+    "partial",
+    "disagree",
+    "no_overlap",
+    "one_sided_viator",
+    "one_sided_oebb",
+    "no_service",
+    "no_data",
+]
+
+
 class ResultEntry(BaseModel):
     """One cell in the matrix."""
 
@@ -350,6 +370,12 @@ class ResultEntry(BaseModel):
     external_source: str | None = None
     external_error: str | None = None
     external_verified_at: datetime | None = None
+    # PR-196a — alignment heatmap signal. tier drives the matrix cell
+    # background colour (viridis palette), score is shown in the
+    # tooltip. NULL on rows that pre-date the sweep — render as
+    # 'no_data' (light grey) in the matrix.
+    external_alignment_score: float | None = None
+    external_alignment_tier: AlignmentTier | None = None
 
 
 class RunDetail(RunSummary):
@@ -393,6 +419,15 @@ class CellTripsDirection(BaseModel):
     external_source: str | None = None
     external_error: str | None = None
     external_verified_at: datetime | None = None
+    # PR-196a — graduated alignment heatmap data. The matrix UI reads
+    # tier + score per cell to colour the viridis-palette background;
+    # the modal renders external_itineraries side-by-side against
+    # `trips` (VIATOR) so the operator sees both planners' answers
+    # without a second round-trip. NULL on legacy rows (renders as
+    # 'no_data' tier — light grey, distinguishable from no_service).
+    external_itineraries: list[dict[str, Any]] | None = None
+    external_alignment_score: float | None = None
+    external_alignment_tier: AlignmentTier | None = None
 
 
 class CellTripsResponse(BaseModel):
@@ -1032,6 +1067,11 @@ def get_run(
                 external_source=getattr(r, "external_source", None),
                 external_error=getattr(r, "external_error", None),
                 external_verified_at=getattr(r, "external_verified_at", None),
+                # PR-196a — alignment tier / score for the matrix
+                # heatmap. NULL on rows that pre-date the sweep; the
+                # JS render maps NULL → 'no_data' tier.
+                external_alignment_score=getattr(r, "external_alignment_score", None),
+                external_alignment_tier=getattr(r, "external_alignment_tier", None),
             )
             for r in results
         ],
@@ -1124,6 +1164,14 @@ def get_cell_trips(
             external_source=r.external_source,
             external_error=r.external_error,
             external_verified_at=r.external_verified_at,
+            # PR-196a — persisted ÖBB itineraries + alignment so the
+            # modal can render the two planners' answers side by side.
+            # Direct attribute access matches the PR-E reads above;
+            # the migration ships in the same release as the writer so
+            # the columns are always present on rows the modal queries.
+            external_itineraries=r.external_itineraries,
+            external_alignment_score=r.external_alignment_score,
+            external_alignment_tier=r.external_alignment_tier,
         )
 
     # direction='single' runs intentionally have no return row — collapse
