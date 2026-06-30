@@ -239,3 +239,74 @@ def test_pr194_side_by_side_grid_css_present(template_text: str):
     assert ".engine-pill.hafas" in template_text
     # CSS variable that scales the grid to N columns:
     assert "--compare-cols" in template_text
+
+
+# ───────────────────── v0.1.43.25 regression guard ─────────────────────
+# The `wireSideBySideToggle` IIFE runs synchronously at module
+# evaluation and reads `_COMPARE_SIDE_BY_SIDE` + `_SIDE_BY_SIDE_STORAGE_KEY`.
+# Because those are block-scoped (`let` / `const`), declaring them
+# AFTER the IIFE puts them in the temporal dead zone — the read throws
+# `ReferenceError: Cannot access '_COMPARE_SIDE_BY_SIDE' before
+# initialization`, which aborts the rest of the inline <script> and
+# leaves the form-submit handler unregistered. The user-visible
+# symptom (v0.1.43.25) was: click Search → page reloads with empty
+# inputs, no fetch dispatched. These tests pin the order so a future
+# move-things-around refactor can't silently reintroduce the bug.
+
+
+def test_side_by_side_storage_key_declared_before_iife(template_text: str):
+    """`const _SIDE_BY_SIDE_STORAGE_KEY = ...` must appear in the
+    template text BEFORE the `wireSideBySideToggle` IIFE that consumes
+    it. Otherwise the IIFE hits the TDZ at module-load."""
+    decl_idx = template_text.find("const _SIDE_BY_SIDE_STORAGE_KEY")
+    iife_idx = template_text.find("(function wireSideBySideToggle()")
+    assert decl_idx != -1, "_SIDE_BY_SIDE_STORAGE_KEY declaration missing"
+    assert iife_idx != -1, "wireSideBySideToggle IIFE missing"
+    assert decl_idx < iife_idx, (
+        "TDZ regression: `const _SIDE_BY_SIDE_STORAGE_KEY` must be "
+        "declared before the wireSideBySideToggle IIFE that consumes "
+        "it — otherwise the IIFE throws ReferenceError on load and "
+        "the form-submit handler never registers (symptom: Search "
+        "reloads the page with empty inputs). See v0.1.43.25 bug."
+    )
+
+
+def test_side_by_side_state_var_declared_before_iife(template_text: str):
+    """`let _COMPARE_SIDE_BY_SIDE = ...` must appear in the template
+    text BEFORE the `wireSideBySideToggle` IIFE that consumes it.
+    Same TDZ rationale as the storage-key test above."""
+    decl_idx = template_text.find("let _COMPARE_SIDE_BY_SIDE")
+    iife_idx = template_text.find("(function wireSideBySideToggle()")
+    assert decl_idx != -1, "_COMPARE_SIDE_BY_SIDE declaration missing"
+    assert iife_idx != -1, "wireSideBySideToggle IIFE missing"
+    assert decl_idx < iife_idx, (
+        "TDZ regression: `let _COMPARE_SIDE_BY_SIDE` must be declared "
+        "before the wireSideBySideToggle IIFE that reads it on the "
+        "first line of its body (cb.checked = _COMPARE_SIDE_BY_SIDE). "
+        "If you move the declaration below the IIFE the page silently "
+        "breaks: the IIFE throws ReferenceError, aborts the rest of "
+        "the <script>, leaves the form-submit handler unregistered, "
+        "and clicking Search reloads /journey with empty inputs."
+    )
+
+
+def test_side_by_side_state_initialised_only_once(template_text: str):
+    """Belt-and-braces: there must be EXACTLY ONE declaration of each
+    side-by-side state binding in the template. A second `let`/`const`
+    declaration (e.g. left behind after a refactor) would throw a
+    SyntaxError at parse time — page fails to load at all — but a
+    careless cut-and-paste could also produce two unrelated names
+    pointing at the same string. Pinning the count keeps the file
+    honest."""
+    storage_decls = template_text.count("const _SIDE_BY_SIDE_STORAGE_KEY")
+    state_decls = template_text.count("let _COMPARE_SIDE_BY_SIDE")
+    assert storage_decls == 1, (
+        f"Expected exactly one `const _SIDE_BY_SIDE_STORAGE_KEY` "
+        f"declaration, found {storage_decls}. A duplicate `let`/`const` "
+        f"in the same scope is a SyntaxError; remove the duplicate."
+    )
+    assert state_decls == 1, (
+        f"Expected exactly one `let _COMPARE_SIDE_BY_SIDE` declaration, "
+        f"found {state_decls}. A duplicate `let`/`const` in the same "
+        f"scope is a SyntaxError; remove the duplicate."
+    )
