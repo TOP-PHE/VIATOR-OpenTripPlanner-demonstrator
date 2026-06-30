@@ -1007,7 +1007,7 @@ def _phase1_snapshot_and_start(run_id: uuid.UUID) -> _Phase1Snapshot | None:
             reference_date_value=run.reference_date,
             cfg=cfg,
         )
-        hubs_now = _load_active_hubs(db)
+        hubs_now = _load_active_hubs(db, countries=run.countries)
         pairs = _hub_pairs(hubs_now, run.direction)
         return _Phase1Snapshot(
             run_mode=run.mode,

@@ -490,3 +490,153 @@ def test_runsummary_legacy_row_without_countries_attribute_is_none():
 
     out = _run_to_summary(run)
     assert out.countries is None
+
+
+# ─────────────────── _phase1_snapshot_and_start execute-time filter ───────────────────
+
+
+def test_phase1_snapshot_honors_country_filter(monkeypatch):
+    """PR-192 regression test: a run with countries=['CH'] must produce a
+    Phase-1 snapshot whose pairs are ONLY among CH hubs. Before PR-192,
+    runner.py:954 (`hubs_now = _load_active_hubs(db)`) dropped the filter
+    when execute_run was refactored to extract Phase-1 into a helper —
+    operator's CH-only selection generated CH-origin x ALL-destination
+    pairs (~214 instead of ~6), silently running cross-border queries the
+    operator never asked for. The matrix row was created correctly by
+    create_run (which still passed countries=), but execute_run re-loaded
+    every active hub and built the full unfiltered pair list."""
+
+    import uuid as _uuid
+
+    from app.network_coverage import runner
+    from app.network_coverage.hubs import Hub
+
+    ch_hubs = [
+        Hub(id=h, name=h, short=h[:5], region="", lat=47.0, lon=8.0)
+        for h in ["zurich", "geneva", "basel"]
+    ]
+    de_hubs = [
+        Hub(id=h, name=h, short=h[:5], region="", lat=52.0, lon=13.0) for h in ["berlin", "munich"]
+    ]
+
+    captured_countries: list[list[str] | None] = []
+
+    def fake_load(_db, countries=None):
+        captured_countries.append(countries)
+        if countries == ["CH"]:
+            return ch_hubs
+        return ch_hubs + de_hubs  # unfiltered: includes DE → would leak
+
+    monkeypatch.setattr(runner, "_load_active_hubs", fake_load)
+
+    # Stub out the other Phase-1 helpers — they're not what this test
+    # exercises and pulling in their real dependencies (CoverageConfig,
+    # ResolvedWindow, session/engine resolution) would bloat the fixture.
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: MagicMock())
+    monkeypatch.setattr(
+        runner,
+        "_resolve_run_mode_targets",
+        lambda _db, _run: ("nap-ch-rail", "otp", [], {}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_resolve_run_window",
+        lambda **_kwargs: MagicMock(),
+    )
+
+    # Build a fake run row carrying the CH-only filter the operator picked.
+    run_row = MagicMock()
+    run_row.id = _uuid.uuid4()
+    run_row.status = "pending"
+    run_row.countries = ["CH"]
+    run_row.direction = "both"
+    run_row.mode = "single_session"
+    run_row.session_id = "nap-ch-rail"
+    run_row.depart_at = datetime(2026, 5, 18, 8, 0)
+    run_row.window_start_local = None
+    run_row.window_end_local = None
+    run_row.window_timezone = None
+    run_row.reference_date = None
+
+    # SessionLocal() is a context manager; .get(NetworkCoverageRun, run_id)
+    # must return our run_row. .commit() is a no-op.
+    db = MagicMock()
+    db.get.return_value = run_row
+    session_ctx = MagicMock()
+    session_ctx.__enter__.return_value = db
+    session_ctx.__exit__.return_value = False
+    monkeypatch.setattr(runner, "SessionLocal", lambda: session_ctx)
+
+    snap = runner._phase1_snapshot_and_start(run_row.id)
+
+    # The filter was threaded through — this is the regression guard.
+    assert captured_countries == [["CH"]], (
+        f"_load_active_hubs called without country filter: {captured_countries}"
+    )
+    # And the resulting pair list only contains CH hubs in BOTH positions
+    # (no DE-origin or DE-destination leak).
+    assert snap is not None
+    ch_ids = {"zurich", "geneva", "basel"}
+    assert all(o.id in ch_ids for o, _ in snap.pairs)
+    assert all(d.id in ch_ids for _, d in snap.pairs)
+    # 3 hubs x 2 directions = 6 pairs (direction='both' excludes self-loops)
+    assert len(snap.pairs) == 6
+
+
+def test_phase1_snapshot_passes_none_when_no_filter(monkeypatch):
+    """The companion case — a run row with countries=None (full-matrix run)
+    must propagate None, NOT silently coerce to an empty list (which would
+    WHERE country IN () and return zero rows). Pins both branches of the
+    PR-192 fix."""
+
+    import uuid as _uuid
+
+    from app.network_coverage import runner
+    from app.network_coverage.hubs import Hub
+
+    all_hubs = [
+        Hub(id=h, name=h, short=h[:5], region="", lat=48.0, lon=2.0)
+        for h in ["paris", "zurich", "berlin"]
+    ]
+
+    captured_countries: list[list[str] | None] = []
+
+    def fake_load(_db, countries=None):
+        captured_countries.append(countries)
+        return all_hubs
+
+    monkeypatch.setattr(runner, "_load_active_hubs", fake_load)
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: MagicMock())
+    monkeypatch.setattr(
+        runner,
+        "_resolve_run_mode_targets",
+        lambda _db, _run: ("nap-fr-rail", "otp", [], {}),
+    )
+    monkeypatch.setattr(runner, "_resolve_run_window", lambda **_kwargs: MagicMock())
+
+    run_row = MagicMock()
+    run_row.id = _uuid.uuid4()
+    run_row.status = "pending"
+    run_row.countries = None  # full-matrix run
+    run_row.direction = "both"
+    run_row.mode = "single_session"
+    run_row.session_id = "nap-fr-rail"
+    run_row.depart_at = datetime(2026, 5, 18, 8, 0)
+    run_row.window_start_local = None
+    run_row.window_end_local = None
+    run_row.window_timezone = None
+    run_row.reference_date = None
+
+    db = MagicMock()
+    db.get.return_value = run_row
+    session_ctx = MagicMock()
+    session_ctx.__enter__.return_value = db
+    session_ctx.__exit__.return_value = False
+    monkeypatch.setattr(runner, "SessionLocal", lambda: session_ctx)
+
+    snap = runner._phase1_snapshot_and_start(run_row.id)
+
+    assert captured_countries == [None]
+    assert snap is not None
+    # 3 hubs x 2 directions = 6 pairs
+    assert len(snap.pairs) == 6
