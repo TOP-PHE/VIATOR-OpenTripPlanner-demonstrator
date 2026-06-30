@@ -136,7 +136,31 @@ async def fetch_plan(
         "transitModes": ["TRANSIT"],
     }
 
-    async with httpx.AsyncClient(timeout=timeout_ms / 1000.0) as client:
+    # PR-188 — close TCP per-request + granular phase timeouts.
+    #
+    # When the coverage runner's outer `asyncio.wait_for` fires its slot
+    # timeout, httpx closes the TCP socket client-side — but MOTIS keeps
+    # crunching the RAPTOR result. When it finishes and tries to write back
+    # it logs "Broken pipe" and discards, with the CPU already spent. Under
+    # many concurrent coverage queries that orphan-compute pile-up pegged
+    # MOTIS at 1798% CPU + 281 GB block I/O while serving ~0 useful results
+    # (observed 2026-06-30).
+    #
+    # `Connection: close` signals MOTIS to release the per-request work the
+    # instant the client disconnects, instead of finish-then-discover-dead-
+    # socket. The trade-off is ~1ms TCP-handshake overhead per call (no
+    # keep-alive); that's negligible compared to the orphan-compute cost we
+    # avoid here.
+    #
+    # Separately, we now give httpx granular per-phase timeouts (connect /
+    # read / write / pool) instead of a single overall deadline. The outer
+    # `asyncio.wait_for(..., slot_timeout)` in the coverage runner stays as
+    # the hard ceiling; these inner phase timeouts let httpx fail fast on
+    # connect/write hangs without burning the whole slot budget.
+    read_timeout_s = timeout_ms / 1000.0
+    timeout = httpx.Timeout(connect=5.0, read=read_timeout_s, write=5.0, pool=5.0)
+    headers = {"Connection": "close"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         r = await client.get(url, params=params)
     r.raise_for_status()
     raw: dict[str, Any] = r.json()
