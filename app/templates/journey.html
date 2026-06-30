@@ -154,13 +154,35 @@
    MOTIS-engine session. One trip signature per row; each cell is a
    slim trip card or a greyed "not found" placeholder. Stacks to one
    column under ~720px so it doesn't horizontal-scroll on mobile. */
-.compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem 1rem; margin-top: 0.4rem; }
+/* PR-194: grid-template-columns is now driven by --compare-cols (defaults
+   to the legacy "1fr 1fr" two-column layout for OTP-vs-MOTIS). The
+   side-by-side reference panel re-uses this primitive and sets
+   --compare-cols inline to repeat(N,1fr) where N = 1 (VIATOR) +
+   count(active reference engines). Mobile collapse rule below stays
+   unchanged. */
+.compare-grid { display: grid; grid-template-columns: var(--compare-cols, 1fr 1fr); gap: 0.6rem 1rem; margin-top: 0.4rem; }
 .compare-grid > .compare-header { font-weight: 600; padding: 0.3rem 0.1rem; border-bottom: 2px solid var(--sleeper); display: flex; align-items: center; gap: 0.4rem; }
 .compare-grid > .compare-header .engine-pill { font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 3px; background: var(--sleeper); color: white; }
 .compare-grid > .compare-header .engine-pill.motis { background: var(--brand-blue); }
+/* PR-194: per-source accent on the column headers in the side-by-side
+   layout — matches the existing left-accent borders on the OJP /
+   HAFAS panels so the visual cue carries between the two layouts. */
+.compare-grid > .compare-header .engine-pill.viator { background: #57606a; }
+.compare-grid > .compare-header .engine-pill.ojp    { background: var(--brand-blue); }
+.compare-grid > .compare-header .engine-pill.hafas  { background: #b3760e; }
+/* PR-194: side-by-side reference grid wraps the OJP / HAFAS panels into
+   a column-grid alongside the VIATOR cards. The column body uses the
+   same .compare-cell primitive as the OTP-vs-MOTIS grid; "empty"
+   cells (a reference engine that returned 0 trips) render with a
+   muted body so the source-query state stays visible — operator
+   needs to see the column was queried and returned nothing. */
+.compare-grid.compare-grid-refs > .compare-cell { background: transparent; padding: 0; }
+.compare-grid.compare-grid-refs > .compare-cell.empty { background: #f8f9fa; border: 1px dashed var(--sleeper); border-radius: 4px; min-height: 4.6rem; display: flex; align-items: center; justify-content: center; color: var(--rail-steel); font-size: 0.85rem; font-style: italic; padding: 0.6rem; }
+.compare-grid.compare-grid-refs .compare-cell::before { content: none; }
 .compare-grid .compare-cell { min-height: 4.6rem; }
 .compare-grid .compare-cell .trip-card { margin-bottom: 0; }
-/* P2 MOTIS — "Compare trains only" toggle, rendered just above the grid
+/* P2 MOTIS — "Compare excluding walk legs" toggle (PR-194 renamed from
+   the original misleading "Compare trains-only"), rendered just above the grid
    when both engines are present. Single checkbox + hint; flipping it
    re-runs the client-side pairing (no fetch). */
 .compare-controls { margin: 0.4rem 0 0.2rem; padding: 0.4rem 0.6rem; background: #f6f8fa; border-left: 3px solid var(--brand-blue); border-radius: 3px; font-size: 0.9rem; }
@@ -258,6 +280,22 @@
       <span class="compare-ref-info" data-tooltip="ÖBB HAFAS covers: DACH (DE/AT/CH), Eurostar/TGV/AVE/Iberian cross-border, Nordic-cross-border (DK/SE/NO to mainland EU).&#10;NOT covered: Norwegian domestic, some regional bus.">?</span>
     </label>
     {% endif %}
+
+    {# PR-194 — opt-in layout toggle. When OFF (default, preserved for
+       existing users) the OJP and HAFAS reference panels render stacked
+       below VIATOR's results. When ON and at least one reference engine
+       returned trips, the three panels render side-by-side in an
+       N-column grid. State is persisted in localStorage so an operator
+       who prefers the column layout doesn't have to re-tick it every
+       search. The checkbox is rendered unconditionally — the toggle is
+       useful even without OJP/HAFAS enabled in the workspace, because
+       it lets the operator pre-set their preference before turning a
+       reference on. #}
+    <label class="compare-ref-field">
+      <input type="checkbox" id="compare-side-by-side">
+      Side-by-side comparison
+      <span class="compare-ref-info" data-tooltip="When ON and any reference engine returned trips, VIATOR / Swiss OJP / ÖBB HAFAS render as columns instead of stacked panels. Mobile collapses back to stacked automatically.">?</span>
+    </label>
 
     <button type="submit" id="go-btn">Search</button>
     <div id="msg" class="msg"></div>
@@ -470,6 +508,40 @@ function setupAutocomplete(prefix) {
 
 setupAutocomplete('from');
 setupAutocomplete('to');
+
+// PR-194 — wire the side-by-side comparison checkbox. Init state from
+// the module-level `_COMPARE_SIDE_BY_SIDE` (read from localStorage at
+// module load). On change we persist to localStorage AND re-render the
+// last payload so the layout flips without re-fetching. When no payload
+// has rendered yet (first page load) the change is just stored — the
+// next search will pick it up via `_shouldRenderSideBySide`.
+(function wireSideBySideToggle() {
+  const cb = document.getElementById('compare-side-by-side');
+  if (!cb) return;
+  cb.checked = _COMPARE_SIDE_BY_SIDE;
+  // PR-194: a side-by-side toggle is harmless when no reference engine
+  // is configured (the render path falls back to stacked anyway), but
+  // it's clearer UX to grey it out + give a tooltip when neither OJP
+  // nor HAFAS is wired up at the workspace level. We can detect that
+  // by looking for the upstream checkboxes — if neither rendered, the
+  // toggle has no work to do.
+  const ojpEnabled = !!document.getElementById('compare-ojp');
+  const hafasEnabled = !!document.getElementById('compare-hafas');
+  if (!ojpEnabled && !hafasEnabled) {
+    cb.disabled = true;
+    const label = cb.closest('label');
+    if (label) label.title = 'No comparison source enabled at the workspace level';
+  }
+  cb.addEventListener('change', () => {
+    _COMPARE_SIDE_BY_SIDE = !!cb.checked;
+    try {
+      window.localStorage.setItem(
+        _SIDE_BY_SIDE_STORAGE_KEY, _COMPARE_SIDE_BY_SIDE ? '1' : '0'
+      );
+    } catch (_e) { /* localStorage unavailable — fine, preference stays per-session */ }
+    if (_LAST_PAYLOAD) render(_LAST_PAYLOAD);
+  });
+})();
 
 // Default depart = now+10min
 const now = new Date(Date.now() + 10*60*1000);
@@ -904,7 +976,8 @@ function _enginesForTrip(trip, engineMap) {
   return present;
 }
 
-// P2 MOTIS — "Compare trains only" toggle state. When ON, the comparison
+// P2 MOTIS — "Compare excluding walk legs" toggle state (PR-194 renamed
+// from the original misleading "trains-only" label). When ON, the comparison
 // grid pairs rows by a fingerprint that ignores WALK legs so same-train
 // trips collapse into one row regardless of access/egress walk-time
 // differences (a real-world finding: OTP and MOTIS often disagree on
@@ -964,7 +1037,13 @@ function _trainOnlySignature(trip) {
 
 function _railOnlyDurationSec(legs) {
   // Sum of non-WALK leg durations. Used when the toggle is ON to
-  // display "X rail" alongside or instead of the total trip duration.
+  // display "X transit" alongside or instead of the total trip duration.
+  // NOTE the name is historical (this function predates BUS/TRAM legs
+  // being kept in the sum) — the underlying logic is
+  // "everything-except-walk", not "rail only". The UI label and the
+  // toggle name now both say "transit" / "excluding walk legs"; the
+  // function name stays for diff stability (no callers rename
+  // necessary, no behavioural change).
   let total = 0;
   for (const lg of (legs || [])) {
     if (!lg || lg.mode === 'WALK') continue;
@@ -994,13 +1073,16 @@ function _renderComparisonCell(trip, engine, tripIndex) {
     return `<div class="compare-cell missing">— not found by ${engine.toUpperCase()}</div>`;
   }
   const legCount = (trip.best.legs || []).length;
-  // When the "Compare trains only" toggle is ON, show "rail-only" time
+  // When the "Compare excluding walk legs" toggle is ON, show transit-only time
   // alongside the total so the operator can see at a glance that the
   // engines agree on the train portion (3h 48m) and only differ on the
   // walks (which produce the ±N min gap in the total).
   const railSec = _railOnlyDurationSec(trip.best.legs);
+  // PR-194: the toggle filters WALK legs only — bus/tram/coach durations
+  // are summed in. Label says "transit" (not "rail") so the UI matches
+  // what `_railOnlyDurationSec` actually returns.
   const durBlock = _COMPARE_TRAINS_ONLY
-    ? `<span style="color: var(--rail-steel)"> · ${dur(railSec)} rail · ${dur(bestRow.duration_seconds)} total</span>`
+    ? `<span style="color: var(--rail-steel)"> · ${dur(railSec)} transit · ${dur(bestRow.duration_seconds)} total</span>`
     : `<span style="color: var(--rail-steel)"> · ${dur(bestRow.duration_seconds)}</span>`;
   // Cards in the grid use the same trip-card class so the click-to-
   // expand wiring at the bottom of render() catches them for free.
@@ -1096,12 +1178,16 @@ function _renderToggleControls() {
   // and calls render(_LAST_PAYLOAD) to rebuild.
   const checked = _COMPARE_TRAINS_ONLY ? 'checked' : '';
   const hint = _COMPARE_TRAINS_ONLY
-    ? 'pairing by rail-only signature (walks ignored)'
+    ? 'pairing by transit-only signature (walk legs ignored, bus/tram/coach kept)'
     : 'pairing by full-trip signature (today\'s default)';
+  // PR-194: the toggle skips WALK legs only; bus/tram/coach are kept.
+  // Label corrected from the original misleading "trains only" — the
+  // underlying filter never inspected mode beyond `mode !== 'WALK'`.
   return `<div class="compare-controls">
+    <!-- PR-194: the toggle skips WALK legs only; bus/tram/coach are kept. Label corrected from the original misleading "trains only". -->
     <label class="compare-toggle">
       <input type="checkbox" id="compare-trains-only" ${checked}>
-      Compare trains only <span class="hint">— ${hint}</span>
+      Compare excluding walk legs <span class="hint">— ${hint}</span>
     </label>
   </div>`;
 }
@@ -1119,6 +1205,100 @@ function renderComparisonGrid(payload) {
     <div class="compare-header"><span class="engine-pill">OTP</span> sessions</div>
     <div class="compare-header"><span class="engine-pill motis">MOTIS</span> sessions</div>
     ${cells.join('')}
+  </div>`;
+}
+
+// PR-194 — side-by-side comparison layout. When the opt-in checkbox
+// is ON and at least one reference engine (OJP / HAFAS) returned trips,
+// the OJP and HAFAS panels render as columns alongside VIATOR's own
+// results instead of stacked below them. Default OFF preserves the
+// existing layout for every workspace that hasn't opted in.
+//
+// State is read from localStorage at module-load so the operator's
+// last choice survives a full page reload. The same key is written
+// back from the change handler at the bottom of `render()`.
+const _SIDE_BY_SIDE_STORAGE_KEY = 'viator.compareSideBySide';
+let _COMPARE_SIDE_BY_SIDE = (function () {
+  try {
+    return window.localStorage.getItem(_SIDE_BY_SIDE_STORAGE_KEY) === '1';
+  } catch (_e) {
+    // localStorage can throw in private-browsing or sandboxed iframes;
+    // default to OFF and keep going.
+    return false;
+  }
+})();
+
+function _refColumnDescriptors(payload) {
+  // List of reference-engine column descriptors that should appear in
+  // the side-by-side grid. A column is included when EITHER the engine
+  // returned trips, OR the payload carries a status object for it (so
+  // an empty / no_route / unavailable status still gets a column with
+  // an explanatory body — operator needs to see the source was
+  // queried). Order matters: OJP first (blue accent) then HAFAS
+  // (amber) so the visual ordering matches the form layout.
+  const out = [];
+  const ojp = payload.ojp_reference;
+  if (ojp) out.push({ key: 'ojp', label: 'Swiss OJP', pillClass: 'ojp', ref: ojp });
+  const hafas = payload.hafas_reference;
+  if (hafas) out.push({ key: 'hafas', label: 'ÖBB HAFAS', pillClass: 'hafas', ref: hafas });
+  return out;
+}
+
+function _shouldRenderSideBySide(payload) {
+  // The toggle is meaningful only when AT LEAST ONE reference engine
+  // either returned trips or has a status entry. Without that the
+  // user would see a single "VIATOR" column wrapping the existing
+  // cards which is identical to the default layout. Returning false
+  // here short-circuits the column build and falls back to stacked.
+  if (!_COMPARE_SIDE_BY_SIDE) return false;
+  const cols = _refColumnDescriptors(payload);
+  return cols.length > 0;
+}
+
+function _refColumnBodyHtml(descriptor) {
+  // Reference-column body. Re-use the existing per-engine renderers
+  // (renderOjpReference / renderHafasReference) so the panel internals
+  // — heading text, card layout, JSON button wiring — stay shared
+  // between the stacked and side-by-side layouts. For the "0 trips"
+  // case we still want a clear "no itineraries found" message so the
+  // column is visibly empty rather than mysteriously blank.
+  const ref = descriptor.ref;
+  if (ref && ref.status === 'ok' && (ref.trips || []).length) {
+    if (descriptor.key === 'ojp') return renderOjpReference(ref);
+    if (descriptor.key === 'hafas') return renderHafasReference(ref);
+  }
+  // Empty body — pick a status-driven message so the operator can tell
+  // why the column is empty (no_route vs. error vs. timeout).
+  let why = 'no itineraries found';
+  if (ref) {
+    if (ref.status === 'no_route') why = 'no itineraries found';
+    else if (ref.status === 'rate_limited') why = `rate-limited — ${escHTML(ref.error || 'try again shortly')}`;
+    else if (ref.status === 'timeout') why = 'timed out';
+    else if (ref.status && ref.status !== 'ok') why = `unavailable — ${escHTML(ref.error || ref.status)}`;
+  }
+  return `<div class="compare-cell empty">${why}</div>`;
+}
+
+function renderSideBySideGrid(payload, viatorCardsHtml) {
+  // Build an N-column grid: column 1 is VIATOR's own cards, columns
+  // 2..N are the reference panels (OJP, HAFAS, ...). Each column body
+  // re-uses an existing renderer so the per-engine card markup stays
+  // canonical (no drift between stacked and side-by-side layouts).
+  const refs = _refColumnDescriptors(payload);
+  const cols = [
+    { key: 'viator', label: 'VIATOR · MOTIS / OTP', pillClass: 'viator', body: viatorCardsHtml || '<div class="compare-cell empty">no itineraries found</div>' },
+    ...refs.map((r) => ({ ...r, body: _refColumnBodyHtml(r) })),
+  ];
+  const headerRow = cols.map((c) =>
+    `<div class="compare-header"><span class="engine-pill ${c.pillClass}">${escHTML(c.label)}</span></div>`
+  ).join('');
+  const bodyRow = cols.map((c) => `<div class="compare-cell">${c.body}</div>`).join('');
+  // grid-template-columns is driven by --compare-cols inline so the
+  // grid scales 1/2/3 columns without a per-N CSS class. Mobile
+  // collapse via the existing @720px rule still fires (single column).
+  return `<div class="compare-grid compare-grid-refs" style="--compare-cols: repeat(${cols.length}, 1fr)">
+    ${headerRow}
+    ${bodyRow}
   </div>`;
 }
 
@@ -1189,24 +1369,39 @@ function render(payload) {
   // three pills count distinct itinerary fingerprints (within-engine
   // duplicates collapse).
   const cmpStrip = comparisonStrip(payload.comparison_summary);
-  // v0.1.35 — the Swiss OJP reference panel (if the operator opted in)
-  // renders below VIATOR's own results. Its cards carry class
-  // `trip-card`, so the expand-wiring below catches them for free.
-  const ojpPanel = renderOjpReference(payload.ojp_reference);
+  // PR-194 — side-by-side fork. When the opt-in toggle is ON AND a
+  // reference engine returned anything, we render a single N-column
+  // grid containing VIATOR cards + each reference panel side-by-side
+  // and suppress the stacked OJP / HAFAS panels (they'd be a
+  // duplicate render). Default-OFF path is unchanged: stacked
+  // panels under VIATOR's own results.
+  const sideBySide = _shouldRenderSideBySide(payload);
+  const ojpPanel = sideBySide ? '' : renderOjpReference(payload.ojp_reference);
   // feat/hafas-journey-comparison — same shape, ÖBB HAFAS reference.
   // Renders below the OJP panel (when both opted in) so the two
   // references stack rather than compete for vertical real estate.
-  const hafasPanel = renderHafasReference(payload.hafas_reference);
+  const hafasPanel = sideBySide ? '' : renderHafasReference(payload.hafas_reference);
   // v0.1.41 — federated (cross-session) itineraries render in their own group;
   // suppress "No itineraries found" when only federated results exist.
   const federatedSection = renderFederated(payload.federated_trips);
+  // PR-194: build the side-by-side grid AFTER `cards` is computed so we
+  // can hand the existing VIATOR-cards HTML to the first column verbatim
+  // — keeps the per-trip markup canonical between layouts.
+  const sideBySideGrid = sideBySide
+    ? renderSideBySideGrid(payload, comparisonGrid || cards)
+    : '';
+  // When the side-by-side grid renders it OWNS the layout slot —
+  // suppress the standalone `cards` / `comparisonGrid` strings so they
+  // don't render twice (once flat, once embedded in the first column).
+  const cardsSlot = sideBySide ? '' : cards;
+  const comparisonGridSlot = sideBySide ? '' : comparisonGrid;
   // P2 MOTIS — comparisonGrid takes the slot `cards` would have taken;
   // they're mutually exclusive (the fork above sets cards='' when the
   // grid is rendered). "No itineraries found" only when nothing landed
-  // anywhere — flat list, grid, or federated.
+  // anywhere — flat list, grid, federated, or side-by-side.
   const noResults =
-    (cards || comparisonGrid || federatedSection) ? '' : '<p>No itineraries found.</p>';
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${comparisonGrid}${cards}${noResults}${federatedSection}${ojpPanel}${hafasPanel}`;
+    (cards || comparisonGrid || federatedSection || sideBySideGrid) ? '' : '<p>No itineraries found.</p>';
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${comparisonGridSlot}${cardsSlot}${sideBySideGrid}${noResults}${federatedSection}${ojpPanel}${hafasPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable. OJP cards
   // also have class `trip-card` so this selector catches them too.
@@ -1242,7 +1437,8 @@ function render(payload) {
       showOjpJsonInspector(idx);
     });
   });
-  // P2 MOTIS — wire the "Compare trains only" toggle. Only present when
+  // P2 MOTIS — wire the "Compare excluding walk legs" toggle (PR-194
+  // honest-label rename). Only present when
   // the comparison grid is rendered; flipping it re-runs the client-side
   // pairing (no fetch). Stays at this level — getElementById walks the
   // whole document so it catches the checkbox whether it lives inside
