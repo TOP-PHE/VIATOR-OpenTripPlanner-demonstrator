@@ -2,9 +2,55 @@
 {% block title %}Network Coverage — VIATOR{% endblock %}
 
 {% block extra_styles %}
-.cov-grid { display: grid; grid-template-columns: 280px 1fr; gap: 1rem; }
+/* PR-195 — page-level layout override. The shared `_base.html` clamps
+   <main> at max-width:1100px which, on a 2560-wide desktop monitor,
+   leaves the 23x23 matrix cramped in the centre with ~60% of the
+   viewport empty. The coverage page has the densest grid in the app
+   (~600 cells across) so it benefits the most from filling the
+   viewport; override is scoped to this page only so other admin
+   pages keep their narrower paragraph-friendly width unless they
+   opt in via the same pattern. 24px gutter matches the existing
+   header `.inner` padding so the header rule and the matrix card
+   stay visually aligned at the left edge. */
+main {
+  max-width: none;
+  margin: 1.5rem 0;
+  padding: 0 1.5rem;
+}
+
+/* Responsive page grid. clamp() gives:
+     - >= ~1820px viewport: sidebar at 400px ceiling (form fields don't
+       need to grow further; matrix gets all the extra room)
+     - 1280px..1820px:       sidebar at 22vw (~280–400px)
+     - <  1280px:            sidebar at 280px floor (form fields stay
+                              legible — the Country fieldset wraps to
+                              two rows below ~260px)
+   Matrix gets 1fr so it absorbs every remaining pixel. align-items:
+   start prevents the sidebar from stretching to match the (often
+   much taller) matrix card. */
+.cov-grid {
+  display: grid;
+  grid-template-columns: clamp(280px, 22vw, 400px) 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+/* PR-195 — collapse to a single-column stack on tablet & phone widths
+   so the form panel renders ABOVE the matrix rather than next to it.
+   Below ~768px the sidebar would otherwise consume nearly half the
+   viewport and squish the matrix to a few unreadable columns; the
+   stack lets the matrix have the full width with its own horizontal
+   scroll bar (the existing `.cov-matrix-wrap` overflow:auto handles
+   wide-table scrolling). */
+@media (max-width: 768px) {
+  main { padding: 0 0.75rem; margin: 1rem 0; }
+  .cov-grid { grid-template-columns: 1fr; }
+}
 .cov-side { background: var(--paper); padding: 1rem; border-radius: 8px; }
-.cov-main { min-height: 400px; }
+/* `min-width: 0` lets the matrix card shrink below its intrinsic
+   content width inside the grid track — without it the .cov-matrix-wrap
+   horizontal scroll bar never appears because the grid track itself
+   expands to fit the 23-column matrix. */
+.cov-main { min-height: 400px; min-width: 0; }
 .cov-form label { font-weight: 600; font-size: 0.85rem; }
 .cov-form select, .cov-form input { width: 100%; padding: 0.4rem; margin: 0.2rem 0 0.6rem; }
 
