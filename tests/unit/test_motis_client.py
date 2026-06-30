@@ -340,6 +340,43 @@ async def test_fetch_plan_unknown_timezone_falls_through_without_raising(monkeyp
     assert "+" not in seen["time"]  # no offset attached
 
 
+async def test_fetch_plan_sets_connection_close_header(monkeypatch):
+    """PR-188 regression: every MOTIS request must carry `Connection: close`.
+
+    Without it, an asyncio.wait_for slot-timeout closes the TCP socket
+    client-side but MOTIS keeps computing the RAPTOR result, then logs
+    "Broken pipe" on write. Under concurrent coverage queries that
+    orphan-compute pile-up pegged MOTIS at 1798% CPU + 281 GB block I/O
+    (2026-06-30) for ~0 useful results.
+
+    `Connection: close` signals MOTIS to release the per-request work
+    when the client disconnects, instead of finish-then-discover-dead-socket.
+    """
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # httpx normalises header names to lowercase for lookup; assert
+        # using the canonical lowercase key.
+        seen["connection_header"] = req.headers.get("connection")
+        return httpx.Response(200, json={"itineraries": []})
+
+    _install_mock(monkeypatch, handler)
+    await motis_client.fetch_plan(
+        session_id="x",
+        from_lat=0.0,
+        from_lon=0.0,
+        to_lat=0.0,
+        to_lon=0.0,
+        when=datetime(2026, 6, 1, 8, 0, tzinfo=UTC),
+        timeout_ms=5000,
+        base_url="http://localhost:8081",
+    )
+    # Case-insensitive comparison: httpx may pass the value through verbatim,
+    # but the value itself is the contract MOTIS reads.
+    assert seen["connection_header"] is not None
+    assert seen["connection_header"].lower() == "close"
+
+
 async def test_fetch_plan_propagates_http_errors(monkeypatch):
     def handler(_req: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "kaboom"})
