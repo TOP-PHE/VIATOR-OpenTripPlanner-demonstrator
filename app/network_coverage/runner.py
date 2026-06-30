@@ -31,8 +31,10 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dtime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from sqlalchemy import select, update
@@ -108,6 +110,27 @@ _DEFAULT_VERIFY_PARALLELISM = 2
 _DEFAULT_VERIFY_TIMEOUT_S = 30.0
 _DEFAULT_VERIFY_SLEEP_BETWEEN_MS = 500
 
+# PR-3 — K-slot time-slicing defaults. K=6 with a 24h window puts a
+# slot every 4 hours, matching the legacy single-call window size so
+# each slot's RAPTOR work is comparable to the v0.1.29.2 baseline.
+# numItineraries=10 per slot caps a single slot at 10x what the live
+# UI uses — keeps each call well under OTP's 60s ceiling on dense
+# graphs even when the slot lands on a busy commuter peak.
+_DEFAULT_SLOT_COUNT = 6
+_DEFAULT_NUM_ITINERARIES_PER_SLOT = 10
+_DEFAULT_SLOT_TIMEOUT_MS = 20_000
+_DEFAULT_WITHIN_PAIR_PARALLELISM = 3
+_DEFAULT_WINDOW_START_LOCAL = "00:00"
+_DEFAULT_WINDOW_END_LOCAL = "24:00"
+_DEFAULT_WINDOW_TIMEZONE = "UTC"
+
+# "24:00" sentinel — accepted as the day-window upper bound so the form
+# can offer a full-day default without the operator typing "00:00" and
+# losing the "ends at midnight" semantic. Translated to (next_day,
+# 00:00) at execute time so the actual UTC slot grid does the right
+# thing.
+_END_OF_DAY_SENTINEL = "24:00"
+
 # Cell statuses that trigger an external-verify pass. 'ok' is
 # excluded because we don't need ÖBB to confirm a route VIATOR
 # already returned. 'skipped' is excluded because those cells never
@@ -137,6 +160,14 @@ class CoverageConfig:
     verify_parallelism: int = _DEFAULT_VERIFY_PARALLELISM
     verify_timeout_s: float = _DEFAULT_VERIFY_TIMEOUT_S
     verify_sleep_ms: int = _DEFAULT_VERIFY_SLEEP_BETWEEN_MS
+    # PR-3 — K-slot time-slicing.
+    slot_count: int = _DEFAULT_SLOT_COUNT
+    num_itineraries_per_slot: int = _DEFAULT_NUM_ITINERARIES_PER_SLOT
+    slot_timeout_ms: int = _DEFAULT_SLOT_TIMEOUT_MS
+    within_pair_parallelism: int = _DEFAULT_WITHIN_PAIR_PARALLELISM
+    default_window_start: str = _DEFAULT_WINDOW_START_LOCAL
+    default_window_end: str = _DEFAULT_WINDOW_END_LOCAL
+    default_timezone: str = _DEFAULT_WINDOW_TIMEZONE
 
 
 def _load_coverage_config(db: DbSession) -> CoverageConfig:
@@ -159,6 +190,20 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
         verify_parallelism=int(cfg.get("COVERAGE_VERIFY_PARALLELISM", _DEFAULT_VERIFY_PARALLELISM)),
         verify_timeout_s=float(cfg.get("COVERAGE_VERIFY_TIMEOUT_S", _DEFAULT_VERIFY_TIMEOUT_S)),
         verify_sleep_ms=int(cfg.get("COVERAGE_VERIFY_SLEEP_MS", _DEFAULT_VERIFY_SLEEP_BETWEEN_MS)),
+        # PR-3 — K-slot + day-window + timezone defaults.
+        slot_count=int(cfg.get("COVERAGE_SLOT_COUNT", _DEFAULT_SLOT_COUNT)),
+        num_itineraries_per_slot=int(
+            cfg.get("COVERAGE_NUM_ITINERARIES_PER_SLOT", _DEFAULT_NUM_ITINERARIES_PER_SLOT)
+        ),
+        slot_timeout_ms=int(cfg.get("COVERAGE_SLOT_TIMEOUT_MS", _DEFAULT_SLOT_TIMEOUT_MS)),
+        within_pair_parallelism=int(
+            cfg.get("COVERAGE_WITHIN_PAIR_PARALLELISM", _DEFAULT_WITHIN_PAIR_PARALLELISM)
+        ),
+        default_window_start=str(
+            cfg.get("COVERAGE_DEFAULT_WINDOW_START", _DEFAULT_WINDOW_START_LOCAL)
+        ),
+        default_window_end=str(cfg.get("COVERAGE_DEFAULT_WINDOW_END", _DEFAULT_WINDOW_END_LOCAL)),
+        default_timezone=str(cfg.get("COVERAGE_DEFAULT_TIMEZONE", _DEFAULT_WINDOW_TIMEZONE)),
     )
 
 
@@ -167,29 +212,13 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
 # PR-1 — Stop button. Each in-flight `execute_run` registers an
 # `asyncio.Event` keyed by run_id in `_CANCEL_EVENTS`. The
 # POST /runs/{id}/stop endpoint sets that event; the per-pair loop checks
-# it before each pair and exits cleanly when set. Cells that already
-# processed before the click stay in the DB — partial results are
-# valuable. The endpoint NEVER touches `network_coverage_runs.status`
-# directly; that write happens in `execute_run`'s post-loop branch once
-# the runner has observed the signal, so the DB row's terminal-state
-# guarantee (status='running' until the worker says otherwise) holds.
-#
-# Module-level dict because:
-#  - FastAPI BackgroundTasks runs in the same process as the API,
-#  - all coverage runs are single-process (no celery / no multi-worker
-#    scheduling for this feature),
-#  - swapping in a Redis-backed signal later is a one-helper change if
-#    we ever go multi-process.
+# it before each pair and exits cleanly when set. Cells already processed
+# before the click stay in the DB — partial results are valuable.
 _CANCEL_EVENTS: dict[uuid.UUID, asyncio.Event] = {}
 
 
 def register_cancel(run_id: uuid.UUID) -> asyncio.Event:
-    """Register (or reuse) the cancel event for `run_id`.
-
-    Idempotent: if a previous registration is still present (e.g. the
-    worker died and is being relaunched on the same run id — unlikely
-    in practice but defensive), the existing event is returned so a
-    Stop click in the meantime still fires for the new worker."""
+    """Register (or reuse) the cancel event for `run_id`. Idempotent."""
     ev = _CANCEL_EVENTS.get(run_id)
     if ev is None:
         ev = asyncio.Event()
@@ -198,14 +227,12 @@ def register_cancel(run_id: uuid.UUID) -> asyncio.Event:
 
 
 def clear_cancel(run_id: uuid.UUID) -> None:
-    """Drop the cancel event from the registry. Safe to call multiple
-    times — used in `execute_run`'s `finally` to keep the dict bounded."""
+    """Drop the cancel event from the registry. Safe to call multiple times."""
     _CANCEL_EVENTS.pop(run_id, None)
 
 
 def is_cancelled(run_id: uuid.UUID) -> bool:
-    """True when the cancel event for `run_id` is set. Cheap O(1) dict
-    lookup — called from inside the per-pair hot loop."""
+    """True when the cancel event for `run_id` is set."""
     ev = _CANCEL_EVENTS.get(run_id)
     return ev is not None and ev.is_set()
 
@@ -213,18 +240,427 @@ def is_cancelled(run_id: uuid.UUID) -> bool:
 def request_cancel(run_id: uuid.UUID) -> bool:
     """Public entry point for the POST /stop endpoint. Returns True when
     a live cancel event was found and set, False when no event was
-    registered (i.e. the run isn't actually being processed in this
-    worker — caller should re-check the DB row state and 409 if needed).
-
-    Does NOT flip `status='cancelled'` on the row — that's the runner's
-    job once it has observed the signal and finished the in-flight
-    write, so we don't end up with status='cancelled' but the runner
-    still mid-pair persisting a fresh row."""
+    registered. Does NOT flip status — runner owns terminal-state writes."""
     ev = _CANCEL_EVENTS.get(run_id)
     if ev is None:
         return False
     ev.set()
     return True
+
+
+# ─────────────────── PR-3 — day window + K-slot helpers ────────────────────
+#
+# The runner now slices each pair into K time-slots covering a per-run
+# day window in the run's IANA timezone. Helpers below are all DB-free
+# and unit-tested in `tests/unit/test_coverage_slicing.py` so they can
+# be exercised without the full execute_run pipeline.
+
+
+@dataclass(frozen=True)
+class ResolvedWindow:
+    """Resolved per-run day-window — UTC anchor instants + the IANA zone
+    used to compute them. Threaded through `_fetch_plan_sliced` so the
+    K-slot grid + the trip-belongs filter agree on the same boundaries.
+
+    `start_utc` / `end_utc` bracket the calendar-day window in UTC; the
+    K time-slot boundaries are computed by even subdivision between
+    them. `tz_name` is preserved so the trip filter can re-localise
+    `first_transit_leg_departure_utc` back to the same wall-clock zone
+    the operator selected (matters for cross-midnight night-train
+    windows like 18:00-06:00).
+    """
+
+    start_utc: datetime
+    end_utc: datetime
+    tz_name: str
+
+
+def _default_reference_date(tz_name: str | None) -> date:
+    """Tomorrow in `tz_name`, falling back to UTC for unknown zones.
+
+    Extracted so `create_run` stays under Sonar's cognitive-complexity
+    threshold (the nested try/except for ZoneInfo + the date arithmetic
+    pushed the calling site over otherwise)."""
+    try:
+        tz_for_ref = ZoneInfo(tz_name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        tz_for_ref = ZoneInfo("UTC")
+    return (datetime.now(tz_for_ref) + timedelta(days=1)).date()
+
+
+def _resolve_timezone(tz_name: str | None, cfg: CoverageConfig) -> ZoneInfo:
+    """Return a ZoneInfo for `tz_name`, falling back to the cfg default
+    and finally to UTC. Unknown zones log a warning but never raise —
+    the runner must always make progress on a coverage run.
+    """
+    candidate = tz_name or cfg.default_timezone or "UTC"
+    try:
+        return ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning(
+            "PR-3 unknown timezone %r — falling back to UTC for day-window resolution",
+            candidate,
+        )
+        return ZoneInfo("UTC")
+
+
+def _parse_hhmm(value: str | None, default: str) -> tuple[int, bool]:
+    """Parse "HH:MM" into hours-from-midnight, returning (hours_minutes
+    as total minutes, is_end_of_day_sentinel).
+
+    The "24:00" sentinel returns (1440, True) so callers can recognise
+    "midnight of the NEXT day" semantics — Postgres TIME forbids 24:00
+    so we can't round-trip the literal through the DB. Anything that
+    fails to parse falls back to `default` (also parsed) — defence in
+    depth, the API layer validates upstream.
+    """
+    candidate = (value or default or "00:00").strip()
+    if candidate == _END_OF_DAY_SENTINEL:
+        return 24 * 60, True
+    try:
+        hh_str, mm_str = candidate.split(":", 1)
+        hh = int(hh_str)
+        mm = int(mm_str)
+        if not (0 <= hh <= 23) or not (0 <= mm <= 59):
+            raise ValueError
+        return hh * 60 + mm, False
+    except (ValueError, AttributeError):
+        # Default fallback — re-parse the default which is operator-
+        # supplied via platform_config, so it MAY also be bogus; final
+        # fallback is 0 minutes so the runner never crashes.
+        if value is None or value == default:
+            return 0, False
+        return _parse_hhmm(default, "00:00")
+
+
+def _resolve_run_window(
+    *,
+    window_start_local: dtime | str | None,
+    window_end_local: dtime | str | None,
+    window_timezone: str | None,
+    reference_date_value: date | None,
+    cfg: CoverageConfig,
+) -> ResolvedWindow:
+    """Compose the per-run day-window into a (start_utc, end_utc) pair.
+
+    Accepts either `datetime.time` (the ORM column type) or "HH:MM"
+    string for the bounds so callers from both the runner (ORM rows)
+    and the unit tests (strings) can use the same helper.
+
+    Rules:
+      - NULL bound → fall back to cfg.default_window_start/end
+      - "24:00" string is honoured as end-of-day (= next-day 00:00)
+      - bound start >= bound end → treated as a cross-midnight window
+        (e.g. 18:00-06:00 = 12-hour night-train slice), end_utc is
+        rolled forward by one day
+      - reference_date NULL → today's date in the resolved timezone
+        (matches `create_run`'s "tomorrow" default at run-create time;
+        execute time only sees this branch if the row was inserted
+        without a date for some reason)
+    """
+    tz = _resolve_timezone(window_timezone, cfg)
+
+    def _to_string_bound(b: dtime | str | None, default: str) -> str:
+        if b is None:
+            return default
+        if isinstance(b, dtime):
+            return f"{b.hour:02d}:{b.minute:02d}"
+        return b
+
+    start_minutes, _ = _parse_hhmm(
+        _to_string_bound(window_start_local, cfg.default_window_start),
+        cfg.default_window_start,
+    )
+    end_minutes, end_is_sentinel = _parse_hhmm(
+        _to_string_bound(window_end_local, cfg.default_window_end),
+        cfg.default_window_end,
+    )
+
+    if reference_date_value is None:
+        # Use today in the resolved tz — same fallback `create_run` uses
+        # for the "tomorrow" persistence default, but here we don't bump
+        # by 1 day because execute_run shouldn't silently shift the
+        # window from what create_run captured. If a future code path
+        # bypasses create_run and lands here we still produce a usable
+        # window.
+        reference_date_value = datetime.now(tz).date()
+
+    start_local = datetime.combine(
+        reference_date_value,
+        dtime(hour=start_minutes // 60, minute=start_minutes % 60),
+        tzinfo=tz,
+    )
+
+    # "24:00" sentinel == 1440 minutes == midnight of the NEXT day.
+    # A cross-midnight window like 18:00-06:00 also needs the next-day
+    # bump on end_utc; we detect that as "end <= start" once both are
+    # in 0-1440 minutes and not the sentinel.
+    end_day = reference_date_value
+    if end_is_sentinel or (not end_is_sentinel and end_minutes <= start_minutes):
+        end_day = reference_date_value + timedelta(days=1)
+    end_minutes_clamped = 0 if end_is_sentinel else end_minutes
+    end_local = datetime.combine(
+        end_day,
+        dtime(hour=end_minutes_clamped // 60, minute=end_minutes_clamped % 60),
+        tzinfo=tz,
+    )
+    return ResolvedWindow(
+        start_utc=start_local.astimezone(UTC),
+        end_utc=end_local.astimezone(UTC),
+        tz_name=str(tz),
+    )
+
+
+def _slot_boundaries(window: ResolvedWindow, slot_count: int) -> list[datetime]:
+    """Return slot_count+1 UTC datetimes spanning [start_utc, end_utc].
+
+    slot_count=1 returns [start_utc, end_utc] — i.e. one slot covering
+    the whole window, matching the legacy single-call behaviour.
+    """
+    if slot_count < 1:
+        slot_count = 1
+    total_seconds = (window.end_utc - window.start_utc).total_seconds()
+    slot_seconds = total_seconds / slot_count
+    return [window.start_utc + timedelta(seconds=i * slot_seconds) for i in range(slot_count)] + [
+        window.end_utc
+    ]
+
+
+def _coverage_dedup_key(trip: dict[str, Any]) -> tuple[str, str, tuple[str, ...], str]:
+    """4-tuple identity for a trip in the K-slot dedup pass.
+
+    (from_stop_id_norm, first_transit_leg_dep_utc_minute, route_signature,
+    to_stop_id_norm) where:
+      - from/to stop ids come from the first/last TRANSIT leg (NOT the
+        itinerary endpoints, which on a walk-then-train trip would be
+        the operator's coords)
+      - dep is truncated to the minute (departure times that differ by
+        seconds are the same train in practice)
+      - route_signature is the tuple of (route_short_name or mode) for
+        every transit leg in order — same train sequence == same route
+
+    A walk-only trip (no transit legs) returns ("", "", (), "") which
+    naturally collapses all walk-only trips to one entry — they're not
+    distinguishable as separate "services" anyway.
+    """
+    legs = trip.get("legs") or []
+    transit_legs = [
+        lg for lg in legs if (lg.get("mode") or "").upper() not in ("WALK", "TRANSFER", "")
+    ]
+    if not transit_legs:
+        return ("", "", (), "")
+
+    first = transit_legs[0]
+    last = transit_legs[-1]
+    from_stop = _normalise_stop_id(first.get("from_stop_id"))
+    to_stop = _normalise_stop_id(last.get("to_stop_id"))
+
+    dep = trip.get("first_transit_leg_departure_utc") or first.get("departure") or ""
+    dep_minute = _truncate_iso_to_minute(dep)
+
+    route_sig = tuple(
+        (lg.get("route_short_name") or lg.get("mode") or "").strip().upper() for lg in transit_legs
+    )
+    return (from_stop, dep_minute, route_sig, to_stop)
+
+
+def _normalise_stop_id(stop_id: str | Any) -> str:
+    """Strip the OTP/MOTIS feed-id prefix so cross-engine dedup works.
+
+    OTP stop ids are `<feed>:<local>`; MOTIS uses `<feed>_<local>`. A
+    train surfaced by both engines should dedup, so we collapse both
+    forms onto `<local>` — the local part is the canonical identifier
+    that survives engine swap. Missing / None returns "" so the
+    dedup tuple stays a plain string."""
+    if not stop_id:
+        return ""
+    s = str(stop_id)
+    # OTP form first (colon), then MOTIS (underscore). Prefer the
+    # right-most separator so a `<feed>_<local_with_underscores>` id
+    # keeps the locally-meaningful portion intact.
+    if ":" in s:
+        return s.rsplit(":", 1)[-1]
+    if "_" in s:
+        return s.rsplit("_", 1)[-1]
+    return s
+
+
+def _truncate_iso_to_minute(value: str) -> str:
+    """`YYYY-MM-DDTHH:MM:SS+00:00` → `YYYY-MM-DDTHH:MM+00:00`. Defensive
+    against malformed input — returns the string unchanged if the seconds
+    field isn't where we expect it."""
+    if not value or "T" not in value:
+        return value
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M%z")
+
+
+def _trip_belongs_to_window(trip: dict[str, Any], window: ResolvedWindow) -> bool:
+    """True iff the trip's FIRST TRANSIT LEG departure (UTC) falls in
+    [window.start_utc, window.end_utc).
+
+    Trips with no `first_transit_leg_departure_utc` (walk-only, or a
+    client that hasn't been upgraded to emit the field) return False —
+    they have no boarding event to anchor against the window. The
+    runner treats those as "doesn't count" rather than guessing.
+    """
+    dep_str = trip.get("first_transit_leg_departure_utc")
+    if not dep_str or not isinstance(dep_str, str):
+        return False
+    try:
+        dep_utc = datetime.fromisoformat(dep_str)
+    except (TypeError, ValueError):
+        return False
+    if dep_utc.tzinfo is None:
+        dep_utc = dep_utc.replace(tzinfo=UTC)
+    return window.start_utc <= dep_utc < window.end_utc
+
+
+async def _fetch_plan_sliced(
+    *,
+    engine: str,
+    session_id: str,
+    origin: Hub,
+    dest: Hub,
+    window: ResolvedWindow,
+    cfg: CoverageConfig,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """K-slot fetch_plan dispatch + dedup. Returns ``(last_raw, deduped_trips)``.
+
+    K = `cfg.slot_count`. K=1 is bit-identical to the legacy single
+    fetch_plan call (= the rollback flag — set COVERAGE_SLOT_COUNT=1 in
+    /admin/config to revert PR-3 behaviour). K>1 fires `cfg.within_pair_
+    parallelism` concurrent calls, each anchored at a slot boundary,
+    each requesting `cfg.num_itineraries_per_slot` itineraries within
+    `slot_seconds` seconds, then filters every returned trip on
+    `_trip_belongs_to_window` and deduplicates on `_coverage_dedup_key`.
+
+    `last_raw` is the raw response from the chronologically-last slot
+    (proxy for "give me one raw payload I can introspect" — used by
+    the recorder for the journey_search_executions row). Persisting
+    all K raws would multiply storage by K with no analytical gain
+    (the deduped trip list is the canonical artifact).
+
+    Per-slot exceptions are captured so a single timed-out slot
+    doesn't poison the whole pair — the rest still contribute their
+    trips and the pair gets the partial coverage it deserves. If
+    EVERY slot raises, the first exception is re-raised so the caller
+    sees an error status (matches the legacy single-call behaviour).
+    """
+    boundaries = _slot_boundaries(window, cfg.slot_count)
+
+    # K=1 parity: single call with the full window, no dedup, no filter.
+    # This branch is the operator's emergency rollback to pre-PR-3 behaviour
+    # — IMPORTANT not to add any deviation here (filter, dedup, etc.) or
+    # the "set slot_count=1" rollback story breaks.
+    if cfg.slot_count == 1:
+        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
+            session_id=session_id,
+            from_lat=origin.lat,
+            from_lon=origin.lon,
+            to_lat=dest.lat,
+            to_lon=dest.lon,
+            when=boundaries[0],
+            timeout_ms=cfg.pair_timeout_ms,
+            num_itineraries=cfg.num_itineraries,
+            search_window_seconds=cfg.search_window_seconds,
+        )
+        return raw, trips
+
+    semaphore = asyncio.Semaphore(cfg.within_pair_parallelism)
+    slot_seconds = int((window.end_utc - window.start_utc).total_seconds() / cfg.slot_count)
+
+    async def _one_slot(slot_start: datetime) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with semaphore:
+            try:
+                raw, trips = await asyncio.wait_for(
+                    planner_dispatch.planner_for_engine(engine).fetch_plan(
+                        session_id=session_id,
+                        from_lat=origin.lat,
+                        from_lon=origin.lon,
+                        to_lat=dest.lat,
+                        to_lon=dest.lon,
+                        when=slot_start,
+                        timeout_ms=cfg.slot_timeout_ms,
+                        num_itineraries=cfg.num_itineraries_per_slot,
+                        search_window_seconds=slot_seconds,
+                    ),
+                    timeout=cfg.slot_timeout_ms / 1000.0,
+                )
+                return raw, trips
+            except Exception as exc:
+                # Per-slot tolerance: log and return empty so the rest of
+                # the slots still contribute. The caller re-raises only
+                # when every slot failed.
+                log.debug(
+                    "PR-3 slot at %s for %s -> %s failed: %s",
+                    slot_start.isoformat(),
+                    origin.id,
+                    dest.id,
+                    exc,
+                )
+                raise
+
+    results = await asyncio.gather(
+        *(_one_slot(b) for b in boundaries[:-1]),
+        return_exceptions=True,
+    )
+    return _merge_slot_results(results, window)
+
+
+def _accumulate_slot_trips(
+    trips: list[dict[str, Any]],
+    window: ResolvedWindow,
+    deduped: dict[tuple[str, str, tuple[str, ...], str], dict[str, Any]],
+) -> None:
+    """Merge one slot's trips into the accumulating dedup map (in place).
+
+    Extracted from `_merge_slot_results` so the parent's nested for/if
+    chain stays under Sonar's cognitive-complexity ceiling. Walk-only
+    trips and trips whose first transit-leg boards outside the run's
+    day window are dropped here so the caller can stay agnostic to the
+    filter rules — see `_trip_belongs_to_window` for the exact rule."""
+    for trip in trips:
+        if not _trip_belongs_to_window(trip, window):
+            continue
+        key = _coverage_dedup_key(trip)
+        if key not in deduped:
+            deduped[key] = trip
+
+
+def _merge_slot_results(
+    results: list[Any],
+    window: ResolvedWindow,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Filter + dedup K-slot outcomes into one ``(last_raw, trips)`` pair.
+
+    Extracted from `_fetch_plan_sliced` so that function stays under
+    Sonar's cognitive-complexity ceiling. Re-raises the first slot
+    exception ONLY when no slot succeeded — otherwise partial coverage
+    is more useful than an error status (matches PR-E's
+    one-bad-cell-doesn't-abort-the-run posture)."""
+    deduped: dict[tuple[str, str, tuple[str, ...], str], dict[str, Any]] = {}
+    last_raw: dict[str, Any] = {}
+    first_exc: BaseException | None = None
+    successes = 0
+    for outcome in results:
+        if isinstance(outcome, BaseException):
+            if first_exc is None:
+                first_exc = outcome
+            continue
+        successes += 1
+        raw, trips = outcome
+        if raw:
+            last_raw = raw  # last successful payload wins
+        _accumulate_slot_trips(trips, window, deduped)
+    if successes == 0 and first_exc is not None:
+        raise first_exc
+    return last_raw, list(deduped.values())
 
 
 def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
@@ -317,6 +753,10 @@ def create_run(
     mode: str = MODE_SINGLE_SESSION,
     countries: list[str] | None = None,
     verify_externally: bool = False,
+    window_start_local: dtime | None = None,
+    window_end_local: dtime | None = None,
+    window_timezone: str | None = None,
+    reference_date_value: date | None = None,
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
@@ -369,6 +809,13 @@ def create_run(
     label = session_id if mode == MODE_SINGLE_SESSION else FANOUT_SESSION_LABEL
     assert label is not None  # narrowing for mypy — guaranteed by mode validation above
 
+    # PR-3 — resolve `reference_date` to a concrete calendar day NOW so
+    # the row carries the operator's intent verbatim. Default is
+    # "tomorrow in the resolved timezone" — gives a same-day result for
+    # operators in any zone without needing to think about UTC drift.
+    if reference_date_value is None:
+        reference_date_value = _default_reference_date(window_timezone)
+
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,
         session_id=session_id,
@@ -381,6 +828,13 @@ def create_run(
         mode=mode,
         countries=norm_countries,
         verify_externally=verify_externally,
+        # PR-3 — per-run day window. NULL across the board reproduces
+        # pre-PR-3 behaviour at execute time (runner falls back to the
+        # platform_config defaults).
+        window_start_local=window_start_local,
+        window_end_local=window_end_local,
+        window_timezone=window_timezone,
+        reference_date=reference_date_value,
     )
     db.add(run)
     db.flush()
@@ -422,12 +876,8 @@ def _snapshot_fanout_sessions(db: DbSession) -> tuple[list[str], dict[str, str]]
 
 @dataclass(frozen=True)
 class _Phase1Snapshot:
-    """Frozen result of Phase-1 setup: everything the per-pair loop needs.
-
-    Extracted from `execute_run` so the outer function stays under Sonar's
-    cognitive-complexity ceiling. Per-pair execution reads everything it
-    needs from this snapshot (no further DB lookups during Phase 2).
-    """
+    """Frozen result of Phase-1 setup. Per-pair execution reads everything
+    it needs from this snapshot (no further DB lookups during Phase 2)."""
 
     run_mode: str
     session_id_for_pairs: str | None
@@ -437,19 +887,15 @@ class _Phase1Snapshot:
     depart_at_for_pairs: datetime
     pairs: list[tuple[Hub, Hub]]
     cfg: CoverageConfig
+    window: ResolvedWindow
 
 
 def _resolve_run_mode_targets(
     db: DbSession, run: NetworkCoverageRun
 ) -> tuple[str | None, str, list[str], dict[str, str]]:
     """Resolve the session(s) and engine(s) the runner will call into.
-
-    Mutates `run.status='failed'` (and stamps `finished_at`, commits) when
-    the run's mode is unsatisfiable so the outer Phase-1 helper can short-
-    circuit cleanly. Returns
-    (session_id_for_pairs, engine_for_pairs, fanout_session_ids, engine_by_session)
-    — single_session populates the first two, fanout the last two.
-    """
+    Mutates `run.status='failed'` inline when the run's mode is
+    unsatisfiable so the outer Phase-1 helper can short-circuit cleanly."""
     if run.mode == MODE_SINGLE_SESSION:
         if run.session_id is None:
             log.warning("run %s mode=single_session has no session_id — aborting", run.id)
@@ -472,17 +918,8 @@ def _resolve_run_mode_targets(
 
 
 def _phase1_snapshot_and_start(run_id: uuid.UUID) -> _Phase1Snapshot | None:
-    """Phase-1 of `execute_run` — validate the run, flip to running, snapshot
-    the inputs the per-pair loop needs (incl. the frozen CoverageConfig).
-
-    Returns None when the run is unprocessable (missing, already terminal,
-    single_session-with-no-session_id, fanout-with-no-eligible-sessions).
-    The caller's `finally` will still drop the cancel-event registration.
-
-    v0.1.31 — hubs are re-read at execute time (not snapshotted at
-    create_run), so operators who edit the hub list between create and
-    execute see results consistent with the live matrix UI.
-    """
+    """Phase-1 of `execute_run` — validate the run, flip to running,
+    snapshot the inputs the per-pair loop needs (cfg + window + hubs)."""
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
@@ -498,14 +935,22 @@ def _phase1_snapshot_and_start(run_id: uuid.UUID) -> _Phase1Snapshot | None:
         run.status = "running"
         run.started_at = datetime.now(UTC)
         db.commit()
-        # PR-2 — freeze the tunables NOW. Editing /admin/config mid-run
-        # must not perturb the in-flight job.
         cfg = _load_coverage_config(db)
         session_id_for_pairs, engine_for_pairs, fanout_session_ids, engine_by_session = (
             _resolve_run_mode_targets(db, run)
         )
         if run.status == "failed":
             return None
+        # PR-3 — resolve the run's day-window into a (start_utc, end_utc)
+        # pair now so every per-pair call sees the same grid. Per-run
+        # column NULL → fall back to platform_config defaults via cfg.
+        window = _resolve_run_window(
+            window_start_local=run.window_start_local,
+            window_end_local=run.window_end_local,
+            window_timezone=run.window_timezone,
+            reference_date_value=run.reference_date,
+            cfg=cfg,
+        )
         hubs_now = _load_active_hubs(db)
         pairs = _hub_pairs(hubs_now, run.direction)
         return _Phase1Snapshot(
@@ -517,6 +962,7 @@ def _phase1_snapshot_and_start(run_id: uuid.UUID) -> _Phase1Snapshot | None:
             depart_at_for_pairs=run.depart_at,
             pairs=pairs,
             cfg=cfg,
+            window=window,
         )
 
 
@@ -528,17 +974,9 @@ async def _process_pair_with_cancel(
     origin: Hub,
     dest: Hub,
 ) -> None:
-    """PR-1 — per-pair coroutine with cooperative cancel.
-
-    Checked at the top (after the semaphore wait so the operator's Stop
-    click propagates to queued-but-not-running pairs) AND once more inside
-    the slot so a click that lands while we're waiting for the semaphore
-    short-circuits the actual OTP/MOTIS call. Cells that already wrote
-    their result rows before the click stay in the DB.
-
-    Extracted from `execute_run`'s inner closure so the parent function's
-    cognitive complexity stays under Sonar's ceiling.
-    """
+    """PR-1 — per-pair coroutine with cooperative cancel. Checked before
+    AND inside the semaphore so a Stop click propagates to both queued
+    and in-flight pairs."""
     if is_cancelled(run_id):
         return
     async with semaphore:
@@ -553,9 +991,10 @@ async def _process_pair_with_cancel(
                 dest=dest,
                 depart_at=snap.depart_at_for_pairs,
                 cfg=snap.cfg,
+                window=snap.window,
             )
             return
-        assert snap.session_id_for_pairs is not None  # narrowed at Phase 1
+        assert snap.session_id_for_pairs is not None
         await _execute_pair(
             run_id=run_id,
             session_id=snap.session_id_for_pairs,
@@ -564,16 +1003,13 @@ async def _process_pair_with_cancel(
             dest=dest,
             depart_at=snap.depart_at_for_pairs,
             cfg=snap.cfg,
+            window=snap.window,
         )
 
 
 def _mark_run_failed(run_id: uuid.UUID) -> None:
     """Stamp `status='failed' + finished_at=now()` in its own short txn.
-
-    Used by `execute_run` when the per-pair `asyncio.gather` raises — we
-    keep the failure-write isolated from the in-flight pair-loop session
-    so a transactional collision can't double-fault.
-    """
+    Used by `execute_run` when the per-pair gather raises."""
     with SessionLocal() as db:
         db.execute(
             update(NetworkCoverageRun)
@@ -584,19 +1020,9 @@ def _mark_run_failed(run_id: uuid.UUID) -> None:
 
 
 def _persist_cancelled_run(*, run_id: uuid.UUID, elapsed_s: float) -> None:
-    """PR-1 — terminal-state writer for an operator-cancelled run.
-
-    Recomputes counter rollups from whatever cells made it into the
-    results table (some pairs may have been mid-flight when the Stop
-    click landed; those that completed their persist before the cancel-
-    check fires keep their row). Stamps `finished_at`, attaches a
-    `cancelled_by_operator` marker on `summary`, and flips status to
-    'cancelled'. Single transaction so the matrix UI flips atomically.
-
-    Mirrors the structure of `_finalise_completed_run` minus the verify
-    sweep — running ÖBB HAFAS over the partial cell set when the
-    operator just asked us to stop would be wrong.
-    """
+    """PR-1 — terminal-state writer for operator-cancelled runs.
+    Recomputes counters from the partial cell set, stamps finished_at,
+    attaches a `cancelled_by_operator` marker, flips status."""
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
@@ -624,13 +1050,8 @@ def _persist_cancelled_run(*, run_id: uuid.UUID, elapsed_s: float) -> None:
 async def _finalise_completed_run(
     *, run_id: uuid.UUID, elapsed_s: float, cfg: CoverageConfig
 ) -> None:
-    """Phase-3 of `execute_run` — recompute summary counters, optionally
-    run the PR-E external-verify sweep, and flip the run to 'completed'
-    in a single transaction.
-
-    Extracted from `execute_run` so the parent function stays under
-    Sonar's cognitive-complexity ceiling.
-    """
+    """Phase-3 — recompute summary counters, optionally run the PR-E
+    external-verify sweep, flip to 'completed' in one transaction."""
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
@@ -646,11 +1067,6 @@ async def _finalise_completed_run(
         run.no_route_pairs = sum(1 for r in rows if r.status == "no_route")
         run.error_pairs = sum(1 for r in rows if r.status not in ("ok", "no_route", "skipped"))
 
-        # PR-E — external-verify sweep dispatch. Extracted to keep
-        # execute_run under Sonar's CC=15 ceiling; the helper handles
-        # the opt-in check, candidate filtering, logging, and zero-fill
-        # counters in one place. ORM mutations on the rows are flushed
-        # by the single db.commit() below, atomic with status='completed'.
         verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows, cfg=cfg)
 
         run.summary = {
@@ -667,9 +1083,8 @@ async def _finalise_completed_run(
             "external_error_count": verify_counters["error"],
         }
         # Flip status LAST so a partially-completed sweep that exits
-        # via an unexpected exception (above the broad-except in the
-        # helper) leaves the run in 'running' and mark_orphaned_runs
-        # will catch it at next startup.
+        # via an unexpected exception leaves the run in 'running' and
+        # mark_orphaned_runs catches it at next startup.
         run.status = "completed"
         db.commit()
 
@@ -685,10 +1100,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
     PR-1 — wraps the whole body in try/finally so the cancel-event
     registration set by `register_cancel(run_id)` is always cleared, even
     when execute_run exits via an exception, early-return, or terminal-
-    state short-circuit. Phase-1 setup, the per-pair coroutine, and the
-    failed/cancelled/completed terminal writes all live in dedicated
-    helpers so this function stays under Sonar's cognitive-complexity
-    ceiling.
+    state short-circuit.
     """
     log.info("network-coverage run %s starting", run_id)
     started = time.monotonic()
@@ -700,8 +1112,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
             return
 
         # Phase 2: process pairs with bounded concurrency. Each pair gets
-        # its own short-lived DB session — no transaction stays open
-        # across the network call to OTP.
+        # its own short-lived DB session.
         semaphore = asyncio.Semaphore(snap.cfg.pair_parallelism)
         try:
             await asyncio.gather(
@@ -724,10 +1135,9 @@ async def execute_run(run_id: uuid.UUID) -> None:
 
         elapsed_s = time.monotonic() - started
 
-        # PR-1 — if a Stop click set the cancel event at any point during
-        # Phase 2, persist the partial state under status='cancelled'
-        # instead of running Phase 3 (the verify sweep + status='completed'
-        # write). The cells already processed survive.
+        # PR-1 — if a Stop click set the cancel event mid-Phase-2, persist
+        # the partial state under status='cancelled' instead of running
+        # Phase 3. The cells already processed survive.
         if is_cancelled(run_id):
             _persist_cancelled_run(run_id=run_id, elapsed_s=elapsed_s)
             log.info(
@@ -894,6 +1304,7 @@ async def _execute_pair(
     dest: Hub,
     depart_at: datetime,
     cfg: CoverageConfig | None = None,
+    window: ResolvedWindow | None = None,
 ) -> None:
     """Run a single A→B search and persist the result row.
 
@@ -907,6 +1318,12 @@ async def _execute_pair(
     `cfg` is PR-2's operator-tunable knob bundle. Defaults to a fresh
     `CoverageConfig()` (= prior hardcoded constants) when called from a
     test that doesn't thread one in.
+
+    `window` is PR-3's resolved per-run day-window. When supplied, the
+    fetch goes through `_fetch_plan_sliced` (K time-slot dispatch +
+    filter + dedup); when None, falls back to the legacy single
+    fetch_plan call so direct unit-test callers keep working. The
+    runner always supplies `window`; only tests rely on the None path.
     """
     cfg = cfg or CoverageConfig()
     started = time.monotonic()
@@ -922,19 +1339,30 @@ async def _execute_pair(
     trips: list[dict[str, Any]] = []
 
     try:
-        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
-            session_id=session_id,
-            from_lat=origin.lat,
-            from_lon=origin.lon,
-            to_lat=dest.lat,
-            to_lon=dest.lon,
-            when=depart_at,
-            timeout_ms=cfg.pair_timeout_ms,
-            # v0.1.29 — full-day coverage mode (now operator-tunable via
-            # COVERAGE_NUM_ITINERARIES / COVERAGE_SEARCH_WINDOW_SECONDS).
-            num_itineraries=cfg.num_itineraries,
-            search_window_seconds=cfg.search_window_seconds,
-        )
+        if window is not None:
+            # PR-3 — K-slot dispatch via the resolved per-run window.
+            raw, trips = await _fetch_plan_sliced(
+                engine=engine,
+                session_id=session_id,
+                origin=origin,
+                dest=dest,
+                window=window,
+                cfg=cfg,
+            )
+        else:
+            raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
+                session_id=session_id,
+                from_lat=origin.lat,
+                from_lon=origin.lon,
+                to_lat=dest.lat,
+                to_lon=dest.lon,
+                when=depart_at,
+                timeout_ms=cfg.pair_timeout_ms,
+                # Legacy path — operator-tunable via COVERAGE_NUM_ITINERARIES
+                # / COVERAGE_SEARCH_WINDOW_SECONDS.
+                num_itineraries=cfg.num_itineraries,
+                search_window_seconds=cfg.search_window_seconds,
+            )
         response_ms = int((time.monotonic() - started) * 1000)
         num_itineraries = len(trips)
         if trips:
@@ -1077,6 +1505,7 @@ async def _query_one_session_for_pair(
     depart_at: datetime,
     run_id: uuid.UUID,
     cfg: CoverageConfig | None = None,
+    window: ResolvedWindow | None = None,
 ) -> _FanoutSub:
     """One fetch_plan call for one (session, pair). Tolerates its own
     exception so a planner container being down doesn't poison the pair —
@@ -1085,21 +1514,35 @@ async def _query_one_session_for_pair(
     for this session (see `execute_run`).
 
     `cfg` is PR-2's operator-tunable knob bundle (timeout, num itineraries,
-    search window). Defaults to `CoverageConfig()` for direct test use."""
+    search window). Defaults to `CoverageConfig()` for direct test use.
+
+    `window` is PR-3's resolved per-run day-window — when supplied the
+    call goes through `_fetch_plan_sliced` (K-slot dispatch); when None
+    the legacy single fetch_plan call is used."""
     cfg = cfg or CoverageConfig()
     sub_start = time.monotonic()
     try:
-        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
-            session_id=sid,
-            from_lat=origin.lat,
-            from_lon=origin.lon,
-            to_lat=dest.lat,
-            to_lon=dest.lon,
-            when=depart_at,
-            timeout_ms=cfg.pair_timeout_ms,
-            num_itineraries=cfg.num_itineraries,
-            search_window_seconds=cfg.search_window_seconds,
-        )
+        if window is not None:
+            raw, trips = await _fetch_plan_sliced(
+                engine=engine,
+                session_id=sid,
+                origin=origin,
+                dest=dest,
+                window=window,
+                cfg=cfg,
+            )
+        else:
+            raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
+                session_id=sid,
+                from_lat=origin.lat,
+                from_lon=origin.lon,
+                to_lat=dest.lat,
+                to_lon=dest.lon,
+                when=depart_at,
+                timeout_ms=cfg.pair_timeout_ms,
+                num_itineraries=cfg.num_itineraries,
+                search_window_seconds=cfg.search_window_seconds,
+            )
         response_ms = int((time.monotonic() - sub_start) * 1000)
         sub_status = "ok" if trips else "no_route"
         return sid, sub_status, raw, trips, response_ms
@@ -1340,6 +1783,7 @@ async def _execute_pair_fanout(
     dest: Hub,
     depart_at: datetime,
     cfg: CoverageConfig | None = None,
+    window: ResolvedWindow | None = None,
 ) -> None:
     """PR #36 — run an A→B search against EVERY fanout-enabled session and
     persist one merged result row.
@@ -1374,6 +1818,7 @@ async def _execute_pair_fanout(
                 depart_at=depart_at,
                 run_id=run_id,
                 cfg=cfg,
+                window=window,
             )
             for sid in session_ids
         )

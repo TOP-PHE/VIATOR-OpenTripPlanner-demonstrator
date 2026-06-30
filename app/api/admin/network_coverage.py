@@ -27,9 +27,12 @@ polls GET /runs/{id} every 5s to render progress; status flips to
 
 from __future__ import annotations
 
+import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from datetime import time as dtime
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -38,6 +41,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
+from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...models import (
     JourneySearchExecution,
@@ -52,6 +56,12 @@ from ...network_coverage import external_verify, hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
+
+# PR-3 — "HH:MM" and "24:00" sentinel. The DB stores TIME (which can't
+# represent 24:00), so the API accepts the sentinel and the runner
+# translates it to end-of-day in `_resolve_run_window`. Pre-compiled
+# regex so the validator is cheap on every request.
+_HHMM_RE = re.compile(r"^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$")
 
 router = APIRouter(
     prefix="/api/admin/network-coverage",
@@ -173,6 +183,68 @@ class RunCreate(BaseModel):
             "NetworkCoverageResult.external_* columns."
         ),
     )
+    # PR-3 — per-run day-window override (origin-local time-of-day slice).
+    # All four fields are optional; NULL means "use the platform_config
+    # defaults" (resolved at execute time, see runner._resolve_run_window).
+    # The form's Advanced section pre-fills each from the defaults.
+    window_start_local: str | None = Field(
+        default=None,
+        description=("Day-window start as 'HH:MM' 24h. None = use COVERAGE_DEFAULT_WINDOW_START."),
+    )
+    window_end_local: str | None = Field(
+        default=None,
+        description=(
+            "Day-window end as 'HH:MM' 24h, or '24:00' for end-of-day. "
+            "None = use COVERAGE_DEFAULT_WINDOW_END."
+        ),
+    )
+    window_timezone: str | None = Field(
+        default=None,
+        description=(
+            "IANA timezone (e.g. 'Europe/Vienna'). Must be in "
+            "COVERAGE_DEFAULT_TIMEZONE.choices. None = use "
+            "COVERAGE_DEFAULT_TIMEZONE."
+        ),
+    )
+    reference_date: date | None = Field(
+        default=None,
+        description=(
+            "Calendar date in window_timezone the K slots anchor on. "
+            "None = tomorrow at run-create time in window_timezone."
+        ),
+    )
+
+    @field_validator("window_start_local", "window_end_local")
+    @classmethod
+    def _validate_hhmm(cls, v: str | None) -> str | None:
+        """Accept 'HH:MM' (00:00-23:59) or the '24:00' end-of-day
+        sentinel on the end bound. Empty / None = use the platform
+        default at execute time."""
+        if v is None or v == "":
+            return None
+        if not _HHMM_RE.match(v):
+            raise ValueError(f"must be 'HH:MM' (00:00-23:59) or '24:00'; got {v!r}")
+        return v
+
+    @field_validator("window_timezone")
+    @classmethod
+    def _validate_tz(cls, v: str | None) -> str | None:
+        """Restrict to the COVERAGE_DEFAULT_TIMEZONE choices list. The
+        DB column is loose TEXT so a future operator-typed zone doesn't
+        require a migration — the gate lives here at the API surface so
+        the form's `<select>` and the API stay in sync."""
+        if v is None or v == "":
+            return None
+        spec = CONFIG_SCHEMA.get("COVERAGE_DEFAULT_TIMEZONE", {})
+        choices = spec.get("choices")
+        if choices is not None and v not in choices:
+            raise ValueError(f"timezone must be one of {choices}, got {v!r}")
+        # Defence in depth — make sure zoneinfo can actually resolve it.
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone {v!r}") from exc
+        return v
 
     @field_validator("countries")
     @classmethod
@@ -223,6 +295,14 @@ class RunSummary(BaseModel):
     # runs auto-verified. Default False handles legacy / pre-migration
     # rows gracefully via the `_run_to_summary` getattr fallback.
     verify_externally: bool = False
+    # PR-3 — resolved per-run day-window for UI display. NULL on each
+    # field = "uses the platform_config default" — the UI shows a
+    # subtler "[default]" pill in that case so the operator knows the
+    # behaviour without having to look up the config.
+    window_start_local: str | None = None
+    window_end_local: str | None = None
+    window_timezone: str | None = None
+    reference_date: str | None = None
 
 
 class ResultEntry(BaseModel):
@@ -536,6 +616,13 @@ def create_run(
     if depart_at.tzinfo is None:
         depart_at = depart_at.replace(tzinfo=UTC)
 
+    # PR-3 — translate "HH:MM" / "24:00" strings into the DB's TIME type.
+    # "24:00" stores as 00:00 (the runner detects the sentinel by
+    # comparing against window_start_local at execute time and bumps
+    # the end day by one).
+    window_start = _hhmm_to_time(body.window_start_local)
+    window_end = _hhmm_to_time(body.window_end_local)
+
     try:
         run = runner.create_run(
             db,
@@ -546,6 +633,10 @@ def create_run(
             mode=body.mode,
             countries=body.countries,
             verify_externally=body.verify_externally,
+            window_start_local=window_start,
+            window_end_local=window_end,
+            window_timezone=body.window_timezone,
+            reference_date_value=body.reference_date,
         )
     except ValueError as e:
         # `runner.create_run` raises ValueError when the country filter
@@ -845,16 +936,12 @@ def stop_run(
 ) -> RunSummary:
     """PR-1 — operator-driven cancel for an in-flight coverage run.
 
-    Today there's no way to abort a coverage matrix once started —
-    operators who realise a 33h run was queued by mistake have to wait
-    or bounce the worker container (which orphans the row without a
-    clean terminal state). This endpoint fires a cooperative cancel
-    signal that the runner checks between each pair; the worker exits
-    the per-pair loop cleanly, persists the cells already processed,
-    and flips the row to status='cancelled' with a `cancelled_by_operator`
-    marker on `summary`.
+    Fires a cooperative cancel signal the runner checks between each
+    pair; the worker exits the per-pair loop cleanly, persists the cells
+    already processed, and flips the row to status='cancelled' with a
+    `cancelled_by_operator` marker on `summary`.
 
-    Returns the updated run summary (status will read 'running' on the
+    Returns the updated run summary (status reads 'running' on the
     initial response — the runner observes the signal a beat later when
     the next pair-check fires). The UI polls /runs/{id} every 5s so the
     'cancelled' flip surfaces within one polling tick.
@@ -862,9 +949,7 @@ def stop_run(
     Status codes:
       200 — signal accepted, runner is in-flight and will stop
       404 — run id unknown
-      409 — run is not in 'running' state (terminal already, or never
-            started — POST /runs+the runner schedule are the only
-            transitions into 'running')
+      409 — run is not in 'running' state
     """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
@@ -1096,6 +1181,38 @@ async def verify_cell_external(
 # ─────────────────────────── helpers ───────────────────────────
 
 
+def _hhmm_to_time(value: str | None) -> dtime | None:
+    """PR-3 — translate the API's 'HH:MM' / '24:00' string into the DB's
+    `datetime.time` column type. `None` passes through (= use the
+    platform_config default at execute time). '24:00' stores as
+    `00:00` — the runner translates it back to end-of-day in
+    `_resolve_run_window` by detecting `end <= start` after parsing.
+    The pydantic validator already gated the format upstream so this
+    is a parse-only conversion."""
+    if value is None or value == "":
+        return None
+    if value == "24:00":
+        return dtime(hour=0, minute=0)
+    hh, mm = value.split(":", 1)
+    return dtime(hour=int(hh), minute=int(mm))
+
+
+def _time_to_hhmm(value: dtime | None) -> str | None:
+    """Inverse of `_hhmm_to_time` for the GET surface. Stored 00:00 with
+    NULL window_start_local could be either "midnight" or "end-of-day"
+    sentinel; we DON'T try to disambiguate here because the persisted
+    value is already the disambiguated form (start vs end columns are
+    separate). The runner handles cross-midnight semantics.
+
+    Defensive type check (`isinstance(dtime)`) so a MagicMock-populated
+    fixture in the test suite (which puts a MagicMock on every
+    attribute) doesn't crash _run_to_summary when the test happens to
+    not care about the window."""
+    if not isinstance(value, dtime):
+        return None
+    return f"{value.hour:02d}:{value.minute:02d}"
+
+
 def _hub_to_info(hub: NetworkCoverageHub) -> HubInfo:
     """Shared shape converter for the v0.1.31 hub endpoints."""
     return HubInfo(
@@ -1206,4 +1323,30 @@ def _run_to_summary(run: Any) -> RunSummary:
         # that lack the column. In production every row carries it
         # via the server_default='false'.
         verify_externally=bool(getattr(run, "verify_externally", False)),
+        # PR-3 — per-run day-window for UI display. Each field is NULL
+        # on legacy rows (and on any new run that didn't override the
+        # platform default); the UI renders a "[default]" badge in
+        # that case. getattr fallbacks keep the test fixtures working.
+        window_start_local=_time_to_hhmm(getattr(run, "window_start_local", None)),
+        window_end_local=_time_to_hhmm(getattr(run, "window_end_local", None)),
+        window_timezone=_safe_str(getattr(run, "window_timezone", None)),
+        reference_date=_safe_iso_date(getattr(run, "reference_date", None)),
     )
+
+
+def _safe_str(value: Any) -> str | None:
+    """Type-narrow to `str | None` — drops MagicMocks the test fixtures
+    splatter onto every attribute. Same defensive pattern as
+    `_time_to_hhmm`."""
+    return value if isinstance(value, str) else None
+
+
+def _safe_iso_date(value: Any) -> str | None:
+    """`date.isoformat()` for an actual `date` (or `datetime`); None for
+    everything else — protects _run_to_summary from MagicMock-shaped
+    test fixtures."""
+    from datetime import date as _date_cls
+
+    if isinstance(value, _date_cls):
+        return value.isoformat()
+    return None

@@ -41,6 +41,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+
 log = logging.getLogger(__name__)
 
 
@@ -157,6 +159,14 @@ def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
     Best-effort fields (None until we capture a live response to confirm
     MOTIS's exact field names — see the inline notes in `_leg_to_canonical`):
         leg distance, route_id, agency_id, feed_id.
+
+    PR-3: each trip carries an extra `first_transit_leg_departure_utc`
+    (UTC-ISO string or None when the itinerary is walk-only). The
+    coverage runner uses this — NOT `departure_at` — to decide whether
+    a trip's BOARDING falls inside the run's day window. `departure_at`
+    is the itinerary START (which on a walk-then-train trip is the
+    walking step) so it would silently let "leaves the door at 23:50,
+    boards 00:15 train" trips slip into the previous day's window.
     """
     itineraries = raw.get("itineraries") or []
     out: list[dict[str, Any]] = []
@@ -179,6 +189,10 @@ def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
                 "arrival_at": str(it.get("endTime") or ""),
                 "modes": ",".join(modes),
                 "legs": legs_norm,
+                # PR-3 — first transit-leg boarding time in UTC ISO. See
+                # the module-level note in _first_transit_leg_departure_utc
+                # for why this is separate from `departure_at`.
+                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
                 # Same convention as OTP — underscore-prefixed keys are
                 # presentation-layer-only and stripped by recorder.persist_trip.
                 "_raw_itinerary": it,

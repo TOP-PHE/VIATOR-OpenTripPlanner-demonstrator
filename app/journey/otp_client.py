@@ -39,6 +39,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+
 log = logging.getLogger(__name__)
 
 
@@ -386,6 +388,13 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
                 "arrival_at": _iso_to_utc_iso(it.get("end")) or "",
                 "modes": ",".join(sorted(set(modes_set))),
                 "legs": legs_norm,
+                # PR-3 — first transit-leg boarding time in UTC ISO.
+                # The coverage runner uses this (NOT the itinerary-level
+                # `departure_at` which is the trip START — often a walk
+                # leg) to decide whether the trip belongs in a day-window
+                # slice. See app/journey/trip_normalize.py for the
+                # cross-client contract.
+                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
                 # v0.1.26 — raw OTP itinerary slice for the JSON inspector
                 # in the journey UI. Underscore prefix marks it as
                 # presentation-layer-only; recorder.persist_trip() drops

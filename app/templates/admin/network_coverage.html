@@ -346,6 +346,46 @@ body.cov-filter-ext-disagrees .cov-matrix td:not([data-external-ok="true"]):not(
             </span>
           </span>
         </label>
+        {# PR-3 — Advanced section: per-run day-window override + IANA
+           timezone + reference date. Collapsed by default; all four
+           fields are pre-filled from platform_config so leaving the
+           section unopened reproduces "use the defaults" behaviour.
+           "24:00" is accepted as the end sentinel for end-of-day
+           windows; the runner translates that to next-day midnight. #}
+        <details style="margin-top: 0.6rem">
+          <summary style="cursor: pointer; font-weight: 600; font-size: 0.85rem">
+            Advanced — day window, timezone, reference date
+          </summary>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 0.6rem; margin-top: 0.5rem; font-size: 0.82rem">
+            <label style="display: flex; flex-direction: column; gap: 0.15rem">
+              <span>Day window start <span class="hint" style="font-weight: normal">(HH:MM, origin local)</span></span>
+              <input type="time" name="window_start_local" id="cov-window-start" value="{{ coverage_window_start_default }}">
+            </label>
+            <label style="display: flex; flex-direction: column; gap: 0.15rem">
+              <span>Day window end <span class="hint" style="font-weight: normal">(HH:MM or 24:00)</span></span>
+              {# `type="text"` (not `time`) so the operator can type the
+                 "24:00" sentinel — `time` inputs clamp to 00:00–23:59. #}
+              <input type="text" name="window_end_local" id="cov-window-end" pattern="^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$" value="{{ coverage_window_end_default }}">
+            </label>
+            <label style="display: flex; flex-direction: column; gap: 0.15rem">
+              <span>Timezone <span class="hint" style="font-weight: normal">(IANA)</span></span>
+              <select name="window_timezone" id="cov-window-tz">
+                {% for tz in coverage_timezone_choices %}
+                  <option value="{{ tz }}"{% if tz == coverage_timezone_default %} selected{% endif %}>{{ tz }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label style="display: flex; flex-direction: column; gap: 0.15rem">
+              <span>Reference date <span class="hint" style="font-weight: normal">(default: tomorrow)</span></span>
+              <input type="date" name="reference_date" id="cov-reference-date">
+            </label>
+          </div>
+          <p class="hint" style="margin: 0.4rem 0 0; font-size: 0.72rem">
+            Defaults: 00:00–24:00 UTC tomorrow. Override for morning-peak
+            (06:00–12:00), night-trains (18:00–06:00, cross-midnight), or
+            cross-TZ comparisons.
+          </p>
+        </details>
         <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
       </form>
     {% endif %}
@@ -891,6 +931,20 @@ document.getElementById('cov-form')?.addEventListener('submit', async (e) => {
   if (fd.get('verify_externally') === 'on') {
     body.verify_externally = true;
   }
+  // PR-3 — Advanced section: per-run day-window override + IANA
+  // timezone + reference date. Each field is only sent when the
+  // operator actually changed it from the platform default. We
+  // intentionally don't send "" — the API treats absent as "use
+  // platform default" which keeps the request body clean and lets a
+  // legacy submit reproduce pre-PR-3 behaviour.
+  const windowStart = (fd.get('window_start_local') || '').trim();
+  const windowEnd = (fd.get('window_end_local') || '').trim();
+  const windowTz = (fd.get('window_timezone') || '').trim();
+  const refDate = (fd.get('reference_date') || '').trim();
+  if (windowStart) body.window_start_local = windowStart;
+  if (windowEnd) body.window_end_local = windowEnd;
+  if (windowTz) body.window_timezone = windowTz;
+  if (refDate) body.reference_date = refDate;
   const btn = document.getElementById('cov-go');
   btn.disabled = true; const original = btn.textContent; btn.textContent = 'Starting…';
   try {

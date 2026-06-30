@@ -527,6 +527,11 @@ def _make_snapshot(*, mode: str = "single_session"):
         depart_at_for_pairs=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
         pairs=[(origin, dest)],
         cfg=runner.CoverageConfig(),
+        window=runner.ResolvedWindow(
+            start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
+            end_utc=datetime(2026, 7, 2, 0, 0, tzinfo=UTC),
+            tz_name="UTC",
+        ),
     )
 
 
