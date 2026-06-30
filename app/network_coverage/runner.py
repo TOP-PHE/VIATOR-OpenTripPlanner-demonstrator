@@ -30,6 +30,7 @@ import logging
 import time
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ import httpx
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DbSession
 
+from .. import config_service
 from ..db import SessionLocal
 from ..journey import planner_dispatch, recorder
 from ..models import (
@@ -62,64 +64,102 @@ FANOUT_SESSION_LABEL = "fanout"
 
 log = logging.getLogger(__name__)
 
-# Bounded parallelism — number of pairs to run simultaneously.
-# 5 keeps OTP comfortable while still cutting wallclock by ~5x.
-# Adjust via NETWORK_COVERAGE_PARALLELISM platform_config in the future
-# if operators want it tunable.
-_PARALLELISM = 5
-
-# Per-pair HTTP timeout. We use a generous 60s — coverage runs are not
-# user-facing, and a slow OTP returning a real itinerary is more
-# valuable signal than a fast timeout.
-_PER_PAIR_TIMEOUT_MS = 60_000
-
-# v0.1.29.2 — coverage search parameters. Originally I shipped 50/24h
-# in v0.1.29 to give "full-day visibility per pair" but that exceeded
-# OTP's 60s apiProcessingTimeout for long-haul pairs on a France-wide
-# multi-NAP graph (Paris-Paris pairs worked fine because the routing
-# is local; Paris→Lille / Paris→Strasbourg / cross-cutting pairs all
-# timed out — RAPTOR's per-call work scales near-quadratically with
-# searchWindow on dense networks).
+# ─────────────────── operator-tunable knobs (platform_config) ───────────────────
 #
+# The seven runner knobs below live in `app.config_schema.CONFIG_SCHEMA`
+# (keys `COVERAGE_*`) so operators can tune them from /admin/config
+# without code changes or redeploys.
+#
+# At the start of every execute_run() we snapshot the current DB values
+# into a `CoverageConfig` and thread it through every helper. The
+# snapshot is FROZEN for the run's lifetime — editing /admin/config
+# mid-run does not perturb the in-flight job (avoids the
+# "half-the-pairs-used-old-timeout" failure mode that would otherwise
+# make post-mortems painful).
+#
+# Defaults below are bit-identical to the prior hardcoded module
+# constants — see the design history baked into each field's comment.
+# `CONFIG_SCHEMA` enforces the same bounds.
+#
+# `_VERIFY_STATUSES` is intentionally NOT tunable — it's part of the
+# behaviour contract with the matrix UI (which cell colourings get the
+# external-verify treatment), not an operational knob.
+
+# v0.1.29.2 background on `num_itineraries` / `search_window_seconds`:
+# Originally shipped as 50/24h in v0.1.29 to give "full-day visibility
+# per pair" but that exceeded OTP's 60s apiProcessingTimeout for
+# long-haul pairs on a France-wide multi-NAP graph (RAPTOR's per-call
+# work scales near-quadratically with searchWindow on dense networks).
 # v0.1.29.2 reduces the window to 4h (matching the v0.1.27 baseline
 # that completed cleanly) but keeps numItineraries at 50 — so we still
-# get ALL alternatives within a 4-hour departure window, just not the
-# whole 24h. For 08:00 depart that's 08:00-12:00, which catches the
-# bulk of weekday TGV service for any pair (Paris-Lyon has ~7-8 TGVs
-# in that window, Paris-Marseille ~3-4).
-#
-# For full-day visibility: queued for v0.1.30 — a "time-of-day sweep"
-# button that runs the matrix at 06:00 / 10:00 / 14:00 / 18:00 / 22:00
-# and stitches the per-pair counts. That's the right architecture for
-# 24h coverage on a heavy graph; jamming it into a single OTP call was
-# the v0.1.29 mistake.
-_COVERAGE_NUM_ITINERARIES = 50
-_COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h — same as live UI baseline
+# get ALL alternatives within a 4-hour departure window. Operators
+# who tune the window up should expect ~quadratic wallclock growth.
 
-# PR-E — external-verify sweep tunables.
-#
-# Parallelism stays low (2) because ÖBB HAFAS has an implicit ~1-2
-# req/s/IP soft cap. Each verify is TWO round-trips (LocGeoPos +
-# TripSearch) so the wall-time is ~3-5s per cell. With 200 no_route
-# cells at parallelism=2 the sweep is ~5-10 min, which is acceptable
-# for an operator-opt-in feature. Drop to 1 if HAFAS pushes back.
-_VERIFY_PARALLELISM = 2
-# Inter-call sleep inside each semaphore slot — additional cushion
-# on top of parallelism so we don't burst-saturate HAFAS at startup.
-# 500ms x parallelism=2 ~= 1 verify/s effective rate, matching the
-# documented tolerance ceiling.
-_VERIFY_SLEEP_BETWEEN_MS = 500
-# Per-verify HTTP timeout. HAFAS responses are usually < 2s but we
-# allow generous headroom for slow round-trips and the two-step
-# LocGeoPos + TripSearch chain.
-_VERIFY_TIMEOUT_SECONDS = 30.0
+# Module-level defaults — also serve as the fallback CoverageConfig used
+# by unit tests that exercise the per-pair helpers directly without
+# standing up a DB. The keep-as-default approach lets us refactor
+# without breaking the existing patch-the-module-constant idiom in
+# test_coverage_external_verify_sweep.py.
+_DEFAULT_PAIR_PARALLELISM = 5
+_DEFAULT_PER_PAIR_TIMEOUT_MS = 60_000
+_DEFAULT_COVERAGE_NUM_ITINERARIES = 50
+_DEFAULT_COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h
+_DEFAULT_VERIFY_PARALLELISM = 2
+_DEFAULT_VERIFY_TIMEOUT_S = 30.0
+_DEFAULT_VERIFY_SLEEP_BETWEEN_MS = 500
+
 # Cell statuses that trigger an external-verify pass. 'ok' is
 # excluded because we don't need ÖBB to confirm a route VIATOR
 # already returned. 'skipped' is excluded because those cells never
 # actually got queried — no signal in asking ÖBB. 'no_route' is the
 # canonical click-to-verify case; 'timeout' and 'error' are added
 # in PR-E so a flaky OTP run can be disambiguated from real gaps.
+# Intentionally NOT operator-tunable — see module comment.
 _VERIFY_STATUSES = ("no_route", "timeout", "error")
+
+
+@dataclass(frozen=True)
+class CoverageConfig:
+    """Snapshot of operator-tunable runner knobs, read once at
+    execute_run start and frozen for the run's lifetime.
+
+    Every field maps 1:1 to a `COVERAGE_*` key in
+    `app.config_schema.CONFIG_SCHEMA`. Defaults on this dataclass match
+    the schema defaults (= the prior hardcoded module constants), so
+    constructing `CoverageConfig()` with no DB is a valid fallback —
+    used by unit tests that exercise per-pair helpers in isolation.
+    """
+
+    num_itineraries: int = _DEFAULT_COVERAGE_NUM_ITINERARIES
+    search_window_seconds: int = _DEFAULT_COVERAGE_SEARCH_WINDOW_SECONDS
+    pair_timeout_ms: int = _DEFAULT_PER_PAIR_TIMEOUT_MS
+    pair_parallelism: int = _DEFAULT_PAIR_PARALLELISM
+    verify_parallelism: int = _DEFAULT_VERIFY_PARALLELISM
+    verify_timeout_s: float = _DEFAULT_VERIFY_TIMEOUT_S
+    verify_sleep_ms: int = _DEFAULT_VERIFY_SLEEP_BETWEEN_MS
+
+
+def _load_coverage_config(db: DbSession) -> CoverageConfig:
+    """Read every `COVERAGE_*` platform_config row into a frozen
+    CoverageConfig. Falls back to dataclass defaults for any key that
+    config_service can't resolve (defence in depth — schema defaults
+    already cover the missing-row case, but a typed gap here would
+    cascade into a runtime crash in the per-pair loop)."""
+    cfg = config_service.get_all(db)
+    return CoverageConfig(
+        num_itineraries=int(cfg.get("COVERAGE_NUM_ITINERARIES", _DEFAULT_COVERAGE_NUM_ITINERARIES)),
+        search_window_seconds=int(
+            cfg.get(
+                "COVERAGE_SEARCH_WINDOW_SECONDS",
+                _DEFAULT_COVERAGE_SEARCH_WINDOW_SECONDS,
+            )
+        ),
+        pair_timeout_ms=int(cfg.get("COVERAGE_PAIR_TIMEOUT_MS", _DEFAULT_PER_PAIR_TIMEOUT_MS)),
+        pair_parallelism=int(cfg.get("COVERAGE_PAIR_PARALLELISM", _DEFAULT_PAIR_PARALLELISM)),
+        verify_parallelism=int(cfg.get("COVERAGE_VERIFY_PARALLELISM", _DEFAULT_VERIFY_PARALLELISM)),
+        verify_timeout_s=float(cfg.get("COVERAGE_VERIFY_TIMEOUT_S", _DEFAULT_VERIFY_TIMEOUT_S)),
+        verify_sleep_ms=int(cfg.get("COVERAGE_VERIFY_SLEEP_MS", _DEFAULT_VERIFY_SLEEP_BETWEEN_MS)),
+    )
 
 
 def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
@@ -336,6 +376,9 @@ async def execute_run(run_id: uuid.UUID) -> None:
     # fanout mode populates `engine_by_session`.
     engine_for_pairs: str = "otp"
     engine_by_session: dict[str, str] = {}
+    # PR-2 — snapshot the seven operator-tunable knobs from platform_config
+    # at run start and freeze them for the duration. See CoverageConfig.
+    cfg: CoverageConfig = CoverageConfig()
 
     # Phase 1: snapshot the run inputs and flip to "running" in a short txn.
     with SessionLocal() as db:
@@ -353,6 +396,9 @@ async def execute_run(run_id: uuid.UUID) -> None:
         run.status = "running"
         run.started_at = datetime.now(UTC)
         db.commit()
+        # Freeze the tunables NOW — see CoverageConfig docstring for why
+        # editing /admin/config mid-run must not perturb the in-flight job.
+        cfg = _load_coverage_config(db)
         run_mode = run.mode
         if run_mode == MODE_SINGLE_SESSION:
             if run.session_id is None:
@@ -396,7 +442,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
     # Phase 2: process pairs with bounded concurrency. Each pair gets
     # its own short-lived DB session — no transaction stays open
     # across the network call to OTP.
-    semaphore = asyncio.Semaphore(_PARALLELISM)
+    semaphore = asyncio.Semaphore(cfg.pair_parallelism)
 
     async def _one_pair(origin: Hub, dest: Hub) -> None:
         async with semaphore:
@@ -408,6 +454,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
                     origin=origin,
                     dest=dest,
                     depart_at=depart_at_for_pairs,
+                    cfg=cfg,
                 )
             else:
                 assert session_id_for_pairs is not None  # narrowed at Phase 1
@@ -418,6 +465,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
                     origin=origin,
                     dest=dest,
                     depart_at=depart_at_for_pairs,
+                    cfg=cfg,
                 )
 
     try:
@@ -467,7 +515,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # the opt-in check, candidate filtering, logging, and zero-fill
         # counters in one place. ORM mutations on the rows are flushed
         # by the single db.commit() below, atomic with status='completed'.
-        verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows)
+        verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows, cfg=cfg)
 
         run.summary = {
             "elapsed_seconds": elapsed_s,
@@ -499,6 +547,7 @@ async def _maybe_run_external_verify_sweep(
     db: DbSession,
     run: NetworkCoverageRun,
     rows: Sequence[NetworkCoverageResult],
+    cfg: CoverageConfig | None = None,
 ) -> dict[str, int]:
     """PR-E — opt-in entry point for the external-verify sweep. Returns
     the zero-fill counters if the run didn't opt in or has no candidate
@@ -507,7 +556,12 @@ async def _maybe_run_external_verify_sweep(
 
     Extracted from `execute_run` so that function stays under Sonar's
     cognitive-complexity ceiling — the verify-sweep dispatch alone
-    introduced multiple branches that pushed Phase-3 over the limit."""
+    introduced multiple branches that pushed Phase-3 over the limit.
+
+    `cfg` is PR-2's operator-tunable knob bundle. Defaults to a fresh
+    `CoverageConfig()` (= prior hardcoded constants) when called from a
+    test that doesn't thread one in."""
+    cfg = cfg or CoverageConfig()
     zero = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
     if not getattr(run, "verify_externally", False):
         return zero
@@ -519,7 +573,7 @@ async def _maybe_run_external_verify_sweep(
     )
     if not candidate_rows:
         return zero
-    counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows)
+    counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows, cfg=cfg)
     log.info("PR-E external-verify sweep done for run %s - %s", run.id, counters)
     return counters
 
@@ -529,6 +583,7 @@ async def _run_external_verify_sweep(
     db: DbSession,
     run: NetworkCoverageRun,
     rows: list[NetworkCoverageResult],
+    cfg: CoverageConfig | None = None,
 ) -> dict[str, int]:
     """PR-E — sweep `rows` through ÖBB HAFAS and mutate each row's
     external_* columns in place on the attached ORM objects. Caller's
@@ -539,12 +594,17 @@ async def _run_external_verify_sweep(
     can't abort the run. Bounded concurrency via Semaphore + a short
     sleep inside each slot keeps us under ÖBB's documented soft cap.
 
-    Returns rollup counters for run.summary."""
-    counters: dict[str, int] = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
-    semaphore = asyncio.Semaphore(_VERIFY_PARALLELISM)
-    sleep_seconds = _VERIFY_SLEEP_BETWEEN_MS / 1000.0
+    `cfg` is PR-2's operator-tunable knob bundle (verify_parallelism,
+    verify_timeout_s, verify_sleep_ms). Defaults to `CoverageConfig()`
+    when called directly from a test that doesn't supply one.
 
-    async with httpx.AsyncClient(timeout=_VERIFY_TIMEOUT_SECONDS) as client:
+    Returns rollup counters for run.summary."""
+    cfg = cfg or CoverageConfig()
+    counters: dict[str, int] = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    semaphore = asyncio.Semaphore(cfg.verify_parallelism)
+    sleep_seconds = cfg.verify_sleep_ms / 1000.0
+
+    async with httpx.AsyncClient(timeout=cfg.verify_timeout_s) as client:
 
         async def _verify_one(row: NetworkCoverageResult) -> None:
             async with semaphore:
@@ -627,6 +687,7 @@ async def _execute_pair(
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
+    cfg: CoverageConfig | None = None,
 ) -> None:
     """Run a single A→B search and persist the result row.
 
@@ -636,7 +697,12 @@ async def _execute_pair(
     which come from the hub preset rather than master_stations geocoding.
     `engine` is passed in (snapshotted at Phase 1) so this hot per-pair
     function doesn't pay a DB lookup; see `execute_run`.
+
+    `cfg` is PR-2's operator-tunable knob bundle. Defaults to a fresh
+    `CoverageConfig()` (= prior hardcoded constants) when called from a
+    test that doesn't thread one in.
     """
+    cfg = cfg or CoverageConfig()
     started = time.monotonic()
     status = "error"
     response_ms = 0
@@ -657,10 +723,11 @@ async def _execute_pair(
             to_lat=dest.lat,
             to_lon=dest.lon,
             when=depart_at,
-            timeout_ms=_PER_PAIR_TIMEOUT_MS,
-            # v0.1.29 — full-day coverage mode (see module-level constants).
-            num_itineraries=_COVERAGE_NUM_ITINERARIES,
-            search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
+            timeout_ms=cfg.pair_timeout_ms,
+            # v0.1.29 — full-day coverage mode (now operator-tunable via
+            # COVERAGE_NUM_ITINERARIES / COVERAGE_SEARCH_WINDOW_SECONDS).
+            num_itineraries=cfg.num_itineraries,
+            search_window_seconds=cfg.search_window_seconds,
         )
         response_ms = int((time.monotonic() - started) * 1000)
         num_itineraries = len(trips)
@@ -803,12 +870,17 @@ async def _query_one_session_for_pair(
     dest: Hub,
     depart_at: datetime,
     run_id: uuid.UUID,
+    cfg: CoverageConfig | None = None,
 ) -> _FanoutSub:
     """One fetch_plan call for one (session, pair). Tolerates its own
     exception so a planner container being down doesn't poison the pair —
     the caller treats the returned status as "this session contributed
     nothing useful" and moves on. `engine` is the snapshotted backend
-    for this session (see `execute_run`)."""
+    for this session (see `execute_run`).
+
+    `cfg` is PR-2's operator-tunable knob bundle (timeout, num itineraries,
+    search window). Defaults to `CoverageConfig()` for direct test use."""
+    cfg = cfg or CoverageConfig()
     sub_start = time.monotonic()
     try:
         raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
@@ -818,9 +890,9 @@ async def _query_one_session_for_pair(
             to_lat=dest.lat,
             to_lon=dest.lon,
             when=depart_at,
-            timeout_ms=_PER_PAIR_TIMEOUT_MS,
-            num_itineraries=_COVERAGE_NUM_ITINERARIES,
-            search_window_seconds=_COVERAGE_SEARCH_WINDOW_SECONDS,
+            timeout_ms=cfg.pair_timeout_ms,
+            num_itineraries=cfg.num_itineraries,
+            search_window_seconds=cfg.search_window_seconds,
         )
         response_ms = int((time.monotonic() - sub_start) * 1000)
         sub_status = "ok" if trips else "no_route"
@@ -1061,6 +1133,7 @@ async def _execute_pair_fanout(
     origin: Hub,
     dest: Hub,
     depart_at: datetime,
+    cfg: CoverageConfig | None = None,
 ) -> None:
     """PR #36 — run an A→B search against EVERY fanout-enabled session and
     persist one merged result row.
@@ -1078,7 +1151,11 @@ async def _execute_pair_fanout(
       3. `session_ids` on the result row records WHICH sessions returned
          ≥1 trip — that's the per-cell coverage signal PR #36 is built
          around.
+
+    `cfg` is PR-2's operator-tunable knob bundle. Defaults to
+    `CoverageConfig()` for direct test use.
     """
+    cfg = cfg or CoverageConfig()
     pair_start = time.monotonic()
 
     per_session = await asyncio.gather(
@@ -1090,6 +1167,7 @@ async def _execute_pair_fanout(
                 dest=dest,
                 depart_at=depart_at,
                 run_id=run_id,
+                cfg=cfg,
             )
             for sid in session_ids
         )

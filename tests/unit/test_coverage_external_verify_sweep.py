@@ -187,12 +187,12 @@ async def test_sweep_calls_verify_with_run_depart_at_and_hub_coords():
             best_transfers=1,
         )
     )
-    # Suppress the inter-call sleep so the test completes instantly.
-    with (
-        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
-        patch.object(runner, "_VERIFY_SLEEP_BETWEEN_MS", 0),
-    ):
-        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows)
+    # PR-2 — pass a CoverageConfig with verify_sleep_ms=0 so the test
+    # completes instantly (replaces the old `patch.object(_VERIFY_SLEEP_BETWEEN_MS, 0)`
+    # idiom now that those constants live on the CoverageConfig dataclass).
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     fake_verify.assert_awaited_once()
     call_kwargs = fake_verify.await_args.kwargs
@@ -227,11 +227,9 @@ async def test_sweep_persists_verify_result_onto_row():
             best_transfers=0,
         )
     )
-    with (
-        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
-        patch.object(runner, "_VERIFY_SLEEP_BETWEEN_MS", 0),
-    ):
-        await runner._run_external_verify_sweep(db=db, run=run, rows=rows)
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+        await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert row.external_source == "fahrplan.oebb.at"
     assert row.external_ok is True
@@ -269,11 +267,9 @@ async def test_sweep_counters_split_by_verdict_class():
         external_verify.VerifyResult(source="fahrplan.oebb.at", ok=False, error="HTTP 500"),
     ]
     fake_verify = AsyncMock(side_effect=verdicts)
-    with (
-        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
-        patch.object(runner, "_VERIFY_SLEEP_BETWEEN_MS", 0),
-    ):
-        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows)
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert counters["verified"] == 3
     assert counters["ok"] == 1
@@ -297,11 +293,9 @@ async def test_sweep_handles_soft_deleted_hub():
     rows = [row]
 
     fake_verify = AsyncMock()  # should NOT be called
-    with (
-        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
-        patch.object(runner, "_VERIFY_SLEEP_BETWEEN_MS", 0),
-    ):
-        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows)
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     fake_verify.assert_not_awaited()
     assert row.external_error == "hub_missing"
@@ -332,11 +326,9 @@ async def test_sweep_continues_when_one_cell_raises():
             raise RuntimeError("simulated adapter explosion")
         return external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
 
-    with (
-        patch.object(external_verify, "verify_via_oebb_hafas", side_effect=_fake),
-        patch.object(runner, "_VERIFY_SLEEP_BETWEEN_MS", 0),
-    ):
-        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows)
+    fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
+    with patch.object(external_verify, "verify_via_oebb_hafas", side_effect=_fake):
+        counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     # row_ok got its verdict cleanly
     assert row_ok.external_ok is True

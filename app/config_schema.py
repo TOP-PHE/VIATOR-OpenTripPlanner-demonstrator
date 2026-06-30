@@ -68,6 +68,34 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     },
     "OJP_API_TOKEN": {"type": "secret", "default": "", "sensitive": True},
     "OJP_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
+    # ── Network coverage matrix ───────────────────────────────────────
+    # Tunables for the background coverage runner (app/network_coverage/
+    # runner.py). Defaults are bit-identical to the prior hardcoded
+    # module constants so flipping any operator-tunable here is a
+    # behaviour-neutral change. Config is read once at execute_run start
+    # and frozen for the run's lifetime — editing mid-run does not
+    # disturb the in-flight job.
+    #
+    # `_NUM_ITINERARIES` / `_SEARCH_WINDOW_SECONDS` mirror the OTP-side
+    # query depth knobs above but apply to the coverage path (which uses
+    # a wider window than the live UI to surface ALL alternatives per pair
+    # within the depart window — see runner module docstring for the
+    # 4h-vs-24h analysis). They're separate from OTP_* so operators can
+    # tune coverage independently of the live journey-UI experience.
+    #
+    # `_PAIR_PARALLELISM` = 5 keeps OTP comfortable while cutting wall-
+    # time ~5x vs sequential. `_PAIR_TIMEOUT_MS` = 60s matches OTP's
+    # apiProcessingTimeout default. The VERIFY_* trio governs the
+    # opt-in ÖBB-HAFAS external-verify sweep (PR-E): low parallelism (2)
+    # + 500ms inter-call sleep keeps us under HAFAS's documented soft
+    # cap of ~1-2 req/s/IP.
+    "COVERAGE_NUM_ITINERARIES": {"type": "int", "default": 50, "min": 1, "max": 200},
+    "COVERAGE_SEARCH_WINDOW_SECONDS": {"type": "int", "default": 14400, "min": 600, "max": 86400},
+    "COVERAGE_PAIR_TIMEOUT_MS": {"type": "int", "default": 60000, "min": 5000, "max": 300000},
+    "COVERAGE_PAIR_PARALLELISM": {"type": "int", "default": 5, "min": 1, "max": 20},
+    "COVERAGE_VERIFY_PARALLELISM": {"type": "int", "default": 2, "min": 1, "max": 10},
+    "COVERAGE_VERIFY_TIMEOUT_S": {"type": "int", "default": 30, "min": 5, "max": 300},
+    "COVERAGE_VERIFY_SLEEP_MS": {"type": "int", "default": 500, "min": 0, "max": 10000},
     # ── Master data refresh ───────────────────────────────────────────
     "MASTER_STATIONS_REFRESH_DAYS": {"type": "int", "default": 30, "min": 1, "max": 365},
     "MASTER_CARRIERS_REFRESH_DAYS": {"type": "int", "default": 90, "min": 1, "max": 365},
