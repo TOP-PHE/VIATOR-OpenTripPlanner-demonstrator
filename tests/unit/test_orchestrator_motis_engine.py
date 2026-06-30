@@ -83,9 +83,7 @@ def test_motis_healthcheck_uses_wget_not_curl():
     # Pull out the `test:` line — the actual healthcheck command — so the
     # negative `curl` assertion isn't tripped by explanatory YAML comments
     # that mention curl in passing.
-    test_line = next(
-        line for line in motis_block.splitlines() if line.lstrip().startswith("test:")
-    )
+    test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))
     # The MOTIS image has no curl — the probe must use wget.
     assert "wget" in test_line
     assert "--spider" in test_line
