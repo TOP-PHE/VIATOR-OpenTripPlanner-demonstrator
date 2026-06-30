@@ -111,9 +111,43 @@
 /* v0.1.35 — Swiss OJP reference-comparison. The opt-in checkbox sits in
    the search form; the results render in a panel below VIATOR's own,
    with a left accent border so the operator can tell at a glance which
-   engine produced which itineraries. */
+   engine produced which itineraries. The HAFAS counterpart (added in
+   feat/hafas-journey-comparison) shares the same `.compare-ref-field`
+   layout so both checkboxes line up; the legacy `.compare-ojp-field`
+   selector remains as an alias for any sub-page that referenced it. */
+.compare-ref-field,
 .compare-ojp-field { display: flex; align-items: center; gap: 0.4rem; margin: 0.2rem 0 0.6rem; font-size: 0.9rem; cursor: pointer; }
+.compare-ref-field input,
 .compare-ojp-field input { width: auto; }
+/* Coverage-tooltip icon next to each compare-with-X label. Renders a
+   small "?" badge; hovering reveals the tooltip text (CSS-only — no
+   JS needed). Operators were guessing scope from the engine name
+   ("does Swiss OJP cover Germany?" — no, it doesn't; "what does HAFAS
+   include?" — DACH + cross-border + Eurostar/TGV/AVE), so the
+   tooltip is the explicit answer. */
+.compare-ref-info {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.05rem; height: 1.05rem; border-radius: 50%;
+  background: #e8f0fb; color: #1C75BC; border: 1px solid #c5d6f0;
+  font-size: 0.72rem; font-weight: 700;
+  cursor: help; user-select: none; position: relative;
+}
+.compare-ref-info:hover { background: #1C75BC; color: #fff; border-color: #1C75BC; }
+.compare-ref-info[data-tooltip]:hover::after {
+  content: attr(data-tooltip);
+  position: absolute; left: 50%; bottom: calc(100% + 0.4rem); transform: translateX(-50%);
+  background: #24292f; color: #fff; padding: 0.5rem 0.7rem; border-radius: 4px;
+  font-size: 0.78rem; font-weight: normal; white-space: pre-line;
+  width: 260px; z-index: 100; pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+}
+/* Visual styling for the HAFAS reference panel — mirrors the OJP panel
+   above but uses a distinct accent colour so operators can tell at a
+   glance which engine produced which result block. Amber/orange-ish
+   for HAFAS so it stands apart from OJP's blue. */
+.hafas-ref-panel { margin-top: 1.2rem; border-top: 2px solid var(--sleeper); padding-top: 0.8rem; }
+.hafas-ref-panel h3 { margin: 0 0 0.6rem; font-size: 1rem; }
+.hafas-ref-card { border-left: 3px solid #b3760e; }
 /* P2 MOTIS — side-by-side OTP-vs-MOTIS comparison view. Engaged
    automatically when the operator picked "All engines" AND the serving
    fanout pool returned results from both an OTP-engine session and a
@@ -201,11 +235,27 @@
     </select>
 
     {# v0.1.35 — only rendered when OJP comparison is enabled AND a token
-       is configured (journey_page passes ojp_comparison_enabled). #}
+       is configured (journey_page passes ojp_comparison_enabled). The
+       coverage tooltip on the "?" icon makes scope explicit so operators
+       don't expect Swiss OJP to cover DACH or cross-border services. #}
     {% if ojp_comparison_enabled %}
-    <label class="compare-ojp-field">
+    <label class="compare-ref-field">
       <input type="checkbox" id="compare-ojp">
       Compare with Swiss OJP reference
+      <span class="compare-ref-info" data-tooltip="Swiss OJP covers: Swiss public transport only (CH).">?</span>
+    </label>
+    {% endif %}
+
+    {# feat/hafas-journey-comparison — ÖBB HAFAS is enabled by default
+       (no API token needed) so the per-search checkbox is the only gate.
+       Coverage tooltip lists the empirically-validated network footprint
+       — DACH + cross-border + Eurostar/TGV/AVE/Iberian + Nordic-cross-
+       border — so operators know when to expect a hit. #}
+    {% if hafas_comparison_enabled %}
+    <label class="compare-ref-field">
+      <input type="checkbox" id="compare-hafas">
+      Compare with ÖBB HAFAS
+      <span class="compare-ref-info" data-tooltip="ÖBB HAFAS covers: DACH (DE/AT/CH), Eurostar/TGV/AVE/Iberian cross-border, Nordic-cross-border (DK/SE/NO to mainland EU).&#10;NOT covered: Norwegian domestic, some regional bus.">?</span>
     </label>
     {% endif %}
 
@@ -507,6 +557,10 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
     // `?.` → undefined → false when it's not rendered. The server also
     // gates on its own config, so a stale `true` here is harmless.
     compare_ojp: !!document.getElementById('compare-ojp')?.checked,
+    // feat/hafas-journey-comparison — same pattern for ÖBB HAFAS. The
+    // server gates on HAFAS_COMPARISON_ENABLED so a missing-checkbox
+    // submission silently degrades to "no comparison" without erroring.
+    compare_hafas: !!document.getElementById('compare-hafas')?.checked,
     ...(engineSel ? { engine: engineSel } : {}),
   };
   const btn = document.getElementById('go-btn');
@@ -727,6 +781,53 @@ function renderOjpReference(ref) {
   }).join('');
   return `<div class="ojp-ref-panel">
     <h3>Reference — Swiss OJP
+      <span style="font-weight:normal;color:var(--rail-steel);font-size:0.85rem">· ${head}</span>
+    </h3>
+    ${cards}
+  </div>`;
+}
+
+// feat/hafas-journey-comparison — render the external ÖBB HAFAS
+// reference panel. `ref` is payload.hafas_reference: {status, trips,
+// response_ms, error?}. Same status-vocab + status-driven heading text
+// as the OJP renderer (`renderOjpReference`); the cards carry class
+// `trip-card` so render()'s expand-wiring catches them, plus the
+// distinct `hafas-ref-card` class for the amber left-accent border.
+// No {} JSON button on these cards — HAFAS trips don't carry a
+// _raw_itinerary slice (the raw mgate payload isn't persisted).
+function renderHafasReference(ref) {
+  if (!ref) return '';
+  let head;
+  if (ref.status === 'ok') {
+    const n = ref.trips.length;
+    head = `${n} itiner${n === 1 ? 'y' : 'ies'} · ${ref.response_ms}ms`;
+  } else if (ref.status === 'no_route') {
+    head = `no itinerary found · ${ref.response_ms}ms`;
+  } else if (ref.status === 'timeout') {
+    head = `timed out · ${ref.response_ms}ms`;
+  } else {
+    head = `unavailable — ${escHTML(ref.error || 'error')}`;
+  }
+  const cards = (ref.trips || []).map((t) => {
+    const legCount = (t.legs || []).length;
+    const tripOps = operatorsForTrip(t.legs);
+    return `<div class="trip-card hafas-ref-card">
+      <div class="top">
+        <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
+             <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
+        <div class="top-actions">
+          ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
+        </div>
+      </div>
+      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+        ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
+        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
+      </div>
+      <div class="legs-detail">${legsHTML(t.legs)}</div>
+    </div>`;
+  }).join('');
+  return `<div class="hafas-ref-panel">
+    <h3>Reference — ÖBB HAFAS (fahrplan.oebb.at)
       <span style="font-weight:normal;color:var(--rail-steel);font-size:0.85rem">· ${head}</span>
     </h3>
     ${cards}
@@ -1092,6 +1193,10 @@ function render(payload) {
   // renders below VIATOR's own results. Its cards carry class
   // `trip-card`, so the expand-wiring below catches them for free.
   const ojpPanel = renderOjpReference(payload.ojp_reference);
+  // feat/hafas-journey-comparison — same shape, ÖBB HAFAS reference.
+  // Renders below the OJP panel (when both opted in) so the two
+  // references stack rather than compete for vertical real estate.
+  const hafasPanel = renderHafasReference(payload.hafas_reference);
   // v0.1.41 — federated (cross-session) itineraries render in their own group;
   // suppress "No itineraries found" when only federated results exist.
   const federatedSection = renderFederated(payload.federated_trips);
@@ -1101,7 +1206,7 @@ function render(payload) {
   // anywhere — flat list, grid, or federated.
   const noResults =
     (cards || comparisonGrid || federatedSection) ? '' : '<p>No itineraries found.</p>';
-  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${comparisonGrid}${cards}${noResults}${federatedSection}${ojpPanel}`;
+  el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${comparisonGrid}${cards}${noResults}${federatedSection}${ojpPanel}${hafasPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable. OJP cards
   // also have class `trip-card` so this selector catches them too.

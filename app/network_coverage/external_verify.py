@@ -363,6 +363,115 @@ async def _post_hafas(
     return payload, None
 
 
+class HafasTripPayload(BaseModel):
+    """Outcome of the two-step LocGeoPos+TripSearch flow, retaining the
+    raw payload so journey-level callers can normalise the connection
+    list into trip dicts without re-running the network calls.
+
+    `verdict` carries the same VerifyResult shape coverage uses (so the
+    yes/no façade still works); `payload` is the parsed TripSearch JSON
+    response (or None when an upstream step failed). `from_lid` /
+    `to_lid` carry the LocGeoPos-resolved station identifiers so
+    journey clients can quote the snapped station in diagnostics.
+
+    This is the lower-level return shape used by `fetch_oebb_two_step`;
+    the historical `verify_via_oebb_hafas` is a façade that throws
+    `payload` away and returns just the `verdict`."""
+
+    verdict: VerifyResult
+    payload: dict[str, Any] | None = None
+    from_lid: str | None = None
+    to_lid: str | None = None
+
+    # Pydantic v2 — allow dict[str, Any]. (BaseModel default behaviour
+    # already permits this; the explicit class config keeps a regression
+    # in a future schema change from silently breaking journey callers.)
+    model_config = {"arbitrary_types_allowed": True}
+
+
+async def fetch_oebb_two_step(
+    *,
+    from_lat: float,
+    from_lon: float,
+    to_lat: float,
+    to_lon: float,
+    depart_at: datetime,
+    client: httpx.AsyncClient | None = None,
+) -> HafasTripPayload:
+    """Run the LocGeoPos → TripSearch two-step against ÖBB's HAFAS
+    backend and return both the verdict *and* the raw parsed payload.
+
+    This is the building block both the coverage-cell verify path and
+    the journey-search comparison path call. Coverage only needs the
+    summarised verdict (`verify_via_oebb_hafas` is a thin wrapper that
+    returns just `.verdict`); the journey path also needs `payload`
+    so it can normalise the connection list into VIATOR's canonical
+    trip-dict shape.
+
+    Never raises — network / parse failures land in `verdict.error`."""
+    resolve_body = _build_locgeopos_body([(from_lat, from_lon), (to_lat, to_lon)])
+
+    async def _run(c: httpx.AsyncClient) -> HafasTripPayload:
+        # Step 1: coord → station lid resolution.
+        resolve_payload, err = await _post_hafas(c, resolve_body)
+        if err is not None:
+            return HafasTripPayload(verdict=err)
+        if resolve_payload is None:  # pragma: no cover — defensive
+            return HafasTripPayload(
+                verdict=VerifyResult(
+                    source=_SOURCE_OEBB_HAFAS, ok=False, error="no resolve payload"
+                )
+            )
+        if resolve_payload.get("err") and resolve_payload["err"] != "OK":
+            return HafasTripPayload(
+                verdict=VerifyResult(
+                    source=_SOURCE_OEBB_HAFAS,
+                    ok=False,
+                    error=f"hafas envelope: {resolve_payload['err']}",
+                )
+            )
+        lids = _extract_lids_from_locgeopos(resolve_payload, count=2)
+        from_lid, to_lid = lids[0], lids[1]
+        if not from_lid or not to_lid:
+            # One or both endpoints don't snap to an ÖBB station. This
+            # is informative ("ÖBB doesn't have this stop in its
+            # catalogue") rather than a true backend failure — but
+            # we can't route without IDs, so surface as yellow with
+            # the friendly H9220-equivalent message.
+            return HafasTripPayload(
+                verdict=VerifyResult(
+                    source=_SOURCE_OEBB_HAFAS,
+                    ok=False,
+                    error=_HAFAS_ERROR_MESSAGES["H9220"],
+                ),
+                from_lid=from_lid,
+                to_lid=to_lid,
+            )
+
+        # Step 2: trip search using the resolved station lids.
+        trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
+        trip_payload, err2 = await _post_hafas(c, trip_body)
+        if err2 is not None:
+            return HafasTripPayload(verdict=err2, from_lid=from_lid, to_lid=to_lid)
+        if trip_payload is None:  # pragma: no cover — defensive
+            return HafasTripPayload(
+                verdict=VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no trip payload"),
+                from_lid=from_lid,
+                to_lid=to_lid,
+            )
+        return HafasTripPayload(
+            verdict=_parse_hafas_response(trip_payload),
+            payload=trip_payload,
+            from_lid=from_lid,
+            to_lid=to_lid,
+        )
+
+    if client is not None:
+        return await _run(client)
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as c:
+        return await _run(c)
+
+
 async def verify_via_oebb_hafas(
     *,
     from_lat: float,
@@ -374,58 +483,25 @@ async def verify_via_oebb_hafas(
 ) -> VerifyResult:
     """Ask ÖBB's HAFAS backend whether it can route this pair.
 
-    Two-step internally: first resolve both coords to station lids via
-    LocGeoPos, then run TripSearch with `type:"S"`. Returns a single
-    VerifyResult either way — the two-POST shape is invisible to the
-    caller.
+    Two-step internally (LocGeoPos → TripSearch); returns the
+    summarised verdict — the two-POST shape and the raw payload are
+    invisible to the caller. Journey-level callers that *do* need the
+    raw payload should use `fetch_oebb_two_step` directly.
 
     `client` is injected for tests; production callers pass None and
     we manage a one-shot AsyncClient internally. Network / parse
     failures produce a VerifyResult with `ok=False` and `error` set —
     never raises to the caller, since the UI surface treats "unknown"
     as a distinct visual state from "external said no"."""
-    resolve_body = _build_locgeopos_body([(from_lat, from_lon), (to_lat, to_lon)])
-
-    async def _run(c: httpx.AsyncClient) -> VerifyResult:
-        # Step 1: coord → station lid resolution.
-        resolve_payload, err = await _post_hafas(c, resolve_body)
-        if err is not None:
-            return err
-        if resolve_payload is None:  # pragma: no cover — defensive
-            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no resolve payload")
-        if resolve_payload.get("err") and resolve_payload["err"] != "OK":
-            return VerifyResult(
-                source=_SOURCE_OEBB_HAFAS,
-                ok=False,
-                error=f"hafas envelope: {resolve_payload['err']}",
-            )
-        lids = _extract_lids_from_locgeopos(resolve_payload, count=2)
-        from_lid, to_lid = lids[0], lids[1]
-        if not from_lid or not to_lid:
-            # One or both endpoints don't snap to an ÖBB station. This
-            # is informative ("ÖBB doesn't have this stop in its
-            # catalogue") rather than a true backend failure — but
-            # we can't route without IDs, so surface as yellow with
-            # the friendly H9220-equivalent message.
-            return VerifyResult(
-                source=_SOURCE_OEBB_HAFAS,
-                ok=False,
-                error=_HAFAS_ERROR_MESSAGES["H9220"],
-            )
-
-        # Step 2: trip search using the resolved station lids.
-        trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
-        trip_payload, err2 = await _post_hafas(c, trip_body)
-        if err2 is not None:
-            return err2
-        if trip_payload is None:  # pragma: no cover — defensive
-            return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no trip payload")
-        return _parse_hafas_response(trip_payload)
-
-    if client is not None:
-        return await _run(client)
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as c:
-        return await _run(c)
+    out = await fetch_oebb_two_step(
+        from_lat=from_lat,
+        from_lon=from_lon,
+        to_lat=to_lat,
+        to_lon=to_lon,
+        depart_at=depart_at,
+        client=client,
+    )
+    return out.verdict
 
 
 def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:

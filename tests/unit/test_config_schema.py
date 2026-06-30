@@ -333,3 +333,40 @@ def test_coverage_default_timezone_choices() -> None:
     # Anything else refuses — keeps the API + form + DB in sync.
     with pytest.raises(ValueError, match="must be one of"):
         coerce("COVERAGE_DEFAULT_TIMEZONE", "Mars/Phobos")
+
+
+# ─────────────────── ÖBB HAFAS journey comparison (PR) ──────────────────
+# Two keys land via feat/hafas-journey-comparison to power the journey-
+# UI's second comparison checkbox. HAFAS_COMPARISON_ENABLED defaults to
+# True because HAFAS needs no API token (the embedded Scotty
+# credentials in external_verify.py are public).
+
+
+def test_hafas_comparison_keys_present() -> None:
+    """Both HAFAS_* keys must exist — the journey API + pages reads
+    them at request time; the journey-UI checkbox is gated by the
+    enabled flag."""
+    assert "HAFAS_COMPARISON_ENABLED" in CONFIG_SCHEMA
+    assert "HAFAS_TIMEOUT_MS" in CONFIG_SCHEMA
+
+
+def test_hafas_comparison_enabled_default_true() -> None:
+    """Defaults to True — unlike OJP which needs a token before the
+    feature is useful, HAFAS works out of the box. A False default
+    would hide the journey-UI checkbox by default; the operator
+    flipping it on per-search would be the only way to opt in."""
+    assert default_for("HAFAS_COMPARISON_ENABLED") is True
+    assert coerce("HAFAS_COMPARISON_ENABLED", False) is False
+    assert coerce("HAFAS_COMPARISON_ENABLED", "false") is False
+
+
+def test_hafas_timeout_ms_bounds() -> None:
+    # Default 10s — matches OJP. HAFAS's mgate is occasionally slow
+    # under load; 10s keeps the journey-UI responsive without
+    # prematurely killing valid calls.
+    assert default_for("HAFAS_TIMEOUT_MS") == 10_000
+    assert coerce("HAFAS_TIMEOUT_MS", "30000") == 30_000
+    with pytest.raises(ValueError, match="below minimum"):
+        coerce("HAFAS_TIMEOUT_MS", 100)
+    with pytest.raises(ValueError, match="above maximum"):
+        coerce("HAFAS_TIMEOUT_MS", 999_999)
