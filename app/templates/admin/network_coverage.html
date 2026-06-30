@@ -1483,10 +1483,11 @@ function renderCellTrips(payload, orig, dest) {
 const _MODAL_SHOW_WALKS_KEY = 'viator.modalShowWalks';
 let MODAL_SHOW_WALKS = (function () {
   try {
-    return window.localStorage.getItem(_MODAL_SHOW_WALKS_KEY) === '1';
+    return globalThis.localStorage.getItem(_MODAL_SHOW_WALKS_KEY) === '1';
   } catch (_e) {
     // localStorage can throw in private-browsing / sandboxed iframes;
     // default to OFF so the modal opens cleanly even then.
+    console.warn('[network_coverage] modal-show-walks read from localStorage failed; defaulting to OFF', _e);
     return false;
   }
 })();
@@ -1745,8 +1746,12 @@ document.addEventListener('change', (e) => {
   }
   if (e.target && e.target.matches('[data-action="modal-show-walks"]')) {
     MODAL_SHOW_WALKS = !!e.target.checked;
-    try { window.localStorage.setItem(_MODAL_SHOW_WALKS_KEY, MODAL_SHOW_WALKS ? '1' : '0'); }
-    catch (_e) { /* private-browsing / sandboxed iframe — fall through. */ }
+    try {
+      globalThis.localStorage.setItem(_MODAL_SHOW_WALKS_KEY, MODAL_SHOW_WALKS ? '1' : '0');
+    } catch (_e) {
+      // private-browsing / sandboxed iframe — in-memory state still works for this session.
+      console.warn('[network_coverage] modal-show-walks persist to localStorage failed', _e);
+    }
     applyModalShowWalks();
   }
 });
@@ -1762,7 +1767,7 @@ document.addEventListener('change', (e) => {
 // stays the canonical source of truth. The transient overlay just
 // gives the operator an at-a-glance "did the picture change?" view.
 //
-// PR-196b TODO: persisting the live re-verify back to
+// PR-196b followup (deferred): persisting the live re-verify back to
 // external_itineraries + recomputing alignment_score would require a
 // backend change to the verify-external endpoint (write through to
 // the cell row, recompute via compute_alignment). Out of scope for
