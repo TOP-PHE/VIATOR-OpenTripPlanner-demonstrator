@@ -43,6 +43,19 @@ const SECTIONS = [
   // dev-dashboard.opentransportdata.swiss into OJP_API_TOKEN. The feature
   // stays off until OJP_COMPARISON_ENABLED is ticked AND a token is set.
   { title: 'Swiss OJP comparison', keys: ['OJP_COMPARISON_ENABLED','OJP_API_ENDPOINT','OJP_API_TOKEN','OJP_TIMEOUT_MS'] },
+  // Network coverage matrix — knobs for the background coverage runner
+  // (app/network_coverage/runner.py). Order matches CONFIG_SCHEMA's
+  // grouping (query depth → cross-pair parallelism → K-slot slicing →
+  // day-window defaults → verify sweep). All 14 keys auto-exposed via
+  // /api/admin/config; surfacing them here saves operators a psql trip
+  // when tuning a coverage run.
+  { title: 'Network coverage matrix', keys: [
+    'COVERAGE_NUM_ITINERARIES','COVERAGE_SEARCH_WINDOW_SECONDS','COVERAGE_PAIR_TIMEOUT_MS',
+    'COVERAGE_PAIR_PARALLELISM','COVERAGE_WITHIN_PAIR_PARALLELISM',
+    'COVERAGE_SLOT_COUNT','COVERAGE_NUM_ITINERARIES_PER_SLOT','COVERAGE_SLOT_TIMEOUT_MS',
+    'COVERAGE_DEFAULT_WINDOW_START','COVERAGE_DEFAULT_WINDOW_END','COVERAGE_DEFAULT_TIMEZONE',
+    'COVERAGE_VERIFY_PARALLELISM','COVERAGE_VERIFY_TIMEOUT_S','COVERAGE_VERIFY_SLEEP_MS',
+  ] },
   { title: 'Master data refresh', keys: ['MASTER_STATIONS_REFRESH_DAYS','MASTER_CARRIERS_REFRESH_DAYS'] },
   // v0.1.11: previously hardcoded / .env-only.
   // REBUILD_DEBOUNCE_SECONDS=0 means "rebuild starts on click" (demo).
@@ -54,7 +67,20 @@ const SECTIONS = [
 
 const SECRETS = new Set(['SMTP_PASS','OJP_API_TOKEN']);
 const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN','OJP_COMPARISON_ENABLED']);
-const CHOICES = { SMTP_SECURE: ['none','starttls','tls'], REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'] };
+const CHOICES = {
+  SMTP_SECURE: ['none','starttls','tls'],
+  REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'],
+  // Mirror CONFIG_SCHEMA['COVERAGE_DEFAULT_TIMEZONE'].choices — kept in
+  // sync via the drift-guard in tests/unit/test_admin_config_template.py
+  // so adding a zone in the schema without updating this list fails CI.
+  COVERAGE_DEFAULT_TIMEZONE: [
+    'UTC',
+    'Europe/Berlin','Europe/Vienna','Europe/Paris','Europe/Madrid',
+    'Europe/Stockholm','Europe/Warsaw','Europe/Budapest','Europe/Prague',
+    'Europe/Helsinki','Europe/Athens','Europe/Brussels','Europe/Amsterdam',
+    'Europe/Lisbon','Europe/Rome',
+  ],
+};
 
 const toast = document.getElementById('toast');
 function showToast(kind, text) {
