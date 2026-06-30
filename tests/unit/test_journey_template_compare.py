@@ -17,11 +17,28 @@ from pathlib import Path
 import pytest
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "app" / "templates" / "journey.html"
+# PR-196b — the compare-grid CSS + JS primitives were lifted out of
+# journey.html into shared static assets so the network-coverage cell
+# modal can re-use the same N-column primitive. The template still has
+# to <link>/<script> them in; the CSS rules + the renderGrid primitive
+# itself live in these files now.
+SHARED_CSS = Path(__file__).resolve().parents[2] / "app" / "static" / "css" / "compare_grid.css"
+SHARED_JS = Path(__file__).resolve().parents[2] / "app" / "static" / "js" / "compare_grid.js"
 
 
 @pytest.fixture(scope="module")
 def template_text() -> str:
     return TEMPLATE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def shared_css_text() -> str:
+    return SHARED_CSS.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def shared_js_text() -> str:
+    return SHARED_JS.read_text(encoding="utf-8")
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -89,12 +106,21 @@ def test_comparison_grid_appears_in_innerhtml_template(template_text: str):
     assert "${comparisonGrid}" in template_text or "${comparisonGridSlot}" in template_text
 
 
-def test_comparison_grid_css_present(template_text: str):
-    """CSS classes the grid relies on must be defined in the template's
-    <style> block. Without these, the grid renders as a vertical pile of
-    cards instead of two columns."""
+def test_comparison_grid_css_present(template_text: str, shared_css_text: str):
+    """CSS classes the grid relies on must be defined in the shared
+    stylesheet AND the template must <link> to it. Without these, the
+    grid renders as a vertical pile of cards instead of two columns.
+
+    PR-196b — the rules moved out of journey.html into the shared CSS
+    file so the network-coverage modal can re-use them. The template
+    pin is now "link to the shared file" + "shared file defines the
+    rules"."""
+    assert "/static/app/css/compare_grid.css" in template_text, (
+        "journey.html must <link> to the shared compare-grid CSS — "
+        "without it the grid loses every layout rule."
+    )
     for css_class in (".compare-grid", ".compare-header", ".compare-cell"):
-        assert css_class in template_text, f"Missing CSS rule for {css_class}"
+        assert css_class in shared_css_text, f"Missing CSS rule for {css_class}"
 
 
 def test_engine_dropdown_is_present_in_form(template_text: str):
@@ -120,11 +146,13 @@ def test_compare_trains_only_toggle_is_wired(template_text: str):
     assert "render(_LAST_PAYLOAD)" in template_text
 
 
-def test_compare_controls_css_present(template_text: str):
+def test_compare_controls_css_present(shared_css_text: str):
     """The toggle's container styling must be defined — without it the
-    checkbox renders as a bare unstyled input inside the results pane."""
+    checkbox renders as a bare unstyled input inside the results pane.
+
+    PR-196b — the rule moved into the shared compare-grid CSS file."""
     for css_class in (".compare-controls", ".compare-toggle"):
-        assert css_class in template_text, f"Missing CSS rule for {css_class}"
+        assert css_class in shared_css_text, f"Missing CSS rule for {css_class}"
 
 
 # ──────────────────── feat/hafas-journey-comparison ────────────────────
@@ -228,17 +256,21 @@ def test_pr194_side_by_side_wired_to_render(template_text: str):
     assert "viator.compareSideBySide" in template_text  # localStorage key
 
 
-def test_pr194_side_by_side_grid_css_present(template_text: str):
+def test_pr194_side_by_side_grid_css_present(shared_css_text: str):
     """CSS for the side-by-side column grid must be defined — without
     it the columns wrap, the empty-column placeholder is unstyled,
-    and the per-source pill accent colours fall back to grey."""
-    assert "compare-grid-refs" in template_text
+    and the per-source pill accent colours fall back to grey.
+
+    PR-196b — the rules moved into the shared compare-grid CSS so
+    they're authoritatively defined once. We assert on the shared
+    file rather than the template body."""
+    assert "compare-grid-refs" in shared_css_text
     # Per-source pill accents (new in PR-194):
-    assert ".engine-pill.viator" in template_text
-    assert ".engine-pill.ojp" in template_text
-    assert ".engine-pill.hafas" in template_text
+    assert ".engine-pill.viator" in shared_css_text
+    assert ".engine-pill.ojp" in shared_css_text
+    assert ".engine-pill.hafas" in shared_css_text
     # CSS variable that scales the grid to N columns:
-    assert "--compare-cols" in template_text
+    assert "--compare-cols" in shared_css_text
 
 
 # ───────────────────── v0.1.43.25 regression guard ─────────────────────
