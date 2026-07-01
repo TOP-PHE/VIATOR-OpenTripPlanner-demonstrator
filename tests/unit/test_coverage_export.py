@@ -100,6 +100,10 @@ def _sample_cells() -> dict[str, dict]:
             "best_operators": "EUROSTAR",
             "error_message": None,
             "session_ids": None,
+            # PR-196a — alignment scored; exercises the tier-attribute +
+            # score-badge render path.
+            "external_alignment_tier": "agree",
+            "external_alignment_score": 1.0,
             "trips": [
                 {
                     "rank": 0,
@@ -134,6 +138,12 @@ def _sample_cells() -> dict[str, dict]:
             "best_operators": None,
             "error_message": None,
             "session_ids": None,
+            # PR-196a — the real _build_export_context ALWAYS emits both
+            # keys via getattr(..., None); this cell is unscored so both
+            # are explicitly None (not simply omitted) to match that
+            # contract and exercise the "no_data" default-tier path.
+            "external_alignment_tier": None,
+            "external_alignment_score": None,
             "trips": [],
         },
         # Timeout/error are tested via a third synthetic pair — picking
@@ -196,6 +206,55 @@ def test_no_route_cell_emits_class_and_empty_set_glyph() -> None:
     html = _render()
     assert 'class="cell-no-route"' in html
     assert "∅" in html  # the empty-set glyph for no-route cells
+
+
+# ─────────────────────── PR-196a alignment heatmap in export ───────────────────────
+
+
+def test_scored_cell_carries_alignment_tier_attribute() -> None:
+    """The ok cell in the fixture has external_alignment_tier='agree' —
+    the template must surface it as a data-alignment-tier attribute so
+    the CSS heatmap toggle can colour it."""
+    html = _render()
+    assert 'data-alignment-tier="agree"' in html
+
+
+def test_scored_cell_shows_score_badge() -> None:
+    """A cell with a non-null external_alignment_score must render the
+    small corner badge with the score to one decimal place."""
+    html = _render()
+    assert '<span class="cov-align-badge">1.0</span>' in html
+
+
+def test_unscored_cell_defaults_to_no_data_tier() -> None:
+    """The no_route cell in the fixture has NO external_alignment_tier
+    set (pre-sweep / never scored). It must default to 'no_data' —
+    same convention as the live matrix's externalOkAttr() — rather than
+    emitting an empty or missing data-alignment-tier attribute, which
+    would leave the CSS heatmap unable to colour it at all."""
+    html = _render()
+    assert 'data-alignment-tier="no_data"' in html
+
+
+def test_alignment_toggle_checkbox_present() -> None:
+    """The opt-in heatmap toggle must exist so operators can flip
+    between the primary status legend and the alignment view without
+    re-downloading the report."""
+    html = _render()
+    assert 'id="align-toggle-input"' in html
+    assert 'type="checkbox"' in html
+
+
+def test_alignment_tier_css_rules_present() -> None:
+    """The viridis tier palette must be inlined in the <style> block —
+    this is a self-contained file, so it cannot link to
+    compare_grid.css. Spot-check the 'agree' (darkest) and 'no_data'
+    (lightest) tiers so a future edit that drops the whole block is
+    caught."""
+    html = _render()
+    assert 'td[data-alignment-tier="agree"]' in html
+    assert 'td[data-alignment-tier="no_data"]' in html
+    assert "#440154" in html  # agree tier's viridis dark-purple
 
 
 def test_self_pair_renders_as_self_class() -> None:
@@ -442,6 +501,73 @@ def test_build_export_context_attaches_trips_by_journey_search_id() -> None:
     assert len(ctx["cells"]["p-nord:bxl-mid"]["trips"]) == 1
     assert ctx["cells"]["p-nord:bxl-mid"]["trips"][0]["duration_seconds"] == 4980
     assert ctx["cells"]["bxl-mid:p-nord"]["trips"] == []
+
+
+def test_build_export_context_includes_alignment_tier_and_score() -> None:
+    """PR-196a — the alignment tier + score columns must round-trip
+    through the export context exactly like every other external_*
+    field, so the offline report's heatmap has data to render."""
+    from app.api.admin.network_coverage import _build_export_context
+
+    results = [
+        _StubResult(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            response_ms=1432,
+            num_itineraries=1,
+            best_duration_seconds=4980,
+            best_num_transfers=0,
+            best_operators="EUROSTAR",
+            error_message=None,
+            journey_search_id=None,
+            session_ids=None,
+            external_alignment_tier="mostly_agree",
+            external_alignment_score=0.7,
+        ),
+    ]
+    ctx = _build_export_context(
+        run=_stub_run(),
+        results=results,
+        hubs=[_stub_hub_info()],
+        trips_by_search={},
+    )
+    cell = ctx["cells"]["p-nord:bxl-mid"]
+    assert cell["external_alignment_tier"] == "mostly_agree"
+    assert cell["external_alignment_score"] == 0.7
+
+
+def test_build_export_context_defaults_alignment_fields_to_none() -> None:
+    """A row that pre-dates the PR-196a sweep (or was never scored) has
+    no external_alignment_tier/score attributes at all — the marshaller
+    must default to None via getattr rather than raise AttributeError."""
+    from app.api.admin.network_coverage import _build_export_context
+
+    results = [
+        _StubResult(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            response_ms=1432,
+            num_itineraries=1,
+            best_duration_seconds=4980,
+            best_num_transfers=0,
+            best_operators="EUROSTAR",
+            error_message=None,
+            journey_search_id=None,
+            session_ids=None,
+            # external_alignment_tier / external_alignment_score omitted
+        ),
+    ]
+    ctx = _build_export_context(
+        run=_stub_run(),
+        results=results,
+        hubs=[_stub_hub_info()],
+        trips_by_search={},
+    )
+    cell = ctx["cells"]["p-nord:bxl-mid"]
+    assert cell["external_alignment_tier"] is None
+    assert cell["external_alignment_score"] is None
 
 
 def test_build_export_context_run_meta_uses_started_at_not_created_at() -> None:

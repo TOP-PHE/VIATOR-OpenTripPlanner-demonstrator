@@ -834,6 +834,12 @@ def _build_export_context(
                 if getattr(r, "external_verified_at", None)
                 else None
             ),
+            # PR-196a — alignment heatmap signal, mirrored into the offline
+            # export so operators reviewing a downloaded report see the same
+            # tier-colored cells as the live matrix, not just the older
+            # PR-E green/blue/yellow verdict dot.
+            "external_alignment_tier": getattr(r, "external_alignment_tier", None),
+            "external_alignment_score": getattr(r, "external_alignment_score", None),
         }
     run_meta = {
         "id": str(run.id),

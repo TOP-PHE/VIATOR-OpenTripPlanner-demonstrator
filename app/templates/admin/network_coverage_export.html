@@ -66,6 +66,34 @@
     .cell-pending { background: #fff; color: var(--pending); }
     .cell-self { background: var(--self); color: var(--pending); }
 
+    /* PR-196a — ÖBB alignment heatmap, mirrored into the offline export.
+       Hex values copied from the live matrix's palette in
+       network_coverage.html (body.cov-align-mode-colors .cov-matrix td[...])
+       — keep the two in sync if either palette changes. Self-contained
+       file, so these are inlined here rather than linked from
+       compare_grid.css (whose modal-pill variant differs slightly on
+       purpose — the pill communicates the same tiers as the heatmap
+       against different backgrounds, see that file's own comments).
+       Cells only pick up these colours when body carries
+       .cov-align-mode-colors, toggled by the checkbox below — default
+       OFF so the report's primary legend (status: ok/no-route/error)
+       reads first. */
+    body.cov-align-mode-colors td[data-alignment-tier="agree"]            { background: #440154 !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="mostly_agree"]     { background: #31688e !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="partial"]          { background: #35b779 !important; color: #0d2616; }
+    body.cov-align-mode-colors td[data-alignment-tier="disagree"]         { background: #fde725 !important; color: #4a3500; }
+    body.cov-align-mode-colors td[data-alignment-tier="no_overlap"]       { background: #e76f51 !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="one_sided_viator"] { background: #b8b8b8 !important; color: #1c1c1c; }
+    body.cov-align-mode-colors td[data-alignment-tier="one_sided_oebb"]   { background: #8a8a8a !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="no_service"]      { background: #d8d8d8 !important; color: #4a4a4a; }
+    body.cov-align-mode-colors td[data-alignment-tier="no_data"]         { background: #f0f0f0 !important; color: #8a939d; }
+    table.matrix td { position: relative; }
+    .cov-align-badge {
+      position: absolute; bottom: 1px; right: 2px; font-size: 8px;
+      font-weight: 600; opacity: 0.75; pointer-events: none; line-height: 1;
+    }
+    .align-toggle { display: inline-flex; align-items: center; gap: 0.35rem; margin-left: 0.6rem; font-size: 0.85rem; }
+
     /* Drilldown modal */
     .modal-back {
       position: fixed; inset: 0; background: rgba(15, 25, 40, 0.55);
@@ -164,6 +192,15 @@
   <strong style="color: var(--error)">red</strong> = timeout / error.
   Diagonal cells (origin = destination) are intentionally skipped.
 </p>
+<p class="meta">
+  <label class="align-toggle">
+    <input type="checkbox" id="align-toggle-input">
+    Show ÖBB alignment heatmap instead
+    (viridis: dark purple = full agreement, yellow/orange = disagreement,
+    grey = one-sided or not yet scored — small number in the corner is
+    the alignment score 0.00–1.00)
+  </label>
+</p>
 
 <div class="matrix-wrap">
   <table class="matrix">
@@ -184,24 +221,36 @@
             <td class="cell-self">·</td>
           {% else %}
             {% set cell = cells.get(orig.id ~ ":" ~ dest.id) %}
+            {# PR-196a — tier defaults to "no_data" for rows that pre-date
+               the sweep or never got an alignment score, mirroring the
+               live matrix's externalOkAttr() convention. #}
+            {% set tier = (cell.external_alignment_tier if cell else None) or "no_data" %}
+            {% set score = cell.external_alignment_score if cell else None %}
             {% if not cell %}
               <td class="cell-pending" title="No result yet (run may still be in progress)">…</td>
             {% elif cell.status == "ok" %}
               {% set hours = (cell.best_duration_seconds // 3600) if cell.best_duration_seconds else 0 %}
               {% set mins = ((cell.best_duration_seconds % 3600) // 60) if cell.best_duration_seconds else 0 %}
-              <td class="cell-ok" data-pair="{{ orig.id }}:{{ dest.id }}"
-                  title="{{ orig.name }} → {{ dest.name }} · {{ cell.num_itineraries }} itineraries · {{ cell.best_operators or '' }}">
+              <td class="cell-ok" data-pair="{{ orig.id }}:{{ dest.id }}" data-alignment-tier="{{ tier }}"
+                  title="{{ orig.name }} → {{ dest.name }} · {{ cell.num_itineraries }} itineraries · {{ cell.best_operators or '' }}{% if score is not none %} · alignment {{ tier }} ({{ '%.2f'|format(score) }}){% endif %}">
                 {{ "%dh%02d"|format(hours, mins) }}·{{ cell.num_itineraries }}
+                {% if score is not none %}<span class="cov-align-badge">{{ '%.1f'|format(score) }}</span>{% endif %}
               </td>
             {% elif cell.status == "no_route" %}
-              <td class="cell-no-route" data-pair="{{ orig.id }}:{{ dest.id }}"
-                  title="{{ orig.name }} → {{ dest.name }} · no route found ({{ cell.response_ms or 0 }} ms)">∅</td>
+              <td class="cell-no-route" data-pair="{{ orig.id }}:{{ dest.id }}" data-alignment-tier="{{ tier }}"
+                  title="{{ orig.name }} → {{ dest.name }} · no route found ({{ cell.response_ms or 0 }} ms){% if score is not none %} · alignment {{ tier }} ({{ '%.2f'|format(score) }}){% endif %}">∅
+                {% if score is not none %}<span class="cov-align-badge">{{ '%.1f'|format(score) }}</span>{% endif %}
+              </td>
             {% elif cell.status == "timeout" %}
-              <td class="cell-timeout" data-pair="{{ orig.id }}:{{ dest.id }}"
-                  title="{{ orig.name }} → {{ dest.name }} · query timed out ({{ cell.response_ms or 0 }} ms)">⧗</td>
+              <td class="cell-timeout" data-pair="{{ orig.id }}:{{ dest.id }}" data-alignment-tier="{{ tier }}"
+                  title="{{ orig.name }} → {{ dest.name }} · query timed out ({{ cell.response_ms or 0 }} ms){% if score is not none %} · alignment {{ tier }} ({{ '%.2f'|format(score) }}){% endif %}">⧗
+                {% if score is not none %}<span class="cov-align-badge">{{ '%.1f'|format(score) }}</span>{% endif %}
+              </td>
             {% elif cell.status == "error" %}
-              <td class="cell-error" data-pair="{{ orig.id }}:{{ dest.id }}"
-                  title="{{ orig.name }} → {{ dest.name }} · error: {{ cell.error_message or '?' }}">✕</td>
+              <td class="cell-error" data-pair="{{ orig.id }}:{{ dest.id }}" data-alignment-tier="{{ tier }}"
+                  title="{{ orig.name }} → {{ dest.name }} · error: {{ cell.error_message or '?' }}{% if score is not none %} · alignment {{ tier }} ({{ '%.2f'|format(score) }}){% endif %}">✕
+                {% if score is not none %}<span class="cov-align-badge">{{ '%.1f'|format(score) }}</span>{% endif %}
+              </td>
             {% else %}
               <td class="cell-pending" data-pair="{{ orig.id }}:{{ dest.id }}">?</td>
             {% endif %}
@@ -336,6 +385,10 @@
     if (cell.best_operators) parts.push(`operators: <code>${escapeHTML(cell.best_operators)}</code>`);
     if (cell.session_ids && cell.session_ids.length) parts.push(`sessions: <code>${escapeHTML(cell.session_ids.join(', '))}</code>`);
     if (cell.error_message) parts.push(`error: <code>${escapeHTML(cell.error_message)}</code>`);
+    if (cell.external_alignment_tier) {
+      const scoreTxt = cell.external_alignment_score != null ? ` (${cell.external_alignment_score.toFixed(2)})` : '';
+      parts.push(`ÖBB alignment: <code>${escapeHTML(cell.external_alignment_tier)}${scoreTxt}</code>`);
+    }
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
     const body = (cell.trips && cell.trips.length)
       ? cell.trips.map(renderTrip).join('')
@@ -356,6 +409,19 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeModal();
   });
+
+  // PR-196a — toggle between the status legend (default) and the ÖBB
+  // alignment heatmap. Pure CSS class flip on <body>, no re-render, so
+  // the offline file stays snappy with zero JS state beyond the
+  // checkbox itself. Default OFF: matches the live matrix's default
+  // ("Off (status colours)") and keeps the report's primary legend
+  // (green/amber/red) the first thing an operator sees.
+  const alignToggle = document.getElementById('align-toggle-input');
+  if (alignToggle) {
+    alignToggle.addEventListener('change', () => {
+      document.body.classList.toggle('cov-align-mode-colors', alignToggle.checked);
+    });
+  }
 })();
 </script>
 
