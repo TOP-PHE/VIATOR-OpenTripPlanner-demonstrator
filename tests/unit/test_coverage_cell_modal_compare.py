@@ -240,3 +240,66 @@ def test_reverify_refreshes_modal_in_place(template_text: str):
         "to refreshModalOebbColumn — otherwise the ÖBB column doesn't "
         "actually refresh on re-verify."
     )
+
+
+# ─────────────────── Re-run link coord-guard regression ───────────────────
+# Bug reported on v0.1.43.28: clicking the modal's "Re-run live in the
+# journey UI" link opens /journey with From/To/Depart all empty. Root
+# cause: HUBS entries with null/undefined lat or lon interpolated raw
+# into the URL template produce `from_lat=undefined&from_lon=undefined`.
+# journey.html's setPair() bails on empty lat/lon but treats the LITERAL
+# STRING "undefined" as truthy, writes it into the hidden field, and
+# then parseFloat("undefined") at submit yields NaN — presenting as
+# "search does nothing / all fields empty" to the operator. Fix: coerce
+# each coord via Number()/Number.isFinite() and gate the whole link on
+# all four coords being non-null.
+
+
+def test_rerun_link_coerces_coords_before_interpolation(template_text: str):
+    """The Re-run link's coord interpolation must go through a `coord()`
+    helper that returns null for non-finite values, so a stale/partial
+    hub row (lat=null / lon=undefined) never produces the literal string
+    "undefined" in the /journey URL. Without this the operator sees
+    From/To/Depart all empty after Re-run because journey.html's
+    downstream setPair() misreads "undefined" as truthy and then chokes
+    at submit-time parseFloat."""
+    assert "Number.isFinite(Number(v))" in template_text, (
+        "Missing the Number.isFinite(Number(v)) coord-coercer in "
+        "openDetailModal's Re-run link block. Without it, a hub row "
+        "with null/undefined lat or lon produces `from_lat=undefined` "
+        "in the URL — reported v0.1.43.28 bug where Re-run opens "
+        "/journey with all fields empty."
+    )
+    # The four coord-nullness checks must gate the link so a bad hub
+    # coord makes the link disappear rather than deep-linking to a
+    # broken URL.
+    for check in ("oLat !== null", "oLon !== null", "dLat !== null", "dLon !== null"):
+        assert check in template_text, (
+            f"Re-run link must gate on `{check}` so a hub row with a "
+            f"null/undefined coord makes the link disappear rather "
+            f"than producing `from_lat=undefined` in the /journey URL."
+        )
+
+
+def test_rerun_link_uses_coerced_coord_vars_not_raw_hub_fields(template_text: str):
+    """Belt-and-braces: after the coerce, the URL template must use the
+    numeric-typed locals (oLat/oLon/dLat/dLon) and NOT the raw
+    orig.lat/orig.lon/dest.lat/dest.lon paths. If a refactor puts the
+    raw fields back into the href, the coerce is defeated and the
+    "undefined" leak returns."""
+    assert "from_lat=${oLat}" in template_text, (
+        "Re-run link href must interpolate the coerced `oLat` local, "
+        "not the raw `orig.lat` — otherwise the coord-coercer is a "
+        "dead-store and the null/undefined leak returns at the URL."
+    )
+    assert "from_lon=${oLon}" in template_text
+    assert "to_lat=${dLat}" in template_text
+    assert "to_lon=${dLon}" in template_text
+    # Negative: the raw-field interpolation MUST NOT appear in the
+    # rerunLink template. Scoped to /journey? so unrelated orig.lat
+    # usage elsewhere in the file isn't caught.
+    assert "/journey?from_lat=${orig.lat}" not in template_text, (
+        "Regression: Re-run link is back to interpolating raw "
+        "`orig.lat`. Use the coerced `oLat` local instead — see the "
+        "v0.1.43.28 empty-prefill bug."
+    )

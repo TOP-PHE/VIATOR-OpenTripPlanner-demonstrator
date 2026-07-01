@@ -1387,9 +1387,22 @@ async function openDetailModal(originId, destId, result) {
   const departParam = CURRENT_RUN_DEPART_AT
     ? '&depart_at=' + encodeURIComponent(CURRENT_RUN_DEPART_AT)
     : '';
-  const rerunLink = (orig && dest)
-    ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${orig.lat}&from_lon=${orig.lon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dest.lat}&to_lon=${dest.lon}&to_name=${encodeURIComponent(dest.name)}${departParam}" target="_blank">↗ Re-run live in the journey UI</a></p>`
-    : '';
+  // Coerce coords to finite numbers before interpolation. journey.html's
+  // setPair() bails on empty lat/lon but treats the literal string
+  // "undefined" as truthy, then chokes at submit as parseFloat("undefined")
+  // → NaN → the "pick from dropdown suggestions" error, which the operator
+  // sees as From/To/Depart all EMPTY. Guard here rather than downstream so
+  // the fallback link cleanly disappears when a hub row is stale/partial
+  // (null lat/lon) rather than deep-linking to a broken /journey URL.
+  const coord = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const oLat = orig ? coord(orig.lat) : null;
+  const oLon = orig ? coord(orig.lon) : null;
+  const dLat = dest ? coord(dest.lat) : null;
+  const dLon = dest ? coord(dest.lon) : null;
+  const rerunLink =
+    orig && dest && oLat !== null && oLon !== null && dLat !== null && dLon !== null
+      ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${oLat}&from_lon=${oLon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dLat}&to_lon=${dLon}&to_name=${encodeURIComponent(dest.name)}${departParam}" target="_blank">↗ Re-run live in the journey UI</a></p>`
+      : '';
   const modalBody = document.getElementById('cov-modal-body');
   modalBody.innerHTML = '<p class="hint">Loading itineraries…</p>' + rerunLink;
   document.getElementById('cov-modal').hidden = false;
