@@ -3,7 +3,7 @@
 Working notes for AI sessions resuming this project. Concise + structured.
 Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `docs/admin-guide.md`.
 
-Last updated: 2026-07-01, after v0.1.43.28 (deployed to VPS) + PR #201 merged.
+Last updated: 2026-07-01, after v0.1.43.28 (deployed to VPS) + PR #202/#203 merged.
 
 ---
 
@@ -41,6 +41,8 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 | willfarrell/autoheal watchdog, opt-in via `viator.autoheal="true"` label | Docker doesn't auto-restart on `(unhealthy)` alone; the eu19-transit-motis incident (below) ran undetected for ~10h | PR-199 (#199) |
 | Coverage cell modal "Re-run" link coerces coords via `Number.isFinite`, gates the whole link on all 4 non-null | A stale/null hub coord produced `from_lat=undefined` in the URL, which journey.html's `setPair()` treats as truthy → `parseFloat("undefined")` → NaN at submit → "search does nothing" | PR-200 (#200) |
 | Offline HTML export mirrors the live matrix's alignment heatmap, opt-in toggle, all CSS inlined | Export is `Content-Disposition: attachment`, zero external assets, must stay viewable offline forever | PR-201 (#201) |
+| Coverage cell modal "Re-run" link also passes `&from_uic=&to_uic=` | Prep for the UIC backfill (Scope B, not yet built); safe no-op today since coverage hubs carry no UIC column | PR-202 (#202) |
+| `AutohealExcessiveRestarts` Prometheus alert (`>3 restarts/hour`) + cadvisor `viator.autoheal` label-whitelist fix | Autoheal restarting silently forever would mask a *recurring* problem exactly as it did in the 07-01 slot-window incident (below) — restarts alone aren't a fix if the same container keeps flipping unhealthy | PR-203 (#203) |
 
 **MOTIS quirks operationally important:**
 - MOTIS HTTP server can die silently while process stays alive → docker healthcheck uses `wget --spider` (PR-191 / #191)
@@ -48,6 +50,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 - `docker compose restart` hangs on uvicorn graceful shutdown when BackgroundTasks in flight → use `docker kill` + `docker compose up -d`
 - **Silent-death + no auto-restart**: on 2026-06-30/07-01, `motis-eu19-transit-motis` sat `(unhealthy)` at 99% CPU for ~10 hours (healthcheck correctly flagged it, but nothing acted — docker doesn't auto-restart on unhealthy, that's a k8s liveness-probe feature, not a plain-docker one). PR-199's autoheal watchdog is the fix; PR-203 (open) adds a Prometheus alert (`AutohealExcessiveRestarts`, >3 restarts/hour) so a *recurring* unhealthy condition pages someone instead of silently auto-recovering forever. **No Alertmanager/Grafana contact point exists yet** — the alert fires and is visible in the UI but nobody gets paged externally until a notification channel (SMTP/webhook) is configured.
 - **Full stack recovery recipe** when things look broken after a VPS reboot: `docker compose -p viator down && docker compose -p viator up -d` — recreates the docker network cleanly (fixes a `postgres` DNS-resolution failure observed once after an unclean host reboot) and re-runs the sessions-orchestrator regen on `web` boot, so newly-templated `viator.autoheal` labels land on MOTIS/OTP containers that predate PR-199.
+- **Autoheal restarting ≠ autoheal fixing — a second, different-cause incident (2026-07-01)**: mid-sweep on a fresh eu19 coverage run, `viator-autoheal-1` restarted `motis-eu19-transit-motis` **8 times in ~43 minutes** (every ~6 min). This time MOTIS was NOT a zombie — `platform_config.COVERAGE_SLOT_COUNT` was stuck at `2` (a stale manual override from earlier incident tuning) instead of the code default `6`, widening each K-slot RAPTOR query to a 12h search window instead of the documented-safe 4h (`runner.py` comments: RAPTOR cost scales near-quadratically with window size). Even just ~2 concurrent 12h-window queries pegged MOTIS at 199.91% CPU, starving its own `GET /` healthcheck → flagged unhealthy → autoheal restarted it → repeat every ~6 min, each restart wiping in-flight pairs (the coverage matrix showed scattered fully-red origin rows interleaved with rows that had real durations — not a clean single-point crash). Fix: `DELETE FROM platform_config WHERE key='COVERAGE_SLOT_COUNT';` to restore the default, then re-run (the polluted run's error cells aren't real `no_route` findings). **Two gotchas that cost debugging time**: (1) the autoheal container is named `viator-autoheal-1` (compose v2 `<project>-<service>-<replica>`, no `container_name:` override) — not bare `autoheal`; (2) `docker inspect --format='{{.RestartCount}}'` stays `0` for autoheal-triggered restarts because autoheal calls the Docker API directly rather than going through the container's own `restart:` policy — don't let `restarts=0` next to an obviously-fresh `Up 11 seconds` fool you into thinking nothing restarted it.
 
 ---
 
@@ -58,7 +61,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
   - HAFAS form: `A=1@L=8503000`
   - Canonical: `UIC:8503000`
   - Fallback: lat/lon rounded to ~110 m when no UIC available
-  - **Coverage hubs (`network_coverage_hubs` table) carry NO UIC column today** — no FK/join to `master_stations`. The Re-run link's `&from_uic=&to_uic=` (PR-202, open) is wired but always resolves to empty string until a follow-up adds the column + backfill.
+  - **Coverage hubs (`network_coverage_hubs` table) carry NO UIC column today** — no FK/join to `master_stations`. The Re-run link's `&from_uic=&to_uic=` (PR-202, merged) is wired but always resolves to empty string until a follow-up adds the column + backfill.
 - **Timezones**: IANA names everywhere (`Europe/Zurich`, never `CET`/`CEST`)
 - **Time semantics**: trip "departs" at `first_transit_leg_departure_utc` (boarding time of the first non-walk/non-transfer leg)
 - **Mode vocabulary**: upper-case (`WALK`, `RAIL`, `BUS`, `TRAM`, `SUBWAY`, `FERRY`, `COACH`)
@@ -142,7 +145,7 @@ docker/
 ├── docker-compose.yml                   Main stack incl. autoheal service (opt-in via viator.autoheal label)
 └── prometheus/
     ├── prometheus.yml                   Scrape config + rule_files stanza (added by #203)
-    └── rules/autoheal.yml               [PR-203, open] AutohealExcessiveRestarts alert (no notification channel wired yet)
+    └── rules/autoheal.yml               AutohealExcessiveRestarts alert (PR-203, merged; no notification channel wired yet)
 alembic/versions/                        Migrations (YYYYMMDD_HHMM_descriptor.py pattern)
 tests/unit/                              ~200 unit tests, no DB needed
 tests/integration/                       Integration tests (skip without Postgres)
@@ -154,7 +157,7 @@ tests/integration/                       Integration tests (skip without Postgre
 
 **Live on VPS: v0.1.43.28** (tag pushed + deployed 2026-07-01).
 
-**Merged to main since the last update (10 PRs, #194→#201)**:
+**Merged to main since the last update (12 PRs, #194→#203)**:
 - #194 CLAUDE.md (this file, first version)
 - #195 ÖBB alignment heatmap + sweep verifies ALL cells ("PR-196a")
 - #196 hotfix: TDZ ReferenceError broke the journey-search submit button entirely (v0.1.43.25 regression from #192 — a top-level IIFE read a `let`/`const` declared ~700 lines below it)
@@ -163,12 +166,14 @@ tests/integration/                       Integration tests (skip without Postgre
 - #199 willfarrell/autoheal watchdog (opt-in label, no self-heal loop, docker socket `:ro`)
 - #200 hotfix: coverage modal Re-run link leaked `from_lat=undefined` on stale/null hub coords → journey search appeared to "do nothing"
 - #201 offline HTML export renders the alignment heatmap (was PR-E's binary legend only)
+- #202 wires `&from_uic=&to_uic=` into the Re-run link (Scope A of the UIC backfill); safe no-op today since coverage hubs carry no UIC column yet
+- #203 `AutohealExcessiveRestarts` Prometheus alert + cadvisor `viator.autoheal` label-whitelist fix; **still no Alertmanager/Grafana contact point configured**, so nobody is paged externally yet
 
-**Open, not yet merged**:
-- #202 (`feat/coverage-rerun-uic-passthrough`) — wires `&from_uic=&to_uic=` into the Re-run link; safe no-op today (hubs have no UIC), activates once a follow-up adds the column
-- #203 (`ops/autoheal-restart-alert`) — Prometheus alert on excessive autoheal restarts; cadvisor label-whitelist fix + new rule file; **no Alertmanager/Grafana contact point configured**, so nobody is paged externally yet
+**None currently open.**
 
-**Incident resolved this session**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
+**Incident #1 (2026-06-30/07-01)**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
+
+**Incident #2 (2026-07-01), same alarm, different cause**: with PR-199+203 live, a fresh eu19 sweep hit the exact same "autoheal keeps restarting the container" symptom (8 restarts in ~43 min) — but this time it wasn't a zombie, it was a **stale `platform_config.COVERAGE_SLOT_COUNT=2` override** (should be the code default `6`) tripling each K-slot query's RAPTOR search window to 12h instead of the documented-safe 4h, pegging MOTIS's CPU at 199.91% until it missed its own healthcheck. See §2 MOTIS-quirks bullet and §8 recipe below for the full diagnostic trail and fix. **Lesson**: "autoheal is restarting this container repeatedly" is a symptom with (at least) two different root causes — always check `platform_config` for a stale `COVERAGE_*` override before assuming it's a repeat of incident #1.
 
 **Data gap discovered**: eu19 MOTIS session's Dutch (NS) GTFS appears stale/incomplete — Amsterdam↔Rotterdam and Amsterdam↔Leiden return `no_route` from VIATOR while ÖBB HAFAS confirms real trains exist. Needs an NS GTFS re-import into the eu19 graph (not yet actioned).
 
@@ -176,10 +181,10 @@ tests/integration/                       Integration tests (skip without Postgre
 
 ## 7. Next steps (priorities)
 
-1. **Merge PR-202 + PR-203** (both open, both green on their own — no blocking dependencies on each other)
-2. **Decide a notification channel** for #203's alert: Alertmanager (new subsystem) vs. Grafana-provisioned alerting (fits the existing dashboards/datasources-as-code pattern better) — either needs a real SMTP/webhook contact point that doesn't exist today
-3. **Re-import NS (Netherlands) GTFS** into the eu19 MOTIS session — confirmed data gap, not a code bug (see incident above)
-4. **Run a full eu19 validation sweep** with `verify_externally=true` now that the heatmap + zombie-MOTIS issues are both fixed — this is the first "real" alignment-heatmap dataset
+1. **Guard against a stale/unsafe `COVERAGE_SLOT_COUNT`** (new, from incident #2): nothing today stops `platform_config` from holding a slot count that implies a search window wide enough to overload MOTIS and trigger an autoheal restart-loop. Add a cheap safeguard — e.g. warn (admin UI + startup log) if the effective per-slot window (`day_window / slot_count`) exceeds ~6h, or clamp it. Also worth a one-time audit of every `COVERAGE_*` value in `platform_config` for other leftover overrides from past incident tuning (this project's psql-fallback recipe makes it easy to set a knob and easy to forget to unset it).
+2. **Decide a notification channel** for #203's alert: Alertmanager (new subsystem) vs. Grafana-provisioned alerting (fits the existing dashboards/datasources-as-code pattern better) — either needs a real SMTP/webhook contact point that doesn't exist today. Incident #2 reinforces this: the alert would have fired (8 restarts/hour ≫ the >3 threshold) but nobody was paged — only caught by someone watching the live matrix.
+3. **Re-import NS (Netherlands) GTFS** into the eu19 MOTIS session — confirmed data gap, not a code bug (see incident #1 above)
+4. **Run a full eu19 validation sweep** with `verify_externally=true` now that the heatmap + both autoheal-restart-loop incidents are resolved — this is the first "real" alignment-heatmap dataset. The 2026-07-01 run that surfaced incident #2 needs re-doing; its error cells are restart-loop collateral, not genuine `no_route` findings.
 5. **Hub trim for eu19**: 94 hubs × both directions = 8742 pairs runs ~14h at current knob defaults. Recommendation: 3 hubs/country ≈ 42 hubs = 1722 pairs ≈ 90-150 min. Operational decision (toggle `is_active` in Manage Hubs), not a code change — ask before building an automated top-3-picker script
 6. **UIC backfill for coverage hubs** (Scope B of PR-202): nullable `uic` column + FK to `master_stations` + backfill by name/coord match + surface in `HubInfo`/manage-hubs UI. Activates PR-202's passthrough.
 7. **Reconcile the 3 near-duplicate viridis hex palettes** (compare_grid.css modal-pill, network_coverage.html live matrix, network_coverage_export.html) — PR-201 aligned the export to the modal-pill (WCAG-AA-safe) values; the live matrix's own palette in `network_coverage.html` still has the old, lower-contrast hex and wasn't flagged by Sonar because those specific lines predate this round of new-code scanning
@@ -221,6 +226,30 @@ docker compose -p viator exec web sh -c \
   "curl -s -m 30 'http://motis-<sid>:8080/api/v6/plan?fromPlace=<LAT>,<LON>&toPlace=<LAT>,<LON>&time=<ISO8601>&numItineraries=3&searchWindow=3600&transitModes=TRANSIT' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({\"itineraries\": len(d.get(\"itineraries\",[])), \"from\": d.get(\"from\"), \"to\": d.get(\"to\")}, indent=2))'"
 ```
 (No `jq` in the web image — pipe through `python3 -c` instead.) `itineraries: 0` + `from.stopId: null` on ONE direction only = walk-graph dead-zone at that coord (nudge it). Zero on BOTH directions = real data gap (missing GTFS feed). Non-zero once MOTIS is freshly restarted = it was just the zombie.
+
+**Diagnosing an autoheal restart-loop (recurring unhealthy, not a one-off zombie)**:
+```bash
+# Is autoheal actually cycling this container, and how often?
+docker logs viator-autoheal-1 --tail 50 | grep -i <sid>
+# (container is `viator-autoheal-1` — no container_name override — not bare `autoheal`)
+# 3+ restarts within an hour = NOT a one-off zombie; something is making it
+# unhealthy repeatedly. `docker inspect .RestartCount` will misleadingly
+# read 0 here — autoheal restarts via the Docker API directly, bypassing
+# the container's own `restart:` policy counter.
+
+# Before assuming it's a repeat of the zombie-MOTIS incident, check for a
+# stale coverage knob overload instead:
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "SELECT key, value FROM platform_config WHERE key LIKE 'COVERAGE_%' ORDER BY key;"
+# COVERAGE_SLOT_COUNT below the code default (6, with the default 24h day
+# window) means each slot's searchWindow is wider than the documented-safe
+# 4h — RAPTOR cost scales near-quadratically with it, and even 2 concurrent
+# queries at 12h+ windows can peg MOTIS's CPU enough to starve its own
+# healthcheck (confirm live with `docker stats --no-stream <container>`).
+# Reset the stale override:
+docker compose -p viator exec postgres psql -U viator -d viator -c \
+  "DELETE FROM platform_config WHERE key = 'COVERAGE_SLOT_COUNT';"
+```
 
 **Setting a coverage knob without admin UI** (psql fallback):
 ```sql
