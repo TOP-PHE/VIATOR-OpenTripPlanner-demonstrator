@@ -150,6 +150,30 @@ def test_non_serving_motis_session_renders_nothing():
     assert "otp-x:" not in out
 
 
+def test_motis_service_carries_autoheal_optin_label():
+    """The 2026-06 eu19-transit-motis incident: MOTIS container reported
+    (unhealthy) for ~10h at 99% CPU and docker did nothing about it. The
+    fix is a two-part opt-in: (1) the willfarrell/autoheal watchdog service
+    in docker/docker-compose.yml, (2) this label on every serve container
+    that should be restarted when its healthcheck flips. Postgres and other
+    stateful services are deliberately NOT labelled."""
+    out = render_compose([_StubSession(id="x", engine="motis", state=SessionState.SERVING.value)])
+    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    assert "viator.autoheal" in motis_block
+    assert '"true"' in motis_block
+
+
+def test_otp_service_carries_autoheal_optin_label():
+    """Same opt-in pattern as MOTIS — the per-session OTP serve container
+    has its own healthcheck (curl /otp/) and the same failure-mode risk,
+    so it opts into autoheal the same way. Prevents an asymmetry where
+    only MOTIS sessions get watchdog coverage."""
+    out = render_compose([_StubSession(id="x", engine="otp", state=SessionState.SERVING.value)])
+    otp_block = out.split("otp-x:")[1].split("\n\n")[0]
+    assert "viator.autoheal" in otp_block
+    assert '"true"' in otp_block
+
+
 # ───────────────────────────── render_nginx ─────────────────────────────
 
 

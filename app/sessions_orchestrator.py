@@ -78,6 +78,13 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
     labels:
       viator.session_id: "{sid}"
       viator.category: "{category}"
+      viator.engine: "otp"
+      # Opt into the autoheal watchdog defined in docker/docker-compose.yml.
+      # Per-session OTP serve containers already have a healthcheck (curl
+      # /otp/); this label is what tells autoheal to restart them when the
+      # probe flips to (unhealthy). Prompted by the 2026-06 MOTIS incident
+      # where a stuck container went unrestarted for ~10h.
+      viator.autoheal: "true"
 
 """
 
@@ -129,6 +136,13 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
       viator.session_id: "{sid}"
       viator.category: "{category}"
       viator.engine: "motis"
+      # Opt into the autoheal watchdog defined in docker/docker-compose.yml.
+      # This is the direct fix for the 2026-06 eu19-transit-motis incident:
+      # PR-#191 gave the MOTIS container a working healthcheck (wget --spider),
+      # but nothing was actioning the (unhealthy) state — the container sat at
+      # 99% CPU for ~10h before an operator noticed. With this label plus the
+      # autoheal service, docker+autoheal restart it within one poll interval.
+      viator.autoheal: "true"
 
 """
 
