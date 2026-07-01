@@ -95,6 +95,26 @@ main {
 .run-row .stop-btn:hover:not(:disabled) { background: #ffebe9; }
 .run-row .stop-btn:disabled { opacity: 0.5; cursor: progress; }
 
+/* Delete button — visible on any non-running run row so operators can
+   clear out test/experimental runs cluttering the sidebar. Hard delete
+   (cascades result rows at the DB level), confirmed via a JS confirm()
+   since it can't be undone. Neutral by default (shown on every
+   terminal-state row, so a permanent red would be too loud); it only
+   turns warning-red on hover as the destructive-intent cue. */
+.run-row .delete-btn {
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.7rem;
+  background: #fff;
+  color: #57606a;
+  border: 1px solid #d0d7de;
+  border-radius: 3px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.run-row .delete-btn:hover:not(:disabled) { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+.run-row .delete-btn:disabled { opacity: 0.5; cursor: progress; }
+
 /* Progress bar for a running run. */
 .cov-progress { background: #eef0f2; border-radius: 4px; height: 8px; margin-top: 0.4rem; overflow: hidden; }
 .cov-progress-bar { background: var(--brand-blue); height: 100%; transition: width 0.3s; }
@@ -1071,12 +1091,19 @@ async function reloadRunList(activeId) {
       const stopBtn = r.status === 'running'
         ? `<button type="button" class="stop-btn" data-action="stop-run" title="Cancel this in-flight coverage run. Cells already processed will stay in the DB.">Stop</button>`
         : '';
+      // Delete is only meaningful once a run is done moving — the API
+      // itself also rejects 'running' with 409, this just keeps the
+      // button from ever appearing on a row where it can't work.
+      const deleteBtn = r.status !== 'running'
+        ? `<button type="button" class="delete-btn" data-action="delete-run" title="Permanently delete this run and its results. Cannot be undone.">Delete</button>`
+        : '';
       return `<div class="${cls}" data-run-id="${escHTML(r.id)}">
         <div class="top">
           <strong>${escHTML(r.session_label)}</strong>
           ${countryBadge}
           <span class="cov-pill" data-status="${escHTML(r.status)}">${escHTML(r.status)}</span>
           ${stopBtn}
+          ${deleteBtn}
         </div>
         <div class="meta">
           ${escHTML(r.depart_at.replace('T',' ').slice(0,16))} ·
@@ -1092,10 +1119,12 @@ async function reloadRunList(activeId) {
     }).join('');
     el.querySelectorAll('.run-row').forEach(row => {
       row.addEventListener('click', (e) => {
-        // PR-1 — the Stop button is a child of the row; ignore the row
-        // click when the originating target was the button itself, so a
-        // Stop click doesn't also reload the run beneath the toast.
+        // PR-1 — the Stop/Delete buttons are children of the row; ignore
+        // the row click when the originating target was a button itself,
+        // so a Stop/Delete click doesn't also reload the run beneath the
+        // toast.
         if (e.target.closest('[data-action="stop-run"]')) return;
+        if (e.target.closest('[data-action="delete-run"]')) return;
         loadRun(row.dataset.runId);
       });
       const stopEl = row.querySelector('[data-action="stop-run"]');
@@ -1103,6 +1132,13 @@ async function reloadRunList(activeId) {
         stopEl.addEventListener('click', (e) => {
           e.stopPropagation();
           stopRun(row.dataset.runId, stopEl);
+        });
+      }
+      const deleteEl = row.querySelector('[data-action="delete-run"]');
+      if (deleteEl) {
+        deleteEl.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteRun(row.dataset.runId, deleteEl);
         });
       }
     });
@@ -1152,6 +1188,50 @@ async function stopRun(runId, btn) {
   } finally {
     // Re-enable just in case the reload above didn't replace this node
     // (e.g. transient network blip — the operator can click again).
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
+// Permanently removes a run + its result rows (hard delete — the DB
+// cascades NetworkCoverageResult via ondelete=CASCADE). Unlike Stop,
+// this can't be undone, so it's gated behind an explicit confirm().
+async function deleteRun(runId, btn) {
+  if (!confirm('Delete this run and all its results? This cannot be undone.')) {
+    return;
+  }
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  try {
+    const r = await fetch(`/api/admin/network-coverage/runs/${encodeURIComponent(runId)}`, {
+      method: 'DELETE',
+    });
+    if (!r.ok) {
+      let detail = `Delete failed (${r.status})`;
+      if (r.headers.get('content-type')?.includes('application/json')) {
+        const j = await r.json();
+        if (j && j.detail) detail = j.detail;
+      }
+      showToast('error', detail);
+      return;
+    }
+    showToast('success', 'Run deleted.');
+    // If the deleted run was the one loaded in the main panel, that
+    // panel is now showing content for a run that no longer exists —
+    // reset it to the same placeholder shown before any run is picked,
+    // rather than leaving stale matrix/summary content with no way to
+    // refresh it.
+    if (runId === CURRENT_RUN_ID) {
+      if (CURRENT_POLL_HANDLE) { clearInterval(CURRENT_POLL_HANDLE); CURRENT_POLL_HANDLE = null; }
+      CURRENT_RUN_ID = null;
+      document.getElementById('cov-main').innerHTML =
+        '<p style="color: var(--rail-steel)">Pick a session and click Run, or select an existing run from the sidebar.</p>';
+    }
+    await reloadRunList(CURRENT_RUN_ID);
+  } catch (err) {
+    showToast('error', `Delete failed: ${err.message}`);
+  } finally {
     btn.disabled = false;
     btn.textContent = originalText;
   }

@@ -1084,6 +1084,44 @@ def get_run(
     )
 
 
+@router.delete(
+    "/runs/{run_id}",
+    status_code=204,
+    responses={
+        404: {"description": _RUN_NOT_FOUND},
+        409: {
+            "description": (
+                "Run is in 'running' state — stop it first. Deleting an "
+                "in-flight run would race the background worker's writes."
+            )
+        },
+    },
+)
+def delete_run(
+    run_id: uuid.UUID,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> None:
+    """Hard-delete a coverage run and its result rows.
+
+    Unlike `delete_hub` (soft-delete — a hub is referenced by many
+    historical runs' `hub_id` strings), a run isn't referenced by
+    anything else: `NetworkCoverageResult.run_id` cascades at the DB
+    level (`ondelete="CASCADE"`), so this is a single clean DELETE.
+
+    Blocked for 'running' runs (409) — stop it via the Stop button/
+    endpoint first so the background worker isn't racing a delete of
+    the row it's about to write terminal-state fields onto.
+    """
+    run = db.get(NetworkCoverageRun, run_id)
+    if run is None:
+        raise HTTPException(404, _RUN_NOT_FOUND)
+    if run.status == "running":
+        raise HTTPException(409, "Run is 'running' — stop it before deleting")
+    db.delete(run)
+    db.commit()
+
+
 @router.get(
     "/runs/{run_id}/cells/{origin_id}/{dest_id}/trips",
     responses={404: {"description": _RUN_NOT_FOUND}},
