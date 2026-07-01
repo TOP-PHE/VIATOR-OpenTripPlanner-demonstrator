@@ -262,6 +262,7 @@ services:
       - "--web.route-prefix=/prometheus/"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     depends_on:
       web:
@@ -317,7 +318,12 @@ services:
       # emits one metric per (container × every label), which on a
       # multi-session VIATOR can be hundreds of useless time-series.
       - "--store_container_labels=false"
-      - "--whitelisted_container_labels=com.docker.compose.service,viator.session_id,viator.category"
+      # viator.autoheal whitelisted so the AutohealExcessiveRestarts alert
+      # (docker/prometheus/rules/autoheal.yml) can filter
+      # container_start_time_seconds by container_label_viator_autoheal="true" —
+      # without this, cadvisor silently drops the label from its output and
+      # the alert's PromQL matches zero series.
+      - "--whitelisted_container_labels=com.docker.compose.service,viator.session_id,viator.category,viator.autoheal"
       # Disable the on-disk WAL — we don't need historical metrics inside
       # cAdvisor itself, prometheus is the long-term store.
       - "--disable_metrics=disk,network,tcp,udp,advtcp,sched,process,hugetlb,referenced_memory,cpu_topology,resctrl"
