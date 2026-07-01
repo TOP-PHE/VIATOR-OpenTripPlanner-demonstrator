@@ -1094,9 +1094,9 @@ async function reloadRunList(activeId) {
       // Delete is only meaningful once a run is done moving — the API
       // itself also rejects 'running' with 409, this just keeps the
       // button from ever appearing on a row where it can't work.
-      const deleteBtn = r.status !== 'running'
-        ? `<button type="button" class="delete-btn" data-action="delete-run" title="Permanently delete this run and its results. Cannot be undone.">Delete</button>`
-        : '';
+      const deleteBtn = r.status === 'running'
+        ? ''
+        : `<button type="button" class="delete-btn" data-action="delete-run" title="Permanently delete this run and its results. Cannot be undone.">Delete</button>`;
       return `<div class="${cls}" data-run-id="${escHTML(r.id)}">
         <div class="top">
           <strong>${escHTML(r.session_label)}</strong>

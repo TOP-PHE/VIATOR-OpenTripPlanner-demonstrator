@@ -117,7 +117,7 @@ def test_delete_button_only_renders_for_non_running_status(template_text: str):
     """The button must be gated the same way the API gates it (409 on
     'running') — otherwise an operator sees a Delete button that always
     fails on in-flight runs."""
-    assert "r.status !== 'running'" in template_text
+    assert "const deleteBtn = r.status === 'running'" in template_text
     assert 'data-action="delete-run"' in template_text
 
 
