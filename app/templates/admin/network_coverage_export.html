@@ -67,26 +67,25 @@
     .cell-self { background: var(--self); color: var(--pending); }
 
     /* PR-196a — ÖBB alignment heatmap, mirrored into the offline export.
-       Hex values copied from the live matrix's palette in
-       network_coverage.html (body.cov-align-mode-colors .cov-matrix td[...])
-       — keep the two in sync if either palette changes. Self-contained
-       file, so these are inlined here rather than linked from
-       compare_grid.css (whose modal-pill variant differs slightly on
-       purpose — the pill communicates the same tiers as the heatmap
-       against different backgrounds, see that file's own comments).
-       Cells only pick up these colours when body carries
-       .cov-align-mode-colors, toggled by the checkbox below — default
-       OFF so the report's primary legend (status: ok/no-route/error)
-       reads first. */
+       Hex values match compare_grid.css's modal-pill palette (which was
+       already adjusted for WCAG AA contrast during PR-197's Sonar pass —
+       no_overlap/one_sided_oebb/no_data are DARKER than the live matrix's
+       still-unfixed palette in network_coverage.html for that reason; see
+       the follow-up flagged in this PR's description to reconcile the
+       matrix palette too). Self-contained file, so these are inlined
+       here rather than linked from compare_grid.css. Cells only pick up
+       these colours when body carries .cov-align-mode-colors, toggled by
+       the checkbox below — default OFF so the report's primary legend
+       (status: ok/no-route/error) reads first. */
     body.cov-align-mode-colors td[data-alignment-tier="agree"]            { background: #440154 !important; color: #fff; }
     body.cov-align-mode-colors td[data-alignment-tier="mostly_agree"]     { background: #31688e !important; color: #fff; }
     body.cov-align-mode-colors td[data-alignment-tier="partial"]          { background: #35b779 !important; color: #0d2616; }
     body.cov-align-mode-colors td[data-alignment-tier="disagree"]         { background: #fde725 !important; color: #4a3500; }
-    body.cov-align-mode-colors td[data-alignment-tier="no_overlap"]       { background: #e76f51 !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="no_overlap"]       { background: #c4452a !important; color: #fff; }
     body.cov-align-mode-colors td[data-alignment-tier="one_sided_viator"] { background: #b8b8b8 !important; color: #1c1c1c; }
-    body.cov-align-mode-colors td[data-alignment-tier="one_sided_oebb"]   { background: #8a8a8a !important; color: #fff; }
+    body.cov-align-mode-colors td[data-alignment-tier="one_sided_oebb"]   { background: #6e6e6e !important; color: #fff; }
     body.cov-align-mode-colors td[data-alignment-tier="no_service"]      { background: #d8d8d8 !important; color: #4a4a4a; }
-    body.cov-align-mode-colors td[data-alignment-tier="no_data"]         { background: #f0f0f0 !important; color: #8a939d; }
+    body.cov-align-mode-colors td[data-alignment-tier="no_data"]         { background: #f0f0f0 !important; color: #5b6470; }
     table.matrix td { position: relative; }
     .cov-align-badge {
       position: absolute; bottom: 1px; right: 2px; font-size: 8px;
@@ -368,6 +367,18 @@
     return `<span class="pill" style="background:${c.bg};color:${c.fg}">${escapeHTML(status)}</span>`;
   }
 
+  function alignmentSummaryPart(cell) {
+    // Extracted out of openModal so that function's cognitive complexity
+    // stays under Sonar's ceiling — this was the last straw that pushed
+    // it from 15 to 17. Returns null (not a falsy empty string) so the
+    // call site's `if (part)` reads cleanly as "nothing to add".
+    if (!cell.external_alignment_tier) return null;
+    const scoreTxt = cell.external_alignment_score == null
+      ? ''
+      : ` (${cell.external_alignment_score.toFixed(2)})`;
+    return `ÖBB alignment: <code>${escapeHTML(cell.external_alignment_tier)}${scoreTxt}</code>`;
+  }
+
   function openModal(pairKey) {
     const [orig, dest] = pairKey.split(':');
     const cell = CELLS[pairKey];
@@ -385,10 +396,8 @@
     if (cell.best_operators) parts.push(`operators: <code>${escapeHTML(cell.best_operators)}</code>`);
     if (cell.session_ids && cell.session_ids.length) parts.push(`sessions: <code>${escapeHTML(cell.session_ids.join(', '))}</code>`);
     if (cell.error_message) parts.push(`error: <code>${escapeHTML(cell.error_message)}</code>`);
-    if (cell.external_alignment_tier) {
-      const scoreTxt = cell.external_alignment_score != null ? ` (${cell.external_alignment_score.toFixed(2)})` : '';
-      parts.push(`ÖBB alignment: <code>${escapeHTML(cell.external_alignment_tier)}${scoreTxt}</code>`);
-    }
+    const alignmentPart = alignmentSummaryPart(cell);
+    if (alignmentPart) parts.push(alignmentPart);
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
     const body = (cell.trips && cell.trips.length)
       ? cell.trips.map(renderTrip).join('')
