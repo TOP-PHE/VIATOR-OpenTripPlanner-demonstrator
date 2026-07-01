@@ -91,6 +91,26 @@ def test_motis_healthcheck_uses_wget_not_curl():
     assert "curl" not in test_line
 
 
+def test_motis_healthcheck_timeout_tolerates_transient_slowness_under_load():
+    """2026-07-01 eu19 incident: autoheal restarted eu19-transit-motis
+    every ~6min for 2h+ even on an unloaded 18-core host, because the old
+    5s wget timeout / 10s docker timeout misread a session briefly busy
+    with concurrent RAPTOR queries as dead. Both budgets must be wide
+    enough to tolerate that without being infinite (a genuine zombie must
+    still get caught)."""
+    out = render_compose([_StubSession(id="x", engine="motis")])
+    motis_block = out.split("motis-x:")[1].split("\n\n")[0]
+    test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))
+    timeout_line = next(
+        line for line in motis_block.splitlines() if line.lstrip().startswith("timeout:")
+    )
+    assert "--timeout=15" in test_line
+    assert "timeout: 20s" in timeout_line
+    # retries/interval unchanged — only the per-probe budget was widened.
+    assert "retries: 3" in motis_block
+    assert "interval: 30s" in motis_block
+
+
 def test_motis_service_overrides_container_user_to_root():
     """Phase-0.5 spike: the MOTIS image runs as `User: motis` by default.
     Without `user: "0:0"`, the serve container can't map the read-only

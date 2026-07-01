@@ -127,9 +127,20 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
       # so the previous curl-based probe always failed and every MOTIS
       # container reported (unhealthy), preventing docker from auto-
       # restarting MOTIS when the HTTP server actually died.
-      test: ["CMD", "wget", "--spider", "-q", "--timeout=5", "http://localhost:8080/"]
+      #
+      # `--timeout=15` / `timeout: 20s` (was 5s/10s): the 2026-07-01 eu19
+      # incident showed autoheal restarting eu19-transit-motis every ~6min
+      # for 2h+ straight even with a healthy, un-overloaded host (18 cores,
+      # MOTIS pegged at only ~2). Root cause wasn't a dead process — a
+      # handful of concurrent heavy RAPTOR queries on the 19-country graph
+      # occasionally made the HTTP layer too slow to answer a trivial `GET
+      # /` within 5s, which 3 consecutive misses (`retries: 3`) then read
+      # as "dead". Widening the per-probe budget stops "briefly busy doing
+      # real work" from being misread as "hung" without materially
+      # softening genuine-zombie detection (still ~3 x 30s intervals).
+      test: ["CMD", "wget", "--spider", "-q", "--timeout=15", "http://localhost:8080/"]
       interval: 30s
-      timeout: 10s
+      timeout: 20s
       start_period: {start_period}s
       retries: 3
     labels:
