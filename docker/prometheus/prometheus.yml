@@ -17,6 +17,21 @@ global:
   external_labels:
     cluster: viator-vps
 
+# Alert rules. First rule file: autoheal.yml, fires when willfarrell/autoheal
+# (docker/docker-compose.yml) restarts the same container more than a few
+# times in an hour — a signal the watchdog is papering over a real bug
+# rather than recovering a transient blip.
+#
+# NOTE: no Alertmanager is deployed and no Grafana alerting/notification
+# channel is provisioned yet (see docker/grafana/provisioning/ — only
+# dashboards/ and datasources/ exist). A firing alert here is visible at
+# /prometheus/alerts and in Grafana's "Alerting" tab (it already has this
+# Prometheus instance as a datasource), but nobody gets paged externally
+# until a contact point (SMTP/webhook) is configured. Flagged, not solved,
+# by this rule file alone.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
   - job_name: viator-web
     metrics_path: /metrics

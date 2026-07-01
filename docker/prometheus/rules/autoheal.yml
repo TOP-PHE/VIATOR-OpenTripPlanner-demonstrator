@@ -1,0 +1,56 @@
+# Alert on excessive autoheal-driven restarts.
+#
+# willfarrell/autoheal (docker/docker-compose.yml, added by ops PR #199)
+# restarts any container carrying the `viator.autoheal="true"` label when
+# docker's healthcheck reports it unhealthy. It is a SAFETY NET, not a fix
+# — if a container is restarting repeatedly, autoheal papers over a real
+# problem (a stuck MOTIS import, a memory leak, a crash-loop) rather than
+# solving it. The 2026-06 eu19-transit-motis incident (container stuck at
+# 99% CPU for ~10h with no restart, because nothing was acting on the
+# unhealthy state) motivated the watchdog; this alert is the follow-up
+# that makes sure the watchdog itself doesn't silently mask a recurring
+# problem the same way.
+#
+# Metric: cadvisor's `container_start_time_seconds` is a gauge holding the
+# container's most recent start time as a unix timestamp. `changes(...[1h])`
+# counts how many times that gauge's VALUE changed within the window —
+# each restart produces a new start timestamp, so this is a restart
+# counter without cadvisor needing to expose one directly.
+#
+# Label requirement: `container_label_viator_autoheal="true"` only appears
+# on cadvisor's output once cadvisor is told to whitelist the
+# `viator.autoheal` docker label (see docker-compose.yml cadvisor service
+# `--whitelisted_container_labels`). Without that flag this alert's PromQL
+# matches zero series — silently, not with an error.
+#
+# NOTE: no Alertmanager and no Grafana alerting/contact-point is
+# provisioned yet. This alert will evaluate and show as "firing" at
+# /prometheus/alerts and in Grafana's Alerting tab (Prometheus is already
+# wired as a Grafana datasource), but nothing pages externally until a
+# notification channel is configured. That's a deliberate, flagged gap —
+# see the PR this file ships in for the two options considered
+# (Alertmanager vs. Grafana-native alerting) and what each still needs.
+
+groups:
+  - name: viator-autoheal
+    rules:
+      - alert: AutohealExcessiveRestarts
+        # Threshold of 3 restarts/hour is a starting point, not a tuned
+        # value — whoever owns the paging policy should revisit it once
+        # there's a baseline of how often healthy containers restart for
+        # unrelated reasons (deploys, manual `docker compose up -d`, etc.)
+        expr: sum by (name) (changes(container_start_time_seconds{container_label_viator_autoheal="true"}[1h])) > 3
+        # Wait 5m before firing so a single evaluation right after a burst
+        # of legitimate restarts (e.g. a deploy recreating several
+        # autoheal-labelled containers back to back) doesn't page anyone.
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Container {{ $labels.name }} restarted more than 3 times in the last hour via autoheal"
+          description: >-
+            willfarrell/autoheal has restarted {{ $labels.name }}
+            {{ $value }} times in the past hour. This is a persistent
+            unhealthy condition, not a transient blip — investigate the
+            container's logs and healthcheck rather than relying on
+            autoheal to keep recovering it.
