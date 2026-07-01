@@ -1399,9 +1399,18 @@ async function openDetailModal(originId, destId, result) {
   const oLon = orig ? coord(orig.lon) : null;
   const dLat = dest ? coord(dest.lat) : null;
   const dLon = dest ? coord(dest.lon) : null;
+  // Coverage hubs don't carry a UIC today (no column, no join to
+  // master_stations), so orig.uic/dest.uic are always undefined and
+  // these resolve to ''. Wiring them through now is a no-op in behaviour
+  // but means the link picks up UIC-based routing automatically the
+  // moment hub rows gain a uic field — same "value or empty string"
+  // convention already used for the autocomplete-pick handler in
+  // journey.html (`uic.value = s.uic || '';`).
+  const oUic = orig && orig.uic ? encodeURIComponent(orig.uic) : '';
+  const dUic = dest && dest.uic ? encodeURIComponent(dest.uic) : '';
   const rerunLink =
     orig && dest && oLat !== null && oLon !== null && dLat !== null && dLon !== null
-      ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${oLat}&from_lon=${oLon}&from_name=${encodeURIComponent(orig.name)}&to_lat=${dLat}&to_lon=${dLon}&to_name=${encodeURIComponent(dest.name)}${departParam}" target="_blank">↗ Re-run live in the journey UI</a></p>`
+      ? `<p style="margin: 0.6rem 0 0; font-size: 0.85rem"><a href="/journey?from_lat=${oLat}&from_lon=${oLon}&from_name=${encodeURIComponent(orig.name)}&from_uic=${oUic}&to_lat=${dLat}&to_lon=${dLon}&to_name=${encodeURIComponent(dest.name)}&to_uic=${dUic}${departParam}" target="_blank">↗ Re-run live in the journey UI</a></p>`
       : '';
   const modalBody = document.getElementById('cov-modal-body');
   modalBody.innerHTML = '<p class="hint">Loading itineraries…</p>' + rerunLink;

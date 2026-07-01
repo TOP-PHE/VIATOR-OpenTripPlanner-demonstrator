@@ -303,3 +303,43 @@ def test_rerun_link_uses_coerced_coord_vars_not_raw_hub_fields(template_text: st
         "`orig.lat`. Use the coerced `oLat` local instead — see the "
         "v0.1.43.28 empty-prefill bug."
     )
+
+
+# ─────────────────── Re-run link UIC passthrough (Scope A) ───────────────────
+# Coverage hubs carry no UIC field today (no column on NetworkCoverageHub,
+# no join to master_stations) — so orig.uic/dest.uic are always undefined
+# and oUic/dUic below always resolve to ''. This is intentionally a no-op
+# in behaviour: it future-proofs the Re-run link so the moment hub rows
+# gain a `uic` value, journey.html's existing UIC-based routing engages
+# automatically without a second template change.
+
+
+def test_rerun_link_includes_uic_params(template_text: str):
+    """The Re-run link must send from_uic/to_uic alongside from_lat/
+    from_lon so journey.html's setPair() can populate the hidden
+    #from-uic/#to-uic fields — those feed UIC-based station routing on
+    the backend, not just coordinate routing. Missing these params
+    means coverage-hub re-runs always fall back to raw-coordinate
+    matching even when a hub eventually carries a UIC."""
+    assert "from_uic=${oUic}" in template_text, (
+        "Re-run link href is missing &from_uic=${oUic} — without it, "
+        "journey.html's prefill never populates #from-uic, and the "
+        "backend always falls back to coordinate-only routing for "
+        "coverage-hub re-runs even once hubs carry a UIC."
+    )
+    assert "to_uic=${dUic}" in template_text
+
+
+def test_rerun_link_uic_locals_use_value_or_empty_string_convention(template_text: str):
+    """oUic/dUic must follow the `s.uic || ''` convention already
+    established in journey.html's autocomplete-pick handler — never
+    interpolate a raw possibly-undefined orig.uic/dest.uic directly,
+    which would repeat the exact "undefined"-string bug the coord
+    guard above was written to fix."""
+    assert "orig && orig.uic ? encodeURIComponent(orig.uic) : ''" in template_text, (
+        "Missing (or changed) the oUic derivation — must guard on "
+        "`orig && orig.uic` before encoding, else a hub with no uic "
+        "field produces the literal string 'undefined' in the URL "
+        "again (same failure class as the v0.1.43.28 coord bug)."
+    )
+    assert "dest && dest.uic ? encodeURIComponent(dest.uic) : ''" in template_text
