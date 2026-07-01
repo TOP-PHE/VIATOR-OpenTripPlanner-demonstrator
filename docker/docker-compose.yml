@@ -30,6 +30,45 @@ services:
       web:
         condition: service_healthy   # audit-2026-05 #8: don't proxy until uvicorn is actually ready
 
+  # willfarrell/autoheal watches every container carrying the label
+  # `viator.autoheal="true"` and restarts it when docker reports
+  # (unhealthy). Opt-in by label so postgres and other stateful services
+  # are never touched — only stateless serve containers (web, per-session
+  # motis-*/otp-*) get the label. Motivated by the 2026-06 eu19-transit-motis
+  # incident: MOTIS container reported (unhealthy) for ~10h at 99% CPU and
+  # docker doesn't auto-restart on unhealthy alone (that's a k8s-ism, not a
+  # docker one) — a watchdog is the missing piece.
+  #
+  # Socket mounted `:ro` — willfarrell/autoheal only needs POST
+  # /containers/{id}/restart, which the daemon still allows over a
+  # read-only socket mount (Docker ACLs are daemon-level, not fd-level).
+  # Matches promtail's :ro pattern below; least privilege among the four
+  # containers that see /var/run/docker.sock in this file (worker RW,
+  # cadvisor RW, promtail RO, autoheal RO).
+  #
+  # Autoheal itself carries NO viator.autoheal label — a watchdog restarting
+  # itself on its own healthcheck bounce is a classic self-heal loop.
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    restart: unless-stopped
+    environment:
+      # Opt-in mode: only touch containers carrying the label below set to
+      # "true". The default (AUTOHEAL_CONTAINER_LABEL=autoheal, value=true)
+      # would restart anything labelled `autoheal=true` on the host, which
+      # collides with other stacks; we scope to our namespace.
+      AUTOHEAL_CONTAINER_LABEL: viator.autoheal
+      # Poll cadence — 10s picks up an unhealthy flip within one interval
+      # of docker marking it (docker checks every 30s per our service
+      # healthchecks; autoheal polling faster than that costs nothing).
+      AUTOHEAL_INTERVAL: 10
+      # Delay after container start before autoheal considers it — we set
+      # to 0 because our services already declare `start_period` (300-600s
+      # on OTP/MOTIS) in their own healthcheck blocks, so docker won't
+      # report unhealthy until the grace period is over.
+      AUTOHEAL_START_PERIOD: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
   web:
     # Pull from GHCR by default; the `build:` stanza is the fallback for local
     # dev and for VPSes that prefer building over pulling. `VIATOR_VERSION`
@@ -89,6 +128,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    labels:
+      # Opt into the autoheal watchdog defined above. The image's built-in
+      # HEALTHCHECK (curl /healthz/version) is what autoheal watches for the
+      # (unhealthy) flip; a stall auto-restarts within one poll (10s).
+      viator.autoheal: "true"
 
   worker:
     image: ghcr.io/top-phe/viator-web:${VIATOR_VERSION:-latest}
