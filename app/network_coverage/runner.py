@@ -29,7 +29,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
@@ -1456,6 +1456,34 @@ async def _run_external_verify_sweep(
     return counters
 
 
+# 2026-07-01 eu19 incident: a MOTIS/OTP session that flips unhealthy
+# mid-run gets killed and takes 90-180s to cold-boot back up (see
+# CLAUDE.md). Before this retry, every pair scheduled during that window
+# failed *instantly* with httpx.ConnectError (the port simply isn't
+# listening yet) and got persisted as a wrong 'error' cell — turning one
+# transient container bounce into dozens of misleading matrix cells.
+# Growing backoff gives the session a real chance to come back before
+# giving up; cost is near-zero for the overwhelming common case (no
+# ConnectError at all, so no retry ever happens).
+_CONNECT_RETRY_DELAYS_S: tuple[float, ...] = (5.0, 15.0, 40.0)
+
+
+async def _call_with_connect_retry[T](fetch: Callable[[], Awaitable[T]]) -> T:
+    """Retry `fetch()` on `httpx.ConnectError` only, with growing backoff.
+
+    Every other exception (timeout, HTTP error, bad response shape, ...)
+    propagates on the first attempt — those aren't caused by a session
+    bounce and retrying wouldn't change the outcome, it would just make a
+    genuinely-broken pair take longer to report as such.
+    """
+    for delay_s in _CONNECT_RETRY_DELAYS_S:
+        try:
+            return await fetch()
+        except httpx.ConnectError:
+            await asyncio.sleep(delay_s)
+    return await fetch()
+
+
 async def _execute_pair(
     *,
     run_id: uuid.UUID,
@@ -1499,10 +1527,10 @@ async def _execute_pair(
     raw: dict[str, Any] = {}
     trips: list[dict[str, Any]] = []
 
-    try:
+    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if window is not None:
             # PR-3 — K-slot dispatch via the resolved per-run window.
-            raw, trips = await _fetch_plan_sliced(
+            return await _fetch_plan_sliced(
                 engine=engine,
                 session_id=session_id,
                 origin=origin,
@@ -1510,20 +1538,22 @@ async def _execute_pair(
                 window=window,
                 cfg=cfg,
             )
-        else:
-            raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
-                session_id=session_id,
-                from_lat=origin.lat,
-                from_lon=origin.lon,
-                to_lat=dest.lat,
-                to_lon=dest.lon,
-                when=depart_at,
-                timeout_ms=cfg.pair_timeout_ms,
-                # Legacy path — operator-tunable via COVERAGE_NUM_ITINERARIES
-                # / COVERAGE_SEARCH_WINDOW_SECONDS.
-                num_itineraries=cfg.num_itineraries,
-                search_window_seconds=cfg.search_window_seconds,
-            )
+        return await planner_dispatch.planner_for_engine(engine).fetch_plan(
+            session_id=session_id,
+            from_lat=origin.lat,
+            from_lon=origin.lon,
+            to_lat=dest.lat,
+            to_lon=dest.lon,
+            when=depart_at,
+            timeout_ms=cfg.pair_timeout_ms,
+            # Legacy path — operator-tunable via COVERAGE_NUM_ITINERARIES
+            # / COVERAGE_SEARCH_WINDOW_SECONDS.
+            num_itineraries=cfg.num_itineraries,
+            search_window_seconds=cfg.search_window_seconds,
+        )
+
+    try:
+        raw, trips = await _call_with_connect_retry(_fetch)
         response_ms = int((time.monotonic() - started) * 1000)
         num_itineraries = len(trips)
         if trips:
@@ -1682,9 +1712,10 @@ async def _query_one_session_for_pair(
     the legacy single fetch_plan call is used."""
     cfg = cfg or CoverageConfig()
     sub_start = time.monotonic()
-    try:
+
+    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if window is not None:
-            raw, trips = await _fetch_plan_sliced(
+            return await _fetch_plan_sliced(
                 engine=engine,
                 session_id=sid,
                 origin=origin,
@@ -1692,18 +1723,20 @@ async def _query_one_session_for_pair(
                 window=window,
                 cfg=cfg,
             )
-        else:
-            raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
-                session_id=sid,
-                from_lat=origin.lat,
-                from_lon=origin.lon,
-                to_lat=dest.lat,
-                to_lon=dest.lon,
-                when=depart_at,
-                timeout_ms=cfg.pair_timeout_ms,
-                num_itineraries=cfg.num_itineraries,
-                search_window_seconds=cfg.search_window_seconds,
-            )
+        return await planner_dispatch.planner_for_engine(engine).fetch_plan(
+            session_id=sid,
+            from_lat=origin.lat,
+            from_lon=origin.lon,
+            to_lat=dest.lat,
+            to_lon=dest.lon,
+            when=depart_at,
+            timeout_ms=cfg.pair_timeout_ms,
+            num_itineraries=cfg.num_itineraries,
+            search_window_seconds=cfg.search_window_seconds,
+        )
+
+    try:
+        raw, trips = await _call_with_connect_retry(_fetch)
         response_ms = int((time.monotonic() - sub_start) * 1000)
         sub_status = "ok" if trips else "no_route"
         return sid, sub_status, raw, trips, response_ms
