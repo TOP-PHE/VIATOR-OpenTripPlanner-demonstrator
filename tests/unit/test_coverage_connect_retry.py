@@ -89,6 +89,28 @@ async def test_gives_up_and_raises_after_exhausting_all_retries(_no_real_sleep):
 
 
 @pytest.mark.asyncio
+async def test_retries_on_remote_protocol_error_then_succeeds(_no_real_sleep):
+    """2026-07-02 — a session bounce lands mid-request instead of before
+    it: MOTIS/OTP accepts the TCP connection then drops it without
+    replying, which httpx surfaces as RemoteProtocolError rather than
+    ConnectError. Same retry treatment applies."""
+    attempts = 0
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return "recovered"
+
+    result = await runner._call_with_connect_retry(_fetch)
+
+    assert result == "recovered"
+    assert attempts == 2
+    assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+
+
+@pytest.mark.asyncio
 async def test_does_not_retry_non_connect_errors(_no_real_sleep):
     """A timeout, a bad response, or any other failure isn't caused by a
     session bounce — retrying wouldn't change the outcome, it would just
