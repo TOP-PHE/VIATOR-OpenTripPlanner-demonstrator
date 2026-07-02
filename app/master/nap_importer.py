@@ -622,8 +622,9 @@ async def fetch_datasets(
     # `_sanitize_for_log` already strips/escapes control characters and
     # caps length before this reaches the log record. The rule's taint
     # tracker doesn't recognise a project-local sanitizer function, only
-    # a fixed set of library calls. NOSONAR suppresses the alarm on this
-    # line only — the argument passed is the sanitized value, not `nap_url`.
+    # a fixed set of library calls — the suppression below only silences
+    # this one alarm; the argument passed is the sanitized value, not
+    # the raw `nap_url`.
     log.info(
         "fetching NAP catalogue from %s%s",  # NOSONAR python:S5145
         _sanitize_for_log(nap_url),
