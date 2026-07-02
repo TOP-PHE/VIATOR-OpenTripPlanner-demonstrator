@@ -87,10 +87,10 @@
                   <button type="button" class="secondary" data-action="import-from-nap" title="Bulk-import providers from a National Access Point catalogue (e.g. transport.data.gouv.fr)">⇪ Import from NAP</button>
                 </div>
               </fieldset>
-              <label>OSM PBF URL <code>(.osm.pbf)</code></label>
+              <label for="osm_pbf">OSM PBF URL <code>(.osm.pbf)</code></label>
               {# Full-width so a long Geofabrik URL is readable without
                  scrolling inside the field (UX, v0.1.40). #}
-              <input type="url" name="osm_pbf" style="width: 100%; box-sizing: border-box"
+              <input type="url" id="osm_pbf" name="osm_pbf" style="width: 100%; box-sizing: border-box"
                      placeholder="https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf">
               <p class="hint" style="margin-top: 0.25rem">
                 Must cover every region your providers reach. France-wide PBF + IDFM
