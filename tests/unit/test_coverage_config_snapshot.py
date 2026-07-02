@@ -16,6 +16,7 @@ tests pin:
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import patch
 
 import pytest
@@ -44,7 +45,7 @@ def test_coverage_config_is_frozen():
     """Frozen so a per-pair helper that accidentally mutates the
     snapshot doesn't poison the rest of the run."""
     cfg = runner.CoverageConfig()
-    with pytest.raises(Exception):  # noqa: B017 — dataclasses raises FrozenInstanceError, type varies by Python version
+    with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.num_itineraries = 1  # type: ignore[misc]
 
 

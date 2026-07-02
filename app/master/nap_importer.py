@@ -618,8 +618,15 @@ async def fetch_datasets(
     # value chain are obviously sanitised.
     safe_url = _validate_safe_http_url(fetch_url)
 
+    # SonarCloud's S5145 ("log-injection") is a false positive here:
+    # `_sanitize_for_log` already strips/escapes control characters and
+    # caps length before this reaches the log record. The rule's taint
+    # tracker doesn't recognise a project-local sanitizer function, only
+    # a fixed set of library calls — the suppression below only silences
+    # this one alarm; the argument passed is the sanitized value, not
+    # the raw `nap_url`.
     log.info(
-        "fetching NAP catalogue from %s%s",
+        "fetching NAP catalogue from %s%s",  # NOSONAR python:S5145
         _sanitize_for_log(nap_url),
         " (authenticated)" if nap_auth is not None else "",
     )
