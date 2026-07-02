@@ -1467,9 +1467,21 @@ async def _run_external_verify_sweep(
 # ConnectError at all, so no retry ever happens).
 _CONNECT_RETRY_DELAYS_S: tuple[float, ...] = (5.0, 15.0, 40.0)
 
+_CONNECT_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    # 2026-07-02 — eu19 sweep post-healthcheck-fix still showed a handful
+    # of "Server disconnected without sending a response" failures: the
+    # TCP connection is accepted but MOTIS/OTP drops it before replying,
+    # which surfaces as RemoteProtocolError rather than ConnectError. Same
+    # class of transient session-bounce symptom (a restart landing mid-
+    # request instead of before it), so it gets the same retry treatment.
+    httpx.RemoteProtocolError,
+)
+
 
 async def _call_with_connect_retry[T](fetch: Callable[[], Awaitable[T]]) -> T:
-    """Retry `fetch()` on `httpx.ConnectError` only, with growing backoff.
+    """Retry `fetch()` on connection-level session-bounce errors only
+    (`_CONNECT_RETRY_EXCEPTIONS`), with growing backoff.
 
     Every other exception (timeout, HTTP error, bad response shape, ...)
     propagates on the first attempt — those aren't caused by a session
@@ -1479,7 +1491,7 @@ async def _call_with_connect_retry[T](fetch: Callable[[], Awaitable[T]]) -> T:
     for delay_s in _CONNECT_RETRY_DELAYS_S:
         try:
             return await fetch()
-        except httpx.ConnectError:
+        except _CONNECT_RETRY_EXCEPTIONS:
             await asyncio.sleep(delay_s)
     return await fetch()
 
