@@ -323,10 +323,17 @@
             <input type="text" id="hub-short" required maxlength="16">
           </label>
           <label>Latitude
-            <input type="number" step="0.000001" id="hub-lat" required>
+            <!-- step="any" — a fixed step like 0.000001 rejects any value
+                 that doesn't land exactly on that 6-decimal grid. Coords
+                 pulled from a MOTIS/OTP trip result routinely carry more
+                 (or fewer, with float round-trip noise) decimal digits,
+                 which tripped the browser's own step-mismatch validation
+                 and surfaced a confusing "wrong coordinate" error with a
+                 truncated suggested value the operator never typed. -->
+            <input type="number" step="any" id="hub-lat" required>
           </label>
           <label>Longitude
-            <input type="number" step="0.000001" id="hub-lon" required>
+            <input type="number" step="any" id="hub-lon" required>
           </label>
           <label>Tier
             <select id="hub-tier">
