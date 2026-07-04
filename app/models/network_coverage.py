@@ -318,14 +318,20 @@ class NetworkCoverageHub(Base):
                editor convention is uppercase 2-letter; we don't enforce
                via CHECK because future codes (e.g. "EU" for cross-
                border placeholders) shouldn't break the schema.
-      region   free-form string. Used by the matrix CSS to colour
-               row/column headers — keep the existing
-               paris/NE/CE/SE/SW/W/Center vocabulary for FR hubs so
-               the historical matrix aesthetic is preserved.
+      region   free-form string, informational only (shown in the
+               manage-hubs UI). No longer drives matrix styling — the
+               country-band header (added alongside `modes` below)
+               superseded the old per-region `th` background tint.
       tier     'main' | 'regional'. Operator-meaningful split: main =
                TGV/IC headline city, regional = TER halt or smaller
                commuter city used for stress-testing. Surfaces in the
                UI as separate sections under each country header.
+      modes    nullable, compact joined code like "R+M" (Rail + Metro).
+               NULL = not yet classified, renders as "?" in the matrix's
+               type band. Populated by a separate classification job
+               (GTFS/NeTEx route_type cross-reference, falling back to
+               historical coverage-run results), not set at hub-create
+               time.
     """
 
     __tablename__ = "network_coverage_hubs"
@@ -347,6 +353,7 @@ class NetworkCoverageHub(Base):
     country: Mapped[str] = mapped_column(String(2), nullable=False)
     region: Mapped[str | None] = mapped_column(String(40))
     tier: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'main'"))
+    modes: Mapped[str | None] = mapped_column(String(20))
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lon: Mapped[float] = mapped_column(Float, nullable=False)
     # Soft-delete flag. UI hides is_active=false by default; admin can

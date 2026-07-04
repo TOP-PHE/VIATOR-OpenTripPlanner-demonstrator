@@ -95,6 +95,7 @@ class HubInfo(BaseModel):
     region: str | None = None
     country: str = "FR"
     tier: str = "main"
+    modes: str | None = None
     lat: float
     lon: float
     is_active: bool = True
@@ -111,6 +112,9 @@ class HubCreate(BaseModel):
     country: str = Field(min_length=2, max_length=2, description="ISO 3166-1 alpha-2 (uppercase)")
     region: str | None = Field(default=None, max_length=40)
     tier: str = Field(default="main", pattern=r"^(main|regional)$")
+    # Left unset at create time — populated later by the classification
+    # job (or a manual edit) once GTFS/NeTEx route_type data is known.
+    modes: str | None = Field(default=None, max_length=20)
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     sort_order: int = Field(default=100, ge=0, le=10_000)
@@ -125,6 +129,7 @@ class HubUpdate(BaseModel):
     country: str | None = Field(default=None, min_length=2, max_length=2)
     region: str | None = Field(default=None, max_length=40)
     tier: str | None = Field(default=None, pattern=r"^(main|regional)$")
+    modes: str | None = Field(default=None, max_length=20)
     lat: float | None = Field(default=None, ge=-90, le=90)
     lon: float | None = Field(default=None, ge=-180, le=180)
     sort_order: int | None = Field(default=None, ge=0, le=10_000)
@@ -483,6 +488,7 @@ def list_hubs(
                 region=r.region,
                 country=r.country,
                 tier=r.tier,
+                modes=r.modes,
                 lat=r.lat,
                 lon=r.lon,
                 is_active=r.is_active,
@@ -527,6 +533,7 @@ def create_hub(
         country=body.country.upper(),
         region=body.region,
         tier=body.tier,
+        modes=body.modes,
         lat=body.lat,
         lon=body.lon,
         sort_order=body.sort_order,
@@ -789,6 +796,70 @@ def _fetch_trips_by_search(
     return out
 
 
+# Country → hue for the matrix's country band. MUST stay in sync with
+# COUNTRY_HUES in network_coverage.html's <script> — Jinja (this file,
+# server-rendered export) and the live matrix's client-side JS render
+# the same header band independently and have no shared runtime to pull
+# a single source of truth from. Same tradeoff already accepted for the
+# viridis alignment palette (see CLAUDE.md's palette-reconciliation
+# note); if you change one side, change the other.
+_COUNTRY_HUES: dict[str, int] = {
+    "AT": 160,
+    "BE": 172,
+    "CH": 185,
+    "CZ": 197,
+    "DE": 209,
+    "DK": 222,
+    "ES": 234,
+    "FR": 246,
+    "GB": 259,
+    "HU": 271,
+    "IT": 283,
+    "NL": 296,
+    "NO": 308,
+    "PL": 320,
+    "SE": 333,
+}
+
+
+def _country_color(country: str) -> str:
+    hue = _COUNTRY_HUES.get(country)
+    return "#5B6B82" if hue is None else f"hsl({hue}, 48%, 40%)"
+
+
+def _annotate_hubs_with_country_bands(
+    hubs: list[HubInfo],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pre-computes what the export template needs to render the country
+    band without doing any previtem/lookahead logic in Jinja: each hub
+    dict gets `band_color` always, and `country_rowspan` only on the
+    first hub of its country's run (mirrors the live matrix's rowspan
+    merge). Also returns the column-axis runs for the header row.
+
+    Hubs arrive already sorted by country (see `_resolve_hubs`), so
+    "consecutive same country" is the whole run, not accidental
+    adjacency.
+    """
+    annotated: list[dict[str, Any]] = []
+    col_runs: list[dict[str, Any]] = []
+    for i, hub in enumerate(hubs):
+        row = hub.model_dump()
+        row["band_color"] = _country_color(hub.country)
+        is_first_of_run = i == 0 or hubs[i - 1].country != hub.country
+        if is_first_of_run:
+            span = 1
+            j = i + 1
+            while j < len(hubs) and hubs[j].country == hub.country:
+                span += 1
+                j += 1
+            row["country_rowspan"] = span
+            col_runs.append({"country": hub.country, "span": span, "color": row["band_color"]})
+        else:
+            row["country_rowspan"] = None
+        annotated.append(row)
+    return annotated, col_runs
+
+
 def _build_export_context(
     *,
     run: Any,
@@ -855,9 +926,11 @@ def _build_export_context(
         "error_pairs": run.error_pairs,
         "created_at": run.started_at.isoformat() if run.started_at else None,
     }
+    annotated_hubs, country_col_runs = _annotate_hubs_with_country_bands(hubs)
     return {
         "run": run_meta,
-        "hubs": [h.model_dump() for h in hubs],
+        "hubs": annotated_hubs,
+        "country_col_runs": country_col_runs,
         "cells": cells,
     }
 
@@ -1335,6 +1408,7 @@ def _hub_to_info(hub: NetworkCoverageHub) -> HubInfo:
         region=hub.region,
         country=hub.country,
         tier=hub.tier,
+        modes=hub.modes,
         lat=hub.lat,
         lon=hub.lon,
         is_active=hub.is_active,
