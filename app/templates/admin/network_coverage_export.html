@@ -441,6 +441,16 @@
     return `ÖBB alignment: <code>${escapeHTML(cell.external_alignment_tier)}${scoreTxt}</code>`;
   }
 
+  function renderModalBody(cell) {
+    const trips = cell.trips || [];
+    if (!trips.length) return '<div class="empty-trips">No itineraries recorded for this cell.</div>';
+    const truncated = cell.num_itineraries != null && cell.num_itineraries > trips.length;
+    const note = truncated
+      ? `<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — the export caps itinerary detail per cell to keep the report a manageable size.</p>`
+      : '';
+    return note + trips.map(renderTrip).join('');
+  }
+
   function openModal(pairKey) {
     const [orig, dest] = pairKey.split(':');
     const cell = CELLS[pairKey];
@@ -461,15 +471,7 @@
     const alignmentPart = alignmentSummaryPart(cell);
     if (alignmentPart) parts.push(alignmentPart);
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
-    const trips = cell.trips || [];
-    const truncated = cell.num_itineraries != null && cell.num_itineraries > trips.length;
-    const note = truncated
-      ? `<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — the export caps itinerary detail per cell to keep the report a manageable size.</p>`
-      : '';
-    const body = trips.length
-      ? note + trips.map(renderTrip).join('')
-      : '<div class="empty-trips">No itineraries recorded for this cell.</div>';
-    document.getElementById('modal-body').innerHTML = body;
+    document.getElementById('modal-body').innerHTML = renderModalBody(cell);
     document.getElementById('modal').hidden = false;
   }
 
