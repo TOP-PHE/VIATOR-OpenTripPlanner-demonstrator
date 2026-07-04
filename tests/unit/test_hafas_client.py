@@ -107,9 +107,12 @@ def test_index_operators_extracts_name_id() -> None:
         ("RAIL", "RAIL"),
         ("", "TRANSIT"),  # empty falls through to TRANSIT
         ("CUSTOM-MODE", "CUSTOM-MODE"),  # unrecognised pass-through (upper)
+        (None, "TRANSIT"),  # missing category
+        (7, "7"),  # HAFAS sometimes sends a numeric product code, not a string
+        (0, "TRANSIT"),  # falsy int must not crash str(cat or "").upper()
     ],
 )
-def test_map_cat_to_mode(category: str, expected_mode: str) -> None:
+def test_map_cat_to_mode(category: str | int | None, expected_mode: str) -> None:
     """Map various HAFAS product categories to VIATOR's mode
     vocabulary. The pass-through case is deliberate — a new category
     we haven't classified should still be visible in diagnostics

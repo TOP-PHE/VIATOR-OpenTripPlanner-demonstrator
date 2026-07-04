@@ -101,6 +101,27 @@ def test_translate_hafas_error_unknown_falls_through() -> None:
     assert "H9999" in msg
 
 
+@pytest.mark.parametrize(
+    ("cat", "expected_mode"),
+    [
+        ("RJ", "RAIL"),
+        ("BUS", "BUS"),
+        ("Tram", "TRAM"),
+        (None, "TRANSIT"),
+        # HAFAS occasionally sends a numeric product code instead of a
+        # string abbreviation — this was crashing every verify-sweep
+        # call for the affected products with AttributeError: 'int'
+        # object has no attribute 'upper', silently caught per-cell as
+        # external_error='sweep_exception'. str(cat or "") must never
+        # raise regardless of the input type.
+        (7, "RAIL"),  # falls through to the big rail bucket, same as any unrecognised string
+        (0, "TRANSIT"),  # falsy int must not crash
+    ],
+)
+def test_hafas_cat_to_mode_handles_non_string_categories(cat, expected_mode: str) -> None:
+    assert external_verify._hafas_cat_to_mode(cat) == expected_mode
+
+
 # ─────────────────────── LocGeoPos body shape ───────────────────────
 
 

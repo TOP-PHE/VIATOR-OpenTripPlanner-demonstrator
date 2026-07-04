@@ -385,7 +385,7 @@ def _hafas_time_to_utc_iso(date: str | None, time_hhmm: str | None) -> str | Non
         return None
 
 
-def _hafas_cat_to_mode(cat: str | None) -> str:
+def _hafas_cat_to_mode(cat: str | int | None) -> str:
     """PR-196a — map HAFAS product category ("ICE", "RJ", "S", "Bus")
     to the same RAIL/BUS/TRAM/SUBWAY/FERRY vocabulary VIATOR's OTP /
     MOTIS clients emit. Matches `app.journey.hafas_client._map_cat_to_mode`
@@ -397,7 +397,12 @@ def _hafas_cat_to_mode(cat: str | None) -> str:
     coverage subpackage free of a journey-package import (cyclic risk —
     journey already imports `external_verify` for the HAFAS adapter).
     """
-    cat_upper = (cat or "").upper()
+    # HAFAS occasionally returns `cat` as an int (a numeric product code)
+    # rather than a string abbreviation — str() first so `.upper()` never
+    # raises AttributeError on those responses (was crashing every
+    # verify-sweep call for the affected products, silently caught
+    # per-cell as external_error='sweep_exception').
+    cat_upper = str(cat or "").upper()
     if not cat_upper:
         return "TRANSIT"
     if "BUS" in cat_upper:

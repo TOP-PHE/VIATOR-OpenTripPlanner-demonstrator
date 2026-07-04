@@ -403,7 +403,7 @@ def _enrich_transit_leg(
         leg["agency_id"] = op.get("id")
 
 
-def _map_cat_to_mode(cat: str) -> str:
+def _map_cat_to_mode(cat: str | int | None) -> str:
     """Map a HAFAS product category to VIATOR's mode vocabulary.
 
     HAFAS categories are operator-specific shorthand ("ICE", "EC",
@@ -412,7 +412,11 @@ def _map_cat_to_mode(cat: str) -> str:
     categories pass through as upper-cased so they're still visible
     in diagnostics.
     """
-    cat_upper = (cat or "").upper()
+    # HAFAS occasionally returns `cat` as an int (a numeric product code)
+    # rather than a string abbreviation — str() first so `.upper()` never
+    # raises AttributeError on those responses. Mirrors the same fix in
+    # app/network_coverage/external_verify.py's _hafas_cat_to_mode.
+    cat_upper = str(cat or "").upper()
     if not cat_upper:
         return "TRANSIT"
     # Order matters — check the most specific buckets first.
