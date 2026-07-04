@@ -1465,6 +1465,7 @@ function renderRun(run) {
         await navigator.clipboard.writeText(url);
         showToast('success', 'Share link copied — anyone with it can view this report, no login needed.');
       } catch (err) {
+        console.warn('clipboard.writeText failed for share link', err);
         showToast('error', `Couldn't copy automatically — here's the link: ${url}`);
       }
     });
