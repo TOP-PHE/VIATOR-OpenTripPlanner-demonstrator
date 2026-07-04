@@ -182,6 +182,7 @@
     .leg .service { font-family: ui-monospace, "Courier New", monospace; font-size: 0.78rem; color: var(--muted); }
     .leg .agency { font-size: 0.78rem; color: var(--muted); }
     .empty-trips { color: var(--muted); font-style: italic; padding: 1rem 0; }
+    .truncated-note { color: var(--muted); font-style: italic; font-size: 0.85rem; margin: 0 0 0.75rem; }
 
     /* JSON appendix */
     details.raw {
@@ -329,14 +330,20 @@
 </div>
 
 <!-- All data embedded so the file is self-contained. Both the hubs map and
-     the cells map are needed by the click handler to format the modal. -->
+     the cells map are needed by the click handler to format the modal.
+     `run` is tiny (a handful of scalar fields) so embedding it here too
+     costs nothing extra, and lets the raw-data panel below reuse these
+     three parsed objects instead of asking Jinja to serialize `cells`
+     a second time. -->
 <script id="cov-hubs" type="application/json">{{ hubs|tojson }}</script>
 <script id="cov-cells" type="application/json">{{ cells|tojson }}</script>
+<script id="cov-run" type="application/json">{{ run|tojson }}</script>
 
 <script>
 (function () {
   const HUBS = JSON.parse(document.getElementById('cov-hubs').textContent);
   const CELLS = JSON.parse(document.getElementById('cov-cells').textContent);
+  const RUN = JSON.parse(document.getElementById('cov-run').textContent);
   const HUBS_BY_ID = Object.fromEntries(HUBS.map(h => [h.id, h]));
 
   function fmtDuration(s) {
@@ -454,8 +461,13 @@
     const alignmentPart = alignmentSummaryPart(cell);
     if (alignmentPart) parts.push(alignmentPart);
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
-    const body = (cell.trips && cell.trips.length)
-      ? cell.trips.map(renderTrip).join('')
+    const trips = cell.trips || [];
+    const truncated = cell.num_itineraries != null && cell.num_itineraries > trips.length;
+    const note = truncated
+      ? `<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — the export caps itinerary detail per cell to keep the report a manageable size.</p>`
+      : '';
+    const body = trips.length
+      ? note + trips.map(renderTrip).join('')
       : '<div class="empty-trips">No itineraries recorded for this cell.</div>';
     document.getElementById('modal-body').innerHTML = body;
     document.getElementById('modal').hidden = false;
@@ -486,16 +498,30 @@
       document.body.classList.toggle('cov-align-mode-colors', alignToggle.checked);
     });
   }
+
+  // Raw-data panel reuses the RUN/HUBS/CELLS objects already parsed above
+  // instead of having Jinja serialize `cells` a second time server-side.
+  // For a large fanout run `cells` can carry hundreds of thousands of
+  // itinerary legs — a second `tojson(indent=2)` pass over that (plus the
+  // pretty-printing whitespace) was pegging the server's CPU/memory on
+  // every view of this page, whether or not anyone ever opened the panel.
+  // Deferred until the <details> is actually opened, and only computed
+  // once, so the common case (nobody opens it) pays nothing.
+  const rawDetails = document.getElementById('raw-export-details');
+  const rawPre = document.getElementById('raw-export-json');
+  if (rawDetails && rawPre) {
+    rawDetails.addEventListener('toggle', () => {
+      if (rawDetails.open && !rawPre.textContent) {
+        rawPre.textContent = JSON.stringify({ run: RUN, hubs: HUBS, cells: CELLS }, null, 2);
+      }
+    }, { once: false });
+  }
 })();
 </script>
 
-<details class="raw">
+<details class="raw" id="raw-export-details">
   <summary>Raw export data (JSON) — for re-processing or import into other tools</summary>
-  <pre>{
-  "run": {{ run|tojson(indent=2) }},
-  "hubs": {{ hubs|tojson(indent=2) }},
-  "cells": {{ cells|tojson(indent=2) }}
-}</pre>
+  <pre id="raw-export-json"></pre>
 </details>
 
 <footer class="report">

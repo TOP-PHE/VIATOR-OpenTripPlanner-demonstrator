@@ -749,6 +749,22 @@ def _resolve_hubs(db: DbSession) -> list[HubInfo]:
     ]
 
 
+# Cap on how many itineraries per search get full leg detail embedded in
+# the export/share HTML. K-slot coverage (runner.py's `slot_count` x
+# `num_itineraries_per_slot`, 6x10 by default) can legitimately accumulate
+# 50+ deduped itineraries for a single pair — harmless in the DB, but
+# fatal to embed in full for every cell of a large matrix: a real
+# 8742-pair fanout run was found carrying 221k trip rows / ~372MB of raw
+# `legs` JSON, which ballooned to 13+GB and pegged the web process's CPU
+# once Jinja's `tojson` had to serialize it all (twice, before the
+# companion fix that de-duplicated the raw-data panel's own JSON dump).
+# `cells[key].num_itineraries` (from the result row, not this list) still
+# reports the true total, so nothing about the run's own findings is
+# hidden — only how many of them get full leg detail in this view. The
+# modal notes when it's showing a truncated set.
+_MAX_TRIPS_PER_CELL_EXPORT = 10
+
+
 def _fetch_trips_by_search(
     db: DbSession, search_ids: list[uuid.UUID]
 ) -> dict[str, list[dict[str, Any]]]:
@@ -771,6 +787,11 @@ def _fetch_trips_by_search(
     looked correct in tests with synthetic data but failed in production
     because real coverage rows store the *search_id*, not the execution_id.
     Fixed 2026-06-25 after every exported cell came back trip-less.
+
+    Capped at `_MAX_TRIPS_PER_CELL_EXPORT` per search — see that constant's
+    comment. The query still orders by `rank_in_response` first, so the
+    kept trips are always the best-ranked ones regardless of how many
+    executions/slots contributed to a given search.
     """
     if not search_ids:
         return {}
@@ -782,7 +803,10 @@ def _fetch_trips_by_search(
     ).all()
     out: dict[str, list[dict[str, Any]]] = {}
     for search_id, t in rows:
-        out.setdefault(str(search_id), []).append(
+        bucket = out.setdefault(str(search_id), [])
+        if len(bucket) >= _MAX_TRIPS_PER_CELL_EXPORT:
+            continue
+        bucket.append(
             {
                 "rank": t.rank_in_response,
                 "duration_seconds": t.duration_seconds,
