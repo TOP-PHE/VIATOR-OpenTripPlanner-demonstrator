@@ -1388,6 +1388,8 @@ function renderRun(run) {
        href="/api/admin/network-coverage/runs/${escHTML(run.id)}/export.html"
        download
        title="Download a self-contained HTML report of this run. The file embeds every cell's full itinerary detail (legs, operators, train numbers) so it opens offline and you can share it by email.">⬇ Download HTML report</a>
+    <button type="button" class="cov-download" id="cov-share-btn" data-run-id="${escHTML(run.id)}"
+       title="Copy a link anyone can open (no login) to view this same report in their browser — no need to email the file.">🔗 Copy share link</button>
     ${buildRunStatsSubline(run)}
   </div>`;
 
@@ -1451,6 +1453,23 @@ function renderRun(run) {
       renderRun(run);
     });
   });
+
+  // Copy-share-link — /share/coverage/{id} needs no login, unlike the
+  // download link above; the run's own (unguessable) id is the access
+  // control. See app/api/coverage_share.py for the security rationale.
+  const shareBtn = document.getElementById('cov-share-btn');
+  if (shareBtn) {
+    shareBtn.addEventListener('click', async () => {
+      const url = `${location.origin}/share/coverage/${encodeURIComponent(shareBtn.dataset.runId)}`;
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('success', 'Share link copied — anyone with it can view this report, no login needed.');
+      } catch (err) {
+        console.warn('clipboard.writeText failed for share link', err);
+        showToast('error', `Couldn't copy automatically — here's the link: ${url}`);
+      }
+    });
+  }
 }
 
 async function openDetailModal(originId, destId, result) {
