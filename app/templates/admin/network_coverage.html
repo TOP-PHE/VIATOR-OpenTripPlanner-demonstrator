@@ -131,15 +131,55 @@ main {
      status-glyph layout. */
   position: relative;
 }
+/* Country + type header bands. The axis-name row/column (th.hub-label)
+   already existed; these two add a banded frame above/beside it:
+   country (solid color, colspan/rowspan-merged across each country's
+   run of hubs) then type (a lighter tint of the same color, R/T/M/B/C
+   codes). Fixed widths/heights on the country + type bands make the
+   sticky offsets below deterministic — only the last band in each
+   sticky stack (the name row/column) is left auto-sized, since nothing
+   needs to stack past it. */
+:root {
+  --cov-band-country-w: 1.7rem;
+  --cov-band-type-w: 2.9rem;
+  --cov-band-row-h: 1.35rem;
+}
 .cov-matrix thead th {
-  position: sticky; top: 0; z-index: 2; background: #f6f8fa;
+  position: sticky; z-index: 2; background: #f6f8fa;
   font-weight: 600; padding: 0.3rem 0.4rem;
 }
+.cov-matrix thead tr:nth-child(1) th { top: 0; height: var(--cov-band-row-h); }
+.cov-matrix thead tr:nth-child(2) th { top: var(--cov-band-row-h); height: var(--cov-band-row-h); }
+.cov-matrix thead tr:nth-child(3) th { top: calc(var(--cov-band-row-h) * 2); }
 .cov-matrix tbody th {
-  position: sticky; left: 0; z-index: 1; background: #f6f8fa;
+  position: sticky; z-index: 1; background: #f6f8fa;
   text-align: right; font-weight: 600; padding: 0.3rem 0.5rem;
 }
-.cov-matrix thead th:first-child { z-index: 3; }
+.cov-matrix tbody th.cov-band-country { left: 0; width: var(--cov-band-country-w); }
+.cov-matrix tbody th.cov-band-type    { left: var(--cov-band-country-w); width: var(--cov-band-type-w); }
+.cov-matrix tbody th.hub-label        { left: calc(var(--cov-band-country-w) + var(--cov-band-type-w)); }
+/* Corner spacers sit above every other sticky cell in both directions
+   (they're sticky on BOTH axes at once) so nothing scrolls over them. */
+.cov-matrix thead th.cov-corner { left: 0; background: var(--paper); z-index: 4; }
+.cov-matrix thead th:not(.cov-corner):first-of-type { z-index: 3; }
+
+/* `.cov-matrix th.` prefix (not a bare class) is load-bearing: the
+   generic `.cov-matrix thead/tbody th` rules above set a background,
+   and a bare `.cov-band-country` class alone (specificity 0,1,0) loses
+   that fight against `.cov-matrix thead th` (0,1,2) — the color would
+   silently never render. */
+.cov-matrix th.cov-band-country {
+  color: #fff; font-weight: 700; font-size: 0.68rem;
+  letter-spacing: 0.03em; text-transform: uppercase; text-align: center !important;
+  background: var(--band-color);
+}
+.cov-matrix th.cov-band-country.row { writing-mode: vertical-rl; transform: rotate(180deg); padding-inline: 0.2rem; }
+.cov-matrix th.cov-band-type {
+  font-weight: 700; font-size: 0.68rem; text-align: center !important;
+  background: color-mix(in srgb, var(--band-color) 28%, white);
+  color: var(--band-color);
+}
+.cov-matrix th.hub-label[data-has-country] { background: color-mix(in srgb, var(--band-color) 9%, white); }
 .cov-matrix tbody td.diag { background: #d0d7de; }
 /* v0.1.29.4 — explicit dark text on every status background. The default
    inherited body colour was a medium grey that was nearly unreadable
@@ -157,13 +197,6 @@ main {
    secondary to the duration. Replaces the previous opacity:0.7 which
    rendered nearly invisible on the lighter green shades. */
 .cov-matrix tbody td .cov-count-suffix { color: #2a5a3a; font-weight: 400; margin-left: 1px; }
-.cov-matrix .region-paris  th { background: #e8f0fb !important; }
-.cov-matrix .region-NE     th { background: #fff8e1 !important; }
-.cov-matrix .region-CE     th { background: #f0eee9 !important; }
-.cov-matrix .region-Center th { background: #e9f6ec !important; }
-.cov-matrix .region-SE     th { background: #fdecef !important; }
-.cov-matrix .region-SW     th { background: #ddf4ff !important; }
-.cov-matrix .region-W      th { background: #ddebd0 !important; }
 
 /* Per-cell tooltip on hover — shows duration / transfers / operators. */
 .cov-cell-tip {
@@ -655,8 +688,8 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
           <input type="text" name="short" maxlength="16" required>
         </div>
         <div>
-          <label>Region <span class="hint" style="font-weight: normal">(optional, for header colour)</span></label>
-          <input type="text" name="region" maxlength="40">
+          <label for="hub-form-region">Region <span class="hint" style="font-weight: normal">(optional, informational)</span></label>
+          <input type="text" id="hub-form-region" name="region" maxlength="40">
         </div>
       </div>
       <div class="form-row">
@@ -673,6 +706,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
           <input type="number" name="sort_order" value="100" min="0" max="10000">
         </div>
       </div>
+      <label for="hub-form-modes">Transport modes
+        <span class="hint" style="font-weight: normal">(matrix type band — e.g. "R+M"; blank = not yet classified)</span>
+      </label>
+      <input type="text" id="hub-form-modes" name="modes" maxlength="20" placeholder="R, T, M, B, C, or a combination like R+T">
       <p class="hub-form-error" id="hub-form-error"></p>
       <div class="hub-form-actions">
         <button type="button" data-action="hub-modal-close">Cancel</button>
@@ -1348,6 +1385,37 @@ async function refreshRun() {
   }
 }
 
+// Country → hue lookup for the matrix's country band. Fixed, alphabetical
+// assignment (not "whichever countries happen to be in this run") so a
+// given country always renders the same color across every run/session —
+// operators build muscle memory for "AT is violet" instead of it shifting
+// per matrix. Deliberately confined to 160°-345° (teal through magenta) so
+// no country color can be mistaken for the ok/no_route/error cell colors,
+// which all live in the red-orange-green band this range skips entirely.
+// Falls back to --rail-steel for any country not in this list yet.
+const COUNTRY_HUES = {
+  AT: 160, BE: 172, CH: 185, CZ: 197, DE: 209, DK: 222, ES: 234, FR: 246,
+  GB: 259, HU: 271, IT: 283, NL: 296, NO: 308, PL: 320, SE: 333,
+};
+function countryColor(code) {
+  const h = COUNTRY_HUES[code];
+  return h == null ? '#5B6B82' : `hsl(${h}, 48%, 40%)`;
+}
+
+// Groups consecutive hubs sharing the same value at `key` — powers the
+// colspan/rowspan merge on the country band. Hubs already arrive sorted
+// by country from the API, so "consecutive" is the whole country's run,
+// not just accidental adjacency.
+function groupRuns(list, key) {
+  const runs = [];
+  for (const item of list) {
+    const last = runs[runs.length - 1];
+    if (last && last.value === item[key]) last.span++;
+    else runs.push({ value: item[key], span: 1 });
+  }
+  return runs;
+}
+
 function renderRun(run) {
   const main = document.getElementById('cov-main');
   // PR-196a — clear the alignment-mode body class when loading a run
@@ -1394,9 +1462,28 @@ function renderRun(run) {
   </div>`;
 
   // Build the matrix. Rows = origin (read down), columns = destination.
-  const headerRow = '<tr><th></th>' + HUBS.map(h =>
-    `<th class="region-${escHTML(h.region)}" title="${escHTML(h.name)}">${escHTML(h.short)}</th>`
+  // Three header rows (country / type / name) mirror three leading
+  // columns on each body row — see the "Country + type header bands"
+  // CSS block above for the sticky-offset math this layout depends on.
+  const countryColRuns = groupRuns(HUBS, 'country');
+  const bandStyle = h => ` style="--band-color: ${countryColor(h.country)}"`;
+
+  const countryHeaderRow = '<tr>' +
+    '<th class="cov-corner" scope="col" colspan="3" rowspan="2"></th>' +
+    countryColRuns.map(run =>
+      `<th class="cov-band-country" scope="col" colspan="${run.span}" style="--band-color: ${countryColor(run.value)}">${escHTML(run.value)}</th>`
+    ).join('') +
+    '</tr>';
+  const typeHeaderRow = '<tr>' + HUBS.map(h =>
+    `<th class="cov-band-type" scope="col"${bandStyle(h)} title="${escHTML(h.modes || 'not yet classified')}">${escHTML(h.modes || '?')}</th>`
   ).join('') + '</tr>';
+  const nameHeaderRow = '<tr><th class="cov-corner" scope="col" colspan="3"></th>' + HUBS.map(h =>
+    `<th class="hub-label" scope="col" data-has-country title="${escHTML(h.name)}"${bandStyle(h)}>${escHTML(h.short)}</th>`
+  ).join('') + '</tr>';
+  const headerRow = countryHeaderRow + typeHeaderRow + nameHeaderRow;
+
+  const countryRowRuns = groupRuns(HUBS, 'country');
+  let hubIdx = 0;
   const bodyRows = HUBS.map(orig => {
     // PR-E refactor — cell-builder moved to `buildMatrixCellTd` so the
     // status × view-mode × external-verdict matrix lives in one place
@@ -1404,7 +1491,17 @@ function renderRun(run) {
     const cells = HUBS.map(dest =>
       buildMatrixCellTd(orig, dest, cell.get(`${orig.id}|${dest.id}`))
     ).join('');
-    return `<tr class="region-${escHTML(orig.region)}"><th title="${escHTML(orig.name)}">${escHTML(orig.short)}</th>${cells}</tr>`;
+    // Country band th only on the first row of each country's run
+    // (rowspan covers the rest) — same merge the column header does.
+    const isFirstOfRun = hubIdx === 0 || HUBS[hubIdx - 1].country !== orig.country;
+    const countryTh = isFirstOfRun
+      ? `<th class="cov-band-country row" scope="rowgroup" rowspan="${countryRowRuns.find(r => r.value === orig.country).span}" style="--band-color: ${countryColor(orig.country)}">${escHTML(orig.country)}</th>`
+      : '';
+    hubIdx++;
+    return `<tr>${countryTh}` +
+      `<th class="cov-band-type" scope="row"${bandStyle(orig)} title="${escHTML(orig.modes || 'not yet classified')}">${escHTML(orig.modes || '?')}</th>` +
+      `<th class="hub-label" scope="row" data-has-country title="${escHTML(orig.name)}"${bandStyle(orig)}>${escHTML(orig.short)}</th>` +
+      `${cells}</tr>`;
   }).join('');
 
   // v0.1.29 — legend changes with the view mode so it explains what
@@ -1431,6 +1528,11 @@ function renderRun(run) {
     <span style="background:#ffd6cc;padding:0 4px;border-radius:2px">red ⏱</span> = timeout;
     <span style="background:#ffebe9;padding:0 4px;border-radius:2px">red ✗</span> = error.
     Click any cell for the detail.
+    <br>
+    Header bands: the solid color strip groups hubs by country (same country = same color on
+    every run); the row beneath it shows transport modes serving that station —
+    <code>R</code>=Rail, <code>T</code>=Tram, <code>M</code>=Metro, <code>B</code>=Bus,
+    <code>C</code>=Coach, <code>?</code>=not yet classified.
   </p>`;
 
   // Wire click-to-drill on every populated cell.
@@ -2142,6 +2244,7 @@ function openHubModal(mode, hubId, prefillCountry) {
         form.elements['country'].value = h.country;
         form.elements['region'].value = h.region || '';
         form.elements['tier'].value = h.tier;
+        form.elements['modes'].value = h.modes || '';
         form.elements['lat'].value = h.lat;
         form.elements['lon'].value = h.lon;
         form.elements['sort_order'].value = h.sort_order;
@@ -2165,6 +2268,7 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       country: (fd.get('country') || '').toUpperCase(),
       region: fd.get('region') || null,
       tier: fd.get('tier') || 'main',
+      modes: fd.get('modes') || null,
       lat: parseFloat(fd.get('lat')),
       lon: parseFloat(fd.get('lon')),
       sort_order: parseInt(fd.get('sort_order') || '100', 10),

@@ -40,7 +40,9 @@ def _env() -> Environment:
 
 def _sample_hubs() -> list[dict]:
     """Two real-shaped hubs — enough to render a 2x2 matrix with one
-    self-cell and three populated cells."""
+    self-cell and three populated cells. band_color/country_rowspan/modes
+    mirror what `_annotate_hubs_with_country_bands` actually computes
+    (each hub here is a single-hub country run, so rowspan=1 on both)."""
     return [
         {
             "id": "p-nord",
@@ -49,6 +51,9 @@ def _sample_hubs() -> list[dict]:
             "region": "ile-de-france",
             "country": "FR",
             "tier": "main",
+            "modes": "R",
+            "band_color": "hsl(246, 48%, 40%)",
+            "country_rowspan": 1,
             "lat": 48.8809,
             "lon": 2.3553,
             "is_active": True,
@@ -61,11 +66,22 @@ def _sample_hubs() -> list[dict]:
             "region": "brussels",
             "country": "BE",
             "tier": "main",
+            "modes": None,
+            "band_color": "hsl(172, 48%, 40%)",
+            "country_rowspan": 1,
             "lat": 50.8358,
             "lon": 4.3360,
             "is_active": True,
             "sort_order": 0,
         },
+    ]
+
+
+def _sample_country_col_runs() -> list[dict]:
+    """Matches `_sample_hubs()` — each hub is its own single-hub run."""
+    return [
+        {"country": "FR", "span": 1, "color": "hsl(246, 48%, 40%)"},
+        {"country": "BE", "span": 1, "color": "hsl(172, 48%, 40%)"},
     ]
 
 
@@ -158,7 +174,12 @@ def _render() -> str:
     """Render the export template with the standard sample fixtures."""
     env = _env()
     tpl = env.get_template("admin/network_coverage_export.html")
-    return tpl.render(run=_sample_run(), hubs=_sample_hubs(), cells=_sample_cells())
+    return tpl.render(
+        run=_sample_run(),
+        hubs=_sample_hubs(),
+        cells=_sample_cells(),
+        country_col_runs=_sample_country_col_runs(),
+    )
 
 
 # ─────────────────────── template renders ───────────────────────
@@ -350,6 +371,19 @@ def test_modal_markup_present() -> None:
     assert "data-close" in html
 
 
+def test_country_and_type_bands_render_with_real_values() -> None:
+    """Smoke test on real rendered output (not just 'doesn't crash'): both
+    header bands must actually contain the sample hubs' country codes and
+    type codes, including the '?' fallback for an unclassified hub."""
+    html = _render()
+    assert 'class="band-country"' in html
+    assert ">FR<" in html
+    assert ">BE<" in html
+    assert 'class="band-type"' in html
+    assert ">R<" in html  # Paris Nord's modes="R"
+    assert ">?<" in html  # Bruxelles-Midi's modes=None
+
+
 # ─────────────────────── data-shaping helpers ───────────────────────
 #
 # `_build_export_context` and `_export_filename` were extracted from the
@@ -449,6 +483,78 @@ def test_build_export_context_keys_cells_by_origin_dest() -> None:
     assert "p-nord:bxl-mid" in ctx["cells"]
     assert ctx["cells"]["p-nord:bxl-mid"]["status"] == "ok"
     assert ctx["cells"]["p-nord:bxl-mid"]["best_operators"] == "EUROSTAR"
+
+
+# ─────────────────────── country + type header bands ───────────────────────
+
+
+def test_country_color_is_stable_and_falls_back_for_unknown_codes() -> None:
+    from app.api.admin.network_coverage import _country_color
+
+    # Same country -> same color every call (operators build muscle memory
+    # for "AT is violet" across different runs/sessions).
+    assert _country_color("AT") == _country_color("AT")
+    assert _country_color("AT") != _country_color("BE")
+    # A country not in the curated list still renders something, not a
+    # crash or an empty string.
+    assert _country_color("ZZ") == "#5B6B82"
+
+
+def test_annotate_hubs_merges_consecutive_same_country_into_one_run() -> None:
+    from app.api.admin.network_coverage import _annotate_hubs_with_country_bands
+
+    hubs = [
+        _stub_hub_info(id="a", country="AT"),
+        _stub_hub_info(id="b", country="AT"),
+        _stub_hub_info(id="c", country="BE"),
+    ]
+    annotated, col_runs = _annotate_hubs_with_country_bands(hubs)
+
+    assert [r["country"] for r in col_runs] == ["AT", "BE"]
+    assert [r["span"] for r in col_runs] == [2, 1]
+    # Rowspan only on the first hub of each run; the rest get None so the
+    # template knows not to emit a duplicate <th> for that cell.
+    assert annotated[0]["country_rowspan"] == 2
+    assert annotated[1]["country_rowspan"] is None
+    assert annotated[2]["country_rowspan"] == 1
+    # Every hub still gets a band_color, run or no run.
+    assert all(a["band_color"] for a in annotated)
+
+
+def test_annotate_hubs_does_not_merge_non_consecutive_same_country() -> None:
+    """Country A, B, A (not pre-sorted) must NOT merge the two A's into
+    one run — that would mis-render a rowspan over B's row."""
+    from app.api.admin.network_coverage import _annotate_hubs_with_country_bands
+
+    hubs = [
+        _stub_hub_info(id="a1", country="AT"),
+        _stub_hub_info(id="b1", country="BE"),
+        _stub_hub_info(id="a2", country="AT"),
+    ]
+    annotated, col_runs = _annotate_hubs_with_country_bands(hubs)
+
+    assert [r["country"] for r in col_runs] == ["AT", "BE", "AT"]
+    assert [r["span"] for r in col_runs] == [1, 1, 1]
+    assert [a["country_rowspan"] for a in annotated] == [1, 1, 1]
+
+
+def test_build_export_context_exposes_country_col_runs() -> None:
+    from app.api.admin.network_coverage import _build_export_context
+
+    ctx = _build_export_context(
+        run=_stub_run(),
+        results=[],
+        hubs=[
+            _stub_hub_info(id="p-nord", country="FR"),
+            _stub_hub_info(id="bxl-mid", country="BE"),
+        ],
+        trips_by_search={},
+    )
+    assert ctx["country_col_runs"] == [
+        {"country": "FR", "span": 1, "color": ctx["hubs"][0]["band_color"]},
+        {"country": "BE", "span": 1, "color": ctx["hubs"][1]["band_color"]},
+    ]
+    assert ctx["hubs"][0]["country_rowspan"] == 1
 
 
 def test_build_export_context_attaches_trips_by_journey_search_id() -> None:
@@ -867,6 +973,7 @@ def test_resolve_hubs_returns_db_rows_when_present() -> None:
         region="ile-de-france",
         country="FR",
         tier="main",
+        modes=None,
         lat=48.8809,
         lon=2.3553,
         is_active=True,
@@ -952,6 +1059,6 @@ def test_export_run_html_renders_with_content_disposition(monkeypatch) -> None:
     cd = response.headers["Content-Disposition"]
     assert "coverage-eu11-transit-motis-20260629-0555.html" in cd
     assert cd.startswith("attachment;")
-    # Template context has the three top-level keys the template indexes by.
-    assert set(captured["context"].keys()) == {"run", "hubs", "cells"}
+    # Template context has the top-level keys the template indexes by.
+    assert set(captured["context"].keys()) == {"run", "hubs", "cells", "country_col_runs"}
     assert captured["context"]["cells"] == {}  # no results passed

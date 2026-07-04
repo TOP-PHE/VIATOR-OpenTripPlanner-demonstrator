@@ -22,6 +22,10 @@
       --self: #f0f0f0;
       --pending: #adb5bd;
       --link: #1c7ed6;
+      /* Country + type header bands (see the .matrix rule block below) */
+      --band-country-w: 22px;
+      --band-type-w: 38px;
+      --band-row-h: 18px;
     }
     * { box-sizing: border-box; }
     body {
@@ -55,8 +59,38 @@
       text-align: center; vertical-align: middle;
     }
     table.matrix th { background: #f5f7fa; font-weight: 600; }
-    table.matrix th.axis-row { text-align: right; position: sticky; left: 0; z-index: 1; background: #f5f7fa; }
-    table.matrix th.country { font-size: 0.7rem; color: var(--muted); font-weight: 500; background: #fafbfc; }
+
+    /* Country + type header bands — same layout as the live matrix
+       (network_coverage.html): a solid country strip merged across
+       each country's run of hubs, a lighter-tint type strip beneath
+       it (R/T/M/B/C), then the existing axis-row (station name).
+       Fixed widths/heights on the first two bands make the sticky
+       offsets below deterministic; only axis-row (the last band in
+       each stack) is left auto-sized. */
+    table.matrix thead th { position: sticky; z-index: 2; }
+    table.matrix thead tr:nth-child(1) th { top: 0; height: var(--band-row-h); }
+    table.matrix thead tr:nth-child(2) th { top: var(--band-row-h); height: var(--band-row-h); }
+    table.matrix thead tr:nth-child(3) th { top: calc(var(--band-row-h) * 2); }
+    table.matrix th.corner { left: 0; background: var(--bg); z-index: 4; border: none; }
+    table.matrix th.band-country {
+      left: 0; width: var(--band-country-w); position: sticky;
+      color: #fff; font-weight: 700; font-size: 9px; letter-spacing: 0.03em;
+      text-transform: uppercase; background: var(--band-color);
+    }
+    table.matrix th.band-country.row { writing-mode: vertical-rl; transform: rotate(180deg); }
+    table.matrix th.band-type {
+      left: var(--band-country-w); width: var(--band-type-w); position: sticky;
+      font-size: 0.7rem; font-weight: 700;
+      background: color-mix(in srgb, var(--band-color) 28%, white);
+      color: var(--band-color);
+    }
+    table.matrix th.axis-row {
+      left: calc(var(--band-country-w) + var(--band-type-w));
+      text-align: right; position: sticky; z-index: 1; background: #f5f7fa;
+    }
+    table.matrix th.axis-row[data-has-country] {
+      background: color-mix(in srgb, var(--band-color) 9%, white);
+    }
     .cell-ok { background: var(--ok-bg); cursor: pointer; }
     .cell-ok:hover { background: #d4ecdb; }
     .cell-no-route { background: var(--no-route-bg); color: var(--no-route); cursor: pointer; }
@@ -192,6 +226,12 @@
   Diagonal cells (origin = destination) are intentionally skipped.
 </p>
 <p class="meta">
+  Header bands: the solid colour strip groups hubs by country (same country = same colour on
+  every run); the row beneath it shows transport modes serving that station —
+  <code>R</code>=Rail, <code>T</code>=Tram, <code>M</code>=Metro, <code>B</code>=Bus,
+  <code>C</code>=Coach, <code>?</code>=not yet classified.
+</p>
+<p class="meta">
   <label class="align-toggle">
     <input type="checkbox" id="align-toggle-input">
     Show ÖBB alignment heatmap instead
@@ -205,16 +245,31 @@
   <table class="matrix">
     <thead>
       <tr>
-        <th class="axis-row">&nbsp;</th>
+        <th class="corner" scope="col" colspan="3" rowspan="2"></th>
+        {% for run in country_col_runs %}
+        <th class="band-country" scope="col" colspan="{{ run.span }}" style="--band-color: {{ run.color }}">{{ run.country }}</th>
+        {% endfor %}
+      </tr>
+      <tr>
         {% for h in hubs %}
-        <th title="{{ h.name }} ({{ h.country }})">{{ h.short or h.id }}</th>
+        <th class="band-type" scope="col" style="--band-color: {{ h.band_color }}" title="{{ h.modes or 'not yet classified' }}">{{ h.modes or '?' }}</th>
+        {% endfor %}
+      </tr>
+      <tr>
+        <th class="corner" scope="col" colspan="3"></th>
+        {% for h in hubs %}
+        <th class="axis-row" scope="col" data-has-country style="--band-color: {{ h.band_color }}" title="{{ h.name }} ({{ h.country }})">{{ h.short or h.id }}</th>
         {% endfor %}
       </tr>
     </thead>
     <tbody>
       {% for orig in hubs %}
       <tr>
-        <th class="axis-row" title="{{ orig.name }} ({{ orig.country }})">{{ orig.short or orig.id }}</th>
+        {% if orig.country_rowspan %}
+        <th class="band-country row" scope="rowgroup" rowspan="{{ orig.country_rowspan }}" style="--band-color: {{ orig.band_color }}">{{ orig.country }}</th>
+        {% endif %}
+        <th class="band-type" scope="row" style="--band-color: {{ orig.band_color }}" title="{{ orig.modes or 'not yet classified' }}">{{ orig.modes or '?' }}</th>
+        <th class="axis-row" scope="row" data-has-country style="--band-color: {{ orig.band_color }}" title="{{ orig.name }} ({{ orig.country }})">{{ orig.short or orig.id }}</th>
         {% for dest in hubs %}
           {% if orig.id == dest.id %}
             <td class="cell-self">·</td>
