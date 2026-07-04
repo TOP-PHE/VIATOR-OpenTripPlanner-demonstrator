@@ -960,6 +960,47 @@ def test_fetch_trips_by_search_unions_fanout_executions() -> None:
     assert len(out[str(search_id)]) == 3
 
 
+def test_fetch_trips_by_search_caps_trips_per_search_at_max() -> None:
+    """K-slot coverage runs can accumulate 50+ deduped itineraries for a
+    single pair (slot_count x num_itineraries_per_slot). Embedding all of
+    them in the export/share HTML is what let a real 8742-pair run balloon
+    to 13+GB of process memory and hang the web process — see the module
+    comment on `_MAX_TRIPS_PER_CELL_EXPORT`. The helper must keep only the
+    first `_MAX_TRIPS_PER_CELL_EXPORT` rows per search (already ordered by
+    rank_in_response by the query), not allow unbounded growth."""
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _MAX_TRIPS_PER_CELL_EXPORT, _fetch_trips_by_search
+
+    search_id = uuid4()
+    exec_id = uuid4()
+    rows = [(search_id, _trip_stub(exec_id, rank=i)) for i in range(_MAX_TRIPS_PER_CELL_EXPORT + 5)]
+    db = _MockDb(rows=rows)
+    out = _fetch_trips_by_search(db, search_ids=[search_id])
+    assert len(out[str(search_id)]) == _MAX_TRIPS_PER_CELL_EXPORT
+    assert [t["rank"] for t in out[str(search_id)]] == list(range(_MAX_TRIPS_PER_CELL_EXPORT))
+
+
+def test_fetch_trips_by_search_cap_applies_independently_per_search() -> None:
+    """The cap is per search_id, not a global budget across the whole
+    batch — an early search in a large run must not crowd out a later
+    one's trips."""
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _MAX_TRIPS_PER_CELL_EXPORT, _fetch_trips_by_search
+
+    search_a = uuid4()
+    search_b = uuid4()
+    exec_a = uuid4()
+    exec_b = uuid4()
+    rows = [(search_a, _trip_stub(exec_a, rank=i)) for i in range(_MAX_TRIPS_PER_CELL_EXPORT + 3)]
+    rows += [(search_b, _trip_stub(exec_b, rank=i)) for i in range(3)]
+    db = _MockDb(rows=rows)
+    out = _fetch_trips_by_search(db, search_ids=[search_a, search_b])
+    assert len(out[str(search_a)]) == _MAX_TRIPS_PER_CELL_EXPORT
+    assert len(out[str(search_b)]) == 3
+
+
 def test_resolve_hubs_returns_db_rows_when_present() -> None:
     """Happy path: `network_coverage_hubs` table has rows → return them
     via `_hub_to_info` shape conversion. The fallback to static HUBS
