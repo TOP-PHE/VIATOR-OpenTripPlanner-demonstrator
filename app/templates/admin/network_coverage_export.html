@@ -22,6 +22,10 @@
       --self: #f0f0f0;
       --pending: #adb5bd;
       --link: #1c7ed6;
+      /* Country + type header bands (see the .matrix rule block below) */
+      --band-country-w: 22px;
+      --band-type-w: 38px;
+      --band-row-h: 18px;
     }
     * { box-sizing: border-box; }
     body {
@@ -63,26 +67,26 @@
        Fixed widths/heights on the first two bands make the sticky
        offsets below deterministic; only axis-row (the last band in
        each stack) is left auto-sized. */
-    :root { --band-country-w: 22px; --band-type-w: 38px; --band-row-h: 18px; }
     table.matrix thead th { position: sticky; z-index: 2; }
     table.matrix thead tr:nth-child(1) th { top: 0; height: var(--band-row-h); }
     table.matrix thead tr:nth-child(2) th { top: var(--band-row-h); height: var(--band-row-h); }
     table.matrix thead tr:nth-child(3) th { top: calc(var(--band-row-h) * 2); }
     table.matrix th.corner { left: 0; background: var(--bg); z-index: 4; border: none; }
-    table.matrix th.band-country { left: 0; width: var(--band-country-w); }
-    table.matrix th.band-type    { left: var(--band-country-w); width: var(--band-type-w); }
-    table.matrix th.axis-row     { left: calc(var(--band-country-w) + var(--band-type-w)); }
-
-    table.matrix th.axis-row { text-align: right; position: sticky; z-index: 1; background: #f5f7fa; }
     table.matrix th.band-country {
+      left: 0; width: var(--band-country-w); position: sticky;
       color: #fff; font-weight: 700; font-size: 9px; letter-spacing: 0.03em;
-      text-transform: uppercase; background: var(--band-color); position: sticky;
+      text-transform: uppercase; background: var(--band-color);
     }
     table.matrix th.band-country.row { writing-mode: vertical-rl; transform: rotate(180deg); }
     table.matrix th.band-type {
-      font-size: 0.7rem; font-weight: 700; position: sticky;
+      left: var(--band-country-w); width: var(--band-type-w); position: sticky;
+      font-size: 0.7rem; font-weight: 700;
       background: color-mix(in srgb, var(--band-color) 28%, white);
       color: var(--band-color);
+    }
+    table.matrix th.axis-row {
+      left: calc(var(--band-country-w) + var(--band-type-w));
+      text-align: right; position: sticky; z-index: 1; background: #f5f7fa;
     }
     table.matrix th.axis-row[data-has-country] {
       background: color-mix(in srgb, var(--band-color) 9%, white);
@@ -241,20 +245,20 @@
   <table class="matrix">
     <thead>
       <tr>
-        <th class="corner" colspan="3" rowspan="2"></th>
+        <th class="corner" scope="col" colspan="3" rowspan="2"></th>
         {% for run in country_col_runs %}
-        <th class="band-country" colspan="{{ run.span }}" style="--band-color: {{ run.color }}">{{ run.country }}</th>
+        <th class="band-country" scope="col" colspan="{{ run.span }}" style="--band-color: {{ run.color }}">{{ run.country }}</th>
         {% endfor %}
       </tr>
       <tr>
         {% for h in hubs %}
-        <th class="band-type" style="--band-color: {{ h.band_color }}" title="{{ h.modes or 'not yet classified' }}">{{ h.modes or '?' }}</th>
+        <th class="band-type" scope="col" style="--band-color: {{ h.band_color }}" title="{{ h.modes or 'not yet classified' }}">{{ h.modes or '?' }}</th>
         {% endfor %}
       </tr>
       <tr>
-        <th class="corner" colspan="3"></th>
+        <th class="corner" scope="col" colspan="3"></th>
         {% for h in hubs %}
-        <th class="axis-row" data-has-country style="--band-color: {{ h.band_color }}" title="{{ h.name }} ({{ h.country }})">{{ h.short or h.id }}</th>
+        <th class="axis-row" scope="col" data-has-country style="--band-color: {{ h.band_color }}" title="{{ h.name }} ({{ h.country }})">{{ h.short or h.id }}</th>
         {% endfor %}
       </tr>
     </thead>
@@ -262,10 +266,10 @@
       {% for orig in hubs %}
       <tr>
         {% if orig.country_rowspan %}
-        <th class="band-country row" rowspan="{{ orig.country_rowspan }}" style="--band-color: {{ orig.band_color }}">{{ orig.country }}</th>
+        <th class="band-country row" scope="rowgroup" rowspan="{{ orig.country_rowspan }}" style="--band-color: {{ orig.band_color }}">{{ orig.country }}</th>
         {% endif %}
-        <th class="band-type" style="--band-color: {{ orig.band_color }}" title="{{ orig.modes or 'not yet classified' }}">{{ orig.modes or '?' }}</th>
-        <th class="axis-row" data-has-country style="--band-color: {{ orig.band_color }}" title="{{ orig.name }} ({{ orig.country }})">{{ orig.short or orig.id }}</th>
+        <th class="band-type" scope="row" style="--band-color: {{ orig.band_color }}" title="{{ orig.modes or 'not yet classified' }}">{{ orig.modes or '?' }}</th>
+        <th class="axis-row" scope="row" data-has-country style="--band-color: {{ orig.band_color }}" title="{{ orig.name }} ({{ orig.country }})">{{ orig.short or orig.id }}</th>
         {% for dest in hubs %}
           {% if orig.id == dest.id %}
             <td class="cell-self">·</td>

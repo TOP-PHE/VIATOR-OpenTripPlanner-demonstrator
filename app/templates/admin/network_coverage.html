@@ -688,8 +688,8 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
           <input type="text" name="short" maxlength="16" required>
         </div>
         <div>
-          <label>Region <span class="hint" style="font-weight: normal">(optional, informational)</span></label>
-          <input type="text" name="region" maxlength="40">
+          <label for="hub-form-region">Region <span class="hint" style="font-weight: normal">(optional, informational)</span></label>
+          <input type="text" id="hub-form-region" name="region" maxlength="40">
         </div>
       </div>
       <div class="form-row">
@@ -706,10 +706,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
           <input type="number" name="sort_order" value="100" min="0" max="10000">
         </div>
       </div>
-      <label>Transport modes
+      <label for="hub-form-modes">Transport modes
         <span class="hint" style="font-weight: normal">(matrix type band — e.g. "R+M"; blank = not yet classified)</span>
       </label>
-      <input type="text" name="modes" maxlength="20" placeholder="R, T, M, B, C, or a combination like R+T">
+      <input type="text" id="hub-form-modes" name="modes" maxlength="20" placeholder="R, T, M, B, C, or a combination like R+T">
       <p class="hub-form-error" id="hub-form-error"></p>
       <div class="hub-form-actions">
         <button type="button" data-action="hub-modal-close">Cancel</button>
@@ -1469,16 +1469,16 @@ function renderRun(run) {
   const bandStyle = h => ` style="--band-color: ${countryColor(h.country)}"`;
 
   const countryHeaderRow = '<tr>' +
-    '<th class="cov-corner" colspan="3" rowspan="2"></th>' +
+    '<th class="cov-corner" scope="col" colspan="3" rowspan="2"></th>' +
     countryColRuns.map(run =>
-      `<th class="cov-band-country" colspan="${run.span}" style="--band-color: ${countryColor(run.value)}">${escHTML(run.value)}</th>`
+      `<th class="cov-band-country" scope="col" colspan="${run.span}" style="--band-color: ${countryColor(run.value)}">${escHTML(run.value)}</th>`
     ).join('') +
     '</tr>';
   const typeHeaderRow = '<tr>' + HUBS.map(h =>
-    `<th class="cov-band-type"${bandStyle(h)} title="${escHTML(h.modes || 'not yet classified')}">${escHTML(h.modes || '?')}</th>`
+    `<th class="cov-band-type" scope="col"${bandStyle(h)} title="${escHTML(h.modes || 'not yet classified')}">${escHTML(h.modes || '?')}</th>`
   ).join('') + '</tr>';
-  const nameHeaderRow = '<tr><th class="cov-corner" colspan="3"></th>' + HUBS.map(h =>
-    `<th class="hub-label" data-has-country title="${escHTML(h.name)}"${bandStyle(h)}>${escHTML(h.short)}</th>`
+  const nameHeaderRow = '<tr><th class="cov-corner" scope="col" colspan="3"></th>' + HUBS.map(h =>
+    `<th class="hub-label" scope="col" data-has-country title="${escHTML(h.name)}"${bandStyle(h)}>${escHTML(h.short)}</th>`
   ).join('') + '</tr>';
   const headerRow = countryHeaderRow + typeHeaderRow + nameHeaderRow;
 
@@ -1495,12 +1495,12 @@ function renderRun(run) {
     // (rowspan covers the rest) — same merge the column header does.
     const isFirstOfRun = hubIdx === 0 || HUBS[hubIdx - 1].country !== orig.country;
     const countryTh = isFirstOfRun
-      ? `<th class="cov-band-country row" rowspan="${countryRowRuns.find(r => r.value === orig.country).span}" style="--band-color: ${countryColor(orig.country)}">${escHTML(orig.country)}</th>`
+      ? `<th class="cov-band-country row" scope="rowgroup" rowspan="${countryRowRuns.find(r => r.value === orig.country).span}" style="--band-color: ${countryColor(orig.country)}">${escHTML(orig.country)}</th>`
       : '';
     hubIdx++;
     return `<tr>${countryTh}` +
-      `<th class="cov-band-type"${bandStyle(orig)} title="${escHTML(orig.modes || 'not yet classified')}">${escHTML(orig.modes || '?')}</th>` +
-      `<th class="hub-label" data-has-country title="${escHTML(orig.name)}"${bandStyle(orig)}>${escHTML(orig.short)}</th>` +
+      `<th class="cov-band-type" scope="row"${bandStyle(orig)} title="${escHTML(orig.modes || 'not yet classified')}">${escHTML(orig.modes || '?')}</th>` +
+      `<th class="hub-label" scope="row" data-has-country title="${escHTML(orig.name)}"${bandStyle(orig)}>${escHTML(orig.short)}</th>` +
       `${cells}</tr>`;
   }).join('');
 
