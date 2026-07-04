@@ -24,6 +24,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from . import concurrency, config_service, detect, ingestion
+from .api import coverage_share as coverage_share_routes
 from .api import credentials as credentials_routes
 from .api import geocode as geocode_routes
 from .api import journey as journey_routes
@@ -140,6 +141,7 @@ app.include_router(admin_users.router)
 app.include_router(admin_sessions.router)
 app.include_router(admin_nap_catalogues.router)
 app.include_router(admin_network_coverage.router)
+app.include_router(coverage_share_routes.router)
 app.include_router(admin_replay.router)
 app.include_router(master_stations.router)
 app.include_router(master_aliases.router)
