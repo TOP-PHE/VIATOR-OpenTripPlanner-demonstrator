@@ -13,7 +13,7 @@ by a separate follow-up (GTFS/NeTEx route_type cross-reference, with a
 fallback to inspecting historical coverage-run results), not by this
 migration.
 
-Revision ID: 20260704_1000_hub_transport_modes
+Revision ID: 20260704_1000_hub_modes
 Revises: 20260701_0900_oebb_alignment
 Create Date: 2026-07-04 10:00:00.000000
 """
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "20260704_1000_hub_transport_modes"
+revision: str = "20260704_1000_hub_modes"
 down_revision: str | Sequence[str] | None = "20260701_0900_oebb_alignment"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
