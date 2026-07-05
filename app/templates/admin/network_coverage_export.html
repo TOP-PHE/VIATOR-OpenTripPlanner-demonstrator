@@ -499,6 +499,9 @@
       const trips = (data.outbound && data.outbound.trips) || [];
       next = { loading: false, error: false, loaded: true, trips };
     } catch (err) {
+      // Surface the cause for anyone debugging a share page that shows
+      // the retry message — the modal itself stays generic on purpose.
+      console.warn('coverage share: cell trips fetch failed', err);
       next = { loading: false, error: true, loaded: false, trips: [] };
     }
     tripState.set(pairKey, next);
@@ -507,13 +510,7 @@
     }
   }
 
-  function openModal(pairKey) {
-    const [orig, dest] = pairKey.split(':');
-    const cell = CELLS[pairKey];
-    if (!cell) return;
-    const o = HUBS_BY_ID[orig], d = HUBS_BY_ID[dest];
-    const title = `${o ? o.name : orig} → ${d ? d.name : dest}`;
-    document.getElementById('modal-title').textContent = title;
+  function buildSummaryParts(cell) {
     const parts = [
       statusPill(cell.status),
       `${cell.response_ms || 0} ms`,
@@ -526,7 +523,17 @@
     if (cell.error_message) parts.push(`error: <code>${escapeHTML(cell.error_message)}</code>`);
     const alignmentPart = alignmentSummaryPart(cell);
     if (alignmentPart) parts.push(alignmentPart);
-    document.getElementById('modal-summary').innerHTML = parts.join(' · ');
+    return parts;
+  }
+
+  function openModal(pairKey) {
+    const [orig, dest] = pairKey.split(':');
+    const cell = CELLS[pairKey];
+    if (!cell) return;
+    const o = HUBS_BY_ID[orig], d = HUBS_BY_ID[dest];
+    const title = `${o ? o.name : orig} → ${d ? d.name : dest}`;
+    document.getElementById('modal-title').textContent = title;
+    document.getElementById('modal-summary').innerHTML = buildSummaryParts(cell).join(' · ');
     currentPair = pairKey;
     // Kick the lazy fetch off BEFORE rendering the body: loadCellTrips
     // resets the pair's state synchronously (before its first await),
