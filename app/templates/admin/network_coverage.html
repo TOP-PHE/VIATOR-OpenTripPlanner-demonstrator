@@ -173,7 +173,17 @@ main {
 }
 .cov-matrix tbody th.cov-band-country { left: 0; }
 .cov-matrix tbody th.cov-band-type    { left: var(--cov-band-country-w); }
-.cov-matrix tbody th.hub-label        { left: calc(var(--cov-band-country-w) + var(--cov-band-type-w)); text-overflow: ellipsis; }
+/* left/sticky is tbody-only on purpose — the thead's hub-label cells
+   are column headers for the DATA columns and scroll normally with
+   them; only the ROW-label (tbody) hub-label needs to stay pinned
+   next to the country/type bands. text-overflow is NOT tbody-only,
+   though: thead uses the identical <th class="hub-label"> markup for
+   column headers (nameHeaderRow) with the same fixed-width column, so
+   without this on both, a long label hard-clips with no "…" in the
+   header row while the exact same label ellipsizes two rows down as
+   the row label — confirmed via adversarial review of PR #217. */
+.cov-matrix tbody th.hub-label { left: calc(var(--cov-band-country-w) + var(--cov-band-type-w)); }
+.cov-matrix th.hub-label { text-overflow: ellipsis; }
 /* Corner spacers sit above every other sticky cell in both directions
    (they're sticky on BOTH axes at once) so nothing scrolls over them. */
 .cov-matrix thead th.cov-corner { left: 0; background: var(--paper); z-index: 4; }

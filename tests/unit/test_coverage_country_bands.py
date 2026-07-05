@@ -90,6 +90,21 @@ def test_matrix_uses_fixed_table_layout_with_colgroup(live_text: str):
     assert "--cov-hub-label-w" in live_text and "--cov-data-col-w" in live_text
 
 
+def test_matrix_hub_label_ellipsis_applies_to_header_row_too(live_text: str):
+    """Adversarial-review finding on PR #217: the initial fix scoped
+    `text-overflow: ellipsis` to `tbody th.hub-label` only. thead's
+    column-header row uses the identical <th class="hub-label"> markup
+    (nameHeaderRow) pinned to the same fixed-width column — without the
+    same rule, a long label hard-clips with no "…" in the header while
+    the exact same label ellipsizes cleanly as the row label. `left`
+    (the sticky offset) is correctly tbody-only — thead's hub-label
+    cells are column headers that scroll normally, not sticky columns
+    — only text-overflow needs to cover both."""
+    assert re.search(r"\.cov-matrix th\.hub-label\s*\{[^}]*text-overflow:\s*ellipsis", live_text)
+    assert re.search(r"\.cov-matrix tbody th\.hub-label\s*\{[^}]*left:", live_text)
+    assert not re.search(r"\.cov-matrix thead th\.hub-label\s*\{[^}]*left:", live_text)
+
+
 def test_matrix_tbody_sticky_cells_have_explicit_z_index(live_text: str):
     """The gap-closing fix alone wasn't sufficient — even with zero gap,
     a rowspan'd sticky <th> without an explicit z-index let plain <td>s
