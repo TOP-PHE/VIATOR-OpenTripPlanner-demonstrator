@@ -805,6 +805,32 @@ def test_side_by_side_wiring_present() -> None:
     assert 'class="sbs"' in html or ".sbs {" in html
 
 
+def test_times_render_pinned_to_cet_not_viewer_local() -> None:
+    """Adversarial-review finding on the side-by-side: ÖBB verify data
+    is persisted as NAIVE CET wall-clock strings while VIATOR carries
+    offset-aware instants — Date-parsing both made the columns diverge
+    by the viewer's UTC-offset difference (a London reader saw every
+    'agree' cell offset by an hour). fmtTime/fmtDate must slice naive
+    strings verbatim and pin aware ones to Europe/Vienna, and the
+    comparison must say so."""
+    html = _render()
+    # Aware path pinned to CET (not viewer-local getHours()).
+    assert "timeZone: 'Europe/Vienna'" in html
+    # Naive path sliced, never Date-parsed.
+    assert "_HAS_OFFSET" in html
+    # The reader is told which clock they're looking at.
+    assert "Central European Time" in html
+
+
+def test_external_itinerary_guards_null_num_transfers() -> None:
+    """HAFAS omits/garbles `chg` on some connections, so the persisted
+    num_transfers can be null — the ÖBB card must render nothing rather
+    than a literal 'null transfers' (the live matrix modal guards this
+    via fmtCount; the export renderer needs its own guard)."""
+    html = _render()
+    assert "it.num_transfers == null" in html
+
+
 def test_build_export_context_run_meta_uses_started_at_not_created_at() -> None:
     """Regression lock: the NetworkCoverageRun model has `started_at`,
     not `created_at`. Mypy caught this in CI on the first push of this

@@ -378,22 +378,41 @@
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
     return h ? `${h}h${String(m).padStart(2, '0')}` : `${m}m`;
   }
+  // ALL times in this report render in Central European Time, not the
+  // viewer's local zone. The ÖBB verify data is persisted as NAIVE
+  // CET/CEST wall-clock strings (external_verify._hafas_time_to_utc_iso
+  // deliberately skips the UTC conversion), so they display verbatim;
+  // the VIATOR side carries offset-aware instants and is pinned to
+  // Europe/Vienna so the side-by-side compares like-for-like. Without
+  // the pinning, a share-link reader outside CET saw the two columns
+  // offset by their UTC-offset difference — an 'agree' cell looked like
+  // a systematic planner disagreement.
+  const _HAS_OFFSET = /([zZ]|[+-]\d{2}:?\d{2})$/;
   function fmtTime(iso) {
     if (!iso) return '—';
+    if (!_HAS_OFFSET.test(iso)) {
+      // Naive wall-clock string (ÖBB verify data — already CET/CEST):
+      // slice the digits out rather than round-tripping through Date,
+      // which would misparse it as viewer-local time.
+      const m = /T(\d{2}:\d{2})/.exec(iso);
+      return m ? m[1] : iso;
+    }
     // No try/catch — `new Date(invalid)` doesn't throw, it returns a Date
     // whose getTime() is NaN. Check for that explicitly and fall back to
     // the raw string. (Sonar S2486 dislikes silent swallowing in catch.)
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    return `${hh}:${mm}`;
+    return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Vienna' });
   }
   function fmtDate(iso) {
     if (!iso) return '';
+    if (!_HAS_OFFSET.test(iso)) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+      return m ? `${m[3]}/${m[2]}` : '';
+    }
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return '';
-    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
+    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', timeZone: 'Europe/Vienna' });
   }
   function escapeHTML(s) {
     // Use replaceAll() (literal strings) instead of replace(/.../g, ...)
@@ -463,12 +482,19 @@
 
   function renderExternalItinerary(it) {
     const legs = (it.legs || []).map(renderExternalLeg).join('');
+    // HAFAS omits/garbles `chg` on some connections, so the persisted
+    // num_transfers can legitimately be null — render nothing rather
+    // than a literal "null transfers" (mirrors fmtCount in the live
+    // matrix modal).
+    const transfers = it.num_transfers == null
+      ? ''
+      : `<span class="transfers">${it.num_transfers} transfer${it.num_transfers === 1 ? '' : 's'}</span>`;
     return `
       <div class="trip">
         <div class="trip-head">
           <span class="when">${fmtDate(it.departure_at)} ${fmtTime(it.departure_at)} → ${fmtTime(it.arrival_at)}</span>
           <span class="duration">${fmtDuration(it.duration_seconds)}</span>
-          <span class="transfers">${it.num_transfers} transfer${it.num_transfers === 1 ? '' : 's'}</span>
+          ${transfers}
         </div>
         <div class="legs">${legs || '<div class="empty-trips">No legs recorded for this itinerary.</div>'}</div>
       </div>
@@ -480,7 +506,8 @@
   // ÖBB itineraries; otherwise the single-column VIATOR list renders.
   function renderComparison(tripsHtml, externalItineraries) {
     const oebbHtml = externalItineraries.map(renderExternalItinerary).join('');
-    return `<div class="sbs">
+    return `<p class="truncated-note">All times are shown in Central European Time (CET/CEST).</p>
+    <div class="sbs">
       <div><span class="sbs-head viator">VIATOR · MOTIS / OTP</span>${tripsHtml || '<div class="empty-trips">No itineraries recorded.</div>'}</div>
       <div class="oebb-col"><span class="sbs-head oebb">ÖBB HAFAS</span>${oebbHtml}</div>
     </div>`;
