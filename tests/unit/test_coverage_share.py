@@ -10,8 +10,8 @@ succeed.
 
 `_build_export_context` and the Jinja template itself are already
 covered by test_coverage_export.py; here we only monkeypatch the DB-
-touching helpers (`_resolve_hubs`, `_fetch_trips_by_search`,
-`runner.get_run_with_results`) and let the real context-building +
+touching helpers (`_resolve_hubs`, `runner.get_run_with_results`,
+`_build_cell_trips_response`) and let the real context-building +
 real template render run, so a wiring mistake between this module and
 the shared export helpers would still be caught.
 """
@@ -99,11 +99,15 @@ def _stub_hub_info(**overrides):
     return HubInfo(**base)
 
 
-def _make_app() -> FastAPI:
+def _make_app(db_factory=None) -> FastAPI:
     """A minimal app carrying only the share router + the same slowapi
     wiring `app.main` sets up for real — enough for `@limiter.limit(...)`
     to actually execute, without importing the whole application (DB
-    engine, sessions orchestrator, etc.)."""
+    engine, sessions orchestrator, etc.).
+
+    `db_factory` lets cell-trips tests inject a stub with a working
+    `.get()`; the page tests keep the bare `object()` since they
+    monkeypatch every DB-touching helper anyway."""
     app = FastAPI()
     app.state.limiter = limiter
 
@@ -113,7 +117,7 @@ def _make_app() -> FastAPI:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
     app.add_middleware(SlowAPIMiddleware)
     app.include_router(coverage_share.router)
-    app.dependency_overrides[get_db] = lambda: object()
+    app.dependency_overrides[get_db] = db_factory or (lambda: object())
     return app
 
 
@@ -127,12 +131,18 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
             dest_hub_id="p-nord",
             status="ok",
             response_ms=100,
-            num_itineraries=0,
+            num_itineraries=3,
             best_duration_seconds=None,
             best_num_transfers=None,
             best_operators=None,
             error_message=None,
-            journey_search_id=None,
+            # A REAL search id, deliberately: with journey_search_id=None
+            # the cell renders "trips": [] no matter what the route does,
+            # and a regression that re-embeds trips (re-adding a
+            # _fetch_trips_by_search call on this path) would go
+            # undetected. With a real id, the assertion below only holds
+            # while the route truly embeds nothing.
+            journey_search_id=uuid.uuid4(),
             session_ids=None,
         ),
     ]
@@ -140,13 +150,18 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
         coverage_share.runner, "get_run_with_results", lambda db, run_id: (run, results)
     )
     monkeypatch.setattr(coverage_share, "_resolve_hubs", lambda db: [_stub_hub_info()])
-    monkeypatch.setattr(coverage_share, "_fetch_trips_by_search", lambda db, ids: {})
 
     client = TestClient(_make_app())
     resp = client.get(f"/share/coverage/{run.id}")
 
     assert resp.status_code == 200
     assert "eu11-transit-motis" in resp.text
+    # Share pages are lazy — trips are fetched per cell on click, never
+    # embedded, so page size stays constant regardless of run size. The
+    # cell has a search id and claims 3 itineraries, yet its embedded
+    # trips must still be empty.
+    assert '"lazy_trips": true' in resp.text
+    assert '"trips": []' in resp.text
 
 
 def test_share_link_404_for_unknown_run(monkeypatch):
@@ -167,7 +182,6 @@ def test_share_link_has_no_content_disposition_header(monkeypatch):
     run = _stub_run()
     monkeypatch.setattr(coverage_share.runner, "get_run_with_results", lambda db, run_id: (run, []))
     monkeypatch.setattr(coverage_share, "_resolve_hubs", lambda db: [_stub_hub_info()])
-    monkeypatch.setattr(coverage_share, "_fetch_trips_by_search", lambda db, ids: {})
 
     client = TestClient(_make_app())
     resp = client.get(f"/share/coverage/{run.id}")
@@ -190,6 +204,99 @@ def test_view_shared_run_has_no_current_user_dependency():
     `require_platform_admin` parameter — that would silently reintroduce
     a login requirement this route is explicitly designed not to have."""
     sig = inspect.signature(coverage_share.view_shared_run)
+    assert "CurrentUser" not in str(sig)
+
+
+# ─────────────────────── lazy per-cell trips endpoint ───────────────────────
+
+
+class _StubDb:
+    """`shared_cell_trips` only touches `db.get`; everything after the
+    run lookup is delegated to `_build_cell_trips_response`, which the
+    tests monkeypatch."""
+
+    def __init__(self, run) -> None:
+        self._run = run
+
+    def get(self, _model, _run_id):
+        return self._run
+
+
+def test_shared_cell_trips_succeeds_with_no_auth(monkeypatch):
+    """The share page's modal fetches this anonymously — same capability
+    model as the page itself (the run id in the URL is the token)."""
+    from app.api.admin.network_coverage import CellTripsResponse
+
+    run = _stub_run()
+    canned = CellTripsResponse(direction="both", outbound=None, return_=None)
+    captured = {}
+
+    def fake_build(db, run_arg, origin_id, dest_id):
+        captured["args"] = (run_arg, origin_id, dest_id)
+        return canned
+
+    monkeypatch.setattr(coverage_share, "_build_cell_trips_response", fake_build)
+
+    client = TestClient(_make_app(db_factory=lambda: _StubDb(run)))
+    resp = client.get(f"/share/coverage/{run.id}/cells/p-nord/bxl-mid/trips")
+
+    assert resp.status_code == 200
+    assert resp.json()["direction"] == "both"
+    assert captured["args"] == (run, "p-nord", "bxl-mid")
+
+
+def test_shared_cell_trips_404_for_unknown_run():
+    client = TestClient(_make_app(db_factory=lambda: _StubDb(None)))
+    resp = client.get(f"/share/coverage/{uuid.uuid4()}/cells/a/b/trips")
+    assert resp.status_code == 404
+
+
+def test_shared_cell_trips_strips_admin_only_external_itineraries(monkeypatch):
+    """The raw ÖBB payloads captured by the verify sweep were never
+    embedded or rendered by the share page — they were reachable only
+    through the platform_admin cell-trips endpoint. The public twin must
+    null them out, or a bare share URL silently grants previously
+    admin-only third-party planner data (and the module's 'reveals only
+    what the page shows' capability model becomes false)."""
+    from app.api.admin.network_coverage import CellTripsDirection, CellTripsResponse
+
+    run = _stub_run()
+    loaded = CellTripsResponse(
+        direction="both",
+        outbound=CellTripsDirection(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            trips=[{"rank": 0, "duration_seconds": 5000, "legs": []}],
+            external_itineraries=[{"duration_seconds": 5100, "legs": []}],
+        ),
+        return_=CellTripsDirection(
+            origin_hub_id="bxl-mid",
+            dest_hub_id="p-nord",
+            status="ok",
+            external_itineraries=[{"duration_seconds": 5200, "legs": []}],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_share, "_build_cell_trips_response", lambda db, run_arg, o, d: loaded
+    )
+
+    client = TestClient(_make_app(db_factory=lambda: _StubDb(run)))
+    resp = client.get(f"/share/coverage/{run.id}/cells/p-nord/bxl-mid/trips")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["outbound"]["external_itineraries"] is None
+    assert body["return"]["external_itineraries"] is None
+    # The VIATOR trips themselves — what the modal renders — survive.
+    assert len(body["outbound"]["trips"]) == 1
+
+
+def test_shared_cell_trips_has_no_current_user_dependency():
+    """Same structural guard as the page route — the modal's fetch has
+    no way to attach admin credentials, so accidentally inheriting auth
+    here would break every share link's drill-down silently."""
+    sig = inspect.signature(coverage_share.shared_cell_trips)
     assert "CurrentUser" not in str(sig)
 
 
