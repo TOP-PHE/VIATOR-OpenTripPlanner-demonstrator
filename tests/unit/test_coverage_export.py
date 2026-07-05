@@ -1273,3 +1273,46 @@ def test_export_run_html_drops_legs_above_the_pair_threshold(monkeypatch) -> Non
     # The share page's lazy mode is never used for the download — the
     # offline file has no server to fetch from.
     assert captured["context"]["lazy_trips"] is False
+
+
+def test_export_run_html_keeps_legs_at_exactly_the_pair_threshold(monkeypatch) -> None:
+    """The threshold is INCLUSIVE: a run of exactly
+    `_EXPORT_LEG_DETAIL_MAX_PAIRS` result rows keeps full leg detail —
+    that's the contract the constant's size math is built on. Pins the
+    boundary so a `<=` → `<` refactor can't ship silently (mutation
+    testing showed the rest of the suite passes under that change)."""
+    from fastapi.responses import HTMLResponse
+
+    from app.api.admin import network_coverage as mod
+
+    run = _stub_run()
+    results = [
+        _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
+        for i in range(mod._EXPORT_LEG_DETAIL_MAX_PAIRS)
+    ]
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (run, results))
+
+    captured: dict = {}
+
+    def fake_fetch(_db, search_ids, *, include_legs=True):
+        captured["include_legs"] = include_legs
+        return {}
+
+    monkeypatch.setattr(mod, "_fetch_trips_by_search", fake_fetch)
+    monkeypatch.setattr(
+        mod.templates,
+        "TemplateResponse",
+        lambda _req, _name, context: (
+            captured.__setitem__("context", context),
+            HTMLResponse(content="<html>stub</html>"),
+        )[1],
+    )
+
+    mod.export_run_html(
+        run_id="11111111-1111-1111-1111-111111111111",
+        request=None,
+        db=_MockDb(rows=[]),
+        _=None,
+    )
+    assert captured["include_legs"] is True
+    assert captured["context"]["legs_omitted"] is False

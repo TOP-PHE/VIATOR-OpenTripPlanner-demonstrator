@@ -448,13 +448,25 @@
     return `ÖBB alignment: <code>${escapeHTML(cell.external_alignment_tier)}${scoreTxt}</code>`;
   }
 
-  function renderModalBody(cell) {
-    if (FLAGS.lazy_trips && !cell._tripsLoaded) {
-      return cell._tripsError
-        ? '<div class="empty-trips">Could not load itineraries for this cell — close and re-open to retry.</div>'
-        : '<div class="empty-trips">Loading itineraries…</div>';
+  // Share page only (FLAGS.lazy_trips): fetch state lives in this Map,
+  // NOT on the CELLS objects — the raw-data JSON panel below serializes
+  // CELLS verbatim, and writing bookkeeping flags or fetched trips onto
+  // those objects would make that machine-readable dump depend on which
+  // cells the reader happened to click. Keyed by pairKey; value is
+  // {loading, error, loaded, trips}.
+  const tripState = new Map();
+
+  function renderModalBody(pairKey, cell) {
+    let trips = cell.trips || [];
+    if (FLAGS.lazy_trips) {
+      const st = tripState.get(pairKey);
+      if (!st || !st.loaded) {
+        return st && st.error
+          ? '<div class="empty-trips">Could not load itineraries for this cell — close and re-open to retry.</div>'
+          : '<div class="empty-trips">Loading itineraries…</div>';
+      }
+      trips = st.trips;
     }
-    const trips = cell.trips || [];
     if (!trips.length) return '<div class="empty-trips">No itineraries recorded for this cell.</div>';
     const notes = [];
     if (cell.num_itineraries != null && cell.num_itineraries > trips.length) {
@@ -473,25 +485,25 @@
   // `currentPair` guards against a slow response landing after the
   // reader has already opened a different cell.
   let currentPair = null;
-  async function loadCellTrips(pairKey, cell) {
-    if (cell._tripsLoading) return;
-    cell._tripsLoading = true;
-    cell._tripsError = false;
+  async function loadCellTrips(pairKey) {
+    const prior = tripState.get(pairKey);
+    if (prior && prior.loading) return;
+    tripState.set(pairKey, { loading: true, error: false, loaded: false, trips: [] });
+    let next;
     try {
       const [orig, dest] = pairKey.split(':');
       const url = `/share/coverage/${encodeURIComponent(RUN.id)}/cells/${encodeURIComponent(orig)}/${encodeURIComponent(dest)}/trips`;
       const resp = await fetch(url);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
-      cell.trips = (data.outbound && data.outbound.trips) || [];
-      cell._tripsLoaded = true;
+      const trips = (data.outbound && data.outbound.trips) || [];
+      next = { loading: false, error: false, loaded: true, trips };
     } catch (err) {
-      cell._tripsError = true;
-    } finally {
-      cell._tripsLoading = false;
+      next = { loading: false, error: true, loaded: false, trips: [] };
     }
+    tripState.set(pairKey, next);
     if (currentPair === pairKey) {
-      document.getElementById('modal-body').innerHTML = renderModalBody(cell);
+      document.getElementById('modal-body').innerHTML = renderModalBody(pairKey, CELLS[pairKey]);
     }
   }
 
@@ -517,11 +529,12 @@
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
     currentPair = pairKey;
     // Kick the lazy fetch off BEFORE rendering the body: loadCellTrips
-    // clears the error/loading flags synchronously (before its first
-    // await), so a retry after a failed fetch renders as "Loading…"
-    // instead of momentarily re-showing the stale error text.
-    if (FLAGS.lazy_trips && !cell._tripsLoaded) loadCellTrips(pairKey, cell);
-    document.getElementById('modal-body').innerHTML = renderModalBody(cell);
+    // resets the pair's state synchronously (before its first await),
+    // so a retry after a failed fetch renders as "Loading…" instead of
+    // momentarily re-showing the stale error text.
+    const st = tripState.get(pairKey);
+    if (FLAGS.lazy_trips && !(st && st.loaded)) loadCellTrips(pairKey);
+    document.getElementById('modal-body').innerHTML = renderModalBody(pairKey, cell);
     document.getElementById('modal').hidden = false;
   }
 

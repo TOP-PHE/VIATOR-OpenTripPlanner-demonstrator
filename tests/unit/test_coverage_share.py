@@ -131,12 +131,18 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
             dest_hub_id="p-nord",
             status="ok",
             response_ms=100,
-            num_itineraries=0,
+            num_itineraries=3,
             best_duration_seconds=None,
             best_num_transfers=None,
             best_operators=None,
             error_message=None,
-            journey_search_id=None,
+            # A REAL search id, deliberately: with journey_search_id=None
+            # the cell renders "trips": [] no matter what the route does,
+            # and a regression that re-embeds trips (re-adding a
+            # _fetch_trips_by_search call on this path) would go
+            # undetected. With a real id, the assertion below only holds
+            # while the route truly embeds nothing.
+            journey_search_id=uuid.uuid4(),
             session_ids=None,
         ),
     ]
@@ -151,8 +157,11 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
     assert resp.status_code == 200
     assert "eu11-transit-motis" in resp.text
     # Share pages are lazy — trips are fetched per cell on click, never
-    # embedded, so page size stays constant regardless of run size.
+    # embedded, so page size stays constant regardless of run size. The
+    # cell has a search id and claims 3 itineraries, yet its embedded
+    # trips must still be empty.
     assert '"lazy_trips": true' in resp.text
+    assert '"trips": []' in resp.text
 
 
 def test_share_link_404_for_unknown_run(monkeypatch):
@@ -240,6 +249,47 @@ def test_shared_cell_trips_404_for_unknown_run():
     client = TestClient(_make_app(db_factory=lambda: _StubDb(None)))
     resp = client.get(f"/share/coverage/{uuid.uuid4()}/cells/a/b/trips")
     assert resp.status_code == 404
+
+
+def test_shared_cell_trips_strips_admin_only_external_itineraries(monkeypatch):
+    """The raw ÖBB payloads captured by the verify sweep were never
+    embedded or rendered by the share page — they were reachable only
+    through the platform_admin cell-trips endpoint. The public twin must
+    null them out, or a bare share URL silently grants previously
+    admin-only third-party planner data (and the module's 'reveals only
+    what the page shows' capability model becomes false)."""
+    from app.api.admin.network_coverage import CellTripsDirection, CellTripsResponse
+
+    run = _stub_run()
+    loaded = CellTripsResponse(
+        direction="both",
+        outbound=CellTripsDirection(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            trips=[{"rank": 0, "duration_seconds": 5000, "legs": []}],
+            external_itineraries=[{"duration_seconds": 5100, "legs": []}],
+        ),
+        return_=CellTripsDirection(
+            origin_hub_id="bxl-mid",
+            dest_hub_id="p-nord",
+            status="ok",
+            external_itineraries=[{"duration_seconds": 5200, "legs": []}],
+        ),
+    )
+    monkeypatch.setattr(
+        coverage_share, "_build_cell_trips_response", lambda db, run_arg, o, d: loaded
+    )
+
+    client = TestClient(_make_app(db_factory=lambda: _StubDb(run)))
+    resp = client.get(f"/share/coverage/{run.id}/cells/p-nord/bxl-mid/trips")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["outbound"]["external_itineraries"] is None
+    assert body["return"]["external_itineraries"] is None
+    # The VIATOR trips themselves — what the modal renders — survive.
+    assert len(body["outbound"]["trips"]) == 1
 
 
 def test_shared_cell_trips_has_no_current_user_dependency():

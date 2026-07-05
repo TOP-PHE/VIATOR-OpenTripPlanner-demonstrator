@@ -14,8 +14,9 @@ is no listing/enumeration endpoint here to discover one. This is
 "unlisted, not secret," matching the actual sensitivity of the data
 (coverage timing/alignment figures — nothing confidential), not a
 login-gated share. The per-cell trips endpoint below shares the same
-model: it only ever reveals data the page at `/{run_id}` would have
-embedded anyway, so knowing the run id already grants it.
+model: it reveals only data the page at `/{run_id}` would have embedded
+or rendered anyway (the admin-only `external_itineraries` field is
+stripped from its responses), so knowing the run id already grants it.
 
 Kept on its own router rather than as one dependency-less route bolted
 onto the admin router, so its lack of auth is a property of *which
@@ -111,12 +112,24 @@ def shared_cell_trips(
     sharing its query/marshalling helper so the two can't drift.
 
     No auth by design: the run id in the path is the same capability
-    that already unlocks the full report page, and this returns strictly
-    a subset of what that page used to embed. The higher 120/minute
+    that already unlocks the full report page. The higher 120/minute
     budget (vs 60 for the page) is because a reader exploring a matrix
     legitimately clicks many cells in quick succession.
+
+    `external_itineraries` (the raw ÖBB payloads captured by the verify
+    sweep) is stripped below: the share page has never embedded or
+    rendered it — only the admin matrix modal does, behind
+    platform_admin — and third-party planner data is a different
+    sensitivity class than the run's own coverage figures. Without the
+    strip, this route would silently expand the capability beyond
+    "what the page shows", which is the property that justifies no auth.
     """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
-    return _build_cell_trips_response(db, run, origin_id, dest_id)
+    resp = _build_cell_trips_response(db, run, origin_id, dest_id)
+    if resp.outbound is not None:
+        resp.outbound.external_itineraries = None
+    if resp.return_ is not None:
+        resp.return_.external_itineraries = None
+    return resp
