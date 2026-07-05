@@ -122,10 +122,24 @@ main {
 /* The matrix. Sticky first row + first column so headers stay visible
    while scrolling 23×23 cells. Cell colour = status / duration. */
 .cov-matrix-wrap { overflow: auto; max-height: calc(100vh - 280px); border: 1px solid var(--sleeper); border-radius: 4px; }
-.cov-matrix { border-collapse: collapse; font-size: 0.72rem; }
+/* table-layout: fixed + width: max-content are both load-bearing, not
+   cosmetic — found via a real bug report (a scrolled matrix showed
+   fragments of data cells bleeding through the sticky country/type/
+   name columns). Root cause: under the default `auto` table layout,
+   the browser shrinks a column below its declared `width` whenever
+   every cell in it is narrower (e.g. every band-type cell is a single
+   "?" glyph) — it measured ~half the declared width in production.
+   Since the NEXT sticky column's `left` offset is computed from the
+   declared widths below, that mismatch opened a real gap that the
+   scrolled-past data cells showed through. `fixed` layout + the
+   <colgroup> the JS emits (renderRun) makes every column exactly the
+   declared width regardless of its content; `max-content` stops the
+   table from proportionally shrinking those declared widths back down
+   to fit the wrapper (which would silently reintroduce the same gap). */
+.cov-matrix { border-collapse: collapse; font-size: 0.72rem; table-layout: fixed; width: max-content; }
 .cov-matrix th, .cov-matrix td {
-  border: 1px solid #eaeef2; padding: 0.15rem 0.3rem; min-width: 38px; text-align: center;
-  vertical-align: middle; white-space: nowrap;
+  border: 1px solid #eaeef2; padding: 0.15rem 0.3rem; text-align: center;
+  vertical-align: middle; white-space: nowrap; overflow: hidden;
   /* PR-E — anchors the absolutely-positioned external-verify dot to
      the cell's top-right corner without disrupting the existing
      status-glyph layout. */
@@ -135,14 +149,16 @@ main {
    already existed; these two add a banded frame above/beside it:
    country (solid color, colspan/rowspan-merged across each country's
    run of hubs) then type (a lighter tint of the same color, R/T/M/B/C
-   codes). Fixed widths/heights on the country + type bands make the
-   sticky offsets below deterministic — only the last band in each
-   sticky stack (the name row/column) is left auto-sized, since nothing
-   needs to stack past it. */
+   codes). Every column (these two, the name column, and every data
+   column) gets an explicit width via the <colgroup> renderRun emits —
+   table-layout: fixed needs that to size them deterministically
+   instead of guessing from content. */
 :root {
   --cov-band-country-w: 1.7rem;
   --cov-band-type-w: 2.9rem;
   --cov-band-row-h: 1.35rem;
+  --cov-hub-label-w: 6.5rem;
+  --cov-data-col-w: 4.5rem;
 }
 .cov-matrix thead th {
   position: sticky; z-index: 2; background: #f6f8fa;
@@ -155,9 +171,19 @@ main {
   position: sticky; z-index: 1; background: #f6f8fa;
   text-align: right; font-weight: 600; padding: 0.3rem 0.5rem;
 }
-.cov-matrix tbody th.cov-band-country { left: 0; width: var(--cov-band-country-w); }
-.cov-matrix tbody th.cov-band-type    { left: var(--cov-band-country-w); width: var(--cov-band-type-w); }
-.cov-matrix tbody th.hub-label        { left: calc(var(--cov-band-country-w) + var(--cov-band-type-w)); }
+.cov-matrix tbody th.cov-band-country { left: 0; }
+.cov-matrix tbody th.cov-band-type    { left: var(--cov-band-country-w); }
+/* left/sticky is tbody-only on purpose — the thead's hub-label cells
+   are column headers for the DATA columns and scroll normally with
+   them; only the ROW-label (tbody) hub-label needs to stay pinned
+   next to the country/type bands. text-overflow is NOT tbody-only,
+   though: thead uses the identical <th class="hub-label"> markup for
+   column headers (nameHeaderRow) with the same fixed-width column, so
+   without this on both, a long label hard-clips with no "…" in the
+   header row while the exact same label ellipsizes two rows down as
+   the row label — confirmed via adversarial review of PR #217. */
+.cov-matrix tbody th.hub-label { left: calc(var(--cov-band-country-w) + var(--cov-band-type-w)); }
+.cov-matrix th.hub-label { text-overflow: ellipsis; }
 /* Corner spacers sit above every other sticky cell in both directions
    (they're sticky on BOTH axes at once) so nothing scrolls over them. */
 .cov-matrix thead th.cov-corner { left: 0; background: var(--paper); z-index: 4; }
@@ -1484,6 +1510,15 @@ function renderRun(run) {
     `<th class="hub-label" scope="col" data-has-country title="${escHTML(h.name)}"${bandStyle(h)}>${escHTML(h.short)}</th>`
   ).join('') + '</tr>';
   const headerRow = countryHeaderRow + typeHeaderRow + nameHeaderRow;
+  // table-layout: fixed (see the CSS block above) needs every column's
+  // width declared here, independent of any row's content — colspan'd
+  // header cells can't assign per-column widths on their own.
+  const colgroup = '<colgroup>' +
+    '<col style="width: var(--cov-band-country-w)">' +
+    '<col style="width: var(--cov-band-type-w)">' +
+    '<col style="width: var(--cov-hub-label-w)">' +
+    HUBS.map(() => '<col style="width: var(--cov-data-col-w)">').join('') +
+    '</colgroup>';
 
   const countryRowRuns = groupRuns(HUBS, 'country');
   let hubIdx = 0;
@@ -1519,6 +1554,7 @@ function renderRun(run) {
          for trip-count information.`;
   main.innerHTML = summary + `<div class="cov-matrix-wrap">
     <table class="cov-matrix">
+      ${colgroup}
       <thead>${headerRow}</thead>
       <tbody>${bodyRows}</tbody>
     </table>

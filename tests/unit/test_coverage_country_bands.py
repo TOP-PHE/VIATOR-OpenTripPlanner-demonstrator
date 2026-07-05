@@ -72,6 +72,49 @@ def test_legend_explains_the_type_codes(live_text: str):
         assert code in live_text
 
 
+def test_matrix_uses_fixed_table_layout_with_colgroup(live_text: str):
+    """Regression lock for a real bug report: scrolled data cells bled
+    through the sticky country/type/name columns. Root cause was
+    table-layout: auto silently shrinking a declared-width column
+    (band-type's cells are all a single "?" glyph) below its CSS
+    `width`, which desynced it from the next sticky column's
+    calc()-based `left` offset. `fixed` layout only sizes columns
+    correctly when paired with a <colgroup> declaring every column's
+    width — colspan'd header cells can't do that on their own — and the
+    table needs `width: max-content` or it proportionally shrinks the
+    declared widths back down to fit the wrapper, reintroducing the
+    exact same gap."""
+    assert "table-layout: fixed" in live_text
+    assert "width: max-content" in live_text
+    assert re.search(r"const colgroup = ", live_text)
+    assert "--cov-hub-label-w" in live_text and "--cov-data-col-w" in live_text
+
+
+def test_matrix_hub_label_ellipsis_applies_to_header_row_too(live_text: str):
+    """Adversarial-review finding on PR #217: the initial fix scoped
+    `text-overflow: ellipsis` to `tbody th.hub-label` only. thead's
+    column-header row uses the identical <th class="hub-label"> markup
+    (nameHeaderRow) pinned to the same fixed-width column — without the
+    same rule, a long label hard-clips with no "…" in the header while
+    the exact same label ellipsizes cleanly as the row label. `left`
+    (the sticky offset) is correctly tbody-only — thead's hub-label
+    cells are column headers that scroll normally, not sticky columns
+    — only text-overflow needs to cover both."""
+    assert re.search(r"\.cov-matrix th\.hub-label\s*\{[^}]*text-overflow:\s*ellipsis", live_text)
+    assert re.search(r"\.cov-matrix tbody th\.hub-label\s*\{[^}]*left:", live_text)
+    assert not re.search(r"\.cov-matrix thead th\.hub-label\s*\{[^}]*left:", live_text)
+
+
+def test_matrix_tbody_sticky_cells_have_explicit_z_index(live_text: str):
+    """The gap-closing fix alone wasn't sufficient — even with zero gap,
+    a rowspan'd sticky <th> without an explicit z-index let plain <td>s
+    from later rows paint over it during horizontal scroll (confirmed
+    via elementFromPoint in a browser, not just geometry). Every tbody
+    sticky th needs the same explicit value so none of them can lose
+    that fight to a data cell."""
+    assert re.search(r"\.cov-matrix tbody th \{[^}]*z-index:\s*1", live_text)
+
+
 # ─────────────────────── offline export (Jinja) ───────────────────────
 
 
@@ -88,6 +131,28 @@ def test_export_type_band_falls_back_to_unclassified_marker(export_text: str):
 def test_export_legend_explains_the_type_codes(export_text: str):
     for code in ("Rail", "Tram", "Metro", "Bus", "Coach"):
         assert code in export_text
+
+
+def test_export_matrix_uses_fixed_table_layout_with_colgroup(export_text: str):
+    """Same regression lock as the live matrix (see the sibling test):
+    the offline export had the identical table-layout: auto + declared
+    -width-column mismatch, worse in practice since its px-based guess
+    (38px) was further from the "?" glyph's real rendered width than
+    the live app's rem-based one."""
+    assert "table-layout: fixed" in export_text
+    assert "width: max-content" in export_text
+    assert "<colgroup>" in export_text
+    assert "--axis-row-w" in export_text and "--data-col-w" in export_text
+
+
+def test_export_matrix_tbody_sticky_cells_have_explicit_z_index(export_text: str):
+    """band-country and band-type had NO z-index at all (only axis-row
+    did) — confirmed via elementFromPoint in a browser that scrolled
+    data cells painted over them despite correct geometry. All three
+    need it."""
+    assert re.search(r"th\.band-country\s*\{[^}]*z-index:\s*1", export_text)
+    assert re.search(r"th\.band-type\s*\{[^}]*z-index:\s*1", export_text)
+    assert re.search(r"th\.axis-row\s*\{[^}]*z-index:\s*1", export_text)
 
 
 # ─────────────────────── modes field round-trip (hub CRUD) ───────────────────────
