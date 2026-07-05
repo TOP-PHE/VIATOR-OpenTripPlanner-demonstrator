@@ -13,7 +13,9 @@ run's id is equivalent to holding an unguessable bearer token, and there
 is no listing/enumeration endpoint here to discover one. This is
 "unlisted, not secret," matching the actual sensitivity of the data
 (coverage timing/alignment figures — nothing confidential), not a
-login-gated share.
+login-gated share. The per-cell trips endpoint below shares the same
+model: it only ever reveals data the page at `/{run_id}` would have
+embedded anyway, so knowing the run id already grants it.
 
 Kept on its own router rather than as one dependency-less route bolted
 onto the admin router, so its lack of auth is a property of *which
@@ -32,13 +34,15 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session as DbSession
 
 from ..db import get_db
+from ..models import NetworkCoverageRun
 from ..network_coverage import runner
 from ..rate_limit import limiter
 from ..templating import templates
 from .admin.network_coverage import (
     _RUN_NOT_FOUND,
+    CellTripsResponse,
+    _build_cell_trips_response,
     _build_export_context,
-    _fetch_trips_by_search,
     _resolve_hubs,
 )
 
@@ -56,11 +60,19 @@ def view_shared_run(
     run_id: uuid.UUID,
     db: Annotated[DbSession, Depends(get_db)],
 ) -> HTMLResponse:
-    """Render the same self-contained report as the admin export endpoint,
-    inline (no Content-Disposition) and with no auth dependency — the
-    URL itself, carrying the unguessable run id, is the access control.
+    """Render the run report inline (no Content-Disposition) and with no
+    auth dependency — the URL itself, carrying the unguessable run id,
+    is the access control.
 
-    Reuses `_build_export_context` verbatim (same helper the authenticated
+    Unlike the downloaded export, this page embeds NO trip detail
+    (`lazy_trips=True`): the modal fetches each clicked cell's
+    itineraries from the sibling endpoint below, exactly like the live
+    admin matrix does. That keeps the page a constant few MB regardless
+    of run size — a 94-hub / 8742-pair run embedded ~150MB of leg JSON
+    under the old embed-everything approach, which no browser could
+    open — while preserving FULL leg detail on click for any run.
+
+    Reuses `_build_export_context` (same helper the authenticated
     download endpoint calls) so the shared view and the downloaded file
     can never drift apart into two different renderings of the same run.
 
@@ -72,11 +84,39 @@ def view_shared_run(
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
-    search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
     context = _build_export_context(
         run=run,
         results=results,
         hubs=_resolve_hubs(db),
-        trips_by_search=_fetch_trips_by_search(db, search_ids),
+        trips_by_search={},
+        lazy_trips=True,
     )
     return templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
+
+
+@router.get(
+    "/{run_id}/cells/{origin_id}/{dest_id}/trips",
+    responses={404: {"description": _RUN_NOT_FOUND}},
+)
+@limiter.limit("120/minute")
+def shared_cell_trips(
+    request: Request,
+    run_id: uuid.UUID,
+    origin_id: str,
+    dest_id: str,
+    db: Annotated[DbSession, Depends(get_db)],
+) -> CellTripsResponse:
+    """One cell's trip breakdown for the share page's click modal —
+    the public twin of the admin `GET /runs/{id}/cells/{o}/{d}/trips`,
+    sharing its query/marshalling helper so the two can't drift.
+
+    No auth by design: the run id in the path is the same capability
+    that already unlocks the full report page, and this returns strictly
+    a subset of what that page used to embed. The higher 120/minute
+    budget (vs 60 for the page) is because a reader exploring a matrix
+    legitimately clicks many cells in quick succession.
+    """
+    run = db.get(NetworkCoverageRun, run_id)
+    if run is None:
+        raise HTTPException(404, _RUN_NOT_FOUND)
+    return _build_cell_trips_response(db, run, origin_id, dest_id)

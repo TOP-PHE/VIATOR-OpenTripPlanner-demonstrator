@@ -764,9 +764,20 @@ def _resolve_hubs(db: DbSession) -> list[HubInfo]:
 # modal notes when it's showing a truncated set.
 _MAX_TRIPS_PER_CELL_EXPORT = 10
 
+# Above this many result rows, the DOWNLOADED export drops leg-by-leg
+# detail from the embedded trips (summaries — times, duration, transfers,
+# modes — stay). Legs average ~1.7KB/trip and are ~90% of the report's
+# bytes: a real 8742-pair run still produced a ~150MB file after the
+# per-cell cap above, which no browser can open even when the download
+# succeeds. 500 pairs x 10 trips x ~1.7KB keeps the worst full-detail
+# file under ~10MB. The ONLINE share page is unaffected — it lazy-loads
+# each cell's full detail on click (see app/api/coverage_share.py), so
+# it keeps full fidelity at any run size.
+_EXPORT_LEG_DETAIL_MAX_PAIRS = 500
+
 
 def _fetch_trips_by_search(
-    db: DbSession, search_ids: list[uuid.UUID]
+    db: DbSession, search_ids: list[uuid.UUID], *, include_legs: bool = True
 ) -> dict[str, list[dict[str, Any]]]:
     """Bulk-fetch every JourneyTrip linked (via JourneySearchExecution) to
     the given JourneySearch ids.
@@ -792,29 +803,63 @@ def _fetch_trips_by_search(
     comment. The query still orders by `rank_in_response` first, so the
     kept trips are always the best-ranked ones regardless of how many
     executions/slots contributed to a given search.
+
+    `include_legs=False` (large exports — see `_EXPORT_LEG_DETAIL_MAX_PAIRS`)
+    projects explicit columns instead of full ORM rows so the legs JSON is
+    never even pulled out of Postgres — on the 8742-pair run that's ~372MB
+    of wire traffic skipped, not just dropped after fetching. Trips then
+    carry `"legs": []`, which the export modal renders as a summary row.
     """
     if not search_ids:
         return {}
-    rows = db.execute(
+    base = (
         select(JourneySearchExecution.search_id, JourneyTrip)
-        .join(JourneyTrip, JourneyTrip.execution_id == JourneySearchExecution.id)
+        if include_legs
+        else select(
+            JourneySearchExecution.search_id,
+            JourneyTrip.rank_in_response,
+            JourneyTrip.duration_seconds,
+            JourneyTrip.num_transfers,
+            JourneyTrip.departure_at,
+            JourneyTrip.arrival_at,
+            JourneyTrip.modes,
+        )
+    )
+    rows = db.execute(
+        base.join(JourneyTrip, JourneyTrip.execution_id == JourneySearchExecution.id)
         .where(JourneySearchExecution.search_id.in_(search_ids))
         .order_by(JourneySearchExecution.search_id, JourneyTrip.rank_in_response)
     ).all()
+    if include_legs:
+        records = (
+            (
+                search_id,
+                t.rank_in_response,
+                t.duration_seconds,
+                t.num_transfers,
+                t.departure_at,
+                t.arrival_at,
+                t.modes,
+                t.legs,
+            )
+            for search_id, t in rows
+        )
+    else:
+        records = ((*row, []) for row in rows)
     out: dict[str, list[dict[str, Any]]] = {}
-    for search_id, t in rows:
+    for search_id, rank, duration_seconds, num_transfers, departure_at, arrival_at, modes, legs in records:
         bucket = out.setdefault(str(search_id), [])
         if len(bucket) >= _MAX_TRIPS_PER_CELL_EXPORT:
             continue
         bucket.append(
             {
-                "rank": t.rank_in_response,
-                "duration_seconds": t.duration_seconds,
-                "num_transfers": t.num_transfers,
-                "departure_at": t.departure_at.isoformat() if t.departure_at else None,
-                "arrival_at": t.arrival_at.isoformat() if t.arrival_at else None,
-                "modes": t.modes,
-                "legs": t.legs,
+                "rank": rank,
+                "duration_seconds": duration_seconds,
+                "num_transfers": num_transfers,
+                "departure_at": departure_at.isoformat() if departure_at else None,
+                "arrival_at": arrival_at.isoformat() if arrival_at else None,
+                "modes": modes,
+                "legs": legs,
             }
         )
     return out
@@ -890,6 +935,8 @@ def _build_export_context(
     results: list[Any],
     hubs: list[HubInfo],
     trips_by_search: dict[str, list[dict[str, Any]]],
+    lazy_trips: bool = False,
+    legs_omitted: bool = False,
 ) -> dict[str, Any]:
     """Pure data-shaping from DB rows → template context dict.
 
@@ -900,6 +947,12 @@ def _build_export_context(
 
     Cells are keyed by `"<origin_id>:<dest_id>"` so the Jinja template can
     index by string concat — cleaner than nested loops with tuple keys.
+
+    `lazy_trips` (share page) tells the template that trips were NOT
+    embedded and the modal should fetch each cell's detail on click.
+    `legs_omitted` (large downloads) tells it trips were embedded without
+    leg detail so the modal can explain the gap. Both default False so
+    the small-run download keeps its historical full-detail behaviour.
     """
     cells: dict[str, dict[str, Any]] = {}
     for r in results:
@@ -956,6 +1009,8 @@ def _build_export_context(
         "hubs": annotated_hubs,
         "country_col_runs": country_col_runs,
         "cells": cells,
+        "lazy_trips": lazy_trips,
+        "legs_omitted": legs_omitted,
     }
 
 
@@ -1054,6 +1109,12 @@ def export_run_html(
     in-flight state. Recipients viewing a 'running' export see the matrix
     as of the snapshot moment.
 
+    Large runs (> `_EXPORT_LEG_DETAIL_MAX_PAIRS` result rows) drop the
+    leg-by-leg detail from embedded trips — the full-detail file for a
+    94-hub run is ~150MB, which downloads fine but no browser will open.
+    Trip summaries (times, duration, transfers, modes) stay, and the
+    modal points at the online share link for full depth.
+
     Implementation: data-shaping lives in `_build_export_context` so it's
     unit-testable without DB. This function is thin orchestration:
     query → marshal → render → set download header.
@@ -1062,11 +1123,13 @@ def export_run_html(
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
     search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
+    include_legs = len(results) <= _EXPORT_LEG_DETAIL_MAX_PAIRS
     context = _build_export_context(
         run=run,
         results=results,
         hubs=_resolve_hubs(db),
-        trips_by_search=_fetch_trips_by_search(db, search_ids),
+        trips_by_search=_fetch_trips_by_search(db, search_ids, include_legs=include_legs),
+        legs_omitted=not include_legs,
     )
     response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
     response.headers["Content-Disposition"] = f'attachment; filename="{_export_filename(run)}"'
@@ -1246,13 +1309,26 @@ def get_cell_trips(
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
+    return _build_cell_trips_response(db, run, origin_id, dest_id)
 
+
+def _build_cell_trips_response(
+    db: DbSession, run: NetworkCoverageRun, origin_id: str, dest_id: str
+) -> CellTripsResponse:
+    """Query + marshal one cell's trip breakdown (both directions).
+
+    Extracted from `get_cell_trips` so the public share router
+    (app/api/coverage_share.py) can serve the identical payload for the
+    share page's lazy cell modal without inheriting this router's
+    platform_admin dependency — same reuse pattern as
+    `_build_export_context`.
+    """
     # Fetch both result rows in one round-trip. The UNIQUE constraint
     # `(run_id, origin, dest)` means we get at most 2 rows here.
     rows = (
         db.execute(
             select(NetworkCoverageResult)
-            .where(NetworkCoverageResult.run_id == run_id)
+            .where(NetworkCoverageResult.run_id == run.id)
             .where(
                 (
                     (NetworkCoverageResult.origin_hub_id == origin_id)

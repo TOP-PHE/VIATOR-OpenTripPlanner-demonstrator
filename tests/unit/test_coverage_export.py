@@ -170,8 +170,14 @@ def _sample_cells() -> dict[str, dict]:
     }
 
 
-def _render() -> str:
-    """Render the export template with the standard sample fixtures."""
+def _render(**flags) -> str:
+    """Render the export template with the standard sample fixtures.
+
+    `flags` passes through `lazy_trips` / `legs_omitted`; omitting them
+    (all the pre-existing tests) exercises the template's own
+    `|default(false)` fallbacks — the same situation as a cached old
+    context or the small-run download path.
+    """
     env = _env()
     tpl = env.get_template("admin/network_coverage_export.html")
     return tpl.render(
@@ -179,6 +185,7 @@ def _render() -> str:
         hubs=_sample_hubs(),
         cells=_sample_cells(),
         country_col_runs=_sample_country_col_runs(),
+        **flags,
     )
 
 
@@ -190,6 +197,42 @@ def test_template_renders_without_error() -> None:
     html = _render()
     assert html.startswith("<!DOCTYPE html>")
     assert "</html>" in html
+
+
+def test_flags_default_false_when_context_omits_them() -> None:
+    """Old callers (and the small-run download) pass no flags at all —
+    the template's `|default(false)` must render both as JSON false so
+    the modal keeps its historical embedded-trips behaviour."""
+    html = _render()
+    assert '"lazy_trips": false' in html
+    assert '"legs_omitted": false' in html
+
+
+def test_lazy_trips_flag_flips_in_rendered_json() -> None:
+    html = _render(lazy_trips=True)
+    assert '"lazy_trips": true' in html
+    assert '"legs_omitted": false' in html
+
+
+def test_lazy_fetch_wiring_present() -> None:
+    """The share page's modal must be able to fetch per-cell detail:
+    the flags tag, the loader function, and the public endpoint URL
+    pattern all have to survive template refactors."""
+    html = _render()
+    assert 'id="cov-flags"' in html
+    assert "loadCellTrips" in html
+    assert "/share/coverage/" in html
+    assert "/trips" in html
+    assert "Loading itineraries" in html
+
+
+def test_legs_omitted_note_text_present() -> None:
+    """The large-download modal explains why legs are missing and where
+    to find them — the wording lives in JS so it renders regardless of
+    which cell is opened."""
+    html = _render(legs_omitted=True)
+    assert "Leg-by-leg detail is omitted" in html
+    assert "shared link" in html
 
 
 def test_includes_run_metadata_header() -> None:
@@ -1001,6 +1044,58 @@ def test_fetch_trips_by_search_cap_applies_independently_per_search() -> None:
     assert len(out[str(search_b)]) == 3
 
 
+def test_fetch_trips_by_search_without_legs_returns_summaries_with_empty_legs() -> None:
+    """`include_legs=False` (large exports) projects explicit columns —
+    the query returns plain tuples instead of ORM rows, so the ~1.7KB/trip
+    legs JSON never leaves Postgres. The output shape must be identical
+    to the full path except `legs` is always `[]`."""
+    from datetime import datetime
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _fetch_trips_by_search
+
+    search_id = uuid4()
+    # Column-projected row shape: (search_id, rank, duration, transfers,
+    # departure_at, arrival_at, modes) — no trip object, no legs.
+    rows = [
+        (search_id, 0, 4980, 0, datetime(2026, 6, 29, 6, 25), datetime(2026, 6, 29, 7, 48), "RAIL"),
+        (search_id, 1, 5400, 1, None, None, "RAIL,TRAM"),
+    ]
+    db = _MockDb(rows=rows)
+    out = _fetch_trips_by_search(db, search_ids=[search_id], include_legs=False)
+    trips = out[str(search_id)]
+    assert len(trips) == 2
+    assert trips[0] == {
+        "rank": 0,
+        "duration_seconds": 4980,
+        "num_transfers": 0,
+        "departure_at": "2026-06-29T06:25:00",
+        "arrival_at": "2026-06-29T07:48:00",
+        "modes": "RAIL",
+        "legs": [],
+    }
+    assert trips[1]["legs"] == []
+    assert trips[1]["departure_at"] is None
+
+
+def test_fetch_trips_by_search_without_legs_still_caps_per_search() -> None:
+    """The per-cell cap applies on both query paths — a large export
+    must not regain unbounded trips just because it took the no-legs
+    branch."""
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _MAX_TRIPS_PER_CELL_EXPORT, _fetch_trips_by_search
+
+    search_id = uuid4()
+    rows = [
+        (search_id, i, 3600, 0, None, None, "RAIL")
+        for i in range(_MAX_TRIPS_PER_CELL_EXPORT + 4)
+    ]
+    db = _MockDb(rows=rows)
+    out = _fetch_trips_by_search(db, search_ids=[search_id], include_legs=False)
+    assert len(out[str(search_id)]) == _MAX_TRIPS_PER_CELL_EXPORT
+
+
 def test_resolve_hubs_returns_db_rows_when_present() -> None:
     """Happy path: `network_coverage_hubs` table has rows → return them
     via `_hub_to_info` shape conversion. The fallback to static HUBS
@@ -1101,5 +1196,80 @@ def test_export_run_html_renders_with_content_disposition(monkeypatch) -> None:
     assert "coverage-eu11-transit-motis-20260629-0555.html" in cd
     assert cd.startswith("attachment;")
     # Template context has the top-level keys the template indexes by.
-    assert set(captured["context"].keys()) == {"run", "hubs", "cells", "country_col_runs"}
+    assert set(captured["context"].keys()) == {
+        "run",
+        "hubs",
+        "cells",
+        "country_col_runs",
+        "lazy_trips",
+        "legs_omitted",
+    }
     assert captured["context"]["cells"] == {}  # no results passed
+    # A tiny run keeps the historical full-embed behaviour: nothing lazy,
+    # nothing omitted.
+    assert captured["context"]["lazy_trips"] is False
+    assert captured["context"]["legs_omitted"] is False
+
+
+def _minimal_result_stub(origin: str = "a", dest: str = "b"):
+    """The 9 attributes `_build_export_context` reads directly off a
+    result row (the external_* / session_ids extras go through getattr
+    with a None default, so a bare stub is enough for those)."""
+    return _StubResult(
+        origin_hub_id=origin,
+        dest_hub_id=dest,
+        status="ok",
+        response_ms=100,
+        num_itineraries=1,
+        best_duration_seconds=3600,
+        best_num_transfers=0,
+        best_operators=None,
+        error_message=None,
+        journey_search_id=None,
+    )
+
+
+def test_export_run_html_drops_legs_above_the_pair_threshold(monkeypatch) -> None:
+    """A run with more result rows than `_EXPORT_LEG_DETAIL_MAX_PAIRS`
+    must fetch trips WITHOUT legs and flag `legs_omitted` to the
+    template — the full-detail file for a 94-hub run is ~150MB, which no
+    browser can open. Below the threshold nothing changes (previous
+    test)."""
+    from fastapi.responses import HTMLResponse
+
+    from app.api.admin import network_coverage as mod
+
+    run = _stub_run()
+    results = [
+        _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
+        for i in range(mod._EXPORT_LEG_DETAIL_MAX_PAIRS + 1)
+    ]
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (run, results))
+
+    captured: dict = {}
+
+    def fake_fetch(_db, search_ids, *, include_legs=True):
+        captured["include_legs"] = include_legs
+        return {}
+
+    monkeypatch.setattr(mod, "_fetch_trips_by_search", fake_fetch)
+    monkeypatch.setattr(
+        mod.templates,
+        "TemplateResponse",
+        lambda _req, _name, context: (
+            captured.__setitem__("context", context),
+            HTMLResponse(content="<html>stub</html>"),
+        )[1],
+    )
+
+    mod.export_run_html(
+        run_id="11111111-1111-1111-1111-111111111111",
+        request=None,
+        db=_MockDb(rows=[]),
+        _=None,
+    )
+    assert captured["include_legs"] is False
+    assert captured["context"]["legs_omitted"] is True
+    # The share page's lazy mode is never used for the download — the
+    # offline file has no server to fetch from.
+    assert captured["context"]["lazy_trips"] is False

@@ -338,12 +338,19 @@
 <script id="cov-hubs" type="application/json">{{ hubs|tojson }}</script>
 <script id="cov-cells" type="application/json">{{ cells|tojson }}</script>
 <script id="cov-run" type="application/json">{{ run|tojson }}</script>
+{# lazy_trips: served by the ONLINE share route — no trips embedded, the
+   modal fetches each cell's detail on click (works at any run size).
+   legs_omitted: large DOWNLOADED export — trip summaries embedded but
+   leg detail dropped to keep the file openable. Defaults keep old
+   renders (and the small-run download) on the full-embed path. #}
+<script id="cov-flags" type="application/json">{{ {"lazy_trips": lazy_trips|default(false), "legs_omitted": legs_omitted|default(false)}|tojson }}</script>
 
 <script>
 (function () {
   const HUBS = JSON.parse(document.getElementById('cov-hubs').textContent);
   const CELLS = JSON.parse(document.getElementById('cov-cells').textContent);
   const RUN = JSON.parse(document.getElementById('cov-run').textContent);
+  const FLAGS = JSON.parse(document.getElementById('cov-flags').textContent);
   const HUBS_BY_ID = Object.fromEntries(HUBS.map(h => [h.id, h]));
 
   function fmtDuration(s) {
@@ -442,13 +449,50 @@
   }
 
   function renderModalBody(cell) {
+    if (FLAGS.lazy_trips && !cell._tripsLoaded) {
+      return cell._tripsError
+        ? '<div class="empty-trips">Could not load itineraries for this cell — close and re-open to retry.</div>'
+        : '<div class="empty-trips">Loading itineraries…</div>';
+    }
     const trips = cell.trips || [];
     if (!trips.length) return '<div class="empty-trips">No itineraries recorded for this cell.</div>';
-    const truncated = cell.num_itineraries != null && cell.num_itineraries > trips.length;
-    const note = truncated
-      ? `<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — the export caps itinerary detail per cell to keep the report a manageable size.</p>`
-      : '';
-    return note + trips.map(renderTrip).join('');
+    const notes = [];
+    if (cell.num_itineraries != null && cell.num_itineraries > trips.length) {
+      notes.push(`<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — this report caps itinerary detail per cell to keep it a manageable size.</p>`);
+    }
+    if (FLAGS.legs_omitted) {
+      notes.push('<p class="truncated-note">Leg-by-leg detail is omitted from this offline export because the run is large — open the run’s shared link for full detail.</p>');
+    }
+    return notes.join('') + trips.map(renderTrip).join('');
+  }
+
+  // Share page only (FLAGS.lazy_trips): the page embeds no trip detail —
+  // fetch one cell's itineraries on demand from the public per-cell
+  // endpoint, exactly like the live admin matrix's modal does. The run
+  // id in the URL is the same capability that unlocked this page.
+  // `currentPair` guards against a slow response landing after the
+  // reader has already opened a different cell.
+  let currentPair = null;
+  async function loadCellTrips(pairKey, cell) {
+    if (cell._tripsLoading) return;
+    cell._tripsLoading = true;
+    cell._tripsError = false;
+    try {
+      const [orig, dest] = pairKey.split(':');
+      const url = `/share/coverage/${encodeURIComponent(RUN.id)}/cells/${encodeURIComponent(orig)}/${encodeURIComponent(dest)}/trips`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      cell.trips = (data.outbound && data.outbound.trips) || [];
+      cell._tripsLoaded = true;
+    } catch (err) {
+      cell._tripsError = true;
+    } finally {
+      cell._tripsLoading = false;
+    }
+    if (currentPair === pairKey) {
+      document.getElementById('modal-body').innerHTML = renderModalBody(cell);
+    }
   }
 
   function openModal(pairKey) {
@@ -471,11 +515,20 @@
     const alignmentPart = alignmentSummaryPart(cell);
     if (alignmentPart) parts.push(alignmentPart);
     document.getElementById('modal-summary').innerHTML = parts.join(' · ');
+    currentPair = pairKey;
+    // Kick the lazy fetch off BEFORE rendering the body: loadCellTrips
+    // clears the error/loading flags synchronously (before its first
+    // await), so a retry after a failed fetch renders as "Loading…"
+    // instead of momentarily re-showing the stale error text.
+    if (FLAGS.lazy_trips && !cell._tripsLoaded) loadCellTrips(pairKey, cell);
     document.getElementById('modal-body').innerHTML = renderModalBody(cell);
     document.getElementById('modal').hidden = false;
   }
 
-  function closeModal() { document.getElementById('modal').hidden = true; }
+  function closeModal() {
+    currentPair = null;
+    document.getElementById('modal').hidden = true;
+  }
 
   document.addEventListener('click', (e) => {
     const t = e.target.closest('[data-pair]');
