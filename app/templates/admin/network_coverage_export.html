@@ -26,6 +26,8 @@
       --band-country-w: 22px;
       --band-type-w: 38px;
       --band-row-h: 18px;
+      --axis-row-w: 92px;
+      --data-col-w: 68px;
     }
     * { box-sizing: border-box; }
     body {
@@ -51,12 +53,28 @@
 
     /* Matrix */
     .matrix-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
-    table.matrix {
-      border-collapse: collapse; font-size: 11px; min-width: 100%;
-    }
+    /* table-layout: fixed is load-bearing, not cosmetic. Under the
+       default `auto` layout the browser shrinks a column below its
+       declared `width` whenever every cell in it is narrower than that
+       (e.g. band-type's cells are all a single "?" glyph) — the column
+       genuinely rendered ~18px wide against a declared 38px in
+       production. Since the NEXT sticky column's `left` offset is
+       computed from the declared widths (below), that mismatch opened
+       a real gap between the two sticky columns that the scrolled-past
+       data cells showed through. `fixed` layout + the <colgroup> makes
+       every column's width exactly what's declared, independent of its
+       content, which is what the offsets below already assumed. */
+    /* width: max-content is also load-bearing: with `width: auto` (the
+       default), a fixed-layout table whose declared column-width sum
+       exceeds its container shrinks every column proportionally to
+       fit instead of overflowing into .matrix-wrap's scrollbar — which
+       would silently reintroduce the exact mismatch this table-layout
+       switch exists to fix. max-content sizes the table to the sum of
+       its (now fixed) column widths and lets the wrapper scroll. */
+    table.matrix { border-collapse: collapse; font-size: 11px; table-layout: fixed; width: max-content; }
     table.matrix th, table.matrix td {
       border: 1px solid var(--line); padding: 4px 6px; white-space: nowrap;
-      text-align: center; vertical-align: middle;
+      text-align: center; vertical-align: middle; overflow: hidden;
     }
     table.matrix th { background: #f5f7fa; font-weight: 600; }
 
@@ -64,22 +82,29 @@
        (network_coverage.html): a solid country strip merged across
        each country's run of hubs, a lighter-tint type strip beneath
        it (R/T/M/B/C), then the existing axis-row (station name).
-       Fixed widths/heights on the first two bands make the sticky
-       offsets below deterministic; only axis-row (the last band in
-       each stack) is left auto-sized. */
+       All three (plus every data column) get an explicit width via the
+       <colgroup> below, which is what makes table-layout: fixed size
+       them deterministically instead of guessing from content. */
     table.matrix thead th { position: sticky; z-index: 2; }
     table.matrix thead tr:nth-child(1) th { top: 0; height: var(--band-row-h); }
     table.matrix thead tr:nth-child(2) th { top: var(--band-row-h); height: var(--band-row-h); }
     table.matrix thead tr:nth-child(3) th { top: calc(var(--band-row-h) * 2); }
     table.matrix th.corner { left: 0; background: var(--bg); z-index: 4; border: none; }
+    /* z-index: 1 on every tbody sticky <th> below is NOT redundant with
+       "positioned beats non-positioned" stacking order in theory — in
+       practice (Chromium, tested), a rowspan'd sticky <th> (band-country
+       spans multiple hub rows) without an explicit z-index let plain
+       <td>s from LATER rows in DOM order paint over it during
+       horizontal scroll. All three bands need the same explicit value
+       so none of them can win that fight against a data cell. */
     table.matrix th.band-country {
-      left: 0; width: var(--band-country-w); position: sticky;
+      left: 0; position: sticky; z-index: 1;
       color: #fff; font-weight: 700; font-size: 9px; letter-spacing: 0.03em;
       text-transform: uppercase; background: var(--band-color);
     }
     table.matrix th.band-country.row { writing-mode: vertical-rl; transform: rotate(180deg); }
     table.matrix th.band-type {
-      left: var(--band-country-w); width: var(--band-type-w); position: sticky;
+      left: var(--band-country-w); position: sticky; z-index: 1;
       font-size: 0.7rem; font-weight: 700;
       background: color-mix(in srgb, var(--band-color) 28%, white);
       color: var(--band-color);
@@ -87,6 +112,7 @@
     table.matrix th.axis-row {
       left: calc(var(--band-country-w) + var(--band-type-w));
       text-align: right; position: sticky; z-index: 1; background: #f5f7fa;
+      text-overflow: ellipsis;
     }
     table.matrix th.axis-row[data-has-country] {
       background: color-mix(in srgb, var(--band-color) 9%, white);
@@ -264,6 +290,14 @@
 
 <div class="matrix-wrap">
   <table class="matrix">
+    <colgroup>
+      <col style="width: var(--band-country-w)">
+      <col style="width: var(--band-type-w)">
+      <col style="width: var(--axis-row-w)">
+      {% for h in hubs %}
+      <col style="width: var(--data-col-w)">
+      {% endfor %}
+    </colgroup>
     <thead>
       <tr>
         <th class="corner" scope="col" colspan="3" rowspan="2"></th>
