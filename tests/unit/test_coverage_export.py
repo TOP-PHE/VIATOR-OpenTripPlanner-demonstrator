@@ -1088,8 +1088,7 @@ def test_fetch_trips_by_search_without_legs_still_caps_per_search() -> None:
 
     search_id = uuid4()
     rows = [
-        (search_id, i, 3600, 0, None, None, "RAIL")
-        for i in range(_MAX_TRIPS_PER_CELL_EXPORT + 4)
+        (search_id, i, 3600, 0, None, None, "RAIL") for i in range(_MAX_TRIPS_PER_CELL_EXPORT + 4)
     ]
     db = _MockDb(rows=rows)
     out = _fetch_trips_by_search(db, search_ids=[search_id], include_legs=False)

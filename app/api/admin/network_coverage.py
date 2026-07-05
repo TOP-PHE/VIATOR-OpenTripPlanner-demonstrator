@@ -847,7 +847,16 @@ def _fetch_trips_by_search(
     else:
         records = ((*row, []) for row in rows)
     out: dict[str, list[dict[str, Any]]] = {}
-    for search_id, rank, duration_seconds, num_transfers, departure_at, arrival_at, modes, legs in records:
+    for (
+        search_id,
+        rank,
+        duration_seconds,
+        num_transfers,
+        departure_at,
+        arrival_at,
+        modes,
+        legs,
+    ) in records:
         bucket = out.setdefault(str(search_id), [])
         if len(bucket) >= _MAX_TRIPS_PER_CELL_EXPORT:
             continue
