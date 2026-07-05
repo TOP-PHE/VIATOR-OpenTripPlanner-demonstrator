@@ -946,6 +946,7 @@ def _build_export_context(
     trips_by_search: dict[str, list[dict[str, Any]]],
     lazy_trips: bool = False,
     legs_omitted: bool = False,
+    include_external_itineraries: bool = False,
 ) -> dict[str, Any]:
     """Pure data-shaping from DB rows → template context dict.
 
@@ -962,6 +963,13 @@ def _build_export_context(
     `legs_omitted` (large downloads) tells it trips were embedded without
     leg detail so the modal can explain the gap. Both default False so
     the small-run download keeps its historical full-detail behaviour.
+
+    `include_external_itineraries` embeds the verify sweep's persisted
+    ÖBB itineraries per cell so the downloaded file can render the
+    VIATOR-vs-ÖBB side-by-side offline. Only the small-run download
+    turns it on (same tier as leg detail — the payloads are compact but
+    there's no reason to grow the large export the slimming just
+    shrank); the share page leaves it off and fetches per cell instead.
     """
     cells: dict[str, dict[str, Any]] = {}
     for r in results:
@@ -997,6 +1005,12 @@ def _build_export_context(
             # PR-E green/blue/yellow verdict dot.
             "external_alignment_tier": getattr(r, "external_alignment_tier", None),
             "external_alignment_score": getattr(r, "external_alignment_score", None),
+            # Persisted ÖBB itineraries for the offline side-by-side —
+            # None (key always present, for a stable raw-JSON schema)
+            # unless the caller opted in; see the docstring.
+            "external_itineraries": (
+                getattr(r, "external_itineraries", None) if include_external_itineraries else None
+            ),
         }
     run_meta = {
         "id": str(run.id),
@@ -1139,6 +1153,8 @@ def export_run_html(
         hubs=_resolve_hubs(db),
         trips_by_search=_fetch_trips_by_search(db, search_ids, include_legs=include_legs),
         legs_omitted=not include_legs,
+        # ÖBB side-by-side rides the same small-run tier as leg detail.
+        include_external_itineraries=include_legs,
     )
     response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
     response.headers["Content-Disposition"] = f'attachment; filename="{_export_filename(run)}"'

@@ -719,6 +719,92 @@ def test_build_export_context_defaults_alignment_fields_to_none() -> None:
     assert cell["external_alignment_score"] is None
 
 
+def test_build_export_context_embeds_external_itineraries_only_when_opted_in() -> None:
+    """The ÖBB side-by-side data rides the small-run download tier: the
+    key is ALWAYS present (stable raw-JSON schema) but carries the
+    persisted itineraries only when the caller opts in — the share page
+    leaves it off and lazy-fetches per cell instead."""
+    from app.api.admin.network_coverage import _build_export_context
+
+    oebb = [{"duration_seconds": 5100, "num_transfers": 1, "legs": []}]
+    results = [
+        _StubResult(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            response_ms=1432,
+            num_itineraries=1,
+            best_duration_seconds=4980,
+            best_num_transfers=0,
+            best_operators="EUROSTAR",
+            error_message=None,
+            journey_search_id=None,
+            session_ids=None,
+            external_itineraries=oebb,
+        ),
+    ]
+    common = {"run": _stub_run(), "results": results, "hubs": [_stub_hub_info()]}
+    on = _build_export_context(**common, trips_by_search={}, include_external_itineraries=True)
+    off = _build_export_context(**common, trips_by_search={})
+    assert on["cells"]["p-nord:bxl-mid"]["external_itineraries"] == oebb
+    assert off["cells"]["p-nord:bxl-mid"]["external_itineraries"] is None
+
+
+def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypatch) -> None:
+    """The download endpoint ties the ÖBB embed to the same threshold as
+    leg detail: small runs get the offline side-by-side, large runs stay
+    slim (their side-by-side lives on the share link)."""
+    from fastapi.responses import HTMLResponse
+
+    from app.api.admin import network_coverage as mod
+
+    oebb = [{"duration_seconds": 5100, "legs": []}]
+    captured: dict = {}
+    monkeypatch.setattr(mod, "_fetch_trips_by_search", lambda _db, _ids, *, include_legs=True: {})
+    monkeypatch.setattr(
+        mod.templates,
+        "TemplateResponse",
+        lambda _req, _name, context: (
+            captured.__setitem__("context", context),
+            HTMLResponse(content="<html>stub</html>"),
+        )[1],
+    )
+
+    def result(i):
+        r = _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
+        r.external_itineraries = oebb
+        return r
+
+    for count, expect in (
+        (1, oebb),
+        (mod._EXPORT_LEG_DETAIL_MAX_PAIRS + 1, None),
+    ):
+        results = [result(i) for i in range(count)]
+        monkeypatch.setattr(
+            mod.runner, "get_run_with_results", lambda _d, _r, res=results: (_stub_run(), res)
+        )
+        mod.export_run_html(
+            run_id="11111111-1111-1111-1111-111111111111",
+            request=None,
+            db=_MockDb(rows=[]),
+            _=None,
+        )
+        assert captured["context"]["cells"]["hub0:hub1"]["external_itineraries"] == expect
+
+
+def test_side_by_side_wiring_present() -> None:
+    """The share/export modal's VIATOR-vs-ÖBB comparison: renderer
+    functions, column labels, and the CSS hooks must survive template
+    refactors — they're what makes the share page match the live app's
+    cell modal."""
+    html = _render()
+    assert "renderComparison" in html
+    assert "renderExternalItinerary" in html
+    assert "ÖBB HAFAS" in html
+    assert "VIATOR · MOTIS / OTP" in html
+    assert 'class="sbs"' in html or ".sbs {" in html
+
+
 def test_build_export_context_run_meta_uses_started_at_not_created_at() -> None:
     """Regression lock: the NetworkCoverageRun model has `started_at`,
     not `created_at`. Mypy caught this in CI on the first push of this

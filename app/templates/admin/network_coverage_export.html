@@ -167,12 +167,18 @@
     .trip-head .transfers { color: var(--muted); font-size: 0.85rem; }
     .legs { padding: 0.4rem 0.7rem; }
     .leg {
-      display: grid; grid-template-columns: 60px 90px 1fr 1fr 100px;
+      /* First track is minmax(60px, max-content), not a fixed 60px: long
+         mode names (REGIONAL_RAIL, LONG_DISTANCE) overflowed a fixed
+         track and painted over the times column. */
+      display: grid; grid-template-columns: minmax(60px, max-content) 90px 1fr 1fr 100px;
       gap: 0.5rem; padding: 0.3rem 0;
       border-top: 1px dashed #e7eaee; font-size: 0.85rem;
     }
     .leg:first-child { border-top: 0; }
-    .leg .mode { font-weight: 600; font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 3px; text-align: center; }
+    /* overflow-wrap (not nowrap): when the modal is narrow the grid can
+       squeeze the minmax track back to its 60px floor — the chip text
+       must wrap inside it rather than paint over the times column. */
+    .leg .mode { font-weight: 600; font-size: 0.72rem; padding: 0.1rem 0.4rem; border-radius: 3px; text-align: center; overflow-wrap: anywhere; }
     .leg .mode.RAIL, .leg .mode.SUBWAY, .leg .mode.TRAM { background: #dbe9fa; color: #0c4a6e; }
     .leg .mode.BUS, .leg .mode.COACH { background: #fbe2c2; color: #8b4d00; }
     .leg .mode.WALK, .leg .mode.FOOT { background: #e9ecef; color: var(--muted); }
@@ -183,6 +189,20 @@
     .leg .agency { font-size: 0.78rem; color: var(--muted); }
     .empty-trips { color: var(--muted); font-style: italic; padding: 1rem 0; }
     .truncated-note { color: var(--muted); font-style: italic; font-size: 0.85rem; margin: 0 0 0.75rem; }
+
+    /* VIATOR vs ÖBB side-by-side — mirrors the live matrix modal's
+       compare grid (PR-196b) with the export template's own styling.
+       Collapses to one column on narrow screens. */
+    .sbs { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; align-items: start; }
+    @media (max-width: 900px) { .sbs { grid-template-columns: 1fr; } }
+    .sbs-head {
+      display: inline-block; font-size: 0.72rem; font-weight: 600;
+      padding: 0.15rem 0.55rem; border-radius: 3px; margin: 0.2rem 0 0.6rem;
+    }
+    .sbs-head.viator { background: #1f2933; color: #e6edf3; }
+    .sbs-head.oebb { background: #b45309; color: #fff7ed; }
+    /* ÖBB legs reuse .leg but VerifyLeg has no agency column — 4 tracks. */
+    .sbs .oebb-col .leg { grid-template-columns: minmax(60px, max-content) 90px 1fr 1fr; }
 
     /* JSON appendix */
     details.raw {
@@ -425,6 +445,47 @@
     `;
   }
 
+  // ÖBB HAFAS itinerary card — the persisted VerifyItinerary shape is
+  // narrower than a VIATOR trip (no rank/route_short_name; legs carry
+  // UIC codes instead of station names), so the card shows what's there.
+  function renderExternalLeg(leg) {
+    const mode = leg.mode || 'TRANSIT';
+    const service = leg.route_name || (mode === 'WALK' ? 'walk' : '');
+    return `
+      <div class="leg">
+        <div class="mode ${escapeHTML(mode)}">${escapeHTML(mode)}</div>
+        <div class="when">${fmtTime(leg.dep_utc)} → ${fmtTime(leg.arr_utc)}</div>
+        <div><span class="stops">${escapeHTML(leg.from_uic || '?')}<span class="arrow">→</span>${escapeHTML(leg.to_uic || '?')}</span></div>
+        <div class="service">${escapeHTML(service)}</div>
+      </div>
+    `;
+  }
+
+  function renderExternalItinerary(it) {
+    const legs = (it.legs || []).map(renderExternalLeg).join('');
+    return `
+      <div class="trip">
+        <div class="trip-head">
+          <span class="when">${fmtDate(it.departure_at)} ${fmtTime(it.departure_at)} → ${fmtTime(it.arrival_at)}</span>
+          <span class="duration">${fmtDuration(it.duration_seconds)}</span>
+          <span class="transfers">${it.num_transfers} transfer${it.num_transfers === 1 ? '' : 's'}</span>
+        </div>
+        <div class="legs">${legs || '<div class="empty-trips">No legs recorded for this itinerary.</div>'}</div>
+      </div>
+    `;
+  }
+
+  // Two-column VIATOR vs ÖBB layout, same idea as the live matrix
+  // modal's compare grid. Only used when the cell actually has persisted
+  // ÖBB itineraries; otherwise the single-column VIATOR list renders.
+  function renderComparison(tripsHtml, externalItineraries) {
+    const oebbHtml = externalItineraries.map(renderExternalItinerary).join('');
+    return `<div class="sbs">
+      <div><span class="sbs-head viator">VIATOR · MOTIS / OTP</span>${tripsHtml || '<div class="empty-trips">No itineraries recorded.</div>'}</div>
+      <div class="oebb-col"><span class="sbs-head oebb">ÖBB HAFAS</span>${oebbHtml}</div>
+    </div>`;
+  }
+
   function statusPill(status) {
     const map = {
       ok: { bg: 'var(--ok-bg)', fg: 'var(--ok)' },
@@ -458,6 +519,7 @@
 
   function renderModalBody(pairKey, cell) {
     let trips = cell.trips || [];
+    let ext = cell.external_itineraries || [];
     if (FLAGS.lazy_trips) {
       const st = tripState.get(pairKey);
       if (!st || !st.loaded) {
@@ -466,8 +528,8 @@
           : '<div class="empty-trips">Loading itineraries…</div>';
       }
       trips = st.trips;
+      ext = st.externalItineraries;
     }
-    if (!trips.length) return '<div class="empty-trips">No itineraries recorded for this cell.</div>';
     const notes = [];
     if (cell.num_itineraries != null && cell.num_itineraries > trips.length) {
       notes.push(`<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — this report caps itinerary detail per cell to keep it a manageable size.</p>`);
@@ -475,6 +537,11 @@
     if (FLAGS.legs_omitted) {
       notes.push('<p class="truncated-note">Leg-by-leg detail is omitted from this offline export because the run is large — open the run’s shared link for full detail.</p>');
     }
+    // The verify sweep records ÖBB itineraries even for cells where
+    // VIATOR found nothing (that's its whole point) — so the comparison
+    // renders whenever the ÖBB side has data, including trip-less cells.
+    if (ext.length) return notes.join('') + renderComparison(trips.map(renderTrip).join(''), ext);
+    if (!trips.length) return '<div class="empty-trips">No itineraries recorded for this cell.</div>';
     return notes.join('') + trips.map(renderTrip).join('');
   }
 
@@ -488,7 +555,7 @@
   async function loadCellTrips(pairKey) {
     const prior = tripState.get(pairKey);
     if (prior && prior.loading) return;
-    tripState.set(pairKey, { loading: true, error: false, loaded: false, trips: [] });
+    tripState.set(pairKey, { loading: true, error: false, loaded: false, trips: [], externalItineraries: [] });
     let next;
     try {
       const [orig, dest] = pairKey.split(':');
@@ -497,12 +564,13 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const trips = (data.outbound && data.outbound.trips) || [];
-      next = { loading: false, error: false, loaded: true, trips };
+      const externalItineraries = (data.outbound && data.outbound.external_itineraries) || [];
+      next = { loading: false, error: false, loaded: true, trips, externalItineraries };
     } catch (err) {
       // Surface the cause for anyone debugging a share page that shows
       // the retry message — the modal itself stays generic on purpose.
       console.warn('coverage share: cell trips fetch failed', err);
-      next = { loading: false, error: true, loaded: false, trips: [] };
+      next = { loading: false, error: true, loaded: false, trips: [], externalItineraries: [] };
     }
     tripState.set(pairKey, next);
     if (currentPair === pairKey) {
