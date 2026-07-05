@@ -251,13 +251,13 @@ def test_shared_cell_trips_404_for_unknown_run():
     assert resp.status_code == 404
 
 
-def test_shared_cell_trips_strips_admin_only_external_itineraries(monkeypatch):
-    """The raw ÖBB payloads captured by the verify sweep were never
-    embedded or rendered by the share page — they were reachable only
-    through the platform_admin cell-trips endpoint. The public twin must
-    null them out, or a bare share URL silently grants previously
-    admin-only third-party planner data (and the module's 'reveals only
-    what the page shows' capability model becomes false)."""
+def test_shared_cell_trips_includes_external_itineraries_for_side_by_side(monkeypatch):
+    """Deliberate product decision (2026-07-05): the share page renders
+    the same VIATOR-vs-ÖBB side-by-side as the admin matrix modal, so
+    the public endpoint passes the verify sweep's persisted ÖBB
+    itineraries through. (An earlier revision stripped them on the
+    'page never rendered it' argument — that premise no longer holds;
+    the docstrings in coverage_share.py document the expanded scope.)"""
     from app.api.admin.network_coverage import CellTripsDirection, CellTripsResponse
 
     run = _stub_run()
@@ -286,9 +286,8 @@ def test_shared_cell_trips_strips_admin_only_external_itineraries(monkeypatch):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["outbound"]["external_itineraries"] is None
-    assert body["return"]["external_itineraries"] is None
-    # The VIATOR trips themselves — what the modal renders — survive.
+    assert body["outbound"]["external_itineraries"] == [{"duration_seconds": 5100, "legs": []}]
+    assert body["return"]["external_itineraries"] == [{"duration_seconds": 5200, "legs": []}]
     assert len(body["outbound"]["trips"]) == 1
 
 
