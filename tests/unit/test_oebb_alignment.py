@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.network_coverage.alignment import _oebb_naive_to_utc_iso as _vienna_local_to_utc
 from app.network_coverage.alignment import compute_alignment
 from app.network_coverage.external_verify import VerifyItinerary, VerifyLeg, extract_uic
 
@@ -85,13 +86,27 @@ def _v_leg(
     arr: str = "2026-06-30T13:30",
     route: str = "RJ 1141",
 ) -> dict:
-    """Build a VIATOR-shaped leg with stop_ids that carry the UIC."""
+    """Build a VIATOR-shaped leg with stop_ids that carry the UIC.
+
+    `dep`/`arr` are given as Vienna-local wall-clock strings for
+    readability — same literal format `_o_leg` takes — and converted to
+    genuine UTC-instant ISO strings here, the shape real VIATOR leg
+    timestamps actually carry in production (both OTP and MOTIS return
+    offset-aware times; see `hafas_client._hafas_dt_to_utc_iso` for the
+    equivalent real conversion on the ÖBB side of the LIVE journey
+    comparison, as opposed to the coverage sweep's intentionally-naive
+    persistence this module reads). This means `_v_leg(dep=X)` and
+    `_o_leg(dep=X)` called with the same literal X describe the SAME
+    real train on the two DIFFERENT wire-format bases each production
+    consumer actually sees — reusing the identical naive string for
+    both (the pre-fix version of this fixture) was the reason the
+    cross-engine timezone mismatch went undetected by this test file."""
     return {
         "mode": mode,
         "from_stop_id": f"SBB:{from_uic}:0:5",
         "to_stop_id": f"SBB:{to_uic}:0:5",
-        "departure": dep,
-        "arrival": arr,
+        "departure": _vienna_local_to_utc(dep),
+        "arrival": _vienna_local_to_utc(arr),
         "route_short_name": route,
     }
 
@@ -340,3 +355,53 @@ def test_compute_alignment_caps_score_at_one_when_overcounting() -> None:
     # row to multiple VIATOR trips.
     assert score == 0.33
     assert tier == "disagree"
+
+
+# ─────────────── _oebb_naive_to_utc_iso (cross-engine timezone fix) ───────────────
+
+
+def test_oebb_naive_to_utc_iso_converts_cest_summer_date() -> None:
+    """June is CEST (UTC+2) — 08:00 Vienna-local is 06:00 UTC."""
+    assert _vienna_local_to_utc("2026-06-30T08:00") == "2026-06-30T06:00:00+00:00"
+
+
+def test_oebb_naive_to_utc_iso_converts_cet_winter_date() -> None:
+    """January is CET (UTC+1), not CEST — the conversion must be
+    DST-aware (via zoneinfo), not a hardcoded +2h offset."""
+    assert _vienna_local_to_utc("2026-01-15T08:00") == "2026-01-15T07:00:00+00:00"
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-date"])
+def test_oebb_naive_to_utc_iso_returns_none_on_unparseable(value: str | None) -> None:
+    assert _vienna_local_to_utc(value) is None
+
+
+def test_compute_alignment_exact_match_across_summer_dst_boundary() -> None:
+    """Regression lock for the cross-engine timezone bug: `_o_leg`'s
+    ÖBB-shaped fixture keeps naive Vienna-local strings PASSED THROUGH
+    UNCHANGED (matching production — external_verify persists them
+    naive), while `_v_leg` now converts to genuine UTC. Before the fix
+    in `_verify_itinerary_to_legs`/`_oebb_naive_to_utc_iso`, the exact
+    fingerprint compared VIATOR's raw UTC digits against ÖBB's raw
+    local digits verbatim — a same-train, same-minute pair like this
+    one would NOT have exact-matched (fingerprints differ whenever the
+    CEST offset is nonzero), silently scoring 'no_overlap' instead of
+    'agree'."""
+    v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
+    o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
+    score, tier = compute_alignment(v, o)
+    assert score == 1.0
+    assert tier == "agree"
+
+
+def test_compute_alignment_fuzzy_match_survives_cest_offset() -> None:
+    """Same regression, fuzzy-fallback path: a genuine ±3min schedule
+    jitter on the SAME real train must still fuzzy-match once both
+    sides are on the same clock basis — pre-fix, the ~2h CEST skew
+    would have blown well past the ±5min tolerance regardless of the
+    real jitter being tiny."""
+    v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
+    o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:03", arr="2026-06-30T13:33")])]
+    score, tier = compute_alignment(v, o)
+    assert score == 0.7
+    assert tier == "mostly_agree"

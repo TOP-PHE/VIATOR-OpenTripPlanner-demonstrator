@@ -725,6 +725,19 @@ async def fetch_oebb_two_step(
 
         # Step 2: trip search using the resolved station lids.
         trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
+        # TEMP DEBUG (2026-07) — investigating a reported large VIATOR/ÖBB
+        # time-window divergence in the journey-search side-by-side. Logs
+        # the exact anchor sent to HAFAS so it can be diffed against
+        # motis_client's equivalent log for the same search. Safe to
+        # remove once that investigation concludes.
+        req = trip_body["svcReqL"][0]["req"]
+        log.info(
+            "hafas.trip_search.request depart_at=%s (tzinfo=%s) -> outDate=%s outTime=%s",
+            depart_at.isoformat(),
+            depart_at.tzinfo,
+            req["outDate"],
+            req["outTime"],
+        )
         trip_payload, err2 = await _post_hafas(c, trip_body)
         if err2 is not None:
             return HafasTripPayload(verdict=err2, from_lid=from_lid, to_lid=to_lid)

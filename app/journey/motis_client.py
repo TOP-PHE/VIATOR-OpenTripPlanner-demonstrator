@@ -125,6 +125,12 @@ async def fetch_plan(
                 "unknown session_timezone for session_id=%s; treating naive `when` as UTC",
                 session_id,
             )
+    # TEMP DEBUG (2026-07) — investigating a reported large VIATOR/ÖBB
+    # time-window divergence in the journey-search side-by-side. Logs the
+    # exact anchor sent to MOTIS so it can be diffed against
+    # external_verify's equivalent HAFAS log for the same search. Safe to
+    # remove once that investigation concludes.
+    log.info("motis.plan.request session_id=%s time=%s", session_id, when.isoformat())
     params: dict[str, Any] = {
         "fromPlace": from_place,
         "toPlace": to_place,
