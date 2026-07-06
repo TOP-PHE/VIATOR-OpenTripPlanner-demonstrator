@@ -53,11 +53,19 @@ keep the matrix legend scannable, not a per-percentile gradient:
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ..journey.signature import transit_fingerprint
 from .external_verify import VerifyItinerary, extract_uic
+
+# `external_verify._hafas_time_to_utc_iso` persists VerifyLeg/VerifyItinerary
+# dep_utc/arr_utc as NAIVE Europe/Vienna wall-clock strings (the "_utc" name
+# is aspirational — see that function's own docstring). This is the zone
+# `_verify_itinerary_to_legs` localizes them from before comparing against
+# VIATOR's genuinely UTC-instant leg times.
+_OEBB_REFERENCE_TZ = ZoneInfo("Europe/Vienna")
 
 # Threshold constants — kept at module scope so the test that exercises
 # tier boundaries can import + assert against the same values, and a
@@ -84,6 +92,33 @@ def _strip_walk_legs(legs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [leg for leg in legs if (leg.get("mode") or "").upper() not in ("", "WALK", "TRANSFER")]
 
 
+def _oebb_naive_to_utc_iso(value: str | None) -> str | None:
+    """Convert a persisted VerifyLeg/VerifyItinerary naive Vienna-local
+    timestamp to a genuine UTC-instant ISO string — the same basis
+    VIATOR's own leg `departure`/`arrival` values are already on.
+
+    Without this, `transit_fingerprint`'s minute-rounding (exact-match
+    tier) and `_first_transit_dep_dt`'s ±5min fuzzy comparison both
+    compared VIATOR's true-UTC digits against ÖBB's local-clock digits
+    verbatim — a systematic 1-2h (CET/CEST) skew that made a genuine
+    train-for-train match nearly impossible to detect on either tier,
+    silently pushing real matches toward 'no_overlap'/'disagree'. This
+    went uncaught because the existing tests built BOTH sides' fixture
+    legs with the same naive-looking timestamp, which isn't
+    representative of production data (only the ÖBB side is naive).
+
+    Returns None on unparseable/missing input so the caller treats the
+    leg as unmatchable rather than guessing at a time.
+    """
+    if not value:
+        return None
+    try:
+        naive = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=_OEBB_REFERENCE_TZ).astimezone(UTC).isoformat()
+
+
 def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
     """Translate a persisted VerifyItinerary into the leg-dict shape
     :func:`transit_fingerprint` expects.
@@ -104,8 +139,8 @@ def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
             # VIATOR-side `SBB:8503000:0:5`.
             "from_stop_id": leg.from_uic,
             "to_stop_id": leg.to_uic,
-            "departure": leg.dep_utc,
-            "arrival": leg.arr_utc,
+            "departure": _oebb_naive_to_utc_iso(leg.dep_utc),
+            "arrival": _oebb_naive_to_utc_iso(leg.arr_utc),
             "route_short_name": leg.route_name,
         }
         for leg in it.legs
