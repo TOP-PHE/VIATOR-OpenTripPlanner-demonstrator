@@ -378,6 +378,51 @@ async def test_sweep_writes_alignment_fields_on_successful_verify():
     assert len(row.external_itineraries) == 1
 
 
+# ─────── _fetch_viator_trips_for_search (apples-to-apples window fix) ───────
+
+
+def _make_trip_row(departure_at):
+    row = MagicMock()
+    row.duration_seconds = 1800
+    row.num_transfers = 0
+    row.departure_at = departure_at
+    row.arrival_at = departure_at
+    row.modes = "RAIL"
+    row.legs = []
+    return row
+
+
+def _db_returning_trips(rows):
+    db = MagicMock()
+    db.execute.return_value.scalars.return_value.all.return_value = rows
+    return db
+
+
+def test_fetch_viator_trips_for_search_excludes_trips_before_depart_at():
+    """The scope-mismatch bug: a cell's VIATOR trips span the whole
+    K-slot day window while ÖBB's verify call is one forward-looking
+    search anchored at run.depart_at — trips departing before that
+    anchor were never comparable to what ÖBB was actually asked and
+    must be excluded from the scorer's input, not merely deprioritised."""
+    depart_at = datetime(2026, 7, 13, 6, 0, 0, tzinfo=UTC)
+    db = _db_returning_trips(
+        [
+            _make_trip_row(datetime(2026, 7, 13, 2, 34, 0, tzinfo=UTC)),  # before — dropped
+            _make_trip_row(datetime(2026, 7, 13, 6, 0, 0, tzinfo=UTC)),  # exact boundary — kept
+            _make_trip_row(datetime(2026, 7, 13, 7, 20, 0, tzinfo=UTC)),  # after — kept
+        ]
+    )
+    out = runner._fetch_viator_trips_for_search(db, uuid.uuid4(), depart_at)
+    assert [t["departure_at"] for t in out] == [
+        "2026-07-13T06:00:00+00:00",
+        "2026-07-13T07:20:00+00:00",
+    ]
+
+
+def test_fetch_viator_trips_for_search_none_when_no_search_id():
+    assert runner._fetch_viator_trips_for_search(MagicMock(), None, datetime.now(UTC)) == []
+
+
 # ─────────────────────── _maybe_run_external_verify_sweep candidate filter ───────────────────────
 
 

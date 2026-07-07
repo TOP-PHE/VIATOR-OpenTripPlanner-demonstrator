@@ -760,7 +760,9 @@ def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypa
 
     oebb = [{"duration_seconds": 5100, "legs": []}]
     captured: dict = {}
-    monkeypatch.setattr(mod, "_fetch_trips_by_search", lambda _db, _ids, *, include_legs=True: {})
+    monkeypatch.setattr(
+        mod, "_fetch_trips_by_search", lambda _db, _ids, _depart_at=None, *, include_legs=True: {}
+    )
     monkeypatch.setattr(
         mod.templates,
         "TemplateResponse",
@@ -1181,6 +1183,58 @@ def test_fetch_trips_by_search_without_legs_still_caps_per_search() -> None:
     assert len(out[str(search_id)]) == _MAX_TRIPS_PER_CELL_EXPORT
 
 
+class _CapturingDb:
+    """Unlike `_MockDb` elsewhere in this file (which deliberately does
+    NOT inspect the statement — see its docstring), these two tests
+    exist specifically to pin the conditional query-building logic
+    itself (does `depart_at` actually add the WHERE/ORDER BY it's
+    supposed to), so they need the real constructed statement, not
+    canned rows."""
+
+    def __init__(self) -> None:
+        self.captured = None
+
+    def execute(self, stmt):
+        self.captured = stmt
+        return _MockExecuteResult([])
+
+
+def test_fetch_trips_by_search_depart_at_filters_and_orders_chronologically() -> None:
+    """`depart_at`'s filter/order happen at the SQL level — an
+    out-of-window trip is never even pulled off the wire, same
+    memory-safety spirit as `include_legs=False`. Regression lock for
+    the VIATOR/ÖBB search-scope mismatch: a cell's VIATOR trips span
+    the whole K-slot day window while ÖBB's verify call is a single
+    forward-looking search anchored at depart_at."""
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _fetch_trips_by_search
+
+    db = _CapturingDb()
+    _fetch_trips_by_search(db, [uuid4()], datetime(2026, 7, 13, 6, 0, tzinfo=UTC))
+    compiled = str(db.captured.compile(compile_kwargs={"literal_binds": True}))
+    assert "journey_trips.departure_at >=" in compiled
+    assert "ORDER BY journey_search_executions.search_id, journey_trips.departure_at" in compiled
+
+
+def test_fetch_trips_by_search_without_depart_at_orders_by_rank() -> None:
+    """`depart_at=None` (the default) keeps the pre-existing best-
+    ranked-first behaviour with no time filter, for callers with no
+    natural depart_at to compare against."""
+    from uuid import uuid4
+
+    from app.api.admin.network_coverage import _fetch_trips_by_search
+
+    db = _CapturingDb()
+    _fetch_trips_by_search(db, [uuid4()])
+    compiled = str(db.captured)
+    assert "journey_trips.departure_at >=" not in compiled
+    assert (
+        "ORDER BY journey_search_executions.search_id, journey_trips.rank_in_response" in compiled
+    )
+
+
 def test_resolve_hubs_returns_db_rows_when_present() -> None:
     """Happy path: `network_coverage_hubs` table has rows → return them
     via `_hub_to_info` shape conversion. The fallback to static HUBS
@@ -1333,7 +1387,7 @@ def test_export_run_html_drops_legs_above_the_pair_threshold(monkeypatch) -> Non
 
     captured: dict = {}
 
-    def fake_fetch(_db, search_ids, *, include_legs=True):
+    def fake_fetch(_db, search_ids, _depart_at=None, *, include_legs=True):
         captured["include_legs"] = include_legs
         return {}
 
@@ -1379,7 +1433,7 @@ def test_export_run_html_keeps_legs_at_exactly_the_pair_threshold(monkeypatch) -
 
     captured: dict = {}
 
-    def fake_fetch(_db, search_ids, *, include_legs=True):
+    def fake_fetch(_db, search_ids, _depart_at=None, *, include_legs=True):
         captured["include_legs"] = include_legs
         return {}
 

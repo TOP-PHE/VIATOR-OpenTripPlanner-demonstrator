@@ -777,7 +777,11 @@ _EXPORT_LEG_DETAIL_MAX_PAIRS = 500
 
 
 def _fetch_trips_by_search(
-    db: DbSession, search_ids: list[uuid.UUID], *, include_legs: bool = True
+    db: DbSession,
+    search_ids: list[uuid.UUID],
+    depart_at: datetime | None = None,
+    *,
+    include_legs: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bulk-fetch every JourneyTrip linked (via JourneySearchExecution) to
     the given JourneySearch ids.
@@ -800,9 +804,22 @@ def _fetch_trips_by_search(
     Fixed 2026-06-25 after every exported cell came back trip-less.
 
     Capped at `_MAX_TRIPS_PER_CELL_EXPORT` per search — see that constant's
-    comment. The query still orders by `rank_in_response` first, so the
-    kept trips are always the best-ranked ones regardless of how many
-    executions/slots contributed to a given search.
+    comment.
+
+    `depart_at`, when given, restricts to trips departing at/after it and
+    orders chronologically instead of by `rank_in_response` (both applied
+    at the SQL level, so an out-of-window trip is never even pulled off
+    the wire — same memory-safety spirit as `include_legs=False` below).
+    ÖBB's verify-sweep call is a single forward-looking search anchored
+    at the run's depart_at, while a cell's VIATOR trips span the whole
+    K-slot day window (runner.py) — without this filter, the side-by-side
+    comparison (and the persisted alignment score — see
+    `runner._fetch_viator_trips_for_search`, which applies the same
+    filter Python-side since that path isn't a bulk/streaming query)
+    could pit ÖBB's few depart_at-anchored itineraries against VIATOR
+    trips from hours before or after, an apples-to-oranges scope
+    mismatch. `None` (the default) keeps the original best-ranked-first
+    behaviour for callers with no natural depart_at to compare against.
 
     `include_legs=False` (large exports — see `_EXPORT_LEG_DETAIL_MAX_PAIRS`)
     projects explicit columns instead of full ORM rows so the legs JSON is
@@ -825,11 +842,17 @@ def _fetch_trips_by_search(
             JourneyTrip.modes,
         )
     )
-    rows = db.execute(
-        base.join(JourneyTrip, JourneyTrip.execution_id == JourneySearchExecution.id)
-        .where(JourneySearchExecution.search_id.in_(search_ids))
-        .order_by(JourneySearchExecution.search_id, JourneyTrip.rank_in_response)
-    ).all()
+    stmt = base.join(JourneyTrip, JourneyTrip.execution_id == JourneySearchExecution.id).where(
+        JourneySearchExecution.search_id.in_(search_ids)
+    )
+    stmt = (
+        stmt.where(JourneyTrip.departure_at >= depart_at).order_by(
+            JourneySearchExecution.search_id, JourneyTrip.departure_at
+        )
+        if depart_at is not None
+        else stmt.order_by(JourneySearchExecution.search_id, JourneyTrip.rank_in_response)
+    )
+    rows = db.execute(stmt).all()
     if include_legs:
         records = (
             (
@@ -1151,7 +1174,9 @@ def export_run_html(
         run=run,
         results=results,
         hubs=_resolve_hubs(db),
-        trips_by_search=_fetch_trips_by_search(db, search_ids, include_legs=include_legs),
+        trips_by_search=_fetch_trips_by_search(
+            db, search_ids, run.depart_at, include_legs=include_legs
+        ),
         legs_omitted=not include_legs,
         # ÖBB side-by-side rides the same small-run tier as leg detail.
         include_external_itineraries=include_legs,
@@ -1381,7 +1406,7 @@ def _build_cell_trips_response(
         for r in (outbound_row, return_row)
         if r is not None and r.journey_search_id is not None
     ]
-    trips_by_search = _fetch_trips_by_search(db, search_ids)
+    trips_by_search = _fetch_trips_by_search(db, search_ids, run.depart_at)
 
     def _row_to_direction(r: NetworkCoverageResult | None) -> CellTripsDirection | None:
         if r is None:
