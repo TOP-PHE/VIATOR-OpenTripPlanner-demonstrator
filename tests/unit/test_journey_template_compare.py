@@ -449,3 +449,115 @@ def test_sbs_dispatch_does_not_double_inject_walk_toggle(template_text: str):
         "the SBS wrapper owns the single walk-leg toggle without "
         "competing nested copies from comparisonGrid."
     )
+
+
+# ───────────────── v0.1.44 VIATOR-vs-ÖBB row alignment ─────────────────
+# When ÖBB HAFAS is the sole reference column, VIATOR and ÖBB trips are
+# paired onto the same visual row by matching `first_transit_leg_departure_utc`
+# instead of rendering two independent, unaligned column bodies. Same
+# trip-wire rationale as the rest of this file: these are inline JS
+# helpers with no Python-executable path, so a careless refactor that
+# drops one silently breaks the browser render with no server-side signal.
+
+PAIRING_HELPERS = [
+    "_firstTransitLeg",
+    "_firstTransitLegDepUtc",
+    "_firstTransitLegLabel",
+    "_pairViatorAndOebbTrips",
+    "_trainIdMismatchNote",
+    "renderViatorOebbPairedGrid",
+    "_viatorTripCardHtml",
+    "_oebbTripCardHtml",
+]
+
+
+@pytest.mark.parametrize("name", PAIRING_HELPERS)
+def test_pairing_helper_is_defined(name: str, template_text: str):
+    """Every helper the VIATOR-vs-ÖBB paired grid depends on must be
+    defined as either `function name(` or `const name =`."""
+    function_re = rf"function\s+{re.escape(name)}\s*\("
+    const_re = rf"const\s+{re.escape(name)}\s*="
+    assert re.search(function_re, template_text) or re.search(const_re, template_text), (
+        f"JS helper {name!r} is called from renderViatorOebbPairedGrid but "
+        f"never defined in app/templates/journey.html — the browser will "
+        f"throw a ReferenceError the first time a HAFAS-only SBS search runs."
+    )
+
+
+def test_paired_grid_dispatched_when_hafas_is_sole_reference(template_text: str):
+    """`renderSideBySideGrid` must fork to `renderViatorOebbPairedGrid`
+    specifically when ÖBB HAFAS is the only reference column present —
+    OJP-involved configurations (OJP alone, or OJP+HAFAS together) keep
+    the original independent-columns `CompareGrid.renderGrid` path,
+    since pairing is only defined for the two-source VIATOR/ÖBB case."""
+    sbs_start = template_text.find("function renderSideBySideGrid(")
+    assert sbs_start != -1, "renderSideBySideGrid function missing"
+    next_fn = template_text.find("\nfunction ", sbs_start + len("function renderSideBySideGrid("))
+    assert next_fn != -1, "Could not bound renderSideBySideGrid body"
+    sbs_body = template_text[sbs_start:next_fn]
+    assert "renderViatorOebbPairedGrid(payload)" in sbs_body, (
+        "renderSideBySideGrid no longer forks to the paired-row grid — "
+        "VIATOR and ÖBB trips would render as two independent, unaligned "
+        "column bodies again (the original user-reported bug)."
+    )
+    assert "_refsForPairing.length === 1" in sbs_body and "'hafas'" in sbs_body, (
+        "The paired-grid fork must be scoped to the HAFAS-is-sole-reference "
+        "case — without this guard, OJP-involved SBS layouts would either "
+        "lose their columns or crash looking for a non-existent HAFAS "
+        "reference."
+    )
+
+
+def test_pairing_matches_on_first_transit_leg_departure(template_text: str):
+    """`_pairViatorAndOebbTrips` must key the match on
+    `first_transit_leg_departure_utc` — the field every engine client
+    computes on a consistent UTC clock basis — not on wall-clock local
+    time or duration, which can drift a minute apart between sources."""
+    assert "first_transit_leg_departure_utc" in template_text
+    fn_start = template_text.find("function _pairViatorAndOebbTrips(")
+    assert fn_start != -1, "_pairViatorAndOebbTrips function missing"
+    next_fn = template_text.find("\nfunction ", fn_start + len("function _pairViatorAndOebbTrips("))
+    body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 2000]
+    assert "_firstTransitLegDepUtc" in body, (
+        "_pairViatorAndOebbTrips must match rows via _firstTransitLegDepUtc "
+        "(first_transit_leg_departure_utc) — the shared cross-engine match "
+        "key computed server-side by every engine client."
+    )
+
+
+def test_unmatched_trips_from_both_sides_still_render(template_text: str):
+    """Trips with no counterpart on the other side must still appear as
+    their own row (with a 'not found by' placeholder on the empty side)
+    rather than being silently dropped — an operator needs to see every
+    itinerary either engine found."""
+    assert "not found by VIATOR" in template_text
+    assert "not found by ÖBB HAFAS" in template_text
+
+
+def test_train_mismatch_warning_wired(template_text: str):
+    """A matched row (same departure/arrival) whose two sources disagree
+    on the train label must render a spanning warning note — this is
+    the exact behaviour the operator asked for after noticing VIATOR and
+    ÖBB report the same physical service under different train IDs."""
+    assert "function _trainIdMismatchNote(" in template_text
+    assert "train-mismatch-row" in template_text
+    assert "train-mismatch-note" in template_text
+    # Must actually be invoked from the paired-grid row builder.
+    fn_start = template_text.find("function renderViatorOebbPairedGrid(")
+    assert fn_start != -1, "renderViatorOebbPairedGrid function missing"
+    next_fn = template_text.find(
+        "\nfunction ", fn_start + len("function renderViatorOebbPairedGrid(")
+    )
+    body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 3000]
+    assert "_trainIdMismatchNote(" in body, (
+        "renderViatorOebbPairedGrid must call _trainIdMismatchNote per "
+        "matched row so the warning actually renders, not just be defined."
+    )
+
+
+def test_train_mismatch_css_present(shared_css_text: str):
+    """CSS for the mismatch note must be defined in the shared stylesheet
+    — without it the warning renders as unstyled text with no visual
+    distinction from the trip cards around it."""
+    assert ".train-mismatch-row" in shared_css_text
+    assert ".train-mismatch-note" in shared_css_text

@@ -114,6 +114,22 @@
   z-index: 1;
 }
 
+/* v0.1.44 — VIATOR-vs-ÖBB paired row (renderViatorOebbPairedGrid in
+   journey.html): a matched row's departure/arrival agree but the two
+   sources can still label the train differently (VIATOR's GTFS feed
+   vs HAFAS's own product/line name) — this note spans both columns
+   directly under that row via inline `grid-column: 1 / -1`. */
+.compare-grid .train-mismatch-row { padding: 0.3rem 0 0.6rem; }
+.train-mismatch-note {
+  display: block;
+  background: #fff8e6;
+  border: 1px solid #f0c674;
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.82rem;
+  color: #6b5416;
+}
+
 @media (max-width: 720px) {
   .compare-grid { grid-template-columns: 1fr; }
   .compare-grid > .compare-header { border-bottom: none; padding: 0.6rem 0.1rem 0.2rem; }

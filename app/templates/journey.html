@@ -873,6 +873,29 @@ function renderOjpReference(ref) {
 // distinct `hafas-ref-card` class for the amber left-accent border.
 // No {} JSON button on these cards — HAFAS trips don't carry a
 // _raw_itinerary slice (the raw mgate payload isn't persisted).
+// v0.1.44 — ÖBB HAFAS trip card markup, extracted out of
+// renderHafasReference()'s inline builder so renderViatorOebbPairedGrid
+// can render one card at a time (paired-grid rows interleave VIATOR
+// and ÖBB cards) — same markup, same behaviour, single source of truth.
+function _oebbTripCardHtml(t) {
+  const legCount = (t.legs || []).length;
+  const tripOps = operatorsForTrip(t.legs);
+  return `<div class="trip-card hafas-ref-card">
+    <div class="top">
+      <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
+           <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
+      <div class="top-actions">
+        ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
+      </div>
+    </div>
+    <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+      ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
+      <span style="color: var(--brand-blue)">▸ click for leg detail</span>
+    </div>
+    <div class="legs-detail">${legsHTML(t.legs)}</div>
+  </div>`;
+}
+
 function renderHafasReference(ref) {
   if (!ref) return '';
   let head;
@@ -886,24 +909,7 @@ function renderHafasReference(ref) {
   } else {
     head = `unavailable — ${escHTML(ref.error || 'error')}`;
   }
-  const cards = (ref.trips || []).map((t) => {
-    const legCount = (t.legs || []).length;
-    const tripOps = operatorsForTrip(t.legs);
-    return `<div class="trip-card hafas-ref-card">
-      <div class="top">
-        <div><strong>${fmt(t.departure_at)} → ${fmt(t.arrival_at)}</strong>
-             <span style="color: var(--rail-steel)"> · ${dur(t.duration_seconds)}</span></div>
-        <div class="top-actions">
-          ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
-        </div>
-      </div>
-      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
-        ${escHTML(t.modes || '—')} · ${legCount} leg${legCount === 1 ? '' : 's'} ·
-        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
-      </div>
-      <div class="legs-detail">${legsHTML(t.legs)}</div>
-    </div>`;
-  }).join('');
+  const cards = (ref.trips || []).map((t) => _oebbTripCardHtml(t)).join('');
   return `<div class="hafas-ref-panel">
     <h3>Reference — ÖBB HAFAS (fahrplan.oebb.at)
       <span style="font-weight:normal;color:var(--rail-steel);font-size:0.85rem">· ${head}</span>
@@ -1293,6 +1299,137 @@ function _viatorColumnLabel(payload) {
   return 'VIATOR · MOTIS / OTP';
 }
 
+// v0.1.44 — VIATOR trip card markup, extracted out of render()'s
+// inline builder so renderViatorOebbPairedGrid() below can render one
+// card at a time (paired-grid rows interleave VIATOR and ÖBB cards) --
+// same markup, same behaviour, single source of truth.
+function _viatorTripCardHtml(t, i) {
+  const flag = t.origin_flag.replace('_', '-');
+  const legCount = t.best.legs.length;
+  const tripOps = operatorsForTrip(t.best.legs);
+  // v0.1.36 — comparison pill (Phase 2). t.comparison is one of
+  // 'common' / 'otp_only' / 'uncomparable', set server-side. Empty
+  // string when comparison wasn't run (no OJP opt-in).
+  const cmp = comparisonPill(t.comparison);
+  return `<div class="trip-card" data-trip-index="${i}">
+    <div class="top">
+      <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
+           <span style="color: var(--rail-steel)"> · ${dur(t.best.duration_seconds)}</span></div>
+      <div class="top-actions">
+        ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
+        <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
+                title="Show OTP JSON for this itinerary">{}</button>
+        ${cmp}
+        <span class="flag ${flag}">${t.origin_flag}</span>
+      </div>
+    </div>
+    <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
+      ${t.best.modes || '—'} · ${legCount} leg${legCount===1?'':'s'} ·
+      Found in: ${t.found_in_sessions.join(', ')} ·
+      <span style="color: var(--brand-blue)">▸ click for leg detail</span>
+    </div>
+    <div class="legs-detail">
+      ${legsHTML(t.best.legs)}
+    </div>
+  </div>`;
+}
+
+// v0.1.44 — VIATOR-vs-ÖBB row alignment. Both sides already compute
+// `first_transit_leg_departure_utc` server-side from the identical
+// `trip_normalize.first_transit_leg_departure_utc` helper (every engine
+// client threads it through — MOTIS, OTP, HAFAS, OJP), so it's the same
+// instant on a comparable clock basis regardless of which engine found
+// the trip. Two itineraries departing their first non-WALK leg at that
+// same instant are, for all practical purposes, the same physical
+// train — this is the exact signal an operator uses when eyeballing
+// the two columns, just made explicit instead of left to the reader.
+function _firstTransitLeg(legs) {
+  for (const lg of (legs || [])) {
+    if (lg && lg.mode !== 'WALK') return lg;
+  }
+  return null;
+}
+
+function _firstTransitLegDepUtc(tripLike) {
+  return (tripLike && tripLike.first_transit_leg_departure_utc) || null;
+}
+
+function _firstTransitLegLabel(legs) {
+  const lg = _firstTransitLeg(legs);
+  if (!lg) return '';
+  return String(lg.route_short_name || lg.route_long_name || '').trim();
+}
+
+function _pairViatorAndOebbTrips(viatorTrips, oebbTrips) {
+  // First-come-first-matched on the ÖBB side: within one result set a
+  // first-transit-leg departure instant is virtually never duplicated,
+  // so simple linear matching is enough (no need for the endpoint +
+  // train-number guarding the coverage alignment scorer uses — that
+  // guards against a fuzzy ±5min tolerance false-matching a busy
+  // corridor's next departure; here the match is an EXACT instant, an
+  // incomparably stronger signal).
+  const oebbUsed = new Set();
+  const rows = [];
+  for (const vt of viatorTrips) {
+    const vDep = _firstTransitLegDepUtc(vt.best);
+    let matchIdx = null;
+    if (vDep) {
+      for (let i = 0; i < oebbTrips.length; i++) {
+        if (oebbUsed.has(i)) continue;
+        if (_firstTransitLegDepUtc(oebbTrips[i]) === vDep) {
+          matchIdx = i;
+          break;
+        }
+      }
+    }
+    if (matchIdx !== null) oebbUsed.add(matchIdx);
+    rows.push({ viator: vt, oebb: matchIdx !== null ? oebbTrips[matchIdx] : null });
+  }
+  // Any ÖBB itinerary nothing on the VIATOR side matched still needs a
+  // row — otherwise "ÖBB found 5, VIATOR found 1" would silently drop
+  // the 4 ÖBB-only itineraries instead of showing them as ÖBB-only rows.
+  oebbTrips.forEach((ot, i) => {
+    if (!oebbUsed.has(i)) rows.push({ viator: null, oebb: ot });
+  });
+  return rows;
+}
+
+function _trainIdMismatchNote(viatorTrip, oebbTrip) {
+  // Only called for an actually-matched row (same departure instant on
+  // both sides). The two sources can still label the physical train
+  // differently (VIATOR reads its GTFS feed's route_short_name; HAFAS
+  // reports its own product/line name) — flag it so the operator
+  // doesn't misread a label mismatch as "these are different trains"
+  // when the times already say otherwise.
+  const vLabel = _firstTransitLegLabel((viatorTrip.best || {}).legs);
+  const oLabel = _firstTransitLegLabel(oebbTrip.legs);
+  if (!vLabel || !oLabel || vLabel.toUpperCase() === oLabel.toUpperCase()) return '';
+  return `<div class="compare-cell train-mismatch-row" style="grid-column: 1 / -1">
+    <span class="train-mismatch-note">⚠ Same departure and arrival time, but the two sources report different train identifiers — VIATOR: <strong>${escHTML(vLabel)}</strong> · ÖBB HAFAS: <strong>${escHTML(oLabel)}</strong>. Very likely the same physical service.</span>
+  </div>`;
+}
+
+function renderViatorOebbPairedGrid(payload) {
+  const viatorTrips = payload.trips || [];
+  const oebbTrips = (payload.hafas_reference && payload.hafas_reference.trips) || [];
+  const rows = _pairViatorAndOebbTrips(viatorTrips, oebbTrips);
+  const body = rows.map((row) => {
+    const vCell = row.viator
+      ? `<div class="compare-cell present">${_viatorTripCardHtml(row.viator, viatorTrips.indexOf(row.viator))}</div>`
+      : '<div class="compare-cell missing">— not found by VIATOR</div>';
+    const oCell = row.oebb
+      ? `<div class="compare-cell present">${_oebbTripCardHtml(row.oebb)}</div>`
+      : '<div class="compare-cell missing">— not found by ÖBB HAFAS</div>';
+    const note = (row.viator && row.oebb) ? _trainIdMismatchNote(row.viator, row.oebb) : '';
+    return vCell + oCell + note;
+  }).join('');
+  return `<div class="compare-grid compare-grid-refs" style="--compare-cols: 1fr 1fr">
+    <div class="compare-header"><span class="engine-pill viator">${escHTML(_viatorColumnLabel(payload))}</span></div>
+    <div class="compare-header"><span class="engine-pill hafas">ÖBB HAFAS</span></div>
+    ${body}
+  </div>`;
+}
+
 function renderSideBySideGrid(payload, viatorCardsHtml) {
   // Build an N-column grid: column 1 is VIATOR's own cards, columns
   // 2..N are the reference panels (OJP, HAFAS, ...). Each column body
@@ -1308,6 +1445,19 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   // so single-engine SBS reads "VIATOR · MOTIS" / "VIATOR · OTP"
   // instead of the misleading combined "VIATOR · MOTIS / OTP" when only
   // one engine actually ran.
+  //
+  // v0.1.44 — when ÖBB HAFAS is the ONLY reference column (no Swiss OJP
+  // alongside it), align VIATOR and ÖBB trips onto the same grid row
+  // whenever they share a first-transit-leg departure instant (see
+  // renderViatorOebbPairedGrid) instead of the two independent-column
+  // layout below. Falls back to the plain layout for every other
+  // configuration (OJP alone, or OJP+HAFAS together) — pairwise
+  // alignment across 3+ columns is a different, unrequested feature.
+  const _refsForPairing = _refColumnDescriptors(payload);
+  if (_refsForPairing.length === 1 && _refsForPairing[0].key === 'hafas'
+      && payload.hafas_reference && payload.hafas_reference.status === 'ok') {
+    return `${_renderToggleControls()}${renderViatorOebbPairedGrid(payload)}`;
+  }
   //
   // PR-198 — the "Compare excluding walk legs" toggle is prepended
   // HERE rather than left to `renderComparisonGrid` (its previous-only
@@ -1358,36 +1508,7 @@ function render(payload) {
   // column list whenever only one engine type ran (single-engine
   // fanout, or one of the engines errored out for every session).
   const comparisonGrid = _shouldRenderComparison(payload) ? renderComparisonGrid(payload) : '';
-  const cards = comparisonGrid ? '' : payload.trips.map((t, i) => {
-    const flag = t.origin_flag.replace('_', '-');
-    const legCount = t.best.legs.length;
-    const tripOps = operatorsForTrip(t.best.legs);
-    // v0.1.36 — comparison pill (Phase 2). t.comparison is one of
-    // 'common' / 'otp_only' / 'uncomparable', set server-side. Empty
-    // string when comparison wasn't run (no OJP opt-in).
-    const cmp = comparisonPill(t.comparison);
-    return `<div class="trip-card" data-trip-index="${i}">
-      <div class="top">
-        <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
-             <span style="color: var(--rail-steel)"> · ${dur(t.best.duration_seconds)}</span></div>
-        <div class="top-actions">
-          ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
-          <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
-                  title="Show OTP JSON for this itinerary">{}</button>
-          ${cmp}
-          <span class="flag ${flag}">${t.origin_flag}</span>
-        </div>
-      </div>
-      <div style="font-size: 0.85rem; color: var(--rail-steel); margin-top: 0.3rem">
-        ${t.best.modes || '—'} · ${legCount} leg${legCount===1?'':'s'} ·
-        Found in: ${t.found_in_sessions.join(', ')} ·
-        <span style="color: var(--brand-blue)">▸ click for leg detail</span>
-      </div>
-      <div class="legs-detail">
-        ${legsHTML(t.best.legs)}
-      </div>
-    </div>`;
-  }).join('');
+  const cards = comparisonGrid ? '' : payload.trips.map((t, i) => _viatorTripCardHtml(t, i)).join('');
   // v0.1.36 — Phase 2 comparison summary strip. Rendered above the
   // result cards when OJP comparison was opted in AND succeeded. The
   // three pills count distinct itinerary fingerprints (within-engine
