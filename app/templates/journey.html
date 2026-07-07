@@ -1343,9 +1343,20 @@ function _viatorTripCardHtml(t, i) {
 // same instant are, for all practical purposes, the same physical
 // train — this is the exact signal an operator uses when eyeballing
 // the two columns, just made explicit instead of left to the reader.
+// v0.1.44 — mirrors the server-side `_NON_TRANSIT_MODES` convention
+// (app/journey/trip_normalize.py) that `first_transit_leg_departure_utc`
+// itself is built on: WALK, TRANSFER, and empty/missing mode are all
+// non-transit. Matching only `!== 'WALK'` would pick a TRANSFER/no-mode
+// filler leg instead of the real first transit leg on itineraries with
+// an intermediate non-JNY/non-WALK section (HAFAS emits `mode: null`
+// for those) — silently defeating the mismatch-warning check below,
+// which then reads an empty label off the wrong leg and never fires.
+const _NON_TRANSIT_MODES = new Set(['WALK', 'TRANSFER', '']);
+
 function _firstTransitLeg(legs) {
   for (const lg of (legs || [])) {
-    if (lg && lg.mode !== 'WALK') return lg;
+    const mode = String((lg && lg.mode) || '').toUpperCase();
+    if (lg && !_NON_TRANSIT_MODES.has(mode)) return lg;
   }
   return null;
 }
@@ -1360,37 +1371,59 @@ function _firstTransitLegLabel(legs) {
   return String(lg.route_short_name || lg.route_long_name || '').trim();
 }
 
+function _pairedGridMissingCell(label) {
+  return `<div class="compare-cell missing">— not found by ${escHTML(label)}</div>`;
+}
+
+function _pairedGridRowSortKey(row) {
+  return (row.viator && row.viator.best.departure_at)
+    || (row.oebb && row.oebb.departure_at)
+    || '';
+}
+
 function _pairViatorAndOebbTrips(viatorTrips, oebbTrips) {
-  // First-come-first-matched on the ÖBB side: within one result set a
-  // first-transit-leg departure instant is virtually never duplicated,
-  // so simple linear matching is enough (no need for the endpoint +
-  // train-number guarding the coverage alignment scorer uses — that
-  // guards against a fuzzy ±5min tolerance false-matching a busy
-  // corridor's next departure; here the match is an EXACT instant, an
-  // incomparably stronger signal).
+  // Match on the EXACT first-transit-leg departure instant — a much
+  // stronger signal than the coverage alignment scorer's fuzzy ±5min +
+  // endpoint tolerance (that guards against a busy corridor's *next*
+  // departure false-matching; here there's no fuzziness to exploit).
+  // Still, a high-frequency corridor CAN have two distinct itineraries
+  // sharing that exact instant (same first train, different transfer
+  // onward) — when more than one ÖBB candidate matches, prefer the one
+  // whose arrival also agrees before falling back to the first found.
   const oebbUsed = new Set();
   const rows = [];
-  for (const vt of viatorTrips) {
+  viatorTrips.forEach((vt, viatorIndex) => {
     const vDep = _firstTransitLegDepUtc(vt.best);
     let matchIdx = null;
     if (vDep) {
+      const candidates = [];
       for (let i = 0; i < oebbTrips.length; i++) {
         if (oebbUsed.has(i)) continue;
-        if (_firstTransitLegDepUtc(oebbTrips[i]) === vDep) {
-          matchIdx = i;
-          break;
-        }
+        if (_firstTransitLegDepUtc(oebbTrips[i]) === vDep) candidates.push(i);
+      }
+      if (candidates.length === 1) {
+        matchIdx = candidates[0];
+      } else if (candidates.length > 1) {
+        const arrivalMatch = candidates.find(i => oebbTrips[i].arrival_at === vt.best.arrival_at);
+        matchIdx = arrivalMatch !== undefined ? arrivalMatch : candidates[0];
       }
     }
     if (matchIdx !== null) oebbUsed.add(matchIdx);
-    rows.push({ viator: vt, oebb: matchIdx !== null ? oebbTrips[matchIdx] : null });
-  }
+    rows.push({ viator: vt, viatorIndex, oebb: matchIdx !== null ? oebbTrips[matchIdx] : null });
+  });
   // Any ÖBB itinerary nothing on the VIATOR side matched still needs a
   // row — otherwise "ÖBB found 5, VIATOR found 1" would silently drop
   // the 4 ÖBB-only itineraries instead of showing them as ÖBB-only rows.
   oebbTrips.forEach((ot, i) => {
-    if (!oebbUsed.has(i)) rows.push({ viator: null, oebb: ot });
+    if (!oebbUsed.has(i)) rows.push({ viator: null, viatorIndex: null, oebb: ot });
   });
+  // Both VIATOR's own trips and the ÖBB-only leftovers arrive in their
+  // source's chronological order, but concatenating the two groups
+  // un-sorted would bury an early ÖBB-only itinerary under VIATOR's
+  // later departures. Re-sort the merged list by whichever side has a
+  // departure time (mirrors the sortKey approach `_bucketsForGrid`
+  // uses for the OTP-vs-MOTIS grid) so the row order stays chronological.
+  rows.sort((a, b) => _pairedGridRowSortKey(a).localeCompare(_pairedGridRowSortKey(b)));
   return rows;
 }
 
@@ -1413,16 +1446,21 @@ function renderViatorOebbPairedGrid(payload) {
   const viatorTrips = payload.trips || [];
   const oebbTrips = (payload.hafas_reference && payload.hafas_reference.trips) || [];
   const rows = _pairViatorAndOebbTrips(viatorTrips, oebbTrips);
-  const body = rows.map((row) => {
-    const vCell = row.viator
-      ? `<div class="compare-cell present">${_viatorTripCardHtml(row.viator, viatorTrips.indexOf(row.viator))}</div>`
-      : '<div class="compare-cell missing">— not found by VIATOR</div>';
-    const oCell = row.oebb
-      ? `<div class="compare-cell present">${_oebbTripCardHtml(row.oebb)}</div>`
-      : '<div class="compare-cell missing">— not found by ÖBB HAFAS</div>';
-    const note = (row.viator && row.oebb) ? _trainIdMismatchNote(row.viator, row.oebb) : '';
-    return vCell + oCell + note;
-  }).join('');
+  // Both sides genuinely found nothing (a valid, empty 'ok' response is
+  // not an error) — say so explicitly instead of rendering two bare
+  // column headers with no body, which reads as a broken page.
+  const body = rows.length
+    ? rows.map((row) => {
+        const vCell = row.viator
+          ? `<div class="compare-cell present">${_viatorTripCardHtml(row.viator, row.viatorIndex)}</div>`
+          : _pairedGridMissingCell('VIATOR');
+        const oCell = row.oebb
+          ? `<div class="compare-cell present">${_oebbTripCardHtml(row.oebb)}</div>`
+          : _pairedGridMissingCell('ÖBB HAFAS');
+        const note = (row.viator && row.oebb) ? _trainIdMismatchNote(row.viator, row.oebb) : '';
+        return vCell + oCell + note;
+      }).join('')
+    : '<div class="compare-cell empty">no itineraries found</div>'.repeat(2);
   return `<div class="compare-grid compare-grid-refs" style="--compare-cols: 1fr 1fr">
     <div class="compare-header"><span class="engine-pill viator">${escHTML(_viatorColumnLabel(payload))}</span></div>
     <div class="compare-header"><span class="engine-pill hafas">ÖBB HAFAS</span></div>
@@ -1453,10 +1491,18 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   // layout below. Falls back to the plain layout for every other
   // configuration (OJP alone, or OJP+HAFAS together) — pairwise
   // alignment across 3+ columns is a different, unrequested feature.
+  //
+  // Deliberately does NOT render `_renderToggleControls()` here: that
+  // toggle flips `_COMPARE_TRAINS_ONLY`, which only the OTP-vs-MOTIS
+  // `renderComparisonGrid` pairing reads. `_pairViatorAndOebbTrips`
+  // always matches on the first TRANSIT leg's departure regardless of
+  // the flag (walk legs were never part of the key), so showing the
+  // checkbox here would be an inert control that looks broken to an
+  // operator who flips it and sees nothing change.
   const _refsForPairing = _refColumnDescriptors(payload);
   if (_refsForPairing.length === 1 && _refsForPairing[0].key === 'hafas'
       && payload.hafas_reference && payload.hafas_reference.status === 'ok') {
-    return `${_renderToggleControls()}${renderViatorOebbPairedGrid(payload)}`;
+    return renderViatorOebbPairedGrid(payload);
   }
   //
   // PR-198 — the "Compare excluding walk legs" toggle is prepended
