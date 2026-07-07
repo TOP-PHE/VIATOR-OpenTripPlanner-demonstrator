@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service
 from ..db import get_db
-from ..journey import hafas_client, ojp_client, planner_dispatch, recorder
+from ..journey import hafas_client, ojp_client, planner_dispatch, recorder, trip_normalize
 from ..models import GraphSnapshot
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -288,7 +288,20 @@ async def _query_hafas_reference(
         return int((time.monotonic() - start) * 1000)
 
     try:
-        raw, trips = await hafas_client.fetch_plan(
+        # v0.1.45 — anchor-time pagination (same fix as OJP's
+        # fetch_reference_paginated). HAFAS's TripSearch is hardcoded to
+        # numF=5 connections from one anchor time, not a time span, so
+        # a single fetch_plan call stops far short of MOTIS/OTP's wider
+        # searchWindow — the ÖBB panel reads as "found far less" when it
+        # was only ever asked about a narrow slice of the day. Target
+        # window matches the SAME OTP_SEARCH_WINDOW_SECONDS config used
+        # for VIATOR's own fanout, so both sides were asked about
+        # (approximately) the same span. This runs in parallel with the
+        # VIATOR session fanout (not after it), so the target window is
+        # this configured default rather than VIATOR's actual result
+        # span — see the post-fanout truncation in `fanout()` for the
+        # step that clips HAFAS down to VIATOR's ACTUAL last departure.
+        raw, trips = await hafas_client.fetch_plan_paginated(
             from_lat=body.from_.lat,
             from_lon=body.from_.lon,
             to_lat=body.to.lat,
@@ -297,6 +310,8 @@ async def _query_hafas_reference(
             timeout_ms=int(cfg.get("HAFAS_TIMEOUT_MS", 10_000)),
             from_name=body.from_.label,
             to_name=body.to.label,
+            target_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
+            max_pages=4,
         )
         # `raw.status` is the engine-level verdict ("ok" / "no_route" /
         # "error"). Lift it into the response so the journey UI's
@@ -310,6 +325,10 @@ async def _query_hafas_reference(
         }
         if raw.get("error"):
             result["error"] = str(raw["error"])
+        # Surface page count so the UI / operator can see whether
+        # pagination actually fired — same convention as OJP's `pages`.
+        if raw.get("pages"):
+            result["pages"] = raw["pages"]
         return result
     except (TimeoutError, httpx.TimeoutException):
         return {"status": "timeout", "trips": [], "response_ms": _ms()}
@@ -396,6 +415,47 @@ def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
     if len(s) == 1:
         return f"{next(iter(s)).upper()}_ONLY"
     return "SUBSET"
+
+
+def _truncate_hafas_to_viator_window(
+    hafas_reference: dict[str, Any] | None, viator_trips: list[dict[str, Any]]
+) -> None:
+    """Mutate `hafas_reference['trips']` in place, dropping any ÖBB trip
+    departing after VIATOR's own latest departure.
+
+    v0.1.45 — `hafas_client.fetch_plan_paginated` targets a FIXED window
+    (`OTP_SEARCH_WINDOW_SECONDS`) chosen before VIATOR's own fanout even
+    starts (the two run concurrently — see `_query_hafas_reference`).
+    If ÖBB's pagination overshoots VIATOR's ACTUAL result span (VIATOR
+    returned fewer/earlier trips than the configured window would
+    suggest, e.g. MOTIS ran dry after 3 sessions), the side-by-side
+    comparison would show ÖBB with MORE coverage in a time range VIATOR
+    was never even displayed for — the mirror image of the original
+    "ÖBB looks artificially worse" complaint this pagination fixes, and
+    just as misleading. Clips to what VIATOR's fanout actually
+    returned, not what it was merely configured to search for.
+    """
+    if not hafas_reference or not viator_trips:
+        return
+    latest_viator_dep_ts = None
+    for t in viator_trips:
+        latest_viator_dep_ts = trip_normalize.max_dep_ts(
+            latest_viator_dep_ts, t.get("best", {}).get("departure_at")
+        )
+    if latest_viator_dep_ts is None:
+        return
+    trips = hafas_reference.get("trips") or []
+    kept = []
+    dropped = 0
+    for t in trips:
+        dep_ts = trip_normalize.max_dep_ts(None, t.get("departure_at"))
+        if dep_ts is None or dep_ts <= latest_viator_dep_ts:
+            kept.append(t)
+        else:
+            dropped += 1
+    if dropped:
+        hafas_reference["trips"] = kept
+        hafas_reference["trimmed_to_viator_window"] = True
 
 
 # ────────────────────── P2 MOTIS — engine filter helpers ──────────────────────
@@ -633,6 +693,13 @@ async def fanout(
                 "origin_flag": _origin_flag(slot["found_in_sessions"], sids_in_fanout),
             }
         )
+
+    # v0.1.45 — clip ÖBB HAFAS's paginated results down to VIATOR's own
+    # actual result window (not merely its configured search window —
+    # see _truncate_hafas_to_viator_window's docstring). Must run AFTER
+    # merged_trips is final; hafas_reference was fetched concurrently
+    # with the fanout above and can't know VIATOR's actual span until now.
+    _truncate_hafas_to_viator_window(hafas_reference, merged_trips)
 
     # v0.1.41 — federated fallback (hub-and-spoke). When no single session
     # returned an end-to-end itinerary, try stitching a domestic leg onto the

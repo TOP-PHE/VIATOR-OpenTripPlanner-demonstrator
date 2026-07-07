@@ -37,7 +37,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from .trip_normalize import dedup_batch_and_track_latest_dep as _dedup_batch_and_track_latest_dep
 from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+from .trip_normalize import next_anchor_or_none as _next_anchor_or_none
 
 log = logging.getLogger(__name__)
 
@@ -351,61 +353,9 @@ async def _fetch_one_page(
     return batch, False
 
 
-def _dedup_batch_and_track_latest_dep(
-    batch: list[dict[str, Any]], seen_fps: set[str]
-) -> tuple[list[dict[str, Any]], float | None]:
-    """One page's bookkeeping: dedupe by transit_fingerprint, track the
-    latest departure across ALL trips (duplicates included — a boundary
-    dup still proves OJP advanced to that anchor).
-
-    Walk-only trips (empty fingerprint) are never deduplicated; they're
-    rare for any OD pair where pagination would even fire.
-    """
-    # Lazy import: signature.py pulls SQLAlchemy for trip_signature
-    # even though transit_fingerprint itself is DB-free. Importing at
-    # call time keeps ojp_client importable in lightweight environments
-    # that don't have SQLAlchemy on the path.
-    from .signature import transit_fingerprint
-
-    new_trips: list[dict[str, Any]] = []
-    latest_dep_ts: float | None = None
-    for t in batch:
-        fp = transit_fingerprint(t.get("legs") or [])
-        if not (fp and fp in seen_fps):
-            if fp:
-                seen_fps.add(fp)
-            new_trips.append(t)
-        latest_dep_ts = _max_dep_ts(latest_dep_ts, t.get("departure_at"))
-    return new_trips, latest_dep_ts
-
-
-def _max_dep_ts(current: float | None, dep_str: str | None) -> float | None:
-    """Return max(current, parse(dep_str)) ignoring unparseable entries."""
-    if not dep_str:
-        return current
-    try:
-        dep_ts = datetime.fromisoformat(dep_str).timestamp()
-    except ValueError:
-        return current
-    return dep_ts if current is None else max(current, dep_ts)
-
-
-def _next_anchor_or_none(latest_dep_ts: float | None, target_end_ts: float) -> datetime | None:
-    """Compute the next page's anchor, or None to stop.
-
-    Returns None when:
-    - latest_dep_ts is None (no parseable departures, can't advance), OR
-    - latest_dep_ts >= target window end (OJP caught up to OTP).
-
-    Otherwise returns `latest_dep_ts + 1 min` as a UTC datetime — the
-    +60 s nudge avoids OJP returning the same train as the leading
-    edge of the next batch.
-    """
-    if latest_dep_ts is None:
-        return None
-    if latest_dep_ts >= target_end_ts:
-        return None
-    return datetime.fromtimestamp(latest_dep_ts + 60.0, tz=UTC)
+# _dedup_batch_and_track_latest_dep / _next_anchor_or_none moved to
+# trip_normalize.py (v0.1.45) so hafas_client's own anchor-pagination
+# wrapper can share the identical algorithm instead of re-deriving it.
 
 
 # ───────────────────────────── response parse ───────────────────────────

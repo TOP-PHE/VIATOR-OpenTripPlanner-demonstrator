@@ -52,7 +52,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from ..network_coverage import external_verify
+from .trip_normalize import dedup_batch_and_track_latest_dep as _dedup_batch_and_track_latest_dep
 from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+from .trip_normalize import next_anchor_or_none as _next_anchor_or_none
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +151,93 @@ async def fetch_plan(
     trips = _normalise_payload(out.payload)
     raw["status"] = "ok" if trips else "no_route"
     return raw, trips
+
+
+async def fetch_plan_paginated(
+    *,
+    from_lat: float,
+    from_lon: float,
+    to_lat: float,
+    to_lon: float,
+    when: datetime,
+    timeout_ms: int = 10_000,
+    from_name: str | None = None,
+    to_name: str | None = None,
+    target_window_seconds: int = 21600,
+    max_pages: int = 4,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Call `fetch_plan` repeatedly with successively later anchor times
+    until HAFAS's coverage matches `target_window_seconds`, HAFAS runs
+    out of connections, or `max_pages` is reached. Same `(raw, trips)`
+    contract as `fetch_plan` — `raw['response_ms']` is summed across
+    pages and `raw['pages']` is set when more than one page fired.
+
+    **Why this exists** (v0.1.45). HAFAS's TripSearch is hardcoded to
+    `numF=5` (see `external_verify._build_trip_search_body`) — the next
+    5 connections from ONE anchor time, not a time span. An operator
+    comparing the ÖBB panel against MOTIS/OTP's much wider
+    `searchWindow` sees HAFAS's reference stop hours earlier than
+    VIATOR's own results, which reads as "ÖBB found far less" when
+    really it was only ever asked about a narrow slice of the day.
+
+    Mirrors `ojp_client.fetch_reference_paginated` (identical problem,
+    identical fix) — see that function's docstring for the general
+    anchor-pagination algorithm; the per-page loop here is HAFAS-
+    specific because `fetch_plan` never raises (errors surface via
+    `raw['status']`), unlike `ojp_client.fetch_reference` which can
+    raise `httpx.HTTPError` mid-flight.
+
+    Stop conditions, evaluated each page:
+    - **empty batch** (`no_route` or `error` status) → HAFAS exhausted
+      or failed at this anchor; return whatever was collected so far.
+    - **all trips were duplicates of earlier pages** → no forward
+      progress, bail (boundary collision only).
+    - **latest `departure_at` >= `when + target_window_seconds`** →
+      coverage caught up to the target.
+    - **`max_pages` reached** → hard cap (default 4 pages x 5 results
+      = 20 trips max, same ceiling as OJP's pagination).
+    """
+    target_end_ts = when.timestamp() + target_window_seconds
+    anchor = when
+    all_trips: list[dict[str, Any]] = []
+    seen_fps: set[str] = set()
+    total_ms = 0
+    pages = 0
+    first_raw: dict[str, Any] | None = None
+    fetch_kwargs = {
+        "from_lat": from_lat,
+        "from_lon": from_lon,
+        "to_lat": to_lat,
+        "to_lon": to_lon,
+        "timeout_ms": timeout_ms,
+        "from_name": from_name,
+        "to_name": to_name,
+    }
+
+    for _ in range(max_pages):
+        pages += 1
+        raw, batch = await fetch_plan(when=anchor, **fetch_kwargs)
+        total_ms += int(raw.get("response_ms") or 0)
+        if first_raw is None:
+            first_raw = raw
+        if not batch:
+            break  # HAFAS exhausted / errored at this anchor
+
+        new_trips, latest_dep_ts = _dedup_batch_and_track_latest_dep(batch, seen_fps)
+        if not new_trips:
+            break  # all-dups -> no forward progress
+        all_trips.extend(new_trips)
+        next_anchor = _next_anchor_or_none(latest_dep_ts, target_end_ts)
+        if next_anchor is None:
+            break
+        anchor = next_anchor
+
+    raw_out = dict(first_raw or {})
+    raw_out["response_ms"] = total_ms
+    raw_out["status"] = "ok" if all_trips else raw_out.get("status", "no_route")
+    if pages > 1:
+        raw_out["pages"] = pages
+    return raw_out, all_trips
 
 
 # ─────────────────────── request-side helpers ───────────────────────

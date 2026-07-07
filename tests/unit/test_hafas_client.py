@@ -18,7 +18,7 @@ Three layers, mirroring `test_external_verify.py`:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -632,3 +632,208 @@ async def test_external_verify_facade_unchanged_after_refactor() -> None:
     assert result.ok is True
     assert result.num_connections == 1
     assert result.best_duration_seconds == 2 * 3600
+
+
+# ─────────────────────── fetch_plan_paginated ───────────────────────
+#
+# v0.1.45 — mirrors test_ojp_client.py's TestFetchReferencePaginated
+# (same algorithm, shared via trip_normalize.dedup_batch_and_track_
+# latest_dep / next_anchor_or_none). Monkeypatches `hafas_client.
+# fetch_plan` directly rather than mocking HTTP transport, matching
+# how the OJP suite tests fetch_reference_paginated against
+# fetch_reference — the pagination loop's own logic is what's under
+# test, not the wire format underneath a single page.
+
+
+def _make_hafas_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str) -> dict:
+    """A minimal trip dict whose transit_fingerprint is determined by
+    (route, from_uic, to_uic, dep_minute) — same shape convention as
+    test_ojp_client.py's _make_trip."""
+    return {
+        "duration_seconds": 1800,
+        "num_transfers": 0,
+        "departure_at": dep_iso,
+        "arrival_at": dep_iso,
+        "modes": "RAIL",
+        "legs": [
+            {
+                "mode": "RAIL",
+                "from_lat": 48.1859,
+                "from_lon": 16.3754,
+                "to_lat": 47.8127,
+                "to_lon": 13.0467,
+                "from_stop_id": f"HAFAS:{from_uic}",
+                "to_stop_id": f"HAFAS:{to_uic}",
+                "departure": dep_iso,
+                "arrival": dep_iso,
+                "route_short_name": route,
+                "feed_id": "fahrplan.oebb.at",
+            }
+        ],
+        "feed_id": "fahrplan.oebb.at",
+    }
+
+
+class TestFetchPlanPaginated:
+    @pytest.mark.asyncio
+    async def test_single_page_covers_window_no_pagination(self, monkeypatch) -> None:
+        # First batch's latest departure already reaches the target
+        # window end - one call, return what came back.
+        async def fake_fetch_plan(**kw):
+            when = kw["when"]
+            trip = _make_hafas_trip(
+                dep_iso=(when + timedelta(hours=7)).isoformat(),
+                route="RJ 63",
+                from_uic="8100002",
+                to_uic="8100173",
+            )
+            return {"status": "ok", "response_ms": 400}, [trip]
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert len(trips) == 1
+        assert raw["status"] == "ok"
+        assert "pages" not in raw  # single page — no pagination diagnostic noise
+
+    @pytest.mark.asyncio
+    async def test_paginates_until_window_covered(self, monkeypatch) -> None:
+        # Each batch's latest trip is +1h ahead of its anchor. Target
+        # window 4h → need 4 calls to walk past the 4h mark.
+        calls: list[datetime] = []
+
+        async def fake_fetch_plan(**kw):
+            calls.append(kw["when"])
+            base = kw["when"]
+            trips = [
+                _make_hafas_trip(
+                    dep_iso=(base + timedelta(minutes=30)).isoformat(),
+                    route="RJ 1",
+                    from_uic=f"810{1000 + len(calls)}",
+                    to_uic="8100173",
+                ),
+                _make_hafas_trip(
+                    dep_iso=(base + timedelta(minutes=60)).isoformat(),
+                    route="RJ 2",
+                    from_uic=f"810{2000 + len(calls)}",
+                    to_uic="8100173",
+                ),
+            ]
+            return {"status": "ok", "response_ms": 300}, trips
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        start = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=start,
+            timeout_ms=5000,
+            target_window_seconds=4 * 3600,
+            max_pages=8,
+        )
+        assert raw.get("pages") == 4
+        assert len(trips) == 8  # 2 unique trips per page x 4 pages
+        assert raw["response_ms"] == 300 * 4  # summed across pages
+        for i in range(1, len(calls)):
+            assert calls[i] > calls[i - 1]
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_stops_pagination(self, monkeypatch) -> None:
+        page_calls = {"n": 0}
+
+        async def fake_fetch_plan(**kw):
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {"status": "ok", "response_ms": 200}, [
+                    _make_hafas_trip(
+                        dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
+                        route="RJ 1",
+                        from_uic="8100001",
+                        to_uic="8100173",
+                    )
+                ]
+            return {"status": "no_route", "response_ms": 150}, []
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert page_calls["n"] == 2
+        assert len(trips) == 1
+        # Partial data recovered from page 1 -> overall status still 'ok'.
+        assert raw["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_first_page_error_propagates_status(self, monkeypatch) -> None:
+        async def fake_fetch_plan(**kw):
+            return {"status": "error", "error": "boom", "response_ms": 50}, []
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert trips == []
+        assert raw["status"] == "error"
+        assert raw["error"] == "boom"
+
+    @pytest.mark.asyncio
+    async def test_all_duplicates_stops_pagination(self, monkeypatch) -> None:
+        # Fake ignores the anchor and always echoes back the exact same
+        # connection (fixed dep_iso -> identical transit_fingerprint
+        # every page). Page 1 adds it as new; page 2 sees only a dup and
+        # must bail rather than looping to max_pages asking the same
+        # question forever.
+        page_calls = {"n": 0}
+
+        async def fake_fetch_plan(**kw):
+            page_calls["n"] += 1
+            trip = _make_hafas_trip(
+                dep_iso="2026-06-28T08:30:00+00:00",
+                route="RJ 1",
+                from_uic="8100001",
+                to_uic="8100173",
+            )
+            return {"status": "ok", "response_ms": 100}, [trip]
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        _raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert page_calls["n"] == 2  # page 1: new trip; page 2: dup detected, bail
+        assert len(trips) == 1

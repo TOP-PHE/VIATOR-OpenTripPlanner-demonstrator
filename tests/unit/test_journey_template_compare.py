@@ -717,3 +717,84 @@ def test_paired_grid_breaks_same_instant_ties_on_arrival(template_text: str):
         "between two distinct ÖBB itineraries could silently pair the "
         "wrong one to a VIATOR trip."
     )
+
+
+# ───────────────── v0.1.45 "possible duplicate" badge ─────────────────
+# MOTIS can report a single physically-coupled/portioned train (e.g.
+# SNCF's "601" + "601A", split for part of the journey but one driver)
+# as two independent itineraries sharing the exact same departure and
+# arrival. No block_id or trip-composition data exists anywhere in the
+# pipeline to confirm the two really are one physical service, so this
+# is a same-engine, display-only heuristic: flag every trip whose
+# (departure_at, arrival_at) pair was already seen earlier in the list.
+
+
+def test_duplicate_detector_helper_is_defined(template_text: str):
+    assert "function _duplicateDepartureArrivalIndices(" in template_text
+
+
+def test_viator_card_accepts_duplicate_flag_and_renders_badge(template_text: str):
+    """`_viatorTripCardHtml` must accept the duplicate flag as its third
+    parameter and conditionally render `.dup-badge` from it — otherwise
+    the detector's output never reaches the DOM."""
+    fn_start = template_text.find("function _viatorTripCardHtml(")
+    assert fn_start != -1, "_viatorTripCardHtml function missing"
+    next_fn = template_text.find("\nfunction ", fn_start + len("function _viatorTripCardHtml("))
+    body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 2000]
+    assert "isDuplicate" in body, (
+        "_viatorTripCardHtml no longer accepts an isDuplicate parameter — "
+        "the possible-duplicate badge can never be shown."
+    )
+    assert "dup-badge" in body, (
+        "_viatorTripCardHtml no longer renders the .dup-badge element — "
+        "even with isDuplicate wired in, nothing would render."
+    )
+
+
+def test_duplicate_flag_wired_into_flat_list_render(template_text: str):
+    """The main `render(payload)` cards map must compute the duplicate
+    set from `payload.trips` and pass it per-card — otherwise the flat
+    (non-SBS) list never shows the badge even though the paired grid
+    does."""
+    render_start = template_text.find("function render(payload) {")
+    assert render_start != -1, "render(payload) function missing"
+    next_fn = template_text.find("\nfunction ", render_start + len("function render(payload) {"))
+    body = template_text[render_start : next_fn if next_fn != -1 else render_start + 4000]
+    assert "_duplicateDepartureArrivalIndices(payload.trips)" in body, (
+        "render(payload) no longer computes the duplicate-index set from "
+        "payload.trips — the flat card list would lose the possible-"
+        "duplicate badge entirely."
+    )
+    assert "_viatorTripCardHtml(t, i, " in body, (
+        "render(payload)'s cards map no longer passes a third argument "
+        "to _viatorTripCardHtml — the duplicate flag is computed but "
+        "never threaded into the card markup."
+    )
+
+
+def test_duplicate_flag_wired_into_paired_grid(template_text: str):
+    """`renderViatorOebbPairedGrid` must also compute and pass the
+    duplicate flag for its VIATOR column — the SBS paired grid is a
+    SEPARATE render path from the flat list and doesn't inherit the
+    flat list's wiring."""
+    fn_start = template_text.find("function renderViatorOebbPairedGrid(")
+    assert fn_start != -1, "renderViatorOebbPairedGrid function missing"
+    next_fn = template_text.find(
+        "\nfunction ", fn_start + len("function renderViatorOebbPairedGrid(")
+    )
+    body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 3000]
+    assert "_duplicateDepartureArrivalIndices(viatorTrips)" in body, (
+        "renderViatorOebbPairedGrid no longer computes the duplicate-"
+        "index set — the SBS paired grid would lose the possible-"
+        "duplicate badge."
+    )
+    assert "_viatorTripCardHtml(row.viator, row.viatorIndex, " in body, (
+        "renderViatorOebbPairedGrid's VIATOR cell no longer passes the "
+        "duplicate flag into _viatorTripCardHtml."
+    )
+
+
+def test_duplicate_badge_css_present(template_text: str):
+    """`.dup-badge` styling must be defined — without it the badge
+    renders as unstyled inline text with no visual warning cue."""
+    assert ".dup-badge" in template_text
