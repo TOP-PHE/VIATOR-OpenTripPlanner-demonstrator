@@ -807,6 +807,33 @@ def test_side_by_side_wiring_present() -> None:
     assert 'class="sbs"' in html or ".sbs {" in html
 
 
+def test_trip_card_rank_badge_uses_array_position() -> None:
+    """Regression lock (adversarial review of PR #221): once a cell's
+    trips are fetched filtered-and-sorted by departure time
+    (_fetch_trips_by_search's depart_at handling) rather than VIATOR's
+    rank_in_response order, badging by `trip.rank` produced a
+    non-sequential list (e.g. #7, #2, #9 top to bottom). renderTrip
+    must take a 2nd `idx` param (trips.map(renderTrip) already passes
+    it) and badge by array position instead."""
+    html = _render()
+    assert "function renderTrip(trip, idx)" in html
+    assert 'class="rank">#${idx + 1}' in html
+    assert 'class="rank">#${trip.rank + 1}' not in html
+
+
+def test_truncation_note_does_not_claim_ranked_best_first() -> None:
+    """Regression lock: `cell.num_itineraries` is the persisted total
+    across the whole day, independent of the depart_at filter — once
+    _fetch_trips_by_search filters+sorts by depart_at, the trips that
+    survive are the earliest ones at/after the requested time, not
+    VIATOR's best-ranked ones. The old wording ('ranked, best first')
+    would tell a stakeholder that better options were cut for size
+    when they were actually excluded by time window."""
+    html = _render()
+    assert "ranked, best first" not in html
+    assert "earliest itineraries departing at or after the requested time" in html
+
+
 def test_build_export_context_run_meta_uses_started_at_not_created_at() -> None:
     """Regression lock: the NetworkCoverageRun model has `started_at`,
     not `created_at`. Mypy caught this in CI on the first push of this

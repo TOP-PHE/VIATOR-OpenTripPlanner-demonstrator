@@ -117,6 +117,25 @@ def test_pill_classes_for_both_columns(template_text: str):
     assert "pillClass: 'oebb'" in template_text
 
 
+def test_viator_trip_card_rank_badge_uses_array_position(template_text: str):
+    """Regression lock (adversarial review of PR #221): once a cell's
+    trips are fetched filtered-and-sorted by departure time
+    (_fetch_trips_by_search's depart_at handling) rather than VIATOR's
+    rank_in_response order, badging by `trip.rank` produced a
+    non-sequential list (e.g. #7, #2, #9 top to bottom). The card must
+    take a 2nd `idx` param (trips.map(renderModalViatorTripCard) already
+    passes it) and badge by array position instead.
+
+    No "old pattern is gone" negative check here — the dead (never
+    called) legacy `renderTripCard` function still has the old
+    `trip.rank`-based badge and isn't in this fix's scope, so a blanket
+    file-wide absence check would be a false positive against it."""
+    assert re.search(
+        r"function\s+renderModalViatorTripCard\s*\(\s*trip\s*,\s*idx\s*\)", template_text
+    ), "renderModalViatorTripCard must accept an idx param to badge by array position"
+    assert 'cov-trip-rank">#${idx + 1}' in template_text
+
+
 def test_oebb_column_reads_external_itineraries(template_text: str):
     """The ÖBB column body MUST read from CellTripsDirection.
     external_itineraries (populated by PR-196a's sweep) — anything
