@@ -460,7 +460,14 @@
     `;
   }
 
-  function renderTrip(trip) {
+  // `idx` (2nd .map() arg — trips.map(renderTrip) already passes it)
+  // drives the "#N" badge instead of `trip.rank`. `rank` is VIATOR's
+  // internal response-quality order; once a cell's trips are fetched
+  // filtered-and-sorted by departure time (_fetch_trips_by_search's
+  // depart_at handling), rendering them in `rank` order would make the
+  // badges non-sequential against the now-chronological list — using
+  // position keeps the badge matching what's actually on screen.
+  function renderTrip(trip, idx) {
     const dep = fmtTime(trip.departure_at);
     const arr = fmtTime(trip.arrival_at);
     const day = fmtDate(trip.departure_at);
@@ -468,7 +475,7 @@
     return `
       <div class="trip">
         <div class="trip-head">
-          <span class="rank">#${trip.rank + 1}</span>
+          <span class="rank">#${idx + 1}</span>
           <span class="when">${day} ${dep} → ${arr}</span>
           <span class="duration">${fmtDuration(trip.duration_seconds)}</span>
           <span class="transfers">${trip.num_transfers} transfer${trip.num_transfers === 1 ? '' : 's'}</span>
@@ -566,7 +573,14 @@
     }
     const notes = [];
     if (cell.num_itineraries != null && cell.num_itineraries > trips.length) {
-      notes.push(`<p class="truncated-note">Showing top ${trips.length} of ${cell.num_itineraries} itineraries (ranked, best first) — this report caps itinerary detail per cell to keep it a manageable size.</p>`);
+      // The old wording described the cap as picking VIATOR's top
+      // quality-ranked trips (rank_in_response order). Since
+      // _fetch_trips_by_search now also filters+sorts by depart_at, the
+      // trips reaching this template are the earliest ones at/after the
+      // run's requested time instead — the note has to say so, or a
+      // stakeholder reads it as "N better options got cut for size" when
+      // they were actually excluded by time window.
+      notes.push(`<p class="truncated-note">Showing the ${trips.length} earliest itineraries departing at or after the requested time (of ${cell.num_itineraries} found across the day) — this report limits itinerary detail per cell to keep it a manageable size.</p>`);
     }
     if (FLAGS.legs_omitted) {
       notes.push('<p class="truncated-note">Leg-by-leg detail is omitted from this offline export because the run is large — open the run’s shared link for full detail.</p>');

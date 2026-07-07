@@ -1808,12 +1808,22 @@ function renderModalOebbColumn(itineraries) {
 // shape as the legacy renderTripCard but `.cov-cell-trip.viator`
 // styling sits tighter for the two-column layout. WALK legs carry the
 // `walk-leg` class so the modal-only toggle can hide them in-place.
-function renderModalViatorTripCard(trip) {
+//
+// `idx` (2nd .map() arg — already passed by renderModalViatorColumn's
+// `trips.map(renderModalViatorTripCard)`, just unused before this fix)
+// drives the "#N" badge instead of `trip.rank`. `rank` is VIATOR's
+// internal response-quality order; once a cell's trips are fetched
+// filtered-and-sorted by departure time (see _fetch_trips_by_search's
+// depart_at handling), rendering them in `rank` order would make the
+// badges non-sequential (e.g. #7, #2, #9 top to bottom) against the
+// now-chronological list — using position keeps the badge matching
+// what's actually on screen.
+function renderModalViatorTripCard(trip, idx) {
   const legs = (trip.legs || []).map(renderModalLeg).join('');
   const transfers = fmtCount(trip.num_transfers, 'transfer');
   return `<div class="cov-trip cov-cell-trip viator">
     <div class="cov-trip-head">
-      <span class="cov-trip-rank">#${(trip.rank || 0) + 1}</span>
+      <span class="cov-trip-rank">#${idx + 1}</span>
       <span>${fmtTime(trip.departure_at)} → ${fmtTime(trip.arrival_at)}</span>
       <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
       <span class="hint">${escHTML(transfers)}</span>

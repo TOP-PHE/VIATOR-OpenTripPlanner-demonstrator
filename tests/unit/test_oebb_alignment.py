@@ -20,10 +20,12 @@ Out of scope (covered elsewhere):
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from app.network_coverage.alignment import _oebb_naive_to_utc_iso as _vienna_local_to_utc
-from app.network_coverage.alignment import compute_alignment
+from app.network_coverage.alignment import compute_alignment, filter_trips_from_depart_at
 from app.network_coverage.external_verify import VerifyItinerary, VerifyLeg, extract_uic
 
 # ─────────────────────── extract_uic ───────────────────────
@@ -405,3 +407,55 @@ def test_compute_alignment_fuzzy_match_survives_cest_offset() -> None:
     score, tier = compute_alignment(v, o)
     assert score == 0.7
     assert tier == "mostly_agree"
+
+
+# ─────────── filter_trips_from_depart_at (VIATOR/ÖBB search-scope fix) ───────────
+
+
+def _trip(dep_iso: str | None, tag: str) -> dict:
+    """Minimal trip dict — only departure_at matters to the filter; `tag`
+    lets assertions identify which trips survived without depending on
+    dict identity."""
+    return {"departure_at": dep_iso, "tag": tag}
+
+
+def test_filter_trips_from_depart_at_drops_earlier_trips() -> None:
+    """The bug this fixes: a cell's VIATOR trips span the WHOLE K-slot
+    day window, while ÖBB's verify-sweep call is one forward-looking
+    search anchored at depart_at — so trips departing before that
+    anchor were never comparable to what ÖBB was asked and must be
+    excluded, not just deprioritised."""
+    depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    trips = [
+        _trip("2026-07-13T02:34:00+00:00", "too-early"),
+        _trip("2026-07-13T05:59:00+00:00", "one-minute-too-early"),
+        _trip("2026-07-13T06:00:00+00:00", "exact-boundary"),
+        _trip("2026-07-13T07:20:00+00:00", "later"),
+    ]
+    out = filter_trips_from_depart_at(trips, depart_at)
+    assert [t["tag"] for t in out] == ["exact-boundary", "later"]
+
+
+def test_filter_trips_from_depart_at_sorts_chronologically() -> None:
+    """Kept trips come back earliest-first regardless of input order —
+    matching HAFAS's own next-N-departures-from-depart_at ordering, not
+    VIATOR's internal quality/duration rank_in_response order."""
+    depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    trips = [
+        _trip("2026-07-13T09:00:00+00:00", "third"),
+        _trip("2026-07-13T06:05:00+00:00", "first"),
+        _trip("2026-07-13T07:30:00+00:00", "second"),
+    ]
+    out = filter_trips_from_depart_at(trips, depart_at)
+    assert [t["tag"] for t in out] == ["first", "second", "third"]
+
+
+@pytest.mark.parametrize("dep_iso", [None, "", "not-a-date"])
+def test_filter_trips_from_depart_at_drops_unparseable_departure(dep_iso: str | None) -> None:
+    depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    out = filter_trips_from_depart_at([_trip(dep_iso, "bad")], depart_at)
+    assert out == []
+
+
+def test_filter_trips_from_depart_at_empty_input() -> None:
+    assert filter_trips_from_depart_at([], datetime(2026, 7, 13, 6, 0, tzinfo=UTC)) == []

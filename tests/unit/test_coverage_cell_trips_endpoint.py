@@ -114,7 +114,7 @@ def test_get_cell_trips_returns_both_directions_for_direction_both(monkeypatch):
     monkeypatch.setattr(
         api,
         "_fetch_trips_by_search",
-        lambda _db, ids: {
+        lambda _db, ids, _depart_at=None: {
             str(out_row.journey_search_id): [{"rank": 0, "duration_seconds": 22920}],
             str(ret_row.journey_search_id): [{"rank": 0, "duration_seconds": 24000}],
         },
@@ -154,7 +154,7 @@ def test_get_cell_trips_hides_return_when_direction_single(monkeypatch):
     monkeypatch.setattr(
         api,
         "_fetch_trips_by_search",
-        lambda _db, ids: {str(out_row.journey_search_id): []},
+        lambda _db, ids, _depart_at=None: {str(out_row.journey_search_id): []},
     )
 
     resp = api.get_cell_trips(
@@ -182,7 +182,7 @@ def test_get_cell_trips_return_none_for_missing_reverse_row(monkeypatch):
     # Only the outbound row in the DB — reverse missing.
     db = _db_returning(run=run, rows=[out_row])
 
-    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids, _depart_at=None: {})
 
     resp = api.get_cell_trips(
         run_id=run.id,
@@ -234,7 +234,7 @@ def test_get_cell_trips_row_without_journey_search_id_returns_empty_trips(monkey
     db = _db_returning(run=run, rows=[out_row])
 
     # Trips fetcher should never be called with None ids, but stub it anyway.
-    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids, _depart_at=None: {})
 
     resp = api.get_cell_trips(
         run_id=run.id,
@@ -262,7 +262,7 @@ def test_get_cell_trips_passes_only_non_null_search_ids_to_fetcher(monkeypatch):
 
     captured_ids: list = []
 
-    def fake_fetcher(_db, ids):
+    def fake_fetcher(_db, ids, _depart_at=None):
         captured_ids.extend(ids)
         return {}
 
@@ -316,7 +316,7 @@ def test_get_cell_trips_round_trips_alignment_fields_into_response(monkeypatch):
     )
     db = _db_returning(run=run, rows=[out_row])
 
-    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids, _depart_at=None: {})
 
     resp = api.get_cell_trips(
         run_id=run.id,
@@ -353,7 +353,7 @@ def test_get_cell_trips_rejects_unknown_alignment_tier(monkeypatch):
     )
     db = _db_returning(run=run, rows=[out_row])
 
-    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids: {})
+    monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids, _depart_at=None: {})
 
     with pytest.raises(ValidationError):
         api.get_cell_trips(

@@ -53,7 +53,10 @@ from ..models import (
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from . import external_verify  # PR-E — auto-verify-on-completion sweep
-from .alignment import compute_alignment  # PR-196a — graduated heatmap scorer
+from .alignment import (
+    compute_alignment,  # PR-196a — graduated heatmap scorer
+    filter_trips_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
+)
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
 # PR #36 — valid coverage-run modes.
@@ -1287,7 +1290,7 @@ async def _maybe_run_external_verify_sweep(
 
 
 def _fetch_viator_trips_for_search(
-    db: DbSession, search_id: uuid.UUID | None
+    db: DbSession, search_id: uuid.UUID | None, depart_at: datetime
 ) -> list[dict[str, Any]]:
     """PR-196a — pull the VIATOR-side trip dicts for one search_id.
 
@@ -1298,7 +1301,15 @@ def _fetch_viator_trips_for_search(
     but threading the full dict keeps the data contract identical to
     what the modal renders. Empty list when search_id is NULL or the
     JOIN finds no rows (status='ok' but no trips = the alignment
-    treats VIATOR as one-sided empty)."""
+    treats VIATOR as one-sided empty).
+
+    Filtered to `filter_trips_from_depart_at(..., depart_at)` — a
+    cell's VIATOR trips span the whole K-slot day window (see that
+    function's docstring), while ÖBB's `verify_via_oebb_hafas` call is
+    a single forward-looking search anchored at `depart_at`. Without
+    this, the scorer compared ÖBB's few depart_at-anchored itineraries
+    against ALL of VIATOR's day-spanning ones and would rarely find a
+    real match even when one exists."""
     if search_id is None:
         return []
     rows = (
@@ -1311,7 +1322,7 @@ def _fetch_viator_trips_for_search(
         .scalars()
         .all()
     )
-    return [
+    trips = [
         {
             "duration_seconds": t.duration_seconds,
             "num_transfers": t.num_transfers,
@@ -1322,6 +1333,7 @@ def _fetch_viator_trips_for_search(
         }
         for t in rows
     ]
+    return filter_trips_from_depart_at(trips, depart_at)
 
 
 def _persist_alignment_on_row(
@@ -1413,7 +1425,9 @@ async def _run_external_verify_sweep(
                     # verdicts get an empty ÖBB side ("we couldn't ask")
                     # which the scorer maps to no_service / one_sided
                     # based on whether VIATOR returned anything.
-                    viator_trips = _fetch_viator_trips_for_search(db, row.journey_search_id)
+                    viator_trips = _fetch_viator_trips_for_search(
+                        db, row.journey_search_id, run.depart_at
+                    )
                     _persist_alignment_on_row(row, viator_trips, verdict.itineraries)
                     counters["verified"] += 1
                     if verdict.error is not None:

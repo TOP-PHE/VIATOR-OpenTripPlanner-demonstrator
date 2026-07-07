@@ -92,6 +92,50 @@ def _strip_walk_legs(legs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [leg for leg in legs if (leg.get("mode") or "").upper() not in ("", "WALK", "TRANSFER")]
 
 
+def filter_trips_from_depart_at(
+    trips: list[dict[str, Any]], depart_at: datetime
+) -> list[dict[str, Any]]:
+    """Keep only trips departing at/after `depart_at`, sorted
+    chronologically (earliest first).
+
+    ÖBB HAFAS's TripSearch is a forward "depart after" query — `numF=5`
+    (see external_verify._build_trip_search_body) returns its next 5
+    connections from `depart_at`, not 5 spread across the whole day.
+    VIATOR's own per-cell trip list, by contrast, aggregates K time
+    slots spanning the ENTIRE requested day window (runner.py's K-slot
+    time-slicing), so without this filter a cell's VIATOR side could
+    show itineraries from hours before OR after `depart_at` that ÖBB
+    was never asked about — comparing a whole-day aggregate against a
+    single-instant snapshot. That scope mismatch is independent of (and
+    was found to be larger in practice than) the clock-basis mismatch
+    `_oebb_naive_to_utc_iso` fixes.
+
+    Used both by the alignment scorer (so a persisted score reflects a
+    comparable window — see `runner._fetch_viator_trips_for_search`)
+    and by the cell-detail display (so the VIATOR and ÖBB columns shown
+    side by side represent the same search scope — see
+    `network_coverage._fetch_trips_by_search`), rather than duplicating
+    this filter in each caller.
+
+    Trips with a missing/unparseable `departure_at` are dropped — with
+    no placement in the window, there's no basis to call them
+    comparable to ÖBB's answer either way.
+    """
+    dated: list[tuple[datetime, dict[str, Any]]] = []
+    for t in trips:
+        dep_str = t.get("departure_at")
+        if not dep_str:
+            continue
+        try:
+            dep = datetime.fromisoformat(dep_str)
+        except ValueError:
+            continue
+        if dep >= depart_at:
+            dated.append((dep, t))
+    dated.sort(key=lambda pair: pair[0])
+    return [t for _, t in dated]
+
+
 def _oebb_naive_to_utc_iso(value: str | None) -> str | None:
     """Convert a persisted VerifyLeg/VerifyItinerary naive Vienna-local
     timestamp to a genuine UTC-instant ISO string — the same basis
