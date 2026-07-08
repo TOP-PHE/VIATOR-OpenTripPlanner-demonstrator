@@ -218,7 +218,11 @@ class RunCreate(BaseModel):
         default=None,
         description=(
             "Calendar date in window_timezone the K slots anchor on. "
-            "None = tomorrow at run-create time in window_timezone."
+            "None = the day whose day-window contains depart_at (normally "
+            "depart_at's own date; one day earlier for a cross-midnight "
+            "window). Supplying a date that disagrees with that anchor is "
+            "a 400: the grid is searched on reference_date while every "
+            "comparison anchors on depart_at, so the two must agree."
         ),
     )
 
@@ -629,14 +633,7 @@ def list_runs(
     stats_by_run = _aggregate_response_ms(db, [r.id for r in rows])
     # One config read for the whole sidebar, not one per run.
     cfg = runner._load_coverage_config(db)
-    return [
-        _run_to_summary(
-            r,
-            response_ms_stats=stats_by_run.get(r.id),
-            depart_at_outside_window=_depart_at_outside_window(r, cfg),
-        )
-        for r in rows
-    ]
+    return [_run_to_summary(r, response_ms_stats=stats_by_run.get(r.id), cfg=cfg) for r in rows]
 
 
 @router.post(
@@ -734,7 +731,7 @@ def create_run(
     # response is sent — the operator gets the run id immediately and
     # the UI starts polling.
     bg.add_task(runner.execute_run, run.id)
-    return _run_to_summary(run)
+    return _run_to_summary(run, cfg=runner._load_coverage_config(db))
 
 
 def _resolve_hubs(db: DbSession) -> list[HubInfo]:
@@ -933,25 +930,55 @@ def _depart_at_outside_window(run: NetworkCoverageRun, cfg: runner.CoverageConfi
     the run's own trips, rendering an empty VIATOR column next to a
     non-zero `num_itineraries`.
 
+    Deliberately a calendar-DAY comparison, not window containment: an
+    operator who narrows the window to 06:00-22:00 and departs at 05:30
+    has a perfectly-anchored run whose depart_at merely precedes the first
+    slot — badging that as "wrong day" would slander a valid run and
+    silently disable PR #221's filter for it.
+
     An unresolvable window counts as "outside": both callers degrade to
     the safe, pre-filter behaviour rather than hiding trips.
     """
     try:
-        return not runner.depart_at_within_window(run, cfg)
+        return not runner.reference_date_matches_depart_at(run, cfg)
     except Exception:
         log.warning("could not resolve window for run %s — treating depart_at as unusable", run.id)
         return True
 
 
+def _safe_depart_at_iso(run: Any) -> str:
+    """Raw (UTC) `depart_at` ISO string. Only used when no `cfg` is
+    available to localise it — see `_run_to_summary`."""
+    depart_at = getattr(run, "depart_at", None)
+    return depart_at.isoformat() if depart_at else ""
+
+
+def _depart_at_local_iso(run: NetworkCoverageRun, cfg: runner.CoverageConfig) -> str:
+    """`run.depart_at` rendered as a wall-clock in the run's own timezone.
+
+    `depart_at` is persisted as an instant (`timestamptz`), and psycopg
+    hands it back in UTC. Echoing that verbatim shows a `Europe/Brussels`
+    operator "04:40" for the 06:40 they typed. Every display surface — run
+    header, sidebar, export report, the journey deep-link — reads this
+    field, so localise once here rather than at each of them.
+    """
+    try:
+        tz = runner._resolve_timezone(run.window_timezone, cfg)
+        return run.depart_at.astimezone(tz).isoformat()
+    except Exception:  # never break the banner over a bad zone
+        log.warning("could not localise depart_at for run %s", run.id)
+        return run.depart_at.isoformat()
+
+
 def _comparable_depart_at(db: DbSession, run: NetworkCoverageRun) -> datetime | None:
     """`run.depart_at`, but only when the run actually searched that day.
 
-    A `depart_at` outside the searched window is exactly the case
+    A `depart_at` whose day the run never searched is exactly the case
     `_fetch_trips_by_search`'s own contract calls "no natural depart_at to
     compare against" — so return None and let it fall back to the
     pre-filter, rank-ordered list rather than showing the operator nothing.
-    New runs are always inside their window, so the filter fires normally
-    and PR #221's intent is preserved untouched.
+    New runs always agree (create_run rejects a mismatched reference_date),
+    so the filter fires normally and PR #221's intent is preserved.
     """
     cfg = runner._load_coverage_config(db)
     return None if _depart_at_outside_window(run, cfg) else run.depart_at
@@ -1030,6 +1057,7 @@ def _build_export_context(
     lazy_trips: bool = False,
     legs_omitted: bool = False,
     include_external_itineraries: bool = False,
+    cfg: runner.CoverageConfig | None = None,
 ) -> dict[str, Any]:
     """Pure data-shaping from DB rows → template context dict.
 
@@ -1100,7 +1128,12 @@ def _build_export_context(
         "session_id": run.session_id,
         "mode": getattr(run, "mode", "single_session"),
         "direction": run.direction,
-        "depart_at": run.depart_at.isoformat() if run.depart_at else None,
+        # Localised + wrong-day flagged exactly as the live matrix does,
+        # so a downloaded report can't quietly disagree with the UI it
+        # was exported from.
+        "depart_at": (_depart_at_local_iso(run, cfg) if cfg else _safe_depart_at_iso(run)) or None,
+        "depart_at_outside_window": bool(cfg and _depart_at_outside_window(run, cfg)),
+        "reference_date": _safe_iso_date(getattr(run, "reference_date", None)),
         "status": run.status,
         "total_pairs": run.total_pairs,
         "completed_pairs": run.completed_pairs,
@@ -1230,6 +1263,7 @@ def export_run_html(
         raise HTTPException(404, _RUN_NOT_FOUND)
     search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
     include_legs = len(results) <= _EXPORT_LEG_DETAIL_MAX_PAIRS
+    cfg = runner._load_coverage_config(db)
     context = _build_export_context(
         run=run,
         results=results,
@@ -1240,6 +1274,7 @@ def export_run_html(
         legs_omitted=not include_legs,
         # ÖBB side-by-side rides the same small-run tier as leg detail.
         include_external_itineraries=include_legs,
+        cfg=cfg,
     )
     response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
     response.headers["Content-Disposition"] = f'attachment; filename="{_export_filename(run)}"'
@@ -1295,7 +1330,7 @@ def stop_run(
     # runner, NOT here, so the row's terminal-state guarantee holds
     # (status='running' until the worker confirms it has stopped).
     runner.request_cancel(run_id)
-    return _run_to_summary(run)
+    return _run_to_summary(run, cfg=runner._load_coverage_config(db))
 
 
 @router.get(
@@ -1317,7 +1352,7 @@ def get_run(
     summary = _run_to_summary(
         run,
         response_ms_stats=_stats_from_results(results),
-        depart_at_outside_window=_comparable_depart_at(db, run) is None,
+        cfg=runner._load_coverage_config(db),
     )
     return RunDetail(
         **summary.model_dump(),
@@ -1784,8 +1819,18 @@ def _run_to_summary(
     run: Any,
     *,
     response_ms_stats: tuple[int | None, float | None, int | None] | None = None,
-    depart_at_outside_window: bool = False,
+    cfg: runner.CoverageConfig | None = None,
 ) -> RunSummary:
+    """`cfg` is required to answer two questions about the run's timezone:
+    whether its `reference_date` agrees with `depart_at`, and what
+    wall-clock `depart_at` should display as. Every caller has a `db` and
+    so can supply it; the `None` default exists only for the test fixtures
+    that build a summary from a bare MagicMock row."""
+    depart_at_outside_window = False
+    depart_at_iso = _safe_depart_at_iso(run)
+    if cfg is not None:
+        depart_at_outside_window = _depart_at_outside_window(run, cfg)
+        depart_at_iso = _depart_at_local_iso(run, cfg)
     duration_seconds = _compute_duration_seconds(
         getattr(run, "started_at", None),
         getattr(run, "finished_at", None),
@@ -1800,7 +1845,8 @@ def _run_to_summary(
         id=str(run.id),
         session_id=run.session_id,
         session_label=run.session_label,
-        depart_at=run.depart_at.isoformat() if run.depart_at else "",
+        # Localised to the run's own timezone — see `_depart_at_local_iso`.
+        depart_at=depart_at_iso,
         started_at=run.started_at.isoformat() if run.started_at else "",
         finished_at=run.finished_at.isoformat() if run.finished_at else None,
         status=run.status,

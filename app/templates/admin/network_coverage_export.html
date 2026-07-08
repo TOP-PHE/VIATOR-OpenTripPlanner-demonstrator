@@ -43,6 +43,12 @@
     h1 { font-size: 1.4rem; margin: 0 0 0.35rem; }
     h2 { font-size: 1.05rem; margin: 1.6rem 0 0.8rem; color: var(--ink); }
     .meta { color: var(--muted); font-size: 0.85rem; }
+    /* Wrong-day run — same amber "verify me" palette the live matrix uses. */
+    .window-warning {
+      margin-top: 0.6rem; padding: 0.5rem 0.7rem;
+      background: #fff8e6; border: 1px solid #f0c674; border-radius: 4px;
+      font-size: 0.82rem; line-height: 1.45; color: #6b5416;
+    }
     .meta strong { color: var(--ink); font-weight: 600; }
     .totals { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 0.5rem; }
     .totals span { padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; }
@@ -256,6 +262,19 @@
     <strong>Depart:</strong> {{ run.depart_at or "—" }} ·
     <strong>Created:</strong> {{ run.created_at or "—" }}
   </div>
+  {# A run whose K-slot grid searched a different calendar day than its own
+     depart_at names. Mirrors buildRunWindowWarning() in network_coverage.html
+     so a downloaded report can never look healthier than the live matrix it
+     was exported from. #}
+  {% if run.depart_at_outside_window %}
+  <div class="window-warning">
+    ⚠ This run searched <strong>{{ run.reference_date or "a different day" }}</strong>, not its
+    stated departure date <strong>{{ (run.depart_at or "")[:10] or "(unknown)" }}</strong>. The
+    counts and itineraries below are real, but they describe
+    {{ run.reference_date or "another day" }}. Any ÖBB alignment score in this report compared the
+    two engines across different days and is not meaningful.
+  </div>
+  {% endif %}
   <div class="totals">
     <span class="t-ok">{{ run.ok_pairs }} ok</span>
     <span class="t-no-route">{{ run.no_route_pairs }} no-route</span>

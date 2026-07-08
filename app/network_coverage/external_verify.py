@@ -57,6 +57,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from pydantic import BaseModel, Field
@@ -94,6 +95,11 @@ _OEBB_CLIENT = {
     "name": "oebb",
 }
 _OEBB_VER = "1.42"
+
+# HAFAS reads TripSearch's `outDate` / `outTime` in the operator's own
+# zone — no offset ever reaches the wire. Mirrors
+# `hafas_client._REFERENCE_TZ` for the journey-search path.
+_OEBB_TIMEZONE = "Europe/Vienna"
 
 # Identify ourselves rather than masquerading — ÖBB tolerates known
 # clients, and "VIATOR-coverage-verify" is honest about why we're here.
@@ -309,6 +315,34 @@ def _extract_lids_from_locgeopos(payload: dict[str, Any], count: int) -> list[st
     return out
 
 
+def _to_oebb_local(depart_at: datetime) -> datetime:
+    """Render `depart_at` as an ÖBB-local (Europe/Vienna) wall-clock.
+
+    `outDate` / `outTime` go on the wire as bare `strftime` strings with
+    no offset, and HAFAS reads them in the operator's own zone. So
+    whatever wall-clock this returns IS the departure HAFAS searches for,
+    regardless of the datetime's tzinfo.
+
+    A tz-aware input is CONVERTED (its instant is what the caller meant);
+    a naive input is assumed to already be Vienna-local and passed
+    through. Before this existed, callers handed in whatever they had:
+    the coverage runner passes `run.depart_at` straight from a
+    `timestamptz` column, which psycopg returns in UTC — so a
+    `Europe/Brussels` run's 06:40 (= 04:40Z) was sent as `outTime=044000`
+    and ÖBB was asked about 04:40 Vienna, two hours before the operator's
+    departure. `hafas_client._localise_when` does the same conversion for
+    the journey-search path; converting again here is idempotent.
+    """
+    try:
+        tz: Any = ZoneInfo(_OEBB_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):  # pragma: no cover
+        log.warning("could not load %s — sending depart_at as-is", _OEBB_TIMEZONE)
+        return depart_at
+    if depart_at.tzinfo is None:
+        return depart_at
+    return depart_at.astimezone(tz)
+
+
 def _build_trip_search_body(
     *,
     from_lid: str,
@@ -319,7 +353,9 @@ def _build_trip_search_body(
 
     Uses `type:"S"` (station) with the pre-resolved lids from
     LocGeoPos. Date and time are local-tz strings (HAFAS interprets in
-    the operator's TZ, which is Europe/Vienna for ÖBB)."""
+    the operator's TZ, which is Europe/Vienna for ÖBB) — so a tz-aware
+    `depart_at` is converted to Vienna first, see `_to_oebb_local`."""
+    depart_local = _to_oebb_local(depart_at)
     return {
         "auth": {"type": "AID", "aid": _OEBB_AID},
         "client": _OEBB_CLIENT,
@@ -332,8 +368,8 @@ def _build_trip_search_body(
                 "req": {
                     "depLocL": [{"type": "S", "lid": from_lid}],
                     "arrLocL": [{"type": "S", "lid": to_lid}],
-                    "outDate": depart_at.strftime("%Y%m%d"),
-                    "outTime": depart_at.strftime("%H%M%S"),
+                    "outDate": depart_local.strftime("%Y%m%d"),
+                    "outTime": depart_local.strftime("%H%M%S"),
                     "numF": 5,
                     "getPolyline": False,
                     "getPasslist": False,

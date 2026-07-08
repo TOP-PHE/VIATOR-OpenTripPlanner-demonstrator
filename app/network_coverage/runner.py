@@ -337,14 +337,42 @@ class ResolvedWindow:
     tz_name: str
 
 
+def _anchor_reference_date(
+    depart_at_local: datetime, start_minutes: int, end_minutes: int, end_is_sentinel: bool
+) -> date:
+    """The calendar day whose day-window contains `depart_at_local`.
+
+    For an ordinary window (00:00-24:00, 06:00-22:00, ...) that is simply
+    the local date. For a **cross-midnight** window — which
+    `_resolve_run_window` explicitly supports, e.g. an 18:00-06:00
+    night-train slice — a 02:00 departure belongs to the window that
+    *opened the previous evening*, so the anchor day is one day earlier.
+    Getting this wrong would compose a grid starting 16 hours after the
+    train the operator asked about.
+
+    A `depart_at_local` that falls in neither window (e.g. 10:00 with an
+    18:00-06:00 window — the operator's departure sits outside their own
+    window) degrades to the local date. The run still searches a coherent
+    grid; it just doesn't contain `depart_at`, which is the operator's
+    own configuration choice, not a bug we can resolve for them.
+    """
+    if not end_is_sentinel and end_minutes <= start_minutes:  # cross-midnight
+        local_minutes = depart_at_local.hour * 60 + depart_at_local.minute
+        if local_minutes < end_minutes:
+            return depart_at_local.date() - timedelta(days=1)
+    return depart_at_local.date()
+
+
 def _anchor_depart_at_and_reference_date(
     depart_at: datetime,
     reference_date_value: date | None,
+    window_start_local: dtime | str | None,
+    window_end_local: dtime | str | None,
     window_timezone: str | None,
     cfg: CoverageConfig,
 ) -> tuple[datetime, date]:
     """Resolve `depart_at` to an instant and `reference_date` to the day
-    that instant falls on — both read in the run's own timezone.
+    whose window contains it — both read in the run's own timezone.
 
     Two invariants this establishes, neither of which held before:
 
@@ -356,9 +384,12 @@ def _anchor_depart_at_and_reference_date(
        `depart_at`, the K-slot window, and `reference_date` now all read
        against `_resolve_timezone(window_timezone, cfg)`. A caller that
        supplies a tz-aware `depart_at` is respected as-is (it already
-       names an instant).
+       names an instant). Every *consumer* of the stored instant must
+       therefore localise before rendering a wall-clock — see
+       `external_verify._build_trip_search_body` (ÖBB reads outDate /
+       outTime as Vienna-local) and `_run_to_summary`'s `depart_at`.
 
-    2. **`reference_date` defaults to `depart_at`'s day, not tomorrow.**
+    2. **`reference_date` is the day whose window contains `depart_at`.**
        The K-slot search grid is composed *exclusively* from
        `reference_date` + `window_*_local` (see `_resolve_run_window`);
        `depart_at` is never passed to the planner. Meanwhile every
@@ -376,6 +407,15 @@ def _anchor_depart_at_and_reference_date(
        VIATOR side filtered down to nothing. The wrong day was invisible
        because the cell modal renders leg times as HH:MM with no date.
 
+    An **explicitly supplied** `reference_date` that disagrees with
+    `depart_at`'s anchor day is rejected (ValueError -> HTTP 400) rather
+    than persisted. Honouring it would recreate exactly the defect above
+    on a brand-new run: the grid searches one day, every depart_at-anchored
+    comparison judges another, and the alignment sweep writes
+    `one_sided_oebb` tiers for the whole matrix. Operators who want a
+    different schedule day move `depart_at`, which is the field that
+    actually names it.
+
     `app/models/network_coverage.py`'s `reference_date` docstring has
     always *claimed* create_run keeps the two consistent. This is the
     first version that actually does.
@@ -383,37 +423,58 @@ def _anchor_depart_at_and_reference_date(
     tz = _resolve_timezone(window_timezone, cfg)
     if depart_at.tzinfo is None:
         depart_at = depart_at.replace(tzinfo=tz)
+    start_minutes, end_minutes, end_is_sentinel = _window_bounds_minutes(
+        window_start_local, window_end_local, cfg
+    )
+    anchor = _anchor_reference_date(
+        depart_at.astimezone(tz), start_minutes, end_minutes, end_is_sentinel
+    )
     if reference_date_value is None:
-        reference_date_value = depart_at.astimezone(tz).date()
+        return depart_at, anchor
+    if reference_date_value != anchor:
+        raise ValueError(
+            f"reference_date {reference_date_value.isoformat()} does not match the day-window "
+            f"containing depart_at ({anchor.isoformat()}). The K-slot grid is searched on "
+            f"reference_date while every comparison anchors on depart_at, so the two must agree. "
+            f"Move the Departure to the day you want to search, or clear the Reference date."
+        )
     return depart_at, reference_date_value
 
 
-def resolve_window_for_run(run: NetworkCoverageRun, cfg: CoverageConfig) -> ResolvedWindow:
-    """`_resolve_run_window` for an already-persisted run row.
+def expected_reference_date(run: NetworkCoverageRun, cfg: CoverageConfig) -> date:
+    """The `reference_date` `create_run` would derive for this row today.
 
-    Public because the admin API needs to ask "did this run actually
-    search the day its `depart_at` names?" — see
-    `network_coverage._comparable_depart_at`.
+    Read-path twin of `_anchor_depart_at_and_reference_date`. Uses the
+    run's OWN persisted window columns; only a NULL column falls back to
+    `cfg`, and only the timezone fallback can move the answer (a
+    day-level comparison is far less config-sensitive than window
+    containment). The true fix for that residue is freezing the resolved
+    window onto the run row — tracked separately.
     """
-    return _resolve_run_window(
-        window_start_local=run.window_start_local,
-        window_end_local=run.window_end_local,
-        window_timezone=run.window_timezone,
-        reference_date_value=run.reference_date,
-        cfg=cfg,
+    tz = _resolve_timezone(run.window_timezone, cfg)
+    start_minutes, end_minutes, end_is_sentinel = _window_bounds_minutes(
+        run.window_start_local, run.window_end_local, cfg
+    )
+    return _anchor_reference_date(
+        run.depart_at.astimezone(tz), start_minutes, end_minutes, end_is_sentinel
     )
 
 
-def depart_at_within_window(run: NetworkCoverageRun, cfg: CoverageConfig) -> bool:
-    """True when `run.depart_at` lies inside the window the run searched.
+def reference_date_matches_depart_at(run: NetworkCoverageRun, cfg: CoverageConfig) -> bool:
+    """True when the run searched the day its own `depart_at` names.
 
     False for every run created before `_anchor_depart_at_and_reference_date`
     landed (their `reference_date` is "tomorrow at create time", unrelated
     to `depart_at`). Callers use this to decide whether `depart_at` is a
     meaningful anchor to filter that run's trips against.
+
+    Deliberately a **calendar-day** comparison, not window containment: an
+    operator who narrows the window to 06:00-22:00 and asks to depart at
+    05:30 has made a correctly-anchored run whose depart_at simply
+    precedes the first slot. Treating that as "wrong day" would badge a
+    valid run and silently drop PR #221's trip filter.
     """
-    window = resolve_window_for_run(run, cfg)
-    return window.start_utc <= run.depart_at < window.end_utc
+    return run.reference_date == expected_reference_date(run, cfg)
 
 
 def _resolve_timezone(tz_name: str | None, cfg: CoverageConfig) -> ZoneInfo:
@@ -461,6 +522,41 @@ def _parse_hhmm(value: str | None, default: str) -> tuple[int, bool]:
         return _parse_hhmm(default, "00:00")
 
 
+def _window_bounds_minutes(
+    window_start_local: dtime | str | None,
+    window_end_local: dtime | str | None,
+    cfg: CoverageConfig,
+) -> tuple[int, int, bool]:
+    """`(start_minutes, end_minutes, end_is_sentinel)` for a run's bounds.
+
+    Accepts either `datetime.time` (the ORM column type) or "HH:MM" string
+    so the runner (ORM rows), `create_run` (validated form input) and the
+    unit tests can share one parser. NULL bound -> the cfg default.
+
+    Shared by `_resolve_run_window` (which composes the K-slot grid) and
+    `_anchor_reference_date` (which picks the day that grid anchors on),
+    so the two can never disagree about where a cross-midnight window
+    starts.
+    """
+
+    def _to_string_bound(b: dtime | str | None, default: str) -> str:
+        if b is None:
+            return default
+        if isinstance(b, dtime):
+            return f"{b.hour:02d}:{b.minute:02d}"
+        return b
+
+    start_minutes, _ = _parse_hhmm(
+        _to_string_bound(window_start_local, cfg.default_window_start),
+        cfg.default_window_start,
+    )
+    end_minutes, end_is_sentinel = _parse_hhmm(
+        _to_string_bound(window_end_local, cfg.default_window_end),
+        cfg.default_window_end,
+    )
+    return start_minutes, end_minutes, end_is_sentinel
+
+
 def _resolve_run_window(
     *,
     window_start_local: dtime | str | None,
@@ -481,35 +577,23 @@ def _resolve_run_window(
       - bound start >= bound end → treated as a cross-midnight window
         (e.g. 18:00-06:00 = 12-hour night-train slice), end_utc is
         rolled forward by one day
-      - reference_date NULL → today's date in the resolved timezone
-        (matches `create_run`'s "tomorrow" default at run-create time;
-        execute time only sees this branch if the row was inserted
-        without a date for some reason)
+      - reference_date NULL → today's date in the resolved timezone.
+        `create_run` always persists a concrete `reference_date` (the day
+        whose window contains `depart_at` — see
+        `_anchor_depart_at_and_reference_date`), so execute time only
+        sees this branch if the row was inserted without a date for some
+        reason.
     """
     tz = _resolve_timezone(window_timezone, cfg)
-
-    def _to_string_bound(b: dtime | str | None, default: str) -> str:
-        if b is None:
-            return default
-        if isinstance(b, dtime):
-            return f"{b.hour:02d}:{b.minute:02d}"
-        return b
-
-    start_minutes, _ = _parse_hhmm(
-        _to_string_bound(window_start_local, cfg.default_window_start),
-        cfg.default_window_start,
-    )
-    end_minutes, end_is_sentinel = _parse_hhmm(
-        _to_string_bound(window_end_local, cfg.default_window_end),
-        cfg.default_window_end,
+    start_minutes, end_minutes, end_is_sentinel = _window_bounds_minutes(
+        window_start_local, window_end_local, cfg
     )
 
     if reference_date_value is None:
-        # Use today in the resolved tz — same fallback `create_run` uses
-        # for the "tomorrow" persistence default, but here we don't bump
-        # by 1 day because execute_run shouldn't silently shift the
-        # window from what create_run captured. If a future code path
-        # bypasses create_run and lands here we still produce a usable
+        # Today in the resolved tz. `create_run` always persists a concrete
+        # reference_date (the day whose window contains depart_at), so
+        # execute_run never takes this branch; it exists only so a future
+        # code path that bypasses create_run still produces a usable
         # window.
         reference_date_value = datetime.now(tz).date()
 
@@ -944,7 +1028,12 @@ def create_run(
     # see `_anchor_depart_at_and_reference_date` for why that used to be
     # "tomorrow" and what it broke.
     depart_at, reference_date_value = _anchor_depart_at_and_reference_date(
-        depart_at, reference_date_value, window_timezone, _load_coverage_config(db)
+        depart_at,
+        reference_date_value,
+        window_start_local,
+        window_end_local,
+        window_timezone,
+        _load_coverage_config(db),
     )
 
     run = NetworkCoverageRun(

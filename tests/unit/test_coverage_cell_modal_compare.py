@@ -396,8 +396,20 @@ def test_run_window_warning_css_present(template_text: str):
     assert ".cov-window-warning" in template_text
 
 
-def test_reference_date_hint_no_longer_promises_tomorrow(template_text: str):
+def test_no_operator_facing_copy_still_promises_tomorrow(template_text: str):
     """The form hint said "(default: tomorrow)" — which was true, and was
-    the bug. It now defaults to the Departure date."""
-    assert "(default: tomorrow)" not in template_text
+    the bug. A first pass fixed that string but left a SECOND copy of the
+    same promise two lines below ("Defaults: 00:00-24:00 UTC tomorrow"),
+    and the guard only pinned the string that had been replaced.
+
+    So assert on the *concept*: no operator-facing sentence in the Advanced
+    panel may say the reference date defaults to tomorrow. The word only
+    survives inside JS comments explaining the historical bug, which the
+    operator never reads — strip comment lines before checking.
+    """
+    visible = " ".join(ln for ln in template_text.splitlines() if not ln.strip().startswith("//"))
+    assert "tomorrow" not in visible.lower(), (
+        "operator-facing copy still promises a 'tomorrow' default for "
+        "reference_date; create_run now anchors it on depart_at"
+    )
     assert "(default: the Departure date)" in template_text

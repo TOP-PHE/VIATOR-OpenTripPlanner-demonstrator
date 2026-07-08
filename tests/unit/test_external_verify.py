@@ -728,3 +728,62 @@ async def test_verify_via_oebb_hafas_latin1_body_does_not_crash() -> None:
     assert result.ok is True
     assert result.num_connections == 1
     assert result.best_duration_seconds == 4 * 3600 + 15 * 60
+
+
+# ─────────── depart_at is Vienna wall-clock on the wire ───────────
+# `outDate`/`outTime` go on the wire as bare strftime strings with no
+# offset, and HAFAS reads them in the operator's own zone. Any tz-aware
+# `depart_at` must therefore be CONVERTED to Europe/Vienna before
+# formatting. The coverage runner hands in `run.depart_at` straight from a
+# timestamptz column (psycopg returns UTC), so without this a
+# Europe/Brussels run's 06:40 (= 04:40Z) asked OeBB about 04:40 Vienna.
+
+
+def test_build_trip_search_body_converts_aware_depart_at_to_vienna() -> None:
+    from datetime import UTC
+
+    # 04:40Z on 2026-07-20 == 06:40 Vienna (CEST, UTC+2)
+    body = external_verify._build_trip_search_body(
+        from_lid="A=1@L=X@",
+        to_lid="A=1@L=Y@",
+        depart_at=datetime(2026, 7, 20, 4, 40, 0, tzinfo=UTC),
+    )
+    req = body["svcReqL"][0]["req"]
+    assert req["outTime"] == "064000"
+    assert req["outDate"] == "20260720"
+
+
+def test_build_trip_search_body_conversion_can_roll_the_date() -> None:
+    from datetime import UTC
+
+    # 23:30Z on 2026-07-20 == 01:30 Vienna on the 21st.
+    body = external_verify._build_trip_search_body(
+        from_lid="A=1@L=X@",
+        to_lid="A=1@L=Y@",
+        depart_at=datetime(2026, 7, 20, 23, 30, 0, tzinfo=UTC),
+    )
+    req = body["svcReqL"][0]["req"]
+    assert req["outDate"] == "20260721"
+    assert req["outTime"] == "013000"
+
+
+def test_build_trip_search_body_passes_naive_depart_at_through() -> None:
+    """A naive depart_at is already the Vienna wall-clock the caller meant;
+    converting it would be a guess. Preserves the pre-existing contract."""
+    body = external_verify._build_trip_search_body(
+        from_lid="A=1@L=X@",
+        to_lid="A=1@L=Y@",
+        depart_at=datetime(2026, 7, 20, 6, 40, 0),
+    )
+    assert body["svcReqL"][0]["req"]["outTime"] == "064000"
+
+
+def test_to_oebb_local_is_idempotent_for_an_already_vienna_datetime() -> None:
+    """`hafas_client._localise_when` already converts before calling into
+    the two-step, so the journey path double-converts. Must be a no-op."""
+    from zoneinfo import ZoneInfo
+
+    vienna = datetime(2026, 7, 20, 6, 40, tzinfo=ZoneInfo("Europe/Vienna"))
+    once = external_verify._to_oebb_local(vienna)
+    twice = external_verify._to_oebb_local(once)
+    assert once == twice == vienna
