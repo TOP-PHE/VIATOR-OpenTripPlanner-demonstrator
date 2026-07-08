@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -473,25 +474,22 @@ def _truncate_hafas_to_viator_window(
     """
     if not hafas_reference or not viator_trips:
         return
-    latest_viator_ts = None
-    for t in viator_trips:
-        ts = _boarding_ts(t.get("best") or {})
-        if ts is not None and (latest_viator_ts is None or ts > latest_viator_ts):
-            latest_viator_ts = ts
+    latest_viator_ts = _latest_boarding_ts(t.get("best") or {} for t in viator_trips)
     if latest_viator_ts is None:
         return
     trips = hafas_reference.get("trips") or []
-    kept = []
-    dropped = 0
-    for t in trips:
-        ts = _boarding_ts(t)
-        if ts is None or ts <= latest_viator_ts:
-            kept.append(t)
-        else:
-            dropped += 1
-    if dropped:
+    # An unparseable ÖBB boarding time is KEPT: silently hiding a
+    # malformed-but-real result is a worse failure mode than one extra card.
+    kept = [t for t in trips if (ts := _boarding_ts(t)) is None or ts <= latest_viator_ts]
+    if len(kept) != len(trips):
         hafas_reference["trips"] = kept
         hafas_reference["trimmed_to_viator_window"] = True
+
+
+def _latest_boarding_ts(trips: Iterable[dict[str, Any]]) -> float | None:
+    """Max `_boarding_ts` across `trips`, or None if none are parseable."""
+    stamps = [ts for t in trips if (ts := _boarding_ts(t)) is not None]
+    return max(stamps) if stamps else None
 
 
 # ────────────────────── P2 MOTIS — engine filter helpers ──────────────────────

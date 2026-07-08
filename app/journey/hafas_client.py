@@ -219,9 +219,6 @@ async def fetch_plan_paginated(
     page_error: str | None = None
     stopped_reason: str | None = None
     started = time.monotonic()
-    # Below this, a page has too little budget left to be worth issuing
-    # (HAFAS's two-step needs a LocGeoPos round-trip before TripSearch).
-    _MIN_PAGE_BUDGET_MS = 500
     # dict[str, Any]: heterogeneous kwargs (floats, int, str|None) that
     # mypy can't unpack into fetch_plan's typed params without this.
     fetch_kwargs: dict[str, Any] = {
@@ -234,36 +231,20 @@ async def fetch_plan_paginated(
     }
 
     for _ in range(max_pages):
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        remaining_ms = total_timeout_ms - elapsed_ms
-        if pages and remaining_ms < _MIN_PAGE_BUDGET_MS:
-            # Page 1 always runs (callers expect at least one attempt);
-            # every later page must fit inside the remaining budget.
+        page_timeout_ms = _page_timeout_or_none(
+            pages=pages, started=started, total_timeout_ms=total_timeout_ms, timeout_ms=timeout_ms
+        )
+        if page_timeout_ms is None:
             stopped_reason = "budget"
             break
 
         pages += 1
-        # Clamp each page to what's left of the overall budget (never
-        # below the floor, so page 1 still gets a usable timeout even
-        # with a pathologically small total_timeout_ms).
-        page_timeout_ms = max(_MIN_PAGE_BUDGET_MS, min(timeout_ms, remaining_ms))
         raw, batch = await fetch_plan(when=anchor, timeout_ms=page_timeout_ms, **fetch_kwargs)
         total_ms += int(raw.get("response_ms") or 0)
         if first_raw is None:
             first_raw = raw
         if not batch:
-            # Distinguish "HAFAS cleanly ran out of connections" from
-            # "a later page blew up" — the latter means our coverage is
-            # silently short of the target window, and the operator
-            # comparing column depths deserves to know.
-            if raw.get("status") == "error" and all_trips:
-                page_error = str(raw.get("error") or "HAFAS pagination failed mid-flight")
-                log.warning(
-                    "HAFAS pagination stopped at page %d (kept %d trips so far): %s",
-                    pages,
-                    len(all_trips),
-                    page_error,
-                )
+            page_error = _page_error_or_none(raw, all_trips, pages)
             break
 
         new_trips, latest_dep_ts = _dedup_batch_and_track_latest_dep(batch, seen_fps)
@@ -275,9 +256,78 @@ async def fetch_plan_paginated(
             break
         anchor = next_anchor
 
+    return (
+        _paginated_raw(
+            first_raw=first_raw,
+            total_ms=total_ms,
+            pages=pages,
+            page_error=page_error,
+            stopped_reason=stopped_reason,
+            has_trips=bool(all_trips),
+        ),
+        all_trips,
+    )
+
+
+# Below this, a page has too little budget left to be worth issuing
+# (HAFAS's two-step needs a LocGeoPos round-trip before TripSearch).
+_MIN_PAGE_BUDGET_MS = 500
+
+
+def _page_timeout_or_none(
+    *, pages: int, started: float, total_timeout_ms: int, timeout_ms: int
+) -> int | None:
+    """This page's timeout in ms, or None when the overall budget is spent.
+
+    Page 1 always runs — callers expect at least one attempt, so it gets
+    a usable timeout even with a pathologically small `total_timeout_ms`.
+    Every later page must fit inside what's left, which is what makes
+    `total_timeout_ms` a real ceiling rather than a per-page hint.
+    """
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    remaining_ms = total_timeout_ms - elapsed_ms
+    if pages and remaining_ms < _MIN_PAGE_BUDGET_MS:
+        return None
+    return max(_MIN_PAGE_BUDGET_MS, min(timeout_ms, remaining_ms))
+
+
+def _page_error_or_none(
+    raw: dict[str, Any], all_trips: list[dict[str, Any]], pages: int
+) -> str | None:
+    """Distinguish "HAFAS cleanly ran out of connections" from "a later
+    page blew up".
+
+    The latter means our coverage is silently short of the target window,
+    and the operator comparing column depths deserves to know. A page-1
+    failure needs no special handling — `first_raw` already carries its
+    error status through to the caller.
+    """
+    if raw.get("status") != "error" or not all_trips:
+        return None
+    page_error = str(raw.get("error") or "HAFAS pagination failed mid-flight")
+    log.warning(
+        "HAFAS pagination stopped at page %d (kept %d trips so far): %s",
+        pages,
+        len(all_trips),
+        page_error,
+    )
+    return page_error
+
+
+def _paginated_raw(
+    *,
+    first_raw: dict[str, Any] | None,
+    total_ms: int,
+    pages: int,
+    page_error: str | None,
+    stopped_reason: str | None,
+    has_trips: bool,
+) -> dict[str, Any]:
+    """Assemble the paginated call's `raw` diagnostic dict from page 1's
+    raw plus the whole run's bookkeeping."""
     raw_out = dict(first_raw or {})
     raw_out["response_ms"] = total_ms
-    raw_out["status"] = "ok" if all_trips else raw_out.get("status", "no_route")
+    raw_out["status"] = "ok" if has_trips else raw_out.get("status", "no_route")
     if pages > 1:
         raw_out["pages"] = pages
     if page_error:
@@ -285,7 +335,7 @@ async def fetch_plan_paginated(
         raw_out["error"] = page_error
     if stopped_reason:
         raw_out["pagination_stopped"] = stopped_reason
-    return raw_out, all_trips
+    return raw_out
 
 
 # ─────────────────────── request-side helpers ───────────────────────
