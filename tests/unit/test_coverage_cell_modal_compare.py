@@ -441,9 +441,9 @@ def test_both_leg_renderers_hide_via_the_canonical_predicate(template_text: str)
         start = template_text.find(f"function {fn}(")
         assert start != -1, f"{fn} missing"
         body = template_text[start : template_text.find("\n}\n", start)]
-        assert (
-            "isModalTransitLeg(leg)" in body
-        ), f"{fn} must derive its walk-leg class from isModalTransitLeg, not `mode === 'WALK'`"
+        assert "isModalTransitLeg(leg)" in body, (
+            f"{fn} must derive its walk-leg class from isModalTransitLeg, not `mode === 'WALK'`"
+        )
 
 
 def test_transit_bounds_helper_and_overnight_guard(template_text: str):
