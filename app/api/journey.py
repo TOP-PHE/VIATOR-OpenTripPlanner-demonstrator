@@ -301,17 +301,25 @@ async def _query_hafas_reference(
         # this configured default rather than VIATOR's actual result
         # span — see the post-fanout truncation in `fanout()` for the
         # step that clips HAFAS down to VIATOR's ACTUAL last departure.
+        hafas_timeout_ms = int(cfg.get("HAFAS_TIMEOUT_MS", 10_000))
         raw, trips = await hafas_client.fetch_plan_paginated(
             from_lat=body.from_.lat,
             from_lon=body.from_.lon,
             to_lat=body.to.lat,
             to_lon=body.to.lon,
             when=when,
-            timeout_ms=int(cfg.get("HAFAS_TIMEOUT_MS", 10_000)),
+            timeout_ms=hafas_timeout_ms,
             from_name=body.from_.label,
             to_name=body.to.label,
             target_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
             max_pages=4,
+            # `hafas_task` is awaited bare inside the journey concurrency
+            # semaphore, so an unbounded paginated call (4 pages x the
+            # per-page timeout = 40 s) would stall /fanout far past the
+            # single-page latency this endpoint was sized for. Cap the
+            # whole paginated call at 2x one page's budget; pagination
+            # returns whatever it collected when the budget runs out.
+            total_timeout_ms=hafas_timeout_ms * 2,
         )
         # `raw.status` is the engine-level verdict ("ok" / "no_route" /
         # "error"). Lift it into the response so the journey UI's
@@ -325,6 +333,11 @@ async def _query_hafas_reference(
         }
         if raw.get("error"):
             result["error"] = str(raw["error"])
+        # A page-2+ failure keeps the trips collected so far but means
+        # ÖBB's coverage is short of the target window — say so instead
+        # of letting the panel imply a complete result set.
+        if raw.get("partial"):
+            result["partial"] = True
         # Surface page count so the UI / operator can see whether
         # pagination actually fired — same convention as OJP's `pages`.
         if raw.get("pages"):
@@ -417,11 +430,28 @@ def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
     return "SUBSET"
 
 
+def _boarding_ts(trip: dict[str, Any]) -> float | None:
+    """The trip's BOARDING instant as an epoch float, or None.
+
+    Prefers `first_transit_leg_departure_utc` — the repo's canonical
+    "when did this itinerary actually board" field, computed on a
+    consistent UTC basis by every engine client (see
+    `trip_normalize.first_transit_leg_departure_utc`). Falls back to the
+    itinerary-level `departure_at` only when no transit leg exists (a
+    walk-only itinerary), since `departure_at` is the START of the whole
+    trip — usually a walk leg — and comparing one engine's walk start
+    against another's would shift the boundary by the access-walk length.
+    """
+    return trip_normalize.max_dep_ts(
+        None, trip.get("first_transit_leg_departure_utc") or trip.get("departure_at")
+    )
+
+
 def _truncate_hafas_to_viator_window(
     hafas_reference: dict[str, Any] | None, viator_trips: list[dict[str, Any]]
 ) -> None:
     """Mutate `hafas_reference['trips']` in place, dropping any ÖBB trip
-    departing after VIATOR's own latest departure.
+    boarding after VIATOR's own latest boarding.
 
     v0.1.45 — `hafas_client.fetch_plan_paginated` targets a FIXED window
     (`OTP_SEARCH_WINDOW_SECONDS`) chosen before VIATOR's own fanout even
@@ -434,22 +464,28 @@ def _truncate_hafas_to_viator_window(
     "ÖBB looks artificially worse" complaint this pagination fixes, and
     just as misleading. Clips to what VIATOR's fanout actually
     returned, not what it was merely configured to search for.
+
+    Compares BOARDING times (`_boarding_ts`) on both sides, not the
+    walk-inclusive `departure_at`: the two engines produce different
+    access walks for the same physical train, so a `departure_at`
+    boundary would clip ÖBB trips VIATOR did in fact cover (or keep
+    ones it didn't) by however many minutes the walks differ.
     """
     if not hafas_reference or not viator_trips:
         return
-    latest_viator_dep_ts = None
+    latest_viator_ts = None
     for t in viator_trips:
-        latest_viator_dep_ts = trip_normalize.max_dep_ts(
-            latest_viator_dep_ts, t.get("best", {}).get("departure_at")
-        )
-    if latest_viator_dep_ts is None:
+        ts = _boarding_ts(t.get("best") or {})
+        if ts is not None and (latest_viator_ts is None or ts > latest_viator_ts):
+            latest_viator_ts = ts
+    if latest_viator_ts is None:
         return
     trips = hafas_reference.get("trips") or []
     kept = []
     dropped = 0
     for t in trips:
-        dep_ts = trip_normalize.max_dep_ts(None, t.get("departure_at"))
-        if dep_ts is None or dep_ts <= latest_viator_dep_ts:
+        ts = _boarding_ts(t)
+        if ts is None or ts <= latest_viator_ts:
             kept.append(t)
         else:
             dropped += 1

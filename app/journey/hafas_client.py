@@ -165,12 +165,14 @@ async def fetch_plan_paginated(
     to_name: str | None = None,
     target_window_seconds: int = 21600,
     max_pages: int = 4,
+    total_timeout_ms: int = 20_000,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Call `fetch_plan` repeatedly with successively later anchor times
     until HAFAS's coverage matches `target_window_seconds`, HAFAS runs
-    out of connections, or `max_pages` is reached. Same `(raw, trips)`
-    contract as `fetch_plan` — `raw['response_ms']` is summed across
-    pages and `raw['pages']` is set when more than one page fired.
+    out of connections, `total_timeout_ms` is spent, or `max_pages` is
+    reached. Same `(raw, trips)` contract as `fetch_plan` —
+    `raw['response_ms']` is summed across pages and `raw['pages']` is
+    set when more than one page fired.
 
     **Why this exists** (v0.1.45). HAFAS's TripSearch is hardcoded to
     `numF=5` (see `external_verify._build_trip_search_body`) — the next
@@ -187,13 +189,23 @@ async def fetch_plan_paginated(
     `raw['status']`), unlike `ojp_client.fetch_reference` which can
     raise `httpx.HTTPError` mid-flight.
 
+    `total_timeout_ms` bounds the WHOLE paginated call, not each page.
+    Without it a slow-but-not-erroring HAFAS could burn `max_pages` x
+    `timeout_ms` (4 x 10 s = 40 s) while the journey concurrency
+    semaphore is held — `/fanout` would stall far past the single-page
+    latency callers were sized for. Each page's own timeout is clamped
+    to the remaining budget so the total is a real ceiling.
+
     Stop conditions, evaluated each page:
     - **empty batch** (`no_route` or `error` status) → HAFAS exhausted
       or failed at this anchor; return whatever was collected so far.
+      A page-2+ `error` is surfaced as `raw['partial']` + `raw['error']`
+      rather than silently masquerading as a clean end-of-results.
     - **all trips were duplicates of earlier pages** → no forward
       progress, bail (boundary collision only).
     - **latest `departure_at` >= `when + target_window_seconds`** →
       coverage caught up to the target.
+    - **budget spent** → `raw['pagination_stopped'] = 'budget'`.
     - **`max_pages` reached** → hard cap (default 4 pages x 5 results
       = 20 trips max, same ceiling as OJP's pagination).
     """
@@ -204,24 +216,55 @@ async def fetch_plan_paginated(
     total_ms = 0
     pages = 0
     first_raw: dict[str, Any] | None = None
-    fetch_kwargs = {
+    page_error: str | None = None
+    stopped_reason: str | None = None
+    started = time.monotonic()
+    # Below this, a page has too little budget left to be worth issuing
+    # (HAFAS's two-step needs a LocGeoPos round-trip before TripSearch).
+    _MIN_PAGE_BUDGET_MS = 500
+    # dict[str, Any]: heterogeneous kwargs (floats, int, str|None) that
+    # mypy can't unpack into fetch_plan's typed params without this.
+    fetch_kwargs: dict[str, Any] = {
         "from_lat": from_lat,
         "from_lon": from_lon,
         "to_lat": to_lat,
         "to_lon": to_lon,
-        "timeout_ms": timeout_ms,
         "from_name": from_name,
         "to_name": to_name,
     }
 
     for _ in range(max_pages):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        remaining_ms = total_timeout_ms - elapsed_ms
+        if pages and remaining_ms < _MIN_PAGE_BUDGET_MS:
+            # Page 1 always runs (callers expect at least one attempt);
+            # every later page must fit inside the remaining budget.
+            stopped_reason = "budget"
+            break
+
         pages += 1
-        raw, batch = await fetch_plan(when=anchor, **fetch_kwargs)
+        # Clamp each page to what's left of the overall budget (never
+        # below the floor, so page 1 still gets a usable timeout even
+        # with a pathologically small total_timeout_ms).
+        page_timeout_ms = max(_MIN_PAGE_BUDGET_MS, min(timeout_ms, remaining_ms))
+        raw, batch = await fetch_plan(when=anchor, timeout_ms=page_timeout_ms, **fetch_kwargs)
         total_ms += int(raw.get("response_ms") or 0)
         if first_raw is None:
             first_raw = raw
         if not batch:
-            break  # HAFAS exhausted / errored at this anchor
+            # Distinguish "HAFAS cleanly ran out of connections" from
+            # "a later page blew up" — the latter means our coverage is
+            # silently short of the target window, and the operator
+            # comparing column depths deserves to know.
+            if raw.get("status") == "error" and all_trips:
+                page_error = str(raw.get("error") or "HAFAS pagination failed mid-flight")
+                log.warning(
+                    "HAFAS pagination stopped at page %d (kept %d trips so far): %s",
+                    pages,
+                    len(all_trips),
+                    page_error,
+                )
+            break
 
         new_trips, latest_dep_ts = _dedup_batch_and_track_latest_dep(batch, seen_fps)
         if not new_trips:
@@ -237,6 +280,11 @@ async def fetch_plan_paginated(
     raw_out["status"] = "ok" if all_trips else raw_out.get("status", "no_route")
     if pages > 1:
         raw_out["pages"] = pages
+    if page_error:
+        raw_out["partial"] = True
+        raw_out["error"] = page_error
+    if stopped_reason:
+        raw_out["pagination_stopped"] = stopped_reason
     return raw_out, all_trips
 
 
@@ -244,24 +292,38 @@ async def fetch_plan_paginated(
 
 
 def _localise_when(when: datetime) -> datetime:
-    """Render `when` as a tz-aware datetime for HAFAS's TripSearch.
+    """Render `when` as a Europe/Vienna-local datetime for HAFAS's TripSearch.
 
-    Naive input (the journey UI's `datetime-local` is naive) is
-    localised to Europe/Vienna; tz-aware input is used as-is.
-    `external_verify._build_trip_search_body` formats `outDate` /
-    `outTime` off the resulting datetime's HHMMSS / YYYYMMDD — both
-    naive-friendly methods, so a tz attached here is informational at
-    the wire level but matters when comparing against UTC trip-leg
-    timestamps. Falls back to UTC if the zone fails to load (shouldn't
-    happen on a normal OS — see ojp_client for the matching pattern).
+    `external_verify._build_trip_search_body` serialises `outDate` /
+    `outTime` with bare `strftime("%Y%m%d")` / `strftime("%H%M%S")` —
+    no UTC offset reaches the wire, and HAFAS interprets those fields
+    in the operator's own zone (Europe/Vienna for ÖBB; see that
+    function's docstring). So whatever wall-clock this returns IS what
+    HAFAS searches for, regardless of the datetime's tzinfo.
+
+    Two input shapes, both normalised to Vienna wall-clock:
+
+    - **naive** (the journey UI's `datetime-local`) — the operator
+      typed a local time; attach Vienna so "pick 12:51" searches 12:51.
+    - **tz-aware** (`datetime.now(UTC)` from `_resolve_when`, and every
+      pagination anchor from `trip_normalize.next_anchor_or_none`, which
+      returns UTC) — CONVERT to Vienna so the same *instant* is
+      searched. Passing a UTC-aware datetime through unchanged used to
+      send UTC wall-clock mislabelled as Vienna local, shifting every
+      search by the live offset (-2 h in CEST). Pagination made this
+      acute: each anchor is derived from the previous page's UTC
+      departure times, so the skew compounded across pages.
+
+    Falls back to UTC if the zone fails to load (shouldn't happen on a
+    normal OS — see ojp_client for the matching pattern).
     """
-    if when.tzinfo is not None:
-        return when
     tz: Any = UTC
     try:
         tz = ZoneInfo(_REFERENCE_TZ)
     except (ZoneInfoNotFoundError, ValueError):  # pragma: no cover
         log.warning("could not load %s — using UTC for HAFAS TripSearch", _REFERENCE_TZ)
+    if when.tzinfo is not None:
+        return when.astimezone(tz)
     return when.replace(tzinfo=tz)
 
 

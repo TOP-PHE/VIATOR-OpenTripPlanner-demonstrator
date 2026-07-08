@@ -571,9 +571,17 @@ async def test_fetch_plan_naive_when_localises_to_vienna() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_plan_aware_when_used_as_is() -> None:
-    """A tz-aware `when` (e.g. `datetime.now(UTC)`) must NOT be
-    re-localised. Confirms the localisation logic is naive-only."""
+async def test_fetch_plan_aware_when_converted_to_vienna_wall_clock() -> None:
+    """A tz-aware `when` (e.g. `datetime.now(UTC)` from `_resolve_when`,
+    or any pagination anchor, which `next_anchor_or_none` emits in UTC)
+    must be CONVERTED to Europe/Vienna — not passed through.
+
+    `external_verify._build_trip_search_body` serialises outDate/outTime
+    with bare strftime, no offset, and HAFAS reads those fields as
+    Vienna local. Passing a UTC-aware datetime through unchanged sent
+    UTC wall-clock mislabelled as Vienna, searching 2 h earlier than
+    asked (CEST). The *instant* must be preserved while the wall-clock
+    fields become Vienna's."""
     captured: dict = {}
 
     async def fake_two_step(**kwargs):
@@ -584,7 +592,7 @@ async def test_fetch_plan_aware_when_used_as_is() -> None:
             )
         )
 
-    when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
+    when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)  # 2026-06-28 is CEST (UTC+2)
     with patch.object(external_verify, "fetch_oebb_two_step", side_effect=fake_two_step):
         await hafas_client.fetch_plan(
             from_lat=0.0,
@@ -593,7 +601,11 @@ async def test_fetch_plan_aware_when_used_as_is() -> None:
             to_lon=0.0,
             when=when,
         )
+    # Same instant...
     assert captured["depart_at"] == when
+    # ...but the wall-clock HAFAS will read is Vienna's, not UTC's.
+    assert captured["depart_at"].hour == 10
+    assert captured["depart_at"].strftime("%H%M%S") == "100000"
 
 
 # ─────────────────────── verify_via_oebb_hafas façade still works ───────────────────────
@@ -837,3 +849,124 @@ class TestFetchPlanPaginated:
         )
         assert page_calls["n"] == 2  # page 1: new trip; page 2: dup detected, bail
         assert len(trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_midflight_page_error_surfaces_partial_not_clean_ok(self, monkeypatch) -> None:
+        """A page-2+ failure must keep the trips gathered so far BUT
+        flag `partial` + `error` — otherwise a transient HAFAS 5xx on
+        page 2 renders as a clean, complete-looking result set that is
+        silently short of the target window."""
+        page_calls = {"n": 0}
+
+        async def fake_fetch_plan(**kw):
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {"status": "ok", "response_ms": 200}, [
+                    _make_hafas_trip(
+                        dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
+                        route="RJ 1",
+                        from_uic="8100001",
+                        to_uic="8100173",
+                    )
+                ]
+            return {"status": "error", "error": "HAFAS 502", "response_ms": 90}, []
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert len(trips) == 1  # page 1's trip survives
+        assert raw["status"] == "ok"  # trips render
+        assert raw["partial"] is True  # ...but coverage is short
+        assert "HAFAS 502" in raw["error"]
+
+    @pytest.mark.asyncio
+    async def test_clean_no_route_on_later_page_is_not_flagged_partial(self, monkeypatch) -> None:
+        """The mirror of the test above: HAFAS cleanly running out of
+        connections (`no_route`) is NOT an error and must not set
+        `partial` — otherwise every fully-paginated search would carry
+        a spurious warning."""
+        page_calls = {"n": 0}
+
+        async def fake_fetch_plan(**kw):
+            page_calls["n"] += 1
+            if page_calls["n"] == 1:
+                return {"status": "ok", "response_ms": 200}, [
+                    _make_hafas_trip(
+                        dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
+                        route="RJ 1",
+                        from_uic="8100001",
+                        to_uic="8100173",
+                    )
+                ]
+            return {"status": "no_route", "response_ms": 90}, []
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=5000,
+            target_window_seconds=21600,
+            max_pages=4,
+        )
+        assert len(trips) == 1
+        assert raw["status"] == "ok"
+        assert "partial" not in raw
+        assert "error" not in raw
+
+    @pytest.mark.asyncio
+    async def test_total_timeout_budget_stops_pagination(self, monkeypatch) -> None:
+        """The whole paginated call is bounded by `total_timeout_ms`, not
+        just each page. Without this a slow-but-not-erroring HAFAS could
+        burn max_pages x timeout_ms (4 x 10 s) while /fanout holds the
+        journey concurrency semaphore.
+
+        Simulated by advancing a fake monotonic clock inside each page
+        so no real time passes."""
+        page_calls = {"n": 0}
+        clock = {"t": 0.0}
+
+        monkeypatch.setattr(hafas_client.time, "monotonic", lambda: clock["t"])
+
+        async def fake_fetch_plan(**kw):
+            page_calls["n"] += 1
+            clock["t"] += 4.0  # each page "takes" 4 s
+            return {"status": "ok", "response_ms": 4000}, [
+                _make_hafas_trip(
+                    dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
+                    route=f"RJ {page_calls['n']}",
+                    from_uic=f"810{1000 + page_calls['n']}",
+                    to_uic="8100173",
+                )
+            ]
+
+        monkeypatch.setattr(hafas_client, "fetch_plan", fake_fetch_plan)
+
+        raw, trips = await hafas_client.fetch_plan_paginated(
+            from_lat=0,
+            from_lon=0,
+            to_lat=0,
+            to_lon=0,
+            when=datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC),
+            timeout_ms=10_000,
+            target_window_seconds=21600,  # would otherwise want all 4 pages
+            max_pages=4,
+            total_timeout_ms=10_000,  # only ~2 pages' worth of budget
+        )
+        # 4 s + 4 s = 8 s spent; a 3rd page has < 500 ms floor... it has
+        # 2 s, so it runs, reaching 12 s > 10 s -> 4th page refused.
+        assert page_calls["n"] < 4, "budget must stop pagination before max_pages"
+        assert raw["pagination_stopped"] == "budget"
+        assert len(trips) == page_calls["n"]  # every issued page's trip kept

@@ -112,3 +112,91 @@ def test_keeps_hafas_trips_with_unparseable_departure():
     _truncate_hafas_to_viator_window(hafas_reference, viator_trips)
 
     assert len(hafas_reference["trips"]) == 1
+
+
+# ─────────────── boarding-time (not walk-inclusive) boundary ───────────────
+# The window boundary must compare `first_transit_leg_departure_utc` (the
+# repo's canonical boarding instant) on BOTH sides, not the itinerary-level
+# `departure_at`, which is the start of the whole trip -- usually an access
+# walk. The two engines produce different access walks for the same physical
+# train, so a `departure_at` boundary shifts by however long those walks
+# differ, clipping ÖBB trips VIATOR actually covered.
+
+
+def test_boundary_uses_first_transit_leg_departure_not_walk_start():
+    # VIATOR's last trip: 20 min access walk -> departure_at 06:40 but
+    # BOARDS at 07:00. An ÖBB trip boarding the very same 07:00 train
+    # (no walk, departure_at 07:00) must be KEPT: a departure_at
+    # boundary (06:40) would have wrongly dropped it.
+    viator_trips = [
+        {
+            "best": {
+                "departure_at": "2026-07-20T06:40:00+00:00",
+                "first_transit_leg_departure_utc": "2026-07-20T07:00:00+00:00",
+            }
+        }
+    ]
+    hafas_reference = {
+        "status": "ok",
+        "trips": [
+            {
+                "departure_at": "2026-07-20T07:00:00+00:00",
+                "first_transit_leg_departure_utc": "2026-07-20T07:00:00+00:00",
+            }
+        ],
+    }
+
+    _truncate_hafas_to_viator_window(hafas_reference, viator_trips)
+
+    assert len(hafas_reference["trips"]) == 1
+    assert "trimmed_to_viator_window" not in hafas_reference
+
+
+def test_boundary_still_drops_oebb_trip_boarding_after_viators_last_boarding():
+    viator_trips = [
+        {
+            "best": {
+                "departure_at": "2026-07-20T06:40:00+00:00",
+                "first_transit_leg_departure_utc": "2026-07-20T07:00:00+00:00",
+            }
+        }
+    ]
+    hafas_reference = {
+        "status": "ok",
+        "trips": [
+            {
+                "departure_at": "2026-07-20T07:05:00+00:00",
+                "first_transit_leg_departure_utc": "2026-07-20T07:30:00+00:00",
+            }
+        ],
+    }
+
+    _truncate_hafas_to_viator_window(hafas_reference, viator_trips)
+
+    assert hafas_reference["trips"] == []
+    assert hafas_reference["trimmed_to_viator_window"] is True
+
+
+def test_falls_back_to_departure_at_for_walk_only_itineraries():
+    # A walk-only itinerary has no transit leg, so
+    # first_transit_leg_departure_utc is None -- fall back to
+    # departure_at rather than treating the trip as timeless.
+    viator_trips = [
+        {
+            "best": {
+                "departure_at": "2026-07-20T07:00:00+00:00",
+                "first_transit_leg_departure_utc": None,
+            }
+        }
+    ]
+    hafas_reference = {
+        "status": "ok",
+        "trips": [
+            {"departure_at": "2026-07-20T06:30:00+00:00", "first_transit_leg_departure_utc": None},
+            {"departure_at": "2026-07-20T09:00:00+00:00", "first_transit_leg_departure_utc": None},
+        ],
+    }
+
+    _truncate_hafas_to_viator_window(hafas_reference, viator_trips)
+
+    assert [t["departure_at"] for t in hafas_reference["trips"]] == ["2026-07-20T06:30:00+00:00"]
