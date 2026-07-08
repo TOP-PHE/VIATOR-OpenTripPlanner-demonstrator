@@ -1795,16 +1795,67 @@ let MODAL_SHOW_WALKS = (function () {
   }
 })();
 
+// Modes that are not a train. Mirrors the canonical set the backend uses
+// everywhere else — `alignment._strip_walk_legs`, `signature.py`,
+// `trip_normalize._NON_TRANSIT_MODES`, `journey.html` — so the rows this
+// modal hides are exactly the rows the alignment scorer ignores. A bare
+// `mode !== 'WALK'` would keep a MOTIS `TRANSFER` leg (and a HAFAS section
+// with `mode: null`), leaving the recomputed header disagreeing with the
+// legs drawn beneath it.
+const MODAL_NON_TRANSIT_MODES = new Set(['WALK', 'TRANSFER', '']);
+
+function isModalTransitLeg(leg) {
+  return !MODAL_NON_TRANSIT_MODES.has(String((leg && leg.mode) || '').toUpperCase());
+}
+
+// First train's departure → last train's arrival, walks excluded.
+// `depKey`/`arrKey` differ per engine: VIATOR legs carry `departure` /
+// `arrival` (true UTC instants); ÖBB VerifyLegs carry `dep_utc` / `arr_utc`
+// (naive Europe/Vienna — the `_utc` name is aspirational, see
+// `external_verify._hafas_time_to_utc_iso`). We read whichever field the leg
+// ROW already renders, so the header can never disagree with the legs on
+// screen. A duration is a difference, so it is offset-invariant either way.
+//
+// Returns null when there is no train at all, or the timestamps can't be
+// parsed — the caller then keeps the door-to-door header rather than
+// inventing one.
+function modalTransitBounds(legs, depKey, arrKey) {
+  const transit = (legs || []).filter(isModalTransitLeg);
+  if (!transit.length) return null;
+  const dep = transit[0][depKey];
+  const arr = transit[transit.length - 1][arrKey];
+  if (!dep || !arr) return null;
+  let seconds = (new Date(arr) - new Date(dep)) / 1000;
+  if (!Number.isFinite(seconds)) return null;
+  // Overnight: HAFAS anchors every leg to the connection's single `date` and
+  // `_hafas_time_to_utc_iso` drops the day-roll prefix, so an arrival after
+  // midnight parses as EARLIER than its departure. A train cannot arrive
+  // before it leaves; roll the arrival forward one day.
+  if (seconds < 0) seconds += 86400;
+  return { dep, arr, seconds };
+}
+
 // PR-196b — apply or remove the modal-only "show walks" class on the
 // rendered <body>. Cheap CSS toggle (`.cov-cell-trip .cov-leg.walk-leg`
 // is hidden by default; this class flips the [hidden] attr on every
 // walk row). Called from the change handler so the operator's flip is
 // instant — no re-render needed.
+//
+// It also swaps each trip card's header between its door-to-door times
+// (`data-walks="1"`) and its train-only times (`data-walks="0"`), so hiding
+// the walks recomputes start / arrival / duration from whatever legs remain
+// instead of leaving a header that contradicts them — an ÖBB itinerary
+// otherwise reads "08:10 → 10:48 · 2h38" above a single rail leg running
+// 08:10 → 10:06, because the hidden egress leg is Eurostar's 60-minute
+// check-in allowance at Bruxelles-Midi International.
 function applyModalShowWalks() {
   const modalBody = document.getElementById('cov-modal-body');
   if (!modalBody) return;
   modalBody.querySelectorAll('.cov-leg.walk-leg').forEach((row) => {
     row.hidden = !MODAL_SHOW_WALKS;
+  });
+  modalBody.querySelectorAll('[data-walks]').forEach((el) => {
+    el.hidden = (el.dataset.walks === '1') !== MODAL_SHOW_WALKS;
   });
 }
 
@@ -1859,14 +1910,45 @@ function renderModalOebbColumn(itineraries) {
 // badges non-sequential (e.g. #7, #2, #9 top to bottom) against the
 // now-chronological list — using position keeps the badge matching
 // what's actually on screen.
+// Both header variants are rendered up-front and `applyModalShowWalks()`
+// flips which one is [hidden]. Rendering both (rather than re-rendering the
+// card on every toggle) keeps the flip instant and can't drop the operator's
+// scroll position or an expanded card.
+//
+// `data-walks="1"` = door-to-door (shown when walks are visible).
+// `data-walks="0"` = train-only   (shown when walks are hidden).
+function modalTripHeadTimes(fullDep, fullArr, fullSeconds, bounds) {
+  // No train, or unparseable timestamps → emit only the door-to-door variant,
+  // unconditionally visible. It then ignores the toggle, because there is
+  // nothing honest to recompute.
+  if (!bounds) {
+    return (
+      `<span>${fmtTime(fullDep)} → ${fmtTime(fullArr)}</span>` +
+      `<span class="cov-trip-duration">${fmtDuration(fullSeconds)}</span>`
+    );
+  }
+  // Initial [hidden] is baked in from the persisted preference — same as the
+  // leg rows do — because applyModalShowWalks() only runs on a toggle flip,
+  // not on first render. Getting this wrong would show a door-to-door header
+  // above already-hidden walk legs.
+  const fullHidden = MODAL_SHOW_WALKS ? '' : ' hidden';
+  const transitHidden = MODAL_SHOW_WALKS ? ' hidden' : '';
+  return (
+    `<span data-walks="1"${fullHidden}>${fmtTime(fullDep)} → ${fmtTime(fullArr)}</span>` +
+    `<span class="cov-trip-duration" data-walks="1"${fullHidden}>${fmtDuration(fullSeconds)}</span>` +
+    `<span data-walks="0"${transitHidden}>${fmtTime(bounds.dep)} → ${fmtTime(bounds.arr)}</span>` +
+    `<span class="cov-trip-duration" data-walks="0"${transitHidden}>${fmtDuration(bounds.seconds)}</span>`
+  );
+}
+
 function renderModalViatorTripCard(trip, idx) {
   const legs = (trip.legs || []).map(renderModalLeg).join('');
   const transfers = fmtCount(trip.num_transfers, 'transfer');
+  const bounds = modalTransitBounds(trip.legs, 'departure', 'arrival');
   return `<div class="cov-trip cov-cell-trip viator">
     <div class="cov-trip-head">
       <span class="cov-trip-rank">#${idx + 1}</span>
-      <span>${fmtTime(trip.departure_at)} → ${fmtTime(trip.arrival_at)}</span>
-      <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
+      ${modalTripHeadTimes(trip.departure_at, trip.arrival_at, trip.duration_seconds, bounds)}
       <span class="hint">${escHTML(transfers)}</span>
     </div>
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
@@ -1885,10 +1967,14 @@ function renderModalOebbTripCard(it) {
   // the `hidden` attr in place.
   const legs = (it.legs || []).map(renderModalOebbLeg).join('');
   const transfers = fmtCount(it.num_transfers, 'transfer');
+  // ÖBB brackets its itineraries with WALK sections whose minutes live in
+  // HAFAS's `dur` (hence `duration_seconds`), so the door-to-door header can
+  // exceed the train by the better part of an hour at a hub like
+  // Bruxelles-Midi International.
+  const bounds = modalTransitBounds(it.legs, 'dep_utc', 'arr_utc');
   return `<div class="cov-trip cov-cell-trip oebb">
     <div class="cov-trip-head">
-      <span>${fmtTime(it.departure_at)} → ${fmtTime(it.arrival_at)}</span>
-      <span class="cov-trip-duration">${fmtDuration(it.duration_seconds)}</span>
+      ${modalTripHeadTimes(it.departure_at, it.arrival_at, it.duration_seconds, bounds)}
       <span class="hint">${escHTML(transfers)}</span>
     </div>
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
@@ -1905,7 +1991,9 @@ function renderModalLeg(leg) {
   const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
   const headsign = leg.trip_headsign ? ' (' + escHTML(leg.trip_headsign) + ')' : '';
   const agency = leg.agency_name || leg.feed_id || '';
-  const isWalk = mode === 'WALK';
+  // Hide exactly the legs `modalTransitBounds` excludes, so the recomputed
+  // header always describes the rows still on screen.
+  const isWalk = !isModalTransitLeg(leg);
   const walkClass = isWalk ? ' walk-leg' : '';
   const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
   return `<div class="cov-leg${walkClass}"${hiddenAttr}>
@@ -1924,7 +2012,8 @@ function renderModalLeg(leg) {
 function renderModalOebbLeg(leg) {
   const mode = leg.mode || 'TRANSIT';
   const service = leg.route_name || (mode === 'WALK' ? 'walk' : '');
-  const isWalk = mode === 'WALK';
+  // Same rule as the VIATOR row — see renderModalLeg.
+  const isWalk = !isModalTransitLeg(leg);
   const walkClass = isWalk ? ' walk-leg' : '';
   const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
   const fromTok = leg.from_uic || '?';

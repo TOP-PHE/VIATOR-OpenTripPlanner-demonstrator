@@ -413,3 +413,76 @@ def test_no_operator_facing_copy_still_promises_tomorrow(template_text: str):
         "reference_date; create_run now anchors it on depart_at"
     )
     assert "(default: the Departure date)" in template_text
+
+
+# ───────── "Show walk legs" OFF must recompute the card header ─────────
+# The header used to show door-to-door times unconditionally, so hiding the
+# walk rows left an OeBB itinerary reading "08:10 -> 10:48 - 2h38" above a
+# single rail leg running 08:10 -> 10:06. (That 42 min is Eurostar's check-in
+# allowance at Bruxelles-Midi International, which HAFAS models as an egress
+# WALK -- real data, deliberately kept.) With walks hidden the header must
+# describe the remaining legs: first train's departure -> last train's arrival.
+
+
+def test_modal_non_transit_modes_matches_the_backend_set(template_text: str):
+    """A bare `mode !== 'WALK'` would keep a MOTIS TRANSFER leg (and a HAFAS
+    section with mode: null) visible while excluding it from the recomputed
+    header — the exact divergence `_NON_TRANSIT_MODES` exists to prevent, and
+    the bug PR #222 fixed once already in journey.html."""
+    assert "const MODAL_NON_TRANSIT_MODES = new Set(['WALK', 'TRANSFER', ''])" in template_text
+    assert "function isModalTransitLeg(leg)" in template_text
+    assert ".toUpperCase()" in template_text
+
+
+def test_both_leg_renderers_hide_via_the_canonical_predicate(template_text: str):
+    """Rows hidden must be exactly the rows excluded from the recompute, or
+    the header contradicts the legs again — on one column only."""
+    for fn in ("renderModalLeg", "renderModalOebbLeg"):
+        start = template_text.find(f"function {fn}(")
+        assert start != -1, f"{fn} missing"
+        body = template_text[start : template_text.find("\n}\n", start)]
+        assert "isModalTransitLeg(leg)" in body, (
+            f"{fn} must derive its walk-leg class from isModalTransitLeg, not `mode === 'WALK'`"
+        )
+
+
+def test_transit_bounds_helper_and_overnight_guard(template_text: str):
+    start = template_text.find("function modalTransitBounds(")
+    assert start != -1, "modalTransitBounds missing"
+    body = template_text[start : template_text.find("\n}\n", start)]
+    assert "filter(isModalTransitLeg)" in body
+    # HAFAS anchors every leg to the connection's single `date` and
+    # `_hafas_time_to_utc_iso` drops the day-roll prefix, so an arrival after
+    # midnight parses EARLIER than its departure. Without the roll-forward the
+    # header would show a negative duration on every NightJet.
+    assert "seconds += 86400" in body, "overnight roll-forward guard missing"
+    assert "Number.isFinite(seconds)" in body
+
+
+def test_header_emits_both_variants_and_toggle_swaps_them(template_text: str):
+    assert 'data-walks="1"' in template_text  # door-to-door
+    assert 'data-walks="0"' in template_text  # train only
+    start = template_text.find("function applyModalShowWalks(")
+    body = template_text[start : template_text.find("\n}\n", start)]
+    assert "[data-walks]" in body, "applyModalShowWalks must swap the header variants"
+    assert "MODAL_SHOW_WALKS" in body
+
+
+def test_initial_render_bakes_in_the_persisted_preference(template_text: str):
+    """`applyModalShowWalks()` only runs on a toggle flip, never after the
+    first modal render — so the header variants must carry their initial
+    [hidden] from MODAL_SHOW_WALKS, exactly as the leg rows do. Otherwise an
+    operator with walks persisted OFF opens the modal to a door-to-door header
+    above already-hidden legs."""
+    start = template_text.find("function modalTripHeadTimes(")
+    assert start != -1, "modalTripHeadTimes missing"
+    body = template_text[start : template_text.find("\n}\n", start)]
+    assert "MODAL_SHOW_WALKS ? '' : ' hidden'" in body
+    assert "MODAL_SHOW_WALKS ? ' hidden' : ''" in body
+
+
+def test_both_cards_recompute_with_their_own_leg_field_names(template_text: str):
+    """VIATOR legs carry `departure`/`arrival`; OeBB VerifyLegs carry
+    `dep_utc`/`arr_utc`. One missing call would silently fix a single column."""
+    assert "modalTransitBounds(trip.legs, 'departure', 'arrival')" in template_text
+    assert "modalTransitBounds(it.legs, 'dep_utc', 'arr_utc')" in template_text
