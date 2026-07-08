@@ -245,6 +245,24 @@ main {
   color: var(--rail-steel);
   font-variant-numeric: tabular-nums;
 }
+/* Run searched a different calendar day than its depart_at names —
+   only reachable on rows created before create_run derived
+   reference_date from depart_at. Same amber "verify me" palette as the
+   journey page's train-mismatch note (compare_grid.css). */
+.cov-window-warning {
+  width: 100%; flex-basis: 100%;
+  margin-top: 0.4rem;
+  padding: 0.5rem 0.7rem;
+  background: #fff8e6;
+  border: 1px solid #f0c674;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: #6b5416;
+}
+.cov-window-warning code {
+  background: #f6e7c1; padding: 0 0.2rem; border-radius: 2px;
+}
 /* v0.1.29 — view toggle. Three modes change what each cell displays.
    v0.1.29.5 — pinned dark text on inactive buttons. The previous rule
    only set a colour on .active (white on blue); the inactive state had
@@ -626,7 +644,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
               </select>
             </label>
             <label style="display: flex; flex-direction: column; gap: 0.15rem">
-              <span>Reference date <span class="hint" style="font-weight: normal">(default: tomorrow)</span></span>
+              <span>Reference date <span class="hint" style="font-weight: normal">(default: the Departure date)</span></span>
               <input type="date" name="reference_date" id="cov-reference-date">
             </label>
           </div>
@@ -947,6 +965,26 @@ function buildRunStatsSubline(run) {
   }
   if (parts.length === 0) return '';
   return `<div class="cov-summary-subline">${parts.join(' · ')}</div>`;
+}
+
+// The run's K-slot grid searched a different calendar day than its own
+// `depart_at` names. Only possible on runs created before create_run
+// started deriving `reference_date` from `depart_at` — back then it
+// defaulted to "tomorrow at create time", so the matrix answers a day
+// the operator never asked for. The numbers on such a run are real but
+// describe the wrong date; say so rather than let it pass as current.
+// The cell modal renders leg times as HH:MM with no date, which is
+// precisely why this went unnoticed for so long.
+function buildRunWindowWarning(run) {
+  if (!run.depart_at_outside_window) return '';
+  const refDate = run.reference_date ? escHTML(run.reference_date) : 'a different day';
+  const departDay = run.depart_at ? escHTML(String(run.depart_at).slice(0, 10)) : '(unknown)';
+  return `<div class="cov-window-warning">⚠ This run searched <strong>${refDate}</strong>, not its
+    stated departure date <strong>${departDay}</strong> — its <code>reference_date</code> defaulted
+    to "tomorrow" instead of the departure day (fixed for new runs). The cell counts and itineraries
+    below are real, but they describe ${refDate}. Any ÖBB alignment score on this run compared the
+    two engines across different days and is not meaningful. Re-run to get results for
+    ${departDay}.</div>`;
 }
 
 // PR-E — Sonar follow-up: the per-cell `inner` glyph for non-ok
@@ -1488,6 +1526,7 @@ function renderRun(run) {
     <button type="button" class="cov-download" id="cov-share-btn" data-run-id="${escHTML(run.id)}"
        title="Copy a link anyone can open (no login) to view this same report in their browser — no need to email the file.">🔗 Copy share link</button>
     ${buildRunStatsSubline(run)}
+    ${buildRunWindowWarning(run)}
   </div>`;
 
   // Build the matrix. Rows = origin (read down), columns = destination.

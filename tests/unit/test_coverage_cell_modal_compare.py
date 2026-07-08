@@ -362,3 +362,42 @@ def test_rerun_link_uic_locals_use_value_or_empty_string_convention(template_tex
         "again (same failure class as the v0.1.43.28 coord bug)."
     )
     assert "dest && dest.uic ? encodeURIComponent(dest.uic) : ''" in template_text
+
+
+# ───────── wrong-day run warning banner (reference_date ⟂ depart_at) ─────────
+# A run whose K-slot grid searched a different calendar day than its own
+# depart_at names produces real-looking numbers for the wrong date. The
+# cell modal renders leg times as HH:MM with no date, so the operator has
+# no way to notice. Only reachable on rows created before create_run
+# started deriving reference_date from depart_at.
+
+
+def test_run_window_warning_helper_is_defined(template_text: str):
+    assert "function buildRunWindowWarning(run)" in template_text
+
+
+def test_run_window_warning_is_gated_on_the_backend_flag(template_text: str):
+    """The banner must key off `depart_at_outside_window` (computed
+    server-side against the run's resolved window) rather than
+    re-deriving the comparison in JS, where the run's timezone isn't
+    available."""
+    assert "run.depart_at_outside_window" in template_text
+
+
+def test_run_window_warning_is_actually_rendered(template_text: str):
+    """Defined-but-never-called is the classic way a warning silently
+    stops warning."""
+    assert "${buildRunWindowWarning(run)}" in template_text
+
+
+def test_run_window_warning_css_present(template_text: str):
+    """Without the rule the banner renders as unstyled text indistinguishable
+    from the stats subline it sits under."""
+    assert ".cov-window-warning" in template_text
+
+
+def test_reference_date_hint_no_longer_promises_tomorrow(template_text: str):
+    """The form hint said "(default: tomorrow)" — which was true, and was
+    the bug. It now defaults to the Departure date."""
+    assert "(default: tomorrow)" not in template_text
+    assert "(default: the Departure date)" in template_text

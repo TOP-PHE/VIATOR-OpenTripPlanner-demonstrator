@@ -337,17 +337,83 @@ class ResolvedWindow:
     tz_name: str
 
 
-def _default_reference_date(tz_name: str | None) -> date:
-    """Tomorrow in `tz_name`, falling back to UTC for unknown zones.
+def _anchor_depart_at_and_reference_date(
+    depart_at: datetime,
+    reference_date_value: date | None,
+    window_timezone: str | None,
+    cfg: CoverageConfig,
+) -> tuple[datetime, date]:
+    """Resolve `depart_at` to an instant and `reference_date` to the day
+    that instant falls on — both read in the run's own timezone.
 
-    Extracted so `create_run` stays under Sonar's cognitive-complexity
-    threshold (the nested try/except for ZoneInfo + the date arithmetic
-    pushed the calling site over otherwise)."""
-    try:
-        tz_for_ref = ZoneInfo(tz_name or "UTC")
-    except (ZoneInfoNotFoundError, ValueError):
-        tz_for_ref = ZoneInfo("UTC")
-    return (datetime.now(tz_for_ref) + timedelta(days=1)).date()
+    Two invariants this establishes, neither of which held before:
+
+    1. **`depart_at` is a wall-clock in the run's zone, not in UTC.** The
+       admin form's `<input type="datetime-local">` posts a naive string
+       with no offset. Stamping it UTC (the old `depart_at.replace(
+       tzinfo=UTC)` in the API layer) silently reinterpreted "06:40" as
+       06:40Z = 08:40 for a `Europe/Brussels` run. One zone per run:
+       `depart_at`, the K-slot window, and `reference_date` now all read
+       against `_resolve_timezone(window_timezone, cfg)`. A caller that
+       supplies a tz-aware `depart_at` is respected as-is (it already
+       names an instant).
+
+    2. **`reference_date` defaults to `depart_at`'s day, not tomorrow.**
+       The K-slot search grid is composed *exclusively* from
+       `reference_date` + `window_*_local` (see `_resolve_run_window`);
+       `depart_at` is never passed to the planner. Meanwhile every
+       downstream comparison anchors on `depart_at`: the ÖBB verify sweep
+       (`verify_via_oebb_hafas(..., depart_at=run.depart_at)`) and the
+       trip filters in `_fetch_trips_by_search` /
+       `alignment.filter_trips_from_depart_at`.
+
+       Defaulting `reference_date` to "tomorrow at create time" let the
+       two name different calendar days. An operator asking for
+       2026-07-20 on 2026-07-08 got a matrix searched on 2026-07-09,
+       whose trips then failed `departure_at >= depart_at` by 11 days —
+       every cell rendered "no itineraries found" beside a non-zero
+       itinerary count, and every alignment score was scored against a
+       VIATOR side filtered down to nothing. The wrong day was invisible
+       because the cell modal renders leg times as HH:MM with no date.
+
+    `app/models/network_coverage.py`'s `reference_date` docstring has
+    always *claimed* create_run keeps the two consistent. This is the
+    first version that actually does.
+    """
+    tz = _resolve_timezone(window_timezone, cfg)
+    if depart_at.tzinfo is None:
+        depart_at = depart_at.replace(tzinfo=tz)
+    if reference_date_value is None:
+        reference_date_value = depart_at.astimezone(tz).date()
+    return depart_at, reference_date_value
+
+
+def resolve_window_for_run(run: NetworkCoverageRun, cfg: CoverageConfig) -> ResolvedWindow:
+    """`_resolve_run_window` for an already-persisted run row.
+
+    Public because the admin API needs to ask "did this run actually
+    search the day its `depart_at` names?" — see
+    `network_coverage._comparable_depart_at`.
+    """
+    return _resolve_run_window(
+        window_start_local=run.window_start_local,
+        window_end_local=run.window_end_local,
+        window_timezone=run.window_timezone,
+        reference_date_value=run.reference_date,
+        cfg=cfg,
+    )
+
+
+def depart_at_within_window(run: NetworkCoverageRun, cfg: CoverageConfig) -> bool:
+    """True when `run.depart_at` lies inside the window the run searched.
+
+    False for every run created before `_anchor_depart_at_and_reference_date`
+    landed (their `reference_date` is "tomorrow at create time", unrelated
+    to `depart_at`). Callers use this to decide whether `depart_at` is a
+    meaningful anchor to filter that run's trips against.
+    """
+    window = resolve_window_for_run(run, cfg)
+    return window.start_utc <= run.depart_at < window.end_utc
 
 
 def _resolve_timezone(tz_name: str | None, cfg: CoverageConfig) -> ZoneInfo:
@@ -872,11 +938,14 @@ def create_run(
     assert label is not None  # narrowing for mypy — guaranteed by mode validation above
 
     # PR-3 — resolve `reference_date` to a concrete calendar day NOW so
-    # the row carries the operator's intent verbatim. Default is
-    # "tomorrow in the resolved timezone" — gives a same-day result for
-    # operators in any zone without needing to think about UTC drift.
-    if reference_date_value is None:
-        reference_date_value = _default_reference_date(window_timezone)
+    # the row carries the operator's intent verbatim. It defaults to the
+    # calendar day of `depart_at`, read in the run's own timezone, so the
+    # day the K-slot grid searches is the day the operator asked for —
+    # see `_anchor_depart_at_and_reference_date` for why that used to be
+    # "tomorrow" and what it broke.
+    depart_at, reference_date_value = _anchor_depart_at_and_reference_date(
+        depart_at, reference_date_value, window_timezone, _load_coverage_config(db)
+    )
 
     run = NetworkCoverageRun(
         actor_user_id=actor_user_id,

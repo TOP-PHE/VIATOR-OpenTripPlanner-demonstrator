@@ -20,7 +20,7 @@ Coverage:
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -657,10 +657,18 @@ def _stub_active_hubs(monkeypatch: Any) -> None:
     monkeypatch.setattr(runner, "_load_active_hubs", fake_load)
 
 
-def test_create_run_window_fields_default_to_none_and_reference_date_to_tomorrow(monkeypatch):
-    """All-NULL window inputs reproduce pre-PR-3 behaviour. reference_date
-    is computed by _default_reference_date — 'tomorrow' in the resolved
-    timezone (UTC fallback when no zone supplied)."""
+def test_create_run_window_fields_default_to_none_and_reference_date_to_depart_at_day(monkeypatch):
+    """All-NULL window inputs reproduce pre-PR-3 behaviour, but
+    reference_date now defaults to the CALENDAR DAY OF depart_at — not
+    "tomorrow at create time".
+
+    Regression guard for the wrong-day bug: `_resolve_run_window` builds
+    the K-slot search grid from `reference_date` alone, while every
+    downstream comparison (the ÖBB verify sweep, PR #221's trip filter)
+    anchors on `depart_at`. When the two named different days the run
+    searched a day the operator never asked for, and
+    `departure_at >= depart_at` matched zero of the run's own trips.
+    """
     from unittest.mock import MagicMock
 
     _stub_active_hubs(monkeypatch)
@@ -680,9 +688,9 @@ def test_create_run_window_fields_default_to_none_and_reference_date_to_tomorrow
     assert row.window_start_local is None
     assert row.window_end_local is None
     assert row.window_timezone is None
-    # _default_reference_date returned SOME date — exact value depends
-    # on the clock so assert only the type contract.
-    assert row.reference_date is not None
+    # The exact date, not merely "some date" — the old assertion
+    # (`is not None`) is what let "tomorrow" slip through for months.
+    assert row.reference_date == date(2026, 7, 1)
 
 
 def test_create_run_persists_explicit_window_and_timezone(monkeypatch):
@@ -715,20 +723,110 @@ def test_create_run_persists_explicit_window_and_timezone(monkeypatch):
     assert row.reference_date == date(2026, 7, 1)
 
 
-def test_default_reference_date_unknown_tz_falls_back_to_utc():
-    """Operator picks a bogus IANA zone → _default_reference_date falls
-    back to UTC silently rather than raising. Without this, the runner
-    would crash before the row is even inserted."""
-    result = runner._default_reference_date("Not/A/Zone")
-    assert isinstance(result, date)
+# ───────────── _anchor_depart_at_and_reference_date ─────────────
+# One timezone per run: a naive `depart_at` (what the admin form's
+# datetime-local posts) is a wall-clock in the run's own window_timezone,
+# and reference_date is the day that instant falls on IN THAT ZONE.
 
 
-def test_default_reference_date_uses_supplied_tz_for_tomorrow():
-    """The 'tomorrow' anchor is computed in the picked zone — matters at
-    the date boundary when UTC and the picked zone disagree on what
-    'today' is."""
-    result = runner._default_reference_date("Europe/Berlin")
-    assert isinstance(result, date)
+def test_anchor_localises_naive_depart_at_to_the_window_timezone():
+    """A naive depart_at is the operator's local wall-clock, NOT UTC.
+
+    The old API layer did `depart_at.replace(tzinfo=UTC)`, so an operator
+    on a Europe/Brussels run asking for 06:40 actually anchored at
+    06:40Z = 08:40 local, silently clipping the early-morning trips off
+    the front of every depart_at-anchored comparison."""
+    cfg = runner.CoverageConfig()
+    depart_at, ref = runner._anchor_depart_at_and_reference_date(
+        datetime(2026, 7, 20, 6, 40), None, "Europe/Brussels", cfg
+    )
+    # 06:40 Brussels in July (CEST, UTC+2) == 04:40Z — the same instant
+    # the operator meant, not 06:40Z.
+    assert depart_at.utcoffset() == timedelta(hours=2)
+    assert depart_at.astimezone(UTC) == datetime(2026, 7, 20, 4, 40, tzinfo=UTC)
+    assert ref == date(2026, 7, 20)
+
+
+def test_anchor_respects_an_already_aware_depart_at():
+    """A tz-aware depart_at already names an instant — keep it, and read
+    reference_date off it in the run's zone."""
+    cfg = runner.CoverageConfig()
+    aware = datetime(2026, 7, 20, 4, 40, tzinfo=UTC)
+    depart_at, ref = runner._anchor_depart_at_and_reference_date(
+        aware, None, "Europe/Brussels", cfg
+    )
+    assert depart_at == aware  # same instant
+    assert ref == date(2026, 7, 20)  # 06:40 Brussels
+
+
+def test_anchor_reads_reference_date_in_the_window_timezone_not_utc():
+    """Date-boundary case: the instant's UTC day and its local day differ.
+    reference_date must follow the run's zone, since that's the zone the
+    K-slot window is composed in."""
+    cfg = runner.CoverageConfig()
+    # 2026-07-20 13:00Z == 2026-07-21 01:00 NZST (UTC+12)
+    _depart_at, ref = runner._anchor_depart_at_and_reference_date(
+        datetime(2026, 7, 20, 13, 0, tzinfo=UTC), None, "Pacific/Auckland", cfg
+    )
+    assert ref == date(2026, 7, 21)
+
+
+def test_anchor_never_overrides_an_explicit_reference_date():
+    """An operator who typed a Reference date means it."""
+    cfg = runner.CoverageConfig()
+    _depart_at, ref = runner._anchor_depart_at_and_reference_date(
+        datetime(2026, 7, 20, 6, 40), date(2026, 8, 1), "Europe/Brussels", cfg
+    )
+    assert ref == date(2026, 8, 1)
+
+
+def test_anchor_unknown_timezone_falls_back_to_utc():
+    """Operator picks a bogus IANA zone → fall back to UTC silently rather
+    than raising. Without this the runner crashes before the row exists."""
+    cfg = runner.CoverageConfig()
+    depart_at, ref = runner._anchor_depart_at_and_reference_date(
+        datetime(2026, 7, 20, 6, 40), None, "Not/A/Zone", cfg
+    )
+    assert depart_at.utcoffset() == timedelta(0)
+    assert ref == date(2026, 7, 20)
+
+
+# ───────────── depart_at_within_window ─────────────
+
+
+def _run_row(*, depart_at, reference_date, tz=None, start=None, end=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        depart_at=depart_at,
+        reference_date=reference_date,
+        window_timezone=tz,
+        window_start_local=start,
+        window_end_local=end,
+    )
+
+
+def test_depart_at_within_window_true_for_a_correctly_anchored_run():
+    """Every run created by the fixed create_run: depart_at falls inside
+    the day-window its own reference_date generates."""
+    cfg = runner.CoverageConfig()  # 00:00-24:00 UTC full-day default
+    run = _run_row(
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC),
+        reference_date=date(2026, 7, 20),
+    )
+    assert runner.depart_at_within_window(run, cfg) is True
+
+
+def test_depart_at_within_window_false_for_a_legacy_tomorrow_run():
+    """The exact production shape that produced "26 itineraries" beside an
+    empty trip list: the run searched 2026-07-09 (reference_date defaulted
+    to tomorrow-at-create) while depart_at named 2026-07-20."""
+    cfg = runner.CoverageConfig()
+    run = _run_row(
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC),
+        reference_date=date(2026, 7, 9),
+    )
+    assert runner.depart_at_within_window(run, cfg) is False
 
 
 # ─────────────────── _merge_slot_results uncovered branches ───────────────────

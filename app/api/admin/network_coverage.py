@@ -27,6 +27,7 @@ polls GET /runs/{id} every 5s to render progress; status flips to
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from datetime import UTC, date, datetime
@@ -72,6 +73,8 @@ router = APIRouter(
 # and the cell-trips endpoints. Constant so a future rename / i18n only
 # touches one site (Sonar S1192).
 _RUN_NOT_FOUND = "Run not found"
+
+log = logging.getLogger(__name__)
 
 # Shared 404 detail for cell lookups within a run — used by the
 # verify-external endpoint. Mirrors the _RUN_NOT_FOUND pattern.
@@ -308,6 +311,15 @@ class RunSummary(BaseModel):
     window_end_local: str | None = None
     window_timezone: str | None = None
     reference_date: str | None = None
+    # True when `depart_at` does NOT fall inside the day-window this run
+    # actually searched — i.e. the run's matrix answers a different
+    # calendar day than the departure the operator asked for. Only ever
+    # True on rows created before `runner._anchor_depart_at_and_reference_date`
+    # (whose `reference_date` defaulted to "tomorrow at create time").
+    # Such a run's numbers are real but describe the wrong day, so the UI
+    # badges it and the trip filter is disabled for it — see
+    # `_comparable_depart_at`.
+    depart_at_outside_window: bool = False
     # PR-190 — banner stats so operators watching a long run can see
     # "how long has it been running" and "how fast is the runner". All
     # four fields are NULL until at least one cell has finished:
@@ -615,7 +627,16 @@ def list_runs(
     """
     rows = runner.list_recent_runs(db, limit=limit)
     stats_by_run = _aggregate_response_ms(db, [r.id for r in rows])
-    return [_run_to_summary(r, response_ms_stats=stats_by_run.get(r.id)) for r in rows]
+    # One config read for the whole sidebar, not one per run.
+    cfg = runner._load_coverage_config(db)
+    return [
+        _run_to_summary(
+            r,
+            response_ms_stats=stats_by_run.get(r.id),
+            depart_at_outside_window=_depart_at_outside_window(r, cfg),
+        )
+        for r in rows
+    ]
 
 
 @router.post(
@@ -671,11 +692,13 @@ def create_run(
 
     _validate_run_create_mode(body, db)
 
-    # Normalise depart_at to UTC if naive — OTP interprets this in
-    # transitModelTimeZone; we keep our DB representation tz-aware.
+    # A naive `depart_at` (what `<input type="datetime-local">` posts —
+    # no offset on the wire) is localised by `runner.create_run` against
+    # the run's own `window_timezone`. It is deliberately NOT stamped UTC
+    # here: doing so read the operator's "06:40" as 06:40Z, i.e. 08:40 on
+    # a Europe/Brussels run, silently clipping the early-morning trips off
+    # the front of every depart_at-anchored comparison. One zone per run.
     depart_at = body.depart_at
-    if depart_at.tzinfo is None:
-        depart_at = depart_at.replace(tzinfo=UTC)
 
     # PR-3 — translate "HH:MM" / "24:00" strings into the DB's TIME type.
     # "24:00" stores as 00:00 (the runner detects the sentinel by
@@ -895,6 +918,43 @@ def _fetch_trips_by_search(
             }
         )
     return out
+
+
+def _depart_at_outside_window(run: NetworkCoverageRun, cfg: runner.CoverageConfig) -> bool:
+    """True when the run did NOT search the day its `depart_at` names.
+
+    The K-slot grid a run executes is composed from `run.reference_date` +
+    `window_*_local` (`runner._resolve_run_window`); `run.depart_at` is a
+    separate instant. On runs created before
+    `runner._anchor_depart_at_and_reference_date`, `reference_date`
+    defaulted to "tomorrow at create time", so the two routinely named
+    different calendar days — and `_fetch_trips_by_search`'s
+    `JourneyTrip.departure_at >= depart_at` predicate then matched ZERO of
+    the run's own trips, rendering an empty VIATOR column next to a
+    non-zero `num_itineraries`.
+
+    An unresolvable window counts as "outside": both callers degrade to
+    the safe, pre-filter behaviour rather than hiding trips.
+    """
+    try:
+        return not runner.depart_at_within_window(run, cfg)
+    except Exception:
+        log.warning("could not resolve window for run %s — treating depart_at as unusable", run.id)
+        return True
+
+
+def _comparable_depart_at(db: DbSession, run: NetworkCoverageRun) -> datetime | None:
+    """`run.depart_at`, but only when the run actually searched that day.
+
+    A `depart_at` outside the searched window is exactly the case
+    `_fetch_trips_by_search`'s own contract calls "no natural depart_at to
+    compare against" — so return None and let it fall back to the
+    pre-filter, rank-ordered list rather than showing the operator nothing.
+    New runs are always inside their window, so the filter fires normally
+    and PR #221's intent is preserved untouched.
+    """
+    cfg = runner._load_coverage_config(db)
+    return None if _depart_at_outside_window(run, cfg) else run.depart_at
 
 
 # Country → hue for the matrix's country band. MUST stay in sync with
@@ -1175,7 +1235,7 @@ def export_run_html(
         results=results,
         hubs=_resolve_hubs(db),
         trips_by_search=_fetch_trips_by_search(
-            db, search_ids, run.depart_at, include_legs=include_legs
+            db, search_ids, _comparable_depart_at(db, run), include_legs=include_legs
         ),
         legs_omitted=not include_legs,
         # ÖBB side-by-side rides the same small-run tier as leg detail.
@@ -1254,7 +1314,11 @@ def get_run(
         raise HTTPException(404, _RUN_NOT_FOUND)
     # PR-190 — compute response_ms stats from the in-memory results we
     # already loaded; a second DB round-trip would be wasteful here.
-    summary = _run_to_summary(run, response_ms_stats=_stats_from_results(results))
+    summary = _run_to_summary(
+        run,
+        response_ms_stats=_stats_from_results(results),
+        depart_at_outside_window=_comparable_depart_at(db, run) is None,
+    )
     return RunDetail(
         **summary.model_dump(),
         summary=run.summary,
@@ -1406,7 +1470,7 @@ def _build_cell_trips_response(
         for r in (outbound_row, return_row)
         if r is not None and r.journey_search_id is not None
     ]
-    trips_by_search = _fetch_trips_by_search(db, search_ids, run.depart_at)
+    trips_by_search = _fetch_trips_by_search(db, search_ids, _comparable_depart_at(db, run))
 
     def _row_to_direction(r: NetworkCoverageResult | None) -> CellTripsDirection | None:
         if r is None:
@@ -1720,6 +1784,7 @@ def _run_to_summary(
     run: Any,
     *,
     response_ms_stats: tuple[int | None, float | None, int | None] | None = None,
+    depart_at_outside_window: bool = False,
 ) -> RunSummary:
     duration_seconds = _compute_duration_seconds(
         getattr(run, "started_at", None),
@@ -1767,6 +1832,7 @@ def _run_to_summary(
         window_end_local=_time_to_hhmm(getattr(run, "window_end_local", None)),
         window_timezone=_safe_str(getattr(run, "window_timezone", None)),
         reference_date=_safe_iso_date(getattr(run, "reference_date", None)),
+        depart_at_outside_window=depart_at_outside_window,
         # PR-190 — banner stats. duration is always computable when
         # started_at is set; per-cell response stats need to be passed
         # in by the caller (a single batched query handles the sidebar
