@@ -459,3 +459,128 @@ def test_filter_trips_from_depart_at_drops_unparseable_departure(dep_iso: str | 
 
 def test_filter_trips_from_depart_at_empty_input() -> None:
     assert filter_trips_from_depart_at([], datetime(2026, 7, 13, 6, 0, tzinfo=UTC)) == []
+
+
+# ───────── cross-namespace matching (Amsterdam → Bruxelles-Midi) ─────────
+# Reproduces the production cell that scored `no_overlap 0.00` while both
+# engines had plainly found the same 08:10 Eurostar. Two independent
+# reasons it failed, both fixed here:
+#
+#   1. The fuzzy guard required endpoint-id equality. `extract_uic` scrapes
+#      digits out of a HAFAS lid and calls them a UIC, but OeBB's
+#      L=4899427 for Amsterdam Centraal is an OeBB-internal id, not that
+#      station's UIC (8400058). The namespaces coincide only inside DACH.
+#   2. It then required the whole route label to be string-equal. VIATOR's
+#      GTFS feed says "Eurostar"; OeBB's HAFAS says "EUR 9322".
+
+
+def test_eurostar_matches_across_id_namespaces_and_label_systems() -> None:
+    """The exact production case. Same train: departs 08:10, arrives 10:06.
+
+    VIATOR calls it "Eurostar" from stop 8400058; OeBB calls it "EUR 9322"
+    from its internal id 4899427. Neither the ids nor the labels agree, yet
+    it is unambiguously one service and must score as agreement."""
+    v = [
+        _viator_trip(
+            [
+                _v_leg(
+                    from_uic="8400058",  # Amsterdam Centraal, real UIC
+                    to_uic="8814001",  # Bruxelles-Midi, real UIC
+                    dep="2026-07-13T08:10",
+                    arr="2026-07-13T10:06",
+                    route="Eurostar",  # brand, no number
+                )
+            ]
+        )
+    ]
+    o = [
+        _o_itin(
+            legs=[
+                _o_leg(
+                    from_uic="UIC:4899427",  # OeBB-internal, NOT a UIC
+                    to_uic="UIC:4335695",
+                    dep="2026-07-13T08:10",
+                    arr="2026-07-13T10:06",
+                    route="EUR 9322",
+                )
+            ]
+        )
+    ]
+    score, tier = compute_alignment(v, o)
+    assert score == 0.7  # fuzzy credit
+    assert tier == "mostly_agree"
+
+
+def test_differing_endpoint_ids_alone_never_block_a_match() -> None:
+    """Endpoint identity is not a discriminator inside a coverage cell —
+    both engines were asked for the same hub pair by construction. Same
+    train number, same departure, ids from different namespaces."""
+    v = [_viator_trip([_v_leg(from_uic="8400058", to_uic="8814001", route="RJ 1141")])]
+    o = [_o_itin(legs=[_o_leg(from_uic="UIC:4899427", to_uic="UIC:4335695", route="RJ 1141")])]
+    score, _tier = compute_alignment(v, o)
+    assert score == 0.7
+
+
+def test_numeric_train_numbers_still_guard_high_frequency_corridors() -> None:
+    """The anti-false-positive guard the module docstring was written for
+    survives: when BOTH sides carry a number, they must agree. Two
+    Eurostars 5 min apart are different services."""
+    v = [_viator_trip([_v_leg(route="EUR 9322", dep="2026-07-13T08:10")])]
+    o = [_o_itin(legs=[_o_leg(route="EUR 9328", dep="2026-07-13T08:12")])]
+    score, tier = compute_alignment(v, o)
+    assert score == 0.0
+    assert tier == "no_overlap"
+
+
+def test_no_number_same_departure_but_different_span_declines() -> None:
+    """Span fallback only fires when a number is unavailable, and it is not
+    a free pass: an unrelated service leaving the same minute but running
+    40 min longer must NOT be credited."""
+    v = [_viator_trip([_v_leg(route="Eurostar", dep="2026-07-13T08:10", arr="2026-07-13T10:06")])]
+    o = [_o_itin(legs=[_o_leg(route="Intercity", dep="2026-07-13T08:10", arr="2026-07-13T10:46")])]
+    score, tier = compute_alignment(v, o)
+    assert score == 0.0
+    assert tier == "no_overlap"
+
+
+def test_no_number_same_departure_and_span_matches() -> None:
+    v = [_viator_trip([_v_leg(route="Eurostar", dep="2026-07-13T08:10", arr="2026-07-13T10:06")])]
+    o = [_o_itin(legs=[_o_leg(route="Thalys", dep="2026-07-13T08:13", arr="2026-07-13T10:08")])]
+    score, _tier = compute_alignment(v, o)
+    assert score == 0.7
+
+
+# ───────── _first_train_number: digits, not brands ─────────
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("EUR 9322", "9322"),
+        ("RJ 1141", "1141"),
+        ("TGV 9582", "9582"),
+        ("RE 8235 (Train-No. 8235)", "8235"),
+        ("601A", "601"),
+        ("Eurostar", None),  # brand
+        ("Nahreisezug", None),  # product class
+        ("Sprinter", None),
+        ("", None),
+    ],
+)
+def test_first_train_number_extracts_digits_only(label: str, expected: str | None) -> None:
+    from app.network_coverage.alignment import _first_train_number
+
+    assert _first_train_number([{"route_short_name": label}]) == expected
+
+
+def test_transit_span_ignores_intermediate_legs_and_uses_spine_ends() -> None:
+    """Span is first-transit departure → last-transit arrival, so a
+    two-train itinerary is compared on the whole rail journey, not on
+    either leg alone."""
+    from app.network_coverage.alignment import _transit_span_seconds
+
+    legs = [
+        {"departure": "2026-07-13T09:48:00+00:00", "arrival": "2026-07-13T10:05:00+00:00"},
+        {"departure": "2026-07-13T10:12:00+00:00", "arrival": "2026-07-13T12:11:00+00:00"},
+    ]
+    assert _transit_span_seconds(legs) == (2 * 3600 + 23 * 60)

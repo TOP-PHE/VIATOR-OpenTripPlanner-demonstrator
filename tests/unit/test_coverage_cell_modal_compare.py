@@ -413,3 +413,37 @@ def test_no_operator_facing_copy_still_promises_tomorrow(template_text: str):
         "reference_date; create_run now anchors it on depart_at"
     )
     assert "(default: the Departure date)" in template_text
+
+
+# ───────── transit-span line (walk-inclusive header vs walk-stripped legs) ─────────
+# The card header shows door-to-door times. With "Show walk legs" off, the
+# walks vanish from the leg list but their minutes stay in the header, so an
+# OeBB itinerary reads "08:10 -> 10:48" above a single rail leg running
+# "08:10 -> 10:06" (HAFAS appends a 42-min egress walk at Bruxelles-Midi).
+# Rendering the train's own span removes the apparent contradiction, and it
+# is the same span alignment._transit_span_seconds scores on.
+
+
+def test_transit_span_helper_is_defined(template_text: str):
+    assert "function transitSpanLabel(legs, depKey, arrKey)" in template_text
+
+
+def test_transit_span_skips_walk_legs(template_text: str):
+    """The whole point: filter WALK out before taking first dep / last arr."""
+    fn_start = template_text.find("function transitSpanLabel(")
+    assert fn_start != -1
+    body = template_text[fn_start : fn_start + 900]
+    assert "!== 'WALK'" in body, "transitSpanLabel must exclude WALK legs"
+
+
+def test_transit_span_rendered_on_both_engine_cards(template_text: str):
+    """VIATOR legs carry `departure`/`arrival`; OeBB VerifyLegs carry
+    `dep_utc`/`arr_utc`. Both cards must render the span, with their own
+    field names — a single missing call silently reintroduces the
+    contradiction on one side only."""
+    assert "transitSpanLabel(trip.legs, 'departure', 'arrival')" in template_text
+    assert "transitSpanLabel(it.legs, 'dep_utc', 'arr_utc')" in template_text
+
+
+def test_transit_span_css_present(template_text: str):
+    assert ".cov-transit-span" in template_text

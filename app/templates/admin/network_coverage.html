@@ -315,6 +315,13 @@ main {
 .cov-trip-head { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; margin-bottom: 0.25rem; }
 .cov-trip-rank { font-weight: 600; color: var(--brand-blue); min-width: 1.8rem; }
 .cov-trip-duration { font-weight: 600; }
+/* The train's own span (walks excluded) — what the alignment scorer
+   actually compares. Rendered under the door-to-door header so hiding
+   walk legs can't make the header look like it contradicts the legs. */
+.cov-transit-span {
+  display: block; font-size: 0.74rem; color: var(--rail-steel);
+  margin: -0.1rem 0 0.3rem 0.1rem; font-variant-numeric: tabular-nums;
+}
 .cov-trip-legs { padding-left: 0.5rem; border-left: 2px solid #d0d7de; margin-left: 0.4rem; }
 /* First track is minmax(60px, max-content), not a fixed 60px: long mode
    names (REGIONAL_RAIL, LONG_DISTANCE) overflowed a fixed track and
@@ -1859,6 +1866,27 @@ function renderModalOebbColumn(itineraries) {
 // badges non-sequential (e.g. #7, #2, #9 top to bottom) against the
 // now-chronological list — using position keeps the badge matching
 // what's actually on screen.
+// The card header shows DOOR-TO-DOOR times (`departure_at`/`arrival_at`),
+// which include the access + egress walks. With "Show walk legs" off those
+// walks vanish from the leg list while the header keeps their minutes, so
+// the header appears to contradict the legs beneath it — an ÖBB itinerary
+// reads "08:10 → 10:48" above a single rail leg running "08:10 → 10:06",
+// because HAFAS appended a 42-minute egress walk that is no longer drawn.
+//
+// So render the TRAIN's own span too, whenever it differs. That's also the
+// span the alignment scorer compares (alignment._transit_span_seconds), so
+// what the operator reads is what the tier was computed from.
+function transitSpanLabel(legs, depKey, arrKey) {
+  const transit = (legs || []).filter(l => (l.mode || 'TRANSIT') !== 'WALK');
+  if (!transit.length) return '';
+  const dep = transit[0][depKey];
+  const arr = transit[transit.length - 1][arrKey];
+  if (!dep || !arr) return '';
+  const seconds = (new Date(arr) - new Date(dep)) / 1000;
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  return `<span class="cov-transit-span" title="First train's departure to last train's arrival — walks excluded. This is what the alignment score compares.">train ${fmtTime(dep)} → ${fmtTime(arr)} · ${escHTML(fmtDuration(seconds))}</span>`;
+}
+
 function renderModalViatorTripCard(trip, idx) {
   const legs = (trip.legs || []).map(renderModalLeg).join('');
   const transfers = fmtCount(trip.num_transfers, 'transfer');
@@ -1869,6 +1897,7 @@ function renderModalViatorTripCard(trip, idx) {
       <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
       <span class="hint">${escHTML(transfers)}</span>
     </div>
+    ${transitSpanLabel(trip.legs, 'departure', 'arrival')}
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
   </div>`;
 }
@@ -1891,6 +1920,7 @@ function renderModalOebbTripCard(it) {
       <span class="cov-trip-duration">${fmtDuration(it.duration_seconds)}</span>
       <span class="hint">${escHTML(transfers)}</span>
     </div>
+    ${transitSpanLabel(it.legs, 'dep_utc', 'arr_utc')}
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
   </div>`;
 }

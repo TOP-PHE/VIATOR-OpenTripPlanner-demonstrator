@@ -11,19 +11,42 @@ Scoring is hybrid by design:
      UIC-normalised fingerprint cross-engine dedup already uses on the
      federated planner). Exact hash match → credit 1.0.
 
-  2. **Fuzzy fallback** — for VIATOR trips that didn't exact-match,
-     find an ÖBB itinerary with the same (first_UIC, last_UIC) endpoint
-     pair AND the same first-transit-leg train-number (from HAFAS
-     ``prodL.name``, the operator-readable "RJ 1141" style label) AND a
-     departure time within ±5 minutes. Credit 0.7.
+  2. **Fuzzy fallback** — for VIATOR trips that didn't exact-match, find
+     an ÖBB itinerary whose first transit leg departs within ±5 minutes
+     and which is the same service by one of two rules:
 
-We deliberately do NOT have a tier weaker than the train-number-guarded
-fuzzy match. The next plausible signal — same endpoints + same minute
-without train-number agreement — produces a flood of false positives on
-high-frequency corridors (Paris-Lyon TGV departing every 30 min would
-auto-credit unrelated trains running in similar slots). On those
-corridors the operator's signal is the train *identity*, not the
-schedule overlap.
+       * both sides report a **numeric train number** (HAFAS ``prodL.name``
+         "RJ 1141" → ``1141``; ÖBB's "EUR 9322" → ``9322``) → the numbers
+         must agree; or
+       * at least one side reports **no** number (VIATOR's GTFS feed says
+         "Eurostar", a brand shared by every service on the corridor) →
+         the **transit-only spans** must agree within ±5 minutes.
+
+     Credit 0.7 either way.
+
+The train-number rule still blocks the high-frequency-corridor false
+positive: two Paris-Lyon TGVs departing 5 minutes apart carry different
+numbers, so they never auto-credit. The span rule only engages when no
+number is available on at least one side, and then requires agreement on
+*both* ends of the train's own journey — a much stronger claim than
+"same departure minute".
+
+Two things are deliberately NOT part of the match:
+
+  * **Endpoint identity.** Both engines were asked for the same
+    origin→destination hub pair by construction of the coverage cell, so
+    within a cell it discriminates nothing. Across engines it is actively
+    wrong: ``extract_uic`` scrapes the digits out of a HAFAS lid and calls
+    them a UIC, but ÖBB's ``L=4899427`` for Amsterdam Centraal is an
+    ÖBB-internal id, not that station's UIC (``8400058``). The namespaces
+    coincide only inside DACH — which is why the old endpoint guard looked
+    correct and silently rejected every cross-border pair.
+
+  * **Walk-inclusive durations.** ÖBB appends a 42-minute egress walk on
+    the Bruxelles-Midi hub (LocGeoPos snaps the coords to a stop away from
+    the platforms), so door-to-door times compare the engines' station
+    geocoding rather than their trains. Every comparison here runs on the
+    walk-stripped transit spine.
 
 Score normalisation::
 
@@ -52,13 +75,14 @@ keep the matrix legend scannable, not a per-percentile gradient:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..journey.signature import transit_fingerprint
-from .external_verify import VerifyItinerary, extract_uic
+from .external_verify import VerifyItinerary
 
 # `external_verify._hafas_time_to_utc_iso` persists VerifyLeg/VerifyItinerary
 # dep_utc/arr_utc as NAIVE Europe/Vienna wall-clock strings (the "_utc" name
@@ -75,8 +99,16 @@ _TIER_AGREE_MIN = 1.00
 _TIER_MOSTLY_MIN = 0.70
 _TIER_PARTIAL_MIN = 0.40
 _FUZZY_DEP_TOLERANCE_SECONDS = 5 * 60
+# Transit-only span tolerance, used ONLY when at least one side reports no
+# numeric train number. Same width as the departure tolerance: two services
+# that leave within 5 min AND arrive within 5 min of each other, on the
+# same hub pair, answer the operator's question identically.
+_FUZZY_SPAN_TOLERANCE_SECONDS = 5 * 60
 _FUZZY_CREDIT = 0.70
 _EXACT_CREDIT = 1.00
+# First digit-run of a route label: "EUR 9322" → 9322, "RJ 1141" → 1141.
+# A label with no digits ("Eurostar", "Sprinter") is a brand, not a number.
+_TRAIN_NUMBER_RE = re.compile(r"\d+")
 # Cap reward at 3 matches per side — see module docstring rationale.
 _SCORE_CAP_PER_SIDE = 3
 
@@ -191,28 +223,49 @@ def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
     ]
 
 
-def _endpoint_uics(transit_legs: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """First/last UIC of the transit-leg spine, for the fuzzy fallback
-    endpoint match. Returns (None, None) on an empty spine — caller
-    treats that as unmatchable."""
-    if not transit_legs:
-        return None, None
-    first = extract_uic(transit_legs[0].get("from_stop_id"))
-    last = extract_uic(transit_legs[-1].get("to_stop_id"))
-    return first, last
-
-
 def _first_train_number(transit_legs: list[dict[str, Any]]) -> str | None:
-    """Operator-readable train number of the first transit leg ("RJ 1141"
-    on HAFAS, "TGV 9582" on SNCF). Returns None when missing — fuzzy
-    fallback requires both sides to have one, so a missing number on
-    either side blocks the match (deliberate: see module docstring)."""
+    """The *numeric* train number of the first transit leg, or None.
+
+    "RJ 1141" → "1141", "EUR 9322" → "9322", "TGV 9582" → "9582".
+    A label carrying no digits at all ("Eurostar", "Nahreisezug",
+    "Sprinter") is NOT a train number — it's a brand or a product class
+    shared by every service on the corridor — so it returns None and the
+    caller falls back to a schedule-shaped comparison.
+
+    Previously this returned the whole label upper-cased, which turned the
+    fuzzy guard into a string-equality test between two different naming
+    systems: VIATOR's GTFS feed says "Eurostar" where ÖBB's HAFAS says
+    "EUR 9322". They never matched, so every cross-border service scored
+    `no_overlap` however well the two engines actually agreed.
+    """
     if not transit_legs:
         return None
     name = transit_legs[0].get("route_short_name") or transit_legs[0].get("route_long_name")
     if not name:
         return None
-    return str(name).strip().upper() or None
+    m = _TRAIN_NUMBER_RE.search(str(name))
+    return m.group(0) if m else None
+
+
+def _transit_span_seconds(transit_legs: list[dict[str, Any]]) -> float | None:
+    """Seconds from the first transit leg's departure to the last transit
+    leg's arrival — the journey as the *train* experiences it.
+
+    Deliberately excludes the access/egress walks that bracket a trip: the
+    two engines resolve the same hub to different stops and can produce
+    very different walks (ÖBB appends a 42-minute walk on the
+    Bruxelles-Midi hub, where LocGeoPos snaps the coords to a stop away
+    from the platforms). Comparing walk-inclusive door-to-door times would
+    judge the engines on their station geocoding, not on whether they
+    found the same train.
+    """
+    if not transit_legs:
+        return None
+    dep = _parse_iso_minute(transit_legs[0].get("departure"))
+    arr = _parse_iso_minute(transit_legs[-1].get("arrival"))
+    if dep is None or arr is None:
+        return None
+    return (arr - dep).total_seconds()
 
 
 def _parse_iso_minute(value: str | None) -> datetime | None:
@@ -236,25 +289,47 @@ def _first_transit_dep_dt(transit_legs: list[dict[str, Any]]) -> datetime | None
 
 def _is_fuzzy_candidate(
     o_legs: list[dict[str, Any]],
-    v_first: str,
-    v_last: str,
-    v_train: str,
+    v_train: str | None,
     v_dep: datetime,
+    v_span: float | None,
 ) -> bool:
-    """True iff `o_legs` matches the VIATOR side on (first_UIC, last_UIC)
-    endpoints AND first-transit-leg train number AND first-leg departure
-    within ±5 min. Extracted from `_fuzzy_match` so the outer function
-    stays under Sonar's cognitive-complexity ceiling — the cascade of
-    five `continue` checks was the bulk of its complexity."""
-    o_first, o_last = _endpoint_uics(o_legs)
-    if o_first != v_first or o_last != v_last:
-        return False
-    if _first_train_number(o_legs) != v_train:
-        return False
+    """True iff `o_legs` is the same physical service as the VIATOR spine.
+
+    Departure of the first transit leg must agree within ±5 min. Then:
+
+    * **both sides carry a numeric train number** → require agreement.
+      This is the strong signal, and it still blocks the high-frequency-
+      corridor false positive the module docstring warns about (two
+      Paris-Lyon TGVs 5 min apart have different numbers).
+    * **either side has no number** ("Eurostar" is a brand, not a train
+      number) → require the transit-only spans to agree within ±5 min.
+      Two *different* services leaving the same station within 5 minutes
+      of each other and arriving within 5 minutes of each other are, for
+      the operator's question ("does ÖBB confirm this service?"), the
+      same answer.
+
+    Endpoint identity is deliberately NOT checked. Both engines were asked
+    for the same origin→destination hub pair by construction of the
+    coverage cell, so within a cell it discriminates nothing — while
+    across engines it is actively wrong: `extract_uic` scrapes the digits
+    out of a HAFAS lid and calls them a UIC, but ÖBB's `L=4899427` for
+    Amsterdam Centraal is an ÖBB-internal id, not that station's UIC
+    (`8400058`). The two namespaces coincide only inside DACH, which is
+    why this guard appeared to work and silently rejected every
+    cross-border pair.
+    """
     o_dep = _first_transit_dep_dt(o_legs)
     if o_dep is None:
         return False
-    return abs((v_dep - o_dep).total_seconds()) <= _FUZZY_DEP_TOLERANCE_SECONDS
+    if abs((v_dep - o_dep).total_seconds()) > _FUZZY_DEP_TOLERANCE_SECONDS:
+        return False
+    o_train = _first_train_number(o_legs)
+    if v_train is not None and o_train is not None:
+        return v_train == o_train
+    o_span = _transit_span_seconds(o_legs)
+    if v_span is None or o_span is None:
+        return False
+    return abs(v_span - o_span) <= _FUZZY_SPAN_TOLERANCE_SECONDS
 
 
 def _fuzzy_match(
@@ -266,21 +341,18 @@ def _fuzzy_match(
     matched candidate's index (so the caller can mark it matched and
     avoid double-counting) or None.
 
-    Fuzzy match = same (first_UIC, last_UIC) endpoint pair AND same
-    first-transit-leg train number AND first-leg departure within
-    ±5 min. Either side missing a train number → no match (intentional;
-    see module docstring on the high-frequency-corridor false-positive
-    risk).
+    See `_is_fuzzy_candidate` for the rule. A VIATOR spine with no
+    parseable first-transit departure is unmatchable.
     """
-    v_first, v_last = _endpoint_uics(viator_legs)
     v_train = _first_train_number(viator_legs)
     v_dep = _first_transit_dep_dt(viator_legs)
-    if v_first is None or v_last is None or v_train is None or v_dep is None:
+    v_span = _transit_span_seconds(viator_legs)
+    if v_dep is None:
         return None
     for idx, o_legs in oebb_candidates:
         if idx in already_matched_oebb:
             continue
-        if _is_fuzzy_candidate(o_legs, v_first, v_last, v_train, v_dep):
+        if _is_fuzzy_candidate(o_legs, v_train, v_dep, v_span):
             return idx
     return None
 
