@@ -649,9 +649,12 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
             </label>
           </div>
           <p class="hint" style="margin: 0.4rem 0 0; font-size: 0.72rem">
-            Defaults: 00:00–24:00 UTC tomorrow. Override for morning-peak
-            (06:00–12:00), night-trains (18:00–06:00, cross-midnight), or
-            cross-TZ comparisons.
+            Defaults: 00:00–24:00 UTC on the Departure date. Override for
+            morning-peak (06:00–12:00), night-trains (18:00–06:00,
+            cross-midnight), or cross-TZ comparisons. A Reference date that
+            disagrees with the Departure date is rejected — the grid is
+            searched on one and every comparison anchors on the other, so
+            they must name the same day.
           </p>
         </details>
         <button type="submit" id="cov-go" style="width: 100%; margin-top: 0.4rem">Run coverage</button>
@@ -968,22 +971,21 @@ function buildRunStatsSubline(run) {
 }
 
 // The run's K-slot grid searched a different calendar day than its own
-// `depart_at` names. Only possible on runs created before create_run
-// started deriving `reference_date` from `depart_at` — back then it
-// defaulted to "tomorrow at create time", so the matrix answers a day
-// the operator never asked for. The numbers on such a run are real but
-// describe the wrong date; say so rather than let it pass as current.
-// The cell modal renders leg times as HH:MM with no date, which is
-// precisely why this went unnoticed for so long.
+// `depart_at` names. Reachable only on rows created before create_run
+// began anchoring `reference_date` on `depart_at`; new runs whose two
+// dates disagree are rejected at create time. The numbers on such a run
+// are real but describe the wrong date, so say so rather than let it pass
+// as current. Deliberately states only what is observable from the row —
+// it does not guess WHY the two dates diverged. The cell modal renders leg
+// times as HH:MM with no date, which is precisely why this went unnoticed.
 function buildRunWindowWarning(run) {
   if (!run.depart_at_outside_window) return '';
   const refDate = run.reference_date ? escHTML(run.reference_date) : 'a different day';
   const departDay = run.depart_at ? escHTML(String(run.depart_at).slice(0, 10)) : '(unknown)';
   return `<div class="cov-window-warning">⚠ This run searched <strong>${refDate}</strong>, not its
-    stated departure date <strong>${departDay}</strong> — its <code>reference_date</code> defaulted
-    to "tomorrow" instead of the departure day (fixed for new runs). The cell counts and itineraries
-    below are real, but they describe ${refDate}. Any ÖBB alignment score on this run compared the
-    two engines across different days and is not meaningful. Re-run to get results for
+    stated departure date <strong>${departDay}</strong>. The cell counts and itineraries below are
+    real, but they describe ${refDate}. Any ÖBB alignment score on this run compared the two engines
+    across different days and is not meaningful. Re-run to get results for
     ${departDay}.</div>`;
 }
 

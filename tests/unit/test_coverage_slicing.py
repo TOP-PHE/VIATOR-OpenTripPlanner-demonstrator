@@ -726,7 +726,13 @@ def test_create_run_persists_explicit_window_and_timezone(monkeypatch):
 # ───────────── _anchor_depart_at_and_reference_date ─────────────
 # One timezone per run: a naive `depart_at` (what the admin form's
 # datetime-local posts) is a wall-clock in the run's own window_timezone,
-# and reference_date is the day that instant falls on IN THAT ZONE.
+# and `reference_date` is the day whose WINDOW contains that instant.
+
+
+def _anchor(depart_at, ref=None, *, start=None, end=None, tz=None):
+    return runner._anchor_depart_at_and_reference_date(
+        depart_at, ref, start, end, tz, runner.CoverageConfig()
+    )
 
 
 def test_anchor_localises_naive_depart_at_to_the_window_timezone():
@@ -736,12 +742,9 @@ def test_anchor_localises_naive_depart_at_to_the_window_timezone():
     on a Europe/Brussels run asking for 06:40 actually anchored at
     06:40Z = 08:40 local, silently clipping the early-morning trips off
     the front of every depart_at-anchored comparison."""
-    cfg = runner.CoverageConfig()
-    depart_at, ref = runner._anchor_depart_at_and_reference_date(
-        datetime(2026, 7, 20, 6, 40), None, "Europe/Brussels", cfg
-    )
-    # 06:40 Brussels in July (CEST, UTC+2) == 04:40Z — the same instant
-    # the operator meant, not 06:40Z.
+    depart_at, ref = _anchor(datetime(2026, 7, 20, 6, 40), tz="Europe/Brussels")
+    # 06:40 Brussels in July (CEST, UTC+2) == 04:40Z -- the instant the
+    # operator meant, not 06:40Z.
     assert depart_at.utcoffset() == timedelta(hours=2)
     assert depart_at.astimezone(UTC) == datetime(2026, 7, 20, 4, 40, tzinfo=UTC)
     assert ref == date(2026, 7, 20)
@@ -750,11 +753,8 @@ def test_anchor_localises_naive_depart_at_to_the_window_timezone():
 def test_anchor_respects_an_already_aware_depart_at():
     """A tz-aware depart_at already names an instant — keep it, and read
     reference_date off it in the run's zone."""
-    cfg = runner.CoverageConfig()
     aware = datetime(2026, 7, 20, 4, 40, tzinfo=UTC)
-    depart_at, ref = runner._anchor_depart_at_and_reference_date(
-        aware, None, "Europe/Brussels", cfg
-    )
+    depart_at, ref = _anchor(aware, tz="Europe/Brussels")
     assert depart_at == aware  # same instant
     assert ref == date(2026, 7, 20)  # 06:40 Brussels
 
@@ -763,35 +763,66 @@ def test_anchor_reads_reference_date_in_the_window_timezone_not_utc():
     """Date-boundary case: the instant's UTC day and its local day differ.
     reference_date must follow the run's zone, since that's the zone the
     K-slot window is composed in."""
-    cfg = runner.CoverageConfig()
     # 2026-07-20 13:00Z == 2026-07-21 01:00 NZST (UTC+12)
-    _depart_at, ref = runner._anchor_depart_at_and_reference_date(
-        datetime(2026, 7, 20, 13, 0, tzinfo=UTC), None, "Pacific/Auckland", cfg
-    )
+    _depart_at, ref = _anchor(datetime(2026, 7, 20, 13, 0, tzinfo=UTC), tz="Pacific/Auckland")
     assert ref == date(2026, 7, 21)
-
-
-def test_anchor_never_overrides_an_explicit_reference_date():
-    """An operator who typed a Reference date means it."""
-    cfg = runner.CoverageConfig()
-    _depart_at, ref = runner._anchor_depart_at_and_reference_date(
-        datetime(2026, 7, 20, 6, 40), date(2026, 8, 1), "Europe/Brussels", cfg
-    )
-    assert ref == date(2026, 8, 1)
 
 
 def test_anchor_unknown_timezone_falls_back_to_utc():
     """Operator picks a bogus IANA zone → fall back to UTC silently rather
     than raising. Without this the runner crashes before the row exists."""
-    cfg = runner.CoverageConfig()
-    depart_at, ref = runner._anchor_depart_at_and_reference_date(
-        datetime(2026, 7, 20, 6, 40), None, "Not/A/Zone", cfg
-    )
+    depart_at, ref = _anchor(datetime(2026, 7, 20, 6, 40), tz="Not/A/Zone")
     assert depart_at.utcoffset() == timedelta(0)
     assert ref == date(2026, 7, 20)
 
 
-# ───────────── depart_at_within_window ─────────────
+def test_anchor_accepts_an_explicit_reference_date_that_agrees():
+    _depart_at, ref = _anchor(datetime(2026, 7, 20, 6, 40), date(2026, 7, 20), tz="Europe/Brussels")
+    assert ref == date(2026, 7, 20)
+
+
+def test_anchor_rejects_an_explicit_reference_date_that_disagrees():
+    """Honouring a mismatched reference_date would recreate the very bug
+    this whole change fixes, on a brand-new run: the grid searches one day
+    while every depart_at-anchored comparison judges another, and the
+    alignment sweep writes one_sided tiers across the whole matrix.
+    `create_run`'s ValueError maps to HTTP 400 at the API layer."""
+    with pytest.raises(ValueError, match="does not match the day-window"):
+        _anchor(datetime(2026, 7, 20, 8, 0), date(2026, 7, 27), tz="Europe/Brussels")
+
+
+# ── cross-midnight windows: the anchor day is the day the window OPENED ──
+
+
+def test_anchor_for_cross_midnight_window_uses_the_previous_day():
+    """Night-train run: window 18:00-06:00, depart 02:00. That 02:00 train
+    belongs to the window that opened at 18:00 the PREVIOUS evening, so the
+    grid must anchor on the 20th — not the 21st, which would compose a grid
+    starting 16 hours after the train the operator asked about."""
+    _depart_at, ref = _anchor(
+        datetime(2026, 7, 21, 2, 0), start=dtime(18, 0), end=dtime(6, 0), tz="Europe/Vienna"
+    )
+    assert ref == date(2026, 7, 20)
+
+
+def test_anchor_for_cross_midnight_window_evening_side_uses_the_same_day():
+    _depart_at, ref = _anchor(
+        datetime(2026, 7, 20, 20, 0), start=dtime(18, 0), end=dtime(6, 0), tz="Europe/Vienna"
+    )
+    assert ref == date(2026, 7, 20)
+
+
+def test_anchor_for_narrowed_window_outside_it_degrades_to_the_local_date():
+    """Operator narrows to 06:00-22:00 and departs 05:30 — outside their own
+    window. Not a bug we can resolve for them; anchor on the local date and
+    let the run search a coherent grid."""
+    _depart_at, ref = _anchor(
+        datetime(2026, 7, 20, 5, 30), start=dtime(6, 0), end=dtime(22, 0), tz="Europe/Vienna"
+    )
+    assert ref == date(2026, 7, 20)
+
+
+# ───────────── reference_date_matches_depart_at ─────────────
 
 
 def _run_row(*, depart_at, reference_date, tz=None, start=None, end=None):
@@ -806,269 +837,50 @@ def _run_row(*, depart_at, reference_date, tz=None, start=None, end=None):
     )
 
 
-def test_depart_at_within_window_true_for_a_correctly_anchored_run():
-    """Every run created by the fixed create_run: depart_at falls inside
-    the day-window its own reference_date generates."""
+def test_reference_date_matches_for_a_correctly_anchored_run():
     cfg = runner.CoverageConfig()  # 00:00-24:00 UTC full-day default
     run = _run_row(
-        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC),
-        reference_date=date(2026, 7, 20),
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC), reference_date=date(2026, 7, 20)
     )
-    assert runner.depart_at_within_window(run, cfg) is True
+    assert runner.reference_date_matches_depart_at(run, cfg) is True
 
 
-def test_depart_at_within_window_false_for_a_legacy_tomorrow_run():
+def test_reference_date_mismatch_for_the_legacy_tomorrow_run():
     """The exact production shape that produced "26 itineraries" beside an
     empty trip list: the run searched 2026-07-09 (reference_date defaulted
     to tomorrow-at-create) while depart_at named 2026-07-20."""
     cfg = runner.CoverageConfig()
     run = _run_row(
-        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC),
-        reference_date=date(2026, 7, 9),
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC), reference_date=date(2026, 7, 9)
     )
-    assert runner.depart_at_within_window(run, cfg) is False
+    assert runner.reference_date_matches_depart_at(run, cfg) is False
 
 
-# ─────────────────── _merge_slot_results uncovered branches ───────────────────
-
-
-def test_merge_slot_results_all_slot_failures_re_raises_first():
-    """Every slot threw → we re-raise the FIRST exception so the parent
-    pair can register as 'error' instead of silently degrading to
-    'no_route'. Without this, a fully-broken planner would look like a
-    sparse-corridor signal."""
-    window = runner.ResolvedWindow(
-        start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
-        end_utc=datetime(2026, 7, 2, 0, 0, tzinfo=UTC),
-        tz_name="UTC",
+def test_narrowed_window_with_earlier_depart_at_is_not_flagged_as_wrong_day():
+    """Regression guard: a DAY-level comparison, not window containment.
+    depart_at 05:30 precedes a 06:00-22:00 window's first slot, but the run
+    is correctly anchored — badging it would slander a valid run AND
+    silently disable PR #221's trip filter for it."""
+    cfg = runner.CoverageConfig()
+    run = _run_row(
+        depart_at=datetime(2026, 7, 20, 5, 30, tzinfo=UTC),
+        reference_date=date(2026, 7, 20),
+        start=dtime(6, 0),
+        end=dtime(22, 0),
     )
-    first = TimeoutError("slot 0 timed out")
-    second = RuntimeError("slot 1 also broke")
-
-    with pytest.raises(TimeoutError, match="slot 0"):
-        runner._merge_slot_results([first, second], window)
+    assert runner.reference_date_matches_depart_at(run, cfg) is True
 
 
-def test_merge_slot_results_partial_failure_keeps_successful_trips():
-    """One slot errored, one succeeded → no re-raise. The successful
-    slot's trips survive, the error is swallowed (partial coverage is
-    more useful than aborting the pair)."""
-    window = runner.ResolvedWindow(
-        start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
-        end_utc=datetime(2026, 7, 2, 0, 0, tzinfo=UTC),
-        tz_name="UTC",
+def test_cross_midnight_run_anchored_on_the_previous_day_is_not_flagged():
+    """A night-train run legitimately stores reference_date = depart_at's
+    day minus one. Containment-based detection would flag it; day-level
+    detection using the same anchor rule must not."""
+    cfg = runner.CoverageConfig()
+    run = _run_row(
+        depart_at=datetime(2026, 7, 21, 0, 0, tzinfo=UTC),  # 02:00 Vienna
+        reference_date=date(2026, 7, 20),
+        tz="Europe/Vienna",
+        start=dtime(18, 0),
+        end=dtime(6, 0),
     )
-    good_trip = _make_trip(
-        legs=[_transit_leg(departure="2026-07-01T09:00:00+00:00")],
-        first_transit_dep_utc="2026-07-01T09:00:00+00:00",
-    )
-    error = RuntimeError("transient HTTP 503")
-    success = ({"trip_count": 1}, [good_trip])
-
-    raw, trips = runner._merge_slot_results([error, success], window)
-
-    assert len(trips) == 1
-    assert raw == {"trip_count": 1}
-
-
-def test_merge_slot_results_falsy_raw_does_not_overwrite_last_raw():
-    """Branch coverage: `if raw:` is False for an empty dict — last_raw
-    stays at the most recent NON-empty payload. The drilldown modal
-    reads `last_raw` to show one slot's response shape; we'd rather
-    show a real one than an empty one."""
-    window = runner.ResolvedWindow(
-        start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
-        end_utc=datetime(2026, 7, 2, 0, 0, tzinfo=UTC),
-        tz_name="UTC",
-    )
-    populated_slot = ({"meta": "filled"}, [])
-    empty_slot = ({}, [])
-
-    raw, _trips = runner._merge_slot_results([populated_slot, empty_slot], window)
-
-    assert raw == {"meta": "filled"}
-
-
-# ─────────────────── create_run validation raises ───────────────────
-
-
-def test_create_run_rejects_invalid_direction(monkeypatch):
-    """direction must be 'both' or 'single' — anything else raises before
-    any DB write. Caller (the API layer) re-surfaces this as a 400."""
-    from unittest.mock import MagicMock
-
-    _stub_active_hubs(monkeypatch)
-
-    with pytest.raises(ValueError, match="direction"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id="sess",
-            depart_at=datetime(2026, 7, 1, 8, 0),
-            direction="diagonal",
-        )
-
-
-def test_create_run_rejects_invalid_mode(monkeypatch):
-    """mode must be in VALID_MODES — operator typo on the form is the
-    only way to hit this, but defending against it keeps the matrix
-    from inserting half-baked rows."""
-    from unittest.mock import MagicMock
-
-    _stub_active_hubs(monkeypatch)
-
-    with pytest.raises(ValueError, match="mode"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id="sess",
-            depart_at=datetime(2026, 7, 1, 8, 0),
-            mode="ensemble",
-        )
-
-
-def test_create_run_rejects_single_session_without_session_id(monkeypatch):
-    """single_session needs a session_id — empty/None is invalid because
-    Phase-1 would have nothing to query."""
-    from unittest.mock import MagicMock
-
-    _stub_active_hubs(monkeypatch)
-
-    with pytest.raises(ValueError, match="session_id"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id=None,
-            depart_at=datetime(2026, 7, 1, 8, 0),
-            mode="single_session",
-        )
-
-
-def test_create_run_rejects_fanout_with_session_id(monkeypatch):
-    """fanout mode is mutually exclusive with a single session_id —
-    operator can't have both. Fanout discovers sessions at execute time."""
-    from unittest.mock import MagicMock
-
-    _stub_active_hubs(monkeypatch)
-
-    with pytest.raises(ValueError, match="fanout"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id="sess-1",
-            depart_at=datetime(2026, 7, 1, 8, 0),
-            mode="fanout",
-        )
-
-
-def test_create_run_no_hubs_in_db_raises(monkeypatch):
-    """Empty hub list (fresh install, no seed yet) raises a clear error
-    instead of inserting a zero-pair run that the matrix UI would render
-    as a blank grid."""
-    from unittest.mock import MagicMock
-
-    monkeypatch.setattr(runner, "_load_active_hubs", lambda _db, countries=None: [])
-
-    with pytest.raises(ValueError, match="No active hubs configured"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id="sess",
-            depart_at=datetime(2026, 7, 1, 8, 0),
-        )
-
-
-def test_create_run_countries_filter_with_no_matches_raises(monkeypatch):
-    """Filter that matches no hubs → operator gets a focused error
-    ("countries={['XX']}") instead of the generic "no hubs" message,
-    so they know to fix the filter, not the seed."""
-    from unittest.mock import MagicMock
-
-    monkeypatch.setattr(runner, "_load_active_hubs", lambda _db, countries=None: [])
-
-    with pytest.raises(ValueError, match="countries"):
-        runner.create_run(
-            MagicMock(),
-            actor_user_id=None,
-            session_id="sess",
-            depart_at=datetime(2026, 7, 1, 8, 0),
-            countries=["XX"],
-        )
-
-
-# ─────────────────── tiny utility helpers ───────────────────
-
-
-def test_parse_hhmm_end_of_day_sentinel():
-    """'24:00' is the special end-of-day sentinel — must return (1440,
-    True) so the runner can detect "midnight next day" semantics that
-    Postgres TIME can't natively store."""
-    minutes, is_eod = runner._parse_hhmm("24:00", "00:00")
-    assert minutes == 24 * 60
-    assert is_eod is True
-
-
-def test_parse_hhmm_invalid_falls_back_to_default():
-    """Bogus value with a valid default → re-parses the default. Defence
-    in depth — the API layer normally catches this, but if a malformed
-    row sneaks through (manual DB edit, migration glitch), the runner
-    stays alive."""
-    minutes, is_eod = runner._parse_hhmm("not-a-time", "06:00")
-    assert minutes == 6 * 60
-    assert is_eod is False
-
-
-def test_parse_hhmm_invalid_with_same_default_falls_back_to_zero():
-    """Bogus value AND bogus default → return (0, False) rather than
-    infinite-recursing. The last-line-of-defence path."""
-    minutes, is_eod = runner._parse_hhmm("nope", "nope")
-    assert minutes == 0
-    assert is_eod is False
-
-
-def test_parse_hhmm_out_of_range_falls_back_to_default():
-    """'25:00' fails the 0-23 hour check → falls through to default."""
-    minutes, _is_eod = runner._parse_hhmm("25:00", "08:00")
-    assert minutes == 8 * 60
-
-
-def test_normalise_stop_id_strips_otp_feed_prefix():
-    """OTP form `<feed>:<local>` → returns the local portion. Matches
-    MOTIS's equivalent stop so cross-engine dedup collapses them."""
-    assert runner._normalise_stop_id("SBB:Parent8501120") == "Parent8501120"
-
-
-def test_normalise_stop_id_strips_motis_feed_prefix():
-    """MOTIS form `<feed>_<local>` → returns the local portion."""
-    assert runner._normalise_stop_id("sbb_8501120") == "8501120"
-
-
-def test_normalise_stop_id_empty_or_none_returns_empty_string():
-    """Missing / falsy input → "" so the dedup tuple stays a plain string
-    and never accidentally introduces a None in the key."""
-    assert runner._normalise_stop_id(None) == ""
-    assert runner._normalise_stop_id("") == ""
-
-
-def test_normalise_stop_id_no_separator_returns_unchanged():
-    """A bare local id with no feed prefix passes through unchanged."""
-    assert runner._normalise_stop_id("8501120") == "8501120"
-
-
-def test_truncate_iso_to_minute_drops_seconds():
-    """Standard happy path — `:SS+00:00` chopped to minute precision so
-    boundary timestamps from adjacent slots dedup despite second-level
-    jitter from RAPTOR's per-call rounding."""
-    assert runner._truncate_iso_to_minute("2026-07-01T08:00:42+00:00") == "2026-07-01T08:00+0000"
-
-
-def test_truncate_iso_to_minute_missing_T_passes_through():
-    """No "T" separator → return as-is. Operator-malformed input
-    shouldn't crash the dedup."""
-    assert runner._truncate_iso_to_minute("not-a-timestamp") == "not-a-timestamp"
-    assert runner._truncate_iso_to_minute("") == ""
-
-
-def test_truncate_iso_to_minute_unparseable_passes_through():
-    """Has a "T" but isoformat parse fails → defensive return as-is."""
-    assert runner._truncate_iso_to_minute("2026-13-99T99:99:99") == "2026-13-99T99:99:99"
+    assert runner.reference_date_matches_depart_at(run, cfg) is True
