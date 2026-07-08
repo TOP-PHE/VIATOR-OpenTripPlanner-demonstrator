@@ -230,11 +230,11 @@ async def test_query_hafas_reference_returns_ok_with_trips_on_success():
     fake_raw = {"status": "ok", "format": "hafas-mgate", "response_ms": 123}
     fake_fetch = AsyncMock(return_value=(fake_raw, fake_trips))
 
-    cfg = {"HAFAS_TIMEOUT_MS": 10_000}
+    cfg = {"HAFAS_TIMEOUT_MS": 10_000, "OTP_SEARCH_WINDOW_SECONDS": 21_600}
     from datetime import UTC, datetime
 
     when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
-    with patch("app.api.journey.hafas_client.fetch_plan", fake_fetch):
+    with patch("app.api.journey.hafas_client.fetch_plan_paginated", fake_fetch):
         result = await _query_hafas_reference(cfg, body, when)
     assert result["status"] == "ok"
     assert result["trips"] == fake_trips
@@ -256,8 +256,10 @@ async def test_query_hafas_reference_surfaces_no_route_status():
     from datetime import UTC, datetime
 
     when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
-    with patch("app.api.journey.hafas_client.fetch_plan", fake_fetch):
-        result = await _query_hafas_reference({"HAFAS_TIMEOUT_MS": 10_000}, body, when)
+    with patch("app.api.journey.hafas_client.fetch_plan_paginated", fake_fetch):
+        result = await _query_hafas_reference(
+            {"HAFAS_TIMEOUT_MS": 10_000, "OTP_SEARCH_WINDOW_SECONDS": 21_600}, body, when
+        )
     assert result["status"] == "no_route"
     assert result["trips"] == []
 
@@ -276,8 +278,10 @@ async def test_query_hafas_reference_surfaces_error_with_message():
     from datetime import UTC, datetime
 
     when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
-    with patch("app.api.journey.hafas_client.fetch_plan", fake_fetch):
-        result = await _query_hafas_reference({"HAFAS_TIMEOUT_MS": 10_000}, body, when)
+    with patch("app.api.journey.hafas_client.fetch_plan_paginated", fake_fetch):
+        result = await _query_hafas_reference(
+            {"HAFAS_TIMEOUT_MS": 10_000, "OTP_SEARCH_WINDOW_SECONDS": 21_600}, body, when
+        )
     assert result["status"] == "error"
     assert result["error"] == "backend down"
 
@@ -300,8 +304,10 @@ async def test_query_hafas_reference_never_raises_on_httpx_error():
     from datetime import UTC, datetime
 
     when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
-    with patch("app.api.journey.hafas_client.fetch_plan", fake_fetch):
-        result = await _query_hafas_reference({"HAFAS_TIMEOUT_MS": 10_000}, body, when)
+    with patch("app.api.journey.hafas_client.fetch_plan_paginated", fake_fetch):
+        result = await _query_hafas_reference(
+            {"HAFAS_TIMEOUT_MS": 10_000, "OTP_SEARCH_WINDOW_SECONDS": 21_600}, body, when
+        )
     assert result["status"] == "error"
     assert "HAFAS request failed" in result["error"]
 
@@ -322,7 +328,9 @@ async def test_query_hafas_reference_never_raises_on_timeout():
     from datetime import UTC, datetime
 
     when = datetime(2026, 6, 28, 8, 0, 0, tzinfo=UTC)
-    with patch("app.api.journey.hafas_client.fetch_plan", fake_fetch):
-        result = await _query_hafas_reference({"HAFAS_TIMEOUT_MS": 10_000}, body, when)
+    with patch("app.api.journey.hafas_client.fetch_plan_paginated", fake_fetch):
+        result = await _query_hafas_reference(
+            {"HAFAS_TIMEOUT_MS": 10_000, "OTP_SEARCH_WINDOW_SECONDS": 21_600}, body, when
+        )
     assert result["status"] == "timeout"
     assert result["trips"] == []

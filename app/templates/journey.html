@@ -28,6 +28,21 @@
 .flag.NAP-ONLY   { background: #fdecef; color: #b30021; }
 .flag.MERITS-ONLY{ background: #e8f0fb; color: #1C75BC; }
 .flag.SUBSET     { background: #fff8e1; color: #b3760e; }
+/* v0.1.45 — "possible duplicate" badge. MOTIS occasionally reports a
+   single physically-coupled service (e.g. SNCF's "601" + "601A"
+   portions, split for part of the journey but one driver/consist) as
+   two separate itineraries sharing the exact same departure/arrival.
+   No block_id or trip-composition data is available anywhere in the
+   pipeline to confirm coupling programmatically, so this is a same-
+   engine heuristic flag on the SECOND (and later) occurrence of an
+   exact (departure_at, arrival_at) pair — not a claim, just a nudge
+   for the operator to look closer. Same amber palette as the ÖBB
+   train-mismatch note (compare_grid.css) for visual consistency
+   between the two "verify me" signals. */
+.dup-badge {
+  font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600;
+  background: #fff8e6; color: #6b5416; border: 1px solid #f0c674; white-space: nowrap;
+}
 .timing-strip { display:flex; gap: 1rem; flex-wrap: wrap; padding: 0.6rem; background: #eef2f8; border-radius: 4px; font-size: 0.8rem; color: var(--rail-steel); margin-bottom: 0.6rem; }
 .station-input { position: relative; }
 .suggestions { position: absolute; left: 0; right: 0; top: 100%; background: #fff; border: 1px solid var(--sleeper); border-top: none; max-height: 220px; overflow-y: auto; z-index: 10; display: none; }
@@ -1299,11 +1314,33 @@ function _viatorColumnLabel(payload) {
   return 'VIATOR · MOTIS / OTP';
 }
 
+// v0.1.45 — same-engine "possible duplicate" detector. Flags every
+// trip whose (departure_at, arrival_at) pair was already seen earlier
+// in the list — a coupled/portioned train (same physical service,
+// e.g. SNCF "601" + "601A") can show up as two independent MOTIS
+// itineraries with identical start/end times. There's no block_id or
+// trip-composition field anywhere in the pipeline to confirm the two
+// are actually one train, so this is deliberately a display-only
+// nudge on the SECOND+ occurrence, not a merge/dedup of the data.
+function _duplicateDepartureArrivalIndices(trips) {
+  const seen = new Set();
+  const dupIndices = new Set();
+  (trips || []).forEach((t, i) => {
+    const key = `${t.best.departure_at}|${t.best.arrival_at}`;
+    if (seen.has(key)) {
+      dupIndices.add(i);
+    } else {
+      seen.add(key);
+    }
+  });
+  return dupIndices;
+}
+
 // v0.1.44 — VIATOR trip card markup, extracted out of render()'s
 // inline builder so renderViatorOebbPairedGrid() below can render one
 // card at a time (paired-grid rows interleave VIATOR and ÖBB cards) --
 // same markup, same behaviour, single source of truth.
-function _viatorTripCardHtml(t, i) {
+function _viatorTripCardHtml(t, i, isDuplicate) {
   const flag = t.origin_flag.replace('_', '-');
   const legCount = t.best.legs.length;
   const tripOps = operatorsForTrip(t.best.legs);
@@ -1311,6 +1348,9 @@ function _viatorTripCardHtml(t, i) {
   // 'common' / 'otp_only' / 'uncomparable', set server-side. Empty
   // string when comparison wasn't run (no OJP opt-in).
   const cmp = comparisonPill(t.comparison);
+  const dupBadge = isDuplicate
+    ? `<span class="dup-badge" title="Another itinerary in this list departs and arrives at the exact same time — possibly the same physical service (e.g. a coupled/portioned train) listed twice.">⚠ possible duplicate</span>`
+    : '';
   return `<div class="trip-card" data-trip-index="${i}">
     <div class="top">
       <div><strong>${fmt(t.best.departure_at)} → ${fmt(t.best.arrival_at)}</strong>
@@ -1320,6 +1360,7 @@ function _viatorTripCardHtml(t, i) {
         <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
                 title="Show OTP JSON for this itinerary">{}</button>
         ${cmp}
+        ${dupBadge}
         <span class="flag ${flag}">${t.origin_flag}</span>
       </div>
     </div>
@@ -1446,13 +1487,14 @@ function renderViatorOebbPairedGrid(payload) {
   const viatorTrips = payload.trips || [];
   const oebbTrips = (payload.hafas_reference && payload.hafas_reference.trips) || [];
   const rows = _pairViatorAndOebbTrips(viatorTrips, oebbTrips);
+  const dupIndices = _duplicateDepartureArrivalIndices(viatorTrips);
   // Both sides genuinely found nothing (a valid, empty 'ok' response is
   // not an error) — say so explicitly instead of rendering two bare
   // column headers with no body, which reads as a broken page.
   const body = rows.length
     ? rows.map((row) => {
         const vCell = row.viator
-          ? `<div class="compare-cell present">${_viatorTripCardHtml(row.viator, row.viatorIndex)}</div>`
+          ? `<div class="compare-cell present">${_viatorTripCardHtml(row.viator, row.viatorIndex, dupIndices.has(row.viatorIndex))}</div>`
           : _pairedGridMissingCell('VIATOR');
         const oCell = row.oebb
           ? `<div class="compare-cell present">${_oebbTripCardHtml(row.oebb)}</div>`
@@ -1554,7 +1596,10 @@ function render(payload) {
   // column list whenever only one engine type ran (single-engine
   // fanout, or one of the engines errored out for every session).
   const comparisonGrid = _shouldRenderComparison(payload) ? renderComparisonGrid(payload) : '';
-  const cards = comparisonGrid ? '' : payload.trips.map((t, i) => _viatorTripCardHtml(t, i)).join('');
+  const _dupIndices = _duplicateDepartureArrivalIndices(payload.trips);
+  const cards = comparisonGrid
+    ? ''
+    : payload.trips.map((t, i) => _viatorTripCardHtml(t, i, _dupIndices.has(i))).join('');
   // v0.1.36 — Phase 2 comparison summary strip. Rendered above the
   // result cards when OJP comparison was opted in AND succeeded. The
   // three pills count distinct itinerary fingerprints (within-engine
