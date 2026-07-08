@@ -454,9 +454,48 @@ def test_comparable_depart_at_degrades_to_none_when_the_window_cannot_be_resolve
     def _boom(_run, _cfg):
         raise ValueError("bad window")
 
-    monkeypatch.setattr(runner, "depart_at_within_window", _boom)
+    monkeypatch.setattr(runner, "reference_date_matches_depart_at", _boom)
     run = _window_run_row(
         depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC), reference_date=date(2026, 7, 20)
     )
 
     assert api._comparable_depart_at(MagicMock(), run) is None
+
+
+# ─────────── depart_at is displayed in the run's own timezone ───────────
+# `depart_at` is persisted as an instant; psycopg hands it back in UTC.
+# Echoing that verbatim showed a Europe/Brussels operator "04:40" for the
+# 06:40 they typed — the run header, sidebar, export report and journey
+# deep-link all read this one field.
+
+
+def test_depart_at_local_iso_renders_the_run_timezone_wall_clock(monkeypatch):
+    from datetime import UTC, date, datetime
+
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import runner
+
+    run = _window_run_row(
+        depart_at=datetime(2026, 7, 20, 4, 40, tzinfo=UTC),  # 06:40 Brussels
+        reference_date=date(2026, 7, 20),
+        tz="Europe/Brussels",
+    )
+    iso = api._depart_at_local_iso(run, runner.CoverageConfig())
+    assert iso.startswith("2026-07-20T06:40:00")
+    assert iso.endswith("+02:00")
+
+
+def test_depart_at_local_iso_falls_back_to_utc_on_a_bad_zone(monkeypatch):
+    from datetime import UTC, date, datetime
+
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import runner
+
+    def _boom(_tz, _cfg):
+        raise ValueError("bad zone")
+
+    monkeypatch.setattr(runner, "_resolve_timezone", _boom)
+    run = _window_run_row(
+        depart_at=datetime(2026, 7, 20, 4, 40, tzinfo=UTC), reference_date=date(2026, 7, 20)
+    )
+    assert api._depart_at_local_iso(run, runner.CoverageConfig()).startswith("2026-07-20T04:40:00")
