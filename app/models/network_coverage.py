@@ -177,9 +177,21 @@ class NetworkCoverageRun(Base):
     window_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Calendar day (in window_timezone) on which the K time-slots are
-    # anchored. NULL = "tomorrow at run-create time in window_timezone"
-    # — resolved by `runner.create_run` so the persisted depart_at and
-    # the reference_date stay consistent on the row.
+    # anchored — the day the run's searches ACTUALLY execute against,
+    # since `_resolve_run_window` composes the slot grid from this column
+    # and never from `depart_at`.
+    #
+    # Resolved by `runner._anchor_depart_at_and_reference_date` at
+    # create time: when the operator leaves it blank it defaults to the
+    # calendar day of `depart_at`, read in `window_timezone`, so the
+    # persisted `depart_at` and `reference_date` stay consistent on the
+    # row. Until that helper landed this comment described an intent the
+    # code never implemented — the default was "tomorrow at run-create
+    # time", so a run could (and routinely did) search a completely
+    # different day than its own `depart_at`, silently invalidating every
+    # depart_at-anchored comparison downstream. Rows written before the
+    # fix still carry the old default; the admin API badges them via
+    # `RunSummary.depart_at_outside_window`.
     reference_date: Mapped[date | None] = mapped_column(Date(), nullable=True)
 
 

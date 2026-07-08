@@ -385,3 +385,78 @@ def test_get_cell_trips_response_serialises_return_under_return_key():
     assert payload["return"]["origin_hub_id"] == "B"
     # And the Python attribute name is NOT leaked to the wire.
     assert "return_" not in payload
+
+
+# ─────────── _comparable_depart_at — the wrong-day guard ───────────
+# `_fetch_trips_by_search` filters `JourneyTrip.departure_at >= depart_at`
+# (PR #221). But the K-slot grid a run searched is composed from
+# `reference_date`, never from `depart_at`. On runs created before
+# `runner._anchor_depart_at_and_reference_date`, reference_date defaulted
+# to "tomorrow at create time", so the two named different calendar days
+# and the predicate matched ZERO of the run's own trips — the modal showed
+# "26 itineraries" beside "no itineraries found".
+
+
+def _window_run_row(*, depart_at, reference_date, tz=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        depart_at=depart_at,
+        reference_date=reference_date,
+        window_timezone=tz,
+        window_start_local=None,
+        window_end_local=None,
+    )
+
+
+def test_comparable_depart_at_returns_depart_at_when_run_searched_that_day(monkeypatch):
+    """A correctly-anchored run: the filter must fire, preserving PR #221."""
+    from datetime import UTC, date, datetime
+
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import runner
+
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: runner.CoverageConfig())
+    depart_at = datetime(2026, 7, 20, 6, 40, tzinfo=UTC)
+    run = _window_run_row(depart_at=depart_at, reference_date=date(2026, 7, 20))
+
+    assert api._comparable_depart_at(MagicMock(), run) == depart_at
+
+
+def test_comparable_depart_at_returns_none_for_a_legacy_wrong_day_run(monkeypatch):
+    """The production shape. depart_at names 2026-07-20 but the run
+    searched 2026-07-09, so depart_at is not a usable anchor: fall back to
+    the unfiltered, rank-ordered list instead of rendering nothing."""
+    from datetime import UTC, date, datetime
+
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import runner
+
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: runner.CoverageConfig())
+    run = _window_run_row(
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC), reference_date=date(2026, 7, 9)
+    )
+
+    assert api._comparable_depart_at(MagicMock(), run) is None
+
+
+def test_comparable_depart_at_degrades_to_none_when_the_window_cannot_be_resolved(monkeypatch):
+    """A window calc that blows up must never 500 the modal, and must not
+    silently hide trips — treat depart_at as unusable."""
+    from datetime import UTC, date, datetime
+
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import runner
+
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: runner.CoverageConfig())
+
+    def _boom(_run, _cfg):
+        raise ValueError("bad window")
+
+    monkeypatch.setattr(runner, "depart_at_within_window", _boom)
+    run = _window_run_row(
+        depart_at=datetime(2026, 7, 20, 6, 40, tzinfo=UTC), reference_date=date(2026, 7, 20)
+    )
+
+    assert api._comparable_depart_at(MagicMock(), run) is None
