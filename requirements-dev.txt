@@ -12,12 +12,12 @@ pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.15.20               # also our formatter — black was dropped in audit
+ruff==0.15.21               # also our formatter — black was dropped in audit
                             # #21 closure (drop-in replacement, eliminates
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
                             # once black is removed.
-mypy==2.1.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
+mypy==2.2.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
 
 # Security
 bandit==1.9.4
