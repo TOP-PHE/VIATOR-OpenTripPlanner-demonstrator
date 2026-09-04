@@ -150,21 +150,20 @@ jobs:
           tags: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
-          # Attestations OFF for the scan build.
+          # Attestations OFF for the scan build — defence in depth, not a fix.
           #
-          # build-push-action attaches a buildx-generated SBOM/provenance
-          # attestation by default. Trivy PREFERS an embedded SBOM over walking
-          # the filesystem — it says so in the log: "Third-party SBOM may lead to
-          # inaccurate vulnerability detection". Combined with `cache-from`, that
-          # SBOM can describe cached layer contents rather than what was actually
-          # just built, so Trivy reports versions the image does not contain.
+          # build-push-action attaches a buildx SBOM/provenance attestation by
+          # default. That was NOT the cause of the 2026-09-04 scan mismatch (the
+          # culprit was pip's vendored SBOM inside the image — see the Trivy step
+          # below), and turning these off did not resolve it.
           #
-          # Seen on 2026-09-04: the build installed setuptools 84.0.0 and msgpack
-          # 1.2.2, the scanned-file listing showed exactly those, and the findings
-          # table still reported 70.3.0 / 1.1.2 from the stale attestation.
+          # They stay off anyway: Trivy prefers ANY embedded SBOM over walking the
+          # filesystem, so an attestation is a second way to reintroduce exactly
+          # the same class of bug. A scan build should describe itself as little
+          # as possible and let the scanner look.
           #
           # Nothing is lost: the real SBOM is generated separately below by
-          # anchore/sbom-action, from this same loaded image.
+          # anchore/sbom-action from this same loaded image.
           provenance: false
           sbom: false
           # Stamp the web image with the release version so the UI badge +
@@ -215,27 +214,38 @@ jobs:
       # exit-code, and the table doubles as the diagnostic readout. Do NOT
       # pass `output:` here — it would redirect the table to a file and
       # silence the log, which defeats the diagnostic purpose.
-      # Second skip-list entry, `**/dist-info/sboms/**` — read this before removing it.
+      # The two SBOM entries in skip-files below — read this before removing them.
       #
-      # Modern wheels ship a PEP 770 SBOM at `<pkg>.dist-info/sboms/*.json`
-      # describing that wheel's BUILD/BUNDLED dependencies. Trivy treats an
-      # embedded SBOM as authoritative for the whole language ecosystem and stops
-      # trusting the filesystem — it logs "Third-party SBOM may lead to inaccurate
-      # vulnerability detection", reports `Number of language-specific files: num=1`,
-      # and names the target literally `Python` instead of a path.
+      # `pip/_vendor/bom.cdx.json` is pip's OWN SBOM describing the libraries pip
+      # vendors for its internal use (msgpack for its HTTP cache, and friends).
+      # Trivy treats any embedded SBOM as authoritative for the whole language
+      # ecosystem and STOPS walking the filesystem — it warns "Third-party SBOM may
+      # lead to inaccurate vulnerability detection", reports `Number of
+      # language-specific files: num=1`, and names the target literally `Python`
+      # rather than a path.
       #
       # On 2026-09-04 that made it report setuptools 70.3.0 and msgpack 1.1.2 as
-      # HIGH, blocking the build. All three independent sources disagreed:
-      #   - the build log installed setuptools 84.0.0 and msgpack 1.2.2
-      #   - Trivy's own per-file rows for those dist-info/METADATA paths showed 0
-      #   - the Syft CycloneDX SBOM of the same image (3565 components) listed
-      #     only 84.0.0 and 1.2.2
-      # The vulnerable versions were not in the image. It was a false positive.
+      # HIGH and block the build. Those are the versions pip VENDORS. They are not
+      # what the image has installed — three independent sources agreed:
+      #   - the build log installs setuptools 84.0.0 and msgpack 1.2.2
+      #   - Trivy's own per-file rows for those dist-info/METADATA paths report 0
+      #   - the Syft CycloneDX SBOM of the same image, 3565 components, lists only
+      #     84.0.0 and 1.2.2
       #
-      # Skipping these files makes Trivy fall back to per-package METADATA, which
-      # it already parses correctly. The risk this closes is not just noise: a
-      # scanner that invents a finding from a stale embedded SBOM can equally
-      # HIDE a real one, so a green run was not trustworthy while this was live.
+      # The important part is not the false positive. It is that while Trivy reads
+      # that one SBOM it reports pip's vendor manifest INSTEAD OF the ~100 packages
+      # actually installed — so a real CVE in a real dependency would go unseen.
+      # Skipping it makes Trivy scan the true filesystem again. This widens
+      # coverage; it does not narrow it.
+      #
+      # pip's vendored copies are accepted risk, same class as the vendored docker
+      # CLI Go modules already in .trivyignore: reachable only by pip itself during
+      # installs, never by the application, and not patchable by us short of pip
+      # upstream re-vendoring.
+      #
+      # `**/dist-info/sboms/**` is pre-emptive, not a fix for the above: PEP 770
+      # lets wheels ship the same kind of SBOM (cryptography and others already do)
+      # and would trigger the identical failure once such a wheel lands here.
       - name: Trivy — vulnerability scan (table, gating)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         env:
@@ -249,7 +259,7 @@ jobs:
           ignore-unfixed: true                               # suppress unactionable findings
           vuln-type: ${{ matrix.image.trivy_vuln_type }}      # web: os,library | otp: os only
           trivyignores: ".trivyignore"
-          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/dist-info/sboms/**"
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/pip/_vendor/bom.cdx.json,**/dist-info/sboms/**"
           format: table
 
       # SARIF pass — non-fatal, full severity range. Feeds the GitHub
@@ -269,7 +279,7 @@ jobs:
           trivyignores: ".trivyignore"
           # Same PEP 770 skip as the gating pass above — keep the two in step, or
           # the SARIF in the Security tab will disagree with what gated the build.
-          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/dist-info/sboms/**"
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/pip/_vendor/bom.cdx.json,**/dist-info/sboms/**"
           format: sarif
           output: trivy-${{ matrix.image.name }}.sarif
 
