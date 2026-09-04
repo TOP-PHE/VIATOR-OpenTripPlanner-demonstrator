@@ -147,7 +147,7 @@ jobs:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
           load: true
-          tags: viator-${{ matrix.image.name }}:scan
+          tags: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
           # Attestations OFF for the scan build.
@@ -218,7 +218,7 @@ jobs:
       - name: Trivy — vulnerability scan (table, gating)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          image-ref: viator-${{ matrix.image.name }}:scan
+          image-ref: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           severity: CRITICAL,HIGH
           exit-code: 1                                       # fail on any HIGH/CRITICAL
           ignore-unfixed: true                               # suppress unactionable findings
@@ -237,7 +237,7 @@ jobs:
         if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          image-ref: viator-${{ matrix.image.name }}:scan
+          image-ref: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           exit-code: 0                                       # never fail the build here
           ignore-unfixed: true
           vuln-type: ${{ matrix.image.trivy_vuln_type }}
@@ -295,7 +295,7 @@ jobs:
         continue-on-error: true
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
         with:
-          image: viator-${{ matrix.image.name }}:scan
+          image: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           format: cyclonedx-json
           artifact-name: sbom-${{ matrix.image.name }}.cyclonedx.json
           output-file: sbom-${{ matrix.image.name }}.cyclonedx.json
