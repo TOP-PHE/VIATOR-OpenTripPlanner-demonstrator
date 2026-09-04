@@ -41,8 +41,20 @@ repos:
         # mypy is slow; skip on commit, run on push or in CI
         stages: [pre-push]
 
-  - repo: https://github.com/hadolint/hadolint
-    rev: v2.13.1-beta
-    hooks:
-      - id: hadolint-docker
-        args: ["--ignore", "DL3008", "--ignore", "DL3013"]
+  # Dockerfile linting deliberately does NOT live here.
+  #
+  # It runs as the `hadolint` job in .github/workflows/docker.yml, via the
+  # SHA-pinned hadolint/hadolint-action. That is the single source of truth.
+  #
+  # Why not a pre-commit hook as well:
+  #   - The upstream hadolint-docker hook's entry carries no image tag, so it
+  #     resolves :latest. `rev:` pins the hook definition, never the image. CI
+  #     therefore tracked whatever :latest happened to be, and on 2026-09-04 a
+  #     newer image began failing every open PR on unchanged Dockerfiles.
+  #   - `pre-commit run --all-files` lints Dockerfiles on every PR regardless of
+  #     what changed, which is exactly the docs-only-PR stall that docker.yml's
+  #     `docker-gate` design (audit-2026-05 #26) exists to prevent.
+  #   - The action is covered by Dependabot's github-actions ecosystem, so it
+  #     stays current *and* every version change arrives as a reviewable PR that
+  #     CI proves before merge. An unpinned image gives currency without either.
+  #   - Dropping it also means pre-commit no longer needs a Docker daemon locally.

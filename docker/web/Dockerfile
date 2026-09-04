@@ -62,10 +62,17 @@ COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/
 
 WORKDIR /srv
 
-# Upgrade pip first — the python:3.12-slim base ships pip 25.0.1 which has
-# CVE-2025-8869 (MEDIUM, tarfile symlink check) and CVE-2026-1703 (LOW, wheel
-# path traversal). Pin to a fixed version that's also new enough for our deps.
-RUN pip install --upgrade "pip>=26.0"
+# Upgrade pip AND setuptools first. The python:3.14-slim base ships both at
+# versions with known fixable CVEs:
+#   pip 25.0.1        — CVE-2025-8869 (MEDIUM, tarfile symlink check),
+#                       CVE-2026-1703 (LOW, wheel path traversal)
+#   setuptools 70.3.0 — CVE-2025-47273 (HIGH, path traversal in PackageIndex),
+#                       fixed in 78.1.1
+# setuptools is a build-time dependency that stays resident in the image, so
+# Trivy sees it at `--severity CRITICAL,HIGH` and fails the build. It is
+# fixable, so it is fixed here rather than added to .trivyignore — that file is
+# reserved for findings with no upstream fix.
+RUN pip install --upgrade "pip>=26.0" "setuptools>=78.1.1"
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
