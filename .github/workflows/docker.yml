@@ -215,8 +215,33 @@ jobs:
       # exit-code, and the table doubles as the diagnostic readout. Do NOT
       # pass `output:` here — it would redirect the table to a file and
       # silence the log, which defeats the diagnostic purpose.
+      # Second skip-list entry, `**/dist-info/sboms/**` — read this before removing it.
+      #
+      # Modern wheels ship a PEP 770 SBOM at `<pkg>.dist-info/sboms/*.json`
+      # describing that wheel's BUILD/BUNDLED dependencies. Trivy treats an
+      # embedded SBOM as authoritative for the whole language ecosystem and stops
+      # trusting the filesystem — it logs "Third-party SBOM may lead to inaccurate
+      # vulnerability detection", reports `Number of language-specific files: num=1`,
+      # and names the target literally `Python` instead of a path.
+      #
+      # On 2026-09-04 that made it report setuptools 70.3.0 and msgpack 1.1.2 as
+      # HIGH, blocking the build. All three independent sources disagreed:
+      #   - the build log installed setuptools 84.0.0 and msgpack 1.2.2
+      #   - Trivy's own per-file rows for those dist-info/METADATA paths showed 0
+      #   - the Syft CycloneDX SBOM of the same image (3565 components) listed
+      #     only 84.0.0 and 1.2.2
+      # The vulnerable versions were not in the image. It was a false positive.
+      #
+      # Skipping these files makes Trivy fall back to per-package METADATA, which
+      # it already parses correctly. The risk this closes is not just noise: a
+      # scanner that invents a finding from a stale embedded SBOM can equally
+      # HIDE a real one, so a green run was not trustworthy while this was live.
       - name: Trivy — vulnerability scan (table, gating)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        env:
+          # Temporary: names the SBOM file Trivy picks up, so the skip glob above
+          # can be confirmed to match it. Remove once this is verified green.
+          TRIVY_DEBUG: "true"
         with:
           image-ref: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           severity: CRITICAL,HIGH
@@ -224,7 +249,7 @@ jobs:
           ignore-unfixed: true                               # suppress unactionable findings
           vuln-type: ${{ matrix.image.trivy_vuln_type }}      # web: os,library | otp: os only
           trivyignores: ".trivyignore"
-          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/dist-info/sboms/**"
           format: table
 
       # SARIF pass — non-fatal, full severity range. Feeds the GitHub
@@ -242,7 +267,9 @@ jobs:
           ignore-unfixed: true
           vuln-type: ${{ matrix.image.trivy_vuln_type }}
           trivyignores: ".trivyignore"
-          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose"
+          # Same PEP 770 skip as the gating pass above — keep the two in step, or
+          # the SARIF in the Security tab will disagree with what gated the build.
+          skip-files: "usr/local/bin/docker,usr/local/libexec/docker/cli-plugins/docker-buildx,usr/local/libexec/docker/cli-plugins/docker-compose,**/dist-info/sboms/**"
           format: sarif
           output: trivy-${{ matrix.image.name }}.sarif
 
