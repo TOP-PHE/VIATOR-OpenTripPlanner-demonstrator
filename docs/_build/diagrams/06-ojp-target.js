@@ -22,7 +22,9 @@ exports.svg = () => {
   s.box('fanout', 170, 250, 460, 60, 'the existing fanout', { kind: 'module', sub: '/api/journey/fanout — reused unchanged' });
   s.box('dispatch', 80, 352, 280, 58, 'planner_dispatch', { kind: 'module', sub: 'the engine seam' });
   s.box('oracles',  440, 352, 280, 58, 'oracle registry', { kind: 'module', sub: 'selectable per run and country' });
-  s.box('motis',    80, 448, 280, 62, 'MOTIS sessions', { kind: 'engine', sub: 'fed from National Access Points' });
+  s.box('motis',    80, 448, 280, 62, 'MOTIS sessions', {
+    kind: 'engine', sub: 'fed from National Access Points', badge: 'also serves /ojp20',
+  });
   s.box('orlist',  440, 442, 280, 74,
     ['ÖBB HAFAS · Swiss OJP', 'Digitransit (FI + EE)', 'NAPCORE demonstrator'], { kind: 'external', size: 11.5 });
 
@@ -41,7 +43,7 @@ exports.svg = () => {
 
   s.text(24, 552, 'ojp_client.py is already 723 lines of OJP 2.0 XML proven against the live Swiss endpoint. Stage 2 inverts it:', { size: 10.5 });
   s.text(24, 568, 'parse an inbound OJPTripRequest, run the existing fanout, emit TripResults. Marshalling, not protocol research.', { size: 10.5 });
-  s.text(24, 584, 'Because the surface sits above the engine seam, neither MOTIS’s nor OTP’s roadmap is on the critical path.', { size: 10.5 });
+  s.text(24, 584, 'MOTIS 2.9+ serves its own /ojp20, but that is one session’s graph — not the fanout, and not schema-valid.', { size: 10.5 });
   s.text(24, 606, 'Oracle trips never enter the /ojp response — a standard OJP consumer would silently attribute them to VIATOR.',
     { size: 10.5, italic: true, fill: '#A9691A' });
 

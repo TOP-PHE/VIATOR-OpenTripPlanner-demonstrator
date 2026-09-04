@@ -7,11 +7,13 @@
  */
 const fs = require('fs');
 const path = require('path');
-// sharp is installed next door in docxbuild/ — resolve it from there.
-const sharp = (() => {
-  try { return require('sharp'); }
-  catch { return require(path.join(__dirname, '..', 'docxbuild', 'node_modules', 'sharp')); }
-})();
+let sharp;
+try {
+  sharp = require('sharp');
+} catch {
+  console.error('sharp is not installed. From docs/_build, run:  npm install docx sharp');
+  process.exit(1);
+}
 
 const OUT = process.argv[2] || path.join(__dirname, 'out');
 const DIR = path.join(__dirname, 'diagrams');

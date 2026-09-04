@@ -2059,8 +2059,17 @@ open standard API can match closed national planners - and VIATOR measures the g
 modes, no benchmark, and **no published API yet**. VIATOR proposes to prove *sufficiency* - that NAP
 data reproduces incumbent production results - across the 19 countries VIATOR ingests, at whatever
 strength the oracle map allows (see 12.5), and to serve the answer over the ecosystem's own standard.
-Publishing an API therefore closes the single biggest gap versus the NAPCORE demonstrator, and
-Stage 1 below does it on its own, in days.
+Publishing an API therefore closes the biggest gap versus that demonstrator, and Stage 1 below does
+it on its own, in days.
+
+Be precise about *which* gap, though, because this moved in March 2026. Having **an** OJP endpoint is
+no longer distinctive - two open-source routers now ship one (12.2). That also downgrades the
+demonstrator's missing API from a capability gap to a **deployment choice**: it is built on the
+Digitransit platform, so OTP's OJP sandbox is one configuration flag away, and the Transitous/MOTIS
+peer already serves `/ojp20` unflagged. What remains distinctive is serving OJP **over a
+multi-session fanout, with per-oracle comparison and alignment scoring**. No open-source router does
+that. The durable claim is about the fanout and the benchmark, not about being first to publish an
+endpoint.
 
 **The regulatory driver.** The TEL TSI - Commission Implementing Regulation (EU) 2026/253, adopted
 6 February 2026 - mandates NeTEx/SIRI for rail via the National Access Points, with monitoring from
@@ -2086,7 +2095,7 @@ of asserting a blanket negative.
 |---|---|---|
 | **BR-1** | A machine client can obtain VIATOR fanout results without a browser session cookie | A script holding only an API key retrieves trips for an OD pair |
 | **BR-2** | The machine contract is versioned and published | `GET` of the OpenAPI JSON returns a document describing a stable `/api/v1/plan`; the route shape does not change without a version bump |
-| **BR-3** | VIATOR answers an OJP 2.0 `OJPTripRequest` with a conformant `OJPTripDelivery` | The emitted XML validates against the official XSDs |
+| **BR-3** | VIATOR answers an OJP 2.0 `OJPTripRequest` with a conformant `OJPTripDelivery` | **Every build** validates the emitted XML against the official XSDs in CI - not once, by hand. See 12.2 for why this is a requirement and not a nicety |
 | **BR-4** | The comparison product is available over a machine surface with per-oracle provenance intact | A comparison response carries VIATOR trips, each oracle's trips labelled by source, and alignment scoring - never a single averaged "agreement" number |
 | **BR-5** | The oracle is selectable per run and per country, and overridable per request on the comparison endpoint | A caller can ask for one oracle, several, or the region default, and the response states which answered |
 | **BR-6** | Absence of an oracle degrades the claim, it does not block the country | A country with no oracle still returns a coverage result and is reported as a distinct tier, not silently skipped |
@@ -2109,31 +2118,53 @@ something anyone can self-host. The API must therefore sit at the VIATOR layer, 
 `/api/journey/fanout` (chapter 3), where the fanout, the merge by `trip_signature`, the
 `transit_fingerprint` diff (chapter 4) and the alignment scoring (chapter 5) already live.
 
-**The corrected premise.** A widely repeated assumption inside this project was that MOTIS is
-OJP-compliant and OTP is not. It is the other way round on tooling, and **neither engine actually
-serves OJP**. *(The row that matters is "Serves OJP?"; the rest is developer detail.)*
+**The premise, corrected twice.** A widely repeated assumption inside this project was that MOTIS is
+OJP-compliant and OTP is not. That was wrong in both directions - and the second correction is recent
+enough that most published material still has it wrong - including this project's own strategy memo,
+and the widely-cited SKI+ market research of 4 November 2025, which stated that the OJP 2.0
+specification was not implemented in either open-source router. That was true when written, four
+months before both shipped. Do not cite it as current.
 
-| | MOTIS | OTP 2.x |
+Until March 2026, neither engine served OJP at all. **Since then, both do.** Verified 2026-09-04 by
+reading both dispatch chains at source and live-probing MOTIS.
+
+| | MOTIS 2.9+ | OTP 2.9+ |
 |---|---|---|
-| **APIs served** | REST/JSON over HTTP + OpenAPI spec; npm JS client | GTFS GraphQL v1 + Transmodel GraphQL v3 |
-| **Serves OJP?** | **No.** OJP appears nowhere in the repo as current *or* planned | **No** (open upstream issue #4896) |
-| **Ingests NeTEx** | yes | yes (Nordic profile) |
-| **Ingests SIRI** | yes - SIRI-ET/SX/FM, VDV 454 | yes (Entur) |
-| **OJP tooling nearby** | none found | `opentripplanner/ojp-java-model` (EUPL-1.2, maintained) |
+| **OJP endpoint** | `POST /ojp20` - registered unconditionally, **no feature flag** | `POST /otp/ojp/v2` - sandbox, **off by default** |
+| **Shipped** | v2.9.0, 19 March 2026 | v2.9.0, 18 March 2026 |
+| **Licence** | MIT | LGPL-3.0 |
+| **Schema-valid?** | **No** - 23 XSD errors in 5 classes; its own golden test files fail identically | **Yes** - its golden trip response validates clean |
+| **Services covered** | 4 of OJP's 9 | 2 of 9 (`TripRequest`, `StopEventRequest`) |
+| Other APIs served | REST/JSON + OpenAPI | GTFS GraphQL v1 + Transmodel GraphQL v3 |
 
-The source of the confusion is the NLnet grant for MOTIS, which says it *will* add support for
-NeTEx, SIRI-ET, SIRI-SX and OJP. That is **funded future work, not shipped**. And the MOTIS README's
-"supported formats" list is about **ingestion** - GTFS, NeTEx, GTFS-RT, SIRI-ET/SX/FM, VDV 454.
-Serving OJP is an *output* concern and is not in that list. MOTIS's ingestion story is genuinely
-strong; its *serving* story is a plain REST API - the very `/api/v6/plan` VIATOR already calls
-through `motis_client.py`.
+Neither implements `ExchangePointsRequest`, `MultiPointTripRequest` or `TripRefineRequest` - the
+services that make OJP a *federation* protocol rather than an XML skin over a local router. Both are
+effectively one-maintainer artefacts with no OJP feature commits since March 2026.
 
-Two consequences follow, and they are the whole reason this chapter can be scheduled at all:
+Why one validates and the other does not is worth knowing, because VIATOR faces the same fork in the
+road. OTP marshals through JAXB from XSD-generated classes (`org.opentripplanner:ojp-java-model`), so
+namespaces and element order are **structurally enforced**. MOTIS hand-writes XML with pugixml and has
+**no XSD check in CI** - its tests diff against its own output, which locks the defects in. See 12.3.
+
+**This changes the build-versus-reuse calculus without changing where the API belongs.** What changes
+is that Stage 2 is no longer greenfield: OTP's schema-valid mapper is now a readable reference for
+the expensive part of it (12.3). What does not change is the placement - an engine's OJP endpoint
+serves *one session's graph*. It is not the fanout, not the merge, not the comparison; it is exactly
+the commodity part. Three consequences:
 
 1. **Neither engine is on the critical path.** VIATOR does not wait for, switch to, or lobby any
    engine project to get an API. BR-8.
 2. **The commodity part stays private.** Third parties talk to VIATOR's fanout and comparison. The
    engine behind it is an implementation detail, selectable per session.
+3. **The differentiator moved.** Speaking OJP is no longer the distinctive part. Serving it over a
+   multi-session fanout with per-oracle comparison and alignment scoring still is.
+
+**Practical note, worth checking before any of this is built.** The orchestrator pins
+`ghcr.io/motis-project/motis:${MOTIS_VERSION:-latest}` (chapter 7), so any MOTIS session container
+rebuilt since March 2026 is **very likely already exposing `/ojp20`**, unflagged. Confirm it by
+POSTing a minimal `OJPTripRequest` at the container directly - a `GET` proves little, since a
+POST-only route may legitimately answer 404. A positive result is a free local **integration** target
+to develop a client against. It is not the product, and its output does not validate.
 
 **Current positioning, stated once so nothing below is ambiguous:** the engine is **MOTIS only**, fed
 exclusively from National Access Points. OTP is **decommissioned as a deployment**; `otp_client.py`
@@ -2144,7 +2175,7 @@ BR-8 testable without running two engines in production.
 
 ### 12.3 Proposed solution architecture
 
-![Proposed API surface — purple is new; everything below the fanout already exists and is reused unchanged](diagrams/arch-ojp-target.svg)
+![Proposed API surface - purple is new; everything below the fanout already exists and is reused unchanged](diagrams/arch-ojp-target.svg)
 
 Three stages plus the comparison endpoint, deliberately ordered so that the cheapest item delivers
 the biggest competitive gain first. **The stages are not contiguous in time** - 12.6 gives the true
@@ -2166,7 +2197,10 @@ Stage 2b needs the multi-oracle schema work in 12.5.
 its response shape changes without deprecation. Stage 1 adds a stable route, an API-key credential
 path alongside the session cookie, a response-schema freeze, and a published OpenAPI JSON. Where
 sensible the request/response shape deliberately mirrors MOTIS's `/api/v6/plan`, so that anything
-already speaking MOTIS speaks VIATOR after a base-URL change.
+already speaking MOTIS speaks VIATOR after a base-URL change. **That is borrowed vocabulary, not a
+dependency**: the mirrored field names are frozen into VIATOR's own published schema and do not track
+MOTIS's versioning afterwards. BR-8 forbids depending on an engine's contract; it does not forbid
+copying a shape that callers already know.
 
 **Stage 2 - the asset already in the repo.** `app/journey/ojp_client.py` is **723 lines of working
 OJP 2.0 XML**, verified on the wire against the live opentransportdata.swiss endpoint. It already:
@@ -2182,6 +2216,21 @@ existing fanout call, then emit `TripResult`s from the canonical trip dicts that
 to start, with `OJPLocationInformationRequest` second because `app/api/geocode.py` already performs
 that lookup. Responses will be validated against the official XSDs from the VDVde/OJP repository
 using lxml - the same technique already used for NeTEx XSD validation in this project.
+
+**Two reference points now exist that did not when this was first sketched** (12.2), and they point
+in opposite directions. OTP's `ext/ojp` sandbox is a working, **schema-valid** mapping of a router's
+output onto `OJPTripDelivery`; its response mapper plus `ojp-java-model` shows how to do the
+expensive part of this stage - stop-place and quay modelling, `TimedLeg` / `ContinuousLeg` /
+`TransferLeg` structure, Transmodel mode-and-submode mapping - and is worth reading before writing
+any of it, whatever the implementation language. It is a **partial** reference, not a template:
+2 of OJP's 9 services, shipped off by default, and dormant since March 2026. MOTIS is the cautionary
+half: a competent implementation that emits 23 schema violations because nothing ever checks it
+against the standard.
+
+**So XSD validation goes into CI on day one, not at the end.** It is the cheapest quality gate
+available here and it is precisely what separates the two live implementations. A golden-file test
+that diffs against your own output proves only that you are consistently wrong. The public Bruno test
+corpus at `openTdataCH/ojp-tests-public` (Apache-2.0) is a ready-made request set to point at it.
 
 **Stage 3 - real-time.** SIRI-SX/ET consumption, driven by the TEL TSI monitoring horizon. Note that
 MOTIS already ingests SIRI-ET/SX/FM: if VIATOR keeps MOTIS as its engine, part of Stage 3 is a
@@ -2233,7 +2282,7 @@ Oracle selection therefore belongs on the comparison endpoint - for example
 `reference=oebb,digitransit` - which is the surface that can carry it. This is also what satisfies
 BR-4 and BR-5 without compromising BR-3.
 
-#### The `ParticipantRef` question - resolved against the XSDs
+#### 12.4.1 The `ParticipantRef` question, resolved against the XSDs
 
 This was an open question in the strategy memo. It has now been checked directly against the `v2.0`
 tag of the [VDVde/OJP](https://github.com/VDVde/OJP) schemas and the official generated documentation
@@ -2306,7 +2355,7 @@ Swiss OJP is CH-only, so the oracle map, not the NAP data, is the limiting facto
 |---|---|---|---|
 | CH | Swiss OJP, opentransportdata.swiss | Official **OJP 2.0**, token | verified, in use |
 | DACH + Eurostar/TGV/AVE/Iberian + Nordic cross-border | ÖBB HAFAS `mgate.exe` | **Unofficial**, fragile | verified, in use |
-| **FI + EE** | **Digitransit** — `https://api.digitransit.fi/routing/v2/finland/gtfs/v1` | **Official GraphQL**, registration required | **verified - the endpoint is literally labelled "Finland and Estonia"** |
+| **FI + EE** | **Digitransit** - `https://api.digitransit.fi/routing/v2/finland/gtfs/v1` | **Official GraphQL**, registration required | **verified - the endpoint is literally labelled "Finland and Estonia"** |
 | NO / Nordic | Entur JourneyPlanner (Transmodel GraphQL) | Official, open | not verified this session |
 | LT | VINTRA (national multimodal planner, country-wide GTFS) | API status unclear | uncertain |
 | LV | none found (Vivi is a rail operator, not a planner API) | - | **could not find one** |
@@ -2395,9 +2444,10 @@ than a competitor. Same finding either way; better opening move.
 
 | Do not | Because |
 |---|---|
-| **Wait for MOTIS's OJP grant work** | Not shipped, and not VIATOR's timeline to control. Stage 2 does not need it |
+| **Treat MOTIS's `/ojp20` as a shortcut** | It ships today (12.2), but it serves a single session's graph rather than the fanout, and its output fails the official XSD. Useful as a local integration target; not the product, and not a dependency |
+| **Copy MOTIS's marshalling approach** | Hand-written XML with no schema check in CI is exactly how it accumulated 23 violations. Bind generated classes, or validate every build - preferably both |
 | **Use `openmove/ojp-middleware`** | It was an OJP→OTP wrapper, but it is **archived (Feb 2026)** and targets an OTP **1.5.4** fork. VIATOR's dormant OTP adapter targets 2.9 |
-| **Adopt `ojp-java-model`** | It is Java; VIATOR is Python. Its value here is the **XSD set it points at**, not the code |
+| **Adopt `ojp-java-model` as a dependency** | It is Java; VIATOR is Python. Its value here is the **XSD set it points at**, plus the schema-valid mapping OTP builds on top of it (12.3). Read both; depend on neither |
 | **Put the API on an engine** | It belongs above both. See 12.2 and BR-8 |
 
 **Sequencing.** Stage 1 is independent of everything in 12.5 and should ship first, because it is
@@ -2435,15 +2485,18 @@ do while ÖBB is still the only writer.
 - **The public API must never be an engine's API.** Proxying OTP GraphQL or MOTIS REST would publish
   the commodity part and put someone else's roadmap on VIATOR's critical path. Every published route
   must resolve through the fanout layer (BR-8).
-- **Neither MOTIS nor OTP serves OJP.** MOTIS's NeTEx/SIRI support is **ingestion**, and the NLnet
-  grant text describes funded future work. Anyone planning around "MOTIS will give us OJP" is
-  planning around something that does not exist today.
+- **An engine's OJP endpoint is not VIATOR's OJP endpoint.** Both MOTIS 2.9+ and OTP 2.9+ serve OJP
+  2.0 (12.2), but each serves a single session's graph. Routing a caller there would publish the
+  commodity part and silently drop the fanout, the merge and the comparison - the entire product.
+- **Validate against the XSD in CI, on every build.** MOTIS ships 23 schema violations because its
+  tests diff against its own output rather than against the standard. That is the failure mode to
+  design out, not a MOTIS-specific bug. A response that only your own tests accept is not interop.
 - **`POST /ojp` carries VIATOR trips only.** The envelope's `siri:ProducerRef` is 0:1, so one response
   has exactly one producer identity. Per-leg attribution through `Leg/ParticipantRef` is legal (12.4)
   but optional and largely ignored by clients today, so an oracle trip inside a `TripDelivery` is
   attributed to VIATOR in practice. A correctness invariant, not a style preference.
 - **Never design anything that needs a field on `TripResult`.** It has no `ParticipantRef`, no
-  `ProducerRef`, and — unlike `Trip` and `TripSummary` — **no extension point**. Any custom child
+  `ProducerRef`, and - unlike `Trip` and `TripSummary` - **no extension point**. Any custom child
   breaks schema validity, and it breaks silently until someone validates.
 - **Never average an oracle score with a peer score.** Agreement with ÖBB production and agreement
   with the NAPCORE demonstrator are different claims of different strength. Collapsing them into one
