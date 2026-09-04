@@ -3,7 +3,16 @@
 Working notes for AI sessions resuming this project. Concise + structured.
 Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `docs/admin-guide.md`.
 
-Last updated: 2026-07-01, after v0.1.43.28 (deployed to VPS) + PR #202/#203 merged.
+**Start with `docs/architecture.md` (#242)** if you are new to the code — chapter 2 is the map
+(module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
+traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
+
+Last updated: 2026-09-04, after PRs #242–#245 (docs set + two CI fixes).
+
+**Coverage caveat for this file:** §2/§5/§7 were last curated at #205. PRs **#206–#227** merged after
+that and are listed in §6 by commit subject only — they have not been triaged into the decisions
+table, the key-files map, or the priorities list. Treat those three sections as accurate up to #205
+and provisional after it. Nothing here is stale as of #245; it is incomplete, which is different.
 
 ---
 
@@ -43,6 +52,9 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 | Offline HTML export mirrors the live matrix's alignment heatmap, opt-in toggle, all CSS inlined | Export is `Content-Disposition: attachment`, zero external assets, must stay viewable offline forever | PR-201 (#201) |
 | Coverage cell modal "Re-run" link also passes `&from_uic=&to_uic=` | Prep for the UIC backfill (Scope B, not yet built); safe no-op today since coverage hubs carry no UIC column | PR-202 (#202) |
 | `AutohealExcessiveRestarts` Prometheus alert (`>3 restarts/hour`) + cadvisor `viator.autoheal` label-whitelist fix | Autoheal restarting silently forever would mask a *recurring* problem exactly as it did in the 07-01 slot-window incident (below) — restarts alone aren't a fix if the same container keeps flipping unhealthy | PR-203 (#203) |
+| **Dockerfile linting lives ONLY in `docker.yml`'s `hadolint` job** — the pre-commit `hadolint-docker` hook is gone | It ran the same linter twice. The pre-commit copy's entry carried no image tag so it resolved `:latest` and drifted (`rev:` pins the hook definition, never the image; `v2.13.1-beta` has no image tag at all). Worse, `--all-files` linted Dockerfiles on **every** PR, reintroducing the docs-only stall `docker-gate` exists to prevent. The action is SHA-pinned and Dependabot-managed, so it stays current *and* each bump is a reviewable PR. Also means `pre-commit` no longer needs a local Docker daemon | #244 (after #243's stop-gap pin) |
+| **Trivy `skip-files` excludes embedded SBOMs** — `**/pip/_vendor/bom.cdx.json`, `**/dist-info/sboms/**` | Trivy treats *any* embedded SBOM as authoritative for the whole language ecosystem and stops walking the filesystem. pip's vendored manifest made it report phantom HIGHs **and ignore the ~100 packages actually installed** — a real CVE would have gone unreported. See §8 recipe | #245 |
+| Scan image tagged `:scan-${{ github.run_id }}`; buildx `provenance`/`sbom` attestations off for the scan build | Both were diagnostics that did **not** fix #245's mismatch. Kept as defence in depth: a unique tag can't collide with a cached result, and an attestation is a second route to the same embedded-SBOM bug | #245 |
 
 **MOTIS quirks operationally important:**
 - MOTIS HTTP server can die silently while process stays alive → docker healthcheck uses `wget --spider` (PR-191 / #191)
@@ -149,6 +161,19 @@ docker/
 alembic/versions/                        Migrations (YYYYMMDD_HHMM_descriptor.py pattern)
 tests/unit/                              ~200 unit tests, no DB needed
 tests/integration/                       Integration tests (skip without Postgres)
+docs/                                    (#242) Reference documentation set
+├── architecture.md                      12 chapters, one per module cluster, each ending "Invariants & traps".
+│                                        Ch.2 is the map (module map, topology, the 3 principal flows);
+│                                        ch.12 is the PROPOSED OJP API — plan, not as-built
+├── user-guide.md                        Task-oriented, no dev experience assumed
+├── diagrams/                            6 diagrams, .svg (renders on GitHub) + .png (embedded in Word)
+├── brand/                               TrackOnPath logo + the symbol-only mark used in page footers
+├── VIATOR-*.docx                        Word builds: title page, copyright/licence page, per-page footer
+└── _build/                              Regenerates all of the above. Node only — no pandoc, no LibreOffice.
+                                         `npm install docx sharp` then build-diagrams.js / md2docx.js.
+                                         READ _build/README.md before touching it: the .docx must stay
+                                         under 1024 KB for check-added-large-files, which is why the
+                                         diagram PNGs are palette-quantised
 ```
 
 ---
@@ -169,6 +194,51 @@ tests/integration/                       Integration tests (skip without Postgre
 - #202 wires `&from_uic=&to_uic=` into the Re-run link (Scope A of the UIC backfill); safe no-op today since coverage hubs carry no UIC column yet
 - #203 `AutohealExcessiveRestarts` Prometheus alert + cadvisor `viator.autoheal` label-whitelist fix; **still no Alertmanager/Grafana contact point configured**, so nobody is paged externally yet
 
+**Merged 2026-09-04 (4 PRs, #242→#245)** — a docs set, and two CI faults found while trying to land it:
+
+- **#242 docs set.** `docs/architecture.md` (12 chapters, 6 diagrams), `docs/user-guide.md`, Word
+  builds of both with logo + copyright/licence page, and `docs/_build/` so they stay reproducible.
+  The diagrams were built from ground truth read out of the code, which corrected three things prose
+  had blurred: `journey`↔`network_coverage` are **not** mutually dependent (the reverse is one line,
+  `hafas_client`→`external_verify`, and `external_verify` imports nothing internal so no chain
+  closes); `web` and `worker` **share no Python at all**; `configured` and `deleted` are in
+  `SessionState` and are **never assigned**.
+- **#243 → #244 hadolint.** #243 pinned the pre-commit hadolint image as a stop-gap; #244 removed the
+  hook entirely. See §2. Net effect: Dockerfile linting has one home, stays current via Dependabot,
+  and no longer blocks PRs that contain no Dockerfile.
+- **#245 Trivy was lying.** It failed the `web` build on two HIGH CVEs that were **not in the image**.
+  Cause: pip's vendored SBOM (`pip/_vendor/bom.cdx.json`). See §2 and the §8 recipe. **The false
+  positive was the harmless half** — while Trivy read that SBOM it reported pip's vendor manifest
+  *instead of* the ~100 real packages, so green scans were not trustworthy. Now 89 real targets, 0
+  findings.
+
+Also enabled `deleteBranchOnMerge` on the repo (it was off; hundreds of stale branches had accumulated).
+
+**Merged #206→#227, not yet triaged into §2/§5/§7 — commit subjects only:**
+
+| PR | Subject |
+|---|---|
+| #227 | fix(coverage): recompute trip header from remaining legs when walks are hidden |
+| #225 | fix(coverage): address adversarial review of the reference_date fix |
+| #224 | fix(coverage): search the day the operator asked for, not "tomorrow" |
+| #223 | feat(journey): paginate ÖBB HAFAS to VIATOR's window, flag possible-duplicate trips |
+| #222 | feat(journey): align VIATOR and ÖBB HAFAS trips by first-transit departure in SBS view |
+| #221 | feat(coverage): align VIATOR trips shown/scored to ÖBB's depart_at window |
+| #220 | fix(coverage): normalize ÖBB timestamps to UTC before alignment scoring |
+| #219, #218 | dependabot: actions + python-runtime patch/minor groups |
+| #217 | fix(coverage): stop scrolled data cells bleeding through sticky matrix columns |
+| #216 | feat(coverage): VIATOR-vs-ÖBB side-by-side on the share page + mode-chip overlap fix |
+| #215 | feat(coverage): lazy-load share-page cell detail + slim large downloads |
+| #214 | fix(coverage): stop export/share page ballooning memory on large runs |
+| #213 | fix(hafas): don't crash cat-to-mode mapping when HAFAS sends an int |
+| #212 | feat(coverage): country + transport-mode header bands on the matrix |
+| #211 | feat(coverage): unauthenticated share link for a run's HTML report |
+| #210 | fix(journey): allow any-precision coords in Promote-to-Hub form |
+| #209 | fix(coverage): also retry on RemoteProtocolError, not just ConnectError |
+| #208 | fix(sonar): clear the failing quality gate |
+| #207 | fix(coverage): widen MOTIS healthcheck timeout + retry ConnectError with backoff |
+| #206 | feat(coverage): Delete button for coverage runs in the admin sidebar |
+
 **None currently open.**
 
 **Incident #1 (2026-06-30/07-01)**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
@@ -181,6 +251,11 @@ tests/integration/                       Integration tests (skip without Postgre
 
 ## 7. Next steps (priorities)
 
+0. **Triage #206→#227 into this file** (new): those 22 PRs are listed in §6 by commit subject only.
+   The decisions table (§2), key-files map (§5) and this priorities list have not absorbed them, so
+   several entries below may already be done or obsolete. Worth one pass before trusting §7 to plan
+   from — in particular #220–#224 reworked ÖBB/VIATOR time alignment, which touches the same
+   machinery as items 4 and 7.
 1. **Guard against a stale/unsafe `COVERAGE_SLOT_COUNT`** (new, from incident #2): nothing today stops `platform_config` from holding a slot count that implies a search window wide enough to overload MOTIS and trigger an autoheal restart-loop. Add a cheap safeguard — e.g. warn (admin UI + startup log) if the effective per-slot window (`day_window / slot_count`) exceeds ~6h, or clamp it. Also worth a one-time audit of every `COVERAGE_*` value in `platform_config` for other leftover overrides from past incident tuning (this project's psql-fallback recipe makes it easy to set a knob and easy to forget to unset it).
 2. **Decide a notification channel** for #203's alert: Alertmanager (new subsystem) vs. Grafana-provisioned alerting (fits the existing dashboards/datasources-as-code pattern better) — either needs a real SMTP/webhook contact point that doesn't exist today. Incident #2 reinforces this: the alert would have fired (8 restarts/hour ≫ the >3 threshold) but nobody was paged — only caught by someone watching the live matrix.
 3. **Re-import NS (Netherlands) GTFS** into the eu19 MOTIS session — confirmed data gap, not a code bug (see incident #1 above)
@@ -259,6 +334,44 @@ INSERT INTO platform_config (key, value) VALUES
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 ```
 Runner reads config at `execute_run` start and freezes for that run's lifetime.
+
+**Trivy reports a CVE for a version the image does not contain** (#245, 2026-09-04):
+
+```bash
+# 1. Name the SBOM Trivy is reading. NOTHING else names it — the SARIF only
+#    says "Python". Add to the trivy-action step, then remove once diagnosed:
+#      env:
+#        TRIVY_DEBUG: "true"
+#    Look for:  file_path="...bom.cdx.json" name="pip"
+
+# 2. Prove what is ACTUALLY in the image, without needing Docker locally.
+#    The pipeline already produces a Syft SBOM — download and grep it:
+gh run download <run-id> --name sbom-web.cyclonedx.json --dir /tmp/sbom
+python -c "import json;d=json.load(open('/tmp/sbom/sbom-web.cyclonedx.json'));\
+print([f\"{c['name']} {c['version']}\" for c in d['components'] if c['name'] in ('setuptools','msgpack')])"
+```
+
+Tells that Trivy is reading an embedded SBOM rather than the filesystem: the warning
+`Third-party SBOM may lead to inaccurate vulnerability detection`, `Number of language-specific
+files: num=1`, a target named literally `Python` instead of a path, and per-package
+`dist-info/METADATA` rows all showing `0` while the summary reports findings. Fix by adding the file
+to `skip-files` in **both** Trivy steps (keep them identical, or the Security tab disagrees with what
+gated the build). **Do not reach for `.trivyignore`** — that file is for findings with no upstream
+fix, and this is not a finding at all.
+
+**Git operations fail with permission / "Invalid argument" errors** — OneDrive marks files read-only
+in this tree. It silently breaks `git worktree prune` (33 stale admin dirs had accumulated against 5
+real worktrees), half-applies `git pull` with `unable to unlink old '<file>': Invalid argument`, and
+blocks folder deletion. Run this first:
+
+```bash
+attrib.exe -R "<path>\*.*" /S /D
+```
+
+To recover a half-applied pull: it leaves tracked files on disk with HEAD unmoved, so they show as
+*untracked*. Verify they match `origin/main` (`git hash-object` vs `git rev-parse origin/main:<path>`),
+confirm `git rev-list --count origin/main..main` is 0 and no tracked file is modified, then
+`git reset --hard origin/main`.
 
 **Sonar coverage gate** is strict (≥80% on new code, CC≤15/function). Patterns that have bitten multiple PRs this project:
 - Add tests for tiny utility helpers (regex parsers, format helpers) — Sonar counts them generously toward the ratio.
