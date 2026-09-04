@@ -35,3 +35,12 @@ opentelemetry-instrumentation-fastapi==0.64b0
 opentelemetry-instrumentation-sqlalchemy==0.64b0
 opentelemetry-instrumentation-httpx==0.64b0
 opentelemetry-instrumentation-logging==0.64b0
+
+# ────── Transitive-dependency security floors ──────
+# Nothing in app/ imports these. They arrive transitively, and are constrained
+# here only to keep the built image free of *fixable* HIGH findings, because
+# .trivyignore is reserved for CVEs with no upstream fix. Floors, not pins
+# (`>=` not `==`), so the resolver stays free to satisfy whichever package
+# pulls them in. Drop an entry once that package requires the fixed version
+# on its own.
+msgpack>=1.2.1                  # GHSA-6v7p-g79w-8964 — OOB read / crash on Unpacker reuse after an error
