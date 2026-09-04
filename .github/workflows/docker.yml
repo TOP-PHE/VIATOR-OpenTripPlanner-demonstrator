@@ -248,10 +248,6 @@ jobs:
       # and would trigger the identical failure once such a wheel lands here.
       - name: Trivy — vulnerability scan (table, gating)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        env:
-          # Temporary: names the SBOM file Trivy picks up, so the skip glob above
-          # can be confirmed to match it. Remove once this is verified green.
-          TRIVY_DEBUG: "true"
         with:
           image-ref: viator-${{ matrix.image.name }}:scan-${{ github.run_id }}
           severity: CRITICAL,HIGH
