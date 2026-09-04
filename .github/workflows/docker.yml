@@ -363,16 +363,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Ignored rules, all deliberate choices rather than unfixed findings:
+      #   DL3008/DL3013  unpinned apt / pip versions — accepted for our skeletons
+      #   DL3066         `USER appuser:appuser` is intentional. Both images run
+      #                  `chown -R appuser:appuser` first, and a numeric UID would
+      #                  break the volume ownership the inbox and graphs mounts
+      #                  depend on
+      #   DL3025         the web HEALTHCHECK needs shell form for its `|| exit 1`
+      #                  fallback; JSON notation would silently drop it
+      #
+      # DL3066/DL3025 are pre-emptive: hadolint v2.15.x emits them against these
+      # Dockerfiles, and this action is Dependabot-managed, so without them the
+      # next version bump would fail on choices we have already made.
       - name: Lint web Dockerfile
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5  # v3.3.0
         with:
           dockerfile: docker/web/Dockerfile
-          ignore: DL3008,DL3013    # apt pin / pip pin — acceptable for our skeletons
+          ignore: DL3008,DL3013,DL3066,DL3025
       - name: Lint otp Dockerfile
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5  # v3.3.0
         with:
           dockerfile: docker/otp/Dockerfile
-          ignore: DL3008,DL3013
+          ignore: DL3008,DL3013,DL3066,DL3025
 
   # ───────────────────────────── docker-gate ─────────────────────────────
   # Audit-2026-05 #26 — pipeline gate that ALWAYS reports a status.

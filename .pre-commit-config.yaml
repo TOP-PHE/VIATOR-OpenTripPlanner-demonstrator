@@ -41,32 +41,20 @@ repos:
         # mypy is slow; skip on commit, run on push or in CI
         stages: [pre-push]
 
-  # hadolint, declared locally so the IMAGE can be pinned.
+  # Dockerfile linting deliberately does NOT live here.
   #
-  # The upstream hadolint-docker hook's entry is `ghcr.io/hadolint/hadolint hadolint`
-  # with no tag, so it resolves :latest. `rev:` pins the hook *definition*, never the
-  # image — and there is no v2.13.1-beta image tag at all, only -beta3/-beta4 and the
-  # released v2.13.1. So CI silently tracked whatever :latest happened to be.
+  # It runs as the `hadolint` job in .github/workflows/docker.yml, via the
+  # SHA-pinned hadolint/hadolint-action. That is the single source of truth.
   #
-  # That bit on 2026-09-04: main was last green on 2026-07-08, :latest had moved on
-  # (hadolint is at v2.15.1 now), and the newer image started emitting DL3066/DL3025
-  # against Dockerfiles nobody had touched — blocking every open PR, including a
-  # docs-only one. Declaring the hook locally is the only way to pin the image.
-  #
-  # Ignored rules, all deliberate rather than unfixed:
-  #   DL3008/DL3013  unpinned apt/pip versions — accepted for this project
-  #   DL3066         `USER appuser:appuser` is intentional. Both images `chown -R
-  #                  appuser:appuser` first, and a numeric UID would break the volume
-  #                  ownership the inbox and graphs mounts depend on
-  #   DL3025         the HEALTHCHECK needs shell form for its `|| exit 1` fallback;
-  #                  JSON notation would silently drop it
-  - repo: local
-    hooks:
-      - id: hadolint-docker
-        name: Lint Dockerfiles
-        language: docker_image
-        types: ["dockerfile"]
-        entry: ghcr.io/hadolint/hadolint:v2.13.1 hadolint
-        args:
-          ["--ignore", "DL3008", "--ignore", "DL3013",
-           "--ignore", "DL3066", "--ignore", "DL3025"]
+  # Why not a pre-commit hook as well:
+  #   - The upstream hadolint-docker hook's entry carries no image tag, so it
+  #     resolves :latest. `rev:` pins the hook definition, never the image. CI
+  #     therefore tracked whatever :latest happened to be, and on 2026-09-04 a
+  #     newer image began failing every open PR on unchanged Dockerfiles.
+  #   - `pre-commit run --all-files` lints Dockerfiles on every PR regardless of
+  #     what changed, which is exactly the docs-only-PR stall that docker.yml's
+  #     `docker-gate` design (audit-2026-05 #26) exists to prevent.
+  #   - The action is covered by Dependabot's github-actions ecosystem, so it
+  #     stays current *and* every version change arrives as a reviewable PR that
+  #     CI proves before merge. An unpinned image gives currency without either.
+  #   - Dropping it also means pre-commit no longer needs a Docker daemon locally.
