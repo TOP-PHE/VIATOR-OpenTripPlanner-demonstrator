@@ -150,6 +150,23 @@ jobs:
           tags: viator-${{ matrix.image.name }}:scan
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to:   type=gha,scope=${{ matrix.image.name }},mode=max
+          # Attestations OFF for the scan build.
+          #
+          # build-push-action attaches a buildx-generated SBOM/provenance
+          # attestation by default. Trivy PREFERS an embedded SBOM over walking
+          # the filesystem — it says so in the log: "Third-party SBOM may lead to
+          # inaccurate vulnerability detection". Combined with `cache-from`, that
+          # SBOM can describe cached layer contents rather than what was actually
+          # just built, so Trivy reports versions the image does not contain.
+          #
+          # Seen on 2026-09-04: the build installed setuptools 84.0.0 and msgpack
+          # 1.2.2, the scanned-file listing showed exactly those, and the findings
+          # table still reported 70.3.0 / 1.1.2 from the stale attestation.
+          #
+          # Nothing is lost: the real SBOM is generated separately below by
+          # anchore/sbom-action, from this same loaded image.
+          provenance: false
+          sbom: false
           # Stamp the web image with the release version so the UI badge +
           # /healthz/version report what's actually running. The OTP image
           # ignores this build-arg (no ARG declared in its Dockerfile —
