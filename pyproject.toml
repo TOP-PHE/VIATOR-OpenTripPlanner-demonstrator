@@ -6,7 +6,12 @@
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["docker/otp", "**/migrations/versions/*"]
+# `*.md` — ruff 0.16 began formatting Python code blocks inside Markdown. Our docs
+# are illustrative, not source: snippets carry `...` placeholders, are deliberately
+# elided, and are laid out for reading. Left on, it expands a compact 2-line
+# CONFIG_SCHEMA summary in docs/architecture.md into 8 lines, and churns line endings
+# on Windows checkouts. Prose is not source — ruff owns app/, tests/ and alembic/.
+extend-exclude = ["docker/otp", "**/migrations/versions/*", "*.md"]
 
 [tool.ruff.lint]
 select = [
