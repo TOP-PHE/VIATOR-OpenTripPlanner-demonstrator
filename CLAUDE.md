@@ -291,7 +291,19 @@ Two carry live consequences:
 Treat every alignment score currently in the database as unusable — §7 item 3 gives three independent
 reasons.
 
-**None currently open.**
+**Open PRs — four, all Dependabot, all `MERGEABLE` but `BEHIND` main (as of 2026-09-04):**
+
+| PR | Opened | Touches | Note |
+|---|---|---|---|
+| #246 | 04 Sep | `requirements.txt`, `requirements-dev.txt` | python-runtime patch/minor, 15 updates. No collision with the `msgpack>=1.2.1` floor from #245 |
+| #241 | 31 Aug | 4 workflow files | actions patch/minor, 9 updates. **Bumps `hadolint-action` v3.3.0 → v3.5.0** — the first real test of #244's pre-emptive `DL3066`/`DL3025` ignores. Touches only action SHAs; no conflict with the Trivy/hadolint edits |
+| #233 | 27 Jul | `requirements-dev.txt` | python-dev patch/minor, 3 updates |
+| #231 | 13 Jul | `requirements-dev.txt` | types-requests bump |
+
+**Their check results are stale and mean nothing yet.** All four ran against a `main` whose hadolint
+was drifting on `:latest` and whose Trivy was reporting phantom CVEs (both fixed by #243/#244/#245).
+Update each onto current `main` to force a re-run before reading its status. Suggested order: #241
+first (it validates the CI fix), then #246, then the two older dev-dep ones.
 
 **Incident #1 (2026-06-30/07-01)**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
 
@@ -316,18 +328,27 @@ reasons.
    Also delete or fix `test_modal_non_transit_modes_matches_the_backend_set`: it never imports the
    backend set, and its `assert ".toUpperCase()" in template_text` is satisfied by unrelated
    country-filter code, so the protection it claims can be removed with CI green.
-2. **Fix `extract_uic`, then re-decide the #226 matcher rework** (closed unmerged 2026-07-08). Two
-   faults stacked. **(a) `extract_uic` has never worked, anywhere** — verified 2026-09-04. Its regex
-   `(?<!\d)(\d{7,8})(?!\d)` used with `.search()` takes the first standalone 7–8 digit run in the lid,
-   and a real HAFAS lid puts coordinates first, so
+2. **Endpoint identity is broken at three levels. Fix the bottom two now; the top one is item 7.**
+   *(a) `extract_uic` has never worked, anywhere* — verified 2026-09-04. Its regex
+   `(?<!\d)(\d{7,8})(?!\d)` with `.search()` takes the first standalone 7–8 digit run in the lid, and a
+   real HAFAS lid puts coordinates first, so
    `A=1@O=Wien Hbf@X=16375326@Y=48185507@U=81@L=008100002@B=1@` yields `16375326` — a longitude in
    micro-degrees. Every unit fixture uses a stripped lid with no `X=`/`Y=`, which is why the suite is
-   green. This is **not** the cross-border-only problem it was previously believed to be. **(b)** the
-   fuzzy tier's guard `_is_fuzzy_candidate` requires both spines to share `(first_UIC, last_UIC)` and
-   returns False there, before the train number is read — so combined with (a) it compares two
-   longitudes and rejects essentially every pair. #226 would have dropped the guard and made
-   `_first_train_number` extract the numeric part ("EUR 9322" → 9322, None for digit-less brand
-   labels). Fix (a) first, then re-decide whether the guard is still wanted. **Blocks item 3.**
+   green. Not the cross-border-only problem it was previously believed to be: it writes garbage into
+   persisted JSONB on every sweep, so fix it regardless of what follows.
+   *(b) Even fixed, the value is not a UIC.* It is ÖBB's INTERNAL station id — verified by live probe:
+   ÖBB returns `L=8800004` for Bruxelles-Midi where MOTIS reports `stopCode=8814001`. Two different,
+   both-valid numbering systems. So `_is_fuzzy_candidate`'s guard — which requires both spines to share
+   `(first_UIC, last_UIC)` and returns False *there*, before the train number is read — cannot work by
+   comparing raw ids. **Short-term fix: drop the guard**, as #226 proposed (closed unmerged), and let
+   train number + ±5min carry the match. Also make `_first_train_number` extract the numeric part
+   ("EUR 9322" → 9322, None for digit-less brand labels).
+   *(c) Do NOT "fix" this with coordinate proximity.* It was considered and rejected on measurement:
+   St Pancras ↔ King's Cross is **247 m** and must stay separate, while Bruxelles-Midi ↔ Midi Eurostar
+   is **53 m** and must merge. (Paris Nord ↔ Est 549 m, St Pancras ↔ Euston 588 m.) That leaves a
+   53–247 m window — under 5× spread, no margin for feed coordinate error, and it fails on the Eurostar
+   corridor specifically. Proximity is a legitimate *input to resolution* (item 7), never a runtime
+   matcher. **Blocks item 3.**
 3. **Run a full eu19 validation sweep** with `verify_externally=true` — still the first "real"
    alignment-heatmap dataset, but not runnable until item 2 lands, and every earlier sweep is invalid
    for at least one of three separate reasons: pre-#213 (2026-07-04) sweeps lost their ÖBB scores to a
@@ -346,11 +367,28 @@ reasons.
    `JourneyTrip.departure_at` (an itinerary start that may be a walk leg) while the runner's own window
    gate uses `first_transit_leg_departure_utc`. #224 filed the divergence knowingly; it is still open.
    Pick one and make §2's canonical-departure row true again.
-7. **Hub metadata backfill** (merges the old UIC item with the orphan from #212): nullable `uic` column
-   + FK to `master_stations` + backfill by name/coord match, which activates PR-202's `&from_uic=`
-   passthrough and would give item 2's matcher a real UIC source; AND populate
-   `NetworkCoverageHub.modes`. #212 shipped the column and the R/T/M/B/C header band, but every hub
-   renders `?` — the band is decorative until something classifies them.
+7. **Give both engines a shared namespace via `master_stations`** — the durable fix for item 2, and the
+   old "hub UIC backfill" item reframed. The registry is already built for exactly this problem: it is
+   UIC-keyed and carries **per-operator code columns** (`uic8_sncf`, `trigramme_sncf`, `db_code`,
+   `trenitalia_code`, `renfe_code`, `atoc_code`) plus `latitude`/`longitude` and a self-referencing
+   `parent_uic`. So:
+   - **Add an ÖBB code column**, following the pattern the other operators already set. Resolution then
+     becomes a lookup, not a guess, and `alignment` compares real UICs on both sides.
+   - **`parent_uic` is what makes Brussels correct structurally.** Bruxelles-Midi and Midi Eurostar are
+     parent and child of one complex — merged because the data says so, not because they happen to be
+     53 m apart. St Pancras and King's Cross are separate roots and can never merge at any distance.
+   - **Coordinates + name drive the resolution, offline and once**, with ambiguous cases surfaced for a
+     human. Resolve a station once and it stays resolved; a threshold re-guesses on every cell of an
+     8742-pair sweep and leaves no record of what it decided.
+   - Also gives PR-202's `&from_uic=` passthrough something real, and adds the `uic` column
+     `network_coverage_hubs` still lacks.
+   - Separately, populate `NetworkCoverageHub.modes`: #212 shipped the column and the R/T/M/B/C header
+     band, but every hub renders `?`, so the band is decorative until something classifies them.
+
+   **Batch the schema half of this with item 1.** #227 needs per-leg `duration_seconds` on `VerifyLeg`;
+   this needs `VerifyLeg` to persist enough to resolve (raw ÖBB id, name, coordinates) instead of one
+   pre-cooked `from_uic`. Same model change, same persisted-JSONB migration, same full re-sweep. Doing
+   them separately means re-sweeping twice.
 8. **Hub trim for eu19**: 94 hubs × both directions = 8742 pairs runs ~14 h at current knob defaults.
    Recommendation: 3 hubs/country ≈ 42 hubs = 1722 pairs ≈ 90–150 min. Operational decision (toggle
    `is_active` in Manage Hubs), not a code change — ask before building an automated top-3 picker.
