@@ -291,19 +291,24 @@ Two carry live consequences:
 Treat every alignment score currently in the database as unusable — §7 item 3 gives three independent
 reasons.
 
-**Open PRs — four, all Dependabot, all `MERGEABLE` but `BEHIND` main (as of 2026-09-04):**
+**Open PRs: none.** The four Dependabot backlog PRs were all updated onto current `main`, re-run and
+merged on 2026-09-04 — #241, #246, #233, #231, in that order. Their pre-merge check results had been
+stale (they ran against a `main` whose hadolint was drifting on `:latest` and whose Trivy was reporting
+phantom CVEs) so each was re-run after `gh pr update-branch`; #241 doubled as the first live test of
+#244's pre-emptive `DL3066`/`DL3025` ignores, and #246 as the first full web build/scan under the
+Trivy `skip-files` fix. Both held.
 
-| PR | Opened | Touches | Note |
-|---|---|---|---|
-| #246 | 04 Sep | `requirements.txt`, `requirements-dev.txt` | python-runtime patch/minor, 15 updates. No collision with the `msgpack>=1.2.1` floor from #245 |
-| #241 | 31 Aug | 4 workflow files | actions patch/minor, 9 updates. **Bumps `hadolint-action` v3.3.0 → v3.5.0** — the first real test of #244's pre-emptive `DL3066`/`DL3025` ignores. Touches only action SHAs; no conflict with the Trivy/hadolint edits |
-| #233 | 27 Jul | `requirements-dev.txt` | python-dev patch/minor, 3 updates |
-| #231 | 13 Jul | `requirements-dev.txt` | types-requests bump |
+**One of those merges carries a policy change worth knowing about.** #233 bumped `ruff 0.15.20 → 0.16.0`,
+and 0.16 began formatting Python code blocks **inside Markdown files**. It flagged `VIATOR-strategy.md`,
+`VIATOR-technical-spec.md` and `docs/architecture.md`. Rather than accept the reformat, `"*.md"` was
+added to `extend-exclude` in `pyproject.toml` (with the reasoning in a comment there) — the one real
+change it wanted was expanding a deliberately compact 2-line `CONFIG_SCHEMA` summary in
+`docs/architecture.md` into 8 lines, and the docs' snippets carry `...` placeholders and are laid out
+for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose is not source.**
 
-**Their check results are stale and mean nothing yet.** All four ran against a `main` whose hadolint
-was drifting on `:latest` and whose Trivy was reporting phantom CVEs (both fixed by #243/#244/#245).
-Update each onto current `main` to force a re-run before reading its status. Suggested order: #241
-first (it validates the CI fix), then #246, then the two older dev-dep ones.
+> **Local trap when reproducing this:** `ruff format --check .` reports ~126 files on a Windows checkout
+> versus 3 in CI — CRLF line endings, not real formatting drift. Never run `ruff format` across the tree
+> here; scope it to the specific files CI names.
 
 **Incident #1 (2026-06-30/07-01)**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
 
