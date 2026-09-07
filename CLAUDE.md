@@ -79,13 +79,20 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
   - MOTIS form: `ScheduledStopPoint:8503000` or `feed:NNNNNNN`
   - HAFAS form: `A=1@L=8503000` — **but `external_verify.extract_uic` does not actually extract this.**
     Its regex is `(?<!\d)(\d{7,8})(?!\d)` used with `.search()`, i.e. the *first standalone 7–8 digit
-    run anywhere in the string*. A real HAFAS lid carries the coordinates first:
-    `A=1@O=Wien Hbf@X=16375326@Y=48185507@U=81@L=008100002@B=1@` → it returns **`16375326`**, the
-    longitude in micro-degrees. (And `L=008100002` is 9 digits with leading zeros, so it would not
-    match even if reached.) **This has never worked in production, in any country** — not a
-    cross-border-only problem. Every unit fixture uses a stripped lid (`A=1@L=8000207@`) with no
-    `X=`/`Y=`, which is exactly why the suite is green. Consequence: the alignment matcher's
-    endpoint-UIC guard compares two longitudes and rejects essentially every pair. §7 item 2
+    run anywhere in the string*. A real HAFAS lid carries the coordinates first, so it returns a
+    **coordinate**, never the `L=` value. Verified against a live ÖBB probe 2026-09-07:
+    `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` → **`UIC:4899427`** (= 4.899427°E,
+    the longitude in micro-degrees) instead of the real UIC `8400058`, which is sitting in `L=`.
+    Note the return is the prefixed string `UIC:…`, and `m.group(1)[:7]` truncates: at |lon| ≥ 10 the
+    run is 8 digits so Wien yields `UIC:1637460` — neither a coordinate nor an id. At |lon| < 1 the X
+    run is too short to match and it falls through to the **latitude**. **This has never worked in
+    production, in any country** — not a cross-border-only problem. Every unit fixture uses a stripped
+    lid (`A=1@L=8000207@`) with no `X=`/`Y=`, which is exactly why the suite is green.
+    *(An earlier version of this note claimed real `L=` values are 9-digit zero-padded and so "would
+    not match even if reached". The live probe contradicts that — `8400058`, `8898004` and `904050` are
+    all unpadded. The width rule still matters, but for the opposite reason: 6-digit ids like `904050`
+    fail it. §7 item 2.)* Consequence: the alignment matcher's endpoint-UIC guard compares two
+    coordinates and rejects essentially every pair. §7 item 2
   - Canonical: `UIC:8503000`
   - Fallback: lat/lon rounded to ~110 m when no UIC available
   - **Coverage hubs (`network_coverage_hubs` table) carry NO UIC column today** — no FK/join to `master_stations`. The Re-run link's `&from_uic=&to_uic=` (PR-202, merged) is wired but always resolves to empty string until a follow-up adds the column + backfill.
@@ -344,21 +351,63 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    Also delete or fix `test_modal_non_transit_modes_matches_the_backend_set`: it never imports the
    backend set, and its `assert ".toUpperCase()" in template_text` is satisfied by unrelated
    country-filter code, so the protection it claims can be removed with CI green.
-2. **Endpoint identity is broken at three levels. Fix the bottom two now; the top one is item 7.**
-   *(a) `extract_uic` has never worked, anywhere* — verified 2026-09-04. Its regex
-   `(?<!\d)(\d{7,8})(?!\d)` with `.search()` takes the first standalone 7–8 digit run in the lid, and a
-   real HAFAS lid puts coordinates first, so
-   `A=1@O=Wien Hbf@X=16375326@Y=48185507@U=81@L=008100002@B=1@` yields `16375326` — a longitude in
-   micro-degrees. Every unit fixture uses a stripped lid with no `X=`/`Y=`, which is why the suite is
-   green. Not the cross-border-only problem it was previously believed to be: it writes garbage into
-   persisted JSONB on every sweep, so fix it regardless of what follows.
-   *(b) Even fixed, the value is not a UIC.* It is ÖBB's INTERNAL station id — verified by live probe:
-   ÖBB returns `L=8800004` for Bruxelles-Midi where MOTIS reports `stopCode=8814001`. Two different,
-   both-valid numbering systems. So `_is_fuzzy_candidate`'s guard — which requires both spines to share
-   `(first_UIC, last_UIC)` and returns False *there*, before the train number is read — cannot work by
-   comparing raw ids. **Short-term fix: drop the guard**, as #226 proposed (closed unmerged), and let
-   train number + ±5min carry the match. Also make `_first_train_number` extract the numeric part
-   ("EUR 9322" → 9322, None for digit-less brand labels).
+2. **Endpoint identity: (a) is a bug — fix it. (b) is an OPEN QUESTION — measure it, don't assume it.
+   (c) is a rejected approach.** *(Rewritten 2026-09-07 after a live ÖBB probe + adversarial review;
+   the previous text asserted a namespace thesis that the probe refuted. See "What changed" below.)*
+   *(a) `extract_uic` has never worked, anywhere* — verified 2026-09-04, re-verified by live
+   `LocGeoPos` probe 2026-09-07. `_UIC_RE = (?<!\d)(\d{7,8})(?!\d)` with `.search()` takes the leftmost
+   standalone 7–8 digit run, and a real HAFAS lid orders its fields `A= @ O= @ X= @ Y= @ U= @ L=`, so it
+   returns the **X longitude in micro-degrees** and never reaches `L=`. Real probe response:
+   `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` → `UIC:4899427` (= 4.899427°E).
+   **Three failure regimes by longitude:** at |lon| ≥ 10 the run is 8 digits and `m.group(1)[:7]`
+   truncates it further (Wien → `UIC:1637460`, neither coordinate nor id); at 1 ≤ |lon| < 10 it returns
+   the longitude verbatim; at |lon| < 1 the X run is too short to match and it falls through to the
+   **latitude**. Every unit fixture uses a stripped lid with no `X=`/`Y=` (`grep "X=" --include=*.py`
+   returns nothing), which is why the suite is green. It writes garbage into persisted JSONB on every
+   sweep — fix regardless of what follows.
+   **The clean value is already in the response and is being thrown away.** Every `locL` entry carries
+   `extId` beside `lid` (`8400058`, `8898004`, `904050` for the three probed stations). `extId` appears
+   **nowhere in the codebase**; `_index_hafas_locations` (`external_verify.py:550-554`) keeps only
+   `{lid, name}` and drops it one line before `_build_leg_from_section` (`:509-510`) could use it.
+   **Do NOT simply feed `extId` into `_UIC_RE`** — its 7–8 digit width returns `None` for 6-digit ids
+   (`904050`, and six of Wien's eight nearest candidates) and for 9-digit zero-padded ones. A naive
+   extId fix looks like a fix and is not one.
+   *(b) Whether the ÖBB id and the VIATOR id share a namespace is UNMEASURED.* The previous claim here
+   — "it is ÖBB's INTERNAL station id" — **was wrong**, and traces to a single misattribution in #226's
+   `f2c166b`: it read `extract_uic`'s broken output (`4899427`), assumed that was the `L=` field, and
+   named it an internal id. It is a longitude. Live probe: Amsterdam's `L=` **is** the NL UIC `8400058`;
+   Brussels resolves to `8898004` (Midi Eurostar, rank 0 — *not* `8800004`, which is rank 1 and which
+   the app never sees); Wien resolves to `904050`, not a UIC in any scheme. So *"sometimes not a UIC"*
+   is right and *"is ÖBB's internal id"* is wrong — it is station-by-station.
+   ⚠️ **The old "MOTIS reports `stopCode=8814001`" was UNSOURCED and must not be reused.** `stopCode`
+   appears exactly once in this repo — in the sentence that has now been deleted. `motis_client.py:270`
+   reads `stopId`, formatted `<feed>_<local>`; no captured MOTIS response exists in the tree; and the
+   only other place naming 8814001 (`test_hub_derive.py:171`) calls it Bruxelles-**Nord**.
+   **Capture one real MOTIS response for Amsterdam→Brussels before designing anything on this.**
+   **Do NOT drop the guard.** #226 proposed exactly that and was rejected for the right reason: it
+   trades a *visible* false negative (`no_overlap` on a correct match) for *invisible* false positives
+   (`mostly_agree` on a different train), which for a validation oracle is strictly worse. Keep the
+   guard and make its rejections **legible** instead — record per cell whether the fuzzy tier failed on
+   endpoints, train number or time — so an id-artefact `no_overlap` is distinguishable from a real one.
+   Salvage from #226 afterwards: `_first_train_number` should extract the numeric run ("EUR 9322" →
+   9322, None for digit-less brand labels) — but land it *after* the diagnostic, since it loosens
+   matching. Guard ordering confirmed: `_is_fuzzy_candidate` (`alignment.py:249-251`) returns False on
+   endpoints before `_first_train_number` (`:252`); there is a **second, earlier gate** at
+   `_fuzzy_match:278` that aborts on the VIATOR side before any candidate is examined.
+   *Separate live defect, same file — currently 100% silent.* `_build_locgeopos_body` sets `maxLoc: 1`
+   (`:280`) and `_extract_lids_from_locgeopos` takes `loc_l[0]` (`:313`), so a hub coordinate snaps to
+   the nearest *stop*, not the nearest *station*. Wien Hbf snaps to "Wien Hbf (Busbahnhof Regional)" — a
+   **bus terminal** 52 m away; canonical `8100002` is not among the eight nearest. The docstring's
+   "railway stops only" claim is false. The resolved lid is used for the TripSearch and then discarded
+   by the `verify_via_oebb_hafas` facade — **no log line, no UI field, no persisted column records which
+   station ÖBB actually answered about.** Surface it before fixing it; resolve it properly in item 7
+   (`parent_uic` is the only correct fix — Midi/Midi-Eurostar merge because the data says parent/child,
+   St Pancras/King's Cross never merge at any distance).
+   *Recommended order:* **Step 0** — pure observability (persist resolved `lid`/`extId`/`name`/`dist` +
+   per-cell rejection reason; zero behaviour change, merges alone). **Step 1** — thread `extId` through
+   with a new `_uic_from_extid` that handles 6- and 9-digit ids, plus a characterization test that pins
+   today's longitude return *before* flipping it. **Step 2** — measure on ~20 mixed pairs, not 8742; the
+   rejection histogram, not an argument, decides whether item 7 blocks item 3.
    *Where #226's rejected code actually is:* branch `fix/coverage-alignment-cross-namespace`, single
    commit `f2c166b` *"fix(coverage): score alignment across engine id/label namespaces"* — **not** on
    `main`. It survives on origin and is checked out locally in the `wt-align-match` worktree (the only
