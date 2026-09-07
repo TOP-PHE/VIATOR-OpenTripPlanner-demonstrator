@@ -43,4 +43,4 @@ opentelemetry-instrumentation-logging==0.65b0
 # (`>=` not `==`), so the resolver stays free to satisfy whichever package
 # pulls them in. Drop an entry once that package requires the fixed version
 # on its own.
-msgpack>=1.2.1                  # GHSA-6v7p-g79w-8964 — OOB read / crash on Unpacker reuse after an error
+msgpack>=1.2.2                  # GHSA-6v7p-g79w-8964 — OOB read / crash on Unpacker reuse after an error
