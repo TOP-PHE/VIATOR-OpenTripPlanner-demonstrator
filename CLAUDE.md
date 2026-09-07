@@ -291,12 +291,23 @@ Two carry live consequences:
 Treat every alignment score currently in the database as unusable — §7 item 3 gives three independent
 reasons.
 
-**Open PRs: none.** The four Dependabot backlog PRs were all updated onto current `main`, re-run and
-merged on 2026-09-04 — #241, #246, #233, #231, in that order. Their pre-merge check results had been
-stale (they ran against a `main` whose hadolint was drifting on `:latest` and whose Trivy was reporting
-phantom CVEs) so each was re-run after `gh pr update-branch`; #241 doubled as the first live test of
-#244's pre-emptive `DL3066`/`DL3025` ignores, and #246 as the first full web build/scan under the
-Trivy `skip-files` fix. Both held.
+**Open PRs: none** (as of 2026-09-07). Two waves of Dependabot PRs were cleared:
+
+- **2026-09-04, the backlog** — #241, #246, #233, #231, in that order. Their pre-merge check results
+  had been stale (they ran against a `main` whose hadolint was drifting on `:latest` and whose Trivy
+  was reporting phantom CVEs) so each was re-run after `gh pr update-branch`; #241 doubled as the first
+  live test of #244's pre-emptive `DL3066`/`DL3025` ignores, and #246 as the first full web build/scan
+  under the Trivy `skip-files` fix. Both held.
+- **2026-09-07** — #251 (ruff 0.16.0→0.16.6, mypy 2.3.1, pre-commit 4.6.2), #252 (msgpack floor
+  `>=1.2.1`→`>=1.2.2`, the GHSA-6v7p-g79w-8964 entry), #253 (`actions/setup-python` v6.3.0 → **v7.0.0**).
+  #251 re-confirmed the `*.md` ruff exclusion below survives a ruff bump; #252 re-ran the full web
+  build+scan, so the Trivy fix is confirmed twice over.
+
+**On #253, because it is a major bump:** v7.0.0's only breaking change is the removal of the
+`pip-install` input. Neither call site uses it — `ci.yml:55` and `ci.yml:189` pass only
+`python-version: "3.12"` and `cache: pip`, and those two jobs (Python lint+type+test, SonarCloud) are
+exactly the jobs fed by the action, both green on v7 at normal duration so `cache: pip` still resolves.
+The rest of v7 is internal: ESM migration, `@actions/cache` 6.2.0, dropping EOL Pythons.
 
 **One of those merges carries a policy change worth knowing about.** #233 bumped `ruff 0.15.20 → 0.16.0`,
 and 0.16 began formatting Python code blocks **inside Markdown files**. It flagged `VIATOR-strategy.md`,
@@ -348,6 +359,11 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    comparing raw ids. **Short-term fix: drop the guard**, as #226 proposed (closed unmerged), and let
    train number + ±5min carry the match. Also make `_first_train_number` extract the numeric part
    ("EUR 9322" → 9322, None for digit-less brand labels).
+   *Where #226's rejected code actually is:* branch `fix/coverage-alignment-cross-namespace`, single
+   commit `f2c166b` *"fix(coverage): score alignment across engine id/label namespaces"* — **not** on
+   `main`. It survives on origin and is checked out locally in the `wt-align-match` worktree (the only
+   worktree kept after the 2026-09-07 cleanup, kept precisely for this item). Read it before re-deriving
+   the approach from scratch; the review rejected the *design*, not every line of it.
    *(c) Do NOT "fix" this with coordinate proximity.* It was considered and rejected on measurement:
    St Pancras ↔ King's Cross is **247 m** and must stay separate, while Bruxelles-Midi ↔ Midi Eurostar
    is **53 m** and must merge. (Paris Nord ↔ Est 549 m, St Pancras ↔ Euston 588 m.) That leaves a
