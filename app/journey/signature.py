@@ -113,6 +113,19 @@ _UIC_RE = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
 _SWISS_DSN_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
 _SWISS_SLOID_PREFIX = "ch:1:"  # opentransportdata.swiss authority namespace
 
+# Already-canonical cross-engine stop tokens, which pass through
+# `_fingerprint_stop_token` verbatim instead of being re-parsed.
+#
+# Deliberate twin of `external_verify._SCHEME_UIC` / `_SCHEME_OEBB` — that
+# module intentionally imports nothing from `app.journey`, so the vocabulary is
+# duplicated rather than shared (same pattern as the `_hafas_cat_to_mode` twin).
+# `test_canonical_token_vocabulary_agrees_across_modules` pins them together.
+#
+# `UIC:` + exactly 7 digits is the only UIC shape any producer in the tree
+# emits — both `extract_uic` and `oebb_stop_id` apply `[:7]` — so this
+# fullmatch is behaviour-preserving on every pre-existing input.
+_CANONICAL_TOKEN_RE = re.compile(r"\A(?:UIC:\d{7}|OEBB:.{1,64})\Z", re.DOTALL)
+
 
 def _uic_from_stop_id(stop_id: str | None) -> str | None:
     """Parse the canonical 7-digit UIC out of an OTP / OJP / SNCF stop_id.
@@ -173,6 +186,11 @@ def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float |
     """Return the per-endpoint stop token used by `transit_fingerprint`.
 
     Strategy:
+      0. If the stop_id is ALREADY a canonical token (`UIC:NNNNNNN` or
+         `OEBB:…`, see `_CANONICAL_TOKEN_RE`), return it verbatim. The ÖBB
+         adapter emits these directly — `external_verify.oebb_stop_id` has
+         already done the namespace decision with better information than a
+         regex over an opaque string has.
       1. If the stop_id contains a 7-digit UIC chunk, return `UIC:NNNNNNN`.
          This is the strongest cross-engine identifier — both OTP's
          ``SBB:8501120:0:5`` and OJP's ``ch:1:sloid:8501120:0:5`` produce
@@ -182,7 +200,17 @@ def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float |
          of access/egress walks. Walks are stripped before this is called,
          so the only callers are RAIL/BUS/TRANSIT legs which both engines
          resolve to a stop with an id.
+
+    **Step 0 must stay ahead of step 1 — do not "tidy" it downwards.** An
+    `OEBB:` token names a station we could NOT place in the UIC namespace.
+    Run after `_uic_from_stop_id`, a payload like ``OEBB:00000000`` would parse
+    back out as ``0000000`` and be re-labelled the fabricated ``UIC:0000000``,
+    silently re-entering the namespace it was built to stay out of. At step 0
+    that is structurally impossible. Pinned by
+    `test_oebb_token_can_never_reparse_as_a_uic`.
     """
+    if stop_id and _CANONICAL_TOKEN_RE.fullmatch(stop_id):
+        return stop_id
     uic = _uic_from_stop_id(stop_id)
     if uic:
         return f"UIC:{uic}"

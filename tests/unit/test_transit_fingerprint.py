@@ -25,7 +25,39 @@ from typing import Any
 import pytest
 
 from app.api.journey import _build_comparison
-from app.journey.signature import transit_fingerprint
+from app.journey.signature import _fingerprint_stop_token, transit_fingerprint
+
+# ─────────────────── canonical-token passthrough ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("stop_id", "expected", "why"),
+    [
+        ("UIC:8400058", "UIC:8400058", "identical to pre-passthrough behaviour"),
+        ("SBB:8507000:0:5", "UIC:8507000", "VIATOR OTP form, unchanged"),
+        ("ch:1:sloid:7000:4:7", "UIC:8507000", "Swiss DSN branch still reached"),
+        ("StopPoint:OCELyria-87686006", "UIC:8768600", "SNCF 8-digit, unchanged"),
+    ],
+)
+def test_fingerprint_stop_token_passthrough_is_behaviour_preserving(
+    stop_id: str, expected: str, why: str
+) -> None:
+    """The step-0 passthrough added for ÖBB tokens must not perturb any
+    pre-existing input. It is a `fullmatch` on `UIC:` + exactly 7 digits, which
+    is the only UIC shape any producer in the tree emits."""
+    assert _fingerprint_stop_token(stop_id, None, None) == expected, why
+
+
+def test_fingerprint_stop_token_keeps_oebb_tokens_out_of_the_coordinate_fallback() -> None:
+    """An `OEBB:` token names a real station we could not place in the UIC
+    namespace. It must survive verbatim rather than collapsing into the `"?,?"`
+    coordinate sentinel, which is what a leg with no id AND no coordinates
+    produces — see `alignment._OEBB_UNKNOWN_ENDPOINT`."""
+    assert _fingerprint_stop_token("OEBB:904050", None, None) == "OEBB:904050"
+    assert _fingerprint_stop_token("OEBB:904050", None, None) != "?,?"
+    # And a genuinely id-less, coordinate-less leg still yields the sentinel.
+    assert _fingerprint_stop_token(None, None, None) == "?,?"
+
 
 # ─────────────────── transit_fingerprint ───────────────────
 

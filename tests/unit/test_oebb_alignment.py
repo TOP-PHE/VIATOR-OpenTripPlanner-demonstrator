@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.network_coverage import alignment, external_verify
 from app.network_coverage.alignment import _oebb_naive_to_utc_iso as _vienna_local_to_utc
 from app.network_coverage.alignment import compute_alignment, filter_trips_from_depart_at
 from app.network_coverage.external_verify import VerifyItinerary, VerifyLeg, extract_uic
@@ -140,6 +141,100 @@ def _o_leg(
     return VerifyLeg(
         mode=mode, from_uic=from_uic, to_uic=to_uic, dep_utc=dep, arr_utc=arr, route_name=route
     )
+
+
+# ───────────────── endpoint identity: tokens, not coordinates ─────────────────
+#
+# These four are the assertions that separate this design from PR #226. #226
+# made matching MORE permissive by deleting the endpoint guard, and was
+# rejected because it traded a VISIBLE false negative for INVISIBLE false
+# positives. Nothing here deletes a discriminator; the guard is fed the input
+# it was always meant to read.
+
+
+def test_two_id_less_itineraries_do_not_exact_match() -> None:
+    """**The #226 test — read this one first.**
+
+    A VIATOR leg with no stop_id AND no coordinates fingerprints its endpoints
+    as the literal `"?,?"`. VerifyLeg carries no lat/lon at all, so if the ÖBB
+    side passed a bare None it would produce the SAME `"?,?"` — and with equal
+    mode, equal rounded minutes and equal route name the two would hash
+    identically and score a 1.00 `agree` on zero endpoint evidence.
+
+    `alignment._OEBB_UNKNOWN_ENDPOINT` is what makes that impossible. Note
+    `test_compute_alignment_empty_route_same_minute_still_exact_matches` proves
+    an empty route name does NOT save us here — only the sentinel does.
+    """
+    v_leg = {
+        "mode": "RAIL",
+        "from_stop_id": None,
+        "to_stop_id": None,
+        "from_lat": None,
+        "from_lon": None,
+        "to_lat": None,
+        "to_lon": None,
+        "departure": _vienna_local_to_utc("2026-06-30T08:00"),
+        "arrival": _vienna_local_to_utc("2026-06-30T13:30"),
+        "route_short_name": "RJ 1141",
+    }
+    o_it = _o_itin(legs=[_o_leg(from_uic=None, to_uic=None)])
+
+    score, tier = compute_alignment([_viator_trip([v_leg])], [o_it])
+
+    assert score != 1.0, "two id-less itineraries must not be credited as identical"
+    assert tier != "agree"
+
+
+def test_guard_rejects_cross_namespace_endpoints() -> None:
+    """Matchable on every axis except identity — same train number, same
+    minute, same mode — and still refused, because ÖBB named a station we
+    could not place in the shared namespace (Wien Hbf's bus terminal)."""
+    v = [_viator_trip([_v_leg(from_uic="8100002", to_uic="8103000")])]
+    o = [_o_itin(legs=[_o_leg(from_uic="OEBB:904050", to_uic="OEBB:904062")])]
+
+    score, tier = compute_alignment(v, o)
+
+    assert score == 0.0
+    assert tier == "no_overlap"
+
+
+def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
+    """The one case the fix is allowed to NEWLY accept — without it the fix is
+    unfalsifiable. The ÖBB side is built through the real leg builder from a
+    zero-padded extId, so this exercises the whole path, not just the scorer."""
+    o_leg = external_verify._build_leg_from_section(
+        {
+            "type": "JNY",
+            "dep": {"locX": 0, "dTimeS": "080000"},
+            "arr": {"locX": 1, "aTimeS": "133000"},
+            "jny": {"prodX": 0},
+        },
+        "20260630",
+        external_verify._index_hafas_locations(
+            [
+                {"lid": "A=1@O=Wien Hbf@X=16375526@L=008100002@", "extId": "008100002"},
+                {"lid": "A=1@O=Zuerich HB@X=8540192@L=8503000@", "extId": "8503000"},
+            ]
+        ),
+        external_verify._index_hafas_products([{"name": "RJ 1141", "prodCtx": {"catOut": "RJ"}}]),
+    )
+    assert o_leg is not None
+    assert o_leg.from_uic == "UIC:8100002", "zero padding absorbed"
+
+    v = [_viator_trip([_v_leg(from_uic="8100002", to_uic="8503000")])]
+    _score, tier = compute_alignment(v, [_o_itin(legs=[o_leg])])
+
+    assert tier == "agree"
+
+
+def test_endpoint_token_passes_canonical_through_and_still_parses_viator_ids() -> None:
+    """`_endpoint_token` must not regress the VIATOR side while gaining the
+    ÖBB passthrough."""
+    assert alignment._endpoint_token("OEBB:904050") == "OEBB:904050"
+    assert alignment._endpoint_token("OEBB:?") == "OEBB:?"
+    assert alignment._endpoint_token("UIC:8400058") == "UIC:8400058"
+    assert alignment._endpoint_token("SBB:8507000:0:5") == "UIC:8507000"
+    assert alignment._endpoint_token(None) is None
 
 
 def test_compute_alignment_both_empty_is_no_service() -> None:

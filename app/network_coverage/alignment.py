@@ -57,8 +57,20 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ..journey.signature import transit_fingerprint
+from ..journey.signature import _CANONICAL_TOKEN_RE, transit_fingerprint
 from .external_verify import VerifyItinerary, extract_uic
+
+# An ÖBB endpoint with NO id at all. VerifyLeg carries no lat/lon, so a bare
+# None here reaches `signature._round_latlon_coarse(None, None)` and becomes
+# the literal "?,?" — which a VIATOR leg missing BOTH stop_id and coordinates
+# also produces. Same mode + same rounded minutes + same route name would then
+# hash identically and score a 1.00 `agree` on ZERO endpoint evidence.
+#
+# This sentinel makes that collision impossible: it lives in the `OEBB:`
+# namespace, which no VIATOR-side token can ever occupy. It is not defensive
+# noise — it is the reason this fix is not #226. Do not delete it as unused.
+# Pinned by `test_two_id_less_itineraries_do_not_exact_match`.
+_OEBB_UNKNOWN_ENDPOINT = "OEBB:?"
 
 # `external_verify._hafas_time_to_utc_iso` persists VerifyLeg/VerifyItinerary
 # dep_utc/arr_utc as NAIVE Europe/Vienna wall-clock strings (the "_utc" name
@@ -169,20 +181,21 @@ def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
 
     `transit_fingerprint` reads (mode, from_stop_id, to_stop_id, lat,
     lon, departure, arrival, route_short_name) per leg. Our
-    VerifyItinerary stores UICs in `from_uic` / `to_uic` (already
-    canonical), so we surface them as `from_stop_id` / `to_stop_id` and
-    let the fingerprint extract the UIC out of the prefixed form (same
-    regex it uses for VIATOR's `SBB:8501120:0:5`-style stop_ids).
+    VerifyItinerary stores a :func:`external_verify.oebb_stop_id` TOKEN in
+    `from_uic` / `to_uic` — `UIC:NNNNNNN`, or `OEBB:…` for an ÖBB id that does
+    not normalise into the shared namespace — which
+    `signature._fingerprint_stop_token` passes through verbatim at its step 0.
+    A missing id becomes `_OEBB_UNKNOWN_ENDPOINT` rather than None; see that
+    constant for why the difference is load-bearing.
     """
     return [
         {
             "mode": leg.mode,
-            # `transit_fingerprint` parses the UIC out of the stop_id —
-            # `UIC:8503000` matches its 7-digit regex on the trailing
-            # number, so the cross-engine fingerprint agrees with a
-            # VIATOR-side `SBB:8503000:0:5`.
-            "from_stop_id": leg.from_uic,
-            "to_stop_id": leg.to_uic,
+            # Already-canonical tokens; `_fingerprint_stop_token` returns them
+            # unchanged, so an ÖBB `UIC:8503000` agrees with a VIATOR-side
+            # `SBB:8503000:0:5`, while an `OEBB:` token agrees with nothing.
+            "from_stop_id": leg.from_uic or _OEBB_UNKNOWN_ENDPOINT,
+            "to_stop_id": leg.to_uic or _OEBB_UNKNOWN_ENDPOINT,
             "departure": _oebb_naive_to_utc_iso(leg.dep_utc),
             "arrival": _oebb_naive_to_utc_iso(leg.arr_utc),
             "route_short_name": leg.route_name,
@@ -191,14 +204,32 @@ def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
     ]
 
 
-def _endpoint_uics(transit_legs: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """First/last UIC of the transit-leg spine, for the fuzzy fallback
-    endpoint match. Returns (None, None) on an empty spine — caller
+def _endpoint_token(stop_id: str | None) -> str | None:
+    """Canonical tokens pass through verbatim; anything else goes to
+    `extract_uic`, which is still the correct parser for VIATOR-side ids.
+
+    Without the passthrough, `extract_uic("OEBB:904050")` returns None and the
+    guard can no longer tell "ÖBB named a station outside our namespace" from
+    "there was no id at all". The REJECTION is identical either way — the
+    diagnostic signal is not, and that signal is what §7 item 2's measurement
+    step needs.
+
+    Outcome-identical to the previous code for every pre-existing input:
+    `extract_uic("UIC:8400058")` already returned `"UIC:8400058"`.
+    """
+    if stop_id and _CANONICAL_TOKEN_RE.fullmatch(stop_id):
+        return stop_id
+    return extract_uic(stop_id)
+
+
+def _endpoint_tokens(transit_legs: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """First/last endpoint token of the transit-leg spine, for the fuzzy
+    fallback endpoint match. Returns (None, None) on an empty spine — caller
     treats that as unmatchable."""
     if not transit_legs:
         return None, None
-    first = extract_uic(transit_legs[0].get("from_stop_id"))
-    last = extract_uic(transit_legs[-1].get("to_stop_id"))
+    first = _endpoint_token(transit_legs[0].get("from_stop_id"))
+    last = _endpoint_token(transit_legs[-1].get("to_stop_id"))
     return first, last
 
 
@@ -246,7 +277,7 @@ def _is_fuzzy_candidate(
     within ±5 min. Extracted from `_fuzzy_match` so the outer function
     stays under Sonar's cognitive-complexity ceiling — the cascade of
     five `continue` checks was the bulk of its complexity."""
-    o_first, o_last = _endpoint_uics(o_legs)
+    o_first, o_last = _endpoint_tokens(o_legs)
     if o_first != v_first or o_last != v_last:
         return False
     if _first_train_number(o_legs) != v_train:
@@ -272,7 +303,7 @@ def _fuzzy_match(
     see module docstring on the high-frequency-corridor false-positive
     risk).
     """
-    v_first, v_last = _endpoint_uics(viator_legs)
+    v_first, v_last = _endpoint_tokens(viator_legs)
     v_train = _first_train_number(viator_legs)
     v_dep = _first_transit_dep_dt(viator_legs)
     if v_first is None or v_last is None or v_train is None or v_dep is None:

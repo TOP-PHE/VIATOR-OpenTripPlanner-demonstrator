@@ -77,22 +77,27 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 
 - **Stop IDs**: UIC numeric code is canonical (`8503000` = Zürich HB). Adapters normalise via regex:
   - MOTIS form: `ScheduledStopPoint:8503000` or `feed:NNNNNNN`
-  - HAFAS form: `A=1@L=8503000` — **but `external_verify.extract_uic` does not actually extract this.**
-    Its regex is `(?<!\d)(\d{7,8})(?!\d)` used with `.search()`, i.e. the *first standalone 7–8 digit
-    run anywhere in the string*. A real HAFAS lid carries the coordinates first, so it returns a
-    **coordinate**, never the `L=` value. Verified against a live ÖBB probe 2026-09-07:
-    `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` → **`UIC:4899427`** (= 4.899427°E,
-    the longitude in micro-degrees) instead of the real UIC `8400058`, which is sitting in `L=`.
-    Note the return is the prefixed string `UIC:…`, and `m.group(1)[:7]` truncates: at |lon| ≥ 10 the
-    run is 8 digits so Wien yields `UIC:1637460` — neither a coordinate nor an id. At |lon| < 1 the X
-    run is too short to match and it falls through to the **latitude**. **This has never worked in
-    production, in any country** — not a cross-border-only problem. Every unit fixture uses a stripped
-    lid (`A=1@L=8000207@`) with no `X=`/`Y=`, which is exactly why the suite is green.
+  - **HAFAS form — use `external_verify.oebb_stop_id()`, NEVER `extract_uic`.** `extract_uic`'s regex
+    is `(?<!\d)(\d{7,8})(?!\d)` used with `.search()`, i.e. the *first standalone 7–8 digit run
+    anywhere in the string*, and a real lid carries the coordinates first — so it returns a
+    **coordinate**. Verified against a live ÖBB probe 2026-09-07:
+    `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` → **`UIC:4899427`** (= 4.899427°E)
+    instead of the real UIC `8400058` sitting in `L=`. Three regimes, since `m.group(1)[:7]` also
+    truncates: |lon| ≥ 10 → 8-digit run cut to `UIC:1637460` (neither coordinate nor id);
+    1 ≤ |lon| < 10 → the longitude verbatim; |lon| < 1 → falls through to the **latitude**. This never
+    worked in production, in any country. Every pre-existing fixture uses a stripped lid
+    (`A=1@L=8000207@`) with no `X=`/`Y=`, which is exactly why the suite was green.
+    **Fixed 2026-09-08.** `oebb_stop_id()` reads HAFAS's `extId` (present 7/7 in the probe) and falls
+    back to the lid's `L=` parsed **by field name**. It emits three states — `UIC:NNNNNNN` (normalised
+    into the shared namespace), `OEBB:<payload>` (a real ÖBB id we could NOT place there — Wien Hbf's
+    coords resolve to a *bus* terminal `904050`, 6 digits, not a UIC), or `None`. `extract_uic` itself
+    is unchanged and still correct for VIATOR-side ids; `test_extract_uic_must_never_be_called_on_a_
+    hafas_lid` is the permanent trip-wire against a new call site.
     *(An earlier version of this note claimed real `L=` values are 9-digit zero-padded and so "would
-    not match even if reached". The live probe contradicts that — `8400058`, `8898004` and `904050` are
-    all unpadded. The width rule still matters, but for the opposite reason: 6-digit ids like `904050`
-    fail it. §7 item 2.)* Consequence: the alignment matcher's endpoint-UIC guard compares two
-    coordinates and rejects essentially every pair. §7 item 2
+    not match even if reached". The probe contradicts that — `8400058`, `8898004`, `904050` are all
+    unpadded. `oebb_stop_id` absorbs padding regardless, since BE/AT MOTIS shapes do carry it.)*
+    **Every alignment score written before the fix was computed from coordinates** — NULLed by
+    `20260908_1200_null_pre_extid`; a re-sweep is required. §7 item 2
   - Canonical: `UIC:8503000`
   - Fallback: lat/lon rounded to ~110 m when no UIC available
   - **Coverage hubs (`network_coverage_hubs` table) carry NO UIC column today** — no FK/join to `master_stations`. The Re-run link's `&from_uic=&to_uic=` (PR-202, merged) is wired but always resolves to empty string until a follow-up adds the column + backfill.
@@ -354,24 +359,32 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
 2. **Endpoint identity: (a) is a bug — fix it. (b) is an OPEN QUESTION — measure it, don't assume it.
    (c) is a rejected approach.** *(Rewritten 2026-09-07 after a live ÖBB probe + adversarial review;
    the previous text asserted a namespace thesis that the probe refuted. See "What changed" below.)*
-   *(a) `extract_uic` has never worked, anywhere* — verified 2026-09-04, re-verified by live
-   `LocGeoPos` probe 2026-09-07. `_UIC_RE = (?<!\d)(\d{7,8})(?!\d)` with `.search()` takes the leftmost
-   standalone 7–8 digit run, and a real HAFAS lid orders its fields `A= @ O= @ X= @ Y= @ U= @ L=`, so it
-   returns the **X longitude in micro-degrees** and never reaches `L=`. Real probe response:
+   *(a) ✅ **FIXED 2026-09-08*** — `extract_uic` had never worked on a lid, anywhere. `_UIC_RE =
+   (?<!\d)(\d{7,8})(?!\d)` with `.search()` takes the leftmost standalone 7–8 digit run, and a real
+   HAFAS lid orders its fields `A= @ O= @ X= @ Y= @ U= @ L=`, so it returned the **X longitude in
+   micro-degrees** and never reached `L=`:
    `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` → `UIC:4899427` (= 4.899427°E).
    **Three failure regimes by longitude:** at |lon| ≥ 10 the run is 8 digits and `m.group(1)[:7]`
-   truncates it further (Wien → `UIC:1637460`, neither coordinate nor id); at 1 ≤ |lon| < 10 it returns
+   truncates it further (Wien → `UIC:1637552`, neither coordinate nor id); at 1 ≤ |lon| < 10 it returns
    the longitude verbatim; at |lon| < 1 the X run is too short to match and it falls through to the
-   **latitude**. Every unit fixture uses a stripped lid with no `X=`/`Y=` (`grep "X=" --include=*.py`
-   returns nothing), which is why the suite is green. It writes garbage into persisted JSONB on every
-   sweep — fix regardless of what follows.
-   **The clean value is already in the response and is being thrown away.** Every `locL` entry carries
-   `extId` beside `lid` (`8400058`, `8898004`, `904050` for the three probed stations). `extId` appears
-   **nowhere in the codebase**; `_index_hafas_locations` (`external_verify.py:550-554`) keeps only
-   `{lid, name}` and drops it one line before `_build_leg_from_section` (`:509-510`) could use it.
+   **latitude**. Every pre-existing fixture used a stripped lid with no `X=`/`Y=`, which is why the
+   suite was green on a function that never worked.
+   **The fix:** `oebb_stop_id()` reads HAFAS's `extId` (present on 7/7 TripSearch `locL` entries in the
+   live probe) and falls back to the lid's `L=` parsed **by field name**, never by substring search.
+   `_index_hafas_locations` now keeps `ext_id` — dropping it there was the proximate cause.
+   `extract_uic`'s code is **unchanged** and stays mirrored with `signature._uic_from_stop_id`; what
+   changed is that nothing calls it on a lid.
+   **Three-state token, and the middle state is load-bearing:** `UIC:NNNNNNN` (normalised into the
+   shared namespace) / `OEBB:<payload>` (a real ÖBB id we could NOT place there) / `None` (no id).
+   Do NOT "simplify" `OEBB:` away to `None`: `VerifyLeg` has no lat/lon, so a None endpoint becomes the
+   literal `"?,?"` — exactly what a VIATOR leg with neither id nor coordinates produces — and with equal
+   mode, minutes and route name the two hash identically and score a false `agree` on **zero** endpoint
+   evidence. `alignment._OEBB_UNKNOWN_ENDPOINT` closes that channel. Likewise `_oebb_opaque_payload`
+   strips leading zeros so an `OEBB:` payload can never contain a 7–8 digit run and re-parse back into
+   a UIC (raw `00904050` would have become the fabricated `UIC:0090405`).
    **Do NOT simply feed `extId` into `_UIC_RE`** — its 7–8 digit width returns `None` for 6-digit ids
-   (`904050`, and six of Wien's eight nearest candidates) and for 9-digit zero-padded ones. A naive
-   extId fix looks like a fix and is not one.
+   (`904050`, and six of Wien's eight nearest candidates). A naive extId fix looks like a fix and is
+   not one; that is why `_OEBB_UIC_RE` is a separate `fullmatch` with `0*` padding absorption.
    *(b) Whether the ÖBB id and the VIATOR id share a namespace is UNMEASURED.* The previous claim here
    — "it is ÖBB's INTERNAL station id" — **was wrong**, and traces to a single misattribution in #226's
    `f2c166b`: it read `extract_uic`'s broken output (`4899427`), assumed that was the `L=` field, and
@@ -580,9 +593,16 @@ docker compose -p viator logs web --since 2h | grep -i "external_verify\|sweep_e
 #    no_overlap/disagree? → the matcher, not the data.
 #      - whole 1-2h skew across the board = OeBB timestamps not localised (#220,
 #        fixed; VerifyLeg.dep_utc is naive Europe/Vienna despite the name)
-#      - otherwise = the endpoint-UIC guard. extract_uic returns a LONGITUDE, not a
-#        UIC (§3), so the guard compares two coordinates and rejects nearly
-#        everything. STILL OPEN — §7 item 2. Expect this on essentially every pair.
+#      - if the run predates 2026-09-08 = the endpoint-UIC guard. extract_uic
+#        returned a LONGITUDE, not a UIC (§3), so the guard compared two
+#        coordinates and rejected nearly everything. FIXED by oebb_stop_id();
+#        pre-fix scores are NULLed by 20260908_1200_null_pre_extid — re-sweep
+#        before reading anything into them.
+#      - on a POST-fix run, check the endpoint tokens in the cell modal. Two
+#        `OEBB:` tokens = OeBB named stations we could not map into the UIC
+#        namespace (expected at Wien Hbf, whose coords snap to a BUS terminal —
+#        the maxLoc:1 defect, still open). A `UIC:` vs `OEBB:` pair = genuine
+#        cross-namespace divergence. Neither is a matcher bug. §7 item 2.
 ```
 
 **The `web` container pegs at ~128% CPU and 13 GB+ RAM and never returns** (#214/#215): someone opened
