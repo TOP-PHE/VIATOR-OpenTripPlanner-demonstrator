@@ -56,7 +56,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -65,15 +65,38 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 
-# PR-196a — UIC extraction regex shared between the leg builder and the
-# alignment scorer. Matches a 7- or 8-digit run, prefers the first 7
-# digits as the canonical UIC (8-digit form is UIC + check digit, e.g.
-# SNCF's `OCELyria-87686006` carries UIC 8768600 + check 6). The
-# (?<!\d) / (?!\d) anchors avoid picking a substring of a longer digit
-# run or a sub-stop index of the right length — mirrors the rule in
-# app/journey/signature.py::_UIC_RE so both modules agree on which
-# digit run "is" the UIC.
+# PR-196a — UIC extraction regex for VIATOR-side stop ids. Matches a 7- or
+# 8-digit run, prefers the first 7 digits as the canonical UIC (8-digit form
+# is UIC + check digit, e.g. SNCF's `OCELyria-87686006` carries UIC 8768600 +
+# check 6). The (?<!\d) / (?!\d) anchors avoid picking a substring of a longer
+# digit run or a sub-stop index of the right length — mirrors the rule in
+# app/journey/signature.py::_UIC_RE so both modules agree on which digit run
+# "is" the UIC.
+#
+# ⚠️ NEVER run this against a raw HAFAS lid. It is a `.search()` over the whole
+# string, and a real lid orders its fields `A= @ O= @ X= @ Y= @ U= @ L=`, so
+# the first match is the X LONGITUDE in micro-degrees and `L=` is never
+# reached. Use `oebb_stop_id()` for HAFAS locations. The three failure regimes
+# are pinned by `test_extract_uic_must_never_be_called_on_a_hafas_lid`.
 _UIC_RE = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
+
+# ── canonical cross-engine stop-token vocabulary ──
+#
+# Deliberate twin of `app/journey/signature.py::_CANONICAL_TOKEN_RE`. This
+# module deliberately imports nothing from `app.journey` (the dependency
+# direction #242's diagrams document), so the vocabulary is duplicated rather
+# than shared — same pattern as the `_hafas_cat_to_mode` twin. Kept honest by
+# `test_canonical_token_vocabulary_agrees_across_modules`.
+_SCHEME_UIC = "UIC:"  # normalised into the shared cross-engine UIC namespace
+_SCHEME_OEBB = "OEBB:"  # a real ÖBB station id we could NOT place in that namespace
+_MAX_OPAQUE_PAYLOAD_CHARS = 64
+
+# `fullmatch`, not `search` — this classifies a station id we already hold,
+# rather than hunting for one inside a larger string. `0*` absorbs the BE/AT
+# zero padding (`008100002` → `8100002`); the leading `[1-9]` blocks the
+# all-zero degenerate; `\Z` rejects genuine 9+-significant-digit ids instead of
+# silently truncating them into a plausible-looking UIC.
+_OEBB_UIC_RE = re.compile(r"\A0*([1-9]\d{6,7})\Z")
 
 
 # ─────────────────────── HAFAS profile ───────────────────────
@@ -141,7 +164,19 @@ class VerifyLeg(BaseModel):
     (mode for WALK-strip + leg identity) and the modal renderer wants
     (route_name for the operator-readable train number). Walk legs
     carry mode='WALK' so the alignment scorer can drop them with the
-    same predicate that handles VIATOR-side trips."""
+    same predicate that handles VIATOR-side trips.
+
+    `from_uic` / `to_uic` keep their names for JSONB compatibility, but the
+    value is a **token** from :func:`oebb_stop_id`, not necessarily a UIC:
+    `UIC:NNNNNNN`, or `OEBB:<payload>` for a real ÖBB id we could not place in
+    the shared namespace, or None for no id at all.
+
+    The `*_id_raw` / `*_name` / `*_id_source` fields are the provenance
+    half of CLAUDE.md §7 item 7, landed here deliberately: they cost ~90 bytes
+    a leg against the ~1.7 KB/trip baseline, and adding them later would mean a
+    second ~14 h re-sweep for zero saving. `_id_raw` is what a future
+    `master_stations` pass joins on to correct a heuristically-labelled token
+    without re-sweeping. All optional so legacy JSONB rows still validate."""
 
     mode: str
     from_uic: str | None = None
@@ -149,6 +184,12 @@ class VerifyLeg(BaseModel):
     dep_utc: str | None = None
     arr_utc: str | None = None
     route_name: str | None = None
+    from_id_raw: str | None = None
+    to_id_raw: str | None = None
+    from_name: str | None = None
+    to_name: str | None = None
+    from_id_source: str | None = None
+    to_id_source: str | None = None
 
 
 class VerifyItinerary(BaseModel):
@@ -208,16 +249,131 @@ class VerifyResult(BaseModel):
 # ─────────────────────── HAFAS protocol bits ───────────────────────
 
 
-def extract_uic(stop_id: str | None) -> str | None:
-    """PR-196a — extract a canonical `UIC:NNNNNNN` token from any stop_id
-    a HAFAS or MOTIS / VIATOR leg might carry, or None if none present.
+class OebbStopId(NamedTuple):
+    """The outcome of classifying one ÖBB HAFAS location.
 
-    Handles three observed forms:
-      - HAFAS lid (`A=1@L=8503000@…`)               → `UIC:8503000`
+    `token` is what the matcher compares; `raw` is the untouched id kept for a
+    later `master_stations` join (so a mislabelled token can be audited and
+    corrected without a second ~14 h re-sweep); `source` records which field
+    it came from, which is how a namespace rejection becomes separable from a
+    genuine no-overlap.
+    """
+
+    token: str | None  # "UIC:NNNNNNN" | "OEBB:<payload>" | None
+    raw: str | None  # the untouched chosen id
+    source: str | None  # "extid" | "lid_L" | None
+
+
+def _lid_field(lid: str | None, key: str) -> str | None:
+    """Value of one `KEY=` field of a HAFAS lid, or None.
+
+    Splits on `@` and matches the field NAME exactly. This is the whole point:
+    a substring `.search()` over the whole lid is what made `extract_uic`
+    return a longitude. Splitting also terminates the value at the next `@`,
+    so a trailing `@B=1@` after `L=` is handled.
+
+    Do NOT read `U=` as a country code — the live probe shows `U=81` on both
+    NL and BE stations while docs/architecture.md:726 records `U=181` on an
+    Austrian one. It is not a country prefix.
+
+    A station name containing a literal `@` would break the split; accepted,
+    since we take the first segment whose prefix is exactly `key + "="`.
+    """
+    if not lid:
+        return None
+    prefix = f"{key}="
+    for seg in lid.split("@"):
+        if seg.startswith(prefix):
+            return seg[len(prefix) :].strip() or None
+    return None
+
+
+def _oebb_opaque_payload(raw: str) -> str:
+    """Payload for an `OEBB:` token.
+
+    INVARIANT, load-bearing — do not "simplify". An all-digit payload must
+    never contain a run of exactly 7 or 8 digits, or `_UIC_RE` /
+    `signature._UIC_RE` could re-parse it back into a UIC downstream. Leading
+    zeros are stripped for exactly that reason: emitting the raw `00904050`
+    would be an 8-digit run and would re-parse as the fabricated
+    `UIC:0090405`.
+
+    Proof: a stripped all-digit payload starts with a non-zero digit (or is
+    `"0"`), and any such value 7-8 digits long would already have matched
+    `_OEBB_UIC_RE` and become a `UIC:` token instead of reaching here.
+    """
+    value = raw.strip()[:_MAX_OPAQUE_PAYLOAD_CHARS]
+    if value.isdigit():
+        return value.lstrip("0") or "0"
+    return value
+
+
+def oebb_stop_id(ext_id: object, *, lid: str | None = None) -> OebbStopId:
+    """Classify one ÖBB HAFAS location into a comparable stop token.
+
+    Prefers `extId` — a clean station id present on every `locL` entry in the
+    live probe — and falls back to the lid's `L=` field parsed by NAME. It
+    never scans the lid for "a number that looks like a UIC"; that is the bug
+    this function exists to replace.
+
+    Three-state contract, and the distinction is the point:
+
+    - ``UIC:NNNNNNN`` — normalised into the shared cross-engine namespace, so
+      it is comparable to any other engine's `UIC:` token.
+    - ``OEBB:<payload>`` — a real ÖBB id we could NOT place in that namespace
+      (Wien Hbf's bus terminal `904050` is 6 digits and is not a UIC in any
+      scheme). It exists, it is identifiable, and it is comparable to nothing.
+    - ``None`` — there was no id at all.
+
+    Collapsing the middle case into `None` would be actively unsafe: VerifyLeg
+    carries no lat/lon, so a None endpoint reaches
+    `signature._round_latlon_coarse(None, None)` and becomes the literal
+    `"?,?"` — which a VIATOR leg missing both id and coordinates also produces.
+    Same mode, same rounded minutes, same route name would then hash
+    identically and score a 1.00 `agree` on ZERO endpoint evidence.
+
+    `ext_id` is deliberately typed `object` and `str()`-coerced: HAFAS field
+    types are untrusted. #213 was exactly this — a numeric `cat` raised
+    `AttributeError` and was swallowed per-cell as
+    `external_error='sweep_exception'`.
+
+    The 7-or-8-digit width test is a HEURISTIC, not a registry lookup: a
+    7-digit ÖBB id that is not really a UIC will be labelled `UIC:`. That is
+    why `raw` is retained — see §7 item 7 (`master_stations`).
+    """
+    raw = str(ext_id).strip() if ext_id is not None else ""
+    source = "extid"
+    if not raw:
+        raw = _lid_field(lid, "L") or ""
+        source = "lid_L"
+    if not raw:
+        return OebbStopId(None, None, None)
+    m = _OEBB_UIC_RE.fullmatch(raw)
+    if m:
+        # 8-digit = 7-digit UIC + trailing check digit → keep first 7. Parity
+        # with `extract_uic` and `signature._uic_from_stop_id` is mandatory:
+        # an asymmetry here would engineer a systematic cross-engine mismatch
+        # across the whole FR 87xxxxxx corridor.
+        return OebbStopId(f"{_SCHEME_UIC}{m.group(1)[:7]}", raw, source)
+    return OebbStopId(f"{_SCHEME_OEBB}{_oebb_opaque_payload(raw)}", raw, source)
+
+
+def extract_uic(stop_id: str | None) -> str | None:
+    """PR-196a — extract a canonical `UIC:NNNNNNN` token from a VIATOR-side
+    stop_id, or None if none present.
+
+    Handles two observed forms:
       - MOTIS / GTFS-flavoured (`ScheduledStopPoint:8503000`) → `UIC:8503000`
       - SNCF 8-digit (`OCELyria-87686006`)          → `UIC:8768600`
         (the trailing digit is a Luhn-style check, dropped to align with
         SBB's 7-digit UICs of the SAME train)
+
+    ⚠️ **Never call this on a raw HAFAS lid.** It is a `.search()` over the
+    whole string, and a real lid orders its fields `A= @ O= @ X= @ Y= @ U= @
+    L=` — so it returns the X longitude in micro-degrees, not the station id.
+    Only the coordinate-free `A=1@L=8503000@` form parses by luck, and no live
+    response carries that shape. Use :func:`oebb_stop_id` for HAFAS locations.
+    Pinned by `test_extract_uic_must_never_be_called_on_a_hafas_lid`.
 
     Returns None on any other shape — caller treats that as "non-UIC
     endpoint, fall back to lat/lon for matching". Mirrors the
@@ -504,13 +660,23 @@ def _build_leg_from_section(
     dep_loc = _lookup_indexed(dep.get("locX"), locations)
     arr_loc = _lookup_indexed(arr.get("locX"), locations)
     mode, route_name = _resolve_section_mode_and_route(sec_type, sec.get("jny"), products)
+    # `oebb_stop_id`, NOT `extract_uic` — the latter is a `.search()` over the
+    # whole lid and returns the X longitude. See both docstrings.
+    dep_id = oebb_stop_id(dep_loc.get("ext_id"), lid=dep_loc.get("lid"))
+    arr_id = oebb_stop_id(arr_loc.get("ext_id"), lid=arr_loc.get("lid"))
     return VerifyLeg(
         mode=mode,
-        from_uic=extract_uic(dep_loc.get("lid")),
-        to_uic=extract_uic(arr_loc.get("lid")),
+        from_uic=dep_id.token,
+        to_uic=arr_id.token,
         dep_utc=_hafas_time_to_utc_iso(date, dep.get("dTimeS")),
         arr_utc=_hafas_time_to_utc_iso(date, arr.get("aTimeS")),
         route_name=route_name,
+        from_id_raw=dep_id.raw,
+        to_id_raw=arr_id.raw,
+        from_name=dep_loc.get("name"),
+        to_name=arr_loc.get("name"),
+        from_id_source=dep_id.source,
+        to_id_source=arr_id.source,
     )
 
 
@@ -524,10 +690,11 @@ def _build_itinerary_from_connection(
     Walks every `secL` section via `_build_leg_from_section`. JNY → transit
     leg with product line as `route_name` + RAIL/BUS/... mode mapped from
     the product category, WALK/TRSF → mode='WALK' so the alignment scorer
-    can strip uniformly across HAFAS / MOTIS / VIATOR. Endpoints are UIC
-    tokens when the HAFAS lid carries one (the common case for mainline
-    rail) or None otherwise (rare — small bus stops the journey UI never
-    reaches anyway).
+    can strip uniformly across HAFAS / MOTIS / VIATOR. Endpoints carry a
+    :func:`oebb_stop_id` token — `UIC:NNNNNNN` when the station's id
+    normalises into the shared namespace (the common case for mainline rail),
+    `OEBB:<payload>` when it is a real ÖBB id that does not (Wien Hbf's bus
+    terminal), or None when there is no id at all.
     """
     date = conn.get("date")
     legs: list[VerifyLeg] = []
@@ -548,10 +715,21 @@ def _build_itinerary_from_connection(
 
 
 def _index_hafas_locations(loc_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    """PR-196a — `{idx: {lid, name}}` from `common.locL`. Subset of the
-    hafas_client.py index — the alignment scorer only needs the lid for
-    UIC extraction, not the coords."""
-    return {i: {"lid": loc.get("lid"), "name": loc.get("name")} for i, loc in enumerate(loc_l)}
+    """PR-196a — `{idx: {lid, name, ext_id}}` from `common.locL`.
+
+    `ext_id` is the station id HAFAS supplies as a clean field beside the lid
+    (present on 7/7 entries in the live probe). **Dropping it here was the
+    proximate cause of the endpoint-identity bug**: it was discarded one line
+    before `_build_leg_from_section` — the only caller — had to fall back to
+    scraping the lid, which returned a longitude. Pinned by
+    `test_index_hafas_locations_keeps_ext_id`.
+
+    Still a subset of the hafas_client.py index: the alignment scorer needs
+    identity and a display name, not the coords."""
+    return {
+        i: {"lid": loc.get("lid"), "name": loc.get("name"), "ext_id": loc.get("extId")}
+        for i, loc in enumerate(loc_l)
+    }
 
 
 def _index_hafas_products(prod_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:

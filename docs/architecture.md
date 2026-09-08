@@ -720,18 +720,28 @@ polylines stay out.
   stay bit-identical.** Adding a filter or dedup to that branch breaks the rollback story —
   and note K=1 also skips `_trip_belongs_to_window`, so walk-only trips that K>1 discards
   will count as `ok` at K=1.
-- **`extract_uic` is broken on real HAFAS lids, and this makes alignment scores
-  unreliable.** `_UIC_RE = (?<!\d)(\d{7,8})(?!\d)` is applied with `.search()` to the whole
-  lid. A production ÖBB lid looks like
-  `A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008100002@B=1@` — the regex latches onto
-  the first 7–8-digit run, which is the **longitude in micro-degrees** (`16375526` →
-  `UIC:1637552`), not the station. Worse, the real `L=` value is zero-padded to 9 digits,
-  which the anchored 7-or-8-digit pattern cannot match at all. The unit tests use a
-  synthetic short lid (`A=1@L=8507000@`) that hides both failures. Consequence: ÖBB-side
-  `from_uic`/`to_uic` are wrong, `transit_fingerprint` never agrees across engines, and
-  both the exact pass and the fuzzy endpoint check fail — cells collapse toward
-  `no_overlap`/`disagree`. **Treat published alignment scores as unvalidated until this is
-  fixed** (parse the `L=` field explicitly, strip leading zeros).
+- **ÖBB endpoint identity: never call `extract_uic` on a HAFAS lid.** `_UIC_RE =
+  (?<!\d)(\d{7,8})(?!\d)` is a `.search()` over the whole string, and a production lid
+  orders its fields `A= @ O= @ X= @ Y= @ U= @ L=` —
+  `A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008100002@B=1@` — so it latches onto the
+  **longitude in micro-degrees** (`16375526` → `UIC:1637552`) and never reaches the station
+  id. Three regimes: at |lon| ≥ 10 the 8-digit run is additionally truncated by `[:7]`; at
+  1 ≤ |lon| < 10 the longitude is returned verbatim; at |lon| < 1 the X run is too short to
+  match and it falls through to the **latitude**. Fixture lids in the tests are synthetic
+  short forms (`A=1@L=8507000@`) that hide all three.
+  **Fixed** by `oebb_stop_id()`, which reads HAFAS's `extId` field (present on 7/7 entries
+  in a live probe) and falls back to the lid's `L=` parsed **by field name**, never by
+  substring search. It emits a three-state token — `UIC:NNNNNNN` when the id normalises into
+  the shared cross-engine namespace, `OEBB:<payload>` for a real ÖBB id that does not (Wien
+  Hbf's coordinates resolve to a regional *bus* terminal, `904050`, which is not a UIC in
+  any scheme), and `None` for no id at all. The middle state is load-bearing: collapsing it
+  to `None` would make an ÖBB leg fingerprint as `"?,?"` — identical to a VIATOR leg with
+  neither id nor coordinates — and score a false `agree` on zero endpoint evidence.
+  *Correction to an earlier version of this note:* the real `L=` values are **not**
+  zero-padded to 9 digits (`8400058`, `8898004`, `904050` in the probe are all unpadded);
+  `oebb_stop_id` absorbs padding anyway, since the BE/AT MOTIS shapes do carry it.
+  **Every alignment score written before this fix was computed from coordinates** and is
+  NULLed by migration `20260908_1200_null_pre_extid`; a re-sweep is required.
 - **The sweep compares a full day against a single moment.** VIATOR's side is every trip
   found across all K slots of the run window; the ÖBB side is one `TripSearch` anchored at
   `run.depart_at` with `numF=5`. Even with a correct UIC parser, that asymmetry
