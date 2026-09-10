@@ -25,7 +25,7 @@ from typing import Any
 
 from sqlalchemy import asc
 
-from . import graph_snapshots
+from . import engine_versions, graph_snapshots
 from .db import SessionLocal
 from .models import RebuildJob
 from .models import Session as SessionRow
@@ -1001,7 +1001,36 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
             _MAXMEM_MARKER.unlink(missing_ok=True)
 
 
-_MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"
+# Pinned in `app/engine_versions.py`, which the serve template reads too — build
+# and serve must not drift apart. Was `:latest`, which never moved because the
+# deploy path only pulls web/worker; see that module's docstring.
+_MOTIS_IMAGE = engine_versions.MOTIS_IMAGE
+
+
+def _motis_version() -> str:
+    """Best-effort engine version string, recorded in every rebuild log.
+
+    Nothing used to record which MOTIS actually built a graph, so a three-version
+    drift stayed invisible for months. This is the cheap half of the fix; the
+    durable half is an `engine_build` row (MCT design chapter 10). Never raises —
+    a missing version must not fail a build.
+    """
+    # Built as a local first, matching the other docker invocations here — an
+    # inline literal trips ruff's S607 (partial executable path) where a variable
+    # does not, and the argv is constants only, so S603 does not apply either.
+    version_cmd = ["docker", "run", "--rm", _MOTIS_IMAGE, "/motis", "--version"]
+    try:
+        proc = subprocess.run(  # noqa: S603
+            version_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unknown ({type(exc).__name__})"
+    out = (proc.stdout or proc.stderr or "").strip()
+    return out.splitlines()[0] if out else "unknown"
 
 # Separator the rebuild-log emits between captured stdout and stderr from
 # any docker subprocess. Module-level constant so Sonar's S1192 isn't
@@ -1265,6 +1294,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             check=False,
         )
         output = (
+            f"[viator] engine: {_MOTIS_IMAGE} ({_motis_version()})\n"
             "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"

@@ -17,6 +17,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
+from . import engine_versions
 from .models import Session as SessionRow
 from .models.sessions import SessionState
 
@@ -106,8 +107,14 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
 #     needed so the serve process can map the read-only data dir without
 #     uid-mismatch quirks (the worker writes the data dir as root via its
 #     own `--user 0:0` runs).
+# The image is rendered from `engine_versions.MOTIS_IMAGE`, the same constant the
+# worker's build containers use. It was `${{MOTIS_VERSION:-latest}}` — an env var
+# nothing ever set, so it always resolved to `latest`, and architecture.md ch.7
+# already warned that pinning the builder alone would let the two drift apart.
+# Writing the resolved tag into the compose file also means an operator reading
+# it can see which version is actually serving.
 _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
-    image: ghcr.io/motis-project/motis:${{MOTIS_VERSION:-latest}}
+    image: {motis_image}
     restart: unless-stopped
     user: "0:0"
     volumes:
@@ -190,6 +197,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
             parts.append(
                 _MOTIS_SVC_TEMPLATE.format(
                     sid=s.id,
+                    motis_image=engine_versions.MOTIS_IMAGE,
                     # MOTIS imports the full year up front; cold-start is
                     # dominated by data-mmap, not query warmup. Reuse the
                     # OTP knob so operators tune both planners the same way.
