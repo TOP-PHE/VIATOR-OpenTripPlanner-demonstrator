@@ -91,6 +91,68 @@ def test_leg_canonical_maps_motis_fields_to_otp_shape():
     assert out["distance_meters"] == 0.0
 
 
+def test_leg_canonical_surfaces_stop_code_and_parent_id():
+    """MOTIS returns `stopCode` and `parentId` on every Place and both were
+    being dropped. Values verbatim from the live eu19 session, 2026-09-07.
+
+    `stopCode` is the ONLY place a NAP feed hands us a real UIC — on the
+    `eurostar` feed it is `8400058` for Amsterdam Centraal, identical to what
+    ÖBB HAFAS returns as `extId`. `parentId` groups the three platform-level
+    Amsterdam stopIds into one station.
+
+    `stopId` must stay untouched: it keys `_feed_id_from_motis_id` and
+    `stations_xref (session_id, stop_id)`.
+    """
+    leg = {
+        "mode": "REGIONAL_RAIL",
+        "startTime": "2026-09-09T09:10:00Z",
+        "endTime": "2026-09-09T11:06:00Z",
+        "duration": 6960,
+        "from": {
+            "name": "Amsterdam-Centraal",
+            "lat": 52.379650,
+            "lon": 4.899982,
+            "stopId": "eurostar_amsterdam_centraal",
+            "stopCode": "8400058",
+            "parentId": "eurostar_amsterdam_centraal_station_area",
+        },
+        "to": {
+            "name": "Bruxelles-Midi",
+            "lat": 50.835374,
+            "lon": 4.335695,
+            "stopId": "eurostar_bruxelles_midi",
+            "stopCode": "8814001",
+            "parentId": "eurostar_bruxelles_midi_station_area",
+        },
+        "routeShortName": "NLAMA -> GBSPX",
+    }
+    out = _leg_to_canonical(leg)
+
+    assert out["from_stop_id"] == "eurostar_amsterdam_centraal", "stopId unchanged"
+    assert out["from_stop_code"] == "8400058", "the real UIC, previously dropped"
+    assert out["from_parent_id"] == "eurostar_amsterdam_centraal_station_area"
+    assert out["to_stop_code"] == "8814001"
+    assert out["to_parent_id"] == "eurostar_bruxelles_midi_station_area"
+
+
+def test_leg_canonical_parent_id_groups_platform_level_stops():
+    """`nl-nap` returns platform-level stops: Amsterdam Centraal arrives as
+    three distinct stopIds that all share one parentId. Without it the same
+    station fingerprints differently depending on which platform was used."""
+    parents = set()
+    for sid in ("nl-nap_2992170", "nl-nap_2992179", "nl-nap_2992182"):
+        out = _leg_to_canonical(
+            {
+                "mode": "REGIONAL_RAIL",
+                "from": {"stopId": sid, "parentId": "nl-nap_stoparea:18188"},
+                "to": {"stopId": "nl-nap_2992416", "parentId": "nl-nap_stoparea:482359"},
+            }
+        )
+        parents.add(out["from_parent_id"])
+        assert out["from_stop_code"] is None, "nl-nap publishes no stop_code on these"
+    assert parents == {"nl-nap_stoparea:18188"}, "three platforms, one station"
+
+
 def test_leg_canonical_tolerates_missing_optional_fields():
     out = _leg_to_canonical(
         {"mode": "WALK", "startTime": "2026-06-01T08:00:00Z", "endTime": "2026-06-01T08:05:00Z"}
