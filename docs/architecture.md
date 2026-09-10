@@ -1176,8 +1176,15 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 - **Orphan cleanup is OTP-only, by design.** The `docker ps` filter is `name=^viator-otp-`, and
   the expected-set is filtered to the `otp-` prefix so a MOTIS name can't mask a removed OTP
   session. Consequence: a deleted MOTIS session's `motis-<sid>` container is never torn down.
-- **The MOTIS build image is hardcoded** (`_MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"`)
-  while the serve template uses `${MOTIS_VERSION:-latest}`. Pin one and the other drifts.
+- **The MOTIS image is pinned once, in `app/engine_versions.py`**, and both the build containers
+  (`worker.run_build_motis`) and the serve template read it from there. This trap was previously
+  recorded here as a warning and then sprung anyway: the builder said `:latest` and the serve
+  template said `${MOTIS_VERSION:-latest}` — an env var nothing ever set. Because Docker fetches
+  `:latest` only when the image is absent locally, and the deploy recipe pulls `web`/`worker` only,
+  production ran **v2.10.2 from 2026-05-30 until 2026-09-10**, three minor versions behind, with
+  nothing recording the fact. Bump `MOTIS_VERSION` to upgrade; `VIATOR_MOTIS_VERSION` overrides it
+  for a one-off test. Every MOTIS rebuild log now opens with the resolved image, which is
+  informative only because the tag is pinned; the resolved digest is future work.
 - **`otp_heap` is the *serve* heap; `otp_build_heap` is the *build* heap.** Confusable names.
   If `otp_heap` is unset the orchestrator derives ~⅓ of the build heap, floored at 4 g — this
   closed the trap where a 64 g build succeeded and the serve container crash-looped at a hidden
@@ -2169,8 +2176,8 @@ the commodity part. Three consequences:
 3. **The differentiator moved.** Speaking OJP is no longer the distinctive part. Serving it over a
    multi-session fanout with per-oracle comparison and alignment scoring still is.
 
-**Practical note, worth checking before any of this is built.** The orchestrator pins
-`ghcr.io/motis-project/motis:${MOTIS_VERSION:-latest}` (chapter 7), so any MOTIS session container
+**Practical note, worth checking before any of this is built.** The orchestrator pins the MOTIS image via
+`engine_versions.MOTIS_IMAGE` (chapter 7), currently `2.11.2`, so any MOTIS session container
 rebuilt since March 2026 is **very likely already exposing `/ojp20`**, unflagged. Confirm it by
 POSTing a minimal `OJPTripRequest` at the container directly - a `GET` proves little, since a
 POST-only route may legitimately answer 404. A positive result is a free local **integration** target
