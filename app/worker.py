@@ -1032,6 +1032,7 @@ def _motis_version() -> str:
     out = (proc.stdout or proc.stderr or "").strip()
     return out.splitlines()[0] if out else "unknown"
 
+
 # Separator the rebuild-log emits between captured stdout and stderr from
 # any docker subprocess. Module-level constant so Sonar's S1192 isn't
 # tripped by the OTP + MOTIS builders both reaching for the same string.
