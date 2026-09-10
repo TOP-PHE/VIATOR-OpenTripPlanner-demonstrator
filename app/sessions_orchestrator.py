@@ -135,17 +135,33 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
       # container reported (unhealthy), preventing docker from auto-
       # restarting MOTIS when the HTTP server actually died.
       #
-      # `--timeout=15` / `timeout: 20s` (was 5s/10s): the 2026-07-01 eu19
-      # incident showed autoheal restarting eu19-transit-motis every ~6min
-      # for 2h+ straight even with a healthy, un-overloaded host (18 cores,
-      # MOTIS pegged at only ~2). Root cause wasn't a dead process — a
-      # handful of concurrent heavy RAPTOR queries on the 19-country graph
-      # occasionally made the HTTP layer too slow to answer a trivial `GET
-      # /` within 5s, which 3 consecutive misses (`retries: 3`) then read
-      # as "dead". Widening the per-probe budget stops "briefly busy doing
-      # real work" from being misread as "hung" without materially
-      # softening genuine-zombie detection (still ~3 x 30s intervals).
-      test: ["CMD", "wget", "--spider", "-q", "--timeout=15", "http://localhost:8080/"]
+      # PROBE 127.0.0.1, NEVER `localhost`. MOTIS binds IPv4 only —
+      # `listening on 0.0.0.0:8080` — while `localhost` inside the container
+      # resolves to ::1 first. BusyBox wget tries ::1, gets ECONNREFUSED and
+      # stops; it does not fall back to IPv4. So the probe failed instantly,
+      # always, on a server that was answering perfectly well. Measured on the
+      # VPS 2026-09-10, same container, same instant:
+      #     wget http://127.0.0.1:8080/  -> exit 0
+      #     wget http://localhost:8080/  -> "can't connect: Connection refused"
+      #     curl from the web container  -> 200
+      #
+      # This healthcheck had therefore NEVER passed. Two earlier fixes missed
+      # it because both blamed the symptom: the curl probe was replaced by wget
+      # (correct — the image has no curl), and later the budget was widened
+      # from 5s/10s to 15s/20s on the theory that heavy RAPTOR queries made the
+      # HTTP layer too slow to answer in time. It was never slow. It was
+      # refused, in microseconds. That reading is retracted, and it explains
+      # what CLAUDE.md already flagged as disputed about 2026-07-01: MOTIS at
+      # "199% CPU" on an 18-core host is idle, not overloaded, and ~6min
+      # between restarts is just retries x interval plus a cold start.
+      #
+      # The OTP template still says `localhost` and is fine: curl tries ::1
+      # then falls back to IPv4. Left alone deliberately — it works, and this
+      # commit fixes a live bug rather than harmonising healthy code.
+      #
+      # `-O /dev/null` rather than `--spider`: a plain GET is exactly what was
+      # verified working above. `--spider` was not, and is not worth assuming.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "--timeout=15", "http://127.0.0.1:8080/"]
       interval: 30s
       timeout: 20s
       start_period: {start_period}s
