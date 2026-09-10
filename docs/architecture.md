@@ -1183,8 +1183,8 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
   `:latest` only when the image is absent locally, and the deploy recipe pulls `web`/`worker` only,
   production ran **v2.10.2 from 2026-05-30 until 2026-09-10**, three minor versions behind, with
   nothing recording the fact. Bump `MOTIS_VERSION` to upgrade; `VIATOR_MOTIS_VERSION` overrides it
-  for a one-off test. Every MOTIS rebuild log now opens with the resolved image and its
-  `/motis --version` output.
+  for a one-off test. Every MOTIS rebuild log now opens with the resolved image, which is
+  informative only because the tag is pinned; the resolved digest is future work.
 - **`otp_heap` is the *serve* heap; `otp_build_heap` is the *build* heap.** Confusable names.
   If `otp_heap` is unset the orchestrator derives ~⅓ of the build heap, floored at 4 g — this
   closed the trap where a 64 g build succeeded and the serve container crash-looped at a hidden

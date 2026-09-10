@@ -1007,32 +1007,6 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
 _MOTIS_IMAGE = engine_versions.MOTIS_IMAGE
 
 
-def _motis_version() -> str:
-    """Best-effort engine version string, recorded in every rebuild log.
-
-    Nothing used to record which MOTIS actually built a graph, so a three-version
-    drift stayed invisible for months. This is the cheap half of the fix; the
-    durable half is an `engine_build` row (MCT design chapter 10). Never raises —
-    a missing version must not fail a build.
-    """
-    # Built as a local first, matching the other docker invocations here — an
-    # inline literal trips ruff's S607 (partial executable path) where a variable
-    # does not, and the argv is constants only, so S603 does not apply either.
-    version_cmd = ["docker", "run", "--rm", _MOTIS_IMAGE, "/motis", "--version"]
-    try:
-        proc = subprocess.run(  # noqa: S603
-            version_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"unknown ({type(exc).__name__})"
-    out = (proc.stdout or proc.stderr or "").strip()
-    return out.splitlines()[0] if out else "unknown"
-
-
 # Separator the rebuild-log emits between captured stdout and stderr from
 # any docker subprocess. Module-level constant so Sonar's S1192 isn't
 # tripped by the OTP + MOTIS builders both reaching for the same string.
@@ -1295,7 +1269,14 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             check=False,
         )
         output = (
-            f"[viator] engine: {_MOTIS_IMAGE} ({_motis_version()})\n"
+            # Records which engine built this graph. Under the old `:latest` the
+            # tag said nothing — production ran v2.10.2 for months unnoticed — so
+            # this line is only meaningful because the tag is now pinned. A probe
+            # (`/motis --version`) was tried and dropped: it added a third docker
+            # run to a lifecycle two tests deliberately assert is exactly two, and
+            # the complete answer is the resolved *digest*, which belongs with the
+            # `engine_build` row (MCT design ch.10.2), not a per-build shell-out.
+            f"[viator] engine: {_MOTIS_IMAGE}\n"
             "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"
