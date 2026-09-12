@@ -722,12 +722,13 @@ polylines stay out.
   will count as `ok` at K=1.
 - **ÖBB endpoint identity: never call `extract_uic` on a HAFAS lid.** `_UIC_RE =
   (?<!\d)(\d{7,8})(?!\d)` is a `.search()` over the whole string, and a production lid
-  orders its fields `A= @ O= @ X= @ Y= @ U= @ L=` —
-  `A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008100002@B=1@` — so it latches onto the
-  **longitude in micro-degrees** (`16375526` → `UIC:1637552`) and never reaches the station
-  id. Three regimes: at |lon| ≥ 10 the 8-digit run is additionally truncated by `[:7]`; at
-  1 ≤ |lon| < 10 the longitude is returned verbatim; at |lon| < 1 the X run is too short to
-  match and it falls through to the **latitude**. Fixture lids in the tests are synthetic
+  orders its fields `A= @ O= @ X= @ Y= @ U= @ L=` — verbatim from the 2026-09-07 probe,
+  `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` — so it latches onto the
+  **longitude in micro-degrees** (`4899427` → `UIC:4899427`, 4.899427° E) and never reaches
+  the station id `8400058`. Three regimes: at |lon| ≥ 10 the 8-digit run is additionally
+  truncated by `[:7]` (a Wien longitude, `X=16375526` → `UIC:1637552`); at 1 ≤ |lon| < 10
+  the longitude is returned verbatim, as above; at |lon| < 1 the X run is too short to match
+  and it falls through to the **latitude**. Fixture lids in the tests are synthetic
   short forms (`A=1@L=8507000@`) that hide all three.
   **Fixed** by `oebb_stop_id()`, which reads HAFAS's `extId` field (present on 7/7 entries
   in a live probe) and falls back to the lid's `L=` parsed **by field name**, never by
