@@ -396,8 +396,11 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    is right and *"is ÖBB's internal id"* is wrong — it is station-by-station.
    ⚠️ **The old "MOTIS reports `stopCode=8814001`" was UNSOURCED and must not be reused.** `stopCode`
    appears exactly once in this repo — in the sentence that has now been deleted. `motis_client.py:270`
-   reads `stopId`, formatted `<feed>_<local>`; no captured MOTIS response exists in the tree; and the
-   only other place naming 8814001 (`test_hub_derive.py:171`) calls it Bruxelles-**Nord**.
+   reads `stopId`, formatted `<feed>_<local>`; and no captured MOTIS response exists in the tree.
+   *(Corrected 2026-09-12: this note also cited `test_hub_derive.py` calling 8814001 Bruxelles-**Nord**.
+   That comment was wrong and #261 fixed it — Trainline `stations.csv` gives `8814001` as
+   Bruxelles-**Midi**'s `uic`; Nord is `8812005`. The id is plausible for Midi; what stays unsourced
+   is that MOTIS emits it.)*
    **Capture one real MOTIS response for Amsterdam→Brussels before designing anything on this.**
    **Do NOT drop the guard.** #226 proposed exactly that and was rejected for the right reason: it
    trades a *visible* false negative (`no_overlap` on a correct match) for *invisible* false positives
