@@ -44,9 +44,11 @@ AMS_EXTID = "8400058"
 BXL_LID = "A=1@O=Bruxelles Midi@X=4335695@Y=50835375@U=81@L=8800004@"
 BXL_EXTID = "8800004"
 
-# From docs/architecture.md:726 — the only in-tree record of a ZERO-PADDED `L=`
-# carrying a trailing `B=` field after it.
-WIEN_PADDED_LID = "A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008100002@B=1@"
+# SYNTHETIC, not a probe capture: every probe `L=` above is unpadded. Pins a
+# ZERO-PADDED `L=` with a trailing `B=` field after it, which `oebb_stop_id`
+# must absorb anyway. Wien Hbf's EVA is `8103000` (Trainline db_id/obb_id);
+# `8100002` is Salzburg Hbf's.
+WIEN_PADDED_LID = "A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008103000@B=1@"
 
 # A |lon| < 1 station (Greenwich meridian): the X run is only 6 digits, so it
 # does not match the 7-8 width and `.search()` falls through to the LATITUDE.
@@ -258,9 +260,9 @@ def test_oebb_stop_id_lid_fallback_reads_the_L_field_not_the_coordinates() -> No
 def test_oebb_stop_id_lid_fallback_handles_padded_and_trailing_fields() -> None:
     """Zero-padded `L=` plus a trailing `@B=1@` after it, in one case."""
     got = external_verify.oebb_stop_id(None, lid=WIEN_PADDED_LID)
-    assert got.token == "UIC:8100002"
+    assert got.token == "UIC:8103000"
     assert got.token != "UIC:1637552", "must not read the truncated X longitude"
-    assert got.raw == "008100002"
+    assert got.raw == "008103000"
 
 
 def test_oebb_stop_id_lid_without_L_field_yields_no_token() -> None:
@@ -272,10 +274,10 @@ def test_oebb_stop_id_lid_without_L_field_yields_no_token() -> None:
 
 def test_oebb_stop_id_ignores_the_U_field() -> None:
     """`U=` is not a country code — the live probe shows `U=81` on both NL and
-    BE stations, while docs/architecture.md:726 records `U=181` on an Austrian
-    one. Only `L=` is read."""
+    BE stations. Only `L=` is read, so the synthetic Wien lid's `U=181` changes
+    nothing."""
     assert external_verify.oebb_stop_id(None, lid=AMS_LID).token == "UIC:8400058"
-    assert external_verify.oebb_stop_id(None, lid=WIEN_PADDED_LID).token == "UIC:8100002"
+    assert external_verify.oebb_stop_id(None, lid=WIEN_PADDED_LID).token == "UIC:8103000"
 
 
 def test_oebb_stop_id_prefers_extid_over_lid() -> None:

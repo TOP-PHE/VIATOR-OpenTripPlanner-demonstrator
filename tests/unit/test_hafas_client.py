@@ -37,18 +37,18 @@ def test_index_locations_inverts_micro_degrees_to_decimals() -> None:
     loc_l = [
         {
             "name": "Wien Hbf",
-            "lid": "A=1@L=8100002@",
+            "lid": "A=1@L=8103000@",
             "crd": {"x": 16_375_400, "y": 48_185_900},
         },
         {
             "name": "Salzburg Hbf",
-            "lid": "A=1@L=8100173@",
+            "lid": "A=1@L=8100002@",
             "crd": {"x": 13_046_700, "y": 47_812_700},
         },
     ]
     out = hafas_client._index_locations(loc_l)
     assert out[0]["name"] == "Wien Hbf"
-    assert out[0]["lid"] == "A=1@L=8100002@"
+    assert out[0]["lid"] == "A=1@L=8103000@"
     # lat = y / 1e6, lon = x / 1e6 — inverting LocGeoPos's swap.
     assert out[0]["lat"] == pytest.approx(48.185900)
     assert out[0]["lon"] == pytest.approx(16.375400)
@@ -207,12 +207,12 @@ def _real_world_payload() -> dict:
         "locL": [
             {
                 "name": "Wien Hbf",
-                "lid": "A=1@L=8100002@",
+                "lid": "A=1@L=8103000@",
                 "crd": {"x": 16_375_400, "y": 48_185_900},
             },
             {
                 "name": "Salzburg Hbf",
-                "lid": "A=1@L=8100173@",
+                "lid": "A=1@L=8100002@",
                 "crd": {"x": 13_046_700, "y": 47_812_700},
             },
         ],
@@ -267,8 +267,8 @@ def test_normalise_payload_happy_path_canonical_trip_dict() -> None:
     assert leg["mode"] == "RAIL"
     assert leg["from_name"] == "Wien Hbf"
     assert leg["to_name"] == "Salzburg Hbf"
-    assert leg["from_stop_id"] == "A=1@L=8100002@"
-    assert leg["to_stop_id"] == "A=1@L=8100173@"
+    assert leg["from_stop_id"] == "A=1@L=8103000@"
+    assert leg["to_stop_id"] == "A=1@L=8100002@"
     assert leg["from_lat"] == pytest.approx(48.185900)
     assert leg["to_lat"] == pytest.approx(47.812700)
     assert leg["route_short_name"] == "RJ"
@@ -412,8 +412,8 @@ async def test_fetch_plan_happy_returns_ok_and_trips() -> None:
     handler = _two_step_handler(
         resolve_response=_locgeopos_response(
             [
-                ("A=1@L=8100002@", "Wien Hbf"),
-                ("A=1@L=8100173@", "Salzburg Hbf"),
+                ("A=1@L=8103000@", "Wien Hbf"),
+                ("A=1@L=8100002@", "Salzburg Hbf"),
             ]
         ),
         trip_response=_real_world_payload(),
@@ -428,8 +428,8 @@ async def test_fetch_plan_happy_returns_ok_and_trips() -> None:
         )
     assert raw["status"] == "ok"
     assert raw["format"] == "hafas-mgate"
-    assert raw["from_lid"] == "A=1@L=8100002@"
-    assert raw["to_lid"] == "A=1@L=8100173@"
+    assert raw["from_lid"] == "A=1@L=8103000@"
+    assert raw["to_lid"] == "A=1@L=8100002@"
     assert len(trips) == 1
     assert trips[0]["modes"] == "RAIL"
     assert trips[0]["first_transit_leg_departure_utc"]
@@ -696,8 +696,8 @@ class TestFetchPlanPaginated:
             trip = _make_hafas_trip(
                 dep_iso=(when + timedelta(hours=7)).isoformat(),
                 route="RJ 63",
-                from_uic="8100002",
-                to_uic="8100173",
+                from_uic="8103000",
+                to_uic="8100002",
             )
             return {"status": "ok", "response_ms": 400}, [trip]
 
@@ -731,13 +731,13 @@ class TestFetchPlanPaginated:
                     dep_iso=(base + timedelta(minutes=30)).isoformat(),
                     route="RJ 1",
                     from_uic=f"810{1000 + len(calls)}",
-                    to_uic="8100173",
+                    to_uic="8100002",
                 ),
                 _make_hafas_trip(
                     dep_iso=(base + timedelta(minutes=60)).isoformat(),
                     route="RJ 2",
                     from_uic=f"810{2000 + len(calls)}",
-                    to_uic="8100173",
+                    to_uic="8100002",
                 ),
             ]
             return {"status": "ok", "response_ms": 300}, trips
@@ -773,7 +773,7 @@ class TestFetchPlanPaginated:
                         dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
                         route="RJ 1",
                         from_uic="8100001",
-                        to_uic="8100173",
+                        to_uic="8100002",
                     )
                 ]
             return {"status": "no_route", "response_ms": 150}, []
@@ -831,7 +831,7 @@ class TestFetchPlanPaginated:
                 dep_iso="2026-06-28T08:30:00+00:00",
                 route="RJ 1",
                 from_uic="8100001",
-                to_uic="8100173",
+                to_uic="8100002",
             )
             return {"status": "ok", "response_ms": 100}, [trip]
 
@@ -866,7 +866,7 @@ class TestFetchPlanPaginated:
                         dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
                         route="RJ 1",
                         from_uic="8100001",
-                        to_uic="8100173",
+                        to_uic="8100002",
                     )
                 ]
             return {"status": "error", "error": "HAFAS 502", "response_ms": 90}, []
@@ -904,7 +904,7 @@ class TestFetchPlanPaginated:
                         dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
                         route="RJ 1",
                         from_uic="8100001",
-                        to_uic="8100173",
+                        to_uic="8100002",
                     )
                 ]
             return {"status": "no_route", "response_ms": 90}, []
@@ -948,7 +948,7 @@ class TestFetchPlanPaginated:
                     dep_iso=(kw["when"] + timedelta(minutes=30)).isoformat(),
                     route=f"RJ {page_calls['n']}",
                     from_uic=f"810{1000 + page_calls['n']}",
-                    to_uic="8100173",
+                    to_uic="8100002",
                 )
             ]
 

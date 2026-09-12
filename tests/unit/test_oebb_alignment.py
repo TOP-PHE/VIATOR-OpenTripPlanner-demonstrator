@@ -212,16 +212,16 @@ def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
         "20260630",
         external_verify._index_hafas_locations(
             [
-                {"lid": "A=1@O=Wien Hbf@X=16375526@L=008100002@", "extId": "008100002"},
+                {"lid": "A=1@O=Wien Hbf@X=16375526@L=008103000@", "extId": "008103000"},
                 {"lid": "A=1@O=Zuerich HB@X=8540192@L=8503000@", "extId": "8503000"},
             ]
         ),
         external_verify._index_hafas_products([{"name": "RJ 1141", "prodCtx": {"catOut": "RJ"}}]),
     )
     assert o_leg is not None
-    assert o_leg.from_uic == "UIC:8100002", "zero padding absorbed"
+    assert o_leg.from_uic == "UIC:8103000", "zero padding absorbed"
 
-    v = [_viator_trip([_v_leg(from_uic="8100002", to_uic="8503000")])]
+    v = [_viator_trip([_v_leg(from_uic="8103000", to_uic="8503000")])]
     _score, tier = compute_alignment(v, [_o_itin(legs=[o_leg])])
 
     assert tier == "agree"
