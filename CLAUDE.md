@@ -412,7 +412,12 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    *Separate live defect, same file — currently 100% silent.* `_build_locgeopos_body` sets `maxLoc: 1`
    (`:280`) and `_extract_lids_from_locgeopos` takes `loc_l[0]` (`:313`), so a hub coordinate snaps to
    the nearest *stop*, not the nearest *station*. Wien Hbf snaps to "Wien Hbf (Busbahnhof Regional)" — a
-   **bus terminal** 52 m away; canonical `8100002` is not among the eight nearest. The docstring's
+   **bus terminal** 52 m away (`904050`). The canonical station *was* among the eight nearest, just not
+   rank 0: Wien Hbf's EVA `8103000` (Trainline `db_id`/`obb_id`, the id ÖBB HAFAS uses) sat at 197 m.
+   *(Corrected 2026-09-11 against Trainline `stations.csv` and DELFI: this note used to call `8100002`
+   canonical — that is **Salzburg Hbf's** EVA. Wien Hbf's international-series code, Trainline `uic` as
+   used by SBB and Trenitalia, is `8101003` — which is also **Wien Blumental's** EVA, so a bare 7-digit
+   id does not identify a station without its namespace.)* The docstring's
    "railway stops only" claim is false. The resolved lid is used for the TripSearch and then discarded
    by the `verify_via_oebb_hafas` facade — **no log line, no UI field, no persisted column records which
    station ÖBB actually answered about.** Surface it before fixing it; resolve it properly in item 7
