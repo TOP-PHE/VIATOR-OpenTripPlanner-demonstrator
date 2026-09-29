@@ -59,6 +59,31 @@
     <tr class="detail-row" data-sid-detail="{{ s.id }}" hidden>
       <td colspan="9" style="padding: 0">
         <div class="detail-panel">
+          <!-- Feed status: read-only overview of every provider timetable -->
+          <section class="detail-section" data-role="feed-status" data-sid="{{ s.id }}">
+            <h3>Feed status</h3>
+            <p class="hint">
+              One row per provider timetable, grouped by country. <strong>Format OK</strong> means the
+              file passed the format check (the right kind of archive) when it entered the slot; the
+              timetable content itself is not checked. Refresh or upload from
+              <em>Configure sources</em> below.
+            </p>
+            <div class="feed-status-toolbar">
+              <label>Source
+                <select class="feed-status-mode" data-sid="{{ s.id }}">
+                  <option value="">All</option>
+                  <option value="url">URL</option>
+                  <option value="nap">NAP resolver</option>
+                  <option value="upload">Upload</option>
+                  <option value="cross_border_filter">Derived</option>
+                </select>
+              </label>
+              <button type="button" class="secondary" data-action="reload-feed-status" data-sid="{{ s.id }}">↻ Reload</button>
+              <span class="hint" data-role="feed-status-summary"></span>
+            </div>
+            <div data-role="feed-status-groups"><p class="hint">Loading…</p></div>
+          </section>
+
           <!-- Configure: edit config.sources URLs -->
           <section class="detail-section">
             <h3>Configure sources</h3>
@@ -516,6 +541,15 @@
   .prov-status-pill[data-state="error"]   { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
   .prov-status-pill[data-state="pending"] { background: #f6f8fa; color: #57606a; border-color: #d0d7de; }
   .prov-status-pill[data-state="loading"] { background: #f6f8fa; color: #8c959f; border-color: #d0d7de; font-style: italic; }
+  /* Feed status panel */
+  .feed-status-toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .feed-status-country { margin: 0.4rem 0; }
+  .feed-status-country > summary { cursor: pointer; font-weight: 600; }
+  .feed-status-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.3rem; }
+  .feed-status-table th, .feed-status-table td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid #d0d7de; vertical-align: top; }
+  .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; word-break: break-word; }
+  .feed-format-ok { color: #1a7f37; }
+  .feed-format-unknown { color: #5b6470; }
   /* v0.1.37 — per-provider upload (source = "Upload a file"). */
   .prov-upload-controls { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   .prov-upload-controls input[type="file"] { flex: 1 1 auto; min-width: 12rem; }
@@ -849,7 +883,7 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
             <p class="hint" style="margin: 0.25rem 0 0">
               Each refresh asks the NAP for the <em>current</em> file (the file name rotates on most
               portals) and skips it if unchanged. A downloaded file must pass a format check (right
-              kind of archive) before it replaces the previous one; its content is not validated.
+              kind of archive) before it replaces the previous one; the timetable content itself is not checked.
               Types: <code>tdg</code> (transport.data.gouv.fr), <code>udata</code>,
               <code>permalink</code>, <code>dated</code>.
             </p>
@@ -1310,6 +1344,109 @@ function _renderProviderStatusText(s) {
   return `✓ ${size} · ${age}`.replace(/ · $/, '');
 }
 
+// ── Feed status panel ─────────────────────────────────────────────────
+// Read-only overview built from the same /providers/status payload as the
+// card pills. Grouped by country; the Source filter narrows by source mode.
+// Wording rule: a file is "format OK" (it passed the format check), never
+// described as checked for content.
+const _feedStatusCache = new Map();  // sid -> last statuses payload
+const FEED_MODE_LABELS = {url: 'URL', nap: 'NAP', upload: 'Upload', cross_border_filter: 'Derived'};
+const FEED_RESULT_LABELS = {fetched: '⤓ fetched', unchanged: '= unchanged', skipped: '⚠ skipped'};
+const FEED_STATE_ORDER = ['ok', 'stale', 'error', 'pending'];
+
+function feedModeLabel(s) {
+  const base = FEED_MODE_LABELS[s.source] || 'URL';
+  return s.resolver_type ? `${base} · ${s.resolver_type}` : base;
+}
+
+function feedFormatCheckHTML(s) {
+  if (s.format_ok === true) return '<span class="feed-format-ok">✓ format OK</span>';
+  if (s.fetched_at) return '<span class="feed-format-unknown" title="The file in the slot predates the format check, or is derived">not checked</span>';
+  return '<span class="feed-format-unknown">—</span>';
+}
+
+function feedLastResultHTML(s) {
+  const a = s.last_attempt;
+  if (!a) return '<span class="hint">—</span>';
+  const label = FEED_RESULT_LABELS[a.status] || escHTML(a.status || '');
+  const when = _relativeTimeShort(a.at);
+  const head = when ? `${label} · ${escHTML(when)}` : label;
+  if (a.status !== 'skipped' || !a.reason) return head;
+  return `${head}<div class="feed-reason">${escHTML(a.reason)}</div>`;
+}
+
+function feedRowHTML(fid, s) {
+  const name = s.label && s.label !== fid ? ` <span class="hint">${escHTML(s.label)}</span>` : '';
+  const checked = _relativeTimeShort(s.checked_at);
+  return `<tr>
+    <td><code>${escHTML(fid)}</code>${name}</td>
+    <td>${escHTML(feedModeLabel(s))}</td>
+    <td>${escHTML(s.format || '')}</td>
+    <td><span class="prov-status-pill" data-state="${escAttr(s.state)}">${escHTML(_renderProviderStatusText(s))}</span></td>
+    <td>${checked ? escHTML(checked) : '<span class="hint">—</span>'}</td>
+    <td>${feedLastResultHTML(s)}</td>
+    <td>${feedFormatCheckHTML(s)}</td>
+  </tr>`;
+}
+
+function feedGroupsByCountry(statuses, mode) {
+  const groups = new Map();
+  Object.keys(statuses).sort().forEach(fid => {
+    const s = statuses[fid];
+    if (mode && (s.source || 'url') !== mode) return;
+    const country = s.country_iso || '—';
+    if (!groups.has(country)) groups.set(country, []);
+    groups.get(country).push([fid, s]);
+  });
+  return new Map([...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+}
+
+function feedStateCounts(rows) {
+  const counts = {};
+  rows.forEach(([, s]) => { counts[s.state] = (counts[s.state] || 0) + 1; });
+  return FEED_STATE_ORDER.filter(k => counts[k]).map(k => `${counts[k]} ${k}`).join(' · ');
+}
+
+function feedCountryHTML(country, rows) {
+  const open = rows.some(([, s]) => s.state !== 'ok') ? ' open' : '';
+  return `<details class="feed-status-country"${open}>
+    <summary>${escHTML(country)} · ${rows.length} feed${rows.length === 1 ? '' : 's'} · ${escHTML(feedStateCounts(rows))}</summary>
+    <table class="feed-status-table">
+      <thead><tr><th>Provider</th><th>Source</th><th>Format</th><th>File</th><th>Last check</th><th>Last result</th><th>Format check</th></tr></thead>
+      <tbody>${rows.map(([fid, s]) => feedRowHTML(fid, s)).join('')}</tbody>
+    </table>
+  </details>`;
+}
+
+function renderFeedStatusPanel(sid, statuses) {
+  if (statuses) _feedStatusCache.set(sid, statuses);
+  const data = _feedStatusCache.get(sid) || {};
+  const panel = document.querySelector(`section[data-role="feed-status"][data-sid="${CSS.escape(sid)}"]`);
+  if (!panel) return;
+  const mode = panel.querySelector('.feed-status-mode')?.value || '';
+  const groups = feedGroupsByCountry(data, mode);
+  const rows = [...groups.values()].flat();
+  panel.querySelector('[data-role="feed-status-summary"]').textContent =
+    rows.length ? `${rows.length} feed${rows.length === 1 ? '' : 's'} · ${feedStateCounts(rows)}` : '';
+  panel.querySelector('[data-role="feed-status-groups"]').innerHTML = rows.length
+    ? [...groups.entries()].map(([c, r]) => feedCountryHTML(c, r)).join('')
+    : '<p class="hint">No providers match.</p>';
+}
+
+document.addEventListener('change', e => {
+  const sel = e.target.closest('.feed-status-mode');
+  if (sel) renderFeedStatusPanel(sel.dataset.sid, null);
+});
+
+document.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-action="reload-feed-status"]');
+  if (!btn) return;
+  const sid = btn.dataset.sid;
+  const form = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"]`);
+  loadProviderStatuses(sid, form);
+});
+// ── end feed status panel ─────────────────────────────────────────────
+
 async function loadProviderStatuses(sid, formEl) {
   if (!sid || !formEl) return;
   let statuses = {};
@@ -1324,6 +1461,7 @@ async function loadProviderStatuses(sid, formEl) {
   } catch (err) {
     return;
   }
+  renderFeedStatusPanel(sid, statuses);
   formEl.querySelectorAll('.prov-status-pill').forEach(pill => {
     const fid = pill.dataset.feedId;
     const s = statuses[fid];

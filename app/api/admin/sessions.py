@@ -944,6 +944,21 @@ class ProviderStatus(BaseModel):
     # backs the provider, not just that one is present.
     source: str | None = None
     upload_filename: str | None = None
+    # Feed-status panel (docs/nap-feed-resolvers.md): grouping keys and the
+    # per-task fetch state kept by app/feed_fetch.py.
+    label: str | None = None
+    country_iso: str | None = None
+    format: str | None = None
+    resolver_type: str | None = None  # "tdg" | "udata" | … for source "nap"
+    checked_at: datetime | None = None  # last time a refresh confirmed the file current
+    # {"at", "status": "fetched" | "unchanged" | "skipped", "reason"} of the
+    # latest refresh of this provider's timetable, including a full skip reason.
+    last_attempt: dict[str, Any] | None = None
+    # True when the file in the slot passed the format check on its way in
+    # (a checked download, or an upload — both run detect). None = unknown:
+    # no file, a derived feed, or a file that predates the check. A format
+    # check only — it says nothing about the timetable content.
+    format_ok: bool | None = None
 
 
 # How recently a provider's inbox file must have been refreshed before we
@@ -1595,13 +1610,30 @@ def _fetch_state_dir(sid: str) -> Path:
     return settings.inbox_dir / sid / "_fetch_state"
 
 
-def _fetch_checked_at(sid: str, label: str) -> datetime | None:
-    """When a refresh last confirmed this task's file current, if ever."""
-    raw = feed_fetch.load_state(_fetch_state_dir(sid), label).get("checked_at")
+def _parse_iso(raw: object) -> datetime | None:
     try:
         return datetime.fromisoformat(raw) if isinstance(raw, str) else None
     except ValueError:
         return None
+
+
+def _fetch_checked_at(sid: str, label: str) -> datetime | None:
+    """When a refresh last confirmed this task's file current, if ever."""
+    return _parse_iso(feed_fetch.load_state(_fetch_state_dir(sid), label).get("checked_at"))
+
+
+def _record_attempt(sid: str, label: str, outcome: dict[str, Any]) -> None:
+    """Remember this task's latest outcome (with the full skip reason) for the
+    feed-status panel. Best-effort, like every fetch-state write. Stored next
+    to the conditional-GET validators; `fetch_validated` ignores the key."""
+    state_dir = _fetch_state_dir(sid)
+    state = feed_fetch.load_state(state_dir, label)
+    state["last_attempt"] = {
+        "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "status": outcome.get("status"),
+        "reason": outcome.get("reason"),
+    }
+    feed_fetch.save_state(state_dir, label, state)
 
 
 def _current_target_exists(sid: str, kind: str, staged_filename: str | None) -> bool:
@@ -1677,6 +1709,18 @@ async def _refresh_one_task(
     nothing rotated, no rebuild) or `skipped` (failed; the slot keeps its
     previous file). Per-task failures never abort the rest of the batch.
     """
+    outcome = await _resolve_and_download(client, db, sid, staging, task)
+    _record_attempt(sid, task.label, outcome)
+    return outcome
+
+
+async def _resolve_and_download(
+    client: httpx.AsyncClient,
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    task: _RefreshTask,
+) -> dict[str, Any]:
     if task.resolver is None:
         return await _download_task(client, db, sid, staging, task, task.url)
     # The file URL comes from a third-party catalogue — every redirect hop
@@ -2291,19 +2335,59 @@ def get_providers_status(
     for p in providers:
         tt = p.get("timetable") or {}
         fmt = tt.get("format", "gtfs")
+        fetch_state = feed_fetch.load_state(
+            _fetch_state_dir(sid), f"provider[{p['id']}].timetable({fmt})"
+        )
         status = _derive_provider_status(
             feed_id=p["id"],
             timetable_format=fmt,
             inbox_root=inbox_root,
             latest_audit_meta=latest_meta,
             now=now,
-            checked_at=_fetch_checked_at(sid, f"provider[{p['id']}].timetable({fmt})"),
+            checked_at=_parse_iso(fetch_state.get("checked_at")),
         )
-        status.source = tt.get("source")
-        if status.source == "upload":
-            status.upload_filename = latest_upload_filename.get(p["id"])
+        _decorate_status(status, p, fetch_state, latest_upload_filename.get(p["id"]))
         out[p["id"]] = status
     return out
+
+
+def _decorate_status(
+    status: ProviderStatus,
+    provider: dict[str, Any],
+    fetch_state: dict[str, Any],
+    upload_filename: str | None,
+) -> None:
+    """Add the feed-status panel fields to a derived `ProviderStatus`."""
+    tt = provider.get("timetable") or {}
+    status.source = tt.get("source")
+    if status.source == "upload":
+        status.upload_filename = upload_filename
+    status.label = provider.get("label")
+    status.country_iso = provider.get("country_iso")
+    status.format = tt.get("format", "gtfs")
+    resolver = tt.get("resolver") if status.source == "nap" else None
+    status.resolver_type = resolver.get("type") if isinstance(resolver, dict) else None
+    status.checked_at = _parse_iso(fetch_state.get("checked_at"))
+    attempt = fetch_state.get("last_attempt")
+    status.last_attempt = attempt if isinstance(attempt, dict) else None
+    status.format_ok = _format_ok(status, fetch_state)
+
+
+def _format_ok(status: ProviderStatus, fetch_state: dict[str, Any]) -> bool | None:
+    """Did the file now in the slot pass the format check on its way in?
+
+    Uploads always run `detect.detect`; url/nap downloads do since the
+    fetch pipeline (their state then carries the file's sha256). A manual
+    upload deletes that state, so a stale sha256 never vouches for an
+    uploaded file. Anything else (derived feeds, files scp'd in, files from
+    before the check existed) is unknown, not OK."""
+    if status.fetched_at is None:
+        return None
+    if status.source == "upload":
+        return True if status.upload_filename else None
+    if status.source in ("url", "nap", None) and fetch_state.get("sha256"):
+        return True
+    return None
 
 
 # ───────────────────────── rebuilds ─────────────────────────
