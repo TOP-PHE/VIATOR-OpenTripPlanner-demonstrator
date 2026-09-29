@@ -147,7 +147,8 @@ async def test_tdg_never_picks_a_replacement_silently() -> None:
     async with _client(handler) as c:
         with pytest.raises(ResolveError, match="no longer in dataset") as exc:
             await resolve(c, resolver)
-    assert "80931" in str(exc.value) and "83316" in str(exc.value)
+    assert "80931" in str(exc.value)
+    assert "83316" in str(exc.value)
 
 
 async def test_tdg_unavailable_resource_is_an_error() -> None:
@@ -289,9 +290,10 @@ async def test_dated_gives_up_after_max_days_back() -> None:
         calls += 1
         return httpx.Response(410 if calls == 2 else 404)
 
+    today = date(2026, 9, 29)
     async with _client(handler) as c:
         with pytest.raises(ResolveError, match=r"2026-09-26\.\.2026-09-29"):
-            await resolve(c, resolver, today=date(2026, 9, 29))
+            await resolve(c, resolver, today=today)
     assert calls == 4
 
 
@@ -306,9 +308,10 @@ async def test_dated_stops_on_an_error_that_is_not_a_miss(status: int) -> None:
         calls += 1
         return httpx.Response(status)
 
+    today = date(2026, 9, 29)
     async with _client(handler) as c:
         with pytest.raises(ResolveError, match=f"HTTP {status}") as exc:
-            await resolve(c, DE, today=date(2026, 9, 29))
+            await resolve(c, DE, today=today)
     assert calls == 1
     assert "no file found" not in str(exc.value)
 
@@ -321,9 +324,10 @@ async def test_dated_stops_on_a_network_error() -> None:
         calls += 1
         raise httpx.ConnectError("boom")
 
+    today = date(2026, 9, 29)
     async with _client(handler) as c:
         with pytest.raises(ResolveError, match="failed: boom"):
-            await resolve(c, DE, today=date(2026, 9, 29))
+            await resolve(c, DE, today=today)
     assert calls == 1
 
 

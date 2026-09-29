@@ -151,7 +151,8 @@ async def test_fetch_then_304_is_unchanged_without_a_second_dispatch(
     assert second["status"] == "unchanged"
     assert dispatched == ["GTFS"], "an unchanged feed must not rotate the slot or queue a rebuild"
     checked = sessions_api._fetch_checked_at("s1", LABEL)
-    assert checked is not None and datetime.now(UTC) - checked < timedelta(minutes=1)
+    assert checked is not None
+    assert datetime.now(UTC) - checked < timedelta(minutes=1)
     # nothing left in staging either way
     assert list((inbox / "s1" / "_staging").iterdir()) == []
 
