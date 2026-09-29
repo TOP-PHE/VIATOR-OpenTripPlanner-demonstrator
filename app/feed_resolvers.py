@@ -28,6 +28,8 @@ Resolver types (probed live against each portal 2026-09-29):
     dated      a URL carrying the publication date — {url, max_days_back};
                `{date}` becomes YYYYMMDD, walked back day by day until the
                server answers with a zip (DE DELFI, published Mondays).
+               Only a 404/410 or a non-zip 200 steps back a day; any other
+               error stops the walk and is reported as-is.
 
 Portals that need an account (AT mobilitaetsverbuende OIDC, ES NAP API key)
 are not covered yet — see docs/nap-feed-resolvers.md.
@@ -35,7 +37,10 @@ are not covered yet — see docs/nap-feed-resolvers.md.
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlparse
@@ -71,6 +76,85 @@ def _require_https(value: object, field: str) -> str:
     return s
 
 
+_PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _check_placeholders(url: str, allowed: set[str], field: str) -> None:
+    # `[^{}]*`, not `\w*`: `{foo-bar}` or `{ date }` must be reported, not
+    # passed through to the server as literal braces.
+    unknown = set(_PLACEHOLDER_RE.findall(url)) - allowed
+    if unknown:
+        raise ValueError(f"{field} has unknown placeholders {sorted(unknown)}")
+
+
+def _validate_tdg(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    value = raw.get("resource_id")
+    # bool is an int subclass and float("81653.9") would truncate — accept
+    # only a real int or a string of digits, and only a positive one.
+    if isinstance(value, str) and value.strip().isdigit():
+        resource_id: int | None = int(value.strip())
+    elif isinstance(value, int) and not isinstance(value, bool):
+        resource_id = value
+    else:
+        resource_id = None
+    if resource_id is None or resource_id <= 0:
+        raise ValueError(
+            f"{where}.resource_id={value!r} must be the integer "
+            "transport.data.gouv.fr resource id (e.g. 81653)"
+        )
+    dataset_id = str(raw.get("dataset_id") or "").strip().lower()
+    if not _HEX24_RE.match(dataset_id):
+        raise ValueError(
+            f"{where}.dataset_id={raw.get('dataset_id')!r} must be the 24-hex "
+            "transport.data.gouv.fr dataset id"
+        )
+    return {"type": "tdg", "dataset_id": dataset_id, "resource_id": resource_id}
+
+
+def _validate_udata(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    api = _require_https(raw.get("api"), f"{where}.api").rstrip("/")
+    dataset_id = str(raw.get("dataset_id") or "").strip()
+    if not dataset_id or "/" in dataset_id:
+        raise ValueError(f"{where}.dataset_id={raw.get('dataset_id')!r} must be a dataset id")
+    title_regex = str(raw.get("title_regex") or "").strip()
+    try:
+        re.compile(title_regex)
+    except re.error as exc:
+        raise ValueError(f"{where}.title_regex is not a valid regex: {exc}") from exc
+    if not title_regex:
+        raise ValueError(f"{where}.title_regex is required (selects the resource family)")
+    return {"type": "udata", "api": api, "dataset_id": dataset_id, "title_regex": title_regex}
+
+
+def _validate_permalink(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    url = _require_https(raw.get("url"), f"{where}.url")
+    _check_placeholders(url, {"timetable_year"}, f"{where}.url")
+    return {"type": "permalink", "url": url}
+
+
+def _validate_dated(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    url = _require_https(raw.get("url"), f"{where}.url")
+    if "{date}" not in url:
+        raise ValueError(f"{where}.url must contain a {{date}} placeholder (YYYYMMDD)")
+    _check_placeholders(url, {"date"}, f"{where}.url")
+    days_raw = raw.get("max_days_back", _DATED_DEFAULT_DAYS_BACK)
+    if (
+        not isinstance(days_raw, int)
+        or isinstance(days_raw, bool)
+        or not 1 <= days_raw <= _DATED_MAX_DAYS_BACK
+    ):
+        raise ValueError(f"{where}.max_days_back must be an integer 1..{_DATED_MAX_DAYS_BACK}")
+    return {"type": "dated", "url": url, "max_days_back": days_raw}
+
+
+_VALIDATORS = {
+    "tdg": _validate_tdg,
+    "udata": _validate_udata,
+    "permalink": _validate_permalink,
+    "dated": _validate_dated,
+}
+
+
 def validate_resolver(raw: object, where: str) -> dict[str, Any]:
     """Validate a `timetable.resolver` object, returning the cleaned dict.
 
@@ -79,59 +163,12 @@ def validate_resolver(raw: object, where: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be an object with a 'type'")
     rtype = str(raw.get("type") or "").strip().lower()
-    if rtype not in RESOLVER_TYPES:
+    validator = _VALIDATORS.get(rtype)
+    if validator is None:
         raise ValueError(
             f"{where}.type={raw.get('type')!r} must be one of {sorted(RESOLVER_TYPES)}"
         )
-
-    if rtype == "tdg":
-        try:
-            resource_id = int(raw.get("resource_id"))  # type: ignore[arg-type]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{where}.resource_id={raw.get('resource_id')!r} must be the integer "
-                "transport.data.gouv.fr resource id (e.g. 81653)"
-            ) from exc
-        dataset_id = str(raw.get("dataset_id") or "").strip().lower()
-        if not _HEX24_RE.match(dataset_id):
-            raise ValueError(
-                f"{where}.dataset_id={raw.get('dataset_id')!r} must be the 24-hex "
-                "transport.data.gouv.fr dataset id"
-            )
-        return {"type": "tdg", "dataset_id": dataset_id, "resource_id": resource_id}
-
-    if rtype == "udata":
-        api = _require_https(raw.get("api"), f"{where}.api").rstrip("/")
-        dataset_id = str(raw.get("dataset_id") or "").strip()
-        if not dataset_id or "/" in dataset_id:
-            raise ValueError(f"{where}.dataset_id={raw.get('dataset_id')!r} must be a dataset id")
-        title_regex = str(raw.get("title_regex") or "").strip()
-        try:
-            re.compile(title_regex)
-        except re.error as exc:
-            raise ValueError(f"{where}.title_regex is not a valid regex: {exc}") from exc
-        if not title_regex:
-            raise ValueError(f"{where}.title_regex is required (selects the resource family)")
-        return {"type": "udata", "api": api, "dataset_id": dataset_id, "title_regex": title_regex}
-
-    if rtype == "permalink":
-        url = _require_https(raw.get("url"), f"{where}.url")
-        unknown = set(re.findall(r"\{(\w*)\}", url)) - {"timetable_year"}
-        if unknown:
-            raise ValueError(f"{where}.url has unknown placeholders {sorted(unknown)}")
-        return {"type": "permalink", "url": url}
-
-    # dated
-    url = _require_https(raw.get("url"), f"{where}.url")
-    if "{date}" not in url:
-        raise ValueError(f"{where}.url must contain a {{date}} placeholder (YYYYMMDD)")
-    unknown = set(re.findall(r"\{(\w*)\}", url)) - {"date"}
-    if unknown:
-        raise ValueError(f"{where}.url has unknown placeholders {sorted(unknown)}")
-    days_raw = raw.get("max_days_back", _DATED_DEFAULT_DAYS_BACK)
-    if not isinstance(days_raw, int) or not 1 <= days_raw <= _DATED_MAX_DAYS_BACK:
-        raise ValueError(f"{where}.max_days_back must be an integer 1..{_DATED_MAX_DAYS_BACK}")
-    return {"type": "dated", "url": url, "max_days_back": days_raw}
+    return validator(raw, where)
 
 
 def describe(resolver: dict[str, Any]) -> str:
@@ -215,25 +252,65 @@ async def _resolve_udata(client: httpx.AsyncClient, r: dict[str, Any]) -> str:
     return str(newest["url"])
 
 
+# Answers that mean "nothing published that day" — keep walking back. Any
+# other failure (401/403, 5xx, network) says nothing about the date, and
+# stepping past it would report a misleading "no file found".
+_DATED_MISS_STATUSES = frozenset({404, 410})
+
+
+async def _probe_dated(client: httpx.AsyncClient, url: str) -> bool:
+    """True if `url` serves a zip. False for a miss (404/410, or a 200/206
+    that isn't a zip). Raises ResolveError for anything else."""
+    try:
+        # Ranged GET, not HEAD: several portals answer HEAD wrongly. Some
+        # ignore Range and stream the whole file — stop after one chunk.
+        async with client.stream("GET", url, headers={"Range": "bytes=0-3"}) as resp:
+            if resp.status_code in _DATED_MISS_STATUSES:
+                return False
+            if resp.status_code not in (200, 206):
+                raise ResolveError(f"HTTP {resp.status_code} probing {url}")
+            async for chunk in resp.aiter_bytes(4):
+                return chunk[:4] == _ZIP_MAGIC
+            return False
+    except httpx.HTTPError as exc:
+        raise ResolveError(f"probing {url} failed: {exc}") from exc
+
+
 async def _resolve_dated(client: httpx.AsyncClient, r: dict[str, Any], today: date) -> str:
     tried: list[str] = []
     for back in range(r["max_days_back"] + 1):
         day = today - timedelta(days=back)
         url = str(r["url"]).replace("{date}", day.strftime("%Y%m%d"))
         tried.append(day.isoformat())
-        try:
-            # Ranged GET, not HEAD: several portals answer HEAD wrongly. Some
-            # ignore Range and stream the whole file — stop after one chunk.
-            async with client.stream("GET", url, headers={"Range": "bytes=0-3"}) as resp:
-                if resp.status_code not in (200, 206):
-                    continue
-                async for chunk in resp.aiter_bytes(4):
-                    if chunk[:4] == _ZIP_MAGIC:
-                        return url
-                    break
-        except httpx.HTTPError:
-            continue
+        if await _probe_dated(client, url):
+            return url
     raise ResolveError(f"no file found for any date {tried[-1]}..{tried[0]} at {r['url']}")
+
+
+@asynccontextmanager
+async def redirect_guard(client: httpx.AsyncClient) -> AsyncIterator[None]:
+    """While active, every request `client` sends — each redirect hop
+    included — must pass the SSRF guard. `resolve()` only checks the URL it
+    returns; a public URL can still 302 to 169.254.169.254. Scoped to one
+    NAP task so plain URL providers keep their behaviour. The refresh loop
+    runs tasks sequentially, so the hook never leaks onto another task."""
+
+    async def _check(request: httpx.Request) -> None:
+        url = str(request.url)
+        try:
+            await asyncio.to_thread(_validate_safe_http_url, url)
+        except ValueError as exc:
+            raise httpx.RequestError(f"blocked request to {url}: {exc}", request=request) from exc
+
+    hooks = client.event_hooks
+    hooks["request"] = [*hooks.get("request", []), _check]
+    client.event_hooks = hooks
+    try:
+        yield
+    finally:
+        hooks = client.event_hooks
+        hooks["request"] = [h for h in hooks.get("request", []) if h is not _check]
+        client.event_hooks = hooks
 
 
 async def resolve(

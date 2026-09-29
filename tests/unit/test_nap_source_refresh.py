@@ -193,6 +193,67 @@ async def test_dispatch_failure_is_skipped_and_state_not_saved(
     assert list((inbox / "s1" / "_staging").iterdir()) == []
 
 
+async def test_failure_after_resolution_shows_the_resolved_url(
+    inbox: Path, dispatched: list[str]
+) -> None:
+    resolver = {"type": "permalink", "url": "https://nap.example/netex_{timetable_year}/permalink"}
+    task = sessions_api._RefreshTask(
+        "provider[SBB].timetable(netex_epip)", "NeTEx-EPIP", "display", "sbb.zip", None, resolver
+    )
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))) as c:
+        outcome = await _refresh_one_task(c, None, "s1", staging, task)  # type: ignore[arg-type]
+    assert outcome["status"] == "skipped"
+    assert outcome["url"].startswith("https://nap.example/netex_20")
+    assert "{timetable_year}" not in outcome["url"]
+
+
+async def test_nap_download_redirect_to_a_private_address_is_blocked(
+    inbox: Path, dispatched: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def guard(url: str) -> str:
+        if "10.0.0.5" in url:
+            raise ValueError("resolves to non-public address")
+        return url
+
+    monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", guard)
+
+    def download(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "10.0.0.5":
+            return httpx.Response(200, content=_gtfs_zip())
+        return httpx.Response(302, headers={"Location": "http://10.0.0.5/internal.zip"})
+
+    (task,) = _build_refresh_tasks(_nap_config())
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    handler = _portal(download)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, follow_redirects=True) as c:
+        outcome = await _refresh_one_task(c, None, "s1", staging, task)  # type: ignore[arg-type]
+        assert c.event_hooks["request"] == []
+    assert outcome["status"] == "skipped"
+    assert "non-public" in outcome["reason"]
+    assert dispatched == []
+
+
+async def test_overlapping_refreshes_get_distinct_staging_names(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    async def fake_fetch(client: Any, **kw: Any) -> Any:
+        seen.append(kw["base_name"])
+        raise sessions_api.feed_fetch.FetchError("stop here")
+
+    monkeypatch.setattr(sessions_api.feed_fetch, "fetch_validated", fake_fetch)
+    task = sessions_api._RefreshTask("provider[X].mct", "SNCF-MCT", "https://x/y.csv", None, None)
+    async with httpx.AsyncClient() as client:
+        for _ in range(2):
+            await _refresh_one_task(client, None, "s1", inbox, task)  # type: ignore[arg-type]
+    assert len(set(seen)) == 2
+
+
 async def test_non_http_url_is_skipped(inbox: Path) -> None:
     task = sessions_api._RefreshTask("provider[X].mct", "SNCF-MCT", "ftp://x/y.csv", None, None)
     async with httpx.AsyncClient() as client:
@@ -210,11 +271,38 @@ def test_current_target_exists_per_kind(inbox: Path) -> None:
     (inbox / "s1" / "gtfs").mkdir(parents=True)
     (inbox / "s1" / "gtfs" / "a.zip").write_bytes(b"x")
     assert sessions_api._current_target_exists("s1", "GTFS", "a.zip")
-    assert not sessions_api._current_target_exists("s1", "SNCF-MCT", None)
+    assert not sessions_api._current_target_exists("s1", "NeTEx-FR-Horaires", None)
+
+
+def test_shared_db_slot_never_counts_as_current(inbox: Path) -> None:
+    """runtime/SNCF-MCT holds whichever provider loaded last — it proves
+    nothing about this task's file, so a 304 must not be trusted."""
     (inbox / "s1" / "runtime" / "SNCF-MCT").mkdir(parents=True)
     (inbox / "s1" / "runtime" / "SNCF-MCT" / "latest.csv").write_bytes(b"x")
-    assert sessions_api._current_target_exists("s1", "SNCF-MCT", None)
-    assert not sessions_api._current_target_exists("s1", "NeTEx-FR-Horaires", None)
+    assert not sessions_api._current_target_exists("s1", "SNCF-MCT", None)
+    assert not sessions_api._current_target_exists("s1", "SNCF-Stations", None)
+
+
+def test_upload_forgets_every_task_that_writes_the_slot(inbox: Path) -> None:
+    from app import feed_fetch
+
+    state_dir = sessions_api._fetch_state_dir("s1")
+    epip = "provider[SNCB].timetable(netex_epip)"
+    nordic = "provider[SNCB].timetable(netex_nordic)"
+    gtfs = "provider[SNCB].timetable(gtfs)"
+    other = "provider[OTHER].timetable(netex_epip)"
+    for label in (epip, nordic, gtfs, other, "osm_pbf"):
+        feed_fetch.save_state(state_dir, label, {"etag": "x"})
+
+    sessions_api._forget_fetch_state_for_slot("s1", "NeTEx-EPIP", "sncb.zip")
+    assert feed_fetch.load_state(state_dir, epip) == {}
+    assert feed_fetch.load_state(state_dir, nordic) == {}  # same netex/sncb.zip slot
+    assert feed_fetch.load_state(state_dir, gtfs) == {"etag": "x"}  # gtfs/ is another slot
+    assert feed_fetch.load_state(state_dir, other) == {"etag": "x"}
+
+    sessions_api._forget_fetch_state_for_slot("s1", "OSM-PBF", None)
+    assert feed_fetch.load_state(state_dir, "osm_pbf") == {}
+    sessions_api._forget_fetch_state_for_slot("s1", "SNCF-MCT", None)  # no-op, no crash
 
 
 def test_fetch_checked_at_tolerates_garbage(inbox: Path) -> None:
@@ -251,6 +339,37 @@ def test_recent_unchanged_check_keeps_an_old_file_fresh(tmp_path: Path) -> None:
     )
     assert status.state == "ok"
     assert status.error_hint is None
+
+
+def test_unchanged_timetable_counts_as_this_providers_success(tmp_path: Path) -> None:
+    """Mirror of the case above: another task of the same provider failed,
+    but its timetable was confirmed current — no failure hint. Fails if
+    `unchanged` stops counting as a successful attempt."""
+    _old_slot(tmp_path, hours=1)
+    status = _derive_provider_status(
+        feed_id="TRENITAL-FR",
+        timetable_format="gtfs",
+        inbox_root=tmp_path,
+        latest_audit_meta={
+            "fetched": [],
+            "unchanged": [LABEL],
+            "skipped": ["provider[TRENITAL-FR].mct"],
+        },
+        now=datetime.now(UTC),
+    )
+    assert status.error_hint is None
+
+
+def test_only_skipped_gets_the_failure_hint(tmp_path: Path) -> None:
+    _old_slot(tmp_path, hours=1)
+    status = _derive_provider_status(
+        feed_id="TRENITAL-FR",
+        timetable_format="gtfs",
+        inbox_root=tmp_path,
+        latest_audit_meta={"fetched": [], "unchanged": [], "skipped": [LABEL]},
+        now=datetime.now(UTC),
+    )
+    assert status.error_hint == "last refresh failed — using previous file"
 
 
 def test_without_a_check_an_old_file_is_stale(tmp_path: Path) -> None:

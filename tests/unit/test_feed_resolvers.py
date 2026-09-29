@@ -67,6 +67,14 @@ def test_validate_tdg_normalises_ids() -> None:
         ({"type": "dated", "url": "https://x/{date}_{foo}.zip"}, "placeholders"),
         ({"type": "dated", "url": "https://x/{date}.zip", "max_days_back": 0}, "max_days_back"),
         ({"type": "dated", "url": "https://x/{date}.zip", "max_days_back": 999}, "max_days_back"),
+        ({"type": "dated", "url": "https://x/{date}.zip", "max_days_back": True}, "max_days_back"),
+        ({"type": "dated", "url": "https://x/{date}_{foo-bar}.zip"}, "placeholders"),
+        ({"type": "permalink", "url": "https://x/{ timetable_year }/p"}, "placeholders"),
+        ({"type": "tdg", "dataset_id": TDG_DATASET, "resource_id": True}, "resource_id"),
+        ({"type": "tdg", "dataset_id": TDG_DATASET, "resource_id": 81653.9}, "resource_id"),
+        ({"type": "tdg", "dataset_id": TDG_DATASET, "resource_id": 0}, "resource_id"),
+        ({"type": "tdg", "dataset_id": TDG_DATASET, "resource_id": -5}, "resource_id"),
+        ({"type": "tdg", "dataset_id": TDG_DATASET, "resource_id": "-5"}, "resource_id"),
     ],
 )
 def test_validate_rejects_bad_resolvers(raw: object, fragment: str) -> None:
@@ -279,14 +287,55 @@ async def test_dated_gives_up_after_max_days_back() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        if calls == 2:
-            raise httpx.ConnectError("boom")
-        return httpx.Response(404)
+        return httpx.Response(410 if calls == 2 else 404)
 
     async with _client(handler) as c:
         with pytest.raises(ResolveError, match=r"2026-09-26\.\.2026-09-29"):
             await resolve(c, resolver, today=date(2026, 9, 29))
     assert calls == 4
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+async def test_dated_stops_on_an_error_that_is_not_a_miss(status: int) -> None:
+    """A 401 or 5xx says nothing about whether that day was published —
+    walking past it would end in a misleading "no file found"."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status)
+
+    async with _client(handler) as c:
+        with pytest.raises(ResolveError, match=f"HTTP {status}") as exc:
+            await resolve(c, DE, today=date(2026, 9, 29))
+    assert calls == 1
+    assert "no file found" not in str(exc.value)
+
+
+async def test_dated_stops_on_a_network_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("boom")
+
+    async with _client(handler) as c:
+        with pytest.raises(ResolveError, match="failed: boom"):
+            await resolve(c, DE, today=date(2026, 9, 29))
+    assert calls == 1
+
+
+async def test_dated_empty_200_is_a_miss() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "20260929_" in request.url.path:
+            return httpx.Response(200, content=b"")
+        return httpx.Response(206, content=b"PK\x03\x04")
+
+    async with _client(handler) as c:
+        url = await resolve(c, DE, today=date(2026, 9, 29))
+    assert "20260928_" in url
 
 
 # ─────────────────────────── SSRF + unknown ───────────────────────────
@@ -309,3 +358,33 @@ async def test_unknown_type_is_a_resolve_error() -> None:
     async with _client(lambda r: httpx.Response(500)) as c:
         with pytest.raises(ResolveError, match="unknown resolver type"):
             await resolve(c, {"type": "ftp"})
+
+
+# ─────────────────────────── redirect guard ───────────────────────────
+
+
+async def test_redirect_guard_checks_every_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    checked: list[str] = []
+
+    def guard(url: str) -> str:
+        checked.append(url)
+        if "169.254" in url:
+            raise ValueError("resolves to non-public address")
+        return url
+
+    monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", guard)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "nap.example":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest"})
+        return httpx.Response(200, content=b"metadata")
+
+    async with _client(handler) as c:
+        async with feed_resolvers.redirect_guard(c):
+            with pytest.raises(httpx.RequestError, match="non-public"):
+                await c.get("https://nap.example/permalink")
+        assert checked == ["https://nap.example/permalink", "http://169.254.169.254/latest"]
+        # Scoped: once the NAP task is done, a plain URL provider is unaffected.
+        assert c.event_hooks["request"] == []
+        r = await c.get("https://nap.example/permalink")
+        assert r.status_code == 200

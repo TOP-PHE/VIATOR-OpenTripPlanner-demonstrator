@@ -1,3 +1,5 @@
+#Requires -Version 7.5
+
 <#
 .SYNOPSIS
     Switch a session's hand-uploaded NAP providers to automated sources.
@@ -9,7 +11,12 @@
     OUIGO-ES stay on manual upload - see docs/nap-feed-resolvers.md).
 
     Dry run by default: prints what would change and writes nothing. Pass
-    -Apply to PATCH the session config. Nothing is downloaded here - click
+    -Apply to PATCH the session config.
+
+    Needs PowerShell 7.5+ for ConvertFrom-Json -DateKind String. Without it,
+    the ISO timestamps in config._meta come back as local DateTime objects
+    and are re-serialised in a different format on PATCH, which breaks the
+    server's string comparison for staleness. Nothing is downloaded here - click
     "Refresh sources" (or per-provider Refresh) afterwards; each file already
     in the inbox stays live until its replacement downloads and validates.
 
@@ -30,7 +37,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$sources = Get-Content -LiteralPath $SourcesFile -Raw | ConvertFrom-Json -AsHashtable
+$sources = Get-Content -LiteralPath $SourcesFile -Raw | ConvertFrom-Json -AsHashtable -DateKind String
 $sources.Remove("_comment")
 
 $securePw = Read-Host -Prompt "Password for $AdminEmail" -AsSecureString
@@ -42,7 +49,8 @@ if ($login.StatusCode -ne 200) { throw "Login failed ($($login.StatusCode)): $($
 
 $r = Invoke-WebRequest -Uri "$BaseUrl/api/sessions" -WebSession $web -SkipHttpErrorCheck
 if ($r.StatusCode -ne 200) { throw "GET /api/sessions -> $($r.StatusCode): $($r.Content)" }
-$session = @($r.Content | ConvertFrom-Json -AsHashtable) | Where-Object { $_.id -eq $SessionId }
+# -DateKind String: keep config._meta timestamps byte-for-byte (see .DESCRIPTION).
+$session = @($r.Content | ConvertFrom-Json -AsHashtable -DateKind String) | Where-Object { $_.id -eq $SessionId }
 if (-not $session) { throw "Session $SessionId not found" }
 $config = $session.config
 $providers = $config.sources.providers

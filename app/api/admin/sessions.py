@@ -694,15 +694,13 @@ async def upload_to_session(
             )
         staged_filename = ingestion.staged_filename_for_format(provider_id, fmt)
         provider_feed_id = provider_id
-        # The slot no longer holds the last downloaded file — forget its
-        # validators so the next refresh can't call it "unchanged".
-        feed_fetch.state_path(
-            _fetch_state_dir(sid), f"provider[{provider_id}].timetable({fmt})"
-        ).unlink(missing_ok=True)
 
     triggered = ingestion.dispatch(
         staged_path, detected, db, session_id=sid, staged_filename=staged_filename
     )
+    # The slot no longer holds the last downloaded file — forget the fetch
+    # state of every task that writes it, so no refresh can call it "unchanged".
+    _forget_fetch_state_for_slot(sid, detected, staged_filename)
     # Where did dispatch end up putting it? Reconstruct from the rules. With
     # a provider slot the name is `<feed_id>.zip`; otherwise the legacy name.
     final_path = _reconstruct_dispatch_target(sid, detected, staged_filename or staged_path.name)
@@ -1607,16 +1605,39 @@ def _fetch_checked_at(sid: str, label: str) -> datetime | None:
 
 
 def _current_target_exists(sid: str, kind: str, staged_filename: str | None) -> bool:
-    """Does the slot a task would dispatch into already hold a file? Without
-    one, an "unchanged" verdict would leave the provider with nothing."""
-    base = settings.inbox_dir / sid
-    if kind in ingestion.STAGE_INTO_OTP_INBOX:
-        name = staged_filename or ingestion.STAGE_INTO_OTP_INBOX_FILENAME[kind]
-        return (base / ingestion.STAGE_INTO_OTP_INBOX[kind] / name).is_file()
-    if kind in ingestion.LOAD_TO_DB:
-        runtime = base / "runtime" / kind
-        return runtime.is_dir() and any(runtime.glob("latest.*"))
-    return False
+    """Does the slot a task would dispatch into already hold *this task's*
+    file? Without one, an "unchanged" verdict would leave the provider with
+    nothing. LOAD_TO_DB kinds (SNCF-MCT / SNCF-Stations) share one slot per
+    kind across every provider, so a file there proves nothing about this
+    task — always download them."""
+    if kind not in ingestion.STAGE_INTO_OTP_INBOX:
+        return False
+    name = staged_filename or ingestion.STAGE_INTO_OTP_INBOX_FILENAME[kind]
+    return (settings.inbox_dir / sid / ingestion.STAGE_INTO_OTP_INBOX[kind] / name).is_file()
+
+
+def _labels_writing_slot(kind: str, staged_filename: str | None) -> list[str]:
+    """Every refresh-task label whose download lands in the slot `kind` +
+    `staged_filename` names — whatever the provider's *current* source is,
+    since a later switch back to url/nap would reuse the stale state."""
+    if kind == "OSM-PBF":
+        return ["osm_pbf"]
+    subdir = ingestion.STAGE_INTO_OTP_INBOX.get(kind)
+    if subdir is None:
+        return []
+    name = staged_filename or ingestion.STAGE_INTO_OTP_INBOX_FILENAME[kind]
+    pid = Path(name).stem.upper()  # feed ids are upper-case; slot names are lower
+    return [
+        f"provider[{pid}].timetable({fmt})"
+        for fmt, details in ingestion.TIMETABLE_FORMAT_DETAILS.items()
+        if details["subdir"] == subdir
+    ]
+
+
+def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | None) -> None:
+    state_dir = _fetch_state_dir(sid)
+    for label in _labels_writing_slot(kind, staged_filename):
+        feed_fetch.state_path(state_dir, label).unlink(missing_ok=True)
 
 
 def _resolve_credential(
@@ -1650,24 +1671,45 @@ async def _refresh_one_task(
     staging: Path,
     task: _RefreshTask,
 ) -> dict[str, Any]:
-    """Run one resolve+download+validate+dispatch task. Returns a dict for
+    """Run one resolve+download+format-check+dispatch task. Returns a dict for
     the response — `status` is `fetched` (new file dispatched, rebuild
     queued), `unchanged` (upstream file identical to the one in the slot —
     nothing rotated, no rebuild) or `skipped` (failed; the slot keeps its
     previous file). Per-task failures never abort the rest of the batch.
     """
-    label, kind, url = task.label, task.kind, task.url
-
-    def _skip(reason: str, shown_url: str = url) -> dict[str, Any]:
-        return {"status": "skipped", "key": label, "url": shown_url, "reason": reason}
-
-    if task.resolver is not None:
+    if task.resolver is None:
+        return await _download_task(client, db, sid, staging, task, task.url)
+    # The file URL comes from a third-party catalogue — every redirect hop
+    # of the lookup and the download is re-checked against the SSRF guard.
+    async with feed_resolvers.redirect_guard(client):
         try:
             url = await feed_resolvers.resolve(client, task.resolver)
         except feed_resolvers.ResolveError as exc:
-            return _skip(f"NAP resolver failed: {exc}")
+            return _skipped(task, task.url, f"NAP resolver failed: {exc}")
+        return await _download_task(client, db, sid, staging, task, url)
+
+
+def _skipped(task: _RefreshTask, url: str, reason: str) -> dict[str, Any]:
+    return {"status": "skipped", "key": task.label, "url": url, "reason": reason}
+
+
+async def _download_task(
+    client: httpx.AsyncClient,
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    task: _RefreshTask,
+    url: str,
+) -> dict[str, Any]:
+    """Download + format-check + dispatch `url` for `task` (its resolver, if
+    any, has already run — `url` is the file to fetch)."""
+    label, kind = task.label, task.kind
+
+    def _skip(reason: str) -> dict[str, Any]:
+        return _skipped(task, url, reason)
+
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        return _skip("not an http(s) URL", url)
+        return _skip("not an http(s) URL")
 
     # Credential none → anonymous fetch; missing or undecryptable (e.g.
     # JWT_SECRET rotated) → this task fails with the reason, others proceed.
@@ -1687,7 +1729,9 @@ async def _refresh_one_task(
             extra_headers=extra_headers,
             kind=kind,
             staging=staging,
-            base_name=f"{ts}-{base_key}",
+            # uuid: two overlapping refreshes of one session must not share
+            # staging files.
+            base_name=f"{ts}-{base_key}-{uuid.uuid4().hex[:8]}",
             suffix=_url_suffix(url),
             previous=feed_fetch.load_state(state_dir, label),
             have_current=_current_target_exists(sid, kind, task.staged_filename),
@@ -1714,7 +1758,7 @@ async def _refresh_one_task(
             "reason": result.reason,
         }
 
-    assert result.path is not None  # "fetched" always carries the validated file
+    assert result.path is not None  # "fetched" always carries the format-checked file
     try:
         ingestion.dispatch(
             result.path,

@@ -955,11 +955,14 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 
 ### Invariants & traps
 
-- **Refresh validates before dispatch.** Since the NAP-resolver work, `_refresh_one_task` downloads
-  through `feed_fetch.fetch_validated`, which checks magic bytes and requires `detect.detect` to agree
-  with the declared kind before the slot is touched. An HTML stub served with HTTP 200 is refused and
-  the previous file stays. An unchanged upstream file (304 / same sha256) is reported `unchanged` and
-  queues no rebuild. See [nap-feed-resolvers.md](nap-feed-resolvers.md).
+- **Refresh runs a format check before dispatch.** Since the NAP-resolver work, `_refresh_one_task`
+  downloads through `feed_fetch.fetch_validated`, which checks magic bytes and requires
+  `detect.detect` to agree with the declared kind before the slot is touched. An HTML stub served
+  with HTTP 200 is refused and the previous file stays. This is a format check only: it does not
+  validate the feed's content, so UI text must say "format OK", never "validated". An unchanged upstream
+  file (304 / same sha256) is reported `unchanged` and queues no rebuild. OSM refresh is the
+  exception to "the previous file stays": it rotates `osm.pbf` before downloading. See
+  [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a
   legacy single-feed session and destructive in a multi-feed one. Always pass a per-feed filename
   when refreshing one of N feeds. The OSM path passes `"osm.pbf"` explicitly so the generational

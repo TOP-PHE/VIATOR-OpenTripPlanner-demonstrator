@@ -305,3 +305,113 @@ def test_save_state_failure_is_not_fatal(staging: Path) -> None:
     blocker = staging / "file"
     blocker.write_text("x", encoding="utf-8")
     feed_fetch.save_state(blocker / "sub", "k", {"a": 1})  # mkdir under a file fails
+
+
+# ─────────────────────────── corrupt archives ───────────────────────────
+
+
+async def test_corrupt_gzip_is_rejected_and_staging_emptied(staging: Path) -> None:
+    body = gzip.compress(NETEX_XML * 50)
+    corrupt = body[:20] + bytes(b ^ 0xFF for b in body[20:-8]) + body[-8:]  # zlib.error
+    with pytest.raises(FetchError, match="gzip body could not be unpacked"):
+        await _fetch(lambda r: httpx.Response(200, content=corrupt), staging, kind="NeTEx-EPIP")
+    assert list(staging.iterdir()) == []
+
+
+async def test_truncated_zip_is_rejected_and_staging_emptied(staging: Path) -> None:
+    body = _gtfs_zip()[:40]
+    with pytest.raises(FetchError, match="not a usable GTFS archive"):
+        await _fetch(lambda r: httpx.Response(200, content=body), staging)
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "exc", [NotImplementedError("Deflate64"), RuntimeError("encrypted"), EOFError()]
+)
+async def test_any_archive_error_becomes_a_fetch_error(
+    staging: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    def explode(path: Path) -> str:
+        raise exc
+
+    monkeypatch.setattr(feed_fetch.detect, "detect", explode)
+    with pytest.raises(FetchError, match="not a usable GTFS archive"):
+        await _fetch(lambda r: httpx.Response(200, content=_gtfs_zip()), staging)
+    assert list(staging.iterdir()) == []
+
+
+async def test_unexpected_error_in_the_check_still_cleans_up(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(raw: Path, kind: str, **kw: Any) -> Path:
+        raw.with_name(f"{kw['base_name']}.zip").write_bytes(b"half-written")
+        raise MemoryError("boom")
+
+    monkeypatch.setattr(feed_fetch, "_validate", explode)
+    with pytest.raises(FetchError, match=r"not a usable GTFS file \(MemoryError"):
+        await _fetch(lambda r: httpx.Response(200, content=_gtfs_zip()), staging)
+    assert list(staging.iterdir()) == []
+
+
+# ─────────────────────────── kinds ───────────────────────────
+
+
+async def test_either_netex_profile_satisfies_the_other(staging: Path) -> None:
+    """Both profiles dispatch into netex/; detect() calls this file EPIP."""
+    result = await _fetch(
+        lambda r: httpx.Response(200, content=_netex_zip()), staging, kind="NeTEx-Nordic"
+    )
+    assert result.status == "fetched"
+
+
+async def test_netex_declared_but_gtfs_served_is_still_rejected(staging: Path) -> None:
+    with pytest.raises(FetchError, match="declared NeTEx-Nordic but the file is GTFS"):
+        await _fetch(
+            lambda r: httpx.Response(200, content=_gtfs_zip()), staging, kind="NeTEx-Nordic"
+        )
+
+
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        (b"", "empty"),
+        (b"  \n", "empty"),
+        (b'{"error": "quota"}', "JSON"),
+        (b"\xef\xbb\xbf<!DOCTYPE html><html>", "HTML"),
+    ],
+)
+async def test_csv_kinds_reject_non_csv_bodies(staging: Path, body: bytes, fragment: str) -> None:
+    with pytest.raises(FetchError, match=fragment):
+        await _fetch(
+            lambda r: httpx.Response(200, content=body), staging, kind="SNCF-MCT", suffix=".csv"
+        )
+    assert list(staging.iterdir()) == []
+
+
+async def test_csv_with_a_bom_is_accepted(staging: Path) -> None:
+    body = b"\xef\xbb\xbfcode_uic;correspondance\n1;2\n"
+    result = await _fetch(
+        lambda r: httpx.Response(200, content=body), staging, kind="SNCF-MCT", suffix=".csv"
+    )
+    assert result.status == "fetched"
+    assert result.path == staging / "20260929-provider.csv"
+
+
+# ─────────────────────────── credential hygiene ───────────────────────────
+
+
+async def test_failure_reason_never_carries_the_fetch_url(staging: Path) -> None:
+    with pytest.raises(FetchError) as exc:
+        await _fetch(lambda r: httpx.Response(403), staging)
+    assert "403" in str(exc.value)
+    assert "secret" not in str(exc.value)
+
+
+async def test_transport_error_message_is_scrubbed(staging: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"cannot reach {request.url}")
+
+    with pytest.raises(FetchError) as exc:
+        await _fetch(handler, staging)
+    assert "secret" not in str(exc.value)
+    assert "https://nap.example/feed" in str(exc.value)

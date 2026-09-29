@@ -12,12 +12,18 @@ portal names its current file differently, and the files go stale within days to
 adds a fourth timetable source, `"nap"`, whose provider stores a **resolver** instead of a URL.
 Every refresh then:
 
-1. **resolves** the current file URL from the portal (`feed_resolvers.resolve`), with the SSRF
-   guard applied to whatever the portal's JSON returns;
+1. **resolves** the current file URL from the portal (`feed_resolvers.resolve`). The SSRF guard
+   checks whatever the portal's JSON returns, and **every redirect hop** of the catalogue lookup
+   and the download (`feed_resolvers.redirect_guard`, `nap` providers only);
 2. **downloads it conditionally**, replaying the previous ETag / Last-Modified. `304` means
    *unchanged*;
-3. **validates before touching the slot**: zip / gzip / PBF magic bytes, then `detect.detect`
-   must agree with the declared format. An `.xml.gz` NeTEx is re-wrapped as a zip;
+3. runs a **format check before touching the slot**: zip / gzip / PBF magic bytes, then
+   `detect.detect` must agree with the declared format (either NeTEx profile satisfies the
+   other: both go to `netex/`). An `.xml.gz` NeTEx is re-wrapped as a zip. CSV kinds (MCT,
+   stations) refuse an empty body, JSON, or HTML (even behind a BOM). A corrupt archive is a
+   rejected file, not a server error. **This is a format check only.** It proves the file is the
+   right *kind* of archive, not that its content is correct. UI text must say "format OK", never
+   "validated";
 4. treats a **sha256 match** with the previous download as *unchanged* too. This covers servers
    with no validators (OURA) and servers whose ETag flaps between backends (Renfe);
 5. **retries** transport errors and 429/5xx twice (2 s, 10 s).
@@ -26,11 +32,15 @@ An *unchanged* file is not rotated and queues no rebuild. The refresh response a
 in a separate `unchanged` list. A failed or rejected download leaves the previous file in the
 slot. The fetch pipeline (steps 2–5) applies to **every** URL download, not only `nap` providers:
 a URL provider serving an HTML landing page is now refused instead of being staged as `<feed>.zip`.
+Failure reasons never include the fetch URL, because a credential may be embedded in it.
 
 Per-task state lives in `inbox/<sid>/_fetch_state/<task>.json`, outside the directories the builds
-glob. A manual upload to a provider deletes that provider's state, so the next refresh cannot call
-the uploaded file "unchanged". Freshness pills measure age from the later of the file's mtime and
-the last *unchanged* check.
+glob. A manual upload deletes the state of **every** task that writes the slot it replaced
+(whatever the provider's current source, and both NeTEx formats), so no later refresh can call
+the uploaded file "unchanged". MCT and stations CSVs share one DB-load slot per kind across all
+providers, so they are always downloaded in full; a 304 or hash match is never trusted for them.
+Freshness pills measure age from the later of the file's mtime and the last *unchanged* check.
+Staging files carry a random suffix, so two overlapping refreshes of one session cannot collide.
 
 ## Resolver types
 
@@ -39,7 +49,7 @@ the last *unchanged* check.
 | `tdg` | `dataset_id` (24-hex), `resource_id` (int) | Checks the resource is still in `GET /api/datasets/<id>` and `is_available`, then uses `https://transport.data.gouv.fr/resources/<id>/download`. A vanished id is an error that lists the candidates. **It never picks a replacement silently** | 15 FR feeds |
 | `udata` | `api`, `dataset_id`, `title_regex` | Newest resource (by `created_at`) whose title matches | LU (data.public.lu) |
 | `permalink` | `url`, optionally containing `{timetable_year}` | Placeholder substituted; the server redirects to the newest file | CH (opentransportdata.swiss) |
-| `dated` | `url` with `{date}` (YYYYMMDD), `max_days_back` (1–60, default 21) | Walks back day by day with a 4-byte ranged GET until a zip answers | DE (DELFI, published Mondays) |
+| `dated` | `url` with `{date}` (YYYYMMDD), `max_days_back` (1–60, default 21) | Walks back day by day with a 4-byte ranged GET until a zip answers. Only a 404/410, or a 200/206 that is not a zip, steps back a day. Any other status (401, 403, 5xx) or a network error stops the walk and reports the real error | DE (DELFI, published Mondays) |
 
 `{timetable_year}` is the European timetable year in force today. It switches on the Sunday after
 the second Saturday of December (2026-12-13 is the first day of 2027).
@@ -85,8 +95,11 @@ resolver as JSON.
   refuse HEAD. The `dated` resolver uses a 4-byte ranged GET and stops after one chunk, because
   some servers ignore Range.
 - **Replay the ETag verbatim.** LIO's server sends it unquoted. Quoting it defeats the 304.
-- **A resolver error, rejected file or failed download never empties a slot.** The previous
-  file stays until a replacement has fully validated. A 304 or hash match is only trusted when
-  the slot still holds a file.
+- **A resolver error, rejected file or failed download never empties a timetable slot.** The
+  previous file stays until a replacement has passed the format check. A 304 or hash match is
+  only trusted when the slot still holds this task's file.
+- **OSM is the exception.** `POST /sources/osm/refresh` rotates `osm.pbf` to `osm.pbf.old.1`
+  *before* downloading, so a failed OSM refresh does leave the slot empty (the previous file is
+  recoverable from `.old.1`). That also means an OSM refresh is always a full download.
 - Fetch state is keyed by the task label (`provider[<ID>].timetable(<fmt>)`). Renaming a provider
   id costs one full re-download, nothing more.

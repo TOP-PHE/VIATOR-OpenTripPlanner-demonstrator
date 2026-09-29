@@ -15,9 +15,11 @@ bit (or would bite) an automated download:
   1. conditional GET — the ETag / Last-Modified from the previous fetch of
      the same URL are replayed; a 304 means "unchanged";
   2. retries with backoff on transport errors and 429/5xx;
-  3. validation before anything touches the slot — zip / gzip / PBF magic
-     bytes, then `detect.detect` must agree with the declared kind (a
-     `.xml.gz` NeTEx, as the Italian NAP serves it, is re-wrapped as a zip);
+  3. a format check before anything touches the slot — zip / gzip / PBF
+     magic bytes, then `detect.detect` must agree with the declared kind (a
+     `.xml.gz` NeTEx, as the Italian NAP serves it, is re-wrapped as a zip).
+     This is a format check only: it proves the file is the right *kind* of
+     archive, not that its content is correct;
   4. a sha256 match against the previous fetch is also "unchanged" (for
      servers without validators, or whose ETag flaps between backends).
 
@@ -48,6 +50,12 @@ log = logging.getLogger(__name__)
 
 # Kinds whose file must be a timetable archive `detect.detect` recognises.
 TIMETABLE_KINDS: frozenset[str] = frozenset({"GTFS", "NeTEx-EPIP", "NeTEx-Nordic"})
+# Both NeTEx profiles dispatch into the same netex/ slot and `detect` cannot
+# tell them apart reliably — either one satisfies the other.
+_NETEX_KINDS: frozenset[str] = frozenset({"NeTEx-EPIP", "NeTEx-Nordic"})
+# CSV kinds, loaded into the DB rather than a build slot (a CSV or a zip of CSVs).
+_CSV_KINDS: frozenset[str] = frozenset({"SNCF-MCT", "SNCF-Stations"})
+_UTF8_BOM = b"\xef\xbb\xbf"
 
 _ZIP_MAGIC = b"PK\x03\x04"
 _EMPTY_ZIP_MAGIC = b"PK\x05\x06"
@@ -69,7 +77,7 @@ class FetchError(Exception):
 class FetchResult:
     status: str  # "fetched" | "unchanged"
     reason: str | None = None
-    path: Path | None = None  # validated file, ready for dispatch ("fetched" only)
+    path: Path | None = None  # format-checked file, ready for dispatch ("fetched" only)
     size_bytes: int = 0
     sha256: str | None = None
     state: dict[str, Any] = field(default_factory=dict)
@@ -106,7 +114,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-# ──────────────────────────── validation ────────────────────────────
+# ──────────────────────────── format check ────────────────────────────
 
 
 def _describe_head(head: bytes) -> str:
@@ -139,51 +147,91 @@ def _gunzip_to_zip(src: Path, dest: Path, member: str) -> None:
         shutil.copyfileobj(gz, out, 1024 * 1024)
 
 
+def _kind_matches(declared: str, detected: str) -> bool:
+    if declared in _NETEX_KINDS:
+        return detected in _NETEX_KINDS
+    return detected == declared
+
+
+def _validate_timetable_archive(
+    raw: Path, head: bytes, kind: str, *, base_name: str, disposition: str | None
+) -> Path:
+    final = raw.with_name(f"{base_name}.zip")
+    if head.startswith(_ZIP_MAGIC):
+        raw.replace(final)
+    elif head.startswith(_GZIP_MAGIC):
+        try:
+            _gunzip_to_zip(raw, final, _inner_name(disposition, base_name))
+        except Exception as exc:  # zlib.error, EOFError, BadGzipFile, OSError…
+            raise FetchError(f"gzip body could not be unpacked: {exc}") from exc
+        raw.unlink(missing_ok=True)
+    elif head.startswith(_EMPTY_ZIP_MAGIC):
+        raise FetchError("server sent an empty zip archive")
+    else:
+        raise FetchError(f"expected a {kind} zip, got {_describe_head(head)}")
+    try:
+        detected = detect.detect(final)
+    except Exception as exc:  # BadZipFile, zlib.error, NotImplementedError (Deflate64)…
+        raise FetchError(f"not a usable {kind} archive: {exc}") from exc
+    if not _kind_matches(kind, detected):
+        raise FetchError(f"declared {kind} but the file is {detected}")
+    return final
+
+
+def _validate_csv(head: bytes, kind: str) -> None:
+    """CSV (or zipped-CSV) kinds: refuse an empty body, JSON, or an HTML page
+    — including one behind a UTF-8 BOM."""
+    text = head.removeprefix(_UTF8_BOM).lstrip()
+    if not text or text[:1] in (b"<", b"{", b"["):
+        raise FetchError(f"expected a {kind} file, got {_describe_head(text)}")
+
+
 def _validate(
     raw: Path, kind: str, *, base_name: str, suffix: str, disposition: str | None
 ) -> Path:
-    """Check `raw` really is a `kind` file. Returns the path to dispatch —
-    `raw` renamed with the right suffix (dispatch and detect key off it), or a
-    new zip wrapping a gzip body. Raises FetchError; the caller deletes the
-    leftovers."""
+    """Format check: is `raw` really a `kind` file? Returns the path to
+    dispatch — `raw` renamed with the right suffix (dispatch and detect key
+    off it), or a new zip wrapping a gzip body. Raises FetchError for a
+    rejected file; any other exception means the archive itself is corrupt
+    (the caller converts it). The caller deletes the leftovers either way."""
     with raw.open("rb") as f:
         head = f.read(64)
 
     if kind in TIMETABLE_KINDS:
-        final = raw.with_name(f"{base_name}.zip")
-        if head.startswith(_ZIP_MAGIC):
-            raw.replace(final)
-        elif head.startswith(_GZIP_MAGIC):
-            try:
-                _gunzip_to_zip(raw, final, _inner_name(disposition, base_name))
-            except (OSError, EOFError, zipfile.BadZipFile) as exc:
-                final.unlink(missing_ok=True)
-                raise FetchError(f"gzip body could not be unpacked: {exc}") from exc
-            raw.unlink(missing_ok=True)
-        elif head.startswith(_EMPTY_ZIP_MAGIC):
-            raise FetchError("server sent an empty zip archive")
-        else:
-            raise FetchError(f"expected a {kind} zip, got {_describe_head(head)}")
-        try:
-            detected = detect.detect(final)
-        except (ValueError, zipfile.BadZipFile, OSError) as exc:
-            final.unlink(missing_ok=True)
-            raise FetchError(f"not a usable {kind} archive: {exc}") from exc
-        if detected != kind:
-            final.unlink(missing_ok=True)
-            raise FetchError(f"declared {kind} but the file is {detected}")
-        return final
-
+        return _validate_timetable_archive(
+            raw, head, kind, base_name=base_name, disposition=disposition
+        )
     if kind == "OSM-PBF":
         # A PBF opens with the 4-byte big-endian length of a small BlobHeader.
         if not head.startswith(b"\x00\x00\x00"):
             raise FetchError(f"expected an OSM PBF, got {_describe_head(head)}")
         suffix = ".pbf"
+    elif kind in _CSV_KINDS:
+        _validate_csv(head, kind)
     elif head.lstrip()[:1] == b"<":
         raise FetchError(f"expected a {kind} file, got {_describe_head(head)}")
     final = raw.with_name(f"{base_name}{suffix}")
     raw.replace(final)
     return final
+
+
+def _discard_staged(staging: Path, base_name: str) -> None:
+    """Delete everything this fetch staged (`<base_name>.download`, the
+    renamed or re-wrapped file). `base_name` is unique per task run."""
+    for leftover in staging.glob(f"{base_name}.*"):
+        leftover.unlink(missing_ok=True)
+
+
+def _download_error(exc: httpx.HTTPError, fetch_url: str, state_url: str) -> str:
+    """Operator-facing reason. Never echo `fetch_url`: a credential may be
+    baked into it (query-param auth)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        return f"download failed: HTTP {response.status_code} {response.reason_phrase}".rstrip()
+    message = str(exc) or type(exc).__name__
+    if fetch_url != state_url:
+        message = message.replace(fetch_url, state_url)
+    return f"download failed: {message}"
 
 
 # ──────────────────────────── download ────────────────────────────
@@ -243,7 +291,7 @@ async def fetch_validated(
     previous: dict[str, Any],
     have_current: bool,
 ) -> FetchResult:
-    """Download `fetch_url` and validate it as `kind`.
+    """Download `fetch_url` and format-check it as `kind`.
 
     `state_url` is the URL without credential material (what gets stored and
     compared across runs). `previous` is the stored state of the last
@@ -263,7 +311,7 @@ async def fetch_validated(
     try:
         status, resp_headers, sha, size = await _stream_with_retry(client, fetch_url, headers, raw)
     except httpx.HTTPError as exc:
-        raise FetchError(f"download failed: {exc}") from exc
+        raise FetchError(_download_error(exc, fetch_url, state_url)) from exc
 
     checked = {**previous, "checked_at": _now_iso()}
     if status == 304:
@@ -298,6 +346,12 @@ async def fetch_validated(
             disposition=resp_headers.get("content-disposition"),
         )
     except FetchError:
-        raw.unlink(missing_ok=True)
+        _discard_staged(staging, base_name)
         raise
+    except Exception as exc:
+        # A corrupt archive surfaces as zlib.error, EOFError, BadZipFile,
+        # NotImplementedError (Deflate64), RuntimeError (encrypted member)…
+        # — all mean "rejected", never a 500 for the whole refresh.
+        _discard_staged(staging, base_name)
+        raise FetchError(f"not a usable {kind} file ({type(exc).__name__}: {exc})") from exc
     return FetchResult(status="fetched", path=final, size_bytes=size, sha256=sha, state=new_state)
