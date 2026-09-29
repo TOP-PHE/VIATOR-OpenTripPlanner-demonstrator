@@ -955,11 +955,11 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 
 ### Invariants & traps
 
-- **`detect` runs on uploads only.** `detect.detect` is called from `main.py::_do_upload` and
-  `sessions.py::upload_to_session`. The refresh-from-URL path (`_refresh_one_task`) dispatches using
-  the kind *declared in the provider config* — a URL that starts serving a different format is filed
-  into the wrong slot with no complaint. (Related known trap: third-party hosts return 10 KB HTML
-  stubs with HTTP 200; trust file size, not status code.)
+- **Refresh validates before dispatch.** Since the NAP-resolver work, `_refresh_one_task` downloads
+  through `feed_fetch.fetch_validated`, which checks magic bytes and requires `detect.detect` to agree
+  with the declared kind before the slot is touched. An HTML stub served with HTTP 200 is refused and
+  the previous file stays. An unchanged upstream file (304 / same sha256) is reported `unchanged` and
+  queues no rebuild. See [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a
   legacy single-feed session and destructive in a multi-feed one. Always pass a per-feed filename
   when refreshing one of N feeds. The OSM path passes `"osm.pbf"` explicitly so the generational

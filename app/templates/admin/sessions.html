@@ -841,6 +841,18 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
               Save the session first so the provider exists, then upload.
             </p>
           </div>
+          <div class="prov-tt-nap-row" ${ttSource === 'nap' ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <label>NAP resolver <span class="hint">(JSON — see docs/nap-feed-resolvers.md)</span></label>
+            <textarea class="prov-tt-resolver" rows="3" spellcheck="false"
+                      placeholder='{"type": "tdg", "dataset_id": "64635525318cc75a9a8a771f", "resource_id": 81653}'
+                      style="width: 100%; font-family: monospace">${escHTML(tt.resolver ? JSON.stringify(tt.resolver) : '')}</textarea>
+            <p class="hint" style="margin: 0.25rem 0 0">
+              Each refresh asks the NAP for the <em>current</em> file (the file name rotates on most
+              portals), skips it if unchanged, and rejects anything that isn't a real feed archive.
+              Types: <code>tdg</code> (transport.data.gouv.fr), <code>udata</code>,
+              <code>permalink</code>, <code>dated</code>.
+            </p>
+          </div>
           <div class="prov-tt-derived-row" ${ttSource === 'cross_border_filter' ? '' : 'hidden'} style="margin-top: 0.4rem">
             <div class="prov-grid-3">
               <div>
@@ -1006,6 +1018,7 @@ function providerCardHTML(p, opts) {
               <select class="prov-tt-source">
                 <option value="url"    ${ttSource === 'url' ? 'selected' : ''}>Download from URL</option>
                 <option value="upload" ${ttSource === 'upload' ? 'selected' : ''}>Upload a file</option>
+                <option value="nap"    ${ttSource === 'nap' ? 'selected' : ''}>NAP resolver (current file)</option>
                 <option value="cross_border_filter" ${ttSource === 'cross_border_filter' ? 'selected' : ''}>Cross-border filter (derived)</option>
               </select>
             </div>
@@ -1116,6 +1129,23 @@ function collectDerivedFields(card, id, timetable) {
   return true;
 }
 
+// NAP resolver (source "nap") — the JSON object is validated server-side
+// (app/feed_resolvers.py); here we only check it parses to an object with a type.
+function collectResolverField(card, id, timetable) {
+  const raw = (card.querySelector('.prov-tt-resolver')?.value || '').trim();
+  let resolver;
+  try { resolver = JSON.parse(raw); } catch (err) {
+    showToast('error', `${id}: NAP resolver is not valid JSON (${err.message})`);
+    return false;
+  }
+  if (!resolver || typeof resolver !== 'object' || Array.isArray(resolver) || !resolver.type) {
+    showToast('error', `${id}: NAP resolver must be a JSON object with a "type"`);
+    return false;
+  }
+  timetable.resolver = resolver;
+  return true;
+}
+
 function readProviderCard(card) {
   // Opposite of providerCardHTML — collect the form values back into a
   // canonical provider object. Returns null + shows a toast for invalid
@@ -1150,6 +1180,8 @@ function readProviderCard(card) {
     timetable.url = ttUrl;
   } else if (ttSource === 'cross_border_filter') {
     if (!collectDerivedFields(card, id, timetable)) return null;
+  } else if (ttSource === 'nap') {
+    if (!collectResolverField(card, id, timetable)) return null;
   }
   const provider = {
     id,
@@ -1327,8 +1359,9 @@ async function refreshOneProvider(form, refreshBtn) {
     }
     const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
     const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
-    showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
-    if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+    const unchanged = (body.unchanged || []).map(u => u.key).join(', ');
+    showToast('success', `${pid}: fetched ${fetched}${unchanged ? ' | unchanged ' + unchanged : ''}${skipped ? ' | skipped ' + skipped : ''}`);
+    if ((body.fetched || []).length || (body.unchanged || []).length) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
   } catch (err) { showToast('error', String(err)); }
   finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
@@ -1470,6 +1503,8 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     const urlRow = card.querySelector('.prov-tt-url-row');
     const upRow = card.querySelector('.prov-tt-upload-row');
     const derivedRow = card.querySelector('.prov-tt-derived-row');
+    const napRow = card.querySelector('.prov-tt-nap-row');
+    if (napRow) napRow.hidden = src !== 'nap';
     if (urlRow) urlRow.hidden = src !== 'url';
     if (upRow) upRow.hidden = src !== 'upload';
     if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
@@ -1638,8 +1673,9 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
       const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
-      showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
-      if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+      const unchanged = (body.unchanged || []).map(u => u.key).join(', ');
+      showToast('success', `Fetched: ${fetched}${unchanged ? ' | Unchanged: ' + unchanged : ''}${skipped ? ' | Skipped: ' + skipped : ''}`);
+      if ((body.fetched || []).length || (body.unchanged || []).length) markRefreshCompletedLocally(sid);
       // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
       // mtimes / sizes are visible without a page reload.
       loadProviderStatuses(sid, form);

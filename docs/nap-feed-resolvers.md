@@ -1,0 +1,92 @@
+# NAP feed resolvers — automated download of portal-published feeds
+
+**Status:** shipped (this PR). **Audience:** operators and implementers.
+**Code:** `app/feed_resolvers.py` (which file is current), `app/feed_fetch.py` (download it safely),
+`_refresh_one_task` in `app/api/admin/sessions.py` (glue).
+
+## Why
+
+26 of the eu19 session's timetables were downloaded by hand from national access points and
+uploaded as files (`source: "upload"`), because their download URL is not a fixed address. Each
+portal names its current file differently, and the files go stale within days to weeks. This
+adds a fourth timetable source, `"nap"`, whose provider stores a **resolver** instead of a URL.
+Every refresh then:
+
+1. **resolves** the current file URL from the portal (`feed_resolvers.resolve`), with the SSRF
+   guard applied to whatever the portal's JSON returns;
+2. **downloads it conditionally**, replaying the previous ETag / Last-Modified. `304` means
+   *unchanged*;
+3. **validates before touching the slot**: zip / gzip / PBF magic bytes, then `detect.detect`
+   must agree with the declared format. An `.xml.gz` NeTEx is re-wrapped as a zip;
+4. treats a **sha256 match** with the previous download as *unchanged* too. This covers servers
+   with no validators (OURA) and servers whose ETag flaps between backends (Renfe);
+5. **retries** transport errors and 429/5xx twice (2 s, 10 s).
+
+An *unchanged* file is not rotated and queues no rebuild. The refresh response and audit carry it
+in a separate `unchanged` list. A failed or rejected download leaves the previous file in the
+slot. The fetch pipeline (steps 2–5) applies to **every** URL download, not only `nap` providers:
+a URL provider serving an HTML landing page is now refused instead of being staged as `<feed>.zip`.
+
+Per-task state lives in `inbox/<sid>/_fetch_state/<task>.json`, outside the directories the builds
+glob. A manual upload to a provider deletes that provider's state, so the next refresh cannot call
+the uploaded file "unchanged". Freshness pills measure age from the later of the file's mtime and
+the last *unchanged* check.
+
+## Resolver types
+
+| `type` | Fields | Resolution | Used for |
+|---|---|---|---|
+| `tdg` | `dataset_id` (24-hex), `resource_id` (int) | Checks the resource is still in `GET /api/datasets/<id>` and `is_available`, then uses `https://transport.data.gouv.fr/resources/<id>/download`. A vanished id is an error that lists the candidates. **It never picks a replacement silently** | 15 FR feeds |
+| `udata` | `api`, `dataset_id`, `title_regex` | Newest resource (by `created_at`) whose title matches | LU (data.public.lu) |
+| `permalink` | `url`, optionally containing `{timetable_year}` | Placeholder substituted; the server redirects to the newest file | CH (opentransportdata.swiss) |
+| `dated` | `url` with `{date}` (YYYYMMDD), `max_days_back` (1–60, default 21) | Walks back day by day with a 4-byte ranged GET until a zip answers | DE (DELFI, published Mondays) |
+
+`{timetable_year}` is the European timetable year in force today. It switches on the Sunday after
+the second Saturday of December (2026-12-13 is the first day of 2027).
+
+Config example (`sources.providers[]`):
+
+```json
+{"id": "CFL", "label": "CFL Luxembourg", "country_iso": "LU",
+ "timetable": {"format": "netex_epip", "source": "nap",
+   "resolver": {"type": "udata", "api": "https://data.public.lu/api/1",
+                "dataset_id": "56fbd4e5855e9b6a1088f54e",
+                "title_regex": "^netex-\\d{8}-\\d{8}\\.zip$"}}}
+```
+
+In the admin UI the provider card's **Source** menu has a "NAP resolver" option taking the
+resolver as JSON.
+
+## eu19 feed map (probed live 2026-09-29)
+
+`scripts/eu19_nap_sources.json` holds the replacement for 23 of the 26 uploaded feeds.
+`scripts/switch_to_nap_sources.ps1` applies it to a session (dry run by default; `-Apply` to save).
+
+| Feeds | Source | Notes |
+|---|---|---|
+| 15 FR (BREIZHGO … TRENITAL-FR) | `nap/tdg` | 4 datasets have look-alike neighbours and are pinned by resource id: IDFM 80921 (not the Google/ITO rewrites 80931/83316), ZOU 83990 (not the Transdev "zou" dataset), FLUO 83635, ALEOP 80721. Never store the publisher's `original_url`: it rotates (ATOUMOD) or embeds an API key (LIO). HEAD is unreliable on tdg, so it is never used |
+| FGC, EUSKOTREN, RENFE-AVLD, RENFE-CERC | `url` | The operators' own fixed URLs are the files the ES NAP re-publishes (size and date match; FGC, Euskotren and Renfe AV/LD also matched by content). The ES NAP itself needs a login for every download |
+| TRENITALIA | `url` | Italian NAP public catalogue, asset 1080596, `/checkedResource` = the last *validated* version. It serves `.xml.gz` with no validators, so change detection relies on the hash. **This corrects eu19-providers.md, which says CCISS is SPID-walled** |
+| SBB | `nap/permalink` | `timetablenetex_<year>/permalink` redirects to a 60-second presigned R2 URL; never store it. About 660 MB, new file roughly twice a week. The CKAN API is blocked (403) or needs a key; the permalink needs neither |
+| CFL | `nap/udata` | Publisher is ATP (national multimodal), CC0. The local `netex-20260618-20260823.zip` is byte-size identical to this dataset's resource, which settles eu19-providers.md's "cannot be traced" |
+| DB | `nap/dated` | `YYYYMMDD_fahrplaene_gesamtdeutschland.zip`, about 2 GB. No `latest` alias; old files are pruned. The file URL answers anonymously, but the dataset page states download is for registered users. **Register once on opendata-oepnv.de before relying on this** (CC-BY). Refresh at most weekly |
+
+### Still manual (not in the map)
+
+| Feed | Blocker | Next step |
+|---|---|---|
+| OBB (AT) | data.mobilitaetsverbuende.at file endpoint returns 401 without a Keycloak password-grant token (documented by the provider as its public API flow) | PH registers and accepts the dataset-67 licence; then add an `oidc_password` credential scheme + resolver |
+| OUIGO-ES | Exists only on the ES NAP (API key via free registration); the local copy is actually a MERITS-style export | Register for an ES NAP API key, or keep as a quarterly manual upload |
+| NMBS (BE) | The stable blob URL serves a **different export** (enRoute, 2,184 files, 7.8 GB uncompressed) from our local file. Also the licence is marked non-commercial, and our local file expired 2025-12-13 | Decide on licence; test the loader against the new structure (or use the anonymous GTFS feed) |
+
+## Invariants & traps
+
+- **Never HEAD** a NAP download URL. tdg answers 404 or "200, length 0", and R2 presigned URLs
+  refuse HEAD. The `dated` resolver uses a 4-byte ranged GET and stops after one chunk, because
+  some servers ignore Range.
+- **Replay the ETag verbatim.** LIO's server sends it unquoted. Quoting it defeats the 304.
+- **A resolver error, rejected file or failed download never empties a slot.** The previous
+  file stays until a replacement has fully validated. A 304 or hash match is only trusted when
+  the slot still holds a file.
+- Fetch state is keyed by the task label (`provider[<ID>].timetable(<fmt>)`). Renaming a provider
+  id costs one full re-download, nothing more.

@@ -30,6 +30,12 @@ data we're using today?" Findings ranked by severity below.
 
 **🇮🇹 IT — CCISS is a SPID-login road-safety portal, NOT a multimodal data catalogue**
 
+> **Corrected 2026-09-29** ([nap-feed-resolvers.md](nap-feed-resolvers.md)). The Italian NAP has a *public*
+> catalogue at `https://www.cciss.it/nap/mmtis/public/` that needs no SPID login. Trenitalia's national NeTEx
+> is there (organisation 1077484 → dataset 1077621 → asset 1080596, validated VALID 2026-09-25), and its
+> header matches our `IT-TRENITALIA-NeTEx_L1.zip`. So IT Trenitalia **is** NAP-attested. The SPID wall
+> below applies to `cciss.it/dataset`, not to the MMTIS catalogue.
+
 - Live probe (2026-06-29) confirms: cciss.it landing page is the public road-traffic info portal; cciss.it/dataset returns a SPID authentication wall ("As of October 1, 2021, citizens can no longer access the CCISS portal using their previous credentials").
 - No multimodal/transit datasets visible. Italy's listed MMTIS NAP per Delegated Regulation 2017/1926 **does not actually publish open transit data**.
 - Same pattern as 🇸🇰 SK — the listed NAP is non-compliant with the multimodal scope.
@@ -38,6 +44,11 @@ data we're using today?" Findings ranked by severity below.
 - **Action**: Document the IT NAP non-compliance explicitly. Possible mitigations (in order of effort): (a) accept the gap, document it for any compliance audit; (b) probe whether data.gov.it or a Ministry-level Italian portal hosts a real MMTIS NAP that CCISS doesn't reference; (c) escalate to Italian Ministero per chiarification.
 
 **🇱🇺 LU — current source not discoverable through the official NAP**
+
+> **Resolved 2026-09-29** ([nap-feed-resolvers.md](nap-feed-resolvers.md)). The file comes from data.public.lu
+> dataset `56fbd4e5855e9b6a1088f54e` ("horaires-et-arrets-des-transport-publics-netex", publisher ATP, CC0).
+> Its listed filesize is 32,955,161 B, identical to our local file. It is found through the udata API,
+> not the search SPA.
 
 - Live probe of data.public.lu search for "CFL" returned **3 datasets only**: FLEX car-sharing, P+R parking, hiking trails. **NO transit timetable** visible. Searches for "horaire", "transports publics" hit the SPA shell (couldn't enumerate).
 - Our currently-ingested `LU-NAP-netex-20260618-20260823.zip` (CFL national rail + bus, NeTEx-EPIP) cannot be traced back to data.public.lu through the public search.
