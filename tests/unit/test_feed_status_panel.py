@@ -203,6 +203,7 @@ def test_panel_renders_on_every_status_load(template_text: str) -> None:
         "feedLastResultHTML",
         "feedRowHTML",
         "feedGroupsByCountry",
+        "feedCountLabel",
         "feedStateCounts",
         "feedCountryHTML",
         "renderFeedStatusPanel",

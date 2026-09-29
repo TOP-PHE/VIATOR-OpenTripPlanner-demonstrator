@@ -547,7 +547,7 @@
   .feed-status-country > summary { cursor: pointer; font-weight: 600; }
   .feed-status-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.3rem; }
   .feed-status-table th, .feed-status-table td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid #d0d7de; vertical-align: top; }
-  .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; word-break: break-word; }
+  .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
   .feed-format-ok { color: #1a7f37; }
   .feed-format-unknown { color: #5b6470; }
   /* v0.1.37 — per-provider upload (source = "Upload a file"). */
@@ -1401,6 +1401,10 @@ function feedGroupsByCountry(statuses, mode) {
   return new Map([...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])));
 }
 
+function feedCountLabel(n) {
+  return n === 1 ? '1 feed' : `${n} feeds`;
+}
+
 function feedStateCounts(rows) {
   const counts = {};
   rows.forEach(([, s]) => { counts[s.state] = (counts[s.state] || 0) + 1; });
@@ -1410,7 +1414,7 @@ function feedStateCounts(rows) {
 function feedCountryHTML(country, rows) {
   const open = rows.some(([, s]) => s.state !== 'ok') ? ' open' : '';
   return `<details class="feed-status-country"${open}>
-    <summary>${escHTML(country)} · ${rows.length} feed${rows.length === 1 ? '' : 's'} · ${escHTML(feedStateCounts(rows))}</summary>
+    <summary>${escHTML(country)} · ${feedCountLabel(rows.length)} · ${escHTML(feedStateCounts(rows))}</summary>
     <table class="feed-status-table">
       <thead><tr><th>Provider</th><th>Source</th><th>Format</th><th>File</th><th>Last check</th><th>Last result</th><th>Format check</th></tr></thead>
       <tbody>${rows.map(([fid, s]) => feedRowHTML(fid, s)).join('')}</tbody>
@@ -1426,8 +1430,8 @@ function renderFeedStatusPanel(sid, statuses) {
   const mode = panel.querySelector('.feed-status-mode')?.value || '';
   const groups = feedGroupsByCountry(data, mode);
   const rows = [...groups.values()].flat();
-  panel.querySelector('[data-role="feed-status-summary"]').textContent =
-    rows.length ? `${rows.length} feed${rows.length === 1 ? '' : 's'} · ${feedStateCounts(rows)}` : '';
+  const summary = rows.length ? `${feedCountLabel(rows.length)} · ${feedStateCounts(rows)}` : '';
+  panel.querySelector('[data-role="feed-status-summary"]').textContent = summary;
   panel.querySelector('[data-role="feed-status-groups"]').innerHTML = rows.length
     ? [...groups.entries()].map(([c, r]) => feedCountryHTML(c, r)).join('')
     : '<p class="hint">No providers match.</p>';
