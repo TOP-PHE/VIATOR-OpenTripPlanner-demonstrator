@@ -248,11 +248,16 @@ async def _stream_to(
         response.raise_for_status()
         digest = hashlib.sha256()
         size = 0
-        with dest.open("wb") as out:
+        # File I/O off the event loop: feeds run to ~2 GB (DE DELFI) and a
+        # slow disk must not stall every other request the web process serves.
+        out = await asyncio.to_thread(dest.open, "wb")
+        try:
             async for chunk in response.aiter_bytes(1024 * 1024):
-                out.write(chunk)
+                await asyncio.to_thread(out.write, chunk)
                 digest.update(chunk)
                 size += len(chunk)
+        finally:
+            await asyncio.to_thread(out.close)
         return response.status_code, response.headers, digest.hexdigest(), size
 
 
