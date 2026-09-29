@@ -80,7 +80,8 @@ async def test_each_refresh_records_its_outcome(inbox: Path) -> None:
     assert second["last_attempt"]["status"] == "skipped"
     assert "503" in second["last_attempt"]["reason"]
     # A failed attempt must not disturb what the next conditional GET replays.
-    assert second["etag"] == '"v1"' and second["sha256"] == first["sha256"]
+    assert second["etag"] == '"v1"'
+    assert second["sha256"] == first["sha256"]
     assert datetime.fromisoformat(second["last_attempt"]["at"]) <= datetime.now(UTC)
 
 
@@ -128,7 +129,8 @@ def test_decorate_fills_the_grouping_keys() -> None:
     }
     _decorate_status(status, provider, fetch_state, None)
     assert (status.label, status.country_iso, status.format) == ("SNCF Voyageurs", "FR", "gtfs")
-    assert status.source == "nap" and status.resolver_type == "tdg"
+    assert status.source == "nap"
+    assert status.resolver_type == "tdg"
     assert status.checked_at == datetime(2026, 9, 29, 10, tzinfo=UTC)
     assert status.last_attempt == fetch_state["last_attempt"]
     assert status.format_ok is True
