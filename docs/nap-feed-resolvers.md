@@ -91,8 +91,26 @@ resolver as JSON.
 
 ## eu19 feed map (probed live 2026-09-29)
 
-`scripts/eu19_nap_sources.json` holds the replacement for 23 of the 26 uploaded feeds.
-`scripts/switch_to_nap_sources.ps1` applies it to a session (dry run by default; `-Apply` to save).
+`app/data/eu19_nap_sources.json` holds the replacement for 23 of the 26 uploaded feeds. It lives
+under `app/` because the web image copies only `app/`.
+
+**Switching a session to it, per country.** In the session's detail panel, **Automated NAP
+sources** lists every provider that has an entry in the map, grouped by country:
+
+- *can switch*: the provider still uses another source;
+- *automated*: it already uses exactly the mapped source;
+- *format differs*: the session and the map disagree on the format (GTFS vs NeTEx). It is never
+  switched automatically; check it by hand.
+
+Tick countries, then **Switch selected countries**. This is `POST /api/sessions/<sid>/nap-sources/apply`
+(platform admin, like a config save). It changes the configuration only, with the same validation,
+staleness flag and audit trail as a config save. The audit row (`session.nap_sources.applied`)
+keeps each replaced timetable, so a switch can be undone by hand. Nothing is downloaded: click
+**Refresh providers** next. Every current file stays until its replacement passes the format
+check. Switching one country at a time lets you refresh and check it before moving on.
+
+`scripts/switch_to_nap_sources.ps1` does the same for all countries at once, from a PC (dry run by
+default; `-Apply` to save).
 
 | Feeds | Source | Notes |
 |---|---|---|

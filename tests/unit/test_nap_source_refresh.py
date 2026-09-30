@@ -389,11 +389,11 @@ def test_without_a_check_an_old_file_is_stale(tmp_path: Path) -> None:
 
 
 def test_eu19_source_map_validates() -> None:
-    """scripts/eu19_nap_sources.json feeds a live session PATCH — every entry
+    """app/data/eu19_nap_sources.json feeds a live session PATCH — every entry
     must pass the same provider validation the PATCH runs."""
     import json
 
-    path = Path(__file__).resolve().parents[2] / "scripts" / "eu19_nap_sources.json"
+    path = Path(__file__).resolve().parents[2] / "app" / "data" / "eu19_nap_sources.json"
     entries = {
         k: v for k, v in json.loads(path.read_text(encoding="utf-8")).items() if k != "_comment"
     }

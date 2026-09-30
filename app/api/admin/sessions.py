@@ -48,6 +48,7 @@ from ... import (
     feed_resolvers,
     inbox_sweep,
     ingestion,
+    nap_source_map,
     sessions_orchestrator,
     staleness,
 )
@@ -2388,6 +2389,128 @@ def _format_ok(status: ProviderStatus, fetch_state: dict[str, Any]) -> bool | No
     if status.source in ("url", "nap", None) and fetch_state.get("sha256"):
         return True
     return None
+
+
+# ─────────────── automated NAP sources, per country (app/nap_source_map.py) ───────────────
+
+
+class NapSourcesPlan(BaseModel):
+    countries: list[nap_source_map.CountryPlan]
+    # Map entries whose provider id this session doesn't have (a map built
+    # for eu19 also serves eu11, which carries a subset).
+    not_in_session: list[str]
+
+
+class NapSourcesApplyBody(BaseModel):
+    provider_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class NapSourcesApplyResponse(BaseModel):
+    changed: list[str]
+    skipped: list[dict[str, str]]
+    # The saved config, so the page can refresh its Configure form — a later
+    # "Save config" from a stale form would silently undo the switch.
+    config: dict[str, Any]
+
+
+@router.get(
+    "/{sid}/nap-sources",
+    response_model=NapSourcesPlan,
+    responses={
+        400: {"description": "Session config is malformed"},
+        404: {"description": "Session not found"},
+    },
+)
+def get_nap_sources(
+    sid: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> NapSourcesPlan:
+    """Which of this session's providers can move to an automated NAP
+    source, grouped by country. Read-only."""
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    try:
+        providers = ingestion.normalize_providers(s.config or {})
+    except ValueError as exc:
+        raise HTTPException(400, f"session config is malformed: {exc}") from exc
+    source_map = nap_source_map.load_map()
+    in_session = {p["id"] for p in providers}
+    return NapSourcesPlan(
+        countries=nap_source_map.plan(providers, source_map),
+        not_in_session=sorted(set(source_map) - in_session),
+    )
+
+
+@router.post(
+    "/{sid}/nap-sources/apply",
+    response_model=NapSourcesApplyResponse,
+    responses={
+        400: {"description": "Legacy config shape, or the switched config fails validation"},
+        404: {"description": "Session not found"},
+    },
+)
+def apply_nap_sources(
+    sid: str,
+    body: NapSourcesApplyBody,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> NapSourcesApplyResponse:
+    """Switch the given providers' timetables to their mapped automated
+    source. Config only — nothing is downloaded; refresh afterwards. Same
+    validation, staleness bump and audit trail as a config save
+    (`patch_session`); countries don't change, so no country gate."""
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    config = s.config or {}
+    if not isinstance((config.get("sources") or {}).get("providers"), list):
+        raise HTTPException(
+            400,
+            "this session still uses a legacy sources shape — save its Configure form once first",
+        )
+    new_config, changed, skipped = nap_source_map.apply(
+        config, set(body.provider_ids), nap_source_map.load_map()
+    )
+    if changed:
+        _save_nap_switch(db, request, actor, s, new_config, changed, skipped)
+    return NapSourcesApplyResponse(changed=changed, skipped=skipped, config=s.config or {})
+
+
+def _save_nap_switch(
+    db: DbSession,
+    request: Request,
+    actor: CurrentUser,
+    s: SessionRow,
+    new_config: dict[str, Any],
+    changed: list[str],
+    skipped: list[dict[str, str]],
+) -> None:
+    try:
+        new_config["sources"]["providers"] = ingestion.normalize_providers(new_config)
+    except ValueError as exc:
+        raise HTTPException(400, f"switched config fails validation: {exc}") from exc
+    if not staleness.sources_subtree_equal(s.config, new_config):
+        staleness.mark_sources_changed(new_config)
+    previous = {
+        p.get("id"): p.get("timetable")
+        for p in ((s.config or {}).get("sources") or {}).get("providers") or []
+        if isinstance(p, dict) and p.get("id") in changed
+    }
+    s.config = new_config
+    audit.record(
+        db,
+        action="session.nap_sources.applied",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=s.id,
+        # `previous` keeps each replaced timetable, so a switch can be undone by hand.
+        metadata={"changed": changed, "skipped": skipped, "previous": previous},
+    )
+    db.commit()
 
 
 # ───────────────────────── rebuilds ─────────────────────────
