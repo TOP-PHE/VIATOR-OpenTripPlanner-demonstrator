@@ -841,6 +841,19 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
               Save the session first so the provider exists, then upload.
             </p>
           </div>
+          <div class="prov-tt-nap-row" ${ttSource === 'nap' ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <label>NAP resolver <span class="hint">(JSON — see docs/nap-feed-resolvers.md)</span></label>
+            <textarea class="prov-tt-resolver" rows="3" spellcheck="false"
+                      placeholder='{"type": "tdg", "dataset_id": "64635525318cc75a9a8a771f", "resource_id": 81653}'
+                      style="width: 100%; font-family: monospace">${escHTML(tt.resolver ? JSON.stringify(tt.resolver) : '')}</textarea>
+            <p class="hint" style="margin: 0.25rem 0 0">
+              Each refresh asks the NAP for the <em>current</em> file (the file name rotates on most
+              portals) and skips it if unchanged. A downloaded file must pass a format check (right
+              kind of archive) before it replaces the previous one; its content is not validated.
+              Types: <code>tdg</code> (transport.data.gouv.fr), <code>udata</code>,
+              <code>permalink</code>, <code>dated</code>.
+            </p>
+          </div>
           <div class="prov-tt-derived-row" ${ttSource === 'cross_border_filter' ? '' : 'hidden'} style="margin-top: 0.4rem">
             <div class="prov-grid-3">
               <div>
@@ -866,8 +879,10 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
             </label>
             <p class="hint" style="margin: 0.25rem 0 0">
               Derives this feed by running the cross-border filter on the linked national feed —
-              one source of truth, no drift. Refresh this provider (or the national session) to
-              (re)build it. The national feed must already be loaded on its own session.
+              one source of truth, no drift. Refresh this provider to (re)build it. Refreshing the
+              national session rebuilds it too, but only when the national file actually changed —
+              if the national feed comes back unchanged, refresh this provider directly.
+              The national feed must already be loaded on its own session.
             </p>
           </div>`;
 }
@@ -1006,6 +1021,7 @@ function providerCardHTML(p, opts) {
               <select class="prov-tt-source">
                 <option value="url"    ${ttSource === 'url' ? 'selected' : ''}>Download from URL</option>
                 <option value="upload" ${ttSource === 'upload' ? 'selected' : ''}>Upload a file</option>
+                <option value="nap"    ${ttSource === 'nap' ? 'selected' : ''}>NAP resolver (current file)</option>
                 <option value="cross_border_filter" ${ttSource === 'cross_border_filter' ? 'selected' : ''}>Cross-border filter (derived)</option>
               </select>
             </div>
@@ -1116,6 +1132,53 @@ function collectDerivedFields(card, id, timetable) {
   return true;
 }
 
+// NAP resolver (source "nap") — the JSON object is validated server-side
+// (app/feed_resolvers.py); here we only check it parses to an object with a type.
+function collectResolverField(card, id, timetable) {
+  const raw = (card.querySelector('.prov-tt-resolver')?.value || '').trim();
+  let resolver;
+  try { resolver = JSON.parse(raw); } catch (err) {
+    showToast('error', `${id}: NAP resolver is not valid JSON (${err.message})`);
+    return false;
+  }
+  if (!resolver || typeof resolver !== 'object' || Array.isArray(resolver) || !resolver.type) {
+    showToast('error', `${id}: NAP resolver must be a JSON object with a "type"`);
+    return false;
+  }
+  timetable.resolver = resolver;
+  return true;
+}
+
+// URL mode (source "url") needs an http(s) timetable URL.
+function collectTimetableUrl(card, id, timetable) {
+  const ttUrl = card.querySelector('.prov-tt-url').value.trim();
+  if (!ttUrl) {
+    showToast('error', `${id}: timetable URL is required (or switch Source to "Upload a file")`);
+    return false;
+  }
+  if (!/^https?:\/\//.test(ttUrl)) {
+    showToast('error', `${id}: timetable URL must be http(s)`);
+    return false;
+  }
+  timetable.url = ttUrl;
+  return true;
+}
+
+// v0.1.37 — source-aware: URL mode requires an http(s) URL; Upload mode
+// requires no URL (the operator attaches a file via the upload button);
+// cross_border_filter (§12) needs a link to a national feed, no URL; nap
+// needs a resolver object.
+const TIMETABLE_SOURCE_COLLECTORS = {
+  url: collectTimetableUrl,
+  cross_border_filter: collectDerivedFields,
+  nap: collectResolverField,
+};
+
+function collectTimetableSource(card, id, ttSource, timetable) {
+  const collect = TIMETABLE_SOURCE_COLLECTORS[ttSource];
+  return collect ? collect(card, id, timetable) : true;
+}
+
 function readProviderCard(card) {
   // Opposite of providerCardHTML — collect the form values back into a
   // canonical provider object. Returns null + shows a toast for invalid
@@ -1125,7 +1188,6 @@ function readProviderCard(card) {
   const country = card.querySelector('.prov-country').value.trim().toUpperCase();
   const ttFormat = card.querySelector('.prov-tt-format').value;
   const ttSource = card.querySelector('.prov-tt-source')?.value || 'url';
-  const ttUrl = card.querySelector('.prov-tt-url').value.trim();
   if (!FEED_ID_RE.test(id)) {
     showToast('error', `Provider id ${JSON.stringify(id)} must be uppercase, 2-16 chars (A-Z, 0-9, _, -)`);
     return null;
@@ -1134,23 +1196,8 @@ function readProviderCard(card) {
     showToast('error', `${id}: country ${JSON.stringify(country)} must be 2 uppercase letters`);
     return null;
   }
-  // v0.1.37 — source-aware: URL mode requires an http(s) URL; Upload mode
-  // requires no URL (the operator attaches a file via the upload button);
-  // cross_border_filter (§12) needs a link to a national feed, no URL.
   const timetable = {format: ttFormat, source: ttSource};
-  if (ttSource === 'url') {
-    if (!ttUrl) {
-      showToast('error', `${id}: timetable URL is required (or switch Source to "Upload a file")`);
-      return null;
-    }
-    if (!/^https?:\/\//.test(ttUrl)) {
-      showToast('error', `${id}: timetable URL must be http(s)`);
-      return null;
-    }
-    timetable.url = ttUrl;
-  } else if (ttSource === 'cross_border_filter') {
-    if (!collectDerivedFields(card, id, timetable)) return null;
-  }
+  if (!collectTimetableSource(card, id, ttSource, timetable)) return null;
   const provider = {
     id,
     label: label || id,
@@ -1310,6 +1357,34 @@ async function loadProviderStatuses(sid, formEl) {
 // v0.1.37 — extracted from the config-form click delegation so that
 // handler stays a thin dispatcher (one branch per action) and each piece
 // keeps its cognitive complexity in check.
+// Refresh-response helpers shared by the per-provider and session-wide
+// Refresh buttons. "unchanged" = upstream file identical to the one in the
+// slot (HTTP 304 / same sha256): no rotation, no rebuild, still a success.
+function refreshKeys(items) {
+  return (items || []).map(i => i.key).join(', ');
+}
+
+function skippedSummary(items) {
+  return (items || []).map(s => {
+    const why = s.error || s.reason;
+    return s.key + (why ? ` (${why})` : '');
+  }).join(', ');
+}
+
+function refreshSummary(body, titleCase) {
+  const word = w => (titleCase ? w[0].toUpperCase() + w.slice(1) + ':' : w);
+  const unchanged = refreshKeys(body.unchanged);
+  const skipped = skippedSummary(body.skipped);
+  let text = `${word('fetched')} ${refreshKeys(body.fetched) || 'none'}`;
+  if (unchanged) text += ` | ${word('unchanged')} ${unchanged}`;
+  if (skipped) text += ` | ${word('skipped')} ${skipped}`;
+  return text;
+}
+
+function refreshSucceeded(body) {
+  return (body.fetched || []).length > 0 || (body.unchanged || []).length > 0;
+}
+
 async function refreshOneProvider(form, refreshBtn) {
   const card = refreshBtn.closest('.provider-card');
   const pid = card.querySelector('.prov-id').value.trim();
@@ -1325,10 +1400,8 @@ async function refreshOneProvider(form, refreshBtn) {
       showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
       return;
     }
-    const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-    const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
-    showToast('success', `${pid}: fetched ${fetched}${skipped ? ' | skipped ' + skipped : ''}`);
-    if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+    showToast('success', `${pid}: ${refreshSummary(body, false)}`);
+    if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
   } catch (err) { showToast('error', String(err)); }
   finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
@@ -1470,6 +1543,8 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     const urlRow = card.querySelector('.prov-tt-url-row');
     const upRow = card.querySelector('.prov-tt-upload-row');
     const derivedRow = card.querySelector('.prov-tt-derived-row');
+    const napRow = card.querySelector('.prov-tt-nap-row');
+    if (napRow) napRow.hidden = src !== 'nap';
     if (urlRow) urlRow.hidden = src !== 'url';
     if (upRow) upRow.hidden = src !== 'upload';
     if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
@@ -1636,10 +1711,8 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       const r = await fetch(`/api/sessions/${sid}/sources/refresh`, {method:'POST'});
       const body = await r.json().catch(() => ({}));
       if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
-      const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
-      const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
-      showToast('success', `Fetched: ${fetched}${skipped ? ' | Skipped: ' + skipped : ''}`);
-      if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
+      showToast('success', refreshSummary(body, true));
+      if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
       // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
       // mtimes / sizes are visible without a page reload.
       loadProviderStatuses(sid, form);

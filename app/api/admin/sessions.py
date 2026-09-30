@@ -22,7 +22,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 
 import httpx
 from fastapi import (
@@ -41,7 +41,16 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from ... import audit, detect, inbox_sweep, ingestion, sessions_orchestrator, staleness
+from ... import (
+    audit,
+    detect,
+    feed_fetch,
+    feed_resolvers,
+    inbox_sweep,
+    ingestion,
+    sessions_orchestrator,
+    staleness,
+)
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
 from ...models import Session as SessionRow
@@ -689,6 +698,9 @@ async def upload_to_session(
     triggered = ingestion.dispatch(
         staged_path, detected, db, session_id=sid, staged_filename=staged_filename
     )
+    # The slot no longer holds the last downloaded file — forget the fetch
+    # state of every task that writes it, so no refresh can call it "unchanged".
+    _forget_fetch_state_for_slot(sid, detected, staged_filename)
     # Where did dispatch end up putting it? Reconstruct from the rules. With
     # a provider slot the name is `<feed_id>.zip`; otherwise the legacy name.
     final_path = _reconstruct_dispatch_target(sid, detected, staged_filename or staged_path.name)
@@ -901,6 +913,9 @@ def _reconstruct_dispatch_target(sid: str, kind: str, filename: str) -> Path:
 class RefreshSourcesResponse(BaseModel):
     fetched: list[dict[str, Any]]
     skipped: list[dict[str, Any]]
+    # Checked upstream and found identical to the file already in the slot
+    # (HTTP 304 or sha256 match) — nothing rotated, no rebuild queued.
+    unchanged: list[dict[str, Any]] = []
     # PR #33: filenames renamed to `.orphaned` because their provider was
     # removed from the session config but the inbox file lingered. Surfaced
     # to the operator so they can verify the build picks up only the
@@ -975,16 +990,18 @@ async def refresh_sources(
     # endpoint so refreshing a GTFS feed doesn't accidentally bust the
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(s.config or {}, include_osm=False)
-    fetched, skipped = await _gather_refresh_outcomes(db, sid, staging, s.config or {}, work)
+    fetched, unchanged, skipped = await _gather_refresh_outcomes(
+        db, sid, staging, s.config or {}, work
+    )
 
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         s.state = SessionState.POPULATED.value
 
     # Staleness tracking (v0.1.7.1): mark refresh completed so the next
     # rebuild is no longer flagged stale. Done only when at least one
-    # task actually fetched — if every URL failed, the on-disk data is
-    # still stale and the operator needs to know.
-    if fetched:
+    # task fetched or confirmed its file current — if every URL failed,
+    # the on-disk data is still stale and the operator needs to know.
+    if fetched or unchanged:
         if s.config is None:
             s.config = {}
         staleness.mark_refresh_completed(s.config)
@@ -1016,6 +1033,7 @@ async def refresh_sources(
         metadata={
             "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
             "fetched": [f["key"] for f in fetched],
+            "unchanged": [u["key"] for u in unchanged],
             "skipped": [s_["key"] for s_ in skipped],
             "orphaned": orphaned,  # PR #33
             "cascaded": _cascade_keys(cascaded),
@@ -1023,7 +1041,11 @@ async def refresh_sources(
     )
     db.commit()
     return RefreshSourcesResponse(
-        fetched=fetched, skipped=skipped, orphaned=orphaned, cascaded=cascaded
+        fetched=fetched,
+        unchanged=unchanged,
+        skipped=skipped,
+        orphaned=orphaned,
+        cascaded=cascaded,
     )
 
 
@@ -1145,7 +1167,7 @@ async def refresh_osm(
     # branch (only rotates the exact file). The legacy "rotate everything
     # not ending in .old" branch would re-rotate our .old.<N> generations,
     # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
-    task: _RefreshTask = ("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
+    task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         outcome = await _refresh_one_task(client, db, sid, staging, task)
         if outcome.get("status") == "fetched":
@@ -1189,24 +1211,24 @@ def _url_suffix(url: str) -> str:
     return ""
 
 
-def _stat_size(p: Path) -> int:
-    try:
-        return p.stat().st_size
-    except OSError:
-        return 0
-
-
 # ──── refresh task model — used by both session-wide and per-provider ────
 
 
-# Per-task tuple shape: (label, kind, url, staged_filename_or_None, credential_id_or_None).
-# `label` is what we surface in the API response — operators see things
-# like `gtfs[SNCF]` (multi-feed legacy) or `provider[SNCF].timetable`
-# (provider-bundle v0.1.6) or `provider[SNCF].mct` etc., not just bare keys.
-# `credential_id` (v0.1.10) is the optional UUID of a user_credentials row
-# whose decrypted secret should be applied to the HTTP request. None means
-# anonymous fetch (the v0.1.6-v0.1.9 default behaviour).
-_RefreshTask = tuple[str, str, str, str | None, str | None]
+class _RefreshTask(NamedTuple):
+    """One download. `label` is what we surface in the API response —
+    operators see things like `provider[SNCF].timetable(gtfs)` or
+    `provider[SNCF].mct`, not just bare keys. `credential_id` (v0.1.10) is the
+    optional UUID of a user_credentials row whose decrypted secret should be
+    applied to the HTTP request; None means anonymous fetch. `resolver` is set
+    for a `source: "nap"` timetable — `url` is then only its display form and
+    the file URL is resolved at refresh time (app/feed_resolvers.py)."""
+
+    label: str
+    kind: str
+    url: str
+    staged_filename: str | None
+    credential_id: str | None
+    resolver: dict[str, Any] | None = None
 
 
 def _build_refresh_tasks(
@@ -1261,20 +1283,21 @@ def _build_refresh_tasks(
         tt = p.get("timetable") or {}
         tt_url = tt.get("url")
         tt_fmt = tt.get("format", "gtfs")
-        if tt_url:
-            kind = ingestion.TIMETABLE_FORMAT_DETAILS[tt_fmt]["kind"]
+        resolver = tt.get("resolver") if tt.get("source") == "nap" else None
+        if tt_url or resolver:
             tasks.append(
-                (
+                _RefreshTask(
                     f"provider[{pid}].timetable({tt_fmt})",
-                    kind,
-                    tt_url,
+                    ingestion.TIMETABLE_FORMAT_DETAILS[tt_fmt]["kind"],
+                    feed_resolvers.describe(resolver) if resolver else str(tt_url),
                     ingestion.staged_filename_for_format(pid, tt_fmt),
                     p.get("timetable_credential_id"),
+                    resolver,
                 )
             )
         if p.get("mct_url"):
             tasks.append(
-                (
+                _RefreshTask(
                     f"provider[{pid}].mct",
                     "SNCF-MCT",
                     p["mct_url"],
@@ -1284,7 +1307,7 @@ def _build_refresh_tasks(
             )
         if p.get("stations_csv_url"):
             tasks.append(
-                (
+                _RefreshTask(
                     f"provider[{pid}].stations_csv",
                     "SNCF-Stations",
                     p["stations_csv_url"],
@@ -1302,7 +1325,7 @@ def _build_refresh_tasks(
         and isinstance(sources.get("osm_pbf"), str)
         and sources["osm_pbf"]
     ):
-        tasks.append(("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
+        tasks.append(_RefreshTask("osm_pbf", "OSM-PBF", sources["osm_pbf"], None, None))
 
     return tasks
 
@@ -1432,26 +1455,27 @@ async def _gather_refresh_outcomes(
     staging: Path,
     config: dict[str, Any],
     work: list[_RefreshTask],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Run the URL-download tasks then the derived (cross_border_filter)
-    providers, partitioning every outcome into (fetched, skipped).
+    providers, partitioning every outcome into (fetched, unchanged, skipped).
 
     Derived providers are materialised after the URL downloads so a same-session
     national+derived pair resolves in one refresh (see
     docs/provider-source-modes-design.md §12)."""
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-
-    def _record(outcome: dict[str, Any]) -> None:
-        bucket = fetched if outcome.get("status") == "fetched" else skipped
-        bucket.append({k: v for k, v in outcome.items() if k != "status"})
-
+    buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
-            _record(await _refresh_one_task(client, db, sid, staging, task))
+            _bucket_outcome(buckets, await _refresh_one_task(client, db, sid, staging, task))
     for outcome in await _run_derived_filters(db, sid, config, staging):
-        _record(outcome)
-    return fetched, skipped
+        _bucket_outcome(buckets, outcome)
+    return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
+
+
+def _bucket_outcome(buckets: dict[str, list[dict[str, Any]]], outcome: dict[str, Any]) -> None:
+    """File a task outcome under its status (anything unknown counts as skipped)."""
+    status = outcome.get("status")
+    bucket = buckets[status] if status in ("fetched", "unchanged") else buckets["skipped"]
+    bucket.append({k: v for k, v in outcome.items() if k != "status"})
 
 
 # v0.1.19 — pure state-derivation helper. Lives alongside `_build_refresh_tasks`
@@ -1470,6 +1494,7 @@ def _derive_provider_status(
     latest_audit_meta: dict[str, Any] | None,
     now: datetime,
     freshness_hours: int = _PROVIDER_FRESHNESS_HOURS,
+    checked_at: datetime | None = None,
 ) -> ProviderStatus:
     """Decide what to show on a provider card based on inbox + audit state.
 
@@ -1491,6 +1516,11 @@ def _derive_provider_status(
     we're looking for is at `<inbox_root>/<subdir>/<feed_id_lower>.zip` where
     `<subdir>` is `gtfs/` or `netex/` per the timetable format — same
     convention `dispatch()` uses to stage downloaded files.
+
+    `checked_at` is when a refresh last confirmed the file is still current
+    upstream (HTTP 304 / same sha256). An unchanged file keeps its old mtime,
+    so freshness is measured from whichever is later. `unchanged` audit keys
+    count as a successful attempt.
     """
     fmt_details = ingestion.TIMETABLE_FORMAT_DETAILS.get(timetable_format)
     if fmt_details is None:
@@ -1519,7 +1549,10 @@ def _derive_provider_status(
         marker = f"provider[{feed_id}]."
         in_fetched = any(
             isinstance(k, str) and k.startswith(marker)
-            for k in latest_audit_meta.get("fetched", [])
+            for k in [
+                *latest_audit_meta.get("fetched", []),
+                *latest_audit_meta.get("unchanged", []),
+            ]
         )
         in_skipped = any(
             isinstance(k, str) and k.startswith(marker)
@@ -1527,7 +1560,8 @@ def _derive_provider_status(
         )
 
     if fetched_at is not None:
-        age_h = (now - fetched_at).total_seconds() / 3600.0
+        last_confirmed = max(fetched_at, checked_at) if checked_at else fetched_at
+        age_h = (now - last_confirmed).total_seconds() / 3600.0
         state = "ok" if age_h <= freshness_hours else "stale"
         # If the *latest* audit row has this provider only in skipped (no
         # successful task), the file is from an earlier successful run but
@@ -1555,6 +1589,81 @@ def _derive_provider_status(
     return ProviderStatus(feed_id=feed_id, state="pending")
 
 
+def _fetch_state_dir(sid: str) -> Path:
+    """Per-task conditional-GET / sha256 state (app/feed_fetch.py). Kept out
+    of gtfs/, netex/ and osm/ — every build globs those."""
+    return settings.inbox_dir / sid / "_fetch_state"
+
+
+def _fetch_checked_at(sid: str, label: str) -> datetime | None:
+    """When a refresh last confirmed this task's file current, if ever."""
+    raw = feed_fetch.load_state(_fetch_state_dir(sid), label).get("checked_at")
+    try:
+        return datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+
+
+def _current_target_exists(sid: str, kind: str, staged_filename: str | None) -> bool:
+    """Does the slot a task would dispatch into already hold *this task's*
+    file? Without one, an "unchanged" verdict would leave the provider with
+    nothing. LOAD_TO_DB kinds (SNCF-MCT / SNCF-Stations) share one slot per
+    kind across every provider, so a file there proves nothing about this
+    task — always download them."""
+    if kind not in ingestion.STAGE_INTO_OTP_INBOX:
+        return False
+    name = staged_filename or ingestion.STAGE_INTO_OTP_INBOX_FILENAME[kind]
+    return (settings.inbox_dir / sid / ingestion.STAGE_INTO_OTP_INBOX[kind] / name).is_file()
+
+
+def _labels_writing_slot(kind: str, staged_filename: str | None) -> list[str]:
+    """Every refresh-task label whose download lands in the slot `kind` +
+    `staged_filename` names — whatever the provider's *current* source is,
+    since a later switch back to url/nap would reuse the stale state."""
+    if kind == "OSM-PBF":
+        return ["osm_pbf"]
+    subdir = ingestion.STAGE_INTO_OTP_INBOX.get(kind)
+    if subdir is None:
+        return []
+    name = staged_filename or ingestion.STAGE_INTO_OTP_INBOX_FILENAME[kind]
+    pid = Path(name).stem.upper()  # feed ids are upper-case; slot names are lower
+    return [
+        f"provider[{pid}].timetable({fmt})"
+        for fmt, details in ingestion.TIMETABLE_FORMAT_DETAILS.items()
+        if details["subdir"] == subdir
+    ]
+
+
+def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | None) -> None:
+    state_dir = _fetch_state_dir(sid)
+    for label in _labels_writing_slot(kind, staged_filename):
+        feed_fetch.state_path(state_dir, label).unlink(missing_ok=True)
+
+
+def _resolve_credential(
+    db: DbSession, credential_id: str | None, url: str
+) -> tuple[str, dict[str, str], Any]:
+    """Apply a stored credential (v0.1.10) to `url`. Returns (fetch_url,
+    extra_headers, credential_row_or_None); raises ValueError with an
+    operator-facing reason when the credential is gone or undecryptable."""
+    if not credential_id:
+        return url, {}, None
+    # Triple-dot: this file is at app/api/admin/sessions.py; we need
+    # `app.credentials` (the crypto module) and `app.models`. Single-dot
+    # would resolve to `app.api.credentials` (the router).
+    from ... import credentials as crypto_module
+    from ...models import UserCredential
+
+    cred = db.get(UserCredential, uuid.UUID(credential_id))
+    if cred is None:
+        raise ValueError(f"credential {credential_id} not found (was it deleted?)")
+    try:
+        fetch_url, extra_headers = crypto_module.apply_credential(cred, url, settings.jwt_secret)
+    except crypto_module.CredentialDecryptError as exc:
+        raise ValueError(f"credential {cred.name!r} cannot be decrypted: {exc}") from exc
+    return fetch_url, extra_headers, cred
+
+
 async def _refresh_one_task(
     client: httpx.AsyncClient,
     db: DbSession,
@@ -1562,65 +1671,76 @@ async def _refresh_one_task(
     staging: Path,
     task: _RefreshTask,
 ) -> dict[str, Any]:
-    """Run one download+dispatch task. Returns a dict for the response —
-    `status: fetched` or `status: skipped`. Wrapped error handling so the
-    per-task failure doesn't abort the rest of the batch.
+    """Run one resolve+download+format-check+dispatch task. Returns a dict for
+    the response — `status` is `fetched` (new file dispatched, rebuild
+    queued), `unchanged` (upstream file identical to the one in the slot —
+    nothing rotated, no rebuild) or `skipped` (failed; the slot keeps its
+    previous file). Per-task failures never abort the rest of the batch.
     """
-    label, kind, url, staged_filename, credential_id = task
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        return {"status": "skipped", "key": label, "url": url, "reason": "not an http(s) URL"}
-
-    # Resolve credential (v0.1.10) — none → fetch anonymously, missing →
-    # skip with a clear reason so the operator knows to detach or pick a
-    # different one. Decryption failure (e.g. JWT_SECRET rotated) is
-    # surfaced the same way: this task fails, but other tasks proceed.
-    extra_headers: dict[str, str] = {}
-    fetch_url = url
-    cred = None
-    if credential_id:
-        # Triple-dot: this file is at app/api/admin/sessions.py; we need
-        # `app.credentials` (the crypto module) and `app.models`. Single-dot
-        # would resolve to `app.api.credentials` (the router we just added).
-        from ... import credentials as crypto_module
-        from ...models import UserCredential
-
-        cred = db.get(UserCredential, uuid.UUID(credential_id))
-        if cred is None:
-            return {
-                "status": "skipped",
-                "key": label,
-                "url": url,
-                "reason": f"credential {credential_id} not found (was it deleted?)",
-            }
+    if task.resolver is None:
+        return await _download_task(client, db, sid, staging, task, task.url)
+    # The file URL comes from a third-party catalogue — every redirect hop
+    # of the lookup and the download is re-checked against the SSRF guard.
+    async with feed_resolvers.redirect_guard(client):
         try:
-            fetch_url, extra_headers = crypto_module.apply_credential(
-                cred, url, settings.jwt_secret
-            )
-        except crypto_module.CredentialDecryptError as exc:
-            return {
-                "status": "skipped",
-                "key": label,
-                "url": url,
-                "reason": f"credential {cred.name!r} cannot be decrypted: {exc}",
-            }
+            url = await feed_resolvers.resolve(client, task.resolver)
+        except feed_resolvers.ResolveError as exc:
+            return _skipped(task, task.url, f"NAP resolver failed: {exc}")
+        return await _download_task(client, db, sid, staging, task, url)
 
+
+def _skipped(task: _RefreshTask, url: str, reason: str) -> dict[str, Any]:
+    return {"status": "skipped", "key": task.label, "url": url, "reason": reason}
+
+
+async def _download_task(
+    client: httpx.AsyncClient,
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    task: _RefreshTask,
+    url: str,
+) -> dict[str, Any]:
+    """Download + format-check + dispatch `url` for `task` (its resolver, if
+    any, has already run — `url` is the file to fetch)."""
+    label, kind = task.label, task.kind
+
+    def _skip(reason: str) -> dict[str, Any]:
+        return _skipped(task, url, reason)
+
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return _skip("not an http(s) URL")
+
+    # Credential none → anonymous fetch; missing or undecryptable (e.g.
+    # JWT_SECRET rotated) → this task fails with the reason, others proceed.
+    try:
+        fetch_url, extra_headers, cred = _resolve_credential(db, task.credential_id, url)
+    except ValueError as exc:
+        return _skip(str(exc))
+
+    state_dir = _fetch_state_dir(sid)
     base_key = label.split("[", 1)[0]
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    staged_name = f"{ts}-{base_key}{_url_suffix(url)}"
-    staged_path = staging / staged_name
     try:
-        async with client.stream("GET", fetch_url, headers=extra_headers) as response:
-            response.raise_for_status()
-            with staged_path.open("wb") as out:
-                async for chunk in response.aiter_bytes(1024 * 1024):
-                    out.write(chunk)
-    except httpx.HTTPError as exc:
-        staged_path.unlink(missing_ok=True)
-        return {"status": "skipped", "key": label, "url": url, "reason": f"download failed: {exc}"}
+        result = await feed_fetch.fetch_validated(
+            client,
+            fetch_url=fetch_url,
+            state_url=url,
+            extra_headers=extra_headers,
+            kind=kind,
+            staging=staging,
+            # uuid: two overlapping refreshes of one session must not share
+            # staging files.
+            base_name=f"{ts}-{base_key}-{uuid.uuid4().hex[:8]}",
+            suffix=_url_suffix(url),
+            previous=feed_fetch.load_state(state_dir, label),
+            have_current=_current_target_exists(sid, kind, task.staged_filename),
+        )
+    except feed_fetch.FetchError as exc:
+        return _skip(str(exc))
 
     # Stamp last_used_at on the credential so users can see "this hasn't
-    # been used in months — maybe drop it." Best-effort; failures here
-    # don't fail the refresh.
+    # been used in months — maybe drop it." Best-effort.
     if cred is not None:
         try:
             cred.last_used_at = datetime.now(UTC)
@@ -1628,21 +1748,39 @@ async def _refresh_one_task(
         except Exception as exc:
             log.warning("could not stamp last_used_at on credential %s: %s", cred.id, exc)
 
-    size_bytes = _stat_size(staged_path)
+    if result.status == "unchanged":
+        feed_fetch.save_state(state_dir, label, result.state)
+        return {
+            "status": "unchanged",
+            "key": label,
+            "kind": kind,
+            "url": url,
+            "reason": result.reason,
+        }
+
+    assert result.path is not None  # "fetched" always carries the format-checked file
     try:
         ingestion.dispatch(
-            staged_path,
+            result.path,
             kind,
             db,
             session_id=sid,
-            staged_filename=staged_filename,
+            staged_filename=task.staged_filename,
         )
     except Exception as exc:
-        staged_path.unlink(missing_ok=True)
-        return {"status": "skipped", "key": label, "url": url, "reason": f"dispatch failed: {exc}"}
+        result.path.unlink(missing_ok=True)
+        return _skip(f"dispatch failed: {exc}")
+    finally:
+        result.path.unlink(missing_ok=True)
 
-    staged_path.unlink(missing_ok=True)
-    return {"status": "fetched", "key": label, "kind": kind, "url": url, "size_bytes": size_bytes}
+    feed_fetch.save_state(state_dir, label, result.state)
+    return {
+        "status": "fetched",
+        "key": label,
+        "kind": kind,
+        "url": url,
+        "size_bytes": result.size_bytes,
+    }
 
 
 # ──── bulk import providers from a National Access Point (v0.1.8) ────
@@ -1930,12 +2068,14 @@ def _finalise_provider_refresh(
     pid: str,
     fetched: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
+    unchanged: list[dict[str, Any]] | None = None,
 ) -> RefreshSourcesResponse:
     """Shared tail for both per-provider refresh paths: advance state, clear the
     staleness flag (lossy-by-design — see refresh_sources), audit, commit."""
+    unchanged = unchanged or []
     if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         session.state = SessionState.POPULATED.value
-    if fetched:
+    if fetched or unchanged:
         if session.config is None:
             session.config = {}
         staleness.mark_refresh_completed(session.config)
@@ -1951,11 +2091,12 @@ def _finalise_provider_refresh(
         metadata={
             "provider_id": pid,
             "fetched": [f["key"] for f in fetched],
+            "unchanged": [u["key"] for u in unchanged],
             "skipped": [s_["key"] for s_ in skipped],
         },
     )
     db.commit()
-    return RefreshSourcesResponse(fetched=fetched, skipped=skipped)
+    return RefreshSourcesResponse(fetched=fetched, unchanged=unchanged, skipped=skipped)
 
 
 async def _refresh_derived_provider(
@@ -1999,8 +2140,8 @@ async def _refresh_provider_urls(
     pid: str,
     staging: Path,
 ) -> RefreshSourcesResponse:
-    """Per-provider 'Refresh' for a url-source provider: download its timetable +
-    optional MCT + stations CSV into the slot."""
+    """Per-provider 'Refresh' for a url- or nap-source provider: download its
+    timetable + optional MCT + stations CSV into the slot."""
     work = _build_refresh_tasks(session.config or {}, only_provider=pid)
     if not work:
         raise HTTPException(
@@ -2008,14 +2149,10 @@ async def _refresh_provider_urls(
             f"Provider {pid!r} has no URLs to refresh "
             "(no timetable, MCT, or stations CSV configured).",
         )
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+    buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
-            outcome = await _refresh_one_task(client, db, sid, staging, task)
-            (fetched if outcome.get("status") == "fetched" else skipped).append(
-                {k: v for k, v in outcome.items() if k != "status"}
-            )
+            _bucket_outcome(buckets, await _refresh_one_task(client, db, sid, staging, task))
     return _finalise_provider_refresh(
         db,
         request=request,
@@ -2023,8 +2160,9 @@ async def _refresh_provider_urls(
         session=session,
         sid=sid,
         pid=pid,
-        fetched=fetched,
-        skipped=skipped,
+        fetched=buckets["fetched"],
+        skipped=buckets["skipped"],
+        unchanged=buckets["unchanged"],
     )
 
 
@@ -2159,6 +2297,7 @@ def get_providers_status(
             inbox_root=inbox_root,
             latest_audit_meta=latest_meta,
             now=now,
+            checked_at=_fetch_checked_at(sid, f"provider[{p['id']}].timetable({fmt})"),
         )
         status.source = tt.get("source")
         if status.source == "upload":
