@@ -75,9 +75,20 @@ def test_motis_healthcheck_uses_wget_not_curl():
     ships wget but NOT curl. The previous `curl -fsS …` probe therefore
     failed on every run, so every MOTIS container reported (unhealthy)
     and docker could not auto-restart MOTIS when it actually hung.
-    `wget --spider` issues a HEAD-like request, ships in the base image,
-    and exits non-zero on HTTP error — exactly what docker's healthcheck
-    contract needs."""
+    wget ships in the base image and exits non-zero on HTTP error — exactly
+    what docker's healthcheck contract needs.
+
+    It must also probe **127.0.0.1, never `localhost`**. MOTIS binds IPv4 only
+    (`listening on 0.0.0.0:8080`), `localhost` resolves to ::1 first inside the
+    container, and BusyBox wget stops at ECONNREFUSED without falling back to
+    IPv4. Measured on the VPS 2026-09-10: 127.0.0.1 exits 0 while `localhost`
+    is refused, on the same container at the same instant, while curl from
+    another container gets 200. That made this healthcheck fail permanently and
+    autoheal restart a healthy MOTIS every few minutes. The address assertion
+    below is the trip-wire; do not relax it to a hostname.
+
+    `--spider` is deliberately not asserted: a plain GET (`-O /dev/null`) is
+    what was verified working, and `--spider` was not."""
     out = render_compose([_StubSession(id="x", engine="motis")])
     motis_block = out.split("motis-x:")[1].split("\n\n")[0]
     # Pull out the `test:` line — the actual healthcheck command — so the
@@ -86,18 +97,29 @@ def test_motis_healthcheck_uses_wget_not_curl():
     test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))
     # The MOTIS image has no curl — the probe must use wget.
     assert "wget" in test_line
-    assert "--spider" in test_line
     # Negative assertion: no leftover curl invocation in the actual probe.
     assert "curl" not in test_line
+    # The bug this guards: `localhost` resolves to ::1, where MOTIS is not
+    # listening, so the probe is refused instantly and forever.
+    assert "127.0.0.1" in test_line
+    assert "localhost" not in test_line
 
 
 def test_motis_healthcheck_timeout_tolerates_transient_slowness_under_load():
-    """2026-07-01 eu19 incident: autoheal restarted eu19-transit-motis
-    every ~6min for 2h+ even on an unloaded 18-core host, because the old
-    5s wget timeout / 10s docker timeout misread a session briefly busy
-    with concurrent RAPTOR queries as dead. Both budgets must be wide
-    enough to tolerate that without being infinite (a genuine zombie must
-    still get caught)."""
+    """Both budgets must be wide enough to tolerate a session briefly busy
+    with concurrent RAPTOR queries, without being infinite — a genuine zombie
+    must still get caught.
+
+    Historical note, because the original rationale here was wrong. This was
+    written for the 2026-07-01 eu19 incident on the theory that a 5s wget /
+    10s docker budget misread a busy session as dead. It did not: the probe
+    was pointed at `localhost`, which resolves to ::1 where MOTIS never
+    listens, so it was *refused in microseconds* rather than timing out. No
+    timeout would ever have helped. See the address assertions in
+    `test_motis_healthcheck_uses_wget_not_curl`, which is the real fix.
+
+    The wider budgets are kept anyway: harmless, and defensible on their own
+    terms once the probe reaches a listening socket."""
     out = render_compose([_StubSession(id="x", engine="motis")])
     motis_block = out.split("motis-x:")[1].split("\n\n")[0]
     test_line = next(line for line in motis_block.splitlines() if line.lstrip().startswith("test:"))

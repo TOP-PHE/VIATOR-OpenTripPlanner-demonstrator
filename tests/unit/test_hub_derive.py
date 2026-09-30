@@ -161,14 +161,15 @@ def test_country_from_coords_handles_missing_inputs() -> None:
     [
         # OTP stop_id format is `<feedId>:<uic_code>`. The first 2 digits
         # of the numeric tail are the country prefix per UIC 920-14.
-        ("SNCF:8711300", "FR"),  # Paris Nord
-        ("EUROSTAR:8821006", "BE"),  # Bruxelles-Midi (88 = SNCB/Belgium)
+        # Station names checked against Trainline stations.csv (2026-09-12).
+        ("SNCF:8711300", "FR"),  # Paris Est
+        ("EUROSTAR:8821006", "BE"),  # Antwerpen-Centraal (88 = SNCB/Belgium)
         ("DB:8000105", "DE"),  # Frankfurt Hbf
-        ("RENFE:7100000", "ES"),  # Madrid Atocha
-        ("TRENITALIA:8300003", "IT"),  # Roma Termini
+        ("RENFE:7100000", "ES"),  # no station; prefix only (Madrid Atocha is 7160000)
+        ("TRENITALIA:8300003", "IT"),  # Piedimulera (Roma Termini is 8308409)
         ("SBB:8503000", "CH"),  # Zürich Hbf
-        ("OBB:8100173", "AT"),  # Wien Hbf
-        ("NMBS:8814001", "BE"),  # Bruxelles-Nord
+        ("OBB:8100173", "AT"),  # Graz Hbf
+        ("NMBS:8814001", "BE"),  # Bruxelles-Midi
         # Inputs that should NOT resolve via UIC prefix:
         (None, None),
         ("", None),

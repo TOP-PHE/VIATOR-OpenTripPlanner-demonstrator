@@ -722,12 +722,13 @@ polylines stay out.
   will count as `ok` at K=1.
 - **ÖBB endpoint identity: never call `extract_uic` on a HAFAS lid.** `_UIC_RE =
   (?<!\d)(\d{7,8})(?!\d)` is a `.search()` over the whole string, and a production lid
-  orders its fields `A= @ O= @ X= @ Y= @ U= @ L=` —
-  `A=1@O=Wien Hbf@X=16375526@Y=48185507@U=181@L=008100002@B=1@` — so it latches onto the
-  **longitude in micro-degrees** (`16375526` → `UIC:1637552`) and never reaches the station
-  id. Three regimes: at |lon| ≥ 10 the 8-digit run is additionally truncated by `[:7]`; at
-  1 ≤ |lon| < 10 the longitude is returned verbatim; at |lon| < 1 the X run is too short to
-  match and it falls through to the **latitude**. Fixture lids in the tests are synthetic
+  orders its fields `A= @ O= @ X= @ Y= @ U= @ L=` — verbatim from the 2026-09-07 probe,
+  `A=1@O=Amsterdam Centraal@X=4899427@Y=52379191@U=81@L=8400058@` — so it latches onto the
+  **longitude in micro-degrees** (`4899427` → `UIC:4899427`, 4.899427° E) and never reaches
+  the station id `8400058`. Three regimes: at |lon| ≥ 10 the 8-digit run is additionally
+  truncated by `[:7]` (a Wien longitude, `X=16375526` → `UIC:1637552`); at 1 ≤ |lon| < 10
+  the longitude is returned verbatim, as above; at |lon| < 1 the X run is too short to match
+  and it falls through to the **latitude**. Fixture lids in the tests are synthetic
   short forms (`A=1@L=8507000@`) that hide all three.
   **Fixed** by `oebb_stop_id()`, which reads HAFAS's `extId` field (present on 7/7 entries
   in a live probe) and falls back to the lid's `L=` parsed **by field name**, never by
@@ -954,11 +955,14 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 
 ### Invariants & traps
 
-- **`detect` runs on uploads only.** `detect.detect` is called from `main.py::_do_upload` and
-  `sessions.py::upload_to_session`. The refresh-from-URL path (`_refresh_one_task`) dispatches using
-  the kind *declared in the provider config* — a URL that starts serving a different format is filed
-  into the wrong slot with no complaint. (Related known trap: third-party hosts return 10 KB HTML
-  stubs with HTTP 200; trust file size, not status code.)
+- **Refresh runs a format check before dispatch.** Since the NAP-resolver work, `_refresh_one_task`
+  downloads through `feed_fetch.fetch_validated`, which checks magic bytes and requires
+  `detect.detect` to agree with the declared kind before the slot is touched. An HTML stub served
+  with HTTP 200 is refused and the previous file stays. This is a format check only: it does not
+  validate the feed's content, so UI text must say "format OK", never "validated". An unchanged upstream
+  file (304 / same sha256) is reported `unchanged` and queues no rebuild. OSM refresh is the
+  exception to "the previous file stays": it rotates `osm.pbf` before downloading. See
+  [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a
   legacy single-feed session and destructive in a multi-feed one. Always pass a per-feed filename
   when refreshing one of N feeds. The OSM path passes `"osm.pbf"` explicitly so the generational
@@ -1176,8 +1180,15 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 - **Orphan cleanup is OTP-only, by design.** The `docker ps` filter is `name=^viator-otp-`, and
   the expected-set is filtered to the `otp-` prefix so a MOTIS name can't mask a removed OTP
   session. Consequence: a deleted MOTIS session's `motis-<sid>` container is never torn down.
-- **The MOTIS build image is hardcoded** (`_MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"`)
-  while the serve template uses `${MOTIS_VERSION:-latest}`. Pin one and the other drifts.
+- **The MOTIS image is pinned once, in `app/engine_versions.py`**, and both the build containers
+  (`worker.run_build_motis`) and the serve template read it from there. This trap was previously
+  recorded here as a warning and then sprung anyway: the builder said `:latest` and the serve
+  template said `${MOTIS_VERSION:-latest}` — an env var nothing ever set. Because Docker fetches
+  `:latest` only when the image is absent locally, and the deploy recipe pulls `web`/`worker` only,
+  production ran **v2.10.2 from 2026-05-30 until 2026-09-10**, three minor versions behind, with
+  nothing recording the fact. Bump `MOTIS_VERSION` to upgrade; `VIATOR_MOTIS_VERSION` overrides it
+  for a one-off test. Every MOTIS rebuild log now opens with the resolved image, which is
+  informative only because the tag is pinned; the resolved digest is future work.
 - **`otp_heap` is the *serve* heap; `otp_build_heap` is the *build* heap.** Confusable names.
   If `otp_heap` is unset the orchestrator derives ~⅓ of the build heap, floored at 4 g — this
   closed the trap where a 64 g build succeeded and the serve container crash-looped at a hidden
@@ -2169,8 +2180,8 @@ the commodity part. Three consequences:
 3. **The differentiator moved.** Speaking OJP is no longer the distinctive part. Serving it over a
    multi-session fanout with per-oracle comparison and alignment scoring still is.
 
-**Practical note, worth checking before any of this is built.** The orchestrator pins
-`ghcr.io/motis-project/motis:${MOTIS_VERSION:-latest}` (chapter 7), so any MOTIS session container
+**Practical note, worth checking before any of this is built.** The orchestrator pins the MOTIS image via
+`engine_versions.MOTIS_IMAGE` (chapter 7), currently `2.11.2`, so any MOTIS session container
 rebuilt since March 2026 is **very likely already exposing `/ojp20`**, unflagged. Confirm it by
 POSTing a minimal `OJPTripRequest` at the container directly - a `GET` proves little, since a
 POST-only route may legitimately answer 404. A positive result is a free local **integration** target

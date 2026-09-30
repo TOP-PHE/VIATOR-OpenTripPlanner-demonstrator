@@ -25,7 +25,7 @@ from typing import Any
 
 from sqlalchemy import asc
 
-from . import graph_snapshots
+from . import engine_versions, graph_snapshots
 from .db import SessionLocal
 from .models import RebuildJob
 from .models import Session as SessionRow
@@ -1001,7 +1001,11 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
             _MAXMEM_MARKER.unlink(missing_ok=True)
 
 
-_MOTIS_IMAGE = "ghcr.io/motis-project/motis:latest"
+# Pinned in `app/engine_versions.py`, which the serve template reads too — build
+# and serve must not drift apart. Was `:latest`, which never moved because the
+# deploy path only pulls web/worker; see that module's docstring.
+_MOTIS_IMAGE = engine_versions.MOTIS_IMAGE
+
 
 # Separator the rebuild-log emits between captured stdout and stderr from
 # any docker subprocess. Module-level constant so Sonar's S1192 isn't
@@ -1265,6 +1269,14 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             check=False,
         )
         output = (
+            # Records which engine built this graph. Under the old `:latest` the
+            # tag said nothing — production ran v2.10.2 for months unnoticed — so
+            # this line is only meaningful because the tag is now pinned. A probe
+            # (`/motis --version`) was tried and dropped: it added a third docker
+            # run to a lifecycle two tests deliberately assert is exactly two, and
+            # the complete answer is the resolved *digest*, which belongs with the
+            # `engine_build` row (MCT design ch.10.2), not a per-build shell-out.
+            f"[viator] engine: {_MOTIS_IMAGE}\n"
             "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"

@@ -335,7 +335,9 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
 
 **Incident #1 (2026-06-30/07-01)**: `motis-eu19-transit-motis` silent-death (~10h at 99% CPU, undetected) during a coverage run. Root-cause confirmed via direct MOTIS curl post-recovery: **not** a walk-graph/coord problem (Brussels-Midi routes correctly once MOTIS is healthy) — it was purely the zombie process. Fixed operationally with `docker compose down/up`; PR-199 + PR-203 are the structural fix so it self-heals + eventually pages next time.
 
-**Incident #2 (2026-07-01), same alarm, different cause**: with PR-199+203 live, a fresh eu19 sweep hit the exact same "autoheal keeps restarting the container" symptom (8 restarts in ~43 min) — but this time it wasn't a zombie, it was a **stale `platform_config.COVERAGE_SLOT_COUNT=2` override** (should be the code default `6`) tripling each K-slot query's RAPTOR search window to 12h instead of the documented-safe 4h. The override was real and resetting it was correct. **The stated mechanism is now disputed**: this file originally recorded ~199.91% CPU as "MOTIS pegged, starving its own healthcheck", but #207's commit message points out the host has 18 cores — so 199.91% is ~2 of them, an idle machine — and attributes the restarts instead to a healthcheck probe budget (`wget --timeout 5s`) too tight for a container briefly busy with real RAPTOR work: a false-positive restart. #207 widened the probe to 15s and added connect-level retries. Both stories cannot be the mechanism; the dispute is recorded rather than resolved. **Lesson**: "autoheal is restarting this container repeatedly" now has **three** known causes — a genuine zombie (incident #1), a knob really overloading the engine, and a probe budget too tight for healthy work. Check the probe budget and the host core count before concluding overload.
+**Incident #2 (2026-07-01), same alarm, different cause**: with PR-199+203 live, a fresh eu19 sweep hit the exact same "autoheal keeps restarting the container" symptom (8 restarts in ~43 min) — but this time it wasn't a zombie, it was a **stale `platform_config.COVERAGE_SLOT_COUNT=2` override** (should be the code default `6`) tripling each K-slot query's RAPTOR search window to 12h instead of the documented-safe 4h. The override was real and resetting it was correct. **The stated mechanism is now disputed**: this file originally recorded ~199.91% CPU as "MOTIS pegged, starving its own healthcheck", but #207's commit message points out the host has 18 cores — so 199.91% is ~2 of them, an idle machine — and attributes the restarts instead to a healthcheck probe budget (`wget --timeout 5s`) too tight for a container briefly busy with real RAPTOR work: a false-positive restart. #207 widened the probe to 15s and added connect-level retries. **DISPUTE RESOLVED 2026-09-10 — neither story was the mechanism.** The healthcheck probed `http://localhost:8080/`, and inside the container `localhost` resolves to `::1` first. MOTIS binds IPv4 only (`listening on 0.0.0.0:8080`), and BusyBox wget stops at ECONNREFUSED without falling back to IPv4. **The probe was refused in microseconds, always** — it never timed out and was never starved of CPU. Measured on the VPS, same container, same instant: `wget http://127.0.0.1:8080/` exits 0; `wget http://localhost:8080/` is refused; `curl` from the `web` container gets 200. So this healthcheck had **never passed since PR-191 introduced it**, autoheal restarted a healthy MOTIS every ~4 min indefinitely, and #207's timeout widening treated a symptom that did not exist. ~6 min between restarts is simply `retries: 3` x `interval: 30s` plus a cold start. Fixed by probing `127.0.0.1` (PR after #258). The `COVERAGE_SLOT_COUNT=2` override was real and resetting it was still correct — it just wasn't what autoheal was reacting to.
+
+**Lesson**: "autoheal is restarting this container repeatedly" has **four** known causes — a genuine zombie (incident #1), a knob really overloading the engine, a probe budget too tight for healthy work, and **a probe that cannot reach the server at all**. Before theorising about load, run the probe by hand from inside the container and confirm it can connect: `docker exec <c> wget -q -O /dev/null http://127.0.0.1:8080/; echo $?`. A probe that fails instantly is refused, not slow — and `localhost` is not `127.0.0.1` when the server is IPv4-only.
 
 **Data gap discovered**: eu19 MOTIS session's Dutch (NS) GTFS appears stale/incomplete — Amsterdam↔Rotterdam and Amsterdam↔Leiden return `no_route` from VIATOR while ÖBB HAFAS confirms real trains exist. Needs an NS GTFS re-import into the eu19 graph (not yet actioned).
 
@@ -394,8 +396,11 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    is right and *"is ÖBB's internal id"* is wrong — it is station-by-station.
    ⚠️ **The old "MOTIS reports `stopCode=8814001`" was UNSOURCED and must not be reused.** `stopCode`
    appears exactly once in this repo — in the sentence that has now been deleted. `motis_client.py:270`
-   reads `stopId`, formatted `<feed>_<local>`; no captured MOTIS response exists in the tree; and the
-   only other place naming 8814001 (`test_hub_derive.py:171`) calls it Bruxelles-**Nord**.
+   reads `stopId`, formatted `<feed>_<local>`; and no captured MOTIS response exists in the tree.
+   *(Corrected 2026-09-12: this note also cited `test_hub_derive.py` calling 8814001 Bruxelles-**Nord**.
+   That comment was wrong and #261 fixed it — Trainline `stations.csv` gives `8814001` as
+   Bruxelles-**Midi**'s `uic`; Nord is `8812005`. The id is plausible for Midi; what stays unsourced
+   is that MOTIS emits it.)*
    **Capture one real MOTIS response for Amsterdam→Brussels before designing anything on this.**
    **Do NOT drop the guard.** #226 proposed exactly that and was rejected for the right reason: it
    trades a *visible* false negative (`no_overlap` on a correct match) for *invisible* false positives
@@ -410,7 +415,12 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    *Separate live defect, same file — currently 100% silent.* `_build_locgeopos_body` sets `maxLoc: 1`
    (`:280`) and `_extract_lids_from_locgeopos` takes `loc_l[0]` (`:313`), so a hub coordinate snaps to
    the nearest *stop*, not the nearest *station*. Wien Hbf snaps to "Wien Hbf (Busbahnhof Regional)" — a
-   **bus terminal** 52 m away; canonical `8100002` is not among the eight nearest. The docstring's
+   **bus terminal** 52 m away (`904050`). The canonical station *was* among the eight nearest, just not
+   rank 0: Wien Hbf's EVA `8103000` (Trainline `db_id`/`obb_id`, the id ÖBB HAFAS uses) sat at 197 m.
+   *(Corrected 2026-09-11 against Trainline `stations.csv` and DELFI: this note used to call `8100002`
+   canonical — that is **Salzburg Hbf's** EVA. Wien Hbf's international-series code, Trainline `uic` as
+   used by SBB and Trenitalia, is `8101003` — which is also **Wien Blumental's** EVA, so a bare 7-digit
+   id does not identify a station without its namespace.)* The docstring's
    "railway stops only" claim is false. The resolved lid is used for the TripSearch and then discarded
    by the `verify_via_oebb_hafas` facade — **no log line, no UI field, no persisted column records which
    station ÖBB actually answered about.** Surface it before fixing it; resolve it properly in item 7
@@ -492,7 +502,8 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
 11. **Audit `platform_config` for stale `COVERAGE_*` overrides** and clamp obviously-unsafe values —
     e.g. warn if the effective per-slot window (`day_window / slot_count`) exceeds ~6 h. The schema
     bound is only `min: 1, max: 24`, which does not prevent the `slot_count=2` that triggered incident
-    #2. Demoted from the top of this list because that incident's mechanism is now disputed (§6) — this
+    #2. Demoted from the top of this list because that incident's mechanism turned out to be the broken
+    healthcheck, not the knob (§6, resolved 2026-09-10) — this
     is hygiene, not an incident fix.
 12. **Counter race** on `completed_pairs`: a cancelled run showed 1857/342. Note the per-pair path
     already uses an atomic SQL-side increment (`completed_pairs = NetworkCoverageRun.completed_pairs + 1`,
