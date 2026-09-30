@@ -23,8 +23,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import asc
-
 from . import engine_versions, graph_snapshots
 from .db import SessionLocal
 from .models import RebuildJob
@@ -268,7 +266,7 @@ def tick() -> None:
         job = (
             db.query(RebuildJob)
             .filter(RebuildJob.status == "pending")
-            .order_by(asc(RebuildJob.created_at))
+            .order_by(RebuildJob.created_at.asc())
             .first()
         )
         if job is None:

@@ -2610,7 +2610,7 @@ def list_rebuilds(
     rows = (
         db.query(RebuildJob)
         .filter(RebuildJob.session_id == sid)
-        .order_by(desc(RebuildJob.created_at))
+        .order_by(RebuildJob.created_at.desc())
         .limit(limit)
         .all()
     )
