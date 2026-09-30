@@ -29,6 +29,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session as DbSession
 
+from .feed_resolvers import validate_resolver
 from .models import RebuildJob
 from .settings import settings
 
@@ -77,9 +78,13 @@ _OTP_TIMETABLE_FORMATS: frozenset[str] = frozenset({"gtfs", "netex_nordic", "net
 #              app.gtfs_cross_border_filter.filter_to_cross_border on the
 #              linked national feed into this provider's slot. One source of
 #              truth, no drift. See docs/provider-source-modes-design.md §12.
+#   "nap"    — a `resolver` names the feed on its National Access Point; each
+#              refresh resolves the *current* file URL (the file name rotates
+#              on most portals). See app/feed_resolvers.py and
+#              docs/nap-feed-resolvers.md.
 # A "server_file" mode (reference a pre-generated artifact) is still planned
 # (§9 Phase 2) and is not yet a valid value.
-_TIMETABLE_SOURCES: frozenset[str] = frozenset({"url", "upload", "cross_border_filter"})
+_TIMETABLE_SOURCES: frozenset[str] = frozenset({"url", "upload", "cross_border_filter", "nap"})
 
 # The OTP entrypoint's build-config generator reads each timetable file
 # from one of these subdirs (the v0.1.4 single-feed code already did this
@@ -377,6 +382,10 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
         timetable["url"] = url
     if source == "cross_border_filter":
         timetable.update(_validate_cross_border_filter(tt, index))
+    if source == "nap":
+        timetable["resolver"] = validate_resolver(
+            tt.get("resolver"), f"providers[{index}].timetable.resolver"
+        )
 
     # ── gtfs_rt (optional) ───────────────────────────────────────────
     gtfs_rt_raw = raw.get("gtfs_rt") or {}
