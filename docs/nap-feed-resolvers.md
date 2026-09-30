@@ -42,6 +42,28 @@ providers, so they are always downloaded in full; a 304 or hash match is never t
 Freshness pills measure age from the later of the file's mtime and the last *unchanged* check.
 Staging files carry a random suffix, so two overlapping refreshes of one session cannot collide.
 
+## Feed status panel
+
+Each session's detail panel opens with **Feed status**, a read-only table with one row per provider
+timetable. Rows are grouped by country, and the **Source** menu filters by source mode (URL, NAP
+resolver, Upload, Derived). Each row shows:
+
+- the file in the slot (size and age, same pill as the provider card);
+- the last check (when a refresh last confirmed the file current);
+- the last result (`fetched`, `unchanged` or `skipped`). A skip shows its **full reason**, so
+  "click Refresh to see why" is no longer needed;
+- **format OK** when the file passed the format check on its way in (a checked download, or an
+  upload). "not checked" means a derived feed, a file placed by hand, or a file from before the
+  check existed.
+
+Wording rule: the panel says "format OK", never "validated". Only the format is checked, not the
+timetable content. A trip-wire test (`tests/unit/test_feed_status_panel.py`) enforces it.
+
+The data comes from `GET /api/sessions/<sid>/providers/status`, which now also returns `label`,
+`country_iso`, `format`, `resolver_type`, `checked_at`, `last_attempt` and `format_ok`. Every
+refresh task writes its outcome to `last_attempt` in its fetch-state file. Derived
+(cross-border filter) feeds have no fetch state, so their last result stays empty.
+
 ## Resolver types
 
 | `type` | Fields | Resolution | Used for |
