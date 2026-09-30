@@ -2415,7 +2415,6 @@ class NapSourcesApplyResponse(BaseModel):
 
 @router.get(
     "/{sid}/nap-sources",
-    response_model=NapSourcesPlan,
     responses={
         400: {"description": "Session config is malformed"},
         404: {"description": "Session not found"},
@@ -2445,7 +2444,6 @@ def get_nap_sources(
 
 @router.post(
     "/{sid}/nap-sources/apply",
-    response_model=NapSourcesApplyResponse,
     responses={
         400: {"description": "Legacy config shape, or the switched config fails validation"},
         404: {"description": "Session not found"},
