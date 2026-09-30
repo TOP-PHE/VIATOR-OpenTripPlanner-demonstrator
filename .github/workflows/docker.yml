@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
 
       - name: Log in to GHCR
         if: env.PUSH == 'true'
@@ -142,7 +142,7 @@ jobs:
 
       # Build and load locally so Trivy can scan before pushing.
       - name: Build (load locally for scan)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
@@ -291,7 +291,7 @@ jobs:
       - name: Upload Trivy SARIF to GitHub Security tab
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always()
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd  # v4
         with:
           sarif_file: trivy-${{ matrix.image.name }}.sarif
           category: trivy-${{ matrix.image.name }}
@@ -342,7 +342,7 @@ jobs:
       # build instead of reusing the cached layers.
       - name: Build and push (multi-tag)
         if: env.PUSH == 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
