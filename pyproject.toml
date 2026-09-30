@@ -61,7 +61,7 @@ strict = true
 warn_unused_ignores = true
 warn_return_any = true
 disallow_untyped_decorators = false       # FastAPI route decorators are dynamically typed
-plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+plugins = ["pydantic.mypy"]
 exclude = [
     "tests/",                              # tests deliberately use fixtures with looser typing
     "docker/",
