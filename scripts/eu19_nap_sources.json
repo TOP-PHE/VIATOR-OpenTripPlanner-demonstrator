@@ -1,0 +1,28 @@
+{
+  "_comment": "Replacement timetable sources for the eu19/eu11 providers that were downloaded by hand from NAP portals and uploaded. Probed live 2026-09-29; see docs/nap-feed-resolvers.md for how each was identified. Applied by scripts/switch_to_nap_sources.ps1.",
+  "BREIZHGO":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "658626a91554e836ebac182c", "resource_id": 81474}},
+  "EUROSTAR":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "63bc5f36f25deab1e855c0ff", "resource_id": 82199}},
+  "FLUO":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "69174dc1b9e078a6679087b4", "resource_id": 83635}},
+  "HDF-TER":     {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "69127d95821dea86547b9619", "resource_id": 83620}},
+  "IDFM":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "6449c52caeceb71273a42dd3", "resource_id": 80921}},
+  "LIO":         {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "647148f898aadb3cec613674", "resource_id": 81026}},
+  "ATOUMOD":     {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "5ced52ed8b4c4177b679d377", "resource_id": 81942}},
+  "NAQUITAINE":  {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "6246416dbd6bdfe8bceb4ce1", "resource_id": 82321}},
+  "OURA":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "61f7b4f89e4131deaf48fe02", "resource_id": 78904}},
+  "ALEOP":       {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "632b2c56696ec36c7f4811c8", "resource_id": 80721}},
+  "ZOU":         {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "69e2cd307123972d45a21d49", "resource_id": 83990}},
+  "RENFE-FR":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "6703a201386f775e01f4269b", "resource_id": 82386}},
+  "SNCF":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "6853c089b3ed5781f6adfdf7", "resource_id": 83582}},
+  "TRANSILIEN":  {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "563dd039b5950814b0588710", "resource_id": 67595}},
+  "TRENITAL-FR": {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "64635525318cc75a9a8a771f", "resource_id": 81653}},
+
+  "FGC":         {"format": "gtfs", "source": "url", "url": "https://www.fgc.cat/google/google_transit.zip"},
+  "EUSKOTREN":   {"format": "gtfs", "source": "url", "url": "https://opendata.euskadi.eus/transport/moveuskadi/euskotren/gtfs_euskotren.zip"},
+  "RENFE-AVLD":  {"format": "gtfs", "source": "url", "url": "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip"},
+  "RENFE-CERC":  {"format": "gtfs", "source": "url", "url": "https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip"},
+
+  "TRENITALIA":  {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/1080596/checkedResource"},
+  "SBB":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "permalink", "url": "https://data.opentransportdata.swiss/dataset/timetablenetex_{timetable_year}/permalink"}},
+  "CFL":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "udata", "api": "https://data.public.lu/api/1", "dataset_id": "56fbd4e5855e9b6a1088f54e", "title_regex": "^netex-\\d{8}-\\d{8}\\.zip$"}},
+  "DB":          {"format": "netex_epip", "source": "nap", "resolver": {"type": "dated", "url": "https://www.opendata-oepnv.de/fileadmin/datasets/delfi/{date}_fahrplaene_gesamtdeutschland.zip", "max_days_back": 21}}
+}
