@@ -5,10 +5,13 @@
     Switch a session's hand-uploaded NAP providers to automated sources.
 
 .DESCRIPTION
-    Reads scripts/eu19_nap_sources.json (provider id -> timetable object) and
+    Reads app/data/eu19_nap_sources.json (provider id -> timetable object) and
     replaces the `timetable` of every matching provider in the session's
     config. Providers not in the file are left untouched (AT OBB, BE SNCB,
     OUIGO-ES stay on manual upload - see docs/nap-feed-resolvers.md).
+
+    The admin page does the same per country (session detail > Automated NAP
+    sources). Prefer it; this script remains for scripted, all-at-once use.
 
     Dry run by default: prints what would change and writes nothing. Pass
     -Apply to PATCH the session config.
@@ -31,7 +34,7 @@ param(
     [string]$BaseUrl = "https://vmi3259514.contaboserver.net",
     [string]$AdminEmail = "patrick.heuguet@trackonpath.com",
     [string]$SessionId = "eu19-transit-motis",
-    [string]$SourcesFile = (Join-Path $PSScriptRoot "eu19_nap_sources.json"),
+    [string]$SourcesFile = (Join-Path $PSScriptRoot "..\app\data\eu19_nap_sources.json"),
     [switch]$Apply
 )
 

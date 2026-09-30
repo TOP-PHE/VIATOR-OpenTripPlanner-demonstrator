@@ -1,5 +1,5 @@
 {
-  "_comment": "Replacement timetable sources for the eu19/eu11 providers that were downloaded by hand from NAP portals and uploaded. Probed live 2026-09-29; see docs/nap-feed-resolvers.md for how each was identified. Applied by scripts/switch_to_nap_sources.ps1.",
+  "_comment": "Replacement timetable sources for the eu19/eu11 providers that were downloaded by hand from NAP portals and uploaded. Probed live 2026-09-29; see docs/nap-feed-resolvers.md for how each was identified. Applied per country from the session admin page (Automated NAP sources) or by scripts/switch_to_nap_sources.ps1.",
   "BREIZHGO":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "658626a91554e836ebac182c", "resource_id": 81474}},
   "EUROSTAR":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "63bc5f36f25deab1e855c0ff", "resource_id": 82199}},
   "FLUO":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "69174dc1b9e078a6679087b4", "resource_id": 83635}},

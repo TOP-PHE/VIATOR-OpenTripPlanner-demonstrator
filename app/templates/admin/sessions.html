@@ -84,6 +84,23 @@
             <div data-role="feed-status-groups"><p class="hint">Loading…</p></div>
           </section>
 
+          <!-- Automated NAP sources: per-country switch from hand uploads (app/nap_source_map.py) -->
+          <section class="detail-section" data-role="nap-sources" data-sid="{{ s.id }}">
+            <h3>Automated NAP sources</h3>
+            <p class="hint">
+              Providers that can move from a hand-uploaded file to an automated source
+              (a NAP resolver or the operator's own fixed URL), grouped by country. Applying only
+              changes the configuration: nothing is downloaded. Then click <kbd>Refresh providers</kbd>;
+              each current file stays in place until its replacement passes the format check.
+            </p>
+            <div data-role="nap-sources-countries"><p class="hint">Loading…</p></div>
+            <div class="nap-sources-actions">
+              <button type="button" class="secondary" data-action="nap-sources-select-all" data-sid="{{ s.id }}">Select all available</button>
+              <button type="button" data-action="nap-sources-apply" data-sid="{{ s.id }}">Switch selected countries</button>
+              <span class="hint" data-role="nap-sources-summary"></span>
+            </div>
+          </section>
+
           <!-- Configure: edit config.sources URLs -->
           <section class="detail-section">
             <h3>Configure sources</h3>
@@ -550,6 +567,15 @@
   .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
   .feed-format-ok { color: #1a7f37; }
   .feed-format-unknown { color: #5b6470; }
+  /* Automated NAP sources */
+  .nap-sources-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-top: 0.5rem; }
+  .nap-country { display: flex; gap: 0.5rem; align-items: flex-start; margin: 0.35rem 0; }
+  .nap-country > input { margin-top: 0.25rem; }
+  .nap-country > details { flex: 1; }
+  .nap-country summary { cursor: pointer; }
+  .nap-detail { overflow-wrap: anywhere; }
+  .nap-country-status-applied { color: #1a7f37; }
+  .nap-country-status-format_mismatch { color: #9a6700; }
   /* v0.1.37 — per-provider upload (source = "Upload a file"). */
   .prov-upload-controls { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   .prov-upload-controls input[type="file"] { flex: 1 1 auto; min-width: 12rem; }
@@ -698,6 +724,7 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // once the response lands. We don't await here because the rest of
       // the expand flow (staleness banner, jobs list) is independent.
       loadProviderStatuses(sid, cf);
+      loadNapSourcesPlan(sid);
       // OSM scope: default to transit-focused for sessions that don't have
       // it set yet (legacy / pre-v0.1.5). Stored at the top level of config,
       // not under `sources`, because it's not a download URL.
@@ -1450,6 +1477,158 @@ document.addEventListener('click', e => {
   loadProviderStatuses(sid, form);
 });
 // ── end feed status panel ─────────────────────────────────────────────
+
+// ── Automated NAP sources (per-country switch) ─────────────────────────
+// GET /nap-sources groups the session's mapped providers by country; POST
+// /nap-sources/apply switches the ticked countries' "available" providers.
+// Config only — the operator refreshes afterwards.
+const NAP_STATUS_LABELS = {
+  applied: '✓ automated',
+  available: 'can switch',
+  format_mismatch: '⚠ format differs — switch by hand',
+};
+const _napPlanCache = new Map();  // sid -> last plan
+
+function napSection(sid) {
+  return document.querySelector(`section[data-role="nap-sources"][data-sid="${CSS.escape(sid)}"]`);
+}
+
+function napCountryCounts(providers) {
+  const counts = {};
+  providers.forEach(p => { counts[p.status] = (counts[p.status] || 0) + 1; });
+  return counts;
+}
+
+function napCountrySummary(counts) {
+  const parts = [];
+  if (counts.available) parts.push(`${counts.available} can switch`);
+  if (counts.applied) parts.push(`${counts.applied} automated`);
+  if (counts.format_mismatch) parts.push(`${counts.format_mismatch} format differs`);
+  return parts.join(' · ');
+}
+
+function napProviderRowHTML(p) {
+  const name = p.label && p.label !== p.id ? ` <span class="hint">${escHTML(p.label)}</span>` : '';
+  const target = p.proposed_source === 'nap' ? 'NAP' : 'URL';
+  return `<tr>
+    <td><code>${escHTML(p.id)}</code>${name}</td>
+    <td>${escHTML(p.current_source || 'url')} → ${escHTML(target)}</td>
+    <td class="hint nap-detail">${escHTML(p.proposed_detail)}</td>
+    <td class="nap-country-status-${escAttr(p.status)}">${escHTML(NAP_STATUS_LABELS[p.status] || p.status)}</td>
+  </tr>`;
+}
+
+function napCountryHTML(c) {
+  // The checkbox sits outside <summary>: a click inside a summary also
+  // toggles the <details>, which is not what ticking a country means.
+  const counts = napCountryCounts(c.providers);
+  const disabled = counts.available ? '' : ' disabled';
+  return `<div class="nap-country">
+    <input type="checkbox" class="nap-country-pick" data-country="${escAttr(c.country_iso)}"
+           aria-label="Switch ${escAttr(c.country_iso)}"${disabled}>
+    <details>
+      <summary><strong>${escHTML(c.country_iso)}</strong> · ${escHTML(napCountrySummary(counts))}</summary>
+      <table class="feed-status-table">
+        <thead><tr><th>Provider</th><th>Source</th><th>Automated source</th><th>Status</th></tr></thead>
+        <tbody>${c.providers.map(napProviderRowHTML).join('')}</tbody>
+      </table>
+    </details>
+  </div>`;
+}
+
+function renderNapSourcesPlan(sid, plan) {
+  const section = napSection(sid);
+  if (!section) return;
+  _napPlanCache.set(sid, plan);
+  const list = section.querySelector('[data-role="nap-sources-countries"]');
+  list.innerHTML = plan.countries.length
+    ? plan.countries.map(napCountryHTML).join('')
+    : '<p class="hint">None of this session\'s providers has an automated source in the map.</p>';
+  const all = plan.countries.flatMap(c => c.providers);
+  const counts = napCountryCounts(all);
+  section.querySelector('[data-role="nap-sources-summary"]').textContent =
+    all.length ? napCountrySummary(counts) : '';
+}
+
+async function loadNapSourcesPlan(sid) {
+  const section = napSection(sid);
+  if (!section) return;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/nap-sources`);
+    if (!r.ok) {
+      // 403 for content managers: this switch is platform-admin only, like a config save.
+      section.hidden = true;
+      return;
+    }
+    renderNapSourcesPlan(sid, await r.json());
+  } catch (err) {
+    console.warn('loading NAP sources plan failed', err);
+  }
+}
+
+function napSelectedProviderIds(sid) {
+  const section = napSection(sid);
+  const plan = _napPlanCache.get(sid);
+  if (!section || !plan) return [];
+  const picked = new Set([...section.querySelectorAll('.nap-country-pick:checked')].map(el => el.dataset.country));
+  return plan.countries
+    .filter(c => picked.has(c.country_iso))
+    .flatMap(c => c.providers.filter(p => p.status === 'available').map(p => p.id));
+}
+
+function napSyncSessionRow(sid, config) {
+  // Keep the page's copy of the config (Configure form, staleness banner)
+  // in step with the server, so a later "Save config" can't undo the switch.
+  const row = document.querySelector(`tr[data-sid="${CSS.escape(sid)}"]`);
+  if (!row) return;
+  row.dataset.config = JSON.stringify(config);
+  const form = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"]`);
+  if (form) {
+    populateProvidersList(form, config.sources || {});
+    loadProviderStatuses(sid, form);
+  }
+  setStalenessBanner(sid);
+}
+
+function napErrorText(body, status) {
+  // FastAPI returns a string for HTTPException and a list for a 422.
+  const detail = body && body.detail;
+  if (typeof detail === 'string') return detail;
+  return detail ? JSON.stringify(detail) : `Failed (${status})`;
+}
+
+async function applyNapSources(sid, btn) {
+  const ids = napSelectedProviderIds(sid);
+  if (!ids.length) { showToast('error', 'Tick at least one country with providers that can switch.'); return; }
+  if (!confirm(`Switch ${ids.length} provider(s) to their automated source?\n\n${ids.join(', ')}\n\nNothing is downloaded until you click Refresh providers.`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/nap-sources/apply`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({provider_ids: ids}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('error', napErrorText(body, r.status)); return; }
+    napSyncSessionRow(sid, body.config);
+    const skipped = (body.skipped || []).map(s => `${s.id} (${s.reason})`).join(', ');
+    showToast('success', `Switched ${body.changed.length}: ${body.changed.join(', ') || 'none'}${skipped ? ' | skipped ' + skipped : ''}. Next: Refresh providers.`);
+    loadNapSourcesPlan(sid);
+  } catch (err) {
+    showToast('error', String(err));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-action="nap-sources-apply"], button[data-action="nap-sources-select-all"]');
+  if (!btn) return;
+  const sid = btn.dataset.sid;
+  if (btn.dataset.action === 'nap-sources-apply') { applyNapSources(sid, btn); return; }
+  napSection(sid)?.querySelectorAll('.nap-country-pick:not(:disabled)').forEach(el => { el.checked = true; });
+});
+// ── end automated NAP sources ─────────────────────────────────────────
 
 async function loadProviderStatuses(sid, formEl) {
   if (!sid || !formEl) return;
