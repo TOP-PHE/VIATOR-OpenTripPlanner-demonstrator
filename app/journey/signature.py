@@ -182,7 +182,19 @@ def _round_latlon_coarse(lat: float | None, lon: float | None) -> str:
     return f"{round(lat, 3):.3f},{round(lon, 3):.3f}"
 
 
-def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float | None) -> str:
+# A station code an engine handed us DIRECTLY, already UIC-shaped: 7 significant
+# digits, optionally zero-padded (BE/AT publish `008400058`). `fullmatch`, so a
+# platform ordinal ("1", "2") or a local short code ("1101") can never qualify —
+# which matters, because most NAP feeds put exactly those in `stop_code`.
+_EXPLICIT_UIC_CODE_RE = re.compile(r"\A0*([1-9]\d{6})\Z")
+
+
+def _fingerprint_stop_token(
+    stop_id: str | None,
+    lat: float | None,
+    lon: float | None,
+    stop_code: str | None = None,
+) -> str:
     """Return the per-endpoint stop token used by `transit_fingerprint`.
 
     Strategy:
@@ -191,6 +203,15 @@ def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float |
          adapter emits these directly — `external_verify.oebb_stop_id` has
          already done the namespace decision with better information than a
          regex over an opaque string has.
+      0b. If the engine handed us an explicit `stop_code` that is UIC-shaped,
+         trust it over anything parsed out of the stop_id. MOTIS surfaces GTFS
+         `stop_code`, and on the `eurostar` feed that is a real UIC (`8400058`
+         for Amsterdam Centraal — identical to ÖBB HAFAS's `extId`), while the
+         feed-internal `stopId` (`eurostar_amsterdam_centraal`) carries no
+         digits at all. Guarded by a `fullmatch` on 7 significant digits, so
+         the platform ordinals and local short codes that most NAP feeds put in
+         `stop_code` (`1`, `2`, `1101`) are ignored rather than fabricated into
+         a UIC.
       1. If the stop_id contains a 7-digit UIC chunk, return `UIC:NNNNNNN`.
          This is the strongest cross-engine identifier — both OTP's
          ``SBB:8501120:0:5`` and OJP's ``ch:1:sloid:8501120:0:5`` produce
@@ -211,6 +232,10 @@ def _fingerprint_stop_token(stop_id: str | None, lat: float | None, lon: float |
     """
     if stop_id and _CANONICAL_TOKEN_RE.fullmatch(stop_id):
         return stop_id
+    if stop_code:
+        m = _EXPLICIT_UIC_CODE_RE.fullmatch(str(stop_code).strip())
+        if m:
+            return f"UIC:{m.group(1)}"
     uic = _uic_from_stop_id(stop_id)
     if uic:
         return f"UIC:{uic}"
@@ -263,11 +288,20 @@ def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
         mode = (leg.get("mode") or "").upper()
         if mode in ("", "WALK", "TRANSFER"):
             continue
+        # `*_stop_code` is present only on MOTIS legs (motis_client surfaces
+        # GTFS `stop_code`); absent everywhere else, so OTP/OJP tokens are
+        # bit-identical to before this argument existed.
         from_tok = _fingerprint_stop_token(
-            leg.get("from_stop_id"), leg.get("from_lat"), leg.get("from_lon")
+            leg.get("from_stop_id"),
+            leg.get("from_lat"),
+            leg.get("from_lon"),
+            leg.get("from_stop_code"),
         )
         to_tok = _fingerprint_stop_token(
-            leg.get("to_stop_id"), leg.get("to_lat"), leg.get("to_lon")
+            leg.get("to_stop_id"),
+            leg.get("to_lat"),
+            leg.get("to_lon"),
+            leg.get("to_stop_code"),
         )
         dep = _round_minute(leg.get("departure"))
         arr = _round_minute(leg.get("arrival"))

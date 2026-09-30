@@ -263,6 +263,25 @@ def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
       * `stopId` uses underscore: `<feed>_<local>` not OTP's `<feed>:<local>`.
         Feed id is extracted via _feed_id_from_motis_id so the federated
         planner's dedup keys still work.
+      * `stopCode` and `parentId` are ALSO present and were previously dropped.
+        See below — `stopCode` is the only place a NAP feed hands us a real UIC.
+
+    **`stopCode` — the station code, when the feed publishes one.** Measured
+    against the live eu19 session 2026-09-07: of 30 GTFS feeds, only `eurostar`
+    puts a UIC there (`8400058` for Amsterdam Centraal, matching ÖBB HAFAS's
+    `extId` exactly). `nl-nap` populates it with a local short code (`1101`),
+    and IDFM/OURA/transilien with platform ordinals (`1`, `2`). So it is
+    surfaced, not trusted: a consumer must decide per feed whether the value is
+    a UIC. `signature.transit_fingerprint` only uses it when it is UIC-shaped.
+
+    **`parentId` — station-level grouping.** MOTIS returns platform-level stops,
+    so Amsterdam Centraal arrives as three distinct `stopId`s
+    (`nl-nap_2992170` / `_2992179` / `_2992182`) that all share
+    `parentId = nl-nap_stoparea:18188`. Without it, the same station produces
+    different fingerprints depending on which platform a trip used.
+
+    `stopId` itself is left UNCHANGED — it is the key for
+    `_feed_id_from_motis_id` and for `stations_xref (session_id, stop_id)`.
     """
     f = leg.get("from") or {}
     t = leg.get("to") or {}
@@ -282,10 +301,14 @@ def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
         "from_lat": f.get("lat"),
         "from_lon": f.get("lon"),
         "from_stop_id": from_stop_id,
+        "from_stop_code": f.get("stopCode"),
+        "from_parent_id": f.get("parentId"),
         "to_name": t.get("name"),
         "to_lat": t.get("lat"),
         "to_lon": t.get("lon"),
         "to_stop_id": to_stop_id,
+        "to_stop_code": t.get("stopCode"),
+        "to_parent_id": t.get("parentId"),
         "route_short_name": leg.get("routeShortName"),
         "route_long_name": leg.get("routeLongName"),
         "route_id": leg.get("routeId"),

@@ -48,6 +48,44 @@ def test_fingerprint_stop_token_passthrough_is_behaviour_preserving(
     assert _fingerprint_stop_token(stop_id, None, None) == expected, why
 
 
+@pytest.mark.parametrize(
+    ("stop_id", "stop_code", "expected", "why"),
+    [
+        # The eurostar feed: stopId carries no digits, stop_code IS the UIC.
+        # 8400058 is what OeBB HAFAS returns as extId for the same station.
+        ("eurostar_amsterdam_centraal", "8400058", "UIC:8400058", "eurostar feed, real UIC"),
+        ("eurostar_bruxelles_midi", "8814001", "UIC:8814001", "eurostar feed, real UIC"),
+        # BE/AT publish zero-padded; absorbed.
+        ("x_y", "008400058", "UIC:8400058", "zero-padded UIC"),
+        # nl-nap puts a LOCAL short code here — must NOT become a UIC.
+        ("nl-nap_2515174", "1101", "UIC:2515174", "local code ignored; falls back to stop_id"),
+        # IDFM / OURA / transilien put platform ordinals here. The ordinal is
+        # ignored AND the 6-digit stop_id is not UIC-shaped either, so this
+        # correctly ends at the coordinate fallback rather than inventing a code.
+        ("idfm_471184", "2", "52.000,4.000", "platform ordinal ignored, falls to coords"),
+        # No code at all -> unchanged behaviour.
+        ("SBB:8507000:0:5", None, "UIC:8507000", "no stop_code, VIATOR path unchanged"),
+    ],
+)
+def test_explicit_stop_code_is_trusted_only_when_uic_shaped(
+    stop_id: str, stop_code: str | None, expected: str, why: str
+) -> None:
+    """MOTIS hands us GTFS `stop_code`. Measured across the 30 eu19 feeds
+    (2026-09-07): only `eurostar` puts a UIC there; `nl-nap` uses local short
+    codes and IDFM/OURA/transilien use platform ordinals. So the code is trusted
+    only when it is UIC-shaped — otherwise we would fabricate `UIC:1101`."""
+    assert _fingerprint_stop_token(stop_id, 52.0, 4.0, stop_code) == expected, why
+
+
+def test_stop_code_does_not_perturb_legs_that_lack_one() -> None:
+    """OTP and OJP legs carry no `stop_code`, so their tokens must be identical
+    to what they were before the argument existed."""
+    for sid in ("SBB:8507000:0:5", "ch:1:sloid:7000:4:7", "StopPoint:OCELyria-87686006"):
+        assert _fingerprint_stop_token(sid, 46.5, 6.6) == _fingerprint_stop_token(
+            sid, 46.5, 6.6, None
+        )
+
+
 def test_fingerprint_stop_token_keeps_oebb_tokens_out_of_the_coordinate_fallback() -> None:
     """An `OEBB:` token names a real station we could not place in the UIC
     namespace. It must survive verbatim rather than collapsing into the `"?,?"`
