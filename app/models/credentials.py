@@ -62,7 +62,7 @@ AUTH_TYPE_BEARER = "bearer"
 AUTH_TYPE_BASIC = "basic"
 AUTH_TYPE_QUERY = "query"
 AUTH_TYPE_HEADER = "header"
-AUTH_TYPE_OAUTH2_PASSWORD = "oauth2_password"  # noqa: S105 — a scheme name, not a secret
+AUTH_TYPE_OAUTH2_LOGIN = "oauth2_password"
 
 
 class UserCredential(TimestampMixin, Base):

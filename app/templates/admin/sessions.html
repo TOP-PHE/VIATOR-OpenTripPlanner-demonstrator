@@ -1009,6 +1009,16 @@ const KEPT_CREDENTIAL_KEYS = ['gtfs_rt_credential_id', 'mct_credential_id', 'sta
 const CREDENTIAL_SOURCES = new Set(['url', 'nap']);
 let credentialListPromise = null;
 
+// Credential ids the card does not edit (GTFS-RT, MCT, stations CSV) ride
+// along on it so a save never drops them.
+function keptCredentialsJSON(p) {
+  const kept = {};
+  for (const key of KEPT_CREDENTIAL_KEYS) {
+    if (p[key]) kept[key] = p[key];
+  }
+  return JSON.stringify(kept);
+}
+
 function timetableCredentialRowHTML(credId, ttSource) {
   const saved = credId
     ? `<option value="${escAttr(credId)}" selected>(saved credential)</option>`
@@ -1093,12 +1103,8 @@ function providerCardHTML(p, opts) {
   const statusPill = p.id
     ? `<span class="prov-status-pill" data-feed-id="${escAttr(p.id)}" data-state="loading">…</span>`
     : '';
-  // Credential ids this card does not edit (GTFS-RT, MCT, stations CSV)
-  // ride along on the card so a save never drops them.
-  const keptCreds = {};
-  for (const key of KEPT_CREDENTIAL_KEYS) if (p[key]) keptCreds[key] = p[key];
   return `
-    <details class="provider-card"${openAttr} data-kept-creds="${escAttr(JSON.stringify(keptCreds))}">
+    <details class="provider-card"${openAttr} data-kept-creds="${escAttr(keptCredentialsJSON(p))}">
       <summary>
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
         ${statusPill}

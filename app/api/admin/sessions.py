@@ -2851,7 +2851,14 @@ class PromoteResponse(BaseModel):
     fragments_written: bool
 
 
-@router.post("/{sid}/promote", response_model=PromoteResponse)
+@router.post(
+    "/{sid}/promote",
+    response_model=PromoteResponse,
+    responses={
+        400: {"description": "Session is not in state graph_built or serving."},
+        404: {"description": "Session not found."},
+    },
+)
 def promote_session(
     sid: str,
     request: Request,

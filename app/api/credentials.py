@@ -195,7 +195,16 @@ def create_credential(
     return CredentialResponse.from_orm_credential(cred)
 
 
-@router.patch("/{cred_id}", response_model=CredentialResponse)
+@router.patch(
+    "/{cred_id}",
+    response_model=CredentialResponse,
+    # Declared for Sonar S8415, like app/api/admin/sessions.py.
+    responses={
+        400: {"description": "Invalid auth type, param name or secret for the scheme."},
+        404: {"description": "Credential not found (or not yours)."},
+        409: {"description": "Another of your credentials has that name."},
+    },
+)
 def patch_credential(
     cred_id: uuid.UUID,
     payload: CredentialPatch,
@@ -331,7 +340,13 @@ class LoginCheckResponse(BaseModel):
     detail: str
 
 
-@router.post("/{cred_id}/test-login")
+@router.post(
+    "/{cred_id}/test-login",
+    responses={
+        400: {"description": "The credential is not a login."},
+        404: {"description": "Credential not found (or not yours)."},
+    },
+)
 async def check_login(
     cred_id: uuid.UUID,
     db: Annotated[Session, Depends(get_db)],

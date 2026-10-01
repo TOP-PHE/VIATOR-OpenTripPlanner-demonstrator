@@ -97,11 +97,12 @@ def test_login_scheme_needs_no_param_name() -> None:
 
 
 def test_a_login_cannot_become_a_static_header() -> None:
+    plaintext = json.dumps(LOGIN)
     with pytest.raises(ValueError, match="authorize"):
         crypto.apply_to_request(
             "https://x.example/f",
             auth_type="oauth2_password",
-            plaintext=json.dumps(LOGIN),
+            plaintext=plaintext,
             param_name=None,
         )
 
@@ -296,24 +297,26 @@ def test_create_refuses_an_incomplete_login(api: None) -> None:
     body = credentials_api.CredentialCreate(
         name="x", auth_type="oauth2_password", secret=json.dumps({"token_url": TOKEN_URL})
     )
+    db, actor = _Db(), _Actor()
     with pytest.raises(HTTPException) as exc:
-        credentials_api.create_credential(body, None, _Db(), _Actor())  # type: ignore[arg-type]
+        credentials_api.create_credential(body, None, db, actor)  # type: ignore[arg-type]
     assert exc.value.status_code == 400
 
 
 def test_patch_to_a_login_needs_the_secret_re_entered(api: None) -> None:
     cred = _Cred("bearer", "tok")
     patch = credentials_api.CredentialPatch(auth_type="oauth2_password")
+    db, actor = _Db(cred), _Actor(cred.user_id)
     with pytest.raises(HTTPException, match="re-entered"):
-        credentials_api.patch_credential(cred.id, patch, None, _Db(cred), _Actor(cred.user_id))  # type: ignore[arg-type]
+        credentials_api.patch_credential(cred.id, patch, None, db, actor)  # type: ignore[arg-type]
 
 
 def test_patch_validates_a_rotated_login(api: None) -> None:
     cred = _Cred("oauth2_password", json.dumps(LOGIN))
-    db = _Db(cred)
+    db, actor = _Db(cred), _Actor(cred.user_id)
     bad = credentials_api.CredentialPatch(secret="{}")
     with pytest.raises(HTTPException) as exc:
-        credentials_api.patch_credential(cred.id, bad, None, db, _Actor(cred.user_id))  # type: ignore[arg-type]
+        credentials_api.patch_credential(cred.id, bad, None, db, actor)  # type: ignore[arg-type]
     assert exc.value.status_code == 400
     good = credentials_api.CredentialPatch(secret=json.dumps({**LOGIN, "password": "new"}))
     credentials_api.patch_credential(cred.id, good, None, db, _Actor(cred.user_id))  # type: ignore[arg-type]
@@ -366,8 +369,9 @@ async def test_check_login_refuses_static_or_foreign_credentials(
 ) -> None:
     cred = _Cred("bearer", "tok") if owner_matches else _Cred("oauth2_password", "{}")
     actor = _Actor(cred.user_id if owner_matches else None)
+    db = _Db(cred)
     with pytest.raises(HTTPException) as exc:
-        await credentials_api.check_login(cred.id, _Db(cred), actor)  # type: ignore[arg-type]
+        await credentials_api.check_login(cred.id, db, actor)  # type: ignore[arg-type]
     assert exc.value.status_code == (400 if owner_matches else 404)
 
 
