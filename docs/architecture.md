@@ -1186,8 +1186,15 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
   template said `${MOTIS_VERSION:-latest}` — an env var nothing ever set. Because Docker fetches
   `:latest` only when the image is absent locally, and the deploy recipe pulls `web`/`worker` only,
   production ran **v2.10.2 from 2026-05-30 until 2026-09-10**, three minor versions behind, with
-  nothing recording the fact. Bump `MOTIS_VERSION` to upgrade; `VIATOR_MOTIS_VERSION` overrides it
-  for a one-off test. Every MOTIS rebuild log now opens with the resolved image, which is
+  nothing recording the fact. Bump `MOTIS_VERSION` to upgrade; `VIATOR_MOTIS_VERSION` (`.env`,
+  forwarded to `web` and `worker`) overrides it, and `VIATOR_MOTIS_BUILD_VERSION` overrides the
+  build containers alone. **A version change makes every existing MOTIS graph unreadable**
+  (`tt: binary version mismatch`, serve container crash-loops) until that session is rebuilt —
+  this is what took eu19 down on 2026-10-01, when the #258 pin to 2.11.2 met a graph built by
+  2.10.2, and 2.11.2's import of the 34.5 GB Europe PBF then died at "Load OSM / Ways" with
+  92 GB free. Rolled back to 2.10.2 with the override. To try a candidate, set only the build
+  version: a failed build leaves `current` alone, a successful one repoints it at a graph only the
+  new version reads, so set `VIATOR_MOTIS_VERSION` to match straight after. Every MOTIS rebuild log now opens with the resolved image, which is
   informative only because the tag is pinned; the resolved digest is future work.
 - **`otp_heap` is the *serve* heap; `otp_build_heap` is the *build* heap.** Confusable names.
   If `otp_heap` is unset the orchestrator derives ~⅓ of the build heap, floored at 4 g — this

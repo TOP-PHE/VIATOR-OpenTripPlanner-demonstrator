@@ -97,6 +97,9 @@ services:
       INBOX_DIR: /data/inbox
       GRAPH_DIR: /data/graphs
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
+      # MOTIS version override (app/engine_versions.py). Empty = the pinned version.
+      # web renders the serve containers' image from it.
+      VIATOR_MOTIS_VERSION: ${VIATOR_MOTIS_VERSION:-}
       # Phase-2 JWT auth — required.
       JWT_SECRET: ${JWT_SECRET}
       JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:-false}
@@ -165,6 +168,10 @@ services:
       GRAPH_DIR: /data/graphs
       OTP_BUILD_HEAP: ${OTP_BUILD_HEAP:-12g}
       DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-1800}
+      # MOTIS version overrides (app/engine_versions.py). Empty = the pinned version.
+      # The build one defaults to the serve one; set it alone to try a candidate.
+      VIATOR_MOTIS_VERSION: ${VIATOR_MOTIS_VERSION:-}
+      VIATOR_MOTIS_BUILD_VERSION: ${VIATOR_MOTIS_BUILD_VERSION:-}
       JWT_SECRET: ${JWT_SECRET}
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:

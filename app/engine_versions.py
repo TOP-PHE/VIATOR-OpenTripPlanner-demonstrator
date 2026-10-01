@@ -30,8 +30,21 @@ probe. See the MCT design, chapter 10.
 import os
 
 # GHCR image tags carry no `v` — release tags are `v2.11.2`, image tags `2.11.2`.
-MOTIS_VERSION = os.environ.get("VIATOR_MOTIS_VERSION", "2.11.2")
+_MOTIS_PINNED = "2.11.2"
+
+# `or`, not a `.get` default: docker-compose forwards an unset .env variable as an
+# empty string, which must mean "use the pin", not the image tag `motis:`.
+MOTIS_VERSION = os.environ.get("VIATOR_MOTIS_VERSION") or _MOTIS_PINNED
 MOTIS_IMAGE = f"ghcr.io/motis-project/motis:{MOTIS_VERSION}"
+
+# The worker's build containers can run a different version than the serve
+# containers, to try a candidate without touching what is live: a failed build
+# leaves the serving graph alone. A *successful* one repoints `current` at a graph
+# only the build version can read, so set VIATOR_MOTIS_VERSION to the same value
+# right after and restart the session's MOTIS container. Defaults to the serve
+# version, so build and serve agree unless an operator deliberately splits them.
+MOTIS_BUILD_VERSION = os.environ.get("VIATOR_MOTIS_BUILD_VERSION") or MOTIS_VERSION
+MOTIS_BUILD_IMAGE = f"ghcr.io/motis-project/motis:{MOTIS_BUILD_VERSION}"
 
 # OTP is pinned in `docker/otp/Dockerfile` (``ARG OTP_VERSION``) because VIATOR
 # builds its own OTP image rather than consuming an upstream one. Recorded here
