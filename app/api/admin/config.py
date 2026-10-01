@@ -52,6 +52,28 @@ def patch_config(
     return new_state
 
 
+_SMTP_FAILURE_MESSAGES: tuple[tuple[type[Exception], str], ...] = (
+    (
+        email_sender.SmtpAuthError,
+        "SMTP server refused the login — check SMTP_USER / SMTP_PASS.",
+    ),
+    (
+        email_sender.SmtpConnectionError,
+        "Could not reach the SMTP server — check SMTP_HOST, SMTP_PORT and SMTP_SECURE.",
+    ),
+)
+_SMTP_FAILURE_DEFAULT = (
+    "SMTP server rejected the message. The audit log (smtp.test.failed) has the server's answer."
+)
+
+
+def _smtp_failure_message(exc: Exception) -> str:
+    return next(
+        (msg for cls, msg in _SMTP_FAILURE_MESSAGES if isinstance(exc, cls)),
+        _SMTP_FAILURE_DEFAULT,
+    )
+
+
 @router.post(
     "/smtp/test",
     summary="Send a test email using the current SMTP configuration",
@@ -88,7 +110,10 @@ async def smtp_test(
             metadata={"to": str(body.to), "error": str(exc)},
         )
         db.commit()
-        return {"ok": False, "error": str(exc)}
+        # Fixed text only: the exception message comes from the SMTP server
+        # and the transport stack (CodeQL py/stack-trace-exposure). The full
+        # detail is in the audit event above and the server log.
+        return {"ok": False, "error": _smtp_failure_message(exc)}
 
     audit.record(
         db,

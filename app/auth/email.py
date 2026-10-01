@@ -45,6 +45,14 @@ class EmailSendError(RuntimeError):
     """The SMTP server rejected the message or the connection failed."""
 
 
+class SmtpAuthError(EmailSendError):
+    """The SMTP server refused SMTP_USER / SMTP_PASS."""
+
+
+class SmtpConnectionError(EmailSendError):
+    """SMTP_HOST:SMTP_PORT could not be reached, or the session dropped."""
+
+
 # ──────────────────────────── public API ────────────────────────────
 
 
@@ -163,20 +171,25 @@ async def _send_via_smtp(
             start_tls=start_tls,
             timeout=15,
         )
+    except aiosmtplib.SMTPAuthenticationError as exc:
+        log.error("SMTP authentication failed: host=%s user=%s", cfg["SMTP_HOST"], cfg["SMTP_USER"])
+        raise SmtpAuthError(str(exc)) from exc
+    except (ConnectionError, OSError, TimeoutError) as exc:
+        # Before the generic SMTPException branch: aiosmtplib's connect,
+        # timeout and disconnect errors subclass both.
+        log.error(
+            "SMTP transport failed: host=%s port=%s err=%s",
+            cfg["SMTP_HOST"],
+            cfg["SMTP_PORT"],
+            exc,
+        )
+        raise SmtpConnectionError(str(exc)) from exc
     except aiosmtplib.SMTPException as exc:
         log.error(
             "SMTP send failed: host=%s port=%s code=%s msg=%s",
             cfg["SMTP_HOST"],
             cfg["SMTP_PORT"],
             getattr(exc, "code", None),
-            exc,
-        )
-        raise EmailSendError(str(exc)) from exc
-    except (ConnectionError, OSError, TimeoutError) as exc:
-        log.error(
-            "SMTP transport failed: host=%s port=%s err=%s",
-            cfg["SMTP_HOST"],
-            cfg["SMTP_PORT"],
             exc,
         )
         raise EmailSendError(str(exc)) from exc

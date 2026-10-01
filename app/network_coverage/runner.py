@@ -486,9 +486,11 @@ def _resolve_timezone(tz_name: str | None, cfg: CoverageConfig) -> ZoneInfo:
     try:
         return ZoneInfo(candidate)
     except (ZoneInfoNotFoundError, ValueError):
+        # Line breaks stripped explicitly (CodeQL py/log-injection): %r
+        # escapes them already, but the name comes from a run's config.
         log.warning(
             "PR-3 unknown timezone %r — falling back to UTC for day-window resolution",
-            candidate,
+            candidate.replace("\r", "").replace("\n", "")[:80],
         )
         return ZoneInfo("UTC")
 

@@ -38,7 +38,7 @@ ENV PYTHONUNBUFFERED=1 \
 # fixed-upstream Debian CVEs to force the apt layer to re-evaluate. The
 # echo's stdout goes only to the build log; it does not affect the
 # runtime image.
-RUN echo "apt cache bust 2026-06-26 — refresh for libssh2 CVE-2026-55200 (OOB write in transport.c) + CVE-2026-7598 (integer overflow on username/password); fixed in libssh2-1t64 1.11.1-1+deb13u1. Previous bust 2026-05-29 for krb5 CVE-2026-40356." \
+RUN echo "apt cache bust 2026-10-01 — refresh for OpenSSL CVE-2026-75804 (QUIC flow-control DoS) + CVE-2026-84782 (DTLS retransmission info disclosure); fixed in openssl/libssl3t64/openssl-provider-legacy 3.5.7-1~deb13u3. Previous bust 2026-06-26 for libssh2 CVE-2026-55200 + CVE-2026-7598." \
     && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl \
