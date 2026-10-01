@@ -17,7 +17,8 @@ bit (or would bite) an automated download:
   2. retries with backoff on transport errors and 429/5xx;
   3. a format check before anything touches the slot — zip / gzip / PBF
      magic bytes, then `detect.detect` must agree with the declared kind (a
-     `.xml.gz` NeTEx, as the Italian NAP serves it, is re-wrapped as a zip).
+     `.xml.gz` or plain `.xml` NeTEx, as the Italian NAP serves them, is
+     re-wrapped as a zip).
      This is a format check only: it proves the file is the right *kind* of
      archive, not that its content is correct;
   4. a sha256 match against the previous fetch is also "unchanged" (for
@@ -138,13 +139,21 @@ def _inner_name(disposition: str | None, fallback: str) -> str:
     return name if name.lower().endswith(".xml") else f"{fallback}.xml"
 
 
-def _gunzip_to_zip(src: Path, dest: Path, member: str) -> None:
+def _wrap_in_zip(src: Path, dest: Path, member: str, *, gunzip: bool) -> None:
+    opener = gzip.open if gunzip else open
     with (
-        gzip.open(src, "rb") as gz,
+        opener(src, "rb") as body,
         zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf,
         zf.open(member, "w", force_zip64=True) as out,
     ):
-        shutil.copyfileobj(gz, out, 1024 * 1024)
+        shutil.copyfileobj(body, out, 1024 * 1024)
+
+
+def _is_bare_xml(head: bytes) -> bool:
+    """A lone XML document, not an HTML page. Whether it is NeTEx is left to
+    `detect`, which rejects any XML outside the NeTEx namespace."""
+    text = head.removeprefix(_UTF8_BOM).lstrip()[:15].lower()
+    return text.startswith(b"<") and not text.startswith((b"<!doctype", b"<html"))
 
 
 def _kind_matches(declared: str, detected: str) -> bool:
@@ -161,9 +170,13 @@ def _validate_timetable_archive(
         raw.replace(final)
     elif head.startswith(_GZIP_MAGIC):
         try:
-            _gunzip_to_zip(raw, final, _inner_name(disposition, base_name))
+            _wrap_in_zip(raw, final, _inner_name(disposition, base_name), gunzip=True)
         except Exception as exc:  # zlib.error, EOFError, BadGzipFile, OSError…
             raise FetchError(f"gzip body could not be unpacked: {exc}") from exc
+        raw.unlink(missing_ok=True)
+    elif kind in _NETEX_KINDS and _is_bare_xml(head):
+        # The Italian NAP serves some assets (Trenord) as plain XML.
+        _wrap_in_zip(raw, final, _inner_name(disposition, base_name), gunzip=False)
         raw.unlink(missing_ok=True)
     elif head.startswith(_EMPTY_ZIP_MAGIC):
         raise FetchError("server sent an empty zip archive")

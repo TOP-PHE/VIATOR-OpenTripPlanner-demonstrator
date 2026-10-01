@@ -121,6 +121,22 @@ async def test_gzip_without_disposition_gets_a_fallback_member_name(staging: Pat
         assert z.namelist() == ["20260929-provider.xml"]
 
 
+async def test_plain_xml_netex_is_wrapped_as_a_zip(staging: Path) -> None:
+    """The Italian NAP serves Trenord (asset 131494) as plain XML."""
+    headers = {"Content-Disposition": 'attachment; filename="IT-ITC4-TRENORD_336.xml"'}
+    result = await _fetch(
+        lambda r: httpx.Response(200, content=NETEX_XML, headers=headers),
+        staging,
+        kind="NeTEx-EPIP",
+    )
+    assert result.status == "fetched"
+    assert result.path == staging / "20260929-provider.zip"
+    with zipfile.ZipFile(result.path) as z:
+        assert z.namelist() == ["IT-ITC4-TRENORD_336.xml"]
+        assert z.read("IT-ITC4-TRENORD_336.xml") == NETEX_XML
+    assert not (staging / "20260929-provider.download").exists()
+
+
 async def test_osm_pbf_keeps_pbf_suffix(staging: Path) -> None:
     body = b"\x00\x00\x00\x0d" + b"\x0a\x09OSMHeader" + b"\x00" * 100
     result = await _fetch(lambda r: httpx.Response(200, content=body), staging, kind="OSM-PBF")
@@ -149,6 +165,9 @@ async def test_csv_kind_keeps_the_url_suffix(staging: Path) -> None:
         ("NeTEx-EPIP", None, "declared NeTEx-EPIP but the file is GTFS"),
         ("GTFS", b"PK\x03\x04truncated-garbage", "not a usable GTFS archive"),
         ("GTFS", b"\x1f\x8b\x08\x00corrupt", "gzip body could not be unpacked"),
+        ("GTFS", NETEX_XML, "HTML/XML page"),
+        ("NeTEx-EPIP", b"<!DOCTYPE html><html><body>Login</body></html>", "HTML"),
+        ("NeTEx-EPIP", b"<?xml version='1.0'?><error>quota</error>", "not NeTEx"),
         ("OSM-PBF", b"<html>Geofabrik 410</html>", "expected an OSM PBF"),
         ("SNCF-MCT", b"  <html>nope</html>", "expected a SNCF-MCT file"),
     ],
