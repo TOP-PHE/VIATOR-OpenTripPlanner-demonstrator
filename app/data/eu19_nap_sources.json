@@ -1,5 +1,5 @@
 {
-  "_comment": "Replacement timetable sources for the eu19/eu11 providers that were downloaded by hand from NAP portals and uploaded. Probed live 2026-09-29; see docs/nap-feed-resolvers.md for how each was identified. Applied per country from the session admin page (Automated NAP sources) or by scripts/switch_to_nap_sources.ps1.",
+  "_comment": "Replacement timetable sources for the eu19/eu11 providers that were downloaded by hand from NAP portals and uploaded. Probed live 2026-09-29; see docs/nap-feed-resolvers.md for how each was identified. Applied per country from the session admin page (Automated NAP sources) or by scripts/switch_to_nap_sources.ps1. OBB and the ES entries need a login/API-key credential selected on the provider card: the map carries no credential.",
   "BREIZHGO":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "658626a91554e836ebac182c", "resource_id": 81474}},
   "EUROSTAR":    {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "63bc5f36f25deab1e855c0ff", "resource_id": 82199}},
   "FLUO":        {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "69174dc1b9e078a6679087b4", "resource_id": 83635}},
@@ -16,12 +16,15 @@
   "TRANSILIEN":  {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "563dd039b5950814b0588710", "resource_id": 67595}},
   "TRENITAL-FR": {"format": "gtfs", "source": "nap", "resolver": {"type": "tdg", "dataset_id": "64635525318cc75a9a8a771f", "resource_id": 81653}},
 
-  "FGC":         {"format": "gtfs", "source": "url", "url": "https://www.fgc.cat/google/google_transit.zip"},
-  "EUSKOTREN":   {"format": "gtfs", "source": "url", "url": "https://opendata.euskadi.eus/transport/moveuskadi/euskotren/gtfs_euskotren.zip"},
-  "RENFE-AVLD":  {"format": "gtfs", "source": "url", "url": "https://ssl.renfe.com/gtransit/Fichero_AV_LD/google_transit.zip"},
-  "RENFE-CERC":  {"format": "gtfs", "source": "url", "url": "https://ssl.renfe.com/ftransit/Fichero_CER_FOMENTO/fomento_transit.zip"},
+  "FGC":         {"format": "gtfs", "source": "nap", "resolver": {"type": "json_api", "url": "https://nap.transportes.gob.es/api/Fichero/GetList", "items": "conjuntosDatoDto.ficherosDto", "match": {"_parent.conjuntoDatoId": "^1373$", "tipoFicheroNombre": "^GTFS-ZIP$"}, "sort": "fechaActualizacion", "download": "https://nap.transportes.gob.es/api/Fichero/download/{ficheroId}"}},
+  "EUSKOTREN":   {"format": "gtfs", "source": "nap", "resolver": {"type": "json_api", "url": "https://nap.transportes.gob.es/api/Fichero/GetList", "items": "conjuntosDatoDto.ficherosDto", "match": {"_parent.conjuntoDatoId": "^1062$", "tipoFicheroNombre": "^GTFS-ZIP$"}, "sort": "fechaActualizacion", "download": "https://nap.transportes.gob.es/api/Fichero/download/{ficheroId}"}},
+  "RENFE-AVLD":  {"format": "gtfs", "source": "nap", "resolver": {"type": "json_api", "url": "https://nap.transportes.gob.es/api/Fichero/GetList", "items": "conjuntosDatoDto.ficherosDto", "match": {"_parent.conjuntoDatoId": "^897$", "tipoFicheroNombre": "^GTFS-ZIP$"}, "sort": "fechaActualizacion", "download": "https://nap.transportes.gob.es/api/Fichero/download/{ficheroId}"}},
+  "RENFE-CERC":  {"format": "gtfs", "source": "nap", "resolver": {"type": "json_api", "url": "https://nap.transportes.gob.es/api/Fichero/GetList", "items": "conjuntosDatoDto.ficherosDto", "match": {"_parent.conjuntoDatoId": "^929$", "tipoFicheroNombre": "^GTFS-ZIP$"}, "sort": "fechaActualizacion", "download": "https://nap.transportes.gob.es/api/Fichero/download/{ficheroId}"}},
+  "OUIGO-ES":    {"format": "gtfs", "source": "nap", "resolver": {"type": "json_api", "url": "https://nap.transportes.gob.es/api/Fichero/GetList", "items": "conjuntosDatoDto.ficherosDto", "match": {"_parent.conjuntoDatoId": "^1515$", "tipoFicheroNombre": "^GTFS-ZIP$"}, "sort": "fechaActualizacion", "download": "https://nap.transportes.gob.es/api/Fichero/download/{ficheroId}"}},
 
   "TRENITALIA":  {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/1080596/checkedResource"},
+  "TRENORD":     {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/131494/checkedResource"},
+  "OBB":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "permalink", "url": "https://data.mobilitaetsverbuende.at/api/public/v1/data-sets/67/{timetable_year}/file"}},
   "SBB":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "permalink", "url": "https://data.opentransportdata.swiss/dataset/timetablenetex_{timetable_year}/permalink"}},
   "CFL":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "udata", "api": "https://data.public.lu/api/1", "dataset_id": "56fbd4e5855e9b6a1088f54e", "title_regex": "^netex-\\d{8}-\\d{8}\\.zip$"}},
   "DB":          {"format": "netex_epip", "source": "nap", "resolver": {"type": "dated", "url": "https://www.opendata-oepnv.de/fileadmin/datasets/delfi/{date}_fahrplaene_gesamtdeutschland.zip", "max_days_back": 21}}

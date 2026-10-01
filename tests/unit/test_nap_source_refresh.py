@@ -401,7 +401,7 @@ def test_eu19_source_map_validates() -> None:
     }
     providers = [{"id": pid, "timetable": tt} for pid, tt in entries.items()]
     cleaned = ingestion.normalize_providers({"sources": {"providers": providers}})
-    assert len(cleaned) == 23
+    assert len(cleaned) == 26
     assert {p["timetable"]["source"] for p in cleaned} == {"nap", "url"}
 
 
