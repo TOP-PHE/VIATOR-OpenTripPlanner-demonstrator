@@ -34,7 +34,8 @@ def _reload() -> ModuleType:
     return importlib.reload(engine_versions)
 
 
-def test_unset_uses_the_pin(reload_versions: pytest.MonkeyPatch) -> None:
+@pytest.mark.usefixtures("reload_versions")
+def test_unset_uses_the_pin() -> None:
     v = _reload()
     assert v.MOTIS_VERSION == v._MOTIS_PINNED
     assert f"ghcr.io/motis-project/motis:{v._MOTIS_PINNED}" == v.MOTIS_IMAGE
