@@ -62,6 +62,7 @@ AUTH_TYPE_BEARER = "bearer"
 AUTH_TYPE_BASIC = "basic"
 AUTH_TYPE_QUERY = "query"
 AUTH_TYPE_HEADER = "header"
+AUTH_TYPE_OAUTH2_PASSWORD = "oauth2_password"  # noqa: S105 — a scheme name, not a secret
 
 
 class UserCredential(TimestampMixin, Base):
@@ -76,6 +77,9 @@ class UserCredential(TimestampMixin, Base):
         basic    plaintext is "user:pass" (httpx encodes to b64)
         query    plaintext is the value; param_name holds the URL key
         header   plaintext is the value; param_name holds the header name
+        oauth2_password
+                 plaintext is a JSON login {token_url, client_id, username,
+                 password[, scope]}, exchanged for a Bearer token at use time
         none     unused (we don't create rows for `none`)
 
     The plaintext is short (typically < 200 chars), but we use LargeBinary
@@ -87,14 +91,14 @@ class UserCredential(TimestampMixin, Base):
         # CHECK keeps the auth_type set in sync with the application enum.
         # Bump both when adding a new auth scheme.
         CheckConstraint(
-            "auth_type IN ('bearer','basic','query','header')",
+            "auth_type IN ('bearer','basic','query','header','oauth2_password')",
             name="ck_user_credentials_auth_type",
         ),
         # `param_name` is required for query+header (URL key / header name).
-        # Bearer + basic don't use it (the scheme is the "name"). Enforced
+        # Bearer, basic and oauth2_password don't use it. Enforced
         # by app code on POST/PATCH; CHECK here is a belt-and-braces.
         CheckConstraint(
-            "(auth_type IN ('bearer','basic') AND param_name IS NULL) "
+            "(auth_type IN ('bearer','basic','oauth2_password') AND param_name IS NULL) "
             "OR (auth_type IN ('query','header') AND param_name IS NOT NULL "
             "AND length(param_name) > 0)",
             name="ck_user_credentials_param_name_required",

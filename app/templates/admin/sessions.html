@@ -912,7 +912,8 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
               portals) and skips it if unchanged. A downloaded file must pass a format check (right
               kind of archive) before it replaces the previous one; the timetable content itself is not checked.
               Types: <code>tdg</code> (transport.data.gouv.fr), <code>udata</code>,
-              <code>permalink</code>, <code>dated</code>.
+              <code>permalink</code>, <code>dated</code>, <code>json_api</code> (portals that need
+              an account — pick the credential below; it is sent with the lookup and the download).
             </p>
           </div>
           <div class="prov-tt-derived-row" ${ttSource === 'cross_border_filter' ? '' : 'hidden'} style="margin-top: 0.4rem">
@@ -1000,6 +1001,67 @@ async function populateDerivedCard(card) {
   fillDerivedProviderSelect(provSel, sessions.find(s => s.id === savedSession), savedProvider);
 }
 
+// ── Timetable credential picker ──
+// Sources that download (url, nap) can send a saved credential — a key, a
+// token or a login (/credentials). The list is the caller's own
+// credentials; one saved by someone else stays selected as "(not yours)".
+const KEPT_CREDENTIAL_KEYS = ['gtfs_rt_credential_id', 'mct_credential_id', 'stations_csv_credential_id'];
+const CREDENTIAL_SOURCES = new Set(['url', 'nap']);
+let credentialListPromise = null;
+
+function timetableCredentialRowHTML(credId, ttSource) {
+  const saved = credId
+    ? `<option value="${escAttr(credId)}" selected>(saved credential)</option>`
+    : '';
+  return `
+          <div class="prov-tt-cred-row" ${CREDENTIAL_SOURCES.has(ttSource) ? '' : 'hidden'} style="margin-top: 0.4rem">
+            <label>Credential <span class="hint">(for portals that need an account — manage at <a href="/credentials">/credentials</a>)</span></label>
+            <select class="prov-tt-cred" data-value="${escAttr(credId || '')}">
+              <option value="">— none (public) —</option>${saved}
+            </select>
+          </div>`;
+}
+
+function credentialOptionLabel(c) {
+  return c.auth_type === 'oauth2_password' ? `${c.name} (login)` : `${c.name} (${c.auth_type})`;
+}
+
+async function loadCredentialList() {
+  credentialListPromise ??= fetch('/api/credentials')
+    .then(r => (r.ok ? r.json() : []))
+    .catch(err => { console.warn('loading /api/credentials failed', err); return []; });
+  return credentialListPromise;
+}
+
+async function fillCredentialPickers(root) {
+  const selects = root.querySelectorAll('select.prov-tt-cred');
+  if (!selects.length) return;
+  const creds = await loadCredentialList();
+  selects.forEach(sel => {
+    const current = sel.dataset.value || '';
+    const known = creds.some(c => c.id === current);
+    const options = ['<option value="">— none (public) —</option>'];
+    for (const c of creds) {
+      options.push(`<option value="${escAttr(c.id)}"${c.id === current ? ' selected' : ''}>${escHTML(credentialOptionLabel(c))}</option>`);
+    }
+    if (current && !known) {
+      options.push(`<option value="${escAttr(current)}" selected>(saved credential — not yours)</option>`);
+    }
+    sel.innerHTML = options.join('');
+  });
+}
+
+function collectCredentialIds(card, ttSource, provider) {
+  let kept = {};
+  try { kept = JSON.parse(card.dataset.keptCreds || '{}'); } catch (err) {
+    console.warn('provider card kept-credentials unreadable', err);
+  }
+  Object.assign(provider, kept);
+  const credId = card.querySelector('.prov-tt-cred')?.value || '';
+  if (credId && CREDENTIAL_SOURCES.has(ttSource)) provider.timetable_credential_id = credId;
+}
+// ── end timetable credential picker ──
+
 function providerCardHTML(p, opts) {
   // One <details> per provider. v0.1.12: cards are collapsed by default
   // (operators were drowning in a sea of open forms when a session had
@@ -1031,8 +1093,12 @@ function providerCardHTML(p, opts) {
   const statusPill = p.id
     ? `<span class="prov-status-pill" data-feed-id="${escAttr(p.id)}" data-state="loading">…</span>`
     : '';
+  // Credential ids this card does not edit (GTFS-RT, MCT, stations CSV)
+  // ride along on the card so a save never drops them.
+  const keptCreds = {};
+  for (const key of KEPT_CREDENTIAL_KEYS) if (p[key]) keptCreds[key] = p[key];
   return `
-    <details class="provider-card"${openAttr}>
+    <details class="provider-card"${openAttr} data-kept-creds="${escAttr(JSON.stringify(keptCreds))}">
       <summary>
         <span class="prov-summary-label">${escAttr(summaryLabel)}</span>
         ${statusPill}
@@ -1088,6 +1154,7 @@ function providerCardHTML(p, opts) {
             </div>
           </div>
           ${timetableSourceRowsHTML(tt, ttSource, df, railOnly)}
+          ${timetableCredentialRowHTML(p.timetable_credential_id, ttSource)}
           <p class="hint" style="margin: 0.25rem 0 0">
             NeTEx-FR is intentionally absent — OTP can't read it. For NeTEx-FR archive-only
             (compliance), use the <em>Upload a file</em> form below with declared standard
@@ -1267,6 +1334,7 @@ function readProviderCard(card) {
     gtfs_rt: {},
   };
   if (!collectProviderUrlFields(card, id, provider)) return null;
+  collectCredentialIds(card, ttSource, provider);
   return provider;
 }
 
@@ -1314,6 +1382,7 @@ function populateProvidersList(form, sources) {
   rows.querySelectorAll('.provider-card').forEach((c) => {
     if (c.querySelector('.prov-derived-session')) populateDerivedCard(c);
   });
+  fillCredentialPickers(rows);
 }
 
 // v0.1.12: show/hide the Expand-all/Collapse-all toolbar based on whether
@@ -1819,6 +1888,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       ),
     );
     syncProvidersToolbar(form);
+    fillCredentialPickers(rows.lastElementChild);
   });
 
   // v0.1.12: Expand-all / Collapse-all accordion toolbar.
@@ -1869,6 +1939,8 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     if (urlRow) urlRow.hidden = src !== 'url';
     if (upRow) upRow.hidden = src !== 'upload';
     if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
+    const credRow = card.querySelector('.prov-tt-cred-row');
+    if (credRow) credRow.hidden = !CREDENTIAL_SOURCES.has(src);
     // First switch to cross_border_filter on a card that hasn't been populated
     // yet (e.g. a freshly-added provider) fills the session/provider dropdowns.
     if (src === 'cross_border_filter') populateDerivedCard(card);

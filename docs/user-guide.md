@@ -67,7 +67,7 @@ sees.
 | Reports | `/admin/reports` | Search history and analytics |
 | Configuration | `/admin/config` | Platform behaviour, changed without redeploying |
 | Users | `/admin/users` | Accounts and roles |
-| Credentials | `/credentials` | API keys for authenticated NAPs |
+| Credentials | `/credentials` | API keys and portal logins for authenticated NAPs (AT login, ES `ApiKey`) |
 
 The two that matter for the mission are **Journey search** and **Network coverage**. The rest
 exist to feed them.

@@ -16,8 +16,16 @@ Three concerns in one module to keep them auditable together:
 
   3. **httpx application.** `apply_to_request(...)` takes a stored
      credential + a base URL and returns the (possibly augmented) URL +
-     headers tuple to pass to httpx. Covers all four auth schemes; the
-     fifth (`none`) just returns the inputs unchanged.
+     headers tuple to pass to httpx. Covers all four static auth schemes;
+     `none` just returns the inputs unchanged.
+
+  4. **Login exchange.** `oauth2_password` stores a login, not a token:
+     `{token_url, client_id, username, password[, scope]}` as JSON. Each
+     use posts an OAuth2 password grant to `token_url` and sends the
+     returned access token as a Bearer header (`authorize(...)`). This is
+     the flow the Austrian NAP (data.mobilitaetsverbuende.at, Keycloak)
+     documents for scripted downloads. Tokens are cached in-process until
+     shortly before they expire.
 
 Why the crypto lives next to the http-injection helper: the failure modes
 are coupled. If decryption fails, the http call must not silently
@@ -44,9 +52,12 @@ Threat model (what this protects, what it does NOT):
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
-from typing import TYPE_CHECKING, Final, Literal
+import time
+from typing import TYPE_CHECKING, Any, Final, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from cryptography.exceptions import InvalidTag
@@ -55,6 +66,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 if TYPE_CHECKING:
+    import httpx
+
     from .models import UserCredential
 
 log = logging.getLogger(__name__)
@@ -62,9 +75,20 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────────── auth types ───────────────────────────────
 
-AuthType = Literal["none", "bearer", "basic", "query", "header"]
-AUTH_TYPES: Final[tuple[AuthType, ...]] = ("none", "bearer", "basic", "query", "header")
+AuthType = Literal["none", "bearer", "basic", "query", "header", "oauth2_password"]
+AUTH_TYPES: Final[tuple[AuthType, ...]] = (
+    "none",
+    "bearer",
+    "basic",
+    "query",
+    "header",
+    "oauth2_password",
+)
 AUTH_TYPES_REQUIRING_PARAM_NAME: Final[frozenset[str]] = frozenset({"query", "header"})
+# Schemes whose secret is a login exchanged for a token at use time. They
+# cannot be turned into static headers (OTP router-config, NAP catalogue
+# import) — only `authorize()` can apply them.
+AUTH_TYPES_NEEDING_LOGIN: Final[frozenset[str]] = frozenset({"oauth2_password"})
 
 
 # ─────────────────────────────── crypto core ──────────────────────────────
@@ -186,6 +210,51 @@ def validate_param_name(auth_type: AuthType, raw: str | None) -> str | None:
     return name
 
 
+_OAUTH2_REQUIRED: Final[tuple[str, ...]] = ("token_url", "client_id", "username", "password")
+_OAUTH2_OPTIONAL: Final[tuple[str, ...]] = ("scope",)
+
+
+def parse_oauth2_password_secret(plaintext: str) -> dict[str, str]:
+    """Parse + validate an `oauth2_password` secret. Raises ValueError.
+
+    Error messages name the faulty field, never its value — the value may
+    be the password.
+    """
+    try:
+        raw = json.loads(plaintext)
+    except ValueError as exc:
+        raise ValueError("oauth2_password secret must be a JSON object") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("oauth2_password secret must be a JSON object")
+    unknown = set(raw) - set(_OAUTH2_REQUIRED) - set(_OAUTH2_OPTIONAL)
+    if unknown:
+        raise ValueError(f"oauth2_password secret has unknown fields {sorted(unknown)}")
+    out: dict[str, str] = {}
+    for field in (*_OAUTH2_REQUIRED, *_OAUTH2_OPTIONAL):
+        value = raw.get(field)
+        if value is None and field in _OAUTH2_OPTIONAL:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"oauth2_password secret needs a non-empty {field!r}")
+        # A password may legitimately start or end with a space.
+        out[field] = value if field == "password" else value.strip()
+    parsed = urlparse(out["token_url"])
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("oauth2_password token_url must be an https URL")
+    return out
+
+
+def validate_secret(auth_type: AuthType, secret: str) -> str:
+    """Return the secret to encrypt for `auth_type`. Raises ValueError.
+
+    Static schemes store the value as typed. A login scheme is re-serialised
+    so the stored JSON is canonical.
+    """
+    if auth_type == "oauth2_password":
+        return json.dumps(parse_oauth2_password_secret(secret), separators=(",", ":"))
+    return secret
+
+
 # ────────────────────────── httpx integration ─────────────────────────────
 
 
@@ -231,6 +300,10 @@ def apply_to_request(
             # Should be caught by validate_param_name on save.
             raise ValueError("header auth_type requires param_name")
         return url, {param_name: plaintext}
+
+    if auth_type in AUTH_TYPES_NEEDING_LOGIN:
+        # A login is not a header. Callers that can log in use authorize().
+        raise ValueError(f"auth_type {auth_type!r} needs a login exchange; use authorize()")
 
     if auth_type == "query":
         if not param_name:
@@ -281,3 +354,118 @@ def apply_credential(
         plaintext=plaintext,
         param_name=credential.param_name,
     )
+
+
+# ──────────────────────────── login exchange ──────────────────────────────
+
+
+class CredentialLoginError(RuntimeError):
+    """The login exchange failed (bad password, licence not accepted,
+    portal down). The message is operator-facing and never holds a secret."""
+
+
+# (credential id, nonce) -> (access_token, monotonic expiry). The nonce
+# changes on every secret rotation, so a rotated login never reuses a token
+# minted from the old one.
+_token_cache: dict[tuple[str, bytes], tuple[str, float]] = {}
+# Refresh this long before the portal's expiry: a long download must not
+# start with a token that dies in its first second.
+_TOKEN_EXPIRY_MARGIN_S: Final[float] = 30.0
+_TOKEN_DEFAULT_TTL_S: Final[float] = 60.0
+
+
+def _login_error_detail(resp: httpx.Response) -> str:
+    """`invalid_grant: Invalid user credentials` from an OAuth2 error body,
+    else the bare status. Only the two standard error fields are read, so a
+    portal echoing the request back cannot leak the password into a log."""
+    detail = f"HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+    except ValueError:
+        return detail
+    if isinstance(body, dict) and isinstance(body.get("error"), str):
+        detail += f" {body['error'][:80]}"
+        if isinstance(body.get("error_description"), str):
+            detail += f": {body['error_description'][:200]}"
+    return detail
+
+
+async def fetch_oauth2_token(client: httpx.AsyncClient, login: dict[str, str]) -> tuple[str, float]:
+    """OAuth2 password grant. Returns (access_token, lifetime_seconds)."""
+    import httpx as _httpx
+
+    # Late import: app.master pulls in heavier modules than this one needs.
+    from .master.nap_importer import _validate_safe_http_url
+
+    try:
+        token_url = await asyncio.to_thread(_validate_safe_http_url, login["token_url"])
+    except ValueError as exc:
+        raise CredentialLoginError(f"token URL refused: {exc}") from exc
+    form = {
+        "grant_type": "password",
+        "client_id": login["client_id"],
+        "username": login["username"],
+        "password": login["password"],
+    }
+    if login.get("scope"):
+        form["scope"] = login["scope"]
+    try:
+        # No redirects: a token endpoint that redirects is misconfigured,
+        # and following it would re-post the password to another URL.
+        resp = await client.post(
+            token_url,
+            data=form,
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
+    except _httpx.HTTPError as exc:
+        raise CredentialLoginError(f"login request to {token_url} failed: {exc}") from exc
+    if resp.status_code != 200:
+        raise CredentialLoginError(f"login refused by {token_url}: {_login_error_detail(resp)}")
+    try:
+        body: Any = resp.json()
+    except ValueError as exc:
+        raise CredentialLoginError(f"login answer from {token_url} is not JSON") from exc
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise CredentialLoginError(f"login answer from {token_url} has no access_token")
+    expires_in = body.get("expires_in")
+    ttl = (
+        float(expires_in)
+        if isinstance(expires_in, int | float) and not isinstance(expires_in, bool)
+        else _TOKEN_DEFAULT_TTL_S
+    )
+    return token, ttl
+
+
+async def authorize(
+    client: httpx.AsyncClient,
+    credential: UserCredential,
+    url: str,
+    jwt_secret: str | bytes,
+) -> tuple[str, dict[str, str]]:
+    """Async `apply_credential` that also handles login schemes.
+
+    Raises CredentialDecryptError (key rotated / tampered row) or
+    CredentialLoginError (login refused / portal unreachable).
+    """
+    plaintext = decrypt(credential.ciphertext, credential.nonce, jwt_secret)
+    if credential.auth_type not in AUTH_TYPES_NEEDING_LOGIN:
+        return apply_to_request(
+            url,
+            auth_type=credential.auth_type,  # type: ignore[arg-type]
+            plaintext=plaintext,
+            param_name=credential.param_name,
+        )
+    try:
+        login = parse_oauth2_password_secret(plaintext)
+    except ValueError as exc:
+        raise CredentialLoginError(f"stored login is unusable: {exc}") from exc
+    key = (str(credential.id), bytes(credential.nonce))
+    cached = _token_cache.get(key)
+    if cached is None or cached[1] <= time.monotonic():
+        token, ttl = await fetch_oauth2_token(client, login)
+        expiry = time.monotonic() + max(ttl - _TOKEN_EXPIRY_MARGIN_S, 0.0)
+        _token_cache[key] = (token, expiry)
+        cached = (token, expiry)
+    return url, {"Authorization": f"Bearer {cached[0]}"}

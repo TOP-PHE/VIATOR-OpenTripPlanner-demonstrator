@@ -1673,12 +1673,13 @@ def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | Non
         feed_fetch.state_path(state_dir, label).unlink(missing_ok=True)
 
 
-def _resolve_credential(
-    db: DbSession, credential_id: str | None, url: str
+async def _authorize(
+    client: httpx.AsyncClient, db: DbSession, credential_id: str | None, url: str
 ) -> tuple[str, dict[str, str], Any]:
-    """Apply a stored credential (v0.1.10) to `url`. Returns (fetch_url,
-    extra_headers, credential_row_or_None); raises ValueError with an
-    operator-facing reason when the credential is gone or undecryptable."""
+    """Apply a stored credential (v0.1.10) to `url`, logging in first for a
+    login scheme. Returns (fetch_url, extra_headers, credential_row_or_None);
+    raises ValueError with an operator-facing reason when the credential is
+    gone, undecryptable or its login is refused."""
     if not credential_id:
         return url, {}, None
     # Triple-dot: this file is at app/api/admin/sessions.py; we need
@@ -1691,9 +1692,13 @@ def _resolve_credential(
     if cred is None:
         raise ValueError(f"credential {credential_id} not found (was it deleted?)")
     try:
-        fetch_url, extra_headers = crypto_module.apply_credential(cred, url, settings.jwt_secret)
+        fetch_url, extra_headers = await crypto_module.authorize(
+            client, cred, url, settings.jwt_secret
+        )
     except crypto_module.CredentialDecryptError as exc:
         raise ValueError(f"credential {cred.name!r} cannot be decrypted: {exc}") from exc
+    except crypto_module.CredentialLoginError as exc:
+        raise ValueError(f"credential {cred.name!r}: {exc}") from exc
     return fetch_url, extra_headers, cred
 
 
@@ -1724,11 +1729,21 @@ async def _resolve_and_download(
 ) -> dict[str, Any]:
     if task.resolver is None:
         return await _download_task(client, db, sid, staging, task, task.url)
+
     # The file URL comes from a third-party catalogue — every redirect hop
     # of the lookup and the download is re-checked against the SSRF guard.
+    async def _sign(url: str) -> tuple[str, dict[str, str]]:
+        try:
+            fetch_url, headers, _ = await _authorize(client, db, task.credential_id, url)
+        except ValueError as exc:
+            raise feed_resolvers.ResolveError(str(exc)) from exc
+        return fetch_url, headers
+
     async with feed_resolvers.redirect_guard(client):
         try:
-            url = await feed_resolvers.resolve(client, task.resolver)
+            url = await feed_resolvers.resolve(
+                client, task.resolver, auth=_sign if task.credential_id else None
+            )
         except feed_resolvers.ResolveError as exc:
             return _skipped(task, task.url, f"NAP resolver failed: {exc}")
         return await _download_task(client, db, sid, staging, task, url)
@@ -1759,7 +1774,7 @@ async def _download_task(
     # Credential none → anonymous fetch; missing or undecryptable (e.g.
     # JWT_SECRET rotated) → this task fails with the reason, others proceed.
     try:
-        fetch_url, extra_headers, cred = _resolve_credential(db, task.credential_id, url)
+        fetch_url, extra_headers, cred = await _authorize(client, db, task.credential_id, url)
     except ValueError as exc:
         return _skip(str(exc))
 
@@ -1963,6 +1978,12 @@ async def import_providers_from_nap(
                     "falling back to anonymous NAP fetch",
                     cat.name,
                     cat.credential_id,
+                )
+            elif cred.auth_type in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
+                raise HTTPException(
+                    400,
+                    f"NAP credential {cred.name!r} is a login ({cred.auth_type}); "
+                    "catalogue imports support static keys and tokens only.",
                 )
             else:
                 try:

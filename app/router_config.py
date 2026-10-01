@@ -37,10 +37,13 @@ decrypts and passes the materialised mapping in.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from typing import Any
 
-from .credentials import AuthType, apply_to_request
+from .credentials import AUTH_TYPES_NEEDING_LOGIN, AuthType, apply_to_request
+
+log = logging.getLogger(__name__)
 
 # Defaults baked into every per-session config. Mirrors the static
 # `docker/otp/router-config.json` to preserve behaviour for sessions
@@ -119,6 +122,15 @@ def _apply_url_auth(
         return url, {}
     auth_type, plaintext, param_name = credentials[credential_id]
     if auth_type == "none":
+        return url, {}
+    if auth_type in AUTH_TYPES_NEEDING_LOGIN:
+        # OTP polls with static headers; a token minted now would expire
+        # within minutes. Better an anonymous updater than a broken config.
+        log.warning(
+            "credential %s is a login (%s); OTP cannot log in — GTFS-RT updater left anonymous",
+            credential_id,
+            auth_type,
+        )
         return url, {}
     return apply_to_request(
         url,
