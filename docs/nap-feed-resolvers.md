@@ -139,8 +139,12 @@ OUIGO / Iryo — no secret. Those field names go into `items`, `match`, `sort` a
 
 ## eu19 feed map (probed live 2026-09-29)
 
-`app/data/eu19_nap_sources.json` holds the replacement for 23 of the 26 uploaded feeds. It lives
-under `app/` because the web image copies only `app/`.
+`app/data/eu19_nap_sources.json` holds the replacement for 25 of the 26 uploaded feeds, plus
+TRENORD (added 2026-10-01). It lives under `app/` because the web image copies only `app/`.
+
+**The map carries no credential.** For the entries that need one (OBB, the ES feeds) switching sets
+the source only: select the credential on the provider card, save, then refresh. A credential
+already selected on the card is kept.
 
 **Switching a session to it, per country.** In the session's detail panel, **Automated NAP
 sources** lists every provider that has an entry in the map, grouped by country:
@@ -163,8 +167,10 @@ default; `-Apply` to save).
 | Feeds | Source | Notes |
 |---|---|---|
 | 15 FR (BREIZHGO … TRENITAL-FR) | `nap/tdg` | 4 datasets have look-alike neighbours and are pinned by resource id: IDFM 80921 (not the Google/ITO rewrites 80931/83316), ZOU 83990 (not the Transdev "zou" dataset), FLUO 83635, ALEOP 80721. Never store the publisher's `original_url`: it rotates (ATOUMOD) or embeds an API key (LIO). HEAD is unreliable on tdg, so it is never used |
-| FGC, EUSKOTREN, RENFE-AVLD, RENFE-CERC | `url` | The operators' own fixed URLs are the files the ES NAP re-publishes (size and date match; FGC, Euskotren and Renfe AV/LD also matched by content). The ES NAP itself needs a login for every download |
+| FGC 1373, EUSKOTREN 1062, RENFE-AVLD 897, RENFE-CERC 929, OUIGO-ES 1515 | `nap/json_api` | ES NAP catalogue `GetList` (about 10 MB, mostly base64 logos), file `download/{ficheroId}`. Matched on the dataset id (`_parent.conjuntoDatoId`) and `tipoFicheroNombre` `^GTFS-ZIP$` — a looser `^GTFS` would also match `GTFS RT`. **Needs the ES `ApiKey` credential selected on the provider card.** Before 2026-10-01 the first four pointed at the operators' own URLs (same files); switched so every ES feed comes from the NAP. Iryo is not on the ES NAP |
 | TRENITALIA | `url` | Italian NAP public catalogue, asset 1080596, `/checkedResource` = the last *validated* version. It serves `.xml.gz` with no validators, so change detection relies on the hash. **This corrects eu19-providers.md, which says CCISS is SPID-walled** |
+| TRENORD | `url` | Italian NAP dataset IT-ITC4-TRENORD_336 (NeTEx, Italian profile level 1, Trenord only), asset 131494 `/checkedResource`. Anonymous, like TRENITALIA. The session declares GTFS (dati.lombardia.it), so the panel shows *format differs*: switch it by hand |
+| OBB | `nap/permalink` | Dataset 67, "Railway Timetable Data (NeTEx) - Current Reference Data" (not 71, the changeover snapshot; not 66, GTFS). **Needs the AT *Login* credential** with client id `dbp-public-ui`, and the dataset licence accepted on the portal. The catalogue is public, so only the file request tests the token |
 | SBB | `nap/permalink` | `timetablenetex_<year>/permalink` redirects to a 60-second presigned R2 URL; never store it. About 660 MB, new file roughly twice a week. The CKAN API is blocked (403) or needs a key; the permalink needs neither |
 | CFL | `nap/udata` | Publisher is ATP (national multimodal), CC0. The local `netex-20260618-20260823.zip` is byte-size identical to this dataset's resource, which settles eu19-providers.md's "cannot be traced" |
 | DB | `nap/dated` | `YYYYMMDD_fahrplaene_gesamtdeutschland.zip`, about 2 GB. No `latest` alias; old files are pruned. The file URL answers anonymously, but the dataset page states download is for registered users. **Register once on opendata-oepnv.de before relying on this** (CC-BY). Refresh at most weekly |
@@ -173,8 +179,7 @@ default; `-Apply` to save).
 
 | Feed | Blocker | Next step |
 |---|---|---|
-| OBB (AT) | data.mobilitaetsverbuende.at file endpoint returns 401 without a Keycloak password-grant token (documented by the provider as its public API flow) | Login credential + `json_api` resolver now supported (above). Accept the dataset-67 licence, run the probe, add the map entry |
-| OUIGO-ES, IRYO (new) | Exist only on the ES NAP (API key via free registration); the local OUIGO copy is actually a MERITS-style export | `ApiKey` header credential + `json_api` resolver now supported (above). Run the probe, add the map entries |
+| IRYO (new) | Not on the ES NAP | Find another source (e.g. a Transitous feed) |
 | NMBS (BE) | The stable blob URL serves a **different export** (enRoute, 2,184 files, 7.8 GB uncompressed) from our local file. Also the licence is marked non-commercial, and our local file expired 2025-12-13 | Decide on licence; test the loader against the new structure (or use the anonymous GTFS feed) |
 
 ## Invariants & traps

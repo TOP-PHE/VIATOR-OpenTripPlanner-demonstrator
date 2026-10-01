@@ -115,10 +115,22 @@ def test_switched_config_still_validates() -> None:
     assert next(p for p in providers if p["id"] == "SNCF")["timetable"]["source"] == "nap"
 
 
+def test_switch_keeps_the_credential_selected_on_the_card() -> None:
+    """The map carries no credential: OBB and the ES entries rely on the one
+    already chosen on the provider card surviving the switch."""
+    config = _config()
+    sncf = next(p for p in config["sources"]["providers"] if p["id"] == "SNCF")
+    sncf["timetable_credential_id"] = "11111111-1111-1111-1111-111111111111"
+    new, _, _ = nap_source_map.apply(config, {"SNCF"}, SOURCE_MAP)
+    providers = ingestion.normalize_providers(new)
+    switched = next(p for p in providers if p["id"] == "SNCF")
+    assert switched["timetable_credential_id"] == "11111111-1111-1111-1111-111111111111"
+
+
 def test_shipped_map_loads_without_comment_keys() -> None:
     nap_source_map.load_map.cache_clear()
     shipped = nap_source_map.load_map()
-    assert len(shipped) == 23
+    assert len(shipped) == 26
     assert not any(k.startswith("_") for k in shipped)
 
 
