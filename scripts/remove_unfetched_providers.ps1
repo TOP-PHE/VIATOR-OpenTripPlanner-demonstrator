@@ -66,7 +66,8 @@ $remove = @($providers | Where-Object {
     $s -and $s.state -in @("pending", "error") -and $src -eq "url" -and ("$($_.label)" -like $LabelLike) -and
         $_.id -notin $Keep
 })
-$keep = @($providers | Where-Object { $_.id -notin @($remove | ForEach-Object { $_.id }) })
+# Not "$keep": PowerShell names are case-insensitive, so it would overwrite -Keep.
+$kept = @($providers | Where-Object { $_.id -notin @($remove | ForEach-Object { $_.id }) })
 
 foreach ($id in $Keep) {
     if ($id -notin @($providers | ForEach-Object { $_.id })) {
@@ -75,7 +76,7 @@ foreach ($id in $Keep) {
 }
 $remove | Sort-Object { $_.country_iso }, { $_.id } |
     ForEach-Object { Write-Host ("  remove  {0,-3} {1,-20} {2}" -f $_.country_iso, $_.id, $_.label) }
-Write-Host "[plan] remove $($remove.Count) URL providers with no file; keep $($keep.Count) of $($providers.Count)"
+Write-Host "[plan] remove $($remove.Count) URL providers with no file; keep $($kept.Count) of $($providers.Count)"
 
 if (-not $Apply) {
     Write-Host "Dry run - nothing written. Re-run with -Apply to save." -ForegroundColor Cyan
@@ -83,7 +84,7 @@ if (-not $Apply) {
 }
 if ($remove.Count -eq 0) { return }
 
-$config.sources.providers = $keep
+$config.sources.providers = $kept
 $body = @{ config = $config } | ConvertTo-Json -Depth 30 -Compress
 $r = Invoke-WebRequest -Uri "$BaseUrl/api/sessions/$SessionId" -Method Patch -ContentType "application/json" `
     -Body $body -WebSession $web -SkipHttpErrorCheck
