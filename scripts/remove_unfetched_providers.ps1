@@ -16,7 +16,8 @@
       - "pending" or "error" in /providers/status, i.e. no file in the inbox
         (never fetched, or only failed attempts).
     Every provider that has a file (fresh or stale) is kept, so no build loses
-    data. Optional -LabelLike narrows it further (e.g. "Réseau urbain*").
+    data. Optional -LabelLike narrows it further (e.g. "Réseau urbain*"), and
+    -Keep lists provider ids that are never removed.
 
     Dry run by default: lists what would go and writes nothing. -Apply saves
     the session config (same PATCH and validation as "Save config").
@@ -25,6 +26,7 @@
     .\remove_unfetched_providers.ps1                         # dry run, eu19
     .\remove_unfetched_providers.ps1 -Apply
     .\remove_unfetched_providers.ps1 -LabelLike "Réseau urbain*" -Apply
+    .\remove_unfetched_providers.ps1 -Keep RGIONHAUTS-DE-FR -Apply
 #>
 
 [CmdletBinding()]
@@ -33,6 +35,7 @@ param(
     [string]$AdminEmail = "patrick.heuguet@trackonpath.com",
     [string]$SessionId = "eu19-transit-motis",
     [string]$LabelLike = "*",
+    [string[]]$Keep = @(),
     [switch]$Apply
 )
 
@@ -60,10 +63,16 @@ $status = $r.Content | ConvertFrom-Json -AsHashtable -DateKind String
 $remove = @($providers | Where-Object {
     $s = $status[$_.id]
     $src = if ($_.timetable.source) { $_.timetable.source } else { "url" }
-    $s -and $s.state -in @("pending", "error") -and $src -eq "url" -and ("$($_.label)" -like $LabelLike)
+    $s -and $s.state -in @("pending", "error") -and $src -eq "url" -and ("$($_.label)" -like $LabelLike) -and
+        $_.id -notin $Keep
 })
 $keep = @($providers | Where-Object { $_.id -notin @($remove | ForEach-Object { $_.id }) })
 
+foreach ($id in $Keep) {
+    if ($id -notin @($providers | ForEach-Object { $_.id })) {
+        Write-Host "  warning: -Keep $id is not a provider of $SessionId (check the spelling)" -ForegroundColor Yellow
+    }
+}
 $remove | Sort-Object { $_.country_iso }, { $_.id } |
     ForEach-Object { Write-Host ("  remove  {0,-3} {1,-20} {2}" -f $_.country_iso, $_.id, $_.label) }
 Write-Host "[plan] remove $($remove.Count) URL providers with no file; keep $($keep.Count) of $($providers.Count)"
