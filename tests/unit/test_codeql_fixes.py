@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from app.api.admin import config as config_api
 from app.api.admin import sessions as sessions_api
 from app.auth import email
+from app.logging_config import one_line
 from app.master import nap_importer
 from app.network_coverage import runner
 
@@ -124,3 +125,32 @@ def test_unknown_timezone_log_line_cannot_be_split(
     (record,) = [r for r in caplog.records if "unknown timezone" in r.getMessage()]
     assert "\n" not in record.getMessage()
     assert "Bad/ZoneFAKE ERROR forged" in record.getMessage()
+
+
+# ─────────── #43 #44 #45 #70 #71 log values kept on one line ───────────
+
+
+def test_one_line_escapes_line_breaks_and_caps() -> None:
+    assert one_line("a@b.example\r\nFAKE ERROR") == "a@b.example\\r\\nFAKE ERROR"
+    assert one_line(12) == "12"
+    assert len(one_line("x" * 500)) == 200
+
+
+async def test_disabled_email_logs_the_recipient_on_one_line(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # See the timezone test above: alembic's fileConfig may have disabled it.
+    monkeypatch.setattr(email.log, "disabled", False)
+    monkeypatch.setattr(email, "_read_smtp_config", lambda: {**CFG, "SMTP_HOST": ""})
+    with caplog.at_level(logging.INFO, logger=email.log.name):
+        await email._deliver(
+            to="x@y.example\nFAKE ERROR forged",
+            subject="s",
+            html="h",
+            text="body",
+            purpose="test",
+        )
+    lines = [r.getMessage() for r in caplog.records if r.name == email.log.name]
+    assert lines
+    assert all("x@y.example\\nFAKE ERROR forged" in m for m in lines)
+    assert not any("\nFAKE ERROR" in m for m in lines)

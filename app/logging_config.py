@@ -91,3 +91,14 @@ def setup_logging(
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+
+
+def one_line(value: object, max_len: int = 200) -> str:
+    """`value` as a single, capped log field.
+
+    Line breaks become visible `\\r` / `\\n`, so a value that came from a
+    request or a config row cannot forge an extra log line. The final
+    `.replace("\\n", ...)` is the form CodeQL's py/log-injection query
+    recognises as a sanitiser — keep it last.
+    """
+    return str(value)[:max_len].replace("\r", "\\r").replace("\n", "\\n")
