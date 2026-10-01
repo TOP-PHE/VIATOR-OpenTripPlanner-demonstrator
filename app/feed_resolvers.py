@@ -30,26 +30,32 @@ Resolver types (probed live against each portal 2026-09-29):
                server answers with a zip (DE DELFI, published Mondays).
                Only a 404/410 or a non-zip 200 steps back a day; any other
                error stops the walk and is reported as-is.
-
-Portals that need an account (AT mobilitaetsverbuende OIDC, ES NAP API key)
-are not covered yet — see docs/nap-feed-resolvers.md.
+    json_api   any JSON catalogue API — {url, items, match, sort,
+               download | url_field}. Picks one entry of a JSON listing and
+               builds its file URL. The only type whose lookup is sent with
+               the provider's credential: it exists for portals that need an
+               account (AT mobilitaetsverbuende login, ES NAP API key).
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from .master.nap_importer import _validate_safe_http_url
 
-RESOLVER_TYPES: frozenset[str] = frozenset({"tdg", "udata", "permalink", "dated"})
+RESOLVER_TYPES: frozenset[str] = frozenset({"tdg", "udata", "permalink", "dated", "json_api"})
+
+# Signs a request for an authenticated portal: URL in, (URL, extra headers)
+# out. Raises ResolveError when the credential is unusable.
+Authorizer = Callable[[str], Awaitable[tuple[str, dict[str, str]]]]
 
 TDG_API = "https://transport.data.gouv.fr/api/datasets"
 TDG_DOWNLOAD = "https://transport.data.gouv.fr/resources/{resource_id}/download"
@@ -147,11 +153,71 @@ def _validate_dated(raw: dict[str, Any], where: str) -> dict[str, Any]:
     return {"type": "dated", "url": url, "max_days_back": days_raw}
 
 
+_FIELD_PATH_RE = re.compile(r"^[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*$")
+_JSON_API_MAX_MATCH = 5
+
+
+def _field_path(value: object, field: str) -> str:
+    s = str(value or "").strip()
+    if not _FIELD_PATH_RE.match(s):
+        raise ValueError(f"{field}={value!r} must be a dotted field path like 'data.files'")
+    return s
+
+
+def _validate_json_api_match(raw: object, where: str) -> dict[str, str]:
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"{where}.match must be an object of field path -> regex")
+    if len(raw) > _JSON_API_MAX_MATCH:
+        raise ValueError(f"{where}.match takes at most {_JSON_API_MAX_MATCH} fields")
+    match: dict[str, str] = {}
+    for key, pattern in raw.items():
+        path = _field_path(key, f"{where}.match key")
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError(f"{where}.match[{path!r}] must be a non-empty regex")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"{where}.match[{path!r}] is not a valid regex: {exc}") from exc
+        match[path] = pattern
+    return match
+
+
+def _validate_json_api(raw: dict[str, Any], where: str) -> dict[str, Any]:
+    url = _require_https(raw.get("url"), f"{where}.url")
+    _check_placeholders(url, {"timetable_year"}, f"{where}.url")
+    items = str(raw.get("items") or "").strip()
+    out: dict[str, Any] = {
+        "type": "json_api",
+        "url": url,
+        "items": _field_path(items, f"{where}.items") if items else "",
+        "match": _validate_json_api_match(raw.get("match"), where),
+    }
+    if raw.get("sort"):
+        out["sort"] = _field_path(raw["sort"], f"{where}.sort")
+    download, url_field = raw.get("download"), raw.get("url_field")
+    if bool(download) == bool(url_field):
+        raise ValueError(f"{where} needs exactly one of 'download' (URL template) or 'url_field'")
+    if url_field:
+        out["url_field"] = _field_path(url_field, f"{where}.url_field")
+        return out
+    template = _require_https(download, f"{where}.download")
+    for name in _PLACEHOLDER_RE.findall(template):
+        if name != "timetable_year":
+            _field_path(name, f"{where}.download placeholder")
+    # The lookup carries the provider's credential and so will the download:
+    # keep both on the catalogue's own host.
+    if urlparse(template).hostname != urlparse(url).hostname:
+        raise ValueError(f"{where}.download must be on the same host as {where}.url")
+    out["download"] = template
+    return out
+
+
 _VALIDATORS = {
     "tdg": _validate_tdg,
     "udata": _validate_udata,
     "permalink": _validate_permalink,
     "dated": _validate_dated,
+    "json_api": _validate_json_api,
 }
 
 
@@ -198,13 +264,26 @@ def timetable_year(d: date) -> int:
     return d.year + 1 if d >= change_day else d.year
 
 
-async def _get_json(client: httpx.AsyncClient, url: str) -> Any:
+async def _get_json(client: httpx.AsyncClient, url: str, auth: Authorizer | None = None) -> Any:
+    # SSRF check before signing: a credential is never minted for, or sent
+    # to, a refused address.
     try:
-        r = await client.get(_validate_safe_http_url(url), headers={"Accept": "application/json"})
+        safe_url = _validate_safe_http_url(url)
+    except ValueError as exc:
+        raise ResolveError(f"catalogue lookup failed ({url}): {exc}") from exc
+    fetch_url, headers = await auth(safe_url) if auth else (safe_url, {})
+    try:
+        r = await client.get(fetch_url, headers={"Accept": "application/json", **headers})
         r.raise_for_status()
         return r.json()
+    except httpx.HTTPStatusError as exc:
+        # `str(exc)` would print the request URL, which may carry a
+        # query-string key.
+        raise ResolveError(
+            f"catalogue lookup failed ({url}): HTTP {exc.response.status_code}"
+        ) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise ResolveError(f"catalogue lookup failed ({url}): {exc}") from exc
+        raise ResolveError(f"catalogue lookup failed ({url}): {type(exc).__name__}") from exc
 
 
 # ──────────────────────────── resolvers ────────────────────────────
@@ -287,6 +366,97 @@ async def _resolve_dated(client: httpx.AsyncClient, r: dict[str, Any], today: da
     raise ResolveError(f"no file found for any date {tried[-1]}..{tried[0]} at {r['url']}")
 
 
+def _field(obj: Any, path: str) -> Any:
+    for part in path.split("."):
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(part)
+    return obj
+
+
+def _walk_items(node: Any, parts: list[str], parent: Any) -> Iterator[dict[str, Any]]:
+    """Every object at `parts` below `node`, lists flattened at any level.
+    Each comes back with `_parent`: the object holding the list it was in,
+    so a match can test a file's dataset (`_parent.name`)."""
+    if isinstance(node, list):
+        for element in node:
+            yield from _walk_items(element, parts, parent)
+    elif isinstance(node, dict):
+        if not parts:
+            yield {**node, "_parent": parent}
+        else:
+            yield from _walk_items(node.get(parts[0]), parts[1:], {**node, "_parent": parent})
+
+
+def _sort_key(value: Any) -> tuple[int, float, str]:
+    # Numbers order numerically (version 10 after 9), anything else as text
+    # (ISO dates order correctly as text).
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return (1, float(value), "")
+    return (0, 0.0, "" if value is None else str(value))
+
+
+def _describe_entry(entry: dict[str, Any], r: dict[str, Any]) -> str:
+    fields = [*r["match"], r.get("sort")]
+    return "{" + ", ".join(f"{f}={_field(entry, f)!r}" for f in fields if f) + "}"
+
+
+def _pick_json_api_entry(data: Any, r: dict[str, Any]) -> dict[str, Any]:
+    parts = r["items"].split(".") if r["items"] else []
+    entries = list(_walk_items(data, parts, None))
+    if not entries:
+        raise ResolveError(f"no objects at {r['items'] or '(root)'!r} in {r['url']}")
+    patterns = {path: re.compile(rx) for path, rx in r["match"].items()}
+    matching = [
+        e
+        for e in entries
+        if all(
+            _field(e, path) is not None and rx.search(str(_field(e, path)))
+            for path, rx in patterns.items()
+        )
+    ]
+    if not matching:
+        raise ResolveError(f"none of {len(entries)} entries matches {r['match']}")
+    if "sort" in r:
+        return max(matching, key=lambda e: _sort_key(_field(e, r["sort"])))
+    if len(matching) > 1:
+        # Never guess between several files — same rule as tdg.
+        shown = "; ".join(_describe_entry(e, r) for e in matching[:5])
+        raise ResolveError(
+            f"{len(matching)} entries match {r['match']} — narrow the match or add 'sort': {shown}"
+        )
+    return matching[0]
+
+
+def _json_api_file_url(entry: dict[str, Any], r: dict[str, Any], today: date) -> str:
+    if "url_field" in r:
+        value = _field(entry, r["url_field"])
+        if not isinstance(value, str) or not value:
+            raise ResolveError(f"matched entry has no {r['url_field']!r}")
+        # The download is sent with the provider's credential — never to a
+        # host other than the catalogue the operator configured.
+        if urlparse(value).hostname != urlparse(r["url"]).hostname:
+            raise ResolveError(f"file URL {value} is not on the catalogue's host")
+        return value
+
+    def _fill(m: re.Match[str]) -> str:
+        name = m.group(1)
+        value = timetable_year(today) if name == "timetable_year" else _field(entry, name)
+        if value is None or isinstance(value, dict | list):
+            raise ResolveError(f"matched entry has no usable {name!r} for the download URL")
+        return quote(str(value), safe="")
+
+    return _PLACEHOLDER_RE.sub(_fill, r["download"])
+
+
+async def _resolve_json_api(
+    client: httpx.AsyncClient, r: dict[str, Any], today: date, auth: Authorizer | None
+) -> str:
+    url = str(r["url"]).replace("{timetable_year}", str(timetable_year(today)))
+    entry = _pick_json_api_entry(await _get_json(client, url, auth), r)
+    return _json_api_file_url(entry, r, today)
+
+
 @asynccontextmanager
 async def redirect_guard(client: httpx.AsyncClient) -> AsyncIterator[None]:
     """While active, every request `client` sends — each redirect hop
@@ -314,9 +484,16 @@ async def redirect_guard(client: httpx.AsyncClient) -> AsyncIterator[None]:
 
 
 async def resolve(
-    client: httpx.AsyncClient, resolver: dict[str, Any], *, today: date | None = None
+    client: httpx.AsyncClient,
+    resolver: dict[str, Any],
+    *,
+    today: date | None = None,
+    auth: Authorizer | None = None,
 ) -> str:
-    """Return the URL of the resolver's current file, or raise ResolveError."""
+    """Return the URL of the resolver's current file, or raise ResolveError.
+
+    `auth` signs the catalogue lookup of a `json_api` resolver. The other
+    types query public catalogues and never see the credential."""
     today = today or date.today()
     rtype = resolver.get("type")
     if rtype == "tdg":
@@ -327,6 +504,8 @@ async def resolve(
         url = str(resolver["url"]).replace("{timetable_year}", str(timetable_year(today)))
     elif rtype == "dated":
         url = await _resolve_dated(client, resolver, today)
+    elif rtype == "json_api":
+        url = await _resolve_json_api(client, resolver, today, auth)
     else:
         raise ResolveError(f"unknown resolver type {rtype!r}")
     # The URL may come from a third-party catalogue's JSON — same SSRF

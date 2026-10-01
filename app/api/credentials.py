@@ -6,6 +6,7 @@ Each user owns their own credential library. The four endpoints:
     POST   /api/credentials              create one
     PATCH  /api/credentials/{id}         rename / update secret / change note
     DELETE /api/credentials/{id}         drop one
+    POST   /api/credentials/{id}/test-login   try a login credential now
 
 Authorization model:
 
@@ -29,6 +30,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -42,6 +44,9 @@ from ..security import CurrentUser, client_ip, require_logged_in
 from ..settings import settings
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
+
+# One 404 for "does not exist" and "not yours" — never leak existence.
+_NOT_FOUND = "Credential not found"
 
 
 # ────────────────────────────── pydantic models ──────────────────────────────
@@ -78,6 +83,8 @@ class CredentialCreate(BaseModel):
     For `basic`:  "user:pass" (we b64-encode at send time).
     For `query`:  the value (param_name is the URL key).
     For `header`: the value (param_name is the header name).
+    For `oauth2_password`: a JSON login
+        {"token_url", "client_id", "username", "password"[, "scope"]}.
     """
 
     name: str = Field(min_length=1, max_length=80)
@@ -140,6 +147,7 @@ def create_credential(
         if auth_type == "none":
             raise HTTPException(400, "auth_type='none' has no secret to store")
         param_name = crypto_module.validate_param_name(auth_type, payload.param_name)
+        secret = crypto_module.validate_secret(auth_type, payload.secret)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -158,7 +166,7 @@ def create_credential(
             f"Pick a different name or PATCH the existing one.",
         )
 
-    ciphertext, nonce = crypto_module.encrypt(payload.secret, settings.jwt_secret)
+    ciphertext, nonce = crypto_module.encrypt(secret, settings.jwt_secret)
 
     cred = UserCredential(
         user_id=actor.id,
@@ -190,7 +198,16 @@ def create_credential(
     return CredentialResponse.from_orm_credential(cred)
 
 
-@router.patch("/{cred_id}", response_model=CredentialResponse)
+@router.patch(
+    "/{cred_id}",
+    # Response model inferred from the return annotation (S8409); error
+    # responses declared for S8415, like app/api/admin/sessions.py.
+    responses={
+        400: {"description": "Invalid auth type, param name or secret for the scheme."},
+        404: {"description": "Credential not found (or not yours)."},
+        409: {"description": "Another of your credentials has that name."},
+    },
+)
 def patch_credential(
     cred_id: uuid.UUID,
     payload: CredentialPatch,
@@ -206,7 +223,7 @@ def patch_credential(
     cred = db.get(UserCredential, cred_id)
     if cred is None or cred.user_id != actor.id:
         # Same 404 for "doesn't exist" and "not yours" — don't leak existence.
-        raise HTTPException(404, "Credential not found")
+        raise HTTPException(404, _NOT_FOUND)
 
     changes: dict[str, dict[str, object]] = {}
 
@@ -231,6 +248,13 @@ def patch_credential(
             raise HTTPException(400, str(exc)) from exc
         if new_type == "none":
             raise HTTPException(400, "Use DELETE to remove a credential, not auth_type='none'")
+        login_types = crypto_module.AUTH_TYPES_NEEDING_LOGIN
+        if (new_type in login_types) != (cred.auth_type in login_types) and payload.secret is None:
+            # A login and a token are stored differently — the old secret
+            # cannot be reinterpreted under the new scheme.
+            raise HTTPException(
+                400, "Switching to or from a login scheme needs the secret re-entered"
+            )
         if new_type != cred.auth_type:
             changes["auth_type"] = {"from": cred.auth_type, "to": new_type}
             cred.auth_type = new_type
@@ -246,7 +270,14 @@ def patch_credential(
             raise HTTPException(400, str(exc)) from exc
 
     if payload.secret is not None:
-        ciphertext, nonce = crypto_module.encrypt(payload.secret, settings.jwt_secret)
+        try:
+            secret = crypto_module.validate_secret(
+                cred.auth_type,  # type: ignore[arg-type]
+                payload.secret,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        ciphertext, nonce = crypto_module.encrypt(secret, settings.jwt_secret)
         cred.ciphertext = ciphertext
         cred.nonce = nonce
         # Don't put the secret in `changes`; just record that it was rotated.
@@ -270,10 +301,14 @@ def patch_credential(
     return CredentialResponse.from_orm_credential(cred)
 
 
-# `response_model=None` is needed even for `-> None` returns, otherwise
-# FastAPI infers a model from the annotation and refuses status-204 (which
-# explicitly forbids a response body).
-@router.delete("/{cred_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+# No `response_model=None` (S8409): FastAPI infers None from the `-> None`
+# annotation, so status 204 keeps its empty body (checked on 0.141.1; older
+# releases needed the explicit None).
+@router.delete(
+    "/{cred_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"description": "Credential not found (or not yours)."}},
+)
 def delete_credential(
     cred_id: uuid.UUID,
     request: Request,
@@ -291,7 +326,7 @@ def delete_credential(
     """
     cred = db.get(UserCredential, cred_id)
     if cred is None or cred.user_id != actor.id:
-        raise HTTPException(404, "Credential not found")
+        raise HTTPException(404, _NOT_FOUND)
 
     audit.record(
         db,
@@ -305,3 +340,46 @@ def delete_credential(
 
     db.delete(cred)
     db.commit()
+
+
+class LoginCheckResponse(BaseModel):
+    ok: bool
+    detail: str
+
+
+@router.post(
+    "/{cred_id}/test-login",
+    responses={
+        400: {"description": "The credential is not a login."},
+        404: {"description": "Credential not found (or not yours)."},
+    },
+)
+async def check_login(
+    cred_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_logged_in)],
+) -> LoginCheckResponse:
+    """Run a login credential's token exchange now, so a wrong password or
+    an unaccepted licence shows up here instead of at the next refresh.
+
+    Owner-only, like PATCH. The token itself is never returned.
+    """
+    cred = db.get(UserCredential, cred_id)
+    if cred is None or cred.user_id != actor.id:
+        raise HTTPException(404, _NOT_FOUND)
+    if cred.auth_type not in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
+        raise HTTPException(400, f"auth_type {cred.auth_type!r} has no login to test")
+    # Read what the exchange needs, then hand the connection back: the
+    # login may wait on a slow portal for up to the timeout.
+    ciphertext, nonce = cred.ciphertext, cred.nonce
+    db.close()
+    try:
+        plaintext = crypto_module.decrypt(ciphertext, nonce, settings.jwt_secret)
+        login = crypto_module.parse_oauth2_password_secret(plaintext)
+        async with httpx.AsyncClient(timeout=30) as client:
+            _, ttl = await crypto_module.fetch_oauth2_token(client, login)
+    except (crypto_module.CredentialDecryptError, crypto_module.CredentialLoginError) as exc:
+        return LoginCheckResponse(ok=False, detail=str(exc))
+    except ValueError as exc:
+        return LoginCheckResponse(ok=False, detail=f"stored login is unusable: {exc}")
+    return LoginCheckResponse(ok=True, detail=f"login OK — token valid for {int(ttl)} s")

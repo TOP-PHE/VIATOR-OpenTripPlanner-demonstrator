@@ -392,3 +392,168 @@ async def test_redirect_guard_checks_every_hop(monkeypatch: pytest.MonkeyPatch) 
         assert c.event_hooks["request"] == []
         r = await c.get("https://nap.example/permalink")
         assert r.status_code == 200
+
+
+# ─────────────────────────── json_api ───────────────────────────
+
+ES_API = "https://nap.example.es/api/Fichero/GetList"
+JSON_API = {
+    "type": "json_api",
+    "url": ES_API,
+    "items": "conjuntos.ficheros",
+    "match": {"_parent.nombre": "(?i)ouigo", "tipo": "GTFS"},
+    "sort": "fechaActualizacion",
+    "download": "https://nap.example.es/api/Fichero/download/{id}",
+}
+CATALOGUE = {
+    "conjuntos": [
+        {
+            "nombre": "OUIGO España",
+            "ficheros": [
+                {"id": 11, "tipo": "GTFS", "fechaActualizacion": "2026-08-01"},
+                {"id": 12, "tipo": "GTFS", "fechaActualizacion": "2026-09-15"},
+                {"id": 13, "tipo": "NeTEx", "fechaActualizacion": "2026-09-20"},
+            ],
+        },
+        {"nombre": "Iryo", "ficheros": [{"id": 21, "tipo": "GTFS", "fechaActualizacion": "x"}]},
+    ]
+}
+
+
+def test_validate_json_api_keeps_a_clean_config() -> None:
+    assert validate_resolver({**JSON_API, "type": "JSON_API"}, "r") == JSON_API
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"match": {}}, "match must be"),
+        ({"match": {"a b": "x"}}, "dotted field path"),
+        ({"match": {"tipo": "("}}, "not a valid regex"),
+        ({"match": {"tipo": ""}}, "non-empty regex"),
+        ({"match": {f"f{i}": "x" for i in range(6)}}, "at most"),
+        ({"items": "a..b"}, "dotted field path"),
+        ({"url_field": "url"}, "exactly one"),
+        ({"download": None}, "exactly one"),
+        ({"download": "https://elsewhere.example/{id}"}, "same host"),
+        ({"download": "https://nap.example.es/{bad name}"}, "dotted field path"),
+        ({"url": "https://nap.example.es/{year}"}, "unknown placeholders"),
+        ({"sort": "-x"}, "dotted field path"),
+    ],
+)
+def test_validate_json_api_rejects(patch: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_resolver({**JSON_API, **patch}, "r")
+
+
+def test_validate_json_api_with_url_field_and_root_items() -> None:
+    raw = {"type": "json_api", "url": ES_API, "match": {"id": "^5$"}, "url_field": "file.href"}
+    assert validate_resolver(raw, "r") == {**raw, "items": ""}
+
+
+def _catalogue(seen: list[httpx.Request], payload: Any = CATALOGUE) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=payload)
+
+    return handler
+
+
+async def test_json_api_picks_the_newest_match_and_signs_the_lookup() -> None:
+    seen: list[httpx.Request] = []
+    signed: list[str] = []
+
+    async def auth(url: str) -> tuple[str, dict[str, str]]:
+        signed.append(url)
+        return url, {"ApiKey": "k"}
+
+    async with _client(_catalogue(seen)) as c:
+        url = await resolve(c, JSON_API, auth=auth)
+    assert url == "https://nap.example.es/api/Fichero/download/12"
+    assert signed == [ES_API]
+    assert seen[0].headers["ApiKey"] == "k"
+
+
+async def test_json_api_without_sort_refuses_to_guess() -> None:
+    resolver = {k: v for k, v in JSON_API.items() if k != "sort"}
+    async with _client(_catalogue([])) as c:
+        with pytest.raises(ResolveError, match="2 entries match") as exc:
+            await resolve(c, resolver)
+    assert "tipo='GTFS'" in str(exc.value)
+
+
+async def test_json_api_single_match_without_sort() -> None:
+    resolver = {k: v for k, v in JSON_API.items() if k != "sort"}
+    resolver["match"] = {"_parent.nombre": "Iryo"}
+    async with _client(_catalogue([])) as c:
+        assert (await resolve(c, resolver)).endswith("/download/21")
+
+
+async def test_json_api_no_match_and_no_items_are_errors() -> None:
+    async with _client(_catalogue([])) as c:
+        with pytest.raises(ResolveError, match="none of 4 entries"):
+            await resolve(c, {**JSON_API, "match": {"tipo": "^XML$"}})
+        with pytest.raises(ResolveError, match="no objects at 'nothing'"):
+            await resolve(c, {**JSON_API, "items": "nothing"})
+
+
+async def test_json_api_numbers_sort_numerically() -> None:
+    payload = [{"id": 9, "v": 9}, {"id": 10, "v": 10}]
+    resolver = {**JSON_API, "items": "", "match": {"id": "."}, "sort": "v"}
+    async with _client(_catalogue([], payload)) as c:
+        assert (await resolve(c, resolver)).endswith("/download/10")
+
+
+async def test_json_api_download_placeholders_are_quoted_and_checked() -> None:
+    payload = [{"id": "a/b", "year": 2027}]
+    resolver = {
+        **JSON_API,
+        "items": "",
+        "match": {"id": "."},
+        "download": "https://nap.example.es/d/{id}/{timetable_year}",
+    }
+    async with _client(_catalogue([], payload)) as c:
+        url = await resolve(c, resolver, today=date(2026, 12, 20))
+        assert url == "https://nap.example.es/d/a%2Fb/2027"
+        with pytest.raises(ResolveError, match="no usable 'missing'"):
+            await resolve(c, {**resolver, "download": "https://nap.example.es/{missing}"})
+
+
+async def test_json_api_url_field_must_stay_on_the_catalogue_host() -> None:
+    payload = [
+        {"id": 1, "href": "https://nap.example.es/f.zip"},
+        {"id": 2, "href": "https://evil.example/f.zip"},
+    ]
+    base = {"type": "json_api", "url": ES_API, "items": "", "url_field": "href"}
+    async with _client(_catalogue([], payload)) as c:
+        assert await resolve(c, {**base, "match": {"id": "^1$"}}) == "https://nap.example.es/f.zip"
+        with pytest.raises(ResolveError, match="not on the catalogue's host"):
+            await resolve(c, {**base, "match": {"id": "^2$"}})
+        with pytest.raises(ResolveError, match="no 'nope'"):
+            await resolve(c, {**base, "match": {"id": "^1$"}, "url_field": "nope"})
+
+
+async def test_json_api_lookup_error_hides_the_query_string() -> None:
+    async with _client(lambda r: httpx.Response(401)) as c:
+        with pytest.raises(ResolveError, match="HTTP 401") as exc:
+            await resolve(c, {**JSON_API, "url": ES_API + "?apikey=SECRET"})
+    assert str(exc.value).count("SECRET") == 1  # the configured URL only, never the signed one
+
+
+async def test_json_api_lookup_is_ssrf_checked_before_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(url: str) -> str:
+        raise ValueError("private")
+
+    monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", refuse)
+    signed: list[str] = []
+
+    async def auth(url: str) -> tuple[str, dict[str, str]]:
+        signed.append(url)
+        return url, {}
+
+    async with _client(_catalogue([])) as c:
+        with pytest.raises(ResolveError, match="private"):
+            await resolve(c, JSON_API, auth=auth)
+    assert signed == []

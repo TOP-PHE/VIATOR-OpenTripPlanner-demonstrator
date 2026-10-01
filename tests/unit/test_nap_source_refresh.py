@@ -9,6 +9,8 @@ reports `unchanged` / `skipped` without touching the slot.
 from __future__ import annotations
 
 import io
+import json
+import uuid
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -401,3 +403,135 @@ def test_eu19_source_map_validates() -> None:
     cleaned = ingestion.normalize_providers({"sources": {"providers": providers}})
     assert len(cleaned) == 23
     assert {p["timetable"]["source"] for p in cleaned} == {"nap", "url"}
+
+
+# ─────────────────────────── login portals (json_api + credential) ───────────────────────────
+
+AT_RESOLVER = {
+    "type": "json_api",
+    "url": "https://data.example.at/api/public/v1/data-sets",
+    "items": "",
+    "match": {"name": "ÖBB"},
+    "download": "https://data.example.at/api/public/v1/data-sets/{id}/file",
+}
+AT_LOGIN = {
+    "token_url": "https://user.example.at/token",
+    "client_id": "dbp-script-download",
+    "username": "u",
+    "password": "p",
+}
+
+
+class _CredDb:
+    def __init__(self, cred: Any) -> None:
+        self.cred = cred
+
+    def get(self, model: Any, key: Any) -> Any:
+        return self.cred
+
+    def flush(self) -> None: ...
+
+
+def _login_cred(plaintext: str, auth_type: str = "oauth2_password") -> Any:
+    from types import SimpleNamespace
+
+    from app import credentials as crypto
+
+    ciphertext, nonce = crypto.encrypt(plaintext, sessions_api.settings.jwt_secret)
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        name="AT NAP login",
+        auth_type=auth_type,
+        param_name=None,
+        ciphertext=ciphertext,
+        nonce=nonce,
+        last_used_at=None,
+    )
+
+
+def _at_task(cred_id: str) -> Any:
+    return sessions_api._RefreshTask(
+        "provider[OBB].timetable(gtfs)", "GTFS", "display", "obb.zip", cred_id, AT_RESOLVER
+    )
+
+
+async def test_login_portal_logs_in_once_and_signs_lookup_and_download(
+    inbox: Path, dispatched: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import credentials as crypto
+    from app.master import nap_importer
+
+    monkeypatch.setattr(nap_importer, "_validate_safe_http_url", lambda url: url)
+    crypto._token_cache.clear()
+    cred = _login_cred(json.dumps(AT_LOGIN))
+    seen: list[tuple[str, str | None]] = []
+
+    def portal(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("Authorization")))
+        if request.url.host == "user.example.at":
+            return httpx.Response(200, json={"access_token": "T", "expires_in": 300})
+        if request.url.path.endswith("/data-sets"):
+            return httpx.Response(200, json=[{"id": 67, "name": "ÖBB Personenverkehr"}])
+        return httpx.Response(200, content=_gtfs_zip())
+
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(portal)) as c:
+        outcome = await _refresh_one_task(c, _CredDb(cred), "s1", staging, _at_task(str(cred.id)))  # type: ignore[arg-type]
+    assert outcome["status"] == "fetched", outcome
+    assert outcome["url"] == "https://data.example.at/api/public/v1/data-sets/67/file"
+    assert seen == [
+        ("/token", None),
+        ("/api/public/v1/data-sets", "Bearer T"),
+        ("/api/public/v1/data-sets/67/file", "Bearer T"),
+    ]
+    assert cred.last_used_at is not None
+    assert dispatched == ["GTFS"]
+
+
+async def test_refused_login_skips_the_task_and_keeps_the_slot(
+    inbox: Path, dispatched: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import credentials as crypto
+    from app.master import nap_importer
+
+    monkeypatch.setattr(nap_importer, "_validate_safe_http_url", lambda url: url)
+    crypto._token_cache.clear()
+    cred = _login_cred(json.dumps(AT_LOGIN))
+
+    def portal(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid_grant"})
+
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(portal)) as c:
+        outcome = await _refresh_one_task(c, _CredDb(cred), "s1", staging, _at_task(str(cred.id)))  # type: ignore[arg-type]
+    assert outcome["status"] == "skipped"
+    assert "NAP resolver failed" in outcome["reason"]
+    assert "'AT NAP login': login refused" in outcome["reason"]
+    assert "invalid_grant" in outcome["reason"]
+    assert dispatched == []
+
+
+async def test_missing_credential_is_reported_for_a_login_portal(inbox: Path) -> None:
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))) as c:
+        outcome = await _refresh_one_task(
+            c, _CredDb(None), "s1", staging, _at_task(str(uuid.uuid4()))
+        )  # type: ignore[arg-type]
+    assert outcome["status"] == "skipped"
+    assert "not found" in outcome["reason"]
+
+
+async def test_undecryptable_credential_is_reported(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cred = _login_cred(json.dumps(AT_LOGIN))
+    monkeypatch.setattr(sessions_api.settings, "jwt_secret", "another-secret-entirely-32-bytes!")
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))) as c:
+        outcome = await _refresh_one_task(c, _CredDb(cred), "s1", staging, _at_task(str(cred.id)))  # type: ignore[arg-type]
+    assert outcome["status"] == "skipped"
+    assert "cannot be decrypted" in outcome["reason"]

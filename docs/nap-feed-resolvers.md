@@ -72,6 +72,7 @@ refresh task writes its outcome to `last_attempt` in its fetch-state file. Deriv
 | `udata` | `api`, `dataset_id`, `title_regex` | Newest resource (by `created_at`) whose title matches | LU (data.public.lu) |
 | `permalink` | `url`, optionally containing `{timetable_year}` | Placeholder substituted; the server redirects to the newest file | CH (opentransportdata.swiss) |
 | `dated` | `url` with `{date}` (YYYYMMDD), `max_days_back` (1–60, default 21) | Walks back day by day with a 4-byte ranged GET until a zip answers. Only a 404/410, or a 200/206 that is not a zip, steps back a day. Any other status (401, 403, 5xx) or a network error stops the walk and reports the real error | DE (DELFI, published Mondays) |
+| `json_api` | `url` (may hold `{timetable_year}`), `items` (dotted path to the entries; lists are flattened at every level), `match` (field path → regex, all must match, up to 5), optional `sort` (field path; the highest wins), and **one of** `download` (URL template, `{field.path}` placeholders, same host as `url`) or `url_field` (field holding the file URL, must be on the same host) | Fetches the JSON catalogue, keeps the entries matching every regex, picks the highest `sort` value — or refuses if several match and there is no `sort` — then builds the file URL. Each flattened entry carries `_parent`, so a file can be matched on its dataset (`_parent.name`). **The only type whose lookup carries the provider's credential** | AT, ES (portals that need an account) |
 
 `{timetable_year}` is the European timetable year in force today. It switches on the Sunday after
 the second Saturday of December (2026-12-13 is the first day of 2027).
@@ -88,6 +89,50 @@ Config example (`sources.providers[]`):
 
 In the admin UI the provider card's **Source** menu has a "NAP resolver" option taking the
 resolver as JSON.
+
+## Portals that need an account
+
+A provider's timetable can carry a credential (`timetable_credential_id`), chosen in the provider
+card's **Credential** menu for the *URL* and *NAP resolver* sources. The secret itself is entered
+only on the **/credentials** page, stored encrypted (AES-256-GCM), and never shown again.
+
+| Scheme | Stored | Sent |
+|---|---|---|
+| `header`, `query`, `bearer`, `basic` | the key / token / `user:pass` | as is, on every request |
+| `oauth2_password` (*Login*) | `{token_url, client_id, username, password[, scope]}` | an OAuth2 password grant is posted to `token_url` first; the access token goes out as `Authorization: Bearer`. Tokens are cached in-process until 30 s before they expire, so one refresh logs in once |
+
+The credential is applied to the `json_api` catalogue lookup and to the download. The other
+resolver types query public catalogues and never see it. Safety rules:
+
+- the token URL, the lookup and every redirect hop pass the SSRF guard **before** anything is
+  signed; the token request never follows redirects (that would re-post the password);
+- a `json_api` file URL must be on the catalogue's host, so the credential cannot be carried to a
+  host the operator did not configure;
+- error messages name the HTTP status and the OAuth2 `error` field only — never the password,
+  the token, or a signed URL's query string;
+- a refused login, a deleted credential, or an undecryptable one (JWT_SECRET rotated) fails that
+  one task with the reason; the previous file stays.
+
+A login credential cannot be used where only a static header is possible: the OTP GTFS-RT
+router config leaves that updater anonymous (and logs it), and NAP catalogue imports refuse it.
+**Test login** on /credentials runs the exchange immediately, so a wrong password or an
+unaccepted licence shows there rather than at the next refresh.
+
+**Presets** on /credentials fill the fixed, public parts:
+
+- **Austria** (data.mobilitaetsverbuende.at): *Login*, token URL
+  `https://user.mobilitaetsverbuende.at/auth/realms/dbp-public/protocol/openid-connect/token`,
+  client id `dbp-script-download`. The account must have accepted each dataset's licence on the
+  portal. The provider's documentation page is titled "only until November 22nd": the API may
+  change after that date; re-run the probe if lookups start failing.
+- **Spain** (nap.transportes.gob.es): *Custom header* `ApiKey`, the key from the portal's
+  account page. Catalogue `GET /api/Fichero/GetList`; file `GET /api/Fichero/download/{id}`.
+- **Belgium**: no credential needed for the SNCB/NMBS NeTEx (public blob URL); see "Still manual".
+
+**Finishing a `json_api` config.** The portals block the development cloud, so the field names
+were not probed. On the VPS run `python3 scripts/probe_nap_api.py at` (or `es`). It prompts for the
+login or key without echoing it, and prints only the JSON shape and the entries matching OBB /
+OUIGO / Iryo — no secret. Those field names go into `items`, `match`, `sort` and `download`.
 
 ## eu19 feed map (probed live 2026-09-29)
 
@@ -125,8 +170,8 @@ default; `-Apply` to save).
 
 | Feed | Blocker | Next step |
 |---|---|---|
-| OBB (AT) | data.mobilitaetsverbuende.at file endpoint returns 401 without a Keycloak password-grant token (documented by the provider as its public API flow) | PH registers and accepts the dataset-67 licence; then add an `oidc_password` credential scheme + resolver |
-| OUIGO-ES | Exists only on the ES NAP (API key via free registration); the local copy is actually a MERITS-style export | Register for an ES NAP API key, or keep as a quarterly manual upload |
+| OBB (AT) | data.mobilitaetsverbuende.at file endpoint returns 401 without a Keycloak password-grant token (documented by the provider as its public API flow) | Login credential + `json_api` resolver now supported (above). Accept the dataset-67 licence, run the probe, add the map entry |
+| OUIGO-ES, IRYO (new) | Exist only on the ES NAP (API key via free registration); the local OUIGO copy is actually a MERITS-style export | `ApiKey` header credential + `json_api` resolver now supported (above). Run the probe, add the map entries |
 | NMBS (BE) | The stable blob URL serves a **different export** (enRoute, 2,184 files, 7.8 GB uncompressed) from our local file. Also the licence is marked non-commercial, and our local file expired 2025-12-13 | Decide on licence; test the loader against the new structure (or use the anonymous GTFS feed) |
 
 ## Invariants & traps
