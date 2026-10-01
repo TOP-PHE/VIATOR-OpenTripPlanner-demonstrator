@@ -110,7 +110,13 @@ def test_legacy_nap_url_refuses_anything_else() -> None:
 # ─────────────────────────── #89 timezone log line ───────────────────────────
 
 
-def test_unknown_timezone_log_line_cannot_be_split(caplog: pytest.LogCaptureFixture) -> None:
+def test_unknown_timezone_log_line_cannot_be_split(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # In a full `pytest` run the integration migration tests go first, and
+    # alembic/env.py's fileConfig() disables every logger that already
+    # exists (disable_existing_loggers defaults to True) — this one included.
+    monkeypatch.setattr(runner.log, "disabled", False)
     cfg = runner.CoverageConfig()
     with caplog.at_level(logging.WARNING, logger=runner.log.name):
         zone = runner._resolve_timezone("Bad/Zone\nFAKE ERROR forged", cfg)
