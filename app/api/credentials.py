@@ -45,6 +45,9 @@ from ..settings import settings
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
 
+# One 404 for "does not exist" and "not yours" — never leak existence.
+_NOT_FOUND = "Credential not found"
+
 
 # ────────────────────────────── pydantic models ──────────────────────────────
 
@@ -197,8 +200,8 @@ def create_credential(
 
 @router.patch(
     "/{cred_id}",
-    response_model=CredentialResponse,
-    # Declared for Sonar S8415, like app/api/admin/sessions.py.
+    # Response model inferred from the return annotation (S8409); error
+    # responses declared for S8415, like app/api/admin/sessions.py.
     responses={
         400: {"description": "Invalid auth type, param name or secret for the scheme."},
         404: {"description": "Credential not found (or not yours)."},
@@ -220,7 +223,7 @@ def patch_credential(
     cred = db.get(UserCredential, cred_id)
     if cred is None or cred.user_id != actor.id:
         # Same 404 for "doesn't exist" and "not yours" — don't leak existence.
-        raise HTTPException(404, "Credential not found")
+        raise HTTPException(404, _NOT_FOUND)
 
     changes: dict[str, dict[str, object]] = {}
 
@@ -319,7 +322,7 @@ def delete_credential(
     """
     cred = db.get(UserCredential, cred_id)
     if cred is None or cred.user_id != actor.id:
-        raise HTTPException(404, "Credential not found")
+        raise HTTPException(404, _NOT_FOUND)
 
     audit.record(
         db,
@@ -359,7 +362,7 @@ async def check_login(
     """
     cred = db.get(UserCredential, cred_id)
     if cred is None or cred.user_id != actor.id:
-        raise HTTPException(404, "Credential not found")
+        raise HTTPException(404, _NOT_FOUND)
     if cred.auth_type not in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
         raise HTTPException(400, f"auth_type {cred.auth_type!r} has no login to test")
     # Read what the exchange needs, then hand the connection back: the

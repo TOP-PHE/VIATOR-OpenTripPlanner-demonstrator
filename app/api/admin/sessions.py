@@ -2853,7 +2853,6 @@ class PromoteResponse(BaseModel):
 
 @router.post(
     "/{sid}/promote",
-    response_model=PromoteResponse,
     responses={
         400: {"description": "Session is not in state graph_built or serving."},
         404: {"description": "Session not found."},
