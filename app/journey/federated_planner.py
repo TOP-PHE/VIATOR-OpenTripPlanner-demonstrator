@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..logging_config import one_line
 from .signature import _uic_from_stop_id, transit_fingerprint
 
 if TYPE_CHECKING:
@@ -371,7 +372,9 @@ async def _fetch_leg(
             session_timezone=ctx.tz_for.get(session.id),
         )
     except Exception as exc:  # network/OTP error on one leg shouldn't 500 the query
-        log.warning("federated leg %s %s->%s failed: %s", session.id, frm, to, exc)
+        log.warning(
+            "federated leg %s %s->%s failed: %s", session.id, one_line(frm), one_line(to), exc
+        )
         return []
     return trips
 

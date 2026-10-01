@@ -22,6 +22,7 @@ from jinja2 import Environment, PackageLoader, select_autoescape
 
 from .. import config_service
 from ..db import SessionLocal
+from ..logging_config import one_line
 
 log = logging.getLogger(__name__)
 
@@ -133,10 +134,10 @@ async def _deliver(
         log.warning(
             "[EMAIL DISABLED — SMTP_HOST not set] purpose=%s to=%s subject=%r",
             purpose,
-            to,
+            one_line(to),
             subject,
         )
-        log.info("[EMAIL BODY for %s — %s]\n%s", purpose, to, text)
+        log.info("[EMAIL BODY for %s — %s]\n%s", purpose, one_line(to), text)
         return
 
     await _send_via_smtp(cfg, to=to, subject=subject, html=html, text=text)
@@ -194,7 +195,7 @@ async def _send_via_smtp(
         )
         raise EmailSendError(str(exc)) from exc
 
-    log.info("email sent: to=%s subject=%r host=%s", to, subject, cfg["SMTP_HOST"])
+    log.info("email sent: to=%s subject=%r host=%s", one_line(to), subject, cfg["SMTP_HOST"])
 
 
 def _tls_modes(secure: str) -> tuple[bool, bool]:
