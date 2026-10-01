@@ -130,7 +130,8 @@ given file is decided by the data server, and shows as an HTTP 401 on refresh.
   change after that date; re-run the probe if lookups start failing.
 - **Spain** (nap.transportes.gob.es): *Custom header* `ApiKey`, the key from the portal's
   account page. Catalogue `GET /api/Fichero/GetList`; file `GET /api/Fichero/download/{id}`.
-- **Belgium**: no credential needed for the SNCB/NMBS NeTEx (public blob URL); see "Still manual".
+- **Belgium**: no credential needed for the SNCB/NMBS NeTEx (public blob URL). A transportdata.be
+  login or API token is not used.
 
 **Finishing a `json_api` config.** The portals block the development cloud, so the field names
 were not probed. On the VPS run `python3 scripts/probe_nap_api.py at` (or `es`). It prompts for the
@@ -139,8 +140,8 @@ OUIGO / Iryo — no secret. Those field names go into `items`, `match`, `sort` a
 
 ## eu19 feed map (probed live 2026-09-29)
 
-`app/data/eu19_nap_sources.json` holds the replacement for 25 of the 26 uploaded feeds, plus
-TRENORD (added 2026-10-01). It lives under `app/` because the web image copies only `app/`.
+`app/data/eu19_nap_sources.json` holds the replacement for all 26 uploaded feeds (NMBS added
+2026-10-01), plus TRENORD (added 2026-10-01). It lives under `app/` because the web image copies only `app/`.
 
 **The map carries no credential.** For the entries that need one (OBB, the ES feeds) switching sets
 the source only: select the credential on the provider card, save, then refresh. A credential
@@ -170,6 +171,7 @@ default; `-Apply` to save).
 | FGC 1373, EUSKOTREN 1062, RENFE-AVLD 897, RENFE-CERC 929, OUIGO-ES 1515 | `nap/json_api` | ES NAP catalogue `GetList` (about 10 MB, mostly base64 logos), file `download/{ficheroId}`. Matched on the dataset id (`_parent.conjuntoDatoId`) and `tipoFicheroNombre` `^GTFS-ZIP$` — a looser `^GTFS` would also match `GTFS RT`. **Needs the ES `ApiKey` credential selected on the provider card.** Before 2026-10-01 the first four pointed at the operators' own URLs (same files); switched so every ES feed comes from the NAP. Iryo is not on the ES NAP |
 | TRENITALIA | `url` | Italian NAP public catalogue, asset 1080596, `/checkedResource` = the last *validated* version. It serves `.xml.gz` with no validators, so change detection relies on the hash. **This corrects eu19-providers.md, which says CCISS is SPID-walled** |
 | TRENORD | `url` | Italian NAP dataset IT-ITC4-TRENORD_336 (NeTEx, Italian profile level 1, Trenord only), asset 131494 `/checkedResource`. Anonymous, like TRENITALIA. The session declares GTFS (dati.lombardia.it), so the panel shows *format differs*: switch it by hand |
+| NMBS | `url` | Belgian NAP (transportdata.be) blob `netex-nmbssncb-latest.zip`, anonymous. Probed from the VPS 2026-10-01: 141 MB, 2,184 files (`common.xml` about 1 GB + one `line-gr:nmbssncb:*.xml` per line, 7.8 GB uncompressed), enRoute export, regenerated daily, sends ETag and Last-Modified (an unchanged file is a 304). Calendar 2025-12-29 → 2026-12-12. A different export from the old hand-uploaded file (which expired 2025-12-13): watch the first MOTIS import. **Licence marked "Other (Non-Commercial)"** (see eu19-compliance-summary.md) |
 | OBB | `nap/permalink` | Dataset 67, "Railway Timetable Data (NeTEx) - Current Reference Data" (not 71, the changeover snapshot; not 66, GTFS). **Needs the AT *Login* credential** with client id `dbp-public-ui`, and the dataset licence accepted on the portal. The catalogue is public, so only the file request tests the token |
 | SBB | `nap/permalink` | `timetablenetex_<year>/permalink` redirects to a 60-second presigned R2 URL; never store it. About 660 MB, new file roughly twice a week. The CKAN API is blocked (403) or needs a key; the permalink needs neither |
 | CFL | `nap/udata` | Publisher is ATP (national multimodal), CC0. The local `netex-20260618-20260823.zip` is byte-size identical to this dataset's resource, which settles eu19-providers.md's "cannot be traced" |
@@ -180,7 +182,6 @@ default; `-Apply` to save).
 | Feed | Blocker | Next step |
 |---|---|---|
 | IRYO (new) | Not on the ES NAP | Find another source (e.g. a Transitous feed) |
-| NMBS (BE) | The stable blob URL serves a **different export** (enRoute, 2,184 files, 7.8 GB uncompressed) from our local file. Also the licence is marked non-commercial, and our local file expired 2025-12-13 | Decide on licence; test the loader against the new structure (or use the anonymous GTFS feed) |
 
 ## Invariants & traps
 

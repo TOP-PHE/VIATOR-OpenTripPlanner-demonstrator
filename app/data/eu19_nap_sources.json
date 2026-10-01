@@ -24,6 +24,7 @@
 
   "TRENITALIA":  {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/1080596/checkedResource"},
   "TRENORD":     {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/131494/checkedResource"},
+  "NMBS":        {"format": "netex_epip", "source": "url", "url": "https://belgianmobilityversioned.blob.core.windows.net/netex/production/netex-nmbssncb-latest.zip"},
   "OBB":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "permalink", "url": "https://data.mobilitaetsverbuende.at/api/public/v1/data-sets/67/{timetable_year}/file"}},
   "SBB":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "permalink", "url": "https://data.opentransportdata.swiss/dataset/timetablenetex_{timetable_year}/permalink"}},
   "CFL":         {"format": "netex_epip", "source": "nap", "resolver": {"type": "udata", "api": "https://data.public.lu/api/1", "dataset_id": "56fbd4e5855e9b6a1088f54e", "title_regex": "^netex-\\d{8}-\\d{8}\\.zip$"}},
