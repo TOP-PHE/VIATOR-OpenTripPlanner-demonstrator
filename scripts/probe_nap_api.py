@@ -34,8 +34,11 @@ PORTALS: dict[str, dict[str, str]] = {
             "https://user.mobilitaetsverbuende.at/auth/realms/dbp-public"
             "/protocol/openid-connect/token"
         ),
-        "client_id": "dbp-script-download",
-        "list_url": "https://data.mobilitaetsverbuende.at/api/public/v1/data-sets",
+        "client_id": "dbp-public-ui",
+        "list_url": (
+            "https://data.mobilitaetsverbuende.at/api/public/v1/data-sets"
+            "?tagFilterModeInclusive=true"
+        ),
         "grep": r"(?i)öbb|oebb|personenverkehr|rail",
     },
     "es": {
@@ -46,6 +49,8 @@ PORTALS: dict[str, dict[str, str]] = {
 
 _SAMPLE_CHARS = 60
 _MAX_MATCHES = 40
+# Base64 logos in the ES catalogue: megabytes of noise in every match.
+_SKIP_KEYS = frozenset({"imagenByte"})
 
 
 def _request(url: str, *, data: bytes | None = None, headers: dict[str, str]) -> Any:
@@ -102,6 +107,8 @@ def shape(node: Any, path: str = "", out: dict[str, str] | None = None) -> dict[
     if isinstance(node, dict):
         out.setdefault(path or "(root)", "object")
         for key, value in node.items():
+            if key in _SKIP_KEYS:
+                continue
             shape(value, f"{path}.{key}" if path else key, out)
     elif isinstance(node, list):
         out[path or "(root)"] = f"list[{len(node)}]"
@@ -118,9 +125,15 @@ def matches(node: Any, pattern: re.Pattern[str], path: str = "") -> list[tuple[s
     if isinstance(node, dict):
         for key, value in node.items():
             found += matches(value, pattern, f"{path}.{key}" if path else key)
-        own = any(isinstance(v, str) and pattern.search(v) for v in node.values())
+        own = any(
+            isinstance(v, str) and pattern.search(v) for k, v in node.items() if k not in _SKIP_KEYS
+        )
         if own:
-            scalars = {k: v for k, v in node.items() if not isinstance(v, dict | list)}
+            scalars = {
+                k: v
+                for k, v in node.items()
+                if k not in _SKIP_KEYS and not isinstance(v, dict | list)
+            }
             found.append((path or "(root)", scalars))
     elif isinstance(node, list):
         for i, element in enumerate(node):

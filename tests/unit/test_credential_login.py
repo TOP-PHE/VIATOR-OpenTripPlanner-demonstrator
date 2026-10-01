@@ -383,7 +383,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_credentials_page_offers_the_login_scheme_and_nap_presets() -> None:
     html = (ROOT / "app" / "templates" / "credentials.html").read_text(encoding="utf-8")
     assert '<option value="oauth2_password">' in html
-    assert "dbp-script-download" in html
+    assert "client_id: 'dbp-public-ui'" in html
     assert "param_name: 'ApiKey'" in html
     assert "/test-login" in html
     for field in ("token_url", "client_id", "username", "password"):
