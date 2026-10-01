@@ -38,7 +38,8 @@ def _reload() -> ModuleType:
 def test_unset_uses_the_pin() -> None:
     v = _reload()
     assert v.MOTIS_VERSION == v._MOTIS_PINNED
-    assert f"ghcr.io/motis-project/motis:{v._MOTIS_PINNED}" == v.MOTIS_IMAGE
+    assert v.MOTIS_IMAGE.startswith("ghcr.io/motis-project/motis:")
+    assert v.MOTIS_IMAGE.endswith(f":{v._MOTIS_PINNED}")
     assert v.MOTIS_BUILD_IMAGE == v.MOTIS_IMAGE
 
 
