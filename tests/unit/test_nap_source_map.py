@@ -130,7 +130,7 @@ def test_switch_keeps_the_credential_selected_on_the_card() -> None:
 def test_shipped_map_loads_without_comment_keys() -> None:
     nap_source_map.load_map.cache_clear()
     shipped = nap_source_map.load_map()
-    assert len(shipped) == 26
+    assert len(shipped) == 27
     assert not any(k.startswith("_") for k in shipped)
 
 
