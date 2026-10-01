@@ -301,13 +301,12 @@ def patch_credential(
     return CredentialResponse.from_orm_credential(cred)
 
 
-# `response_model=None` is needed even for `-> None` returns, otherwise
-# FastAPI infers a model from the annotation and refuses status-204 (which
-# explicitly forbids a response body).
+# No `response_model=None` (S8409): FastAPI infers None from the `-> None`
+# annotation, so status 204 keeps its empty body (checked on 0.141.1; older
+# releases needed the explicit None).
 @router.delete(
     "/{cred_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    response_model=None,
     responses={404: {"description": "Credential not found (or not yours)."}},
 )
 def delete_credential(
