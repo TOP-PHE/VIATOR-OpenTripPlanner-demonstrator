@@ -115,15 +115,18 @@ resolver types query public catalogues and never see it. Safety rules:
 
 A login credential cannot be used where only a static header is possible: the OTP GTFS-RT
 router config leaves that updater anonymous (and logs it), and NAP catalogue imports refuse it.
-**Test login** on /credentials runs the exchange immediately, so a wrong password or an
-unaccepted licence shows there rather than at the next refresh.
+**Test login** on /credentials runs the exchange immediately, so a wrong password shows there
+rather than at the next refresh. It checks the login only: whether the portal then serves a
+given file is decided by the data server, and shows as an HTTP 401 on refresh.
 
 **Presets** on /credentials fill the fixed, public parts:
 
 - **Austria** (data.mobilitaetsverbuende.at): *Login*, token URL
   `https://user.mobilitaetsverbuende.at/auth/realms/dbp-public/protocol/openid-connect/token`,
-  client id `dbp-script-download`. The account must have accepted each dataset's licence on the
-  portal. The provider's documentation page is titled "only until November 22nd": the API may
+  client id `dbp-public-ui` (the portal's web client). **Not** `dbp-script-download`: that
+  client logs in, but `/data-sets/{id}/{year}/file` answers 401 to its token (probed
+  2026-10-01; the catalogue is public, so a lookup succeeding proves nothing about the token).
+  The account must have accepted each dataset's licence on the portal. The provider's documentation page is titled "only until November 22nd": the API may
   change after that date; re-run the probe if lookups start failing.
 - **Spain** (nap.transportes.gob.es): *Custom header* `ApiKey`, the key from the portal's
   account page. Catalogue `GET /api/Fichero/GetList`; file `GET /api/Fichero/download/{id}`.
