@@ -165,7 +165,10 @@ def test_send_failure_returns_ok_false_with_error(
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
-    assert "server said no" in body["error"]
+    # The server's answer stays in the audit event, never in the response
+    # (CodeQL py/stack-trace-exposure).
+    assert "server said no" not in body["error"]
+    assert "audit log" in body["error"]
 
     from app.db import SessionLocal
     from app.models import AuditEvent
@@ -177,6 +180,7 @@ def test_send_failure_returns_ok_false_with_error(
             .all()
         )
     assert len(events) == 1
+    assert "server said no" in (events[0].metadata_ or {}).get("error", "")
 
 
 def test_smtp_test_requires_platform_admin(client: TestClient) -> None:

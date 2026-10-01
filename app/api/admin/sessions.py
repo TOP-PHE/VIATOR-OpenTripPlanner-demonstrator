@@ -1870,9 +1870,9 @@ class ImportFromNapBody(BaseModel):
     )
     nap_url: str | None = Field(
         default=None,
-        description="DIRECT NAP endpoint URL. Legacy escape hatch — operators "
-        "should use nap_catalogue_id (managed at /admin/nap-catalogues) so "
-        "credentials can be attached. Anonymous fetch only.",
+        description="Legacy: a NAP endpoint URL, accepted only if it is the default "
+        "FR NAP or the URL of a saved catalogue. Use nap_catalogue_id (managed at "
+        "/admin/nap-catalogues) so credentials can be attached. Anonymous fetch only.",
     )
     country: str | None = Field(default=None, max_length=2, description="ISO-2 country filter")
     modes: list[str] | None = Field(
@@ -1908,10 +1908,35 @@ class ImportFromNapResponse(BaseModel):
     preview: bool
 
 
+def _legacy_nap_url(db: DbSession, requested: str) -> str:
+    """The stored URL matching the legacy `nap_url` field; 400 otherwise."""
+    from ...master import nap_importer
+    from ...models import NapCatalogue
+
+    if requested == nap_importer.DEFAULT_FR_NAP_URL:
+        return nap_importer.DEFAULT_FR_NAP_URL
+    stored = db.execute(
+        select(NapCatalogue.url).where(NapCatalogue.url == requested).limit(1)
+    ).scalar_one_or_none()
+    if stored is None:
+        raise HTTPException(
+            400,
+            "nap_url must be the default FR NAP or the URL of a saved NAP catalogue "
+            "(/admin/nap-catalogues); prefer nap_catalogue_id.",
+        )
+    return str(stored)
+
+
 @router.post(
     "/{sid}/providers/import-from-nap",
     response_model=ImportFromNapResponse,
     summary="Bulk-import providers from a NAP catalogue (preview or commit)",
+    responses={
+        400: {
+            "description": "No NAP named, a malformed id, or a nap_url that is not allow-listed."
+        },
+        404: {"description": "Session or NAP catalogue not found."},
+    },
 )
 async def import_providers_from_nap(
     sid: str,
@@ -1998,7 +2023,11 @@ async def import_providers_from_nap(
                     ) from exc
                 nap_auth = (cred.auth_type, plaintext, cred.param_name)
     elif body.nap_url:
-        nap_url = body.nap_url
+        # Legacy field, allow-listed (CodeQL py/full-ssrf): it may only name
+        # the default FR NAP or a saved catalogue, and the URL fetched is the
+        # stored one, never the request's string. Catalogues are created by
+        # platform admins at /admin/nap-catalogues.
+        nap_url = _legacy_nap_url(db, body.nap_url)
     else:
         raise HTTPException(
             400,
