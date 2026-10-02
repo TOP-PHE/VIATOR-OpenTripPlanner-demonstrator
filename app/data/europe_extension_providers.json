@@ -1,0 +1,140 @@
+{
+  "_comment": "Providers that extend eu19-transit-motis to the rest of Europe. Added to a session with scripts/session_providers.py --add (dry run by default). Every entry is fetched automatically on each 'Refresh providers' - none is a manual upload. 'provenance' says where the data comes from and is repeated in the label so it shows wherever the provider is listed: nap = listed on the country's MMTIS National Access Point; official = published by the operator or a government body but not (yet) confirmed on a NAP; community = built by volunteers from the operator's website, used only where no official feed exists. 'probe' records the 2026-10-02 check from the VPS. Research: docs/eu-extension-providers.md.",
+  "providers": [
+    {
+      "id": "CP",
+      "label": "CP - Comboios de Portugal",
+      "country_iso": "PT",
+      "provenance": "nap",
+      "nap_reference": "https://nap-portugal.imt-ip.pt/nap/multimodalsupplydetail/176",
+      "probe": "GTFS, 174 rail routes, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://publico.cp.pt/gtfs/gtfs.zip"}
+    },
+    {
+      "id": "IRISHRAIL",
+      "label": "Iarnrod Eireann [official, NAP unconfirmed]",
+      "country_iso": "IE",
+      "provenance": "official",
+      "nap_reference": "https://data.gov.ie/dataset/gtfs-irish-rail-gtfs",
+      "probe": "GTFS, 19 rail routes incl. Dublin-Belfast Enterprise, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://www.transportforireland.ie/transitData/Data/GTFS_Irish_Rail.zip"}
+    },
+    {
+      "id": "VR",
+      "label": "VR (Fintraffic Digitraffic) [official, NAP unconfirmed]",
+      "country_iso": "FI",
+      "provenance": "official",
+      "nap_reference": "https://finap.fi",
+      "probe": "GTFS, 744 rail routes, calendar to 2027-12-31; the server answers 406 unless the request accepts gzip (the app's client does)",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://rata.digitraffic.fi/api/v1/trains/gtfs-passenger-stops.zip"}
+    },
+    {
+      "id": "ELRON",
+      "label": "Elron [official, NAP unconfirmed]",
+      "country_iso": "EE",
+      "provenance": "official",
+      "nap_reference": "https://www.agri.ee (public transport register open data)",
+      "probe": "GTFS, 28 rail routes incl. Tallinn-Riga, calendar to 2026-12-31",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://eu-gtfs.remix.com/elron.zip"}
+    },
+    {
+      "id": "VIVI",
+      "label": "Pasazieru vilciens / VIVI [official, NAP unconfirmed]",
+      "country_iso": "LV",
+      "provenance": "official",
+      "nap_reference": "https://data.lvceli.lv/opendata/EN/PublicTransport -> data.gov.lv",
+      "probe": "GTFS, 48 rail routes, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://www.vivi.lv/uploads/GTFS.zip"}
+    },
+    {
+      "id": "LT-ALL",
+      "label": "Lithuania all operators (visimarsrutai.lt) [official, NAP unconfirmed]",
+      "country_iso": "LT",
+      "provenance": "official",
+      "nap_reference": "https://www.visimarsrutai.lt/gtfs",
+      "probe": "GTFS 65 MB, 3480 routes of which 73 rail; calendar end 2099-12-31 is a placeholder",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://www.visimarsrutai.lt/gtfs/gtfs_all.zip"}
+    },
+    {
+      "id": "HZPP",
+      "label": "HZ Putnicki prijevoz [official, NAP unconfirmed]",
+      "country_iso": "HR",
+      "provenance": "official",
+      "nap_reference": "https://data.gov.hr/ckan/dataset/vozni-red-h-putni-kog-prijevoza-u-gtfs-obliku",
+      "probe": "GTFS, 143 routes of which 138 rail, calendar to 2026-12-13",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://www.hzpp.hr/GTFS_files.zip"}
+    },
+    {
+      "id": "ITALO",
+      "label": "Italo (NTV) + ItaloBus",
+      "country_iso": "IT",
+      "provenance": "nap",
+      "nap_reference": "https://www.cciss.it/nap/mmtis/public/en/catalog/Dataset/1814124",
+      "probe": "gzip-compressed NeTEx (188 KB), unpacked by app/feed_fetch.py like Trenord; stops are known to be listed out of order - check the build",
+      "timetable": {"format": "netex_epip", "source": "url", "url": "https://www.cciss.it/nap/mmtis/public/api/v1/download/blob/Asset/1814124/checkedResource"}
+    },
+    {
+      "id": "CY-INTERCITY",
+      "label": "Cyprus Intercity buses",
+      "country_iso": "CY",
+      "provenance": "nap",
+      "nap_reference": "https://traffic4cyprus.org.cy/dataset/publictransportstatic",
+      "probe": "GTFS, 60 bus routes (calendar_dates only)",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://motionbuscard.org.cy/opendata/downloadfile?file=GTFS%5C5_google_transit.zip&rel=True"}
+    },
+    {
+      "id": "BEOGRAD",
+      "label": "Belgrade city + suburban transit [official, no NAP]",
+      "country_iso": "RS",
+      "provenance": "official",
+      "nap_reference": "https://data.gov.rs (Secretariat for Public Transport, City of Belgrade)",
+      "probe": "GTFS 17 MB, 241 tram/trolleybus/bus routes, calendar to 2029-12-31",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://data.gov.rs/sr/datasets/r/729be9a1-7ed9-453d-9a3d-68fa30f07529"}
+    },
+    {
+      "id": "TIRANA",
+      "label": "Tirana city transit [official, no NAP]",
+      "country_iso": "AL",
+      "provenance": "official",
+      "nap_reference": "https://pt.tirana.al (Municipality of Tirana, CC-BY-SA-4.0)",
+      "probe": "not probed from the VPS; mirror copy: 27 routes, calendar to 2026-12-31",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://pt.tirana.al/gtfs/gtfs.zip"}
+    },
+    {
+      "id": "SRBIJAVOZ",
+      "label": "Srbijavoz rail [COMMUNITY - not NAP, not official]",
+      "country_iso": "RS",
+      "provenance": "community",
+      "nap_reference": "none - built by vekejsn/gtfs-generators from srbvoz.rs; no official feed exists",
+      "probe": "not probed from the VPS; research copy: 264 routes incl. Belgrade-Bar and Subotica-Szeged, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://gitlab.com/api/v4/projects/vekejsn%2Fgtfs-generators/packages/generic/srbijavoz-merged-gtfs/latest/srbijavoz_merged.zip"}
+    },
+    {
+      "id": "ZPCG",
+      "label": "ZPCG Montenegro rail [COMMUNITY - not NAP, not official]",
+      "country_iso": "ME",
+      "provenance": "community",
+      "nap_reference": "none - built by Transitous (jbb.ghsq.de), ODbL; no official feed exists",
+      "probe": "not probed from the VPS; research mirror: 30 routes, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://jbb.ghsq.de/gtfs/me-zpcg.gtfs.zip"}
+    },
+    {
+      "id": "MZT",
+      "label": "MZ Transport North Macedonia rail [COMMUNITY - not NAP, not official]",
+      "country_iso": "MK",
+      "provenance": "community",
+      "nap_reference": "none - hand-built by hoermalmeister/gtfs-rehost; no official feed exists",
+      "probe": "not probed from the VPS; research copy: 16 trips, calendar to 2026-12-12",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://hoermalmeister.github.io/gtfs-rehost/mzi/mzi.zip"}
+    },
+    {
+      "id": "TRAINKOS",
+      "label": "Trainkos Kosovo rail [COMMUNITY - not NAP, not official]",
+      "country_iso": "XK",
+      "provenance": "community",
+      "nap_reference": "none - hand-built by hoermalmeister/gtfs-rehost; no official feed exists",
+      "probe": "not probed from the VPS; research copy: 6 trips, calendar to 2026-12-13",
+      "timetable": {"format": "gtfs", "source": "url", "url": "https://hoermalmeister.github.io/gtfs-rehost/trainkos/trainkos.zip"}
+    }
+  ]
+}
