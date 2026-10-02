@@ -175,6 +175,10 @@ def test_feed_id_extraction_handles_edge_cases():
     assert _feed_id_from_motis_id("renfe-ld_60000") == "renfe-ld"
     # Multi-underscore feed id: only the LAST `_` splits feed from local.
     assert _feed_id_from_motis_id("eu_corridors_TGV6603") == "eu_corridors"
+    # NeTEx local ids carry `:` and may contain `_` themselves (DB DELFI).
+    assert _feed_id_from_motis_id("db_DE::ScheduledStopPoint:8700014_DBDB") == "db"
+    assert _feed_id_from_motis_id("eu_corridors_FR::Quay:12_3") == "eu_corridors"
+    assert _feed_id_from_motis_id("DE::ScheduledStopPoint:1_2") is None
     # No underscore → no feed id, return None rather than guess.
     assert _feed_id_from_motis_id("standalone-id") is None
     # Empty / None.
@@ -458,3 +462,15 @@ async def test_fetch_plan_propagates_http_errors(monkeypatch):
     except httpx.HTTPStatusError:
         return
     raise AssertionError("expected httpx.HTTPStatusError for a 500 response")
+
+
+def test_operator_names_lose_the_numeric_code_prefix():
+    from app.journey.trip_normalize import clean_operator_name
+
+    assert clean_operator_name("80___ DB Fernverkehr AG") == "DB Fernverkehr AG"
+    assert clean_operator_name("3018___ EUROSTAR") == "EUROSTAR"
+    assert clean_operator_name("SNCF") == "SNCF"
+    assert clean_operator_name("1. FC Bus") == "1. FC Bus"
+    assert clean_operator_name("80___") == "80___"
+    assert clean_operator_name(None) is None
+    assert clean_operator_name("  ") is None

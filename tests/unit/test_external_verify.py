@@ -787,3 +787,24 @@ def test_to_oebb_local_is_idempotent_for_an_already_vienna_datetime() -> None:
     once = external_verify._to_oebb_local(vienna)
     twice = external_verify._to_oebb_local(once)
     assert once == twice == vienna
+
+
+@pytest.mark.asyncio
+async def test_a_hafas_timeout_names_its_type() -> None:
+    """httpx timeouts stringify to "" — the journey page showed a bare
+    "unavailable — http:". The error now names the exception type."""
+
+    def _timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_timeout)) as client:
+        result = await external_verify.verify_via_oebb_hafas(
+            from_lat=0.0,
+            from_lon=0.0,
+            to_lat=0.0,
+            to_lon=0.0,
+            depart_at=datetime(2026, 6, 28, 8, 0, 0),
+            client=client,
+        )
+    assert result.ok is False
+    assert result.error == "http: ReadTimeout"
