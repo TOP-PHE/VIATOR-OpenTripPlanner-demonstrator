@@ -906,6 +906,24 @@ Three things to watch as you onboard more sessions:
 | `viator_graphs-<sid>` count | Each `serving` session keeps `current` + 2 historical graphs | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
 | Free RAM during a build | OTP build needs `OTP_BUILD_HEAP + ~4 GB` headroom | If a build OOMs, raise `OTP_BUILD_MEM_LIMIT` (≥ heap + 4) OR upgrade VPS RAM. France-wide builds need 32 GB minimum. |
 
+**Admin → Storage** (`/admin/storage`) shows the data disk's use, a warning from 85 % full, the
+space each session takes (graphs, feeds and OSM), and a list of what can be deleted:
+
+| Kind | What it is | Safe to delete? |
+|---|---|---|
+| Incomplete build | A build or MOTIS import that failed or was interrupted | Yes, never usable |
+| Previous build | An earlier complete build, not the one served | Yes; you lose that rollback point |
+| Rollback copy | `*.zip.old`, `osm.pbf.old.N`, the previous version of a feed or OSM file | Yes; recreated at the next refresh |
+| Orphaned feed | `*.orphaned`, the file of a provider removed from its session | Yes |
+| Staging leftover | A `_staging/` file older than a day, from an interrupted refresh | Yes |
+| Deleted session | Folders of a session that no longer exists | Yes |
+
+The build a session serves (`current`), live feeds and OSM files, and everything of a session whose
+rebuild is running are never listed. Deletion re-checks each item first and is recorded in the audit
+log (`storage.cleanup`). Docker images are not covered: on the host, `docker image prune` or remove
+old `viator-web` / `viator-otp` tags. Since PR #283 a failed build deletes its own folder; before it,
+failed Europe imports filled the disk on 2026-10-01 and took the site down.
+
 ---
 
 ## 6. Troubleshooting

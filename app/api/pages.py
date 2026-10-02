@@ -190,6 +190,16 @@ def admin_reports_page(request: Request) -> Response:
     return templates.TemplateResponse(request, "admin/reports.html", {"current_user": user})
 
 
+@router.get("/admin/storage", response_class=HTMLResponse)
+def admin_storage_page(request: Request) -> Response:
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login("/admin/storage")
+    if user.role != "platform_admin":
+        return _forbidden_html(request, "Platform admin access required.")
+    return templates.TemplateResponse(request, "admin/storage.html", {"current_user": user})
+
+
 @router.get("/admin/network-coverage", response_class=HTMLResponse)
 def admin_network_coverage_page(
     request: Request,
