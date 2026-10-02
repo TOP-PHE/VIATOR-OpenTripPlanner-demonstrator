@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -434,3 +435,18 @@ async def test_transport_error_message_is_scrubbed(staging: Path) -> None:
         await _fetch(handler, staging)
     assert "secret" not in str(exc.value)
     assert "https://nap.example/feed" in str(exc.value)
+
+
+def test_state_path_never_leaves_the_state_dir(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key regex already drops path separators; the containment check is
+    the second line, so loosen the regex and try to climb out."""
+    state_dir = staging / "_fetch_state"
+    assert feed_fetch.state_path(state_dir, "../../etc/passwd").parent == state_dir.resolve()
+    monkeypatch.setattr(feed_fetch, "_STATE_KEY_RE", re.compile(r"[^A-Za-z0-9_./-]+"))
+    with pytest.raises(ValueError, match="escapes"):
+        feed_fetch.state_path(state_dir, "../../etc/passwd")
+    assert feed_fetch.load_state(state_dir, "../../etc/passwd") == {}
+    feed_fetch.save_state(state_dir, "../../escaped", {"etag": "x"})
+    assert not (staging / "escaped.json").exists()
