@@ -43,6 +43,9 @@ const SECTIONS = [
   // dev-dashboard.opentransportdata.swiss into OJP_API_TOKEN. The feature
   // stays off until OJP_COMPARISON_ENABLED is ticked AND a token is set.
   { title: 'Swiss OJP comparison', keys: ['OJP_COMPARISON_ENABLED','OJP_API_ENDPOINT','OJP_API_TOKEN','OJP_TIMEOUT_MS'] },
+  // ÖBB HAFAS reference comparison (public endpoint, no token).
+  // HAFAS_TIMEOUT_MS is per request; the paginated search may take twice it.
+  { title: 'ÖBB HAFAS comparison', keys: ['HAFAS_COMPARISON_ENABLED','HAFAS_TIMEOUT_MS'] },
   // Network coverage matrix — knobs for the background coverage runner
   // (app/network_coverage/runner.py). Order matches CONFIG_SCHEMA's
   // grouping (query depth → cross-pair parallelism → K-slot slicing →
@@ -66,7 +69,7 @@ const SECTIONS = [
 ];
 
 const SECRETS = new Set(['SMTP_PASS','OJP_API_TOKEN']);
-const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN','OJP_COMPARISON_ENABLED']);
+const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_OPEN','OJP_COMPARISON_ENABLED','HAFAS_COMPARISON_ENABLED']);
 const CHOICES = {
   SMTP_SECURE: ['none','starttls','tls'],
   REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'],
