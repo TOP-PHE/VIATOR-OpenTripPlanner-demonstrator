@@ -1112,8 +1112,10 @@ orphaned OTP services, warns about non-compose containers running the VIATOR OTP
 so the next tick retries.
 
 **Max-memory rebuild.** A per-job checkbox (`rebuild_jobs.max_memory`) for the worst-case
-all-Europe build on one VPS: stop the serving session containers plus the observability stack,
-auto-size the heap to host RAM (`auto_build_heap`, reserving 8 GB), build, then restart
+all-Europe build on one VPS: stop the autoheal watchdog (first, so it cannot restart an
+unhealthy session container mid-stop), the serving session containers and the observability
+stack, then check with `compose ps` that they are down, retry once, and log an error naming any
+that are still running. Then auto-size the heap to host RAM (`auto_build_heap`, reserving 8 GB), build, then restart
 everything in a `finally`. `/data/generated/.max-mem-stopped` records what was stopped so a
 worker killed mid-build revives it at next boot.
 
