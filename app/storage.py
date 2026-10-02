@@ -22,6 +22,7 @@ moved) is skipped rather than deleted.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -29,6 +30,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .logging_config import one_line
+
+log = logging.getLogger(__name__)
 
 # Builds are written to `<YYYYMMDD-HHMMSS>` folders (worker.run_build / run_build_motis).
 _BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
@@ -334,7 +339,10 @@ def delete(
             else:
                 path.unlink()
         except (OSError, ValueError) as exc:
-            skipped.append({"id": cid, "reason": f"could not delete: {exc}"})
+            # The error text names paths and OS details: keep it in the server log,
+            # never in the response (CodeQL py/stack-trace-exposure).
+            log.warning("storage clean-up could not delete %s: %s", one_line(cid), one_line(exc))
+            skipped.append({"id": cid, "reason": "could not delete (see the web server log)"})
             continue
         deleted.append({"id": cid, "category": cand.category, "size_bytes": cand.size_bytes})
     return deleted, skipped

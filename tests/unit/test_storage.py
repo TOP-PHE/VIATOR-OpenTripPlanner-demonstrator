@@ -240,3 +240,23 @@ def test_api_delete_with_nothing_valid_writes_no_audit(
     assert out["deleted"] == []
     assert recorded == []
     assert not db.committed
+
+
+def test_a_failed_delete_does_not_leak_the_error(
+    volumes: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox, graphs = volumes
+    report = storage.scan(inbox, graphs, {"eu19", "nap-fr-rail"}, set(), now=NOW)
+
+    def _boom(_path: object) -> None:
+        raise PermissionError("[Errno 13] Permission denied: '/data/graphs/secret'")
+
+    monkeypatch.setattr(storage.shutil, "rmtree", _boom)
+    deleted, skipped = storage.delete(["graphs/motis/eu19/20261001-172636"], report, inbox, graphs)
+    assert deleted == []
+    assert skipped == [
+        {
+            "id": "graphs/motis/eu19/20261001-172636",
+            "reason": "could not delete (see the web server log)",
+        }
+    ]
