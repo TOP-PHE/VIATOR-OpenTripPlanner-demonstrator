@@ -405,6 +405,9 @@ def test_credentials_page_offers_the_login_scheme_and_nap_presets() -> None:
     assert "/test-login" in html
     for field in ("token_url", "client_id", "username", "password"):
         assert f'data-login-field="{field}"' in html
+    # The browser must not demand a client id: b2b.nap.si (SI) has none.
+    assert 'data-login-field="client_id" data-optional' in html
+    assert "!('optional' in i.dataset)" in html
 
 
 def test_session_provider_card_keeps_and_edits_credential_ids() -> None:
