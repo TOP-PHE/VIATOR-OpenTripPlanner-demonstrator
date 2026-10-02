@@ -12,6 +12,8 @@ Runs inside the web container, which has the app code and the database:
     docker compose -p viator exec -T web python - --session eu19-transit-motis < scripts/session_providers.py
     docker compose -p viator exec -T web python - --session eu19-transit-motis --remove A,B < scripts/session_providers.py
     docker compose -p viator exec -T web python - --session eu19-transit-motis --remove A,B --apply < scripts/session_providers.py
+    docker compose -p viator exec -T web python - --session eu19-transit-motis --add all < scripts/session_providers.py
+    docker compose -p viator exec -T web python - --session eu19-transit-motis --add CP,VR --apply < scripts/session_providers.py
 
 `--remove` is a dry run unless `--apply` is given. Saving validates the new
 config (normalize_providers), sets the staleness flag and writes a
@@ -19,6 +21,13 @@ config (normalize_providers), sets the staleness flag and writes a
 provider in full, so it can be put back by hand. The removed providers' files
 stay in the inbox until the next "Refresh providers", which renames them to
 `<id>.zip.orphaned` (never deletes) so the build stops loading them.
+
+`--add` takes providers from app/data/europe_extension_providers.json
+(`all`, or comma-separated ids) and is a dry run unless `--apply` is given.
+Each line shows the entry's provenance - NAP, official (no NAP listing
+confirmed) or COMMUNITY - which the labels also carry. Countries with no
+master_stations rows are refused, as on the admin page: import them from
+Trainline first. Saving writes a `session.providers.added` audit row.
 """
 
 from __future__ import annotations
@@ -30,9 +39,11 @@ from collections import defaultdict
 from typing import Any
 
 import httpx
+from sqlalchemy import func, select
 
-from app import audit, ingestion, staleness
+from app import audit, ingestion, provider_catalogue, staleness
 from app.db import SessionLocal
+from app.models import MasterStation
 from app.models import Session as SessionRow
 
 TDG_API = "https://transport.data.gouv.fr/api/datasets"
@@ -123,11 +134,74 @@ def remove(db, s, ids: set[str], apply: bool) -> int:
     return 0
 
 
+def _countries_without_stations(db, countries: set[str]) -> set[str]:
+    rows = db.execute(
+        select(MasterStation.country_iso, func.count())
+        .where(MasterStation.country_iso.in_(countries))
+        .group_by(MasterStation.country_iso)
+    ).all()
+    return countries - {ci for ci, n in rows if n > 0}
+
+
+def add(db, s, wanted: set[str] | None, apply: bool) -> int:
+    config = s.config or {}
+    providers = (config.get("sources") or {}).get("providers") or []
+    existing = {p.get("id") for p in providers if isinstance(p, dict)}
+    to_add, present, unknown = provider_catalogue.plan_add(
+        provider_catalogue.load(), existing, wanted
+    )
+    if unknown:
+        print(f"not in the catalogue: {', '.join(unknown)} - nothing written", file=sys.stderr)
+        return 1
+    for pid in present:
+        print(f"  SKIP   {pid:20} already in {s.id}")
+    for e in to_add:
+        print(
+            f"  ADD    {e['country_iso']:2} {e['id']:15} {e['provenance'].upper():9} | {e['label']}"
+        )
+    if not to_add:
+        print("Nothing to add.")
+        return 0
+    missing = _countries_without_stations(db, {e["country_iso"] for e in to_add})
+    if missing:
+        print(
+            f"no master_stations rows for {', '.join(sorted(missing))} - import them from "
+            "Trainline first (Admin > Master stations), then re-run. Nothing written.",
+            file=sys.stderr,
+        )
+        return 1
+    if not apply:
+        print("Dry run - nothing written. Re-run with --apply to save.")
+        return 0
+    new_config = json.loads(json.dumps(config))
+    sources = new_config.setdefault("sources", {})
+    sources["providers"] = list(sources.get("providers") or []) + [
+        provider_catalogue.session_provider(e) for e in to_add
+    ]
+    sources["providers"] = ingestion.normalize_providers(new_config)
+    if not staleness.sources_subtree_equal(s.config, new_config):
+        staleness.mark_sources_changed(new_config)
+    s.config = new_config
+    audit.record(
+        db,
+        action="session.providers.added",
+        target_kind="session",
+        target_id=s.id,
+        metadata={"added": to_add, "via": "scripts/session_providers.py"},
+    )
+    db.commit()
+    print(f"saved: {len(to_add)} provider(s) added. Click 'Refresh providers' to download them.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--session", required=True)
     ap.add_argument("--remove", help="comma-separated provider ids to remove")
-    ap.add_argument("--apply", action="store_true", help="save the removal (default: dry run)")
+    ap.add_argument(
+        "--add", help="'all' or comma-separated ids from app/data/europe_extension_providers.json"
+    )
+    ap.add_argument("--apply", action="store_true", help="save the change (default: dry run)")
     args = ap.parse_args()
 
     db = SessionLocal()
@@ -136,6 +210,13 @@ def main() -> int:
         if s is None:
             print(f"session {args.session} not found", file=sys.stderr)
             return 1
+        if args.add:
+            wanted = (
+                None
+                if args.add.strip().lower() == "all"
+                else {i.strip() for i in args.add.split(",") if i.strip()}
+            )
+            return add(db, s, wanted, args.apply)
         if args.remove:
             return remove(
                 db, s, {i.strip() for i in args.remove.split(",") if i.strip()}, args.apply
