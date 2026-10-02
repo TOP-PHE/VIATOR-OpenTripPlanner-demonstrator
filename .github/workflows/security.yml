@@ -33,7 +33,9 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
           category: 'trivy-fs'
-
+      - name: Préparer le dossier de rapports
+        if: always()
+        run: mkdir -p reports
       - name: Trivy - JSON
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
