@@ -940,6 +940,7 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
         otp_heap_value,
         mem_limit_value,
     )
+    succeeded = False
     try:
         proc = subprocess.run(  # noqa: S603
             cmd,
@@ -988,8 +989,11 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
 
         _prune_old_graphs(sid, keep=3)
 
+        succeeded = True
         return output, True, str(graph_target)
     finally:
+        if not succeeded:
+            _discard_failed_build(graph_target)
         # Always revive what a max-memory rebuild stopped — even on build
         # failure or an exception promoting the graph. The serving containers
         # re-read their `current` symlink, so a rebuilt session comes back on
@@ -1140,6 +1144,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             log.warning("max-memory marker write failed (%s) — crash recovery off", exc)
         _stop_services(stopped_services)
 
+    succeeded = False
     try:
         # The MOTIS container is spawned via the *host's* docker daemon (the
         # worker has /var/run/docker.sock mounted). Bind-mounting the worker's
@@ -1307,11 +1312,34 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
 
         _prune_old_motis_imports(sid, keep=3)
 
+        succeeded = True
         return output, True, str(staging)
     finally:
+        if not succeeded:
+            _discard_failed_build(staging)
         if max_memory and stopped_services:
             _start_services(stopped_services)
             _MAXMEM_MARKER.unlink(missing_ok=True)
+
+
+def _discard_failed_build(build_dir: Path) -> None:
+    """Delete the folder a failed build wrote into.
+
+    Success prunes old builds (`keep=3`), but nothing ever removed a *failed*
+    build's folder, and a failed Europe-wide MOTIS import leaves tens of GB of
+    partial street and timetable data behind. On 2026-10-01 about fifteen of
+    them filled the 678 GB disk and took the site down (web, postgres). The
+    build log is kept in `rebuild_jobs.log`; the partial data is of no use.
+    Never removes the folder `current` points to.
+    """
+    current = build_dir.parent / "current"
+    try:
+        if current.is_symlink() and current.resolve() == build_dir.resolve():
+            return
+    except OSError:
+        return
+    shutil.rmtree(build_dir, ignore_errors=True)
+    log.info("removed failed build folder %s", build_dir)
 
 
 def _prune_old_motis_imports(sid: str, keep: int) -> None:

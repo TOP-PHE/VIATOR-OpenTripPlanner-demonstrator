@@ -474,3 +474,70 @@ def test_run_build_motis_surfaces_subprocess_failure_in_log(
     assert path == ""
     assert "schema mismatch" in log
     assert call_count["n"] == 2  # config (ok) + import (fail)
+
+
+def _failing_import_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
+    inbox = tmp_path / "inbox"
+    graphs = tmp_path / "graphs"
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    monkeypatch.setattr(settings, "graph_dir", graphs)
+    sid = "eu19-transit-motis"
+    (inbox / sid / "osm").mkdir(parents=True)
+    (inbox / sid / "osm" / "osm.pbf").write_bytes(b"dummy")
+    (inbox / sid / "gtfs").mkdir(parents=True)
+    (inbox / sid / "gtfs" / "sncf.zip").write_bytes(b"dummy")
+
+    class _Proc:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def _fake_run(cmd, **_kwargs):
+        for i, arg in enumerate(cmd):
+            if arg == "-w" and i + 1 < len(cmd):
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                staging = graphs / rel
+                if "config" in cmd:
+                    staging.joinpath("config.yml").write_text("osm: x\n")
+                    return _Proc(0)
+                # The import writes partial data, then dies (OOM, disk full).
+                staging.joinpath("osr.bin").write_bytes(b"x" * 1024)
+                return _Proc(137)
+        return _Proc(0)
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    return graphs / "motis" / sid, sid
+
+
+def test_failed_import_removes_its_build_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """2026-10-01: failed Europe imports were never cleaned up and filled the
+    disk. A failed build must leave no folder behind."""
+    root, sid = _failing_import_setup(tmp_path, monkeypatch)
+    _, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok is False
+    assert not [p for p in root.iterdir() if p.name != "current"]
+
+
+def test_failed_import_keeps_the_live_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root, sid = _failing_import_setup(tmp_path, monkeypatch)
+    live = root / "20260629-213457"
+    live.mkdir(parents=True)
+    (live / "tt.bin").write_bytes(b"live")
+    (root / "current").symlink_to(live.name, target_is_directory=True)
+
+    _, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok is False
+    assert sorted(p.name for p in root.iterdir()) == ["20260629-213457", "current"]
+    assert (root / "current" / "tt.bin").read_bytes() == b"live"
+
+
+def test_discard_never_removes_the_current_build(tmp_path: Path):
+    live = tmp_path / "20260629-213457"
+    live.mkdir()
+    (tmp_path / "current").symlink_to(live.name, target_is_directory=True)
+    worker._discard_failed_build(live)
+    assert live.is_dir()
