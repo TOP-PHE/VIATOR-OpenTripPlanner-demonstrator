@@ -83,6 +83,15 @@
       "timetable": {"format": "gtfs", "source": "url", "url": "https://motionbuscard.org.cy/opendata/downloadfile?file=GTFS%5C5_google_transit.zip&rel=True"}
     },
     {
+      "id": "SI-NAP",
+      "label": "Slovenia national timetable (SZ rail + buses)",
+      "country_iso": "SI",
+      "provenance": "nap",
+      "nap_reference": "https://www.nap.si (B2B dataset b2b.netex, access granted 2026-10-02 until 2027-10-02)",
+      "probe": "not probed: needs the SI NAP login - set the provider's timetable credential to 'SI NAP login' (Credentials > preset Slovenia) before refreshing",
+      "timetable": {"format": "netex_epip", "source": "url", "url": "https://b2b.nap.si/data/b2b.netex"}
+    },
+    {
       "id": "BEOGRAD",
       "label": "Belgrade city + suburban transit [official, no NAP]",
       "country_iso": "RS",

@@ -31,6 +31,7 @@ run; `--apply` saves), then **Refresh providers**.
 | HR | HZPP | official | GTFS, 138 rail routes |
 | IT | ITALO | nap | gzip NeTEx — stops listed out of order upstream, check the build |
 | CY | CY-INTERCITY | nap | GTFS, 60 bus routes (no rail in CY) |
+| SI | SI-NAP | nap | national NeTEx `b2b.nap.si/data/b2b.netex`; needs the 'SI NAP login' credential (B2B access granted 2026-10-02 → 2027-10-02) |
 | RS | BEOGRAD | official | GTFS city + suburban, 241 routes |
 | AL | TIRANA | official | not probed (city transit; HSH rail publishes nothing) |
 | RS | SRBIJAVOZ | community | not probed; incl. Belgrade–Bar, Subotica–Szeged |
@@ -43,7 +44,6 @@ run; `--apply` saves), then **Refresh providers**.
 | Country | Why | Next step |
 |---|---|---|
 | SK | `zsr.sk/.../gtfs/gtfs.zip` returned an HTML page from the VPS | find the current ŽSR GTFS link (CC0, covers ZSSK, RegioJet, Leo Express) |
-| SI | nap.si serves national rail+bus GTFS / NeTEx EPIP only after registration + OAuth2 | operator registers; then an OAuth2 resolver |
 | RO | CFR + 6 private operators published as custom XML on data.gov.ro | XML → GTFS conversion step; confirm NAP listing (pna.cestrin.ro) |
 | BG | BGNAP API is open; the BDZ entry may be metadata only | check the BDZ subsets; Sofia GTFS is available |
 | CY, LV, GR, RO | NAPs / portals are CKAN | a `ckan` resolver would read the current file from the NAP catalogue itself |
