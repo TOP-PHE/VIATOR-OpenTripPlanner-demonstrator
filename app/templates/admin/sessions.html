@@ -1803,7 +1803,8 @@ async function waitForRefreshOutcome(sid, form, marks) {
 function attemptSummary(statuses, pids) {
   return pids.map(pid => {
     const a = statuses[pid].last_attempt;
-    return `${pid}: ${a.status}${a.reason ? ` (${a.reason})` : ''}`;
+    const why = a.reason ? ' (' + a.reason + ')' : '';
+    return `${pid}: ${a.status}${why}`;
   }).join(' | ');
 }
 
