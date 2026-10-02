@@ -86,6 +86,12 @@ def test_bad_login_secrets_are_refused_without_echoing_values(secret: str, messa
     assert LOGIN["password"] not in str(exc.value)
 
 
+def test_a_login_without_client_id_is_accepted() -> None:
+    """b2b.nap.si (SI) takes a plain password grant with no client id."""
+    login = {k: v for k, v in LOGIN.items() if k != "client_id"}
+    assert json.loads(crypto.validate_secret("oauth2_password", json.dumps(login))) == login
+
+
 def test_static_secrets_are_stored_as_typed() -> None:
     assert crypto.validate_secret("header", " key ") == " key "
 
@@ -124,6 +130,16 @@ async def test_password_grant_posts_the_login_and_returns_the_token() -> None:
         "password": " s3cret pass ",
         "scope": "openid",
     }
+
+
+async def test_password_grant_without_client_id_sends_none() -> None:
+    calls: list[httpx.Request] = []
+    login = {k: v for k, v in LOGIN.items() if k != "client_id"}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_token_portal(calls))) as c:
+        await crypto.fetch_oauth2_token(c, login)
+    form = dict(httpx.QueryParams(calls[0].content.decode()))
+    assert "client_id" not in form
+    assert form["grant_type"] == "password"
 
 
 async def test_refused_login_reports_the_oauth_error_but_never_the_password() -> None:
@@ -385,6 +401,7 @@ def test_credentials_page_offers_the_login_scheme_and_nap_presets() -> None:
     assert '<option value="oauth2_password">' in html
     assert "client_id: 'dbp-public-ui'" in html
     assert "param_name: 'ApiKey'" in html
+    assert "'https://b2b.nap.si/uc/user/token'" in html
     assert "/test-login" in html
     for field in ("token_url", "client_id", "username", "password"):
         assert f'data-login-field="{field}"' in html

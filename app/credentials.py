@@ -20,11 +20,12 @@ Three concerns in one module to keep them auditable together:
      `none` just returns the inputs unchanged.
 
   4. **Login exchange.** `oauth2_password` stores a login, not a token:
-     `{token_url, client_id, username, password[, scope]}` as JSON. Each
+     `{token_url, username, password[, client_id][, scope]}` as JSON. Each
      use posts an OAuth2 password grant to `token_url` and sends the
      returned access token as a Bearer header (`authorize(...)`). This is
      the flow the Austrian NAP (data.mobilitaetsverbuende.at, Keycloak)
-     documents for scripted downloads. Tokens are cached in-process until
+     documents for scripted downloads, and the Slovenian NAP's B2B service
+     (b2b.nap.si, no client id). Tokens are cached in-process until
      shortly before they expire.
 
 Why the crypto lives next to the http-injection helper: the failure modes
@@ -210,8 +211,9 @@ def validate_param_name(auth_type: AuthType, raw: str | None) -> str | None:
     return name
 
 
-_OAUTH2_REQUIRED: Final[tuple[str, ...]] = ("token_url", "client_id", "username", "password")
-_OAUTH2_OPTIONAL: Final[tuple[str, ...]] = ("scope",)
+_OAUTH2_REQUIRED: Final[tuple[str, ...]] = ("token_url", "username", "password")
+# client_id: Keycloak portals (AT) need one; b2b.nap.si (SI) has none.
+_OAUTH2_OPTIONAL: Final[tuple[str, ...]] = ("client_id", "scope")
 
 
 def parse_oauth2_password_secret(plaintext: str) -> dict[str, str]:
@@ -403,12 +405,12 @@ async def fetch_oauth2_token(client: httpx.AsyncClient, login: dict[str, str]) -
         raise CredentialLoginError(f"token URL refused: {exc}") from exc
     form = {
         "grant_type": "password",
-        "client_id": login["client_id"],
         "username": login["username"],
         "password": login["password"],
     }
-    if login.get("scope"):
-        form["scope"] = login["scope"]
+    for optional in _OAUTH2_OPTIONAL:
+        if login.get(optional):
+            form[optional] = login[optional]
     try:
         # No redirects: a token endpoint that redirects is misconfigured,
         # and following it would re-post the password to another URL.
