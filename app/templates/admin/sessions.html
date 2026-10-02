@@ -1764,6 +1764,68 @@ async function loadProviderStatuses(sid, formEl) {
       }
     }
   });
+  return statuses;
+}
+
+// A slow source (nap.si serves ~120 KB/s) can outlast nginx's 600 s proxy
+// timeout. The browser then gets a 502/504 while the server keeps
+// downloading, and the pills would stay stale until a page reload. Treat a
+// gateway error as "still running": poll the status until every watched
+// provider records an attempt newer than the click.
+const _GATEWAY_STATUSES = new Set([502, 503, 504]);
+const _REFRESH_POLL_MS = 20000;
+const _REFRESH_POLL_MAX_MS = 30 * 60 * 1000;
+
+// Attempt times as the page last saw them, taken at click time. Compared
+// with the server's own timestamps only — never with the browser clock.
+function attemptMarks(sid, pids) {
+  const known = _feedStatusCache.get(sid) || {};
+  return Object.fromEntries(pids.map(pid => [pid, known[pid]?.last_attempt?.at || null]));
+}
+
+function _attemptsDone(statuses, marks) {
+  return Object.entries(marks).every(([pid, before]) => {
+    const at = statuses?.[pid]?.last_attempt?.at;
+    return Boolean(at) && at !== before;
+  });
+}
+
+async function waitForRefreshOutcome(sid, form, marks) {
+  const deadline = Date.now() + _REFRESH_POLL_MAX_MS;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, _REFRESH_POLL_MS));
+    const statuses = await loadProviderStatuses(sid, form);
+    if (_attemptsDone(statuses, marks)) return statuses;
+  }
+  return null;
+}
+
+function attemptSummary(statuses, pids) {
+  return pids.map(pid => {
+    const a = statuses[pid].last_attempt;
+    return `${pid}: ${a.status}${a.reason ? ` (${a.reason})` : ''}`;
+  }).join(' | ');
+}
+
+// Shared tail of both Refresh buttons for a response that is not OK. A
+// gateway error waits for the server-side outcome; anything else is a real
+// failure. The pills are re-read either way — a failed attempt is a state.
+async function handleRefreshFailure(r, body, sid, form, marks) {
+  if (!_GATEWAY_STATUSES.has(r.status)) {
+    showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
+    loadProviderStatuses(sid, form);
+    return;
+  }
+  showToast('warning', 'Slow download — still running on the server. The status updates by itself when it ends.');
+  const pids = Object.keys(marks);
+  const statuses = await waitForRefreshOutcome(sid, form, marks);
+  if (!statuses) {
+    showToast('error', 'No result after 30 min — check the Feed status panel or the web log.');
+    return;
+  }
+  const failed = pids.some(pid => statuses[pid].last_attempt.status === 'skipped');
+  showToast(failed ? 'error' : 'success', attemptSummary(statuses, pids));
+  if (!failed) markRefreshCompletedLocally(sid);
 }
 
 // v0.1.37 — extracted from the config-form click delegation so that
@@ -1805,11 +1867,12 @@ async function refreshOneProvider(form, refreshBtn) {
   refreshBtn.disabled = true;
   const original = refreshBtn.textContent;
   refreshBtn.textContent = 'Downloading…';
+  const marks = attemptMarks(sid, [pid]);
   try {
     const r = await fetch(`/api/sessions/${sid}/providers/${encodeURIComponent(pid)}/refresh`, {method: 'POST'});
     const body = await r.json().catch(() => ({}));
     if (!r.ok) {
-      showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
+      await handleRefreshFailure(r, body, sid, form, marks);
       return;
     }
     showToast('success', `${pid}: ${refreshSummary(body, false)}`);
@@ -2122,10 +2185,13 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
     const form = btn.closest('form[data-form="config"]');
     const sid = form.dataset.sid;
     btn.disabled = true; const original = btn.textContent; btn.textContent = 'Downloading…';
+    const known = _feedStatusCache.get(sid) || {};
+    const downloaded = Object.keys(known).filter(pid => ['url', 'nap'].includes(known[pid].source));
+    const marks = attemptMarks(sid, downloaded);
     try {
       const r = await fetch(`/api/sessions/${sid}/sources/refresh`, {method:'POST'});
       const body = await r.json().catch(() => ({}));
-      if (!r.ok) { showToast('error', body.detail || `Failed (${r.status})`); return; }
+      if (!r.ok) { await handleRefreshFailure(r, body, sid, form, marks); return; }
       showToast('success', refreshSummary(body, true));
       if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
       // v0.1.19: re-stamp every provider's status pill so the freshly-pulled
