@@ -43,7 +43,7 @@
     <tr data-sid="{{ s.id }}" data-state="{{ s.state }}" data-config='{{ (s.config or {}) | tojson }}'>
       <td><button type="button" class="secondary" data-action="expand" aria-expanded="false">▸</button></td>
       <td><code>{{ s.id }}</code></td>
-      <td>{{ s.name }}</td>
+      <td data-role="session-name">{{ s.name }}</td>
       <td>{{ s.category }}</td>
       <td><span class="engine-badge engine-{{ s.engine or 'otp' }}">{{ (s.engine or 'otp') | upper }}</span></td>
       <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span></td>
@@ -52,6 +52,7 @@
       </td>
       <td style="font-size: 0.85rem; color: var(--rail-steel)">{{ s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '—' }}</td>
       <td style="white-space: nowrap">
+        <button type="button" class="secondary" data-action="rename" title="Change the display name (the id stays)">Rename</button>
         <button type="button" class="secondary" data-action="archive" {% if s.state == 'archived' %}disabled{% endif %}>Archive</button>
         <button type="button" class="danger" data-action="delete" title="Permanently delete (irreversible)">Delete</button>
       </td>
@@ -669,6 +670,21 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
     const r = await fetch(`/api/sessions/${sid}`, {method:'PATCH', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({include_in_fanout: e.target.checked})});
     showToast(r.ok ? 'success' : 'error', r.ok ? `Fanout updated for ${sid}` : `Failed (${r.status})`);
+  });
+  // Display name only: the id names the containers, folders and routes.
+  row.querySelector('button[data-action="rename"]')?.addEventListener('click', async () => {
+    const cell = row.querySelector('[data-role="session-name"]');
+    const name = window.prompt(`New display name for ${sid} (the id stays):`, cell.textContent.trim());
+    if (name === null || !name.trim() || name.trim() === cell.textContent.trim()) return;
+    const r = await fetch(`/api/sessions/${sid}`, {method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: name.trim()})});
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      showToast('error', typeof j.detail === 'string' ? j.detail : `Rename failed (${r.status})`);
+      return;
+    }
+    cell.textContent = (await r.json()).name;
+    showToast('success', `Renamed ${sid}`);
   });
   row.querySelector('button[data-action="archive"]')?.addEventListener('click', async () => {
     if (!confirm(`Archive session ${sid}? Its inbox and graphs are preserved but it stops serving.`)) return;
