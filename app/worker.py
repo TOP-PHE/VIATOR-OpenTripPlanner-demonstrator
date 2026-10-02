@@ -79,6 +79,13 @@ _OBSERVABILITY_SERVICES: tuple[str, ...] = (
     "tempo",
 )
 
+# The autoheal watchdog is stopped first and restarted with the rest. A session
+# container that is unhealthy when the stop begins (MOTIS mid-crash-loop, OTP
+# out of memory) is still in autoheal's "unhealthy" list when compose stops it,
+# and autoheal's restart call then starts it again. That is the likeliest
+# reason the 2026-10-01 max-memory build ran with every session still up.
+_WATCHDOG_SERVICES: tuple[str, ...] = ("autoheal",)
+
 # Records the services stopped for an in-flight max-memory rebuild so a worker
 # that dies mid-build can restart them on next boot (the normal restart runs in
 # run_build's `finally`; this is the crash-safety net).
@@ -86,13 +93,14 @@ _MAXMEM_MARKER = Path("/data/generated/.max-mem-stopped")
 
 
 def _max_memory_stop_targets(serving_services: list[str]) -> list[str]:
-    """Compose service names to stop for a max-memory rebuild: every serving
-    session's per-engine service plus the observability stack. Caller passes
+    """Compose service names to stop for a max-memory rebuild: the autoheal
+    watchdog (first, so it cannot restart what follows), every serving
+    session's per-engine service, and the observability stack. Caller passes
     in the already-resolved service names (via `_serving_session_services`),
     so MOTIS sessions resolve as `motis-<sid>` and OTP as `otp-<sid>` —
     pre-Phase-1 this helper hard-coded the `otp-` prefix.
     Pure — unit-tested."""
-    return list(serving_services) + list(_OBSERVABILITY_SERVICES)
+    return [*_WATCHDOG_SERVICES, *serving_services, *_OBSERVABILITY_SERVICES]
 
 
 def _compose(*args: str) -> subprocess.CompletedProcess[str]:
@@ -123,6 +131,38 @@ def _stop_services(services: list[str]) -> None:
     r = _compose("stop", *services)
     if r.returncode != 0:
         log.warning("max-memory stop exit=%s: %s", r.returncode, r.stderr.strip())
+    # `compose stop` exiting 0 does not prove the containers stayed down (see
+    # _WATCHDOG_SERVICES). Check, retry once, and say so loudly if it failed:
+    # a max-memory build running next to the serving engines is the silent
+    # failure this guards against.
+    still_up = _running_services(services)
+    if not still_up:
+        return
+    log.warning(
+        "max-memory rebuild: %d containers still running after stop, retrying: %s",
+        len(still_up),
+        _log_safe(still_up),
+    )
+    _compose("stop", *still_up)
+    still_up = _running_services(still_up)
+    if still_up:
+        log.error(
+            "max-memory rebuild: %d containers could not be stopped; the build "
+            "runs without their memory: %s",
+            len(still_up),
+            _log_safe(still_up),
+        )
+
+
+def _running_services(services: list[str]) -> list[str]:
+    """Which of `services` have a running container, in the given order.
+    Empty when compose cannot be asked: the check is best-effort."""
+    r = _compose("ps", "--status", "running", "--services", *services)
+    if r.returncode != 0:
+        log.warning("max-memory: could not list running services (exit=%s)", r.returncode)
+        return []
+    running = set(r.stdout.split())
+    return [s for s in services if s in running]
 
 
 def _start_services(services: list[str]) -> None:
