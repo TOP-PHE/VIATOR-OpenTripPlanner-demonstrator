@@ -135,7 +135,7 @@ def _stop_services(services: list[str]) -> None:
     # _WATCHDOG_SERVICES). Check, retry once, and say so loudly if it failed:
     # a max-memory build running next to the serving engines is the silent
     # failure this guards against.
-    still_up = _running_services(services)
+    still_up = _running_services(services) or []
     if not still_up:
         return
     log.warning(
@@ -144,7 +144,7 @@ def _stop_services(services: list[str]) -> None:
         _log_safe(still_up),
     )
     _compose("stop", *still_up)
-    still_up = _running_services(still_up)
+    still_up = _running_services(still_up) or []
     if still_up:
         log.error(
             "max-memory rebuild: %d containers could not be stopped; the build "
@@ -154,31 +154,69 @@ def _stop_services(services: list[str]) -> None:
         )
 
 
-def _running_services(services: list[str]) -> list[str]:
+def _running_services(services: list[str]) -> list[str] | None:
     """Which of `services` have a running container, in the given order.
-    Empty when compose cannot be asked: the check is best-effort."""
+    None when compose cannot be asked: the check is best-effort."""
     r = _compose("ps", "--status", "running", "--services", *services)
     if r.returncode != 0:
         log.warning("max-memory: could not list running services (exit=%s)", r.returncode)
-        return []
+        return None
     running = set(r.stdout.split())
     return [s for s in services if s in running]
 
 
+def _not_running(services: list[str]) -> list[str]:
+    """`services` without a running container. Empty when compose cannot be
+    asked, so a failed check never triggers a restart on a guess."""
+    running = _running_services(services)
+    if running is None:
+        return []
+    return [s for s in services if s not in running]
+
+
+# Per-session serve services (`otp-<sid>`, `motis-<sid>`, see _service_name_for)
+# mount only named volumes, so recreating them with `up -d` from the worker is
+# safe: handle_reload_trigger does it routinely.
+_SESSION_SERVICE_PREFIXES: tuple[str, ...] = ("otp-", "motis-")
+
+
 def _start_services(services: list[str]) -> None:
+    """Restart what a max-memory rebuild stopped.
+
+    `start`, check, retry `start` once, and only then recreate with `up -d` —
+    and only session services. Never `up -d` the observability stack from
+    here: compose runs in the worker at /srv/docker, so a relative bind mount
+    such as `./loki/loki-config.yaml` resolves to /srv/docker/loki/... on the
+    HOST, which does not exist; the daemon creates an empty directory there
+    and mounts it over the config file. On 2026-10-02 that left loki, tempo,
+    prometheus, grafana and promtail crash-looping on "is a directory".
+    Anything still down is logged with the command to run on the host."""
     if not services:
         return
     log.info("max-memory rebuild: restarting %d containers: %s", len(services), _log_safe(services))
     r = _compose("start", *services)
     if r.returncode != 0:
-        # `start` only revives existing stopped containers; if any were pruned,
-        # recreate them from config. `up -d` is the robust fallback.
+        log.warning("max-memory restart exit=%s: %s", r.returncode, r.stderr.strip())
+    down = _not_running(services)
+    if down:
         log.warning(
-            "max-memory restart exit=%s (%s) — falling back to `up -d`",
-            r.returncode,
-            r.stderr.strip(),
+            "max-memory rebuild: %d containers not running after start, retrying: %s",
+            len(down),
+            _log_safe(down),
         )
-        _compose("up", "-d", "--no-deps", *services)
+        _compose("start", *down)
+        down = _not_running(down)
+    sessions = [s for s in down if s.startswith(_SESSION_SERVICE_PREFIXES)]
+    if sessions:
+        _compose("up", "-d", "--no-deps", *sessions)
+        down = _not_running(down)
+    if down:
+        log.error(
+            "max-memory rebuild: %d containers did not restart; from the compose "
+            "directory on the host run: docker compose -p viator up -d %s",
+            len(down),
+            _log_safe(down),
+        )
 
 
 def _recover_max_memory_stopped() -> None:
