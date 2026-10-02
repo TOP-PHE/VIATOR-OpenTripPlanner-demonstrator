@@ -1,0 +1,167 @@
+{% extends "_base.html" %}
+{% block title %}Storage — VIATOR admin{% endblock %}
+
+{% block extra_styles %}
+.st-card { background: var(--paper); padding: 1rem 1.5rem; border-radius: 8px; margin-bottom: 1rem; }
+.st-card h2 { margin-top: 0; font-size: 1rem; }
+.st-hint { color: var(--rail-steel); font-size: 0.85rem; margin-top: 0; }
+.st-bar { height: 18px; background: #e3e7ec; border-radius: 4px; overflow: hidden; margin: 0.5rem 0; }
+.st-bar > span { display: block; height: 100%; background: var(--brand-blue); }
+.st-bar.warn > span { background: #c4452a; }
+.st-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.st-cat { font-size: 0.75rem; padding: 0.1rem 0.45rem; border-radius: 10px; background: #e3e7ec; white-space: nowrap; }
+.st-cat[data-cat="failed_build"], .st-cat[data-cat="orphan_session"] { background: #fdecef; color: var(--fail); }
+.st-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.5rem 0; }
+.st-path { font-family: ui-monospace, monospace; font-size: 0.8rem; word-break: break-all; }
+{% endblock %}
+
+{% block content %}
+<h1>Storage</h1>
+<p class="st-hint">
+  Disk use of the data volumes (feeds, OSM files, graphs) and what can be deleted.
+  The build a session is serving, live feeds and anything of a session whose rebuild
+  is running are never listed. Docker images are not covered here; clean those with
+  <code>docker image prune</code> on the host.
+</p>
+
+<div id="warn" class="msg warning"></div>
+
+<div class="st-card">
+  <h2>Disk</h2>
+  <div id="disk">Loading…</div>
+</div>
+
+<div class="st-card">
+  <h2>Clean-up candidates</h2>
+  <p class="st-hint">
+    <b>Incomplete build</b>: a build that failed or was interrupted, of no use.
+    <b>Previous build</b>: an earlier complete build kept for rollback.
+    <b>Rollback copy</b>: the previous version of a feed or OSM file.
+    <b>Orphaned feed</b>: the file of a provider removed from its session.
+  </p>
+  <div class="st-actions">
+    <button type="button" id="sel-safe" class="secondary">Select incomplete builds, orphans and leftovers</button>
+    <button type="button" id="sel-none" class="secondary">Clear selection</button>
+    <button type="button" id="delete">Delete selected</button>
+    <span id="sel-total"></span>
+  </div>
+  <div id="cands">Loading…</div>
+</div>
+
+<div class="st-card">
+  <h2>Per session</h2>
+  <div id="sessions">Loading…</div>
+</div>
+
+<div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 240px; max-width: 480px"></div>
+
+<script>
+const CAT_LABEL = {
+  failed_build: 'Incomplete build',
+  previous_build: 'Previous build',
+  old_copy: 'Rollback copy',
+  orphaned_feed: 'Orphaned feed',
+  staging_leftover: 'Staging leftover',
+  orphan_session: 'Deleted session',
+};
+// Pre-selected by "Select …": nothing here is a rollback point.
+const SAFE_CATS = new Set(['failed_build', 'orphaned_feed', 'staging_leftover', 'orphan_session']);
+
+let report = null;
+const toast = document.getElementById('toast');
+function showToast(kind, t) { toast.className = 'msg show ' + kind; toast.textContent = t; setTimeout(() => { toast.className = 'msg'; }, 6000); }
+function escHTML(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c])); }
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
+  return (n / 1024 ** i).toFixed(i >= 3 ? 1 : 0) + ' ' + u[i];
+}
+function fmtDate(epoch) { return epoch ? new Date(epoch * 1000).toISOString().slice(0, 16).replace('T', ' ') : '—'; }
+
+function renderDisk(r) {
+  const warn = document.getElementById('warn');
+  if (r.warn) {
+    warn.className = 'msg warning show';
+    warn.textContent = `The data disk is ${r.used_percent}% full. A Europe-wide build needs tens of GB; free space before the next rebuild.`;
+  } else {
+    warn.className = 'msg warning';
+  }
+  document.getElementById('disk').innerHTML =
+    `<div class="st-bar${r.warn ? ' warn' : ''}"><span style="width:${Math.min(r.used_percent, 100)}%"></span></div>` +
+    `${fmtBytes(r.used_bytes)} used of ${fmtBytes(r.total_bytes)} (${r.used_percent}%) · <b>${fmtBytes(r.free_bytes)} free</b>`;
+}
+
+function renderSessions(r) {
+  if (!r.sessions.length) { document.getElementById('sessions').innerHTML = '<em>no session folders</em>'; return; }
+  const rows = r.sessions.map(s => `<tr>
+    <td>${escHTML(s.session_id)}${s.known ? '' : ' <span class="st-cat" data-cat="orphan_session">deleted</span>'}</td>
+    <td class="st-num">${fmtBytes(s.graphs_bytes)}</td>
+    <td class="st-num">${fmtBytes(s.inbox_bytes)}</td>
+    <td class="st-num"><b>${fmtBytes(s.graphs_bytes + s.inbox_bytes)}</b></td>
+    <td class="st-path">${escHTML(s.current_build || '—')}</td></tr>`).join('');
+  document.getElementById('sessions').innerHTML =
+    `<table><thead><tr><th>Session</th><th class="st-num">Graphs</th><th class="st-num">Feeds &amp; OSM</th><th class="st-num">Total</th><th>Serving build</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderCandidates(r) {
+  if (!r.candidates.length) { document.getElementById('cands').innerHTML = '<em>Nothing to clean up.</em>'; updateTotal(); return; }
+  const rows = r.candidates.map(c => `<tr>
+    <td><input type="checkbox" class="cand" value="${escHTML(c.id)}" data-size="${c.size_bytes}" data-cat="${escHTML(c.category)}"></td>
+    <td><span class="st-cat" data-cat="${escHTML(c.category)}">${escHTML(CAT_LABEL[c.category] || c.category)}</span></td>
+    <td>${escHTML(c.session_id || '—')}</td>
+    <td class="st-path" title="${escHTML(c.reason)}">${escHTML(c.id)}</td>
+    <td class="st-num">${fmtBytes(c.size_bytes)}</td>
+    <td class="st-num">${fmtDate(c.modified)}</td></tr>`).join('');
+  document.getElementById('cands').innerHTML =
+    `<table><thead><tr><th></th><th>Kind</th><th>Session</th><th>Path</th><th class="st-num">Size</th><th class="st-num">Modified (UTC)</th></tr></thead><tbody>${rows}</tbody></table>`;
+  document.querySelectorAll('input.cand').forEach(cb => cb.addEventListener('change', updateTotal));
+  updateTotal();
+}
+
+function selected() { return [...document.querySelectorAll('input.cand:checked')]; }
+function updateTotal() {
+  const sel = selected();
+  const bytes = sel.reduce((n, cb) => n + Number(cb.dataset.size), 0);
+  document.getElementById('sel-total').textContent = sel.length ? `${sel.length} selected · ${fmtBytes(bytes)}` : '';
+  document.getElementById('delete').disabled = !sel.length;
+}
+
+function render(r) { report = r; renderDisk(r); renderCandidates(r); renderSessions(r); }
+
+async function load() {
+  const resp = await fetch('/api/admin/storage');
+  if (!resp.ok) { showToast('error', `Could not read storage (${resp.status})`); return; }
+  render(await resp.json());
+}
+
+document.getElementById('sel-safe').addEventListener('click', () => {
+  document.querySelectorAll('input.cand').forEach(cb => { cb.checked = SAFE_CATS.has(cb.dataset.cat); });
+  updateTotal();
+});
+document.getElementById('sel-none').addEventListener('click', () => {
+  document.querySelectorAll('input.cand').forEach(cb => { cb.checked = false; });
+  updateTotal();
+});
+document.getElementById('delete').addEventListener('click', async () => {
+  const sel = selected();
+  if (!sel.length) return;
+  const bytes = sel.reduce((n, cb) => n + Number(cb.dataset.size), 0);
+  if (!confirm(`Delete ${sel.length} item(s), ${fmtBytes(bytes)}?\n\nThis cannot be undone. Items that stopped qualifying since this page loaded (a rebuild started, a build became current) are skipped.`)) return;
+  const btn = document.getElementById('delete');
+  btn.disabled = true;
+  const resp = await fetch('/api/admin/storage/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: sel.map(cb => cb.value)}),
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { showToast('error', body.detail ? JSON.stringify(body.detail) : `Failed (${resp.status})`); btn.disabled = false; return; }
+  const skipped = body.skipped.length ? ` · ${body.skipped.length} skipped` : '';
+  showToast(body.skipped.length ? 'warning' : 'success', `Freed ${fmtBytes(body.freed_bytes)} (${body.deleted.length} deleted${skipped})`);
+  if (body.skipped.length) console.warn('storage clean-up skipped', body.skipped);
+  render(body.report);
+});
+
+load();
+</script>
+{% endblock %}
