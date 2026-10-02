@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .trip_normalize import clean_operator_name
 from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
 
 log = logging.getLogger(__name__)
@@ -245,7 +246,13 @@ def _feed_id_from_motis_id(motis_id: str | None) -> str | None:
     """
     if not motis_id or "_" not in motis_id:
         return None
-    return motis_id.rsplit("_", 1)[0] or None
+    # A NeTEx local id carries `:` (`DE::ScheduledStopPoint:8700014_DBDB`)
+    # and may itself contain `_`; a feed tag never contains `:`. So split
+    # within the part before the first `:` — `db_DE::…` gives `db`.
+    head = motis_id.split(":", 1)[0] if ":" in motis_id else motis_id
+    if "_" not in head:
+        return None
+    return head.rsplit("_", 1)[0] or None
 
 
 def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
@@ -312,7 +319,7 @@ def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
         "route_short_name": leg.get("routeShortName"),
         "route_long_name": leg.get("routeLongName"),
         "route_id": leg.get("routeId"),
-        "agency_name": leg.get("agencyName"),
+        "agency_name": clean_operator_name(leg.get("agencyName")),
         "agency_id": leg.get("agencyId"),
         "agency_url": leg.get("agencyUrl"),
         # Both stops should share a feed id (transit legs don't cross feeds);
