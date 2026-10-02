@@ -123,4 +123,42 @@ def test_running_services_is_empty_when_compose_fails(monkeypatch):
     monkeypatch.setattr(
         worker, "_compose", lambda *a: CompletedProcess(list(a), 1, stdout="", stderr="boom")
     )
-    assert worker._running_services(["otp-a"]) == []
+    assert worker._running_services(["otp-a"]) is None
+    assert worker._not_running(["otp-a"]) == []
+
+
+def test_start_checks_and_is_done_when_everything_runs(monkeypatch):
+    from app import worker
+
+    fake = _FakeCompose([{"autoheal", "otp-a", "loki"}])
+    monkeypatch.setattr(worker, "_compose", fake)
+    worker._start_services(["autoheal", "otp-a", "loki"])
+    assert [c[0] for c in fake.calls] == ["start", "ps"]
+
+
+def test_start_retries_then_recreates_only_session_services(monkeypatch, caplog):
+    """`up -d` from the worker resolves relative bind mounts against
+    /srv/docker on the host, so it is reserved for session services
+    (named volumes only); loki stays down and is reported."""
+    from app import worker
+
+    monkeypatch.setattr(worker.log, "disabled", False)  # see test_stop_retries_…
+    fake = _FakeCompose([set(), set(), set()])
+    monkeypatch.setattr(worker, "_compose", fake)
+    worker._start_services(["motis-eu19", "loki"])
+    verbs = [c[:2] for c in fake.calls]
+    assert ("start", "motis-eu19") in verbs
+    assert ("up", "-d") in verbs
+    up = next(c for c in fake.calls if c[0] == "up")
+    assert up == ("up", "-d", "--no-deps", "motis-eu19")
+    assert "did not restart" in caplog.text
+    assert "up -d motis-eu19 loki" in caplog.text
+
+
+def test_start_never_runs_up_for_the_observability_stack(monkeypatch):
+    from app import worker
+
+    fake = _FakeCompose([set()])
+    monkeypatch.setattr(worker, "_compose", fake)
+    worker._start_services(["grafana", "loki", "promtail", "prometheus", "tempo"])
+    assert all(c[0] != "up" for c in fake.calls)

@@ -1117,7 +1117,7 @@ unhealthy session container mid-stop), the serving session containers and the ob
 stack, then check with `compose ps` that they are down, retry once, and log an error naming any
 that are still running. Then auto-size the heap to host RAM (`auto_build_heap`, reserving 8 GB), build, then restart
 everything in a `finally`. `/data/generated/.max-mem-stopped` records what was stopped so a
-worker killed mid-build revives it at next boot.
+worker killed mid-build revives it at next boot. The restart is `start`, check, retry `start` once, then `up -d` for session services only. The worker runs compose at `/srv/docker`, so `up -d` there would resolve the observability stack's relative bind mounts (`./loki/loki-config.yaml`) against a host path that does not exist and mount an empty directory over the config; anything still down is logged with the host command instead.
 
 **Concurrency.** `ConcurrencyGate.acquire_or_fail()` admits or raises `ConcurrencyExceeded`
 (→ HTTP 503) — *"we deliberately do not queue: queue depth itself becomes a failure mode under
