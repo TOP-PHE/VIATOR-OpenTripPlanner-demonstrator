@@ -1001,8 +1001,9 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
 
 # Pinned in `app/engine_versions.py`, which the serve template reads too — build
 # and serve must not drift apart. Was `:latest`, which never moved because the
-# deploy path only pulls web/worker; see that module's docstring.
-_MOTIS_IMAGE = engine_versions.MOTIS_IMAGE
+# deploy path only pulls web/worker; see that module's docstring. The build
+# version can be split from the serve one to try a candidate (VIATOR_MOTIS_BUILD_VERSION).
+_MOTIS_IMAGE = engine_versions.MOTIS_BUILD_IMAGE
 
 
 # Separator the rebuild-log emits between captured stdout and stderr from
