@@ -94,6 +94,9 @@ def test_stop_checks_and_is_done_when_everything_stopped(monkeypatch):
 def test_stop_retries_containers_that_came_back(monkeypatch, caplog):
     from app import worker
 
+    # In a full `pytest` run the integration migration tests go first, and
+    # alembic/env.py's fileConfig() disables every logger that already exists.
+    monkeypatch.setattr(worker.log, "disabled", False)
     fake = _FakeCompose([{"otp-a"}, set()])
     monkeypatch.setattr(worker, "_compose", fake)
     worker._stop_services(["autoheal", "otp-a", "grafana"])
@@ -105,6 +108,7 @@ def test_stop_retries_containers_that_came_back(monkeypatch, caplog):
 def test_stop_reports_containers_it_cannot_stop(monkeypatch, caplog):
     from app import worker
 
+    monkeypatch.setattr(worker.log, "disabled", False)  # see the test above
     fake = _FakeCompose([{"otp-a"}])
     monkeypatch.setattr(worker, "_compose", fake)
     worker._stop_services(["otp-a", "grafana"])
