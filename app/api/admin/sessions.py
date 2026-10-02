@@ -105,7 +105,9 @@ class SessionCreate(BaseModel):
 
 
 class SessionPatch(BaseModel):
-    name: str | None = None
+    # Same bounds as SessionCreate.name; surrounding spaces are stripped in
+    # patch_session, which then refuses a blank name.
+    name: str | None = Field(default=None, min_length=1, max_length=200)
     config: dict[str, Any] | None = None
     include_in_fanout: bool | None = None
     state: str | None = None
@@ -240,9 +242,12 @@ def patch_session(
         raise HTTPException(404, "Session not found")
 
     changes: dict[str, dict[str, Any]] = {}
-    if body.name is not None and body.name != s.name:
-        changes["name"] = {"from": s.name, "to": body.name}
-        s.name = body.name
+    new_name = body.name.strip() if body.name is not None else None
+    if new_name is not None and not new_name:
+        raise HTTPException(400, "Session name cannot be blank")
+    if new_name is not None and new_name != s.name:
+        changes["name"] = {"from": s.name, "to": new_name}
+        s.name = new_name
     if body.config is not None and body.config != s.config:
         # Validate osm_scope if present — fail-fast at save time means the
         # operator gets a clear UI error instead of an opaque build failure
