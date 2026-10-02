@@ -151,3 +151,11 @@ def test_timezone_choices_match_schema(template_text: str) -> None:
         f"'COVERAGE_DEFAULT_TIMEZONE'].choices but not in the template's "
         f"CHOICES dict: {missing}"
     )
+
+
+def test_no_schema_key_left_off_the_page(template_text: str) -> None:
+    """Every key in CONFIG_SCHEMA is editable on /admin/config. The ÖBB
+    HAFAS keys existed in the schema with no section, so an operator who
+    needed a longer HAFAS_TIMEOUT_MS could not find it."""
+    missing = sorted(k for k in CONFIG_SCHEMA if f"'{k}'" not in template_text)
+    assert missing == []
