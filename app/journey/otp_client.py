@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from .trip_normalize import clean_operator_name
 from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
 
 log = logging.getLogger(__name__)
@@ -368,7 +369,7 @@ def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
                     "route_long_name": route.get("longName"),
                     "route_id": route.get("gtfsId"),
                     # v0.1.26 — operator visibility on each leg.
-                    "agency_name": agency.get("name"),
+                    "agency_name": clean_operator_name(agency.get("name")),
                     "agency_id": agency.get("gtfsId"),
                     "agency_url": agency.get("url"),
                     "feed_id": feed_id_from_trip,

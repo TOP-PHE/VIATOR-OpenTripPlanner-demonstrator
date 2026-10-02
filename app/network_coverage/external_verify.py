@@ -834,8 +834,10 @@ async def _post_hafas(
     try:
         response = await client.post(_OEBB_ENDPOINT, json=body, headers=_HEADERS)
     except httpx.HTTPError as e:
-        log.warning("HAFAS request failed: %s", e)
-        return None, VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"http: {e}")
+        # Timeouts stringify to "" — name the type, or the UI shows "http: ".
+        detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        log.warning("HAFAS request failed: %s", detail)
+        return None, VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error=f"http: {detail}")
     if response.status_code != 200:
         return None, VerifyResult(
             source=_SOURCE_OEBB_HAFAS,

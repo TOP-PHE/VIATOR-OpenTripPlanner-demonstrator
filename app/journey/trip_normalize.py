@@ -15,8 +15,24 @@ three clients can share the implementation without circular imports.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
+
+# DB's NeTEx (DELFI) names operators with their numeric code in front:
+# `80___ DB Fernverkehr AG`, `87___ SNCF`, `3018___ EUROSTAR`.
+_OPERATOR_CODE_PREFIX_RE = re.compile(r"^\d+_+\s*")
+
+
+def clean_operator_name(name: Any) -> str | None:
+    """Operator name for display, without a leading `<code>___` prefix.
+
+    Display only: no matching or fingerprint reads `agency_name`."""
+    if not isinstance(name, str):
+        return None
+    cleaned = _OPERATOR_CODE_PREFIX_RE.sub("", name).strip()
+    return cleaned or name.strip() or None
+
 
 # Modes treated as non-transit. The canonical mode vocabulary across
 # OTP / MOTIS / OJP is upper-case strings; `_first_transit_leg_*` is
