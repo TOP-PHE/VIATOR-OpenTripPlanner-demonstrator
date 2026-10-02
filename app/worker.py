@@ -1093,6 +1093,20 @@ _MOTIS_IMAGE = engine_versions.MOTIS_BUILD_IMAGE
 # tripped by the OTP + MOTIS builders both reaching for the same string.
 _STDERR_SEP = "\n--- stderr ---\n"
 
+# Exit statuses of a `docker run` whose process died on a signal (128 + n).
+_SIGNAL_EXITS = {
+    137: "killed (SIGKILL) - usually out of memory, or the container was stopped",
+    139: "crashed (SIGSEGV, segmentation fault)",
+    134: "aborted (SIGABRT)",
+    143: "terminated (SIGTERM)",
+}
+
+
+def _describe_exit(code: int) -> str:
+    """`exit 137 - killed (SIGKILL) - ...` for a rebuild log line."""
+    meaning = _SIGNAL_EXITS.get(code)
+    return f"exit {code}" + (f" - {meaning}" if meaning else "")
+
 
 def _strip_tiles_block(config_yml: Path) -> None:
     """Remove the top-level `tiles:` block from a MOTIS-generated config.yml.
@@ -1368,7 +1382,15 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
         )
 
         if import_proc.returncode != 0:
-            return output, False, ""
+            # The exit status is the only trace when MOTIS is killed: its
+            # stderr is empty and the progress bars stop mid-step (2026-10-02,
+            # eu19 died at "tt 92% sbb: Parse Files" with nothing else).
+            return (
+                output
+                + f"\n[viator] motis import failed: {_describe_exit(import_proc.returncode)}\n",
+                False,
+                "",
+            )
 
         # Sanity check: config.yml must still exist post-import. MOTIS's
         # `tt.bin` is the actual proof of successful timetable indexing

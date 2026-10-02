@@ -473,7 +473,16 @@ def test_run_build_motis_surfaces_subprocess_failure_in_log(
     assert ok is False
     assert path == ""
     assert "schema mismatch" in log
+    # The exit status is recorded: it is the only trace when MOTIS is killed.
+    assert log.rstrip().endswith("[viator] motis import failed: exit 2")
     assert call_count["n"] == 2  # config (ok) + import (fail)
+
+
+def test_exit_statuses_name_the_signal():
+    assert worker._describe_exit(1) == "exit 1"
+    assert worker._describe_exit(137).startswith("exit 137 - killed (SIGKILL)")
+    assert "out of memory" in worker._describe_exit(137)
+    assert worker._describe_exit(139) == "exit 139 - crashed (SIGSEGV, segmentation fault)"
 
 
 def _failing_import_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
