@@ -2795,7 +2795,13 @@ def list_rebuilds(
     return [_job_to_response(j, db=db) for j in rows]
 
 
-@router.post("/{sid}/rebuilds/{job_id}/cancel", response_model=RebuildJobResponse)
+@router.post(
+    "/{sid}/rebuilds/{job_id}/cancel",
+    responses={
+        404: {"description": "No such rebuild job in this session"},
+        409: {"description": "The rebuild job has already finished"},
+    },
+)
 def cancel_rebuild(
     sid: str,
     job_id: uuid.UUID,

@@ -84,7 +84,8 @@ def test_a_pending_job_is_cancelled_at_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert out.status == "cancelled"
     assert job.finished_at is not None
     assert job.cancel_requested_at is None
-    assert "cancelled at" in job.log and "ops@example.org" in job.log
+    assert "cancelled at" in job.log
+    assert "ops@example.org" in job.log
     assert db.committed
     assert recorded[0]["action"] == "session.rebuild.cancelled"
     assert recorded[0]["metadata"] == {"job_id": str(job.id), "status": "cancelled"}
@@ -105,14 +106,16 @@ def test_a_running_job_is_flagged_for_the_worker(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.parametrize("status", ["done", "failed", "cancelled"])
 def test_a_finished_job_answers_409(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    job = _job(status)
     with pytest.raises(HTTPException) as exc:
-        _cancel(monkeypatch, _job(status))
+        _cancel(monkeypatch, job)
     assert exc.value.status_code == 409
 
 
 def test_a_job_of_another_session_is_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = _job("pending")
     with pytest.raises(HTTPException) as exc:
-        _cancel(monkeypatch, _job("pending"), sid="nap-fr-rail")
+        _cancel(monkeypatch, job, sid="nap-fr-rail")
     assert exc.value.status_code == 404
 
 
