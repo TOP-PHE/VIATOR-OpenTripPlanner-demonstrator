@@ -40,8 +40,10 @@ _BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
 # Rotated feed copies: `sncf.zip.old`, `sncf.zip.old.2`, `osm.pbf.old.1`; removed providers: `.orphaned`.
 _STALE_FILE_RE = re.compile(r"\.(?:old(?:\.\d+)?|orphaned)$")
 _STAGING_MIN_AGE_S = 24 * 3600
+_OTP_GRAPH = "graph.obj"
+_OTP_ROUTER_CONFIG = "router-config.json"
 # Top-level graph-volume names that are not session folders.
-_GRAPH_ROOT_RESERVED = {"motis", "graph.obj", "router-config.json", "current", "lost+found"}
+_GRAPH_ROOT_RESERVED = {"motis", _OTP_GRAPH, _OTP_ROUTER_CONFIG, "current", "lost+found"}
 
 WARN_PERCENT = 85.0
 
@@ -140,7 +142,7 @@ def _current_target(session_dir: Path) -> str | None:
 
 def _is_complete_build(build_dir: Path) -> bool:
     """A MOTIS import writes `tt.bin`, an OTP build `graph.obj`."""
-    return (build_dir / "tt.bin").exists() or (build_dir / "graph.obj").exists()
+    return (build_dir / "tt.bin").exists() or (build_dir / _OTP_GRAPH).exists()
 
 
 # ──────────────────────────── scan ────────────────────────────
@@ -247,7 +249,7 @@ def _graph_roots(graph_dir: Path) -> list[tuple[Path, str]]:
 def _root_leftovers(graph_dir: Path) -> list[Candidate]:
     """OTP build output written at the volume root and never moved (failed build)."""
     out = []
-    for name in ("graph.obj", "router-config.json"):
+    for name in (_OTP_GRAPH, _OTP_ROUTER_CONFIG):
         leftover = graph_dir / name
         if leftover.is_file() and not leftover.is_symlink():
             out.append(

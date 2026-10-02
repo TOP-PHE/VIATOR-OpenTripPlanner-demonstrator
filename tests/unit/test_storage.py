@@ -217,7 +217,8 @@ def test_api_report_and_delete(volumes: tuple[Path, Path], monkeypatch: pytest.M
         {"id": "inbox/eu19/osm/osm.pbf", "reason": "no longer a clean-up candidate"}
     ]
     assert out["freed_bytes"] == 500
-    assert recorded and recorded[0]["action"] == "storage.cleanup"
+    assert len(recorded) == 1
+    assert recorded[0]["action"] == "storage.cleanup"
     assert db.committed
     assert "graphs/motis/eu19/20261001-172636" not in {c["id"] for c in out["report"]["candidates"]}
 
