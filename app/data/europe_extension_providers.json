@@ -87,9 +87,9 @@
       "label": "Slovenia national timetable (SZ rail + buses)",
       "country_iso": "SI",
       "provenance": "nap",
-      "nap_reference": "https://www.nap.si (B2B dataset b2b.netex, access granted 2026-10-02 until 2027-10-02)",
-      "probe": "not probed: needs the SI NAP login - set the provider's timetable credential to 'SI NAP login' (Credentials > preset Slovenia) before refreshing",
-      "timetable": {"format": "netex_epip", "source": "url", "url": "https://b2b.nap.si/data/b2b.netex"}
+      "nap_reference": "https://www.nap.si (B2B datasets b2b.netex.*, access granted 2026-10-02 until 2027-10-02)",
+      "probe": "VPS 2026-10-02: zip 57 MB holding one 495 MB XML, self-contained (18509 ServiceJourney, 2449 Line, 9842 ScheduledStopPoint, 5357 StopPlace, 10087 Quay, 25286 coordinates). b2b.netex itself is only the parent permission and answers 403; b2b.netex.stopplaces is a stops-only subset. Served at ~100-150 KB/s. Needs the 'SI NAP login' timetable credential",
+      "timetable": {"format": "netex_epip", "source": "url", "url": "https://b2b.nap.si/data/b2b.netex.lines"}
     },
     {
       "id": "BEOGRAD",

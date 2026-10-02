@@ -31,7 +31,7 @@ run; `--apply` saves), then **Refresh providers**.
 | HR | HZPP | official | GTFS, 138 rail routes |
 | IT | ITALO | nap | gzip NeTEx — stops listed out of order upstream, check the build |
 | CY | CY-INTERCITY | nap | GTFS, 60 bus routes (no rail in CY) |
-| SI | SI-NAP | nap | national NeTEx `b2b.nap.si/data/b2b.netex`; needs the 'SI NAP login' credential (B2B access granted 2026-10-02 → 2027-10-02) |
+| SI | SI-NAP | nap | national NeTEx `b2b.nap.si/data/b2b.netex.lines` (57 MB zip, 495 MB XML, self-contained: 18 509 journeys, 25 286 coordinates); `b2b.netex` alone is the parent permission and answers 403. Needs the 'SI NAP login' credential (access 2026-10-02 → 2027-10-02) |
 | RS | BEOGRAD | official | GTFS city + suburban, 241 routes |
 | AL | TIRANA | official | not probed (city transit; HSH rail publishes nothing) |
 | RS | SRBIJAVOZ | community | not probed; incl. Belgrade–Bar, Subotica–Szeged |
