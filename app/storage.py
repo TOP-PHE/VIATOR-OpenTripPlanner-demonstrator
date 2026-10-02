@@ -95,22 +95,30 @@ def path_size(path: Path) -> int:
     total = 0
     stack = [path]
     while stack:
-        here = stack.pop()
-        try:
-            with os.scandir(here) as it:
-                for entry in it:
-                    try:
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                        else:
-                            total += entry.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        continue
-        except OSError:
-            continue
+        total += _dir_files_size(stack.pop(), stack)
     return total
+
+
+def _dir_files_size(here: Path, subdirs: list[Path]) -> int:
+    """Size of the files directly in `here`; its subfolders go onto `subdirs`."""
+    try:
+        with os.scandir(here) as it:
+            entries = list(it)
+    except OSError:
+        return 0
+    return sum(_entry_size(entry, subdirs) for entry in entries)
+
+
+def _entry_size(entry: os.DirEntry[str], subdirs: list[Path]) -> int:
+    try:
+        if entry.is_symlink():
+            return 0
+        if entry.is_dir(follow_symlinks=False):
+            subdirs.append(Path(entry.path))
+            return 0
+        return entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        return 0
 
 
 def _mtime(path: Path) -> float:
@@ -170,6 +178,19 @@ def _build_candidates(
     return out
 
 
+def _classify_inbox_file(name: str, in_staging: bool, age_s: float) -> tuple[str, str] | None:
+    """(category, reason) for an inbox file that can go, or None for one in use."""
+    if in_staging:
+        if age_s < _STAGING_MIN_AGE_S:
+            return None
+        return "staging_leftover", "Left in _staging by an interrupted refresh"
+    if not _STALE_FILE_RE.search(name):
+        return None
+    if name.endswith(".orphaned"):
+        return "orphaned_feed", "Feed file of a provider removed from the session"
+    return "old_copy", "Previous version kept after a refresh (rollback copy)"
+
+
 def _inbox_candidates(root: Path, sid: str, busy: bool, now: float) -> list[Candidate]:
     out: list[Candidate] = []
     if busy or not root.is_dir():
@@ -178,32 +199,65 @@ def _inbox_candidates(root: Path, sid: str, busy: bool, now: float) -> list[Cand
         here = Path(dirpath)
         dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
         in_staging = "_staging" in here.relative_to(root).parts
-        for name in filenames:
-            path = here / name
-            if path.is_symlink():
-                continue
-            rel = path.relative_to(root.parent).as_posix()
-            if in_staging:
-                if now - _mtime(path) < _STAGING_MIN_AGE_S:
-                    continue
-                category, reason = "staging_leftover", "Left in _staging by an interrupted refresh"
-            elif _STALE_FILE_RE.search(name):
-                if name.endswith(".orphaned"):
-                    category = "orphaned_feed"
-                    reason = "Feed file of a provider removed from the session"
-                else:
-                    category = "old_copy"
-                    reason = "Previous version kept after a refresh (rollback copy)"
-            else:
+        for path in (here / name for name in filenames):
+            kind = (
+                None
+                if path.is_symlink()
+                else _classify_inbox_file(path.name, in_staging, now - _mtime(path))
+            )
+            if kind is None:
                 continue
             out.append(
                 Candidate(
-                    id=f"inbox/{rel}",
-                    category=category,
+                    id=f"inbox/{path.relative_to(root.parent).as_posix()}",
+                    category=kind[0],
                     session_id=sid,
                     size_bytes=path_size(path),
                     modified=_mtime(path),
-                    reason=reason,
+                    reason=kind[1],
+                )
+            )
+    return out
+
+
+def _disk_report(graph_dir: Path) -> Report:
+    try:
+        du = shutil.disk_usage(graph_dir)
+    except OSError:
+        return Report(0, 0, 0, 0.0, False)
+    pct = round(100.0 * du.used / du.total, 1) if du.total else 0.0
+    return Report(du.total, du.used, du.free, pct, pct >= WARN_PERCENT)
+
+
+def _subdirs(base: Path) -> list[Path]:
+    if not base.is_dir():
+        return []
+    return [c for c in sorted(base.iterdir()) if c.is_dir() and not c.is_symlink()]
+
+
+def _graph_roots(graph_dir: Path) -> list[tuple[Path, str]]:
+    """(session folder, candidate id prefix): OTP at graphs/<sid>/, MOTIS at graphs/motis/<sid>/."""
+    otp = [
+        (c, f"graphs/{c.name}") for c in _subdirs(graph_dir) if c.name not in _GRAPH_ROOT_RESERVED
+    ]
+    motis = [(c, f"graphs/motis/{c.name}") for c in _subdirs(graph_dir / "motis")]
+    return otp + motis
+
+
+def _root_leftovers(graph_dir: Path) -> list[Candidate]:
+    """OTP build output written at the volume root and never moved (failed build)."""
+    out = []
+    for name in ("graph.obj", "router-config.json"):
+        leftover = graph_dir / name
+        if leftover.is_file() and not leftover.is_symlink():
+            out.append(
+                Candidate(
+                    id=f"graphs/{name}",
+                    category="failed_build",
+                    session_id=None,
+                    size_bytes=path_size(leftover),
+                    modified=_mtime(leftover),
+                    reason="OTP build output never moved into a session (failed build)",
                 )
             )
     return out
@@ -220,67 +274,31 @@ def scan(
     """`session_ids`: every session that exists. `busy_session_ids`: those
     with a rebuild running, whose files are left alone."""
     now = time.time() if now is None else now
-    try:
-        du = shutil.disk_usage(graph_dir)
-        total, used, free = du.total, du.used, du.free
-    except OSError:
-        total = used = free = 0
-    pct = round(100.0 * used / total, 1) if total else 0.0
-    report = Report(total, used, free, pct, pct >= WARN_PERCENT)
-
+    report = _disk_report(graph_dir)
     usages: dict[str, SessionUsage] = {}
 
     def usage_for(sid: str) -> SessionUsage:
         return usages.setdefault(sid, SessionUsage(sid, sid in session_ids))
 
-    # Graph builds: OTP at graphs/<sid>/, MOTIS at graphs/motis/<sid>/.
-    graph_roots: list[tuple[Path, str, str]] = []
-    for base, prefix in ((graph_dir, "graphs"), (graph_dir / "motis", "graphs/motis")):
-        if not base.is_dir():
-            continue
-        for child in sorted(base.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                continue
-            if base == graph_dir and child.name in _GRAPH_ROOT_RESERVED:
-                continue
-            graph_roots.append((child, f"{prefix}/{child.name}", child.name))
-
-    for root, prefix, sid in graph_roots:
-        usage = usage_for(sid)
-        if sid not in session_ids:
-            usage.graphs_bytes += path_size(root)
+    for root, prefix in _graph_roots(graph_dir):
+        sid = root.name
+        if sid in session_ids:
+            busy = sid in busy_session_ids
+            report.candidates += _build_candidates(root, prefix, sid, busy, usage_for(sid))
+        else:
+            usage_for(sid).graphs_bytes += path_size(root)
             report.candidates.append(_orphan(root, prefix, sid))
-            continue
-        report.candidates += _build_candidates(root, prefix, sid, sid in busy_session_ids, usage)
 
-    # Leftovers of a failed OTP build, written at the volume root before being moved.
     if not busy_session_ids:
-        for name in ("graph.obj", "router-config.json"):
-            leftover = graph_dir / name
-            if leftover.is_file() and not leftover.is_symlink():
-                report.candidates.append(
-                    Candidate(
-                        id=f"graphs/{name}",
-                        category="failed_build",
-                        session_id=None,
-                        size_bytes=path_size(leftover),
-                        modified=_mtime(leftover),
-                        reason="OTP build output never moved into a session (failed build)",
-                    )
-                )
+        report.candidates += _root_leftovers(graph_dir)
 
-    # Inbox: one folder per session.
-    if inbox_dir.is_dir():
-        for child in sorted(inbox_dir.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                continue
-            sid = child.name
-            usage = usage_for(sid)
-            usage.inbox_bytes += path_size(child)
-            if sid not in session_ids:
-                report.candidates.append(_orphan(child, f"inbox/{sid}", sid))
-                continue
-            report.candidates += _inbox_candidates(child, sid, sid in busy_session_ids, now)
+    for root in _subdirs(inbox_dir):
+        sid = root.name
+        usage_for(sid).inbox_bytes += path_size(root)
+        if sid in session_ids:
+            report.candidates += _inbox_candidates(root, sid, sid in busy_session_ids, now)
+        else:
+            report.candidates.append(_orphan(root, f"inbox/{sid}", sid))
 
     report.sessions = sorted(
         usages.values(), key=lambda u: u.graphs_bytes + u.inbox_bytes, reverse=True

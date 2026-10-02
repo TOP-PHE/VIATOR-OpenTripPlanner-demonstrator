@@ -70,7 +70,7 @@ const SAFE_CATS = new Set(['failed_build', 'orphaned_feed', 'staging_leftover', 
 let report = null;
 const toast = document.getElementById('toast');
 function showToast(kind, t) { toast.className = 'msg show ' + kind; toast.textContent = t; setTimeout(() => { toast.className = 'msg'; }, 6000); }
-function escHTML(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c])); }
+function escHTML(s) { return String(s ?? '').replaceAll(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c])); }
 function fmtBytes(n) {
   if (!n) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -115,7 +115,7 @@ function renderCandidates(r) {
     <td class="st-num">${fmtDate(c.modified)}</td></tr>`).join('');
   document.getElementById('cands').innerHTML =
     `<table><thead><tr><th></th><th>Kind</th><th>Session</th><th>Path</th><th class="st-num">Size</th><th class="st-num">Modified (UTC)</th></tr></thead><tbody>${rows}</tbody></table>`;
-  document.querySelectorAll('input.cand').forEach(cb => cb.addEventListener('change', updateTotal));
+  for (const cb of document.querySelectorAll('input.cand')) cb.addEventListener('change', updateTotal);
   updateTotal();
 }
 
@@ -136,11 +136,11 @@ async function load() {
 }
 
 document.getElementById('sel-safe').addEventListener('click', () => {
-  document.querySelectorAll('input.cand').forEach(cb => { cb.checked = SAFE_CATS.has(cb.dataset.cat); });
+  for (const cb of document.querySelectorAll('input.cand')) cb.checked = SAFE_CATS.has(cb.dataset.cat);
   updateTotal();
 });
 document.getElementById('sel-none').addEventListener('click', () => {
-  document.querySelectorAll('input.cand').forEach(cb => { cb.checked = false; });
+  for (const cb of document.querySelectorAll('input.cand')) cb.checked = false;
   updateTotal();
 });
 document.getElementById('delete').addEventListener('click', async () => {
