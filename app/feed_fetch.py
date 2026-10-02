@@ -35,6 +35,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import zipfile
@@ -88,7 +89,20 @@ class FetchResult:
 
 
 def state_path(state_dir: Path, key: str) -> Path:
-    return state_dir / f"{_STATE_KEY_RE.sub('_', key).strip('_')}.json"
+    """`<state_dir>/<key with unsafe characters replaced>.json`.
+
+    The key is a task label built from a session's provider id, i.e. operator
+    input. The regex already leaves no path separator, so the name cannot leave
+    `state_dir`; the containment check below makes that explicit, in a form
+    static analysers recognise (pythonsecurity:S2083), and keeps it true if the
+    regex is ever loosened. Raises ValueError for a name that would escape.
+    """
+    name = f"{_STATE_KEY_RE.sub('_', key).strip('_')}.json"
+    base = os.path.realpath(state_dir)
+    target = os.path.realpath(Path(base) / name)
+    if not target.startswith(base + os.sep):
+        raise ValueError(f"fetch-state name escapes {base}")
+    return Path(target)
 
 
 def load_state(state_dir: Path, key: str) -> dict[str, Any]:
@@ -107,7 +121,7 @@ def save_state(state_dir: Path, key: str, state: dict[str, Any]) -> None:
         tmp = target.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(target)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         log.warning("could not save fetch state %s: %s", key, exc)
 
 
