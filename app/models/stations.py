@@ -51,6 +51,8 @@ _TRUE = text("TRUE")
 _STATION_FK = "station_ref.id"
 _VERSION_FK = "station_source_version.id"
 _BUILD_FK = "station_build.id"
+_USER_FK = "users.id"
+_SET_NULL = "SET NULL"
 
 
 # ───────────────────────────── sources ─────────────────────────────
@@ -86,7 +88,7 @@ class StationSource(TimestampMixin, Base):
     # Same shape as an entry of app/data/eu19_nap_sources.json.
     resolver_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     credential_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("user_credentials.id", ondelete="SET NULL")
+        UUID(as_uuid=True), ForeignKey("user_credentials.id", ondelete=_SET_NULL)
     )
     country_iso: Mapped[str | None] = mapped_column(Text)
     operator: Mapped[str | None] = mapped_column(Text)
@@ -134,7 +136,7 @@ class StationSourceVersion(Base):
     stats: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     stored_path: Mapped[str | None] = mapped_column(Text)
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+        UUID(as_uuid=True), ForeignKey(_USER_FK, ondelete=_SET_NULL)
     )
 
 
@@ -372,7 +374,7 @@ class StationRef(Base):
 
     # Grouping
     complex_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("station_complex.id", ondelete="SET NULL")
+        BigInteger, ForeignKey("station_complex.id", ondelete=_SET_NULL)
     )
     complex_role: Mapped[str | None] = mapped_column(Text)
 
@@ -500,7 +502,7 @@ class StationRefFlag(Base):
     level: Mapped[str | None] = mapped_column(Text)
     warning_code: Mapped[str | None] = mapped_column(Text)
     related_station_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey(_STATION_FK, ondelete="SET NULL")
+        BigInteger, ForeignKey(_STATION_FK, ondelete=_SET_NULL)
     )
 
 
@@ -527,7 +529,7 @@ class StationRefOverride(Base):
     value: Mapped[str | None] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(Text)
     set_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+        UUID(as_uuid=True), ForeignKey(_USER_FK, ondelete=_SET_NULL)
     )
     set_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
