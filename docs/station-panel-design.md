@@ -311,6 +311,27 @@ contradicts** the reference. Filter by feed and by country.
 carries and the raw record. Where a dedicated stop registry exists for the country (Infrabel, DiDok,
 OpenStation, CHB, NSR, NaPTAN), the screen prefers it and says so in an `origin` column.
 
+As built (`app/api/master/station_links.py`):
+
+- **Unmatched** is a link row with no station, that is a row of the unmatched-stops file. The list
+  opens on the `Rail` and `Multimodal` labels only: the `Urban` rows are tram and bus stops that
+  were never expected to match a railway location. The label filter is a set of checkboxes built
+  from the labels the data carries; with none ticked the list shows every label. Rows are ordered
+  nearest first, and each shows the nearest PLC with its distance, linked to the reference row(s)
+  of that PLC.
+- **Contradicting** is a link that names a reference row, is **not asserted**, and **carries a code
+  value**: the code said "this reference row", the distance or the name said otherwise, so the
+  offline chain refused the match. This is the definition `station_ref_link` can answer on its own
+  and it is an interpretation, listed in section 13. A link records the chain's verdict on one stop;
+  it does not compare the stop's code with `station_ref_code`, so a code asserted on one station
+  while another station carries the same code is not found here. That comparison belongs to the
+  resolver.
+- **Feed**: an unmatched stop can be listed for several feeds in one cell (`A|B`). The filter finds
+  it under each of them, and the feed counts count it once per feed.
+- **Country**: the stop's own for the unmatched list. A matched link has no country, so the
+  contradictions are filtered by the country of the reference row they point at.
+- A link naming a reference row the master does not carry is not imported, so it is in neither list.
+
 ### B. Infrastructure registers — `/admin/stations/registers`
 
 Two tabs, CRD first, each reading the latest `source_version_id` of its source.
@@ -754,6 +775,9 @@ corrected; this table is the record.
 | the delta lists what was "renumbered" | neither register table keeps a column saying one code replaces another | inferred: a removed and a created location with the same name at the same place, each paired once |
 | `era_operational_point.rl100` | the telref extract's 36 columns have no RL100 | the column stays NULL in step 1 |
 | screen B is two lists | a CRD PLC has one row per validity period | the lists show every row; the delta takes the latest validity as the PLC's row |
+| screen A lists "stops whose code contradicts the reference" | the links file records a verdict per stop (tier, asserted or not); no column says "contradiction", and nothing in step 1 compares a stop's code with the reference's codes | a matched link that is not asserted although it carries a code value. **To be confirmed by the owner** |
+| screen A filters by feed | an unmatched stop lists several feeds in one cell (`A\|B`) | the filter matches any feed of the cell; the counts count the stop once per feed |
+| screen A filters by country | the links file has no country column; only the unmatched stops carry one | the reference row's country for the contradictions, the stop's own for the unmatched |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:
 `warnings`, `n_issues`, `n_warnings`, `review_links`, `nap_station_ids`, `best_match_method`,

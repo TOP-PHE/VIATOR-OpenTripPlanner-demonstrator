@@ -1374,3 +1374,155 @@ def test_the_registers_are_open_to_both_working_roles(
     for headers in (admin, content_manager):
         assert client.get(f"{REG}/crd/versions", headers=headers).status_code == 200
         assert client.get(f"{REG}/era/versions", headers=headers).status_code == 200
+
+
+# ── screen A: the two lists of NAP stops (unit 8) ────────────────────────
+
+LINKS = "/api/master/station-links"
+LINK_ROUTES = [f"{LINKS}/summary", f"{LINKS}/unmatched", f"{LINKS}/contradictions"]
+
+
+def _stops(client: TestClient, headers: dict[str, str], name: str, **params: object) -> list[str]:
+    found = client.get(f"{LINKS}/{name}", headers=headers, params=params)
+    assert found.status_code == 200, found.text
+    return [row["offline_station_id"] for row in found.json()]
+
+
+def test_unmatched_stops_default_to_rail_and_multimodal(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(f"{LINKS}/unmatched", headers=content_manager)
+    assert r.status_code == 200, r.text
+    assert r.headers["X-Total-Count"] == "2"
+    rows = r.json()
+    # The nearest first; a stop with no nearest reference row comes last.
+    assert [row["offline_station_id"] for row in rows] == ["NAPST0102", "NAPST0103"]
+    west = rows[0]
+    assert (west["stop_name"], west["label"], west["iso2"]) == ("Sampleton West", "Rail", "ZZ")
+    assert west["feed_key"] == "DE_DELFI|ZZ_FEED"
+    assert (west["lat"], west["lon"]) == (50.11, 4.11)
+    assert west["reason"] == "name_mismatch"
+    assert (west["nearest_plc"], west["nearest_distance_m"]) == ("ZZ00002", 150.0)
+    # The reference row of the nearest PLC, to link to.
+    assert west["nearest"] == [
+        {
+            "id": _station_id("ZZ00002"),
+            "plc": "ZZ00002",
+            "era_uopid": "ZZ00002",
+            "name": "Sampleton",
+            "iso2": "ZZ",
+        }
+    ]
+    interchange = rows[1]
+    assert (interchange["nearest_plc"], interchange["nearest"]) == (None, [])
+
+
+def test_unmatched_stops_filters(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    cm = content_manager
+    every = ["NAPST0102", "NAPST0101", "NAPST0103", "NAPST0104"]
+    assert _stops(client, cm, "unmatched", label="all") == every
+    assert _stops(client, cm, "unmatched", label="Urban") == ["NAPST0101"]
+    assert _stops(client, cm, "unmatched", label=["Urban", "unknown"]) == [
+        "NAPST0101",
+        "NAPST0104",
+    ]
+    # A stop listed for two feeds is found under each of them.
+    assert _stops(client, cm, "unmatched", feed="DE_DELFI") == ["NAPST0102"]
+    assert _stops(client, cm, "unmatched", feed="ZZ_FEED") == ["NAPST0102", "NAPST0103"]
+    assert _stops(client, cm, "unmatched", feed="ZZ") == []  # a feed, not a prefix of one
+    assert _stops(client, cm, "unmatched", country="yy") == ["NAPST0103"]
+    assert _stops(client, cm, "unmatched", q="west") == ["NAPST0102"]
+    assert _stops(client, cm, "unmatched", q="tram") == []  # urban: outside the default
+    assert _stops(client, cm, "unmatched", q="tram", label="all") == ["NAPST0101"]
+
+    paged = client.get(
+        f"{LINKS}/unmatched", headers=cm, params={"label": "all", "size": 1, "page": 1}
+    )
+    assert paged.headers["X-Total-Count"] == "4"
+    assert [row["offline_station_id"] for row in paged.json()] == ["NAPST0101"]
+
+
+def test_stops_whose_code_contradicts_the_reference(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    cm = content_manager
+    r = client.get(f"{LINKS}/contradictions", headers=cm)
+    assert r.status_code == 200, r.text
+    assert r.headers["X-Total-Count"] == "1"
+    # NAPST0003 is not asserted either, but it carries no code: a candidate
+    # by name only, not a contradiction.
+    (row,) = r.json()
+    assert row["offline_station_id"] == "NAPST0002"
+    assert (row["feed_key"], row["stop_key"], row["stop_name"]) == (
+        "DE_DELFI",
+        "de:99:2",
+        "Sampleton Nord",
+    )
+    assert (row["code_value"], row["code_series"]) == ("9900002", "DELFI_stop_key")
+    assert (row["tier"], row["distance_m"], row["name_sim"]) == ("T2_name_distance", 480.0, 0.61)
+    assert row["note"] == "code points here, name does not"
+    assert row["station"]["plc"] == "ZZ00002"
+    assert row["station"]["id"] == row["station_id"]
+
+    assert _stops(client, cm, "contradictions", feed="DE_DELFI") == ["NAPST0002"]
+    assert _stops(client, cm, "contradictions", feed="CH_SBB") == []
+    assert _stops(client, cm, "contradictions", country="zz") == ["NAPST0002"]
+    assert _stops(client, cm, "contradictions", country="FR") == []
+    assert _stops(client, cm, "contradictions", q="9900002") == ["NAPST0002"]  # the code
+    assert _stops(client, cm, "contradictions", q="de:99:2") == ["NAPST0002"]  # the stop key
+    assert _stops(client, cm, "contradictions", q="nord") == ["NAPST0002"]  # the name
+    assert _stops(client, cm, "contradictions", q="9900001") == []
+    assert _stops(client, cm, "contradictions", page=1) == []
+
+
+def test_links_summary(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    def counts(facet: list[dict]) -> dict[str, int]:
+        return {item["value"]: item["count"] for item in facet}
+
+    body = client.get(f"{LINKS}/summary", headers=content_manager).json()
+    assert body["default_labels"] == ["Rail", "Multimodal"]
+    assert body["links"] == 8
+    unmatched = body["unmatched"]
+    assert unmatched["total"] == 4
+    assert counts(unmatched["labels"]) == {"Multimodal": 1, "Rail": 1, "Urban": 1, "unknown": 1}
+    # Sampleton West is listed for two feeds and counts under each.
+    assert unmatched["feeds"] == [
+        {"value": "DE_DELFI", "count": 1},
+        {"value": "ZZ_FEED", "count": 4},
+    ]
+    assert counts(unmatched["countries"]) == {"YY": 1, "ZZ": 3}
+    contradictions = body["contradictions"]
+    assert contradictions["total"] == 1
+    assert contradictions["feeds"] == [{"value": "DE_DELFI", "count": 1}]
+    assert contradictions["countries"] == [{"value": "ZZ", "count": 1}]
+
+
+def test_links_before_any_build(client: TestClient, content_manager: dict[str, str]) -> None:
+    body = client.get(f"{LINKS}/summary", headers=content_manager).json()
+    assert (body["links"], body["unmatched"]["total"], body["contradictions"]["total"]) == (0, 0, 0)
+    assert body["unmatched"]["labels"] == []
+    for name in ("unmatched", "contradictions"):
+        r = client.get(f"{LINKS}/{name}", headers=content_manager)
+        assert r.status_code == 200, r.text
+        assert r.headers["X-Total-Count"] == "0"
+        assert r.json() == []
+
+
+@pytest.mark.parametrize("path", LINK_ROUTES)
+def test_every_links_route_refuses_an_end_user_and_an_anonymous_caller(
+    client: TestClient, end_user: dict[str, str], path: str
+) -> None:
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=end_user).status_code == 403
+
+
+def test_the_links_are_open_to_both_working_roles(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str]
+) -> None:
+    for headers in (admin, content_manager):
+        for path in LINK_ROUTES:
+            assert client.get(path, headers=headers).status_code == 200

@@ -40,6 +40,7 @@ from .api.admin import storage as admin_storage
 from .api.admin import users as admin_users
 from .api.auth import routes as auth_routes
 from .api.master import aliases as master_aliases
+from .api.master import station_links as master_station_links
 from .api.master import station_ref as master_station_ref
 from .api.master import station_registers as master_station_registers
 from .api.master import stations as master_stations
@@ -152,6 +153,7 @@ app.include_router(admin_station_sources.router)
 app.include_router(master_stations.router)
 app.include_router(master_station_ref.router)
 app.include_router(master_station_registers.router)
+app.include_router(master_station_links.router)
 app.include_router(master_aliases.router)
 app.include_router(reports_routes.router)
 app.include_router(journey_routes.router)
