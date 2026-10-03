@@ -6,10 +6,11 @@ measurements this design answers to.
 
 **Version 2, 2026-10-03.** The first version was reviewed adversarially against the repository and
 the real data and came back with 12 blocking findings. This version incorporates them; §12 lists
-what changed and why. Status: proposed, not built.
+what changed and why. Status: step 1 is being built on `feat/station-panel`; §13 lists every place
+where building it contradicted this document, and the text above §13 has been corrected to match.
 
 > **Two kinds of figures appear below.** Statements about this repository carry a `file:line` and
-> are checkable here. Figures about the offline mapping chain — row counts, the 15 `nap_*` columns,
+> are checkable here. Figures about the offline mapping chain — row counts, the 16 `nap_*` columns,
 > build time and memory — are measured **outside** this repository and cannot be checked from it.
 
 ---
@@ -74,8 +75,9 @@ requirement. So:
 
 **`station_source`** — one row per (portal, dataset).
 
-`id` uuid pk · `key` text unique (`CRD`, `ERA_TELREF`, `TRAINLINE`, `NAP_CH_SBB`, `REG_BE_INFRABEL`)
-· `label` · `kind` (`spine`, `timetable`, `registry`, `merits_input`, `crosscheck`) · `format` ·
+`id` uuid pk · `key` text unique (`CRD`, `ERA_TELREF`, `TRAINLINE`, `nap_CH_SBB`, `REG_BE_INFRABEL`)
+· `label` · `kind` (`spine`, `timetable`, `registry`, `merits_input`, `crosscheck`,
+`offline_build`) · `format` ·
 `acquisition` (`resolver`, `url`, `upload`) · `resolver_type` null · `resolver_config` jsonb, the
 same shape as an `app/data/eu19_nap_sources.json` entry · `credential_id` uuid null, FK
 `ON DELETE SET NULL` as `nap_catalogues` already does · `country_iso` · `operator` · `licence`,
@@ -86,6 +88,13 @@ same shape as an `app/data/eu19_nap_sources.json` entry · `credential_id` uuid 
 (`nap_FR_regional`, `nap_ES_regional`, `nap_CH_SBB_non_rail_members`) that do not map onto one
 (portal, dataset). They are seeded as sources flagged unresolved so their codes import now and the
 split is a later, trackable job.
+
+**What the first migration seeds.** Configuration, never data: one source per input the step 1
+importer knows. `CRD`, `ERA_TELREF` and the three offline outputs `OFFLINE_MASTER`, `OFFLINE_LINKS`,
+`OFFLINE_UNMAPPED` (kind `offline_build`) each declare, in `format`, which of the five file shapes
+they accept; `TRAINLINE`; and the 16 provider columns of the offline master, whose `key` is the
+column name verbatim (`nap_CH_SBB`, not `NAP_CH_SBB`) so that `station_ref_code.source_key` joins
+`station_source.key` without a case mapping.
 
 **Trainline is a `station_source` too.** Otherwise a build's input manifest cannot be complete: the
 existing 04:00 refresh writes `master_stations` with no fingerprint. The cron writes a
@@ -106,7 +115,9 @@ Version 1 defined none, so screen B could not have been built.
 · `plc` · `start_validity` · `end_validity` · `active_flag` · `name` · `free_text` · `lat` · `lon`
 · `passenger_flag` · `freight_flag` · `responsible_im` · `nuts`.
 Unique `(source_version_id, country, location_code, start_validity)` — CRD's own key is (country,
-code, validity). Index `(source_version_id, plc)`.
+code, validity). Index `(source_version_id, plc)`. The validity and the three flags are stored as
+text, exactly as the offline extractor wrote them; `station_ref.crd_start` / `crd_end` are the
+parsed dates.
 
 **`crd_subsidiary`** — `id` · `source_version_id` · `plc` · `subsidiary_type` · `allocation_company`
 · `code` · `name`. Index `(source_version_id, plc)`.
@@ -124,11 +135,11 @@ The delta shown on upload is a set difference between two `source_version_id`s o
 |---|---|
 | Identity | `id` bigserial pk · `plc` text not null, `CHECK (length(plc) = 7)` · `era_uopid` text **not null** · `previous_plc` text null |
 | Constraint | `UNIQUE (plc, era_uopid)` |
-| Names | `name` · `name_src` · `alt_name` text[] |
+| Names | `name` · `name_src` · `alt_name` text[] · `alt_name_text` |
 | Position | `lat` · `lon` · `pos_src` · `link_pos_src` · `position_flag` |
-| Classification | `iso2` · `iso2_all` char(2)[] · `op_type_all` · `op_type_src` · `is_passenger` · `is_passenger_src` · `plc_kind` |
+| Classification | `iso2` · `iso2_all` text[] · `op_type_all` text[] · `op_type_src` · `is_passenger` · `is_passenger_src` · `plc_kind` |
 | Multiplicity | `n_op_with_plc` int · `plc_op_max_sep_m` int |
-| Spine | `spine_source` · `crd_start` · `crd_end` · `is_current` generated · `crd_source_tag` |
+| Spine | `spine_source` · `crd_start` · `crd_end` · `is_current` bool, set by the build · `crd_source_tag` |
 | MERITS (chosen) | `uic_merits` · `uic_merits_origin` · `uic_merits_rule` · `uic_merits_confidence` |
 | Other codes | `rl100` · `nat_code` · `nat_code_series` · `nat_code_src` · `ifopt_dhid` · `ifopt_dhid_src` · `eva` · `eva_src` · `eva_all` text[] |
 | Grouping | `complex_id` FK `ON DELETE SET NULL` · `complex_role` |
@@ -146,12 +157,22 @@ Why these and not version 1's:
   with every child FK and every hand correction pointing at a dead build — or an in-place rewrite
   with no history. The row is current state; history is `station_ref_history`.
 - **`previous_plc`** is the only safe historical join after a renumbering, on a table keyed on PLC.
-- **`is_current`** = `crd_end IS NULL OR crd_end >= CURRENT_DATE`, with a partial index. Without it
-  nothing says a row is retired, on the table step 7 puts behind the typeahead.
+- **`is_current`** = `crd_end IS NULL OR crd_end >= ` the build date, with a partial index. Without
+  it nothing says a row is retired, on the table step 7 puts behind the typeahead. It is a plain
+  boolean the build sets, **not** a generated column: a generation expression and an index predicate
+  must be immutable, and `CURRENT_DATE` is not, so Postgres refuses both. The consequence is that it
+  goes stale between builds; a nightly `UPDATE` is a small later addition.
+- **`complex_role`** is `principal` or `member`, the one `CHECK` on this table besides the PLC
+  length.
 
-Indexes: GIN trigram on `name` and on `alt_name` (`pg_trgm` is already used by `master_stations`);
-btree `(iso2, is_passenger)`; partial `WHERE is_passenger AND uic_merits IS NOT NULL` for the
-typeahead; btree on `uic_merits`, `previous_plc`, `complex_id`; GIN on `iso2_all`.
+Indexes: GIN trigram on `name` and on `alt_name_text` (`pg_trgm` is already used by
+`master_stations`); btree `(iso2, is_passenger)`; partial GIN trigram on `name`
+`WHERE is_passenger AND uic_merits IS NOT NULL` for the typeahead; btree on `uic_merits`,
+`previous_plc`, `complex_id`; GIN on `iso2_all`; partial btree `(plc) WHERE is_current`.
+
+`alt_name_text` is `alt_name` joined into one string, maintained by the build. It exists only for
+the trigram index: `gin_trgm_ops` cannot index a `text[]`, and `array_to_string` is not immutable,
+so neither an expression index nor a generated column can do it.
 
 **`station_ref_code`** — one row per (station, source, series, code). Where "one column per
 provider" lives: stored long, displayed wide.
@@ -160,9 +181,16 @@ provider" lives: stored long, displayed wide.
 `code_raw` null · `normalisation_rule` null · `is_primary` · `evidence_only` bool · `confidence` ·
 `method`.
 
-`UNIQUE (station_id, source_key, series, code)`. **`(series, code)` is a lookup index, not a unique
-key**: on the real data, 3,580 `(series, code)` pairs map to more than one station, so a unique
-constraint would fail on the first import. A second index on `(code)` serves bare-code search.
+`UNIQUE NULLS NOT DISTINCT (station_id, source_key, series, code)`. **`(series, code)` is a lookup
+index, not a unique key**: on the real data, 3,580 `(series, code)` pairs map to more than one
+station, so a unique constraint would fail on the first import. A second index on `(code)` serves
+bare-code search.
+
+`series` is **nullable**. The offline master's provider columns carry codes and no series, and one
+column can mix shapes (`9900001|9900001:0:1`), so a per-column series would be a guess. The importer
+fills `series` only where the links file names it for the same station and the same code value, and
+leaves it NULL otherwise; `NULLS NOT DISTINCT` (Postgres 15+, the stack runs 16) keeps the unique
+key meaningful for those rows.
 
 `code_raw` and `normalisation_rule` exist because `code` is not always what the provider published —
 DIUM codes are normalised. `evidence_only` marks a code that must never be used as a join key.
@@ -186,13 +214,20 @@ filtering.
 **`station_ref_flag`** — `station_id` · `token` · `payload` · `level` · `warning_code` ·
 `related_station_id` FK `ON DELETE SET NULL`. `UNIQUE (station_id, token, payload)`. A `text[]` of
 `token:payload` strings cannot be joined, and many tokens name another station — a swap partner, a
-displaced candidate — which the detail page must link to.
+displaced candidate — which the detail page must link to. `payload` is `NOT NULL`, the empty string
+for a bare token: left nullable, the unique key would not constrain bare tokens, for the same reason
+`era_uopid` is `NOT NULL`.
 
 **`station_ref_override`** — `station_id` · `field_name` · `value` · `reason` · `set_by` · `set_at`
-· `computed_value_at_set` · `released_at`. Partial unique `(station_id, field_name) WHERE
-released_at IS NULL`. One boolean per row cannot work against per-value provenance: when a rebuild
-improves a *different* field of a corrected row, it must not have to choose between its improvement
-and the correction.
+· `computed_value_at_set` · `computed_value_latest` · `released_at`. Partial unique
+`(station_id, field_name) WHERE released_at IS NULL`. One boolean per row cannot work against
+per-value provenance: when a rebuild improves a *different* field of a corrected row, it must not
+have to choose between its improvement and the correction.
+
+`station_ref` holds the *effective* value, so a search or a filter sees the correction.
+`computed_value_latest` is what the last build computed underneath it: without it a release after a
+rebuild could only restore the value from the day the correction was made. `station_id` is
+`ON DELETE RESTRICT` here — a station carrying hand corrections is not deleted by accident.
 
 **`station_ref_link`** — the adjudication ladder, at the offline links file's grain.
 `station_id` null · `source_version_id` · `offline_station_id` · `feed_key` · `stop_key` ·
@@ -206,6 +241,14 @@ lists are rendered from.
 
 **`station_ref_history`** — `station_id` · `build_id` · `field_name` · `old_value` · `new_value`.
 Written by the build from its own diff.
+
+**FK actions this section leaves open**, as built: every child's `station_id` is `ON DELETE
+CASCADE` (codes, MERITS candidates, aliases, flags, links, history are derived rows) except the
+override's, which is `RESTRICT`; `build_id` on aliases and history is `CASCADE`, since those rows
+belong to one build; `set_by` and `uploaded_by` are `SET NULL`. Indexes added beyond the ones named
+above: `station_ref_link (station_id)` and a partial `(label, iso2) WHERE station_id IS NULL` for
+screen A, `station_ref_flag (token)` for the flag filter, `station_ref_alias (station_id)`, and
+`station_ref_history (station_id, build_id)` and `(build_id)`.
 
 ### 3.4 Complexes
 
@@ -247,8 +290,9 @@ file, so nothing can populate it until an extractor runs in the server.
 
 ### 3.7 Builds
 
-**`station_build`** — `id` · `started_at` · `finished_at` · `status` · `builder_version` · `inputs`
-jsonb (source version ids and sha256) · `counts` jsonb · `diff_summary` jsonb · `log_path`.
+**`station_build`** — `id` bigserial, so builds are numbered · `started_at` · `finished_at` ·
+`status` · `builder_version` · `inputs` jsonb (source version ids and sha256) · `counts` jsonb ·
+`diff_summary` jsonb · `log_path`.
 
 **Retention**: keep the last three builds' rows and their `station_ref_history`; keep every
 `station_source_version` row but only the last two stored files per source.
@@ -469,9 +513,11 @@ float representation, list order), against a pinned `--winner-key`.
   test asserts it, and its `REQUIRED_TABLES` list (`tests/integration/test_migrations.py:23-43`)
   must be extended.
 - **Linting and coverage of migrations**: the `**/migrations/versions/*` exclude in
-  `pyproject.toml:14` has never matched `alembic/versions/`, so ruff lints migrations. The same
-  stale glob is in `sonar-project.properties` twice, so Sonar raises issues on new migrations **and
-  counts them in new-code coverage**. The integration downgrade test is what covers them.
+  `pyproject.toml:14` has never matched `alembic/versions/`, so ruff lints migrations. Sonar does
+  **not** see them: `sonar-project.properties` sets `sonar.sources=app`, and `alembic/` is outside
+  it, so the stale globs there are moot and migrations count in neither Sonar's issues nor its
+  new-code coverage. What checks a migration is ruff, the offline-SQL unit test
+  (`tests/unit/test_station_schema.py`) and the integration upgrade/downgrade test.
 - **Routers**: `app/api/__init__.py` is empty; registration is two hand-written lines in
   `app/main.py`.
 - **Auth**: there is no router-level dependency anywhere, so an endpoint has no auth unless its own
@@ -527,7 +573,7 @@ at `app/api/admin/sessions.py:664` so it returns 400 rather than 500.
 
 | File | Feeds |
 |---|---|
-| `station_master_crd_*.csv` (63,049 × 73) | `station_ref`, `station_ref_merits`, `station_ref_flag`, and `station_ref_code` from its 15 `nap_*` columns — 39,515 non-empty cells, 2,069 of them `\|`-separated multi-value |
+| `station_master_crd_*.csv` (63,049 × 73) | `station_ref`, `station_ref_merits`, `station_ref_flag`, and `station_ref_code` from its 16 `nap_*` provider columns — 39,515 non-empty cells, 2,069 of them `\|`-separated multi-value |
 | `station_links_crd_*.csv` (44,708 × 24) | `station_ref_link`, asserted and non-asserted |
 | `nap_rail_stations_unmapped_crd_*.csv` (29,670 × 23) | `station_ref_link` with a null `station_id` |
 | `crd_locations_*.csv` (63,049 × 65) | `crd_location` |
@@ -582,3 +628,27 @@ XML file, any artefact, any change to the journey page.
 | nav group copied from `Admin dashboard` | wrong role block; hides the menu from content managers | stays in the Stations block |
 | typeahead exposes passenger rows | over half have no UIC | exposes routable rows |
 | the port is "the builder", 4,015 lines | ~19,000 lines across 17 scripts | sized per stage |
+
+---
+
+## 13. What building step 1 changed
+
+Version 2 was reviewed against the repository but never built. Each row below is a statement this
+document made that the code, Postgres or the file shapes contradicted. The sections above have been
+corrected; this table is the record.
+
+### Schema
+
+| Version 2 said | What is true | As built |
+|---|---|---|
+| `is_current` is a generated column with a partial index | a generation expression and an index predicate must be immutable; `CURRENT_DATE` is not | a plain boolean the build sets, partial index `WHERE is_current`. It goes stale between builds |
+| GIN trigram on `alt_name` | `gin_trgm_ops` cannot index a `text[]`, and `array_to_string` is not immutable | a text column `alt_name_text`, maintained by the build, carries the index |
+| `iso2_all` char(2)[] | §3's own rule is "never `char(n)`": it pads short values and rejects long ones, and the importer must keep what it does not recognise | `text[]` |
+| `station_ref_code.series` is part of the key and FK'd | the master's provider columns carry no series, and one column mixes code shapes | `series` nullable, `UNIQUE NULLS NOT DISTINCT`; filled from the links file where it names the same station and code |
+| `station_ref_flag` `UNIQUE (station_id, token, payload)` | with a nullable `payload` the key does not constrain bare tokens | `payload` is `NOT NULL`, `''` for a bare token |
+| `station_ref_override` keeps `computed_value_at_set` only | a release after a rebuild would restore a stale value | `computed_value_latest` added |
+| `complex_role` has a `CHECK` | the value set was never given | `principal`, `member` |
+| "the 15 `nap_*` columns" | the header in `station-offline-file-shapes.md` lists 16 | 16 provider sources seeded; the importer takes the list from the header |
+| source keys such as `NAP_CH_SBB` | the shapes document says `source_key` is the column name | `nap_CH_SBB`, verbatim |
+| only `station_code_series` is seeded | the upload route needs a source to exist, and its `format` is what says which file shape it accepts | the first migration also seeds 22 `station_source` rows; kind `offline_build` added |
+| Sonar counts new migrations in new-code coverage | `sonar.sources=app`; `alembic/` is outside it | corrected in §9 |

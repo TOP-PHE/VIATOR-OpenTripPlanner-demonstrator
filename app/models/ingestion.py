@@ -88,3 +88,7 @@ class RebuildJob(TimestampMixin, Base):
     # the build container, so it watches this column, kills the container and
     # records the job as `cancelled`. A pending job is cancelled outright.
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # What the worker runs for this job: 'graph' (an OTP or MOTIS build, the
+    # only kind before the station panel) or 'station_build' (the station
+    # reference import, which has no session and no build container).
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'graph'"))

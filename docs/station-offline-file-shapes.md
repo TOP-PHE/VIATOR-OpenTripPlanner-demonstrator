@@ -69,9 +69,12 @@ exist (`plc_kind`): `era_internal_eu` (89 rows, prefix `EU`, border points), `ui
   one; `uic_merits_candidate` is the calculated one and may differ (it does on the 18 rows whose
   origin is `Trainline (calculated differs)`); each value in `uic_merits_conflict_values` is a
   further non-chosen row.
-- Each of the 15 `nap_*` provider columns → `station_ref_code` rows, one per `|`-separated value.
+- Each of the 16 `nap_*` provider columns → `station_ref_code` rows, one per `|`-separated value.
   `source_key` is the column name. `nap_station_ids` is **not** a provider column — it lists the
-  offline station ids the row is linked to.
+  offline station ids the row is linked to. (This document used to say 15; the header above lists
+  16, and the header is what was read from the file.) The master states no series for these codes:
+  `series` is taken from the links file where it names the same station and the same code value,
+  and is NULL otherwise.
 - `flags` → one `station_ref_flag` row per `;`-separated token; split each on the first `:` into
   token and payload. When the payload is a PLC present in this file, set `related_station_id`.
 - `n_nap_feeds`, `best_tier`, `warning_level` → the columns of the same name.
@@ -134,9 +137,10 @@ that were never expected to match a railway location.
 plc,iso2,uopid,era_uri,name,op_type,is_passenger,lat,lon,n_plc_on_op,n_op_with_plc,plc_prefix,plc_kind,iso3,era_iso2_table,iso2_all,n_countries,op_type_all,n_op_types,is_passenger_src,alt_name,n_names,position_flag,lat_dp,lon_dp,location_uri,n_locations,plc_op_max_sep_m,plc_op_names_agree,net_element,n_line_refs,line_ids,line_ids_src,n_tracks,n_sidings,local_rules_or_restrictions,spine_source,crd_country,crd_location_code,crd_start,crd_end,crd_passenger_flag,crd_freight_flag,crd_responsible_im,crd_nuts,crd_rl100,crd_sncf_codes,crd_sncf_site_codes,crd_ns_abbrev,crd_sncb_telegraph,crd_sbb_enee,crd_dium_codes,previous_plc,era_name,era_lat,era_lon,era_crd_dist_m,name_src,pos_src,op_type_src,era_crd_passenger_disagree,crd_source_tag,crd_position_issue,era_position_alternative,crd_key_check
 ```
 
-The first 36 columns are identical to file 5, by design. `plc_op_max_sep_m`, `n_op_with_plc`,
-`is_passenger_src` and `crd_start` / `crd_end` are needed by `station_ref` and are **not** in file 1
-— read them from here, joined on `(plc, uopid)`.
+The first 36 columns are identical to file 5, by design. `plc_op_max_sep_m`, `is_passenger_src` and
+`crd_start` / `crd_end` are needed by `station_ref` and are **not** in file 1 — read them from
+here, joined on `(plc, uopid)`. (`n_op_with_plc` is in both headers; the importer reads it from
+file 1 and falls back to this file.)
 
 The subsidiary codes are flattened into `crd_rl100`, `crd_sncf_codes`, `crd_sncf_site_codes`,
 `crd_ns_abbrev`, `crd_sncb_telegraph`, `crd_sbb_enee`, `crd_dium_codes`. In step 1 the importer
