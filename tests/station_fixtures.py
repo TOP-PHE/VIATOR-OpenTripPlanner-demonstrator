@@ -52,7 +52,7 @@ def page_request(path: str, role: str | None) -> Request:
 
 
 _SCRIPT_RE = re.compile(
-    r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>", re.DOTALL | re.IGNORECASE
+    r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script\b[^>]*>", re.DOTALL | re.IGNORECASE
 )
 
 
