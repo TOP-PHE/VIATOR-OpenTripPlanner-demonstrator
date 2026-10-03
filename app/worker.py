@@ -54,6 +54,11 @@ _DOCKER = "/usr/local/bin/docker"
 _BUILD_CONTAINER_PREFIX = "viator-build-"
 _CANCEL_POLL_SECONDS = 10.0
 
+# `rebuild_jobs.kind`: what the worker runs for a job. Every job before the
+# station panel was a graph build, hence the default.
+_GRAPH_JOB_KIND = "graph"
+_STATION_BUILD_KIND = "station_build"
+
 
 def _name_args(container_name: str | None) -> list[str]:
     return ["--name", container_name] if container_name else []
@@ -312,6 +317,17 @@ def main() -> None:
     except Exception:
         log.exception("orphan rebuild_jobs cleanup failed at startup (non-fatal)")
 
+    # The same for station builds: a `station_build` row left `running` by a
+    # worker that died would show as an eternal build on the Sources screen.
+    try:
+        from .master import station_import
+
+        n = station_import.mark_orphaned_builds()
+        if n:
+            log.warning("marked %d orphaned station builds as failed at startup", n)
+    except Exception:
+        log.exception("orphan station_build cleanup failed at startup (non-fatal)")
+
     # A build container outlives the worker that started it. Its job was just
     # marked failed, so nothing would ever read its result — stop it before it
     # competes with the next build for memory.
@@ -376,6 +392,7 @@ def tick() -> None:
         job_id = job.id
         sid = job.session_id
         max_memory = bool(job.max_memory)
+        kind = getattr(job, "kind", None) or _GRAPH_JOB_KIND
         # Conditional claim: an operator may have cancelled the job since the
         # SELECT above, and that must win over starting it.
         claimed = db.execute(
@@ -387,6 +404,15 @@ def tick() -> None:
         db.commit()
         if claimed is None:
             return
+
+    # A station reference build is not a graph build: it has no session, no
+    # engine and no build container. Branch BEFORE the engine lookup, so none
+    # of what follows runs for it: no cancel watcher (which would `docker kill`
+    # a container that never existed), no session state advance, no graph
+    # snapshot, no max-memory stop of the serving stack.
+    if kind == _STATION_BUILD_KIND:
+        _run_station_build(job_id)
+        return
 
     log.info("running rebuild job %s (session=%s max_memory=%s)", job_id, sid, max_memory)
     # P1 MOTIS — dispatch to the engine-appropriate builder. We resolve
@@ -479,6 +505,32 @@ def tick() -> None:
                     job_id,
                 )
 
+        db.commit()
+
+
+def _run_station_build(job_id: uuid.UUID) -> None:
+    """Run the station importer for a `station_build` job and record the outcome.
+
+    The importer records its own `station_build` row and never raises for a
+    refused or failed build; the guard here is for what it cannot foresee (the
+    database going away mid-build), so the job row never stays `running`.
+    """
+    from .master import station_import
+
+    log.info("running station build job %s", job_id)
+    try:
+        output, success = station_import.run_build()
+    except Exception:
+        log.exception("station build job %s crashed", job_id)
+        output, success = "[viator] the station build crashed: see the worker log\n", False
+
+    with SessionLocal() as db:
+        job = db.get(RebuildJob, job_id)
+        if job is None:  # pragma: no cover  defensive
+            return
+        job.finished_at = datetime.now(UTC)
+        job.status = "done" if success else "failed"
+        job.log = (job.log or "") + output[-32_000:]
         db.commit()
 
 

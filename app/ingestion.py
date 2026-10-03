@@ -517,20 +517,37 @@ def dispatch(
     raise ValueError(f"No dispatch rule for kind={kind}")
 
 
-def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> None:
-    """Coalesce: skip if a pending job for the same session already exists."""
+GRAPH_JOB_KIND = "graph"
+
+
+def _enqueue_rebuild(
+    db: DbSession, *, session_id: str | None, reason: str, kind: str = GRAPH_JOB_KIND
+) -> bool:
+    """Queue a job for the worker. Returns False when it coalesced.
+
+    Coalesces on `(status, session_id, kind)`: skip if a pending job of the
+    same kind for the same session already exists. The kind is part of the key
+    because a station build has no session, exactly like the legacy
+    session-less graph job: on `(status, session_id)` alone one would swallow
+    the other.
+    """
     pending = (
         db.query(RebuildJob)
         .filter(RebuildJob.status == "pending")
+        # SQLAlchemy renders `== None` as IS NULL, so session-less jobs do
+        # coalesce with each other — which is why the kind must tell them apart.
         .filter(RebuildJob.session_id == session_id)
+        .filter(RebuildJob.kind == kind)
         .first()
     )
     if pending is not None:
-        return
+        return False
     job = RebuildJob(
         session_id=session_id,
         status="pending",
+        kind=kind,
         log=f"queued at {datetime.now(UTC).isoformat()} — {reason}\n",
     )
     db.add(job)
     db.commit()
+    return True

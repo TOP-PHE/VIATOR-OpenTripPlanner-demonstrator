@@ -105,6 +105,9 @@
     .top nav .nav-group:hover .nav-dropdown,
     .top nav .nav-group:focus-within .nav-dropdown,
     .top nav .nav-group[open] .nav-dropdown { display: block; }
+    /* A group near the left of the nav opens to the right of its summary;
+       anchored right like the default, its panel would cover the logo. */
+    .top nav .nav-group-left .nav-dropdown { left: 0; right: auto; }
     .top nav .nav-dropdown a {
       display: block;
       padding: 0.5rem 1rem;
@@ -160,6 +163,23 @@
     th { background: #eef2f8; font-weight: 600; color: var(--brand-blue); }
     tr.changed { background: #fffbe6; }
 
+    /* ───── badges and hints ─────
+       `.flag` is promoted from journey.html: the Trainline panel uses it for its
+       DRIFT badge and could not reach a rule kept in another page's style block.
+       The green and red variants are the journey page's own, written with this
+       file's variables. The blue and amber ones take the pairs this file and the
+       station panel already use on those tints, which meet WCAG AA at this size;
+       journey.html keeps its two, which it shares with .leg-mode and .cmp-count.
+       `.hint` never had a rule of its own, only scoped ones (.hub-form-grid .hint,
+       .detail-section .hint, …). They all set this colour, and they still win
+       where they apply. */
+    .flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
+    .flag.ALL         { background: #e9f6ec; color: var(--ok); }
+    .flag.NAP-ONLY    { background: #fdecef; color: var(--fail); }
+    .flag.MERITS-ONLY { background: #e8f0fb; color: var(--brand-blue-d); }
+    .flag.SUBSET      { background: #fff8e1; color: #6f5100; }
+    .hint { color: var(--rail-steel); }
+
     /* ───── footer ───── */
     footer { margin-top: 4rem; padding: 1.2rem; border-top: 1px solid var(--sleeper); color: var(--rail-steel); font-size: 0.75rem; line-height: 1.6; }
     footer .inner { max-width: 1100px; margin: 0 auto; }
@@ -198,7 +218,41 @@
           {% if current_user %}
             <a href="/journey">Search</a>
             {% if current_user.role in ('platform_admin', 'content_manager') %}
-              <a href="/admin/master/stations">Stations</a>
+              {# Station panel (docs/station-panel-design.md section 2). The group
+                 stays in THIS role block: four of its five entries are for
+                 content managers, who never see the platform-admin block below.
+                 Only the fifth entry is platform-admin-only. Same markup as the
+                 Admin dashboard group: a native <details>, no JavaScript. #}
+              <details class="nav-group nav-group-left">
+                <summary>Stations</summary>
+                <div class="nav-dropdown" role="menu">
+                  <div class="nav-dropdown-section">Inputs</div>
+                  <a href="/admin/stations/nap" role="menuitem"
+                     title="What each feed says about each stop: the stops we could not match, and the ones whose code contradicts the reference">
+                    NAP&nbsp;station&nbsp;information
+                  </a>
+                  <a href="/admin/stations/registers" role="menuitem"
+                     title="CRD primary locations and ERA operational points, and what changed between two versions">
+                    Infrastructure&nbsp;registers
+                  </a>
+                  <a href="/admin/stations/trainline" role="menuitem"
+                     title="The Trainline registry: the MERITS code when a station is known to Trainline">
+                    Trainline&nbsp;codes
+                  </a>
+                  <div class="nav-dropdown-section">Reference</div>
+                  <a href="/admin/stations/reference" role="menuitem"
+                     title="VIATOR's own station reference, keyed on the primary location code">
+                    VIATOR&nbsp;station&nbsp;reference
+                  </a>
+                  {% if current_user.role == 'platform_admin' %}
+                    <div class="nav-dropdown-section">Administration</div>
+                    <a href="/admin/stations/sources" role="menuitem"
+                       title="How every station input is acquired: sources, uploaded versions, builds">
+                      Sources&nbsp;and&nbsp;integration
+                    </a>
+                  {% endif %}
+                </div>
+              </details>
             {% endif %}
             {% if current_user.role == 'platform_admin' %}
               <a href="/admin/sessions">Sessions</a>

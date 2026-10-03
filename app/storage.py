@@ -12,7 +12,9 @@ What is never a candidate:
   * the build a session's `current` symlink points to (what is served);
   * anything of a session whose rebuild is running;
   * a live feed or `osm.pbf` (only `.old`, `.old.N` and `.orphaned` copies);
-  * a `_staging/` file younger than a day (a refresh may be writing it).
+  * a `_staging/` file younger than a day (a refresh may be writing it);
+  * the top-level inbox folders `_stations` and `_staging`, which are not
+    session folders (`INBOX_ROOT_RESERVED`).
 
 Deletion re-runs the scan and deletes only ids present in the fresh result,
 so the endpoint can never be pointed at an arbitrary path, and a candidate that
@@ -44,6 +46,13 @@ _OTP_GRAPH = "graph.obj"
 _OTP_ROUTER_CONFIG = "router-config.json"
 # Top-level graph-volume names that are not session folders.
 _GRAPH_ROOT_RESERVED = {"motis", _OTP_GRAPH, _OTP_ROUTER_CONFIG, "current", "lost+found"}
+# Top-level inbox names that are not session folders either, and so must never
+# be offered as "the folder of a session that no longer exists":
+#   `_stations`  the station panel's source files (app/master/station_store.py).
+#                They are the only copy of what a station build was made from.
+#   `_staging`   where the legacy `/upload` route streams a file before it is
+#                dispatched. Deleting it mid-upload loses the upload.
+INBOX_ROOT_RESERVED = frozenset({"_stations", "_staging"})
 
 WARN_PERCENT = 85.0
 
@@ -280,7 +289,10 @@ def scan(
     usages: dict[str, SessionUsage] = {}
 
     def usage_for(sid: str) -> SessionUsage:
-        return usages.setdefault(sid, SessionUsage(sid, sid in session_ids))
+        # A reserved folder is reported (its size matters) but is not "a
+        # deleted session": `known` is what the page badges as deleted.
+        known = sid in session_ids or sid in INBOX_ROOT_RESERVED
+        return usages.setdefault(sid, SessionUsage(sid, known))
 
     for root, prefix in _graph_roots(graph_dir):
         sid = root.name
@@ -297,6 +309,8 @@ def scan(
     for root in _subdirs(inbox_dir):
         sid = root.name
         usage_for(sid).inbox_bytes += path_size(root)
+        if sid in INBOX_ROOT_RESERVED:
+            continue
         if sid in session_ids:
             report.candidates += _inbox_candidates(root, sid, sid in busy_session_ids, now)
         else:

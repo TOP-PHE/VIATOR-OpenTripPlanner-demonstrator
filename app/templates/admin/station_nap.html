@@ -1,0 +1,189 @@
+{% extends "_base.html" %}
+{% block title %}NAP station information — VIATOR admin{% endblock %}
+
+{% block content %}
+{% set station_tab = 'nap' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>NAP station information</h1>
+<p class="sp-lead">
+  What the timetable feeds say about their stops, against the station reference. In this first
+  step the screen is the two lists that do the daily work. The view of one stop with every field
+  its feed carries arrives with the step that reads the feeds on the server.
+</p>
+
+<div class="sp-tablist">
+  <button type="button" class="secondary" data-view="unmatched" aria-pressed="true">Stops we could not match <span id="count-unmatched"></span></button>
+  <button type="button" class="secondary" data-view="contradictions" aria-pressed="false">Stops whose code contradicts the reference <span id="count-contradictions"></span></button>
+</div>
+
+<div class="sp-banner note" id="explain"></div>
+
+<form id="filters" class="sp-filters">
+  <label>Feed <select name="feed"><option value="">any</option></select></label>
+  <label>Country <select name="country"><option value="">any</option></select></label>
+  <label>Search <input type="search" name="q" placeholder="stop name" style="min-width: 14rem"></label>
+  <fieldset id="labels" style="border: 0; padding: 0; margin: 0; display: flex; gap: 0.6rem; align-items: center">
+    <legend class="sp-muted" style="font-size: 0.8rem; font-weight: 600; padding: 0">Kind of stop</legend>
+  </fieldset>
+  <button type="submit">Search</button>
+  <button type="button" class="secondary" id="clear">Clear</button>
+</form>
+
+<div class="sp-scroll">
+  <table>
+    <thead id="nap-head"><tr>
+      <th scope="col">Stop</th><th scope="col">Feed</th><th scope="col">Country</th>
+      <th scope="col">Kind</th><th scope="col">Position</th><th scope="col">Reason</th>
+      <th scope="col">Nearest reference row</th><th scope="col">Distance</th>
+    </tr></thead>
+    <tbody id="nap-body"><tr><td colspan="8">Loading…</td></tr></tbody>
+  </table>
+</div>
+<div id="pager" class="sp-pager"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+const SP = globalThis.StationPanel;
+const API = '/api/master/station-links/';
+const PAGE_SIZE = 50;
+const DASH = '<span class="sp-muted">—</span>';
+const VIEWS = {
+  unmatched: {
+    heads: ['Stop', 'Feed', 'Country', 'Kind', 'Position', 'Reason', 'Nearest reference row', 'Distance'],
+    explain: 'Stops of the feeds that no reference row could be matched to, the nearest first. By default only rail and multimodal stops are listed: the urban ones are tram and bus stops that were never expected to match a railway location.',
+  },
+  contradictions: {
+    heads: ['Feed', 'Stop', 'Code', 'Reference row the code points at', 'Tier', 'Method', 'Distance', 'Name similarity', 'Note'],
+    explain: 'Links that were not asserted although the stop carries a code: the code says "this reference row", the distance or the name says otherwise. Either the stop carries a wrong code, or the reference row is wrong.',
+  },
+};
+
+let view = 'unmatched';
+let page = 0;
+let summary = null;
+
+const filters = document.getElementById('filters');
+const body = document.getElementById('nap-body');
+
+function text(value) {
+  return value === null || value === undefined || value === '' ? DASH : SP.esc(value);
+}
+
+function metres(value) {
+  return value === null || value === undefined ? DASH : SP.fmtInt(Math.round(value)) + ' m';
+}
+
+function stationLink(s) {
+  return '<a href="/admin/stations/reference/' + s.id + '"><span class="sp-code">' + SP.esc(s.plc) + '</span> ' + SP.esc(s.name || '') + '</a>';
+}
+
+function nearestCell(r) {
+  if (!r.nearest_plc) return DASH;
+  if (!r.nearest.length) return '<span class="sp-code">' + SP.esc(r.nearest_plc) + '</span>';
+  return r.nearest.map(stationLink).join('<br>');
+}
+
+function unmatchedRow(r) {
+  const position = r.lat === null || r.lon === null ? DASH : r.lat.toFixed(5) + ', ' + r.lon.toFixed(5);
+  return '<tr><td>' + text(r.stop_name) + '<br><span class="sp-code sp-muted">' + SP.esc(r.offline_station_id || '') + '</span></td>' +
+    '<td>' + SP.esc(r.feed_key || '').replaceAll('|', '<br>') + '</td><td>' + text(r.iso2) + '</td>' +
+    '<td>' + text(r.label) + '</td><td class="sp-code">' + position + '</td><td>' + text(r.reason) + '</td>' +
+    '<td>' + nearestCell(r) + '</td><td class="sp-num">' + metres(r.nearest_distance_m) + '</td></tr>';
+}
+
+function contradictionRow(r) {
+  const station = r.station ? stationLink(r.station) + ' <span class="sp-muted">' + SP.esc(r.station.iso2 || '') + '</span>' : DASH;
+  const similarity = r.name_sim === null ? DASH : r.name_sim.toFixed(2);
+  return '<tr><td>' + text(r.feed_key) + '</td>' +
+    '<td>' + text(r.stop_name) + '<br><span class="sp-code sp-muted">' + SP.esc(r.stop_key || '') + '</span></td>' +
+    '<td><span class="sp-code">' + SP.esc(r.code_value) + '</span><br><span class="sp-muted">' + SP.esc(r.code_series || '') + '</span></td>' +
+    '<td>' + station + '</td><td>' + text(r.tier) + '</td><td>' + text(r.match_method) + '</td>' +
+    '<td class="sp-num">' + metres(r.distance_m) + '</td><td class="sp-num">' + similarity + '</td><td>' + text(r.note) + '</td></tr>';
+}
+
+const ROWS = {unmatched: unmatchedRow, contradictions: contradictionRow};
+
+function fillSelect(select, facet) {
+  select.length = 1;
+  for (const item of facet) {
+    if (item.value) select.add(new Option(item.value + ' (' + SP.fmtInt(item.count) + ')', item.value));
+  }
+}
+
+function renderLabels() {
+  const box = document.getElementById('labels');
+  box.hidden = view !== 'unmatched';
+  for (const old of box.querySelectorAll('label')) old.remove();
+  for (const item of summary.unmatched.labels) {
+    const checked = summary.default_labels.includes(item.value) ? ' checked' : '';
+    box.insertAdjacentHTML('beforeend',
+      '<label class="sp-check"><input type="checkbox" name="label" value="' + SP.esc(item.value) + '"' + checked + '> ' +
+      SP.esc(item.value) + ' <span class="sp-muted">(' + SP.fmtInt(item.count) + ')</span></label>');
+  }
+}
+
+function currentParams() {
+  const data = new FormData(filters);
+  const params = new URLSearchParams(SP.query({
+    feed: data.get('feed'), country: data.get('country'), q: (data.get('q') || '').trim(), page, size: PAGE_SIZE,
+  }));
+  if (view === 'unmatched') {
+    const labels = data.getAll('label');
+    // No box ticked means every kind, not the default two.
+    for (const label of labels.length ? labels : ['all']) params.append('label', label);
+  }
+  return params.toString();
+}
+
+async function load(toPage) {
+  page = toPage;
+  const columns = VIEWS[view].heads.length;
+  try {
+    const {data, headers} = await SP.getJson(API + view + '?' + currentParams());
+    body.innerHTML = data.length
+      ? data.map(ROWS[view]).join('')
+      : '<tr><td colspan="' + columns + '"><em>Nothing to show.</em></td></tr>';
+    SP.renderPager(document.getElementById('pager'), page, PAGE_SIZE, SP.totalOf(headers), load);
+  } catch (err) {
+    SP.toast('error', 'Could not load the list: ' + err.message);
+  }
+}
+
+async function show(name) {
+  view = name;
+  for (const tab of document.querySelectorAll('[data-view]')) {
+    tab.setAttribute('aria-pressed', String(tab.dataset.view === name));
+  }
+  document.getElementById('nap-head').innerHTML =
+    '<tr>' + VIEWS[name].heads.map((title) => '<th scope="col">' + title + '</th>').join('') + '</tr>';
+  document.getElementById('explain').textContent = VIEWS[name].explain;
+  filters.reset();
+  fillSelect(filters.elements.feed, summary[name].feeds);
+  fillSelect(filters.elements.country, summary[name].countries);
+  renderLabels();
+  await load(0);
+}
+
+async function init() {
+  const {data} = await SP.getJson(API + 'summary');
+  summary = data;
+  document.getElementById('count-unmatched').textContent = '(' + SP.fmtInt(data.unmatched.total) + ')';
+  document.getElementById('count-contradictions').textContent = '(' + SP.fmtInt(data.contradictions.total) + ')';
+  await show('unmatched');
+}
+
+for (const tab of document.querySelectorAll('[data-view]')) {
+  tab.addEventListener('click', () => show(tab.dataset.view));
+}
+filters.addEventListener('submit', (event) => { event.preventDefault(); load(0); });
+document.getElementById('clear').addEventListener('click', () => show(view));
+
+try {
+  await init();
+} catch (err) {
+  SP.toast('error', 'Could not load the stops: ' + err.message);
+}
+</script>
+{% endblock %}

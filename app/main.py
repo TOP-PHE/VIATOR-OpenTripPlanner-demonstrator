@@ -35,10 +35,14 @@ from .api.admin import nap_catalogues as admin_nap_catalogues
 from .api.admin import network_coverage as admin_network_coverage
 from .api.admin import replay as admin_replay
 from .api.admin import sessions as admin_sessions
+from .api.admin import station_sources as admin_station_sources
 from .api.admin import storage as admin_storage
 from .api.admin import users as admin_users
 from .api.auth import routes as auth_routes
 from .api.master import aliases as master_aliases
+from .api.master import station_links as master_station_links
+from .api.master import station_ref as master_station_ref
+from .api.master import station_registers as master_station_registers
 from .api.master import stations as master_stations
 from .db import SessionLocal
 from .logging_config import setup_logging
@@ -145,7 +149,11 @@ app.include_router(admin_network_coverage.router)
 app.include_router(coverage_share_routes.router)
 app.include_router(admin_replay.router)
 app.include_router(admin_storage.router)
+app.include_router(admin_station_sources.router)
 app.include_router(master_stations.router)
+app.include_router(master_station_ref.router)
+app.include_router(master_station_registers.router)
+app.include_router(master_station_links.router)
 app.include_router(master_aliases.router)
 app.include_router(reports_routes.router)
 app.include_router(journey_routes.router)

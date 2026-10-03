@@ -244,17 +244,101 @@ def admin_network_coverage_page(
     )
 
 
-@router.get("/admin/master/stations", response_class=HTMLResponse)
-def admin_master_stations_page(request: Request) -> Response:
+# ────────────────────────── station panel ──────────────────────────
+#
+# Five screens under /admin/stations (docs/station-panel-design.md section 2).
+# Four are for content managers and platform admins; the fifth, sources, is
+# for platform admins only. Pages use the redirect-on-failure guard, never the
+# JSON API's `require_*` dependencies.
+
+_STATION_ROLES = ("platform_admin", "content_manager")
+_TRAINLINE_TEMPLATE = "admin/master_stations.html"
+
+
+def _station_page(request: Request, path: str, template: str, **context: object) -> Response:
+    """Render a station screen for a content manager or a platform admin."""
     user = _maybe_user(request)
     if user is None:
-        return _redirect_to_login("/admin/master/stations")
-    if user.role not in ("platform_admin", "content_manager"):
+        return _redirect_to_login(path)
+    if user.role not in _STATION_ROLES:
         return _forbidden_html(request, "Content-manager or platform-admin access required.")
+    return templates.TemplateResponse(request, template, {"current_user": user, **context})
+
+
+@router.get("/admin/master/stations", response_class=HTMLResponse)
+def admin_master_stations_page(request: Request) -> Response:
+    """The address the Trainline panel had before the station panel existed.
+    It is bookmarked and an integration test asserts it: it keeps working and
+    serves the same template as /admin/stations/trainline."""
+    return _station_page(request, "/admin/master/stations", _TRAINLINE_TEMPLATE)
+
+
+@router.get("/admin/stations/nap", response_class=HTMLResponse)
+def admin_station_nap_page(request: Request) -> Response:
+    """Screen A: what each feed says about each stop."""
+    return _station_page(request, "/admin/stations/nap", "admin/station_nap.html")
+
+
+@router.get("/admin/stations/registers", response_class=HTMLResponse)
+def admin_station_registers_page(request: Request) -> Response:
+    """Screen B: the infrastructure registers, CRD and ERA."""
+    return _station_page(request, "/admin/stations/registers", "admin/station_registers.html")
+
+
+@router.get("/admin/stations/trainline", response_class=HTMLResponse)
+def admin_station_trainline_page(request: Request) -> Response:
+    """Screen C: the Trainline registry, as one input among several."""
+    return _station_page(request, "/admin/stations/trainline", _TRAINLINE_TEMPLATE)
+
+
+@router.get("/admin/stations/reference", response_class=HTMLResponse)
+def admin_station_reference_page(request: Request) -> Response:
+    """Screen D: the VIATOR station reference."""
+    return _station_page(request, "/admin/stations/reference", "admin/station_reference.html")
+
+
+@router.get("/admin/stations/reference/{station_id}", response_class=HTMLResponse)
+def admin_station_detail_page(request: Request, station_id: int) -> Response:
+    """Screen D, one station: every code, MERITS candidate, matched stop, flag
+    and correction. The page is a shell; the API answers 404 for an unknown id.
+
+    An anonymous browser is sent to the login page with the reference list,
+    not this station, as its return address: a redirect target must not be
+    built from a value the request supplied (CodeQL py/url-redirection).
+    """
+    return _station_page(
+        request,
+        "/admin/stations/reference",
+        "admin/station_reference_detail.html",
+        station_id=station_id,
+    )
+
+
+@router.get("/admin/stations/sources", response_class=HTMLResponse)
+def admin_station_sources_page(request: Request) -> Response:
+    """Screen E: how every station input is acquired. Platform admin only."""
+    path = "/admin/stations/sources"
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login(path)
+    if user.role != "platform_admin":
+        return _forbidden_html(request, "Platform admin access required.")
+    from ..feed_resolvers import RESOLVER_TYPES
+    from ..master import station_files
+    from .admin import station_sources as sources_api
+
     return templates.TemplateResponse(
         request,
-        "admin/master_stations.html",
-        {"current_user": user},
+        "admin/station_sources.html",
+        {
+            "current_user": user,
+            "access_warn_days": sources_api.ACCESS_WARN_DAYS,
+            "source_kinds": sorted(sources_api.SOURCE_KINDS),
+            "source_formats": sorted(sources_api.SOURCE_FORMATS),
+            "source_acquisitions": sorted(sources_api.SOURCE_ACQUISITIONS),
+            "resolver_types": sorted(RESOLVER_TYPES),
+            "format_hints": station_files.FORMAT_LABELS,
+        },
     )
 
 
