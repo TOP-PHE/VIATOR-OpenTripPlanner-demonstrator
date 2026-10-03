@@ -67,8 +67,8 @@ def test_pivot_codes_turns_long_rows_into_one_column_per_provider() -> None:
 
 
 def test_a_search_term_cannot_inject_like_wildcards() -> None:
-    assert api._like("100%_sure\\") == "%100\\%\\_sure\\\\%"
-    assert api._like("Sampleton") == "%Sampleton%"
+    assert api.like_pattern("100%_sure\\") == "%100\\%\\_sure\\\\%"
+    assert api.like_pattern("Sampleton") == "%Sampleton%"
 
 
 # ── the list query: paginate first, never join the codes ───────────────

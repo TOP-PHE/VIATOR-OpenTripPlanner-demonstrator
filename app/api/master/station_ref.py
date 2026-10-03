@@ -185,7 +185,7 @@ def pivot_codes(rows: Iterable[tuple[int, str, str]]) -> dict[int, dict[str, lis
     return out
 
 
-def _like(term: str) -> str:
+def like_pattern(term: str) -> str:
     """A LIKE pattern matching `term` anywhere, its own wildcards escaped."""
     escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
@@ -196,7 +196,7 @@ def search_clause(term: str) -> ColumnElement[bool]:
 
     The code lookup is a subquery on `station_ref_code (code)`, not a join.
     """
-    like = _like(term)
+    like = like_pattern(term)
     by_code = select(StationRefCode.station_id).where(StationRefCode.code == term)
     return or_(
         StationRef.name.ilike(like, escape="\\"),
@@ -241,7 +241,7 @@ def filter_clauses(
     return clauses
 
 
-def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[tuple[StationRef]]:
+def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[Any]:
     """The reference rows of the list, before the page is cut.
 
     Collapsed, one row per PLC stands for all its operational points: the one
@@ -263,7 +263,7 @@ def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select
     )
 
 
-def count_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[tuple[int]]:
+def count_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[Any]:
     counted = func.count(StationRef.plc.distinct()) if collapse else func.count()
     return select(counted).select_from(StationRef).where(*clauses)
 
