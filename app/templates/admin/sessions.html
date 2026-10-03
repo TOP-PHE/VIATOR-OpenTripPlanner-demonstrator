@@ -568,6 +568,10 @@
   .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
   .feed-format-ok { color: #1a7f37; }
   .feed-format-unknown { color: #5b6470; }
+  /* NeTEx structure check (app/netex_structure.py): never blocks, only tells. */
+  .feed-structure { font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
+  .feed-structure[data-level="warn"] { color: #8a5300; }
+  .feed-structure[data-level="red"] { color: #cf222e; }
   /* Automated NAP sources */
   .nap-sources-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-top: 0.5rem; }
   .nap-country { display: flex; gap: 0.5rem; align-items: flex-start; margin: 0.35rem 0; }
@@ -1478,9 +1482,18 @@ function feedModeLabel(s) {
 }
 
 function feedFormatCheckHTML(s) {
-  if (s.format_ok === true) return '<span class="feed-format-ok">✓ format OK</span>';
-  if (s.fetched_at) return '<span class="feed-format-unknown" title="The file in the slot predates the format check, or is derived">not checked</span>';
-  return '<span class="feed-format-unknown">—</span>';
+  let base = '<span class="feed-format-unknown">—</span>';
+  if (s.format_ok === true) base = '<span class="feed-format-ok">✓ format OK</span>';
+  else if (s.fetched_at) base = '<span class="feed-format-unknown" title="The file in the slot predates the format check, or is derived">not checked</span>';
+  return base + feedStructureHTML(s.structure);
+}
+
+// NeTEx only: what the structure check found at the last download.
+function feedStructureHTML(st) {
+  if (!st || st.level === 'ok' || !(st.messages || []).length) return '';
+  const icon = st.level === 'red' ? '✗' : '⚠';
+  const lines = st.messages.map(m => `${icon} ${escHTML(m)}`).join('<br>');
+  return `<div class="feed-structure" data-level="${escAttr(st.level)}">${lines}</div>`;
 }
 
 function feedLastResultHTML(s) {
