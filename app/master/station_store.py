@@ -62,8 +62,13 @@ def source_dir(key: str) -> Path:
 
 
 def safe_filename(name: str | None) -> str:
-    """Strip path components and anything outside a conservative alphabet."""
-    base = Path(name or "").name
+    """Strip path components and anything outside a conservative alphabet.
+
+    Both separators are handled by hand: the server runs on Linux, where
+    `Path("C:\\data\\x.csv").name` keeps the whole string, and a browser on
+    Windows may send exactly that.
+    """
+    base = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
     return re.sub(r"[^A-Za-z0-9._-]", "_", base)[:200] or "upload.bin"
 
 

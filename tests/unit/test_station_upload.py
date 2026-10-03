@@ -411,8 +411,9 @@ def test_every_route_of_the_router_requires_a_platform_admin() -> None:
 def test_the_router_is_registered() -> None:
     from app.main import app
 
-    paths = {getattr(r, "path", "") for r in app.routes}
-    assert "/api/admin/stations/sources/{key}/versions" in paths
+    # The OpenAPI schema, not `app.routes`: newer FastAPI versions keep an
+    # included router as one entry there instead of flattening its routes.
+    assert "post" in app.openapi()["paths"]["/api/admin/stations/sources/{key}/versions"]
 
 
 # ── the per-session upload route: 400, not 500 ─────────────────────────
