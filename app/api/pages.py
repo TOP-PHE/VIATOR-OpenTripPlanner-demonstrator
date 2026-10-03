@@ -300,10 +300,15 @@ def admin_station_reference_page(request: Request) -> Response:
 @router.get("/admin/stations/reference/{station_id}", response_class=HTMLResponse)
 def admin_station_detail_page(request: Request, station_id: int) -> Response:
     """Screen D, one station: every code, MERITS candidate, matched stop, flag
-    and correction. The page is a shell; the API answers 404 for an unknown id."""
+    and correction. The page is a shell; the API answers 404 for an unknown id.
+
+    An anonymous browser is sent to the login page with the reference list,
+    not this station, as its return address: a redirect target must not be
+    built from a value the request supplied (CodeQL py/url-redirection).
+    """
     return _station_page(
         request,
-        f"/admin/stations/reference/{station_id}",
+        "/admin/stations/reference",
         "admin/station_reference_detail.html",
         station_id=station_id,
     )

@@ -526,7 +526,8 @@ def test_the_detail_page_is_guarded() -> None:
     assert pages.admin_station_detail_page(page_request(path, "end_user"), 42).status_code == 403
     anonymous = pages.admin_station_detail_page(page_request(path, None), 42)
     assert anonymous.status_code == 303
-    assert anonymous.headers["location"] == f"/login?next={path}"
+    # The return address is the list: nothing the request supplied goes into a redirect.
+    assert anonymous.headers["location"] == "/login?next=/admin/stations/reference"
 
 
 def test_the_list_screen_shows_what_the_design_asks_for() -> None:
