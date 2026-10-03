@@ -2353,6 +2353,7 @@ document.querySelectorAll('button[data-action="promote"]').forEach(btn => {
 // collapses the session row, since we re-poll only the visible target).
 
 const _runningJobsPolls = new Map();  // sid -> interval handle
+const _jobsCache = new Map();  // sid -> last /rebuilds payload (Cancel reads the job status)
 
 function _formatDuration(seconds) {
   if (seconds === null || seconds === undefined) return '';
@@ -2452,6 +2453,44 @@ function _renderMemPill(job) {
     : '';
 }
 
+// Cancel: pending jobs stop at once; running ones are flagged and the worker
+// kills the build container within ~10 s. The served graph is never touched.
+function _renderCancelControl(job) {
+  if (job.status !== 'pending' && job.status !== 'running') return '';
+  if (job.cancel_requested) {
+    return `<span class="rebuild-pill" data-flavour="failed">cancelling…</span>`;
+  }
+  return `<button type="button" class="secondary" data-action="cancel-rebuild" ` +
+    `data-job-id="${escAttr(job.id)}" style="padding: 0.1rem 0.5rem; font-size: 0.8rem">✕ Cancel</button>`;
+}
+
+async function cancelRebuild(sid, jobId, status) {
+  const what = status === 'running'
+    ? 'Stop this running build? The graph being served stays as it is.'
+    : 'Cancel this queued build?';
+  if (!confirm(what)) return;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/rebuilds/${encodeURIComponent(jobId)}/cancel`, {method: 'POST'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('error', body.detail || `Cancel failed (${r.status})`); return; }
+    showToast('success', body.status === 'cancelled'
+      ? 'Build cancelled.'
+      : 'Cancel requested: the worker stops the build within ~10 s.');
+  } catch (err) { showToast('error', String(err)); }
+  loadJobs(sid);
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action="cancel-rebuild"]');
+  if (!btn) return;
+  // The button can sit inside a <summary>: keep the click from toggling it.
+  e.preventDefault();
+  e.stopPropagation();
+  const panel = btn.closest('div[data-role="jobs"]');
+  const job = (_jobsCache.get(panel?.dataset.sid) || []).find(j => j.id === btn.dataset.jobId);
+  if (panel && job) cancelRebuild(panel.dataset.sid, job.id, job.status);
+});
+
 function _renderCurrentBuildCard(job) {
   const snap = job.snapshot;
   const isCurrent = !!(snap && snap.is_current);
@@ -2484,6 +2523,7 @@ function _renderCurrentBuildCard(job) {
         ${_renderCachePill(job.cache_hit)}
         ${_renderMemPill(job)}
         ${durationCell}
+        ${_renderCancelControl(job)}
         <span>· ${isRunning ? 'started' : 'built'} ${escHTML(_formatBuiltAt(isRunning ? job.started_at : builtAt))}</span>
         ${period}
       </div>
@@ -2540,6 +2580,7 @@ function _renderHistoryItem(job) {
         ${_renderCachePill(job.cache_hit)}
         ${_renderMemPill(job)}
         <code>${escHTML(versionLabel)}</code>
+        ${_renderCancelControl(job)}
         <span>${escHTML(_formatBuiltAt(builtAt))}</span>
         ${duration ? `<span class="hint">· ${escHTML(duration)}</span>` : ''}
       </summary>
@@ -2584,6 +2625,7 @@ async function loadJobs(sid) {
     return;
   }
   const jobs = await r.json();
+  _jobsCache.set(sid, jobs);
   target.dataset.loaded = '1';
   if (!jobs.length) {
     target.innerHTML = '<em class="hint">No rebuild jobs yet. Click <kbd>Rebuild graph</kbd> above.</em>';
