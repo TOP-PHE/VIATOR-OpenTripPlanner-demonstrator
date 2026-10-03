@@ -241,7 +241,7 @@ def filter_clauses(
     return clauses
 
 
-def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[Any]:
+def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[StationRef]:
     """The reference rows of the list, before the page is cut.
 
     Collapsed, one row per PLC stands for all its operational points: the one
@@ -263,7 +263,7 @@ def page_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select
     )
 
 
-def count_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[Any]:
+def count_query(clauses: Sequence[ColumnElement[bool]], collapse: bool) -> Select[int]:
     counted = func.count(StationRef.plc.distinct()) if collapse else func.count()
     return select(counted).select_from(StationRef).where(*clauses)
 
