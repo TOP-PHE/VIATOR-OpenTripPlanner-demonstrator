@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections import Counter
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.exc import OperationalError
 
 from alembic import command
@@ -681,8 +682,170 @@ def test_rebuilding_from_the_same_files_changes_nothing(built: dict[str, dict]) 
     assert _scalar("SELECT count(*) FROM station_ref_flag") == 8
     assert _scalar("SELECT count(*) FROM crd_location") == 4
     assert _scalar("SELECT count(*) FROM station_ref_history") == 0
-    assert _scalar("SELECT count(*) FROM station_ref_alias") == 2  # one per build
+    # The aliases too: the set of this build, not one more set per build.
+    second_build = _scalar("SELECT max(id) FROM station_build")
+    assert _rows("SELECT alias_plc, build_id FROM station_ref_alias") == [("ZZ00009", second_build)]
     assert _rows("SELECT status FROM station_build ORDER BY id") == [("done",), ("done",)]
+    # Nothing changed on any station: none is marked as changed by this build.
+    assert (
+        _scalar(
+            "SELECT count(*) FROM station_ref WHERE last_changed_build_id = :build",
+            build=second_build,
+        )
+        == 0
+    )
+
+
+def test_a_rebuild_leaves_exactly_the_current_aliases(
+    client: TestClient, admin: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.master import station_import
+
+    def rebuild(rows: list[dict[str, str]], filename: str) -> None:
+        _, content = station_file("OFFLINE_MASTER", rows)
+        _upload(client, admin, "OFFLINE_MASTER", content, filename).raise_for_status()
+        output, success = station_import.run_build()
+        assert success, output
+
+    aliases = (
+        "SELECT a.alias_plc, r.plc FROM station_ref_alias a"
+        " JOIN station_ref r ON r.id = a.station_id ORDER BY a.alias_plc, r.plc"
+    )
+    assert _rows(aliases) == [("ZZ00009", "ZZ00002")]
+
+    # The next issue of the master gives the old PLC to another station.
+    rows = master_rows()
+    rows[0] = {**rows[0], "previous_plc": "ZZ00009"}
+    rows[1] = {**rows[1], "previous_plc": ""}
+    rebuild(rows, "station_master_crd_2026-10.csv")
+    assert _rows(aliases) == [("ZZ00009", "ZZ00001")]  # one lookup, one station
+    sampleton = client.get(f"{REF}/{_station_id('ZZ00002')}", headers=admin).json()
+    assert (sampleton["previous_plc"], sampleton["aliases"]) == (None, [])
+    central = client.get(f"{REF}/{_station_id('ZZ00001')}", headers=admin).json()
+    assert [a["alias_plc"] for a in central["aliases"]] == ["ZZ00009"]
+
+    # The one after withdraws it: nothing of an earlier build stays behind.
+    rows[0] = {**rows[0], "previous_plc": ""}
+    rebuild(rows, "station_master_crd_2026-11.csv")
+    assert _rows(aliases) == []
+    central = client.get(f"{REF}/{_station_id('ZZ00001')}", headers=admin).json()
+    assert (central["previous_plc"], central["aliases"]) == (None, [])
+
+
+def test_a_change_of_codes_merits_or_flags_alone_is_a_change(
+    client: TestClient, admin: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.master import station_import
+
+    first_build = _scalar("SELECT max(id) FROM station_build")
+    central, sampleton = _station_id("ZZ00001"), _station_id("ZZ00002")
+
+    rows = master_rows()
+    rows[0] = {
+        **rows[0],
+        # A stop key replaced inside a provider cell: same feed count, same tier.
+        "nap_CH_SBB": "9900001|9900001:0:2",
+        # One more conflict value: the chosen code and the confidence stay.
+        "uic_merits_conflict_values": "9900041=ZZ_Rail",
+        # One more flag, at the same warning level.
+        "flags": rows[0]["flags"] + ";platform_count_differs:ZZ00002",
+    }
+    filename, content = station_file("OFFLINE_MASTER", rows)
+    _upload(client, admin, "OFFLINE_MASTER", content, filename).raise_for_status()
+    output, success = station_import.run_build()
+    assert success, output
+
+    # No column of station_ref moved, and the station is still not "unchanged".
+    assert "done: 0 created, 1 changed, 4 unchanged, 0 absent" in output
+    second_build = _scalar("SELECT max(id) FROM station_build")
+    history = _rows(
+        "SELECT station_id, build_id, field_name, old_value, new_value"
+        " FROM station_ref_history ORDER BY field_name"
+    )
+    assert history == [
+        (
+            central,
+            second_build,
+            "codes",
+            "source_key=nap_CH_SBB code=9900001:0:1",
+            "source_key=nap_CH_SBB code=9900001:0:2",
+        ),
+        (
+            central,
+            second_build,
+            "flags",
+            None,
+            f"token=platform_count_differs payload=ZZ00002 related_station_id={sampleton}",
+        ),
+        (
+            central,
+            second_build,
+            "merits",
+            None,
+            "code=9900041 origin=Conflict value sources=ZZ_Rail",
+        ),
+    ]
+    changed = _rows(
+        "SELECT plc, last_changed_build_id FROM station_ref WHERE era_uopid = plc ORDER BY plc"
+    )
+    assert changed == [
+        ("ZZ00001", second_build),
+        ("ZZ00002", first_build),
+        ("ZZ00004", first_build),
+    ]
+    diff = _scalar("SELECT diff_summary FROM station_build ORDER BY id DESC LIMIT 1")
+    assert diff["fields_changed"] == {"codes": 1, "flags": 1, "merits": 1}  # type: ignore[index]
+    # The children themselves are the new ones, once.
+    assert _rows(
+        "SELECT code FROM station_ref_code WHERE station_id = :id ORDER BY code", id=central
+    ) == [("9900001",), ("9900001:0:2",), ("ZZ_FEED#MC",)]
+    detail = client.get(f"{REF}/{central}", headers=admin).json()
+    assert [h["field_name"] for h in detail["history"]] == ["codes", "flags", "merits"]
+
+
+def test_a_build_inserts_each_table_in_one_statement(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    from app.db import engine
+    from app.master import station_import
+
+    _upload_all(client, admin)
+    inserts: Counter[str] = Counter()
+
+    def count(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+        if statement.startswith("INSERT INTO "):
+            inserts[statement.split()[2]] += 1
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        output, success = station_import.run_build()
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert success, output
+
+    # The fixture rows differ in which of their cells are empty, as the real
+    # ones do. Left to itself the ORM bulk path sends a new statement each
+    # time the set of non-empty cells changes from one row to the next.
+    tables = (
+        "crd_location",
+        "crd_subsidiary",
+        "era_operational_point",
+        "station_ref",
+        "station_ref_code",
+        "station_ref_merits",
+        "station_ref_flag",
+        "station_ref_alias",
+        "station_ref_link",
+    )
+    assert {table: inserts[table] for table in tables} == dict.fromkeys(tables, 1)
+    # And what is written is unchanged: an empty cell is NULL, a default applies.
+    assert _rows("SELECT lat, eva, is_current FROM station_ref WHERE plc = 'ZZ00004'") == [
+        (None, None, True)
+    ]
+    assert _rows(
+        "SELECT series, code_raw, is_primary FROM station_ref_code WHERE code = 'de:99:2'"
+    ) == [(None, None, True)]
+    assert _scalar("SELECT is_joinable FROM station_code_series WHERE key = 'ZZ_series_from_links'")
 
 
 def test_a_new_master_issue_updates_in_place_and_writes_history(

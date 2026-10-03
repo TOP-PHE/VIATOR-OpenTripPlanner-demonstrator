@@ -3,7 +3,10 @@
 The writes run against Postgres in tests/integration/test_station_panel.py.
 Here: what the build decides to write (`plan_reference`, no database), how a
 hand correction survives a rebuild, which inputs a build needs, and that a
-`station_build` job never reaches the graph builders.
+`station_build` job never reaches the graph builders. The build stage itself
+runs here too, against an in-memory stand-in for the station tables, and its
+bulk inserts against SQLite: what a rebuild leaves behind, and in how many
+statements, is checked without Postgres.
 
 Every row is invented; the PLC prefix `ZZ` does not exist.
 """
@@ -11,12 +14,15 @@ Every row is invented; the PLC prefix `ZZ` does not exist.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from app import ingestion, worker
 from app.master import station_files as sf
@@ -562,6 +568,482 @@ def test_link_rows_keep_unmatched_stops_and_drop_orphans() -> None:
     assert {r["label"] for r in unmatched} == {"Urban", "Rail", "Multimodal", "unknown"}
     assert unmatched[0]["nearest_plc"] == "ZZ00001"
     assert "NAPST0099" not in {r["offline_station_id"] for r in rows}  # the orphan
+
+
+# ── what a build changed on a station's codes, MERITS candidates, flags ──
+
+
+def test_child_sets_group_rows_by_station_and_read_a_list_as_a_tuple() -> None:
+    # As read from the database (a text[] comes back as a list) or as about to
+    # be written: the two must compare equal.
+    rows = [
+        (1, "9900002", ["ZZ_Rail", "ZZ_Timetable"], True),
+        (1, "9900012", None, False),
+        (2, "9900004", [], False),  # an empty array says what NULL says: no source
+    ]
+    assert si.child_sets(rows) == {
+        1: {("9900002", ("ZZ_Rail", "ZZ_Timetable"), True), ("9900012", None, False)},
+        2: {("9900004", None, False)},
+    }
+    assert si.child_sets([]) == {}
+
+
+def test_child_text_names_every_value_a_row_carries() -> None:
+    columns = ("code", "is_chosen", "origin", "sources")
+    rows = {
+        ("9900012", False, "Calculated", ("CALC",)),
+        ("9900002", True, None, ("ZZ_Rail", "ZZ_Timetable")),
+    }
+    # A stable order, a true flag by its name alone, nothing for an empty value.
+    assert si.child_text(columns, rows) == (
+        "code=9900002 is_chosen sources=ZZ_Rail|ZZ_Timetable; "
+        "code=9900012 origin=Calculated sources=CALC"
+    )
+    flag = ("token", "payload", "related_station_id")
+    assert si.child_text(flag, {("bare_token", "", None)}) == "token=bare_token"
+    assert si.child_text(flag, {("swap_partner", "ZZ00001", 11)}) == (
+        "token=swap_partner payload=ZZ00001 related_station_id=11"
+    )
+    assert si.child_text(columns, set()) is None
+
+
+def test_child_changes_report_the_rows_that_went_and_the_rows_that_came() -> None:
+    columns = ("token", "payload")
+    before = {1: {("swap_partner", "ZZ00002"), ("bare_token", "")}, 2: {("bare_token", "")}}
+    after = {
+        1: {("swap_partner", "ZZ00003"), ("bare_token", "")},
+        2: {("bare_token", "")},
+        3: set(),
+    }
+    # Station 2 kept its rows, station 3 never had any: neither is a change.
+    assert si.child_changes("flags", columns, before, after, [1, 2, 3], BUILD) == [
+        {
+            "station_id": 1,
+            "build_id": BUILD,
+            "field_name": "flags",
+            "old_value": "token=swap_partner payload=ZZ00002",
+            "new_value": "token=swap_partner payload=ZZ00003",
+        }
+    ]
+    # Only the stations asked about: one created by this build is not a change.
+    assert si.child_changes("flags", columns, {}, {9: {("bare_token", "")}}, [], BUILD) == []
+    # Every row gone: nothing came.
+    (gone,) = si.child_changes("flags", columns, before, {}, [2], BUILD)
+    assert (gone["old_value"], gone["new_value"]) == ("token=bare_token", None)
+
+
+# ── the build stage, against an in-memory stand-in for the station tables ──
+
+
+class _Result:
+    """What `Session.execute` hands back, as far as the build stage reads it."""
+
+    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+        self.rows = rows
+
+    def __iter__(self) -> Iterator[tuple[Any, ...]]:
+        return iter(self.rows)
+
+    def all(self) -> list[tuple[Any, ...]]:
+        return self.rows
+
+    def scalars(self) -> list[Any]:
+        return [row[0] for row in self.rows]
+
+
+class _Tables:
+    """Enough of a database for `write_reference`: the rows of each table, as dicts.
+
+    It understands the statements the build stage issues and nothing else: a
+    bulk INSERT, with or without RETURNING; a bulk UPDATE by primary key; an
+    UPDATE or a DELETE of every row, or of the rows whose column is IN a
+    list; a SELECT of columns of one table, every row. Postgres runs the same
+    build in tests/integration/test_station_panel.py.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, list[dict[str, Any]]] = {}
+        self.serial = 0
+        self.selects: list[str] = []  # the table of every SELECT, in order
+        self.overrides: list[Any] = []
+        # The aggregate provider column of the fixture: its codes are evidence.
+        self.unresolved = ["nap_ES_regional"]
+
+    def table(self, name: str) -> list[dict[str, Any]]:
+        return self.rows.setdefault(name, [])
+
+    def get(self, _model: object, _key: object) -> None:
+        return None  # no source version row to mark as imported
+
+    def execute(self, statement: Any, params: list[dict[str, Any]] | None = None) -> _Result:
+        if statement.is_select:
+            return self._select(statement)
+        table = self.table(statement.table.name)
+        if statement.is_insert:
+            return self._insert(statement, table, params or [])
+        if params is not None:  # a bulk UPDATE, by primary key
+            by_id = {row["id"]: row for row in table}
+            for values in params:
+                by_id[values["id"]].update(values)
+            return _Result([])
+        chosen = self._chosen(statement, table)
+        if statement.is_delete:
+            gone = {row["id"] for row in chosen}
+            table[:] = [row for row in table if row["id"] not in gone]
+            return _Result([])
+        bound = statement.compile().params
+        values = {name: value for name, value in bound.items() if name in statement.table.c}
+        for row in chosen:
+            row.update(values)
+        return _Result([])
+
+    def _insert(
+        self, statement: Any, table: list[dict[str, Any]], params: list[dict[str, Any]]
+    ) -> _Result:
+        # Every row of a batch carries the same keys, None included: without
+        # that a bulk INSERT cannot go out as one statement.
+        assert len({frozenset(row) for row in params}) == 1, statement.table.name
+        # And none gives None to a column that has a server default: the bulk
+        # INSERT writes a None as NULL, where the default was meant.
+        defaulted = {c.name for c in statement.table.c if c.server_default is not None}
+        for row in params:
+            assert not [name for name in defaulted & set(row) if row[name] is None], row
+        returned = [column["name"] for column in statement.returning_column_descriptions]
+        out = []
+        for values in params:
+            self.serial += 1
+            row = {"id": self.serial, **values}
+            table.append(row)
+            out.append(tuple(row[name] for name in returned))
+        return _Result(out)
+
+    @staticmethod
+    def _chosen(statement: Any, table: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        where = statement.whereclause
+        if where is None:
+            return list(table)
+        wanted = set(where.right.value)
+        return [row for row in table if row[where.left.name] in wanted]
+
+    def _select(self, statement: Any) -> _Result:
+        columns = list(statement.selected_columns)
+        name = columns[0].table.name
+        self.selects.append(name)
+        if name == "station_ref_override":
+            return _Result([(correction,) for correction in self.overrides])
+        if name == "station_source":
+            return _Result([(key,) for key in self.unresolved])
+        return _Result([tuple(row.get(c.name) for c in columns) for row in self.table(name)])
+
+
+_INPUTS = {
+    fmt: SimpleNamespace(version_id=uuid.uuid4()) for fmt in (sf.MASTER, sf.LINKS, sf.UNMAPPED)
+}
+
+
+def _build(db: _Tables, build_id: int, data: si.ParsedInputs | None = None) -> dict[str, Any]:
+    """Run the build stage as build `build_id`; returns its diff summary."""
+    _, diff = si.write_reference(db, build_id, _INPUTS, data or parsed(), TODAY)  # type: ignore[arg-type]
+    return diff
+
+
+def _station(db: _Tables, plc: str, uopid: str | None = None) -> dict[str, Any]:
+    key = (plc, uopid or plc)
+    return next(r for r in db.table("station_ref") if (r["plc"], r["era_uopid"]) == key)
+
+
+def _history(db: _Tables) -> list[tuple[Any, ...]]:
+    return [
+        (h["station_id"], h["build_id"], h["field_name"], h["old_value"], h["new_value"])
+        for h in db.table("station_ref_history")
+    ]
+
+
+def _aliases(db: _Tables) -> list[tuple[str, int, int]]:
+    return [(a["alias_plc"], a["station_id"], a["build_id"]) for a in db.table("station_ref_alias")]
+
+
+def test_a_first_build_writes_the_reference_and_its_children() -> None:
+    db = _Tables()
+    diff = _build(db, 1)
+    assert diff == {"created": 5, "changed": 0, "unchanged": 0, "absent": 0, "fields_changed": {}}
+    assert {name: len(rows) for name, rows in db.rows.items() if rows} == {
+        "station_ref": 5,
+        "station_code_series": 2,
+        "station_ref_code": 4,
+        "station_ref_merits": 6,
+        "station_ref_flag": 8,
+        "station_ref_alias": 1,
+        "station_ref_link": 8,
+    }
+    assert {row["last_changed_build_id"] for row in db.table("station_ref")} == {1}
+
+
+def test_a_rebuild_from_the_same_files_changes_nothing_and_piles_nothing_up() -> None:
+    db = _Tables()
+    _build(db, 1)
+    before = {name: len(rows) for name, rows in db.rows.items()}
+    diff = _build(db, 2)
+    assert diff == {"created": 0, "changed": 0, "unchanged": 5, "absent": 0, "fields_changed": {}}
+    assert {name: len(rows) for name, rows in db.rows.items()} == before
+    assert _history(db) == []
+    lineage = {
+        (r["last_built_build_id"], r["last_changed_build_id"]) for r in db.rows["station_ref"]
+    }
+    assert lineage == {(2, 1)}
+    # The children are compared in memory: each table is read once per build,
+    # whatever the number of stations.
+    assert db.selects[len(db.selects) // 2 :] == [
+        "station_ref",
+        "station_ref_override",
+        "station_ref_code",
+        "station_ref_merits",
+        "station_ref_flag",
+        "station_source",
+        "station_code_series",
+    ]
+
+
+def test_a_build_leaves_exactly_the_current_aliases() -> None:
+    db = _Tables()
+    _build(db, 1)
+    _build(db, 2)
+    central, sampleton = _station(db, "ZZ00001")["id"], _station(db, "ZZ00002")["id"]
+    # One alias per old PLC, not one per build: it resolves in one lookup.
+    assert _aliases(db) == [("ZZ00009", sampleton, 2)]
+
+    # The next issue of the master gives the old PLC to another station...
+    rows = master_rows()
+    rows[0] = {**rows[0], "previous_plc": "ZZ00009"}
+    rows[1] = {**rows[1], "previous_plc": ""}
+    _build(db, 3, parsed(rows))
+    assert _aliases(db) == [("ZZ00009", central, 3)]  # no longer listed under Sampleton
+
+    # ...and the one after withdraws it: nothing of an earlier build stays.
+    rows[0] = {**rows[0], "previous_plc": ""}
+    _build(db, 4, parsed(rows))
+    assert _aliases(db) == []
+
+
+def test_a_change_of_codes_merits_or_flags_alone_is_a_change() -> None:
+    db = _Tables()
+    _build(db, 1)
+    central, sampleton = _station(db, "ZZ00001")["id"], _station(db, "ZZ00002")["id"]
+
+    rows = master_rows()
+    rows[0] = {
+        **rows[0],
+        # A stop key replaced inside a provider cell: same feed count, same tier.
+        "nap_CH_SBB": "9900001|9900001:0:2",
+        # One more conflict value: the chosen code and the confidence stay.
+        "uic_merits_conflict_values": "9900041=ZZ_Rail",
+        # One more flag, at the same warning level.
+        "flags": rows[0]["flags"] + ";platform_count_differs:ZZ00002",
+    }
+    diff = _build(db, 2, parsed(rows))
+
+    # No column of station_ref moved, and the station is still not "unchanged".
+    assert (diff["created"], diff["changed"], diff["unchanged"]) == (0, 1, 4)
+    assert diff["fields_changed"] == {"codes": 1, "merits": 1, "flags": 1}
+    assert _history(db) == [
+        (
+            central,
+            2,
+            "codes",
+            "source_key=nap_CH_SBB code=9900001:0:1",
+            "source_key=nap_CH_SBB code=9900001:0:2",
+        ),
+        (central, 2, "merits", None, "code=9900041 origin=Conflict value sources=ZZ_Rail"),
+        (
+            central,
+            2,
+            "flags",
+            None,
+            f"token=platform_count_differs payload=ZZ00002 related_station_id={sampleton}",
+        ),
+    ]
+    changed = {r["plc"]: r["last_changed_build_id"] for r in db.table("station_ref")}
+    assert changed == {"ZZ00001": 2, "ZZ00002": 1, "ZZ00003": 1, "ZZ00004": 1}
+    assert {r["last_built_build_id"] for r in db.table("station_ref")} == {2}
+
+
+def test_a_series_the_links_file_changes_is_a_change_of_the_code() -> None:
+    db = _Tables()
+    _build(db, 1)
+    data = parsed()
+    for link in data.links:
+        if link.fields.get("code_series") == "CH_service_point_number":
+            link.fields["code_series"] = "ZZ_series_renamed"
+    diff = _build(db, 2, data)
+
+    assert (diff["changed"], diff["unchanged"]) == (1, 4)
+    assert _history(db) == [
+        (
+            _station(db, "ZZ00001")["id"],
+            2,
+            "codes",
+            "source_key=nap_CH_SBB code=9900001 series=CH_service_point_number is_primary",
+            "source_key=nap_CH_SBB code=9900001 series=ZZ_series_renamed is_primary",
+        )
+    ]
+
+
+def test_a_station_changed_in_its_columns_and_its_children_is_counted_once() -> None:
+    db = _Tables()
+    _build(db, 1)
+    rows = master_rows()
+    rows[1] = {**rows[1], "era_name": "Sampleton Hbf", "nap_DE_DELFI": "de:99:3"}
+    diff = _build(db, 2, parsed(rows))
+
+    assert (diff["changed"], diff["unchanged"]) == (1, 4)
+    assert diff["fields_changed"] == {"name": 1, "codes": 1}
+    sampleton = _station(db, "ZZ00002")
+    assert (sampleton["name"], sampleton["last_changed_build_id"]) == ("Sampleton Hbf", 2)
+    assert _history(db) == [
+        (sampleton["id"], 2, "name", "Sampleton", "Sampleton Hbf"),
+        (
+            sampleton["id"],
+            2,
+            "codes",
+            "source_key=nap_DE_DELFI code=de:99:2 is_primary",
+            "source_key=nap_DE_DELFI code=de:99:3 is_primary",
+        ),
+    ]
+
+
+def test_a_created_station_is_not_a_change_and_the_flag_that_now_links_to_it_is() -> None:
+    rows = master_rows()
+    # A flag naming a PLC the file does not have yet: stored, linked to nothing.
+    rows[2] = {**rows[2], "flags": rows[2]["flags"] + ";renumbered_to:ZZ00005"}
+    db = _Tables()
+    _build(db, 1, parsed(rows))
+
+    newcomer = {**rows[4], "plc": "ZZ00005", "era_uopid": "ZZ00005", "era_name": "Newville"}
+    diff = _build(db, 2, parsed([*rows, newcomer]))
+
+    assert (diff["created"], diff["changed"], diff["unchanged"]) == (1, 1, 4)
+    yard, newville = _station(db, "ZZ00003", "ZZOP03A")["id"], _station(db, "ZZ00005")["id"]
+    # The new station's own codes, candidates and flags are not a change of it.
+    assert _history(db) == [
+        (
+            yard,
+            2,
+            "flags",
+            "token=renumbered_to payload=ZZ00005",
+            f"token=renumbered_to payload=ZZ00005 related_station_id={newville}",
+        )
+    ]
+
+
+def test_a_correction_made_between_two_builds_is_not_a_change_of_the_next() -> None:
+    db = _Tables()
+    _build(db, 1)
+    station = _station(db, "ZZ00002")
+    # What the API does when a content manager corrects the MERITS code: the
+    # candidates are rewritten and the chosen one is mirrored on the row.
+    columns = ("code", "origin", "rule", "confidence", "sources", "check_digit", "is_chosen")
+    merits = db.table("station_ref_merits")
+    mine = [m for m in merits if m["station_id"] == station["id"]]
+    corrected = so.merits_with_override(
+        [{c: m[c] for c in columns} for m in mine], "9900777", "per the operator"
+    )
+    merits[:] = [m for m in merits if m["station_id"] != station["id"]]
+    merits += [{"id": 900 + n, "station_id": station["id"], **c} for n, c in enumerate(corrected)]
+    station.update(so.merits_mirror(corrected))
+    db.overrides.append(
+        override(station["id"], "uic_merits", "9900777", "9900002", reason="per the operator")
+    )
+
+    diff = _build(db, 2)
+    # The build re-applies the correction and finds what is already there.
+    assert (diff["changed"], diff["unchanged"]) == (0, 5)
+    assert _history(db) == []
+    assert _station(db, "ZZ00002")["uic_merits"] == "9900777"
+
+
+# ── bulk inserts: one statement per chunk, whatever cells are empty ────
+
+
+class _ProbeBase(DeclarativeBase):
+    pass
+
+
+class _Probe(_ProbeBase):
+    """Shaped like the station tables where it matters: nullable columns."""
+
+    __tablename__ = "bulk_probe"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plc: Mapped[str]
+    era_uopid: Mapped[str]
+    name: Mapped[str | None]
+    lat: Mapped[float | None]
+    eva: Mapped[str | None]
+    n_nap_feeds: Mapped[int | None]
+
+
+def _probe_rows(count: int = 120) -> list[dict[str, Any]]:
+    """Rows with the same keys, whose empty cells fall differently row after row."""
+    return [
+        {
+            "plc": f"ZZ{n:05d}",
+            "era_uopid": f"ZZ{n:05d}",
+            "name": None if n % 2 else f"Station {n}",
+            "lat": None if n % 3 else 50.0 + n / 1000,
+            "eva": None if n % 5 else f"99{n:05d}",
+            "n_nap_feeds": None if n % 7 else n,
+        }
+        for n in range(1, count + 1)
+    ]
+
+
+@pytest.fixture
+def probe() -> Iterator[tuple[Session, list[str]]]:
+    """A SQLite session on the probe table, and the INSERT statements it sends."""
+    engine = create_engine("sqlite://")
+    _ProbeBase.metadata.create_all(engine)
+    inserts: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_rest: Any) -> None:
+        if statement.startswith("INSERT"):
+            inserts.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    with Session(engine) as db:
+        yield db, inserts
+    engine.dispose()
+
+
+def _probe_stored(db: Session) -> list[dict[str, Any]]:
+    columns = [c for c in _Probe.__table__.c if c.name != "id"]
+    stored = db.execute(select(*columns).order_by(_Probe.id)).all()
+    return [dict(row._mapping) for row in stored]
+
+
+def test_a_bulk_insert_is_one_statement_whatever_cells_are_empty(
+    probe: tuple[Session, list[str]],
+) -> None:
+    db, inserts = probe
+    rows = _probe_rows()
+    si._insert(db, _Probe, rows)
+    # Left to itself the ORM drops a None-valued key and batches only
+    # neighbours with the same keys left: these 120 rows were 120 statements.
+    assert len(inserts) == 1
+    # What is written is what was written before: an empty cell is NULL.
+    assert _probe_stored(db) == rows
+
+
+def test_new_stations_go_in_one_statement_and_their_ids_come_back(
+    probe: tuple[Session, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, inserts = probe
+    monkeypatch.setattr(si, "StationRef", _Probe)
+    rows = _probe_rows()
+    ids = si._write_stations(db, si._Plan(new_rows=rows))
+    assert len(inserts) == 1
+    assert set(ids) == {(row["plc"], row["era_uopid"]) for row in rows}
+    assert sorted(ids.values()) == list(range(1, len(rows) + 1))
+    assert _probe_stored(db) == rows
 
 
 # ── the inputs a build needs ───────────────────────────────────────────

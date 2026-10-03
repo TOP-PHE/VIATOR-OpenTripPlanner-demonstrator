@@ -591,7 +591,11 @@ class StationRefLink(Base):
 
 
 class StationRefHistory(Base):
-    """What one build changed on one station, field by field."""
+    """What one build changed on one station, field by field.
+
+    `field_name` is a column of `station_ref`, or `codes`, `merits` or `flags`
+    when the station's rows in that child table are no longer the ones it had.
+    """
 
     __tablename__ = "station_ref_history"
     __table_args__ = (

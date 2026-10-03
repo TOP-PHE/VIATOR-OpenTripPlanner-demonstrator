@@ -209,7 +209,8 @@ is a later normalisation, not an import-time guess.
 filtering.
 
 **`station_ref_alias`** — `station_id` · `alias_plc` · `reason` · `build_id`.
-`UNIQUE (alias_plc, build_id)`. An old PLC resolves in one lookup.
+`UNIQUE (alias_plc, build_id)`. An old PLC resolves in one lookup: a build replaces the whole
+set, so the table holds the aliases of the latest build and nothing of an earlier one.
 
 **`station_ref_flag`** — `station_id` · `token` · `payload` · `level` · `warning_code` ·
 `related_station_id` FK `ON DELETE SET NULL`. `UNIQUE (station_id, token, payload)`. A `text[]` of
@@ -240,7 +241,11 @@ both are stored as text, never as a vocabulary. This table, not `nap_stop`, is w
 lists are rendered from.
 
 **`station_ref_history`** — `station_id` · `build_id` · `field_name` · `old_value` · `new_value`.
-Written by the build from its own diff.
+Written by the build from its own diff. `field_name` is a column of `station_ref`, or `codes`,
+`merits` or `flags` for a station whose rows in that child table are no longer the ones it had:
+`old_value` then lists the rows that went and `new_value` the rows that came, each as
+`column=value` pairs. Either kind of row makes the station "changed" in the build's diff summary
+and sets its `last_changed_build_id`.
 
 **FK actions this section leaves open**, as built: every child's `station_id` is `ON DELETE
 CASCADE` (codes, MERITS candidates, aliases, flags, links, history are derived rows) except the
@@ -801,6 +806,9 @@ corrected; this table is the record.
 | the master's 16 provider columns → `station_ref_code` | the columns carry no series | `series` from the links file where it names the same station and the same code value, exactly one series; NULL otherwise. A series the links introduce is added to `station_code_series` |
 | a station absent from a newer master | not addressed | kept, untouched, recognisable by `last_built_build_id` |
 | `previous_plc` → one `station_ref_alias` row | two operational points of one PLC carry the same `previous_plc`, and `UNIQUE (alias_plc, build_id)` allows one | one alias per old PLC, the first station in key order; collisions are counted |
+| aliases carry a `build_id`, one set per build | nothing removed the set of an earlier build: an old PLC withdrawn from a station, or given to another, stayed listed under the first, and a rebuild from the same files added a full copy | the build deletes every alias and writes its own set, in its transaction. A station absent from the master keeps its `previous_plc` column and has no alias |
+| history is "written by the build from its own diff" | the diff covered the columns of `station_ref` only, so a build that replaced a station's codes, MERITS candidates or flags reported it unchanged and left no record | the build reads the three child tables once, compares them in memory with the rows it writes, and writes one history row per station and child table that differs (`codes`, `merits`, `flags`). A flag that only gains or loses the station it links to counts |
+| the children are bulk-inserted | an ORM bulk INSERT leaves a None-valued key out and batches only consecutive rows with the same keys left: on rows whose empty cells differ, close to one statement per row | every bulk INSERT sets `render_nulls`, and every row of a batch carries the same keys, None included. A column with a server default is given a value on every row or left out of every row |
 | a flag payload that is a PLC sets `related_station_id` | a PLC can carry several operational points | the one whose operational-point id is the PLC itself, else the first in byte order |
 | a flag names one other station | 51 of the 694 `candidate_displaced_to` flags list 2 to 5 PLCs joined by `\|`, and a flag row has one `related_station_id` | one flag row per PLC when every part of the payload is a PLC of the file; any other payload stays whole. The list shows a token once, and the flag filter counts stations, not rows |
 | each value of `uic_merits_conflict_values` is a further candidate | every item is `<code>=<labels>`, never a bare code, and on 14 of the 35 cells the code is the chosen one again | split on the first `=`: the code is the candidate, the labels are its `sources`; a code the row already carries gains the labels and is not a second candidate |

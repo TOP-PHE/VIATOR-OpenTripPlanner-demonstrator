@@ -22,6 +22,11 @@ Three stages, in this order:
 absent from this one is kept, untouched, and is recognisable by its
 `last_built_build_id`: deleting it would delete its hand corrections with it.
 
+What a build changed is written to `station_ref_history`: one row per column
+of `station_ref` that moved, and one row per station whose codes, MERITS
+candidates or flags are no longer the rows it had, under the field name
+`codes`, `merits` or `flags`. Either makes the station "changed".
+
 Parsing lives in `station_parse.py` and the correction rule in
 `station_overrides.py`; both are pure. What is here is the plan (pure) and the
 writes.
@@ -33,13 +38,13 @@ import logging
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import Insert, delete, insert, select, update
 from sqlalchemy.orm import Session as DbSession
 
 from .. import ingestion
@@ -102,6 +107,22 @@ _LINK_COLUMNS = (
     "nearest_distance_m",
     "note",
 )
+# The children a build derives whole from its files and that the diff of the
+# station_ref columns cannot see: the name a change of them is written under
+# in station_ref_history, their table, and the columns the build writes.
+_CHILD_SETS: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
+    ("codes", StationRefCode, ("source_key", "code", "series", "is_primary", "evidence_only")),
+    (
+        "merits",
+        StationRefMerits,
+        ("code", "is_chosen", "origin", "rule", "confidence", "sources", "check_digit"),
+    ),
+    ("flags", StationRefFlag, ("token", "payload", "related_station_id")),
+)
+
+# One child row as the values of its columns, and those rows per station id.
+ChildRow = tuple[Any, ...]
+ChildSets = dict[int, set[ChildRow]]
 
 
 # ───────────────────────────── the plan (pure) ─────────────────────────────
@@ -143,6 +164,69 @@ def computed_fields(
 def diff_fields(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[tuple[str, Any, Any]]:
     """The fields of `new` whose value differs from `old`: (name, old, new)."""
     return [(name, old.get(name), value) for name, value in new.items() if old.get(name) != value]
+
+
+def child_sets(rows: Iterable[Sequence[Any]]) -> ChildSets:
+    """Rows of (station id, value, ...) as one set of value tuples per station.
+
+    A list (the sources of a MERITS candidate) is read as a tuple, and an
+    empty one as no value, so that a row as the database returns it and the
+    same row as the build is about to write it compare equal.
+    """
+    out: ChildSets = {}
+    for station_id, *values in rows:
+        row = tuple((tuple(v) or None) if isinstance(v, list) else v for v in values)
+        out.setdefault(station_id, set()).add(row)
+    return out
+
+
+def child_text(columns: Sequence[str], rows: Iterable[ChildRow]) -> str | None:
+    """How child rows are written to `station_ref_history`.
+
+    Per row, `column=value` for every column that has a value and the bare
+    column name for a true flag; the rows in a stable order, joined by `; `.
+    No row is no value.
+    """
+    lines = sorted(
+        " ".join(
+            name if value is True else f"{name}={field_text(value)}"
+            for name, value in zip(columns, row, strict=True)
+            if value is not None and value is not False and value != ""
+        )
+        for row in rows
+    )
+    return "; ".join(lines) or None
+
+
+def child_changes(
+    name: str,
+    columns: Sequence[str],
+    before: Mapping[int, set[ChildRow]],
+    after: Mapping[int, set[ChildRow]],
+    station_ids: Iterable[int],
+    build_id: int,
+) -> list[dict[str, Any]]:
+    """One history row per station whose child rows are not the ones it had.
+
+    `old_value` lists the rows that went and `new_value` the rows that came;
+    a row with one value changed is in both. Only `station_ids` are compared:
+    a station this build creates has no earlier state to differ from.
+    """
+    nothing: set[ChildRow] = set()
+    history = []
+    for station_id in station_ids:
+        old, new = before.get(station_id, nothing), after.get(station_id, nothing)
+        if old != new:
+            history.append(
+                {
+                    "station_id": station_id,
+                    "build_id": build_id,
+                    "field_name": name,
+                    "old_value": child_text(columns, old - new),
+                    "new_value": child_text(columns, new - old),
+                }
+            )
+    return history
 
 
 def related_station(plc: str, by_plc: Mapping[str, list[tuple[str, int]]]) -> int | None:
@@ -322,9 +406,27 @@ def parse_inputs(inputs: Mapping[str, BuildInput], build_log: BuildLog) -> Parse
 # ───────────────────────────── extract stage ─────────────────────────────
 
 
+def _bulk_insert(model: Any) -> Insert:
+    """The INSERT every bulk write of the importer goes through.
+
+    Left to itself, an ORM bulk INSERT leaves a None-valued key out of the
+    statement, so that a server default can apply, and then batches only the
+    consecutive rows that have the same keys left. On station rows, where the
+    empty cells fall differently from one row to the next, that is close to
+    one statement per row. `render_nulls` writes the NULL instead: rows that
+    carry the same keys go out as one executemany per chunk.
+
+    It asks two things of the rows, and every list the importer builds meets
+    both: every row of a batch carries the same keys, None included; and a
+    column with a server default is either given a value on every row or left
+    out of every row, since a None would now be written as NULL.
+    """
+    return insert(model).execution_options(render_nulls=True)
+
+
 def _insert(db: DbSession, model: Any, rows: Sequence[dict[str, Any]]) -> None:
     for chunk in chunks(rows):
-        db.execute(insert(model), list(chunk))
+        db.execute(_bulk_insert(model), list(chunk))
 
 
 def _has_rows(db: DbSession, model: Any, version_id: uuid.UUID) -> bool:
@@ -528,13 +630,56 @@ def _write_stations(db: DbSession, plan: _Plan) -> dict[sp.Key, int]:
     ids: dict[sp.Key, int] = {}
     for chunk in chunks(plan.new_rows):
         returned = db.execute(
-            insert(StationRef).returning(StationRef.id, StationRef.plc, StationRef.era_uopid),
+            _bulk_insert(StationRef).returning(StationRef.id, StationRef.plc, StationRef.era_uopid),
             list(chunk),
         )
         ids.update({(r[1], r[2]): r[0] for r in returned})
     for chunk in chunks(plan.updates):
         db.execute(update(StationRef), list(chunk))
     return ids
+
+
+def _load_children(db: DbSession) -> dict[str, ChildSets]:
+    """Every station's codes, MERITS candidates and flags as the last build
+    left them: one query per table, so that the build can compare them in
+    memory with the ones it writes. Read before they are replaced."""
+    return {
+        name: child_sets(
+            db.execute(
+                select(model.station_id, *[getattr(model, column) for column in columns])
+            ).all()
+        )
+        for name, model, columns in _CHILD_SETS
+    }
+
+
+def _child_history(
+    before: Mapping[str, ChildSets],
+    written: Mapping[str, Sequence[Mapping[str, Any]]],
+    station_ids: Sequence[int],
+    build_id: int,
+) -> list[dict[str, Any]]:
+    """The history rows of the stations of `station_ids` whose codes, MERITS
+    candidates or flags, as this build writes them, are not the ones in
+    `before`."""
+    history: list[dict[str, Any]] = []
+    for name, _model, columns in _CHILD_SETS:
+        after = child_sets(
+            [row["station_id"], *(row[column] for column in columns)] for row in written[name]
+        )
+        history += child_changes(name, columns, before[name], after, station_ids, build_id)
+    return history
+
+
+def _mark_changed(db: DbSession, station_ids: Sequence[int], build_id: int) -> None:
+    """Set `last_changed_build_id` on the stations only their children changed
+    on: no column of theirs moved, so the update of the changed rows, which
+    sets it for the others, left them alone."""
+    for chunk in chunks(station_ids):
+        db.execute(
+            update(StationRef),
+            [{"id": station_id, "last_changed_build_id": build_id} for station_id in chunk],
+        )
 
 
 def _replace_children(db: DbSession, station_ids: Sequence[int]) -> None:
@@ -671,6 +816,9 @@ def write_reference(
 
     present = set(plan.present)
     ids = {key: row["id"] for key, row in existing.items() if key in present}
+    # The stations an earlier build wrote, and their children as it left them.
+    known = sorted(ids.values())
+    children_before = _load_children(db)
     ids.update(_write_stations(db, plan))
     station_ids = sorted(ids.values())
     _replace_children(db, station_ids)
@@ -693,14 +841,27 @@ def write_reference(
     aliases = _alias_rows(parsed, ids, build_id, counts)
     links = _link_rows(parsed, inputs, ids, counts)
 
+    # The diff of the station_ref columns does not see the children: a station
+    # whose codes, candidates or flags alone changed is a changed station too.
+    child_history = _child_history(
+        children_before, {"codes": codes, "merits": merits, "flags": flags}, known, build_id
+    )
+    children_only = sorted(
+        {row["station_id"] for row in child_history} - {row["id"] for row in plan.updates}
+    )
+    _mark_changed(db, children_only, build_id)
+
+    # Links and aliases are the whole set of this build: nothing of an earlier
+    # one stays, so an old PLC resolves to one station, in one lookup.
     db.execute(delete(StationRefLink).execution_options(**_NO_SYNC))
+    db.execute(delete(StationRefAlias).execution_options(**_NO_SYNC))
     for model, rows in (
         (StationRefCode, codes),
         (StationRefMerits, merits),
         (StationRefFlag, flags),
         (StationRefAlias, aliases),
         (StationRefLink, links),
-        (StationRefHistory, plan.history),
+        (StationRefHistory, [*plan.history, *child_history]),
     ):
         _insert(db, model, rows)
     for fmt in (sf.MASTER, sf.LINKS, sf.UNMAPPED):
@@ -720,12 +881,13 @@ def write_reference(
         overrides_drifted=plan.overrides["drifted"],
         overrides_redundant=plan.overrides["redundant"],
     )
+    fields_changed = plan.fields_changed + Counter(row["field_name"] for row in child_history)
     diff_summary: dict[str, Any] = {
         "created": len(plan.new_rows),
-        "changed": len(plan.updates),
-        "unchanged": plan.unchanged,
+        "changed": len(plan.updates) + len(children_only),
+        "unchanged": plan.unchanged - len(children_only),
         "absent": absent,
-        "fields_changed": dict(plan.fields_changed.most_common()),
+        "fields_changed": dict(fields_changed.most_common()),
     }
     return counts, diff_summary
 
