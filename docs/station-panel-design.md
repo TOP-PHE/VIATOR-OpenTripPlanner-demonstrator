@@ -167,8 +167,11 @@ constraint would fail on the first import. A second index on `(code)` serves bar
 `code_raw` and `normalisation_rule` exist because `code` is not always what the provider published —
 DIUM codes are normalised. `evidence_only` marks a code that must never be used as a join key.
 
-**`station_code_series`** — `key` pk (`uic_intl`, `eva`, `plc`, `dhid`, `didok`, `sloid`, `sr70`,
-`rl100`, `cdt`, `renfe`, `ns_abbrev`, `dium`, `national`, `feed_local`) · `label` · `is_joinable`.
+**`station_code_series`** — `key` pk · `label` · `family` null · `is_joinable`. Seeded with the 14
+keys the offline files actually use (`SNCF_8digit`, `CH_service_point_number`, `DELFI_stop_key`,
+`PLC`, … — listed verbatim in `docs/station-offline-file-shapes.md`). `family` is where a coarser
+grouping (`uic_intl`, `eva`, `dhid`) goes when it is decided; mapping the offline keys onto families
+is a later normalisation, not an import-time guess.
 
 **`station_ref_merits`** — `station_id` · `code` · `origin` · `rule` · `confidence` · `sources` ·
 `check_digit` · `is_chosen`. `UNIQUE (station_id, code)` and a partial unique
@@ -192,10 +195,14 @@ improves a *different* field of a corrected row, it must not have to choose betw
 and the correction.
 
 **`station_ref_link`** — the adjudication ladder, at the offline links file's grain.
-`station_id` null · `source_version_id` · `feed_key` · `stop_key` · `stop_name` · `code_value` ·
-`code_series` · `match_method` · `tier` · `asserted` bool · `distance_m` · `name_sim` · `note`.
-A null `station_id` is an unmatched stop. This table, not `nap_stop`, is what screen A's two lists
-are rendered from.
+`station_id` null · `source_version_id` · `offline_station_id` · `feed_key` · `stop_key` ·
+`stop_name` · `iso2` · `lat` · `lon` · `label` · `code_value` · `code_series` · `match_method` ·
+`tier` · `asserted` bool · `distance_m` · `name_sim` · `reason` · `nearest_plc` ·
+`nearest_distance_m` · `note`.
+A null `station_id` is an unmatched stop, and `nearest_plc` with its distance is the hint the
+operator works from. `match_method` is free text — 6,544 distinct values offline — and `tier` has 21;
+both are stored as text, never as a vocabulary. This table, not `nap_stop`, is what screen A's two
+lists are rendered from.
 
 **`station_ref_history`** — `station_id` · `build_id` · `field_name` · `old_value` · `new_value`.
 Written by the build from its own diff.
