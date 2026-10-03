@@ -174,32 +174,40 @@ def _service_days(frame: ET.Element, stats: FrameStats) -> dict[str, set[date]]:
     ordered = sorted(enumerate(assignments), key=lambda p: (int(p[1].get("order") or 0), p[0]))
     for _, a in ordered:
         dt = _ref(a, "DayTypeRef")
-        if not dt:
-            stats.unresolved += 1
-            continue
-        days: list[date] | None
-        if period := _ref(a, "OperatingPeriodRef"):
-            days = periods.get(period)
-            if days is not None and dt in day_types:
-                allowed = _weekdays(day_types[dt])
-                if allowed is not None:
-                    days = [d for d in days if d.weekday() in allowed]
-        elif op_day := _ref(a, "OperatingDayRef"):
-            days = [op_days[op_day]] if op_day in op_days else None
-        else:
-            d = _date(_text(a, "Date"))
-            days = [d] if d else None
+        days = _assignment_days(a, day_types.get(dt), periods, op_days) if dt else None
         if days is None:
             stats.unresolved += 1
             continue
-        available = (a.get("isAvailable") or _text(a, "isAvailable") or "true") != "false"
         target = result.setdefault(dt, set())
-        if available:
+        if _is_available(a):
             target.update(days)
         else:
             target.difference_update(days)
     stats.day_types = len(result)
     return result
+
+
+def _assignment_days(
+    a: ET.Element,
+    day_type: ET.Element | None,
+    periods: dict[str, list[date]],
+    op_days: dict[str, date],
+) -> list[date] | None:
+    """The days one DayTypeAssignment names, or None when its reference is unknown."""
+    if period := _ref(a, "OperatingPeriodRef"):
+        days = periods.get(period)
+        allowed = _weekdays(day_type) if day_type is not None else None
+        if days is None or allowed is None:
+            return days
+        return [d for d in days if d.weekday() in allowed]
+    if op_day := _ref(a, "OperatingDayRef"):
+        return [op_days[op_day]] if op_day in op_days else None
+    d = _date(_text(a, "Date"))
+    return [d] if d else None
+
+
+def _is_available(a: ET.Element) -> bool:
+    return (a.get("isAvailable") or _text(a, "isAvailable") or "true") != "false"
 
 
 # ─────────────────────────── frame rewrite ───────────────────────────
@@ -273,46 +281,61 @@ def _end_tag(prefix: bytes | None) -> bytes:
     return b"</" + (prefix + b":" if prefix else b"") + b"ServiceCalendarFrame>"
 
 
+def _ns_decls(buf: bytes) -> bytes:
+    root = _ROOT_RE.search(buf)
+    return b"".join(_XMLNS_RE.findall(root.group(0))) if root else b""
+
+
+def _complete_frame(buf: bytes) -> tuple[int, int, str] | None:
+    """(start, end, prefix) of the first whole ServiceCalendarFrame in `buf`."""
+    start = _FRAME_START_RE.search(buf)
+    if start is None:
+        return None
+    end_tag = _end_tag(start.group(1))
+    end = buf.find(end_tag, start.start())
+    if end < 0:
+        return None
+    return start.start(), end + len(end_tag), (start.group(1) or b"").decode()
+
+
+def _write_frame(
+    dst: IO[bytes], frame: bytes, prefix: str, ns_decls: bytes, stats: ConvertStats
+) -> bool:
+    result = convert_frame(frame, prefix, ns_decls)
+    if result is None:
+        dst.write(frame)
+        return False
+    dst.write(result[0])
+    stats.frames.append(result[1])
+    return True
+
+
 def _rewrite_stream(src: IO[bytes], dst: IO[bytes], stats: ConvertStats) -> bool:
-    """Copy `src` to `dst`, rewriting every ServiceCalendarFrame. True if any changed."""
-    buf = b""
-    ns_decls = b""
-    changed = False
-    eof = False
+    """Copy `src` to `dst`, rewriting every ServiceCalendarFrame. True if any changed.
+
+    Only the bytes after the last possible frame start are held back; a frame
+    that has started is buffered whole (calendar frames are small). A
+    truncated document is passed through untouched."""
+    buf, ns_decls, changed, eof = b"", b"", False, False
     while True:
-        if not eof:
-            chunk = src.read(_CHUNK)
-            eof = not chunk
-            buf += chunk
-        if not ns_decls and (root := _ROOT_RE.search(buf)):
-            ns_decls = b"".join(_XMLNS_RE.findall(root.group(0)))
-        start = _FRAME_START_RE.search(buf)
-        if start is None:
-            if eof:
-                dst.write(buf)
-                return changed
+        ns_decls = ns_decls or _ns_decls(buf)
+        found = _complete_frame(buf)
+        if found is not None:
+            start, end, prefix = found
+            dst.write(buf[:start])
+            changed |= _write_frame(dst, buf[start:end], prefix, ns_decls, stats)
+            buf = buf[end:]
+            continue
+        if eof:
+            dst.write(buf)
+            return changed
+        if _FRAME_START_RE.search(buf) is None:
             keep = min(len(buf), _TAIL_KEEP)
             dst.write(buf[: len(buf) - keep])
             buf = buf[len(buf) - keep :]
-            continue
-        end_tag = _end_tag(start.group(1))
-        end = buf.find(end_tag, start.start())
-        if end < 0:
-            if eof:  # truncated document: pass it through untouched
-                dst.write(buf)
-                return changed
-            continue  # read on until the frame is whole (it is small)
-        end += len(end_tag)
-        dst.write(buf[: start.start()])
-        prefix = (start.group(1) or b"").decode()
-        result = convert_frame(buf[start.start() : end], prefix, ns_decls)
-        if result is None:
-            dst.write(buf[start.start() : end])
-        else:
-            dst.write(result[0])
-            stats.frames.append(result[1])
-            changed = True
-        buf = buf[end:]
+        chunk = src.read(_CHUNK)
+        eof = not chunk
+        buf += chunk
 
 
 def convert_zip(src: Path, dest: Path) -> ConvertStats | None:
