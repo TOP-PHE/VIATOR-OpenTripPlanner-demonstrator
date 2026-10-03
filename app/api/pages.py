@@ -244,26 +244,57 @@ def admin_network_coverage_page(
     )
 
 
-@router.get("/admin/master/stations", response_class=HTMLResponse)
-def admin_master_stations_page(request: Request) -> Response:
-    user = _maybe_user(request)
-    if user is None:
-        return _redirect_to_login("/admin/master/stations")
-    if user.role not in ("platform_admin", "content_manager"):
-        return _forbidden_html(request, "Content-manager or platform-admin access required.")
-    return templates.TemplateResponse(
-        request,
-        "admin/master_stations.html",
-        {"current_user": user},
-    )
-
-
 # ────────────────────────── station panel ──────────────────────────
 #
 # Five screens under /admin/stations (docs/station-panel-design.md section 2).
 # Four are for content managers and platform admins; the fifth, sources, is
 # for platform admins only. Pages use the redirect-on-failure guard, never the
 # JSON API's `require_*` dependencies.
+
+_STATION_ROLES = ("platform_admin", "content_manager")
+_TRAINLINE_TEMPLATE = "admin/master_stations.html"
+
+
+def _station_page(request: Request, path: str, template: str) -> Response:
+    """Render a station screen for a content manager or a platform admin."""
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login(path)
+    if user.role not in _STATION_ROLES:
+        return _forbidden_html(request, "Content-manager or platform-admin access required.")
+    return templates.TemplateResponse(request, template, {"current_user": user})
+
+
+@router.get("/admin/master/stations", response_class=HTMLResponse)
+def admin_master_stations_page(request: Request) -> Response:
+    """The address the Trainline panel had before the station panel existed.
+    It is bookmarked and an integration test asserts it: it keeps working and
+    serves the same template as /admin/stations/trainline."""
+    return _station_page(request, "/admin/master/stations", _TRAINLINE_TEMPLATE)
+
+
+@router.get("/admin/stations/nap", response_class=HTMLResponse)
+def admin_station_nap_page(request: Request) -> Response:
+    """Screen A: what each feed says about each stop."""
+    return _station_page(request, "/admin/stations/nap", "admin/station_nap.html")
+
+
+@router.get("/admin/stations/registers", response_class=HTMLResponse)
+def admin_station_registers_page(request: Request) -> Response:
+    """Screen B: the infrastructure registers, CRD and ERA."""
+    return _station_page(request, "/admin/stations/registers", "admin/station_registers.html")
+
+
+@router.get("/admin/stations/trainline", response_class=HTMLResponse)
+def admin_station_trainline_page(request: Request) -> Response:
+    """Screen C: the Trainline registry, as one input among several."""
+    return _station_page(request, "/admin/stations/trainline", _TRAINLINE_TEMPLATE)
+
+
+@router.get("/admin/stations/reference", response_class=HTMLResponse)
+def admin_station_reference_page(request: Request) -> Response:
+    """Screen D: the VIATOR station reference."""
+    return _station_page(request, "/admin/stations/reference", "admin/station_reference.html")
 
 
 @router.get("/admin/stations/sources", response_class=HTMLResponse)

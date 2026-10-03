@@ -1,0 +1,15 @@
+{% extends "_base.html" %}
+{% block title %}NAP station information — VIATOR admin{% endblock %}
+
+{% block content %}
+{% set station_tab = 'nap' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>NAP station information</h1>
+<p class="sp-lead">
+  What each feed says about each stop. In this first step the screen is the two lists that do the
+  daily work: the stops no reference row could be matched to, and the stops whose code contradicts
+  the reference.
+</p>
+<div class="sp-banner note">This screen is not built yet: the two lists arrive with the next change.</div>
+{% endblock %}

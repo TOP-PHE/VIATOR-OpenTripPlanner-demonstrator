@@ -1,11 +1,19 @@
 {% extends "_base.html" %}
-{% block title %}Master stations — VIATOR admin{% endblock %}
+{% block title %}Trainline codes — VIATOR admin{% endblock %}
 
 {% block content %}
-<h1>Master stations</h1>
-<p style="color: var(--rail-steel); max-width: 720px">
-  UIC-keyed registry of European passenger stations, seeded from the
-  <a href="https://github.com/trainline-eu/stations" target="_blank">Trainline open dataset</a> (ODbL).
+{% set station_tab = 'trainline' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>Trainline codes</h1>
+<p class="sp-lead">
+  One input among several. This UIC-keyed registry is seeded from the
+  <a href="https://github.com/trainline-eu/stations" target="_blank" rel="noopener">Trainline open dataset</a> (ODbL).
+  What the station reference takes from it is <strong>the MERITS code, when a station is known to
+  Trainline</strong> — matched by railway code only, never by name or by position. It is also what the
+  journey search suggests stations from today.
+</p>
+<p class="sp-lead">
   Local edits flip the row's <code>source</code> to <code>manual</code> and prevail over future Trainline updates;
   upstream changes to those rows are surfaced in the drift queue below.
 </p>

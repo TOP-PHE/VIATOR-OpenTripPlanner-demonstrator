@@ -105,6 +105,9 @@
     .top nav .nav-group:hover .nav-dropdown,
     .top nav .nav-group:focus-within .nav-dropdown,
     .top nav .nav-group[open] .nav-dropdown { display: block; }
+    /* A group near the left of the nav opens to the right of its summary;
+       anchored right like the default, its panel would cover the logo. */
+    .top nav .nav-group-left .nav-dropdown { left: 0; right: auto; }
     .top nav .nav-dropdown a {
       display: block;
       padding: 0.5rem 1rem;
@@ -198,7 +201,41 @@
           {% if current_user %}
             <a href="/journey">Search</a>
             {% if current_user.role in ('platform_admin', 'content_manager') %}
-              <a href="/admin/master/stations">Stations</a>
+              {# Station panel (docs/station-panel-design.md section 2). The group
+                 stays in THIS role block: four of its five entries are for
+                 content managers, who never see the platform-admin block below.
+                 Only the fifth entry is platform-admin-only. Same markup as the
+                 Admin dashboard group: a native <details>, no JavaScript. #}
+              <details class="nav-group nav-group-left">
+                <summary>Stations</summary>
+                <div class="nav-dropdown" role="menu">
+                  <div class="nav-dropdown-section">Inputs</div>
+                  <a href="/admin/stations/nap" role="menuitem"
+                     title="What each feed says about each stop: the stops we could not match, and the ones whose code contradicts the reference">
+                    NAP&nbsp;station&nbsp;information
+                  </a>
+                  <a href="/admin/stations/registers" role="menuitem"
+                     title="CRD primary locations and ERA operational points, and what changed between two versions">
+                    Infrastructure&nbsp;registers
+                  </a>
+                  <a href="/admin/stations/trainline" role="menuitem"
+                     title="The Trainline registry: the MERITS code when a station is known to Trainline">
+                    Trainline&nbsp;codes
+                  </a>
+                  <div class="nav-dropdown-section">Reference</div>
+                  <a href="/admin/stations/reference" role="menuitem"
+                     title="VIATOR's own station reference, keyed on the primary location code">
+                    VIATOR&nbsp;station&nbsp;reference
+                  </a>
+                  {% if current_user.role == 'platform_admin' %}
+                    <div class="nav-dropdown-section">Administration</div>
+                    <a href="/admin/stations/sources" role="menuitem"
+                       title="How every station input is acquired: sources, uploaded versions, builds">
+                      Sources&nbsp;and&nbsp;integration
+                    </a>
+                  {% endif %}
+                </div>
+              </details>
             {% endif %}
             {% if current_user.role == 'platform_admin' %}
               <a href="/admin/sessions">Sessions</a>

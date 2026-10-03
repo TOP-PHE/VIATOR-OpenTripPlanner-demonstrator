@@ -1,0 +1,14 @@
+{% extends "_base.html" %}
+{% block title %}VIATOR station reference — VIATOR admin{% endblock %}
+
+{% block content %}
+{% set station_tab = 'reference' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>VIATOR station reference</h1>
+<p class="sp-lead">
+  VIATOR's own reference table, keyed on the CRD primary location code and the ERA operational
+  point: one code per provider, a MERITS code with its provenance, and the flags the build raised.
+</p>
+<div class="sp-banner note">This screen is not built yet: the reference list arrives with the next change.</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "_base.html" %}
+{% block title %}Infrastructure registers — VIATOR admin{% endblock %}
+
+{% block content %}
+{% set station_tab = 'registers' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>Infrastructure registers</h1>
+<p class="sp-lead">
+  The two registers the station reference is built on: the CRD primary locations and the ERA
+  operational points, each as its latest uploaded version carries them.
+</p>
+<div class="sp-banner note">This screen is not built yet: the register lists arrive with the next change.</div>
+{% endblock %}

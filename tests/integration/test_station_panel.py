@@ -811,3 +811,46 @@ def test_a_build_left_running_by_a_dead_worker_is_closed_at_startup(
         db.commit()
     assert station_import.mark_orphaned_builds() == 1
     assert _rows("SELECT status FROM station_build ORDER BY id") == [("failed",), ("done",)]
+
+
+# ───────────────────── unit 5: the nav group and the pages ─────────────────────
+
+# The four screens a content manager works on, and the address the Trainline
+# panel had before: all open to both roles.
+SHARED_PAGES = [
+    "/admin/stations/nap",
+    "/admin/stations/registers",
+    "/admin/stations/trainline",
+    "/admin/stations/reference",
+    "/admin/master/stations",
+]
+
+
+@pytest.mark.parametrize("page", SHARED_PAGES)
+def test_station_pages_render_for_both_roles(
+    client: TestClient,
+    admin: dict[str, str],
+    content_manager: dict[str, str],
+    end_user: dict[str, str],
+    page: str,
+) -> None:
+    anonymous = client.get(page)
+    assert anonymous.status_code == 303
+    assert anonymous.headers["location"] == f"/login?next={page}"
+    for headers in (admin, content_manager):
+        r = client.get(page, headers=headers)
+        assert r.status_code == 200, f"{page}: {r.status_code}"
+        assert 'class="sp-tabs"' in r.text
+        assert "<summary>Stations</summary>" in r.text
+    assert client.get(page, headers=end_user).status_code == 403
+
+
+def test_the_nav_group_shows_the_fifth_entry_to_platform_admins_only(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str]
+) -> None:
+    page = "/admin/stations/reference"
+    as_admin = client.get(page, headers=admin).text
+    as_manager = client.get(page, headers=content_manager).text
+    assert as_admin.count('href="/admin/stations/sources"') == 2  # nav group and tab bar
+    assert 'href="/admin/stations/sources"' not in as_manager
+    assert as_manager.count('href="/admin/stations/nap"') == 2
