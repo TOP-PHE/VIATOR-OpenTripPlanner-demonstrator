@@ -516,7 +516,8 @@ def test_the_detail_page_renders_for_both_roles(role: str, tmp_path: Path) -> No
     html = response.body.decode()
     assert 'data-station-id="42"' in html
     assert 'href="/admin/stations/reference" aria-current="page"' in html
-    assert "Connection times" in html and "Not part of this first step" in html
+    assert "Connection times" in html
+    assert "Not part of this first step" in html
     assert assert_scripts_parse(html, tmp_path) == 3
 
 
