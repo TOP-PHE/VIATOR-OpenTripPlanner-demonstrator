@@ -1,0 +1,361 @@
+{% extends "_base.html" %}
+{% block title %}Station sources — VIATOR admin{% endblock %}
+
+{% block content %}
+{% set station_tab = 'sources' %}
+{% include "admin/_station_panel.html" %}
+
+<h1>Sources and integration</h1>
+<p class="sp-lead">
+  How every station input is acquired. One row per source; each acquired file is a
+  <em>version</em>, identified by its sha256, so uploading the same file twice changes nothing.
+  The station files carry licensed rows and are never in the code repository: they are uploaded
+  here and kept on the server.
+</p>
+
+<div class="sp-card">
+  <h2>Sources</h2>
+  <div class="sp-filters">
+    <button type="button" id="add-source">＋ Add a source</button>
+    <label class="sp-check"><input type="checkbox" id="show-columns"> show the offline master's provider columns</label>
+  </div>
+  <div class="sp-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Source</th>
+          <th scope="col">Kind</th>
+          <th scope="col">Format</th>
+          <th scope="col">Acquisition</th>
+          <th scope="col">Credential</th>
+          <th scope="col">Cadence</th>
+          <th scope="col">Triggers rebuild</th>
+          <th scope="col">Last acquisition</th>
+          <th scope="col">Fingerprint</th>
+          <th scope="col">As of</th>
+          <th scope="col">Access expiry</th>
+          <th scope="col">State</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="sources-body"><tr><td colspan="13">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <p class="sp-muted" style="font-size: 0.82rem; margin-bottom: 0">
+    Access expiry: <span class="sp-pill warn">amber</span> within {{ access_warn_days }} days,
+    <span class="sp-pill bad">red</span> once past.
+  </p>
+</div>
+
+<div class="sp-card">
+  <h2>Build history</h2>
+  <p class="sp-lead" style="font-size: 0.88rem">
+    A build reads the five offline files and replaces the station reference. Each row lists the
+    file versions the build was made from and what it changed.
+  </p>
+  <div id="queued"></div>
+  <div class="sp-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Build</th>
+          <th scope="col">Started (UTC)</th>
+          <th scope="col">Duration</th>
+          <th scope="col">Status</th>
+          <th scope="col">Inputs</th>
+          <th scope="col">Rows</th>
+          <th scope="col">Changes</th>
+        </tr>
+      </thead>
+      <tbody id="builds-body"><tr><td colspan="7">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<dialog id="source-dialog" class="sp-dialog">
+  <form id="source-form" method="dialog">
+    <h2 id="source-dialog-title">Add a source</h2>
+    <div class="sp-form-grid">
+      <label>Key <input type="text" name="key" required pattern="[A-Za-z][A-Za-z0-9_]{1,63}" autocomplete="off" placeholder="REG_BE_INFRABEL"></label>
+      <label>Label <input type="text" name="label" required maxlength="200" autocomplete="off"></label>
+      <label>Kind <select name="kind">{% for value in source_kinds %}<option value="{{ value }}">{{ value }}</option>{% endfor %}</select></label>
+      <label>Format <select name="format">{% for value in source_formats %}<option value="{{ value }}">{{ value }}</option>{% endfor %}</select></label>
+      <label>Acquisition <select name="acquisition">{% for value in source_acquisitions %}<option value="{{ value }}">{{ value }}</option>{% endfor %}</select></label>
+      <label>Resolver type <select name="resolver_type"><option value="">— none —</option>{% for value in resolver_types %}<option value="{{ value }}">{{ value }}</option>{% endfor %}</select></label>
+      <label>Country (ISO-2) <input type="text" name="country_iso" maxlength="2" autocomplete="off" style="text-transform: uppercase"></label>
+      <label>Operator <input type="text" name="operator" maxlength="120" autocomplete="off"></label>
+      <label class="wide">Licence <input type="text" name="licence" maxlength="500" autocomplete="off"></label>
+      <label class="wide">Licence URL <input type="text" name="licence_url" inputmode="url" autocomplete="off" placeholder="https://…"></label>
+      <label>Access expires on <input type="date" name="access_expires_on"></label>
+      <label>Refresh cadence <input type="text" name="refresh_cadence" maxlength="120" autocomplete="off" placeholder="monthly"></label>
+      <label class="wide">Credential <select name="credential_id"><option value="">— no authentication —</option></select></label>
+      <label class="wide">Resolver configuration (JSON) <textarea name="resolver_config" rows="3" spellcheck="false" class="sp-code" placeholder="{}"></textarea></label>
+      <label class="sp-check"><input type="checkbox" name="triggers_rebuild"> a new version triggers a rebuild</label>
+      <label class="sp-check"><input type="checkbox" name="enabled" checked> enabled</label>
+      <label class="sp-check wide"><input type="checkbox" name="source_key_unresolved"> aggregate of several datasets, still to be split</label>
+    </div>
+    <div style="display: flex; gap: 0.5rem; justify-content: flex-end">
+      <button type="button" class="secondary" data-close="source-dialog">Cancel</button>
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="upload-dialog" class="sp-dialog">
+  <form id="upload-form" method="dialog">
+    <h2>Upload a version — <span id="upload-key" class="sp-code"></span></h2>
+    <p class="sp-muted" id="upload-hint" style="font-size: 0.88rem"></p>
+    <label>File <input type="file" name="file" required></label>
+    <label>As of <span class="sp-muted" style="font-weight: normal">(the date the file describes; read off the file name when left empty)</span>
+      <input type="date" name="as_of"></label>
+    <div style="display: flex; gap: 0.5rem; justify-content: flex-end">
+      <button type="button" class="secondary" data-close="upload-dialog">Cancel</button>
+      <button type="submit" id="upload-submit">Upload</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+const SP = globalThis.StationPanel;
+const FORMAT_HINTS = {{ format_hints | tojson }};
+const TEXT_FIELDS = ['label', 'kind', 'format', 'acquisition', 'resolver_type', 'country_iso', 'operator',
+  'licence', 'licence_url', 'access_expires_on', 'refresh_cadence', 'credential_id'];
+const FLAG_FIELDS = ['triggers_rebuild', 'enabled', 'source_key_unresolved'];
+const ACCESS_PILL = {expired: 'bad', soon: 'warn', ok: 'ok'};
+const BUILD_PILL = {done: 'ok', failed: 'bad', running: 'info'};
+
+let sources = [];
+let editingKey = null;
+let uploadKey = null;
+
+const sourceDialog = document.getElementById('source-dialog');
+const sourceForm = document.getElementById('source-form');
+const uploadDialog = document.getElementById('upload-dialog');
+const uploadForm = document.getElementById('upload-form');
+
+function yesNo(flag) { return flag ? 'yes' : 'no'; }
+
+function accessCell(s) {
+  if (!s.access_expires_on) return '<span class="sp-muted">—</span>';
+  const days = s.access_days_left;
+  const when = days < 0 ? 'expired ' + (-days) + ' d ago' : days + ' d left';
+  return SP.pill(ACCESS_PILL[s.access_state] || '', s.access_expires_on) + ' <span class="sp-muted">' + SP.esc(when) + '</span>';
+}
+
+function stateCell(s) {
+  const parts = [s.enabled ? SP.pill('ok', 'enabled') : SP.pill('', 'disabled')];
+  if (s.source_key_unresolved) parts.push(SP.pill('warn', 'aggregate, unresolved'));
+  return parts.join(' ');
+}
+
+function versionCells(s) {
+  const v = s.latest_version;
+  if (!v) return '<td class="sp-muted">never</td><td class="sp-muted">—</td><td class="sp-muted">—</td>';
+  const failed = v.status === 'failed' ? ' ' + SP.pill('bad', 'failed') : '';
+  return '<td title="' + SP.esc(v.filename) + ' · ' + SP.fmtBytes(v.bytes) + '">' + SP.fmtDate(v.acquired_at) + failed + '</td>' +
+    '<td class="sp-code" title="' + SP.esc(v.sha256) + '">' + SP.shortSha(v.sha256) + '</td>' +
+    '<td>' + SP.esc(v.as_of || '—') + '</td>';
+}
+
+function actionCell(s) {
+  const key = SP.esc(s.key);
+  const toggle = s.enabled ? 'Disable' : 'Enable';
+  return '<td style="white-space: nowrap">' +
+    '<button type="button" class="secondary" data-act="edit" data-key="' + key + '">Edit</button> ' +
+    '<button type="button" class="secondary" data-act="upload" data-key="' + key + '">Upload</button> ' +
+    '<button type="button" class="secondary" data-act="toggle" data-key="' + key + '">' + toggle + '</button></td>';
+}
+
+function sourceRow(s) {
+  const acquisition = s.resolver_type ? s.acquisition + ' (' + s.resolver_type + ')' : s.acquisition;
+  return '<tr>' +
+    '<td><strong>' + SP.esc(s.label) + '</strong><br><span class="sp-code sp-muted">' + SP.esc(s.key) + '</span></td>' +
+    '<td>' + SP.esc(s.kind) + '</td>' +
+    '<td class="sp-code">' + SP.esc(s.format) + '</td>' +
+    '<td>' + SP.esc(acquisition) + '</td>' +
+    '<td>' + SP.esc(s.credential_name || '—') + '</td>' +
+    '<td>' + SP.esc(s.refresh_cadence || '—') + '</td>' +
+    '<td>' + yesNo(s.triggers_rebuild) + '</td>' +
+    versionCells(s) +
+    '<td>' + accessCell(s) + '</td>' +
+    '<td>' + stateCell(s) + '</td>' +
+    actionCell(s) + '</tr>';
+}
+
+function renderSources() {
+  const showColumns = document.getElementById('show-columns').checked;
+  const visible = sources.filter((s) => showColumns || s.format !== 'offline_master_column');
+  const body = document.getElementById('sources-body');
+  body.innerHTML = visible.length ? visible.map(sourceRow).join('') : '<tr><td colspan="13"><em>No source.</em></td></tr>';
+}
+
+function inputsCell(build) {
+  const inputs = build.inputs || {};
+  const lines = Object.entries(inputs).map(([key, v]) =>
+    '<span class="sp-code" title="' + SP.esc(v.sha256 || '') + '">' + SP.esc(key) + ' ' + SP.shortSha(v.sha256) + '</span>');
+  return lines.join('<br>') || '<span class="sp-muted">—</span>';
+}
+
+function summaryCell(summary) {
+  const entries = Object.entries(summary || {}).filter(([, value]) => typeof value === 'number');
+  if (!entries.length) return '<span class="sp-muted">—</span>';
+  return entries.map(([name, value]) => SP.esc(name) + ' ' + SP.fmtInt(value)).join('<br>');
+}
+
+function buildRow(b) {
+  const duration = b.duration_seconds === null ? '—' : b.duration_seconds.toFixed(1) + ' s';
+  const error = b.counts && b.counts.error ? '<br><span class="sp-muted">' + SP.esc(b.counts.error) + '</span>' : '';
+  return '<tr><td>#' + b.id + '</td><td>' + SP.fmtDate(b.started_at) + '</td><td class="sp-num">' + duration + '</td>' +
+    '<td>' + SP.pill(BUILD_PILL[b.status] || '', b.status) + error + '</td>' +
+    '<td>' + inputsCell(b) + '</td><td>' + summaryCell(b.counts) + '</td><td>' + summaryCell(b.diff_summary) + '</td></tr>';
+}
+
+function renderBuilds(data) {
+  const body = document.getElementById('builds-body');
+  body.innerHTML = data.builds.length ? data.builds.map(buildRow).join('') : '<tr><td colspan="7"><em>No build yet.</em></td></tr>';
+  const queued = document.getElementById('queued');
+  queued.innerHTML = data.queued.length
+    ? '<div class="sp-banner note">' + data.queued.length + ' station build job(s) queued or running; the worker starts a queued job once its debounce has elapsed.</div>'
+    : '';
+}
+
+async function loadSources() {
+  const {data} = await SP.getJson('/api/admin/stations/sources');
+  sources = data;
+  renderSources();
+}
+
+async function loadBuilds() {
+  const {data} = await SP.getJson('/api/admin/stations/builds');
+  renderBuilds(data);
+}
+
+async function loadCredentials() {
+  const select = sourceForm.elements.credential_id;
+  try {
+    const {data} = await SP.getJson('/api/credentials');
+    for (const cred of data) select.add(new Option(cred.name, cred.id));
+  } catch (err) {
+    console.warn('station sources: could not list credentials', err);
+  }
+}
+
+function fillForm(s) {
+  for (const name of TEXT_FIELDS) sourceForm.elements[name].value = s[name] ?? '';
+  for (const name of FLAG_FIELDS) sourceForm.elements[name].checked = Boolean(s[name]);
+  sourceForm.elements.resolver_config.value = s.resolver_config ? JSON.stringify(s.resolver_config, null, 2) : '';
+}
+
+function openSourceDialog(s) {
+  editingKey = s ? s.key : null;
+  document.getElementById('source-dialog-title').textContent = s ? 'Edit ' + s.key : 'Add a source';
+  sourceForm.reset();
+  sourceForm.elements.key.value = s ? s.key : '';
+  sourceForm.elements.key.disabled = Boolean(s);
+  if (s) fillForm(s);
+  sourceDialog.showModal();
+}
+
+function readForm() {
+  const body = {};
+  for (const name of TEXT_FIELDS) body[name] = sourceForm.elements[name].value.trim() || null;
+  for (const name of FLAG_FIELDS) body[name] = sourceForm.elements[name].checked;
+  const raw = sourceForm.elements.resolver_config.value.trim();
+  body.resolver_config = raw ? JSON.parse(raw) : null;
+  return body;
+}
+
+async function saveSource(event) {
+  event.preventDefault();
+  let body;
+  try {
+    body = readForm();
+  } catch (err) {
+    SP.toast('error', 'The resolver configuration is not valid JSON: ' + err.message);
+    return;
+  }
+  try {
+    if (editingKey) {
+      await SP.sendJson('PATCH', '/api/admin/stations/sources/' + encodeURIComponent(editingKey), body);
+    } else {
+      body.key = sourceForm.elements.key.value.trim();
+      await SP.sendJson('POST', '/api/admin/stations/sources', body);
+    }
+    sourceDialog.close();
+    SP.toast('success', 'Source saved');
+    await loadSources();
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
+}
+
+function openUploadDialog(s) {
+  uploadKey = s.key;
+  uploadForm.reset();
+  document.getElementById('upload-key').textContent = s.key;
+  document.getElementById('upload-hint').textContent = FORMAT_HINTS[s.format]
+    ? 'Expected: ' + FORMAT_HINTS[s.format] + '. A file with another header is refused.'
+    : 'This format is stored as it is; nothing reads it yet.';
+  uploadDialog.showModal();
+}
+
+function describeUpload(result) {
+  if (!result.created) return 'This exact file was already uploaded: nothing changed';
+  return 'Uploaded ' + result.version.filename + ' (' + SP.fmtBytes(result.version.bytes) + ')';
+}
+
+async function submitUpload(event) {
+  event.preventDefault();
+  const button = document.getElementById('upload-submit');
+  button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('file', uploadForm.elements.file.files[0]);
+    if (uploadForm.elements.as_of.value) form.append('as_of', uploadForm.elements.as_of.value);
+    const url = '/api/admin/stations/sources/' + encodeURIComponent(uploadKey) + '/versions';
+    const resp = await SP.request(url, {method: 'POST', body: form});
+    const result = await resp.json();
+    uploadDialog.close();
+    SP.toast(result.created ? 'success' : 'warning', describeUpload(result));
+    await Promise.all([loadSources(), loadBuilds()]);
+  } catch (err) {
+    SP.toast('error', err.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function toggleSource(s) {
+  try {
+    await SP.sendJson('PATCH', '/api/admin/stations/sources/' + encodeURIComponent(s.key), {enabled: !s.enabled});
+    await loadSources();
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
+}
+
+const ACTIONS = {edit: openSourceDialog, upload: openUploadDialog, toggle: toggleSource};
+
+document.getElementById('sources-body').addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-act]');
+  if (!button) return;
+  const source = sources.find((s) => s.key === button.dataset.key);
+  if (source) ACTIONS[button.dataset.act](source);
+});
+document.getElementById('add-source').addEventListener('click', () => openSourceDialog(null));
+document.getElementById('show-columns').addEventListener('change', renderSources);
+sourceForm.addEventListener('submit', saveSource);
+uploadForm.addEventListener('submit', submitUpload);
+for (const button of document.querySelectorAll('button[data-close]')) {
+  button.addEventListener('click', () => document.getElementById(button.dataset.close).close());
+}
+
+try {
+  await Promise.all([loadSources(), loadBuilds(), loadCredentials()]);
+} catch (err) {
+  SP.toast('error', 'Could not load the station sources: ' + err.message);
+}
+</script>
+{% endblock %}

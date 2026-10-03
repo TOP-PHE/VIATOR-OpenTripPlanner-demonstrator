@@ -1,0 +1,168 @@
+{# Shared by the five station screens: the tab bar, the styles and a few JS
+   helpers. Included at the top of each screen's content block, with
+   `station_tab` naming the active entry.
+
+   One copy on purpose: the helpers (escaping, fetch, pager) are the same on
+   every screen, and five inline copies would drift. They live in a template
+   rather than under app/static/ so they ship with the page that needs them. #}
+<style>
+  main { max-width: 1500px; }
+  .sp-tabs { display: flex; gap: 0.25rem; flex-wrap: wrap; border-bottom: 2px solid var(--sleeper); margin-bottom: 1.2rem; }
+  .sp-tabs a { padding: 0.45rem 0.85rem; text-decoration: none; color: var(--rail-steel); border-radius: 6px 6px 0 0; font-size: 0.9rem; }
+  .sp-tabs a:hover { background: var(--paper); color: var(--brand-blue); }
+  .sp-tabs a[aria-current="page"] { background: var(--brand-blue); color: #fff; font-weight: 600; }
+  .sp-lead { color: var(--rail-steel); max-width: 900px; margin-top: 0; }
+  .sp-card { background: var(--paper); padding: 1rem 1.25rem; border-radius: 8px; margin-bottom: 1rem; }
+  .sp-card h2 { margin: 0 0 0.5rem; font-size: 1.05rem; }
+  .sp-filters { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: end; margin-bottom: 0.75rem; }
+  .sp-filters label { margin: 0; font-size: 0.8rem; font-weight: 600; color: var(--rail-steel); display: grid; gap: 0.2rem; }
+  .sp-filters input, .sp-filters select { width: auto; min-width: 8rem; }
+  .sp-filters button { margin-top: 0; }
+  .sp-scroll { overflow-x: auto; border: 1px solid var(--sleeper); border-radius: 4px; }
+  .sp-scroll table { margin: 0; }
+  .sp-scroll th { white-space: nowrap; }
+  .sp-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sp-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.82rem; }
+  .sp-muted { color: var(--rail-steel); }
+  .sp-pill { display: inline-block; font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 10px; background: #e3e7ec; color: #1c2330; white-space: nowrap; }
+  .sp-pill.ok { background: #e9f6ec; color: var(--ok); }
+  .sp-pill.warn { background: #fff8e1; color: #6f5100; }
+  .sp-pill.bad { background: #fdecef; color: var(--fail); }
+  .sp-pill.info { background: #e8f0fb; color: var(--brand-blue-d); }
+  .sp-banner { padding: 0.6rem 0.9rem; border-radius: 4px; margin-bottom: 0.8rem; font-size: 0.9rem; }
+  .sp-banner.licence { background: #fff8e1; color: #6f5100; border: 1px solid #f0d77a; }
+  .sp-banner.note { background: #e8f0fb; color: var(--brand-blue-d); border: 1px solid #c5d6ee; }
+  .sp-pager { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.6rem; font-size: 0.9rem; }
+  .sp-pager button { margin-top: 0; padding: 0.25rem 0.6rem; }
+  .sp-pager .sp-pos { color: var(--rail-steel); }
+  .sp-toast { position: fixed; right: 1rem; bottom: 1rem; min-width: 240px; max-width: 520px; z-index: 60; }
+  dialog.sp-dialog { border: 1px solid var(--sleeper); border-radius: 8px; padding: 1.25rem; max-width: 640px; width: 92vw; }
+  dialog.sp-dialog::backdrop { background: rgba(28, 35, 48, 0.4); }
+  dialog.sp-dialog h2 { margin-top: 0; font-size: 1.1rem; }
+  .sp-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.9rem; }
+  .sp-form-grid .wide { grid-column: 1 / -1; }
+  .sp-check { display: inline-flex; align-items: center; gap: 0.35rem; font-weight: normal; }
+</style>
+
+<nav class="sp-tabs" aria-label="Station panel">
+  <a href="/admin/stations/nap"{% if station_tab == 'nap' %} aria-current="page"{% endif %}>NAP station information</a>
+  <a href="/admin/stations/registers"{% if station_tab == 'registers' %} aria-current="page"{% endif %}>Infrastructure registers</a>
+  <a href="/admin/stations/trainline"{% if station_tab == 'trainline' %} aria-current="page"{% endif %}>Trainline codes</a>
+  <a href="/admin/stations/reference"{% if station_tab == 'reference' %} aria-current="page"{% endif %}>VIATOR station reference</a>
+  {% if current_user.role == 'platform_admin' %}
+  <a href="/admin/stations/sources"{% if station_tab == 'sources' %} aria-current="page"{% endif %}>Sources and integration</a>
+  {% endif %}
+</nav>
+
+<div id="sp-toast" class="msg sp-toast" role="status"></div>
+
+<script>
+globalThis.StationPanel = (() => {
+  const ESCAPES = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
+  const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let toastTimer = null;
+
+  function esc(value) {
+    return String(value ?? '').replaceAll(/[&<>"']/g, (c) => ESCAPES[c]);
+  }
+
+  function fmtInt(n) {
+    return Number(n ?? 0).toLocaleString('en-GB');
+  }
+
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), UNITS.length - 1);
+    return (n / 1024 ** i).toFixed(i >= 2 ? 1 : 0) + ' ' + UNITS[i];
+  }
+
+  // "2026-10-03T12:00:00+00:00" -> "2026-10-03 12:00"
+  function fmtDate(iso) {
+    return iso ? String(iso).slice(0, 16).replace('T', ' ') : '—';
+  }
+
+  function shortSha(sha) {
+    return sha ? String(sha).slice(0, 12) : '—';
+  }
+
+  function toast(kind, text) {
+    const el = document.getElementById('sp-toast');
+    el.className = 'msg sp-toast show ' + kind;
+    el.textContent = text;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.className = 'msg sp-toast'; }, 6000);
+  }
+
+  // The API answers {"detail": "..."} on a refusal; anything else is a status code.
+  async function errorText(resp) {
+    try {
+      const body = await resp.json();
+      return typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+    } catch (err) {
+      console.warn('station panel: the error response was not JSON', err);
+      return 'HTTP ' + resp.status;
+    }
+  }
+
+  async function request(url, options) {
+    const resp = await fetch(url, options);
+    if (!resp.ok) throw new Error(await errorText(resp));
+    return resp;
+  }
+
+  async function getJson(url) {
+    const resp = await request(url);
+    return {data: await resp.json(), headers: resp.headers};
+  }
+
+  async function sendJson(method, url, body) {
+    const options = {method};
+    if (body !== undefined) {
+      options.headers = {'Content-Type': 'application/json'};
+      options.body = JSON.stringify(body);
+    }
+    const resp = await request(url, options);
+    return resp.status === 204 ? null : resp.json();
+  }
+
+  // Query string from an object, dropping empty values.
+  function query(params) {
+    const out = new URLSearchParams();
+    for (const [name, value] of Object.entries(params)) {
+      if (value !== null && value !== undefined && value !== '') out.set(name, String(value));
+    }
+    return out.toString();
+  }
+
+  function totalOf(headers) {
+    return Number.parseInt(headers.get('X-Total-Count') || '0', 10);
+  }
+
+  function pagerButton(label, target, disabled) {
+    const off = disabled ? ' disabled' : '';
+    return '<button type="button" class="secondary" data-page="' + target + '"' + off + '>' + label + '</button>';
+  }
+
+  // First / Prev / position / Next / Last. `go(page)` is called with a 0-based page.
+  function renderPager(el, page, size, total, go) {
+    const pages = Math.max(1, Math.ceil(total / size));
+    const last = pages - 1;
+    el.innerHTML = [
+      pagerButton('« First', 0, page === 0),
+      pagerButton('‹ Prev', Math.max(0, page - 1), page === 0),
+      '<span class="sp-pos">page ' + (page + 1) + ' of ' + pages + ' · ' + fmtInt(total) + ' rows</span>',
+      pagerButton('Next ›', Math.min(last, page + 1), page >= last),
+      pagerButton('Last »', last, page >= last),
+    ].join(' ');
+    for (const button of el.querySelectorAll('button[data-page]')) {
+      button.addEventListener('click', () => go(Number.parseInt(button.dataset.page, 10)));
+    }
+  }
+
+  function pill(kind, text) {
+    return '<span class="sp-pill ' + kind + '">' + esc(text) + '</span>';
+  }
+
+  return {esc, fmtInt, fmtBytes, fmtDate, shortSha, toast, getJson, sendJson, request, query, totalOf, renderPager, pill};
+})();
+</script>

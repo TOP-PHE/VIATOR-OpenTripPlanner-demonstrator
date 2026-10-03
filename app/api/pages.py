@@ -258,6 +258,42 @@ def admin_master_stations_page(request: Request) -> Response:
     )
 
 
+# ────────────────────────── station panel ──────────────────────────
+#
+# Five screens under /admin/stations (docs/station-panel-design.md section 2).
+# Four are for content managers and platform admins; the fifth, sources, is
+# for platform admins only. Pages use the redirect-on-failure guard, never the
+# JSON API's `require_*` dependencies.
+
+
+@router.get("/admin/stations/sources", response_class=HTMLResponse)
+def admin_station_sources_page(request: Request) -> Response:
+    """Screen E: how every station input is acquired. Platform admin only."""
+    path = "/admin/stations/sources"
+    user = _maybe_user(request)
+    if user is None:
+        return _redirect_to_login(path)
+    if user.role != "platform_admin":
+        return _forbidden_html(request, "Platform admin access required.")
+    from ..feed_resolvers import RESOLVER_TYPES
+    from ..master import station_files
+    from .admin import station_sources as sources_api
+
+    return templates.TemplateResponse(
+        request,
+        "admin/station_sources.html",
+        {
+            "current_user": user,
+            "access_warn_days": sources_api.ACCESS_WARN_DAYS,
+            "source_kinds": sorted(sources_api.SOURCE_KINDS),
+            "source_formats": sorted(sources_api.SOURCE_FORMATS),
+            "source_acquisitions": sorted(sources_api.SOURCE_ACQUISITIONS),
+            "resolver_types": sorted(RESOLVER_TYPES),
+            "format_hints": station_files.FORMAT_LABELS,
+        },
+    )
+
+
 @router.get("/journey", response_class=HTMLResponse)
 def journey_page(
     request: Request,

@@ -264,3 +264,151 @@ def test_session_upload_of_a_station_csv_is_400_not_500(
     )
     assert r.status_code == 400
     assert "Detection failed" in r.json()["detail"]
+
+
+# ───────────────────── unit 3: sources API and screen E ─────────────────────
+
+SOURCES = "/api/admin/stations/sources"
+
+# Every JSON route of the platform-admin router: (method, path).
+ADMIN_ROUTES = [
+    ("GET", SOURCES),
+    ("POST", SOURCES),
+    ("PATCH", f"{SOURCES}/CRD"),
+    ("DELETE", f"{SOURCES}/CRD"),
+    ("GET", f"{SOURCES}/CRD/versions"),
+    ("POST", f"{SOURCES}/CRD/versions"),
+    ("GET", "/api/admin/stations/builds"),
+]
+
+
+def test_sources_list_carries_the_seeds_and_the_latest_version(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    r = client.get(SOURCES, headers=admin)
+    assert r.status_code == 200, r.text
+    rows = {s["key"]: s for s in r.json()}
+    assert len(rows) == 22
+    assert rows["CRD"]["format"] == sf.CRD_LOCATIONS
+    assert rows["CRD"]["triggers_rebuild"] is True
+    assert rows["TRAINLINE"]["acquisition"] == "url"
+    assert rows["nap_FR_regional"]["source_key_unresolved"] is True
+    assert all(s["latest_version"] is None and s["version_count"] == 0 for s in rows.values())
+    assert all(s["access_state"] == "none" for s in rows.values())
+
+    _upload(client, admin, "ERA_TELREF", TELREF, "telref_locations_v3.csv").raise_for_status()
+    rows = {s["key"]: s for s in client.get(SOURCES, headers=admin).json()}
+    assert rows["ERA_TELREF"]["version_count"] == 1
+    assert rows["ERA_TELREF"]["latest_version"]["filename"] == "telref_locations_v3.csv"
+    assert rows["CRD"]["latest_version"] is None
+
+
+def test_source_create_edit_disable_delete(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    body = {
+        "key": "REG_ZZ_TEST",
+        "label": "A test register",
+        "kind": "registry",
+        "format": "other",
+        "acquisition": "upload",
+        "country_iso": "zz",
+        "access_expires_on": "2020-01-01",
+    }
+    r = client.post(SOURCES, headers=admin, json=body)
+    assert r.status_code == 201, r.text
+    created = r.json()
+    assert created["country_iso"] == "ZZ"
+    assert created["access_state"] == "expired"  # the date is past: red
+    assert client.post(SOURCES, headers=admin, json=body).status_code == 409
+    assert (
+        client.post(
+            SOURCES, headers=admin, json={**body, "key": "X2", "kind": "planet"}
+        ).status_code
+        == 400
+    )
+
+    one = f"{SOURCES}/REG_ZZ_TEST"
+    r = client.patch(one, headers=admin, json={"enabled": False, "access_expires_on": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is False
+    assert r.json()["access_state"] == "none"
+    assert r.json()["label"] == "A test register"  # not sent, not touched
+    assert client.patch(one, headers=admin, json={"label": None}).status_code == 400
+    assert client.patch(f"{SOURCES}/NOPE", headers=admin, json={"enabled": True}).status_code == 404
+
+    assert client.delete(one, headers=admin).status_code == 204
+    assert client.delete(one, headers=admin).status_code == 404
+
+
+def test_a_source_with_versions_cannot_be_deleted(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    _upload(client, admin, "ERA_TELREF", TELREF, "telref_locations_v3.csv").raise_for_status()
+    r = client.delete(f"{SOURCES}/ERA_TELREF", headers=admin)
+    assert r.status_code == 409
+    assert "disabled" in r.json()["detail"]
+
+
+def test_versions_are_listed_newest_first(
+    client: TestClient, admin: dict[str, str], inbox: Path
+) -> None:
+    second = csv_bytes(
+        sf.FILE_SHAPES[sf.ERA_TELREF],
+        {"plc": "ZZ00002", "uopid": "ZZ00002", "name": "Sampleton", "iso2": "ZZ"},
+    )
+    _upload(client, admin, "ERA_TELREF", TELREF, "telref_v1.csv").raise_for_status()
+    _upload(client, admin, "ERA_TELREF", second, "telref_v2.csv").raise_for_status()
+    r = client.get(f"{SOURCES}/ERA_TELREF/versions", headers=admin)
+    assert r.status_code == 200
+    assert [v["filename"] for v in r.json()] == ["telref_v2.csv", "telref_v1.csv"]
+    assert client.get(f"{SOURCES}/NOPE/versions", headers=admin).status_code == 404
+
+
+def test_builds_list_shows_history_and_queued_station_jobs_only(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    from app.db import SessionLocal
+    from app.models import RebuildJob, StationBuild
+
+    r = client.get("/api/admin/stations/builds", headers=admin)
+    assert r.status_code == 200
+    assert r.json() == {"builds": [], "queued": []}
+
+    with SessionLocal() as db:
+        db.add(StationBuild(status="done", counts={"station_ref": 3}, diff_summary={"created": 3}))
+        db.add(RebuildJob(status="pending", kind="station_build"))
+        db.add(RebuildJob(status="pending"))  # a graph job: not ours
+        db.add(RebuildJob(status="done", kind="station_build"))  # finished: not queued
+        db.commit()
+    body = client.get("/api/admin/stations/builds", headers=admin).json()
+    assert [b["status"] for b in body["builds"]] == ["done"]
+    assert body["builds"][0]["counts"] == {"station_ref": 3}
+    assert [j["status"] for j in body["queued"]] == ["pending"]
+
+
+@pytest.mark.parametrize(("method", "path"), ADMIN_ROUTES)
+def test_every_sources_route_refuses_anyone_but_a_platform_admin(
+    client: TestClient,
+    content_manager: dict[str, str],
+    end_user: dict[str, str],
+    method: str,
+    path: str,
+) -> None:
+    assert client.request(method, path).status_code == 401
+    assert client.request(method, path, headers=end_user).status_code == 403
+    assert client.request(method, path, headers=content_manager).status_code == 403
+
+
+def test_sources_page_is_for_platform_admins(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str]
+) -> None:
+    page = "/admin/stations/sources"
+    anonymous = client.get(page)
+    assert anonymous.status_code == 303
+    assert anonymous.headers["location"] == f"/login?next={page}"
+    assert client.get(page, headers=content_manager).status_code == 403
+    r = client.get(page, headers=admin)
+    assert r.status_code == 200
+    assert "Sources and integration" in r.text
+    assert "VIATOR" in r.text
