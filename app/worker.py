@@ -18,11 +18,14 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import update
 
 from . import engine_versions, graph_snapshots, netex_calendar
 from .db import SessionLocal
@@ -44,6 +47,16 @@ _RELOAD_TRIGGER = Path("/data/generated/.reload-trigger")
 # Hard-coding it (rather than `shutil.which`) also makes the security review
 # trivial: every subprocess invocation passes through this constant.
 _DOCKER = "/usr/local/bin/docker"
+
+# Every build container is named `<prefix><job id>`, so the worker can find it:
+# to kill it when an operator cancels the job, and to kill one a previous worker
+# left running (a worker restart abandons its `docker run`, not the container).
+_BUILD_CONTAINER_PREFIX = "viator-build-"
+_CANCEL_POLL_SECONDS = 10.0
+
+
+def _name_args(container_name: str | None) -> list[str]:
+    return ["--name", container_name] if container_name else []
 
 
 def _host_total_gb() -> int | None:
@@ -299,6 +312,11 @@ def main() -> None:
     except Exception:
         log.exception("orphan rebuild_jobs cleanup failed at startup (non-fatal)")
 
+    # A build container outlives the worker that started it. Its job was just
+    # marked failed, so nothing would ever read its result — stop it before it
+    # competes with the next build for memory.
+    _kill_orphaned_build_containers()
+
     # v0.1.38 — restart any containers a max-memory rebuild left stopped if the
     # previous worker died mid-build before its `finally` could run.
     _recover_max_memory_stopped()
@@ -355,12 +373,20 @@ def tick() -> None:
         if datetime.now(UTC) < deadline:
             return
 
-        job.status = "running"
-        job.started_at = datetime.now(UTC)
-        db.commit()
         job_id = job.id
         sid = job.session_id
         max_memory = bool(job.max_memory)
+        # Conditional claim: an operator may have cancelled the job since the
+        # SELECT above, and that must win over starting it.
+        claimed = db.execute(
+            update(RebuildJob)
+            .where(RebuildJob.id == job_id, RebuildJob.status == "pending")
+            .values(status="running", started_at=datetime.now(UTC))
+            .returning(RebuildJob.id)
+        ).scalar_one_or_none()
+        db.commit()
+        if claimed is None:
+            return
 
     log.info("running rebuild job %s (session=%s max_memory=%s)", job_id, sid, max_memory)
     # P1 MOTIS — dispatch to the engine-appropriate builder. We resolve
@@ -372,17 +398,35 @@ def tick() -> None:
             row = db.get(SessionRow, sid)
             if row is not None:
                 engine = getattr(row, "engine", "otp") or "otp"
-    if engine == "motis":
-        output, success, graph_path = run_build_motis(session_id=sid, max_memory=max_memory)
-    else:
-        output, success, graph_path = run_build(session_id=sid, max_memory=max_memory)
+    container = _build_container_name(job_id)
+    done = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_for_cancel, args=(job_id, container, done), daemon=True
+    )
+    watcher.start()
+    try:
+        if engine == "motis":
+            output, success, graph_path = run_build_motis(
+                session_id=sid, max_memory=max_memory, container_name=container
+            )
+        else:
+            output, success, graph_path = run_build(
+                session_id=sid, max_memory=max_memory, container_name=container
+            )
+    finally:
+        done.set()
+        watcher.join(timeout=_CANCEL_POLL_SECONDS + 5)
 
     with SessionLocal() as db:
         job = db.get(RebuildJob, job_id)
         if job is None:  # pragma: no cover  defensive
             return
         job.finished_at = datetime.now(UTC)
-        job.status = "done" if success else "failed"
+        job.status = _final_status(
+            success=success, cancel_requested=job.cancel_requested_at is not None
+        )
+        if job.status == "cancelled":
+            output += "\n[viator] cancelled by an operator: build container stopped\n"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
 
@@ -436,6 +480,64 @@ def tick() -> None:
                 )
 
         db.commit()
+
+
+def _final_status(*, success: bool, cancel_requested: bool) -> str:
+    """A build that finished before the kill landed is still `done`: its graph
+    is already promoted, so calling it cancelled would misreport what serves."""
+    if success:
+        return "done"
+    return "cancelled" if cancel_requested else "failed"
+
+
+def _build_container_name(job_id: uuid.UUID) -> str:
+    return f"{_BUILD_CONTAINER_PREFIX}{job_id}"
+
+
+def _cancel_requested(job_id: uuid.UUID) -> bool:
+    with SessionLocal() as db:
+        job = db.get(RebuildJob, job_id)
+        return job is not None and job.cancel_requested_at is not None
+
+
+def _kill_container(name: str) -> None:
+    # Fails harmlessly between the MOTIS `config` and `import` containers,
+    # when no container carries the name.
+    subprocess.run(  # noqa: S603
+        [_DOCKER, "kill", name], capture_output=True, text=True, check=False
+    )
+
+
+def _watch_for_cancel(job_id: uuid.UUID, container: str, done: threading.Event) -> None:
+    """Runs beside a build. Once the job is cancelled, kill its container on
+    every poll: MOTIS runs `config` then `import` under the same name, and a
+    container started after the first kill must not survive either."""
+    seen = False
+    while not done.wait(_CANCEL_POLL_SECONDS):
+        try:
+            if not _cancel_requested(job_id):
+                continue
+            if not seen:
+                log.warning("rebuild job %s cancelled: stopping %s", job_id, container)
+                seen = True
+            _kill_container(container)
+        except Exception:
+            log.exception("cancel check failed for rebuild job %s", job_id)
+
+
+def _kill_orphaned_build_containers() -> None:
+    ps = subprocess.run(  # noqa: S603
+        [_DOCKER, "ps", "-q", "--filter", f"name=^{_BUILD_CONTAINER_PREFIX}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ids = ps.stdout.split()
+    if ps.returncode != 0 or not ids:
+        return
+    log.warning("stopping %d build container(s) left by a previous worker", len(ids))
+    for cid in ids:
+        _kill_container(cid)
 
 
 def _list_serving_sessions() -> list[str]:
@@ -717,7 +819,9 @@ def handle_reload_trigger() -> None:
     log.info("reload completed; trigger deleted")
 
 
-def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
+def run_build(
+    *, session_id: str | None, max_memory: bool = False, container_name: str | None = None
+) -> tuple[str, bool, str]:
     """Invoke OTP build via the docker socket. Returns (log, success, graph_path).
 
     When `max_memory` is set, the worker first stops the serving sessions +
@@ -989,6 +1093,7 @@ def run_build(*, session_id: str | None, max_memory: bool = False) -> tuple[str,
         "viator",  # must match `name:` in docker/docker-compose.yml
         "run",
         "--rm",
+        *_name_args(container_name),
         "-e",
         # v0.1.23 — heap now resolved from session config (with the env-var
         # default as fallback), not always from settings. Lets operators
@@ -1151,7 +1256,9 @@ def _strip_tiles_block(config_yml: Path) -> None:
     config_yml.write_text("".join(out), encoding="utf-8")  # NOSONAR
 
 
-def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tuple[str, bool, str]:
+def run_build_motis(
+    *, session_id: str | None, max_memory: bool = False, container_name: str | None = None
+) -> tuple[str, bool, str]:
     """P1 MOTIS — invoke `/motis config` + `/motis import` via the docker socket.
 
     Returns the same `(log, success, data_path)` triple as the OTP builder
@@ -1262,6 +1369,7 @@ def run_build_motis(*, session_id: str | None, max_memory: bool = False) -> tupl
             "docker",
             "run",
             "--rm",
+            *_name_args(container_name),
             "--user",
             worker_user,
             "--network",

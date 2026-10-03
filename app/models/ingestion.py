@@ -84,3 +84,7 @@ class RebuildJob(TimestampMixin, Base):
     # auto-sizes the build heap to host RAM, then restarts them when done.
     # One-off per job (UI checkbox next to Rebuild), not a session default.
     max_memory: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    # Set by the web app when an operator cancels a RUNNING job. The worker owns
+    # the build container, so it watches this column, kills the container and
+    # records the job as `cancelled`. A pending job is cancelled outright.
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

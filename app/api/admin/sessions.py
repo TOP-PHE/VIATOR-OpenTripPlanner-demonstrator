@@ -2605,6 +2605,8 @@ class RebuildJobResponse(BaseModel):
     snapshot: SnapshotInfo | None = None  # joined from graph_snapshots by rebuild_job_id
     cache_hit: bool | None = None  # parsed from log; None when not detectable
     max_memory: bool = False  # v0.1.38 — job ran (or will run) in max-memory mode
+    # A running job whose cancel the worker has not acted on yet.
+    cancel_requested: bool = False
 
 
 class OsmCountryRow(BaseModel):
@@ -2793,6 +2795,57 @@ def list_rebuilds(
     return [_job_to_response(j, db=db) for j in rows]
 
 
+@router.post(
+    "/{sid}/rebuilds/{job_id}/cancel",
+    responses={
+        404: {"description": "No such rebuild job in this session"},
+        409: {"description": "The rebuild job has already finished"},
+    },
+)
+def cancel_rebuild(
+    sid: str,
+    job_id: uuid.UUID,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> RebuildJobResponse:
+    """Cancel a rebuild. A pending job is cancelled at once. A running one is
+    flagged: the worker owns the build container, notices the flag within
+    ~10 s, kills the container and records the job as `cancelled` (or `done`,
+    if the build finished first). A finished job answers 409.
+
+    A cancelled or failed build never touches the graph being served.
+    """
+    job = db.get(RebuildJob, job_id)
+    if job is None or job.session_id != sid:
+        raise HTTPException(404, "Rebuild job not found")
+    now = datetime.now(UTC)
+    who = actor.username or "an operator"
+    if job.status == "pending":
+        job.status = "cancelled"
+        job.finished_at = now
+        job.log = (job.log or "") + f"cancelled at {now.isoformat()} by {who} (never started)\n"
+    elif job.status == "running":
+        if job.cancel_requested_at is None:
+            job.cancel_requested_at = now
+            job.log = (job.log or "") + f"cancel requested at {now.isoformat()} by {who}\n"
+    else:
+        raise HTTPException(409, f"Rebuild job already {job.status}")
+
+    audit.record(
+        db,
+        action="session.rebuild.cancelled",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="session",
+        target_id=sid,
+        metadata={"job_id": str(job.id), "status": job.status},
+    )
+    db.commit()
+    db.refresh(job)
+    return _job_to_response(job)
+
+
 def _classify_rebuild_log(log: str | None) -> dict[str, Any]:
     """Pure: parse a rebuild log tail for human-actionable signals.
 
@@ -2874,6 +2927,7 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
         snapshot=snapshot_info,
         cache_hit=classification["cache_hit"],
         max_memory=bool(j.max_memory),
+        cancel_requested=j.cancel_requested_at is not None,
     )
 
 
