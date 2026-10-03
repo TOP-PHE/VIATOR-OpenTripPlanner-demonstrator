@@ -88,6 +88,21 @@ class DriftResolveBody(BaseModel):
 # ────────────────────────── search / list ──────────────────────────
 
 
+def pinned_page(page: int | None) -> int:
+    """The page the caller asked for; the first one when it asked for none."""
+    return 0 if page is None else page
+
+
+def drift_uics_of(db: DbSession) -> set[str]:
+    """The UICs with a pending drift.
+
+    Only the key is read. The rows carry `trainline_snapshot`, a JSONB
+    document per station, and this runs on every call of the list — per
+    keystroke from the journey typeahead.
+    """
+    return set(db.execute(select(MasterStationPendingDrift.uic)).scalars().all())
+
+
 @router.get("", response_model=list[StationResponse])
 def list_stations(
     response: Response,
@@ -95,7 +110,14 @@ def list_stations(
     _: Annotated[CurrentUser, Depends(require_content_manager)],
     q: str | None = Query(None, description="Substring of name (case-insensitive)"),
     country: str | None = Query(None, max_length=2),
-    page: int = Query(0, ge=0),
+    page: int | None = Query(
+        None,
+        ge=0,
+        description=(
+            "Omitted: the first page, or in `context` mode with `q` the page of "
+            "the first match. Given: that page, 0 included."
+        ),
+    ),
     size: int = Query(50, ge=1, le=500),
     mode: str = Query(
         "filter",
@@ -126,6 +148,10 @@ def list_stations(
                        caller). Lets the UI present "showing matches on
                        page X of Y" without a second round-trip.
 
+    `page` is optional. Omitted, the caller has pinned no page: it gets the
+    first one, or in context mode with `q` the page of the first match.
+    Given, it is the page shown — `page=0` is the first page, not "no page".
+
     Sorting is `(country_iso, name)`, stable across requests.
     """
     base_filter = select(MasterStation)
@@ -148,7 +174,7 @@ def list_stations(
     response.headers["X-Total-Count"] = str(total)
 
     match_count = 0
-    match_page = page
+    match_page = pinned_page(page)
     if q and match_clause is not None:
         # How many matches across the (country-filtered) universe.
         matches_universe = base_filter.where(match_clause)
@@ -182,10 +208,11 @@ def list_stations(
                 match_page = before_count // size
         response.headers["X-Match-Page"] = str(match_page)
 
-    # When the caller didn't pin a page (page=0 default) and we've computed
-    # a context-mode jump page, navigate there. If they explicitly requested
-    # a page, respect it (lets the UI flip pages while keeping the search).
-    effective_page = match_page if (mode == "context" and page == 0 and q) else page
+    # When the caller pinned no page (`page` omitted) and we've computed a
+    # context-mode jump page, navigate there. A page the caller asked for is
+    # respected, 0 included: page 0 used to double as "no page asked for", so
+    # going back to the first page during a context search was a silent no-op.
+    effective_page = match_page if (mode == "context" and page is None and q) else pinned_page(page)
 
     rows = (
         db.execute(
@@ -196,7 +223,7 @@ def list_stations(
         .scalars()
         .all()
     )
-    drift_uics = {d.uic for d in db.execute(select(MasterStationPendingDrift)).scalars().all()}
+    drift_uics = drift_uics_of(db)
 
     # In context mode, flag rows that match the query so the UI can render
     # a highlight class. In filter mode, every row is by definition a match,

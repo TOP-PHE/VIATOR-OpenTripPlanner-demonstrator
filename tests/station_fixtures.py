@@ -94,18 +94,24 @@ def assert_scripts_parse(html: str, tmp_path: Path) -> int:
     return len(scripts)
 
 
-def run_in_node(script: str, expression: str) -> Any:
-    """Evaluate `expression` after running a classic inline script, in Node.
-
-    Enough for helpers that do not touch the DOM until they are called.
-    """
+def run_node_program(program: str) -> Any:
+    """Run a Node program that writes one JSON document to its standard output."""
     node = node_or_skip()
-    program = script + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
     result = subprocess.run(
         [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def run_in_node(script: str, expression: str) -> Any:
+    """Evaluate `expression` after running a classic inline script, in Node.
+
+    Enough for helpers that do not touch the DOM until they are called.
+    """
+    return run_node_program(
+        script + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
+    )
 
 
 def csv_bytes(header: Sequence[str], *rows: dict[str, str]) -> bytes:

@@ -380,10 +380,41 @@ Three defects fixed in passing, each stated where it really is:
 - **`« First` is a silent no-op during a context search, and so is typing `1` in the page-jump
   box.** The cause is server-side: `page == 0` doubles as the sentinel for "caller pinned no page",
   so `stations.py:188` overrides it with the match page. Fix it at the API with
-  `page: int | None = None` — **not** in the template. The `filter` default stays untouched: the
-  typeahead depends on it.
-- **`.hint` and `.flag` are used by the panel but defined only in `journey.html`'s own style
-  block**, so the DRIFT badge renders unstyled. Promote them into `_base.html`.
+  `page: int | None = None`. The `filter` default stays untouched: the typeahead depends on it.
+  **The template has to follow**, which version 2 ruled out: the panel sent `page=0` on every
+  fresh search, and once the API respects a page it is given, that would pin every search to the
+  first page and the jump to the first match would be gone. The panel now sends `page` only when
+  the operator asked for one by number (`« First`, `‹ Prev`, `Next ›`, `Last »`, the page-jump
+  box) and leaves it out otherwise.
+- **`.flag` is used by the panel but defined only in `journey.html`'s own style block**, so the
+  DRIFT badge renders unstyled. Promoted into `_base.html`.
+- **`.hint` is used by the panel and was defined nowhere.** Version 2 said `journey.html` defined
+  it; it only has `.hub-form-grid .hint`, and the other pages have scoped rules of their own
+  (`.detail-section .hint`, `.compare-toggle .hint`, `.cov-trip-section summary > .hint`). Every
+  one of them sets the same colour, so `_base.html` now carries `.hint { color: var(--rail-steel) }`
+  and nothing else.
+
+As built:
+
+- `app/api/master/stations.py`: `drift_uics_of()` selects `MasterStationPendingDrift.uic` alone.
+  `page` is `int | None`; `pinned_page()` reads it. Omitted, the list starts on the first page, or
+  in `context` mode with `q` on the page of the first match. Given, it is the page shown.
+  `X-Match-Page` is unchanged. `/drift`, the queue itself, still returns the full rows.
+- **`.flag` in `_base.html` is not a verbatim move.** `.flag`, `.flag.ALL` and `.flag.NAP-ONLY`
+  are the journey page's rules, the two colours written as the `--ok` and `--fail` variables that
+  hold the same values. `.flag.MERITS-ONLY` and `.flag.SUBSET` are not: the journey page's blue
+  (`#1C75BC` on `#e8f0fb`, 4.2:1) and amber (`#b3760e` on `#fff8e1`, 3.6:1) are below the 4.5:1
+  that WCAG AA asks of text this size, and the Sonar gate refuses new CSS that is. The base rules
+  take the pairs `_base.html` and the station panel already use on those two tints
+  (`--brand-blue-d`, and `#6f5100` as in `.msg.warning`). `journey.html` keeps its own two rules,
+  which it shares with `.leg-mode` and `.cmp-count`; they come later in the stylesheet and win, so
+  **the journey page renders exactly as before**. Two palettes for two variants is a debt, listed
+  in section 13.
+- **The base `.hint` reaches further than the panel.** A hint that had no rule now takes the muted
+  colour its class always asked for: on the journey page the paragraph at the top of the
+  "Promote to hub" form and the note beside "Cross-session journeys"; on the coverage page most of
+  its hints; on the sessions page those outside a detail section. Colour only — a font size would
+  have changed the hints that scoped rules already style.
 
 ### D. VIATOR station reference — `/admin/stations/reference`
 
@@ -778,6 +809,9 @@ corrected; this table is the record.
 | screen A lists "stops whose code contradicts the reference" | the links file records a verdict per stop (tier, asserted or not); no column says "contradiction", and nothing in step 1 compares a stop's code with the reference's codes | a matched link that is not asserted although it carries a code value. **To be confirmed by the owner** |
 | screen A filters by feed | an unmatched stop lists several feeds in one cell (`A\|B`) | the filter matches any feed of the cell; the counts count the stop once per feed |
 | screen A filters by country | the links file has no country column; only the unmatched stops carry one | the reference row's country for the contradictions, the stop's own for the unmatched |
+| screen C: fix `page` "at the API — **not** in the template" | the panel sends `page=0` on every fresh search; with the API fix alone, no search would ever jump to its first match again | the API fix, and the panel sends `page` only when the operator asked for a page by number |
+| screen C: `.hint` and `.flag` are "defined only in `journey.html`'s own style block" | true of `.flag`. `.hint` had no unscoped rule in any template or stylesheet | `.flag` moved; `.hint` defined in `_base.html`, colour only, which also mutes the hints that had no rule on the journey, coverage and sessions pages |
+| screen C: "promote" `.flag` | two of its four variants are below WCAG AA (4.2:1 and 3.6:1), and the Sonar gate refuses that on new CSS | the base carries AA pairs for those two; `journey.html` keeps its own two and renders as before. **Owner to decide** whether the journey page adopts the base pairs |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:
 `warnings`, `n_issues`, `n_warnings`, `review_links`, `nap_station_ids`, `best_match_method`,

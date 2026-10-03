@@ -163,6 +163,23 @@
     th { background: #eef2f8; font-weight: 600; color: var(--brand-blue); }
     tr.changed { background: #fffbe6; }
 
+    /* ───── badges and hints ─────
+       `.flag` is promoted from journey.html: the Trainline panel uses it for its
+       DRIFT badge and could not reach a rule kept in another page's style block.
+       The green and red variants are the journey page's own, written with this
+       file's variables. The blue and amber ones take the pairs this file and the
+       station panel already use on those tints, which meet WCAG AA at this size;
+       journey.html keeps its two, which it shares with .leg-mode and .cmp-count.
+       `.hint` never had a rule of its own, only scoped ones (.hub-form-grid .hint,
+       .detail-section .hint, …). They all set this colour, and they still win
+       where they apply. */
+    .flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
+    .flag.ALL         { background: #e9f6ec; color: var(--ok); }
+    .flag.NAP-ONLY    { background: #fdecef; color: var(--fail); }
+    .flag.MERITS-ONLY { background: #e8f0fb; color: var(--brand-blue-d); }
+    .flag.SUBSET      { background: #fff8e1; color: #6f5100; }
+    .hint { color: var(--rail-steel); }
+
     /* ───── footer ───── */
     footer { margin-top: 4rem; padding: 1.2rem; border-top: 1px solid var(--sleeper); color: var(--rail-steel); font-size: 0.75rem; line-height: 1.6; }
     footer .inner { max-width: 1100px; margin: 0 auto; }

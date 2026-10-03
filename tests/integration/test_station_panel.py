@@ -1526,3 +1526,108 @@ def test_the_links_are_open_to_both_working_roles(
     for headers in (admin, content_manager):
         for path in LINK_ROUTES:
             assert client.get(path, headers=headers).status_code == 200
+
+
+# ── screen C: the Trainline codes panel, three fixes (unit 9) ────────────
+
+MASTER = "/api/master/stations"
+# Synthetic stations, in the order the list sorts them: three pages of two, and one.
+MASTER_NAMES = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf"]
+
+
+@pytest.fixture
+def master_stations(client: TestClient) -> list[str]:
+    """Seven synthetic Trainline rows in country ZZ; Echo has a pending drift."""
+    from app.db import SessionLocal
+    from app.models import MasterStation, MasterStationPendingDrift
+
+    with SessionLocal() as db:
+        for index, name in enumerate(MASTER_NAMES, start=1):
+            db.add(
+                MasterStation(uic=f"99000{index:02d}", name=f"{name} Synthetic", country_iso="ZZ")
+            )
+        db.flush()
+        db.add(
+            MasterStationPendingDrift(
+                uic="9900005",
+                trainline_snapshot={"name": "Echo Renamed Synthetic"},
+                fields_differing=["name"],
+            )
+        )
+        db.commit()
+    return MASTER_NAMES
+
+
+def _names(response) -> list[str]:
+    assert response.status_code == 200, response.text
+    return [row["name"].split()[0] for row in response.json()]
+
+
+def test_a_context_search_lands_on_its_first_match_when_no_page_is_pinned(
+    client: TestClient, content_manager: dict[str, str], master_stations: list[str]
+) -> None:
+    search = {"q": "echo", "mode": "context", "size": 2}
+    r = client.get(MASTER, headers=content_manager, params=search)
+    assert _names(r) == ["Echo", "Foxtrot"]
+    assert r.headers["X-Match-Page"] == "2"
+    assert r.headers["X-Match-Count"] == "1"
+    assert r.headers["X-Total-Count"] == "7"  # context mode does not shrink the list
+    assert [row["is_match"] for row in r.json()] == [True, False]
+
+
+def test_page_zero_is_the_first_page_during_a_context_search(
+    client: TestClient, content_manager: dict[str, str], master_stations: list[str]
+) -> None:
+    search = {"q": "echo", "mode": "context", "size": 2}
+    # « First, and typing 1 in the page box: page 0 is a page, not "no page".
+    first = client.get(MASTER, headers=content_manager, params={**search, "page": 0})
+    assert _names(first) == ["Alpha", "Bravo"]
+    assert first.headers["X-Match-Page"] == "2"  # where the match is, all the same
+    last = client.get(MASTER, headers=content_manager, params={**search, "page": 3})
+    assert _names(last) == ["Golf"]
+    match = client.get(MASTER, headers=content_manager, params={**search, "page": 2})
+    assert _names(match) == ["Echo", "Foxtrot"]
+    assert client.get(MASTER, headers=content_manager, params={"page": -1}).status_code == 422
+
+
+def test_the_default_mode_still_filters(
+    client: TestClient, content_manager: dict[str, str], master_stations: list[str]
+) -> None:
+    # What the journey typeahead sends: `q` and `size`. It must keep hiding
+    # the rows that do not match.
+    r = client.get(MASTER, headers=content_manager, params={"q": "echo", "size": 20})
+    assert _names(r) == ["Echo"]
+    assert r.headers["X-Total-Count"] == "1"
+    assert r.json()[0]["is_match"] is True
+    by_code = client.get(MASTER, headers=content_manager, params={"q": "9900007", "size": 20})
+    assert _names(by_code) == ["Golf"]
+
+    everything = client.get(MASTER, headers=content_manager, params={"size": 3})
+    assert _names(everything) == ["Alpha", "Bravo", "Charlie"]
+    assert "X-Match-Page" not in everything.headers
+    second = client.get(MASTER, headers=content_manager, params={"size": 3, "page": 1})
+    assert _names(second) == ["Delta", "Echo", "Foxtrot"]
+
+
+def test_the_list_flags_the_stations_with_a_pending_drift(
+    client: TestClient, content_manager: dict[str, str], master_stations: list[str]
+) -> None:
+    rows = client.get(MASTER, headers=content_manager).json()
+    assert [row["name"].split()[0] for row in rows if row["has_drift"]] == ["Echo"]
+    assert len(rows) == 7
+    # The drift queue still returns the full rows.
+    (drift,) = client.get(f"{MASTER}/drift", headers=content_manager).json()
+    assert drift["trainline_snapshot"] == {"name": "Echo Renamed Synthetic"}
+
+
+def test_the_trainline_page_carries_the_promoted_styles(
+    client: TestClient, content_manager: dict[str, str]
+) -> None:
+    for page in ("/admin/stations/trainline", "/admin/master/stations"):
+        html = client.get(page, headers=content_manager).text
+        assert ".flag.SUBSET" in html
+        assert ".hint { color: var(--rail-steel); }" in html
+    journey = client.get("/journey", headers=content_manager)
+    assert journey.status_code == 200
+    assert ".flag { font-size: 0.7rem;" in journey.text  # from the base template now
+    assert ".flag.SUBSET     { background: #fff8e1; color: #b3760e; }" in journey.text
