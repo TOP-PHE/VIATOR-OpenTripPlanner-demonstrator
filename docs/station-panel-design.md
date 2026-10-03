@@ -564,10 +564,18 @@ Streams to `inbox/_stations/<key>/` while computing sha256, writes `station_sour
 **bypasses `detect.detect` and `ingestion.dispatch` entirely**. Both existing upload routes refuse a
 station file: they require a `declared_standard` in `detect.KNOWN_KINDS`, and `_detect_csv` accepts
 a CSV only if its header looks like SNCF stations or MCT. While there, wrap the bare `detect` call
-at `app/api/admin/sessions.py:664` so it returns 400 rather than 500.
+in `upload_to_session` (`app/api/admin/sessions.py`) so it returns 400 rather than 500.
+
+As built: the file lands in `<key>/_incoming/` while it streams, and moves to
+`<key>/<sha256 prefix>-<name>` once kept. Where the source's `format` is one of the five offline
+shapes, the header is checked before anything is recorded; a mismatch is a 400 that names the
+missing and unexpected columns, and nothing is stored. An identical re-upload answers 200 with
+`created: false`. An optional `as_of` form field states the date the file describes; without it
+the date is read off the file name (`…_2026-09.csv`, `…_2026-09-14.csv`) when it carries one.
 
 **The storage reservation** — add `_stations` and `_staging` to the reserved top-level names in
-`app/storage.py`'s inbox scan.
+`app/storage.py`'s inbox scan (`INBOX_ROOT_RESERVED`). Their size is still reported; they are never
+a clean-up candidate, and `delete` refuses them because it only accepts ids from a fresh scan.
 
 **The importer** — reads five offline files, each uploaded as a source version, and writes build #1:
 
@@ -652,3 +660,11 @@ corrected; this table is the record.
 | source keys such as `NAP_CH_SBB` | the shapes document says `source_key` is the column name | `nap_CH_SBB`, verbatim |
 | only `station_code_series` is seeded | the upload route needs a source to exist, and its `format` is what says which file shape it accepts | the first migration also seeds 22 `station_source` rows; kind `offline_build` added |
 | Sonar counts new migrations in new-code coverage | `sonar.sources=app`; `alembic/` is outside it | corrected in §9 |
+
+### Storage and upload
+
+| Version 2 said | What is true | As built |
+|---|---|---|
+| wrap the `detect` call "so it returns 400 rather than 500" | `detect` raises `ValueError` for what it cannot classify, but a corrupt `.zip` raises `zipfile.BadZipFile`, which is not a `ValueError` | both are caught, and the staged copy is removed |
+| the upload route "writes `station_source_version`" | nothing said the file is looked at before the build refuses it | the header is checked at upload against the shape the source's `format` declares |
+| `_stations` and `_staging` are the folders in the trap | `inbox/_phase1/`, the legacy session-less inbox, is offered for deletion the same way | left as it is — not asked for, and it holds no station data; noted for a decision |

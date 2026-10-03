@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import uuid
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
@@ -661,8 +662,14 @@ async def upload_to_session(
             size += len(chunk)
 
     # Verify the format matches what the user said. dispatch() can move it
-    # only if detect agrees.
-    detected = detect.detect(staged_path)
+    # only if detect agrees. `detect` raises on a file it cannot classify (an
+    # unknown extension, a CSV that is neither SNCF stations nor MCT, a zip
+    # that is not one): that is the caller's mistake, so 400, not 500.
+    try:
+        detected = detect.detect(staged_path)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        staged_path.unlink(missing_ok=True)
+        raise HTTPException(400, f"Detection failed: {exc}") from exc
     if detected != declared_standard:
         staged_path.unlink(missing_ok=True)
         raise HTTPException(

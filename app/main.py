@@ -35,6 +35,7 @@ from .api.admin import nap_catalogues as admin_nap_catalogues
 from .api.admin import network_coverage as admin_network_coverage
 from .api.admin import replay as admin_replay
 from .api.admin import sessions as admin_sessions
+from .api.admin import station_sources as admin_station_sources
 from .api.admin import storage as admin_storage
 from .api.admin import users as admin_users
 from .api.auth import routes as auth_routes
@@ -145,6 +146,7 @@ app.include_router(admin_network_coverage.router)
 app.include_router(coverage_share_routes.router)
 app.include_router(admin_replay.router)
 app.include_router(admin_storage.router)
+app.include_router(admin_station_sources.router)
 app.include_router(master_stations.router)
 app.include_router(master_aliases.router)
 app.include_router(reports_routes.router)
