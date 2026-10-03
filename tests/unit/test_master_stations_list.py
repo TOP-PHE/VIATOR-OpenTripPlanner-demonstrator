@@ -149,8 +149,8 @@ def test_pinned_page(page: int | None, expected: int) -> None:
 
 def test_page_is_optional_in_the_signature_and_the_mode_default_is_untouched() -> None:
     parameters = inspect.signature(stations.list_stations).parameters
-    assert parameters["page"].annotation == "int | None"
-    assert parameters["page"].default.default is None
+    assert parameters["page"].annotation.startswith("Annotated[int | None, Query(")
+    assert parameters["page"].default is None
     assert parameters["mode"].default.default == "filter"
 
 
@@ -302,10 +302,24 @@ def test_the_moved_variants_render_as_they_did_on_the_journey_page() -> None:
     assert ".flag.NAP-ONLY    { background: #fdecef; color: var(--fail); }" in base
 
 
+def test_the_journey_page_opts_out_of_the_base_hint() -> None:
+    # Step 1 changes nothing on the journey page. Its hints that never had a
+    # rule keep the colour of their parent; the scoped ones are more specific
+    # than either rule and keep theirs.
+    journey = (TEMPLATES / "journey.html").read_text(encoding="utf-8")
+    assert re.findall(r"^\.hint \{[^}]*\}", journey, re.MULTILINE) == [".hint { color: inherit; }"]
+    assert ".hub-form-grid .hint { font-size: 0.72rem; color: var(--rail-steel);" in journey
+    # It sits in the page's style block, which the base template places after its own rules.
+    start = journey.index("{% block extra_styles %}")
+    styles = journey[start : journey.index("{% endblock %}", start)]
+    assert ".hint { color: inherit; }" in styles
+
+
 def test_no_other_template_defines_an_unscoped_hint_or_flag() -> None:
     for path in sorted(TEMPLATES.rglob("*.html")):
         if path.name == "_base.html":
             continue
         text = path.read_text(encoding="utf-8")
-        assert not re.search(r"^\s*\.hint\s*\{", text, re.MULTILINE), path.name
         assert not re.search(r"^\s*\.flag\s*\{", text, re.MULTILINE), path.name
+        if path.name != "journey.html":  # its opt-out is pinned by the test above
+            assert not re.search(r"^\s*\.hint\s*\{", text, re.MULTILINE), path.name

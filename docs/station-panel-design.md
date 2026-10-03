@@ -411,10 +411,14 @@ As built:
   **the journey page renders exactly as before**. Two palettes for two variants is a debt, listed
   in section 13.
 - **The base `.hint` reaches further than the panel.** A hint that had no rule now takes the muted
-  colour its class always asked for: on the journey page the paragraph at the top of the
-  "Promote to hub" form and the note beside "Cross-session journeys"; on the coverage page most of
-  its hints; on the sessions page those outside a detail section. Colour only — a font size would
-  have changed the hints that scoped rules already style.
+  colour its class always asked for: on the coverage page most of its hints, on the sessions page
+  those outside a detail section. Colour only — a font size would have changed the hints that
+  scoped rules already style.
+- **The journey page opts out.** Section 11 puts any change to the journey page outside step 1,
+  and two of its hints had no rule (the paragraph at the top of the "Promote to hub" form, the note
+  beside "Cross-session journeys"). `journey.html` therefore carries `.hint { color: inherit; }`:
+  those two keep the colour of their parent, and the scoped rules, more specific than either, keep
+  theirs. Deleting that one line lets the base rule apply there too.
 
 ### D. VIATOR station reference — `/admin/stations/reference`
 
@@ -810,7 +814,7 @@ corrected; this table is the record.
 | screen A filters by feed | an unmatched stop lists several feeds in one cell (`A\|B`) | the filter matches any feed of the cell; the counts count the stop once per feed |
 | screen A filters by country | the links file has no country column; only the unmatched stops carry one | the reference row's country for the contradictions, the stop's own for the unmatched |
 | screen C: fix `page` "at the API — **not** in the template" | the panel sends `page=0` on every fresh search; with the API fix alone, no search would ever jump to its first match again | the API fix, and the panel sends `page` only when the operator asked for a page by number |
-| screen C: `.hint` and `.flag` are "defined only in `journey.html`'s own style block" | true of `.flag`. `.hint` had no unscoped rule in any template or stylesheet | `.flag` moved; `.hint` defined in `_base.html`, colour only, which also mutes the hints that had no rule on the journey, coverage and sessions pages |
+| screen C: `.hint` and `.flag` are "defined only in `journey.html`'s own style block" | true of `.flag`. `.hint` had no unscoped rule in any template or stylesheet | `.flag` moved; `.hint` defined in `_base.html`, colour only, which also mutes the hints that had no rule on the coverage and sessions pages. `journey.html` opts out with `.hint { color: inherit; }` and renders as before. **Owner to decide** whether it should |
 | screen C: "promote" `.flag` | two of its four variants are below WCAG AA (4.2:1 and 3.6:1), and the Sonar gate refuses that on new CSS | the base carries AA pairs for those two; `journey.html` keeps its own two and renders as before. **Owner to decide** whether the journey page adopts the base pairs |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:

@@ -260,7 +260,7 @@ function renderPagination(totalPages) {
   ].join(' ');
   // Wire up nav buttons.
   p.querySelectorAll('button[data-page]').forEach(b => b.addEventListener('click', () => {
-    showPage(parseInt(b.dataset.page, 10));
+    showPage(Number.parseInt(b.dataset.page, 10));
   }));
   // Jump-to-page on Enter.
   const jump = p.querySelector('input.page-jump');

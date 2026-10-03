@@ -110,14 +110,16 @@ def list_stations(
     _: Annotated[CurrentUser, Depends(require_content_manager)],
     q: str | None = Query(None, description="Substring of name (case-insensitive)"),
     country: str | None = Query(None, max_length=2),
-    page: int | None = Query(
-        None,
-        ge=0,
-        description=(
-            "Omitted: the first page, or in `context` mode with `q` the page of "
-            "the first match. Given: that page, 0 included."
+    page: Annotated[
+        int | None,
+        Query(
+            ge=0,
+            description=(
+                "Omitted: the first page, or in `context` mode with `q` the page of "
+                "the first match. Given: that page, 0 included."
+            ),
         ),
-    ),
+    ] = None,
     size: int = Query(50, ge=1, le=500),
     mode: str = Query(
         "filter",

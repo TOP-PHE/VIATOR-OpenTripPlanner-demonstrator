@@ -28,6 +28,11 @@
    .cmp-count, which override the base ones. */
 .flag.MERITS-ONLY{ background: #e8f0fb; color: #1C75BC; }
 .flag.SUBSET     { background: #fff8e1; color: #b3760e; }
+/* _base.html now gives .hint a muted colour. This page's hints outside
+   .hub-form-grid and .compare-toggle never had a rule, and the station panel
+   changes nothing on this page: they keep the colour of their parent. Delete
+   this rule to let the base one apply here too. */
+.hint { color: inherit; }
 /* v0.1.45 — "possible duplicate" badge. MOTIS occasionally reports a
    single physically-coupled service (e.g. SNCF's "601" + "601A"
    portions, split for part of the journey but one driver/consist) as

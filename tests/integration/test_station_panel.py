@@ -1630,4 +1630,8 @@ def test_the_trainline_page_carries_the_promoted_styles(
     journey = client.get("/journey", headers=content_manager)
     assert journey.status_code == 200
     assert ".flag { font-size: 0.7rem;" in journey.text  # from the base template now
+    # The base hint rule first, then the page's own opt-out, which wins.
+    assert journey.text.index(".hint { color: var(--rail-steel); }") < journey.text.index(
+        ".hint { color: inherit; }"
+    )
     assert ".flag.SUBSET     { background: #fff8e1; color: #b3760e; }" in journey.text
