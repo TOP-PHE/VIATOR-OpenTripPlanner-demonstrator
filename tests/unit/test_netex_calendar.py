@@ -330,3 +330,18 @@ def test_generated_ids_are_named_after_the_day_type(tmp_path: Path) -> None:
     xml = out.decode()
     assert 'id="VIATOR:UicOperatingPeriod:SI:DT:weekdays"' in xml
     assert 'id="VIATOR:DayTypeAssignment:SI:DT:weekdays"' in xml
+
+
+def test_a_reference_to_a_period_defined_elsewhere_is_not_a_reason_to_rewrite(
+    tmp_path: Path,
+) -> None:
+    """DB, CFL, CIS-CZ and NMBS assign by OperatingPeriodRef to UicOperatingPeriods;
+    when the period sits in another frame or file the frame alone cannot see
+    it, and rewriting would empty those day types."""
+    split = """<ServiceCalendarFrame id="DE:SCF:2">
+      <dayTypeAssignments><DayTypeAssignment id="DE:DTA:1" order="1">
+        <OperatingPeriodRef ref="DE:UOP:in-another-file"/><DayTypeRef ref="DE:DT:1"/>
+        <isAvailable>true</isAvailable></DayTypeAssignment>
+      </dayTypeAssignments></ServiceCalendarFrame>"""
+    stats, _ = _convert(tmp_path, _doc(split))
+    assert stats is None

@@ -44,7 +44,7 @@ from defusedxml.ElementTree import ParseError
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 # Bumped whenever the output changes, so cached conversions are redone.
-CONVERTER_VERSION = 2
+CONVERTER_VERSION = 3
 
 _CHUNK = 8 * 1024 * 1024
 _FRAME_START_RE = re.compile(rb"<(?:([A-Za-z_][\w.-]*):)?ServiceCalendarFrame\b")
@@ -147,18 +147,18 @@ def _periods(frame: ET.Element, op_days: dict[str, date]) -> dict[str, list[date
 
 
 def _needs_conversion(frame: ET.Element) -> bool:
-    """True when an assignment points at something MOTIS cannot resolve: a dated
-    `OperatingDay`, or a plain `OperatingPeriod`. Frames whose assignments use
-    only `Date` (SBB's public-holiday day types; SBB journeys take their days
-    from `AvailabilityCondition`s instead) are left as published."""
-    uic = {el.get("id") for el in frame.iter() if _local(el) == "UicOperatingPeriod"}
+    """True only on positive evidence of the model MOTIS cannot read, in this
+    frame: an assignment by `OperatingDayRef`, or by `OperatingPeriodRef` to a
+    plain `OperatingPeriod` defined here. A reference to a period defined in
+    another frame or file (DB splits its data over ~28 000 files) is never a
+    reason to rewrite: the frame cannot resolve it either way. Measured
+    2026-10-03 on the eu19 inbox, only SI-NAP qualifies; SBB, DB, NMBS, ÖBB,
+    CFL, CIS-CZ, Trenitalia, Trenord and Italo are left as published."""
+    plain = {el.get("id") for el in frame.iter() if _local(el) == "OperatingPeriod"}
     for el in frame.iter():
         if _local(el) != "DayTypeAssignment":
             continue
-        if _ref(el, "OperatingDayRef"):
-            return True
-        period = _ref(el, "OperatingPeriodRef")
-        if period and period not in uic:
+        if _ref(el, "OperatingDayRef") or _ref(el, "OperatingPeriodRef") in plain:
             return True
     return False
 
