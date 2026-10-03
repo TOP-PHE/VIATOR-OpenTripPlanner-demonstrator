@@ -201,7 +201,9 @@ def test_station_template_javascript_follows_the_house_rules(name: str) -> None:
         assert "err" in body  # the caught error is reported, not swallowed
     # Data reaches a script as JSON, never as a Jinja expression inside JavaScript.
     for script in re.findall(
-        r"<script(?![^>]*application/json)[^>]*>(.*?)</script>", html, re.DOTALL
+        r"<script(?![^>]*application/json)[^>]*>(.*?)</script\s*>",
+        html,
+        re.DOTALL | re.IGNORECASE,
     ):
         assert "{{" not in script
         assert "{%" not in script

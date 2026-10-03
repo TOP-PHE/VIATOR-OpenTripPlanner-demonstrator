@@ -51,7 +51,9 @@ def page_request(path: str, role: str | None) -> Request:
     )
 
 
-_SCRIPT_RE = re.compile(r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>", re.DOTALL)
+_SCRIPT_RE = re.compile(
+    r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>", re.DOTALL | re.IGNORECASE
+)
 
 
 def inline_scripts(html: str) -> list[tuple[bool, str]]:
