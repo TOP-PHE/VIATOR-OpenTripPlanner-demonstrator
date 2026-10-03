@@ -2740,11 +2740,12 @@ def enqueue_rebuild(
             "Click 'Refresh all sources' (or upload one manually) before Rebuild graph.",
         )
 
-    # Reuse the same coalescing logic ingestion uses.
+    # Reuse the same coalescing logic ingestion uses: (status, session, kind).
     pending = (
         db.query(RebuildJob)
         .filter(RebuildJob.status == "pending")
         .filter(RebuildJob.session_id == sid)
+        .filter(RebuildJob.kind == ingestion.GRAPH_JOB_KIND)
         .first()
     )
     suffix = " (max-memory)" if max_memory else ""
@@ -2752,6 +2753,7 @@ def enqueue_rebuild(
         pending = RebuildJob(
             session_id=sid,
             status="pending",
+            kind=ingestion.GRAPH_JOB_KIND,
             max_memory=max_memory,
             log=f"queued at {datetime.now(UTC).isoformat()} — manual trigger{suffix}\n",
         )

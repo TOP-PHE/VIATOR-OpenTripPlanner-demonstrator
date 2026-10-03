@@ -51,8 +51,15 @@
   <h2>Build history</h2>
   <p class="sp-lead" style="font-size: 0.88rem">
     A build reads the five offline files and replaces the station reference. Each row lists the
-    file versions the build was made from and what it changed.
+    file versions the build was made from and what it changed. A build is queued when a new
+    version lands on a source that triggers a rebuild and all five inputs are present; the worker
+    starts a queued build once the rebuild debounce (<code>REBUILD_DEBOUNCE_SECONDS</code>) has
+    elapsed. A build that is refused or fails leaves the reference exactly as it was.
   </p>
+  <div class="sp-filters">
+    <button type="button" id="rebuild-now">Rebuild now</button>
+    <span id="readiness" class="sp-muted"></span>
+  </div>
   <div id="queued"></div>
   <div class="sp-scroll">
     <table>
@@ -219,6 +226,25 @@ function renderBuilds(data) {
   queued.innerHTML = data.queued.length
     ? '<div class="sp-banner note">' + data.queued.length + ' station build job(s) queued or running; the worker starts a queued job once its debounce has elapsed.</div>'
     : '';
+  renderReadiness(data.missing_inputs);
+}
+
+function renderReadiness(missing) {
+  const ready = missing.length === 0;
+  document.getElementById('rebuild-now').disabled = !ready;
+  document.getElementById('readiness').textContent = ready
+    ? 'All five inputs are present.'
+    : 'A build needs all five inputs. Missing: ' + missing.join('; ');
+}
+
+async function rebuildNow() {
+  try {
+    const decision = await SP.sendJson('POST', '/api/admin/stations/builds');
+    SP.toast('success', decision.note);
+    await loadBuilds();
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
 }
 
 async function loadSources() {
@@ -303,7 +329,7 @@ function openUploadDialog(s) {
 
 function describeUpload(result) {
   if (!result.created) return 'This exact file was already uploaded: nothing changed';
-  return 'Uploaded ' + result.version.filename + ' (' + SP.fmtBytes(result.version.bytes) + ')';
+  return 'Uploaded ' + result.version.filename + ' (' + SP.fmtBytes(result.version.bytes) + '); ' + result.build.note;
 }
 
 async function submitUpload(event) {
@@ -345,6 +371,7 @@ document.getElementById('sources-body').addEventListener('click', (event) => {
   if (source) ACTIONS[button.dataset.act](source);
 });
 document.getElementById('add-source').addEventListener('click', () => openSourceDialog(null));
+document.getElementById('rebuild-now').addEventListener('click', rebuildNow);
 document.getElementById('show-columns').addEventListener('change', renderSources);
 sourceForm.addEventListener('submit', saveSource);
 uploadForm.addEventListener('submit', submitUpload);

@@ -193,7 +193,13 @@ class _FakeDb:
 
 
 def _source(**kw: Any) -> SimpleNamespace:
-    base = {"id": uuid.uuid4(), "key": "ERA_TELREF", "format": sf.ERA_TELREF, "enabled": True}
+    base = {
+        "id": uuid.uuid4(),
+        "key": "ERA_TELREF",
+        "format": sf.ERA_TELREF,
+        "enabled": True,
+        "triggers_rebuild": False,
+    }
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -388,6 +394,103 @@ async def test_an_upload_over_the_limit_is_413(
         await harness.upload(TELREF)
     assert exc.value.status_code == 413
     assert _stored_files(inbox) == []
+
+
+# ── what an upload triggers ────────────────────────────────────────────
+
+
+def _builds(
+    monkeypatch: pytest.MonkeyPatch, problems: list[str], *, created: bool = True
+) -> list[str]:
+    """Stand in for the importer's two entry points; returns the enqueue reasons."""
+    reasons: list[str] = []
+
+    def enqueue(_db: Any, reason: str) -> bool:
+        reasons.append(reason)
+        return created
+
+    monkeypatch.setattr(api.station_import, "find_inputs", lambda _db: ({}, problems))
+    monkeypatch.setattr(api.station_import, "enqueue_build", enqueue)
+    return reasons
+
+
+async def test_a_source_that_does_not_trigger_a_rebuild_queues_nothing(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reasons = _builds(monkeypatch, [])
+    out, _, _ = await _Harness(monkeypatch, _source(triggers_rebuild=False)).upload(TELREF)
+    assert out.build.queued is False
+    assert out.build.note == "this source does not trigger a rebuild"
+    assert reasons == []
+
+
+async def test_a_new_version_queues_a_build_once_all_five_inputs_are_there(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reasons = _builds(monkeypatch, [])
+    out, _, _ = await _Harness(monkeypatch, _source(triggers_rebuild=True)).upload(TELREF)
+    assert out.build.queued is True
+    assert out.build.note == "a station build is queued"
+    assert reasons == ["a new version of ERA_TELREF"]
+
+
+async def test_an_upload_says_what_is_still_missing_instead_of_queueing_a_doomed_build(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reasons = _builds(
+        monkeypatch, ["CRD: no file uploaded yet", "OFFLINE_LINKS: no file uploaded yet"]
+    )
+    out, _, _ = await _Harness(monkeypatch, _source(triggers_rebuild=True)).upload(TELREF)
+    assert out.created is True  # the file is kept all the same
+    assert out.build.queued is False
+    assert out.build.note == (
+        "no build queued yet: CRD: no file uploaded yet; OFFLINE_LINKS: no file uploaded yet"
+    )
+    assert reasons == []
+
+
+async def test_uploads_in_a_row_coalesce_into_one_build(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _builds(monkeypatch, [], created=False)
+    out, _, _ = await _Harness(monkeypatch, _source(triggers_rebuild=True)).upload(TELREF)
+    assert out.build.queued is True
+    assert out.build.note == "a station build was already queued"
+
+
+async def test_an_identical_re_upload_does_not_queue_a_build(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reasons = _builds(monkeypatch, [])
+    harness = _Harness(monkeypatch, _source(triggers_rebuild=True))
+    await harness.upload(TELREF)
+    again, _, _ = await harness.upload(TELREF)
+    assert again.build.queued is False
+    assert "nothing changed" in again.build.note
+    assert reasons == ["a new version of ERA_TELREF"]  # the first upload only
+
+
+def test_rebuild_now_queues_a_build_or_says_what_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[dict[str, Any]] = []
+    monkeypatch.setattr(api.audit, "record", lambda _db, **kw: recorded.append(kw))
+
+    _builds(monkeypatch, ["CRD: no file uploaded yet"])
+    with pytest.raises(HTTPException) as exc:
+        api.queue_build(REQUEST, _FakeDb(), ACTOR)  # type: ignore[arg-type]
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "A build needs all five inputs: CRD: no file uploaded yet"
+    assert recorded == []
+
+    reasons = _builds(monkeypatch, [])
+    db = _FakeDb()
+    out = api.queue_build(REQUEST, db, ACTOR)  # type: ignore[arg-type]
+    assert (out.queued, out.note) == (True, "a station build is queued")
+    assert reasons == ["requested by ops@example.org"]
+    assert recorded[0]["action"] == "station_build.requested"
+    assert recorded[0]["metadata"] == {"coalesced": False}
+    assert db.committed
 
 
 def test_the_route_bypasses_detect_and_dispatch() -> None:

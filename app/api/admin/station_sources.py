@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from ... import audit, feed_resolvers
 from ...db import get_db
-from ...master import station_files, station_store
+from ...master import station_files, station_import, station_store
 from ...models import (
     RebuildJob,
     StationBuild,
@@ -65,8 +65,10 @@ SOURCE_FORMATS: frozenset[str] = frozenset(
 
 # An access grant ending within this many days is shown in amber; past, in red.
 ACCESS_WARN_DAYS = 90
-STATION_BUILD_KIND = "station_build"
+STATION_BUILD_KIND = station_import.STATION_BUILD_KIND
 _NOT_FOUND = "Station source not found"
+_QUEUED = "a station build is queued"
+_ALREADY_QUEUED = "a station build was already queued"
 # Columns that are NOT NULL: a PATCH may change them, never blank them.
 _NOT_NULLABLE = (
     "label",
@@ -95,10 +97,21 @@ class VersionResponse(BaseModel):
     stats: dict[str, Any] | None
 
 
+class BuildDecision(BaseModel):
+    """Whether a station build was queued, and if not, why not."""
+
+    queued: bool
+    note: str
+
+
+_UNCHANGED = BuildDecision(queued=False, note="the same file was already there: nothing changed")
+
+
 class UploadResult(BaseModel):
     # False when the same file was already there: nothing was written.
     created: bool
     version: VersionResponse
+    build: BuildDecision
 
 
 class SourceResponse(BaseModel):
@@ -194,6 +207,8 @@ class BuildsResponse(BaseModel):
     builds: list[BuildResponse]
     # Station build jobs the worker has not finished yet.
     queued: list[QueuedJob]
+    # What a build started now would be refused for. Empty: all five inputs are there.
+    missing_inputs: list[str]
 
 
 # ────────────────────────────── pure helpers ──────────────────────────────
@@ -667,7 +682,9 @@ async def upload_version(
     if existing is not None:
         station_store.discard(received)
         response.status_code = 200
-        return UploadResult(created=False, version=version_response(existing, source.key))
+        return UploadResult(
+            created=False, version=version_response(existing, source.key), build=_UNCHANGED
+        )
 
     stats = _check_shape(source, received)
     stored = station_store.keep(received, source.key, filename)
@@ -693,7 +710,9 @@ async def upload_version(
         if winner is None:  # pragma: no cover  defensive
             raise
         response.status_code = 200
-        return UploadResult(created=False, version=version_response(winner, source.key))
+        return UploadResult(
+            created=False, version=version_response(winner, source.key), build=_UNCHANGED
+        )
 
     audit.record(
         db,
@@ -711,10 +730,59 @@ async def upload_version(
     )
     db.commit()
     db.refresh(version)
-    return UploadResult(created=True, version=version_response(version, source.key))
+    result = version_response(version, source.key)
+    return UploadResult(created=True, version=result, build=_queue_build_for(db, source))
 
 
 # ──────────────────────────────── builds ────────────────────────────────
+
+
+def _queue_build_for(db: DbSession, source: StationSource) -> BuildDecision:
+    """A new version of a source that triggers a rebuild queues one — once all
+    five inputs are there. Until then the upload says what is still missing,
+    rather than queueing a build that could only be refused."""
+    if not source.triggers_rebuild:
+        return BuildDecision(queued=False, note="this source does not trigger a rebuild")
+    _, problems = station_import.find_inputs(db)
+    if problems:
+        return BuildDecision(queued=False, note="no build queued yet: " + "; ".join(problems))
+    created = station_import.enqueue_build(db, f"a new version of {source.key}")
+    return BuildDecision(queued=True, note=_QUEUED if created else _ALREADY_QUEUED)
+
+
+@router.post(
+    "/builds",
+    response_model=BuildDecision,
+    status_code=202,
+    responses={
+        409: {"description": "A build needs all five inputs; the detail lists what is missing"}
+    },
+)
+def queue_build(
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> BuildDecision:
+    """Queue a station build from the files already uploaded.
+
+    Needed because re-uploading an identical file is a no-op: without this, a
+    build that failed for a reason outside the files could not be run again.
+    The worker starts it once the rebuild debounce has elapsed.
+    """
+    _, problems = station_import.find_inputs(db)
+    if problems:
+        raise HTTPException(409, "A build needs all five inputs: " + "; ".join(problems))
+    created = station_import.enqueue_build(db, f"requested by {actor.username}")
+    audit.record(
+        db,
+        action="station_build.requested",
+        actor_user_id=actor.id,
+        actor_ip=client_ip(request),
+        target_kind="station_build",
+        metadata={"coalesced": not created},
+    )
+    db.commit()
+    return BuildDecision(queued=True, note=_QUEUED if created else _ALREADY_QUEUED)
 
 
 @router.get("/builds", response_model=BuildsResponse)
@@ -724,7 +792,9 @@ def list_builds(
     limit: int = 20,
 ) -> BuildsResponse:
     """Build history, newest first, with each build's inputs and diff summary,
-    and the station build jobs the worker has not finished yet."""
+    the station build jobs the worker has not finished yet, and what a build
+    started now would still be missing."""
+    problems = station_import.find_inputs(db)[1]
     builds = (
         db.execute(
             select(StationBuild).order_by(StationBuild.id.desc()).limit(max(1, min(limit, 200)))
@@ -746,6 +816,7 @@ def list_builds(
     )
     return BuildsResponse(
         builds=[build_response(b) for b in builds],
+        missing_inputs=problems,
         queued=[
             QueuedJob(
                 id=str(j.id),

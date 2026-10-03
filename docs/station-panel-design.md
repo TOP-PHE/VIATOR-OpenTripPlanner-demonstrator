@@ -398,8 +398,27 @@ builder; `RebuildJob` has no kind column; `_enqueue_rebuild` coalesces on `(stat
 so a station job with a null session would collide with the `_phase1` graph job. The change is one
 migration and three edits: add `kind` to `rebuild_jobs` (`'graph'` by default, or
 `'station_build'`), branch on it in `tick()` **before** the engine lookup, and coalesce on
-`(status, session_id, kind)`. A station build must also not provoke the worker's per-tick side
-effects (compose up, nginx reload, orphan-container removal).
+`(status, session_id, kind)`.
+
+What the branch keeps a station build away from is what a graph job itself does: the cancel
+watcher, which would `docker kill` a build container that never existed; the session state
+advance; the graph snapshot; the max-memory stop of the serving stack. Compose up, nginx reload
+and orphan-container removal are a different thing: they live in `handle_reload_trigger()`, run
+after every tick whatever the job was, and act only when the `.reload-trigger` file exists, so no
+job provokes them and there was nothing to suppress there.
+
+**The three stages of a build**, as built (`app/master/station_import.py`):
+
+1. *Parse*, with no database. All five files are read and checked first; a refusal here leaves
+   every table untouched.
+2. *Extract*. The CRD locations and the ERA operational points go into the register tables, once
+   per source version, and are committed — so the delta between two versions is available
+   whether or not the build that follows succeeds.
+3. *Build*, in one transaction. `station_ref` is upserted on `(plc, era_uopid)`, hand corrections
+   are re-applied, and the derived children are replaced.
+
+A row present in an earlier build and absent from the current master is **kept**, untouched, and
+is recognisable by its `last_built_build_id`: deleting it would delete its hand corrections.
 
 **Where the files live.** There are exactly two data volumes, `inbox` and `graphs`, and
 `app/storage.py:297-303` offers any top-level inbox folder that is not a session id to the operator
@@ -407,11 +426,19 @@ for deletion on the Storage page. So the station store, `inbox/_stations/`, must
 reserved set in `app/storage.py` — and `_staging`, which already falls into that trap, with it.
 
 **What triggers a rebuild.** A new source version on a source with `triggers_rebuild`, or the
-button. Never a schedule alone: a rebuild is an event.
+button. Never a schedule alone: a rebuild is an event. As built: the upload queues a build only
+once all five inputs are present, and otherwise says what is still missing — with four files of
+five, a build could only be refused. The button (`POST /api/admin/stations/builds`) is in step 1,
+not step 4: re-uploading an identical file is a no-op, so without it a build that failed for a
+reason outside the files could never be run again. A queued build waits out the worker's rebuild
+debounce like any other job; uploads in a row coalesce into one build.
 
-**What the build asserts before it replaces anything**: every flag token classified; every
-CRD-derived row carrying its licence tag; every active override re-applied. A build that fails is
-recorded and discarded.
+**What the build asserts before it replaces anything**: every CRD-derived row carrying its
+licence tag (rows whose `spine_source` is `CRD_and_ERA` or `CRD_only`); every active override
+re-applied. A build that fails is recorded and discarded. "Every flag token classified" is **not**
+asserted in step 1: no classification of tokens exists in the repository or in the files, and the
+shapes document says an unknown token must be stored, not refused. `station_ref_flag.level` and
+`warning_code` are NULL until one exists; the build counts the distinct tokens.
 
 ---
 
@@ -668,3 +695,31 @@ corrected; this table is the record.
 | wrap the `detect` call "so it returns 400 rather than 500" | `detect` raises `ValueError` for what it cannot classify, but a corrupt `.zip` raises `zipfile.BadZipFile`, which is not a `ValueError` | both are caught, and the staged copy is removed |
 | the upload route "writes `station_source_version`" | nothing said the file is looked at before the build refuses it | the header is checked at upload against the shape the source's `format` declares |
 | `_stations` and `_staging` are the folders in the trap | `inbox/_phase1/`, the legacy session-less inbox, is offered for deletion the same way | left as it is — not asked for, and it holds no station data; noted for a decision |
+
+### Worker and importer
+
+| Version 2 said | What is true | As built |
+|---|---|---|
+| a station build "must not provoke the worker's per-tick side effects (compose up, nginx reload, orphan-container removal)" | those live in `handle_reload_trigger()`, run after every tick whatever the job was, and act only when `.reload-trigger` exists: no job provokes them | the `kind` branch skips what a graph job itself does — the cancel watcher, the session state advance, the graph snapshot, the max-memory stop |
+| a new version on a source with `triggers_rebuild` triggers a rebuild | with four files of five uploaded, that build can only be refused | a build is queued once all five inputs are present; the upload says what is missing otherwise |
+| "rebuild now" arrives in step 4 | an identical re-upload is a no-op, so a build that failed for a reason outside the files could not be re-run | `POST /api/admin/stations/builds` and its button are in step 1 |
+| the delta is computed "on upload … before anything is rebuilt" | the register rows are written by the importer in the worker, not by the upload request | the extract stage commits the registers before the build stage; the delta is computed on demand between two loaded versions. There is no human gate between the two stages |
+| the build asserts "every flag token classified" | no classification exists, and the shapes document forbids refusing an unknown token | not asserted; `level` and `warning_code` stay NULL, the build counts distinct tokens |
+| `crd_locations_*.csv` → `crd_location` | the file's grain is (PLC, operational point): a CRD location repeats on every operational point of its PLC, which the table's own unique key forbids | one `crd_location` per (country, code, start of validity); ERA-only rows yield none |
+| the master's 16 provider columns → `station_ref_code` | the columns carry no series | `series` from the links file where it names the same station and the same code value, exactly one series; NULL otherwise. A series the links introduce is added to `station_code_series` |
+| a station absent from a newer master | not addressed | kept, untouched, recognisable by `last_built_build_id` |
+| `previous_plc` → one `station_ref_alias` row | two operational points of one PLC carry the same `previous_plc`, and `UNIQUE (alias_plc, build_id)` allows one | one alias per old PLC, the first station in key order; collisions are counted |
+| a flag payload that is a PLC sets `related_station_id` | a PLC can carry several operational points | the one whose operational-point id is the PLC itself, else the first in byte order |
+
+**Not imported from the master in step 1**, because the shapes document maps them nowhere:
+`warnings`, `n_issues`, `n_warnings`, `review_links`, `nap_station_ids`, `best_match_method`,
+`uic_merits_n_sources`, `uic_merits_collision`, `era_name_2022`, `era_crd_dist_m`, `crd_key_check`
+and the five `crd_*` code columns (those reach `crd_subsidiary` through the CRD locations file).
+From the links file: `railway_label`, `rail_served`, `modes`, `station_distance_m`,
+`station_name_sim`, `spine_source`, `link_pos_src`, `station_distance_spine_m`. From the unmatched
+stops: `rail_served`, `rail_repl`, `modes`, the three code columns, `review_links` and the
+`nearest_*` columns other than the PLC and its distance.
+
+**A MERITS correction** changes which candidate is chosen, never the candidates: the build's own
+candidates all stay, a `Manual` one is added when the corrected code is none of them, and
+`station_ref`'s four MERITS columns mirror whichever is chosen.
