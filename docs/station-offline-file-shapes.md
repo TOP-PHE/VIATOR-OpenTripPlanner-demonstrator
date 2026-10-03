@@ -14,11 +14,16 @@ as text — several look numeric and are not (a leading zero is significant in a
 
 | Separator | Meaning | Where |
 |---|---|---|
-| `\|` | several values of the same series | every `nap_*` column, `eva_all`, `nap_station_ids`, `review_links`, `uic_merits_conflict_values` |
-| `;` | several tokens | `flags`, `warnings`, `op_type_all`, `iso2_all` |
-| `+` | several source labels | `uic_merits_sources`, `eva_src` |
+| `\|` | several values of the same series | every `nap_*` column, `eva_all`, `nap_station_ids`, `review_links`, `uic_merits_conflict_values`; and inside a `flags` payload that lists several PLCs |
+| `;` | several tokens, several names | `flags`, `warnings`, `op_type_all`, `iso2_all`, `era_alt_name` (`alt_name` in file 4) |
+| `+` | several source labels | `uic_merits_sources`, `eva_src`, the labels of a `uic_merits_conflict_values` item |
+| `=` | code, then the source labels that state it | every item of `uic_merits_conflict_values`, e.g. `9900022=ZZ_Rail` |
 | `#` | feed label, then the feed-local stop key | inside `nap_*_regional` values, e.g. `ES_FGC#MC` |
 | `:` | token, then payload | inside `flags`, e.g. `candidate_displaced_to:ZZ00002` |
+
+**A `|` inside an alternative name is not a separator.** In `era_alt_name` it only ever occurs as
+` | ` inside one bilingual name (`Exampleville-Midi | Voorbeeldstad-Zuid`): the two languages of
+one name, not two names.
 
 An empty cell means "no value", never zero. Anything the importer does not recognise is kept as
 opaque text, not rejected — the offline vocabulary grows between issues.
@@ -60,15 +65,25 @@ exist (`plc_kind`): `era_internal_eu` (89 rows, prefix `EU`, border points), `ui
 
 **Mapping**
 
-- `era_name` → `station_ref.name`; `era_alt_name` → `alt_name` (split on `|`).
+- `era_name` → `station_ref.name`; `era_alt_name` → `alt_name`, split on `;`. Of its 5,773
+  non-empty cells, 19 hold two names joined by `;` (no space after it) and 99 hold one bilingual
+  name containing ` | `, which is kept whole; no cell has both. (This document used to say "split
+  on `|`": that cut the 99 bilingual names in two and left the 19 pairs unsplit.)
+  `alt_name_text` is the names joined with `; `.
 - `lat`, `lon` are empty where `pos_src` is `none` (9,014 rows) — nullable.
 - `iso2_all`, `op_type_all` → arrays, split on `;`.
 - `eva_all` → array, split on `|`.
 - `previous_plc` → `station_ref.previous_plc` and one `station_ref_alias` row.
 - The MERITS group → one `station_ref_merits` row per distinct code: `uic_merits` is the chosen
   one; `uic_merits_candidate` is the calculated one and may differ (it does on the 18 rows whose
-  origin is `Trainline (calculated differs)`); each value in `uic_merits_conflict_values` is a
+  origin is `Trainline (calculated differs)`); each item of `uic_merits_conflict_values` is a
   further non-chosen row.
+  An item is **never a bare code**: it is `<code>=<labels>`, the labels being the sources that
+  state the code, joined by `+` when there are several (`9900022=ZZ_Rail`,
+  `9900002=Trainline_via_EVA`). Split it on the first `=`: the left part is the candidate's
+  `code`, the right part its `sources`. Items are joined by `|`, but all 35 non-empty cells of the
+  2026-09 file hold exactly one. On 14 of them the code is the row's own `uic_merits` again: that
+  is not a second candidate, and the label goes to the candidate the row already has.
 - Each of the 16 `nap_*` provider columns → `station_ref_code` rows, one per `|`-separated value.
   `source_key` is the column name. `nap_station_ids` is **not** a provider column — it lists the
   offline station ids the row is linked to. (This document used to say 15; the header above lists
@@ -77,6 +92,11 @@ exist (`plc_kind`): `era_internal_eu` (89 rows, prefix `EU`, border points), `ui
   and is NULL otherwise.
 - `flags` → one `station_ref_flag` row per `;`-separated token; split each on the first `:` into
   token and payload. When the payload is a PLC present in this file, set `related_station_id`.
+  A payload can list **several PLCs joined by `|`** (`candidate_displaced_to:ZZ00002|ZZ00003`):
+  51 of the 694 `candidate_displaced_to` flags name 2 to 5 PLCs. When every part is a PLC present
+  in this file, write one row per PLC, each with its own payload and `related_station_id`, so that
+  every station the flag names is linked. Any other payload containing a `|` is kept whole
+  (`same_source_multiple_values`, whose payload is not a list of PLCs).
 - `n_nap_feeds`, `best_tier`, `warning_level` → the columns of the same name.
 
 **Example** (invented):
@@ -141,6 +161,20 @@ The first 36 columns are identical to file 5, by design. `plc_op_max_sep_m`, `is
 `crd_start` / `crd_end` are needed by `station_ref` and are **not** in file 1 — read them from
 here, joined on `(plc, uopid)`. (`n_op_with_plc` is in both headers; the importer reads it from
 file 1 and falls back to this file.)
+
+**`name`, `lat` and `lon` are not always CRD's.** They are the spine's values, already joined:
+`name_src` (`CRD` · `ERA`) and `pos_src` (`CRD` · `ERA` · `none`) say which register each came
+from. `crd_location` is the CRD register, so it takes `name` only where `name_src` is `CRD`, and
+`lat` / `lon` only where `pos_src` is `CRD`; otherwise the column is NULL — the file carries no
+CRD value to put there. Of the 61,548 rows that carry a CRD country or code, 404 have `name_src`
+and `pos_src` = `ERA`, all with `spine_source` = `ERA_retired_in_CRD` (retired in CRD, still in
+ERA); they are 394 of the 61,218 `crd_location` rows once de-duplicated on CRD's key. Several
+operational points of one retired location can carry different ERA names and positions, so
+copying them would also make the kept row depend on file order.
+
+`alt_name` is the same cell as file 1's `era_alt_name`, on every row, with the same convention:
+`;` joins several names and a ` | ` is inside one bilingual name. It is not imported from this
+file, nor from file 5.
 
 The subsidiary codes are flattened into `crd_rl100`, `crd_sncf_codes`, `crd_sncf_site_codes`,
 `crd_ns_abbrev`, `crd_sncb_telegraph`, `crd_sbb_enee`, `crd_dium_codes`. In step 1 the importer

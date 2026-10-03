@@ -112,6 +112,25 @@ def test_a_flag_payload_resolves_to_one_station_deterministically() -> None:
     assert si.related_station("with:colons", by_plc) is None
 
 
+def test_a_flag_payload_listing_plcs_becomes_one_target_per_plc() -> None:
+    by_plc = {
+        "ZZ00001": [("ZZ00001", 11)],
+        "ZZ00002": [("ZZ00002", 21)],
+        "ZZ00003": [("ZZOP03B", 32), ("ZZOP03A", 31)],
+    }
+    # Every part is a PLC of the file: each station it names is linked.
+    assert si.flag_targets("ZZ00002|ZZ00003", by_plc) == [("ZZ00002", 21), ("ZZ00003", 31)]
+    assert si.flag_targets("ZZ00003|ZZ00001|ZZ00003", by_plc) == [("ZZ00003", 31), ("ZZ00001", 11)]
+    # One PLC, as before.
+    assert si.flag_targets("ZZ00002", by_plc) == [("ZZ00002", 21)]
+    # Anything else is kept whole: a part that is not a PLC of the file, a
+    # payload whose pipe separates something other than PLCs, no payload.
+    assert si.flag_targets("ZZ00002|ZZ00099", by_plc) == [("ZZ00002|ZZ00099", None)]
+    assert si.flag_targets("ZZ_RAIL=9900001|9900002", by_plc) == [("ZZ_RAIL=9900001|9900002", None)]
+    assert si.flag_targets("with:colons", by_plc) == [("with:colons", None)]
+    assert si.flag_targets("", by_plc) == [("", None)]
+
+
 # ── computed fields ────────────────────────────────────────────────────
 
 
@@ -350,6 +369,28 @@ def test_a_merits_correction_changes_the_chosen_candidate_not_the_candidates() -
     assert correction.computed_value_latest == "9900002"
 
 
+def test_a_merits_correction_to_a_conflict_value_picks_that_candidate() -> None:
+    existing = as_existing(si.plan_reference(parsed(), {}, {}, BUILD, TODAY))
+    key = ("ZZ00002", "ZZ00002")
+    station_id = existing[key]["id"]
+    # 9900022 is in the file as `9900022=ZZ_Rail`: the operator settles the
+    # conflict in its favour.
+    correction = override(station_id, "uic_merits", "9900022", "9900002")
+    plan = si.plan_reference(parsed(), existing, {station_id: [correction]}, BUILD + 1, TODAY)
+
+    # The candidate is found by its code: no Manual twin is added beside it.
+    assert [(c["code"], c["is_chosen"]) for c in plan.merits[key]] == [
+        ("9900002", False),
+        ("9900012", False),
+        ("9900022", True),
+        ("9900032", False),
+    ]
+    picked = plan.merits[key][2]
+    assert (picked["origin"], picked["sources"]) == (sp.ORIGIN_CONFLICT, ["ZZ_Rail"])
+    (update,) = plan.updates
+    assert (update["uic_merits"], update["uic_merits_origin"]) == ("9900022", sp.ORIGIN_CONFLICT)
+
+
 def test_merits_candidates_under_a_correction_and_after_its_release() -> None:
     computed = [
         {
@@ -413,20 +454,79 @@ def _ids(data: si.ParsedInputs) -> dict[sp.Key, int]:
     return {row.key: index for index, row in enumerate(data.master, start=1)}
 
 
+def _flags_by_key(
+    data: si.ParsedInputs, ids: dict[sp.Key, int]
+) -> dict[tuple[int, str, str], int | None]:
+    """(station, token, payload) -> related station, for every flag row written."""
+    rows = si._flag_rows(data, ids)
+    keys = [(f["station_id"], f["token"], f["payload"]) for f in rows]
+    assert len(keys) == len(set(keys))  # UNIQUE (station_id, token, payload)
+    assert len({tuple(sorted(row)) for row in rows}) == 1  # homogeneous for a bulk insert
+    return {key: f["related_station_id"] for key, f in zip(keys, rows, strict=True)}
+
+
 def test_flag_rows_link_to_the_station_their_payload_names() -> None:
     data = parsed()
     ids = _ids(data)
-    flags = {(f["station_id"], f["token"]): f for f in si._flag_rows(data, ids)}
+    flags = _flags_by_key(data, ids)
     central, sampleton, yard_a = ids[("ZZ00001", "ZZ00001")], ids[("ZZ00002", "ZZ00002")], 3
 
-    assert flags[(central, "candidate_displaced_to")]["related_station_id"] == sampleton
-    assert flags[(sampleton, "swap_partner")]["related_station_id"] == central
-    assert flags[(central, "plc_kind_national")]["payload"] == ""  # '' rather than NULL
-    assert flags[(central, "plc_kind_national")]["related_station_id"] is None
+    assert flags[(central, "candidate_displaced_to", "ZZ00002")] == sampleton
+    assert flags[(sampleton, "swap_partner", "ZZ00001")] == central
+    # '' rather than NULL for a bare token, and no station.
+    assert flags[(central, "plc_kind_national", "")] is None
     # A PLC with two operational points resolves to one of them, always the same.
-    assert flags[(yard_a, "shares_plc_with")]["related_station_id"] == yard_a
+    assert flags[(yard_a, "shares_plc_with", "ZZ00003")] == yard_a
     # A payload that is not a PLC of the file links to nothing.
-    assert flags[(5, "token_of_tomorrow")]["related_station_id"] is None
+    assert flags[(5, "token_of_tomorrow", "with:colons")] is None
+
+
+def test_a_flag_listing_several_plcs_links_every_station_it_names() -> None:
+    data = parsed()
+    ids = _ids(data)
+    flags = _flags_by_key(data, ids)
+    central, sampleton, yard_a = ids[("ZZ00001", "ZZ00001")], ids[("ZZ00002", "ZZ00002")], 3
+
+    # `candidate_displaced_to:ZZ00001|ZZ00003` on Sampleton: one row per PLC.
+    token = (sampleton, "candidate_displaced_to")
+    displaced = {key[2]: related for key, related in flags.items() if key[:2] == token}
+    assert displaced == {"ZZ00001": central, "ZZ00003": yard_a}
+
+
+def test_a_piped_payload_that_is_not_a_list_of_plcs_stays_one_flag() -> None:
+    rows = master_rows()
+    rows[0] = {
+        **rows[0],
+        "flags": "same_source_multiple_values:ZZ_RAIL=9900001|9900002"
+        ";candidate_displaced_to:ZZ00002|ZZ00099",
+    }
+    data = parsed(rows)
+    ids = _ids(data)
+    central = ids[("ZZ00001", "ZZ00001")]
+    flags = {key: rel for key, rel in _flags_by_key(data, ids).items() if key[0] == central}
+    assert flags == {
+        (central, "same_source_multiple_values", "ZZ_RAIL=9900001|9900002"): None,
+        # ZZ00099 is not a PLC of the file: the payload is not split, and not linked.
+        (central, "candidate_displaced_to", "ZZ00002|ZZ00099"): None,
+    }
+
+
+def test_a_plc_named_twice_under_one_token_is_one_flag_row() -> None:
+    # The same station named by a list and on its own: the unique key
+    # (station, token, payload) would refuse the second row.
+    rows = master_rows()
+    rows[0] = {
+        **rows[0],
+        "flags": "candidate_displaced_to:ZZ00002|ZZ00003;candidate_displaced_to:ZZ00002",
+    }
+    data = parsed(rows)
+    ids = _ids(data)
+    central = ids[("ZZ00001", "ZZ00001")]
+    written = [key for key in _flags_by_key(data, ids) if key[0] == central]
+    assert written == [
+        (central, "candidate_displaced_to", "ZZ00002"),
+        (central, "candidate_displaced_to", "ZZ00003"),
+    ]
 
 
 def test_an_old_plc_resolves_to_one_station() -> None:
@@ -520,7 +620,7 @@ def test_parse_inputs_reads_all_five_files(tmp_path: Path) -> None:
     data = si.parse_inputs(inputs, build_log)
     assert len(data.master) == 5
     assert len(data.links) == 9  # five link rows and four unmatched stops
-    assert len(data.crd.locations) == 3
+    assert len(data.crd.locations) == 4
     assert len(data.telref.points) == 5
     assert "master: 5 rows" in build_log.text()
 

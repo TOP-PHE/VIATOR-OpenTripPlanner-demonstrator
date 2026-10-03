@@ -6,11 +6,18 @@ mapping). `app/master/station_import.py` does the writing; nothing here does.
 
 Cell conventions, from the shapes document:
 
-    |   several values of the same series      nap_* columns, eva_all, alt names
-    ;   several tokens                         flags, op_type_all, iso2_all
-    +   several source labels                  uic_merits_sources
+    |   several values of the same series      nap_* columns, eva_all, conflict values
+    ;   several tokens, several names          flags, op_type_all, iso2_all, alt names
+    +   several source labels                  uic_merits_sources, conflict value labels
     :   token, then payload                    inside flags
+    =   code, then its source labels           inside uic_merits_conflict_values
     #   feed label, then feed-local stop key   inside nap_*_regional values
+
+Two places where a `|` is not what the first line says. Inside an alternative
+name it is part of the name: ` | ` joins the two languages of one bilingual
+name. Inside a flag payload it lists several PLCs; the payload is kept whole
+here, and the importer, which knows the PLCs of the file, writes one flag row
+per PLC.
 
 An empty cell is "no value", never zero. Anything not recognised is kept as
 opaque text: an unknown tier, flag token, match method or `nat_code_series`
@@ -27,7 +34,7 @@ from __future__ import annotations
 import csv
 import math
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -53,6 +60,9 @@ ORIGIN_CONFLICT = "Conflict value"
 # Spine sources whose rows are CRD-derived beyond doubt, and so must carry the
 # licence tag. `ERA_only` rows carry none; other values are not asserted on.
 _CRD_DERIVED = frozenset({"CRD_and_ERA", "CRD_only"})
+
+# The value of `name_src` / `pos_src` on a row whose name / position is CRD's own.
+_SRC_CRD = "CRD"
 
 # The CRD subsidiary codes, flattened into columns by the offline extractor.
 SUBSIDIARY_COLUMNS = (
@@ -162,6 +172,19 @@ def split_flag(raw: str) -> tuple[str, str]:
     return token, payload
 
 
+def split_conflict_value(raw: str) -> tuple[str, tuple[str, ...]]:
+    """`9900032=ZZ_Rail+ZZ_Timetable` -> (code, source labels), split on the first `=`.
+
+    The offline chain writes every conflict value with the sources that state
+    it. A value without a label is a bare code; one without a code is kept
+    whole, like anything else that is not recognised.
+    """
+    code, _, labels = raw.partition("=")
+    if not code:
+        return raw, ()
+    return code, tuple(split_cell(labels, "+"))
+
+
 # ───────────────────────────── reading ─────────────────────────────
 
 
@@ -227,9 +250,13 @@ def merits_candidates(row: Row) -> list[MeritsCandidate]:
     `uic_merits` is the chosen one. `uic_merits_candidate` is the calculated
     one; it usually equals the chosen code and is then the same candidate, and
     where it differs it stays as a second, not chosen, candidate, so a
-    calculated code is never withdrawn. Each value of
-    `uic_merits_conflict_values` is a further candidate. The sources and the
-    check digit belong to the calculation.
+    calculated code is never withdrawn. `uic_merits_sources` and the check
+    digit belong to the calculation.
+
+    Each item of `uic_merits_conflict_values` is `code=labels`: the code is a
+    further candidate and the labels are its sources. Where the code is one
+    the row already carries (in the real master it is often the chosen code
+    again) there is no second candidate: that candidate gains the labels.
     """
     chosen = row["uic_merits"]
     calculated = row["uic_merits_candidate"]
@@ -260,10 +287,19 @@ def merits_candidates(row: Row) -> list[MeritsCandidate]:
             check_digit=check_digit,
             is_chosen=False,
         )
-    for value in split_cell(row["uic_merits_conflict_values"], "|"):
-        if value not in out:
-            out[value] = MeritsCandidate(value, ORIGIN_CONFLICT, None, None, (), None, False)
+    _add_conflict_values(out, row["uic_merits_conflict_values"])
     return list(out.values())
+
+
+def _add_conflict_values(out: dict[str, MeritsCandidate], cell: str) -> None:
+    """Add the `code=labels` items of a conflict cell to the candidates by code."""
+    for raw in split_cell(cell, "|"):
+        code, labels = split_conflict_value(raw)
+        known = out.get(code)
+        if known is None:
+            out[code] = MeritsCandidate(code, ORIGIN_CONFLICT, None, None, labels, None, False)
+        else:
+            out[code] = replace(known, sources=tuple(dict.fromkeys((*known.sources, *labels))))
 
 
 def provider_codes(row: Row, columns: Iterable[str]) -> list[CodeValue]:
@@ -280,18 +316,36 @@ def provider_codes(row: Row, columns: Iterable[str]) -> list[CodeValue]:
 
 
 def row_flags(row: Row) -> list[tuple[str, str]]:
-    """The `;`-separated flags of a master row as (token, payload) pairs."""
+    """The `;`-separated flags of a master row as (token, payload) pairs.
+
+    A payload that lists several PLCs (`candidate_displaced_to:ZZ00002|ZZ00003`)
+    is kept whole: `station_import.flag_targets` splits it, once the PLCs of
+    the file are known.
+    """
     return list(dict.fromkeys(split_flag(raw) for raw in split_cell(row["flags"], ";")))
+
+
+def alt_names(cell: str | None) -> list[str]:
+    """The alternative names of a station: `;` joins several names.
+
+    A ` | ` is inside one bilingual name (`Exampleville-Midi | Voorbeeldstad-Zuid`)
+    and is kept. This is the convention of `era_alt_name` in the master and of
+    `alt_name` in the CRD locations file, which holds the same cell; only the
+    master's is imported.
+    """
+    return split_cell(cell, ";")
 
 
 def master_fields(row: Row) -> dict[str, Any]:
     """The station_ref columns one master row fills."""
-    alt_name = split_cell(row["era_alt_name"], "|")
+    alt_name = alt_names(row["era_alt_name"])
     fields: dict[str, Any] = {name: text_or_none(row[name]) for name in _MASTER_TEXT_FIELDS}
     fields.update(
         name=text_or_none(row["era_name"]),
         alt_name=alt_name or None,
-        alt_name_text=" | ".join(alt_name) or None,
+        # For the trigram index. Not joined with a pipe, which belongs to a
+        # bilingual name: one name alone is the text exactly as published.
+        alt_name_text="; ".join(alt_name) or None,
         lat=parse_float(row["lat"]),
         lon=parse_float(row["lon"]),
         iso2_all=split_cell(row["iso2_all"], ";") or None,
@@ -457,6 +511,16 @@ def _spine_extras(row: Row, result: CrdParse) -> dict[str, Any]:
 
 
 def _crd_location(row: Row) -> dict[str, Any]:
+    """One row of the CRD register: what CRD itself says, and nothing else.
+
+    The file's `name`, `lat` and `lon` are the spine's, already joined with
+    ERA; `name_src` and `pos_src` say which register each came from. Where the
+    spine fell back on ERA (a location retired in CRD and still in ERA) the
+    file carries no CRD name or position, and the register row has none:
+    ERA's would otherwise be shown as CRD's.
+    """
+    own_name = row["name_src"] == _SRC_CRD
+    own_position = row["pos_src"] == _SRC_CRD
     return {
         "country": text_or_none(row["crd_country"]),
         "location_code": text_or_none(row["crd_location_code"]),
@@ -464,9 +528,9 @@ def _crd_location(row: Row) -> dict[str, Any]:
         # Kept as published; station_ref carries the parsed dates.
         "start_validity": text_or_none(row["crd_start"]),
         "end_validity": text_or_none(row["crd_end"]),
-        "name": text_or_none(row["name"]),
-        "lat": parse_float(row["lat"]),
-        "lon": parse_float(row["lon"]),
+        "name": text_or_none(row["name"]) if own_name else None,
+        "lat": parse_float(row["lat"]) if own_position else None,
+        "lon": parse_float(row["lon"]) if own_position else None,
         "passenger_flag": text_or_none(row["crd_passenger_flag"]),
         "freight_flag": text_or_none(row["crd_freight_flag"]),
         "responsible_im": text_or_none(row["crd_responsible_im"]),

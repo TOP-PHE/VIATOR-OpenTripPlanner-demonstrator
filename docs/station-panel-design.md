@@ -700,7 +700,7 @@ a clean-up candidate, and `delete` refuses them because it only accepts ids from
 
 | File | Feeds |
 |---|---|
-| `station_master_crd_*.csv` (63,049 × 73) | `station_ref`, `station_ref_merits`, `station_ref_flag`, and `station_ref_code` from its 16 `nap_*` provider columns — 39,515 non-empty cells, 2,069 of them `\|`-separated multi-value |
+| `station_master_crd_*.csv` (63,049 × 73) | `station_ref`, `station_ref_merits`, `station_ref_flag`, and `station_ref_code` from its 16 `nap_*` provider columns — 22,134 non-empty cells, 1,540 of them `\|`-separated multi-value. (This row used to say 39,515 and 2,069: that count included `nap_station_ids`, which is not a provider column) |
 | `station_links_crd_*.csv` (44,708 × 24) | `station_ref_link`, asserted and non-asserted |
 | `nap_rail_stations_unmapped_crd_*.csv` (29,670 × 23) | `station_ref_link` with a null `station_id` |
 | `crd_locations_*.csv` (63,049 × 65) | `crd_location` |
@@ -802,6 +802,10 @@ corrected; this table is the record.
 | a station absent from a newer master | not addressed | kept, untouched, recognisable by `last_built_build_id` |
 | `previous_plc` → one `station_ref_alias` row | two operational points of one PLC carry the same `previous_plc`, and `UNIQUE (alias_plc, build_id)` allows one | one alias per old PLC, the first station in key order; collisions are counted |
 | a flag payload that is a PLC sets `related_station_id` | a PLC can carry several operational points | the one whose operational-point id is the PLC itself, else the first in byte order |
+| a flag names one other station | 51 of the 694 `candidate_displaced_to` flags list 2 to 5 PLCs joined by `\|`, and a flag row has one `related_station_id` | one flag row per PLC when every part of the payload is a PLC of the file; any other payload stays whole. The list shows a token once, and the flag filter counts stations, not rows |
+| each value of `uic_merits_conflict_values` is a further candidate | every item is `<code>=<labels>`, never a bare code, and on 14 of the 35 cells the code is the chosen one again | split on the first `=`: the code is the candidate, the labels are its `sources`; a code the row already carries gains the labels and is not a second candidate |
+| `era_alt_name` is split on `\|` | `;` joins several names; a `\|` only occurs inside one bilingual name | split on `;`, the pipe kept; `alt_name_text` joins the names with `; ` |
+| `crd_location` takes the file's `name`, `lat`, `lon` | they are the spine's joined values: on 404 rows retired in CRD they are ERA's (`name_src`, `pos_src`), 394 register rows | `name` only where `name_src` is `CRD`, `lat` / `lon` only where `pos_src` is `CRD`; NULL otherwise |
 
 ### Screens
 

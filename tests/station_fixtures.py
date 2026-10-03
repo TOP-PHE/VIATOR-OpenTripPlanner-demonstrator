@@ -132,15 +132,33 @@ def _cell(value: str) -> str:
 #
 # Five reference rows over four PLCs:
 #
-#   ZZ00001 / ZZ00001   Exampleville Central   passenger, MERITS chosen = calculated
+#   ZZ00001 / ZZ00001   Exampleville Central   passenger, MERITS chosen = calculated,
+#                                              two alternative names joined by `;`
 #   ZZ00002 / ZZ00002   Sampleton              passenger, MERITS chosen differs from the
-#                                              calculated one, two conflict values,
-#                                              renumbered from ZZ00009
+#                                              calculated one, three conflict values,
+#                                              renumbered from ZZ00009, one bilingual
+#                                              alternative name, a flag naming two PLCs
 #   ZZ00003 / ZZOP03A   Testbury Yard A        two operational points on one PLC,
 #   ZZ00003 / ZZOP03B   Testbury Yard B        retired in CRD (crd_end is past)
 #   ZZ00004 / ZZ00004   Mockford Halt          ERA-only: no CRD row, no licence tag,
 #                                              no position, a calculated MERITS code
 #                                              that was not chosen
+#
+# The CRD locations file carries one more row, ZZ00008 / ZZOP08A Formerton
+# Sidings: retired in CRD and still in ERA, so its name and position are ERA's.
+#
+# The cells have the shapes the real files have, with invented values:
+#
+#   era_alt_name                  `;` joins several names; a ` | ` is inside one
+#                                 bilingual name and is not a separator
+#   uic_merits_conflict_values    every item is `<code>=<labels>`, never a bare code,
+#                                 and the code can be the chosen one again. The real
+#                                 file has one item per cell; three are packed into
+#                                 one cell here, joined by `|` as the offline chain
+#                                 joins them, so that one row shows the three cases
+#   flags                         a payload can list several PLCs joined by `|`
+#   name_src, pos_src             say which register the spine's name and position
+#                                 came from
 #
 # `LICENCE_TAG` stands for the constant the offline chain writes on CRD-derived rows.
 
@@ -153,7 +171,7 @@ def master_rows() -> list[dict[str, str]]:
             "plc": "ZZ00001",
             "era_uopid": "ZZ00001",
             "era_name": "Exampleville Central",
-            "era_alt_name": "Exampleville|Exampleville Hbf",
+            "era_alt_name": "Exampleville;Exampleville Hbf",
             "op_type_all": "station;junction",
             "is_passenger": "yes",
             "plc_kind": "national",
@@ -191,6 +209,7 @@ def master_rows() -> list[dict[str, str]]:
             "plc": "ZZ00002",
             "era_uopid": "ZZ00002",
             "era_name": "Sampleton",
+            "era_alt_name": "Sampleton-Midi | Sampelstad-Zuid",
             "is_passenger": "yes",
             "plc_kind": "national",
             "iso2": "ZZ",
@@ -203,14 +222,16 @@ def master_rows() -> list[dict[str, str]]:
             "uic_merits_check_digit": "7",
             "uic_merits_sources": "CALC",
             "uic_merits_confidence": "conflict",
-            "uic_merits_conflict_values": "9900022|9900032",
+            "uic_merits_conflict_values": (
+                "9900002=Trainline_via_EVA|9900022=ZZ_Rail|9900032=ZZ_Rail+ZZ_Timetable"
+            ),
             "uic_merits": "9900002",
             "uic_merits_origin": "Trainline (calculated differs)",
             "uic_merits_rule": "Trainline preferred over the calculation",
             "nap_DE_DELFI": "de:99:2",
             "n_nap_feeds": "1",
             "best_tier": "T2_name_distance",
-            "flags": "swap_partner:ZZ00001",
+            "flags": "swap_partner:ZZ00001;candidate_displaced_to:ZZ00001|ZZ00003",
             "warning_level": "WARNING",
             "spine_source": "CRD_and_ERA",
             "previous_plc": "ZZ00009",
@@ -311,6 +332,9 @@ def crd_location_rows() -> list[dict[str, str]]:
             "crd_freight_flag": "false",
             "crd_responsible_im": "ZZ Infra",
             "crd_nuts": "ZZ001",
+            # The spine's name and position are CRD's own on these rows.
+            "name_src": "CRD",
+            "pos_src": "CRD",
             "crd_source_tag": LICENCE_TAG,
         }
         base.update(extra)
@@ -346,7 +370,26 @@ def crd_location_rows() -> list[dict[str, str]]:
             "n_op_with_plc": "1",
             "is_passenger_src": "ERA",
             "spine_source": "ERA_only",
+            "name_src": "ERA",
+            "pos_src": "none",
         },
+        # Retired in CRD and still in ERA: the row keeps its CRD key and
+        # validity, and the spine's name and position are ERA's.
+        row(
+            "ZZ00008",
+            "ZZOP08A",
+            "Formerton Sidings",
+            lat="50.8",
+            lon="4.8",
+            spine_source="ERA_retired_in_CRD",
+            crd_end="2022-12-10",
+            era_name="Formerton Sidings",
+            era_lat="50.8",
+            era_lon="4.8",
+            era_crd_dist_m="212",
+            name_src="ERA",
+            pos_src="ERA",
+        ),
     ]
 
 

@@ -295,9 +295,12 @@ def _page_extras(
         .order_by(StationRefCode.is_primary.desc(), StationRefCode.code)
     ).all()
     flags: dict[int, list[str]] = {}
+    # DISTINCT: a flag that names several PLCs is one row per PLC, and the
+    # list shows each token once.
     for station_id, token in db.execute(
         select(StationRefFlag.station_id, StationRefFlag.token)
         .where(StationRefFlag.station_id.in_(ids))
+        .distinct()
         .order_by(StationRefFlag.token)
     ).all():
         flags.setdefault(station_id, []).append(token)
@@ -407,11 +410,14 @@ def list_reference(
 # ────────────────────────────── summary ──────────────────────────────
 
 
-def _facet(db: DbSession, column: Any) -> list[dict[str, Any]]:
+def _facet(db: DbSession, column: Any, per: Any = None) -> list[dict[str, Any]]:
+    """The values of `column`, each with a count: the rows that carry it, or
+    the distinct values of `per` among those rows when given."""
+    counted = func.count() if per is None else func.count(per.distinct())
     rows = db.execute(
-        select(column, func.count())
+        select(column, counted)
         .group_by(column)
-        .order_by(func.count().desc(), column)
+        .order_by(counted.desc(), column)
         .limit(_FACET_LIMIT)
     ).all()
     return [{"value": row[0], "count": int(row[1])} for row in rows]
@@ -472,7 +478,8 @@ def reference_summary(
         "providers": _providers(db),
         "countries": _facet(db, StationRef.iso2),
         "confidences": _facet(db, StationRef.uic_merits_confidence),
-        "flags": _facet(db, StationRefFlag.token),
+        # Stations, not flag rows: a flag naming several PLCs is one row per PLC.
+        "flags": _facet(db, StationRefFlag.token, StationRefFlag.station_id),
         "complex_kinds": sorted(COMPLEX_KINDS),
         "overridable_fields": sorted(so.OVERRIDABLE_FIELDS),
     }

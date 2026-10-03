@@ -237,8 +237,8 @@ def test_unknown_vocabulary_is_stored_not_refused() -> None:
 def test_master_fields() -> None:
     fields = parsed_master()[("ZZ00001", "ZZ00001")].fields
     assert fields["name"] == "Exampleville Central"
-    assert fields["alt_name"] == ["Exampleville", "Exampleville Hbf"]
-    assert fields["alt_name_text"] == "Exampleville | Exampleville Hbf"
+    assert fields["alt_name"] == ["Exampleville", "Exampleville Hbf"]  # joined by `;` in the file
+    assert fields["alt_name_text"] == "Exampleville; Exampleville Hbf"
     assert fields["op_type_all"] == ["station", "junction"]
     assert fields["iso2_all"] == ["ZZ"]
     assert fields["eva_all"] == ["9900001", "9900002"]
@@ -257,6 +257,22 @@ def test_a_row_without_a_position_has_none_not_zero() -> None:
     assert fields["alt_name"] is None
     assert fields["alt_name_text"] is None
     assert fields["pos_src"] == "none"
+
+
+def test_a_pipe_inside_an_alternative_name_is_part_of_the_name() -> None:
+    # One bilingual name, as the register publishes it: not two names.
+    fields = parsed_master()[("ZZ00002", "ZZ00002")].fields
+    assert fields["alt_name"] == ["Sampleton-Midi | Sampelstad-Zuid"]
+    # Searchable exactly as published: no doubled space around the pipe.
+    assert fields["alt_name_text"] == "Sampleton-Midi | Sampelstad-Zuid"
+
+
+def test_alternative_names_are_split_on_the_semicolon_only() -> None:
+    both = sp.master_fields(master(era_alt_name="Exampleville-Midi | Voorbeeldstad-Zuid;Old Town"))
+    assert both["alt_name"] == ["Exampleville-Midi | Voorbeeldstad-Zuid", "Old Town"]
+    assert both["alt_name_text"] == "Exampleville-Midi | Voorbeeldstad-Zuid; Old Town"
+    repeated = sp.master_fields(master(era_alt_name="Old Town;;Old Town"))
+    assert repeated["alt_name"] == ["Old Town"]
 
 
 # ── the master: MERITS candidates from one row ─────────────────────────
@@ -282,7 +298,9 @@ def test_merits_calculated_differs_and_conflict_values_are_kept() -> None:
 
     chosen = candidates["9900002"]
     assert chosen.origin == "Trainline (calculated differs)"
-    assert chosen.sources == ()  # the sources and the check digit describe the calculation
+    # `uic_merits_sources` and the check digit describe the calculation, not
+    # this code: its one source is the label of the conflict value naming it.
+    assert chosen.sources == ("Trainline_via_EVA",)
     assert chosen.check_digit is None
 
     calculated = candidates["9900012"]  # never withdrawn
@@ -290,7 +308,11 @@ def test_merits_calculated_differs_and_conflict_values_are_kept() -> None:
     assert calculated.sources == ("CALC",)
     assert calculated.check_digit == "7"
 
+    # A conflict value is `code=labels`: the code alone is the candidate.
     assert candidates["9900022"].origin == sp.ORIGIN_CONFLICT
+    assert candidates["9900022"].sources == ("ZZ_Rail",)
+    assert candidates["9900032"].sources == ("ZZ_Rail", "ZZ_Timetable")
+    assert all(c.code.isdigit() for c in candidates.values())
 
 
 def test_merits_calculated_but_nothing_chosen() -> None:
@@ -306,8 +328,35 @@ def test_merits_none_at_all() -> None:
 
 
 def test_a_conflict_value_equal_to_the_chosen_code_is_not_a_second_candidate() -> None:
-    row = master(uic_merits_conflict_values="9900001|9900077")
-    assert [c.code for c in sp.merits_candidates(row)] == ["9900001", "9900077"]
+    # The shape of the real cells: one item, `code=label`, the code being the
+    # chosen one again.
+    row = master(
+        uic_merits="9900002",
+        uic_merits_candidate="9900012",
+        uic_merits_conflict_values="9900002=Trainline_via_EVA",
+    )
+    candidates = sp.merits_candidates(row)
+    assert [(c.code, c.is_chosen) for c in candidates] == [("9900002", True), ("9900012", False)]
+    assert candidates[0].sources == ("Trainline_via_EVA",)  # the label is not lost
+
+    # A code that is already a candidate keeps the sources it has and gains the label.
+    row = master(uic_merits_conflict_values="9900001=ZZ_Rail|9900077=ZZ_Rail")
+    first, second = sp.merits_candidates(row)
+    assert (first.code, first.sources) == ("9900001", ("TRAINLINE", "CALC", "ZZ_Rail"))
+    assert (second.code, second.origin) == ("9900077", sp.ORIGIN_CONFLICT)
+
+
+def test_a_conflict_value_splits_on_its_first_equals_sign_only() -> None:
+    assert sp.split_conflict_value("9900022=ZZ_Rail") == ("9900022", ("ZZ_Rail",))
+    assert sp.split_conflict_value("9900032=ZZ_Rail+ZZ_Timetable") == (
+        "9900032",
+        ("ZZ_Rail", "ZZ_Timetable"),
+    )
+    assert sp.split_conflict_value("9900042=a=b") == ("9900042", ("a=b",))
+    # Never refused: a bare code has no label, and an item with no code is kept whole.
+    assert sp.split_conflict_value("9900052") == ("9900052", ())
+    assert sp.split_conflict_value("9900062=") == ("9900062", ())
+    assert sp.split_conflict_value("=ZZ_Rail") == ("=ZZ_Rail", ())
 
 
 # ── the master: codes and flags ────────────────────────────────────────
@@ -340,6 +389,12 @@ def test_flags_split_into_token_and_payload() -> None:
     ]
     assert sp.row_flags(master(flags="a:1;a:1;b")) == [("a", "1"), ("b", "")]
     assert sp.row_flags(master(flags="")) == []
+    # A payload listing several PLCs stays whole here: only the importer knows
+    # which PLCs the file has, and writes one flag row per PLC.
+    assert parsed_master()[("ZZ00002", "ZZ00002")].flags == [
+        ("swap_partner", "ZZ00001"),
+        ("candidate_displaced_to", "ZZ00001|ZZ00003"),
+    ]
 
 
 # ── links ──────────────────────────────────────────────────────────────
@@ -396,7 +451,7 @@ def parsed_crd() -> sp.CrdParse:
 
 def test_crd_locations_yield_the_columns_the_master_lacks() -> None:
     crd = parsed_crd()
-    assert crd.rows == 5
+    assert crd.rows == 6
     assert crd.extras[("ZZ00003", "ZZOP03B")] == {
         "plc_op_max_sep_m": 140,
         "is_passenger_src": "CRD_derived",
@@ -409,13 +464,59 @@ def test_crd_locations_yield_the_columns_the_master_lacks() -> None:
 
 def test_one_crd_location_per_crd_key_not_per_operational_point() -> None:
     crd = parsed_crd()
-    assert [loc["plc"] for loc in crd.locations] == ["ZZ00001", "ZZ00002", "ZZ00003"]
+    assert [loc["plc"] for loc in crd.locations] == ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00008"]
     assert crd.duplicates_dropped == 1  # the second operational point of ZZ00003
     yard = crd.locations[2]
     assert (yard["country"], yard["location_code"]) == ("ZZ", "00003")
     assert yard["start_validity"] == "2019-12-15"  # kept as published
     assert yard["end_validity"] == "2021-06-30"
     assert yard["freight_flag"] == "true"
+
+
+def test_a_crd_location_takes_its_name_and_position_from_crd_only() -> None:
+    central, _, _, retired = parsed_crd().locations
+    # CRD's own name and position.
+    assert (central["name"], central["lat"], central["lon"]) == ("Exampleville Central", 50.0, 4.0)
+    # Retired in CRD: the spine fell back on ERA's name and position, and the
+    # file carries no CRD value for them. The CRD register shows none.
+    assert (retired["name"], retired["lat"], retired["lon"]) == (None, None, None)
+    # Everything that is CRD's own stays.
+    assert (retired["country"], retired["location_code"]) == ("ZZ", "00008")
+    assert (retired["start_validity"], retired["end_validity"]) == ("2019-12-15", "2022-12-10")
+    assert retired["responsible_im"] == "ZZ Infra"
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected"),
+    [
+        ({"name_src": "CRD", "pos_src": "CRD"}, ("Exampleville Central", 50.0, 4.0)),
+        ({"name_src": "ERA", "pos_src": "CRD"}, (None, 50.0, 4.0)),
+        ({"name_src": "CRD", "pos_src": "ERA"}, ("Exampleville Central", None, None)),
+        ({"name_src": "CRD", "pos_src": "none"}, ("Exampleville Central", None, None)),
+        # A source the file does not state is not assumed to be CRD.
+        ({"name_src": "", "pos_src": ""}, (None, None, None)),
+    ],
+)
+def test_the_name_and_the_position_of_a_crd_location_are_decided_separately(
+    sources: dict[str, str], expected: tuple[str | None, float | None, float | None]
+) -> None:
+    rows = [full(sf.CRD_LOCATIONS, {**crd_location_rows()[0], **sources})]
+    (location,) = sp.parse_crd_locations(rows).locations
+    assert (location["name"], location["lat"], location["lon"]) == expected
+
+
+def test_a_retired_location_is_the_same_whichever_operational_point_comes_first() -> None:
+    # Several ERA operational points of one retired CRD location, each with its
+    # own ERA name and position: the register row must not depend on file order.
+    retired = crd_location_rows()[5]
+    north = {**retired, "uopid": "ZZOP08A", "name": "Formerton Sidings North", "lat": "50.80"}
+    south = {**retired, "uopid": "ZZOP08B", "name": "Formerton Sidings South", "lat": "50.81"}
+
+    def locations(*rows: dict[str, str]) -> list[dict[str, object]]:
+        return sp.parse_crd_locations(full(sf.CRD_LOCATIONS, row) for row in rows).locations
+
+    assert locations(north, south) == locations(south, north)
+    assert len(locations(north, south)) == 1
 
 
 def test_an_era_only_row_yields_no_crd_location() -> None:

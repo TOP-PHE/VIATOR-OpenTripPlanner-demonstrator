@@ -135,6 +135,47 @@ def test_search_covers_name_plc_and_every_code() -> None:
         assert f"station_ref.{column} = " in query
 
 
+# ── flags: a flag naming several PLCs is one row per PLC ───────────────
+
+
+class _Scalars(list[Any]):
+    def first(self) -> Any:
+        return None
+
+
+class _RecordingDb:
+    """Answers every query with nothing, and keeps the SQL it was asked."""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    def execute(self, statement: Any) -> Any:
+        self.statements.append(sql(statement))
+        return SimpleNamespace(all=list, scalars=_Scalars, scalar_one=lambda: 0)
+
+    def about(self, table: str) -> list[str]:
+        return [s for s in self.statements if f"FROM {table}" in s]
+
+
+def test_the_list_shows_a_flag_token_once_however_many_rows_carry_it() -> None:
+    db = _RecordingDb()
+    api._page_extras(db, [_station()])  # type: ignore[arg-type]
+    (flags,) = db.about("station_ref_flag")
+    assert flags.startswith("SELECT DISTINCT station_ref_flag.station_id, station_ref_flag.token")
+
+
+def test_the_flag_filter_counts_stations_not_flag_rows() -> None:
+    db = _RecordingDb()
+    summary = api.reference_summary(db, ACTOR)  # type: ignore[arg-type]
+    assert summary["flags"] == []
+    (flags,) = db.about("station_ref_flag")
+    assert "count(DISTINCT station_ref_flag.station_id)" in flags
+    assert "GROUP BY station_ref_flag.token" in flags
+    # The other facets count reference rows, as before.
+    countries = next(s for s in db.statements if "GROUP BY station_ref.iso2" in s)
+    assert "count(*)" in countries
+
+
 # ── the row ────────────────────────────────────────────────────────────
 
 

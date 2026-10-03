@@ -161,6 +161,24 @@ def related_station(plc: str, by_plc: Mapping[str, list[tuple[str, int]]]) -> in
     return min(candidates)[1]
 
 
+def flag_targets(
+    payload: str, by_plc: Mapping[str, list[tuple[str, int]]]
+) -> list[tuple[str, int | None]]:
+    """The (payload, related station) pairs one flag is written as.
+
+    A payload usually names one thing. Some list several PLCs joined by `|`
+    (`candidate_displaced_to:ZZ00002|ZZ00003`): when every part is a PLC of
+    the file, the flag becomes one row per PLC, so that each station it names
+    is linked. A flag row has one `related_station_id`, and its unique key
+    (station, token, payload) allows the rows. Any other payload is kept
+    whole, whatever it contains (`same_source_multiple_values:ZZ_RAIL=1|2`).
+    """
+    parts = sp.split_cell(payload, "|")
+    if len(parts) > 1 and all(part in by_plc for part in parts):
+        return [(part, related_station(part, by_plc)) for part in parts]
+    return [(payload, related_station(payload, by_plc) if payload else None)]
+
+
 def chunks(items: Sequence[Any], size: int = _CHUNK) -> Iterator[Sequence[Any]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
@@ -565,17 +583,24 @@ def _flag_rows(parsed: ParsedInputs, ids: Mapping[sp.Key, int]) -> list[dict[str
     by_plc: dict[str, list[tuple[str, int]]] = {}
     for (plc, uopid), station_id in ids.items():
         by_plc.setdefault(plc, []).append((uopid, station_id))
-    rows = []
+    rows: list[dict[str, Any]] = []
     for master in parsed.master:
-        for token, payload in master.flags:
-            rows.append(
-                {
-                    "station_id": ids[master.key],
-                    "token": token,
-                    "payload": payload,
-                    "related_station_id": related_station(payload, by_plc) if payload else None,
-                }
-            )
+        # A dict: a PLC named by a list and again on its own is one row, which
+        # is what the unique key (station, token, payload) requires.
+        written = dict.fromkeys(
+            (token, part, related)
+            for token, payload in master.flags
+            for part, related in flag_targets(payload, by_plc)
+        )
+        rows.extend(
+            {
+                "station_id": ids[master.key],
+                "token": token,
+                "payload": part,
+                "related_station_id": related,
+            }
+            for token, part, related in written
+        )
     return rows
 
 

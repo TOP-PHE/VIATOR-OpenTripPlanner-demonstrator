@@ -535,8 +535,16 @@ def test_build_one_writes_the_reference_at_its_grain(built: dict[str, dict]) -> 
     central, sampleton, yard_a, _, halt = rows
     assert central[2:] == (
         "Exampleville Central", True, 0, "2019-12-15", None, True, "9900001",
-        "Exampleville | Exampleville Hbf", ["ZZ"], 1,
+        "Exampleville; Exampleville Hbf", ["ZZ"], 1,
     )  # fmt: skip
+    # One bilingual name, stored as published: its pipe is not a separator.
+    assert sampleton[9] == "Sampleton-Midi | Sampelstad-Zuid"
+    assert _rows(
+        "SELECT alt_name FROM station_ref WHERE plc IN ('ZZ00001', 'ZZ00002') ORDER BY plc"
+    ) == [
+        (["Exampleville", "Exampleville Hbf"],),
+        (["Sampleton-Midi | Sampelstad-Zuid"],),
+    ]
     assert sampleton[10] == ["ZZ", "YY"]
     assert yard_a[3:7] == (False, 140, "2019-12-15", "2021-06-30")  # retired in CRD
     assert halt[8] is None  # a calculated MERITS code that was not chosen
@@ -574,16 +582,32 @@ def test_build_one_writes_codes_merits_flags_aliases_and_links(built: dict[str, 
         ("ZZ00002", "9900032", "Conflict value", False),
         ("ZZ00004", "9900004", "Calculated", False),
     ]
+    # A conflict value is `code=labels` in the file: the code alone is the
+    # candidate, and the labels are its sources. The one that names the chosen
+    # code again is no second candidate; the chosen code gains its label.
+    sources = _rows(
+        "SELECT m.code, m.sources FROM station_ref_merits m"
+        " JOIN station_ref r ON r.id = m.station_id WHERE r.plc = 'ZZ00002' ORDER BY m.code"
+    )
+    assert sources == [
+        ("9900002", ["Trainline_via_EVA"]),
+        ("9900012", ["CALC"]),
+        ("9900022", ["ZZ_Rail"]),
+        ("9900032", ["ZZ_Rail", "ZZ_Timetable"]),
+    ]
 
     flags = _rows(
         "SELECT r.plc, f.token, f.payload, o.plc FROM station_ref_flag f"
         " JOIN station_ref r ON r.id = f.station_id"
         " LEFT JOIN station_ref o ON o.id = f.related_station_id"
-        " ORDER BY r.plc, r.era_uopid, f.token"
+        " ORDER BY r.plc, r.era_uopid, f.token, f.payload"
     )
     assert flags == [
         ("ZZ00001", "candidate_displaced_to", "ZZ00002", "ZZ00002"),
         ("ZZ00001", "plc_kind_national", "", None),
+        # One flag naming two PLCs: one row per PLC, each linked to its station.
+        ("ZZ00002", "candidate_displaced_to", "ZZ00001", "ZZ00001"),
+        ("ZZ00002", "candidate_displaced_to", "ZZ00003", "ZZ00003"),
         ("ZZ00002", "swap_partner", "ZZ00001", "ZZ00001"),
         ("ZZ00003", "shares_plc_with", "ZZ00003", "ZZ00003"),
         ("ZZ00004", "bare_token", "", None),
@@ -622,6 +646,15 @@ def test_build_one_loads_the_registers(built: dict[str, dict]) -> None:
         ("ZZ00001", "ZZ", "00001", "2019-12-15", None),
         ("ZZ00002", "ZZ", "00002", "2019-12-15", None),
         ("ZZ00003", "ZZ", "00003", "2019-12-15", "2021-06-30"),  # once, not per operational point
+        ("ZZ00008", "ZZ", "00008", "2019-12-15", "2022-12-10"),
+    ]
+    # The register holds CRD's own name and position. ZZ00008 is retired in
+    # CRD: the file carries ERA's for it (name_src, pos_src), so it has none.
+    assert _rows("SELECT plc, name, lat, lon FROM crd_location ORDER BY plc") == [
+        ("ZZ00001", "Exampleville Central", 50.0, 4.0),
+        ("ZZ00002", "Sampleton", 50.1, 4.1),
+        ("ZZ00003", "Testbury Yard", 50.2, 4.2),
+        ("ZZ00008", None, None, None),
     ]
     assert _scalar("SELECT count(*) FROM crd_subsidiary") == 4
     assert _scalar("SELECT count(*) FROM era_operational_point") == 5
@@ -629,7 +662,7 @@ def test_build_one_loads_the_registers(built: dict[str, dict]) -> None:
         "SELECT v.stats FROM station_source_version v JOIN station_source s ON s.id = v.source_id"
         " WHERE s.key = 'CRD'"
     )
-    assert stats["crd_locations"] == 3  # type: ignore[index]
+    assert stats["crd_locations"] == 4  # type: ignore[index]
     assert stats["duplicates_dropped"] == 1  # type: ignore[index]
 
 
@@ -645,7 +678,8 @@ def test_rebuilding_from_the_same_files_changes_nothing(built: dict[str, dict]) 
     assert _scalar("SELECT count(*) FROM station_ref_code") == 4
     assert _scalar("SELECT count(*) FROM station_ref_merits") == 6
     assert _scalar("SELECT count(*) FROM station_ref_link") == 8
-    assert _scalar("SELECT count(*) FROM crd_location") == 3
+    assert _scalar("SELECT count(*) FROM station_ref_flag") == 8
+    assert _scalar("SELECT count(*) FROM crd_location") == 4
     assert _scalar("SELECT count(*) FROM station_ref_history") == 0
     assert _scalar("SELECT count(*) FROM station_ref_alias") == 2  # one per build
     assert _rows("SELECT status FROM station_build ORDER BY id") == [("done",), ("done",)]
@@ -911,6 +945,8 @@ def test_the_reference_list_shows_one_row_per_plc_by_default(
         "nap_ES_regional": ["ZZ_FEED#MC"],
     }
     assert central["flags"] == ["candidate_displaced_to", "plc_kind_national"]
+    # A token once, although the flag names two PLCs and is two rows.
+    assert rows["ZZ00002"]["flags"] == ["candidate_displaced_to", "swap_partner"]
     assert (central["uic_merits"], central["uic_merits_origin"]) == (
         "9900001",
         "Trainline = calculated",
@@ -944,6 +980,8 @@ def test_the_reference_list_uncollapsed_and_paginated(
     [
         ({"q": "sampl"}, ["ZZ00002"]),  # by name, case-insensitive
         ({"q": "Hbf"}, ["ZZ00001"]),  # by an alternative name
+        # A bilingual alternative name, typed as the register publishes it.
+        ({"q": "Sampleton-Midi | Sampelstad-Zuid"}, ["ZZ00002"]),
         ({"q": "ZZ0000"}, ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00004"]),  # by PLC
         ({"q": "de:99:2"}, ["ZZ00002"]),  # by any code in any series
         ({"q": "9900001:0:1"}, ["ZZ00001"]),
@@ -955,6 +993,7 @@ def test_the_reference_list_uncollapsed_and_paginated(
         ({"confidence": "conflict"}, ["ZZ00002"]),
         ({"confidence": "none"}, ["ZZ00003"]),
         ({"flag": "swap_partner"}, ["ZZ00002"]),
+        ({"flag": "candidate_displaced_to"}, ["ZZ00001", "ZZ00002"]),
         ({"has_code": "true"}, ["ZZ00001", "ZZ00002"]),
         ({"has_code": "false"}, ["ZZ00003", "ZZ00004"]),
         ({"q": "Testbury Yard B"}, ["ZZ00003"]),  # a match on the second operational point
@@ -996,6 +1035,8 @@ def test_reference_summary(
     assert next(p for p in body["providers"] if p["key"] == "nap_ES_regional")["unresolved"] is True
     assert body["countries"] == [{"value": "ZZ", "count": 5}]
     assert {"value": "swap_partner", "count": 1} in body["flags"]
+    # Two stations carry it, on three rows (one of the flags names two PLCs).
+    assert {"value": "candidate_displaced_to", "count": 2} in body["flags"]
     assert {c["value"] for c in body["confidences"]} == {"high", "conflict", "low", None}
     assert "uic_merits" in body["overridable_fields"]
     assert len(body["complex_kinds"]) == 4
@@ -1038,6 +1079,19 @@ def test_reference_detail(
         ("9900022", False),
         ("9900032", False),
     ]
+    # A conflict value's label is the candidate's source, not part of its code.
+    assert [m["sources"] for m in sampleton["merits"]][2:] == [
+        ["ZZ_Rail"],
+        ["ZZ_Rail", "ZZ_Timetable"],
+    ]
+    # A flag naming several PLCs links to every station it names.
+    named = [
+        (f["payload"], f["related"]["plc"], f["related"]["era_uopid"])
+        for f in sampleton["flags"]
+        if f["token"] == "candidate_displaced_to"
+    ]
+    assert named == [("ZZ00001", "ZZ00001", "ZZ00001"), ("ZZ00003", "ZZ00003", "ZZOP03A")]
+    assert sampleton["alt_name"] == ["Sampleton-Midi | Sampelstad-Zuid"]
     assert [a["alias_plc"] for a in sampleton["aliases"]] == ["ZZ00009"]
     assert sampleton["links"][0]["asserted"] is False
 
@@ -1210,10 +1264,17 @@ def test_the_crd_list_reads_the_latest_loaded_version(
 ) -> None:
     r = client.get(f"{REG}/crd", headers=content_manager)
     assert r.status_code == 200, r.text
-    assert r.headers["X-Total-Count"] == "3"
+    assert r.headers["X-Total-Count"] == "4"
     assert r.headers["X-Version-Id"] == built["CRD"]["version"]["id"]
     rows = r.json()
-    assert [row["plc"] for row in rows] == ["ZZ00001", "ZZ00002", "ZZ00003"]
+    assert [row["plc"] for row in rows] == ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00008"]
+    # CRD's own name and position, or none: never ERA's under the CRD heading.
+    assert [(row["name"], row["lat"], row["lon"]) for row in rows] == [
+        ("Exampleville Central", 50.0, 4.0),
+        ("Sampleton", 50.1, 4.1),
+        ("Testbury Yard", 50.2, 4.2),
+        (None, None, None),  # retired in CRD: the file has ERA's name and position
+    ]
     central = rows[0]
     assert (central["country"], central["location_code"]) == ("ZZ", "00001")
     assert (central["start_validity"], central["end_validity"]) == ("2019-12-15", None)
@@ -1245,8 +1306,11 @@ def test_the_era_list_and_the_register_filters(
 
     assert plcs("crd", q="sampl") == ["ZZ00002"]
     assert plcs("crd", q="00003") == ["ZZ00003"]  # by PLC substring and by CRD code
-    assert plcs("crd", country="zz") == ["ZZ00001", "ZZ00002", "ZZ00003"]
+    assert plcs("crd", country="zz") == ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00008"]
     assert plcs("crd", country="FR") == []
+    # ERA's name of a location retired in CRD is not in the CRD register.
+    assert plcs("crd", q="formerton") == []
+    assert plcs("crd", q="ZZ00008") == ["ZZ00008"]
     assert plcs("era", q="ZZOP03B") == ["ZZ00003"]  # by operational point id
     assert plcs("era", q="halt") == ["ZZ00004"]
     paged = client.get(f"{REG}/era", headers=content_manager, params={"size": 2, "page": 2})
@@ -1264,7 +1328,7 @@ def test_register_versions_carry_the_licence_of_the_source(
     assert version["loaded"] is True
     assert version["as_of"] == "2026-09-01"  # read off crd_locations_2026-09.csv
     assert version["sha256"] == built["CRD"]["version"]["sha256"]
-    assert version["stats"]["rows"] == 5
+    assert version["stats"]["rows"] == 6
     (source,) = body["sources"]
     assert source["key"] == "CRD"
     assert "RNE licence" in source["licence"]  # what the licence banner shows
@@ -1327,7 +1391,8 @@ def test_the_delta_between_two_crd_versions(
         "renamed": 1,
         "moved": 1,
         "renumbered": 1,
-        "unchanged": 0,
+        # ZZ00008, retired in CRD: no CRD name or position in either version.
+        "unchanged": 1,
     }
     assert [c["key"] for c in delta["created"]] == ["ZZ00007"]
     assert delta["renamed"][0]["new"]["name"] == "Exampleville Central Station"
@@ -1338,14 +1403,14 @@ def test_the_delta_between_two_crd_versions(
     assert delta["truncated"] == []
 
     # The list now reads the newer version; the older one is still there to compare.
-    assert client.get(f"{REG}/crd", headers=content_manager).headers["X-Total-Count"] == "4"
+    assert client.get(f"{REG}/crd", headers=content_manager).headers["X-Total-Count"] == "5"
     older = client.get(f"{REG}/crd", headers=content_manager, params={"version_id": delta["older"]})
-    assert older.headers["X-Total-Count"] == "3"
+    assert older.headers["X-Total-Count"] == "4"
 
     # A higher threshold: the yard no longer counts as moved.
     loose = client.get(f"{REG}/crd/delta", headers=content_manager, params={"threshold_m": 5000})
     assert loose.json()["counts"]["moved"] == 0
-    assert loose.json()["counts"]["unchanged"] == 1
+    assert loose.json()["counts"]["unchanged"] == 2
 
     # Reversed, a created location is a removed one.
     reverse = client.get(
