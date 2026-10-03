@@ -33,7 +33,7 @@ from datetime import UTC, date, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
@@ -142,7 +142,7 @@ class SourceResponse(BaseModel):
 
 
 class SourceCreate(BaseModel):
-    key: str = Field(pattern=station_store.SOURCE_KEY_RE.pattern)
+    key: str
     label: str = Field(min_length=1, max_length=200)
     kind: str
     format: str
@@ -159,6 +159,16 @@ class SourceCreate(BaseModel):
     triggers_rebuild: bool = False
     enabled: bool = True
     source_key_unresolved: bool = False
+
+    @field_validator("key")
+    @classmethod
+    def _key_is_a_safe_folder_name(cls, value: str) -> str:
+        if not station_store.SOURCE_KEY_RE.fullmatch(value):
+            raise ValueError(
+                "must start with a letter and hold only letters, digits and underscores "
+                "(2 to 64 characters): it becomes a folder name"
+            )
+        return value
 
 
 class SourcePatch(BaseModel):
@@ -368,12 +378,22 @@ def _credential_names(db: DbSession, sources: list[StationSource]) -> dict[uuid.
 
 
 def _latest_versions(db: DbSession) -> dict[uuid.UUID, StationSourceVersion]:
-    """The most recent version of every source, in one query (DISTINCT ON)."""
+    """The most recent version of every source, in one query."""
+    newest = (
+        select(
+            StationSourceVersion.source_id.label("source_id"),
+            func.max(StationSourceVersion.acquired_at).label("acquired_at"),
+        )
+        .group_by(StationSourceVersion.source_id)
+        .subquery()
+    )
     rows = (
         db.execute(
-            select(StationSourceVersion)
-            .distinct(StationSourceVersion.source_id)
-            .order_by(StationSourceVersion.source_id, StationSourceVersion.acquired_at.desc())
+            select(StationSourceVersion).join(
+                newest,
+                (StationSourceVersion.source_id == newest.c.source_id)
+                & (StationSourceVersion.acquired_at == newest.c.acquired_at),
+            )
         )
         .scalars()
         .all()
@@ -454,7 +474,7 @@ async def _receive(file: UploadFile, key: str) -> station_store.Received:
 # ──────────────────────────────── sources ────────────────────────────────
 
 
-@router.get("/sources", response_model=list[SourceResponse])
+@router.get("/sources")
 def list_sources(
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
@@ -483,10 +503,10 @@ def list_sources(
 
 @router.post(
     "/sources",
-    response_model=SourceResponse,
     status_code=201,
     responses={
         400: {"description": "A kind, format, acquisition or resolver type no code knows"},
+        404: {"description": "The credential does not exist"},
         409: {"description": "A source with that key already exists"},
     },
 )
@@ -528,7 +548,6 @@ def create_source(
 
 @router.patch(
     "/sources/{key}",
-    response_model=SourceResponse,
     responses={
         400: {"description": "A kind, format, acquisition or resolver type no code knows"},
         404: {"description": _NOT_FOUND},
@@ -580,7 +599,6 @@ def patch_source(
 @router.delete(
     "/sources/{key}",
     status_code=204,
-    response_model=None,
     responses={
         404: {"description": _NOT_FOUND},
         409: {"description": "The source has acquired files: disable it instead"},
@@ -622,7 +640,6 @@ def delete_source(
 
 @router.get(
     "/sources/{key}/versions",
-    response_model=list[VersionResponse],
     responses={404: {"description": _NOT_FOUND}},
 )
 def list_versions(
@@ -752,7 +769,6 @@ def _queue_build_for(db: DbSession, source: StationSource) -> BuildDecision:
 
 @router.post(
     "/builds",
-    response_model=BuildDecision,
     status_code=202,
     responses={
         409: {"description": "A build needs all five inputs; the detail lists what is missing"}
@@ -785,7 +801,7 @@ def queue_build(
     return BuildDecision(queued=True, note=_QUEUED if created else _ALREADY_QUEUED)
 
 
-@router.get("/builds", response_model=BuildsResponse)
+@router.get("/builds")
 def list_builds(
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],

@@ -168,7 +168,12 @@ def merits_with_override(
     except the one carrying `value`. If no candidate carries it, a `Manual`
     one is added. A `value` of None means "this station has no MERITS code".
     """
-    out = [{**candidate, "is_chosen": False} for candidate in candidates]
+    # A `Manual` candidate left by an earlier correction goes: one at most.
+    out = [
+        {**candidate, "is_chosen": False}
+        for candidate in candidates
+        if candidate.get("origin") != ORIGIN_MANUAL
+    ]
     if value is None:
         return out
     for candidate in out:

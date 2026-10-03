@@ -61,6 +61,8 @@ def inline_scripts(html: str) -> list[tuple[bool, str]]:
         attrs = match.group("attrs")
         if "src=" in attrs or not match.group("body").strip():
             continue
+        if "application/json" in attrs:  # a data block, not a script
+            continue
         out.append(('type="module"' in attrs, match.group("body")))
     return out
 

@@ -401,8 +401,9 @@ def test_a_correction_that_cannot_be_reapplied_refuses_the_build() -> None:
     existing = as_existing(si.plan_reference(parsed(), {}, {}, BUILD, TODAY))
     station_id = existing[("ZZ00001", "ZZ00001")]["id"]
     broken = override(station_id, "lat", "north", "50.0")
+    data, corrections = parsed(), {station_id: [broken]}
     with pytest.raises(sf.StationFileError, match="can no longer be applied"):
-        si.plan_reference(parsed(), existing, {station_id: [broken]}, BUILD + 1, TODAY)
+        si.plan_reference(data, existing, corrections, BUILD + 1, TODAY)
 
 
 # ── child rows ─────────────────────────────────────────────────────────
@@ -531,8 +532,9 @@ def test_a_refused_file_is_named_by_its_source(tmp_path: Path) -> None:
         fmt: si.BuildInput(fmt, f"SRC_{fmt}", uuid.uuid4(), "ab" * 32, path.name, path, None)
         for fmt, path in paths.items()
     }
+    build_log = si.BuildLog()
     with pytest.raises(sf.StationFileError) as exc:
-        si.parse_inputs(inputs, si.BuildLog())
+        si.parse_inputs(inputs, build_log)
     assert f"SRC_{sf.MASTER} (station_master_crd_2026-09.csv)" in str(exc.value)
     assert "missing columns" in str(exc.value)
 

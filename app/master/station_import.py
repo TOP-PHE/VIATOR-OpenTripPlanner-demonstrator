@@ -504,7 +504,7 @@ def plan_reference(
     return plan
 
 
-def _write_stations(db: DbSession, plan: _Plan, build_id: int) -> dict[sp.Key, int]:
+def _write_stations(db: DbSession, plan: _Plan) -> dict[sp.Key, int]:
     """Insert the new rows, update the changed ones; returns key -> id for every
     row of this build."""
     ids: dict[sp.Key, int] = {}
@@ -646,7 +646,7 @@ def write_reference(
 
     present = set(plan.present)
     ids = {key: row["id"] for key, row in existing.items() if key in present}
-    ids.update(_write_stations(db, plan, build_id))
+    ids.update(_write_stations(db, plan))
     station_ids = sorted(ids.values())
     _replace_children(db, station_ids)
     for chunk in chunks(station_ids):

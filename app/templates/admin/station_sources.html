@@ -124,9 +124,12 @@
 {% endblock %}
 
 {% block extra_scripts %}
+{# Data for the script travels as JSON in its own block, never as Jinja inside
+   JavaScript: the script below stays plain JS that a linter can parse. #}
+<script type="application/json" id="format-hints">{{ format_hints | tojson }}</script>
 <script type="module">
 const SP = globalThis.StationPanel;
-const FORMAT_HINTS = {{ format_hints | tojson }};
+const FORMAT_HINTS = JSON.parse(document.getElementById('format-hints').textContent);
 const TEXT_FIELDS = ['label', 'kind', 'format', 'acquisition', 'resolver_type', 'country_iso', 'operator',
   'licence', 'licence_url', 'access_expires_on', 'refresh_cadence', 'credential_id'];
 const FLAG_FIELDS = ['triggers_rebuild', 'enabled', 'source_key_unresolved'];

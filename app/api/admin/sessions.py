@@ -662,20 +662,8 @@ async def upload_to_session(
             size += len(chunk)
 
     # Verify the format matches what the user said. dispatch() can move it
-    # only if detect agrees. `detect` raises on a file it cannot classify (an
-    # unknown extension, a CSV that is neither SNCF stations nor MCT, a zip
-    # that is not one): that is the caller's mistake, so 400, not 500.
-    try:
-        detected = detect.detect(staged_path)
-    except (ValueError, zipfile.BadZipFile) as exc:
-        staged_path.unlink(missing_ok=True)
-        raise HTTPException(400, f"Detection failed: {exc}") from exc
-    if detected != declared_standard:
-        staged_path.unlink(missing_ok=True)
-        raise HTTPException(
-            400,
-            f"File looks like {detected!r}, but declared as {declared_standard!r}",
-        )
+    # only if detect agrees.
+    detected = _detected_kind(staged_path, declared_standard)
 
     # Optional: attach this upload to a configured provider (v0.1.37). The
     # file then lands at the provider's own slot (`<feed_id>.zip`) and the
@@ -899,6 +887,28 @@ def _read_gtfs_stops(zip_path: Path) -> list[tuple[str | None, float | None, flo
     except (KeyError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
         return out
     return out
+
+
+def _detected_kind(staged_path: Path, declared_standard: str) -> str:
+    """What the staged file is, or 400 (and the staged copy removed) when it is
+    not what the caller declared.
+
+    `detect` raises on a file it cannot classify (an unknown extension, a CSV
+    that is neither SNCF stations nor MCT) and `zipfile` on a zip that is not
+    one. Both are the caller's mistake: 400, not 500.
+    """
+    try:
+        detected = detect.detect(staged_path)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        staged_path.unlink(missing_ok=True)
+        raise HTTPException(400, f"Detection failed: {exc}") from exc
+    if detected != declared_standard:
+        staged_path.unlink(missing_ok=True)
+        raise HTTPException(
+            400,
+            f"File looks like {detected!r}, but declared as {declared_standard!r}",
+        )
+    return detected
 
 
 def _safe_filename(name: str) -> str:

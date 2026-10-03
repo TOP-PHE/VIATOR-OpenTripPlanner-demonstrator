@@ -111,8 +111,9 @@ async def test_receive_hashes_while_streaming_and_keep_moves_it(inbox: Path) -> 
 
 
 async def test_an_oversized_upload_leaves_nothing_behind(inbox: Path) -> None:
+    too_big = _upload(b"x" * 5000)
     with pytest.raises(station_store.UploadTooLarge):
-        await station_store.receive(_upload(b"x" * 5000), "CRD", max_bytes=4096)
+        await station_store.receive(too_big, "CRD", max_bytes=4096)
     assert list((inbox / "_stations" / "CRD" / "_incoming").iterdir()) == []
 
 
@@ -157,7 +158,7 @@ def test_reserved_inbox_folders_are_never_clean_up_candidates(tmp_path: Path) ->
 def test_the_reserved_names_cannot_be_session_ids() -> None:
     # A session id is a slug starting with a letter, so no session can ever
     # be shadowed by a reserved folder.
-    assert frozenset({"_stations", "_staging"}) == storage.INBOX_ROOT_RESERVED
+    assert sorted(storage.INBOX_ROOT_RESERVED) == ["_staging", "_stations"]
     assert all(name.startswith("_") for name in storage.INBOX_ROOT_RESERVED)
     assert station_store.STORE_DIRNAME in storage.INBOX_ROOT_RESERVED
 
@@ -477,14 +478,14 @@ def test_rebuild_now_queues_a_build_or_says_what_is_missing(
     monkeypatch.setattr(api.audit, "record", lambda _db, **kw: recorded.append(kw))
 
     _builds(monkeypatch, ["CRD: no file uploaded yet"])
+    db = _FakeDb()
     with pytest.raises(HTTPException) as exc:
-        api.queue_build(REQUEST, _FakeDb(), ACTOR)  # type: ignore[arg-type]
+        api.queue_build(REQUEST, db, ACTOR)  # type: ignore[arg-type]
     assert exc.value.status_code == 409
     assert exc.value.detail == "A build needs all five inputs: CRD: no file uploaded yet"
     assert recorded == []
 
     reasons = _builds(monkeypatch, [])
-    db = _FakeDb()
     out = api.queue_build(REQUEST, db, ACTOR)  # type: ignore[arg-type]
     assert (out.queued, out.note) == (True, "a station build is queued")
     assert reasons == ["requested by ops@example.org"]
@@ -540,11 +541,12 @@ async def test_session_upload_answers_400_when_detect_cannot_classify(
 ) -> None:
     session = SimpleNamespace(id="xb-test", config={}, state="created")
     db = SimpleNamespace(get=lambda _model, _sid: session)
+    upload = _upload(data, filename)
     with pytest.raises(HTTPException) as exc:
         await sessions_api.upload_to_session(
             "xb-test",
             "GTFS",
-            _upload(data, filename),
+            upload,
             REQUEST,  # type: ignore[arg-type]
             db,  # type: ignore[arg-type]
             ACTOR,  # type: ignore[arg-type]

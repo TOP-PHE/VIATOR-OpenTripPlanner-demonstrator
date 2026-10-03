@@ -33,6 +33,11 @@ def master(**overrides: str) -> dict[str, str]:
     return full(sf.MASTER, {**master_rows()[0], **overrides})
 
 
+def read_all(path: Path, fmt: str) -> list[dict[str, str]]:
+    """`read_rows` is a generator: nothing is read, or refused, until it is consumed."""
+    return list(sp.read_rows(path, fmt))
+
+
 def parsed_master() -> dict[sp.Key, sp.MasterRow]:
     rows = sp.parse_master(full(sf.MASTER, row) for row in master_rows())
     return {row.key: row for row in rows}
@@ -146,7 +151,7 @@ def test_read_rows_keeps_a_leading_zero_and_a_quoted_comma(tmp_path: Path) -> No
 def test_read_rows_refuses_a_file_of_another_shape(tmp_path: Path) -> None:
     paths = write_station_files(tmp_path)
     with pytest.raises(sf.StationFileError, match="missing columns"):
-        list(sp.read_rows(paths[sf.LINKS], sf.MASTER))
+        read_all(paths[sf.LINKS], sf.MASTER)
 
 
 def test_read_rows_refuses_a_row_with_more_cells_than_columns(tmp_path: Path) -> None:
@@ -155,7 +160,7 @@ def test_read_rows_refuses_a_row_with_more_cells_than_columns(tmp_path: Path) ->
     too_long = ",".join(["x"] * 37)  # an unquoted comma shifted everything right
     path.write_text(f"{header}\n{too_long}\n", encoding="utf-8-sig")
     with pytest.raises(sf.StationFileError, match="line 2: more cells than columns"):
-        list(sp.read_rows(path, sf.ERA_TELREF))
+        read_all(path, sf.ERA_TELREF)
 
 
 # ── the master: grain and refusals ─────────────────────────────────────
@@ -187,8 +192,9 @@ def test_the_same_plc_with_another_operational_point_is_not_a_repeat() -> None:
 
 
 def test_a_plc_that_is_not_seven_characters_is_refused() -> None:
+    rows = [master(plc="ZZ1", era_uopid="ZZ1")]
     with pytest.raises(sf.StationFileError, match=r"a PLC must be 7 characters: line 2 \('ZZ1'"):
-        sp.parse_master([master(plc="ZZ1", era_uopid="ZZ1")])
+        sp.parse_master(rows)
 
 
 def test_a_plc_is_validated_on_length_only() -> None:
@@ -199,8 +205,9 @@ def test_a_plc_is_validated_on_length_only() -> None:
 
 
 def test_a_crd_derived_row_without_its_licence_tag_is_refused() -> None:
+    untagged = [master(crd_source_tag="")]
     with pytest.raises(sf.StationFileError, match="carries no licence tag"):
-        sp.parse_master([master(crd_source_tag="")])
+        sp.parse_master(untagged)
     # An ERA-only row carries none, and that is not an error.
     (row,) = sp.parse_master([master(spine_source="ERA_only", crd_source_tag="")])
     assert row.fields["crd_source_tag"] is None

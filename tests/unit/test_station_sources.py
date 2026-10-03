@@ -62,7 +62,7 @@ def test_a_grant_turns_amber_ninety_days_before_it_ends() -> None:
 def test_the_five_offline_shapes_are_accepted_formats() -> None:
     assert set(sf.FILE_SHAPES) <= api.SOURCE_FORMATS
     assert {"trainline_csv", "offline_master_column", "other"} <= api.SOURCE_FORMATS
-    assert {"resolver", "url", "upload"} == api.SOURCE_ACQUISITIONS
+    assert sorted(api.SOURCE_ACQUISITIONS) == ["resolver", "upload", "url"]
     assert {"spine", "timetable", "registry", "merits_input", "crosscheck"} <= api.SOURCE_KINDS
 
 
@@ -266,12 +266,14 @@ def test_create_source(recorded: list[dict[str, Any]]) -> None:
 
 
 def test_create_source_refusals(recorded: list[dict[str, Any]]) -> None:
+    key_taken = _FakeDb(uuid.uuid4())
     with pytest.raises(HTTPException) as clash:
-        _create(_FakeDb(uuid.uuid4()))  # the key is taken
+        _create(key_taken)
     assert clash.value.status_code == 409
 
+    key_free = _FakeDb(None)
     with pytest.raises(HTTPException) as vocab:
-        _create(_FakeDb(None), kind="planet")
+        _create(key_free, kind="planet")
     assert vocab.value.status_code == 400
     assert "unknown kind" in vocab.value.detail
     assert recorded == []
@@ -327,13 +329,14 @@ def test_patch_that_changes_nothing_writes_no_audit_row(
 
 
 def test_patch_refusals(recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
     with pytest.raises(HTTPException) as blank:
-        _patch(_source(), monkeypatch, label=None, enabled=None)
+        _patch(source, monkeypatch, label=None, enabled=None)
     assert blank.value.status_code == 400
     assert "enabled, label" in blank.value.detail
 
     with pytest.raises(HTTPException) as vocab:
-        _patch(_source(), monkeypatch, acquisition="resolver")  # no resolver_type
+        _patch(source, monkeypatch, acquisition="resolver")  # no resolver_type
     assert vocab.value.status_code == 400
     assert recorded == []
 
@@ -362,8 +365,9 @@ def test_credential_id_must_be_a_uuid_of_an_existing_credential() -> None:
     with pytest.raises(HTTPException) as bad:
         api._resolve_credential_id(db, "not-a-uuid")  # type: ignore[arg-type]
     assert bad.value.status_code == 400
+    unknown = str(uuid.uuid4())
     with pytest.raises(HTTPException) as missing:
-        api._resolve_credential_id(db, str(uuid.uuid4()))  # type: ignore[arg-type]
+        api._resolve_credential_id(db, unknown)  # type: ignore[arg-type]
     assert missing.value.status_code == 404
 
 

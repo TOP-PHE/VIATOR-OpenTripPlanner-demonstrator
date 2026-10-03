@@ -28,7 +28,8 @@ _INCOMING = "_incoming"
 _CHUNK = 1024 * 1024
 
 # A source key becomes a folder name, so it is a closed alphabet: no slash, no dot.
-SOURCE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,63}$")
+# re.ASCII: without it `\w` would also accept accented letters and other scripts.
+SOURCE_KEY_RE = re.compile(r"^[A-Za-z]\w{1,63}$", re.ASCII)
 
 _FULL_DATE_RE = re.compile(r"(?<!\d)(\d{4})-?(\d{2})-?(\d{2})(?!\d)")
 _MONTH_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})(?!\d)")
