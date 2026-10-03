@@ -311,3 +311,22 @@ def test_pruning_old_builds_keeps_the_conversion_cache(
         (motis_root / name).mkdir(parents=True)
     worker._prune_old_motis_imports("eu19", keep=1)
     assert sorted(p.name for p in motis_root.iterdir()) == ["20261003-000000", "_netex"]
+
+
+def test_date_only_assignments_are_left_as_published(tmp_path: Path) -> None:
+    """SBB's calendar file assigns its public-holiday day types by `Date` only;
+    its journeys take their days from AvailabilityConditions. Left alone."""
+    sbb = """<ServiceCalendarFrame id="ch:1:SCF">
+      <dayTypes><DayType id="ch:1:DayType:Dreikoenigstag"/></dayTypes>
+      <dayTypeAssignments><DayTypeAssignment id="ch:1:DayTypeAssignment:1" order="1">
+        <Date>2026-01-06</Date><DayTypeRef ref="ch:1:DayType:Dreikoenigstag"/></DayTypeAssignment>
+      </dayTypeAssignments></ServiceCalendarFrame>"""
+    stats, _ = _convert(tmp_path, _doc(sbb))
+    assert stats is None
+
+
+def test_generated_ids_are_named_after_the_day_type(tmp_path: Path) -> None:
+    _, out = _convert(tmp_path, _doc())
+    xml = out.decode()
+    assert 'id="VIATOR:UicOperatingPeriod:SI:DT:weekdays"' in xml
+    assert 'id="VIATOR:DayTypeAssignment:SI:DT:weekdays"' in xml

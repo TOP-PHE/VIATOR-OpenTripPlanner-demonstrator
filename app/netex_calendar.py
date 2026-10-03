@@ -44,7 +44,7 @@ from defusedxml.ElementTree import ParseError
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 # Bumped whenever the output changes, so cached conversions are redone.
-CONVERTER_VERSION = 1
+CONVERTER_VERSION = 2
 
 _CHUNK = 8 * 1024 * 1024
 _FRAME_START_RE = re.compile(rb"<(?:([A-Za-z_][\w.-]*):)?ServiceCalendarFrame\b")
@@ -147,14 +147,18 @@ def _periods(frame: ET.Element, op_days: dict[str, date]) -> dict[str, list[date
 
 
 def _needs_conversion(frame: ET.Element) -> bool:
+    """True when an assignment points at something MOTIS cannot resolve: a dated
+    `OperatingDay`, or a plain `OperatingPeriod`. Frames whose assignments use
+    only `Date` (SBB's public-holiday day types; SBB journeys take their days
+    from `AvailabilityCondition`s instead) are left as published."""
     uic = {el.get("id") for el in frame.iter() if _local(el) == "UicOperatingPeriod"}
     for el in frame.iter():
         if _local(el) != "DayTypeAssignment":
             continue
-        if el.get("isAvailable") == "false" or _text(el, "isAvailable") == "false":
+        if _ref(el, "OperatingDayRef"):
             return True
         period = _ref(el, "OperatingPeriodRef")
-        if not period or period not in uic:
+        if period and period not in uic:
             return True
     return False
 
@@ -217,14 +221,15 @@ def _render(prefix: str, days_by_type: dict[str, set[date]]) -> tuple[str, str]:
     """(UicOperatingPeriod elements, dayTypeAssignments block)."""
     p = f"{prefix}:" if prefix else ""
     periods, assigns = [], []
-    for n, (dt, days) in enumerate(sorted(days_by_type.items()), start=1):
+    for dt, days in sorted(days_by_type.items()):
         if days:
             first, last = min(days), max(days)
             bits = "".join("1" if d in days else "0" for d in _days_between(first, last))
         else:  # referenced by journeys maybe; must exist or MOTIS drops the file
             first = last = date(2000, 1, 1)
             bits = "0"
-        pid = quoteattr(f"VIATOR:UicOperatingPeriod:{n}")
+        # Named after the DayType, so ids stay unique across frames and files.
+        pid = quoteattr(f"VIATOR:UicOperatingPeriod:{dt}")
         periods.append(
             f'<{p}UicOperatingPeriod version="1" id={pid}>'
             f"<{p}FromDate>{first.isoformat()}T00:00:00</{p}FromDate>"
@@ -232,7 +237,7 @@ def _render(prefix: str, days_by_type: dict[str, set[date]]) -> tuple[str, str]:
             f"<{p}ValidDayBits>{bits}</{p}ValidDayBits>"
             f"</{p}UicOperatingPeriod>"
         )
-        aid = quoteattr(f"VIATOR:DayTypeAssignment:{n}")
+        aid = quoteattr(f"VIATOR:DayTypeAssignment:{dt}")
         assigns.append(
             f'<{p}DayTypeAssignment version="1" id={aid} order="1">'
             f"<{p}OperatingPeriodRef ref={pid}/>"
