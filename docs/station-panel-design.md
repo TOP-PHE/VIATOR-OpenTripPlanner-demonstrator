@@ -328,6 +328,22 @@ CSV. The delta works identically on two CSV versions.
 
 **ERA**: the same view, read-only — operation types, national identifiers, RL100.
 
+As built (`app/api/master/station_registers.py`, `app/master/station_delta.py`):
+
+- Each list reads one version, by default the latest one whose rows are **loaded**. A version that
+  was uploaded and not yet imported is listed, marked as not loaded, and is not what the list
+  shows: the rows are written by the importer's extract stage, not by the upload.
+- The delta is computed on demand between any two loaded versions (`/{register}/delta`), the two
+  most recent by default, with the "moved" threshold as a parameter (100 m by default). It
+  compares locations, not validity periods: for CRD, the row with the latest start of validity
+  stands for its PLC.
+- **`renumbered` is inferred**, not read: `crd_location` and `era_operational_point` keep no
+  "this code replaces that one" column, so a removed and a created location are paired only when
+  they carry the same name at the same place. It is a reading aid; the reference's own
+  `previous_plc` and `station_ref_alias` remain the record of a renumbering.
+- The licence banner is the `licence` of the register's source, so it is there before any file is
+  uploaded. `rl100` on the ERA tab is empty in step 1: the telref extract has no such column.
+
 ### C. Trainline codes — `/admin/stations/trainline`
 
 Today's panel, relabelled as an input, with a header saying what it is for: the MERITS code when a
@@ -730,6 +746,14 @@ corrected; this table is the record.
 | a station absent from a newer master | not addressed | kept, untouched, recognisable by `last_built_build_id` |
 | `previous_plc` → one `station_ref_alias` row | two operational points of one PLC carry the same `previous_plc`, and `UNIQUE (alias_plc, build_id)` allows one | one alias per old PLC, the first station in key order; collisions are counted |
 | a flag payload that is a PLC sets `related_station_id` | a PLC can carry several operational points | the one whose operational-point id is the PLC itself, else the first in byte order |
+
+### Screens
+
+| Version 2 said | What is true | As built |
+|---|---|---|
+| the delta lists what was "renumbered" | neither register table keeps a column saying one code replaces another | inferred: a removed and a created location with the same name at the same place, each paired once |
+| `era_operational_point.rl100` | the telref extract's 36 columns have no RL100 | the column stays NULL in step 1 |
+| screen B is two lists | a CRD PLC has one row per validity period | the lists show every row; the delta takes the latest validity as the PLC's row |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:
 `warnings`, `n_issues`, `n_warnings`, `review_links`, `nap_station_ids`, `best_match_method`,

@@ -7,8 +7,220 @@
 
 <h1>Infrastructure registers</h1>
 <p class="sp-lead">
-  The two registers the station reference is built on: the CRD primary locations and the ERA
-  operational points, each as its latest uploaded version carries them.
+  The two registers the station reference is built on, each as its latest loaded version carries
+  it. Both are read-only here: a register changes when a new version of its source is uploaded
+  {% if current_user.role == 'platform_admin' %}on <a href="/admin/stations/sources">Sources and integration</a>{% else %}by a platform admin{% endif %}.
 </p>
-<div class="sp-banner note">This screen is not built yet: the register lists arrive with the next change.</div>
+
+<div class="sp-tablist">
+  <button type="button" class="secondary" data-register="crd" aria-pressed="true">CRD primary locations</button>
+  <button type="button" class="secondary" data-register="era" aria-pressed="false">ERA operational points</button>
+</div>
+
+<div id="licence"></div>
+<div class="sp-card" id="version-card">Loading…</div>
+
+<div class="sp-card" id="delta-card" hidden>
+  <h2>What changed between two versions</h2>
+  <form id="delta-form" class="sp-filters">
+    <label>From <select name="older"></select></label>
+    <label>To <select name="newer"></select></label>
+    <label>Moved further than <input type="number" name="threshold_m" value="100" min="0" max="100000" step="any" style="width: 6rem"> m</label>
+    <button type="submit">Compare</button>
+  </form>
+  <div id="delta"></div>
+</div>
+
+<form id="filters" class="sp-filters">
+  <label>Search <input type="search" name="q" placeholder="name, PLC or code" style="min-width: 16rem"></label>
+  <label>Country <input type="text" name="country" maxlength="2" placeholder="ISO-2" style="width: 5rem; text-transform: uppercase"></label>
+  <button type="submit">Search</button>
+  <button type="button" class="secondary" id="clear">Clear</button>
+</form>
+
+<div class="sp-scroll">
+  <table>
+    <thead id="reg-head"></thead>
+    <tbody id="reg-body"><tr><td>Loading…</td></tr></tbody>
+  </table>
+</div>
+<div id="pager" class="sp-pager"></div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+const SP = globalThis.StationPanel;
+const API = '/api/master/station-registers/';
+const PAGE_SIZE = 50;
+const DASH = '<span class="sp-muted">—</span>';
+const DELTA_KINDS = ['created', 'removed', 'renumbered', 'renamed', 'moved'];
+const NOTES = {
+  crd: 'The server does not parse the CRD XML export yet: the extract is produced offline and uploaded as a CSV. The comparison below works the same on two CSV versions.',
+  era: 'Read-only: operation types, national identifiers and positions as the ERA register publishes them.',
+};
+const HEADS = {
+  crd: ['PLC', 'Name', 'Position', 'Passenger / freight', 'Country', 'Validity', 'Subsidiary codes'],
+  era: ['PLC', 'Operational point', 'Name', 'Type', 'Country', 'Position', 'RL100'],
+};
+
+let register = 'crd';
+let page = 0;
+let info = null;
+
+const filters = document.getElementById('filters');
+const deltaForm = document.getElementById('delta-form');
+
+function text(value) {
+  return value === null || value === undefined || value === '' ? DASH : SP.esc(value);
+}
+
+function position(row) {
+  return row.lat === null || row.lon === null ? DASH : row.lat.toFixed(5) + ', ' + row.lon.toFixed(5);
+}
+
+function subsidiaries(row) {
+  if (!row.subsidiaries.length) return DASH;
+  return row.subsidiaries.map((s) =>
+    '<span class="sp-pill" title="' + SP.esc(s.type) + '">' + SP.esc(s.type.replace('crd_', '')) + '</span> <span class="sp-code">' + SP.esc(s.code) + '</span>').join('<br>');
+}
+
+function crdRow(r) {
+  return '<tr><td class="sp-code">' + SP.esc(r.plc) + '</td><td>' + text(r.name) + '</td><td class="sp-code">' + position(r) + '</td>' +
+    '<td>' + text(r.passenger_flag) + ' / ' + text(r.freight_flag) + '</td>' +
+    '<td>' + text(r.country) + ' <span class="sp-code sp-muted">' + SP.esc(r.location_code || '') + '</span></td>' +
+    '<td>' + text(r.start_validity) + ' → ' + text(r.end_validity) + '</td><td>' + subsidiaries(r) + '</td></tr>';
+}
+
+function eraRow(r) {
+  return '<tr><td class="sp-code">' + SP.esc(r.plc) + '</td><td class="sp-code">' + SP.esc(r.uopid) + '</td><td>' + text(r.name) + '</td>' +
+    '<td>' + text(r.op_type) + '</td><td>' + text(r.iso2) + '</td><td class="sp-code">' + position(r) + '</td><td>' + text(r.rl100) + '</td></tr>';
+}
+
+const ROWS = {crd: crdRow, era: eraRow};
+
+function versionLabel(v) {
+  return (v.as_of || SP.fmtDate(v.acquired_at)) + ' · ' + SP.shortSha(v.sha256);
+}
+
+function renderLicence() {
+  const box = document.getElementById('licence');
+  const licensed = info.sources.filter((s) => s.licence);
+  box.innerHTML = licensed.map((s) =>
+    '<div class="sp-banner licence"><strong>Licence — ' + SP.esc(s.label) + '.</strong> ' + SP.esc(s.licence) +
+    ' These rows stay inside VIATOR: they are not to be exported, published or copied elsewhere.</div>').join('');
+}
+
+function renderVersion() {
+  const card = document.getElementById('version-card');
+  const current = info.versions.find((v) => v.id === info.current);
+  const note = '<p class="sp-muted" style="margin: 0.5rem 0 0; font-size: 0.85rem">' + NOTES[register] + '</p>';
+  if (!current) {
+    const waiting = info.versions.length ? ' A version is uploaded but not imported yet.' : '';
+    card.innerHTML = '<strong>No version of this register is loaded.</strong>' + waiting + note;
+    return;
+  }
+  const rows = (current.stats || {}).rows;
+  card.innerHTML =
+    '<strong>' + SP.esc(current.source_key) + '</strong> · extracted ' + SP.esc(current.as_of || 'on an unstated date') +
+    ' · uploaded ' + SP.fmtDate(current.acquired_at) + ' UTC<br>' +
+    '<span class="sp-muted">Fingerprint </span><span class="sp-code" title="' + SP.esc(current.sha256) + '">' + SP.shortSha(current.sha256) + '</span>' +
+    ' · <span class="sp-muted">file </span>' + SP.esc(current.filename) + ' (' + SP.fmtBytes(current.bytes) + ')' +
+    ' · <span id="row-count">' + (rows === undefined ? '' : SP.fmtInt(rows) + ' rows in the file') + '</span>' + note;
+}
+
+function renderDeltaForm() {
+  const loaded = info.versions.filter((v) => v.loaded);
+  document.getElementById('delta-card').hidden = loaded.length < 2;
+  document.getElementById('delta').innerHTML = '';
+  if (loaded.length < 2) return;
+  for (const name of ['older', 'newer']) {
+    const select = deltaForm.elements[name];
+    select.length = 0;
+    for (const v of loaded) select.add(new Option(versionLabel(v), v.id));
+  }
+  deltaForm.elements.newer.value = loaded[0].id;
+  deltaForm.elements.older.value = loaded[1].id;
+}
+
+function deltaItem(kind, item) {
+  if (kind === 'created' || kind === 'removed') {
+    return '<span class="sp-code">' + SP.esc(item.key) + '</span> ' + SP.esc(item.name || '');
+  }
+  const extra = kind === 'moved' ? ' <span class="sp-muted">' + SP.fmtInt(item.distance_m) + ' m</span>' : '';
+  return '<span class="sp-code">' + SP.esc(item.old.key) + '</span> ' + SP.esc(item.old.name || '') + ' → ' +
+    '<span class="sp-code">' + SP.esc(item.new.key) + '</span> ' + SP.esc(item.new.name || '') + extra;
+}
+
+function deltaSection(kind, data) {
+  const count = data.counts[kind];
+  if (!count) return '';
+  const more = data.truncated.includes(kind) ? '<li class="sp-muted">… and ' + SP.fmtInt(count - data.limit) + ' more</li>' : '';
+  return '<details><summary><strong>' + SP.fmtInt(count) + '</strong> ' + kind + '</summary><ul>' +
+    data[kind].map((item) => '<li>' + deltaItem(kind, item) + '</li>').join('') + more + '</ul></details>';
+}
+
+async function compare(event) {
+  event.preventDefault();
+  const params = {older: deltaForm.elements.older.value, newer: deltaForm.elements.newer.value, threshold_m: deltaForm.elements.threshold_m.value};
+  try {
+    const {data} = await SP.getJson(API + register + '/delta?' + SP.query(params));
+    const sections = DELTA_KINDS.map((kind) => deltaSection(kind, data)).join('');
+    document.getElementById('delta').innerHTML =
+      (sections || '<p><em>Nothing changed between these two versions.</em></p>') +
+      '<p class="sp-muted" style="font-size: 0.85rem">' + SP.fmtInt(data.counts.unchanged) + ' unchanged. "Renumbered" pairs a removed and a created location with the same name at the same place.</p>';
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
+}
+
+async function load(toPage) {
+  page = toPage;
+  const data = new FormData(filters);
+  const params = {q: (data.get('q') || '').trim(), country: (data.get('country') || '').trim(), page, size: PAGE_SIZE};
+  const body = document.getElementById('reg-body');
+  const columns = HEADS[register].length;
+  if (!info.current) {
+    body.innerHTML = '<tr><td colspan="' + columns + '"><em>Nothing to show yet.</em></td></tr>';
+    document.getElementById('pager').innerHTML = '';
+    return;
+  }
+  try {
+    const {data: rows, headers} = await SP.getJson(API + register + '?' + SP.query(params));
+    body.innerHTML = rows.length
+      ? rows.map(ROWS[register]).join('')
+      : '<tr><td colspan="' + columns + '"><em>No row matches.</em></td></tr>';
+    SP.renderPager(document.getElementById('pager'), page, PAGE_SIZE, SP.totalOf(headers), load);
+  } catch (err) {
+    SP.toast('error', 'Could not load the register: ' + err.message);
+  }
+}
+
+async function show(name) {
+  register = name;
+  for (const tab of document.querySelectorAll('[data-register]')) {
+    tab.setAttribute('aria-pressed', String(tab.dataset.register === name));
+  }
+  document.getElementById('reg-head').innerHTML =
+    '<tr>' + HEADS[name].map((title) => '<th scope="col">' + title + '</th>').join('') + '</tr>';
+  try {
+    const {data} = await SP.getJson(API + name + '/versions');
+    info = data;
+    renderLicence();
+    renderVersion();
+    renderDeltaForm();
+    await load(0);
+  } catch (err) {
+    SP.toast('error', 'Could not load the register: ' + err.message);
+  }
+}
+
+for (const tab of document.querySelectorAll('[data-register]')) {
+  tab.addEventListener('click', () => show(tab.dataset.register));
+}
+filters.addEventListener('submit', (event) => { event.preventDefault(); load(0); });
+document.getElementById('clear').addEventListener('click', () => { filters.reset(); load(0); });
+deltaForm.addEventListener('submit', compare);
+
+await show('crd');
+</script>
 {% endblock %}

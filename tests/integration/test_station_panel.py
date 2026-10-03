@@ -20,7 +20,13 @@ from sqlalchemy.exc import OperationalError
 
 from alembic import command
 from app.master import station_files as sf
-from tests.station_fixtures import STATION_FILE_SET, csv_bytes, master_rows, station_file
+from tests.station_fixtures import (
+    STATION_FILE_SET,
+    crd_location_rows,
+    csv_bytes,
+    master_rows,
+    station_file,
+)
 
 # Not a real secret — the bootstrap token used only by these fixtures.
 _BOOTSTRAP = "test-bootstrap-token"
@@ -1185,3 +1191,186 @@ def test_the_reference_is_open_to_both_working_roles(
         page = client.get("/admin/stations/reference/1", headers=headers)
         assert page.status_code == 200
         assert 'data-station-id="1"' in page.text
+
+
+# ───────────────────── unit 7: screen B, the registers ─────────────────────
+
+REG = "/api/master/station-registers"
+
+REGISTER_ROUTES = [
+    ("GET", f"{REG}/crd"),
+    ("GET", f"{REG}/era"),
+    ("GET", f"{REG}/crd/versions"),
+    ("GET", f"{REG}/era/delta"),
+]
+
+
+def test_the_crd_list_reads_the_latest_loaded_version(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(f"{REG}/crd", headers=content_manager)
+    assert r.status_code == 200, r.text
+    assert r.headers["X-Total-Count"] == "3"
+    assert r.headers["X-Version-Id"] == built["CRD"]["version"]["id"]
+    rows = r.json()
+    assert [row["plc"] for row in rows] == ["ZZ00001", "ZZ00002", "ZZ00003"]
+    central = rows[0]
+    assert (central["country"], central["location_code"]) == ("ZZ", "00001")
+    assert (central["start_validity"], central["end_validity"]) == ("2019-12-15", None)
+    assert central["subsidiaries"] == [
+        {"type": "crd_dium_codes", "code": "990001"},
+        {"type": "crd_rl100", "code": "ZEXC"},
+        {"type": "crd_sncf_codes", "code": "99001"},
+        {"type": "crd_sncf_codes", "code": "99002"},
+    ]
+    assert rows[1]["subsidiaries"] == []
+
+
+def test_the_era_list_and_the_register_filters(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(f"{REG}/era", headers=content_manager)
+    assert r.headers["X-Total-Count"] == "5"
+    assert r.headers["X-Version-Id"] == built["ERA_TELREF"]["version"]["id"]
+    assert [(row["plc"], row["uopid"]) for row in r.json()][2:4] == [
+        ("ZZ00003", "ZZOP03A"),
+        ("ZZ00003", "ZZOP03B"),
+    ]
+    assert r.json()[0]["op_type"] == "station"
+
+    def plcs(register: str, **params: object) -> list[str]:
+        found = client.get(f"{REG}/{register}", headers=content_manager, params=params)
+        assert found.status_code == 200, found.text
+        return [row["plc"] for row in found.json()]
+
+    assert plcs("crd", q="sampl") == ["ZZ00002"]
+    assert plcs("crd", q="00003") == ["ZZ00003"]  # by PLC substring and by CRD code
+    assert plcs("crd", country="zz") == ["ZZ00001", "ZZ00002", "ZZ00003"]
+    assert plcs("crd", country="FR") == []
+    assert plcs("era", q="ZZOP03B") == ["ZZ00003"]  # by operational point id
+    assert plcs("era", q="halt") == ["ZZ00004"]
+    paged = client.get(f"{REG}/era", headers=content_manager, params={"size": 2, "page": 2})
+    assert paged.headers["X-Total-Count"] == "5"
+    assert [row["plc"] for row in paged.json()] == ["ZZ00004"]
+    assert client.get(f"{REG}/gtfs", headers=content_manager).status_code == 422
+
+
+def test_register_versions_carry_the_licence_of_the_source(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    body = client.get(f"{REG}/crd/versions", headers=content_manager).json()
+    assert body["current"] == built["CRD"]["version"]["id"]
+    (version,) = body["versions"]
+    assert version["loaded"] is True
+    assert version["as_of"] == "2026-09-01"  # read off crd_locations_2026-09.csv
+    assert version["sha256"] == built["CRD"]["version"]["sha256"]
+    assert version["stats"]["rows"] == 5
+    (source,) = body["sources"]
+    assert source["key"] == "CRD"
+    assert "RNE licence" in source["licence"]  # what the licence banner shows
+
+    era = client.get(f"{REG}/era/versions", headers=content_manager).json()
+    assert era["sources"][0]["licence"] is None
+
+
+def test_a_register_before_any_import(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str], inbox: Path
+) -> None:
+    assert client.get(f"{REG}/crd", headers=content_manager).status_code == 404
+    empty = client.get(f"{REG}/crd/versions", headers=content_manager).json()
+    assert (empty["current"], empty["versions"]) == (None, [])
+    assert empty["sources"][0]["key"] == "CRD"  # the banner does not wait for a file
+
+    # Uploaded, not imported yet: listed, and marked as not loaded.
+    filename, content = station_file("CRD")
+    _upload(client, admin, "CRD", content, filename).raise_for_status()
+    waiting = client.get(f"{REG}/crd/versions", headers=content_manager).json()
+    assert waiting["current"] is None
+    assert [v["loaded"] for v in waiting["versions"]] == [False]
+    assert client.get(f"{REG}/crd", headers=content_manager).status_code == 404
+    assert client.get(f"{REG}/crd/delta", headers=content_manager).status_code == 409
+
+
+def test_the_delta_between_two_crd_versions(
+    client: TestClient,
+    admin: dict[str, str],
+    content_manager: dict[str, str],
+    built: dict[str, dict],
+) -> None:
+    from app.master import station_import
+
+    # One loaded version: nothing to compare yet.
+    assert client.get(f"{REG}/crd/delta", headers=content_manager).status_code == 409
+
+    rows = crd_location_rows()
+    rows[0] = {**rows[0], "name": "Exampleville Central Station"}  # renamed
+    # Sampleton keeps its name and place and gets a new code: renumbered.
+    rows[1] = {**rows[1], "plc": "ZZ00012", "uopid": "ZZ00012", "crd_location_code": "00012"}
+    rows[2] = {**rows[2], "lat": "50.21"}  # moved by about 1.1 km
+    rows[3] = {**rows[3], "lat": "50.21"}
+    newville = {"plc": "ZZ00007", "uopid": "ZZ00007", "name": "Newville", "lat": "50.7"}
+    rows.append({**rows[0], **newville, "lon": "4.7", "crd_location_code": "00007"})  # created
+    filename, content = station_file("CRD", rows)
+    second = _upload(client, admin, "CRD", content, filename.replace("09", "10"))
+    assert second.status_code == 201, second.text
+    output, success = station_import.run_build()
+    assert success, output
+
+    r = client.get(f"{REG}/crd/delta", headers=content_manager)
+    assert r.status_code == 200, r.text
+    delta = r.json()
+    assert delta["older"] == built["CRD"]["version"]["id"]
+    assert delta["newer"] == second.json()["version"]["id"]
+    assert delta["counts"] == {
+        "created": 1,
+        "removed": 0,
+        "renamed": 1,
+        "moved": 1,
+        "renumbered": 1,
+        "unchanged": 0,
+    }
+    assert [c["key"] for c in delta["created"]] == ["ZZ00007"]
+    assert delta["renamed"][0]["new"]["name"] == "Exampleville Central Station"
+    assert delta["moved"][0]["old"]["key"] == "ZZ00003"
+    assert 1000 < delta["moved"][0]["distance_m"] < 1200
+    renumbered = delta["renumbered"][0]
+    assert (renumbered["old"]["key"], renumbered["new"]["key"]) == ("ZZ00002", "ZZ00012")
+    assert delta["truncated"] == []
+
+    # The list now reads the newer version; the older one is still there to compare.
+    assert client.get(f"{REG}/crd", headers=content_manager).headers["X-Total-Count"] == "4"
+    older = client.get(f"{REG}/crd", headers=content_manager, params={"version_id": delta["older"]})
+    assert older.headers["X-Total-Count"] == "3"
+
+    # A higher threshold: the yard no longer counts as moved.
+    loose = client.get(f"{REG}/crd/delta", headers=content_manager, params={"threshold_m": 5000})
+    assert loose.json()["counts"]["moved"] == 0
+    assert loose.json()["counts"]["unchanged"] == 1
+
+    # Reversed, a created location is a removed one.
+    reverse = client.get(
+        f"{REG}/crd/delta",
+        headers=content_manager,
+        params={"older": delta["newer"], "newer": delta["older"]},
+    )
+    assert reverse.json()["counts"]["removed"] == 1
+    unknown = client.get(
+        f"{REG}/crd/delta", headers=content_manager, params={"older": str(uuid.uuid4())}
+    )
+    assert unknown.status_code == 404
+
+
+@pytest.mark.parametrize(("method", "path"), REGISTER_ROUTES)
+def test_every_register_route_refuses_an_end_user_and_an_anonymous_caller(
+    client: TestClient, end_user: dict[str, str], method: str, path: str
+) -> None:
+    assert client.request(method, path).status_code == 401
+    assert client.request(method, path, headers=end_user).status_code == 403
+
+
+def test_the_registers_are_open_to_both_working_roles(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str]
+) -> None:
+    for headers in (admin, content_manager):
+        assert client.get(f"{REG}/crd/versions", headers=headers).status_code == 200
+        assert client.get(f"{REG}/era/versions", headers=headers).status_code == 200
