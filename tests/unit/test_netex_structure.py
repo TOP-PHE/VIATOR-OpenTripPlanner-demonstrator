@@ -262,3 +262,54 @@ def test_the_page_shows_structure_findings() -> None:
     )
     assert "function feedStructureHTML(st)" in html
     assert "return base + feedStructureHTML(s.structure);" in html
+
+
+# ── rules from the nigiri gap analysis ──────────────────────────────
+
+
+def _messages(elements: dict[str, int], prefixes: dict[str, int] | None = None) -> list[str]:
+    base = {"ServiceJourney": 1, "UicOperatingPeriod": 1, "DayTypeAssignment": 1}
+    fp = _fp({**base, **elements})
+    fp.prefixes = prefixes or {}
+    return assess(fp, None).messages
+
+
+def test_journey_types_motis_does_not_read_are_flagged() -> None:
+    msgs = _messages({"DatedServiceJourney": 3, "TemplateServiceJourney": 1})
+    assert any(
+        m.startswith("DatedServiceJourney (x3): DatedServiceJourney: not read") for m in msgs
+    )
+    assert any(m.startswith("TemplateServiceJourney (x1)") for m in msgs)
+
+
+def test_interchanges_warn_about_stay_seated_and_the_import_abort() -> None:
+    msgs = _messages({"ServiceJourneyInterchange": 2})
+    assert any("missing StaySeated as true" in m and "aborts the whole import" in m for m in msgs)
+
+
+def test_references_without_their_target_in_the_file_are_flagged() -> None:
+    msgs = _messages({"TrainNumberRef": 4, "OperatorRef": 2, "Line": 1})
+    assert any(m.startswith("TrainNumberRef without any TrainNumber") for m in msgs)
+    assert any(m.startswith("OperatorRef but no Operator") for m in msgs)
+    assert any(m.startswith("lines without additionalOperators") for m in msgs)
+    ok = _messages({"TrainNumberRef": 4, "TrainNumber": 4, "OperatorRef": 2, "Operator": 1})
+    assert not any("TrainNumber" in m or "Operator" in m for m in ok)
+
+
+def test_product_categories_outside_a_value_set_are_flagged() -> None:
+    assert any("outside a ValueSet" in m for m in _messages({"TypeOfProductCategory": 2}))
+    assert not any(
+        "outside a ValueSet" in m for m in _messages({"TypeOfProductCategory": 2, "ValueSet": 1})
+    )
+
+
+def test_prefixed_elements_are_flagged_except_gml(tmp_path: Path) -> None:
+    body = (
+        b'<netex:PublicationDelivery xmlns:netex="x" xmlns:gml="g"><netex:ServiceJourney/>'
+        b"<gml:pos>1 2</gml:pos></netex:PublicationDelivery>"
+    )
+    fp = fingerprint(_zip(tmp_path, {"a.xml": body}))
+    assert fp.prefixes == {"gml": 1, "netex": 2}
+    msgs = assess(fp, None).messages
+    assert "2 elements written with prefix 'netex:': MOTIS reads unprefixed names" in msgs
+    assert not any("'gml:'" in m for m in msgs)

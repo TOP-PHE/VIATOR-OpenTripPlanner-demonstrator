@@ -54,20 +54,123 @@ class Rule:
     message: str
 
 
-# Measured against nigiri's NeTEx loader at the commits MOTIS 2.10.2 and
-# 2.11.3 pin (docs: the NeTEx calendar note). Extend as gaps are confirmed.
+# Measured against nigiri's NeTEx loader (src/loader/netex/load_timetable.cc)
+# at the commit MOTIS 2.10.2 pins; identical for these points at the 2.11.3
+# commit. `nigiri:N` = line N there. Each element is a valid NeTEx form
+# (NeTEx-CEN XSD v2.0) that the loader does not read, or reads in a way that
+# can drop the whole file: any unresolved reference throws, and the file is
+# discarded with one `ERROR:` line on stderr (nigiri:1249).
 RULES: tuple[Rule, ...] = (
     Rule(
         "OperatingDayRef",
         WARN,
-        "calendar by dated OperatingDay: MOTIS cannot read it, VIATOR converts it at build",
+        "calendar by dated OperatingDay: not read by MOTIS (nigiri:684-689), converted by VIATOR at build",
     ),
     Rule(
         "OperatingPeriod",
         WARN,
-        "plain OperatingPeriod (no ValidDayBits): MOTIS cannot read it, VIATOR converts it at build",
+        "plain OperatingPeriod: not read by MOTIS (nigiri:649), converted by VIATOR at build",
+    ),
+    Rule(
+        "FromOperatingDayRef",
+        WARN,
+        "period bounded by OperatingDay refs: MOTIS needs FromDate/ToDate (nigiri:653), file may be dropped",
+    ),
+    Rule(
+        "ValidBetween",
+        WARN,
+        "validity by ValidBetween: not read by MOTIS (nigiri:961-969), those courses may run every day",
+    ),
+    Rule(
+        "DatedServiceJourney",
+        WARN,
+        "DatedServiceJourney: not read by MOTIS (nigiri:940 reads ServiceJourney only)",
+    ),
+    Rule(
+        "TemplateServiceJourney",
+        WARN,
+        "TemplateServiceJourney (frequency-based): not read by MOTIS (nigiri:940)",
+    ),
+    Rule("VehicleJourney", WARN, "VehicleJourney: not read by MOTIS (nigiri:940)"),
+    Rule(
+        "NormalDatedVehicleJourney",
+        WARN,
+        "NormalDatedVehicleJourney: not read by MOTIS (nigiri:940)",
+    ),
+    Rule("SpecialService", WARN, "SpecialService: not read by MOTIS (nigiri:940)"),
+    Rule(
+        "JourneyPattern",
+        WARN,
+        "plain JourneyPattern: MOTIS reads ServiceJourneyPattern only (nigiri:814), file may be dropped",
+    ),
+    Rule(
+        "TimingPointInJourneyPattern",
+        WARN,
+        "TimingPointInJourneyPattern: not matched by MOTIS (nigiri:819, 1023), file may be dropped",
+    ),
+    Rule(
+        "FlexibleLine",
+        WARN,
+        "FlexibleLine: not loaded by MOTIS (nigiri:470), references to it drop the file",
+    ),
+    Rule("GeneralFrame", WARN, "GeneralFrame: nothing inside it is read by MOTIS"),
+    Rule("TrainStopAssignment", WARN, "TrainStopAssignment: not read by MOTIS (nigiri:605)"),
+    Rule(
+        "vehicleJourneyStopAssignments",
+        WARN,
+        "stop assignments on journeys: not read by MOTIS (nigiri:605)",
+    ),
+    Rule(
+        "ServiceJourneyInterchange",
+        WARN,
+        "interchanges: MOTIS treats a missing StaySeated as true (XSD default false, nigiri:874); "
+        "a link to a course it did not load aborts the whole import (nigiri:1602)",
+    ),
+    Rule(
+        "JourneyMeeting",
+        WARN,
+        "JourneyMeeting: MOTIS turns every meeting into a stay-seated link (nigiri:869-874)",
     ),
 )
+
+
+def _ratio_rules(el: dict[str, int]) -> list[tuple[str, str]]:
+    """Rules that compare two counts in the same file."""
+    out = []
+    if el.get("TrainNumberRef") and not el.get("TrainNumber"):
+        out.append(
+            (
+                WARN,
+                "TrainNumberRef without any TrainNumber in the file: "
+                "MOTIS looks them up in the same file only (nigiri:952), file may be dropped",
+            )
+        )
+    if el.get("TypeOfProductCategory") and not el.get("ValueSet"):
+        out.append(
+            (
+                WARN,
+                "TypeOfProductCategory outside a ValueSet: MOTIS reads "
+                "typesOfValue/ValueSet/values only (nigiri:423), file may be dropped",
+            )
+        )
+    for ref, target in (("OperatorRef", "Operator"), ("AuthorityRef", "Authority")):
+        if el.get(ref) and not el.get(target):
+            out.append(
+                (
+                    WARN,
+                    f"{ref} but no {target} in the file: MOTIS resolves it only in the same "
+                    "file or a declared base file (nigiri:88-106, 1278), file may be dropped",
+                )
+            )
+    if el.get("Line") and not el.get("additionalOperators"):
+        out.append(
+            (
+                WARN,
+                "lines without additionalOperators: MOTIS reads the line operator "
+                "only there (nigiri:483), lines get an empty operator",
+            )
+        )
+    return out
 
 
 @dataclass
@@ -76,6 +179,8 @@ class Fingerprint:
     header: dict[str, str] = field(default_factory=dict)
     xml_files: int = 0
     elements: dict[str, int] = field(default_factory=dict)
+    # Element start tags written with a namespace prefix, by prefix.
+    prefixes: dict[str, int] = field(default_factory=dict)
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -83,6 +188,7 @@ class Fingerprint:
             "header": self.header,
             "xml_files": self.xml_files,
             "elements": self.elements,
+            "prefixes": self.prefixes,
         }
 
 
@@ -148,9 +254,14 @@ def fingerprint(path: Path) -> Fingerprint:
             fp.header = _header(_count(f, counts))
         fp.xml_files = 1
     merged: collections.Counter[str] = collections.Counter()
+    prefixes: collections.Counter[str] = collections.Counter()
     for raw, n in counts.items():
-        merged[raw.decode("ascii", "replace").rsplit(":", 1)[-1]] += n
+        prefix, _, name = raw.decode("ascii", "replace").rpartition(":")
+        merged[name] += n
+        if prefix:
+            prefixes[prefix] += n
     fp.elements = dict(sorted(merged.items()))
+    fp.prefixes = dict(sorted(prefixes.items()))
     return fp
 
 
@@ -175,6 +286,15 @@ def assess(current: Fingerprint, previous: dict[str, Any] | None) -> Assessment:
     for rule in RULES:
         if el.get(rule.element):
             result.add(rule.level, f"{rule.element} (x{el[rule.element]}): {rule.message}")
+    for level, message in _ratio_rules(el):
+        result.add(level, message)
+    # gml:pos is read with its literal prefix (nigiri:156-171); any other
+    # prefixed element is invisible to the loader's unprefixed XPaths.
+    for prefix, n in current.prefixes.items():
+        if prefix != "gml":
+            result.add(
+                WARN, f"{n} elements written with prefix '{prefix}:': MOTIS reads unprefixed names"
+            )
 
     if not previous or previous.get("version") != FINGERPRINT_VERSION:
         return result
