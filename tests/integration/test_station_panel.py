@@ -854,3 +854,334 @@ def test_the_nav_group_shows_the_fifth_entry_to_platform_admins_only(
     assert as_admin.count('href="/admin/stations/sources"') == 2  # nav group and tab bar
     assert 'href="/admin/stations/sources"' not in as_manager
     assert as_manager.count('href="/admin/stations/nap"') == 2
+
+
+# ───────────────────── unit 6: screen D, the reference ─────────────────────
+
+REF = "/api/master/station-ref"
+
+# Every JSON route of the reference router: (method, path).
+REFERENCE_ROUTES = [
+    ("GET", REF),
+    ("GET", f"{REF}/summary"),
+    ("GET", f"{REF}/1"),
+    ("POST", f"{REF}/1/overrides"),
+    ("DELETE", f"{REF}/1/overrides/1"),
+    ("POST", f"{REF}/complexes"),
+    ("DELETE", f"{REF}/complexes/1"),
+]
+
+
+def _station_id(plc: str, uopid: str | None = None) -> int:
+    return int(
+        _scalar(
+            "SELECT id FROM station_ref WHERE plc = :plc AND era_uopid = :uopid",
+            plc=plc,
+            uopid=uopid or plc,
+        )
+    )
+
+
+def test_the_reference_list_shows_one_row_per_plc_by_default(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(REF, headers=content_manager)
+    assert r.status_code == 200, r.text
+    assert r.headers["X-Total-Count"] == "4"  # four PLCs, five operational points
+    rows = {row["plc"]: row for row in r.json()}
+    assert list(rows) == ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00004"]
+
+    yard = rows["ZZ00003"]
+    # era_uopid is half the key, and the badge says the PLC is more than this row.
+    assert yard["era_uopid"] == "ZZOP03A"
+    assert yard["op_badge"] == "PLC carries 2 operational points, 140 m apart"
+    assert yard["is_current"] is False
+    assert rows["ZZ00001"]["op_badge"] is None
+
+    central = rows["ZZ00001"]
+    # One column per provider, pivoted after the page was cut.
+    assert central["codes"] == {
+        "nap_CH_SBB": ["9900001", "9900001:0:1"],
+        "nap_ES_regional": ["ZZ_FEED#MC"],
+    }
+    assert central["flags"] == ["candidate_displaced_to", "plc_kind_national"]
+    assert (central["uic_merits"], central["uic_merits_origin"]) == (
+        "9900001",
+        "Trainline = calculated",
+    )
+    assert central["in_latest_build"] is True
+    assert central["has_override"] is False
+
+
+def test_the_reference_list_uncollapsed_and_paginated(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(REF, headers=content_manager, params={"collapse": "false"})
+    assert r.headers["X-Total-Count"] == "5"
+    assert [(row["plc"], row["era_uopid"]) for row in r.json()][2:4] == [
+        ("ZZ00003", "ZZOP03A"),
+        ("ZZ00003", "ZZOP03B"),
+    ]
+    page = client.get(REF, headers=content_manager, params={"size": 2, "page": 1})
+    assert page.headers["X-Total-Count"] == "4"  # the total, not the page length
+    assert [row["plc"] for row in page.json()] == ["ZZ00003", "ZZ00004"]
+    beyond = client.get(REF, headers=content_manager, params={"size": 2, "page": 9})
+    assert beyond.json() == []
+    # The operational points of one PLC, as the "expand" control asks for them.
+    both = client.get(REF, headers=content_manager, params={"plc": "ZZ00003", "collapse": "false"})
+    assert [row["era_uopid"] for row in both.json()] == ["ZZOP03A", "ZZOP03B"]
+    assert client.get(REF, headers=content_manager, params={"size": 0}).status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("params", "plcs"),
+    [
+        ({"q": "sampl"}, ["ZZ00002"]),  # by name, case-insensitive
+        ({"q": "Hbf"}, ["ZZ00001"]),  # by an alternative name
+        ({"q": "ZZ0000"}, ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00004"]),  # by PLC
+        ({"q": "de:99:2"}, ["ZZ00002"]),  # by any code in any series
+        ({"q": "9900001:0:1"}, ["ZZ00001"]),
+        ({"q": "9900002"}, ["ZZ00002"]),  # by MERITS code
+        ({"q": "ZZ00009"}, ["ZZ00002"]),  # by the PLC it had before
+        ({"q": "100%"}, []),  # a wildcard is a character, not a pattern
+        ({"country": "zz"}, ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00004"]),
+        ({"country": "FR"}, []),
+        ({"confidence": "conflict"}, ["ZZ00002"]),
+        ({"confidence": "none"}, ["ZZ00003"]),
+        ({"flag": "swap_partner"}, ["ZZ00002"]),
+        ({"has_code": "true"}, ["ZZ00001", "ZZ00002"]),
+        ({"has_code": "false"}, ["ZZ00003", "ZZ00004"]),
+        ({"q": "Testbury Yard B"}, ["ZZ00003"]),  # a match on the second operational point
+    ],
+)
+def test_reference_search_and_filters(
+    client: TestClient,
+    content_manager: dict[str, str],
+    built: dict[str, dict],
+    params: dict[str, str],
+    plcs: list[str],
+) -> None:
+    r = client.get(REF, headers=content_manager, params=params)
+    assert r.status_code == 200, r.text
+    assert [row["plc"] for row in r.json()] == plcs
+    assert r.headers["X-Total-Count"] == str(len(plcs))
+
+
+def test_a_search_matching_one_operational_point_shows_that_one(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    (row,) = client.get(REF, headers=content_manager, params={"q": "Testbury Yard B"}).json()
+    assert row["era_uopid"] == "ZZOP03B"
+
+
+def test_reference_summary(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    r = client.get(f"{REF}/summary", headers=content_manager)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stations"] == 5
+    assert body["plcs"] == 4
+    assert set(body["build"]["inputs"]) == set(STATION_FILE_SET)
+    assert body["build"]["diff_summary"]["created"] == 5
+    with_codes = [p["key"] for p in body["providers"] if p["has_codes"]]
+    assert with_codes == ["nap_CH_SBB", "nap_DE_DELFI", "nap_ES_regional"]
+    assert len(body["providers"]) == 16
+    assert next(p for p in body["providers"] if p["key"] == "nap_ES_regional")["unresolved"] is True
+    assert body["countries"] == [{"value": "ZZ", "count": 5}]
+    assert {"value": "swap_partner", "count": 1} in body["flags"]
+    assert {c["value"] for c in body["confidences"]} == {"high", "conflict", "low", None}
+    assert "uic_merits" in body["overridable_fields"]
+    assert len(body["complex_kinds"]) == 4
+
+
+def test_reference_summary_before_any_build(
+    client: TestClient, content_manager: dict[str, str]
+) -> None:
+    body = client.get(f"{REF}/summary", headers=content_manager).json()
+    assert body["build"] is None
+    assert body["stations"] == 0
+    assert client.get(REF, headers=content_manager).json() == []
+
+
+def test_reference_detail(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    central = client.get(f"{REF}/{_station_id('ZZ00001')}", headers=content_manager).json()
+    assert central["plc"] == "ZZ00001"
+    assert central["crd_start"] == "2019-12-15"
+    assert [(c["source_key"], c["code"], c["series"]) for c in central["codes"]] == [
+        ("nap_CH_SBB", "9900001", "CH_service_point_number"),
+        ("nap_CH_SBB", "9900001:0:1", None),
+        ("nap_ES_regional", "ZZ_FEED#MC", "ZZ_series_from_links"),
+    ]
+    assert [m["code"] for m in central["merits"]] == ["9900001"]
+    assert [link["offline_station_id"] for link in central["links"]] == ["NAPST0001", "NAPST0005"]
+    # A flag links to the station its payload names.
+    displaced = next(f for f in central["flags"] if f["token"] == "candidate_displaced_to")
+    assert displaced["related"]["plc"] == "ZZ00002"
+    assert central["siblings"] == []
+    assert central["complex"] is None
+    assert central["overrides"] == []
+
+    sampleton = client.get(f"{REF}/{_station_id('ZZ00002')}", headers=content_manager).json()
+    # Every MERITS candidate, the chosen one first.
+    assert [(m["code"], m["is_chosen"]) for m in sampleton["merits"]] == [
+        ("9900002", True),
+        ("9900012", False),
+        ("9900022", False),
+        ("9900032", False),
+    ]
+    assert [a["alias_plc"] for a in sampleton["aliases"]] == ["ZZ00009"]
+    assert sampleton["links"][0]["asserted"] is False
+
+    yard = client.get(f"{REF}/{_station_id('ZZ00003', 'ZZOP03A')}", headers=content_manager).json()
+    assert [s["era_uopid"] for s in yard["siblings"]] == ["ZZOP03B"]
+    assert yard["op_badge"] == "PLC carries 2 operational points, 140 m apart"
+
+    assert client.get(f"{REF}/999999", headers=content_manager).status_code == 404
+
+
+def test_a_correction_is_applied_survives_a_rebuild_and_can_be_released(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.master import station_import
+
+    station_id = _station_id("ZZ00002")
+    one = f"{REF}/{station_id}"
+    r = client.post(
+        f"{one}/overrides",
+        headers=content_manager,
+        json={"field_name": "name", "value": "Sampleton Central", "reason": "platform signs"},
+    )
+    assert r.status_code == 201, r.text
+    override = r.json()
+    assert override["computed_value_at_set"] == "Sampleton"
+    assert _scalar("SELECT set_by IS NOT NULL FROM station_ref_override") is True
+
+    listed = client.get(REF, headers=content_manager, params={"q": "Sampleton Central"}).json()
+    assert [(row["plc"], row["has_override"]) for row in listed] == [("ZZ00002", True)]
+
+    output, success = station_import.run_build()
+    assert success, output
+    detail = client.get(one, headers=content_manager).json()
+    assert detail["name"] == "Sampleton Central"  # re-applied by the build
+    assert detail["overrides"][0]["active"] is True
+
+    released = client.delete(f"{one}/overrides/{override['id']}", headers=content_manager)
+    assert released.status_code == 200, released.text
+    assert released.json()["active"] is False
+    assert client.get(one, headers=content_manager).json()["name"] == "Sampleton"
+    again = client.delete(f"{one}/overrides/{override['id']}", headers=content_manager)
+    assert again.status_code == 409
+
+
+def test_correction_refusals(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    one = f"{REF}/{_station_id('ZZ00001')}/overrides"
+    for body, status in (
+        ({"field_name": "plc", "value": "ZZ00099", "reason": "not valid"}, 400),  # identity
+        ({"field_name": "lat", "value": "north", "reason": "not valid"}, 400),
+        ({"field_name": "name", "value": "x", "reason": ""}, 422),  # a reason is required
+    ):
+        assert client.post(one, headers=content_manager, json=body).status_code == status
+    missing = client.post(
+        f"{REF}/999999/overrides",
+        headers=content_manager,
+        json={"field_name": "name", "value": "x", "reason": "none"},
+    )
+    assert missing.status_code == 404
+    assert _scalar("SELECT count(*) FROM station_ref_override") == 0
+
+
+def test_a_merits_correction_changes_the_chosen_candidate_and_is_reversible(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    one = f"{REF}/{_station_id('ZZ00002')}"
+    r = client.post(
+        f"{one}/overrides",
+        headers=content_manager,
+        json={"field_name": "uic_merits", "value": "9900777", "reason": "per the operator"},
+    )
+    assert r.status_code == 201, r.text
+    detail = client.get(one, headers=content_manager).json()
+    assert (detail["uic_merits"], detail["uic_merits_origin"]) == ("9900777", "Manual")
+    # Nothing computed was withdrawn.
+    assert [(m["code"], m["is_chosen"]) for m in detail["merits"]] == [
+        ("9900777", True),
+        ("9900002", False),
+        ("9900012", False),
+        ("9900022", False),
+        ("9900032", False),
+    ]
+
+    client.delete(f"{one}/overrides/{r.json()['id']}", headers=content_manager).raise_for_status()
+    detail = client.get(one, headers=content_manager).json()
+    assert (detail["uic_merits"], detail["uic_merits_origin"]) == (
+        "9900002",
+        "Trainline (calculated differs)",
+    )
+    assert [m["code"] for m in detail["merits"]] == ["9900002", "9900012", "9900022", "9900032"]
+
+
+def test_group_and_ungroup_a_complex(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    central, sampleton = _station_id("ZZ00001"), _station_id("ZZ00002")
+    body = {
+        "label": "Exampleville",
+        "kind": "adjacent_treated_as_one",
+        "station_ids": [central, sampleton],
+        "principal_id": central,
+        "requires_physical_separation": True,
+        "separation_reason": "border control between the two halves",
+    }
+    r = client.post(f"{REF}/complexes", headers=content_manager, json=body)
+    assert r.status_code == 201, r.text
+    complex_id = r.json()["id"]
+
+    detail = client.get(f"{REF}/{sampleton}", headers=content_manager).json()
+    assert detail["complex"]["label"] == "Exampleville"
+    assert detail["complex"]["source"] == "manual"
+    assert detail["complex"]["requires_physical_separation"] is True
+    assert [(m["plc"], m["complex_role"]) for m in detail["complex"]["members"]] == [
+        ("ZZ00001", "principal"),
+        ("ZZ00002", "member"),
+    ]
+    listed = {row["plc"]: row for row in client.get(REF, headers=content_manager).json()}
+    assert listed["ZZ00001"]["complex_label"] == "Exampleville"
+
+    # A station is in one complex at most; a rebuild leaves the grouping alone.
+    assert client.post(f"{REF}/complexes", headers=content_manager, json=body).status_code == 409
+    from app.master import station_import
+
+    assert station_import.run_build()[1] is True
+    assert _scalar("SELECT count(*) FROM station_ref WHERE complex_id IS NOT NULL") == 2
+
+    assert (
+        client.delete(f"{REF}/complexes/{complex_id}", headers=content_manager).status_code == 204
+    )
+    assert _scalar("SELECT count(*) FROM station_ref WHERE complex_role IS NOT NULL") == 0
+    assert (
+        client.delete(f"{REF}/complexes/{complex_id}", headers=content_manager).status_code == 404
+    )
+
+
+@pytest.mark.parametrize(("method", "path"), REFERENCE_ROUTES)
+def test_every_reference_route_refuses_an_end_user_and_an_anonymous_caller(
+    client: TestClient, end_user: dict[str, str], method: str, path: str
+) -> None:
+    assert client.request(method, path).status_code == 401
+    assert client.request(method, path, headers=end_user).status_code == 403
+
+
+def test_the_reference_is_open_to_both_working_roles(
+    client: TestClient, admin: dict[str, str], content_manager: dict[str, str]
+) -> None:
+    for headers in (admin, content_manager):
+        assert client.get(REF, headers=headers).status_code == 200
+        assert client.get(f"{REF}/summary", headers=headers).status_code == 200
+        page = client.get("/admin/stations/reference/1", headers=headers)
+        assert page.status_code == 200
+        assert 'data-station-id="1"' in page.text

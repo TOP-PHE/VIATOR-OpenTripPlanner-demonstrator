@@ -371,6 +371,26 @@ Connection times arrive in step 6 — until then the panel says so rather than s
 
 Header: the build this state comes from, its input versions, and the diff against the previous one.
 
+As built (`app/api/master/station_ref.py`):
+
+- **Collapsed means one row per PLC, decided by the server.** `collapse=true` is the default: the
+  list keeps, per PLC, the operational point whose id is the PLC itself, else the first in byte
+  order, among the rows the filters match — so a search that hits only the second operational
+  point shows that one. `X-Total-Count` then counts PLCs. The badge's button fetches
+  `?plc=…&collapse=false` and inserts the others under the row.
+- **Search** is name, alternative names and PLC by substring; operational-point id, previous PLC,
+  MERITS code, EVA, RL100 and any provider code by equality. The provider codes are reached through
+  a subquery on `station_ref_code (code)`, the flag filter through one on
+  `station_ref_flag (token)`: neither joins.
+- **A correction** is `POST /{id}/overrides` with a field, a value and a reason. Correctable
+  fields: `name`, `lat`, `lon`, `iso2`, `is_passenger`, `uic_merits`, `rl100`, `nat_code`,
+  `ifopt_dhid`, `eva`. Identity (`plc`, `era_uopid`) is not. Correcting a field already corrected
+  releases the earlier correction and keeps it as history.
+- **A complex** is created from two or more stations selected in the list
+  (`POST /complexes`), with one of them optionally its principal, and removed whole
+  (`DELETE /complexes/{id}`). One made here is `manual`; a station is in one complex at most; a
+  rebuild leaves `complex_id` and `complex_role` alone.
+
 ### E. Sources and integration — `/admin/stations/sources`
 
 One row per source: label · kind · format · acquisition · credential · cadence · triggers rebuild ·

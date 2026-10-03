@@ -168,3 +168,40 @@ def test_an_end_user_has_no_stations_group() -> None:
 def test_every_inline_script_parses(path: str, tmp_path: Path) -> None:
     html = render(path, "platform_admin").body.decode()
     assert assert_scripts_parse(html, tmp_path) >= 2  # the shared helpers and the logout script
+
+
+TEMPLATES = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin"
+# The templates written for the station panel (the Trainline one predates it).
+STATION_TEMPLATES = sorted(p.name for p in TEMPLATES.glob("station_*.html"))
+
+
+def _exported_helpers() -> set[str]:
+    shared = (TEMPLATES / "_station_panel.html").read_text(encoding="utf-8")
+    exported = re.search(r"return \{([^}]+)\};\s*\}\)\(\);", shared)
+    assert exported
+    return {name.strip() for name in exported.group(1).split(",")}
+
+
+@pytest.mark.parametrize("name", STATION_TEMPLATES)
+def test_a_station_template_uses_only_helpers_the_partial_exports(name: str) -> None:
+    html = (TEMPLATES / name).read_text(encoding="utf-8")
+    assert '{% include "admin/_station_panel.html" %}' in html
+    used = set(re.findall(r"\bSP\.(\w+)\b", html))
+    assert used <= _exported_helpers(), (
+        f"used but not exported: {sorted(used - _exported_helpers())}"
+    )
+
+
+@pytest.mark.parametrize("name", [*STATION_TEMPLATES, "_station_panel.html"])
+def test_station_template_javascript_follows_the_house_rules(name: str) -> None:
+    html = (TEMPLATES / name).read_text(encoding="utf-8")
+    assert "window." not in html  # globalThis, not window
+    assert not re.search(r"catch\s*(\([^)]*\))?\s*\{\s*\}", html)  # no empty catch
+    for body in re.findall(r"catch \(err\) \{(.*?)\}", html, re.DOTALL):
+        assert "err" in body  # the caught error is reported, not swallowed
+    # Data reaches a script as JSON, never as a Jinja expression inside JavaScript.
+    for script in re.findall(
+        r"<script(?![^>]*application/json)[^>]*>(.*?)</script>", html, re.DOTALL
+    ):
+        assert "{{" not in script
+        assert "{%" not in script

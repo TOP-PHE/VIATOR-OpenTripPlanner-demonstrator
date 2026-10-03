@@ -7,8 +7,293 @@
 
 <h1>VIATOR station reference</h1>
 <p class="sp-lead">
-  VIATOR's own reference table, keyed on the CRD primary location code and the ERA operational
+  VIATOR's own reference table, keyed on the CRD primary location code (PLC) and the ERA operational
   point: one code per provider, a MERITS code with its provenance, and the flags the build raised.
+  Search by name, PLC or any code in any series.
 </p>
-<div class="sp-banner note">This screen is not built yet: the reference list arrives with the next change.</div>
+
+<div class="sp-card" id="build-card">Loading…</div>
+
+<form id="filters" class="sp-filters">
+  <label>Search <input type="search" name="q" placeholder="name, PLC or any code" style="min-width: 16rem"></label>
+  <label>Country <select name="country"><option value="">any</option></select></label>
+  <label>MERITS confidence <select name="confidence"><option value="">any</option></select></label>
+  <label>Flag <select name="flag"><option value="">any</option></select></label>
+  <label>Timetable code
+    <select name="has_code">
+      <option value="">any</option>
+      <option value="true">has one</option>
+      <option value="false">has none</option>
+    </select>
+  </label>
+  <label class="sp-check" title="A PLC can carry several operational points, most of them identical in every column shown here">
+    <input type="checkbox" name="collapse" checked> one row per PLC
+  </label>
+  <button type="submit">Search</button>
+  <button type="button" class="secondary" id="clear">Clear</button>
+  <button type="button" class="secondary" id="group" disabled>Group selected…</button>
+</form>
+
+<div class="sp-scroll">
+  <table>
+    <thead id="ref-head"></thead>
+    <tbody id="ref-body"><tr><td>Loading…</td></tr></tbody>
+  </table>
+</div>
+<div id="pager" class="sp-pager"></div>
+
+<p class="sp-muted" style="font-size: 0.82rem">
+  Connection times are not part of this first step: they are still inside the NeTEx archives, and
+  arrive with the step that reads them.
+</p>
+
+<dialog id="group-dialog" class="sp-dialog">
+  <form id="group-form" method="dialog">
+    <h2>Group stations into a complex</h2>
+    <p class="sp-muted" id="group-members" style="font-size: 0.88rem"></p>
+    <div class="sp-form-grid">
+      <label class="wide">Label <input type="text" name="label" required maxlength="200" autocomplete="off"></label>
+      <label>Kind <select name="kind"></select></label>
+      <label>Principal station <select name="principal_id"><option value="">— none —</option></select></label>
+      <label class="wide">Rule <input type="text" name="rule" maxlength="500" autocomplete="off" placeholder="why these belong together"></label>
+      <label class="sp-check wide"><input type="checkbox" name="requires_physical_separation"> its parts must stay physically apart (border control)</label>
+      <label class="wide">Reason for the separation <input type="text" name="separation_reason" maxlength="500" autocomplete="off"></label>
+    </div>
+    <div style="display: flex; gap: 0.5rem; justify-content: flex-end">
+      <button type="button" class="secondary" id="group-cancel">Cancel</button>
+      <button type="submit">Create the complex</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+const SP = globalThis.StationPanel;
+const API = '/api/master/station-ref';
+const PAGE_SIZE = 50;
+const WARNING_PILL = {OK: 'ok', INFO: 'info', WARNING: 'warn', ISSUE: 'bad'};
+
+let providers = [];
+let rows = [];
+let page = 0;
+const selected = new Map();
+
+const filters = document.getElementById('filters');
+const body = document.getElementById('ref-body');
+const groupDialog = document.getElementById('group-dialog');
+const groupForm = document.getElementById('group-form');
+
+function providerLabel(key) {
+  return key.startsWith('nap_') ? key.slice(4) : key;
+}
+
+// `noneValue`: what a row without the value is filtered by; without it such rows are not offered.
+function fillSelect(select, facet, noneValue) {
+  for (const item of facet) {
+    const value = item.value ?? noneValue;
+    if (value) select.add(new Option(value + ' (' + SP.fmtInt(item.count) + ')', value));
+  }
+}
+
+function inputsLine(inputs) {
+  return Object.entries(inputs || {}).map(([key, v]) =>
+    '<span class="sp-code" title="' + SP.esc(v.filename || '') + '">' + SP.esc(key) + ' ' + SP.shortSha(v.sha256) + '</span>').join(' · ');
+}
+
+function renderBuild(summary) {
+  const card = document.getElementById('build-card');
+  const b = summary.build;
+  if (!b) {
+    card.innerHTML = '<strong>No build yet.</strong> The reference is empty until the five offline files are uploaded and imported.';
+    return;
+  }
+  const d = b.diff_summary || {};
+  card.innerHTML =
+    '<strong>Build #' + b.id + '</strong> · finished ' + SP.fmtDate(b.finished_at) + ' UTC · ' +
+    SP.fmtInt(summary.stations) + ' operational points on ' + SP.fmtInt(summary.plcs) + ' PLCs<br>' +
+    '<span class="sp-muted">Inputs: </span>' + inputsLine(b.inputs) + '<br>' +
+    '<span class="sp-muted">Against the previous state: </span>' +
+    SP.fmtInt(d.created) + ' created · ' + SP.fmtInt(d.changed) + ' changed · ' +
+    SP.fmtInt(d.unchanged) + ' unchanged · ' + SP.fmtInt(d.absent) + ' no longer in the master';
+}
+
+function renderHead() {
+  const cells = ['', 'PLC', 'Operational point', 'Name', 'Country', 'Complex', 'MERITS']
+    .map((title) => '<th scope="col">' + title + '</th>');
+  for (const p of providers) {
+    const note = p.unresolved ? ' (aggregate of several datasets)' : '';
+    cells.push('<th scope="col" title="' + SP.esc(p.label + note) + '">' + SP.esc(providerLabel(p.key)) + (p.unresolved ? ' *' : '') + '</th>');
+  }
+  cells.push('<th scope="col">Flags</th>');
+  document.getElementById('ref-head').innerHTML = '<tr>' + cells.join('') + '</tr>';
+}
+
+function meritsCell(r) {
+  if (!r.uic_merits) return '<span class="sp-muted">—</span>';
+  const origin = r.uic_merits_origin ? ' <span class="sp-muted">' + SP.esc(r.uic_merits_origin) + '</span>' : '';
+  return '<span class="sp-code">' + SP.esc(r.uic_merits) + '</span>' + origin;
+}
+
+function nameCell(r) {
+  const marks = [];
+  if (r.has_override) marks.push(SP.pill('info', 'corrected'));
+  if (!r.is_current) marks.push(SP.pill('', 'retired'));
+  if (!r.in_latest_build) marks.push(SP.pill('warn', 'not in the latest build'));
+  const link = '<a href="/admin/stations/reference/' + r.id + '">' + SP.esc(r.name || '(no name)') + '</a>';
+  return link + (marks.length ? ' ' + marks.join(' ') : '');
+}
+
+function badgeCell(r) {
+  if (!r.op_badge) return '<span class="sp-code">' + SP.esc(r.era_uopid) + '</span>';
+  return '<span class="sp-code">' + SP.esc(r.era_uopid) + '</span><br>' +
+    '<button type="button" class="secondary sp-expand" data-plc="' + SP.esc(r.plc) + '" title="Show every operational point of this PLC">' +
+    SP.esc(r.op_badge) + '</button>';
+}
+
+function complexCell(r) {
+  if (!r.complex_id) return '<span class="sp-muted">—</span>';
+  return SP.esc(r.complex_label || '#' + r.complex_id) + ' <span class="sp-muted">' + SP.esc(r.complex_role || '') + '</span>';
+}
+
+function flagsCell(r) {
+  const level = r.warning_level ? SP.pill(WARNING_PILL[r.warning_level] || '', r.warning_level) + ' ' : '';
+  return level + r.flags.map((token) => '<span class="sp-pill">' + SP.esc(token) + '</span>').join(' ');
+}
+
+function rowHtml(r, extraClass) {
+  const checked = selected.has(r.id) ? ' checked' : '';
+  const cells = [
+    '<td><input type="checkbox" class="pick" data-id="' + r.id + '" aria-label="Select ' + SP.esc(r.plc) + '"' + checked + '></td>',
+    '<td class="sp-code">' + SP.esc(r.plc) + '</td>',
+    '<td>' + badgeCell(r) + '</td>',
+    '<td>' + nameCell(r) + '</td>',
+    '<td>' + SP.esc(r.iso2 || '—') + '</td>',
+    '<td>' + complexCell(r) + '</td>',
+    '<td>' + meritsCell(r) + '</td>',
+  ];
+  for (const p of providers) {
+    cells.push('<td class="sp-code">' + (r.codes[p.key] || []).map(SP.esc).join('<br>') + '</td>');
+  }
+  cells.push('<td>' + flagsCell(r) + '</td>');
+  return '<tr class="' + extraClass + '" data-plc="' + SP.esc(r.plc) + '">' + cells.join('') + '</tr>';
+}
+
+function currentFilters() {
+  const data = new FormData(filters);
+  return {
+    q: (data.get('q') || '').trim(),
+    country: data.get('country'),
+    confidence: data.get('confidence'),
+    flag: data.get('flag'),
+    has_code: data.get('has_code'),
+    collapse: filters.elements.collapse.checked,
+  };
+}
+
+async function load(toPage) {
+  page = toPage;
+  const params = {...currentFilters(), page, size: PAGE_SIZE};
+  try {
+    const {data, headers} = await SP.getJson(API + '?' + SP.query(params));
+    rows = data;
+    const columns = 8 + providers.length;
+    body.innerHTML = rows.length
+      ? rows.map((r) => rowHtml(r, '')).join('')
+      : '<tr><td colspan="' + columns + '"><em>No station matches.</em></td></tr>';
+    SP.renderPager(document.getElementById('pager'), page, PAGE_SIZE, SP.totalOf(headers), load);
+  } catch (err) {
+    SP.toast('error', 'Could not load the reference: ' + err.message);
+  }
+}
+
+// Show every operational point of one PLC under its collapsed row.
+async function expand(button) {
+  const plc = button.dataset.plc;
+  button.disabled = true;
+  try {
+    const {data} = await SP.getJson(API + '?' + SP.query({plc, collapse: false, size: 200}));
+    const shown = new Set(rows.map((r) => r.id));
+    const others = data.filter((r) => !shown.has(r.id));
+    rows = rows.concat(others);
+    button.closest('tr').insertAdjacentHTML('afterend', others.map((r) => rowHtml(r, 'changed')).join(''));
+  } catch (err) {
+    button.disabled = false;
+    SP.toast('error', err.message);
+  }
+}
+
+function togglePick(box) {
+  const id = Number.parseInt(box.dataset.id, 10);
+  if (box.checked) selected.set(id, rows.find((r) => r.id === id));
+  else selected.delete(id);
+  document.getElementById('group').disabled = selected.size < 2;
+}
+
+function openGroupDialog() {
+  const members = [...selected.values()];
+  groupForm.reset();
+  document.getElementById('group-members').textContent =
+    members.map((r) => r.plc + ' ' + (r.name || '')).join(' · ');
+  const principal = groupForm.elements.principal_id;
+  principal.length = 1;
+  for (const r of members) principal.add(new Option(r.plc + ' ' + (r.name || ''), r.id));
+  groupDialog.showModal();
+}
+
+async function createComplex(event) {
+  event.preventDefault();
+  const form = groupForm.elements;
+  const payload = {
+    label: form.label.value.trim(),
+    kind: form.kind.value,
+    station_ids: [...selected.keys()],
+    principal_id: form.principal_id.value ? Number.parseInt(form.principal_id.value, 10) : null,
+    rule: form.rule.value.trim() || null,
+    requires_physical_separation: form.requires_physical_separation.checked,
+    separation_reason: form.separation_reason.value.trim() || null,
+  };
+  try {
+    await SP.sendJson('POST', API + '/complexes', payload);
+    groupDialog.close();
+    selected.clear();
+    document.getElementById('group').disabled = true;
+    SP.toast('success', 'Complex created');
+    await load(page);
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
+}
+
+async function init() {
+  const {data: summary} = await SP.getJson(API + '/summary');
+  providers = summary.providers.filter((p) => p.has_codes);
+  renderBuild(summary);
+  renderHead();
+  fillSelect(filters.elements.country, summary.countries);
+  fillSelect(filters.elements.confidence, summary.confidences, 'none');
+  fillSelect(filters.elements.flag, summary.flags);
+  for (const kind of summary.complex_kinds) groupForm.elements.kind.add(new Option(kind.replaceAll('_', ' '), kind));
+  await load(0);
+}
+
+filters.addEventListener('submit', (event) => { event.preventDefault(); load(0); });
+document.getElementById('clear').addEventListener('click', () => { filters.reset(); load(0); });
+document.getElementById('group').addEventListener('click', openGroupDialog);
+document.getElementById('group-cancel').addEventListener('click', () => groupDialog.close());
+groupForm.addEventListener('submit', createComplex);
+body.addEventListener('click', (event) => {
+  const button = event.target.closest('button.sp-expand');
+  if (button) expand(button);
+});
+body.addEventListener('change', (event) => {
+  if (event.target.classList.contains('pick')) togglePick(event.target);
+});
+
+try {
+  await init();
+} catch (err) {
+  SP.toast('error', 'Could not load the reference: ' + err.message);
+}
+</script>
 {% endblock %}

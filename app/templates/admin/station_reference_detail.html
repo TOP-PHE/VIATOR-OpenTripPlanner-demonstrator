@@ -1,0 +1,312 @@
+{% extends "_base.html" %}
+{% block title %}Station {{ station_id }} — VIATOR station reference{% endblock %}
+
+{% block content %}
+{% set station_tab = 'reference' %}
+{% include "admin/_station_panel.html" %}
+
+<p><a href="/admin/stations/reference">‹ Back to the reference</a></p>
+<h1 id="title">Station</h1>
+<div id="station" data-station-id="{{ station_id }}">
+
+  <div class="sp-two">
+    <div class="sp-card">
+      <h2>Identity</h2>
+      <dl class="sp-kv" id="identity"></dl>
+    </div>
+    <div class="sp-card">
+      <h2>Classification and position</h2>
+      <dl class="sp-kv" id="classification"></dl>
+    </div>
+  </div>
+
+  <div class="sp-card">
+    <h2>MERITS candidates</h2>
+    <p class="sp-muted" style="font-size: 0.85rem; margin-top: 0">
+      Every candidate, not only the chosen one. A calculated code is never withdrawn.
+    </p>
+    <div class="sp-scroll"><table>
+      <thead><tr>
+        <th scope="col">Code</th><th scope="col">Chosen</th><th scope="col">Origin</th>
+        <th scope="col">Rule</th><th scope="col">Confidence</th><th scope="col">Sources</th>
+        <th scope="col">Check digit</th>
+      </tr></thead>
+      <tbody id="merits"></tbody>
+    </table></div>
+  </div>
+
+  <div class="sp-card">
+    <h2>Codes</h2>
+    <div class="sp-scroll"><table>
+      <thead><tr>
+        <th scope="col">Provider</th><th scope="col">Code</th><th scope="col">Series</th>
+        <th scope="col">Primary</th><th scope="col">Use</th><th scope="col">Rule</th>
+      </tr></thead>
+      <tbody id="codes"></tbody>
+    </table></div>
+  </div>
+
+  <div class="sp-card">
+    <h2>Matched NAP stops</h2>
+    <div class="sp-scroll"><table>
+      <thead><tr>
+        <th scope="col">Feed</th><th scope="col">Stop</th><th scope="col">Name</th>
+        <th scope="col">Asserted</th><th scope="col">Tier</th><th scope="col">Method</th>
+        <th scope="col">Code</th><th scope="col" class="sp-num">Distance</th>
+        <th scope="col" class="sp-num">Name similarity</th><th scope="col">Note</th>
+      </tr></thead>
+      <tbody id="links"></tbody>
+    </table></div>
+  </div>
+
+  <div class="sp-two">
+    <div class="sp-card">
+      <h2>Complex</h2>
+      <div id="complex"></div>
+    </div>
+    <div class="sp-card">
+      <h2>Flags</h2>
+      <div id="flags"></div>
+    </div>
+  </div>
+
+  <div class="sp-card">
+    <h2>Corrections</h2>
+    <p class="sp-muted" style="font-size: 0.85rem; margin-top: 0">
+      A correction is per field and survives rebuilds. Underneath it, the build keeps computing its
+      own value; releasing the correction restores that value as it is now.
+    </p>
+    <form id="override-form" class="sp-filters">
+      <label>Field <select name="field_name" required></select></label>
+      <label>Value <input type="text" name="value" autocomplete="off" placeholder="empty: no value"></label>
+      <label>Reason <input type="text" name="reason" required minlength="3" maxlength="500" autocomplete="off" style="min-width: 18rem"></label>
+      <button type="submit">Correct</button>
+    </form>
+    <div class="sp-scroll"><table>
+      <thead><tr>
+        <th scope="col">Field</th><th scope="col">Corrected to</th><th scope="col">Build computes</th>
+        <th scope="col">Reason</th><th scope="col">Set</th><th scope="col">State</th><th scope="col">Action</th>
+      </tr></thead>
+      <tbody id="overrides"></tbody>
+    </table></div>
+  </div>
+
+  <div class="sp-two">
+    <div class="sp-card">
+      <h2>What the builds changed</h2>
+      <div class="sp-scroll"><table>
+        <thead><tr><th scope="col">Build</th><th scope="col">Field</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+        <tbody id="history"></tbody>
+      </table></div>
+    </div>
+    <div class="sp-card">
+      <h2>Connection times</h2>
+      <p class="sp-muted" style="margin: 0">
+        Not part of this first step. The connection times are still inside the NeTEx archives;
+        they arrive with the step that reads them, and this panel will list them then.
+      </p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script type="module">
+const SP = globalThis.StationPanel;
+const STATION_ID = document.getElementById('station').dataset.stationId;
+const API = '/api/master/station-ref/' + STATION_ID;
+const DASH = '<span class="sp-muted">—</span>';
+const overrideForm = document.getElementById('override-form');
+
+function text(value) {
+  if (value === null || value === undefined || value === '') return DASH;
+  if (Array.isArray(value)) return value.length ? value.map(SP.esc).join(', ') : DASH;
+  return SP.esc(value);
+}
+
+function yesNo(flag) {
+  if (flag === null || flag === undefined) return DASH;
+  return flag ? 'yes' : 'no';
+}
+
+function kv(pairs) {
+  return pairs.map(([label, html]) => '<dt>' + label + '</dt><dd>' + html + '</dd>').join('');
+}
+
+function stationLink(s) {
+  return '<a href="/admin/stations/reference/' + s.id + '"><span class="sp-code">' + SP.esc(s.plc) + ' / ' + SP.esc(s.era_uopid) + '</span> ' + SP.esc(s.name || '') + '</a>';
+}
+
+function emptyRow(columns, message) {
+  return '<tr><td colspan="' + columns + '"><em>' + message + '</em></td></tr>';
+}
+
+function siblingsHtml(d) {
+  if (!d.siblings.length) return DASH;
+  return SP.esc(d.op_badge || '') + '<br>' + d.siblings.map(stationLink).join('<br>');
+}
+
+function renderIdentity(d) {
+  document.getElementById('title').textContent = (d.name || '(no name)') + ' — ' + d.plc;
+  const state = [d.is_current ? SP.pill('ok', 'current') : SP.pill('', 'retired')];
+  if (!d.in_latest_build) state.push(SP.pill('warn', 'not in the latest build'));
+  document.getElementById('identity').innerHTML = kv([
+    ['PLC', '<span class="sp-code">' + SP.esc(d.plc) + '</span> ' + text(d.plc_kind)],
+    ['Operational point', '<span class="sp-code">' + SP.esc(d.era_uopid) + '</span>'],
+    ['Previous PLC', text(d.previous_plc)],
+    ['Aliases', d.aliases.length ? [...new Set(d.aliases.map((a) => a.alias_plc))].map(SP.esc).join(', ') : DASH],
+    ['Name', text(d.name) + ' <span class="sp-muted">' + SP.esc(d.name_src || '') + '</span>'],
+    ['Other names', text(d.alt_name)],
+    ['Same PLC', siblingsHtml(d)],
+    ['Spine', text(d.spine_source) + ' · CRD ' + text(d.crd_start) + ' → ' + text(d.crd_end)],
+    ['State', state.join(' ')],
+    ['Licence tag', text(d.crd_source_tag)],
+    ['Builds', 'first seen #' + text(d.first_seen_build_id) + ' · last built #' + text(d.last_built_build_id) + ' · last changed #' + text(d.last_changed_build_id)],
+  ]);
+}
+
+function renderClassification(d) {
+  const position = d.lat === null ? DASH : d.lat + ', ' + d.lon;
+  document.getElementById('classification').innerHTML = kv([
+    ['Country', text(d.iso2) + ' <span class="sp-muted">all: ' + text(d.iso2_all) + '</span>'],
+    ['Passenger', yesNo(d.is_passenger) + ' <span class="sp-muted">' + SP.esc(d.is_passenger_src || '') + '</span>'],
+    ['Types', text(d.op_type_all) + ' <span class="sp-muted">' + SP.esc(d.op_type_src || '') + '</span>'],
+    ['Position', position + ' <span class="sp-muted">' + SP.esc(d.pos_src || '') + ' · ' + SP.esc(d.position_flag || '') + '</span>'],
+    ['RL100', text(d.rl100)],
+    ['National code', text(d.nat_code) + ' <span class="sp-muted">' + SP.esc(d.nat_code_series || '') + '</span>'],
+    ['IFOPT / DHID', text(d.ifopt_dhid)],
+    ['EVA', text(d.eva) + ' <span class="sp-muted">all: ' + text(d.eva_all) + '</span>'],
+    ['Best tier', text(d.best_tier)],
+    ['NAP feeds', text(d.n_nap_feeds)],
+    ['Warning level', text(d.warning_level)],
+  ]);
+}
+
+function meritsRow(m) {
+  return '<tr><td class="sp-code">' + SP.esc(m.code) + '</td><td>' + (m.is_chosen ? SP.pill('ok', 'chosen') : '') + '</td>' +
+    '<td>' + text(m.origin) + '</td><td>' + text(m.rule) + '</td><td>' + text(m.confidence) + '</td>' +
+    '<td>' + text(m.sources) + '</td><td>' + text(m.check_digit) + '</td></tr>';
+}
+
+function codeRow(c) {
+  const use = c.evidence_only ? SP.pill('warn', 'evidence only') : 'join key';
+  return '<tr><td class="sp-code">' + SP.esc(c.source_key) + '</td><td class="sp-code">' + SP.esc(c.code) + '</td>' +
+    '<td>' + text(c.series) + '</td><td>' + yesNo(c.is_primary) + '</td><td>' + use + '</td>' +
+    '<td>' + text(c.normalisation_rule) + '</td></tr>';
+}
+
+function linkRow(l) {
+  const code = l.code_value ? '<span class="sp-code">' + SP.esc(l.code_value) + '</span> <span class="sp-muted">' + SP.esc(l.code_series || '') + '</span>' : DASH;
+  return '<tr><td>' + text(l.feed_key) + '</td><td class="sp-code">' + text(l.stop_key) + '</td><td>' + text(l.stop_name) + '</td>' +
+    '<td>' + (l.asserted ? SP.pill('ok', 'asserted') : SP.pill('', 'not asserted')) + '</td>' +
+    '<td>' + text(l.tier) + '</td><td>' + text(l.match_method) + '</td><td>' + code + '</td>' +
+    '<td class="sp-num">' + (l.distance_m === null ? DASH : Math.round(l.distance_m) + ' m') + '</td>' +
+    '<td class="sp-num">' + (l.name_sim === null ? DASH : l.name_sim.toFixed(2)) + '</td><td>' + text(l.note) + '</td></tr>';
+}
+
+function renderComplex(d) {
+  const box = document.getElementById('complex');
+  const c = d.complex;
+  if (!c) {
+    box.innerHTML = '<p class="sp-muted" style="margin: 0">Not part of a complex. Stations are grouped from the reference list.</p>';
+    return;
+  }
+  const separation = c.requires_physical_separation
+    ? SP.pill('warn', 'must stay physically apart') + ' ' + SP.esc(c.separation_reason || '')
+    : 'none required';
+  box.innerHTML = '<dl class="sp-kv">' + kv([
+    ['Label', SP.esc(c.label)],
+    ['Kind', SP.esc(c.kind) + ' <span class="sp-muted">' + SP.esc(c.source) + '</span>'],
+    ['Rule', text(c.rule)],
+    ['Separation', separation],
+    ['Members', c.members.map((m) => stationLink(m) + ' <span class="sp-muted">' + SP.esc(m.complex_role || '') + '</span>').join('<br>')],
+  ]) + '</dl><button type="button" class="secondary" id="ungroup" data-complex-id="' + c.id + '">Ungroup this complex</button>';
+}
+
+function flagHtml(f) {
+  const payload = f.payload ? ': <span class="sp-code">' + SP.esc(f.payload) + '</span>' : '';
+  const related = f.related ? ' → ' + stationLink(f.related) : '';
+  return '<li><span class="sp-pill">' + SP.esc(f.token) + '</span>' + payload + related + '</li>';
+}
+
+function overrideRow(o) {
+  const state = o.active ? SP.pill('info', 'active') : 'released ' + SP.fmtDate(o.released_at);
+  const drift = o.active && o.drifted ? ' ' + SP.pill('warn', 'was ' + (o.computed_value_at_set ?? 'empty') + ' when set') : '';
+  const action = o.active ? '<button type="button" class="secondary" data-release="' + o.id + '">Release</button>' : '';
+  return '<tr><td class="sp-code">' + SP.esc(o.field_name) + '</td><td>' + text(o.value) + '</td>' +
+    '<td>' + text(o.computed_value_latest) + drift + '</td><td>' + text(o.reason) + '</td>' +
+    '<td>' + SP.fmtDate(o.set_at) + '</td><td>' + state + '</td><td>' + action + '</td></tr>';
+}
+
+function historyRow(h) {
+  return '<tr><td>#' + h.build_id + '</td><td class="sp-code">' + SP.esc(h.field_name) + '</td>' +
+    '<td>' + text(h.old_value) + '</td><td>' + text(h.new_value) + '</td></tr>';
+}
+
+function fill(id, items, row, columns, message) {
+  document.getElementById(id).innerHTML = items.length ? items.map(row).join('') : emptyRow(columns, message);
+}
+
+function render(d) {
+  renderIdentity(d);
+  renderClassification(d);
+  fill('merits', d.merits, meritsRow, 7, 'No MERITS candidate.');
+  fill('codes', d.codes, codeRow, 6, 'No provider code.');
+  fill('links', d.links, linkRow, 10, 'No NAP stop is matched to this station.');
+  fill('overrides', d.overrides, overrideRow, 7, 'No correction.');
+  fill('history', d.history, historyRow, 4, 'No build has changed this station since it was first seen.');
+  renderComplex(d);
+  document.getElementById('flags').innerHTML = d.flags.length
+    ? '<ul style="margin: 0; padding-left: 1.1rem">' + d.flags.map(flagHtml).join('') + '</ul>'
+    : '<p class="sp-muted" style="margin: 0">No flag.</p>';
+}
+
+async function load() {
+  const {data} = await SP.getJson(API);
+  render(data);
+}
+
+async function act(run, done) {
+  try {
+    await run();
+    SP.toast('success', done);
+    await load();
+  } catch (err) {
+    SP.toast('error', err.message);
+  }
+}
+
+async function loadFields() {
+  const {data} = await SP.getJson('/api/master/station-ref/summary');
+  for (const name of data.overridable_fields) overrideForm.elements.field_name.add(new Option(name, name));
+}
+
+overrideForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const form = overrideForm.elements;
+  const payload = {field_name: form.field_name.value, value: form.value.value, reason: form.reason.value.trim()};
+  act(() => SP.sendJson('POST', API + '/overrides', payload), 'Correction saved').then(() => {
+    form.value.value = '';
+    form.reason.value = '';
+  });
+});
+
+document.getElementById('station').addEventListener('click', (event) => {
+  const release = event.target.closest('button[data-release]');
+  if (release) {
+    act(() => SP.sendJson('DELETE', API + '/overrides/' + release.dataset.release), 'Correction released');
+    return;
+  }
+  const ungroup = event.target.closest('#ungroup');
+  if (ungroup && confirm('Ungroup this complex? Its stations stay; only the grouping goes.')) {
+    act(() => SP.sendJson('DELETE', '/api/master/station-ref/complexes/' + ungroup.dataset.complexId), 'Complex ungrouped');
+  }
+});
+
+try {
+  await Promise.all([load(), loadFields()]);
+} catch (err) {
+  SP.toast('error', 'Could not load this station: ' + err.message);
+}
+</script>
+{% endblock %}

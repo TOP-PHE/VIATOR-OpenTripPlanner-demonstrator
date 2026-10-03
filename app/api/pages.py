@@ -255,14 +255,14 @@ _STATION_ROLES = ("platform_admin", "content_manager")
 _TRAINLINE_TEMPLATE = "admin/master_stations.html"
 
 
-def _station_page(request: Request, path: str, template: str) -> Response:
+def _station_page(request: Request, path: str, template: str, **context: object) -> Response:
     """Render a station screen for a content manager or a platform admin."""
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login(path)
     if user.role not in _STATION_ROLES:
         return _forbidden_html(request, "Content-manager or platform-admin access required.")
-    return templates.TemplateResponse(request, template, {"current_user": user})
+    return templates.TemplateResponse(request, template, {"current_user": user, **context})
 
 
 @router.get("/admin/master/stations", response_class=HTMLResponse)
@@ -295,6 +295,18 @@ def admin_station_trainline_page(request: Request) -> Response:
 def admin_station_reference_page(request: Request) -> Response:
     """Screen D: the VIATOR station reference."""
     return _station_page(request, "/admin/stations/reference", "admin/station_reference.html")
+
+
+@router.get("/admin/stations/reference/{station_id}", response_class=HTMLResponse)
+def admin_station_detail_page(request: Request, station_id: int) -> Response:
+    """Screen D, one station: every code, MERITS candidate, matched stop, flag
+    and correction. The page is a shell; the API answers 404 for an unknown id."""
+    return _station_page(
+        request,
+        f"/admin/stations/reference/{station_id}",
+        "admin/station_reference_detail.html",
+        station_id=station_id,
+    )
 
 
 @router.get("/admin/stations/sources", response_class=HTMLResponse)

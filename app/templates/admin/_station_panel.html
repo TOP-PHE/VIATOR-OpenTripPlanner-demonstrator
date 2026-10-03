@@ -42,6 +42,14 @@
   .sp-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.9rem; }
   .sp-form-grid .wide { grid-column: 1 / -1; }
   .sp-check { display: inline-flex; align-items: center; gap: 0.35rem; font-weight: normal; }
+  button.sp-expand { margin-top: 0.2rem; padding: 0.1rem 0.45rem; font-size: 0.72rem; font-weight: normal; }
+  .sp-kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; font-size: 0.9rem; }
+  .sp-kv dt { color: var(--rail-steel); }
+  .sp-kv dd { margin: 0; }
+  .sp-two { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 1rem; }
+  .sp-tablist { display: flex; gap: 0.25rem; margin-bottom: 0.8rem; }
+  .sp-tablist button { margin-top: 0; }
+  .sp-tablist button[aria-selected="true"] { background: var(--brand-blue); color: #fff; }
 </style>
 
 <nav class="sp-tabs" aria-label="Station panel">
