@@ -39,7 +39,8 @@ _START_TAG_RE = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 _ROOT_RE = re.compile(rb"<(?:[\w.-]+:)?PublicationDelivery\b[^>]*>", re.S)
 _VERSION_RE = re.compile(rb"""\sversion=["']([^"']*)["']""")
 _XSD_RE = re.compile(rb"""schemaLocation=["'][^"']*?/([\d.]+)/xsd""")
-_PROFILE_RE = re.compile(rb"<!--\s*Profile:?\s*([^-]*?)\s*-->")
+# Captured text is stripped by the caller; no nested quantifiers to backtrack on.
+_PROFILE_RE = re.compile(rb"<!--\s*Profile:?([^-]*)-->")
 _PARTICIPANT_RE = re.compile(rb"<(?:[\w.-]+:)?ParticipantRef>([^<]*)<")
 
 OK, WARN, RED = "ok", "warn", "red"
@@ -275,39 +276,55 @@ def _journeys_without_calendar(elements: dict[str, int]) -> bool:
     return has_journeys and calendars == 0
 
 
-def assess(current: Fingerprint, previous: dict[str, Any] | None) -> Assessment:
-    """Rules against MOTIS, then the difference with the previous download."""
-    result = Assessment()
+def _rule_findings(current: Fingerprint) -> list[tuple[str, str]]:
+    """What MOTIS will not read in this file, whatever came before."""
     el = current.elements
+    out: list[tuple[str, str]] = []
     if not el.get("ServiceJourney"):
-        result.add(RED, "no ServiceJourney in the file: no course can be loaded")
+        out.append((RED, "no ServiceJourney in the file: no course can be loaded"))
     elif _journeys_without_calendar(el):
-        result.add(RED, "courses but no calendar (DayTypeAssignment, AvailabilityCondition)")
-    for rule in RULES:
-        if el.get(rule.element):
-            result.add(rule.level, f"{rule.element} (x{el[rule.element]}): {rule.message}")
-    for level, message in _ratio_rules(el):
-        result.add(level, message)
+        out.append((RED, "courses but no calendar (DayTypeAssignment, AvailabilityCondition)"))
+    out += [
+        (rule.level, f"{rule.element} (x{el[rule.element]}): {rule.message}")
+        for rule in RULES
+        if el.get(rule.element)
+    ]
+    out += _ratio_rules(el)
     # gml:pos is read with its literal prefix (nigiri:156-171); any other
     # prefixed element is invisible to the loader's unprefixed XPaths.
-    for prefix, n in current.prefixes.items():
-        if prefix != "gml":
-            result.add(
-                WARN, f"{n} elements written with prefix '{prefix}:': MOTIS reads unprefixed names"
-            )
+    out += [
+        (WARN, f"{n} elements written with prefix '{prefix}:': MOTIS reads unprefixed names")
+        for prefix, n in current.prefixes.items()
+        if prefix != "gml"
+    ]
+    return out
 
-    if not previous or previous.get("version") != FINGERPRINT_VERSION:
-        return result
+
+def _diff_findings(current: Fingerprint, previous: dict[str, Any]) -> list[tuple[str, str]]:
+    """What changed since the previous download: header values, element names."""
     before_header = previous.get("header") or {}
-    for key, now in current.header.items():
-        was = before_header.get(key, "")
-        if was != now:
-            result.add(WARN, f"header {key} changed: {was or '∅'} → {now or '∅'}")
+    out = [
+        (WARN, f"header {key} changed: {before_header.get(key, '') or '∅'} → {now or '∅'}")
+        for key, now in current.header.items()
+        if before_header.get(key, "") != now
+    ]
+    el = current.elements
     before = previous.get("elements") or {}
     appeared = sorted(set(el) - set(before))
     vanished = sorted(set(before) - set(el))
     if appeared:
-        result.add(WARN, "new elements since last download: " + ", ".join(appeared[:20]))
+        out.append((WARN, "new elements since last download: " + ", ".join(appeared[:20])))
     if vanished:
-        result.add(WARN, "elements gone since last download: " + ", ".join(vanished[:20]))
+        out.append((WARN, "elements gone since last download: " + ", ".join(vanished[:20])))
+    return out
+
+
+def assess(current: Fingerprint, previous: dict[str, Any] | None) -> Assessment:
+    """Rules against MOTIS, then the difference with the previous download."""
+    findings = _rule_findings(current)
+    if previous and previous.get("version") == FINGERPRINT_VERSION:
+        findings += _diff_findings(current, previous)
+    result = Assessment()
+    for level, message in findings:
+        result.add(level, message)
     return result
