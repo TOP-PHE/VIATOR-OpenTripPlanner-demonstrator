@@ -8,7 +8,9 @@ not do, and that the page renders for a platform admin only.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,13 @@ from fastapi import HTTPException
 from app.api import pages
 from app.api.admin import station_sources as api
 from app.master import station_files as sf
-from tests.station_fixtures import assert_scripts_parse, inline_scripts, page_request, run_in_node
+from tests.station_fixtures import (
+    assert_scripts_parse,
+    inline_scripts,
+    node_or_skip,
+    page_request,
+    run_in_node,
+)
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin"
 ACTOR = SimpleNamespace(id=uuid.uuid4(), username="ops@example.org", role="platform_admin")
@@ -321,6 +329,27 @@ def test_patch_with_an_explicit_null_clears_a_nullable_field(
     assert out.access_state == "none"
 
 
+def test_patch_without_a_credential_field_leaves_the_credential_attached(
+    recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Absent is not null. The edit dialog relies on it: it leaves the field
+    out unless the operator changed the selection."""
+    credential = uuid.uuid4()
+    source = _source(credential_id=credential)
+    _patch(source, monkeypatch, label="A renamed register")
+    assert source.credential_id == credential
+    assert recorded[0]["metadata"] == {"fields": ["label"]}
+
+
+def test_patch_with_an_explicit_null_detaches_the_credential(
+    recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(credential_id=uuid.uuid4())
+    _patch(source, monkeypatch, credential_id=None)
+    assert source.credential_id is None
+    assert recorded[0]["metadata"] == {"fields": ["credential_id"]}
+
+
 def test_patch_that_changes_nothing_writes_no_audit_row(
     recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -492,6 +521,275 @@ def test_the_sources_screen_wires_its_actions(sources_html: str) -> None:
     # Everything interpolated into innerHTML goes through the escaper.
     assert "SP.esc(s.label)" in sources_html
     assert "SP.esc(s.key)" in sources_html
+
+
+# ── the source dialog and a credential the caller cannot list ──────────
+#
+# GET /api/credentials lists the caller's own credentials, while a source may
+# carry one saved by another platform admin. The page's module is loaded in
+# Node on a stand-in DOM, and its dialog is opened, changed and saved.
+
+MINE = "11111111-1111-4111-8111-111111111111"
+THEIRS = "22222222-2222-4222-8222-222222222222"
+NOT_LISTED = " (not in your credential list)"
+
+FORM_DOM = """
+const MINE = __MINE__;
+const FAKE_SOURCES = __SOURCES__;
+const FAKE_CREDENTIALS = __CREDENTIALS__;  // null: the list cannot be read
+const fakeSent = [];
+const fakeToasts = [];
+
+// An element that accepts any call and any assignment.
+function fakeNode() {
+  return new Proxy({}, {
+    get: (target, key) => (key in target ? target[key] : () => fakeNode()),
+    set: (target, key, value) => { target[key] = value; return true; },
+  });
+}
+
+function fakeInput(defaults = {}) {
+  const el = {value: '', checked: false, ...defaults};
+  el.reset = () => { Object.assign(el, {value: '', checked: false, ...defaults}); };
+  return el;
+}
+
+// A <select> as the HTML standard defines `value`: assigning a value that no
+// option has selects nothing, and the select then reads back ''.
+class FakeOption {
+  constructor(text, value) {
+    this.text = text;
+    this.value = value;
+    this.select = null;
+  }
+
+  remove() {
+    const select = this.select;
+    if (!select) return;
+    const at = select.options.indexOf(this);
+    select.options.splice(at, 1);
+    this.select = null;
+    // With its selected option gone, a select shows its first one.
+    if (select.selectedIndex === at) select.selectedIndex = 0;
+    else if (select.selectedIndex > at) select.selectedIndex -= 1;
+  }
+}
+
+function fakeSelect(...options) {
+  const el = {
+    options: [],
+    selectedIndex: 0,
+    add(option) { option.select = el; el.options.push(option); },
+    get value() { return el.options[el.selectedIndex]?.value ?? ''; },
+    set value(wanted) {
+      el.selectedIndex = el.options.findIndex((option) => option.value === String(wanted));
+    },
+    reset() { el.selectedIndex = 0; },
+  };
+  for (const option of options) el.add(option);
+  return el;
+}
+
+const fakeFields = {
+  credential_id: fakeSelect(new FakeOption('no authentication', '')),
+  enabled: fakeInput({checked: true}),
+};
+const fakeForm = {
+  elements: new Proxy(fakeFields, {get: (fields, name) => (fields[name] ??= fakeInput())}),
+  reset() { for (const field of Object.values(fakeFields)) field.reset(); },
+  addEventListener() {},
+};
+const fakeById = {'format-hints': {textContent: '{}'}, 'source-form': fakeForm};
+
+globalThis.Option = FakeOption;
+globalThis.document = {
+  getElementById: (id) => (fakeById[id] ??= fakeNode()),
+  querySelectorAll: () => [],
+};
+globalThis.fetch = async (url, options = {}) => {
+  if (options.method) {
+    fakeSent.push({method: options.method, url, body: JSON.parse(options.body)});
+    return {ok: true, status: 200, json: async () => ({})};
+  }
+  const data = {
+    '/api/admin/stations/sources': FAKE_SOURCES,
+    '/api/admin/stations/builds': {builds: [], queued: [], missing_inputs: []},
+    '/api/credentials': FAKE_CREDENTIALS,
+  }[url];
+  if (data === null) return {ok: false, status: 503, json: async () => ({detail: 'unavailable'})};
+  return {ok: true, status: 200, json: async () => data, headers: new Map()};
+};
+"""
+
+# The real toast arms a 6 s timer; the scenario only needs what was said.
+FORM_TOAST = """
+globalThis.StationPanel.toast = (kind, text) => { fakeToasts.push(kind + ': ' + text); };
+"""
+
+FORM_SCENARIO = """
+{
+  const select = sourceForm.elements.credential_id;
+  const submit = {preventDefault() {}};
+  const shown = () => ({
+    value: select.value,
+    label: select.options[select.selectedIndex]?.text ?? null,
+    options: select.options.map((option) => option.value),
+  });
+  const save = async () => {
+    await saveSource(submit);
+    return fakeSent.at(-1);
+  };
+  const edit = async (key, change) => {
+    openSourceDialog(sources.find((s) => s.key === key));
+    const before = shown();
+    change(sourceForm.elements);
+    return {shown: before, sent: await save()};
+  };
+  const add = async (key, credential) => {
+    openSourceDialog(null);
+    const before = shown();
+    sourceForm.elements.key.value = key;
+    sourceForm.elements.label.value = 'A new register';
+    select.value = credential;
+    return {shown: before, sent: await save()};
+  };
+
+  const out = {};
+  out.renamed = await edit('REG_ZZ_THEIRS', (fields) => { fields.label.value = 'A renamed register'; });
+  out.own = await edit('REG_ZZ_MINE', (fields) => { fields.label.value = 'A renamed register'; });
+  out.detached = await edit('REG_ZZ_THEIRS', () => { select.value = ''; });
+  out.replaced = await edit('REG_ZZ_THEIRS', () => { select.value = MINE; });
+  out.added = await add('REG_ZZ_NEW', '');
+  out.addedWithMine = await add('REG_ZZ_NEWER', MINE);
+  out.toasts = fakeToasts;
+  process.stdout.write(JSON.stringify(out));
+}
+"""
+
+
+def _listed(key: str, credential_id: str, credential_name: str) -> dict[str, Any]:
+    """A source as GET /api/admin/stations/sources returns it."""
+    source = _source(
+        key=key,
+        label="A test register",
+        kind="registry",
+        format="other",
+        licence=None,
+        country_iso="ZZ",
+        credential_id=uuid.UUID(credential_id),
+    )
+    listed = api.source_response(source, today=TODAY, credential_name=credential_name)  # type: ignore[arg-type]
+    return listed.model_dump()
+
+
+def _run_source_dialog(folder: Path, credentials: list[dict[str, str]] | None) -> dict[str, Any]:
+    """Drive the source dialog of the real page, the caller's credential list
+    being `credentials` (None: it cannot be read)."""
+    node = node_or_skip()
+    ((_, shared),) = inline_scripts((TEMPLATES / "_station_panel.html").read_text(encoding="utf-8"))
+    ((is_module, page),) = inline_scripts(
+        (TEMPLATES / "station_sources.html").read_text(encoding="utf-8")
+    )
+    assert is_module
+    listed = [
+        _listed("REG_ZZ_THEIRS", THEIRS, "Other admin key"),
+        _listed("REG_ZZ_MINE", MINE, "My key"),
+    ]
+    dom = (
+        FORM_DOM.replace("__MINE__", json.dumps(MINE))
+        .replace("__SOURCES__", json.dumps(listed))
+        .replace("__CREDENTIALS__", json.dumps(credentials))
+    )
+    # A file, not `node -e`: the page's script is a module with a top-level await.
+    program = folder / "source_dialog.mjs"
+    program.write_text(dom + shared + FORM_TOAST + page + FORM_SCENARIO, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(program)], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.fixture(scope="module")
+def dialog(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """The caller owns `My key`; `Other admin key` is another admin's."""
+    return _run_source_dialog(tmp_path_factory.mktemp("dialog"), [{"id": MINE, "name": "My key"}])
+
+
+@pytest.fixture(scope="module")
+def dialog_without_list(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """GET /api/credentials fails: the select holds `no authentication` only."""
+    return _run_source_dialog(tmp_path_factory.mktemp("dialog"), None)
+
+
+def test_renaming_a_source_keeps_a_credential_the_caller_cannot_list(
+    dialog: dict[str, Any], recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admin B renames a source that carries admin A's credential."""
+    renamed = dialog["renamed"]
+    # The select names the credential instead of falling back to "no authentication" ...
+    assert renamed["shown"]["value"] == THEIRS
+    assert renamed["shown"]["label"] == "Other admin key" + NOT_LISTED
+    assert renamed["shown"]["options"] == ["", MINE, THEIRS]
+    # ... and the request leaves the credential out, since it was not changed.
+    assert renamed["sent"]["method"] == "PATCH"
+    assert renamed["sent"]["url"] == "/api/admin/stations/sources/REG_ZZ_THEIRS"
+    assert "credential_id" not in renamed["sent"]["body"]
+    assert dialog["toasts"] == ["success: Source saved"] * 6
+
+    # The route, given that very body: the label changes, the credential stays.
+    source = _source(
+        key="REG_ZZ_THEIRS",
+        label="A test register",
+        kind="registry",
+        format="other",
+        licence=None,
+        country_iso="ZZ",
+        credential_id=uuid.UUID(THEIRS),
+    )
+    _patch(source, monkeypatch, **renamed["sent"]["body"])
+    assert source.label == "A renamed register"
+    assert source.credential_id == uuid.UUID(THEIRS)
+    assert recorded[0]["metadata"] == {"fields": ["label"]}
+
+
+def test_the_dialog_sends_the_credential_only_when_the_selection_changed(
+    dialog: dict[str, Any],
+) -> None:
+    # The caller's own credential is an ordinary option, and is not sent either.
+    assert dialog["own"]["shown"]["value"] == MINE
+    assert dialog["own"]["shown"]["label"] == "My key"
+    assert dialog["own"]["shown"]["options"] == ["", MINE]
+    assert "credential_id" not in dialog["own"]["sent"]["body"]
+    # Choosing "no authentication" detaches: an explicit null.
+    assert dialog["detached"]["sent"]["body"]["credential_id"] is None
+    # Choosing another credential replaces it.
+    assert dialog["replaced"]["sent"]["body"]["credential_id"] == MINE
+
+
+def test_the_placeholder_of_one_source_is_not_offered_to_the_next(
+    dialog: dict[str, Any],
+) -> None:
+    # "Add a source", opened after an edit of the source with admin A's credential.
+    assert dialog["added"]["shown"] == {
+        "value": "",
+        "label": "no authentication",
+        "options": ["", MINE],
+    }
+    assert dialog["added"]["sent"]["method"] == "POST"
+    assert dialog["added"]["sent"]["body"]["key"] == "REG_ZZ_NEW"
+    assert "credential_id" not in dialog["added"]["sent"]["body"]
+    assert dialog["addedWithMine"]["sent"]["body"]["credential_id"] == MINE
+
+
+def test_a_credential_list_that_cannot_be_read_does_not_detach_the_credential(
+    dialog_without_list: dict[str, Any],
+) -> None:
+    """The owner edits their own source while GET /api/credentials fails."""
+    own = dialog_without_list["own"]
+    assert own["shown"]["value"] == MINE
+    assert own["shown"]["label"] == "My key" + NOT_LISTED
+    assert "credential_id" not in own["sent"]["body"]
 
 
 def test_the_tab_bar_hides_the_sources_entry_from_content_managers(shared_html: str) -> None:

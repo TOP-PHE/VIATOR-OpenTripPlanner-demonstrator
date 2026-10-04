@@ -228,7 +228,20 @@ def test_rebuild_jobs_kind_defaults_to_graph(alembic_cfg: Config) -> None:
 
 
 def test_downgrade_past_the_station_panel_leaves_no_station_table(alembic_cfg: Config) -> None:
+    """Rolled back with jobs in the queue: no station table, no `kind`, and no
+    station job either. A station job has no session, so without `kind` the
+    previous release's worker would run it as the legacy session-less graph build."""
     engine = _fresh_head(alembic_cfg)
+    # `log` only labels the rows here, so the survivor can be told apart.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO rebuild_jobs (status, kind, log) VALUES "
+                "('pending', 'station_build', 'a queued station build'), "
+                "('done', 'station_build', 'a finished station build'), "
+                "('pending', 'graph', 'a queued graph build')"
+            )
+        )
     command.downgrade(alembic_cfg, "20261002_2100_rebuild_cancel")
     inspector = inspect(engine)
     left = {
@@ -238,3 +251,6 @@ def test_downgrade_past_the_station_panel_leaves_no_station_table(alembic_cfg: C
     }
     assert not left, f"station tables left behind: {sorted(left)}"
     assert "kind" not in {c["name"] for c in inspector.get_columns("rebuild_jobs")}
+    with engine.connect() as conn:
+        jobs = [tuple(row) for row in conn.execute(text("SELECT status, log FROM rebuild_jobs"))]
+    assert jobs == [("pending", "a queued graph build")]

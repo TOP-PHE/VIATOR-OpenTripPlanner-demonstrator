@@ -131,13 +131,17 @@
 const SP = globalThis.StationPanel;
 const FORMAT_HINTS = JSON.parse(document.getElementById('format-hints').textContent);
 const TEXT_FIELDS = ['label', 'kind', 'format', 'acquisition', 'resolver_type', 'country_iso', 'operator',
-  'licence', 'licence_url', 'access_expires_on', 'refresh_cadence', 'credential_id'];
+  'licence', 'licence_url', 'access_expires_on', 'refresh_cadence'];
 const FLAG_FIELDS = ['triggers_rebuild', 'enabled', 'source_key_unresolved'];
 const ACCESS_PILL = {expired: 'bad', soon: 'warn', ok: 'ok'};
 const BUILD_PILL = {done: 'ok', failed: 'bad', running: 'info'};
 
 let sources = [];
 let editingKey = null;
+// The credential the source dialog was opened with (null: none), and the
+// option standing for it when the caller's own list does not hold it.
+let openedCredential = null;
+let unlistedCredential = null;
 let uploadKey = null;
 
 const sourceDialog = document.getElementById('source-dialog');
@@ -277,6 +281,24 @@ function fillForm(s) {
   sourceForm.elements.resolver_config.value = s.resolver_config ? JSON.stringify(s.resolver_config, null, 2) : '';
 }
 
+// The select lists the caller's own credentials, and a source may carry one
+// saved by another administrator, or be opened before the list has arrived.
+// A select given a value none of its options has reads back '', which would
+// show "no authentication": such a credential gets an option of its own.
+function showCredential(s) {
+  const select = sourceForm.elements.credential_id;
+  if (unlistedCredential) unlistedCredential.remove();
+  unlistedCredential = null;
+  openedCredential = s?.credential_id ?? null;
+  select.value = openedCredential ?? '';
+  if (openedCredential && select.value !== openedCredential) {
+    const name = s.credential_name || 'saved credential';
+    unlistedCredential = new Option(name + ' (not in your credential list)', openedCredential);
+    select.add(unlistedCredential);
+    select.value = openedCredential;
+  }
+}
+
 function openSourceDialog(s) {
   editingKey = s ? s.key : null;
   document.getElementById('source-dialog-title').textContent = s ? 'Edit ' + s.key : 'Add a source';
@@ -284,12 +306,17 @@ function openSourceDialog(s) {
   sourceForm.elements.key.value = s ? s.key : '';
   sourceForm.elements.key.disabled = Boolean(s);
   if (s) fillForm(s);
+  showCredential(s);
   sourceDialog.showModal();
 }
 
 function readForm() {
   const body = {};
   for (const name of TEXT_FIELDS) body[name] = sourceForm.elements[name].value.trim() || null;
+  // The credential is sent only when the operator changed the selection: the
+  // API leaves an absent field as it is, and detaches the credential on a null.
+  const credential = sourceForm.elements.credential_id.value || null;
+  if (credential !== openedCredential) body.credential_id = credential;
   for (const name of FLAG_FIELDS) body[name] = sourceForm.elements[name].checked;
   const raw = sourceForm.elements.resolver_config.value.trim();
   body.resolver_config = raw ? JSON.parse(raw) : null;

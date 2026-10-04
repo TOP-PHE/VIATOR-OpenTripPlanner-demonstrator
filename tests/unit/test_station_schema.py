@@ -4,7 +4,9 @@ Alembic renders the four migrations to SQL in offline mode, so the things the
 design insists on can be asserted here: the revision ids fit Alembic's
 varchar(32), `(plc, era_uopid)` is unique with `era_uopid` NOT NULL,
 `(series, code)` is a plain index, the FK actions are the specified ones, and
-the migrations create exactly the columns the ORM models declare.
+the migrations create exactly the columns the ORM models declare. The one
+statement that touches rows, the DELETE of the last downgrade, is also run on
+an in-memory SQLite stand-in for `rebuild_jobs`.
 
 The live upgrade/downgrade runs in tests/integration/test_migrations.py.
 """
@@ -17,12 +19,16 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from alembic import command
 from app import models
+from app.master.station_import import STATION_BUILD_KIND
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = "20261002_2100_rebuild_cancel"
@@ -319,6 +325,46 @@ def test_downgrade_drops_everything_the_upgrade_created(downgrade_sql: str) -> N
     dropped = set(re.findall(r"DROP TABLE (\w+);", downgrade_sql))
     assert dropped == set(STATION_TABLES)
     assert "ALTER TABLE rebuild_jobs DROP COLUMN kind;" in downgrade_sql
+
+
+def test_downgrade_deletes_the_station_jobs_before_it_drops_the_column(downgrade_sql: str) -> None:
+    # A station job has no session. Without `kind` it reads as the legacy
+    # session-less graph job, which the previous release's worker runs as an
+    # OTP build: the rows go first, while the column can still tell them apart.
+    delete = "DELETE FROM rebuild_jobs WHERE kind = 'station_build';"
+    assert delete in downgrade_sql
+    assert downgrade_sql.index(delete) < downgrade_sql.index(
+        "ALTER TABLE rebuild_jobs DROP COLUMN kind;"
+    )
+    # The migration spells the kind out; it is the one the app queues.
+    assert f"'{STATION_BUILD_KIND}'" in delete
+
+
+def test_downgrade_leaves_the_graph_jobs_and_no_station_job() -> None:
+    """The downgrade of `rebuild_jobs.kind`, run on a stand-in table."""
+    script = ScriptDirectory.from_config(_cfg(io.StringIO()))
+    migration = script.get_revision(REVISIONS[-1]).module
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE rebuild_jobs (id INTEGER PRIMARY KEY, session_id TEXT, "
+                "status TEXT NOT NULL, kind VARCHAR(32) DEFAULT 'graph' NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO rebuild_jobs (id, status, kind) VALUES "
+                "(1, 'pending', 'station_build'), (2, 'done', 'station_build'), "
+                "(3, 'pending', 'graph'), (4, 'done', 'graph')"
+            )
+        )
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.downgrade()
+        left = [tuple(row) for row in conn.execute(text("SELECT * FROM rebuild_jobs ORDER BY id"))]
+    engine.dispose()
+    # Three columns: `kind` is gone, and so is every job only it could tell apart.
+    assert left == [(3, None, "pending"), (4, None, "done")]
 
 
 def test_required_tables_of_the_integration_test_cover_the_station_tables() -> None:

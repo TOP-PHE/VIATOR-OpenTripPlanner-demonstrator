@@ -36,4 +36,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # A station job has no session. Without `kind` it reads as the legacy
+    # session-less graph job, and the worker of the previous release would run
+    # an OTP build for it. Nothing before this revision can run one: they go
+    # first, finished ones included, while the column still tells them apart.
+    op.execute(sa.text("DELETE FROM rebuild_jobs WHERE kind = 'station_build'"))
     op.drop_column("rebuild_jobs", "kind")

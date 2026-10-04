@@ -792,6 +792,7 @@ corrected; this table is the record.
 | source keys such as `NAP_CH_SBB` | the shapes document says `source_key` is the column name | `nap_CH_SBB`, verbatim |
 | only `station_code_series` is seeded | the upload route needs a source to exist, and its `format` is what says which file shape it accepts | the first migration also seeds 22 `station_source` rows; kind `offline_build` added |
 | Sonar counts new migrations in new-code coverage | `sonar.sources=app`; `alembic/` is outside it | corrected in §9 |
+| `downgrade()` "must really drop everything" | dropping `rebuild_jobs.kind` left the station jobs in the queue. They have no session, so the worker of the previous release takes one for the legacy session-less graph job and starts an OTP build | the downgrade deletes the `station_build` jobs, finished ones included, before it drops the column |
 
 ### Storage and upload
 
@@ -838,6 +839,7 @@ corrected; this table is the record.
 | screen C: fix `page` "at the API — **not** in the template" | the panel sends `page=0` on every fresh search; with the API fix alone, no search would ever jump to its first match again | the API fix, and the panel sends `page` only when the operator asked for a page by number |
 | screen C: `.hint` and `.flag` are "defined only in `journey.html`'s own style block" | true of `.flag`. `.hint` had no unscoped rule in any template or stylesheet | `.flag` moved; `.hint` defined in `_base.html`, colour only, which also mutes the hints that had no rule on the coverage and sessions pages. `journey.html` opts out with `.hint { color: inherit; }` and renders as before. **Owner to decide** whether it should |
 | screen C: "promote" `.flag` | two of its four variants are below WCAG AA (4.2:1 and 3.6:1), and the Sonar gate refuses that on new CSS | the base carries AA pairs for those two; `journey.html` keeps its own two and renders as before. **Owner to decide** whether the journey page adopts the base pairs |
+| screen E: "edit" a source | the dialog lists the caller's own credentials and sent every field. A source can carry a credential saved by another administrator: the select could not show it, read back empty, and saving any other change sent `credential_id: null`, which detached it | the dialog shows such a credential under its name, marked as not in the caller's list, and sends `credential_id` only when the selection changed. The `PATCH` route leaves an absent field as it is; only an explicit `null` detaches |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:
 `warnings`, `n_issues`, `n_warnings`, `review_links`, `nap_station_ids`, `best_match_method`,
