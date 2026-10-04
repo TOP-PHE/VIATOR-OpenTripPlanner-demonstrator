@@ -355,7 +355,8 @@ class StationRef(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=_TRUE)
     crd_source_tag: Mapped[str | None] = mapped_column(Text)
 
-    # MERITS: mirrors the chosen row of station_ref_merits, for fast filtering.
+    # MERITS: code, origin and confidence mirror the chosen row of
+    # station_ref_merits, for fast filtering. The rule is the build's own text.
     uic_merits: Mapped[str | None] = mapped_column(_KEY)
     uic_merits_origin: Mapped[str | None] = mapped_column(Text)
     uic_merits_rule: Mapped[str | None] = mapped_column(Text)

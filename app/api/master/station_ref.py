@@ -10,6 +10,10 @@
 
 Authorization: content_manager or platform_admin, declared on every route.
 
+The four routes that write are serialised with the station build
+(`app/master/station_lock.py`): each takes the lock before it reads anything,
+and answers 409 while a build is writing the reference.
+
 **The pivot has one affordable shape.** "One column per provider" is stored
 long, in `station_ref_code`. The list paginates `station_ref` FIRST, then
 fetches the codes of that page's stations in one query and pivots them here,
@@ -36,6 +40,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from ... import audit
 from ...db import get_db
+from ...master import station_lock
 from ...master import station_overrides as so
 from ...models import (
     StationBuild,
@@ -61,6 +66,11 @@ COMPLEX_KINDS: frozenset[str] = frozenset(
 COMPLEX_ROLES = ("principal", "member")
 NO_CONFIDENCE = "none"
 _NOT_FOUND = "Station not found"
+_BUILD_WRITING = (
+    "A station build is writing the reference: nothing was saved. "
+    "Try again when the build has finished."
+)
+_BUILD_WRITING_DOC = "A station build is writing the reference: nothing is saved"
 _PROVIDER_FORMAT = "offline_master_column"
 _FACET_LIMIT = 200
 _HISTORY_LIMIT = 100
@@ -646,6 +656,20 @@ def get_station(
 # ────────────────────────────── overrides ──────────────────────────────
 
 
+def _hold_reference(db: DbSession) -> None:
+    """What every route that writes the reference does before it reads anything.
+
+    The station build plans from one reading of the reference and of the
+    corrections, then writes: an edit that landed in between would be
+    overwritten, or left half applied. The lock keeps a build out of its
+    write stage until this request's transaction ends. While a build is
+    writing, the request is refused at once: it does not hang for the length
+    of the build.
+    """
+    if not station_lock.try_for_edit(db):
+        raise HTTPException(409, _BUILD_WRITING)
+
+
 def _overrides_of(db: DbSession, station_id: int) -> list[StationRefOverride]:
     return list(
         db.execute(
@@ -723,6 +747,7 @@ def _restore(db: DbSession, station: StationRef, field_name: str, computed: str 
     responses={
         400: {"description": "A field that cannot be corrected, or a value that does not fit it"},
         404: {"description": _NOT_FOUND},
+        409: {"description": _BUILD_WRITING_DOC},
     },
 )
 def set_override(
@@ -738,6 +763,7 @@ def set_override(
     underneath what it computes itself. Correcting a field that is already
     corrected replaces the earlier correction, which is kept as released.
     """
+    _hold_reference(db)
     station = _station_or_404(db, station_id)
     try:
         value = so.from_text(body.field_name, body.value)
@@ -791,7 +817,10 @@ def set_override(
     "/{station_id}/overrides/{override_id}",
     responses={
         404: {"description": "No such correction on this station"},
-        409: {"description": "The correction was already released, or cannot be"},
+        409: {
+            "description": "The correction was already released, or cannot be. "
+            + _BUILD_WRITING_DOC
+        },
     },
 )
 def release_override(
@@ -803,6 +832,7 @@ def release_override(
 ) -> dict[str, Any]:
     """Release a correction: the field goes back to what the build computes
     now, which is not necessarily what it computed when the correction was made."""
+    _hold_reference(db)
     station = _station_or_404(db, station_id)
     override = db.get(StationRefOverride, override_id)
     if override is None or override.station_id != station_id:
@@ -837,7 +867,9 @@ def release_override(
     responses={
         400: {"description": "Unknown kind, or a principal that is not one of the stations"},
         404: {"description": "One of the stations does not exist"},
-        409: {"description": "One of the stations already belongs to a complex"},
+        409: {
+            "description": "One of the stations already belongs to a complex. " + _BUILD_WRITING_DOC
+        },
     },
 )
 def create_complex(
@@ -856,6 +888,7 @@ def create_complex(
     ids = sorted(set(body.station_ids))
     if body.principal_id is not None and body.principal_id not in ids:
         raise HTTPException(400, "principal_id must be one of station_ids")
+    _hold_reference(db)
     stations = list(db.execute(select(StationRef).where(StationRef.id.in_(ids))).scalars())
     if len(stations) != len(ids):
         raise HTTPException(404, "One of the stations does not exist")
@@ -894,7 +927,10 @@ def create_complex(
 @router.delete(
     "/complexes/{complex_id}",
     status_code=204,
-    responses={404: {"description": "Complex not found"}},
+    responses={
+        404: {"description": "Complex not found"},
+        409: {"description": _BUILD_WRITING_DOC},
+    },
 )
 def delete_complex(
     complex_id: int,
@@ -903,6 +939,7 @@ def delete_complex(
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> None:
     """Ungroup a complex. Its stations stay; only the grouping goes."""
+    _hold_reference(db)
     group = db.get(StationComplex, complex_id)
     if group is None:
         raise HTTPException(404, "Complex not found")

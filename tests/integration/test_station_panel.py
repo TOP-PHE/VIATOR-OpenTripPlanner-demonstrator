@@ -9,8 +9,11 @@ Every station file used here is synthetic: PLC prefix `ZZ`, invented names.
 from __future__ import annotations
 
 import os
+import threading
+import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1389,6 +1392,215 @@ def test_group_and_ungroup_a_complex(
     assert (
         client.delete(f"{REF}/complexes/{complex_id}", headers=content_manager).status_code == 404
     )
+
+
+def test_a_released_merits_correction_leaves_the_rule_the_build_computes(
+    client: TestClient,
+    admin: dict[str, str],
+    content_manager: dict[str, str],
+    built: dict[str, dict],
+) -> None:
+    from app.master import station_import
+
+    def rebuild(rule: str) -> None:
+        # A station without a MERITS code, as the master writes most of them:
+        # a sentence saying why, and no candidate.
+        rows = master_rows()
+        rows[3] = {**rows[3], "uic_merits_rule": rule}
+        filename, content = station_file("OFFLINE_MASTER", rows)
+        _upload(client, admin, "OFFLINE_MASTER", content, filename).raise_for_status()
+        output, success = station_import.run_build()
+        assert success, output
+
+    # Invented sentences, with the shape of the real ones.
+    said = "No operator timetable names this station, and no calculation covers its country"
+    reworded = "No operator timetable names this station; its country has no calculation yet"
+    rebuild(said)
+    one = f"{REF}/{_station_id('ZZ00003', 'ZZOP03B')}"
+    before = client.get(one, headers=content_manager).json()
+    assert (before["uic_merits"], before["uic_merits_rule"], before["merits"]) == (None, said, [])
+
+    r = client.post(
+        f"{one}/overrides",
+        headers=content_manager,
+        json={"field_name": "uic_merits", "value": "9900555", "reason": "per the operator"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["computed_value_at_set"] is None
+    corrected = client.get(one, headers=content_manager).json()
+    assert (corrected["uic_merits"], corrected["uic_merits_origin"]) == ("9900555", "Manual")
+    # The reason is on the Manual candidate; the rule stays the build's sentence.
+    assert [(m["code"], m["rule"]) for m in corrected["merits"]] == [
+        ("9900555", "per the operator")
+    ]
+    assert corrected["uic_merits_rule"] == said
+
+    # The next issue of the master rewords the sentence, under the correction.
+    rebuild(reworded)
+    rebuilt = client.get(one, headers=content_manager).json()
+    assert (rebuilt["uic_merits"], rebuilt["uic_merits_rule"]) == ("9900555", reworded)
+
+    client.delete(f"{one}/overrides/{r.json()['id']}", headers=content_manager).raise_for_status()
+    released = client.get(one, headers=content_manager).json()
+    assert (released["uic_merits"], released["uic_merits_origin"], released["merits"]) == (
+        None,
+        None,
+        [],
+    )
+    assert released["uic_merits_rule"] == reworded  # what the build computes now, not NULL
+
+    # The next build has nothing to put back: no change, no history row of its own.
+    output, success = station_import.run_build()
+    assert success, output
+    assert "done: 0 created, 0 changed, 5 unchanged, 0 absent" in output
+    assert _rows(
+        "SELECT old_value, new_value FROM station_ref_history"
+        " WHERE field_name = 'uic_merits_rule' ORDER BY build_id"
+    ) == [(None, said), (said, reworded)]
+
+
+# The lock of app/master/station_lock.py, as another session takes it: a build
+# in its write stage holds it exclusively, an edit in flight holds it shared.
+_BUILD_HOLDS = "SELECT pg_advisory_xact_lock(CAST(:key AS bigint))"
+_EDIT_HOLDS = "SELECT pg_advisory_xact_lock_shared(CAST(:key AS bigint))"
+_RENAME = {"field_name": "name", "value": "Sampleton Central", "reason": "platform signs"}
+
+
+def _lock_key() -> dict[str, int]:
+    from app.master import station_lock
+
+    return {"key": station_lock.REFERENCE_LOCK_KEY}
+
+
+def _wait_until(done: Callable[[], bool], seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not done():
+        assert time.monotonic() < deadline, "what the test waits for never happened"
+        time.sleep(0.05)
+
+
+def test_no_edit_goes_through_while_a_build_is_writing(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.db import engine
+
+    central, sampleton = _station_id("ZZ00001"), _station_id("ZZ00002")
+    yard, halt = _station_id("ZZ00003", "ZZOP03A"), _station_id("ZZ00004")
+    one = f"{REF}/{sampleton}"
+    earlier = client.post(
+        f"{one}/overrides",
+        headers=content_manager,
+        json={"field_name": "rl100", "value": "ZSAM", "reason": "as signed"},
+    )
+    assert earlier.status_code == 201, earlier.text
+    grouping = {"label": "Exampleville", "kind": "one_site", "station_ids": [central, sampleton]}
+    group = client.post(f"{REF}/complexes", headers=content_manager, json=grouping)
+    assert group.status_code == 201, group.text
+
+    with engine.connect() as build:  # stands for a build in its write stage
+        build.execute(text(_BUILD_HOLDS), _lock_key())
+        refused = [
+            client.post(f"{one}/overrides", headers=content_manager, json=_RENAME),
+            client.delete(f"{one}/overrides/{earlier.json()['id']}", headers=content_manager),
+            client.post(
+                f"{REF}/complexes",
+                headers=content_manager,
+                json={**grouping, "station_ids": [yard, halt]},
+            ),
+            client.delete(f"{REF}/complexes/{group.json()['id']}", headers=content_manager),
+        ]
+        for response in refused:
+            # At once, with the reason: the request does not wait for the build.
+            assert response.status_code == 409, response.text
+            assert "station build is writing" in response.json()["detail"]
+        # Reading is never refused, and nothing was written.
+        detail = client.get(one, headers=content_manager)
+        assert detail.status_code == 200, detail.text
+        assert (detail.json()["name"], detail.json()["rl100"]) == ("Sampleton", "ZSAM")
+        assert _scalar("SELECT count(*) FROM station_ref_override WHERE released_at IS NULL") == 1
+        assert _scalar("SELECT count(*) FROM station_ref WHERE complex_id IS NOT NULL") == 2
+        build.rollback()
+
+    # The build is over: the same correction goes through.
+    assert client.post(f"{one}/overrides", headers=content_manager, json=_RENAME).status_code == 201
+    assert client.get(one, headers=content_manager).json()["name"] == "Sampleton Central"
+
+
+def test_two_edits_do_not_keep_each_other_out(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.db import engine
+
+    one = f"{REF}/{_station_id('ZZ00002')}"
+    with engine.connect() as other:  # another content manager's edit, in mid-flight
+        other.execute(text(_EDIT_HOLDS), _lock_key())
+        r = client.post(f"{one}/overrides", headers=content_manager, json=_RENAME)
+        assert r.status_code == 201, r.text
+        other.rollback()
+
+
+def test_a_build_waits_for_an_edit_in_flight_and_reapplies_its_correction(
+    client: TestClient, admin: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.db import engine
+    from app.master import station_import
+
+    sampleton = _station_id("ZZ00002")
+    # The next issue of the master renames Sampleton and moves it: the build
+    # rewrites every built column of its row.
+    rows = master_rows()
+    rows[1] = {**rows[1], "era_name": "Sampleton Hbf", "lat": "50.123000"}
+    filename, content = station_file("OFFLINE_MASTER", rows)
+    _upload(client, admin, "OFFLINE_MASTER", content, filename).raise_for_status()
+
+    waiting = (
+        "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database"
+        " WHERE d.datname = current_database() AND l.locktype = 'advisory' AND NOT l.granted"
+    )
+    outcome: list[tuple[str, bool]] = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(station_import.run_build()), daemon=True
+    )
+    with engine.connect() as edit:  # a correction route, in mid-flight
+        edit.execute(text(_EDIT_HOLDS), _lock_key())
+        worker.start()
+        try:
+            # The build parses its files, loads the registers and stops at the
+            # lock: it has read nothing of the reference yet.
+            _wait_until(lambda: _scalar(waiting) == 1)
+            assert outcome == []
+            edit.execute(
+                text("UPDATE station_ref SET name = 'Sampleton Central' WHERE id = :id"),
+                {"id": sampleton},
+            )
+            edit.execute(
+                text(
+                    "INSERT INTO station_ref_override (station_id, field_name, value, reason,"
+                    " computed_value_at_set, computed_value_latest) VALUES (:id, 'name',"
+                    " 'Sampleton Central', 'platform signs', 'Sampleton', 'Sampleton')"
+                ),
+                {"id": sampleton},
+            )
+            edit.commit()
+        finally:
+            edit.rollback()  # whatever happened above, let the build go
+            worker.join(timeout=60)
+    assert not worker.is_alive()
+    ((output, success),) = outcome
+    assert success, output
+
+    # The correction was committed while the build waited, so the build read
+    # it: the name holds, the other field improves, and what a release would
+    # restore is what the build computes now.
+    assert _rows("SELECT name, lat FROM station_ref WHERE id = :id", id=sampleton) == [
+        ("Sampleton Central", 50.123)
+    ]
+    assert _rows(
+        "SELECT computed_value_at_set, computed_value_latest FROM station_ref_override"
+    ) == [("Sampleton", "Sampleton Hbf")]
+    assert _rows("SELECT field_name FROM station_ref_history") == [("lat",)]
+    counts = _scalar("SELECT counts FROM station_build ORDER BY id DESC LIMIT 1")
+    assert counts["overrides_applied"] == 1  # type: ignore[index]
 
 
 @pytest.mark.parametrize(("method", "path"), REFERENCE_ROUTES)

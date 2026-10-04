@@ -156,7 +156,16 @@ def apply_overrides(
 
 ORIGIN_MANUAL = "Manual"
 # The station_ref columns that mirror the chosen MERITS candidate.
-MERITS_MIRROR = ("uic_merits", "uic_merits_origin", "uic_merits_rule", "uic_merits_confidence")
+#
+# Not `uic_merits_rule`: that column is the build's own text, and a correction
+# never writes it. Where the master gives a station no code, it carries a
+# sentence saying why and no candidate, so the sentence is on the row and
+# nowhere else. Were the mirror to write the rule, the correction's reason
+# would replace it and a release, with nothing chosen, could only blank it.
+# Left alone, it is also what the latest build computed whenever the
+# correction is released. The reason of a correction is on its override row,
+# and on the `Manual` candidate when the correction adds one.
+MERITS_MIRROR = ("uic_merits", "uic_merits_origin", "uic_merits_confidence")
 
 
 def merits_with_override(
@@ -207,13 +216,12 @@ def merits_without_override(
 
 
 def merits_mirror(candidates: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """The four station_ref columns that mirror the chosen candidate."""
+    """The station_ref columns that mirror the chosen candidate (`MERITS_MIRROR`)."""
     chosen = next((c for c in candidates if c["is_chosen"]), None)
     if chosen is None:
         return dict.fromkeys(MERITS_MIRROR)
     return {
         "uic_merits": chosen["code"],
         "uic_merits_origin": chosen.get("origin"),
-        "uic_merits_rule": chosen.get("rule"),
         "uic_merits_confidence": chosen.get("confidence"),
     }

@@ -467,6 +467,10 @@ As built (`app/api/master/station_ref.py`):
   (`POST /complexes`), with one of them optionally its principal, and removed whole
   (`DELETE /complexes/{id}`). One made here is `manual`; a station is in one complex at most; a
   rebuild leaves `complex_id` and `complex_role` alone.
+- **While a station build is writing the reference**, the four routes that write (set or release
+  a correction, group or ungroup a complex) answer `409` at once and save nothing; the panel
+  shows the reason. They do not wait: a build's write stage lasts far longer than a request
+  should. Reading is never refused.
 
 ### E. Sources and integration — `/admin/stations/sources`
 
@@ -512,7 +516,11 @@ job provokes them and there was nothing to suppress there.
    per source version, and are committed — so the delta between two versions is available
    whether or not the build that follows succeeds.
 3. *Build*, in one transaction. `station_ref` is upserted on `(plc, era_uopid)`, hand corrections
-   are re-applied, and the derived children are replaced.
+   are re-applied, and the derived children are replaced. The transaction opens by taking a
+   Postgres advisory lock (`app/master/station_lock.py`) and reads the reference and the active
+   corrections only once it holds it: the build plans from one reading, so no correction may be
+   set or released between that reading and the commit. The routes that write a correction or a
+   complex take the same lock, shared, before they read anything, and do not wait for it.
 
 A row present in an earlier build and absent from the current master is **kept**, untouched, and
 is recognisable by its `last_built_build_id`: deleting it would delete its hand corrections.
@@ -814,6 +822,8 @@ corrected; this table is the record.
 | each value of `uic_merits_conflict_values` is a further candidate | every item is `<code>=<labels>`, never a bare code, and on 14 of the 35 cells the code is the chosen one again | split on the first `=`: the code is the candidate, the labels are its `sources`; a code the row already carries gains the labels and is not a second candidate |
 | `era_alt_name` is split on `\|` | `;` joins several names; a `\|` only occurs inside one bilingual name | split on `;`, the pipe kept; `alt_name_text` joins the names with `; ` |
 | `crd_location` takes the file's `name`, `lat`, `lon` | they are the spine's joined values: on 404 rows retired in CRD they are ERA's (`name_src`, `pos_src`), 394 register rows | `name` only where `name_src` is `CRD`, `lat` / `lon` only where `pos_src` is `CRD`; NULL otherwise |
+| hand corrections are re-applied by the build, "in one transaction" | the build read the reference and the corrections once and took no lock, and the correction routes wrote `station_ref` directly: a correction set or released while a build ran was overwritten or left half applied until the next build, and the two could deadlock | one transaction-level advisory lock. The build takes it exclusively, first, and reads only then; a writing route takes it shared before it reads, without waiting, and answers `409` while a build is writing |
+| `station_ref`'s four MERITS columns mirror the chosen candidate | 19,018 master rows carry no MERITS code and a `uic_merits_rule` sentence saying why, with no candidate: the sentence is on the row and nowhere else. A correction replaced it with its reason, and a release, with nothing chosen, blanked it | three columns mirror: code, origin, confidence. `uic_merits_rule` is the build's own text, which a correction never writes; its reason is on the override and on the `Manual` candidate |
 
 ### Screens
 
@@ -840,4 +850,6 @@ stops: `rail_served`, `rail_repl`, `modes`, the three code columns, `review_link
 
 **A MERITS correction** changes which candidate is chosen, never the candidates: the build's own
 candidates all stay, a `Manual` one is added when the corrected code is none of them, and
-`station_ref`'s four MERITS columns mirror whichever is chosen.
+`station_ref`'s `uic_merits`, `uic_merits_origin` and `uic_merits_confidence` mirror whichever is
+chosen. `uic_merits_rule` does not: it stays what the build computed, under a correction and
+after its release.

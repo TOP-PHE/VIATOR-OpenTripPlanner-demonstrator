@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from sqlalchemy.dialects import postgresql
 
 from app.api import pages
 from app.api.master import station_ref as api
+from app.master import station_lock
 from app.master import station_overrides as so
 from app.security import require_content_manager
 from tests.station_fixtures import assert_scripts_parse, page_request
@@ -272,20 +274,37 @@ class _FakeDb:
         self.station = station
         self._scalars = list(scalars)
         self.added: list[Any] = []
+        self.deleted: list[Any] = []
         self.objects: dict[int, Any] = {}
         self.committed = False
+        # False: a station build holds the lock, and no edit may go through.
+        self.lock_free = True
+        # What the route asked of the database, in order: "lock", "get", "execute".
+        self.events: list[str] = []
 
     def get(self, model: Any, key: int) -> Any:
+        self.events.append("get")
         if model is api.StationRef:
             return self.station if self.station is not None and key == self.station.id else None
         return self.objects.get(key)
 
-    def execute(self, _stmt: object) -> Any:
+    def execute(self, statement: Any) -> Any:
+        # The lock a writing route tries before anything else: not waited for.
+        if "pg_try_advisory_xact_lock_shared" in str(statement):
+            self.events.append("lock")
+            return SimpleNamespace(scalar_one=lambda: self.lock_free)
+        self.events.append("execute")
+        return self._answer()
+
+    def _answer(self) -> Any:
         value = self._scalars.pop(0) if self._scalars else None
         return SimpleNamespace(scalar_one_or_none=lambda: value)
 
     def add(self, obj: Any) -> None:
         self.added.append(obj)
+
+    def delete(self, obj: Any) -> None:
+        self.deleted.append(obj)
 
     def flush(self) -> None:
         for index, obj in enumerate(self.added, start=100):
@@ -421,6 +440,47 @@ def _release(db: _FakeDb, override_id: int, station_id: int = 3) -> dict[str, An
     return api.release_override(station_id, override_id, REQUEST, db, ACTOR)  # type: ignore[arg-type]
 
 
+# Invented, with the shape of the real ones: where the master gives a station
+# no MERITS code, it says why in a sentence, and the station has no candidate.
+NO_CODE_RULE = "No operator timetable names this station, and no calculation covers its country"
+
+
+def test_a_merits_correction_and_its_release_leave_the_rule_the_build_computed(
+    recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    station = _station(uic_merits_rule=NO_CODE_RULE)
+    stored: list[dict[str, Any]] = []  # the station's candidates, as the table holds them
+    write = api._replace_candidates
+
+    def replace(db: Any, target: Any, candidates: list[dict[str, Any]]) -> None:
+        stored[:] = candidates
+        write(db, target, candidates)
+
+    monkeypatch.setattr(api, "_candidates", lambda _db, _id: list(stored))
+    monkeypatch.setattr(api, "_replace_candidates", replace)
+
+    db = _FakeDb(station, None)
+    _set(db, "uic_merits", "9900555")
+    assert (station.uic_merits, station.uic_merits_origin) == ("9900555", so.ORIGIN_MANUAL)
+    # The reason is on the correction and on its candidate. The rule is the
+    # build's own sentence: no candidate carries it, so nothing could restore it.
+    assert stored[0]["rule"] == "checked on site"
+    assert station.uic_merits_rule == NO_CODE_RULE
+
+    correction = next(o for o in db.added if isinstance(o, api.StationRefOverride))
+    assert correction.computed_value_latest is None
+    db.objects[correction.id] = correction
+    _release(db, correction.id)
+
+    assert stored == []  # the Manual candidate went, and the build had none
+    assert (station.uic_merits, station.uic_merits_origin, station.uic_merits_confidence) == (
+        None,
+        None,
+        None,
+    )
+    assert station.uic_merits_rule == NO_CODE_RULE  # what the build computed, not NULL
+
+
 def _override(**kw: Any) -> SimpleNamespace:
     base = {
         "id": 5,
@@ -495,7 +555,7 @@ class _ComplexDb(_FakeDb):
         super().__init__(None)
         self.stations = stations
 
-    def execute(self, _stmt: object) -> Any:
+    def _answer(self) -> Any:
         return SimpleNamespace(scalars=lambda: self.stations)
 
 
@@ -544,6 +604,98 @@ def test_a_complex_needs_at_least_two_stations() -> None:
         "parallel_register",
         "adjacent_treated_as_one",
     }
+
+
+# ── one lock between the edits and the station build ───────────────────
+
+EDITS = ("set a correction", "release a correction", "group a complex", "ungroup a complex")
+
+
+def _edit(kind: str) -> tuple[_FakeDb, Callable[[], Any]]:
+    """One of the four routes that write the reference, on a database where it
+    has what it needs to go through."""
+    if kind == "set a correction":
+        setting = _FakeDb(_station(), None)
+        return setting, lambda: _set(setting, "name", "Testbury Depot")
+    if kind == "release a correction":
+        releasing = _FakeDb(_station(name="Testbury Depot"))
+        releasing.objects[5] = _override()
+        return releasing, lambda: _release(releasing, 5)
+    if kind == "group a complex":
+        grouping = _ComplexDb([_station(id=1, plc="ZZ00001"), _station(id=2, plc="ZZ00002")])
+        return grouping, lambda: api.create_complex(_complex_body(), REQUEST, grouping, ACTOR)  # type: ignore[arg-type]
+    ungrouping = _FakeDb(None)
+    ungrouping.objects[7] = SimpleNamespace(label="Exampleville")
+    return ungrouping, lambda: api.delete_complex(7, REQUEST, ungrouping, ACTOR)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("kind", EDITS)
+def test_an_edit_takes_the_lock_before_it_reads_anything(
+    recorded: list[dict[str, Any]], kind: str
+) -> None:
+    db, edit = _edit(kind)
+    edit()
+    # First, and once: a build that starts now waits for this request, and
+    # what the request then reads is not being rewritten under it.
+    assert db.events[0] == "lock"
+    assert db.events.count("lock") == 1
+    assert len(db.events) > 1
+    assert db.committed
+    assert len(recorded) == 1
+
+
+@pytest.mark.parametrize("kind", EDITS)
+def test_no_edit_goes_through_while_a_build_is_writing(
+    recorded: list[dict[str, Any]], kind: str
+) -> None:
+    db, edit = _edit(kind)
+    db.lock_free = False
+    with pytest.raises(HTTPException) as exc:
+        edit()
+    assert exc.value.status_code == 409
+    assert "station build" in exc.value.detail
+    # Refused at once, before anything was read: nothing waits for the build.
+    assert db.events == ["lock"]
+    assert (db.added, db.deleted, db.committed) == ([], [], False)
+    assert recorded == []
+
+
+def test_every_writing_route_documents_the_refusal() -> None:
+    writing = [r for r in api.router.routes if r.methods & {"POST", "DELETE"}]  # type: ignore[attr-defined]
+    assert len(writing) == 4
+    for route in writing:
+        described = route.responses.get(409, {}).get("description", "")  # type: ignore[attr-defined]
+        assert "station build" in described, route.path  # type: ignore[attr-defined]
+
+
+class _LockDb:
+    """Keeps the SQL of the lock statement, as Postgres receives it."""
+
+    def __init__(self, granted: bool) -> None:
+        self.granted = granted
+        self.sql: list[str] = []
+
+    def execute(self, statement: Any) -> Any:
+        compiled = statement.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+        self.sql.append(re.sub(r"\s+", " ", str(compiled)))
+        return SimpleNamespace(scalar_one=lambda: self.granted)
+
+
+def test_the_build_waits_for_the_lock_and_an_edit_only_tries_it() -> None:
+    key = station_lock.REFERENCE_LOCK_KEY
+    assert 0 < key < 2**63  # the key of an advisory lock is a bigint
+
+    build, edit, refused = _LockDb(True), _LockDb(True), _LockDb(False)
+    station_lock.hold_for_build(build)  # type: ignore[arg-type]
+    assert station_lock.try_for_edit(edit) is True  # type: ignore[arg-type]
+    assert station_lock.try_for_edit(refused) is False  # type: ignore[arg-type]
+    # Exclusive and waited for by the build; shared and only tried by an edit,
+    # so two edits never keep each other out. Both end with the transaction.
+    assert build.sql == [f"SELECT pg_advisory_xact_lock({key}) AS pg_advisory_xact_lock_1"]
+    tried = f"SELECT pg_try_advisory_xact_lock_shared({key}) AS pg_try_advisory_xact_lock_shared_1"
+    assert edit.sql == refused.sql == [tried]
 
 
 # ── the pages ──────────────────────────────────────────────────────────

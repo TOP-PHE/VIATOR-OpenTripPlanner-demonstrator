@@ -14,7 +14,7 @@ Every row is invented; the PLC prefix `ZZ` does not exist.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -370,8 +370,9 @@ def test_a_merits_correction_changes_the_chosen_candidate_not_the_candidates() -
     (update,) = plan.updates
     assert update["uic_merits"] == "9900777"
     assert update["uic_merits_origin"] == so.ORIGIN_MANUAL
-    assert update["uic_merits_rule"] == "per the operator"
     assert update["uic_merits_confidence"] is None
+    # The rule stays the build's own: the reason is on the Manual candidate.
+    assert update["uic_merits_rule"] == "Trainline preferred over the calculation"
     assert correction.computed_value_latest == "9900002"
 
 
@@ -425,7 +426,6 @@ def test_merits_candidates_under_a_correction_and_after_its_release() -> None:
     assert so.merits_mirror(none) == {
         "uic_merits": None,
         "uic_merits_origin": None,
-        "uic_merits_rule": None,
         "uic_merits_confidence": None,
     }
 
@@ -439,7 +439,6 @@ def test_merits_candidates_under_a_correction_and_after_its_release() -> None:
     assert so.merits_mirror(released) == {
         "uic_merits": "9900002",
         "uic_merits_origin": "Trainline",
-        "uic_merits_rule": "r",
         "uic_merits_confidence": "high",
     }
 
@@ -665,6 +664,11 @@ class _Tables:
         self.rows: dict[str, list[dict[str, Any]]] = {}
         self.serial = 0
         self.selects: list[str] = []  # the table of every SELECT, in order
+        # The lock against the hand edits: how many SELECTs had been issued
+        # each time it was taken, and what an edit in flight commits while
+        # the build waits for it.
+        self.locks: list[int] = []
+        self.while_waiting: Callable[[], None] | None = None
         self.overrides: list[Any] = []
         # The aggregate provider column of the fixture: its codes are evidence.
         self.unresolved = ["nap_ES_regional"]
@@ -725,8 +729,18 @@ class _Tables:
         wanted = set(where.right.value)
         return [row for row in table if row[where.left.name] in wanted]
 
+    def _lock(self) -> _Result:
+        """The build's lock: granted once the edits in flight have committed."""
+        if self.while_waiting is not None:
+            self.while_waiting()
+            self.while_waiting = None
+        self.locks.append(len(self.selects))
+        return _Result([])
+
     def _select(self, statement: Any) -> _Result:
         columns = list(statement.selected_columns)
+        if getattr(columns[0], "name", None) == "pg_advisory_xact_lock":
+            return self._lock()
         name = columns[0].table.name
         self.selects.append(name)
         if name == "station_ref_override":
@@ -959,6 +973,124 @@ def test_a_correction_made_between_two_builds_is_not_a_change_of_the_next() -> N
     assert (diff["changed"], diff["unchanged"]) == (0, 5)
     assert _history(db) == []
     assert _station(db, "ZZ00002")["uic_merits"] == "9900777"
+
+
+# ── the build and the hand edits: one lock, and the rule of a MERITS code ──
+
+
+def test_the_build_takes_the_lock_before_it_reads_the_reference_and_the_corrections() -> None:
+    db = _Tables()
+    _build(db, 1)
+    # Once, and before any SELECT: what the build then reads, and plans from,
+    # cannot be corrected under it until its transaction ends.
+    assert db.locks == [0]
+    assert db.selects[:2] == ["station_ref", "station_ref_override"]
+
+
+def test_a_correction_committed_while_the_build_waits_is_reapplied_not_overwritten() -> None:
+    db = _Tables()
+    _build(db, 1)
+    station = _station(db, "ZZ00002")
+
+    def correct_the_name() -> None:
+        # What the API commits for a correction of the name. Its request holds
+        # the lock the build is waiting for, so it is in before the build reads.
+        station["name"] = "Sampleton Central"
+        db.overrides.append(override(station["id"], "name", "Sampleton Central", "Sampleton"))
+
+    db.while_waiting = correct_the_name
+    # The next issue of the master renames the station and moves it: the build
+    # rewrites every built column of its row.
+    rows = master_rows()
+    rows[1] = {**rows[1], "era_name": "Sampleton Hbf", "lat": "50.123"}
+    diff = _build(db, 2, parsed(rows))
+
+    assert (station["name"], station["lat"]) == ("Sampleton Central", 50.123)
+    (correction,) = db.overrides
+    assert correction.computed_value_latest == "Sampleton Hbf"  # what a release restores
+    assert [(h[2], h[4]) for h in _history(db)] == [("lat", "50.123")]
+    assert (diff["changed"], diff["unchanged"]) == (1, 4)
+
+
+# Invented, with the shape of the real ones: where the master gives a station
+# no MERITS code, it says why in a sentence, and the station has no candidate.
+NO_CODE_RULE = "No operator timetable names this station, and no calculation covers its country"
+REWORDED_RULE = "No operator timetable names this station; its country has no calculation yet"
+_MERITS_COLUMNS = ("code", "origin", "rule", "confidence", "sources", "check_digit", "is_chosen")
+
+
+def _rewrite_candidates(
+    db: _Tables,
+    station: dict[str, Any],
+    change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
+) -> None:
+    """What the API does to a station's MERITS candidates when a correction is
+    set or released: rewrite them, and mirror the chosen one on the row."""
+    merits = db.table("station_ref_merits")
+    mine = [m for m in merits if m["station_id"] == station["id"]]
+    after = change([{c: m[c] for c in _MERITS_COLUMNS} for m in mine])
+    merits[:] = [m for m in merits if m["station_id"] != station["id"]]
+    merits += [{"id": 900 + n, "station_id": station["id"], **c} for n, c in enumerate(after)]
+    station.update(so.merits_mirror(after))
+
+
+def test_the_mirror_of_the_chosen_candidate_leaves_the_rule_alone() -> None:
+    # Code, origin and confidence follow the chosen candidate. The rule does
+    # not: with no code, the master's sentence is on the row and on no
+    # candidate, and a mirror that wrote it could not put it back.
+    assert so.MERITS_MIRROR == ("uic_merits", "uic_merits_origin", "uic_merits_confidence")
+    manual = so.merits_with_override([], "9900555", "per the operator")
+    assert so.merits_mirror(manual) == {
+        "uic_merits": "9900555",
+        "uic_merits_origin": so.ORIGIN_MANUAL,
+        "uic_merits_confidence": None,
+    }
+    assert so.merits_mirror(so.merits_without_override(manual, None)) == dict.fromkeys(
+        so.MERITS_MIRROR
+    )
+
+
+def test_a_released_merits_correction_leaves_the_rule_the_build_computes_now() -> None:
+    def issue(rule: str) -> si.ParsedInputs:
+        rows = master_rows()
+        rows[3] = {**rows[3], "uic_merits_rule": rule}  # no code, no candidate: a sentence
+        return parsed(rows)
+
+    db = _Tables()
+    _build(db, 1, issue(NO_CODE_RULE))
+    station = _station(db, "ZZ00003", "ZZOP03B")
+    assert (station["uic_merits"], station["uic_merits_rule"]) == (None, NO_CODE_RULE)
+    assert not [m for m in db.table("station_ref_merits") if m["station_id"] == station["id"]]
+
+    # A content manager gives the station a code by hand...
+    _rewrite_candidates(
+        db, station, lambda found: so.merits_with_override(found, "9900555", "per the operator")
+    )
+    db.overrides.append(
+        override(station["id"], "uic_merits", "9900555", None, reason="per the operator")
+    )
+    assert station["uic_merits_rule"] == NO_CODE_RULE
+    # ...the next issue of the master rewords its sentence...
+    _build(db, 2, issue(REWORDED_RULE))
+    assert (station["uic_merits"], station["uic_merits_origin"]) == ("9900555", so.ORIGIN_MANUAL)
+    assert station["uic_merits_rule"] == REWORDED_RULE
+    # ...and the correction is released.
+    (correction,) = db.overrides
+    _rewrite_candidates(
+        db,
+        station,
+        lambda found: so.merits_without_override(found, correction.computed_value_latest),
+    )
+    db.overrides.clear()
+    assert (station["uic_merits"], station["uic_merits_origin"]) == (None, None)
+    assert station["uic_merits_rule"] == REWORDED_RULE  # what the build computes now, not NULL
+
+    # The next build has nothing to put back: no change, no history row of its own.
+    before = _history(db)
+    assert [(h[1], h[2]) for h in before] == [(2, "uic_merits_rule")]
+    diff = _build(db, 3, issue(REWORDED_RULE))
+    assert (diff["changed"], diff["unchanged"]) == (0, 5)
+    assert _history(db) == before
 
 
 # ── bulk inserts: one statement per chunk, whatever cells are empty ────

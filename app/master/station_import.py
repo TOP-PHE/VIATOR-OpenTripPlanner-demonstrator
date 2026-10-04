@@ -16,7 +16,9 @@ Three stages, in this order:
   3. **Build**, in one transaction: `station_ref` is upserted on its natural
      key, hand corrections are re-applied, and the derived children (codes,
      MERITS candidates, flags, aliases, links) are replaced. A build that
-     fails is recorded and discarded.
+     fails is recorded and discarded. The transaction opens by taking the
+     lock of `station_lock`, so no hand correction is set or released
+     between what the build reads and what it writes.
 
 `station_ref` rows are current state. A row present in an earlier build and
 absent from this one is kept, untouched, and is recognisable by its
@@ -68,9 +70,9 @@ from ..models import (
     StationSourceVersion,
 )
 from . import station_files as sf
+from . import station_lock, station_store
 from . import station_overrides as so
 from . import station_parse as sp
-from . import station_store
 from .station_files import StationFileError
 
 log = logging.getLogger(__name__)
@@ -809,7 +811,14 @@ def write_reference(
     parsed: ParsedInputs,
     today: date,
 ) -> tuple[dict[str, int], dict[str, Any]]:
-    """The build stage. The caller owns the transaction."""
+    """The build stage. The caller owns the transaction.
+
+    The lock comes first, and is held until that transaction ends: everything
+    below is planned from one reading of the reference and of the active
+    corrections, so no correction may be set or released between that reading
+    and the commit. See `station_lock`.
+    """
+    station_lock.hold_for_build(db)
     columns = _built_columns()
     existing = _load_existing(db, columns)
     plan = plan_reference(parsed, existing, _load_overrides(db), build_id, today)
