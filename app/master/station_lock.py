@@ -48,5 +48,4 @@ def hold_for_build(db: DbSession) -> None:
 def try_for_edit(db: DbSession) -> bool:
     """Keep a build out until the caller's transaction ends. False, at once,
     when a build is writing or waiting to: the caller must not write."""
-    granted = db.execute(select(func.pg_try_advisory_xact_lock_shared(_key()))).scalar_one()
-    return bool(granted)
+    return bool(db.execute(select(func.pg_try_advisory_xact_lock_shared(_key()))).scalar_one())
