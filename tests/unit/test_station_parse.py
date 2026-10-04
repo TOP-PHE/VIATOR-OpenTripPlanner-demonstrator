@@ -512,7 +512,8 @@ def test_the_name_and_the_position_of_a_crd_location_are_decided_separately(
 ) -> None:
     rows = [full(sf.CRD_LOCATIONS, {**crd_location_rows()[0], **sources})]
     (location,) = sp.parse_crd_locations(rows).locations
-    assert (location["name"], location["lat"], location["lon"]) == expected
+    kept = (location["name"], location["lat"], location["lon"])
+    assert kept == expected
 
 
 def test_a_retired_location_is_the_same_whichever_operational_point_comes_first() -> None:
