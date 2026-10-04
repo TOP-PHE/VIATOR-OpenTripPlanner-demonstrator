@@ -9,7 +9,9 @@ tests/integration/test_station_panel.py.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -28,7 +30,13 @@ from app.api.master import station_ref as api
 from app.master import station_lock
 from app.master import station_overrides as so
 from app.security import require_content_manager
-from tests.station_fixtures import assert_scripts_parse, page_request, sqlite_stand_in
+from tests.station_fixtures import (
+    assert_scripts_parse,
+    inline_scripts,
+    node_or_skip,
+    page_request,
+    sqlite_stand_in,
+)
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin"
 ACTOR = SimpleNamespace(id=uuid.uuid4(), username="cm@example.org", role="content_manager")
@@ -541,6 +549,43 @@ def test_a_merits_correction_and_its_release_leave_the_rule_the_build_computed(
     assert station.uic_merits_rule == NO_CODE_RULE  # what the build computed, not NULL
 
 
+def test_a_merits_correction_and_its_release_leave_the_confidence_of_the_calculation(
+    recorded: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No chosen code and a calculated one: the build puts the master's
+    # confidence on the row, and on the candidate it describes.
+    station = _station(uic_merits_confidence="low")
+    stored = [
+        {"code": "9900004", "origin": "Calculated", "rule": None, "confidence": "low",
+         "sources": ["CALC"], "check_digit": "1", "is_chosen": False},
+    ]  # fmt: skip
+    write = api._replace_candidates
+
+    def replace(db: Any, target: Any, candidates: list[dict[str, Any]]) -> None:
+        stored[:] = candidates
+        write(db, target, candidates)
+
+    monkeypatch.setattr(api, "_candidates", lambda _db, _id: list(stored))
+    monkeypatch.setattr(api, "_replace_candidates", replace)
+
+    db = _FakeDb(station, None)
+    _set(db, "uic_merits", "9900555")
+    # The code given by hand is chosen, and has no confidence of its own.
+    assert (station.uic_merits, station.uic_merits_confidence) == ("9900555", None)
+
+    correction = next(o for o in db.added if isinstance(o, api.StationRefOverride))
+    db.objects[correction.id] = correction
+    _release(db, correction.id)
+
+    # The calculated code was never withdrawn, and the row is as the build wrote it.
+    assert [(c["code"], c["is_chosen"]) for c in stored] == [("9900004", False)]
+    assert (station.uic_merits, station.uic_merits_origin, station.uic_merits_confidence) == (
+        None,
+        None,
+        "low",
+    )
+
+
 def _override(**kw: Any) -> SimpleNamespace:
     base = {
         "id": 5,
@@ -954,3 +999,161 @@ def test_the_detail_screen_has_every_section() -> None:
     ):
         assert f"<h2>{section}</h2>" in html
     assert "f.related ? ' → ' + stationLink(f.related)" in html  # a flag links to its station
+
+
+# ── the correction form of the detail page ─────────────────────────────
+#
+# The page's module is loaded in Node on a stand-in DOM, and its correction
+# form is submitted: refused by the API, then saved.
+
+CORRECTION_DOM = """
+const FAKE_DETAIL = __DETAIL__;
+const fakeSent = [];
+const fakeToasts = [];
+const fakeListeners = {};
+// What the API answers next: a refusal of the write, a page that cannot be read.
+const fakeApi = {refusal: null, detailDown: false};
+
+// An element that accepts any call and any assignment.
+function fakeNode() {
+  return new Proxy({}, {
+    get: (target, key) => (key in target ? target[key] : () => fakeNode()),
+    set: (target, key, value) => { target[key] = value; return true; },
+  });
+}
+
+const fakeFields = {
+  field_name: {value: 'name', add() {}},
+  value: {value: ''},
+  reason: {value: ''},
+};
+const fakeById = {
+  station: {dataset: {stationId: '42'}, addEventListener() {}},
+  'override-form': {
+    elements: fakeFields,
+    addEventListener(type, listener) { fakeListeners[type] = listener; },
+  },
+};
+
+globalThis.Option = class {};
+globalThis.document = {getElementById: (id) => (fakeById[id] ??= fakeNode())};
+globalThis.fetch = async (url, options = {}) => {
+  if (options.method) {
+    fakeSent.push({method: options.method, url, body: JSON.parse(options.body)});
+    const refusal = fakeApi.refusal;
+    if (refusal) return {ok: false, status: refusal.status, json: async () => ({detail: refusal.detail})};
+    return {ok: true, status: 201, json: async () => ({})};
+  }
+  if (url.endsWith('/summary')) {
+    return {ok: true, status: 200, json: async () => ({overridable_fields: ['name', 'lat']})};
+  }
+  if (fakeApi.detailDown) return {ok: false, status: 503, json: async () => ({detail: 'unavailable'})};
+  return {ok: true, status: 200, json: async () => FAKE_DETAIL};
+};
+"""
+
+# The real toast arms a 6 s timer; the scenario only needs what was said.
+CORRECTION_TOAST = """
+globalThis.StationPanel.toast = (kind, text) => { fakeToasts.push(kind + ': ' + text); };
+"""
+
+CORRECTION_SCENARIO = """
+{
+  const fields = overrideForm.elements;
+  // Every answer of the stand-in API is already there: one turn of the event
+  // loop lets the page finish what the submit started.
+  const settled = () => new Promise((resolve) => { setImmediate(resolve); });
+  const submit = async (answer = {}) => {
+    Object.assign(fakeApi, {refusal: null, detailDown: false}, answer);
+    fields.value.value = 'Sampleton Central';
+    fields.reason.value = ' platform signs ';
+    fakeListeners.submit({preventDefault() {}});
+    await settled();
+    return {
+      form: {value: fields.value.value, reason: fields.reason.value},
+      sent: fakeSent.at(-1),
+      toast: fakeToasts.at(-1),
+    };
+  };
+
+  const out = {};
+  out.writing = await submit({refusal: {status: 409, detail: __BUILD_WRITING__}});
+  out.invalid = await submit({refusal: {status: 400, detail: 'name: not like this'}});
+  out.saved = await submit();
+  out.savedNotReloaded = await submit({detailDown: true});
+  out.requests = fakeSent.length;
+  process.stdout.write(JSON.stringify(out));
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def correction_form(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """Submit the correction form of the real detail page, four times: while a
+    build is writing, with a value the API refuses, saved, and saved while the
+    page cannot be read again."""
+    node = node_or_skip()
+    ((_, shared),) = inline_scripts((TEMPLATES / "_station_panel.html").read_text(encoding="utf-8"))
+    ((is_module, page),) = inline_scripts(
+        (TEMPLATES / "station_reference_detail.html").read_text(encoding="utf-8")
+    )
+    assert is_module
+    # A station as GET /api/master/station-ref/{id} returns it, as far as the
+    # page reads it. Invented.
+    lists = ("aliases", "siblings", "merits", "codes", "links", "overrides", "history", "flags")
+    detail: dict[str, Any] = {
+        "id": 42,
+        "plc": "ZZ00002",
+        "era_uopid": "ZZ00002",
+        "name": "Sampleton",
+        "is_current": True,
+        "in_latest_build": True,
+        "lat": 50.1,
+        "lon": 4.1,
+        "complex": None,
+        **{name: [] for name in lists},
+    }
+    dom = CORRECTION_DOM.replace("__DETAIL__", json.dumps(detail))
+    scenario = CORRECTION_SCENARIO.replace("__BUILD_WRITING__", json.dumps(api._BUILD_WRITING))
+    # A file, not `node -e`: the page's script is a module with a top-level await.
+    program = tmp_path_factory.mktemp("correction") / "correction_form.mjs"
+    program.write_text(dom + shared + CORRECTION_TOAST + page + scenario, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(program)], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+TYPED = {"value": "Sampleton Central", "reason": " platform signs "}
+SENT = {
+    "method": "POST",
+    "url": "/api/master/station-ref/42/overrides",
+    "body": {"field_name": "name", "value": "Sampleton Central", "reason": "platform signs"},
+}
+
+
+def test_a_refused_correction_stays_in_the_form(correction_form: dict[str, Any]) -> None:
+    # A station build is writing the reference. The refusal says to try again
+    # when it has finished: what was typed is still there to try again with.
+    writing = correction_form["writing"]
+    assert writing["sent"] == SENT
+    assert writing["toast"] == "error: " + api._BUILD_WRITING
+    assert writing["form"] == TYPED
+    # A value the API refuses: the operator corrects it, and keeps the reason.
+    invalid = correction_form["invalid"]
+    assert invalid["toast"] == "error: name: not like this"
+    assert invalid["form"] == TYPED
+
+
+def test_a_saved_correction_empties_the_form(correction_form: dict[str, Any]) -> None:
+    saved = correction_form["saved"]
+    assert saved["sent"] == SENT
+    assert saved["toast"] == "success: Correction saved"
+    assert saved["form"] == {"value": "", "reason": ""}
+    # Saved, and the page could not be read again: the toast says so, and the
+    # form is emptied all the same, since the correction is in.
+    not_reloaded = correction_form["savedNotReloaded"]
+    assert not_reloaded["toast"] == "error: unavailable"
+    assert not_reloaded["form"] == {"value": "", "reason": ""}
+    assert correction_form["requests"] == 4  # one POST per submit, none repeated

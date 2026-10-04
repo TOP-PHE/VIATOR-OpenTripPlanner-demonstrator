@@ -266,14 +266,20 @@ async function load() {
   render(data);
 }
 
+// Resolves to whether `run` went through. A refusal is shown, and nothing
+// else is done. Once `run` went through the answer is yes, even when the page
+// cannot be read again afterwards: that failure is shown, what was saved is saved.
 async function act(run, done) {
+  let saved = false;
   try {
     await run();
+    saved = true;
     SP.toast('success', done);
     await load();
   } catch (err) {
     SP.toast('error', err.message);
   }
+  return saved;
 }
 
 async function loadFields() {
@@ -285,7 +291,9 @@ overrideForm.addEventListener('submit', (event) => {
   event.preventDefault();
   const form = overrideForm.elements;
   const payload = {field_name: form.field_name.value, value: form.value.value, reason: form.reason.value.trim()};
-  act(() => SP.sendJson('POST', API + '/overrides', payload), 'Correction saved').then(() => {
+  act(() => SP.sendJson('POST', API + '/overrides', payload), 'Correction saved').then((saved) => {
+    // A refused correction stays in the form, to be changed or sent again.
+    if (!saved) return;
     form.value.value = '';
     form.reason.value = '';
   });

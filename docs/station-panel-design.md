@@ -862,4 +862,6 @@ stops: `rail_served`, `rail_repl`, `modes`, the three code columns, `review_link
 candidates all stay, a `Manual` one is added when the corrected code is none of them, and
 `station_ref`'s `uic_merits`, `uic_merits_origin` and `uic_merits_confidence` mirror whichever is
 chosen. `uic_merits_rule` does not: it stays what the build computed, under a correction and
-after its release.
+after its release. With nothing chosen the code and the origin are empty, and the confidence is
+the calculated candidate's: that is what the build writes where the master calculates a code and
+chooses none, so releasing a correction on such a station leaves the row as it was built.

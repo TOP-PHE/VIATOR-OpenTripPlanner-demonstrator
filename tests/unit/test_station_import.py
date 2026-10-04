@@ -1051,6 +1051,84 @@ def test_the_mirror_of_the_chosen_candidate_leaves_the_rule_alone() -> None:
     )
 
 
+def test_with_nothing_chosen_the_mirror_keeps_the_confidence_of_the_calculation() -> None:
+    # Invented, as the parser builds it for a row with a calculated code and
+    # no chosen one: the row's confidence is on that candidate, and on the row.
+    calculated = {
+        "code": "9900004",
+        "origin": sp.ORIGIN_CALCULATED,
+        "rule": None,
+        "confidence": "low",
+        "sources": ["CALC"],
+        "check_digit": "1",
+        "is_chosen": False,
+    }
+    as_built = {"uic_merits": None, "uic_merits_origin": None, "uic_merits_confidence": "low"}
+    assert so.merits_mirror([calculated]) == as_built
+    assert so.merits_mirror(iter([calculated])) == as_built  # read once, whatever it is given
+
+    # A code given by hand has no confidence of its own...
+    manual = so.merits_with_override([calculated], "9900555", "per the operator")
+    assert so.merits_mirror(manual)["uic_merits_confidence"] is None
+    # ...and its release puts back the row the build wrote, confidence included.
+    assert so.merits_mirror(so.merits_without_override(manual, None)) == as_built
+    # A correction to "no MERITS code" says what the build says: the same row.
+    assert so.merits_mirror(so.merits_with_override([calculated], None, "reason")) == as_built
+
+    # Only the calculation lends its confidence: no other candidate carries the row's.
+    conflict = {**calculated, "origin": sp.ORIGIN_CONFLICT}
+    assert so.merits_mirror([conflict]) == dict.fromkeys(so.MERITS_MIRROR)
+
+
+def test_the_mirror_of_the_candidates_a_build_writes_is_the_row_it_writes() -> None:
+    # A release has the candidates and nothing else to put the row back from:
+    # mirrored from them, every station of the file is as built, with a code
+    # chosen (two rows), with none and a calculated one, with no candidate.
+    shapes = set()
+    for row in parsed().master:
+        candidates = si._candidate_dicts(row)
+        built = {name: row.fields[name] for name in so.MERITS_MIRROR}
+        assert so.merits_mirror(candidates) == built, row.key
+        shapes.add((built["uic_merits"] is not None, len(candidates)))
+    assert shapes == {(True, 1), (True, 4), (False, 1), (False, 0)}
+
+
+def test_a_released_merits_correction_leaves_the_confidence_the_build_computes() -> None:
+    db = _Tables()
+    _build(db, 1)
+    # Mockford Halt: no chosen code, one calculated candidate, and a confidence,
+    # which with nothing chosen describes that calculation.
+    station = _station(db, "ZZ00004")
+    built = {name: station[name] for name in so.MERITS_MIRROR}
+    assert built == {"uic_merits": None, "uic_merits_origin": None, "uic_merits_confidence": "low"}
+
+    # A content manager gives the station a code by hand...
+    _rewrite_candidates(
+        db, station, lambda found: so.merits_with_override(found, "9900555", "per the operator")
+    )
+    db.overrides.append(
+        override(station["id"], "uic_merits", "9900555", None, reason="per the operator")
+    )
+    assert (station["uic_merits"], station["uic_merits_confidence"]) == ("9900555", None)
+    # ...a build re-applies the correction and finds what is already there...
+    assert _build(db, 2)["changed"] == 0
+    # ...and the correction is released.
+    (correction,) = db.overrides
+    _rewrite_candidates(
+        db,
+        station,
+        lambda found: so.merits_without_override(found, correction.computed_value_latest),
+    )
+    db.overrides.clear()
+    assert {name: station[name] for name in so.MERITS_MIRROR} == built
+
+    # The next build has nothing to put back: no change, and no history row
+    # saying the confidence went from nothing to `low`.
+    diff = _build(db, 3)
+    assert (diff["changed"], diff["unchanged"]) == (0, 5)
+    assert _history(db) == []
+
+
 def test_a_released_merits_correction_leaves_the_rule_the_build_computes_now() -> None:
     def issue(rule: str) -> si.ParsedInputs:
         rows = master_rows()

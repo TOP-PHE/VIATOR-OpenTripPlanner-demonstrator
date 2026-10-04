@@ -21,6 +21,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .station_parse import ORIGIN_CALCULATED
+
 MERITS_FIELD = "uic_merits"
 _ISO2_LENGTH = 2
 
@@ -216,10 +218,22 @@ def merits_without_override(
 
 
 def merits_mirror(candidates: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """The station_ref columns that mirror the chosen candidate (`MERITS_MIRROR`)."""
+    """The station_ref columns that mirror the chosen candidate (`MERITS_MIRROR`).
+
+    With nothing chosen there is no code and no origin, and the confidence is
+    the calculated candidate's. Where the master chooses no code, its
+    confidence describes the calculation: the build puts it on the row and on
+    that candidate (`station_parse.merits_candidates`). Blanked instead, a
+    released correction would leave the row without it until the next build
+    wrote it back, as a change that never happened.
+    """
+    candidates = list(candidates)
     chosen = next((c for c in candidates if c["is_chosen"]), None)
     if chosen is None:
-        return dict.fromkeys(MERITS_MIRROR)
+        confidence = next(
+            (c.get("confidence") for c in candidates if c.get("origin") == ORIGIN_CALCULATED), None
+        )
+        return {**dict.fromkeys(MERITS_MIRROR), "uic_merits_confidence": confidence}
     return {
         "uic_merits": chosen["code"],
         "uic_merits_origin": chosen.get("origin"),

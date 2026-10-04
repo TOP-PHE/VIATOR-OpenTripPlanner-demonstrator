@@ -1699,6 +1699,56 @@ def test_a_released_merits_correction_leaves_the_rule_the_build_computes(
     ) == [(None, said), (said, reworded)]
 
 
+def test_a_released_merits_correction_leaves_the_confidence_of_the_calculation(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    from app.master import station_import
+
+    # Mockford Halt: no chosen code, a calculated one, and the master's
+    # confidence, which with nothing chosen describes that calculation.
+    one = f"{REF}/{_station_id('ZZ00004')}"
+
+    def merits() -> tuple:
+        detail = client.get(one, headers=content_manager).json()
+        return (
+            detail["uic_merits"],
+            detail["uic_merits_origin"],
+            detail["uic_merits_confidence"],
+            [(m["code"], m["is_chosen"]) for m in detail["merits"]],
+        )
+
+    def listed_as_low() -> list[str]:
+        rows = client.get(REF, headers=content_manager, params={"confidence": "low"}).json()
+        return [row["plc"] for row in rows]
+
+    computed = (None, None, "low", [("9900004", False)])
+    assert merits() == computed
+    assert listed_as_low() == ["ZZ00004"]
+
+    r = client.post(
+        f"{one}/overrides",
+        headers=content_manager,
+        json={"field_name": "uic_merits", "value": "9900555", "reason": "per the operator"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["computed_value_at_set"] is None
+    # The code given by hand is chosen and has no confidence of its own; the
+    # calculated one is not withdrawn.
+    assert merits() == ("9900555", "Manual", None, [("9900555", True), ("9900004", False)])
+    assert listed_as_low() == []
+
+    client.delete(f"{one}/overrides/{r.json()['id']}", headers=content_manager).raise_for_status()
+    # The row is as the build wrote it, at once: not NULL until the next build.
+    assert merits() == computed
+    assert listed_as_low() == ["ZZ00004"]
+
+    # And that build has nothing to put back: no change, no history row.
+    output, success = station_import.run_build()
+    assert success, output
+    assert "done: 0 created, 0 changed, 5 unchanged, 0 absent" in output
+    assert _scalar("SELECT count(*) FROM station_ref_history") == 0
+
+
 # The lock of app/master/station_lock.py, as another session takes it: a build
 # in its write stage holds it exclusively, an edit in flight holds it shared.
 _BUILD_HOLDS = "SELECT pg_advisory_xact_lock(CAST(:key AS bigint))"
