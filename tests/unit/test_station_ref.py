@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,14 +19,16 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import insert, select, text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 
 from app.api import pages
 from app.api.master import station_ref as api
 from app.master import station_lock
 from app.master import station_overrides as so
 from app.security import require_content_manager
-from tests.station_fixtures import assert_scripts_parse, page_request
+from tests.station_fixtures import assert_scripts_parse, page_request, sqlite_stand_in
 
 TEMPLATES = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin"
 ACTOR = SimpleNamespace(id=uuid.uuid4(), username="cm@example.org", role="content_manager")
@@ -135,6 +137,64 @@ def test_search_covers_name_plc_and_every_code() -> None:
         assert f"station_ref.{column} ILIKE" in query
     for column in ("era_uopid", "previous_plc", "uic_merits", "eva", "rl100"):
         assert f"station_ref.{column} = " in query
+
+
+# ── the search, executed: what a term with a wildcard in it matches ────
+
+
+@pytest.fixture
+def reference() -> Iterator[Session]:
+    """The columns the search reads, in SQLite, with invented stations. Two of
+    them carry a LIKE wildcard, or the escape character, in their own name."""
+    engine = sqlite_stand_in(api.StationRef, api.StationRefCode)
+    stations = [
+        (1, "ZZ00001", "Exampleville Central", "Exampleville; Exampleville Hbf"),
+        (2, "ZZ00002", "Sampleton", None),
+        (5, "ZZ00005", "Sam_leton Sidings", None),
+        (6, "ZZ00006", "Quarterbury 25% Halt", "Quarterbury\\Dock"),
+    ]
+    with Session(engine) as db:
+        db.execute(
+            insert(api.StationRef.__table__),
+            [
+                {"id": i, "plc": plc, "era_uopid": plc, "name": name, "alt_name_text": alt}
+                for i, plc, name, alt in stations
+            ],
+        )
+        db.execute(
+            insert(api.StationRefCode.__table__),
+            [{"station_id": 2, "source_key": "nap_DE_DELFI", "code": "de:99:2"}],
+        )
+        yield db
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("term", "plcs"),
+    [
+        ("sampl", ["ZZ00002"]),  # by substring, whatever the case
+        ("hbf", ["ZZ00001"]),  # in an alternative name
+        ("zz0000", ["ZZ00001", "ZZ00002", "ZZ00005", "ZZ00006"]),  # in the PLC
+        ("de:99:2", ["ZZ00002"]),  # a provider code, by equality
+        # A wildcard typed in the term is a character. Read as a pattern, each
+        # of these would match more: `_` any one character, `%` anything.
+        ("Sam_leton", ["ZZ00005"]),  # not Sampleton as well
+        ("%", ["ZZ00006"]),  # not every station
+        ("Hb_", []),  # not "Hbf"
+        ("ZZ0000_", []),  # not every PLC
+        ("de:99:_", []),  # a code is compared whole, never as a pattern
+        # The escape character itself is a character too.
+        ("y\\D", ["ZZ00006"]),
+    ],
+)
+def test_a_wildcard_in_a_search_term_is_a_character_not_a_pattern(
+    reference: Session, term: str, plcs: list[str]
+) -> None:
+    clauses = api.filter_clauses(q=term)
+    plc = api.StationRef.plc
+    assert reference.execute(select(plc).where(*clauses).order_by(plc)).scalars().all() == plcs
+    # The total of the list is counted with the same clauses.
+    assert reference.execute(api.count_query(clauses, collapse=False)).scalar_one() == len(plcs)
 
 
 # ── flags: a flag naming several PLCs is one row per PLC ───────────────
@@ -536,6 +596,130 @@ def test_override_dict_flags_a_computed_value_that_moved() -> None:
     assert steady["drifted"] is False
 
 
+# ── corrections, in a real table: which earlier one the route finds ────
+
+
+class _CorrectionsDb(_FakeDb):
+    """`_FakeDb`, with `station_ref_override` as a real table, in SQLite.
+
+    `_FakeDb` answers the lookup of an earlier correction from a queue,
+    whatever the statement asks. Here the route's own SELECT, with its WHERE,
+    finds the earlier correction or does not, and the rows it writes are
+    checked by the unique index of the model.
+    """
+
+    def __init__(self, station: Any, corrections: Session) -> None:
+        super().__init__(station)
+        self.corrections = corrections
+
+    def get(self, model: Any, key: int) -> Any:
+        if model is not api.StationRefOverride:
+            return super().get(model, key)
+        self.events.append("get")
+        return self.corrections.get(model, key)
+
+    def execute(self, statement: Any) -> Any:
+        if "FROM station_ref_override" not in str(statement):
+            return super().execute(statement)  # the lock
+        self.events.append("execute")
+        return self.corrections.execute(statement)
+
+    def add(self, obj: Any) -> None:
+        super().add(obj)
+        self.corrections.add(obj)
+
+    def flush(self) -> None:
+        self.corrections.flush()
+
+    def commit(self) -> None:
+        self.corrections.commit()
+        super().commit()
+
+    def refresh(self, obj: Any) -> None:
+        self.corrections.refresh(obj)
+
+
+@pytest.fixture
+def corrections() -> Iterator[Session]:
+    """`station_ref_override` in SQLite, with the model's unique index: one
+    active correction per station and field."""
+    table = api.StationRefOverride.__table__
+    engine = sqlite_stand_in(api.StationRefOverride)
+    index = next(i for i in table.indexes if i.name == "uq_station_ref_override_active")
+    columns = ", ".join(column.name for column in index.columns)
+    active = index.dialect_options["postgresql"]["where"]
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"CREATE UNIQUE INDEX {index.name} ON {table.name} ({columns}) WHERE {active}")
+        )
+    with Session(engine) as db:
+        yield db
+    engine.dispose()
+
+
+def _corrections(db: Session, *, active: bool) -> list[tuple[int, str, str | None]]:
+    """(station, field, value) of the active corrections, or of the released
+    ones, in the order they were made."""
+    table = api.StationRefOverride
+    released = table.released_at
+    rows = db.execute(
+        select(table.station_id, table.field_name, table.value)
+        .where(released.is_(None) if active else released.is_not(None))
+        .order_by(table.id)
+    )
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+def test_a_new_correction_releases_the_earlier_one_of_that_station_and_field_only(
+    recorded: list[dict[str, Any]], corrections: Session
+) -> None:
+    yard = _station()  # station 3: "Testbury Yard A", at latitude 50.2
+    halt = _station(id=4, plc="ZZ00004", era_uopid="ZZ00004", name="Mockford Halt")
+    here, there = _CorrectionsDb(yard, corrections), _CorrectionsDb(halt, corrections)
+
+    _set(there, "name", "Mockford", station_id=4)
+    first = _set(here, "name", "Testbury Depot")
+    moved = _set(here, "lat", "50.25")
+    # Three corrections, all active: the name of another station and another
+    # field of this one are not earlier corrections of this station's name.
+    assert _corrections(corrections, active=True) == [
+        (4, "name", "Mockford"),
+        (3, "name", "Testbury Depot"),
+        (3, "lat", "50.25"),
+    ]
+    assert _corrections(corrections, active=False) == []
+    # Under the position is the position the build computed, not a name.
+    assert moved["computed_value_at_set"] == "50.2"
+
+    second = _set(here, "name", "Testbury Works")
+    # By now the table also holds a released correction of this very field.
+    third = _set(here, "name", "Testbury Sidings")
+    assert _corrections(corrections, active=True) == [
+        (4, "name", "Mockford"),
+        (3, "lat", "50.25"),
+        (3, "name", "Testbury Sidings"),
+    ]
+    # The earlier ones are kept, as released: they are the history.
+    assert _corrections(corrections, active=False) == [
+        (3, "name", "Testbury Depot"),
+        (3, "name", "Testbury Works"),
+    ]
+    # Under each is what the build computes, never the correction it replaced.
+    for correction in (first, second, third):
+        assert correction["computed_value_at_set"] == "Testbury Yard A"
+        assert correction["computed_value_latest"] == "Testbury Yard A"
+    assert (yard.name, yard.lat, halt.name) == ("Testbury Sidings", 50.25, "Mockford")
+
+    # Releasing the position restores a position, and nothing else moves.
+    _release(here, moved["id"])
+    assert (yard.name, yard.lat) == ("Testbury Sidings", 50.2)
+    assert _corrections(corrections, active=True) == [
+        (4, "name", "Mockford"),
+        (3, "name", "Testbury Sidings"),
+    ]
+    assert [event["action"] for event in recorded].count("station_ref.override.set") == 5
+
+
 # ── complexes ──────────────────────────────────────────────────────────
 
 
@@ -579,6 +763,7 @@ def test_grouping_marks_the_principal_and_the_members(recorded: list[dict[str, A
     [
         ({"kind": "a_vague_feeling"}, [], 400),
         ({"principal_id": 9}, [], 400),  # the principal is not one of the stations
+        ({"station_ids": [1, 1]}, [_station(id=1)], 400),  # one station, given twice
         ({}, [_station(id=1)], 404),  # one of the two does not exist
         ({}, [_station(id=1), _station(id=2, complex_id=4)], 409),  # already grouped
     ],
@@ -595,9 +780,28 @@ def test_grouping_refusals(
     assert recorded == []
 
 
-def test_a_complex_needs_at_least_two_stations() -> None:
+def test_a_complex_needs_at_least_two_stations(recorded: list[dict[str, Any]]) -> None:
     with pytest.raises(ValueError, match="station_ids"):
         _complex_body(station_ids=[1])
+    # Two different stations: the same one given twice, or three times, is one.
+    # The body's own length check counts the items, so the route counts again
+    # once the repeats are gone, before it takes the lock or reads anything.
+    for repeated in ([5, 5], [5, 5, 5]):
+        station = _station(id=5)
+        db = _ComplexDb([station])
+        body = _complex_body(station_ids=repeated, principal_id=5)
+        with pytest.raises(HTTPException) as exc:
+            api.create_complex(body, REQUEST, db, ACTOR)  # type: ignore[arg-type]
+        assert exc.value.status_code == 400
+        assert "at least two different stations" in exc.value.detail
+        assert (station.complex_id, station.complex_role) == (None, None)
+        assert (db.events, db.added, db.committed) == ([], [], False)
+    assert recorded == []
+    # A repeat among different stations is not an error: it is dropped.
+    stations = [_station(id=1, plc="ZZ00001"), _station(id=2, plc="ZZ00002")]
+    body = _complex_body(station_ids=[2, 1, 2])
+    grouped = api.create_complex(body, REQUEST, _ComplexDb(stations), ACTOR)  # type: ignore[arg-type]
+    assert grouped["station_ids"] == [1, 2]
     assert set(api.COMPLEX_KINDS) == {
         "one_site",
         "shared_operational_point",

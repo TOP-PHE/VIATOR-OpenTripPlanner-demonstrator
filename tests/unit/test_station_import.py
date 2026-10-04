@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, event, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app import ingestion, worker
 from app.master import station_files as sf
@@ -33,6 +33,7 @@ from tests.station_fixtures import (
     crd_location_rows,
     link_rows,
     master_rows,
+    sqlite_stand_in,
     telref_rows,
     unmapped_rows,
     write_station_files,
@@ -1093,6 +1094,106 @@ def test_a_released_merits_correction_leaves_the_rule_the_build_computes_now() -
     assert _history(db) == before
 
 
+# ── which corrections a build reads: the active ones, from a real table ──
+
+
+class _TablesWithCorrections(_Tables):
+    """The stand-in, with `station_ref_override` as a real table, in SQLite.
+
+    `_Tables` hands the build whatever is in its `overrides` list, whatever
+    was asked. Here the build's own SELECT, with its WHERE, decides which
+    corrections it reads.
+    """
+
+    def __init__(self, corrections: Session) -> None:
+        super().__init__()
+        self.corrections = corrections
+
+    def _select(self, statement: Any) -> Any:
+        if "FROM station_ref_override" not in str(statement):
+            return super()._select(statement)
+        self.selects.append("station_ref_override")
+        return self.corrections.execute(statement)
+
+
+@pytest.fixture
+def corrections() -> Iterator[Session]:
+    engine = sqlite_stand_in(si.StationRefOverride)
+    with Session(engine) as db:
+        yield db
+    engine.dispose()
+
+
+def _correct(corrections: Session, station: dict[str, Any], field: str, value: str) -> Any:
+    """The row the API stores for a correction: the value, and under it what
+    the build had computed."""
+    computed = so.to_text(station[field])
+    correction = si.StationRefOverride(
+        station_id=station["id"],
+        field_name=field,
+        value=value,
+        reason="per the operator",
+        set_at=datetime(2026, 10, 3, tzinfo=UTC),
+        computed_value_at_set=computed,
+        computed_value_latest=computed,
+    )
+    corrections.add(correction)
+    corrections.flush()
+    return correction
+
+
+def _chosen(db: _Tables, station: dict[str, Any]) -> list[tuple[str, bool]]:
+    mine = [m for m in db.table("station_ref_merits") if m["station_id"] == station["id"]]
+    return sorted((m["code"], m["is_chosen"]) for m in mine)
+
+
+def test_a_released_correction_is_not_reapplied_by_the_next_build(corrections: Session) -> None:
+    db = _TablesWithCorrections(corrections)
+
+    def build(build_id: int) -> tuple[int, int, int]:
+        counts, diff = si.write_reference(db, build_id, _INPUTS, parsed(), TODAY)  # type: ignore[arg-type]
+        return counts["overrides_applied"], diff["changed"], diff["unchanged"]
+
+    assert build(1) == (0, 0, 0)
+    station = _station(db, "ZZ00002")
+    computed = [("9900002", True), ("9900012", False), ("9900022", False), ("9900032", False)]
+    assert (station["name"], _chosen(db, station)) == ("Sampleton", computed)
+
+    # A content manager corrects the name and the MERITS code, as the API does it...
+    name = _correct(corrections, station, "name", "Sampleton Central")
+    merits = _correct(corrections, station, "uic_merits", "9900777")
+    station["name"] = "Sampleton Central"
+    _rewrite_candidates(
+        db, station, lambda found: so.merits_with_override(found, "9900777", "per the operator")
+    )
+    # ...and the next build re-applies both: it finds what is already there.
+    assert build(2) == (2, 0, 5)
+    assert (station["name"], station["uic_merits"]) == ("Sampleton Central", "9900777")
+    assert station["uic_merits_origin"] == so.ORIGIN_MANUAL
+    # The correction went on the master's own candidates: none was withdrawn.
+    corrected = [(code, False) for code, _ in computed]
+    assert _chosen(db, station) == [*corrected, ("9900777", True)]
+
+    # Both are released. The rows stay, as history, and the API puts back
+    # what the build computes.
+    for correction in (name, merits):
+        correction.released_at = datetime(2026, 10, 4, tzinfo=UTC)
+    corrections.flush()
+    station["name"] = name.computed_value_latest
+    _rewrite_candidates(
+        db, station, lambda found: so.merits_without_override(found, merits.computed_value_latest)
+    )
+    kept = corrections.execute(select(si.StationRefOverride.field_name)).scalars().all()
+    assert sorted(kept) == ["name", "uic_merits"]
+
+    # The build after that reads neither: nothing is applied, nothing changes.
+    assert build(3) == (0, 0, 5)
+    assert (station["name"], station["uic_merits"]) == ("Sampleton", "9900002")
+    assert station["uic_merits_origin"] == "Trainline (calculated differs)"
+    assert _chosen(db, station) == computed
+    assert _history(db) == []
+
+
 # ── bulk inserts: one statement per chunk, whatever cells are empty ────
 
 
@@ -1316,6 +1417,67 @@ def test_a_crash_is_recorded_without_leaking_its_message(monkeypatch: pytest.Mon
     _, success, closed = _run(monkeypatch, [], parse_inputs=crash)
     assert success is False
     assert closed["counts"] == {"error": "internal error (RuntimeError): see the worker log"}
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        # A refusal of the build stage itself, raised once the registers are in.
+        (
+            sf.StationFileError("the correction of 'lat' on station 3 can no longer be applied"),
+            "the correction of 'lat' on station 3 can no longer be applied",
+        ),
+        # A crash while it writes: its message stays in the worker log.
+        (
+            RuntimeError("index row size 3024 exceeds btree version 4 maximum 2704"),
+            "internal error (RuntimeError): see the worker log",
+        ),
+    ],
+    ids=["refused", "crashed"],
+)
+def test_a_build_that_fails_while_it_writes_keeps_the_registers_and_discards_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, reason: str
+) -> None:
+    # The two stages in real transactions, on a SQLite file: what each wrote is
+    # read back on another connection, once the build has returned.
+    engine = create_engine(f"sqlite:///{tmp_path / 'stages.db'}")
+    _ProbeBase.metadata.create_all(engine)
+    rows = select(_Probe.plc).order_by(_Probe.id)
+
+    def write(db: Session, plc: str) -> None:
+        si._insert(db, _Probe, [{**_probe_rows(1)[0], "plc": plc}])
+
+    def registers(db: Session, _inputs: Any, _parsed: Any) -> dict[str, int]:
+        write(db, "ZZREG01")
+        return {"crd_locations": 1}
+
+    def reference(db: Session, *_a: Any) -> None:
+        # The build stage has rows of its own in its transaction, and sees the
+        # registers the extract stage committed, when it fails.
+        write(db, "ZZREF01")
+        assert db.execute(rows).scalars().all() == ["ZZREG01", "ZZREF01"]
+        raise failure
+
+    monkeypatch.setattr(si.log, "disabled", True)
+    try:
+        _, success, closed = _run(
+            monkeypatch,
+            [],
+            SessionLocal=sessionmaker(engine, autoflush=False),
+            parse_inputs=lambda _inputs, _log: None,
+            load_registers=registers,
+            write_reference=reference,
+        )
+        with Session(engine) as db:
+            stored = db.execute(rows).scalars().all()
+    finally:
+        engine.dispose()
+
+    assert success is False
+    assert (closed["status"], closed["counts"]) == ("failed", {"error": reason})
+    # The registers stay: a delta between two versions needs no successful
+    # build. What the build stage wrote went with its transaction.
+    assert stored == ["ZZREG01"]
 
 
 # ── coalescing on (status, session, kind) ──────────────────────────────

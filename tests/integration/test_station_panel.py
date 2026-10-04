@@ -987,6 +987,108 @@ def test_a_master_with_a_repeated_pair_is_refused_and_nothing_changes(
     assert _scalar("SELECT count(*) FROM station_ref WHERE name LIKE 'A twin%'") == 0
 
 
+def test_a_build_that_fails_while_it_writes_keeps_the_registers_and_discards_the_rest(
+    client: TestClient,
+    admin: dict[str, str],
+    content_manager: dict[str, str],
+    built: dict[str, dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.master import station_import
+    from app.models import StationRefFlag
+
+    def reference() -> dict[str, list[tuple]]:
+        """Every row of the reference and of what the build derives with it."""
+        tables = (
+            "station_ref",
+            "station_ref_code",
+            "station_ref_merits",
+            "station_ref_flag",
+            "station_ref_alias",
+            "station_ref_link",
+            "station_ref_history",
+            "station_code_series",
+        )
+        return {
+            table: _rows(f"SELECT * FROM {table} ORDER BY 1")  # noqa: S608 - fixed table names
+            for table in tables
+        }
+
+    before = reference()
+    assert len(before["station_ref"]) == 5
+
+    # A new version of CRD: one location renamed, one created.
+    crd = crd_location_rows()
+    crd[0] = {**crd[0], "name": "Exampleville Central Station"}
+    newville = {"plc": "ZZ00007", "uopid": "ZZ00007", "name": "Newville Junction", "lat": "50.7"}
+    crd.append({**crd[0], **newville, "lon": "4.7", "crd_location_code": "00007"})
+    filename, content = station_file("CRD", crd)
+    new_crd = _upload(client, admin, "CRD", content, filename.replace("09", "10"))
+    assert new_crd.status_code == 201, new_crd.text
+    # And a new issue of the master: one station renamed, one created, so the
+    # build stage has an UPDATE and an INSERT of its own to lose.
+    master = master_rows()
+    master[1] = {**master[1], "era_name": "Sampleton Hbf"}
+    master.append({**master[4], "plc": "ZZ00005", "era_uopid": "ZZ00005", "era_name": "Newville"})
+    filename, content = station_file("OFFLINE_MASTER", master)
+    new_master = _upload(client, admin, "OFFLINE_MASTER", content, filename.replace("09", "10"))
+    assert new_master.status_code == 201, new_master.text
+
+    insert = station_import._insert
+    written: list[tuple] = []
+
+    def failing_on_flags(db, model, rows) -> None:
+        """Postgres refuses a statement of the build stage, midway: as it would
+        an index row too long for the unique key of the flags."""
+        if model is StationRefFlag:
+            # The stage has written by now, in its transaction: the new
+            # station, the new name, and the flags it replaces are gone.
+            state = text(
+                "SELECT (SELECT count(*) FROM station_ref),"
+                " (SELECT name FROM station_ref WHERE plc = 'ZZ00002'),"
+                " (SELECT count(*) FROM station_ref_flag)"
+            )
+            written.extend(tuple(row) for row in db.execute(state))
+            db.execute(text("SELECT 1 / 0"))
+        insert(db, model, rows)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(station_import, "_insert", failing_on_flags)
+        output, success = station_import.run_build()
+
+    assert success is False
+    assert written == [(6, "Sampleton Hbf", 0)]
+    (failed,) = _rows("SELECT status, counts FROM station_build ORDER BY id DESC LIMIT 1")
+    assert failed[0] == "failed"
+    # A crash is recorded without its message: that stays in the worker log.
+    assert failed[1]["error"].startswith("internal error (")
+    assert failed[1]["error"].endswith("): see the worker log")
+    assert "division by zero" not in output
+
+    # The build stage is discarded whole: the reference is what build #1 left.
+    assert reference() == before
+    # The extract stage was committed before it: the new CRD version is
+    # loaded, and its delta against the previous one needs no successful build.
+    crd_id, master_id = new_crd.json()["version"]["id"], new_master.json()["version"]["id"]
+    loaded = "SELECT count(*) FROM crd_location WHERE source_version_id = CAST(:id AS uuid)"
+    assert _scalar(loaded, id=crd_id) == 5
+    status = "SELECT status FROM station_source_version WHERE id = CAST(:id AS uuid)"
+    assert _scalar(status, id=crd_id) == "imported"
+    assert _scalar(status, id=master_id) == "uploaded"  # read, and not imported
+    delta = client.get(f"{REG}/crd/delta", headers=content_manager)
+    assert delta.status_code == 200, delta.text
+    assert (delta.json()["older"], delta.json()["newer"]) == (built["CRD"]["version"]["id"], crd_id)
+    assert (delta.json()["counts"]["created"], delta.json()["counts"]["renamed"]) == (1, 1)
+
+    # Nothing of the failed build is in the way of the next one, on the same files.
+    output, success = station_import.run_build()
+    assert success, output
+    assert "done: 1 created, 1 changed, 4 unchanged, 0 absent" in output
+    assert _scalar("SELECT name FROM station_ref WHERE plc = 'ZZ00002'") == "Sampleton Hbf"
+    assert _scalar(status, id=master_id) == "imported"
+    assert _scalar(loaded, id=crd_id) == 5  # loaded once, by the build that failed
+
+
 def test_rebuild_now_queues_a_build_and_coalesces(
     client: TestClient, admin: dict[str, str], built: dict[str, dict]
 ) -> None:
@@ -1153,7 +1255,14 @@ def test_the_reference_list_uncollapsed_and_paginated(
         ({"q": "9900001:0:1"}, ["ZZ00001"]),
         ({"q": "9900002"}, ["ZZ00002"]),  # by MERITS code
         ({"q": "ZZ00009"}, ["ZZ00002"]),  # by the PLC it had before
-        ({"q": "100%"}, []),  # a wildcard is a character, not a pattern
+        # A wildcard is a character, not a pattern. No fixture value contains
+        # one, so each finds nothing; read as a pattern, `%` would match every
+        # station, `Sam_leton` Sampleton, `Hb_` an alternative name and
+        # `ZZ0000_` every PLC.
+        ({"q": "%"}, []),
+        ({"q": "Sam_leton"}, []),
+        ({"q": "Hb_"}, []),
+        ({"q": "ZZ0000_"}, []),
         ({"country": "zz"}, ["ZZ00001", "ZZ00002", "ZZ00003", "ZZ00004"]),
         ({"country": "FR"}, []),
         ({"confidence": "conflict"}, ["ZZ00002"]),
@@ -1301,6 +1410,92 @@ def test_a_correction_is_applied_survives_a_rebuild_and_can_be_released(
     again = client.delete(f"{one}/overrides/{override['id']}", headers=content_manager)
     assert again.status_code == 409
 
+    # A released correction is history: the next build reads the active ones
+    # only, and does not put this one back.
+    output, success = station_import.run_build()
+    assert success, output
+    assert "done: 0 created, 0 changed, 5 unchanged, 0 absent" in output
+    after = client.get(one, headers=content_manager).json()
+    assert after["name"] == "Sampleton"
+    assert [(o["value"], o["active"]) for o in after["overrides"]] == [("Sampleton Central", False)]
+    counts = _scalar("SELECT counts FROM station_build ORDER BY id DESC LIMIT 1")
+    assert counts["overrides_applied"] == 0  # type: ignore[index]
+    assert _scalar("SELECT count(*) FROM station_ref_history") == 0
+
+
+def test_a_second_correction_releases_the_earlier_one_of_that_field_only(
+    client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
+) -> None:
+    one = f"{REF}/{_station_id('ZZ00002')}"
+    other = f"{REF}/{_station_id('ZZ00001')}"
+
+    def correct(station: str, field: str, value: str) -> dict:
+        r = client.post(
+            f"{station}/overrides",
+            headers=content_manager,
+            json={"field_name": field, "value": value, "reason": "checked on site"},
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def corrections(*, active: bool) -> list[tuple]:
+        return _rows(
+            "SELECT r.plc, o.field_name, o.value FROM station_ref_override o"
+            " JOIN station_ref r ON r.id = o.station_id"
+            " WHERE (o.released_at IS NULL) = :active ORDER BY o.id",
+            active=active,
+        )
+
+    correct(other, "name", "Exampleville Hbf")
+    first = correct(one, "name", "Sampleton Central")
+    moved = correct(one, "lat", "50.5")
+    # Three corrections, all active: the name of another station and another
+    # field of this one are not earlier corrections of this station's name.
+    assert corrections(active=True) == [
+        ("ZZ00001", "name", "Exampleville Hbf"),
+        ("ZZ00002", "name", "Sampleton Central"),
+        ("ZZ00002", "lat", "50.5"),
+    ]
+    assert corrections(active=False) == []
+    # Under the position is the position the build computed, not a name.
+    assert moved["computed_value_at_set"] == "50.1"
+
+    second = correct(one, "name", "Sampleton Hbf")
+    # By now the table also holds a released correction of this very field.
+    third = correct(one, "name", "Sampleton Gare")
+    assert corrections(active=True) == [
+        ("ZZ00001", "name", "Exampleville Hbf"),
+        ("ZZ00002", "lat", "50.5"),
+        ("ZZ00002", "name", "Sampleton Gare"),
+    ]
+    # The earlier ones are kept, as released: they are the history.
+    assert corrections(active=False) == [
+        ("ZZ00002", "name", "Sampleton Central"),
+        ("ZZ00002", "name", "Sampleton Hbf"),
+    ]
+    # Under each is what the build computes, never the correction it replaced.
+    for correction in (first, second, third):
+        assert correction["computed_value_at_set"] == "Sampleton"
+        assert correction["computed_value_latest"] == "Sampleton"
+
+    detail = client.get(one, headers=content_manager).json()
+    assert (detail["name"], detail["lat"]) == ("Sampleton Gare", 50.5)
+    assert len(detail["overrides"]) == 4
+    assert {(o["field_name"], o["value"]) for o in detail["overrides"] if o["active"]} == {
+        ("name", "Sampleton Gare"),
+        ("lat", "50.5"),
+    }
+    assert client.get(other, headers=content_manager).json()["name"] == "Exampleville Hbf"
+
+    # Releasing the position restores a position, and the name keeps its correction.
+    released = client.delete(f"{one}/overrides/{moved['id']}", headers=content_manager)
+    assert released.status_code == 200, released.text
+    detail = client.get(one, headers=content_manager).json()
+    assert (detail["name"], detail["lat"]) == ("Sampleton Gare", 50.1)
+    # Releasing the name restores what the build computed, not an earlier correction.
+    client.delete(f"{one}/overrides/{third['id']}", headers=content_manager).raise_for_status()
+    assert client.get(one, headers=content_manager).json()["name"] == "Sampleton"
+
 
 def test_correction_refusals(
     client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
@@ -1324,31 +1519,67 @@ def test_correction_refusals(
 def test_a_merits_correction_changes_the_chosen_candidate_and_is_reversible(
     client: TestClient, content_manager: dict[str, str], built: dict[str, dict]
 ) -> None:
+    from app.master import station_import
+
     one = f"{REF}/{_station_id('ZZ00002')}"
+
+    def merits() -> tuple:
+        """The three columns that mirror the chosen candidate, and the candidates."""
+        detail = client.get(one, headers=content_manager).json()
+        return (
+            detail["uic_merits"],
+            detail["uic_merits_origin"],
+            detail["uic_merits_confidence"],
+            [(m["code"], m["is_chosen"]) for m in detail["merits"]],
+        )
+
+    def rebuild(applied: int) -> None:
+        """A build from the same files: it leaves what it finds, and says how
+        many corrections it re-applied."""
+        output, success = station_import.run_build()
+        assert success, output
+        assert "done: 0 created, 0 changed, 5 unchanged, 0 absent" in output
+        counts = _scalar("SELECT counts FROM station_build ORDER BY id DESC LIMIT 1")
+        assert counts["overrides_applied"] == applied  # type: ignore[index]
+
+    computed = (
+        "9900002",
+        "Trainline (calculated differs)",
+        "conflict",
+        [("9900002", True), ("9900012", False), ("9900022", False), ("9900032", False)],
+    )
+    # Nothing computed is withdrawn: the four candidates stay, none of them chosen.
+    corrected = (
+        "9900777",
+        "Manual",
+        None,
+        [("9900777", True), *[(code, False) for code, _ in computed[3]]],
+    )
+    assert merits() == computed
+
     r = client.post(
         f"{one}/overrides",
         headers=content_manager,
         json={"field_name": "uic_merits", "value": "9900777", "reason": "per the operator"},
     )
     assert r.status_code == 201, r.text
-    detail = client.get(one, headers=content_manager).json()
-    assert (detail["uic_merits"], detail["uic_merits_origin"]) == ("9900777", "Manual")
-    # Nothing computed was withdrawn.
-    assert [(m["code"], m["is_chosen"]) for m in detail["merits"]] == [
-        ("9900777", True),
-        ("9900002", False),
-        ("9900012", False),
-        ("9900022", False),
-        ("9900032", False),
-    ]
+    assert merits() == corrected
+    # A build under the correction writes the corrected candidates, not the
+    # master's own: the candidate table and the mirrored columns still agree.
+    rebuild(applied=1)
+    assert merits() == corrected
+    chosen = "SELECT code, origin FROM station_ref_merits WHERE station_id = :id AND is_chosen"
+    assert _rows(chosen, id=_station_id("ZZ00002")) == [("9900777", "Manual")]
 
     client.delete(f"{one}/overrides/{r.json()['id']}", headers=content_manager).raise_for_status()
-    detail = client.get(one, headers=content_manager).json()
-    assert (detail["uic_merits"], detail["uic_merits_origin"]) == (
-        "9900002",
-        "Trainline (calculated differs)",
-    )
-    assert [m["code"] for m in detail["merits"]] == ["9900002", "9900012", "9900022", "9900032"]
+    assert merits() == computed
+    # And a build after the release does not put the correction back.
+    rebuild(applied=0)
+    assert merits() == computed
+    assert _rows(chosen, id=_station_id("ZZ00002")) == [
+        ("9900002", "Trainline (calculated differs)")
+    ]
+    assert _scalar("SELECT count(*) FROM station_ref_history") == 0
 
 
 def test_group_and_ungroup_a_complex(
@@ -1363,6 +1594,15 @@ def test_group_and_ungroup_a_complex(
         "requires_physical_separation": True,
         "separation_reason": "border control between the two halves",
     }
+    # Two different stations: the same one given twice is one, and is refused.
+    twice = client.post(
+        f"{REF}/complexes", headers=content_manager, json={**body, "station_ids": [central] * 2}
+    )
+    assert twice.status_code == 400, twice.text
+    assert "at least two different stations" in twice.json()["detail"]
+    assert _scalar("SELECT count(*) FROM station_complex") == 0
+    assert _scalar("SELECT count(*) FROM station_ref WHERE complex_id IS NOT NULL") == 0
+
     r = client.post(f"{REF}/complexes", headers=content_manager, json=body)
     assert r.status_code == 201, r.text
     complex_id = r.json()["id"]
@@ -1688,6 +1928,13 @@ def test_the_era_list_and_the_register_filters(
     assert plcs("crd", q="ZZ00008") == ["ZZ00008"]
     assert plcs("era", q="ZZOP03B") == ["ZZ00003"]  # by operational point id
     assert plcs("era", q="halt") == ["ZZ00004"]
+    # A wildcard typed in the search is a character, and no row has one: read
+    # as a pattern, `%` would be every row and `Sam_leton` Sampleton.
+    for register in ("crd", "era"):
+        assert plcs(register, q="sampleton") == ["ZZ00002"]
+        assert plcs(register, q="%") == []
+        assert plcs(register, q="Sam_leton") == []
+        assert plcs(register, q="ZZ0000_") == []
     paged = client.get(f"{REG}/era", headers=content_manager, params={"size": 2, "page": 2})
     assert paged.headers["X-Total-Count"] == "5"
     assert [row["plc"] for row in paged.json()] == ["ZZ00004"]
@@ -1876,6 +2123,10 @@ def test_unmatched_stops_filters(
     assert _stops(client, cm, "unmatched", q="west") == ["NAPST0102"]
     assert _stops(client, cm, "unmatched", q="tram") == []  # urban: outside the default
     assert _stops(client, cm, "unmatched", q="tram", label="all") == ["NAPST0101"]
+    # A wildcard typed in the search is a character, and no stop has one: read
+    # as a pattern, `%` would be all four and `Sampleton _est` Sampleton West.
+    assert _stops(client, cm, "unmatched", q="%", label="all") == []
+    assert _stops(client, cm, "unmatched", q="Sampleton _est", label="all") == []
 
     paged = client.get(
         f"{LINKS}/unmatched", headers=cm, params={"label": "all", "size": 1, "page": 1}
@@ -1914,6 +2165,9 @@ def test_stops_whose_code_contradicts_the_reference(
     assert _stops(client, cm, "contradictions", q="de:99:2") == ["NAPST0002"]  # the stop key
     assert _stops(client, cm, "contradictions", q="nord") == ["NAPST0002"]  # the name
     assert _stops(client, cm, "contradictions", q="9900001") == []
+    # A wildcard is a character here too: neither is the name of the stop.
+    assert _stops(client, cm, "contradictions", q="%") == []
+    assert _stops(client, cm, "contradictions", q="Sampleton _ord") == []
     assert _stops(client, cm, "contradictions", page=1) == []
 
 

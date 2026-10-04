@@ -204,10 +204,20 @@ def test_a_plc_is_validated_on_length_only() -> None:
         assert row.plc == plc
 
 
-def test_a_crd_derived_row_without_its_licence_tag_is_refused() -> None:
-    untagged = [master(crd_source_tag="")]
-    with pytest.raises(sf.StationFileError, match="carries no licence tag"):
+@pytest.mark.parametrize("spine_source", ["CRD_and_ERA", "CRD_only"])
+def test_a_crd_derived_row_without_its_licence_tag_is_refused(spine_source: str) -> None:
+    # Both kinds of CRD-derived row: the one ERA carries too, and the one only
+    # CRD has, the RNE-licensed row with no ERA counterpart.
+    untagged = [master(spine_source=spine_source, crd_source_tag="")]
+    with pytest.raises(sf.StationFileError, match="carries no licence tag") as exc:
         sp.parse_master(untagged)
+    assert "line 2 ('ZZ00001', 'ZZ00001')" in str(exc.value)
+    # With its tag, the same row is read.
+    (row,) = sp.parse_master([master(spine_source=spine_source)])
+    assert row.fields["crd_source_tag"] == LICENCE_TAG
+
+
+def test_a_row_that_is_not_crd_derived_needs_no_licence_tag() -> None:
     # An ERA-only row carries none, and that is not an error.
     (row,) = sp.parse_master([master(spine_source="ERA_only", crd_source_tag="")])
     assert row.fields["crd_source_tag"] is None

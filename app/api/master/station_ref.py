@@ -865,7 +865,10 @@ def release_override(
     "/complexes",
     status_code=201,
     responses={
-        400: {"description": "Unknown kind, or a principal that is not one of the stations"},
+        400: {
+            "description": "Unknown kind, fewer than two different stations, "
+            "or a principal that is not one of the stations"
+        },
         404: {"description": "One of the stations does not exist"},
         409: {
             "description": "One of the stations already belongs to a complex. " + _BUILD_WRITING_DOC
@@ -886,6 +889,10 @@ def create_complex(
     if body.kind not in COMPLEX_KINDS:
         raise HTTPException(400, f"unknown kind {body.kind!r}; valid: {sorted(COMPLEX_KINDS)}")
     ids = sorted(set(body.station_ids))
+    # The body counts items, so the same station given twice passes it: two
+    # different stations are counted here, once the repeats are gone.
+    if len(ids) < 2:
+        raise HTTPException(400, "a complex needs at least two different stations")
     if body.principal_id is not None and body.principal_id not in ids:
         raise HTTPException(400, "principal_id must be one of station_ids")
     _hold_reference(db)

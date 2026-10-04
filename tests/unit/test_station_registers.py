@@ -1,7 +1,8 @@
 """The registers screen (unit 7): the version delta, and the shape of the lists.
 
 The delta is pure: two lists of rows in, five kinds of change out. The SQL of
-the lists runs in tests/integration/test_station_panel.py.
+the lists runs in tests/integration/test_station_panel.py; their search also
+runs here, on a SQLite stand-in.
 
 Every row is invented; the PLC prefix `ZZ` does not exist.
 """
@@ -9,16 +10,20 @@ Every row is invented; the PLC prefix `ZZ` does not exist.
 from __future__ import annotations
 
 import re
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 
 from app.api.master import station_registers as api
 from app.master import station_delta as sd
 from app.security import require_content_manager
+from tests.station_fixtures import sqlite_stand_in
 
 TEMPLATE = (
     Path(__file__).resolve().parents[2] / "app" / "templates" / "admin" / "station_registers.html"
@@ -244,6 +249,57 @@ def test_the_search_is_by_name_plc_and_the_registers_own_code() -> None:
     era = _where("era", q="x", country="zz")
     assert "era_operational_point.uopid = " in era
     assert "era_operational_point.iso2 = " in era
+
+
+VERSION = uuid.uuid4()
+# (PLC, name, the register's own code). One name carries a LIKE wildcard.
+REGISTER_ROWS = [
+    ("ZZ00002", "Sampleton", "00002"),
+    ("ZZ00005", "Sam_leton Sidings", "00005"),
+    ("ZZ00006", "Quarterbury 25% Halt", "00006"),
+]
+
+
+@pytest.fixture
+def registers() -> Iterator[Session]:
+    """The columns the register search reads, in SQLite, with invented rows:
+    one version of each register, and one row of another version."""
+    engine = sqlite_stand_in(api.CrdLocation, api.EraOperationalPoint)
+    other = uuid.uuid4()
+    versions = [*[(VERSION, row) for row in REGISTER_ROWS], (other, ("ZZ00009", "Sampleton", "0"))]
+    with Session(engine) as db:
+        for table, code in ((api.CrdLocation, "location_code"), (api.EraOperationalPoint, "uopid")):
+            db.execute(
+                insert(table.__table__),
+                [
+                    {"source_version_id": version, "plc": plc, "name": name, code: own}
+                    for version, (plc, name, own) in versions
+                ],
+            )
+        yield db
+    engine.dispose()
+
+
+@pytest.mark.parametrize("register", ["crd", "era"])
+@pytest.mark.parametrize(
+    ("term", "plcs"),
+    [
+        ("sampl", ["ZZ00002"]),  # by substring, whatever the case, in one version only
+        ("zz0000", ["ZZ00002", "ZZ00005", "ZZ00006"]),  # in the PLC
+        ("00005", ["ZZ00005"]),  # the PLC again, and the register's own code
+        # A wildcard typed in the term is a character, not a pattern.
+        ("Sam_leton", ["ZZ00005"]),  # not Sampleton as well
+        ("%", ["ZZ00006"]),  # not every row
+        ("ZZ0000_", []),  # not every PLC
+        ("0000_", []),  # nor by its digits; and a code is compared whole
+    ],
+)
+def test_a_wildcard_in_a_register_search_is_a_character_not_a_pattern(
+    registers: Session, register: str, term: str, plcs: list[str]
+) -> None:
+    plc = api._REGISTERS[register].table.plc
+    clauses = api.list_clauses(register, VERSION, term, None)
+    assert registers.execute(select(plc).where(*clauses).order_by(plc)).scalars().all() == plcs
 
 
 def test_the_two_registers_map_to_the_two_offline_shapes() -> None:

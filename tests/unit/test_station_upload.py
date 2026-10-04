@@ -298,36 +298,60 @@ async def test_re_uploading_an_identical_file_is_a_no_op(
     assert len(_stored_files(inbox)) == 1  # nothing left in _incoming either
 
 
-async def test_a_lost_race_on_the_unique_key_is_also_a_no_op(
+async def _lose_the_race(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, filename: str
+) -> tuple[Any, Any, Response, _FakeDb]:
+    """Two uploads of the same bytes race on the unique key (source, sha256).
+
+    The winner is a real upload: its file is in the store and its row points
+    to it. The loser checked for an existing version before the winner had
+    committed, so it stored its copy too, and only its INSERT is refused.
+    Returns (the winner's row, the loser's answer, its response, its session).
+    """
+    _, _, won = await harness.upload(TELREF)
+    (winner,) = won.added
+    answers = iter([None])  # the loser's check before it stored; the winner afterwards
+    monkeypatch.setattr(api, "_existing_version", lambda *_a: next(answers, winner))
+    db = _FakeDb(flush_error=IntegrityError("insert", {}, Exception("duplicate key")))
+    out, response, _ = await harness.upload(TELREF, filename=filename, db=db)
+    return winner, out, response, db
+
+
+async def test_a_lost_race_on_the_unique_key_keeps_the_file_of_the_winner(
     inbox: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = _Harness(monkeypatch, _source())
-    winner = SimpleNamespace(
-        id=uuid.uuid4(),
-        sha256=hashlib.sha256(TELREF).hexdigest(),
-        acquired_at=datetime(2026, 10, 3, tzinfo=UTC),
-        as_of=None,
-        filename="telref_locations_v3.csv",
-        bytes=len(TELREF),
-        status="uploaded",
-        error=None,
-        stats=None,
+    winner, out, response, db = await _lose_the_race(
+        harness, monkeypatch, "telref_locations_v3.csv"
     )
-    calls = {"n": 0}
-
-    def existing(_db: Any, _source: Any, _sha: str) -> Any:
-        calls["n"] += 1
-        return None if calls["n"] == 1 else winner  # absent, then present after the race
-
-    monkeypatch.setattr(api, "_existing_version", existing)
-    db = _FakeDb(flush_error=IntegrityError("insert", {}, Exception("duplicate key")))
-    out, response, _ = await harness.upload(TELREF, db=db)
 
     assert out.created is False
     assert response.status_code == 200
     assert out.version.id == str(winner.id)
     assert db.rolled_back
-    assert _stored_files(inbox) == []
+    assert len(harness.audit) == 1  # the winning upload only
+    # Same bytes under the same name: both uploads were moved to one path.
+    # What is there is the file the winner's row points to, and the only copy.
+    kept = Path(winner.stored_path)
+    assert Path(db.added[0].stored_path) == kept
+    assert _stored_files(inbox) == [kept]
+    assert kept.read_bytes() == TELREF
+
+
+async def test_a_lost_race_under_another_name_removes_the_copy_of_the_loser(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _Harness(monkeypatch, _source())
+    winner, out, _, db = await _lose_the_race(harness, monkeypatch, "renamed.csv")
+
+    assert out.created is False
+    assert out.version.id == str(winner.id)
+    # Another name is another path: no row points to the loser's copy, so it
+    # goes, and the winner's file is not touched.
+    kept = Path(winner.stored_path)
+    assert Path(db.added[0].stored_path).name.endswith("-renamed.csv")
+    assert _stored_files(inbox) == [kept]
+    assert kept.read_bytes() == TELREF
 
 
 async def test_a_file_of_the_wrong_shape_is_refused_with_the_column_list(

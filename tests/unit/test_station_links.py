@@ -1,22 +1,27 @@
 """The two lists of screen A (unit 8): unmatched stops, and stops whose code
 contradicts the reference. Both are read from `station_ref_link`.
 
-The filters are checked here by compiling them; the lists run against
-Postgres in tests/integration/test_station_panel.py.
+The filters are checked here by compiling them, and the two searches by
+running them on a SQLite stand-in; the lists run against Postgres in
+tests/integration/test_station_panel.py.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import insert, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 
 from app.api.master import station_links as api
 from app.models import StationRefLink
 from app.security import require_content_manager
+from tests.station_fixtures import sqlite_stand_in
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin" / "station_nap.html"
 
@@ -107,6 +112,70 @@ def test_contradictions_filter_by_feed_and_by_the_reference_rows_country() -> No
     assert "station_ref.iso2 = 'ZZ'" in sql
     assert "station_ref_link.code_value = '9900002'" in sql
     assert "station_ref_link.stop_key = '9900002'" in sql
+
+
+# ── the filters, executed: what a term with a wildcard in it matches ───
+
+
+def _link(stop: str, name: str, **kw: Any) -> dict[str, Any]:
+    """One link row; every row carries the same keys, as a bulk INSERT needs."""
+    row = {"station_id": None, "label": "Rail", "code_value": None, "stop_key": None}
+    return {**row, "offline_station_id": stop, "stop_name": name, "asserted": False, **kw}
+
+
+@pytest.fixture
+def links() -> Iterator[Session]:
+    """The columns the two lists search, in SQLite, with invented stops. One
+    stop of each list carries a LIKE wildcard in its own name."""
+    engine = sqlite_stand_in(StationRefLink)
+    code = {"station_id": 2, "code_value": "9900002"}  # matched, with a code, not asserted
+    rows = [
+        _link("NAPST0102", "Sampleton West"),
+        _link("NAPST0105", "Sampleton _est", label="Urban"),
+        _link("NAPST0002", "Sampleton Nord", stop_key="de:99:2", **code),
+        _link("NAPST0006", "Sampleton 100% Nord", stop_key="de:99:6", **code),
+    ]
+    with Session(engine) as db:
+        db.execute(insert(StationRefLink.__table__), rows)
+        yield db
+    engine.dispose()
+
+
+def _stops(db: Session, clauses: list[Any]) -> list[str]:
+    stop = StationRefLink.offline_station_id
+    return list(db.execute(select(stop).where(*clauses).order_by(stop)).scalars())
+
+
+@pytest.mark.parametrize(
+    ("term", "stops"),
+    [
+        ("west", ["NAPST0102"]),  # by substring, whatever the case
+        # A wildcard typed in the term is a character, not a pattern.
+        ("Sampleton _est", ["NAPST0105"]),  # not Sampleton West as well
+        ("%", []),  # not every stop
+    ],
+)
+def test_a_wildcard_in_an_unmatched_search_is_a_character(
+    links: Session, term: str, stops: list[str]
+) -> None:
+    assert _stops(links, api.unmatched_clauses(labels=["all"], q=term)) == stops
+
+
+@pytest.mark.parametrize(
+    ("term", "stops"),
+    [
+        ("nord", ["NAPST0002", "NAPST0006"]),
+        ("de:99:2", ["NAPST0002"]),  # the stop key, by equality
+        ("9900002", ["NAPST0002", "NAPST0006"]),  # the code, by equality
+        ("Sampleton _ord", []),  # not Sampleton Nord
+        ("%", ["NAPST0006"]),  # the one stop with a percent sign in its name
+        ("de:99:_", []),  # a key is compared whole, never as a pattern
+    ],
+)
+def test_a_wildcard_in_a_contradiction_search_is_a_character(
+    links: Session, term: str, stops: list[str]
+) -> None:
+    assert _stops(links, api.contradiction_clauses(q=term)) == stops
 
 
 # ── gates and registration ─────────────────────────────────────────────

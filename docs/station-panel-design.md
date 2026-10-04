@@ -465,8 +465,9 @@ As built (`app/api/master/station_ref.py`):
   releases the earlier correction and keeps it as history.
 - **A complex** is created from two or more stations selected in the list
   (`POST /complexes`), with one of them optionally its principal, and removed whole
-  (`DELETE /complexes/{id}`). One made here is `manual`; a station is in one complex at most; a
-  rebuild leaves `complex_id` and `complex_role` alone.
+  (`DELETE /complexes/{id}`). Two or more different stations: an id given twice counts once, and
+  one station alone is refused with `400`. One made here is `manual`; a station is in one
+  complex at most; a rebuild leaves `complex_id` and `complex_role` alone.
 - **While a station build is writing the reference**, the four routes that write (set or release
   a correction, group or ungroup a complex) answer `409` at once and save nothing; the panel
   shows the reason. They do not wait: a build's write stage lasts far longer than a request
@@ -801,6 +802,7 @@ corrected; this table is the record.
 | wrap the `detect` call "so it returns 400 rather than 500" | `detect` raises `ValueError` for what it cannot classify, but a corrupt `.zip` raises `zipfile.BadZipFile`, which is not a `ValueError` | both are caught, and the staged copy is removed |
 | the upload route "writes `station_source_version`" | nothing said the file is looked at before the build refuses it | the header is checked at upload against the shape the source's `format` declares |
 | `_stations` and `_staging` are the folders in the trap | `inbox/_phase1/`, the legacy session-less inbox, is offered for deletion the same way | left as it is — not asked for, and it holds no station data; noted for a decision |
+| unique `(source_id, sha256)`, "so re-uploading the same file is a no-op" | a kept file is named `<sha256 prefix>-<name>`: two uploads of the same bytes under the same name, each past the check before the other committed, are moved to one path. The one refused on the unique key then removed "its" file, the only copy and the one the winner's row points to; re-uploading it is a no-op, so the panel could not put it back. Not reachable with the single web process of today; it is with several workers or replicas | the upload that loses removes its stored copy only when the winner's row points elsewhere, which is the same bytes under another name |
 
 ### Worker and importer
 
@@ -839,6 +841,7 @@ corrected; this table is the record.
 | screen C: fix `page` "at the API — **not** in the template" | the panel sends `page=0` on every fresh search; with the API fix alone, no search would ever jump to its first match again | the API fix, and the panel sends `page` only when the operator asked for a page by number |
 | screen C: `.hint` and `.flag` are "defined only in `journey.html`'s own style block" | true of `.flag`. `.hint` had no unscoped rule in any template or stylesheet | `.flag` moved; `.hint` defined in `_base.html`, colour only, which also mutes the hints that had no rule on the coverage and sessions pages. `journey.html` opts out with `.hint { color: inherit; }` and renders as before. **Owner to decide** whether it should |
 | screen C: "promote" `.flag` | two of its four variants are below WCAG AA (4.2:1 and 3.6:1), and the Sonar gate refuses that on new CSS | the base carries AA pairs for those two; `journey.html` keeps its own two and renders as before. **Owner to decide** whether the journey page adopts the base pairs |
+| screen D: a complex is "created from two or more stations" | the body's length check counts the items of the list, and the route removed repeated ids after it: one station given twice made a complex of one, and that station was then refused from any real grouping until it was ungrouped. The panel cannot send it; a direct call can | the route counts again once the repeats are gone and answers `400` below two different stations |
 | screen E: "edit" a source | the dialog lists the caller's own credentials and sent every field. A source can carry a credential saved by another administrator: the select could not show it, read back empty, and saving any other change sent `credential_id: null`, which detached it | the dialog shows such a credential under its name, marked as not in the caller's list, and sends `credential_id` only when the selection changed. The `PATCH` route leaves an absent field as it is; only an explicit `null` detaches |
 
 **Not imported from the master in step 1**, because the shapes document maps them nowhere:

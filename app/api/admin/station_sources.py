@@ -722,8 +722,12 @@ async def upload_version(
     except IntegrityError:
         # Two uploads of the same file raced; the other one won.
         db.rollback()
-        stored.unlink(missing_ok=True)
         winner = _existing_version(db, source, received.sha256)
+        # The stored name is the sha256 prefix and the file name: the same
+        # bytes under the same name went to the same path, and what is there
+        # is the file the winner's row points to. Only a copy of our own goes.
+        if winner is None or winner.stored_path != str(stored):
+            stored.unlink(missing_ok=True)
         if winner is None:  # pragma: no cover  defensive
             raise
         response.status_code = 200

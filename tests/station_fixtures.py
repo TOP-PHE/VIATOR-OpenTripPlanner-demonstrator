@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import Engine, Integer, create_engine, text
+from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 STATION_TABS = (
@@ -112,6 +114,30 @@ def run_in_node(script: str, expression: str) -> Any:
     return run_node_program(
         script + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
     )
+
+
+def sqlite_stand_in(*models: Any) -> Engine:
+    """An in-memory SQLite database with one table per model: the model's
+    table name and column names, and nothing else of it.
+
+    The station tables themselves need Postgres (arrays, JSONB, partial
+    indexes) and run in tests/integration. This is for a statement the
+    application builds on plain columns: a unit test can execute it here and
+    read what it really matches, where compiling it only shows its text. The
+    columns have no type, so SQLite keeps each value as it is given.
+    """
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    with engine.begin() as conn:
+        for model in models:
+            table = model.__table__
+            columns = ", ".join(
+                f'"{column.name}" INTEGER PRIMARY KEY'  # numbered by SQLite when not given
+                if column.primary_key and isinstance(column.type, Integer)
+                else f'"{column.name}"'
+                for column in table.c
+            )
+            conn.execute(text(f'CREATE TABLE "{table.name}" ({columns})'))
+    return engine
 
 
 def csv_bytes(header: Sequence[str], *rows: dict[str, str]) -> bytes:
