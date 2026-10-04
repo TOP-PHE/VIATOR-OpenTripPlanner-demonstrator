@@ -1996,6 +1996,10 @@ def test_the_delta_between_two_crd_versions(
     rows[3] = {**rows[3], "lat": "50.21"}
     newville = {"plc": "ZZ00007", "uopid": "ZZ00007", "name": "Newville", "lat": "50.7"}
     rows.append({**rows[0], **newville, "lon": "4.7", "crd_location_code": "00007"})  # created
+    # Formerton Sidings, retired in the first version, is CRD's own again: its
+    # CRD name and position appear. Read the other way, CRD retires it.
+    reinstated = {"spine_source": "CRD_and_ERA", "crd_end": "", "name_src": "CRD", "pos_src": "CRD"}
+    rows[5] = {**rows[5], **reinstated}
     filename, content = station_file("CRD", rows)
     second = _upload(client, admin, "CRD", content, filename.replace("09", "10"))
     assert second.status_code == 201, second.text
@@ -2013,7 +2017,7 @@ def test_the_delta_between_two_crd_versions(
         "renamed": 1,
         "moved": 1,
         "renumbered": 1,
-        # ZZ00008, retired in CRD: no CRD name or position in either version.
+        # ZZ00008: a name and a position that appear are no rename and no move.
         "unchanged": 1,
     }
     assert [c["key"] for c in delta["created"]] == ["ZZ00007"]
@@ -2034,13 +2038,23 @@ def test_the_delta_between_two_crd_versions(
     assert loose.json()["counts"]["moved"] == 0
     assert loose.json()["counts"]["unchanged"] == 2
 
-    # Reversed, a created location is a removed one.
+    # Reversed, a created location is a removed one. ZZ00008 is then a location
+    # CRD retires between the two versions: its name and position leave the
+    # register, CRD changed its validity only, and that is not a rename.
     reverse = client.get(
         f"{REG}/crd/delta",
         headers=content_manager,
         params={"older": delta["newer"], "newer": delta["older"]},
     )
-    assert reverse.json()["counts"]["removed"] == 1
+    assert reverse.json()["counts"] == {
+        "created": 0,
+        "removed": 1,
+        "renamed": 1,
+        "moved": 1,
+        "renumbered": 1,
+        "unchanged": 1,
+    }
+    assert [pair["old"]["key"] for pair in reverse.json()["renamed"]] == ["ZZ00001"]
     unknown = client.get(
         f"{REG}/crd/delta", headers=content_manager, params={"older": str(uuid.uuid4())}
     )

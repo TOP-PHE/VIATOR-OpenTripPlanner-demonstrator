@@ -173,6 +173,59 @@ def test_a_missing_name_equals_an_empty_one() -> None:
     assert delta.renamed == []
 
 
+def test_a_name_that_appears_or_disappears_is_not_a_rename() -> None:
+    named = [row("ZZ00001", "Exampleville Central", 50.0, 4.0)]
+    for bare in (row("ZZ00001"), row("ZZ00001", "  ")):
+        gone = sd.register_delta(named, [bare])
+        assert (gone.renamed, gone.moved, gone.unchanged) == ([], [], 1)
+        back = sd.register_delta([bare], named)
+        assert (back.renamed, back.moved, back.unchanged) == ([], [], 1)
+    # Named in both versions, and differently: that is still a rename.
+    other = sd.register_delta(named, [row("ZZ00001", "Exampleville Hbf", 50.0, 4.0)])
+    assert len(other.renamed) == 1
+
+
+def test_a_location_crd_retires_between_two_versions_is_not_renamed() -> None:
+    """Once a location is retired in CRD the file carries ERA's name and
+    position for it (name_src, pos_src), so its register row has none. CRD
+    changed the validity, not the name: the delta must not call it renamed."""
+    from app.master import station_files as sf
+    from app.master import station_parse as sp
+    from tests.station_fixtures import crd_location_rows
+
+    own = crd_location_rows()[0]
+    retired = {
+        **own,
+        "spine_source": "ERA_retired_in_CRD",
+        "crd_end": "2022-12-10",
+        "name_src": "ERA",
+        "pos_src": "ERA",
+    }
+
+    def delta_rows(source: dict[str, str]) -> list[sd.RegisterRow]:
+        line = {column: source.get(column, "") for column in sf.FILE_SHAPES[sf.CRD_LOCATIONS]}
+        return api.crd_rows(
+            (loc["plc"], loc["name"], loc["lat"], loc["lon"], loc["start_validity"])
+            for loc in sp.parse_crd_locations([line]).locations
+        )
+
+    older, newer = delta_rows(own), delta_rows(retired)
+    assert [(r.key, r.name, r.lat, r.lon) for r in older] == [
+        ("ZZ00001", "Exampleville Central", 50.0, 4.0)
+    ]
+    assert [(r.key, r.name, r.lat, r.lon) for r in newer] == [("ZZ00001", None, None, None)]
+    # Retired, and reinstated: neither direction is a rename or a move.
+    for delta in (sd.register_delta(older, newer), sd.register_delta(newer, older)):
+        assert delta.counts() == {
+            "created": 0,
+            "removed": 0,
+            "renamed": 0,
+            "moved": 0,
+            "renumbered": 0,
+            "unchanged": 1,
+        }
+
+
 # ── register rows for the delta ────────────────────────────────────────
 
 

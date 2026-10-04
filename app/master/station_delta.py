@@ -5,7 +5,7 @@ The delta of screen B is a set difference between two `source_version_id`s of
 
     created      a location the newer version has and the older one lacks
     removed      the reverse
-    renamed      same key, another name
+    renamed      same key, another name; both versions name the location
     moved        same key, a position further away than a threshold
     renumbered   a removed and a created location that are plainly the same
                  place under a new code: same name, same position
@@ -121,14 +121,18 @@ def register_delta(
     """The delta from an older version of a register to a newer one.
 
     Rows are matched on `key`. A position that appears or disappears is not a
-    move: a move needs both positions.
+    move: a move needs both positions. A name that appears or disappears is
+    not a rename either: a rename needs both names. A location retired in CRD
+    has neither in the CRD register from then on (the file carries ERA's), and
+    CRD changed its validity, not its name.
     """
     old_by_key = {row.key: row for row in old}
     new_by_key = {row.key: row for row in new}
     delta = Delta()
     for key in sorted(old_by_key.keys() & new_by_key.keys()):
         before, after = old_by_key[key], new_by_key[key]
-        renamed = not _same_name(before, after)
+        named_in_both = bool(_name_key(before) and _name_key(after))
+        renamed = named_in_both and not _same_name(before, after)
         apart = distance_m(before, after)
         moved = apart is not None and apart > threshold_m
         if renamed:

@@ -363,6 +363,10 @@ As built (`app/api/master/station_registers.py`, `app/master/station_delta.py`):
   most recent by default, with the "moved" threshold as a parameter (100 m by default). It
   compares locations, not validity periods: for CRD, the row with the latest start of validity
   stands for its PLC.
+- A rename needs a name in both versions, as a move needs a position in both: one that appears or
+  disappears is neither. A location retired in CRD has no name and no position in the CRD register
+  from then on (the file carries ERA's); CRD changed its validity, not its name. The delta has no
+  kind for a retirement: such a location counts as unchanged.
 - **`renumbered` is inferred**, not read: `crd_location` and `era_operational_point` keep no
   "this code replaces that one" column, so a removed and a created location are paired only when
   they carry the same name at the same place. It is a reading aid; the reference's own
@@ -833,6 +837,7 @@ corrected; this table is the record.
 | Version 2 said | What is true | As built |
 |---|---|---|
 | the delta lists what was "renumbered" | neither register table keeps a column saying one code replaces another | inferred: a removed and a created location with the same name at the same place, each paired once |
+| the delta lists what was "renamed" | `crd_location` holds CRD's own name only, so a location CRD retires between two versions goes from its CRD name to none: every such retirement read as a rename, although CRD changed the validity only | a rename needs a name in both versions, as a move needs a position in both; a name that appears or disappears is not a rename |
 | `era_operational_point.rl100` | the telref extract's 36 columns have no RL100 | the column stays NULL in step 1 |
 | screen B is two lists | a CRD PLC has one row per validity period | the lists show every row; the delta takes the latest validity as the PLC's row |
 | screen A lists "stops whose code contradicts the reference" | the links file records a verdict per stop (tier, asserted or not); no column says "contradiction", and nothing in step 1 compares a stop's code with the reference's codes | a matched link that is not asserted although it carries a code value. **To be confirmed by the owner** |
