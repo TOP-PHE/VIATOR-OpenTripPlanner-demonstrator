@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -26,7 +27,7 @@ from typing import Any
 
 from sqlalchemy import update
 
-from . import engine_versions, graph_snapshots
+from . import engine_versions, graph_snapshots, netex_calendar
 from .db import SessionLocal
 from .models import RebuildJob
 from .models import Session as SessionRow
@@ -1398,8 +1399,11 @@ def run_build_motis(
         # Preserve each file's source subdir (gtfs/ or netex/) in the
         # in-container path so MOTIS auto-detects the right loader per
         # file. f.parent.name is "gtfs" or "netex" from the glob above.
+        # NeTEx calendars MOTIS cannot read are rewritten into a copy under the
+        # graphs volume (app/netex_calendar.py); the inbox keeps the original.
+        netex_notes: list[str] = []
         in_container_timetables = [
-            f"/inbox/{sid}/{f.parent.name}/{f.name}" for f in timetable_files
+            _motis_timetable_path(sid, f, motis_root, netex_notes) for f in timetable_files
         ]
         config_cmd = [
             *common_cmd,
@@ -1481,7 +1485,8 @@ def run_build_motis(
             # the complete answer is the resolved *digest*, which belongs with the
             # `engine_build` row (MCT design ch.10.2), not a per-build shell-out.
             f"[viator] engine: {_MOTIS_IMAGE}\n"
-            "[viator] motis config OK (tiles block stripped)\n"
+            + "".join(f"[viator] {note}\n" for note in netex_notes)
+            + "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"
             + (import_proc.stdout or "")
@@ -1550,12 +1555,52 @@ def _discard_failed_build(build_dir: Path) -> None:
     log.info("removed failed build folder %s", build_dir)
 
 
+_NETEX_CACHE_DIR = "_netex"
+_BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def _motis_timetable_path(sid: str, f: Path, motis_root: Path, notes: list[str]) -> str:
+    """In-container path MOTIS reads `f` from: the inbox file itself, or for a
+    NeTEx zip whose calendar MOTIS cannot read, a converted copy kept in
+    `graphs/motis/<sid>/_netex/` under the same file name (MOTIS names the
+    dataset after it). The copy is redone only when the source changes."""
+    original = f"/inbox/{sid}/{f.parent.name}/{f.name}"
+    if f.parent.name != "netex":
+        return original
+    cache = motis_root / _NETEX_CACHE_DIR
+    dest = cache / f.name
+    marker = cache / f"{f.name}.source"
+    st = f.stat()
+    key = f"{netex_calendar.CONVERTER_VERSION}:{st.st_size}:{st.st_mtime_ns}"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        cached = marker.read_text(encoding="utf-8") if marker.exists() else None
+        if cached is None or cached.split("\n", 1)[0] != key:
+            dest.unlink(missing_ok=True)
+            stats = netex_calendar.convert_zip(f, dest)
+            summary = stats.summary() if stats else ""
+            marker.write_text(f"{key}\n{summary}", encoding="utf-8")
+            cached = marker.read_text(encoding="utf-8")
+    except Exception:
+        # Never fail the build over this: MOTIS reads the published file.
+        log.exception("NeTEx calendar conversion failed for %s; using the original", f.name)
+        notes.append(f"netex calendar: {f.name} conversion failed, original used")
+        return original
+    if not dest.exists():
+        return original
+    summary = cached.split("\n", 1)[1] if "\n" in cached else ""
+    notes.append(f"netex calendar: {f.name} converted for MOTIS ({summary})")
+    rel = dest.relative_to(Path(str(settings.graph_dir)))
+    return f"/graphs/{rel.as_posix()}"
+
+
 def _prune_old_motis_imports(sid: str, keep: int) -> None:
     base = Path(str(settings.graph_dir)) / "motis" / sid
     if not base.is_dir():
         return
+    # Build folders only: `current` and the `_netex` conversion cache stay.
     snapshots = sorted(
-        (p for p in base.iterdir() if p.is_dir() and p.name != "current"),
+        (p for p in base.iterdir() if p.is_dir() and _BUILD_DIR_RE.match(p.name)),
         reverse=True,
     )
     for old in snapshots[keep:]:
