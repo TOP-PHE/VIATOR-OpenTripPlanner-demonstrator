@@ -965,6 +965,9 @@ class ProviderStatus(BaseModel):
     # no file, a derived feed, or a file that predates the check. A format
     # check only — it says nothing about the timetable content.
     format_ok: bool | None = None
+    # NeTEx only: {"level": "ok"|"warn"|"red", "messages": [...]} from the
+    # structure check run at download (app/netex_structure.py). Never blocks.
+    structure: dict[str, Any] | None = None
 
 
 # How recently a provider's inbox file must have been refreshed before we
@@ -1839,13 +1842,17 @@ async def _download_task(
         result.path.unlink(missing_ok=True)
 
     feed_fetch.save_state(state_dir, label, result.state)
-    return {
+    outcome: dict[str, Any] = {
         "status": "fetched",
         "key": label,
         "kind": kind,
         "url": url,
         "size_bytes": result.size_bytes,
     }
+    assessment = (result.state.get("structure") or {}).get("assessment") or {}
+    if assessment.get("level") in ("warn", "red"):
+        outcome["structure"] = assessment
+    return outcome
 
 
 # ──── bulk import providers from a National Access Point (v0.1.8) ────
@@ -2427,6 +2434,9 @@ def _decorate_status(
     attempt = fetch_state.get("last_attempt")
     status.last_attempt = attempt if isinstance(attempt, dict) else None
     status.format_ok = _format_ok(status, fetch_state)
+    structure = fetch_state.get("structure")
+    if isinstance(structure, dict) and isinstance(structure.get("assessment"), dict):
+        status.structure = structure["assessment"]
 
 
 def _format_ok(status: ProviderStatus, fetch_state: dict[str, Any]) -> bool | None:
