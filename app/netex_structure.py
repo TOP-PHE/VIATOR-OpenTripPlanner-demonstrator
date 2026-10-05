@@ -13,11 +13,15 @@ file gets a fingerprint and an assessment, shown in the Feed status panel:
   namespace prefix dropped). Comparing it with the previous download reveals
   any new structure, in any part of NeTEx, without knowing it in advance;
 * RULES: element names that mark a form MOTIS does not read, measured against
-  nigiri's loader.
+  nigiri's loader;
+* the calendar: for each `DayType`, whether anything gives it dates. SI-NAP's
+  2026-10-01 file defined every rail day type by its `Name` alone ("Vozi vsak
+  dan.") and many bus ones by `DaysOfWeek` plus exclusions only; both load
+  without error and run on no date, so nothing else would flag them.
 
 Warnings never block the file: keeping an old timetable silently would hide
-the change just as well. Counting is a byte scan, not an XML parse (~110 MB/s
-of XML; a full parse took 40 min on DB's 2 GB zip).
+the change just as well. Counting is a byte scan, not an XML parse (~75 MB/s
+of XML with the calendar scan; a full parse took 40 min on DB's 2 GB zip).
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 # Bumped when the fingerprint changes shape, so old ones are not compared.
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 
 _CHUNK = 8 * 1024 * 1024
 # `<name` of every start tag; closing tags (`</`), comments (`<!`) and
@@ -42,6 +46,21 @@ _XSD_RE = re.compile(rb"""schemaLocation=["'][^"']*?/([\d.]+)/xsd""")
 # Captured text is stripped by the caller; no nested quantifiers to backtrack on.
 _PROFILE_RE = re.compile(rb"<!--\s*Profile:?([^-]*)-->")
 _PARTICIPANT_RE = re.compile(rb"<(?:[\w.-]+:)?ParticipantRef>([^<]*)<")
+# Calendar blocks: a DayType definition or a DayTypeAssignment, whole.
+_CAL_START_RE = re.compile(rb"<(?:[\w.-]+:)?(DayType|DayTypeAssignment)[\s>]")
+_DAY_TYPE_RE = re.compile(
+    rb"""<(?:[\w.-]+:)?DayType\s[^>]*?\bid=["']([^"']+)["'][^>]*(?<!/)>(.*?)</(?:[\w.-]+:)?DayType>""",
+    re.S,
+)
+_DTA_RE = re.compile(
+    rb"<(?:[\w.-]+:)?DayTypeAssignment[\s>].*?</(?:[\w.-]+:)?DayTypeAssignment>", re.S
+)
+# Starts on the literal name so the scan stays fast; `DayTypeRef\s` is only
+# ever the start tag (the end tag is `DayTypeRef>`).
+_DAY_TYPE_REF_RE = re.compile(rb"""DayTypeRef\s[^>]*?\bref=["']([^"']+)["']""")
+_NOT_AVAILABLE_RE = re.compile(rb"""isAvailable(?:=["']false["']|>\s*false\s*<)""")
+_NAME_RE = re.compile(rb"<(?:[\w.-]+:)?Name>([^<]*)<")
+_EXAMPLES = 3
 
 OK, WARN, RED = "ok", "warn", "red"
 
@@ -182,6 +201,8 @@ class Fingerprint:
     elements: dict[str, int] = field(default_factory=dict)
     # Element start tags written with a namespace prefix, by prefix.
     prefixes: dict[str, int] = field(default_factory=dict)
+    # _CalendarScan.summary(): day types that nothing gives dates to.
+    calendar: dict[str, Any] = field(default_factory=dict)
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -190,6 +211,7 @@ class Fingerprint:
             "xml_files": self.xml_files,
             "elements": self.elements,
             "prefixes": self.prefixes,
+            "calendar": self.calendar,
         }
 
 
@@ -222,7 +244,85 @@ def _header(head: bytes) -> dict[str, str]:
     }
 
 
-def _count(stream: Any, counts: collections.Counter[bytes]) -> bytes:
+class _CalendarScan:
+    """For each DayType of the file: does anything give it dates?
+
+    Collected on the same byte scan as the element counts. A DayType "has
+    dates" when at least one DayTypeAssignment names it without
+    `isAvailable=false`; nigiri reads assignments only (nigiri:684-689) and
+    VIATOR's converter (app/netex_calendar.py) builds dates from them, so a
+    DayType with `DaysOfWeek` but no positive assignment runs on no date too.
+    """
+
+    def __init__(self) -> None:
+        self.weekdays: dict[str, bool] = {}  # DayType id -> has DaysOfWeek
+        self.names: dict[str, str] = {}
+        self.positive: set[str] = set()
+        self.refs: collections.Counter[bytes] = collections.Counter()  # all DayTypeRef, raw
+        self.assignment_refs: collections.Counter[str] = collections.Counter()
+
+    def feed(self, buf: bytes) -> None:
+        if b"DayType" not in buf:
+            return
+        self.refs.update(_DAY_TYPE_REF_RE.findall(buf))
+        if b"DayType " in buf or b"DayType>" in buf:
+            self._day_types(buf)
+        if b"DayTypeAssignment" in buf:
+            self._assignments(buf)
+
+    def _day_types(self, buf: bytes) -> None:
+        for m in _DAY_TYPE_RE.finditer(buf):
+            dt = m.group(1).decode("utf-8", "replace")
+            self.weekdays[dt] = b"DaysOfWeek>" in m.group(2)
+            name = _NAME_RE.search(m.group(2))
+            if name:
+                self.names[dt] = name.group(1).decode("utf-8", "replace").strip()[:80]
+
+    def _assignments(self, buf: bytes) -> None:
+        for m in _DTA_RE.finditer(buf):
+            ref = _DAY_TYPE_REF_RE.search(m.group(0))
+            if ref is None:
+                continue
+            dt = ref.group(1).decode("utf-8", "replace")
+            self.assignment_refs[dt] += 1
+            if not _NOT_AVAILABLE_RE.search(m.group(0)):
+                self.positive.add(dt)
+
+    def summary(self) -> dict[str, Any]:
+        """Day types with no positive assignment, split by whether they give
+        DaysOfWeek, with how often journeys and other elements refer to them."""
+        out: dict[str, Any] = {"day_types": len(self.weekdays)}
+        for key, with_weekdays in (("no_dates", False), ("weekdays_only", True)):
+            ids = sorted(
+                dt
+                for dt, dow in self.weekdays.items()
+                if dow is with_weekdays and dt not in self.positive
+            )
+            uses = {dt: self.refs[dt.encode()] - self.assignment_refs[dt] for dt in ids}
+            top = sorted(ids, key=lambda dt: -uses[dt])[:_EXAMPLES]
+            out[key] = {
+                "count": len(ids),
+                "references": sum(uses.values()),
+                "examples": [
+                    {"id": dt, "name": self.names.get(dt, ""), "references": uses[dt]} for dt in top
+                ],
+            }
+        return out
+
+
+def _calendar_cut(buf: bytes, cut: int) -> int:
+    """Move `cut` back to the last calendar block still open in `buf`, so a
+    DayType or DayTypeAssignment split across reads is scanned whole."""
+    window = max(0, cut - 1024 * 1024)  # blocks are a few kB
+    starts = list(_CAL_START_RE.finditer(buf, window, cut))
+    if not starts:
+        return cut
+    last = starts[-1]  # blocks do not nest: only the last one can be open
+    close = re.compile(rb"</(?:[\w.-]+:)?" + last.group(1) + rb">")
+    return cut if close.search(buf, last.end(), cut) else last.start()
+
+
+def _count(stream: Any, counts: collections.Counter[bytes], calendar: _CalendarScan) -> bytes:
     """Count start tags of one XML stream; returns its first bytes."""
     head = b""
     tail = b""
@@ -231,28 +331,34 @@ def _count(stream: Any, counts: collections.Counter[bytes]) -> bytes:
             head = chunk[:8192]
         buf = tail + chunk
         cut = buf.rfind(b"<")  # a tag split across reads is counted next time
+        if cut < 0:
+            cut = len(buf)
+        cut = _calendar_cut(buf, cut)
         counts.update(_START_TAG_RE.findall(buf, 0, cut))
+        calendar.feed(buf[:cut])
         tail = buf[cut:]
     counts.update(_START_TAG_RE.findall(tail))
+    calendar.feed(tail)
     return head
 
 
 def fingerprint(path: Path) -> Fingerprint:
     """Fingerprint a NeTEx zip (or a bare XML file)."""
     counts: collections.Counter[bytes] = collections.Counter()
+    calendar = _CalendarScan()
     fp = Fingerprint()
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
             names = sorted(n for n in z.namelist() if n.lower().endswith(".xml"))
             for name in names:
                 with z.open(name) as f:
-                    head = _count(f, counts)
+                    head = _count(f, counts, calendar)
                 if not fp.header:
                     fp.header = _header(head)
             fp.xml_files = len(names)
     else:
         with path.open("rb") as f:
-            fp.header = _header(_count(f, counts))
+            fp.header = _header(_count(f, counts, calendar))
         fp.xml_files = 1
     merged: collections.Counter[str] = collections.Counter()
     prefixes: collections.Counter[str] = collections.Counter()
@@ -263,6 +369,7 @@ def fingerprint(path: Path) -> Fingerprint:
             prefixes[prefix] += n
     fp.elements = dict(sorted(merged.items()))
     fp.prefixes = dict(sorted(prefixes.items()))
+    fp.calendar = calendar.summary()
     return fp
 
 
@@ -274,6 +381,38 @@ def _journeys_without_calendar(elements: dict[str, int]) -> bool:
         + elements.get("UicOperatingPeriod", 0)
     )
     return has_journeys and calendars == 0
+
+
+def _examples(entry: dict[str, Any]) -> str:
+    names = [f'"{e["name"]}"' if e.get("name") else e["id"] for e in entry.get("examples", [])]
+    return "; e.g. " + ", ".join(names) if names else ""
+
+
+def _calendar_findings(calendar: dict[str, Any]) -> list[tuple[str, str]]:
+    """Day types that run on no date in MOTIS, though the file loads cleanly."""
+    out: list[tuple[str, str]] = []
+    none = calendar.get("no_dates") or {}
+    if none.get("count"):
+        out.append(
+            (
+                RED,
+                f"{none['count']} day types ({none['references']} references from journeys) have "
+                "no DayTypeAssignment and no DaysOfWeek: their days are only in the name, "
+                "they run on no date" + _examples(none),
+            )
+        )
+    weekly = calendar.get("weekdays_only") or {}
+    if weekly.get("count"):
+        out.append(
+            (
+                RED,
+                f"{weekly['count']} day types ({weekly['references']} references from journeys) give "
+                "DaysOfWeek but no positive DayTypeAssignment: neither MOTIS (nigiri:684-689) nor "
+                "VIATOR's converter turns weekdays into dates, they run on no date"
+                + _examples(weekly),
+            )
+        )
+    return out
 
 
 def _rule_findings(current: Fingerprint) -> list[tuple[str, str]]:
@@ -290,6 +429,7 @@ def _rule_findings(current: Fingerprint) -> list[tuple[str, str]]:
         if el.get(rule.element)
     ]
     out += _ratio_rules(el)
+    out += _calendar_findings(current.calendar)
     # gml:pos is read with its literal prefix (nigiri:156-171); any other
     # prefixed element is invisible to the loader's unprefixed XPaths.
     out += [

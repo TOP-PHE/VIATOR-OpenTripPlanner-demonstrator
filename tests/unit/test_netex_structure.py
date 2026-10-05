@@ -313,3 +313,106 @@ def test_prefixed_elements_are_flagged_except_gml(tmp_path: Path) -> None:
     msgs = assess(fp, None).messages
     assert "2 elements written with prefix 'netex:': MOTIS reads unprefixed names" in msgs
     assert not any("'gml:'" in m for m in msgs)
+
+
+# ── calendar: day types that nothing gives dates to ─────────────────
+
+# Shapes copied from SI-NAP's NETEX_PI_01_SI_NAP_NETWORK_20261001.XML (2026-10-03):
+# rail day types carry only a Name; bus ones DaysOfWeek and exclusions only.
+SI_CALENDAR = (
+    b'<PublicationDelivery xmlns="http://www.netex.org.uk/netex" version="2.0:EU_PI-1.0">'
+    b"<TimetableFrame><vehicleJourneys>"
+    b'<ServiceJourney id="r1"><TransportMode>rail</TransportMode><dayTypes>'
+    b'<DayTypeRef ref="SI:DayType:rail" /></dayTypes></ServiceJourney>'
+    b'<ServiceJourney id="r2"><dayTypes><DayTypeRef ref="SI:DayType:rail" /></dayTypes>'
+    b"</ServiceJourney>"
+    b'<ServiceJourney id="b1"><dayTypes><DayTypeRef ref="SI:DayType:term" /></dayTypes>'
+    b"</ServiceJourney>"
+    b'<ServiceJourney id="b2"><dayTypes><DayTypeRef ref="SI:DayType:dated" /></dayTypes>'
+    b"</ServiceJourney>"
+    b"</vehicleJourneys></TimetableFrame><ServiceCalendarFrame><dayTypes>"
+    b'<DayType id="SI:DayType:rail" created="2025-12-10T16:07:31Z" version="1">'
+    b"<Name>Ne vozi ob sobotah, nedeljah in praznikih-dela prostih dneh v RS.</Name></DayType>"
+    b'<DayType id="SI:DayType:term" version="1"><Name>Vozi ob delavnikih razen sobote</Name>'
+    b"<properties><PropertyOfDay><DaysOfWeek>Monday Tuesday Wednesday Thursday Friday"
+    b"</DaysOfWeek></PropertyOfDay></properties></DayType>"
+    b'<DayType id="SI:DayType:dated" version="1"><Name>Vozi 1.9.</Name></DayType>'
+    b"</dayTypes><dayTypeAssignments>"
+    b'<DayTypeAssignment id="a1" version="2" order="1"><OperatingPeriodRef ref="p" />'
+    b'<DayTypeRef version="2" ref="SI:DayType:term" /><isAvailable>false</isAvailable>'
+    b"</DayTypeAssignment>"
+    b'<DayTypeAssignment id="a2" version="1" order="1"><OperatingDayRef ref="d" />'
+    b'<DayTypeRef version="1" ref="SI:DayType:dated" /></DayTypeAssignment>'
+    b"</dayTypeAssignments></ServiceCalendarFrame></PublicationDelivery>"
+)
+
+
+def test_day_types_without_dates_are_counted_with_their_journeys(tmp_path: Path) -> None:
+    cal = fingerprint(_zip(tmp_path, {"SI.XML": SI_CALENDAR})).calendar
+    assert cal["day_types"] == 3
+    assert cal["no_dates"]["count"] == 1
+    assert cal["no_dates"]["references"] == 2
+    assert cal["no_dates"]["examples"][0]["name"].startswith("Ne vozi ob sobotah")
+    # Exclusions alone give no date: the assignment's own reference is not a use.
+    assert cal["weekdays_only"]["count"] == 1
+    assert cal["weekdays_only"]["references"] == 1
+    assert cal["weekdays_only"]["examples"][0]["id"] == "SI:DayType:term"
+
+
+def test_day_types_without_dates_are_red(tmp_path: Path) -> None:
+    result = assess(fingerprint(_zip(tmp_path, {"SI.XML": SI_CALENDAR})), None)
+    assert result.level == RED
+    assert any(
+        m.startswith("1 day types (2 references from journeys) have no DayTypeAssignment")
+        and '"Ne vozi ob sobotah' in m
+        for m in result.messages
+    )
+    assert any(
+        m.startswith("1 day types (1 references from journeys) give DaysOfWeek")
+        for m in result.messages
+    )
+
+
+def test_every_day_type_with_a_positive_assignment_is_ok(tmp_path: Path) -> None:
+    body = SI_CALENDAR.replace(b"<isAvailable>false</isAvailable>", b"")
+    body = body.replace(
+        b"<Name>Ne vozi ob sobotah, nedeljah in praznikih-dela prostih dneh v RS.</Name></DayType>",
+        b"<Name>rail</Name></DayType>",
+    ).replace(
+        b"</dayTypeAssignments>",
+        b'<DayTypeAssignment id="a3"><OperatingDayRef ref="d"/>'
+        b'<DayTypeRef ref="SI:DayType:rail"/></DayTypeAssignment></dayTypeAssignments>',
+    )
+    cal = fingerprint(_zip(tmp_path, {"SI.XML": body})).calendar
+    assert cal["no_dates"]["count"] == 0
+    assert cal["weekdays_only"]["count"] == 0
+    assert not any("day types" in m for m in assess(Fingerprint(calendar=cal), None).messages)
+
+
+@pytest.mark.parametrize("chunk", [7, 64, 500])
+def test_calendar_blocks_split_across_reads_are_read_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chunk: int
+) -> None:
+    whole = fingerprint(_zip(tmp_path, {"SI.XML": SI_CALENDAR}, "a.zip")).calendar
+    monkeypatch.setattr(netex_structure, "_CHUNK", chunk)
+    assert fingerprint(_zip(tmp_path, {"SI.XML": SI_CALENDAR}, "b.zip")).calendar == whole
+
+
+def test_prefixed_calendar_elements_are_read(tmp_path: Path) -> None:
+    body = (
+        b'<n:PublicationDelivery xmlns:n="http://www.netex.org.uk/netex">'
+        b'<n:ServiceJourney id="j"><n:dayTypes><n:DayTypeRef ref="t"/></n:dayTypes></n:ServiceJourney>'
+        b"<n:DayType id='t'><n:Name>x</n:Name></n:DayType></n:PublicationDelivery>"
+    )
+    cal = fingerprint(_zip(tmp_path, {"a.xml": body})).calendar
+    assert cal["no_dates"] == {
+        "count": 1,
+        "references": 1,
+        "examples": [{"id": "t", "name": "x", "references": 1}],
+    }
+
+
+def test_a_file_without_day_types_has_no_calendar_finding(tmp_path: Path) -> None:
+    fp = fingerprint(_zip(tmp_path, {"a.xml": SBB_HEAD + SBB_BODY}))
+    assert fp.calendar["day_types"] == 0
+    assert not any("day types" in m for m in assess(fp, None).messages)
