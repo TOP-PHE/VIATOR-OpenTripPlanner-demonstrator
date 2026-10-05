@@ -299,7 +299,7 @@ class _CalendarScan:
                 if dow is with_weekdays and dt not in self.positive
             )
             uses = {dt: self.refs[dt.encode()] - self.assignment_refs[dt] for dt in ids}
-            top = sorted(ids, key=lambda dt: -uses[dt])[:_EXAMPLES]
+            top = sorted(ids, key=uses.__getitem__, reverse=True)[:_EXAMPLES]
             out[key] = {
                 "count": len(ids),
                 "references": sum(uses.values()),
