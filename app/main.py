@@ -157,12 +157,26 @@ app.include_router(page_routes.router)
 _scheduler: object | None = None
 
 
+def _warn_if_legacy_basic_auth_is_locked() -> None:
+    """`ADMIN_USER` without `ADMIN_PASSWORD` makes `/` ask for a credential that
+    nothing satisfies. Say so once at boot instead of leaving the operator to
+    work it out from a browser prompt that never accepts.
+    """
+    if settings.admin_user and not settings.admin_password:
+        log.warning(
+            "legacy_basic_auth.locked",
+            reason="ADMIN_USER is set but ADMIN_PASSWORD is empty",
+            fix="set both to enable the upload UI, or clear ADMIN_USER for Phase-2 mode",
+        )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     """Run once per worker. Schema is owned by Alembic and applied by the
     container entrypoint *before* uvicorn — we just bootstrap runtime state.
     """
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
+    _warn_if_legacy_basic_auth_is_locked()
     # Initialise concurrency gates from the live platform_config. If the DB is
     # unreachable at boot (rare; the entrypoint just ran a migration on it),
     # we fall back to schema defaults so the app still starts.
@@ -258,9 +272,9 @@ def index(
       returns None, we redirect to `/login`. The Phase-1 upload UI is
       unreachable here — avoids the browser's native basic-auth prompt
       on a bare-hostname visit, which is otherwise confusing UX.
-    - **Phase-1 deployment** (`ADMIN_USER` set): basic-auth required;
-      `authed_or_none` returns the username and we render the legacy
-      upload dashboard.
+    - **Phase-1 deployment** (`ADMIN_USER` and `ADMIN_PASSWORD` both
+      set): basic-auth required; `authed_or_none` returns the username
+      and we render the legacy upload dashboard.
     """
     if user is None:
         return RedirectResponse("/login", status_code=303)

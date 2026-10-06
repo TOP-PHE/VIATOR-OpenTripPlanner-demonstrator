@@ -72,7 +72,7 @@ The compose project is named `viator`, so volume names are `viator_<volume>`:
 
 VIATOR uses **JWT in an httponly cookie**, set by `/api/auth/login` after password verification. The first platform admin is created via the one-shot bootstrap endpoint (see spec §11.4); subsequent users are invited via the admin UI which sends a magic-link email through the SMTP credentials in `platform_config`.
 
-There is **no basic auth** anywhere in the runtime stack. `/api/healthz` and `/api/readyz` are public; everything else requires a valid JWT (or, for HTML page routes, redirects to `/login`).
+There is **no basic auth** in the default runtime stack — the legacy Phase-1 upload UI stays off unless `ADMIN_USER` and `ADMIN_PASSWORD` are both set in `.env`. `/api/healthz` and `/api/readyz` are public; everything else requires a valid JWT (or, for HTML page routes, redirects to `/login`).
 
 ## Configuration
 

@@ -3,7 +3,9 @@
 Two authentication surfaces coexist:
 
 - **`authed`** — HTTP basic auth, kept for the Phase-1 upload UI (`/`, `/upload`).
-  The single basic-auth credential corresponds to the operator's `.env` config.
+  The single basic-auth credential corresponds to the operator's `.env` config,
+  and exists only when BOTH `ADMIN_USER` and `ADMIN_PASSWORD` are set — an empty
+  setting switches the surface off.
 
 - **`current_user_jwt`** + **`require_*`** — JWT (cookie or Bearer header), used
   by everything new (auth API, admin API, future journey UI). This is the
@@ -46,10 +48,15 @@ class CurrentUser:
 # ────────────────────────── basic auth (Phase-1) ──────────────────────────
 
 
+def _basic_configured() -> bool:
+    """The legacy credential exists only when both halves are set."""
+    return bool(settings.admin_user and settings.admin_password)
+
+
 def _check_basic(creds: HTTPBasicCredentials) -> None:
     ok_user = secrets.compare_digest(creds.username, settings.admin_user)
     ok_pwd = secrets.compare_digest(creds.password, settings.admin_password)
-    if not (ok_user and ok_pwd):
+    if not (_basic_configured() and ok_user and ok_pwd):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
@@ -58,7 +65,10 @@ def _check_basic(creds: HTTPBasicCredentials) -> None:
 
 
 def authed(creds: Annotated[HTTPBasicCredentials | None, Depends(_basic)]) -> str:
-    """Phase-1 basic auth — preserved for the upload UI on `/` and `/upload`."""
+    """Phase-1 basic auth — preserved for the upload UI on `/` and `/upload`.
+
+    Always 401 while `ADMIN_USER` or `ADMIN_PASSWORD` is empty (Phase-2 mode).
+    """
     if creds is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
