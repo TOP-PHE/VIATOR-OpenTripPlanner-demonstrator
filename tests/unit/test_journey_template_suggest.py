@@ -108,3 +108,20 @@ def test_an_older_answer_never_overwrites_a_newer_one(template_text: str) -> Non
     assert body.lstrip().startswith("const mine = ++seq;")
     guard = refresh.index("if (mine !== seq) return;")
     assert refresh.index("await Promise.all(") < guard < refresh.index("items = _mergeSuggestions(")
+
+
+def test_a_keystroke_a_pick_and_a_blur_also_drop_an_answer_in_flight(template_text: str) -> None:
+    """Without these, an answer still in flight re-shows the old list during
+    the debounce after a keystroke, or re-opens the box after a pick or a blur."""
+    setup = template_text[template_text.index("function setupAutocomplete(") :]
+
+    pick = re.search(r"  function pick\(i\) \{.*?\n  \}\n", setup, re.S)
+    assert pick, "pick() not found"
+    assert "++seq;" in pick.group(0)
+    assert pick.group(0).index("++seq;") < pick.group(0).index("box.classList.remove('show')")
+
+    assert "++seq; clearTimeout(t); t = setTimeout(refresh, 150);" in setup
+
+    blur = re.search(r"inp\.addEventListener\('blur', \(\) => \{(.*?)\n  \}\);", setup, re.S)
+    assert blur, "the blur listener is not a block"
+    assert blur.group(1).lstrip().startswith("++seq;")
