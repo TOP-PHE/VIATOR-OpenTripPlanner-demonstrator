@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -62,6 +63,17 @@ class Settings(BaseSettings):
     # If the env var is missing entirely (running tests, bare `python -m app`),
     # default `"dev"` keeps the badge non-blank.
     viator_version: str = "dev"
+
+    # Multimodal Station Mapping module (MSMM) — the journey typeahead's
+    # station source, see app/station_module.py. Both empty (the default):
+    # the module is not used and the typeahead serves VIATOR's own
+    # master_stations list. The URL is the module's in-network address,
+    # `http://msmm-web:8000`; the token is the module's MSMM_INTERNAL_TOKEN,
+    # generated on the server and kept in docker/.env only. repr=False keeps
+    # it out of every repr of the settings. No `MSMM_` prefix on purpose:
+    # the module refuses any unknown `MSMM_` name in its own environment.
+    station_module_url: str = ""
+    station_module_token: str = Field(default="", repr=False)
 
     class Config:
         env_file = ".env"
