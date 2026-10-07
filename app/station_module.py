@@ -9,7 +9,8 @@ inside the network like VIATOR's calls to MOTIS):
   stations whose name or MERITS code matches `q`. Used by the journey
   typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
 - `attribution()` — `GET /internal/v1/attribution`, the licence text of the
-  module's sources, kept 60 s.
+  module's sources, kept 60 s. Asynchronous, like search, so that its
+  deadline is real.
 
 Both return `None` on any failure, and the caller then uses VIATOR's own
 behaviour (the master_stations list; no notice). VIATOR must keep working
@@ -18,8 +19,8 @@ without the module.
 Rules this client keeps on purpose:
 
 - **Its own headers, built from nothing.** `Authorization: Bearer <token>`,
-  `X-Viator-User-Id` (search only) and `Content-Type: application/json`
-  (search only). Nothing of the incoming request is ever forwarded, so a
+  `Accept-Encoding: identity`, `X-Viator-User-Id` (search only) and
+  `Content-Type: application/json` (search only). Nothing of the incoming request is ever forwarded, so a
   browser cannot set the user id: it comes from the JWT user of
   `require_logged_in`. `trust_env=False` keeps proxy variables and `.netrc`
   out of the call.
@@ -34,8 +35,9 @@ Rules this client keeps on purpose:
   for everyone.
 - **A real deadline and a size cap**: 1 s for a whole search, 0.5 s for an
   attribution (httpx's timeouts bound each read, not the call), and a body
-  larger than 64 KiB (search) or 256 KiB (attribution) is refused unread.
-  Both count as failures that pause. Any other error (a bad address, a
+  larger than 64 KiB (search) or 256 KiB (attribution) is refused unread;
+  so is a compressed answer, which could inflate past the cap at once.
+  All count as failures that pause. Any other error (a bad address, a
   token httpx cannot encode) falls back too, as `network`.
 - **A bad row is dropped, never the whole answer.**
 - **The log never holds the text, a body, the token or an exception's
@@ -71,14 +73,16 @@ USER_HEADER = "X-Viator-User-Id"
 SEARCH_DEADLINE = 1.0
 SEARCH_TIMEOUT = httpx.Timeout(SEARCH_DEADLINE, connect=0.3)
 # The attribution is read while /journey renders: half a second for the whole
-# call. It is synchronous, so the deadline is checked between reads; each
-# read is bounded at 0.25 s, so the call never lasts more than about 0.75 s.
+# call, enforced the same way.
 ATTRIBUTION_DEADLINE = 0.5
-ATTRIBUTION_TIMEOUT = httpx.Timeout(0.25)
+ATTRIBUTION_TIMEOUT = httpx.Timeout(ATTRIBUTION_DEADLINE)
 
 # The largest body read from the module, decoded. A search answer is ten
 # short rows (a few KiB); an attribution is at most 20 groups of texts of 500
-# characters. Anything larger is refused without being read to its end.
+# characters. Anything larger is refused without being read to its end. The
+# cap counts the bytes as they arrive: the client asks for no compression
+# and refuses a compressed answer, which could inflate far past the cap
+# inside a single chunk.
 SEARCH_MAX_BYTES = 64 * 1024
 ATTRIBUTION_MAX_BYTES = 256 * 1024
 
@@ -120,8 +124,8 @@ class _Answer:
 
 
 class _State:
-    """The pause and the cached attribution, shared by the event loop (search)
-    and the thread pool (attribution), under one lock."""
+    """The pause and the cached attribution, under one lock: the calls run on
+    the event loop, but the lock keeps the state safe from any thread."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -167,8 +171,12 @@ def _url(path: str) -> str:
     return settings.station_module_url.rstrip("/") + path
 
 
-def _authorization() -> dict[str, str]:
-    return {"Authorization": f"Bearer {settings.station_module_token.get_secret_value()}"}
+def _headers() -> dict[str, str]:
+    """The headers of every call: the token, and no compression (see the cap)."""
+    return {
+        "Authorization": f"Bearer {settings.station_module_token.get_secret_value()}",
+        "Accept-Encoding": "identity",
+    }
 
 
 def _too_large(response: httpx.Response, limit: int) -> bool:
@@ -177,31 +185,24 @@ def _too_large(response: httpx.Response, limit: int) -> bool:
     return length.isdigit() and int(length) > limit
 
 
-def _append_capped(body: bytearray, chunk: bytes, limit: int) -> None:
-    body += chunk
-    if len(body) > limit:
-        raise _Failure("shape", pause=True)
+def _compressed(response: httpx.Response) -> bool:
+    """True when the answer carries a Content-Encoding other than identity."""
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    return encoding not in ("", "identity")
 
 
-async def _read_async(response: httpx.Response, limit: int) -> _Answer:
-    """The answer, its body read up to `limit` decoded bytes, else a shape failure."""
-    if _too_large(response, limit):
+async def _read(response: httpx.Response, limit: int) -> _Answer:
+    """The answer, its body read as it arrives up to `limit` bytes, else a
+    shape failure. A compressed answer is refused unread."""
+    if _compressed(response) or _too_large(response, limit):
         raise _Failure("shape", pause=True)
     body = bytearray()
+    # With no Content-Encoding (or identity), the decoded bytes are the bytes
+    # as they arrive: nothing is inflated before the cap is checked.
     async for chunk in response.aiter_bytes():
-        _append_capped(body, chunk, limit)
-    return _Answer(response.status_code, bytes(body))
-
-
-def _read_sync(response: httpx.Response, limit: int, deadline: float) -> _Answer:
-    """As `_read_async`, and a timeout once `deadline` (time.monotonic) is passed."""
-    if _too_large(response, limit):
-        raise _Failure("shape", pause=True)
-    body = bytearray()
-    for chunk in response.iter_bytes():
-        _append_capped(body, chunk, limit)
-        if time.monotonic() > deadline:
-            raise _Failure("timeout", pause=True)
+        body += chunk
+        if len(body) > limit:
+            raise _Failure("shape", pause=True)
     return _Answer(response.status_code, bytes(body))
 
 
@@ -285,7 +286,7 @@ def _stations(payload: Any) -> list[dict[str, Any]]:
 
 async def _post_search(q: str, user_id: uuid.UUID) -> _Answer:
     headers = {
-        **_authorization(),
+        **_headers(),
         USER_HEADER: str(user_id),
         "Content-Type": "application/json",
     }
@@ -296,7 +297,7 @@ async def _post_search(q: str, user_id: uuid.UUID) -> _Answer:
             httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client,
             client.stream("POST", _url(SEARCH_PATH), content=body, headers=headers) as response,
         ):
-            return await _read_async(response, SEARCH_MAX_BYTES)
+            return await _read(response, SEARCH_MAX_BYTES)
     except (TimeoutError, httpx.TimeoutException):
         raise _Failure("timeout", pause=True) from None
     except httpx.HTTPError:
@@ -359,15 +360,15 @@ def _attribution_of(payload: Any) -> dict[str, Any]:
     }
 
 
-def _get_attribution() -> _Answer:
-    deadline = time.monotonic() + ATTRIBUTION_DEADLINE
+async def _get_attribution() -> _Answer:
     try:
-        with (
-            httpx.Client(timeout=ATTRIBUTION_TIMEOUT, trust_env=False) as client,
-            client.stream("GET", _url(ATTRIBUTION_PATH), headers=_authorization()) as response,
+        async with (
+            asyncio.timeout(ATTRIBUTION_DEADLINE),
+            httpx.AsyncClient(timeout=ATTRIBUTION_TIMEOUT, trust_env=False) as client,
+            client.stream("GET", _url(ATTRIBUTION_PATH), headers=_headers()) as response,
         ):
-            return _read_sync(response, ATTRIBUTION_MAX_BYTES, deadline)
-    except httpx.TimeoutException:
+            return await _read(response, ATTRIBUTION_MAX_BYTES)
+    except (TimeoutError, httpx.TimeoutException):
         raise _Failure("timeout", pause=True) from None
     except httpx.HTTPError:
         raise _Failure("network", pause=True) from None
@@ -387,9 +388,11 @@ def _forget_and_fail(failure: _Failure) -> None:
     _fail(failure)
 
 
-def attribution() -> dict[str, Any] | None:
+async def attribution() -> dict[str, Any] | None:
     """The module's attribution text, cached 60 s; `None` when the module is
-    not configured, is paused or fails (and a failure forgets the cache)."""
+    not configured, is paused or fails (and a failure forgets the cache).
+    Asynchronous so that its deadline bounds the whole call, headers
+    included; the page that shows it awaits it."""
     try:
         if not enabled():
             raise _Failure("off", pause=False)
@@ -398,7 +401,7 @@ def attribution() -> dict[str, Any] | None:
         cached = _cached_attribution()
         if cached is not None:
             return cached
-        answer = _attribution_of(_json_body(_get_attribution()))
+        answer = _attribution_of(_json_body(await _get_attribution()))
     except _Failure as failure:
         _forget_and_fail(failure)
         return None

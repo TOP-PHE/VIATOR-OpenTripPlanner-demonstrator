@@ -94,23 +94,17 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
 def module(monkeypatch: pytest.MonkeyPatch, token: str, clock: FakeClock) -> Iterator[Module]:
     stand_in = Module()
     transport = httpx.MockTransport(stand_in)
-    real_async, real_sync = httpx.AsyncClient, httpx.Client
+    real_async = httpx.AsyncClient
 
     def async_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        stand_in.clients.append({"kind": "async", **kwargs})
+        stand_in.clients.append(kwargs.copy())
         kwargs["transport"] = transport
         return real_async(*args, **kwargs)
-
-    def sync_factory(*args: Any, **kwargs: Any) -> httpx.Client:
-        stand_in.clients.append({"kind": "sync", **kwargs})
-        kwargs["transport"] = transport
-        return real_sync(*args, **kwargs)
 
     # alembic's fileConfig (run by the integration tests) disables every logger
     # that exists at that moment; this one must be live for caplog.
     monkeypatch.setattr(station_module.log, "disabled", False)
     monkeypatch.setattr(station_module.httpx, "AsyncClient", async_factory)
-    monkeypatch.setattr(station_module.httpx, "Client", sync_factory)
     monkeypatch.setattr(settings, "station_module_url", MODULE_URL)
     monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
     station_module.reset()
@@ -145,6 +139,7 @@ async def test_search_posts_the_text_in_the_body_with_only_its_own_headers(
     assert request.headers["authorization"] == f"Bearer {token}"
     assert request.headers["x-viator-user-id"] == str(user)
     assert request.headers["content-type"] == "application/json"
+    assert request.headers["accept-encoding"] == "identity"
     ours = {"authorization", "x-viator-user-id", "content-type", "content-length"}
     assert set(request.headers.keys()) <= ours | _HTTPX_DEFAULTS
     for browser_or_proxy in ("cookie", "origin", "sec-fetch-site", "sec-fetch-mode", "referer"):
@@ -161,15 +156,16 @@ async def test_a_trailing_slash_on_the_address_is_not_doubled(
     assert module.requests[0].url.path == "/internal/v1/stations/search"
 
 
-def test_attribution_is_a_get_with_the_token_and_no_user(module: Module, token: str) -> None:
+async def test_attribution_is_a_get_with_the_token_and_no_user(module: Module, token: str) -> None:
     module.answer(200, {"statement": "ZZ statement", "sources": []})
 
-    assert station_module.attribution() == {"statement": "ZZ statement", "sources": []}
+    assert await station_module.attribution() == {"statement": "ZZ statement", "sources": []}
     (request,) = module.requests
     assert request.method == "GET"
     assert str(request.url) == f"{MODULE_URL}/internal/v1/attribution"
     assert request.headers["authorization"] == f"Bearer {token}"
     assert "x-viator-user-id" not in request.headers
+    assert request.headers["accept-encoding"] == "identity"
     assert set(request.headers.keys()) <= {"authorization"} | _HTTPX_DEFAULTS
 
 
@@ -302,7 +298,7 @@ async def test_a_failure_that_says_unreachable_pauses_every_call_for_thirty_seco
     caplog.clear()
     with caplog.at_level(logging.INFO):
         assert await station_module.search("Zzville", uuid.uuid4()) is None
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
     assert len(module.requests) == calls  # no call to the module during the pause
     assert _reasons(caplog) == ["paused", "paused"]
 
@@ -347,7 +343,7 @@ async def test_without_both_settings_nothing_is_called(
 
     with caplog.at_level(logging.INFO):
         assert await station_module.search("Zzville", uuid.uuid4()) is None
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert module.requests == []
     assert _reasons(caplog) == ["off", "off"]
@@ -363,7 +359,7 @@ async def test_the_token_and_the_text_are_never_logged(
             station_module.reset()
             _setup_failure(module, kind)
             await station_module.search(marker, uuid.uuid4())
-            station_module.attribution()
+            await station_module.attribution()
         station_module.reset()
         module.answer(200, {"stations": [_row(marker)]})
         await station_module.search(marker, uuid.uuid4())
@@ -392,31 +388,33 @@ def _attribution(**group: Any) -> dict[str, Any]:
     }
 
 
-def test_attribution_is_kept_sixty_seconds(module: Module, clock: FakeClock) -> None:
+async def test_attribution_is_kept_sixty_seconds(module: Module, clock: FakeClock) -> None:
     module.answer(200, _attribution())
 
-    first = station_module.attribution()
+    first = await station_module.attribution()
     clock.now += 59.9
-    second = station_module.attribution()
+    second = await station_module.attribution()
 
     assert first == second == _attribution()
     assert len(module.requests) == 1
 
     clock.now += 0.2
-    station_module.attribution()
+    await station_module.attribution()
     assert len(module.requests) == 2
 
 
-def test_attribution_is_forgotten_at_the_first_failure(module: Module, clock: FakeClock) -> None:
+async def test_attribution_is_forgotten_at_the_first_failure(
+    module: Module, clock: FakeClock
+) -> None:
     module.answer(200, _attribution())
-    station_module.attribution()
+    await station_module.attribution()
 
     clock.now += 61
     module.answer(429, {"detail": "ZZ", "code": "all_minute"})  # a failure that does not pause
-    assert station_module.attribution() is None
+    assert await station_module.attribution() is None
 
     module.answer(200, _attribution())
-    assert station_module.attribution() == _attribution()
+    assert await station_module.attribution() == _attribution()
     assert len(module.requests) == 3
 
 
@@ -424,31 +422,31 @@ async def test_a_search_failure_that_pauses_also_forgets_the_attribution(
     module: Module, clock: FakeClock
 ) -> None:
     module.answer(200, _attribution())
-    station_module.attribution()
+    await station_module.attribution()
     module.fail(httpx.ConnectError)
     await station_module.search("Zzville", uuid.uuid4())
 
     clock.now += PAUSE_PLUS
     module.answer(200, _attribution(licence="ZZ Licence Two"))
-    assert station_module.attribution() == _attribution(licence="ZZ Licence Two")
+    assert await station_module.attribution() == _attribution(licence="ZZ Licence Two")
 
 
 @pytest.mark.parametrize(
     "url", ["javascript:alert(1)", "ftp://licence.invalid/zz", "//licence.invalid/zz", "zz"]
 )
-def test_a_licence_address_that_is_not_a_web_address_is_dropped_and_the_group_kept(
+async def test_a_licence_address_that_is_not_a_web_address_is_dropped_and_the_group_kept(
     module: Module, url: str
 ) -> None:
     module.answer(200, _attribution(licence_url=url))
 
-    answer = station_module.attribution()
+    answer = await station_module.attribution()
 
     assert answer == _attribution(licence_url=None)
 
 
-def test_a_null_licence_address_stays_null(module: Module) -> None:
+async def test_a_null_licence_address_stays_null(module: Module) -> None:
     module.answer(200, _attribution(licence_url=None))
-    assert station_module.attribution() == _attribution(licence_url=None)
+    assert await station_module.attribution() == _attribution(licence_url=None)
 
 
 @pytest.mark.parametrize(
@@ -469,29 +467,29 @@ def test_a_null_licence_address_stays_null(module: Module) -> None:
         pytest.param(_attribution(licence_url=99), id="address-not-text"),
     ],
 )
-def test_an_attribution_of_the_wrong_shape_is_refused_and_pauses(
+async def test_an_attribution_of_the_wrong_shape_is_refused_and_pauses(
     module: Module, caplog: pytest.LogCaptureFixture, payload: Any
 ) -> None:
     module.answer(200, payload)
 
     with caplog.at_level(logging.INFO):
-        assert station_module.attribution() is None
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert _reasons(caplog) == ["shape", "paused"]
     assert len(module.requests) == 1
 
 
-def test_an_attribution_that_times_out_pauses(module: Module) -> None:
+async def test_an_attribution_that_times_out_pauses(module: Module) -> None:
     module.fail(httpx.ReadTimeout)
-    assert station_module.attribution() is None
-    assert station_module.attribution() is None
+    assert await station_module.attribution() is None
+    assert await station_module.attribution() is None
     assert len(module.requests) == 1
 
 
-def test_an_unreachable_attribution_pauses(module: Module) -> None:
+async def test_an_unreachable_attribution_pauses(module: Module) -> None:
     module.fail(httpx.ConnectError)
-    assert station_module.attribution() is None
+    assert await station_module.attribution() is None
     assert len(module.requests) == 1
 
 
@@ -511,16 +509,6 @@ class _TrickleAsync(httpx.AsyncByteStream):
             yield b" "
 
 
-class _TrickleSync(httpx.SyncByteStream):
-    def __init__(self, gap: float, count: int) -> None:
-        self.gap, self.count = gap, count
-
-    def __iter__(self):  # type: ignore[override]
-        for _ in range(self.count):
-            time.sleep(self.gap)
-            yield b" "
-
-
 async def test_a_trickling_search_answer_is_cut_at_the_deadline_and_pauses(
     module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -537,25 +525,109 @@ async def test_a_trickling_search_answer_is_cut_at_the_deadline_and_pauses(
     assert len(module.requests) == 1
 
 
-def test_a_trickling_attribution_is_cut_at_the_deadline_and_pauses(
+async def test_a_trickling_attribution_is_cut_at_the_deadline_and_pauses(
     module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(station_module, "ATTRIBUTION_DEADLINE", 0.1)
-    module.handler = lambda _r: httpx.Response(200, stream=_TrickleSync(0.03, 100))
+    module.handler = lambda _r: httpx.Response(200, stream=_TrickleAsync(0.03, 100))
 
     started = time.monotonic()
     with caplog.at_level(logging.INFO):
-        assert station_module.attribution() is None
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert time.monotonic() - started < 1.0
     assert _reasons(caplog) == ["timeout", "paused"]
 
 
-async def test_the_whole_search_is_bounded_by_its_deadline(module: Module) -> None:
-    """The deadline is the design's one second, around the whole call."""
-    assert station_module.SEARCH_DEADLINE == 1.0
-    assert station_module.ATTRIBUTION_DEADLINE == 0.5
+def _slow_headers(delay: float) -> Callable[[httpx.Request], Any]:
+    """A module that takes `delay` seconds before it sends its headers."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(delay)
+        return httpx.Response(200, json={"stations": [], "statement": "ZZ", "sources": []})
+
+    return handler
+
+
+async def test_a_search_whose_headers_trickle_is_cut_at_the_deadline_and_pauses(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The deadline covers the whole call, the wait for the headers included."""
+    monkeypatch.setattr(station_module, "SEARCH_DEADLINE", 0.2)
+    module.handler = _slow_headers(3.0)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+
+    assert time.monotonic() - started < 1.0
+    assert _reasons(caplog) == ["timeout"]
+    assert station_module._paused()
+
+
+async def test_an_attribution_whose_headers_trickle_is_cut_at_the_deadline_and_pauses(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(station_module, "ATTRIBUTION_DEADLINE", 0.2)
+    module.handler = _slow_headers(3.0)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.INFO):
+        assert await station_module.attribution() is None
+
+    assert time.monotonic() - started < 1.0
+    assert _reasons(caplog) == ["timeout"]
+    assert station_module._paused()
+
+
+async def test_a_cancelled_search_is_cancelled_not_a_fallback_and_sets_no_pause(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancellation (the client went away) must propagate: the catch-all is
+    `except Exception`, which CancelledError is not."""
+    module.handler = _slow_headers(3.0)
+
+    with caplog.at_level(logging.INFO):
+        task = asyncio.create_task(station_module.search("Zzville", uuid.uuid4()))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert _reasons(caplog) == []
+    assert not station_module._paused()
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br", " GZIP "])
+async def test_a_compressed_answer_is_refused_unread_and_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, encoding: str
+) -> None:
+    """A small compressed body could inflate far past the cap in one chunk:
+    the client asks for none and refuses any, even one that would inflate to
+    a valid, small answer."""
+    import gzip
+    import zlib
+
+    plain = json.dumps({"stations": [_row()], "statement": "ZZ", "sources": []}).encode()
+    packed = zlib.compress(plain) if encoding == "deflate" else gzip.compress(plain)
+    module.handler = lambda _r: httpx.Response(
+        200, content=packed, headers={"Content-Encoding": encoding}
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        station_module.reset()
+        assert await station_module.attribution() is None
+
+    assert _reasons(caplog) == ["shape", "shape"]
+
+
+async def test_an_identity_encoding_is_accepted(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        200, json={"stations": [_row()]}, headers={"Content-Encoding": "identity"}
+    )
+    assert await station_module.search("Zzville", uuid.uuid4()) == [_row()]
 
 
 @pytest.mark.parametrize("announced", [True, False], ids=["content-length", "chunked"])
@@ -591,7 +663,7 @@ class _Chunks(httpx.AsyncByteStream, httpx.SyncByteStream):
 
 
 @pytest.mark.parametrize("announced", [True, False], ids=["content-length", "chunked"])
-def test_an_oversized_attribution_is_refused_and_pauses(
+async def test_an_oversized_attribution_is_refused_and_pauses(
     module: Module, caplog: pytest.LogCaptureFixture, announced: bool
 ) -> None:
     big = b" " * (station_module.ATTRIBUTION_MAX_BYTES + 1)
@@ -601,7 +673,7 @@ def test_an_oversized_attribution_is_refused_and_pauses(
         module.handler = lambda _r: httpx.Response(200, stream=_Chunks([big[:4096], big[4096:]]))
 
     with caplog.at_level(logging.INFO):
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert _reasons(caplog) == ["shape"]
 
@@ -613,7 +685,7 @@ async def test_an_address_httpx_refuses_falls_back_as_network_and_pauses(
 
     with caplog.at_level(logging.INFO):
         assert await station_module.search("Zzville", uuid.uuid4()) is None
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert _reasons(caplog) == ["network", "paused"]
     assert module.requests == []
@@ -628,7 +700,7 @@ async def test_a_token_httpx_cannot_encode_falls_back_and_never_reaches_the_log(
     with caplog.at_level(logging.DEBUG):
         assert await station_module.search("Zzville", uuid.uuid4()) is None
         station_module.reset()
-        assert station_module.attribution() is None
+        assert await station_module.attribution() is None
 
     assert _reasons(caplog) == ["network", "network"]
     assert module.requests == []
@@ -655,14 +727,12 @@ async def test_the_clients_are_built_with_their_timeouts_and_without_the_environ
     module.answer(200, {"stations": []})
     await station_module.search("Zzville", uuid.uuid4())
     module.answer(200, {"statement": "ZZ", "sources": []})
-    station_module.attribution()
+    await station_module.attribution()
 
     search_client, attribution_client = module.clients
-    assert search_client["kind"] == "async"
     assert search_client["timeout"] == httpx.Timeout(1.0, connect=0.3)
     assert search_client["trust_env"] is False
-    assert attribution_client["kind"] == "sync"
-    assert attribution_client["timeout"] == httpx.Timeout(0.25)
+    assert attribution_client["timeout"] == httpx.Timeout(0.5)
     assert attribution_client["trust_env"] is False
 
 
