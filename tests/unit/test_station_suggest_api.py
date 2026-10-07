@@ -11,6 +11,7 @@ reached: its calls go through `httpx.MockTransport`. Invented values only.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app import station_module
 from app.api import station_suggest
@@ -98,14 +100,14 @@ def module(monkeypatch: pytest.MonkeyPatch) -> Iterator[Module]:
 def module_on(monkeypatch: pytest.MonkeyPatch, module: Module) -> str:
     token = secrets.token_hex(32)
     monkeypatch.setattr(settings, "station_module_url", MODULE_URL)
-    monkeypatch.setattr(settings, "station_module_token", token)
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
     return token
 
 
 @pytest.fixture
 def module_off(monkeypatch: pytest.MonkeyPatch, module: Module) -> None:
     monkeypatch.setattr(settings, "station_module_url", "")
-    monkeypatch.setattr(settings, "station_module_token", "")
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(""))
 
 
 @pytest.fixture
@@ -190,6 +192,29 @@ def test_a_text_the_module_would_refuse_is_422_and_nothing_is_searched(
     _, cookies = _login()
 
     answer = _post(client, body, cookies)
+
+    assert answer.status_code == 422
+    assert module.requests == []
+    assert fallback.calls == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(b'{"q": "zz\\ud800z"}', id="a-lone-high-surrogate"),
+        pytest.param(b'{"q": "\\udfffzzz"}', id="a-lone-low-surrogate-first"),
+    ],
+)
+def test_a_lone_surrogate_is_422_and_nothing_is_searched(
+    client: TestClient, module_on: str, module: Module, fallback: Fallback, raw: bytes
+) -> None:
+    """JSON can carry a lone surrogate, which no UTF-8 text holds; sent on,
+    it makes the module fail with a 500, which pauses it for every user."""
+    _, cookies = _login()
+    client.cookies.clear()
+    client.cookies.set(*next(iter(cookies.items())))
+
+    answer = client.post(ROUTE, content=raw, headers={"Content-Type": "application/json"})
 
     assert answer.status_code == 422
     assert module.requests == []
@@ -393,6 +418,9 @@ def test_the_fallback_query_binds_the_text_and_never_writes_it_into_the_statemen
     assert marker not in str(compiled)
     assert set(compiled.params.values()) >= {f"%{marker}%", marker}
     assert "LIMIT" in str(compiled)
+    # The LIKE names its escape character: PostgreSQL's default happens to be
+    # the same backslash, but the statement must not rely on it.
+    assert "ESCAPE '" + chr(92) in str(compiled)
 
 
 @pytest.mark.parametrize(
@@ -427,3 +455,54 @@ def test_a_user_without_a_viator_id_gets_the_fallback_without_any_call(
     assert answer.json() == [VIATOR_ROW]
     assert module.requests == []
     assert fallback.calls == ["Zzt"]
+
+
+# ───────────────────────── errors that are not answers ─────────────────────────
+
+
+@pytest.fixture
+def live_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    # alembic's fileConfig (run by the integration tests) disables loggers.
+    monkeypatch.setattr(station_module.log, "disabled", False)
+
+
+def test_an_address_httpx_refuses_gives_viators_own_list(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "http://[::1:8000")
+    _, cookies = _login()
+
+    answer = _post(client, {"q": "Zzt"}, cookies)
+
+    assert answer.status_code == 200
+    assert answer.json() == [VIATOR_ROW]
+    assert module.requests == []
+
+
+def test_a_token_httpx_cannot_encode_gives_viators_own_list_and_stays_out_of_the_log(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    live_log: None,
+) -> None:
+    token = "zz\u00e9\u20ac" + secrets.token_hex(8)
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
+    _, cookies = _login()
+
+    with caplog.at_level(logging.DEBUG):
+        answer = _post(client, {"q": "Zzt"}, cookies)
+
+    assert answer.status_code == 200
+    assert answer.json() == [VIATOR_ROW]
+    assert module.requests == []
+    logged = caplog.text + "".join(str(r.args) + str(r.exc_info) for r in caplog.records)
+    assert "station_module.fallback reason=network" in logged
+    for character in ("\u00e9", "\u20ac", token[4:]):
+        assert character not in logged

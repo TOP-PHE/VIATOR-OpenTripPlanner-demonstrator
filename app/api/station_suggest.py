@@ -9,7 +9,8 @@ with exactly the rules of the Multimodal Station Mapping module's search
 (`normalise_query`): Unicode NFC, any control character refused, white
 space trimmed and runs of it made one space, then 3 to 100 characters. So
 no text VIATOR accepts can earn a 422 from the module, and the normalised
-text is the one VIATOR sends.
+text is the one VIATOR sends. A lone surrogate is refused as well, which the
+module's rules do not yet say: it would make the module fail with a 500.
 
 Where the stations come from:
 
@@ -38,8 +39,8 @@ import re
 import unicodedata
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, field_validator
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Executable, or_, select
 from sqlalchemy.orm import Session as DbSession
 from starlette.concurrency import run_in_threadpool
@@ -63,17 +64,23 @@ _ESCAPE = "\\"
 
 _WHITE_SPACE = re.compile(r"\s+")
 
+# Control characters (Cc), and lone surrogates (Cs): JSON can carry `\ud800`,
+# which no UTF-8 text can hold. Sent on, it makes the module fail with a 500,
+# which pauses the module for every user: one user must not be able to.
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cs"})
+
 
 def normalise_query(text: str) -> str:
     """The text as the module searches for it, or ValueError.
 
     Unicode NFC; any control character (category Cc, tab and line end
-    included) refuses it wherever it stands; spaces at both ends removed
-    and every run of white space made one space; then 3 to 100 characters.
+    included) or lone surrogate (Cs) refuses it wherever it stands; spaces
+    at both ends removed and every run of white space made one space; then 3
+    to 100 characters.
     """
     composed = unicodedata.normalize("NFC", text)
-    if any(unicodedata.category(character) == "Cc" for character in composed):
-        raise ValueError("q must not contain a control character")
+    if any(unicodedata.category(character) in _REFUSED_CATEGORIES for character in composed):
+        raise ValueError("q must not contain a control character or a lone surrogate")
     joined = _WHITE_SPACE.sub(" ", composed).strip(" ")
     if not QUERY_MIN <= len(joined) <= QUERY_MAX:
         raise ValueError(f"q must be {QUERY_MIN} to {QUERY_MAX} characters long")
@@ -86,16 +93,23 @@ def escape_like(text: str) -> str:
 
 
 class SuggestBody(BaseModel):
-    """`{"q": <text>}`; nothing else."""
+    """`{"q": <text>}`; nothing else. The text is normalised by the route."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     q: str
 
-    @field_validator("q")
-    @classmethod
-    def _normalised(cls, value: str) -> str:
-        return normalise_query(value)
+
+def _normalised_or_422(text: str) -> str:
+    """`normalise_query`, its refusal a 422 with a fixed sentence.
+
+    Not a pydantic validator: the framework's 422 copies the refused input
+    into its answer, and a lone surrogate cannot be written as UTF-8 JSON,
+    so that answer itself would fail with a 500."""
+    try:
+        return normalise_query(text)
+    except ValueError as refused:
+        raise HTTPException(status_code=422, detail=str(refused)) from None
 
 
 def fallback_statement(q: str) -> Executable:
@@ -143,8 +157,9 @@ async def suggest(
     db: Annotated[DbSession, Depends(get_db)],
 ) -> list[dict[str, Any]]:
     """At most ten stations whose name contains `q`, or whose UIC is `q`."""
+    q = _normalised_or_422(body.q)
     if user.id is not None:
-        rows = await station_module.search(body.q, user.id)
+        rows = await station_module.search(q, user.id)
         if rows is not None:
             return [{**row, "source": "msmm"} for row in rows]
-    return await run_in_threadpool(fallback_rows, db, body.q)
+    return await run_in_threadpool(fallback_rows, db, q)
