@@ -93,3 +93,18 @@ def test_eschtml_is_a_hoisted_function_of_the_same_script(template_text: str) ->
     line = re.search(r"^function escHTML\(s\) \{.*$", block, re.M)
     assert line, "escHTML is not a function declaration of the typeahead's script"
     assert "replace(/[<>&]/g" in line.group(0)
+
+
+def test_an_older_answer_never_overwrites_a_newer_one(template_text: str) -> None:
+    """Each refresh takes a sequence number before anything else (also before
+    the early return that hides the box), and drops its answer when a newer
+    refresh has started meanwhile: a slow answer can neither overwrite the
+    newer list nor re-show a box that was cleared."""
+    setup = template_text[template_text.index("function setupAutocomplete(") :]
+    refresh = _refresh(template_text)
+
+    assert re.search(r"^  let seq = 0;$", setup[: setup.index("async function refresh")], re.M)
+    body = refresh.split("{", 1)[1]
+    assert body.lstrip().startswith("const mine = ++seq;")
+    guard = refresh.index("if (mine !== seq) return;")
+    assert refresh.index("await Promise.all(") < guard < refresh.index("items = _mergeSuggestions(")

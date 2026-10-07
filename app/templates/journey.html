@@ -470,8 +470,13 @@ function setupAutocomplete(prefix) {
   // OSM filtering.
   const uic = document.getElementById(prefix + '-uic');
   let active = -1; let items = [];
+  // Sequence guard: each refresh takes a number, and only the latest one may
+  // write the list. An older, slower answer arriving late is dropped, so it
+  // can neither overwrite a newer list nor re-show a box that was cleared.
+  let seq = 0;
 
   async function refresh() {
+    const mine = ++seq;
     const q = inp.value.trim();
     if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
     // Two parallel sources:
@@ -490,6 +495,7 @@ function setupAutocomplete(prefix) {
         : Promise.resolve([]),
       _fetchJson(`/api/geocode?q=${qs}&size=20`),
     ]);
+    if (mine !== seq) return;
     items = _mergeSuggestions(fromStations, fromMotis);
     if (!items.length) { box.classList.remove('show'); return; }
     box.innerHTML = items.map(_suggestionHtml).join('');
