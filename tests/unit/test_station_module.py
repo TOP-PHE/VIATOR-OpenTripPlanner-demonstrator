@@ -8,15 +8,18 @@ drawn at run time.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from app import station_module
 from app.settings import settings
@@ -52,6 +55,8 @@ class Module:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
+        # The keyword arguments of every httpx client the code built.
+        self.clients: list[dict[str, Any]] = []
         self.handler: Callable[[httpx.Request], httpx.Response] = lambda _r: httpx.Response(
             200, json={"stations": [_row()]}
         )
@@ -92,10 +97,12 @@ def module(monkeypatch: pytest.MonkeyPatch, token: str, clock: FakeClock) -> Ite
     real_async, real_sync = httpx.AsyncClient, httpx.Client
 
     def async_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        stand_in.clients.append({"kind": "async", **kwargs})
         kwargs["transport"] = transport
         return real_async(*args, **kwargs)
 
     def sync_factory(*args: Any, **kwargs: Any) -> httpx.Client:
+        stand_in.clients.append({"kind": "sync", **kwargs})
         kwargs["transport"] = transport
         return real_sync(*args, **kwargs)
 
@@ -105,7 +112,7 @@ def module(monkeypatch: pytest.MonkeyPatch, token: str, clock: FakeClock) -> Ite
     monkeypatch.setattr(station_module.httpx, "AsyncClient", async_factory)
     monkeypatch.setattr(station_module.httpx, "Client", sync_factory)
     monkeypatch.setattr(settings, "station_module_url", MODULE_URL)
-    monkeypatch.setattr(settings, "station_module_token", token)
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
     station_module.reset()
     yield stand_in
     station_module.reset()
@@ -336,7 +343,7 @@ async def test_without_both_settings_nothing_is_called(
     token: str,
 ) -> None:
     monkeypatch.setattr(settings, "station_module_url", url)
-    monkeypatch.setattr(settings, "station_module_token", token)
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
 
     with caplog.at_level(logging.INFO):
         assert await station_module.search("Zzville", uuid.uuid4()) is None
@@ -486,3 +493,196 @@ def test_an_unreachable_attribution_pauses(module: Module) -> None:
     module.fail(httpx.ConnectError)
     assert station_module.attribution() is None
     assert len(module.requests) == 1
+
+
+# ───────────────────────── the deadline, the size cap, the rest ─────────────────────────
+
+
+class _TrickleAsync(httpx.AsyncByteStream):
+    """A body that arrives one byte every `gap` seconds: each read is quick,
+    the whole answer is not."""
+
+    def __init__(self, gap: float, count: int) -> None:
+        self.gap, self.count = gap, count
+
+    async def __aiter__(self):  # type: ignore[override]
+        for _ in range(self.count):
+            await asyncio.sleep(self.gap)
+            yield b" "
+
+
+class _TrickleSync(httpx.SyncByteStream):
+    def __init__(self, gap: float, count: int) -> None:
+        self.gap, self.count = gap, count
+
+    def __iter__(self):  # type: ignore[override]
+        for _ in range(self.count):
+            time.sleep(self.gap)
+            yield b" "
+
+
+async def test_a_trickling_search_answer_is_cut_at_the_deadline_and_pauses(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(station_module, "SEARCH_DEADLINE", 0.2)
+    module.handler = lambda _r: httpx.Response(200, stream=_TrickleAsync(0.05, 100))
+
+    started = time.monotonic()
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+
+    assert time.monotonic() - started < 1.0  # 100 bytes x 0.05 s would be 5 s
+    assert _reasons(caplog) == ["timeout", "paused"]
+    assert len(module.requests) == 1
+
+
+def test_a_trickling_attribution_is_cut_at_the_deadline_and_pauses(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(station_module, "ATTRIBUTION_DEADLINE", 0.1)
+    module.handler = lambda _r: httpx.Response(200, stream=_TrickleSync(0.03, 100))
+
+    started = time.monotonic()
+    with caplog.at_level(logging.INFO):
+        assert station_module.attribution() is None
+        assert station_module.attribution() is None
+
+    assert time.monotonic() - started < 1.0
+    assert _reasons(caplog) == ["timeout", "paused"]
+
+
+async def test_the_whole_search_is_bounded_by_its_deadline(module: Module) -> None:
+    """The deadline is the design's one second, around the whole call."""
+    assert station_module.SEARCH_DEADLINE == 1.0
+    assert station_module.ATTRIBUTION_DEADLINE == 0.5
+
+
+@pytest.mark.parametrize("announced", [True, False], ids=["content-length", "chunked"])
+async def test_an_oversized_search_answer_is_refused_and_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, announced: bool
+) -> None:
+    big = b'{"stations": [' + b" " * (station_module.SEARCH_MAX_BYTES + 1) + b"]}"
+    if announced:
+        module.handler = lambda _r: httpx.Response(200, content=big)
+    else:
+        chunks = [big[i : i + 4096] for i in range(0, len(big), 4096)]
+        module.handler = lambda _r: httpx.Response(200, stream=_Chunks(chunks))
+
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+
+    assert _reasons(caplog) == ["shape", "paused"]
+
+
+class _Chunks(httpx.AsyncByteStream, httpx.SyncByteStream):
+    """A body sent in chunks, without a Content-Length."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+
+    async def __aiter__(self):  # type: ignore[override]
+        for chunk in self.chunks:
+            yield chunk
+
+    def __iter__(self):  # type: ignore[override]
+        yield from self.chunks
+
+
+@pytest.mark.parametrize("announced", [True, False], ids=["content-length", "chunked"])
+def test_an_oversized_attribution_is_refused_and_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, announced: bool
+) -> None:
+    big = b" " * (station_module.ATTRIBUTION_MAX_BYTES + 1)
+    if announced:
+        module.handler = lambda _r: httpx.Response(200, content=big)
+    else:
+        module.handler = lambda _r: httpx.Response(200, stream=_Chunks([big[:4096], big[4096:]]))
+
+    with caplog.at_level(logging.INFO):
+        assert station_module.attribution() is None
+
+    assert _reasons(caplog) == ["shape"]
+
+
+async def test_an_address_httpx_refuses_falls_back_as_network_and_pauses(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "http://[::1:8000")
+
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        assert station_module.attribution() is None
+
+    assert _reasons(caplog) == ["network", "paused"]
+    assert module.requests == []
+
+
+async def test_a_token_httpx_cannot_encode_falls_back_and_never_reaches_the_log(
+    module: Module, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    token = "zzé€" + secrets.token_hex(8)
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(token))
+
+    with caplog.at_level(logging.DEBUG):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        station_module.reset()
+        assert station_module.attribution() is None
+
+    assert _reasons(caplog) == ["network", "network"]
+    assert module.requests == []
+    logged = caplog.text + "".join(str(r.args) + str(r.exc_info) for r in caplog.records)
+    for character in ("é", "€", token[4:]):
+        assert character not in logged
+
+
+async def test_a_json_the_parser_cannot_handle_falls_back(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    deep = b"[" * 20_000 + b"]" * 20_000  # RecursionError in json, not a ValueError
+    module.handler = lambda _r: httpx.Response(200, stream=_Chunks([deep]))
+
+    with caplog.at_level(logging.INFO):
+        assert await station_module.search("Zzville", uuid.uuid4()) is None
+
+    assert _reasons(caplog) == ["network"]
+
+
+async def test_the_clients_are_built_with_their_timeouts_and_without_the_environment(
+    module: Module,
+) -> None:
+    module.answer(200, {"stations": []})
+    await station_module.search("Zzville", uuid.uuid4())
+    module.answer(200, {"statement": "ZZ", "sources": []})
+    station_module.attribution()
+
+    search_client, attribution_client = module.clients
+    assert search_client["kind"] == "async"
+    assert search_client["timeout"] == httpx.Timeout(1.0, connect=0.3)
+    assert search_client["trust_env"] is False
+    assert attribution_client["kind"] == "sync"
+    assert attribution_client["timeout"] == httpx.Timeout(0.25)
+    assert attribution_client["trust_env"] is False
+
+
+@pytest.mark.parametrize(
+    ("kind", "level"),
+    [
+        ("429", logging.INFO),
+        ("503-busy", logging.INFO),
+        ("403", logging.WARNING),
+        ("network", logging.WARNING),
+        ("timeout", logging.WARNING),
+    ],
+)
+async def test_one_request_refusals_log_at_info_and_faults_at_warning(
+    module: Module, caplog: pytest.LogCaptureFixture, kind: str, level: int
+) -> None:
+    _setup_failure(module, kind)
+
+    with caplog.at_level(logging.DEBUG):
+        await station_module.search("Zzville", uuid.uuid4())
+
+    (record,) = [r for r in caplog.records if r.name == station_module.log.name]
+    assert record.levelno == level

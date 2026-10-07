@@ -32,6 +32,11 @@ Rules this client keeps on purpose:
   timeout, not each. **No pause after 429, 422 or 503 `busy`**: those concern
   one request, and pausing on them would let one user switch the module off
   for everyone.
+- **A real deadline and a size cap**: 1 s for a whole search, 0.5 s for an
+  attribution (httpx's timeouts bound each read, not the call), and a body
+  larger than 64 KiB (search) or 256 KiB (attribution) is refused unread.
+  Both count as failures that pause. Any other error (a bad address, a
+  token httpx cannot encode) falls back too, as `network`.
 - **A bad row is dropped, never the whole answer.**
 - **The log never holds the text, a body, the token or an exception's
   text**: one line `station_module.fallback reason=<word>` per fallback.
@@ -39,6 +44,7 @@ Rules this client keeps on purpose:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -58,11 +64,23 @@ SEARCH_PATH = "/internal/v1/stations/search"
 ATTRIBUTION_PATH = "/internal/v1/attribution"
 USER_HEADER = "X-Viator-User-Id"
 
-# The typeahead is on the keystroke path: one second at most, of which 0.3 s
-# to connect. The module itself stops a statement after 0.8 s.
-SEARCH_TIMEOUT = httpx.Timeout(1.0, connect=0.3)
-# The attribution is read while /journey renders: half a second at most.
-ATTRIBUTION_TIMEOUT = 0.5
+# The typeahead is on the keystroke path: one second at most for the whole
+# call (SEARCH_DEADLINE, enforced around it: httpx's own timeouts bound each
+# read, not the call, so a server trickling bytes would outlast them), and
+# 0.3 s to connect. The module itself stops a statement after 0.8 s.
+SEARCH_DEADLINE = 1.0
+SEARCH_TIMEOUT = httpx.Timeout(SEARCH_DEADLINE, connect=0.3)
+# The attribution is read while /journey renders: half a second for the whole
+# call. It is synchronous, so the deadline is checked between reads; each
+# read is bounded at 0.25 s, so the call never lasts more than about 0.75 s.
+ATTRIBUTION_DEADLINE = 0.5
+ATTRIBUTION_TIMEOUT = httpx.Timeout(0.25)
+
+# The largest body read from the module, decoded. A search answer is ten
+# short rows (a few KiB); an attribution is at most 20 groups of texts of 500
+# characters. Anything larger is refused without being read to its end.
+SEARCH_MAX_BYTES = 64 * 1024
+ATTRIBUTION_MAX_BYTES = 256 * 1024
 
 PAUSE_SECONDS = 30.0
 ATTRIBUTION_TTL_SECONDS = 60.0
@@ -77,7 +95,8 @@ _PAUSING_503_CODES = frozenset({"no_build", "database"})
 
 _URL_SCHEMES = ("https://", "http://")
 
-_QUIET_REASONS = frozenset({"off", "paused"})
+# States and one-request refusals, not faults: logged at INFO.
+_QUIET_REASONS = frozenset({"off", "paused", "busy", "status_429"})
 
 # The clock of the pause and of the attribution cache; tests replace it.
 clock: Callable[[], float] = time.monotonic
@@ -90,6 +109,14 @@ class _Failure(Exception):
         super().__init__(reason)
         self.reason = reason
         self.pause = pause
+
+
+class _Answer:
+    """The status and the (capped) body of one answer of the module."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self.body = body
 
 
 class _State:
@@ -114,7 +141,7 @@ def reset() -> None:
 
 def enabled() -> bool:
     """True when the module is configured: both the address and the token are set."""
-    return bool(settings.station_module_url and settings.station_module_token)
+    return bool(settings.station_module_url and settings.station_module_token.get_secret_value())
 
 
 def _paused() -> bool:
@@ -129,8 +156,9 @@ def _fail(failure: _Failure) -> None:
         with _state.lock:
             _state.paused_until = clock() + PAUSE_SECONDS
             _state.attribution = None
-    # `off` and `paused` are states, not faults: INFO, so a VIATOR without the
-    # module, or a paused one, does not fill the log with warnings.
+    # `off`, `paused`, 429 and `busy` are states or one-request refusals, not
+    # faults: INFO, so a VIATOR without the module, a paused one, or a busy
+    # one, does not fill the log with warnings.
     level = logging.INFO if failure.reason in _QUIET_REASONS else logging.WARNING
     log.log(level, "station_module.fallback reason=%s", failure.reason)
 
@@ -140,35 +168,69 @@ def _url(path: str) -> str:
 
 
 def _authorization() -> dict[str, str]:
-    return {"Authorization": f"Bearer {settings.station_module_token}"}
+    return {"Authorization": f"Bearer {settings.station_module_token.get_secret_value()}"}
 
 
-def _error_code(response: httpx.Response) -> str | None:
+def _too_large(response: httpx.Response, limit: int) -> bool:
+    """True when the answer announces a body larger than `limit`."""
+    length = response.headers.get("content-length", "")
+    return length.isdigit() and int(length) > limit
+
+
+def _append_capped(body: bytearray, chunk: bytes, limit: int) -> None:
+    body += chunk
+    if len(body) > limit:
+        raise _Failure("shape", pause=True)
+
+
+async def _read_async(response: httpx.Response, limit: int) -> _Answer:
+    """The answer, its body read up to `limit` decoded bytes, else a shape failure."""
+    if _too_large(response, limit):
+        raise _Failure("shape", pause=True)
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        _append_capped(body, chunk, limit)
+    return _Answer(response.status_code, bytes(body))
+
+
+def _read_sync(response: httpx.Response, limit: int, deadline: float) -> _Answer:
+    """As `_read_async`, and a timeout once `deadline` (time.monotonic) is passed."""
+    if _too_large(response, limit):
+        raise _Failure("shape", pause=True)
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        _append_capped(body, chunk, limit)
+        if time.monotonic() > deadline:
+            raise _Failure("timeout", pause=True)
+    return _Answer(response.status_code, bytes(body))
+
+
+def _error_code(answer: _Answer) -> str | None:
     """The `code` word of a module error body, or None."""
     try:
-        body = response.json()
+        body = json.loads(answer.body)
     except ValueError:
         return None
     code = body.get("code") if isinstance(body, dict) else None
     return code if isinstance(code, str) else None
 
 
-def _status_failure(response: httpx.Response) -> _Failure:
+def _status_failure(answer: _Answer) -> _Failure:
     """The failure a status other than 200 means (20.16 of the module's design)."""
-    status = response.status_code
+    status = answer.status
     if status == 503:
-        code = _error_code(response)
+        code = _error_code(answer)
         if code == "busy":
             return _Failure("busy", pause=False)
         return _Failure("status_503", pause=code in _PAUSING_503_CODES)
     return _Failure(f"status_{status}", pause=status in _PAUSING_STATUSES)
 
 
-def _json_body(response: httpx.Response) -> Any:
-    if response.status_code != 200:
-        raise _status_failure(response)
+def _json_body(answer: _Answer) -> Any:
+    if answer.status != 200:
+        raise _status_failure(answer)
     try:
-        return response.json()
+        return json.loads(answer.body)
     except ValueError:
         raise _Failure("shape", pause=True) from None
 
@@ -221,7 +283,7 @@ def _stations(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-async def _post_search(q: str, user_id: uuid.UUID) -> httpx.Response:
+async def _post_search(q: str, user_id: uuid.UUID) -> _Answer:
     headers = {
         **_authorization(),
         USER_HEADER: str(user_id),
@@ -229,9 +291,13 @@ async def _post_search(q: str, user_id: uuid.UUID) -> httpx.Response:
     }
     body = json.dumps({"q": q}).encode("utf-8")
     try:
-        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client:
-            return await client.post(_url(SEARCH_PATH), content=body, headers=headers)
-    except httpx.TimeoutException:
+        async with (
+            asyncio.timeout(SEARCH_DEADLINE),
+            httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client,
+            client.stream("POST", _url(SEARCH_PATH), content=body, headers=headers) as response,
+        ):
+            return await _read_async(response, SEARCH_MAX_BYTES)
+    except (TimeoutError, httpx.TimeoutException):
         raise _Failure("timeout", pause=True) from None
     except httpx.HTTPError:
         raise _Failure("network", pause=True) from None
@@ -245,10 +311,15 @@ async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
             raise _Failure("off", pause=False)
         if _paused():
             raise _Failure("paused", pause=False)
-        response = await _post_search(q, user_id)
-        return _stations(_json_body(response))
+        return _stations(_json_body(await _post_search(q, user_id)))
     except _Failure as failure:
         _fail(failure)
+        return None
+    except Exception:
+        # Anything else (an address httpx refuses, a token it cannot encode, a
+        # JSON parser error) falls back too, and its text is never logged: an
+        # exception about a header can quote the token.
+        _fail(_Failure("network", pause=True))
         return None
 
 
@@ -288,10 +359,14 @@ def _attribution_of(payload: Any) -> dict[str, Any]:
     }
 
 
-def _get_attribution() -> httpx.Response:
+def _get_attribution() -> _Answer:
+    deadline = time.monotonic() + ATTRIBUTION_DEADLINE
     try:
-        with httpx.Client(timeout=ATTRIBUTION_TIMEOUT, trust_env=False) as client:
-            return client.get(_url(ATTRIBUTION_PATH), headers=_authorization())
+        with (
+            httpx.Client(timeout=ATTRIBUTION_TIMEOUT, trust_env=False) as client,
+            client.stream("GET", _url(ATTRIBUTION_PATH), headers=_authorization()) as response,
+        ):
+            return _read_sync(response, ATTRIBUTION_MAX_BYTES, deadline)
     except httpx.TimeoutException:
         raise _Failure("timeout", pause=True) from None
     except httpx.HTTPError:
@@ -304,6 +379,12 @@ def _cached_attribution() -> dict[str, Any] | None:
     if cached is not None and clock() - cached[0] < ATTRIBUTION_TTL_SECONDS:
         return cached[1]
     return None
+
+
+def _forget_and_fail(failure: _Failure) -> None:
+    with _state.lock:
+        _state.attribution = None
+    _fail(failure)
 
 
 def attribution() -> dict[str, Any] | None:
@@ -319,9 +400,11 @@ def attribution() -> dict[str, Any] | None:
             return cached
         answer = _attribution_of(_json_body(_get_attribution()))
     except _Failure as failure:
-        with _state.lock:
-            _state.attribution = None
-        _fail(failure)
+        _forget_and_fail(failure)
+        return None
+    except Exception:
+        # As in search(): any other error falls back, its text never logged.
+        _forget_and_fail(_Failure("network", pause=True))
         return None
     with _state.lock:
         _state.attribution = (clock(), answer)
