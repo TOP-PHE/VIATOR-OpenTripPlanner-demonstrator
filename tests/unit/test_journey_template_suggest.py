@@ -117,11 +117,22 @@ def test_a_keystroke_a_pick_and_a_blur_also_drop_an_answer_in_flight(template_te
 
     pick = re.search(r"  function pick\(i\) \{.*?\n  \}\n", setup, re.S)
     assert pick, "pick() not found"
-    assert "++seq;" in pick.group(0)
+    assert "++seq; clearTimeout(t);" in pick.group(0)
     assert pick.group(0).index("++seq;") < pick.group(0).index("box.classList.remove('show')")
 
     assert "++seq; clearTimeout(t); t = setTimeout(refresh, 150);" in setup
 
     blur = re.search(r"inp\.addEventListener\('blur', \(\) => \{(.*?)\n  \}\);", setup, re.S)
     assert blur, "the blur listener is not a block"
-    assert blur.group(1).lstrip().startswith("++seq;")
+    assert blur.group(1).lstrip().startswith("++seq; clearTimeout(t);")
+
+
+def test_the_debounce_timer_is_declared_before_the_functions_that_cancel_it(
+    template_text: str,
+) -> None:
+    """pick() cancels `t`; `t` is declared with `seq`, above refresh() and pick()."""
+    setup = template_text[template_text.index("function setupAutocomplete(") :]
+    declared = re.search(r"^  let t;$", setup, re.M)
+    assert declared, "`let t;` is not declared on its own line in setupAutocomplete"
+    assert declared.start() < setup.index("async function refresh")
+    assert "let t; inp.addEventListener" not in setup

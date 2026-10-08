@@ -474,8 +474,11 @@ function setupAutocomplete(prefix) {
   // write the list. An older, slower answer arriving late is dropped, so it
   // can neither overwrite a newer list nor re-show a box that was cleared.
   // A keystroke, a pick and a blur also move the number on, so an answer
-  // still in flight cannot re-open the box after any of them.
+  // still in flight cannot re-open the box after any of them; a pick and a
+  // blur also cancel the debounce timer `t`, so a refresh still pending
+  // from the last keystroke cannot either.
   let seq = 0;
+  let t;
 
   async function refresh() {
     const mine = ++seq;
@@ -512,10 +515,10 @@ function setupAutocomplete(prefix) {
     const s = items[i];
     inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
     uic.value = s.uic || '';
-    ++seq;
+    ++seq; clearTimeout(t);
     box.classList.remove('show');
   }
-  let t; inp.addEventListener('input', () => {
+  inp.addEventListener('input', () => {
     // CRITICAL: when the operator edits the input text, the previously-
     // picked station's lat/lon become stale. Clear them so a submit
     // refuses with "Please pick both stations from the suggestions"
@@ -529,7 +532,7 @@ function setupAutocomplete(prefix) {
     ++seq; clearTimeout(t); t = setTimeout(refresh, 150);
   });
   inp.addEventListener('blur', () => {
-    ++seq;
+    ++seq; clearTimeout(t);
     setTimeout(() => box.classList.remove('show'), 150);
   });
   inp.addEventListener('keydown', e => {
