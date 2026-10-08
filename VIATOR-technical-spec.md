@@ -65,7 +65,7 @@ VIATOR is a **multi-tenant, multi-session journey-planning demonstrator** built 
 | Journey UI | Static HTML + MapLibre GL + vanilla JS, served by nginx |
 | Routing engine | OpenTripPlanner 2.9.0 on Java 25 (Eclipse Temurin) |
 | Database | Postgres 16 |
-| Auth | JWT (`python-jose`) + bcrypt (`passlib[bcrypt]`) |
+| Auth | JWT (`PyJWT`; was `python-jose` until #319) + bcrypt (`passlib[bcrypt]`) |
 | Email | `aiosmtplib` over SMTP/STARTTLS |
 | Rate limiting | `slowapi` |
 | Container runtime | Docker Engine 29 + Compose plugin |
@@ -201,7 +201,7 @@ Indexed on `(ts DESC)` and `(actor_user_id, ts DESC)` for the admin views.
 
 | OSCAR (Node.js) | VIATOR (Python) |
 |---|---|
-| `jsonwebtoken` | `python-jose[cryptography]` |
+| `jsonwebtoken` | `PyJWT` (was `python-jose[cryptography]` until #319) |
 | `bcrypt` (12 rounds) | `passlib[bcrypt]` (12 rounds) |
 | `express-rate-limit` | `slowapi` |
 | `sendVerificationEmail` util | `app.email.send_verification(user, token)` using `aiosmtplib` |
@@ -2153,7 +2153,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 |---|---|---|
 | **`black --check`** | `would reformat path/to/file.py` | Run `py -3.12 -m black .` locally, commit, push. Black is opinionated by design — never argue with it. |
 | **`ruff check`** | Rule code + file:line + suggested fix | Most rules are auto-fixable: `py -3.12 -m ruff check . --fix`. For the rest, edit per the rule's docs at https://docs.astral.sh/ruff/rules/. |
-| **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-python-jose`). Add to `requirements-dev.txt`, reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
+| **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-requests`). Add to `requirements-dev.txt`, reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
 | **`mypy --strict`** "Returning Any from function declared to return X" | A typed function calls an untyped one | Wrap the return in an explicit cast: `result: str = untyped_call(...); return result`. Don't blanket-ignore. |
 | **`mypy --strict`** "Function 'count' could always be true in boolean context" | SQLAlchemy Row attribute clashes with `tuple.count` / `tuple.index` method | Rename the column label: `func.count().label("count")` → `func.count().label("n_executions")` and update the consumer. |
 | **`mypy --strict`** "Unused 'type: ignore' comment" | Mypy got smarter and no longer needs the suppression | Just delete the `# type: ignore[...]` comment. |
@@ -2195,7 +2195,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | Pre-commit | pre-commit | 4.0.1 | `.pre-commit-config.yaml` |
 | Migrations | Alembic | 1.14.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
-| Type stubs | types-requests, types-passlib, types-python-jose, sqlalchemy[mypy] | various | `requirements-dev.txt` |
+| Type stubs | types-requests, types-passlib, sqlalchemy[mypy] | various | `requirements-dev.txt` |
 
 ### 15.13 What the JS toolchain looks like (when we add it)
 
