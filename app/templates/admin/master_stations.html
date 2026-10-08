@@ -5,7 +5,7 @@
 <h1>Master stations</h1>
 <p style="color: var(--rail-steel); max-width: 720px">
   UIC-keyed registry of European passenger stations, seeded from the
-  <a href="https://github.com/trainline-eu/stations" target="_blank">Trainline open dataset</a> (ODbL).
+  <a href="https://github.com/trainline-eu/stations" target="_blank" rel="noopener">Trainline open dataset</a> (ODbL).
   Local edits flip the row's <code>source</code> to <code>manual</code> and prevail over future Trainline updates;
   upstream changes to those rows are surfaced in the drift queue below.
 </p>
@@ -72,6 +72,24 @@ const PAGE_SIZE = 50;
 let currentPage = 0;
 let lastQuery = null;
 let lastCountry = null;
+// Set by the pagination controls just before they load a page: the operator
+// asked for that page by number, so it is sent as it is, page 0 included. Any
+// other load sends no page, and a context search then lands on the page of its
+// first match. Page 0 used to double as "no page asked for", which made
+// « First and typing 1 in the page box silent no-ops during a context search.
+let pagePinned = false;
+
+function takePinnedPage(queryChanged) {
+  // A new query is a fresh search whatever control started it.
+  const pinned = pagePinned && !queryChanged;
+  pagePinned = false;
+  return pinned;
+}
+
+function showPage(n) {
+  pagePinned = true;
+  return loadStations({page: n, flashMatches: false});
+}
 
 function escHTML(s) { return (s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -140,14 +158,17 @@ async function loadStations({page = 0, flashMatches = true} = {}) {
 
   // Reset to page 0 if the query changed — gives the user "find this and
   // jump to it" behaviour when they type something new.
-  if (q !== lastQuery || c !== lastCountry) page = 0;
+  const queryChanged = q !== lastQuery || c !== lastCountry;
+  const pinned = takePinnedPage(queryChanged);
+  if (queryChanged) page = 0;
   lastQuery = q; lastCountry = c; currentPage = page;
 
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (c) params.set('country', c);
   params.set('mode', ctxMode ? 'context' : 'filter');
-  params.set('page', String(page));
+  // Only a page the operator asked for is sent: see pagePinned.
+  if (pinned) params.set('page', String(page));
   params.set('size', String(PAGE_SIZE));
 
   const r = await fetch('/api/master/stations?' + params.toString());
@@ -160,11 +181,11 @@ async function loadStations({page = 0, flashMatches = true} = {}) {
   const total = parseInt(r.headers.get('X-Total-Count') || '0', 10);
   const matchCount = parseInt(r.headers.get('X-Match-Count') || '0', 10);
   // Server tells us which page the first match is on — use it to align
-  // currentPage when we asked for page=0 and the server jumped us to a
+  // currentPage when we pinned no page and the server jumped us to a
   // match page. (Otherwise the pagination footer would say "page 1"
   // when we're actually viewing page 12.)
   const matchPage = r.headers.get('X-Match-Page');
-  if (matchPage !== null && q && ctxMode && page === 0) {
+  if (matchPage !== null && q && ctxMode && !pinned) {
     currentPage = parseInt(matchPage, 10);
   }
 
@@ -231,7 +252,7 @@ function renderPagination(totalPages) {
   ].join(' ');
   // Wire up nav buttons.
   p.querySelectorAll('button[data-page]').forEach(b => b.addEventListener('click', () => {
-    loadStations({page: parseInt(b.dataset.page, 10), flashMatches: false});
+    showPage(Number.parseInt(b.dataset.page, 10));
   }));
   // Jump-to-page on Enter.
   const jump = p.querySelector('input.page-jump');
@@ -241,7 +262,7 @@ function renderPagination(totalPages) {
       let n = parseInt(jump.value, 10);
       if (Number.isNaN(n)) return;
       n = Math.max(1, Math.min(totalPages, n)) - 1;
-      loadStations({page: n, flashMatches: false});
+      showPage(n);
     }
   });
 }
