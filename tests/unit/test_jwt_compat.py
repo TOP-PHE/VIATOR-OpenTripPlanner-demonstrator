@@ -23,7 +23,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import jwt.api_jwt
 import pytest
+from fastapi import HTTPException, Request
 from jwt import PyJWTError
 
 from app import security
@@ -40,8 +42,8 @@ def _json(obj: Any, *, sort_keys: bool = False) -> bytes:
     return json.dumps(obj, separators=(",", ":"), sort_keys=sort_keys).encode("utf-8")
 
 
-def _sign(signing_input: str, secret: str) -> str:
-    mac = hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256)
+def _sign(signing_input: str, secret: str, digest: Any = hashlib.sha256) -> str:
+    mac = hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), digest)
     return _b64url(mac.digest())
 
 
@@ -49,12 +51,13 @@ def _token(
     claims: dict[str, Any],
     secret: str,
     header: dict[str, Any] | None = None,
+    digest: Any = hashlib.sha256,
 ) -> str:
     """A compact JWS in the byte-exact form the app issues for HS256."""
     head = _b64url(_json(header if header is not None else _HS256_HEADER, sort_keys=True))
     body = _b64url(_json(claims))
     signing_input = f"{head}.{body}"
-    return f"{signing_input}.{_sign(signing_input, secret)}"
+    return f"{signing_input}.{_sign(signing_input, secret, digest)}"
 
 
 def _claims(**overrides: Any) -> dict[str, Any]:
@@ -83,6 +86,12 @@ def _refused(token: str) -> None:
     with pytest.raises(PyJWTError):
         tokens.decode_jwt(token)
     assert security._decode_to_user(token) is None
+
+
+def _bearer_request(token: str) -> Request:
+    return Request(
+        {"type": "http", "headers": [(b"authorization", f"Bearer {token}".encode("ascii"))]}
+    )
 
 
 # ───────────────────────── issuing: byte format ─────────────────────────
@@ -144,37 +153,51 @@ def test_token_without_exp_is_accepted(secret: str) -> None:
 
 
 def test_token_with_iat_in_the_future_is_refused(secret: str) -> None:
-    # The one deliberate change of #319. python-jose only checked that iat
-    # was a number; PyJWT also refuses an iat more than the leeway (1 s)
-    # ahead of now. issue_jwt sets iat to the current whole second, so no
-    # token the app ever issued is affected; only a hand-made one could be.
+    # Changed by #319: python-jose only checked that iat was a number; PyJWT
+    # also refuses an iat more than the leeway (1 s) ahead of now. issue_jwt
+    # sets iat to the current whole second, so no token the app issued is
+    # affected; only a hand-made one signed with our secret could be.
     _refused(_token(_claims(iat=int(time.time()) + 3600), secret))
 
 
-def _within_one_second(check: Any) -> None:
-    """Run `check(now)` where `now` is the current whole second, retrying if
-    the clock ticks over during the check (the boundary is second-exact)."""
-    for _ in range(5):
-        now = int(time.time())
-        result = check(now)
-        if int(time.time()) == now:
-            assert result
-            return
-    pytest.fail("clock kept ticking over a second boundary")
+def test_token_with_nbf_in_the_future_is_refused(secret: str) -> None:
+    _refused(_token(_claims(nbf=int(time.time()) + 3600), secret))
 
 
-def test_exp_equal_to_the_current_second_is_still_accepted(secret: str) -> None:
-    def check(now: int) -> bool:
-        return security._decode_to_user(_token(_claims(exp=now), secret)) is not None
-
-    _within_one_second(check)
+def test_expiry_leeway_is_one_second() -> None:
+    assert tokens._EXP_LEEWAY_SECONDS == 1
 
 
-def test_exp_one_second_in_the_past_is_refused(secret: str) -> None:
-    def check(now: int) -> bool:
-        return security._decode_to_user(_token(_claims(exp=now - 1), secret)) is None
+@pytest.fixture
+def frozen_pyjwt_clock(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Freeze PyJWT's clock 0.9 s into a whole second; return that second.
 
-    _within_one_second(check)
+    0.9 s in is where a leeway below one second would already refuse a
+    token whose exp is that second, so the boundary tests below fail for
+    any leeway other than 1.
+    """
+    second = int(time.time())
+    fixed = datetime.fromtimestamp(second + 0.9, tz=UTC)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return fixed
+
+    monkeypatch.setattr(jwt.api_jwt, "datetime", _Frozen)
+    return second
+
+
+def test_exp_equal_to_the_current_second_is_still_accepted(
+    secret: str, frozen_pyjwt_clock: int
+) -> None:
+    token = _token(_claims(iat=frozen_pyjwt_clock - 60, exp=frozen_pyjwt_clock), secret)
+    assert security._decode_to_user(token) is not None
+
+
+def test_exp_one_second_in_the_past_is_refused(secret: str, frozen_pyjwt_clock: int) -> None:
+    token = _token(_claims(iat=frozen_pyjwt_clock - 60, exp=frozen_pyjwt_clock - 1), secret)
+    _refused(token)
 
 
 # ─────────────────────────────── refusing ───────────────────────────────
@@ -209,11 +232,22 @@ def test_alg_none_is_refused(secret: str, signature: str) -> None:
     _refused(f"{head}.{body}.{signature}")
 
 
-@pytest.mark.parametrize("alg", ["RS256", "ES256", "HS384", "HS512", "PS256"])
+@pytest.mark.parametrize("alg", ["RS256", "ES256", "PS256"])
 def test_other_alg_header_is_refused_even_when_hmac_signed(secret: str, alg: str) -> None:
     # Algorithm confusion: the header claims another algorithm while the
     # signature is an HMAC with our secret. Only HS256 is ever accepted.
     _refused(_token(_claims(), secret, header={"alg": alg, "typ": "JWT"}))
+
+
+@pytest.mark.parametrize(
+    ("alg", "digest"),
+    [("HS384", hashlib.sha384), ("HS512", hashlib.sha512)],
+    ids=["HS384", "HS512"],
+)
+def test_other_hmac_alg_is_refused_by_the_allow_list(secret: str, alg: str, digest: Any) -> None:
+    # Correctly signed for its own algorithm with our secret, so only
+    # `algorithms=[settings.jwt_alg]` can refuse it.
+    _refused(_token(_claims(), secret, header={"alg": alg, "typ": "JWT"}, digest=digest))
 
 
 def test_non_string_sub_is_refused(secret: str) -> None:
@@ -255,3 +289,19 @@ def test_missing_identity_claim_gives_no_user(secret: str) -> None:
     token = _token(claims, secret)
     assert tokens.decode_jwt(token) == claims
     assert security._decode_to_user(token) is None
+
+
+@pytest.mark.parametrize("claim", ["exp", "iat"])
+@pytest.mark.parametrize(
+    "value",
+    [None, [1, 2], float("inf")],
+    ids=["null", "list", "infinity"],
+)
+def test_malformed_time_claim_is_a_401_not_a_crash(secret: str, claim: str, value: Any) -> None:
+    # Fixed by #319: python-jose raised TypeError / OverflowError on these
+    # (signed with our secret), which escaped security.py as an HTTP 500.
+    token = _token(_claims(**{claim: value}), secret)
+    _refused(token)
+    with pytest.raises(HTTPException) as caught:
+        security.current_user_jwt(_bearer_request(token))
+    assert caught.value.status_code == 401

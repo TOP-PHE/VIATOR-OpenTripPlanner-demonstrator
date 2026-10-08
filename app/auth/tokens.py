@@ -21,9 +21,23 @@ from ..settings import settings
 # One second of leeway keeps the expiry boundary exactly where python-jose
 # put it before #319: jose refused a token when exp < the current WHOLE second,
 # PyJWT refuses when exp <= the current fractional time. With leeway 1 both
-# accept a token until one full second after exp. The one change: PyJWT also
-# refuses an iat more than the leeway in the future, which python-jose did not
-# check (issue_jwt never mints one). Pinned by tests/unit/test_jwt_compat.py.
+# accept a token until one full second after exp.
+#
+# Differences from python-jose (#319). None affects a token issue_jwt mints,
+# and every newly accepted or formerly crashing case needs a token signed
+# with JWT_SECRET:
+#   - now refused: iat more than 1 s in the future; a crit header, a
+#     non-string kid, b64:false; a valid token with a non-ASCII character
+#     appended; a signature in standard base64 (+ /).
+#   - now accepted: nbf up to 1 s in the future (the leeway applies to it);
+#     aud "" or []; a token carrying at_hash.
+#   - fixed: exp/iat null, a list or Infinity raised TypeError/OverflowError
+#     (HTTP 500); PyJWT raises PyJWTError, so the request gets a 401.
+#   - an empty JWT_SECRET is refused (issue raises, decode gives no user)
+#     where jose signed with an empty key; a secret under 32 bytes logs
+#     InsecureKeyLengthWarning.
+# The boundary, iat, nbf and malformed exp/iat cases are pinned by
+# tests/unit/test_jwt_compat.py.
 _EXP_LEEWAY_SECONDS = 1
 
 
