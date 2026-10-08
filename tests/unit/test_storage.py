@@ -92,6 +92,38 @@ def test_served_builds_and_live_files_are_never_candidates(volumes: tuple[Path, 
         assert live not in ids
 
 
+def test_the_top_level_staging_folder_is_never_a_clean_up_candidate(tmp_path: Path) -> None:
+    # `inbox/_staging` is where the legacy `/upload` route streams a file
+    # before dispatching it. It is no session's folder, and it used to be
+    # offered for deletion as "a session that no longer exists".
+    inbox, graphs = tmp_path / "vol" / "inbox", tmp_path / "vol" / "graphs"
+    graphs.mkdir(parents=True)
+    _write(inbox / "_staging" / "20261003-120000-abcd1234" / "feed.zip", 10)
+    _write(inbox / "gone-session" / "gtfs" / "x.zip", 10)
+
+    report = storage.scan(inbox, graphs, set(), set())
+    assert _ids(report) == {"inbox/gone-session": "orphan_session"}
+
+    usage = {u.session_id: u for u in report.sessions}
+    # Reported, since its size matters, but not badged as a deleted session.
+    assert usage["_staging"].inbox_bytes == 10
+    assert usage["_staging"].known is True
+    assert usage["gone-session"].known is False
+
+    # And delete refuses it even when asked by id.
+    deleted, skipped = storage.delete(["inbox/_staging"], report, inbox, graphs)
+    assert deleted == []
+    assert skipped == [{"id": "inbox/_staging", "reason": "no longer a clean-up candidate"}]
+    assert (inbox / "_staging" / "20261003-120000-abcd1234" / "feed.zip").is_file()
+
+
+def test_a_reserved_name_cannot_be_a_session_id() -> None:
+    # A session id is a slug starting with a letter, so no session can ever be
+    # shadowed by a reserved folder.
+    assert sorted(storage.INBOX_ROOT_RESERVED) == ["_staging"]
+    assert all(name.startswith("_") for name in storage.INBOX_ROOT_RESERVED)
+
+
 def test_a_session_with_a_running_rebuild_is_left_alone(volumes: tuple[Path, Path]) -> None:
     inbox, graphs = volumes
     ids = _ids(storage.scan(inbox, graphs, {"eu19", "nap-fr-rail"}, {"eu19"}, now=NOW))

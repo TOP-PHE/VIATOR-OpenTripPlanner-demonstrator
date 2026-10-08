@@ -23,11 +23,16 @@
 .leg-route { font-weight: 600; }
 .leg-stops { color: #333; }
 .leg-meta { color: var(--rail-steel); font-size: 0.78rem; text-align: right; }
-.flag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 1px; }
-.flag.ALL        { background: #e9f6ec; color: #1a7e3c; }
-.flag.NAP-ONLY   { background: #fdecef; color: #b30021; }
+/* .flag, .flag.ALL and .flag.NAP-ONLY now live in _base.html, unchanged. The
+   two below stay here: this page's blue and amber, shared with .leg-mode and
+   .cmp-count, which override the base ones. */
 .flag.MERITS-ONLY{ background: #e8f0fb; color: #1C75BC; }
 .flag.SUBSET     { background: #fff8e1; color: #b3760e; }
+/* _base.html now gives .hint a muted colour. This page's hints outside
+   .hub-form-grid and .compare-toggle never had a rule, and moving the rule
+   must change nothing on this page: they keep the colour of their parent.
+   Delete this rule to let the base one apply here too. */
+.hint { color: inherit; }
 /* v0.1.45 — "possible duplicate" badge. MOTIS occasionally reports a
    single physically-coupled service (e.g. SNCF's "601" + "601A"
    portions, split for part of the journey but one driver/consist) as
