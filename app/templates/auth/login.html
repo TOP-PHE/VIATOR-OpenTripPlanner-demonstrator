@@ -24,6 +24,23 @@
 
 {% block extra_scripts %}
 <script>
+// The page to open after signing in: `next` from this page's address when it
+// is a path of this site — the pattern of app/api/pages.py::safe_next (change
+// both or neither), and not /login itself. Anything else (`//host`, `/\host`,
+// `https:`, a query, a control character) is ignored silently, never shown.
+const NEXT_PATTERN = /^\/(?![/\\])[A-Za-z0-9._~/-]{0,199}$/;
+
+function safeNext() {
+  let value = null;
+  try {
+    value = new URLSearchParams(globalThis.location.search).get('next');
+  } catch (err) {
+    console.warn('login: could not read next from the address', err);
+  }
+  if (value === null || value === '/login' || !NEXT_PATTERN.test(value)) return null;
+  return value;
+}
+
 const form = document.getElementById('login-form');
 const msg = document.getElementById('msg');
 const btn = document.getElementById('submit-btn');
@@ -50,12 +67,12 @@ form.addEventListener('submit', async (e) => {
       return;
     }
     const body = await r.json();
-    // Land on the most useful page for this role.
+    // A valid `next` wins; otherwise land on the most useful page for this role.
     // Phase-2 note: do NOT bounce to "/" — in Phase-2 mode that redirects
     // back to /login, creating a redirect loop. Send non-admins to /journey
     // (the journey planner UI, accessible to any logged-in user).
-    const dest = body.role === 'platform_admin' ? '/admin/users' : '/journey';
-    window.location.href = dest;
+    const dest = safeNext() || (body.role === 'platform_admin' ? '/admin/users' : '/journey');
+    globalThis.location.href = dest;
   } catch (err) {
     show('error', String(err));
   } finally {

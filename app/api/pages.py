@@ -11,6 +11,7 @@ the JSON API's 401: an unauthenticated browser hitting `/admin/users` lands on
 
 from __future__ import annotations
 
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -47,6 +48,22 @@ def _redirect_to_login(next_path: str) -> RedirectResponse:
     )
 
 
+# The pages `next` may name: a path of this site, at most 200 characters,
+# made of letters, digits and `._~/-` only. The look-ahead refuses `//host`
+# and `/\host`, which a browser reads as another site; no `:`, so no scheme;
+# no `?`, `#`, `%` or space. auth/login.html applies the same pattern in
+# script: change both or neither.
+_NEXT_PATTERN = re.compile(r"^/(?![/\\])[A-Za-z0-9._~/-]{0,199}$")
+
+
+def safe_next(value: str | None) -> str | None:
+    """`value` when it is a path of this site to open after logging in, else
+    None. `/login` itself is refused, so a login never leads back to it."""
+    if value is None or value == "/login" or _NEXT_PATTERN.fullmatch(value) is None:
+        return None
+    return value
+
+
 def _forbidden_html(request: Request, message: str) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
@@ -66,7 +83,10 @@ def login_page(request: Request) -> Response:
         # Already logged in — bounce to the most useful page for this role.
         # Phase-2 note: do NOT bounce non-admins to "/" — that redirects back
         # to /login in Phase-2 mode, creating a loop. /journey is universal.
-        dest = "/admin/users" if user.role == "platform_admin" else "/journey"
+        # A valid `next` (see safe_next) wins; an invalid one is ignored.
+        dest = safe_next(request.query_params.get("next")) or (
+            "/admin/users" if user.role == "platform_admin" else "/journey"
+        )
         return RedirectResponse(dest, status_code=303)
     return templates.TemplateResponse(
         request,
