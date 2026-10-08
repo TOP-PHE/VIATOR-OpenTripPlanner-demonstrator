@@ -11,14 +11,16 @@ the JSON API's 401: an unauthenticated browser hitting `/admin/users` lands on
 
 from __future__ import annotations
 
-from typing import Annotated
+import re
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from .. import config_service
+from .. import config_service, station_module
 from ..db import get_db
 from ..models import Session as SessionRow
 from ..models import User
@@ -47,6 +49,22 @@ def _redirect_to_login(next_path: str) -> RedirectResponse:
     )
 
 
+# The pages `next` may name: a path of this site, at most 200 characters,
+# made of letters, digits and `._~/-` only. The look-ahead refuses `//host`
+# and `/\host`, which a browser reads as another site; no `:`, so no scheme;
+# no `?`, `#`, `%` or space. auth/login.html applies the same pattern in
+# script: change both or neither.
+_NEXT_PATTERN = re.compile(r"^/(?![/\\])[A-Za-z0-9._~/-]{0,199}$")
+
+
+def safe_next(value: str | None) -> str | None:
+    """`value` when it is a path of this site to open after logging in, else
+    None. `/login` itself is refused, so a login never leads back to it."""
+    if value is None or value == "/login" or _NEXT_PATTERN.fullmatch(value) is None:
+        return None
+    return value
+
+
 def _forbidden_html(request: Request, message: str) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
@@ -66,7 +84,10 @@ def login_page(request: Request) -> Response:
         # Already logged in — bounce to the most useful page for this role.
         # Phase-2 note: do NOT bounce non-admins to "/" — that redirects back
         # to /login in Phase-2 mode, creating a loop. /journey is universal.
-        dest = "/admin/users" if user.role == "platform_admin" else "/journey"
+        # A valid `next` (see safe_next) wins; an invalid one is ignored.
+        dest = safe_next(request.query_params.get("next")) or (
+            "/admin/users" if user.role == "platform_admin" else "/journey"
+        )
         return RedirectResponse(dest, status_code=303)
     return templates.TemplateResponse(
         request,
@@ -258,32 +279,53 @@ def admin_master_stations_page(request: Request) -> Response:
     )
 
 
+def _comparison_flags(db: Session) -> dict[str, bool]:
+    """The two reference-engine checkboxes of /journey, read from platform_config.
+
+    The "Compare with Swiss OJP reference" checkbox is only rendered
+    when the feature is both enabled AND has a token configured —
+    mirroring the dormant-until-configured rule in config_schema.py.
+    HAFAS has no token gate (the embedded credentials are public),
+    so just the boolean enable-flag governs whether the second
+    checkbox renders."""
+    cfg = config_service.get_all(db)
+    return {
+        "ojp_comparison_enabled": bool(cfg.get("OJP_COMPARISON_ENABLED"))
+        and bool(cfg.get("OJP_API_TOKEN")),
+        "hafas_comparison_enabled": bool(cfg.get("HAFAS_COMPARISON_ENABLED")),
+    }
+
+
 @router.get("/journey", response_class=HTMLResponse)
-def journey_page(
+async def journey_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ) -> Response:
+    """The journey search page.
+
+    Asynchronous so that it can await the station module's attribution
+    (app/station_module.py: the cached answer, or a call of at most 0.5 s,
+    or None, with no call at all while the module is paused). It is awaited
+    first, before the database is touched, so that no pooled connection is
+    held during that wait; and only when the module is configured, so that
+    a VIATOR without it logs no fallback line on every page. The
+    platform_config read is synchronous database work, so it runs in the
+    thread pool, as it did when this handler was synchronous."""
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    # The "Compare with Swiss OJP reference" checkbox is only rendered
-    # when the feature is both enabled AND has a token configured —
-    # mirroring the dormant-until-configured rule in config_schema.py.
-    # HAFAS has no token gate (the embedded credentials are public),
-    # so just the boolean enable-flag governs whether the second
-    # checkbox renders.
-    cfg = config_service.get_all(db)
-    ojp_comparison_enabled = bool(cfg.get("OJP_COMPARISON_ENABLED")) and bool(
-        cfg.get("OJP_API_TOKEN")
+    # The licence notice under the title: shown only when the module answered.
+    station_attribution: dict[str, Any] | None = (
+        await station_module.attribution() if station_module.enabled() else None
     )
-    hafas_comparison_enabled = bool(cfg.get("HAFAS_COMPARISON_ENABLED"))
+    flags = await run_in_threadpool(_comparison_flags, db)
     return templates.TemplateResponse(
         request,
         "journey.html",
         {
             "current_user": user,
-            "ojp_comparison_enabled": ojp_comparison_enabled,
-            "hafas_comparison_enabled": hafas_comparison_enabled,
+            **flags,
+            "station_attribution": station_attribution,
         },
     )
 

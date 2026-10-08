@@ -227,6 +227,11 @@
               <a href="/admin/network-coverage" title="Run all-pairs journey-search matrix across major French rail hubs">Coverage</a>
               <a href="/admin/reports">Reports</a>
               <a href="/admin/storage" title="Disk usage and clean-up of old builds and feed copies">Storage</a>
+              {# The station mapping module's screens, served by nginx under /msmm/;
+                 only when VIATOR uses the module (app/templating.py). #}
+              {% if station_module_enabled and current_user.role == 'platform_admin' %}
+                <a href="/msmm/" title="Station mapping module">Stations (MSMM)</a>
+              {% endif %}
               {# Audit-2026-05 #14 Phase 2.2 — Admin dashboard dropdown.
                  Built on `<details>/<summary>` (native HTML disclosure
                  widget) so it's keyboard- and touch-accessible without

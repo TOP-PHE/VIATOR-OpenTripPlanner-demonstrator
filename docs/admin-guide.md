@@ -2349,6 +2349,53 @@ docker compose up -d                                       certbot renew --dry-r
 
 ---
 
+## 11. Station mapping module (optional)
+
+VIATOR can take its journey-page station suggestions from the Multimodal
+Station Mapping module (MSMM), a separate service on the same Docker network.
+It is optional: **VIATOR works without it.**
+
+Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
+
+| Setting | Value |
+|---|---|
+| `STATION_MODULE_URL` | the module's address inside the Docker network: `http://msmm-web:8000` |
+| `STATION_MODULE_TOKEN` | the module's machine token: the same value as its `MSMM_INTERNAL_TOKEN` |
+
+- **Where the token comes from.** It is generated on the server, on the
+  module's side, and copied from the module's `.env` into VIATOR's without
+  being shown (step 9 of "Brancher VIATOR sur le module (étape 2)" in the
+  module's deployment runbook). It is never typed by
+  hand, never committed, never put in GitHub, never pasted elsewhere.
+- **Empty means "not used".** The module is used only when **both** settings
+  are set. With either one empty, VIATOR makes no call to the module: the
+  journey typeahead serves VIATOR's own station list, the journey page shows
+  no licence notice, and the menu shows no "Stations (MSMM)" link.
+- **When it is used**, every logged-in user's typeahead asks the module first;
+  `/journey` shows, under its title, the module's statement and the licence of
+  each of its sources; platform administrators get a "Stations (MSMM)" link in
+  the menu to the module's screens at `/msmm/`.
+- **Signing in from a link.** A page that needs a login sends you to
+  `/login?next=<page>`; after signing in you return to that page only when
+  its address has no query string (and is a plain path of this site);
+  otherwise you land on your role's default page (`/admin/users` for a
+  platform administrator, `/journey` for the others). This does not depend
+  on the module's settings.
+- **If the module fails** (stopped, slow, a wrong token, an error), VIATOR
+  falls back to its own station list and drops the notice; after a failure
+  that says the module is unreachable or misconfigured, it makes no call to
+  the module for 30 seconds. The `web` log says why, one line per fallback:
+  `station_module.fallback reason=<word>` (`off`, `timeout`, `network`,
+  `status_<n>`, `busy`, `shape`, `paused`), never the token.
+- **After changing either setting**, recreate the `web` container so it reads
+  the new environment, from `/opt/viator/docker`:
+  `sudo docker compose up -d --force-recreate web`. A
+  `docker compose restart web` keeps the old environment.
+- **To stop using the module**, empty `STATION_MODULE_URL` and recreate `web`
+  the same way.
+
+---
+
 ## Index of related guides
 
 - [`docker/INSTALL.md`](../docker/INSTALL.md) — first-time VPS install
