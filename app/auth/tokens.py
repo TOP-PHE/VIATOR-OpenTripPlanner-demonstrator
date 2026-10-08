@@ -12,11 +12,33 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from jose import jwt as jose_jwt
+import jwt
 
 from ..settings import settings
 
 # ────────────────────────────── JWT ──────────────────────────────
+
+# One second of leeway keeps the expiry boundary exactly where python-jose
+# put it before #319: jose refused a token when exp < the current WHOLE second,
+# PyJWT refuses when exp <= the current fractional time. With leeway 1 both
+# accept a token until one full second after exp.
+#
+# Differences from python-jose (#319). None affects a token issue_jwt mints,
+# and every newly accepted or formerly crashing case needs a token signed
+# with JWT_SECRET:
+#   - now refused: iat more than 1 s in the future; a crit header, a
+#     non-string kid, b64:false; a valid token with a non-ASCII character
+#     appended; a signature in standard base64 (+ /).
+#   - now accepted: nbf up to 1 s in the future (the leeway applies to it);
+#     aud "" or []; a token carrying at_hash.
+#   - fixed: exp/iat null, a list or Infinity raised TypeError/OverflowError
+#     (HTTP 500); PyJWT raises PyJWTError, so the request gets a 401.
+#   - an empty JWT_SECRET is refused (issue raises, decode gives no user)
+#     where jose signed with an empty key; a secret under 32 bytes logs
+#     InsecureKeyLengthWarning.
+# The boundary, iat, nbf and malformed exp/iat cases are pinned by
+# tests/unit/test_jwt_compat.py.
+_EXP_LEEWAY_SECONDS = 1
 
 
 def issue_jwt(
@@ -36,14 +58,17 @@ def issue_jwt(
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
-    encoded: str = jose_jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_alg)
+    encoded: str = jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_alg)
     return encoded
 
 
 def decode_jwt(token: str) -> dict[str, Any]:
-    """Decode + verify signature + check expiry. Raises jose.JWTError on failure."""
-    decoded: dict[str, Any] = jose_jwt.decode(
-        token, settings.jwt_secret, algorithms=[settings.jwt_alg]
+    """Decode + verify signature + check expiry. Raises jwt.PyJWTError on failure."""
+    decoded: dict[str, Any] = jwt.decode(
+        token,
+        settings.jwt_secret,
+        algorithms=[settings.jwt_alg],
+        leeway=_EXP_LEEWAY_SECONDS,
     )
     return decoded
 

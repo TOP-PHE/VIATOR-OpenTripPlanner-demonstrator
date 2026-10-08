@@ -293,7 +293,7 @@ Registration is **open** — anyone with a valid email can self-register as `end
 
 ### 4.2 OSCAR pattern reuse
 
-OSCAR ([TOP-PHE/OSCAR-OSdm-Compliance-Automation-Runner](https://github.com/TOP-PHE/OSCAR-OSdm-Compliance-Automation-Runner)) already implements a comparable flow in Node.js: JWT (`jsonwebtoken`), bcrypt 12-rounds, verification-token email confirmation, role enum, rate limiting (20 attempts / 15 min), audit logging. Because VIATOR's admin app is Python/FastAPI, we **reimplement the same flow** with the equivalent Python libraries (`passlib[bcrypt]`, `python-jose`, `aiosmtplib`, `slowapi`). The HTML email templates can be lifted from OSCAR verbatim, restyled with the VIATOR palette.
+OSCAR ([TOP-PHE/OSCAR-OSdm-Compliance-Automation-Runner](https://github.com/TOP-PHE/OSCAR-OSdm-Compliance-Automation-Runner)) already implements a comparable flow in Node.js: JWT (`jsonwebtoken`), bcrypt 12-rounds, verification-token email confirmation, role enum, rate limiting (20 attempts / 15 min), audit logging. Because VIATOR's admin app is Python/FastAPI, we **reimplement the same flow** with the equivalent Python libraries (`passlib[bcrypt]`, `PyJWT` (`python-jose` until #319), `aiosmtplib`, `slowapi`). The HTML email templates can be lifted from OSCAR verbatim, restyled with the VIATOR palette.
 
 Concrete spec lives in `VIATOR-technical-spec.md` §3.
 

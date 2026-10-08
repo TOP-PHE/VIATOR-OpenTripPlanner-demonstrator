@@ -6,7 +6,7 @@ import time
 import uuid
 
 import pytest
-from jose import JWTError
+from jwt import PyJWTError
 
 from app.auth import tokens
 
@@ -28,18 +28,19 @@ def test_jwt_tamper_detection() -> None:
     tampered = (
         f"{head}.{payload[:-1]}A.{sig}" if payload[-1] != "A" else f"{head}.{payload[:-1]}B.{sig}"
     )
-    with pytest.raises(JWTError):
+    with pytest.raises(PyJWTError):
         tokens.decode_jwt(tampered)
 
 
 def test_jwt_expired_rejected() -> None:
     # ttl_seconds=1 + sleep(2.5): generous margin past the int-truncated exp.
-    # python-jose treats `now == exp` as "still valid" (it uses strict <), and
+    # decode treats `now == exp` as "still valid" (the 1 s leeway in
+    # app/auth/tokens.py keeps python-jose's strict-< boundary), and
     # both iat/exp are stored as int(timestamp) so a 1.5s sleep can land
     # exactly on `now == exp` after truncation. 2.5s is comfortably past that.
     jwt = tokens.issue_jwt(uuid.uuid4(), "x@y.z", "end_user", ttl_seconds=1)
     time.sleep(2.5)
-    with pytest.raises(JWTError):
+    with pytest.raises(PyJWTError):
         tokens.decode_jwt(jwt)
 
 
