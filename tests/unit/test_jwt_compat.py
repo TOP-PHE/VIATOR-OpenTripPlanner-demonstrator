@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from jose import JWTError
+from jwt import PyJWTError
 
 from app import security
 from app.auth import tokens
@@ -80,7 +80,7 @@ def secret(monkeypatch: pytest.MonkeyPatch) -> str:
 
 def _refused(token: str) -> None:
     """Refused at both layers: decode_jwt raises, the request has no user."""
-    with pytest.raises(JWTError):
+    with pytest.raises(PyJWTError):
         tokens.decode_jwt(token)
     assert security._decode_to_user(token) is None
 
@@ -143,9 +143,12 @@ def test_token_without_exp_is_accepted(secret: str) -> None:
     assert tokens.decode_jwt(_token(claims, secret)) == claims
 
 
-def test_token_with_iat_in_the_future_is_accepted(secret: str) -> None:
-    claims = _claims(iat=int(time.time()) + 3600)
-    assert tokens.decode_jwt(_token(claims, secret)) == claims
+def test_token_with_iat_in_the_future_is_refused(secret: str) -> None:
+    # The one deliberate change of #319. python-jose only checked that iat
+    # was a number; PyJWT also refuses an iat more than the leeway (1 s)
+    # ahead of now. issue_jwt sets iat to the current whole second, so no
+    # token the app ever issued is affected; only a hand-made one could be.
+    _refused(_token(_claims(iat=int(time.time()) + 3600), secret))
 
 
 def _within_one_second(check: Any) -> None:

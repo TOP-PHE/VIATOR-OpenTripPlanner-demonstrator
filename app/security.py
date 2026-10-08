@@ -28,7 +28,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from jose import JWTError
+from jwt import PyJWTError
 
 from .auth import tokens
 from .settings import settings
@@ -120,7 +120,7 @@ def _decode_to_user(token: str | None) -> CurrentUser | None:
         return None
     try:
         claims = tokens.decode_jwt(token)
-    except JWTError:
+    except PyJWTError:
         return None
     sub = claims.get("sub")
     email = claims.get("email")

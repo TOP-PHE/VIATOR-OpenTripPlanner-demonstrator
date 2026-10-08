@@ -7,7 +7,8 @@ psycopg[binary]==3.3.6
 pydantic==2.13.5
 pydantic-settings==2.15.0        # 2.14.2 fixes GHSA-4xgf-cpjx-pc3j
 alembic==1.20.0
-python-jose[cryptography]==3.5.0   # 3.4.0+ fixes CVE-2024-33664 + CVE-2024-33663 (algorithm confusion)
+PyJWT==2.15.1                   # session JWTs (app/auth/tokens.py), HS256 only; replaced python-jose in #319. Ships its own types
+cryptography==50.0.2            # AES-256-GCM + HKDF for stored credentials (app/credentials.py); came in via python-jose[cryptography] until #319, now pinned directly
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1                   # passlib 1.7.4 needs bcrypt < 4.1
 slowapi==0.1.10
