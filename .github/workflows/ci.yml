@@ -52,9 +52,12 @@ jobs:
         with:
           fetch-depth: 0   # SonarCloud needs full git history for blame
 
+      # The Python of the web image (docker/web/Dockerfile, `FROM python:3.14-slim`);
+      # change both together, and the pre-commit job's below (#325). v0.1.44.13
+      # passed every check on 3.12 and crash-looped on the image's 3.14 (#324).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
@@ -163,7 +166,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
       - run: pip install pre-commit
       - run: pre-commit run --all-files --show-diff-on-failure

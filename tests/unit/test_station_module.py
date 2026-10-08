@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -733,16 +734,64 @@ async def test_a_token_httpx_cannot_encode_falls_back_and_never_reaches_the_log(
         assert character not in logged
 
 
-async def test_a_json_the_parser_cannot_handle_falls_back(
-    module: Module, caplog: pytest.LogCaptureFixture
+# The stack of the thread `_on_a_fixed_stack` runs in. Since Python 3.14 the
+# json parser stops at a depth set by the C stack it has, no longer at a fixed
+# count: 20,000 levels raise RecursionError on 3.12 but parse on 3.14 with the
+# usual 8 MiB stack, and the limit grows with `ulimit -s`. A thread's stack is
+# set here, whatever the machine, so the depth below fails on every Python.
+_PARSER_STACK = 16 * 1024 * 1024
+_TOO_DEEP = 1_000_000  # about 130,000 levels fit in 16 MiB on 3.14; 3.12 stops far sooner
+
+
+def _on_a_fixed_stack[T](work: Callable[[], T]) -> T:
+    """The result of `work()`, run in a new thread with a `_PARSER_STACK` stack."""
+    results: list[T] = []
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            results.append(work())
+        except Exception as error:
+            errors.append(error)
+
+    previous = threading.stack_size(_PARSER_STACK)
+    try:
+        thread = threading.Thread(target=run)
+        thread.start()
+    finally:
+        threading.stack_size(previous)
+    thread.join()
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+def _raises_recursion_error(body: bytes) -> bool:
+    try:
+        json.loads(body)
+    except RecursionError:
+        return True
+    return False
+
+
+def test_a_json_the_parser_cannot_handle_falls_back(
+    module: Module, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    deep = b"[" * 20_000 + b"]" * 20_000  # RecursionError in json, not a ValueError
+    deep = b"[" * _TOO_DEEP + b"]" * _TOO_DEEP  # RecursionError in json, not a ValueError
+    # 2 MB: above the cap, which would refuse it as `shape` before the parser.
+    monkeypatch.setattr(station_module, "SEARCH_MAX_BYTES", len(deep))
     module.handler = lambda _r: httpx.Response(200, stream=_Chunks([deep]))
 
+    # The input really is one the parser cannot handle, on the same stack.
+    assert _on_a_fixed_stack(lambda: _raises_recursion_error(deep))
     with caplog.at_level(logging.INFO):
-        assert await station_module.search("Zzville", uuid.uuid4()) is None
+        rows = _on_a_fixed_stack(
+            lambda: asyncio.run(station_module.search("Zzville", uuid.uuid4()))
+        )
 
+    assert rows is None
     assert _reasons(caplog) == ["network"]
+    assert len(module.requests) == 1
 
 
 async def test_the_clients_are_built_with_their_timeouts_and_without_the_environment(

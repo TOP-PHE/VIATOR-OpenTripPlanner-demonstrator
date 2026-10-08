@@ -320,6 +320,12 @@ reasons.
 `python-version: "3.12"` and `cache: pip`, and those two jobs (Python lint+type+test, SonarCloud) are
 exactly the jobs fed by the action, both green on v7 at normal duration so `cache: pip` still resolves.
 The rest of v7 is internal: ESM migration, `@actions/cache` 6.2.0, dropping EOL Pythons.
+*(Since #325, CI runs Python **3.14**, the image's (`FROM python:3.14-slim`): both `setup-python` call
+sites — the Python lint+type+test job and the pre-commit job — pass `python-version: "3.14"`, and
+mypy's `python_version` and `sonar.python.version` say 3.14 (ruff's `target-version` stays py312 on
+purpose, see `pyproject.toml`); `tests/unit/test_ci_python_is_the_image_python.py` holds them together.
+Change them with the Dockerfile, never apart: v0.1.44.13 passed every check on 3.12 and crash-looped on
+3.14 (#324).)*
 
 **One of those merges carries a policy change worth knowing about.** #233 bumped `ruff 0.15.20 → 0.16.0`,
 and 0.16 began formatting Python code blocks **inside Markdown files**. It flagged `VIATOR-strategy.md`,

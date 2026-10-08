@@ -17,7 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# Apply pending Debian security patches at build time. The python:3.12-slim
+# Apply pending Debian security patches at build time. The python:3.14-slim
 # tag is rebuilt on Python's cadence, not Debian's, so it can lag behind
 # debian-security-announce. `apt-get upgrade` here closes that gap and keeps
 # Trivy's OS scan green between base-image refreshes.
@@ -55,7 +55,7 @@ RUN echo "apt cache bust 2026-10-01 — refresh for OpenSSL CVE-2026-75804 (QUIC
 # builds, so we MUST copy the plugin directory in addition to the binary.
 #
 # Both are statically-linked Go binaries with no shared-library deps, so
-# they run cleanly in the python:3.12-slim runtime without any apt
+# they run cleanly in the python:3.14-slim runtime without any apt
 # installs.
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/ /usr/local/libexec/docker/cli-plugins/
