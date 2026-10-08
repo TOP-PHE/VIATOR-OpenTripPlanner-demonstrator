@@ -2024,11 +2024,29 @@ Journey `render(payload)` reads: `executions[]` (`session_id`, `engine`, `status
 - **The intro paragraph on `/admin/network-coverage` is hardcoded** ("26 curated French rail hubs…
   650 directional pairs"). Hubs are now DB-driven and multi-country; this text is stale copy, not a
   fact about the system.
-- **`?next=` is dead.** `pages.py::_redirect_to_login` builds `/login?next=<path>`, but
-  `auth/login.html` ignores it entirely and always lands on `/admin/users` (admins) or `/journey`.
-  Deep-linking an admin to a protected page loses their destination.
-- **`_forbidden_html(request, message)` discards `message`** — it renders bare `_base.html` with a
-  403. A non-admin hitting an admin page sees an empty shell with no explanation.
+- **`?next=` is followed, but only a plain path of this site (#317).** `pages.py::safe_next`
+  accepts a value matching `^/(?![/\\])[A-Za-z0-9._~/-]{0,199}$`: a leading `/`, then at most 199
+  letters, digits or `._~/-`. The look-ahead refuses `//host` and `/\host` (a browser reads both
+  as another site); there is no `:` (no scheme), and no `?`, `#`, `%` or space, so **a value with a
+  query string is refused**. `/login` itself is refused too, so a login never leads back to it. An
+  invalid value is ignored silently, never shown: the person lands on the role's default page
+  (`pages.py::_default_page`: `/admin/users` for `platform_admin`, `/journey` for the others).
+  - *Where `next` is produced:* `_redirect_to_login(<fixed path>)` in each protected page route
+    (always a literal path, so it always passes); nginx's `@auth_redirect`
+    (`return 302 /login?next=$request_uri;`) when `auth_request` answers 401 on `/grafana/` or
+    `/prometheus/` - `$request_uri` keeps the query string, so a Grafana deep link such as
+    `/grafana/d/<uid>?orgId=1` fails the check and falls back to the default page; and the station
+    mapping module, which sends a person without a session to `/login?next=/msmm/`.
+  - *Where it is checked:* twice, with the same pattern. `login_page` checks it server-side for a
+    person already logged in (303 to `next`, else to the default page); `auth/login.html`'s
+    `safeNext()` checks it in script after a successful sign-in. Change the two patterns together or
+    not at all; `tests/unit/test_login_next.py` compares them.
+- **`_forbidden_html(request, message)` renders `forbidden.html` with status 403** - the message as
+  text (autoescaped; never `|safe`, even though every caller passes a literal), the visitor's own
+  role, a link to `_default_page(role)`, and "sign out and sign in as another user", which POSTs
+  `/api/auth/logout` and then opens `/login?next=<this page>`. Since `next` is followed, a person
+  whose session expired on a bookmarked admin page they may not open lands here after logging in,
+  so the page must say where they are. It must not reveal more than the person already knows.
 - **The "Re-run live in the journey UI" deep-link is half-wired.** The coverage modal emits
   `/journey?from_lat=…&from_name=…`, and `prefillFromQuery` fills the hidden coordinate fields — but
   it looks up the visible box as `getElementById(prefix)` when the actual id is `from-input` /
