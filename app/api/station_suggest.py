@@ -17,10 +17,11 @@ framework's.** FastAPI's own 422 copies the refused input into its answer;
 JSON can carry a lone surrogate (`\ud800`) anywhere, in a value or a field
 name, which no UTF-8 answer can hold, so that answer would itself fail with
 a 500. The route therefore takes the parsed JSON as it comes and checks it
-against `SuggestBody` itself. The order stays the framework's: a body that
-is not JSON at all is refused before the login check (its answer never holds
-the input), and a JSON body is checked only once the user is known, so an
-anonymous request still gets 401 whatever its body.
+against `SuggestBody` itself. The order stays the framework's: a body sent
+as JSON that does not parse is refused before the login check (its answer
+never holds the input); any other body is checked only once the user is
+known, so an anonymous request still gets 401 whatever its body (a body sent
+as another type, `text/plain` for one, included).
 
 Where the stations come from:
 

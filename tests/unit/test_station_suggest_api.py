@@ -164,36 +164,50 @@ def test_the_route_is_post_only(client: TestClient, module_off: None) -> None:
 
 # ───────────────────────────── the text ─────────────────────────────
 
+# The 422 sentences of the route, written out: a text rule names itself; a
+# body that is not `{"q": <text>}` gets one fixed sentence.
+LENGTH_REFUSED = "q must be 3 to 100 characters long"
+CONTROL_REFUSED = "q must not contain a control character or a lone surrogate"
+BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
+
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "detail"),
     [
-        pytest.param({"q": ""}, id="empty"),
-        pytest.param({"q": "zz"}, id="two-characters"),
-        pytest.param({"q": "  zz  "}, id="two-once-trimmed"),
-        pytest.param({"q": "z" * 101}, id="a-hundred-and-one"),
-        pytest.param({"q": "zz\x00zz"}, id="a-null"),
-        pytest.param({"q": "zz\tzz"}, id="a-tab"),
-        pytest.param({"q": "zz\nzz"}, id="a-line-end"),
-        pytest.param({"q": "zzzz\r"}, id="a-carriage-return-at-the-end"),
-        pytest.param({"q": "zz\x1bzz"}, id="an-escape"),
-        pytest.param({"q": "zz\x7fzz"}, id="delete"),
-        pytest.param({"q": "zz\x85zz"}, id="a-c1-control"),
-        pytest.param({"q": "u\u0308u\u0308"}, id="two-letters-once-composed"),
-        pytest.param({"q": 999}, id="q-a-number"),
-        pytest.param({"q": ["Zzville"]}, id="q-a-list"),
-        pytest.param({"q": "Zzville", "size": 50}, id="an-unknown-field"),
-        pytest.param({}, id="nothing"),
+        pytest.param({"q": ""}, LENGTH_REFUSED, id="empty"),
+        pytest.param({"q": "zz"}, LENGTH_REFUSED, id="two-characters"),
+        pytest.param({"q": "  zz  "}, LENGTH_REFUSED, id="two-once-trimmed"),
+        pytest.param({"q": "z" * 101}, LENGTH_REFUSED, id="a-hundred-and-one"),
+        pytest.param({"q": "zz\x00zz"}, CONTROL_REFUSED, id="a-null"),
+        pytest.param({"q": "zz\tzz"}, CONTROL_REFUSED, id="a-tab"),
+        pytest.param({"q": "zz\nzz"}, CONTROL_REFUSED, id="a-line-end"),
+        pytest.param({"q": "zzzz\r"}, CONTROL_REFUSED, id="a-carriage-return-at-the-end"),
+        pytest.param({"q": "zz\x1bzz"}, CONTROL_REFUSED, id="an-escape"),
+        pytest.param({"q": "zz\x7fzz"}, CONTROL_REFUSED, id="delete"),
+        pytest.param({"q": "zz\x85zz"}, CONTROL_REFUSED, id="a-c1-control"),
+        pytest.param({"q": "u\u0308u\u0308"}, LENGTH_REFUSED, id="two-letters-once-composed"),
+        pytest.param({"q": 999}, BODY_REFUSED, id="q-a-number"),
+        pytest.param({"q": ["Zzville"]}, BODY_REFUSED, id="q-a-list"),
+        pytest.param({"q": "Zzville", "size": 50}, BODY_REFUSED, id="an-unknown-field"),
+        pytest.param({}, BODY_REFUSED, id="nothing"),
     ],
 )
 def test_a_text_the_module_would_refuse_is_422_and_nothing_is_searched(
-    client: TestClient, module_on: str, module: Module, fallback: Fallback, body: dict[str, Any]
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    body: dict[str, Any],
+    detail: str,
 ) -> None:
+    """A text refused by the text rules says which rule; a body of the wrong
+    shape gets the one fixed sentence. Neither stands in for the other."""
     _, cookies = _login()
 
     answer = _post(client, body, cookies)
 
     assert answer.status_code == 422
+    assert answer.json() == {"detail": detail}
     assert module.requests == []
     assert fallback.calls == []
 
@@ -217,6 +231,8 @@ def test_a_lone_surrogate_is_422_and_nothing_is_searched(
     answer = client.post(ROUTE, content=raw, headers={"Content-Type": "application/json"})
 
     assert answer.status_code == 422
+    assert answer.json() == {"detail": CONTROL_REFUSED}
+    assert answer.json()["detail"] != station_suggest._BODY_REFUSED
     assert module.requests == []
     assert fallback.calls == []
 
@@ -234,7 +250,9 @@ class UntouchedDb:
 
 # Bodies the framework's own 422 could not answer: its answer copies the
 # input, and a lone surrogate (in a value, in a field name, in a list) or
-# bytes that are not UTF-8 cannot be written as UTF-8 JSON. Each was a 500.
+# bytes that are not UTF-8 cannot be written as UTF-8 JSON; nor can NaN and
+# infinities, which Python's JSON reader accepts; nor could a deeply nested
+# body be. Each was a 500.
 UNANSWERABLE_BODIES = [
     pytest.param(
         b'{"q": "zzz", "x": "\\ud800"}', "application/json", id="surrogate-in-other-field"
@@ -247,6 +265,17 @@ UNANSWERABLE_BODIES = [
     pytest.param(b'["\\ud800zz"]', "application/json", id="a-list-not-an-object"),
     pytest.param(b'"\\ud800zz"', "application/json", id="a-text-not-an-object"),
     pytest.param(b'{"q": "zz\xff\xfezz"}', "text/plain", id="not-utf8-not-json-type"),
+    pytest.param(b'{"q": NaN}', "application/json", id="q-nan"),
+    pytest.param(b'{"q": "zzz", "n": Infinity}', "application/json", id="infinity-in-other-field"),
+    pytest.param(b'{"q": 1e999}', "application/json", id="q-a-number-too-large"),
+    pytest.param(
+        b'{"q": "zzz", "x": ' + b"[" * 1000 + b"]" * 1000 + b"}",
+        "application/json",
+        id="nested-a-thousand-deep",
+    ),
+    pytest.param(
+        b'{"q": "zzz", "\xed\xa0\x80": 1}', "application/json", id="raw-surrogate-in-name"
+    ),
 ]
 
 
@@ -270,8 +299,8 @@ def test_a_body_the_framework_could_not_echo_is_the_routes_own_422(
     assert answer.status_code == 422
     assert answer.headers["content-type"] == "application/json"
     text = answer.content.decode("utf-8")
-    assert json.loads(text) == {"detail": station_suggest._BODY_REFUSED}
-    for piece in ("ud800", "udfff", "\\x", "zzz", 'zz"', "Input should"):
+    assert json.loads(text) == {"detail": BODY_REFUSED}
+    for piece in ("ud800", "udfff", "\\x", "zzz", 'zz"', "Input should", "NaN", "Infinity", "[["):
         assert piece not in text
     assert module.requests == []
     assert fallback.calls == []
@@ -298,7 +327,7 @@ def test_every_refusal_of_the_body_is_the_same_fixed_sentence(
     answer = client.post(ROUTE, content=body, headers={"Content-Type": "application/json"})
 
     assert answer.status_code == 422
-    assert answer.json() == {"detail": station_suggest._BODY_REFUSED}
+    assert answer.json() == {"detail": BODY_REFUSED}
     assert module.requests == []
     assert fallback.calls == []
 
@@ -348,9 +377,9 @@ def test_a_body_that_is_not_json_is_still_the_frameworks_422_without_the_input(
 def test_the_published_request_body_is_still_the_models_schema() -> None:
     published = app.openapi()
     operation = published["paths"][ROUTE]["post"]
+    # Inline, not a named component: the route no longer lets the framework
+    # read the body as the model (see the route's docstring).
     schema = operation["requestBody"]["content"]["application/json"]["schema"]
-    if "$ref" in schema:  # the framework's way, when it validated the body itself
-        schema = published["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
 
     assert operation["requestBody"]["required"] is True
     assert schema["properties"] == {"q": {"type": "string", "title": "Q"}}
