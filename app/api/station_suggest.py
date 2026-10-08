@@ -64,6 +64,12 @@ _ESCAPE = "\\"
 
 _WHITE_SPACE = re.compile(r"\s+")
 
+# The description of the route's 422 in its OpenAPI answers.
+_REFUSED_TEXT = (
+    "The text is not one the station search accepts: 3 to 100 characters once "
+    "normalised, no control character, no lone surrogate."
+)
+
 # Control characters (Cc), and lone surrogates (Cs): JSON can carry `\ud800`,
 # which no UTF-8 text can hold. Sent on, it makes the module fail with a 500,
 # which pauses the module for every user: one user must not be able to.
@@ -150,7 +156,10 @@ def fallback_rows(db: DbSession, q: str) -> list[dict[str, Any]]:
     ]
 
 
-@router.post("/suggest")
+@router.post(
+    "/suggest",
+    responses={422: {"description": _REFUSED_TEXT}},
+)
 async def suggest(
     body: SuggestBody,
     user: Annotated[CurrentUser, Depends(require_logged_in)],

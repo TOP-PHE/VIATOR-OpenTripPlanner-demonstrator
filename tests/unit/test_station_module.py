@@ -202,7 +202,8 @@ async def test_bad_rows_are_dropped_and_the_others_kept(module: Module) -> None:
     assert rows is not None
     assert [r["name"] for r in rows] == [g["name"] for g in good]
     assert rows[0]["name"] == "Zz <b>Markup</b> Halt"  # kept as sent; the page escapes it
-    assert rows[2]["latitude"] == 45.0 and isinstance(rows[2]["latitude"], float)
+    assert rows[2]["latitude"] == 45.0
+    assert isinstance(rows[2]["latitude"], float)
     assert set(rows[0]) == {"name", "latitude", "longitude", "country_iso", "uic"}
 
 
@@ -211,7 +212,8 @@ async def test_at_most_ten_rows_are_kept(module: Module) -> None:
 
     rows = await station_module.search("Zzville", uuid.uuid4())
 
-    assert rows is not None and len(rows) == 10
+    assert rows is not None
+    assert len(rows) == 10
     assert rows[-1]["name"] == "Zz 9"
 
 
