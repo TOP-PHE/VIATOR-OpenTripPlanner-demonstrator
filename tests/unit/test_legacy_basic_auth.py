@@ -148,9 +148,10 @@ def test_index_redirects_to_login_when_admin_user_is_empty(
 
 def test_index_guard_refuses_when_only_the_user_is_set(configure) -> None:
     configure("ops", "")
+    creds = HTTPBasicCredentials(username="ops", password="")
 
     with pytest.raises(HTTPException) as exc:
-        security.authed_or_none(HTTPBasicCredentials(username="ops", password=""))
+        security.authed_or_none(creds)
 
     assert exc.value.status_code == 401
 
