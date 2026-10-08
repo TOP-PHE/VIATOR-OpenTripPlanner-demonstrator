@@ -2043,8 +2043,10 @@ Journey `render(payload)` reads: `executions[]` (`session_id`, `engine`, `status
     not at all; `tests/unit/test_login_next.py` compares them.
 - **`_forbidden_html(request, message)` renders `forbidden.html` with status 403** - the message as
   text (autoescaped; never `|safe`, even though every caller passes a literal), the visitor's own
-  role, a link to `_default_page(role)`, and "sign out and sign in as another user", which POSTs
-  `/api/auth/logout` and then opens `/login?next=<this page>`. Since `next` is followed, a person
+  role, a link to `_default_page(role)`, and "sign out and sign in as another user". That link's
+  script POSTs `/api/auth/logout` and, only when it succeeds, opens `/login?next=<this page>`; a
+  failed sign-out leaves a line of text on the page instead. Without script the link opens plain
+  `/login`, which sends a still-signed-in person to their default page, never back to the 403. Since `next` is followed, a person
   whose session expired on a bookmarked admin page they may not open lands here after logging in,
   so the page must say where they are. It must not reveal more than the person already knows.
 - **The "Re-run live in the journey UI" deep-link is half-wired.** The coverage modal emits

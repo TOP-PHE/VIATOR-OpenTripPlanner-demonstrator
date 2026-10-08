@@ -89,15 +89,23 @@ def _href(html: str, element_id: str) -> str:
     return unescape(match.group(1))
 
 
+def _next_href(html: str) -> str:
+    """Where the switch-user script goes once signed out."""
+    match = re.search(r'<a [^>]*id="forbidden-switch" [^>]*data-next-href="([^"]*)"', html)
+    assert match is not None
+    return unescape(match.group(1))
+
+
 # ───────────────────────────── the real pages ─────────────────────────────
 
 
 def test_the_cases_cover_every_forbidden_page_of_the_router() -> None:
     """A new caller of _forbidden_html must be added to the cases above."""
     source = Path(pages.__file__).read_text(encoding="utf-8")
-    assert source.count("return _forbidden_html(request, ") == len(
-        PLATFORM_ADMIN_PAGES + MANAGER_PAGES
-    )
+    # Every call, however ruff format lays it out; minus the definition.
+    calls = len(re.findall(r"\b_forbidden_html\(", source)) - 1
+    assert "def _forbidden_html(" in source
+    assert calls == len(PLATFORM_ADMIN_PAGES + MANAGER_PAGES)
     for page in PLATFORM_ADMIN_PAGES + MANAGER_PAGES:
         assert f'_redirect_to_login("{page}")' in source
 
@@ -117,7 +125,10 @@ def test_a_forbidden_page_says_why_and_where_to_go(
     assert f'<p id="forbidden-message">{message}</p>' in content
     assert f'<strong id="forbidden-role">{role.replace("_", " ")}</strong>' in content
     assert _href(content, "forbidden-home") == default
-    assert _href(content, "forbidden-switch") == f"/login?next={page}"
+    # Without script, plain /login (which sends a signed-in person to their
+    # start page, never back here); with script, back here after signing in.
+    assert _href(content, "forbidden-switch") == "/login"
+    assert _next_href(content) == f"/login?next={page}"
     # The default page link works for this person.
     assert client.get(default, follow_redirects=False).status_code == 200
 
@@ -129,9 +140,16 @@ def test_the_switch_user_link_signs_out_before_opening_login(client: TestClient)
 
     script = html[html.index("document.getElementById('forbidden-switch')") :]
     script = script[: script.index("</script>")]
-    assert "fetch('/api/auth/logout', {method: 'POST'})" in script
-    assert "globalThis.location.href = dest;" in script
+    assert "e.preventDefault();" in script
+    assert "const dest = e.currentTarget.dataset.nextHref || '/login';" in script
+    assert "const res = await fetch('/api/auth/logout', {method: 'POST'});" in script
+    assert "signedOut = res.ok;" in script
+    # It navigates only once signed out; a failure is said on the page.
+    assert "if (signedOut) {\n    globalThis.location.href = dest;" in script
+    assert script.count("location.href") == 1
+    assert "msg.textContent = 'Sign-out failed. Please try again.';" in script
     assert script.index("/api/auth/logout") < script.index("globalThis.location.href")
+    assert '<div id="forbidden-switch-msg" class="msg error"></div>' in html
 
 
 def test_the_login_page_and_the_403_page_share_the_default_page_rule() -> None:
@@ -153,8 +171,17 @@ def _probe_app(message: str, path: str = "/zz-probe") -> TestClient:
     return TestClient(probe)
 
 
-@pytest.mark.parametrize("role", ["end_user", "content_manager"])
-def test_the_message_is_escaped_never_markup(role: str) -> None:
+@pytest.mark.parametrize(
+    ("role", "default"),
+    [
+        ("end_user", "/journey"),
+        ("content_manager", "/journey"),
+        # No real page answers 403 to a platform admin; the probe pins that
+        # the link follows the role, not a fixed page.
+        ("platform_admin", "/admin/users"),
+    ],
+)
+def test_the_message_is_escaped_never_markup(role: str, default: str) -> None:
     probe = _probe_app("<b>zz</b> & <script>zz()</script>")
     _log_in(probe, role)
 
@@ -168,7 +195,8 @@ def test_the_message_is_escaped_never_markup(role: str) -> None:
     )
     assert "<b>zz</b>" not in answer.text
     assert "<script>zz()" not in answer.text
-    assert _href(content, "forbidden-home") == "/journey"
+    assert f'<strong id="forbidden-role">{role.replace("_", " ")}</strong>' in content
+    assert _href(content, "forbidden-home") == default
 
 
 def test_a_path_next_may_not_name_signs_in_without_next() -> None:
@@ -178,6 +206,7 @@ def test_a_path_next_may_not_name_signs_in_without_next() -> None:
     content = _content(probe.get("/zz:probe").text)
 
     assert _href(content, "forbidden-switch") == "/login"
+    assert _next_href(content) == "/login"
 
 
 def test_without_a_session_the_page_offers_to_sign_in() -> None:

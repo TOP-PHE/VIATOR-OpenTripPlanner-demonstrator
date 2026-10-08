@@ -837,7 +837,9 @@ into the admin UI just works.
   carries one (most Grafana links do, e.g. `?orgId=1`) is not followed:
   after sign-in the operator lands on their role's default page
   (`/admin/users` for a platform administrator, `/journey` for the
-  others) and opens the dashboard again from the menu.
+  others) and must open the dashboard again. A platform administrator
+  can use the "Admin dashboard" menu: its links carry no query string,
+  so they are followed after sign-in; other roles have no such menu.
 
 **Tunables (in `.env`):**
 

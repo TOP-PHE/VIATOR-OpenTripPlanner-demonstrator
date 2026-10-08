@@ -14,8 +14,12 @@
     <strong id="forbidden-role">{{ current_user.role.replace('_', ' ') }}</strong>,
     which cannot open this page.</p>
   <a class="btn" id="forbidden-home" href="{{ default_page }}">Go to your start page</a>
+  {#- Without script the link opens plain /login, which sends a signed-in
+      visitor to their start page, never back here. With script, it signs
+      out first, then opens /login with this page as `next`. -#}
   <p class="hint">Need another account?
-    <a id="forbidden-switch" href="{{ login_href }}">Sign out and sign in as another user</a>.</p>
+    <a id="forbidden-switch" href="/login" data-next-href="{{ login_href }}">Sign out and sign in as another user</a>.</p>
+  <div id="forbidden-switch-msg" class="msg error"></div>
   {% else %}
   <a class="btn" id="forbidden-home" href="{{ login_href }}">Sign in</a>
   {% endif %}
@@ -24,17 +28,26 @@
 
 {% block extra_scripts %}
 <script>
-// Sign out first, then open the link's own address (/login, with this page
-// as `next`): /login sends a signed-in visitor straight back to a page.
+// Sign out first, then open /login with this page as `next` (data-next-href,
+// built server-side). If the sign-out fails, stay and say so: /login would
+// send a still-signed-in visitor straight back to a page.
 document.getElementById('forbidden-switch')?.addEventListener('click', async (e) => {
   e.preventDefault();
-  const dest = e.currentTarget.getAttribute('href');
+  const dest = e.currentTarget.dataset.nextHref || '/login';
+  const msg = document.getElementById('forbidden-switch-msg');
+  let signedOut = false;
   try {
-    await fetch('/api/auth/logout', {method: 'POST'});
+    const res = await fetch('/api/auth/logout', {method: 'POST'});
+    signedOut = res.ok;
   } catch (err) {
     console.warn('forbidden page: sign-out request failed', err);
   }
-  globalThis.location.href = dest;
+  if (signedOut) {
+    globalThis.location.href = dest;
+    return;
+  }
+  msg.textContent = 'Sign-out failed. Please try again.';
+  msg.classList.add('show');
 });
 </script>
 {% endblock %}
