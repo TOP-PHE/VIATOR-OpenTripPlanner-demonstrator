@@ -221,6 +221,143 @@ def test_a_lone_surrogate_is_422_and_nothing_is_searched(
     assert fallback.calls == []
 
 
+class UntouchedDb:
+    """Stands in for the session of `get_db`: any use of it is recorded."""
+
+    def __init__(self) -> None:
+        self.used: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.used.append(name)
+        raise AssertionError(f"the database was used: {name}")
+
+
+# Bodies the framework's own 422 could not answer: its answer copies the
+# input, and a lone surrogate (in a value, in a field name, in a list) or
+# bytes that are not UTF-8 cannot be written as UTF-8 JSON. Each was a 500.
+UNANSWERABLE_BODIES = [
+    pytest.param(
+        b'{"q": "zzz", "x": "\\ud800"}', "application/json", id="surrogate-in-other-field"
+    ),
+    pytest.param(b'{"q": "zzz", "\\ud800": 1}', "application/json", id="surrogate-as-field-name"),
+    pytest.param(b'{"q": ["\\ud800"]}', "application/json", id="q-a-list-with-a-surrogate"),
+    pytest.param(
+        b'{"q": {"zz": "\\udfff"}}', "application/json", id="q-an-object-with-a-surrogate"
+    ),
+    pytest.param(b'["\\ud800zz"]', "application/json", id="a-list-not-an-object"),
+    pytest.param(b'"\\ud800zz"', "application/json", id="a-text-not-an-object"),
+    pytest.param(b'{"q": "zz\xff\xfezz"}', "text/plain", id="not-utf8-not-json-type"),
+]
+
+
+@pytest.mark.parametrize(("raw", "content_type"), UNANSWERABLE_BODIES)
+def test_a_body_the_framework_could_not_echo_is_the_routes_own_422(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    raw: bytes,
+    content_type: str,
+) -> None:
+    db = UntouchedDb()
+    app.dependency_overrides[get_db] = lambda: db
+    _, cookies = _login()
+    client.cookies.clear()
+    client.cookies.set(*next(iter(cookies.items())))
+
+    answer = client.post(ROUTE, content=raw, headers={"Content-Type": content_type})
+
+    assert answer.status_code == 422
+    assert answer.headers["content-type"] == "application/json"
+    text = answer.content.decode("utf-8")
+    assert json.loads(text) == {"detail": station_suggest._BODY_REFUSED}
+    for piece in ("ud800", "udfff", "\\x", "zzz", 'zz"', "Input should"):
+        assert piece not in text
+    assert module.requests == []
+    assert fallback.calls == []
+    assert db.used == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b"", id="empty"),
+        pytest.param(b"null", id="null"),
+        pytest.param(b'{"q": 999}', id="q-a-number"),
+        pytest.param(b'{"q": "Zzville", "size": 50}', id="an-unknown-field"),
+        pytest.param(b"{}", id="nothing"),
+    ],
+)
+def test_every_refusal_of_the_body_is_the_same_fixed_sentence(
+    client: TestClient, module_on: str, module: Module, fallback: Fallback, body: bytes
+) -> None:
+    _, cookies = _login()
+    client.cookies.clear()
+    client.cookies.set(*next(iter(cookies.items())))
+
+    answer = client.post(ROUTE, content=body, headers={"Content-Type": "application/json"})
+
+    assert answer.status_code == 422
+    assert answer.json() == {"detail": station_suggest._BODY_REFUSED}
+    assert module.requests == []
+    assert fallback.calls == []
+
+
+@pytest.mark.parametrize(("raw", "content_type"), UNANSWERABLE_BODIES)
+def test_an_anonymous_request_is_refused_before_its_body_is_read(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    raw: bytes,
+    content_type: str,
+) -> None:
+    """As before the route checked its body itself: the login check first."""
+    client.cookies.clear()
+
+    answer = client.post(ROUTE, content=raw, headers={"Content-Type": content_type})
+
+    assert answer.status_code == 401
+    assert module.requests == []
+    assert fallback.calls == []
+
+
+@pytest.mark.parametrize("logged_in", [False, True], ids=["anonymous", "logged-in"])
+def test_a_body_that_is_not_json_is_still_the_frameworks_422_without_the_input(
+    client: TestClient, module_on: str, module: Module, logged_in: bool
+) -> None:
+    """Unchanged: the framework refuses unparsable JSON before the login
+    check; its answer names the position, never the text."""
+    client.cookies.clear()
+    if logged_in:
+        _, cookies = _login()
+        client.cookies.set(*next(iter(cookies.items())))
+
+    answer = client.post(
+        ROUTE, content=b'{"q": "zzz\\ud800', headers={"Content-Type": "application/json"}
+    )
+
+    assert answer.status_code == 422
+    (error,) = answer.json()["detail"]
+    assert error["type"] == "json_invalid"
+    assert error["input"] == {}
+    assert "zzz" not in answer.text
+    assert module.requests == []
+
+
+def test_the_published_request_body_is_still_the_models_schema() -> None:
+    published = app.openapi()
+    operation = published["paths"][ROUTE]["post"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    if "$ref" in schema:  # the framework's way, when it validated the body itself
+        schema = published["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
+
+    assert operation["requestBody"]["required"] is True
+    assert schema["properties"] == {"q": {"type": "string", "title": "Q"}}
+    assert schema["required"] == ["q"]
+    assert schema["additionalProperties"] is False
+
+
 @pytest.mark.parametrize(
     ("given", "searched"),
     [
