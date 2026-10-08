@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from fastapi.templating import Jinja2Templates
 
+from . import station_module
 from .settings import settings
 
 templates = Jinja2Templates(directory="app/templates")
@@ -46,3 +47,10 @@ def _display_version(raw: str) -> str:
 
 
 templates.env.globals["viator_version"] = _display_version(settings.viator_version)
+
+
+# The administrator's menu link to the station mapping module (`/msmm/`) shows
+# only when VIATOR uses the module: by the client's own rule, both
+# STATION_MODULE_URL and STATION_MODULE_TOKEN set. Process settings, so
+# constant for the life of the process.
+templates.env.globals["station_module_enabled"] = station_module.enabled()
