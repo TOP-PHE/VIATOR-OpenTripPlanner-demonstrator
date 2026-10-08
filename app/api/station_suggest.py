@@ -14,7 +14,7 @@ module's rules do not yet say: it would make the module fail with a 500.
 
 **Every refusal of the body is a 422 with a fixed sentence, never the
 framework's.** FastAPI's own 422 copies the refused input into its answer;
-JSON can carry a lone surrogate (`\ud800`) anywhere, in a value or a field
+JSON can carry a lone surrogate (`\\ud800`) anywhere, in a value or a field
 name, which no UTF-8 answer can hold, so that answer would itself fail with
 a 500. The route therefore takes the parsed JSON as it comes and checks it
 against `SuggestBody` itself. The order stays the framework's: a body sent
