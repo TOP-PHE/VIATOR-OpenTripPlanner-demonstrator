@@ -2364,7 +2364,8 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
 
 - **Where the token comes from.** It is generated on the server, on the
   module's side, and copied from the module's `.env` into VIATOR's without
-  being shown (the module's deployment runbook, step 9). It is never typed by
+  being shown (step 9 of "Brancher VIATOR sur le module (étape 2)" in the
+  module's deployment runbook). It is never typed by
   hand, never committed, never put in GitHub, never pasted elsewhere.
 - **Empty means "not used".** The module is used only when **both** settings
   are set. With either one empty, VIATOR makes no call to the module: the
@@ -2374,6 +2375,12 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   `/journey` shows, under its title, the module's statement and the licence of
   each of its sources; platform administrators get a "Stations (MSMM)" link in
   the menu to the module's screens at `/msmm/`.
+- **Signing in from a link.** A page that needs a login sends you to
+  `/login?next=<page>`; after signing in you return to that page only when
+  its address has no query string (and is a plain path of this site);
+  otherwise you land on your role's default page (`/admin/users` for a
+  platform administrator, `/journey` for the others). This does not depend
+  on the module's settings.
 - **If the module fails** (stopped, slow, a wrong token, an error), VIATOR
   falls back to its own station list and drops the notice; after a failure
   that says the module is unreachable or misconfigured, it makes no call to

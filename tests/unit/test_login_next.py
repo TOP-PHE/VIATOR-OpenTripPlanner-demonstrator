@@ -152,15 +152,48 @@ def test_a_logged_in_person_with_no_valid_next_goes_to_the_role_default(
 # ───────────────────────────── the login page ─────────────────────────────
 
 
+SAFE_NEXT_JS = """function safeNext() {
+  let value = null;
+  try {
+    value = new URLSearchParams(globalThis.location.search).get('next');
+  } catch (err) {
+    console.warn('login: could not read next from the address', err);
+  }
+  if (value === null || value === '/login' || !NEXT_PATTERN.test(value)) return null;
+  return value;
+}"""
+
+
+def _lines(html: str) -> list[str]:
+    return [line.strip() for line in html.splitlines()]
+
+
 def test_the_rendered_login_page_holds_the_pattern(client: TestClient) -> None:
+    """The script is not executed here (CI has no JS engine): its exact lines are."""
     answer = _get_login(client, {"next": "/msmm/"})
 
     assert answer.status_code == 200
-    assert JS_PATTERN_LINE in answer.text
-    assert "value === '/login'" in answer.text
-    assert "safeNext() || (body.role === 'platform_admin' ? '/admin/users' : '/journey')" in (
-        answer.text
+    lines = _lines(answer.text)
+    assert JS_PATTERN_LINE in lines
+    # safeNext() exactly as written: the full refusal condition, and no
+    # second NEXT_PATTERN inside it.
+    assert SAFE_NEXT_JS in answer.text
+    assert (
+        "if (value === null || value === '/login' || !NEXT_PATTERN.test(value)) return null;"
+        in lines
     )
+    # The destination, and the one place it is used.
+    assert (
+        "const dest = safeNext() || "
+        "(body.role === 'platform_admin' ? '/admin/users' : '/journey');" in lines
+    )
+    script = answer.text[answer.text.index("const NEXT_PATTERN") :]
+    script = script[: script.index("</script>")]
+    assert _lines(script).count("globalThis.location.href = dest;") == 1
+    assert script.count("location.href") == 1
+    # NEXT_PATTERN is defined once and used once, nowhere else.
+    assert len(re.findall(r"\bNEXT_PATTERN\b", answer.text)) == 2
+    assert len(re.findall(r"\bsafeNext\b", answer.text)) == 2
 
 
 def test_the_script_pattern_is_the_python_pattern() -> None:

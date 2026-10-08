@@ -305,15 +305,20 @@ async def journey_page(
 
     Asynchronous so that it can await the station module's attribution
     (app/station_module.py: the cached answer, or a call of at most 0.5 s,
-    or None, with no call at all while the module is paused). The
+    or None, with no call at all while the module is paused). It is awaited
+    first, before the database is touched, so that no pooled connection is
+    held during that wait; and only when the module is configured, so that
+    a VIATOR without it logs no fallback line on every page. The
     platform_config read is synchronous database work, so it runs in the
     thread pool, as it did when this handler was synchronous."""
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    flags = await run_in_threadpool(_comparison_flags, db)
     # The licence notice under the title: shown only when the module answered.
-    station_attribution: dict[str, Any] | None = await station_module.attribution()
+    station_attribution: dict[str, Any] | None = (
+        await station_module.attribution() if station_module.enabled() else None
+    )
+    flags = await run_in_threadpool(_comparison_flags, db)
     return templates.TemplateResponse(
         request,
         "journey.html",

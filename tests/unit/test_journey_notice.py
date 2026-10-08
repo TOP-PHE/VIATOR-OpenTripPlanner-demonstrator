@@ -17,7 +17,9 @@ address, a token drawn at run time.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import logging
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -48,6 +50,12 @@ ATTRIBUTION = {
 }
 
 
+# Where each stand-in platform_config read ran: "off-loop" (a worker thread)
+# or "on-loop" (the event loop, which a database call must never block); and
+# "module-call" for each call of the module, to prove their order.
+CONFIG_READS: list[str] = []
+
+
 class Module:
     """A stand-in for the module: answers `response`, records every request."""
 
@@ -57,6 +65,7 @@ class Module:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        CONFIG_READS.append("module-call")
         return self.response
 
 
@@ -92,7 +101,18 @@ def module_off(monkeypatch: pytest.MonkeyPatch, module: Module) -> None:
 def platform_config(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Stands in for platform_config: the page reads it without a database."""
     values: dict[str, Any] = {}
-    monkeypatch.setattr(config_service, "get_all", lambda db, **_kw: dict(values))
+
+    def get_all(db: Any, **_kw: Any) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            CONFIG_READS.append("off-loop")
+        else:
+            CONFIG_READS.append("on-loop")
+        return dict(values)
+
+    CONFIG_READS.clear()
+    monkeypatch.setattr(config_service, "get_all", get_all)
     return values
 
 
@@ -159,7 +179,8 @@ def test_every_value_of_the_notice_is_escaped(
                     "licence": "<b>ZZ licence</b>",
                     "licence_url": 'https://zz.invalid/"><img src=x onerror=zz()>',
                     "labels": ["<i>ZZ label</i>", "ZZ & co"],
-                }
+                },
+                {"licence": "<u>ZZ plain</u>", "licence_url": None, "labels": ["ZZ source"]},
             ],
         },
     )
@@ -170,7 +191,9 @@ def test_every_value_of_the_notice_is_escaped(
     assert "&lt;b&gt;ZZ licence&lt;/b&gt;" in notice
     assert "&lt;i&gt;ZZ label&lt;/i&gt;, ZZ &amp; co" in notice
     assert 'href="https://zz.invalid/&#34;&gt;&lt;img src=x onerror=zz()&gt;"' in notice
-    for raw in ("<script>", "<b>", "<i>", "<img"):
+    # A licence without a link (the CRD case) is escaped as well.
+    assert "<br>\n    &lt;u&gt;ZZ plain&lt;/u&gt;: ZZ source" in notice
+    for raw in ("<script>", "<b>", "<i>", "<img", "<u>"):
         assert raw not in notice
 
 
@@ -226,12 +249,49 @@ def test_the_template_checks_the_address_again(url: str) -> None:
     assert "<a " not in notice
 
 
-def test_no_notice_without_the_module(client: TestClient, module_off: None, module: Module) -> None:
-    answer = _get(client, "/journey")
+def test_a_plain_http_licence_address_is_a_link(
+    client: TestClient, module_on: None, module: Module
+) -> None:
+    url = "http://zz.invalid/licence"
+    module.response = httpx.Response(
+        200,
+        json={
+            "statement": STATEMENT,
+            "sources": [{"licence": "ZZ licence", "licence_url": url, "labels": ["ZZ source"]}],
+        },
+    )
+
+    notice = _notice(_get(client, "/journey").text)
+
+    assert f'<a href="{url}" target="_blank" rel="noopener">ZZ licence</a>: ZZ source' in notice
+
+
+def test_no_notice_and_no_fallback_line_without_the_module(
+    client: TestClient, module_off: None, module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=station_module.log.name):
+        answer = _get(client, "/journey")
 
     assert answer.status_code == 200
     assert 'station-attribution">' not in answer.text
     assert module.requests == []
+    # A VIATOR without the module does not log `reason=off` on every page.
+    assert "station_module.fallback" not in caplog.text
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["with-the-module", "without-the-module"])
+def test_platform_config_is_read_off_the_event_loop_after_the_module(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, module: Module, on: bool
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", MODULE_URL if on else "")
+    monkeypatch.setattr(
+        settings, "station_module_token", SecretStr(secrets.token_hex(32) if on else "")
+    )
+
+    assert _get(client, "/journey").status_code == 200
+    # Off the event loop; and after the module's call, so that no database
+    # connection is held while the page waits for the module.
+    assert (["module-call", "off-loop"] if on else ["off-loop"]) == CONFIG_READS
 
 
 @pytest.mark.parametrize(
