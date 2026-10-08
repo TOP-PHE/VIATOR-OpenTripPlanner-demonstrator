@@ -98,7 +98,7 @@ MAX_TEXT = 500
 _PAUSING_STATUSES = frozenset({401, 403, 404, 405, 413, 415, 500})
 _PAUSING_503_CODES = frozenset({"no_build", "database"})
 
-# A scheme check of a link shown on a page, never a connection (hence NOSONAR).
+# A scheme check of a link shown on a page, never a connection: S5332 does not apply.
 _URL_SCHEMES = ("https://", "http://")  # NOSONAR python:S5332
 
 # States and one-request refusals, not faults: logged at INFO.
