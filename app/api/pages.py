@@ -12,14 +12,15 @@ the JSON API's 401: an unauthenticated browser hitting `/admin/users` lands on
 from __future__ import annotations
 
 import re
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from .. import config_service
+from .. import config_service, station_module
 from ..db import get_db
 from ..models import Session as SessionRow
 from ..models import User
@@ -278,32 +279,48 @@ def admin_master_stations_page(request: Request) -> Response:
     )
 
 
+def _comparison_flags(db: Session) -> dict[str, bool]:
+    """The two reference-engine checkboxes of /journey, read from platform_config.
+
+    The "Compare with Swiss OJP reference" checkbox is only rendered
+    when the feature is both enabled AND has a token configured —
+    mirroring the dormant-until-configured rule in config_schema.py.
+    HAFAS has no token gate (the embedded credentials are public),
+    so just the boolean enable-flag governs whether the second
+    checkbox renders."""
+    cfg = config_service.get_all(db)
+    return {
+        "ojp_comparison_enabled": bool(cfg.get("OJP_COMPARISON_ENABLED"))
+        and bool(cfg.get("OJP_API_TOKEN")),
+        "hafas_comparison_enabled": bool(cfg.get("HAFAS_COMPARISON_ENABLED")),
+    }
+
+
 @router.get("/journey", response_class=HTMLResponse)
-def journey_page(
+async def journey_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
 ) -> Response:
+    """The journey search page.
+
+    Asynchronous so that it can await the station module's attribution
+    (app/station_module.py: the cached answer, or a call of at most 0.5 s,
+    or None, with no call at all while the module is paused). The
+    platform_config read is synchronous database work, so it runs in the
+    thread pool, as it did when this handler was synchronous."""
     user = _maybe_user(request)
     if user is None:
         return _redirect_to_login("/journey")
-    # The "Compare with Swiss OJP reference" checkbox is only rendered
-    # when the feature is both enabled AND has a token configured —
-    # mirroring the dormant-until-configured rule in config_schema.py.
-    # HAFAS has no token gate (the embedded credentials are public),
-    # so just the boolean enable-flag governs whether the second
-    # checkbox renders.
-    cfg = config_service.get_all(db)
-    ojp_comparison_enabled = bool(cfg.get("OJP_COMPARISON_ENABLED")) and bool(
-        cfg.get("OJP_API_TOKEN")
-    )
-    hafas_comparison_enabled = bool(cfg.get("HAFAS_COMPARISON_ENABLED"))
+    flags = await run_in_threadpool(_comparison_flags, db)
+    # The licence notice under the title: shown only when the module answered.
+    station_attribution: dict[str, Any] | None = await station_module.attribution()
     return templates.TemplateResponse(
         request,
         "journey.html",
         {
             "current_user": user,
-            "ojp_comparison_enabled": ojp_comparison_enabled,
-            "hafas_comparison_enabled": hafas_comparison_enabled,
+            **flags,
+            "station_attribution": station_attribution,
         },
     )
 

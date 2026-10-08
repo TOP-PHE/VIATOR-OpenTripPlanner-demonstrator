@@ -197,10 +197,26 @@
 .cmp-pill.otp-only     { background: #e8f0fb; color: #1C75BC; }
 .cmp-pill.ojp-only     { background: #fff8e1; color: #b3760e; }
 .cmp-pill.uncomparable { background: #eef0f2; color: #57606a; }
+/* The station module's licence notice, under the title. */
+.station-attribution { font-size: 0.8rem; color: var(--rail-steel); margin: -0.25rem 0 0.75rem; }
 {% endblock %}
 
 {% block content %}
 <h1>Search a journey</h1>
+{# Where the station suggestions come from, as the station mapping module
+   says (app/station_module.py, attribution()): only when the module answered.
+   Rendered here by Jinja, every value escaped, never built in script and
+   never `|safe`. A licence is a link only to an http(s) address: escaping
+   does not stop a `javascript:` address in an href. #}
+{% if station_attribution %}
+<p class="station-attribution">
+  {{ station_attribution.statement }}
+  {% for group in station_attribution.sources %}
+    <br>
+    {% if group.licence_url and (group.licence_url.startswith('https://') or group.licence_url.startswith('http://')) %}<a href="{{ group.licence_url }}" target="_blank" rel="noopener">{{ group.licence }}</a>{% else %}{{ group.licence }}{% endif %}: {{ group.labels | join(', ') }}
+  {% endfor %}
+</p>
+{% endif %}
 <p style="color: var(--rail-steel)">
   One search runs against every fanout-enabled session and merges the results.
   Each itinerary is flagged by which sessions returned it.
