@@ -10,8 +10,8 @@ inside the network like VIATOR's calls to MOTIS):
   typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
 - `attribution()` — `GET /internal/v1/attribution`, the licence text of the
   module's sources, kept 60 s. Asynchronous, like search, so that its
-  deadline is real. No caller yet: the notice on /journey that will await
-  it comes in a later change.
+  deadline is real. Awaited by `journey_page` (app/api/pages.py) for the
+  licence notice under the title of /journey.
 
 Both return `None` on any failure, and the caller then uses VIATOR's own
 behaviour (the master_stations list; no notice). VIATOR must keep working
@@ -394,8 +394,9 @@ async def attribution() -> dict[str, Any] | None:
     """The module's attribution text, cached 60 s; `None` when the module is
     not configured, is paused or fails (and a failure forgets the cache).
     Asynchronous so that its deadline bounds the whole call, headers
-    included. Nothing calls it yet: the notice that shows it comes in a
-    later change, which will await it."""
+    included. Awaited by `journey_page` (app/api/pages.py), only when the
+    module is configured, for the licence notice under the title of
+    /journey."""
     try:
         if not enabled():
             raise _Failure("off", pause=False)
