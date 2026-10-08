@@ -302,6 +302,7 @@ def test_malformed_time_claim_is_a_401_not_a_crash(secret: str, claim: str, valu
     # (signed with our secret), which escaped security.py as an HTTP 500.
     token = _token(_claims(**{claim: value}), secret)
     _refused(token)
+    request = _bearer_request(token)
     with pytest.raises(HTTPException) as caught:
-        security.current_user_jwt(_bearer_request(token))
+        security.current_user_jwt(request)
     assert caught.value.status_code == 401
