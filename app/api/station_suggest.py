@@ -12,6 +12,17 @@ no text VIATOR accepts can earn a 422 from the module, and the normalised
 text is the one VIATOR sends. A lone surrogate is refused as well, which the
 module's rules do not yet say: it would make the module fail with a 500.
 
+**Every refusal of the body is a 422 with a fixed sentence, never the
+framework's.** FastAPI's own 422 copies the refused input into its answer;
+JSON can carry a lone surrogate (`\ud800`) anywhere, in a value or a field
+name, which no UTF-8 answer can hold, so that answer would itself fail with
+a 500. The route therefore takes the parsed JSON as it comes and checks it
+against `SuggestBody` itself. The order stays the framework's: a body sent
+as JSON that does not parse is refused before the login check (its answer
+never holds the input); any other body is checked only once the user is
+known, so an anonymous request still gets 401 whatever its body (a body sent
+as another type, `text/plain` for one, included).
+
 Where the stations come from:
 
 1. **The module** (app/station_module.py), when it is configured and the
@@ -39,8 +50,8 @@ import re
 import unicodedata
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import Executable, or_, select
 from sqlalchemy.orm import Session as DbSession
 from starlette.concurrency import run_in_threadpool
@@ -67,8 +78,12 @@ _WHITE_SPACE = re.compile(r"\s+")
 # The description of the route's 422 in its OpenAPI answers.
 _REFUSED_TEXT = (
     "The text is not one the station search accepts: 3 to 100 characters once "
-    "normalised, no control character, no lone surrogate."
+    "normalised, no control character, no lone surrogate. Or the body is not "
+    '{"q": <text>} and nothing else.'
 )
+
+# The 422 of a body that is not `{"q": <text>}` and nothing else.
+_BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
 
 # Control characters (Cc), and lone surrogates (Cs): JSON can carry `\ud800`,
 # which no UTF-8 text can hold. Sent on, it makes the module fail with a 500,
@@ -104,6 +119,16 @@ class SuggestBody(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     q: str
+
+
+def _body_or_422(given: Any) -> SuggestBody:
+    """`given` (the parsed JSON body) as a `SuggestBody`, or a 422 with a
+    fixed sentence. pydantic's error is dropped: it holds the input, which
+    may be a lone surrogate that no UTF-8 answer can carry."""
+    try:
+        return SuggestBody.model_validate(given)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail=_BODY_REFUSED) from None
 
 
 def _normalised_or_422(text: str) -> str:
@@ -159,14 +184,22 @@ def fallback_rows(db: DbSession, q: str) -> list[dict[str, Any]]:
 @router.post(
     "/suggest",
     responses={422: {"description": _REFUSED_TEXT}},
+    # The body is declared `Any` below so that the framework never validates
+    # it (see the module's docstring); the published schema stays the model's.
+    openapi_extra={
+        "requestBody": {
+            "content": {"application/json": {"schema": SuggestBody.model_json_schema()}},
+            "required": True,
+        }
+    },
 )
 async def suggest(
-    body: SuggestBody,
     user: Annotated[CurrentUser, Depends(require_logged_in)],
     db: Annotated[DbSession, Depends(get_db)],
+    given: Annotated[Any, Body()] = None,
 ) -> list[dict[str, Any]]:
     """At most ten stations whose name contains `q`, or whose UIC is `q`."""
-    q = _normalised_or_422(body.q)
+    q = _normalised_or_422(_body_or_422(given).q)
     if user.id is not None:
         rows = await station_module.search(q, user.id)
         if rows is not None:
