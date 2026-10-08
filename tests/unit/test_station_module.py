@@ -599,18 +599,40 @@ async def test_a_cancelled_search_is_cancelled_not_a_fallback_and_sets_no_pause(
     assert not station_module._paused()
 
 
-@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br", " GZIP "])
+async def test_a_cancelled_attribution_is_cancelled_not_a_fallback_and_sets_no_pause(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    module.handler = _slow_headers(3.0)
+
+    with caplog.at_level(logging.INFO):
+        task = asyncio.create_task(station_module.attribution())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert _reasons(caplog) == []
+    assert not station_module._paused()
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", " GZIP ", "zz"])
 async def test_a_compressed_answer_is_refused_unread_and_pauses(
     module: Module, caplog: pytest.LogCaptureFixture, encoding: str
 ) -> None:
     """A small compressed body could inflate far past the cap in one chunk:
     the client asks for none and refuses any, even one that would inflate to
-    a valid, small answer."""
+    a valid, small answer. An encoding httpx does not know ("zz") is sent
+    uncompressed, so only the encoding check refuses it."""
     import gzip
     import zlib
 
     plain = json.dumps({"stations": [_row()], "statement": "ZZ", "sources": []}).encode()
-    packed = zlib.compress(plain) if encoding == "deflate" else gzip.compress(plain)
+    if encoding == "zz":
+        packed = plain
+    elif encoding == "deflate":
+        packed = zlib.compress(plain)
+    else:
+        packed = gzip.compress(plain)
     module.handler = lambda _r: httpx.Response(
         200, content=packed, headers={"Content-Encoding": encoding}
     )
