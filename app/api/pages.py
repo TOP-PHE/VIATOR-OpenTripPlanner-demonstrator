@@ -65,11 +65,37 @@ def safe_next(value: str | None) -> str | None:
     return value
 
 
+def _default_page(role: str) -> str:
+    """The page a role lands on when no valid `next` names one: after logging
+    in, on `/login` when already logged in, and from the 403 page.
+    auth/login.html's script applies the same rule: change both or neither.
+    Never "/" for a non-admin: in Phase-2 mode "/" sends back to /login."""
+    return "/admin/users" if role == "platform_admin" else "/journey"
+
+
 def _forbidden_html(request: Request, message: str) -> HTMLResponse:
+    """The 403 page of a protected page the visitor's role may not open.
+
+    It shows `message` as text (Jinja escapes it; never mark it safe), the
+    visitor's own role, a link to that role's default page, and a way to sign
+    out and sign in as another user, coming back to this page. Nothing the
+    visitor does not already know. The status stays 403."""
+    user = _maybe_user(request)
     return templates.TemplateResponse(
         request,
-        "_base.html",
-        {"current_user": _maybe_user(request)},
+        "forbidden.html",
+        {
+            "current_user": user,
+            "message": message,
+            "default_page": _default_page(user.role) if user is not None else None,
+            # Signing in as someone else comes back here when the path is one
+            # `next` may name (every protected page's is); otherwise plain /login.
+            "login_href": (
+                f"/login?next={request.url.path}"
+                if safe_next(request.url.path) is not None
+                else "/login"
+            ),
+        },
         status_code=403,
     )
 
@@ -85,9 +111,7 @@ def login_page(request: Request) -> Response:
         # Phase-2 note: do NOT bounce non-admins to "/" — that redirects back
         # to /login in Phase-2 mode, creating a loop. /journey is universal.
         # A valid `next` (see safe_next) wins; an invalid one is ignored.
-        dest = safe_next(request.query_params.get("next")) or (
-            "/admin/users" if user.role == "platform_admin" else "/journey"
-        )
+        dest = safe_next(request.query_params.get("next")) or _default_page(user.role)
         return RedirectResponse(dest, status_code=303)
     return templates.TemplateResponse(
         request,

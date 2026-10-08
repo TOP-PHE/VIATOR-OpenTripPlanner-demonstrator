@@ -832,7 +832,14 @@ into the admin UI just works.
   users on first sight (Editor role by default; manually upgrade to
   Admin in Grafana's user management for power users).
 - 401 from the auth-request bounces the operator to `/login?next=...`
-  so the round-trip lands them back at the dashboard after sign-in.
+  so the round-trip lands them back at the dashboard after sign-in, but
+  only when the requested address has no query string. A deep link that
+  carries one (most Grafana links do, e.g. `?orgId=1`) is not followed:
+  after sign-in the operator lands on their role's default page
+  (`/admin/users` for a platform administrator, `/journey` for the
+  others) and must open the dashboard again. A platform administrator
+  can use the "Admin dashboard" menu: its links carry no query string,
+  so they are followed after sign-in; other roles have no such menu.
 
 **Tunables (in `.env`):**
 
