@@ -46,7 +46,7 @@ from typing import Any
 
 import httpx
 
-from . import detect
+from . import detect, netex_structure
 
 log = logging.getLogger(__name__)
 
@@ -386,4 +386,23 @@ async def fetch_validated(
         # — all mean "rejected", never a 500 for the whole refresh.
         _discard_staged(staging, base_name)
         raise FetchError(f"not a usable {kind} file ({type(exc).__name__}: {exc})") from exc
+    if kind in _NETEX_KINDS:
+        new_state["structure"] = await asyncio.to_thread(
+            _structure_check, final, previous.get("structure")
+        )
     return FetchResult(status="fetched", path=final, size_bytes=size, sha256=sha, state=new_state)
+
+
+def _structure_check(path: Path, previous: Any) -> dict[str, Any]:
+    """Fingerprint + assessment of a downloaded NeTEx file (app/netex_structure.py).
+    Never fails the download: a check that cannot run is itself a warning."""
+    before = previous.get("fingerprint") if isinstance(previous, dict) else None
+    try:
+        fp = netex_structure.fingerprint(path)
+        result = netex_structure.assess(fp, before)
+    except Exception as exc:  # corrupt member, odd encoding… the format check already passed
+        log.warning("NeTEx structure check failed for %s: %s", path.name, exc)
+        failed = netex_structure.Assessment()
+        failed.add(netex_structure.WARN, f"structure check could not run: {exc}")
+        return {"checked_at": _now_iso(), "fingerprint": before, "assessment": failed.to_state()}
+    return {"checked_at": _now_iso(), "fingerprint": fp.to_state(), "assessment": result.to_state()}

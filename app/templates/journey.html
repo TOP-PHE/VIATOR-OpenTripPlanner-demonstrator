@@ -392,6 +392,9 @@
 <script src="/static/app/js/compare_grid.js"></script>
 <script>
 const SUGGEST_MIN = 2;
+// The station list (POST /api/stations/suggest) needs 3 characters, the rule
+// of the station module's search; the MOTIS geocoder keeps SUGGEST_MIN.
+const STATION_SUGGEST_MIN = 3;
 
 // Helpers used by the From/To typeahead. Extracted from setupAutocomplete
 // to keep the keystroke handler's cognitive complexity below Sonar's S3776
@@ -417,14 +420,17 @@ function _mergeSuggestions(fromStations, fromMotis) {
   return out;
 }
 
+// Station names come from third-party feeds and are stored as they come:
+// both the name and the country go through escHTML (hoisted, below) before
+// they reach innerHTML.
 function _suggestionHtml(s, i) {
   const country = s.country_iso
-    ? ` <span style="color:var(--rail-steel)">[${s.country_iso}]</span>`
+    ? ` <span style="color:var(--rail-steel)">[${escHTML(s.country_iso)}]</span>`
     : '';
   const transit = s.source === 'motis'
     ? ' <span style="color:var(--rail-steel);font-size:0.75em">(transit)</span>'
     : '';
-  return `<div class="suggestion" data-i="${i}">${s.name}${country}${transit}</div>`;
+  return `<div class="suggestion" data-i="${i}">${escHTML(s.name)}${country}${transit}</div>`;
 }
 
 // Tolerant fetch — typeahead must never reject the keystroke handler with
@@ -441,6 +447,22 @@ async function _fetchJson(url) {
   }
 }
 
+// Same tolerance for a JSON POST: the station list takes the typed text in
+// the request body, never in the address. Returns [] on any failure.
+async function _postJson(url, body) {
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    return r.ok ? await r.json() : [];
+  } catch (err) {
+    console.warn('typeahead post failed:', url, err);
+    return [];
+  }
+}
+
 function setupAutocomplete(prefix) {
   const inp = document.getElementById(prefix + '-input');
   const box = document.getElementById(prefix + '-sug');
@@ -453,12 +475,24 @@ function setupAutocomplete(prefix) {
   // OSM filtering.
   const uic = document.getElementById(prefix + '-uic');
   let active = -1; let items = [];
+  // Sequence guard: each refresh takes a number, and only the latest one may
+  // write the list. An older, slower answer arriving late is dropped, so it
+  // can neither overwrite a newer list nor re-show a box that was cleared.
+  // A keystroke, a pick and a blur also move the number on, so an answer
+  // still in flight cannot re-open the box after any of them; a pick and a
+  // blur also cancel the debounce timer `t`, so a refresh still pending
+  // from the last keystroke cannot either.
+  let seq = 0;
+  let t;
 
   async function refresh() {
+    const mine = ++seq;
     const q = inp.value.trim();
     if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
     // Two parallel sources:
-    //   /api/master/stations — curated rail stations (Trainline ODbL).
+    //   /api/stations/suggest — rail stations from the station module, or
+    //                  VIATOR's own list (Trainline ODbL) when the module
+    //                  is not used or does not answer; from 3 characters.
     //   /api/geocode — MOTIS geocoder of the first serving MOTIS session,
     //                  unlocks urban-transit stops (BVB Basel trams,
     //                  Saint-Louis cross-border tram, etc.) that aren't
@@ -466,9 +500,12 @@ function setupAutocomplete(prefix) {
     //                  is serving, so behaviour degrades to "stations only".
     const qs = encodeURIComponent(q);
     const [fromStations, fromMotis] = await Promise.all([
-      _fetchJson(`/api/master/stations?q=${qs}&size=20`),
+      q.length >= STATION_SUGGEST_MIN
+        ? _postJson('/api/stations/suggest', {q})
+        : Promise.resolve([]),
       _fetchJson(`/api/geocode?q=${qs}&size=20`),
     ]);
+    if (mine !== seq) return;
     items = _mergeSuggestions(fromStations, fromMotis);
     if (!items.length) { box.classList.remove('show'); return; }
     box.innerHTML = items.map(_suggestionHtml).join('');
@@ -483,9 +520,10 @@ function setupAutocomplete(prefix) {
     const s = items[i];
     inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
     uic.value = s.uic || '';
+    ++seq; clearTimeout(t);
     box.classList.remove('show');
   }
-  let t; inp.addEventListener('input', () => {
+  inp.addEventListener('input', () => {
     // CRITICAL: when the operator edits the input text, the previously-
     // picked station's lat/lon become stale. Clear them so a submit
     // refuses with "Please pick both stations from the suggestions"
@@ -496,9 +534,12 @@ function setupAutocomplete(prefix) {
     if (inp.value.trim() !== name.value) {
       lat.value = ''; lon.value = ''; name.value = ''; uic.value = '';
     }
-    clearTimeout(t); t = setTimeout(refresh, 150);
+    ++seq; clearTimeout(t); t = setTimeout(refresh, 150);
   });
-  inp.addEventListener('blur', () => setTimeout(() => box.classList.remove('show'), 150));
+  inp.addEventListener('blur', () => {
+    ++seq; clearTimeout(t);
+    setTimeout(() => box.classList.remove('show'), 150);
+  });
   inp.addEventListener('keydown', e => {
     if (!box.classList.contains('show')) return;
     if (e.key === 'ArrowDown') { active = Math.min(active+1, items.length-1); paint(); e.preventDefault(); }

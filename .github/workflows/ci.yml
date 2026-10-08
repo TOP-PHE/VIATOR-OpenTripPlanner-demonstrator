@@ -129,13 +129,28 @@ jobs:
       #   entered, and we don't decrypt attacker-supplied JWE tokens.
       #   Re-evaluate when python-jose ships a fix, or if we ever adopt
       #   JWE / encrypted tokens.
+      #
+      # PYSEC-2024-232 / CVE-2024-33663 / GHSA-6c5p-j8vq-pqhj — python-jose 3.5.0
+      #   Algorithm confusion with OpenSSH ECDSA and other public-key
+      #   formats: an attacker signs an HS256 token using the server's
+      #   PUBLIC key as the HMAC secret. The PyPA and GHSA records list it
+      #   fixed in 3.4.0, but OSV began reporting 3.5.0 as affected, with no
+      #   fix version, around 2026-10-06; 3.5.0 is the latest release.
+      #   **Unreachable in VIATOR**: tokens are HS256, signed and verified
+      #   with the private `jwt_secret` only (app/auth/tokens.py); decode
+      #   pins `algorithms=[settings.jwt_alg]`, which is HS256
+      #   (app/settings.py; no deployment file overrides JWT_ALG); no public
+      #   key exists anywhere in the app. Re-evaluate if JWT ever moves to
+      #   RS*/ES* or a public-key verifier, or when python-jose ships a new
+      #   release (or migrate to PyJWT).
       - name: pip-audit (Python CVEs)
         run: |
           pip-audit --strict --vulnerability-service=osv \
             --ignore-vuln GHSA-wj6h-64fc-37mp \
             --ignore-vuln GHSA-3936-cmfr-pm3m \
             --ignore-vuln GHSA-6w46-j5rx-g56g \
-            --ignore-vuln PYSEC-2025-185
+            --ignore-vuln PYSEC-2025-185 \
+            --ignore-vuln PYSEC-2024-232
         continue-on-error: false
 
       # Audit-2026-05 P0 #4 (coverage floor — the L-effort test-writing
