@@ -105,6 +105,11 @@ services:
       JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:-false}
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost}
+      # Multimodal Station Mapping module (app/station_module.py). Empty = not
+      # used: the journey typeahead serves VIATOR's own station list. Web only;
+      # the worker is not given the token.
+      STATION_MODULE_URL: ${STATION_MODULE_URL:-}
+      STATION_MODULE_TOKEN: ${STATION_MODULE_TOKEN:-}
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
