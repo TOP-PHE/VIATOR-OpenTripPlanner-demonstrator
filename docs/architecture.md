@@ -159,7 +159,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 6. Self-registration: `POST /api/auth/register-request` **always returns 204** (no email enumeration); creates a `VerificationToken` storing only the *hash* while the raw token goes out in the magic link via `auth/email.py::send_verification_email` → `/confirm/<raw>` → `GET /api/auth/check-token` → `POST /api/auth/register-confirm` (10/hour), which creates the `User` at `REGISTRATION_DEFAULT_ROLE` and issues a JWT. Gated by the `REGISTRATION_OPEN` config key.
 7. Password reset mirrors that exactly: `password-reset-request` (5/hour, always 204) → `PasswordResetToken` with 2 h TTL → `/reset/<raw>` → `password-reset-confirm`.
 8. Observability SSO: nginx `auth_request` on `/grafana/` and `/prometheus/` hits `GET /api/auth/proxy-validate`, which returns 200 plus `X-Forwarded-User` / `X-Forwarded-Role` headers. The role is translated by `auth/grafana_role_map.py::viator_role_to_grafana` into Grafana's Admin/Editor/Viewer vocabulary, unknown roles falling back to Viewer. Deliberately separate from `/me` because it's hit at scrape frequency and must not be rate-limited.
-9. **Legacy surface still live:** `security.py::authed` (HTTP basic against `ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`. When `ADMIN_USER` is empty, `authed_or_none` returns `None` and `/` redirects to `/login` — this exists purely to avoid the browser's native basic-auth popup on a bare-hostname visit to a Phase-2 deployment.
+9. **Legacy surface still live:** `security.py::authed` (HTTP basic against `ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`. When `ADMIN_USER` is empty, `authed_or_none` returns `None` and `/` redirects to `/login` — this exists purely to avoid the browser's native basic-auth popup on a bare-hostname visit to a Phase-2 deployment. The credential exists only when both settings are non-empty: with either one empty, `authed` answers 401 to every request, so `/upload` is closed in Phase-2 mode.
 
 ---
 
@@ -217,7 +217,8 @@ JSON in the address bar.
 
 **Auth vocabulary** (`security.py`): `require_logged_in` = platform_admin ∪ content_manager ∪
 end_user; `require_content_manager` = admin ∪ CM; `require_platform_admin` = admin only.
-Legacy HTTP-basic (`ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`.
+Legacy HTTP-basic (`ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload` in `main.py`,
+and is off unless both are set.
 
 ### Route inventory
 
@@ -276,7 +277,7 @@ Legacy HTTP-basic (`ADMIN_USER`/`ADMIN_PASSWORD`) still guards `/` and `/upload`
 | GET | `/journey`, `/credentials` | Operator pages | redirect if anon |
 | GET | `/admin/users`, `/admin/config`, `/admin/sessions`, `/admin/reports`, `/admin/network-coverage`, `/admin/nap-catalogues` | Admin page shells | redirect if anon, 403 HTML if not admin |
 | GET | `/admin/master/stations` | Station registry page | admin or content_manager |
-| GET | `/`, POST `/upload` | Legacy Phase-1 upload UI (`main.py`) | HTTP basic |
+| GET | `/`, POST `/upload` | Legacy Phase-1 upload UI (`main.py`) | HTTP basic — off unless `ADMIN_USER` and `ADMIN_PASSWORD` are both set |
 | GET | `/healthz`, `/healthz/version` | Liveness + deployed image version | anon |
 
 ### How the fanout endpoint works
@@ -1500,12 +1501,15 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
 - **You cannot set a secret to the literal string `********`** — it is the no-change sentinel.
 - **Coverage runs freeze their config.** `execute_run` reads `CoverageConfig` once and holds it for the
   run's lifetime; changing a `COVERAGE_*` knob mid-run does nothing.
-- **Insecure `settings.py` defaults must be overridden in `.env`.** `admin_user="admin"`,
-  `admin_password="admin"`, `jwt_secret="change-me-in-prod-…"`, and `jwt_cookie_secure=False` (the
-  session cookie will be sent over plaintext until this is `True` behind TLS).
-- **The Phase-1 basic-auth surface is still live** on `/` and `/upload`. Setting `ADMIN_USER` empty
-  puts the deployment in "Phase-2 mode": `authed_or_none` returns `None` and `/` redirects to `/login`
-  instead of firing the browser's native basic-auth popup.
+- **Insecure `settings.py` defaults must be overridden in `.env`.** `jwt_secret="change-me-in-prod-…"`
+  and `jwt_cookie_secure=False` (the session cookie will be sent over plaintext until this is `True`
+  behind TLS). `admin_user` and `admin_password` default to empty, which leaves the legacy surface off.
+- **The Phase-1 basic-auth surface is still in the code** on `/` and `/upload`, and is live only when
+  `ADMIN_USER` and `ADMIN_PASSWORD` are both set. Setting `ADMIN_USER` empty puts the deployment in
+  "Phase-2 mode": `authed_or_none` returns `None` and `/` redirects to `/login` instead of firing the
+  browser's native basic-auth popup, and `/upload` answers 401 to everything. `ADMIN_USER` set with
+  `ADMIN_PASSWORD` empty is a misconfiguration: both routes refuse, and `main.py` logs
+  `legacy_basic_auth.locked` at boot.
 - **Bootstrap closes itself.** `POST /api/auth/bootstrap-platform-user` 403s permanently once any
   `platform_admin` row exists, so a forgotten `BOOTSTRAP_TOKEN` in `.env` is untidy, not an open door.
 - **Middleware ordering: verify before you rely on the comment.** Starlette's `add_middleware` inserts

@@ -22,9 +22,10 @@ class Settings(BaseSettings):
     inbox_dir: Path = Path("/data/inbox")
     graph_dir: Path = Path("/data/graphs")
 
-    # Phase-1 upload UI (HTTP basic auth — kept until journey UI lands)
-    admin_user: str = "admin"
-    admin_password: str = "admin"  # noqa: S105 — pydantic-settings default; operator MUST override via .env in prod
+    # Phase-1 upload UI (HTTP basic auth — kept until journey UI lands).
+    # Off unless BOTH are set; unset and empty mean the same thing (Phase-2 mode).
+    admin_user: str = ""
+    admin_password: str = ""
     max_upload_mb: int = 2048
     debounce_seconds: int = 1800
     # v0.1.32 — default bumped 12g → 24g. The 12g default fit when VIATOR
