@@ -129,6 +129,10 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install -r requirements-dev.txt
 pre-commit install && pre-commit install --hook-type pre-push
+# The pre-push hook is `mypy app/` (CI's command) as a `repo: local`, `language: system` hook (#327):
+# it runs the mypy on PATH, so push from this activated venv with requirements-dev.txt installed,
+# or it fails with "Executable `mypy` not found". Run it by hand:
+#   pre-commit run mypy --hook-stage pre-push --all-files
 
 # Test loop
 pytest                                              # unit + integration (integration skips without Postgres)
