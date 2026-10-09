@@ -100,7 +100,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
     `20260908_1200_null_pre_extid`; a re-sweep is required. §7 item 2
   - Canonical: `UIC:8503000`
   - Fallback: lat/lon rounded to ~110 m when no UIC available
-  - **Coverage hubs (`network_coverage_hubs` table) carry NO UIC column today** — no FK/join to `master_stations`. The Re-run link's `&from_uic=&to_uic=` (PR-202, merged) is wired but always resolves to empty string until a follow-up adds the column + backfill.
+  - **Coverage hubs (`network_coverage_hubs`) carry a nullable station code** (`uic`, `uic_origin` = `msmm` | `manual`, MSMM step 3, #332): proposed by the station module and confirmed by an administrator, or typed by hand; no FK/join to `master_stations` (a MERITS code need not be a Trainline `uic`). The Re-run link's `&from_uic=&to_uic=` (PR-202) carries it; it is empty for an unresolved hub. The coverage runner still routes by position and never calls the module.
 - **Timezones**: IANA names everywhere (`Europe/Zurich`, never `CET`/`CEST`)
 - **One timezone per coverage run**: `run.depart_at` is an instant anchored in that run's
   `window_timezone`, and `reference_date` is derived from it. `depart_at` is `timestamptz` so psycopg
@@ -479,8 +479,9 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
    - **Coordinates + name drive the resolution, offline and once**, with ambiguous cases surfaced for a
      human. Resolve a station once and it stays resolved; a threshold re-guesses on every cell of an
      8742-pair sweep and leaves no record of what it decided.
-   - Also gives PR-202's `&from_uic=` passthrough something real, and adds the `uic` column
-     `network_coverage_hubs` still lacks.
+   - The hubs' `uic` column exists since #332 (MSMM step 3: proposed through the station module,
+     confirmed by an administrator, or typed as `manual`), which PR-202's `&from_uic=` passthrough
+     now carries; the ÖBB code column and the offline resolution above remain to do.
    - Separately, populate `NetworkCoverageHub.modes`: #212 shipped the column and the R/T/M/B/C header
      band, but every hub renders `?`, so the band is decorative until something classifies them.
 

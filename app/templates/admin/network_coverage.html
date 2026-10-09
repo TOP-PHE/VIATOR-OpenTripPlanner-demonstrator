@@ -525,6 +525,18 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 .hub-form-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.8rem; }
 .hub-form-actions button { padding: 0.4rem 1rem; font-size: 0.85rem; cursor: pointer; }
 .hub-form-error { color: #cf222e; font-size: 0.8rem; margin-top: 0.4rem; min-height: 1.1em; }
+/* MSMM step 3 — station codes of the hubs: the code on each row, and the
+   proposals / check results of the station module under the tools. */
+.hub-row .hub-code { color: #5b6470; font-family: ui-monospace, monospace; font-size: 0.72rem; }
+.hub-codes-tools { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.3rem 0; }
+.hub-codes-tools button { padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; }
+.hub-codes { margin: 0.4rem 0; padding: 0.4rem; border: 1px solid #d0d7de; border-radius: 4px; font-size: 0.78rem; }
+.hub-codes-status { display: block; margin: 0 0 0.3rem; color: #5b6470; }
+.hub-codes-status.error { color: #cf222e; }
+.hub-code-item { padding: 0.25rem 0; border-bottom: 1px dotted #eaeef2; }
+.hub-code-item:last-child { border-bottom: none; }
+.hub-code-item label { display: block; font-weight: normal; margin-left: 0.6rem; }
+.hub-code-item .hub-code-note { color: #5b6470; margin-left: 0.6rem; }
 {% endblock %}
 
 {% block content %}
@@ -672,6 +684,25 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         </label>
         <button type="button" id="hubs-add-new">+ Add hub</button>
       </div>
+      {% if station_module_enabled %}
+      {# MSMM step 3 — station codes from the station module. Each click
+         costs at most 10 searches (propose) or one lookup of at most 10
+         (save) or 20 codes (check) on the administrator's own limits at the
+         module; nothing is written until he saves the codes he ticked. #}
+      <div class="hub-codes-tools">
+        <button type="button" id="hub-codes-resolve" title="Ask the station module for the codes of up to 10 hubs without one">Propose station codes</button>
+        <button type="button" id="hub-codes-check" title="Re-read the stored codes of up to 20 hubs in the station module">Check station codes</button>
+      </div>
+      <div id="hub-codes" class="hub-codes" hidden>
+        <output id="hub-codes-status" class="hub-codes-status"></output>
+        <div id="hub-codes-list"></div>
+        <div class="hub-codes-tools">
+          <button type="button" id="hub-codes-confirm" hidden>Save ticked codes</button>
+          <button type="button" id="hub-codes-next" hidden>Next hubs</button>
+          <button type="button" id="hub-codes-close">Close</button>
+        </div>
+      </div>
+      {% endif %}
       <div id="hubs-list">
         <em class="hint">Loading…</em>
       </div>
@@ -760,6 +791,11 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         <span class="hint" style="font-weight: normal">(matrix type band — e.g. "R+M"; blank = not yet classified)</span>
       </label>
       <input type="text" id="hub-form-modes" name="modes" maxlength="20" placeholder="R, T, M, B, C, or a combination like R+T">
+      <label for="hub-form-uic">Station code
+        <span class="hint" style="font-weight: normal">(the station module's code; a code typed here is marked "manual"; blank = none)</span>
+      </label>
+      <input type="text" id="hub-form-uic" name="uic" maxlength="20" autocomplete="off" spellcheck="false">
+      <p class="hint" id="hub-form-uic-origin" style="margin: 0.2rem 0 0; font-size: 0.72rem"></p>
       <p class="hub-form-error" id="hub-form-error"></p>
       <div class="hub-form-actions">
         <button type="button" data-action="hub-modal-close">Cancel</button>
@@ -1680,13 +1716,11 @@ async function openDetailModal(originId, destId, result) {
   const oLon = orig ? coord(orig.lon) : null;
   const dLat = dest ? coord(dest.lat) : null;
   const dLon = dest ? coord(dest.lon) : null;
-  // Coverage hubs don't carry a UIC today (no column, no join to
-  // master_stations), so orig.uic/dest.uic are always undefined and
-  // these resolve to ''. Wiring them through now is a no-op in behaviour
-  // but means the link picks up UIC-based routing automatically the
-  // moment hub rows gain a uic field — same "value or empty string"
-  // convention already used for the autocomplete-pick handler in
-  // journey.html (`uic.value = s.uic || '';`).
+  // Since MSMM step 3 a hub may carry a station code (`uic`, confirmed
+  // from the station module or typed by an administrator); an unresolved
+  // hub has none and these resolve to '' — the same "value or empty
+  // string" convention as the autocomplete-pick handler in journey.html
+  // (`uic.value = s.uic || '';`).
   const oUic = orig && orig.uic ? encodeURIComponent(orig.uic) : '';
   const dUic = dest && dest.uic ? encodeURIComponent(dest.uic) : '';
   const rerunLink =
@@ -2286,6 +2320,7 @@ const COUNTRY_NAMES = {
 
 let HUB_EDIT_MODE = 'create';   // 'create' | 'edit'
 let HUB_EDIT_ID = null;          // when 'edit', the slug being edited
+let HUB_EDIT_UIC = '';           // when 'edit', the station code as loaded
 
 async function loadHubs() {
   const showInactive = document.getElementById('hubs-show-inactive')?.checked || false;
@@ -2347,6 +2382,8 @@ function renderHubs(hubs) {
     `;
   }).join('');
 
+  fillHubCodes(list, hubs);
+
   // Wire row buttons.
   list.querySelectorAll('[data-edit-hub]').forEach(b => {
     b.addEventListener('click', () => openHubModal('edit', b.dataset.editHub));
@@ -2373,6 +2410,7 @@ function renderHubsTier(label, hubs) {
             <strong>${escHTML(h.short)}</strong> · ${escHTML(h.name)}
             ${h.region ? `<span class="hint" style="font-size: 0.7rem"> · ${escHTML(h.region)}</span>` : ''}
             <div class="hub-slug">${escHTML(h.id)} · ${h.lat.toFixed(4)}, ${h.lon.toFixed(4)}</div>
+            <div class="hub-code" data-code-for="${escHTML(h.id)}"></div>
           </div>
           <div class="hub-actions">
             ${h.is_active
@@ -2401,6 +2439,8 @@ function openHubModal(mode, hubId, prefillCountry) {
   const errEl = document.getElementById('hub-form-error');
   errEl.textContent = '';
   form.reset();
+  HUB_EDIT_UIC = '';
+  document.getElementById('hub-form-uic-origin').textContent = '';
 
   if (mode === 'create') {
     title.textContent = prefillCountry ? `Add ${prefillCountry} hub` : 'Add hub';
@@ -2427,6 +2467,9 @@ function openHubModal(mode, hubId, prefillCountry) {
         form.elements['lat'].value = h.lat;
         form.elements['lon'].value = h.lon;
         form.elements['sort_order'].value = h.sort_order;
+        form.elements['uic'].value = h.uic || '';
+        HUB_EDIT_UIC = h.uic || '';
+        document.getElementById('hub-form-uic-origin').textContent = hubCodeLabel(h);
       });
   }
   modal.hidden = false;
@@ -2452,6 +2495,12 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       lon: parseFloat(fd.get('lon')),
       sort_order: parseInt(fd.get('sort_order') || '100', 10),
     };
+    const typedUic = (fd.get('uic') || '').trim();
+    if (typedUic !== HUB_EDIT_UIC) {
+      // Sent only when changed, so saving a hub never turns a code
+      // confirmed from the station module into a "manual" one.
+      body.uic = typedUic || null;
+    }
     let url, method;
     if (HUB_EDIT_MODE === 'create') {
       body.id = fd.get('id');
@@ -2467,7 +2516,7 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
     });
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));
-      errEl.textContent = j.detail || `Failed (${r.status})`;
+      errEl.textContent = hubFormError(j.detail, r.status);
       return;
     }
     document.getElementById('hub-modal').hidden = true;
@@ -2478,6 +2527,13 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
     submitBtn.textContent = 'Save';
   }
 });
+
+// The error of a refused hub form: FastAPI's 422 detail is a list of
+// messages (the station code's rule among them), any other a sentence.
+function hubFormError(detail, status) {
+  if (Array.isArray(detail)) return detail.map(d => d.msg).join('; ');
+  return detail || `Failed (${status})`;
+}
 
 async function deleteHub(hubId) {
   if (!confirm(`Soft-delete hub "${hubId}"? It will be hidden from the matrix and new runs but historical runs that reference it will still render correctly.`)) return;
@@ -2531,6 +2587,219 @@ if (_hubsPanel) {
 }
 document.getElementById('hubs-show-inactive')?.addEventListener('change', loadHubs);
 document.getElementById('hubs-add-new')?.addEventListener('click', () => openHubModal('create'));
+
+// ──────────────────────────────────────────────────────────────────
+// MSMM step 3 — station codes of the hubs
+// ──────────────────────────────────────────────────────────────────
+// Every value that comes from the station module (names, codes) is put in
+// the page with textContent or as an input's value, never through
+// innerHTML: the module's names come from third-party feeds, stored as
+// they come.
+
+const HUB_CODES_API = '/api/admin/network-coverage/hubs';
+// The hubs already shown in this round, skipped by the next click.
+const HUB_CODES = { mode: null, skip: [], heldUntil: 0 };
+
+function hubCodeLabel(h) {
+  if (!h.uic) return 'No station code';
+  const origin = h.uic_origin === 'msmm' ? 'from the station module' : 'typed by hand';
+  return `Station code ${h.uic} (${origin})`;
+}
+
+// The code line of each hub row, as text (renderHubsTier leaves it empty).
+function fillHubCodes(list, hubs) {
+  const byId = new Map(hubs.map(h => [h.id, h]));
+  list.querySelectorAll('[data-code-for]').forEach(el => {
+    const h = byId.get(el.dataset.codeFor);
+    el.textContent = h ? hubCodeLabel(h) : '';
+  });
+}
+
+function hubCodesElement(tag, text, className) {
+  const el = document.createElement(tag);
+  if (text !== undefined) el.textContent = text;
+  if (className) el.className = className;
+  return el;
+}
+
+function hubCodesStatus(text, isError) {
+  const el = document.getElementById('hub-codes-status');
+  el.textContent = text;
+  el.classList.toggle('error', Boolean(isError));
+}
+
+// The buttons that call the module: disabled while a request runs, and
+// for the module's Retry-After after a 429.
+function setHubCodeButtons(disabled) {
+  ['hub-codes-resolve', 'hub-codes-check', 'hub-codes-confirm', 'hub-codes-next']
+    .map(id => document.getElementById(id))
+    .filter(Boolean)
+    .forEach(b => { b.disabled = disabled; });
+}
+
+function releaseHubCodeButtons() {
+  if (Date.now() >= HUB_CODES.heldUntil) setHubCodeButtons(false);
+}
+
+function holdHubCodeButtons(seconds) {
+  HUB_CODES.heldUntil = Date.now() + seconds * 1000;
+  setHubCodeButtons(true);
+  setTimeout(releaseHubCodeButtons, seconds * 1000);
+}
+
+async function postHubCodes(path, body) {
+  setHubCodeButtons(true);
+  try {
+    const r = await fetch(`${HUB_CODES_API}/${path}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (r.ok) return await r.json();
+    return { status: 'unavailable', message: `The request failed (${r.status}); nothing was changed.` };
+  } catch (err) {
+    console.warn(`hub codes: POST ${path} failed`, err);
+    return { status: 'unavailable', message: 'The request failed; nothing was changed.' };
+  } finally {
+    releaseHubCodeButtons();
+  }
+}
+
+// The common part of every answer: its sentence, and the wait after a 429.
+function showHubCodesAnswer(answer, okText) {
+  if (answer.status === 'limited') {
+    holdHubCodeButtons(answer.retry_after || 60);
+  }
+  hubCodesStatus(answer.status === 'ok' ? okText : answer.message, answer.status !== 'ok');
+}
+
+function openHubCodes(mode) {
+  HUB_CODES.mode = mode;
+  document.getElementById('hub-codes').hidden = false;
+  document.getElementById('hub-codes-list').replaceChildren();
+  document.getElementById('hub-codes-confirm').hidden = true;
+  document.getElementById('hub-codes-next').hidden = true;
+  hubCodesStatus(mode === 'resolve' ? 'Asking the station module…' : 'Checking the codes…');
+}
+
+function showHubCodesNext(left, label) {
+  const next = document.getElementById('hub-codes-next');
+  next.hidden = !Number.isFinite(left) || left <= 0;
+  next.textContent = `${label} (${left} left)`;
+}
+
+// One candidate of a proposal: a tick box (proposed) or a choice (to pick).
+function hubCandidateInput(proposal, candidate, kind) {
+  const label = document.createElement('label');
+  const input = document.createElement('input');
+  input.type = kind;
+  input.name = `hub-code-${proposal.hub_id}`;
+  input.value = candidate.uic;
+  input.dataset.hubId = proposal.hub_id;
+  label.append(input, ` ${candidate.name} · ${candidate.uic} · ${candidate.country_iso || '?'} · ${candidate.distance_m} m`);
+  return label;
+}
+
+// The "leave it" choice of a hub to pick, chosen at first: nothing is saved for it.
+function hubLeaveInput(proposal) {
+  const label = document.createElement('label');
+  const input = document.createElement('input');
+  input.type = 'radio';
+  input.name = `hub-code-${proposal.hub_id}`;
+  input.value = '';
+  input.checked = true;
+  label.append(input, ' Leave it');
+  return label;
+}
+
+function hubProposalItem(proposal) {
+  const item = hubCodesElement('div', undefined, 'hub-code-item');
+  item.append(hubCodesElement('strong', proposal.hub_name));
+  if (!proposal.candidates.length) {
+    item.append(hubCodesElement('div', 'No station within 300 m found by name: type the code in the hub form if you know it.', 'hub-code-note'));
+    return item;
+  }
+  const kind = proposal.state === 'proposed' ? 'checkbox' : 'radio';
+  if (kind === 'radio') {
+    item.append(hubCodesElement('div', 'Several stations within 300 m: pick one, or leave it.', 'hub-code-note'));
+  }
+  proposal.candidates.forEach(c => item.append(hubCandidateInput(proposal, c, kind)));
+  if (kind === 'radio') item.append(hubLeaveInput(proposal));
+  return item;
+}
+
+async function resolveHubCodes() {
+  openHubCodes('resolve');
+  const answer = await postHubCodes('resolve', { skip: HUB_CODES.skip });
+  const proposals = answer.proposals || [];
+  proposals.forEach(p => HUB_CODES.skip.push(p.hub_id));
+  const list = document.getElementById('hub-codes-list');
+  proposals.forEach(p => list.append(hubProposalItem(p)));
+  showHubCodesAnswer(answer, proposals.length
+    ? 'Tick the codes to keep, then save. Nothing is stored before you save.'
+    : 'Every active hub has a station code, or has been looked at.');
+  document.getElementById('hub-codes-confirm').hidden = !proposals.some(p => p.candidates.length);
+  showHubCodesNext(answer.left, 'Propose for the next hubs');
+}
+
+async function confirmHubCodes() {
+  const ticked = Array.from(document.querySelectorAll('#hub-codes-list input:checked'))
+    .filter(input => input.value !== '');
+  const pairs = Array.from(ticked, input => ({ hub_id: input.dataset.hubId, uic: input.value }));
+  if (!pairs.length) {
+    hubCodesStatus('Tick at least one code.', true);
+    return;
+  }
+  const answer = await postHubCodes('confirm', { pairs });
+  const results = answer.results || [];
+  const stored = results.filter(r => r.state === 'stored').length;
+  const refused = results.length - stored;
+  showHubCodesAnswer(answer, `${stored} code(s) saved` + (refused ? `, ${refused} not served by the station module (left as they were).` : '.'));
+  if (answer.status === 'ok') {
+    ticked.forEach(input => { input.closest('.hub-code-item')?.remove(); });
+    await loadHubs();
+  }
+}
+
+function hubCheckItem(result) {
+  const item = hubCodesElement('div', undefined, 'hub-code-item');
+  item.append(hubCodesElement('strong', `${result.hub_name} · ${result.uic}`));
+  const note = result.state === 'not_served'
+    ? 'The station module does not serve this code (any more).'
+    : `The station module names it "${result.module_name}".`;
+  item.append(hubCodesElement('div', note, 'hub-code-note'));
+  return item;
+}
+
+async function checkHubCodes() {
+  openHubCodes('check');
+  const answer = await postHubCodes('check', { skip: HUB_CODES.skip });
+  const results = answer.results || [];
+  results.forEach(r => HUB_CODES.skip.push(r.hub_id));
+  const shown = results.filter(r => r.state !== 'ok');
+  const list = document.getElementById('hub-codes-list');
+  shown.forEach(r => list.append(hubCheckItem(r)));
+  showHubCodesAnswer(answer, `${results.length} code(s) checked, ${shown.length} to look at. Nothing was changed.`);
+  showHubCodesNext(answer.left, 'Check the next hubs');
+}
+
+// A button of the tools starts a new round; "next" goes on with this one.
+function startHubCodes(run) {
+  HUB_CODES.skip = [];
+  run();
+}
+
+document.getElementById('hub-codes-resolve')?.addEventListener('click', () => startHubCodes(resolveHubCodes));
+document.getElementById('hub-codes-check')?.addEventListener('click', () => startHubCodes(checkHubCodes));
+document.getElementById('hub-codes-confirm')?.addEventListener('click', confirmHubCodes);
+document.getElementById('hub-codes-next')?.addEventListener('click', () => {
+  (HUB_CODES.mode === 'check' ? checkHubCodes : resolveHubCodes)();
+});
+document.getElementById('hub-codes-close')?.addEventListener('click', () => {
+  document.getElementById('hub-codes').hidden = true;
+  HUB_CODES.mode = null;
+  HUB_CODES.skip = [];
+});
 
 // Reuse the toast plumbing from the rest of the admin pages — copy
 // the minimal version here so this template doesn't depend on

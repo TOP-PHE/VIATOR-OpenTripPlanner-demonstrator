@@ -1,27 +1,35 @@
 """Client of the Multimodal Station Mapping module (MSMM).
 
 The module is a separate service on VIATOR's Docker network. It answers
-two calls VIATOR uses, under `/internal/v1/`, reached at
+three calls VIATOR uses, under `/internal/v1/`, reached at
 `settings.station_module_url` (normally `http://msmm-web:8000`, plain HTTP
 inside the network like VIATOR's calls to MOTIS):
 
 - `search(q, user_id)` — `POST /internal/v1/stations/search`, at most ten
   stations whose name or MERITS code matches `q`. Used by the journey
   typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
+  `search_outcome(q, user_id)` is the same call in its detailed form (an
+  `Outcome`: the rows, the reason word, the `Retry-After` of a 429);
+  `search()` returns its rows. The coverage hubs' resolve route uses it.
+- `lookup(uics, user_id)` — `POST /internal/v1/stations/lookup`, the served
+  stations of 1 to 20 distinct MERITS codes, each with its `parent_uic`;
+  every code counts as one call on the person's limits. An `Outcome` too.
+  Used by the coverage hubs' confirm and check routes
+  (app/api/admin/network_coverage.py), never by the typeahead.
 - `attribution()` — `GET /internal/v1/attribution`, the licence text of the
   module's sources, kept 60 s. Asynchronous, like search, so that its
   deadline is real. Awaited by `journey_page` (app/api/pages.py) for the
   licence notice under the title of /journey.
 
-Both return `None` on any failure, and the caller then uses VIATOR's own
-behaviour (the master_stations list; no notice). VIATOR must keep working
-without the module.
+`search()` and `attribution()` return `None` on any failure, and the caller
+then uses VIATOR's own behaviour (the master_stations list; no notice).
+VIATOR must keep working without the module.
 
 Rules this client keeps on purpose:
 
 - **Its own headers, built from nothing.** `Authorization: Bearer <token>`,
-  `Accept-Encoding: identity`, `X-Viator-User-Id` (search only) and
-  `Content-Type: application/json` (search only). Nothing of the incoming request is ever forwarded, so a
+  `Accept-Encoding: identity`, `X-Viator-User-Id` (search and lookup) and
+  `Content-Type: application/json` (search and lookup). Nothing of the incoming request is ever forwarded, so a
   browser cannot set the user id: it comes from the JWT user of
   `require_logged_in`. `trust_env=False` keeps proxy variables and `.netrc`
   out of the call.
@@ -33,16 +41,20 @@ Rules this client keeps on purpose:
   the module during the pause, so a module that hangs costs one keystroke a
   timeout, not each. **No pause after 429, 422 or 503 `busy`**: those concern
   one request, and pausing on them would let one user switch the module off
-  for everyone.
-- **A real deadline and a size cap**: 1 s for a whole search, 0.5 s for an
-  attribution (httpx's timeouts bound each read, not the call), and a body
-  larger than 64 KiB (search) or 256 KiB (attribution) is refused unread;
+  for everyone. **A lookup never starts the pause** (but honours one that
+  runs): the pause protects every user's typeahead from a module that
+  hangs, and a rare admin action must not switch it off for everyone, in
+  particular when an older module answers 404 for the lookup's path.
+- **A real deadline and a size cap**: 1 s for a whole search or lookup, 0.5 s
+  for an attribution (httpx's timeouts bound each read, not the call), and a
+  body larger than 64 KiB (search, lookup) or 256 KiB (attribution) is refused unread;
   so is a compressed answer, which could inflate past the cap at once.
   All count as failures that pause. Any other error (a bad address, a
   token httpx cannot encode) falls back too, as `network`.
 - **A bad row is dropped, never the whole answer.**
 - **The log never holds the text, a body, the token or an exception's
-  text**: one line `station_module.fallback reason=<word>` per fallback.
+  text**: one line `station_module.fallback reason=<word>` per fallback
+  (`station_module.lookup_failed reason=<word>` for a lookup), never a code.
 """
 
 from __future__ import annotations
@@ -51,10 +63,13 @@ import asyncio
 import json
 import logging
 import math
+import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, TypeGuard
 
 import httpx
@@ -64,8 +79,21 @@ from .settings import settings
 log = logging.getLogger(__name__)
 
 SEARCH_PATH = "/internal/v1/stations/search"
+LOOKUP_PATH = "/internal/v1/stations/lookup"
 ATTRIBUTION_PATH = "/internal/v1/attribution"
 USER_HEADER = "X-Viator-User-Id"
+
+# A lookup: 1 to 20 distinct codes, each 3 to 20 characters (the module's
+# rule, its design 21.5 and 18.28 entry 256).
+LOOKUP_MAX = 20
+CODE_MIN = 3
+CODE_MAX = 20
+
+# The `Retry-After` of a 429 is kept when it is a plain number of seconds in
+# this range; a date, or anything else, gives None.
+RETRY_AFTER_MAX = 86_400
+# ASCII digits only: `\d` alone would also take digits of other scripts.
+_DIGITS = re.compile(r"\d{1,6}", re.ASCII)
 
 # The typeahead is on the keystroke path: one second at most for the whole
 # call (SEARCH_DEADLINE, enforced around it: httpx's own timeouts bound each
@@ -108,21 +136,39 @@ _QUIET_REASONS = frozenset({"off", "paused", "busy", "status_429"})
 clock: Callable[[], float] = time.monotonic
 
 
-class _Failure(Exception):
-    """A call that ends in the fallback: the reason word, and whether it pauses."""
+@dataclass(frozen=True)
+class Outcome:
+    """The detailed result of a search or a lookup.
 
-    def __init__(self, reason: str, *, pause: bool) -> None:
+    `rows`: the checked rows, or None on failure. `reason`: `ok`, or the
+    reason word of the failure (`off`, `paused`, `timeout`, `network`,
+    `status_<n>`, `busy`, `shape`). `retry_after`: on a 429, the whole
+    seconds of the module's `Retry-After` when it is a plain number from 1
+    to 86,400, else None."""
+
+    rows: list[dict[str, Any]] | None
+    reason: str
+    retry_after: int | None = None
+
+
+class _Failure(Exception):
+    """A call that ends in the fallback: the reason word, whether it pauses,
+    and the `Retry-After` of a 429."""
+
+    def __init__(self, reason: str, *, pause: bool, retry_after: int | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.pause = pause
+        self.retry_after = retry_after
 
 
 class _Answer:
-    """The status and the (capped) body of one answer of the module."""
+    """The status, the (capped) body and the `Retry-After` of one answer."""
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(self, status: int, body: bytes, retry_after: int | None = None) -> None:
         self.status = status
         self.body = body
+        self.retry_after = retry_after
 
 
 class _State:
@@ -155,6 +201,38 @@ def _paused() -> bool:
         return clock() < _state.paused_until
 
 
+def paused() -> bool:
+    """True while the pause after a failure runs: a caller can then answer
+    "the module did not answer" without making a call (the hub routes)."""
+    return _paused()
+
+
+def code_refused(code: str) -> str | None:
+    """Why a station code would be refused by the module's lookup, as one
+    word, or None. The module's own rule, mirrored (its design, 18.28 entry
+    256): a surrogate first, then a control character (category Cc, NUL, tab
+    and line end included), white space as Python counts it (a no-break space
+    included), and a length outside 3 to 20 characters. The word names the
+    rule, never the code."""
+    if any(unicodedata.category(character) == "Cs" for character in code):
+        return "surrogate"
+    if any(unicodedata.category(character) == "Cc" for character in code):
+        return "control character"
+    if any(character.isspace() for character in code):
+        return "white space"
+    if not CODE_MIN <= len(code) <= CODE_MAX:
+        return "length"
+    return None
+
+
+def _log_failure(event: str, reason: str) -> None:
+    # `off`, `paused`, 429 and `busy` are states or one-request refusals, not
+    # faults: INFO, so a VIATOR without the module, a paused one, or a busy
+    # one, does not fill the log with warnings.
+    level = logging.INFO if reason in _QUIET_REASONS else logging.WARNING
+    log.log(level, "%s reason=%s", event, reason)
+
+
 def _fail(failure: _Failure) -> None:
     """Log one fallback line, start the pause when the failure calls for it,
     and forget the cached attribution: a module that just failed shows no notice."""
@@ -162,11 +240,7 @@ def _fail(failure: _Failure) -> None:
         with _state.lock:
             _state.paused_until = clock() + PAUSE_SECONDS
             _state.attribution = None
-    # `off`, `paused`, 429 and `busy` are states or one-request refusals, not
-    # faults: INFO, so a VIATOR without the module, a paused one, or a busy
-    # one, does not fill the log with warnings.
-    level = logging.INFO if failure.reason in _QUIET_REASONS else logging.WARNING
-    log.log(level, "station_module.fallback reason=%s", failure.reason)
+    _log_failure("station_module.fallback", failure.reason)
 
 
 def _url(path: str) -> str:
@@ -205,7 +279,18 @@ async def _read(response: httpx.Response, limit: int) -> _Answer:
         body += chunk
         if len(body) > limit:
             raise _Failure("shape", pause=True)
-    return _Answer(response.status_code, bytes(body))
+    retry_after = _retry_after(response) if response.status_code == 429 else None
+    return _Answer(response.status_code, bytes(body), retry_after)
+
+
+def _retry_after(response: httpx.Response) -> int | None:
+    """The `Retry-After` of an answer as whole seconds, 1 to 86,400, when it
+    is a plain number; None for a date, an empty or any other value."""
+    value = response.headers.get("retry-after", "").strip()
+    if not _DIGITS.fullmatch(value):
+        return None
+    seconds = int(value)
+    return seconds if 1 <= seconds <= RETRY_AFTER_MAX else None
 
 
 def _error_code(answer: _Answer) -> str | None:
@@ -226,6 +311,8 @@ def _status_failure(answer: _Answer) -> _Failure:
         if code == "busy":
             return _Failure("busy", pause=False)
         return _Failure("status_503", pause=code in _PAUSING_503_CODES)
+    if status == 429:
+        return _Failure("status_429", pause=False, retry_after=answer.retry_after)
     return _Failure(f"status_{status}", pause=status in _PAUSING_STATUSES)
 
 
@@ -242,10 +329,23 @@ def _is_number(value: Any) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _plain(value: str) -> bool:
+    """True when the text holds no surrogate (Cs) and no control character
+    (Cc). A lone surrogate, which JSON can carry, cannot be written as UTF-8:
+    VIATOR's own JSON answer (or a database write) would fail with a 500."""
+    return not any(unicodedata.category(character) in ("Cs", "Cc") for character in value)
+
+
+def _text_or_null(value: Any) -> bool:
+    """True for None or a plain text (see `_plain`)."""
+    return value is None or (isinstance(value, str) and _plain(value))
+
+
 def _station_row(item: Any) -> dict[str, Any] | None:
     """One row of the module's answer as the typeahead reads it, or None when
     it is not a usable row. The name is kept as sent (it may hold markup: the
-    page escapes it)."""
+    page escapes it), but a row whose name, code or country holds a surrogate
+    or a control character is dropped."""
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -253,13 +353,13 @@ def _station_row(item: Any) -> dict[str, Any] | None:
     longitude = item.get("longitude")
     country = item.get("country_iso")
     uic = item.get("uic")
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str) or not name or not _plain(name):
         return None
     if not (_is_number(latitude) and _is_number(longitude)):
         return None
-    if country is not None and not isinstance(country, str):
+    if not _text_or_null(country):
         return None
-    if not isinstance(uic, str):
+    if not isinstance(uic, str) or not _plain(uic):
         return None
     return {
         "name": name,
@@ -286,18 +386,20 @@ def _stations(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-async def _post_search(q: str, user_id: uuid.UUID) -> _Answer:
+async def _post(path: str, payload: dict[str, Any], user_id: uuid.UUID) -> _Answer:
+    """One counted call (search or lookup): a POST of `payload` as JSON, on
+    behalf of `user_id`, within the search's deadline and size cap."""
     headers = {
         **_headers(),
         USER_HEADER: str(user_id),
         "Content-Type": "application/json",
     }
-    body = json.dumps({"q": q}).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8")
     try:
         async with (
             asyncio.timeout(SEARCH_DEADLINE),
             httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client,
-            client.stream("POST", _url(SEARCH_PATH), content=body, headers=headers) as response,
+            client.stream("POST", _url(path), content=body, headers=headers) as response,
         ):
             return await _read(response, SEARCH_MAX_BYTES)
     except (TimeoutError, httpx.TimeoutException):
@@ -306,24 +408,107 @@ async def _post_search(q: str, user_id: uuid.UUID) -> _Answer:
         raise _Failure("network", pause=True) from None
 
 
-async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
+async def search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
     """At most ten stations of the module for `q` (already normalised by the
-    caller), on behalf of the VIATOR user `user_id`; `None` on any failure."""
+    caller), on behalf of the VIATOR user `user_id`, as an `Outcome`: the
+    rows, or None with the reason word of the failure and, on a 429, the
+    module's `Retry-After`. The pause rules of `search()`, which wraps it."""
     try:
         if not enabled():
             raise _Failure("off", pause=False)
         if _paused():
             raise _Failure("paused", pause=False)
-        return _stations(_json_body(await _post_search(q, user_id)))
+        rows = _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
     except _Failure as failure:
         _fail(failure)
-        return None
+        return Outcome(None, failure.reason, failure.retry_after)
     except Exception:
         # Anything else (an address httpx refuses, a token it cannot encode, a
         # JSON parser error) falls back too, and its text is never logged: an
         # exception about a header can quote the token.
         _fail(_Failure("network", pause=True))
+        return Outcome(None, "network")
+    return Outcome(rows, "ok")
+
+
+async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
+    """At most ten stations of the module for `q` (already normalised by the
+    caller), on behalf of the VIATOR user `user_id`; `None` on any failure."""
+    return (await search_outcome(q, user_id)).rows
+
+
+def _checked_codes(uics: list[str]) -> list[str]:
+    """The codes of a lookup, or ValueError: 1 to 20 codes, all distinct as
+    written (capitals included), each passing `code_refused`. The module
+    would refuse the whole call otherwise, after counting it."""
+    if not 1 <= len(uics) <= LOOKUP_MAX:
+        raise ValueError(f"a lookup takes 1 to {LOOKUP_MAX} codes")
+    if len(set(uics)) != len(uics):
+        raise ValueError("a lookup takes each code once")
+    for code in uics:
+        if not isinstance(code, str) or code_refused(code) is not None:
+            raise ValueError("a code of the lookup is not one the module accepts")
+    return list(uics)
+
+
+def _lookup_row(item: Any, asked: set[str]) -> dict[str, Any] | None:
+    """One row of a lookup answer: a search row whose code was asked for,
+    plus `parent_uic` (a string or null); None when it is not a usable row."""
+    row = _station_row(item)
+    if row is None or row["uic"] not in asked:
         return None
+    parent = item.get("parent_uic")
+    if not _text_or_null(parent):
+        return None
+    row["parent_uic"] = parent
+    return row
+
+
+def _lookup_rows(payload: Any, codes: list[str]) -> list[dict[str, Any]]:
+    """The usable rows of a lookup answer, at most one per code asked; a
+    wrong top-level shape refuses the whole answer."""
+    stations = payload.get("stations") if isinstance(payload, dict) else None
+    if not isinstance(stations, list):
+        raise _Failure("shape", pause=False)
+    asked = set(codes)
+    rows: list[dict[str, Any]] = []
+    for item in stations:
+        row = _lookup_row(item, asked)
+        if row is not None:
+            asked.discard(row["uic"])
+            rows.append(row)
+    return rows
+
+
+async def lookup(uics: list[str], user_id: uuid.UUID) -> Outcome:
+    """The module's served stations of `uics` (1 to 20 distinct codes), on
+    behalf of the VIATOR user `user_id`, as an `Outcome`: at most one row per
+    code, with its `parent_uic`; a code the module does not serve is simply
+    absent. Each code counts as one call on the person's limits.
+
+    Codes the module would refuse (more than 20, a repeated code, a code that
+    fails `code_refused`) raise ValueError before any call: the caller sends
+    codes it stored or that the module proposed, each once.
+
+    **A failure never starts the pause** (the typeahead of every user must
+    not switch to the fallback because of an admin action); a pause that runs
+    is honoured (`paused`, no call). Failures are logged as
+    `station_module.lookup_failed reason=<word>`, never a code."""
+    codes = _checked_codes(uics)
+    try:
+        if not enabled():
+            raise _Failure("off", pause=False)
+        if _paused():
+            raise _Failure("paused", pause=False)
+        rows = _lookup_rows(_json_body(await _post(LOOKUP_PATH, {"uics": codes}, user_id)), codes)
+    except _Failure as failure:
+        _log_failure("station_module.lookup_failed", failure.reason)
+        return Outcome(None, failure.reason, failure.retry_after)
+    except Exception:
+        # As in search(): its text is never logged; and no pause.
+        _log_failure("station_module.lookup_failed", "network")
+        return Outcome(None, "network")
+    return Outcome(rows, "ok")
 
 
 def _short_text(value: Any) -> str:

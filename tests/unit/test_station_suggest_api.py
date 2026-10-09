@@ -429,6 +429,28 @@ def test_the_module_rows_pass_through_tagged_msmm(
     assert fallback.calls == []
 
 
+@pytest.mark.parametrize(
+    "field", ["name", "uic", "country_iso"], ids=["in-the-name", "in-the-code", "in-the-country"]
+)
+def test_a_module_row_holding_a_lone_surrogate_is_dropped_never_a_500(
+    client: TestClient, module_on: str, module: Module, fallback: Fallback, field: str
+) -> None:
+    """A module may write `\\ud800` in its JSON; such a row cannot be written
+    in VIATOR's UTF-8 answer and is dropped, the others served."""
+    broken = {**MODULE_ROW, "uic": "9900003", field: "Zz\ud800"}
+    body = json.dumps({"stations": [broken, MODULE_ROW]}).encode("ascii")
+    module.response = httpx.Response(
+        200, content=body, headers={"Content-Type": "application/json"}
+    )
+    _, cookies = _login()
+
+    answer = _post(client, {"q": "Zzville"}, cookies)
+
+    assert answer.status_code == 200
+    assert json.loads(answer.content.decode("utf-8")) == [{**MODULE_ROW, "source": "msmm"}]
+    assert fallback.calls == []
+
+
 def test_an_empty_answer_of_the_module_is_returned_as_it_is(
     client: TestClient, module_on: str, module: Module, fallback: Fallback
 ) -> None:

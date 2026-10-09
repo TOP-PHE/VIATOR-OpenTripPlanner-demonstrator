@@ -1280,6 +1280,8 @@ def test_resolve_hubs_returns_db_rows_when_present() -> None:
         lon=2.3553,
         is_active=True,
         sort_order=0,
+        uic=None,
+        uic_origin=None,
     )
     db = _MockDb(rows=[hub_row])
     out = _resolve_hubs(db)

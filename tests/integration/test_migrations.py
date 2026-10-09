@@ -12,11 +12,12 @@ without Postgres (e.g. a contributor's laptop without the stack up).
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from alembic import command
 
@@ -111,3 +112,99 @@ def test_downgrade_base_drops_everything(alembic_cfg: Config) -> None:
 
     remaining = set(inspect(engine).get_table_names()) - {"alembic_version"}
     assert not remaining, f"downgrade base left tables behind: {sorted(remaining)}"
+
+
+# ── 20261009_1200_hub_uic: a station code on the coverage hubs ──
+
+_BEFORE_HUB_UIC = "20261002_2100_rebuild_cancel"
+_HUB_UIC = "20261009_1200_hub_uic"
+
+
+def _hub_columns(engine: Any) -> set[str]:
+    return {column["name"] for column in inspect(engine).get_columns("network_coverage_hubs")}
+
+
+def _set_code(engine: Any, uic: str | None, origin: str | None) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE network_coverage_hubs SET uic = :uic, uic_origin = :origin WHERE id = 'zz-hub'"
+            ),
+            {"uic": uic, "origin": origin},
+        )
+
+
+def test_hub_uic_revision_up_down_up_and_its_check(alembic_cfg: Config) -> None:
+    """The revision adds two null columns to the existing hubs and writes
+    nothing else; the CHECK keeps a code and its origin together; the
+    downgrade drops both and keeps the hub; a second upgrade works."""
+    url = _postgres_or_skip()
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+
+    command.upgrade(alembic_cfg, _BEFORE_HUB_UIC)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO network_coverage_hubs (id, name, short, country, lat, lon) "
+                "VALUES ('zz-hub', 'ZZ Hub Central', 'ZZ Hub', 'ZZ', 45.5, 6.25)"
+            )
+        )
+
+    command.upgrade(alembic_cfg, _HUB_UIC)
+    assert {"uic", "uic_origin"} <= _hub_columns(engine)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT name, uic, uic_origin FROM network_coverage_hubs WHERE id = 'zz-hub'")
+        ).one()
+    assert tuple(row) == ("ZZ Hub Central", None, None)
+
+    for origin in ("msmm", "manual"):
+        _set_code(engine, "9900001", origin)
+    _set_code(engine, None, None)
+    _set_code(engine, "ZZ9", "manual")
+    _set_code(engine, "Z" * 20, "msmm")
+    refused = (
+        ("9900001", None),
+        ("9900001", "zz"),
+        (None, "msmm"),
+        (None, "manual"),
+        ("", "manual"),
+        ("ZZ", "msmm"),
+    )
+    for uic, origin in refused:
+        with pytest.raises(IntegrityError):
+            _set_code(engine, uic, origin)
+
+    _set_code(engine, "9900001", "manual")
+    command.downgrade(alembic_cfg, _BEFORE_HUB_UIC)
+    assert not {"uic", "uic_origin"} & _hub_columns(engine)
+    with engine.connect() as conn:
+        names = (
+            conn.execute(text("SELECT name FROM network_coverage_hubs WHERE id = 'zz-hub'"))
+            .scalars()
+            .all()
+        )
+    assert names == ["ZZ Hub Central"]
+
+    command.upgrade(alembic_cfg, "head")
+    assert {"uic", "uic_origin"} <= _hub_columns(engine)
+
+
+def test_the_models_check_is_the_revisions_check() -> None:
+    """The model's CHECK text and the revision's are the same rule, written twice."""
+    import importlib.util
+    from pathlib import Path
+
+    from app.models.network_coverage import UIC_ORIGIN_CHECK
+
+    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / f"{_HUB_UIC}.py"
+    spec = importlib.util.spec_from_file_location("hub_uic_revision", path)
+    assert spec is not None
+    assert spec.loader is not None
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    assert revision._CHECK == UIC_ORIGIN_CHECK
