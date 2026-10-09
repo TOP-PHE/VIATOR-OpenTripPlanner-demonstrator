@@ -48,6 +48,7 @@
   font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600;
   background: #fff8e6; color: #6b5416; border: 1px solid #f0c674; white-space: nowrap;
 }
+.depart-warn { margin: 0.25rem 0 0; font-size: 0.8rem; color: #5b6470; }
 .timing-strip { display:flex; gap: 1rem; flex-wrap: wrap; padding: 0.6rem; background: #eef2f8; border-radius: 4px; font-size: 0.8rem; color: var(--rail-steel); margin-bottom: 0.6rem; }
 .station-input { position: relative; }
 .suggestions { position: absolute; left: 0; right: 0; top: 100%; background: #fff; border: 1px solid var(--sleeper); border-top: none; max-height: 220px; overflow-y: auto; z-index: 10; display: none; }
@@ -244,7 +245,8 @@
     </div>
 
     <label>Depart</label>
-    <input type="datetime-local" id="depart" name="depart">
+    <input type="datetime-local" id="depart" name="depart" aria-describedby="depart-warn">
+    <p id="depart-warn" class="depart-warn" hidden>&#9888; This date is in the past: the timetables loaded in VIATOR may not cover it, and its engines then find nothing (ÖBB HAFAS may still answer).</p>
 
     {# P2 MOTIS — engine filter. Default "All engines" preserves the legacy
        fan-out-everywhere behaviour. Picking OTP or MOTIS restricts the
@@ -626,9 +628,29 @@ let _COMPARE_SIDE_BY_SIDE = (function () {
   });
 })();
 
+// The browser's local wall clock as `YYYY-MM-DDTHH:MM`, the format of a
+// datetime-local input. (toISOString() gives UTC: the default below used to be
+// one or two hours early in Paris, and on the previous day just after midnight.)
+function _localIsoMinutes(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// #338 — warn before searching when the chosen date is in the past: a
+// session's loaded timetable usually starts around the day it was built, so
+// VIATOR's engines may find nothing while ÖBB HAFAS still answers. A warning
+// only; the search still runs. (VIATOR does not know each session's window
+// in advance; MOTIS names it when it refuses, see the timing strip.)
+function _updateDepartWarning() {
+  const value = document.getElementById('depart').value;
+  const today = _localIsoMinutes(new Date()).slice(0, 10);
+  document.getElementById('depart-warn').hidden = !(value && value.slice(0, 10) < today);
+}
+
 // Default depart = now+10min
 const now = new Date(Date.now() + 10*60*1000);
-document.getElementById('depart').value = now.toISOString().slice(0,16);
+document.getElementById('depart').value = _localIsoMinutes(now);
+document.getElementById('depart').addEventListener('input', _updateDepartWarning);
 
 // v0.1.44 — pre-fill from URL query params so the "Re-run live in journey
 // UI" link from the network-coverage cell modal can hand off the exact
@@ -668,6 +690,7 @@ document.getElementById('depart').value = now.toISOString().slice(0,16);
   if (depart) {
     document.getElementById('depart').value = depart.slice(0, 16);
   }
+  _updateDepartWarning();
 })();
 
 document.getElementById('journey-form').addEventListener('submit', async (e) => {
@@ -1626,11 +1649,27 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   return `${_renderToggleControls()}${CompareGrid.renderGrid(cols, { variant: 'refs' })}`;
 }
 
+// #338 — a session whose engine refused the date says so ("date outside the
+// loaded timetable (loaded: … UTC)") instead of a bare "error" / "no_route".
+// `detail` is a fixed sentence built by the server, never the engine's text;
+// it is escaped all the same, like every field of the strip.
+function _execStatusText(e) {
+  return e.reason === 'outside_timetable' && e.detail ? e.detail : e.status;
+}
+
+function _noResultsHtml(payload) {
+  const refused = (payload.executions || [])
+    .filter((e) => e && e.reason === 'outside_timetable')
+    .map((e) => escHTML(e.session_id));
+  if (!refused.length) return '<p>No itineraries found.</p>';
+  return `<p>No itineraries found. The date is outside the timetable loaded in ${refused.join(', ')}.</p>`;
+}
+
 function render(payload) {
   _LAST_PAYLOAD = payload;
   const el = document.getElementById('results');
   const exec = payload.executions.map(e =>
-    `${e.session_id}: ${e.num_itineraries} trips in ${e.response_ms}ms (${e.status})`
+    `${escHTML(e.session_id)}: ${escHTML(e.num_itineraries)} trips in ${escHTML(e.response_ms)}ms (${escHTML(_execStatusText(e))})`
   ).join(' · ');
   // v0.1.26 — overall operator summary for the result set. Answers
   // "is Trenitalia in my results?" without expanding every card.
@@ -1708,7 +1747,7 @@ function render(payload) {
   // grid is rendered). "No itineraries found" only when nothing landed
   // anywhere — flat list, grid, federated, or side-by-side.
   const noResults =
-    (cards || comparisonGrid || federatedSection || sideBySideGrid) ? '' : '<p>No itineraries found.</p>';
+    (cards || comparisonGrid || federatedSection || sideBySideGrid) ? '' : _noResultsHtml(payload);
   el.innerHTML = `<div class="timing-strip">${exec}</div>${opSummary}${cmpStrip}${comparisonGridSlot}${cardsSlot}${sideBySideGrid}${noResults}${federatedSection}${ojpPanel}${hafasPanel}`;
   // Wire click-to-expand on every card. Toggle on each click; only one
   // open at a time keeps the scroll position predictable. OJP cards
