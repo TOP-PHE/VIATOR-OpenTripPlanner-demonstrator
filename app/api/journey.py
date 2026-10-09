@@ -33,8 +33,10 @@ class Coord(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     label: str | None = None
-    # UIC code from master_stations, set by the journey UI when the
-    # operator picks a station from the dropdown. When present, the
+    # Station code set by the journey UI when the operator picks a station
+    # from the dropdown: the station module's code when STATION_MODULE_URL
+    # is set (since MSMM step 2), else Trainline's `uic` from
+    # master_stations — the two may differ (issue #331). When present, the
     # server builds an OTP stop id (`<feedId>:<uic>`) and routes via
     # `planConnection`'s stopLocation input — bypassing the lat/lon →
     # walk-graph snap, which fails for small/border stations whose
