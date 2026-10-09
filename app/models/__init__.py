@@ -18,6 +18,7 @@ from .master import (
     MasterCarrier,
     MasterCarrierPendingDrift,
     MasterStation,
+    MasterStationEditArchive,
     MasterStationPendingDrift,
     RouteAlias,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "MasterCarrier",
     "MasterCarrierPendingDrift",
     "MasterStation",
+    "MasterStationEditArchive",
     "MasterStationPendingDrift",
     "McTOverride",
     "NapCatalogue",

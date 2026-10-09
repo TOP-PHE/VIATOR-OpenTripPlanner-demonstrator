@@ -2401,6 +2401,64 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
 - **To stop using the module**, empty `STATION_MODULE_URL` and recreate `web`
   the same way.
 
+### 11.1 Who is the reference for a station (MSMM step 3)
+
+- **The station module is the reference** for what a person sees and picks:
+  names, positions and codes. **Station edits are made only in the module**,
+  on its reference screen (platform administrators only). VIATOR has no
+  station edit and no drift queue any more, for content managers and
+  administrators alike. A content manager who finds a wrong station tells an
+  administrator.
+- **VIATOR's `master_stations` stays as the Trainline list**: the fallback
+  when the module does not answer, and the key of VIATOR's internal joins
+  (the federated planner, the country check of sessions, `stations_xref`),
+  which stay on Trainline's codes for now (VIATOR issue #331). The daily
+  Trainline import (04:00 UTC) keeps it fresh, as does **Refresh from
+  Trainline** on the Stations page.
+- **The Stations page** (`/admin/master/stations`, platform administrators
+  and content managers) is a search page: one field (at least 3 characters),
+  at most 10 results, no list, no paging, no total. Each search goes to the
+  module first and counts on the person's own limits there, the same counters
+  as his journey typeahead. Each result says where it comes from: **MSMM**, or
+  **Trainline** when the module is not used or did not answer (a notice says
+  so). A platform administrator gets an "open in the module" link on each MSMM
+  result. Nothing can be edited on the page.
+
+#### The archive of the edits made in VIATOR
+
+The release that removed VIATOR's station edits runs one database revision
+(`20261010_1200_edit_archive`) when the `web` container starts.
+**Take a database backup before deploying it** (5.2): it changes rows. In
+one transaction it copies every station row an operator had edited
+(`source = 'manual'`), with its pending drift row, into the table
+`master_stations_edit_archive`, then hands those rows back to the Trainline
+import (`source = 'trainline'`) and empties the drift queue. The next import
+gives them Trainline's values again. Nothing is deleted: the archive stays,
+and no screen shows it.
+
+The `web` start log gives the count, in one line:
+`station edit archive: <n> station row(s) archived in master_stations_edit_archive; ...`.
+If it is not 0, list the archive, from `/opt/viator/docker` (read only):
+
+```bash
+sudo docker compose exec -T postgres psql -U viator -d viator -c "SELECT a.uic, a.station->>'name' AS edited_name, a.station->>'country_iso' AS country, a.drift_fields, a.archived_at FROM master_stations_edit_archive AS a ORDER BY a.uic"
+```
+
+After the first import that follows, this line lists the archived rows
+whose edited values are still in the fallback list, because Trainline no
+longer carries their code (the import never deletes a row):
+
+```bash
+sudo docker compose exec -T postgres psql -U viator -d viator -c "SELECT a.uic, a.station->>'name' AS edited_name FROM master_stations_edit_archive AS a JOIN master_stations AS s ON s.uic = a.uic WHERE to_jsonb(s) - 'source' - 'updated_at' = a.station - 'source' - 'updated_at' ORDER BY a.uic"
+```
+
+For each edit that matters, find the station in the module by its search and
+correct it there with a hand correction; or let it go. To undo the whole
+step, the revision's downgrade (`alembic downgrade 20261009_1200_hub_uic`
+in the `web` container, after reverting the release) writes the archived
+values back over what an import wrote since, marks them `manual` again,
+recreates the drift rows and drops the archive.
+
 ---
 
 ## Index of related guides
