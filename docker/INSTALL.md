@@ -203,7 +203,7 @@ docker compose build
 
 Two images are produced/pulled:
 
-- `viator-web` (FastAPI admin app + worker share this image; ~280 MB) — `python:3.12-slim` + the docker CLI from `docker:29-cli` (multi-stage) + `requirements.txt` + `app/`
+- `viator-web` (FastAPI admin app + worker share this image; ~280 MB) — `python:3.14-slim` + the docker CLI from `docker:29-cli` (multi-stage) + `requirements.txt` + `app/`
 - `viator-otp` (Eclipse Temurin JRE 25 + OTP shaded jar; ~420 MB)
 
 If the OTP image build fails on the Maven download, the version pin is in `otp/Dockerfile` (`ARG OTP_VERSION=2.9.0`) — bump to a version that exists on Maven Central.

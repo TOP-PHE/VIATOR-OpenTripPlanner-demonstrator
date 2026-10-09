@@ -60,8 +60,8 @@ VIATOR is a **multi-tenant, multi-session journey-planning demonstrator** built 
 | Layer | Technology |
 |---|---|
 | Reverse proxy | nginx 1.27 |
-| Admin app | Python 3.12 + FastAPI 0.115 + Jinja2 + SQLAlchemy 2 |
-| Worker | Python 3.12 (same image as admin app, different command) |
+| Admin app | Python 3.14 + FastAPI 0.115 + Jinja2 + SQLAlchemy 2 |
+| Worker | Python 3.14 (same image as admin app, different command) |
 | Journey UI | Static HTML + MapLibre GL + vanilla JS, served by nginx |
 | Routing engine | OpenTripPlanner 2.9.0 on Java 25 (Eclipse Temurin) |
 | Database | Postgres 16 |
@@ -1840,7 +1840,7 @@ Every push to `main` (and every PR) runs the following without human action:
    │  CI workflow   │ │ Pre-commit job │ │ Docker workflow│
    │  ────────────  │ │ ────────────── │ │ ────────────── │
    │  • ruff        │ │  • runs all    │ │  • build web   │
-   │  • black       │ │    pre-commit  │ │  • build otp   │
+   │  • ruff format │ │    pre-commit  │ │  • build otp   │
    │  • mypy strict │ │    hooks fresh │ │  • hadolint    │
    │  • bandit      │ │    in CI to    │ │  • Trivy scan  │
    │  • pytest      │ │    catch drift │ │  • push GHCR   │
@@ -1865,32 +1865,32 @@ The deploy workflow (`deploy.yml`) is **manual on purpose** — see 15.10.
 
 | Tool | Version | Why this version | Where to get it |
 |---|---|---|---|
-| **Python** | **3.12.x** | CI uses 3.12; **3.14 has a known pip 26.1 incompatibility** (`AttributeError: module 'warnings' has no attribute '_add_filter'`). Stick to 3.12 locally. | https://www.python.org/downloads/release/python-3128/ |
+| **Python** | **3.14.x** | The web image's Python (`FROM python:3.14-slim`), and CI's since #325; work locally on the same version (`tests/unit/test_ci_python_is_the_image_python.py` keeps CI and the image together). | https://www.python.org/downloads/ |
 | Docker Desktop | latest | For local OTP + Postgres + the per-session compose stack | docker.com |
 | Git | 2.40+ | — | git-scm.com |
 | GitHub CLI (`gh`) | optional | Lets you tail CI logs without opening a browser. Useful but not required. | https://cli.github.com/ |
 | Node.js 22 | optional | Only if you'll touch the journey UI build (vanilla JS works fine without) | nodejs.org |
 
-> **Windows specific:** if the Python installer asks "Add Python to PATH", say yes. Otherwise the `Scripts/` folder containing `uvicorn.exe`, `black.exe`, etc. won't be reachable. You can fix it after the fact via System Properties → Environment Variables, adding `C:\Users\<you>\AppData\Local\Programs\Python\Python312\Scripts` to the user PATH.
+> **Windows specific:** if the Python installer asks "Add Python to PATH", say yes. Otherwise the `Scripts/` folder containing `uvicorn.exe`, `ruff.exe`, etc. won't be reachable. You can fix it after the fact via System Properties → Environment Variables, adding `C:\Users\<you>\AppData\Local\Programs\Python\Python314\Scripts` to the user PATH.
 
 #### 15.2.2 Install the project deps
 
 From the repo root:
 
 ```bash
-# Pick the right Python explicitly (Windows: py -3.12; macOS/Linux: python3.12)
-py -3.12 -m pip install -r requirements.txt          # runtime
-py -3.12 -m pip install -r requirements-dev.txt      # adds black, ruff, mypy, pytest, bandit, pre-commit
+# Pick the right Python explicitly (Windows: py -3.14; macOS/Linux: python3.14)
+py -3.14 -m pip install -r requirements.txt          # runtime
+py -3.14 -m pip install -r requirements-dev.txt      # adds ruff, mypy, pytest, bandit, pre-commit
 ```
 
-> **Don't upgrade pip if it warns you to.** The notice "A new release of pip is available: 24.3.1 -> 26.1" is **harmless on Python 3.12**, but pip 26.1 is broken on Python 3.14 — keep pip 24.x to be safe across machines.
+> **pip upgrade notices are harmless.** An earlier version of this guide warned that pip 26.1 broke on Python 3.14; that does not hold on 3.14 final releases (checked on 3.14.8 with pip 26.1 and 26.2), and the web image itself upgrades to pip >= 26.0 on 3.14 (`docker/web/Dockerfile`).
 
 #### 15.2.3 Verify the install
 
 A 5-second smoke check that doesn't need a database:
 
 ```bash
-py -3.12 -c "from app import main; print('OK')"
+py -3.14 -c "from app import main; print('OK')"
 ```
 
 If this prints `OK`, the import chain is healthy. If it raises, paste the traceback and fix before going further — CI will hit the same import error.
@@ -1898,10 +1898,10 @@ If this prints `OK`, the import chain is healthy. If it raises, paste the traceb
 #### 15.2.4 Install pre-commit hooks (recommended)
 
 ```bash
-py -3.12 -m pre_commit install
+py -3.14 -m pre_commit install
 ```
 
-This wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff/black/mypy/hadolint run automatically on staged files at commit time. **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway.
+This wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff (lint and format) and the basic file checks run automatically on staged files at commit time. The mypy hook is a pre-push hook and currently cannot run (#327); run `mypy app` yourself (15.3), as CI does. **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway.
 
 ### 15.3 Local quality gates — the same checks CI runs
 
@@ -1909,19 +1909,19 @@ Before you push, run these in order. Each takes seconds. CI will run identical c
 
 ```bash
 # 1. Lint
-py -3.12 -m ruff check .
+py -3.14 -m ruff check .
 
 # 2. Format check (do not auto-fix; just verify)
-py -3.12 -m black --check .
+py -3.14 -m ruff format --check .
 
 # 3. Type check (strict — every function must be fully typed)
-py -3.12 -m mypy --strict app
+py -3.14 -m mypy --strict app
 
 # 4. Security scan
-py -3.12 -m bandit -r app -ll
+py -3.14 -m bandit -r app -ll
 
 # 5. Tests (needs a Postgres on localhost:5432, see 15.4)
-py -3.12 -m pytest --cov=app --cov-report=xml
+py -3.14 -m pytest --cov=app --cov-report=xml
 ```
 
 If any of those fail, CI will fail in the same way. Fixing locally is faster than push-wait-fix-push loops.
@@ -1929,8 +1929,8 @@ If any of those fail, CI will fail in the same way. Fixing locally is faster tha
 **Auto-fix shortcuts:**
 
 ```bash
-py -3.12 -m ruff check . --fix      # fixes most lint issues automatically
-py -3.12 -m black .                 # rewrites files in place to satisfy black --check
+py -3.14 -m ruff check . --fix      # fixes most lint issues automatically
+py -3.14 -m ruff format .           # rewrites files in place to satisfy ruff format --check
 ```
 
 ### 15.4 Running tests against Postgres locally
@@ -1945,11 +1945,11 @@ docker run --rm -d --name viator-pg \
 
 # Run alembic migrations against it
 DATABASE_URL=postgresql+psycopg://postgres:ci@localhost:5432/viator_ci \
-    py -3.12 -m alembic upgrade head
+    py -3.14 -m alembic upgrade head
 
 # Run tests
 DATABASE_URL=postgresql+psycopg://postgres:ci@localhost:5432/viator_ci \
-    py -3.12 -m pytest -v
+    py -3.14 -m pytest -v
 
 # Tear down when done
 docker rm -f viator-pg
@@ -1959,11 +1959,11 @@ docker rm -f viator-pg
 
 ```
 .github/workflows/
-├── ci.yml              # ruff + black + mypy + bandit + pytest + coverage + (optional) SonarCloud
+├── ci.yml              # ruff + ruff format + mypy + bandit + pytest + coverage + (optional) SonarCloud
 └── docker.yml          # web + otp image build, hadolint, Trivy, GHCR push (matrix)
 
 .pre-commit-config.yaml # local + CI pre-commit hooks
-pyproject.toml          # ruff/black/mypy/pytest/coverage config (single source of truth)
+pyproject.toml          # ruff/mypy/pytest/coverage config (single source of truth)
 sonar-project.properties # SonarCloud project metadata
 .trivyignore            # CVE allow-list (see 15.8)
 ci/trivy-config-ignore.rego  # OPA policy for Trivy config-mode (Dockerfile) findings
@@ -1977,7 +1977,7 @@ Triggers: every PR + every push to `main`.
 
 Two jobs run in parallel:
 
-1. **`python`** — installs Python 3.12, brings up a Postgres 16 service container, runs ruff → black --check → mypy --strict → bandit → pytest → uploads `coverage.xml` as an artifact. If `SONARCLOUD_ENABLED=true`, also runs the SonarCloud scanner.
+1. **`python`** — installs Python 3.14 (the image's), brings up a Postgres 16 service container, runs ruff → ruff format --check → mypy --strict → bandit → pytest → uploads `coverage.xml` as an artifact. If `SONARCLOUD_ENABLED=true`, also runs the SonarCloud scanner.
 2. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`. This is the belt-and-braces job: it catches the case where `.pre-commit-config.yaml` and the standalone tool versions have drifted.
 
 A failure in either job makes the PR un-mergeable (assuming branch protection is enabled per 15.7.3).
@@ -2070,9 +2070,9 @@ The `docker.yml` workflow fails if Trivy reports any CRITICAL or HIGH CVE that h
 
 Six escape hatches, in order of preference:
 
-1. **Apply pending OS patches at build time.** Both Dockerfiles run `apt-get update && apt-get upgrade -y` because the base image tags (`eclipse-temurin:25-jre-noble`, `python:3.12-slim`) are rebuilt on a slower cadence than `debian-security-announce` / `ubuntu-security-announce` post fixes. **Most OS-package CVE findings clear with a clean rebuild** (no code change needed). If a build runs from cache and skips the apt steps, force a rebuild: in CI, push an empty commit; locally, `docker compose build --no-cache <service>`.
+1. **Apply pending OS patches at build time.** Both Dockerfiles run `apt-get update && apt-get upgrade -y` because the base image tags (`eclipse-temurin:25-jre-noble`, `python:3.14-slim`) are rebuilt on a slower cadence than `debian-security-announce` / `ubuntu-security-announce` post fixes. **Most OS-package CVE findings clear with a clean rebuild** (no code change needed). If a build runs from cache and skips the apt steps, force a rebuild: in CI, push an empty commit; locally, `docker compose build --no-cache <service>`.
 2. **Reduce the dependency surface.** If a package brings transitive deps you don't need, swap to a leaner equivalent. Example: the web image previously installed Debian's `docker.io` (daemon + CLI + tools, ~50 transitive deps) just so the worker could shell out to `docker` to spawn otp-build jobs. Replaced with a multi-stage `COPY --from=docker:27-cli /usr/local/bin/docker` — single static go binary, no apt deps. Big CVE surface reduction for the same functionality.
-3. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.12-slim` has a newer revision, pin to it.
+3. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.14-slim` has a newer revision, pin to it.
 4. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
 5. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
    ```
@@ -2099,17 +2099,18 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 | Hook | What it does | Auto-fix? |
 |---|---|---|
 | `ruff` | Lint | Yes (`--fix`) |
-| `ruff-format` | Equivalent of black, faster | Yes |
-| `black` | Format check | Yes (rewrites files) |
-| `mypy` (strict) | Type check on `app/` | No — manual fix required |
-| `hadolint` | Dockerfile lint | No |
+| `ruff-format` | Format (replaced black) | Yes |
+| `trailing-whitespace`, `end-of-file-fixer`, `check-yaml`, `check-toml`, `check-added-large-files`, `check-merge-conflict`, `detect-private-key` | Basic file checks | Partly (whitespace and end of file) |
+| `mypy` (strict, pre-push only) | Type check | No — and it currently cannot run (#327); CI runs `mypy app/` |
+
+Dockerfile lint (hadolint) is not a pre-commit hook: it runs in `docker.yml` (see the comment in `.pre-commit-config.yaml`).
 
 After installing hooks (see 15.2.4), they run on every `git commit`. A failed hook **aborts the commit** and prints the diff. Re-stage the auto-fixed files and commit again.
 
 To run them on the whole repo without committing:
 
 ```bash
-py -3.12 -m pre_commit run --all-files
+py -3.14 -m pre_commit run --all-files
 ```
 
 ### 15.10 Deployment to the VPS — manual on purpose
@@ -2151,8 +2152,8 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 
 | Failing step | Symptom | Fix |
 |---|---|---|
-| **`black --check`** | `would reformat path/to/file.py` | Run `py -3.12 -m black .` locally, commit, push. Black is opinionated by design — never argue with it. |
-| **`ruff check`** | Rule code + file:line + suggested fix | Most rules are auto-fixable: `py -3.12 -m ruff check . --fix`. For the rest, edit per the rule's docs at https://docs.astral.sh/ruff/rules/. |
+| **`ruff format --check`** | `Would reformat: path/to/file.py` | Run `py -3.14 -m ruff format .` locally, commit, push. The formatter is opinionated by design — never argue with it. |
+| **`ruff check`** | Rule code + file:line + suggested fix | Most rules are auto-fixable: `py -3.14 -m ruff check . --fix`. For the rest, edit per the rule's docs at https://docs.astral.sh/ruff/rules/. |
 | **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-requests`). Add to `requirements-dev.txt`, reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
 | **`mypy --strict`** "Returning Any from function declared to return X" | A typed function calls an untyped one | Wrap the return in an explicit cast: `result: str = untyped_call(...); return result`. Don't blanket-ignore. |
 | **`mypy --strict`** "Function 'count' could always be true in boolean context" | SQLAlchemy Row attribute clashes with `tuple.count` / `tuple.index` method | Rename the column label: `func.count().label("count")` → `func.count().label("n_executions")` and update the consumer. |
@@ -2161,8 +2162,8 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **`pytest`** Postgres connection refused | No Postgres on `localhost:5432` | Start one per 15.4, set `DATABASE_URL`. |
 | **`bandit`** new MEDIUM/HIGH finding | A real security issue | Fix the code. If genuinely a false positive, mark the line with `# nosec BXXX` + a comment. |
 | **`Trivy`** CRITICAL on the OTP image | Almost always a JRE base CVE | Bump `eclipse-temurin:25-jre-noble` digest in `docker/otp/Dockerfile`. If no fix available, use `--ignore-unfixed` (already on) — the build still passes. |
-| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | You're on Python 3.14 with pip 26.1 | Install Python **3.12** alongside 3.14: download from python.org, then use `py -3.12 -m pip` everywhere. |
-| **`ruff` / `black` / `pytest` not found** after `pip install` | Scripts directory not on PATH | Either add `…\Python312\Scripts` to PATH (15.2.1), or always invoke as `py -3.12 -m <tool>`. |
+| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | Reported with Python 3.14 and pip 26.1; not reproduced on 3.14.8 with pip 26.1 or 26.2 | Upgrade to the latest Python 3.14.x and pip (`py -3.14 -m pip install --upgrade pip`). Do not fall back to 3.12: CI and the image run 3.14 (#325). |
+| **`ruff` / `mypy` / `pytest` not found** after `pip install` | Scripts directory not on PATH | Either add `…\Python314\Scripts` to PATH (15.2.1), or always invoke as `py -3.14 -m <tool>`. |
 | **PowerShell** `&&` parser error | You're on Windows PowerShell 5.1 (no `&&` support) | Use `;` to chain unconditionally, or `; if ($?) { ... }` for "run B only if A succeeded". Or upgrade to PowerShell 7. |
 | **Git** "LF will be replaced by CRLF" warnings on Windows | Git's `core.autocrlf=true` rewriting line endings | **Harmless** — files in the repo stay LF, only the working copy gets CRLF. To silence: add a `.gitattributes` with `* text=auto eol=lf`. |
 | **GitHub Actions** "Node.js 20 actions are deprecated" | The action's runner uses Node 20 internally; June 2026 makes Node 24 the default, September 2026 removes Node 20. | **Already addressed.** All actions bumped to versions that ship Node 24 runners: `actions/checkout@v5`, `actions/setup-python@v6`, `actions/upload-artifact@v5`, `actions/download-artifact@v5`, `docker/setup-buildx-action@v4`, `docker/login-action@v4`, `docker/metadata-action@v6`, `docker/build-push-action@v7`, `github/codeql-action/upload-sarif@v4`, `SonarSource/sonarcloud-github-action@v5`, `hadolint/hadolint-action@v3.3.0`. If a future warning lists a different action, run `curl -fsSL https://api.github.com/repos/<owner>/<repo>/releases?per_page=3` to find the latest published tag and bump to it. |
@@ -2186,7 +2187,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | Test runner | pytest + pytest-asyncio + pytest-cov + httpx | 8.3.4 / 0.24.0 / 6.0.0 / 0.28.1 | `pyproject.toml` `[tool.pytest.ini_options]` |
 | Coverage | coverage.py (via pytest-cov) → `coverage.xml` | 7.13.5 | `pyproject.toml` `[tool.coverage.*]` |
 | Lint | ruff | 0.7.4 | `pyproject.toml` `[tool.ruff]` |
-| Format | black | 24.10.0 | `pyproject.toml` `[tool.black]` |
+| Format | ruff format | same as ruff | `pyproject.toml` `[tool.ruff.format]` |
 | Type | mypy (strict) | 1.13.0 | `pyproject.toml` `[tool.mypy]` |
 | Security (code) | bandit | 1.7.10 | `pyproject.toml` `[tool.bandit]` |
 | Security (deps) | pip-audit | 2.7.3 | command-line flags |
