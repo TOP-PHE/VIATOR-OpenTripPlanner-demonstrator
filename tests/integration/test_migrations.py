@@ -164,7 +164,17 @@ def test_hub_uic_revision_up_down_up_and_its_check(alembic_cfg: Config) -> None:
     for origin in ("msmm", "manual"):
         _set_code(engine, "9900001", origin)
     _set_code(engine, None, None)
-    for uic, origin in (("9900001", None), ("9900001", "zz"), (None, "msmm"), (None, "manual")):
+    _set_code(engine, "ZZ9", "manual")
+    _set_code(engine, "Z" * 20, "msmm")
+    refused = (
+        ("9900001", None),
+        ("9900001", "zz"),
+        (None, "msmm"),
+        (None, "manual"),
+        ("", "manual"),
+        ("ZZ", "msmm"),
+    )
+    for uic, origin in refused:
         with pytest.raises(IntegrityError):
             _set_code(engine, uic, origin)
 
@@ -181,3 +191,19 @@ def test_hub_uic_revision_up_down_up_and_its_check(alembic_cfg: Config) -> None:
 
     command.upgrade(alembic_cfg, "head")
     assert {"uic", "uic_origin"} <= _hub_columns(engine)
+
+
+def test_the_models_check_is_the_revisions_check() -> None:
+    """The model's CHECK text and the revision's are the same rule, written twice."""
+    import importlib.util
+    from pathlib import Path
+
+    from app.models.network_coverage import UIC_ORIGIN_CHECK
+
+    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / f"{_HUB_UIC}.py"
+    spec = importlib.util.spec_from_file_location("hub_uic_revision", path)
+    assert spec is not None and spec.loader is not None
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    assert revision._CHECK == UIC_ORIGIN_CHECK

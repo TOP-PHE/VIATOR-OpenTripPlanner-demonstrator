@@ -305,7 +305,8 @@ class NetworkCoverageResult(Base):
 # The CHECK of `network_coverage_hubs.uic_origin` (alembic 20261009_1200_hub_uic).
 UIC_ORIGIN_CHECK = (
     "(uic IS NULL AND uic_origin IS NULL) OR "
-    "(uic IS NOT NULL AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
+    "(uic IS NOT NULL AND char_length(uic) BETWEEN 3 AND 20 "
+    "AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
 )
 
 
@@ -357,7 +358,8 @@ class NetworkCoverageHub(Base):
     __table_args__ = (
         CheckConstraint("tier IN ('main','regional')", name="tier_valid"),
         # A code and its origin go together: both null (not resolved), or a
-        # code from the station module ('msmm') or typed by hand ('manual').
+        # code of 3 to 20 characters from the station module ('msmm') or typed
+        # by hand ('manual').
         CheckConstraint(UIC_ORIGIN_CHECK, name="uic_origin_valid"),
         Index("ix_network_coverage_hubs_country_tier", "country", "tier", "is_active"),
         Index("ix_network_coverage_hubs_active_sort", "is_active", "sort_order"),

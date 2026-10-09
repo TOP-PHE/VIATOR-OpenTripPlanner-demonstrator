@@ -8,7 +8,8 @@ Adds two nullable columns to `network_coverage_hubs`:
 - `uic_origin` (`String(8)`): `msmm` when an administrator confirmed it from
   a module answer, `manual` when an administrator typed it.
 
-and one CHECK: both null, or a code with an origin of `msmm` or `manual`.
+and one CHECK: both null, or a code of 3 to 20 characters (the station
+module's length rule) with an origin of `msmm` or `manual`.
 
 No foreign key to `master_stations`: a MERITS code need not be a Trainline
 `uic`. The migration writes nothing else and calls nothing: every existing
@@ -39,7 +40,8 @@ depends_on: str | Sequence[str] | None = None
 # is spelled out: `NULL IN (...)` is NULL, which a CHECK lets through.
 _CHECK = (
     "(uic IS NULL AND uic_origin IS NULL) OR "
-    "(uic IS NOT NULL AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
+    "(uic IS NOT NULL AND char_length(uic) BETWEEN 3 AND 20 "
+    "AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
 )
 
 
