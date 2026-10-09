@@ -36,7 +36,8 @@ OUTSIDE_TIMETABLE = "outside_timetable"
 _MOTIS_PHRASE = "is outside of loaded timetable window"
 # A MOTIS error longer than this is not the one recognised here.
 _MAX_MESSAGE = 400
-_STAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2})")
+# re.ASCII: `\d` is 0-9 only, not every Unicode digit.
+_STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", re.ASCII)
 
 
 @dataclass(frozen=True)

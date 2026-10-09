@@ -264,3 +264,9 @@ def test_otp_routing_errors_of_another_type_are_no_refusal(routing_errors: Any) 
 
 def test_otp_answer_that_is_not_an_object_is_no_refusal() -> None:
     assert from_otp_answer([]) is None  # type: ignore[arg-type]
+
+
+def test_only_ascii_digits_make_a_window_stamp() -> None:
+    # Arabic-Indic digits for 2031-03-01: `\d` without re.ASCII would accept them.
+    error = f"query time x {_PHRASE} [\u0662\u0660\u0663\u0661-03-01 00:00, 2031-05-30 00:00["
+    assert from_motis_refusal(_response(400, json={"error": error})) == OutsideTimetable()
