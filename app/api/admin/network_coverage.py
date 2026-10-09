@@ -811,6 +811,12 @@ def _module_refusal() -> str | None:
     return None
 
 
+# The refusals of the three station-code routes, for their OpenAPI answers.
+_HUB_CODE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    403: {"description": "Not a platform administrator, or not a VIATOR user."},
+}
+
+
 def _caller(admin: CurrentUser) -> uuid.UUID:
     """The administrator's VIATOR user id, on whose behalf the module is called."""
     if admin.id is None:  # pragma: no cover — require_platform_admin admits JWT users only
@@ -881,7 +887,7 @@ def _hubs_by_id(db: DbSession, ids: list[str]) -> dict[str, NetworkCoverageHub]:
     return {hub.id: hub for hub in rows.scalars().all()}
 
 
-@router.post("/hubs/resolve")
+@router.post("/hubs/resolve", responses=_HUB_CODE_RESPONSES)
 async def resolve_hub_codes(
     body: HubBatchRequest,
     db: Annotated[DbSession, Depends(get_db)],
@@ -924,7 +930,7 @@ async def resolve_hub_codes(
     return HubResolveResponse(status="ok", proposals=proposals, left=len(hubs) - len(proposals))
 
 
-@router.post("/hubs/confirm")
+@router.post("/hubs/confirm", responses=_HUB_CODE_RESPONSES)
 async def confirm_hub_codes(
     body: HubConfirmRequest,
     db: Annotated[DbSession, Depends(get_db)],
@@ -1000,7 +1006,7 @@ def _checked(hub: NetworkCoverageHub, row: dict[str, Any] | None) -> HubChecked:
     )
 
 
-@router.post("/hubs/check")
+@router.post("/hubs/check", responses=_HUB_CODE_RESPONSES)
 async def check_hub_codes(
     body: HubBatchRequest,
     db: Annotated[DbSession, Depends(get_db)],

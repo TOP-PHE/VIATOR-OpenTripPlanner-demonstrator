@@ -531,7 +531,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 .hub-codes-tools { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.3rem 0; }
 .hub-codes-tools button { padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; }
 .hub-codes { margin: 0.4rem 0; padding: 0.4rem; border: 1px solid #d0d7de; border-radius: 4px; font-size: 0.78rem; }
-.hub-codes-status { margin: 0 0 0.3rem; color: #5b6470; }
+.hub-codes-status { display: block; margin: 0 0 0.3rem; color: #5b6470; }
 .hub-codes-status.error { color: #cf222e; }
 .hub-code-item { padding: 0.25rem 0; border-bottom: 1px dotted #eaeef2; }
 .hub-code-item:last-child { border-bottom: none; }
@@ -694,7 +694,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         <button type="button" id="hub-codes-check" title="Re-read the stored codes of up to 20 hubs in the station module">Check station codes</button>
       </div>
       <div id="hub-codes" class="hub-codes" hidden>
-        <p id="hub-codes-status" class="hub-codes-status" role="status"></p>
+        <output id="hub-codes-status" class="hub-codes-status"></output>
         <div id="hub-codes-list"></div>
         <div class="hub-codes-tools">
           <button type="button" id="hub-codes-confirm" hidden>Save ticked codes</button>
@@ -2684,7 +2684,7 @@ function openHubCodes(mode) {
 
 function showHubCodesNext(left, label) {
   const next = document.getElementById('hub-codes-next');
-  next.hidden = !(left > 0);
+  next.hidden = !Number.isFinite(left) || left <= 0;
   next.textContent = `${label} (${left} left)`;
 }
 

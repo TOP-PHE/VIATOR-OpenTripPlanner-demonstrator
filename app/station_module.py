@@ -92,7 +92,8 @@ CODE_MAX = 20
 # The `Retry-After` of a 429 is kept when it is a plain number of seconds in
 # this range; a date, or anything else, gives None.
 RETRY_AFTER_MAX = 86_400
-_DIGITS = re.compile(r"[0-9]{1,6}")
+# ASCII digits only: `\d` alone would also take digits of other scripts.
+_DIGITS = re.compile(r"\d{1,6}", re.ASCII)
 
 # The typeahead is on the keystroke path: one second at most for the whole
 # call (SEARCH_DEADLINE, enforced around it: httpx's own timeouts bound each
