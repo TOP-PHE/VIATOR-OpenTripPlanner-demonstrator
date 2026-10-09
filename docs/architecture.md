@@ -252,6 +252,9 @@ and is off unless both are set.
 | GET/POST | `/api/admin/network-coverage/hubs` | List / create hub | platform_admin |
 | PATCH/DELETE | `.../hubs/{id}` | Edit / soft-delete hub | platform_admin |
 | POST | `.../hubs/derive` | Derive slug/short/country from name+coords (powers "+ Hub") | platform_admin |
+| POST | `.../hubs/resolve` | Station codes proposed by the station module for ≤10 unresolved hubs a click (one search each, candidates within 300 m); writes nothing | platform_admin |
+| POST | `.../hubs/confirm` | Store ≤10 accepted codes after one module lookup (`uic_origin='msmm'`) | platform_admin |
+| POST | `.../hubs/check` | Re-read ≤20 stored codes a click with one lookup; shows unserved codes and differing names; writes nothing | platform_admin |
 | GET/POST | `.../runs` | List runs / start a run (schedules `execute_run` as BackgroundTask) | platform_admin |
 | GET | `.../runs/{id}` | Run summary + every cell — the matrix poll (5 s) | platform_admin |
 | POST | `.../runs/{id}/stop` | Cooperative cancel; 409 if not `running` | platform_admin |
@@ -1755,7 +1758,9 @@ Uniqueness: `(run_id, origin_hub_id, dest_hub_id)`.
 
 `id` `String(64)` PK (slug) · `name` · `short` · `country` `String(2)` · `region` (free-form,
 drives header colouring) · `tier` CHECK `main`|`regional` · `lat`/`lon` · `is_active` (soft delete)
-· `sort_order` (default 100) · `created_at` / `updated_at`.
+· `sort_order` (default 100) · `created_at` / `updated_at` · `uic` `String(20)` and `uic_origin`
+`String(8)`, both null or both set, CHECK `uic_origin_valid`: `uic` 3 to 20 characters and origin
+`msmm` (confirmed from the station module) or `manual` (typed); no FK to `master_stations`.
 
 It became a table at v0.1.31 because *"waiting on a code release + Docker build + tag push for every
 'I want to add Köln to the matrix' is a velocity tax we don't need."* `app/network_coverage/hubs.py`
