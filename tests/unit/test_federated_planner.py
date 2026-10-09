@@ -726,6 +726,13 @@ def _delta(before):
     return {o: after[o] - before[o] for o in after if after[o] != before[o]}
 
 
+@pytest.fixture
+def live_log(monkeypatch):
+    # alembic's fileConfig (run by the integration tests) disables every logger
+    # that exists at that moment; this one must be live for caplog.
+    monkeypatch.setattr(fp.log, "disabled", False)
+
+
 def _assert_log_has_no_code(caplog):
     text = " ".join(r.getMessage() for r in caplog.records)
     for code in (_ORIGIN, _HUB, _DEST, "9900009"):
@@ -740,7 +747,7 @@ def test_ends_lacking_words(origin_lacks, dest_lacks, word):
     assert fp._ends_lacking(origin_lacks, dest_lacks) == word
 
 
-async def test_counter_check1_code_not_served(monkeypatch, caplog):
+async def test_counter_check1_code_not_served(monkeypatch, caplog, live_log):
     sessions = _zz_sessions(monkeypatch)
     _recording_otp(monkeypatch)
     before = _counts()
@@ -758,7 +765,7 @@ async def test_counter_check1_code_not_served(monkeypatch, caplog):
     _assert_log_has_no_code(caplog)
 
 
-async def test_counter_check2_position_missing(monkeypatch, caplog):
+async def test_counter_check2_position_missing(monkeypatch, caplog, live_log):
     sessions = _zz_sessions(monkeypatch)
     _recording_otp(monkeypatch)
     before = _counts()
@@ -769,7 +776,7 @@ async def test_counter_check2_position_missing(monkeypatch, caplog):
     _assert_log_has_no_code(caplog)
 
 
-async def test_counter_no_shared_hub(monkeypatch, caplog):
+async def test_counter_no_shared_hub(monkeypatch, caplog, live_log):
     a = types.SimpleNamespace(id="zz-a")
     b = types.SimpleNamespace(id="zz-b")
     served = {"zz-a": {_ORIGIN}, "zz-b": {_DEST}}
@@ -781,7 +788,7 @@ async def test_counter_no_shared_hub(monkeypatch, caplog):
     assert "federated try ended" not in caplog.text  # only checks 1 and 2 log
 
 
-async def test_counter_planned_with_request_positions(monkeypatch, caplog):
+async def test_counter_planned_with_request_positions(monkeypatch, caplog, live_log):
     sessions = _zz_sessions(monkeypatch)
     _recording_otp(monkeypatch)
     before = _counts()
