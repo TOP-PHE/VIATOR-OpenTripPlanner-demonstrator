@@ -761,7 +761,7 @@ the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
 
 ### 5.5 Prometheus metrics (audit #14, since v0.1.32.15+)
 
-The web container exposes `/metrics` in Prometheus exposition format. Two
+The web container exposes `/metrics` in Prometheus exposition format. Three
 metric families:
 
 **HTTP metrics (auto-collected):**
@@ -784,6 +784,36 @@ so meta-traffic doesn't dilute application latency signals.
 
 A scrape costs a few ms — four indexed COUNT(*) queries against small
 tables. Default Prometheus scrape interval (15 s) is fine.
+
+**Federated planner (issue #331):**
+- `viator_federated_planner_tries_total{outcome}` — one increment per try of
+  the federated planner (the `/journey` fallback when no single session found
+  a trip and both stations carry a code) that reaches a decision. A try that
+  raises is not counted; the log shows it as "federated planner failed".
+  `outcome` is one of five fixed words:
+  - `code_not_served` — an endpoint code is in no session's feed (check 1);
+  - `no_shared_hub` — the sessions of the two ends share no station;
+  - `position_missing` — an endpoint has a position neither in
+    `master_stations` nor in the request (check 2);
+  - `planned_master_positions` — the try went to OTP with both endpoint
+    positions from `master_stations`;
+  - `planned_request_positions` — the try went to OTP with at least one
+    endpoint position taken from the request, because `master_stations` had
+    no position for that code.
+
+  The label never holds a station code or name. Checks 1 and 2 also write one
+  log line, e.g. `federated try ended: code_not_served (destination)`.
+
+  Reading the mismatch share (what decision 60 of the station module's step 3
+  waits for before moving VIATOR's internal lookups off Trainline's codes):
+  with `T = sum(increase(viator_federated_planner_tries_total[30d]))`, the
+  share of tries whose code the feeds do not know is
+  `increase(...{outcome="code_not_served"}[30d]) / T`, and the share whose
+  code `master_stations` does not place is
+  `(increase(...{outcome="planned_request_positions"}[30d]) + increase(...{outcome="position_missing"}[30d])) / T`.
+  Both counts include codes that were already unknown before the station
+  module; compare with a period before `STATION_MODULE_URL` was set when one
+  is available.
 
 #### Securing the endpoint
 
