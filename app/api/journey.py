@@ -194,16 +194,21 @@ async def _query_session(
             to_stop_id=_stop_id_for(session, body.to.uic),
             session_timezone=_session_timezone(session),
         )
-        elapsed = int((time.monotonic() - start) * 1000)
         refusal = None if trips else timetable_window.from_otp_answer(raw)
-        return ("ok" if trips else "no_route"), raw, trips, elapsed, refusal
+        status = "ok" if trips else "no_route"
+        return status, raw, trips, _elapsed_ms(start), refusal
     except (TimeoutError, httpx.TimeoutException):
-        return "timeout", {}, [], int((time.monotonic() - start) * 1000), None
+        return "timeout", {}, [], _elapsed_ms(start), None
     except httpx.HTTPStatusError as exc:
         refusal = timetable_window.from_motis_refusal(exc.response)
-        return "error", {}, [], int((time.monotonic() - start) * 1000), refusal
+        return "error", {}, [], _elapsed_ms(start), refusal
     except httpx.HTTPError:
-        return "error", {}, [], int((time.monotonic() - start) * 1000), None
+        return "error", {}, [], _elapsed_ms(start), None
+
+
+def _elapsed_ms(start: float) -> int:
+    """Milliseconds since `start`, a `time.monotonic()` reading."""
+    return int((time.monotonic() - start) * 1000)
 
 
 async def _query_ojp_reference(
