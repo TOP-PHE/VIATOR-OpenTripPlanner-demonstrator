@@ -635,8 +635,10 @@ async def test_plan_federated_uses_request_positions_for_codes_master_lacks(monk
     assert out[0]["via_hubs"] == [_HUB]
     assert out[0]["stitched_from_sessions"] == ["zz-origin", "zz-dest"]
     leg1, leg2 = calls
-    assert leg1["from"] == _REQUEST_ORIGIN and leg1["to"] == _MASTER_HUB
-    assert leg2["from"] == _MASTER_HUB and leg2["to"] == _REQUEST_DEST
+    assert leg1["from"] == _REQUEST_ORIGIN
+    assert leg1["to"] == _MASTER_HUB
+    assert leg2["from"] == _MASTER_HUB
+    assert leg2["to"] == _REQUEST_DEST
     # the code still routes by stop id; OTP falls back to the position if unknown
     assert leg1["from_stop_id"] == f"ZZA:{_ORIGIN}"
     assert leg2["to_stop_id"] == f"ZZB:{_DEST}"
