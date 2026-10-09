@@ -1,330 +1,201 @@
 {% extends "_base.html" %}
-{% block title %}Master stations — VIATOR admin{% endblock %}
+{% block title %}Stations — VIATOR admin{% endblock %}
+
+{% block extra_styles %}
+  .station-search { margin-bottom: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .station-search input[type="search"] { flex: 1; min-width: 220px; }
+  .station-status { display: block; margin-bottom: 0.4rem; }
+  .station-results td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Origin labels. Contrast on their backgrounds: 7.9:1 and 6.6:1 (WCAG AA needs 4.5:1). */
+  .origin { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
+  .origin-msmm { background: #e6f0fa; color: #174a78; }
+  .origin-trainline { background: #eef0f3; color: #4a5562; }
+{% endblock %}
 
 {% block content %}
-<h1>Master stations</h1>
-<p style="color: var(--rail-steel); max-width: 720px">
-  UIC-keyed registry of European passenger stations, seeded from the
-  <a href="https://github.com/trainline-eu/stations" target="_blank" rel="noopener">Trainline open dataset</a> (ODbL).
-  Local edits flip the row's <code>source</code> to <code>manual</code> and prevail over future Trainline updates;
-  upstream changes to those rows are surfaced in the drift queue below.
+<h1>Stations</h1>
+<p class="hint" style="max-width: 760px">
+  The station module (MSMM) is the reference for a station: names, positions
+  and codes. Corrections are made in the module, not here. VIATOR's own list,
+  imported from the
+  <a href="https://github.com/trainline-eu/stations" target="_blank" rel="noopener">Trainline open dataset</a>
+  (ODbL), is the fallback when the module does not answer, and the key of
+  VIATOR's internal joins. A search shows at most 10 stations.
 </p>
 
-<form id="search-form" style="margin-bottom: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center">
-  <input id="q" placeholder="search by name / UIC" style="flex: 1; min-width: 200px">
-  <input id="country" placeholder="country (FR, DE, IT…)" maxlength="2" style="width: 140px">
-  <label class="hint" title="Context mode: jump to the page where matches appear, with neighbours visible. Filter mode: hide non-matching rows.">
-    <input type="checkbox" id="context-mode" checked>
-    show in context
-  </label>
+<form id="search-form" class="station-search" role="search">
+  <label for="q" class="hint">Station name or code</label>
+  <input id="q" name="q" type="search" minlength="3" maxlength="100" autocomplete="off"
+         placeholder="at least 3 characters">
   <button type="submit">Search</button>
-  <button type="button" id="clear-btn" class="secondary">Clear</button>
-  <button type="button" id="refresh-btn" class="secondary">Refresh from Trainline</button>
+  <button type="button" id="refresh-btn" class="secondary"
+          title="Import the latest Trainline list, VIATOR's fallback">Refresh from Trainline</button>
 </form>
 
-<details class="card" style="margin-bottom: 1rem">
-  <summary style="cursor: pointer; font-weight: 600">Pending drift (<span id="drift-count">…</span>)</summary>
-  <div id="drift-list" style="margin-top: 0.5rem">Loading…</div>
-</details>
-
-<div id="results-meta" class="hint" style="margin-bottom: 0.4rem"></div>
-<div id="results-scroll" class="stations-scroll">
-  <div id="results">Loading…</div>
-</div>
-<div id="pagination" class="pagination-bar"></div>
+<output id="status" class="hint station-status" for="q"></output>
+<p id="notice" class="msg"></p>
+<div id="results" class="station-results"></div>
 
 <div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 220px"></div>
-
-<style>
-  .stations-scroll { max-height: min(60vh, 640px); overflow-y: auto; border: 1px solid var(--rail-border, #d0d7de); border-radius: 4px; }
-  .stations-scroll table { margin: 0; }
-  .stations-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--rail-bg, #f6f8fa); box-shadow: inset 0 -1px 0 var(--rail-border, #d0d7de); }
-  tr.match-row { background: #fff8c4; }
-  tr.match-row.flash { animation: matchflash 1.4s ease-out; }
-  @keyframes matchflash {
-    0%   { background: #ffe066; box-shadow: 0 0 0 2px #ffd43b inset; }
-    60%  { background: #fff3b0; box-shadow: 0 0 0 2px transparent inset; }
-    100% { background: #fff8c4; }
-  }
-  .pagination-bar { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.6rem; font-size: 0.9rem; }
-  .pagination-bar button { padding: 0.25rem 0.6rem; }
-  .pagination-bar input.page-jump { width: 4.5rem; text-align: right; }
-  .pagination-bar .pos { color: var(--rail-steel); }
-  mark.q-hit { background: #ffe066; color: inherit; padding: 0 1px; border-radius: 2px; }
-  /* Operator code badges (one row in master_stations table). Dense, scannable.
-     Each badge is two pills joined: operator name (steel grey) + code value
-     (mono font, slightly highlighted). */
-  .op-code { display: inline-flex; align-items: stretch; margin: 1px 4px 1px 0; font-size: 0.72rem; font-family: ui-monospace, Menlo, Consolas, monospace; line-height: 1.2; border-radius: 3px; overflow: hidden; }
-  .op-code .op-name { background: #e7eaef; color: #4a5562; padding: 1px 5px; }
-  .op-code .op-val  { background: #f5f7f9; color: #1a2230; padding: 1px 6px; border: 1px solid #e7eaef; border-left: 0; }
-</style>
 {% endblock %}
 
 {% block extra_scripts %}
 <script>
-const toast = document.getElementById('toast');
-function showToast(kind, t){ toast.className='msg show '+kind; toast.textContent=t; setTimeout(()=>toast.className='msg',3500); }
+// The Stations page (MSMM step 3): a search, never a list. Every value that
+// comes from the module or from Trainline goes in as text (textContent, an
+// attribute), never as HTML.
+const MODULE_ENABLED = {{ 'true' if station_module_enabled else 'false' }};
+// "open in the module" links: platform administrators only, and only when
+// VIATOR uses the module (its screens admit administrators only).
+const MODULE_LINKS = {{ 'true' if (station_module_enabled and current_user.role == 'platform_admin') else 'false' }};
+const MODULE_REFERENCE = '/msmm/admin/stations/reference';
+const QUERY_MIN = 3;
 
-// Pagination state — preserved across searches/page flips. Gets reset
-// when the search query changes (so a new search lands on its match
-// page rather than the page index from the previous query).
-const PAGE_SIZE = 50;
-let currentPage = 0;
-let lastQuery = null;
-let lastCountry = null;
-// Set by the pagination controls just before they load a page: the operator
-// asked for that page by number, so it is sent as it is, page 0 included. Any
-// other load sends no page, and a context search then lands on the page of its
-// first match. Page 0 used to double as "no page asked for", which made
-// « First and typing 1 in the page box silent no-ops during a context search.
-let pagePinned = false;
-
-function takePinnedPage(queryChanged) {
-  // A new query is a fresh search whatever control started it.
-  const pinned = pagePinned && !queryChanged;
-  pagePinned = false;
-  return pinned;
-}
-
-function showPage(n) {
-  pagePinned = true;
-  return loadStations({page: n, flashMatches: false});
-}
-
-function escHTML(s) { return (s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
-
-// Operator-code label map — keeps the UI label decoupled from the
-// JSONB key name so we can rename underlying keys without churning the
-// display. Mirrors the values in app/master/trainline.py::_OTHER_CODES_COL_MAP.
-const OPERATOR_CODE_LABELS = {
-  // Dedicated columns
-  trigramme_sncf: 'SNCF',
-  db_code: 'DB',
-  trenitalia_code: 'Trenitalia',
-  renfe_code: 'Renfe',
-  atoc_code: 'ATOC',
-  // JSONB keys
-  obb: 'ÖBB',
-  sbb: 'SBB',
-  entur: 'Entur',
-  ntv: 'Italo (NTV)',
-  trenord: 'Trenord',
-  cercanias: 'Cercanías',
-  benerail: 'Benerail',
-  westbahn: 'Westbahn',
-  flixbus: 'Flixbus',
-  busbud: 'Busbud',
-  distribusion: 'Distribusion',
-  iata: 'IATA',
+const NOTICES = {
+  msmm: 'Stations from the station module, the reference. Corrections are made in the module.',
+  fallback: "The station module did not answer; these results come from VIATOR's Trainline list, used as a fallback.",
 };
+const LABELS = {msmm: 'MSMM', trainline: 'Trainline'};
 
-function operatorBadges(s) {
-  // Render every populated operator code as a small badge. Dedicated
-  // columns (trigramme_sncf etc.) and other_codes JSONB keys are merged
-  // into one display so the operator sees the full set without caring
-  // about storage layout.
-  const codes = [];
-  for (const [field, label] of Object.entries(OPERATOR_CODE_LABELS)) {
-    let val;
-    if (field in s) {
-      val = s[field];
-    } else if (s.other_codes && field in s.other_codes) {
-      val = s.other_codes[field];
-    }
-    if (val) codes.push({label, value: String(val)});
+const statusLine = document.getElementById('status');
+const notice = document.getElementById('notice');
+const results = document.getElementById('results');
+const toast = document.getElementById('toast');
+
+function showToast(kind, text) {
+  toast.className = 'msg show ' + kind;
+  toast.textContent = text;
+  setTimeout(() => { toast.className = 'msg'; }, 3500);
+}
+
+function setNotice(kind, text) {
+  notice.className = text ? 'msg show ' + kind : 'msg';
+  notice.textContent = text || '';
+}
+
+function moduleLink(code) {
+  const link = document.createElement('a');
+  link.href = MODULE_REFERENCE + '?q=' + encodeURIComponent(code);
+  link.textContent = 'open in the module';
+  return link;
+}
+
+function cell(text, className) {
+  const td = document.createElement('td');
+  td.textContent = text;
+  if (className) td.className = className;
+  return td;
+}
+
+function position(station) {
+  const {latitude, longitude} = station;
+  if (typeof latitude !== 'number' || typeof longitude !== 'number') return '—';
+  return latitude.toFixed(5) + ', ' + longitude.toFixed(5);
+}
+
+function stationRow(station, origin) {
+  const tr = document.createElement('tr');
+  tr.appendChild(cell(station.name || '—'));
+  tr.appendChild(cell(station.country_iso || '—'));
+  const code = cell('');
+  if (station.uic) {
+    const tag = document.createElement('code');
+    tag.textContent = station.uic;
+    code.appendChild(tag);
+  } else {
+    code.textContent = '—';
   }
-  if (!codes.length) return '<span style="color: var(--rail-steel); font-size: 0.85rem">—</span>';
-  return codes.map(c =>
-    `<span class="op-code" title="${escAttr(c.label)}: ${escAttr(c.value)}"><span class="op-name">${escHTML(c.label)}</span><span class="op-val">${escHTML(c.value)}</span></span>`
-  ).join('');
+  tr.appendChild(code);
+  tr.appendChild(cell(position(station), 'num'));
+  const label = document.createElement('span');
+  label.className = 'origin origin-' + origin;
+  label.textContent = LABELS[origin];
+  const labelCell = cell('');
+  labelCell.appendChild(label);
+  tr.appendChild(labelCell);
+  if (MODULE_LINKS) {
+    const linkCell = cell('');
+    if (origin === 'msmm' && station.uic) linkCell.appendChild(moduleLink(station.uic));
+    tr.appendChild(linkCell);
+  }
+  return tr;
 }
 
-function escAttr(s) { return (s || '').toString().replace(/"/g, '&quot;'); }
-
-function highlightSubstring(text, q) {
-  // Wrap occurrences of `q` in <mark> for visual scanning. Case-insensitive
-  // but preserves the original casing in the result. q is escaped before
-  // building the regex so things like "Saint-Étienne" don't blow up.
-  if (!q) return escHTML(text);
-  const safe = escHTML(text);
-  const qEsc = escHTML(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return safe.replace(new RegExp(qEsc, 'gi'), m => `<mark class="q-hit">${m}</mark>`);
-}
-
-async function loadStations({page = 0, flashMatches = true} = {}) {
-  const q = document.getElementById('q').value.trim();
-  const c = document.getElementById('country').value.trim();
-  const ctxMode = document.getElementById('context-mode').checked;
-
-  // Reset to page 0 if the query changed — gives the user "find this and
-  // jump to it" behaviour when they type something new.
-  const queryChanged = q !== lastQuery || c !== lastCountry;
-  const pinned = takePinnedPage(queryChanged);
-  if (queryChanged) page = 0;
-  lastQuery = q; lastCountry = c; currentPage = page;
-
-  const params = new URLSearchParams();
-  if (q) params.set('q', q);
-  if (c) params.set('country', c);
-  params.set('mode', ctxMode ? 'context' : 'filter');
-  // Only a page the operator asked for is sent: see pagePinned.
-  if (pinned) params.set('page', String(page));
-  params.set('size', String(PAGE_SIZE));
-
-  const r = await fetch('/api/master/stations?' + params.toString());
-  if (!r.ok) {
-    document.getElementById('results').innerHTML =
-      `<em class="hint">Failed to load stations (${r.status}). Try logging in again.</em>`;
+function render(answer) {
+  const origin = answer.origin === 'msmm' ? 'msmm' : 'trainline';
+  const stations = Array.isArray(answer.stations) ? answer.stations : [];
+  if (origin === 'msmm') setNotice('success', NOTICES.msmm);
+  else if (MODULE_ENABLED) setNotice('warning', NOTICES.fallback);
+  else setNotice('', '');
+  results.replaceChildren();
+  if (!stations.length) {
+    statusLine.textContent = 'No station found.';
     return;
   }
-  const rows = await r.json();
-  const total = parseInt(r.headers.get('X-Total-Count') || '0', 10);
-  const matchCount = parseInt(r.headers.get('X-Match-Count') || '0', 10);
-  // Server tells us which page the first match is on — use it to align
-  // currentPage when we pinned no page and the server jumped us to a
-  // match page. (Otherwise the pagination footer would say "page 1"
-  // when we're actually viewing page 12.)
-  const matchPage = r.headers.get('X-Match-Page');
-  if (matchPage !== null && q && ctxMode && !pinned) {
-    currentPage = parseInt(matchPage, 10);
+  statusLine.textContent = stations.length + (stations.length === 1 ? ' station' : ' stations');
+  const table = document.createElement('table');
+  const head = table.createTHead().insertRow();
+  const headings = ['Name', 'Country', 'Code', 'Position', 'Origin'];
+  if (MODULE_LINKS) headings.push('');
+  for (const heading of headings) {
+    const th = document.createElement('th');
+    th.textContent = heading;
+    head.appendChild(th);
   }
+  const body = table.createTBody();
+  for (const station of stations) body.appendChild(stationRow(station, origin));
+  results.appendChild(table);
+}
 
-  const head = '<tr><th>UIC</th><th>Name</th><th>Country</th><th>Operator codes</th><th>Source</th><th></th></tr>';
-  const body = rows.map(s => `<tr data-uic="${escHTML(s.uic)}" class="${s.is_match ? 'match-row' : ''}">
-    <td><code>${highlightSubstring(s.uic, q)}</code></td>
-    <td>${highlightSubstring(s.name, q)}${s.has_drift ? ' <span class="flag SUBSET" style="font-size:0.65rem">DRIFT</span>' : ''}</td>
-    <td>${escHTML(s.country_iso) || '—'}</td>
-    <td>${operatorBadges(s)}</td>
-    <td><span style="font-size:0.75rem; color: var(--rail-steel)">${escHTML(s.source)}</span></td>
-    <td><button type="button" class="secondary" data-action="edit">Edit</button></td>
-  </tr>`).join('');
-  document.getElementById('results').innerHTML = `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
-  document.querySelectorAll('button[data-action="edit"]').forEach(b => b.addEventListener('click', editStation));
+function clearResults(message) {
+  results.replaceChildren();
+  setNotice('', '');
+  statusLine.textContent = message;
+}
 
-  // Header line: total count + match count + current page.
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const pageOneIndexed = currentPage + 1;
-  let meta = `${total.toLocaleString()} station${total === 1 ? '' : 's'} total`;
-  if (q) {
-    if (ctxMode) {
-      meta += ` · ${matchCount.toLocaleString()} match${matchCount === 1 ? '' : 'es'} for ${JSON.stringify(q)} (highlighted in yellow)`;
-    } else {
-      meta += ` · filtered to ${rows.length} on this page`;
-    }
-  }
-  meta += ` · page ${pageOneIndexed} of ${totalPages}`;
-  document.getElementById('results-meta').textContent = meta;
-
-  renderPagination(totalPages);
-
-  // If we jumped to a match page, scroll the first match into view inside
-  // the scroll container and flash it so the operator sees what got found.
-  if (flashMatches && q && ctxMode && rows.some(r => r.is_match)) {
-    requestAnimationFrame(() => {
-      const firstMatch = document.querySelector('tr.match-row');
-      if (firstMatch) {
-        firstMatch.scrollIntoView({block: 'center', behavior: 'smooth'});
-        firstMatch.classList.add('flash');
-        setTimeout(() => firstMatch.classList.remove('flash'), 1500);
-      }
+async function search(q) {
+  statusLine.textContent = 'Searching…';
+  let answer;
+  try {
+    answer = await fetch('/api/master/stations/search', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({q}),
     });
-  } else {
-    // No match flash needed → scroll the table back to its top so the
-    // user sees the start of the new page.
-    document.getElementById('results-scroll').scrollTop = 0;
+  } catch (error) {
+    clearResults('The search failed: VIATOR did not answer (' + error.name + ').');
+    return;
   }
+  if (answer.status === 422) {
+    clearResults('Type 3 to 100 characters, without control characters.');
+    return;
+  }
+  if (!answer.ok) {
+    clearResults('The search failed (' + answer.status + '). Try logging in again.');
+    return;
+  }
+  render(await answer.json());
 }
 
-function renderPagination(totalPages) {
-  const p = document.getElementById('pagination');
-  const cur = currentPage;
-  const last = totalPages - 1;
-  const btn = (label, target, disabled = false, title = '') =>
-    `<button type="button" class="secondary" ${disabled ? 'disabled' : ''} data-page="${target}" title="${escHTML(title)}">${label}</button>`;
-  p.innerHTML = [
-    btn('« First', 0, cur === 0, 'first page'),
-    btn('‹ Prev', Math.max(0, cur - 1), cur === 0, 'previous page'),
-    `<span class="pos">page</span>`,
-    `<input class="page-jump" type="number" min="1" max="${totalPages}" value="${cur + 1}" aria-label="jump to page">`,
-    `<span class="pos">of ${totalPages}</span>`,
-    btn('Next ›', Math.min(last, cur + 1), cur === last, 'next page'),
-    btn('Last »', last, cur === last, 'last page'),
-  ].join(' ');
-  // Wire up nav buttons.
-  p.querySelectorAll('button[data-page]').forEach(b => b.addEventListener('click', () => {
-    showPage(Number.parseInt(b.dataset.page, 10));
-  }));
-  // Jump-to-page on Enter.
-  const jump = p.querySelector('input.page-jump');
-  jump.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      let n = parseInt(jump.value, 10);
-      if (Number.isNaN(n)) return;
-      n = Math.max(1, Math.min(totalPages, n)) - 1;
-      showPage(n);
-    }
-  });
-}
-
-async function loadDrift() {
-  const r = await fetch('/api/master/stations/drift');
-  const rows = await r.json();
-  document.getElementById('drift-count').textContent = rows.length;
-  if (!rows.length) { document.getElementById('drift-list').innerHTML = '<em>No drift detected. Master data is up to date.</em>'; return; }
-  document.getElementById('drift-list').innerHTML = rows.map(d => `<div style="border-top: 1px solid var(--sleeper); padding: 0.6rem 0">
-    <strong>${d.uic}</strong> — fields differing: ${d.fields_differing.join(', ')}
-    <button type="button" class="secondary" data-uic="${d.uic}" data-action="keep">Keep ours</button>
-    <button type="button" class="secondary" data-uic="${d.uic}" data-action="adopt">Adopt Trainline</button>
-  </div>`).join('');
-  document.querySelectorAll('#drift-list button').forEach(b => b.addEventListener('click', resolveDrift));
-}
-
-async function resolveDrift(e) {
-  const uic = e.target.dataset.uic;
-  const action = e.target.dataset.action === 'keep' ? 'keep_ours' : 'adopt_full';
-  const r = await fetch(`/api/master/stations/${uic}/drift/resolve`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({action}),
-  });
-  if (r.ok) { showToast('success', `Resolved (${action}) for ${uic}`); loadDrift(); loadStations(); }
-  else showToast('error', 'Failed');
-}
-
-async function editStation(e) {
-  const row = e.target.closest('tr');
-  const uic = row.dataset.uic;
-  const name = prompt(`New name for ${uic}:`);
-  if (!name) return;
-  const r = await fetch(`/api/master/stations/${uic}`, {
-    method: 'PATCH', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({name}),
-  });
-  if (r.ok) { showToast('success', `Updated ${uic}`); loadStations(); }
-  else showToast('error', 'Failed');
-}
-
-document.getElementById('search-form').addEventListener('submit', e => { e.preventDefault(); loadStations({page: 0}); });
-document.getElementById('clear-btn').addEventListener('click', () => {
-  document.getElementById('q').value = '';
-  document.getElementById('country').value = '';
-  loadStations({page: 0, flashMatches: false});
+document.getElementById('search-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const q = document.getElementById('q').value.trim();
+  if (q.length < QUERY_MIN) {
+    clearResults('Type at least ' + QUERY_MIN + ' characters.');
+    return;
+  }
+  search(q);
 });
-// Re-run the search when the operator toggles context/filter mode so the
-// table layout matches expectations immediately without a manual click.
-document.getElementById('context-mode').addEventListener('change', () => {
-  loadStations({page: 0});
-});
+
 document.getElementById('refresh-btn').addEventListener('click', async () => {
-  if (!confirm('Refresh master_stations from the latest Trainline CSV? Manual edits are preserved.')) return;
-  const r = await fetch('/api/master/stations/refresh-trainline', {method: 'POST'});
-  if (r.ok) {
-    const counts = await r.json();
-    showToast('success', `+${counts.added} added · ${counts.updated} updated · ${counts.skipped_manual} kept manual · ${counts.pending_drift} new drifts`);
-    loadStations(); loadDrift();
-  } else showToast('error', 'Refresh failed');
+  if (!globalThis.confirm("Refresh VIATOR's Trainline list (the fallback) from the latest Trainline CSV?")) return;
+  const answer = await fetch('/api/master/stations/refresh-trainline', {method: 'POST'});
+  if (answer.ok) {
+    const counts = await answer.json();
+    showToast('success', `+${counts.added} added · ${counts.updated} updated`);
+  } else {
+    showToast('error', 'Refresh failed (' + answer.status + ').');
+  }
 });
-
-loadStations(); loadDrift();
 </script>
 {% endblock %}
