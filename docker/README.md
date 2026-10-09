@@ -22,7 +22,7 @@ docker/
 │   └── conf.d/
 │       └── sessions.generated.conf  # per-session routing (auto-generated)
 ├── web/
-│   └── Dockerfile              # python:3.12-slim + docker CLI + app code
+│   └── Dockerfile              # python:3.14-slim + docker CLI + app code
 └── otp/
     ├── Dockerfile              # eclipse-temurin:25-jre-noble + otp-shaded jar
     ├── entrypoint.sh           # build / serve modes

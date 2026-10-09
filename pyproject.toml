@@ -1,5 +1,5 @@
 # VIATOR — Python tooling configuration
-# This file holds config for ruff, black, mypy, pytest, coverage.
+# This file holds config for ruff (lint + format), mypy, pytest, coverage.
 # It is intentionally NOT a [project] section: VIATOR is a deployed application,
 # not a published Python package, so we avoid the setuptools/poetry build machinery.
 
@@ -36,7 +36,7 @@ select = [
     "RUF",        # ruff-specific
 ]
 ignore = [
-    "E501",       # line too long — black handles formatting
+    "E501",       # line too long — `ruff format` handles formatting
     "S101",       # assert in tests is fine
     "S104",       # FastAPI bind on 0.0.0.0 is intentional in containerised app
     "B008",       # FastAPI Depends() in defaults is the framework idiom
@@ -49,16 +49,6 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 line-ending = "lf"
-
-[tool.black]
-line-length = 100
-target-version = ["py312"]
-extend-exclude = '''
-(
-    /docker/otp
-  | /migrations/versions
-)
-'''
 
 [tool.mypy]
 python_version = "3.14"

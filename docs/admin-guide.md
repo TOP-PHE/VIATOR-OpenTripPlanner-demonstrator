@@ -192,7 +192,7 @@ Both workflows must complete green:
 
 - **Docker workflow** — builds + Trivy-scans + pushes to GHCR. This is the
   one that gates publishing the image.
-- **CI workflow** — lint (ruff), format (black), type (mypy --strict),
+- **CI workflow** — lint (ruff), format (ruff format), type (mypy --strict),
   security (bandit), test (pytest with coverage). This is the quality gate;
   it doesn't gate publishing but red CI on a release tag is technical debt.
 

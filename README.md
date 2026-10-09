@@ -21,12 +21,12 @@ Rail journey-planning demonstrator built on OpenTripPlanner — checks routing r
 
 ```
 OpenJourneyPlanner/
-├── app/                          # FastAPI admin app + worker (Python 3.12)
+├── app/                          # FastAPI admin app + worker (Python 3.14)
 ├── tests/                        # pytest suite (unit + integration)
 ├── docker/                       # container stack (web, worker, otp, postgres, nginx)
 ├── branding/                     # VIATOR icon, lockup, brand brief
 ├── .github/workflows/            # CI: lint, type, test, scan, sonar
-├── pyproject.toml                # ruff, black, mypy, pytest, coverage config
+├── pyproject.toml                # ruff, mypy, pytest, coverage config
 ├── requirements.txt              # runtime deps
 ├── requirements-dev.txt          # CI / dev deps (test, lint, type, security)
 ├── .pre-commit-config.yaml       # pre-commit hooks
