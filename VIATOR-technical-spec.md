@@ -60,7 +60,7 @@ VIATOR is a **multi-tenant, multi-session journey-planning demonstrator** built 
 | Layer | Technology |
 |---|---|
 | Reverse proxy | nginx 1.27 |
-| Admin app | Python 3.14 + FastAPI 0.115 + Jinja2 + SQLAlchemy 2 |
+| Admin app | Python 3.14 + FastAPI 0.142 + Jinja2 + SQLAlchemy 2.1 |
 | Worker | Python 3.14 (same image as admin app, different command) |
 | Journey UI | Static HTML + MapLibre GL + vanilla JS, served by nginx |
 | Routing engine | OpenTripPlanner 2.9.0 on Java 25 (Eclipse Temurin) |
@@ -1873,7 +1873,7 @@ The deploy workflow (`deploy.yml`) is **manual on purpose** — see 15.10.
 | GitHub CLI (`gh`) | optional | Lets you tail CI logs without opening a browser. Useful but not required. | https://cli.github.com/ |
 | Node.js 22 | optional | Only if you'll touch the journey UI build (vanilla JS works fine without) | nodejs.org |
 
-> **Windows specific:** if the Python installer asks "Add Python to PATH", say yes. Otherwise the `Scripts/` folder containing `uvicorn.exe`, `ruff.exe`, etc. won't be reachable. You can fix it after the fact via System Properties → Environment Variables, adding `C:\Users\<you>\AppData\Local\Programs\Python\Python314\Scripts` to the user PATH.
+> **Windows specific:** python.org offers more than one way to install Python on Windows, and the options differ between releases; follow "Using Python on Windows" in the 3.14 documentation (https://docs.python.org/3.14/using/windows.html) rather than this guide. Whichever method you use, check that `py -3.14 --version` prints 3.14.x. The commands in this chapter call every tool as `py -3.14 -m <tool>`, which works whether or not the folder holding `ruff.exe`, `mypy.exe`, etc. is on PATH. For bare `ruff`, `mypy`, … commands, and for the pre-push mypy hook (15.2.4), work in an activated virtual environment (`py -3.14 -m venv .venv`, then `.venv\Scripts\activate`), which puts its `Scripts` folder on PATH. Some install methods offer an "Add Python to PATH" option or put installed tools in a per-user `Scripts` folder (the classic installer uses `%LOCALAPPDATA%\Programs\Python\Python314\Scripts` for a per-user install); the folder depends on the method, so check where yours puts them before adding one to PATH.
 
 #### 15.2.2 Install the project deps
 
@@ -1885,7 +1885,7 @@ py -3.14 -m pip install -r requirements.txt          # runtime
 py -3.14 -m pip install -r requirements-dev.txt      # adds ruff, mypy, pytest, bandit, pre-commit
 ```
 
-> **pip upgrade notices are harmless.** An earlier version of this guide warned that pip 26.1 broke on Python 3.14; that does not hold on 3.14 final releases (checked on 3.14.8 with pip 26.1 and 26.2), and the web image itself upgrades to pip >= 26.0 on 3.14 (`docker/web/Dockerfile`).
+> **pip upgrade notices.** An earlier version of this guide warned that pip 26.1 broke on Python 3.14. That failure did not reproduce on Python 3.14.8 on Linux with pip 26.1 and 26.2, the only combination tested; other 3.14 releases and Windows were not checked. The web image itself upgrades to pip >= 26.0 on 3.14 (`docker/web/Dockerfile`). If you hit the failure, see the `pip install` row of 15.11.
 
 #### 15.2.3 Verify the install
 
@@ -1901,9 +1901,10 @@ If this prints `OK`, the import chain is healthy. If it raises, paste the traceb
 
 ```bash
 py -3.14 -m pre_commit install
+py -3.14 -m pre_commit install --hook-type pre-push   # optional: mypy before each push
 ```
 
-This wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff (lint and format) and the basic file checks run automatically on staged files at commit time. The mypy hook is a pre-push hook and currently cannot run (#327); run `mypy app` yourself (15.3), as CI does. **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway.
+The first line wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff (lint and format) and the basic file checks run automatically on staged files at commit time. The second adds the pre-push hook, which runs `mypy app/`, the command CI runs, with the `mypy` found on PATH (#327). It does not install anything itself: push from an activated virtual environment where `pip install -r requirements-dev.txt` was run, or the hook stops with "Executable `mypy` not found". **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway, and the CI Python job runs `mypy app/`.
 
 ### 15.3 Local quality gates — the same checks CI runs
 
@@ -1977,12 +1978,13 @@ ci/trivy-config-ignore.rego  # OPA policy for Trivy config-mode (Dockerfile) fin
 
 Triggers: every PR + every push to `main`.
 
-Two jobs run in parallel:
+Three jobs. `python` and `pre-commit` run in parallel; `sonarcloud` waits for `python`:
 
-1. **`python`** — installs Python 3.14 (the image's), brings up a Postgres 16 service container, runs ruff → ruff format --check → mypy --strict → bandit → pytest → uploads `coverage.xml` as an artifact. If `SONARCLOUD_ENABLED=true`, also runs the SonarCloud scanner.
-2. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`. This is the belt-and-braces job: it catches the case where `.pre-commit-config.yaml` and the standalone tool versions have drifted.
+1. **`python`** — installs Python 3.14 (the image's), brings up a Postgres 16 service container, runs ruff → ruff format --check → mypy --strict → bandit → pip-audit → pytest → uploads `coverage.xml` as an artifact.
+2. **`sonarcloud`** — `needs: python`, so it starts only when that job has passed. It downloads `coverage.xml` and runs the SonarCloud scanner. It runs only when the repository variable `SONARCLOUD_ENABLED` is `true` and the event is a push or a pull request from a branch of this repository (not a fork); otherwise it is skipped.
+3. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`, which runs the commit-stage hooks only (not the pre-push mypy hook). This is the belt-and-braces job: it catches files committed without the local hooks.
 
-A failure in either job makes the PR un-mergeable (assuming branch protection is enabled per 15.7.3).
+A failure in any job makes the PR un-mergeable (assuming branch protection is enabled per 15.7.3).
 
 #### 15.6.2 `docker.yml` — image build + security scan + GHCR push
 
@@ -2096,14 +2098,14 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 
 ### 15.9 Pre-commit framework — what runs and when
 
-`.pre-commit-config.yaml` configures these hooks (versions match the standalone tools in `requirements-dev.txt`):
+`.pre-commit-config.yaml` configures these hooks. The ruff hooks and the basic file checks run in environments pre-commit builds from each hook repository's `rev:`, which can differ from the `ruff==` pin in `requirements-dev.txt`; the mypy hook runs the developer's own installed `mypy`, so it uses exactly the `requirements-dev.txt` versions:
 
 | Hook | What it does | Auto-fix? |
 |---|---|---|
 | `ruff` | Lint | Yes (`--fix`) |
 | `ruff-format` | Format (replaced black) | Yes |
 | `trailing-whitespace`, `end-of-file-fixer`, `check-yaml`, `check-toml`, `check-added-large-files`, `check-merge-conflict`, `detect-private-key` | Basic file checks | Partly (whitespace and end of file) |
-| `mypy` (strict, pre-push only) | Type check | No — and it currently cannot run (#327); CI runs `mypy app/` |
+| `mypy` (strict, pre-push only) | Runs `mypy app/`, the command CI runs, as a `repo: local`, `language: system` hook (#327). Needs an activated environment with `requirements-dev.txt` installed; otherwise it fails with "Executable `mypy` not found". Run it by hand with `pre-commit run mypy --hook-stage pre-push --all-files` | No |
 
 Dockerfile lint (hadolint) is not a pre-commit hook: it runs in `docker.yml` (see the comment in `.pre-commit-config.yaml`).
 
@@ -2164,8 +2166,8 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **`pytest`** Postgres connection refused | No Postgres on `localhost:5432` | Start one per 15.4, set `DATABASE_URL`. |
 | **`bandit`** new MEDIUM/HIGH finding | A real security issue | Fix the code. If genuinely a false positive, mark the line with `# nosec BXXX` + a comment. |
 | **`Trivy`** CRITICAL on the OTP image | Almost always a JRE base CVE | Bump `eclipse-temurin:25-jre-noble` digest in `docker/otp/Dockerfile`. If no fix available, use `--ignore-unfixed` (already on) — the build still passes. |
-| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | Reported with Python 3.14 and pip 26.1; not reproduced on 3.14.8 with pip 26.1 or 26.2 | Upgrade to the latest Python 3.14.x and pip (`py -3.14 -m pip install --upgrade pip`). Do not fall back to 3.12: CI and the image run 3.14 (#325). |
-| **`ruff` / `mypy` / `pytest` not found** after `pip install` | Scripts directory not on PATH | Either add `…\Python314\Scripts` to PATH (15.2.1), or always invoke as `py -3.14 -m <tool>`. |
+| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | Reported with Python 3.14 and pip 26.1; not reproduced on 3.14.8 on Linux with pip 26.1 or 26.2 (the only combination tested) | Upgrade to the latest Python 3.14.x and pip (`py -3.14 -m pip install --upgrade pip`). Do not fall back to 3.12: CI and the image run 3.14 (#325). |
+| **`ruff` / `mypy` / `pytest` not found** after `pip install` (or the pre-push hook says "Executable `mypy` not found") | The folder holding the tools' scripts is not on PATH, or the virtual environment is not activated | Activate the virtual environment you installed `requirements-dev.txt` into, or put your install's scripts folder on PATH (15.2.1), or invoke tools as `py -3.14 -m <tool>` (the pre-push hook needs `mypy` on PATH). |
 | **PowerShell** `&&` parser error | You're on Windows PowerShell 5.1 (no `&&` support) | Use `;` to chain unconditionally, or `; if ($?) { ... }` for "run B only if A succeeded". Or upgrade to PowerShell 7. |
 | **Git** "LF will be replaced by CRLF" warnings on Windows | Git's `core.autocrlf=true` rewriting line endings | **Harmless** — files in the repo stay LF, only the working copy gets CRLF. To silence: add a `.gitattributes` with `* text=auto eol=lf`. |
 | **GitHub Actions** "Node.js 20 actions are deprecated" | The action's runner uses Node 20 internally; June 2026 makes Node 24 the default, September 2026 removes Node 20. | **Already addressed.** All actions bumped to versions that ship Node 24 runners: `actions/checkout@v5`, `actions/setup-python@v6`, `actions/upload-artifact@v5`, `actions/download-artifact@v5`, `docker/setup-buildx-action@v4`, `docker/login-action@v4`, `docker/metadata-action@v6`, `docker/build-push-action@v7`, `github/codeql-action/upload-sarif@v4`, `SonarSource/sonarcloud-github-action@v5`, `hadolint/hadolint-action@v3.3.0`. If a future warning lists a different action, run `curl -fsSL https://api.github.com/repos/<owner>/<repo>/releases?per_page=3` to find the latest published tag and bump to it. |
@@ -2184,21 +2186,23 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 
 ### 15.12 Tooling matrix (reference)
 
+Python tool versions are the pins of `requirements-dev.txt` (and `requirements.txt` for Alembic); Trivy and hadolint are the action versions pinned in `docker.yml`. Those files are the source of truth if this table drifts again.
+
 | Concern | Tool | Pinned version | Config location |
 |---|---|---|---|
-| Test runner | pytest + pytest-asyncio + pytest-cov + httpx | 8.3.4 / 0.24.0 / 6.0.0 / 0.28.1 | `pyproject.toml` `[tool.pytest.ini_options]` |
-| Coverage | coverage.py (via pytest-cov) → `coverage.xml` | 7.13.5 | `pyproject.toml` `[tool.coverage.*]` |
-| Lint | ruff | 0.7.4 | `pyproject.toml` `[tool.ruff]` |
+| Test runner | pytest + pytest-asyncio + pytest-cov + httpx | 9.1.1 / 1.4.0 / 7.1.0 / 0.28.1 | `pyproject.toml` `[tool.pytest.ini_options]` |
+| Coverage | coverage.py (via pytest-cov) → `coverage.xml` | not pinned (installed by pytest-cov) | `pyproject.toml` `[tool.coverage.*]` |
+| Lint | ruff | 0.16.10 (the pre-commit hook pins its own `rev:`, see 15.9) | `pyproject.toml` `[tool.ruff]` |
 | Format | ruff format | same as ruff | `pyproject.toml` `[tool.ruff.format]` |
-| Type | mypy (strict) | 1.13.0 | `pyproject.toml` `[tool.mypy]` |
-| Security (code) | bandit | 1.7.10 | `pyproject.toml` `[tool.bandit]` |
-| Security (deps) | pip-audit | 2.7.3 | command-line flags |
+| Type | mypy (strict) | 2.4.0 | `pyproject.toml` `[tool.mypy]` |
+| Security (code) | bandit | 1.9.4 | no config file: command-line flags in `ci.yml` (`bandit -r app/ -ll`); ruff's `S` rules (flake8-bandit) in `pyproject.toml` `[tool.ruff.lint]` also run on every lint |
+| Security (deps) | pip-audit | 2.10.1 | command-line flags in `ci.yml` |
 | Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
-| Dockerfile lint | hadolint | 2.13.1-beta | command-line flags |
-| Pre-commit | pre-commit | 4.0.1 | `.pre-commit-config.yaml` |
-| Migrations | Alembic | 1.14.0 | `alembic.ini` + `alembic/env.py` |
+| Dockerfile lint | hadolint (via hadolint/hadolint-action) | v3.5.0 | `ignore:` list in `docker.yml` |
+| Pre-commit | pre-commit | 4.6.2 | `.pre-commit-config.yaml` |
+| Migrations | Alembic | 1.20.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
-| Type stubs | types-requests, types-passlib, sqlalchemy[mypy] | various | `requirements-dev.txt` |
+| Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.txt` | `requirements-dev.txt` |
 
 ### 15.13 What the JS toolchain looks like (when we add it)
 

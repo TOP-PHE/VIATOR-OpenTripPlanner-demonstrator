@@ -97,13 +97,6 @@ jobs:
       # Mirror the .trivyignore convention: one CVE per line, written
       # justification, re-evaluate when the underlying dep changes.
       #
-      # GHSA-3936-cmfr-pm3m — black 24.10.0 (fix in 26.3.1, dev-only)
-      #   Formatter ReDoS via crafted docstring. Black runs on our own
-      #   source code in CI and dev only; we never format untrusted input.
-      #   Bump deferred — 24.10 → 26.3 spans 18 months of style updates
-      #   and will produce diff churn that doesn't belong in the audit
-      #   PR. Tracked separately in audit-2026-05.md (P1 follow-up).
-      #
       # GHSA-6w46-j5rx-g56g — pytest 8.3.4 (fix in 9.0.3, dev-only)
       #   Test isolation issue. Pytest runs only on our test files in CI;
       #   no production exposure. Bump deferred — 8 → 9 is a major bump
@@ -112,7 +105,6 @@ jobs:
       - name: pip-audit (Python CVEs)
         run: |
           pip-audit --strict --vulnerability-service=osv \
-            --ignore-vuln GHSA-3936-cmfr-pm3m \
             --ignore-vuln GHSA-6w46-j5rx-g56g
         continue-on-error: false
 
