@@ -829,3 +829,426 @@ async def test_one_request_refusals_log_at_info_and_faults_at_warning(
 
     (record,) = [r for r in caplog.records if r.name == station_module.log.name]
     assert record.levelno == level
+
+
+# ───────────────────── the detailed form: search_outcome() ─────────────────────
+
+
+async def test_search_outcome_gives_the_rows_and_ok(module: Module) -> None:
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome([_row()], "ok", None)
+    assert len(module.requests) == 1
+
+
+async def test_a_429_with_retry_after_gives_its_seconds(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        429, json={"detail": "ZZ", "code": "user_minute"}, headers={"Retry-After": "17"}
+    )
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "status_429", 17)
+    assert not station_module.paused()
+
+
+@pytest.mark.parametrize(
+    "header",
+    [None, "Wed, 21 Oct 2026 07:28:00 GMT", "0", "86401", "1.5", "-3", "", "17 seconds"],
+    ids=["none", "a-date", "zero", "over-a-day", "a-fraction", "negative", "empty", "words"],
+)
+async def test_a_429_without_a_plain_number_of_seconds_gives_no_retry_after(
+    module: Module, header: str | None
+) -> None:
+    headers = {} if header is None else {"Retry-After": header}
+    module.handler = lambda _r: httpx.Response(429, json={"code": "user_minute"}, headers=headers)
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome.rows is None
+    assert outcome.reason == "status_429"
+    assert outcome.retry_after is None
+
+
+@pytest.mark.parametrize("seconds", ["1", "86400", " 60 "])
+async def test_the_bounds_of_retry_after_are_kept(module: Module, seconds: str) -> None:
+    module.handler = lambda _r: httpx.Response(429, json={}, headers={"Retry-After": seconds})
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome.retry_after == int(seconds)
+
+
+async def test_a_retry_after_on_another_status_is_ignored(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        503, json={"code": "busy"}, headers={"Retry-After": "5"}
+    )
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "busy", None)
+
+
+@pytest.mark.parametrize(("kind", "reason"), PAUSING + NOT_PAUSING)
+async def test_each_search_failure_gives_its_reason_word_and_no_rows(
+    module: Module, caplog: pytest.LogCaptureFixture, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, reason, None)
+    assert _reasons(caplog) == [reason]
+
+
+@pytest.mark.parametrize(("kind", "reason"), PAUSING)
+async def test_search_outcome_keeps_the_pause_rules(
+    module: Module, clock: FakeClock, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+    await station_module.search_outcome("Zzville", uuid.uuid4())
+    module.answer(200, {"stations": [_row()]})
+
+    clock.now += 29.9
+    assert await station_module.search_outcome("Zzville", uuid.uuid4()) == station_module.Outcome(
+        None, "paused", None
+    )
+    assert len(module.requests) == 1
+    clock.now += 0.2
+    assert (await station_module.search_outcome("Zzville", uuid.uuid4())).reason == "ok"
+
+
+@pytest.mark.parametrize(("kind", "reason"), NOT_PAUSING)
+async def test_search_outcome_does_not_pause_on_one_request_refusals(
+    module: Module, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+    await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert not station_module.paused()
+    module.answer(200, {"stations": []})
+    assert await station_module.search("Zzville", uuid.uuid4()) == []
+
+
+async def test_search_outcome_off_without_the_settings(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "")
+
+    assert await station_module.search_outcome("Zzville", uuid.uuid4()) == station_module.Outcome(
+        None, "off", None
+    )
+    assert module.requests == []
+
+
+async def test_search_outcome_falls_back_as_network_on_an_unforeseen_error(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "http://[::1:8000")
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "network", None)
+    assert station_module.paused()
+
+
+async def test_search_returns_the_rows_of_search_outcome(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(429, json={}, headers={"Retry-After": "17"})
+    assert await station_module.search("Zzville", uuid.uuid4()) is None
+    module.answer(200, {"stations": [_row()]})
+    assert await station_module.search("Zzville", uuid.uuid4()) == [_row()]
+
+
+# ───────────────────────────── paused() ─────────────────────────────
+
+
+async def test_paused_is_true_during_the_pause_and_false_after(
+    module: Module, clock: FakeClock
+) -> None:
+    assert not station_module.paused()
+    module.fail(httpx.ConnectError)
+    await station_module.search("Zzville", uuid.uuid4())
+
+    assert station_module.paused()
+    clock.now += station_module.PAUSE_SECONDS - 0.1
+    assert station_module.paused()
+    clock.now += 0.2
+    assert not station_module.paused()
+
+
+# ───────────────────────────── lookup() ─────────────────────────────
+
+
+def _lookup_row(uic: str, parent: str | None = None, **extra: Any) -> dict[str, Any]:
+    return {**_row(f"Zz Station {uic}", uic), "parent_uic": parent, **extra}
+
+
+def _lookup_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
+    prefix = "station_module.lookup_failed reason="
+    return [
+        r.getMessage().removeprefix(prefix)
+        for r in caplog.records
+        if r.name == station_module.log.name and r.getMessage().startswith(prefix)
+    ]
+
+
+async def test_lookup_posts_the_codes_in_the_body_with_only_its_own_headers(
+    module: Module, token: str
+) -> None:
+    user = uuid.uuid4()
+    module.answer(200, {"stations": [_lookup_row("9900001")]})
+
+    outcome = await station_module.lookup(["9900001", "9900002"], user)
+
+    assert outcome.reason == "ok"
+    (request,) = module.requests
+    assert request.method == "POST"
+    assert str(request.url) == f"{MODULE_URL}/internal/v1/stations/lookup"
+    assert request.url.query == b""
+    assert json.loads(request.content) == {"uics": ["9900001", "9900002"]}
+    assert request.headers["authorization"] == f"Bearer {token}"
+    assert request.headers["x-viator-user-id"] == str(user)
+    assert request.headers["content-type"] == "application/json"
+    assert request.headers["accept-encoding"] == "identity"
+    ours = {"authorization", "x-viator-user-id", "content-type", "content-length"}
+    assert set(request.headers.keys()) <= ours | _HTTPX_DEFAULTS
+    assert "9900001" not in str(request.url)
+
+
+async def test_lookup_gives_the_rows_with_their_parent_in_the_order_of_the_answer(
+    module: Module,
+) -> None:
+    module.answer(
+        200,
+        {"stations": [_lookup_row("9900003", "9900009"), _lookup_row("9900001")]},
+    )
+
+    outcome = await station_module.lookup(["9900001", "9900002", "9900003"], uuid.uuid4())
+
+    assert outcome.reason == "ok"
+    assert outcome.retry_after is None
+    assert outcome.rows == [_lookup_row("9900003", "9900009"), _lookup_row("9900001")]
+
+
+async def test_a_bad_lookup_row_is_dropped_and_the_others_kept(module: Module) -> None:
+    good = [_lookup_row("9900001"), _lookup_row("9900004", "9900001")]
+    bad = [
+        _lookup_row("9900002", parent=99),  # a parent that is not text
+        _lookup_row("9900003", name=""),  # no name
+        _lookup_row("9900005", latitude=None),  # no position
+        _lookup_row("9900099"),  # a code that was not asked for
+        _lookup_row("9900001"),  # a second row for a code
+        "not a row",
+    ]
+    module.answer(200, {"stations": [good[0], *bad, good[1]]})
+
+    outcome = await station_module.lookup(
+        ["9900001", "9900002", "9900003", "9900004", "9900005"], uuid.uuid4()
+    )
+
+    assert outcome.rows == good
+
+
+async def test_an_empty_lookup_answer_is_an_answer(module: Module) -> None:
+    module.answer(200, {"stations": []})
+    assert await station_module.lookup(["9900001"], uuid.uuid4()) == station_module.Outcome(
+        [], "ok", None
+    )
+
+
+@pytest.mark.parametrize(("kind", "reason"), PAUSING + NOT_PAUSING)
+async def test_each_lookup_failure_gives_its_reason_and_never_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+    if kind == "no-stations-list":
+        module.answer(200, {"stations": "ZZ"})
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, reason, None)
+    assert _lookup_reasons(caplog) == [reason]
+    assert _reasons(caplog) == [f"station_module.lookup_failed reason={reason}"]
+    # No pause: the typeahead goes on calling the module.
+    assert not station_module.paused()
+    module.answer(200, {"stations": [_row()]})
+    assert await station_module.search("Zzville", uuid.uuid4()) == [_row()]
+
+
+async def test_a_lookup_failure_keeps_the_cached_attribution(module: Module) -> None:
+    module.answer(200, _attribution())
+    await station_module.attribution()
+    module.fail(httpx.ConnectError)
+    await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert await station_module.attribution() == _attribution()
+    assert len(module.requests) == 2
+
+
+async def test_a_lookup_429_gives_its_retry_after(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        429, json={"code": "user_minute"}, headers={"Retry-After": "42"}
+    )
+
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "status_429", 42)
+
+
+async def test_a_running_pause_is_honoured_by_lookup(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    module.fail(httpx.ConnectError)
+    await station_module.search("Zzville", uuid.uuid4())
+    calls = len(module.requests)
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "paused", None)
+    assert len(module.requests) == calls
+    assert _lookup_reasons(caplog) == ["paused"]
+
+
+async def test_lookup_makes_no_call_without_the_settings(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(""))
+
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "off", None)
+    assert module.requests == []
+
+
+async def test_a_trickling_lookup_is_cut_at_the_deadline_without_a_pause(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(station_module, "SEARCH_DEADLINE", 0.2)
+    module.handler = lambda _r: httpx.Response(200, stream=_TrickleAsync(0.05, 100))
+
+    started = time.monotonic()
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert time.monotonic() - started < 1.0
+    assert outcome.reason == "timeout"
+    assert not station_module.paused()
+
+
+async def test_an_oversized_lookup_answer_is_refused_without_a_pause(module: Module) -> None:
+    big = b'{"stations": [' + b" " * (station_module.SEARCH_MAX_BYTES + 1) + b"]}"
+    module.handler = lambda _r: httpx.Response(200, content=big)
+
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome.reason == "shape"
+    assert not station_module.paused()
+
+
+async def test_a_compressed_lookup_answer_is_refused_without_a_pause(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        200, content=b"{}", headers={"Content-Encoding": "zz"}
+    )
+
+    assert (await station_module.lookup(["9900001"], uuid.uuid4())).reason == "shape"
+    assert not station_module.paused()
+
+
+async def test_an_unforeseen_lookup_error_is_network_without_a_pause(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "http://[::1:8000")
+
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "network", None)
+    assert not station_module.paused()
+    assert module.requests == []
+
+
+def _codes(count: int) -> list[str]:
+    return [f"99{i:05d}" for i in range(count)]
+
+
+@pytest.mark.parametrize(
+    "codes",
+    [
+        pytest.param([], id="none"),
+        pytest.param(_codes(21), id="twenty-one"),
+        pytest.param(["9900001", "9900002", "9900001"], id="repeated"),
+        pytest.param(["ZZ"], id="two-characters"),
+        pytest.param(["9" * 21], id="twenty-one-characters"),
+        pytest.param(["99 001"], id="a-space"),
+        pytest.param(["99\u00a0001"], id="a-no-break-space"),
+        pytest.param(["99\t001"], id="a-tab"),
+        pytest.param(["9900001\n"], id="a-line-end"),
+        pytest.param(["99\x00001"], id="a-nul"),
+        pytest.param(["99\x7f001"], id="a-delete"),
+        pytest.param(["99\ud800001"], id="a-surrogate"),
+        pytest.param([""], id="empty"),
+    ],
+)
+async def test_a_lookup_the_module_would_refuse_is_refused_locally(
+    module: Module, codes: list[str]
+) -> None:
+    with pytest.raises(ValueError, match=r"lookup|code"):
+        await station_module.lookup(codes, uuid.uuid4())
+    assert module.requests == []
+
+
+async def test_codes_that_differ_only_in_capitals_are_two_codes(module: Module) -> None:
+    module.answer(200, {"stations": []})
+
+    await station_module.lookup(["zz999", "ZZ999"], uuid.uuid4())
+
+    assert json.loads(module.requests[0].content) == {"uics": ["zz999", "ZZ999"]}
+
+
+async def test_twenty_codes_of_three_to_twenty_characters_are_sent(module: Module) -> None:
+    module.answer(200, {"stations": []})
+    codes = ["ZZ9", "Z" * 20, *_codes(18)]
+
+    assert (await station_module.lookup(codes, uuid.uuid4())).reason == "ok"
+    assert json.loads(module.requests[0].content) == {"uics": codes}
+
+
+async def test_lookup_never_logs_a_code_or_the_token(
+    module: Module, token: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    marker = f"ZZ{secrets.token_hex(4)}"
+    with caplog.at_level(logging.DEBUG):
+        for kind, _reason in PAUSING + NOT_PAUSING:
+            _setup_failure(module, kind)
+            await station_module.lookup([marker], uuid.uuid4())
+        module.answer(200, {"stations": [_lookup_row(marker)]})
+        await station_module.lookup([marker], uuid.uuid4())
+
+    logged = caplog.text + "".join(str(r.args) for r in caplog.records)
+    assert caplog.records
+    assert marker not in logged
+    assert token not in logged
+    assert "stand-in failure" not in logged
+
+
+@pytest.mark.parametrize(
+    ("code", "word"),
+    [
+        ("9900001", None),
+        ("ZZ9", None),
+        ("Z" * 20, None),
+        ("zz-99/1", None),
+        ("ZZ", "length"),
+        ("Z" * 21, "length"),
+        ("99 01", "white space"),
+        ("99\u200a01", "white space"),
+        ("99\t01", "control character"),
+        ("99\x0001", "control character"),
+        ("99\x8501", "control character"),
+        ("99\udfff01", "surrogate"),
+        ("\ud800\t", "surrogate"),
+    ],
+)
+def test_code_refused_mirrors_the_module_rule(code: str, word: str | None) -> None:
+    assert station_module.code_refused(code) == word
