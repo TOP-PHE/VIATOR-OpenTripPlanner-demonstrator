@@ -147,7 +147,7 @@ class MasterStationEditArchive(Base):
 
     Filled once by revision `20261010_1200_edit_archive`: every
     `master_stations` row that was `manual`, or had a pending drift row, as it
-    stood, with that drift row; the station rows were then handed back to the
+    stood, with that drift row; the edited rows were then handed back to the
     Trainline import. Nothing in the application reads or writes it: an
     administrator reads it with the runbook's `psql` line and carries an edit
     that matters into the station module, the reference since step 3.

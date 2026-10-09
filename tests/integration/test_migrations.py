@@ -439,10 +439,31 @@ def _guide_queries() -> list[str]:
     )
 
 
+# A Trainline CSV after the revision, as `trainline.parse_csv` reads it:
+# 9900001 with every edited field replaced; 9900011 with a new name and
+# country but no operator code and no position (empty cells are skipped);
+# 9900002 dropped by Trainline; the two rows never edited carried as before.
+_CSV_AFTER = (
+    "id;uic;name;country;latitude;longitude;sncf_id;db_id\n"
+    "1;9900001;ZZ Upstream Halt;ZY;45.11;6.11;;\n"
+    "3;9900003;ZZ Plain Central;ZZ;45.5;6.25;;\n"
+    "4;9900004;ZZ Odd Drift;ZZ;45.4;6.3;;\n"
+    "11;9900011;ZZ Upstream Gare;ZY;;;;\n"
+)
+
+
 def test_the_admin_guides_psql_lines_read_the_archive(alembic_cfg: Config) -> None:
-    """The guide's two lines run as written: the first lists every archived
-    row; the second, after an import, only those whose edited values are
-    still in the fallback list (here: Trainline did not carry them)."""
+    """The guide's two lines run as written. The first lists every archived
+    row. The second, after a real Trainline upsert, lists the edited rows
+    with a field that still holds its archived value, and names the
+    fields: the import sets only the fields its CSV fills, so the operator
+    codes and the position of 9900011 survive, and 9900002 (dropped by
+    Trainline) keeps everything. 9900001, whose every edited field the CSV
+    replaces, and 9900004, never edited, are not listed."""
+    from sqlalchemy.orm import Session
+
+    from app.master import trainline
+
     url = _postgres_or_skip()
     engine = create_engine(url)
     with engine.begin() as conn:
@@ -450,18 +471,33 @@ def test_the_admin_guides_psql_lines_read_the_archive(alembic_cfg: Config) -> No
         conn.execute(text("CREATE SCHEMA public;"))
     command.upgrade(alembic_cfg, _HUB_UIC)
     _seed_stations(engine)
-    command.upgrade(alembic_cfg, _STATION_EDIT_ARCHIVE)
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE master_stations SET name = 'ZZ Upstream Halt' WHERE uic = '9900001'")
+            text(
+                "INSERT INTO master_stations (uic, name, country_iso, latitude, longitude, "
+                "trigramme_sncf, db_code, source) VALUES ('9900011', 'ZZ Edited Gare', 'ZZ', "
+                "45.7, 6.7, 'ZZTRI', 'ZZDB1', 'manual')"
+            )
         )
+    command.upgrade(alembic_cfg, _STATION_EDIT_ARCHIVE)
+
+    parsed, parents = trainline.parse_csv(_CSV_AFTER)
+    with Session(engine) as session:
+        trainline.upsert_with_drift_protection(session, parsed, parents)
+    after = _stations(engine)
+    assert after["9900011"]["name"] == "ZZ Upstream Gare"
+    assert after["9900011"]["db_code"] == "ZZDB1"  # the edit the import leaves
+    assert _drift(engine) == {}  # no row is manual any more: no drift written
 
     listing, left = _guide_queries()
     for query in (listing, left):
         assert query.lstrip().upper().startswith("SELECT ")
     with engine.connect() as conn:
         listed = [row[0] for row in conn.execute(text(listing)).all()]
-        still_edited = [row[0] for row in conn.execute(text(left)).all()]
+        still_edited = {row[0]: row[2] for row in conn.execute(text(left)).all()}
 
-    assert listed == [_EDITED_WITH_DRIFT, _EDITED, _DRIFT_NOT_MANUAL]
-    assert still_edited == [_EDITED, _DRIFT_NOT_MANUAL]
+    assert listed == [_EDITED_WITH_DRIFT, _EDITED, _DRIFT_NOT_MANUAL, "9900011"]
+    assert still_edited == {
+        _EDITED: "name, country_iso, latitude, parent_uic",
+        "9900011": "latitude, longitude, trigramme_sncf, db_code",
+    }

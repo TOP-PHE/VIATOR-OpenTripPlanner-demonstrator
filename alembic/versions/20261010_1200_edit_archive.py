@@ -22,15 +22,24 @@ This revision, in the one transaction of `alembic upgrade`:
    anything to read.
 
 The next Trainline import (04:00 UTC, or "Refresh from Trainline" on the
-Stations page) then gives these rows Trainline's values again. A row whose
-`uic` Trainline has since dropped keeps its edited values, now marked
-`trainline`: the import never deletes a row. The archive keeps every one;
-nothing removes it. The runbook's read-only `psql` line lists them.
+Stations page) then overwrites these rows **only where Trainline's CSV has a
+value**: the import skips empty cells and sets only the fields it read, and
+it sets `parent_uic` only when the CSV names a parent. So an edit that filled
+a field Trainline leaves empty (an operator code, a position, a parent)
+survives, now marked `trainline`; and a row whose `uic` Trainline has since
+dropped keeps all its edited values, since the import never deletes a row.
+The revision does not clear those fields: Trainline's values are not known
+here. The archive keeps every row; nothing removes it. The second read-only
+`psql` line of docs/admin-guide.md section 11.1 lists, after an import, the
+archived edited rows with a field that still holds its archived value.
 
-The downgrade writes the archived rows back (every column, `source = 'manual'`
-included), recreates the drift rows from the archive and drops the table. It
-does not undo what an import wrote in between, which the archive's values
-replace.
+The downgrade writes the archived rows back (every column, each row's own
+archived `source` included: `manual` for every edited row), recreates the
+drift rows from the archive and drops the table. It does not undo what an
+import wrote in between, which the archive's values replace. A restored
+`parent_uic` that names a station deleted since, and not in the archive,
+would fail the downgrade on the foreign key, and the whole downgrade rolls
+back; no code deletes a station.
 
 The drift table, its model and the import's protection of `manual` rows stay,
 empty and dormant: no code can make a row `manual` any more.

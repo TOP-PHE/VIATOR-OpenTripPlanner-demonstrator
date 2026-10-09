@@ -643,7 +643,7 @@ The system rejects searches whose original `graph_snapshot.timetable_main_versio
 
 ## 7. Master data management
 
-Cross-source comparison only works if VIATOR has a stable view of "the same station" and "the same service" across NAP, MERITS, Trenitalia France, and any future feed. Three master tables hold this reference data, all editable from the admin UI and seedable from open datasets.
+Cross-source comparison only works if VIATOR has a stable view of "the same station" and "the same service" across NAP, MERITS, Trenitalia France, and any future feed. Three master tables hold this reference data, editable from the admin UI (stations no longer, since MSMM step 3: they are corrected in the station module) and seedable from open datasets.
 
 ### 7.1 Master stations
 
@@ -1587,7 +1587,7 @@ docker compose start web worker
 
 #### 11.7.3 Configuration drift protection
 
-Master-data rows with `source='manual'` are **never** overwritten by the Trainline CSV bootstrap or any automatic refresh. If you've curated the master_stations table by hand, those edits survive forever — no backup needed. Same rule for `route_aliases`: hand-entered rows are sacred.
+Master-data rows with `source='manual'` are **never** overwritten by the Trainline CSV bootstrap or any automatic refresh. *(Since MSMM step 3 no station row is `manual`: the edits were archived in `master_stations_edit_archive` and the rows handed back to the import; take a backup before that release. See `docs/admin-guide.md` §11.1.)* Same rule for `route_aliases`: hand-entered rows are sacred.
 
 ### 11.8 Observability
 

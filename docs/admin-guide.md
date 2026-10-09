@@ -2421,8 +2421,8 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   module first and counts on the person's own limits there, the same counters
   as his journey typeahead. Each result says where it comes from: **MSMM**, or
   **Trainline** when the module is not used or did not answer (a notice says
-  so). A platform administrator gets an "open in the module" link on each MSMM
-  result. Nothing can be edited on the page.
+  so). When VIATOR uses the module, a platform administrator gets an "open in
+  the module" link on each MSMM result. Nothing can be edited on the page.
 
 #### The archive of the edits made in VIATOR
 
@@ -2430,11 +2430,20 @@ The release that removed VIATOR's station edits runs one database revision
 (`20261010_1200_edit_archive`) when the `web` container starts.
 **Take a database backup before deploying it** (5.2): it changes rows. In
 one transaction it copies every station row an operator had edited
-(`source = 'manual'`), with its pending drift row, into the table
-`master_stations_edit_archive`, then hands those rows back to the Trainline
-import (`source = 'trainline'`) and empties the drift queue. The next import
-gives them Trainline's values again. Nothing is deleted: the archive stays,
-and no screen shows it.
+(`source = 'manual'`), with its pending drift row, and every other station
+that has a pending drift row, into the table `master_stations_edit_archive`;
+then it hands the edited rows back to the Trainline import
+(`source = 'trainline'`) and empties the drift queue. Nothing is deleted: the
+archive stays, and no screen shows it.
+
+**The next import does not undo every edit.** It overwrites a field only when
+Trainline's CSV has a value for it (empty cells are skipped, and a parent is
+set only when the CSV names one), and it never deletes a row. So an edit that
+filled a field Trainline leaves empty (an operator code such as `db_code` or
+`trigramme_sncf`, a position, a parent) stays in the fallback list, now marked
+`trainline`; and a row whose code Trainline no longer carries keeps all its
+edited values. The revision does not clear them, because Trainline's own
+values are not known to it.
 
 The `web` start log gives the count, in one line:
 `station edit archive: <n> station row(s) archived in master_stations_edit_archive; ...`.
@@ -2444,20 +2453,27 @@ If it is not 0, list the archive, from `/opt/viator/docker` (read only):
 sudo docker compose exec -T postgres psql -U viator -d viator -c "SELECT a.uic, a.station->>'name' AS edited_name, a.station->>'country_iso' AS country, a.drift_fields, a.archived_at FROM master_stations_edit_archive AS a ORDER BY a.uic"
 ```
 
-After the first import that follows, this line lists the archived rows
-whose edited values are still in the fallback list, because Trainline no
-longer carries their code (the import never deletes a row):
+After the first import that follows, this line lists the edited rows with
+at least one of `name`, `country_iso`, `latitude`, `longitude`,
+`trigramme_sncf`, `db_code`, `parent_uic` that still holds its archived
+value, and names those fields (`still_as_edited`). The archive does not say
+which fields the operator changed, so a field listed may simply be one
+Trainline gives the same value; compare with the module before acting.
+Stations that were never edited (a drift row on a non-`manual` station) are
+not listed:
 
 ```bash
-sudo docker compose exec -T postgres psql -U viator -d viator -c "SELECT a.uic, a.station->>'name' AS edited_name FROM master_stations_edit_archive AS a JOIN master_stations AS s ON s.uic = a.uic WHERE to_jsonb(s) - 'source' - 'updated_at' = a.station - 'source' - 'updated_at' ORDER BY a.uic"
+sudo docker compose exec -T postgres psql -U viator -d viator -c "SELECT uic, edited_name, still_as_edited FROM (SELECT a.uic, a.station->>'name' AS edited_name, array_to_string(ARRAY(SELECT f FROM unnest(ARRAY['name','country_iso','latitude','longitude','trigramme_sncf','db_code','parent_uic']) AS f WHERE a.station->f <> 'null'::jsonb AND to_jsonb(s)->f = a.station->f), ', ') AS still_as_edited FROM master_stations_edit_archive AS a JOIN master_stations AS s ON s.uic = a.uic WHERE a.station->>'source' = 'manual') AS t WHERE still_as_edited <> '' ORDER BY uic"
 ```
 
 For each edit that matters, find the station in the module by its search and
 correct it there with a hand correction; or let it go. To undo the whole
 step, the revision's downgrade (`alembic downgrade 20261009_1200_hub_uic`
 in the `web` container, after reverting the release) writes the archived
-values back over what an import wrote since, marks them `manual` again,
-recreates the drift rows and drops the archive.
+values back over what an import wrote since, with each row's own archived
+`source` (`manual` for every edited row), recreates the drift rows and drops
+the archive. A restored parent that names a station deleted since would make
+the downgrade fail and roll back whole; no code deletes a station.
 
 ---
 
