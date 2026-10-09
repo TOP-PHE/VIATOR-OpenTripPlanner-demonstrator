@@ -302,6 +302,13 @@ class NetworkCoverageResult(Base):
     external_alignment_tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
+# The CHECK of `network_coverage_hubs.uic_origin` (alembic 20261009_1200_hub_uic).
+UIC_ORIGIN_CHECK = (
+    "(uic IS NULL AND uic_origin IS NULL) OR "
+    "(uic IS NOT NULL AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
+)
+
+
 class NetworkCoverageHub(Base):
     """v0.1.31 — operator-editable hub catalog.
 
@@ -349,6 +356,9 @@ class NetworkCoverageHub(Base):
     __tablename__ = "network_coverage_hubs"
     __table_args__ = (
         CheckConstraint("tier IN ('main','regional')", name="tier_valid"),
+        # A code and its origin go together: both null (not resolved), or a
+        # code from the station module ('msmm') or typed by hand ('manual').
+        CheckConstraint(UIC_ORIGIN_CHECK, name="uic_origin_valid"),
         Index("ix_network_coverage_hubs_country_tier", "country", "tier", "is_active"),
         Index("ix_network_coverage_hubs_active_sort", "is_active", "sort_order"),
     )
@@ -366,6 +376,15 @@ class NetworkCoverageHub(Base):
     region: Mapped[str | None] = mapped_column(String(40))
     tier: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'main'"))
     modes: Mapped[str | None] = mapped_column(String(20))
+    # The station's code (step 3 of the station module, MSMM): the module's
+    # MERITS code when it came from the module, confirmed by an administrator
+    # through POST /hubs/confirm (`uic_origin = 'msmm'`), or typed by an
+    # administrator (`'manual'`). Null = not resolved: the hub works as
+    # before. No foreign key to `master_stations`: a MERITS code need not be
+    # a Trainline `uic`. The coverage runner never reads it (it routes by
+    # position); the cell dialog's re-run link carries it to /journey.
+    uic: Mapped[str | None] = mapped_column(String(20))
+    uic_origin: Mapped[str | None] = mapped_column(String(8))
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lon: Mapped[float] = mapped_column(Float, nullable=False)
     # Soft-delete flag. UI hides is_active=false by default; admin can
