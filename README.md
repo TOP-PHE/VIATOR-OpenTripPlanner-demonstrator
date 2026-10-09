@@ -91,7 +91,7 @@ After signing in as a platform admin, the nav exposes:
 - **`/admin/users`** — promote / deactivate users
 - **`/admin/sessions`** — create / archive sessions, toggle fanout
 - **`/admin/config`** — SMTP, concurrency limits, registration policy, retention; SMTP test button
-- **`/admin/master/stations`** — Trainline-seeded UIC station registry; refresh + drift queue
+- **`/admin/master/stations`** — Stations search page (the station module first, VIATOR's Trainline list as the fallback; read only) + Trainline refresh
 - **`/admin/reports`** — search volume per session/user, top O&D pairs, trip-source distribution
 
 The **content_manager** role gets `/journey` + master-data write access.
@@ -104,7 +104,7 @@ Run automatically inside the `web` container:
 | Cron | Schedule (UTC) | What it does |
 |---|---|---|
 | `retention` | daily 03:00 | Three-tier prune of raw responses → trips → search summaries → audit per `JOURNEY_*_RETENTION_DAYS` |
-| `master_stations_refresh` | daily 04:00 | Pulls Trainline CSV; manual edits never overwritten — drift surfaced in admin UI |
+| `master_stations_refresh` | daily 04:00 | Pulls Trainline CSV into VIATOR's fallback list (station edits are made in the station module since MSMM step 3) |
 
 Set env var `VIATOR_DISABLE_CRONS=1` to disable (used in tests).
 

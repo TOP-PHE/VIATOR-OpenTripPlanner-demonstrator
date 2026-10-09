@@ -449,26 +449,19 @@ airports.
 
 Trainline refreshes the CSV monthly. VIATOR mirrors with
 `POST /api/master/stations/refresh-trainline` — ~30 s for the full ~7000
-station import. Manual edits (`source='manual'`) are never overwritten;
-upstream changes to those rows are surfaced in the **Pending drift**
-queue with per-key granularity (e.g. `other_codes.sbb` rather than just
-`other_codes`).
+station import.
 
-### 5.2 Browsing the table (since v0.1.7)
+Since MSMM step 3 stations are not edited in VIATOR: the station module
+is the reference, and corrections are made there. The edits made in
+VIATOR before were archived (`docs/admin-guide.md` §11.1).
 
-The Master Stations page (`/admin/master/stations`) supports:
+### 5.2 The Stations page
 
-- **Scrollable table with sticky header** — vertical scroll inside a fixed
-  container, column titles stay visible
-- **Pagination footer** — `« First · ‹ Prev · page [N] of M · Next › · Last »`
-  + jump-to-page input
-- **Context-mode search** (default on) — typing "Paris" jumps to the
-  alphabetical page where Paris stations live, highlights matching rows
-  in yellow with a brief flash, scrolls the first match into view. Other
-  stations on the page remain visible for context. Toggle off for
-  classic filter behaviour.
-- **Operator-code badges** — every station shows a row of compact badges
-  for each operator code present (SNCF, DB, Trenitalia, ÖBB, SBB, etc.).
+The Stations page (`/admin/master/stations`) is a search page: one field
+(at least 3 characters), at most 10 results, each labelled **MSMM** (from
+the station module) or **Trainline** (VIATOR's own list, the fallback when
+the module is not used or does not answer). There is no list, no paging
+and no edit; the **Refresh from Trainline** button stays.
 
 ### 5.3 Refresh recipe
 
@@ -477,7 +470,8 @@ The Master Stations page (`/admin/master/stations`) supports:
 # API equivalent:
 curl -X POST -H "Authorization: Bearer <jwt>" \
   https://<your-host>/api/master/stations/refresh-trainline
-# returns: {"added": N, "updated": N, "skipped_manual": N, "pending_drift": N}
+# returns: {"added": N, "updated": N, "skipped_manual": N, "pending_drift": N, "parent_links_set": N}
+# (skipped_manual and pending_drift stay 0 since MSMM step 3: no row is manual)
 ```
 
 ---

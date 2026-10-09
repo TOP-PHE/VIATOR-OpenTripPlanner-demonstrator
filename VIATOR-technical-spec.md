@@ -659,6 +659,12 @@ Periodic refresh: monthly by default (`MASTER_STATIONS_REFRESH_DAYS`). The trip_
 
 #### Conflict resolution — "our edits prevail, but stay informed"
 
+> **Superseded by MSMM step 3 (2026-10).** Stations are no longer edited in VIATOR: the station
+> module is the reference and corrections are made there. The edit and drift routes below are
+> removed, the existing edits were archived in `master_stations_edit_archive`, and the import's
+> `manual` branch is dormant (`docs/architecture.md` ch. 8, `docs/admin-guide.md` §11.1). The
+> policy is kept here as the record of what VIATOR did before.
+
 Local fixes must always win — but admins also need to know when Trainline later updates a row we've already touched, in case our fix becomes obsolete or Trainline's improvement is genuinely better. The policy is **row-level lock with drift surfacing**:
 
 1. Each `master_stations` row carries a `source` column. Trainline-imported rows are `source='trainline'`. The moment a row is edited via the admin UI (PATCH or POST), `source` flips to `'manual'`.
@@ -678,7 +684,7 @@ Local fixes must always win — but admins also need to know when Trainline late
    - **Adopt Trainline's value (full row)** — overwrites our row with Trainline's, flips `source` back to `'trainline'`, clears drift.
    - **Adopt selected fields only** — partial adoption; row stays `'manual'`; drift entry cleared.
 
-4. A `GET /api/master/stations/drift` endpoint lists all pending-drift rows so the team can periodically reconcile.
+4. A `GET /api/master/stations/drift` endpoint lists all pending-drift rows so the team can periodically reconcile (removed in MSMM step 3).
 
 The same pattern applies to `master_carriers` (RICS dictionary) — pending-drift table, three resolution actions.
 
@@ -1066,7 +1072,7 @@ The audit row records `action=user.created` with `metadata={email, role, name}` 
 | `POST /api/journey/compare` | same + `session_id_a`, `session_id_b` | `{a, b, diff}` (kept for explicit two-session comparison) | logged-in |
 | `GET /api/journey/searches/<search_id>` | — | full recorded search with executions and trips | search owner or platform_admin |
 
-The journey UI's From/To autocomplete uses **`GET /api/master/stations?q=`** (§9.9) directly — no separate geocode endpoint exists.
+The journey UI's From/To autocomplete uses **`POST /api/stations/suggest`** (the station module, else VIATOR's Trainline list) and `GET /api/geocode` (MOTIS geocoder); `GET /api/master/stations?q=` was removed in MSMM step 3.
 
 ### 9.5 Audit
 
@@ -1110,12 +1116,8 @@ All write operations on master data are open to **content_manager and platform_a
 
 | Method & path | Body / params | Returns | Roles |
 |---|---|---|---|
-| `GET /api/master/stations?q=&country=&page=` | — | paginated `master_stations` rows; rows with pending drift include a flag | logged-in |
-| `POST /api/master/stations` | full row | `201 { ... }`, `source = 'manual'` | content_manager, platform_admin |
-| `PATCH /api/master/stations/<uic>` | partial | updated row, `source = 'manual'` | content_manager, platform_admin |
-| `POST /api/master/stations/refresh-trainline` | — | `{ added, updated, skipped_manual, pending_drift }` | content_manager, platform_admin |
-| `GET /api/master/stations/drift` | — | list of pending-drift rows with field-level diffs | content_manager, platform_admin |
-| `POST /api/master/stations/<uic>/drift/resolve` | `{ action: 'keep_ours' \| 'adopt_full' \| 'adopt_fields', fields?: [...] }` | updated row | content_manager, platform_admin |
+| `POST /api/master/stations/search` | `{ q }` (3 to 100 characters) | `{ origin: 'msmm' \| 'trainline', stations: [≤10] }`; no list, no paging (MSMM step 3: the station list, edit and drift routes are removed) | content_manager, platform_admin |
+| `POST /api/master/stations/refresh-trainline` | — | `{ added, updated, skipped_manual, pending_drift, parent_links_set }` | content_manager, platform_admin |
 | `GET /api/master/route-aliases?q=` | — | list | content_manager, platform_admin |
 | `POST /api/master/route-aliases` | `{ canonical_name, alias, applies_from?, applies_until?, scope? }` | `201 { ... }` | content_manager, platform_admin |
 | `DELETE /api/master/route-aliases/<id>` | — | `204` | content_manager, platform_admin |

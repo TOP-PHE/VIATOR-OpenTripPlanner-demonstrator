@@ -6,7 +6,7 @@ person who owns the GitHub repo, the GHCR container registry, and the VPS
 running the stack.
 
 If you're an end user (running journey searches in the browser) or a
-content manager (curating master stations / aliases), this is **not** the
+content manager (searching stations, curating aliases), this is **not** the
 doc you want — see `docs/nap-fr-rail.md` for an operator walkthrough and
 the in-app help in Admin → Configuration for runtime knobs.
 

@@ -106,7 +106,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 
 ![The journey fanout — one search broadcast to every serving session and to the reference planners at the same time](diagrams/arch-journey-fanout.svg)
 
-1. Browser loads `/journey` — `app/api/pages.py` renders `templates/journey.html`. The station typeahead calls `GET /api/master/stations` (`api/master/stations.py`, the UIC registry) and `GET /api/geocode` (`api/geocode.py`, which proxies the first serving MOTIS session's `/api/v1/geocode` so urban stops missing from Trainline still resolve; returns `[]` rather than 5xx if no MOTIS is up).
+1. Browser loads `/journey` — `app/api/pages.py` renders `templates/journey.html`. The station typeahead calls `POST /api/stations/suggest` (`api/station_suggest.py`: the station module, or VIATOR's own Trainline list when the module is not used or does not answer) and `GET /api/geocode` (`api/geocode.py`, which proxies the first serving MOTIS session's `/api/v1/geocode` so urban stops missing from Trainline still resolve; returns `[]` rather than 5xx if no MOTIS is up).
 2. Form POSTs `/api/journey/fanout` → `api/journey.py::fanout`, gated by `Depends(require_logged_in)`.
 3. `config_service.get_all(db)` loads `platform_config` (30 s in-process cache). `_validate_engine_filter(body.engine)` 400s on a bad engine; `_select_fanout_sessions(db, engine)` selects sessions where `state='serving' AND include_in_fanout`. Empty → 409 with a message distinguishing "no sessions at all" from "none with that engine".
 4. `concurrency.semaphores.journey.acquire_or_fail()` — `MAX_CONCURRENT_JOURNEYS` (default 20). **Rejects rather than queues**; caller gets 503 + `Retry-After`. `recorder.begin_search()` writes the `journey_searches` row.
@@ -205,7 +205,8 @@ JSON in the address bar.
 | `api/admin/network_coverage.py` | 1,528 | Hubs, runs, cells, external verify, HTML export |
 | `api/auth/routes.py` | 450 | register / login / reset / bootstrap / nginx `auth_request` |
 | `api/reports.py` | 378 | Search analytics, O&D pairs, version-diff, CSV |
-| `api/master/stations.py` | 324 | UIC station registry + Trainline drift resolution |
+| `api/master/stations.py` | 99 | The Stations page's search (the typeahead's, shared) + Trainline refresh |
+| `api/station_suggest.py` | 240 | Journey typeahead: the station module, else VIATOR's Trainline list |
 | `api/pages.py` | 310 | Jinja shells; redirect-on-auth-failure |
 | `api/credentials.py` | 307 | Per-user credential library (secrets never returned) |
 | `api/admin/nap_catalogues.py` | 308 | NAP catalogue CRUD feeding the Import-from-NAP picker |
@@ -228,13 +229,11 @@ and is off unless both are set.
 | POST | `/api/journey/plan` | Same query against one named session | logged-in |
 | GET | `/api/journey/searches/{id}` | Recorded search + executions + trips | owner or admin |
 | GET | `/api/geocode?q=&size=` | MOTIS stop typeahead proxy | logged-in |
+| POST | `/api/stations/suggest` | Typeahead stations, body `{"q"}`: ≤10 from the station module, else VIATOR's Trainline list; no slowapi limit (the module's per-person limits) | logged-in |
 | GET/POST | `/api/credentials` | List / create own credentials | logged-in |
 | PATCH/DELETE | `/api/credentials/{id}` | Update / drop own credential | logged-in (own only) |
-| GET | `/api/master/stations` | Paged UIC registry (`filter` \| `context` mode) | content_manager |
-| PATCH | `/api/master/stations/{uic}` | Manual station edit (sets `source='manual'`) | content_manager |
-| POST | `/api/master/stations/refresh-trainline` | Re-pull the Trainline CSV | content_manager |
-| GET | `/api/master/stations/drift` | Pending Trainline-vs-ours differences | content_manager |
-| POST | `/api/master/stations/{uic}/drift/resolve` | `keep_ours` \| `adopt_full` \| `adopt_fields` | content_manager |
+| POST | `/api/master/stations/search` | The Stations page's search, body `{"q"}`: the typeahead's checks, module call and fallback; answers `{"origin": "msmm"\|"trainline", "stations": [≤10]}`; no list, no paging, no total, no edit | content_manager |
+| POST | `/api/master/stations/refresh-trainline` | Re-pull the Trainline CSV (VIATOR's fallback list) | content_manager |
 | GET/POST | `/api/master/route-aliases` | List / create alias | content_manager |
 | DELETE | `/api/master/route-aliases/{id}` | Drop alias | content_manager |
 | GET/POST | `/api/sessions` | List / create session (slug, category, engine validated) | platform_admin |
@@ -279,7 +278,7 @@ and is off unless both are set.
 | GET | `/login`, `/register`, `/confirm/{t}`, `/reset[/{t}]` | Auth page shells | anon |
 | GET | `/journey`, `/credentials` | Operator pages | redirect if anon |
 | GET | `/admin/users`, `/admin/config`, `/admin/sessions`, `/admin/reports`, `/admin/network-coverage`, `/admin/nap-catalogues` | Admin page shells | redirect if anon, 403 HTML if not admin |
-| GET | `/admin/master/stations` | Station registry page | admin or content_manager |
+| GET | `/admin/master/stations` | Stations search page (read only) | admin or content_manager |
 | GET | `/`, POST `/upload` | Legacy Phase-1 upload UI (`main.py`) | HTTP basic — off unless `ADMIN_USER` and `ADMIN_PASSWORD` are both set |
 | GET | `/healthz`, `/healthz/version` | Liveness + deployed image version | anon |
 
@@ -1231,15 +1230,17 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 
 VIATOR's product is a comparison: the same query answered by several engines, side by side. That only works if two engines' answers can be recognised as describing *the same place*. They never say it the same way — OTP on Swiss data emits `SBB:8507000:0:7`, Swiss OJP `ch:1:sloid:7000:4:7`, SNCF `StopArea:OCE85010082`, ÖBB HAFAS `A=1@L=8503000`. Master data is the identity layer that collapses those into one thing.
 
+Since MSMM step 3 **the station module is the reference for a station** (what a person sees and picks: names, positions, codes), and station edits are made only there. VIATOR's `master_stations` stays as the Trainline list: the fallback when the module does not answer, and the key of VIATOR's internal joins (the federated planner, the country check of sessions, `stations_xref`), which stay on Trainline's codes until code agreement is measured (issue #331).
+
 Two halves. **A UIC-keyed registry of European stations** carrying every operator's private code for that station, plus a table of service-name equivalences (`TGV` ⇄ `TGV INOUI`) doing the same for train names. And **a registry of NAP endpoints** — a *NAP* (National Access Point) is the public catalogue each EU country must run listing where its operators publish timetables. That half is about where feeds come from: saved URLs plus, for NAPs needing an API key, an attached credential.
 
 ### Key modules
 
 | Module | Role |
 |---|---|
-| `app/models/master.py` | `MasterStation` (UIC-keyed registry), `RouteAlias`, `MasterCarrier` (RICS dictionary), two `*_pending_drift` mirrors |
+| `app/models/master.py` | `MasterStation` (UIC-keyed registry), `RouteAlias`, `MasterCarrier` (RICS dictionary), two `*_pending_drift` mirrors, `MasterStationEditArchive` (the station edits archived by MSMM step 3; read by nothing) |
 | `app/master/trainline.py` | Bootstrap + refresh from the trainline-eu/stations CSV; the drift-protection upsert |
-| `app/api/master/stations.py` | Station list/search, manual edit, "refresh Trainline", drift queue + resolution |
+| `app/api/master/stations.py` | The Stations page's search (the typeahead's functions, `station_suggest.py`) and "refresh Trainline"; no list, no edit, no drift queue |
 | `app/api/master/aliases.py` | Route-alias CRUD (list / create / delete — no update; delete and recreate) |
 | `app/models/nap_catalogues.py` | `NapCatalogue` — one saved NAP endpoint, optionally with a credential |
 | `app/master/nap_importer.py` | Fetch a NAP catalogue, filter it, emit provider entries for a session's config |
@@ -1261,9 +1262,9 @@ Consumers sit outside the cluster: `journey/signature.py` (fingerprinting), `api
 
 Import is `trainline.py`, from the trainline-eu/stations CSV (ODbL, semicolon-delimited). Its docstring names the trap that bites first: the CSV has *two id spaces*. `uic` is official and becomes our PK; `id` is Trainline's own sequential integer; and `parent_station_id` points at the parent's **Trainline `id`, not its UIC**. `parse_csv` builds a `trainline_id → uic` map from the same file and returns parent links separately; `upsert_with_drift_protection` applies them in a **second pass after every row exists**, because inserting a child before its parent trips the self-referential FK.
 
-**Drift protection** is the other half. A row with `source='manual'` is *never* overwritten by a refresh — the upstream row goes to `master_stations_pending_drift` with a `fields_differing` list for a human to resolve (`keep_ours` / `adopt_full` / `adopt_fields`). `_diff_fields` decomposes `other_codes` per key (`other_codes.obb`) so the queue says *which* operator code changed. Refresh runs daily at 04:00 from the APScheduler cron in `main.py`, and on demand via `POST /api/master/stations/refresh-trainline`.
+**Drift protection** is the other half, **dormant since MSMM step 3**. A row with `source='manual'` is *never* overwritten by a refresh — the upstream row goes to `master_stations_pending_drift` with a `fields_differing` list (`_diff_fields` decomposes `other_codes` per key, `other_codes.obb`). The edit route and the drift queue that made and resolved such rows are gone; revision `20261010_1200_edit_archive` copied every `manual` row and every drift row into `master_stations_edit_archive`, *then* set the rows back to `source='trainline'` and deleted the drift rows, in one transaction, printing the count to the start log. No code can make a row `manual` any more; the branch and the drift table stay until the owner drops them. `docs/admin-guide.md` §11.1 gives the `psql` lines that read the archive. Refresh runs daily at 04:00 from the APScheduler cron in `main.py`, and on demand via `POST /api/master/stations/refresh-trainline`.
 
-**Matching at query time** uses two mechanisms. *Typeahead*: `journey.html` fires `/api/master/stations?q=` and `/api/geocode?q=` in parallel; master rows win a lowercased-name collision "because they carry UIC + dedicated operator codes", and coord-less rows are dropped. Picking one stashes its UIC in a hidden field, and `_stop_id_for(session, uic)` builds `<feedId>:<uic>` so OTP routes by stop rather than coordinate — bypassing the walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering. *Fingerprinting*: `trip_signature` (within-session) resolves `stop_id → UIC` by DB lookup in `stations_xref`, falling back to lat/lon at 4 dp; `transit_fingerprint` (cross-engine) parses the UIC out of the stop-id string with a regex instead, because `stations_xref` has no rows for the synthetic OJP reference feed. `route_short_name` is canonicalised through `route_aliases` before hashing — that is what `RouteAlias` exists for.
+**Matching at query time** uses two mechanisms. *Typeahead*: `journey.html` fires `POST /api/stations/suggest` (the station module, else VIATOR's Trainline list, from 3 characters) and `/api/geocode?q=` in parallel; station rows win a lowercased-name collision because they carry a code, and coord-less rows are dropped. Picking one stashes its UIC in a hidden field, and `_stop_id_for(session, uic)` builds `<feedId>:<uic>` so OTP routes by stop rather than coordinate — bypassing the walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering. *Fingerprinting*: `trip_signature` (within-session) resolves `stop_id → UIC` by DB lookup in `stations_xref`, falling back to lat/lon at 4 dp; `transit_fingerprint` (cross-engine) parses the UIC out of the stop-id string with a regex instead, because `stations_xref` has no rows for the synthetic OJP reference feed. `route_short_name` is canonicalised through `route_aliases` before hashing — that is what `RouteAlias` exists for.
 
 ### How it works — NAP catalogues and the importer
 
@@ -1293,7 +1294,9 @@ The NAP URL is operator-supplied and reaches network I/O, so `_validate_safe_htt
 | `is_main_station` / `is_suggestable` | default FALSE / TRUE |
 | `trigramme_sncf`, `db_code`, `trenitalia_code`, `renfe_code`, `atoc_code` | dedicated operator codes |
 | `other_codes` / `name_translations` | JSONB: `{"obb": …, "sbb": …}` / `{"fr": …, "de": …}` |
-| `source` | CHECK: `trainline` \| `sncf` \| `manual` \| `merits` \| `other` |
+| `source` | CHECK: `trainline` \| `sncf` \| `manual` \| `merits` \| `other`; no code writes `manual` since MSMM step 3 |
+
+`master_stations_edit_archive` (PK `uic`, written once by revision `20261010_1200_edit_archive`, no FK): `station` JSONB (every column of the row as it stood), `drift_snapshot` JSONB / `drift_fields` text[] / `drift_detected_at` (the pending drift row, when there was one), `archived_at`. The downgrade writes the rows back as `manual`, recreates the drift rows and drops the table.
 
 `nap_catalogues`: `id` UUID PK · `name` ≤80, **unique** (the picker must be unambiguous) · `url` ≤2048 · `default_country` ISO-2 · `default_modes` comma-joined subset of `{rail, urban, bus, bike}` · `credential_id` FK → `user_credentials`, nullable, `ON DELETE SET NULL` · `note` ≤280, never sent to the NAP.
 
@@ -1309,11 +1312,12 @@ Provider dict emitted by `make_provider_from_dataset`, destined for `session.con
 ### Invariants & traps
 
 - **UIC is the identity; everything else is a nickname.** Any new adapter must normalise to `UIC:<7 digits>`. Lose that and cross-engine matching degrades silently to coordinate matching — which reads as "the engines disagree".
-- **Editing a station via the API sets `source='manual'` permanently.** `patch_station` does it on any change. The row is then excluded from every future refresh and accumulates drift entries instead. `adopt_full` flips `source` back to `'trainline'` and re-enrols it in silent updates; `adopt_fields` does **not**.
+- **Stations cannot be edited in VIATOR (MSMM step 3, decisions 53 and 55).** Corrections are made in the station module's reference screen. The edits made before were archived (`master_stations_edit_archive`) and their rows handed back to the import; an archived row whose code Trainline has since dropped keeps its edited values, marked `trainline`, because the import never deletes a row (the second `psql` line of `docs/admin-guide.md` §11.1 lists them). Do not reintroduce a write path that sets `manual`: the import would freeze that row again.
+- **The Stations page must stay a search, not a list.** `POST /api/master/stations/search` gives at most 10 rows for 3 characters or more, with no paging and no total, through the module's per-person limits (the same counters as the typeahead); an empty module answer is `origin: "msmm"` and is never topped up with Trainline rows. A route that lists `master_stations` would undo decision 54.
 - **`parent_station_id` in the CSV is a Trainline integer, not a UIC.** Rows without a UIC are skipped entirely, so a parent link can dangle and is dropped.
 - **Pass 2 of the upsert deliberately carries `WHERE source != 'manual'`.** Remove it and a refresh silently rewrites operator-rebuilt parent relationships.
 - **`stations_xref` is read but never written.** `trip_signature` looks up `(session_id, stop_id)` in it and `sessions.py` deletes its rows on session delete, but nothing in the repo populates it. In practice the within-session signature always falls back to lat/lon, and real cross-engine matching is done by `transit_fingerprint`'s regex parse. Do not assume the table has rows.
-- **`GET /api/master/stations` requires `content_manager` or `platform_admin`,** while `/journey` is open to `end_user` — and the typeahead's `_fetchJson` returns `[]` on any non-2xx. For an `end_user` the station list silently vanishes, suggestions come from the MOTIS geocoder only, and no UIC is attached. Symptom: "stop-id routing stopped working for one user".
+- **The journey typeahead and the Stations page share one search** (`station_suggest.query_or_422` and `find_stations`): the typeahead under `require_logged_in`, the page under `require_content_manager`. A change to the text rules or the fallback changes both.
 - **`MASTER_STATIONS_REFRESH_DAYS` is in `CONFIG_SCHEMA` and the admin config UI, but nothing reads it.** `main.py` claims the interval is "handled in `trainline.refresh()`"; that function has no such check — the 04:00 cron refreshes every day. Same for `MASTER_CARRIERS_REFRESH_DAYS`: `master_carriers` has no importer, API or UI today, only the model.
 - **`trigramme_sncf` is populated from Trainline's `sncf_id`** (`FRPNO`), not `sncf_tvs_id` (the actual 3-letter TVS trigramme, present in the CSV but unmapped). The column name over-promises.
 - **`_normalise_country` accepts only a 2-character *alphabetic* value** from `covered_area[].insee`. Numeric INSEE codes (`75`, `75056`) yield `None` and the dataset falls back to the caller's `country`. It is fishing for an ISO-2 code, not parsing INSEE.
@@ -1773,7 +1777,8 @@ survives as the migration seed and legacy fallback.
 | `master_stations` | `uic` (String PK) | `name`, `slug`, `country_iso`, `latitude`/`longitude`, `parent_uic` (self-FK), `is_main_station`, `is_suggestable`, operator codes (`trigramme_sncf`, `db_code`, `trenitalia_code`, `renfe_code`, `atoc_code`, `other_codes` JSONB), `name_translations` JSONB, `source` CHECK `trainline`\|`sncf`\|`manual`\|`merits`\|`other` |
 | `route_aliases` | `id` UUID | `canonical_name` ⇄ `alias` (e.g. TGV ⇄ TGV INOUI), optional `applies_from/until`, `scope_country`, `scope_carrier`; unique on the 4-tuple |
 | `master_carriers` | `rics_code` PK | `short_name`, `full_name`, `country_iso`, `legacy_codes` JSONB |
-| `master_stations_pending_drift` / `master_carriers_pending_drift` | mirrors the parent PK | `*_snapshot` JSONB + `fields_differing` `ARRAY(String)` — upstream values that disagree with local edits, surfaced in the admin UI rather than silently overwritten |
+| `master_stations_pending_drift` / `master_carriers_pending_drift` | mirrors the parent PK | `*_snapshot` JSONB + `fields_differing` `ARRAY(String)` — upstream values that disagree with local edits; the stations one is empty and dormant since MSMM step 3 (no screen reads it) |
+| `master_stations_edit_archive` | `uic` | `station` JSONB, `drift_snapshot` JSONB, `drift_fields`, `drift_detected_at`, `archived_at` — the station edits archived by MSMM step 3; read by nothing in the application |
 | `stations_xref` | `(session_id, stop_id)` | `uic` (FK→`master_stations.uic`), `trigramme`, `insee`, `rics` — the per-session bridge `trip_signature` reads |
 
 #### Supporting tables
@@ -1878,7 +1883,7 @@ That is a deliberate constraint, and it has consequences a contributor must inte
 | `/admin/users` | `admin/users.html` | platform_admin | Create users, change roles, deactivate |
 | `/admin/nap-catalogues` | `admin/nap_catalogues.html` | platform_admin | CRUD the National Access Point endpoints that feed the Import-from-NAP picker |
 | `/admin/reports` | `admin/reports.html` | platform_admin | Volume/latency per session and per user; CSV download |
-| `/admin/master/stations` | `admin/master_stations.html` | platform_admin **or** content_manager | Search/edit the UIC station registry; review Trainline drift queue |
+| `/admin/master/stations` | `admin/master_stations.html` | platform_admin **or** content_manager | Search stations (≤10 a search, each labelled MSMM or Trainline; "open in the module" for administrators); refresh the Trainline list. Read only |
 | `/credentials` | `credentials.html` | any logged-in user | Store AES-256-GCM-encrypted feed credentials (write-only — never displayed back) |
 | `/login`, `/register`, `/confirm/{t}`, `/reset`, `/reset/{t}` | `auth/*.html` | public | Auth flows |
 | `/` | `index.html` | HTTP-basic (`authed_or_none`) | **Legacy Phase-1 upload dashboard.** Standalone `<!doctype html>` — does *not* extend `_base.html`. Redirects to `/login` when `ADMIN_USER` is empty |
@@ -1922,11 +1927,12 @@ able to see that a source *was queried and came back empty*, which is a finding,
 Note `body` is injected raw: **the caller escapes, not the primitive.**
 
 **The journey page.** The form is two typeahead boxes plus hidden `lat`/`lon`/`name`/`uic` fields
-per endpoint. The typeahead queries two sources in parallel — `/api/master/stations` (curated
-Trainline/UIC registry) and `/api/geocode` (proxied MOTIS geocoder, which unlocks urban stops like
-Basel trams that aren't in the registry) — and merges them with master_stations winning on
-lowercased-name collision, dropping any row without coordinates. Both fetches are wrapped in a
-tolerant `_fetchJson` that returns `[]` on any failure so a 500 from one source can't break the
+per endpoint. The typeahead queries two sources in parallel — `POST /api/stations/suggest` (the station module,
+or VIATOR's Trainline list when the module is not used or does not answer) and `/api/geocode`
+(proxied MOTIS geocoder, which unlocks urban stops like Basel trams that aren't in the registry) —
+and merges them with the stations winning on lowercased-name collision, dropping any row without
+coordinates. Both fetches are wrapped in a
+tolerant helper (`_postJson`, `_fetchJson`) that returns `[]` on any failure so a 500 from one source can't break the
 keystroke handler. The `input` handler **clears the hidden coords whenever the visible text no
 longer matches the picked name** — this fixed a real bug where retyping the destination silently
 routed to the previous station's coordinates.

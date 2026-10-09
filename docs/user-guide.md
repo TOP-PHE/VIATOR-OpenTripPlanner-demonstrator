@@ -62,7 +62,7 @@ sees.
 | **Journey search** | `/journey` | Plan one journey; compare engines and reference planners side by side |
 | **Network coverage** | `/admin/network-coverage` | Systematically test many station pairs at once; the main analytical surface |
 | Sessions | `/admin/sessions` | Onboard data, build routing graphs, control which are live |
-| Master stations | `/admin/master/stations` | Station identity: UIC codes, aliases, cross-references |
+| Stations | `/admin/master/stations` | Search stations (from the station module, or VIATOR's Trainline list as a fallback); refresh the Trainline list. Read only: stations are corrected in the station module |
 | NAP catalogues | `/admin/nap-catalogues` | Saved National Access Point endpoints (and their credentials) |
 | Reports | `/admin/reports` | Search history and analytics |
 | Configuration | `/admin/config` | Platform behaviour, changed without redeploying |

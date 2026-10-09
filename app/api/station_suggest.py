@@ -37,8 +37,8 @@ Where the stations come from:
 2. **VIATOR's own `master_stations` list otherwise** (the module not
    configured, paused, failing, or a user without an id), with the same
    guards: name contains `q` (its `%`, `_` and backslash literal) or UIC
-   equals `q`, rows with a position only, ordered by `(country_iso, name)`
-   like the admin station list, at most 10 rows, tagged `source: "viator"`.
+   equals `q`, rows with a position only, ordered by `(country_iso, name)`,
+   at most 10 rows, tagged `source: "viator"`.
    Every value of `q` is a bound parameter, never in the statement's text,
    which VIATOR's SQLAlchemy tracing records.
 
