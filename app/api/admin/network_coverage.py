@@ -211,6 +211,25 @@ _CONFIRM_REFUSED = (
 )
 
 
+# The refusals of the hub form's and the station codes' routes, for their
+# OpenAPI answers.
+_BODY_422: dict[int | str, dict[str, Any]] = {
+    422: {"description": "The body breaks a rule: a fixed sentence, never the input."},
+}
+_HUB_CODE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_BODY_422,
+    403: {"description": "Not a platform administrator, or not a VIATOR user."},
+}
+_HUB_CREATE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_BODY_422,
+    409: {"description": "A hub with this id already exists."},
+}
+_HUB_UPDATE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **_BODY_422,
+    404: {"description": _HUB_NOT_FOUND},
+}
+
+
 def _body_or_422[M: BaseModel](model: type[M], given: Any, refused: str) -> M:
     """`given` (the parsed JSON body) as `model`, or a 422 whose detail is
     `refused` and the names of the fields at fault, never a value."""
@@ -224,7 +243,7 @@ def _body_or_422[M: BaseModel](model: type[M], given: Any, refused: str) -> M:
                 if error["loc"] and str(error["loc"][0]) in model.model_fields
             }
         )
-        detail = refused + (f" Fields at fault: {', '.join(fields)}." if fields else "")
+        detail = refused + f" Fields at fault: {', '.join(fields)}." if fields else refused
         raise HTTPException(status_code=422, detail=detail) from None
 
 
@@ -654,7 +673,7 @@ def list_hubs(
     ]
 
 
-@router.post("/hubs", response_model=HubInfo, status_code=201)
+@router.post("/hubs", response_model=HubInfo, status_code=201, responses=_HUB_CREATE_RESPONSES)
 def create_hub(
     body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
@@ -691,7 +710,7 @@ def create_hub(
     return _hub_to_info(hub)
 
 
-@router.patch("/hubs/{hub_id}", response_model=HubInfo)
+@router.patch("/hubs/{hub_id}", response_model=HubInfo, responses=_HUB_UPDATE_RESPONSES)
 def update_hub(
     hub_id: str,
     body: Annotated[Any, Body()],
@@ -893,12 +912,6 @@ def _module_refusal() -> str | None:
     if station_module.paused():
         return _MODULE_DID_NOT_ANSWER
     return None
-
-
-# The refusals of the three station-code routes, for their OpenAPI answers.
-_HUB_CODE_RESPONSES: dict[int | str, dict[str, Any]] = {
-    403: {"description": "Not a platform administrator, or not a VIATOR user."},
-}
 
 
 def _caller(admin: CurrentUser) -> uuid.UUID:

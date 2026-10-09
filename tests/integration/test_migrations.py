@@ -202,7 +202,8 @@ def test_the_models_check_is_the_revisions_check() -> None:
 
     path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / f"{_HUB_UIC}.py"
     spec = importlib.util.spec_from_file_location("hub_uic_revision", path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     revision = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(revision)
 
