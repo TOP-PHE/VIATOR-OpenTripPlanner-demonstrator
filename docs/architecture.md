@@ -1554,6 +1554,12 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   short-circuits on the empty env var, which is what keeps the test suite from dialling `tempo:4317`.
 - **Inbound `X-Request-ID` is only honoured if it matches `[A-Za-z0-9_-]{1,64}`**, otherwise a fresh
   UUID4 is minted — this is log-injection defence, not cosmetics.
+- **No query string in VIATOR's own logs (#339).** `setup_logging` (and the worker's setup) set
+  the `httpx`/`httpcore` loggers to WARNING, because their INFO request line prints the full URL —
+  a `query` feed credential (`?apikey=…`) or the typed geocoder text. `DropTypedQueryString` cuts
+  the query off `/api/geocode` in the uvicorn access log. Do not lower those loggers to INFO to
+  debug a feed: the line would print the credential. nginx's access log and the OTel spans still
+  carry full URLs (open, admin-guide §5.4).
 - **Worker-side metrics do not exist.** `/metrics` is served by the web container only; build-duration
   histograms from the worker are explicitly out of scope (they'd need multiprocess metric storage).
 

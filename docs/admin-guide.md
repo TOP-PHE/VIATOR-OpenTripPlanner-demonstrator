@@ -759,6 +759,26 @@ Switch to colored console output for local dev: set `LOG_FORMAT=console` in
 the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
 (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) and defaults to `INFO`.
 
+**What the logs leave out on purpose (#339).** A query string can carry a
+secret or what a user typed: a feed credential of auth type `query` is added
+to the feed's URL as `?<param>=<value>` (`app/credentials.py`), and the
+station fields of `/journey` send the typed text to `/api/geocode?q=…`, which
+VIATOR forwards to MOTIS as `?text=…`. So:
+
+- the `httpx` and `httpcore` loggers are set to `WARNING` in web and worker:
+  their INFO line `HTTP Request: GET <full URL> "<status>"` is not written
+  (their warnings and errors still are);
+- the uvicorn access log keeps `GET /api/geocode` but drops its query
+  string (`app/logging_config.py`, `DropTypedQueryString`). The station list
+  (`POST /api/stations/suggest`) takes its text in the body and is not
+  affected.
+
+Still carrying full URLs, and not changed by #339 (open points):
+nginx's default access log (`$request`, query string included, for
+`/api/geocode?q=…` and any other route), and the OpenTelemetry spans of the
+httpx and FastAPI instrumentation sent to Tempo, whose URL attributes can
+include the query string of an outgoing feed request or of `/api/geocode`.
+
 ### 5.5 Prometheus metrics (audit #14, since v0.1.32.15+)
 
 The web container exposes `/metrics` in Prometheus exposition format. Three
@@ -1518,7 +1538,8 @@ failure stays a WARNING with a reason word and the exception's type, e.g.
 `MOTIS geocoder unreachable for session <sid>: reason=timeout (ReadTimeout)`
 (`timeout` is the 1.5 s budget, `connect` a refused or unresolved
 connection, `network` another transport error). Neither line carries the
-typed text.
+typed text, nor do httpx's request lines or the uvicorn access line of
+`/api/geocode` (§5.4, "What the logs leave out on purpose").
 
 ---
 
