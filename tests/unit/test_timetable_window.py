@@ -241,3 +241,26 @@ async def test_an_otp_no_route_stays_a_no_route(monkeypatch: pytest.MonkeyPatch)
 
     assert status == "no_route"
     assert refusal is None
+
+
+# ───────────────────── the parsers never raise (#339 review) ─────────────────────
+
+
+def test_a_deeply_nested_body_is_no_refusal_and_no_exception() -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    response = _response(400, content=deep.encode(), headers={"content-type": "application/json"})
+    assert from_motis_refusal(response) is None
+
+
+@pytest.mark.parametrize(
+    "routing_errors",
+    [7, 7.5, True, {"code": "OUTSIDE_SERVICE_PERIOD"}],
+    ids=["int", "float", "bool", "dict"],
+)
+def test_otp_routing_errors_of_another_type_are_no_refusal(routing_errors: Any) -> None:
+    raw = {"data": {"planConnection": {"edges": [], "routingErrors": routing_errors}}}
+    assert from_otp_answer(raw) is None
+
+
+def test_otp_answer_that_is_not_an_object_is_no_refusal() -> None:
+    assert from_otp_answer([]) is None  # type: ignore[arg-type]

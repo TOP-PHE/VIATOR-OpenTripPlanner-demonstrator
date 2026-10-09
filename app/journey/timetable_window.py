@@ -36,7 +36,7 @@ OUTSIDE_TIMETABLE = "outside_timetable"
 _MOTIS_PHRASE = "is outside of loaded timetable window"
 # A MOTIS error longer than this is not the one recognised here.
 _MAX_MESSAGE = 400
-_STAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})")
+_STAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2})")
 
 
 @dataclass(frozen=True)
@@ -78,7 +78,7 @@ def from_motis_refusal(response: httpx.Response) -> OutsideTimetable | None:
         return None
     try:
         body = response.json()
-    except ValueError:
+    except (RecursionError, TypeError, ValueError):  # never raise: no refusal then
         return None
     message = body.get("error") if isinstance(body, dict) else None
     if not isinstance(message, str) or len(message) > _MAX_MESSAGE:
@@ -96,7 +96,14 @@ def from_motis_refusal(response: httpx.Response) -> OutsideTimetable | None:
 
 def from_otp_answer(raw: dict[str, Any]) -> OutsideTimetable | None:
     """OTP's `OUTSIDE_SERVICE_PERIOD` routing error on an answer with no
-    itinerary, or None."""
+    itinerary, or None. Never raises, whatever the answer's shape."""
+    try:
+        return _otp_refusal(raw)
+    except (RecursionError, TypeError, ValueError):
+        return None
+
+
+def _otp_refusal(raw: Any) -> OutsideTimetable | None:
     data = raw.get("data") if isinstance(raw, dict) else None
     plan = data.get("planConnection") if isinstance(data, dict) else None
     if not isinstance(plan, dict) or plan.get("edges"):
