@@ -876,3 +876,67 @@ def test_the_distance_is_the_haversine_in_metres() -> None:
     assert network_coverage._distance_m(45.0, 6.0, 45.0, 6.0) == 0
     assert network_coverage._distance_m(45.0, 6.0, _north(45.0, 300), 6.0) == pytest.approx(300)
     assert network_coverage.PROPOSAL_RADIUS_M == 300
+
+
+# ───────────────────────── the manage-hubs panel ─────────────────────────
+
+TEMPLATE = REPO / "app" / "templates" / "admin" / "network_coverage.html"
+
+
+@pytest.fixture(scope="module")
+def template_text() -> str:
+    return TEMPLATE.read_text(encoding="utf-8")
+
+
+def _codes_script(text: str) -> str:
+    """The script of the station codes, from its banner to the toast helper."""
+    start = text.index("// MSMM step 3 — station codes of the hubs")
+    end = text.index("// Reuse the toast plumbing", start)
+    return text[start:end]
+
+
+def test_the_buttons_are_shown_only_with_the_module(template_text: str) -> None:
+    match = re.search(r"{% if station_module_enabled %}(.*?){% endif %}", template_text, re.S)
+    assert match
+    block = match.group(1)
+    assert 'id="hub-codes-resolve"' in block
+    assert 'id="hub-codes-check"' in block
+    assert template_text.count('id="hub-codes-resolve"') == 1
+    assert template_text.count('id="hub-codes-check"') == 1
+
+
+def test_module_data_never_goes_through_inner_html(template_text: str) -> None:
+    script = _codes_script(template_text)
+    code_lines = [line for line in script.splitlines() if not line.strip().startswith("//")]
+    assert not any("innerHTML" in line or "insertAdjacentHTML" in line for line in code_lines)
+    assert "textContent" in script
+    # The candidates' and the check's names and codes are text nodes.
+    assert "label.append(input, ` ${candidate.name}" in script
+    assert "hubCodesElement('strong', proposal.hub_name)" in script
+    assert '`The station module names it "${result.module_name}".`' in script
+
+
+def test_the_code_on_each_hub_row_is_written_as_text(template_text: str) -> None:
+    assert '<div class="hub-code" data-code-for="${escHTML(h.id)}"></div>' in template_text
+    fill = _codes_script(template_text)
+    assert "el.textContent = h ? hubCodeLabel(h) : '';" in fill
+    assert "fillHubCodes(list, hubs);" in template_text
+
+
+def test_the_form_sends_the_code_only_when_it_changed(template_text: str) -> None:
+    assert 'id="hub-form-uic" name="uic" maxlength="20"' in template_text
+    assert "if (typedUic !== HUB_EDIT_UIC) {" in template_text
+    assert "body.uic = typedUic || null;" in template_text
+    assert "HUB_EDIT_UIC = h.uic || '';" in template_text
+
+
+def test_a_429_holds_the_buttons_for_the_modules_retry_after(template_text: str) -> None:
+    script = _codes_script(template_text)
+    assert "holdHubCodeButtons(answer.retry_after || 60);" in script
+    assert "setHubCodeButtons(true);" in script  # also while a request runs
+
+
+def test_the_cell_dialog_link_carries_the_hub_code(template_text: str) -> None:
+    assert "const oUic = orig && orig.uic ? encodeURIComponent(orig.uic) : '';" in template_text
+    assert "&from_uic=${oUic}" in template_text
+    assert "&to_uic=${dUic}" in template_text
