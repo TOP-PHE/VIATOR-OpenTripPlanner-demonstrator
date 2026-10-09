@@ -122,10 +122,11 @@ def test_session_id_must_be_slug(client: TestClient, admin: dict[str, str]) -> N
 # ────────────────────────── master data ──────────────────────────
 
 
-def test_master_stations_empty(client: TestClient, admin: dict[str, str]) -> None:
-    r = client.get("/api/master/stations", headers=admin)
+def test_master_stations_search_empty(client: TestClient, admin: dict[str, str]) -> None:
+    # Without the station module, the search reads VIATOR's own (empty) list.
+    r = client.post("/api/master/stations/search", headers=admin, json={"q": "Zzville"})
     assert r.status_code == 200
-    assert r.json() == []
+    assert r.json() == {"origin": "trainline", "stations": []}
 
 
 def test_route_aliases_crud(client: TestClient, admin: dict[str, str]) -> None:

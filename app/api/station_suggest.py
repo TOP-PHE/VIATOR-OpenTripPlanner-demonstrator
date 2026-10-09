@@ -82,7 +82,7 @@ _ESCAPE = "\\"
 _WHITE_SPACE = re.compile(r"\s+")
 
 # The description of the route's 422 in its OpenAPI answers.
-_REFUSED_TEXT = (
+REFUSED_TEXT = (
     "The text is not one the station search accepts: 3 to 100 characters once "
     "normalised, no control character, no lone surrogate. Or the body is not "
     '{"q": <text>} and nothing else.'
@@ -218,7 +218,7 @@ async def find_stations(
 
 @router.post(
     "/suggest",
-    responses={422: {"description": _REFUSED_TEXT}},
+    responses={422: {"description": REFUSED_TEXT}},
     # The body is declared `Any` below so that the framework never validates
     # it (see the module's docstring); the published schema stays the model's.
     openapi_extra={

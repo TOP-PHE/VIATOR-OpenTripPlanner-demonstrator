@@ -1,282 +1,87 @@
-"""Master stations + drift API. See spec §9.9."""
+"""The "Stations" admin page's API: search, and the Trainline refresh.
+
+Since MSMM step 3 the station module is the reference for a station, and
+station edits are made only there (decisions 52 to 55 of the module's
+design). This router therefore has two routes, both for content managers and
+platform administrators (`require_content_manager`):
+
+- `POST /api/master/stations/search`: at most ten stations for a text of 3
+  characters or more. It is the journey typeahead's search
+  (app/api/station_suggest.py) under another gate: the same body check
+  (`query_or_422`), the same call of the module on behalf of the person, so
+  the same per-person counters at the module, and the same fallback on
+  VIATOR's own Trainline list (`find_stations`). The answer says once where
+  the stations come from: `{"origin": "msmm" | "trainline", "stations":
+  [...]}`. An empty answer of the module is `msmm` with no station: it is
+  never topped up with Trainline rows. No paging, no total, no list: the
+  table cannot be read off the page. No slowapi limit, as on the typeahead
+  (behind nginx it would be one counter for the whole site); the limits are
+  the module's.
+- `POST /api/master/stations/refresh-trainline`: the Trainline import on
+  demand, which keeps the fallback list and VIATOR's internal joins fresh.
+
+The paged list (`GET`), the edit (`PATCH /{uic}`) and the drift queue
+(`GET /drift`, `POST /{uic}/drift/resolve`) are gone. The edits made before
+were archived by revision 20261010_1200_edit_archive.
+"""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session as DbSession
 
 from ... import audit
 from ...db import get_db
 from ...master import trainline
-from ...models import MasterStation, MasterStationPendingDrift
 from ...security import CurrentUser, client_ip, require_content_manager
+from .. import station_suggest
 
 router = APIRouter(prefix="/api/master/stations", tags=["master", "stations"])
 
+# The fields of a station on the page, from either origin: those of the
+# typeahead's rows, the only ones the module gives.
+STATION_FIELDS = ("name", "latitude", "longitude", "country_iso", "uic")
 
-class StationResponse(BaseModel):
-    uic: str
-    name: str
-    country_iso: str | None
-    latitude: float | None
-    longitude: float | None
-    # Dedicated operator codes — frequently queried, displayed as columns
-    # in the admin UI's main station table.
-    trigramme_sncf: str | None
-    db_code: str | None
-    trenitalia_code: str | None
-    renfe_code: str | None
-    atoc_code: str | None
-    # Catch-all JSONB for less common operator codes — OBB, SBB, NTV,
-    # Trenord, Cercanías, Entur, Westbahn, Flixbus, Benerail, etc. UI
-    # renders dynamically via small operator badges.
-    other_codes: dict[str, str]
-    is_main_station: bool
-    source: str
-    has_drift: bool
-    # True when this row matches the search query (only meaningful in
-    # `context` mode — see list_stations). The UI uses this to highlight
-    # matching rows while keeping their alphabetical neighbours visible.
-    is_match: bool = False
-
-    @classmethod
-    def from_orm_with_drift(
-        cls,
-        s: MasterStation,
-        drift_uics: set[str],
-        *,
-        is_match: bool = False,
-    ) -> StationResponse:
-        return cls(
-            uic=s.uic,
-            name=s.name,
-            country_iso=s.country_iso,
-            latitude=s.latitude,
-            longitude=s.longitude,
-            trigramme_sncf=s.trigramme_sncf,
-            db_code=s.db_code,
-            trenitalia_code=s.trenitalia_code,
-            renfe_code=s.renfe_code,
-            atoc_code=s.atoc_code,
-            other_codes=s.other_codes or {},
-            is_main_station=s.is_main_station,
-            source=s.source,
-            has_drift=s.uic in drift_uics,
-            is_match=is_match,
-        )
+_FORBIDDEN = {"description": "Content-manager or platform-admin access required."}
 
 
-class StationPatch(BaseModel):
-    name: str | None = None
-    country_iso: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
-    trigramme_sncf: str | None = None
-    db_code: str | None = None
+def _shown(row: dict[str, Any]) -> dict[str, Any]:
+    """A station row in the page's shape: the five fields, nothing else."""
+    return {field: row.get(field) for field in STATION_FIELDS}
 
 
-class DriftResolveBody(BaseModel):
-    action: str  # 'keep_ours' | 'adopt_full' | 'adopt_fields'
-    fields: list[str] | None = None
-
-
-# ────────────────────────── search / list ──────────────────────────
-
-
-def pinned_page(page: int | None) -> int:
-    """The page the caller asked for; the first one when it asked for none."""
-    return 0 if page is None else page
-
-
-def drift_uics_of(db: DbSession) -> set[str]:
-    """The UICs with a pending drift.
-
-    Only the key is read. The rows carry `trainline_snapshot`, a JSONB
-    document per station, and this runs on every call of the list — per
-    keystroke from the journey typeahead.
-    """
-    return set(db.execute(select(MasterStationPendingDrift.uic)).scalars().all())
-
-
-@router.get("", response_model=list[StationResponse])
-def list_stations(
-    response: Response,
+@router.post(
+    "/search",
+    responses={
+        403: _FORBIDDEN,
+        422: {"description": station_suggest.REFUSED_TEXT},
+    },
+    # The body is declared `Any` below so that the framework never validates
+    # it (see app/api/station_suggest.py); the published schema is the model's.
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {"schema": station_suggest.SuggestBody.model_json_schema()}
+            },
+            "required": True,
+        }
+    },
+)
+async def search_stations(
+    user: Annotated[CurrentUser, Depends(require_content_manager)],
     db: Annotated[DbSession, Depends(get_db)],
-    _: Annotated[CurrentUser, Depends(require_content_manager)],
-    q: str | None = Query(None, description="Substring of name (case-insensitive)"),
-    country: str | None = Query(None, max_length=2),
-    page: Annotated[
-        int | None,
-        Query(
-            ge=0,
-            description=(
-                "Omitted: the first page, or in `context` mode with `q` the page of "
-                "the first match. Given: that page, 0 included."
-            ),
-        ),
-    ] = None,
-    size: int = Query(50, ge=1, le=500),
-    mode: str = Query(
-        "filter",
-        pattern="^(filter|context)$",
-        description=(
-            "filter (default): hides non-matching rows. "
-            "context: returns the page containing the first alphabetical match "
-            "(or the requested `page` if no match), with `is_match` set on rows "
-            "that satisfy the query — lets the UI highlight matches in place "
-            "while keeping their alphabetical neighbours visible."
-        ),
-    ),
-) -> list[StationResponse]:
-    """List master stations with pagination.
-
-    Headers:
-        X-Total-Count: total rows matching the country filter (in `filter`
-                       mode this is also constrained by `q`; in `context`
-                       mode `q` doesn't shrink the universe — it only
-                       drives where the page lands and which rows are
-                       flagged is_match).
-        X-Match-Count: when `q` is set, how many rows match across the
-                       entire (country-filtered) universe. In `context`
-                       mode, useful for "N matches across all pages".
-        X-Match-Page:  when `q` is set in context mode, the page index
-                       containing the first match (the same `page` the
-                       endpoint navigated to unless overridden by the
-                       caller). Lets the UI present "showing matches on
-                       page X of Y" without a second round-trip.
-
-    `page` is optional. Omitted, the caller has pinned no page: it gets the
-    first one, or in context mode with `q` the page of the first match.
-    Given, it is the page shown — `page=0` is the first page, not "no page".
-
-    Sorting is `(country_iso, name)`, stable across requests.
-    """
-    base_filter = select(MasterStation)
-    if country:
-        base_filter = base_filter.where(MasterStation.country_iso == country.upper())
-
-    match_clause = None
-    if q:
-        like = f"%{q}%"
-        match_clause = or_(MasterStation.name.ilike(like), MasterStation.uic.ilike(like))
-
-    # Universe = the alphabetical list the UI is paging through. In filter
-    # mode, the universe shrinks to matches; in context mode, it doesn't.
-    universe = base_filter
-    if mode == "filter" and match_clause is not None:
-        universe = universe.where(match_clause)
-
-    # Total for X-Total-Count — the full universe size, not just this page.
-    total = db.execute(select(func.count()).select_from(universe.subquery())).scalar_one()
-    response.headers["X-Total-Count"] = str(total)
-
-    match_count = 0
-    match_page = pinned_page(page)
-    if q and match_clause is not None:
-        # How many matches across the (country-filtered) universe.
-        matches_universe = base_filter.where(match_clause)
-        match_count = db.execute(
-            select(func.count()).select_from(matches_universe.subquery())
-        ).scalar_one()
-        response.headers["X-Match-Count"] = str(match_count)
-
-        if mode == "context" and match_count > 0:
-            # Find the alphabetical position of the first match within the
-            # full base_filter universe, so we can compute which page to
-            # jump to. Postgres-side: count rows that come strictly before
-            # the first match in (country_iso, name) order.
-            first_match = db.execute(
-                base_filter.where(match_clause)
-                .order_by(MasterStation.country_iso, MasterStation.name)
-                .limit(1)
-            ).scalar_one_or_none()
-            if first_match is not None:
-                # Rows alphabetically before the first match.
-                before_filter = base_filter.where(
-                    or_(
-                        MasterStation.country_iso < first_match.country_iso,
-                        (MasterStation.country_iso == first_match.country_iso)
-                        & (MasterStation.name < first_match.name),
-                    )
-                )
-                before_count = db.execute(
-                    select(func.count()).select_from(before_filter.subquery())
-                ).scalar_one()
-                match_page = before_count // size
-        response.headers["X-Match-Page"] = str(match_page)
-
-    # When the caller pinned no page (`page` omitted) and we've computed a
-    # context-mode jump page, navigate there. A page the caller asked for is
-    # respected, 0 included: page 0 used to double as "no page asked for", so
-    # going back to the first page during a context search was a silent no-op.
-    effective_page = match_page if (mode == "context" and page is None and q) else pinned_page(page)
-
-    rows = (
-        db.execute(
-            universe.order_by(MasterStation.country_iso, MasterStation.name)
-            .offset(effective_page * size)
-            .limit(size)
-        )
-        .scalars()
-        .all()
-    )
-    drift_uics = drift_uics_of(db)
-
-    # In context mode, flag rows that match the query so the UI can render
-    # a highlight class. In filter mode, every row is by definition a match,
-    # so we set is_match=True on all of them for consistency.
-    def _is_match(s: MasterStation) -> bool:
-        if not q:
-            return False
-        if mode == "filter":
-            return True
-        ql = q.lower()
-        return ql in (s.name or "").lower() or ql in (s.uic or "").lower()
-
-    return [StationResponse.from_orm_with_drift(s, drift_uics, is_match=_is_match(s)) for s in rows]
+    given: Annotated[Any, Body()] = None,
+) -> dict[str, Any]:
+    """At most ten stations whose name contains `q`, or whose code is `q`,
+    and where they come from."""
+    q = station_suggest.query_or_422(given)
+    origin, rows = await station_suggest.find_stations(db, q, user)
+    return {"origin": origin, "stations": [_shown(row) for row in rows]}
 
 
-@router.patch("/{uic}", response_model=StationResponse)
-def patch_station(
-    uic: str,
-    body: StationPatch,
-    request: Request,
-    db: Annotated[DbSession, Depends(get_db)],
-    actor: Annotated[CurrentUser, Depends(require_content_manager)],
-) -> StationResponse:
-    s = db.get(MasterStation, uic)
-    if s is None:
-        raise HTTPException(404, "Station not found")
-    changes = {}
-    for f, v in body.model_dump(exclude_none=True).items():
-        if getattr(s, f) != v:
-            changes[f] = {"from": getattr(s, f), "to": v}
-            setattr(s, f, v)
-    if changes:
-        s.source = "manual"
-        s.updated_at = datetime.now(UTC)
-        audit.record(
-            db,
-            action="master_station.updated",
-            actor_user_id=actor.id,
-            actor_ip=client_ip(request),
-            target_kind="master_station",
-            target_id=uic,
-            metadata={"changes": changes},
-        )
-    db.commit()
-    return StationResponse.from_orm_with_drift(s, set())
-
-
-# ────────────────────────── refresh + drift ──────────────────────────
-
-
-@router.post("/refresh-trainline")
+@router.post("/refresh-trainline", responses={403: _FORBIDDEN})
 async def refresh_trainline(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
@@ -292,62 +97,3 @@ async def refresh_trainline(
     )
     db.commit()
     return counts
-
-
-@router.get("/drift")
-def list_drift(
-    db: Annotated[DbSession, Depends(get_db)],
-    _: Annotated[CurrentUser, Depends(require_content_manager)],
-) -> list[dict[str, Any]]:
-    rows = db.execute(select(MasterStationPendingDrift)).scalars().all()
-    return [
-        {
-            "uic": r.uic,
-            "fields_differing": list(r.fields_differing),
-            "trainline_snapshot": r.trainline_snapshot,
-            "detected_at": r.detected_at.isoformat() if r.detected_at else None,
-        }
-        for r in rows
-    ]
-
-
-@router.post("/{uic}/drift/resolve", response_model=StationResponse)
-def resolve_drift(
-    uic: str,
-    body: DriftResolveBody,
-    request: Request,
-    db: Annotated[DbSession, Depends(get_db)],
-    actor: Annotated[CurrentUser, Depends(require_content_manager)],
-) -> StationResponse:
-    drift = db.get(MasterStationPendingDrift, uic)
-    if drift is None:
-        raise HTTPException(404, "No pending drift for that UIC")
-    s = db.get(MasterStation, uic)
-    if s is None:
-        raise HTTPException(404, "Station not found")
-
-    snapshot = dict(drift.trainline_snapshot or {})
-    if body.action == "adopt_full":
-        for k, v in snapshot.items():
-            if hasattr(s, k):
-                setattr(s, k, v)
-        s.source = "trainline"
-    elif body.action == "adopt_fields":
-        for k in body.fields or []:
-            if k in snapshot and hasattr(s, k):
-                setattr(s, k, snapshot[k])
-    elif body.action != "keep_ours":
-        raise HTTPException(400, "action must be one of: keep_ours, adopt_full, adopt_fields")
-
-    db.delete(drift)
-    audit.record(
-        db,
-        action=f"master_station.drift.{body.action}",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="master_station",
-        target_id=uic,
-        metadata={"fields": body.fields or list(snapshot.keys())},
-    )
-    db.commit()
-    return StationResponse.from_orm_with_drift(s, set())
