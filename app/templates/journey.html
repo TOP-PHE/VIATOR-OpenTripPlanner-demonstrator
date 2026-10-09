@@ -454,12 +454,15 @@ function _suggestionHtml(s, i) {
 // Tolerant fetch — typeahead must never reject the keystroke handler with
 // an uncaught error. Returns [] on any failure mode (network, non-2xx,
 // non-JSON body). The console.warn keeps a breadcrumb in devtools so a
-// silent 500 from one source doesn't get lost.
-async function _fetchJson(url) {
+// silent 500 from one source doesn't get lost. `signal` lets the typeahead
+// abort a request a newer keystroke has superseded (#338); that abort is
+// expected, so it returns [] without a warning.
+async function _fetchJson(url, signal) {
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, {signal});
     return r.ok ? await r.json() : [];
   } catch (err) {
+    if (err && err.name === 'AbortError') return [];
     console.warn('typeahead fetch failed:', url, err);
     return [];
   }
@@ -502,9 +505,19 @@ function setupAutocomplete(prefix) {
   // from the last keystroke cannot either.
   let seq = 0;
   let t;
+  // The MOTIS geocoder request in flight, aborted as soon as it is superseded
+  // (a newer refresh, a pick, a blur): its answer would be dropped anyway, and
+  // the abort spares MOTIS the work and tells the server why the request ended
+  // (#338: the server logs it at INFO as `superseded`, not as a warning).
+  let geocodeCall = null;
+  function abortGeocode() {
+    if (geocodeCall) geocodeCall.abort();
+    geocodeCall = null;
+  }
 
   async function refresh() {
     const mine = ++seq;
+    abortGeocode();
     const q = inp.value.trim();
     if (q.length < SUGGEST_MIN) { box.classList.remove('show'); return; }
     // Two parallel sources:
@@ -517,11 +530,12 @@ function setupAutocomplete(prefix) {
     //                  in master_stations. Returns [] if no MOTIS session
     //                  is serving, so behaviour degrades to "stations only".
     const qs = encodeURIComponent(q);
+    geocodeCall = new AbortController();
     const [fromStations, fromMotis] = await Promise.all([
       q.length >= STATION_SUGGEST_MIN
         ? _postJson('/api/stations/suggest', {q})
         : Promise.resolve([]),
-      _fetchJson(`/api/geocode?q=${qs}&size=20`),
+      _fetchJson(`/api/geocode?q=${qs}&size=20`, geocodeCall.signal),
     ]);
     if (mine !== seq) return;
     items = _mergeSuggestions(fromStations, fromMotis);
@@ -538,7 +552,7 @@ function setupAutocomplete(prefix) {
     const s = items[i];
     inp.value = s.name; lat.value = s.latitude; lon.value = s.longitude; name.value = s.name;
     uic.value = s.uic || '';
-    ++seq; clearTimeout(t);
+    ++seq; clearTimeout(t); abortGeocode();
     box.classList.remove('show');
   }
   inp.addEventListener('input', () => {
@@ -555,7 +569,7 @@ function setupAutocomplete(prefix) {
     ++seq; clearTimeout(t); t = setTimeout(refresh, 150);
   });
   inp.addEventListener('blur', () => {
-    ++seq; clearTimeout(t);
+    ++seq; clearTimeout(t); abortGeocode();
     setTimeout(() => box.classList.remove('show'), 150);
   });
   inp.addEventListener('keydown', e => {
