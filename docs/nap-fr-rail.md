@@ -263,7 +263,7 @@ recommended-set sessions:
 | France + Spain (Renfe) | `FR`, `ES` |
 | France + UK + Spain + Italy (everything) | `FR`, `GB`, `ES`, `IT` |
 
-**Refresh from Trainline** once on the Master Stations page imports all of
+**Refresh from Trainline** once on the Stations page imports all of
 these in one go — Trainline's CSV is pan-European.
 
 ---
@@ -433,9 +433,10 @@ What different log lines mean:
 
 ## 5. Master stations
 
-The `master_stations` table is the canonical European station registry
-used by VIATOR for journey-UI autocomplete, trip-signature canonicalisation,
-and the country-gate.
+The `master_stations` table is VIATOR's own copy of the Trainline station
+list: the fallback of the journey-UI autocomplete when the station module
+(the reference since MSMM step 3) does not answer, and the key of
+trip-signature canonicalisation and of the country-gate.
 
 ### 5.1 Bootstrap source
 

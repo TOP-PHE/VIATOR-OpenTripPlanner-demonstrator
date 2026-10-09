@@ -1119,7 +1119,7 @@ otp_api_timeout + 2 000 ms` (the +2 000 covers connection + transit).
 **Step 2 — diagnose by direct OTP query** to bypass the fanout layer:
 
 ```bash
-# Substitute your actual stop ids from /admin/master/stations
+# Substitute your actual coordinates (search a station on /admin/master/stations)
 curl -s "https://vmi3259514.contaboserver.net/otp/nap-fr-rail/otp/gtfs/v1" \
   -H "Content-Type: application/json" \
   -d '{"query":"{plan(from:{lat:48.8443,lon:2.3739} to:{lat:43.3026,lon:5.3801} date:\"2026-05-19\" time:\"07:39\" numItineraries:5){itineraries{startTime endTime legs{mode startTime endTime}}}}"}' \
