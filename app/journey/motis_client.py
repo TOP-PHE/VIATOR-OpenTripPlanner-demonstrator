@@ -88,7 +88,8 @@ async def fetch_plan(
     leave it unset and use the per-session DNS name.
 
     Raises `httpx.HTTPError` on transport / HTTP failure (caller maps to
-    `'error'`, same contract as OTP).
+    `'error'`, same contract as OTP). A date outside the loaded timetable is
+    an HTTP 400 that `timetable_window.from_motis_refusal` recognises (#338).
     """
     url = f"{_base_url_for(session_id, base_url)}/api/v6/plan"
     # MOTIS's `fromPlace`/`toPlace` accept either a coord string or a stop id,

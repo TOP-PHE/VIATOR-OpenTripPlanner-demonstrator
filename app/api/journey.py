@@ -17,7 +17,14 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service
 from ..db import get_db
-from ..journey import hafas_client, ojp_client, planner_dispatch, recorder, trip_normalize
+from ..journey import (
+    hafas_client,
+    ojp_client,
+    planner_dispatch,
+    recorder,
+    timetable_window,
+    trip_normalize,
+)
 from ..models import GraphSnapshot
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -154,8 +161,16 @@ async def _query_session(
     *,
     num_itineraries: int,
     search_window_seconds: int,
-) -> tuple[str, dict[str, Any], list[dict[str, Any]], int]:
-    """Returns (status, raw, trips, response_ms).
+) -> tuple[
+    str, dict[str, Any], list[dict[str, Any]], int, timetable_window.OutsideTimetable | None
+]:
+    """Returns (status, raw, trips, response_ms, outside_timetable).
+
+    `outside_timetable` is set when the engine refused the date because its
+    loaded timetable does not cover it (#338): MOTIS with an HTTP 400 (status
+    stays "error"), OTP with an OUTSIDE_SERVICE_PERIOD routing error (status
+    stays "no_route"). The statuses are the database's; the page shows the
+    reason instead.
 
     `num_itineraries` / `search_window_seconds` come from platform_config
     (OTP_NUM_ITINERARIES / OTP_SEARCH_WINDOW_SECONDS, both runtime-editable).
@@ -180,11 +195,15 @@ async def _query_session(
             session_timezone=_session_timezone(session),
         )
         elapsed = int((time.monotonic() - start) * 1000)
-        return ("ok" if trips else "no_route"), raw, trips, elapsed
+        refusal = None if trips else timetable_window.from_otp_answer(raw)
+        return ("ok" if trips else "no_route"), raw, trips, elapsed, refusal
     except (TimeoutError, httpx.TimeoutException):
-        return "timeout", {}, [], int((time.monotonic() - start) * 1000)
+        return "timeout", {}, [], int((time.monotonic() - start) * 1000), None
+    except httpx.HTTPStatusError as exc:
+        refusal = timetable_window.from_motis_refusal(exc.response)
+        return "error", {}, [], int((time.monotonic() - start) * 1000), refusal
     except httpx.HTTPError:
-        return "error", {}, [], int((time.monotonic() - start) * 1000)
+        return "error", {}, [], int((time.monotonic() - start) * 1000), None
 
 
 async def _query_ojp_reference(
@@ -355,6 +374,22 @@ async def _query_hafas_reference(
             "response_ms": _ms(),
             "error": f"HAFAS request failed: {type(exc).__name__}",
         }
+
+
+def _refusal_fields(refusal: timetable_window.OutsideTimetable | None) -> dict[str, Any]:
+    """The fields an execution gets when its engine refused the date (#338):
+    `reason`, a fixed `detail` sentence, and the loaded `timetable_window`
+    when the engine named it. Nothing of the engine's own text."""
+    if refusal is None:
+        return {}
+    fields: dict[str, Any] = {
+        "reason": timetable_window.OUTSIDE_TIMETABLE,
+        "detail": refusal.detail(),
+    }
+    window = refusal.window()
+    if window is not None:
+        fields["timetable_window"] = window
+    return fields
 
 
 def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
@@ -635,7 +670,7 @@ async def fanout(
     any_ok = False
     sids_in_fanout = [s.id for s in sessions]
 
-    for session, (status, raw, trips, response_ms) in zip(sessions, results, strict=True):
+    for session, (status, raw, trips, response_ms, refusal) in zip(sessions, results, strict=True):
         snap = _current_snapshot(db, session.id)
         # Note: a missing graph_snapshots row is NOT an error — it just
         # means the worker hasn't written a snapshot record yet (Phase-3
@@ -657,25 +692,23 @@ async def fanout(
             status=status,
             response_ms=response_ms,
             raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
-            error_message=None,
+            error_message=refusal.detail() if refusal else None,
             trips=trips,
         )
-        executions_summary.append(
-            {
-                "session_id": session.id,
-                # P2 MOTIS — engine surfaced so the journey UI can switch
-                # into the OTP-vs-MOTIS comparison view when both engines
-                # actually participated in the fanout (rather than guessing
-                # from session id naming conventions).
-                "engine": getattr(session, "engine", "otp") or "otp",
-                "graph_snapshot_id": (
-                    str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None
-                ),
-                "status": status,
-                "num_itineraries": exe.num_itineraries,
-                "response_ms": response_ms,
-            }
-        )
+        summary: dict[str, Any] = {
+            "session_id": session.id,
+            # P2 MOTIS — engine surfaced so the journey UI can switch
+            # into the OTP-vs-MOTIS comparison view when both engines
+            # actually participated in the fanout (rather than guessing
+            # from session id naming conventions).
+            "engine": getattr(session, "engine", "otp") or "otp",
+            "graph_snapshot_id": (str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None),
+            "status": status,
+            "num_itineraries": exe.num_itineraries,
+            "response_ms": response_ms,
+        }
+        summary.update(_refusal_fields(refusal))
+        executions_summary.append(summary)
 
         # Merge trips by signature for the response payload.
         for trip in trips:
@@ -838,7 +871,7 @@ async def plan(
                 requested_time=when,
                 modes=",".join(body.modes),
             )
-            status, raw, trips, response_ms = await _query_session(
+            status, raw, trips, response_ms, refusal = await _query_session(
                 db,
                 s,
                 body,
@@ -860,7 +893,7 @@ async def plan(
         status=status,
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
-        error_message=None,
+        error_message=refusal.detail() if refusal else None,
         trips=trips,
     )
     recorder.finish_search(
@@ -872,7 +905,12 @@ async def plan(
     )
     db.commit()
 
-    return {"search_id": str(search.id), "status": status, "trips": trips}
+    return {
+        "search_id": str(search.id),
+        "status": status,
+        "trips": trips,
+        **_refusal_fields(refusal),
+    }
 
 
 @router.get("/searches/{search_id}")
