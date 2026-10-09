@@ -902,7 +902,7 @@ async def resolve_hub_codes(
     proposals: list[HubProposal] = []
     for hub in hubs[:RESOLVE_BATCH]:
         try:
-            text = normalise_query(hub.name)
+            searched = normalise_query(hub.name)
         except ValueError:
             # A name the module's search cannot take (under 3 characters, a
             # control character): no call, nothing to propose.
@@ -910,7 +910,7 @@ async def resolve_hub_codes(
                 HubProposal(hub_id=hub.id, hub_name=hub.name, state="to_pick", candidates=[])
             )
             continue
-        outcome = await station_module.search_outcome(text, user_id)
+        outcome = await station_module.search_outcome(searched, user_id)
         if outcome.rows is None:
             status, message, retry_after = _failure(outcome)
             return HubResolveResponse(
