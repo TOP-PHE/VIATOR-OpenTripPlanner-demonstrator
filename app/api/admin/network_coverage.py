@@ -38,15 +38,24 @@ from __future__ import annotations
 import logging
 import math
 import re
+import unicodedata
 import uuid
 from datetime import UTC, date, datetime
 from datetime import time as dtime
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
@@ -157,6 +166,68 @@ def _station_code(value: str | None) -> str | None:
 TypedCode = Annotated[str | None, AfterValidator(_station_code)]
 
 
+def _writable(text: str) -> bool:
+    """True when the text holds no surrogate (Cs) and no control character
+    (Cc, NUL included). JSON can carry a lone surrogate (`\\ud800`) or a NUL,
+    which PostgreSQL refuses and no UTF-8 answer can hold: a 500 either way."""
+    return not any(unicodedata.category(character) in ("Cs", "Cc") for character in text)
+
+
+def _writable_text(value: Any) -> Any:
+    """`value`, or ValueError when it is a text that fails `_writable`."""
+    if isinstance(value, str) and not _writable(value):
+        raise ValueError("a text holds a control character or a lone surrogate")
+    return value
+
+
+def _writable_id(value: str) -> str:
+    if not _writable(value):
+        raise ValueError("a hub id holds a control character or a lone surrogate")
+    return value
+
+
+HubId = Annotated[str, Field(min_length=1, max_length=64), AfterValidator(_writable_id)]
+
+# The 422 of a hub body that breaks a rule: a fixed sentence, then the names
+# of the fields at fault, never their values. FastAPI's own 422 copies the
+# refused input into its answer; a lone surrogate there cannot be written as
+# UTF-8, so that answer would itself fail with a 500 (as in
+# app/api/station_suggest.py). Only the routes of the hub form and of the
+# station codes answer this way.
+_HUB_REFUSED = (
+    "The hub is not valid: name 1 to 120 characters, short 1 to 16, country 2, "
+    "region up to 40, modes up to 20, tier main or regional, latitude -90 to 90, "
+    "longitude -180 to 180, sort order 0 to 10000, station code 3 to 20 characters "
+    "with no white space; no text may hold a control character or a lone surrogate."
+)
+_BATCH_REFUSED = (
+    'The body must be {"skip": [<hub id>, ...]}: at most 2000 ids of 1 to 64 characters, '
+    "with no control character and no lone surrogate."
+)
+_CONFIRM_REFUSED = (
+    'The body must be {"pairs": [{"hub_id": <hub id>, "uic": <code>}, ...]}: 1 to 10 pairs, '
+    "each hub once, each code 3 to 20 characters with no white space, no control character "
+    "and no lone surrogate."
+)
+
+
+def _body_or_422[M: BaseModel](model: type[M], given: Any, refused: str) -> M:
+    """`given` (the parsed JSON body) as `model`, or a 422 whose detail is
+    `refused` and the names of the fields at fault, never a value."""
+    try:
+        return model.model_validate(given)
+    except ValidationError as failure:
+        fields = sorted(
+            {
+                str(error["loc"][0])
+                for error in failure.errors(include_input=False, include_url=False)
+                if error["loc"] and str(error["loc"][0]) in model.model_fields
+            }
+        )
+        detail = refused + (f" Fields at fault: {', '.join(fields)}." if fields else "")
+        raise HTTPException(status_code=422, detail=detail) from None
+
+
 class HubCreate(BaseModel):
     """v0.1.31 — POST /hubs body. id is the slug, mandatory and immutable
     once created; any later edits use PATCH on the existing id."""
@@ -175,6 +246,11 @@ class HubCreate(BaseModel):
     sort_order: int = Field(default=100, ge=0, le=10_000)
     # A station code typed by hand: stored with uic_origin = 'manual'.
     uic: TypedCode = None
+
+    @field_validator("*")
+    @classmethod
+    def _writable_texts(cls, value: Any) -> Any:
+        return _writable_text(value)
 
 
 class HubUpdate(BaseModel):
@@ -196,6 +272,11 @@ class HubUpdate(BaseModel):
     # A station code typed by hand: stored with uic_origin = 'manual' when it
     # differs from the stored one; null clears the code and its origin.
     uic: TypedCode = None
+
+    @field_validator("*")
+    @classmethod
+    def _writable_texts(cls, value: Any) -> Any:
+        return _writable_text(value)
 
 
 class RunCreate(BaseModel):
@@ -575,7 +656,7 @@ def list_hubs(
 
 @router.post("/hubs", response_model=HubInfo, status_code=201)
 def create_hub(
-    body: HubCreate,
+    body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubInfo:
@@ -584,27 +665,28 @@ def create_hub(
     Slug must be unique (PK conflict → 409). Country normalised to
     uppercase to keep ISO codes consistent regardless of operator
     typing habits."""
+    hub_body = _body_or_422(HubCreate, body, _HUB_REFUSED)
     hub = NetworkCoverageHub(
-        id=body.id,
-        name=body.name,
-        short=body.short,
-        country=body.country.upper(),
-        region=body.region,
-        tier=body.tier,
-        modes=body.modes,
-        lat=body.lat,
-        lon=body.lon,
-        sort_order=body.sort_order,
+        id=hub_body.id,
+        name=hub_body.name,
+        short=hub_body.short,
+        country=hub_body.country.upper(),
+        region=hub_body.region,
+        tier=hub_body.tier,
+        modes=hub_body.modes,
+        lat=hub_body.lat,
+        lon=hub_body.lon,
+        sort_order=hub_body.sort_order,
         is_active=True,
-        uic=body.uic,
-        uic_origin="manual" if body.uic is not None else None,
+        uic=hub_body.uic,
+        uic_origin="manual" if hub_body.uic is not None else None,
     )
     db.add(hub)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(409, f"Hub with id={body.id!r} already exists") from None
+        raise HTTPException(409, f"Hub with id={hub_body.id!r} already exists") from None
     db.refresh(hub)
     return _hub_to_info(hub)
 
@@ -612,7 +694,7 @@ def create_hub(
 @router.patch("/hubs/{hub_id}", response_model=HubInfo)
 def update_hub(
     hub_id: str,
-    body: HubUpdate,
+    body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubInfo:
@@ -622,10 +704,14 @@ def update_hub(
     The slug (id) is immutable — to rename, soft-delete and create new.
     Country is uppercased on write.
     """
+    changes = _body_or_422(HubUpdate, body, _HUB_REFUSED)
+    if len(hub_id) > 64 or not _writable(hub_id):
+        # No hub has such an id, and PostgreSQL would refuse a NUL in it.
+        raise HTTPException(404, _HUB_NOT_FOUND)
     hub = db.get(NetworkCoverageHub, hub_id)
     if hub is None:
         raise HTTPException(404, f"Hub {hub_id!r} not found")
-    data = body.model_dump(exclude_unset=True)
+    data = changes.model_dump(exclude_unset=True)
     if "country" in data and data["country"] is not None:
         data["country"] = data["country"].upper()
     if "uic" in data:
@@ -692,9 +778,7 @@ class HubBatchRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    skip: list[Annotated[str, Field(max_length=64)]] = Field(
-        default_factory=list, max_length=_SKIP_MAX
-    )
+    skip: list[HubId] = Field(default_factory=list, max_length=_SKIP_MAX)
 
 
 class HubCandidate(BaseModel):
@@ -734,7 +818,7 @@ class HubConfirmPair(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    hub_id: str = Field(min_length=1, max_length=64)
+    hub_id: HubId
     uic: str
 
     @field_validator("uic")
@@ -882,14 +966,18 @@ def _hubs_to_look_at(db: DbSession, *, resolved: bool, skip: list[str]) -> list[
 
 
 def _hubs_by_id(db: DbSession, ids: list[str]) -> dict[str, NetworkCoverageHub]:
-    """The hubs of these ids that exist, by id."""
-    rows = db.execute(select(NetworkCoverageHub).where(NetworkCoverageHub.id.in_(ids)))
+    """The active hubs of these ids, by id: a soft-deleted hub takes no code."""
+    rows = db.execute(
+        select(NetworkCoverageHub)
+        .where(NetworkCoverageHub.id.in_(ids))
+        .where(NetworkCoverageHub.is_active.is_(True))
+    )
     return {hub.id: hub for hub in rows.scalars().all()}
 
 
 @router.post("/hubs/resolve", responses=_HUB_CODE_RESPONSES)
 async def resolve_hub_codes(
-    body: HubBatchRequest,
+    body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
     admin: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubResolveResponse:
@@ -898,8 +986,9 @@ async def resolve_hub_codes(
     administrator. Writes nothing: the administrator confirms what he
     accepts with POST /hubs/confirm. Stops at the first failure; at a 429
     it answers what it found with the module's Retry-After, never retrying."""
+    asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = _hubs_to_look_at(db, resolved=False, skip=body.skip)
+    hubs = _hubs_to_look_at(db, resolved=False, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubResolveResponse(
@@ -932,7 +1021,7 @@ async def resolve_hub_codes(
 
 @router.post("/hubs/confirm", responses=_HUB_CODE_RESPONSES)
 async def confirm_hub_codes(
-    body: HubConfirmRequest,
+    body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
     admin: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubConfirmResponse:
@@ -940,12 +1029,13 @@ async def confirm_hub_codes(
     one lookup of the module with each distinct code once: a code the module
     serves is stored with uic_origin 'msmm'; one it does not serve is
     refused and its hub left as it was. On any failure nothing is written."""
+    confirm = _body_or_422(HubConfirmRequest, body, _CONFIRM_REFUSED)
     user_id = _caller(admin)
     refusal = _module_refusal()
     if refusal is not None:
         return HubConfirmResponse(status="unavailable", message=refusal, results=[])
-    hubs = _hubs_by_id(db, [pair.hub_id for pair in body.pairs])
-    codes = list(dict.fromkeys(pair.uic for pair in body.pairs if pair.hub_id in hubs))
+    hubs = _hubs_by_id(db, [pair.hub_id for pair in confirm.pairs])
+    codes = list(dict.fromkeys(pair.uic for pair in confirm.pairs if pair.hub_id in hubs))
     served: dict[str, dict[str, Any]] = {}
     if codes:
         outcome = await station_module.lookup(codes, user_id)
@@ -957,7 +1047,7 @@ async def confirm_hub_codes(
         served = {row["uic"]: row for row in outcome.rows}
     now = datetime.now(UTC)
     results: list[HubConfirmed] = []
-    for pair in body.pairs:
+    for pair in confirm.pairs:
         hub = hubs.get(pair.hub_id)
         row = served.get(pair.uic)
         if hub is None:
@@ -1008,7 +1098,7 @@ def _checked(hub: NetworkCoverageHub, row: dict[str, Any] | None) -> HubChecked:
 
 @router.post("/hubs/check", responses=_HUB_CODE_RESPONSES)
 async def check_hub_codes(
-    body: HubBatchRequest,
+    body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
     admin: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubCheckResponse:
@@ -1016,8 +1106,9 @@ async def check_hub_codes(
     the module, each distinct code once, and show each hub whose code the
     module no longer serves or whose module name differs from its own.
     Writes nothing, clears nothing: the administrator decides."""
+    asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = _hubs_to_look_at(db, resolved=True, skip=body.skip)
+    hubs = _hubs_to_look_at(db, resolved=True, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubCheckResponse(status="unavailable", message=refusal, results=[], left=len(hubs))

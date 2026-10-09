@@ -104,7 +104,7 @@ class Hubs:
         return [h for h in self.rows if (h.uic is not None) == resolved and h.id not in set(skip)]
 
     def by_id(self, _db: Any, ids: list[str]) -> dict[str, NetworkCoverageHub]:
-        return {h.id: h for h in self.rows if h.id in ids}
+        return {h.id: h for h in self.rows if h.id in ids and h.is_active}
 
 
 class Module:
@@ -940,3 +940,181 @@ def test_the_cell_dialog_link_carries_the_hub_code(template_text: str) -> None:
     assert "const oUic = orig && orig.uic ? encodeURIComponent(orig.uic) : '';" in template_text
     assert "&from_uic=${oUic}" in template_text
     assert "&to_uic=${dUic}" in template_text
+
+
+# ─────────────── never a 500 on a lone surrogate or a NUL ───────────────
+
+# JSON escapes as a client may send them: a lone surrogate and a NUL.
+_SURROGATE = "\\ud800"
+_NUL = "\\u0000"
+
+
+def _raw(client: TestClient, method: str, url: str, body: str) -> httpx.Response:
+    return client.request(
+        method, url, content=body.encode("ascii"), headers={"Content-Type": "application/json"}
+    )
+
+
+def _assert_fixed_422(answer: httpx.Response) -> None:
+    assert answer.status_code == 422
+    text = answer.content.decode("utf-8")  # valid UTF-8 JSON
+    detail = json.loads(text)["detail"]
+    assert isinstance(detail, str)
+    assert "99Z" not in text  # the refused value is never echoed
+    assert "\\ud800" not in text
+    assert "input" not in text
+
+
+_HUB_JSON = (
+    '{"id": "zz-hub", "name": "NAME", "short": "ZZ", "country": "ZZ", '
+    '"lat": 45.0, "lon": 6.0, "uic": "CODE"}'
+)
+
+
+@pytest.mark.parametrize("bad", [_SURROGATE, _NUL], ids=["surrogate", "nul"])
+@pytest.mark.parametrize("field", ["uic", "name"])
+def test_a_hub_create_with_an_unwritable_character_is_a_fixed_422(
+    client: TestClient, db: FakeDb, field: str, bad: str
+) -> None:
+    name, code = ("ZZ Hub", f"99Z{bad}1") if field == "uic" else (f"99Z{bad}", "9900001")
+
+    answer = _raw(client, "POST", BASE, _HUB_JSON.replace("NAME", name).replace("CODE", code))
+
+    _assert_fixed_422(answer)
+    assert f"Fields at fault: {field}." in answer.json()["detail"]
+    assert db.commits == 0
+
+
+@pytest.mark.parametrize("bad", [_SURROGATE, _NUL], ids=["surrogate", "nul"])
+@pytest.mark.parametrize("field", ["uic", "name", "region"])
+def test_a_hub_patch_with_an_unwritable_character_is_a_fixed_422(
+    client: TestClient, db: FakeDb, field: str, bad: str
+) -> None:
+    answer = _raw(client, "PATCH", f"{BASE}/zz-hub-01", f'{{"{field}": "99Z{bad}1"}}')
+
+    _assert_fixed_422(answer)
+    assert db.commits == 0
+
+
+@pytest.mark.parametrize("path", ["zz%00hub", "z" * 65], ids=["nul", "too-long"])
+def test_a_hub_patch_on_an_impossible_id_is_a_404_without_a_statement(
+    client: TestClient, db: FakeDb, path: str
+) -> None:
+    # FakeDb has no `get`: reaching the database would be a 500.
+    answer = client.patch(f"{BASE}/{path}", json={"name": "ZZ Renamed"})
+
+    assert answer.status_code == 404
+    assert db.commits == 0
+
+
+@pytest.mark.parametrize("bad", [_SURROGATE, _NUL], ids=["surrogate", "nul"])
+@pytest.mark.parametrize("field", ["uic", "hub_id"])
+def test_a_confirm_with_an_unwritable_character_is_a_fixed_422(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module, field: str, bad: str
+) -> None:
+    hubs.rows = [_hub(1)]
+    pair = {"hub_id": "zz-hub-01", "uic": "9900001"}
+    pair[field] = f"99Z{bad}1"
+    body = json.dumps({"pairs": [pair]}).replace("\\\\", "\\")
+
+    answer = _raw(client, "POST", f"{BASE}/confirm", body)
+
+    _assert_fixed_422(answer)
+    assert "Fields at fault: pairs." in answer.json()["detail"]
+    assert module.requests == []
+    assert db.commits == 0
+
+
+@pytest.mark.parametrize("bad", [_SURROGATE, _NUL, ""], ids=["surrogate", "nul", "empty"])
+@pytest.mark.parametrize("route", ["resolve", "check"])
+def test_a_skip_list_with_an_unwritable_id_is_a_fixed_422(
+    client: TestClient, hubs: Hubs, module: Module, route: str, bad: str
+) -> None:
+    hubs.rows = [_hub(1), _hub(2, uic="9900002", origin="msmm")]
+    skip = f'"99Z{bad}1"' if bad else '""'
+
+    answer = _raw(client, "POST", f"{BASE}/{route}", f'{{"skip": [{skip}]}}')
+
+    _assert_fixed_422(answer)
+    assert "Fields at fault: skip." in answer.json()["detail"]
+    assert hubs.skips == []  # the hubs were never read
+    assert module.requests == []
+
+
+@pytest.mark.parametrize("route", ["resolve", "check", "confirm"])
+def test_a_body_of_the_wrong_shape_is_a_fixed_422(
+    client: TestClient, hubs: Hubs, module: Module, route: str
+) -> None:
+    answer = _raw(client, "POST", f"{BASE}/{route}", '["99Z"]')
+
+    _assert_fixed_422(answer)
+    assert module.requests == []
+
+
+def test_a_lookup_row_holding_a_surrogate_stores_nothing_and_answers_utf8(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1), _hub(2)]
+    rows = [
+        _station("ZZ \ud800 One", "9900001", 45.0, 6.0),
+        _station("ZZ Two", "9900002", 45.0, 6.0),
+    ]
+    module.lookup_response = httpx.Response(
+        200,
+        content=json.dumps({"stations": rows}).encode("ascii"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    answer = client.post(f"{BASE}/confirm", json={"pairs": _pairs(3)[1:]})
+
+    assert answer.status_code == 200
+    body = json.loads(answer.content.decode("utf-8"))
+    assert [r["state"] for r in body["results"]] == ["not_served", "stored"]
+    assert [h.uic for h in hubs.rows] == [None, "9900002"]
+
+
+def test_a_search_row_holding_a_surrogate_is_not_proposed(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hub = _hub(1)
+    hubs.rows = [hub]
+    rows = [_station("ZZ \ud800", "9900001", hub.lat, hub.lon)]
+    payload = json.dumps({"stations": rows}).encode("ascii")
+    module.search = lambda _q: httpx.Response(
+        200, content=payload, headers={"Content-Type": "application/json"}
+    )
+
+    answer = client.post(f"{BASE}/resolve", json={})
+
+    assert answer.status_code == 200
+    assert json.loads(answer.content.decode("utf-8"))["proposals"][0]["candidates"] == []
+
+
+# ───────────────────── soft-deleted hubs, the 300 m edge ─────────────────────
+
+
+def test_confirm_takes_no_code_for_a_soft_deleted_hub(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    gone = _hub(1, is_active=False)
+    hubs.rows = [gone]
+
+    body = client.post(
+        f"{BASE}/confirm", json={"pairs": [{"hub_id": gone.id, "uic": "9900001"}]}
+    ).json()
+
+    assert body["results"][0]["state"] == "unknown_hub"
+    assert module.requests == []
+    assert gone.uic is None
+
+
+@pytest.mark.parametrize(("distance", "kept"), [(300.0, True), (300.000001, False)])
+def test_a_station_exactly_300_m_away_is_a_candidate(
+    monkeypatch: pytest.MonkeyPatch, distance: float, kept: bool
+) -> None:
+    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
+
+    proposal = network_coverage._proposal(_hub(1), [_station("ZZ Edge", "9900001", 45.0, 6.0)])
+
+    assert (proposal.state == "proposed") is kept
+    assert len(proposal.candidates) == int(kept)
