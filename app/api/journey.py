@@ -756,6 +756,8 @@ async def fanout(
                 sessions=list(sessions),
                 timeout_ms=timeout_ms,
                 session_timezone_for={s.id: _session_timezone(s) for s in sessions},
+                origin_position=(body.from_.lat, body.from_.lon),
+                dest_position=(body.to.lat, body.to.lon),
             )
         except Exception:
             logging.getLogger(__name__).exception("federated planner failed (non-fatal)")

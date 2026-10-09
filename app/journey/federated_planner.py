@@ -324,6 +324,28 @@ def _resolve_coords(db: DbSession, wanted_uics: set[str]) -> dict[str, tuple[flo
     return coords
 
 
+def _fill_endpoint_positions(
+    coords: dict[str, tuple[float, float]],
+    endpoints: list[tuple[str, tuple[float, float] | None]],
+) -> bool:
+    """Give an endpoint code missing from `coords` the position the request sent.
+
+    Since MSMM step 2 the typeahead can put the station module's code in the
+    form, and that code may have no `master_stations` row, or a row with no
+    position (issue #331). The request's lat/lon is the position of the very
+    station the person picked, already range-checked by the API model, so it
+    stands in for the missing one. A code that `master_stations` does place
+    keeps that position: the request's never overrides it, so a found code is
+    planned exactly as before. Returns True when a request position was used.
+    """
+    used = False
+    for code, position in endpoints:
+        if code not in coords and position is not None:
+            coords[code] = position
+            used = True
+    return used
+
+
 def _primary_feed_id(session: SessionRow) -> str | None:
     """First provider's OTP feedId (== the stop_id namespace prefix on that
     feed). Mirrors `app.api.journey._primary_feed_id`; kept local so this
@@ -455,12 +477,22 @@ async def plan_federated(
     session_timezone_for: dict[str, str | None] | None = None,
     existing_fingerprints: set[str] | None = None,
     mct_seconds: int = DEFAULT_MCT_SECONDS,
+    origin_position: tuple[float, float] | None = None,
+    dest_position: tuple[float, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Phase-1 single-transfer stitch. Returns ranked stitched itineraries.
 
     Requires UIC origin/destination (the form sends them when the operator picks
     from the station dropdown). Returns `[]` when there's no UIC, no hub, or no
     leg combination connects — a correct "no federated result".
+
+    Two checks decide whether a try can go on:
+
+    1. each endpoint code is a station some session's feed serves — that is
+       how the planner knows which sessions to route each end in, so it stays;
+    2. each endpoint has a position. `master_stations` gives it; when it has
+       no row or no position for the code, `origin_position` /
+       `dest_position` (the request's `(lat, lon)`) stand in (issue #331).
     """
     if not origin_uic or not dest_uic or origin_uic == dest_uic:
         return []
@@ -476,6 +508,7 @@ async def plan_federated(
         return []
 
     coords = _resolve_coords(db, {origin_uic, dest_uic} | candidate_hubs)
+    _fill_endpoint_positions(coords, [(origin_uic, origin_position), (dest_uic, dest_position)])
     if origin_uic not in coords or dest_uic not in coords:
         return []  # can't query OTP without endpoint coordinates
 

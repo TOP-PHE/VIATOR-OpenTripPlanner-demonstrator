@@ -531,3 +531,171 @@ def test_session_served_uics_reads_caches_and_invalidates(tmp_path, monkeypatch)
 
 def test_read_stop_ids_missing_dir(tmp_path):
     assert fp._read_stop_ids(tmp_path / "does-not-exist") == []
+
+
+# ───────────── endpoint positions: master_stations, then the request (#331) ─────────────
+# Invented codes and positions only. Since MSMM step 2 the typeahead can send the
+# station module's code, which master_stations may not hold; the request's
+# validated lat/lon then stands in for the missing position.
+
+_ORIGIN, _HUB, _DEST = "9900001", "9900002", "9900003"
+_MASTER_ORIGIN = (45.10, 3.10)
+_MASTER_HUB = (45.50, 3.50)
+_MASTER_DEST = (45.90, 3.90)
+_REQUEST_ORIGIN = (45.11, 3.11)
+_REQUEST_DEST = (45.91, 3.91)
+
+
+def _row(code, position):
+    lat, lon = position if position else (None, None)
+    return types.SimpleNamespace(uic=code, latitude=lat, longitude=lon)
+
+
+def _zz_sessions(monkeypatch):
+    """Two invented sessions sharing the invented hub; origin in one, dest in the other."""
+    so = types.SimpleNamespace(id="zz-origin", config={"sources": {"providers": [{"id": "ZZA"}]}})
+    sd = types.SimpleNamespace(id="zz-dest", config={"sources": {"providers": [{"id": "ZZB"}]}})
+    served = {"zz-origin": {_ORIGIN, _HUB}, "zz-dest": {_HUB, _DEST}}
+    monkeypatch.setattr(fp, "_session_served_uics", lambda s: served[s.id])
+    return [so, sd]
+
+
+def _recording_otp(monkeypatch):
+    """Fake OTP: one trip per leg; records each call's session, positions and stop ids."""
+    from app.journey import otp_client
+
+    calls: list[dict] = []
+
+    async def _fake(*, session_id, from_lat, from_lon, to_lat, to_lon, **kw):
+        calls.append(
+            {
+                "session": session_id,
+                "from": (from_lat, from_lon),
+                "to": (to_lat, to_lon),
+                "from_stop_id": kw.get("from_stop_id"),
+                "to_stop_id": kw.get("to_stop_id"),
+            }
+        )
+        if session_id == "zz-origin":
+            dep, arr, frm, to = "2026-05-22T08:00:00Z", "2026-05-22T09:00:00Z", _ORIGIN, _HUB
+        else:
+            dep, arr, frm, to = "2026-05-22T09:20:00Z", "2026-05-22T10:00:00Z", _HUB, _DEST
+        trip = {
+            "departure_at": dep,
+            "arrival_at": arr,
+            "num_transfers": 0,
+            "modes": "RAIL",
+            "legs": [_otp_leg(frm, to, "ZZ1", dep, arr)],
+        }
+        return ({}, [trip])
+
+    monkeypatch.setattr(otp_client, "fetch_plan", _fake)
+    return calls
+
+
+async def _plan(rows, sessions, **kw):
+    return await fp.plan_federated(
+        _FakeDb(rows),
+        origin_uic=_ORIGIN,
+        dest_uic=_DEST,
+        when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+        sessions=sessions,
+        timeout_ms=5000,
+        **kw,
+    )
+
+
+def test_fill_endpoint_positions_only_fills_missing_codes():
+    coords = {_ORIGIN: _MASTER_ORIGIN}
+    used = fp._fill_endpoint_positions(coords, [(_ORIGIN, _REQUEST_ORIGIN), (_DEST, _REQUEST_DEST)])
+    assert used is True
+    assert coords == {_ORIGIN: _MASTER_ORIGIN, _DEST: _REQUEST_DEST}  # found code kept
+
+
+def test_fill_endpoint_positions_without_request_positions_changes_nothing():
+    coords = {_ORIGIN: _MASTER_ORIGIN}
+    assert fp._fill_endpoint_positions(coords, [(_ORIGIN, None), (_DEST, None)]) is False
+    assert coords == {_ORIGIN: _MASTER_ORIGIN}
+
+
+async def test_plan_federated_uses_request_positions_for_codes_master_lacks(monkeypatch):
+    """No master_stations row for either endpoint: the request's positions are used."""
+    sessions = _zz_sessions(monkeypatch)
+    calls = _recording_otp(monkeypatch)
+    out = await _plan(
+        [_row(_HUB, _MASTER_HUB)],
+        sessions,
+        origin_position=_REQUEST_ORIGIN,
+        dest_position=_REQUEST_DEST,
+    )
+    assert len(out) == 1
+    assert out[0]["via_hubs"] == [_HUB]
+    assert out[0]["stitched_from_sessions"] == ["zz-origin", "zz-dest"]
+    leg1, leg2 = calls
+    assert leg1["from"] == _REQUEST_ORIGIN and leg1["to"] == _MASTER_HUB
+    assert leg2["from"] == _MASTER_HUB and leg2["to"] == _REQUEST_DEST
+    # the code still routes by stop id; OTP falls back to the position if unknown
+    assert leg1["from_stop_id"] == f"ZZA:{_ORIGIN}"
+    assert leg2["to_stop_id"] == f"ZZB:{_DEST}"
+
+
+async def test_plan_federated_uses_request_position_when_master_row_has_none(monkeypatch):
+    """A master_stations row without a position counts as missing, end by end."""
+    sessions = _zz_sessions(monkeypatch)
+    calls = _recording_otp(monkeypatch)
+    rows = [_row(_ORIGIN, None), _row(_HUB, _MASTER_HUB), _row(_DEST, _MASTER_DEST)]
+    out = await _plan(rows, sessions, origin_position=_REQUEST_ORIGIN, dest_position=_REQUEST_DEST)
+    assert len(out) == 1
+    leg1, leg2 = calls
+    assert leg1["from"] == _REQUEST_ORIGIN  # no master position: the request's
+    assert leg2["to"] == _MASTER_DEST  # master position: never the request's
+
+
+async def test_plan_federated_found_codes_behave_exactly_as_before(monkeypatch):
+    """Codes master_stations places: same OTP calls and same result, request
+    positions passed or not."""
+    rows = [_row(_ORIGIN, _MASTER_ORIGIN), _row(_HUB, _MASTER_HUB), _row(_DEST, _MASTER_DEST)]
+
+    sessions = _zz_sessions(monkeypatch)
+    calls_before = _recording_otp(monkeypatch)
+    out_before = await _plan(rows, sessions)
+
+    calls_after = _recording_otp(monkeypatch)
+    out_after = await _plan(
+        rows, sessions, origin_position=_REQUEST_ORIGIN, dest_position=_REQUEST_DEST
+    )
+
+    assert out_after == out_before
+    assert len(out_before) == 1
+    assert calls_after == calls_before
+    assert calls_before[0]["from"] == _MASTER_ORIGIN
+    assert calls_before[1]["to"] == _MASTER_DEST
+
+
+async def test_plan_federated_no_position_anywhere_returns_empty(monkeypatch):
+    """Check 2 still ends the try when neither master_stations nor the request
+    gives an endpoint a position; OTP is never asked."""
+    sessions = _zz_sessions(monkeypatch)
+    calls = _recording_otp(monkeypatch)
+    out = await _plan([_row(_HUB, _MASTER_HUB)], sessions, origin_position=_REQUEST_ORIGIN)
+    assert out == []
+    assert calls == []
+
+
+async def test_plan_federated_code_no_feed_serves_returns_empty(monkeypatch):
+    """Check 1 stays: a code no session's feed serves ends the try, even with
+    positions in the request (they cannot say which sessions serve the end)."""
+    sessions = _zz_sessions(monkeypatch)
+    calls = _recording_otp(monkeypatch)
+    out = await fp.plan_federated(
+        _FakeDb([_row(_HUB, _MASTER_HUB)]),
+        origin_uic="9900009",  # served by no session
+        dest_uic=_DEST,
+        when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+        sessions=sessions,
+        timeout_ms=5000,
+        origin_position=_REQUEST_ORIGIN,
+        dest_position=_REQUEST_DEST,
+    )
+    assert out == []
+    assert calls == []
