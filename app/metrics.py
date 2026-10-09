@@ -71,6 +71,30 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
 )
 
+# ─── Federated planner ─────────────────────────────────────────────────────
+
+# How each try of the federated planner ended (issue #331). One increment per
+# try that reaches a decision, so the sum of all outcomes is the number of such
+# tries and each outcome's share can be read on the server. A try that raises
+# (a database error, say) is not counted: the fanout logs it as a failure. The
+# label holds fixed reason words only: never a station name and never a code.
+FEDERATED_PLANNER_OUTCOMES = (
+    "code_not_served",  # check 1: an endpoint code is in no session's feed
+    "no_shared_hub",  # the sessions serving the two ends share no station
+    "position_missing",  # check 2: no position in master_stations nor the request
+    "planned_master_positions",  # both endpoint positions from master_stations
+    "planned_request_positions",  # at least one endpoint position from the request
+)
+
+FEDERATED_PLANNER_TRIES_TOTAL = Counter(
+    "viator_federated_planner_tries_total",
+    "Tries of the federated planner, labelled by how they ended.",
+    labelnames=("outcome",),
+)
+for _outcome in FEDERATED_PLANNER_OUTCOMES:
+    # Create each series at zero so a rate can be read before the first hit.
+    FEDERATED_PLANNER_TRIES_TOTAL.labels(outcome=_outcome)
+
 # These regexes match the route templates we want to keep out of the HTTP
 # histograms. Compiled once. Match against the matched-route's `path`
 # attribute (e.g. ``/metrics``, ``/healthz/version``, ``/static/branding/x.svg``).

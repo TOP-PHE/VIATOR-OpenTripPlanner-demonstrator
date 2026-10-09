@@ -185,3 +185,40 @@ def test_fanout_skips_federated_without_uic(
     assert r.status_code == 200, r.text
     assert "federated_trips" not in r.json()
     assert called["hit"] is False
+
+
+def test_fanout_hands_the_request_positions_to_the_federated_planner(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #331: the form's validated lat/lon reach the planner, which uses them
+    when master_stations has no position for a code (invented codes here)."""
+    _make_serving_session("nap-eu-corridors")
+    from app.journey import federated_planner, otp_client
+
+    async def _no_trips(**_kw):
+        return ({}, [])
+
+    monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
+
+    seen: dict = {}
+
+    async def _capture(*_a, **kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(federated_planner, "plan_federated", _capture)
+
+    r = client.post(
+        "/api/journey/fanout",
+        headers=admin,
+        json={
+            "from": {"lat": 45.11, "lon": 3.11, "label": "ZZ Origin", "uic": "9900001"},
+            "to": {"lat": 45.91, "lon": 3.91, "label": "ZZ Destination", "uic": "9900003"},
+            "depart_at": "2026-05-22T08:00:00",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert seen["origin_uic"] == "9900001"
+    assert seen["dest_uic"] == "9900003"
+    assert seen["origin_position"] == (45.11, 3.11)
+    assert seen["dest_position"] == (45.91, 3.91)
