@@ -673,7 +673,7 @@ def list_hubs(
     ]
 
 
-@router.post("/hubs", response_model=HubInfo, status_code=201, responses=_HUB_CREATE_RESPONSES)
+@router.post("/hubs", status_code=201, responses=_HUB_CREATE_RESPONSES)
 def create_hub(
     body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],
@@ -710,7 +710,7 @@ def create_hub(
     return _hub_to_info(hub)
 
 
-@router.patch("/hubs/{hub_id}", response_model=HubInfo, responses=_HUB_UPDATE_RESPONSES)
+@router.patch("/hubs/{hub_id}", responses=_HUB_UPDATE_RESPONSES)
 def update_hub(
     hub_id: str,
     body: Annotated[Any, Body()],
