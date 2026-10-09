@@ -74,9 +74,10 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
 # ─── Federated planner ─────────────────────────────────────────────────────
 
 # How each try of the federated planner ended (issue #331). One increment per
-# try, so the sum of all outcomes is the number of tries and each outcome's
-# share can be read on the server. The label holds fixed reason words only:
-# never a station name and never a station code.
+# try that reaches a decision, so the sum of all outcomes is the number of such
+# tries and each outcome's share can be read on the server. A try that raises
+# (a database error, say) is not counted: the fanout logs it as a failure. The
+# label holds fixed reason words only: never a station name and never a code.
 FEDERATED_PLANNER_OUTCOMES = (
     "code_not_served",  # check 1: an endpoint code is in no session's feed
     "no_shared_hub",  # the sessions serving the two ends share no station

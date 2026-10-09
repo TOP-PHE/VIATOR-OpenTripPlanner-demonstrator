@@ -544,7 +544,8 @@ stitched Paris→Fribourg via Besançon over 12 regional legs instead of via a S
 routes origin→hub and hub→dest with a 10-minute minimum connection time and drops the phantom
 egress/access walks at the stitch boundary. Endpoint and hub positions come from `master_stations`;
 when it has no row or no position for an endpoint code (a station module code, #331), the request's
-lat/lon stands in. Each try is counted by how it ended in `viator_federated_planner_tries_total`.
+lat/lon stands in. Each try that reaches a decision is counted by how it ended in
+`viator_federated_planner_tries_total` (a try that raises is not counted).
 
 ### Invariants & traps
 
@@ -1448,7 +1449,8 @@ Prometheus): request count + latency histogram labelled by the **route template*
 not the rendered URL) so path parameters can't explode label cardinality, plus a custom collector
 running four `COUNT(*)` gauges at scrape time (rebuild queue depth, serving sessions, lifetime and
 failed rebuilds) with a bare `except` so a DB hiccup can't take the whole endpoint down, plus
-`viator_federated_planner_tries_total` (how each federated try ended, fixed reason words only).
+`viator_federated_planner_tries_total` (how each federated try that reaches a decision ended, fixed
+reason words only).
 *Traces* (OTLP gRPC → Tempo): auto-instrumentation only — there is not a single manual
 `start_span` in `app/`. `LoggingInstrumentor` injects `otelTraceID` into log records, and Grafana's
 Loki datasource turns that into a click-through to the trace. Sampling is 100%, which is only

@@ -877,3 +877,19 @@ def test_outcome_series_exist_at_zero_on_a_fresh_import():
         cwd=repo_root,
     )
     assert result.returncode == 0, result.stderr
+
+
+async def test_a_try_that_raises_counts_nothing(monkeypatch):
+    """Only tries that reach a decision are counted: a database error while
+    resolving positions propagates (the fanout logs it) and no outcome moves."""
+    sessions = _zz_sessions(monkeypatch)
+    _recording_otp(monkeypatch)
+
+    def _broken(*_a, **_k):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(fp, "_resolve_coords", _broken)
+    before = _counts()
+    with pytest.raises(RuntimeError):
+        await _plan([], sessions, origin_position=_REQUEST_ORIGIN, dest_position=_REQUEST_DEST)
+    assert _delta(before) == {}

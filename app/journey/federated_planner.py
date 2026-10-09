@@ -513,8 +513,9 @@ async def plan_federated(
        no row or no position for the code, `origin_position` /
        `dest_position` (the request's `(lat, lon)`) stand in (issue #331).
 
-    Each try that gets past the code guard is counted once in
-    `viator_federated_planner_tries_total` by how it ended, so the share of
+    Each try that gets past the code guard and reaches a decision is counted
+    once in `viator_federated_planner_tries_total` by how it ended (a try that
+    raises is not counted; the fanout logs it), so the share of
     module codes that the feeds or master_stations do not know can be
     measured on the server.
     """
