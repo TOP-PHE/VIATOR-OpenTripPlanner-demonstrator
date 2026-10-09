@@ -37,6 +37,10 @@ HUBS = [
     ("zz-a-2", "ZA", 100, True, None, None),
     ("zz-a-1", "ZA", 50, True, None, None),
     ("zz-a-0", "ZA", 100, False, None, None),  # soft-deleted: never looked at
+    # These two make the matrix order (country, sort_order, id) differ from
+    # the order of the ids alone and from (sort_order, id).
+    ("zz-a-9", "ZA", 10, True, None, None),
+    ("zz-b-0", "ZB", 20, True, None, None),
     ("zz-b-1", "ZB", 100, True, "9900001", "msmm"),
     ("zz-a-3", "ZA", 100, True, "9900002", "manual"),
     ("zz-a-4", "ZA", 100, False, "9900003", "msmm"),  # soft-deleted
@@ -105,9 +109,17 @@ def _ids(hubs: list[Any]) -> list[str]:
 def test_resolve_looks_at_the_active_unresolved_hubs_in_the_matrix_order(db: Session) -> None:
     from app.api.admin.network_coverage import _hubs_to_look_at
 
-    assert _ids(_hubs_to_look_at(db, resolved=False, skip=[])) == ["zz-a-1", "zz-a-2", "zz-b-2"]
-    assert _ids(_hubs_to_look_at(db, resolved=False, skip=["zz-a-1", "zz-zz"])) == [
+    assert _ids(_hubs_to_look_at(db, resolved=False, skip=[])) == [
+        "zz-a-9",
+        "zz-a-1",
         "zz-a-2",
+        "zz-b-0",
+        "zz-b-2",
+    ]
+    assert _ids(_hubs_to_look_at(db, resolved=False, skip=["zz-a-1", "zz-zz"])) == [
+        "zz-a-9",
+        "zz-a-2",
+        "zz-b-0",
         "zz-b-2",
     ]
 
@@ -122,7 +134,8 @@ def test_check_looks_at_the_active_resolved_hubs_in_the_matrix_order(db: Session
 def test_hubs_by_id_finds_those_that_exist(db: Session) -> None:
     from app.api.admin.network_coverage import _hubs_by_id
 
-    assert sorted(_hubs_by_id(db, ["zz-a-1", "zz-a-0", "zz-zz"])) == ["zz-a-0", "zz-a-1"]
+    # zz-a-0 is soft-deleted: it takes no code.
+    assert sorted(_hubs_by_id(db, ["zz-a-1", "zz-a-0", "zz-zz"])) == ["zz-a-1"]
 
 
 class _Module:
@@ -211,7 +224,7 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
 
     proposals = test_client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
-    assert [p["hub_id"] for p in proposals] == ["zz-a-1", "zz-a-2", "zz-b-2"]
+    assert [p["hub_id"] for p in proposals] == ["zz-a-9", "zz-a-1", "zz-a-2", "zz-b-0", "zz-b-2"]
     assert all(p["state"] == "proposed" for p in proposals)
     assert _row(fresh_db, "zz-a-1") == (None, None, False)
 
@@ -231,6 +244,20 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
     listed = {h["id"]: h for h in test_client.get(BASE).json()}
     assert (listed["zz-a-1"]["uic"], listed["zz-a-1"]["uic_origin"]) == ("9900042", "msmm")
     assert len([r for r in module.requests if r.url.path.endswith("/lookup")]) == 1
+
+
+def test_confirm_writes_nothing_to_a_soft_deleted_hub(
+    fresh_db: str, client: tuple[TestClient, _Module]
+) -> None:
+    test_client, module = client
+
+    answer = test_client.post(
+        f"{BASE}/confirm", json={"pairs": [{"hub_id": "zz-a-0", "uic": "9900042"}]}
+    ).json()
+
+    assert [r["state"] for r in answer["results"]] == ["unknown_hub"]
+    assert _row(fresh_db, "zz-a-0") == (None, None, False)
+    assert module.requests == []
 
 
 def test_a_typed_code_is_stored_as_manual_and_cleared_by_null(
