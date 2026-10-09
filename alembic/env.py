@@ -22,7 +22,7 @@ config = context.config
 # disable_existing_loggers=False: the default (True) disables every logger that
 # already exists when this runs. The container runs `alembic upgrade head` in a
 # process of its own, but the integration tests run it inside the pytest
-# process, where that silenced 22 `app.*` loggers for every later test and let
+# process, where that silenced every `app.*` logger for every later test and let
 # "this line is not logged" assertions pass for the wrong reason (#337).
 if config.config_file_name is not None:
     fileConfig(config.config_file_name, disable_existing_loggers=False)

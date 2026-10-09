@@ -4,7 +4,7 @@ alembic/env.py calls `fileConfig(alembic.ini)`. With the default
 `disable_existing_loggers=True` that disabled every logger that already
 existed. The container runs `alembic upgrade head` in a process of its own, so
 production never noticed, but the integration tests run it inside the pytest
-process: from then on 26 `app.*` loggers were disabled, and a later test that
+process: from then on every `app.*` logger was disabled, and a later test that
 asserted a line was NOT logged passed whether or not the line was written.
 
 The migration runs offline (`--sql`, no database): env.py, and so fileConfig,
