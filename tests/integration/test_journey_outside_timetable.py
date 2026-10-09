@@ -184,3 +184,72 @@ def test_fanout_names_the_refusal_of_each_engine(
             for e in db.query(JourneySearchExecution).filter_by(search_id=body["search_id"])
         }
     assert stored == {"zz-motis": _DETAIL, "zz-otp": "date outside the loaded timetable"}
+
+
+def _install_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = httpx.MockTransport(_engines)
+    real_cls = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+def _stored_error_message(search_id: str) -> list[str | None]:
+    from app.db import SessionLocal
+    from app.models import JourneySearchExecution
+
+    with SessionLocal() as db:
+        return [
+            e.error_message for e in db.query(JourneySearchExecution).filter_by(search_id=search_id)
+        ]
+
+
+@pytest.mark.parametrize(
+    ("sid", "engine", "status", "detail", "window"),
+    [
+        (
+            "zz-motis",
+            "motis",
+            "error",
+            _DETAIL,
+            {"from": "2031-03-01T00:00:00+00:00", "until": "2031-05-30T00:00:00+00:00"},
+        ),
+        ("zz-otp", "otp", "no_route", "date outside the loaded timetable", None),
+    ],
+    ids=["motis", "otp"],
+)
+def test_plan_names_the_refusal_of_its_session(
+    client: TestClient,
+    admin: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    sid: str,
+    engine: str,
+    status: str,
+    detail: str,
+    window: dict[str, str] | None,
+) -> None:
+    """The single-session /plan route says it too, and stores the sentence."""
+    _make_serving_session(sid, engine)
+    _install_engines(monkeypatch)
+
+    r = client.post(
+        "/api/journey/plan",
+        headers=admin,
+        json={
+            "session_id": sid,
+            "from": {"lat": 46.5, "lon": 6.6, "label": "Zz A"},
+            "to": {"lat": 47.4, "lon": 8.5, "label": "Zz B"},
+            "depart_at": "2031-02-03T05:05:00",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == status
+    assert body["trips"] == []
+    assert body["reason"] == "outside_timetable"
+    assert body["detail"] == detail
+    assert body.get("timetable_window") == window
+    assert _stored_error_message(body["search_id"]) == [detail]
