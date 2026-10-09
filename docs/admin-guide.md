@@ -1488,6 +1488,38 @@ to the audit doc's tracking table and triage from there.
 For all other audit findings and the prioritised action plan, see
 [`audit-2026-05.md`](audit-2026-05.md).
 
+### 6.13 Journey search says "date outside the loaded timetable"
+
+Since #338 the timing strip of `/journey` reads, for example,
+`eu19-transit-motis: 0 trips in 54ms (date outside the loaded timetable (loaded: 2026-10-01 00:00 to 2026-12-14 00:00 UTC))`
+instead of `(error)`. The session's engine refused the date: its loaded
+timetable does not cover it. This is not a fault of the session, and ÖBB
+HAFAS, shown beside it, can still answer, because it is not limited to a
+loaded feed.
+
+- **MOTIS** sessions refuse with HTTP 400 and name the window they have
+  loaded (UTC, end excluded); VIATOR shows it. The execution keeps status
+  `error` in the database, with the sentence in `error_message`.
+- **OTP** sessions answer `OUTSIDE_SERVICE_PERIOD` and name no window, so
+  the strip says only "date outside the loaded timetable". The execution
+  keeps status `no_route`.
+
+What to do: search a date inside the window, or, if the window is too
+short or too old, refresh the session's feeds and rebuild it. The form
+warns before searching when the chosen date is in the past, since a
+session's timetable usually starts around the day it was built.
+
+**MOTIS geocoder lines in the web log.** The station fields of `/journey`
+also ask the first serving MOTIS session's geocoder. A call that a newer
+keystroke, a pick or leaving the field supersedes is aborted by the page
+and logged at INFO as
+`MOTIS geocoder call for session <sid> ended: reason=superseded`. A real
+failure stays a WARNING with a reason word and the exception's type, e.g.
+`MOTIS geocoder unreachable for session <sid>: reason=timeout (ReadTimeout)`
+(`timeout` is the 1.5 s budget, `connect` a refused or unresolved
+connection, `network` another transport error). Neither line carries the
+typed text.
+
 ---
 
 ## 7. Rollback
