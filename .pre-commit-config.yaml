@@ -14,10 +14,13 @@ repos:
       - id: check-merge-conflict
       - id: detect-private-key
 
+  # rev must be "v" + requirements-dev.txt's ruff pin: Dependabot does not
+  # update pre-commit revs, so tests/unit/test_dev_tool_pins_stay_in_step.py
+  # fails when the two drift (#336). Bump them together.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.16.10
     hooks:
-      - id: ruff
+      - id: ruff-check   # the hook repo now calls the old id "ruff" a legacy alias
         args: ["--fix"]
       - id: ruff-format
 

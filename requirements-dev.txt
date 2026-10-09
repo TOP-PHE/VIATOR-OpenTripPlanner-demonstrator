@@ -17,6 +17,9 @@ ruff==0.16.10               # also our formatter — black was dropped in audit
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
                             # once black is removed.
+                            # .pre-commit-config.yaml's ruff rev must be
+                            # "v" + this version; a unit test fails on drift
+                            # (Dependabot bumps this line only, #336).
 mypy==2.4.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
 
 # Security

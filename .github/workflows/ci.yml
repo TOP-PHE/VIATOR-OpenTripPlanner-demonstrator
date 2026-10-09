@@ -97,15 +97,12 @@ jobs:
       # Mirror the .trivyignore convention: one CVE per line, written
       # justification, re-evaluate when the underlying dep changes.
       #
-      # GHSA-6w46-j5rx-g56g — pytest 8.3.4 (fix in 9.0.3, dev-only)
-      #   Test isolation issue. Pytest runs only on our test files in CI;
-      #   no production exposure. Bump deferred — 8 → 9 is a major bump
-      #   with potential fixture-API breakage; out of scope for the
-      #   security-floor audit PR. Tracked in audit-2026-05.md.
+      # None today. The last one, GHSA-6w46-j5rx-g56g (pytest 8.3.4), went
+      # in #336: requirements-dev.txt pins pytest 9.x, which carries the fix
+      # (audit-2026-05 #22, done in #56).
       - name: pip-audit (Python CVEs)
         run: |
-          pip-audit --strict --vulnerability-service=osv \
-            --ignore-vuln GHSA-6w46-j5rx-g56g
+          pip-audit --strict --vulnerability-service=osv
         continue-on-error: false
 
       # Audit-2026-05 P0 #4 (coverage floor — the L-effort test-writing
@@ -160,5 +157,9 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      - run: pip install pre-commit
+      # The pre-commit version requirements-dev.txt pins, so this job and a
+      # developer's machine run the same one (#336). Without the pin pip gets an
+      # empty name and the step fails; test_dev_tool_pins_stay_in_step.py checks it.
+      - name: Install pre-commit (requirements-dev.txt's pin)
+        run: pip install "$(grep -oE '^pre-commit==[^[:space:]]+' requirements-dev.txt)"
       - run: pre-commit run --all-files --show-diff-on-failure
