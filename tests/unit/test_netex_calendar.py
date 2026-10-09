@@ -289,7 +289,6 @@ def test_build_falls_back_to_the_original_on_a_conversion_error(
 ) -> None:
     from app import worker
 
-    monkeypatch.setattr(worker.log, "disabled", False)
     motis_root, netex = _worker_dirs(tmp_path, monkeypatch)
     src = netex / "si-nap.zip"
     src.write_bytes(b"not a zip")

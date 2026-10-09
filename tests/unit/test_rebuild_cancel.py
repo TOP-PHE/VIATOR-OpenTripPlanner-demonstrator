@@ -167,7 +167,6 @@ def test_watcher_survives_a_failed_check(monkeypatch: pytest.MonkeyPatch) -> Non
         done.set()
         return False
 
-    monkeypatch.setattr(worker.log, "disabled", False)
     monkeypatch.setattr(worker, "_CANCEL_POLL_SECONDS", 0.001)
     monkeypatch.setattr(worker, "_cancel_requested", flaky)
     worker._watch_for_cancel(uuid.uuid4(), "viator-build-x", done)
