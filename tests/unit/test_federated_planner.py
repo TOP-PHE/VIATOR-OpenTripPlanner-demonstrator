@@ -825,3 +825,55 @@ async def test_counter_not_touched_without_codes():
         timeout_ms=1000,
     )
     assert _delta(before) == {}
+
+
+@pytest.mark.parametrize(
+    ("rows", "word"),
+    [
+        # origin placed by master_stations, destination nowhere
+        ([_row(_ORIGIN, _MASTER_ORIGIN), _row(_HUB, _MASTER_HUB)], "destination"),
+        # destination placed by master_stations, origin nowhere
+        ([_row(_HUB, _MASTER_HUB), _row(_DEST, _MASTER_DEST)], "origin"),
+    ],
+)
+async def test_check2_log_names_the_end_without_position(monkeypatch, caplog, live_log, rows, word):
+    """Check 2 names the one end that has no position, not the other."""
+    sessions = _zz_sessions(monkeypatch)
+    calls = _recording_otp(monkeypatch)
+    before = _counts()
+    with caplog.at_level(logging.INFO, logger=fp.__name__):
+        out = await _plan(rows, sessions)
+    assert out == []
+    assert calls == []
+    assert _delta(before) == {"position_missing": 1.0}
+    assert f"federated try ended: position_missing ({word})" in caplog.text
+    _assert_log_has_no_code(caplog)
+
+
+def test_outcome_series_exist_at_zero_on_a_fresh_import():
+    """Each outcome's series exists, at zero, as soon as app.metrics is imported,
+    whatever ran before: checked in a fresh interpreter that never plans."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    probe = (
+        "from app.metrics import FEDERATED_PLANNER_OUTCOMES, FEDERATED_PLANNER_TRIES_TOTAL\n"
+        "samples = {\n"
+        "    s.labels['outcome']: s.value\n"
+        "    for m in FEDERATED_PLANNER_TRIES_TOTAL.collect()\n"
+        "    for s in m.samples\n"
+        "    if s.name.endswith('_total')\n"
+        "}\n"
+        "assert samples == {o: 0.0 for o in FEDERATED_PLANNER_OUTCOMES}, samples\n"
+        "assert len(samples) == 5, samples\n"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=repo_root,
+    )
+    assert result.returncode == 0, result.stderr
