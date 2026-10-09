@@ -1,7 +1,8 @@
 """MOTIS geocoder proxy for the journey-form typeahead.
 
-The journey UI's existing /api/master/stations typeahead is bootstrapped
-from Trainline-eu/stations (rail mainline stations only — ~50k entries).
+The journey UI's station typeahead (/api/stations/suggest) serves rail
+stations: the station module's, or VIATOR's own list bootstrapped from
+Trainline-eu/stations (rail mainline stations only — ~50k entries).
 For sessions whose GTFS feed covers urban transit too (e.g. the full
 Swiss national feed, which includes BVB Basel trams + Saint-Louis cross-
 border tram terminus + every VBZ, TPG, etc. stop), MOTIS's own geocoder

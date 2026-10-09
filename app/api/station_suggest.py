@@ -1,8 +1,14 @@
 """Station suggestions for the journey typeahead: `POST /api/stations/suggest`.
 
 Open to every logged-in user (`require_logged_in`): an end user is served,
-which `GET /api/master/stations` (content managers and administrators only)
-never did.
+which the old `GET /api/master/stations` (content managers and
+administrators only, removed in MSMM step 3) never did.
+
+The checks of the body (`query_or_422`) and the search itself
+(`find_stations`: the module, then VIATOR's own list) are shared with the
+"Stations" admin page's `POST /api/master/stations/search`
+(app/api/master/stations.py), which differs only in its gate and in the
+shape of its answer.
 
 The text `q` arrives in the JSON body, never in the URL, and is validated
 with exactly the rules of the Multimodal Station Mapping module's search
@@ -31,8 +37,8 @@ Where the stations come from:
 2. **VIATOR's own `master_stations` list otherwise** (the module not
    configured, paused, failing, or a user without an id), with the same
    guards: name contains `q` (its `%`, `_` and backslash literal) or UIC
-   equals `q`, rows with a position only, ordered by `(country_iso, name)`
-   like the admin station list, at most 10 rows, tagged `source: "viator"`.
+   equals `q`, rows with a position only, ordered by `(country_iso, name)`,
+   at most 10 rows, tagged `source: "viator"`.
    Every value of `q` is a bound parameter, never in the statement's text,
    which VIATOR's SQLAlchemy tracing records.
 
@@ -48,7 +54,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -76,7 +82,7 @@ _ESCAPE = "\\"
 _WHITE_SPACE = re.compile(r"\s+")
 
 # The description of the route's 422 in its OpenAPI answers.
-_REFUSED_TEXT = (
+REFUSED_TEXT = (
     "The text is not one the station search accepts: 3 to 100 characters once "
     "normalised, no control character, no lone surrogate. Or the body is not "
     '{"q": <text>} and nothing else.'
@@ -143,6 +149,13 @@ def _normalised_or_422(text: str) -> str:
         raise HTTPException(status_code=422, detail=str(refused)) from None
 
 
+def query_or_422(given: Any) -> str:
+    """The text of the body `given` (the parsed JSON), normalised, or a 422
+    with a fixed sentence: `{"q": <text>}` and nothing else, then the
+    module's text rules (`normalise_query`)."""
+    return _normalised_or_422(_body_or_422(given).q)
+
+
 def fallback_statement(q: str) -> Executable:
     """The query of VIATOR's own stations for `q`; `q` only as bound parameters."""
     return (
@@ -181,9 +194,31 @@ def fallback_rows(db: DbSession, q: str) -> list[dict[str, Any]]:
     ]
 
 
+# Where an answer's stations come from: the module, or VIATOR's own
+# Trainline list (the fallback).
+Origin = Literal["msmm", "trainline"]
+
+
+async def find_stations(
+    db: DbSession, q: str, user: CurrentUser
+) -> tuple[Origin, list[dict[str, Any]]]:
+    """At most ten stations for the normalised text `q`, and where they come from.
+
+    The module first, on behalf of `user` (its counters are this person's);
+    its answer is final, an empty one included. VIATOR's own list when the
+    module is not configured, paused or failing, or when the user has no
+    VIATOR id (the basic-auth shadow user): the rows of `fallback_rows`.
+    """
+    if user.id is not None:
+        rows = await station_module.search(q, user.id)
+        if rows is not None:
+            return "msmm", rows
+    return "trainline", await run_in_threadpool(fallback_rows, db, q)
+
+
 @router.post(
     "/suggest",
-    responses={422: {"description": _REFUSED_TEXT}},
+    responses={422: {"description": REFUSED_TEXT}},
     # The body is declared `Any` below so that the framework never validates
     # it (see the module's docstring); the published schema stays the model's.
     openapi_extra={
@@ -199,9 +234,7 @@ async def suggest(
     given: Annotated[Any, Body()] = None,
 ) -> list[dict[str, Any]]:
     """At most ten stations whose name contains `q`, or whose UIC is `q`."""
-    q = _normalised_or_422(_body_or_422(given).q)
-    if user.id is not None:
-        rows = await station_module.search(q, user.id)
-        if rows is not None:
-            return [{**row, "source": "msmm"} for row in rows]
-    return await run_in_threadpool(fallback_rows, db, q)
+    origin, rows = await find_stations(db, query_or_422(given), user)
+    if origin == "msmm":
+        return [{**row, "source": "msmm"} for row in rows]
+    return rows

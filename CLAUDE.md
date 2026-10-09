@@ -100,6 +100,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
     `20260908_1200_null_pre_extid`; a re-sweep is required. §7 item 2
   - Canonical: `UIC:8503000`
   - Fallback: lat/lon rounded to ~110 m when no UIC available
+  - **The station module (MSMM) is the reference for a station; VIATOR edits none** (MSMM step 3, decisions 52–55): `master_stations` is the Trainline list, kept fresh by the daily import and "Refresh from Trainline", used as the fallback of the typeahead and of the Stations page and as the key of VIATOR's internal joins (federated planner, session country gate, `stations_xref`; they stay on Trainline until code agreement is measured, #331). The Stations page (`/admin/master/stations`) is a search (`POST /api/master/stations/search`, the typeahead's functions, ≤10 results labelled MSMM or Trainline, no list/paging/total); the list, PATCH and drift routes are gone. Revision `20261010_1200_edit_archive` archived the old `manual` rows and drift rows in `master_stations_edit_archive` before handing the rows back to the import, which overwrites only the fields its CSV fills (an edited operator code, position or parent that Trainline leaves empty survives, marked `trainline`; admin-guide §11.1 has the `psql` line that lists them); the import's `manual` branch and the drift table are dormant. Never add a write path that sets `source='manual'`.
   - **Coverage hubs (`network_coverage_hubs`) carry a nullable station code** (`uic`, `uic_origin` = `msmm` | `manual`, MSMM step 3, #332): proposed by the station module and confirmed by an administrator, or typed by hand; no FK/join to `master_stations` (a MERITS code need not be a Trainline `uic`). The Re-run link's `&from_uic=&to_uic=` (PR-202) carries it; it is empty for an unresolved hub. The coverage runner still routes by position and never calls the module.
 - **Timezones**: IANA names everywhere (`Europe/Zurich`, never `CET`/`CEST`)
 - **One timezone per coverage run**: `run.depart_at` is an instant anchored in that run's
@@ -481,7 +482,9 @@ for reading, not execution. **Ruff owns `app/`, `tests/` and `alembic/`; prose i
      8742-pair sweep and leaves no record of what it decided.
    - The hubs' `uic` column exists since #332 (MSMM step 3: proposed through the station module,
      confirmed by an administrator, or typed as `manual`), which PR-202's `&from_uic=` passthrough
-     now carries; the ÖBB code column and the offline resolution above remain to do.
+     now carries; the ÖBB code column and the offline resolution above remain to do. Since MSMM
+     step 3 stations are corrected only in the station module, and VIATOR's internal joins stay on
+     Trainline's codes until code agreement is measured (#331): any resolution work starts there.
    - Separately, populate `NetworkCoverageHub.modes`: #212 shipped the column and the R/T/M/B/C header
      band, but every hub renders `?`, so the band is decorative until something classifies them.
 

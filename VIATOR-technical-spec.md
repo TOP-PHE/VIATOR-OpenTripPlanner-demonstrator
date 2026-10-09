@@ -643,7 +643,7 @@ The system rejects searches whose original `graph_snapshot.timetable_main_versio
 
 ## 7. Master data management
 
-Cross-source comparison only works if VIATOR has a stable view of "the same station" and "the same service" across NAP, MERITS, Trenitalia France, and any future feed. Three master tables hold this reference data, all editable from the admin UI and seedable from open datasets.
+Cross-source comparison only works if VIATOR has a stable view of "the same station" and "the same service" across NAP, MERITS, Trenitalia France, and any future feed. Three master tables hold this reference data, editable from the admin UI (stations no longer, since MSMM step 3: they are corrected in the station module) and seedable from open datasets.
 
 ### 7.1 Master stations
 
@@ -658,6 +658,12 @@ docker compose run --rm web python -m app.master.bootstrap_stations
 Periodic refresh: monthly by default (`MASTER_STATIONS_REFRESH_DAYS`). The trip_signature canonicaliser (§6.4) resolves any source-specific stop_id to UIC by joining on the per-session `stations_xref` table → `master_stations` table.
 
 #### Conflict resolution — "our edits prevail, but stay informed"
+
+> **Superseded by MSMM step 3 (2026-10).** Stations are no longer edited in VIATOR: the station
+> module is the reference and corrections are made there. The edit and drift routes below are
+> removed, the existing edits were archived in `master_stations_edit_archive`, and the import's
+> `manual` branch is dormant (`docs/architecture.md` ch. 8, `docs/admin-guide.md` §11.1). The
+> policy is kept here as the record of what VIATOR did before.
 
 Local fixes must always win — but admins also need to know when Trainline later updates a row we've already touched, in case our fix becomes obsolete or Trainline's improvement is genuinely better. The policy is **row-level lock with drift surfacing**:
 
@@ -678,7 +684,7 @@ Local fixes must always win — but admins also need to know when Trainline late
    - **Adopt Trainline's value (full row)** — overwrites our row with Trainline's, flips `source` back to `'trainline'`, clears drift.
    - **Adopt selected fields only** — partial adoption; row stays `'manual'`; drift entry cleared.
 
-4. A `GET /api/master/stations/drift` endpoint lists all pending-drift rows so the team can periodically reconcile.
+4. A `GET /api/master/stations/drift` endpoint lists all pending-drift rows so the team can periodically reconcile (removed in MSMM step 3).
 
 The same pattern applies to `master_carriers` (RICS dictionary) — pending-drift table, three resolution actions.
 
@@ -1066,7 +1072,7 @@ The audit row records `action=user.created` with `metadata={email, role, name}` 
 | `POST /api/journey/compare` | same + `session_id_a`, `session_id_b` | `{a, b, diff}` (kept for explicit two-session comparison) | logged-in |
 | `GET /api/journey/searches/<search_id>` | — | full recorded search with executions and trips | search owner or platform_admin |
 
-The journey UI's From/To autocomplete uses **`GET /api/master/stations?q=`** (§9.9) directly — no separate geocode endpoint exists.
+The journey UI's From/To autocomplete uses **`POST /api/stations/suggest`** (the station module, else VIATOR's Trainline list) and `GET /api/geocode` (MOTIS geocoder); `GET /api/master/stations?q=` was removed in MSMM step 3.
 
 ### 9.5 Audit
 
@@ -1110,12 +1116,8 @@ All write operations on master data are open to **content_manager and platform_a
 
 | Method & path | Body / params | Returns | Roles |
 |---|---|---|---|
-| `GET /api/master/stations?q=&country=&page=` | — | paginated `master_stations` rows; rows with pending drift include a flag | logged-in |
-| `POST /api/master/stations` | full row | `201 { ... }`, `source = 'manual'` | content_manager, platform_admin |
-| `PATCH /api/master/stations/<uic>` | partial | updated row, `source = 'manual'` | content_manager, platform_admin |
-| `POST /api/master/stations/refresh-trainline` | — | `{ added, updated, skipped_manual, pending_drift }` | content_manager, platform_admin |
-| `GET /api/master/stations/drift` | — | list of pending-drift rows with field-level diffs | content_manager, platform_admin |
-| `POST /api/master/stations/<uic>/drift/resolve` | `{ action: 'keep_ours' \| 'adopt_full' \| 'adopt_fields', fields?: [...] }` | updated row | content_manager, platform_admin |
+| `POST /api/master/stations/search` | `{ q }` (3 to 100 characters) | `{ origin: 'msmm' \| 'trainline', stations: [≤10] }`; no list, no paging (MSMM step 3: the station list, edit and drift routes are removed) | content_manager, platform_admin |
+| `POST /api/master/stations/refresh-trainline` | — | `{ added, updated, skipped_manual, pending_drift, parent_links_set }` | content_manager, platform_admin |
 | `GET /api/master/route-aliases?q=` | — | list | content_manager, platform_admin |
 | `POST /api/master/route-aliases` | `{ canonical_name, alias, applies_from?, applies_until?, scope? }` | `201 { ... }` | content_manager, platform_admin |
 | `DELETE /api/master/route-aliases/<id>` | — | `204` | content_manager, platform_admin |
@@ -1585,7 +1587,7 @@ docker compose start web worker
 
 #### 11.7.3 Configuration drift protection
 
-Master-data rows with `source='manual'` are **never** overwritten by the Trainline CSV bootstrap or any automatic refresh. If you've curated the master_stations table by hand, those edits survive forever — no backup needed. Same rule for `route_aliases`: hand-entered rows are sacred.
+Master-data rows with `source='manual'` are **never** overwritten by the Trainline CSV bootstrap or any automatic refresh. *(Since MSMM step 3 no station row is `manual`: the edits were archived in `master_stations_edit_archive` and the rows handed back to the import; take a backup before that release. See `docs/admin-guide.md` §11.1.)* Same rule for `route_aliases`: hand-entered rows are sacred.
 
 ### 11.8 Observability
 

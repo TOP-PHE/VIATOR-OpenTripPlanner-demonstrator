@@ -1,4 +1,5 @@
-"""Master data: stations, route aliases, carriers, and pending-drift mirrors. See spec §7."""
+"""Master data: stations, route aliases, carriers, pending-drift mirrors, and the
+archive of the station edits VIATOR no longer makes. See spec §7."""
 
 from __future__ import annotations
 
@@ -137,6 +138,31 @@ class MasterStationPendingDrift(Base):
     trainline_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     fields_differing: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MasterStationEditArchive(Base):
+    """The station edits made in VIATOR before MSMM step 3, kept for reading.
+
+    Filled once by revision `20261010_1200_edit_archive`: every
+    `master_stations` row that was `manual`, or had a pending drift row, as it
+    stood, with that drift row; the edited rows were then handed back to the
+    Trainline import. Nothing in the application reads or writes it: an
+    administrator reads it with the runbook's `psql` line and carries an edit
+    that matters into the station module, the reference since step 3.
+    No foreign key: the archive outlives anything done to `master_stations`.
+    """
+
+    __tablename__ = "master_stations_edit_archive"
+
+    uic: Mapped[str] = mapped_column(String, primary_key=True)
+    # Every column of the master_stations row, as it stood.
+    station: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    drift_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    drift_fields: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    drift_detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
