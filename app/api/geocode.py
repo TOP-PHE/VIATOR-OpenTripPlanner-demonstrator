@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
 import httpx
@@ -140,7 +140,7 @@ async def _client_gone(request: Request) -> None:
 
 
 async def _unless_client_gone(
-    call: Awaitable[httpx.Response], client_gone: Awaitable[None] | None
+    call: Awaitable[httpx.Response], client_gone: Callable[[], Awaitable[None]] | None
 ) -> httpx.Response | None:
     """The answer of `call`, or None when `client_gone` finishes first; the
     call still in flight is then cancelled, so MOTIS's answer is not awaited
@@ -148,7 +148,9 @@ async def _unless_client_gone(
     if client_gone is None:
         return await call
     fetch = asyncio.ensure_future(call)
-    gone = asyncio.ensure_future(client_gone)
+    # The watcher starts here, once the client and its call exist, so it is
+    # never created without being awaited.
+    gone = asyncio.ensure_future(client_gone())
     try:
         await asyncio.wait({fetch, gone}, return_when=asyncio.FIRST_COMPLETED)
         if fetch.done():
@@ -166,11 +168,12 @@ async def _unless_client_gone(
 
 
 async def _fetch_motis_geocode(
-    session_id: str, q: str, client_gone: Awaitable[None] | None = None
+    session_id: str, q: str, client_gone: Callable[[], Awaitable[None]] | None = None
 ) -> Any:
     """HTTP fetch of MOTIS's geocoder. Returns the parsed JSON payload, or
     `[]` on any failure mode (network error, non-2xx, non-JSON body), or
-    when `client_gone` finishes first (the browser dropped the request).
+    when the watcher `client_gone()` returns first (the browser dropped the
+    request).
 
     Logging (#338): a superseded or cancelled call is INFO, a real failure
     (timeout, connection, other transport error, non-2xx, non-JSON) is
@@ -229,5 +232,5 @@ async def geocode(
     motis = _pick_motis_session(db)
     if motis is None:
         return []
-    payload = await _fetch_motis_geocode(motis.id, q, _client_gone(request))
+    payload = await _fetch_motis_geocode(motis.id, q, lambda: _client_gone(request))
     return _extract_stops(payload, size)

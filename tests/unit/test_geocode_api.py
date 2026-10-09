@@ -262,7 +262,7 @@ async def test_a_call_the_browser_dropped_is_info_and_motis_is_not_awaited(monke
         await asyncio.sleep(0)
 
     with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
-        out = await asyncio.wait_for(_fetch_motis_geocode(_SID, _TYPED, browser_left()), 2)
+        out = await asyncio.wait_for(_fetch_motis_geocode(_SID, _TYPED, browser_left), 2)
 
     assert out == []
     assert not motis_answered.is_set()  # the call to MOTIS was cancelled
@@ -280,7 +280,7 @@ async def test_an_answer_before_the_browser_leaves_is_returned(monkeypatch, capl
     still_there = asyncio.Event()
 
     with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
-        out = await _fetch_motis_geocode(_SID, _TYPED, still_there.wait())
+        out = await _fetch_motis_geocode(_SID, _TYPED, still_there.wait)
 
     assert out == [_STOP_BASEL]
     assert _geocode_lines(caplog) == []
@@ -299,7 +299,7 @@ async def test_when_listening_for_the_browser_fails_the_answer_is_still_awaited(
         raise RuntimeError("zz receive failed")
 
     with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
-        out = await _fetch_motis_geocode(_SID, _TYPED, listening_fails())
+        out = await _fetch_motis_geocode(_SID, _TYPED, listening_fails)
 
     assert out == [_STOP_AESCHEN]
     assert _geocode_lines(caplog) == []
