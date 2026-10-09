@@ -166,7 +166,7 @@ def add(db, s, wanted: set[str] | None, apply: bool) -> int:
     if missing:
         print(
             f"no master_stations rows for {', '.join(sorted(missing))} - import them from "
-            "Trainline first (Admin > Master stations), then re-run. Nothing written.",
+            "Trainline first (Admin > Stations, Refresh from Trainline), then re-run. Nothing written.",
             file=sys.stderr,
         )
         return 1

@@ -5,7 +5,14 @@ CSV is semicolon-delimited UTF-8. Source:
 
 Conflict resolution: rows with `source='manual'` are NEVER overwritten by a
 refresh — instead, the upstream snapshot is recorded in the
-`master_stations_pending_drift` table and surfaced in the admin UI.
+`master_stations_pending_drift` table.
+
+That branch is dormant since MSMM step 3: station edits are made only in the
+station module, VIATOR's edit route and drift queue are gone, and revision
+20261010_1200_edit_archive archived the edited rows and handed them back to
+this import (`source='trainline'`). No code can make a row `manual` any more,
+so no drift row is written; the branch stays until the owner decides to drop
+the drift table, once the archive has been read.
 
 Two ID spaces in the upstream CSV (frequent source of bugs):
 
