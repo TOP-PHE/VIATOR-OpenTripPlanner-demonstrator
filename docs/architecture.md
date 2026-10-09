@@ -542,7 +542,9 @@ process-lifetime cached), intersects two sessions' sets to find shared hubs, ran
 **destination-country-first then by great-circle detour** — because ranking by proximity alone once
 stitched Paris→Fribourg via Besançon over 12 regional legs instead of via a Swiss gateway — then
 routes origin→hub and hub→dest with a 10-minute minimum connection time and drops the phantom
-egress/access walks at the stitch boundary.
+egress/access walks at the stitch boundary. Endpoint and hub positions come from `master_stations`;
+when it has no row or no position for an endpoint code (a station module code, #331), the request's
+lat/lon stands in. Each try is counted by how it ended in `viator_federated_planner_tries_total`.
 
 ### Invariants & traps
 
@@ -1359,7 +1361,7 @@ seams are drawn where a real product would draw them, so nothing has to be unpic
 | `app/db.py` | SQLAlchemy engine + `SessionLocal` + the `get_db` FastAPI dependency. Schema is Alembic's, never `create_all()` |
 | `app/logging_config.py` | structlog + stdlib unified into one JSON renderer chain |
 | `app/middleware/request_id.py` | Binds a `request_id` contextvar per request; echoes `X-Request-ID` |
-| `app/metrics.py` | Prometheus HTTP middleware, four DB-derived gauges, `/metrics` |
+| `app/metrics.py` | Prometheus HTTP middleware, four DB-derived gauges, the federated planner's tries counter, `/metrics` |
 | `app/tracing.py` | OpenTelemetry SDK + OTLP→Tempo exporter + auto-instrumentation (FastAPI, SQLAlchemy, httpx, logging) |
 | `app/rate_limit.py` | slowapi `Limiter` with **no default limits**; routes opt in |
 
@@ -1445,7 +1447,8 @@ so uvicorn, SQLAlchemy and APScheduler emit the same shape without per-module mi
 Prometheus): request count + latency histogram labelled by the **route template** (`/api/sessions/{sid}`,
 not the rendered URL) so path parameters can't explode label cardinality, plus a custom collector
 running four `COUNT(*)` gauges at scrape time (rebuild queue depth, serving sessions, lifetime and
-failed rebuilds) with a bare `except` so a DB hiccup can't take the whole endpoint down.
+failed rebuilds) with a bare `except` so a DB hiccup can't take the whole endpoint down, plus
+`viator_federated_planner_tries_total` (how each federated try ended, fixed reason words only).
 *Traces* (OTLP gRPC → Tempo): auto-instrumentation only — there is not a single manual
 `start_span` in `app/`. `LoggingInstrumentor` injects `otelTraceID` into log records, and Grafana's
 Loki datasource turns that into a click-through to the trace. Sampling is 100%, which is only
