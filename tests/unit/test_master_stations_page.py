@@ -240,6 +240,12 @@ DOM_SCENARIO = r"""
   submit(); await settle(); await settle();
   out.empty = view();
 
+  answer = {origin: 'zz-unknown', stations: [
+    {name: 'Zz Other', latitude: 45.2, longitude: 6.2, country_iso: 'ZZ', uic: '9900005'},
+  ]};
+  submit(); await settle(); await settle();
+  out.unknown = view();
+
   process.stdout.write(JSON.stringify(out));
 })();
 """
@@ -284,6 +290,12 @@ def test_an_administrator_with_the_module_sees_labels_notices_and_links(
     assert trainline["links"] == [[]]  # no module link on a Trainline row
 
     assert out["empty"]["status"] == "No station found."
+    # An origin the page does not know is shown as Trainline, never as itself.
+    unknown = out["unknown"]
+    assert unknown["cells"][0][4] == "Trainline"
+    assert unknown["labels"] == [["origin origin-trainline"]]
+    assert unknown["links"] == [[]]
+    assert unknown["notice"] == NOTICE_FALLBACK
     assert out["empty"]["notice"] == NOTICE_MSMM
     assert out["empty"]["cells"] == []
 

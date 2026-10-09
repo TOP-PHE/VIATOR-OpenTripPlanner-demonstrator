@@ -205,6 +205,40 @@ def test_an_end_user_with_a_bad_body_is_refused_before_the_body_is_read(
     assert answer.status_code == 403
 
 
+@pytest.mark.parametrize("caller", ["basic-auth", "jwt-subject-not-a-uuid"])
+def test_a_caller_without_a_viator_user_id_cannot_reach_the_route(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+) -> None:
+    """The basic-auth shadow user has no id. The gate admits JWT users only,
+    whose subject must be a UUID, so every search names a person to the
+    module and "the station module did not answer" is never shown to a
+    caller the module was not asked for. The legacy credential is valid
+    here, and still refused."""
+    import base64
+
+    if caller == "basic-auth":
+        user, password = "zz-admin", secrets.token_hex(8)
+        monkeypatch.setattr(settings, "admin_user", user)
+        monkeypatch.setattr(settings, "admin_password", password)
+        pair = base64.b64encode(f"{user}:{password}".encode()).decode()
+        authorization = f"Basic {pair}"
+    else:
+        jwt = tokens.issue_jwt("zz-not-a-uuid", "zz@example.invalid", "platform_admin")  # type: ignore[arg-type]
+        authorization = f"Bearer {jwt}"
+    client.cookies.clear()
+
+    answer = client.post(ROUTE, json={"q": "Zzville"}, headers={"Authorization": authorization})
+
+    assert answer.status_code == 401
+    assert module.requests == []
+    assert fallback.calls == []
+
+
 def test_the_route_is_post_only(client: TestClient, module_off: None) -> None:
     _, cookies = _login()
     client.cookies.clear()

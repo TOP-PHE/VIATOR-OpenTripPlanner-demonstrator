@@ -13,7 +13,11 @@ platform administrators (`require_content_manager`):
   VIATOR's own Trainline list (`find_stations`). The answer says once where
   the stations come from: `{"origin": "msmm" | "trainline", "stations":
   [...]}`. An empty answer of the module is `msmm` with no station: it is
-  never topped up with Trainline rows. No paging, no total, no list: the
+  never topped up with Trainline rows. Every caller has a VIATOR user id:
+  the gate admits JWT users only, and a JWT's subject must be a UUID. (The
+  legacy basic-auth shadow user has no id and cannot reach the route; the
+  shared search would give it Trainline without asking the module, and the
+  page would then say the module did not answer.) No paging, no total, no list: the
   table cannot be read off the page. No slowapi limit, as on the typeahead
   (behind nginx it would be one counter for the whole site); the limits are
   the module's.
