@@ -329,10 +329,23 @@ def _is_number(value: Any) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _plain(value: str) -> bool:
+    """True when the text holds no surrogate (Cs) and no control character
+    (Cc). A lone surrogate, which JSON can carry, cannot be written as UTF-8:
+    VIATOR's own JSON answer (or a database write) would fail with a 500."""
+    return not any(unicodedata.category(character) in ("Cs", "Cc") for character in value)
+
+
+def _text_or_null(value: Any) -> bool:
+    """True for None or a plain text (see `_plain`)."""
+    return value is None or (isinstance(value, str) and _plain(value))
+
+
 def _station_row(item: Any) -> dict[str, Any] | None:
     """One row of the module's answer as the typeahead reads it, or None when
     it is not a usable row. The name is kept as sent (it may hold markup: the
-    page escapes it)."""
+    page escapes it), but a row whose name, code or country holds a surrogate
+    or a control character is dropped."""
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -340,13 +353,13 @@ def _station_row(item: Any) -> dict[str, Any] | None:
     longitude = item.get("longitude")
     country = item.get("country_iso")
     uic = item.get("uic")
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str) or not name or not _plain(name):
         return None
     if not (_is_number(latitude) and _is_number(longitude)):
         return None
-    if country is not None and not isinstance(country, str):
+    if not _text_or_null(country):
         return None
-    if not isinstance(uic, str):
+    if not isinstance(uic, str) or not _plain(uic):
         return None
     return {
         "name": name,
@@ -445,7 +458,7 @@ def _lookup_row(item: Any, asked: set[str]) -> dict[str, Any] | None:
     if row is None or row["uic"] not in asked:
         return None
     parent = item.get("parent_uic")
-    if parent is not None and not isinstance(parent, str):
+    if not _text_or_null(parent):
         return None
     row["parent_uic"] = parent
     return row

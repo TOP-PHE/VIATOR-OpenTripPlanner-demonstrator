@@ -1252,3 +1252,62 @@ async def test_lookup_never_logs_a_code_or_the_token(
 )
 def test_code_refused_mirrors_the_module_rule(code: str, word: str | None) -> None:
     assert station_module.code_refused(code) == word
+
+
+# ─────────────── surrogates and control characters from the module ───────────────
+
+_UNWRITABLE = [
+    pytest.param("\ud800", id="a-surrogate"),
+    pytest.param("\x00", id="a-nul"),
+    pytest.param("\t", id="a-tab"),
+]
+
+
+def _answer_escaped(module: Module, payload: Any) -> None:
+    """A 200 whose JSON writes a lone surrogate as `\\ud800`, as a module may."""
+    body = json.dumps(payload).encode("ascii")
+    module.handler = lambda _r: httpx.Response(
+        200, content=body, headers={"Content-Type": "application/json"}
+    )
+
+
+@pytest.mark.parametrize("bad", _UNWRITABLE)
+@pytest.mark.parametrize("field", ["name", "uic", "country_iso"])
+async def test_a_search_row_with_an_unwritable_character_is_dropped(
+    module: Module, field: str, bad: str
+) -> None:
+    broken = _row("Zz Broken", "9900002")
+    broken[field] = f"Z{bad}Z"
+    _answer_escaped(module, {"stations": [broken, _row()]})
+
+    rows = await station_module.search("Zzville", uuid.uuid4())
+
+    assert rows == [_row()]
+    json.dumps(rows).encode("utf-8")  # VIATOR's own answer can be written
+
+
+@pytest.mark.parametrize("bad", _UNWRITABLE)
+@pytest.mark.parametrize("field", ["name", "uic", "country_iso", "parent_uic"])
+async def test_a_lookup_row_with_an_unwritable_character_is_dropped(
+    module: Module, field: str, bad: str
+) -> None:
+    broken = _lookup_row("9900002", "9900009")
+    broken[field] = f"9900002{bad}" if field == "uic" else f"Z{bad}Z"
+    _answer_escaped(module, {"stations": [broken, _lookup_row("9900001")]})
+
+    outcome = await station_module.lookup(["9900001", "9900002"], uuid.uuid4())
+
+    assert outcome.rows == [_lookup_row("9900001")]
+
+
+class _Headers:
+    def __init__(self, value: str) -> None:
+        self.headers = {"retry-after": value}
+
+
+@pytest.mark.parametrize("value", ["\u0663", "1\u0667", "\uff11\uff17"])
+def test_a_retry_after_in_digits_of_another_script_gives_none(value: str) -> None:
+    """httpx reads headers as Latin-1, so such digits cannot arrive through
+    it today; the rule is pinned on the parser itself (ASCII digits only)."""
+    assert station_module._retry_after(_Headers(value)) is None  # type: ignore[arg-type]
+    assert station_module._retry_after(_Headers("17")) == 17  # type: ignore[arg-type]
