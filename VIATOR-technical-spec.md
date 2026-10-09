@@ -1908,7 +1908,7 @@ The first line wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. Fro
 
 ### 15.3 Local quality gates — the same checks CI runs
 
-Before you push, run these in order. Each takes seconds. CI will run identical commands.
+Before you push, run these in order. They are the commands of CI's Python job (`.github/workflows/ci.yml`), in its order; only the `py -3.14 -m` prefix differs.
 
 ```bash
 # 1. Lint
@@ -1917,15 +1917,21 @@ py -3.14 -m ruff check .
 # 2. Format check (do not auto-fix; just verify)
 py -3.14 -m ruff format --check .
 
-# 3. Type check (strict — every function must be fully typed)
-py -3.14 -m mypy --strict app
+# 3. Type check (strict: `strict = true` in pyproject.toml's [tool.mypy])
+py -3.14 -m mypy app/
 
 # 4. Security scan
-py -3.14 -m bandit -r app -ll
+py -3.14 -m bandit -r app/ -ll
 
-# 5. Tests (needs a Postgres on localhost:5432, see 15.4)
-py -3.14 -m pytest --cov=app --cov-report=xml
+# 5. Known vulnerabilities in the installed packages (needs internet: it asks osv.dev)
+py -3.14 -m pip_audit --strict --vulnerability-service=osv
+
+# 6. Tests with the coverage floor (needs a Postgres, see 15.4; pyproject.toml's
+#    addopts already add --cov=app and the term + XML reports)
+py -3.14 -m pytest --cov-fail-under=12
 ```
+
+CI's pre-commit job runs `pre-commit run --all-files --show-diff-on-failure` (the commit-stage hooks; see 15.2.4), and pip-audit checks the environment it runs in, so run it in the virtual environment where `pip install -r requirements-dev.txt` was run.
 
 If any of those fail, CI will fail in the same way. Fixing locally is faster than push-wait-fix-push loops.
 
@@ -1984,7 +1990,7 @@ Three jobs. `python` and `pre-commit` run in parallel; `sonarcloud` waits for `p
 2. **`sonarcloud`** — `needs: python`, so it starts only when that job has passed. It downloads `coverage.xml` and runs the SonarCloud scanner. It runs only when the repository variable `SONARCLOUD_ENABLED` is `true` and the event is a push or a pull request from a branch of this repository (not a fork); otherwise it is skipped.
 3. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`, which runs the commit-stage hooks only (not the pre-push mypy hook). This is the belt-and-braces job: it catches files committed without the local hooks.
 
-A failure in any job makes the PR un-mergeable (assuming branch protection is enabled per 15.7.3).
+A failure in `python` or `pre-commit` makes the PR un-mergeable: the `main` ruleset requires both (15.7.3). The `sonarcloud` job itself is not required; the SonarCloud quality-gate check it leads to is.
 
 #### 15.6.2 `docker.yml` — image build + security scan + GHCR push
 
@@ -2025,15 +2031,26 @@ This is the **once-per-repository** configuration. After this, everything is aut
 
 The `SONARCLOUD_ENABLED` gate exists so that contributors who fork the repo can run CI without needing a Sonar token of their own. Set it to `true` in the upstream repo only.
 
-#### 15.7.3 Branch protection (Settings → Branches → Add rule for `main`)
+#### 15.7.3 Branch protection: the `main` ruleset (Settings → Rules → Rulesets)
 
-Recommended:
+`main` is protected by a repository ruleset named "Protect main", not by classic branch protection (Settings → Branches shows no rule, and `gh api repos/<owner>/<repo>/branches/main/protection` answers "Branch not protected"). Its target is the default branch, its enforcement is active, and it has no bypass actors. Read it with `gh api repos/<owner>/<repo>/rulesets`, then `gh api repos/<owner>/<repo>/rulesets/<id>`.
 
-- ✅ Require a pull request before merging
-- ✅ Require status checks to pass — select `python`, `pre-commit`, and (if used) `sonar` and `docker`
-- ✅ Require branches to be up to date before merging
-- ✅ Require conversation resolution before merging
-- ✅ Do not allow bypassing the above settings
+Rules, as set on 2026-05-07 and read back on 2026-10-09:
+
+- **Pull request required** before merging, with 0 required approvals; stale approvals are dismissed on push.
+- **Required status checks**, and the branch must be up to date with `main` ("strict"). A required check is matched by its display name, not by the job id in the workflow file:
+
+  | Required check | Where it comes from |
+  |---|---|
+  | `Python (lint + type + test)` | `ci.yml`, job `python` |
+  | `Pre-commit (belt-and-braces)` | `ci.yml`, job `pre-commit` |
+  | `Docker pipeline gate` | `docker.yml`, job `docker-gate`; it always reports, so a docs-only PR does not wait for skipped image jobs (audit-2026-05 #26) |
+  | `SonarCloud Code Analysis` | the SonarCloud GitHub App's quality-gate check, posted after the scan; not the `ci.yml` job `sonarcloud`, whose display name is `SonarCloud` and which is not required |
+
+- **Linear history required**: no merge commits on `main`.
+- **No deletion** of `main` and **no force push** (non-fast-forward).
+
+Not set: required conversation resolution, required reviewers, code-owner review. Renaming one of the jobs above (its `name:`) makes the ruleset wait forever for a check that no longer reports: change the ruleset in the same PR.
 
 #### 15.7.4 Packages (GHCR) visibility
 
@@ -2098,11 +2115,11 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 
 ### 15.9 Pre-commit framework — what runs and when
 
-`.pre-commit-config.yaml` configures these hooks. The ruff hooks and the basic file checks run in environments pre-commit builds from each hook repository's `rev:`, which can differ from the `ruff==` pin in `requirements-dev.txt`; the mypy hook runs the developer's own installed `mypy`, so it uses exactly the `requirements-dev.txt` versions:
+`.pre-commit-config.yaml` configures these hooks. The ruff hooks and the basic file checks run in environments pre-commit builds from each hook repository's `rev:`. Dependabot does not bump a `rev:`, so `tests/unit/test_dev_tool_pins_stay_in_step.py` fails unless the ruff hook's `rev:` is `v` + the `ruff==` pin in `requirements-dev.txt` (#336); bump the two together. CI's pre-commit job installs the `pre-commit==` version that `requirements-dev.txt` pins; the mypy hook runs the developer's own installed `mypy`, so it uses exactly the `requirements-dev.txt` versions:
 
 | Hook | What it does | Auto-fix? |
 |---|---|---|
-| `ruff` | Lint | Yes (`--fix`) |
+| `ruff-check` | Lint | Yes (`--fix`) |
 | `ruff-format` | Format (replaced black) | Yes |
 | `trailing-whitespace`, `end-of-file-fixer`, `check-yaml`, `check-toml`, `check-added-large-files`, `check-merge-conflict`, `detect-private-key` | Basic file checks | Partly (whitespace and end of file) |
 | `mypy` (strict, pre-push only) | Runs `mypy app/`, the command CI runs, as a `repo: local`, `language: system` hook (#327). Needs an activated environment with `requirements-dev.txt` installed; otherwise it fails with "Executable `mypy` not found". Run it by hand with `pre-commit run mypy --hook-stage pre-push --all-files` | No |
