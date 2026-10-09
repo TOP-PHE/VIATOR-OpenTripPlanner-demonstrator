@@ -7,8 +7,11 @@ intersection, MCT arithmetic, stitch assembly, and dedup/rank.
 
 from __future__ import annotations
 
+import logging
 import types
 from datetime import UTC, datetime
+
+import pytest
 
 from app.journey import federated_planner as fp
 from app.journey.signature import transit_fingerprint
@@ -699,3 +702,117 @@ async def test_plan_federated_code_no_feed_serves_returns_empty(monkeypatch):
     )
     assert out == []
     assert calls == []
+
+
+# ───────────── how a try ended: counter and log line (#331) ─────────────
+
+
+def _tries(outcome):
+    from prometheus_client.registry import REGISTRY
+
+    value = REGISTRY.get_sample_value("viator_federated_planner_tries_total", {"outcome": outcome})
+    assert value is not None, f"series {outcome} should exist from import time"
+    return value
+
+
+def _counts():
+    from app.metrics import FEDERATED_PLANNER_OUTCOMES
+
+    return {o: _tries(o) for o in FEDERATED_PLANNER_OUTCOMES}
+
+
+def _delta(before):
+    after = _counts()
+    return {o: after[o] - before[o] for o in after if after[o] != before[o]}
+
+
+def _assert_log_has_no_code(caplog):
+    text = " ".join(r.getMessage() for r in caplog.records)
+    for code in (_ORIGIN, _HUB, _DEST, "9900009"):
+        assert code not in text
+
+
+@pytest.mark.parametrize(
+    ("origin_lacks", "dest_lacks", "word"),
+    [(True, False, "origin"), (False, True, "destination"), (True, True, "both")],
+)
+def test_ends_lacking_words(origin_lacks, dest_lacks, word):
+    assert fp._ends_lacking(origin_lacks, dest_lacks) == word
+
+
+async def test_counter_check1_code_not_served(monkeypatch, caplog):
+    sessions = _zz_sessions(monkeypatch)
+    _recording_otp(monkeypatch)
+    before = _counts()
+    with caplog.at_level(logging.INFO, logger=fp.__name__):
+        await fp.plan_federated(
+            _FakeDb([]),
+            origin_uic=_ORIGIN,
+            dest_uic="9900009",  # served by no session
+            when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+            sessions=sessions,
+            timeout_ms=5000,
+        )
+    assert _delta(before) == {"code_not_served": 1.0}
+    assert "federated try ended: code_not_served (destination)" in caplog.text
+    _assert_log_has_no_code(caplog)
+
+
+async def test_counter_check2_position_missing(monkeypatch, caplog):
+    sessions = _zz_sessions(monkeypatch)
+    _recording_otp(monkeypatch)
+    before = _counts()
+    with caplog.at_level(logging.INFO, logger=fp.__name__):
+        await _plan([_row(_HUB, _MASTER_HUB)], sessions)
+    assert _delta(before) == {"position_missing": 1.0}
+    assert "federated try ended: position_missing (both)" in caplog.text
+    _assert_log_has_no_code(caplog)
+
+
+async def test_counter_no_shared_hub(monkeypatch, caplog):
+    a = types.SimpleNamespace(id="zz-a")
+    b = types.SimpleNamespace(id="zz-b")
+    served = {"zz-a": {_ORIGIN}, "zz-b": {_DEST}}
+    monkeypatch.setattr(fp, "_session_served_uics", lambda s: served[s.id])
+    before = _counts()
+    with caplog.at_level(logging.INFO, logger=fp.__name__):
+        await _plan([], [a, b])
+    assert _delta(before) == {"no_shared_hub": 1.0}
+    assert "federated try ended" not in caplog.text  # only checks 1 and 2 log
+
+
+async def test_counter_planned_with_request_positions(monkeypatch, caplog):
+    sessions = _zz_sessions(monkeypatch)
+    _recording_otp(monkeypatch)
+    before = _counts()
+    with caplog.at_level(logging.INFO, logger=fp.__name__):
+        await _plan(
+            [_row(_HUB, _MASTER_HUB), _row(_DEST, _MASTER_DEST)],
+            sessions,
+            origin_position=_REQUEST_ORIGIN,
+            dest_position=_REQUEST_DEST,
+        )
+    assert _delta(before) == {"planned_request_positions": 1.0}
+    assert "federated try ended" not in caplog.text
+
+
+async def test_counter_planned_with_master_positions(monkeypatch):
+    sessions = _zz_sessions(monkeypatch)
+    _recording_otp(monkeypatch)
+    rows = [_row(_ORIGIN, _MASTER_ORIGIN), _row(_HUB, _MASTER_HUB), _row(_DEST, _MASTER_DEST)]
+    before = _counts()
+    await _plan(rows, sessions, origin_position=_REQUEST_ORIGIN, dest_position=_REQUEST_DEST)
+    assert _delta(before) == {"planned_master_positions": 1.0}
+
+
+async def test_counter_not_touched_without_codes():
+    before = _counts()
+    await fp.plan_federated(
+        _FakeDb([]),
+        origin_uic=None,
+        dest_uic=_DEST,
+        when=datetime(2026, 5, 22, 8, 0, tzinfo=UTC),
+        sessions=[],
+        timeout_ms=1000,
+    )
+    assert _delta(before) == {}

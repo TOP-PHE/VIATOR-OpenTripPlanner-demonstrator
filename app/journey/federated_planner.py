@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..logging_config import one_line
+from ..metrics import FEDERATED_PLANNER_TRIES_TOTAL
 from .signature import _uic_from_stop_id, transit_fingerprint
 
 if TYPE_CHECKING:
@@ -285,6 +286,24 @@ def invalidate_served_uics_cache(session_id: str | None = None) -> None:
 
 
 # ───────────────────────────── orchestration ───────────────────────────────
+def _ends_lacking(origin_lacks: bool, dest_lacks: bool) -> str:
+    """Which end failed a check, as a fixed word (never a code or a name)."""
+    if origin_lacks and dest_lacks:
+        return "both"
+    return "origin" if origin_lacks else "destination"
+
+
+def _record_outcome(outcome: str, ends: str | None = None) -> None:
+    """Count how a try ended (issue #331) and log the two checks' failures.
+
+    The counter's label and the log line hold fixed words only: the outcome
+    from `metrics.FEDERATED_PLANNER_OUTCOMES` and which end failed.
+    """
+    FEDERATED_PLANNER_TRIES_TOTAL.labels(outcome=outcome).inc()
+    if ends is not None:
+        log.info("federated try ended: %s (%s)", outcome, ends)
+
+
 @dataclass(frozen=True)
 class _LegContext:
     """Shared inputs for the per-leg OTP calls (passed down so the helpers stay
@@ -493,6 +512,11 @@ async def plan_federated(
     2. each endpoint has a position. `master_stations` gives it; when it has
        no row or no position for the code, `origin_position` /
        `dest_position` (the request's `(lat, lon)`) stand in (issue #331).
+
+    Each try that gets past the code guard is counted once in
+    `viator_federated_planner_tries_total` by how it ended, so the share of
+    module codes that the feeds or master_stations do not know can be
+    measured on the server.
     """
     if not origin_uic or not dest_uic or origin_uic == dest_uic:
         return []
@@ -501,16 +525,25 @@ async def plan_federated(
     origin_sessions = [s for s in sessions if origin_uic in served[s.id]]
     dest_sessions = [s for s in sessions if dest_uic in served[s.id]]
     if not origin_sessions or not dest_sessions:
+        _record_outcome("code_not_served", _ends_lacking(not origin_sessions, not dest_sessions))
         return []
 
     candidate_hubs = _candidate_hubs(origin_sessions, dest_sessions, served)
     if not candidate_hubs:
+        _record_outcome("no_shared_hub")
         return []
 
     coords = _resolve_coords(db, {origin_uic, dest_uic} | candidate_hubs)
-    _fill_endpoint_positions(coords, [(origin_uic, origin_position), (dest_uic, dest_position)])
+    from_request = _fill_endpoint_positions(
+        coords, [(origin_uic, origin_position), (dest_uic, dest_position)]
+    )
     if origin_uic not in coords or dest_uic not in coords:
-        return []  # can't query OTP without endpoint coordinates
+        # can't query OTP without endpoint coordinates
+        _record_outcome(
+            "position_missing", _ends_lacking(origin_uic not in coords, dest_uic not in coords)
+        )
+        return []
+    _record_outcome("planned_request_positions" if from_request else "planned_master_positions")
 
     ctx = _LegContext(coords=coords, timeout_ms=timeout_ms, tz_for=session_timezone_for or {})
     stitches = await _collect_stitches(
