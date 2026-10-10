@@ -145,17 +145,19 @@ class _Module:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         body = json.loads(request.content)
-        if request.url.path.endswith("/stations/search"):
+        if request.url.path.endswith("/stations/near"):
             return httpx.Response(
                 200,
                 json={
                     "stations": [
                         {
                             "name": "ZZ Station",
-                            "latitude": 45.0,
-                            "longitude": 6.0,
+                            "latitude": body["lat"],
+                            "longitude": body["lon"],
                             "country_iso": "ZZ",
                             "uic": "9900042",
+                            "parent_uic": None,
+                            "distance_m": 0,
                         }
                     ]
                 },
@@ -226,6 +228,10 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
 
     assert [p["hub_id"] for p in proposals] == ["zz-a-9", "zz-a-1", "zz-a-2", "zz-b-0", "zz-b-2"]
     assert all(p["state"] == "proposed" for p in proposals)
+    # One near call per hub at its stored position, never a search by name.
+    near = [json.loads(r.content) for r in module.requests if r.url.path.endswith("/near")]
+    assert near == [{"lat": 45.0, "lon": 6.0, "radius_m": 300}] * 5
+    assert not any(r.url.path.endswith("/search") for r in module.requests)
     assert _row(fresh_db, "zz-a-1") == (None, None, False)
 
     answer = test_client.post(
@@ -244,6 +250,27 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
     listed = {h["id"]: h for h in test_client.get(BASE).json()}
     assert (listed["zz-a-1"]["uic"], listed["zz-a-1"]["uic_origin"]) == ("9900042", "msmm")
     assert len([r for r in module.requests if r.url.path.endswith("/lookup")]) == 1
+
+
+def test_a_hub_whose_stored_position_is_not_a_number_is_skipped_without_a_call(
+    fresh_db: str, client: tuple[TestClient, _Module]
+) -> None:
+    """The columns are NOT NULL, but PostgreSQL's float takes 'NaN' and
+    'Infinity': only a hand edit of the table can store one."""
+    test_client, module = client
+    with create_engine(fresh_db).begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE network_coverage_hubs SET lat = 'NaN', lon = 'Infinity' WHERE id = 'zz-a-1'"
+            )
+        )
+
+    proposals = test_client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    states = {p["hub_id"]: p["state"] for p in proposals}
+    assert states["zz-a-1"] == "no_position"
+    assert len([r for r in module.requests if r.url.path.endswith("/near")]) == 4
+    assert _row(fresh_db, "zz-a-1") == (None, None, False)
 
 
 def test_confirm_writes_nothing_to_a_soft_deleted_hub(

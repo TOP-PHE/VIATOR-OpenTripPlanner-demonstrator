@@ -10,8 +10,9 @@ Endpoints:
   PATCH  /api/admin/network-coverage/hubs/{id}         — v0.1.31: edit hub
   DELETE /api/admin/network-coverage/hubs/{id}         — v0.1.31: soft-delete
   POST   /api/admin/network-coverage/hubs/resolve      — station codes proposed by
-                                                         the station module, at most
-                                                         10 hubs a click; writes nothing
+                                                         the station module from each
+                                                         hub's position, at most 10
+                                                         hubs a click; writes nothing
   POST   /api/admin/network-coverage/hubs/confirm      — store at most 10 codes the
                                                          administrator accepted, after
                                                          one lookup in the module
@@ -76,7 +77,6 @@ from ...network_coverage import external_verify, hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
-from ..station_suggest import normalise_query
 
 # PR-3 — "HH:MM" and "24:00" sentinel. The DB stores TIME (which can't
 # represent 24:00), so the API accepts the sentinel and the runner
@@ -106,22 +106,26 @@ _HUB_NOT_FOUND = "Hub not found"
 
 # ── Station codes from the station module (MSMM step 3) ──
 # The batch of each click, constants of VIATOR's code (the module's own
-# settings cannot be read from here): a resolve makes at most 10 searches, a
-# confirm one lookup of at most 10 codes, a check one lookup of at most 20.
-# Each search and each code is one call on the administrator's own limits
-# at the module (60 a minute by default), so one click costs at most 20 and
-# leaves room for his typing. The module's per-person minute limit must be
-# 20 or more, or every check click is refused whole.
+# settings cannot be read from here): a resolve makes at most 10 near calls
+# (one per hub, at its position), a confirm one lookup of at most 10 codes, a
+# check one lookup of at most 20. Each near call and each code is one call on
+# the administrator's own limits at the module (60 a minute by default), so
+# a resolve and its confirm cost at most 10 + 10 = 20 calls, and a check
+# click 20, which leaves room for his typing. The module's per-person minute
+# limit must be 20 or more, or every check click is refused whole.
+# A near call also counts on the module's own near quota (decision 62 of the
+# module: 30 a minute and 200 a day for one person, 500 a day for everybody):
+# 10 a click stays under the 30 a minute, so three clicks in one minute
+# pass and a fourth is refused with a 429 and its Retry-After.
 RESOLVE_BATCH = 10
 CONFIRM_BATCH = 10
 CHECK_BATCH = 20
-# A module station is a candidate for a hub when it lies within this many
-# metres of the hub's position (haversine). A filter for proposals, never a
-# matcher: two distinct termini can stand closer than this.
-PROPOSAL_RADIUS_M = 300.0
+# The radius of a near call: the module proposes its stations within this
+# many metres of the hub's position (its own maximum). A filter for
+# proposals, never a matcher: two distinct termini can stand closer than this.
+PROPOSAL_RADIUS_M = 300
 # The most hub ids a resolve or check request may name as already shown.
 _SKIP_MAX = 2_000
-_EARTH_RADIUS_M = 6_371_000.0
 _CODE_RULE = "uic must be 3 to 20 characters, with no white space and no control character"
 _MODULE_DID_NOT_ANSWER = "The station module did not answer; nothing was changed."
 _MODULE_OFF = "The station module is not configured; nothing was changed."
@@ -774,9 +778,10 @@ def delete_hub(
 # or PATCH, stored as 'manual'), or proposed by the module and confirmed by
 # an administrator. The three routes below are the second way:
 #
-#   resolve  one search of the module per unresolved hub, at most 10 a click,
-#            one after the other; the candidates within 300 m of the hub's
-#            position; writes nothing.
+#   resolve  one near call of the module per unresolved hub, at the hub's
+#            position, at most 10 a click, one after the other: the module's
+#            stations within 300 m (at most 5); writes nothing. A hub whose
+#            stored position is not a usable one is skipped without a call.
 #   confirm  the pairs (hub, code) the administrator accepted, at most 10,
 #            checked with one lookup of the module, each code sent once;
 #            only a code the module serves is stored ('msmm').
@@ -811,11 +816,14 @@ class HubCandidate(BaseModel):
 
 class HubProposal(BaseModel):
     """One hub looked at by a resolve click. `proposed`: exactly one
-    candidate within 300 m. `to_pick`: none or several, all listed."""
+    candidate within 300 m. `to_pick`: none or several (at most five), all
+    listed. `no_position`: the hub's stored position is not a usable one (not
+    a finite latitude of -90 to 90 and longitude of -180 to 180), so the
+    module was not asked."""
 
     hub_id: str
     hub_name: str
-    state: Literal["proposed", "to_pick"]
+    state: Literal["proposed", "to_pick", "no_position"]
     candidates: list[HubCandidate]
 
 
@@ -936,30 +944,36 @@ def _failure(
     return "unavailable", _MODULE_DID_NOT_ANSWER, None
 
 
-def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle (haversine) distance between two positions, in metres."""
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
+def _has_position(hub: NetworkCoverageHub) -> bool:
+    """True when the hub's stored position can be sent to the module: finite,
+    latitude -90 to 90, longitude -180 to 180. The columns are NOT NULL and
+    the hub form checks the ranges, so only a hand edit of the table (a NaN,
+    an infinity, a value out of range) or a missing value fails this."""
+    lat, lon = hub.lat, hub.lon
+    return (
+        isinstance(lat, int | float)
+        and isinstance(lon, int | float)
+        and math.isfinite(lat)
+        and math.isfinite(lon)
+        and -90 <= lat <= 90
+        and -180 <= lon <= 180
+    )
 
 
 def _proposal(hub: NetworkCoverageHub, rows: list[dict[str, Any]]) -> HubProposal:
-    """The candidates among a search's rows: within 300 m of the hub, with a
-    code the module's lookup accepts, nearest first."""
-    candidates: list[HubCandidate] = []
-    for row in rows:
-        distance = _distance_m(hub.lat, hub.lon, row["latitude"], row["longitude"])
-        if distance <= PROPOSAL_RADIUS_M and station_module.code_refused(row["uic"]) is None:
-            candidates.append(
-                HubCandidate(
-                    name=row["name"],
-                    uic=row["uic"],
-                    country_iso=row["country_iso"],
-                    distance_m=round(distance),
-                )
-            )
+    """The candidates among a near call's rows (already within 300 m of the
+    hub's position, at most five), with a code the module's lookup accepts,
+    nearest first, with the module's distance."""
+    candidates = [
+        HubCandidate(
+            name=row["name"],
+            uic=row["uic"],
+            country_iso=row["country_iso"],
+            distance_m=row["distance_m"],
+        )
+        for row in rows
+        if station_module.code_refused(row["uic"]) is None
+    ]
     candidates.sort(key=lambda candidate: candidate.distance_m)
     state: Literal["proposed", "to_pick"] = "proposed" if len(candidates) == 1 else "to_pick"
     return HubProposal(hub_id=hub.id, hub_name=hub.name, state=state, candidates=candidates)
@@ -994,11 +1008,14 @@ async def resolve_hub_codes(
     db: Annotated[DbSession, Depends(get_db)],
     admin: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> HubResolveResponse:
-    """Propose a station code for at most 10 unresolved hubs: one search of
-    the module per hub (its name), one after the other, on behalf of the
-    administrator. Writes nothing: the administrator confirms what he
-    accepts with POST /hubs/confirm. Stops at the first failure; at a 429
-    it answers what it found with the module's Retry-After, never retrying."""
+    """Propose a station code for at most 10 unresolved hubs: one near call
+    of the module per hub, at the hub's position with a radius of 300 m, one
+    after the other, on behalf of the administrator (never a search by the
+    hub's name: the module's names often differ from the hubs' own). Writes
+    nothing: the administrator confirms what he accepts with POST
+    /hubs/confirm. Stops at the first failure; at a 429 (a limit of the
+    person, or of the near quota) it answers what it found with the module's
+    Retry-After, never retrying."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
     hubs = _hubs_to_look_at(db, resolved=False, skip=asked.skip)
@@ -1009,16 +1026,15 @@ async def resolve_hub_codes(
         )
     proposals: list[HubProposal] = []
     for hub in hubs[:RESOLVE_BATCH]:
-        try:
-            searched = normalise_query(hub.name)
-        except ValueError:
-            # A name the module's search cannot take (under 3 characters, a
-            # control character): no call, nothing to propose.
+        if not _has_position(hub):
+            # No call: the module would refuse the position after counting it.
             proposals.append(
-                HubProposal(hub_id=hub.id, hub_name=hub.name, state="to_pick", candidates=[])
+                HubProposal(hub_id=hub.id, hub_name=hub.name, state="no_position", candidates=[])
             )
             continue
-        outcome = await station_module.search_outcome(searched, user_id)
+        outcome = await station_module.near_outcome(
+            hub.lat, hub.lon, user_id, radius_m=PROPOSAL_RADIUS_M
+        )
         if outcome.rows is None:
             status, message, retry_after = _failure(outcome)
             return HubResolveResponse(

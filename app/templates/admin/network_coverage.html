@@ -690,7 +690,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
          (save) or 20 codes (check) on the administrator's own limits at the
          module; nothing is written until he saves the codes he ticked. #}
       <div class="hub-codes-tools">
-        <button type="button" id="hub-codes-resolve" title="Ask the station module for the codes of up to 10 hubs without one">Propose station codes</button>
+        <button type="button" id="hub-codes-resolve" title="Ask the station module for the stations within 300 m of up to 10 hubs without a code, by their position">Propose station codes</button>
         <button type="button" id="hub-codes-check" title="Re-read the stored codes of up to 20 hubs in the station module">Check station codes</button>
       </div>
       <div id="hub-codes" class="hub-codes" hidden>
@@ -2715,8 +2715,12 @@ function hubLeaveInput(proposal) {
 function hubProposalItem(proposal) {
   const item = hubCodesElement('div', undefined, 'hub-code-item');
   item.append(hubCodesElement('strong', proposal.hub_name));
+  if (proposal.state === 'no_position') {
+    item.append(hubCodesElement('div', 'This hub has no usable position: correct its latitude and longitude in the hub form.', 'hub-code-note'));
+    return item;
+  }
   if (!proposal.candidates.length) {
-    item.append(hubCodesElement('div', 'No station within 300 m found by name: type the code in the hub form if you know it.', 'hub-code-note'));
+    item.append(hubCodesElement('div', 'No station of the module within 300 m of this hub\'s position: check the position, or type the code in the hub form if you know it.', 'hub-code-note'));
     return item;
   }
   const kind = proposal.state === 'proposed' ? 'checkbox' : 'radio';

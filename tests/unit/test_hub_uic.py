@@ -14,6 +14,8 @@ token drawn at run time.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import math
 import re
@@ -41,13 +43,6 @@ from app.settings import settings
 BASE = "/api/admin/network-coverage/hubs"
 MODULE_URL = "http://msmm.invalid:8000"
 REPO = Path(__file__).resolve().parents[2]
-
-# One degree of latitude is about 111,195 m on the haversine's sphere.
-_METRES_PER_DEGREE = 2 * math.pi * 6_371_000.0 / 360
-
-
-def _north(lat: float, metres: float) -> float:
-    return lat + metres / _METRES_PER_DEGREE
 
 
 def _hub(index: int, *, uic: str | None = None, origin: str | None = None, **extra: Any):
@@ -107,11 +102,22 @@ class Hubs:
         return {h.id: h for h in self.rows if h.id in ids and h.is_active}
 
 
+def _near(name: str, uic: str, distance: int, parent: str | None = None) -> dict[str, Any]:
+    """A row of a near answer: a station at `distance` metres of the hub."""
+    return {**_station(name, uic, 45.0, 6.0, parent), "distance_m": distance}
+
+
+def _near_answer(*rows: dict[str, Any]) -> httpx.Response:
+    return httpx.Response(200, json={"stations": list(rows)})
+
+
 class Module:
-    """The module: `search` answers by the text, `lookup` from `served`."""
+    """The module: `near` answers by the body, `search` by the text (the
+    resolve route must never call it), `lookup` from `served`."""
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
+        self.near: Callable[[dict[str, Any]], httpx.Response] = lambda _b: _near_answer()
         self.search: Callable[[str], httpx.Response] = lambda _q: httpx.Response(
             200, json={"stations": []}
         )
@@ -121,6 +127,8 @@ class Module:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         body = json.loads(request.content)
+        if request.url.path.endswith("/stations/near"):
+            return self.near(body)
         if request.url.path.endswith("/stations/search"):
             return self.search(body["q"])
         if self.lookup_response is not None:
@@ -185,30 +193,28 @@ def _jwt(user_id: uuid.UUID, role: str) -> str:
     return tokens.issue_jwt(user_id, f"zz-{user_id.hex[:8]}@example.invalid", role)
 
 
-def _searched_names(module: Module) -> list[str]:
-    return [json.loads(r.content)["q"] for r in module.of("search")]
+def _near_positions(module: Module) -> list[tuple[float, float]]:
+    return [(json.loads(r.content)["lat"], json.loads(r.content)["lon"]) for r in module.of("near")]
 
 
 def _looked_up(module: Module) -> list[list[str]]:
     return [json.loads(r.content)["uics"] for r in module.of("lookup")]
 
 
-def _limited(retry_after: str | None = "17") -> httpx.Response:
+def _limited(retry_after: str | None = "17", code: str = "user_minute") -> httpx.Response:
     headers = {} if retry_after is None else {"Retry-After": retry_after}
-    return httpx.Response(429, json={"code": "user_minute"}, headers=headers)
+    return httpx.Response(429, json={"detail": "ZZ", "code": code}, headers=headers)
 
 
 # ───────────────────────────── resolve ─────────────────────────────
 
 
-def test_one_candidate_within_300_m_is_proposed_and_nothing_is_written(
+def test_one_station_near_the_hub_is_proposed_and_nothing_is_written(
     client: TestClient, db: FakeDb, hubs: Hubs, module: Module, admin: uuid.UUID
 ) -> None:
     hub = _hub(1)
     hubs.rows = [hub]
-    near = _station("ZZ Hub 01 Central", "9900001", _north(hub.lat, 120), hub.lon)
-    far = _station("ZZ Hub 01 Outer", "9900002", _north(hub.lat, 900), hub.lon)
-    module.search = lambda _q: httpx.Response(200, json={"stations": [far, near]})
+    module.near = lambda _b: _near_answer(_near("ZZ Central", "9900001", 120))
 
     answer = client.post(f"{BASE}/resolve", json={})
 
@@ -220,12 +226,14 @@ def test_one_candidate_within_300_m_is_proposed_and_nothing_is_written(
     assert proposal["hub_id"] == hub.id
     assert proposal["state"] == "proposed"
     assert proposal["candidates"] == [
-        {"name": "ZZ Hub 01 Central", "uic": "9900001", "country_iso": "ZZ", "distance_m": 120}
+        {"name": "ZZ Central", "uic": "9900001", "country_iso": "ZZ", "distance_m": 120}
     ]
-    # The search: the hub's name, on behalf of the administrator.
-    (request,) = module.of("search")
-    assert json.loads(request.content) == {"q": "ZZ Hub 01"}
+    # One near call: the hub's position and the 300 m radius, on behalf of
+    # the administrator; never a search by the hub's name.
+    (request,) = module.of("near")
+    assert json.loads(request.content) == {"lat": hub.lat, "lon": hub.lon, "radius_m": 300}
     assert request.headers["x-viator-user-id"] == str(admin)
+    assert module.of("search") == []
     # Nothing written: no commit, the hub still unresolved, no lookup made.
     assert db.commits == 0
     assert hub.uic is None
@@ -233,14 +241,13 @@ def test_one_candidate_within_300_m_is_proposed_and_nothing_is_written(
     assert module.of("lookup") == []
 
 
-def test_two_candidates_within_300_m_are_to_pick_nearest_first(
+def test_several_stations_near_the_hub_are_to_pick_nearest_first(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    hub = _hub(1)
-    hubs.rows = [hub]
-    a = _station("ZZ North", "9900011", _north(hub.lat, 290), hub.lon)
-    b = _station("ZZ South", "9900012", _north(hub.lat, -40), hub.lon)
-    module.search = lambda _q: httpx.Response(200, json={"stations": [a, b]})
+    hubs.rows = [_hub(1)]
+    module.near = lambda _b: _near_answer(
+        _near("ZZ North", "9900011", 290), _near("ZZ South", "9900012", 40)
+    )
 
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
@@ -251,13 +258,24 @@ def test_two_candidates_within_300_m_are_to_pick_nearest_first(
     ]
 
 
-def test_no_candidate_within_300_m_is_to_pick_with_none(
+def test_five_stations_near_the_hub_are_all_listed(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1)]
+    rows = [_near(f"ZZ Stop {i}", f"990002{i}", 10 * i) for i in range(5)]
+    module.near = lambda _b: _near_answer(*rows)
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert proposal["state"] == "to_pick"
+    assert [c["uic"] for c in proposal["candidates"]] == [r["uic"] for r in rows]
+
+
+def test_no_station_near_the_hub_is_to_pick_with_none(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     hub = _hub(1)
     hubs.rows = [hub]
-    just_out = _station("ZZ Outer", "9900021", _north(hub.lat, 301), hub.lon)
-    module.search = lambda _q: httpx.Response(200, json={"stations": [just_out]})
 
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
@@ -267,22 +285,21 @@ def test_no_candidate_within_300_m_is_to_pick_with_none(
         "state": "to_pick",
         "candidates": [],
     }
+    assert len(module.of("near")) == 1
 
 
 def test_a_candidate_whose_code_the_lookup_would_refuse_is_not_offered(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    hub = _hub(1)
-    hubs.rows = [hub]
-    short_code = _station("ZZ Short Code", "ZZ", hub.lat, hub.lon)
-    module.search = lambda _q: httpx.Response(200, json={"stations": [short_code]})
+    hubs.rows = [_hub(1)]
+    module.near = lambda _b: _near_answer(_near("ZZ Short Code", "ZZ", 5))
 
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
     assert proposal["candidates"] == []
 
 
-def test_one_click_makes_exactly_ten_searches_one_after_the_other(
+def test_one_click_makes_exactly_ten_near_calls_one_after_the_other(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     hubs.rows = [_hub(i) for i in range(25)]
@@ -290,8 +307,9 @@ def test_one_click_makes_exactly_ten_searches_one_after_the_other(
     body = client.post(f"{BASE}/resolve", json={}).json()
 
     assert network_coverage.RESOLVE_BATCH == 10
-    assert len(module.of("search")) == 10
-    assert _searched_names(module) == [f"ZZ Hub {i:02d}" for i in range(10)]
+    assert len(module.of("near")) == 10
+    assert _near_positions(module) == [(h.lat, h.lon) for h in hubs.rows[:10]]
+    assert module.of("search") == []
     assert [p["hub_id"] for p in body["proposals"]] == [f"zz-hub-{i:02d}" for i in range(10)]
     assert body["left"] == 15
     assert body["status"] == "ok"
@@ -306,37 +324,42 @@ def test_the_next_click_skips_the_hubs_already_shown(
     body = client.post(f"{BASE}/resolve", json={"skip": shown}).json()
 
     assert hubs.skips == [shown]
-    assert _searched_names(module) == [f"ZZ Hub {i:02d}" for i in range(10, 20)]
+    assert _near_positions(module) == [(h.lat, h.lon) for h in hubs.rows[10:20]]
     assert body["left"] == 5
 
 
-def test_a_429_on_the_fourth_search_stops_the_click_with_three_results(
-    client: TestClient, hubs: Hubs, module: Module
+@pytest.mark.parametrize(
+    "code", ["near_user_minute", "near_user_day", "near_all_day", "user_minute"]
+)
+def test_a_429_on_the_fourth_near_call_stops_the_click_and_keeps_what_was_found(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module, code: str
 ) -> None:
     hubs.rows = [_hub(i) for i in range(25)]
     answers = iter(
-        [httpx.Response(200, json={"stations": []})] * 3
-        + [_limited("17")]
-        + [httpx.Response(200, json={"stations": []})] * 30
+        [_near_answer(_near("ZZ One", "9900031", 15))] * 3
+        + [_limited("17", code)]
+        + [_near_answer()] * 30
     )
-    module.search = lambda _q: next(answers)
+    module.near = lambda _b: next(answers)
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    assert len(module.of("search")) == 4  # no further call, no retry
-    assert len(body["proposals"]) == 3
+    assert len(module.of("near")) == 4  # no further call, no retry
+    assert [p["state"] for p in body["proposals"]] == ["proposed"] * 3
     assert body["status"] == "limited"
     assert body["retry_after"] == 17
     assert "17 seconds" in body["message"]
     assert body["left"] == 22  # the fourth hub was not looked at
     assert not station_module.paused()  # a 429 starts no pause
+    assert db.commits == 0
+    assert all(h.uic is None for h in hubs.rows)
 
 
 def test_a_429_without_retry_after_says_a_minute(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     hubs.rows = [_hub(1)]
-    module.search = lambda _q: _limited(None)
+    module.near = lambda _b: _limited(None, "near_user_minute")
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
@@ -345,34 +368,90 @@ def test_a_429_without_retry_after_says_a_minute(
     assert "a minute" in body["message"]
 
 
-@pytest.mark.parametrize("status", [500, 503, 404])
-def test_another_search_failure_stops_the_click_and_says_so(
+@pytest.mark.parametrize("status", [500, 503, 404, 422])
+def test_another_near_failure_stops_the_click_says_so_and_starts_no_pause(
     client: TestClient, db: FakeDb, hubs: Hubs, module: Module, status: int
 ) -> None:
     hubs.rows = [_hub(i) for i in range(5)]
-    answers = iter([httpx.Response(200, json={"stations": []}), httpx.Response(status, json={})])
-    module.search = lambda _q: next(answers)
+    answers = iter([_near_answer(), httpx.Response(status, json={})])
+    module.near = lambda _b: next(answers)
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    assert len(module.of("search")) == 2
+    assert len(module.of("near")) == 2
     assert body["status"] == "unavailable"
     assert body["message"] == "The station module did not answer; nothing was changed."
     assert body["retry_after"] is None
     assert len(body["proposals"]) == 1
     assert body["left"] == 4
     assert db.commits == 0
+    # A near failure leaves the typeahead alone: no pause.
+    assert not station_module.paused()
 
 
-def test_a_name_the_search_cannot_take_is_to_pick_without_a_call(
+@pytest.mark.parametrize(
+    "position",
+    [
+        {"lat": None},
+        {"lon": None},
+        {"lat": math.nan},
+        {"lon": math.inf},
+        {"lat": 90.5},
+        {"lon": -180.5},
+    ],
+    ids=["no-latitude", "no-longitude", "nan", "infinite", "latitude-out", "longitude-out"],
+)
+def test_a_hub_without_a_usable_position_is_skipped_without_a_call(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module, position: dict[str, Any]
+) -> None:
+    hubs.rows = [_hub(1, **position), _hub(2)]
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert body["status"] == "ok"
+    assert [(p["hub_id"], p["state"]) for p in body["proposals"]] == [
+        ("zz-hub-01", "no_position"),
+        ("zz-hub-02", "to_pick"),
+    ]
+    assert body["proposals"][0]["candidates"] == []
+    assert _near_positions(module) == [(hubs.rows[1].lat, hubs.rows[1].lon)]
+    assert body["left"] == 0
+    assert db.commits == 0
+
+
+def test_a_hub_at_the_edges_of_the_ranges_is_looked_up(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    hubs.rows = [_hub(1, name="ZZ"), _hub(2)]
+    hubs.rows = [_hub(1, lat=-90.0, lon=180.0), _hub(2, lat=0, lon=0)]
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
     assert [p["state"] for p in body["proposals"]] == ["to_pick", "to_pick"]
-    assert _searched_names(module) == ["ZZ Hub 02"]
+    assert _near_positions(module) == [(-90.0, 180.0), (0.0, 0.0)]
+
+
+def test_the_resolve_route_never_calls_the_name_search() -> None:
+    """The hub's name is never sent: the module's names often differ from
+    the hubs' own (a city alone, another language, hyphens)."""
+    source = inspect.getsource(network_coverage.resolve_hub_codes)
+    assert "near_outcome" in source
+    assert "search_outcome" not in source
+    assert "station_module.search" not in source
+    assert "normalise_query" not in source
+    assert network_coverage.PROPOSAL_RADIUS_M == 300
+    assert isinstance(network_coverage.PROPOSAL_RADIUS_M, int)
+
+
+def test_a_hub_with_a_name_the_search_could_not_take_is_still_looked_up(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1, name="ZZ")]
+    module.near = lambda _b: _near_answer(_near("ZZ Long Station Name", "9900041", 3))
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert proposal["state"] == "proposed"
+    assert module.of("search") == []
 
 
 # ───────────────────────────── confirm ─────────────────────────────
@@ -716,13 +795,28 @@ def test_a_real_pause_of_the_client_is_seen_by_the_routes(
 ) -> None:
     hubs.rows = [_hub(1), _hub(2)]
     module.search = lambda _q: httpx.Response(500, json={})
-    client.post(f"{BASE}/resolve", json={})  # a 500 pauses the client
+    # A typeahead search answered 500 pauses the client.
+    assert asyncio.run(station_module.search("ZZ Hub", uuid.uuid4())) is None
     calls = len(module.requests)
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
     assert len(module.requests) == calls
     assert body["status"] == "unavailable"
+
+
+def test_a_near_failure_does_not_pause_the_next_click(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1), _hub(2)]
+    module.near = lambda _b: httpx.Response(500, json={})
+    client.post(f"{BASE}/resolve", json={})
+
+    module.near = lambda _b: _near_answer()
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert body["status"] == "ok"
+    assert len(module.of("near")) == 3
 
 
 # ───────────────────────────── who may ─────────────────────────────
@@ -872,12 +966,6 @@ def test_coverage_runs_never_import_the_station_module_client() -> None:
         assert not re.search(r"\bstation_module\b", text), path.name
 
 
-def test_the_distance_is_the_haversine_in_metres() -> None:
-    assert network_coverage._distance_m(45.0, 6.0, 45.0, 6.0) == 0
-    assert network_coverage._distance_m(45.0, 6.0, _north(45.0, 300), 6.0) == pytest.approx(300)
-    assert network_coverage.PROPOSAL_RADIUS_M == 300
-
-
 # ───────────────────────── the manage-hubs panel ─────────────────────────
 
 TEMPLATE = REPO / "app" / "templates" / "admin" / "network_coverage.html"
@@ -914,6 +1002,14 @@ def test_module_data_never_goes_through_inner_html(template_text: str) -> None:
     assert "label.append(input, ` ${candidate.name}" in script
     assert "hubCodesElement('strong', proposal.hub_name)" in script
     assert '`The station module names it "${result.module_name}".`' in script
+
+
+def test_the_panel_speaks_of_positions_not_names(template_text: str) -> None:
+    script = _codes_script(template_text)
+    assert "found by name" not in template_text
+    assert "if (proposal.state === 'no_position') {" in script
+    assert "This hub has no usable position" in script
+    assert "within 300 m of this hub\\'s position" in script
 
 
 def test_the_code_on_each_hub_row_is_written_as_text(template_text: str) -> None:
@@ -1073,14 +1169,13 @@ def test_a_lookup_row_holding_a_surrogate_stores_nothing_and_answers_utf8(
     assert [h.uic for h in hubs.rows] == [None, "9900002"]
 
 
-def test_a_search_row_holding_a_surrogate_is_not_proposed(
+def test_a_near_row_holding_a_surrogate_is_not_proposed(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    hub = _hub(1)
-    hubs.rows = [hub]
-    rows = [_station("ZZ \ud800", "9900001", hub.lat, hub.lon)]
+    hubs.rows = [_hub(1)]
+    rows = [_near("ZZ \ud800", "9900001", 4)]
     payload = json.dumps({"stations": rows}).encode("ascii")
-    module.search = lambda _q: httpx.Response(
+    module.near = lambda _b: httpx.Response(
         200, content=payload, headers={"Content-Type": "application/json"}
     )
 
@@ -1090,7 +1185,7 @@ def test_a_search_row_holding_a_surrogate_is_not_proposed(
     assert json.loads(answer.content.decode("utf-8"))["proposals"][0]["candidates"] == []
 
 
-# ───────────────────── soft-deleted hubs, the 300 m edge ─────────────────────
+# ───────────────────── soft-deleted hubs, the module's distance ─────────────────────
 
 
 def test_confirm_takes_no_code_for_a_soft_deleted_hub(
@@ -1108,13 +1203,12 @@ def test_confirm_takes_no_code_for_a_soft_deleted_hub(
     assert gone.uic is None
 
 
-@pytest.mark.parametrize(("distance", "kept"), [(300.0, True), (300.000001, False)])
-def test_a_station_exactly_300_m_away_is_a_candidate(
-    monkeypatch: pytest.MonkeyPatch, distance: float, kept: bool
-) -> None:
-    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
+def test_the_proposal_shows_the_modules_distance_and_does_not_filter_again() -> None:
+    """The module answers only stations within the radius; VIATOR keeps its
+    distance as given, without measuring again (a station at 300 m stays)."""
+    proposal = network_coverage._proposal(
+        _hub(1, lat=-48.5, lon=-123.25), [_near("ZZ Edge", "9900001", 300)]
+    )
 
-    proposal = network_coverage._proposal(_hub(1), [_station("ZZ Edge", "9900001", 45.0, 6.0)])
-
-    assert (proposal.state == "proposed") is kept
-    assert len(proposal.candidates) == int(kept)
+    assert proposal.state == "proposed"
+    assert proposal.candidates[0].distance_m == 300
