@@ -1435,7 +1435,8 @@ def test_the_warning_colours_pass_wcag_aa(template_text: str) -> None:
     rule = match.group(1)
     colour = re.search(r"(?<!-)color: (#[0-9a-f]{6})", rule)
     background = re.search(r"background: (#[0-9a-f]{6})", rule)
-    assert colour and background
+    assert colour
+    assert background
 
     def luminance(hex_colour: str) -> float:
         channels = [int(hex_colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
