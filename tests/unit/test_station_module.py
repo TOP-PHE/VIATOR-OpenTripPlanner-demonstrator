@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import secrets
 import threading
 import time
@@ -1308,3 +1309,300 @@ def test_a_retry_after_in_digits_of_another_script_gives_none(value: str) -> Non
     it today; the rule is pinned on the parser itself (ASCII digits only)."""
     assert station_module._retry_after(_Headers(value)) is None  # type: ignore[arg-type]
     assert station_module._retry_after(_Headers("17")) == 17  # type: ignore[arg-type]
+
+
+# ───────────────────────────── near_outcome() ─────────────────────────────
+
+# An invented position in the open sea, far from any station.
+_SEA_LAT, _SEA_LON = -48.5, -123.25
+
+
+def _near_row(uic: str, distance: int, parent: str | None = None, **extra: Any) -> dict[str, Any]:
+    return {**_lookup_row(uic, parent), "distance_m": distance, **extra}
+
+
+def _near_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
+    prefix = "station_module.near_failed reason="
+    return [
+        r.getMessage().removeprefix(prefix)
+        for r in caplog.records
+        if r.name == station_module.log.name and r.getMessage().startswith(prefix)
+    ]
+
+
+async def test_near_posts_the_position_in_the_body_with_only_its_own_headers(
+    module: Module, token: str
+) -> None:
+    user = uuid.uuid4()
+    module.answer(200, {"stations": [_near_row("9900001", 12)]})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, user)
+
+    assert outcome.reason == "ok"
+    (request,) = module.requests
+    assert request.method == "POST"
+    assert str(request.url) == f"{MODULE_URL}/internal/v1/stations/near"
+    assert request.url.query == b""
+    # The radius defaults to the module's largest, 300 m, sent as an integer.
+    assert json.loads(request.content) == {"lat": _SEA_LAT, "lon": _SEA_LON, "radius_m": 300}
+    assert request.headers["authorization"] == f"Bearer {token}"
+    assert request.headers["x-viator-user-id"] == str(user)
+    assert request.headers["content-type"] == "application/json"
+    assert request.headers["accept-encoding"] == "identity"
+    ours = {"authorization", "x-viator-user-id", "content-type", "content-length"}
+    assert set(request.headers.keys()) <= ours | _HTTPX_DEFAULTS
+    assert "48.5" not in str(request.url)
+    (built,) = module.clients
+    assert built["trust_env"] is False
+
+
+async def test_near_sends_the_radius_asked_and_an_integer_position_as_a_number(
+    module: Module,
+) -> None:
+    module.answer(200, {"stations": []})
+
+    await station_module.near_outcome(-48, -123, uuid.uuid4(), radius_m=150)
+
+    body = json.loads(module.requests[0].content)
+    assert body == {"lat": -48.0, "lon": -123.0, "radius_m": 150}
+    assert isinstance(body["lat"], float)
+
+
+async def test_near_gives_the_rows_with_parent_and_distance_in_the_order_of_the_answer(
+    module: Module,
+) -> None:
+    rows = [_near_row("9900003", 0, "9900009"), _near_row("9900001", 300)]
+    module.answer(200, {"stations": rows})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(rows, "ok", None)
+
+
+async def test_an_empty_near_answer_is_an_answer(module: Module) -> None:
+    module.answer(200, {"stations": []})
+    assert await station_module.near_outcome(
+        _SEA_LAT, _SEA_LON, uuid.uuid4()
+    ) == station_module.Outcome([], "ok", None)
+
+
+async def test_a_bad_near_row_is_dropped_and_the_others_kept(module: Module) -> None:
+    good = [_near_row("9900001", 10), _near_row("9900004", 40, "9900001")]
+    bad = [
+        _near_row("9900002", 20, parent=99),  # a parent that is not text
+        _near_row("9900003", 20, name=""),  # no name
+        _near_row("9900005", 20, latitude=None),  # no position
+        {k: v for k, v in _near_row("9900006", 20).items() if k != "distance_m"},
+        _near_row("9900007", 20.5),  # a distance that is not whole
+        _near_row("9900008", True),  # a truth value
+        _near_row("9900010", -1),  # a negative distance
+        _near_row("9900011", 301),  # beyond the radius asked
+        _near_row("9900012", "20"),  # a distance as text
+        _near_row("9900001", 30),  # a second row for a code
+        "not a row",
+    ]
+    module.answer(200, {"stations": [good[0], *bad, good[1]]})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome.rows == good
+
+
+async def test_a_distance_beyond_a_smaller_radius_is_dropped(module: Module) -> None:
+    module.answer(200, {"stations": [_near_row("9900001", 50), _near_row("9900002", 51)]})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4(), radius_m=50)
+
+    assert outcome.rows == [_near_row("9900001", 50)]
+
+
+async def test_near_keeps_at_most_five_rows(module: Module) -> None:
+    rows = [_near_row(f"99000{i:02d}", i) for i in range(8)]
+    module.answer(200, {"stations": rows})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert station_module.NEAR_MAX_ROWS == 5
+    assert outcome.rows == rows[:5]
+
+
+@pytest.mark.parametrize("bad", _UNWRITABLE)
+@pytest.mark.parametrize("field", ["name", "uic", "country_iso", "parent_uic"])
+async def test_a_near_row_with_an_unwritable_character_is_dropped(
+    module: Module, field: str, bad: str
+) -> None:
+    broken = _near_row("9900002", 20, "9900009")
+    broken[field] = f"9900002{bad}" if field == "uic" else f"Z{bad}Z"
+    _answer_escaped(module, {"stations": [broken, _near_row("9900001", 30)]})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome.rows == [_near_row("9900001", 30)]
+
+
+@pytest.mark.parametrize(("kind", "reason"), PAUSING + NOT_PAUSING)
+async def test_each_near_failure_gives_its_reason_and_never_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, reason, None)
+    assert _near_reasons(caplog) == [reason]
+    assert _reasons(caplog) == [f"station_module.near_failed reason={reason}"]
+    # No pause: the typeahead goes on calling the module.
+    assert not station_module.paused()
+    module.answer(200, {"stations": [_row()]})
+    assert await station_module.search("Zzville", uuid.uuid4()) == [_row()]
+
+
+@pytest.mark.parametrize("code", ["near_user_minute", "near_user_day", "near_all_day"])
+async def test_a_near_429_gives_its_retry_after_and_no_pause(module: Module, code: str) -> None:
+    module.handler = lambda _r: httpx.Response(
+        429, json={"detail": "ZZ", "code": code}, headers={"Retry-After": "42"}
+    )
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "status_429", 42)
+    assert not station_module.paused()
+
+
+async def test_a_near_failure_keeps_the_cached_attribution(module: Module) -> None:
+    module.answer(200, _attribution())
+    await station_module.attribution()
+    module.answer(500, {"detail": "ZZ", "code": "zz"})
+    await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert await station_module.attribution() == _attribution()
+    assert len(module.requests) == 2
+
+
+async def test_a_running_pause_is_honoured_by_near(
+    module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    module.fail(httpx.ConnectError)
+    await station_module.search("Zzville", uuid.uuid4())
+    calls = len(module.requests)
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "paused", None)
+    assert len(module.requests) == calls
+    assert _near_reasons(caplog) == ["paused"]
+    clock.now += PAUSE_PLUS
+    module.answer(200, {"stations": []})
+    assert (await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())).reason == "ok"
+
+
+async def test_near_makes_no_call_without_the_settings(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "")
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "off", None)
+    assert module.requests == []
+
+
+async def test_a_trickling_near_answer_is_cut_at_the_deadline_without_a_pause(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(station_module, "SEARCH_DEADLINE", 0.2)
+    module.handler = lambda _r: httpx.Response(200, stream=_TrickleAsync(0.05, 100))
+
+    started = time.monotonic()
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert time.monotonic() - started < 1.0
+    assert outcome.reason == "timeout"
+    assert not station_module.paused()
+
+
+async def test_an_oversized_or_compressed_near_answer_is_refused_without_a_pause(
+    module: Module,
+) -> None:
+    big = b'{"stations": [' + b" " * (station_module.SEARCH_MAX_BYTES + 1) + b"]}"
+    module.handler = lambda _r: httpx.Response(200, content=big)
+    assert (await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())).reason == "shape"
+
+    module.handler = lambda _r: httpx.Response(
+        200, content=b"{}", headers={"Content-Encoding": "zz"}
+    )
+    assert (await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())).reason == "shape"
+    assert not station_module.paused()
+
+
+async def test_an_unforeseen_near_error_is_network_without_a_pause(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "http://[::1:8000")
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "network", None)
+    assert not station_module.paused()
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon", "radius"),
+    [
+        pytest.param(90.5, 0.0, 300, id="latitude-above-90"),
+        pytest.param(-90.5, 0.0, 300, id="latitude-below-minus-90"),
+        pytest.param(0.0, 180.5, 300, id="longitude-above-180"),
+        pytest.param(0.0, -180.5, 300, id="longitude-below-minus-180"),
+        pytest.param(math.nan, 0.0, 300, id="latitude-nan"),
+        pytest.param(0.0, math.inf, 300, id="longitude-infinite"),
+        pytest.param(True, 0.0, 300, id="latitude-truth-value"),
+        pytest.param(None, 0.0, 300, id="latitude-none"),
+        pytest.param(0.0, "1", 300, id="longitude-text"),
+        pytest.param(0.0, 0.0, 0, id="radius-zero"),
+        pytest.param(0.0, 0.0, 301, id="radius-301"),
+        pytest.param(0.0, 0.0, 300.0, id="radius-float"),
+        pytest.param(0.0, 0.0, True, id="radius-truth-value"),
+    ],
+)
+async def test_a_near_call_the_module_would_refuse_is_refused_locally(
+    module: Module, lat: Any, lon: Any, radius: Any
+) -> None:
+    with pytest.raises(ValueError, match="near call"):
+        await station_module.near_outcome(lat, lon, uuid.uuid4(), radius_m=radius)
+    assert module.requests == []
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon", "radius"),
+    [(90.0, 180.0, 1), (-90.0, -180.0, 300), (0, 0, 300)],
+    ids=["north-east-corner", "south-west-corner", "zero"],
+)
+async def test_the_edges_of_a_near_call_are_sent(
+    module: Module, lat: float, lon: float, radius: int
+) -> None:
+    module.answer(200, {"stations": []})
+
+    assert (await station_module.near_outcome(lat, lon, uuid.uuid4(), radius)).reason == "ok"
+    assert json.loads(module.requests[0].content)["radius_m"] == radius
+
+
+async def test_near_never_logs_a_position_a_code_or_the_token(
+    module: Module, token: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    marker = f"ZZ{secrets.token_hex(4)}"
+    with caplog.at_level(logging.DEBUG):
+        for kind, _reason in PAUSING + NOT_PAUSING:
+            _setup_failure(module, kind)
+            await station_module.near_outcome(-48.123456, -123.654321, uuid.uuid4())
+        module.answer(200, {"stations": [_near_row(marker, 5)]})
+        await station_module.near_outcome(-48.123456, -123.654321, uuid.uuid4())
+
+    logged = caplog.text + "".join(str(r.args) for r in caplog.records)
+    assert caplog.records
+    assert "48.123456" not in logged
+    assert "123.654321" not in logged
+    assert marker not in logged
+    assert token not in logged
+    assert "stand-in failure" not in logged
