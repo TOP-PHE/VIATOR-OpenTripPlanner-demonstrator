@@ -2573,22 +2573,27 @@ uses the module (platform administrators only):
   the module's names often differ from the hubs' own. One station is shown
   with a tick box, not ticked: tick it to keep it; two to five are a choice
   ("Leave it" chosen at first). Each station says where it comes from
-  ("by position" or "by name") and how far it stands from the hub.
-- **When no station stands within 300 m**, the hub's **name** is searched
-  in the module instead (one more call), as the name is stored. Example: a
-  hub stored about 560 m from its station is found this way. The results
-  are listed nearest the hub first, five at most:
-  - within 300 m, as usual;
-  - farther than 300 m, each with a warning such as "Warning: Found by
-    name, 1.2 km from the hub's position — check before confirming". Such a
-    station is always a choice, never a single tick box: make sure it is the
-    hub's station (or correct the hub's position) before saving;
+  ("by position" or "by name") and how far it stands from the hub (in m
+  below a kilometre, else in km).
+- **When the position search returns no usable station**, the hub's
+  **name** is searched in the module instead (one more call), as the name
+  is stored. Example: a hub stored about 560 m from its station is found
+  this way. The panel then says "No station returned by the position
+  search; found by its name instead". A station found by name is **always
+  a choice** ("Leave it" chosen at first), never a single tick box, even
+  alone and close by: make sure it is the hub's station before saving. The
+  results are listed nearest the hub first, five at most:
+  - within 300 m: no warning;
+  - farther than 300 m (measured exactly, shown rounded up: a station at
+    300.4 m reads "301 m"), each with a warning such as "Warning: Found by
+    name, 1.2 km from the hub's position — check before saving": make sure
+    it is the hub's station, or correct the hub's position;
   - more than 50 km away: not listed (a station of the same name in another
-    town), but the panel says how many were left out: check the hub's
-    position.
+    town), but the panel says how many were left out ("1 more station found
+    by name stands over 50 km ..."): check the hub's position.
   When the name search finds nothing either, check the hub's position, or
   type the code in the hub form. A name shorter than 3 or longer than 100
-  characters is not searched.
+  characters is not searched, and the panel says so.
 - **A hub whose stored position is not a usable number** shows "no usable
   position": its position is not sent, but its name is searched, and each
   station found is listed with a warning that the distance is unknown.
@@ -2601,7 +2606,8 @@ the module's limits for this call (by default 30 a minute and 200 a day for
 one person, 500 a day for everybody); a name search is one more call on your
 own limits (by default 60 a minute and 2,000 a day), not on this call's.
 One click is thus at most 20 calls, 30 with its **Save ticked codes**. At a
-limit the click stops and keeps what it found. When the limit is one of this call's own, only **Propose
+limit the click stops and keeps what it found, and says how long to wait
+(in seconds, minutes or hours). When the limit is one of this call's own, only **Propose
 station codes** (and its "next" button) waits, for the time the module
 gives, or until midnight UTC for a daily one ("try again tomorrow
 (UTC)"); you can still save the codes already shown and check stored
