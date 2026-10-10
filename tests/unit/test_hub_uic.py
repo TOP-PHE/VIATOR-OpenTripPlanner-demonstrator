@@ -1903,7 +1903,9 @@ def test_the_panel_speaks_of_positions_first_then_names(template_text: str) -> N
     assert "within 300 m of this hub\\'s position" in script
     assert "found by its name instead: check each one before saving" in script
     # Each candidate says where it comes from, as text.
-    assert "candidate.found_by === 'name' ? 'by name' : 'by position'" in script
+    assert "candidate.found_by === 'name' ? hubNameOrigin(candidate) : 'by position'" in script
+    # A candidate found by a shortened name quotes that text.
+    assert "`by the shortened name «${candidate.shortened_name}»` : 'by name'" in script
     # The warning is a text node starting with the word, tied to its input.
     assert "hubCodesElement('div', `Warning: ${candidate.warning}`, 'hub-code-warning')" in script
     assert "input.setAttribute('aria-describedby', warning.id);" in script
@@ -1963,9 +1965,19 @@ const out = {
   noPositionNone: lines(hubProposalItem({ ...base, state: 'no_position', name_searched: true, candidates: [] })),
   noPositionNotSearched: lines(hubProposalItem({ ...base, state: 'no_position', candidates: [] })),
 };
-// Two items with two warned candidates each: every warning has its own id,
+// Found by a shortened name: the text is markup-like on purpose, to show it
+// stays text.
+const cut = '<b>Zz</b> & Zzx';
+const shortNear = { name: 'ZZ Close', uic: '9900005', country_iso: 'ZZ', distance_m: 200, found_by: 'name', warning: null, shortened_name: cut };
+const shortFar = { name: 'ZZ Beyond', uic: '9900006', country_iso: 'ZZ', distance_m: 1200, found_by: 'name', warning: `Found by the shortened name «${cut}», a looser match, 1.2 km`, shortened_name: cut };
+const shortenedItem = hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 2, candidates: [shortNear, shortFar] });
+out.shortened = lines(shortenedItem);
+out.shortenedTexts = shortenedItem.children.filter(c => c.tag === 'label').map(c => c.children.slice(1).every(k => typeof k === 'string'));
+out.shortenedNone = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 3, candidates: [] }));
+out.shortenedOne = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 1, candidates: [] }));
+// Three items with two warned candidates each: every warning has its own id,
 // each choice points at the warning right after it, none is hidden.
-const items = [far, lost].map(() => hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: [far, lost] }));
+const items = [[far, lost], [far, lost], [shortFar, lost]].map(cands => hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: cands }));
 const described = (c) => c.tag === 'label' && c.children[0].attrs['aria-describedby'];
 const pairs = items.flatMap(item => item.children.flatMap((c, i) => (described(c) ? [[described(c), item.children[i + 1]]] : [])));
 out.warnings = pairs.length;
@@ -2040,7 +2052,26 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
         "hub form if you know it."
     )
     assert "its name was not searched" in out["noPositionNotSearched"][2]
-    assert out["warnings"] == 4
+    # Found by a shortened name: the text that found it, quoted, on each
+    # candidate and in the note, as text nodes (never markup).
+    assert out["shortened"] == [
+        "ZZ Hub 01",
+        "No station returned by the position search nor by the hub's full name; found by "
+        "the shortened name «<b>Zz</b> & Zzx» instead, a looser match: check each one "
+        "before saving, or leave it.",
+        "[radio] ZZ Close · 9900005 · ZZ · 200 m · by the shortened name «<b>Zz</b> & Zzx»",
+        "[radio] ZZ Beyond · 9900006 · ZZ · 1.2 km · by the shortened name «<b>Zz</b> & Zzx»",
+        "Warning: Found by the shortened name «<b>Zz</b> & Zzx», a looser match, 1.2 km",
+        "[radio] Leave it",
+    ]
+    assert out["shortenedTexts"] == [True, True, True]
+    assert out["shortenedNone"][1] == (
+        "No station of the module within 300 m of this hub's position, and none found by "
+        "its name nor by 3 shortened forms of it: type the code in the hub form if you "
+        "know it."
+    )
+    assert "nor by 1 shortened form of it:" in out["shortenedOne"][1]
+    assert out["warnings"] == 6
     assert out["ownWarning"] is True
     assert out["uniqueIds"] is True
     assert out["hidden"] is False
