@@ -167,11 +167,14 @@ NAME_FALLBACK_MAX_DISTANCE_M = 50_000
 # no candidate, the name is searched again without its last word, then its
 # last two, and so on down to its first word, at most this many times per
 # hub. Words are split where the module's search splits them (white space,
-# its hyphens and apostrophes: MODULE_HYPHENS, MODULE_APOSTROPHES), so the
+# its hyphens, apostrophes and punctuation: MODULE_SEPARATORS), so the
 # module's "Marseille-St-Charles" is found by "Marseille" for the hub
-# "Marseille Saint-Charles". Only for a hub with a usable position: without
-# a distance to order and filter them, the results of a single word would be
-# a guess.
+# "Marseille Saint-Charles", and "Basel, Burgfelderhof" is shortened to
+# "Basel". When the cap would leave out the form that ends before the
+# name's first mark of punctuation (the town, in "St-Louis, Gare de
+# Saint-Louis"), that form takes the third place: never more searches.
+# Only for a hub with a usable position: without a distance to order and
+# filter them, the results of a single word would be a guess.
 NAME_SHORTEN_MAX = 3
 # The most calls one hub of a resolve click can make: its near call, the
 # search with its full name, and the shortened ones (`_hub_worst_calls`
@@ -1157,30 +1160,37 @@ def _name_warning(
 
 
 # The characters the station module's search reads as a space between two
-# words: a mirror of MSMM app/master/station_search.py `_HYPHENS` and
-# `_APOSTROPHES` (its fold makes each of them, and white space, a space).
-# VIATOR cannot import the module's code, so they are copied here; change
-# them with the module's (a test pins the copy).
-MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
-MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
-_NAME_WORD = re.compile(r"[^\s" + re.escape(MODULE_HYPHENS + MODULE_APOSTROPHES) + "]+")
+# words, white space aside: its hyphens, apostrophes and punctuation
+# (decision 64 of the module), mirrored once in app/api/station_suggest.py
+# from MSMM app/master/station_search.py `_HYPHENS`, `_APOSTROPHES` and
+# `FOLDED_PUNCTUATION` (a test pins the copy). A word of a hub's name is a
+# run of anything else.
+MODULE_HYPHENS = station_suggest.MODULE_HYPHENS
+MODULE_APOSTROPHES = station_suggest.MODULE_APOSTROPHES
+MODULE_PUNCTUATION = station_suggest.MODULE_PUNCTUATION
+MODULE_SEPARATORS = station_suggest.MODULE_SEPARATORS
+_NAME_WORD = re.compile(r"[^\s" + re.escape(MODULE_SEPARATORS) + "]+")
 # The fewest letters or digits a text the module searches must hold: its
 # own rule is 3 characters once folded (separators made spaces), so a text
-# like "Zz" and a dash is refused with a 422. Three letters or digits always pass it.
+# like "Zz" and a dash, or "St." is refused with a 422. Three letters or
+# digits always pass it.
 _SEARCH_MIN_LETTERS = 3
 
 
 def _searchable(text: str) -> bool:
-    """True when `text` holds enough letters or digits for the module."""
-    return sum(character.isalnum() for character in text) >= _SEARCH_MIN_LETTERS
+    """True when `text` holds enough letters or digits for the module. A
+    module separator never counts, even one Python takes for a letter (the
+    modifier apostrophe U+02BC)."""
+    letters = sum(character.isalnum() and character not in MODULE_SEPARATORS for character in text)
+    return letters >= _SEARCH_MIN_LETTERS
 
 
 def _name_query(hub: NetworkCoverageHub) -> str | None:
     """The hub's name as the module's search takes it (the typeahead's own
     rule, `station_suggest.normalise_query`: NFC, white space made single,
-    3 to 100 characters, and at least 3 letters or digits), or None when
-    the search would refuse it. Sent as stored otherwise: no word is
-    removed."""
+    3 to 100 characters, still 3 once folded as the module folds it, and
+    at least 3 letters or digits), or None when the search would refuse
+    it. Sent as stored otherwise: no word is removed."""
     if not isinstance(hub.name, str):
         return None
     try:
@@ -1194,25 +1204,44 @@ def _shortened_names(name: str) -> list[str]:
     """The shortened forms of a hub's name (`name`: NFC, white space made
     single), longest first: the name up to the end of each word but the
     last, down to its first word, at most NAME_SHORTEN_MAX of them. Words
-    are split at white space and at the module's hyphens and apostrophes,
-    so a form never ends with a separator and never repeats the full name
-    or another form in the module's eyes (each holds fewer words than the
-    one before). Skipped: a form whose last word is a single letter (an
-    elision such as "Zzville-d"), one with fewer than 3 letters or digits,
-    and one the search would refuse (over 100 characters)."""
-    shortened: list[str] = []
+    are split at white space and at the module's hyphens, apostrophes and
+    punctuation (`MODULE_SEPARATORS`), so a form never ends with a
+    separator and never repeats the full name or another form in the
+    module's eyes (each holds fewer words than the one before). Skipped: a
+    form whose last word is a single letter (an elision such as
+    "Zzville-d"), one with fewer than 3 letters or digits, and one the
+    search would refuse (over 100 characters, or under 3 characters once
+    folded). When the cap leaves out the form that ends before the name's
+    first mark of punctuation (`MODULE_PUNCTUATION`), that form takes the
+    last place: "Zz-Zzlouis, Zzgare de Zzsaint-Zzlouis" gives "Zz-Zzlouis,
+    Zzgare de Zzsaint", "Zz-Zzlouis, Zzgare de" and "Zz-Zzlouis" (the
+    town, before the comma), still at most NAME_SHORTEN_MAX searches."""
+    forms: list[str] = []
     words = list(_NAME_WORD.finditer(name))
     for word in reversed(words[:-1]):
-        if len(shortened) == NAME_SHORTEN_MAX:
-            break
         text = name[: word.end()]
         if len(word.group()) == 1 or not _searchable(text):
             continue
         try:
-            shortened.append(station_suggest.normalise_query(text))
+            forms.append(station_suggest.normalise_query(text))
         except ValueError:
             continue
+    shortened = forms[:NAME_SHORTEN_MAX]
+    before = _before_punctuation(name, words)
+    if before in forms and before not in shortened:
+        shortened[-1] = before
     return shortened
+
+
+def _before_punctuation(name: str, words: list[re.Match[str]]) -> str | None:
+    """The name up to the end of its last word before its first mark of
+    punctuation, or None when there is no mark or no word before it."""
+    mark = next(
+        (index for index, character in enumerate(name) if character in MODULE_PUNCTUATION),
+        None,
+    )
+    ends = [word.end() for word in words if mark is not None and word.end() <= mark]
+    return name[: ends[-1]] if ends else None
 
 
 def _name_plan(hub: NetworkCoverageHub, *, located: bool) -> tuple[str | None, list[str]]:

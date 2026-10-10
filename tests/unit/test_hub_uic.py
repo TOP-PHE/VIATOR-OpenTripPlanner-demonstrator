@@ -1230,6 +1230,61 @@ def test_a_form_that_finds_only_stations_beyond_50_km_does_not_stop_the_shorteni
             ["Zza1 Zzb2 Zzc3 Zzd4 Zze5", "Zza1 Zzb2 Zzc3 Zzd4", "Zza1 Zzb2 Zzc3"],
             id="at-most-three",
         ),
+        # Punctuation splits words, as the module's search reads it (its
+        # decision 64): the town before a comma.
+        pytest.param("Zzbasel, Zzhof", ["Zzbasel"], id="comma"),
+        pytest.param("Zzbasel,Zzhof", ["Zzbasel"], id="comma-without-a-space"),
+        pytest.param("Zzbasel (Zzhof)", ["Zzbasel"], id="brackets"),
+        pytest.param("Zzbasel Zzst. Zzjohann", ["Zzbasel Zzst", "Zzbasel"], id="full-stop"),
+        pytest.param("Zzab / Zzcd …", ["Zzab"], id="slash-and-trailing-ellipsis"),
+        pytest.param("Zzab «Zzcd»", ["Zzab"], id="angle-quotes"),
+        pytest.param("Zz. Zzab Zzcd", ["Zz. Zzab"], id="two-letters-and-a-full-stop-skipped"),
+        # The form before the first mark of punctuation takes the last of the
+        # three places when the cap would leave it out.
+        pytest.param(
+            "Zz-Zzlouis, Zzgare de Zzsaint-Zzlouis",
+            ["Zz-Zzlouis, Zzgare de Zzsaint", "Zz-Zzlouis, Zzgare de", "Zz-Zzlouis"],
+            id="the-town-before-the-comma-within-the-cap",
+        ),
+        pytest.param(
+            "Zza1 Zzb2: Zzc3 Zzd4 Zze5 Zzf6",
+            ["Zza1 Zzb2: Zzc3 Zzd4 Zze5", "Zza1 Zzb2: Zzc3 Zzd4", "Zza1 Zzb2"],
+            id="the-text-before-a-colon",
+        ),
+        pytest.param(
+            "Zza1 Zzb2 Zzc3 Zzd4, Zze5",
+            ["Zza1 Zzb2 Zzc3 Zzd4", "Zza1 Zzb2 Zzc3", "Zza1 Zzb2"],
+            id="already-within-the-cap",
+        ),
+        pytest.param(
+            "Zza1 Zzb2 Zzc3 Zzd4 Zze5, Zzf6 Zzg7 Zzh8",
+            [
+                "Zza1 Zzb2 Zzc3 Zzd4 Zze5, Zzf6 Zzg7",
+                "Zza1 Zzb2 Zzc3 Zzd4 Zze5, Zzf6",
+                "Zza1 Zzb2 Zzc3 Zzd4 Zze5",
+            ],
+            id="the-third-place-is-the-text-before-the-comma",
+        ),
+        # Only the first mark counts, and only a form that would be sent.
+        pytest.param(
+            "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6 Zzg7 Zzh8",
+            [
+                "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6 Zzg7",
+                "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6",
+                "Zza1 b, Zzc3 Zzd4; Zze5",
+            ],
+            id="a-one-letter-word-before-the-first-mark",
+        ),
+        pytest.param(
+            "(Zza1) Zzb2 Zzc3 Zzd4 Zze5, Zzf6",
+            ["(Zza1) Zzb2 Zzc3 Zzd4 Zze5", "(Zza1) Zzb2 Zzc3 Zzd4", "(Zza1) Zzb2 Zzc3"],
+            id="a-mark-before-any-word",
+        ),
+        pytest.param(
+            "Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6.",
+            ["Zza1 Zzb2 Zzc3 Zzd4 Zze5", "Zza1 Zzb2 Zzc3 Zzd4", "Zza1 Zzb2 Zzc3"],
+            id="a-mark-after-the-last-word",
+        ),
     ],
 )
 def test_the_shortened_forms_of_a_name(name: str, forms: list[str]) -> None:
@@ -1238,38 +1293,130 @@ def test_the_shortened_forms_of_a_name(name: str, forms: list[str]) -> None:
     assert network_coverage._shortened_names(query) == forms
 
 
-# The module's separators (MSMM app/master/station_search.py, `_HYPHENS` and
-# `_APOSTROPHES`, origin/main of 10 Oct), written out here a second time.
+# The module's separators (MSMM app/master/station_search.py, `_HYPHENS`,
+# `_APOSTROPHES` and `FOLDED_PUNCTUATION` of its PR #29, decision 64),
+# written out here a second time: 32 marks of punctuation.
 _MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
 _MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
+_MODULE_PUNCTUATION = (
+    ',;:./\\()[]{}"!?*+&'
+    "\u00ab\u00bb\u2039\u203a\u201c\u201d\u201e\u201f\u201a\u201b\u2026\u00a1\u00bf\u2044"
+)
+# And the rest of its fold that can change a text's length.
+_MODULE_COMBINING_MARKS = "[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]"
+_MODULE_GONE = "\u00ad"
+_MODULE_LONG_LETTERS = {"\u00df": "ss", "\u00e6": "ae", "\u0153": "oe", "\u00fe": "th"}
 
 
-def _module_separators(path: Path) -> tuple[str, str]:
-    """`_HYPHENS` and `_APOSTROPHES` as the module's source writes them."""
+def _module_constants(path: Path) -> dict[str, Any]:
+    """The constants of the module's fold as its source writes them."""
     text = path.read_text(encoding="utf-8")
-    found = {}
-    for name in ("_HYPHENS", "_APOSTROPHES"):
+    found: dict[str, Any] = {}
+    for name in ("_HYPHENS", "_APOSTROPHES", "FOLDED_GONE"):
         match = re.search(rf"^{name} = (\"[^\"]*\")$", text, re.M)
         assert match, name
         found[name] = ast.literal_eval(match.group(1))
-    return found["_HYPHENS"], found["_APOSTROPHES"]
+    match = re.search(r"^FOLDED_PUNCTUATION = (\(\n.*?\n\))$", text, re.M | re.S)
+    assert match, "FOLDED_PUNCTUATION"
+    found["FOLDED_PUNCTUATION"] = ast.literal_eval(match.group(1))
+    match = re.search(r"^FOLDED_LETTERS = (\{\n.*?\n\})$", text, re.M | re.S)
+    assert match, "FOLDED_LETTERS"
+    found["FOLDED_LETTERS"] = ast.literal_eval(match.group(1))
+    match = re.search(r"^_COMBINING_MARKS = re\.compile\((\"[^\"]*\")\)$", text, re.M)
+    assert match, "_COMBINING_MARKS"
+    found["_COMBINING_MARKS"] = ast.literal_eval(match.group(1))
+    return found
 
 
 def test_the_separators_mirror_the_modules() -> None:
-    """VIATOR splits words where the module's search does. VIATOR's CI
-    cannot read the module's private code: the copy is pinned here, and
-    compared with the module's source itself when MSMM_STATION_SEARCH names
-    a checkout's app/master/station_search.py (as the review did)."""
-    assert network_coverage.MODULE_HYPHENS == _MODULE_HYPHENS
-    assert network_coverage.MODULE_APOSTROPHES == _MODULE_APOSTROPHES
+    """VIATOR splits words, and folds a search text, where the module's
+    search does. VIATOR's CI cannot read the module's private code: the
+    copy is pinned here, and compared with the module's source itself when
+    MSMM_STATION_SEARCH names a checkout's app/master/station_search.py (as
+    the review did)."""
+    suggest = network_coverage.station_suggest
+    assert network_coverage.MODULE_HYPHENS == suggest.MODULE_HYPHENS == _MODULE_HYPHENS
+    assert network_coverage.MODULE_APOSTROPHES == suggest.MODULE_APOSTROPHES
+    assert suggest.MODULE_APOSTROPHES == _MODULE_APOSTROPHES
+    assert network_coverage.MODULE_PUNCTUATION == suggest.MODULE_PUNCTUATION
+    assert suggest.MODULE_PUNCTUATION == _MODULE_PUNCTUATION
+    assert len(_MODULE_PUNCTUATION) == len(set(_MODULE_PUNCTUATION)) == 32
+    assert suggest._MODULE_COMBINING_MARKS.pattern == _MODULE_COMBINING_MARKS
+    assert suggest.MODULE_GONE == _MODULE_GONE
+    assert suggest.MODULE_LONG_LETTERS == _MODULE_LONG_LETTERS
     source = os.environ.get("MSMM_STATION_SEARCH")
     if source:
-        hyphens, apostrophes = _module_separators(Path(source))
-        assert hyphens == network_coverage.MODULE_HYPHENS
-        assert apostrophes == network_coverage.MODULE_APOSTROPHES
+        module = _module_constants(Path(source))
+        assert module["_HYPHENS"] == suggest.MODULE_HYPHENS
+        assert module["_APOSTROPHES"] == suggest.MODULE_APOSTROPHES
+        assert module["FOLDED_PUNCTUATION"] == suggest.MODULE_PUNCTUATION
+        assert module["FOLDED_GONE"] == suggest.MODULE_GONE
+        assert module["_COMBINING_MARKS"] == suggest._MODULE_COMBINING_MARKS.pattern
+        long_letters = {k: v for k, v in module["FOLDED_LETTERS"].items() if len(v) > 1}
+        assert long_letters == suggest.MODULE_LONG_LETTERS
     # Each one splits two words, and white space too.
-    for separator in _MODULE_HYPHENS + _MODULE_APOSTROPHES + "\u00a0\u202f\u3000":
+    for separator in (
+        _MODULE_HYPHENS + _MODULE_APOSTROPHES + _MODULE_PUNCTUATION + "\u00a0\u202f\u3000"
+    ):
         assert network_coverage._shortened_names(f"Zzab{separator}Zzcd") == ["Zzab"], separator
+
+
+@pytest.mark.parametrize(
+    "separator", list(_MODULE_HYPHENS + _MODULE_APOSTROPHES + _MODULE_PUNCTUATION)
+)
+def test_a_module_separator_never_counts_as_a_letter(separator: str) -> None:
+    """The modifier apostrophe (U+02BC) is a letter for Python's `isalnum`
+    but a separator for the module: "Z\u02bcz" holds two letters, not three."""
+    assert not network_coverage._searchable(f"Z{separator}z")
+    assert not network_coverage._searchable(f"{separator}Zz{separator}")
+    assert network_coverage._searchable(f"Z{separator}zz")
+
+
+def test_the_modifier_apostrophe_alone_does_not_make_a_name_searchable(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(name="\u02bcZz \u02bc")]
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert module.of("search") == []
+    assert proposal["name_searched"] is False
+
+
+def test_a_name_with_a_comma_is_shortened_to_the_text_before_it(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # Shaped like "Basel, Burgfelderhof" and "St-Louis, Gare de Saint-Louis":
+    # the module names their stations otherwise, and finds them by the town.
+    town = "Zz-Zzlouis, Zzgare de Zzsaint-Zzlouis"
+    hubs.rows = [_sea_hub(1, name="Zzbasel, Zzhof"), _sea_hub(2, name=town)]
+    _answers(
+        module,
+        {
+            "Zzbasel": [_north("ZZ Basel Zz", "9900291", 0.0018)],
+            "Zz-Zzlouis": [_north("ZZ Louis Zz", "9900292", 0.0108)],
+        },
+    )
+
+    first, second = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [
+        "Zzbasel, Zzhof",
+        "Zzbasel",
+        town,
+        "Zz-Zzlouis, Zzgare de Zzsaint",
+        "Zz-Zzlouis, Zzgare de",
+        "Zz-Zzlouis",
+    ]
+    assert first["candidates"][0]["shortened_name"] == "Zzbasel"
+    assert first["shortened_searches"] == 1
+    assert second["candidates"][0]["shortened_name"] == "Zz-Zzlouis"
+    assert second["candidates"][0]["warning"] == _shortened_warning("Zz-Zzlouis", "1.2 km")
+    assert second["shortened_searches"] == 3
+    # Still at most 1 near + 1 full name + 3 shortened names a hub.
+    assert network_coverage._hub_worst_calls(hubs.rows[0]) == 3
+    assert network_coverage._hub_worst_calls(hubs.rows[1]) == 5
+    assert network_coverage.RESOLVE_HUB_MAX_CALLS == 5
 
 
 def test_a_name_with_fewer_than_three_letters_is_not_searched(
