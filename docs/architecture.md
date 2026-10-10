@@ -106,7 +106,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 
 ![The journey fanout — one search broadcast to every serving session and to the reference planners at the same time](diagrams/arch-journey-fanout.svg)
 
-1. Browser loads `/journey` — `app/api/pages.py` renders `templates/journey.html`. The station typeahead calls `POST /api/stations/suggest` (`api/station_suggest.py`: the station module, or VIATOR's own Trainline list when the module is not used or does not answer) and `GET /api/geocode` (`api/geocode.py`, which proxies the first serving MOTIS session's `/api/v1/geocode` so urban stops missing from Trainline still resolve; returns `[]` rather than 5xx if no MOTIS is up).
+1. Browser loads `/journey` — `app/api/pages.py` renders `templates/journey.html`. The station typeahead calls `POST /api/stations/suggest` (`api/station_suggest.py`: the station module, or VIATOR's own Trainline list when the module is not used or does not answer) and `GET /api/geocode` (`api/geocode.py`, which proxies the first serving MOTIS session's `/api/v1/geocode` so urban stops missing from Trainline still resolve; returns `[]` rather than 5xx if no MOTIS is up). The page aborts a geocoder call that a newer keystroke, a pick or a blur supersedes; the server then cancels its MOTIS call and logs `reason=superseded` at INFO, while a timeout, a refused connection or another transport error is a WARNING with a reason word and the exception's type, never the typed text (#338).
 2. Form POSTs `/api/journey/fanout` → `api/journey.py::fanout`, gated by `Depends(require_logged_in)`.
 3. `config_service.get_all(db)` loads `platform_config` (30 s in-process cache). `_validate_engine_filter(body.engine)` 400s on a bad engine; `_select_fanout_sessions(db, engine)` selects sessions where `state='serving' AND include_in_fanout`. Empty → 409 with a message distinguishing "no sessions at all" from "none with that engine".
 4. `concurrency.semaphores.journey.acquire_or_fail()` — `MAX_CONCURRENT_JOURNEYS` (default 20). **Rejects rather than queues**; caller gets 503 + `Retry-After`. `recorder.begin_search()` writes the `journey_searches` row.
@@ -308,7 +308,12 @@ each step is worth reading in the source, but the shape is:
    `<feedId>:<uic>` and routes by stop — bypassing the lat/lon→walk-graph snap "which fails for
    small/border stations whose walking neighbourhood was stripped by rail-focused OSM filtering."
    `_primary_feed_id` takes the *first* provider; SBB-style feeds (stop_id == UIC) resolve, SNCF-style
-   ones don't and fall back to coordinates.
+   ones don't and fall back to coordinates. A session whose engine refuses the date because its
+   loaded timetable does not cover it (#338, `journey/timetable_window.py`) keeps the database
+   status (`error` for MOTIS's HTTP 400, `no_route` for OTP's `OUTSIDE_SERVICE_PERIOD`) and gets
+   `reason: "outside_timetable"`, a fixed `detail` sentence (also stored as the execution's
+   `error_message`) and, when MOTIS named it, the loaded `timetable_window`; the page shows `detail`
+   instead of the bare status.
 6. **Merge.** Trips are keyed by `signature.trip_signature`; each slot keeps `best` (shortest
    duration), `found_in_sessions`, and per-session timings. `_origin_flag` labels the slot `ALL`,
    `<SESSION>_ONLY`, or `SUBSET`.
@@ -338,7 +343,7 @@ Fanout response:
 |---|---|---|
 | `search_id`, `status` | always | `ok` \| `partial` \| `no_route` \| `error` |
 | `trips[]` | always | `{signature, found_in_sessions[], by_session{}, best, origin_flag, comparison?}` |
-| `executions[]` | always | `{session_id, engine, graph_snapshot_id?, status, num_itineraries, response_ms}` |
+| `executions[]` | always | `{session_id, engine, graph_snapshot_id?, status, num_itineraries, response_ms, reason?, detail?, timetable_window?}`; the last three only when the engine refused the date (#338): `reason` = `outside_timetable`, `timetable_window` = `{from, until}` (UTC, end excluded) when MOTIS named it |
 | `ojp_reference` / `hafas_reference` | opt-in + configured | `{status, trips[], response_ms, error?, pages?}` |
 | `comparison_summary` | OJP returned `ok` | `{common, otp_only, ojp_only}` |
 | `federated_trips[]` | nothing merged + both UICs | hub-stitched itineraries, rendered separately |
@@ -520,6 +525,14 @@ stop-id attempt returns empty with `LOCATION_NOT_FOUND`, the client transparentl
 coordinates; *other* routing errors do not trigger a retry, because they mean OTP found both
 endpoints and simply had no acceptable answer. Endpoint is `/otp/gtfs/v1` — the `/index/graphql`
 form 404s.
+
+**A date outside the loaded timetable** (#338) is refused differently by the two engines, and
+`timetable_window.py` recognises both: MOTIS (v2.11.2) answers `/api/v6/plan` with HTTP 400 and
+`{"error": "query time … is outside of loaded timetable window [from, to["}` (bounds in UTC, end
+excluded); OTP answers 200 with no edges and a `routingErrors` code `OUTSIDE_SERVICE_PERIOD`, naming
+no window. Only the two instants are re-printed from parsed numbers; the engine's text never reaches
+the page or the log. `graph_snapshots.service_period_*` is not used as the window: it comes from the
+first GTFS file of a build only (and is the build day when there is none).
 
 **MOTIS** accepts `from_stop_id` / `to_stop_id` **and deliberately ignores them** (`_ = from_stop_id,
 to_stop_id`). MOTIS indexes stops as `<feed>_<local>` while VIATOR builds OTP's `<provider>:<UIC>`,
@@ -1541,6 +1554,12 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   short-circuits on the empty env var, which is what keeps the test suite from dialling `tempo:4317`.
 - **Inbound `X-Request-ID` is only honoured if it matches `[A-Za-z0-9_-]{1,64}`**, otherwise a fresh
   UUID4 is minted — this is log-injection defence, not cosmetics.
+- **No query string in VIATOR's own logs (#339).** `setup_logging` (and the worker's setup) set
+  the `httpx`/`httpcore` loggers to WARNING, because their INFO request line prints the full URL —
+  a `query` feed credential (`?apikey=…`) or the typed geocoder text. `DropTypedQueryString` cuts
+  the query off `/api/geocode` in the uvicorn access log. Do not lower those loggers to INFO to
+  debug a feed: the line would print the credential. nginx's access log and the OTel spans still
+  carry full URLs (open, admin-guide §5.4).
 - **Worker-side metrics do not exist.** `/metrics` is served by the web container only; build-duration
   histograms from the worker are explicitly out of scope (they'd need multiprocess metric storage).
 
@@ -1703,7 +1722,7 @@ predicate `_select_fanout_sessions` uses.
 | `num_itineraries` | `Integer` | |
 | `response_ms` | `Integer` | |
 | `raw_response` | `JSONB` | The engine's untouched reply — nulled after `JOURNEY_RAW_RESPONSE_RETENTION_DAYS` (default 30) |
-| `error_message` | `String` | |
+| `error_message` | `String` | Set when the engine refused the date (#338): `date outside the loaded timetable`, plus the window MOTIS named; NULL otherwise |
 
 #### `journey_trips` — one itinerary
 

@@ -68,7 +68,37 @@ def test_the_motis_half_is_unchanged(template_text: str) -> None:
 
     assert re.search(r"^const SUGGEST_MIN = 2;$", template_text, re.M)
     assert "if (q.length < SUGGEST_MIN)" in refresh
-    assert "_fetchJson(`/api/geocode?q=${qs}&size=20`)" in refresh
+    assert "_fetchJson(`/api/geocode?q=${qs}&size=20`, geocodeCall.signal)" in refresh
+
+
+def test_a_superseded_geocoder_call_is_aborted(template_text: str) -> None:
+    """#338: a geocoder call that a newer refresh, a pick or a blur supersedes
+    is aborted, so MOTIS stops working for nobody and the server logs it as
+    `superseded` (INFO) rather than as a warning. A new refresh aborts the
+    previous call first thing, even when it then stops on a short text."""
+    setup = template_text[template_text.index("function setupAutocomplete(") :]
+    refresh = _refresh(template_text)
+
+    abort = re.search(r"  function abortGeocode\(\) \{.*?\n  \}\n", setup, re.S)
+    assert abort, "abortGeocode() not found"
+    assert "if (geocodeCall) geocodeCall.abort();" in abort.group(0)
+    assert "geocodeCall = null;" in abort.group(0)
+
+    body = refresh.split("{", 1)[1].lstrip()
+    assert body.startswith("const mine = ++seq;\n    abortGeocode();")
+    assert refresh.index("geocodeCall = new AbortController();") < refresh.index("_fetchJson(")
+    assert "++seq; clearTimeout(t); abortGeocode();" in setup.split("function pick(i)", 1)[1]
+    blur = re.search(r"inp\.addEventListener\('blur', \(\) => \{(.*?)\n  \}\);", setup, re.S)
+    assert blur
+    assert blur.group(1).lstrip().startswith("++seq; clearTimeout(t); abortGeocode();")
+
+
+def test_an_aborted_fetch_is_quiet_and_any_other_failure_still_warns(template_text: str) -> None:
+    get = _function(template_text, "_fetchJson")
+
+    assert "await fetch(url, {signal})" in get
+    quiet = get.index("if (err && err.name === 'AbortError') return [];")
+    assert quiet < get.index("console.warn('typeahead fetch failed:', url, err);")
 
 
 def test_the_suggestion_escapes_the_name_and_the_country(template_text: str) -> None:

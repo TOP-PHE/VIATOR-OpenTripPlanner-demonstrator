@@ -648,12 +648,6 @@ def test_a_user_without_a_viator_id_gets_the_fallback_without_any_call(
 # ───────────────────────── errors that are not answers ─────────────────────────
 
 
-@pytest.fixture
-def live_log(monkeypatch: pytest.MonkeyPatch) -> None:
-    # alembic's fileConfig (run by the integration tests) disables loggers.
-    monkeypatch.setattr(station_module.log, "disabled", False)
-
-
 def test_an_address_httpx_refuses_gives_viators_own_list(
     client: TestClient,
     module_on: str,
@@ -678,7 +672,6 @@ def test_a_token_httpx_cannot_encode_gives_viators_own_list_and_stays_out_of_the
     fallback: Fallback,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    live_log: None,
 ) -> None:
     token = "zz\u00e9\u20ac" + secrets.token_hex(8)
     monkeypatch.setattr(settings, "station_module_token", SecretStr(token))

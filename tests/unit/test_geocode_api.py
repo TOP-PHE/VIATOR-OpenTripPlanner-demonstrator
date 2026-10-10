@@ -10,7 +10,11 @@ Three layers are exercised:
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import httpx
+import pytest
 
 from app.api import geocode as geocode_mod
 from app.api.geocode import _extract_stops, _fetch_motis_geocode, _normalize_hit
@@ -195,3 +199,150 @@ async def test_fetch_returns_empty_on_non_json_body(monkeypatch):
 
     _install_mock_transport(monkeypatch, handler)
     assert await _fetch_motis_geocode("eu-rail-motis", "Basel") == []
+
+
+# ─────────────────────── how a call that got no answer is logged (#338) ───────────────────────
+#
+# "MOTIS geocoder unreachable for session …: " used to end with an empty
+# `str(exc)` (a read timeout has no message). Now: a reason word and the
+# exception's type at WARNING for a real failure; INFO for a call the browser
+# dropped (superseded by a newer keystroke) or that was cancelled. Never the
+# typed text. All values invented.
+
+_TYPED = "Zzq-typed-338"
+_SID = "zz-motis-338"
+
+
+def _geocode_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == geocode_mod.log.name]
+
+
+@pytest.mark.parametrize(
+    ("exc_type", "word"),
+    [
+        (httpx.ReadTimeout, "timeout"),
+        (httpx.ConnectTimeout, "timeout"),
+        (httpx.PoolTimeout, "timeout"),
+        (httpx.ConnectError, "connect"),
+        (httpx.RemoteProtocolError, "network"),
+        (httpx.ReadError, "network"),
+    ],
+)
+async def test_a_failure_is_a_warning_with_a_reason_word_and_its_type(
+    monkeypatch, caplog, exc_type, word
+):
+    def handler(req: httpx.Request) -> httpx.Response:
+        # The message carries the address, typed text included, as some
+        # httpx errors do: it must not reach the log.
+        raise exc_type(f"zz failure at {req.url}", request=req)
+
+    _install_mock_transport(monkeypatch, handler)
+    with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
+        assert await _fetch_motis_geocode(_SID, _TYPED) == []
+
+    (record,) = _geocode_lines(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"MOTIS geocoder unreachable for session {_SID}: reason={word} ({exc_type.__name__})"
+    )
+    assert _TYPED not in caplog.text
+
+
+async def test_a_call_the_browser_dropped_is_info_and_motis_is_not_awaited(monkeypatch, caplog):
+    motis_answered = asyncio.Event()
+
+    async def slow_motis(req: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        motis_answered.set()
+        return httpx.Response(200, json=[_STOP_BASEL])
+
+    _install_mock_transport(monkeypatch, slow_motis)
+
+    async def browser_left() -> None:
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
+        out = await asyncio.wait_for(_fetch_motis_geocode(_SID, _TYPED, browser_left), 2)
+
+    assert out == []
+    assert not motis_answered.is_set()  # the call to MOTIS was cancelled
+    (record,) = _geocode_lines(caplog)
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == f"MOTIS geocoder call for session {_SID} ended: reason=superseded"
+    assert _TYPED not in caplog.text
+
+
+async def test_an_answer_before_the_browser_leaves_is_returned(monkeypatch, caplog):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_STOP_BASEL])
+
+    _install_mock_transport(monkeypatch, handler)
+    still_there = asyncio.Event()
+
+    with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
+        out = await _fetch_motis_geocode(_SID, _TYPED, still_there.wait)
+
+    assert out == [_STOP_BASEL]
+    assert _geocode_lines(caplog) == []
+
+
+async def test_when_listening_for_the_browser_fails_the_answer_is_still_awaited(
+    monkeypatch, caplog
+):
+    async def motis(req: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json=[_STOP_AESCHEN])
+
+    _install_mock_transport(monkeypatch, motis)
+
+    async def listening_fails() -> None:
+        raise RuntimeError("zz receive failed")
+
+    with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
+        out = await _fetch_motis_geocode(_SID, _TYPED, listening_fails)
+
+    assert out == [_STOP_AESCHEN]
+    assert _geocode_lines(caplog) == []
+
+
+async def test_a_cancelled_call_is_info_and_the_cancellation_goes_on(monkeypatch, caplog):
+    started = asyncio.Event()
+
+    async def slow_motis(req: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(5)
+        return httpx.Response(200, json=[])
+
+    _install_mock_transport(monkeypatch, slow_motis)
+
+    with caplog.at_level(logging.DEBUG, logger=geocode_mod.log.name):
+        task = asyncio.ensure_future(_fetch_motis_geocode(_SID, _TYPED))
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    (record,) = _geocode_lines(caplog)
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == f"MOTIS geocoder call for session {_SID} ended: reason=cancelled"
+    assert _TYPED not in caplog.text
+
+
+async def test_client_gone_returns_on_the_disconnect_message_only():
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+    seen: list[str] = []
+
+    async def receive() -> dict:
+        message = next(messages)
+        seen.append(message["type"])
+        return message
+
+    request = geocode_mod.Request({"type": "http", "method": "GET", "headers": []}, receive)
+
+    await asyncio.wait_for(geocode_mod._client_gone(request), 1)
+    assert seen == ["http.request", "http.disconnect"]

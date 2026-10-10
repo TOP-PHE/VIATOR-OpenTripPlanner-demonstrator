@@ -21,11 +21,13 @@ master_stations-only behaviour, which is exactly what users get today.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
@@ -118,9 +120,65 @@ def _extract_stops(payload: Any, size: int) -> list[dict[str, Any]]:
     return out
 
 
-async def _fetch_motis_geocode(session_id: str, q: str) -> Any:
+def _failure_reason(exc: httpx.HTTPError) -> str:
+    """One word for why a geocoder call got no answer (#338). `str(exc)` is
+    often empty (a read timeout has no message), which left the warning
+    reading "unreachable for session …: " with nothing after it."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connect"
+    return "network"
+
+
+async def _client_gone(request: Request) -> None:
+    """Returns once the browser has dropped the request: the typeahead aborts
+    a geocoder call that a newer keystroke, a pick or a blur has superseded."""
+    message = await request.receive()
+    while message["type"] != "http.disconnect":
+        message = await request.receive()
+
+
+async def _unless_client_gone(
+    call: Awaitable[httpx.Response], client_gone: Callable[[], Awaitable[None]] | None
+) -> httpx.Response | None:
+    """The answer of `call`, or None when `client_gone` finishes first; the
+    call still in flight is then cancelled, so MOTIS's answer is not awaited
+    for nobody."""
+    if client_gone is None:
+        return await call
+    fetch = asyncio.ensure_future(call)
+    # The watcher starts here, once the client and its call exist, so it is
+    # never created without being awaited.
+    gone = asyncio.ensure_future(client_gone())
+    try:
+        await asyncio.wait({fetch, gone}, return_when=asyncio.FIRST_COMPLETED)
+        if fetch.done():
+            return fetch.result()
+        if gone.exception() is None:
+            return None
+        # Listening for the browser failed: wait for MOTIS, as before.
+        return await fetch
+    finally:
+        for task in (fetch, gone):
+            task.cancel()
+        await asyncio.wait({fetch, gone})
+        if not gone.cancelled():
+            gone.exception()  # retrieved, so asyncio does not report it as lost
+
+
+async def _fetch_motis_geocode(
+    session_id: str, q: str, client_gone: Callable[[], Awaitable[None]] | None = None
+) -> Any:
     """HTTP fetch of MOTIS's geocoder. Returns the parsed JSON payload, or
-    `[]` on any failure mode (network error, non-2xx, non-JSON body).
+    `[]` on any failure mode (network error, non-2xx, non-JSON body), or
+    when the watcher `client_gone()` returns first (the browser dropped the
+    request).
+
+    Logging (#338): a superseded or cancelled call is INFO, a real failure
+    (timeout, connection, other transport error, non-2xx, non-JSON) is
+    WARNING with a reason word and the exception's type. Never the typed text
+    `q`, nor `str(exc)`, which can carry the request's address.
 
     Kept separate from the endpoint so unit tests can substitute a fake
     httpx via MockTransport — see tests/unit/test_geocode_api.py.
@@ -130,9 +188,20 @@ async def _fetch_motis_geocode(session_id: str, q: str) -> Any:
     url = f"http://motis-{session_id}:8080/api/v1/geocode"  # NOSONAR python:S5332
     try:
         async with httpx.AsyncClient(timeout=_GEOCODE_TIMEOUT_S) as c:
-            r = await c.get(url, params={"text": q})
+            r = await _unless_client_gone(c.get(url, params={"text": q}), client_gone)
+    except asyncio.CancelledError:
+        log.info("MOTIS geocoder call for session %s ended: reason=cancelled", session_id)
+        raise
     except httpx.HTTPError as exc:
-        log.warning("MOTIS geocoder unreachable for session %s: %s", session_id, exc)
+        log.warning(
+            "MOTIS geocoder unreachable for session %s: reason=%s (%s)",
+            session_id,
+            _failure_reason(exc),
+            type(exc).__name__,
+        )
+        return []
+    if r is None:
+        log.info("MOTIS geocoder call for session %s ended: reason=superseded", session_id)
         return []
     if r.status_code != 200:
         log.warning("MOTIS geocoder returned %s for session %s", r.status_code, session_id)
@@ -146,6 +215,7 @@ async def _fetch_motis_geocode(session_id: str, q: str) -> Any:
 
 @router.get("")
 async def geocode(
+    request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     _: Annotated[CurrentUser, Depends(require_logged_in)],
     q: Annotated[str, Query(min_length=2, max_length=200)],
@@ -162,5 +232,5 @@ async def geocode(
     motis = _pick_motis_session(db)
     if motis is None:
         return []
-    payload = await _fetch_motis_geocode(motis.id, q)
+    payload = await _fetch_motis_geocode(motis.id, q, lambda: _client_gone(request))
     return _extract_stops(payload, size)

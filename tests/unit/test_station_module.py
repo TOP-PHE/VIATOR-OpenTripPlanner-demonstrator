@@ -102,9 +102,6 @@ def module(monkeypatch: pytest.MonkeyPatch, token: str, clock: FakeClock) -> Ite
         kwargs["transport"] = transport
         return real_async(*args, **kwargs)
 
-    # alembic's fileConfig (run by the integration tests) disables every logger
-    # that exists at that moment; this one must be live for caplog.
-    monkeypatch.setattr(station_module.log, "disabled", False)
     monkeypatch.setattr(station_module.httpx, "AsyncClient", async_factory)
     monkeypatch.setattr(settings, "station_module_url", MODULE_URL)
     monkeypatch.setattr(settings, "station_module_token", SecretStr(token))

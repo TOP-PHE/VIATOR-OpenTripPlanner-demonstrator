@@ -29,6 +29,7 @@ from sqlalchemy import update
 
 from . import engine_versions, graph_snapshots, netex_calendar
 from .db import SessionLocal
+from .logging_config import quiet_http_client_loggers
 from .models import RebuildJob
 from .models import Session as SessionRow
 from .models.sessions import SessionState
@@ -36,6 +37,8 @@ from .settings import settings
 
 log = logging.getLogger("worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Not httpx's INFO request lines: their URL can carry a feed credential (#339).
+quiet_http_client_loggers()
 
 
 # Same path written by app/api/admin/sessions.py::promote_session.

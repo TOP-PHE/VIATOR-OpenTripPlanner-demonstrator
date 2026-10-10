@@ -35,6 +35,40 @@ def _shared_processors() -> list[Processor]:
     ]
 
 
+# httpx (and httpcore below it) log every request at INFO as
+# `HTTP Request: GET <full URL> "<status>"`, query string included. That URL can
+# carry a feed credential of auth type `query` (`?apikey=…`, app/credentials.py)
+# or the text typed in the journey form's station fields (/api/geocode → MOTIS
+# `?text=…`). WARNING keeps their warnings and errors and drops those lines
+# (#339 review). Nothing in VIATOR reads them.
+QUIET_HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
+
+# Request paths whose query string is the text a user typed: the uvicorn
+# access log keeps the path and drops the query (#339 review). The station
+# list (`POST /api/stations/suggest`) takes its text in the body already.
+TYPED_TEXT_PATHS = ("/api/geocode",)
+
+
+def quiet_http_client_loggers() -> None:
+    """Raise httpx's and httpcore's loggers to WARNING; see above."""
+    for name in QUIET_HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+class DropTypedQueryString(logging.Filter):
+    """On `uvicorn.access`, cut the query string off the paths in
+    TYPED_TEXT_PATHS. uvicorn's access record carries
+    `(client, method, path_with_query, http_version, status)` as its args."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            path, sep, _ = args[2].partition("?")
+            if sep and path in TYPED_TEXT_PATHS:
+                record.args = (args[0], args[1], path, args[3], args[4])
+        return True
+
+
 def setup_logging(
     level: str | None = None,
     *,
@@ -81,6 +115,11 @@ def setup_logging(
         lg = logging.getLogger(name)
         lg.handlers.clear()
         lg.propagate = True
+
+    quiet_http_client_loggers()
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, DropTypedQueryString) for f in access.filters):
+        access.addFilter(DropTypedQueryString())
 
     structlog.configure(
         processors=[

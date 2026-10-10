@@ -759,6 +759,26 @@ Switch to colored console output for local dev: set `LOG_FORMAT=console` in
 the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
 (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) and defaults to `INFO`.
 
+**What the logs leave out on purpose (#339).** A query string can carry a
+secret or what a user typed: a feed credential of auth type `query` is added
+to the feed's URL as `?<param>=<value>` (`app/credentials.py`), and the
+station fields of `/journey` send the typed text to `/api/geocode?q=…`, which
+VIATOR forwards to MOTIS as `?text=…`. So:
+
+- the `httpx` and `httpcore` loggers are set to `WARNING` in web and worker:
+  their INFO line `HTTP Request: GET <full URL> "<status>"` is not written
+  (their warnings and errors still are);
+- the uvicorn access log keeps `GET /api/geocode` but drops its query
+  string (`app/logging_config.py`, `DropTypedQueryString`). The station list
+  (`POST /api/stations/suggest`) takes its text in the body and is not
+  affected.
+
+Still carrying full URLs, and not changed by #339 (open points):
+nginx's default access log (`$request`, query string included, for
+`/api/geocode?q=…` and any other route), and the OpenTelemetry spans of the
+httpx and FastAPI instrumentation sent to Tempo, whose URL attributes can
+include the query string of an outgoing feed request or of `/api/geocode`.
+
 ### 5.5 Prometheus metrics (audit #14, since v0.1.32.15+)
 
 The web container exposes `/metrics` in Prometheus exposition format. Three
@@ -1487,6 +1507,39 @@ to the audit doc's tracking table and triage from there.
 
 For all other audit findings and the prioritised action plan, see
 [`audit-2026-05.md`](audit-2026-05.md).
+
+### 6.13 Journey search says "date outside the loaded timetable"
+
+Since #338 the timing strip of `/journey` reads, for example,
+`eu19-transit-motis: 0 trips in 54ms (date outside the loaded timetable (loaded: 2026-10-01 00:00 to 2026-12-14 00:00 UTC))`
+instead of `(error)`. The session's engine refused the date: its loaded
+timetable does not cover it. This is not a fault of the session, and ÖBB
+HAFAS, shown beside it, can still answer, because it is not limited to a
+loaded feed.
+
+- **MOTIS** sessions refuse with HTTP 400 and name the window they have
+  loaded (UTC, end excluded); VIATOR shows it. The execution keeps status
+  `error` in the database, with the sentence in `error_message`.
+- **OTP** sessions answer `OUTSIDE_SERVICE_PERIOD` and name no window, so
+  the strip says only "date outside the loaded timetable". The execution
+  keeps status `no_route`.
+
+What to do: search a date inside the window, or, if the window is too
+short or too old, refresh the session's feeds and rebuild it. The form
+warns before searching when the chosen date is in the past, since a
+session's timetable usually starts around the day it was built.
+
+**MOTIS geocoder lines in the web log.** The station fields of `/journey`
+also ask the first serving MOTIS session's geocoder. A call that a newer
+keystroke, a pick or leaving the field supersedes is aborted by the page
+and logged at INFO as
+`MOTIS geocoder call for session <sid> ended: reason=superseded`. A real
+failure stays a WARNING with a reason word and the exception's type, e.g.
+`MOTIS geocoder unreachable for session <sid>: reason=timeout (ReadTimeout)`
+(`timeout` is the 1.5 s budget, `connect` a refused or unresolved
+connection, `network` another transport error). Neither line carries the
+typed text, nor do httpx's request lines or the uvicorn access line of
+`/api/geocode` (§5.4, "What the logs leave out on purpose").
 
 ---
 

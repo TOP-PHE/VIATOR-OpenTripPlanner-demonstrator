@@ -111,13 +111,7 @@ def test_legacy_nap_url_refuses_anything_else() -> None:
 # ─────────────────────────── #89 timezone log line ───────────────────────────
 
 
-def test_unknown_timezone_log_line_cannot_be_split(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # In a full `pytest` run the integration migration tests go first, and
-    # alembic/env.py's fileConfig() disables every logger that already
-    # exists (disable_existing_loggers defaults to True) — this one included.
-    monkeypatch.setattr(runner.log, "disabled", False)
+def test_unknown_timezone_log_line_cannot_be_split(caplog: pytest.LogCaptureFixture) -> None:
     cfg = runner.CoverageConfig()
     with caplog.at_level(logging.WARNING, logger=runner.log.name):
         zone = runner._resolve_timezone("Bad/Zone\nFAKE ERROR forged", cfg)
@@ -139,8 +133,6 @@ def test_one_line_escapes_line_breaks_and_caps() -> None:
 async def test_disabled_email_logs_the_recipient_on_one_line(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # See the timezone test above: alembic's fileConfig may have disabled it.
-    monkeypatch.setattr(email.log, "disabled", False)
     monkeypatch.setattr(email, "_read_smtp_config", lambda: {**CFG, "SMTP_HOST": ""})
     with caplog.at_level(logging.INFO, logger=email.log.name):
         await email._deliver(
