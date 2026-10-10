@@ -362,6 +362,7 @@ def test_the_next_click_skips_the_hubs_already_shown(
 ) -> None:
     hubs.rows = [_hub(i) for i in range(25)]
     shown = [f"zz-hub-{i:02d}" for i in range(10)]
+    module.near = lambda _b: _near_answer(_near("ZZ Central", "9900001", 120))
 
     body = client.post(f"{BASE}/resolve", json={"skip": shown}).json()
 
@@ -879,19 +880,20 @@ def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warn
     assert db.commits == 0
 
 
-def test_the_worst_click_makes_ten_near_calls_and_ten_searches(
+def test_a_click_whose_full_names_are_searched_looks_at_six_hubs(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
+    # Names with no shortened form: 2 calls a hub (near + full name). The
+    # budget of 15 lets a hub start while 10 calls or fewer are made: 6
+    # hubs, 12 calls (before the shortening: 10 hubs, 20 calls).
     hubs.rows = [_hub(i) for i in range(25)]
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    # 20 calls on the person's minute window (60 by default at the module):
-    # one click cannot use it up, and its confirm adds at most 10.
-    assert len(module.of("near")) == network_coverage.RESOLVE_BATCH == 10
-    assert _searched(module) == [h.name for h in hubs.rows[:10]]
-    assert network_coverage.RESOLVE_BATCH * 2 + network_coverage.CONFIRM_BATCH <= 30
-    assert body["left"] == 15
+    assert len(module.of("near")) == 6
+    assert _searched(module) == [h.name for h in hubs.rows[:6]]
+    assert body["left"] == 19
+    assert body["status"] == "ok"
 
 
 @pytest.mark.parametrize(
@@ -1313,37 +1315,38 @@ def test_the_worst_click_stays_within_its_budget_of_calls(
     body = client.post(f"{BASE}/resolve", json={}).json()
 
     # Each hub: 1 near call + 1 full name + 3 shortened names = 5 calls, so
-    # a click of 25 calls looks at 5 hubs. With its confirm (at most one code
-    # per hub looked at, at most 10), a click stays at 35 calls or fewer,
-    # well under the module's 60 a minute for one person.
+    # a click of 15 calls looks at 3 hubs. Four such clicks fit in the
+    # module's 60 a minute for one person (three of the 20-call worst click
+    # before the shortening); with its confirm (at most one code per hub
+    # looked at, at most 10) a click stays at 25 calls or fewer.
     assert network_coverage.RESOLVE_HUB_MAX_CALLS == 5
-    assert network_coverage.RESOLVE_CALL_BUDGET == 25
-    assert len(module.of("near")) == 5
-    assert len(module.of("search")) == 20
+    assert network_coverage.RESOLVE_CALL_BUDGET == 15
+    assert len(module.of("near")) == 3
+    assert len(module.of("search")) == 12
     assert len(module.requests) == network_coverage.RESOLVE_CALL_BUDGET
-    assert [p["hub_id"] for p in body["proposals"]] == [f"zz-hub-{i:02d}" for i in range(5)]
+    assert [p["hub_id"] for p in body["proposals"]] == [f"zz-hub-{i:02d}" for i in range(3)]
     assert body["status"] == "ok"
-    assert body["left"] == 20
-    worst = network_coverage.RESOLVE_CALL_BUDGET + network_coverage.CONFIRM_BATCH
-    assert worst <= 35
+    assert body["left"] == 22
+    assert 60 // network_coverage.RESOLVE_CALL_BUDGET == 4
+    assert network_coverage.RESOLVE_CALL_BUDGET + network_coverage.CONFIRM_BATCH <= 25
 
 
 def test_a_click_looks_at_a_hub_only_while_its_worst_case_fits_the_budget(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    # Four hubs at 5 calls (20), then hubs whose near call finds a station
-    # (1 call each): the fifth fits (20 + 5 <= 25), the sixth would not
-    # (21 + 5 > 25), although it would only cost one call.
-    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(4)] + [
-        _hub(i) for i in range(4, 8)
+    # Two hubs at 5 calls (10), then hubs whose near call finds a station
+    # (1 call each): the third fits (10 + 5 <= 15), the fourth would not
+    # (11 + 5 > 15), although it would only cost one call.
+    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(2)] + [
+        _hub(i) for i in range(2, 6)
     ]
-    nears = iter([_near_answer()] * 4 + [_near_answer(_near("ZZ One", "9900261", 15))] * 4)
+    nears = iter([_near_answer()] * 2 + [_near_answer(_near("ZZ One", "9900261", 15))] * 4)
     module.near = lambda _b: next(nears)
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    assert len(module.requests) == 21
-    assert len(body["proposals"]) == 5
+    assert len(module.requests) == 11
+    assert len(body["proposals"]) == 3
     assert body["left"] == 3
 
 

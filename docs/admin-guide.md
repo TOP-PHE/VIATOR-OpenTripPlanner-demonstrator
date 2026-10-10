@@ -2630,10 +2630,13 @@ one person, 500 a day for everybody); each name search (the full name, and
 each shortened form) is one more call on your own limits (by default 60 a
 minute and 2,000 a day), not on this call's. One hub thus costs 1 to 5
 calls (1 position + 1 full name + 3 shortened names). A click stops looking
-at further hubs before its worst case could pass 25 calls: it looks at 10
-hubs when their positions find stations (10 calls), and at 5 when every
-search finds nothing (25 calls). With its **Save ticked codes** (one call a
-code) a click is at most 35 calls, well under your 60 a minute. At a
+at further hubs before its worst case could pass 15 calls: it looks at 10
+hubs when their positions find stations (10 calls), 6 when their full names
+do (12 calls), and 3 when every search finds nothing (15 calls). So four
+**Propose** clicks in a row fit in your 60 a minute even at their worst
+(before the shortening a click could make 20 calls, so three filled the
+minute); a **Check** click is still up to 20 calls. With its **Save ticked
+codes** (one call a code) a click is at most 25 calls. At a
 limit the click stops and keeps what it found, without trying the
 remaining shortened forms, and says how long to wait
 (in seconds, minutes or hours). When the limit is one of this call's own, only **Propose

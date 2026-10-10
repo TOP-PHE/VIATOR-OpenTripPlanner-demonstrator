@@ -121,23 +121,24 @@ _HUB_NOT_FOUND = "Hub not found"
 # 2,000 a day for one person, MSMM app/settings.py internal_user_per_minute
 # and internal_user_per_day).
 # Ten hubs at 5 calls would be 50 calls, 60 with the confirm: the whole
-# minute. So a click also has a budget of RESOLVE_CALL_BUDGET = 25 calls: it
+# minute. So a click also has a budget of RESOLVE_CALL_BUDGET = 15 calls: it
 # looks at the next hub only while the calls made so far plus that hub's
-# worst case (5) stay within 25. Worst case of one resolve click: 25 calls
-# (5 hubs, each at 1 near + 1 full name + 3 shortened names); a click whose
-# near calls find stations still looks at 10 hubs for 10 calls. With its
-# confirm (at most one code per hub looked at, so at most 10): 25 + 10 = 35
-# at the very worst; a check click 20. No single click can use up the 60 a
-# minute (at least 25 stay for his typing). The module's per-person minute
-# limit must be 25 or more, or a worst-case resolve click is refused before
-# its end. A near call also counts on the module's own near quota (decision
+# worst case (5) stay within 15. Worst case of one resolve click: 15 calls
+# (3 hubs, each at 1 near + 1 full name + 3 shortened names); a click whose
+# near calls find stations still looks at 10 hubs for 10 calls, one whose
+# full names find them 6 hubs for 12 calls. Before the shortening the worst
+# click was 20 calls (10 near + 10 searches): 3 such clicks in a row filled
+# the 60 a minute (an administrator clicking Propose and Check in a row met
+# the limit in production). Now 4 worst resolve clicks fit in a minute
+# (4 x 15 = 60), a check click stays 20 (3 a minute). With its confirm (at
+# most one code per hub looked at, so at most 10): 15 + 10 = 25 at the very
+# worst. The module's per-person minute limit must be 20 or more (a check
+# click). A near call also counts on the module's own near quota (decision
 # 62 of the module: 30 a minute and 200 a day for one person, 500 a day for
 # everybody; a search does not): at most 10 a click stays under the 30 a
-# minute, so three clicks in one minute pass and a fourth is refused with a
-# 429 and its Retry-After. At 25 calls a click the day of 2,000 allows 80
-# clicks.
+# minute. At 15 calls a click the day of 2,000 allows 133 clicks.
 RESOLVE_BATCH = 10
-RESOLVE_CALL_BUDGET = 25
+RESOLVE_CALL_BUDGET = 15
 CONFIRM_BATCH = 10
 CHECK_BATCH = 20
 # The radius of a near call: the module proposes its stations within this
@@ -1171,8 +1172,10 @@ def _shortened_names(query: str) -> list[str]:
     longest first: the name up to the end of each word but the last, down
     to its first word, at most NAME_SHORTEN_MAX of them. A form the search
     would refuse (under 3 characters) is skipped, and so is one the module
-    would read as a query already made (the full name included)."""
-    made = {_query_key(query)}
+    would read as the full name (the same words: a name ending with a
+    hyphen or an apostrophe). Two shortened forms never hold the same
+    words, so the full name is the only query one could repeat."""
+    full = _query_key(query)
     shortened: list[str] = []
     ends = [word.end() for word in _NAME_WORD.finditer(query)]
     for end in reversed(ends):
@@ -1182,9 +1185,7 @@ def _shortened_names(query: str) -> list[str]:
             text = station_suggest.normalise_query(query[:end])
         except ValueError:
             continue
-        key = _query_key(text)
-        if key not in made:
-            made.add(key)
+        if _query_key(text) != full:
             shortened.append(text)
     return shortened
 
