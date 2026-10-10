@@ -951,8 +951,58 @@ def test_another_name_search_failure_stops_the_click_without_a_pause(
     assert body["near_limited"] is False
     # An admin search never pauses the typeahead, and never logs the name.
     assert not station_module.paused()
-    assert not any("Secret" in r.getMessage() for r in caplog.records)
+    _assert_logs_hold_none_of(caplog, "Secret", *_position_texts(hubs.rows[0]))
     assert db.commits == 0
+
+
+def _position_texts(hub: NetworkCoverageHub) -> list[str]:
+    return [str(hub.lat), str(hub.lon)]
+
+
+def _assert_logs_hold_none_of(caplog: pytest.LogCaptureFixture, *texts: str) -> None:
+    """No log record (message, arguments or exception) holds any of `texts`."""
+    for record in caplog.records:
+        logged = record.getMessage() + repr(record.args) + str(record.exc_info or "")
+        for text in texts:
+            assert text not in logged, record.name
+
+
+_SECRET_LAT = -47.987654
+_SECRET_LON = -122.876543
+
+
+@pytest.mark.parametrize("path", ["success", "near-429", "search-429"])
+def test_the_resolve_logs_hold_no_name_no_position_and_no_code(
+    client: TestClient, hubs: Hubs, module: Module, caplog: pytest.LogCaptureFixture, path: str
+) -> None:
+    hub = _hub(1, name="ZZ Hidden Hubname", lat=_SECRET_LAT, lon=_SECRET_LON)
+    hubs.rows = [hub]
+    station = _station("ZZ Hidden Station", "9900987", _SECRET_LAT + 0.01, _SECRET_LON)
+    if path == "near-429":
+        module.near = lambda _b: _limited("17", "near_user_minute")
+    elif path == "search-429":
+        module.search = lambda _q: _limited("17", "user_minute")
+    else:
+        _found(module, station)
+
+    with caplog.at_level("DEBUG"):
+        body = client.post(f"{BASE}/resolve", json={}).json()
+
+    expected = {"success": "ok", "near-429": "limited", "search-429": "limited"}[path]
+    assert body["status"] == expected
+    if path == "success":
+        assert body["proposals"][0]["candidates"][0]["uic"] == "9900987"
+    assert caplog.records  # the calls were logged (httpx), without the values
+    _assert_logs_hold_none_of(
+        caplog,
+        "Hidden",
+        "9900987",
+        str(_SECRET_LAT),
+        str(_SECRET_LON),
+        str(_SECRET_LAT + 0.01),
+        "47.98",
+        "122.87",
+    )
 
 
 def test_the_distance_is_an_unrounded_haversine() -> None:
