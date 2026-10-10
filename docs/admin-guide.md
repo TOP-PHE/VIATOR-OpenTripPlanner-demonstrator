@@ -2558,6 +2558,31 @@ values back over what an import wrote since, with each row's own archived
 the archive. A restored parent that names a station deleted since would make
 the downgrade fail and roll back whole; no code deletes a station.
 
+### 11.2 Station codes of the coverage hubs
+
+On the network coverage page, **Manage hubs** shows two buttons when VIATOR
+uses the module (platform administrators only):
+
+- **Propose station codes** looks at up to 10 hubs without a code a click,
+  in the matrix order. For each hub it asks the module for its stations
+  **within 300 m of the hub's position** (latitude and longitude), never by
+  the hub's name: the module's names often differ from the hubs' own. One
+  station is ticked for you; two to five are a choice ("Leave it" chosen at
+  first); none means no station of the module stands within 300 m: check the
+  hub's position, or type the code in the hub form. A hub whose stored
+  position is not a usable number shows "no usable position" and is not
+  sent. Nothing is stored before **Save ticked codes**, which checks the
+  codes with the module first.
+- **Check station codes** re-reads the stored codes of up to 20 hubs a click.
+
+Each hub looked at is one call on your own limits at the module, and also on
+the module's limits for this call (by default 30 a minute and 200 a day for
+one person, 500 a day for everybody). At a limit the click stops, keeps what
+it found, and the buttons wait for the time the module gives. A full limit
+of this call refuses only this button, not your searches. This needs a module that answers this call
+(MSMM v0.3.4 or later); an older one makes the button say that the module
+did not answer.
+
 ---
 
 ## Index of related guides
