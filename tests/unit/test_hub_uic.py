@@ -14,10 +14,12 @@ token drawn at run time.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
 import math
+import os
 import re
 import secrets
 import shutil
@@ -48,9 +50,12 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 def _hub(index: int, *, uic: str | None = None, origin: str | None = None, **extra: Any):
+    # Two words, the first too short to be searched alone: the name has no
+    # shortened form, so a test makes the shortening happen only by naming
+    # its hub otherwise.
     values: dict[str, Any] = {
         "id": f"zz-hub-{index:02d}",
-        "name": f"ZZ Hub {index:02d}",
+        "name": f"ZZ Hub{index:02d}",
         "short": f"ZZ{index:02d}",
         "country": "ZZ",
         "tier": "main",
@@ -239,6 +244,7 @@ def test_one_station_near_the_hub_is_proposed_and_nothing_is_written(
             "distance_m": 120,
             "found_by": "position",
             "warning": None,
+            "shortened_name": None,
         }
     ]
     assert proposal["name_searched"] is False
@@ -300,6 +306,7 @@ def test_no_station_near_the_hub_nor_by_name_is_to_pick_with_none(
         "candidates": [],
         "name_searched": True,
         "far_dropped": 0,
+        "shortened_searches": 0,
     }
     assert len(module.of("near")) == 1
     assert _searched(module) == [hub.name]
@@ -357,6 +364,7 @@ def test_the_next_click_skips_the_hubs_already_shown(
 ) -> None:
     hubs.rows = [_hub(i) for i in range(25)]
     shown = [f"zz-hub-{i:02d}" for i in range(10)]
+    module.near = lambda _b: _near_answer(_near("ZZ Central", "9900001", 120))
 
     body = client.post(f"{BASE}/resolve", json={"skip": shown}).json()
 
@@ -547,7 +555,7 @@ def test_a_hub_without_a_usable_position_gets_no_near_call_but_a_name_search(
     assert body["proposals"][0]["candidates"] == []
     assert body["proposals"][0]["name_searched"] is True
     assert _near_positions(module) == [(hubs.rows[1].lat, hubs.rows[1].lon)]
-    assert _searched(module) == ["ZZ Hub 01", "ZZ Hub 02"]
+    assert _searched(module) == ["ZZ Hub01", "ZZ Hub02"]
     assert body["left"] == 0
     assert db.commits == 0
 
@@ -712,10 +720,10 @@ def test_the_300_m_rule_compares_the_unrounded_distance(
     monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
     row = _north("ZZ Edge", "9900072", 0.0027)
 
-    proposal = network_coverage._name_proposal(_sea_hub(), [row], located=True)
+    candidates, far = network_coverage._name_candidates(_sea_hub(), [row], located=True)
 
-    assert proposal.state == "to_pick"  # never proposed, even alone
-    (candidate,) = proposal.candidates
+    assert far == set()
+    (candidate,) = candidates
     assert (candidate.warning is not None) is warned
     assert candidate.distance_m == shown
 
@@ -750,12 +758,12 @@ def test_the_50_km_rule_drops_only_what_is_farther(
     assert network_coverage.NAME_FALLBACK_MAX_DISTANCE_M == 50_000
     monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
 
-    proposal = network_coverage._name_proposal(
+    candidates, far = network_coverage._name_candidates(
         _sea_hub(), [_north("ZZ Edge", "9900074", 0.45)], located=True
     )
 
-    assert proposal.far_dropped == (1 if dropped else 0)
-    assert len(proposal.candidates) == (0 if dropped else 1)
+    assert far == ({"9900074"} if dropped else set())
+    assert len(candidates) == (0 if dropped else 1)
 
 
 def test_a_name_result_without_a_usable_position_is_shown_last_without_distance(
@@ -857,7 +865,7 @@ def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warn
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
     assert module.of("near") == []
-    assert _searched(module) == ["ZZ Hub 01"]
+    assert _searched(module) == ["ZZ Hub01"]
     assert proposal["state"] == "no_position"
     assert proposal["name_searched"] is True
     # No distance can be told: none dropped, each in the module's order,
@@ -874,19 +882,22 @@ def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warn
     assert db.commits == 0
 
 
-def test_the_worst_click_makes_ten_near_calls_and_ten_searches(
+def test_a_click_whose_full_names_are_searched_looks_at_seven_hubs(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
+    # Names with no shortened form: at most 2 calls a hub (near + full
+    # name), the worst case reserved for each. The budget of 15 lets a hub
+    # start while 13 calls or fewer are made: 7 hubs, 14 calls (before the
+    # shortening: 10 hubs, 20 calls).
     hubs.rows = [_hub(i) for i in range(25)]
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    # 20 calls on the person's minute window (60 by default at the module):
-    # one click cannot use it up, and its confirm adds at most 10.
-    assert len(module.of("near")) == network_coverage.RESOLVE_BATCH == 10
-    assert _searched(module) == [h.name for h in hubs.rows[:10]]
-    assert network_coverage.RESOLVE_BATCH * 2 + network_coverage.CONFIRM_BATCH <= 30
-    assert body["left"] == 15
+    assert len(module.of("near")) == 7
+    assert _searched(module) == [h.name for h in hubs.rows[:7]]
+    assert body["left"] == 18
+    assert body["status"] == "ok"
+    assert body["call_budget_reached"] is True
 
 
 @pytest.mark.parametrize(
@@ -971,31 +982,47 @@ _SECRET_LAT = -47.987654
 _SECRET_LON = -122.876543
 
 
-@pytest.mark.parametrize("path", ["success", "near-429", "search-429"])
+@pytest.mark.parametrize(
+    "path", ["success", "near-429", "search-429", "shortened", "shortened-429", "shortened-none"]
+)
 def test_the_resolve_logs_hold_no_name_no_position_and_no_code(
     client: TestClient, hubs: Hubs, module: Module, caplog: pytest.LogCaptureFixture, path: str
 ) -> None:
-    hub = _hub(1, name="ZZ Hidden Hubname", lat=_SECRET_LAT, lon=_SECRET_LON)
+    hub = _hub(1, name="Zzhidden Hubname-Zzsecret", lat=_SECRET_LAT, lon=_SECRET_LON)
     hubs.rows = [hub]
     station = _station("ZZ Hidden Station", "9900987", _SECRET_LAT + 0.01, _SECRET_LON)
     if path == "near-429":
         module.near = lambda _b: _limited("17", "near_user_minute")
     elif path == "search-429":
         module.search = lambda _q: _limited("17", "user_minute")
+    elif path == "shortened":
+        _answers(module, {"Zzhidden": [station]})
+    elif path == "shortened-429":
+        module.search = lambda q: (
+            _limited("17", "user_minute")
+            if q == "Zzhidden"
+            else httpx.Response(200, json={"stations": []})
+        )
+    elif path == "shortened-none":
+        _answers(module, {})
     else:
         _found(module, station)
 
     with caplog.at_level("DEBUG"):
         body = client.post(f"{BASE}/resolve", json={}).json()
 
-    expected = {"success": "ok", "near-429": "limited", "search-429": "limited"}[path]
-    assert body["status"] == expected
-    if path == "success":
+    assert body["status"] == ("limited" if path.endswith("429") else "ok")
+    if path in ("success", "shortened"):
         assert body["proposals"][0]["candidates"][0]["uic"] == "9900987"
+    if path.startswith("shortened"):
+        assert len(module.of("search")) >= 3
     assert caplog.records  # the calls were logged (httpx), without the values
     _assert_logs_hold_none_of(
         caplog,
         "Hidden",
+        "Zzhidden",
+        "Hubname",
+        "Zzsecret",
         "9900987",
         str(_SECRET_LAT),
         str(_SECRET_LON),
@@ -1024,6 +1051,450 @@ def test_the_distance_is_an_unrounded_haversine() -> None:
 )
 def test_the_distance_text_of_a_warning(metres: int, text: str) -> None:
     assert network_coverage._distance_text(metres) == text
+
+
+# ───────────────────── resolve: the name shortening ─────────────────────
+#
+# When the full name keeps no candidate, the name is searched again without
+# its last word, then its last two, down to its first word (owner decision
+# of 10 Oct), at most three times. Invented names whose words are split at
+# spaces, hyphens and apostrophes.
+_LONG_NAME = "Zzville Zzsaint-Zzcharles"
+
+
+def _answers(module: Module, by_query: dict[str, list[dict[str, Any]]]) -> None:
+    """The search answers each text from `by_query`, nothing for any other."""
+    module.search = lambda q: httpx.Response(200, json={"stations": by_query.get(q, [])})
+
+
+def _shortened_warning(text: str, distance: str) -> str:
+    return (
+        f"Found by the shortened name «{text}», a looser match, {distance} from the "
+        "hub's position — check before saving."
+    )
+
+
+def test_a_full_name_that_finds_a_station_is_not_shortened(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(name=_LONG_NAME)]
+    _answers(module, {_LONG_NAME: [_north("ZZ Found", "9900201", 0.0108)]})
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [_LONG_NAME]
+    assert proposal["shortened_searches"] == 0
+    (candidate,) = proposal["candidates"]
+    assert candidate["shortened_name"] is None
+    assert candidate["warning"] == (
+        "Found by name, 1.2 km from the hub's position — check before saving."
+    )
+
+
+def test_a_full_name_that_keeps_nothing_is_shortened_word_by_word(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module, admin: uuid.UUID
+) -> None:
+    hub = _sea_hub(name=_LONG_NAME)
+    hubs.rows = [hub]
+    _answers(
+        module,
+        {
+            "Zzville": [
+                _north("ZZ Faraway", "9900211", 0.5),  # about 56 km: dropped
+                _station("ZZ Lost", "9900212", 95.0, _SEA_LON),  # no usable position
+                _north("ZZ Beyond", "9900213", 0.0108),  # about 1.2 km
+                _north("ZZ Close", "9900214", 0.0018),  # about 200 m
+            ]
+        },
+    )
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # The near call, the full name, then the name without its last word
+    # (split at the hyphen), then its first word alone, which keeps some.
+    assert [r.url.path.rsplit("/", 1)[1] for r in module.requests] == [
+        "near",
+        "search",
+        "search",
+        "search",
+    ]
+    assert _searched(module) == [_LONG_NAME, "Zzville Zzsaint", "Zzville"]
+    assert all(r.headers["x-viator-user-id"] == str(admin) for r in module.of("search"))
+    (proposal,) = body["proposals"]
+    assert body["status"] == "ok"
+    assert proposal["state"] == "to_pick"  # never proposed
+    assert proposal["name_searched"] is True
+    assert proposal["shortened_searches"] == 2
+    assert proposal["far_dropped"] == 1
+    close, beyond, lost = proposal["candidates"]
+    assert [c["uic"] for c in (close, beyond, lost)] == ["9900214", "9900213", "9900212"]
+    for candidate in (close, beyond, lost):
+        assert candidate["found_by"] == "name"
+        assert candidate["shortened_name"] == "Zzville"
+    # Within 300 m: no warning (the page still says which text found it).
+    assert close["warning"] is None
+    assert beyond["warning"] == _shortened_warning("Zzville", "1.2 km")
+    assert lost["distance_m"] is None
+    assert lost["warning"] == (
+        "Found by the shortened name «Zzville», a looser match; the station module "
+        "gives no usable position for it, so its distance from the hub is unknown "
+        "— check before saving."
+    )
+    assert db.commits == 0
+    assert hub.uic is None
+    assert module.of("lookup") == []
+
+
+def test_the_shortening_stops_at_the_first_form_that_keeps_a_candidate(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(name="Zzaa Zzbb Zzcc Zzdd Zzee")]
+    _answers(module, {"Zzaa Zzbb Zzcc": [_north("ZZ Middle", "9900221", 0.0045)]})
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [
+        "Zzaa Zzbb Zzcc Zzdd Zzee",
+        "Zzaa Zzbb Zzcc Zzdd",
+        "Zzaa Zzbb Zzcc",
+    ]
+    assert proposal["shortened_searches"] == 2
+    (candidate,) = proposal["candidates"]
+    assert candidate["warning"] == _shortened_warning("Zzaa Zzbb Zzcc", "501 m")
+
+
+def test_a_form_that_finds_only_stations_beyond_50_km_does_not_stop_the_shortening(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(name=_LONG_NAME), _sea_hub(2, name=_LONG_NAME)]
+    namesake = _north("ZZ Namesake", "9900231", 0.5)
+    other = _north("ZZ Other Namesake", "9900232", -0.6)
+    answers = iter(
+        [
+            # The first hub: far stations only, then one within reach.
+            [namesake],
+            [namesake, other],
+            [namesake, _north("ZZ Kept", "9900233", 0.0108)],
+            # The second hub: far stations only, every time.
+            [namesake],
+            [other, namesake],
+            [namesake],
+        ]
+    )
+    module.search = lambda _q: httpx.Response(200, json={"stations": next(answers)})
+
+    first, second = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [_LONG_NAME, "Zzville Zzsaint", "Zzville"] * 2
+    assert [c["uic"] for c in first["candidates"]] == ["9900233"]
+    assert first["candidates"][0]["shortened_name"] == "Zzville"
+    # The far stations of every search of the hub, each code once.
+    assert first["far_dropped"] == 2
+    assert second["candidates"] == []
+    assert second["far_dropped"] == 2
+    assert second["shortened_searches"] == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "forms"),
+    [
+        pytest.param(_LONG_NAME, ["Zzville Zzsaint", "Zzville"], id="space-and-hyphen"),
+        # A form ending with a one-letter word (an elision) is skipped.
+        pytest.param("Zzville-d'Zzasq", ["Zzville"], id="apostrophe-elision"),
+        pytest.param("Zzville d\u2019Zzasq", ["Zzville"], id="typographic-apostrophe"),
+        pytest.param("Zzab c Zzdef", ["Zzab"], id="one-letter-word-inside"),
+        pytest.param("Zzl\u2018Zzisle Zzx", ["Zzl\u2018Zzisle", "Zzl"], id="left-quote"),
+        pytest.param("Zzl\u02bcZzisle Zzx", ["Zzl\u02bcZzisle", "Zzl"], id="modifier-apostrophe"),
+        pytest.param("Zzab`Zzcd Zzef", ["Zzab`Zzcd", "Zzab"], id="backtick"),
+        pytest.param("Zzab\u00b4Zzcd", ["Zzab"], id="acute"),
+        pytest.param("Zzville \u2013 Zzsaint", ["Zzville"], id="en-dash-spaced"),
+        pytest.param("Zzville\u2013Zzsaint", ["Zzville"], id="en-dash-joined"),
+        pytest.param(
+            "Zz \u2013 Zzville Zzx Zzy",
+            ["Zz \u2013 Zzville Zzx", "Zz \u2013 Zzville"],
+            id="dash-after-a-short-word",
+        ),
+        pytest.param("Zzville", [], id="one-word"),
+        # Fewer than 3 letters or digits: never sent.
+        pytest.param("ZZ Hub01", [], id="first-word-too-short"),
+        pytest.param("Z Zzhub Zzend", ["Z Zzhub"], id="single-letter-skipped"),
+        pytest.param("Zz ** Zzville", [], id="collapses-below-three"),
+        # The same words as the full name, for the module: never made.
+        pytest.param("Zzville Zzsaint-", ["Zzville"], id="trailing-hyphen"),
+        pytest.param("Zzville Zzsaint \u2013", ["Zzville"], id="trailing-en-dash"),
+        pytest.param("Zzville - Zzsaint", ["Zzville"], id="spaced-hyphen"),
+        pytest.param("Zzab Zzcd'", ["Zzab"], id="trailing-apostrophe"),
+        # At most three forms, the longest.
+        pytest.param(
+            "Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6",
+            ["Zza1 Zzb2 Zzc3 Zzd4 Zze5", "Zza1 Zzb2 Zzc3 Zzd4", "Zza1 Zzb2 Zzc3"],
+            id="at-most-three",
+        ),
+    ],
+)
+def test_the_shortened_forms_of_a_name(name: str, forms: list[str]) -> None:
+    assert network_coverage.NAME_SHORTEN_MAX == 3
+    query = network_coverage.station_suggest.normalise_query(name)
+    assert network_coverage._shortened_names(query) == forms
+
+
+# The module's separators (MSMM app/master/station_search.py, `_HYPHENS` and
+# `_APOSTROPHES`, origin/main of 10 Oct), written out here a second time.
+_MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
+_MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
+
+
+def _module_separators(path: Path) -> tuple[str, str]:
+    """`_HYPHENS` and `_APOSTROPHES` as the module's source writes them."""
+    text = path.read_text(encoding="utf-8")
+    found = {}
+    for name in ("_HYPHENS", "_APOSTROPHES"):
+        match = re.search(rf"^{name} = (\"[^\"]*\")$", text, re.M)
+        assert match, name
+        found[name] = ast.literal_eval(match.group(1))
+    return found["_HYPHENS"], found["_APOSTROPHES"]
+
+
+def test_the_separators_mirror_the_modules() -> None:
+    """VIATOR splits words where the module's search does. VIATOR's CI
+    cannot read the module's private code: the copy is pinned here, and
+    compared with the module's source itself when MSMM_STATION_SEARCH names
+    a checkout's app/master/station_search.py (as the review did)."""
+    assert network_coverage.MODULE_HYPHENS == _MODULE_HYPHENS
+    assert network_coverage.MODULE_APOSTROPHES == _MODULE_APOSTROPHES
+    source = os.environ.get("MSMM_STATION_SEARCH")
+    if source:
+        hyphens, apostrophes = _module_separators(Path(source))
+        assert hyphens == network_coverage.MODULE_HYPHENS
+        assert apostrophes == network_coverage.MODULE_APOSTROPHES
+    # Each one splits two words, and white space too.
+    for separator in _MODULE_HYPHENS + _MODULE_APOSTROPHES + "\u00a0\u202f\u3000":
+        assert network_coverage._shortened_names(f"Zzab{separator}Zzcd") == ["Zzab"], separator
+
+
+def test_a_name_with_fewer_than_three_letters_is_not_searched(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # Four characters for the length rule, but two letters once the module
+    # makes the dash a space: the module would answer a 422.
+    hubs.rows = [_hub(1, name="Zz \u2013")]
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert module.of("search") == []
+    assert proposal["name_searched"] is False
+    assert proposal["shortened_searches"] == 0
+
+
+_TOO_LONG = " ".join(f"Zzword{i:02d}" for i in range(13))  # 116 characters
+
+
+def test_a_name_too_long_to_search_whole_is_still_shortened(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    eleven = " ".join(_TOO_LONG.split()[:11])  # 98 characters
+    ten = " ".join(_TOO_LONG.split()[:10])
+    hubs.rows = [_sea_hub(name=_TOO_LONG), _hub(2, name=_TOO_LONG, lat=math.nan)]
+    _answers(module, {ten: [_north("ZZ Long", "9900271", 0.0018)]})
+
+    first, second = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    # 12 words make 107 characters: refused; then 11 words, then 10, which
+    # finds. The hub without position is not searched at all.
+    assert _searched(module) == [eleven, ten]
+    assert first["name_searched"] is False
+    assert first["shortened_searches"] == 2
+    assert first["candidates"][0]["shortened_name"] == ten
+    assert second["name_searched"] is False
+    assert second["shortened_searches"] == 0
+    assert network_coverage._hub_worst_calls(hubs.rows[0]) == 4
+
+
+def test_a_text_the_module_refuses_is_a_form_that_found_nothing(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    refused = httpx.Response(422, json={"detail": "ZZ", "code": "zz"})
+    hubs.rows = [_sea_hub(name=_LONG_NAME)]
+    module.search = lambda q: (
+        httpx.Response(200, json={"stations": [_north("ZZ Found", "9900281", 0.0018)]})
+        if q == "Zzville"
+        else refused
+    )
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # The full name and the first form are refused: the next form is tried.
+    assert _searched(module) == [_LONG_NAME, "Zzville Zzsaint", "Zzville"]
+    assert body["status"] == "ok"
+    (proposal,) = body["proposals"]
+    assert proposal["candidates"][0]["uic"] == "9900281"
+    assert proposal["name_searched"] is True
+    assert proposal["shortened_searches"] == 2
+    assert not station_module.paused()
+    assert db.commits == 0
+
+
+def test_a_hub_whose_every_search_is_refused_never_blocks_the_next_hubs(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(1, name=_LONG_NAME), _sea_hub(2)]
+    module.search = lambda q: (
+        httpx.Response(422, json={"detail": "ZZ", "code": "zz"})
+        if q.startswith("Zzville")
+        else httpx.Response(200, json={"stations": [_north("ZZ Next", "9900291", 0.0018)]})
+    )
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # The click goes on: the first hub is shown with nothing, so the next
+    # click skips it, and the second hub is looked at.
+    assert body["status"] == "ok"
+    first, second = body["proposals"]
+    assert first["candidates"] == []
+    assert first["shortened_searches"] == 2
+    assert second["candidates"][0]["uic"] == "9900291"
+    assert body["left"] == 0
+
+
+def test_the_shortening_makes_at_most_three_more_searches(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(name="Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6")]
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [
+        "Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6",
+        "Zza1 Zzb2 Zzc3 Zzd4 Zze5",
+        "Zza1 Zzb2 Zzc3 Zzd4",
+        "Zza1 Zzb2 Zzc3",
+    ]
+    assert proposal["candidates"] == []
+    assert proposal["name_searched"] is True
+    assert proposal["shortened_searches"] == 3
+
+
+def test_a_hub_without_a_usable_position_is_not_searched_by_a_shortened_name(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1, name=_LONG_NAME, lat=math.nan)]
+    _answers(module, {"Zzville": [_north("ZZ Guess", "9900241", 0.0)]})
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert module.of("near") == []
+    assert _searched(module) == [_LONG_NAME]
+    assert proposal["state"] == "no_position"
+    assert proposal["candidates"] == []
+    assert proposal["shortened_searches"] == 0
+
+
+@pytest.mark.parametrize(
+    ("answer", "status", "message"),
+    [
+        (_limited("29", "user_minute"), "limited", "try again in 29 seconds"),
+        (httpx.Response(503, json={"detail": "ZZ", "code": "zz"}), "unavailable", "did not answer"),
+    ],
+    ids=["429", "503"],
+)
+def test_a_failure_during_the_shortening_stops_the_click_and_keeps_what_was_found(
+    client: TestClient,
+    db: FakeDb,
+    hubs: Hubs,
+    module: Module,
+    caplog: pytest.LogCaptureFixture,
+    answer: httpx.Response,
+    status: str,
+    message: str,
+) -> None:
+    hubs.rows = [_sea_hub(0), _sea_hub(1, name="Zzsecret Zzhidden-Zzname"), _sea_hub(2)]
+    nears = iter([_near_answer(_near("ZZ One", "9900251", 15)), _near_answer(), _near_answer()])
+    module.near = lambda _b: next(nears)
+    module.search = lambda q: (
+        answer if q == "Zzsecret Zzhidden" else httpx.Response(200, json={"stations": []})
+    )
+
+    with caplog.at_level("DEBUG"):
+        body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # No retry, no shorter form, no further hub.
+    assert _searched(module) == ["Zzsecret Zzhidden-Zzname", "Zzsecret Zzhidden"]
+    assert len(module.of("near")) == 2
+    assert body["status"] == status
+    assert message in body["message"]
+    assert body["retry_after"] == (29 if status == "limited" else None)
+    assert body["near_limited"] is False
+    assert [p["hub_id"] for p in body["proposals"]] == ["zz-hub-00"]
+    assert body["left"] == 2
+    assert not station_module.paused()
+    assert db.commits == 0
+    _assert_logs_hold_none_of(caplog, "Zzsecret", "Zzhidden", "Zzname")
+
+
+def test_the_worst_click_stays_within_its_budget_of_calls(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(25)]
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # Each hub: 1 near call + 1 full name + 3 shortened names = 5 calls, so
+    # a click of 15 calls looks at 3 hubs. Four such clicks fit in the
+    # module's 60 a minute for one person (three of the 20-call worst click
+    # before the shortening); with its confirm (at most one code per hub
+    # looked at, at most 10) a click stays at 25 calls or fewer.
+    assert network_coverage.RESOLVE_HUB_MAX_CALLS == 5
+    assert network_coverage.RESOLVE_CALL_BUDGET == 15
+    assert len(module.of("near")) == 3
+    assert len(module.of("search")) == 12
+    assert len(module.requests) == network_coverage.RESOLVE_CALL_BUDGET
+    assert [p["hub_id"] for p in body["proposals"]] == [f"zz-hub-{i:02d}" for i in range(3)]
+    assert body["status"] == "ok"
+    assert body["left"] == 22
+    assert 60 // network_coverage.RESOLVE_CALL_BUDGET == 4
+    assert network_coverage.RESOLVE_CALL_BUDGET + network_coverage.CONFIRM_BATCH <= 25
+
+
+def test_a_click_looks_at_a_hub_only_while_its_worst_case_fits_the_budget(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # Two hubs at 5 calls (10), then hubs whose near call finds a station
+    # (1 call each, but a worst case of 5): the third fits (10 + 5 <= 15),
+    # the fourth would not (11 + 5 > 15), although it would only cost one.
+    names = [f"Zza{i} Zzb Zzc Zzd Zze" for i in range(6)]
+    hubs.rows = [_hub(i, name=names[i]) for i in range(6)]
+    nears = iter([_near_answer()] * 2 + [_near_answer(_near("ZZ One", "9900261", 15))] * 4)
+    module.near = lambda _b: next(nears)
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert len(module.requests) == 11
+    assert len(body["proposals"]) == 3
+    assert body["left"] == 3
+    assert body["call_budget_reached"] is True
+
+
+def test_a_hub_without_position_reserves_only_its_one_search(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # 10 calls for two hubs, 1 for a hub found by position (worst case 5),
+    # then four hubs without a usable position: each can only make its full
+    # name's search, so each fits (12, 13, 14, 15 <= 15).
+    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(3)] + [
+        _hub(i, lat=math.nan) for i in range(3, 7)
+    ]
+    nears = iter([_near_answer(), _near_answer(), _near_answer(_near("ZZ One", "9900262", 15))])
+    module.near = lambda _b: next(nears)
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert network_coverage._hub_worst_calls(hubs.rows[3]) == 1
+    assert network_coverage._hub_worst_calls(hubs.rows[0]) == 5
+    assert network_coverage._hub_worst_calls(_hub(1)) == 2
+    assert len(module.requests) == 15
+    assert len(body["proposals"]) == 7
+    assert body["left"] == 0
+    assert body["call_budget_reached"] is False
 
 
 # ───────────────────────────── confirm ─────────────────────────────
@@ -1228,8 +1699,8 @@ def test_check_sends_each_code_once_and_applies_the_answer_to_both_hubs(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     hubs.rows = [
-        _hub(1, uic="9900001", origin="msmm"),
-        _hub(2, uic="9900001", origin="manual"),
+        _hub(1, uic="9900001", origin="msmm", name="ZZ Hub 01"),
+        _hub(2, uic="9900001", origin="manual", name="ZZ Hub 02"),
         _hub(3, uic="9900003", origin="msmm"),
     ]
     module.served = {"9900001": _station("ZZ Hub 01", "9900001", 45.0, 6.0)}
@@ -1249,7 +1720,7 @@ def test_check_sends_each_code_once_and_applies_the_answer_to_both_hubs(
 def test_check_shows_a_name_that_differs_and_the_parent_and_writes_nothing(
     client: TestClient, db: FakeDb, hubs: Hubs, module: Module
 ) -> None:
-    same = _hub(1, uic="9900001", origin="msmm")
+    same = _hub(1, uic="9900001", origin="msmm", name="ZZ Hub 01")
     other = _hub(2, uic="9900002", origin="msmm")
     hubs.rows = [same, other]
     module.served = {
@@ -1582,7 +2053,9 @@ def test_the_panel_speaks_of_positions_first_then_names(template_text: str) -> N
     assert "within 300 m of this hub\\'s position" in script
     assert "found by its name instead: check each one before saving" in script
     # Each candidate says where it comes from, as text.
-    assert "candidate.found_by === 'name' ? 'by name' : 'by position'" in script
+    assert "candidate.found_by === 'name' ? hubNameOrigin(candidate) : 'by position'" in script
+    # A candidate found by a shortened name quotes that text.
+    assert "`by the shortened name «${candidate.shortened_name}»` : 'by name'" in script
     # The warning is a text node starting with the word, tied to its input.
     assert "hubCodesElement('div', `Warning: ${candidate.warning}`, 'hub-code-warning')" in script
     assert "input.setAttribute('aria-describedby', warning.id);" in script
@@ -1642,9 +2115,28 @@ const out = {
   noPositionNone: lines(hubProposalItem({ ...base, state: 'no_position', name_searched: true, candidates: [] })),
   noPositionNotSearched: lines(hubProposalItem({ ...base, state: 'no_position', candidates: [] })),
 };
-// Two items with two warned candidates each: every warning has its own id,
+// Found by a shortened name: the text is markup-like on purpose, to show it
+// stays text.
+const cut = '<b>Zz</b> & Zzx';
+const shortNear = { name: 'ZZ Close', uic: '9900005', country_iso: 'ZZ', distance_m: 200, found_by: 'name', warning: null, shortened_name: cut };
+const shortFar = { name: 'ZZ Beyond', uic: '9900006', country_iso: 'ZZ', distance_m: 1200, found_by: 'name', warning: `Found by the shortened name «${cut}», a looser match, 1.2 km`, shortened_name: cut };
+const shortenedItem = hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 2, candidates: [shortNear, shortFar] });
+out.shortened = lines(shortenedItem);
+out.shortenedTexts = shortenedItem.children.filter(c => c.tag === 'label').map(c => c.children.slice(1).every(k => typeof k === 'string'));
+out.shortenedNone = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 3, candidates: [] }));
+out.shortenedOne = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 1, candidates: [] }));
+// A name too long to search whole, searched shortened.
+out.tooLong = lines(hubProposalItem({ ...base, state: 'to_pick', shortened_searches: 1, candidates: [shortNear] }));
+out.tooLongNone = lines(hubProposalItem({ ...base, state: 'to_pick', shortened_searches: 2, candidates: [] }));
+// The sentence after a click, with and without the budget reached.
+const three = [1, 2, 3].map(() => ({}));
+out.okText = hubResolveOkText({ call_budget_reached: false }, three);
+out.budgetText = hubResolveOkText({ call_budget_reached: true }, three);
+out.budgetOne = hubResolveOkText({ call_budget_reached: true }, [{}]);
+out.noneText = hubResolveOkText({ call_budget_reached: false }, []);
+// Three items with two warned candidates each: every warning has its own id,
 // each choice points at the warning right after it, none is hidden.
-const items = [far, lost].map(() => hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: [far, lost] }));
+const items = [[far, lost], [far, lost], [shortFar, lost]].map(cands => hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: cands }));
 const described = (c) => c.tag === 'label' && c.children[0].attrs['aria-describedby'];
 const pairs = items.flatMap(item => item.children.flatMap((c, i) => (described(c) ? [[described(c), item.children[i + 1]]] : [])));
 out.warnings = pairs.length;
@@ -1702,8 +2194,8 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
     )
     assert out["notSearched"][1] == (
         "No station of the module within 300 m of this hub's position, and its name was "
-        "not searched (it is under 3 or over 100 characters): type the code in the hub form "
-        "if you know it."
+        "not searched (it has fewer than 3 letters or digits, or over 100 characters): type "
+        "the code in the hub form if you know it."
     )
     assert out["noPosition"] == [
         "ZZ Hub 01",
@@ -1719,7 +2211,44 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
         "hub form if you know it."
     )
     assert "its name was not searched" in out["noPositionNotSearched"][2]
-    assert out["warnings"] == 4
+    # Found by a shortened name: the text that found it, quoted, on each
+    # candidate and in the note, as text nodes (never markup).
+    assert out["shortened"] == [
+        "ZZ Hub 01",
+        "Neither the position search nor the hub's full name found a station; the "
+        "shortened name «<b>Zz</b> & Zzx» found these instead, a looser match: check each "
+        "one before saving, or leave it.",
+        "[radio] ZZ Close · 9900005 · ZZ · 200 m · by the shortened name «<b>Zz</b> & Zzx»",
+        "[radio] ZZ Beyond · 9900006 · ZZ · 1.2 km · by the shortened name «<b>Zz</b> & Zzx»",
+        "Warning: Found by the shortened name «<b>Zz</b> & Zzx», a looser match, 1.2 km",
+        "[radio] Leave it",
+    ]
+    assert out["shortenedTexts"] == [True, True, True]
+    assert out["shortenedNone"][1] == (
+        "No station of the module within 300 m of this hub's position, and none found by "
+        "its name nor by 3 shortened forms of it: type the code in the hub form if you "
+        "know it."
+    )
+    assert "nor by 1 shortened form of it:" in out["shortenedOne"][1]
+    assert out["tooLong"][1] == (
+        "The position search found no station and the hub's name is too long to search "
+        "whole; the shortened name «<b>Zz</b> & Zzx» found these instead, a looser match: "
+        "check each one before saving, or leave it."
+    )
+    assert out["tooLongNone"][1] == (
+        "No station of the module within 300 m of this hub's position, and its name is too "
+        "long to search whole, and none found by 2 shortened forms of it: type the code in "
+        "the hub form if you know it."
+    )
+    tick = "Tick the codes to keep, then save. Nothing is stored before you save."
+    assert out["okText"] == tick
+    assert out["budgetText"] == (
+        f"{tick} Looked at 3 hubs this time: hubs searched by name use more calls to the "
+        'module. Click "Propose for the next hubs" for more.'
+    )
+    assert "Looked at 1 hub this time" in out["budgetOne"]
+    assert out["noneText"] == "Every active hub has a station code, or has been looked at."
+    assert out["warnings"] == 6
     assert out["ownWarning"] is True
     assert out["uniqueIds"] is True
     assert out["hidden"] is False

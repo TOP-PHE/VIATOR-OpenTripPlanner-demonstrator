@@ -2568,7 +2568,8 @@ On the network coverage page, **Manage hubs** shows two buttons when VIATOR
 uses the module (platform administrators only):
 
 - **Propose station codes** looks at up to 10 hubs without a code a click,
-  in the matrix order. For each hub it asks the module for its stations
+  in the matrix order (fewer when the name searches below add calls, see
+  the limits at the end). For each hub it asks the module for its stations
   **within 300 m of the hub's position** (latitude and longitude) first:
   the module's names often differ from the hubs' own. One station is shown
   with a tick box, not ticked: tick it to keep it; two to five are a choice
@@ -2591,22 +2592,68 @@ uses the module (platform administrators only):
   - more than 50 km away: not listed (a station of the same name in another
     town), but the panel says how many were left out ("1 more station found
     by name stands over 50 km ..."): check the hub's position.
-  When the name search finds nothing either, check the hub's position, or
-  type the code in the hub form. A name shorter than 3 or longer than 100
-  characters is not searched, and the panel says so.
+- **When the full name finds nothing to list either**, the name is
+  **shortened word by word** and searched again: without its last word,
+  then without its last two, down to its first word, three more searches
+  at most. Words end where the module's search splits them: at a space,
+  a hyphen or a dash (-, ‐, ‑, ‒, –, —, −) or an apostrophe or quote
+  (', ‘, ’, ʼ, ` and ´). So a hub named "Zzcity Saint-Zzname" is searched
+  as "Zzcity Saint-Zzname", then "Zzcity Saint", then "Zzcity". This finds
+  a station the module names differently (for example with "St" for
+  "Saint", or a building's name added: "Zzcity-St-Zzname - Building"). A
+  shortened form is not sent when it holds fewer than 3 letters or digits,
+  or when it ends with a one-letter word (such as the "d" of
+  "Zzcity-d'Zzname"); a form never repeats the full name or another form.
+  A name too long to search whole (over 100 characters) is still searched
+  shortened. When the module refuses a text as one it does not take, that
+  form counts as finding nothing and the next one is tried, so one hub
+  never stops every click. The first form that finds a station within 50 km
+  stops the shortening; one that only finds stations beyond 50 km does
+  not, and those are counted once each in the "over 50 km" sentence.
+  The panel says which text found each station ("by the shortened name
+  «Zzcity»", and above them "Neither the position search nor the hub's
+  full name found a station; the shortened name «Zzcity» found these
+  instead, a looser match"). Such a station follows the same rules as one found
+  by name: always a choice, nearest first, five at most, a warning beyond
+  300 m ("Warning: Found by the shortened name «Zzcity», a looser match,
+  1.2 km from the hub's position — check before saving"). A shorter name
+  matches more stations: make sure it is the hub's station.
+  When nothing is found, the panel says so (and how many shortened forms
+  were tried): check the hub's position, or type the code in the hub form.
+  A name with fewer than 3 letters or digits is not searched, and the
+  panel says so.
+  **A hub that never finds anything** (its station is missing from the
+  module) is looked at again on each new round of **Propose station
+  codes**, at its worst cost (up to 5 calls) every time: deactivate it if
+  it is not needed, or type its code in the hub form if you know it.
 - **A hub whose stored position is not a usable number** shows "no usable
-  position": its position is not sent, but its name is searched, and each
-  station found is listed with a warning that the distance is unknown.
+  position": its position is not sent, but its full name is searched, and
+  each station found is listed with a warning that the distance is
+  unknown. Its name is **not shortened**: without a distance, the stations
+  of a single word could not be ordered or filtered.
 - Nothing is stored before **Save ticked codes**, which checks the codes
   with the module first.
 - **Check station codes** re-reads the stored codes of up to 20 hubs a click.
 
 Each hub looked at is one call on your own limits at the module, and also on
 the module's limits for this call (by default 30 a minute and 200 a day for
-one person, 500 a day for everybody); a name search is one more call on your
-own limits (by default 60 a minute and 2,000 a day), not on this call's.
-One click is thus at most 20 calls, 30 with its **Save ticked codes**. At a
-limit the click stops and keeps what it found, and says how long to wait
+one person, 500 a day for everybody); each name search (the full name, and
+each shortened form) is one more call on your own limits (by default 60 a
+minute and 2,000 a day), not on this call's. One hub thus costs 1 to 5
+calls (1 position + 1 full name + 3 shortened names; a hub without a usable
+position only its full name's search). A click looks at the next hub only
+when that hub's worst case still fits in 15 calls: it looks at 10 hubs when
+their positions find stations (10 calls), and at 3 when every search finds
+nothing (15 calls); when it stops before 10 hubs the panel says so ("Looked
+at 3 hubs this time …"): click "Propose for the next hubs" for more. So four
+**Propose** clicks in a row fit in your 60 a minute even at their worst
+(before the shortening a click could make 20 calls, so three filled the
+minute); a **Check** click is still up to 20 calls. Clicks whose positions
+find stations make 10 calls of this call each: three pass in a minute,
+and a fourth waits for this call's own limit (as before). With its **Save ticked
+codes** (one call a code) a click is at most 25 calls. At a
+limit the click stops and keeps what it found, without trying the
+remaining shortened forms, and says how long to wait
 (in seconds, minutes or hours). When the limit is one of this call's own, only **Propose
 station codes** (and its "next" button) waits, for the time the module
 gives, or until midnight UTC for a daily one ("try again tomorrow
