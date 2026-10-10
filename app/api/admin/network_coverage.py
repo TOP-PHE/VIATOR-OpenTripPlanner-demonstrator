@@ -142,7 +142,8 @@ NAME_FALLBACK_MAX = 5
 # not shown (it is counted, and the page says so): a station 50 km away is a
 # namesake in another town or country, never the hub's station, and a hub
 # stored that far from its station needs its position corrected first. A
-# result between 300 m and this is shown with a warning, never "proposed".
+# result between 300 m and this is shown with a warning. No result of the
+# name search is ever "proposed" (owner rule): each one is to pick.
 NAME_FALLBACK_MAX_DISTANCE_M = 50_000
 _EARTH_RADIUS_M = 6_371_000.0
 # The most hub ids a resolve or check request may name as already shown.
@@ -813,8 +814,8 @@ def delete_hub(
 #            stations within 300 m (at most 5). When it finds none, or the
 #            hub's stored position is not a usable one (no near call then),
 #            one name search with the hub's name: at most 5 results, nearest
-#            first, those beyond 300 m with a warning and never "proposed",
-#            those beyond 50 km not shown. Writes nothing.
+#            first, each to pick (never "proposed"), those beyond 300 m with
+#            a warning, those beyond 50 km not shown. Writes nothing.
 #   confirm  the pairs (hub, code) the administrator accepted, at most 10,
 #            checked with one lookup of the module, each code sent once;
 #            only a code the module serves is stored ('msmm').
@@ -857,8 +858,8 @@ class HubCandidate(BaseModel):
 
 class HubProposal(BaseModel):
     """One hub looked at by a resolve click. `proposed`: exactly one
-    candidate, within 300 m and without a warning. `to_pick`: none, several
-    (at most five), or one with a warning, all listed. `no_position`: the
+    candidate of the near call. `to_pick`: none, several (at most five), or
+    any found by name, all listed. `no_position`: the
     hub's stored position is not a usable one (not a finite latitude of -90
     to 90 and longitude of -180 to 180), so no near call was made; the
     candidates, if any, were found by name, each with a warning.
@@ -1038,14 +1039,21 @@ def _has_position(hub: NetworkCoverageHub) -> bool:
     return station_module.position_refused(hub.lat, hub.lon) is None
 
 
-def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
-    """The great-circle (haversine) distance between two positions, in whole
-    metres."""
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """The great-circle (haversine) distance between two positions, in
+    metres, unrounded: the 300 m and 50 km rules compare this value, as the
+    module's near call compares its own (a station at 300.4 m is beyond)."""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = phi2 - phi1
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return round(2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a))))
+    return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _shown_metres(distance: float) -> int:
+    """A distance as shown: whole metres, rounded up, so that a station
+    beyond 300 m never reads "300 m"."""
+    return math.ceil(distance)
 
 
 def _distance_text(metres: int) -> str:
@@ -1065,9 +1073,10 @@ _UNKNOWN_STATION_POSITION = (
 )
 
 
-def _name_warning(located: bool, distance: int | None) -> str | None:
+def _name_warning(located: bool, distance: float | None) -> str | None:
     """The warning of a candidate found by name: None within 300 m of the
-    hub's position, else the distance (or why it is unknown)."""
+    hub's position (the unrounded distance), else the distance (or why it
+    is unknown)."""
     if not located:
         return _UNKNOWN_HUB_POSITION
     if distance is None:
@@ -1075,7 +1084,7 @@ def _name_warning(located: bool, distance: int | None) -> str | None:
     if distance <= PROPOSAL_RADIUS_M:
         return None
     return (
-        f"Found by name, {_distance_text(distance)} from the hub's position "
+        f"Found by name, {_distance_text(_shown_metres(distance))} from the hub's position "
         "— check before confirming."
     )
 
@@ -1099,9 +1108,10 @@ def _name_proposal(
     """The candidates among a name search's rows: a code the lookup accepts,
     each code once, farther than 50 km from the hub's position dropped (and
     counted), nearest first (rows at an unknown distance last, in the
-    module's order), at most five. `proposed` only for a single candidate
-    within 300 m: one with a warning is always to pick."""
-    kept: list[tuple[int | None, int, dict[str, Any]]] = []
+    module's order), at most five. Never `proposed` (owner rule): even a
+    single candidate within 300 m is to pick; one beyond 300 m, or at an
+    unknown distance, carries a warning."""
+    kept: list[tuple[float | None, int, dict[str, Any]]] = []
     seen: set[str] = set()
     far = 0
     for index, row in enumerate(rows):
@@ -1121,17 +1131,13 @@ def _name_proposal(
             name=row["name"],
             uic=row["uic"],
             country_iso=row["country_iso"],
-            distance_m=distance,
+            distance_m=None if distance is None else _shown_metres(distance),
             found_by="name",
             warning=_name_warning(located, distance),
         )
         for distance, _index, row in kept[:NAME_FALLBACK_MAX]
     ]
-    state: Literal["proposed", "to_pick", "no_position"] = "to_pick"
-    if not located:
-        state = "no_position"
-    elif len(candidates) == 1 and candidates[0].warning is None:
-        state = "proposed"
+    state: Literal["to_pick", "no_position"] = "to_pick" if located else "no_position"
     return HubProposal(
         hub_id=hub.id,
         hub_name=hub.name,

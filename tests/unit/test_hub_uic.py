@@ -583,8 +583,9 @@ def test_no_station_near_the_hub_falls_back_to_its_name_after_the_near_call(
     (proposal,) = body["proposals"]
     assert body["status"] == "ok"
     assert proposal["name_searched"] is True
-    # Within 300 m (about 200 m): a normal candidate, proposed when alone.
-    assert proposal["state"] == "proposed"
+    # Within 300 m (about 200 m): no warning, but never proposed, even
+    # alone: a result of the name search is always to pick (owner rule).
+    assert proposal["state"] == "to_pick"
     (candidate,) = proposal["candidates"]
     assert candidate["found_by"] == "name"
     assert candidate["warning"] is None
@@ -614,7 +615,7 @@ def test_name_results_are_ordered_by_distance_and_those_beyond_300_m_carry_a_war
     near, middle, far = proposal["candidates"]
     assert near["warning"] is None
     assert middle["warning"] == (
-        "Found by name, 500 m from the hub's position — check before confirming."
+        "Found by name, 501 m from the hub's position — check before confirming."
     )
     assert far["warning"] == (
         "Found by name, 1.2 km from the hub's position — check before confirming."
@@ -637,20 +638,61 @@ def test_a_single_name_result_beyond_300_m_is_to_pick_never_proposed(
     assert "check before confirming" in candidate["warning"]
 
 
-def test_a_name_result_at_exactly_300_m_counts_as_within(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("distance", "warned", "shown"),
+    [(300.0, False, 300), (300.0001, True, 301), (299.6, False, 300)],
+    ids=["300.0", "300.0001", "299.6"],
+)
+def test_the_300_m_rule_compares_the_unrounded_distance(
+    monkeypatch: pytest.MonkeyPatch, distance: float, warned: bool, shown: int
 ) -> None:
-    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: 300)
+    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
     row = _north("ZZ Edge", "9900072", 0.0027)
 
     proposal = network_coverage._name_proposal(_sea_hub(), [row], located=True)
 
-    assert proposal.state == "proposed"
-    assert proposal.candidates[0].warning is None
-    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: 301)
-    proposal = network_coverage._name_proposal(_sea_hub(), [row], located=True)
-    assert proposal.state == "to_pick"
-    assert proposal.candidates[0].warning is not None
+    assert proposal.state == "to_pick"  # never proposed, even alone
+    (candidate,) = proposal.candidates
+    assert (candidate.warning is not None) is warned
+    assert candidate.distance_m == shown
+
+
+def test_a_name_result_at_300_4_m_is_beyond_300_m(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    """The module's near call keeps a station at an exact distance of 300.0 m
+    or less, so one at 300.4 m reaches the name search: VIATOR must not round
+    it back to 300 m and drop the warning. Measured, not patched."""
+    hubs.rows = [_sea_hub()]
+    degrees = 300.4 / (network_coverage._EARTH_RADIUS_M * math.pi / 180)
+    _found(module, _north("ZZ Just Beyond", "9900073", degrees))
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    (candidate,) = proposal["candidates"]
+    assert proposal["state"] == "to_pick"
+    assert candidate["distance_m"] == 301
+    assert candidate["warning"] == (
+        "Found by name, 301 m from the hub's position — check before confirming."
+    )
+
+
+@pytest.mark.parametrize(
+    ("distance", "dropped"),
+    [(50_000.0, False), (50_000.4, True), (50_001.0, True), (49_999.6, False)],
+)
+def test_the_50_km_rule_drops_only_what_is_farther(
+    monkeypatch: pytest.MonkeyPatch, distance: float, dropped: bool
+) -> None:
+    assert network_coverage.NAME_FALLBACK_MAX_DISTANCE_M == 50_000
+    monkeypatch.setattr(network_coverage, "_distance_m", lambda *_a: distance)
+
+    proposal = network_coverage._name_proposal(
+        _sea_hub(), [_north("ZZ Edge", "9900074", 0.45)], located=True
+    )
+
+    assert proposal.far_dropped == (1 if dropped else 0)
+    assert len(proposal.candidates) == (0 if dropped else 1)
 
 
 def test_a_name_result_without_a_usable_position_is_shown_last_without_distance(
@@ -740,7 +782,7 @@ def test_a_name_result_with_a_refused_or_repeated_code_is_not_offered(
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
     assert [(c["name"], c["uic"]) for c in proposal["candidates"]] == [("ZZ Twice", "9900111")]
-    assert proposal["state"] == "proposed"
+    assert proposal["state"] == "to_pick"
 
 
 def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warning(
@@ -850,13 +892,17 @@ def test_another_name_search_failure_stops_the_click_without_a_pause(
     assert db.commits == 0
 
 
-def test_the_distance_is_a_haversine_in_whole_metres() -> None:
-    assert network_coverage._distance_m(0.0, 0.0, 0.0, 0.0) == 0
-    # One degree of a great circle on a sphere of 6,371 km: 111,195 m.
-    assert network_coverage._distance_m(0.0, 0.0, 1.0, 0.0) == 111_195
-    assert network_coverage._distance_m(0.0, 179.5, 0.0, -179.5) == 111_195
-    assert network_coverage._distance_m(-90.0, 0.0, 90.0, 0.0) == 20_015_087
-    assert network_coverage._distance_m(_SEA_LAT, _SEA_LON, _SEA_LAT, _SEA_LON + 1) == 74_403
+def test_the_distance_is_an_unrounded_haversine() -> None:
+    distance = network_coverage._distance_m
+    assert distance(0.0, 0.0, 0.0, 0.0) == 0
+    # One degree of a great circle on a sphere of 6,371 km: 111,194.93 m.
+    assert distance(0.0, 0.0, 1.0, 0.0) == pytest.approx(111_194.93, abs=0.01)
+    assert distance(0.0, 179.5, 0.0, -179.5) == pytest.approx(111_194.93, abs=0.01)
+    assert distance(-90.0, 0.0, 90.0, 0.0) == pytest.approx(math.pi * 6_371_000, abs=0.01)
+    assert distance(_SEA_LAT, _SEA_LON, _SEA_LAT, _SEA_LON + 1) == pytest.approx(74_403, abs=1)
+    assert isinstance(distance(0.0, 0.0, 0.0027, 0.0), float)
+    assert network_coverage._shown_metres(300.0) == 300
+    assert network_coverage._shown_metres(300.01) == 301
 
 
 @pytest.mark.parametrize(
