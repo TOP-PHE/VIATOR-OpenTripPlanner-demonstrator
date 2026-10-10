@@ -14,6 +14,7 @@ only through `httpx.MockTransport`. Invented values only.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -57,6 +58,9 @@ SHOWN_VIATOR_ROW = {key: value for key, value in VIATOR_ROW.items() if key != "s
 
 LENGTH_REFUSED = "q must be 3 to 100 characters long"
 CONTROL_REFUSED = "q must not contain a control character or a lone surrogate"
+FOLD_REFUSED = (
+    "q must still be 3 characters long once punctuation, hyphens and apostrophes are read as spaces"
+)
 BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
 
 
@@ -358,6 +362,37 @@ def test_each_failure_gives_origin_trainline_and_the_fallback_rows(
     assert len(module.requests) == (1 if pauses else 2)
 
 
+def test_a_text_refused_by_the_module_is_a_422_never_trainline_and_logged_at_info(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 422 of the module (a text it does not take) is answered as the
+    page's own refusal of a text: no Trainline rows labelled as a fallback,
+    the reason word at INFO, never the text, and no pause."""
+    module.response = httpx.Response(422, json={"detail": "ZZ refused", "code": "zz"})
+    _, cookies = _login()
+
+    with caplog.at_level(logging.DEBUG):
+        answer = _post(client, {"q": "Zzmarker"}, cookies)
+        again = _post(client, {"q": "Zzmarker"}, cookies)
+
+    for refused in (answer, again):
+        assert refused.status_code == 422
+        assert refused.json() == {"detail": FOLD_REFUSED}
+    assert fallback.calls == []
+    assert len(module.requests) == 2
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO] == [
+        "station_module.fallback reason=status_422"
+    ] * 2
+    assert {r.levelno for r in caplog.records if r.name == station_module.log.name} == {
+        logging.INFO
+    }
+    assert "Zzmarker" not in caplog.text
+
+
 @pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ReadTimeout])
 def test_an_unreachable_module_gives_origin_trainline(
     client: TestClient,
@@ -426,6 +461,11 @@ def test_a_user_without_a_viator_id_gets_trainline_without_any_call(
         pytest.param({"q": "zz\x00zz"}, CONTROL_REFUSED, id="a-null"),
         pytest.param({"q": "zz\tzz"}, CONTROL_REFUSED, id="a-tab"),
         pytest.param({"q": "zz\x85zz"}, CONTROL_REFUSED, id="a-c1-control"),
+        # Fewer than 3 characters once folded as the module folds them.
+        pytest.param({"q": "Zz."}, FOLD_REFUSED, id="two-letters-and-a-full-stop"),
+        pytest.param({"q": "---"}, FOLD_REFUSED, id="hyphens-only"),
+        pytest.param({"q": "( )"}, FOLD_REFUSED, id="brackets-only"),
+        pytest.param({"q": "Zz\u02bc"}, FOLD_REFUSED, id="modifier-apostrophe"),
         pytest.param({"q": 999}, BODY_REFUSED, id="q-a-number"),
         pytest.param({"q": "Zzville", "page": 1}, BODY_REFUSED, id="a-page"),
         pytest.param({"q": "Zzville", "size": 500}, BODY_REFUSED, id="a-size"),

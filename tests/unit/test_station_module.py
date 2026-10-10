@@ -811,6 +811,7 @@ async def test_the_clients_are_built_with_their_timeouts_and_without_the_environ
     ("kind", "level"),
     [
         ("429", logging.INFO),
+        ("422", logging.INFO),
         ("503-busy", logging.INFO),
         ("403", logging.WARNING),
         ("network", logging.WARNING),
@@ -827,6 +828,34 @@ async def test_one_request_refusals_log_at_info_and_faults_at_warning(
 
     (record,) = [r for r in caplog.records if r.name == station_module.log.name]
     assert record.levelno == level
+
+
+async def test_a_refused_search_text_logs_its_reason_word_at_info_never_the_text(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 422 on a search is the refusal of that text (the typeahead's own
+    rule keeps such texts from being sent): INFO, the reason word only, no
+    pause. A 422 on a lookup is VIATOR's own mistake (its codes are checked
+    first) and still warns."""
+    marker = "Zzmarker Zzquery"
+    module.answer(422, {"detail": "ZZ refused", "code": "zz"})
+
+    with caplog.at_level(logging.DEBUG):
+        outcome = await station_module.search_outcome(marker, uuid.uuid4())
+        await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, station_module.TEXT_REFUSED)
+    assert station_module.TEXT_REFUSED == "status_422"
+    assert not station_module.paused()
+    logged = [
+        (r.levelno, r.getMessage()) for r in caplog.records if r.name == station_module.log.name
+    ]
+    assert logged == [
+        (logging.INFO, "station_module.fallback reason=status_422"),
+        (logging.WARNING, "station_module.lookup_failed reason=status_422"),
+    ]
+    assert "Zzmarker" not in caplog.text
+    assert "ZZ refused" not in caplog.text
 
 
 # ───────────────────── the detailed form: search_outcome() ─────────────────────

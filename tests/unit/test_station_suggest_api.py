@@ -168,6 +168,9 @@ def test_the_route_is_post_only(client: TestClient, module_off: None) -> None:
 # body that is not `{"q": <text>}` gets one fixed sentence.
 LENGTH_REFUSED = "q must be 3 to 100 characters long"
 CONTROL_REFUSED = "q must not contain a control character or a lone surrogate"
+FOLD_REFUSED = (
+    "q must still be 3 characters long once punctuation, hyphens and apostrophes are read as spaces"
+)
 BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
 
 
@@ -186,6 +189,18 @@ BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
         pytest.param({"q": "zz\x7fzz"}, CONTROL_REFUSED, id="delete"),
         pytest.param({"q": "zz\x85zz"}, CONTROL_REFUSED, id="a-c1-control"),
         pytest.param({"q": "u\u0308u\u0308"}, LENGTH_REFUSED, id="two-letters-once-composed"),
+        # Three characters or more, but fewer once folded as the module
+        # folds the text (its punctuation, hyphens and apostrophes spaces):
+        # the module would answer a 422.
+        pytest.param({"q": "Zz."}, FOLD_REFUSED, id="two-letters-and-a-full-stop"),
+        pytest.param({"q": "---"}, FOLD_REFUSED, id="hyphens-only"),
+        pytest.param({"q": "( )"}, FOLD_REFUSED, id="brackets-only"),
+        pytest.param({"q": " ?!, "}, FOLD_REFUSED, id="punctuation-only"),
+        pytest.param({"q": "\u00abZz\u00bb"}, FOLD_REFUSED, id="angle-quotes"),
+        pytest.param({"q": "\u2026Zz\u2026"}, FOLD_REFUSED, id="ellipses-around-two-letters"),
+        pytest.param({"q": "Zz\u02bc"}, FOLD_REFUSED, id="modifier-apostrophe"),
+        pytest.param({"q": "z\u00adz"}, FOLD_REFUSED, id="soft-hyphen-taken-out"),
+        pytest.param({"q": "\u0301\u0301\u0301"}, FOLD_REFUSED, id="combining-marks-only"),
         pytest.param({"q": 999}, BODY_REFUSED, id="q-a-number"),
         pytest.param({"q": ["Zzville"]}, BODY_REFUSED, id="q-a-list"),
         pytest.param({"q": "Zzville", "size": 50}, BODY_REFUSED, id="an-unknown-field"),
@@ -401,6 +416,11 @@ def test_the_published_request_body_is_still_the_models_schema() -> None:
         pytest.param("z" * 100, "z" * 100, id="a-hundred-characters"),
         pytest.param(" " + "z" * 100 + " ", "z" * 100, id="a-hundred-once-trimmed"),
         pytest.param("\u00fc" * 3, "\u00fc" * 3, id="three-letters-not-ascii"),
+        # Folded as the module folds them, still 3 characters: sent as typed.
+        pytest.param("Z.Z", "Z.Z", id="a-full-stop-between-letters"),
+        pytest.param("Zz, Zzhof", "Zz, Zzhof", id="a-comma"),
+        pytest.param("\u00df\u00df.", "\u00df\u00df.", id="letters-the-module-spells-with-two"),
+        pytest.param("Zz-Z", "Zz-Z", id="a-hyphen-between-words"),
     ],
 )
 def test_the_text_is_normalised_as_the_module_does_and_sent_so(
@@ -513,7 +533,6 @@ def test_a_bearer_session_is_not_forwarded_either(
         pytest.param(httpx.Response(405, json={"detail": "zz"}), id="405"),
         pytest.param(httpx.Response(413, json={"code": "size"}), id="413"),
         pytest.param(httpx.Response(415, json={"code": "size"}), id="415"),
-        pytest.param(httpx.Response(422, json={"code": "user"}), id="422"),
         pytest.param(httpx.Response(429, json={"code": "user_minute"}), id="429"),
         pytest.param(httpx.Response(500, json={"error_id": "zz"}), id="500"),
         pytest.param(httpx.Response(503, json={"code": "no_build"}), id="503-no-build"),
@@ -538,6 +557,57 @@ def test_each_failure_of_the_module_gives_viators_own_list(
     assert answer.status_code == 200
     assert answer.json() == [VIATOR_ROW]
     assert fallback.calls == ["Zzt"]
+
+
+@pytest.mark.parametrize("mark", list(station_suggest.MODULE_SEPARATORS))
+def test_two_letters_and_any_module_separator_are_refused_without_a_call(
+    client: TestClient, module_on: str, module: Module, fallback: Fallback, mark: str
+) -> None:
+    """Each mark the module reads as a space, alone after two letters or
+    between two pairs of them: "Zz." is refused by VIATOR as a text too
+    short (no call, no fallback), "Zz.Zz" is searched."""
+    _, cookies = _login()
+
+    refused = _post(client, {"q": f"Zz{mark}"}, cookies)
+
+    assert refused.status_code == 422
+    assert refused.json() == {"detail": FOLD_REFUSED}
+    assert module.requests == []
+    assert fallback.calls == []
+    assert _post(client, {"q": f"Zz{mark}Zz"}, cookies).status_code == 200
+    assert json.loads(module.requests[0].content) == {"q": f"Zz{mark}Zz"}
+
+
+def test_a_text_refused_by_the_module_is_viators_422_logged_at_info_without_the_text(
+    client: TestClient,
+    module_on: str,
+    module: Module,
+    fallback: Fallback,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Should the module still refuse a text VIATOR sent (its 422: a module
+    whose rules moved), the answer is VIATOR's own refusal of a text, never
+    VIATOR's list standing in for the module's; the log says the reason
+    word at INFO, never the text; nothing pauses, so the next text is asked
+    of the module."""
+    module.response = httpx.Response(422, json={"detail": "ZZ refused", "code": "zz"})
+    _, cookies = _login()
+
+    with caplog.at_level(logging.DEBUG):
+        answer = _post(client, {"q": "Zzmarker"}, cookies)
+
+    assert answer.status_code == 422
+    assert answer.json() == {"detail": FOLD_REFUSED}
+    assert fallback.calls == []
+    records = [r for r in caplog.records if r.name == station_module.log.name]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.INFO, "station_module.fallback reason=status_422")
+    ]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "Zzmarker" not in caplog.text
+    module.response = httpx.Response(200, json={"stations": [MODULE_ROW]})
+    assert _post(client, {"q": "Zzville"}, cookies).json() == [{**MODULE_ROW, "source": "msmm"}]
+    assert len(module.requests) == 2
 
 
 @pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ReadTimeout])

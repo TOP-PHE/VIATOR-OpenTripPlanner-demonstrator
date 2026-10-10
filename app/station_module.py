@@ -6,11 +6,13 @@ four calls VIATOR uses, under `/internal/v1/`, reached at
 inside the network like VIATOR's calls to MOTIS):
 
 - `search(q, user_id)` — `POST /internal/v1/stations/search`, at most ten
-  stations whose name or MERITS code matches `q`. Used by the journey
-  typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
+  stations whose name or MERITS code matches `q`.
   `search_outcome(q, user_id)` is the same call in its detailed form (an
   `Outcome`: the rows, the reason word, the `Retry-After` of a 429);
-  `search()` returns its rows. `admin_search_outcome(q, user_id)` is the
+  `search()` returns its rows. The journey typeahead (`POST
+  /api/stations/suggest`) and the "Stations" page search use
+  `search_outcome` (app/api/station_suggest.py `find_stations`), so that a
+  text the module refuses (`TEXT_REFUSED`) is told from a failure. `admin_search_outcome(q, user_id)` is the
   same call made by an admin action (the coverage hubs' resolve route, when
   the near call finds nothing around a hub): it follows the lookup's pause
   rule below.
@@ -34,7 +36,8 @@ inside the network like VIATOR's calls to MOTIS):
   licence notice under the title of /journey.
 
 `search()` and `attribution()` return `None` on any failure, and the caller
-then uses VIATOR's own behaviour (the master_stations list; no notice).
+then uses VIATOR's own behaviour (the master_stations list; no notice); the
+typeahead does so on every failure of `search_outcome` but a refused text.
 VIATOR must keep working without the module.
 
 Rules this client keeps on purpose:
@@ -70,6 +73,9 @@ Rules this client keeps on purpose:
 - **A bad row is dropped, never the whole answer.**
 - **The log never holds the text, a body, the token or an exception's
   text**: one line `station_module.fallback reason=<word>` per fallback
+  (at INFO for `off`, `paused`, `busy`, a 429 and, for a search, a 422:
+  the refusal of one text, which the typeahead's text rule keeps from
+  being sent; at WARNING otherwise)
   (`station_module.lookup_failed reason=<word>` for a lookup,
   `station_module.near_failed reason=<word>` for a near call,
   `station_module.admin_search_failed reason=<word>` for an admin search),
@@ -173,6 +179,13 @@ _URL_SCHEMES = ("https://", "http://")  # NOSONAR python:S5332
 
 # States and one-request refusals, not faults: logged at INFO.
 _QUIET_REASONS = frozenset({"off", "paused", "busy", "status_429"})
+# The reason of a search text the module refuses (its 422: fewer than 3
+# characters once folded, for one). The typeahead's own text rule
+# (app/api/station_suggest.py `normalise_query`) keeps such texts from
+# being sent; one that still reaches the module is a refusal of that text,
+# not a fault: a typeahead search logs it at INFO, never with the text.
+TEXT_REFUSED = "status_422"
+_QUIET_SEARCH_REASONS = _QUIET_REASONS | {TEXT_REFUSED}
 
 # The clock of the pause and of the attribution cache; tests replace it.
 clock: Callable[[], float] = time.monotonic
@@ -282,22 +295,23 @@ def code_refused(code: str) -> str | None:
     return None
 
 
-def _log_failure(event: str, reason: str) -> None:
+def _log_failure(event: str, reason: str, quiet: frozenset[str] = _QUIET_REASONS) -> None:
     # `off`, `paused`, 429 and `busy` are states or one-request refusals, not
     # faults: INFO, so a VIATOR without the module, a paused one, or a busy
-    # one, does not fill the log with warnings.
-    level = logging.INFO if reason in _QUIET_REASONS else logging.WARNING
+    # one, does not fill the log with warnings. A typeahead search adds the
+    # refusal of its text (`TEXT_REFUSED`).
+    level = logging.INFO if reason in quiet else logging.WARNING
     log.log(level, "%s reason=%s", event, reason)
 
 
-def _fail(failure: _Failure) -> None:
+def _fail(failure: _Failure, quiet: frozenset[str] = _QUIET_REASONS) -> None:
     """Log one fallback line, start the pause when the failure calls for it,
     and forget the cached attribution: a module that just failed shows no notice."""
     if failure.pause:
         with _state.lock:
             _state.paused_until = clock() + PAUSE_SECONDS
             _state.attribution = None
-    _log_failure("station_module.fallback", failure.reason)
+    _log_failure("station_module.fallback", failure.reason, quiet)
 
 
 def _url(path: str) -> str:
@@ -471,7 +485,9 @@ async def search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
     """At most ten stations of the module for `q` (already normalised by the
     caller), on behalf of the VIATOR user `user_id`, as an `Outcome`: the
     rows, or None with the reason word of the failure and, on a 429, the
-    module's `Retry-After`. The pause rules of `search()`, which wraps it."""
+    module's `Retry-After`. The pause rules of `search()`, which wraps it.
+    A 422 (`TEXT_REFUSED`, the module does not take the text) starts no
+    pause and is logged at INFO: it concerns that text alone."""
     try:
         if not enabled():
             raise _Failure("off", pause=False)
@@ -479,7 +495,7 @@ async def search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
             raise _Failure("paused", pause=False)
         rows = _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
     except _Failure as failure:
-        _fail(failure)
+        _fail(failure, _QUIET_SEARCH_REASONS)
         return failure.outcome()
     except Exception:
         # Anything else (an address httpx refuses, a token it cannot encode, a

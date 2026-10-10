@@ -167,7 +167,7 @@ async function search(q) {
     return;
   }
   if (answer.status === 422) {
-    clearResults('Type 3 to 100 characters, without control characters.');
+    clearResults('Type 3 to 100 characters, still 3 once punctuation, hyphens and apostrophes are read as spaces, without control characters.');
     return;
   }
   if (!answer.ok) {
