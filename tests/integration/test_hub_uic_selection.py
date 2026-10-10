@@ -162,6 +162,22 @@ class _Module:
                     ]
                 },
             )
+        if request.url.path.endswith("/stations/search"):
+            # The name fallback: a station of the hub's name, 0.01° north.
+            return httpx.Response(
+                200,
+                json={
+                    "stations": [
+                        {
+                            "name": body["q"],
+                            "latitude": 45.01,
+                            "longitude": 6.0,
+                            "country_iso": "ZZ",
+                            "uic": "9900044",
+                        }
+                    ]
+                },
+            )
         served = [
             {
                 "name": "ZZ Station",
@@ -228,7 +244,8 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
 
     assert [p["hub_id"] for p in proposals] == ["zz-a-9", "zz-a-1", "zz-a-2", "zz-b-0", "zz-b-2"]
     assert all(p["state"] == "proposed" for p in proposals)
-    # One near call per hub at its stored position, never a search by name.
+    # One near call per hub at its stored position; each found a station,
+    # so no search by name.
     near = [json.loads(r.content) for r in module.requests if r.url.path.endswith("/near")]
     assert near == [{"lat": 45.0, "lon": 6.0, "radius_m": 300}] * 5
     assert not any(r.url.path.endswith("/search") for r in module.requests)
@@ -252,7 +269,7 @@ def test_resolve_writes_nothing_and_confirm_writes_the_served_code(
     assert len([r for r in module.requests if r.url.path.endswith("/lookup")]) == 1
 
 
-def test_a_hub_whose_stored_position_is_not_a_number_is_skipped_without_a_call(
+def test_a_hub_whose_stored_position_is_not_a_number_is_searched_by_name_only(
     fresh_db: str, client: tuple[TestClient, _Module]
 ) -> None:
     """The columns are NOT NULL, but PostgreSQL's float takes 'NaN' and
@@ -267,9 +284,16 @@ def test_a_hub_whose_stored_position_is_not_a_number_is_skipped_without_a_call(
 
     proposals = test_client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
-    states = {p["hub_id"]: p["state"] for p in proposals}
-    assert states["zz-a-1"] == "no_position"
+    by_id = {p["hub_id"]: p for p in proposals}
+    assert by_id["zz-a-1"]["state"] == "no_position"
     assert len([r for r in module.requests if r.url.path.endswith("/near")]) == 4
+    # Its name read from the table is searched; the station found is listed
+    # without a distance, with a warning, and nothing is written.
+    searched = [json.loads(r.content) for r in module.requests if r.url.path.endswith("/search")]
+    assert searched == [{"q": "ZZ Hub zz-a-1"}]
+    (candidate,) = by_id["zz-a-1"]["candidates"]
+    assert (candidate["uic"], candidate["distance_m"]) == ("9900044", None)
+    assert candidate["warning"]
     assert _row(fresh_db, "zz-a-1") == (None, None, False)
 
 

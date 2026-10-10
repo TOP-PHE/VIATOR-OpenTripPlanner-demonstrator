@@ -11,8 +11,10 @@ Endpoints:
   DELETE /api/admin/network-coverage/hubs/{id}         — v0.1.31: soft-delete
   POST   /api/admin/network-coverage/hubs/resolve      — station codes proposed by
                                                          the station module from each
-                                                         hub's position, at most 10
-                                                         hubs a click; writes nothing
+                                                         hub's position (by its name
+                                                         when nothing stands within
+                                                         300 m), at most 10 hubs a
+                                                         click; writes nothing
   POST   /api/admin/network-coverage/hubs/confirm      — store at most 10 codes the
                                                          administrator accepted, after
                                                          one lookup in the module
@@ -37,9 +39,11 @@ polls GET /runs/{id} every 5s to render progress; status flips to
 from __future__ import annotations
 
 import logging
+import math
 import re
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from datetime import time as dtime
 from typing import Annotated, Any, Literal
@@ -76,6 +80,7 @@ from ...network_coverage import external_verify, hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
+from .. import station_suggest
 
 # PR-3 — "HH:MM" and "24:00" sentinel. The DB stores TIME (which can't
 # represent 24:00), so the API accepts the sentinel and the runner
@@ -105,17 +110,23 @@ _HUB_NOT_FOUND = "Hub not found"
 
 # ── Station codes from the station module (MSMM step 3) ──
 # The batch of each click, constants of VIATOR's code (the module's own
-# settings cannot be read from here): a resolve makes at most 10 near calls
-# (one per hub, at its position), a confirm one lookup of at most 10 codes, a
-# check one lookup of at most 20. Each near call and each code is one call on
-# the administrator's own limits at the module (60 a minute by default), so
-# a resolve and its confirm cost at most 10 + 10 = 20 calls, and a check
-# click 20, which leaves room for his typing. The module's per-person minute
-# limit must be 20 or more, or every check click is refused whole.
+# settings cannot be read from here): a resolve looks at most 10 hubs (one
+# near call each, at its position, and one name search for a hub the near
+# call found nothing around), a confirm one lookup of at most 10 codes, a
+# check one lookup of at most 20. Each near call, each search and each code
+# is one call on the administrator's own limits at the module (its defaults:
+# 60 a minute and 2,000 a day for one person, MSMM app/settings.py
+# internal_user_per_minute and internal_user_per_day). Worst case of one
+# resolve click: 10 near + 10 searches = 20 calls; with its confirm,
+# 20 + 10 = 30; a check click 20. So no single click can use up the 60 a
+# minute (it leaves room for his typing), and the batch stays at 10. The
+# module's per-person minute limit must be 20 or more, or a worst-case
+# resolve click and every check click is refused before its end.
 # A near call also counts on the module's own near quota (decision 62 of the
-# module: 30 a minute and 200 a day for one person, 500 a day for everybody):
-# 10 a click stays under the 30 a minute, so three clicks in one minute
-# pass and a fourth is refused with a 429 and its Retry-After.
+# module: 30 a minute and 200 a day for one person, 500 a day for everybody;
+# a search does not): 10 a click stays under the 30 a minute, so three
+# clicks in one minute pass and a fourth is refused with a 429 and its
+# Retry-After. At 20 calls a click the day of 2,000 allows 100 clicks.
 RESOLVE_BATCH = 10
 CONFIRM_BATCH = 10
 CHECK_BATCH = 20
@@ -123,6 +134,18 @@ CHECK_BATCH = 20
 # many metres of the hub's position (its own maximum). A filter for
 # proposals, never a matcher: two distinct termini can stand closer than this.
 PROPOSAL_RADIUS_M = 300
+# The name fallback (owner decision of 10 Oct): when the near call finds no
+# station around a hub, the hub's name is searched. At most this many of its
+# results are shown, nearest the hub's position first.
+NAME_FALLBACK_MAX = 5
+# A result of the name search farther than this from the hub's position is
+# not shown (it is counted, and the page says so): a station 50 km away is a
+# namesake in another town or country, never the hub's station, and a hub
+# stored that far from its station needs its position corrected first. A
+# result between 300 m and this is shown with a warning. No result of the
+# name search is ever "proposed" (owner rule): each one is to pick.
+NAME_FALLBACK_MAX_DISTANCE_M = 50_000
+_EARTH_RADIUS_M = 6_371_000.0
 # The most hub ids a resolve or check request may name as already shown.
 _SKIP_MAX = 2_000
 _CODE_RULE = "uic must be 3 to 20 characters, with no white space and no control character"
@@ -788,8 +811,11 @@ def delete_hub(
 #
 #   resolve  one near call of the module per unresolved hub, at the hub's
 #            position, at most 10 a click, one after the other: the module's
-#            stations within 300 m (at most 5); writes nothing. A hub whose
-#            stored position is not a usable one is skipped without a call.
+#            stations within 300 m (at most 5). When it finds none, or the
+#            hub's stored position is not a usable one (no near call then),
+#            one name search with the hub's name: at most 5 results, nearest
+#            first, each to pick (never "proposed"), those beyond 300 m with
+#            a warning, those beyond 50 km not shown. Writes nothing.
 #   confirm  the pairs (hub, code) the administrator accepted, at most 10,
 #            checked with one lookup of the module, each code sent once;
 #            only a code the module serves is stored ('msmm').
@@ -814,25 +840,41 @@ class HubBatchRequest(BaseModel):
 
 
 class HubCandidate(BaseModel):
-    """A station of the module within 300 m of a hub, with its distance."""
+    """A station of the module offered for a hub. `found_by`: `position`
+    (the near call: within 300 m, the module's distance) or `name` (the
+    name fallback: the distance VIATOR computed from the hub's position, or
+    None when either position is not a usable one). `warning`: a sentence
+    the page shows with the candidate when it is not a station within 300 m
+    of the hub's position (found by name farther away, or at an unknown
+    distance); None otherwise."""
 
     name: str
     uic: str
     country_iso: str | None = None
-    distance_m: int
+    distance_m: int | None
+    found_by: Literal["position", "name"] = "position"
+    warning: str | None = None
 
 
 class HubProposal(BaseModel):
     """One hub looked at by a resolve click. `proposed`: exactly one
-    candidate within 300 m. `to_pick`: none or several (at most five), all
-    listed. `no_position`: the hub's stored position is not a usable one (not
-    a finite latitude of -90 to 90 and longitude of -180 to 180), so the
-    module was not asked."""
+    candidate of the near call. `to_pick`: none, several (at most five), or
+    any found by name, all listed. `no_position`: the
+    hub's stored position is not a usable one (not a finite latitude of -90
+    to 90 and longitude of -180 to 180), so no near call was made; the
+    candidates, if any, were found by name, each with a warning.
+
+    `name_searched`: the near call found nothing (or could not be made), so
+    the module's name search was asked with the hub's name. `far_dropped`:
+    results of that search farther than 50 km from the hub's position, not
+    listed."""
 
     hub_id: str
     hub_name: str
     state: Literal["proposed", "to_pick", "no_position"]
     candidates: list[HubCandidate]
+    name_searched: bool = False
+    far_dropped: int = 0
 
 
 class HubResolveResponse(BaseModel):
@@ -942,13 +984,26 @@ def _caller(admin: CurrentUser) -> uuid.UUID:
     return admin.id
 
 
+def _wait_text(seconds: int | None) -> str:
+    """The module's Retry-After for a sentence: "a minute" when it gave
+    none, seconds under two minutes, then minutes under two hours, then
+    hours (rounded up); the wait itself is unchanged."""
+    if seconds is None:
+        return "a minute"
+    if seconds < 120:
+        return "1 second" if seconds == 1 else f"{seconds} seconds"
+    if seconds < 7200:
+        return f"about {math.ceil(seconds / 60)} minutes"
+    return f"about {math.ceil(seconds / 3600)} hours"
+
+
 def _failure(
     outcome: station_module.Outcome,
 ) -> tuple[Literal["limited", "unavailable"], str, int | None]:
     """The status, the sentence and the time to wait of a failed call: a 429
     is `limited` with the module's Retry-After; anything else `unavailable`."""
     if outcome.reason == "status_429":
-        wait = f"{outcome.retry_after} seconds" if outcome.retry_after is not None else "a minute"
+        wait = _wait_text(outcome.retry_after)
         return (
             "limited",
             f"The station module's limit is reached; try again in {wait}.",
@@ -962,7 +1017,7 @@ def _near_limit_message(code: str, retry_after: int | None) -> str:
     daily one "tomorrow (UTC)" (its window ends at midnight UTC) rather than
     up to a day of seconds; and that saving and checking still work."""
     if code == "near_user_minute":
-        wait = f"{retry_after} seconds" if retry_after is not None else "a minute"
+        wait = _wait_text(retry_after)
         sentence = f"Your limit of proposals a minute is reached; try again in {wait}."
     elif code == "near_user_day":
         sentence = "Your daily limit of proposals is reached; try again tomorrow (UTC)."
@@ -997,6 +1052,115 @@ def _has_position(hub: NetworkCoverageHub) -> bool:
     return station_module.position_refused(hub.lat, hub.lon) is None
 
 
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """The great-circle (haversine) distance between two positions, in
+    metres, unrounded: the 300 m and 50 km rules compare this value, as the
+    module's near call compares its own (a station at 300.4 m is beyond)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _shown_metres(distance: float) -> int:
+    """A distance as shown: whole metres, rounded up, so that a station
+    beyond 300 m never reads "300 m"."""
+    return math.ceil(distance)
+
+
+def _distance_text(metres: int) -> str:
+    """A distance for a sentence: `640 m` below a kilometre, else `1.2 km`."""
+    if metres < 1000:
+        return f"{metres} m"
+    return f"{metres / 1000:.1f} km"
+
+
+_UNKNOWN_HUB_POSITION = (
+    "Found by name; this hub has no usable position, so the distance is unknown "
+    "— check before saving."
+)
+_UNKNOWN_STATION_POSITION = (
+    "Found by name; the station module gives no usable position for it, so its "
+    "distance from the hub is unknown — check before saving."
+)
+
+
+def _name_warning(located: bool, distance: float | None) -> str | None:
+    """The warning of a candidate found by name: None within 300 m of the
+    hub's position (the unrounded distance), else the distance (or why it
+    is unknown)."""
+    if not located:
+        return _UNKNOWN_HUB_POSITION
+    if distance is None:
+        return _UNKNOWN_STATION_POSITION
+    if distance <= PROPOSAL_RADIUS_M:
+        return None
+    return (
+        f"Found by name, {_distance_text(_shown_metres(distance))} from the hub's position "
+        "— check before saving."
+    )
+
+
+def _name_query(hub: NetworkCoverageHub) -> str | None:
+    """The hub's name as the module's search takes it (the typeahead's own
+    rule, `station_suggest.normalise_query`: NFC, white space made single,
+    3 to 100 characters), or None when the search would refuse it. Sent as
+    stored otherwise: no word is removed."""
+    if not isinstance(hub.name, str):
+        return None
+    try:
+        return station_suggest.normalise_query(hub.name)
+    except ValueError:
+        return None
+
+
+def _name_proposal(
+    hub: NetworkCoverageHub, rows: list[dict[str, Any]], *, located: bool
+) -> HubProposal:
+    """The candidates among a name search's rows: a code the lookup accepts,
+    each code once, farther than 50 km from the hub's position dropped (and
+    counted), nearest first (rows at an unknown distance last, in the
+    module's order), at most five. Never `proposed` (owner rule): even a
+    single candidate within 300 m is to pick; one beyond 300 m, or at an
+    unknown distance, carries a warning."""
+    kept: list[tuple[float | None, int, dict[str, Any]]] = []
+    seen: set[str] = set()
+    far = 0
+    for index, row in enumerate(rows):
+        if row["uic"] in seen or station_module.code_refused(row["uic"]) is not None:
+            continue
+        seen.add(row["uic"])
+        distance = None
+        if located and station_module.position_refused(row["latitude"], row["longitude"]) is None:
+            distance = _distance_m(hub.lat, hub.lon, row["latitude"], row["longitude"])
+        if distance is not None and distance > NAME_FALLBACK_MAX_DISTANCE_M:
+            far += 1
+            continue
+        kept.append((distance, index, row))
+    kept.sort(key=lambda item: (item[0] is None, item[0] or 0, item[1]))
+    candidates = [
+        HubCandidate(
+            name=row["name"],
+            uic=row["uic"],
+            country_iso=row["country_iso"],
+            distance_m=None if distance is None else _shown_metres(distance),
+            found_by="name",
+            warning=_name_warning(located, distance),
+        )
+        for distance, _index, row in kept[:NAME_FALLBACK_MAX]
+    ]
+    state: Literal["to_pick", "no_position"] = "to_pick" if located else "no_position"
+    return HubProposal(
+        hub_id=hub.id,
+        hub_name=hub.name,
+        state=state,
+        candidates=candidates,
+        name_searched=True,
+        far_dropped=far,
+    )
+
+
 def _proposal(hub: NetworkCoverageHub, rows: list[dict[str, Any]]) -> HubProposal:
     """The candidates among a near call's rows (already within 300 m of the
     hub's position, at most five), with a code the module's lookup accepts,
@@ -1011,7 +1175,7 @@ def _proposal(hub: NetworkCoverageHub, rows: list[dict[str, Any]]) -> HubProposa
         for row in rows
         if station_module.code_refused(row["uic"]) is None
     ]
-    candidates.sort(key=lambda candidate: candidate.distance_m)
+    candidates.sort(key=lambda candidate: candidate.distance_m or 0)
     state: Literal["proposed", "to_pick"] = "proposed" if len(candidates) == 1 else "to_pick"
     return HubProposal(hub_id=hub.id, hub_name=hub.name, state=state, candidates=candidates)
 
@@ -1039,6 +1203,56 @@ def _hubs_by_id(db: DbSession, ids: list[str]) -> dict[str, NetworkCoverageHub]:
     return {hub.id: hub for hub in rows.scalars().all()}
 
 
+@dataclass(frozen=True)
+class _ResolveStop:
+    """A module call of a resolve click failed: the click stops here and
+    answers what it found before, with this status and sentence."""
+
+    status: Literal["limited", "unavailable"]
+    message: str
+    retry_after: int | None
+    near_limited: bool
+
+
+async def _look_up_by_name(
+    hub: NetworkCoverageHub, user_id: uuid.UUID, *, located: bool
+) -> HubProposal | _ResolveStop:
+    """The name fallback of one hub: one search of the module with the hub's
+    name (`station_module.admin_search_outcome`, which never pauses the
+    typeahead). A name the search would refuse is not sent: the hub is shown
+    with no candidate. A failure stops the click as a near failure does (a
+    429 keeps what was found, with the module's Retry-After)."""
+    state: Literal["to_pick", "no_position"] = "to_pick" if located else "no_position"
+    query = _name_query(hub)
+    if query is None:
+        return HubProposal(hub_id=hub.id, hub_name=hub.name, state=state, candidates=[])
+    outcome = await station_module.admin_search_outcome(query, user_id)
+    if outcome.rows is None:
+        status, message, retry_after = _failure(outcome)
+        return _ResolveStop(status, message, retry_after, near_limited=False)
+    return _name_proposal(hub, outcome.rows, located=located)
+
+
+async def _look_at(hub: NetworkCoverageHub, user_id: uuid.UUID) -> HubProposal | _ResolveStop:
+    """One hub of a resolve click: the near call at its position; when it
+    gives no usable candidate (no station at all, or only codes the lookup
+    would refuse), or the hub has no usable position (no near call then: the
+    module would refuse the position after counting it), the name fallback.
+    A near failure (a 429 included) stops the click without any name
+    search."""
+    located = _has_position(hub)
+    if located:
+        outcome = await station_module.near_outcome(
+            hub.lat, hub.lon, user_id, radius_m=PROPOSAL_RADIUS_M
+        )
+        if outcome.rows is None:
+            return _ResolveStop(*_resolve_failure(outcome))
+        proposal = _proposal(hub, outcome.rows)
+        if proposal.candidates:
+            return proposal
+    return await _look_up_by_name(hub, user_id, located=located)
+
+
 @router.post("/hubs/resolve", responses=_HUB_CODE_RESPONSES)
 async def resolve_hub_codes(
     body: Annotated[Any, Body()],
@@ -1047,12 +1261,14 @@ async def resolve_hub_codes(
 ) -> HubResolveResponse:
     """Propose a station code for at most 10 unresolved hubs: one near call
     of the module per hub, at the hub's position with a radius of 300 m, one
-    after the other, on behalf of the administrator (never a search by the
-    hub's name: the module's names often differ from the hubs' own). Writes
-    nothing: the administrator confirms what he accepts with POST
-    /hubs/confirm. Stops at the first failure; at a 429 (a limit of the
-    person, or of the near quota) it answers what it found with the module's
-    Retry-After, never retrying."""
+    after the other, on behalf of the administrator. Only when the near call
+    finds no station (or a hub has no usable position) is the hub's name
+    searched (`_look_up_by_name`): the module's names often differ from the
+    hubs' own, so the position comes first. Writes nothing: the
+    administrator confirms what he accepts with POST /hubs/confirm. Stops at
+    the first failure of either call; at a 429 (a limit of the person, or of
+    the near quota) it answers what it found with the module's Retry-After,
+    never retrying."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
     hubs = _hubs_to_look_at(db, resolved=False, skip=asked.skip)
@@ -1063,26 +1279,17 @@ async def resolve_hub_codes(
         )
     proposals: list[HubProposal] = []
     for hub in hubs[:RESOLVE_BATCH]:
-        if not _has_position(hub):
-            # No call: the module would refuse the position after counting it.
-            proposals.append(
-                HubProposal(hub_id=hub.id, hub_name=hub.name, state="no_position", candidates=[])
-            )
-            continue
-        outcome = await station_module.near_outcome(
-            hub.lat, hub.lon, user_id, radius_m=PROPOSAL_RADIUS_M
-        )
-        if outcome.rows is None:
-            status, message, retry_after, near_limited = _resolve_failure(outcome)
+        looked = await _look_at(hub, user_id)
+        if isinstance(looked, _ResolveStop):
             return HubResolveResponse(
-                status=status,
-                message=message,
-                retry_after=retry_after,
+                status=looked.status,
+                message=looked.message,
+                retry_after=looked.retry_after,
                 proposals=proposals,
                 left=len(hubs) - len(proposals),
-                near_limited=near_limited,
+                near_limited=looked.near_limited,
             )
-        proposals.append(_proposal(hub, outcome.rows))
+        proposals.append(looked)
     return HubResolveResponse(status="ok", proposals=proposals, left=len(hubs) - len(proposals))
 
 

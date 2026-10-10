@@ -1650,3 +1650,104 @@ async def test_near_never_logs_a_position_a_code_or_the_token(
 )
 def test_position_refused_is_the_near_calls_rule(lat: Any, lon: Any, refused: bool) -> None:
     assert (station_module.position_refused(lat, lon) is not None) is refused
+
+
+# ───────────────────────── the admin search ─────────────────────────
+
+
+def _admin_search_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
+    prefix = "station_module.admin_search_failed reason="
+    return [
+        r.getMessage().removeprefix(prefix)
+        for r in caplog.records
+        if r.name == station_module.log.name and r.getMessage().startswith(prefix)
+    ]
+
+
+async def test_admin_search_posts_the_text_in_the_body_with_only_its_own_headers(
+    module: Module, token: str
+) -> None:
+    user = uuid.uuid4()
+
+    outcome = await station_module.admin_search_outcome("ZZ Hub Name", user)
+
+    assert outcome == station_module.Outcome([_row()], "ok", None)
+    (request,) = module.requests
+    assert request.method == "POST"
+    assert str(request.url) == f"{MODULE_URL}/internal/v1/stations/search"
+    assert request.url.query == b""
+    assert json.loads(request.content) == {"q": "ZZ Hub Name"}
+    assert request.headers["authorization"] == f"Bearer {token}"
+    assert request.headers["x-viator-user-id"] == str(user)
+    assert request.headers["accept-encoding"] == "identity"
+    ours = {"authorization", "x-viator-user-id", "content-type", "content-length"}
+    assert set(request.headers.keys()) <= ours | _HTTPX_DEFAULTS
+    (built,) = module.clients
+    assert built["trust_env"] is False
+
+
+async def test_admin_search_drops_bad_rows_and_keeps_at_most_ten(module: Module) -> None:
+    rows = [_row(uic=f"99000{i:02d}") for i in range(12)]
+    module.answer(200, {"stations": [_row(name=""), *rows]})
+
+    outcome = await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())
+
+    assert outcome.rows == rows[:10]
+
+
+@pytest.mark.parametrize(("kind", "reason"), PAUSING + NOT_PAUSING)
+async def test_each_admin_search_failure_gives_its_reason_and_never_pauses(
+    module: Module, caplog: pytest.LogCaptureFixture, kind: str, reason: str
+) -> None:
+    _setup_failure(module, kind)
+
+    with caplog.at_level(logging.INFO):
+        outcome = await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())
+
+    assert outcome.rows is None
+    assert outcome.reason == reason
+    assert _admin_search_reasons(caplog) == [reason]
+    # The text is never logged.
+    assert not any("ZZ Hub" in r.getMessage() for r in caplog.records)
+    # No pause: the typeahead of every user goes on calling the module.
+    assert not station_module.paused()
+    module.answer(200, {"stations": [_row()]})
+    assert await station_module.search("Zzville", uuid.uuid4()) == [_row()]
+
+
+async def test_an_admin_search_429_gives_its_retry_after_and_window(module: Module) -> None:
+    module.handler = lambda _r: httpx.Response(
+        429, json={"detail": "ZZ", "code": "user_minute"}, headers={"Retry-After": "9"}
+    )
+
+    outcome = await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "status_429", 9, "user_minute")
+    assert not station_module.paused()
+
+
+async def test_a_running_pause_is_honoured_by_admin_search(
+    module: Module, clock: FakeClock
+) -> None:
+    module.fail(httpx.ConnectError)
+    await station_module.search("Zzville", uuid.uuid4())
+    calls = len(module.requests)
+
+    outcome = await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "paused", None)
+    assert len(module.requests) == calls
+    clock.now += PAUSE_PLUS
+    module.answer(200, {"stations": []})
+    assert (await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())).reason == "ok"
+
+
+async def test_admin_search_makes_no_call_without_the_settings(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(""))
+
+    outcome = await station_module.admin_search_outcome("ZZ Hub", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "off", None)
+    assert module.requests == []

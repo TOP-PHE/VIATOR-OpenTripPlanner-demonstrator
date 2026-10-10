@@ -537,6 +537,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 .hub-code-item:last-child { border-bottom: none; }
 .hub-code-item label { display: block; font-weight: normal; margin-left: 0.6rem; }
 .hub-code-item .hub-code-note { color: #5b6470; margin-left: 0.6rem; }
+/* A candidate found by name beyond 300 m, or at an unknown distance: the
+   word "Warning:" says it, the colours only repeat it (#4a3500 on #fff8c5,
+   the verify banner's pair, about 10:1). */
+.hub-code-item .hub-code-warning { margin: 0 0 0.2rem 1.9rem; padding: 0 0.3rem; color: #4a3500; background: #fff8c5; border-left: 3px solid #9a6700; }
 {% endblock %}
 
 {% block content %}
@@ -686,11 +690,13 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
       </div>
       {% if station_module_enabled %}
       {# MSMM step 3 — station codes from the station module. Each click
-         costs at most 10 searches (propose) or one lookup of at most 10
-         (save) or 20 codes (check) on the administrator's own limits at the
-         module; nothing is written until he saves the codes he ticked. #}
+         costs at most 10 near calls and 10 name searches (propose: a name
+         search only for a hub with no station within 300 m) or one lookup
+         of at most 10 (save) or 20 codes (check) on the administrator's own
+         limits at the module; nothing is written until he saves the codes
+         he ticked. #}
       <div class="hub-codes-tools">
-        <button type="button" id="hub-codes-resolve" title="Ask the station module for the stations within 300 m of up to 10 hubs without a code, by their position">Propose station codes</button>
+        <button type="button" id="hub-codes-resolve" title="Ask the station module for the stations within 300 m of up to 10 hubs without a code, by their position, or by their name when none stands within 300 m">Propose station codes</button>
         <button type="button" id="hub-codes-check" title="Re-read the stored codes of up to 20 hubs in the station module">Check station codes</button>
       </div>
       <div id="hub-codes" class="hub-codes" hidden>
@@ -2600,7 +2606,8 @@ const HUB_CODES_API = '/api/admin/network-coverage/hubs';
 // The hubs already shown in this round, skipped by the next click.
 // heldUntil: every button waits (a limit of every call); proposeHeldUntil:
 // only "Propose" and its "next" wait (a limit of the module's near call).
-const HUB_CODES = { mode: null, skip: [], heldUntil: 0, proposeHeldUntil: 0 };
+// warnings: a counter for the ids of the candidates' warnings.
+const HUB_CODES = { mode: null, skip: [], heldUntil: 0, proposeHeldUntil: 0, warnings: 0 };
 
 function hubCodeLabel(h) {
   if (!h.uic) return 'No station code';
@@ -2706,7 +2713,20 @@ function showHubCodesNext(left, label) {
   next.textContent = `${label} (${left} left)`;
 }
 
-// One candidate of a proposal: a tick box (proposed) or a choice (to pick).
+// A distance as the warnings write it: `640 m` below a kilometre, else `1.2 km`.
+function hubDistanceText(metres) {
+  return metres < 1000 ? `${metres} m` : `${(metres / 1000).toFixed(1)} km`;
+}
+
+// Where a candidate comes from, and how far it stands from the hub.
+function hubCandidateOrigin(candidate) {
+  const origin = candidate.found_by === 'name' ? 'by name' : 'by position';
+  const distance = Number.isFinite(candidate.distance_m) ? hubDistanceText(candidate.distance_m) : 'distance unknown';
+  return `${distance} · ${origin}`;
+}
+
+// One candidate of a proposal: a tick box (proposed) or a choice (to pick),
+// and its warning, as text, when it is not a station within 300 m.
 function hubCandidateInput(proposal, candidate, kind) {
   const label = document.createElement('label');
   const input = document.createElement('input');
@@ -2714,8 +2734,13 @@ function hubCandidateInput(proposal, candidate, kind) {
   input.name = `hub-code-${proposal.hub_id}`;
   input.value = candidate.uic;
   input.dataset.hubId = proposal.hub_id;
-  label.append(input, ` ${candidate.name} · ${candidate.uic} · ${candidate.country_iso || '?'} · ${candidate.distance_m} m`);
-  return label;
+  label.append(input, ` ${candidate.name} · ${candidate.uic} · ${candidate.country_iso || '?'} · ${hubCandidateOrigin(candidate)}`);
+  if (!candidate.warning) return [label];
+  const warning = hubCodesElement('div', `Warning: ${candidate.warning}`, 'hub-code-warning');
+  HUB_CODES.warnings += 1;
+  warning.id = `hub-code-warning-${HUB_CODES.warnings}`;
+  input.setAttribute('aria-describedby', warning.id);
+  return [label, warning];
 }
 
 // The "leave it" choice of a hub to pick, chosen at first: nothing is saved for it.
@@ -2730,22 +2755,54 @@ function hubLeaveInput(proposal) {
   return label;
 }
 
+// The sentence of a proposal with no candidate. A name is not searched only
+// when the search would refuse it (under 3 or over 100 characters).
+function hubNoCandidateNote(proposal) {
+  const where = proposal.state === 'no_position'
+    ? 'Its position cannot be searched'
+    : 'No station of the module within 300 m of this hub\'s position';
+  const byName = proposal.name_searched
+    ? 'and none found by its name'
+    : 'and its name was not searched (it is under 3 or over 100 characters)';
+  return `${where}, ${byName}: type the code in the hub form if you know it.`;
+}
+
+// The sentence about a proposal's candidates, or null.
+function hubCandidatesNote(proposal) {
+  if (!proposal.candidates.length) return hubNoCandidateNote(proposal);
+  if (proposal.state === 'no_position') return 'Found by its name, at a distance that cannot be told: check each one before saving, or leave it.';
+  if (proposal.name_searched) return 'No station returned by the position search; found by its name instead: check each one before saving, or leave it.';
+  if (proposal.state !== 'proposed') return 'Several stations within 300 m: pick one, or leave it.';
+  return null;
+}
+
+// The sentence about name results left out for standing over 50 km away.
+function hubFarNote(count) {
+  if (count === 1) return '1 more station found by name stands over 50 km from the hub\'s position and is not shown: check the position.';
+  return `${count} more stations found by name stand over 50 km from the hub's position and are not shown: check the position.`;
+}
+
+// The sentences above a proposal's candidates.
+function hubProposalNotes(proposal) {
+  const notes = [];
+  if (proposal.state === 'no_position') {
+    notes.push('This hub has no usable position: correct its latitude and longitude in the hub form.');
+  }
+  const about = hubCandidatesNote(proposal);
+  if (about) notes.push(about);
+  if (proposal.far_dropped) {
+    notes.push(hubFarNote(proposal.far_dropped));
+  }
+  return notes;
+}
+
 function hubProposalItem(proposal) {
   const item = hubCodesElement('div', undefined, 'hub-code-item');
   item.append(hubCodesElement('strong', proposal.hub_name));
-  if (proposal.state === 'no_position') {
-    item.append(hubCodesElement('div', 'This hub has no usable position: correct its latitude and longitude in the hub form.', 'hub-code-note'));
-    return item;
-  }
-  if (!proposal.candidates.length) {
-    item.append(hubCodesElement('div', 'No station of the module within 300 m of this hub\'s position: check the position, or type the code in the hub form if you know it.', 'hub-code-note'));
-    return item;
-  }
+  hubProposalNotes(proposal).forEach(note => item.append(hubCodesElement('div', note, 'hub-code-note')));
+  if (!proposal.candidates.length) return item;
   const kind = proposal.state === 'proposed' ? 'checkbox' : 'radio';
-  if (kind === 'radio') {
-    item.append(hubCodesElement('div', 'Several stations within 300 m: pick one, or leave it.', 'hub-code-note'));
-  }
-  proposal.candidates.forEach(c => item.append(hubCandidateInput(proposal, c, kind)));
+  proposal.candidates.forEach(c => item.append(...hubCandidateInput(proposal, c, kind)));
   if (kind === 'radio') item.append(hubLeaveInput(proposal));
   return item;
 }
