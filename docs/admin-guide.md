@@ -2476,7 +2476,8 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   that says the module is unreachable or misconfigured, it makes no call to
   the module for 30 seconds. The `web` log says why, one line per fallback:
   `station_module.fallback reason=<word>` (`off`, `timeout`, `network`,
-  `status_<n>`, `busy`, `shape`, `paused`), never the token. The hub
+  `status_<n>`, `busy`, `shape`, `paused`), never the token and never the
+  typed text. The hub
   station-code buttons (11.2) log their own failures the same way, as
   `station_module.lookup_failed`, `station_module.near_failed` and
   `station_module.admin_search_failed`, and never start the 30 seconds
@@ -2502,6 +2503,16 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   which stay on Trainline's codes for now (VIATOR issue #331). The daily
   Trainline import (04:00 UTC) keeps it fresh, as does **Refresh from
   Trainline** on the Stations page.
+- **A text the module would refuse is not sent.** The typeahead and the
+  Stations page search a text of 3 to 100 characters that still holds 3
+  once the module reads its punctuation (`, ; : . / \ ( ) [ ] { } " ! ? * +
+  &`, the quotes « » ‹ › “ ” „ ‟ ‚ ‛, … ¡ ¿ ⁄), hyphens and apostrophes as
+  spaces. "St.", "---" or "( )" are answered as a text too short is: no
+  call to the module, no Trainline list, no warning in the log (the
+  Stations page says what to type). VIATOR mirrors the module's list of
+  marks; should the module still refuse a text (its rules moved), VIATOR
+  answers the same way and logs `station_module.fallback
+  reason=status_422` at INFO, never the text.
 - **The Stations page** (`/admin/master/stations`, platform administrators
   and content managers) is a search page: one field (at least 3 characters),
   at most 10 results, no list, no paging, no total. Each search goes to the
@@ -2596,12 +2607,20 @@ uses the module (platform administrators only):
   **shortened word by word** and searched again: without its last word,
   then without its last two, down to its first word, three more searches
   at most. Words end where the module's search splits them: at a space,
-  a hyphen or a dash (-, ‐, ‑, ‒, –, —, −) or an apostrophe or quote
-  (', ‘, ’, ʼ, ` and ´). So a hub named "Zzcity Saint-Zzname" is searched
-  as "Zzcity Saint-Zzname", then "Zzcity Saint", then "Zzcity". This finds
+  a hyphen or a dash (-, ‐, ‑, ‒, –, —, −), an apostrophe or quote
+  (', ‘, ’, ʼ, ` and ´), or a mark of punctuation the module reads as a
+  space (`, ; : . / \ ( ) [ ] { } " ! ? * + &`, « » ‹ › “ ” „ ‟ ‚ ‛, … ¡ ¿
+  ⁄; MSMM release with its PR #29). So a hub named "Zzcity Saint-Zzname"
+  is searched as "Zzcity Saint-Zzname", then "Zzcity Saint", then
+  "Zzcity"; "Zzcity, Zzquarter" as "Zzcity, Zzquarter", then "Zzcity".
+  When a long name has a mark of punctuation, the text before the first
+  one (usually the town) is always among the three: "Zzcity-Zzname, Zzgare
+  de Zzsaint-Zzname" is searched as "Zzcity-Zzname, Zzgare de Zzsaint",
+  "Zzcity-Zzname, Zzgare de" and "Zzcity-Zzname". This finds
   a station the module names differently (for example with "St" for
   "Saint", or a building's name added: "Zzcity-St-Zzname - Building"). A
-  shortened form is not sent when it holds fewer than 3 letters or digits,
+  shortened form is not sent when it holds fewer than 3 letters or digits
+  (a hyphen, an apostrophe, ʼ included, or a mark of punctuation is not one),
   or when it ends with a one-letter word (such as the "d" of
   "Zzcity-d'Zzname"); a form never repeats the full name or another form.
   A name too long to search whole (over 100 characters) is still searched
