@@ -14,10 +14,12 @@ token drawn at run time.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
 import math
+import os
 import re
 import secrets
 import shutil
@@ -880,20 +882,22 @@ def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warn
     assert db.commits == 0
 
 
-def test_a_click_whose_full_names_are_searched_looks_at_six_hubs(
+def test_a_click_whose_full_names_are_searched_looks_at_seven_hubs(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
-    # Names with no shortened form: 2 calls a hub (near + full name). The
-    # budget of 15 lets a hub start while 10 calls or fewer are made: 6
-    # hubs, 12 calls (before the shortening: 10 hubs, 20 calls).
+    # Names with no shortened form: at most 2 calls a hub (near + full
+    # name), the worst case reserved for each. The budget of 15 lets a hub
+    # start while 13 calls or fewer are made: 7 hubs, 14 calls (before the
+    # shortening: 10 hubs, 20 calls).
     hubs.rows = [_hub(i) for i in range(25)]
 
     body = client.post(f"{BASE}/resolve", json={}).json()
 
-    assert len(module.of("near")) == 6
-    assert _searched(module) == [h.name for h in hubs.rows[:6]]
-    assert body["left"] == 19
+    assert len(module.of("near")) == 7
+    assert _searched(module) == [h.name for h in hubs.rows[:7]]
+    assert body["left"] == 18
     assert body["status"] == "ok"
+    assert body["call_budget_reached"] is True
 
 
 @pytest.mark.parametrize(
@@ -1194,42 +1198,162 @@ def test_a_form_that_finds_only_stations_beyond_50_km_does_not_stop_the_shorteni
 @pytest.mark.parametrize(
     ("name", "forms"),
     [
-        (_LONG_NAME, ["Zzville Zzsaint", "Zzville"]),
-        ("Zzville-d'Zzasq", ["Zzville-d", "Zzville"]),
-        ("Zzville d\u2019Zzasq", ["Zzville d", "Zzville"]),
-        ("Zzville\u2010Zzsud", ["Zzville"]),
-        ("Zzville", []),
-        # Under 3 characters: never sent.
-        ("ZZ Hub01", []),
-        ("Z Zzhub Zzend", ["Z Zzhub"]),
-        # Read by the module as a query already made: skipped.
-        ("Zzville Zzsaint-", ["Zzville"]),
-        ("Zzville - Zzsaint", ["Zzville"]),
-        ("Zzab Zzcd'", ["Zzab"]),
+        pytest.param(_LONG_NAME, ["Zzville Zzsaint", "Zzville"], id="space-and-hyphen"),
+        # A form ending with a one-letter word (an elision) is skipped.
+        pytest.param("Zzville-d'Zzasq", ["Zzville"], id="apostrophe-elision"),
+        pytest.param("Zzville d\u2019Zzasq", ["Zzville"], id="typographic-apostrophe"),
+        pytest.param("Zzab c Zzdef", ["Zzab"], id="one-letter-word-inside"),
+        pytest.param("Zzl\u2018Zzisle Zzx", ["Zzl\u2018Zzisle", "Zzl"], id="left-quote"),
+        pytest.param("Zzl\u02bcZzisle Zzx", ["Zzl\u02bcZzisle", "Zzl"], id="modifier-apostrophe"),
+        pytest.param("Zzab`Zzcd Zzef", ["Zzab`Zzcd", "Zzab"], id="backtick"),
+        pytest.param("Zzab\u00b4Zzcd", ["Zzab"], id="acute"),
+        pytest.param("Zzville \u2013 Zzsaint", ["Zzville"], id="en-dash-spaced"),
+        pytest.param("Zzville\u2013Zzsaint", ["Zzville"], id="en-dash-joined"),
+        pytest.param(
+            "Zz \u2013 Zzville Zzx Zzy",
+            ["Zz \u2013 Zzville Zzx", "Zz \u2013 Zzville"],
+            id="dash-after-a-short-word",
+        ),
+        pytest.param("Zzville", [], id="one-word"),
+        # Fewer than 3 letters or digits: never sent.
+        pytest.param("ZZ Hub01", [], id="first-word-too-short"),
+        pytest.param("Z Zzhub Zzend", ["Z Zzhub"], id="single-letter-skipped"),
+        pytest.param("Zz ** Zzville", [], id="collapses-below-three"),
+        # The same words as the full name, for the module: never made.
+        pytest.param("Zzville Zzsaint-", ["Zzville"], id="trailing-hyphen"),
+        pytest.param("Zzville Zzsaint \u2013", ["Zzville"], id="trailing-en-dash"),
+        pytest.param("Zzville - Zzsaint", ["Zzville"], id="spaced-hyphen"),
+        pytest.param("Zzab Zzcd'", ["Zzab"], id="trailing-apostrophe"),
         # At most three forms, the longest.
-        (
+        pytest.param(
             "Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6",
             ["Zza1 Zzb2 Zzc3 Zzd4 Zze5", "Zza1 Zzb2 Zzc3 Zzd4", "Zza1 Zzb2 Zzc3"],
+            id="at-most-three",
         ),
-    ],
-    ids=[
-        "space-and-hyphen",
-        "apostrophe",
-        "typographic-apostrophe",
-        "unicode-hyphen",
-        "one-word",
-        "first-word-too-short",
-        "single-letter-skipped",
-        "trailing-hyphen",
-        "spaced-hyphen",
-        "trailing-apostrophe",
-        "at-most-three",
     ],
 )
 def test_the_shortened_forms_of_a_name(name: str, forms: list[str]) -> None:
     assert network_coverage.NAME_SHORTEN_MAX == 3
     query = network_coverage.station_suggest.normalise_query(name)
     assert network_coverage._shortened_names(query) == forms
+
+
+# The module's separators (MSMM app/master/station_search.py, `_HYPHENS` and
+# `_APOSTROPHES`, origin/main of 10 Oct), written out here a second time.
+_MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
+_MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
+
+
+def _module_separators(path: Path) -> tuple[str, str]:
+    """`_HYPHENS` and `_APOSTROPHES` as the module's source writes them."""
+    text = path.read_text(encoding="utf-8")
+    found = {}
+    for name in ("_HYPHENS", "_APOSTROPHES"):
+        match = re.search(rf"^{name} = (\"[^\"]*\")$", text, re.M)
+        assert match, name
+        found[name] = ast.literal_eval(match.group(1))
+    return found["_HYPHENS"], found["_APOSTROPHES"]
+
+
+def test_the_separators_mirror_the_modules() -> None:
+    """VIATOR splits words where the module's search does. VIATOR's CI
+    cannot read the module's private code: the copy is pinned here, and
+    compared with the module's source itself when MSMM_STATION_SEARCH names
+    a checkout's app/master/station_search.py (as the review did)."""
+    assert network_coverage.MODULE_HYPHENS == _MODULE_HYPHENS
+    assert network_coverage.MODULE_APOSTROPHES == _MODULE_APOSTROPHES
+    source = os.environ.get("MSMM_STATION_SEARCH")
+    if source:
+        hyphens, apostrophes = _module_separators(Path(source))
+        assert hyphens == network_coverage.MODULE_HYPHENS
+        assert apostrophes == network_coverage.MODULE_APOSTROPHES
+    # Each one splits two words, and white space too.
+    for separator in _MODULE_HYPHENS + _MODULE_APOSTROPHES + "\u00a0\u202f\u3000":
+        assert network_coverage._shortened_names(f"Zzab{separator}Zzcd") == ["Zzab"], separator
+
+
+def test_a_name_with_fewer_than_three_letters_is_not_searched(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # Four characters for the length rule, but two letters once the module
+    # makes the dash a space: the module would answer a 422.
+    hubs.rows = [_hub(1, name="Zz \u2013")]
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert module.of("search") == []
+    assert proposal["name_searched"] is False
+    assert proposal["shortened_searches"] == 0
+
+
+_TOO_LONG = " ".join(f"Zzword{i:02d}" for i in range(13))  # 116 characters
+
+
+def test_a_name_too_long_to_search_whole_is_still_shortened(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    eleven = " ".join(_TOO_LONG.split()[:11])  # 98 characters
+    ten = " ".join(_TOO_LONG.split()[:10])
+    hubs.rows = [_sea_hub(name=_TOO_LONG), _hub(2, name=_TOO_LONG, lat=math.nan)]
+    _answers(module, {ten: [_north("ZZ Long", "9900271", 0.0018)]})
+
+    first, second = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    # 12 words make 107 characters: refused; then 11 words, then 10, which
+    # finds. The hub without position is not searched at all.
+    assert _searched(module) == [eleven, ten]
+    assert first["name_searched"] is False
+    assert first["shortened_searches"] == 2
+    assert first["candidates"][0]["shortened_name"] == ten
+    assert second["name_searched"] is False
+    assert second["shortened_searches"] == 0
+    assert network_coverage._hub_worst_calls(hubs.rows[0]) == 4
+
+
+def test_a_text_the_module_refuses_is_a_form_that_found_nothing(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    refused = httpx.Response(422, json={"detail": "ZZ", "code": "zz"})
+    hubs.rows = [_sea_hub(name=_LONG_NAME)]
+    module.search = lambda q: (
+        httpx.Response(200, json={"stations": [_north("ZZ Found", "9900281", 0.0018)]})
+        if q == "Zzville"
+        else refused
+    )
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # The full name and the first form are refused: the next form is tried.
+    assert _searched(module) == [_LONG_NAME, "Zzville Zzsaint", "Zzville"]
+    assert body["status"] == "ok"
+    (proposal,) = body["proposals"]
+    assert proposal["candidates"][0]["uic"] == "9900281"
+    assert proposal["name_searched"] is True
+    assert proposal["shortened_searches"] == 2
+    assert not station_module.paused()
+    assert db.commits == 0
+
+
+def test_a_hub_whose_every_search_is_refused_never_blocks_the_next_hubs(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_sea_hub(1, name=_LONG_NAME), _sea_hub(2)]
+    module.search = lambda q: (
+        httpx.Response(422, json={"detail": "ZZ", "code": "zz"})
+        if q.startswith("Zzville")
+        else httpx.Response(200, json={"stations": [_north("ZZ Next", "9900291", 0.0018)]})
+    )
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    # The click goes on: the first hub is shown with nothing, so the next
+    # click skips it, and the second hub is looked at.
+    assert body["status"] == "ok"
+    first, second = body["proposals"]
+    assert first["candidates"] == []
+    assert first["shortened_searches"] == 2
+    assert second["candidates"][0]["uic"] == "9900291"
+    assert body["left"] == 0
 
 
 def test_the_shortening_makes_at_most_three_more_searches(
@@ -1335,11 +1459,10 @@ def test_a_click_looks_at_a_hub_only_while_its_worst_case_fits_the_budget(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     # Two hubs at 5 calls (10), then hubs whose near call finds a station
-    # (1 call each): the third fits (10 + 5 <= 15), the fourth would not
-    # (11 + 5 > 15), although it would only cost one call.
-    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(2)] + [
-        _hub(i) for i in range(2, 6)
-    ]
+    # (1 call each, but a worst case of 5): the third fits (10 + 5 <= 15),
+    # the fourth would not (11 + 5 > 15), although it would only cost one.
+    names = [f"Zza{i} Zzb Zzc Zzd Zze" for i in range(6)]
+    hubs.rows = [_hub(i, name=names[i]) for i in range(6)]
     nears = iter([_near_answer()] * 2 + [_near_answer(_near("ZZ One", "9900261", 15))] * 4)
     module.near = lambda _b: next(nears)
 
@@ -1348,6 +1471,30 @@ def test_a_click_looks_at_a_hub_only_while_its_worst_case_fits_the_budget(
     assert len(module.requests) == 11
     assert len(body["proposals"]) == 3
     assert body["left"] == 3
+    assert body["call_budget_reached"] is True
+
+
+def test_a_hub_without_position_reserves_only_its_one_search(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    # 10 calls for two hubs, 1 for a hub found by position (worst case 5),
+    # then four hubs without a usable position: each can only make its full
+    # name's search, so each fits (12, 13, 14, 15 <= 15).
+    hubs.rows = [_hub(i, name=f"Zza{i} Zzb Zzc Zzd Zze") for i in range(3)] + [
+        _hub(i, lat=math.nan) for i in range(3, 7)
+    ]
+    nears = iter([_near_answer(), _near_answer(), _near_answer(_near("ZZ One", "9900262", 15))])
+    module.near = lambda _b: next(nears)
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert network_coverage._hub_worst_calls(hubs.rows[3]) == 1
+    assert network_coverage._hub_worst_calls(hubs.rows[0]) == 5
+    assert network_coverage._hub_worst_calls(_hub(1)) == 2
+    assert len(module.requests) == 15
+    assert len(body["proposals"]) == 7
+    assert body["left"] == 0
+    assert body["call_budget_reached"] is False
 
 
 # ───────────────────────────── confirm ─────────────────────────────

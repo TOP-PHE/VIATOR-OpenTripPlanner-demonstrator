@@ -122,21 +122,28 @@ _HUB_NOT_FOUND = "Hub not found"
 # and internal_user_per_day).
 # Ten hubs at 5 calls would be 50 calls, 60 with the confirm: the whole
 # minute. So a click also has a budget of RESOLVE_CALL_BUDGET = 15 calls: it
-# looks at the next hub only while the calls made so far plus that hub's
-# worst case (5) stay within 15. Worst case of one resolve click: 15 calls
-# (3 hubs, each at 1 near + 1 full name + 3 shortened names); a click whose
-# near calls find stations still looks at 10 hubs for 10 calls, one whose
-# full names find them 6 hubs for 12 calls. Before the shortening the worst
-# click was 20 calls (10 near + 10 searches): 3 such clicks in a row filled
-# the 60 a minute (an administrator clicking Propose and Check in a row met
-# the limit in production). Now 4 worst resolve clicks fit in a minute
-# (4 x 15 = 60), a check click stays 20 (3 a minute). With its confirm (at
-# most one code per hub looked at, so at most 10): 15 + 10 = 25 at the very
-# worst. The module's per-person minute limit must be 20 or more (a check
-# click). A near call also counts on the module's own near quota (decision
-# 62 of the module: 30 a minute and 200 a day for one person, 500 a day for
-# everybody; a search does not): at most 10 a click stays under the 30 a
-# minute. At 15 calls a click the day of 2,000 allows 133 clicks.
+# looks at the next hub only while the calls made so far plus that hub's own
+# worst case (`_hub_worst_calls`: its near call if it has a usable position,
+# its full name if searchable, and as many shortened forms as its name has,
+# at most 3; 1 for a hub without position) stay within 15; the page then
+# says why it stopped. Worst case of one resolve click: 15 calls (3 hubs,
+# each at 1 near + 1 full name + 3 shortened names). A click whose near
+# calls find stations still looks at 10 hubs for 10 calls; one of hubs
+# whose names have no shortened form, found by their full names, at 7 hubs
+# for 14 calls. Before the shortening the worst click was 20 calls (10 near
+# + 10 searches): 3 such clicks in a row filled the 60 a minute (an
+# administrator clicking Propose and Check in a row met the limit in
+# production). Now 4 worst resolve clicks fit in a minute (4 x 15 = 60); a
+# check click stays 20 (3 a minute). With its confirm (at most one code per
+# hub looked at, so at most 10): 15 + 10 = 25 at the very worst. The
+# module's per-person minute limit must be 20 or more (a check click).
+# A near call also counts on the module's own near quota (decision 62 of
+# the module: 30 a minute and 200 a day for one person, 500 a day for
+# everybody; a search does not): 10 a click stays under the 30 a minute, so
+# three clicks in one minute pass and a fourth is refused with a 429 and its
+# Retry-After (clicks whose near calls find stations: 3 a minute, before and
+# after the shortening). At 15 calls a click the day of 2,000 allows 133
+# clicks.
 RESOLVE_BATCH = 10
 RESOLVE_CALL_BUDGET = 15
 CONFIRM_BATCH = 10
@@ -159,14 +166,16 @@ NAME_FALLBACK_MAX_DISTANCE_M = 50_000
 # The name shortening (owner decision of 10 Oct): when the full name keeps
 # no candidate, the name is searched again without its last word, then its
 # last two, and so on down to its first word, at most this many times per
-# hub. Words are split at white space, hyphens and apostrophes, so the
+# hub. Words are split where the module's search splits them (white space,
+# its hyphens and apostrophes: MODULE_HYPHENS, MODULE_APOSTROPHES), so the
 # module's "Marseille-St-Charles" is found by "Marseille" for the hub
 # "Marseille Saint-Charles". Only for a hub with a usable position: without
 # a distance to order and filter them, the results of a single word would be
 # a guess.
 NAME_SHORTEN_MAX = 3
 # The most calls one hub of a resolve click can make: its near call, the
-# search with its full name, and the shortened ones.
+# search with its full name, and the shortened ones (`_hub_worst_calls`
+# gives each hub's own, never more).
 RESOLVE_HUB_MAX_CALLS = 1 + 1 + NAME_SHORTEN_MAX
 _EARTH_RADIUS_M = 6_371_000.0
 # The most hub ids a resolve or check request may name as already shown.
@@ -183,6 +192,10 @@ _NEAR_NEEDS_NEWER_MODULE = (
 # 62); the daily ones end at midnight UTC.
 _NEAR_WINDOWS = frozenset({"near_user_minute", "near_user_day", "near_all_day"})
 _STILL_WORKS = "Saving and checking codes still work."
+# The reason of a search the module refused as a text it does not take (its
+# 422): the same text always gets the same answer, so it is not a failure
+# to stop at but a form that found nothing.
+_TEXT_REFUSED = "status_422"
 # The matrix order of the hubs, the order in which they are resolved and checked.
 _MATRIX_ORDER = (NetworkCoverageHub.country, NetworkCoverageHub.sort_order, NetworkCoverageHub.id)
 
@@ -924,6 +937,9 @@ class HubResolveResponse(BaseModel):
     # near call is refused, so the panel holds "Propose" and "next" alone
     # and keeps saving and checking codes.
     near_limited: bool = False
+    # True when the click stopped before RESOLVE_BATCH hubs because the next
+    # hub's worst case would pass RESOLVE_CALL_BUDGET: the page says why.
+    call_budget_reached: bool = False
 
 
 class HubConfirmPair(BaseModel):
@@ -1140,54 +1156,87 @@ def _name_warning(
     )
 
 
+# The characters the station module's search reads as a space between two
+# words: a mirror of MSMM app/master/station_search.py `_HYPHENS` and
+# `_APOSTROPHES` (its fold makes each of them, and white space, a space).
+# VIATOR cannot import the module's code, so they are copied here; change
+# them with the module's (a test pins the copy).
+MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
+MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
+_NAME_WORD = re.compile(r"[^\s" + re.escape(MODULE_HYPHENS + MODULE_APOSTROPHES) + "]+")
+# The fewest letters or digits a text the module searches must hold: its
+# own rule is 3 characters once folded (separators made spaces), so a text
+# like "Zz" and a dash is refused with a 422. Three letters or digits always pass it.
+_SEARCH_MIN_LETTERS = 3
+
+
+def _searchable(text: str) -> bool:
+    """True when `text` holds enough letters or digits for the module."""
+    return sum(character.isalnum() for character in text) >= _SEARCH_MIN_LETTERS
+
+
 def _name_query(hub: NetworkCoverageHub) -> str | None:
     """The hub's name as the module's search takes it (the typeahead's own
     rule, `station_suggest.normalise_query`: NFC, white space made single,
-    3 to 100 characters), or None when the search would refuse it. Sent as
-    stored otherwise: no word is removed."""
+    3 to 100 characters, and at least 3 letters or digits), or None when
+    the search would refuse it. Sent as stored otherwise: no word is
+    removed."""
     if not isinstance(hub.name, str):
         return None
     try:
-        return station_suggest.normalise_query(hub.name)
+        query = station_suggest.normalise_query(hub.name)
     except ValueError:
         return None
+    return query if _searchable(query) else None
 
 
-# What separates two words of a hub's name for the shortening: white space,
-# hyphens (the ASCII one and the two Unicode ones) and apostrophes (straight
-# and typographic).
-_NAME_BREAK_CHARACTERS = r"\s\-" + "\u2010\u2011'\u2019"
-_NAME_WORD = re.compile(f"[^{_NAME_BREAK_CHARACTERS}]+")
-_NAME_BREAKS = re.compile(f"[{_NAME_BREAK_CHARACTERS}]+")
-
-
-def _query_key(text: str) -> str:
-    """What two queries share when the module would read them alike: the
-    words, separated by one space, ignoring case."""
-    return _NAME_BREAKS.sub(" ", text).strip().casefold()
-
-
-def _shortened_names(query: str) -> list[str]:
-    """The shortened forms of a hub's name (`query`, already normalised),
-    longest first: the name up to the end of each word but the last, down
-    to its first word, at most NAME_SHORTEN_MAX of them. A form the search
-    would refuse (under 3 characters) is skipped, and so is one the module
-    would read as the full name (the same words: a name ending with a
-    hyphen or an apostrophe). Two shortened forms never hold the same
-    words, so the full name is the only query one could repeat."""
-    full = _query_key(query)
+def _shortened_names(name: str) -> list[str]:
+    """The shortened forms of a hub's name (`name`: NFC, white space made
+    single), longest first: the name up to the end of each word but the
+    last, down to its first word, at most NAME_SHORTEN_MAX of them. Words
+    are split at white space and at the module's hyphens and apostrophes,
+    so a form never ends with a separator and never repeats the full name
+    or another form in the module's eyes (each holds fewer words than the
+    one before). Skipped: a form whose last word is a single letter (an
+    elision such as "Zzville-d"), one with fewer than 3 letters or digits,
+    and one the search would refuse (over 100 characters)."""
     shortened: list[str] = []
-    ends = [word.end() for word in _NAME_WORD.finditer(query)]
-    for end in reversed(ends):
+    words = list(_NAME_WORD.finditer(name))
+    for word in reversed(words[:-1]):
         if len(shortened) == NAME_SHORTEN_MAX:
             break
+        text = name[: word.end()]
+        if len(word.group()) == 1 or not _searchable(text):
+            continue
         try:
-            text = station_suggest.normalise_query(query[:end])
+            shortened.append(station_suggest.normalise_query(text))
         except ValueError:
             continue
-        if _query_key(text) != full:
-            shortened.append(text)
     return shortened
+
+
+def _name_plan(hub: NetworkCoverageHub, *, located: bool) -> tuple[str | None, list[str]]:
+    """The searches the name fallback may make for a hub: its full name
+    (None when the search would refuse it) and its shortened forms. A hub
+    without a usable position is never shortened. A name too long to be
+    searched whole (over 100 characters) is still shortened."""
+    query = _name_query(hub)
+    if not located or not isinstance(hub.name, str):
+        return query, []
+    if query is not None:
+        return query, _shortened_names(query)
+    joined = " ".join(unicodedata.normalize("NFC", hub.name).split())
+    if len(joined) > station_suggest.QUERY_MAX:
+        return None, _shortened_names(joined)
+    return None, []
+
+
+def _hub_worst_calls(hub: NetworkCoverageHub) -> int:
+    """The most calls a resolve click can make for this hub: its near call
+    (with a usable position), its full name, and its shortened forms."""
+    located = _has_position(hub)
+    query, forms = _name_plan(hub, located=located)
+    return int(located) + int(query is not None) + len(forms)
 
 
 def _name_candidates(
@@ -1294,27 +1343,29 @@ async def _look_up_by_name(
     (`station_module.admin_search_outcome`, which never pauses the
     typeahead); when it keeps no candidate and the hub has a usable
     position, one search with each shortened form of the name
-    (`_shortened_names`), longest first, until one keeps a candidate. A
-    name the search would refuse is not sent: the hub is shown with no
-    candidate. Never `proposed` (owner rule): even a single candidate
-    within 300 m is to pick. A failure stops the click as a near failure
-    does (a 429 keeps what was found, with the module's Retry-After); the
-    rest of the shortened forms are not searched."""
+    (`_name_plan`), longest first, until one keeps a candidate. A name the
+    search would refuse is not sent. Never `proposed` (owner rule): even a
+    single candidate within 300 m is to pick. A text the module refuses
+    (a 422) found nothing: the next form is tried, so that a hub never
+    blocks every later click. Any other failure stops the click as a near
+    failure does (a 429 keeps what was found, with the module's
+    Retry-After); the rest of the forms are not searched."""
     state: Literal["to_pick", "no_position"] = "to_pick" if located else "no_position"
-    query = _name_query(hub)
-    if query is None:
-        return HubProposal(hub_id=hub.id, hub_name=hub.name, state=state, candidates=[]), 0
-    queries = [query, *(_shortened_names(query) if located else [])]
+    query, forms = _name_plan(hub, located=located)
+    searches: list[tuple[str, str | None]] = [(form, form) for form in forms]
+    if query is not None:
+        searches.insert(0, (query, None))
     candidates: list[HubCandidate] = []
     far: set[str] = set()
-    searches = 0
-    for index, text in enumerate(queries):
+    made = 0
+    for text, shortened in searches:
         outcome = await station_module.admin_search_outcome(text, user_id)
-        searches += 1
+        made += 1
         if outcome.rows is None:
+            if outcome.reason == _TEXT_REFUSED:
+                continue
             status, message, retry_after = _failure(outcome)
-            return _ResolveStop(status, message, retry_after, near_limited=False), searches
-        shortened = text if index else None
+            return _ResolveStop(status, message, retry_after, near_limited=False), made
         candidates, far_here = _name_candidates(
             hub, outcome.rows, located=located, shortened=shortened
         )
@@ -1326,11 +1377,11 @@ async def _look_up_by_name(
         hub_name=hub.name,
         state=state,
         candidates=candidates,
-        name_searched=True,
+        name_searched=query is not None,
         far_dropped=len(far),
-        shortened_searches=searches - 1,
+        shortened_searches=made - int(query is not None),
     )
-    return proposal, searches
+    return proposal, made
 
 
 async def _look_at(
@@ -1386,8 +1437,10 @@ async def resolve_hub_codes(
         )
     proposals: list[HubProposal] = []
     calls = 0
+    budget_reached = False
     for hub in hubs[:RESOLVE_BATCH]:
-        if calls + RESOLVE_HUB_MAX_CALLS > RESOLVE_CALL_BUDGET:
+        if calls + _hub_worst_calls(hub) > RESOLVE_CALL_BUDGET:
+            budget_reached = True
             break
         looked, made = await _look_at(hub, user_id)
         calls += made
@@ -1401,7 +1454,12 @@ async def resolve_hub_codes(
                 near_limited=looked.near_limited,
             )
         proposals.append(looked)
-    return HubResolveResponse(status="ok", proposals=proposals, left=len(hubs) - len(proposals))
+    return HubResolveResponse(
+        status="ok",
+        proposals=proposals,
+        left=len(hubs) - len(proposals),
+        call_budget_reached=budget_reached,
+    )
 
 
 @router.post("/hubs/confirm", responses=_HUB_CODE_RESPONSES)
