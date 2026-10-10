@@ -846,8 +846,30 @@ async def test_a_429_with_retry_after_gives_its_seconds(module: Module) -> None:
 
     outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
 
-    assert outcome == station_module.Outcome(None, "status_429", 17)
+    assert outcome == station_module.Outcome(None, "status_429", 17, "user_minute")
     assert not station_module.paused()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [None, 7, "zz_window", "USER_MINUTE", "user_minute ", "near_user_day\u0000"],
+    ids=["none", "a-number", "unknown", "capitals", "a-space", "a-nul"],
+)
+async def test_a_429_window_word_outside_the_known_ones_gives_none(
+    module: Module, code: Any
+) -> None:
+    module.handler = lambda _r: httpx.Response(429, json={"detail": "ZZ", "code": code})
+
+    outcome = await station_module.search_outcome("Zzville", uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, "status_429", None, None)
+
+
+@pytest.mark.parametrize("code", sorted(station_module.LIMIT_CODES))
+async def test_each_known_429_window_word_is_kept(module: Module, code: str) -> None:
+    module.handler = lambda _r: httpx.Response(429, json={"detail": "ZZ", "code": code})
+
+    assert (await station_module.search_outcome("Zzville", uuid.uuid4())).code == code
 
 
 @pytest.mark.parametrize(
@@ -1092,7 +1114,7 @@ async def test_a_lookup_429_gives_its_retry_after(module: Module) -> None:
 
     outcome = await station_module.lookup(["9900001"], uuid.uuid4())
 
-    assert outcome == station_module.Outcome(None, "status_429", 42)
+    assert outcome == station_module.Outcome(None, "status_429", 42, "user_minute")
 
 
 async def test_a_running_pause_is_honoured_by_lookup(
@@ -1344,7 +1366,9 @@ async def test_near_posts_the_position_in_the_body_with_only_its_own_headers(
     assert str(request.url) == f"{MODULE_URL}/internal/v1/stations/near"
     assert request.url.query == b""
     # The radius defaults to the module's largest, 300 m, sent as an integer.
-    assert json.loads(request.content) == {"lat": _SEA_LAT, "lon": _SEA_LON, "radius_m": 300}
+    body = json.loads(request.content)
+    assert body == {"lat": _SEA_LAT, "lon": _SEA_LON, "radius_m": 300}
+    assert type(body["radius_m"]) is int
     assert request.headers["authorization"] == f"Bearer {token}"
     assert request.headers["x-viator-user-id"] == str(user)
     assert request.headers["content-type"] == "application/json"
@@ -1366,6 +1390,7 @@ async def test_near_sends_the_radius_asked_and_an_integer_position_as_a_number(
     body = json.loads(module.requests[0].content)
     assert body == {"lat": -48.0, "lon": -123.0, "radius_m": 150}
     assert isinstance(body["lat"], float)
+    assert type(body["radius_m"]) is int
 
 
 async def test_near_gives_the_rows_with_parent_and_distance_in_the_order_of_the_answer(
@@ -1466,7 +1491,7 @@ async def test_a_near_429_gives_its_retry_after_and_no_pause(module: Module, cod
 
     outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
 
-    assert outcome == station_module.Outcome(None, "status_429", 42)
+    assert outcome == station_module.Outcome(None, "status_429", 42, code)
     assert not station_module.paused()
 
 
@@ -1606,3 +1631,22 @@ async def test_near_never_logs_a_position_a_code_or_the_token(
     assert marker not in logged
     assert token not in logged
     assert "stand-in failure" not in logged
+
+
+@pytest.mark.parametrize(
+    ("lat", "lon", "refused"),
+    [
+        (45.0, 6.0, False),
+        (-90, 180, False),
+        (None, 6.0, True),
+        (45.0, None, True),
+        (math.nan, 6.0, True),
+        (45.0, -math.inf, True),
+        (False, 6.0, True),
+        (90.000001, 6.0, True),
+        (45.0, 180.000001, True),
+    ],
+    ids=["plain", "edges", "no-lat", "no-lon", "nan", "infinite", "truth", "lat-out", "lon-out"],
+)
+def test_position_refused_is_the_near_calls_rule(lat: Any, lon: Any, refused: bool) -> None:
+    assert (station_module.position_refused(lat, lon) is not None) is refused

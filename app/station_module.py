@@ -116,6 +116,20 @@ LONGITUDE_MAX = 180.0
 RETRY_AFTER_MAX = 86_400
 # ASCII digits only: `\d` alone would also take digits of other scripts.
 _DIGITS = re.compile(r"\d{1,6}", re.ASCII)
+# The window words of a module 429 (its design 20.4 and 21.13) kept in an
+# `Outcome`; any other `code` gives None. The last three refuse the near call
+# alone: search and lookup go on.
+LIMIT_CODES = frozenset(
+    {
+        "user_minute",
+        "user_day",
+        "all_minute",
+        "all_day",
+        "near_user_minute",
+        "near_user_day",
+        "near_all_day",
+    }
+)
 
 # The typeahead is on the keystroke path: one second at most for the whole
 # call (SEARCH_DEADLINE, enforced around it: httpx's own timeouts bound each
@@ -166,22 +180,37 @@ class Outcome:
     reason word of the failure (`off`, `paused`, `timeout`, `network`,
     `status_<n>`, `busy`, `shape`). `retry_after`: on a 429, the whole
     seconds of the module's `Retry-After` when it is a plain number from 1
-    to 86,400, else None."""
+    to 86,400, else None. `code`: on a 429, the module's window word (its
+    `code`, such as `user_minute` or `near_user_day`) when it is one of
+    `LIMIT_CODES`, else None: it tells a refusal of the near call alone from
+    one of every call."""
 
     rows: list[dict[str, Any]] | None
     reason: str
     retry_after: int | None = None
+    code: str | None = None
 
 
 class _Failure(Exception):
     """A call that ends in the fallback: the reason word, whether it pauses,
-    and the `Retry-After` of a 429."""
+    and the `Retry-After` and window word of a 429."""
 
-    def __init__(self, reason: str, *, pause: bool, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        pause: bool,
+        retry_after: int | None = None,
+        code: str | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.pause = pause
         self.retry_after = retry_after
+        self.code = code
+
+    def outcome(self) -> Outcome:
+        return Outcome(None, self.reason, self.retry_after, self.code)
 
 
 class _Answer:
@@ -334,7 +363,9 @@ def _status_failure(answer: _Answer) -> _Failure:
             return _Failure("busy", pause=False)
         return _Failure("status_503", pause=code in _PAUSING_503_CODES)
     if status == 429:
-        return _Failure("status_429", pause=False, retry_after=answer.retry_after)
+        code = _error_code(answer)
+        word = code if code in LIMIT_CODES else None
+        return _Failure("status_429", pause=False, retry_after=answer.retry_after, code=word)
     return _Failure(f"status_{status}", pause=status in _PAUSING_STATUSES)
 
 
@@ -443,7 +474,7 @@ async def search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
         rows = _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
     except _Failure as failure:
         _fail(failure)
-        return Outcome(None, failure.reason, failure.retry_after)
+        return failure.outcome()
     except Exception:
         # Anything else (an address httpx refuses, a token it cannot encode, a
         # JSON parser error) falls back too, and its text is never logged: an
@@ -540,7 +571,7 @@ async def _without_pause(
         rows = await call()
     except _Failure as failure:
         _log_failure(event, failure.reason)
-        return Outcome(None, failure.reason, failure.retry_after)
+        return failure.outcome()
     except Exception:
         # As in search(): its text is never logged; and no pause.
         _log_failure(event, "network")
@@ -548,15 +579,25 @@ async def _without_pause(
     return Outcome(rows, "ok")
 
 
-def _checked_position(lat: float, lon: float, radius_m: int) -> dict[str, Any]:
-    """The body of a near call, or ValueError: a finite latitude of -90 to 90
-    and longitude of -180 to 180 (not a truth value), and a whole radius of 1
-    to 300 metres. The module would refuse the call otherwise, after
-    counting it."""
+def position_refused(lat: Any, lon: Any) -> str | None:
+    """Why a position would be refused by the module's near call, as a few
+    words, or None: a latitude and a longitude must be finite numbers (not a
+    truth value, not None) from -90 to 90 and from -180 to 180. The hubs'
+    resolve route asks it before sending a hub's stored position."""
     if not (_is_number(lat) and -LATITUDE_MAX <= lat <= LATITUDE_MAX):
-        raise ValueError("a near call takes a latitude from -90 to 90")
+        return "a near call takes a latitude from -90 to 90"
     if not (_is_number(lon) and -LONGITUDE_MAX <= lon <= LONGITUDE_MAX):
-        raise ValueError("a near call takes a longitude from -180 to 180")
+        return "a near call takes a longitude from -180 to 180"
+    return None
+
+
+def _checked_position(lat: float, lon: float, radius_m: int) -> dict[str, Any]:
+    """The body of a near call, or ValueError: a position `position_refused`
+    accepts, and a whole radius of 1 to 300 metres. The module would refuse
+    the call otherwise, after counting it."""
+    refused = position_refused(lat, lon)
+    if refused is not None:
+        raise ValueError(refused)
     if (
         not isinstance(radius_m, int)
         or isinstance(radius_m, bool)
