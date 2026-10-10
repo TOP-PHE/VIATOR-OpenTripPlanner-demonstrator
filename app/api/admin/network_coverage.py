@@ -37,7 +37,6 @@ polls GET /runs/{id} every 5s to render progress; status flips to
 from __future__ import annotations
 
 import logging
-import math
 import re
 import unicodedata
 import uuid
@@ -129,6 +128,15 @@ _SKIP_MAX = 2_000
 _CODE_RULE = "uic must be 3 to 20 characters, with no white space and no control character"
 _MODULE_DID_NOT_ANSWER = "The station module did not answer; nothing was changed."
 _MODULE_OFF = "The station module is not configured; nothing was changed."
+# A 404 on the near call: the module is older than the release that added it.
+_NEAR_NEEDS_NEWER_MODULE = (
+    "The station module does not offer this call: proposing codes by position needs "
+    "MSMM v0.3.4 or later. Nothing was changed."
+)
+# The module's 429 window words that refuse the near call alone (its decision
+# 62); the daily ones end at midnight UTC.
+_NEAR_WINDOWS = frozenset({"near_user_minute", "near_user_day", "near_all_day"})
+_STILL_WORKS = "Saving and checking codes still work."
 # The matrix order of the hubs, the order in which they are resolved and checked.
 _MATRIX_ORDER = (NetworkCoverageHub.country, NetworkCoverageHub.sort_order, NetworkCoverageHub.id)
 
@@ -831,13 +839,18 @@ class HubResolveResponse(BaseModel):
     """`status`: `ok`; `limited` (the module's limit was reached: what was
     found before is kept, `retry_after` seconds to wait, or None when the
     module gave none); `unavailable` (the module is not configured, paused or
-    failed: `message` says which). `left`: unresolved hubs not looked at yet."""
+    failed: `message` says which). `left`: unresolved hubs not looked at yet.
+    `near_limited`: the limit reached is one of the near call alone."""
 
     status: Literal["ok", "limited", "unavailable"]
     message: str | None = None
     retry_after: int | None = None
     proposals: list[HubProposal]
     left: int
+    # True when the 429 came from one of the module's near windows: only the
+    # near call is refused, so the panel holds "Propose" and "next" alone
+    # and keeps saving and checking codes.
+    near_limited: bool = False
 
 
 class HubConfirmPair(BaseModel):
@@ -944,20 +957,44 @@ def _failure(
     return "unavailable", _MODULE_DID_NOT_ANSWER, None
 
 
+def _near_limit_message(code: str, retry_after: int | None) -> str:
+    """The sentence of a near window's 429: the minute one with its wait, a
+    daily one "tomorrow (UTC)" (its window ends at midnight UTC) rather than
+    up to a day of seconds; and that saving and checking still work."""
+    if code == "near_user_minute":
+        wait = f"{retry_after} seconds" if retry_after is not None else "a minute"
+        sentence = f"Your limit of proposals a minute is reached; try again in {wait}."
+    elif code == "near_user_day":
+        sentence = "Your daily limit of proposals is reached; try again tomorrow (UTC)."
+    else:
+        sentence = (
+            "The daily limit of proposals shared by every administrator is reached; "
+            "try again tomorrow (UTC)."
+        )
+    return f"{sentence} {_STILL_WORKS}"
+
+
+def _resolve_failure(
+    outcome: station_module.Outcome,
+) -> tuple[Literal["limited", "unavailable"], str, int | None, bool]:
+    """`_failure` for a near call, and whether the limit reached is the near
+    call's alone (the module refuses only that call: lookup goes on). A 404
+    says the module is too old for the call. No pause either way."""
+    if outcome.reason == "status_429" and outcome.code in _NEAR_WINDOWS:
+        message = _near_limit_message(outcome.code, outcome.retry_after)
+        return "limited", message, outcome.retry_after, True
+    if outcome.reason == "status_404":
+        return "unavailable", _NEAR_NEEDS_NEWER_MODULE, None, False
+    status, message, retry_after = _failure(outcome)
+    return status, message, retry_after, False
+
+
 def _has_position(hub: NetworkCoverageHub) -> bool:
-    """True when the hub's stored position can be sent to the module: finite,
-    latitude -90 to 90, longitude -180 to 180. The columns are NOT NULL and
-    the hub form checks the ranges, so only a hand edit of the table (a NaN,
-    an infinity, a value out of range) or a missing value fails this."""
-    lat, lon = hub.lat, hub.lon
-    return (
-        isinstance(lat, int | float)
-        and isinstance(lon, int | float)
-        and math.isfinite(lat)
-        and math.isfinite(lon)
-        and -90 <= lat <= 90
-        and -180 <= lon <= 180
-    )
+    """True when the hub's stored position can be sent to the module (the
+    near call's own rule, `station_module.position_refused`). The columns
+    are NOT NULL and the hub form checks the ranges, so only a hand edit of
+    the table (a NaN, an infinity, a value out of range) fails this."""
+    return station_module.position_refused(hub.lat, hub.lon) is None
 
 
 def _proposal(hub: NetworkCoverageHub, rows: list[dict[str, Any]]) -> HubProposal:
@@ -1036,13 +1073,14 @@ async def resolve_hub_codes(
             hub.lat, hub.lon, user_id, radius_m=PROPOSAL_RADIUS_M
         )
         if outcome.rows is None:
-            status, message, retry_after = _failure(outcome)
+            status, message, retry_after, near_limited = _resolve_failure(outcome)
             return HubResolveResponse(
                 status=status,
                 message=message,
                 retry_after=retry_after,
                 proposals=proposals,
                 left=len(hubs) - len(proposals),
+                near_limited=near_limited,
             )
         proposals.append(_proposal(hub, outcome.rows))
     return HubResolveResponse(status="ok", proposals=proposals, left=len(hubs) - len(proposals))

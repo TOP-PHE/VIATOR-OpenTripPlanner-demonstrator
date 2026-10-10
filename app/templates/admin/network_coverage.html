@@ -2598,7 +2598,9 @@ document.getElementById('hubs-add-new')?.addEventListener('click', () => openHub
 
 const HUB_CODES_API = '/api/admin/network-coverage/hubs';
 // The hubs already shown in this round, skipped by the next click.
-const HUB_CODES = { mode: null, skip: [], heldUntil: 0 };
+// heldUntil: every button waits (a limit of every call); proposeHeldUntil:
+// only "Propose" and its "next" wait (a limit of the module's near call).
+const HUB_CODES = { mode: null, skip: [], heldUntil: 0, proposeHeldUntil: 0 };
 
 function hubCodeLabel(h) {
   if (!h.uic) return 'No station code';
@@ -2628,13 +2630,21 @@ function hubCodesStatus(text, isError) {
   el.classList.toggle('error', Boolean(isError));
 }
 
+// True for a button that proposes codes (the module's near call) while a
+// near limit holds it: "Propose", and "next" while the dialog proposes.
+function hubProposeHeld(id) {
+  if (Date.now() >= HUB_CODES.proposeHeldUntil) return false;
+  return id === 'hub-codes-resolve' || (id === 'hub-codes-next' && HUB_CODES.mode === 'resolve');
+}
+
 // The buttons that call the module: disabled while a request runs, and
-// for the module's Retry-After after a 429.
+// for the module's Retry-After after a 429 (only the proposing ones after a
+// near limit: saving and checking use another call, which goes on).
 function setHubCodeButtons(disabled) {
   ['hub-codes-resolve', 'hub-codes-check', 'hub-codes-confirm', 'hub-codes-next']
     .map(id => document.getElementById(id))
     .filter(Boolean)
-    .forEach(b => { b.disabled = disabled; });
+    .forEach(b => { b.disabled = disabled || hubProposeHeld(b.id); });
 }
 
 function releaseHubCodeButtons() {
@@ -2644,6 +2654,12 @@ function releaseHubCodeButtons() {
 function holdHubCodeButtons(seconds) {
   HUB_CODES.heldUntil = Date.now() + seconds * 1000;
   setHubCodeButtons(true);
+  setTimeout(releaseHubCodeButtons, seconds * 1000);
+}
+
+function holdHubProposeButtons(seconds) {
+  HUB_CODES.proposeHeldUntil = Date.now() + seconds * 1000;
+  releaseHubCodeButtons();
   setTimeout(releaseHubCodeButtons, seconds * 1000);
 }
 
@@ -2667,7 +2683,9 @@ async function postHubCodes(path, body) {
 
 // The common part of every answer: its sentence, and the wait after a 429.
 function showHubCodesAnswer(answer, okText) {
-  if (answer.status === 'limited') {
+  if (answer.status === 'limited' && answer.near_limited) {
+    holdHubProposeButtons(answer.retry_after || 60);
+  } else if (answer.status === 'limited') {
     holdHubCodeButtons(answer.retry_after || 60);
   }
   hubCodesStatus(answer.status === 'ok' ? okText : answer.message, answer.status !== 'ok');

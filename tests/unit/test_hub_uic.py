@@ -20,6 +20,8 @@ import json
 import math
 import re
 import secrets
+import shutil
+import subprocess
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -329,10 +331,35 @@ def test_the_next_click_skips_the_hubs_already_shown(
 
 
 @pytest.mark.parametrize(
-    "code", ["near_user_minute", "near_user_day", "near_all_day", "user_minute"]
+    ("code", "near_limited", "said"),
+    [
+        (
+            "near_user_minute",
+            True,
+            "Your limit of proposals a minute is reached; try again in 17 seconds.",
+        ),
+        (
+            "near_user_day",
+            True,
+            "Your daily limit of proposals is reached; try again tomorrow (UTC).",
+        ),
+        (
+            "near_all_day",
+            True,
+            "shared by every administrator is reached; try again tomorrow (UTC).",
+        ),
+        ("user_minute", False, "The station module's limit is reached; try again in 17 seconds."),
+        ("all_day", False, "The station module's limit is reached; try again in 17 seconds."),
+    ],
 )
 def test_a_429_on_the_fourth_near_call_stops_the_click_and_keeps_what_was_found(
-    client: TestClient, db: FakeDb, hubs: Hubs, module: Module, code: str
+    client: TestClient,
+    db: FakeDb,
+    hubs: Hubs,
+    module: Module,
+    code: str,
+    near_limited: bool,
+    said: str,
 ) -> None:
     hubs.rows = [_hub(i) for i in range(25)]
     answers = iter(
@@ -348,7 +375,10 @@ def test_a_429_on_the_fourth_near_call_stops_the_click_and_keeps_what_was_found(
     assert [p["state"] for p in body["proposals"]] == ["proposed"] * 3
     assert body["status"] == "limited"
     assert body["retry_after"] == 17
-    assert "17 seconds" in body["message"]
+    assert said in body["message"]
+    # A near window refuses the near call alone: the page keeps Save and Check.
+    assert body["near_limited"] is near_limited
+    assert ("Saving and checking codes still work." in body["message"]) is near_limited
     assert body["left"] == 22  # the fourth hub was not looked at
     assert not station_module.paused()  # a 429 starts no pause
     assert db.commits == 0
@@ -368,7 +398,24 @@ def test_a_429_without_retry_after_says_a_minute(
     assert "a minute" in body["message"]
 
 
-@pytest.mark.parametrize("status", [500, 503, 404, 422])
+def test_a_404_says_the_module_is_too_old_for_the_near_call(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(i) for i in range(3)]
+    module.near = lambda _b: httpx.Response(404, json={"detail": "ZZ", "code": "not_found"})
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert len(module.of("near")) == 1
+    assert body["status"] == "unavailable"
+    assert "needs MSMM v0.3.4 or later" in body["message"]
+    assert body["near_limited"] is False
+    assert body["proposals"] == []
+    assert not station_module.paused()
+    assert db.commits == 0
+
+
+@pytest.mark.parametrize("status", [500, 503, 422])
 def test_another_near_failure_stops_the_click_says_so_and_starts_no_pause(
     client: TestClient, db: FakeDb, hubs: Hubs, module: Module, status: int
 ) -> None:
@@ -1029,7 +1076,88 @@ def test_the_form_sends_the_code_only_when_it_changed(template_text: str) -> Non
 def test_a_429_holds_the_buttons_for_the_modules_retry_after(template_text: str) -> None:
     script = _codes_script(template_text)
     assert "holdHubCodeButtons(answer.retry_after || 60);" in script
+    assert "holdHubProposeButtons(answer.retry_after || 60);" in script
     assert "setHubCodeButtons(true);" in script  # also while a request runs
+
+
+# The buttons' part of the codes script, run in Node with a stand-in page
+# and clock: which buttons a 429 holds, and for how long.
+_BUTTON_PRELUDE = """
+let now = 1000000;
+Date.now = () => now;
+const timers = [];
+globalThis.setTimeout = (fn, ms) => { timers.push([now + ms, fn]); };
+const buttons = {};
+for (const id of ['hub-codes-resolve', 'hub-codes-check', 'hub-codes-confirm', 'hub-codes-next']) {
+  buttons[id] = { id, disabled: false };
+}
+const status = { textContent: '', classList: { toggle() {} } };
+globalThis.document = { getElementById: id => buttons[id] || (id === 'hub-codes-status' ? status : null) };
+"""
+
+_BUTTON_SCENARIO = """
+function disabled() {
+  return Object.fromEntries(Object.entries(buttons).map(([id, b]) => [id.slice(10), b.disabled]));
+}
+function advance(seconds) {
+  now += seconds * 1000;
+  timers.filter(([at]) => at <= now).forEach(([, fn]) => fn());
+}
+const out = {};
+HUB_CODES.mode = 'resolve';
+showHubCodesAnswer({ status: 'limited', near_limited: true, retry_after: 86400, message: 'ZZ' });
+out.nearDay = disabled();
+HUB_CODES.mode = 'check';
+setHubCodeButtons(false);
+out.nearDayInCheck = disabled();
+HUB_CODES.mode = 'resolve';
+setHubCodeButtons(false);
+advance(86399);
+out.nearDayAlmost = disabled();
+advance(1);
+out.nearDayOver = disabled();
+showHubCodesAnswer({ status: 'limited', near_limited: false, retry_after: 17, message: 'ZZ' });
+out.shared = disabled();
+advance(17);
+out.sharedOver = disabled();
+showHubCodesAnswer({ status: 'limited', near_limited: true, message: 'ZZ' });
+out.nearNoWait = disabled();
+advance(60);
+out.nearNoWaitOver = disabled();
+console.log(JSON.stringify(out));
+"""
+
+
+def _button_script(text: str) -> str:
+    script = _codes_script(text)
+    start = script.index("// heldUntil: every button waits")
+    end = script.index("function openHubCodes(")
+    return script[start:end]
+
+
+def test_a_near_limit_holds_only_propose_and_next_in_the_page(template_text: str) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    program = _BUTTON_PRELUDE + _button_script(template_text) + _BUTTON_SCENARIO
+    result = subprocess.run(
+        [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+
+    held = {"resolve": True, "check": False, "confirm": False, "next": True}
+    free = dict.fromkeys(held, False)
+    # A daily near limit: Save and Check stay usable for the whole day.
+    assert out["nearDay"] == held
+    assert out["nearDayInCheck"] == {**held, "next": False}  # "next" checks then
+    assert out["nearDayAlmost"] == held
+    assert out["nearDayOver"] == free
+    # A limit of every call holds the four, for the module's Retry-After.
+    assert out["shared"] == dict.fromkeys(held, True)
+    assert out["sharedOver"] == free
+    assert out["nearNoWait"] == held  # 60 s when the module gave no wait
+    assert out["nearNoWaitOver"] == free
 
 
 def test_the_cell_dialog_link_carries_the_hub_code(template_text: str) -> None:
