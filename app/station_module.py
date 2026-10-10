@@ -10,7 +10,10 @@ inside the network like VIATOR's calls to MOTIS):
   typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
   `search_outcome(q, user_id)` is the same call in its detailed form (an
   `Outcome`: the rows, the reason word, the `Retry-After` of a 429);
-  `search()` returns its rows.
+  `search()` returns its rows. `admin_search_outcome(q, user_id)` is the
+  same call made by an admin action (the coverage hubs' resolve route, when
+  the near call finds nothing around a hub): it follows the lookup's pause
+  rule below.
 - `lookup(uics, user_id)` — `POST /internal/v1/stations/lookup`, the served
   stations of 1 to 20 distinct MERITS codes, each with its `parent_uic`;
   every code counts as one call on the person's limits. An `Outcome` too.
@@ -23,7 +26,8 @@ inside the network like VIATOR's calls to MOTIS):
   one on the module's own near quota (30 a minute and 200 a day for one
   person, 500 a day for everybody). An `Outcome`. Used by the coverage
   hubs' resolve route ("Propose station codes"), which looks a hub up by
-  its position, never by its name.
+  its position first, and by its name (`admin_search_outcome`) only when
+  the near call finds no station.
 - `attribution()` — `GET /internal/v1/attribution`, the licence text of the
   module's sources, kept 60 s. Asynchronous, like search, so that its
   deadline is real. Awaited by `journey_page` (app/api/pages.py) for the
@@ -54,7 +58,8 @@ Rules this client keeps on purpose:
   hangs, and a rare admin action must not switch it off for everyone, in
   particular when an older module answers 404 for the lookup's path. **A
   near call follows the lookup's rule**, for the same reasons (an older
-  module answers 404 for `/stations/near`).
+  module answers 404 for `/stations/near`), **and so does an admin
+  search** (`admin_search_outcome`).
 - **A real deadline and a size cap**: 1 s for a whole search, lookup or near
   call, 0.5 s for an attribution (httpx's timeouts bound each read, not the
   call), and a body larger than 64 KiB (search, lookup, near) or 256 KiB
@@ -66,8 +71,9 @@ Rules this client keeps on purpose:
 - **The log never holds the text, a body, the token or an exception's
   text**: one line `station_module.fallback reason=<word>` per fallback
   (`station_module.lookup_failed reason=<word>` for a lookup,
-  `station_module.near_failed reason=<word>` for a near call), never a code
-  and never a position.
+  `station_module.near_failed reason=<word>` for a near call,
+  `station_module.admin_search_failed reason=<word>` for an admin search),
+  never a code, never a name and never a position.
 """
 
 from __future__ import annotations
@@ -488,6 +494,23 @@ async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
     """At most ten stations of the module for `q` (already normalised by the
     caller), on behalf of the VIATOR user `user_id`; `None` on any failure."""
     return (await search_outcome(q, user_id)).rows
+
+
+async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
+    """The same search as `search_outcome` (at most ten stations for `q`,
+    already normalised by the caller), made by an admin action: the coverage
+    hubs' resolve route, when the near call found nothing around a hub.
+
+    **A failure never starts the pause**, as for `lookup` and `near_outcome`:
+    the typeahead of every user must not switch to the fallback because of a
+    rare admin click; a pause that runs is honoured (`paused`, no call).
+    Failures are logged as `station_module.admin_search_failed reason=<word>`,
+    never the text."""
+
+    async def call() -> list[dict[str, Any]]:
+        return _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
+
+    return await _without_pause("station_module.admin_search_failed", call)
 
 
 def _checked_codes(uics: list[str]) -> list[str]:
