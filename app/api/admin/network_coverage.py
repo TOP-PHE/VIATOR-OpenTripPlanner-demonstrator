@@ -1222,10 +1222,11 @@ async def _look_up_by_name(
 
 async def _look_at(hub: NetworkCoverageHub, user_id: uuid.UUID) -> HubProposal | _ResolveStop:
     """One hub of a resolve click: the near call at its position; when it
-    answers no station at all, or the hub has no usable position (no near
-    call then: the module would refuse the position after counting it), the
-    name fallback. A near failure (a 429 included) stops the click without
-    any name search."""
+    gives no usable candidate (no station at all, or only codes the lookup
+    would refuse), or the hub has no usable position (no near call then: the
+    module would refuse the position after counting it), the name fallback.
+    A near failure (a 429 included) stops the click without any name
+    search."""
     located = _has_position(hub)
     if located:
         outcome = await station_module.near_outcome(
@@ -1233,8 +1234,9 @@ async def _look_at(hub: NetworkCoverageHub, user_id: uuid.UUID) -> HubProposal |
         )
         if outcome.rows is None:
             return _ResolveStop(*_resolve_failure(outcome))
-        if outcome.rows:
-            return _proposal(hub, outcome.rows)
+        proposal = _proposal(hub, outcome.rows)
+        if proposal.candidates:
+            return proposal
     return await _look_up_by_name(hub, user_id, located=located)
 
 

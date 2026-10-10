@@ -309,11 +309,30 @@ def test_a_candidate_whose_code_the_lookup_would_refuse_is_not_offered(
     client: TestClient, hubs: Hubs, module: Module
 ) -> None:
     hubs.rows = [_hub(1)]
-    module.near = lambda _b: _near_answer(_near("ZZ Short Code", "ZZ", 5))
+    module.near = lambda _b: _near_answer(
+        _near("ZZ Short Code", "ZZ", 5), _near("ZZ Good Code", "9900002", 40)
+    )
 
     (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
 
-    assert proposal["candidates"] == []
+    assert [c["uic"] for c in proposal["candidates"]] == ["9900002"]
+    assert module.of("search") == []
+
+
+def test_a_near_answer_with_only_refused_codes_falls_back_to_the_name(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    """No usable candidate by position counts as none: the name is searched."""
+    hub = _sea_hub()
+    hubs.rows = [hub]
+    module.near = lambda _b: _near_answer(_near("ZZ Short Code", "ZZ", 5))
+    _found(module, _north("ZZ By Name", "9900003", 0.0018))
+
+    (proposal,) = client.post(f"{BASE}/resolve", json={}).json()["proposals"]
+
+    assert _searched(module) == [hub.name]
+    assert proposal["name_searched"] is True
+    assert [(c["uic"], c["found_by"]) for c in proposal["candidates"]] == [("9900003", "name")]
 
 
 def test_one_click_makes_exactly_ten_near_calls_one_after_the_other(
@@ -455,6 +474,50 @@ def test_another_near_failure_stops_the_click_says_so_and_starts_no_pause(
     assert db.commits == 0
     # A near failure leaves the typeahead alone: no pause.
     assert not station_module.paused()
+
+
+def _raise(error: type[httpx.HTTPError]) -> Callable[[dict[str, Any]], httpx.Response]:
+    def answer(_body: dict[str, Any]) -> httpx.Response:
+        raise error("stand-in failure")
+
+    return answer
+
+
+@pytest.mark.parametrize(
+    ("near", "reason"),
+    [
+        (_raise(httpx.ReadTimeout), "timeout"),
+        (_raise(httpx.ConnectError), "network"),
+        (lambda _b: httpx.Response(200, text="<html>ZZ</html>"), "shape"),
+        (lambda _b: httpx.Response(200, json={"stations": {"name": "ZZ"}}), "shape"),
+        (lambda _b: httpx.Response(503, json={"detail": "ZZ", "code": "busy"}), "busy"),
+    ],
+    ids=["timeout", "network", "not-json", "wrong-shape", "busy"],
+)
+def test_a_near_failure_without_an_error_status_stops_the_click_without_a_search(
+    client: TestClient,
+    db: FakeDb,
+    hubs: Hubs,
+    module: Module,
+    caplog: pytest.LogCaptureFixture,
+    near: Callable[[dict[str, Any]], httpx.Response],
+    reason: str,
+) -> None:
+    hubs.rows = [_sea_hub(i) for i in range(3)]
+    module.near = near
+
+    with caplog.at_level("INFO"):
+        body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert len(module.of("near")) == 1
+    assert module.of("search") == []
+    assert body["status"] == "unavailable"
+    assert body["message"] == "The station module did not answer; nothing was changed."
+    assert body["proposals"] == []
+    assert body["left"] == 3
+    assert f"station_module.near_failed reason={reason}" in caplog.text
+    assert not station_module.paused()
+    assert db.commits == 0
 
 
 @pytest.mark.parametrize(
