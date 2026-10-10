@@ -690,7 +690,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
          (save) or 20 codes (check) on the administrator's own limits at the
          module; nothing is written until he saves the codes he ticked. #}
       <div class="hub-codes-tools">
-        <button type="button" id="hub-codes-resolve" title="Ask the station module for the codes of up to 10 hubs without one">Propose station codes</button>
+        <button type="button" id="hub-codes-resolve" title="Ask the station module for the stations within 300 m of up to 10 hubs without a code, by their position">Propose station codes</button>
         <button type="button" id="hub-codes-check" title="Re-read the stored codes of up to 20 hubs in the station module">Check station codes</button>
       </div>
       <div id="hub-codes" class="hub-codes" hidden>
@@ -2598,7 +2598,9 @@ document.getElementById('hubs-add-new')?.addEventListener('click', () => openHub
 
 const HUB_CODES_API = '/api/admin/network-coverage/hubs';
 // The hubs already shown in this round, skipped by the next click.
-const HUB_CODES = { mode: null, skip: [], heldUntil: 0 };
+// heldUntil: every button waits (a limit of every call); proposeHeldUntil:
+// only "Propose" and its "next" wait (a limit of the module's near call).
+const HUB_CODES = { mode: null, skip: [], heldUntil: 0, proposeHeldUntil: 0 };
 
 function hubCodeLabel(h) {
   if (!h.uic) return 'No station code';
@@ -2628,13 +2630,21 @@ function hubCodesStatus(text, isError) {
   el.classList.toggle('error', Boolean(isError));
 }
 
+// True for a button that proposes codes (the module's near call) while a
+// near limit holds it: "Propose", and "next" while the dialog proposes.
+function hubProposeHeld(id) {
+  if (Date.now() >= HUB_CODES.proposeHeldUntil) return false;
+  return id === 'hub-codes-resolve' || (id === 'hub-codes-next' && HUB_CODES.mode === 'resolve');
+}
+
 // The buttons that call the module: disabled while a request runs, and
-// for the module's Retry-After after a 429.
+// for the module's Retry-After after a 429 (only the proposing ones after a
+// near limit: saving and checking use another call, which goes on).
 function setHubCodeButtons(disabled) {
   ['hub-codes-resolve', 'hub-codes-check', 'hub-codes-confirm', 'hub-codes-next']
     .map(id => document.getElementById(id))
     .filter(Boolean)
-    .forEach(b => { b.disabled = disabled; });
+    .forEach(b => { b.disabled = disabled || hubProposeHeld(b.id); });
 }
 
 function releaseHubCodeButtons() {
@@ -2644,6 +2654,12 @@ function releaseHubCodeButtons() {
 function holdHubCodeButtons(seconds) {
   HUB_CODES.heldUntil = Date.now() + seconds * 1000;
   setHubCodeButtons(true);
+  setTimeout(releaseHubCodeButtons, seconds * 1000);
+}
+
+function holdHubProposeButtons(seconds) {
+  HUB_CODES.proposeHeldUntil = Date.now() + seconds * 1000;
+  releaseHubCodeButtons();
   setTimeout(releaseHubCodeButtons, seconds * 1000);
 }
 
@@ -2667,7 +2683,9 @@ async function postHubCodes(path, body) {
 
 // The common part of every answer: its sentence, and the wait after a 429.
 function showHubCodesAnswer(answer, okText) {
-  if (answer.status === 'limited') {
+  if (answer.status === 'limited' && answer.near_limited) {
+    holdHubProposeButtons(answer.retry_after || 60);
+  } else if (answer.status === 'limited') {
     holdHubCodeButtons(answer.retry_after || 60);
   }
   hubCodesStatus(answer.status === 'ok' ? okText : answer.message, answer.status !== 'ok');
@@ -2715,8 +2733,12 @@ function hubLeaveInput(proposal) {
 function hubProposalItem(proposal) {
   const item = hubCodesElement('div', undefined, 'hub-code-item');
   item.append(hubCodesElement('strong', proposal.hub_name));
+  if (proposal.state === 'no_position') {
+    item.append(hubCodesElement('div', 'This hub has no usable position: correct its latitude and longitude in the hub form.', 'hub-code-note'));
+    return item;
+  }
   if (!proposal.candidates.length) {
-    item.append(hubCodesElement('div', 'No station within 300 m found by name: type the code in the hub form if you know it.', 'hub-code-note'));
+    item.append(hubCodesElement('div', 'No station of the module within 300 m of this hub\'s position: check the position, or type the code in the hub form if you know it.', 'hub-code-note'));
     return item;
   }
   const kind = proposal.state === 'proposed' ? 'checkbox' : 'radio';

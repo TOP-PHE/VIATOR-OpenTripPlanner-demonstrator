@@ -1,7 +1,7 @@
 """Client of the Multimodal Station Mapping module (MSMM).
 
 The module is a separate service on VIATOR's Docker network. It answers
-three calls VIATOR uses, under `/internal/v1/`, reached at
+four calls VIATOR uses, under `/internal/v1/`, reached at
 `settings.station_module_url` (normally `http://msmm-web:8000`, plain HTTP
 inside the network like VIATOR's calls to MOTIS):
 
@@ -10,12 +10,20 @@ inside the network like VIATOR's calls to MOTIS):
   typeahead through `POST /api/stations/suggest` (app/api/station_suggest.py).
   `search_outcome(q, user_id)` is the same call in its detailed form (an
   `Outcome`: the rows, the reason word, the `Retry-After` of a 429);
-  `search()` returns its rows. The coverage hubs' resolve route uses it.
+  `search()` returns its rows.
 - `lookup(uics, user_id)` — `POST /internal/v1/stations/lookup`, the served
   stations of 1 to 20 distinct MERITS codes, each with its `parent_uic`;
   every code counts as one call on the person's limits. An `Outcome` too.
   Used by the coverage hubs' confirm and check routes
   (app/api/admin/network_coverage.py), never by the typeahead.
+- `near_outcome(lat, lon, user_id, radius_m)` — `POST
+  /internal/v1/stations/near`, at most five served stations within
+  `radius_m` metres (1 to 300) of a position, nearest first, each with its
+  `parent_uic` and its `distance_m`. One call on the person's limits, and
+  one on the module's own near quota (30 a minute and 200 a day for one
+  person, 500 a day for everybody). An `Outcome`. Used by the coverage
+  hubs' resolve route ("Propose station codes"), which looks a hub up by
+  its position, never by its name.
 - `attribution()` — `GET /internal/v1/attribution`, the licence text of the
   module's sources, kept 60 s. Asynchronous, like search, so that its
   deadline is real. Awaited by `journey_page` (app/api/pages.py) for the
@@ -28,8 +36,8 @@ VIATOR must keep working without the module.
 Rules this client keeps on purpose:
 
 - **Its own headers, built from nothing.** `Authorization: Bearer <token>`,
-  `Accept-Encoding: identity`, `X-Viator-User-Id` (search and lookup) and
-  `Content-Type: application/json` (search and lookup). Nothing of the incoming request is ever forwarded, so a
+  `Accept-Encoding: identity`, `X-Viator-User-Id` (search, lookup, near) and
+  `Content-Type: application/json` (search, lookup, near). Nothing of the incoming request is ever forwarded, so a
   browser cannot set the user id: it comes from the JWT user of
   `require_logged_in`. `trust_env=False` keeps proxy variables and `.netrc`
   out of the call.
@@ -44,17 +52,22 @@ Rules this client keeps on purpose:
   for everyone. **A lookup never starts the pause** (but honours one that
   runs): the pause protects every user's typeahead from a module that
   hangs, and a rare admin action must not switch it off for everyone, in
-  particular when an older module answers 404 for the lookup's path.
-- **A real deadline and a size cap**: 1 s for a whole search or lookup, 0.5 s
-  for an attribution (httpx's timeouts bound each read, not the call), and a
-  body larger than 64 KiB (search, lookup) or 256 KiB (attribution) is refused unread;
+  particular when an older module answers 404 for the lookup's path. **A
+  near call follows the lookup's rule**, for the same reasons (an older
+  module answers 404 for `/stations/near`).
+- **A real deadline and a size cap**: 1 s for a whole search, lookup or near
+  call, 0.5 s for an attribution (httpx's timeouts bound each read, not the
+  call), and a body larger than 64 KiB (search, lookup, near) or 256 KiB
+  (attribution) is refused unread;
   so is a compressed answer, which could inflate past the cap at once.
   All count as failures that pause. Any other error (a bad address, a
   token httpx cannot encode) falls back too, as `network`.
 - **A bad row is dropped, never the whole answer.**
 - **The log never holds the text, a body, the token or an exception's
   text**: one line `station_module.fallback reason=<word>` per fallback
-  (`station_module.lookup_failed reason=<word>` for a lookup), never a code.
+  (`station_module.lookup_failed reason=<word>` for a lookup,
+  `station_module.near_failed reason=<word>` for a near call), never a code
+  and never a position.
 """
 
 from __future__ import annotations
@@ -68,7 +81,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, TypeGuard
 
@@ -80,6 +93,7 @@ log = logging.getLogger(__name__)
 
 SEARCH_PATH = "/internal/v1/stations/search"
 LOOKUP_PATH = "/internal/v1/stations/lookup"
+NEAR_PATH = "/internal/v1/stations/near"
 ATTRIBUTION_PATH = "/internal/v1/attribution"
 USER_HEADER = "X-Viator-User-Id"
 
@@ -89,11 +103,33 @@ LOOKUP_MAX = 20
 CODE_MIN = 3
 CODE_MAX = 20
 
+# A near call: a radius of 1 to 300 whole metres, at most five stations (the
+# module's rule, its design 21.13 and decision 62).
+NEAR_RADIUS_MIN = 1
+NEAR_RADIUS_MAX = 300
+NEAR_MAX_ROWS = 5
+LATITUDE_MAX = 90.0
+LONGITUDE_MAX = 180.0
+
 # The `Retry-After` of a 429 is kept when it is a plain number of seconds in
 # this range; a date, or anything else, gives None.
 RETRY_AFTER_MAX = 86_400
 # ASCII digits only: `\d` alone would also take digits of other scripts.
 _DIGITS = re.compile(r"\d{1,6}", re.ASCII)
+# The window words of a module 429 (its design 20.4 and 21.13) kept in an
+# `Outcome`; any other `code` gives None. The last three refuse the near call
+# alone: search and lookup go on.
+LIMIT_CODES = frozenset(
+    {
+        "user_minute",
+        "user_day",
+        "all_minute",
+        "all_day",
+        "near_user_minute",
+        "near_user_day",
+        "near_all_day",
+    }
+)
 
 # The typeahead is on the keystroke path: one second at most for the whole
 # call (SEARCH_DEADLINE, enforced around it: httpx's own timeouts bound each
@@ -138,28 +174,43 @@ clock: Callable[[], float] = time.monotonic
 
 @dataclass(frozen=True)
 class Outcome:
-    """The detailed result of a search or a lookup.
+    """The detailed result of a search, a lookup or a near call.
 
     `rows`: the checked rows, or None on failure. `reason`: `ok`, or the
     reason word of the failure (`off`, `paused`, `timeout`, `network`,
     `status_<n>`, `busy`, `shape`). `retry_after`: on a 429, the whole
     seconds of the module's `Retry-After` when it is a plain number from 1
-    to 86,400, else None."""
+    to 86,400, else None. `code`: on a 429, the module's window word (its
+    `code`, such as `user_minute` or `near_user_day`) when it is one of
+    `LIMIT_CODES`, else None: it tells a refusal of the near call alone from
+    one of every call."""
 
     rows: list[dict[str, Any]] | None
     reason: str
     retry_after: int | None = None
+    code: str | None = None
 
 
 class _Failure(Exception):
     """A call that ends in the fallback: the reason word, whether it pauses,
-    and the `Retry-After` of a 429."""
+    and the `Retry-After` and window word of a 429."""
 
-    def __init__(self, reason: str, *, pause: bool, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        pause: bool,
+        retry_after: int | None = None,
+        code: str | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.pause = pause
         self.retry_after = retry_after
+        self.code = code
+
+    def outcome(self) -> Outcome:
+        return Outcome(None, self.reason, self.retry_after, self.code)
 
 
 class _Answer:
@@ -312,7 +363,9 @@ def _status_failure(answer: _Answer) -> _Failure:
             return _Failure("busy", pause=False)
         return _Failure("status_503", pause=code in _PAUSING_503_CODES)
     if status == 429:
-        return _Failure("status_429", pause=False, retry_after=answer.retry_after)
+        code = _error_code(answer)
+        word = code if code in LIMIT_CODES else None
+        return _Failure("status_429", pause=False, retry_after=answer.retry_after, code=word)
     return _Failure(f"status_{status}", pause=status in _PAUSING_STATUSES)
 
 
@@ -387,7 +440,7 @@ def _stations(payload: Any) -> list[dict[str, Any]]:
 
 
 async def _post(path: str, payload: dict[str, Any], user_id: uuid.UUID) -> _Answer:
-    """One counted call (search or lookup): a POST of `payload` as JSON, on
+    """One counted call (search, lookup or near): a POST of `payload` as JSON, on
     behalf of `user_id`, within the search's deadline and size cap."""
     headers = {
         **_headers(),
@@ -421,7 +474,7 @@ async def search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
         rows = _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
     except _Failure as failure:
         _fail(failure)
-        return Outcome(None, failure.reason, failure.retry_after)
+        return failure.outcome()
     except Exception:
         # Anything else (an address httpx refuses, a token it cannot encode, a
         # JSON parser error) falls back too, and its text is never logged: an
@@ -495,20 +548,127 @@ async def lookup(uics: list[str], user_id: uuid.UUID) -> Outcome:
     is honoured (`paused`, no call). Failures are logged as
     `station_module.lookup_failed reason=<word>`, never a code."""
     codes = _checked_codes(uics)
+
+    async def call() -> list[dict[str, Any]]:
+        payload = _json_body(await _post(LOOKUP_PATH, {"uics": codes}, user_id))
+        return _lookup_rows(payload, codes)
+
+    return await _without_pause("station_module.lookup_failed", call)
+
+
+async def _without_pause(
+    event: str, call: Callable[[], Awaitable[list[dict[str, Any]]]]
+) -> Outcome:
+    """Run one admin call (lookup, near) as an `Outcome`: no call when the
+    module is not configured (`off`) or the pause runs (`paused`); a failure
+    is logged as `<event> reason=<word>` and **never starts the pause** (nor
+    forgets the cached attribution), whatever its kind."""
     try:
         if not enabled():
             raise _Failure("off", pause=False)
         if _paused():
             raise _Failure("paused", pause=False)
-        rows = _lookup_rows(_json_body(await _post(LOOKUP_PATH, {"uics": codes}, user_id)), codes)
+        rows = await call()
     except _Failure as failure:
-        _log_failure("station_module.lookup_failed", failure.reason)
-        return Outcome(None, failure.reason, failure.retry_after)
+        _log_failure(event, failure.reason)
+        return failure.outcome()
     except Exception:
         # As in search(): its text is never logged; and no pause.
-        _log_failure("station_module.lookup_failed", "network")
+        _log_failure(event, "network")
         return Outcome(None, "network")
     return Outcome(rows, "ok")
+
+
+def position_refused(lat: Any, lon: Any) -> str | None:
+    """Why a position would be refused by the module's near call, as a few
+    words, or None: a latitude and a longitude must be finite numbers (not a
+    truth value, not None) from -90 to 90 and from -180 to 180. The hubs'
+    resolve route asks it before sending a hub's stored position."""
+    if not (_is_number(lat) and -LATITUDE_MAX <= lat <= LATITUDE_MAX):
+        return "a near call takes a latitude from -90 to 90"
+    if not (_is_number(lon) and -LONGITUDE_MAX <= lon <= LONGITUDE_MAX):
+        return "a near call takes a longitude from -180 to 180"
+    return None
+
+
+def _checked_position(lat: float, lon: float, radius_m: int) -> dict[str, Any]:
+    """The body of a near call, or ValueError: a position `position_refused`
+    accepts, and a whole radius of 1 to 300 metres. The module would refuse
+    the call otherwise, after counting it."""
+    refused = position_refused(lat, lon)
+    if refused is not None:
+        raise ValueError(refused)
+    if (
+        not isinstance(radius_m, int)
+        or isinstance(radius_m, bool)
+        or not NEAR_RADIUS_MIN <= radius_m <= NEAR_RADIUS_MAX
+    ):
+        raise ValueError(
+            f"a near call takes a whole radius of {NEAR_RADIUS_MIN} to {NEAR_RADIUS_MAX} metres"
+        )
+    return {"lat": float(lat), "lon": float(lon), "radius_m": radius_m}
+
+
+def _near_row(item: Any, radius_m: int) -> dict[str, Any] | None:
+    """One row of a near answer: a search row with `parent_uic` (a string or
+    null) and `distance_m` (a whole number of metres, 0 to the radius); None
+    when it is not a usable row."""
+    row = _station_row(item)
+    if row is None:
+        return None
+    parent = item.get("parent_uic")
+    distance = item.get("distance_m")
+    if not _text_or_null(parent):
+        return None
+    if not isinstance(distance, int) or isinstance(distance, bool):
+        return None
+    if not 0 <= distance <= radius_m:
+        return None
+    row["parent_uic"] = parent
+    row["distance_m"] = distance
+    return row
+
+
+def _near_rows(payload: Any, radius_m: int) -> list[dict[str, Any]]:
+    """The usable rows of a near answer, in the module's order (nearest
+    first), each code once, at most five; a wrong top-level shape refuses
+    the whole answer."""
+    stations = payload.get("stations") if isinstance(payload, dict) else None
+    if not isinstance(stations, list):
+        raise _Failure("shape", pause=False)
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for item in stations:
+        row = _near_row(item, radius_m)
+        if row is None or row["uic"] in seen:
+            continue
+        seen.add(row["uic"])
+        rows.append(row)
+        if len(rows) >= NEAR_MAX_ROWS:
+            break
+    return rows
+
+
+async def near_outcome(
+    lat: float, lon: float, user_id: uuid.UUID, radius_m: int = NEAR_RADIUS_MAX
+) -> Outcome:
+    """The module's served stations within `radius_m` metres (1 to 300) of
+    the position `lat`, `lon`, on behalf of the VIATOR user `user_id`, as an
+    `Outcome`: at most five rows, nearest first, each with its `parent_uic`
+    and its `distance_m`. One call on the person's limits at the module, and
+    one on its near quota; a full near window is a 429 (`near_user_minute`,
+    `near_user_day`, `near_all_day`) with its `Retry-After`, like any 429.
+
+    A position or a radius the module would refuse raises ValueError before
+    any call. **A failure never starts the pause**, as for `lookup`; a pause
+    that runs is honoured. Failures are logged as
+    `station_module.near_failed reason=<word>`, never the position."""
+    body = _checked_position(lat, lon, radius_m)
+
+    async def call() -> list[dict[str, Any]]:
+        return _near_rows(_json_body(await _post(NEAR_PATH, body, user_id)), radius_m)
+
+    return await _without_pause("station_module.near_failed", call)
 
 
 def _short_text(value: Any) -> str:
