@@ -2476,7 +2476,11 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   that says the module is unreachable or misconfigured, it makes no call to
   the module for 30 seconds. The `web` log says why, one line per fallback:
   `station_module.fallback reason=<word>` (`off`, `timeout`, `network`,
-  `status_<n>`, `busy`, `shape`, `paused`), never the token.
+  `status_<n>`, `busy`, `shape`, `paused`), never the token. The hub
+  station-code buttons (11.2) log their own failures the same way, as
+  `station_module.lookup_failed`, `station_module.near_failed` and
+  `station_module.admin_search_failed`, and never start the 30 seconds
+  without calls.
 - **After changing either setting**, recreate the `web` container so it reads
   the new environment, from `/opt/viator/docker`:
   `sudo docker compose up -d --force-recreate web`. A
@@ -2565,21 +2569,39 @@ uses the module (platform administrators only):
 
 - **Propose station codes** looks at up to 10 hubs without a code a click,
   in the matrix order. For each hub it asks the module for its stations
-  **within 300 m of the hub's position** (latitude and longitude), never by
-  the hub's name: the module's names often differ from the hubs' own. One
-  station is shown with a tick box, not ticked: tick it to keep it; two to
-  five are a choice ("Leave it" chosen at first); none means no station of
-  the module stands within 300 m: check the hub's position, or type the
-  code in the hub form. A hub whose stored
-  position is not a usable number shows "no usable position" and is not
-  sent. Nothing is stored before **Save ticked codes**, which checks the
-  codes with the module first.
+  **within 300 m of the hub's position** (latitude and longitude) first:
+  the module's names often differ from the hubs' own. One station is shown
+  with a tick box, not ticked: tick it to keep it; two to five are a choice
+  ("Leave it" chosen at first). Each station says where it comes from
+  ("by position" or "by name") and how far it stands from the hub.
+- **When no station stands within 300 m**, the hub's **name** is searched
+  in the module instead (one more call), as the name is stored. Example: a
+  hub stored about 560 m from its station is found this way. The results
+  are listed nearest the hub first, five at most:
+  - within 300 m, as usual;
+  - farther than 300 m, each with a warning such as "Warning: Found by
+    name, 1.2 km from the hub's position — check before confirming". Such a
+    station is always a choice, never a single tick box: make sure it is the
+    hub's station (or correct the hub's position) before saving;
+  - more than 50 km away: not listed (a station of the same name in another
+    town), but the panel says how many were left out: check the hub's
+    position.
+  When the name search finds nothing either, check the hub's position, or
+  type the code in the hub form. A name shorter than 3 or longer than 100
+  characters is not searched.
+- **A hub whose stored position is not a usable number** shows "no usable
+  position": its position is not sent, but its name is searched, and each
+  station found is listed with a warning that the distance is unknown.
+- Nothing is stored before **Save ticked codes**, which checks the codes
+  with the module first.
 - **Check station codes** re-reads the stored codes of up to 20 hubs a click.
 
 Each hub looked at is one call on your own limits at the module, and also on
 the module's limits for this call (by default 30 a minute and 200 a day for
-one person, 500 a day for everybody). At a limit the click stops and keeps
-what it found. When the limit is one of this call's own, only **Propose
+one person, 500 a day for everybody); a name search is one more call on your
+own limits (by default 60 a minute and 2,000 a day), not on this call's.
+One click is thus at most 20 calls, 30 with its **Save ticked codes**. At a
+limit the click stops and keeps what it found. When the limit is one of this call's own, only **Propose
 station codes** (and its "next" button) waits, for the time the module
 gives, or until midnight UTC for a daily one ("try again tomorrow
 (UTC)"); you can still save the codes already shown and check stored
