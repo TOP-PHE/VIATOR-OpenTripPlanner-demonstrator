@@ -2567,9 +2567,10 @@ uses the module (platform administrators only):
   in the matrix order. For each hub it asks the module for its stations
   **within 300 m of the hub's position** (latitude and longitude), never by
   the hub's name: the module's names often differ from the hubs' own. One
-  station is ticked for you; two to five are a choice ("Leave it" chosen at
-  first); none means no station of the module stands within 300 m: check the
-  hub's position, or type the code in the hub form. A hub whose stored
+  station is shown with a tick box, not ticked: tick it to keep it; two to
+  five are a choice ("Leave it" chosen at first); none means no station of
+  the module stands within 300 m: check the hub's position, or type the
+  code in the hub form. A hub whose stored
   position is not a usable number shows "no usable position" and is not
   sent. Nothing is stored before **Save ticked codes**, which checks the
   codes with the module first.
@@ -2577,11 +2578,15 @@ uses the module (platform administrators only):
 
 Each hub looked at is one call on your own limits at the module, and also on
 the module's limits for this call (by default 30 a minute and 200 a day for
-one person, 500 a day for everybody). At a limit the click stops, keeps what
-it found, and the buttons wait for the time the module gives. A full limit
-of this call refuses only this button, not your searches. This needs a module that answers this call
-(MSMM v0.3.4 or later); an older one makes the button say that the module
-did not answer.
+one person, 500 a day for everybody). At a limit the click stops and keeps
+what it found. When the limit is one of this call's own, only **Propose
+station codes** (and its "next" button) waits, for the time the module
+gives, or until midnight UTC for a daily one ("try again tomorrow
+(UTC)"); you can still save the codes already shown and check stored
+codes, and your searches go on. When it is a limit of every call, all the
+buttons wait for the time the module gives. This needs a module that
+answers this call (MSMM v0.3.4 or later); with an older one the button
+says so ("needs MSMM v0.3.4 or later") and proposes nothing.
 
 ---
 

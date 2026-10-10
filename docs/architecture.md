@@ -251,7 +251,7 @@ and is off unless both are set.
 | GET/POST | `/api/admin/network-coverage/hubs` | List / create hub | platform_admin |
 | PATCH/DELETE | `.../hubs/{id}` | Edit / soft-delete hub | platform_admin |
 | POST | `.../hubs/derive` | Derive slug/short/country from name+coords (powers "+ Hub") | platform_admin |
-| POST | `.../hubs/resolve` | Station codes proposed by the station module for ≤10 unresolved hubs a click: one near call each at the hub's position (`POST /internal/v1/stations/near`, 300 m, ≤5 stations, nearest first), never a search by name; a hub whose stored position cannot be sent is `no_position`, without a call; writes nothing | platform_admin |
+| POST | `.../hubs/resolve` | Station codes proposed by the station module for ≤10 unresolved hubs a click: one near call each at the hub's position (`POST /internal/v1/stations/near`, 300 m, ≤5 stations, nearest first), never a search by name; a hub whose stored position cannot be sent is `no_position`, without a call; a 429 of a near window gives `near_limited: true` (the page then holds only Propose, not Save/Check); writes nothing | platform_admin |
 | POST | `.../hubs/confirm` | Store ≤10 accepted codes after one module lookup (`uic_origin='msmm'`) | platform_admin |
 | POST | `.../hubs/check` | Re-read ≤20 stored codes a click with one lookup; shows unserved codes and differing names; writes nothing | platform_admin |
 | GET/POST | `.../runs` | List runs / start a run (schedules `execute_run` as BackgroundTask) | platform_admin |
