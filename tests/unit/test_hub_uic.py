@@ -678,10 +678,10 @@ def test_name_results_are_ordered_by_distance_and_those_beyond_300_m_carry_a_war
     near, middle, far = proposal["candidates"]
     assert near["warning"] is None
     assert middle["warning"] == (
-        "Found by name, 501 m from the hub's position — check before confirming."
+        "Found by name, 501 m from the hub's position — check before saving."
     )
     assert far["warning"] == (
-        "Found by name, 1.2 km from the hub's position — check before confirming."
+        "Found by name, 1.2 km from the hub's position — check before saving."
     )
     assert all(c["found_by"] == "name" for c in proposal["candidates"])
 
@@ -698,7 +698,7 @@ def test_a_single_name_result_beyond_300_m_is_to_pick_never_proposed(
     assert proposal["state"] == "to_pick"
     (candidate,) = proposal["candidates"]
     assert candidate["distance_m"] > 300
-    assert "check before confirming" in candidate["warning"]
+    assert "check before saving" in candidate["warning"]
 
 
 @pytest.mark.parametrize(
@@ -736,7 +736,7 @@ def test_a_name_result_at_300_4_m_is_beyond_300_m(
     assert proposal["state"] == "to_pick"
     assert candidate["distance_m"] == 301
     assert candidate["warning"] == (
-        "Found by name, 301 m from the hub's position — check before confirming."
+        "Found by name, 301 m from the hub's position — check before saving."
     )
 
 
@@ -777,7 +777,7 @@ def test_a_name_result_without_a_usable_position_is_shown_last_without_distance(
     assert nowhere["distance_m"] is None
     assert nowhere["warning"] == (
         "Found by name; the station module gives no usable position for it, so its "
-        "distance from the hub is unknown — check before confirming."
+        "distance from the hub is unknown — check before saving."
     )
 
 
@@ -869,7 +869,7 @@ def test_a_hub_without_position_lists_its_name_results_with_the_no_position_warn
         assert candidate["found_by"] == "name"
         assert candidate["warning"] == (
             "Found by name; this hub has no usable position, so the distance is unknown "
-            "— check before confirming."
+            "— check before saving."
         )
     assert db.commits == 0
 
@@ -1579,19 +1579,28 @@ function lines(item) {
 _RENDER_SCENARIO = """
 const position = { name: 'ZZ Central', uic: '9900001', country_iso: 'ZZ', distance_m: 120, found_by: 'position', warning: null };
 const near = { name: 'ZZ Near', uic: '9900002', country_iso: 'ZZ', distance_m: 200, found_by: 'name', warning: null };
-const far = { name: 'ZZ Far', uic: '9900003', country_iso: null, distance_m: 1200, found_by: 'name', warning: 'Found by name, 1.2 km from the hub' };
+const far = { name: 'ZZ Far', uic: '9900003', country_iso: null, distance_m: 1260, found_by: 'name', warning: 'Found by name, 1.3 km from the hub' };
 const lost = { name: 'ZZ Lost', uic: '9900004', country_iso: 'ZZ', distance_m: null, found_by: 'name', warning: 'ZZ unknown' };
 const base = { hub_id: 'zz-hub-01', hub_name: 'ZZ Hub 01', name_searched: false, far_dropped: 0 };
 const out = {
   byPosition: lines(hubProposalItem({ ...base, state: 'proposed', candidates: [position] })),
   byName: lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, far_dropped: 2, candidates: [near, far] })),
+  oneFar: lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, far_dropped: 1, candidates: [] })),
   none: lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: [] })),
+  notSearched: lines(hubProposalItem({ ...base, state: 'to_pick', candidates: [] })),
   noPosition: lines(hubProposalItem({ ...base, state: 'no_position', name_searched: true, candidates: [lost] })),
   noPositionNone: lines(hubProposalItem({ ...base, state: 'no_position', name_searched: true, candidates: [] })),
+  noPositionNotSearched: lines(hubProposalItem({ ...base, state: 'no_position', candidates: [] })),
 };
-const farItem = hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: [far] });
-const warning = farItem.children.find(c => c.className === 'hub-code-warning');
-out.describedBy = farItem.children.find(c => c.tag === 'label').children[0].attrs['aria-describedby'] === warning.id && warning.id !== '';
+// Two items with two warned candidates each: every warning has its own id,
+// each choice points at the warning right after it, none is hidden.
+const items = [far, lost].map(() => hubProposalItem({ ...base, state: 'to_pick', name_searched: true, candidates: [far, lost] }));
+const described = (c) => c.tag === 'label' && c.children[0].attrs['aria-describedby'];
+const pairs = items.flatMap(item => item.children.flatMap((c, i) => (described(c) ? [[described(c), item.children[i + 1]]] : [])));
+out.warnings = pairs.length;
+out.ownWarning = pairs.every(([ref, next]) => next.className === 'hub-code-warning' && next.id === ref && ref !== '');
+out.uniqueIds = new Set(pairs.map(([ref]) => ref)).size === pairs.length;
+out.hidden = pairs.some(([, next]) => 'aria-hidden' in next.attrs || next.hidden === true);
 console.log(JSON.stringify(out));
 """
 
@@ -1601,7 +1610,7 @@ def _render_script(text: str) -> str:
     helpers = script[
         script.index("function hubCodesElement(") : script.index("function hubCodesStatus(")
     ]
-    start = script.index("// Where a candidate comes from")
+    start = script.index("// A distance as the warnings write it")
     end = script.index("async function resolveHubCodes(")
     return helpers + script[start:end]
 
@@ -1623,17 +1632,28 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
     ]
     assert out["byName"] == [
         "ZZ Hub 01",
-        "No station within 300 m of this hub's position; found by its name instead: "
+        "No station returned by the position search; found by its name instead: "
         "check each one before saving, or leave it.",
-        "2 more found by name stand over 50 km from the hub's position and are not shown: "
-        "check the position.",
+        "2 more stations found by name stand over 50 km from the hub's position and are "
+        "not shown: check the position.",
         "[radio] ZZ Near · 9900002 · ZZ · 200 m · by name",
-        "[radio] ZZ Far · 9900003 · ? · 1200 m · by name",
-        "Warning: Found by name, 1.2 km from the hub",
+        # The distance is written as the warnings write it.
+        "[radio] ZZ Far · 9900003 · ? · 1.3 km · by name",
+        "Warning: Found by name, 1.3 km from the hub",
         "[radio] Leave it",
     ]
-    assert out["none"][1].startswith(
-        "No station of the module within 300 m of this hub's position, and none found by its name"
+    assert out["oneFar"][2] == (
+        "1 more station found by name stands over 50 km from the hub's position and is "
+        "not shown: check the position."
+    )
+    assert out["none"][1] == (
+        "No station of the module within 300 m of this hub's position, and none found by "
+        "its name: type the code in the hub form if you know it."
+    )
+    assert out["notSearched"][1] == (
+        "No station of the module within 300 m of this hub's position, and its name was "
+        "not searched (it is under 3 or over 100 characters): type the code in the hub form "
+        "if you know it."
     )
     assert out["noPosition"] == [
         "ZZ Hub 01",
@@ -1644,8 +1664,15 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
         "Warning: ZZ unknown",
         "[radio] Leave it",
     ]
-    assert out["noPositionNone"][2] == "Nothing found by its name either."
-    assert out["describedBy"] is True
+    assert out["noPositionNone"][2] == (
+        "Its position cannot be searched, and none found by its name: type the code in the "
+        "hub form if you know it."
+    )
+    assert "its name was not searched" in out["noPositionNotSearched"][2]
+    assert out["warnings"] == 4
+    assert out["ownWarning"] is True
+    assert out["uniqueIds"] is True
+    assert out["hidden"] is False
 
 
 def test_the_code_on_each_hub_row_is_written_as_text(template_text: str) -> None:
@@ -1929,3 +1956,35 @@ def test_the_proposal_shows_the_modules_distance_and_does_not_filter_again() -> 
 
     assert proposal.state == "proposed"
     assert proposal.candidates[0].distance_m == 300
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (None, "a minute"),
+        (1, "1 second"),
+        (17, "17 seconds"),
+        (119, "119 seconds"),
+        (120, "about 2 minutes"),
+        (121, "about 3 minutes"),
+        (7199, "about 120 minutes"),
+        (7200, "about 2 hours"),
+        (50_000, "about 14 hours"),
+    ],
+)
+def test_the_wait_of_a_429_reads_in_seconds_minutes_or_hours(
+    seconds: int | None, text: str
+) -> None:
+    assert network_coverage._wait_text(seconds) == text
+
+
+def test_a_long_retry_after_is_said_in_hours_and_kept_as_given(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hubs.rows = [_hub(1)]
+    module.near = lambda _b: _limited("50000", "user_day")
+
+    body = client.post(f"{BASE}/resolve", json={}).json()
+
+    assert body["message"] == "The station module's limit is reached; try again in about 14 hours."
+    assert body["retry_after"] == 50_000

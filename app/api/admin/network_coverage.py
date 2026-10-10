@@ -984,13 +984,26 @@ def _caller(admin: CurrentUser) -> uuid.UUID:
     return admin.id
 
 
+def _wait_text(seconds: int | None) -> str:
+    """The module's Retry-After for a sentence: "a minute" when it gave
+    none, seconds under two minutes, then minutes under two hours, then
+    hours (rounded up); the wait itself is unchanged."""
+    if seconds is None:
+        return "a minute"
+    if seconds < 120:
+        return "1 second" if seconds == 1 else f"{seconds} seconds"
+    if seconds < 7200:
+        return f"about {math.ceil(seconds / 60)} minutes"
+    return f"about {math.ceil(seconds / 3600)} hours"
+
+
 def _failure(
     outcome: station_module.Outcome,
 ) -> tuple[Literal["limited", "unavailable"], str, int | None]:
     """The status, the sentence and the time to wait of a failed call: a 429
     is `limited` with the module's Retry-After; anything else `unavailable`."""
     if outcome.reason == "status_429":
-        wait = f"{outcome.retry_after} seconds" if outcome.retry_after is not None else "a minute"
+        wait = _wait_text(outcome.retry_after)
         return (
             "limited",
             f"The station module's limit is reached; try again in {wait}.",
@@ -1004,7 +1017,7 @@ def _near_limit_message(code: str, retry_after: int | None) -> str:
     daily one "tomorrow (UTC)" (its window ends at midnight UTC) rather than
     up to a day of seconds; and that saving and checking still work."""
     if code == "near_user_minute":
-        wait = f"{retry_after} seconds" if retry_after is not None else "a minute"
+        wait = _wait_text(retry_after)
         sentence = f"Your limit of proposals a minute is reached; try again in {wait}."
     elif code == "near_user_day":
         sentence = "Your daily limit of proposals is reached; try again tomorrow (UTC)."
@@ -1065,11 +1078,11 @@ def _distance_text(metres: int) -> str:
 
 _UNKNOWN_HUB_POSITION = (
     "Found by name; this hub has no usable position, so the distance is unknown "
-    "— check before confirming."
+    "— check before saving."
 )
 _UNKNOWN_STATION_POSITION = (
     "Found by name; the station module gives no usable position for it, so its "
-    "distance from the hub is unknown — check before confirming."
+    "distance from the hub is unknown — check before saving."
 )
 
 
@@ -1085,7 +1098,7 @@ def _name_warning(located: bool, distance: float | None) -> str | None:
         return None
     return (
         f"Found by name, {_distance_text(_shown_metres(distance))} from the hub's position "
-        "— check before confirming."
+        "— check before saving."
     )
 
 

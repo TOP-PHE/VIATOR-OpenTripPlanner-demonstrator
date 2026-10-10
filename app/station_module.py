@@ -582,7 +582,7 @@ async def lookup(uics: list[str], user_id: uuid.UUID) -> Outcome:
 async def _without_pause(
     event: str, call: Callable[[], Awaitable[list[dict[str, Any]]]]
 ) -> Outcome:
-    """Run one admin call (lookup, near) as an `Outcome`: no call when the
+    """Run one admin call (lookup, near, admin search) as an `Outcome`: no call when the
     module is not configured (`off`) or the pause runs (`paused`); a failure
     is logged as `<event> reason=<word>` and **never starts the pause** (nor
     forgets the cached attribution), whatever its kind."""
