@@ -421,6 +421,9 @@ def test_the_published_request_body_is_still_the_models_schema() -> None:
         pytest.param("Zz, Zzhof", "Zz, Zzhof", id="a-comma"),
         pytest.param("\u00df\u00df.", "\u00df\u00df.", id="letters-the-module-spells-with-two"),
         pytest.param("\u00c6\u0152.", "\u00c6\u0152.", id="capitals-the-module-spells-with-two"),
+        # Two Hangul syllables decompose (NFD) into four letters in the
+        # module's fold ("\u1100\u1161\u1100\u1161"): accepted there, so sent.
+        pytest.param("\uac00\uac00.", "\uac00\uac00.", id="syllables-that-decompose"),
         pytest.param("Zz-Z", "Zz-Z", id="a-hyphen-between-words"),
     ],
 )
