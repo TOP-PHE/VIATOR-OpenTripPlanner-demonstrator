@@ -759,25 +759,57 @@ Switch to colored console output for local dev: set `LOG_FORMAT=console` in
 the `.env` (default is `json`). `LOG_LEVEL` accepts the standard stdlib names
 (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) and defaults to `INFO`.
 
-**What the logs leave out on purpose (#339).** A query string can carry a
-secret or what a user typed: a feed credential of auth type `query` is added
-to the feed's URL as `?<param>=<value>` (`app/credentials.py`), and the
-station fields of `/journey` send the typed text to `/api/geocode?q=…`, which
-VIATOR forwards to MOTIS as `?text=…`. So:
+**What the logs and traces leave out on purpose (#339 and its follow-up).**
+A URL can carry a secret or what a person typed: a feed credential of auth
+type `query` is added to the feed's URL as `?<param>=<value>`
+(`app/credentials.py`); the station fields of `/journey` send the typed
+text to `/api/geocode?q=…`, which VIATOR forwards to MOTIS as `?text=…`;
+the account confirmation page checks its token with
+`/api/auth/check-token?t=…`; the reports filter on `?user=…`; and the
+e-mailed links `/confirm/<token>`, `/reset/<token>` and the share link
+`/share/coverage/<run id>` carry the secret in the path. One rule,
+`app/url_redaction.py`, decides what of a URL may be written:
 
-- the `httpx` and `httpcore` loggers are set to `WARNING` in web and worker:
-  their INFO line `HTTP Request: GET <full URL> "<status>"` is not written
-  (their warnings and errors still are);
-- the uvicorn access log keeps `GET /api/geocode` but drops its query
-  string (`app/logging_config.py`, `DropTypedQueryString`). The station list
-  (`POST /api/stations/suggest`) takes its text in the body and is not
-  affected.
+- every query value becomes `REDACTED`, except the parameters of its
+  allow-list (`limit`, `page`, `size`, `since`, `status`, `session`, … —
+  paging, dates, ids; never a secret, never typed text). A new route's
+  parameter is redacted until someone adds it to that list;
+- the path segment after `/confirm/`, `/reset/` and `/share/coverage/`
+  becomes `REDACTED`; `user:password@` and a `#fragment` too.
 
-Still carrying full URLs, and not changed by #339 (open points):
-nginx's default access log (`$request`, query string included, for
-`/api/geocode?q=…` and any other route), and the OpenTelemetry spans of the
-httpx and FastAPI instrumentation sent to Tempo, whose URL attributes can
-include the query string of an outgoing feed request or of `/api/geocode`.
+Where it applies:
+
+| Output | What it writes |
+|---|---|
+| web's JSON log (uvicorn access line, every message, every field, every traceback) | URLs passed through the rule (`RedactAccessLogTarget`, `redact_urls` in `app/logging_config.py`). The `httpx`/`httpcore` loggers stay at `WARNING` (#339): their INFO line is not written at all |
+| worker's log | the same rule over the whole formatted line (`RedactingFormatter`) |
+| nginx access log (`docker compose -p viator logs nginx`, stdout) | format `viator_redacted`: `client - [time] "GET /path?REDACTED HTTP/2.0" status bytes rt=… urt="…" ua="…" rid=… nrid=…`. The query string is never written, only the `?REDACTED` marker; no referer. `rid` is the `request_id` of web's log lines for that request |
+| nginx error log (stderr) | level `crit` only — see below |
+| OpenTelemetry spans sent to Tempo | each span passes through `RedactingSpanExporter` (`app/tracing.py`): `http.url`, `url.full`, `http.target`, `url.query` of the FastAPI (inbound) and httpx (outbound: feeds, MOTIS, OTP, the station module, ÖBB, OJP) spans follow the rule; the span name, status, exception message and stack trace too; header attributes are replaced whole. SQL spans keep the statement, whose values are bound parameters, never written |
+
+**nginx's error log stays at `crit`.** An nginx error line ends with the raw
+request line (`request: "GET /api/geocode?q=… HTTP/2.0"`) and nginx offers
+no format for it; at the default level `error` such a line is written for
+every failed upstream call (web restarting, a timeout). The access log still
+shows the 502/504 and the upstream time of each failed request. To diagnose
+an upstream problem, set `error_log /var/log/nginx/error.log error;` in
+`docker/nginx/nginx.conf` for the time needed (then
+`docker compose -p viator exec nginx nginx -s reload`), knowing those lines
+carry query strings, and set it back to `crit` afterwards.
+
+**Still outside the rule** (not VIATOR's code): the logs of the engine
+containers (MOTIS, OTP), Grafana and Prometheus, which promtail also ships
+to Loki. MOTIS and OTP receive VIATOR's own requests (positions, the
+geocoder text); whether they log them depends on their own settings.
+
+**Logs written before this change** can still hold query strings: the
+nginx container's log (docker keeps it until the container is recreated),
+Loki (7 days, `docker/loki/loki-config.yaml`) and Tempo (7 days,
+`docker/tempo/tempo-config.yaml`). Recreating the nginx container, which a
+deploy of this change needs anyway to load the new config, starts a fresh
+log: `docker compose -p viator up -d --force-recreate nginx`. The remedy for
+a feed key that may have been written is to have it rotated by its provider
+and to update the credential in `/credentials`.
 
 ### 5.5 Prometheus metrics (audit #14, since v0.1.32.15+)
 
