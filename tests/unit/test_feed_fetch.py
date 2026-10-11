@@ -489,7 +489,8 @@ def test_hostile_keys_land_inside_under_a_plain_name(staging: Path, key: str, na
 
 def test_very_long_key_is_refused(staging: Path) -> None:
     state_dir = staging / "_fetch_state"
-    longest = "z" * (feed_fetch._STATE_NAME_MAX - len(".json"))
+    assert feed_fetch._STATE_NAME_MAX == 200  # the documented limit; a change must be deliberate
+    longest = "z" * (200 - len(".json"))
     assert feed_fetch.state_path(state_dir, longest).name == f"{longest}.json"
     with pytest.raises(ValueError, match="plain file name"):
         feed_fetch.state_path(state_dir, longest + "z")
