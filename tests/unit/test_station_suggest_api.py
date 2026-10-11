@@ -420,6 +420,7 @@ def test_the_published_request_body_is_still_the_models_schema() -> None:
         pytest.param("Z.Z", "Z.Z", id="a-full-stop-between-letters"),
         pytest.param("Zz, Zzhof", "Zz, Zzhof", id="a-comma"),
         pytest.param("\u00df\u00df.", "\u00df\u00df.", id="letters-the-module-spells-with-two"),
+        pytest.param("\u00c6\u0152.", "\u00c6\u0152.", id="capitals-the-module-spells-with-two"),
         pytest.param("Zz-Z", "Zz-Z", id="a-hyphen-between-words"),
     ],
 )
