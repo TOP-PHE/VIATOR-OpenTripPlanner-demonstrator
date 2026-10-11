@@ -125,6 +125,36 @@ def redact_span(span: ReadableSpan) -> ReadableSpan:
     )
 
 
+def strip_span(span: ReadableSpan) -> ReadableSpan:
+    """A copy of `span` that keeps only its identity, timing, kind, status
+    code and non-string attributes: what is exported when `redact_span`
+    fails, so one bad span neither leaks nor costs the batch."""
+    attributes = {
+        k: v for k, v in (span.attributes or {}).items() if isinstance(v, (bool, int, float))
+    }
+    return ReadableSpan(
+        name=REDACTED,
+        context=span.context,
+        parent=span.parent,
+        resource=span.resource,
+        attributes=attributes,
+        kind=span.kind,
+        status=Status(span.status.status_code),
+        start_time=span.start_time,
+        end_time=span.end_time,
+        instrumentation_scope=span.instrumentation_scope,
+    )
+
+
+def _redact_or_strip(span: ReadableSpan) -> ReadableSpan:
+    try:
+        return redact_span(span)
+    except Exception as exc:  # any failure: never export the raw span
+        # The type only: the message could quote the value that failed.
+        log.warning("tracing.redaction_failed", extra={"error_type": type(exc).__name__})
+        return strip_span(span)
+
+
 class RedactingSpanExporter(SpanExporter):
     """A SpanExporter that hands `redact_span` copies to the exporter it
     wraps. It sits between the BatchSpanProcessor and the OTLP exporter, so
@@ -135,7 +165,7 @@ class RedactingSpanExporter(SpanExporter):
         self._inner = inner
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        return self._inner.export([redact_span(s) for s in spans])
+        return self._inner.export([_redact_or_strip(s) for s in spans])
 
     def shutdown(self) -> None:
         self._inner.shutdown()

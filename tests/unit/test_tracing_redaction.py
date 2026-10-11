@@ -95,8 +95,9 @@ def test_inbound_request_and_outbound_httpx_call_carry_no_typed_text(
     blob = _assert_clean(spans)
     kinds = {s.kind.name for s in spans}
     assert {"SERVER", "CLIENT"} <= kinds
-    # The redaction kept the URLs readable: path and the allow-listed size.
-    assert "/api/geocode?q=REDACTED&size=5" in blob
+    # The redaction kept the URLs readable. An absolute URL keeps no value,
+    # not even an allow-listed one (an outbound credential may bear its name).
+    assert "/api/geocode?q=REDACTED&size=REDACTED" in blob
     assert "https://motis.zz.invalid/api/v1/geocode?text=REDACTED" in blob
 
 
@@ -152,7 +153,7 @@ def test_redact_span_covers_name_status_events_links_and_headers(
     exported = spans[-1]
     attrs = dict(exported.attributes or {})
     assert attrs["url.query"] == "q=REDACTED&limit=3"
-    assert attrs["http.url"] == "https://h.zz.invalid/g?text=REDACTED&size=2"
+    assert attrs["http.url"] == "https://h.zz.invalid/g?text=REDACTED&size=REDACTED"
     assert attrs["http.target"] == "/reset/REDACTED"
     assert attrs["http.request.header.authorization"] == ("REDACTED",)
     assert attrs["http.response.header.set_cookie"] == "REDACTED"
@@ -230,3 +231,49 @@ def test_setup_tracing_puts_the_wrapper_in_front_of_the_otlp_exporter(
     spans = received.get_finished_spans()
     _assert_clean(spans)
     assert dict(spans[0].attributes or {})["http.url"] == "https://h.zz.invalid/?apikey=REDACTED"
+
+
+def test_a_span_that_fails_redaction_is_exported_stripped_not_dropped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from app import tracing
+
+    memory = InMemorySpanExporter()
+    tp = TracerProvider()
+    tp.add_span_processor(SimpleSpanProcessor(RedactingSpanExporter(memory)))
+    real = tracing.redact_span
+
+    def flaky(span: ReadableSpan) -> ReadableSpan:
+        if span.name.startswith("bad"):
+            raise ValueError("cannot redact https://h.zz.invalid/?apikey=ZZSECRET99")
+        return real(span)
+
+    monkeypatch.setattr(tracing, "redact_span", flaky)
+    tracer = tp.get_tracer("zz")
+    with tracer.start_as_current_span("bad /x?apikey=ZZSECRET99") as span:
+        span.set_attribute("http.url", "https://h.zz.invalid/?apikey=ZZSECRET99")
+        span.set_attribute("http.status_code", 500)
+        span.add_event("e", {"m": "ZZSECRET99"})
+        span.set_status(Status(StatusCode.ERROR, "ZZSECRET99"))
+    with tracer.start_as_current_span("good") as span:
+        span.set_attribute("http.url", "https://h.zz.invalid/?apikey=ZZSECRET99")
+    spans = memory.get_finished_spans()
+    tp.shutdown()
+    assert [s.name for s in spans] == ["REDACTED", "good"]
+    _assert_clean(spans)
+    bad = spans[0]
+    assert dict(bad.attributes or {}) == {"http.status_code": 500}
+    assert bad.events == ()
+    assert bad.status.status_code is StatusCode.ERROR
+    assert "tracing.redaction_failed" in caplog.text
+    assert "ZZSECRET99" not in caplog.text
+
+
+def test_route_templates_stay_readable_in_spans(
+    provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    tp, memory = provider
+    assert TestClient(_app(tp)).get("/confirm/ZZTOKEN99").status_code == 200
+    server = next(s for s in memory.get_finished_spans() if s.kind.name == "SERVER")
+    assert server.name == "GET /confirm/{token}"
+    assert dict(server.attributes or {})["http.route"] == "/confirm/{token}"
