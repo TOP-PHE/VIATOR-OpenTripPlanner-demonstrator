@@ -137,6 +137,8 @@ def test_redact_span_covers_name_status_events_links_and_headers(
         span.add_link(other_context, {"from": "https://h.zz.invalid/?code=ZZ99"})
         span.set_attribute("url.full", "https://h.zz.invalid/f?token=ZZ99")
         span.set_attribute("url.query", "q=Zzville&limit=3")
+        # A raw space ends a URL for redact_text; a URL attribute is redacted whole.
+        span.set_attribute("http.url", "https://h.zz.invalid/g?text=Zz ZZ99&size=2")
         span.set_attribute("http.target", "/reset/ZZTOKEN99")
         span.set_attribute("http.request.header.authorization", ("Bearer ZZSECRET99",))
         span.set_attribute("http.response.header.set_cookie", "zz=ZZ99")
@@ -150,6 +152,7 @@ def test_redact_span_covers_name_status_events_links_and_headers(
     exported = spans[-1]
     attrs = dict(exported.attributes or {})
     assert attrs["url.query"] == "q=REDACTED&limit=3"
+    assert attrs["http.url"] == "https://h.zz.invalid/g?text=REDACTED&size=2"
     assert attrs["http.target"] == "/reset/REDACTED"
     assert attrs["http.request.header.authorization"] == ("REDACTED",)
     assert attrs["http.response.header.set_cookie"] == "REDACTED"

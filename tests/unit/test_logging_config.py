@@ -201,6 +201,24 @@ def test_the_access_filter_is_added_once(_restore_quieted_loggers: None) -> None
     assert sum(isinstance(f, RedactAccessLogTarget) for f in access.filters) == 1
 
 
+def test_the_access_filter_itself_redacts_the_target() -> None:
+    """The filter works on its own, before any formatter (a handler with
+    another formatter would otherwise print the raw target)."""
+    from app.logging_config import RedactAccessLogTarget
+
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:9999", "GET", "/reset/ZZ99?t=ZZ99&page=2", "1.1", 200),
+        None,
+    )
+    assert RedactAccessLogTarget().filter(record) is True
+    assert record.args == ("127.0.0.1:9999", "GET", "/reset/REDACTED?t=REDACTED&page=2", "1.1", 200)
+
+
 def test_a_record_of_another_shape_passes_untouched() -> None:
     from app.logging_config import RedactAccessLogTarget
 
@@ -306,3 +324,28 @@ def test_the_worker_formatter_redacts_message_and_traceback() -> None:
     root.addHandler(logging.StreamHandler())
     install_redacting_formatter(fmt)
     assert all(isinstance(h.formatter, RedactingFormatter) for h in root.handlers)
+
+
+def test_the_worker_process_logs_through_the_redacting_formatter() -> None:
+    """app/worker.py configures its logging at import; in a fresh process
+    (pytest's own handlers would hide basicConfig here) its root handler
+    must redact."""
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, app.worker\n"
+        "logging.getLogger('worker').warning('fetch https://h.example/f?apikey=ZZ99 failed')\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "OTEL_EXPORTER_OTLP_ENDPOINT": ""},
+        check=True,
+    )
+    assert "f?apikey=REDACTED failed" in done.stderr
+    assert "ZZ99" not in done.stderr + done.stdout

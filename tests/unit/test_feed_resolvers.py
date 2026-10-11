@@ -394,6 +394,33 @@ async def test_redirect_guard_checks_every_hop(monkeypatch: pytest.MonkeyPatch) 
         assert r.status_code == 200
 
 
+async def test_redirect_guard_message_carries_no_query_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal reaches the refresh result and the logs: a hop's query
+    credential (invented `ZZSECRET99`) must not ride along, even when the
+    guard's own message quotes the URL."""
+
+    def guard(url: str) -> str:
+        if "169.254" in url:
+            raise ValueError(f"NAP URL has no public address: {url!r}")
+        return url
+
+    monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", guard)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302, headers={"Location": "http://169.254.169.254/x?apikey=ZZSECRET99"}
+        )
+
+    async with _client(handler) as c, feed_resolvers.redirect_guard(c):
+        with pytest.raises(httpx.RequestError) as caught:
+            await c.get("https://nap.example/permalink?apikey=ZZSECRET99")
+    message = str(caught.value)
+    assert "ZZSECRET99" not in message
+    assert "blocked request to http://169.254.169.254/x?apikey=REDACTED" in message
+
+
 # ─────────────────────────── json_api ───────────────────────────
 
 ES_API = "https://nap.example.es/api/Fichero/GetList"
