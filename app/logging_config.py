@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 import structlog
-from structlog.types import Processor
+from structlog.types import EventDict, Processor
+
+from .url_redaction import redact_text, redact_url
 
 
 def _shared_processors() -> list[Processor]:
@@ -43,10 +46,10 @@ def _shared_processors() -> list[Processor]:
 # (#339 review). Nothing in VIATOR reads them.
 QUIET_HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
 
-# Request paths whose query string is the text a user typed: the uvicorn
-# access log keeps the path and drops the query (#339 review). The station
-# list (`POST /api/stations/suggest`) takes its text in the body already.
-TYPED_TEXT_PATHS = ("/api/geocode",)
+# Every line that still names a URL — uvicorn's access line, a traceback
+# quoting an httpx error, a message — passes through app.url_redaction
+# (RedactAccessLogTarget, redact_urls, RedactingFormatter below): no query
+# value outside its allow-list and no token path reaches the log.
 
 
 def quiet_http_client_loggers() -> None:
@@ -55,18 +58,56 @@ def quiet_http_client_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-class DropTypedQueryString(logging.Filter):
-    """On `uvicorn.access`, cut the query string off the paths in
-    TYPED_TEXT_PATHS. uvicorn's access record carries
-    `(client, method, path_with_query, http_version, status)` as its args."""
+class RedactAccessLogTarget(logging.Filter):
+    """On `uvicorn.access`, pass the request target through
+    `app.url_redaction.redact_url`: every query value outside the allow-list
+    and every token path segment becomes REDACTED, for every route — a new
+    route's query is redacted without anyone remembering it. uvicorn's
+    access record carries `(client, method, path_with_query, http_version,
+    status)` as its args."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
-            path, sep, _ = args[2].partition("?")
-            if sep and path in TYPED_TEXT_PATHS:
-                record.args = (args[0], args[1], path, args[3], args[4])
+            record.args = (args[0], args[1], redact_url(args[2]), args[3], args[4])
         return True
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    # An object the renderer would print with repr() (an httpx.URL, an
+    # exception): print it here, redacted.
+    return redact_text(repr(value))
+
+
+def redact_urls(_logger: Any, _method: str, event_dict: EventDict) -> EventDict:
+    """structlog processor: every string of the line — the message, each
+    field, the formatted traceback — with its URLs passed through
+    `app.url_redaction.redact_text`. Runs last before the renderer, so it
+    sees the stdlib records (uvicorn, SQLAlchemy, APScheduler, httpx's
+    warnings) and the structlog ones alike."""
+    return {k: _redact_value(v) for k, v in event_dict.items()}
+
+
+class RedactingFormatter(logging.Formatter):
+    """A plain-text formatter whose whole output, traceback included, goes
+    through `redact_text`. For the worker, which logs with basicConfig."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_text(super().format(record))
+
+
+def install_redacting_formatter(fmt: str) -> None:
+    """Give every handler of the root logger a RedactingFormatter."""
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(RedactingFormatter(fmt))
 
 
 def setup_logging(
@@ -96,6 +137,7 @@ def setup_logging(
         foreign_pre_chain=pre_chain,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            redact_urls,
             renderer,
         ],
     )
@@ -118,8 +160,8 @@ def setup_logging(
 
     quiet_http_client_loggers()
     access = logging.getLogger("uvicorn.access")
-    if not any(isinstance(f, DropTypedQueryString) for f in access.filters):
-        access.addFilter(DropTypedQueryString())
+    if not any(isinstance(f, RedactAccessLogTarget) for f in access.filters):
+        access.addFilter(RedactAccessLogTarget())
 
     structlog.configure(
         processors=[
