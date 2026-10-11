@@ -1312,6 +1312,26 @@ def test_a_form_that_finds_only_stations_beyond_50_km_does_not_stop_the_shorteni
             id="an-abbreviation-without-a-space",
         ),
         pytest.param(
+            "Zzville Zzs. Zzgallen, Zzbahnhof Zznord Zzost Zzwest",
+            [
+                "Zzville Zzs. Zzgallen, Zzbahnhof Zznord Zzost",
+                "Zzville Zzs. Zzgallen, Zzbahnhof Zznord",
+                "Zzville Zzs. Zzgallen",
+            ],
+            id="an-abbreviation-after-a-long-word",
+        ),
+        # Only a full stop right after a short word is an abbreviation's.
+        pytest.param(
+            "Zzville Zzb, Zzc3 Zzd4 Zze5 Zzf6",
+            ["Zzville Zzb, Zzc3 Zzd4 Zze5", "Zzville Zzb, Zzc3 Zzd4", "Zzville Zzb"],
+            id="a-comma-after-a-short-word",
+        ),
+        pytest.param(
+            "Zzville Zzb . Zzc3 Zzd4 Zze5 Zzf6",
+            ["Zzville Zzb . Zzc3 Zzd4 Zze5", "Zzville Zzb . Zzc3 Zzd4", "Zzville Zzb"],
+            id="a-full-stop-apart-from-a-short-word",
+        ),
+        pytest.param(
             "Zzville. Zzb2 Zzc3 Zzd4 Zze5",
             ["Zzville. Zzb2 Zzc3 Zzd4", "Zzville. Zzb2 Zzc3", "Zzville"],
             id="a-full-stop-after-a-long-word",

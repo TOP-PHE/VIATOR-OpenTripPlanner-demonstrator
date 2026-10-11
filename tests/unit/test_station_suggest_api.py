@@ -582,7 +582,7 @@ def test_two_letters_and_any_module_separator_are_refused_without_a_call(
     assert json.loads(module.requests[0].content) == {"q": f"Zz{mark}Zz"}
 
 
-def test_a_text_refused_by_the_module_is_viators_422_logged_at_info_without_the_text(
+def test_a_text_refused_by_the_module_is_viators_422_and_warns_without_the_text(
     client: TestClient,
     module_on: str,
     module: Module,
