@@ -175,7 +175,8 @@ def test_the_maps_write_the_path_the_client_sent_redacted(
     1.27-alpine itself when written (PR #346)."""
     out = _logged(request_uri, uri)
     assert out == expected
-    assert "ZZ99" not in out and "Zzville" not in out
+    assert "ZZ99" not in out
+    assert "Zzville" not in out
 
 
 def test_the_maps_mirror_the_token_prefixes() -> None:
