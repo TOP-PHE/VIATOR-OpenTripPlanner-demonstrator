@@ -85,6 +85,12 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius_km * math.asin(math.sqrt(a))
 
 
+def _uic_country(uic: str) -> str:
+    """The country part of a UIC code: its first two characters (fewer if
+    the code is shorter, so a 1-character code matches only itself)."""
+    return uic[:2]
+
+
 def rank_hubs(
     hub_uics: set[str],
     coords: dict[str, tuple[float, float]],
@@ -115,13 +121,13 @@ def rank_hubs(
     dest = coords.get(dest_uic)
     if origin is None or dest is None:
         return []
-    dest_country = dest_uic[:2]
+    dest_country = _uic_country(dest_uic)
     scored: list[tuple[int, float, str]] = []
     for uic in hub_uics:
         hub = coords.get(uic)
         if hub is None:
             continue
-        outside_dest_country = 0 if uic.startswith(dest_country) else 1
+        outside_dest_country = 0 if _uic_country(uic) == dest_country else 1
         detour = _haversine_km(*origin, *hub) + _haversine_km(*hub, *dest)
         scored.append((outside_dest_country, detour, uic))
     scored.sort()  # (tier, detour, uic) — tier first, then proximity, then uic
