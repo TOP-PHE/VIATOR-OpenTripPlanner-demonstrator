@@ -26,7 +26,7 @@
 <form id="search-form" class="station-search" role="search">
   <label for="q" class="hint">Station name or code</label>
   <input id="q" name="q" type="search" minlength="3" maxlength="100" autocomplete="off"
-         placeholder="at least 3 characters">
+         placeholder="at least 3 letters or digits">
   <button type="submit">Search</button>
   <button type="button" id="refresh-btn" class="secondary"
           title="Import the latest Trainline list, VIATOR's fallback">Refresh from Trainline</button>
@@ -50,6 +50,10 @@ const MODULE_ENABLED = {{ 'true' if station_module_enabled else 'false' }};
 const MODULE_LINKS = {{ 'true' if (station_module_enabled and current_user.role == 'platform_admin') else 'false' }};
 const MODULE_REFERENCE = '/msmm/admin/stations/reference';
 const QUERY_MIN = 3;
+// The text rule, said the same way for a text too short here and for one
+// the server refuses (a 422: too short once the module reads punctuation,
+// hyphens and apostrophes as spaces, or over 100 characters).
+const TEXT_RULE = "Type at least 3 letters or digits (punctuation, hyphens and apostrophes don't count), at most 100 characters.";
 
 const NOTICES = {
   msmm: 'Stations from the station module, the reference. Corrections are made in the module.',
@@ -167,7 +171,7 @@ async function search(q) {
     return;
   }
   if (answer.status === 422) {
-    clearResults('Type 3 to 100 characters, still 3 once punctuation, hyphens and apostrophes are read as spaces, without control characters.');
+    clearResults(TEXT_RULE);
     return;
   }
   if (!answer.ok) {
@@ -181,7 +185,7 @@ document.getElementById('search-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const q = document.getElementById('q').value.trim();
   if (q.length < QUERY_MIN) {
-    clearResults('Type at least ' + QUERY_MIN + ' characters.');
+    clearResults(TEXT_RULE);
     return;
   }
   search(q);

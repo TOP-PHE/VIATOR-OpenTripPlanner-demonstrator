@@ -2518,7 +2518,8 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   copy of the module's rules has drifted from the module's (a module
   release changed them): tell the developers.
 - **The Stations page** (`/admin/master/stations`, platform administrators
-  and content managers) is a search page: one field (at least 3 characters),
+  and content managers) is a search page: one field (at least 3 letters or
+  digits; punctuation, hyphens and apostrophes don't count),
   at most 10 results, no list, no paging, no total. Each search goes to the
   module first and counts on the person's own limits there, the same counters
   as his journey typeahead. Each result says where it comes from: **MSMM**, or
