@@ -29,12 +29,13 @@ def test_create_run_rejects_invalid_mode():
     values gets a ValueError BEFORE we touch the DB, so the operator
     gets a clear 400 rather than a malformed row."""
     db = MagicMock()
+    depart_at = _naive_depart()
     with pytest.raises(ValueError, match="mode must be one of"):
         runner.create_run(
             db,
             actor_user_id=None,
             session_id="nap-fr-rail",
-            depart_at=_naive_depart(),
+            depart_at=depart_at,
             mode="all_the_things",
         )
 
@@ -45,12 +46,13 @@ def test_create_run_single_session_requires_session_id():
     `run.session_id IS NULL` row that the runner aborts at execute time —
     fail fast at create instead so the operator sees a 400."""
     db = MagicMock()
+    depart_at = _naive_depart()
     with pytest.raises(ValueError, match=r"single_session.*requires a non-empty session_id"):
         runner.create_run(
             db,
             actor_user_id=None,
             session_id=None,
-            depart_at=_naive_depart(),
+            depart_at=depart_at,
             mode=runner.MODE_SINGLE_SESSION,
         )
     with pytest.raises(ValueError, match=r"single_session.*requires a non-empty session_id"):
@@ -58,7 +60,7 @@ def test_create_run_single_session_requires_session_id():
             db,
             actor_user_id=None,
             session_id="",
-            depart_at=_naive_depart(),
+            depart_at=depart_at,
             mode=runner.MODE_SINGLE_SESSION,
         )
 
@@ -69,12 +71,13 @@ def test_create_run_fanout_rejects_session_id():
     the dropdown was still populated). Rejecting it makes the intent
     explicit and prevents confusing behaviour."""
     db = MagicMock()
+    depart_at = _naive_depart()
     with pytest.raises(ValueError, match=r"fanout.*must not specify a session_id"):
         runner.create_run(
             db,
             actor_user_id=None,
             session_id="nap-fr-rail",
-            depart_at=_naive_depart(),
+            depart_at=depart_at,
             mode=runner.MODE_FANOUT,
         )
 
@@ -83,12 +86,13 @@ def test_create_run_rejects_invalid_direction():
     """direction is also enum-shaped — validate at the same gate so the
     error message is symmetric with the mode rejection."""
     db = MagicMock()
+    depart_at = _naive_depart()
     with pytest.raises(ValueError, match="direction"):
         runner.create_run(
             db,
             actor_user_id=None,
             session_id="nap-fr-rail",
-            depart_at=_naive_depart(),
+            depart_at=depart_at,
             direction="sideways",
         )
 
@@ -427,12 +431,16 @@ def test_api_post_runs_rejects_invalid_direction():
 
     from app.api.admin import network_coverage as api
 
+    body = _make_run_create_body(direction="sideways")
+    bg = BackgroundTasks()
+    db = MagicMock()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(direction="sideways"),
-            bg=BackgroundTasks(),
-            db=MagicMock(),
-            actor=_fake_actor(),
+            body=body,
+            bg=bg,
+            db=db,
+            actor=actor,
         )
     assert exc.value.status_code == 400
     assert "direction" in str(exc.value.detail).lower()
@@ -445,12 +453,16 @@ def test_api_post_runs_single_session_missing_session_id_400():
 
     from app.api.admin import network_coverage as api
 
+    body = _make_run_create_body(session_id=None)
+    bg = BackgroundTasks()
+    db = MagicMock()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(session_id=None),
-            bg=BackgroundTasks(),
-            db=MagicMock(),
-            actor=_fake_actor(),
+            body=body,
+            bg=bg,
+            db=db,
+            actor=actor,
         )
     assert exc.value.status_code == 400
     assert "session_id" in str(exc.value.detail).lower()
@@ -464,12 +476,15 @@ def test_api_post_runs_single_session_unknown_session_404():
 
     db = MagicMock()
     db.get.return_value = None
+    body = _make_run_create_body(session_id="missing-session")
+    bg = BackgroundTasks()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(session_id="missing-session"),
-            bg=BackgroundTasks(),
+            body=body,
+            bg=bg,
             db=db,
-            actor=_fake_actor(),
+            actor=actor,
         )
     assert exc.value.status_code == 404
 
@@ -484,12 +499,15 @@ def test_api_post_runs_single_session_not_serving_400():
     session_row = MagicMock()
     session_row.state = "building"
     db.get.return_value = session_row
+    body = _make_run_create_body()
+    bg = BackgroundTasks()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(),
-            bg=BackgroundTasks(),
+            body=body,
+            bg=bg,
             db=db,
-            actor=_fake_actor(),
+            actor=actor,
         )
     assert exc.value.status_code == 400
     assert "serving" in str(exc.value.detail).lower()
@@ -501,12 +519,16 @@ def test_api_post_runs_fanout_with_session_id_400():
 
     from app.api.admin import network_coverage as api
 
+    body = _make_run_create_body(mode="fanout", session_id="nap-fr-rail")
+    bg = BackgroundTasks()
+    db = MagicMock()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(mode="fanout", session_id="nap-fr-rail"),
-            bg=BackgroundTasks(),
-            db=MagicMock(),
-            actor=_fake_actor(),
+            body=body,
+            bg=bg,
+            db=db,
+            actor=actor,
         )
     assert exc.value.status_code == 400
     assert "fanout" in str(exc.value.detail).lower()
@@ -526,12 +548,15 @@ def test_api_post_runs_fanout_no_eligible_session_409(monkeypatch):
     eligible_chain = MagicMock()
     eligible_chain.scalars.return_value.first.return_value = None
     db.execute.return_value = eligible_chain
+    body = _make_run_create_body(mode="fanout", session_id=None)
+    bg = BackgroundTasks()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_run_create_body(mode="fanout", session_id=None),
-            bg=BackgroundTasks(),
+            body=body,
+            bg=bg,
             db=db,
-            actor=_fake_actor(),
+            actor=actor,
         )
     assert exc.value.status_code == 409
 

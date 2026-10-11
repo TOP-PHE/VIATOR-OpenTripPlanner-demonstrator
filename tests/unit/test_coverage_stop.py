@@ -134,11 +134,13 @@ def test_stop_endpoint_404_when_run_unknown():
     db = MagicMock()
     db.get.return_value = None  # run not found
 
+    run_id = uuid.uuid4()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.stop_run(
-            run_id=uuid.uuid4(),
+            run_id=run_id,
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 404
     assert "run" in str(exc.value.detail).lower()
@@ -158,11 +160,12 @@ def test_stop_endpoint_409_when_run_not_running(terminal_status):
     db = MagicMock()
     db.get.return_value = run
 
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.stop_run(
             run_id=run.id,
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 409
     assert terminal_status in str(exc.value.detail)

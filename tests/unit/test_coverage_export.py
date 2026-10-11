@@ -400,7 +400,8 @@ def test_json_appendix_present_for_power_users() -> None:
     by the cov-cells test); just check the appendix exists."""
     html = _render()
     assert 'class="raw"' in html
-    assert "<summary>" in html and "JSON" in html
+    assert "<summary>" in html
+    assert "JSON" in html
 
 
 def test_modal_markup_present() -> None:
@@ -536,7 +537,8 @@ def test_country_color_is_stable_and_falls_back_for_unknown_codes() -> None:
 
     # Same country -> same color every call (operators build muscle memory
     # for "AT is violet" across different runs/sessions).
-    assert _country_color("AT") == _country_color("AT")
+    first = _country_color("AT")
+    assert _country_color("AT") == first
     assert _country_color("AT") != _country_color("BE")
     # A country not in the curated list still renders something, not a
     # crash or an empty string.
@@ -1321,11 +1323,12 @@ def test_export_run_html_404_when_run_missing(monkeypatch) -> None:
 
     monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (None, []))
 
+    db = _MockDb(rows=[])
     with pytest.raises(HTTPException) as exc_info:
         mod.export_run_html(
             run_id="00000000-0000-0000-0000-000000000000",
             request=None,  # not reached on the 404 path
-            db=_MockDb(rows=[]),
+            db=db,
             _=None,
         )
     assert exc_info.value.status_code == 404

@@ -310,12 +310,13 @@ def test_create_run_filter_with_no_matching_hubs_raises(monkeypatch):
     _patch_active_hubs(monkeypatch, {"FR": ["paris"]})  # no AT hubs configured
     db = MagicMock()
 
+    depart_at = datetime(2026, 5, 18, 8, 0)
     with pytest.raises(ValueError, match=r"countries=\['AT'\]"):
         runner.create_run(
             db,
             actor_user_id=None,
             session_id="nap-fr-rail",
-            depart_at=datetime(2026, 5, 18, 8, 0),
+            depart_at=depart_at,
             countries=["AT"],
         )
 
@@ -427,12 +428,15 @@ def test_api_post_runs_translates_no_matching_hubs_to_400(monkeypatch):
     serving_session.state = "serving"
     db.get.return_value = serving_session
 
+    body = _make_body(countries=["AT"])
+    bg = BackgroundTasks()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
-            body=_make_body(countries=["AT"]),
-            bg=BackgroundTasks(),
+            body=body,
+            bg=bg,
             db=db,
-            actor=_fake_actor(),
+            actor=actor,
         )
     assert exc.value.status_code == 400
     assert "AT" in str(exc.value.detail)
