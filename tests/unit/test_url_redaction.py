@@ -169,3 +169,7 @@ def test_every_route_with_a_secret_in_its_path_is_covered() -> None:
     assert any(p.startswith("/share/coverage/") for p in paths)
     assert any(p.startswith("/confirm/") for p in paths)
     assert any(p.startswith("/reset/") for p in paths)
+
+
+def test_a_url_urlsplit_refuses_without_query_keeps_its_path() -> None:
+    assert redact_url("http://[zz/confirm/ZZTOKEN99") == "http://[zz/confirm/REDACTED"

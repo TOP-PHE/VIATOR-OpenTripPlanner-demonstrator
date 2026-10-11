@@ -126,7 +126,9 @@ def redact_url(url: str) -> str:
         parts = urlsplit(url)
     except ValueError:
         head = re.split(r"[?#@]", url, maxsplit=1)[0]
-        return redact_path(head) + ("" if head == url else f"?{REDACTED}")
+        if head == url:
+            return redact_path(head)
+        return f"{redact_path(head)}?{REDACTED}"
     return urlunsplit(
         (
             parts.scheme,
