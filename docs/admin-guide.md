@@ -2620,7 +2620,11 @@ uses the module (platform administrators only):
   When a long name has a mark of punctuation, the text before the first
   one (usually the town) is always among the three: "Zzcity-Zzname, Zzgare
   de Zzsaint-Zzname" is searched as "Zzcity-Zzname, Zzgare de Zzsaint",
-  "Zzcity-Zzname, Zzgare de" and "Zzcity-Zzname". This finds
+  "Zzcity-Zzname, Zzgare de" and "Zzcity-Zzname". The full stop of an
+  abbreviation (after a word of 3 letters or fewer, as in "St.") does not
+  count, and the text must hold a word of 4 letters or digits or more: for
+  "St. Zzname, Zzgare Zznord Zzost Zzwest" the third search is
+  "St. Zzname". This finds
   a station the module names differently (for example with "St" for
   "Saint", or a building's name added: "Zzcity-St-Zzname - Building"). A
   shortened form is not sent when it holds fewer than 3 letters or digits

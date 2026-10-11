@@ -171,8 +171,9 @@ NAME_FALLBACK_MAX_DISTANCE_M = 50_000
 # module's "Marseille-St-Charles" is found by "Marseille" for the hub
 # "Marseille Saint-Charles", and "Basel, Burgfelderhof" is shortened to
 # "Basel". When the cap would leave out the form that ends before the
-# name's first mark of punctuation (the town, in "St-Louis, Gare de
-# Saint-Louis"), that form takes the third place: never more searches.
+# name's first punctuation boundary (the town, in "St-Louis, Gare de
+# Saint-Louis"; a full stop after a word of 3 letters or fewer, as in "St.",
+# is not one), that form takes the third place: never more searches.
 # Only for a hub with a usable position: without a distance to order and
 # filter them, the results of a single word would be a guess.
 NAME_SHORTEN_MAX = 3
@@ -1211,9 +1212,9 @@ def _shortened_names(name: str) -> list[str]:
     form whose last word is a single letter (an elision such as
     "Zzville-d"), one with fewer than 3 letters or digits, and one the
     search would refuse (over 100 characters, or under 3 characters once
-    folded). When the cap leaves out the form that ends before the name's
-    first mark of punctuation (`MODULE_PUNCTUATION`), that form takes the
-    last place: "Zz-Zzlouis, Zzgare de Zzsaint-Zzlouis" gives "Zz-Zzlouis,
+    folded). When the cap leaves out the form that ends at the name's first
+    punctuation boundary (`_boundary_form`), that form takes the last
+    place: "Zz-Zzlouis, Zzgare de Zzsaint-Zzlouis" gives "Zz-Zzlouis,
     Zzgare de Zzsaint", "Zz-Zzlouis, Zzgare de" and "Zz-Zzlouis" (the
     town, before the comma), still at most NAME_SHORTEN_MAX searches."""
     forms: list[str] = []
@@ -1227,21 +1228,46 @@ def _shortened_names(name: str) -> list[str]:
         except ValueError:
             continue
     shortened = forms[:NAME_SHORTEN_MAX]
-    before = _before_punctuation(name, words)
-    if before in forms and before not in shortened:
-        shortened[-1] = before
+    boundary = _boundary_form(name, words, forms)
+    if boundary is not None and boundary not in shortened:
+        shortened[-1] = boundary
     return shortened
 
 
-def _before_punctuation(name: str, words: list[re.Match[str]]) -> str | None:
-    """The name up to the end of its last word before its first mark of
-    punctuation, or None when there is no mark or no word before it."""
-    mark = next(
-        (index for index, character in enumerate(name) if character in MODULE_PUNCTUATION),
-        None,
-    )
-    ends = [word.end() for word in words if mark is not None and word.end() <= mark]
-    return name[: ends[-1]] if ends else None
+# A word this long or longer (letters and digits) names a place; a shorter
+# one followed by a full stop is an abbreviation ("St.", "Zzs."), whose
+# full stop is no boundary for the third-place rule.
+_BOUNDARY_WORD_MIN = 4
+
+
+def _boundary_form(name: str, words: list[re.Match[str]], forms: list[str]) -> str | None:
+    """The form that ends at the name's first punctuation boundary, or None.
+
+    A boundary is a mark of `MODULE_PUNCTUATION` whose form (the name up to
+    the end of its last word before the mark) is one of `forms` (so it
+    would be sent) and holds a whole word of `_BOUNDARY_WORD_MIN` letters
+    or digits or more. A full stop right after a word of 3 letters or
+    fewer is the end of an abbreviation, not a boundary: in "Zzs.
+    Zzgallen, Zzbahnhof" the boundary is the comma ("Zzs. Zzgallen"),
+    never the full stop ("Zzs", which would match many stations)."""
+    for mark, character in enumerate(name):
+        if character not in MODULE_PUNCTUATION:
+            continue
+        before = [word for word in words if word.end() <= mark]
+        if not before:
+            continue
+        last = before[-1]
+        if character == "." and last.end() == mark and _letters(last.group()) < _BOUNDARY_WORD_MIN:
+            continue
+        form = name[: last.end()]
+        if form in forms and any(_letters(w.group()) >= _BOUNDARY_WORD_MIN for w in before):
+            return form
+    return None
+
+
+def _letters(word: str) -> int:
+    """How many letters or digits a word of a hub's name holds."""
+    return sum(character.isalnum() for character in word)
 
 
 def _name_plan(hub: NetworkCoverageHub, *, located: bool) -> tuple[str | None, list[str]]:

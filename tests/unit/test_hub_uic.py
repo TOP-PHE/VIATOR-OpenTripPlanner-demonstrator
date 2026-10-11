@@ -1265,20 +1265,61 @@ def test_a_form_that_finds_only_stations_beyond_50_km_does_not_stop_the_shorteni
             ],
             id="the-third-place-is-the-text-before-the-comma",
         ),
-        # Only the first mark counts, and only a form that would be sent.
+        # The first boundary whose form would be sent and holds a word of 4
+        # letters or digits: a one-letter last word makes the comma none,
+        # so the semicolon is the boundary.
         pytest.param(
             "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6 Zzg7 Zzh8",
             [
                 "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6 Zzg7",
                 "Zza1 b, Zzc3 Zzd4; Zze5 Zzf6",
-                "Zza1 b, Zzc3 Zzd4; Zze5",
+                "Zza1 b, Zzc3 Zzd4",
             ],
             id="a-one-letter-word-before-the-first-mark",
         ),
         pytest.param(
-            "(Zza1) Zzb2 Zzc3 Zzd4 Zze5, Zzf6",
-            ["(Zza1) Zzb2 Zzc3 Zzd4 Zze5", "(Zza1) Zzb2 Zzc3 Zzd4", "(Zza1) Zzb2 Zzc3"],
+            "(Zz) Zzb2 Zzc3 Zzd4 Zze5, Zzf6",
+            ["(Zz) Zzb2 Zzc3 Zzd4 Zze5", "(Zz) Zzb2 Zzc3 Zzd4", "(Zz) Zzb2 Zzc3"],
             id="a-mark-before-any-word",
+        ),
+        # The full stop of an abbreviation (after a word of 3 letters or
+        # fewer) is no boundary: the town is the text before the comma.
+        pytest.param(
+            "Zzs. Zzgallen, Zzbahnhof Zznord Zzost Zzwest",
+            [
+                "Zzs. Zzgallen, Zzbahnhof Zznord Zzost",
+                "Zzs. Zzgallen, Zzbahnhof Zznord",
+                "Zzs. Zzgallen",
+            ],
+            id="a-three-letter-abbreviation",
+        ),
+        pytest.param(
+            "St. Zzgallen, Zzbahnhof Zznord Zzost Zzwest",
+            [
+                "St. Zzgallen, Zzbahnhof Zznord Zzost",
+                "St. Zzgallen, Zzbahnhof Zznord",
+                "St. Zzgallen",
+            ],
+            id="a-two-letter-abbreviation",
+        ),
+        pytest.param(
+            "Zz.Zzville, Zzbahnhof Zznord Zzost Zzwest",
+            [
+                "Zz.Zzville, Zzbahnhof Zznord Zzost",
+                "Zz.Zzville, Zzbahnhof Zznord",
+                "Zz.Zzville",
+            ],
+            id="an-abbreviation-without-a-space",
+        ),
+        pytest.param(
+            "Zzville. Zzb2 Zzc3 Zzd4 Zze5",
+            ["Zzville. Zzb2 Zzc3 Zzd4", "Zzville. Zzb2 Zzc3", "Zzville"],
+            id="a-full-stop-after-a-long-word",
+        ),
+        pytest.param(
+            "Zza Zzb, Zzc3 Zzd4 Zze5 Zzf6 Zzg7",
+            ["Zza Zzb, Zzc3 Zzd4 Zze5 Zzf6", "Zza Zzb, Zzc3 Zzd4 Zze5", "Zza Zzb, Zzc3 Zzd4"],
+            id="no-word-of-four-letters-before-the-comma",
         ),
         pytest.param(
             "Zza1 Zzb2 Zzc3 Zzd4 Zze5 Zzf6.",
