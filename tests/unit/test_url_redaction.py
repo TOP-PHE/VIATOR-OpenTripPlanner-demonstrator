@@ -173,3 +173,114 @@ def test_every_route_with_a_secret_in_its_path_is_covered() -> None:
 
 def test_a_url_urlsplit_refuses_without_query_keeps_its_path() -> None:
     assert redact_url("http://[zz/confirm/ZZTOKEN99") == "http://[zz/confirm/REDACTED"
+
+
+# ─────────── follow-up review of #346 ───────────
+
+
+@pytest.mark.parametrize(
+    "key", sorted(SAFE_QUERY_KEYS), ids=[f"key-{k}" for k in sorted(SAFE_QUERY_KEYS)]
+)
+def test_an_absolute_url_keeps_no_value_even_for_an_allow_listed_key(key: str) -> None:
+    """An administrator may name a query credential `session` or `page`: on
+    an outbound (absolute) URL no value survives."""
+    out = redact_url(f"https://motis.zz.invalid/geocode?text=Zzville&{key}=ZZSECRET99")
+    assert out == f"https://motis.zz.invalid/geocode?text=REDACTED&{key}=REDACTED"
+    assert _clean(redact_text(f"GET https://h.zz.invalid/x?{key.upper()}=ZZSECRET99 failed"))
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("/api/x%3Fq=Zzville", "/api/x%3FREDACTED"),
+        ("/api/x%3fapikey=ZZSECRET99?page=2", "/api/x%3fREDACTED?page=2"),
+        ("https://h.zz.invalid/f%3Fkey=ZZ99", "https://h.zz.invalid/f%3FREDACTED"),
+        ("/a;jsessionid=ZZ99/b;v=ZZ99", "/a;jsessionid=REDACTED/b;v=REDACTED"),
+        ("/a;" + "k" * 41 + "=ZZ99", "/a;REDACTED"),
+        ("/confirm/{token}", "/confirm/{token}"),
+        (
+            "/share/coverage/{run_id}/cells/{a}/{b}/trips",
+            "/share/coverage/{run_id}/cells/{a}/{b}/trips",
+        ),
+        ("/reset/{ZZ99", "/reset/REDACTED"),
+    ],
+    ids=[
+        "encoded-q",
+        "encoded-q-lower",
+        "encoded-abs",
+        "matrix",
+        "matrix-odd-key",
+        "template",
+        "share-template",
+        "not-a-template",
+    ],
+)
+def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) -> None:
+    assert redact_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("(see https://h.zz.invalid/?k=ZZ99)", "(see https://h.zz.invalid/?k=REDACTED)"),
+        ("(https://h.zz.invalid/a_(b)?k=ZZ99)", "(https://h.zz.invalid/a_(b)?k=REDACTED)"),
+        (
+            "line https://h.zz.invalid/?k=ZZ99\\nnext",
+            "line https://h.zz.invalid/?k=REDACTED\\nnext",
+        ),
+        ("a\\nhttps://h.zz.invalid/?k=ZZ99", "a\\nhttps://h.zz.invalid/?k=REDACTED"),
+        ("a\\n/x?q=Zzville\\tb", "a\\n/x?q=REDACTED\\tb"),
+        ("route GET /confirm/{token}", "route GET /confirm/{token}"),
+        ("path /x/y, done", "path /x/y, done"),
+    ],
+    ids=[
+        "paren",
+        "paren-inside",
+        "escape-after",
+        "escape-before",
+        "escape-relative",
+        "template",
+        "plain-path",
+    ],
+)
+def test_text_boundaries(text: str, expected: str) -> None:
+    assert redact_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a" * 100_000,
+        "-/" * 50_000,
+        "-/" * 50_000 + "?a=1",
+        "/" + "a/" * 50_000 + "?q=Zzville",
+        # Shorter: each holds a match or a segment every few characters, so
+        # the cost is per match (linear), and CI machines are slower.
+        "https:/" * 3_000,
+        "a\\n/" * 5_000,
+        "/" + ";k=v" * 5_000,
+        "/" + "%3F" * 7_000,
+        "(http://h.zz.invalid/x" + ")" * 20_000,
+    ],
+    ids=[
+        "letters",
+        "dash-slash",
+        "dash-slash-query",
+        "long-path",
+        "almost-scheme",
+        "escapes",
+        "matrix",
+        "encoded",
+        "parens",
+    ],
+)
+def test_redaction_stays_linear_on_hostile_input(text: str) -> None:
+    """A long hostile path reaches the access line of every request: the
+    redaction must not stall the event loop (it took 60-120 ms for 8k
+    characters with patterns that could start anywhere)."""
+    import time
+
+    start = time.perf_counter()
+    redact_text(text)
+    redact_url(text)
+    assert time.perf_counter() - start < 0.05
