@@ -20,9 +20,11 @@ made spaces, decision 64 of the module), so "St.", "---" or "( )" are
 refused here, as a text of two characters is, and never sent. The
 normalised text is the one VIATOR sends. The module itself refuses a text
 of fewer than 3 characters once folded with a 422; should one still happen
-(a module whose rules moved), it is logged at INFO with the reason word
-only and answered as VIATOR's own refusal of the text, a 422, never by the
-fallback (`find_stations`).
+(the copied rules or the contract have drifted from the module's), it is
+logged at WARNING as `station_module.refused reason=status_422`, never the
+text, and answered as VIATOR's own refusal of the text, a 422, never by the
+fallback (`find_stations`): Trainline rows would be labelled as the answer
+to a text the module never searched.
 
 **Every refusal of the body is a 422 with a fixed sentence, never the
 framework's.** FastAPI's own 422 copies the refused input into its answer;

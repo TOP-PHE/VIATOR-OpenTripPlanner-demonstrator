@@ -589,8 +589,9 @@ def test_a_text_refused_by_the_module_is_viators_422_logged_at_info_without_the_
     """Should the module still refuse a text VIATOR sent (its 422: a module
     whose rules moved), the answer is VIATOR's own refusal of a text, never
     VIATOR's list standing in for the module's; the log says the reason
-    word at INFO, never the text; nothing pauses, so the next text is asked
-    of the module."""
+    word at WARNING (the copied rules have drifted), as a refusal and not a
+    fallback, never the text; nothing pauses, so the next text is asked of
+    the module."""
     module.response = httpx.Response(422, json={"detail": "ZZ refused", "code": "zz"})
     _, cookies = _login()
 
@@ -602,9 +603,8 @@ def test_a_text_refused_by_the_module_is_viators_422_logged_at_info_without_the_
     assert fallback.calls == []
     records = [r for r in caplog.records if r.name == station_module.log.name]
     assert [(r.levelno, r.getMessage()) for r in records] == [
-        (logging.INFO, "station_module.fallback reason=status_422")
+        (logging.WARNING, "station_module.refused reason=status_422")
     ]
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert "Zzmarker" not in caplog.text
     module.response = httpx.Response(200, json={"stations": [MODULE_ROW]})
     assert _post(client, {"q": "Zzville"}, cookies).json() == [{**MODULE_ROW, "source": "msmm"}]

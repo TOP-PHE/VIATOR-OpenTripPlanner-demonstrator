@@ -362,7 +362,7 @@ def test_each_failure_gives_origin_trainline_and_the_fallback_rows(
     assert len(module.requests) == (1 if pauses else 2)
 
 
-def test_a_text_refused_by_the_module_is_a_422_never_trainline_and_logged_at_info(
+def test_a_text_refused_by_the_module_is_a_422_never_trainline_and_warns(
     client: TestClient,
     module_on: str,
     module: Module,
@@ -371,7 +371,8 @@ def test_a_text_refused_by_the_module_is_a_422_never_trainline_and_logged_at_inf
 ) -> None:
     """A 422 of the module (a text it does not take) is answered as the
     page's own refusal of a text: no Trainline rows labelled as a fallback,
-    the reason word at INFO, never the text, and no pause."""
+    the reason word at WARNING (the copied rules have drifted), never the
+    text, and no pause."""
     module.response = httpx.Response(422, json={"detail": "ZZ refused", "code": "zz"})
     _, cookies = _login()
 
@@ -385,10 +386,10 @@ def test_a_text_refused_by_the_module_is_a_422_never_trainline_and_logged_at_inf
     assert fallback.calls == []
     assert len(module.requests) == 2
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO] == [
-        "station_module.fallback reason=status_422"
+        "station_module.refused reason=status_422"
     ] * 2
     assert {r.levelno for r in caplog.records if r.name == station_module.log.name} == {
-        logging.INFO
+        logging.WARNING
     }
     assert "Zzmarker" not in caplog.text
 

@@ -2477,7 +2477,9 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   the module for 30 seconds. The `web` log says why, one line per fallback:
   `station_module.fallback reason=<word>` (`off`, `timeout`, `network`,
   `status_<n>`, `busy`, `shape`, `paused`), never the token and never the
-  typed text. The hub
+  typed text. A text the module refuses (its 422) is not a failure and
+  falls back to nothing: it is logged as `station_module.refused
+  reason=status_422` (11.1). The hub
   station-code buttons (11.2) log their own failures the same way, as
   `station_module.lookup_failed`, `station_module.near_failed` and
   `station_module.admin_search_failed`, and never start the 30 seconds
@@ -2509,10 +2511,12 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   &`, the quotes « » ‹ › “ ” „ ‟ ‚ ‛, … ¡ ¿ ⁄), hyphens and apostrophes as
   spaces. "St.", "---" or "( )" are answered as a text too short is: no
   call to the module, no Trainline list, no warning in the log (the
-  Stations page says what to type). VIATOR mirrors the module's list of
-  marks; should the module still refuse a text (its rules moved), VIATOR
-  answers the same way and logs `station_module.fallback
-  reason=status_422` at INFO, never the text.
+  Stations page says what to type). VIATOR mirrors the module's rule
+  exactly; should the module still refuse a text, VIATOR answers the same
+  way (never with the Trainline list) and logs `station_module.refused
+  reason=status_422` at WARNING, never the text. That line means VIATOR's
+  copy of the module's rules has drifted from the module's (a module
+  release changed them): tell the developers.
 - **The Stations page** (`/admin/master/stations`, platform administrators
   and content managers) is a search page: one field (at least 3 characters),
   at most 10 results, no list, no paging, no total. Each search goes to the
@@ -2610,7 +2614,7 @@ uses the module (platform administrators only):
   a hyphen or a dash (-, ‐, ‑, ‒, –, —, −), an apostrophe or quote
   (', ‘, ’, ʼ, ` and ´), or a mark of punctuation the module reads as a
   space (`, ; : . / \ ( ) [ ] { } " ! ? * + &`, « » ‹ › “ ” „ ‟ ‚ ‛, … ¡ ¿
-  ⁄; MSMM release with its PR #29). So a hub named "Zzcity Saint-Zzname"
+  ⁄; MSMM v0.3.6 or later). So a hub named "Zzcity Saint-Zzname"
   is searched as "Zzcity Saint-Zzname", then "Zzcity Saint", then
   "Zzcity"; "Zzcity, Zzquarter" as "Zzcity, Zzquarter", then "Zzcity".
   When a long name has a mark of punctuation, the text before the first
@@ -2626,7 +2630,9 @@ uses the module (platform administrators only):
   A name too long to search whole (over 100 characters) is still searched
   shortened. When the module refuses a text as one it does not take, that
   form counts as finding nothing and the next one is tried, so one hub
-  never stops every click. The first form that finds a station within 50 km
+  never stops every click. Such a refusal is logged at WARNING
+  (`station_module.admin_search_failed reason=status_422`): it means the
+  rules VIATOR copies from the module have drifted from the module's. The first form that finds a station within 50 km
   stops the shortening; one that only finds stations beyond 50 km does
   not, and those are counted once each in the "over 50 km" sentence.
   The panel says which text found each station ("by the shortened name
