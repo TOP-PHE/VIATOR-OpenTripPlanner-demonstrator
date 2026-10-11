@@ -321,9 +321,13 @@ def test_the_worker_formatter_redacts_message_and_traceback() -> None:
     assert out.startswith("ERROR fetch /x?q=REDACTED failed")
 
     root = logging.getLogger()
-    root.addHandler(logging.StreamHandler())
-    install_redacting_formatter(fmt)
-    assert all(isinstance(h.formatter, RedactingFormatter) for h in root.handlers)
+    saved = list(root.handlers)
+    root.handlers[:] = [logging.StreamHandler()]
+    try:
+        install_redacting_formatter(fmt)
+        assert isinstance(root.handlers[0].formatter, RedactingFormatter)
+    finally:
+        root.handlers[:] = saved
 
 
 def test_the_worker_process_logs_through_the_redacting_formatter() -> None:
