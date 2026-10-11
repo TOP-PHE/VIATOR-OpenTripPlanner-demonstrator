@@ -84,7 +84,7 @@ TOKEN_PATH_PREFIXES: Final[tuple[str, ...]] = ("/confirm/", "/reset/", "/share/c
 _KEY_SHAPE: Final = re.compile(r"[A-Za-z0-9_.\-\[\]]{1,40}")
 
 # A route template segment (`{token}`), kept as it is.
-_TEMPLATE: Final = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+_TEMPLATE: Final = re.compile(r"\{[A-Za-z_]\w*\}", re.ASCII)
 
 # URLs inside free text (an exception message, a log line). Each pattern can
 # start only at a boundary (the look-behind: not inside a word or a path) and
@@ -99,7 +99,7 @@ _AFTER_ESCAPE: Final = r"(?<=\\[nrt])"
 _ABSOLUTE_URL: Final = re.compile(
     rf"(?:(?<![A-Za-z0-9+.\-])|{_AFTER_ESCAPE})[A-Za-z][A-Za-z0-9+.\-]*+://{_URL_BODY}++"
 )
-_RELATIVE_URL: Final = re.compile(rf"(?:(?<![\w/:.])|{_AFTER_ESCAPE})/{_URL_BODY}*+")
+_RELATIVE_URL: Final = re.compile(rf"(?:(?<![\w/.])|{_AFTER_ESCAPE})/{_URL_BODY}*+")
 _TOKEN_PATH: Final = re.compile(
     "(" + "|".join(re.escape(p) for p in TOKEN_PATH_PREFIXES) + r""")([^\s'"<>`/?#;\\]+)"""
 )
@@ -215,4 +215,7 @@ def redact_text(text: str) -> str:
     if not text or "/" not in text:
         return text
     text = _ABSOLUTE_URL.sub(_redact_absolute, text)
-    return _RELATIVE_URL.sub(_redact_relative, text)
+    text = _RELATIVE_URL.sub(_redact_relative, text)
+    # A token path glued to a word (`x/confirm/…`): its prefixes are
+    # literal, so this pass is linear too.
+    return _TOKEN_PATH.sub(_redact_token_segment, text)

@@ -203,6 +203,7 @@ def test_an_absolute_url_keeps_no_value_even_for_an_allow_listed_key(key: str) -
             "/share/coverage/{run_id}/cells/{a}/{b}/trips",
         ),
         ("/reset/{ZZ99", "/reset/REDACTED"),
+        ("/reset/{zz\u00e999}", "/reset/REDACTED"),
     ],
     ids=[
         "encoded-q",
@@ -213,6 +214,7 @@ def test_an_absolute_url_keeps_no_value_even_for_an_allow_listed_key(key: str) -
         "template",
         "share-template",
         "not-a-template",
+        "non-ascii-is-not-a-template",
     ],
 )
 def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) -> None:
@@ -233,6 +235,15 @@ def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) 
         ("route GET /confirm/{token}", "route GET /confirm/{token}"),
         ("x https://h.zz.invalid/x?k=(ZZ99)", "x https://h.zz.invalid/x?k=REDACTED"),
         ("s" * 40 + "://h.zz.invalid/?k=ZZ99", "s" * 40 + "://h.zz.invalid/?k=REDACTED"),
+        ("url:/api/geocode?q=Zzville", "url:/api/geocode?q=REDACTED"),
+        ("see x/confirm/ZZ99 now", "see x/confirm/REDACTED now"),
+        ("GET /a;jsessionid=ZZ99 x", "GET /a;jsessionid=REDACTED x"),
+        ("GET /x%3Fq=ZZ99 x", "GET /x%3FREDACTED x"),
+        ("open /page#ZZ99 x", "open /page#REDACTED x"),
+        (
+            "fetch https://u:ZZ99@h.zz.invalid/p failed",
+            "fetch https://REDACTED@h.zz.invalid/p failed",
+        ),
         ("path /x/y, done", "path /x/y, done"),
     ],
     ids=[
@@ -244,6 +255,12 @@ def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) 
         "template",
         "paren-in-value",
         "long-scheme",
+        "after-colon",
+        "glued-token-path",
+        "matrix-in-text",
+        "encoded-q-in-text",
+        "fragment-in-text",
+        "userinfo-without-query",
         "plain-path",
     ],
 )
@@ -264,6 +281,7 @@ def test_text_boundaries(text: str, expected: str) -> None:
         "a\\n/" * 5_000,
         "/" + ";k=v" * 5_000,
         "/" + "%3F" * 7_000,
+        "x/confirm/" * 5_000,
         "(http://h.zz.invalid/x" + ")" * 20_000,
     ],
     ids=[
@@ -275,6 +293,7 @@ def test_text_boundaries(text: str, expected: str) -> None:
         "escapes",
         "matrix",
         "encoded",
+        "glued-token-paths",
         "parens",
     ],
 )
