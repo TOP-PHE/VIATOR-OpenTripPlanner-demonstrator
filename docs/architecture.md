@@ -1558,20 +1558,30 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
 - **Inbound `X-Request-ID` is only honoured if it matches `[A-Za-z0-9_-]{1,64}`**, otherwise a fresh
   UUID4 is minted — this is log-injection defence, not cosmetics.
 - **No query string and no token path in logs or spans (#339 and its follow-up).** One rule,
-  `app/url_redaction.py` (`redact_url`, `redact_text`): every query value becomes `REDACTED` except
-  the allow-list `SAFE_QUERY_KEYS` (paging, dates, ids), and the segment after `/confirm/`,
-  `/reset/`, `/share/coverage/` (`TOKEN_PATH_PREFIXES`) becomes `REDACTED`. It is applied by the
-  uvicorn access filter (`RedactAccessLogTarget`), by the structlog processor `redact_urls` (every
-  string of every web log line, tracebacks included), by the worker's `RedactingFormatter`, and by
-  `RedactingSpanExporter`, which exports a redacted copy of every span (FastAPI inbound, httpx
-  outbound, SQLAlchemy). nginx mirrors it with the `viator_redacted` log format (path, `?REDACTED`
-  marker, no referer) and keeps its error log at `crit`, because an nginx error line quotes the raw
-  request line. `httpx`/`httpcore` stay at WARNING (#339). Traps: **never add a secret-bearing or
-  typed parameter to `SAFE_QUERY_KEYS`** (tests check the list against the OpenAPI schema and a
-  deny-list); a new route with a token in its **path** needs its prefix in `TOKEN_PATH_PREFIXES`
-  *and* in the nginx map (a test fails otherwise); do not lower nginx's `error_log` below `crit`
-  for good, nor httpx to INFO; do not set `OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*` expecting
-  header values in Tempo — the exporter replaces them whole.
+  `app/url_redaction.py` (`redact_url`, `redact_text`): every query value becomes `REDACTED`; on a
+  request target VIATOR *received* (no scheme, no host) the allow-list `SAFE_QUERY_KEYS` (paging,
+  dates, ids) keeps its values, on an absolute (outbound) URL nothing does, and
+  `credentials.validate_param_name` refuses those names for a query credential. An encoded `%3F`
+  starts a query, matrix parameter values are redacted, and the segment after `/confirm/`,
+  `/reset/`, `/share/coverage/` (`TOKEN_PATH_PREFIXES`) becomes `REDACTED` unless it is a route
+  template (`{token}`). It is applied by the uvicorn access filter (`RedactAccessLogTarget`), by the
+  structlog processor `redact_urls` (every string of every web log line, tracebacks included), by
+  the worker's `RedactingFormatter`, and by `RedactingSpanExporter`, which exports a redacted copy
+  of every span (FastAPI inbound, httpx outbound, SQLAlchemy) — a span whose redaction fails is
+  exported stripped, never raw. nginx mirrors it with the `viator_redacted` log format (the path
+  the client sent, from `$request_uri` cut at `?`, so session ids survive the fragments' `rewrite`;
+  a `?REDACTED` marker; no referer) and keeps its error log at `crit`, because an nginx error line
+  quotes the raw request line and the referrer. `httpx`/`httpcore` stay at WARNING (#339). Traps:
+  **never add a secret-bearing or typed parameter to `SAFE_QUERY_KEYS`** (tests check the list
+  against the OpenAPI schema and a deny-list); a new route with a token in its **path** needs its
+  prefix in `TOKEN_PATH_PREFIXES` *and* in the three nginx maps (a test fails otherwise); the
+  free-text patterns must keep starting only at a boundary and stay possessive — a pattern that
+  can start anywhere is quadratic, and the access line of a hostile 8k path then stalls the event
+  loop (tests time 100k-character inputs); `nginx -s reload` does not load an edited
+  `nginx.conf` (single-file bind mount: restart the container, as the deploy script does); do not
+  lower nginx's `error_log` below `crit` for good, nor httpx to INFO; do not set
+  `OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*` expecting header values in Tempo — the exporter
+  replaces them whole.
 - **Worker-side metrics do not exist.** `/metrics` is served by the web container only; build-duration
   histograms from the worker are explicitly out of scope (they'd need multiprocess metric storage).
 

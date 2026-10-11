@@ -7,14 +7,16 @@ Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `do
 (module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
 traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
 
-Last updated: 2026-09-04. §2/§3/§5/§7 curated through #245; #206–#227 triaged in the same pass.
+Last updated: 2026-10-11 (rule "no query string and no token path in logs or spans", #346). §2/§3/§5/§7
+curated through #245; #206–#227 triaged in the same pass.
 
 **Rule: no query string and no token path in logs or spans.** Any URL that reaches a log line or an
 OpenTelemetry span goes through `app/url_redaction.py` (already wired: uvicorn access filter,
 structlog processor `redact_urls`, worker `RedactingFormatter`, `RedactingSpanExporter`; nginx mirrors
 it with the `viator_redacted` log format and `error_log … crit`). Never log a URL around that path,
 never add a secret-bearing or typed parameter to `SAFE_QUERY_KEYS`, and give a new route with a token
-in its path its prefix in `TOKEN_PATH_PREFIXES` and in nginx's map. Put a secret or typed text in a
+in its path its prefix in `TOKEN_PATH_PREFIXES` and in nginx's maps; after editing `nginx.conf`, restart
+the nginx container (`nginx -s reload` keeps the old single-file mount). Put a secret or typed text in a
 request body or header, never in a URL (`docs/architecture.md` ch. 9 traps, admin-guide §5.4).
 
 **Read §7 items 1 and 2 before writing any coverage code.** `main` currently ships one PR whose own
