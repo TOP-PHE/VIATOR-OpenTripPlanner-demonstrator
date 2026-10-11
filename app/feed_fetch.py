@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -68,6 +69,10 @@ RETRY_DELAYS: tuple[float, ...] = (2.0, 10.0)
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+# What a fetch-state file name may be once unsafe characters are replaced:
+# a strict allow-list, short enough for any file system (255 bytes).
+_STATE_NAME_MAX = 200
+_STATE_NAME_OK = re.compile(rf"[A-Za-z0-9_.-]{{1,{_STATE_NAME_MAX}}}")
 _DISPOSITION_RE = re.compile(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", re.IGNORECASE)
 
 
@@ -92,17 +97,25 @@ def state_path(state_dir: Path, key: str) -> Path:
     """`<state_dir>/<key with unsafe characters replaced>.json`.
 
     The key is a task label built from a session's provider id, i.e. operator
-    input. The regex already leaves no path separator, so the name cannot leave
-    `state_dir`; the containment check below makes that explicit, in a form
-    static analysers recognise (pythonsecurity:S2083), and keeps it true if the
-    regex is ever loosened. Raises ValueError for a name that would escape.
+    input. Two checks keep the file inside `state_dir`, each in a form static
+    analysers recognise (pythonsecurity:S2083), and each still holds if the
+    other is ever loosened:
+
+      1. the file name must match a strict allow-list (letters, digits, `_`,
+         `.`, `-`; at most `_STATE_NAME_MAX` characters);
+      2. the resolved path (symlinks followed) must sit inside the resolved
+         `state_dir`.
+
+    Raises ValueError for a name that fails either of them.
     """
     name = f"{_STATE_KEY_RE.sub('_', key).strip('_')}.json"
-    base = os.path.realpath(state_dir)
-    target = os.path.realpath(Path(base) / name)
-    if not target.startswith(base + os.sep):
+    if not _STATE_NAME_OK.fullmatch(name):
+        raise ValueError("fetch-state name is not a plain file name")
+    base = Path(os.path.realpath(state_dir))
+    target = Path(os.path.realpath(base / name))
+    if not target.is_relative_to(base):
         raise ValueError(f"fetch-state name escapes {base}")
-    return Path(target)
+    return target
 
 
 def load_state(state_dir: Path, key: str) -> dict[str, Any]:
@@ -114,13 +127,31 @@ def load_state(state_dir: Path, key: str) -> dict[str, Any]:
 
 
 def save_state(state_dir: Path, key: str, state: dict[str, Any]) -> None:
-    """Best-effort: a lost state file only costs one full re-download."""
+    """Best-effort: a lost state file only costs one full re-download.
+
+    The new content goes to a temporary file that `tempfile` creates inside
+    the resolved state directory, then replaces the target in one rename, so a
+    reader never sees half a file. Both names are checked to be inside that
+    directory before anything is written.
+    """
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         target = state_path(state_dir, key)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(target)
+        base = target.parent
+        payload = json.dumps(state, indent=2, sort_keys=True)
+        fd, tmp_name = tempfile.mkstemp(dir=base, prefix=".fetch-state-", suffix=".tmp")
+        tmp = Path(os.path.realpath(tmp_name))
+        try:
+            if not tmp.is_relative_to(base):
+                raise ValueError(f"fetch-state temporary file escapes {base}")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(payload)
+            tmp.replace(target)
+        finally:
+            if fd != -1:
+                os.close(fd)
+            tmp.unlink(missing_ok=True)
     except (OSError, ValueError) as exc:
         log.warning("could not save fetch state %s: %s", key, exc)
 

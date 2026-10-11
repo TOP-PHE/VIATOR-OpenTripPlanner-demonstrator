@@ -440,13 +440,126 @@ async def test_transport_error_message_is_scrubbed(staging: Path) -> None:
 def test_state_path_never_leaves_the_state_dir(
     staging: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The key regex already drops path separators; the containment check is
-    the second line, so loosen the regex and try to climb out."""
+    """The key regex already drops path separators; the allow-list on the
+    file name is the second line, so loosen the regex and try to climb out."""
     state_dir = staging / "_fetch_state"
     assert feed_fetch.state_path(state_dir, "../../etc/passwd").parent == state_dir.resolve()
     monkeypatch.setattr(feed_fetch, "_STATE_KEY_RE", re.compile(r"[^A-Za-z0-9_./-]+"))
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="plain file name"):
         feed_fetch.state_path(state_dir, "../../etc/passwd")
+    with pytest.raises(ValueError, match="plain file name"):
+        feed_fetch.state_path(state_dir, "zz/inside")  # a sub-directory is refused too
     assert feed_fetch.load_state(state_dir, "../../etc/passwd") == {}
     feed_fetch.save_state(state_dir, "../../escaped", {"etag": "x"})
     assert not (staging / "escaped.json").exists()
+
+
+def test_containment_check_holds_without_the_allow_list(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Third line: loosen both the regex and the allow-list; the resolved
+    path must still sit inside the resolved state directory."""
+    state_dir = staging / "_fetch_state"
+    state_dir.mkdir()
+    monkeypatch.setattr(feed_fetch, "_STATE_KEY_RE", re.compile(r"[^A-Za-z0-9_./-]+"))
+    monkeypatch.setattr(feed_fetch, "_STATE_NAME_OK", re.compile(r".+"))
+    with pytest.raises(ValueError, match="escapes"):
+        feed_fetch.state_path(state_dir, "../zz-escaped")
+    feed_fetch.save_state(state_dir, "../zz-escaped", {"etag": "x"})
+    assert not (staging / "zz-escaped.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "name"),
+    [
+        ("/etc/zz-absolute", "etc_zz-absolute.json"),
+        ("zz\x00nul", "zz_nul.json"),
+        ("..", "...json"),
+        ("C:\\zz\\win", "C_zz_win.json"),
+    ],
+    ids=["absolute", "nul", "dot-dot", "windows-separators"],
+)
+def test_hostile_keys_land_inside_under_a_plain_name(staging: Path, key: str, name: str) -> None:
+    state_dir = staging / "_fetch_state"
+    assert feed_fetch.state_path(state_dir, key) == state_dir.resolve() / name
+    feed_fetch.save_state(state_dir, key, {"etag": "x"})
+    assert feed_fetch.load_state(state_dir, key) == {"etag": "x"}
+    assert [p.name for p in state_dir.iterdir()] == [name]
+
+
+def test_very_long_key_is_refused(staging: Path) -> None:
+    state_dir = staging / "_fetch_state"
+    longest = "z" * (feed_fetch._STATE_NAME_MAX - len(".json"))
+    assert feed_fetch.state_path(state_dir, longest).name == f"{longest}.json"
+    with pytest.raises(ValueError, match="plain file name"):
+        feed_fetch.state_path(state_dir, longest + "z")
+    feed_fetch.save_state(state_dir, "z" * 5000, {"etag": "x"})  # logged, not raised
+    assert feed_fetch.load_state(state_dir, "z" * 5000) == {}
+    assert not state_dir.exists() or not any(state_dir.iterdir())
+
+
+def test_symlink_out_of_the_state_dir_is_refused(staging: Path) -> None:
+    state_dir = staging / "_fetch_state"
+    state_dir.mkdir()
+    outside = staging / "zz-outside.json"
+    outside.write_text('{"etag": "zz-outside"}', encoding="utf-8")
+    (state_dir / "zz-link.json").symlink_to(outside)
+    with pytest.raises(ValueError, match="escapes"):
+        feed_fetch.state_path(state_dir, "zz-link")
+    assert feed_fetch.load_state(state_dir, "zz-link") == {}
+    feed_fetch.save_state(state_dir, "zz-link", {"etag": "x"})
+    assert outside.read_text(encoding="utf-8") == '{"etag": "zz-outside"}'
+
+
+def test_symlinked_state_dir_is_followed_once(staging: Path) -> None:
+    """A state directory that is itself a symlink still works: names are
+    checked against where it really points."""
+    real = staging / "zz-real"
+    real.mkdir()
+    (staging / "zz-alias").symlink_to(real, target_is_directory=True)
+    feed_fetch.save_state(staging / "zz-alias", "k", {"etag": "x"})
+    assert [p.name for p in real.iterdir()] == ["k.json"]
+    assert feed_fetch.load_state(staging / "zz-alias", "k") == {"etag": "x"}
+
+
+def test_save_state_leaves_no_temporary_file(staging: Path) -> None:
+    state_dir = staging / "_fetch_state"
+    feed_fetch.save_state(state_dir, "k", {"etag": "1"})
+    feed_fetch.save_state(state_dir, "k", {"etag": "2"})
+    assert [p.name for p in state_dir.iterdir()] == ["k.json"]
+    assert feed_fetch.load_state(state_dir, "k") == {"etag": "2"}
+
+
+def test_save_state_refuses_a_temporary_file_outside(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the temporary file ever lands outside the state directory, nothing
+    is written and the stray file is removed."""
+    state_dir = staging / "_fetch_state"
+    elsewhere = staging / "zz-elsewhere"
+    elsewhere.mkdir()
+    real_mkstemp = feed_fetch.tempfile.mkstemp
+
+    def mkstemp_elsewhere(**kwargs: Any) -> tuple[int, str]:
+        kwargs["dir"] = elsewhere
+        return real_mkstemp(**kwargs)
+
+    monkeypatch.setattr(feed_fetch.tempfile, "mkstemp", mkstemp_elsewhere)
+    feed_fetch.save_state(state_dir, "k", {"etag": "x"})
+    assert list(state_dir.iterdir()) == []
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_save_state_cleans_up_when_the_write_fails(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = staging / "_fetch_state"
+    feed_fetch.save_state(state_dir, "k", {"etag": "old"})
+
+    def broken_replace(self: Path, target: object) -> Path:
+        raise OSError("zz simulated rename failure")
+
+    monkeypatch.setattr(Path, "replace", broken_replace)
+    feed_fetch.save_state(state_dir, "k", {"etag": "new"})
+    assert [p.name for p in state_dir.iterdir()] == ["k.json"]
+    assert feed_fetch.load_state(state_dir, "k") == {"etag": "old"}
