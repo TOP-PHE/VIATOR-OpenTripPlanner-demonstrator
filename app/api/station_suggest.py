@@ -11,12 +11,20 @@ The checks of the body (`query_or_422`) and the search itself
 shape of its answer.
 
 The text `q` arrives in the JSON body, never in the URL, and is validated
-with exactly the rules of the Multimodal Station Mapping module's search
-(`normalise_query`): Unicode NFC, any control character refused, white
-space trimmed and runs of it made one space, then 3 to 100 characters. So
-no text VIATOR accepts can earn a 422 from the module, and the normalised
-text is the one VIATOR sends. A lone surrogate is refused as well, which the
-module's rules do not yet say: it would make the module fail with a 500.
+with the rules of the Multimodal Station Mapping module's search
+(`normalise_query`): Unicode NFC, any control character or lone surrogate
+refused, white space trimmed and runs of it made one space, then 3 to 100
+characters; last, the text must still hold 3 characters once folded as the
+module folds it (`module_fold`: its hyphens, apostrophes and punctuation
+made spaces, decision 64 of the module), so "St.", "---" or "( )" are
+refused here, as a text of two characters is, and never sent. The
+normalised text is the one VIATOR sends. The module itself refuses a text
+of fewer than 3 characters once folded with a 422; should one still happen
+(the copied rules or the contract have drifted from the module's), it is
+logged at WARNING as `station_module.refused reason=status_422`, never the
+text, and answered as VIATOR's own refusal of the text, a 422, never by the
+fallback (`find_stations`): Trainline rows would be labelled as the answer
+to a text the module never searched.
 
 **Every refusal of the body is a 422 with a fixed sentence, never the
 framework's.** FastAPI's own 422 copies the refused input into its answer;
@@ -35,7 +43,8 @@ Where the stations come from:
    user has a VIATOR user id: its rows are returned as they come, tagged
    `source: "msmm"` — an empty list included.
 2. **VIATOR's own `master_stations` list otherwise** (the module not
-   configured, paused, failing, or a user without an id), with the same
+   configured, paused, failing, or a user without an id; never for a text
+   the module refused with a 422), with the same
    guards: name contains `q` (its `%`, `_` and backslash literal) or UIC
    equals `q`, rows with a position only, ordered by `(country_iso, name)`,
    at most 10 rows, tagged `source: "viator"`.
@@ -81,11 +90,56 @@ _ESCAPE = "\\"
 
 _WHITE_SPACE = re.compile(r"\s+")
 
+# The characters the station module's search reads as a space between two
+# words: a mirror of MSMM app/master/station_search.py `_HYPHENS`,
+# `_APOSTROPHES` and `FOLDED_PUNCTUATION` (decision 64 of the module: the
+# comma, semicolon, colon, full stop, slash, backslash, round, square and
+# curly brackets, straight double quote, exclamation and question marks,
+# asterisk, plus sign and ampersand; the French and German quotation marks,
+# the ellipsis, the inverted exclamation and question marks, the fraction
+# slash). Its fold makes each of them, and white space, a space. VIATOR
+# cannot import the module's code, so they are copied here once, for the
+# text rule below and the coverage hubs' name shortening; change them with
+# the module's (a test pins the copy and compares it with the module's
+# source when it can read it).
+MODULE_HYPHENS = "-\u2010\u2011\u2012\u2013\u2014\u2212"
+MODULE_APOSTROPHES = "'\u2018\u2019\u02bc`\u00b4"
+MODULE_PUNCTUATION = (
+    ',;:./\\()[]{}"!?*+&'
+    "\u00ab\u00bb\u2039\u203a\u201c\u201d\u201e\u201f\u201a\u201b\u2026\u00a1\u00bf\u2044"
+)
+MODULE_SEPARATORS = MODULE_HYPHENS + MODULE_APOSTROPHES + MODULE_PUNCTUATION
+# The rest of the module's fold that can change a text's length (its
+# `_COMBINING_MARKS`, `FOLDED_GONE` and the letters of `FOLDED_LETTERS` it
+# spells with two): the combining marks taken off once the text is
+# decomposed, the soft hyphen taken out, and four letters spelt with two
+# (the others it spells with one, which leaves the length as it is).
+_MODULE_COMBINING_MARKS = re.compile(
+    "[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]"
+)
+MODULE_GONE = "\u00ad"
+MODULE_LONG_LETTERS = {"\u00df": "ss", "\u00e6": "ae", "\u0153": "oe", "\u00fe": "th"}
+_MODULE_FOLD_TABLE = str.maketrans(
+    {
+        **MODULE_LONG_LETTERS,
+        **dict.fromkeys(MODULE_SEPARATORS, " "),
+        **dict.fromkeys(MODULE_GONE),
+    }
+)
+
 # The description of the route's 422 in its OpenAPI answers.
 REFUSED_TEXT = (
     "The text is not one the station search accepts: 3 to 100 characters once "
-    "normalised, no control character, no lone surrogate. Or the body is not "
+    "normalised, still 3 once punctuation, hyphens and apostrophes are read as "
+    "spaces, no control character, no lone surrogate. Or the body is not "
     '{"q": <text>} and nothing else.'
+)
+
+# The 422 of a text that folds, as the module folds it, to fewer than 3
+# characters; also the answer when the module itself refuses a text (its 422).
+FOLD_REFUSED = (
+    f"q must still be {QUERY_MIN} characters long once punctuation, hyphens and "
+    "apostrophes are read as spaces"
 )
 
 # The 422 of a body that is not `{"q": <text>}` and nothing else.
@@ -97,13 +151,30 @@ _BODY_REFUSED = 'The body must be a JSON object {"q": <text>} and nothing else.'
 _REFUSED_CATEGORIES = frozenset({"Cc", "Cs"})
 
 
+def module_fold(text: str) -> str:
+    """`text` folded as the module's search folds it, for its length.
+
+    The module's `fold_name`: decomposed (NFD), its combining marks taken
+    off, in small letters, every character of `MODULE_SEPARATORS` and white
+    space a space, the soft hyphen taken out, every run of spaces one, none
+    at either end. Of its letters spelt plain, only those spelt with two
+    (`MODULE_LONG_LETTERS`) are spelt here: the others are one letter for
+    one, so the length is the module's. "St." gives "st", "( )" nothing,
+    "Zz, Zzhof" "zz zzhof"."""
+    decomposed = _MODULE_COMBINING_MARKS.sub("", unicodedata.normalize("NFD", text))
+    spaced = _WHITE_SPACE.sub(" ", decomposed.lower().translate(_MODULE_FOLD_TABLE))
+    return spaced.strip(" ")
+
+
 def normalise_query(text: str) -> str:
     """The text as the module searches for it, or ValueError.
 
     Unicode NFC; any control character (category Cc, tab and line end
     included) or lone surrogate (Cs) refuses it wherever it stands; spaces
     at both ends removed and every run of white space made one space; then 3
-    to 100 characters.
+    to 100 characters; last, still 3 characters once folded as the module
+    folds it (`module_fold`): a text such as "St.", "---" or "( )" folds to
+    fewer, and the module would refuse it with a 422.
     """
     composed = unicodedata.normalize("NFC", text)
     if any(unicodedata.category(character) in _REFUSED_CATEGORIES for character in composed):
@@ -111,6 +182,8 @@ def normalise_query(text: str) -> str:
     joined = _WHITE_SPACE.sub(" ", composed).strip(" ")
     if not QUERY_MIN <= len(joined) <= QUERY_MAX:
         raise ValueError(f"q must be {QUERY_MIN} to {QUERY_MAX} characters long")
+    if len(module_fold(joined)) < QUERY_MIN:
+        raise ValueError(FOLD_REFUSED)
     return joined
 
 
@@ -208,11 +281,16 @@ async def find_stations(
     its answer is final, an empty one included. VIATOR's own list when the
     module is not configured, paused or failing, or when the user has no
     VIATOR id (the basic-auth shadow user): the rows of `fallback_rows`.
+    A text the module refuses (its 422: the same text always gets the same
+    answer) is not a failure: it is answered as VIATOR refuses a text, a
+    422 with `FOLD_REFUSED`, never with VIATOR's list.
     """
     if user.id is not None:
-        rows = await station_module.search(q, user.id)
-        if rows is not None:
-            return "msmm", rows
+        outcome = await station_module.search_outcome(q, user.id)
+        if outcome.rows is not None:
+            return "msmm", outcome.rows
+        if outcome.reason == station_module.TEXT_REFUSED:
+            raise HTTPException(status_code=422, detail=FOLD_REFUSED)
     return "trainline", await run_in_threadpool(fallback_rows, db, q)
 
 

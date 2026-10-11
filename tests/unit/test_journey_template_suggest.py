@@ -12,7 +12,10 @@ tests/unit/test_journey_template_compare.py. They pin three things:
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,6 +64,31 @@ def test_the_post_helper_is_as_tolerant_as_the_get_helper(template_text: str) ->
     assert "r.ok ? await r.json() : []" in post
     assert re.search(r"catch \(err\) \{\s*console\.warn\([^)]*\);\s*return \[\];", post)
     assert "body" not in post.split("console.warn(", 1)[1].split(")", 1)[0]
+
+
+def test_a_refused_text_gives_no_station_quietly(template_text: str) -> None:
+    """A 422 of the suggest route (a text too short once the module reads its
+    punctuation, hyphens and apostrophes as spaces) is "no station": no
+    warning, no exception, and the geocoder's rows still show."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    program = (
+        "const warned = [];\n"
+        "console.warn = (...args) => warned.push(args.length);\n"
+        "globalThis.fetch = async () => ({ok: false, status: 422, json: async () => {"
+        " throw new Error('zz no body'); }});\n"
+        + _function(template_text, "_postJson")
+        + "\n_postJson('/api/stations/suggest', {q: 'Zz.'}).then("
+        "(rows) => process.stdout.write(JSON.stringify({rows, warned: warned.length})),"
+        " (error) => process.stdout.write(JSON.stringify({thrown: String(error)})));\n"
+    )
+    result = subprocess.run(
+        [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"rows": [], "warned": 0}
 
 
 def test_the_motis_half_is_unchanged(template_text: str) -> None:

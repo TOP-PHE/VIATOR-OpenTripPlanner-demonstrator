@@ -113,7 +113,9 @@ def module(monkeypatch: pytest.MonkeyPatch, token: str, clock: FakeClock) -> Ite
 
 def _reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
-        r.getMessage().removeprefix("station_module.fallback reason=")
+        r.getMessage()
+        .removeprefix("station_module.fallback reason=")
+        .removeprefix("station_module.refused reason=")
         for r in caplog.records
         if r.name == station_module.log.name
     ]
@@ -811,6 +813,7 @@ async def test_the_clients_are_built_with_their_timeouts_and_without_the_environ
     ("kind", "level"),
     [
         ("429", logging.INFO),
+        ("422", logging.WARNING),
         ("503-busy", logging.INFO),
         ("403", logging.WARNING),
         ("network", logging.WARNING),
@@ -827,6 +830,34 @@ async def test_one_request_refusals_log_at_info_and_faults_at_warning(
 
     (record,) = [r for r in caplog.records if r.name == station_module.log.name]
     assert record.levelno == level
+
+
+async def test_a_refused_search_text_warns_as_a_refusal_never_with_the_text(
+    module: Module, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 422 on a search is the refusal of that text. The typeahead's own
+    rule mirrors the module's, so it means the rules have drifted: WARNING,
+    as `station_module.refused` (no fallback follows), the reason word
+    only, no pause. A 422 on a lookup warns as a lookup failure."""
+    marker = "Zzmarker Zzquery"
+    module.answer(422, {"detail": "ZZ refused", "code": "zz"})
+
+    with caplog.at_level(logging.DEBUG):
+        outcome = await station_module.search_outcome(marker, uuid.uuid4())
+        await station_module.lookup(["9900001"], uuid.uuid4())
+
+    assert outcome == station_module.Outcome(None, station_module.TEXT_REFUSED)
+    assert station_module.TEXT_REFUSED == "status_422"
+    assert not station_module.paused()
+    logged = [
+        (r.levelno, r.getMessage()) for r in caplog.records if r.name == station_module.log.name
+    ]
+    assert logged == [
+        (logging.WARNING, "station_module.refused reason=status_422"),
+        (logging.WARNING, "station_module.lookup_failed reason=status_422"),
+    ]
+    assert "Zzmarker" not in caplog.text
+    assert "ZZ refused" not in caplog.text
 
 
 # ───────────────────── the detailed form: search_outcome() ─────────────────────

@@ -251,6 +251,51 @@ DOM_SCENARIO = r"""
 """
 
 
+TEXT_RULE = (
+    "Type at least 3 letters or digits (punctuation, hyphens and apostrophes don't count), "
+    "at most 100 characters."
+)
+
+REFUSED_SCENARIO = r"""
+(async () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  ids.results.appendChild(new El('table'));
+  ids.notice.textContent = 'zz stale notice';
+  globalThis.fetch = async (url, init) => {
+    posted.push({url, body: init && init.body});
+    return {ok: false, status: 422, json: async () => ({detail: 'zz'})};
+  };
+  document.getElementById('q').value = 'Zz.';
+  ids['search-form'].listeners.submit({preventDefault() {}});
+  await settle(); await settle();
+  process.stdout.write(JSON.stringify({
+    posted: posted.map((p) => p.body),
+    status: ids.status.textContent,
+    notice: ids.notice.textContent,
+    results: ids.results.children.length,
+  }));
+})();
+"""
+
+
+def test_a_text_the_server_refuses_says_the_rule_and_shows_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 422 (a text too short once punctuation, hyphens and apostrophes are
+    left out) says the text rule, with no results and no notice, never
+    "The search failed"."""
+    script = page_script(render(monkeypatch, "content_manager", module=True))
+    out = run_node_program(DOM_PRELUDE + script + REFUSED_SCENARIO)
+
+    assert out == {"posted": ['{"q":"Zz."}'], "status": TEXT_RULE, "notice": "", "results": 0}
+
+
+def test_the_placeholder_says_the_text_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    html = render(monkeypatch, "content_manager", module=True)
+
+    assert 'placeholder="at least 3 letters or digits"' in html
+
+
 def run_page(monkeypatch: pytest.MonkeyPatch, role: str, *, module: bool) -> Any:
     script = page_script(render(monkeypatch, role, module=module))
     return run_node_program(DOM_PRELUDE + script + DOM_SCENARIO)
@@ -261,7 +306,7 @@ def test_an_administrator_with_the_module_sees_labels_notices_and_links(
 ) -> None:
     out = run_page(monkeypatch, "platform_admin", module=True)
 
-    assert out["short"] == {"posted": 0, "status": "Type at least 3 characters."}
+    assert out["short"] == {"posted": 0, "status": TEXT_RULE}
     assert json.loads(out["body"]) == {"q": "Zzville"}
 
     msmm = out["msmm"]
