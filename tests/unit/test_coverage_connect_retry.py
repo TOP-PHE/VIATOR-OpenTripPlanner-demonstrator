@@ -341,3 +341,22 @@ async def test_query_one_session_retries_connect_error_via_shared_helper(
     assert attempts == 2
     assert status == "ok"
     assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+
+
+@pytest.mark.parametrize(
+    ("exc", "status"),
+    [
+        (httpx.ReadTimeout("zz"), "timeout"),
+        (TimeoutError(), "timeout"),
+        (httpx.ConnectError("zz"), "error"),
+        (ValueError("zz"), "error"),
+    ],
+    ids=["httpx-read-timeout", "builtin-timeout", "connect-error", "other"],
+)
+def test_failure_status_names_timeouts_apart(exc: BaseException, status: str) -> None:
+    assert runner._failure_status(exc) == status
+
+
+def test_elapsed_ms_counts_whole_milliseconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 12.3456)
+    assert runner._elapsed_ms(10.0) == 2345

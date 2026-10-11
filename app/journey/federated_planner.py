@@ -121,7 +121,7 @@ def rank_hubs(
         hub = coords.get(uic)
         if hub is None:
             continue
-        outside_dest_country = 0 if uic[:2] == dest_country else 1
+        outside_dest_country = 0 if uic.startswith(dest_country) else 1
         detour = _haversine_km(*origin, *hub) + _haversine_km(*hub, *dest)
         scored.append((outside_dest_country, detour, uic))
     scored.sort()  # (tier, detour, uic) — tier first, then proximity, then uic
