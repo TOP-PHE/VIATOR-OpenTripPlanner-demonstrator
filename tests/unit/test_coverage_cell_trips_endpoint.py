@@ -209,13 +209,15 @@ def test_get_cell_trips_unknown_run_404():
     db = MagicMock()
     db.get.return_value = None  # run not found
 
+    run_id = uuid.uuid4()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.get_cell_trips(
-            run_id=uuid.uuid4(),
+            run_id=run_id,
             origin_id="bxl-mid",
             dest_id="gva-c",
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 404
     assert "run" in str(exc.value.detail).lower()
@@ -355,13 +357,14 @@ def test_get_cell_trips_rejects_unknown_alignment_tier(monkeypatch):
 
     monkeypatch.setattr(api, "_fetch_trips_by_search", lambda _db, ids, _depart_at=None: {})
 
+    actor = _fake_actor()
     with pytest.raises(ValidationError):
         api.get_cell_trips(
             run_id=run.id,
             origin_id="bxl-mid",
             dest_id="gva-c",
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
 
 

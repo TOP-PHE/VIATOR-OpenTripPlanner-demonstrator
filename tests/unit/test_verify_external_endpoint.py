@@ -88,13 +88,15 @@ async def test_verify_external_404_on_unknown_run():
     db = MagicMock()
     db.get.return_value = None  # run lookup returns None
 
+    run_id = uuid.uuid4()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         await api.verify_cell_external(
-            run_id=uuid.uuid4(),
+            run_id=run_id,
             origin_id="bxl-mid",
             dest_id="gva-c",
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 404
     assert "run" in str(exc.value.detail).lower()
@@ -118,13 +120,14 @@ async def test_verify_external_404_on_unknown_cell():
     exec_result.scalars.return_value = scalars
     db.execute.return_value = exec_result
 
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         await api.verify_cell_external(
             run_id=run.id,
             origin_id="bxl-mid",
             dest_id="gva-c",
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 404
     assert "cell" in str(exc.value.detail).lower()
@@ -148,13 +151,14 @@ async def test_verify_external_404_on_soft_deleted_hub():
         dest_hub=_hub_row("gva-c", 46.2044, 6.1432),
     )
 
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         await api.verify_cell_external(
             run_id=run.id,
             origin_id="bxl-mid",
             dest_id="gva-c",
             db=db,
-            _=_fake_actor(),
+            _=actor,
         )
     assert exc.value.status_code == 404
     assert "hub" in str(exc.value.detail).lower()

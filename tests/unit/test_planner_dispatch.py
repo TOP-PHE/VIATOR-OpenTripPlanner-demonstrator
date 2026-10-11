@@ -58,5 +58,6 @@ def test_planner_for_engine_raises_on_typo():
 
 
 def test_get_planner_raises_on_unknown_engine_value():
+    session = SimpleNamespace(engine="motis-experimental")
     with pytest.raises(ValueError, match="Unknown session engine"):
-        planner_dispatch.get_planner(SimpleNamespace(engine="motis-experimental"))
+        planner_dispatch.get_planner(session)

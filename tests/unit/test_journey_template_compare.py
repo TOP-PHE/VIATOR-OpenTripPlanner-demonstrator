@@ -500,12 +500,14 @@ def test_paired_grid_dispatched_when_hafas_is_sole_reference(template_text: str)
         "VIATOR and ÖBB trips would render as two independent, unaligned "
         "column bodies again (the original user-reported bug)."
     )
-    assert "_refsForPairing.length === 1" in sbs_body and "'hafas'" in sbs_body, (
+    message = (
         "The paired-grid fork must be scoped to the HAFAS-is-sole-reference "
         "case — without this guard, OJP-involved SBS layouts would either "
         "lose their columns or crash looking for a non-existent HAFAS "
         "reference."
     )
+    assert "_refsForPairing.length === 1" in sbs_body, message
+    assert "'hafas'" in sbs_body, message
 
 
 def test_pairing_matches_on_first_transit_leg_departure(template_text: str):
@@ -604,11 +606,13 @@ def test_paired_grid_renders_empty_state_when_both_sides_empty(template_text: st
         "\nfunction ", fn_start + len("function renderViatorOebbPairedGrid(")
     )
     body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 3000]
-    assert "rows.length" in body and "no itineraries found" in body, (
+    message = (
         "renderViatorOebbPairedGrid must fall back to an explicit "
         "'no itineraries found' placeholder when the paired rows list "
         "is empty, instead of rendering a body-less grid."
     )
+    assert "rows.length" in body, message
+    assert "no itineraries found" in body, message
 
 
 def test_paired_grid_toggle_not_rendered_for_inert_control(template_text: str):
@@ -648,11 +652,13 @@ def test_paired_grid_rows_sorted_chronologically(template_text: str):
     assert fn_start != -1, "_pairViatorAndOebbTrips function missing"
     next_fn = template_text.find("\nfunction ", fn_start + len("function _pairViatorAndOebbTrips("))
     body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 3000]
-    assert "rows.sort(" in body and "_pairedGridRowSortKey" in body, (
+    message = (
         "_pairViatorAndOebbTrips no longer sorts the merged row list by "
         "departure time — unmatched ÖBB-only rows would render bunched "
         "at the end regardless of their actual departure time."
     )
+    assert "rows.sort(" in body, message
+    assert "_pairedGridRowSortKey" in body, message
 
 
 def test_paired_grid_viator_index_threaded_not_recomputed(template_text: str):
@@ -711,12 +717,14 @@ def test_paired_grid_breaks_same_instant_ties_on_arrival(template_text: str):
     assert fn_start != -1, "_pairViatorAndOebbTrips function missing"
     next_fn = template_text.find("\nfunction ", fn_start + len("function _pairViatorAndOebbTrips("))
     body = template_text[fn_start : next_fn if next_fn != -1 else fn_start + 3000]
-    assert "candidates.length > 1" in body and "arrival_at" in body, (
+    message = (
         "_pairViatorAndOebbTrips no longer breaks same-departure-instant "
         "ties on arrival time — a shared first-leg departure instant "
         "between two distinct ÖBB itineraries could silently pair the "
         "wrong one to a VIATOR trip."
     )
+    assert "candidates.length > 1" in body, message
+    assert "arrival_at" in body, message
 
 
 # ───────────────── v0.1.45 "possible duplicate" badge ─────────────────

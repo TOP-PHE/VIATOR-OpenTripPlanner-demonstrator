@@ -787,8 +787,10 @@ def test_anchor_rejects_an_explicit_reference_date_that_disagrees():
     while every depart_at-anchored comparison judges another, and the
     alignment sweep writes one_sided tiers across the whole matrix.
     `create_run`'s ValueError maps to HTTP 400 at the API layer."""
+    depart_at = datetime(2026, 7, 20, 8, 0)
+    reference_date = date(2026, 7, 27)
     with pytest.raises(ValueError, match="does not match the day-window"):
-        _anchor(datetime(2026, 7, 20, 8, 0), date(2026, 7, 27), tz="Europe/Brussels")
+        _anchor(depart_at, reference_date, tz="Europe/Brussels")
 
 
 # ── cross-midnight windows: the anchor day is the day the window OPENED ──
