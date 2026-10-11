@@ -307,3 +307,50 @@ def test_redaction_stays_linear_on_hostile_input(text: str) -> None:
     redact_text(text)
     redact_url(text)
     assert time.perf_counter() - start < 0.05
+
+
+# ─────────── confirm review of #346: regressions no test caught ───────────
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "//host.zz.invalid/x?page=2&apikey=ZZSECRET99",
+            "//host.zz.invalid/x?page=REDACTED&apikey=REDACTED",
+        ),
+        # urlunsplit writes the empty host as `//`: harmless in a log line.
+        ("http:/x?page=2&k=ZZ99", "http:///x?page=REDACTED&k=REDACTED"),
+    ],
+    ids=["host-without-scheme", "scheme-without-host"],
+)
+def test_a_scheme_or_a_host_alone_makes_a_url_outbound(url: str, expected: str) -> None:
+    """Only a bare path is a target VIATOR received: a scheme alone or a
+    host alone already makes the URL one that keeps no value."""
+    assert redact_url(url) == expected
+
+
+def test_a_literal_carriage_return_escape_is_a_boundary() -> None:
+    assert redact_text("a\\r/api?q=Zzville") == "a\\r/api?q=REDACTED"
+    assert redact_text("a\\rhttps://h.zz.invalid/?k=ZZ99") == "a\\rhttps://h.zz.invalid/?k=REDACTED"
+
+
+def test_a_segment_that_only_starts_like_a_template_is_redacted() -> None:
+    assert redact_path("/confirm/{a}ZZTOKEN99") == "/confirm/REDACTED"
+    assert redact_text("see /reset/{a}ZZTOKEN99") == "see /reset/REDACTED"
+
+
+def test_an_unmatched_parenthesis_inside_the_url_keeps_the_end_of_the_secret_in_the_value() -> None:
+    """Only closing parentheses at the very end are given back to the text:
+    the last characters of a value must never be cut off unredacted."""
+    out = redact_text("x https://h.zz.invalid/a)b?k=ZZSECRET99 y")
+    assert out == "x https://h.zz.invalid/a)b?k=REDACTED y"
+    out = redact_text("x /a)b?k=ZZSECRET99) y")
+    assert out == "x /a)b?k=REDACTED) y"
+    assert "99" not in out
+
+
+def test_a_password_holding_an_at_sign_does_not_leak() -> None:
+    out = redact_url("https://u:p@ssZZ99@h.zz.invalid/x")
+    assert out == "https://REDACTED@h.zz.invalid/x"
+    assert "ZZ99" not in redact_text("fetch https://u:p@ssZZ99@h.zz.invalid/x failed")

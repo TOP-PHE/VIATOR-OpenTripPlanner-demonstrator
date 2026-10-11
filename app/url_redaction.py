@@ -86,9 +86,12 @@ _KEY_SHAPE: Final = re.compile(r"[A-Za-z0-9_.\-\[\]]{1,40}")
 # A route template segment (`{token}`), kept as it is.
 _TEMPLATE: Final = re.compile(r"\{[A-Za-z_]\w*\}", re.ASCII)
 
-# URLs inside free text (an exception message, a log line). Each pattern can
-# start only at a boundary (the look-behind: not inside a word or a path) and
-# its body is possessive, so a scan is linear in the text's length. An
+# URLs inside free text (an exception message, a log line). The look-behind
+# is what keeps a scan linear: a match can start only at a boundary (not
+# inside a word or a path), so each character is read by at most one
+# attempt. Without it, a failed attempt at every position of a long word
+# reads the rest of the word again: quadratic, whatever the quantifiers
+# (the bodies are possessive only to stop backtracking within one match). An
 # absolute URL: a scheme (consumed whole, of any length) and `://`. A relative one:
 # a whole token starting with `/`, redacted when it holds a query, a matrix
 # parameter, an encoded character, a fragment or a token prefix. A literal
