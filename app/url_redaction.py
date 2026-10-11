@@ -89,7 +89,7 @@ _TEMPLATE: Final = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 # URLs inside free text (an exception message, a log line). Each pattern can
 # start only at a boundary (the look-behind: not inside a word or a path) and
 # its body is possessive, so a scan is linear in the text's length. An
-# absolute URL: a scheme of at most 32 characters and `://`. A relative one:
+# absolute URL: a scheme (consumed whole, of any length) and `://`. A relative one:
 # a whole token starting with `/`, redacted when it holds a query, a matrix
 # parameter, an encoded character, a fragment or a token prefix. A literal
 # escape sequence (`one_line` writes a line break as the two characters
@@ -97,7 +97,7 @@ _TEMPLATE: Final = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 _URL_BODY: Final = r"""(?:[^\s'"<>`\\]|\\(?![nrt]))"""
 _AFTER_ESCAPE: Final = r"(?<=\\[nrt])"
 _ABSOLUTE_URL: Final = re.compile(
-    rf"(?:(?<![A-Za-z0-9+.\-])|{_AFTER_ESCAPE})[A-Za-z][A-Za-z0-9+.\-]{{0,31}}://{_URL_BODY}++"
+    rf"(?:(?<![A-Za-z0-9+.\-])|{_AFTER_ESCAPE})[A-Za-z][A-Za-z0-9+.\-]*+://{_URL_BODY}++"
 )
 _RELATIVE_URL: Final = re.compile(rf"(?:(?<![\w/:.])|{_AFTER_ESCAPE})/{_URL_BODY}*+")
 _TOKEN_PATH: Final = re.compile(

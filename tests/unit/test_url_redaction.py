@@ -231,6 +231,8 @@ def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) 
         ("a\\nhttps://h.zz.invalid/?k=ZZ99", "a\\nhttps://h.zz.invalid/?k=REDACTED"),
         ("a\\n/x?q=Zzville\\tb", "a\\n/x?q=REDACTED\\tb"),
         ("route GET /confirm/{token}", "route GET /confirm/{token}"),
+        ("x https://h.zz.invalid/x?k=(ZZ99)", "x https://h.zz.invalid/x?k=REDACTED"),
+        ("s" * 40 + "://h.zz.invalid/?k=ZZ99", "s" * 40 + "://h.zz.invalid/?k=REDACTED"),
         ("path /x/y, done", "path /x/y, done"),
     ],
     ids=[
@@ -240,6 +242,8 @@ def test_encoded_query_matrix_parameters_and_templates(url: str, expected: str) 
         "escape-before",
         "escape-relative",
         "template",
+        "paren-in-value",
+        "long-scheme",
         "plain-path",
     ],
 )
@@ -250,7 +254,7 @@ def test_text_boundaries(text: str, expected: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "a" * 100_000,
+        "a" * 100_000 + " /x",
         "-/" * 50_000,
         "-/" * 50_000 + "?a=1",
         "/" + "a/" * 50_000 + "?q=Zzville",

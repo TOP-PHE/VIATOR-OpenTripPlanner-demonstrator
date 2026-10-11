@@ -232,3 +232,16 @@ def test_the_session_fragments_set_no_log_of_their_own() -> None:
     assert "location" in out
     for directive in ("access_log", "error_log", "log_format"):
         assert directive not in out
+
+
+def test_the_deploy_checks_then_restarts_nginx_after_the_pull() -> None:
+    """nginx.conf is a single-file bind mount: `git pull` replaces the file
+    and only a restart loads it (`nginx -s reload` keeps the old one). The
+    new file is checked first, so a broken config stops the deploy."""
+    script = (Path(__file__).resolve().parents[2] / "bin" / "viator-deploy.sh").read_text()
+    lines = [line.split("#", 1)[0].strip() for line in script.splitlines()]
+    check = lines.index("docker compose run --rm --no-deps -T nginx nginx -t")
+    restart = lines.index("docker compose restart nginx")
+    pull = lines.index("git pull --ff-only --autostash")
+    assert pull < check < restart
+    assert "set -euo pipefail" in lines
