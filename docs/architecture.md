@@ -1042,6 +1042,7 @@ serving journey queries — and the safety rails that keep a build from taking t
 | Module | What it does |
 |---|---|
 | `app/worker.py` (1331 lines) | The whole second process. Polls `rebuild_jobs`, debounces, runs the engine-specific build by shelling out to `docker compose`, promotes the result via a symlink, and watches for the reload-trigger sentinel. |
+| `app/station_builds.py` | Before each MOTIS build: asks the station module (MSMM) for a station build (`POST /internal/v1/builds`) and polls its state (`GET /internal/v1/builds/{id}`) until it ends, 30 min at most (MSMM decision 6). Never blocks the graph: every end of the wait but an operator's cancel lets the build go on. |
 | `app/sessions_orchestrator.py` | Renders `docker-compose.sessions.yml` and `nginx-sessions.conf` from the DB — one service block + one nginx `location` per *serving* session. Generator only; it never calls docker itself. |
 | `app/router_config.py` | Pure function producing per-session `router-config.json` for OTP: GTFS-RT updaters (with credentials applied), API timeout, routing defaults. No DB, no crypto. |
 | `app/otp_heap.py` | Validates `-Xmx` strings; **derives the container's cgroup cap from the heap**; auto-sizes the heap to host RAM for a max-memory rebuild. |
@@ -1096,8 +1097,32 @@ actually died silently.
 `tick()` takes the *oldest* `pending` row from `rebuild_jobs`, checks it is older than
 `REBUILD_DEBOUNCE_SECONDS`, flips it to `running`, re-reads `sessions.engine` in its own short
 transaction (the operator may have edited it since enqueue), then calls `run_build` or
-`run_build_motis`. Both return the same `(log, success, path)` triple so everything past the
-dispatch point stays engine-agnostic.
+`run_build_motis` (through `_run_engine_build`). Both return the same `(log, success, path)`
+triple so everything past the dispatch point stays engine-agnostic.
+
+**The station build before a MOTIS graph** (MSMM decision 6, the module's design 21.18).
+`_run_engine_build` first calls `_wait_for_station_build`, in the job's own flow, before
+`run_build_motis` (OTP builds skip it). `station_builds.wait_before_graph` sends
+`POST /internal/v1/builds` (`{}`, the internal token, no `X-Viator-User-Id`: a service call);
+`done` / `up_to_date` end the wait at once, `queued` / `running` start a `GET` every 10 s, 30 min
+at most from the first `POST`. Each call runs on its own event loop under `asyncio.timeout`, cut at
+5 s or at what is left of the 30 min (`_Wait._limit`), so a module trickling bytes cannot stretch
+it. `failed`, 409 `no_inputs`, 429 `build_interval`, 403,
+any other refusal of the `POST` (the 404 of a module older than these calls) and 403/404 on a
+`GET` end it early; a transient failure (503, timeout, connection refused or reset) of the
+`POST` is tried once more after 10 s, of a `GET` asked again at the next poll. Every end but an
+operator's cancel returns to `run_build_motis`: the module keeps serving its last committed
+build, and an early end logs one WARNING `station_build.unavailable reason=<word>`. Each step is
+appended to `rebuild_jobs.log` at once (`[viator] station-build=<step> …`, in SQL, best-effort),
+and `GET /api/sessions/{sid}/rebuilds` reads the last one back as `station_build` /
+`station_build_text`, the pill of the Sessions page (`waiting` only while the job is `running`, so an orphaned
+job shows none). The cancel is read after every pause (`_cancel_requested`), so it lands within
+about 15 s (a 10 s pause and a 5 s call); a cancelled wait builds nothing and its log says no
+container was started. An exception escaping the wait is caught in `_run_engine_build`, which
+builds the graph anyway; a worker stopped by its container dies in the pause like in a build, and
+the job is closed as orphaned at the next start. Without `STATION_MODULE_URL` /
+`STATION_MODULE_TOKEN` in the worker's environment nothing waits: one INFO line
+`station_build.skipped reason=off`, no pill.
 
 `run_build` resolves every per-session knob defensively — each validator is wrapped so a bad
 value logs a warning and falls back to the default rather than failing the build — writes
@@ -1165,7 +1190,9 @@ year-on-year analytics while shedding the bulky storage early."*
 | `include_in_fanout` | `bool` | with `state='serving'`, gates the partial index `ix_sessions_fanout` |
 
 `rebuild_jobs`: `id`, `session_id`, `status` (`pending|running|done|failed|cancelled`), `log`
-(last 32 KB of build output appended), `graph_path`, `started_at`, `finished_at`, `max_memory`.
+(last 32 KB of build output appended; before it, for a MOTIS build, the station build lines
+`[viator] station-build=<step>`), `graph_path`, `started_at`, `finished_at`, `max_memory`,
+`cancel_requested_at`.
 
 On-disk layout (all inside the shared `viator_graphs` / `viator_inbox` named volumes):
 
@@ -1224,10 +1251,20 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
 - **The cgroup cap must move with the heap.** Bumping `otp_build_heap` while `OTP_BUILD_MEM_LIMIT`
   stayed stale guaranteed a kernel OOM-kill (signal 9) mid-OSM-parse — the JVM never reached its
   own `-Xmx`. The worker now injects a derived `OTP_BUILD_MEM_LIMIT` into the subprocess env.
-- **Promotion is eventually consistent.** Between Promote and the worker's next tick (≤
-  `WORKER_TICK_SECONDS`, default 15) the DB says `serving` but the container is not routable —
+- **Promotion is eventually consistent.** Between Promote and the worker's next pass through its
+  loop (≤ `WORKER_TICK_SECONDS`, default 15, when the worker is idle; when a rebuild is running,
+  the rest of that rebuild, including a MOTIS rebuild's wait of up to 30 min for the station
+  build) the DB says `serving` but the container is not routable —
   and even then the JVM is still booting. Trust the `Grizzly server running.` log line, not the
   green badge.
+- **A MOTIS rebuild can sit in `running` for up to 30 minutes before its build container
+  exists**: it waits for the station module's build (`station_builds`). The worker runs one job
+  at a time and `handle_reload_trigger()` runs in the same loop, so that wait delays every later
+  rebuild **and the promotion of another session to `serving`** too. The bound is 30 minutes from
+  the first `POST`, plus the few milliseconds of the worker's own job-log writes and cancel
+  checks. The Sessions page pill says "Waiting for the station module build". The worker needs
+  the same `STATION_MODULE_URL` / `STATION_MODULE_TOKEN` as `web`: a worker not recreated after
+  a token rotation is refused (403) and builds without waiting, with a warning.
 - **Anything in `running` at worker startup is orphaned by definition** — subprocess handles do
   not survive a container restart — so `_mark_orphaned_rebuild_jobs()` marks them `failed`.
   Without it, ghost "still building" rows block the session's next rebuild forever.
