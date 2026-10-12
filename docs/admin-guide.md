@@ -1129,10 +1129,11 @@ The most common pitfalls (all surfaced in v0.1.9):
 | bandit | `subprocess.run(["docker", ...])` | Use absolute path constant `_DOCKER = "/usr/local/bin/docker"` |
 | pytest | `tmp_path / "x"; x.mkdir()` raising FileExistsError on GHA Linux | `x.mkdir(exist_ok=True)` |
 
-To iterate faster on CI failures, install the same versions locally:
+To iterate faster on CI failures, install the same versions locally (the hashed dev lock;
+to change a version, see VIATOR-technical-spec.md 15.2.5):
 
 ```bash
-pip install -r requirements-dev.txt
+pip install --require-hashes --only-binary :all: -r requirements-dev.txt
 ruff check . && ruff format --check .
 mypy app/
 pytest tests/unit/                  # integration tests need Postgres
