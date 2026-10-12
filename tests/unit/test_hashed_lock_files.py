@@ -551,6 +551,23 @@ def test_dependabot_compiles_the_locks_with_uv() -> None:
     assert python["directory"] == "/"
 
 
+def test_dependabot_keeps_bcrypt_on_the_major_passlib_works_with() -> None:
+    """passlib 1.7.4 fails with bcrypt 5 (Dependabot PR #352): no major bump is proposed.
+
+    Remove this test with the entry, in the pull request that drops passlib.
+    """
+    updates = yaml.safe_load(_text(".github/dependabot.yml"))["updates"]
+    (python,) = [update for update in updates if update["package-ecosystem"] == "uv"]
+    assert python["ignore"] == [
+        {"dependency-name": "bcrypt", "update-types": ["version-update:semver-major"]}
+    ]
+    assert "passlib" in _text("app/auth/passwords.py")
+    assert re.search(r"^bcrypt==4\.", _text("requirements.in"), re.MULTILINE)
+    for update in updates:
+        if update is not python:
+            assert "ignore" not in update, update["package-ecosystem"]
+
+
 def test_dependabot_can_read_every_lock() -> None:
     """Dependabot skips a manifest over 500 KB."""
     for lock in LOCKS.values():
