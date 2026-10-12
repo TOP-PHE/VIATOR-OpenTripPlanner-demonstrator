@@ -134,6 +134,14 @@ def _wait(module: Module, clock: FakeClock, run: Run | None = None) -> sb.WaitRe
     )
 
 
+def test_the_numbers_are_the_contracts() -> None:
+    # The module's design, 21.18, points 1 and 2: written out, not read back.
+    assert sb.POLL_SECONDS == 10.0
+    assert sb.CALL_SECONDS == 5.0
+    assert sb.WAIT_LIMIT_SECONDS == 1800.0
+    assert sb.POST_RETRY_SECONDS == 10.0
+
+
 # ── the outcomes ─────────────────────────────────────────────────────────
 
 
