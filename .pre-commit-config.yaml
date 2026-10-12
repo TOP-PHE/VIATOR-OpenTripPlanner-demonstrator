@@ -1,31 +1,78 @@
 # Run on every commit. Install once with `pre-commit install`.
 # CI also runs `pre-commit run --all-files` as a belt-and-braces check.
+#
+# Every hook is local (`repo: local`, `language: system`): it runs a program
+# installed from the hashed lock file requirements-dev.txt (the hygiene checks
+# of the pre-commit-hooks package, ruff, mypy), so pre-commit fetches no hook
+# repository and pip-installs nothing of its own. Before, it cloned
+# pre-commit-hooks and ruff-pre-commit by tag (a tag can be moved) and
+# installed them with unpinned, unhashed dependencies. Each hook below is
+# written as its project defines it (pre-commit-hooks v5.0.0, ruff-pre-commit
+# at the ruff of the lock): the same program, the same kinds of file, the same
+# stages. `language: system` finds the programs on PATH, so run pre-commit from
+# the activated environment that holds requirements-dev.txt, as CI does.
+# tests/unit/test_dev_tool_pins_stay_in_step.py holds these rules.
 
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+  - repo: local
     hooks:
       - id: trailing-whitespace
+        name: trim trailing whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
       - id: end-of-file-fixer
+        name: fix end of files
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
       - id: check-yaml
+        name: check yaml
+        entry: check-yaml
+        language: system
+        types: [yaml]
       - id: check-toml
+        name: check toml
+        entry: check-toml
+        language: system
+        types: [toml]
       - id: check-added-large-files
+        name: check for added large files
+        entry: check-added-large-files
+        language: system
         args: ["--maxkb=1024"]
+        stages: [pre-commit, pre-push, manual]
       - id: check-merge-conflict
+        name: check for merge conflicts
+        entry: check-merge-conflict
+        language: system
+        types: [text]
       - id: detect-private-key
+        name: detect private key
+        entry: detect-private-key
+        language: system
+        types: [text]
 
-  # rev must be "v" + requirements-dev.txt's ruff pin: Dependabot does not
-  # update pre-commit revs, so tests/unit/test_dev_tool_pins_stay_in_step.py
-  # fails when the two drift (#336). Bump them together.
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.10
-    hooks:
-      - id: ruff-check   # the hook repo now calls the old id "ruff" a legacy alias
+      # The ruff of requirements-dev.txt, the one CI's Python job lints and
+      # formats with: Dependabot raising it in the lock raises it here too.
+      - id: ruff-check   # the hook repo calls the old id "ruff" a legacy alias
+        name: ruff check
+        entry: ruff check --force-exclude
+        language: system
+        types_or: [python, pyi, jupyter]
         args: ["--fix"]
+        require_serial: true
       - id: ruff-format
+        name: ruff format
+        entry: ruff format --force-exclude
+        language: system
+        types_or: [python, pyi, jupyter, markdown]
+        require_serial: true
 
   # black removed in audit-2026-05 #21 closure. `ruff format` (the
-  # ruff-pre-commit hook above) replaces it — single formatter, no
+  # ruff-format hook above) replaces it — single formatter, no
   # flip-flops between two tools with subtly different rules
   # (specifically the multi-line-string `op.execute("""...""")` pattern
   # in Alembic migrations where black 26 + ruff-format 0.7 disagree).
@@ -35,8 +82,9 @@ repos:
   # `mypy app/`, with the mypy, stubs and app packages that
   # requirements-dev.txt pins, so there is no second list of versions to keep
   # in step by hand (the old mirrors-mypy hook's `additional_dependencies` had
-  # drifted until it could not install on Python 3.14). It needs
-  # `pip install -r requirements-dev.txt` in the environment you push from.
+  # drifted until it could not install on Python 3.14). It needs the dev lock
+  # (`pip install --require-hashes --only-binary :all: -r requirements-dev.txt`)
+  # in the environment you push from.
   # Pre-push only: mypy is slow for every commit. CI's pre-commit job runs the
   # commit stage only, so this hook never runs there; CI runs `mypy app/`
   # itself.

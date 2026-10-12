@@ -29,16 +29,19 @@ from sqlalchemy import func, update
 
 from . import engine_versions, graph_snapshots, netex_calendar, station_builds
 from .db import SessionLocal
-from .logging_config import quiet_http_client_loggers
+from .logging_config import install_redacting_formatter, quiet_http_client_loggers
 from .models import RebuildJob
 from .models import Session as SessionRow
 from .models.sessions import SessionState
 from .settings import settings
 
 log = logging.getLogger("worker")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
 # Not httpx's INFO request lines: their URL can carry a feed credential (#339).
 quiet_http_client_loggers()
+# And no URL query value or token path in any other line, traceback included.
+install_redacting_formatter(_LOG_FORMAT)
 
 
 # Same path written by app/api/admin/sessions.py::promote_session.

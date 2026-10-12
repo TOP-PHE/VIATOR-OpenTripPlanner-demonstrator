@@ -61,10 +61,59 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
+      # The lock file only (VIATOR-technical-spec.md 15.2.5): every package with
+      # its exact version and the sha256 of its files, which pip checks before
+      # installing anything; wheels only, so no package's build script runs
+      # here. pip and setuptools first, from the image's build lock: pip-audit
+      # below audits this environment, pip included, and setup-python's pip
+      # can lag behind a fixed CVE (before, `pip install --upgrade pip`,
+      # unpinned).
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+          pip install --require-hashes --only-binary :all: -r requirements-dev.txt
+
+      # Each lock file is compiled again from its source with the uv the dev
+      # lock pins (`python -m uv`: the uv package of this Python, never another
+      # uv found first on PATH) and the command of 15.2.5, and must come out
+      # the same. The versions the lock holds are given as constraints, never
+      # the lock itself: uv keeps the hashes of a lock it is given as they are,
+      # while it asks the package index for those of a new file. So a package
+      # added to a `.in` file and not locked, a pin raised and not locked, a
+      # version or a hash edited by hand, a lock missing or empty: each fails
+      # here, named, and every lock is checked before the step fails. Comments
+      # are left out of the comparison: they are uv's notes, not what pip reads.
+      - name: Lock files match their sources
+        run: |
+          set -euo pipefail
+          stale=0
+          for name in requirements requirements-dev requirements-build; do
+            pins="$RUNNER_TEMP/$name.pins.txt"
+            fresh="$RUNNER_TEMP/$name.txt"
+            rm -f "$fresh"
+            if [ ! -f "$name.txt" ] || ! grep -q -E '^[a-z0-9-]+==' "$name.txt"; then
+              echo "::error::$name.txt is missing or holds no package. Compile it from $name.in with the command of VIATOR-technical-spec.md 15.2.5 and commit both files."
+              stale=1
+              continue
+            fi
+            grep -E '^[a-z0-9-]+==' "$name.txt" | sed -e 's/ *\\$//' > "$pins"
+            if ! python -m uv pip compile --quiet --universal --python-version 3.14 --generate-hashes \
+                --emit-build-options "$name.in" -c "$pins" -o "$fresh"; then
+              echo "::error::$name.in cannot be compiled to the versions of $name.txt (uv says why above). Never edit a lock file by hand: edit $name.in, run the compile command of VIATOR-technical-spec.md 15.2.5 and commit both files."
+              stale=1
+              continue
+            fi
+            if ! diff -u --label "$name.txt (committed)" --label "$name.txt (compiled from $name.in)" \
+                <(grep -v -E '^[[:space:]]*(#|$)' "$name.txt") \
+                <(grep -v -E '^[[:space:]]*(#|$)' "$fresh"); then
+              echo "::error::$name.txt does not match $name.in. Never edit a lock file by hand: edit $name.in, run the compile command of VIATOR-technical-spec.md 15.2.5 and commit both files."
+              stale=1
+            fi
+          done
+          if [ "$stale" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Each lock file is what its source compiles to."
 
       - name: Ruff (lint + format check)
         run: |
@@ -157,9 +206,11 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      # The pre-commit version requirements-dev.txt pins, so this job and a
-      # developer's machine run the same one (#336). Without the pin pip gets an
-      # empty name and the step fails; test_dev_tool_pins_stay_in_step.py checks it.
-      - name: Install pre-commit (requirements-dev.txt's pin)
-        run: pip install "$(grep -oE '^pre-commit==[^[:space:]]+' requirements-dev.txt)"
+          cache-dependency-path: requirements-dev.txt
+      # Every hook is local and runs a program of the dev lock (pre-commit,
+      # pre-commit-hooks, ruff), so this job installs that lock, hashed and
+      # wheels only, like the Python job: the same versions as a developer's
+      # machine and as CI's lint, and pre-commit installs nothing of its own.
+      - name: Install the dev lock (pre-commit, its hooks, ruff)
+        run: 'pip install --require-hashes --only-binary :all: -r requirements-dev.txt'
       - run: pre-commit run --all-files --show-diff-on-failure

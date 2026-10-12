@@ -141,6 +141,19 @@ echo ">>> restart prometheus + grafana to pick up config-file changes"
 docker compose restart prometheus grafana
 echo ""
 
+# nginx.conf is bind-mounted as a single file. `git pull` replaces the file
+# (a new inode), so the running container keeps the old one: neither
+# `compose up -d` nor `nginx -s reload` sees a release's change (e.g. the
+# access-log format without query strings, PR #346). Check the new file in
+# a throwaway container first (`run --rm` mounts the same paths, publishes
+# no port), so a broken config stops the deploy here instead of taking the
+# site down; then restart nginx, which re-reads the file (a second or two
+# of refused connections).
+echo ">>> check the new nginx.conf, then restart nginx to load it"
+docker compose run --rm --no-deps -T nginx nginx -t
+docker compose restart nginx
+echo ""
+
 # ─────────────────────────────── Verify ───────────────────────────────────────
 echo ">>> waiting 8 sec for web container readiness"
 sleep 8

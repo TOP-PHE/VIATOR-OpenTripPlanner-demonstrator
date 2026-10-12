@@ -1,0 +1,56 @@
+# Dev / CI dependencies. Runtime deps live in requirements.in.
+#
+# This file is the source; requirements-dev.txt is the lock file compiled from it: every
+# package (indirect ones included), its exact version and the sha256 hashes of its
+# files. Never edit the lock by hand. To add or upgrade a package, edit this file,
+# run the compile command of VIATOR-technical-spec.md section 15.2.5 from the
+# repository root, and commit both files. CI compiles again and fails when the two
+# disagree (job "Python (lint + type + test)", step "Lock files match their sources").
+#
+# `--only-binary :all:`: wheels only, never a source archive whose build script
+# would run at install time. uv copies it into the lock, so pip applies it wherever
+# the lock is installed.
+--only-binary :all:
+
+-r requirements.in
+
+# Test runner — pytest 9.x for the test-isolation security fix
+# (GHSA-6w46-j5rx-g56g). Audit-2026-05 #22.
+# pytest-asyncio 1.x is the pytest-9-compatible line; we keep
+# `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
+# to be re-decorated with @pytest.mark.asyncio.
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+httpx==0.28.1               # FastAPI async test client
+
+# Lint / format / type
+ruff==0.16.10               # also our formatter — black was dropped in audit
+                            # #21 closure (drop-in replacement, eliminates
+                            # ruff-format ↔ black flip-flop on Alembic files).
+                            # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
+                            # once black is removed.
+                            # The ruff hooks of .pre-commit-config.yaml are
+                            # local and run this one: nothing to bump by hand.
+mypy==2.4.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
+
+# Security
+bandit==1.9.4
+pip-audit==2.10.1
+
+# Pre-commit framework (also used in CI) and the package of its hygiene hooks.
+# Every hook is local (.pre-commit-config.yaml): it runs a program installed from
+# this lock, so pre-commit fetches no repository and installs nothing of its own.
+# pre-commit-hooks is at the version of the remote hooks it replaced (v5.0.0).
+pre-commit==4.6.2
+pre-commit-hooks==5.0.0
+
+# The compiler of the lock files; CI runs it too, to check that each lock matches
+# its source (same version as the Multimodal Station Mapping module's lock files).
+uv==0.12.18
+
+# Stubs for mypy strict mode
+types-requests==2.33.0.20260906
+types-passlib==1.7.7.20260211
+types-defusedxml==0.7.0.20260504   # defusedxml ships no inline types — needed for app/journey/ojp_client.py under mypy strict
+sqlalchemy==2.1.3             # MUST match the pin in requirements.in — pip rejects on conflict (audit-2026-05 #23). No [mypy] extra: 2.1 removed the plugin; typing is native

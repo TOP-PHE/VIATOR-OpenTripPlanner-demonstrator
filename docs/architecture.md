@@ -1411,10 +1411,11 @@ seams are drawn where a real product would draw them, so nothing has to be unpic
 | `app/credentials.py` | HKDF key derivation from `JWT_SECRET`, AES-256-GCM encrypt/decrypt, and the httpx auth-injection helper — all in one file on purpose |
 | `app/audit.py` | 20-line append helper. Deliberately boring; callers shape the metadata and own the commit |
 | `app/db.py` | SQLAlchemy engine + `SessionLocal` + the `get_db` FastAPI dependency. Schema is Alembic's, never `create_all()` |
-| `app/logging_config.py` | structlog + stdlib unified into one JSON renderer chain |
+| `app/logging_config.py` | structlog + stdlib unified into one JSON renderer chain, every string through `app/url_redaction.py` |
 | `app/middleware/request_id.py` | Binds a `request_id` contextvar per request; echoes `X-Request-ID` |
 | `app/metrics.py` | Prometheus HTTP middleware, four DB-derived gauges, the federated planner's tries counter, `/metrics` |
-| `app/tracing.py` | OpenTelemetry SDK + OTLP→Tempo exporter + auto-instrumentation (FastAPI, SQLAlchemy, httpx, logging) |
+| `app/tracing.py` | OpenTelemetry SDK + OTLP→Tempo exporter (behind `RedactingSpanExporter`) + auto-instrumentation (FastAPI, SQLAlchemy, httpx, logging) |
+| `app/url_redaction.py` | The one rule for URLs in logs and spans: query values outside an allow-list and token path segments become `REDACTED` |
 | `app/rate_limit.py` | slowapi `Limiter` with **no default limits**; routes opt in |
 
 ### How it works
@@ -1503,7 +1504,8 @@ failed rebuilds) with a bare `except` so a DB hiccup can't take the whole endpoi
 `viator_federated_planner_tries_total` (how each federated try that reaches a decision ended, fixed
 reason words only).
 *Traces* (OTLP gRPC → Tempo): auto-instrumentation only — there is not a single manual
-`start_span` in `app/`. `LoggingInstrumentor` injects `otelTraceID` into log records, and Grafana's
+`start_span` in `app/`. Every span leaves through `RedactingSpanExporter`, which redacts URL query
+values, token paths and header attributes (see the traps below). `LoggingInstrumentor` injects `otelTraceID` into log records, and Grafana's
 Loki datasource turns that into a click-through to the trace. Sampling is 100%, which is only
 defensible at demonstrator RPM.
 
@@ -1592,12 +1594,31 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   short-circuits on the empty env var, which is what keeps the test suite from dialling `tempo:4317`.
 - **Inbound `X-Request-ID` is only honoured if it matches `[A-Za-z0-9_-]{1,64}`**, otherwise a fresh
   UUID4 is minted — this is log-injection defence, not cosmetics.
-- **No query string in VIATOR's own logs (#339).** `setup_logging` (and the worker's setup) set
-  the `httpx`/`httpcore` loggers to WARNING, because their INFO request line prints the full URL —
-  a `query` feed credential (`?apikey=…`) or the typed geocoder text. `DropTypedQueryString` cuts
-  the query off `/api/geocode` in the uvicorn access log. Do not lower those loggers to INFO to
-  debug a feed: the line would print the credential. nginx's access log and the OTel spans still
-  carry full URLs (open, admin-guide §5.4).
+- **No query string and no token path in logs or spans (#339 and its follow-up).** One rule,
+  `app/url_redaction.py` (`redact_url`, `redact_text`): every query value becomes `REDACTED`; on a
+  request target VIATOR *received* (no scheme, no host) the allow-list `SAFE_QUERY_KEYS` (paging,
+  dates, ids) keeps its values, on an absolute (outbound) URL nothing does, and
+  `credentials.validate_param_name` refuses those names for a query credential. An encoded `%3F`
+  starts a query, matrix parameter values are redacted, and the segment after `/confirm/`,
+  `/reset/`, `/share/coverage/` (`TOKEN_PATH_PREFIXES`) becomes `REDACTED` unless it is a route
+  template (`{token}`). It is applied by the uvicorn access filter (`RedactAccessLogTarget`), by the
+  structlog processor `redact_urls` (every string of every web log line, tracebacks included), by
+  the worker's `RedactingFormatter`, and by `RedactingSpanExporter`, which exports a redacted copy
+  of every span (FastAPI inbound, httpx outbound, SQLAlchemy) — a span whose redaction fails is
+  exported stripped, never raw. nginx mirrors it with the `viator_redacted` log format (the path
+  the client sent, from `$request_uri` cut at `?`, so session ids survive the fragments' `rewrite`;
+  a `?REDACTED` marker; no referer) and keeps its error log at `crit`, because an nginx error line
+  quotes the raw request line and the referrer. `httpx`/`httpcore` stay at WARNING (#339). Traps:
+  **never add a secret-bearing or typed parameter to `SAFE_QUERY_KEYS`** (tests check the list
+  against the OpenAPI schema and a deny-list); a new route with a token in its **path** needs its
+  prefix in `TOKEN_PATH_PREFIXES` *and* in the three nginx maps (a test fails otherwise); the
+  free-text patterns must keep starting only at a boundary and stay possessive — a pattern that
+  can start anywhere is quadratic, and the access line of a hostile 8k path then stalls the event
+  loop (tests time 100k-character inputs); `nginx -s reload` does not load an edited
+  `nginx.conf` (single-file bind mount: restart the container, as the deploy script does); do not
+  lower nginx's `error_log` below `crit` for good, nor httpx to INFO; do not set
+  `OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*` expecting header values in Tempo — the exporter
+  replaces them whole.
 - **Worker-side metrics do not exist.** `/metrics` is served by the web container only; build-duration
   histograms from the worker are explicitly out of scope (they'd need multiprocess metric storage).
 

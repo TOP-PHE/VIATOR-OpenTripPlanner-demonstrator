@@ -27,8 +27,10 @@ OpenJourneyPlanner/
 ├── branding/                     # VIATOR icon, lockup, brand brief
 ├── .github/workflows/            # CI: lint, type, test, scan, sonar
 ├── pyproject.toml                # ruff, mypy, pytest, coverage config
-├── requirements.txt              # runtime deps
-├── requirements-dev.txt          # CI / dev deps (test, lint, type, security)
+├── requirements.in               # runtime deps (hand-written pins)
+├── requirements-dev.in           # CI / dev deps (test, lint, type, security)
+├── requirements-build.in         # pip + setuptools of the web image
+├── requirements*.txt             # hashed lock files compiled from the .in files (never edit)
 ├── .pre-commit-config.yaml       # pre-commit hooks
 ├── sonar-project.properties      # SonarCloud config
 └── .gitignore
@@ -39,7 +41,7 @@ OpenJourneyPlanner/
 ```bash
 # 1. Install Python deps
 python -m venv .venv && source .venv/bin/activate    # or .venv\Scripts\activate on Windows
-pip install -r requirements-dev.txt
+pip install --require-hashes --only-binary :all: -r requirements-dev.txt
 
 # 2. Install pre-commit hooks
 pre-commit install

@@ -7,7 +7,17 @@ Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `do
 (module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
 traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
 
-Last updated: 2026-09-04. §2/§3/§5/§7 curated through #245; #206–#227 triaged in the same pass.
+Last updated: 2026-10-11 (rule "no query string and no token path in logs or spans", #346). §2/§3/§5/§7
+curated through #245; #206–#227 triaged in the same pass.
+
+**Rule: no query string and no token path in logs or spans.** Any URL that reaches a log line or an
+OpenTelemetry span goes through `app/url_redaction.py` (already wired: uvicorn access filter,
+structlog processor `redact_urls`, worker `RedactingFormatter`, `RedactingSpanExporter`; nginx mirrors
+it with the `viator_redacted` log format and `error_log … crit`). Never log a URL around that path,
+never add a secret-bearing or typed parameter to `SAFE_QUERY_KEYS`, and give a new route with a token
+in its path its prefix in `TOKEN_PATH_PREFIXES` and in nginx's maps; after editing `nginx.conf`, restart
+the nginx container (`nginx -s reload` keeps the old single-file mount). Put a secret or typed text in a
+request body or header, never in a URL (`docs/architecture.md` ch. 9 traps, admin-guide §5.4).
 
 **Read §7 items 1 and 2 before writing any coverage code.** `main` currently ships one PR whose own
 title says DO NOT MERGE, and endpoint-UIC matching has never worked in production.
@@ -59,6 +69,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 | Offline HTML export mirrors the live matrix's alignment heatmap, opt-in toggle, all CSS inlined | Export is `Content-Disposition: attachment`, zero external assets, must stay viewable offline forever | PR-201 (#201) |
 | Coverage cell modal "Re-run" link also passes `&from_uic=&to_uic=` | Prep for the UIC backfill (Scope B, not yet built); safe no-op today since coverage hubs carry no UIC column | PR-202 (#202) |
 | `AutohealExcessiveRestarts` Prometheus alert (`>3 restarts/hour`) + cadvisor `viator.autoheal` label-whitelist fix | Autoheal restarting silently forever would mask a *recurring* problem exactly as it did in the 07-01 slot-window incident (below) — restarts alone aren't a fix if the same container keeps flipping unhealthy | PR-203 (#203) |
+| **Every Python package comes from a hashed lock file**: `requirements*.in` hold the hand pins, `uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options` writes the `requirements*.txt` locks; every `pip install` is `--require-hashes --only-binary :all: -r <lock>`; pre-commit hooks are all `repo: local`, `language: system`; Dependabot uses its `uv` updater | Unhashed installs let a re-uploaded or typo-squatted file in, and an sdist runs its build script at install time (SonarQube S8544/S8541). A universal lock serves Linux CI, the linux/amd64 image and a Windows workstation at once (pip-compile cannot). CI recompiles every lock and fails on drift. Never edit a lock by hand; never `pip install <pkg>` bare in a workflow or Dockerfile | `requirements*.in`, CI step "Lock files match their sources", `tests/unit/test_hashed_lock_files.py`, spec 15.2.5 — same design as MSMM PR #34 |
 | **Dockerfile linting lives ONLY in `docker.yml`'s `hadolint` job** — the pre-commit `hadolint-docker` hook is gone | It ran the same linter twice. The pre-commit copy's entry carried no image tag so it resolved `:latest` and drifted (`rev:` pins the hook definition, never the image; `v2.13.1-beta` has no image tag at all). Worse, `--all-files` linted Dockerfiles on **every** PR, reintroducing the docs-only stall `docker-gate` exists to prevent. The action is SHA-pinned and Dependabot-managed, so it stays current *and* each bump is a reviewable PR. Also means `pre-commit` no longer needs a local Docker daemon | #244 (after #243's stop-gap pin) |
 | **Trivy `skip-files` excludes embedded SBOMs** — `**/pip/_vendor/bom.cdx.json`, `**/dist-info/sboms/**` | Trivy treats *any* embedded SBOM as authoritative for the whole language ecosystem and stops walking the filesystem. pip's vendored manifest made it report phantom HIGHs **and ignore the ~100 packages actually installed** — a real CVE would have gone unreported. See §8 recipe | #245 |
 | Scan image tagged `:scan-${{ github.run_id }}`; buildx `provenance`/`sbom` attestations off for the scan build | Both were diagnostics that did **not** fix #245's mismatch. Kept as defence in depth: a unique tag can't collide with a cached result, and an attestation is a second route to the same embedded-SBOM bug | #245 |
@@ -128,12 +139,21 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 ```bash
 # Dev setup
 python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r requirements-dev.txt
+pip install --require-hashes --only-binary :all: -r requirements-dev.txt   # the hashed dev lock (runtime included)
 pre-commit install && pre-commit install --hook-type pre-push
-# The pre-push hook is `mypy app/` (CI's command) as a `repo: local`, `language: system` hook (#327):
-# it runs the mypy on PATH, so push from this activated venv with requirements-dev.txt installed,
-# or it fails with "Executable `mypy` not found". Run it by hand:
+# Every hook is `repo: local`, `language: system` (ruff, mypy, pre-commit-hooks' file checks): it runs
+# the program on PATH, so commit and push from this activated venv with the dev lock installed, or a
+# hook fails with "Executable `…` not found". The pre-push hook is `mypy app/` (CI's command, #327).
+# Run it by hand:
 #   pre-commit run mypy --hook-stage pre-push --all-files
+
+# Python packages: hashed lock files (VIATOR-technical-spec.md 15.2.5). Edit the pins in
+# requirements*.in, NEVER the requirements*.txt locks; then recompile all three with the pinned uv:
+#   uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt
+#   uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements-dev.in -o requirements-dev.txt
+#   uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements-build.in -o requirements-build.txt
+# and commit sources + locks together. CI's "Lock files match their sources" step fails otherwise.
+# Every `pip install` (workflows, Dockerfile) is `--require-hashes --only-binary :all: -r <lock>`.
 
 # Test loop
 pytest                                              # unit + integration (integration skips without Postgres)
@@ -171,6 +191,8 @@ app/
 ├── config_schema.py                     CONFIG_SCHEMA — 14 COVERAGE_* keys + OTP/OJP/HAFAS/fanout
 ├── config_service.py                    get_all(db) with 30s in-process cache
 ├── sessions_orchestrator.py             MOTIS/OTP docker container lifecycle (per-session); both templates carry viator.autoheal="true"
+├── url_redaction.py                     The one rule for URLs in logs/spans (query values outside SAFE_QUERY_KEYS and
+│                                        token path segments → REDACTED); used by logging_config, worker and tracing
 ├── api/
 │   ├── admin/network_coverage.py        Coverage matrix API (runs, results, cell-trips, verify-external, export,
 │   │                                    stop, delete). Also hosts _build_export_context / _build_cell_trips_response /

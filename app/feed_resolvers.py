@@ -50,6 +50,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from .master.nap_importer import _validate_safe_http_url
+from .url_redaction import redact_text
 
 RESOLVER_TYPES: frozenset[str] = frozenset({"tdg", "udata", "permalink", "dated", "json_api"})
 
@@ -470,7 +471,10 @@ async def redirect_guard(client: httpx.AsyncClient) -> AsyncIterator[None]:
         try:
             await asyncio.to_thread(_validate_safe_http_url, url)
         except ValueError as exc:
-            raise httpx.RequestError(f"blocked request to {url}: {exc}", request=request) from exc
+            # The message reaches the refresh result and the logs: a
+            # redirect hop's URL can carry a credential (query auth).
+            reason = redact_text(f"blocked request to {url}: {exc}")
+            raise httpx.RequestError(reason, request=request) from exc
 
     hooks = client.event_hooks
     hooks["request"] = [*hooks.get("request", []), _check]
