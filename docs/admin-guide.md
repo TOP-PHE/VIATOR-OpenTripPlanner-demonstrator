@@ -2715,9 +2715,12 @@ par VIATOR »). OTP builds do not wait.
   at once. These builds show on the module's Sources screen with the
   reason "requested by VIATOR's backend".
 - **How long.** The worker asks the module every 10 s, for 30 minutes at
-  most. The MOTIS build then starts. While the worker waits, the rebuild
-  job is `running` and no other rebuild starts (the worker runs one job at
-  a time), so a wait can delay the next rebuild by up to 30 minutes.
+  most from its first request; each call is cut after 5 s. The MOTIS build
+  then starts. While the worker waits, the rebuild job is `running`, and
+  the worker does nothing else (it runs one job at a time): a wait can
+  delay the next rebuild, and the **promotion of another session to
+  serving** (Promote takes effect when the worker is free), by up to 30
+  minutes.
 - **The graph is always built.** When the module is unreachable, refuses
   (no input files, a build asked for less than 30 minutes ago, a token
   refused, a module older than these calls), reports a failed build, or
@@ -2740,11 +2743,15 @@ par VIATOR »). OTP builds do not wait.
   `timeout` (30 minutes), `shape` (an answer of the wrong form),
   `status_<n>` (any other refusal of the request, such as `status_404` for a
   module older than these calls) or `error`. Never the token.
-- **Cancel.** "✕ Cancel" on a job that waits stops it within 10 s; no graph
-  is built.
+- **Cancel.** "✕ Cancel" on a job that waits stops it within about 15 s (the
+  current 10 s pause and a call of at most 5 s); no graph is built, and the
+  job's log says that no build container was started.
+- **After a worker restart** during a wait, the job is closed as failed at
+  the next start (as for a build) and shows no station pill.
 - **Without the module** (`STATION_MODULE_URL` or `STATION_MODULE_TOKEN`
   empty in the worker's environment) there is no wait and no pill: the
-  worker logs `station_build.skipped reason=off` at INFO and builds.
+  worker logs `station_build.skipped reason=off` at INFO (not a warning:
+  the module is optional) and builds.
 - **Deploy order.** The module's version with these calls (MSMM PR #35)
   first, then this VIATOR version. A VIATOR deployed first gets a 404 from
   the older module, logs `station_build.unavailable reason=status_404`
