@@ -1919,7 +1919,7 @@ Every Python package VIATOR installs comes from a hashed lock file. Each source 
 
 Every install is `pip install --require-hashes --only-binary :all: -r <lock>`: pip refuses a file whose hash is not in the lock and never builds a source archive (no package's build script runs). `tests/unit/test_hashed_lock_files.py` fails on any `pip install` in a workflow or Dockerfile that does otherwise.
 
-The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.18), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
+The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.24), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
 
 ```bash
 uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt
@@ -1930,6 +1930,8 @@ uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-
 **To add or upgrade a package:** edit the pin in the `.in` file (a runtime package in `requirements.in`; a tool in `requirements-dev.in`), run the three commands, check the diff of the locks (only the packages you meant should move; uv keeps every other version the lock already holds), reinstall the dev lock, run the gates of 15.3, and commit the sources and the locks together. To raise an indirect package (a security fix), add `--upgrade-package <name>` to the commands. `pip-compile` is not used: it resolves only for the machine it runs on, so a lock made on Linux would ask Windows for `uvloop` and leave out `colorama`.
 
 CI's `python` job checks every lock right after its install (step "Lock files match their sources"): it compiles each source again, with the lock's versions as constraints, into a new file, and compares it with the committed lock, uv's comments left out. A pin raised or a package added to a `.in` file but not locked, or a version or hash edited by hand in a lock, a lock missing or empty: each fails the step with an `::error::` naming the file, after every lock was checked. Dependabot uses its `uv` updater (`.github/dependabot.yml`), which recompiles the locks itself; its uv may be ahead of the pinned one, and if its lock differs the step fails on its pull request: run the three commands with the pinned uv on that branch.
+
+One package is held back on purpose: `bcrypt` stays below 4.1 (`requirements.in` pins 4.0.1). Passwords are hashed through `passlib` 1.7.4 (`app/auth/passwords.py`, work factor 12), whose bcrypt extra has no upper bound. Under it, bcrypt 4.1.0 raises a TypeError; 4.1.3 to 4.3.x work but log a trapped error reading `bcrypt.__about__` in each process; bcrypt 5 refuses the password longer than 72 bytes that passlib probes it with at its first hash, and every login fails (Dependabot PR #352). `.github/dependabot.yml` therefore ignores bcrypt from 4.1 on (`versions: [">=4.1"]`), and `tests/unit/test_hashed_lock_files.py` holds both the entry and a `requirements.in` pin below 4.1. That ignore also suppresses Dependabot's security updates for bcrypt 4.1 and later: until passlib is replaced, a bcrypt advisory is handled by hand. The entry is removed by a separate pull request that replaces passlib by direct calls to bcrypt (existing `$2b$` hashes stay valid); until then, do not raise bcrypt by hand.
 
 ### 15.3 Local quality gates — the same checks CI runs
 
@@ -2141,7 +2143,7 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 
 ### 15.9 Pre-commit framework — what runs and when
 
-`.pre-commit-config.yaml` configures these hooks. Every hook is `repo: local`, `language: system`: it runs a program installed from the hashed lock `requirements-dev.txt` (15.2.5) — ruff, mypy, and the basic file checks of the `pre-commit-hooks` package (pinned at 5.0.0, the `rev:` the remote hooks had). So pre-commit clones no hook repository by a tag that can move and pip-installs nothing unhashed, and the hooks always run the versions CI runs: when Dependabot raises ruff in the lock, nothing else is bumped by hand (the drift of #336 cannot happen). Each hook is written as its project defines it (pre-commit-hooks v5.0.0, ruff-pre-commit): the same program, file types and stages; `tests/unit/test_dev_tool_pins_stay_in_step.py` holds these rules. Run pre-commit from the activated environment that holds the dev lock; CI's pre-commit job installs that lock:
+`.pre-commit-config.yaml` configures these hooks. Every hook is `repo: local`, `language: system`: it runs a program installed from the hashed lock `requirements-dev.txt` (15.2.5) — ruff, mypy, and the basic file checks of the `pre-commit-hooks` package (pinned at 6.0.0; the remote hooks had `rev:` v5.0.0, and 6.0.0 removed only `check-byte-order-marker` and `fix-encoding-pragma`, which VIATOR never ran). So pre-commit clones no hook repository by a tag that can move and pip-installs nothing unhashed, and the hooks always run the versions CI runs: when Dependabot raises ruff in the lock, nothing else is bumped by hand (the drift of #336 cannot happen). Each hook is written as its project defines it (pre-commit-hooks v6.0.0, ruff-pre-commit): the same program, file types and stages; `tests/unit/test_dev_tool_pins_stay_in_step.py` holds these rules. Run pre-commit from the activated environment that holds the dev lock; CI's pre-commit job installs that lock:
 
 | Hook | What it does | Auto-fix? |
 |---|---|---|
@@ -2244,8 +2246,8 @@ Python tool versions are the pins of `requirements-dev.in` (and `requirements.in
 | Security (deps) | pip-audit | 2.10.1 | command-line flags in `ci.yml` |
 | Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
 | Dockerfile lint | hadolint (via hadolint/hadolint-action) | v3.5.0 | `ignore:` list in `docker.yml` |
-| Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 5.0.0 | `.pre-commit-config.yaml` |
-| Lock files | uv (`uv pip compile`) | 0.12.18 | the commands of 15.2.5; checked by `ci.yml` |
+| Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 6.0.0 | `.pre-commit-config.yaml` |
+| Lock files | uv (`uv pip compile`) | 0.12.24 | the commands of 15.2.5; checked by `ci.yml` |
 | Migrations | Alembic | 1.20.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
 | Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.in` | `requirements-dev.in` |

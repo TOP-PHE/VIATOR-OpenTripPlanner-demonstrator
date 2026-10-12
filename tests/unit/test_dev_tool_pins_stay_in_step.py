@@ -7,13 +7,14 @@ linted by one ruff locally and another in CI. Since the hashed lock files
 `language: system`: it runs the program requirements-dev.txt installed, so
 there is no second version to keep in step, pre-commit clones no hook
 repository by a tag that can move, and pip-installs nothing unhashed. Each
-hook is written as its project defines it (pre-commit-hooks v5.0.0,
+hook is written as its project defines it (pre-commit-hooks v6.0.0,
 ruff-pre-commit): the same program, the same kinds of file, the same stages.
 """
 
 from __future__ import annotations
 
 import re
+from importlib import metadata
 from pathlib import Path
 
 import yaml
@@ -67,6 +68,15 @@ PACKAGES = {"ruff": "ruff", "mypy": "mypy"} | {
     for entry, _ in HOOKS.values()
     if entry.split()[0] not in ("ruff", "mypy")
 }
+# The pre-commit-hooks release whose hook definitions HOOKS copies. The remote hooks were
+# at v5.0.0 when they became local. 6.0.0 removed two hooks VIATOR never ran
+# (check-byte-order-marker, fix-encoding-pragma: their commands are gone, their stale
+# modules still ship in the wheel); the definitions of the seven above, in its
+# .pre-commit-hooks.yaml, and their programs are unchanged (the only code change is
+# `Sequence` imported from collections.abc). The test below fails on any change of the
+# pin, 6.0.1 included: check the new release the same way (no hook used here removed,
+# renamed or redefined), then move this line with the pin.
+HYGIENE_HOOKS_VERSION = "6.0.0"
 SELECTING = (
     "types",
     "types_or",
@@ -122,9 +132,24 @@ def test_every_hook_is_local_and_runs_a_program_of_the_dev_lock() -> None:
     assert {hook["entry"].split()[0] for hook in hooks.values()} == set(PACKAGES)
 
 
-def test_the_hygiene_hooks_are_at_the_version_they_replaced() -> None:
-    """pre-commit-hooks v5.0.0 was the remote `rev:`; its hook definitions are copied."""
-    assert _dev_pins()["pre-commit-hooks"] == "5.0.0"
+def test_the_hygiene_hooks_are_at_the_version_their_definitions_were_checked_against() -> None:
+    """A new pre-commit-hooks major can remove or redefine a hook: it is checked by hand."""
+    assert _dev_pins()["pre-commit-hooks"] == HYGIENE_HOOKS_VERSION
+    # The configuration says which release its hooks are written from.
+    config = (ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+    assert f"pre-commit-hooks v{HYGIENE_HOOKS_VERSION}" in config
+
+
+def test_the_installed_hygiene_package_provides_every_hook_program() -> None:
+    """The dev lock is installed (CI's Python job): each hook's program is one of its commands."""
+    assert metadata.version("pre-commit-hooks") == HYGIENE_HOOKS_VERSION
+    commands = {
+        point.name
+        for point in metadata.distribution("pre-commit-hooks").entry_points
+        if point.group == "console_scripts"
+    }
+    programs = {entry for entry, package in PACKAGES.items() if package == "pre-commit-hooks"}
+    assert programs <= commands, programs - commands
 
 
 def test_ci_runs_pre_commit_from_the_hashed_dev_lock() -> None:

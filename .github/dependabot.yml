@@ -53,6 +53,22 @@ updates:
       python-security:
         applies-to: security-updates
         patterns: ["*"]
+    # bcrypt stays below 4.1, as requirements.in pins it. Passwords are hashed
+    # through passlib 1.7.4 (app/auth/passwords.py), whose bcrypt extra has no
+    # upper bound: bcrypt 4.1.0 raises a TypeError under it, 4.1.3 to 4.3.x
+    # work but log a trapped error reading `bcrypt.__about__` in each process,
+    # and bcrypt 5 refuses the password longer than 72 bytes that passlib
+    # probes it with at its first hash, so every login fails (Dependabot PR
+    # #352 failed CI this way). passlib has had no release since 2020.
+    # A `versions` ignore also suppresses Dependabot's security updates for
+    # bcrypt >= 4.1: until passlib is replaced, a bcrypt advisory is handled
+    # by hand. This lifts when a separate pull request replaces passlib by
+    # direct calls to bcrypt (existing $2b$ hashes stay valid; passwords over
+    # 72 bytes then need handling of our own) and removes this entry.
+    # tests/unit/test_hashed_lock_files.py holds it.
+    ignore:
+      - dependency-name: bcrypt
+        versions: [">=4.1"]
 
   # ────────────────────────────── Docker ────────────────────────────────
   # One block per Dockerfile directory — Dependabot doesn't follow nested
