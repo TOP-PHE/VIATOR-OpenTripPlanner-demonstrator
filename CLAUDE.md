@@ -7,7 +7,17 @@ Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `do
 (module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
 traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
 
-Last updated: 2026-09-04. §2/§3/§5/§7 curated through #245; #206–#227 triaged in the same pass.
+Last updated: 2026-10-11 (rule "no query string and no token path in logs or spans", #346). §2/§3/§5/§7
+curated through #245; #206–#227 triaged in the same pass.
+
+**Rule: no query string and no token path in logs or spans.** Any URL that reaches a log line or an
+OpenTelemetry span goes through `app/url_redaction.py` (already wired: uvicorn access filter,
+structlog processor `redact_urls`, worker `RedactingFormatter`, `RedactingSpanExporter`; nginx mirrors
+it with the `viator_redacted` log format and `error_log … crit`). Never log a URL around that path,
+never add a secret-bearing or typed parameter to `SAFE_QUERY_KEYS`, and give a new route with a token
+in its path its prefix in `TOKEN_PATH_PREFIXES` and in nginx's maps; after editing `nginx.conf`, restart
+the nginx container (`nginx -s reload` keeps the old single-file mount). Put a secret or typed text in a
+request body or header, never in a URL (`docs/architecture.md` ch. 9 traps, admin-guide §5.4).
 
 **Read §7 items 1 and 2 before writing any coverage code.** `main` currently ships one PR whose own
 title says DO NOT MERGE, and endpoint-UIC matching has never worked in production.
@@ -180,6 +190,8 @@ app/
 ├── config_schema.py                     CONFIG_SCHEMA — 14 COVERAGE_* keys + OTP/OJP/HAFAS/fanout
 ├── config_service.py                    get_all(db) with 30s in-process cache
 ├── sessions_orchestrator.py             MOTIS/OTP docker container lifecycle (per-session); both templates carry viator.autoheal="true"
+├── url_redaction.py                     The one rule for URLs in logs/spans (query values outside SAFE_QUERY_KEYS and
+│                                        token path segments → REDACTED); used by logging_config, worker and tracing
 ├── api/
 │   ├── admin/network_coverage.py        Coverage matrix API (runs, results, cell-trips, verify-external, export,
 │   │                                    stop, delete). Also hosts _build_export_context / _build_cell_trips_response /

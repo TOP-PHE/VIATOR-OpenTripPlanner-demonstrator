@@ -35,6 +35,17 @@ Sampling:
     (e.g. 10%) configured via OTEL_TRACES_SAMPLER env var. Documented
     in admin-guide §5.5.
 
+No query string leaves in a span (follow-up of #339): every span goes
+through `RedactingSpanExporter` before the OTLP exporter, which passes the
+URL attributes of the FastAPI (inbound) and httpx (outbound) spans —
+`http.url`, `url.full`, `http.target`, `url.query`, … — through
+`app.url_redaction`, and every other string (span name, status
+description, exception message and stack trace of a span event) through
+`redact_text`. Header attributes, which the instrumentations record only
+when an `OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_*` variable asks, are
+replaced whole. The SQLAlchemy spans carry the statement with its bound
+parameters as placeholders, never the values.
+
 Disabled by default in test environments — the OTLP exporter would
 try to dial `tempo:4317` from every TestClient call and pollute test
 output with connection errors. Enabled when `OTEL_EXPORTER_OTLP_ENDPOINT`
@@ -45,13 +56,122 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Final
+
+from opentelemetry.sdk.trace import Event, ReadableSpan
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.trace import Link, Status
+
+from .url_redaction import REDACTED, redact_query, redact_text, redact_url
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from sqlalchemy.engine import Engine
 
 log = logging.getLogger(__name__)
+
+# Attributes whose whole value is a URL, a path with its query, or a query.
+_URL_ATTRIBUTES: Final[frozenset[str]] = frozenset(
+    {"http.url", "url.full", "http.target", "url.path", "url.original"}
+)
+_QUERY_ATTRIBUTES: Final[frozenset[str]] = frozenset({"url.query"})
+_HEADER_ATTRIBUTE_PREFIXES: Final[tuple[str, ...]] = (
+    "http.request.header.",
+    "http.response.header.",
+)
+
+
+def _redact_value(key: str, value: Any) -> Any:
+    """One attribute value, made safe to export. Non-strings pass unchanged;
+    a sequence of strings is redacted item by item."""
+    if isinstance(value, (tuple, list)):
+        return tuple(_redact_value(key, v) for v in value)
+    if not isinstance(value, str):
+        return value
+    if key.startswith(_HEADER_ATTRIBUTE_PREFIXES):
+        return REDACTED
+    if key in _QUERY_ATTRIBUTES:
+        return redact_query(value)
+    if key in _URL_ATTRIBUTES:
+        return redact_url(value)
+    return redact_text(value)
+
+
+def redact_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
+    """A copy of span or event `attributes` with every value made safe."""
+    return {k: _redact_value(k, v) for k, v in (attributes or {}).items()}
+
+
+def redact_span(span: ReadableSpan) -> ReadableSpan:
+    """A copy of a finished `span` in which no URL query string, token
+    path, URL user info or header value survives (app/url_redaction.py)."""
+    status = span.status
+    if status.description:
+        status = Status(status.status_code, redact_text(status.description))
+    return ReadableSpan(
+        name=redact_text(span.name),
+        context=span.context,
+        parent=span.parent,
+        resource=span.resource,
+        attributes=redact_attributes(span.attributes),
+        events=[Event(e.name, redact_attributes(e.attributes), e.timestamp) for e in span.events],
+        links=[Link(link.context, redact_attributes(link.attributes)) for link in span.links],
+        kind=span.kind,
+        status=status,
+        start_time=span.start_time,
+        end_time=span.end_time,
+        instrumentation_scope=span.instrumentation_scope,
+    )
+
+
+def strip_span(span: ReadableSpan) -> ReadableSpan:
+    """A copy of `span` that keeps only its identity, timing, kind, status
+    code and non-string attributes: what is exported when `redact_span`
+    fails, so one bad span neither leaks nor costs the batch."""
+    attributes = {
+        k: v for k, v in (span.attributes or {}).items() if isinstance(v, (bool, int, float))
+    }
+    return ReadableSpan(
+        name=REDACTED,
+        context=span.context,
+        parent=span.parent,
+        resource=span.resource,
+        attributes=attributes,
+        kind=span.kind,
+        status=Status(span.status.status_code),
+        start_time=span.start_time,
+        end_time=span.end_time,
+        instrumentation_scope=span.instrumentation_scope,
+    )
+
+
+def _redact_or_strip(span: ReadableSpan) -> ReadableSpan:
+    try:
+        return redact_span(span)
+    except Exception as exc:  # any failure: never export the raw span
+        # The type only: the message could quote the value that failed.
+        log.warning("tracing.redaction_failed", extra={"error_type": type(exc).__name__})
+        return strip_span(span)
+
+
+class RedactingSpanExporter(SpanExporter):
+    """A SpanExporter that hands `redact_span` copies to the exporter it
+    wraps. It sits between the BatchSpanProcessor and the OTLP exporter, so
+    whatever an instrumentation records — today's FastAPI, httpx and
+    SQLAlchemy spans, or a new one — is redacted on its way out."""
+
+    def __init__(self, inner: SpanExporter) -> None:
+        self._inner = inner
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        return self._inner.export([_redact_or_strip(s) for s in spans])
+
+    def shutdown(self) -> None:
+        self._inner.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._inner.force_flush(timeout_millis)
 
 
 def setup_tracing(*, service_name: str = "viator-web") -> None:
@@ -75,9 +195,10 @@ def setup_tracing(*, service_name: str = "viator-web") -> None:
         )
         return
 
-    # Lazy imports — the OTel packages are ~12 MB and not needed on a
-    # test run that doesn't exercise tracing. Importing inside the
-    # function keeps test startup snappy.
+    # Lazy imports — the exporter and the instrumentations are not needed
+    # on a test run that doesn't exercise tracing. Importing inside the
+    # function keeps test startup snappy. (The SDK's span types, imported
+    # at the top, are what RedactingSpanExporter is built from.)
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -95,8 +216,10 @@ def setup_tracing(*, service_name: str = "viator-web") -> None:
 
     # 2. OTLP exporter shipping to Tempo over gRPC. `insecure=True`
     #    because tempo:4317 is on the docker bridge network, no TLS.
+    #    Wrapped so that no URL query string, token path or header value
+    #    leaves the process (see RedactingSpanExporter).
     exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(exporter))
+    provider.add_span_processor(BatchSpanProcessor(RedactingSpanExporter(exporter)))
 
     trace.set_tracer_provider(provider)
 
