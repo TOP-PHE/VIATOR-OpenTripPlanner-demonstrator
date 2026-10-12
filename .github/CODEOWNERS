@@ -25,6 +25,8 @@
 /pyproject.toml                  @TOP-PHE
 /requirements.txt                @TOP-PHE
 /requirements-dev.txt            @TOP-PHE
+/requirements*.in                @TOP-PHE
+/requirements-build.txt          @TOP-PHE
 /alembic/                        @TOP-PHE
 
 # ─────────────────────── audit & docs ──────────────────
