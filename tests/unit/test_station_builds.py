@@ -557,10 +557,11 @@ def test_a_status_line_and_headers_trickled_are_cut_at_the_deadline(
     monkeypatch.setattr(
         settings, "station_module_url", f"http://127.0.0.1:{server.getsockname()[1]}"
     )
+    calls = sb._Calls(None)
     started = time.monotonic()
     try:
         with pytest.raises(sb._Transient) as caught:
-            sb._Calls(None).state(BUILD, 1.0)
+            calls.state(BUILD, 1.0)
     finally:
         stop.set()
         thread.join(timeout=5)
