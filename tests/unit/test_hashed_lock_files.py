@@ -189,42 +189,147 @@ def test_the_lock_python_is_the_image_python() -> None:
 # ── every install reads a lock ────────────────────────────────────────────────────────────
 
 
-def _pip_installs() -> list[tuple[str, str]]:
-    """Every line that runs `pip install`, in the workflows and the Dockerfiles."""
+# Any command that installs Python packages: pip (also as `python -m pip`), pipx, uv's
+# own installers and uvx. Only `pip install` from a lock is allowed (below); `uv pip
+# compile`, which installs nothing, is not matched.
+_INSTALLER = re.compile(r"\bpip3? install\b|\bpipx\b|\buv(?:\.exe)? (?:pip|tool) install\b|\buvx\b")
+# The variables and options that send pip or uv to another package index.
+_INDEX_SETTING = re.compile(
+    r"(?<![\w-])(PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|UV_INDEX_URL|UV_EXTRA_INDEX_URL|UV_DEFAULT_INDEX"
+    r"|UV_INDEX|--index-url|--extra-index-url|--default-index|--index)\b(?:[\s:=\"']+(\S*))?"
+)
+PYPI = "https://pypi.org/simple"
+# Folders that are not the repository's own files.
+_NOT_OURS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+
+
+def _joined(text: str) -> list[str]:
+    """The lines of a script or Dockerfile, a line ending in `\\` joined to the next one,
+    comment lines left out."""
+    lines = re.sub(r"\s*\\\n\s*", " ", text).splitlines()
+    return [line.strip() for line in lines if not line.strip().startswith("#")]
+
+
+def _dockerfiles() -> list[Path]:
+    return sorted(
+        path
+        for path in ROOT.glob("**/Dockerfile*")
+        if path.is_file() and not _NOT_OURS & set(path.relative_to(ROOT).parts)
+    )
+
+
+def _command_lines() -> list[tuple[str, str]]:
+    """Every command line of the workflows' `run:` scripts and of every Dockerfile."""
     found: list[tuple[str, str]] = []
     for path in _workflows():
         for script in _run_scripts(yaml.safe_load(path.read_text(encoding="utf-8"))):
-            found += [(path.name, line.strip()) for line in script.splitlines()]
-    for dockerfile in sorted(ROOT.glob("docker/*/Dockerfile")):
-        joined = re.sub(r"\s*\\\n\s*", " ", dockerfile.read_text(encoding="utf-8"))
-        found += [(dockerfile.parent.name, line.strip()) for line in joined.splitlines()]
-    return [(where, line) for where, line in found if re.search(r"\bpip3? install\b", line)]
+            found += [(path.name, line) for line in _joined(script)]
+    for dockerfile in _dockerfiles():
+        where = dockerfile.relative_to(ROOT).as_posix()
+        found += [(where, line) for line in _joined(dockerfile.read_text(encoding="utf-8"))]
+    return found
+
+
+def _pip_installs() -> list[tuple[str, str]]:
+    """Every line that installs Python packages, in the workflows and the Dockerfiles."""
+    return [(where, line) for where, line in _command_lines() if _INSTALLER.search(line)]
+
+
+# The one allowed form: `pip install` with the flags, one lock, at the end of the line.
+_LOCKED_INSTALL = re.compile(rf"^(?:RUN )?(?:\S+ )*?pip install {re.escape(INSTALL)} (\S+)$")
+
+
+def _is_locked_install(line: str) -> bool:
+    found = _LOCKED_INSTALL.search(line)
+    return bool(
+        found
+        # The Dockerfile reads the build lock where its bind mount puts it.
+        and found[1].split("/")[-1] in LOCKS.values()
+        # One install a line, and pip the only installer on it.
+        and _INSTALLER.findall(line) == ["pip install"]
+    )
 
 
 def test_every_pip_install_reads_a_lock_with_its_hashes_and_wheels_only() -> None:
     installs = _pip_installs()
-    command = re.compile(rf"pip install {re.escape(INSTALL)} (\S+)$")
-    loose = [
-        (where, line)
-        for where, line in installs
-        # The Dockerfile reads the build lock where its bind mount puts it.
-        if not ((found := command.search(line)) and found[1].split("/")[-1] in LOCKS.values())
-    ]
-    assert loose == []
+    assert [(where, line) for where, line in installs if not _is_locked_install(line)] == []
     assert sorted(installs) == sorted(
         [
             ("ci.yml", f"python -m pip install {INSTALL} requirements-build.txt"),
             ("ci.yml", f"pip install {INSTALL} requirements-dev.txt"),
             ("ci.yml", f"pip install {INSTALL} requirements-dev.txt"),
             (
-                "web",
+                "docker/web/Dockerfile",
                 "RUN --mount=type=bind,source=requirements-build.txt,"
                 "target=/tmp/requirements-build.txt "
                 f"pip install {INSTALL} /tmp/requirements-build.txt",
             ),
-            ("web", f"RUN pip install {INSTALL} requirements.txt"),
+            ("docker/web/Dockerfile", f"RUN pip install {INSTALL} requirements.txt"),
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("script", "caught"),
+    [
+        pytest.param(f"pip install {INSTALL} requirements.txt", False, id="the-rule"),
+        pytest.param(f"python -m pip \\\n  install {INSTALL} zz.txt", True, id="not-a-lock"),
+        pytest.param("python -m pip \\\n  install zz-one", True, id="split-line"),
+        pytest.param("RUN pipx install zz-one", True, id="pipx"),
+        pytest.param("uv tool install zz-one", True, id="uv-tool"),
+        pytest.param("uvx zz-one", True, id="uvx"),
+        pytest.param("uv pip install zz-one", True, id="uv-pip"),
+        pytest.param(
+            f"uv pip install {INSTALL} requirements.txt", True, id="uv-pip-with-the-flags"
+        ),
+        pytest.param(
+            f"pip install {INSTALL} requirements.txt && pip install zz-one",
+            True,
+            id="two-on-a-line",
+        ),
+        pytest.param(
+            "python -m uv pip compile zz.in -o zz.txt", False, id="compile-installs-nothing"
+        ),
+    ],
+)
+def test_the_install_rule_reads_what_it_should(script: str, caught: bool) -> None:
+    """The reader of the test above, on invented lines."""
+    lines = [line for line in _joined(script) if _INSTALLER.search(line)]
+    assert any(not _is_locked_install(line) for line in lines) == caught
+
+
+def _other_indexes(text: str) -> list[tuple[str, str]]:
+    """Each setting of an index in `text` whose value is not PyPI's (or is not given)."""
+    settings = [(found[1], found[2] or "") for found in _INDEX_SETTING.finditer(text)]
+    return [(name, value) for name, value in settings if value.strip("\"'").rstrip("/") != PYPI]
+
+
+def test_no_workflow_or_dockerfile_points_pip_or_uv_at_another_index() -> None:
+    """PyPI only: the locks were compiled against it, and an extra index lets a package of
+    the same name and a higher version from elsewhere into a later compile."""
+    found: list[tuple[str, str, str]] = []
+    for path in [*_workflows(), *_dockerfiles()]:
+        text = "\n".join(_joined(path.read_text(encoding="utf-8")))
+        found += [(path.name, name, value) for name, value in _other_indexes(text)]
+    assert found == []
+
+
+@pytest.mark.parametrize(
+    ("text", "caught"),
+    [
+        pytest.param("ENV PIP_EXTRA_INDEX_URL=https://zz.invalid/simple", True, id="pip-extra"),
+        pytest.param("ENV PIP_INDEX_URL https://zz.invalid/simple", True, id="pip-index"),
+        pytest.param("  UV_INDEX_URL: ${{ vars.ZZ }}", True, id="uv-index"),
+        pytest.param('UV_EXTRA_INDEX_URL="https://zz.invalid"', True, id="uv-extra"),
+        pytest.param("pip install --extra-index-url https://zz.invalid zz", True, id="option"),
+        pytest.param(f"ENV PIP_INDEX_URL={PYPI}/", False, id="pypi-allowed"),
+        pytest.param(f'UV_INDEX_URL: "{PYPI}"', False, id="pypi-quoted-allowed"),
+        pytest.param(f"ENV PIP_INDEX_URL={PYPI}.zz.invalid", True, id="pypi-lookalike"),
+        pytest.param("ENV PIP_NO_CACHE_DIR=1", False, id="other-variable"),
+    ],
+)
+def test_the_index_rule_reads_what_it_should(text: str, caught: bool) -> None:
+    assert bool(_other_indexes(text)) == caught
 
 
 def test_the_build_lock_is_mounted_never_copied_into_the_image() -> None:
@@ -254,7 +359,10 @@ def test_the_lock_check_runs_right_after_the_install_and_compiles_as_documented(
     assert f"for name in {' '.join(names)}; do" in script
     assert '--emit-build-options "$name.in" -c "$pins" -o "$fresh"' in script
     one_line = re.sub(r"\s*\\\n\s*", " ", script)
-    assert one_line.count(COMPILE.replace("compile", "compile --quiet") + ' "$name.in"') == 1
+    # `python -m uv`: the uv of the lock, installed in this Python, never another on PATH.
+    compile_quiet = "python -m " + COMPILE.replace("compile", "compile --quiet")
+    assert one_line.count(compile_quiet + ' "$name.in"') == 1
+    assert re.findall(r"(?<!-m )\buv pip\b", one_line) == []
 
     # After the install, which brings the uv it runs, and before every other tool.
     names_in_order = [step.get("name") for step in _python_steps()]
@@ -267,11 +375,14 @@ def test_the_lock_check_runs_right_after_the_install_and_compiles_as_documented(
         assert f"{COMPILE} {source} -o {lock}" in spec, source
 
 
-# The stand-in for uv: it writes the committed lock again, as uv does when the source asks
+# The stand-in for `python -m uv` (a `python` first on PATH): it writes the committed lock again, as uv does when the source asks
 # for nothing the lock's versions (its constraints) do not give, unless told to write
 # something else, or to fail as uv fails when the source and the versions disagree.
 _FAKE_UV = """#!/usr/bin/env bash
 set -euo pipefail
+# Only `python -m uv ...`: the step must run the uv of the lock.
+if [ "${1:-}" != "-m" ] || [ "${2:-}" != "uv" ]; then echo "zz: not python -m uv" >&2; exit 4; fi
+shift 2
 printf '%s\\n' "$*" >> "$ZZ_CALLS"
 out=""
 previous=""
@@ -299,7 +410,7 @@ def _run_lock_check(
     tmp_path: Path, locks: dict[str, str | None], change: str
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path]:
     """Run the CI step's script in a folder holding `locks` (None: no such file), with
-    the stand-in for uv first on PATH, as GitHub runs a `run:` (bash -eo pipefail)."""
+    the stand-in for `python -m uv` first on PATH, as GitHub runs a `run:` (bash -eo pipefail)."""
     folder = tmp_path / "repository"
     folder.mkdir()
     for lock, content in locks.items():
@@ -307,7 +418,7 @@ def _run_lock_check(
             (folder / lock).write_text(content, encoding="utf-8", newline="\n")
     tools = tmp_path / "tools"
     tools.mkdir()
-    uv = tools / "uv"
+    uv = tools / "python"
     uv.write_text(_FAKE_UV, encoding="utf-8", newline="\n")
     uv.chmod(0o755)
     script = tmp_path / "step.sh"
