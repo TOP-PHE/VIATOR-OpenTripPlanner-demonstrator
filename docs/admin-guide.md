@@ -2445,7 +2445,8 @@ VIATOR can take its journey-page station suggestions from the Multimodal
 Station Mapping module (MSMM), a separate service on the same Docker network.
 It is optional: **VIATOR works without it.**
 
-Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
+Two settings in `/opt/viator/docker/.env`, read by the `web` and `worker`
+containers (the worker since MSMM decision 6, 11.3):
 
 | Setting | Value |
 |---|---|
@@ -2484,12 +2485,18 @@ Two settings in `/opt/viator/docker/.env`, read by the `web` container only:
   `station_module.lookup_failed`, `station_module.near_failed` and
   `station_module.admin_search_failed`, and never start the 30 seconds
   without calls.
-- **After changing either setting**, recreate the `web` container so it reads
-  the new environment, from `/opt/viator/docker`:
-  `sudo docker compose up -d --force-recreate web`. A
-  `docker compose restart web` keeps the old environment.
+- **After changing either setting**, recreate the `web` **and `worker`**
+  containers so they read the new environment, from `/opt/viator/docker`,
+  when no graph build is running (the Sessions page shows none "running":
+  recreating `worker` stops a build in progress):
+  `sudo docker compose up -d --force-recreate web worker`. A
+  `docker compose restart` keeps the old environment. A `worker` left on an
+  old token is refused (403) once the module drops that token, and then
+  builds its MOTIS graphs without waiting for the station build, with a
+  warning (11.3). The module's runbook says the same in "Changer le jeton"
+  (before its step 3) and "Retirer, côté VIATOR".
 - **To stop using the module**, empty `STATION_MODULE_URL` and recreate `web`
-  the same way.
+  and `worker` the same way.
 
 ### 11.1 Who is the reference for a station (MSMM step 3)
 
@@ -2692,6 +2699,64 @@ codes, and your searches go on. When it is a limit of every call, all the
 buttons wait for the time the module gives. This needs a module that
 answers this call (MSMM v0.3.4 or later); with an older one the button
 says so ("needs MSMM v0.3.4 or later") and proposes nothing.
+
+### 11.3 A station build before each MOTIS graph build (MSMM decision 6)
+
+Before it builds the graph of a **MOTIS** session, the worker asks the
+module for a station build and waits until that build has ended, so that
+the graph is never built while the module's station reference changes
+(the module's design, 21.18; its runbook, « Les constructions demandées
+par VIATOR »). OTP builds do not wait.
+
+- **What the module answers.** A station build already queued or running
+  is the one VIATOR waits for, never a second one. When the module's five
+  input files have not changed since its last successful build, it answers
+  "up to date" at once and nothing is built. Otherwise it starts one build
+  at once. These builds show on the module's Sources screen with the
+  reason "requested by VIATOR's backend".
+- **How long.** The worker asks the module every 10 s, for 30 minutes at
+  most. The MOTIS build then starts. While the worker waits, the rebuild
+  job is `running` and no other rebuild starts (the worker runs one job at
+  a time), so a wait can delay the next rebuild by up to 30 minutes.
+- **The graph is always built.** When the module is unreachable, refuses
+  (no input files, a build asked for less than 30 minutes ago, a token
+  refused, a module older than these calls), reports a failed build, or
+  takes more than 30 minutes, the worker builds the graph all the same, on
+  the station reference the module last committed. A passing failure (the
+  module restarting, a 503, a call over 5 s) is asked again 10 s later
+  within the 30 minutes.
+- **Where you see it.** On the Sessions page, the rebuild card and the
+  history show one pill for the station build: "Waiting for the station
+  module build", "Station build done", "Station build up to date", or
+  "Station module unavailable — graph built on the last station build".
+  The job's log has the line behind it, with the module's build number
+  and, for "unavailable", the reason word:
+  `[viator] station-build=unavailable reason=no_inputs · …`. The
+  `worker` log has one line per wait: `station_build.ready
+  state=<done|up_to_date> build_id=<n>`, or at WARNING
+  `station_build.unavailable reason=<word> [build_id=<n>]`, where the word
+  is `failed`, `no_inputs`, `build_interval`, `token` (a 403), `unknown_build`
+  (a 404 on the build's state), `unreachable` (the request failed twice),
+  `timeout` (30 minutes), `shape` (an answer of the wrong form),
+  `status_<n>` (any other refusal of the request, such as `status_404` for a
+  module older than these calls) or `error`. Never the token.
+- **Cancel.** "✕ Cancel" on a job that waits stops it within 10 s; no graph
+  is built.
+- **Without the module** (`STATION_MODULE_URL` or `STATION_MODULE_TOKEN`
+  empty in the worker's environment) there is no wait and no pill: the
+  worker logs `station_build.skipped reason=off` at INFO and builds.
+- **Deploy order.** The module's version with these calls (MSMM PR #35)
+  first, then this VIATOR version. A VIATOR deployed first gets a 404 from
+  the older module, logs `station_build.unavailable reason=status_404`
+  and builds its graphs as before.
+- **On the server**, nothing beyond the usual deploy: the worker reads the
+  same two settings as `web` from the same `.env`, and
+  `bin/viator-deploy.sh` recreates `web` and `worker` on every deploy. To
+  check after the deploy, from `/opt/viator/docker`:
+  `grep -c STATION_MODULE docker-compose.yml` answers `4` (two lines for
+  `web`, two for `worker`), and
+  `docker exec viator-worker-1 python -c "from app import station_module; print(station_module.enabled())"`
+  answers `True` (it shows neither the address nor the token).
 
 ---
 
