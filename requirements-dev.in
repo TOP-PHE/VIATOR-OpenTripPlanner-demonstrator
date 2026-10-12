@@ -41,9 +41,11 @@ pip-audit==2.10.1
 # Pre-commit framework (also used in CI) and the package of its hygiene hooks.
 # Every hook is local (.pre-commit-config.yaml): it runs a program installed from
 # this lock, so pre-commit fetches no repository and installs nothing of its own.
-# pre-commit-hooks is at the version of the remote hooks it replaced (v5.0.0).
+# pre-commit-hooks replaced the remote hooks at v5.0.0. 6.0.0 removed only two hooks
+# VIATOR never used (check-byte-order-marker, fix-encoding-pragma) and left the seven
+# it runs as they were (tests/unit/test_dev_tool_pins_stay_in_step.py).
 pre-commit==4.6.2
-pre-commit-hooks==5.0.0
+pre-commit-hooks==6.0.0
 
 # The compiler of the lock files; CI runs it too, to check that each lock matches
 # its source (same version as the Multimodal Station Mapping module's lock files).

@@ -7,7 +7,7 @@
 # repository and pip-installs nothing of its own. Before, it cloned
 # pre-commit-hooks and ruff-pre-commit by tag (a tag can be moved) and
 # installed them with unpinned, unhashed dependencies. Each hook below is
-# written as its project defines it (pre-commit-hooks v5.0.0, ruff-pre-commit
+# written as its project defines it (pre-commit-hooks v6.0.0, ruff-pre-commit
 # at the ruff of the lock): the same program, the same kinds of file, the same
 # stages. `language: system` finds the programs on PATH, so run pre-commit from
 # the activated environment that holds requirements-dev.txt, as CI does.

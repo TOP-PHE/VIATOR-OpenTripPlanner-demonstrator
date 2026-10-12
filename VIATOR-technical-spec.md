@@ -1919,7 +1919,7 @@ Every Python package VIATOR installs comes from a hashed lock file. Each source 
 
 Every install is `pip install --require-hashes --only-binary :all: -r <lock>`: pip refuses a file whose hash is not in the lock and never builds a source archive (no package's build script runs). `tests/unit/test_hashed_lock_files.py` fails on any `pip install` in a workflow or Dockerfile that does otherwise.
 
-The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.18), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
+The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.24), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
 
 ```bash
 uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt
@@ -2141,7 +2141,7 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 
 ### 15.9 Pre-commit framework — what runs and when
 
-`.pre-commit-config.yaml` configures these hooks. Every hook is `repo: local`, `language: system`: it runs a program installed from the hashed lock `requirements-dev.txt` (15.2.5) — ruff, mypy, and the basic file checks of the `pre-commit-hooks` package (pinned at 5.0.0, the `rev:` the remote hooks had). So pre-commit clones no hook repository by a tag that can move and pip-installs nothing unhashed, and the hooks always run the versions CI runs: when Dependabot raises ruff in the lock, nothing else is bumped by hand (the drift of #336 cannot happen). Each hook is written as its project defines it (pre-commit-hooks v5.0.0, ruff-pre-commit): the same program, file types and stages; `tests/unit/test_dev_tool_pins_stay_in_step.py` holds these rules. Run pre-commit from the activated environment that holds the dev lock; CI's pre-commit job installs that lock:
+`.pre-commit-config.yaml` configures these hooks. Every hook is `repo: local`, `language: system`: it runs a program installed from the hashed lock `requirements-dev.txt` (15.2.5) — ruff, mypy, and the basic file checks of the `pre-commit-hooks` package (pinned at 6.0.0; the remote hooks had `rev:` v5.0.0, and 6.0.0 removed only `check-byte-order-marker` and `fix-encoding-pragma`, which VIATOR never ran). So pre-commit clones no hook repository by a tag that can move and pip-installs nothing unhashed, and the hooks always run the versions CI runs: when Dependabot raises ruff in the lock, nothing else is bumped by hand (the drift of #336 cannot happen). Each hook is written as its project defines it (pre-commit-hooks v6.0.0, ruff-pre-commit): the same program, file types and stages; `tests/unit/test_dev_tool_pins_stay_in_step.py` holds these rules. Run pre-commit from the activated environment that holds the dev lock; CI's pre-commit job installs that lock:
 
 | Hook | What it does | Auto-fix? |
 |---|---|---|
@@ -2244,8 +2244,8 @@ Python tool versions are the pins of `requirements-dev.in` (and `requirements.in
 | Security (deps) | pip-audit | 2.10.1 | command-line flags in `ci.yml` |
 | Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
 | Dockerfile lint | hadolint (via hadolint/hadolint-action) | v3.5.0 | `ignore:` list in `docker.yml` |
-| Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 5.0.0 | `.pre-commit-config.yaml` |
-| Lock files | uv (`uv pip compile`) | 0.12.18 | the commands of 15.2.5; checked by `ci.yml` |
+| Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 6.0.0 | `.pre-commit-config.yaml` |
+| Lock files | uv (`uv pip compile`) | 0.12.24 | the commands of 15.2.5; checked by `ci.yml` |
 | Migrations | Alembic | 1.20.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
 | Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.in` | `requirements-dev.in` |
