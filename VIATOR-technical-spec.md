@@ -1919,7 +1919,7 @@ Every Python package VIATOR installs comes from a hashed lock file. Each source 
 
 Every install is `pip install --require-hashes --only-binary :all: -r <lock>`: pip refuses a file whose hash is not in the lock and never builds a source archive (no package's build script runs). `tests/unit/test_hashed_lock_files.py` fails on any `pip install` in a workflow or Dockerfile that does otherwise.
 
-The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.18), installed by the dev lock. One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
+The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.18), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
 
 ```bash
 uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt

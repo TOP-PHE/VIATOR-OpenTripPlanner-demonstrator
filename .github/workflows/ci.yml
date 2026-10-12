@@ -74,14 +74,15 @@ jobs:
           pip install --require-hashes --only-binary :all: -r requirements-dev.txt
 
       # Each lock file is compiled again from its source with the uv the dev
-      # lock pins and the command of 15.2.5, and must come out the same. The
-      # versions the lock holds are given as constraints, never the lock itself:
-      # uv keeps the hashes of a lock it is given as they are, while it asks the
-      # package index for those of a new file. So a package added to a `.in`
-      # file and not locked, a pin raised and not locked, a version or a hash
-      # edited by hand, a lock missing or empty: each fails here, named, and
-      # every lock is checked before the step fails. Comments are left out of
-      # the comparison: they are uv's notes, not what pip reads.
+      # lock pins (`python -m uv`: the uv package of this Python, never another
+      # uv found first on PATH) and the command of 15.2.5, and must come out
+      # the same. The versions the lock holds are given as constraints, never
+      # the lock itself: uv keeps the hashes of a lock it is given as they are,
+      # while it asks the package index for those of a new file. So a package
+      # added to a `.in` file and not locked, a pin raised and not locked, a
+      # version or a hash edited by hand, a lock missing or empty: each fails
+      # here, named, and every lock is checked before the step fails. Comments
+      # are left out of the comparison: they are uv's notes, not what pip reads.
       - name: Lock files match their sources
         run: |
           set -euo pipefail
@@ -96,7 +97,7 @@ jobs:
               continue
             fi
             grep -E '^[a-z0-9-]+==' "$name.txt" | sed -e 's/ *\\$//' > "$pins"
-            if ! uv pip compile --quiet --universal --python-version 3.14 --generate-hashes \
+            if ! python -m uv pip compile --quiet --universal --python-version 3.14 --generate-hashes \
                 --emit-build-options "$name.in" -c "$pins" -o "$fresh"; then
               echo "::error::$name.in cannot be compiled to the versions of $name.txt (uv says why above). Never edit a lock file by hand: edit $name.in, run the compile command of VIATOR-technical-spec.md 15.2.5 and commit both files."
               stale=1
