@@ -66,6 +66,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from .url_redaction import SAFE_QUERY_KEYS
+
 if TYPE_CHECKING:
     import httpx
 
@@ -208,6 +210,14 @@ def validate_param_name(auth_type: AuthType, raw: str | None) -> str | None:
         )
     if name is not None and len(name) > 80:
         raise ValueError("param_name longer than 80 chars")
+    if auth_type == "query" and name is not None and name.lower() in SAFE_QUERY_KEYS:
+        # Logs and spans keep the value of these parameters on the requests
+        # VIATOR receives (app/url_redaction.py): a secret must never bear
+        # one of their names.
+        raise ValueError(
+            f"param_name {name!r} is reserved: VIATOR's logs keep the value of "
+            "this query parameter on the requests it receives"
+        )
     return name
 
 

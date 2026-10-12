@@ -271,3 +271,23 @@ class TestKeyDerivation:
         k1 = _derive_key("test-secret")
         k2 = _derive_key(b"test-secret")
         assert k1 == k2
+
+
+@pytest.mark.parametrize("name", ["session", "PAGE", "Since", "limit", " status "])
+def test_a_query_credential_cannot_bear_an_allow_listed_name(name: str) -> None:
+    """app/url_redaction.py keeps these values on inbound request targets;
+    a query secret must never be called like them."""
+    from app.credentials import validate_param_name
+
+    with pytest.raises(ValueError, match="reserved"):
+        validate_param_name("query", name)
+
+
+def test_every_allow_listed_name_is_refused_for_query_only() -> None:
+    from app.credentials import validate_param_name
+    from app.url_redaction import SAFE_QUERY_KEYS
+
+    for name in SAFE_QUERY_KEYS:
+        with pytest.raises(ValueError, match="reserved"):
+            validate_param_name("query", name)
+        assert validate_param_name("header", name) == name
