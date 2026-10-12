@@ -115,6 +115,24 @@ def test_rank_hubs_deterministic_tie_break_on_uic():
     assert fp.rank_hubs({"a", "b"}, coords, "o", "d") == ["a", "b"]
 
 
+def test_rank_hubs_one_character_destination_matches_no_longer_hub():
+    """A 1-character destination code has no 2-digit country: hubs that
+    merely start with that character stay in the other-country tier, so
+    the nearer hub still ranks first."""
+    coords = {
+        "99o": (0.0, 0.0),
+        "9": (0.0, 2.0),
+        "99001": (1.0, 1.0),  # starts with "9", but off the line
+        "88001": (0.0, 1.0),  # on the line
+    }
+    assert fp.rank_hubs({"99001", "88001"}, coords, "99o", "9") == ["88001", "99001"]
+
+
+def test_uic_country_is_the_first_two_characters():
+    assert fp._uic_country("8500010") == "85"
+    assert fp._uic_country("9") == "9"
+
+
 def test_rank_hubs_prefers_destination_country_over_lower_detour():
     # Paris (FR) -> Fribourg (CH). Besancon (FR, 87) is geometrically closer to
     # the straight line (lower detour) than Basel (CH, 85), but cutting in France

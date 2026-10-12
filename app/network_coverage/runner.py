@@ -147,6 +147,18 @@ _END_OF_DAY_SENTINEL = "24:00"
 _VERIFY_STATUSES = ("no_route", "timeout", "error")
 
 
+def _elapsed_ms(start: float) -> int:
+    """Milliseconds since `start`, a `time.monotonic()` reading."""
+    return int((time.monotonic() - start) * 1000)
+
+
+def _failure_status(exc: BaseException) -> str:
+    """Cell status for a failed query: "timeout" when the exception class
+    names a timeout (httpx.ReadTimeout, asyncio.TimeoutError, ...), so the
+    matrix colours it apart from a generic "error"."""
+    return "timeout" if "timeout" in type(exc).__name__.lower() else "error"
+
+
 @dataclass(frozen=True)
 class CoverageConfig:
     """Snapshot of operator-tunable runner knobs, read once at
@@ -1740,7 +1752,7 @@ async def _execute_pair(
 
     try:
         raw, trips = await _call_with_connect_retry(_fetch)
-        response_ms = int((time.monotonic() - started) * 1000)
+        response_ms = _elapsed_ms(started)
         num_itineraries = len(trips)
         if trips:
             status = "ok"
@@ -1756,10 +1768,10 @@ async def _execute_pair(
         else:
             status = "no_route"
     except Exception as exc:  # broad: persist as "error" + message
-        response_ms = int((time.monotonic() - started) * 1000)
+        response_ms = _elapsed_ms(started)
         # Distinguish timeout from generic error for the matrix colouring.
         cls_name = type(exc).__name__
-        status = "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
+        status = _failure_status(exc)
         error_message = f"{cls_name}: {exc}"[:500]
         log.warning(
             "coverage run %s pair %s→%s failed: %s",
@@ -1923,15 +1935,13 @@ async def _query_one_session_for_pair(
 
     try:
         raw, trips = await _call_with_connect_retry(_fetch)
-        response_ms = int((time.monotonic() - sub_start) * 1000)
+        response_ms = _elapsed_ms(sub_start)
         sub_status = "ok" if trips else "no_route"
         return sid, sub_status, raw, trips, response_ms
     except Exception as exc:
-        response_ms = int((time.monotonic() - sub_start) * 1000)
+        response_ms = _elapsed_ms(sub_start)
         cls_name = type(exc).__name__
-        sub_status = (
-            "timeout" if "Timeout" in cls_name or "timeout" in cls_name.lower() else "error"
-        )
+        sub_status = _failure_status(exc)
         log.warning(
             "coverage run %s pair %s→%s session %s failed: %s: %s",
             run_id,
@@ -2214,7 +2224,7 @@ async def _execute_pair_fanout(
         if by_signature
         else None
     )
-    response_ms = int((time.monotonic() - pair_start) * 1000)
+    response_ms = _elapsed_ms(pair_start)
 
     journey_search_id, error_message = _record_fanout_journey_search(
         run_id=run_id,

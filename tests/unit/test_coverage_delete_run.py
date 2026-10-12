@@ -67,8 +67,10 @@ def test_delete_endpoint_404_when_run_unknown():
     db = MagicMock()
     db.get.return_value = None
 
+    run_id = uuid.uuid4()
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
-        api.delete_run(run_id=uuid.uuid4(), db=db, _=_fake_actor())
+        api.delete_run(run_id=run_id, db=db, _=actor)
 
     assert exc.value.status_code == 404
     db.delete.assert_not_called()
@@ -82,8 +84,9 @@ def test_delete_endpoint_409_when_run_running():
     db = MagicMock()
     db.get.return_value = run
 
+    actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
-        api.delete_run(run_id=run.id, db=db, _=_fake_actor())
+        api.delete_run(run_id=run.id, db=db, _=actor)
 
     assert exc.value.status_code == 409
     db.delete.assert_not_called()

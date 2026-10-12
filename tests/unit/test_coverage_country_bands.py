@@ -87,7 +87,8 @@ def test_matrix_uses_fixed_table_layout_with_colgroup(live_text: str):
     assert "table-layout: fixed" in live_text
     assert "width: max-content" in live_text
     assert re.search(r"const colgroup = ", live_text)
-    assert "--cov-hub-label-w" in live_text and "--cov-data-col-w" in live_text
+    assert "--cov-hub-label-w" in live_text
+    assert "--cov-data-col-w" in live_text
 
 
 def test_matrix_hub_label_ellipsis_applies_to_header_row_too(live_text: str):
@@ -142,7 +143,8 @@ def test_export_matrix_uses_fixed_table_layout_with_colgroup(export_text: str):
     assert "table-layout: fixed" in export_text
     assert "width: max-content" in export_text
     assert "<colgroup>" in export_text
-    assert "--axis-row-w" in export_text and "--data-col-w" in export_text
+    assert "--axis-row-w" in export_text
+    assert "--data-col-w" in export_text
 
 
 def test_export_matrix_tbody_sticky_cells_have_explicit_z_index(export_text: str):
