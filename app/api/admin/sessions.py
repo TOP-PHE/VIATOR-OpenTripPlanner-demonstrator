@@ -52,6 +52,7 @@ from ... import (
     nap_source_map,
     sessions_orchestrator,
     staleness,
+    station_builds,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -2634,6 +2635,12 @@ class RebuildJobResponse(BaseModel):
     max_memory: bool = False  # v0.1.38 — job ran (or will run) in max-memory mode
     # A running job whose cancel the worker has not acted on yet.
     cancel_requested: bool = False
+    # The station module's build a MOTIS graph build waits for (MSMM decision
+    # 6): the last step the worker recorded in the log (`waiting`, `done`,
+    # `up_to_date`, `unavailable`, `cancelled`) and its fixed sentence; None
+    # when the job did not wait (OTP, or the module not configured).
+    station_build: str | None = None
+    station_build_text: str | None = None
 
 
 class OsmCountryRow(BaseModel):
@@ -2940,6 +2947,7 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
         duration_seconds = int((j.finished_at - j.started_at).total_seconds())
 
     classification = _classify_rebuild_log(j.log)
+    station_build = station_builds.status_from_log(j.log)
 
     return RebuildJobResponse(
         id=str(j.id),
@@ -2955,6 +2963,8 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
         cache_hit=classification["cache_hit"],
         max_memory=bool(j.max_memory),
         cancel_requested=j.cancel_requested_at is not None,
+        station_build=station_build[0] if station_build else None,
+        station_build_text=station_build[1] if station_build else None,
     )
 
 

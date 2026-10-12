@@ -2466,6 +2466,20 @@ function _renderMemPill(job) {
     : '';
 }
 
+// MSMM decision 6: a MOTIS graph build first waits for the station module's
+// build (at most 30 min). The worker records each step in the job's log; the
+// API gives the step's word and a fixed sentence, shown here as written.
+const _STATION_BUILD_FLAVOURS = {
+  waiting: 'running', done: 'cache-hit', up_to_date: 'cache-hit',
+  unavailable: 'cache-miss', cancelled: 'failed',
+};
+function _renderStationBuildPill(job) {
+  if (!job.station_build || !job.station_build_text) return '';
+  const flavour = _STATION_BUILD_FLAVOURS[job.station_build] || '';
+  return `<span class="rebuild-pill" data-flavour="${escAttr(flavour)}" ` +
+    `title="Station module build (MSMM) before the MOTIS graph">${escHTML(job.station_build_text)}</span>`;
+}
+
 // Cancel: pending jobs stop at once; running ones are flagged and the worker
 // kills the build container within ~10 s. The served graph is never touched.
 function _renderCancelControl(job) {
@@ -2535,6 +2549,7 @@ function _renderCurrentBuildCard(job) {
         ${servingPill}
         ${_renderCachePill(job.cache_hit)}
         ${_renderMemPill(job)}
+        ${_renderStationBuildPill(job)}
         ${durationCell}
         ${_renderCancelControl(job)}
         <span>· ${isRunning ? 'started' : 'built'} ${escHTML(_formatBuiltAt(isRunning ? job.started_at : builtAt))}</span>
@@ -2592,6 +2607,7 @@ function _renderHistoryItem(job) {
         ${_renderStatusPill(job.status)}
         ${_renderCachePill(job.cache_hit)}
         ${_renderMemPill(job)}
+        ${_renderStationBuildPill(job)}
         <code>${escHTML(versionLabel)}</code>
         ${_renderCancelControl(job)}
         <span>${escHTML(_formatBuiltAt(builtAt))}</span>

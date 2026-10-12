@@ -25,9 +25,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 
-from . import engine_versions, graph_snapshots, netex_calendar
+from . import engine_versions, graph_snapshots, netex_calendar, station_builds
 from .db import SessionLocal
 from .logging_config import quiet_http_client_loggers
 from .models import RebuildJob
@@ -408,14 +408,9 @@ def tick() -> None:
     )
     watcher.start()
     try:
-        if engine == "motis":
-            output, success, graph_path = run_build_motis(
-                session_id=sid, max_memory=max_memory, container_name=container
-            )
-        else:
-            output, success, graph_path = run_build(
-                session_id=sid, max_memory=max_memory, container_name=container
-            )
+        output, success, graph_path = _run_engine_build(
+            engine, job_id=job_id, session_id=sid, max_memory=max_memory, container=container
+        )
     finally:
         done.set()
         watcher.join(timeout=_CANCEL_POLL_SECONDS + 5)
@@ -483,6 +478,70 @@ def tick() -> None:
                 )
 
         db.commit()
+
+
+def _run_engine_build(
+    engine: str,
+    *,
+    job_id: uuid.UUID,
+    session_id: str | None,
+    max_memory: bool,
+    container: str,
+) -> tuple[str, bool, str]:
+    """The build of one job. A MOTIS graph is built after the station module's
+    build has ended (MSMM decision 6): the wait comes first, in this job's own
+    flow, and whatever ends it the graph is built, unless the operator
+    cancelled the job meanwhile."""
+    if engine == "motis":
+        waited = _wait_for_station_build(job_id)
+        if not waited.build_graph:
+            return "[viator] cancelled while waiting for the station module build\n", False, ""
+        return run_build_motis(
+            session_id=session_id, max_memory=max_memory, container_name=container
+        )
+    return run_build(session_id=session_id, max_memory=max_memory, container_name=container)
+
+
+def _note_station_build(job_id: uuid.UUID, line: str) -> None:
+    """Append one line of the station build wait to the job's log at once, so
+    the Sessions page shows the wait while it lasts. Appended in SQL: the web
+    app may append a cancel line to the same log meanwhile. Best-effort: a
+    failed write never stops the wait nor the build."""
+    try:
+        with SessionLocal() as db:
+            db.execute(
+                update(RebuildJob)
+                .where(RebuildJob.id == job_id)
+                .values(log=func.coalesce(RebuildJob.log, "") + line)
+            )
+            db.commit()
+    except Exception as exc:
+        log.warning("station build line not recorded for job %s (%s)", job_id, type(exc).__name__)
+
+
+def _wait_for_station_build(job_id: uuid.UUID) -> station_builds.WaitResult:
+    """Ask the station module for a build and wait for its end (at most 30
+    minutes), recording the wait on the job. Without the module configured,
+    nothing is recorded and nothing waits."""
+
+    def should_stop() -> bool:
+        try:
+            return _cancel_requested(job_id)
+        except Exception:
+            return False
+
+    def on_waiting(build_id: int) -> None:
+        _note_station_build(
+            job_id, station_builds.log_line(station_builds.WAITING, build_id=build_id)
+        )
+
+    waited = station_builds.wait_before_graph(should_stop=should_stop, on_waiting=on_waiting)
+    if waited.outcome != station_builds.OFF:
+        _note_station_build(
+            job_id,
+            station_builds.log_line(waited.outcome, build_id=waited.build_id, reason=waited.reason),
+        )
+    return waited
 
 
 def _final_status(*, success: bool, cancel_requested: bool) -> str:
