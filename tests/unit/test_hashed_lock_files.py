@@ -551,18 +551,21 @@ def test_dependabot_compiles_the_locks_with_uv() -> None:
     assert python["directory"] == "/"
 
 
-def test_dependabot_keeps_bcrypt_on_the_major_passlib_works_with() -> None:
-    """passlib 1.7.4 fails with bcrypt 5 (Dependabot PR #352): no major bump is proposed.
+def test_bcrypt_stays_below_4_1_while_passlib_hashes_the_passwords() -> None:
+    """passlib 1.7.4 needs bcrypt < 4.1; Dependabot proposes no bcrypt from 4.1 on.
 
-    Remove this test with the entry, in the pull request that drops passlib.
+    bcrypt 4.1.0 raises a TypeError under passlib, 4.1.3 to 4.3.x log a trapped error
+    reading `bcrypt.__about__`, 5.0.0 fails every hash (Dependabot PR #352). Remove this
+    test with the Dependabot entry, in the pull request that drops passlib.
     """
+    assert re.search(r"^from passlib\b", _text("app/auth/passwords.py"), re.MULTILINE)
+    (pin,) = re.findall(r"^bcrypt==([0-9][^\s#;]*)", _text("requirements.in"), re.MULTILINE)
+    release = tuple(int(part) for part in re.findall(r"\d+", pin)[:2])
+    assert release < (4, 1), pin
+
     updates = yaml.safe_load(_text(".github/dependabot.yml"))["updates"]
     (python,) = [update for update in updates if update["package-ecosystem"] == "uv"]
-    assert python["ignore"] == [
-        {"dependency-name": "bcrypt", "update-types": ["version-update:semver-major"]}
-    ]
-    assert "passlib" in _text("app/auth/passwords.py")
-    assert re.search(r"^bcrypt==4\.", _text("requirements.in"), re.MULTILINE)
+    assert python["ignore"] == [{"dependency-name": "bcrypt", "versions": [">=4.1"]}]
     for update in updates:
         if update is not python:
             assert "ignore" not in update, update["package-ecosystem"]

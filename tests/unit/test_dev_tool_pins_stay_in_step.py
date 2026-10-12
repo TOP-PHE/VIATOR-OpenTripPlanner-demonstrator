@@ -70,10 +70,12 @@ PACKAGES = {"ruff": "ruff", "mypy": "mypy"} | {
 }
 # The pre-commit-hooks release whose hook definitions HOOKS copies. The remote hooks were
 # at v5.0.0 when they became local. 6.0.0 removed two hooks VIATOR never ran
-# (check-byte-order-marker, fix-encoding-pragma); the definitions of the seven above, in
-# its .pre-commit-hooks.yaml, and their programs are unchanged (the only code change is
-# `Sequence` imported from collections.abc). Before this moves to a new major, check that
-# release the same way: no hook used here removed, renamed or redefined.
+# (check-byte-order-marker, fix-encoding-pragma: their commands are gone, their stale
+# modules still ship in the wheel); the definitions of the seven above, in its
+# .pre-commit-hooks.yaml, and their programs are unchanged (the only code change is
+# `Sequence` imported from collections.abc). The test below fails on any change of the
+# pin, 6.0.1 included: check the new release the same way (no hook used here removed,
+# renamed or redefined), then move this line with the pin.
 HYGIENE_HOOKS_VERSION = "6.0.0"
 SELECTING = (
     "types",
