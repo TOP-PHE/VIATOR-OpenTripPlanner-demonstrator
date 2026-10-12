@@ -2948,6 +2948,9 @@ def _job_to_response(j: RebuildJob, db: DbSession | None = None) -> RebuildJobRe
 
     classification = _classify_rebuild_log(j.log)
     station_build = station_builds.status_from_log(j.log)
+    if station_build and station_build[0] == station_builds.WAITING and j.status != "running":
+        # A job that ended while it waited (a worker restart): it waits no more.
+        station_build = None
 
     return RebuildJobResponse(
         id=str(j.id),

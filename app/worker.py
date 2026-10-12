@@ -423,7 +423,7 @@ def tick() -> None:
         job.status = _final_status(
             success=success, cancel_requested=job.cancel_requested_at is not None
         )
-        if job.status == "cancelled":
+        if job.status == "cancelled" and output != _CANCELLED_WHILE_WAITING:
             output += "\n[viator] cancelled by an operator: build container stopped\n"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
@@ -480,6 +480,14 @@ def tick() -> None:
         db.commit()
 
 
+# The log of a job cancelled while it waited for the station module's build:
+# no build container was ever started, so tick() adds no "container stopped".
+_CANCELLED_WHILE_WAITING = (
+    "[viator] cancelled by an operator while waiting for the station module build: "
+    "no build container was started\n"
+)
+
+
 def _run_engine_build(
     engine: str,
     *,
@@ -493,9 +501,15 @@ def _run_engine_build(
     flow, and whatever ends it the graph is built, unless the operator
     cancelled the job meanwhile."""
     if engine == "motis":
-        waited = _wait_for_station_build(job_id)
-        if not waited.build_graph:
-            return "[viator] cancelled while waiting for the station module build\n", False, ""
+        try:
+            waited = _wait_for_station_build(job_id)
+        except Exception as exc:
+            # The wait must never leave the job `running` nor keep the graph
+            # from being built: build it anyway.
+            log.warning("station build wait failed for job %s (%s)", job_id, type(exc).__name__)
+        else:
+            if not waited.build_graph:
+                return _CANCELLED_WHILE_WAITING, False, ""
         return run_build_motis(
             session_id=session_id, max_memory=max_memory, container_name=container
         )

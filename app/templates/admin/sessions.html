@@ -2475,6 +2475,8 @@ const _STATION_BUILD_FLAVOURS = {
 };
 function _renderStationBuildPill(job) {
   if (!job.station_build || !job.station_build_text) return '';
+  // A wait is shown only while the job runs (the API says so too).
+  if (job.station_build === 'waiting' && job.status !== 'running') return '';
   const flavour = _STATION_BUILD_FLAVOURS[job.station_build] || '';
   return `<span class="rebuild-pill" data-flavour="${escAttr(flavour)}" ` +
     `title="Station module build (MSMM) before the MOTIS graph">${escHTML(job.station_build_text)}</span>`;
