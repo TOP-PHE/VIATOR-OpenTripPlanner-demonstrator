@@ -8,11 +8,15 @@ with 99, a token drawn at run time.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
 import secrets
-from collections.abc import Callable, Iterator
+import socket
+import threading
+import time
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -255,6 +259,22 @@ def test_a_transient_poll_failure_is_asked_again(
 
 
 @pytest.mark.usefixtures("token")
+def test_a_poll_retry_is_logged_at_debug_only(
+    module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    module.gets = [
+        httpx.Response(503, json={"code": "busy"}),
+        httpx.Response(200, json=_state("done")),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="app.station_builds"):
+        _wait(module, clock)
+    retries = [r for r in caplog.records if r.getMessage().startswith("station_build.poll_retry")]
+    assert [(r.levelno, r.getMessage()) for r in retries] == [
+        (logging.DEBUG, "station_build.poll_retry reason=status_503")
+    ]
+
+
+@pytest.mark.usefixtures("token")
 def test_thirty_minutes_end_the_wait(
     module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -268,7 +288,26 @@ def test_thirty_minutes_end_the_wait(
     assert len(module.polls) == int(sb.WAIT_LIMIT_SECONDS / sb.POLL_SECONDS) - 1
     assert len(module.posts) == 1
     assert max(clock.slept) == sb.POLL_SECONDS
+    # No empty pause at the limit: the wait ends as soon as nothing is left.
+    assert min(clock.slept) > 0
     assert "station_build.unavailable reason=timeout" in caplog.text
+
+
+@pytest.mark.usefixtures("token")
+def test_the_thirty_minutes_count_from_the_first_request(module: Module, clock: FakeClock) -> None:
+    # The first POST times out (5 s), the retry 10 s later answers `queued`,
+    # then the build runs for ever: polls at 25 s to 1795 s, the last pause
+    # cut to the 5 s left, the end at 1800 s from the first POST.
+    module.post = [timeout_after_five(clock), httpx.Response(200, json=_state("queued"))]
+    module.gets = [httpx.Response(200, json=_state("running"))]
+    start = clock.now
+    result = _wait(module, clock)
+    assert result == sb.WaitResult(sb.UNAVAILABLE, sb.TIMEOUT, BUILD)
+    assert clock.now - start == 1800.0
+    assert len(module.posts) == 2
+    assert len(module.polls) == 178
+    assert clock.slept[0] == 10.0
+    assert clock.slept[-1] == 5.0
 
 
 @pytest.mark.usefixtures("token")
@@ -280,6 +319,9 @@ def test_slow_polls_still_end_at_thirty_minutes(module: Module, clock: FakeClock
     assert clock.now - start <= sb.WAIT_LIMIT_SECONDS
     # Each round is a pause of 10 s and a call of 5 s.
     assert len(module.polls) == 120
+    # The last call ends at the limit itself: no empty pause follows it.
+    assert clock.now - start == sb.WAIT_LIMIT_SECONDS
+    assert min(clock.slept) > 0
 
 
 @pytest.mark.usefixtures("token")
@@ -349,10 +391,13 @@ def test_the_calls_carry_the_token_and_no_user_id(
 
 
 def test_the_client_ignores_proxy_variables() -> None:
-    with sb._client(None) as client:
+    client = sb._client(None)
+    try:
         assert client.trust_env is False
         assert client.follow_redirects is False
         assert client.timeout == httpx.Timeout(sb.CALL_SECONDS)
+    finally:
+        asyncio.run(client.aclose())
 
 
 @pytest.mark.usefixtures("token")
@@ -379,6 +424,13 @@ def test_a_request_answered_in_a_wrong_shape_ends_the_wait(
     module.post = [httpx.Response(200, json=body)]
     assert _wait(module, clock) == sb.WaitResult(sb.UNAVAILABLE, sb.SHAPE, None)
     assert module.polls == []
+
+
+@pytest.mark.usefixtures("token")
+def test_a_field_the_contract_does_not_name_is_ignored(module: Module, clock: FakeClock) -> None:
+    # A later module may add a field: the four are checked, others ignored.
+    module.post = [httpx.Response(200, json={**_state("up_to_date"), "zz_later": 1})]
+    assert _wait(module, clock) == sb.WaitResult(sb.UP_TO_DATE, None, BUILD)
 
 
 @pytest.mark.usefixtures("token")
@@ -423,29 +475,120 @@ def test_a_compressed_or_large_answer_is_refused_unread(
 def test_a_large_body_without_its_length_is_cut_while_read(
     module: Module, clock: FakeClock
 ) -> None:
-    def chunks() -> Iterator[bytes]:
-        while True:
+    async def chunks() -> AsyncIterator[bytes]:
+        # Bounded: without the cap the body is read to its end and refused as
+        # not JSON (`shape`), so the test fails cleanly instead of running away.
+        for _ in range(64):
             yield b" " * 1024
 
     module.post = [lambda _r: httpx.Response(200, content=chunks())]
     assert _wait(module, clock) == sb.WaitResult(sb.UNAVAILABLE, sb.UNREACHABLE, None)
+    assert len(module.posts) == 2
 
 
 @pytest.mark.usefixtures("token")
-def test_a_call_that_trickles_past_five_seconds_is_a_timeout(
-    module: Module, clock: FakeClock
-) -> None:
-    def chunks() -> Iterator[bytes]:
-        for _ in range(10):
-            clock.now += 1.0
-            yield b" "
+def test_an_announced_large_body_is_refused_unread(module: Module, clock: FakeClock) -> None:
+    read: list[int] = []
 
-    module.gets = [
-        lambda _r: httpx.Response(200, content=chunks()),
-        httpx.Response(200, json=_state("done")),
+    async def chunks() -> AsyncIterator[bytes]:
+        read.append(1)
+        yield json.dumps(_state("done")).encode()
+
+    module.post = [
+        lambda _r: httpx.Response(
+            200, content=chunks(), headers={"Content-Length": str(sb.MAX_BYTES + 1)}
+        )
     ]
-    assert _wait(module, clock) == sb.WaitResult(sb.DONE, None, BUILD)
-    assert len(module.polls) == 2
+    assert _wait(module, clock) == sb.WaitResult(sb.UNAVAILABLE, sb.UNREACHABLE, None)
+    assert read == []
+
+
+@pytest.mark.usefixtures("token")
+def test_a_body_trickled_past_five_seconds_is_cut_at_five_seconds() -> None:
+    """A valid `done` answer, one byte every 0.1 s: the call is cut at 5 s
+    (real time), whatever httpx's per-read timeouts would allow."""
+    body = json.dumps(_state("done")).encode()
+
+    async def trickle() -> AsyncIterator[bytes]:
+        for byte in body:
+            await asyncio.sleep(0.1)
+            yield bytes([byte])
+
+    calls = sb._Calls(httpx.MockTransport(lambda _r: httpx.Response(200, content=trickle())))
+    started = time.monotonic()
+    with pytest.raises(sb._Transient) as caught:
+        calls.request(sb.CALL_SECONDS)
+    elapsed = time.monotonic() - started
+    assert caught.value.reason == sb.TIMEOUT
+    assert sb.CALL_SECONDS <= elapsed < sb.CALL_SECONDS + 1.0
+
+
+@pytest.mark.usefixtures("token")
+def test_a_status_line_and_headers_trickled_are_cut_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real socket sending its status line and headers one byte every 0.1 s:
+    the call ends at its deadline (1 s here), not when the headers end."""
+    body = json.dumps(_state("done")).encode()
+    answer = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + b"Content-Length: %d\r\n\r\n" % len(body)
+        + body
+    )
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    stop = threading.Event()
+
+    def serve() -> None:
+        connection, _ = server.accept()
+        with connection:
+            connection.recv(65536)
+            for byte in answer:
+                if stop.wait(0.1):
+                    return
+                try:
+                    connection.send(bytes([byte]))
+                except OSError:
+                    return
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        settings, "station_module_url", f"http://127.0.0.1:{server.getsockname()[1]}"
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(sb._Transient) as caught:
+            sb._Calls(None).state(BUILD, 1.0)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        server.close()
+    elapsed = time.monotonic() - started
+    assert caught.value.reason == sb.TIMEOUT
+    assert 1.0 <= elapsed < 2.0
+
+
+@pytest.mark.usefixtures("token")
+def test_each_call_gets_five_seconds_or_what_is_left(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    limits: list[tuple[str, float]] = []
+
+    def send(_self: sb._Calls, method: str, _path: str, limit: float) -> tuple[int, bytes]:
+        limits.append((method, limit))
+        state = "queued" if method == "POST" else "done"
+        return 200, json.dumps(_state(state)).encode()
+
+    monkeypatch.setattr(sb._Calls, "_send", send)
+    assert _wait(Module(clock), clock) == sb.WaitResult(sb.DONE, None, BUILD)
+    assert limits == [("POST", sb.CALL_SECONDS), ("GET", sb.CALL_SECONDS)]
+    wait = sb._Wait(sb._Calls(None), clock, lambda: False, lambda _b: None)
+    clock.now = wait.deadline - 2.0
+    assert wait._limit() == 2.0
+    clock.now = wait.deadline + 1.0
+    assert wait._limit() == 0.0
 
 
 # ── the log ──────────────────────────────────────────────────────────────
@@ -474,20 +617,35 @@ def test_the_token_is_never_logged(
     assert caplog.records
     assert all(token not in r.getMessage() for r in caplog.records)
     assert token not in caplog.text
-    assert "station_build.error type=ValueError" in caplog.text
+    assert "station_build.unavailable reason=error type=ValueError" in caplog.text
 
 
 @pytest.mark.usefixtures("token")
 def test_an_unexpected_error_ends_the_wait_and_the_graph_is_built(
-    module: Module, clock: FakeClock
+    module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
     def broken(_request: httpx.Request) -> httpx.Response:
         raise RuntimeError("stand-in")
 
     module.post = [broken]
-    result = _wait(module, clock)
+    with caplog.at_level(logging.INFO, logger="app.station_builds"):
+        result = _wait(module, clock)
     assert result == sb.WaitResult(sb.UNAVAILABLE, sb.ERROR, None)
     assert result.build_graph
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.WARNING, "station_build.unavailable reason=error type=RuntimeError")
+    ]
+
+
+def test_a_failing_configuration_check_ends_the_wait(
+    monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    def broken() -> bool:
+        raise RuntimeError("stand-in")
+
+    monkeypatch.setattr(sb.station_module, "enabled", broken)
+    assert _wait(module, clock) == sb.WaitResult(sb.UNAVAILABLE, sb.ERROR, None)
+    assert module.requests == []
 
 
 # ── stopping ─────────────────────────────────────────────────────────────

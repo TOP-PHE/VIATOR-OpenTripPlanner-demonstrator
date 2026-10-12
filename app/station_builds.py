@@ -43,13 +43,19 @@ there is one); the wait itself is never an error.
 Rules kept from `app/station_module.py`: headers built from nothing (the
 token, `Accept-Encoding: identity`, and the JSON type on the `POST`; no user
 id: a service call), `trust_env=False`, a compressed answer or a body over
-4 KiB refused unread, a real deadline of 5 s for each whole call, and a log
-that never holds the token, a body or an exception's text: reason words and
-the build number only.
+4 KiB refused unread, and a log that never holds the token, a body or an
+exception's text: reason words and the build number only.
+
+**A hard deadline for each whole call**: each call runs on its own event
+loop under `asyncio.timeout`, at most 5 s and never past the end of the 30
+minutes, so a module trickling its status line, its headers or its body a
+byte at a time is cut there (`timeout`, a transient failure). With the
+pauses on the same clock, the wait ends at most 30 minutes after the
+first `POST`, plus the few milliseconds of the worker's own checks.
 
 **Stopping.** The worker passes `should_stop`, asked after every pause: an
-operator's cancel of the rebuild job ends the wait within one poll, and no
-graph is built. The pauses go through `Clock.sleep`; a worker stopped by
+operator's cancel of the rebuild job ends the wait after the current pause
+and call (about 15 s at most), and no graph is built. The pauses go through `Clock.sleep`; a worker stopped by
 its container (SIGTERM) dies in it like in a build, and the rebuild job is
 closed as orphaned at the next start (`worker._mark_orphaned_rebuild_jobs`).
 Nothing here catches `BaseException`, so `SystemExit` and
@@ -58,6 +64,7 @@ Nothing here catches `BaseException`, so `SystemExit` and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -247,13 +254,21 @@ def _build_state(body: bytes, states: frozenset[str]) -> BuildState:
 
 
 class _Calls:
-    """The two calls, over one client, each within its deadline of 5 s."""
+    """The two calls, each a whole call under a hard deadline.
 
-    def __init__(self, client: httpx.Client, clock: Clock) -> None:
-        self._client = client
-        self._clock = clock
+    httpx's timeouts bound each read, not the call: a module trickling its
+    status line or its headers a byte at a time would outlast them. So each
+    call runs on its own event loop under `asyncio.timeout(limit)`, as
+    `app/station_module.py` does, and `limit` is at most 5 s and never past
+    the end of the 30 minutes (`_Wait._limit`)."""
 
-    def _send(self, method: str, path: str) -> tuple[int, bytes]:
+    def __init__(self, transport: httpx.AsyncBaseTransport | None) -> None:
+        self._transport = transport
+
+    def _send(self, method: str, path: str, limit: float) -> tuple[int, bytes]:
+        return asyncio.run(self._send_within(method, path, limit))
+
+    async def _send_within(self, method: str, path: str, limit: float) -> tuple[int, bytes]:
         # The token and no compression, as every call of the module (station_module).
         headers = station_module._headers()
         content: bytes | None = None
@@ -261,31 +276,21 @@ class _Calls:
             headers["Content-Type"] = "application/json"
             content = b"{}"
         url = station_module._url(path)
-        started = self._clock.monotonic()
         try:
-            with self._client.stream(method, url, content=content, headers=headers) as response:
-                encoding = response.headers.get("content-encoding", "").strip().lower()
-                length = response.headers.get("content-length", "")
-                if encoding not in ("", "identity") or (
-                    length.isdigit() and int(length) > MAX_BYTES
-                ):
-                    raise _Transient(SHAPE)
-                body = bytearray()
-                for chunk in response.iter_bytes():
-                    body += chunk
-                    if len(body) > MAX_BYTES:
-                        raise _Transient(SHAPE)
-                    if self._clock.monotonic() - started > CALL_SECONDS:
-                        raise _Transient(TIMEOUT)
-                return response.status_code, bytes(body)
-        except httpx.TimeoutException:
+            async with (
+                asyncio.timeout(limit),
+                _client(self._transport) as client,
+                client.stream(method, url, content=content, headers=headers) as response,
+            ):
+                return response.status_code, await _read(response)
+        except (TimeoutError, httpx.TimeoutException):
             raise _Transient(TIMEOUT) from None
         except httpx.TransportError:
             raise _Transient("network") from None
 
-    def request(self) -> BuildState:
+    def request(self, limit: float) -> BuildState:
         """`POST /internal/v1/builds`: the build to wait for."""
-        status, body = self._send("POST", BUILDS_PATH)
+        status, body = self._send("POST", BUILDS_PATH, limit)
         if status == 200:
             try:
                 return _build_state(body, POST_STATES)
@@ -295,9 +300,9 @@ class _Calls:
             raise _Transient("status_503")
         raise _Ended(_REFUSAL_CODES.get(status, f"status_{status}"))
 
-    def state(self, build_id: int) -> BuildState:
+    def state(self, build_id: int, limit: float) -> BuildState:
         """`GET /internal/v1/builds/{build_id}`: the state of that build."""
-        status, body = self._send("GET", f"{BUILDS_PATH}/{build_id}")
+        status, body = self._send("GET", f"{BUILDS_PATH}/{build_id}", limit)
         if status == 200:
             found = _build_state(body, GET_STATES)
             if found.build_id != build_id:
@@ -310,8 +315,23 @@ class _Calls:
         raise _Transient(f"status_{status}")
 
 
-def _client(transport: httpx.BaseTransport | None) -> httpx.Client:
-    return httpx.Client(
+async def _read(response: httpx.Response) -> bytes:
+    """The body, read as it arrives up to 4 KiB; a compressed answer, or one
+    that announces a larger body, is refused unread (`shape`, transient)."""
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    length = response.headers.get("content-length", "")
+    if encoding not in ("", "identity") or (length.isdigit() and int(length) > MAX_BYTES):
+        raise _Transient(SHAPE)
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body += chunk
+        if len(body) > MAX_BYTES:
+            raise _Transient(SHAPE)
+    return bytes(body)
+
+
+def _client(transport: httpx.AsyncBaseTransport | None) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
         timeout=httpx.Timeout(CALL_SECONDS),
         trust_env=False,
         follow_redirects=False,
@@ -344,17 +364,21 @@ class _Wait:
         self.on_waiting = on_waiting
         self.deadline = clock.monotonic() + WAIT_LIMIT_SECONDS
 
+    def _limit(self) -> float:
+        """The deadline of the next call: 5 s, or what is left of the 30 minutes."""
+        return max(0.0, min(CALL_SECONDS, self.deadline - self.clock.monotonic()))
+
     def _request(self) -> BuildState | WaitResult:
         """The `POST`, tried once more 10 s after a transient failure."""
         try:
-            return self.calls.request()
+            return self.calls.request(self._limit())
         except _Transient:
             pass
         self.clock.sleep(POST_RETRY_SECONDS)
         if self.should_stop():
             return WaitResult(CANCELLED)
         try:
-            return self.calls.request()
+            return self.calls.request(self._limit())
         except _Transient:
             return WaitResult(UNAVAILABLE, UNREACHABLE)
 
@@ -371,7 +395,7 @@ class _Wait:
             if self.clock.monotonic() >= self.deadline:
                 return WaitResult(UNAVAILABLE, TIMEOUT, build_id)
             try:
-                found = self.calls.state(build_id)
+                found = self.calls.state(build_id, self._limit())
             except _Transient as transient:
                 log.debug("station_build.poll_retry reason=%s", transient.reason)
                 continue
@@ -415,25 +439,24 @@ def wait_before_graph(
     should_stop: Callable[[], bool],
     on_waiting: Callable[[int], None],
     clock: Clock | None = None,
-    transport: httpx.BaseTransport | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> WaitResult:
     """Ask the module for a station build and wait until it has ended.
 
     `should_stop` is asked after every pause (the operator's cancel);
     `on_waiting(build_id)` is called once when the build is still queued or
     running, so that the worker shows the wait. Never raises an `Exception`:
-    an unexpected one ends the wait (`error`) and the graph is built."""
-    if not station_module.enabled():
-        result = WaitResult(OFF)
-        _log_result(result)
-        return result
+    an unexpected one ends the wait (`error`, one WARNING) and the graph is
+    built."""
     clock = clock or SystemClock()
     try:
-        with _client(transport) as client:
-            result = _Wait(_Calls(client, clock), clock, should_stop, on_waiting).run()
+        if not station_module.enabled():
+            result = WaitResult(OFF)
+        else:
+            result = _Wait(_Calls(transport), clock, should_stop, on_waiting).run()
     except Exception as exc:
-        # Never the exception's text: one about a header can quote the token.
-        log.warning("station_build.error type=%s", type(exc).__name__)
-        result = WaitResult(UNAVAILABLE, ERROR)
+        # One line, never the exception's text: one about a header can quote the token.
+        log.warning("station_build.unavailable reason=%s type=%s", ERROR, type(exc).__name__)
+        return WaitResult(UNAVAILABLE, ERROR)
     _log_result(result)
     return result
