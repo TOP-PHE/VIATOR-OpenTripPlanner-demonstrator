@@ -1877,15 +1877,16 @@ The deploy workflow (`deploy.yml`) is **manual on purpose** — see 15.10.
 
 #### 15.2.2 Install the project deps
 
-From the repo root:
+From the repo root, in an activated virtual environment (15.2.1):
 
 ```bash
 # Pick the right Python explicitly (Windows: py -3.14; macOS/Linux: python3.14)
-py -3.14 -m pip install -r requirements.txt          # runtime
-py -3.14 -m pip install -r requirements-dev.txt      # adds ruff, mypy, pytest, bandit, pre-commit
+py -3.14 -m pip install --require-hashes --only-binary :all: -r requirements-dev.txt
 ```
 
-> **pip upgrade notices.** An earlier version of this guide warned that pip 26.1 broke on Python 3.14. That failure did not reproduce on Python 3.14.8 on Linux with pip 26.1 and 26.2, the only combination tested; other 3.14 releases and Windows were not checked. The web image itself upgrades to pip >= 26.0 on 3.14 (`docker/web/Dockerfile`). If you hit the failure, see the `pip install` row of 15.11.
+`requirements-dev.txt` is the hashed lock file of the dev tools and already holds every runtime package of `requirements.txt` at the same versions, so one install is enough (15.2.5). pip checks the sha256 of every file before installing anything and takes wheels only. The lock is universal: the same file installs on Linux and on Windows (`colorama` and `tzdata` only on Windows, `uvloop` everywhere but Windows).
+
+> **pip upgrade notices.** An earlier version of this guide warned that pip 26.1 broke on Python 3.14. That failure did not reproduce on Python 3.14.8 on Linux with pip 26.1 and 26.2, the only combination tested; other 3.14 releases and Windows were not checked. The web image installs the pip that `requirements-build.txt` pins (26.2.1). If you hit the failure, see the `pip install` row of 15.11.
 
 #### 15.2.3 Verify the install
 
@@ -1904,7 +1905,31 @@ py -3.14 -m pre_commit install
 py -3.14 -m pre_commit install --hook-type pre-push   # optional: mypy before each push
 ```
 
-The first line wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff (lint and format) and the basic file checks run automatically on staged files at commit time. The second adds the pre-push hook, which runs `mypy app/`, the command CI runs, with the `mypy` found on PATH (#327). It does not install anything itself: push from an activated virtual environment where `pip install -r requirements-dev.txt` was run, or the hook stops with "Executable `mypy` not found". **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway, and the CI Python job runs `mypy app/`.
+The first line wires `.pre-commit-config.yaml` into `.git/hooks/pre-commit`. From now on, ruff (lint and format) and the basic file checks run automatically on staged files at commit time. The second adds the pre-push hook, which runs `mypy app/`, the command CI runs, with the `mypy` found on PATH (#327). Every hook is local (`language: system`, 15.9): ruff and the basic file checks too run the programs installed from `requirements-dev.txt`, and pre-commit installs nothing itself. So commit and push from the activated virtual environment where the dev lock was installed (15.2.2), or a hook stops with "Executable `…` not found". **Skip this if you prefer to lint manually** — the CI pre-commit job will catch any drift anyway, and the CI Python job runs `mypy app/`.
+
+#### 15.2.5 Lock files — adding or upgrading a Python package
+
+Every Python package VIATOR installs comes from a hashed lock file. Each source (`.in`) holds the pins chosen by hand; its lock (`.txt`) is compiled from it and holds every package, indirect ones included, with its exact version and the sha256 hashes of its files:
+
+| Source (edit this) | Lock (never edit by hand) | Installed by |
+|---|---|---|
+| `requirements.in` | `requirements.txt` | the web image (`docker/web/Dockerfile`) |
+| `requirements-dev.in` (`-r requirements.in` + the dev tools) | `requirements-dev.txt` | CI's `python` and `pre-commit` jobs, developers (15.2.2) |
+| `requirements-build.in` (pip, setuptools) | `requirements-build.txt` | the web image, first, through a bind mount (never a file of the image); CI's `python` job, first, so pip-audit sees a current pip |
+
+Every install is `pip install --require-hashes --only-binary :all: -r <lock>`: pip refuses a file whose hash is not in the lock and never builds a source archive (no package's build script runs). `tests/unit/test_hashed_lock_files.py` fails on any `pip install` in a workflow or Dockerfile that does otherwise.
+
+The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.18), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
+
+```bash
+uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt
+uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements-dev.in -o requirements-dev.txt
+uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements-build.in -o requirements-build.txt
+```
+
+**To add or upgrade a package:** edit the pin in the `.in` file (a runtime package in `requirements.in`; a tool in `requirements-dev.in`), run the three commands, check the diff of the locks (only the packages you meant should move; uv keeps every other version the lock already holds), reinstall the dev lock, run the gates of 15.3, and commit the sources and the locks together. To raise an indirect package (a security fix), add `--upgrade-package <name>` to the commands. `pip-compile` is not used: it resolves only for the machine it runs on, so a lock made on Linux would ask Windows for `uvloop` and leave out `colorama`.
+
+CI's `python` job checks every lock right after its install (step "Lock files match their sources"): it compiles each source again, with the lock's versions as constraints, into a new file, and compares it with the committed lock, uv's comments left out. A pin raised or a package added to a `.in` file but not locked, or a version or hash edited by hand in a lock, a lock missing or empty: each fails the step with an `::error::` naming the file, after every lock was checked. Dependabot uses its `uv` updater (`.github/dependabot.yml`), which recompiles the locks itself; its uv may be ahead of the pinned one, and if its lock differs the step fails on its pull request: run the three commands with the pinned uv on that branch.
 
 ### 15.3 Local quality gates — the same checks CI runs
 
@@ -1931,7 +1956,7 @@ py -3.14 -m pip_audit --strict --vulnerability-service=osv
 py -3.14 -m pytest --cov-fail-under=12
 ```
 
-CI's pre-commit job runs `pre-commit run --all-files --show-diff-on-failure` (the commit-stage hooks; see 15.2.4), and pip-audit checks the environment it runs in, so run it in the virtual environment where `pip install -r requirements-dev.txt` was run.
+CI's pre-commit job runs `pre-commit run --all-files --show-diff-on-failure` (the commit-stage hooks; see 15.2.4), and pip-audit checks the environment it runs in, so run it in the virtual environment where the dev lock was installed (15.2.2). After changing a `.in` file, also recompile the locks (15.2.5): CI's "Lock files match their sources" step fails otherwise.
 
 If any of those fail, CI will fail in the same way. Fixing locally is faster than push-wait-fix-push loops.
 
@@ -1971,7 +1996,8 @@ docker rm -f viator-pg
 ├── ci.yml              # ruff + ruff format + mypy + bandit + pytest + coverage + (optional) SonarCloud
 └── docker.yml          # web + otp image build, hadolint, Trivy, GHCR push (matrix)
 
-.pre-commit-config.yaml # local + CI pre-commit hooks
+.pre-commit-config.yaml # local + CI pre-commit hooks (all `repo: local`, 15.9)
+requirements*.in        # hand-written pins (sources); requirements*.txt are their hashed locks (15.2.5)
 pyproject.toml          # ruff/mypy/pytest/coverage config (single source of truth)
 sonar-project.properties # SonarCloud project metadata
 .trivyignore            # CVE allow-list (see 15.8)
@@ -1986,9 +2012,9 @@ Triggers: every PR + every push to `main`.
 
 Three jobs. `python` and `pre-commit` run in parallel; `sonarcloud` waits for `python`:
 
-1. **`python`** — installs Python 3.14 (the image's), brings up a Postgres 16 service container, runs ruff → ruff format --check → mypy --strict → bandit → pip-audit → pytest → uploads `coverage.xml` as an artifact.
+1. **`python`** — installs Python 3.14 (the image's), brings up a Postgres 16 service container, installs the hashed locks `requirements-build.txt` then `requirements-dev.txt`, checks that every lock matches its source (15.2.5), runs ruff → ruff format --check → mypy --strict → bandit → pip-audit → pytest → uploads `coverage.xml` as an artifact.
 2. **`sonarcloud`** — `needs: python`, so it starts only when that job has passed. It downloads `coverage.xml` and runs the SonarCloud scanner. It runs only when the repository variable `SONARCLOUD_ENABLED` is `true` and the event is a push or a pull request from a branch of this repository (not a fork); otherwise it is skipped.
-3. **`pre-commit`** — installs pre-commit and runs `pre-commit run --all-files`, which runs the commit-stage hooks only (not the pre-push mypy hook). This is the belt-and-braces job: it catches files committed without the local hooks.
+3. **`pre-commit`** — installs the hashed dev lock (pre-commit, pre-commit-hooks, ruff: every hook is local, 15.9) and runs `pre-commit run --all-files`, which runs the commit-stage hooks only (not the pre-push mypy hook). This is the belt-and-braces job: it catches files committed without the local hooks.
 
 A failure in `python` or `pre-commit` makes the PR un-mergeable: the `main` ruleset requires both (15.7.3). The `sonarcloud` job itself is not required; the SonarCloud quality-gate check it leads to is.
 
@@ -2094,7 +2120,7 @@ Six escape hatches, in order of preference:
 1. **Apply pending OS patches at build time.** Both Dockerfiles run `apt-get update && apt-get upgrade -y` because the base image tags (`eclipse-temurin:25-jre-noble`, `python:3.14-slim`) are rebuilt on a slower cadence than `debian-security-announce` / `ubuntu-security-announce` post fixes. **Most OS-package CVE findings clear with a clean rebuild** (no code change needed). If a build runs from cache and skips the apt steps, force a rebuild: in CI, push an empty commit; locally, `docker compose build --no-cache <service>`.
 2. **Reduce the dependency surface.** If a package brings transitive deps you don't need, swap to a leaner equivalent. Example: the web image previously installed Debian's `docker.io` (daemon + CLI + tools, ~50 transitive deps) just so the worker could shell out to `docker` to spawn otp-build jobs. Replaced with a multi-stage `COPY --from=docker:27-cli /usr/local/bin/docker` — single static go binary, no apt deps. Big CVE surface reduction for the same functionality.
 3. **Update the base image.** If `eclipse-temurin:25-jre-noble` or `python:3.14-slim` has a newer revision, pin to it.
-4. **Update the dependency** that triggered the finding (web image only — `requirements.txt`).
+4. **Update the dependency** that triggered the finding (web image only — the pin in `requirements.in`, then recompile the locks, 15.2.5; for an indirect package, `--upgrade-package <name>`).
 5. **Add to `.trivyignore`** — only if the finding is genuinely not exploitable in our context (e.g. the worker mounts `/var/run/docker.sock`, which Trivy flags but is documented as accepted in §10.1):
    ```
    # .trivyignore — one CVE per line, with a justifying comment above each
@@ -2115,7 +2141,7 @@ Java CVEs in the bundled `otp-shaded-2.9.0.jar` deps are intentionally **exclude
 
 ### 15.9 Pre-commit framework — what runs and when
 
-`.pre-commit-config.yaml` configures these hooks. The ruff hooks and the basic file checks run in environments pre-commit builds from each hook repository's `rev:`. Dependabot does not bump a `rev:`, so `tests/unit/test_dev_tool_pins_stay_in_step.py` fails unless the ruff hook's `rev:` is `v` + the `ruff==` pin in `requirements-dev.txt` (#336); bump the two together. CI's pre-commit job installs the `pre-commit==` version that `requirements-dev.txt` pins; the mypy hook runs the developer's own installed `mypy`, so it uses exactly the `requirements-dev.txt` versions:
+`.pre-commit-config.yaml` configures these hooks. Every hook is `repo: local`, `language: system`: it runs a program installed from the hashed lock `requirements-dev.txt` (15.2.5) — ruff, mypy, and the basic file checks of the `pre-commit-hooks` package (pinned at 5.0.0, the `rev:` the remote hooks had). So pre-commit clones no hook repository by a tag that can move and pip-installs nothing unhashed, and the hooks always run the versions CI runs: when Dependabot raises ruff in the lock, nothing else is bumped by hand (the drift of #336 cannot happen). Each hook is written as its project defines it (pre-commit-hooks v5.0.0, ruff-pre-commit): the same program, file types and stages; `tests/unit/test_dev_tool_pins_stay_in_step.py` holds these rules. Run pre-commit from the activated environment that holds the dev lock; CI's pre-commit job installs that lock:
 
 | Hook | What it does | Auto-fix? |
 |---|---|---|
@@ -2175,7 +2201,7 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 |---|---|---|
 | **`ruff format --check`** | `Would reformat: path/to/file.py` | Run `py -3.14 -m ruff format .` locally, commit, push. The formatter is opinionated by design — never argue with it. |
 | **`ruff check`** | Rule code + file:line + suggested fix | Most rules are auto-fixable: `py -3.14 -m ruff check . --fix`. For the rest, edit per the rule's docs at https://docs.astral.sh/ruff/rules/. |
-| **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-requests`). Add to `requirements-dev.txt`, reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
+| **`mypy --strict`** "Library stubs not installed for X" | A third-party library lacks type info | First try `types-X` on PyPI (e.g. `types-passlib`, `types-requests`). Add to `requirements-dev.in`, recompile the locks (15.2.5), reinstall, re-run. If no stubs exist, mark the import: `# type: ignore[import-untyped]` (with a comment explaining why). |
 | **`mypy --strict`** "Returning Any from function declared to return X" | A typed function calls an untyped one | Wrap the return in an explicit cast: `result: str = untyped_call(...); return result`. Don't blanket-ignore. |
 | **`mypy --strict`** "Function 'count' could always be true in boolean context" | SQLAlchemy Row attribute clashes with `tuple.count` / `tuple.index` method | Rename the column label: `func.count().label("count")` → `func.count().label("n_executions")` and update the consumer. |
 | **`mypy --strict`** "Unused 'type: ignore' comment" | Mypy got smarter and no longer needs the suppression | Just delete the `# type: ignore[...]` comment. |
@@ -2183,8 +2209,10 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 | **`pytest`** Postgres connection refused | No Postgres on `localhost:5432` | Start one per 15.4, set `DATABASE_URL`. |
 | **`bandit`** new MEDIUM/HIGH finding | A real security issue | Fix the code. If genuinely a false positive, mark the line with `# nosec BXXX` + a comment. |
 | **`Trivy`** CRITICAL on the OTP image | Almost always a JRE base CVE | Bump `eclipse-temurin:25-jre-noble` digest in `docker/otp/Dockerfile`. If no fix available, use `--ignore-unfixed` (already on) — the build still passes. |
-| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | Reported with Python 3.14 and pip 26.1; not reproduced on 3.14.8 on Linux with pip 26.1 or 26.2 (the only combination tested) | Upgrade to the latest Python 3.14.x and pip (`py -3.14 -m pip install --upgrade pip`). Do not fall back to 3.12: CI and the image run 3.14 (#325). |
-| **`ruff` / `mypy` / `pytest` not found** after `pip install` (or the pre-push hook says "Executable `mypy` not found") | The folder holding the tools' scripts is not on PATH, or the virtual environment is not activated | Activate the virtual environment you installed `requirements-dev.txt` into, or put your install's scripts folder on PATH (15.2.1), or invoke tools as `py -3.14 -m <tool>` (the pre-push hook needs `mypy` on PATH). |
+| **`pip install`** `AttributeError: module 'warnings' has no attribute '_add_filter'` | Reported with Python 3.14 and pip 26.1; not reproduced on 3.14.8 on Linux with pip 26.1 or 26.2 (the only combination tested) | Upgrade to the latest Python 3.14.x and install the pip the image pins (`py -3.14 -m pip install --require-hashes --only-binary :all: -r requirements-build.txt`). Do not fall back to 3.12: CI and the image run 3.14 (#325). |
+| **`ruff` / `mypy` / `pytest` not found** after `pip install` (or the pre-push hook says "Executable `mypy` not found") | The folder holding the tools' scripts is not on PATH, or the virtual environment is not activated | Activate the virtual environment you installed `requirements-dev.txt` into, or put your install's scripts folder on PATH (15.2.1), or invoke tools as `py -3.14 -m <tool>` (every pre-commit hook is local and needs its program on PATH, 15.9). |
+| **Lock files match their sources** | `::error::requirements….txt does not match requirements….in` (or "cannot be compiled to the versions of", or "is missing or holds no package") | A `.in` file was changed without recompiling, or a lock was edited by hand. Run the three compile commands of 15.2.5 with the pinned uv, check the diff, commit the sources and the locks together. |
+| **`pip install`** `THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE` or `Hashes are required in --require-hashes mode` | A lock was edited by hand, or a package was installed from outside the lock | Recompile the locks (15.2.5); never add a package with a bare `pip install`. |
 | **PowerShell** `&&` parser error | You're on Windows PowerShell 5.1 (no `&&` support) | Use `;` to chain unconditionally, or `; if ($?) { ... }` for "run B only if A succeeded". Or upgrade to PowerShell 7. |
 | **Git** "LF will be replaced by CRLF" warnings on Windows | Git's `core.autocrlf=true` rewriting line endings | **Harmless** — files in the repo stay LF, only the working copy gets CRLF. To silence: add a `.gitattributes` with `* text=auto eol=lf`. |
 | **GitHub Actions** "Node.js 20 actions are deprecated" | The action's runner uses Node 20 internally; June 2026 makes Node 24 the default, September 2026 removes Node 20. | **Already addressed.** All actions bumped to versions that ship Node 24 runners: `actions/checkout@v5`, `actions/setup-python@v6`, `actions/upload-artifact@v5`, `actions/download-artifact@v5`, `docker/setup-buildx-action@v4`, `docker/login-action@v4`, `docker/metadata-action@v6`, `docker/build-push-action@v7`, `github/codeql-action/upload-sarif@v4`, `SonarSource/sonarcloud-github-action@v5`, `hadolint/hadolint-action@v3.3.0`. If a future warning lists a different action, run `curl -fsSL https://api.github.com/repos/<owner>/<repo>/releases?per_page=3` to find the latest published tag and bump to it. |
@@ -2203,23 +2231,24 @@ This table captures every failure mode hit during initial bring-up. Use it as a 
 
 ### 15.12 Tooling matrix (reference)
 
-Python tool versions are the pins of `requirements-dev.txt` (and `requirements.txt` for Alembic); Trivy and hadolint are the action versions pinned in `docker.yml`. Those files are the source of truth if this table drifts again.
+Python tool versions are the pins of `requirements-dev.in` (and `requirements.in` for Alembic), locked with every indirect package in the hashed `requirements-dev.txt` (15.2.5); Trivy and hadolint are the action versions pinned in `docker.yml`. Those files are the source of truth if this table drifts again.
 
 | Concern | Tool | Pinned version | Config location |
 |---|---|---|---|
 | Test runner | pytest + pytest-asyncio + pytest-cov + httpx | 9.1.1 / 1.4.0 / 7.1.0 / 0.28.1 | `pyproject.toml` `[tool.pytest.ini_options]` |
-| Coverage | coverage.py (via pytest-cov) → `coverage.xml` | not pinned (installed by pytest-cov) | `pyproject.toml` `[tool.coverage.*]` |
-| Lint | ruff | 0.16.10 (the pre-commit hook pins its own `rev:`, see 15.9) | `pyproject.toml` `[tool.ruff]` |
+| Coverage | coverage.py (via pytest-cov) → `coverage.xml` | not pinned in the source; locked in `requirements-dev.txt` (installed by pytest-cov) | `pyproject.toml` `[tool.coverage.*]` |
+| Lint | ruff | 0.16.10 (the pre-commit hook is local and runs this one, see 15.9) | `pyproject.toml` `[tool.ruff]` |
 | Format | ruff format | same as ruff | `pyproject.toml` `[tool.ruff.format]` |
 | Type | mypy (strict) | 2.4.0 | `pyproject.toml` `[tool.mypy]` |
 | Security (code) | bandit | 1.9.4 | no config file: command-line flags in `ci.yml` (`bandit -r app/ -ll`); ruff's `S` rules (flake8-bandit) in `pyproject.toml` `[tool.ruff.lint]` also run on every lint |
 | Security (deps) | pip-audit | 2.10.1 | command-line flags in `ci.yml` |
 | Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
 | Dockerfile lint | hadolint (via hadolint/hadolint-action) | v3.5.0 | `ignore:` list in `docker.yml` |
-| Pre-commit | pre-commit | 4.6.2 | `.pre-commit-config.yaml` |
+| Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 5.0.0 | `.pre-commit-config.yaml` |
+| Lock files | uv (`uv pip compile`) | 0.12.18 | the commands of 15.2.5; checked by `ci.yml` |
 | Migrations | Alembic | 1.20.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
-| Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.txt` | `requirements-dev.txt` |
+| Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.in` | `requirements-dev.in` |
 
 ### 15.13 What the JS toolchain looks like (when we add it)
 

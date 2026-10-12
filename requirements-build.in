@@ -1,0 +1,22 @@
+# pip and setuptools of the web image, installed by docker/web/Dockerfile before
+# the packages of requirements.txt: the python:3.14-slim base ships versions with
+# known, fixable CVEs (pip CVE-2025-8869 / CVE-2026-1703, setuptools
+# CVE-2025-47273). setuptools stays resident in the image, so Trivy sees it.
+# CI's Python job installs it first too, so pip-audit sees a pip without a fixed
+# CVE. Never copied into the image: the Dockerfile reads the lock through a bind
+# mount of that one RUN step.
+#
+# This file is the source; requirements-build.txt is the lock file compiled from it: every
+# package (indirect ones included), its exact version and the sha256 hashes of its
+# files. Never edit the lock by hand. To add or upgrade a package, edit this file,
+# run the compile command of VIATOR-technical-spec.md section 15.2.5 from the
+# repository root, and commit both files. CI compiles again and fails when the two
+# disagree (job "Python (lint + type + test)", step "Lock files match their sources").
+#
+# `--only-binary :all:`: wheels only, never a source archive whose build script
+# would run at install time. uv copies it into the lock, so pip applies it wherever
+# the lock is installed.
+--only-binary :all:
+
+pip==26.2.1
+setuptools==84.0.0

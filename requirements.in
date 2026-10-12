@@ -1,0 +1,62 @@
+# Runtime dependencies of the web image (docker/web/Dockerfile). Dev / CI tools
+# live in requirements-dev.in.
+#
+# This file is the source; requirements.txt is the lock file compiled from it: every
+# package (indirect ones included), its exact version and the sha256 hashes of its
+# files. Never edit the lock by hand. To add or upgrade a package, edit this file,
+# run the compile command of VIATOR-technical-spec.md section 15.2.5 from the
+# repository root, and commit both files. CI compiles again and fails when the two
+# disagree (job "Python (lint + type + test)", step "Lock files match their sources").
+#
+# `--only-binary :all:`: wheels only, never a source archive whose build script
+# would run at install time. uv copies it into the lock, so pip applies it wherever
+# the lock is installed.
+--only-binary :all:
+
+fastapi==0.142.2                # 0.116+ pulls starlette>=0.46 (we need >=0.49.1 for CVE-2025-62727); 0.136 pulls starlette 1.0.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32        # 0.0.22+ fixes CVE-2026-24486 (HIGH path traversal); 0.0.26 added CVE-2026-40347 (MEDIUM DoS) fix; 0.0.27 fixes GHSA-pp6c-gr5w-3c5g (multipart parser DoS)
+jinja2==3.1.6                   # 3.1.5+ fixes CVE-2025-27516 (sandbox escape via attr filter)
+sqlalchemy==2.1.3             # 2.0.49 broadens Session.execute() return type to Result[Any] — handled in app/retention.py + app/master/trainline.py via cast (audit-2026-05 #23)
+psycopg[binary]==3.3.6
+pydantic==2.13.5
+pydantic-settings==2.15.0        # 2.14.2 fixes GHSA-4xgf-cpjx-pc3j
+alembic==1.20.0
+PyJWT==2.15.1                   # session JWTs (app/auth/tokens.py), HS256 only; replaced python-jose in #319. Ships its own types
+cryptography==50.0.2            # AES-256-GCM + HKDF for stored credentials (app/credentials.py); came in via python-jose[cryptography] until #319, now pinned directly
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1                   # passlib 1.7.4 needs bcrypt < 4.1
+slowapi==0.1.10
+email-validator==2.3.0          # required by pydantic EmailStr
+aiosmtplib==5.1.3               # used for SMTP delivery in step 4
+httpx==0.28.1                   # async HTTP for Trainline pull + OTP fanout
+defusedxml==0.7.1               # hardened XML parsing for the OJP reference adapter (app/journey/ojp_client.py) — opentransportdata.swiss returns OJP 2.0 XML; stdlib xml.etree is XXE-vulnerable (ruff S314 / bandit B314)
+apscheduler==3.11.3             # in-process scheduler for retention + master-data refresh crons
+structlog==26.1.0               # JSON structured logging — config in app/logging_config.py; bridges stdlib logging + uvicorn/SQLAlchemy/APScheduler emitters into a single JSON stream
+prometheus-client==0.26.0       # Prometheus exposition format + custom collectors (audit #14 — observability triad). HTTP middleware is hand-rolled in app/metrics.py instead of prometheus-fastapi-instrumentator (which pins starlette<1.0.0 and would conflict with our starlette==1.0.0 floor for CVE-2025-62727).
+
+# ────── OpenTelemetry distributed tracing (audit #19 — observability triad / Phase 2.7) ──────
+# Core + SDK + OTLP gRPC exporter → Tempo at tempo:4317. Auto-instrumentation
+# wraps FastAPI requests, SQLAlchemy queries, and outbound httpx calls — each
+# emits a span automatically, no manual `with tracer.start_span(...)` in app/.
+# `opentelemetry-instrumentation-logging` injects trace_id + span_id into
+# stdlib log records so structlog JSON output gets the correlation IDs.
+# Beta-tagged versions (0.62b1) are the production line — OTel uses the
+# `bN` suffix even for stable instrumentation releases. Pin with `==` so
+# pip accepts the pre-release without `--pre`.
+opentelemetry-api==1.45.0
+opentelemetry-sdk==1.45.0
+opentelemetry-exporter-otlp-proto-grpc==1.45.0
+opentelemetry-instrumentation-fastapi==0.66b0
+opentelemetry-instrumentation-sqlalchemy==0.66b0
+opentelemetry-instrumentation-httpx==0.66b0
+opentelemetry-instrumentation-logging==0.66b0
+
+# ────── Transitive-dependency security floors ──────
+# Nothing in app/ imports these. They arrive transitively, and are constrained
+# here only to keep the built image free of *fixable* HIGH findings, because
+# .trivyignore is reserved for CVEs with no upstream fix. Floors, not pins
+# (`>=` not `==`), so the resolver stays free to satisfy whichever package
+# pulls them in. Drop an entry once that package requires the fixed version
+# on its own.
+msgpack>=1.2.3                  # GHSA-6v7p-g79w-8964 — OOB read / crash on Unpacker reuse after an error
