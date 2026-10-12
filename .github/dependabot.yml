@@ -1,7 +1,8 @@
 # Dependabot — automated dependency PRs.
 #
 # Three ecosystems covered:
-#   1. pip       — runtime + dev Python deps (requirements.txt, requirements-dev.txt)
+#   1. uv        — runtime + dev Python deps: the sources requirements*.in and the
+#                  hashed lock files requirements*.txt compiled from them
 #   2. docker    — both Dockerfile base images (python:3.14-slim, eclipse-temurin:25-jre-noble, docker:29-cli)
 #   3. github-actions — pinned action versions in .github/workflows/*.yml
 #
@@ -10,11 +11,25 @@
 # updates remain individual PRs because they need human review.
 #
 # Audit-2026-05 P0 #2.
+#
+# Python uses the `uv` updater, not `pip`: the locks are made by `uv pip compile
+# --universal` (one lock for Linux CI, the linux/amd64 image and a Windows
+# workstation; VIATOR-technical-spec.md 15.2.5). The uv updater raises the pin
+# in the `.in` file and recompiles each lock that holds the package with the
+# options it reads from the lock's header; it can also raise an indirect
+# package in the locks alone, for a security fix. The `pip` updater would
+# recompile with pip-compile, which resolves for one platform only. Dependabot's
+# own uv may be ahead of the one requirements-dev.in pins: if its lock differs,
+# CI's "Lock files match their sources" step fails on its pull request, and the
+# fix is to run the compile commands of 15.2.5 with the pinned uv on that
+# branch. Dependabot reads no file over 500 KB; the largest lock is ~190 KB.
+# The pre-commit hooks are local and run the ruff of the lock, so nothing is
+# bumped by hand when Dependabot raises ruff (#336 no longer applies).
 
 version: 2
 updates:
   # ────────────────────────────── Python ────────────────────────────────
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly

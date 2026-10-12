@@ -72,10 +72,18 @@ WORKDIR /srv
 # Trivy sees it at `--severity CRITICAL,HIGH` and fails the build. It is
 # fixable, so it is fixed here rather than added to .trivyignore — that file is
 # reserved for findings with no upstream fix.
-RUN pip install --upgrade "pip>=26.0" "setuptools>=78.1.1"
+#
+# Every package comes from a hashed lock file (VIATOR-technical-spec.md
+# 15.2.5): its exact version and the sha256 of its files, which pip checks
+# before installing anything (`--require-hashes`), and wheels only
+# (`--only-binary :all:`), so no package's build script runs in the build.
+# The lock of pip and setuptools is read through a bind mount of this one
+# step: it never becomes a file of the image.
+RUN --mount=type=bind,source=requirements-build.txt,target=/tmp/requirements-build.txt \
+    pip install --require-hashes --only-binary :all: -r /tmp/requirements-build.txt
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --require-hashes --only-binary :all: -r requirements.txt
 
 COPY app ./app
 COPY branding ./branding

@@ -49,6 +49,7 @@ jobs:
               - 'docker/**'
               - 'app/**'
               - 'requirements.txt'
+              - 'requirements-build.txt'      # pip + setuptools of the web image (bind-mounted)
               - '.github/workflows/docker.yml'
 
   build-and-scan:
