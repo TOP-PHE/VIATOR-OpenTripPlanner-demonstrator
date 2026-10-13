@@ -212,9 +212,8 @@ class Setup:
             )
         self.extractor = FakeExtractor(tmp, keys)
         self.snapshot = FakeSnapshot()
-        for feed in self.feeds:
-            assert feed.archive is not None and feed.archive_sha256 is not None
-            self.snapshot.pairs[feed.provider_id] = (feed.archive, feed.archive_sha256)
+        for i, feed in enumerate(self.feeds):
+            self.snapshot.pairs[feed.provider_id] = (tmp / f"zz{i}.zip", str(feed.archive_sha256))
         monkeypatch.setattr(station_extract, "ensure_extract", self.extractor)
         monkeypatch.setattr(station_extract, "provider_archive_snapshot", self.snapshot)
 
