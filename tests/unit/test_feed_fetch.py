@@ -7,6 +7,7 @@ reach the slot, never rebuild for an unchanged file, ride out transient errors.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import re
 import zipfile
@@ -97,6 +98,9 @@ async def test_valid_gtfs_is_fetched_with_validators_recorded(staging: Path) -> 
     assert result.state["etag"] == "abc"
     assert result.state["last_modified"].startswith("Mon, 28 Sep")
     assert result.state["sha256"] == result.sha256
+    # the slot holds the download itself: the same identity (station extract check)
+    assert result.state["slot_sha256"] == result.sha256
+    assert result.state["slot_size_bytes"] == len(body)
     assert not (staging / "20260929-provider.download").exists()
 
 
@@ -112,6 +116,11 @@ async def test_gzip_netex_is_rewrapped_as_a_zip(staging: Path) -> None:
     with zipfile.ZipFile(result.path) as z:
         assert z.namelist() == ["IT-IT-TRENITALIA_L1.xml"]
         assert z.read("IT-IT-TRENITALIA_L1.xml") == NETEX_XML
+    # the slot holds the re-wrapped zip: its own identity, not the download's
+    wrapped = result.path.read_bytes()
+    assert result.state["sha256"] == hashlib.sha256(body).hexdigest()
+    assert result.state["slot_sha256"] == hashlib.sha256(wrapped).hexdigest()
+    assert result.state["slot_size_bytes"] == len(wrapped)
 
 
 async def test_gzip_without_disposition_gets_a_fallback_member_name(staging: Path) -> None:
