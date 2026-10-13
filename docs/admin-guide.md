@@ -2832,6 +2832,53 @@ par VIATOR »). OTP builds do not wait.
   `docker exec viator-worker-1 python -c "from app import station_module; print(station_module.enabled())"`
   answers `True` (it shows neither the address nor the token).
 
+### 11.4 The stop extracts for the station module (MSMM referential)
+
+The station module builds its own station referential (the VIATOR station
+id) from the stops of the timetables VIATOR downloads (the module's design,
+section 22). VIATOR never sends an archive: for each version of each feed it
+writes a small **stop extract** and, from the next release (pull request 5),
+sends it to the module. This release only writes the extracts; nothing is
+sent yet and no graph build changes.
+
+- **What it is.** One gzip CSV file per feed version: one row per
+  station-level stop at which a rail trip calls (the GTFS parent station, or
+  the NeTEx root StopPlace), with its name, position, country, rail modes,
+  number of rail calls, operators and every code seen at the station or its
+  platforms (`stop_id=…`, `@id=…`, keyList entries, `Quay/@id=…`). Buses,
+  trams, metros and rail replacement buses are left out. The file carries
+  the feed's key in the module (from the provider's configuration: its NAP
+  resolver, its URL, or `upload:` and the sha256 of the uploaded file; a
+  cross-border filter provider has none and writes none) and the sha256 of
+  the file VIATOR downloaded.
+- **When.** After "Refresh" (all providers or one) that fetched a timetable
+  or found it unchanged, and after an upload attached to an upload
+  provider, in the background once the page has its answer. A big national
+  NeTEx takes a few minutes, in the `web` container; the refresh answer does
+  not wait for it, and a MOTIS build never waits for it either.
+- **Where.** `/data/inbox/<sid>/_extracts/<PROVIDER>.<archive sha256>.<16 hex>.csv.gz`,
+  beside `_fetch_state/`, out of the timetable folders the builds read. The
+  same archive with the same extractor version is never extracted twice (the
+  cache); one file is kept per provider, the newest. Deleting the folder is
+  safe: the next refresh writes them again.
+- **What is cleaned.** The module refuses a whole file for one bad value, so
+  VIATOR drops or cleans before writing: codes whose name has a space or a
+  non-ASCII letter, values holding `|` or a control character, values over
+  200 characters, duplicates, more than 500 codes for a station (names over
+  200 characters are cut); a station without a name or a position is left
+  out. The `web` log has one line per extract, `station extract written:
+  format=… rows=… bytes=… dropped=<reason>:<count>,…`, never a name or code.
+- **When there is none.** A file that would pass one of the module's limits
+  (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`
+  log says `station extract not written: reason=<word>` at WARNING, where the
+  word is `too_many_rows`, `too_large`, `line_too_long`, `cell_too_long`,
+  `no_rail_stop` (no rail station in the feed), `bad_archive` (the file cannot
+  be read as its declared format) or `unsupported_format`. The refresh and the
+  graph are never affected.
+- **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
+  checkout> --feed-key <key> <file>` runs the module's own check on an
+  extract (it prints OK or the refusal word, never a value).
+
 ---
 
 ## Index of related guides
