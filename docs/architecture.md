@@ -1043,7 +1043,7 @@ serving journey queries — and the safety rails that keep a build from taking t
 |---|---|
 | `app/worker.py` (1331 lines) | The whole second process. Polls `rebuild_jobs`, debounces, runs the engine-specific build by shelling out to `docker compose`, promotes the result via a symlink, and watches for the reload-trigger sentinel. |
 | `app/station_builds.py` | Before each MOTIS build: asks the station module (MSMM) for a station build (`POST /internal/v1/builds`) and polls its state (`GET /internal/v1/builds/{id}`) until it ends, 30 min at most (MSMM decision 6). Never blocks the graph: every end of the wait but an operator's cancel lets the build go on. |
-| `app/station_extract_upload.py` | Sends the stop extracts of a session's feeds to the station module (MSMM 22.3, D-R15 A): per feed with a feed key, `HEAD /internal/v1/feeds/{key}/{sha256}?extractor_version=`, and on 404 `station_extract.build_extract` (its cache) then `PUT /internal/v1/feeds/{key}/extract` (gzip streamed from the file). After every refresh (a background task) and before every graph build, OTP and MOTIS (before the MOTIS station build wait). Bounded; never blocks a refresh or a graph; records the last outcome per provider for the feed-status panel. |
+| `app/station_extract_upload.py` | Sends the stop extracts of a session's feeds to the station module (MSMM 22.3, D-R15 A): per feed with a feed key, `HEAD /internal/v1/feeds/{key}/{sha256}?extractor_version=`, and on 404 `station_extract.build_extract` (its cache) then `PUT /internal/v1/feeds/{key}/extract` (gzip streamed from the file). After every refresh (the web process's sender thread) and before every graph build, OTP and MOTIS (before the MOTIS station build wait). Bounded; never blocks a refresh or a graph; records the last outcome per provider for the feed-status panel. |
 | `app/sessions_orchestrator.py` | Renders `docker-compose.sessions.yml` and `nginx-sessions.conf` from the DB — one service block + one nginx `location` per *serving* session. Generator only; it never calls docker itself. |
 | `app/router_config.py` | Pure function producing per-session `router-config.json` for OTP: GTFS-RT updaters (with credentials applied), API timeout, routing defaults. No DB, no crypto. |
 | `app/otp_heap.py` | Validates `-Xmx` strings; **derives the container's cgroup cap from the heap**; auto-sizes the heap to host RAM for a max-memory rebuild. |
@@ -1154,10 +1154,14 @@ job's log. A cancel is read before each feed and after each pause: a cancelled p
 `station_extract.failed type=<class>`) and the graph is built. Without the module configured: one
 INFO line `station_extract.skipped reason=off`, nothing noted.
 
-**After every refresh.** `refresh_sources` and `refresh_provider` (url and nap providers) add
-`station_extract_upload.send_after_refresh` as a FastAPI background task, run in the thread pool
-after the answer is sent: the same pass for the session (or that provider), budget 30 minutes,
-one pass at a time in a process (a lock). So an OTP session sends without a rebuild, and a refresh
+**After every refresh.** `refresh_sources` and `refresh_provider` (url and nap providers) call
+`station_extract_upload.after_refresh`, which queues the pass for one daemon sender thread of the
+web process and returns at once: the same pass for the session (or that provider), budget 30
+minutes, the passes one after the other, a pass already waiting for the same session and provider
+not queued twice. Not a FastAPI background task: the request's task list holds the extractor's own
+warm-up (`station_extract.warm_session_extracts`, PR 4), which its tests pin as the only task; the
+two may extract one archive at the same moment, which costs time only (the extractor writes its
+cache file in one rename). So an OTP session sends without a rebuild, and a refresh
 that found every file unchanged still sends what the module lacks (a first deploy, a new
 extractor version). The last outcome of each provider is written to
 `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` (`{"at", "state", "reason"}`), its

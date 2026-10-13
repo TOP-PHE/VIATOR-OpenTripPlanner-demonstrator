@@ -28,7 +28,6 @@ from typing import Annotated, Any, NamedTuple
 import httpx
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -1007,7 +1006,6 @@ _PROVIDER_FRESHNESS_HOURS = 24
 async def refresh_sources(
     sid: str,
     request: Request,
-    background: BackgroundTasks,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
@@ -1091,9 +1089,9 @@ async def refresh_sources(
     )
     db.commit()
     # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
-    # the stop extracts the station module lacks are sent, after this answer
-    # (a background task, so the refresh never waits on the module).
-    background.add_task(station_extract_upload.send_after_refresh, sid)
+    # the stop extracts the station module lacks are sent, by the process's
+    # sender thread (the refresh never waits on the module).
+    station_extract_upload.after_refresh(sid)
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -2308,7 +2306,6 @@ async def refresh_provider(
     sid: str,
     pid: str,
     request: Request,
-    background: BackgroundTasks,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
@@ -2352,8 +2349,8 @@ async def refresh_provider(
     refreshed = await _refresh_provider_urls(
         db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
-    # MSMM 22.3: this provider's extract, if the module lacks it, after the answer.
-    background.add_task(station_extract_upload.send_after_refresh, sid, pid)
+    # MSMM 22.3: this provider's extract, if the module lacks it (sender thread).
+    station_extract_upload.after_refresh(sid, pid)
     return refreshed
 
 

@@ -24,8 +24,8 @@ follows for a MOTIS session (`app/station_builds.py`) queues it at once.
 **When** (`send_session_extracts`):
 
 - at the end of every refresh of a session's sources, whatever its engine
-  (the refresh endpoints of `app/api/admin/sessions.py` hand it to a
-  background task after their answer: `REFRESH_BUDGET_SECONDS`);
+  (the refresh endpoints of `app/api/admin/sessions.py` queue it for the
+  process's sender thread, `after_refresh`: `REFRESH_BUDGET_SECONDS`);
 - in the worker, at the start of every rebuild job, OTP or MOTIS; for a
   MOTIS session **before** the station build request and its wait, so that
   the build sees the new extracts (`BUILD_BUDGET_SECONDS`).
@@ -84,6 +84,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import re
 import threading
 import time
@@ -795,8 +796,54 @@ def send_session(
 
 
 def send_after_refresh(sid: str, only_provider: str | None = None) -> None:
-    """The background task of a refresh (after its answer is sent)."""
+    """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender thread."""
     send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider)
+
+
+# The refresh endpoints hand their pass to one sender thread of the process,
+# which runs the passes one after the other, never on the event loop and
+# never inside the refresh. Not a FastAPI background task: the request's
+# task list holds the extractor's own warm-up (`station_extract.
+# warm_session_extracts`, pull request 4), which its tests pin as the only
+# task. The two may then extract one archive at the same time: the
+# extractor writes its cache file in one rename, so the cost is time, not a
+# broken file. A pass already waiting for the same session and provider is
+# not queued twice.
+_waiting: queue.Queue[tuple[str, str | None]] = queue.Queue()
+_queued: set[tuple[str, str | None]] = set()
+_queued_lock = threading.Lock()
+_sender: threading.Thread | None = None
+
+
+def _send_queued() -> None:
+    while True:
+        item = _waiting.get()
+        with _queued_lock:
+            _queued.discard(item)
+        try:
+            send_after_refresh(*item)
+        except Exception as exc:  # the thread must outlive any one pass
+            log.warning("station_extract.failed reason=%s type=%s", ERROR, type(exc).__name__)
+        finally:
+            _waiting.task_done()
+
+
+def after_refresh(sid: str, only_provider: str | None = None) -> None:
+    """Queue the pass of a refresh; returns at once. Without the module
+    configured nothing is queued (one INFO line)."""
+    global _sender
+    if not station_module.enabled():
+        log.info("station_extract.skipped reason=off")
+        return
+    item = (sid, only_provider)
+    with _queued_lock:
+        if item in _queued:
+            return
+        _queued.add(item)
+        if _sender is None or not _sender.is_alive():
+            _sender = threading.Thread(target=_send_queued, name="station-extracts", daemon=True)
+            _sender.start()
+    _waiting.put(item)
 
 
 LOG_MARKER = "[viator] station-extracts:"

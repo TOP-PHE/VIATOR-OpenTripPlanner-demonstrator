@@ -11,9 +11,11 @@ from __future__ import annotations
 import inspect
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import BackgroundTasks
 
 from app import station_builds as sb
 from app import station_extract_upload as up
@@ -167,16 +169,73 @@ def test_the_worker_pass_asks_for_the_cancel(monkeypatch: pytest.MonkeyPatch) ->
 # ── after a refresh ──────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("endpoint", "after"),
-    [("refresh_sources", "db.commit()"), ("refresh_provider", "await _refresh_provider_urls")],
-)
-def test_every_refresh_hands_the_pass_to_a_background_task(endpoint: str, after: str) -> None:
-    source = inspect.getsource(getattr(sessions_api, endpoint))
-    assert "background: BackgroundTasks" in source
-    assert "background.add_task(station_extract_upload.send_after_refresh, sid" in source
-    # Once the refresh is written: the task runs after the answer is sent.
-    assert source.index("background.add_task") > source.index(after)
+_ACTOR = SimpleNamespace(id=uuid.uuid4(), username="ops@example.invalid", role="content_manager")
+_REQUEST = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+_CONFIG = {
+    "sources": {
+        "providers": [
+            {"id": "ZZRAIL", "timetable": {"format": "gtfs", "url": "https://zz.invalid/zz.zip"}}
+        ]
+    }
+}
+
+
+def _fake_db() -> SimpleNamespace:
+    row = SimpleNamespace(id="zz-session", config=dict(_CONFIG), state="populated")
+    return SimpleNamespace(get=lambda _model, _sid: row, commit=lambda: None)
+
+
+def _args(endpoint: Any, **given: Any) -> dict[str, Any]:
+    """The endpoint's arguments by name; a task list when it takes one (the
+    extractor's warm-up of pull request 4 adds it)."""
+    args: dict[str, Any] = {**given, "request": _REQUEST, "db": _fake_db(), "actor": _ACTOR}
+    if "background" in inspect.signature(endpoint).parameters:
+        args["background"] = BackgroundTasks()
+    return args
+
+
+def _record_queue(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+    queued: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        sessions_api.station_extract_upload, "after_refresh", lambda *a: queued.append(a)
+    )
+    return queued
+
+
+@pytest.mark.parametrize("bucket", ["fetched", "unchanged", "skipped"])
+async def test_every_session_refresh_queues_the_pass(
+    monkeypatch: pytest.MonkeyPatch, bucket: str
+) -> None:
+    outcome: dict[str, list[Any]] = {"fetched": [], "unchanged": [], "skipped": []}
+    outcome[bucket] = [{"key": "provider[ZZRAIL].timetable(gtfs)"}]
+
+    async def gathered(*_a: Any, **_k: Any) -> tuple[list[Any], ...]:
+        return outcome["fetched"], outcome["unchanged"], outcome["skipped"]
+
+    async def no_cascade(*_a: Any, **_k: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(sessions_api, "_gather_refresh_outcomes", gathered)
+    monkeypatch.setattr(sessions_api, "_cascade_derived_refresh", no_cascade)
+    monkeypatch.setattr(sessions_api, "flag_modified", lambda *_a: None)
+    monkeypatch.setattr(sessions_api.audit, "record", lambda *_a, **_k: None)
+    queued = _record_queue(monkeypatch)
+    await sessions_api.refresh_sources(**_args(sessions_api.refresh_sources, sid="zz-session"))
+    # Whatever the refresh found: a first deploy or a new extractor version
+    # sends what the module lacks even when every file is unchanged.
+    assert queued == [("zz-session",)]
+
+
+async def test_a_provider_refresh_queues_its_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def refreshed(*_a: Any, **_k: Any) -> sessions_api.RefreshSourcesResponse:
+        return sessions_api.RefreshSourcesResponse(fetched=[], skipped=[{"key": "t"}])
+
+    monkeypatch.setattr(sessions_api, "_refresh_provider_urls", refreshed)
+    queued = _record_queue(monkeypatch)
+    await sessions_api.refresh_provider(
+        **_args(sessions_api.refresh_provider, sid="zz-session", pid="ZZRAIL")
+    )
+    assert queued == [("zz-session", "ZZRAIL")]
 
 
 # ── what the Sessions page shows ─────────────────────────────────────────

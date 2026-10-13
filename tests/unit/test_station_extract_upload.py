@@ -1056,3 +1056,59 @@ def test_each_outcome_is_counted(
     _run(setup, module, clock)
     after = {o: value(o) - before[o] for o in STATION_EXTRACT_OUTCOMES}
     assert after == {"sent": 1, "held": 1, "refused": 1, "skipped": 0, "unavailable": 0}
+
+
+@pytest.mark.usefixtures("token")
+def test_the_sender_thread_runs_the_queued_passes_in_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    ran: list[tuple[str, str | None]] = []
+    gate = threading.Event()
+    done = threading.Event()
+
+    def send(sid: str, only_provider: str | None = None) -> None:
+        gate.wait(5)
+        ran.append((sid, only_provider))
+        if len(ran) == 2:
+            done.set()
+
+    monkeypatch.setattr(up, "send_after_refresh", send)
+    up.after_refresh("zz", None)
+    up.after_refresh("zz", "ZZ0")
+    up.after_refresh("zz", "ZZ0")  # already waiting: not queued twice
+    gate.set()
+    assert done.wait(5)
+    up._waiting.join()
+    assert ran == [("zz", None), ("zz", "ZZ0")]
+
+
+@pytest.mark.usefixtures("token")
+def test_a_failing_pass_does_not_stop_the_sender(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[str] = []
+
+    def send(sid: str, only_provider: str | None = None) -> None:
+        calls.append(sid)
+        if sid == "zz-a":
+            raise RuntimeError("stand-in")
+
+    monkeypatch.setattr(up, "send_after_refresh", send)
+    with caplog.at_level(logging.WARNING, logger="app.station_extract_upload"):
+        up.after_refresh("zz-a")
+        up._waiting.join()
+        up.after_refresh("zz-b")
+        up._waiting.join()
+    assert calls == ["zz-a", "zz-b"]
+    assert "station_extract.failed reason=error type=RuntimeError" in caplog.text
+
+
+def test_without_the_module_a_refresh_queues_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(settings, "station_module_url", "")
+    monkeypatch.setattr(up, "send_after_refresh", lambda *_a: pytest.fail("queued"))
+    with caplog.at_level(logging.INFO, logger="app.station_extract_upload"):
+        up.after_refresh("zz")
+    assert up._waiting.unfinished_tasks == 0
+    assert "station_extract.skipped reason=off" in caplog.text
