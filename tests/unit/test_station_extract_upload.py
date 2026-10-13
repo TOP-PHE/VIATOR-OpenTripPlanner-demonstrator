@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import secrets
 import threading
 import tracemalloc
@@ -1660,3 +1661,64 @@ def test_a_slow_name_lookup_does_not_hold_the_pass(
     result = up.send_session_extracts(SESSION, setup.feeds, budget=60.0, record=False)
     assert _states(result) == [(up.UNAVAILABLE, up.TIMEOUT)]
     assert _time.monotonic() - started < 1.5
+
+
+# ── paths from a session id or a provider id (CodeQL py/path-injection) ──
+
+BAD_SESSIONS = ["..", "../zz", "/zz-abs", "zz\x00x", "zz\n", "ZZ", "z", "zz/../yy", "zz.x"]
+BAD_PROVIDERS = ["..", "../ZZ", "ZZ/../YY", "/ZZ", "ZZ\x00", "zz", "ZZ\n", "Z"]
+
+
+@pytest.mark.parametrize("sid", BAD_SESSIONS, ids=range(len(BAD_SESSIONS)))
+def test_a_session_id_of_another_form_names_no_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str
+) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises(ValueError):
+        up._session_dir(sid)
+    up.record_outcome(sid, up.FeedOutcome("ZZ0", up.SENT))
+    assert up.load_outcome(sid, "ZZ0") is None
+    up.forget_outcome(sid, "ZZ0")
+    up.forget_outcomes_except(sid, set())
+    assert up.session_feeds(sid, {"sources": {"providers": []}}, {}) == []
+    # Nothing was written anywhere under the scratch folder.
+    assert set(tmp_path.rglob("*")) == before
+
+
+@pytest.mark.parametrize("pid", BAD_PROVIDERS, ids=range(len(BAD_PROVIDERS)))
+def test_a_provider_id_of_another_form_names_no_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: str
+) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    with pytest.raises(ValueError):
+        up._outcome_path("zz", pid)
+    up.record_outcome("zz", up.FeedOutcome(pid, up.SENT))
+    assert up.load_outcome("zz", pid) is None
+    up.forget_outcome("zz", pid)
+    assert list(tmp_path.rglob("*.json")) == []
+    assert up._archive("zz", {"id": pid, "timetable": {"format": "gtfs"}}) is None
+
+
+def test_a_session_folder_linked_outside_the_inbox_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = tmp_path / "inbox"
+    outside = tmp_path / "outside"
+    inbox.mkdir(exist_ok=True)
+    outside.mkdir()
+    (inbox / "zz").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    with pytest.raises(ValueError):
+        up._session_dir("zz")
+    up.record_outcome("zz", up.FeedOutcome("ZZ0", up.SENT))
+    assert list(outside.rglob("*")) == []
+
+
+def test_a_valid_session_folder_stays_in_the_inbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    assert up._session_dir("zz-e2e") == Path(os.path.realpath(tmp_path)) / "zz-e2e"

@@ -101,6 +101,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -688,8 +689,37 @@ def _refused(pid: str, answer: _Answer) -> FeedOutcome:
 # ── the feeds of a session ───────────────────────────────────────────────
 
 
+# A VIATOR session id as `create_session` admits it, and a provider id as
+# `ingestion` admits it: checked again wherever one names a path.
+SESSION_SLUG = re.compile(r"[a-z][a-z0-9-]{1,62}", re.ASCII)
+PROVIDER_ID = re.compile(r"[A-Z][A-Z0-9_-]{1,15}", re.ASCII)
+
+
+def _session_dir(sid: str) -> Path:
+    """`<inbox>/<sid>`, for a session id of the slug form only, resolved and
+    checked to sit inside the inbox (pythonsecurity:S2083, CodeQL
+    py/path-injection): a value such as `..`, an absolute path or a NUL is
+    refused with `ValueError` whatever the callers checked before."""
+    if SESSION_SLUG.fullmatch(sid) is None:
+        raise ValueError("not a session id")
+    base = Path(os.path.realpath(settings.inbox_dir))
+    folder = Path(os.path.realpath(base / sid))
+    if folder == base or not folder.is_relative_to(base):
+        raise ValueError("session folder outside the inbox")
+    return folder
+
+
 def _fetch_state_dir(sid: str) -> Path:
-    return settings.inbox_dir / sid / "_fetch_state"
+    return _session_dir(sid) / "_fetch_state"
+
+
+def _outcome_path(sid: str, provider_id: str) -> Path:
+    """The file of a provider's last outcome; `ValueError` for an id of
+    another form (`feed_fetch.state_path` checks the name and the folder
+    again)."""
+    if PROVIDER_ID.fullmatch(provider_id) is None:
+        raise ValueError("not a provider id")
+    return feed_fetch.state_path(_fetch_state_dir(sid), STATE_KEY.format(pid=provider_id))
 
 
 def _archive(sid: str, provider: dict[str, Any]) -> Path | None:
@@ -698,9 +728,10 @@ def _archive(sid: str, provider: dict[str, Any]) -> Path | None:
     details = ingestion.TIMETABLE_FORMAT_DETAILS.get(fmt)
     if details is None:
         return None
+    if PROVIDER_ID.fullmatch(str(provider.get("id"))) is None:
+        return None
     path = (
-        settings.inbox_dir
-        / sid
+        _session_dir(sid)
         / details["subdir"]
         / ingestion.staged_filename_for_format(provider["id"], fmt)
     )
@@ -720,6 +751,8 @@ def session_feeds(sid: str, config: dict[str, Any], upload_sha256: dict[str, str
     row, `upload_sha256` by provider id) for an `upload` one, which is also
     its feed key. A provider whose slot is empty, or whose file came in
     another way than its source (no fetch state), has no archive."""
+    if SESSION_SLUG.fullmatch(sid) is None:
+        return []
     try:
         providers = ingestion.normalize_providers(config)
     except ValueError:
@@ -772,14 +805,23 @@ def record_outcome(sid: str, outcome: FeedOutcome, *, at: datetime | None = None
         "state": outcome.state,
         "reason": outcome.reason,
     }
-    feed_fetch.save_state(_fetch_state_dir(sid), STATE_KEY.format(pid=outcome.provider_id), state)
+    try:
+        path = _outcome_path(sid, outcome.provider_id)
+    except ValueError:
+        log.warning("station_extract.not_recorded reason=bad_id")
+        return
+    feed_fetch.save_state(path.parent, STATE_KEY.format(pid=outcome.provider_id), state)
 
 
 def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
     """A provider's last outcome as the Sessions page shows it, or None:
     `{"at", "state", "reason", "text"}`, the text one of `STATUS_TEXTS`
     (with the refusal's word)."""
-    state = feed_fetch.load_state(_fetch_state_dir(sid), STATE_KEY.format(pid=provider_id))
+    try:
+        path = _outcome_path(sid, provider_id)
+    except ValueError:
+        return None
+    state = feed_fetch.load_state(path.parent, STATE_KEY.format(pid=provider_id))
     word = state.get("state")
     if word not in STATUS_TEXTS:
         return None
@@ -801,9 +843,7 @@ _OUTCOME_FILE = re.compile(r"provider_([A-Z][A-Z0-9_-]{1,15})_\.station_extract\
 def forget_outcome(sid: str, provider_id: str) -> None:
     """Remove a provider's last outcome (its slot got another file). Best-effort."""
     with contextlib.suppress(OSError, ValueError):
-        feed_fetch.state_path(_fetch_state_dir(sid), STATE_KEY.format(pid=provider_id)).unlink(
-            missing_ok=True
-        )
+        _outcome_path(sid, provider_id).unlink(missing_ok=True)
 
 
 def forget_outcomes_except(sid: str, keep: set[str] | None) -> None:
@@ -813,7 +853,7 @@ def forget_outcomes_except(sid: str, keep: set[str] | None) -> None:
         return
     try:
         names = [p.name for p in _fetch_state_dir(sid).iterdir()]
-    except OSError:
+    except (OSError, ValueError):
         return
     for name in names:
         found = _OUTCOME_FILE.fullmatch(name)
