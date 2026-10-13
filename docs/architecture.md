@@ -1016,8 +1016,13 @@ web process runs `warm_session_extracts` from a bounded, merging queue (never th
 where a warm waiting minutes for the lock would starve every plain-def endpoint), so
 the extracts sit in `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex>.csv.gz` before
 anything sends them (pull request 5). It pairs each slot file with its sha256 through
-`provider_archive_snapshot` (the slot opened first, the fetch state read, the open file checked to be
-the slot's, then hard-linked to a `.snap` the extraction reads), drops a (session, provider, sha256)
+`provider_archive_snapshot` (the slot opened first, the fetch state read, the slot hard-linked to a
+`.snap` the extraction reads, the link checked to be the file opened first, then the snapshot checked
+to be the file the state describes: size, then streamed sha256, against the state's `slot_size_bytes`
+and `slot_sha256`, which `feed_fetch` records for the downloaded or re-wrapped file; a refresh
+dispatches the new file *before* it saves its state, and a snapshot taken in between is refused as
+`archive_changed`, the next warm takes it; when a cached extract of the state's sha256 exists the slot
+is neither snapshotted nor hashed), drops a (session, provider, sha256)
 already in progress, sweeps left-over `.tmp`/`.snap` files whose inode changed more than an hour ago
 (`st_ctime`: a snapshot's `st_mtime` is the slot's download time), and logs one line per provider with
 `sid=`, `provider=`, a reason word, and for a ready extract its rows, bytes and dropped counts (the

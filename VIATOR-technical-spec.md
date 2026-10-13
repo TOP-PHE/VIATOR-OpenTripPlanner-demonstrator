@@ -402,7 +402,9 @@ ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, sess
                cache_dir=None, wait_seconds=None) -> ExtractResult   # the one entry point
 # ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
 #               body_sha256, dropped); ExtractError(reason) when nothing is written
-provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager
+provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager:
+# the slot hard-linked, checked to be the file opened and the file the fetch state describes
+# (slot_size_bytes, then the streamed slot_sha256 that feed_fetch records), else None
 warm_session_extracts(session_id, config, *, only_provider=None, upload_sha256=None)
 build_extract(...)   # in-process: the child of ensure_extract and the tests only
 ```

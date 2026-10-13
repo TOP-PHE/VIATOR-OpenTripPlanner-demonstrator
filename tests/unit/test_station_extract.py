@@ -212,6 +212,16 @@ def _provider(fmt: str = "gtfs", **timetable: Any) -> dict[str, Any]:
     return {"id": "ZZRAIL", "label": "ZZ Rail", "country_iso": "ZZ", "timetable": tt}
 
 
+def sha_of(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def download_state(path: Path) -> dict[str, Any]:
+    """The fetch state `feed_fetch` saves for a zip downloaded as it is."""
+    sha, size = sha_of(path), path.stat().st_size
+    return {"sha256": sha, "size_bytes": size, "slot_sha256": sha, "slot_size_bytes": size}
+
+
 def _build(
     provider: dict[str, Any], archive: Path, tmp_path: Path, sha: str = SHA_A
 ) -> station_extract.ExtractResult:
@@ -1022,11 +1032,11 @@ def test_warm_session_extracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(station_extract.settings, "inbox_dir", inbox)
     session = inbox / "zz-session"
     (session / "gtfs").mkdir(parents=True)
-    _gtfs(session / "gtfs", name="zzrail.zip")
-    _gtfs(session / "gtfs", name="zzup.zip")
+    rail = _gtfs(session / "gtfs", name="zzrail.zip")
+    up = _gtfs(session / "gtfs", name="zzup.zip")
     _gtfs(session / "gtfs", name="zzwait.zip")
     feed_fetch.save_state(
-        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", {"sha256": SHA_A}
+        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", download_state(rail)
     )
     config = {
         "sources": {
@@ -1049,11 +1059,11 @@ def test_warm_session_extracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
             ]
         }
     }
-    out = warm_session_extracts("zz-session", config, upload_sha256={"ZZUP": SHA_B})
+    out = warm_session_extracts("zz-session", config, upload_sha256={"ZZUP": sha_of(up)})
     assert isinstance(out["ZZRAIL"], station_extract.ExtractResult)
-    assert out["ZZRAIL"].feed_version == SHA_A  # the downloaded bytes', from the fetch state
+    assert out["ZZRAIL"].feed_version == sha_of(rail)  # the download's, from the fetch state
     assert isinstance(out["ZZUP"], station_extract.ExtractResult)
-    assert out["ZZUP"].feed_key == f"upload:{SHA_B}"
+    assert out["ZZUP"].feed_key == f"upload:{sha_of(up)}"
     assert out["ZZWAIT"] == out["ZZNONE"] == out["ZZX"] == "skipped"
     assert out["ZZRAIL"].path_gz.parent == session / "_extracts"
     only = warm_session_extracts("zz-session", config, only_provider="ZZRAIL")
@@ -1069,7 +1079,9 @@ def test_warm_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     (inbox / "s" / "gtfs").mkdir(parents=True)
     (inbox / "s" / "gtfs" / "zzrail.zip").write_bytes(b"not a zip")
     feed_fetch.save_state(
-        inbox / "s" / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", {"sha256": SHA_A}
+        inbox / "s" / "_fetch_state",
+        "provider[ZZRAIL].timetable(gtfs)",
+        download_state(inbox / "s" / "gtfs" / "zzrail.zip"),
     )
     config = {"sources": {"providers": [_provider()]}}
     assert warm_session_extracts("s", config) == {"ZZRAIL": "bad_archive"}

@@ -2894,7 +2894,14 @@ sent yet and no graph build changes.
   `reason=in_flight` (the same archive is being extracted),
   `reason=snapshot_failed` (the timetable file could not be hard-linked into
   `_extracts/`: another disk, a permission) or `reason=slot_changed` (a
-  refresh replaced the file meanwhile; the next one extracts it), or
+  refresh replaced the file meanwhile; the next one extracts it),
+  `reason=archive_changed` (the file in the slot is not yet the one its
+  download state describes: a refresh is between writing the file and
+  saving its state; the next one extracts it), `reason=archive_unverified`
+  (a NeTEx file re-wrapped from `.xml.gz` or `.xml` whose download state was
+  written by an earlier VIATOR: it is extracted after its next changed
+  download, or after deleting that provider's file in `_fetch_state/` and
+  refreshing), or
   `station extract not queued: … reason=queue_full`; never a name or code.
 - **When there is none.** A file that would pass one of the module's limits
   (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`

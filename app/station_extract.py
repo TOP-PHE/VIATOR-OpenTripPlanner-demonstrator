@@ -907,7 +907,7 @@ def provider_archive_snapshot(
     upload_sha256: str | None = None,
 ) -> Iterator[tuple[Path, str] | None]:
     """The provider's timetable slot file and the sha256 of the bytes behind
-    it, as a pair that cannot drift apart, or None when there is none yet.
+    it, checked to belong together, or None when there is none yet.
 
     For a `url` or `nap` provider the sha256 is the one of the last download,
     kept in the fetch state (`FetchResult.sha256`, also kept on a 304); an
@@ -916,11 +916,16 @@ def provider_archive_snapshot(
 
     The slot is opened first, then the state read, then the slot hard-linked
     to a snapshot (`.<pid>.<random>.snap` in the session's `_extracts/`,
-    removed on leaving) and the pair used only when the snapshot is the very
+    removed on leaving). The pair is used only when the snapshot is the very
     file opened first (`os.fstat` of the open file against the snapshot's
-    `stat`): a refresh that replaced the slot meanwhile cannot pair this
-    sha256 with another file, and the extraction reads the snapshot, which no
-    refresh can replace."""
+    `stat`) and is the file the state describes: its size, then its sha256
+    (streamed), against the state's `slot_size_bytes` and `slot_sha256`
+    (`feed_fetch`; for an upload, `upload_sha256`). A refresh dispatches the
+    new file before it saves its state: a snapshot taken between the two
+    holds the new file and reads the old sha256, and is refused
+    (`archive_changed`) instead of being labelled with the wrong version; the
+    next warm takes it. The extraction reads the snapshot, which no refresh
+    can replace."""
     with _snapshot(session_id, provider_cfg, upload_sha256) as (found, _reason):
         yield found
 
@@ -931,8 +936,12 @@ def _snapshot(
 ) -> Iterator[tuple[tuple[Path, str] | None, str]]:
     """`provider_archive_snapshot`, with the reason word when there is none:
     `skipped` (no slot file or no sha256 yet), `snapshot_failed` (the hard
-    link could not be made: another device, a permission) or `slot_changed`
-    (a refresh replaced the slot meanwhile)."""
+    link could not be made: another device, a permission), `slot_changed`
+    (a refresh replaced the slot meanwhile), `archive_changed` (the snapshot
+    is not the file the state describes: a refresh dispatched a new file and
+    has not saved its state yet) or `archive_unverified` (a state written
+    before this release, of a re-wrapped file, which cannot be checked; the
+    next download of a new file writes what is needed)."""
     found = _slot_and_source(session_id, provider_cfg)
     fd = _open_slot(found[0]) if found is not None else None
     if found is None or fd is None:
@@ -942,19 +951,70 @@ def _snapshot(
     snapshot: Path | None = None
     reason = "skipped"
     try:
-        sha = _sha_of_source(session_id, source, state_name, upload_sha256)
-        if sha is not None:
+        expected = _expected(session_id, source, state_name, upload_sha256)
+        if expected is not None:
             snapshot, reason = _link_snapshot(fd, slot, session_id, str(provider_cfg["id"]))
     finally:
         os.close(fd)
     try:
-        if snapshot is not None and sha is not None:
-            yield (snapshot, sha), ""
+        if snapshot is not None and expected is not None:
+            reason = _verify(snapshot, expected)
+        if snapshot is not None and expected is not None and not reason:
+            yield (snapshot, expected.sha256), ""
         else:
             yield None, reason
     finally:
         if snapshot is not None:
             snapshot.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class _Expected:
+    """What the slot must hold: `sha256` labels the extract (the download's,
+    or the upload's), `slot_sha256` and `slot_size` describe the slot file
+    itself (a re-wrapped `.xml.gz` differs from its download); `legacy` when
+    the fetch state predates `slot_sha256`."""
+
+    sha256: str
+    slot_sha256: str
+    slot_size: int | None
+    legacy: bool = False
+
+
+def _expected(
+    session_id: str, source: str, state_name: str, upload_sha256: str | None
+) -> _Expected | None:
+    if source == "upload":
+        if upload_sha256 is None or _SHA256.fullmatch(upload_sha256) is None:
+            return None
+        return _Expected(upload_sha256, upload_sha256, None)
+    state = feed_fetch.load_state(settings.inbox_dir / session_id / "_fetch_state", state_name)
+    sha = state.get("sha256")
+    if not isinstance(sha, str) or _SHA256.fullmatch(sha) is None:
+        return None
+    slot_sha, slot_size = state.get("slot_sha256"), state.get("slot_size_bytes")
+    if isinstance(slot_sha, str) and _SHA256.fullmatch(slot_sha) and isinstance(slot_size, int):
+        return _Expected(sha, slot_sha, slot_size)
+    size = state.get("size_bytes")
+    return _Expected(sha, sha, size if isinstance(size, int) else None, legacy=True)
+
+
+def _verify(snapshot: Path, expected: _Expected) -> str:
+    """'' when the snapshot is the file the state describes (its size, then
+    its sha256, streamed), else the reason word. Hashing a national archive
+    takes seconds: it runs on the warm thread or in the worker, never in a
+    request thread, and only when no cached extract of that sha256 exists."""
+    try:
+        size = snapshot.stat().st_size
+        if expected.slot_size is not None and size != expected.slot_size:
+            return "archive_unverified" if expected.legacy else "archive_changed"
+        digest = hashlib.sha256()
+        with snapshot.open("rb") as fh:
+            while chunk := fh.read(MEGABYTE):
+                digest.update(chunk)
+    except OSError:
+        return "snapshot_failed"
+    return "" if digest.hexdigest() == expected.slot_sha256 else "archive_changed"
 
 
 def _open_slot(slot: Path) -> int | None:
@@ -986,17 +1046,6 @@ def _slot_and_source(
     return slot, source, f"provider[{pid}].timetable({fmt})"
 
 
-def _sha_of_source(
-    session_id: str, source: str, state_name: str, upload_sha256: str | None
-) -> str | None:
-    if source == "upload":
-        sha = upload_sha256
-    else:
-        state = feed_fetch.load_state(settings.inbox_dir / session_id / "_fetch_state", state_name)
-        sha = state.get("sha256") if isinstance(state.get("sha256"), str) else None
-    return sha if sha is not None and _SHA256.fullmatch(sha) else None
-
-
 def _link_snapshot(fd: int, slot: Path, session_id: str, pid: str) -> tuple[Path | None, str]:
     """A hard link to the slot, kept only when it is the file open as `fd`;
     else None and the reason word."""
@@ -1018,11 +1067,31 @@ _IN_FLIGHT: set[tuple[str, str, str]] = set()
 _IN_FLIGHT_LOCK = threading.Lock()
 
 
+def _cached_for(
+    session_id: str, provider: Mapping[str, Any], upload_sha256: str | None
+) -> ExtractResult | None:
+    """The cached extract of the sha256 the state names, if any: then the
+    slot is neither snapshotted nor hashed (an extract of that sha256 was made
+    from a verified snapshot before)."""
+    found = _slot_and_source(session_id, provider)
+    expected = _expected(session_id, found[1], found[2], upload_sha256) if found else None
+    if expected is None:
+        return None
+    try:
+        plan = _plan(provider, Path(), expected.sha256, datetime.now(UTC), extracts_dir(session_id))
+    except ExtractError:
+        return None
+    return _cached(plan.final, plan.meta)
+
+
 def _warm_one(
     session_id: str, provider: Mapping[str, Any], upload_sha256: str | None
 ) -> ExtractResult | str:
     """The extract of one provider, or the reason word there is none."""
     pid = str(provider.get("id") or "")
+    cached = _cached_for(session_id, provider, upload_sha256)
+    if cached is not None:
+        return cached
     with _snapshot(session_id, provider, upload_sha256) as (found, reason):
         if found is None:
             return reason
@@ -1093,7 +1162,16 @@ def warm_session_extracts(
 
 
 # The reasons a provider has no extract that are not a failure.
-_SKIP_REASONS = frozenset({"skipped", "in_flight", "snapshot_failed", "slot_changed"})
+_SKIP_REASONS = frozenset(
+    {
+        "skipped",
+        "in_flight",
+        "snapshot_failed",
+        "slot_changed",
+        "archive_changed",
+        "archive_unverified",
+    }
+)
 
 
 def _log_outcome(session_id: str, pid: str, result: ExtractResult | str) -> None:
