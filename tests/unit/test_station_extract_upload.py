@@ -1058,6 +1058,16 @@ def test_each_outcome_is_counted(
     assert after == {"sent": 1, "held": 1, "refused": 1, "skipped": 0, "unavailable": 0}
 
 
+def _drained(seconds: float = 5.0) -> None:
+    """Wait until the sender thread has run every queued pass, or fail."""
+    import time as _time
+
+    end = _time.monotonic() + seconds
+    while up._waiting.unfinished_tasks and _time.monotonic() < end:
+        _time.sleep(0.01)
+    assert up._waiting.unfinished_tasks == 0, "the sender thread did not run the queued pass"
+
+
 @pytest.mark.usefixtures("token")
 def test_the_sender_thread_runs_the_queued_passes_in_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     import threading
@@ -1078,7 +1088,7 @@ def test_the_sender_thread_runs_the_queued_passes_in_turn(monkeypatch: pytest.Mo
     up.after_refresh("zz", "ZZ0")  # already waiting: not queued twice
     gate.set()
     assert done.wait(5)
-    up._waiting.join()
+    _drained()
     assert ran == [("zz", None), ("zz", "ZZ0")]
 
 
@@ -1096,9 +1106,9 @@ def test_a_failing_pass_does_not_stop_the_sender(
     monkeypatch.setattr(up, "send_after_refresh", send)
     with caplog.at_level(logging.WARNING, logger="app.station_extract_upload"):
         up.after_refresh("zz-a")
-        up._waiting.join()
+        _drained()
         up.after_refresh("zz-b")
-        up._waiting.join()
+        _drained()
     assert calls == ["zz-a", "zz-b"]
     assert "station_extract.failed reason=error type=RuntimeError" in caplog.text
 
