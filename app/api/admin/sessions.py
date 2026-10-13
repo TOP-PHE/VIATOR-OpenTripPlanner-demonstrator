@@ -28,6 +28,7 @@ from typing import Annotated, Any, NamedTuple
 import httpx
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -53,6 +54,7 @@ from ... import (
     sessions_orchestrator,
     staleness,
     station_builds,
+    station_extract,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -617,6 +619,7 @@ async def upload_to_session(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    background: BackgroundTasks,
     provider_id: Annotated[str | None, Form()] = None,
 ) -> UploadResponse:
     """Upload one file into this session's inbox.
@@ -671,6 +674,7 @@ async def upload_to_session(
     # Upload row records the link, instead of the generic gtfs.zip.
     staged_filename: str | None = None
     provider_feed_id: str | None = None
+    upload_source: str | None = None
     if provider_id:
         try:
             providers = ingestion.normalize_providers(s.config)
@@ -696,6 +700,7 @@ async def upload_to_session(
             )
         staged_filename = ingestion.staged_filename_for_format(provider_id, fmt)
         provider_feed_id = provider_id
+        upload_source = match["timetable"].get("source")
 
     triggered = ingestion.dispatch(
         staged_path, detected, db, session_id=sid, staged_filename=staged_filename
@@ -751,6 +756,16 @@ async def upload_to_session(
     )
     db.commit()
     db.refresh(upload)
+    if provider_feed_id is not None and upload_source == "upload":
+        # The station module's stop extract of this file, made now in the
+        # background so that sending it later never waits (app/station_extract.py).
+        background.add_task(
+            station_extract.warm_session_extracts,
+            sid,
+            dict(s.config or {}),
+            only_provider=provider_feed_id,
+            upload_sha256={provider_feed_id: upload.sha256},
+        )
     return UploadResponse(
         id=str(upload.id),
         filename=upload.filename,
@@ -1002,6 +1017,7 @@ async def refresh_sources(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    background: BackgroundTasks,
 ) -> RefreshSourcesResponse:
     """Download every PROVIDER URL in `config.sources` into the session's inbox.
 
@@ -1082,6 +1098,10 @@ async def refresh_sources(
         },
     )
     db.commit()
+    if fetched or unchanged:
+        # The station module's stop extracts of the files now in the slots,
+        # made (or found in the cache) after the answer is sent.
+        background.add_task(station_extract.warm_session_extracts, sid, dict(s.config or {}))
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -2298,6 +2318,7 @@ async def refresh_provider(
     request: Request,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
+    background: BackgroundTasks,
 ) -> RefreshSourcesResponse:
     """Refresh one provider. URL-source providers download their files; a
     cross_border_filter (derived) provider re-runs the filter on its linked
@@ -2336,9 +2357,14 @@ async def refresh_provider(
         return await _refresh_derived_provider(
             db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
         )
-    return await _refresh_provider_urls(
+    result = await _refresh_provider_urls(
         db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
+    if result.fetched or result.unchanged:
+        background.add_task(
+            station_extract.warm_session_extracts, sid, dict(s.config or {}), only_provider=pid
+        )
+    return result
 
 
 # ───────────────────────── per-provider status (v0.1.19) ─────────────────────
