@@ -291,6 +291,98 @@ def test_netex_entities_and_subsets(tmp_path: Path) -> None:
     assert _reason(provider, _zip(tmp_path / "n.zip", {"a.xml": named + body}), tmp_path) == "ok"
 
 
+def test_netex_attribute_between_the_bounds(tmp_path: Path) -> None:
+    # 1.5 MiB: past the attribute bound, under the token bound
+    body = (
+        f'<PublicationDelivery {NS}><Junk v="' + "A" * (3 * MIB // 2) + '"/></PublicationDelivery>'
+    )
+    archive = _zip(tmp_path / "a.zip", {"a.xml": body})
+    reader = netex._Archive(zipfile.ZipFile(archive))
+    with pytest.raises(station_extract_common.ArchiveError) as caught:
+        list(reader.walk(netex._JOURNEYS))
+    assert caught.value.detail == "an XML attribute over 1 MiB"
+
+
+def test_netex_unread_subtrees_not_built(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    passing = "".join(
+        f'<TimetabledPassingTime><StopPointInJourneyPatternRef ref="ZZ:SPJP:{n}"/>'
+        "</TimetabledPassingTime>"
+        for n in range(30)
+    )
+    timetable = EPIP_TIMETABLE.replace(
+        '<LineRef ref="ZZ:Line:R"/></ServiceJourney>',
+        f'<LineRef ref="ZZ:Line:R"/><passingTimes>{passing}</passingTimes></ServiceJourney>',
+    )
+    monkeypatch.setattr(netex, "TARGET_ELEMENTS_MAX", 20)
+    archive = _zip(tmp_path / "p.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + timetable)})
+    reader = netex._Archive(zipfile.ZipFile(archive))
+    journeys = [e for e in reader.walk(netex._JOURNEYS) if e.tag.endswith("ServiceJourney")]
+    assert len(journeys) == 4
+    assert all(netex._child(e, "passingTimes") is None for e in journeys)
+
+
+def test_assignment_and_quay_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = _zip(
+        tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
+    )
+    provider = _provider("netex_epip")
+    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2_000_000)
+    monkeypatch.setattr(netex, "QUAYS_MAX", 2)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+
+
+def test_lines_read_after_their_journeys(tmp_path: Path) -> None:
+    from app.station_extract_netex import _Archive, _read_journeys
+
+    bus_line = EPIP_TIMETABLE.replace(
+        '<ServiceJourney id="ZZ:SJ:3"><TransportMode>bus</TransportMode>',
+        '<ServiceJourney id="ZZ:SJ:3"><LineRef ref="ZZ:Line:B"/>',
+    )
+    archive = _zip(tmp_path / "b.zip", {"zz.xml": _delivery(bus_line + EPIP_SERVICE + EPIP_SITE)})
+    with zipfile.ZipFile(archive) as zf:
+        found = _read_journeys(_Archive(zf))
+    assert set(found.by_pattern) == {"ZZ:SJP:R", "ZZ:SJP:X"}
+
+
+def test_operators_of_journeys_without_a_mode(tmp_path: Path) -> None:
+    site = (
+        '<SiteFrame id="S"><stopPlaces>'
+        + _place("ZZ:SP:9", "<StopPlaceType>railStation</StopPlaceType>")
+        + "</stopPlaces></SiteFrame>"
+    )
+    service = (
+        '<ServiceFrame id="F"><stopAssignments>' + _psa(9, "S9", "ZZ:SP:9") + "</stopAssignments>"
+        '<journeyPatterns><ServiceJourneyPattern id="ZZ:P"><pointsInSequence>'
+        + _point(9, "S9")
+        + "</pointsInSequence></ServiceJourneyPattern></journeyPatterns></ServiceFrame>"
+    )
+    journeys = (
+        '<TimetableFrame id="T"><vehicleJourneys><ServiceJourney id="J">'
+        '<ServiceJourneyPatternRef ref="ZZ:P"/><OperatorRef ref="ZZ:Operator:9"/>'
+        "</ServiceJourney></vehicleJourneys></TimetableFrame>"
+    )
+    provider = _provider("netex_epip")
+    rows = _rows(
+        _build(provider, _netex(tmp_path, "o.zip", site, service, journeys), tmp_path), provider
+    )
+    assert rows["ZZ:SP:9"]["operators"] == "ZZ:Operator:9"
+
+
+def test_warm_sweeps_leftovers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _session(tmp_path, monkeypatch)
+    folder = session / "_extracts"
+    folder.mkdir()
+    old = folder / ".ZZRAIL.zz.tmp"
+    old.write_text("zz")
+    past = time.time() - station_extract.STALE_SECONDS - 10
+    os.utime(old, (past, past))
+    monkeypatch.setattr(station_extract, "_warm_one", lambda *_a: "skipped")
+    station_extract.warm_session_extracts("zz-session", {"sources": {"providers": [_provider()]}})
+    assert not old.exists()
+
+
 def test_netex_external_entity_handler_refuses() -> None:
     with pytest.raises(station_extract_common.ArchiveError):
         netex._refuse_external("c", None, "x", None)
@@ -330,9 +422,28 @@ def test_ensure_extract_in_a_child(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     def no_child(*_a: Any) -> None:
         raise AssertionError("a cache hit starts no child")
 
+    def no_lock(*_a: Any) -> None:
+        raise AssertionError("a cache hit takes no lock")
+
     monkeypatch.setattr(station_extract, "_run_child", no_child)
+    monkeypatch.setattr(station_extract, "_machine_lock", no_lock)
     again = ensure_extract(_provider(), archive, SHA_A, extracted_at=WHEN, session_id="zz-session")
     assert again.body_sha256 == result.body_sha256
+
+
+def test_ensure_extract_runs_the_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
+    started: list[Any] = []
+    real = station_extract._run_child
+
+    def spy(target: Any, args: tuple[Any, ...]) -> Any:
+        started.append(target)
+        return real(target, args)
+
+    monkeypatch.setattr(station_extract, "_run_child", spy)
+    result = ensure_extract(_provider(), _gtfs(tmp_path), SHA_A, extracted_at=WHEN, session_id="s")
+    assert started == [station_extract._child_build]
+    assert result.rows == 3
 
 
 def test_ensure_extract_child_failures_are_extract_errors(
@@ -451,6 +562,16 @@ def test_damaged_cache_is_made_again(tmp_path: Path, damage: str) -> None:
     assert again.path_gz == first.path_gz
     assert again.rows == 3
     assert again.path_gz.read_bytes() == body
+
+
+def test_damaged_cache_removed_even_when_not_made_again(tmp_path: Path) -> None:
+    archive = _gtfs(tmp_path)
+    first = _build(_provider(), archive, tmp_path)
+    first.path_gz.write_bytes(b"zz")
+    archive.unlink()
+    with pytest.raises(ExtractError):
+        _build(_provider(), archive, tmp_path)
+    assert not first.path_gz.exists()
 
 
 def test_temporary_file_synced_before_replace(

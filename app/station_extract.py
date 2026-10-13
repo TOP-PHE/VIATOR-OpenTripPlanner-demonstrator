@@ -887,11 +887,13 @@ def provider_archive_snapshot(
     upload into the slot forgets that state. For an `upload` provider it is
     `upload_sha256`, the sha256 of the uploaded file (`Upload.sha256`).
 
-    The slot is opened first, the state read, and the pair used only when the
-    open file is still the one at the slot; the file is then hard-linked to a
-    snapshot (`.<pid>.<random>.snap` in the session's `_extracts/`, removed on
-    leaving), so a refresh that replaces the slot meanwhile cannot pair this
-    sha256 with another file."""
+    The slot is opened first, then the state read, then the slot hard-linked
+    to a snapshot (`.<pid>.<random>.snap` in the session's `_extracts/`,
+    removed on leaving) and the pair used only when the snapshot is the very
+    file opened first (`os.fstat` of the open file against the snapshot's
+    `stat`): a refresh that replaced the slot meanwhile cannot pair this
+    sha256 with another file, and the extraction reads the snapshot, which no
+    refresh can replace."""
     found = _slot_and_source(session_id, provider_cfg)
     if found is None:
         yield None
@@ -905,7 +907,7 @@ def provider_archive_snapshot(
     snapshot: Path | None = None
     try:
         sha = _sha_of_source(session_id, source, state_name, upload_sha256)
-        if sha is not None and _same_file(fd, slot):
+        if sha is not None:
             snapshot = _link_snapshot(fd, slot, session_id, str(provider_cfg["id"]))
     finally:
         os.close(fd)
@@ -950,7 +952,7 @@ def _sha_of_source(
 
 
 def _link_snapshot(fd: int, slot: Path, session_id: str, pid: str) -> Path | None:
-    """A hard link to the open file, checked to be that very file."""
+    """A hard link to the slot, kept only when it is the file open as `fd`."""
     folder = extracts_dir(session_id)
     try:
         folder.mkdir(parents=True, exist_ok=True)

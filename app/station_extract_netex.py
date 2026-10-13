@@ -197,8 +197,8 @@ def _parser() -> Any:
     refuses every entity declaration (as defusedxml does)."""
     parser = expat.ParserCreate(namespace_separator="}")  # nosec B314
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    # Called for every entity declaration, internal, external and unparsed.
     parser.EntityDeclHandler = _refuse
-    parser.UnparsedEntityDeclHandler = _refuse
     parser.ExternalEntityRefHandler = _refuse_external
     for guard in (
         "SetAllocTrackerMaximumAmplification",
