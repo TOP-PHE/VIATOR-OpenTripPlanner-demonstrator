@@ -2832,6 +2832,95 @@ par VIATOR »). OTP builds do not wait.
   `docker exec viator-worker-1 python -c "from app import station_module; print(station_module.enabled())"`
   answers `True` (it shows neither the address nor the token).
 
+### 11.4 The stop extracts for the station module (MSMM referential)
+
+The station module builds its own station referential (the VIATOR station
+id) from the stops of the timetables VIATOR downloads (the module's design,
+section 22). VIATOR never sends an archive: for each version of each feed it
+writes a small **stop extract** and, from the next release (pull request 5),
+sends it to the module. This release only writes the extracts; nothing is
+sent yet and no graph build changes.
+
+- **What it is.** One gzip CSV file per feed version: one row per
+  station-level stop at which a rail trip calls (the GTFS parent station, or
+  the NeTEx root StopPlace), with its name, position, country, rail modes,
+  number of rail calls, operators and every code seen at the station or its
+  platforms (`stop_id=…`, `@id=…`, keyList entries, `Quay/@id=…`). Buses,
+  trams, metros and rail replacement buses are left out. The file carries
+  the feed's key in the module (from the provider's configuration: its NAP
+  resolver, its URL, or `upload:` and the sha256 of the uploaded file; a
+  cross-border filter provider has none and writes none) and the sha256 of
+  the file VIATOR downloaded.
+- **When.** After "Refresh" (all providers or one) that fetched a timetable
+  or found it unchanged, and after an upload attached to an upload
+  provider, queued once the page has its answer for one thread of the `web`
+  process that does nothing else (a queue of at most 64 sessions; a
+  session already waiting is not queued twice). The refresh answer does not
+  wait for it, no page waits for it, and a MOTIS build never waits for it
+  either.
+- **How, safely.** Each extraction runs in a separate child process of the
+  `web` container, one at a time on the server, with at most 2 GiB of
+  memory, 25 minutes of processor time and 30 minutes in all, at a lower
+  priority, and it dies with the web process. A broken, hostile or oversized
+  archive can only end that child: the log says `reason=resource_limit` (or
+  `input_too_large`, below) and the web process carries on. At the module's
+  200,000-row cap the child was measured at about 830 MiB (GTFS) and
+  730 MiB (NeTEx): the 2 GiB cap leaves some 2.4 times that. 25 minutes of
+  processor time leave room for a `stop_times.txt` of 3 to 4 GB (about
+  12 MB/s), which would be close to 15. Measured times: a 290 MB GTFS in about 25 s, a
+  540 MB single-file NeTEx in about 1 minute; a national file of a few GB
+  takes some minutes.
+- **Memory of the `web` container (a proposal for the owner, not set by
+  this release).** The `web` service has no `mem_limit` today. The
+  extraction adds at most its 2 GiB cap to what `web` already uses (peaks
+  measured: 86 MiB for an ordinary feed, about 830 MiB at the 200,000-row
+  cap). If a limit is set, take the `web`
+  container's usual peak (`docker stats`) plus 2 GiB, and not less than
+  4 GiB.
+- **Where.** `/data/inbox/<sid>/_extracts/<PROVIDER>.<archive sha256>.<16 hex>.csv.gz`,
+  beside `_fetch_state/`, out of the timetable folders the builds read. The
+  same archive with the same extractor version is never extracted twice (the
+  cache); one file is kept per provider, the newest. Deleting the folder is
+  safe: the next refresh writes them again.
+- **What is cleaned.** The module refuses a whole file for one bad value, so
+  VIATOR drops or cleans before writing: codes whose name has a space or a
+  non-ASCII letter, values holding `|` or a control character, values over
+  200 characters, duplicates, more than 500 codes for a station (names over
+  200 characters are cut); a station without a name or a position is left
+  out. The `web` log has one line per provider, with `sid=<session>` and
+  `provider=<id>`: `station extract ready: … rows=<n> bytes=<n>
+  dropped=<reason>:<count>,…` (what was cleaned or dropped), `station
+  extract skipped: … reason=skipped` (no file or no feed key yet),
+  `reason=in_flight` (the same archive is being extracted),
+  `reason=snapshot_failed` (the timetable file could not be hard-linked into
+  `_extracts/`: another disk, a permission) or `reason=slot_changed` (a
+  refresh replaced the file meanwhile; the next one extracts it),
+  `reason=archive_changed` (the file in the slot is not yet the one its
+  download state describes: a refresh is between writing the file and
+  saving its state; the next one extracts it), `reason=archive_unverified`
+  (a NeTEx file re-wrapped from `.xml.gz` or `.xml` whose download state was
+  written by an earlier VIATOR: it is extracted after its next changed
+  download, or after deleting that provider's file in `_fetch_state/` and
+  refreshing), or
+  `station extract not queued: … reason=queue_full`; never a name or code.
+- **When there is none.** A file that would pass one of the module's limits
+  (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`
+  log says `station extract not written: sid=… provider=… reason=<word>` at
+  WARNING, where the word is `too_many_rows`, `too_large`, `line_too_long`,
+  `cell_too_long`, `input_too_large` (the archive passes a bound of what
+  VIATOR reads: a record or text over 1 MiB, nesting past 64, more than 4 GiB
+  unpacked from one file, …), `resource_limit` (the child passed its memory
+  or time), `busy` (another extraction held the server too long),
+  `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
+  file whose rail journeys call but which defines no stop place, as some
+  timetable-only exports do), `bad_archive` (the file cannot be read as its
+  declared format, or a NeTEx file declares an XML entity, which VIATOR
+  refuses), `unsupported_format` or `error`. The refresh and the graph are
+  never affected. A cached file found damaged (after a crash) is made again.
+- **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
+  checkout> --feed-key <key> <file>` runs the module's own check on an
+  extract (it prints OK or the refusal word, never a value).
+
 ---
 
 ## Index of related guides

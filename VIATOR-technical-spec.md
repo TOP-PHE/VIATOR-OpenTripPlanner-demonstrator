@@ -388,6 +388,76 @@ The worker has an APScheduler-style cron that pulls fresh files on the configure
 
 For MERITS (when wired), the same shape applies — `kind: "MERITS-..."` with auth headers stored in `sessions.config.merits_credentials_ref` (a Postgres-stored encrypted secret reference).
 
+
+### 5.2 The stop extract for the station module (MSMM 22.2)
+
+`app/station_extract.py` writes, per feed version, the extract the station module's VIATOR station
+referential reads (MSMM `docs/service-design.md` 22.2 point 6; 22.3 point 3). Public interface, stable
+for the upload step:
+
+```python
+EXTRACTOR_VERSION: str                                   # "viator-stop-extract-1"
+feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
+ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, session_id,
+               cache_dir=None, wait_seconds=None, cache_only=False) -> ExtractResult
+#   the one entry point; cache_only=True returns a valid cached extract or raises
+#   ExtractError("not_cached") without starting or waiting for any extraction
+# ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
+#               body_sha256, dropped); ExtractError(reason) when nothing is written
+provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager:
+# the slot hard-linked, checked to be the file opened and the file the fetch state describes
+# (slot_size_bytes, then the streamed slot_sha256 that feed_fetch records), else None
+warm_session_extracts(session_id, config, *, only_provider=None, upload_sha256=None)
+build_extract(...)   # in-process: the child of ensure_extract and the tests only
+```
+
+- **Form**: gzip, UTF-8 without BOM, CSV, first line `format_version,feed_key,feed_version,
+  extracted_at,extractor_version,stop_key,stop_name,lat,lon,iso2_point,modes,n_calls,operators,codes,
+  provider_id,provider_label,provider_country_iso,provider_provenance`, `format_version` `1` on every
+  row; `modes`/`operators`/`codes` joined by `|`; a code `field=value`; `lat`/`lon` `format(x, ".7f")`;
+  `feed_version` the sha256 of the downloaded bytes (`FetchResult.sha256`, from the fetch state) or of
+  the uploaded file; `iso2_point` from `osm_geo.country_for_point`; `provider_provenance` the
+  provider's own, else the catalogue's for the same id and feed, else `nap` for a NAP-resolved one,
+  else empty.
+- **Feed key**: `nap:tdg:<resource id>`; `nap:<udata|permalink|dated|json_api>:` + 16 hex of the
+  sha256 of the canonical JSON of the resolver's own fields (validated; `dated` without
+  `max_days_back`); `url:` + 16 hex of lower-case host + path + sorted query; `upload:<sha256>`;
+  none for `cross_border_filter`. Identical to MSMM `feed_intake.resolver_identity`/`url_identity`.
+- **Rail and station level**: GTFS `route_type` 2, 100–117 (RAIL_MAIN) and 109, 300, 400, 403, 404
+  (RAIL_SUBURBAN), a call where a trip neither picks up nor drops off not counted, rolled up to the
+  `parent_station`; NeTEx `TransportMode` rail on the ServiceJourney or its Line (suburban by the
+  chain's submodes), a journey with no mode counted at a StopPlace whose mode is rail or type
+  `railStation` and gives no other mode, rolled up through `ParentSiteRef` to a defined StopPlace,
+  positions from `Latitude`/`Longitude` or a `gml:pos` in EPSG:4326/4258, CRS84 or EPSG:2154 (the code
+  matched exactly), or without a system (WGS84, latitude first, when the first value is ≤ 90).
+- **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072
+  characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
+  written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
+- **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
+  `RLIMIT_CPU` 25 min, 30 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
+  one at a time on the machine (`flock` on
+  `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
+  `wait_seconds` is `busy`.
+- **Input bounds**: unpacked bytes 4 GiB a member, 8 GiB a pass; GTFS records ≤1 MiB and ≤200 fields,
+  ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
+  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
+  assignments and Quays, no entity declaration (internal ones included), no external DTD loaded;
+  ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
+- **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
+  rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
+  peak RSS 86 MiB (three passes, about 10 MB/s); at the 200,000-row cap about 830 MiB RSS (GTFS) and
+  730 MiB (NeTEx), some 2.4 times under `RLIMIT_AS`; hostile shapes are refused within the first MiB.
+  A national file of a few GB takes some minutes; `RLIMIT_CPU` is 25 minutes because a 3–4 GB
+  `stop_times.txt` (about 12 MB/s) would be close to 15.
+- **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
+  key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts` on one
+  dedicated thread of the web process (`queue_warm`: a bounded queue of 64 jobs, a job already waiting
+  merged, never the request thread pool), queued after the answer by
+  `POST /api/sessions/{sid}/sources/refresh`, `POST /api/sessions/{sid}/providers/{pid}/refresh` and
+  an upload to an `upload` provider. A damaged cached file is removed and made again; `.tmp`/`.snap`
+  left-overs whose inode last changed more than an hour ago (`st_ctime`: a snapshot is a hard link,
+  its `st_mtime` the slot's) are swept.
+
 ---
 
 ## 6. Journey search & comparison

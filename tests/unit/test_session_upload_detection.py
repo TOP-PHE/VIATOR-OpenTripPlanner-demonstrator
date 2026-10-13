@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 from app.api.admin import sessions as sessions_api
 from app.settings import settings
@@ -45,6 +45,7 @@ async def test_session_upload_answers_400_when_detect_cannot_classify(
     session = SimpleNamespace(id="xb-test", config={}, state="created")
     db = SimpleNamespace(get=lambda _model, _sid: session)
     upload = UploadFile(file=io.BytesIO(data), filename=filename)
+    background = BackgroundTasks()
     with pytest.raises(HTTPException) as exc:
         await sessions_api.upload_to_session(
             "xb-test",
@@ -53,6 +54,7 @@ async def test_session_upload_answers_400_when_detect_cannot_classify(
             REQUEST,  # type: ignore[arg-type]
             db,  # type: ignore[arg-type]
             ACTOR,  # type: ignore[arg-type]
+            background,
         )
     assert exc.value.status_code == 400
     assert exc.value.detail.startswith("Detection failed: ")
@@ -66,6 +68,7 @@ async def test_a_file_that_is_not_what_was_declared_is_still_refused(inbox: Path
     session = SimpleNamespace(id="xb-test", config={}, state="created")
     db = SimpleNamespace(get=lambda _model, _sid: session)
     pbf = UploadFile(file=io.BytesIO(b"\x00\x00\x00\x0d\x0a\x09OSMHeader"), filename="x.osm.pbf")
+    background = BackgroundTasks()
     with pytest.raises(HTTPException) as exc:
         await sessions_api.upload_to_session(
             "xb-test",
@@ -74,6 +77,7 @@ async def test_a_file_that_is_not_what_was_declared_is_still_refused(inbox: Path
             REQUEST,  # type: ignore[arg-type]
             db,  # type: ignore[arg-type]
             ACTOR,  # type: ignore[arg-type]
+            background,
         )
     assert exc.value.status_code == 400
     assert "declared as 'GTFS'" in exc.value.detail

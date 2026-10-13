@@ -417,11 +417,31 @@ async def fetch_validated(
         # — all mean "rejected", never a 500 for the whole refresh.
         _discard_staged(staging, base_name)
         raise FetchError(f"not a usable {kind} file ({type(exc).__name__}: {exc})") from exc
+    # What the slot will hold: the downloaded bytes themselves, or the zip a
+    # `.xml.gz` or bare `.xml` was re-wrapped into. The stop extract checks a
+    # snapshot of the slot against these two (app/station_extract.py), so
+    # that a slot replaced before its state is saved is never paired with the
+    # older sha256.
+    new_state.update(await asyncio.to_thread(_slot_identity, final, size, sha))
     if kind in _NETEX_KINDS:
         new_state["structure"] = await asyncio.to_thread(
             _structure_check, final, previous.get("structure")
         )
     return FetchResult(status="fetched", path=final, size_bytes=size, sha256=sha, state=new_state)
+
+
+def _slot_identity(final: Path, size: int, sha: str) -> dict[str, Any]:
+    """`slot_size_bytes` and `slot_sha256` of the file dispatched to the slot:
+    the download's own when the file was only renamed (same size), else
+    those of the re-wrapped zip, hashed here."""
+    slot_size = final.stat().st_size
+    if slot_size == size:
+        return {"slot_size_bytes": size, "slot_sha256": sha}
+    digest = hashlib.sha256()
+    with final.open("rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            digest.update(chunk)
+    return {"slot_size_bytes": slot_size, "slot_sha256": digest.hexdigest()}
 
 
 def _structure_check(path: Path, previous: Any) -> dict[str, Any]:
