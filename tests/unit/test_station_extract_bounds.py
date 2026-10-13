@@ -1343,3 +1343,25 @@ def test_fetch_records_the_slot_identity(tmp_path: Path) -> None:
     download = gzip_module.compress(b"<xml/>")
     identity = feed_fetch._slot_identity(wrapped, len(download), sha_of(same))
     assert identity == {"slot_size_bytes": wrapped.stat().st_size, "slot_sha256": sha_of(wrapped)}
+
+
+def test_cache_only_never_extracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
+    archive = _gtfs(tmp_path)
+
+    def no_work(*_a: Any) -> None:
+        raise AssertionError("cache_only starts nothing and waits for nothing")
+
+    monkeypatch.setattr(station_extract, "_run_child", no_work)
+    monkeypatch.setattr(station_extract, "_machine_lock", no_work)
+    provider = _provider()
+    with pytest.raises(ExtractError) as caught:
+        ensure_extract(provider, archive, SHA_A, extracted_at=WHEN, session_id="s", cache_only=True)
+    assert caught.value.reason == "not_cached"
+    made = build_extract(
+        provider, archive, SHA_A, extracted_at=WHEN, cache_dir=station_extract.extracts_dir("s")
+    )
+    found = ensure_extract(
+        provider, archive, SHA_A, extracted_at=WHEN, session_id="s", cache_only=True
+    )
+    assert found.body_sha256 == made.body_sha256

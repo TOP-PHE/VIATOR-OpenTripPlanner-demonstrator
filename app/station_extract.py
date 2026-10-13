@@ -12,7 +12,7 @@ This module makes that file. Its public interface is small and stable:
     feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
     ensure_extract(provider_cfg, archive_path, archive_sha256, *,
                    extracted_at, session_id, cache_dir=None,
-                   wait_seconds=None) -> ExtractResult
+                   wait_seconds=None, cache_only=False) -> ExtractResult
     ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows,
                   bytes, body_sha256, dropped)
     ExtractError (with a `reason` word; the only exception it raises)
@@ -112,7 +112,8 @@ class ExtractError(Exception):
     `too_large`, `too_many_rows`, `line_too_long`, `cell_too_long`,
     `resource_limit` (the child process passed its memory, processor-time or
     wall-clock limit), `busy` (another extraction held the machine for longer
-    than the wait), `cache` (the cache folder cannot be written), `error`
+    than the wait), `not_cached` (`ensure_extract(cache_only=True)` found no
+    valid cached extract), `cache` (the cache folder cannot be written), `error`
     (anything else)."""
 
     def __init__(self, reason: str, detail: str = "") -> None:
@@ -843,9 +844,12 @@ def ensure_extract(
     session_id: str,
     cache_dir: Path | None = None,
     wait_seconds: float | None = None,
+    cache_only: bool = False,
 ) -> ExtractResult:
     """The stop extract of `archive_path`: the one entry point for every
-    caller (the web process, the worker).
+    caller (the web process, the worker). With `cache_only`, only a valid
+    cached extract is returned, else `ExtractError` `not_cached`: no
+    extraction is started or waited for (the worker before a graph build).
 
     A valid cached extract (`extracts_dir(session_id)` unless `cache_dir` is
     given) is returned at once. Otherwise the extract is made in a spawned
@@ -863,6 +867,8 @@ def ensure_extract(
         cached = _cached(plan.final, plan.meta)
         if cached is not None:
             return cached
+        if cache_only:
+            raise ExtractError("not_cached", "no valid cached extract")
         deadline = time.monotonic() + (WAIT_SECONDS if wait_seconds is None else wait_seconds)
         with _machine_lock(settings.inbox_dir / _LOCK_NAME, deadline):
             cached = _cached(plan.final, plan.meta)  # made while this one waited

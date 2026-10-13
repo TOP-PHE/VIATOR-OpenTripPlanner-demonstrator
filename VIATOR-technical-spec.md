@@ -401,7 +401,9 @@ for the upload step:
 EXTRACTOR_VERSION: str                                   # "viator-stop-extract-1"
 feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
 ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, session_id,
-               cache_dir=None, wait_seconds=None) -> ExtractResult   # the one entry point
+               cache_dir=None, wait_seconds=None, cache_only=False) -> ExtractResult
+#   the one entry point; cache_only=True returns a valid cached extract or raises
+#   ExtractError("not_cached") without starting or waiting for any extraction
 # ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
 #               body_sha256, dropped); ExtractError(reason) when nothing is written
 provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager:

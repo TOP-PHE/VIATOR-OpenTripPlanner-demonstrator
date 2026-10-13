@@ -977,13 +977,16 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 The station module builds its VIATOR station referential from the stops of the timetables VIATOR
 already downloads; VIATOR never sends an archive, only a small extract per feed version.
 **Every caller goes through `station_extract.ensure_extract(provider_cfg, archive_path,
-archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None) -> ExtractResult(path_gz,
+archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None, cache_only=False) ->
+ExtractResult(path_gz,
 feed_key, feed_version, extractor_version, rows, bytes, body_sha256, dropped)`**: a valid cached
 extract comes back at once; otherwise the extraction runs in a *spawned* child process with 2 GiB of
 address space (`RLIMIT_AS`), 25 minutes of processor time (`RLIMIT_CPU`), 30 minutes of wall-clock
 time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
 `inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
 huge archive can only end the child (`resource_limit`); `ensure_extract` raises `ExtractError` only.
+With `cache_only=True` it returns a valid cached extract or raises `not_cached`, never starting or
+waiting for an extraction (the worker before a graph build).
 `build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
 key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
 fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
