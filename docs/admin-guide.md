@@ -2853,20 +2853,28 @@ sent yet and no graph build changes.
   the file VIATOR downloaded.
 - **When.** After "Refresh" (all providers or one) that fetched a timetable
   or found it unchanged, and after an upload attached to an upload
-  provider, in the background once the page has its answer. The refresh
-  answer does not wait for it, and a MOTIS build never waits for it either.
+  provider, queued once the page has its answer for one thread of the `web`
+  process that does nothing else (a queue of at most 64 sessions; a
+  session already waiting is not queued twice). The refresh answer does not
+  wait for it, no page waits for it, and a MOTIS build never waits for it
+  either.
 - **How, safely.** Each extraction runs in a separate child process of the
   `web` container, one at a time on the server, with at most 2 GiB of
-  memory, 15 minutes of processor time and 20 minutes in all, at a lower
-  priority. A broken, hostile or oversized archive can only end that child:
-  the log says `reason=resource_limit` (or `input_too_large`, below) and the
-  web process carries on. Measured times: a 290 MB GTFS in about 25 s, a
+  memory, 25 minutes of processor time and 30 minutes in all, at a lower
+  priority, and it dies with the web process. A broken, hostile or oversized
+  archive can only end that child: the log says `reason=resource_limit` (or
+  `input_too_large`, below) and the web process carries on. At the module's
+  200,000-row cap the child was measured at about 830 MiB (GTFS) and
+  730 MiB (NeTEx): the 2 GiB cap leaves some 2.4 times that. 25 minutes of
+  processor time leave room for a `stop_times.txt` of 3 to 4 GB (about
+  12 MB/s), which would be close to 15. Measured times: a 290 MB GTFS in about 25 s, a
   540 MB single-file NeTEx in about 1 minute; a national file of a few GB
   takes some minutes.
 - **Memory of the `web` container (a proposal for the owner, not set by
   this release).** The `web` service has no `mem_limit` today. The
-  extraction adds at most its 2 GiB cap to what `web` already uses (the
-  peaks measured were 86 to 452 MiB). If a limit is set, take the `web`
+  extraction adds at most its 2 GiB cap to what `web` already uses (peaks
+  measured: 86 MiB for an ordinary feed, about 830 MiB at the 200,000-row
+  cap). If a limit is set, take the `web`
   container's usual peak (`docker stats`) plus 2 GiB, and not less than
   4 GiB.
 - **Where.** `/data/inbox/<sid>/_extracts/<PROVIDER>.<archive sha256>.<16 hex>.csv.gz`,
@@ -2880,10 +2888,14 @@ sent yet and no graph build changes.
   200 characters, duplicates, more than 500 codes for a station (names over
   200 characters are cut); a station without a name or a position is left
   out. The `web` log has one line per provider, with `sid=<session>` and
-  `provider=<id>`: `station extract ready: … rows=<n>`, `station extract
-  skipped: … reason=skipped` (no file or no feed key yet) or
-  `reason=in_flight` (the same archive is being extracted), never a name or
-  code.
+  `provider=<id>`: `station extract ready: … rows=<n> bytes=<n>
+  dropped=<reason>:<count>,…` (what was cleaned or dropped), `station
+  extract skipped: … reason=skipped` (no file or no feed key yet),
+  `reason=in_flight` (the same archive is being extracted),
+  `reason=snapshot_failed` (the timetable file could not be hard-linked into
+  `_extracts/`: another disk, a permission) or `reason=slot_changed` (a
+  refresh replaced the file meanwhile; the next one extracts it), or
+  `station extract not queued: … reason=queue_full`; never a name or code.
 - **When there is none.** A file that would pass one of the module's limits
   (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`
   log says `station extract not written: sid=… provider=… reason=<word>` at

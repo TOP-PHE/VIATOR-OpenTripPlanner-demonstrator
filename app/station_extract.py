@@ -19,6 +19,8 @@ This module makes that file. Its public interface is small and stable:
     provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)
     warm_session_extracts(session_id, config, *, only_provider=None,
                           upload_sha256=None)
+    queue_warm(session_id, config, *, only_provider=None,
+               upload_sha256=None) -> bool    (the web process: one warm thread)
 
 **Every caller uses `ensure_extract`** (the web process after a refresh, the
 worker before a build): it returns a valid cached extract at once, and
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import ctypes
 import fcntl
 import gzip
 import hashlib
@@ -48,8 +51,10 @@ import logging
 import math
 import multiprocessing
 import os
+import queue
 import re
 import resource
+import signal
 import tempfile
 import threading
 import time
@@ -585,12 +590,18 @@ STALE_SECONDS = 3600
 
 def _sweep(cache_dir: Path) -> None:
     """Remove the temporary files (`.<pid>.*.tmp`) and snapshots
-    (`.<pid>.*.snap`) older than `STALE_SECONDS`."""
+    (`.<pid>.*.snap`) left more than `STALE_SECONDS` ago. The age is that of
+    the last change of the file's inode (`st_ctime`, or `st_mtime` when
+    later): a snapshot is a hard link to the slot, so its `st_mtime` is the
+    slot's download time, possibly hours old, while making the link changes
+    `st_ctime`; a snapshot still waiting for the lock is never taken for a
+    left-over."""
     limit = time.time() - STALE_SECONDS
     for pattern in (".*.tmp", ".*.snap"):
         for old in cache_dir.glob(pattern):
             with contextlib.suppress(OSError):
-                if old.stat().st_mtime < limit:
+                status = old.stat()
+                if max(status.st_ctime, status.st_mtime) < limit:
                     old.unlink()
 
 
@@ -703,8 +714,12 @@ def build_extract(
 # this much address space, processor time and wall-clock time, and the child
 # runs at a lower priority than the web process.
 CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
-CHILD_CPU_SECONDS = 15 * 60
-CHILD_WALL_SECONDS = 20 * 60
+# Measured peaks at MSMM's 200,000-row cap: about 830 MiB RSS (GTFS) and
+# 730 MiB (NeTEx), so 2 GiB of address space leaves some 2.4 times that. A
+# stop_times.txt of 3 to 4 GB reads at about 12 MB/s, close to 15 minutes of
+# processor time: 25 minutes, and a wall clock to match, leave room for it.
+CHILD_CPU_SECONDS = 25 * 60
+CHILD_WALL_SECONDS = 30 * 60
 CHILD_NICE = 10
 # How long `ensure_extract` waits for another extraction to end by default.
 WAIT_SECONDS = CHILD_WALL_SECONDS + 60
@@ -721,7 +736,19 @@ class _Limits:
     nice: int
 
 
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent() -> None:
+    """Linux: the child is killed when its parent dies (even by SIGKILL), so
+    no orphan extraction runs on. Elsewhere, nothing."""
+    with contextlib.suppress(OSError, AttributeError):
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+
+
 def _limit_self(limits: _Limits) -> None:
+    _die_with_parent()
     resource.setrlimit(resource.RLIMIT_AS, (limits.memory, limits.memory))
     resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu, limits.cpu + 30))
     os.nice(limits.nice)
@@ -894,28 +921,47 @@ def provider_archive_snapshot(
     `stat`): a refresh that replaced the slot meanwhile cannot pair this
     sha256 with another file, and the extraction reads the snapshot, which no
     refresh can replace."""
+    with _snapshot(session_id, provider_cfg, upload_sha256) as (found, _reason):
+        yield found
+
+
+@contextlib.contextmanager
+def _snapshot(
+    session_id: str, provider_cfg: Mapping[str, Any], upload_sha256: str | None
+) -> Iterator[tuple[tuple[Path, str] | None, str]]:
+    """`provider_archive_snapshot`, with the reason word when there is none:
+    `skipped` (no slot file or no sha256 yet), `snapshot_failed` (the hard
+    link could not be made: another device, a permission) or `slot_changed`
+    (a refresh replaced the slot meanwhile)."""
     found = _slot_and_source(session_id, provider_cfg)
-    if found is None:
-        yield None
+    fd = _open_slot(found[0]) if found is not None else None
+    if found is None or fd is None:
+        yield None, "skipped"
         return
     slot, source, state_name = found
-    try:
-        fd = os.open(slot, os.O_RDONLY)
-    except OSError:
-        yield None
-        return
     snapshot: Path | None = None
+    reason = "skipped"
     try:
         sha = _sha_of_source(session_id, source, state_name, upload_sha256)
         if sha is not None:
-            snapshot = _link_snapshot(fd, slot, session_id, str(provider_cfg["id"]))
+            snapshot, reason = _link_snapshot(fd, slot, session_id, str(provider_cfg["id"]))
     finally:
         os.close(fd)
     try:
-        yield (snapshot, sha) if snapshot is not None and sha is not None else None
+        if snapshot is not None and sha is not None:
+            yield (snapshot, sha), ""
+        else:
+            yield None, reason
     finally:
         if snapshot is not None:
             snapshot.unlink(missing_ok=True)
+
+
+def _open_slot(slot: Path) -> int | None:
+    try:
+        return os.open(slot, os.O_RDONLY)
+    except OSError:
+        return None
 
 
 def _slot_and_source(
@@ -951,19 +997,20 @@ def _sha_of_source(
     return sha if sha is not None and _SHA256.fullmatch(sha) else None
 
 
-def _link_snapshot(fd: int, slot: Path, session_id: str, pid: str) -> Path | None:
-    """A hard link to the slot, kept only when it is the file open as `fd`."""
+def _link_snapshot(fd: int, slot: Path, session_id: str, pid: str) -> tuple[Path | None, str]:
+    """A hard link to the slot, kept only when it is the file open as `fd`;
+    else None and the reason word."""
     folder = extracts_dir(session_id)
     try:
         folder.mkdir(parents=True, exist_ok=True)
         snapshot = folder / f".{pid}.{os.urandom(6).hex()}.snap"
         os.link(slot, snapshot)
     except OSError:
-        return None
+        return None, "snapshot_failed"
     if _same_file(fd, snapshot):
-        return snapshot
+        return snapshot, ""
     snapshot.unlink(missing_ok=True)
-    return None
+    return None, "slot_changed"
 
 
 # What is in progress in this process: (session, provider, archive sha256).
@@ -976,8 +1023,10 @@ def _warm_one(
 ) -> ExtractResult | str:
     """The extract of one provider, or the reason word there is none."""
     pid = str(provider.get("id") or "")
-    with provider_archive_snapshot(session_id, provider, upload_sha256=upload_sha256) as found:
-        if found is None or feed_key_for(provider, upload_sha256=found[1]) is None:
+    with _snapshot(session_id, provider, upload_sha256) as (found, reason):
+        if found is None:
+            return reason
+        if feed_key_for(provider, upload_sha256=found[1]) is None:
             return "skipped"
         archive, sha = found
         key = (session_id, pid, sha)
@@ -1011,7 +1060,7 @@ def warm_session_extracts(
     that has a feed key and a timetable file: provider id -> its result, or
     the reason word when there is none (`skipped`, `in_flight` when the same
     archive is being made, or an `ExtractError` reason). Run after a refresh
-    or an upload (FastAPI background task), so that sending the extracts
+    or an upload (on the warm thread, `queue_warm`), so that sending the extracts
     later never waits for one to be made. Never raises; one line per
     provider in the log, with the session and provider ids and a reason
     word."""
@@ -1039,16 +1088,94 @@ def warm_session_extracts(
                 type(exc).__name__,
             )
         outcome[pid] = result
-        if isinstance(result, ExtractResult):
-            log.info(
-                "station extract ready: sid=%s provider=%s rows=%d", session_id, pid, result.rows
-            )
-        elif result in ("skipped", "in_flight"):
-            log.info(
-                "station extract skipped: sid=%s provider=%s reason=%s", session_id, pid, result
-            )
-        else:
-            log.warning(
-                "station extract not written: sid=%s provider=%s reason=%s", session_id, pid, result
-            )
+        _log_outcome(session_id, pid, result)
     return outcome
+
+
+# The reasons a provider has no extract that are not a failure.
+_SKIP_REASONS = frozenset({"skipped", "in_flight", "snapshot_failed", "slot_changed"})
+
+
+def _log_outcome(session_id: str, pid: str, result: ExtractResult | str) -> None:
+    """One line per provider: counts and reason words, never a name or code.
+    What the extraction cleaned or dropped (`ExtractResult.dropped`, made in
+    the child, whose own log lines go nowhere) is logged here."""
+    if isinstance(result, ExtractResult):
+        dropped = ",".join(f"{k}:{v}" for k, v in sorted(result.dropped.items())) or "none"
+        log.info(
+            "station extract ready: sid=%s provider=%s rows=%d bytes=%d dropped=%s",
+            session_id,
+            pid,
+            result.rows,
+            result.bytes,
+            dropped,
+        )
+    elif result in _SKIP_REASONS:
+        log.info("station extract skipped: sid=%s provider=%s reason=%s", session_id, pid, result)
+    else:
+        log.warning(
+            "station extract not written: sid=%s provider=%s reason=%s", session_id, pid, result
+        )
+
+
+# ── The warm queue of the web process ─────────────────────────────────────
+
+# Warms run on one thread of their own, never in the request thread pool (a
+# warm can wait for the machine's lock for many minutes). The queue holds at
+# most `QUEUE_MAX` distinct jobs; a job already waiting is replaced by the
+# newer one (its configuration is the newest), never doubled.
+QUEUE_MAX = 64
+_Job = tuple[str, str | None]
+_QUEUE: queue.Queue[_Job] = queue.Queue()
+_PENDING: dict[_Job, tuple[dict[str, Any], dict[str, str]]] = {}
+_PENDING_LOCK = threading.Lock()
+_WORKER: list[threading.Thread] = []
+
+
+def queue_warm(
+    session_id: str,
+    config: Mapping[str, Any],
+    *,
+    only_provider: str | None = None,
+    upload_sha256: Mapping[str, str] | None = None,
+) -> bool:
+    """Queue `warm_session_extracts` for the warm thread and return at once:
+    True when queued (or merged into the same job already waiting), False
+    when the queue is full (logged; the next refresh queues it again)."""
+    job: _Job = (session_id, only_provider)
+    with _PENDING_LOCK:
+        if job in _PENDING:
+            uploads = _PENDING[job][1]
+            _PENDING[job] = (dict(config), {**uploads, **(upload_sha256 or {})})
+            return True
+        if len(_PENDING) >= QUEUE_MAX:
+            log.warning("station extract not queued: sid=%s reason=queue_full", session_id)
+            return False
+        _PENDING[job] = (dict(config), dict(upload_sha256 or {}))
+        _QUEUE.put(job)
+        if not _WORKER or not _WORKER[0].is_alive():
+            worker = threading.Thread(target=_warm_loop, name="station-extract-warm", daemon=True)
+            _WORKER[:] = [worker]
+            worker.start()
+    return True
+
+
+def _warm_loop() -> None:
+    while True:
+        job = _QUEUE.get()
+        try:
+            _run_job(job)
+        finally:
+            _QUEUE.task_done()
+
+
+def _run_job(job: _Job) -> None:
+    with _PENDING_LOCK:
+        taken = _PENDING.pop(job, None)
+    if taken is None:
+        return
+    config, uploads = taken
+    try:
+        warm_session_extracts(job[0], config, only_provider=job[1], upload_sha256=uploads)
+    except Exception as exc:  # the warm thread never dies
+        log.warning("station extract warm failed: sid=%s error=%s", job[0], type(exc).__name__)

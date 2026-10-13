@@ -980,8 +980,8 @@ already downloads; VIATOR never sends an archive, only a small extract per feed 
 archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None) -> ExtractResult(path_gz,
 feed_key, feed_version, extractor_version, rows, bytes, body_sha256, dropped)`**: a valid cached
 extract comes back at once; otherwise the extraction runs in a *spawned* child process with 2 GiB of
-address space (`RLIMIT_AS`), 15 minutes of processor time (`RLIMIT_CPU`), 20 minutes of wall-clock
-time and `nice 10`, one at a time on the machine (a thread lock plus an `flock` on
+address space (`RLIMIT_AS`), 25 minutes of processor time (`RLIMIT_CPU`), 30 minutes of wall-clock
+time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
 `inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
 huge archive can only end the child (`resource_limit`); `ensure_extract` raises `ExtractError` only.
 `build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
@@ -1011,13 +1011,17 @@ A NeTEx archive whose rail journeys call but that defines no StopPlace, or assig
 is `no_stop_place`. Everything MSMM would refuse is cleaned or dropped first and counted by reason
 (`ExtractResult.dropped`); past one of MSMM's limits (200,000 rows, 256 MiB unpacked, 32 MiB gzip, a
 1 MiB line, a 131,072-character cell) nothing is written and `ExtractError.reason` says why. The
-refresh routes and the upload route queue `warm_session_extracts` as a FastAPI background task, so
+refresh routes and the upload route call `queue_warm` after the answer: one dedicated thread of the
+web process runs `warm_session_extracts` from a bounded, merging queue (never the request thread pool,
+where a warm waiting minutes for the lock would starve every plain-def endpoint), so
 the extracts sit in `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex>.csv.gz` before
 anything sends them (pull request 5). It pairs each slot file with its sha256 through
 `provider_archive_snapshot` (the slot opened first, the fetch state read, the open file checked to be
 the slot's, then hard-linked to a `.snap` the extraction reads), drops a (session, provider, sha256)
-already in progress, sweeps left-over `.tmp`/`.snap` files older than an hour, and logs one line per
-provider with `sid=`, `provider=` and a reason word.
+already in progress, sweeps left-over `.tmp`/`.snap` files whose inode changed more than an hour ago
+(`st_ctime`: a snapshot's `st_mtime` is the slot's download time), and logs one line per provider with
+`sid=`, `provider=`, a reason word, and for a ready extract its rows, bytes and dropped counts (the
+child's own log lines go nowhere).
 
 ### Invariants & traps
 

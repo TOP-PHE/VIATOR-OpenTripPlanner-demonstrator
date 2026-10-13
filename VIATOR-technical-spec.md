@@ -430,7 +430,8 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
   written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
 - **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
-  `RLIMIT_CPU` 15 min, 20 min wall clock, `nice 10`), one at a time on the machine (`flock` on
+  `RLIMIT_CPU` 25 min, 30 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
+  one at a time on the machine (`flock` on
   `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
   `wait_seconds` is `busy`.
 - **Input bounds**: unpacked bytes 4 GiB a member, 8 GiB a pass; GTFS records ≤1 MiB and ≤200 fields,
@@ -440,14 +441,18 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
 - **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
   rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
-  peak RSS 86 MiB (three passes, about 10 MB/s); the security review's hostile shapes peak at 452 MiB
-  RSS (200,000 stations with 100-character ids) or are refused within the first MiB. A national file
-  of a few GB takes some minutes, inside the child's 15 minutes.
+  peak RSS 86 MiB (three passes, about 10 MB/s); at the 200,000-row cap about 830 MiB RSS (GTFS) and
+  730 MiB (NeTEx), some 2.4 times under `RLIMIT_AS`; hostile shapes are refused within the first MiB.
+  A national file of a few GB takes some minutes; `RLIMIT_CPU` is 25 minutes because a 3–4 GB
+  `stop_times.txt` (about 12 MB/s) would be close to 15.
 - **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
-  key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts`, queued as a
-  FastAPI background task by `POST /api/sessions/{sid}/sources/refresh`,
-  `POST /api/sessions/{sid}/providers/{pid}/refresh` and an upload to an `upload` provider. A damaged
-  cached file is removed and made again; `.tmp`/`.snap` left-overs older than an hour are swept.
+  key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts` on one
+  dedicated thread of the web process (`queue_warm`: a bounded queue of 64 jobs, a job already waiting
+  merged, never the request thread pool), queued after the answer by
+  `POST /api/sessions/{sid}/sources/refresh`, `POST /api/sessions/{sid}/providers/{pid}/refresh` and
+  an upload to an `upload` provider. A damaged cached file is removed and made again; `.tmp`/`.snap`
+  left-overs whose inode last changed more than an hour ago (`st_ctime`: a snapshot is a hard link,
+  its `st_mtime` the slot's) are swept.
 
 ---
 
