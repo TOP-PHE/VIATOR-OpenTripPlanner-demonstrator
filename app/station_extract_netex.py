@@ -127,22 +127,26 @@ def _walk(source: IO[bytes], targets: frozenset[str], seen: set[str]) -> Iterato
     inside = 0
     for event, element in iterparse(source, events=("start", "end")):
         local = _local(element.tag)
+        is_target = local in targets
         if event == "start":
             stack.append(element)
-            if local in targets:
-                inside += 1
+            inside += is_target
             continue
         stack.pop()
         if local in _ALL:
             seen.add(local)
-        if local in targets:
-            inside -= 1
-            if inside == 0:
-                yield element
+        inside -= is_target
         if inside == 0:
-            element.clear()
-            if stack:
-                stack[-1].remove(element)
+            if is_target:
+                yield element
+            _drop(element, stack)
+
+
+def _drop(element: Element, stack: list[Element]) -> None:
+    """Free a read element: its content, and its place in its parent."""
+    element.clear()
+    if stack:
+        stack[-1].remove(element)
 
 
 class _Archive:
@@ -353,27 +357,38 @@ def _read_places(archive: _Archive, points: dict[str, _Use]) -> _Places:
     assigned: dict[str, _Use] = {}
     for element in archive.walk(_PLACES):
         if _local(element.tag) == "PassengerStopAssignment":
-            calls = points.get(_ref(element, "ScheduledStopPointRef"))
-            place = _ref(element, "QuayRef") or _ref(element, "StopPlaceRef")
-            if calls is not None and place:
-                assigned.setdefault(place, _Use()).merge(calls)
-            continue
-        ident = element.get("id") or ""
-        if not ident:
-            continue
-        if parent := _ref(element, "ParentSiteRef"):
-            places.parent[ident] = parent
-        if _text(element, "TransportMode") == "rail" or (
-            _text(element, "StopPlaceType") == "railStation"
-        ):
-            places.rail_places.add(ident)
-        for quay in _quays(element):
-            if quay.get("id"):
-                places.quay_place[str(quay.get("id"))] = ident
+            _assign(element, points, assigned)
+        else:
+            _note_stop_place(element, places)
     # Keep only the quays that matter.
     places.quay_place = {q: p for q, p in places.quay_place.items() if q in assigned}
     places.use = assigned
     return places
+
+
+def _assign(element: Element, points: dict[str, _Use], assigned: dict[str, _Use]) -> None:
+    """A PassengerStopAssignment: the calls of its point go to its Quay, or
+    to its StopPlace when it names no Quay."""
+    calls = points.get(_ref(element, "ScheduledStopPointRef"))
+    place = _ref(element, "QuayRef") or _ref(element, "StopPlaceRef")
+    if calls is not None and place:
+        assigned.setdefault(place, _Use()).merge(calls)
+
+
+def _note_stop_place(element: Element, places: _Places) -> None:
+    """A StopPlace's parent, whether it calls itself rail, and its Quays."""
+    ident = element.get("id") or ""
+    if not ident:
+        return
+    if parent := _ref(element, "ParentSiteRef"):
+        places.parent[ident] = parent
+    if _text(element, "TransportMode") == "rail" or (
+        _text(element, "StopPlaceType") == "railStation"
+    ):
+        places.rail_places.add(ident)
+    for quay in _quays(element):
+        if quay.get("id"):
+            places.quay_place[str(quay.get("id"))] = ident
 
 
 def _root(place: str, parent: dict[str, str]) -> str:
@@ -484,6 +499,13 @@ def _codes(element: Element, station: Station, prefix: str) -> None:
     station.add_code(f"{prefix}PublicCode", _text(element, "PublicCode"))
 
 
+def _place_codes(element: Element, station: Station) -> None:
+    """The codes of a StopPlace and of its Quays."""
+    _codes(element, station, "")
+    for quay in _quays(element):
+        _codes(quay, station, "Quay/")
+
+
 def _read_details(archive: _Archive, stations: dict[str, Station], parent: dict[str, str]) -> None:
     """Names, positions and codes of the stations, and the codes of their
     child StopPlaces and Quays; a station without a position takes its first
@@ -499,15 +521,11 @@ def _read_details(archive: _Archive, stations: dict[str, Station], parent: dict[
         lat, lon = _position(element)
         if ident == root:
             station.place(_text(element, "Name"), lat, lon)
-            _codes(element, station, "")
-            for quay in _quays(element):
-                _codes(quay, station, "Quay/")
+            _place_codes(element, station)
             continue
         scratch = Station(key=ident)
-        _codes(element, scratch, "")
-        for quay in _quays(element):
-            _codes(quay, scratch, "Quay/")
-        child_codes[root].extend(scratch.codes)
+        _place_codes(element, scratch)
+        child_codes[root].extend(scratch.code_pairs())
         if lat is not None and lon is not None:
             fallback.setdefault(root, (lat, lon))
     for root, codes in child_codes.items():

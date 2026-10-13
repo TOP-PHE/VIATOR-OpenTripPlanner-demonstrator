@@ -156,23 +156,26 @@ def feed_key_for(
     timetable = provider_cfg.get("timetable")
     if not isinstance(timetable, Mapping):
         return None
-    source = str(timetable.get("source") or ("url" if timetable.get("url") else "upload"))
-    key: str | None = None
-    if source == "nap":
-        try:
-            resolver = validate_resolver(timetable.get("resolver"), "resolver")
-        except ValueError:
-            return None
-        key = resolver_identity(resolver)
-    elif source == "url":
-        url = str(timetable.get("url") or "").strip()
-        key = url_identity(url) if url else None
-    elif source == "upload":
-        if upload_sha256 is not None and _SHA256.fullmatch(upload_sha256):
-            key = f"upload:{upload_sha256}"
+    key = _key_of_source(timetable, upload_sha256)
     if key is None or FEED_KEY.fullmatch(key) is None:
         return None
     return key
+
+
+def _key_of_source(timetable: Mapping[str, Any], upload_sha256: str | None) -> str | None:
+    """The key by the timetable's source, before its form is checked."""
+    source = str(timetable.get("source") or ("url" if timetable.get("url") else "upload"))
+    if source == "nap":
+        try:
+            return resolver_identity(validate_resolver(timetable.get("resolver"), "resolver"))
+        except ValueError:
+            return None
+    if source == "url":
+        url = str(timetable.get("url") or "").strip()
+        return url_identity(url) if url else None
+    if source == "upload" and upload_sha256 is not None and _SHA256.fullmatch(upload_sha256):
+        return f"upload:{upload_sha256}"
+    return None
 
 
 # ── The form of the file (MSMM 22.2, point 6) ─────────────────────────────
@@ -318,7 +321,11 @@ def _station_row(station: Station, meta: _Meta, dropped: Counter[str]) -> list[s
         dropped["operator_from_provider"] += 1
         operators = [meta.provider_id]
     codes = _capped(
-        [item for field, value in station.codes if (item := _code_item(field, value, dropped))],
+        [
+            item
+            for field, value in station.code_pairs()
+            if (item := _code_item(field, value, dropped))
+        ],
         dropped,
         "codes",
     )
@@ -452,8 +459,7 @@ def _read_stations(fmt: str, archive_path: Path, provider_id: str) -> dict[str, 
         zipfile.BadZipFile,
         zlib.error,
         csv.Error,
-        NotImplementedError,
-        RuntimeError,
+        RuntimeError,  # NotImplementedError too (a Deflate64 member)
         ValueError,
     ) as exc:
         raise ExtractError("bad_archive", type(exc).__name__) from None

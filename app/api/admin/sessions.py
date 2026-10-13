@@ -601,6 +601,45 @@ class UploadResponse(BaseModel):
     provider_feed_id: str | None = None
 
 
+def _queue_extracts(
+    background: BackgroundTasks,
+    sid: str,
+    config: dict[str, Any] | None,
+    refreshed: bool,
+    only_provider: str | None = None,
+) -> None:
+    """After a refresh that fetched a timetable or found it unchanged: the
+    station module's stop extracts of the files now in the slots, made (or
+    found in the cache) after the answer is sent (app/station_extract.py)."""
+    if refreshed:
+        background.add_task(
+            station_extract.warm_session_extracts,
+            sid,
+            dict(config or {}),
+            only_provider=only_provider,
+        )
+
+
+def _queue_upload_extract(
+    background: BackgroundTasks,
+    sid: str,
+    config: dict[str, Any] | None,
+    provider_id: str | None,
+    source: str | None,
+    sha256: str,
+) -> None:
+    """After an upload to an `upload` provider: the stop extract of that file,
+    keyed by the sha256 of the uploaded bytes, made after the answer."""
+    if provider_id is not None and source == "upload":
+        background.add_task(
+            station_extract.warm_session_extracts,
+            sid,
+            dict(config or {}),
+            only_provider=provider_id,
+            upload_sha256={provider_id: sha256},
+        )
+
+
 @router.post(
     "/{sid}/uploads",
     status_code=201,
@@ -756,16 +795,7 @@ async def upload_to_session(
     )
     db.commit()
     db.refresh(upload)
-    if provider_feed_id is not None and upload_source == "upload":
-        # The station module's stop extract of this file, made now in the
-        # background so that sending it later never waits (app/station_extract.py).
-        background.add_task(
-            station_extract.warm_session_extracts,
-            sid,
-            dict(s.config or {}),
-            only_provider=provider_feed_id,
-            upload_sha256={provider_feed_id: upload.sha256},
-        )
+    _queue_upload_extract(background, sid, s.config, provider_feed_id, upload_source, upload.sha256)
     return UploadResponse(
         id=str(upload.id),
         filename=upload.filename,
@@ -1098,10 +1128,7 @@ async def refresh_sources(
         },
     )
     db.commit()
-    if fetched or unchanged:
-        # The station module's stop extracts of the files now in the slots,
-        # made (or found in the cache) after the answer is sent.
-        background.add_task(station_extract.warm_session_extracts, sid, dict(s.config or {}))
+    _queue_extracts(background, sid, s.config, bool(fetched or unchanged))
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -2360,10 +2387,7 @@ async def refresh_provider(
     result = await _refresh_provider_urls(
         db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
-    if result.fetched or result.unchanged:
-        background.add_task(
-            station_extract.warm_session_extracts, sid, dict(s.config or {}), only_provider=pid
-        )
+    _queue_extracts(background, sid, s.config, bool(result.fetched or result.unchanged), pid)
     return result
 
 

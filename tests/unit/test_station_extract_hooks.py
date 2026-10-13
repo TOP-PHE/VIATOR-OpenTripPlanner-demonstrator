@@ -117,4 +117,4 @@ async def test_refresh_sources_queues_the_extracts(
     [task] = background.tasks
     assert task.func is station_extract.warm_session_extracts
     assert task.args[0] == "zz-session"
-    assert task.kwargs == {}
+    assert task.kwargs == {"only_provider": None}
