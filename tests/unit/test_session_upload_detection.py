@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 from app.api.admin import sessions as sessions_api
 from app.settings import settings
@@ -53,6 +53,7 @@ async def test_session_upload_answers_400_when_detect_cannot_classify(
             REQUEST,  # type: ignore[arg-type]
             db,  # type: ignore[arg-type]
             ACTOR,  # type: ignore[arg-type]
+            BackgroundTasks(),
         )
     assert exc.value.status_code == 400
     assert exc.value.detail.startswith("Detection failed: ")
@@ -74,6 +75,7 @@ async def test_a_file_that_is_not_what_was_declared_is_still_refused(inbox: Path
             REQUEST,  # type: ignore[arg-type]
             db,  # type: ignore[arg-type]
             ACTOR,  # type: ignore[arg-type]
+            BackgroundTasks(),
         )
     assert exc.value.status_code == 400
     assert "declared as 'GTFS'" in exc.value.detail

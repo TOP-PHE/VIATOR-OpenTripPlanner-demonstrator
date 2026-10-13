@@ -180,6 +180,13 @@ def test_upload_attached_to_provider_lands_at_feed_slot(
         assert len(rows) == 1
         assert rows[0].provider_feed_id == "SNCF-XB"
         assert rows[0].stored_path.endswith("sncf-xb.zip")
+        upload_sha256 = rows[0].sha256
+
+    # The station module's stop extract of the uploaded file, made by the
+    # background task after the answer (app/station_extract.py), keyed by the
+    # sha256 of the uploaded bytes.
+    [extract] = (inbox / sid / "_extracts").glob("SNCF-XB.*.csv.gz")
+    assert extract.name.startswith(f"SNCF-XB.{upload_sha256}.")
 
     # The provider-status endpoint surfaces source + the attached filename,
     # so the card can show which file backs the provider (Phase 1b).
