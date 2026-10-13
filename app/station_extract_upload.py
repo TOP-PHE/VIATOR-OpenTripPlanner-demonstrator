@@ -31,14 +31,15 @@ follows for a MOTIS session (`app/station_builds.py`) queues it at once.
   the build sees the new extracts (`BUILD_BUDGET_SECONDS`).
 
 Per feed with a feed key: `HEAD`; on 200 nothing more ("already held"); on
-404 `build_extract` (which reuses its cache by archive sha256 and
-`EXTRACTOR_VERSION`), then the `PUT`.
+404 `station_extract.ensure_extract` (its cache by archive sha256 and
+`EXTRACTOR_VERSION`, else a resource-limited child process), then the `PUT`.
 
 **Bounded.** Each call runs under `asyncio.timeout` on its own event loop
 (the per-call deadline of `app/station_builds.py`): `HEAD_SECONDS` for a
 `HEAD`, `PUT_SECONDS` for a `PUT`, never past the end of the pass's budget.
-The pass stops starting new work once its budget is spent; the feeds left
-are "skipped" with the reason `budget`. Retries:
+The extraction (`_Pass._extract_within`) is waited for at most until the
+budget ends too. The pass stops starting new work once its budget is spent;
+the feeds left are "skipped" with the reason `budget`. Retries:
 
 - 503 `busy` (another extract being received) and 429 `extract_window` (60
   extracts in the UTC half hour): wait the `Retry-After`, then send again,
@@ -124,6 +125,8 @@ TRANSIENT_RETRIES = 2
 # A 503 `busy` or 429 without a usable `Retry-After` (the module always sends one).
 DEFAULT_RETRY_SECONDS = 10.0
 TRANSIENT_PAUSE_SECONDS = 5.0
+# How often the pass looks at the cancel and the budget while an extraction runs.
+EXTRACT_POLL_SECONDS = 1.0
 
 # An answer is a short JSON object, or nothing; anything larger is refused unread.
 MAX_ANSWER_BYTES = 4 * 1024
@@ -158,6 +161,8 @@ SHAPE = "shape"
 ERROR = "error"
 BUSY = "busy"
 EXTRACT_WINDOW = "extract_window"
+ARCHIVE_CHANGED = "archive_changed"
+EXTRACT_GONE = "extract_gone"
 
 # The refusal words of the module's 4xx answers (its design 20.6, 22.3), kept
 # when an answer names one; any other code gives `status_<n>`.
@@ -355,6 +360,9 @@ class _Calls:
             raise _Failure(TIMEOUT) from None
         except httpx.TransportError:
             raise _Failure(NETWORK) from None
+        except OSError:
+            # The extract file went away (the extractor keeps one per provider).
+            raise _Failure(EXTRACT_GONE) from None
 
 
 def _waits(answer: _Answer) -> bool:
@@ -426,7 +434,9 @@ class _Pass:
         should_stop: Callable[[], bool],
         extract: Callable[..., Any],
         extractor_version: str,
+        sid: str = "",
     ) -> None:
+        self.sid = sid
         self.calls = calls
         self.clock = clock
         self.deadline = clock.monotonic() + budget
@@ -461,8 +471,8 @@ class _Pass:
                 raise _Failure(BUDGET)
             try:
                 answer = send(self.limit(call_seconds))
-            except _Failure:
-                if retries.transient():
+            except _Failure as failure:
+                if failure.reason != EXTRACT_GONE and retries.transient():
                     continue
                 raise
             if retries.again(answer):
@@ -489,14 +499,42 @@ class _Pass:
             return _refused(pid, answer)
         return self._send(feed, key)
 
+    def _extract_within(self, feed: Feed) -> Any:
+        """The extract, or a reason word, within what is left of the budget.
+
+        The extractor (`station_extract.ensure_extract`) works in a limited
+        child process that this side cannot cut short; so it runs on a
+        thread of its own, and the pass waits for it at most until the
+        budget ends (`budget`: the child goes on, one extraction at a time
+        on the machine, and its extract is in the cache for the next pass),
+        asking for the operator's cancel every `EXTRACT_POLL_SECONDS`."""
+        box: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["made"] = self.extract(self.sid, feed, max(0.0, self.left()))
+            except Exception as exc:  # one feed, never the pass or the thread
+                log.warning(_FAILED, ERROR, type(exc).__name__)
+                box["made"] = ERROR
+
+        thread = threading.Thread(target=run, name="station-extract-wait", daemon=True)
+        thread.start()
+        while True:
+            thread.join(EXTRACT_POLL_SECONDS)
+            if not thread.is_alive():
+                return box.get("made", ERROR)
+            if self.should_stop():
+                raise _Stop
+            if self.left() <= 0:
+                return BUDGET
+
     def _send(self, feed: Feed, key: str) -> FeedOutcome:
         pid = feed.provider_id
         if self.window_full:
             return FeedOutcome(pid, UNAVAILABLE, EXTRACT_WINDOW)
         if self.left() <= 0:
             return FeedOutcome(pid, SKIPPED, BUDGET)
-        assert feed.archive is not None and feed.archive_sha256 is not None
-        made = self.extract(feed.provider_cfg, feed.archive, feed.archive_sha256)
+        made = self._extract_within(feed)
         if isinstance(made, str):
             return FeedOutcome(pid, SKIPPED, made)
         path = Path(made.path_gz)
@@ -551,8 +589,8 @@ class _Retries:
 
 
 def _unreached(pid: str, reason: str) -> FeedOutcome:
-    if reason == BUDGET:
-        return FeedOutcome(pid, SKIPPED, BUDGET)
+    if reason in (BUDGET, EXTRACT_GONE):
+        return FeedOutcome(pid, SKIPPED, reason)
     return FeedOutcome(pid, UNAVAILABLE, reason)
 
 
@@ -706,14 +744,42 @@ def _log_outcome(outcome: FeedOutcome) -> None:
         )
 
 
-def _extract(provider_cfg: dict[str, Any], archive: Path, sha: str) -> Any:
-    """The extractor's result, or a reason word when it made none."""
+def _source(provider_cfg: dict[str, Any]) -> str:
+    timetable = provider_cfg.get("timetable") or {}
+    return str(timetable.get("source") or ("url" if timetable.get("url") else "upload"))
+
+
+def _extract(sid: str, feed: Feed, wait_seconds: float) -> Any:
+    """The extract of a feed, or a reason word when there is none: through
+    the extractor's one safe entry point, `station_extract.ensure_extract`
+    (a cached extract at once; else a resource-limited child process, one
+    extraction at a time on the machine, waiting at most `wait_seconds` for
+    another one: `busy`). It reads a snapshot of the slot paired with its
+    sha256 (`provider_archive_snapshot`), so a refresh that replaces the file
+    meanwhile cannot pair this feed version with another file: the feed is
+    then `archive_changed`, sent by the next pass. Every reason of the
+    extractor (`resource_limit`, `busy`, `too_large`, `no_rail_stop`, ...)
+    is a skip: none says the module is unavailable."""
+    upload_sha = feed.archive_sha256 if _source(feed.provider_cfg) == "upload" else None
     try:
-        return station_extract.build_extract(
-            provider_cfg, archive, sha, extracted_at=datetime.now(UTC)
-        )
+        with station_extract.provider_archive_snapshot(
+            sid, feed.provider_cfg, upload_sha256=upload_sha
+        ) as found:
+            if found is None or found[1] != feed.archive_sha256:
+                return ARCHIVE_CHANGED
+            return station_extract.ensure_extract(
+                feed.provider_cfg,
+                found[0],
+                found[1],
+                extracted_at=datetime.now(UTC),
+                session_id=sid,
+                wait_seconds=wait_seconds,
+            )
     except station_extract.ExtractError as refused:
         return refused.reason if _WORD.fullmatch(refused.reason) else NO_EXTRACT
+    except Exception as exc:  # the snapshot's file system, never the extraction
+        log.warning(_FAILED, ERROR, type(exc).__name__)
+        return ERROR
 
 
 def send_session_extracts(
@@ -724,7 +790,7 @@ def send_session_extracts(
     should_stop: Callable[[], bool] = lambda: False,
     clock: Clock | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
-    extract: Callable[[dict[str, Any], Path, str], Any] = _extract,
+    extract: Callable[[str, Feed, float], Any] = _extract,
     record: bool = True,
 ) -> PassResult:
     """Send what the module lacks of a session's feeds, within `budget` seconds.
@@ -746,6 +812,7 @@ def send_session_extracts(
             should_stop,
             extract,
             station_extract.EXTRACTOR_VERSION,
+            sid,
         )
         for feed in feeds:
             if should_stop():
@@ -833,9 +900,9 @@ def send_after_refresh(sid: str, only_provider: str | None = None) -> None:
 # never inside the refresh. Not a FastAPI background task: the request's
 # task list holds the extractor's own warm-up (`station_extract.
 # warm_session_extracts`, pull request 4), which its tests pin as the only
-# task. The two may then extract one archive at the same time: the
-# extractor writes its cache file in one rename, so the cost is time, not a
-# broken file. A pass already waiting for the same session and provider is
+# task. Both go through `station_extract.ensure_extract`, one extraction at
+# a time with its cache, so an archive is never extracted twice. A pass
+# already waiting for the same session and provider is
 # not queued twice.
 _waiting: queue.Queue[tuple[str, str | None]] = queue.Queue()
 _queued: set[tuple[str, str | None]] = set()

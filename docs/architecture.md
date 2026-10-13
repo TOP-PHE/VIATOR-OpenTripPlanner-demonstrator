@@ -1196,7 +1196,10 @@ does). `station_extract_upload.send_session` reads the session's providers
 slot (`inbox/<sid>/<gtfs|netex>/<id>.zip`), its sha256 from the fetch state (`sha256`, the bytes
 downloaded) or, for an `upload` provider, from its latest `uploads` row. Per feed: `HEAD
 /internal/v1/feeds/{key}/{sha256}?extractor_version=<EXTRACTOR_VERSION>`; 200 is "already held";
-404 runs `build_extract` (a cache hit when the archive was extracted before) and `PUT
+404 asks the extractor's one safe entry point, `station_extract.ensure_extract` (a cached extract
+at once, else a resource-limited child process, one extraction at a time on the machine), on a
+snapshot of the slot paired with its sha256 (`provider_archive_snapshot`: a slot replaced since the
+`HEAD` is `archive_changed`, sent by the next pass), then `PUT
 /internal/v1/feeds/{key}/extract`, the gzip streamed from its file in 64 KiB pieces with its
 `Content-Length` (never chunked, never held whole), checked against the module's 200 (its own
 sha256, bytes and rows given back). Both calls carry the token, `Accept-Encoding: identity` and
@@ -1204,8 +1207,12 @@ sha256, bytes and rows given back). Both calls carry the token, `Accept-Encoding
 id. **Bounds**: each call under `asyncio.timeout` on its own loop, 10 s for a `HEAD`, 120 s for a
 `PUT`, never past the pass's budget, **5 minutes before a graph build** (`BUILD_BUDGET_SECONDS`;
 30 minutes for a refresh's pass, which nothing waits on); no new work once the budget is spent (the
-feeds left are "skipped", `budget`), so the worst case is the budget plus one extraction and one
-`PUT` already started. 503 `busy` and 429 `extract_window` are sent again after their
+feeds left are "skipped", `budget`). The extraction runs on a thread of its own and the pass waits
+for it at most until the budget ends (its child goes on and leaves the extract in the cache for the
+next pass), passing what is left as `ensure_extract`'s `wait_seconds`; every call's deadline ends
+with the budget too, so a pass ends within its budget. Every reason of the extractor
+(`resource_limit`, `busy`, `too_large`, `no_rail_stop`, …) is a skip, never "module unavailable";
+an extract file that goes away before its `PUT` is `extract_gone`. 503 `busy` and 429 `extract_window` are sent again after their
 `Retry-After` when it fits in the budget (and is at most 120 s); a 429 that cannot be waited ends
 every `PUT` of the pass; 408, any other 5xx, a call past its deadline or a lost connection are
 tried twice more, 5 s apart; every other 4xx is a refusal, never sent again in the pass. One line
@@ -1221,9 +1228,9 @@ INFO line `station_extract.skipped reason=off`, nothing noted.
 web process and returns at once: the same pass for the session (or that provider), budget 30
 minutes, the passes one after the other, a pass already waiting for the same session and provider
 not queued twice. Not a FastAPI background task: the request's task list holds the extractor's own
-warm-up (`station_extract.warm_session_extracts`, PR 4), which its tests pin as the only task; the
-two may extract one archive at the same moment, which costs time only (the extractor writes its
-cache file in one rename). So an OTP session sends without a rebuild, and a refresh
+warm-up (`station_extract.warm_session_extracts`, PR 4), which its tests pin as the only task. Both
+go through `ensure_extract`, which makes one extraction at a time and reuses the cache, so one
+archive is never extracted twice. So an OTP session sends without a rebuild, and a refresh
 that found every file unchanged still sends what the module lacks (a first deploy, a new
 extractor version). The last outcome of each provider is written to
 `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` (`{"at", "state", "reason"}`), its
@@ -1373,7 +1380,8 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
   the same `STATION_MODULE_URL` / `STATION_MODULE_TOKEN` as `web`: a worker not recreated after
   a token rotation is refused (403) and builds without waiting, with a warning.
 - **Before that wait, and before every OTP build, the worker sends the session's stop extracts**
-  (`station_extract_upload`, at most 5 minutes plus one extraction and one `PUT` already started).
+  (`station_extract_upload`, at most 5 minutes: an extraction still running then is left to its
+  child process, whose extract the next pass finds in the cache).
   A failed upload never stops the graph; a cancel during it builds nothing. A feed key travels in
   the path of the two intake calls (the module's contract), so it shows in the httpx trace's URL;
   it is derived from VIATOR's own provider configuration and is no secret, but it is never written

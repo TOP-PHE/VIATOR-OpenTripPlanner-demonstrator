@@ -2,7 +2,7 @@
 
 The module is never reached: a fake module answers through
 `httpx.MockTransport` (or a small streaming transport), a fake clock replaces
-every pause, and a fake extractor stands in for `station_extract.build_extract`
+every pause, and a fake extractor stands in for `station_extract.ensure_extract`
 with its interface. Values are invented: a `.invalid` address, `ZZ` provider
 ids, a token and archive digests drawn at run time.
 """
@@ -10,13 +10,15 @@ ids, a token and archive digests drawn at run time.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import json
 import logging
 import secrets
+import threading
 import tracemalloc
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -56,7 +58,7 @@ def _url_key() -> str:
 
 
 class FakeExtractor:
-    """`station_extract.build_extract` with its interface: writes a small gzip
+    """`station_extract.ensure_extract` with its interface: writes a small gzip
     extract per call, or raises `ExtractError` when told to."""
 
     def __init__(self, tmp: Path, keys: dict[str, str], fail: str | None = None) -> None:
@@ -64,6 +66,8 @@ class FakeExtractor:
         self.keys = keys
         self.fail = fail
         self.calls: list[tuple[str, str]] = []
+        self.waits: list[float] = []
+        self.sessions: list[str] = []
         self.payload = b"format_version,feed_key\n1,zz\n" * 50
 
     def __call__(
@@ -73,10 +77,15 @@ class FakeExtractor:
         archive_sha256: str,
         *,
         extracted_at: datetime,
+        session_id: str,
         cache_dir: Path | None = None,
+        wait_seconds: float | None = None,
     ) -> station_extract.ExtractResult:
         assert extracted_at.tzinfo is not None
+        assert wait_seconds is not None
         self.calls.append((provider_cfg["id"], archive_sha256))
+        self.waits.append(wait_seconds)
+        self.sessions.append(session_id)
         if self.fail is not None:
             raise station_extract.ExtractError(self.fail, "stand-in")
         path = self.tmp / f"{archive_sha256}.csv.gz"
@@ -91,6 +100,22 @@ class FakeExtractor:
             bytes=len(body),
             body_sha256=hashlib.sha256(body).hexdigest(),
         )
+
+
+class FakeSnapshot:
+    """`station_extract.provider_archive_snapshot` with its interface: the
+    pair (file, sha256) each provider id has in `pairs`, else None."""
+
+    def __init__(self) -> None:
+        self.pairs: dict[str, tuple[Path, str]] = {}
+        self.uploads: list[str | None] = []
+
+    @contextlib.contextmanager
+    def __call__(
+        self, session_id: str, provider_cfg: Any, *, upload_sha256: str | None = None
+    ) -> Iterator[tuple[Path, str] | None]:
+        self.uploads.append(upload_sha256)
+        yield self.pairs.get(provider_cfg["id"])
 
 
 Answer = httpx.Response | Callable[[httpx.Request], httpx.Response]
@@ -176,14 +201,22 @@ class Setup:
             self.feeds.append(
                 up.Feed(
                     pid,
-                    {"id": pid, "timetable": {"format": "gtfs"}},
+                    {
+                        "id": pid,
+                        "timetable": {"format": "gtfs", "url": f"https://zz.invalid/{i}.zip"},
+                    },
                     keys[pid],
                     archive,
                     _sha(),
                 )
             )
         self.extractor = FakeExtractor(tmp, keys)
-        monkeypatch.setattr(station_extract, "build_extract", self.extractor)
+        self.snapshot = FakeSnapshot()
+        for feed in self.feeds:
+            assert feed.archive is not None and feed.archive_sha256 is not None
+            self.snapshot.pairs[feed.provider_id] = (feed.archive, feed.archive_sha256)
+        monkeypatch.setattr(station_extract, "ensure_extract", self.extractor)
+        monkeypatch.setattr(station_extract, "provider_archive_snapshot", self.snapshot)
 
 
 @pytest.fixture
@@ -707,7 +740,7 @@ def test_the_token_the_session_and_the_feed_key_are_never_logged(
 
 
 @pytest.mark.usefixtures("token")
-def test_an_unexpected_error_ends_the_pass_with_one_warning(
+def test_an_extractor_that_raises_skips_its_feed_with_one_warning(
     setup: Setup, module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture, token: str
 ) -> None:
     def broken(*_a: Any, **_kw: Any) -> Any:
@@ -723,7 +756,31 @@ def test_an_unexpected_error_ends_the_pass_with_one_warning(
             extract=broken,
             record=False,
         )
-    assert result.outcomes == []
+    assert _states(result) == [(up.SKIPPED, up.ERROR)]
+    assert "station_extract.failed reason=error type=RuntimeError" in caplog.text
+    assert token not in caplog.text
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_an_unexpected_error_ends_the_pass_with_one_warning(
+    setup: Setup, module: Module, clock: FakeClock, caplog: pytest.LogCaptureFixture, token: str
+) -> None:
+    def feeds() -> Iterator[up.Feed]:
+        yield setup.feeds[0]
+        raise RuntimeError(f"stand-in {token}")
+
+    module.heads = [httpx.Response(200)]
+    with caplog.at_level(logging.INFO, logger="app.station_extract_upload"):
+        result = up.send_session_extracts(
+            SESSION,
+            feeds(),
+            budget=10.0,
+            clock=clock,
+            transport=httpx.MockTransport(module),
+            record=False,
+        )
+    assert _states(result) == [(up.HELD, None)]
     assert "station_extract.failed reason=error type=RuntimeError" in caplog.text
     assert token not in caplog.text
 
@@ -758,7 +815,7 @@ def test_an_extract_that_does_not_match_its_feed_is_not_sent(
         }[field]
         return station_extract.ExtractResult(**{**made.__dict__, **changes})
 
-    monkeypatch.setattr(station_extract, "build_extract", wrong)
+    monkeypatch.setattr(station_extract, "ensure_extract", wrong)
     assert _states(_run(setup, module, clock)) == [(up.SKIPPED, up.NO_EXTRACT)]
     assert module.put_requests == []
 
@@ -881,7 +938,10 @@ def test_the_extract_is_streamed_from_its_file(
     key, sha = _url_key(), _sha()
     made = station_extract.ExtractResult(big, key, sha, "v", 50, size, digest)
     feed = up.Feed("ZZ0", {"id": "ZZ0"}, key, tmp_path / "a.zip", sha)
-    monkeypatch.setattr(station_extract, "build_extract", lambda *_a, **_kw: made)
+    monkeypatch.setattr(station_extract, "ensure_extract", lambda *_a, **_kw: made)
+    snapshot = FakeSnapshot()
+    snapshot.pairs["ZZ0"] = (tmp_path / "a.zip", sha)
+    monkeypatch.setattr(station_extract, "provider_archive_snapshot", snapshot)
     counting = _Counting()
     tracemalloc.start()
     try:
@@ -1119,3 +1179,204 @@ def test_without_the_module_a_refresh_queues_nothing(
         up.after_refresh("zz")
     assert up._waiting.unfinished_tasks == 0
     assert "station_extract.skipped reason=off" in caplog.text
+
+
+# ── the safe entry point of the extractor (PR 4's repair round) ──────────
+
+
+@pytest.mark.usefixtures("token")
+def test_the_extract_comes_from_ensure_extract_within_the_budget(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    def slow_404(request: httpx.Request) -> httpx.Response:
+        clock.now += 7.0
+        return httpx.Response(404)
+
+    module.heads = [slow_404]
+    result = _run(setup, module, clock, budget=60.0)
+    assert _states(result) == [(up.SENT, None)]
+    assert setup.extractor.sessions == [SESSION]
+    # It waits for another extraction at most what is left of the budget.
+    assert setup.extractor.waits == [53.0]
+    assert setup.snapshot.uploads == [None]
+
+
+@pytest.mark.usefixtures("token")
+@pytest.mark.parametrize(
+    "reason",
+    ["resource_limit", "busy", "cache", "error", "bad_archive", "input_too_large", "no_rail_stop"],
+)
+def test_every_extractor_reason_is_a_skip(
+    setup: Setup, module: Module, clock: FakeClock, reason: str
+) -> None:
+    setup.extractor.fail = reason
+    result = _run(setup, module, clock)
+    assert _states(result) == [(up.SKIPPED, reason)]
+    assert result.outcomes[0].text == "skipped"
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+@pytest.mark.parametrize("pair", ["other-sha256", "none"])
+def test_a_slot_replaced_since_the_head_is_not_extracted(
+    setup: Setup, module: Module, clock: FakeClock, pair: str
+) -> None:
+    feed = setup.feeds[0]
+    assert feed.archive is not None
+    if pair == "none":
+        del setup.snapshot.pairs[feed.provider_id]
+    else:
+        setup.snapshot.pairs[feed.provider_id] = (feed.archive, _sha())
+    result = _run(setup, module, clock)
+    assert _states(result) == [(up.SKIPPED, up.ARCHIVE_CHANGED)]
+    assert setup.extractor.calls == []
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_an_upload_provider_pairs_its_file_with_the_uploads_sha256(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    old = setup.feeds[0]
+    feed = up.Feed(
+        old.provider_id,
+        {"id": old.provider_id, "timetable": {"format": "gtfs", "source": "upload"}},
+        old.feed_key,
+        old.archive,
+        old.archive_sha256,
+    )
+    setup.feeds[0] = feed
+    assert _states(_run(setup, module, clock)) == [(up.SENT, None)]
+    assert setup.snapshot.uploads == [feed.archive_sha256]
+
+
+class _Blocking:
+    """An extractor still at work: it moves the clock, then waits to be released."""
+
+    def __init__(self, clock: FakeClock, advance: float) -> None:
+        self.clock = clock
+        self.advance = advance
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, *_a: Any, **_kw: Any) -> Any:
+        self.clock.now += self.advance
+        self.started.set()
+        self.release.wait(10)
+        raise station_extract.ExtractError("busy")
+
+
+@pytest.mark.usefixtures("token")
+def test_the_budget_ends_the_wait_for_an_extraction_that_goes_on(
+    setup: Setup, module: Module, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocking = _Blocking(clock, 400.0)
+    monkeypatch.setattr(station_extract, "ensure_extract", blocking)
+    monkeypatch.setattr(up, "EXTRACT_POLL_SECONDS", 0.01)
+    try:
+        result = _run(setup, module, clock, budget=300.0)
+    finally:
+        blocking.release.set()
+    assert _states(result) == [(up.SKIPPED, up.BUDGET)]
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_a_cancel_ends_the_wait_for_an_extraction(
+    setup: Setup, module: Module, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocking = _Blocking(clock, 0.0)
+    monkeypatch.setattr(station_extract, "ensure_extract", blocking)
+    monkeypatch.setattr(up, "EXTRACT_POLL_SECONDS", 0.01)
+    try:
+        result = _run(setup, module, clock, should_stop=blocking.started.is_set)
+    finally:
+        blocking.release.set()
+    assert result.cancelled
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_an_extract_that_goes_away_before_the_put_is_skipped(
+    setup: Setup, module: Module, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = setup.extractor
+
+    def gone(*args: Any, **kwargs: Any) -> station_extract.ExtractResult:
+        made = real(*args, **kwargs)
+        made.path_gz.unlink()
+        return made
+
+    monkeypatch.setattr(station_extract, "ensure_extract", gone)
+    monkeypatch.setattr(up, "_size_on_disk", lambda _p: real_size(real))
+    result = _run(setup, module, clock)
+    assert _states(result) == [(up.SKIPPED, up.EXTRACT_GONE)]
+    assert module.put_requests == []
+    assert clock.slept == []
+
+
+def real_size(extractor: FakeExtractor) -> int:
+    return len(gzip.compress(extractor.payload))
+
+
+@pytest.mark.usefixtures("token")
+def test_end_to_end_with_the_real_extractor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    """A refresh's slot, its fetch state, the real `ensure_extract` (its child
+    process and its cache), and the fake module: the extract sent is an
+    extract of that feed version, made once."""
+    import zipfile
+
+    from app import feed_fetch
+
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    sid = "zz-e2e"
+    slot = tmp_path / sid / "gtfs" / "zzrail.zip"
+    slot.parent.mkdir(parents=True)
+    with zipfile.ZipFile(slot, "w") as zf:
+        zf.writestr("agency.txt", "agency_id,agency_name\nZZR,ZZ Rail\n")
+        zf.writestr(
+            "stops.txt",
+            "stop_id,stop_name,stop_lat,stop_lon\nZZ:A,ZZ Nord,48.8,2.3\nZZ:B,ZZ Sud,48.7,2.2\n",
+        )
+        zf.writestr("routes.txt", "route_id,agency_id,route_type\nR1,ZZR,2\n")
+        zf.writestr("trips.txt", "route_id,service_id,trip_id\nR1,W,T1\n")
+        zf.writestr(
+            "stop_times.txt",
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,08:00:00,08:00:00,ZZ:A,1\nT1,09:00:00,09:00:00,ZZ:B,2\n",
+        )
+    sha = _sha()
+    feed_fetch.save_state(
+        tmp_path / sid / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", {"sha256": sha}
+    )
+    config = {
+        "sources": {
+            "providers": [
+                {
+                    "id": "ZZRAIL",
+                    "label": "ZZ Rail",
+                    "timetable": {
+                        "format": "gtfs",
+                        "source": "url",
+                        "url": "https://zz.invalid/zz.zip",
+                    },
+                }
+            ]
+        }
+    }
+    feeds = up.session_feeds(sid, config, {})
+    module.puts = [_answer_with(rows=2)]
+    result = up.send_session_extracts(
+        sid, feeds, budget=120.0, clock=clock, transport=httpx.MockTransport(module), record=False
+    )
+    assert _states(result) == [(up.SENT, None)]
+    lines = gzip.decompress(module.bodies[0]).decode("utf-8").splitlines()
+    assert lines[0].startswith("format_version,feed_key,feed_version,")
+    assert len(lines) == 3
+    assert all(f",{sha}," in line for line in lines[1:])
+    # The snapshot is gone; the cache holds the one extract.
+    extracts = tmp_path / sid / "_extracts"
+    assert [p.name for p in extracts.iterdir() if p.name.endswith(".snap")] == []
+    assert len(list(extracts.glob("ZZRAIL.*.csv.gz"))) == 1

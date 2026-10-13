@@ -2918,13 +2918,15 @@ provider's slot.
   new extracts. For each provider with a feed key, VIATOR first asks the
   module whether it already holds the extract of that file by this version
   of the extractor (one short `HEAD` call per feed); only when it does not
-  is the extract made (or taken from its cache, `inbox/<sid>/_extracts/`)
-  and sent. A file already sent is never sent again; a new download, or a
+  is the extract made (or taken from its cache, `inbox/<sid>/_extracts/`;
+  one extraction at a time, in a process with limited memory and time,
+  11.4) and sent. A file already sent is never sent again; a new download, or a
   new version of the extractor, is. A derived (cross-border filter)
   provider sends nothing: its national feed is sent by its own session.
-- **How long.** Before a rebuild the sending takes at most 5 minutes (plus
-  one extract being made or sent when the 5 minutes end); the graph build
-  then starts whatever happened. Each call is cut after 10 s (`HEAD`) or 120
+- **How long.** Before a rebuild the sending takes at most 5 minutes; the
+  graph build then starts whatever happened. An extract still being made
+  then goes on in its own limited process and is sent by the next refresh
+  or rebuild. Each call is cut after 10 s (`HEAD`) or 120
   s (the upload). After a refresh nothing waits on it: it may take up to 30
   minutes in the background.
 - **The graph is always built.** The module unreachable, older than these
@@ -2947,7 +2949,7 @@ provider's slot.
   | sent | the module recorded the extract as a new version |
   | already held | the module already had this file's extract (nothing sent, or the upload answered "unchanged") |
   | refused `<reason>` | the module refused the extract, with its reason word (`row`, `header`, `duplicate_stop`, `size`, `token`, `source_taken`, …): see the module's runbook; the next refresh or rebuild tries again, and the module refuses it the same way until the file, the extractor or the module changes |
-  | skipped | nothing sent: no file in the slot yet, no feed key (a derived provider), no extract could be made (the reason word is in the tooltip: `too_large`, `no_rail_stop`, …), or the 5 minutes were spent (`budget`) |
+  | skipped | nothing sent: no file in the slot yet, no feed key (a derived provider), no extract could be made (the reason word is in the tooltip: `too_large`, `no_rail_stop`, `resource_limit` when the extraction passed its memory or time limit, `busy` when another extraction held the machine too long, …), the file was replaced since the check (`archive_changed`), or the 5 minutes were spent (`budget`) |
   | module unavailable | the module did not take it: unreachable, too slow (`timeout`), busy, its half-hour limit reached (`extract_window`), a 404 (a module older than these calls), a 5xx (the word is in the tooltip); sent again at the next refresh or rebuild |
 
   The rebuild job's log has one line per rebuild:
