@@ -452,8 +452,9 @@ def test_ensure_extract_child_failures_are_extract_errors(
     monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
     not_zip = tmp_path / "nz.zip"
     not_zip.write_bytes(b"not a zip")
+    provider = _provider()
     with pytest.raises(ExtractError) as caught:
-        ensure_extract(_provider(), not_zip, SHA_A, extracted_at=WHEN, session_id="s")
+        ensure_extract(provider, not_zip, SHA_A, extracted_at=WHEN, session_id="s")
     assert caught.value.reason == "bad_archive"
     monkeypatch.setattr(station_extract, "CHILD_MEMORY_BYTES", 512 * MIB)
     with pytest.raises(ExtractError) as caught:
@@ -490,11 +491,12 @@ def test_one_extraction_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
     (tmp_path / "inbox").mkdir(exist_ok=True)
     archive = _gtfs(tmp_path)
+    provider = _provider()
     assert station_extract._ONE_HERE.acquire(timeout=1)
     try:
         with pytest.raises(ExtractError) as caught:
             ensure_extract(
-                _provider(), archive, SHA_A, extracted_at=WHEN, session_id="s", wait_seconds=0.1
+                provider, archive, SHA_A, extracted_at=WHEN, session_id="s", wait_seconds=0.1
             )
         assert caught.value.reason == "busy"
     finally:
@@ -504,7 +506,7 @@ def test_one_extraction_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         fcntl.flock(other, fcntl.LOCK_EX)
         with pytest.raises(ExtractError) as caught:
             ensure_extract(
-                _provider(), archive, SHA_A, extracted_at=WHEN, session_id="s", wait_seconds=1.5
+                provider, archive, SHA_A, extracted_at=WHEN, session_id="s", wait_seconds=1.5
             )
         assert caught.value.reason == "busy"
         fcntl.flock(other, fcntl.LOCK_UN)
@@ -569,8 +571,9 @@ def test_damaged_cache_removed_even_when_not_made_again(tmp_path: Path) -> None:
     first = _build(_provider(), archive, tmp_path)
     first.path_gz.write_bytes(b"zz")
     archive.unlink()
+    provider = _provider()
     with pytest.raises(ExtractError):
-        _build(_provider(), archive, tmp_path)
+        _build(provider, archive, tmp_path)
     assert not first.path_gz.exists()
 
 
@@ -587,10 +590,9 @@ def test_temporary_file_synced_before_replace(
 def test_unwritable_cache_is_an_extract_error(tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("zz")
+    provider, archive = _provider(), _gtfs(tmp_path)
     with pytest.raises(ExtractError) as caught:
-        build_extract(
-            _provider(), _gtfs(tmp_path), SHA_A, extracted_at=WHEN, cache_dir=blocker / "x"
-        )
+        build_extract(provider, archive, SHA_A, extracted_at=WHEN, cache_dir=blocker / "x")
     assert caught.value.reason == "cache"
 
 

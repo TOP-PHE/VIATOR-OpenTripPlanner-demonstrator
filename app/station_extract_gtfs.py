@@ -225,31 +225,33 @@ def _add_details(
     """Second pass: the stations' names, positions and codes, then the codes
     of their children, after the station's own; a station without a position
     takes its first child's. Returns the stations stops.txt defines."""
-    children: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
-    child_position: dict[str, tuple[float, float]] = {}
+    children: dict[str, Station] = {}  # per station: its children's codes and first position
     defined: set[str] = set()
     for row in _rows(zf, stops, budget):
         stop_id = row.get("stop_id", "")
-        own = stations.get(stop_id)
         lat, lon = coordinate(row.get("stop_lat")), coordinate(row.get("stop_lon"))
+        own = stations.get(stop_id)
         if own is not None:
             defined.add(stop_id)
             own.place(row.get("stop_name", ""), lat, lon)
-            for name in _CODE_COLUMNS:
-                own.add_code(name, row.get(name))
+            _add_codes(own, row)
         parent = row.get("parent_station", "")
-        if parent not in stations or parent == stop_id:
-            continue
-        if row.get("location_type", "") not in _NOT_A_PLATFORM:
-            children[parent].extend((name, row.get(name, "")) for name in _CODE_COLUMNS)
-        if lat is not None and lon is not None:
-            child_position.setdefault(parent, (lat, lon))
-    for key, codes in children.items():
-        for name, value in codes:
+        if parent in stations and parent != stop_id:
+            child = children.setdefault(parent, Station(key=parent))
+            child.place("", lat, lon)
+            if row.get("location_type", "") not in _NOT_A_PLATFORM:
+                _add_codes(child, row)
+    for key, child in children.items():
+        for name, value in child.code_pairs():
             stations[key].add_code(name, value)
-    for key, (lat, lon) in child_position.items():
-        stations[key].place("", lat, lon)
+        stations[key].codes_over_cap += child.codes_over_cap
+        stations[key].place("", child.lat, child.lon)
     return defined
+
+
+def _add_codes(station: Station, row: dict[str, str]) -> None:
+    for name in _CODE_COLUMNS:
+        station.add_code(name, row.get(name))
 
 
 def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
