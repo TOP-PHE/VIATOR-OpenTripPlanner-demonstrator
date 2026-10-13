@@ -745,7 +745,7 @@ def test_no_extract_skips_the_feed_with_the_extractors_word(
 @pytest.mark.usefixtures("token")
 @pytest.mark.parametrize("field", ["feed_key", "feed_version", "bytes"])
 def test_an_extract_that_does_not_match_its_feed_is_not_sent(
-    setup: Setup, module: Module, clock: FakeClock, field: str
+    setup: Setup, module: Module, clock: FakeClock, field: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real = setup.extractor
 
@@ -758,11 +758,8 @@ def test_an_extract_that_does_not_match_its_feed_is_not_sent(
         }[field]
         return station_extract.ExtractResult(**{**made.__dict__, **changes})
 
-    station_extract.build_extract = wrong  # type: ignore[assignment]
-    try:
-        assert _states(_run(setup, module, clock)) == [(up.SKIPPED, up.NO_EXTRACT)]
-    finally:
-        station_extract.build_extract = real  # type: ignore[assignment]
+    monkeypatch.setattr(station_extract, "build_extract", wrong)
+    assert _states(_run(setup, module, clock)) == [(up.SKIPPED, up.NO_EXTRACT)]
     assert module.put_requests == []
 
 

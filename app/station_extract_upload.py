@@ -185,6 +185,9 @@ REFUSAL_CODES = frozenset(
 )
 PUT_STATUSES = frozenset({"recorded", "unchanged"})
 STATE_KEY = "provider[{pid}].station_extract"
+# Log lines written from more than one place.
+_SKIPPED_OFF = "station_extract.skipped reason=off"
+_FAILED = "station_extract.failed reason=%s type=%s"
 
 
 class Clock(Protocol):
@@ -284,10 +287,14 @@ async def _read(response: httpx.Response) -> bytes:
 
 
 async def _chunks(path: Path) -> AsyncIterator[bytes]:
-    """The file, a piece at a time: an extract is never held whole in memory."""
-    with path.open("rb") as handle:
-        while piece := handle.read(CHUNK_BYTES):
+    """The file, a piece at a time, each read off the event loop: an extract
+    is never held whole in memory."""
+    handle = await asyncio.to_thread(path.open, "rb")
+    try:
+        while piece := await asyncio.to_thread(handle.read, CHUNK_BYTES):
             yield piece
+    finally:
+        await asyncio.to_thread(handle.close)
 
 
 def _client(transport: httpx.AsyncBaseTransport | None, limit: float) -> httpx.AsyncClient:
@@ -448,22 +455,17 @@ class _Pass:
         past its deadline or a lost connection, `TRANSIENT_RETRIES` more
         times; 503 `busy` and 429 after their `Retry-After`, within the
         budget. Returns the last answer; raises `_Failure` when none came."""
-        transient_left = TRANSIENT_RETRIES
+        retries = _Retries(self)
         while True:
             if self.left() <= 0:
                 raise _Failure(BUDGET)
             try:
                 answer = send(self.limit(call_seconds))
             except _Failure:
-                if transient_left > 0 and self.pause(TRANSIENT_PAUSE_SECONDS):
-                    transient_left -= 1
+                if retries.transient():
                     continue
                 raise
-            if _waits(answer):
-                if self.pause(_retry_wait(answer)):
-                    continue
-            elif _transient(answer) and transient_left > 0 and self.pause(TRANSIENT_PAUSE_SECONDS):
-                transient_left -= 1
+            if retries.again(answer):
                 continue
             return answer
 
@@ -525,6 +527,29 @@ def _size_on_disk(path: Path) -> int | None:
         return None
 
 
+class _Retries:
+    """What is left of one call's retries, and whether to try again."""
+
+    def __init__(self, work: _Pass) -> None:
+        self.work = work
+        self.left = TRANSIENT_RETRIES
+
+    def transient(self) -> bool:
+        """After a transient failure: True once the pause is over, while
+        retries are left and the pause fits in the budget."""
+        if self.left > 0 and self.work.pause(TRANSIENT_PAUSE_SECONDS):
+            self.left -= 1
+            return True
+        return False
+
+    def again(self, answer: _Answer) -> bool:
+        """After an answer: busy and 429 after their `Retry-After`, 408 and
+        5xx as a transient failure; every other answer is final."""
+        if _waits(answer):
+            return self.work.pause(_retry_wait(answer))
+        return _transient(answer) and self.transient()
+
+
 def _unreached(pid: str, reason: str) -> FeedOutcome:
     if reason == BUDGET:
         return FeedOutcome(pid, SKIPPED, BUDGET)
@@ -570,6 +595,12 @@ def _archive(sid: str, provider: dict[str, Any]) -> Path | None:
     return path if path.is_file() else None
 
 
+def _fetched_sha256(sid: str, label: str) -> str | None:
+    """The sha256 of the last download of a refresh task (its fetch state)."""
+    raw = feed_fetch.load_state(_fetch_state_dir(sid), label).get("sha256")
+    return raw if isinstance(raw, str) else None
+
+
 def session_feeds(sid: str, config: dict[str, Any], upload_sha256: dict[str, str]) -> list[Feed]:
     """The session's providers as feeds. The archive sha256 is the sha256 of
     the bytes VIATOR downloaded, kept in the fetch state (`sha256`), for a
@@ -591,10 +622,7 @@ def session_feeds(sid: str, config: dict[str, Any], upload_sha256: dict[str, str
         if source == "upload":
             sha = upload_sha256.get(pid)
         else:
-            label = f"provider[{pid}].timetable({fmt})"
-            state = feed_fetch.load_state(_fetch_state_dir(sid), label)
-            raw = state.get("sha256")
-            sha = raw if isinstance(raw, str) else None
+            sha = _fetched_sha256(sid, f"provider[{pid}].timetable({fmt})")
         if sha is not None and SHA256.fullmatch(sha) is None:
             sha = None
         key = station_extract.feed_key_for(
@@ -707,7 +735,7 @@ def send_session_extracts(
     result = PassResult()
     if not station_module.enabled():
         result.off = True
-        log.info("station_extract.skipped reason=off")
+        log.info(_SKIPPED_OFF)
         return result
     clock = clock or SystemClock()
     try:
@@ -733,7 +761,7 @@ def send_session_extracts(
         log.info("station_extract.cancelled")
         return result
     except Exception as exc:
-        log.warning("station_extract.failed reason=%s type=%s", ERROR, type(exc).__name__)
+        log.warning(_FAILED, ERROR, type(exc).__name__)
         return result
     counts = result.counts()
     log.info(
@@ -779,7 +807,7 @@ def send_session(
     an `Exception`. Used by the worker before a graph build, and by the
     refresh endpoints in a background task (`send_after_refresh`)."""
     if not station_module.enabled():
-        log.info("station_extract.skipped reason=off")
+        log.info(_SKIPPED_OFF)
         return PassResult(off=True)
     try:
         if session_factory is None:
@@ -789,7 +817,7 @@ def send_session(
         with session_factory() as db:
             feeds = _feeds_of(db, sid, only_provider)
     except Exception as exc:
-        log.warning("station_extract.failed reason=%s type=%s", ERROR, type(exc).__name__)
+        log.warning(_FAILED, ERROR, type(exc).__name__)
         return PassResult()
     with _one_at_a_time:
         return send_session_extracts(sid, feeds, budget=budget, should_stop=should_stop)
@@ -823,7 +851,7 @@ def _send_queued() -> None:
         try:
             send_after_refresh(*item)
         except Exception as exc:  # the thread must outlive any one pass
-            log.warning("station_extract.failed reason=%s type=%s", ERROR, type(exc).__name__)
+            log.warning(_FAILED, ERROR, type(exc).__name__)
         finally:
             _waiting.task_done()
 
@@ -833,7 +861,7 @@ def after_refresh(sid: str, only_provider: str | None = None) -> None:
     configured nothing is queued (one INFO line)."""
     global _sender
     if not station_module.enabled():
-        log.info("station_extract.skipped reason=off")
+        log.info(_SKIPPED_OFF)
         return
     item = (sid, only_provider)
     with _queued_lock:
