@@ -390,6 +390,52 @@ The worker has an APScheduler-style cron that pulls fresh files on the configure
 
 For MERITS (when wired), the same shape applies — `kind: "MERITS-..."` with auth headers stored in `sessions.config.merits_credentials_ref` (a Postgres-stored encrypted secret reference).
 
+
+### 5.2 The stop extract for the station module (MSMM 22.2)
+
+`app/station_extract.py` writes, per feed version, the extract the station module's VIATOR station
+referential reads (MSMM `docs/service-design.md` 22.2 point 6; 22.3 point 3). Public interface, stable
+for the upload step:
+
+```python
+EXTRACTOR_VERSION: str                                   # "viator-stop-extract-1"
+feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
+build_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at,
+              cache_dir=None) -> ExtractResult
+# ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
+#               body_sha256, dropped); ExtractError(reason) when nothing is written
+warm_session_extracts(session_id, config, *, only_provider=None, upload_sha256=None)
+```
+
+- **Form**: gzip, UTF-8 without BOM, CSV, first line `format_version,feed_key,feed_version,
+  extracted_at,extractor_version,stop_key,stop_name,lat,lon,iso2_point,modes,n_calls,operators,codes,
+  provider_id,provider_label,provider_country_iso,provider_provenance`, `format_version` `1` on every
+  row; `modes`/`operators`/`codes` joined by `|`; a code `field=value`; `lat`/`lon` `format(x, ".7f")`;
+  `feed_version` the sha256 of the downloaded bytes (`FetchResult.sha256`, from the fetch state) or of
+  the uploaded file; `iso2_point` from `osm_geo.country_for_point`; `provider_provenance` the
+  provider's own, else the catalogue's for the same id and feed, else `nap` for a NAP-resolved one,
+  else empty.
+- **Feed key**: `nap:tdg:<resource id>`; `nap:<udata|permalink|dated|json_api>:` + 16 hex of the
+  sha256 of the canonical JSON of the resolver's own fields (validated; `dated` without
+  `max_days_back`); `url:` + 16 hex of lower-case host + path + sorted query; `upload:<sha256>`;
+  none for `cross_border_filter`. Identical to MSMM `feed_intake.resolver_identity`/`url_identity`.
+- **Rail and station level**: GTFS `route_type` 2, 100–117 (RAIL_MAIN) and 109, 300, 400, 403, 404
+  (RAIL_SUBURBAN), a call where a trip neither picks up nor drops off not counted, rolled up to the
+  `parent_station`; NeTEx `TransportMode` rail on the ServiceJourney or its Line (suburban by the
+  chain's submodes), a journey with no mode counted at a StopPlace whose mode is rail or type
+  `railStation`, rolled up through `ParentSiteRef`, positions from `Latitude`/`Longitude` or a
+  `gml:pos` in EPSG:4326, CRS84 or EPSG:2154.
+- **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072
+  characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
+  written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
+- **Streaming**: no archive is unpacked or held; memory follows the rail part of the feed (measured
+  with `tracemalloc` in the tests: under 2 MiB of Python allocations for 11 MiB of GTFS text and for
+  22 MiB of NeTEx XML).
+- **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
+  key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts`, queued as a
+  FastAPI background task by `POST /api/sessions/{sid}/sources/refresh`,
+  `POST /api/sessions/{sid}/providers/{pid}/refresh` and an upload to an `upload` provider.
+
 ---
 
 ## 6. Journey search & comparison

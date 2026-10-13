@@ -822,6 +822,7 @@ went into which build; and stale files silently produce a build the operator thi
 | `app/graph_snapshots.py` | One row per successful build: what went in, which calendar period it covers, which build is current. |
 | `app/staleness.py` | Two timestamps in `config._meta` answering "are the downloaded files in sync with the configured URLs?" |
 | `app/inbox_sweep.py` | Quarantines inbox files belonging to providers the operator has since removed. |
+| `app/station_extract.py` (+ `_gtfs`, `_netex`, `_common`) | The **stop extract** of each timetable feed for the station module (MSMM 22.2): one gzip CSV per feed version, the rail stations only, with their codes; the MSMM feed key of a provider; the cache in `inbox/<sid>/_extracts/`. Made at refresh and upload time; nothing in the graph build reads it. |
 
 ### How it works
 
@@ -972,8 +973,44 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 `CrossBorderStats`: `routes_total / routes_rail / routes_kept`, `trips_*`, `stop_times_*`, `stops_*`,
 `country_combos` (`{"CH+IT": 12, …}`, labelled by ISO name so it sorts alphabetically), `home_country`.
 
+**The stop extract for the station module (MSMM 22.2, VIATOR pull request 4 of the referential).**
+The station module builds its VIATOR station referential from the stops of the timetables VIATOR
+already downloads; VIATOR never sends an archive, only a small extract per feed version.
+`station_extract.build_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at,
+cache_dir=None) -> ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
+body_sha256, dropped)` writes it; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
+key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
+fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
+`cross_border_filter` provider), derived from the configuration only, exactly as MSMM's
+`feed_intake.resolver_identity` / `url_identity`; `EXTRACTOR_VERSION` names the rules. The readers
+stream: GTFS file by file (rail routes, trips and called stops kept, never `stop_times.txt`), NeTEx
+in five `iterparse` passes (defusedxml) that drop each element once read and follow references
+forwards and across files. Rail is GTFS `route_type` 2 and 100–117, with 109/300/400/403/404 as
+suburban (`_is_rail_route_type` of the cross-border filter is deliberately *not* reused: it drops
+the S-Bahn types), and NeTEx `TransportMode` rail on the journey or its Line, a journey with no mode
+at all counting at a StopPlace that says rail or `railStation`. One row per station: the GTFS
+`parent_station` or the stop itself, the NeTEx root StopPlace through `ParentSiteRef`; the children's
+codes are rolled up. Everything MSMM would refuse is cleaned or dropped first and counted by reason
+(`ExtractResult.dropped`); past one of MSMM's limits (200,000 rows, 256 MiB unpacked, 32 MiB gzip, a
+1 MiB line, a 131,072-character cell) nothing is written and `ExtractError.reason` says why. The
+refresh routes and the upload route queue `warm_session_extracts` as a FastAPI background task, so
+the extracts sit in `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex>.csv.gz` before
+`station_extract_upload` sends them (below).
+
 ### Invariants & traps
 
+- **The extract's `feed_version` is the sha256 of the bytes VIATOR downloaded**, from the fetch
+  state (`FetchResult.sha256`, kept on a 304 too), never the sha256 of the slot file: a NeTEx
+  `.xml.gz` re-wrapped as a zip has another one. An upload into the slot forgets the fetch state, so
+  `provider_archive` never pairs a stale sha256 with another file.
+- **The feed key must stay byte-for-byte MSMM's rule.** `tests/unit/test_station_extract.py` holds a
+  copy of MSMM's `resolver_identity`/`url_identity` and pins literal keys; a change on one side
+  only gives every feed a new key in the module (new `pending` feeds). Raise `EXTRACTOR_VERSION`
+  whenever the rows written for the same archive would change: the module keeps one version per
+  (feed, archive, extractor).
+- **One bad item refuses the whole extract in MSMM.** Never write a value straight through: every
+  text goes through `_clean_label`/`_clean_item`/`_code_item`, and a test re-states MSMM's check on
+  every extract it makes (`scripts/check_extract_with_msmm.py` runs MSMM's own, by hand).
 - **Refresh runs a format check before dispatch.** Since the NAP-resolver work, `_refresh_one_task`
   downloads through `feed_fetch.fetch_validated`, which checks magic bytes and requires
   `detect.detect` to agree with the declared kind before the slot is touched. An HTML stub served

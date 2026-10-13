@@ -9,7 +9,7 @@ happens once, when `app/station_extract.py` writes the file.
 from __future__ import annotations
 
 import collections
-import re
+import math
 import zipfile
 from dataclasses import dataclass, field
 
@@ -49,6 +49,10 @@ class Station:
         if value:
             self.codes.setdefault((name, value), None)
 
+    def code_pairs(self) -> list[tuple[str, str]]:
+        """The codes as (field, value) pairs, in the order first seen."""
+        return list(self.codes)
+
     def place(self, name: str, lat: float | None, lon: float | None) -> None:
         """Name and position, the first ones given win."""
         if name and not self.name:
@@ -68,12 +72,11 @@ def members(zf: zipfile.ZipFile) -> dict[str, str]:
     return found
 
 
-_NUMBER = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
-
-
 def coordinate(text: str | None) -> float | None:
-    """A decimal number, or None for anything else (empty, `nan`, words)."""
-    text = (text or "").strip()
-    if not _NUMBER.fullmatch(text):
+    """A finite decimal number, or None for anything else (empty, `nan`,
+    `inf`, words)."""
+    try:
+        value = float((text or "").strip())
+    except ValueError:
         return None
-    return float(text)
+    return value if math.isfinite(value) else None

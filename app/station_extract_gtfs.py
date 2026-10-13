@@ -33,7 +33,10 @@ from .station_extract_common import (
     members,
 )
 
-_REQUIRED = ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
+_STOPS = "stops.txt"
+_REQUIRED = (_STOPS, "routes.txt", "trips.txt", "stop_times.txt")
+# The columns whose values are a stop's codes (MSMM 22.2, point 1).
+_CODE_COLUMNS = ("stop_id", "stop_code", "platform_code")
 
 
 def rail_mode(route_type: str) -> str | None:
@@ -131,6 +134,52 @@ def _calls(
     return calls
 
 
+def _stations(
+    zf: zipfile.ZipFile,
+    stops: str,
+    calls: dict[str, collections.Counter[int]],
+    profiles: list[tuple[str, str]],
+) -> dict[str, Station]:
+    """First pass over stops.txt: the station of each called stop (its
+    `parent_station`, or itself), with the calls, modes and operators."""
+    station_of: dict[str, str] = {}
+    for row in _rows(zf, stops):
+        stop_id = row.get("stop_id", "")
+        if stop_id in calls:
+            station_of[stop_id] = row.get("parent_station") or stop_id
+    stations: dict[str, Station] = {}
+    for stop_id, key in station_of.items():  # a stop stops.txt does not define is skipped
+        station = stations.setdefault(key, Station(key=key))
+        for profile, count in calls[stop_id].items():
+            mode, operator = profiles[profile]
+            station.calls[mode] += count
+            station.operators.add(operator)
+    return stations
+
+
+def _add_details(zf: zipfile.ZipFile, stops: str, stations: dict[str, Station]) -> None:
+    """Second pass: the stations' names, positions and codes, then the codes
+    of their children, after the station's own."""
+    children: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+    for row in _rows(zf, stops):
+        stop_id = row.get("stop_id", "")
+        own = stations.get(stop_id)
+        if own is not None:
+            own.place(
+                row.get("stop_name", ""),
+                coordinate(row.get("stop_lat")),
+                coordinate(row.get("stop_lon")),
+            )
+            for name in _CODE_COLUMNS:
+                own.add_code(name, row.get(name))
+        parent = row.get("parent_station", "")
+        if parent in stations and parent != stop_id:
+            children[parent].extend((name, row.get(name, "")) for name in _CODE_COLUMNS)
+    for key, codes in children.items():
+        for name, value in codes:
+            stations[key].add_code(name, value)
+
+
 def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
     """The rail stations of the GTFS archive `zf`, by station key."""
     files = members(zf)
@@ -144,45 +193,7 @@ def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
     del trips
     if not calls:
         return {}
-
-    # Pass 1 over stops.txt: the station of each called stop.
-    station_of: dict[str, str] = {}
-    for row in _rows(zf, files["stops.txt"]):
-        stop_id = row.get("stop_id", "")
-        if stop_id in calls:
-            station_of[stop_id] = row.get("parent_station") or stop_id
-    stations: dict[str, Station] = {}
-    for stop_id, by_profile in calls.items():
-        key = station_of.get(stop_id)
-        if key is None:  # a call at a stop stops.txt does not define
-            continue
-        station = stations.setdefault(key, Station(key=key))
-        for profile, count in by_profile.items():
-            mode, operator = profiles[profile]
-            station.calls[mode] += count
-            station.operators.add(operator)
-    del calls, station_of
-
-    # Pass 2: the stations' names, positions and codes; the children's codes.
-    children: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
-    for row in _rows(zf, files["stops.txt"]):
-        stop_id = row.get("stop_id", "")
-        own = stations.get(stop_id)
-        if own is not None:
-            own.place(
-                row.get("stop_name", ""),
-                coordinate(row.get("stop_lat")),
-                coordinate(row.get("stop_lon")),
-            )
-            for name in ("stop_id", "stop_code", "platform_code"):
-                own.add_code(name, row.get(name))
-        parent = row.get("parent_station", "")
-        if parent in stations and parent != stop_id:
-            for name in ("stop_id", "stop_code", "platform_code"):
-                value = row.get(name, "")
-                if value:
-                    children[parent].append((name, value))
-    for key, codes in children.items():
-        for name, value in codes:
-            stations[key].add_code(name, value)
+    stations = _stations(zf, files[_STOPS], calls, profiles)
+    del calls
+    _add_details(zf, files[_STOPS], stations)
     return stations

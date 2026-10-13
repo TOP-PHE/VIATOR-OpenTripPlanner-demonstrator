@@ -116,7 +116,8 @@ def _msmm_check(path: Path, feed_key: str) -> list[dict[str, str]]:
         assert all(len(cell) <= 131_072 for cell in record), "a cell past 131072"
         row = dict(zip(_COLUMNS, record, strict=True))
         assert row["format_version"] == "1"
-        assert row["feed_key"] == feed_key and _FEED_KEY.fullmatch(feed_key)
+        assert row["feed_key"] == feed_key
+        assert _FEED_KEY.fullmatch(feed_key)
         assert re.fullmatch(r"[0-9a-f]{64}", row["feed_version"])
         assert _TIMESTAMP.fullmatch(row["extracted_at"])
         datetime.fromisoformat(row["extracted_at"])
@@ -128,13 +129,17 @@ def _msmm_check(path: Path, feed_key: str) -> list[dict[str, str]]:
         assert row["provider_provenance"] in ("", "nap", "official", "community")
         for name, bound in (("lat", 90.0), ("lon", 180.0)):
             assert _NUMBER.fullmatch(row[name]), name
-            assert math.isfinite(float(row[name])) and abs(float(row[name])) <= bound
+            assert math.isfinite(float(row[name]))
+            assert abs(float(row[name])) <= bound
         assert set(_items_ok(row["modes"])) <= {"RAIL_MAIN", "RAIL_SUBURBAN"}
-        assert re.fullmatch(r"\d{1,10}", row["n_calls"]) and 1 <= int(row["n_calls"]) <= 10**9
+        assert re.fullmatch(r"\d{1,10}", row["n_calls"])
+        assert 1 <= int(row["n_calls"]) <= 10**9
         _items_ok(row["operators"])
         for code in _items_ok(row["codes"]):
             field, sep, value = code.partition("=")
-            assert sep and _CODE_FIELD.fullmatch(field) and value, "a code item"
+            assert sep, "a code item"
+            assert _CODE_FIELD.fullmatch(field), "a code field"
+            assert value, "a code value"
         if rows:
             assert all(row[name] == rows[0][name] for name in _SAME), "same on every row"
         assert row["stop_key"] not in keys, "a stop given twice"
@@ -281,7 +286,8 @@ def test_nap_key_equals_msmm_rule(resolver: dict[str, Any]) -> None:
 
     key = feed_key_for(_provider(source="nap", resolver=resolver))
     assert key == _msmm_resolver_identity(validate_resolver(resolver, "r"))
-    assert key is not None and _FEED_KEY.fullmatch(key)
+    assert key is not None
+    assert _FEED_KEY.fullmatch(key)
 
 
 @pytest.mark.parametrize(
@@ -426,7 +432,9 @@ def test_gtfs_extract(tmp_path: Path) -> None:
     assert north["extractor_version"] == EXTRACTOR_VERSION
     assert (north["provider_id"], north["provider_label"]) == ("ZZRAIL", "ZZ Rail")
     assert (north["provider_country_iso"], north["provider_provenance"]) == ("ZZ", "")
-    assert result.rows == 3 and result.feed_key == key and result.feed_version == SHA_A
+    assert result.rows == 3
+    assert result.feed_key == key
+    assert result.feed_version == SHA_A
     body = result.path_gz.read_bytes()
     assert result.bytes == len(body)
     assert result.body_sha256 == hashlib.sha256(body).hexdigest()
@@ -459,8 +467,8 @@ def test_gtfs_without_agency_and_with_padding(tmp_path: Path) -> None:
 def test_single_agency_route_without_agency_id(tmp_path: Path) -> None:
     archive = _gtfs(
         tmp_path,
-        agency="agency_name\nZZ Seule\n",
-        routes="route_id,route_type\nR1,2\nR3,400\n",
+        agency="agency_id,agency_name\nZZS,ZZ Seule\n",
+        routes="route_id,agency_id,route_type\nR1,,2\nR3,,400\n",
     )
     rows = _msmm_check(
         _build(_provider(), archive, tmp_path).path_gz, str(feed_key_for(_provider()))
@@ -496,7 +504,8 @@ def test_cleaning_rules(tmp_path: Path) -> None:
     rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
     assert set(rows) == {"ZZ:S1", "ZZ:S2"}
     north = rows["ZZ:S1"]
-    assert len(north["stop_name"]) == 200 and north["stop_name"].startswith("ZZ n")
+    assert len(north["stop_name"]) == 200
+    assert north["stop_name"].startswith("ZZ n")
     codes = north["codes"].split("|")
     assert codes == [
         "stop_id=ZZ:S1",
@@ -526,13 +535,59 @@ def test_station_with_only_dropped_operators_takes_provider(tmp_path: Path) -> N
     assert result.dropped["operator_from_provider"] == 3
 
 
+def test_more_cleaning(tmp_path: Path) -> None:
+    stops = STOPS.replace("ZZ:S1:P1,9901,", "ZZ:S1:P1,99\x0201,").replace(
+        "ZZ:S3,,ZZ Ville,48.6,", "ZZ:S3,,ZZ Ville,95.0,"
+    )
+    agency = "agency_id,agency_name\nZZR,ZZ Rail\nZZQ,ZZ  Rail\nZZB,ZZ Bus\n"
+    routes = ROUTES + "R5,ZZQ,IC,2\n"
+    trips = TRIPS + "R5,W,T6\n"
+    stop_times = STOP_TIMES + "T6,12:00:00,12:00:00,ZZ:S1:P1,1,,\n"
+    archive = _gtfs(
+        tmp_path, stops=stops, agency=agency, routes=routes, trips=trips, stop_times=stop_times
+    )
+    result = _build(_provider(), archive, tmp_path)
+    rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
+    assert set(rows) == {"ZZ:S1", "ZZ:S2"}  # a latitude of 95 is no position
+    assert rows["ZZ:S1"]["operators"] == "ZZ Rail"  # two spellings, one item
+    assert "stop_code=99\x0201" not in rows["ZZ:S1"]["codes"]
+    assert result.dropped["code_control"] == 1
+    assert result.dropped["duplicate_item"] == 1
+    assert result.dropped["no_position"] == 1
+
+
+def test_netex_non_rail_journeys_dropped_early(tmp_path: Path) -> None:
+    from app.station_extract_netex import _Archive, _read_journeys, _read_lines
+
+    archive = _zip(
+        tmp_path / "epip.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
+    )
+    with zipfile.ZipFile(archive) as zf:
+        reader = _Archive(zf)
+        lines, _ = _read_lines(reader)
+        by_pattern, _ = _read_journeys(reader, lines)
+    # the bus journey (own mode) and none of the line-mode ones that are not rail
+    assert set(by_pattern) == {"ZZ:SJP:R", "ZZ:SJP:X"}
+    bus_line = EPIP_TIMETABLE.replace(
+        '<ServiceJourney id="ZZ:SJ:3"><TransportMode>bus</TransportMode>',
+        '<ServiceJourney id="ZZ:SJ:3"><LineRef ref="ZZ:Line:B"/>',
+    )
+    archive = _zip(tmp_path / "b.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + bus_line)})
+    with zipfile.ZipFile(archive) as zf:
+        reader = _Archive(zf)
+        lines, _ = _read_lines(reader)
+        by_pattern, _ = _read_journeys(reader, lines)
+    assert "ZZ:SJP:B" not in by_pattern  # the Line's bus mode drops it before the patterns
+
+
 def test_codes_capped_at_500(tmp_path: Path) -> None:
     children = "".join(f"ZZ:S1:Q{n},,quai,48.8,2.3,1,ZZ:S1,\n" for n in range(600))
     stops = STOPS + children
     result = _build(_provider(), _gtfs(tmp_path, stops=stops), tmp_path)
     rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
     codes = rows["ZZ:S1"]["codes"].split("|")
-    assert len(codes) == 500 and codes[0] == "stop_id=ZZ:S1"
+    assert len(codes) == 500
+    assert codes[0] == "stop_id=ZZ:S1"
     assert result.dropped["codes_over_cap"] == 606 - 500
 
 
@@ -751,8 +806,9 @@ def test_netex_bus_only_is_no_extract(tmp_path: Path) -> None:
         "<TransportMode>rail</TransportMode>", "<TransportMode>bus</TransportMode>"
     )
     archive = _zip(tmp_path / "bus.zip", {"a.xml": NORDIC_SHARED, "b.xml": line})
+    provider = _provider("netex_nordic")
     with pytest.raises(ExtractError) as caught:
-        _build(_provider("netex_nordic"), archive, tmp_path)
+        _build(provider, archive, tmp_path)
     assert caught.value.reason == "no_rail_stop"
     assert not list((tmp_path / "x").glob("*.gz"))
 
@@ -765,13 +821,15 @@ def test_netex_rail_replacement_bus_is_not_rail(tmp_path: Path) -> None:
         "</BusSubmode>",
     )
     archive = _zip(tmp_path / "sev.zip", {"a.xml": NORDIC_SHARED, "b.xml": line})
+    provider = _provider("netex_nordic")
     with pytest.raises(ExtractError):
-        _build(_provider("netex_nordic"), archive, tmp_path)
+        _build(provider, archive, tmp_path)
 
 
 def test_netex_positions() -> None:
     lat, lon = _lambert93_to_wgs84(700000.0, 6600000.0)
-    assert abs(lat - 46.5) < 1e-9 and abs(lon - 3.0) < 1e-9
+    assert abs(lat - 46.5) < 1e-9
+    assert abs(lon - 3.0) < 1e-9
     from defusedxml.ElementTree import fromstring
 
     from app.station_extract_netex import _position
@@ -792,16 +850,18 @@ def test_netex_positions() -> None:
 
 def test_netex_not_well_formed(tmp_path: Path) -> None:
     archive = _zip(tmp_path / "bad.zip", {"a.xml": "<PublicationDelivery><oops>"})
+    provider = _provider("netex_epip")
     with pytest.raises(ExtractError) as caught:
-        _build(_provider("netex_epip"), archive, tmp_path)
+        _build(provider, archive, tmp_path)
     assert caught.value.reason == "bad_archive"
 
 
 def test_netex_entities_refused(tmp_path: Path) -> None:
     bomb = '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "zz">]><x>&a;</x>'
     archive = _zip(tmp_path / "ent.zip", {"a.xml": bomb})
+    provider = _provider("netex_epip")
     with pytest.raises(ExtractError) as caught:
-        _build(_provider("netex_epip"), archive, tmp_path)
+        _build(provider, archive, tmp_path)
     assert caught.value.reason == "bad_archive"
 
 
@@ -810,26 +870,35 @@ def test_netex_entities_refused(tmp_path: Path) -> None:
 
 def test_refusals(tmp_path: Path) -> None:
     archive = _gtfs(tmp_path)
+    provider = _provider(url="")
     with pytest.raises(ExtractError, match="no_feed_key"):
-        _build(_provider(url=""), archive, tmp_path)
+        _build(provider, archive, tmp_path)
+    provider = _provider()
     with pytest.raises(ExtractError, match="bad_sha256"):
-        _build(_provider(), archive, tmp_path, sha="A" * 64)
+        _build(provider, archive, tmp_path, sha="A" * 64)
+    provider = _provider("netex_fr")
     with pytest.raises(ExtractError, match="unsupported_format"):
-        _build(_provider("netex_fr"), archive, tmp_path)
+        _build(provider, archive, tmp_path)
+    provider = {**_provider(), "id": "zz lower"}
     with pytest.raises(ExtractError, match="bad_provider"):
-        _build({**_provider(), "id": "zz lower"}, archive, tmp_path)
+        _build(provider, archive, tmp_path)
+    provider = _provider()
+    naive = datetime(2026, 1, 1)
     with pytest.raises(ExtractError, match="bad_time"):
-        build_extract(_provider(), archive, SHA_A, extracted_at=datetime(2026, 1, 1))
+        build_extract(provider, archive, SHA_A, extracted_at=naive)
     not_zip = tmp_path / "nz.zip"
     not_zip.write_bytes(b"not a zip")
+    provider = _provider()
     with pytest.raises(ExtractError, match="bad_archive"):
-        _build(_provider(), not_zip, tmp_path)
+        _build(provider, not_zip, tmp_path)
     missing = _zip(tmp_path / "m.zip", {"stops.txt": STOPS})
+    provider = _provider()
     with pytest.raises(ExtractError, match="bad_archive"):
-        _build(_provider(), missing, tmp_path)
+        _build(provider, missing, tmp_path)
     no_rail = _gtfs(tmp_path, name="b.zip", routes="route_id,agency_id,route_type\nR1,ZZR,3\n")
+    provider = _provider()
     with pytest.raises(ExtractError, match="no_rail_stop"):
-        _build(_provider(), no_rail, tmp_path)
+        _build(provider, no_rail, tmp_path)
     assert not list((tmp_path / "x").iterdir())  # nothing written, no temporary file left
 
 
@@ -850,8 +919,10 @@ def test_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, constant: str, value: int, reason: str
 ) -> None:
     monkeypatch.setattr(station_extract, constant, value)
+    provider = _provider()
+    archive = _gtfs(tmp_path)
     with pytest.raises(ExtractError) as caught:
-        _build(_provider(), _gtfs(tmp_path), tmp_path)
+        _build(provider, archive, tmp_path)
     assert caught.value.reason == reason
     assert not list((tmp_path / "x").iterdir())
 
@@ -882,16 +953,20 @@ def test_cache_by_archive_and_extractor(tmp_path: Path, monkeypatch: pytest.Monk
     first = _build(_provider(), archive, tmp_path)
     archive.unlink()  # a cache hit never opens the archive
     again = _build(_provider(), archive, tmp_path)
-    assert again.path_gz == first.path_gz and again.body_sha256 == first.body_sha256
-    assert again.rows == first.rows and again.dropped == {}
+    assert again.path_gz == first.path_gz
+    assert again.body_sha256 == first.body_sha256
+    assert again.rows == first.rows
+    assert again.dropped == {}
     # another archive, or another extractor version, is another extract; one kept
     archive = _gtfs(tmp_path)
     other = _build(_provider(), archive, tmp_path, sha=SHA_B)
-    assert other.path_gz != first.path_gz and not first.path_gz.exists()
+    assert other.path_gz != first.path_gz
+    assert not first.path_gz.exists()
     assert _msmm_check(other.path_gz, other.feed_key)[0]["feed_version"] == SHA_B
     monkeypatch.setattr(station_extract, "EXTRACTOR_VERSION", "viator-stop-extract-99")
     newer = _build(_provider(), archive, tmp_path, sha=SHA_B)
-    assert newer.path_gz != other.path_gz and newer.extractor_version == "viator-stop-extract-99"
+    assert newer.path_gz != other.path_gz
+    assert newer.extractor_version == "viator-stop-extract-99"
     assert [p.name for p in (tmp_path / "x").iterdir()] == [newer.path_gz.name]
 
 
