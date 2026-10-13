@@ -1347,8 +1347,16 @@ def test_end_to_end_with_the_real_extractor(
             "T1,08:00:00,08:00:00,ZZ:A,1\nT1,09:00:00,09:00:00,ZZ:B,2\n",
         )
     sha = _sha()
+    # The fetch state as `feed_fetch` writes it: the download's sha256, and the
+    # slot file's own (PR 4 checks the snapshot against it).
     feed_fetch.save_state(
-        tmp_path / sid / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", {"sha256": sha}
+        tmp_path / sid / "_fetch_state",
+        "provider[ZZRAIL].timetable(gtfs)",
+        {
+            "sha256": sha,
+            "slot_sha256": hashlib.sha256(slot.read_bytes()).hexdigest(),
+            "slot_size_bytes": slot.stat().st_size,
+        },
     )
     config = {
         "sources": {

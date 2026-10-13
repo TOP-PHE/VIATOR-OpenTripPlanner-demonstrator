@@ -610,11 +610,12 @@ def _queue_extracts(
     only_provider: str | None = None,
 ) -> None:
     """After a refresh that fetched a timetable or found it unchanged: the
-    station module's stop extracts of the files now in the slots, made (or
-    found in the cache) after the answer is sent (app/station_extract.py)."""
+    station module's stop extracts of the files now in the slots, queued
+    after the answer is sent for the one warm thread of app/station_extract.py
+    (`queue_warm` returns at once: no request thread ever waits for one)."""
     if refreshed:
         background.add_task(
-            station_extract.warm_session_extracts,
+            station_extract.queue_warm,
             sid,
             dict(config or {}),
             only_provider=only_provider,
@@ -630,10 +631,10 @@ def _queue_upload_extract(
     sha256: str,
 ) -> None:
     """After an upload to an `upload` provider: the stop extract of that file,
-    keyed by the sha256 of the uploaded bytes, made after the answer."""
+    keyed by the sha256 of the uploaded bytes, queued after the answer."""
     if provider_id is not None and source == "upload":
         background.add_task(
-            station_extract.warm_session_extracts,
+            station_extract.queue_warm,
             sid,
             dict(config or {}),
             only_provider=provider_id,

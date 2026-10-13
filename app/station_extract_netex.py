@@ -37,7 +37,7 @@ A member that holds none of a pass's elements is not read again, and inside
 the elements a pass reads, the subtrees no pass reads (passing times, links,
 equipment) are not built. Measured on a synthetic single-file feed of 538 MB
 (200,000 journeys): about 56 s on one core; a national file of a few GB takes
-some minutes, within the child process's 15 minutes of processor time.
+some minutes, within the child process's 25 minutes of processor time.
 """
 
 from __future__ import annotations

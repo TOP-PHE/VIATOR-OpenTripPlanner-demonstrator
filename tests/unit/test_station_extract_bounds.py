@@ -20,6 +20,7 @@ import gzip
 import logging
 import os
 import signal
+import sys
 import time
 import tracemalloc
 import zipfile
@@ -53,6 +54,8 @@ from tests.unit.test_station_extract import (
     _provider,
     _psa,
     _zip,
+    download_state,
+    sha_of,
 )
 
 MIB = 1024 * 1024
@@ -376,8 +379,8 @@ def test_warm_sweeps_leftovers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     folder.mkdir()
     old = folder / ".ZZRAIL.zz.tmp"
     old.write_text("zz")
-    past = time.time() - station_extract.STALE_SECONDS - 10
-    os.utime(old, (past, past))
+    later = time.time() + station_extract.STALE_SECONDS + 60
+    monkeypatch.setattr(station_extract.time, "time", lambda: later)
     monkeypatch.setattr(station_extract, "_warm_one", lambda *_a: "skipped")
     station_extract.warm_session_extracts("zz-session", {"sources": {"providers": [_provider()]}})
     assert not old.exists()
@@ -476,14 +479,17 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[Any] = []
     monkeypatch.setattr(station_extract.resource, "setrlimit", lambda *a: calls.append(a))
     monkeypatch.setattr(station_extract.os, "nice", lambda n: calls.append(("nice", n)))
+    monkeypatch.setattr(station_extract, "_die_with_parent", lambda: calls.append("pdeathsig"))
     station_extract._limit_self(station_extract._Limits(9, 99, 10))
     assert calls == [
+        "pdeathsig",
         (station_extract.resource.RLIMIT_AS, (9, 9)),
         (station_extract.resource.RLIMIT_CPU, (99, 129)),
         ("nice", 10),
     ]
     assert station_extract.CHILD_MEMORY_BYTES == 2 * 1024 * MIB
-    assert station_extract.CHILD_CPU_SECONDS == 15 * 60
+    assert station_extract.CHILD_CPU_SECONDS == 25 * 60
+    assert station_extract.CHILD_WALL_SECONDS == 30 * 60
     assert station_extract.CHILD_NICE == 10
 
 
@@ -596,18 +602,21 @@ def test_unwritable_cache_is_an_extract_error(tmp_path: Path) -> None:
     assert caught.value.reason == "cache"
 
 
-def test_sweep_removes_old_leftovers(tmp_path: Path) -> None:
+def test_sweep_removes_old_leftovers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     folder = tmp_path / "x"
     folder.mkdir()
-    old_tmp, new_tmp = folder / ".ZZRAIL.a.tmp", folder / ".ZZRAIL.b.tmp"
-    old_snap, extract = folder / ".ZZRAIL.c.snap", folder / "ZZRAIL.x.csv.gz"
-    for path in (old_tmp, new_tmp, old_snap, extract):
-        path.write_text("zz")
-    past = time.time() - station_extract.STALE_SECONDS - 10
-    for path in (old_tmp, old_snap, extract):
-        os.utime(path, (past, past))
+    names = [".ZZRAIL.a.tmp", ".ZZRAIL.c.snap", "ZZRAIL.x.csv.gz"]
+    for name in names:
+        (folder / name).write_text("zz")
+    past = time.time() - 2 * station_extract.STALE_SECONDS
+    for name in names:
+        os.utime(folder / name, (past, past))  # an old mtime alone is no left-over
     station_extract._sweep(folder)
-    assert sorted(p.name for p in folder.iterdir()) == [".ZZRAIL.b.tmp", "ZZRAIL.x.csv.gz"]
+    assert sorted(p.name for p in folder.iterdir()) == names
+    later = time.time() + station_extract.STALE_SECONDS + 60
+    monkeypatch.setattr(station_extract.time, "time", lambda: later)
+    station_extract._sweep(folder)
+    assert [p.name for p in folder.iterdir()] == ["ZZRAIL.x.csv.gz"]
 
 
 # ── The slot and its sha256, from one open file ───────────────────────────
@@ -618,9 +627,9 @@ def _session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(station_extract.settings, "inbox_dir", inbox)
     session = inbox / "zz-session"
     (session / "gtfs").mkdir(parents=True)
-    _gtfs(session / "gtfs", name="zzrail.zip")
+    slot = _gtfs(session / "gtfs", name="zzrail.zip")
     feed_fetch.save_state(
-        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", {"sha256": SHA_A}
+        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", download_state(slot)
     )
     return session
 
@@ -631,7 +640,7 @@ def test_snapshot_pairs_the_open_file(tmp_path: Path, monkeypatch: pytest.Monkey
     with station_extract.provider_archive_snapshot("zz-session", _provider()) as found:
         assert found is not None
         snapshot, sha = found
-        assert sha == SHA_A
+        assert sha == sha_of(slot)
         assert snapshot.parent == session / "_extracts"
         assert snapshot.read_bytes() == slot.read_bytes()
         assert snapshot.stat().st_ino == slot.stat().st_ino
@@ -643,7 +652,7 @@ def test_snapshot_refuses_a_slot_replaced_meanwhile(
 ) -> None:
     session = _session(tmp_path, monkeypatch)
     slot = session / "gtfs" / "zzrail.zip"
-    real = station_extract._sha_of_source
+    real = station_extract._expected
 
     def replaced(*args: Any) -> str | None:
         newer = slot.with_suffix(".new")
@@ -651,7 +660,7 @@ def test_snapshot_refuses_a_slot_replaced_meanwhile(
         newer.replace(slot)  # a refresh lands between the open and the check
         return real(*args)
 
-    monkeypatch.setattr(station_extract, "_sha_of_source", replaced)
+    monkeypatch.setattr(station_extract, "_expected", replaced)
     with station_extract.provider_archive_snapshot("zz-session", _provider()) as found:
         assert found is None
 
@@ -667,11 +676,17 @@ def test_snapshot_without_state_or_slot(tmp_path: Path, monkeypatch: pytest.Monk
     with station_extract.provider_archive_snapshot("zz-session", other) as found:
         assert found is None
     upload = {"id": "ZZRAIL", "timetable": {"format": "gtfs", "source": "upload"}}
+    uploaded = sha_of(session / "gtfs" / "zzrail.zip")
+    with station_extract.provider_archive_snapshot(
+        "zz-session", upload, upload_sha256=uploaded
+    ) as found:
+        assert found is not None
+        assert found[1] == uploaded
+    # an upload sha256 that is not the file's: not that upload
     with station_extract.provider_archive_snapshot(
         "zz-session", upload, upload_sha256=SHA_B
     ) as found:
-        assert found is not None
-        assert found[1] == SHA_B
+        assert found is None
     with station_extract.provider_archive_snapshot("zz-session", upload) as found:
         assert found is None
 
@@ -691,7 +706,11 @@ def test_warm_drops_duplicates_and_logs(
             ]
         }
     }
-    key = ("zz-session", "ZZRAIL", SHA_A)
+    key = (
+        "zz-session",
+        "ZZRAIL",
+        sha_of(tmp_path / "inbox" / "zz-session" / "gtfs" / "zzrail.zip"),
+    )
     station_extract._IN_FLIGHT.add(key)
     try:
         with caplog.at_level(logging.INFO, logger="app.station_extract"):
@@ -700,8 +719,8 @@ def test_warm_drops_duplicates_and_logs(
         station_extract._IN_FLIGHT.discard(key)
     assert out == {"ZZRAIL": "in_flight", "ZZWAIT": "skipped"}
     text = caplog.text
-    assert "sid=zz-session provider=ZZRAIL reason=in_flight" in text
-    assert "sid=zz-session provider=ZZWAIT reason=skipped" in text
+    assert "station extract skipped: sid=zz-session provider=ZZRAIL reason=in_flight" in text
+    assert "station extract skipped: sid=zz-session provider=ZZWAIT reason=skipped" in text
 
 
 def test_warm_one_provider_never_stops_the_others(
@@ -734,7 +753,11 @@ def test_warm_reasons_are_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     session = _session(tmp_path, monkeypatch)
-    (session / "gtfs" / "zzrail.zip").write_bytes(b"not a zip")
+    slot = session / "gtfs" / "zzrail.zip"
+    slot.write_bytes(b"not a zip")
+    feed_fetch.save_state(
+        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", download_state(slot)
+    )
 
     def refused(*_a: Any, **_k: Any) -> None:
         raise ExtractError("bad_archive", "zz")
@@ -985,3 +1008,338 @@ def test_extracted_at_in_utc(tmp_path: Path) -> None:
         "2026-10-13T09:30:00+00:00"
     )
     assert datetime.fromisoformat("2026-10-13T09:30:00+00:00") == when.astimezone(UTC)
+
+
+# ── Repair round 2 ────────────────────────────────────────────────────────
+
+_MARKER = "fresh"
+
+
+def _marker() -> Any:
+    """A child target: the module's marker as the child sees it."""
+    return _MARKER
+
+
+def test_child_is_spawned_not_forked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a forked child would inherit the parent's state; a spawned one starts afresh
+    monkeypatch.setattr(sys.modules[__name__], "_MARKER", "parent")
+    assert station_extract._run_child(_marker, ()) == "fresh"
+
+
+def test_cache_made_while_waiting_is_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
+    archive = _gtfs(tmp_path)
+    made = _build(_provider(), archive, tmp_path)
+    answers = iter([None, made])
+    monkeypatch.setattr(station_extract, "_cached", lambda *_a: next(answers))
+
+    def no_child(*_a: Any) -> None:
+        raise AssertionError("the extract made while this one waited is used")
+
+    monkeypatch.setattr(station_extract, "_run_child", no_child)
+    result = ensure_extract(_provider(), archive, SHA_A, extracted_at=WHEN, session_id="s")
+    assert result is made
+
+
+_ORPHAN_SCRIPT = """
+import os, sys, time, threading
+sys.path.insert(0, sys.argv[1])
+from app import station_extract
+from tests.unit import test_station_extract_bounds as t
+threading.Thread(target=station_extract._run_child, args=(t._write_pid_and_sleep, (sys.argv[2],)), daemon=True).start()
+while not os.path.exists(sys.argv[2]):
+    time.sleep(0.05)
+os.kill(os.getpid(), 9)
+"""
+
+
+def _write_pid_and_sleep(path: str) -> Any:
+    Path(path).write_text(str(os.getpid()))
+    time.sleep(60)
+    raise AssertionError("unreachable")
+
+
+def test_child_dies_with_its_parent(tmp_path: Path) -> None:
+    import subprocess
+
+    pid_file = tmp_path / "child.pid"
+    root = str(Path(station_extract.__file__).resolve().parent.parent)
+    subprocess.run(
+        [sys.executable, "-c", _ORPHAN_SCRIPT, root, str(pid_file)],
+        env={**os.environ},
+        timeout=60,
+        check=False,
+    )
+    child = int(pid_file.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    os.kill(child, signal.SIGKILL)
+    raise AssertionError("the child outlived its parent")
+
+
+def test_sweep_keeps_a_fresh_snapshot_of_an_old_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _session(tmp_path, monkeypatch)
+    slot = session / "gtfs" / "zzrail.zip"
+    past = time.time() - 2 * 3600  # downloaded two hours ago, 304 since
+    os.utime(slot, (past, past))
+    with station_extract.provider_archive_snapshot("zz-session", _provider()) as found:
+        assert found is not None
+        station_extract._sweep(session / "_extracts")  # a concurrent warm
+        assert found[0].exists()
+        later = time.time() + station_extract.STALE_SECONDS + 60
+        monkeypatch.setattr(station_extract.time, "time", lambda: later)
+        station_extract._sweep(session / "_extracts")  # an hour after the link: a left-over
+        assert not found[0].exists()
+
+
+def test_snapshot_failure_is_a_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    session = _session(tmp_path, monkeypatch)
+
+    def refused(*_a: Any) -> None:
+        raise OSError("cross-device")
+
+    monkeypatch.setattr(station_extract.os, "link", refused)
+    config = {"sources": {"providers": [_provider()]}}
+    with caplog.at_level(logging.INFO, logger="app.station_extract"):
+        out = station_extract.warm_session_extracts("zz-session", config)
+    assert out == {"ZZRAIL": "snapshot_failed"}
+    assert (
+        "station extract skipped: sid=zz-session provider=ZZRAIL reason=snapshot_failed"
+        in caplog.text
+    )
+    assert not list((session / "_extracts").glob(".*.snap"))
+
+
+def test_slot_changed_is_a_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _session(tmp_path, monkeypatch)
+    slot = session / "gtfs" / "zzrail.zip"
+    real = station_extract._expected
+
+    def replaced(*args: Any) -> str | None:
+        newer = slot.with_suffix(".new")
+        newer.write_bytes(b"another file")
+        newer.replace(slot)
+        return real(*args)
+
+    monkeypatch.setattr(station_extract, "_expected", replaced)
+    out = station_extract.warm_session_extracts(
+        "zz-session", {"sources": {"providers": [_provider()]}}
+    )
+    assert out == {"ZZRAIL": "slot_changed"}
+
+
+def test_ready_line_carries_the_dropped_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _session(tmp_path, monkeypatch)
+    result = station_extract.ExtractResult(
+        path_gz=tmp_path / "x.csv.gz",
+        feed_key="url:" + "9" * 16,
+        feed_version=SHA_A,
+        extractor_version=station_extract.EXTRACTOR_VERSION,
+        rows=9,
+        bytes=99,
+        body_sha256=SHA_B,
+        dropped={"label_cut": 2, "code_bar": 1},
+    )
+    monkeypatch.setattr(station_extract, "ensure_extract", lambda *_a, **_k: result)
+    with caplog.at_level(logging.INFO, logger="app.station_extract"):
+        station_extract.warm_session_extracts(
+            "zz-session", {"sources": {"providers": [_provider()]}}
+        )
+    assert (
+        "station extract ready: sid=zz-session provider=ZZRAIL rows=9 bytes=99 "
+        "dropped=code_bar:1,label_cut:2" in caplog.text
+    )
+
+
+@pytest.fixture
+def warm_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
+    """A fresh queue and warm thread, and the warms they ran."""
+    import queue as queue_module
+    import threading
+
+    ran: list[Any] = []
+    monkeypatch.setattr(station_extract, "_QUEUE", queue_module.Queue())
+    monkeypatch.setattr(station_extract, "_PENDING", {})
+    monkeypatch.setattr(station_extract, "_WORKER", [])
+    gate = threading.Event()
+
+    def warm(session_id: str, config: Any, **kwargs: Any) -> dict[str, Any]:
+        gate.wait(10)
+        ran.append((session_id, config, kwargs))
+        return {}
+
+    monkeypatch.setattr(station_extract, "warm_session_extracts", warm)
+    ran.append(gate)
+    yield ran
+    gate.set()
+
+
+def test_queue_warm_returns_at_once_and_merges(warm_queue: list[Any]) -> None:
+    gate = warm_queue.pop(0)
+    started = time.monotonic()
+    assert station_extract.queue_warm("s1", {"v": 1})  # taken by the thread, which waits
+    time.sleep(0.2)
+    assert station_extract.queue_warm("s2", {"v": 1}, upload_sha256={"Q": SHA_B})
+    assert station_extract.queue_warm("s2", {"v": 2}, upload_sha256={"P": SHA_A})  # merged
+    assert station_extract._QUEUE.qsize() == 1  # one job for s2, not two
+    assert station_extract.queue_warm("s2", {"v": 3}, only_provider="P")
+    assert time.monotonic() - started < 1  # never waits for a warm
+    gate.set()
+    station_extract._QUEUE.join()
+    assert [(sid, cfg) for sid, cfg, _ in warm_queue] == [
+        ("s1", {"v": 1}),
+        ("s2", {"v": 2}),
+        ("s2", {"v": 3}),
+    ]
+    assert warm_queue[1][2] == {
+        "only_provider": None,
+        "upload_sha256": {"Q": SHA_B, "P": SHA_A},
+    }
+    assert warm_queue[2][2]["only_provider"] == "P"
+    assert [t.name for t in station_extract._WORKER] == ["station-extract-warm"]
+
+
+def test_queue_warm_is_bounded(
+    warm_queue: list[Any], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    gate = warm_queue.pop(0)
+    monkeypatch.setattr(station_extract, "QUEUE_MAX", 2)
+    assert station_extract.queue_warm("s1", {})
+    assert station_extract.queue_warm("s2", {})
+    with caplog.at_level(logging.WARNING, logger="app.station_extract"):
+        assert not station_extract.queue_warm("s3", {})
+    assert "sid=s3 reason=queue_full" in caplog.text
+    gate.set()
+    station_extract._QUEUE.join()
+
+
+def test_warm_thread_survives_a_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import queue as queue_module
+
+    monkeypatch.setattr(station_extract, "_QUEUE", queue_module.Queue())
+    monkeypatch.setattr(station_extract, "_PENDING", {})
+    monkeypatch.setattr(station_extract, "_WORKER", [])
+    calls: list[str] = []
+
+    def warm(session_id: str, config: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(session_id)
+        if session_id == "bad":
+            raise RuntimeError("zz")
+        return {}
+
+    monkeypatch.setattr(station_extract, "warm_session_extracts", warm)
+    with caplog.at_level(logging.WARNING, logger="app.station_extract"):
+        station_extract.queue_warm("bad", {})
+        station_extract._QUEUE.join()
+        station_extract.queue_warm("good", {})
+        station_extract._QUEUE.join()
+    assert calls == ["bad", "good"]
+    assert "station extract warm failed: sid=bad error=RuntimeError" in caplog.text
+    station_extract._run_job(("nobody", None))  # a job no longer pending is nothing
+
+
+# ── The window between a refresh's dispatch and its saved state ───────────
+
+
+def test_snapshot_refuses_a_new_file_under_the_old_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    session = _session(tmp_path, monkeypatch)
+    slot = session / "gtfs" / "zzrail.zip"
+    # a refresh dispatched a new file into the slot and has not saved its state
+    newer = _gtfs(tmp_path, name="newer.zip", stops=STOPS.replace("ZZ Sud", "ZZ Sud Neuf"))
+    newer.replace(slot)
+    with station_extract.provider_archive_snapshot("zz-session", _provider()) as found:
+        assert found is None
+    with caplog.at_level(logging.INFO, logger="app.station_extract"):
+        out = station_extract.warm_session_extracts(
+            "zz-session", {"sources": {"providers": [_provider()]}}
+        )
+    assert out == {"ZZRAIL": "archive_changed"}
+    assert "reason=archive_changed" in caplog.text
+    # once the refresh saves its state, the next warm takes it
+    feed_fetch.save_state(
+        session / "_fetch_state", "provider[ZZRAIL].timetable(gtfs)", download_state(slot)
+    )
+    with station_extract.provider_archive_snapshot("zz-session", _provider()) as found:
+        assert found is not None
+        assert found[1] == sha_of(slot)
+
+
+def test_snapshot_size_then_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _session(tmp_path, monkeypatch)
+    slot = session / "gtfs" / "zzrail.zip"
+    name = "provider[ZZRAIL].timetable(gtfs)"
+    state_dir = session / "_fetch_state"
+    good = download_state(slot)
+    # same size, other bytes: the hash decides
+    feed_fetch.save_state(state_dir, name, {**good, "slot_sha256": SHA_B})
+    with station_extract._snapshot("zz-session", _provider(), None) as (found, reason):
+        assert (found, reason) == (None, "archive_changed")
+    # another size: refused without hashing
+    feed_fetch.save_state(state_dir, name, {**good, "slot_size_bytes": 9})
+    with station_extract._snapshot("zz-session", _provider(), None) as (found, reason):
+        assert (found, reason) == (None, "archive_changed")
+    # a state of an earlier release, of a re-wrapped file: cannot be checked
+    legacy = {"sha256": good["sha256"], "size_bytes": 9}
+    feed_fetch.save_state(state_dir, name, legacy)
+    with station_extract._snapshot("zz-session", _provider(), None) as (found, reason):
+        assert (found, reason) == (None, "archive_unverified")
+    # an earlier release's state of a zip downloaded as it is: checked by its sha256
+    feed_fetch.save_state(
+        state_dir, name, {"sha256": good["sha256"], "size_bytes": good["size_bytes"]}
+    )
+    with station_extract._snapshot("zz-session", _provider(), None) as (found, reason):
+        assert found is not None
+        assert reason == ""
+    feed_fetch.save_state(state_dir, name, {"sha256": SHA_A})
+    with station_extract._snapshot("zz-session", _provider(), None) as (found, reason):
+        assert (found, reason) == (None, "archive_changed")
+
+
+def test_a_cached_extract_needs_no_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _session(tmp_path, monkeypatch)
+    config = {"sources": {"providers": [_provider()]}}
+    first = station_extract.warm_session_extracts("zz-session", config)["ZZRAIL"]
+    assert isinstance(first, station_extract.ExtractResult)
+
+    def no_snapshot(*_a: Any) -> None:
+        raise AssertionError("a cached extract is neither snapshotted nor hashed")
+
+    monkeypatch.setattr(station_extract, "_snapshot", no_snapshot)
+    again = station_extract.warm_session_extracts("zz-session", config)["ZZRAIL"]
+    assert isinstance(again, station_extract.ExtractResult)
+    assert again.path_gz == first.path_gz
+    assert session  # the fixture's session
+
+
+def test_fetch_records_the_slot_identity(tmp_path: Path) -> None:
+    import gzip as gzip_module
+
+    same = tmp_path / "same.zip"
+    same.write_bytes(b"PK\x03\x04zz")
+    sha = sha_of(same)
+    assert feed_fetch._slot_identity(same, same.stat().st_size, sha) == {
+        "slot_size_bytes": same.stat().st_size,
+        "slot_sha256": sha,
+    }
+    wrapped = tmp_path / "wrapped.zip"
+    wrapped.write_bytes(b"PK\x03\x04 a zip re-wrapped from a gzip download")
+    download = gzip_module.compress(b"<xml/>")
+    identity = feed_fetch._slot_identity(wrapped, len(download), sha_of(same))
+    assert identity == {"slot_size_bytes": wrapped.stat().st_size, "slot_sha256": sha_of(wrapped)}

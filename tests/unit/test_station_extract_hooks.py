@@ -1,7 +1,7 @@
 """The stop extracts are made at refresh time, after the answer is sent.
 
 `refresh_sources` and `refresh_provider` (app/api/admin/sessions.py) queue
-`station_extract.warm_session_extracts` as a FastAPI background task when a
+`station_extract.queue_warm` as a FastAPI background task when a
 timetable was fetched or found unchanged, so that sending the extracts later
 (and the MOTIS wait of the station build) never waits for one to be made.
 The upload route does the same for an `upload` provider; its integration
@@ -81,7 +81,7 @@ async def test_refresh_provider_queues_the_extract(
         assert background.tasks == []
         return
     [task] = background.tasks
-    assert task.func is station_extract.warm_session_extracts
+    assert task.func is station_extract.queue_warm
     assert task.args == ("zz-session", CONFIG)
     assert task.kwargs == {"only_provider": "ZZRAIL"}
 
@@ -115,6 +115,6 @@ async def test_refresh_sources_queues_the_extracts(
         assert background.tasks == []
         return
     [task] = background.tasks
-    assert task.func is station_extract.warm_session_extracts
+    assert task.func is station_extract.queue_warm
     assert task.args[0] == "zz-session"
     assert task.kwargs == {"only_provider": None}
