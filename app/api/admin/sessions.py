@@ -55,6 +55,7 @@ from ... import (
     staleness,
     station_builds,
     station_extract,
+    station_extract_upload,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -419,7 +420,18 @@ def patch_session(
             metadata={"changes": changes},
         )
     db.commit()
+    if "config" in changes:
+        # A provider removed from the session shows no station module status.
+        station_extract_upload.forget_outcomes_except(sid, _provider_ids(s.config or {}))
     return SessionResponse.from_orm_session(s)
+
+
+def _provider_ids(config: dict[str, Any]) -> set[str] | None:
+    """The session's provider ids, or None when the config cannot be read."""
+    try:
+        return {p["id"] for p in ingestion.normalize_providers(config)}
+    except ValueError:
+        return None
 
 
 @router.delete("/{sid}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1032,6 +1044,11 @@ class ProviderStatus(BaseModel):
     # NeTEx only: {"level": "ok"|"warn"|"red", "messages": [...]} from the
     # structure check run at download (app/netex_structure.py). Never blocks.
     structure: dict[str, Any] | None = None
+    # The last time this provider's stop extract went to the station module
+    # (MSMM 22.3; app/station_extract_upload.py): {"at", "state", "reason",
+    # "text"}, the text one of "sent", "already held", "refused <reason>",
+    # "skipped", "module unavailable". None until a first try.
+    station_extract: dict[str, Any] | None = None
 
 
 # How recently a provider's inbox file must have been refreshed before we
@@ -1130,6 +1147,10 @@ async def refresh_sources(
     )
     db.commit()
     _queue_extracts(background, sid, s.config, bool(fetched or unchanged))
+    # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
+    # the stop extracts the station module lacks are sent, by the process's
+    # sender thread (the refresh never waits on the module).
+    station_extract_upload.after_refresh(sid)
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -1745,6 +1766,9 @@ def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | Non
     state_dir = _fetch_state_dir(sid)
     for label in _labels_writing_slot(kind, staged_filename):
         feed_fetch.state_path(state_dir, label).unlink(missing_ok=True)
+    if staged_filename and kind in ingestion.STAGE_INTO_OTP_INBOX and kind != "OSM-PBF":
+        # The station module status said what became of the file now replaced.
+        station_extract_upload.forget_outcome(sid, Path(staged_filename).stem.upper())
 
 
 async def _authorize(
@@ -2389,6 +2413,8 @@ async def refresh_provider(
         db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
     _queue_extracts(background, sid, s.config, bool(result.fetched or result.unchanged), pid)
+    # MSMM 22.3: this provider's extract, if the module lacks it (sender thread).
+    station_extract_upload.after_refresh(sid, pid)
     return result
 
 
@@ -2479,6 +2505,7 @@ def get_providers_status(
             checked_at=_parse_iso(fetch_state.get("checked_at")),
         )
         _decorate_status(status, p, fetch_state, latest_upload_filename.get(p["id"]))
+        status.station_extract = station_extract_upload.load_outcome(sid, p["id"])
         out[p["id"]] = status
     return out
 

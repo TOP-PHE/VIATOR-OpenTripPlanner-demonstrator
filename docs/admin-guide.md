@@ -2787,7 +2787,11 @@ par VIATOR »). OTP builds do not wait.
   the worker does nothing else (it runs one job at a time): a wait can
   delay the next rebuild, and the **promotion of another session to
   serving** (Promote takes effect when the worker is free), by up to 30
-  minutes.
+  minutes. Before this wait the worker sends the session's stop extracts
+  (11.5, at most 5 minutes), so **a MOTIS rebuild can be `running` for up
+  to about 35 minutes before its build container starts** (5 minutes of
+  upload, then up to 30 of station-build wait), and can delay the next
+  rebuild or a promotion that long.
 - **The graph is always built.** When the module is unreachable, refuses
   (no input files, a build asked for less than 30 minutes ago, a token
   refused, a module older than these calls), reports a failed build, or
@@ -2837,9 +2841,8 @@ par VIATOR »). OTP builds do not wait.
 The station module builds its own station referential (the VIATOR station
 id) from the stops of the timetables VIATOR downloads (the module's design,
 section 22). VIATOR never sends an archive: for each version of each feed it
-writes a small **stop extract** and, from the next release (pull request 5),
-sends it to the module. This release only writes the extracts; nothing is
-sent yet and no graph build changes.
+writes a small **stop extract** and sends it to the module (11.5). Writing
+the extracts changes no graph build.
 
 - **What it is.** One gzip CSV file per feed version: one row per
   station-level stop at which a rail trip calls (the GTFS parent station, or
@@ -2920,6 +2923,88 @@ sent yet and no graph build changes.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).
+
+### 11.5 The stop extracts sent to the module (MSMM station referential)
+
+The module builds its own station referential from the timetables of every
+VIATOR session (the module's design, section 22). VIATOR never sends a
+timetable: for each feed it sends a small **stop extract**, one row per
+rail station of that feed (its name, position, the codes and operators the
+feed gives), made by `app/station_extract.py` from the file in the
+provider's slot.
+
+- **What is sent, and when.** At the end of every refresh of a session's
+  sources (Refresh, or Refresh on one provider card), whatever the engine,
+  OTP or MOTIS, after the refresh has answered; and again by the worker at
+  the start of every rebuild, OTP or MOTIS. For a MOTIS session that is
+  **before** the station build it waits for (11.3), so that build sees the
+  new extracts. For each provider with a feed key, VIATOR first asks the
+  module whether it already holds the extract of that file by this version
+  of the extractor (one short `HEAD` call per feed); only when it does not
+  is the extract sent. After a refresh it is made if needed (or taken from
+  its cache, `inbox/<sid>/_extracts/`; one extraction at a time, in a
+  process with limited memory and time, 11.4). **Before a rebuild only an
+  extract already made is sent**: no extraction starts there, so none can
+  run during the graph build; a feed without one shows "skipped
+  not_cached" and is sent after the next refresh. A file already sent is never sent again; a new download, or a
+  new version of the extractor, is. A derived (cross-border filter)
+  provider sends nothing: its national feed is sent by its own session.
+- **How long.** Before a rebuild the sending takes at most 5 minutes; the
+  graph build then starts whatever happened (for MOTIS, after the station
+  build wait of 11.3: about 35 minutes in all at worst). Each call is cut
+  after 10 s (`HEAD`) or 120 s (the upload), and no upload starts with less
+  than 30 s left. A module that does not answer at all costs one feed's
+  tries (at most 40 s): the feeds after it are marked "module unavailable"
+  without a call; so does a 404 to an upload (a module without the intake
+  calls). After a refresh nothing waits on it: it may take up to 30
+  minutes in the background. Those refresh passes wait in the `web`
+  process's memory: a restart of `web` loses the ones not done yet, and
+  the next rebuild or refresh sends again.
+- **The graph is always built.** The module unreachable, older than these
+  calls (it answers 404), busy, refusing an extract, too slow: VIATOR logs a
+  warning and goes on. When the module says it is busy (503) or that its
+  limit of 60 extracts in the half hour is reached (429), VIATOR waits the
+  time the module gives and sends again, only when that time is at most
+  120 s and fits in the 5 minutes (each wait at least 1 s, at most six for
+  one upload); otherwise the next refresh or rebuild sends it.
+- **The module keeps new feeds pending.** An extract of a feed the module
+  has never seen creates that feed as **pending**: the module uses it only
+  once an administrator has accepted it there (with its licence), on the
+  module's "Timetable feeds" screen. Sending it from VIATOR accepts
+  nothing.
+- **Where you see it.** In the feed-status panel of the session (Sessions
+  page), the column **Station module** shows, per provider, the last try
+  and how long ago:
+
+  | Text | Meaning |
+  |---|---|
+  | sent | the module recorded the extract as a new version |
+  | already held | the module already had this file's extract (nothing sent, or the upload answered "unchanged") |
+  | refused `<reason>` | the module refused the extract, with its reason word (`row`, `header`, `duplicate_stop`, `size`, `token` for a token the module refuses (`STATION_MODULE_TOKEN` is not its `MSMM_INTERNAL_TOKEN`), `source_taken`, …): see the module's runbook; the next refresh or rebuild tries again, and the module refuses it the same way until the file, the extractor or the module changes |
+  | skipped | nothing sent: no file in the slot yet, no feed key (a derived provider), no extract could be made (the reason word is in the tooltip: `too_large`, `no_rail_stop`, `resource_limit` when the extraction passed its memory or time limit, `busy` when another extraction held the machine too long, …), not yet made before a rebuild (`not_cached`: sent after the next refresh), the file in the slot not the one its download recorded (`no_snapshot`, `archive_changed`: a refresh replaced it meanwhile; sent by the next pass), or the time was spent (`budget`) |
+  | module unavailable | the module did not take it: unreachable (`network`), too slow (`timeout`), busy, its half-hour limit reached (`extract_window`), a 404 (a module older than these calls), a 5xx, a redirect or another unexpected answer (a wrong `STATION_MODULE_URL` or a proxy in the way), an answer of the wrong form (`shape`); the word is in the tooltip; sent again at the next refresh or rebuild |
+
+  The rebuild job's log has one line per rebuild:
+  `[viator] station-extracts: sent=1 held=4 …`. The `web` and `worker`
+  logs have one WARNING per refusal or failure,
+  `station_extract.<refused|unavailable|skipped> provider=<id> reason=<word>`,
+  and one INFO line per pass, `station_extract.done feeds=… sent=…`. Never
+  the token, the session id, a feed key or a value of the extract.
+- **Cancel.** "✕ Cancel" on a rebuild that is sending stops it before the
+  next feed or at the end of the current pause (a wait the module asked for
+  can last up to 120 s; a call under way, at most 120 s, finishes first):
+  no graph is built, and the job's log says that no build container was
+  started. While a refresh's pass waits for an extraction, the cancel is
+  looked at every second.
+- **Without the module** (`STATION_MODULE_URL` or `STATION_MODULE_TOKEN`
+  empty) nothing is sent: one INFO line `station_extract.skipped
+  reason=off`, nothing in the column.
+- **Deploy order.** The module's version with the intake calls (MSMM
+  PR #42) first, then this VIATOR version. A VIATOR deployed first gets a
+  404 from the older module: it logs
+  `station_extract.unavailable provider=<id> reason=status_404`, shows
+  "module unavailable" and builds its graphs as before. Nothing else
+  changes on the server: no migration, no new setting.
 
 ---
 

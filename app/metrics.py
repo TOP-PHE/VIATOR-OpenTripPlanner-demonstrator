@@ -95,6 +95,23 @@ for _outcome in FEDERATED_PLANNER_OUTCOMES:
     # Create each series at zero so a rate can be read before the first hit.
     FEDERATED_PLANNER_TRIES_TOTAL.labels(outcome=_outcome)
 
+# ─── Stop extracts sent to the station module ──────────────────────────────
+
+# How each feed of a pass of `app/station_extract_upload.py` ended (MSMM 22.3):
+# one increment per feed. Only the passes run by `web` (after a refresh) are
+# scraped: the worker's own (before a graph build) count in the worker's
+# process, which nothing scrapes (see the module docstring); its rebuild job
+# log carries their counts. The label holds the fixed state words only.
+STATION_EXTRACT_OUTCOMES = ("sent", "held", "refused", "skipped", "unavailable")
+
+STATION_EXTRACT_FEEDS_TOTAL = Counter(
+    "viator_station_extract_feeds_total",
+    "Feeds whose stop extract a pass offered to the station module, by outcome.",
+    labelnames=("outcome",),
+)
+for _outcome in STATION_EXTRACT_OUTCOMES:
+    STATION_EXTRACT_FEEDS_TOTAL.labels(outcome=_outcome)
+
 # These regexes match the route templates we want to keep out of the HTTP
 # histograms. Compiled once. Match against the matched-route's `path`
 # attribute (e.g. ``/metrics``, ``/healthz/version``, ``/static/branding/x.svg``).
