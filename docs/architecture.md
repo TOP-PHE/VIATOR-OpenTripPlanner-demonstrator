@@ -976,33 +976,58 @@ Provider entry (`sessions.config.sources.providers[]`, after `normalize_provider
 **The stop extract for the station module (MSMM 22.2, VIATOR pull request 4 of the referential).**
 The station module builds its VIATOR station referential from the stops of the timetables VIATOR
 already downloads; VIATOR never sends an archive, only a small extract per feed version.
-`station_extract.build_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at,
-cache_dir=None) -> ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
-body_sha256, dropped)` writes it; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
+**Every caller goes through `station_extract.ensure_extract(provider_cfg, archive_path,
+archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None) -> ExtractResult(path_gz,
+feed_key, feed_version, extractor_version, rows, bytes, body_sha256, dropped)`**: a valid cached
+extract comes back at once; otherwise the extraction runs in a *spawned* child process with 2 GiB of
+address space (`RLIMIT_AS`), 15 minutes of processor time (`RLIMIT_CPU`), 20 minutes of wall-clock
+time and `nice 10`, one at a time on the machine (a thread lock plus an `flock` on
+`inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
+huge archive can only end the child (`resource_limit`); `ensure_extract` raises `ExtractError` only.
+`build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
 key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
 fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
 `cross_border_filter` provider), derived from the configuration only, exactly as MSMM's
 `feed_intake.resolver_identity` / `url_identity`; `EXTRACTOR_VERSION` names the rules. The readers
-stream: GTFS file by file (rail routes, trips and called stops kept, never `stop_times.txt`), NeTEx
-in five `iterparse` passes (defusedxml) that drop each element once read and follow references
-forwards and across files. Rail is GTFS `route_type` 2 and 100–117, with 109/300/400/403/404 as
+stream and **bound what they read**, not only what they write: the bytes unpacked per member (4 GiB)
+and per reading pass (8 GiB), counted as read; GTFS records of at most 1 MiB and 200 fields (counted
+before the csv module builds them, a quoted field may span lines), ids of at most 255 characters,
+1,000,000 called stops; NeTEx read with expat in three passes, building elements only inside the ones
+a pass reads (and not their passing times, links or equipment), refusing nesting past 64, a text run
+or attribute over 1 MiB, a token over 2 MiB, 200,000 elements in one read element, 1,000,000 journey
+groups, 2,000,000 assignments or Quays, any entity declaration (expat's amplification guard set when
+available); 200,000 stations and 1,000 raw codes a station everywhere. Past a bound:
+`ExtractError` `input_too_large` or `too_many_rows`. Rail is GTFS `route_type` 2 and 100–117, with 109/300/400/403/404 as
 suburban (`_is_rail_route_type` of the cross-border filter is deliberately *not* reused: it drops
 the S-Bahn types), and NeTEx `TransportMode` rail on the journey or its Line, a journey with no mode
-at all counting at a StopPlace that says rail or `railStation`. One row per station: the GTFS
-`parent_station` or the stop itself, the NeTEx root StopPlace through `ParentSiteRef`; the children's
-codes are rolled up. Everything MSMM would refuse is cleaned or dropped first and counted by reason
+at all counting at a StopPlace whose mode is rail, or that gives no other mode and is a
+`railStation`; a rail journey without a submode takes its Line's. One row per station: the GTFS
+`parent_station` (the stop itself when it has none or names an undefined one), the NeTEx root
+StopPlace through `ParentSiteRef` (a dangling or cyclic parent is no parent); an assignment that names
+a Quay and a StopPlace places the call at the Quay's StopPlace when the Quay is known, else at the
+named StopPlace; the children's codes are rolled up (NeTEx child StopPlaces as `StopPlace/…`, Quays
+as `Quay/…`; GTFS entrances and nodes left out), and a station without a position takes a child's.
+A NeTEx archive whose rail journeys call but that defines no StopPlace, or assigns no point to one,
+is `no_stop_place`. Everything MSMM would refuse is cleaned or dropped first and counted by reason
 (`ExtractResult.dropped`); past one of MSMM's limits (200,000 rows, 256 MiB unpacked, 32 MiB gzip, a
 1 MiB line, a 131,072-character cell) nothing is written and `ExtractError.reason` says why. The
 refresh routes and the upload route queue `warm_session_extracts` as a FastAPI background task, so
 the extracts sit in `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex>.csv.gz` before
-anything sends them (pull request 5).
+anything sends them (pull request 5). It pairs each slot file with its sha256 through
+`provider_archive_snapshot` (the slot opened first, the fetch state read, the open file checked to be
+the slot's, then hard-linked to a `.snap` the extraction reads), drops a (session, provider, sha256)
+already in progress, sweeps left-over `.tmp`/`.snap` files older than an hour, and logs one line per
+provider with `sid=`, `provider=` and a reason word.
 
 ### Invariants & traps
 
 - **The extract's `feed_version` is the sha256 of the bytes VIATOR downloaded**, from the fetch
   state (`FetchResult.sha256`, kept on a 304 too), never the sha256 of the slot file: a NeTEx
-  `.xml.gz` re-wrapped as a zip has another one. An upload into the slot forgets the fetch state, so
-  `provider_archive` never pairs a stale sha256 with another file.
+  `.xml.gz` re-wrapped as a zip has another one. An upload into the slot forgets the fetch state, and
+  `provider_archive_snapshot` uses the pair only while the open file is the slot's.
+- **Never call `build_extract` from the web process or the worker**: it has no memory, time or
+  concurrency limit of its own; `ensure_extract` is the entry point. A damaged cached file (cut by a
+  crash) is removed and made again; the temporary file is `fsync`ed before its rename.
 - **The feed key must stay byte-for-byte MSMM's rule.** `tests/unit/test_station_extract.py` holds a
   copy of MSMM's `resolver_identity`/`url_identity` and pins literal keys; a change on one side
   only gives every feed a new key in the module (new `pending` feeds). Raise `EXTRACTOR_VERSION`
