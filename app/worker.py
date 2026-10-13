@@ -27,7 +27,13 @@ from typing import Any
 
 from sqlalchemy import func, update
 
-from . import engine_versions, graph_snapshots, netex_calendar, station_builds
+from . import (
+    engine_versions,
+    graph_snapshots,
+    netex_calendar,
+    station_builds,
+    station_extract_upload,
+)
 from .db import SessionLocal
 from .logging_config import install_redacting_formatter, quiet_http_client_loggers
 from .models import RebuildJob
@@ -426,7 +432,10 @@ def tick() -> None:
         job.status = _final_status(
             success=success, cancel_requested=job.cancel_requested_at is not None
         )
-        if job.status == "cancelled" and output != _CANCELLED_WHILE_WAITING:
+        if job.status == "cancelled" and output not in (
+            _CANCELLED_WHILE_WAITING,
+            _CANCELLED_WHILE_SENDING,
+        ):
             output += "\n[viator] cancelled by an operator: build container stopped\n"
         job.log = (job.log or "") + output[-32_000:]
         job.graph_path = graph_path
@@ -491,6 +500,13 @@ _CANCELLED_WHILE_WAITING = (
 )
 
 
+# The log of a job cancelled while it sent the session's stop extracts.
+_CANCELLED_WHILE_SENDING = (
+    "[viator] cancelled by an operator while sending the stop extracts to the station "
+    "module: no build container was started\n"
+)
+
+
 def _run_engine_build(
     engine: str,
     *,
@@ -499,10 +515,22 @@ def _run_engine_build(
     max_memory: bool,
     container: str,
 ) -> tuple[str, bool, str]:
-    """The build of one job. A MOTIS graph is built after the station module's
-    build has ended (MSMM decision 6): the wait comes first, in this job's own
-    flow, and whatever ends it the graph is built, unless the operator
-    cancelled the job meanwhile."""
+    """The build of one job. First, whatever the engine, the session's stop
+    extracts the station module lacks are sent (MSMM 22.3, D-R15 A), within
+    `station_extract_upload.BUILD_BUDGET_SECONDS`. Then a MOTIS graph is built
+    after the station module's build has ended (MSMM decision 6): the wait
+    comes after the upload, so that the build sees the new extracts, and
+    whatever ends the upload or the wait the graph is built, unless the
+    operator cancelled the job meanwhile."""
+    if session_id is not None:
+        try:
+            sent = _send_station_extracts(job_id, session_id)
+        except Exception as exc:
+            # The upload must never keep the graph from being built.
+            log.warning("station extracts not sent for job %s (%s)", job_id, type(exc).__name__)
+        else:
+            if sent.cancelled:
+                return _CANCELLED_WHILE_SENDING, False, ""
     if engine == "motis":
         try:
             waited = _wait_for_station_build(job_id)
@@ -517,6 +545,29 @@ def _run_engine_build(
             session_id=session_id, max_memory=max_memory, container_name=container
         )
     return run_build(session_id=session_id, max_memory=max_memory, container_name=container)
+
+
+def _send_station_extracts(job_id: uuid.UUID, session_id: str) -> station_extract_upload.PassResult:
+    """Send the session's stop extracts the module lacks, before the graph
+    build (and, for MOTIS, before the station build it waits for), and note
+    the counts on the job. Without the module configured nothing is called
+    and nothing is noted."""
+
+    def should_stop() -> bool:
+        try:
+            return _cancel_requested(job_id)
+        except Exception:
+            return False
+
+    result = station_extract_upload.send_session(
+        session_id,
+        budget=station_extract_upload.BUILD_BUDGET_SECONDS,
+        should_stop=should_stop,
+    )
+    line = station_extract_upload.log_line(result)
+    if line:
+        _note_station_build(job_id, line)
+    return result
 
 
 def _note_station_build(job_id: uuid.UUID, line: str) -> None:

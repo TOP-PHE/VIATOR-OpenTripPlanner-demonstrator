@@ -1506,6 +1506,22 @@ function feedLastResultHTML(s) {
   return `${head}<div class="feed-reason">${escHTML(a.reason)}</div>`;
 }
 
+// MSMM 22.3: the last time this provider's stop extract went to the station
+// module. The API gives a fixed short text ("sent", "already held",
+// "refused <reason>", "skipped", "module unavailable"), shown as written; a
+// reason word of a skip or an unavailable module goes in the tooltip.
+const _STATION_EXTRACT_FLAVOURS = {
+  sent: 'ok', held: 'ok', refused: 'error', unavailable: 'stale', skipped: 'pending', cancelled: 'pending',
+};
+function feedStationExtractHTML(x) {
+  if (!x || !x.text) return '<span class="hint">—</span>';
+  const when = _relativeTimeShort(x.at);
+  const tip = x.reason && x.state !== 'refused' ? ` title="${escAttr(x.reason)}"` : '';
+  const flavour = _STATION_EXTRACT_FLAVOURS[x.state] || 'pending';
+  const head = `<span class="prov-status-pill" data-state="${escAttr(flavour)}"${tip}>${escHTML(x.text)}</span>`;
+  return when ? `${head} <span class="hint">${escHTML(when)}</span>` : head;
+}
+
 function feedRowHTML(fid, s) {
   const name = s.label && s.label !== fid ? ` <span class="hint">${escHTML(s.label)}</span>` : '';
   const checked = _relativeTimeShort(s.checked_at);
@@ -1517,6 +1533,7 @@ function feedRowHTML(fid, s) {
     <td>${checked ? escHTML(checked) : '<span class="hint">—</span>'}</td>
     <td>${feedLastResultHTML(s)}</td>
     <td>${feedFormatCheckHTML(s)}</td>
+    <td>${feedStationExtractHTML(s.station_extract)}</td>
   </tr>`;
 }
 
@@ -1547,7 +1564,7 @@ function feedCountryHTML(country, rows) {
   return `<details class="feed-status-country"${open}>
     <summary>${escHTML(country)} · ${feedCountLabel(rows.length)} · ${escHTML(feedStateCounts(rows))}</summary>
     <table class="feed-status-table">
-      <thead><tr><th>Provider</th><th>Source</th><th>Format</th><th>File</th><th>Last check</th><th>Last result</th><th>Format check</th></tr></thead>
+      <thead><tr><th>Provider</th><th>Source</th><th>Format</th><th>File</th><th>Last check</th><th>Last result</th><th>Format check</th><th title="The stop extract sent to the station module (MSMM)">Station module</th></tr></thead>
       <tbody>${rows.map(([fid, s]) => feedRowHTML(fid, s)).join('')}</tbody>
     </table>
   </details>`;

@@ -28,6 +28,7 @@ from typing import Annotated, Any, NamedTuple
 import httpx
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -53,6 +54,7 @@ from ... import (
     sessions_orchestrator,
     staleness,
     station_builds,
+    station_extract_upload,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -986,6 +988,11 @@ class ProviderStatus(BaseModel):
     # NeTEx only: {"level": "ok"|"warn"|"red", "messages": [...]} from the
     # structure check run at download (app/netex_structure.py). Never blocks.
     structure: dict[str, Any] | None = None
+    # The last time this provider's stop extract went to the station module
+    # (MSMM 22.3; app/station_extract_upload.py): {"at", "state", "reason",
+    # "text"}, the text one of "sent", "already held", "refused <reason>",
+    # "skipped", "module unavailable". None until a first try.
+    station_extract: dict[str, Any] | None = None
 
 
 # How recently a provider's inbox file must have been refreshed before we
@@ -1000,6 +1007,7 @@ _PROVIDER_FRESHNESS_HOURS = 24
 async def refresh_sources(
     sid: str,
     request: Request,
+    background: BackgroundTasks,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
@@ -1082,6 +1090,10 @@ async def refresh_sources(
         },
     )
     db.commit()
+    # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
+    # the stop extracts the station module lacks are sent, after this answer
+    # (a background task, so the refresh never waits on the module).
+    background.add_task(station_extract_upload.send_after_refresh, sid)
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -2296,6 +2308,7 @@ async def refresh_provider(
     sid: str,
     pid: str,
     request: Request,
+    background: BackgroundTasks,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> RefreshSourcesResponse:
@@ -2336,9 +2349,12 @@ async def refresh_provider(
         return await _refresh_derived_provider(
             db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
         )
-    return await _refresh_provider_urls(
+    refreshed = await _refresh_provider_urls(
         db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
     )
+    # MSMM 22.3: this provider's extract, if the module lacks it, after the answer.
+    background.add_task(station_extract_upload.send_after_refresh, sid, pid)
+    return refreshed
 
 
 # ───────────────────────── per-provider status (v0.1.19) ─────────────────────
@@ -2428,6 +2444,7 @@ def get_providers_status(
             checked_at=_parse_iso(fetch_state.get("checked_at")),
         )
         _decorate_status(status, p, fetch_state, latest_upload_filename.get(p["id"]))
+        status.station_extract = station_extract_upload.load_outcome(sid, p["id"])
         out[p["id"]] = status
     return out
 
