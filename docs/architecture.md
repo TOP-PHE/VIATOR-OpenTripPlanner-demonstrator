@@ -1227,7 +1227,7 @@ feeds left are "skipped", `budget`; no `PUT` starts with less than 30 s left). A
 extraction runs on a thread of its own and the pass waits for it at most until the budget ends (its
 child goes on and leaves the extract in the cache for the next pass), passing what is left as
 `ensure_extract`'s `wait_seconds`; every call's deadline ends with the budget too, and a call's end
-waits at most 1 s for a name lookup still running (`_run`), so a pass ends within its budget. **The
+never waits for a name lookup still running (`_run` closes its loop without joining the resolver thread), so a pass ends within its budget. **The
 module down**: once a call got no answer after its retries (`network`, `timeout`) or a `PUT` was
 answered 404 (intake off, module older than MSMM #42), the feeds left are "module unavailable" without
 a call, so a module that is down costs one feed's retries (at most 40 s for a silent one), not the

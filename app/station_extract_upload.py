@@ -48,8 +48,8 @@ are "skipped" with the reason `budget`. Once a call got no answer after its
 retries (`network`, `timeout`), or a `PUT` was answered 404 (the intake off,
 or a module older than it), the module is taken for down: the feeds left are
 "module unavailable" with the same reason and are not called. Every pause
-lasts at least `PAUSE_FLOOR_SECONDS`, and the end of a call waits at most
-`RESOLVER_GRACE_SECONDS` for a name lookup past its deadline. Retries:
+lasts at least `PAUSE_FLOOR_SECONDS`, and the end of a call never waits for a name lookup
+past its deadline. Retries:
 
 - 503 `busy` (another extract being received) and 429 `extract_window` (60
   extracts in the UTC half hour): wait the `Retry-After`, then send again,
@@ -105,7 +105,6 @@ import queue
 import re
 import threading
 import time
-import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -150,9 +149,6 @@ PAUSE_FLOOR_SECONDS = 1.0
 WAITS_PER_CALL = 6
 # No upload starts with less of the budget left (an extract of 32 MiB needs time).
 MIN_PUT_SECONDS = 30.0
-# What a call may still wait, after its deadline, for a name lookup to give up
-# (the resolver runs on a thread asyncio would otherwise wait for).
-RESOLVER_GRACE_SECONDS = 1.0
 
 # An answer is a short JSON object, or nothing; anything larger is refused unread.
 MAX_ANSWER_BYTES = 4 * 1024
@@ -397,23 +393,16 @@ class _Calls:
 
 
 def _run(call: Coroutine[Any, Any, _Answer]) -> _Answer:
-    """`asyncio.run`, but its end waits at most `RESOLVER_GRACE_SECONDS` for
-    the loop's default executor: a name lookup still running there past the
-    call's deadline (`getaddrinfo` cannot be cut short) is left to finish
-    alone instead of holding the pass."""
-    # A selector loop, as `asyncio.run` makes on Linux; its type declares the
-    # executor timeout.
-    loop = asyncio.SelectorEventLoop()
+    """`asyncio.run`, without its wait for the loop's default executor: a
+    name lookup still running there past the call's deadline (`getaddrinfo`
+    cannot be cut short) is left to finish alone on its thread instead of
+    holding the pass (`loop.close` shuts the executor down without waiting)."""
+    loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(call)
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                loop.run_until_complete(
-                    loop.shutdown_default_executor(timeout=RESOLVER_GRACE_SECONDS)
-                )
         finally:
             loop.close()
 
@@ -691,7 +680,7 @@ def _refused(pid: str, answer: _Answer) -> FeedOutcome:
     if status < 400 or status == 404 or status == 408 or status >= 500:
         # Also a redirect or another 2xx: an address or a proxy in the way.
         return FeedOutcome(pid, UNAVAILABLE, f"status_{status}")
-    if 400 <= status < 500 and code in REFUSAL_CODES:
+    if code in REFUSAL_CODES:
         return FeedOutcome(pid, REFUSED, code)
     return FeedOutcome(pid, REFUSED, f"status_{status}")
 

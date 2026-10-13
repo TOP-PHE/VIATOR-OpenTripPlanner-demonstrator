@@ -1655,9 +1655,8 @@ def test_a_slow_name_lookup_does_not_hold_the_pass(
     monkeypatch.setattr(settings, "station_module_url", "http://msmm.slowdns.invalid:8000")
     monkeypatch.setattr(up, "HEAD_SECONDS", 0.2)
     monkeypatch.setattr(up, "TRANSIENT_RETRIES", 0)
-    monkeypatch.setattr(up, "RESOLVER_GRACE_SECONDS", 0.2)
     setup = Setup(tmp_path, monkeypatch, n=1)
     started = _time.monotonic()
     result = up.send_session_extracts(SESSION, setup.feeds, budget=60.0, record=False)
     assert _states(result) == [(up.UNAVAILABLE, up.TIMEOUT)]
-    assert _time.monotonic() - started < 2.0
+    assert _time.monotonic() - started < 1.5
