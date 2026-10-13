@@ -695,31 +695,46 @@ SESSION_SLUG = re.compile(r"[a-z][a-z0-9-]{1,62}", re.ASCII)
 PROVIDER_ID = re.compile(r"[A-Z][A-Z0-9_-]{1,15}", re.ASCII)
 
 
+def _inside(base: str, *names: str) -> str:
+    """`base` joined with `names`, made real (`os.path.realpath`) and refused
+    with `ValueError` unless it starts with the real base and a separator:
+    the one guard of every path this module builds from a session or a
+    provider id (the form CodeQL's py/path-injection and Sonar's S2083
+    recognise). The checked string is what the caller opens."""
+    root = os.path.realpath(base)
+    candidate = os.path.realpath(Path(root, *names))
+    if not candidate.startswith(root + os.sep):
+        raise ValueError("path outside its base")
+    return candidate
+
+
 def _session_dir(sid: str) -> Path:
-    """`<inbox>/<sid>`, for a session id of the slug form only, resolved and
-    checked to sit inside the inbox (pythonsecurity:S2083, CodeQL
-    py/path-injection): a value such as `..`, an absolute path or a NUL is
-    refused with `ValueError` whatever the callers checked before."""
+    """`<inbox>/<sid>` for a session id of the slug form only, checked to sit
+    inside the inbox: `..`, an absolute path, a NUL or a link out of the
+    inbox is a `ValueError`, whatever the callers checked before."""
     if SESSION_SLUG.fullmatch(sid) is None:
         raise ValueError("not a session id")
-    base = Path(os.path.realpath(settings.inbox_dir))
-    folder = Path(os.path.realpath(base / sid))
-    if folder == base or not folder.is_relative_to(base):
-        raise ValueError("session folder outside the inbox")
-    return folder
+    return Path(_inside(str(settings.inbox_dir), sid))
 
 
 def _fetch_state_dir(sid: str) -> Path:
-    return _session_dir(sid) / "_fetch_state"
+    if SESSION_SLUG.fullmatch(sid) is None:
+        raise ValueError("not a session id")
+    return Path(_inside(str(settings.inbox_dir), sid, "_fetch_state"))
 
 
-def _outcome_path(sid: str, provider_id: str) -> Path:
-    """The file of a provider's last outcome; `ValueError` for an id of
-    another form (`feed_fetch.state_path` checks the name and the folder
-    again)."""
-    if PROVIDER_ID.fullmatch(provider_id) is None:
-        raise ValueError("not a provider id")
-    return feed_fetch.state_path(_fetch_state_dir(sid), STATE_KEY.format(pid=provider_id))
+def _outcome_name(provider_id: str) -> str:
+    """The file name of a provider's last outcome: `feed_fetch.state_path`'s
+    name for the key `provider[<id>].station_extract`."""
+    return f"provider_{provider_id}_.station_extract.json"
+
+
+def _outcome_path(sid: str, provider_id: str) -> str:
+    """The checked path of a provider's last outcome; `ValueError` for a
+    session or provider id of another form, or a path out of the inbox."""
+    if SESSION_SLUG.fullmatch(sid) is None or PROVIDER_ID.fullmatch(provider_id) is None:
+        raise ValueError("not a session or provider id")
+    return _inside(str(settings.inbox_dir), sid, "_fetch_state", _outcome_name(provider_id))
 
 
 def _archive(sid: str, provider: dict[str, Any]) -> Path | None:
@@ -728,14 +743,12 @@ def _archive(sid: str, provider: dict[str, Any]) -> Path | None:
     details = ingestion.TIMETABLE_FORMAT_DETAILS.get(fmt)
     if details is None:
         return None
-    if PROVIDER_ID.fullmatch(str(provider.get("id"))) is None:
+    pid = str(provider.get("id"))
+    if SESSION_SLUG.fullmatch(sid) is None or PROVIDER_ID.fullmatch(pid) is None:
         return None
-    path = (
-        _session_dir(sid)
-        / details["subdir"]
-        / ingestion.staged_filename_for_format(provider["id"], fmt)
-    )
-    return path if path.is_file() else None
+    name = ingestion.staged_filename_for_format(pid, fmt)
+    path = _inside(str(settings.inbox_dir), sid, details["subdir"], name)
+    return Path(path) if Path(path).is_file() else None
 
 
 def _fetched_sha256(sid: str, label: str) -> str | None:
@@ -810,7 +823,7 @@ def record_outcome(sid: str, outcome: FeedOutcome, *, at: datetime | None = None
     except ValueError:
         log.warning("station_extract.not_recorded reason=bad_id")
         return
-    feed_fetch.save_state(path.parent, STATE_KEY.format(pid=outcome.provider_id), state)
+    feed_fetch.save_state(Path(path).parent, STATE_KEY.format(pid=outcome.provider_id), state)
 
 
 def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
@@ -821,7 +834,7 @@ def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
         path = _outcome_path(sid, provider_id)
     except ValueError:
         return None
-    state = feed_fetch.load_state(path.parent, STATE_KEY.format(pid=provider_id))
+    state = feed_fetch.load_state(Path(path).parent, STATE_KEY.format(pid=provider_id))
     word = state.get("state")
     if word not in STATUS_TEXTS:
         return None
@@ -842,8 +855,12 @@ _OUTCOME_FILE = re.compile(r"provider_([A-Z][A-Z0-9_-]{1,15})_\.station_extract\
 
 def forget_outcome(sid: str, provider_id: str) -> None:
     """Remove a provider's last outcome (its slot got another file). Best-effort."""
-    with contextlib.suppress(OSError, ValueError):
-        _outcome_path(sid, provider_id).unlink(missing_ok=True)
+    try:
+        path = _outcome_path(sid, provider_id)
+    except ValueError:
+        return
+    with contextlib.suppress(OSError):
+        Path(path).unlink(missing_ok=True)
 
 
 def forget_outcomes_except(sid: str, keep: set[str] | None) -> None:
@@ -852,7 +869,7 @@ def forget_outcomes_except(sid: str, keep: set[str] | None) -> None:
     if keep is None:
         return
     try:
-        names = [p.name for p in _fetch_state_dir(sid).iterdir()]
+        names = [entry.name for entry in _fetch_state_dir(sid).iterdir()]
     except (OSError, ValueError):
         return
     for name in names:

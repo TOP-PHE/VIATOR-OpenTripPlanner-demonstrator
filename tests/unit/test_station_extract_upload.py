@@ -1722,3 +1722,35 @@ def test_a_valid_session_folder_stays_in_the_inbox(
 ) -> None:
     monkeypatch.setattr(settings, "inbox_dir", tmp_path)
     assert up._session_dir("zz-e2e") == Path(os.path.realpath(tmp_path)) / "zz-e2e"
+
+
+def test_the_outcome_name_is_the_fetch_states(tmp_path: Path) -> None:
+    from app import feed_fetch
+
+    named = feed_fetch.state_path(tmp_path, up.STATE_KEY.format(pid="ZZ_9-A")).name
+    assert named == up._outcome_name("ZZ_9-A")
+
+
+@pytest.mark.parametrize("names", [("..",), ("../x",), ("/abs",), ("a", "..", "..")])
+def test_inside_refuses_a_path_out_of_its_base(tmp_path: Path, names: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError):
+        up._inside(str(tmp_path), *names)
+
+
+def test_inside_refuses_the_base_itself(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        up._inside(str(tmp_path), ".")
+
+
+def test_a_session_id_of_another_form_lists_no_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    folder = tmp_path / "zz.x" / "_fetch_state"
+    folder.mkdir(parents=True)
+    kept = folder / up._outcome_name("ZZ0")
+    kept.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError):
+        up._fetch_state_dir("zz.x")
+    up.forget_outcomes_except("zz.x", set())
+    assert kept.is_file()
