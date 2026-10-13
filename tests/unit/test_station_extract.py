@@ -459,8 +459,8 @@ def test_gtfs_without_agency_and_with_padding(tmp_path: Path) -> None:
 def test_single_agency_route_without_agency_id(tmp_path: Path) -> None:
     archive = _gtfs(
         tmp_path,
-        agency="agency_name\nZZ Seule\n",
-        routes="route_id,route_type\nR1,2\nR3,400\n",
+        agency="agency_id,agency_name\nZZS,ZZ Seule\n",
+        routes="route_id,agency_id,route_type\nR1,,2\nR3,,400\n",
     )
     rows = _msmm_check(
         _build(_provider(), archive, tmp_path).path_gz, str(feed_key_for(_provider()))
@@ -524,6 +524,51 @@ def test_station_with_only_dropped_operators_takes_provider(tmp_path: Path) -> N
     rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
     assert rows["ZZ:S1"]["operators"] == "ZZRAIL"
     assert result.dropped["operator_from_provider"] == 3
+
+
+def test_more_cleaning(tmp_path: Path) -> None:
+    stops = STOPS.replace("ZZ:S1:P1,9901,", "ZZ:S1:P1,99\x0201,").replace(
+        "ZZ:S3,,ZZ Ville,48.6,", "ZZ:S3,,ZZ Ville,95.0,"
+    )
+    agency = "agency_id,agency_name\nZZR,ZZ Rail\nZZQ,ZZ  Rail\nZZB,ZZ Bus\n"
+    routes = ROUTES + "R5,ZZQ,IC,2\n"
+    trips = TRIPS + "R5,W,T6\n"
+    stop_times = STOP_TIMES + "T6,12:00:00,12:00:00,ZZ:S1:P1,1,,\n"
+    archive = _gtfs(
+        tmp_path, stops=stops, agency=agency, routes=routes, trips=trips, stop_times=stop_times
+    )
+    result = _build(_provider(), archive, tmp_path)
+    rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
+    assert set(rows) == {"ZZ:S1", "ZZ:S2"}  # a latitude of 95 is no position
+    assert rows["ZZ:S1"]["operators"] == "ZZ Rail"  # two spellings, one item
+    assert "stop_code=99\x0201" not in rows["ZZ:S1"]["codes"]
+    assert result.dropped["code_control"] == 1
+    assert result.dropped["duplicate_item"] == 1
+    assert result.dropped["no_position"] == 1
+
+
+def test_netex_non_rail_journeys_dropped_early(tmp_path: Path) -> None:
+    from app.station_extract_netex import _Archive, _read_journeys, _read_lines
+
+    archive = _zip(
+        tmp_path / "epip.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
+    )
+    with zipfile.ZipFile(archive) as zf:
+        reader = _Archive(zf)
+        lines, _ = _read_lines(reader)
+        by_pattern, _ = _read_journeys(reader, lines)
+    # the bus journey (own mode) and none of the line-mode ones that are not rail
+    assert set(by_pattern) == {"ZZ:SJP:R", "ZZ:SJP:X"}
+    bus_line = EPIP_TIMETABLE.replace(
+        '<ServiceJourney id="ZZ:SJ:3"><TransportMode>bus</TransportMode>',
+        '<ServiceJourney id="ZZ:SJ:3"><LineRef ref="ZZ:Line:B"/>',
+    )
+    archive = _zip(tmp_path / "b.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + bus_line)})
+    with zipfile.ZipFile(archive) as zf:
+        reader = _Archive(zf)
+        lines, _ = _read_lines(reader)
+        by_pattern, _ = _read_journeys(reader, lines)
+    assert "ZZ:SJP:B" not in by_pattern  # the Line's bus mode drops it before the patterns
 
 
 def test_codes_capped_at_500(tmp_path: Path) -> None:

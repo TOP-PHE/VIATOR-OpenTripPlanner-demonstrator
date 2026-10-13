@@ -34,7 +34,9 @@ import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import IO
-from xml.etree.ElementTree import Element  # nosec B405 - type only; parsing is defusedxml
+
+# Only the type: every parse goes through defusedxml.
+from xml.etree.ElementTree import Element  # nosec B405
 
 from defusedxml.ElementTree import ParseError, iterparse
 
