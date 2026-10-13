@@ -28,30 +28,45 @@ follows for a MOTIS session (`app/station_builds.py`) queues it at once.
   process's sender thread, `after_refresh`: `REFRESH_BUDGET_SECONDS`);
 - in the worker, at the start of every rebuild job, OTP or MOTIS; for a
   MOTIS session **before** the station build request and its wait, so that
-  the build sees the new extracts (`BUILD_BUDGET_SECONDS`).
+  the build sees the new extracts (`BUILD_BUDGET_SECONDS`). The worker uses
+  only extracts already made (`cache_only`): no extraction starts before a
+  graph build, so none can run into it; a feed without one is "skipped
+  not_cached" and goes with the refresh's pass.
 
 Per feed with a feed key: `HEAD`; on 200 nothing more ("already held"); on
 404 `station_extract.ensure_extract` (its cache by archive sha256 and
-`EXTRACTOR_VERSION`, else a resource-limited child process), then the `PUT`.
+`EXTRACTOR_VERSION`, else, after a refresh, a resource-limited child
+process), then the `PUT`.
 
 **Bounded.** Each call runs under `asyncio.timeout` on its own event loop
 (the per-call deadline of `app/station_builds.py`): `HEAD_SECONDS` for a
 `HEAD`, `PUT_SECONDS` for a `PUT`, never past the end of the pass's budget.
 The extraction (`_Pass._extract_within`) is waited for at most until the
-budget ends too. The pass stops starting new work once its budget is spent;
-the feeds left are "skipped" with the reason `budget`. Retries:
+budget ends too. The pass stops starting new work once its budget is spent,
+and starts no `PUT` with less than `MIN_PUT_SECONDS` left; the feeds left
+are "skipped" with the reason `budget`. Once a call got no answer after its
+retries (`network`, `timeout`), or a `PUT` was answered 404 (the intake off,
+or a module older than it), the module is taken for down: the feeds left are
+"module unavailable" with the same reason and are not called. Every pause
+lasts at least `PAUSE_FLOOR_SECONDS`, and the end of a call waits at most
+`RESOLVER_GRACE_SECONDS` for a name lookup past its deadline. Retries:
 
 - 503 `busy` (another extract being received) and 429 `extract_window` (60
   extracts in the UTC half hour): wait the `Retry-After`, then send again,
   only when the wait fits in what is left of the budget (and is at most
   `RETRY_AFTER_MAX_SECONDS`); else the feed ends "module unavailable" with
-  the code as its reason. A 429 that cannot be waited ends every `PUT` of
-  the pass (the window is the module's, for every feed);
+  the code as its reason; at most `WAITS_PER_CALL` waits for one call. A
+  429 that cannot be waited ends every `PUT` of the pass (the window is the
+  module's, for every feed);
 - 408 `timeout`, any other 5xx, a call past its deadline, a lost
   connection: tried again `TRANSIENT_RETRIES` times, `TRANSIENT_PAUSE_SECONDS`
   apart, within the budget;
 - every other 4xx is a refusal: never sent again in the pass, logged with
-  its reason word only ("refused <code>").
+  its reason word only ("refused <code>"; a `HEAD` 403, which has no body,
+  is the token: "refused token");
+- an answer too large or compressed (`shape`) is never sent again; a 3xx,
+  or a 2xx other than 200, is "module unavailable" (an address or a proxy
+  in the way).
 
 **Never blocking.** Nothing here raises an `Exception` to its caller: an
 unexpected one ends the pass (`error`, one WARNING). A failed upload never
@@ -83,13 +98,15 @@ here catches `BaseException`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import queue
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterable
+import warnings
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -127,6 +144,15 @@ DEFAULT_RETRY_SECONDS = 10.0
 TRANSIENT_PAUSE_SECONDS = 5.0
 # How often the pass looks at the cancel and the budget while an extraction runs.
 EXTRACT_POLL_SECONDS = 1.0
+# Every pause lasts at least this long: a `Retry-After: 0` never makes a tight loop.
+PAUSE_FLOOR_SECONDS = 1.0
+# At most this many busy or 429 waits for one call, whatever their length.
+WAITS_PER_CALL = 6
+# No upload starts with less of the budget left (an extract of 32 MiB needs time).
+MIN_PUT_SECONDS = 30.0
+# What a call may still wait, after its deadline, for a name lookup to give up
+# (the resolver runs on a thread asyncio would otherwise wait for).
+RESOLVER_GRACE_SECONDS = 1.0
 
 # An answer is a short JSON object, or nothing; anything larger is refused unread.
 MAX_ANSWER_BYTES = 4 * 1024
@@ -163,6 +189,11 @@ BUSY = "busy"
 EXTRACT_WINDOW = "extract_window"
 ARCHIVE_CHANGED = "archive_changed"
 EXTRACT_GONE = "extract_gone"
+NO_SNAPSHOT = "no_snapshot"
+NOT_CACHED = "not_cached"
+FORBIDDEN_WORD = "token"  # the reason word of a 403: the token refused
+# Failures that are never sent again in a pass: the same file, the same answer.
+_FINAL_FAILURES = frozenset({EXTRACT_GONE, SHAPE})
 
 # The refusal words of the module's 4xx answers (its design 20.6, 22.3), kept
 # when an answer names one; any other code gives `status_<n>`.
@@ -327,12 +358,12 @@ class _Calls:
     def head(self, feed_key: str, sha256: str, extractor_version: str, limit: float) -> _Answer:
         url = station_module._url(f"{FEEDS_PATH}/{feed_key}/{sha256}")
         params = {"extractor_version": extractor_version}
-        return asyncio.run(self._send("HEAD", url, limit, params=params))
+        return _run(self._send("HEAD", url, limit, params=params))
 
     def put(self, feed_key: str, path: Path, size: int, limit: float) -> _Answer:
         url = station_module._url(f"{FEEDS_PATH}/{feed_key}/extract")
         headers = {"Content-Type": CONTENT_TYPE, "Content-Length": str(size)}
-        return asyncio.run(self._send("PUT", url, limit, path=path, extra=headers))
+        return _run(self._send("PUT", url, limit, path=path, extra=headers))
 
     async def _send(
         self,
@@ -363,6 +394,28 @@ class _Calls:
         except OSError:
             # The extract file went away (the extractor keeps one per provider).
             raise _Failure(EXTRACT_GONE) from None
+
+
+def _run(call: Coroutine[Any, Any, _Answer]) -> _Answer:
+    """`asyncio.run`, but its end waits at most `RESOLVER_GRACE_SECONDS` for
+    the loop's default executor: a name lookup still running there past the
+    call's deadline (`getaddrinfo` cannot be cut short) is left to finish
+    alone instead of holding the pass."""
+    # A selector loop, as `asyncio.run` makes on Linux; its type declares the
+    # executor timeout.
+    loop = asyncio.SelectorEventLoop()
+    try:
+        return loop.run_until_complete(call)
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                loop.run_until_complete(
+                    loop.shutdown_default_executor(timeout=RESOLVER_GRACE_SECONDS)
+                )
+        finally:
+            loop.close()
 
 
 def _waits(answer: _Answer) -> bool:
@@ -435,8 +488,10 @@ class _Pass:
         extract: Callable[..., Any],
         extractor_version: str,
         sid: str = "",
+        cache_only: bool = False,
     ) -> None:
         self.sid = sid
+        self.cache_only = cache_only
         self.calls = calls
         self.clock = clock
         self.deadline = clock.monotonic() + budget
@@ -444,6 +499,9 @@ class _Pass:
         self.extract = extract
         self.extractor_version = extractor_version
         self.window_full = False
+        # Set once the module is found down (no answer after the retries, or a
+        # PUT answered 404): the feeds left are not called.
+        self.down: str | None = None
 
     def left(self) -> float:
         return self.deadline - self.clock.monotonic()
@@ -452,7 +510,9 @@ class _Pass:
         return max(0.0, min(call_seconds, self.left()))
 
     def pause(self, seconds: float) -> bool:
-        """Sleep `seconds` when they fit in the budget; False when they do not."""
+        """Sleep `seconds`, at least `PAUSE_FLOOR_SECONDS`, when they fit in the
+        budget; False when they do not."""
+        seconds = max(PAUSE_FLOOR_SECONDS, seconds)
         if seconds > RETRY_AFTER_MAX_SECONDS or seconds >= self.left():
             return False
         self.clock.sleep(seconds)
@@ -472,7 +532,7 @@ class _Pass:
             try:
                 answer = send(self.limit(call_seconds))
             except _Failure as failure:
-                if failure.reason != EXTRACT_GONE and retries.transient():
+                if failure.reason not in _FINAL_FAILURES and retries.transient():
                     continue
                 raise
             if retries.again(answer):
@@ -485,6 +545,8 @@ class _Pass:
             return FeedOutcome(pid, SKIPPED, NO_FEED_KEY)
         if feed.archive is None or feed.archive_sha256 is None:
             return FeedOutcome(pid, SKIPPED, NO_ARCHIVE)
+        if self.down is not None:
+            return FeedOutcome(pid, UNAVAILABLE, self.down)
         key, sha = feed.feed_key, feed.archive_sha256
         try:
             answer = self._call(
@@ -492,12 +554,24 @@ class _Pass:
                 HEAD_SECONDS,
             )
         except _Failure as failure:
-            return _unreached(pid, failure.reason)
+            return self._unreached(pid, failure.reason)
         if answer.status == 200:
             return FeedOutcome(pid, HELD)
+        if answer.status == 403:
+            # A HEAD answer has no body (the server drops it), and the token is
+            # the one thing VIATOR's HEAD can be refused for (the module's i4;
+            # i5 refuses browser headers this client never sends).
+            return FeedOutcome(pid, REFUSED, FORBIDDEN_WORD)
         if answer.status != 404:
             return _refused(pid, answer)
         return self._send(feed, key)
+
+    def _unreached(self, pid: str, reason: str) -> FeedOutcome:
+        """A call that got no answer: once no answer came after the retries,
+        the module is taken for down and the feeds left are not called."""
+        if reason in (NETWORK, TIMEOUT):
+            self.down = reason
+        return _unreached(pid, reason)
 
     def _extract_within(self, feed: Feed) -> Any:
         """The extract, or a reason word, within what is left of the budget.
@@ -512,7 +586,7 @@ class _Pass:
 
         def run() -> None:
             try:
-                box["made"] = self.extract(self.sid, feed, max(0.0, self.left()))
+                box["made"] = self.extract(self.sid, feed, max(0.0, self.left()), self.cache_only)
             except Exception as exc:  # one feed, never the pass or the thread
                 log.warning(_FAILED, ERROR, type(exc).__name__)
                 box["made"] = ERROR
@@ -532,7 +606,7 @@ class _Pass:
         pid = feed.provider_id
         if self.window_full:
             return FeedOutcome(pid, UNAVAILABLE, EXTRACT_WINDOW)
-        if self.left() <= 0:
+        if self.left() < MIN_PUT_SECONDS:
             return FeedOutcome(pid, SKIPPED, BUDGET)
         made = self._extract_within(feed)
         if isinstance(made, str):
@@ -546,15 +620,20 @@ class _Pass:
             or _size_on_disk(path) != size
         ):
             return FeedOutcome(pid, SKIPPED, NO_EXTRACT)
+        if self.left() < MIN_PUT_SECONDS:
+            return FeedOutcome(pid, SKIPPED, BUDGET)
         try:
             answer = self._call(lambda limit: self.calls.put(key, path, size, limit), PUT_SECONDS)
             if answer.status == 200:
                 uploaded = _put_answer(answer, made.body_sha256, size, int(made.rows))
                 return FeedOutcome(pid, SENT if uploaded.status == "recorded" else HELD)
         except _Failure as failure:
-            return _unreached(pid, failure.reason)
+            return self._unreached(pid, failure.reason)
         if answer.status == 429:
             self.window_full = True
+        if answer.status == 404:
+            # The intake calls are off, or the module is older than them.
+            self.down = "status_404"
         return _refused(pid, answer)
 
 
@@ -571,6 +650,7 @@ class _Retries:
     def __init__(self, work: _Pass) -> None:
         self.work = work
         self.left = TRANSIENT_RETRIES
+        self.waits = WAITS_PER_CALL
 
     def transient(self) -> bool:
         """After a transient failure: True once the pause is over, while
@@ -584,6 +664,9 @@ class _Retries:
         """After an answer: busy and 429 after their `Retry-After`, 408 and
         5xx as a transient failure; every other answer is final."""
         if _waits(answer):
+            if self.waits <= 0:
+                return False
+            self.waits -= 1
             return self.work.pause(_retry_wait(answer))
         return _transient(answer) and self.transient()
 
@@ -597,14 +680,16 @@ def _unreached(pid: str, reason: str) -> FeedOutcome:
 def _refused(pid: str, answer: _Answer) -> FeedOutcome:
     """A final answer other than a success: a 4xx refusal with its word, else
     the module unavailable (404 of a module without these calls, 5xx, the
-    busy and window answers that could not be waited)."""
+    busy and window answers that could not be waited, a 3xx or a 2xx other
+    than 200)."""
     code = _code(answer)
     status = answer.status
     if status == 503 and code == BUSY:
         return FeedOutcome(pid, UNAVAILABLE, BUSY)
     if status == 429:
         return FeedOutcome(pid, UNAVAILABLE, EXTRACT_WINDOW)
-    if status == 404 or status == 408 or status >= 500:
+    if status < 400 or status == 404 or status == 408 or status >= 500:
+        # Also a redirect or another 2xx: an address or a proxy in the way.
         return FeedOutcome(pid, UNAVAILABLE, f"status_{status}")
     if 400 <= status < 500 and code in REFUSAL_CODES:
         return FeedOutcome(pid, REFUSED, code)
@@ -721,6 +806,30 @@ def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
 
 
 _WORD = re.compile(r"[a-z0-9_]{1,40}", re.ASCII)
+_OUTCOME_FILE = re.compile(r"provider_([A-Z][A-Z0-9_-]{1,15})_\.station_extract\.json", re.ASCII)
+
+
+def forget_outcome(sid: str, provider_id: str) -> None:
+    """Remove a provider's last outcome (its slot got another file). Best-effort."""
+    with contextlib.suppress(OSError, ValueError):
+        feed_fetch.state_path(_fetch_state_dir(sid), STATE_KEY.format(pid=provider_id)).unlink(
+            missing_ok=True
+        )
+
+
+def forget_outcomes_except(sid: str, keep: set[str] | None) -> None:
+    """Remove the last outcome of every provider not in `keep` (removed from
+    the session). `keep` None (a config that cannot be read): nothing."""
+    if keep is None:
+        return
+    try:
+        names = [p.name for p in _fetch_state_dir(sid).iterdir()]
+    except OSError:
+        return
+    for name in names:
+        found = _OUTCOME_FILE.fullmatch(name)
+        if found is not None and found.group(1) not in keep:
+            forget_outcome(sid, found.group(1))
 
 
 # ── the entry point ──────────────────────────────────────────────────────
@@ -749,23 +858,42 @@ def _source(provider_cfg: dict[str, Any]) -> str:
     return str(timetable.get("source") or ("url" if timetable.get("url") else "upload"))
 
 
-def _extract(sid: str, feed: Feed, wait_seconds: float) -> Any:
-    """The extract of a feed, or a reason word when there is none: through
-    the extractor's one safe entry point, `station_extract.ensure_extract`
-    (a cached extract at once; else a resource-limited child process, one
-    extraction at a time on the machine, waiting at most `wait_seconds` for
-    another one: `busy`). It reads a snapshot of the slot paired with its
-    sha256 (`provider_archive_snapshot`), so a refresh that replaces the file
-    meanwhile cannot pair this feed version with another file: the feed is
-    then `archive_changed`, sent by the next pass. Every reason of the
-    extractor (`resource_limit`, `busy`, `too_large`, `no_rail_stop`, ...)
-    is a skip: none says the module is unavailable."""
-    upload_sha = feed.archive_sha256 if _source(feed.provider_cfg) == "upload" else None
+def _extract(sid: str, feed: Feed, wait_seconds: float, cache_only: bool = False) -> Any:
+    """The extract of a feed, or a reason word when there is none, through
+    the extractor's one safe entry point, `station_extract.ensure_extract`.
+
+    `cache_only` (the worker, before a graph build): only an extract already
+    in the cache; nothing is started, and a feed without one is `not_cached`
+    (the refresh's pass sends it, after the extractor's warm-up). Otherwise
+    (after a refresh): a cached extract at once, else a resource-limited
+    child process, one extraction at a time on the machine, waiting at most
+    `wait_seconds` for another one (`busy`), on a snapshot of the slot that
+    the extractor checks against the fetch state (`provider_archive_snapshot`:
+    the slot's size and sha256). A slot it cannot vouch for (replaced by a
+    refresh meanwhile, not yet described by its state) gives no snapshot
+    (`no_snapshot`); a snapshot of another version than the one the module
+    was asked about is `archive_changed`. Both go with the next pass. Every
+    reason of the extractor (`resource_limit`, `busy`, `too_large`,
+    `no_rail_stop`, ...) is a skip: none says the module is unavailable."""
+    sha = str(feed.archive_sha256)
     try:
+        if cache_only:
+            return station_extract.ensure_extract(
+                feed.provider_cfg,
+                Path(str(feed.archive)),
+                sha,
+                extracted_at=datetime.now(UTC),
+                session_id=sid,
+                wait_seconds=0.0,
+                cache_only=True,
+            )
+        upload_sha = sha if _source(feed.provider_cfg) == "upload" else None
         with station_extract.provider_archive_snapshot(
             sid, feed.provider_cfg, upload_sha256=upload_sha
         ) as found:
-            if found is None or found[1] != feed.archive_sha256:
+            if found is None:
+                return NO_SNAPSHOT
+            if found[1] != sha:
                 return ARCHIVE_CHANGED
             return station_extract.ensure_extract(
                 feed.provider_cfg,
@@ -790,8 +918,9 @@ def send_session_extracts(
     should_stop: Callable[[], bool] = lambda: False,
     clock: Clock | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
-    extract: Callable[[str, Feed, float], Any] = _extract,
+    extract: Callable[[str, Feed, float, bool], Any] = _extract,
     record: bool = True,
+    cache_only: bool = False,
 ) -> PassResult:
     """Send what the module lacks of a session's feeds, within `budget` seconds.
 
@@ -813,6 +942,7 @@ def send_session_extracts(
             extract,
             station_extract.EXTRACTOR_VERSION,
             sid,
+            cache_only,
         )
         for feed in feeds:
             if should_stop():
@@ -869,6 +999,7 @@ def send_session(
     only_provider: str | None = None,
     should_stop: Callable[[], bool] = lambda: False,
     session_factory: Callable[[], Any] | None = None,
+    cache_only: bool = False,
 ) -> PassResult:
     """Read a session's feeds from the database, then send them. Never raises
     an `Exception`. Used by the worker before a graph build, and by the
@@ -887,7 +1018,9 @@ def send_session(
         log.warning(_FAILED, ERROR, type(exc).__name__)
         return PassResult()
     with _one_at_a_time:
-        return send_session_extracts(sid, feeds, budget=budget, should_stop=should_stop)
+        return send_session_extracts(
+            sid, feeds, budget=budget, should_stop=should_stop, cache_only=cache_only
+        )
 
 
 def send_after_refresh(sid: str, only_provider: str | None = None) -> None:

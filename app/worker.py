@@ -563,6 +563,9 @@ def _send_station_extracts(job_id: uuid.UUID, session_id: str) -> station_extrac
         session_id,
         budget=station_extract_upload.BUILD_BUDGET_SECONDS,
         should_stop=should_stop,
+        # Only extracts already made: no extraction starts before a graph
+        # build, so none can run into it (the refresh's pass makes them).
+        cache_only=True,
     )
     line = station_extract_upload.log_line(result)
     if line:

@@ -1117,7 +1117,7 @@ serving journey queries — and the safety rails that keep a build from taking t
 |---|---|
 | `app/worker.py` (1331 lines) | The whole second process. Polls `rebuild_jobs`, debounces, runs the engine-specific build by shelling out to `docker compose`, promotes the result via a symlink, and watches for the reload-trigger sentinel. |
 | `app/station_builds.py` | Before each MOTIS build: asks the station module (MSMM) for a station build (`POST /internal/v1/builds`) and polls its state (`GET /internal/v1/builds/{id}`) until it ends, 30 min at most (MSMM decision 6). Never blocks the graph: every end of the wait but an operator's cancel lets the build go on. |
-| `app/station_extract_upload.py` | Sends the stop extracts of a session's feeds to the station module (MSMM 22.3, D-R15 A): per feed with a feed key, `HEAD /internal/v1/feeds/{key}/{sha256}?extractor_version=`, and on 404 `station_extract.build_extract` (its cache) then `PUT /internal/v1/feeds/{key}/extract` (gzip streamed from the file). After every refresh (the web process's sender thread) and before every graph build, OTP and MOTIS (before the MOTIS station build wait). Bounded; never blocks a refresh or a graph; records the last outcome per provider for the feed-status panel. |
+| `app/station_extract_upload.py` | Sends the stop extracts of a session's feeds to the station module (MSMM 22.3, D-R15 A): per feed with a feed key, `HEAD /internal/v1/feeds/{key}/{sha256}?extractor_version=`, and on 404 `station_extract.ensure_extract` (its cache; after a refresh, else a resource-limited child process; before a build, the cache only) then `PUT /internal/v1/feeds/{key}/extract` (gzip streamed from the file). After every refresh (the web process's sender thread) and before every graph build, OTP and MOTIS (before the MOTIS station build wait). Bounded; never blocks a refresh or a graph; records the last outcome per provider for the feed-status panel. |
 | `app/sessions_orchestrator.py` | Renders `docker-compose.sessions.yml` and `nginx-sessions.conf` from the DB — one service block + one nginx `location` per *serving* session. Generator only; it never calls docker itself. |
 | `app/router_config.py` | Pure function producing per-session `router-config.json` for OTP: GTFS-RT updaters (with credentials applied), API timeout, routing defaults. No DB, no crypto. |
 | `app/otp_heap.py` | Validates `-Xmx` strings; **derives the container's cgroup cap from the heap**; auto-sizes the heap to host RAM for a max-memory rebuild. |
@@ -1208,10 +1208,14 @@ does). `station_extract_upload.send_session` reads the session's providers
 slot (`inbox/<sid>/<gtfs|netex>/<id>.zip`), its sha256 from the fetch state (`sha256`, the bytes
 downloaded) or, for an `upload` provider, from its latest `uploads` row. Per feed: `HEAD
 /internal/v1/feeds/{key}/{sha256}?extractor_version=<EXTRACTOR_VERSION>`; 200 is "already held";
-404 asks the extractor's one safe entry point, `station_extract.ensure_extract` (a cached extract
-at once, else a resource-limited child process, one extraction at a time on the machine), on a
-snapshot of the slot paired with its sha256 (`provider_archive_snapshot`: a slot replaced since the
-`HEAD` is `archive_changed`, sent by the next pass), then `PUT
+404 asks the extractor's one safe entry point, `station_extract.ensure_extract`. **Before a graph
+build (the worker) only an extract already in the cache** (`cache_only=True`: nothing is started, so
+no extraction can run into the build; a feed without one is `skipped not_cached` and goes with the
+refresh's pass). After a refresh: a cached extract at once, else a resource-limited child process,
+one extraction at a time on the machine, on a snapshot of the slot that the extractor checks against
+the fetch state (`provider_archive_snapshot`: size and sha256 of the slot file; one it cannot vouch
+for is `no_snapshot`, a snapshot of another version than the one asked about `archive_changed`;
+both go with the next pass). Then `PUT
 /internal/v1/feeds/{key}/extract`, the gzip streamed from its file in 64 KiB pieces with its
 `Content-Length` (never chunked, never held whole), checked against the module's 200 (its own
 sha256, bytes and rows given back). Both calls carry the token, `Accept-Encoding: identity` and
@@ -1219,14 +1223,21 @@ sha256, bytes and rows given back). Both calls carry the token, `Accept-Encoding
 id. **Bounds**: each call under `asyncio.timeout` on its own loop, 10 s for a `HEAD`, 120 s for a
 `PUT`, never past the pass's budget, **5 minutes before a graph build** (`BUILD_BUDGET_SECONDS`;
 30 minutes for a refresh's pass, which nothing waits on); no new work once the budget is spent (the
-feeds left are "skipped", `budget`). The extraction runs on a thread of its own and the pass waits
-for it at most until the budget ends (its child goes on and leaves the extract in the cache for the
-next pass), passing what is left as `ensure_extract`'s `wait_seconds`; every call's deadline ends
-with the budget too, so a pass ends within its budget. Every reason of the extractor
+feeds left are "skipped", `budget`; no `PUT` starts with less than 30 s left). After a refresh the
+extraction runs on a thread of its own and the pass waits for it at most until the budget ends (its
+child goes on and leaves the extract in the cache for the next pass), passing what is left as
+`ensure_extract`'s `wait_seconds`; every call's deadline ends with the budget too, and a call's end
+waits at most 1 s for a name lookup still running (`_run`), so a pass ends within its budget. **The
+module down**: once a call got no answer after its retries (`network`, `timeout`) or a `PUT` was
+answered 404 (intake off, module older than MSMM #42), the feeds left are "module unavailable" without
+a call, so a module that is down costs one feed's retries (at most 40 s for a silent one), not the
+budget. Every reason of the extractor
 (`resource_limit`, `busy`, `too_large`, `no_rail_stop`, …) is a skip, never "module unavailable";
 an extract file that goes away before its `PUT` is `extract_gone`. 503 `busy` and 429 `extract_window` are sent again after their
-`Retry-After` when it fits in the budget (and is at most 120 s); a 429 that cannot be waited ends
-every `PUT` of the pass; 408, any other 5xx, a call past its deadline or a lost connection are
+`Retry-After` when it fits in the budget (and is at most 120 s), each pause at least 1 s, at most six
+waits for one call; a 429 that cannot be waited ends every `PUT` of the pass; a `HEAD` 403 (no body)
+is `token`; an answer too large or compressed (`shape`) is not sent again; a 3xx or a 2xx other than
+200 is "module unavailable"; 408, any other 5xx, a call past its deadline or a lost connection are
 tried twice more, 5 s apart; every other 4xx is a refusal, never sent again in the pass. One line
 `[viator] station-extracts: sent=… held=… refused=… unavailable=… skipped=…` is appended to the
 job's log. A cancel is read before each feed and after each pause: a cancelled pass builds nothing
@@ -1248,7 +1259,10 @@ extractor version). The last outcome of each provider is written to
 `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` (`{"at", "state", "reason"}`), its
 own key beside the fetch state, so a refresh writing a fetch state at the same moment loses
 nothing; `GET /api/sessions/{sid}/providers/status` gives it back as `station_extract` with a
-fixed text, the "Station module" column of the feed-status panel. No migration.
+fixed text, the "Station module" column of the feed-status panel. No migration. The file is removed
+when an upload replaces the provider's slot (`_forget_fetch_state_for_slot`) and when a saved config
+no longer names the provider (`patch_session`). The sender queue lives in the web process's memory: a
+restart of `web` loses the passes waiting there, and the next rebuild (or refresh) sends again.
 
 `run_build` resolves every per-session knob defensively — each validator is wrapped so a bad
 value logs a warning and falls back to the default rather than failing the build — writes
@@ -1392,8 +1406,10 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
   the same `STATION_MODULE_URL` / `STATION_MODULE_TOKEN` as `web`: a worker not recreated after
   a token rotation is refused (403) and builds without waiting, with a warning.
 - **Before that wait, and before every OTP build, the worker sends the session's stop extracts**
-  (`station_extract_upload`, at most 5 minutes: an extraction still running then is left to its
-  child process, whose extract the next pass finds in the cache).
+  (`station_extract_upload`, at most 5 minutes, extracts already in the cache only: no extraction
+  ever runs into a build). **A MOTIS rebuild can thus sit in `running` for up to about 35 minutes
+  before its build container exists**: 5 minutes of upload, then up to 30 minutes of station-build
+  wait.
   A failed upload never stops the graph; a cancel during it builds nothing. A feed key travels in
   the path of the two intake calls (the module's contract), so it shows in the httpx trace's URL;
   it is derived from VIATOR's own provider configuration and is no secret, but it is never written

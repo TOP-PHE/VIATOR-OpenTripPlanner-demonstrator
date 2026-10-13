@@ -68,6 +68,8 @@ class FakeExtractor:
         self.calls: list[tuple[str, str]] = []
         self.waits: list[float] = []
         self.sessions: list[str] = []
+        self.cache_only: list[bool] = []
+        self.cached = False
         self.payload = b"format_version,feed_key\n1,zz\n" * 50
 
     def __call__(
@@ -80,12 +82,16 @@ class FakeExtractor:
         session_id: str,
         cache_dir: Path | None = None,
         wait_seconds: float | None = None,
+        cache_only: bool = False,
     ) -> station_extract.ExtractResult:
         assert extracted_at.tzinfo is not None
         assert wait_seconds is not None
-        self.calls.append((provider_cfg["id"], archive_sha256))
+        self.cache_only.append(cache_only)
         self.waits.append(wait_seconds)
         self.sessions.append(session_id)
+        if cache_only and not self.cached:
+            raise station_extract.ExtractError("not_cached")
+        self.calls.append((provider_cfg["id"], archive_sha256))
         if self.fail is not None:
             raise station_extract.ExtractError(self.fail, "stand-in")
         path = self.tmp / f"{archive_sha256}.csv.gz"
@@ -377,14 +383,16 @@ def test_a_refusal_without_a_known_word_names_its_status(
 
 
 @pytest.mark.usefixtures("token")
-@pytest.mark.parametrize("status", [403, 422])
+@pytest.mark.parametrize(("status", "reason"), [(403, "token"), (422, "status_422")])
 def test_a_refused_head_sends_no_put(
-    setup: Setup, module: Module, clock: FakeClock, status: int
+    setup: Setup, module: Module, clock: FakeClock, status: int, reason: str
 ) -> None:
-    # A HEAD answer has no body: the status is the reason.
+    # A HEAD answer has no body (the server drops it): a 403 can only be the
+    # token there, any other refusal names its status.
     module.heads = [httpx.Response(status)]
     result = _run(setup, module, clock)
-    assert _states(result) == [(up.REFUSED, f"status_{status}")]
+    assert _states(result) == [(up.REFUSED, reason)]
+    assert result.outcomes[0].text == f"refused {reason}"
     assert module.put_requests == []
 
 
@@ -655,12 +663,14 @@ def test_a_module_without_the_intake_calls_gives_404_and_the_pass_goes_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
 ) -> None:
     # VIATOR deployed before MSMM #42: HEAD and PUT both answer 404.
-    setup = Setup(tmp_path, monkeypatch, n=2)
+    setup = Setup(tmp_path, monkeypatch, n=3)
     module.puts = [httpx.Response(404, json={"detail": "Not Found"})]
     result = _run(setup, module, clock)
-    assert _states(result) == [(up.UNAVAILABLE, "status_404")] * 2
+    assert _states(result) == [(up.UNAVAILABLE, "status_404")] * 3
     assert result.outcomes[0].text == "module unavailable"
-    assert len(module.put_requests) == 2
+    # The first PUT's 404 says the intake is off: the feeds left are not called.
+    assert len(module.put_requests) == 1
+    assert len(module.head_requests) == 1
 
 
 def test_without_the_module_nothing_is_called(
@@ -749,7 +759,7 @@ def test_an_extractor_that_raises_skips_its_feed_with_one_warning(
         result = up.send_session_extracts(
             SESSION,
             setup.feeds,
-            budget=10.0,
+            budget=60.0,
             clock=clock,
             transport=httpx.MockTransport(module),
             extract=broken,
@@ -1227,7 +1237,8 @@ def test_a_slot_replaced_since_the_head_is_not_extracted(
     else:
         setup.snapshot.pairs[feed.provider_id] = (feed.archive, _sha())
     result = _run(setup, module, clock)
-    assert _states(result) == [(up.SKIPPED, up.ARCHIVE_CHANGED)]
+    reason = up.NO_SNAPSHOT if pair == "none" else up.ARCHIVE_CHANGED
+    assert _states(result) == [(up.SKIPPED, reason)]
     assert setup.extractor.calls == []
     assert module.put_requests == []
 
@@ -1387,3 +1398,266 @@ def test_end_to_end_with_the_real_extractor(
     extracts = tmp_path / sid / "_extracts"
     assert [p.name for p in extracts.iterdir() if p.name.endswith(".snap")] == []
     assert len(list(extracts.glob("ZZRAIL.*.csv.gz"))) == 1
+
+    # The worker's pass (cache only) sends that cached extract with no new
+    # extraction, and finds nothing for another archive version.
+    again = Module()
+    again.puts = [_answer_with(rows=2)]
+    cached = up.send_session_extracts(
+        sid,
+        feeds,
+        budget=120.0,
+        clock=clock,
+        transport=httpx.MockTransport(again),
+        record=False,
+        cache_only=True,
+    )
+    assert _states(cached) == [(up.SENT, None)]
+    other = [up.Feed(f.provider_id, f.provider_cfg, f.feed_key, f.archive, _sha()) for f in feeds]
+    missing = up.send_session_extracts(
+        sid,
+        other,
+        budget=120.0,
+        clock=clock,
+        transport=httpx.MockTransport(Module()),
+        record=False,
+        cache_only=True,
+    )
+    assert _states(missing) == [(up.SKIPPED, up.NOT_CACHED)]
+
+
+# ── review round 1 of PR 5 ───────────────────────────────────────────────
+
+
+class _Refused(httpx.AsyncBaseTransport):
+    """A module whose port refuses every connection."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        raise httpx.ConnectError("stand-in refusal", request=request)
+
+
+class _Blackhole(httpx.AsyncBaseTransport):
+    """A module that never answers: each call lasts its whole deadline."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.calls = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        self.clock.now += request.extensions["timeout"]["read"]
+        raise httpx.ReadTimeout("stand-in silence", request=request)
+
+
+@pytest.mark.usefixtures("token")
+def test_a_module_that_refuses_connections_is_not_called_for_every_feed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    setup = Setup(tmp_path, monkeypatch, n=30)
+    refused = _Refused()
+    start = clock.now
+    result = _run(setup, refused, clock)
+    assert _states(result) == [(up.UNAVAILABLE, up.NETWORK)] * 30
+    assert refused.calls == 1 + up.TRANSIENT_RETRIES
+    assert clock.now - start == up.TRANSIENT_PAUSE_SECONDS * up.TRANSIENT_RETRIES
+
+
+@pytest.mark.usefixtures("token")
+def test_a_silent_module_costs_one_feed_of_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    setup = Setup(tmp_path, monkeypatch, n=10)
+    silent = _Blackhole(clock)
+    start = clock.now
+    result = _run(setup, silent, clock)
+    assert _states(result) == [(up.UNAVAILABLE, up.TIMEOUT)] * 10
+    assert silent.calls == 1 + up.TRANSIENT_RETRIES
+    assert clock.now - start == (
+        up.HEAD_SECONDS * (1 + up.TRANSIENT_RETRIES)
+        + up.TRANSIENT_PAUSE_SECONDS * up.TRANSIENT_RETRIES
+    )
+    assert clock.now - start < up.BUILD_BUDGET_SECONDS
+
+
+@pytest.mark.usefixtures("token")
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (_refusal(429, "extract_window", "0"), up.EXTRACT_WINDOW),
+        (_refusal(503, "busy", "0"), up.BUSY),
+    ],
+    ids=["429", "busy"],
+)
+def test_a_retry_after_of_zero_never_makes_a_tight_loop(
+    setup: Setup, module: Module, clock: FakeClock, answer: httpx.Response, reason: str
+) -> None:
+    module.puts = [answer]
+    result = _run(setup, module, clock)
+    assert _states(result) == [(up.UNAVAILABLE, reason)]
+    assert len(module.put_requests) == 1 + up.WAITS_PER_CALL
+    assert clock.slept == [up.PAUSE_FLOOR_SECONDS] * up.WAITS_PER_CALL
+
+
+@pytest.mark.usefixtures("token")
+def test_the_waits_of_one_call_are_capped(setup: Setup, module: Module, clock: FakeClock) -> None:
+    module.puts = [_refusal(503, "busy", "10")]
+    result = _run(setup, module, clock, budget=1000.0)
+    assert _states(result) == [(up.UNAVAILABLE, up.BUSY)]
+    assert clock.slept == [10.0] * up.WAITS_PER_CALL
+
+
+@pytest.mark.usefixtures("token")
+def test_the_worker_pass_uses_only_a_cached_extract(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    result = up.send_session_extracts(
+        SESSION,
+        setup.feeds,
+        budget=60.0,
+        clock=clock,
+        transport=httpx.MockTransport(module),
+        record=False,
+        cache_only=True,
+    )
+    assert _states(result) == [(up.SKIPPED, up.NOT_CACHED)]
+    assert setup.extractor.cache_only == [True]
+    assert setup.extractor.waits == [0.0]
+    # Nothing is snapshotted or hashed for a cache lookup.
+    assert setup.snapshot.uploads == []
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_the_worker_pass_sends_a_cached_extract(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    setup.extractor.cached = True
+    result = up.send_session_extracts(
+        SESSION,
+        setup.feeds,
+        budget=60.0,
+        clock=clock,
+        transport=httpx.MockTransport(module),
+        record=False,
+        cache_only=True,
+    )
+    assert _states(result) == [(up.SENT, None)]
+
+
+@pytest.mark.usefixtures("token")
+def test_the_refresh_pass_may_extract(setup: Setup, module: Module, clock: FakeClock) -> None:
+    _run(setup, module, clock)
+    assert setup.extractor.cache_only == [False]
+
+
+@pytest.mark.usefixtures("token")
+def test_no_put_starts_with_a_sliver_of_budget(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    def slow_404(request: httpx.Request) -> httpx.Response:
+        clock.now += 15.0
+        return httpx.Response(404)
+
+    module.heads = [slow_404]
+    result = _run(setup, module, clock, budget=up.MIN_PUT_SECONDS + 10.0)
+    assert _states(result) == [(up.SKIPPED, up.BUDGET)]
+    assert setup.extractor.calls == []
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+def test_no_put_starts_once_the_extraction_has_spent_the_budget(
+    setup: Setup, module: Module, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = setup.extractor
+
+    def slow(*args: Any, **kwargs: Any) -> station_extract.ExtractResult:
+        made = real(*args, **kwargs)
+        clock.now += 50.0
+        return made
+
+    monkeypatch.setattr(station_extract, "ensure_extract", slow)
+    result = _run(setup, module, clock, budget=up.MIN_PUT_SECONDS + 40.0)
+    assert _states(result) == [(up.SKIPPED, up.BUDGET)]
+    assert module.put_requests == []
+
+
+@pytest.mark.usefixtures("token")
+@pytest.mark.parametrize(
+    ("head", "put", "reason"),
+    [
+        (httpx.Response(302, headers={"Location": "http://zz.invalid/"}), None, "status_302"),
+        (httpx.Response(204), None, "status_204"),
+        (httpx.Response(404), httpx.Response(201, json={"status": "recorded"}), "status_201"),
+        (httpx.Response(404), httpx.Response(301, headers={"Location": "/x"}), "status_301"),
+    ],
+    ids=["head-302", "head-204", "put-201", "put-301"],
+)
+def test_a_redirect_or_another_2xx_is_the_module_unavailable(
+    setup: Setup,
+    module: Module,
+    clock: FakeClock,
+    head: httpx.Response,
+    put: httpx.Response | None,
+    reason: str,
+) -> None:
+    module.heads = [head]
+    module.puts = [put]
+    result = _run(setup, module, clock)
+    assert _states(result) == [(up.UNAVAILABLE, reason)]
+    assert result.outcomes[0].text == "module unavailable"
+
+
+@pytest.mark.usefixtures("token")
+def test_an_oversized_answer_is_not_sent_again(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    module.puts = [httpx.Response(200, content=b"x" * (up.MAX_ANSWER_BYTES + 1))]
+    assert _states(_run(setup, module, clock)) == [(up.UNAVAILABLE, up.SHAPE)]
+    assert len(module.put_requests) == 1
+    assert clock.slept == []
+
+
+def test_a_status_is_forgotten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    for pid in ("ZZA", "ZZB", "ZZC"):
+        up.record_outcome("zz", up.FeedOutcome(pid, up.SENT))
+    up.forget_outcome("zz", "ZZA")
+    assert up.load_outcome("zz", "ZZA") is None
+    up.forget_outcomes_except("zz", None)
+    assert up.load_outcome("zz", "ZZB") is not None
+    up.forget_outcomes_except("zz", {"ZZB"})
+    assert up.load_outcome("zz", "ZZB") is not None
+    assert up.load_outcome("zz", "ZZC") is None
+    up.forget_outcomes_except("zz-none", {"ZZB"})  # no folder: nothing to do
+
+
+@pytest.mark.usefixtures("token")
+def test_a_slow_name_lookup_does_not_hold_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+    import time as _time
+
+    real = socket.getaddrinfo
+
+    def slow(host: Any, *args: Any, **kwargs: Any) -> Any:
+        if host in ("msmm.slowdns.invalid", b"msmm.slowdns.invalid"):
+            _time.sleep(3.0)
+            raise socket.gaierror(-2, "stand-in")
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow)
+    monkeypatch.setattr(settings, "station_module_url", "http://msmm.slowdns.invalid:8000")
+    monkeypatch.setattr(up, "HEAD_SECONDS", 0.2)
+    monkeypatch.setattr(up, "TRANSIENT_RETRIES", 0)
+    monkeypatch.setattr(up, "RESOLVER_GRACE_SECONDS", 0.2)
+    setup = Setup(tmp_path, monkeypatch, n=1)
+    started = _time.monotonic()
+    result = up.send_session_extracts(SESSION, setup.feeds, budget=60.0, record=False)
+    assert _states(result) == [(up.UNAVAILABLE, up.TIMEOUT)]
+    assert _time.monotonic() - started < 2.0

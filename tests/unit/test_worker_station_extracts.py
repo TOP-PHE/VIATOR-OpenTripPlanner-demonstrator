@@ -83,6 +83,8 @@ def test_motis_sends_before_the_station_build_wait(monkeypatch: pytest.MonkeyPat
     assert out == ("built", True, "g")
     assert rec.kw["sid"] == "zz"
     assert rec.kw["budget"] == up.BUILD_BUDGET_SECONDS
+    # No extraction starts before a graph build: only extracts already made.
+    assert rec.kw["cache_only"] is True
     assert rec.lines[0] == "[viator] station-extracts: sent=1\n"
 
 
@@ -263,3 +265,26 @@ def test_the_sessions_page_shows_the_outcome() -> None:
     assert "${feedStationExtractHTML(s.station_extract)}" in html
     assert "escHTML(x.text)" in html
     assert "escAttr(x.reason)" in html
+
+
+def test_an_upload_into_the_slot_forgets_the_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    up.record_outcome("zz", up.FeedOutcome("ZZRAIL", up.SENT))
+    up.record_outcome("zz", up.FeedOutcome("ZZOTHER", up.SENT))
+    sessions_api._forget_fetch_state_for_slot("zz", "GTFS", "zzrail.zip")
+    assert up.load_outcome("zz", "ZZRAIL") is None
+    assert up.load_outcome("zz", "ZZOTHER") is not None
+    sessions_api._forget_fetch_state_for_slot("zz", "OSM-PBF", None)
+    assert up.load_outcome("zz", "ZZOTHER") is not None
+
+
+def test_a_saved_config_forgets_the_removed_providers() -> None:
+    source = inspect.getsource(sessions_api.patch_session)
+    assert (
+        "station_extract_upload.forget_outcomes_except(sid, _provider_ids(s.config or {}))"
+        in source
+    )
+    assert sessions_api._provider_ids(_CONFIG) == {"ZZRAIL"}
+    assert sessions_api._provider_ids({"sources": "zz"}) is None

@@ -420,7 +420,18 @@ def patch_session(
             metadata={"changes": changes},
         )
     db.commit()
+    if "config" in changes:
+        # A provider removed from the session shows no station module status.
+        station_extract_upload.forget_outcomes_except(sid, _provider_ids(s.config or {}))
     return SessionResponse.from_orm_session(s)
+
+
+def _provider_ids(config: dict[str, Any]) -> set[str] | None:
+    """The session's provider ids, or None when the config cannot be read."""
+    try:
+        return {p["id"] for p in ingestion.normalize_providers(config)}
+    except ValueError:
+        return None
 
 
 @router.delete("/{sid}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1755,6 +1766,9 @@ def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | Non
     state_dir = _fetch_state_dir(sid)
     for label in _labels_writing_slot(kind, staged_filename):
         feed_fetch.state_path(state_dir, label).unlink(missing_ok=True)
+    if staged_filename and kind in ingestion.STAGE_INTO_OTP_INBOX and kind != "OSM-PBF":
+        # The station module status said what became of the file now replaced.
+        station_extract_upload.forget_outcome(sid, Path(staged_filename).stem.upper())
 
 
 async def _authorize(
