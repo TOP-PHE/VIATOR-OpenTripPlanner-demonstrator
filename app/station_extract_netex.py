@@ -412,18 +412,19 @@ def _journey(element: Element, found: _Journeys) -> None:
 
 def _keep_rail(table: dict[Any, collections.Counter[_Group]], lines: dict[str, _LineInfo]) -> None:
     """Drop the groups whose Line, read after them, says they are not rail."""
-    for key in list(table):
+    kept_table = {}
+    for key, groups in table.items():
         kept = collections.Counter(
             {
                 group: count
-                for group, count in table[key].items()
+                for group, count in groups.items()
                 if _mode_of(*_with_line(group[1], group[2], lines.get(group[0]))) is not None
             }
         )
         if kept:
-            table[key] = kept
-        else:
-            del table[key]
+            kept_table[key] = kept
+    table.clear()
+    table.update(kept_table)
 
 
 def _read_journeys(archive: _Archive) -> _Journeys:
@@ -571,7 +572,7 @@ def _read_structure(archive: _Archive, found: _Journeys) -> _Places:
         for place in assignments.get(point, ()):
             places.use.setdefault(place, _Use()).merge(calls)
     places.called = bool(use)
-    wanted = {quay for quay, _ in places.use if quay}
+    wanted = {place[0] for place in places.use if place[0]}
     places.quay_place = {q: p for q, p in quays.items() if q in wanted}
     return places
 

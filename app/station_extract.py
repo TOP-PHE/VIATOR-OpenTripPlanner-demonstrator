@@ -565,7 +565,7 @@ def _cached(path: Path, meta: _Meta) -> ExtractResult | None:
         return None
     try:
         return _describe(path, meta, Counter())
-    except (OSError, EOFError, zlib.error, gzip.BadGzipFile, ExtractError):
+    except (OSError, EOFError, zlib.error, ExtractError):  # gzip.BadGzipFile is an OSError
         log.warning("station extract cache damaged, made again: provider=%s", meta.provider_id)
         path.unlink(missing_ok=True)
         return None
@@ -739,7 +739,7 @@ def _child_main(
         conn.send(("error", exc.reason, exc.detail))
     except MemoryError:
         conn.send(("error", "resource_limit", "out of memory"))
-    except BaseException as exc:  # the parent must hear of any end
+    except Exception as exc:  # any other end is heard as a child that sent nothing
         conn.send(("error", "error", type(exc).__name__))
     finally:
         conn.close()
