@@ -10,9 +10,23 @@ This module makes that file. Its public interface is small and stable:
 
     EXTRACTOR_VERSION
     feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
-    build_extract(provider_cfg, archive_path, archive_sha256, *,
-                  extracted_at, cache_dir=None) -> ExtractResult
-    ExtractError (with a `reason` word)
+    ensure_extract(provider_cfg, archive_path, archive_sha256, *,
+                   extracted_at, session_id, cache_dir=None,
+                   wait_seconds=None) -> ExtractResult
+    ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows,
+                  bytes, body_sha256, dropped)
+    ExtractError (with a `reason` word; the only exception it raises)
+    provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)
+    warm_session_extracts(session_id, config, *, only_provider=None,
+                          upload_sha256=None)
+
+**Every caller uses `ensure_extract`** (the web process after a refresh, the
+worker before a build): it returns a valid cached extract at once, and
+otherwise makes it in a child process with a memory, processor-time and
+wall-clock limit, one at a time on the machine, so that a hostile or huge
+archive can only end that child (`resource_limit`), never the caller.
+`build_extract` is the extraction itself, in the calling process: the child
+runs it, and the tests; nothing else may call it.
 
 The form of the file is the contract of MSMM 22.2, point 6, and MSMM's
 `app/master/feed_intake.py::check_extract` is its reference: one bad item
@@ -23,20 +37,26 @@ at all (`ExtractError`).
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import gzip
 import hashlib
 import io
 import json
 import logging
 import math
+import multiprocessing
 import os
 import re
+import resource
 import tempfile
+import threading
+import time
 import zipfile
 import zlib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,7 +67,7 @@ from . import feed_fetch, ingestion, osm_geo, provider_catalogue
 from .feed_resolvers import validate_resolver
 from .settings import settings
 from .station_extract_common import ArchiveError, Station
-from .station_extract_gtfs import read_gtfs
+from .station_extract_gtfs import provider_operator, read_gtfs
 from .station_extract_netex import read_netex
 
 log = logging.getLogger(__name__)
@@ -82,8 +102,13 @@ _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 class ExtractError(Exception):
     """No extract was written. `reason` is a short word for the log and the
     admin status (never a stop, a code or a name): `no_feed_key`,
-    `unsupported_format`, `bad_archive`, `no_rail_stop`, `too_large`,
-    `too_many_rows`, `line_too_long`."""
+    `bad_sha256`, `bad_provider`, `bad_time`, `unsupported_format`,
+    `bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
+    `too_large`, `too_many_rows`, `line_too_long`, `cell_too_long`,
+    `resource_limit` (the child process passed its memory, processor-time or
+    wall-clock limit), `busy` (another extraction held the machine for longer
+    than the wait), `cache` (the cache folder cannot be written), `error`
+    (anything else)."""
 
     def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
@@ -202,7 +227,9 @@ COLUMNS = (
     "provider_provenance",
 )
 # MSMM's limits (`feed_intake.py`): past any of them MSMM refuses the whole
-# extract, so none of them is ever passed here.
+# extract, so none of them is ever passed here. They bound the file written;
+# what is read is bounded by the readers (`station_extract_common`) and the
+# child process's limits (below).
 MEGABYTE = 1024 * 1024
 TEXT_MAX = 200
 ITEMS_MAX = 500
@@ -317,9 +344,12 @@ def _station_row(station: Station, meta: _Meta, dropped: Counter[str]) -> list[s
     )
     if not operators:
         # MSMM needs one operator: a feed that names none (no agency, journeys
-        # without an operator or authority) is the provider's own.
+        # without an operator or authority) is the provider's own, marked so
+        # that no agency name can be taken for it.
         dropped["operator_from_provider"] += 1
-        operators = [meta.provider_id]
+        operators = [provider_operator(meta.provider_id)]
+    if station.codes_over_cap:
+        dropped["codes_over_cap"] += station.codes_over_cap
     codes = _capped(
         [
             item
@@ -370,34 +400,46 @@ def _write(stations: dict[str, Station], meta: _Meta, target: Path, dropped: Cou
     raise `ExtractError` before passing any of MSMM's limits."""
     rows = 0
     unpacked = 0
+    records = (
+        row
+        for key in sorted(stations)
+        if (row := _station_row(stations[key], meta, dropped)) is not None
+    )
     # mtime 0 and no file name: the same rows give the same bytes.
-    with (
-        target.open("wb") as raw,
-        gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as packed,
-    ):
-        for record in [list(COLUMNS)] + [
-            row
-            for key in sorted(stations)
-            if (row := _station_row(stations[key], meta, dropped)) is not None
-        ]:
-            if any(len(cell) > FIELD_MAX for cell in record):
-                raise ExtractError("cell_too_long", "a cell is longer than MSMM reads")
-            line = _csv_line(record)
-            if len(line) > LINE_MAX:
-                raise ExtractError("line_too_long", "a row is longer than MSMM reads")
-            data = line.encode("utf-8")
-            unpacked += len(data)
-            if unpacked > UNPACKED_MAX_BYTES:
-                raise ExtractError("too_large", "the extract unpacks past MSMM's cap")
-            rows += 1
-            if rows - 1 > MAX_ROWS:
-                raise ExtractError("too_many_rows", "more rows than MSMM takes")
-            packed.write(data)
+    with target.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as packed:
+            for record in _with_header(records):
+                rows += 1
+                unpacked += _write_record(packed, record, rows, unpacked)
+        raw.flush()
+        os.fsync(raw.fileno())
     if rows <= 1:
         raise ExtractError("no_rail_stop", "no station-level stop with a rail call")
     if target.stat().st_size > EXTRACT_MAX_BYTES:
         raise ExtractError("too_large", "the gzip file is larger than MSMM takes")
     return rows - 1
+
+
+def _with_header(records: Iterator[list[str]]) -> Iterator[list[str]]:
+    yield list(COLUMNS)
+    yield from records
+
+
+def _write_record(packed: gzip.GzipFile, record: list[str], rows: int, unpacked: int) -> int:
+    """Write one record (the `rows`-th line) and return its size in bytes;
+    refuse before passing one of MSMM's limits."""
+    if any(len(cell) > FIELD_MAX for cell in record):
+        raise ExtractError("cell_too_long", "a cell is longer than MSMM reads")
+    line = _csv_line(record)
+    if len(line) > LINE_MAX:
+        raise ExtractError("line_too_long", "a row is longer than MSMM reads")
+    data = line.encode("utf-8")
+    if unpacked + len(data) > UNPACKED_MAX_BYTES:
+        raise ExtractError("too_large", "the extract unpacks past MSMM's cap")
+    if rows - 1 > MAX_ROWS:
+        raise ExtractError("too_many_rows", "more rows than MSMM takes")
+    packed.write(data)
+    return len(data)
 
 
 # ── The provider's columns ────────────────────────────────────────────────
@@ -434,7 +476,7 @@ def _meta(
     return _Meta(
         feed_key=feed_key,
         feed_version=archive_sha256,
-        extracted_at=extracted_at.isoformat(timespec="seconds"),
+        extracted_at=extracted_at.astimezone(UTC).isoformat(timespec="seconds"),
         provider_id=provider_id,
         provider_label=_clean_label(str(provider_cfg.get("label") or ""), Counter()),
         provider_country_iso=country if _ISO2.fullmatch(country) else "",
@@ -493,13 +535,16 @@ def _cache_name(meta: _Meta) -> str:
 
 
 def _describe(path: Path, meta: _Meta, dropped: Counter[str]) -> ExtractResult:
-    """The result for a written extract: its size, sha256 and rows, read back."""
+    """The result for a written extract: its size, sha256 and rows, read back
+    (a whole gzip stream, or an exception)."""
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(MEGABYTE):
             digest.update(chunk)
     with gzip.open(path, "rb") as fh:
         rows = sum(1 for _ in fh) - 1
+    if rows < 1:
+        raise ExtractError("cache", "an extract without a row")
     return ExtractResult(
         path_gz=path,
         feed_key=meta.feed_key,
@@ -512,6 +557,20 @@ def _describe(path: Path, meta: _Meta, dropped: Counter[str]) -> ExtractResult:
     )
 
 
+def _cached(path: Path, meta: _Meta) -> ExtractResult | None:
+    """The cached extract at `path`, or None. A file that cannot be read back
+    whole (cut short by a crash, damaged) is removed, so that it is made
+    again instead of poisoning that archive for ever."""
+    if not path.is_file():
+        return None
+    try:
+        return _describe(path, meta, Counter())
+    except (OSError, EOFError, zlib.error, gzip.BadGzipFile, ExtractError):
+        log.warning("station extract cache damaged, made again: provider=%s", meta.provider_id)
+        path.unlink(missing_ok=True)
+        return None
+
+
 def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
     """Remove the provider's older extracts: one kept per provider."""
     for old in cache_dir.glob(f"{provider_id}.*.csv.gz"):
@@ -519,32 +578,41 @@ def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
             old.unlink(missing_ok=True)
 
 
-# ── The extract ───────────────────────────────────────────────────────────
+# Temporary files and archive snapshots older than this are left-overs of a
+# process that died; each warm removes them.
+STALE_SECONDS = 3600
 
 
-def build_extract(
+def _sweep(cache_dir: Path) -> None:
+    """Remove the temporary files (`.<pid>.*.tmp`) and snapshots
+    (`.<pid>.*.snap`) older than `STALE_SECONDS`."""
+    limit = time.time() - STALE_SECONDS
+    for pattern in (".*.tmp", ".*.snap"):
+        for old in cache_dir.glob(pattern):
+            with contextlib.suppress(OSError):
+                if old.stat().st_mtime < limit:
+                    old.unlink()
+
+
+# ── The extract, in the calling process ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """What an extraction needs, checked before any work."""
+
+    fmt: str
+    meta: _Meta
+    final: Path
+
+
+def _plan(
     provider_cfg: Mapping[str, Any],
     archive_path: Path,
     archive_sha256: str,
-    *,
     extracted_at: datetime,
-    cache_dir: Path | None = None,
-) -> ExtractResult:
-    """Write the stop extract of `archive_path` and return what was written.
-
-    `archive_sha256` is the sha256 of the bytes VIATOR downloaded (or that
-    the operator uploaded): `FetchResult.sha256`, kept in the fetch state as
-    `sha256`, never the sha256 of the slot file when VIATOR re-wrapped it.
-    `extracted_at` must carry its time zone.
-
-    `cache_dir` is where extracts are kept, by archive sha256 and
-    `EXTRACTOR_VERSION`: a second call for the same archive, extractor and
-    provider returns the file already there. By default it is `_extracts/`
-    of the session inbox the archive sits in (`inbox/<sid>/<subdir>/<file>`).
-
-    Raises `ExtractError` when no extract can be made or when the extract
-    would pass one of MSMM's limits: nothing is written then.
-    """
+    cache_dir: Path | None,
+) -> _Plan:
     if _SHA256.fullmatch(archive_sha256) is None:
         raise ExtractError("bad_sha256", "archive_sha256 is not 64 small hex digits")
     feed_key = feed_key_for(provider_cfg, upload_sha256=archive_sha256)
@@ -556,27 +624,35 @@ def build_extract(
         raise ExtractError("unsupported_format", "not GTFS or NeTEx")
     meta = _meta(provider_cfg, feed_key, archive_sha256, extracted_at)
     folder = cache_dir if cache_dir is not None else archive_path.parent.parent / "_extracts"
-    folder.mkdir(parents=True, exist_ok=True)
-    final = folder / _cache_name(meta)
-    if final.is_file():
-        return _describe(final, meta, Counter())
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ExtractError("cache", type(exc).__name__) from None
+    return _Plan(fmt, meta, folder / _cache_name(meta))
 
-    stations = _read_stations(fmt, archive_path, meta.provider_id)
+
+def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
+    """Read the archive and write the extract of `plan`, atomically."""
+    meta = plan.meta
+    stations = _read_stations(plan.fmt, archive_path, meta.provider_id)
     dropped: Counter[str] = Counter()
-    fd, tmp_name = tempfile.mkstemp(dir=folder, prefix=f".{meta.provider_id}.", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=plan.final.parent, prefix=f".{meta.provider_id}.", suffix=".tmp"
+    )
     os.close(fd)
     tmp = Path(tmp_name)
     try:
         rows = _write(stations, meta, tmp, dropped)
-        tmp.replace(final)
+        tmp.replace(plan.final)
     finally:
         tmp.unlink(missing_ok=True)
     del stations
-    _prune(folder, meta.provider_id, final)
-    result = _describe(final, meta, dropped)
+    _prune(plan.final.parent, meta.provider_id, plan.final)
+    result = _describe(plan.final, meta, dropped)
     log.info(
-        "station extract written: format=%s rows=%d bytes=%d dropped=%s",
-        fmt,
+        "station extract written: provider=%s format=%s rows=%d bytes=%d dropped=%s",
+        meta.provider_id,
+        plan.fmt,
         rows,
         result.bytes,
         ",".join(f"{reason}:{count}" for reason, count in sorted(dropped.items())) or "none",
@@ -584,46 +660,342 @@ def build_extract(
     return result
 
 
+def build_extract(
+    provider_cfg: Mapping[str, Any],
+    archive_path: Path,
+    archive_sha256: str,
+    *,
+    extracted_at: datetime,
+    cache_dir: Path | None = None,
+) -> ExtractResult:
+    """Make the stop extract of `archive_path` **in the calling process**:
+    for the child process of `ensure_extract` and for the tests only. Every
+    other caller uses `ensure_extract`, which bounds the memory and time an
+    archive can take.
+
+    `archive_sha256` is the sha256 of the bytes VIATOR downloaded (or that
+    the operator uploaded): `FetchResult.sha256`, kept in the fetch state as
+    `sha256`, never the sha256 of the slot file when VIATOR re-wrapped it.
+    `extracted_at` must carry its time zone (written in UTC). `cache_dir`
+    holds the extracts, by archive sha256, `EXTRACTOR_VERSION`, feed key and
+    provider columns (default: `_extracts/` of the session inbox the archive
+    sits in, `inbox/<sid>/<subdir>/<file>`); a valid cached extract is
+    returned as it is, a damaged one made again.
+
+    Raises `ExtractError` only: when no extract can be made, or when it would
+    pass one of MSMM's limits or a bound of the readers. Nothing is written
+    then.
+    """
+    try:
+        plan = _plan(provider_cfg, archive_path, archive_sha256, extracted_at, cache_dir)
+        return _cached(plan.final, plan.meta) or _make(plan, archive_path)
+    except ExtractError:
+        raise
+    except MemoryError:
+        raise ExtractError("resource_limit", "out of memory") from None
+    except Exception as exc:
+        raise ExtractError("error", type(exc).__name__) from None
+
+
+# ── The extract, in a child process ───────────────────────────────────────
+
+# The child's limits (review of pull request 4): an archive can take at most
+# this much address space, processor time and wall-clock time, and the child
+# runs at a lower priority than the web process.
+CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
+CHILD_CPU_SECONDS = 15 * 60
+CHILD_WALL_SECONDS = 20 * 60
+CHILD_NICE = 10
+# How long `ensure_extract` waits for another extraction to end by default.
+WAIT_SECONDS = CHILD_WALL_SECONDS + 60
+# One extraction at a time: in this process, and on the machine (a lock file
+# in the inbox, which the web process and the worker share).
+_ONE_HERE = threading.Lock()
+_LOCK_NAME = ".station-extract.lock"
+
+
+@dataclass(frozen=True)
+class _Limits:
+    memory: int
+    cpu: int
+    nice: int
+
+
+def _limit_self(limits: _Limits) -> None:
+    resource.setrlimit(resource.RLIMIT_AS, (limits.memory, limits.memory))
+    resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu, limits.cpu + 30))
+    os.nice(limits.nice)
+
+
+def _child_main(
+    conn: Any, target: Callable[..., ExtractResult], args: tuple[Any, ...], limits: _Limits
+) -> None:
+    """The child process: set its limits, run `target`, send back the result
+    or ("error", reason, detail)."""
+    try:
+        _limit_self(limits)
+        conn.send(("ok", target(*args)))
+    except ExtractError as exc:
+        conn.send(("error", exc.reason, exc.detail))
+    except MemoryError:
+        conn.send(("error", "resource_limit", "out of memory"))
+    except BaseException as exc:  # the parent must hear of any end
+        conn.send(("error", "error", type(exc).__name__))
+    finally:
+        conn.close()
+
+
+def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> ExtractResult:
+    """Run `target(*args)` in a fresh (spawned, never forked) child under the
+    limits above; any end of the child surfaces as a result or `ExtractError`."""
+    limits = _Limits(CHILD_MEMORY_BYTES, CHILD_CPU_SECONDS, CHILD_NICE)
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    child = context.Process(target=_child_main, args=(sender, target, args, limits), daemon=True)
+    message: Any = None
+    try:
+        child.start()
+        sender.close()
+        if receiver.poll(CHILD_WALL_SECONDS):
+            with contextlib.suppress(EOFError, OSError):
+                message = receiver.recv()
+        else:
+            message = ("error", "resource_limit", "wall-clock time")
+    except Exception as exc:
+        raise ExtractError("error", type(exc).__name__) from None
+    finally:
+        receiver.close()
+        child.join(5)
+        if child.is_alive():
+            child.kill()
+            child.join(5)
+    if message is None:
+        # The child ended without a word: killed by a limit (a signal) or worse.
+        reason = "resource_limit" if (child.exitcode or 0) < 0 else "error"
+        raise ExtractError(reason, f"the child ended with {child.exitcode}")
+    if message[0] == "ok":
+        return message[1]  # type: ignore[no-any-return]
+    raise ExtractError(message[1], message[2])
+
+
+@contextlib.contextmanager
+def _machine_lock(lock_path: Path, deadline: float) -> Iterator[None]:
+    """One extraction at a time on the machine: an exclusive lock on a file
+    the web process and the worker share; `busy` past `deadline`."""
+    if not _ONE_HERE.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise ExtractError("busy", "another extraction runs")
+    try:
+        try:
+            handle = lock_path.open("a")
+        except OSError:
+            yield  # no shared folder to lock in: one at a time in this process only
+            return
+        with handle:
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise ExtractError("busy", "another extraction runs") from None
+                    time.sleep(1)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        _ONE_HERE.release()
+
+
+def ensure_extract(
+    provider_cfg: Mapping[str, Any],
+    archive_path: Path,
+    archive_sha256: str,
+    *,
+    extracted_at: datetime,
+    session_id: str,
+    cache_dir: Path | None = None,
+    wait_seconds: float | None = None,
+) -> ExtractResult:
+    """The stop extract of `archive_path`: the one entry point for every
+    caller (the web process, the worker).
+
+    A valid cached extract (`extracts_dir(session_id)` unless `cache_dir` is
+    given) is returned at once. Otherwise the extract is made in a spawned
+    child process with `CHILD_MEMORY_BYTES` of address space,
+    `CHILD_CPU_SECONDS` of processor time, `CHILD_WALL_SECONDS` of wall-clock
+    time and a lower priority, one extraction at a time on the machine; a
+    caller that would wait more than `wait_seconds` (default
+    `WAIT_SECONDS`) for another one gets `busy`. The arguments are those of
+    `build_extract`. Raises `ExtractError` only, `resource_limit` when the
+    child passed a limit.
+    """
+    folder = cache_dir if cache_dir is not None else extracts_dir(session_id)
+    try:
+        plan = _plan(provider_cfg, archive_path, archive_sha256, extracted_at, folder)
+        cached = _cached(plan.final, plan.meta)
+        if cached is not None:
+            return cached
+        deadline = time.monotonic() + (WAIT_SECONDS if wait_seconds is None else wait_seconds)
+        with _machine_lock(settings.inbox_dir / _LOCK_NAME, deadline):
+            cached = _cached(plan.final, plan.meta)  # made while this one waited
+            if cached is not None:
+                return cached
+            args = (dict(provider_cfg), archive_path, archive_sha256)
+            return _run_child(_child_build, (*args, extracted_at, folder))
+    except ExtractError:
+        raise
+    except Exception as exc:
+        raise ExtractError("error", type(exc).__name__) from None
+
+
+def _child_build(
+    provider_cfg: dict[str, Any],
+    archive_path: Path,
+    archive_sha256: str,
+    extracted_at: datetime,
+    cache_dir: Path,
+) -> ExtractResult:
+    return build_extract(
+        provider_cfg, archive_path, archive_sha256, extracted_at=extracted_at, cache_dir=cache_dir
+    )
+
+
 # ── At refresh time ───────────────────────────────────────────────────────
 
 
-def provider_archive(
+def _same_file(fd: int, path: Path) -> bool:
+    try:
+        before, now = os.fstat(fd), path.stat()
+    except OSError:
+        return False
+    return (before.st_dev, before.st_ino) == (now.st_dev, now.st_ino)
+
+
+@contextlib.contextmanager
+def provider_archive_snapshot(
     session_id: str,
     provider_cfg: Mapping[str, Any],
     *,
     upload_sha256: str | None = None,
-) -> tuple[Path, str] | None:
+) -> Iterator[tuple[Path, str] | None]:
     """The provider's timetable slot file and the sha256 of the bytes behind
-    it, or None when there is none yet.
+    it, as a pair that cannot drift apart, or None when there is none yet.
 
     For a `url` or `nap` provider the sha256 is the one of the last download,
     kept in the fetch state (`FetchResult.sha256`, also kept on a 304); an
-    upload into the slot forgets that state, so a stale sha256 is never paired
-    with another file. For an `upload` provider it is `upload_sha256`, the
-    sha256 of the uploaded file (`Upload.sha256`)."""
+    upload into the slot forgets that state. For an `upload` provider it is
+    `upload_sha256`, the sha256 of the uploaded file (`Upload.sha256`).
+
+    The slot is opened first, the state read, and the pair used only when the
+    open file is still the one at the slot; the file is then hard-linked to a
+    snapshot (`.<pid>.<random>.snap` in the session's `_extracts/`, removed on
+    leaving), so a refresh that replaces the slot meanwhile cannot pair this
+    sha256 with another file."""
+    found = _slot_and_source(session_id, provider_cfg)
+    if found is None:
+        yield None
+        return
+    slot, source, state_name = found
+    try:
+        fd = os.open(slot, os.O_RDONLY)
+    except OSError:
+        yield None
+        return
+    snapshot: Path | None = None
+    try:
+        sha = _sha_of_source(session_id, source, state_name, upload_sha256)
+        if sha is not None and _same_file(fd, slot):
+            snapshot = _link_snapshot(fd, slot, session_id, str(provider_cfg["id"]))
+    finally:
+        os.close(fd)
+    try:
+        yield (snapshot, sha) if snapshot is not None and sha is not None else None
+    finally:
+        if snapshot is not None:
+            snapshot.unlink(missing_ok=True)
+
+
+def _slot_and_source(
+    session_id: str, provider_cfg: Mapping[str, Any]
+) -> tuple[Path, str, str] | None:
+    """The slot file of the provider, its source and its fetch-state name."""
     pid = str(provider_cfg.get("id") or "")
     timetable = provider_cfg.get("timetable")
     if not isinstance(timetable, Mapping) or _PROVIDER_ID.fullmatch(pid) is None:
         return None
     fmt = str(timetable.get("format") or "")
     details = ingestion.TIMETABLE_FORMAT_DETAILS.get(fmt)
-    if details is None:
+    source = str(timetable.get("source") or "")
+    if details is None or source not in ("url", "nap", "upload"):
         return None
-    inbox = settings.inbox_dir / session_id
-    slot = inbox / details["subdir"] / ingestion.staged_filename_for_format(pid, fmt)
-    if not slot.is_file():
-        return None
-    source = timetable.get("source")
+    slot = (
+        settings.inbox_dir
+        / session_id
+        / details["subdir"]
+        / ingestion.staged_filename_for_format(pid, fmt)
+    )
+    return slot, source, f"provider[{pid}].timetable({fmt})"
+
+
+def _sha_of_source(
+    session_id: str, source: str, state_name: str, upload_sha256: str | None
+) -> str | None:
     if source == "upload":
         sha = upload_sha256
-    elif source in ("url", "nap"):
-        state = feed_fetch.load_state(inbox / "_fetch_state", f"provider[{pid}].timetable({fmt})")
-        sha = state.get("sha256") if isinstance(state.get("sha256"), str) else None
     else:
+        state = feed_fetch.load_state(settings.inbox_dir / session_id / "_fetch_state", state_name)
+        sha = state.get("sha256") if isinstance(state.get("sha256"), str) else None
+    return sha if sha is not None and _SHA256.fullmatch(sha) else None
+
+
+def _link_snapshot(fd: int, slot: Path, session_id: str, pid: str) -> Path | None:
+    """A hard link to the open file, checked to be that very file."""
+    folder = extracts_dir(session_id)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        snapshot = folder / f".{pid}.{os.urandom(6).hex()}.snap"
+        os.link(slot, snapshot)
+    except OSError:
         return None
-    if sha is None or _SHA256.fullmatch(sha) is None:
-        return None
-    return slot, sha
+    if _same_file(fd, snapshot):
+        return snapshot
+    snapshot.unlink(missing_ok=True)
+    return None
+
+
+# What is in progress in this process: (session, provider, archive sha256).
+_IN_FLIGHT: set[tuple[str, str, str]] = set()
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _warm_one(
+    session_id: str, provider: Mapping[str, Any], upload_sha256: str | None
+) -> ExtractResult | str:
+    """The extract of one provider, or the reason word there is none."""
+    pid = str(provider.get("id") or "")
+    with provider_archive_snapshot(session_id, provider, upload_sha256=upload_sha256) as found:
+        if found is None or feed_key_for(provider, upload_sha256=found[1]) is None:
+            return "skipped"
+        archive, sha = found
+        key = (session_id, pid, sha)
+        with _IN_FLIGHT_LOCK:
+            if key in _IN_FLIGHT:
+                return "in_flight"
+            _IN_FLIGHT.add(key)
+        try:
+            return ensure_extract(
+                provider,
+                archive,
+                sha,
+                extracted_at=datetime.now(UTC),
+                session_id=session_id,
+            )
+        except ExtractError as exc:
+            return exc.reason
+        finally:
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT.discard(key)
 
 
 def warm_session_extracts(
@@ -635,30 +1007,46 @@ def warm_session_extracts(
 ) -> dict[str, ExtractResult | str]:
     """Make, or find in the cache, the extract of every provider of the session
     that has a feed key and a timetable file: provider id -> its result, or
-    the reason word when there is none. Run after a refresh or an upload
-    (FastAPI background task), so that sending the extracts later never waits
-    for one to be made. Never raises: a failure is logged as a reason word."""
+    the reason word when there is none (`skipped`, `in_flight` when the same
+    archive is being made, or an `ExtractError` reason). Run after a refresh
+    or an upload (FastAPI background task), so that sending the extracts
+    later never waits for one to be made. Never raises; one line per
+    provider in the log, with the session and provider ids and a reason
+    word."""
     outcome: dict[str, ExtractResult | str] = {}
     try:
         providers = ingestion.normalize_providers(dict(config))
     except ValueError:
+        log.info("station extract skipped: sid=%s reason=config", session_id)
         return outcome
+    with contextlib.suppress(OSError):
+        _sweep(extracts_dir(session_id))
     uploads = upload_sha256 or {}
     for provider in providers:
         pid = provider["id"]
         if only_provider is not None and pid != only_provider:
             continue
-        found = provider_archive(session_id, provider, upload_sha256=uploads.get(pid))
-        if found is None or feed_key_for(provider, upload_sha256=found[1]) is None:
-            outcome[pid] = "skipped"
-            continue
-        archive, sha = found
         try:
-            outcome[pid] = build_extract(provider, archive, sha, extracted_at=datetime.now(UTC))
-        except ExtractError as exc:
-            log.warning("station extract not written: reason=%s", exc.reason)
-            outcome[pid] = exc.reason
-        except Exception as exc:  # a background task must never die on one feed
-            log.warning("station extract failed: error=%s", type(exc).__name__)
-            outcome[pid] = "error"
+            result = _warm_one(session_id, provider, uploads.get(pid))
+        except Exception as exc:  # one provider never stops the others
+            result = "error"
+            log.warning(
+                "station extract failed: sid=%s provider=%s error=%s",
+                session_id,
+                pid,
+                type(exc).__name__,
+            )
+        outcome[pid] = result
+        if isinstance(result, ExtractResult):
+            log.info(
+                "station extract ready: sid=%s provider=%s rows=%d", session_id, pid, result.rows
+            )
+        elif result in ("skipped", "in_flight"):
+            log.info(
+                "station extract skipped: sid=%s provider=%s reason=%s", session_id, pid, result
+            )
+        else:
+            log.warning(
+                "station extract not written: sid=%s provider=%s reason=%s", session_id, pid, result
+            )
     return outcome

@@ -3,7 +3,10 @@
 Streams: every file is read row by row from the zip, never unpacked to disk
 and never held whole. What is kept in memory is bounded by the rail part of
 the feed: one entry per rail route, per rail trip, and per stop or station at
-which rail calls, never one per row of `stop_times.txt`.
+which rail calls, never one per row of `stop_times.txt`. What is read is
+bounded too: a record of at most `RECORD_MAX` characters and `FIELDS_MAX`
+fields, ids of at most `ID_MAX` characters, the unpacked bytes counted
+(`station_extract_common.open_member`); past a bound the archive is refused.
 
 Order of reading:
 
@@ -12,8 +15,10 @@ Order of reading:
 3. `trips.txt`: the trips of those routes;
 4. `stop_times.txt`: the calls of those trips, counted per stop;
 5. `stops.txt` twice: first which station each called stop belongs to (its
-   `parent_station`, or itself), then the stations' names, positions and
-   codes, with the codes of all their children (22.2, points 1 and 3).
+   `parent_station`, or itself when it has none or names one stops.txt does
+   not define), then the stations' names, positions and codes, with the codes
+   of their children (entrances and generic nodes left out); a station
+   without a position takes its first child's (22.2, points 1 and 3).
 """
 
 from __future__ import annotations
@@ -25,18 +30,37 @@ import zipfile
 from collections.abc import Iterator
 
 from .station_extract_common import (
+    MEGABYTE,
     RAIL_MAIN,
     RAIL_SUBURBAN,
     ArchiveError,
+    Budget,
     Station,
     coordinate,
     members,
+    new_station,
+    open_member,
 )
 
 _STOPS = "stops.txt"
 _REQUIRED = (_STOPS, "routes.txt", "trips.txt", "stop_times.txt")
 # The columns whose values are a stop's codes (MSMM 22.2, point 1).
 _CODE_COLUMNS = ("stop_id", "stop_code", "platform_code")
+# location_type 2 (entrance) and 3 (generic node): no codes of the station.
+_NOT_A_PLATFORM = frozenset({"2", "3"})
+# The bounds of what is read (review of pull request 4).
+RECORD_MAX = MEGABYTE
+FIELDS_MAX = 200
+ID_MAX = 255
+_ID_COLUMNS = ("stop_id", "trip_id", "route_id", "agency_id", "parent_station")
+# The distinct stops at which rail calls that are kept, platforms included.
+CALLED_STOPS_MAX = 1_000_000
+
+
+def provider_operator(provider_id: str) -> str:
+    """The operator item of a feed that names none (MSMM needs one): a
+    marker no agency name or NeTEx reference takes by chance."""
+    return f"VIATOR:provider:{provider_id}"
 
 
 def rail_mode(route_type: str) -> str | None:
@@ -56,26 +80,55 @@ def rail_mode(route_type: str) -> str | None:
     return None
 
 
-def _rows(zf: zipfile.ZipFile, member: str) -> Iterator[dict[str, str]]:
+def _lines(text: io.TextIOWrapper, size: list[int]) -> Iterator[str]:
+    """The physical lines, each read with a bound; `size[0]` counts the
+    characters of the record being built, which the reader sets back to 0
+    after each record, so that no record can grow past `RECORD_MAX` before
+    the csv module has built it (a quoted field may span lines)."""
+    while line := text.readline(RECORD_MAX + 1):
+        size[0] += len(line)
+        if size[0] > RECORD_MAX:
+            raise ArchiveError("input_too_large", "a GTFS record longer than 1 MiB")
+        yield line
+
+
+def _checked(record: list[str], header: list[str]) -> dict[str, str]:
+    if len(record) > FIELDS_MAX:
+        raise ArchiveError("input_too_large", "a GTFS record with too many fields")
+    row = {name: value.strip() for name, value in zip(header, record, strict=False)}
+    if any(len(row.get(name, "")) > ID_MAX for name in _ID_COLUMNS):
+        raise ArchiveError("input_too_large", "a GTFS id longer than 255 characters")
+    return row
+
+
+def _rows(zf: zipfile.ZipFile, member: str, budget: Budget) -> Iterator[dict[str, str]]:
     """The rows of one CSV member as {column: stripped value}, streamed. A
     byte order mark and padded headers or cells are tolerated."""
-    with zf.open(member) as raw:
+    with open_member(zf, member, budget) as raw:
         text = io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="")
-        reader = csv.reader(text)
-        header = [name.strip() for name in next(reader, [])]
+        size = [0]
+        reader = csv.reader(_lines(text, size))
+        header = next(reader, [])
+        if len(header) > FIELDS_MAX:
+            raise ArchiveError("input_too_large", "a GTFS header with too many fields")
+        header = [name.strip() for name in header]
+        size[0] = 0
         for record in reader:
+            size[0] = 0
             if record:
-                yield {name: value.strip() for name, value in zip(header, record, strict=False)}
+                yield _checked(record, header)
 
 
-def _agencies(zf: zipfile.ZipFile, files: dict[str, str]) -> tuple[dict[str, str], str]:
+def _agencies(
+    zf: zipfile.ZipFile, files: dict[str, str], budget: Budget
+) -> tuple[dict[str, str], str]:
     """Agency id -> name, and the name of the feed's only agency ('' when the
     feed names none or several)."""
     names: dict[str, str] = {}
     member = files.get("agency.txt")
     if member is None:
         return names, ""
-    for row in _rows(zf, member):
+    for row in _rows(zf, member, budget):
         name = row.get("agency_name") or row.get("agency_id") or ""
         names[row.get("agency_id", "")] = name
     only = next(iter(names.values())) if len(names) == 1 else ""
@@ -83,21 +136,23 @@ def _agencies(zf: zipfile.ZipFile, files: dict[str, str]) -> tuple[dict[str, str
 
 
 def _rail_profiles(
-    zf: zipfile.ZipFile, files: dict[str, str], provider_id: str
+    zf: zipfile.ZipFile, files: dict[str, str], provider_id: str, budget: Budget
 ) -> tuple[dict[str, int], list[tuple[str, str]]]:
     """Rail route id -> index of its (mode, operator) profile."""
-    agencies, only_agency = _agencies(zf, files)
+    agencies, only_agency = _agencies(zf, files, budget)
     profiles: list[tuple[str, str]] = []
     index: dict[tuple[str, str], int] = {}
     routes: dict[str, int] = {}
-    for row in _rows(zf, files["routes.txt"]):
+    for row in _rows(zf, files["routes.txt"], budget):
         mode = rail_mode(row.get("route_type", ""))
         if mode is None:
             continue
         agency_id = row.get("agency_id", "")
-        # The feed's only agency when the route names none; the provider
-        # itself when the feed names no agency at all (MSMM needs one item).
-        operator = agencies.get(agency_id) or only_agency or agency_id or provider_id
+        # The feed's only agency when the route names none; the provider's
+        # marker when the route has no agency at all (MSMM needs one item).
+        operator = (
+            agencies.get(agency_id) or only_agency or agency_id or provider_operator(provider_id)
+        )
         profile = (mode, operator)
         routes[row.get("route_id", "")] = index.setdefault(profile, len(profiles))
         if len(index) > len(profiles):
@@ -106,10 +161,10 @@ def _rail_profiles(
 
 
 def _rail_trips(
-    zf: zipfile.ZipFile, files: dict[str, str], routes: dict[str, int]
+    zf: zipfile.ZipFile, files: dict[str, str], routes: dict[str, int], budget: Budget
 ) -> dict[str, int]:
     trips: dict[str, int] = {}
-    for row in _rows(zf, files["trips.txt"]):
+    for row in _rows(zf, files["trips.txt"], budget):
         profile = routes.get(row.get("route_id", ""))
         if profile is not None:
             trips[row.get("trip_id", "")] = profile
@@ -117,20 +172,23 @@ def _rail_trips(
 
 
 def _calls(
-    zf: zipfile.ZipFile, files: dict[str, str], trips: dict[str, int]
+    zf: zipfile.ZipFile, files: dict[str, str], trips: dict[str, int], budget: Budget
 ) -> dict[str, collections.Counter[int]]:
     """Stop id -> rail calls by profile. A stop where a trip neither picks up
     nor drops off (both types 1) is passed, not called at."""
     calls: dict[str, collections.Counter[int]] = {}
-    for row in _rows(zf, files["stop_times.txt"]):
+    for row in _rows(zf, files["stop_times.txt"], budget):
         profile = trips.get(row.get("trip_id", ""))
         if profile is None:
             continue
         if row.get("pickup_type") == "1" and row.get("drop_off_type") == "1":
             continue
         stop_id = row.get("stop_id", "")
-        if stop_id:
-            calls.setdefault(stop_id, collections.Counter())[profile] += 1
+        if not stop_id:
+            continue
+        if stop_id not in calls and len(calls) >= CALLED_STOPS_MAX:
+            raise ArchiveError("too_many_rows", "more called stops than VIATOR keeps")
+        calls.setdefault(stop_id, collections.Counter())[profile] += 1
     return calls
 
 
@@ -139,17 +197,21 @@ def _stations(
     stops: str,
     calls: dict[str, collections.Counter[int]],
     profiles: list[tuple[str, str]],
+    budget: Budget,
+    no_parent: frozenset[str] = frozenset(),
 ) -> dict[str, Station]:
     """First pass over stops.txt: the station of each called stop (its
-    `parent_station`, or itself), with the calls, modes and operators."""
+    `parent_station`, or itself, also when its parent is in `no_parent`),
+    with the calls, modes and operators."""
     station_of: dict[str, str] = {}
-    for row in _rows(zf, stops):
+    for row in _rows(zf, stops, budget):
         stop_id = row.get("stop_id", "")
         if stop_id in calls:
-            station_of[stop_id] = row.get("parent_station") or stop_id
+            parent = row.get("parent_station", "")
+            station_of[stop_id] = parent if parent and parent not in no_parent else stop_id
     stations: dict[str, Station] = {}
     for stop_id, key in station_of.items():  # a stop stops.txt does not define is skipped
-        station = stations.setdefault(key, Station(key=key))
+        station = new_station(stations, key)
         for profile, count in calls[stop_id].items():
             mode, operator = profiles[profile]
             station.calls[mode] += count
@@ -157,27 +219,37 @@ def _stations(
     return stations
 
 
-def _add_details(zf: zipfile.ZipFile, stops: str, stations: dict[str, Station]) -> None:
+def _add_details(
+    zf: zipfile.ZipFile, stops: str, stations: dict[str, Station], budget: Budget
+) -> set[str]:
     """Second pass: the stations' names, positions and codes, then the codes
-    of their children, after the station's own."""
+    of their children, after the station's own; a station without a position
+    takes its first child's. Returns the stations stops.txt defines."""
     children: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
-    for row in _rows(zf, stops):
+    child_position: dict[str, tuple[float, float]] = {}
+    defined: set[str] = set()
+    for row in _rows(zf, stops, budget):
         stop_id = row.get("stop_id", "")
         own = stations.get(stop_id)
+        lat, lon = coordinate(row.get("stop_lat")), coordinate(row.get("stop_lon"))
         if own is not None:
-            own.place(
-                row.get("stop_name", ""),
-                coordinate(row.get("stop_lat")),
-                coordinate(row.get("stop_lon")),
-            )
+            defined.add(stop_id)
+            own.place(row.get("stop_name", ""), lat, lon)
             for name in _CODE_COLUMNS:
                 own.add_code(name, row.get(name))
         parent = row.get("parent_station", "")
-        if parent in stations and parent != stop_id:
+        if parent not in stations or parent == stop_id:
+            continue
+        if row.get("location_type", "") not in _NOT_A_PLATFORM:
             children[parent].extend((name, row.get(name, "")) for name in _CODE_COLUMNS)
+        if lat is not None and lon is not None:
+            child_position.setdefault(parent, (lat, lon))
     for key, codes in children.items():
         for name, value in codes:
             stations[key].add_code(name, value)
+    for key, (lat, lon) in child_position.items():
+        stations[key].place("", lat, lon)
+    return defined
 
 
 def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
@@ -186,14 +258,20 @@ def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
     missing = [name for name in _REQUIRED if name not in files]
     if missing:
         raise ArchiveError("bad_archive", f"GTFS without {', '.join(missing)}")
-    routes, profiles = _rail_profiles(zf, files, provider_id)
-    trips = _rail_trips(zf, files, routes) if routes else {}
+    budget = Budget()
+    routes, profiles = _rail_profiles(zf, files, provider_id, budget)
+    trips = _rail_trips(zf, files, routes, budget) if routes else {}
     del routes
-    calls = _calls(zf, files, trips) if trips else {}
+    calls = _calls(zf, files, trips, budget) if trips else {}
     del trips
     if not calls:
         return {}
-    stations = _stations(zf, files[_STOPS], calls, profiles)
-    del calls
-    _add_details(zf, files[_STOPS], stations)
+    stations = _stations(zf, files[_STOPS], calls, profiles, budget)
+    defined = _add_details(zf, files[_STOPS], stations, budget)
+    undefined = frozenset(stations) - defined
+    if undefined:
+        # A parent_station that stops.txt does not define: each of its
+        # children is its own station (22.2, point 1).
+        stations = _stations(zf, files[_STOPS], calls, profiles, budget, undefined)
+        _add_details(zf, files[_STOPS], stations, budget)
     return stations

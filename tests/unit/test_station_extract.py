@@ -461,7 +461,7 @@ def test_gtfs_without_agency_and_with_padding(tmp_path: Path) -> None:
     result = _build(_provider(), archive, tmp_path)
     rows = _msmm_check(result.path_gz, str(feed_key_for(_provider())))
     assert rows[0]["stop_key"] == "ZZ:9"
-    assert rows[0]["operators"] == "ZZRAIL"  # no agency at all: the provider
+    assert rows[0]["operators"] == "VIATOR:provider:ZZRAIL"  # no agency at all: the marker
 
 
 def test_single_agency_route_without_agency_id(tmp_path: Path) -> None:
@@ -531,7 +531,7 @@ def test_station_with_only_dropped_operators_takes_provider(tmp_path: Path) -> N
     agency = "agency_id,agency_name\nZZR,ZZ|Rail\nZZB,ZZ Bus\n"
     result = _build(_provider(), _gtfs(tmp_path, agency=agency), tmp_path)
     rows = _by_key(_msmm_check(result.path_gz, str(feed_key_for(_provider()))))
-    assert rows["ZZ:S1"]["operators"] == "ZZRAIL"
+    assert rows["ZZ:S1"]["operators"] == "VIATOR:provider:ZZRAIL"
     assert result.dropped["operator_from_provider"] == 3
 
 
@@ -557,15 +557,14 @@ def test_more_cleaning(tmp_path: Path) -> None:
 
 
 def test_netex_non_rail_journeys_dropped_early(tmp_path: Path) -> None:
-    from app.station_extract_netex import _Archive, _read_journeys, _read_lines
+    from app.station_extract_netex import _Archive, _read_journeys
 
     archive = _zip(
         tmp_path / "epip.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
     )
     with zipfile.ZipFile(archive) as zf:
         reader = _Archive(zf)
-        lines, _ = _read_lines(reader)
-        by_pattern, _ = _read_journeys(reader, lines)
+        by_pattern = _read_journeys(reader).by_pattern
     # the bus journey (own mode) and none of the line-mode ones that are not rail
     assert set(by_pattern) == {"ZZ:SJP:R", "ZZ:SJP:X"}
     bus_line = EPIP_TIMETABLE.replace(
@@ -575,8 +574,7 @@ def test_netex_non_rail_journeys_dropped_early(tmp_path: Path) -> None:
     archive = _zip(tmp_path / "b.zip", {"zz.xml": _delivery(EPIP_SITE + EPIP_SERVICE + bus_line)})
     with zipfile.ZipFile(archive) as zf:
         reader = _Archive(zf)
-        lines, _ = _read_lines(reader)
-        by_pattern, _ = _read_journeys(reader, lines)
+        by_pattern = _read_journeys(reader).by_pattern
     assert "ZZ:SJP:B" not in by_pattern  # the Line's bus mode drops it before the patterns
 
 
@@ -730,13 +728,17 @@ def test_netex_epip_extract(tmp_path: Path) -> None:
         "PublicCode=ZZC",
         "Quay/@id=ZZ:Quay:99001-1",
         "Quay/uic=9900009",
-        "@id=ZZ:StopPlace:99001-c",
+        "StopPlace/@id=ZZ:StopPlace:99001-c",
         "Quay/@id=ZZ:Quay:99001-c1",
     ]
     assert (central["lat"], central["lon"]) == ("45.1000000", "9.1000000")
     west = rows["ZZ:StopPlace:99002"]
     # the modeless journey counts at a railStation only (the fallback)
-    assert (west["n_calls"], west["modes"], west["operators"]) == ("1", "RAIL_MAIN", "ZZRAIL")
+    assert (west["n_calls"], west["modes"], west["operators"]) == (
+        "1",
+        "RAIL_MAIN",
+        "VIATOR:provider:ZZRAIL",
+    )
     assert (west["lat"], west["lon"]) == ("46.5000000", "3.0000000")  # Lambert-93 origin
     assert result.dropped["code_field"] == 2  # "bad key" and the non-ASCII type
 
@@ -843,7 +845,14 @@ def test_netex_positions() -> None:
 
     assert at('<gml:pos srsName="EPSG:4326">45.5 9.5</gml:pos>') == (45.5, 9.5)
     assert at('<gml:pos srsName="urn:ogc:def:crs:OGC:1.3:CRS84">9.5 45.5</gml:pos>') == (45.5, 9.5)
-    assert at("<gml:pos>45.5 9.5</gml:pos>") == (None, None)  # no system: no guess
+    assert at("<gml:pos>45.5 9.5</gml:pos>") == (45.5, 9.5)  # no system: WGS84, latitude first
+    assert at("<gml:pos>700000 6600000</gml:pos>") == (None, None)  # not a latitude
+    assert at('<gml:pos srsName="EPSG:4258">45.5 9.5</gml:pos>') == (45.5, 9.5)
+    assert at('<gml:pos srsName="EPSG:32154">700000 6600000</gml:pos>') == (None, None)
+    assert at('<gml:pos srsName="EPSG:21540">700000 6600000</gml:pos>') == (None, None)
+    for name in ("urn:ogc:def:crs:EPSG::2154", "http://www.opengis.net/def/crs/EPSG/0/2154"):
+        lat, lon = at(f'<gml:pos srsName="{name}">700000 6600000</gml:pos>')
+        assert (round(lat or 0, 6), round(lon or 0, 6)) == (46.5, 3.0)
     assert at('<gml:pos srsName="EPSG:4326">45.5</gml:pos>') == (None, None)
     assert at("<Longitude>x</Longitude><Latitude>45</Latitude>") == (None, None)
 
@@ -1068,7 +1077,7 @@ def test_warm_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     def boom(*args: Any, **kwargs: Any) -> None:
         raise MemoryError
 
-    monkeypatch.setattr(station_extract, "build_extract", boom)
+    monkeypatch.setattr(station_extract, "ensure_extract", boom)
     assert warm_session_extracts("s", config) == {"ZZRAIL": "error"}
 
 
