@@ -2852,9 +2852,22 @@ the extracts changes no graph build.
   the file VIATOR downloaded.
 - **When.** After "Refresh" (all providers or one) that fetched a timetable
   or found it unchanged, and after an upload attached to an upload
-  provider, in the background once the page has its answer. A big national
-  NeTEx takes a few minutes, in the `web` container; the refresh answer does
-  not wait for it, and a MOTIS build never waits for it either.
+  provider, in the background once the page has its answer. The refresh
+  answer does not wait for it, and a MOTIS build never waits for it either.
+- **How, safely.** Each extraction runs in a separate child process of the
+  `web` container, one at a time on the server, with at most 2 GiB of
+  memory, 15 minutes of processor time and 20 minutes in all, at a lower
+  priority. A broken, hostile or oversized archive can only end that child:
+  the log says `reason=resource_limit` (or `input_too_large`, below) and the
+  web process carries on. Measured times: a 290 MB GTFS in about 25 s, a
+  540 MB single-file NeTEx in about 1 minute; a national file of a few GB
+  takes some minutes.
+- **Memory of the `web` container (a proposal for the owner, not set by
+  this release).** The `web` service has no `mem_limit` today. The
+  extraction adds at most its 2 GiB cap to what `web` already uses (the
+  peaks measured were 86 to 452 MiB). If a limit is set, take the `web`
+  container's usual peak (`docker stats`) plus 2 GiB, and not less than
+  4 GiB.
 - **Where.** `/data/inbox/<sid>/_extracts/<PROVIDER>.<archive sha256>.<16 hex>.csv.gz`,
   beside `_fetch_state/`, out of the timetable folders the builds read. The
   same archive with the same extractor version is never extracted twice (the
@@ -2865,15 +2878,25 @@ the extracts changes no graph build.
   non-ASCII letter, values holding `|` or a control character, values over
   200 characters, duplicates, more than 500 codes for a station (names over
   200 characters are cut); a station without a name or a position is left
-  out. The `web` log has one line per extract, `station extract written:
-  format=… rows=… bytes=… dropped=<reason>:<count>,…`, never a name or code.
+  out. The `web` log has one line per provider, with `sid=<session>` and
+  `provider=<id>`: `station extract ready: … rows=<n>`, `station extract
+  skipped: … reason=skipped` (no file or no feed key yet) or
+  `reason=in_flight` (the same archive is being extracted), never a name or
+  code.
 - **When there is none.** A file that would pass one of the module's limits
   (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`
-  log says `station extract not written: reason=<word>` at WARNING, where the
-  word is `too_many_rows`, `too_large`, `line_too_long`, `cell_too_long`,
-  `no_rail_stop` (no rail station in the feed), `bad_archive` (the file cannot
-  be read as its declared format) or `unsupported_format`. The refresh and the
-  graph are never affected.
+  log says `station extract not written: sid=… provider=… reason=<word>` at
+  WARNING, where the word is `too_many_rows`, `too_large`, `line_too_long`,
+  `cell_too_long`, `input_too_large` (the archive passes a bound of what
+  VIATOR reads: a record or text over 1 MiB, nesting past 64, more than 4 GiB
+  unpacked from one file, …), `resource_limit` (the child passed its memory
+  or time), `busy` (another extraction held the server too long),
+  `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
+  file whose rail journeys call but which defines no stop place, as some
+  timetable-only exports do), `bad_archive` (the file cannot be read as its
+  declared format, or a NeTEx file declares an XML entity, which VIATOR
+  refuses), `unsupported_format` or `error`. The refresh and the graph are
+  never affected. A cached file found damaged (after a crash) is made again.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).

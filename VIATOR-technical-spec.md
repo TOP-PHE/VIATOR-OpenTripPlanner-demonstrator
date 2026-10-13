@@ -400,11 +400,13 @@ for the upload step:
 ```python
 EXTRACTOR_VERSION: str                                   # "viator-stop-extract-1"
 feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
-build_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at,
-              cache_dir=None) -> ExtractResult
+ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, session_id,
+               cache_dir=None, wait_seconds=None) -> ExtractResult   # the one entry point
 # ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
 #               body_sha256, dropped); ExtractError(reason) when nothing is written
+provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager
 warm_session_extracts(session_id, config, *, only_provider=None, upload_sha256=None)
+build_extract(...)   # in-process: the child of ensure_extract and the tests only
 ```
 
 - **Form**: gzip, UTF-8 without BOM, CSV, first line `format_version,feed_key,feed_version,
@@ -423,18 +425,31 @@ warm_session_extracts(session_id, config, *, only_provider=None, upload_sha256=N
   (RAIL_SUBURBAN), a call where a trip neither picks up nor drops off not counted, rolled up to the
   `parent_station`; NeTEx `TransportMode` rail on the ServiceJourney or its Line (suburban by the
   chain's submodes), a journey with no mode counted at a StopPlace whose mode is rail or type
-  `railStation`, rolled up through `ParentSiteRef`, positions from `Latitude`/`Longitude` or a
-  `gml:pos` in EPSG:4326, CRS84 or EPSG:2154.
+  `railStation` and gives no other mode, rolled up through `ParentSiteRef` to a defined StopPlace,
+  positions from `Latitude`/`Longitude` or a `gml:pos` in EPSG:4326/4258, CRS84 or EPSG:2154 (the code
+  matched exactly), or without a system (WGS84, latitude first, when the first value is ≤ 90).
 - **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072
   characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
   written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
-- **Streaming**: no archive is unpacked or held; memory follows the rail part of the feed (measured
-  with `tracemalloc` in the tests: under 2 MiB of Python allocations for 11 MiB of GTFS text and for
-  22 MiB of NeTEx XML).
+- **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
+  `RLIMIT_CPU` 15 min, 20 min wall clock, `nice 10`), one at a time on the machine (`flock` on
+  `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
+  `wait_seconds` is `busy`.
+- **Input bounds**: unpacked bytes 4 GiB a member, 8 GiB a pass; GTFS records ≤1 MiB and ≤200 fields,
+  ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
+  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
+  assignments and Quays, no entity declaration (internal ones included), no external DTD loaded;
+  ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
+- **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
+  rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
+  peak RSS 86 MiB (three passes, about 10 MB/s); the security review's hostile shapes peak at 452 MiB
+  RSS (200,000 stations with 100-character ids) or are refused within the first MiB. A national file
+  of a few GB takes some minutes, inside the child's 15 minutes.
 - **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
   key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts`, queued as a
   FastAPI background task by `POST /api/sessions/{sid}/sources/refresh`,
-  `POST /api/sessions/{sid}/providers/{pid}/refresh` and an upload to an `upload` provider.
+  `POST /api/sessions/{sid}/providers/{pid}/refresh` and an upload to an `upload` provider. A damaged
+  cached file is removed and made again; `.tmp`/`.snap` left-overs older than an hour are swept.
 
 ---
 
