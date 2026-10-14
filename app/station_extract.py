@@ -727,10 +727,13 @@ def _failure(final: Path, fmt: str) -> dict[str, Any] | None:
 def _remembered(final: Path, fmt: str) -> str | None:
     """The reason remembered for the extract `final` read as `fmt`, or None."""
     record = _failure(final, fmt)
-    reason = record.get("reason") if record is not None else None
+    if record is None:
+        return None
+    reason = record.get("reason")
     if not isinstance(reason, str) or reason not in _REMEMBERABLE:
         return None
-    walls = record.get("walls", WALL_CLOCK_TRIES) if record is not None else 0
+    # Only a wall-clock stop carries a count; any other failure counts at once.
+    walls = record.get("walls", WALL_CLOCK_TRIES)
     if not isinstance(walls, int) or walls < WALL_CLOCK_TRIES:
         return None  # one wall-clock stop only: tried again
     return reason

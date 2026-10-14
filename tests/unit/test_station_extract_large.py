@@ -90,7 +90,7 @@ def test_the_bounds_are_the_documented_ones() -> None:
     assert station_extract_common.RATIO_FLOOR_BYTES == 64 * MIB
     assert station_extract_common.MEMBER_MAX_BYTES == 160 * GIB
     assert station_extract_common.ARCHIVE_MAX_BYTES == 160 * GIB
-    assert {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED} == station_extract_common.PACKINGS
+    assert sorted(station_extract_common.PACKINGS) == [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
 
 
 def test_member_bound() -> None:
@@ -1133,6 +1133,27 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     _ensure(archive, lock_dir)
     _ensure(archive, lock_dir)
     assert child.runs == 4
+
+
+@pytest.mark.parametrize(
+    ("record", "remembered"),
+    [
+        ({"reason": "bad_archive"}, "bad_archive"),  # no count: at once
+        ({"reason": "resource_limit", "walls": 1}, None),  # one wall-clock stop
+        ({"reason": "resource_limit", "walls": 2}, "resource_limit"),
+        ({"reason": "resource_limit", "walls": "2"}, None),
+        ({"reason": "bad_archive", "format": "netex_epip"}, None),  # another format
+        ({"reason": "busy"}, None),
+    ],
+)
+def test_the_branches_of_a_remembered_record(
+    tmp_path: Path, record: dict[str, Any], remembered: str | None
+) -> None:
+    final = tmp_path / "ZZRAIL.zz.csv.gz"
+    full = {"limits": station_extract._limits_signature(), "format": "gtfs", **record}
+    station_extract._failed_path(final).write_text(json.dumps(full))
+    assert station_extract._remembered(final, "gtfs") == remembered
+    assert station_extract._remembered(tmp_path / "none.csv.gz", "gtfs") is None
 
 
 def test_a_damaged_marker_is_not_a_failure(

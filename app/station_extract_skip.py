@@ -228,9 +228,9 @@ class SkipFilter:
             index = buffer.find(mark, index + 1, stop)
         return index - 1 if index >= 0 else -1
 
-    def _search(self, key: str, position: int, limit: int, found: int, searched: int) -> int:
-        """Keep and give the result of a search from `position` up to
-        `limit`: `found` (or -1), and how far nothing was found."""
+    def _search(self, key: str, found: int, searched: int) -> int:
+        """Keep and give the result of a search: `found` (or -1), and how
+        far nothing was found (`searched`)."""
         self._found[key] = found
         self._searched[key] = searched if found < 0 else found
         return found
@@ -256,12 +256,12 @@ class SkipFilter:
             return known
         if key == "end":
             found = self._tag(buffer, self._close_tag, position, len(buffer))
-            return self._search(key, position, limit, found, len(buffer))
+            return self._search(key, found, len(buffer))
         if key == "start":
             found = self._tag(buffer, self._open_tag, position, limit)
         else:
             found = self._markup(buffer, 0x21 if key == "!" else 0x3F, position, limit)
-        return self._search(key, position, limit, found, limit)
+        return self._search(key, found, limit)
 
     def _in_cut(self, buffer: bytes, position: int, final: bool) -> tuple[int, bool]:
         """Inside a dropped element: the next end tag of its name, unless a
