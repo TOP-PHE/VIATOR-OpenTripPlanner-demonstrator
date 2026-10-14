@@ -223,8 +223,9 @@ def test_only_stored_or_deflated_members(tmp_path: Path, packing: int) -> None:
         for name, data in files.items():
             zf.writestr(name, data, compress_type=packing if name == "stop_times.txt" else None)
     assert _reason(_provider(), other, tmp_path) == "bad_archive"
+    provider, folder = _provider(), tmp_path / "d"
     with pytest.raises(ExtractError) as refused:
-        build_extract(_provider(), other, SHA_A, extracted_at=WHEN, cache_dir=tmp_path / "d")
+        build_extract(provider, other, SHA_A, extracted_at=WHEN, cache_dir=folder)
     assert refused.value.detail == "a member neither stored nor deflated"
     xml = tmp_path / "x.zip"
     with zipfile.ZipFile(xml, "w") as zf:
