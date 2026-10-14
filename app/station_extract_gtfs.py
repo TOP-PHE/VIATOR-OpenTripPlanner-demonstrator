@@ -119,14 +119,7 @@ def _lines(text: io.TextIOWrapper, size: list[int]) -> Iterator[str]:
         block = text.read(_TEXT_BLOCK)
         if block:
             block = carry + block
-            if _OTHER_BREAKS.search(block) is None:
-                lines = block.splitlines(keepends=True)
-                carry = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
-            else:
-                lines = _PHYSICAL.findall(block)
-                carry = block[sum(map(len, lines)) :]
-            if not carry and lines and lines[-1].endswith("\r"):
-                carry = lines.pop()  # perhaps the first half of a `\r\n`
+            lines, carry = _split(block)
         elif carry:
             block, lines, carry = carry, [carry], ""
         else:
@@ -134,13 +127,33 @@ def _lines(text: io.TextIOWrapper, size: list[int]) -> Iterator[str]:
         if size[0] == 0 and '"' not in block and max(map(len, lines), default=0) <= RECORD_MAX:
             yield from lines
         else:
-            for line in lines:
-                size[0] += len(line)
-                if size[0] > RECORD_MAX:
-                    raise ArchiveError("input_too_large", _TOO_LONG)
-                yield line
+            yield from _counted(lines, size)
         if len(carry) > RECORD_MAX:
             raise ArchiveError("input_too_large", _TOO_LONG)
+
+
+def _split(block: str) -> tuple[list[str], str]:
+    """The whole physical lines of `block`, and what is left after them (a
+    line not ended yet, or a last `\r` that may be the first half of a
+    `\r\n`)."""
+    if _OTHER_BREAKS.search(block) is None:
+        lines = block.splitlines(keepends=True)
+        carry = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
+    else:
+        lines = _PHYSICAL.findall(block)
+        carry = block[sum(map(len, lines)) :]
+    if not carry and lines and lines[-1].endswith("\r"):
+        carry = lines.pop()
+    return lines, carry
+
+
+def _counted(lines: list[str], size: list[int]) -> Iterator[str]:
+    """The lines one at a time, each added to the record's size."""
+    for line in lines:
+        size[0] += len(line)
+        if size[0] > RECORD_MAX:
+            raise ArchiveError("input_too_large", _TOO_LONG)
+        yield line
 
 
 class _Columns:
@@ -280,23 +293,31 @@ def _calls(
             if len(record) != width:
                 _check(record, columns)
                 places = _call_places(columns, len(record))
-            else:
-                for place in ids:  # `_check`, inlined for the common case
-                    if len(record[place]) > ID_MAX:
-                        _check(record, columns)
+            elif any(len(record[place]) > ID_MAX for place in ids):
+                _check(record, columns)  # inlined for the common case: only a long one
             # Most rows are not rail: their other columns are not looked at.
             profile = trips.get(_value(record, places[0]))
-            if profile is None:
-                continue
-            stop_id = _value(record, places[1])
-            if _value(record, places[2]) == "1" and _value(record, places[3]) == "1":
-                continue
-            if not stop_id:
-                continue
-            if stop_id not in calls and len(calls) >= CALLED_STOPS_MAX:
-                raise ArchiveError("too_many_rows", "more called stops than VIATOR keeps")
-            calls.setdefault(stop_id, collections.Counter())[profile] += 1
+            if profile is not None:
+                _add_call(calls, record, places, profile)
     return calls
+
+
+def _add_call(
+    calls: dict[str, collections.Counter[int]],
+    record: list[str],
+    places: list[int | None],
+    profile: int,
+) -> None:
+    """A rail trip's row: a call at its stop, unless the trip passes it
+    without stopping (pick-up and drop-off both type 1) or names none."""
+    stop_id = _value(record, places[1])
+    if _value(record, places[2]) == "1" and _value(record, places[3]) == "1":
+        return
+    if not stop_id:
+        return
+    if stop_id not in calls and len(calls) >= CALLED_STOPS_MAX:
+        raise ArchiveError("too_many_rows", "more called stops than VIATOR keeps")
+    calls.setdefault(stop_id, collections.Counter())[profile] += 1
 
 
 _CALL_COLUMNS = ("trip_id", "stop_id", "pickup_type", "drop_off_type")

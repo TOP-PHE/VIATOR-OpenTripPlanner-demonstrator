@@ -134,27 +134,31 @@ class SkipFilter:
             if self._quote is not None:
                 end = buffer.find(self._quote, position)
                 if end < 0:
-                    self._previous = buffer[-1]
-                    return len(buffer), False
+                    break
                 self._quote = None
                 position = end + 1
                 continue
             match = _TAG_END.search(buffer, position)
             if match is None:
-                self._previous = buffer[-1]
-                return len(buffer), False
+                break
             index = match.start()
-            if buffer[index] != 0x3E:  # a quote opens
-                self._quote = buffer[index : index + 1]
-                position = index + 1
-                continue
-            before = buffer[index - 1] if index > 0 else self._previous
-            self._in_tag = False
-            if before != 0x2F:  # not `/>`: the element is open
-                self._depth += 1
-            if self._depth == 0:
-                self._cutting = False
-            return index + 1, True
+            if buffer[index] == 0x3E:
+                return self._tag_closed(buffer, index), True
+            self._quote = buffer[index : index + 1]  # a quoted value opens
+            position = index + 1
+        self._previous = buffer[-1]
+        return len(buffer), False
+
+    def _tag_closed(self, buffer: bytes, index: int) -> int:
+        """The `>` at `index` ends the start tag: the element is open unless
+        it was `/>`. Returns where to go on."""
+        before = buffer[index - 1] if index > 0 else self._previous
+        self._in_tag = False
+        if before != 0x2F:  # not `/>`: the element is open
+            self._depth += 1
+        if self._depth == 0:
+            self._cutting = False
+        return index + 1
 
     @staticmethod
     def _tag(buffer: bytes, needle: bytes, start: int, stop: int) -> int:

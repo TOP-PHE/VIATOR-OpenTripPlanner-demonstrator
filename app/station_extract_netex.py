@@ -330,6 +330,45 @@ class _Builder:
             self.texts[-1].append(data)
 
 
+class _Feeder:
+    """Feeds one member to expat: the prolog as it is, `_PROLOG_PIECE` bytes
+    at a time until the root element begins (so that the filter takes over
+    close after the root's tag), then everything through `SkipFilter`."""
+
+    def __init__(self, parser: Any, builder: _Builder, skipped: frozenset[str]) -> None:
+        self.parser = parser
+        self.builder = builder
+        self.skipped = skipped
+        self.skip: SkipFilter | None = None
+        self.window = b""  # the last bytes fed while the root element was not seen
+        self.fed = 0
+
+    def _note(self, name: str) -> None:
+        if name in _ALL:
+            self.builder.seen.add(name)
+
+    def _parse(self, data: bytes) -> None:
+        self.parser.Parse(data, False)
+        self.fed += len(data)
+
+    def feed(self, chunk: bytes) -> None:
+        while self.skip is None and chunk:
+            piece, chunk = chunk[:_PROLOG_PIECE], chunk[_PROLOG_PIECE:]
+            self.window = self.window[-_CHUNK:] + piece
+            self._parse(piece)
+            if self.builder.root_index is not None:
+                start = self.builder.root_index - (self.fed - len(self.window))
+                prefix = root_prefix(self.window, start)
+                self.skip = SkipFilter(self.skipped, prefix, self._note)
+        if self.skip is not None and chunk:
+            self._parse(self.skip.feed(chunk))
+
+    def finish(self) -> None:
+        if self.skip is not None:
+            self._parse(self.skip.finish())
+        self.parser.Parse(b"", True)
+
+
 def _walk(
     source: IO[bytes], targets: frozenset[str], seen: set[str], skipped: frozenset[str]
 ) -> Iterator[Element]:
@@ -340,37 +379,15 @@ def _walk(
     byte goes to expat as it is."""
     parser = _parser()
     builder = _Builder(parser, targets, seen)
-    skip: SkipFilter | None = None
-    window = b""  # the last bytes fed while the root element was not seen
-
-    def note(name: str) -> None:
-        if name in _ALL:
-            seen.add(name)
-
-    fed = 0
+    feeder = _Feeder(parser, builder, skipped)
     try:
         while chunk := source.read(_CHUNK):
-            # Until the root element begins, expat gets `_PROLOG_PIECE` bytes at
-            # a time, so that the filter takes over close after the root's tag.
-            while skip is None and chunk:
-                piece, chunk = chunk[:_PROLOG_PIECE], chunk[_PROLOG_PIECE:]
-                window = window[-_CHUNK:] + piece
-                parser.Parse(piece, False)
-                fed += len(piece)
-                if builder.root_index is not None:
-                    start = builder.root_index - (fed - len(window))
-                    skip = SkipFilter(skipped, root_prefix(window, start), note)
-            if skip is not None and chunk:
-                chunk = skip.feed(chunk)
-                parser.Parse(chunk, False)
-                fed += len(chunk)
-            if fed - builder.last_event > XML_TOKEN_MAX:
+            feeder.feed(chunk)
+            if feeder.fed - builder.last_event > XML_TOKEN_MAX:
                 raise ArchiveError("input_too_large", "an XML token over 2 MiB")
             yield from builder.ready
             builder.ready.clear()
-        if skip is not None:
-            parser.Parse(skip.finish(), False)
-        parser.Parse(b"", True)
+        feeder.finish()
     except expat.ExpatError as exc:
         raise ArchiveError("bad_archive", f"XML not well-formed at line {exc.lineno}") from None
     yield from builder.ready

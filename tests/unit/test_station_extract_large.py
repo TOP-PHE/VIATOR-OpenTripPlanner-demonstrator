@@ -222,8 +222,8 @@ def test_the_pass_budget_counts_every_read(tmp_path: Path) -> None:
         with station_extract_common.open_member(zf, "stops.txt", budget) as fh:
             fh.read()
         with (
-            pytest.raises(ArchiveError, match="input_too_large"),
             station_extract_common.open_member(zf, "stops.txt", budget) as fh,
+            pytest.raises(ArchiveError, match="input_too_large"),
         ):
             fh.read()
 

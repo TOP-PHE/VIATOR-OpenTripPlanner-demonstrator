@@ -619,6 +619,8 @@ REMEMBERED_REASONS = frozenset(
     }
 )
 _FAILED_SUFFIX = ".failed"
+# The detail of a `resource_limit` the child met by running out of memory.
+OUT_OF_MEMORY = "out of memory"
 _FAILED_MAX_BYTES = 1024
 
 
@@ -626,7 +628,7 @@ def _remembered_detail(error: ExtractError) -> bool:
     """A `resource_limit` the same archive meets again: out of memory, or the
     processor-time signal (SIGXCPU); never the wall clock."""
     return error.reason == "resource_limit" and error.detail in (
-        "out of memory",
+        OUT_OF_MEMORY,
         f"the child ended with {-signal.SIGXCPU}",
     )
 
@@ -820,7 +822,7 @@ def build_extract(
     except ExtractError:
         raise
     except MemoryError:
-        raise ExtractError("resource_limit", "out of memory") from None
+        raise ExtractError("resource_limit", OUT_OF_MEMORY) from None
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
 
@@ -891,7 +893,7 @@ def _child_main(
     except ExtractError as exc:
         conn.send(("error", exc.reason, exc.detail))
     except MemoryError:
-        conn.send(("error", "resource_limit", "out of memory"))
+        conn.send(("error", "resource_limit", OUT_OF_MEMORY))
     except Exception as exc:  # any other end is heard as a child that sent nothing
         conn.send(("error", "error", type(exc).__name__))
     finally:
