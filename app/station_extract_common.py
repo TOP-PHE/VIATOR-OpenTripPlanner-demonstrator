@@ -9,6 +9,27 @@ The readers bound what they read, not only what they write (review of pull
 request 4): the bytes unpacked from each member and from the archive, the
 size of a record, the number of stations and of codes per station. Past a
 bound they raise `ArchiveError`; nothing grows with a hostile input.
+
+**The unpacked bytes.** Nothing is ever written unpacked: every member is
+streamed, so the bytes a member unpacks to cost processor time, not disk or
+memory, and the child process's processor-time limit
+(`station_extract.CHILD_CPU_SECONDS`) is the last stop. The bounds below stop
+a zip bomb early and accept a national feed (a NeTEx of 2 GB zipped unpacks
+to some 40 GB, a GTFS `stop_times.txt` to several GB):
+
+- a member may unpack to at most `RATIO_MAX` (200) times its packed size
+  (`RATIO_FLOOR_BYTES` at least, so that a small member is never refused).
+  Timetable XML and CSV pack 5 to 30 times, the most regular ones some 60
+  times; deflate reaches about 1,000 times, which only a crafted member
+  does. A bomb is cut at 200 times the bytes really in the archive;
+- a member and one reading pass at most 64 GiB (`MEMBER_MAX_BYTES`,
+  `ARCHIVE_MAX_BYTES`): 1.6 times the largest national feed known, and
+  more than the child reads in its processor time anyway.
+
+Both are checked twice: first on the sizes the zip's central directory
+declares (`check_declared`), so an archive that says it is too large is
+refused at once, before any reading; then on the bytes really unpacked (a
+header can lie).
 """
 
 from __future__ import annotations
@@ -27,9 +48,11 @@ RAIL_SUBURBAN = "RAIL_SUBURBAN"
 MEGABYTE = 1024 * 1024
 GIGABYTE = 1024 * MEGABYTE
 # The bytes unpacked from one member, and from the whole archive in one
-# reading pass. A national feed is a few GB unpacked; a zip bomb stops here.
-MEMBER_MAX_BYTES = 4 * GIGABYTE
-ARCHIVE_MAX_BYTES = 8 * GIGABYTE
+# reading pass (see the module's text for the numbers).
+MEMBER_MAX_BYTES = 64 * GIGABYTE
+ARCHIVE_MAX_BYTES = 64 * GIGABYTE
+RATIO_MAX = 200
+RATIO_FLOOR_BYTES = 64 * MEGABYTE
 # The stations a reader keeps (MSMM takes 200,000 rows), and the raw codes of
 # one station it keeps (MSMM takes 500; twice that leaves room for the codes
 # cleaning drops, the rest is counted).
@@ -109,6 +132,30 @@ def members(zf: zipfile.ZipFile) -> dict[str, str]:
     return found
 
 
+def member_bound(info: zipfile.ZipInfo) -> int:
+    """The most bytes the member `info` may unpack to: `RATIO_MAX` times its
+    packed size, at least `RATIO_FLOOR_BYTES`, at most `MEMBER_MAX_BYTES`."""
+    return min(MEMBER_MAX_BYTES, max(RATIO_FLOOR_BYTES, RATIO_MAX * info.compress_size))
+
+
+_TOO_LARGE_MEMBER = "a member unpacks past VIATOR's bound"
+_TOO_LARGE_ARCHIVE = "the archive unpacks past VIATOR's bound"
+
+
+def check_declared(zf: zipfile.ZipFile, names: list[str]) -> None:
+    """Refuse at once, before reading, an archive whose central directory
+    declares a member of `names` larger than its bound, or more bytes in
+    all than one reading pass takes."""
+    total = 0
+    for name in names:
+        info = zf.getinfo(name)
+        if info.file_size > member_bound(info):
+            raise ArchiveError("input_too_large", _TOO_LARGE_MEMBER)
+        total += info.file_size
+    if total > ARCHIVE_MAX_BYTES:
+        raise ArchiveError("input_too_large", _TOO_LARGE_ARCHIVE)
+
+
 class Budget:
     """The bytes unpacked in one reading pass of an archive."""
 
@@ -119,11 +166,13 @@ class Budget:
 
 class _Counted(io.RawIOBase):
     """A zip member that counts the bytes really unpacked (a header can lie)
-    and refuses past `MEMBER_MAX_BYTES` or the pass's budget."""
+    and refuses past the member's bound (`member_bound`) or the pass's
+    budget."""
 
-    def __init__(self, raw: IO[bytes], budget: Budget) -> None:
+    def __init__(self, raw: IO[bytes], budget: Budget, limit: int) -> None:
         self._raw = raw
         self._budget = budget
+        self._limit = limit
         self._used = 0
 
     def readable(self) -> bool:
@@ -133,8 +182,10 @@ class _Counted(io.RawIOBase):
         data = self._raw.read(len(buffer))
         self._used += len(data)
         self._budget.used += len(data)
-        if self._used > MEMBER_MAX_BYTES or self._budget.used > self._budget.total:
-            raise ArchiveError("input_too_large", "the archive unpacks past VIATOR's bound")
+        if self._used > self._limit:
+            raise ArchiveError("input_too_large", _TOO_LARGE_MEMBER)
+        if self._budget.used > self._budget.total:
+            raise ArchiveError("input_too_large", _TOO_LARGE_ARCHIVE)
         buffer[: len(data)] = data
         return len(data)
 
@@ -144,8 +195,10 @@ class _Counted(io.RawIOBase):
 
 
 def open_member(zf: zipfile.ZipFile, name: str, budget: Budget) -> IO[bytes]:
-    """A member of `zf`, read through the byte counter of `budget`."""
-    return io.BufferedReader(_Counted(zf.open(name), budget), MEGABYTE)
+    """A member of `zf`, read through the byte counter of `budget` and the
+    member's own bound."""
+    info = zf.getinfo(name)
+    return io.BufferedReader(_Counted(zf.open(info), budget, member_bound(info)), MEGABYTE)
 
 
 def coordinate(text: str | None) -> float | None:

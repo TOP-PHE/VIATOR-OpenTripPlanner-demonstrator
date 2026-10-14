@@ -8,6 +8,15 @@ bounded too: a record of at most `RECORD_MAX` characters and `FIELDS_MAX`
 fields, ids of at most `ID_MAX` characters, the unpacked bytes counted
 (`station_extract_common.open_member`); past a bound the archive is refused.
 
+`stop_times.txt`, by far the largest file (some 100 million rows in a
+national feed), is read by column position (`_Columns`): the same csv
+records as every other file, but no dictionary per row and only its four
+columns looked at, about four times faster; the rows of other files are
+read as dictionaries (`_rows`). Both see the same records and the same
+bounds, and give the same values: a column named twice in a header counts
+by its last place within the record, as a dictionary built from the record
+has it.
+
 Order of reading:
 
 1. `agency.txt`: agency id -> name (the operators, 22.2 point 1);
@@ -24,8 +33,10 @@ Order of reading:
 from __future__ import annotations
 
 import collections
+import contextlib
 import csv
 import io
+import re
 import zipfile
 from collections.abc import Iterator
 
@@ -36,6 +47,7 @@ from .station_extract_common import (
     ArchiveError,
     Budget,
     Station,
+    check_declared,
     coordinate,
     members,
     new_station,
@@ -80,30 +92,89 @@ def rail_mode(route_type: str) -> str | None:
     return None
 
 
+# The physical lines as `readline` of a text stream opened with `newline=""`
+# returns them: ended by `\r\n`, `\r` or `\n`, the ending kept.
+_PHYSICAL = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)")
+# `str.splitlines` splits there too, and also at these, faster: it is used on
+# a block that holds none of them.
+_OTHER_BREAKS = re.compile("[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+_TEXT_BLOCK = 256 * 1024  # characters read at a time
+_TOO_LONG = "a GTFS record longer than 1 MiB"
+
+
 def _lines(text: io.TextIOWrapper, size: list[int]) -> Iterator[str]:
-    """The physical lines, each read with a bound; `size[0]` counts the
-    characters of the record being built, which the reader sets back to 0
-    after each record, so that no record can grow past `RECORD_MAX` before
-    the csv module has built it (a quoted field may span lines)."""
-    while line := text.readline(RECORD_MAX + 1):
-        size[0] += len(line)
-        if size[0] > RECORD_MAX:
-            raise ArchiveError("input_too_large", "a GTFS record longer than 1 MiB")
-        yield line
+    """The physical lines, bounded; `size[0]` counts the characters of the
+    record being built, which the reader sets back to 0 after each record,
+    so that no record can grow past `RECORD_MAX` before the csv module has
+    built it (a quoted field may span lines).
+
+    The text is read a block at a time and split in C. A block without a
+    quote character, whose lines all fit the bound, and that begins a record
+    (`size[0]` is 0) is handed over as it is: without a quote every line is
+    a whole record, so each line's bound is the record's. Any other block
+    goes a line at a time with the count. The lines, and when a record is
+    refused, are those of `readline(RECORD_MAX + 1)`."""
+    carry = ""
+    while True:
+        block = text.read(_TEXT_BLOCK)
+        if block:
+            block = carry + block
+            if _OTHER_BREAKS.search(block) is None:
+                lines = block.splitlines(keepends=True)
+                carry = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
+            else:
+                lines = _PHYSICAL.findall(block)
+                carry = block[sum(map(len, lines)) :]
+            if not carry and lines and lines[-1].endswith("\r"):
+                carry = lines.pop()  # perhaps the first half of a `\r\n`
+        elif carry:
+            block, lines, carry = carry, [carry], ""
+        else:
+            return
+        if size[0] == 0 and '"' not in block and max(map(len, lines), default=0) <= RECORD_MAX:
+            yield from lines
+        else:
+            for line in lines:
+                size[0] += len(line)
+                if size[0] > RECORD_MAX:
+                    raise ArchiveError("input_too_large", _TOO_LONG)
+                yield line
+        if len(carry) > RECORD_MAX:
+            raise ArchiveError("input_too_large", _TOO_LONG)
 
 
-def _checked(record: list[str], header: list[str]) -> dict[str, str]:
-    if len(record) > FIELDS_MAX:
-        raise ArchiveError("input_too_large", "a GTFS record with too many fields")
-    row = {name: value.strip() for name, value in zip(header, record, strict=False)}
-    if any(len(row.get(name, "")) > ID_MAX for name in _ID_COLUMNS):
-        raise ArchiveError("input_too_large", "a GTFS id longer than 255 characters")
-    return row
+class _Columns:
+    """Where the columns of a header are, for records of any length: the
+    value of a column is the one a dictionary built from the record (zip of
+    header and record) would hold, its last place within the record."""
+
+    def __init__(self, header: list[str]) -> None:
+        self.width = len(header)
+        self._places: dict[str, list[int]] = {}
+        for place, name in enumerate(header):
+            self._places.setdefault(name, []).append(place)
+        self._ids = {name: self._places[name] for name in _ID_COLUMNS if name in self._places}
+        self.full_ids = self.id_places(self.width)
+
+    def place(self, name: str, length: int) -> int | None:
+        """The place of `name` in a record of `length` fields, or None."""
+        for place in reversed(self._places.get(name, ())):
+            if place < length:
+                return place
+        return None
+
+    def id_places(self, length: int) -> list[int]:
+        found = (self.place(name, length) for name in self._ids)
+        return [place for place in found if place is not None]
 
 
-def _rows(zf: zipfile.ZipFile, member: str, budget: Budget) -> Iterator[dict[str, str]]:
-    """The rows of one CSV member as {column: stripped value}, streamed. A
-    byte order mark and padded headers or cells are tolerated."""
+@contextlib.contextmanager
+def _csv_member(
+    zf: zipfile.ZipFile, member: str, budget: Budget
+) -> Iterator[tuple[list[str], Iterator[list[str]], list[int]]]:
+    """The stripped header of one CSV member, the csv reader of its records
+    and the record size its caller sets back to 0 after each record. A byte
+    order mark and padded headers or cells are tolerated."""
     with open_member(zf, member, budget) as raw:
         text = io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="")
         size = [0]
@@ -111,12 +182,32 @@ def _rows(zf: zipfile.ZipFile, member: str, budget: Budget) -> Iterator[dict[str
         header = next(reader, [])
         if len(header) > FIELDS_MAX:
             raise ArchiveError("input_too_large", "a GTFS header with too many fields")
-        header = [name.strip() for name in header]
         size[0] = 0
+        yield [name.strip() for name in header], reader, size
+
+
+def _check(record: list[str], columns: _Columns) -> None:
+    """The field count and the length of the ids (stripped) of a record."""
+    length = len(record)
+    if length > FIELDS_MAX:
+        raise ArchiveError("input_too_large", "a GTFS record with too many fields")
+    places = columns.full_ids if length == columns.width else columns.id_places(length)
+    for place in places:
+        value = record[place]
+        if len(value) > ID_MAX and len(value.strip()) > ID_MAX:
+            raise ArchiveError("input_too_large", "a GTFS id longer than 255 characters")
+
+
+def _rows(zf: zipfile.ZipFile, member: str, budget: Budget) -> Iterator[dict[str, str]]:
+    """The non-empty rows of one CSV member as {column: stripped value},
+    streamed and checked against the bounds."""
+    with _csv_member(zf, member, budget) as (header, reader, size):
+        columns = _Columns(header)
         for record in reader:
             size[0] = 0
             if record:
-                yield _checked(record, header)
+                _check(record, columns)
+                yield {name: value.strip() for name, value in zip(header, record, strict=False)}
 
 
 def _agencies(
@@ -177,19 +268,46 @@ def _calls(
     """Stop id -> rail calls by profile. A stop where a trip neither picks up
     nor drops off (both types 1) is passed, not called at."""
     calls: dict[str, collections.Counter[int]] = {}
-    for row in _rows(zf, files["stop_times.txt"], budget):
-        profile = trips.get(row.get("trip_id", ""))
-        if profile is None:
-            continue
-        if row.get("pickup_type") == "1" and row.get("drop_off_type") == "1":
-            continue
-        stop_id = row.get("stop_id", "")
-        if not stop_id:
-            continue
-        if stop_id not in calls and len(calls) >= CALLED_STOPS_MAX:
-            raise ArchiveError("too_many_rows", "more called stops than VIATOR keeps")
-        calls.setdefault(stop_id, collections.Counter())[profile] += 1
+    with _csv_member(zf, files["stop_times.txt"], budget) as (header, reader, size):
+        columns = _Columns(header)
+        width, ids = columns.width, columns.full_ids
+        full = _call_places(columns, width)
+        for record in reader:
+            size[0] = 0
+            if not record:
+                continue
+            places = full
+            if len(record) != width:
+                _check(record, columns)
+                places = _call_places(columns, len(record))
+            else:
+                for place in ids:  # `_check`, inlined for the common case
+                    if len(record[place]) > ID_MAX:
+                        _check(record, columns)
+            # Most rows are not rail: their other columns are not looked at.
+            profile = trips.get(_value(record, places[0]))
+            if profile is None:
+                continue
+            stop_id = _value(record, places[1])
+            if _value(record, places[2]) == "1" and _value(record, places[3]) == "1":
+                continue
+            if not stop_id:
+                continue
+            if stop_id not in calls and len(calls) >= CALLED_STOPS_MAX:
+                raise ArchiveError("too_many_rows", "more called stops than VIATOR keeps")
+            calls.setdefault(stop_id, collections.Counter())[profile] += 1
     return calls
+
+
+_CALL_COLUMNS = ("trip_id", "stop_id", "pickup_type", "drop_off_type")
+
+
+def _call_places(columns: _Columns, length: int) -> list[int | None]:
+    return [columns.place(name, length) for name in _CALL_COLUMNS]
+
+
+def _value(record: list[str], place: int | None) -> str:
+    return record[place].strip() if place is not None else ""
 
 
 def _stations(
@@ -260,6 +378,7 @@ def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
     missing = [name for name in _REQUIRED if name not in files]
     if missing:
         raise ArchiveError("bad_archive", f"GTFS without {', '.join(missing)}")
+    check_declared(zf, [files[name] for name in ("agency.txt", *_REQUIRED) if name in files])
     budget = Budget()
     routes, profiles = _rail_profiles(zf, files, provider_id, budget)
     trips = _rail_trips(zf, files, routes, budget) if routes else {}
