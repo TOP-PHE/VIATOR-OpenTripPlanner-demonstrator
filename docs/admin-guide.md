@@ -2863,16 +2863,23 @@ the extracts changes no graph build.
   either.
 - **How, safely.** Each extraction runs in a separate child process of the
   `web` container, one at a time on the server, with at most 2 GiB of
-  memory, 25 minutes of processor time and 30 minutes in all, at a lower
+  memory, 40 minutes of processor time and 45 minutes in all, at a lower
   priority, and it dies with the web process. A broken, hostile or oversized
   archive can only end that child: the log says `reason=resource_limit` (or
   `input_too_large`, below) and the web process carries on. At the module's
   200,000-row cap the child was measured at about 830 MiB (GTFS) and
-  730 MiB (NeTEx): the 2 GiB cap leaves some 2.4 times that. 25 minutes of
-  processor time leave room for a `stop_times.txt` of 3 to 4 GB (about
-  12 MB/s), which would be close to 15. Measured times: a 290 MB GTFS in about 25 s, a
-  540 MB single-file NeTEx in about 1 minute; a national file of a few GB
-  takes some minutes.
+  730 MiB (NeTEx): the 2 GiB cap leaves some 2.4 times that.
+- **National feeds.** Nothing is unpacked to disk: the archive is read as a
+  stream, so a national feed costs processor time only. A NeTEx reads at
+  about 60 MB of unpacked XML a second (the passing times, calendars and
+  links, most of the bytes, are skipped without being parsed), a GTFS at
+  about 0.7 million stop times a second (measured on synthetic national
+  shapes, one core; `scripts/bench_station_extract.py`). So a national
+  NeTEx of 2 GB zipped (some 40 GB unpacked) takes about 11 minutes, a
+  GTFS of 100 million stop times under 3; memory stays at a few hundred
+  MiB. The extracts are made from the smallest timetable file to the
+  largest, so the small feeds of a session are ready within minutes of a
+  refresh, before the national ones.
 - **Memory of the `web` container (a proposal for the owner, not set by
   this release).** The `web` service has no `mem_limit` today. The
   extraction adds at most its 2 GiB cap to what `web` already uses (peaks
@@ -2911,15 +2918,28 @@ the extracts changes no graph build.
   log says `station extract not written: sid=… provider=… reason=<word>` at
   WARNING, where the word is `too_many_rows`, `too_large`, `line_too_long`,
   `cell_too_long`, `input_too_large` (the archive passes a bound of what
-  VIATOR reads: a record or text over 1 MiB, nesting past 64, more than 4 GiB
-  unpacked from one file, …), `resource_limit` (the child passed its memory
-  or time), `busy` (another extraction held the server too long),
+  VIATOR reads: a file in it that unpacks to more than 200 times its packed
+  size or past 64 GiB, which only a zip bomb or a damaged file does — real
+  timetables pack 5 to 30 times, a national feed of tens of GB is read; a
+  record or text over 1 MiB, nesting past 64, …), `resource_limit` (the
+  child passed its memory or time), `busy` (another extraction held the
+  server too long),
   `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
   file whose rail journeys call but which defines no stop place, as some
   timetable-only exports do), `bad_archive` (the file cannot be read as its
   declared format, or a NeTEx file declares an XML entity, which VIATOR
   refuses), `unsupported_format` or `error`. The refresh and the graph are
   never affected. A cached file found damaged (after a crash) is made again.
+- **A failure is remembered.** When the same file would fail again the same
+  way (`bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
+  a module limit, or the child out of memory or processor time), VIATOR
+  keeps the reason in `_extracts/<PROVIDER>.<sha256>.<16 hex>.csv.gz.failed`
+  and does not read that file again: every later pass shows the same reason
+  at once. It is read again when a new file is downloaded, when VIATOR's
+  extractor or one of its bounds changes (a new release), or after you
+  delete that `.failed` file. A child stopped by its wall clock (a busy
+  server), `busy` and `error` are never remembered: the next pass tries
+  again.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).
@@ -2946,7 +2966,8 @@ provider's slot.
   process with limited memory and time, 11.4). **Before a rebuild only an
   extract already made is sent**: no extraction starts there, so none can
   run during the graph build; a feed without one shows "skipped
-  not_cached" and is sent after the next refresh. A file already sent is never sent again; a new download, or a
+  not_cached" (*waiting for its extract; sent at the next pass*) and is
+  sent by the next pass once its extract is made. A file already sent is never sent again; a new download, or a
   new version of the extractor, is. A derived (cross-border filter)
   provider sends nothing: its national feed is sent by its own session.
 - **How long.** Before a rebuild the sending takes at most 5 minutes; the
@@ -2957,7 +2978,12 @@ provider's slot.
   tries (at most 40 s): the feeds after it are marked "module unavailable"
   without a call; so does a 404 to an upload (a module without the intake
   calls). After a refresh nothing waits on it: it may take up to 30
-  minutes in the background. Those refresh passes wait in the `web`
+  minutes in the background. The feeds whose extract is ready go first,
+  then the others from the smallest file to the largest: a national feed
+  whose extraction is still running when the 30 minutes end is the only
+  one "skipped budget"; its extraction goes on, the extracts of the
+  remaining feeds are still made in the background, and the next refresh
+  or rebuild sends them. Those refresh passes wait in the `web`
   process's memory: a restart of `web` loses the ones not done yet, and
   the next rebuild or refresh sends again.
 - **The graph is always built.** The module unreachable, older than these
@@ -2981,8 +3007,15 @@ provider's slot.
   | sent | the module recorded the extract as a new version |
   | already held | the module already had this file's extract (nothing sent, or the upload answered "unchanged") |
   | refused `<reason>` | the module refused the extract, with its reason word (`row`, `header`, `duplicate_stop`, `size`, `token` for a token the module refuses (`STATION_MODULE_TOKEN` is not its `MSMM_INTERNAL_TOKEN`), `source_taken`, …): see the module's runbook; the next refresh or rebuild tries again, and the module refuses it the same way until the file, the extractor or the module changes |
-  | skipped | nothing sent: no file in the slot yet, no feed key (a derived provider), no extract could be made (the reason word is in the tooltip: `too_large`, `no_rail_stop`, `resource_limit` when the extraction passed its memory or time limit, `busy` when another extraction held the machine too long, …), not yet made before a rebuild (`not_cached`: sent after the next refresh), the file in the slot not the one its download recorded (`no_snapshot`, `archive_changed`: a refresh replaced it meanwhile; sent by the next pass), or the time was spent (`budget`) |
-  | module unavailable | the module did not take it: unreachable (`network`), too slow (`timeout`), busy, its half-hour limit reached (`extract_window`), a 404 (a module older than these calls), a 5xx, a redirect or another unexpected answer (a wrong `STATION_MODULE_URL` or a proxy in the way), an answer of the wrong form (`shape`); the word is in the tooltip; sent again at the next refresh or rebuild |
+  | skipped | nothing sent: no file in the slot yet (`no_archive`), no feed key (`no_feed_key`, a derived provider), no extract could be made (`too_large`, `no_rail_stop`, `input_too_large`, `resource_limit` when the extraction passed its memory or time limit, `busy` when another extraction held the machine too long, …), not yet made before a rebuild (`not_cached`: sent by the next pass once made), the file in the slot not the one its download recorded (`no_snapshot`, `archive_changed`: a refresh replaced it meanwhile; sent by the next pass), or the time was spent (`budget`) |
+  | module unavailable | the module did not take it: unreachable (`network`), too slow (`timeout`), busy, its half-hour limit reached (`extract_window`), a 404 (a module older than these calls), a 5xx, a redirect or another unexpected answer (a wrong `STATION_MODULE_URL` or a proxy in the way), an answer of the wrong form (`shape`); sent again at the next refresh or rebuild |
+
+  Beside a "skipped" or "module unavailable" text the reason word is shown
+  (for example `skipped input_too_large`), and under it a short sentence
+  saying what it means (for example *the archive unpacks past VIATOR's
+  bounds (a zip bomb, or a damaged file)*, *waiting for its extract; sent
+  at the next pass*). The sentences are fixed texts of VIATOR, never a
+  file name, an address or a value of the feed.
 
   The rebuild job's log has one line per rebuild:
   `[viator] station-extracts: sent=1 held=4 …`. The `web` and `worker`

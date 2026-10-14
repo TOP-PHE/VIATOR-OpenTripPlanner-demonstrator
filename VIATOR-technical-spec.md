@@ -384,7 +384,7 @@ The build pipeline materializes this config:
 - The `refresh_sources` endpoint downloads each feed → `inbox/<sid>/gtfs/<id_lower>.zip`.
 - The `otp-build` entrypoint scans `gtfs/*.zip` and generates a `build-config.json` with one `transitFeeds` entry per file (feedId = filename stem, uppercased).
 
-**Stop extracts to the station module (MSMM 22.3, D-R15 A; `app/station_extract_upload.py`).** Every session, OTP or MOTIS, sends the station module one rail-only stop extract per feed version (made by `app/station_extract.py`). When: after every refresh (`refresh_sources`, `refresh_provider`; queued for one sender thread of the web process, 30-minute budget) and at the start of every rebuild job in the worker, before the MOTIS station build wait (5-minute budget, cached extracts only: `ensure_extract(..., cache_only=True)`, `skipped not_cached` otherwise; a MOTIS rebuild can wait about 35 minutes in all before its build starts). Per provider with a feed key: `HEAD /internal/v1/feeds/{feed_key}/{sha256}?extractor_version=<v>` (the archive's sha256 is the downloaded bytes', from the fetch state, or the upload's); on 404 the extract comes from `station_extract.ensure_extract` (cached by archive sha256 and extractor version, else made in a resource-limited child process, one at a time; waited for at most until the budget ends; its reasons are skips) and is `PUT` to `/internal/v1/feeds/{feed_key}/extract` as `application/gzip`, streamed from its file with its `Content-Length`. Headers: the machine token, `Accept-Encoding: identity`, `X-Viator-Session-Id: <sid>`; no user id. Per-call deadline 10 s / 120 s (`asyncio.timeout`); `Retry-After` honoured for 503 `busy` and 429 `extract_window` within the budget (each pause ≥1 s, ≤6 waits a call, ≤120 s); no answer after the retries, or a PUT 404, marks the feeds left unavailable without a call; 408/5xx/timeouts tried twice more; other 4xx are refusals, logged with their reason word. A failure never blocks a refresh or a graph build. The last outcome per provider (sent / already held / refused <reason> / skipped / module unavailable) is kept in `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` and shown in the feed-status panel; no migration. The module keeps a new feed `pending` until an administrator accepts it there.
+**Stop extracts to the station module (MSMM 22.3, D-R15 A; `app/station_extract_upload.py`).** Every session, OTP or MOTIS, sends the station module one rail-only stop extract per feed version (made by `app/station_extract.py`). When: after every refresh (`refresh_sources`, `refresh_provider`; queued for one sender thread of the web process, 30-minute budget) and at the start of every rebuild job in the worker, before the MOTIS station build wait (5-minute budget, cached extracts only: `ensure_extract(..., cache_only=True)`, `skipped not_cached` otherwise; a MOTIS rebuild can wait about 35 minutes in all before its build starts). Per provider with a feed key: `HEAD /internal/v1/feeds/{feed_key}/{sha256}?extractor_version=<v>` (the archive's sha256 is the downloaded bytes', from the fetch state, or the upload's); on 404 the extract comes from `station_extract.ensure_extract` (cached by archive sha256 and extractor version, else made in a resource-limited child process, one at a time; waited for at most until the budget ends; its reasons are skips) and is `PUT` to `/internal/v1/feeds/{feed_key}/extract` as `application/gzip`, streamed from its file with its `Content-Length`. Headers: the machine token, `Accept-Encoding: identity`, `X-Viator-Session-Id: <sid>`; no user id. Per-call deadline 10 s / 120 s (`asyncio.timeout`); `Retry-After` honoured for 503 `busy` and 429 `extract_window` within the budget (each pause ≥1 s, ≤6 waits a call, ≤120 s); no answer after the retries, or a PUT 404, marks the feeds left unavailable without a call; 408/5xx/timeouts tried twice more; other 4xx are refusals, logged with their reason word. A failure never blocks a refresh or a graph build. Order: the feeds whose outcome needs no extraction first (an extract, or a remembered failure, in the cache), then from the smallest timetable file to the largest, so one national extraction never keeps the small feeds of a pass waiting; it alone ends `skipped budget`, goes on, and is sent at the next pass. The last outcome per provider (sent / already held / refused <reason> / skipped / module unavailable) is kept in `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` and shown in the feed-status panel with the reason word and a fixed sentence saying what it means (`REASON_TEXTS`); no migration. The module keeps a new feed `pending` until an administrator accepts it there.
 
 The worker has an APScheduler-style cron that pulls fresh files on the configured cadence and feeds them through the same dispatcher as a manual upload would. Audit rows mark the actor as `system:auto-pull`.
 
@@ -436,11 +436,13 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is
   written; over the item and text limits the value is dropped or the label cut, counted in `dropped`.
 - **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
-  `RLIMIT_CPU` 25 min, 30 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
+  `RLIMIT_CPU` 40 min, 45 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
   one at a time on the machine (`flock` on
   `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
   `wait_seconds` is `busy`.
-- **Input bounds**: unpacked bytes 4 GiB a member, 8 GiB a pass; GTFS records ≤1 MiB and ≤200 fields,
+- **Input bounds**: a member unpacks to at most 200 times its packed size (64 MiB at least) and
+  64 GiB, a reading pass to 64 GiB, checked first on the sizes the central directory declares (refused
+  before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
   ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
   tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
   assignments and Quays, no entity declaration (internal ones included), no external DTD loaded;
@@ -449,8 +451,19 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
   peak RSS 86 MiB (three passes, about 10 MB/s); at the 200,000-row cap about 830 MiB RSS (GTFS) and
   730 MiB (NeTEx), some 2.4 times under `RLIMIT_AS`; hostile shapes are refused within the first MiB.
-  A national file of a few GB takes some minutes; `RLIMIT_CPU` is 25 minutes because a 3–4 GB
-  `stop_times.txt` (about 12 MB/s) would be close to 15.
+  Large archives (`scripts/bench_station_extract.py`, synthetic national shapes, one core): the NeTEx
+  reader drops from the raw bytes, before expat, every element no pass reads (passing times,
+  calendars, links, …; `app/station_extract_skip.py`), and the GTFS reader reads `stop_times.txt` by
+  column position: a NeTEx of 4 GB unpacked with 200,000 StopPlaces in 67 s (about 60 MB/s; before,
+  304 s), peak RSS 198 MiB; a GTFS of 40 million stop times in 57 s (before, 127 s), peak RSS
+  100 MiB. A national NeTEx of 2 GB zipped (~40 GB unpacked) takes about 11 minutes, so
+  `RLIMIT_CPU` is 40 minutes (twice an archive packing 30 times, on a slower core).
+- **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,
+  `no_stop_place`, `no_rail_stop`, the MSMM limits, a `resource_limit` of memory or processor time)
+  is kept as `<cache name>.failed` with the signature of every bound; the next caller (cache-only
+  too) gets the reason at once until the archive, the extractor or a bound changes. The warm makes
+  the smallest timetable files first; a send pass sends first the feeds that need no extraction,
+  then by file size.
 - **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
   key and provider columns>.csv.gz`, one per provider; filled by `warm_session_extracts` on one
   dedicated thread of the web process (`queue_warm`: a bounded queue of 64 jobs, a job already waiting
