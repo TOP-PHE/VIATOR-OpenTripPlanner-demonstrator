@@ -17,19 +17,27 @@ memory, and the child process's processor-time limit
 a zip bomb early and accept a national feed (a NeTEx of 2 GB zipped unpacks
 to some 40 GB, a GTFS `stop_times.txt` to several GB):
 
-- a member may unpack to at most `RATIO_MAX` (200) times its packed size
-  (`RATIO_FLOOR_BYTES` at least, so that a small member is never refused).
-  Timetable XML and CSV pack 5 to 30 times, the most regular ones some 60
-  times; deflate reaches about 1,000 times, which only a crafted member
-  does. A bomb is cut at 200 times the bytes really in the archive;
-- a member and one reading pass at most 64 GiB (`MEMBER_MAX_BYTES`,
-  `ARCHIVE_MAX_BYTES`): 1.6 times the largest national feed known, and
-  more than the child reads in its processor time anyway.
+- a member is stored or deflated (`PACKINGS`): bzip2 and lzma pack a run of
+  the same bytes tens of thousands of times, deflate at most about 1,000
+  times; another packing is `bad_archive`;
+- a member read may unpack to at most `RATIO_MAX` (200) times its packed
+  size (`RATIO_FLOOR_BYTES` at least, so that a small member is never
+  refused). Timetable XML and CSV pack 5 to 30 times, the most regular ones
+  some 60 times; only a crafted member nears deflate's 1,000;
+- the members read together may unpack to at most 200 times the packed
+  bytes of the whole archive (64 MiB at least), so that many small members
+  cannot each use the floor;
+- a member and one reading pass at most 160 GiB (`MEMBER_MAX_BYTES`,
+  `ARCHIVE_MAX_BYTES`): a national NeTEx of 2 GB zipped packing 33 times is
+  some 66 GB, and the child reads about 60 MB/s, so its 40 minutes of
+  processor time end near 150 GB anyway.
 
-Both are checked twice: first on the sizes the zip's central directory
-declares (`check_declared`), so an archive that says it is too large is
-refused at once, before any reading; then on the bytes really unpacked (a
-header can lie).
+The members a reader never reads (a PDF, a readme beside the timetable) are
+never checked. Every bound is checked first on the sizes the zip's central
+directory declares (`check_declared`), so an archive that says it is too
+large is refused at once, before any reading; zipfile never gives more bytes
+of a member than its declared size (and checks its CRC), and the bytes really
+unpacked are counted all the same.
 """
 
 from __future__ import annotations
@@ -49,10 +57,12 @@ MEGABYTE = 1024 * 1024
 GIGABYTE = 1024 * MEGABYTE
 # The bytes unpacked from one member, and from the whole archive in one
 # reading pass (see the module's text for the numbers).
-MEMBER_MAX_BYTES = 64 * GIGABYTE
-ARCHIVE_MAX_BYTES = 64 * GIGABYTE
+MEMBER_MAX_BYTES = 160 * GIGABYTE
+ARCHIVE_MAX_BYTES = 160 * GIGABYTE
 RATIO_MAX = 200
 RATIO_FLOOR_BYTES = 64 * MEGABYTE
+# The packings of a member VIATOR reads: stored, deflated.
+PACKINGS = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 # The stations a reader keeps (MSMM takes 200,000 rows), and the raw codes of
 # one station it keeps (MSMM takes 500; twice that leaves room for the codes
 # cleaning drops, the rest is counted).
@@ -142,17 +152,28 @@ _TOO_LARGE_MEMBER = "a member unpacks past VIATOR's bound"
 _TOO_LARGE_ARCHIVE = "the archive unpacks past VIATOR's bound"
 
 
+def archive_bound(zf: zipfile.ZipFile) -> int:
+    """The most bytes the members read together may unpack to: `RATIO_MAX`
+    times the packed bytes of the whole archive, at least
+    `RATIO_FLOOR_BYTES`, at most `ARCHIVE_MAX_BYTES`."""
+    packed = sum(info.compress_size for info in zf.infolist())
+    return min(ARCHIVE_MAX_BYTES, max(RATIO_FLOOR_BYTES, RATIO_MAX * packed))
+
+
 def check_declared(zf: zipfile.ZipFile, names: list[str]) -> None:
     """Refuse at once, before reading, an archive whose central directory
-    declares a member of `names` larger than its bound, or more bytes in
-    all than one reading pass takes."""
+    declares a member of `names` packed otherwise than stored or deflated
+    (`bad_archive`), larger than its bound, or more bytes in all than the
+    archive's bound (`input_too_large`)."""
     total = 0
     for name in names:
         info = zf.getinfo(name)
+        if info.compress_type not in PACKINGS:
+            raise ArchiveError("bad_archive", "a member packed otherwise than deflate")
         if info.file_size > member_bound(info):
             raise ArchiveError("input_too_large", _TOO_LARGE_MEMBER)
         total += info.file_size
-    if total > ARCHIVE_MAX_BYTES:
+    if total > archive_bound(zf):
         raise ArchiveError("input_too_large", _TOO_LARGE_ARCHIVE)
 
 

@@ -75,7 +75,7 @@ from .station_extract_common import (
     new_station,
     open_member,
 )
-from .station_extract_skip import SkipFilter, root_prefix
+from .station_extract_skip import SkipFilter, root_prefix, start_tag_end
 
 # A rail submode that MSMM's offline chain reads as suburban rail (its
 # `nap_modes.py`, `_SUBURBAN_SUBMODES`), compared in small letters.
@@ -330,16 +330,28 @@ class _Builder:
             self.texts[-1].append(data)
 
 
+class _Pass:
+    """No filter: every byte to expat (a root start tag too long to see)."""
+
+    def feed(self, data: bytes) -> bytes:
+        return data
+
+    def finish(self) -> bytes:
+        return b""
+
+
 class _Feeder:
     """Feeds one member to expat: the prolog as it is, `_PROLOG_PIECE` bytes
     at a time until the root element begins (so that the filter takes over
-    close after the root's tag), then everything through `SkipFilter`."""
+    close after the root's tag), then everything through `SkipFilter`, which
+    first reads the bytes expat parsed after the root's start tag (a token
+    boundary) to know its state."""
 
     def __init__(self, parser: Any, builder: _Builder, skipped: frozenset[str]) -> None:
         self.parser = parser
         self.builder = builder
         self.skipped = skipped
-        self.skip: SkipFilter | None = None
+        self.skip: SkipFilter | _Pass | None = None
         self.window = b""  # the last bytes fed while the root element was not seen
         self.fed = 0
 
@@ -351,15 +363,23 @@ class _Feeder:
         self.parser.Parse(data, False)
         self.fed += len(data)
 
+    def _filter(self) -> SkipFilter | _Pass:
+        """The filter, primed with what expat parsed after the root's tag."""
+        start = self.builder.root_index - (self.fed - len(self.window))  # type: ignore[operator]
+        end = start_tag_end(self.window, start) if start >= 0 else None
+        if end is None:
+            return _Pass()
+        skip = SkipFilter(self.skipped, root_prefix(self.window, start), self._note)
+        skip.prime(self.window[end:])
+        return skip
+
     def feed(self, chunk: bytes) -> None:
         while self.skip is None and chunk:
             piece, chunk = chunk[:_PROLOG_PIECE], chunk[_PROLOG_PIECE:]
             self.window = self.window[-_CHUNK:] + piece
             self._parse(piece)
             if self.builder.root_index is not None:
-                start = self.builder.root_index - (self.fed - len(self.window))
-                prefix = root_prefix(self.window, start)
-                self.skip = SkipFilter(self.skipped, prefix, self._note)
+                self.skip = self._filter()
         if self.skip is not None and chunk:
             self._parse(self.skip.feed(chunk))
 

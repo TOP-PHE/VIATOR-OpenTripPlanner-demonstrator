@@ -32,7 +32,8 @@ failure that the same archive would meet again (`REMEMBERED_REASONS`) is
 remembered beside the cache, so that a national archive that cannot be
 extracted is not read again by the next caller (the send pass after the
 warm thread, the next refresh): its reason is given at once, until the
-archive, the extractor or one of the bounds changes.
+archive, the provider's format, the extractor, one of the bounds or the
+readers' code changes.
 `build_extract` is the extraction itself, in the calling process: the child
 runs it, and the tests; nothing else may call it.
 
@@ -49,6 +50,7 @@ import contextlib
 import csv
 import ctypes
 import fcntl
+import functools
 import gzip
 import hashlib
 import io
@@ -61,6 +63,7 @@ import queue
 import re
 import resource
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -82,6 +85,7 @@ from . import (
     station_extract_common,
     station_extract_gtfs,
     station_extract_netex,
+    station_extract_skip,
 )
 from .feed_resolvers import validate_resolver
 from .settings import settings
@@ -604,8 +608,10 @@ def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
 
 # The reasons the same archive would give again, read by the same extractor
 # under the same bounds: remembered, so that it is not read again. A child
-# past its wall clock (a busy machine) or killed from outside is not: the
-# next pass tries again. `busy`, `cache` and `error` are never remembered.
+# killed from outside is not; one past its wall clock (a busy machine) is
+# remembered only the second time in a row (`WALL_CLOCK_TRIES`), so that a
+# national archive does not hold the machine 45 minutes at every pass.
+# `busy`, `cache` and `error` are never remembered.
 REMEMBERED_REASONS = frozenset(
     {
         "bad_archive",
@@ -619,23 +625,53 @@ REMEMBERED_REASONS = frozenset(
     }
 )
 _FAILED_SUFFIX = ".failed"
-# The detail of a `resource_limit` the child met by running out of memory.
+# The details of a `resource_limit`: the child out of memory, past its wall
+# clock.
 OUT_OF_MEMORY = "out of memory"
+WALL_CLOCK = "wall-clock time"
+WALL_CLOCK_TRIES = 2
 _FAILED_MAX_BYTES = 1024
+# The code an extraction runs: a change to any of these files (a reader
+# fixed without a new `EXTRACTOR_VERSION`) makes every remembered failure
+# be tried again.
+_READER_MODULES = (
+    station_extract_common,
+    station_extract_gtfs,
+    station_extract_netex,
+    station_extract_skip,
+)
 
 
 def _remembered_detail(error: ExtractError) -> bool:
     """A `resource_limit` the same archive meets again: out of memory, or the
-    processor-time signal (SIGXCPU); never the wall clock."""
+    processor-time signal (SIGXCPU)."""
     return error.reason == "resource_limit" and error.detail in (
         OUT_OF_MEMORY,
         f"the child ended with {-signal.SIGXCPU}",
     )
 
 
+def _wall_clock(error: ExtractError) -> bool:
+    return error.reason == "resource_limit" and error.detail == WALL_CLOCK
+
+
+@functools.cache
+def _code_signature() -> str:
+    """The sha256 of the extraction's own code (this module and the readers),
+    or of their names when a file cannot be read."""
+    digest = hashlib.sha256()
+    for module in (sys.modules[__name__], *_READER_MODULES):
+        try:
+            digest.update(Path(str(module.__file__)).read_bytes())
+        except OSError:
+            digest.update(module.__name__.encode())
+    return digest.hexdigest()
+
+
 def _limits_signature() -> str:
-    """The 16 hex of every bound an extraction runs under: a remembered
-    failure counts only under the bounds it was met with."""
+    """The 16 hex of every bound an extraction runs under, and of its code:
+    a remembered failure counts only under the bounds and code it was met
+    with."""
     common, gtfs, netex = station_extract_common, station_extract_gtfs, station_extract_netex
     bounds = [
         common.MEMBER_MAX_BYTES,
@@ -657,9 +693,11 @@ def _limits_signature() -> str:
         netex.QUAYS_MAX,
         CHILD_MEMORY_BYTES,
         CHILD_CPU_SECONDS,
+        CHILD_WALL_SECONDS,
         MAX_ROWS,
         EXTRACT_MAX_BYTES,
         UNPACKED_MAX_BYTES,
+        _code_signature(),
     ]
     return _sixteen_hex(json.dumps(bounds))
 
@@ -668,30 +706,51 @@ def _failed_path(final: Path) -> Path:
     return final.with_name(final.name + _FAILED_SUFFIX)
 
 
-def _remembered(final: Path) -> str | None:
-    """The reason remembered for the extract `final`, or None (none, of
-    other bounds, or unreadable)."""
+def _failure(final: Path, fmt: str) -> dict[str, Any] | None:
+    """The failure recorded for the extract `final` read as `fmt`, when it
+    was met under the current bounds and code; else None (none, other
+    bounds, another format, unreadable)."""
     try:
         with _failed_path(final).open("rb") as fh:
             record = json.loads(fh.read(_FAILED_MAX_BYTES))
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("limits") != _limits_signature():
+    if (
+        not isinstance(record, dict)
+        or record.get("limits") != _limits_signature()
+        or record.get("format") != fmt
+    ):
         return None
-    reason = record.get("reason")
-    return reason if isinstance(reason, str) and reason in _REMEMBERABLE else None
+    return record
+
+
+def _remembered(final: Path, fmt: str) -> str | None:
+    """The reason remembered for the extract `final` read as `fmt`, or None."""
+    record = _failure(final, fmt)
+    reason = record.get("reason") if record is not None else None
+    if not isinstance(reason, str) or reason not in _REMEMBERABLE:
+        return None
+    walls = record.get("walls", WALL_CLOCK_TRIES) if record is not None else 0
+    if not isinstance(walls, int) or walls < WALL_CLOCK_TRIES:
+        return None  # one wall-clock stop only: tried again
+    return reason
 
 
 _REMEMBERABLE = REMEMBERED_REASONS | {"resource_limit"}
 
 
-def _remember(final: Path, provider_id: str, error: ExtractError) -> None:
+def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> None:
     """Keep the reason of a failure the same archive would meet again, in
-    place of the provider's older files. Best-effort."""
-    if error.reason not in REMEMBERED_REASONS and not _remembered_detail(error):
+    place of the provider's older files; a wall-clock stop is counted, and
+    remembered from the `WALL_CLOCK_TRIES`-th in a row. Best-effort."""
+    record: dict[str, Any] = {"reason": error.reason, "limits": _limits_signature(), "format": fmt}
+    if _wall_clock(error):
+        before = _failure(final, fmt)
+        walls = before.get("walls") if before is not None else None
+        record["walls"] = (walls if isinstance(walls, int) else 0) + 1
+    elif error.reason not in REMEMBERED_REASONS and not _remembered_detail(error):
         return
     target = _failed_path(final)
-    record = {"reason": error.reason, "limits": _limits_signature()}
     try:
         fd, tmp_name = tempfile.mkstemp(dir=final.parent, prefix=f".{provider_id}.", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -915,7 +974,7 @@ def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> E
             with contextlib.suppress(EOFError, OSError):
                 message = receiver.recv()
         else:
-            message = ("error", "resource_limit", "wall-clock time")
+            message = ("error", "resource_limit", WALL_CLOCK)
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
     finally:
@@ -1001,7 +1060,7 @@ def ensure_extract(
             try:
                 return _run_child(_child_build, (*args, extracted_at, folder))
             except ExtractError as exc:
-                _remember(plan.final, plan.meta.provider_id, exc)
+                _remember(plan.final, plan.meta.provider_id, plan.fmt, exc)
                 raise
     except _Known as known:
         if known.result is not None:
@@ -1029,7 +1088,7 @@ def _known(plan: _Plan) -> None:
     cached = _cached(plan.final, plan.meta)
     if cached is not None:
         raise _Known(cached)
-    reason = _remembered(plan.final)
+    reason = _remembered(plan.final, plan.fmt)
     if reason is not None:
         raise _Known(None, reason)
 
@@ -1042,7 +1101,7 @@ def extract_known(provider_cfg: Mapping[str, Any], archive_sha256: str, *, sessi
         plan = _plan(
             provider_cfg, Path(), archive_sha256, datetime.now(UTC), extracts_dir(session_id)
         )
-        return plan.final.is_file() or _remembered(plan.final) is not None
+        return plan.final.is_file() or _remembered(plan.final, plan.fmt) is not None
     except Exception:  # an ordering hint only
         return False
 

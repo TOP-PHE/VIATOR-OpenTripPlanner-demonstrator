@@ -24,6 +24,7 @@ Every value is invented (`ZZ`, numbers of 9s), every archive built here.
 from __future__ import annotations
 
 import collections
+import contextlib
 import csv
 import gzip
 import io
@@ -87,8 +88,9 @@ def _reason(provider: dict[str, Any], archive: Path, tmp_path: Path) -> str:
 def test_the_bounds_are_the_documented_ones() -> None:
     assert station_extract_common.RATIO_MAX == 200
     assert station_extract_common.RATIO_FLOOR_BYTES == 64 * MIB
-    assert station_extract_common.MEMBER_MAX_BYTES == 64 * GIB
-    assert station_extract_common.ARCHIVE_MAX_BYTES == 64 * GIB
+    assert station_extract_common.MEMBER_MAX_BYTES == 160 * GIB
+    assert station_extract_common.ARCHIVE_MAX_BYTES == 160 * GIB
+    assert {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED} == station_extract_common.PACKINGS
 
 
 def test_member_bound() -> None:
@@ -99,7 +101,7 @@ def test_member_bound() -> None:
 
     assert member_bound(info(0)) == 64 * MIB  # a small member: the floor
     assert member_bound(info(MIB)) == 200 * MIB
-    assert member_bound(info(2 * GIB)) == 64 * GIB  # the absolute cap
+    assert member_bound(info(2 * GIB)) == 160 * GIB  # the absolute cap
     assert member_bound(info(64 * MIB + 1)) == 200 * (64 * MIB + 1)
 
 
@@ -206,6 +208,50 @@ def test_absolute_caps_refuse_from_the_directory(
     archive = _zip(
         tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
     )
+    assert _reason(_provider("netex_epip"), archive, tmp_path) == "input_too_large"
+
+
+@pytest.mark.parametrize("packing", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA], ids=["bzip2", "lzma"])
+def test_only_stored_or_deflated_members(tmp_path: Path, packing: int) -> None:
+    """bzip2 and lzma pack a run of one byte tens of thousands of times."""
+    archive = _gtfs(tmp_path)
+    with zipfile.ZipFile(archive) as zf:
+        files = {name: zf.read(name) for name in zf.namelist()}
+    other = tmp_path / "other.zip"
+    with zipfile.ZipFile(other, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(name, data, compress_type=packing if name == "stop_times.txt" else None)
+    assert _reason(_provider(), other, tmp_path) == "bad_archive"
+    xml = tmp_path / "x.zip"
+    with zipfile.ZipFile(xml, "w") as zf:
+        zf.writestr("a.xml", _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE), packing)
+    assert _reason(_provider("netex_epip"), xml, tmp_path) == "bad_archive"
+    # a file the reader never opens may be packed any way
+    readme = _gtfs(tmp_path, name="readme.zip")
+    with zipfile.ZipFile(readme, "a") as zf:
+        zf.writestr("readme.txt", "zz " * 999, packing)
+    assert _reason(_provider(), readme, tmp_path) == "ok"
+
+
+def test_many_small_members_share_one_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each member under its own floor, together past 200 times the archive."""
+    monkeypatch.setattr(station_extract_common, "RATIO_FLOOR_BYTES", MIB)
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for n in range(24):
+            body = f"<PublicationDelivery {NS}><dataObjects>{' ' * (MIB - 200)}"
+            zf.writestr(f"zz{n}.xml", body + "</dataObjects></PublicationDelivery>")
+    with zipfile.ZipFile(archive) as zf:
+        infos = zf.infolist()
+        assert all(member_bound(info) >= info.file_size for info in infos)
+        assert sum(i.file_size for i in infos) > station_extract_common.archive_bound(zf)
+
+    def never(*_args: Any) -> Any:
+        raise AssertionError("a member was opened")
+
+    monkeypatch.setattr(netex, "open_member", never)
     assert _reason(_provider("netex_epip"), archive, tmp_path) == "input_too_large"
 
 
@@ -344,6 +390,81 @@ def test_skip_filter_leaves_an_unclosed_element_to_expat(tmp_path: Path) -> None
     assert _reason(_provider("netex_epip"), archive, tmp_path) == "bad_archive"
 
 
+_HOSTILE = {
+    "processing instructions": b"<?zz?>",
+    "bare bangs": b"<!z",
+    "nested self-closing": b"<dayTypes/>",
+    "comments": b"<!---->",
+    "nested open and close": b"<dayTypes></dayTypes>",
+}
+
+
+def _cut_seconds(unit: bytes, size: int) -> float:
+    data = b"<dayTypes>" + unit * (size // len(unit)) + b"</dayTypes><b/>"
+    best = float("inf")
+    for _ in range(2):
+        skip = SkipFilter(_SKIP, b"", lambda _n: None)
+        started = time.process_time()
+        out = skip.feed(data) + skip.finish()
+        best = min(best, time.process_time() - started)
+        assert out == b"<b/>"
+    return best
+
+
+@pytest.mark.parametrize("shape", sorted(_HOSTILE))
+def test_skip_filter_is_linear_inside_a_cut(shape: str) -> None:
+    """Review of #358: inside a dropped element every search ran to the end
+    of the chunk again, so a chunk full of small markup took quadratic time
+    (0.2 MB/s). Four times the bytes in one chunk now take about four times
+    as long, not sixteen."""
+    unit = _HOSTILE[shape]
+    small = _cut_seconds(unit, 128 * 1024)
+    large = _cut_seconds(unit, 512 * 1024)
+    assert large < 8 * max(small, 0.002), (shape, small, large)
+
+
+def test_skip_filter_takes_over_at_a_token_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comment begun before the filter takes over, holding what looks like
+    an element of the set, is not cut: the filter first reads what expat
+    already parsed after the root's start tag."""
+    trap = "<!--" + " " * 1500 + "<passingTimes><dayTypes> not markup -->"
+    epip = _delivery(EPIP_TIMETABLE + EPIP_SERVICE + EPIP_SITE)
+    trapped = epip.replace('version="1.1">', 'version="1.1">' + trap, 1)
+    assert trapped != epip
+    plain = _extract_bytes(
+        _provider("netex_epip"), _zip(tmp_path / "plain.zip", {"zz.xml": epip}), tmp_path / "p"
+    )
+    archive = _zip(tmp_path / "trap.zip", {"zz.xml": trapped})
+    assert _same_with_and_without(archive, tmp_path / "trap", monkeypatch) == plain
+
+
+def test_skip_filter_prime() -> None:
+    """Primed with parsed bytes: nothing of them comes back, an element of
+    the set begun there is not dropped, an open comment is known."""
+    skip = SkipFilter(_SKIP, b"", lambda _n: None)
+    skip.prime(b"<x/><dayTypes><y/>")
+    assert skip.feed(b"<z/></dayTypes><dayTypes><q/></dayTypes><w/>") + skip.finish() == (
+        b"<z/></dayTypes><w/>"
+    )
+    skip = SkipFilter(_SKIP, b"", lambda _n: None)
+    skip.prime(b"<x/><!-- ")
+    assert skip.feed(b"<dayTypes> --><dayTypes/><v/>") + skip.finish() == b"<dayTypes> --><v/>"
+    skip = SkipFilter(_SKIP, b"", lambda _n: None)
+    skip.prime(b"<x/><dayTy")  # a name cut in two at the hand-over: begun in parsed bytes
+    assert skip.feed(b"pes><a/></dayTypes><b/>") + skip.finish() == b"pes><a/></dayTypes><b/>"
+
+
+def test_start_tag_end() -> None:
+    from app.station_extract_skip import start_tag_end
+
+    assert start_tag_end(b"<r a=\"1>2\" b='>'>x", 0) == 17
+    assert start_tag_end(b"<r>", 0) == 3
+    assert start_tag_end(b'<r a="1', 0) is None
+    assert start_tag_end(b"<r a", 0) is None
+
+
 def test_root_prefix() -> None:
     assert root_prefix(b'<?xml version="1.0"?><netex:PublicationDelivery x="1">', 21) == b"netex"
     assert root_prefix(b"<PublicationDelivery>", 0) == b""
@@ -358,6 +479,9 @@ class _NoSkip:
     """The reader before the filter: every byte to expat."""
 
     def __init__(self, *_args: Any) -> None:
+        pass
+
+    def prime(self, _parsed: bytes) -> None:
         pass
 
     def feed(self, data: bytes) -> bytes:
@@ -448,6 +572,100 @@ def test_netex_extracts_identical_with_the_filter(
     )
     assert row["operators"] == "ZZ:O"
     assert row["codes"] == "@id=ZZ:SP:9|uic=9900099|Quay/@id=ZZ:Q:9|Quay/PublicCode=9"
+
+
+def _both_ways(real: Any) -> Any:
+    """`build_extract`, which also makes the extract without the filter and
+    checks both are the same bytes (or the same refusal)."""
+
+    def run(provider: dict[str, Any], archive: Path, sha: str, **kwargs: Any) -> Any:
+        folder = Path(kwargs.pop("cache_dir", None) or archive.parent / "x")
+        outcomes = []
+        for label, skip in (("f", netex.SkipFilter), ("u", _NoSkip)):
+            original = netex.SkipFilter
+            netex.SkipFilter = skip  # type: ignore[misc,assignment]
+            try:
+                made = real(
+                    provider,
+                    archive,
+                    sha,
+                    cache_dir=folder.with_name(folder.name + label),
+                    **kwargs,
+                )
+                outcomes.append(made.path_gz.read_bytes())
+            except ExtractError as exc:
+                outcomes.append(exc.reason)
+            finally:
+                netex.SkipFilter = original  # type: ignore[misc]
+        assert outcomes[0] == outcomes[1]
+        return real(provider, archive, sha, cache_dir=folder, **kwargs)
+
+    return run
+
+
+def test_every_netex_case_identical_without_the_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The NeTEx tests of the extractor, each run with extracts made with
+    and without the filter and compared: journeys with calls and no pattern,
+    assignments with only a StopPlace, the railStation fallback, ParentSiteRef
+    chains, patterns whose Line comes through their Route, lines read after
+    their journeys, submodes, no StopPlace, entities, broken XML."""
+    import inspect
+
+    from tests.unit import test_station_extract as base
+    from tests.unit import test_station_extract_bounds as bounds
+
+    for module in (base, bounds):
+        monkeypatch.setattr(module, "build_extract", _both_ways(build_extract))
+    cases = [
+        base.test_netex_non_rail_journeys_dropped_early,
+        base.test_netex_epip_extract,
+        base.test_netex_nordic_extract,
+        base.test_netex_bus_only_is_no_extract,
+        base.test_netex_rail_replacement_bus_is_not_rail,
+        base.test_netex_not_well_formed,
+        base.test_netex_entities_refused,
+        bounds.test_assignment_with_both_references,
+        bounds.test_direct_calls_without_a_pattern,
+        bounds.test_netex_parents_and_positions,
+        bounds.test_railstation_fallback_follows_the_reference,
+        bounds.test_rail_journey_takes_the_lines_submode,
+        bounds.test_no_stop_place,
+        bounds.test_operators_of_journeys_without_a_mode,
+        bounds.test_netex_entities_and_subsets,
+    ]
+    for case in cases:
+        folder = tmp_path / case.__name__
+        folder.mkdir()
+        wanted = inspect.signature(case).parameters
+        case(
+            **{
+                k: v
+                for k, v in {"tmp_path": folder, "monkeypatch": monkeypatch}.items()
+                if k in wanted
+            }
+        )
+
+
+def test_dead_runs_and_dated_journeys_change_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extra = (
+        '<DeadRun id="ZZ:DR:1"><ServiceJourneyPatternRef ref="ZZ:SJP:R"/>'
+        "<passingTimes><TimetabledPassingTime/></passingTimes></DeadRun>"
+        '<DatedServiceJourney id="ZZ:DSJ:1"><ServiceJourneyRef ref="ZZ:SJ:1"/>'
+        '<OperatingDayRef ref="ZZ:OD:1"/></DatedServiceJourney>'
+    )
+    timetable = EPIP_TIMETABLE.replace("</vehicleJourneys>", extra + "</vehicleJourneys>")
+    assert timetable != EPIP_TIMETABLE
+    plain = _extract_bytes(
+        _provider("netex_epip"),
+        _zip(tmp_path / "p.zip", {"zz.xml": _delivery(EPIP_TIMETABLE + EPIP_SERVICE + EPIP_SITE)}),
+        tmp_path / "p",
+    )
+    archive = _zip(tmp_path / "d.zip", {"zz.xml": _delivery(timetable + EPIP_SERVICE + EPIP_SITE)})
+    assert _same_with_and_without(archive, tmp_path / "d", monkeypatch) == plain
 
 
 def test_netex_filter_drops_the_bulk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -845,6 +1063,76 @@ def test_a_remembered_failure_counts_under_its_bounds_only(
     child.fail = None
     made = _ensure(archive, lock_dir)
     assert isinstance(made, station_extract.ExtractResult)
+
+
+def test_a_corrected_format_reads_the_archive_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """Review of #358: a file declared GTFS that is NeTEx fails `bad_archive`;
+    once the provider says NeTEx, it is read again (same file, same key)."""
+    child = _Child(ExtractError("bad_archive"))
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    _ensure(archive, lock_dir)
+    assert _ensure(archive, lock_dir) == ("bad_archive", "remembered")
+    assert child.runs == 1
+    netex_provider = _provider("netex_epip")
+    with contextlib.suppress(ExtractError):
+        ensure_extract(
+            netex_provider, archive, SHA_A, extracted_at=WHEN, session_id="zz", cache_dir=lock_dir
+        )
+    assert child.runs == 2
+
+
+def test_a_changed_reader_reads_the_archive_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """A reader fixed without a new extractor version: its code is in the
+    signature, so failures met by the former code are tried again."""
+    child = _Child(ExtractError("input_too_large"))
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    _ensure(archive, lock_dir)
+    assert _ensure(archive, lock_dir) == ("input_too_large", "remembered")
+    changed = tmp_path / "changed_reader.py"
+    changed.write_text(Path(station_extract_skip_file()).read_text() + "\n# a fix\n")
+    station_extract._code_signature.cache_clear()
+    try:
+        monkeypatch.setattr(station_extract.station_extract_skip, "__file__", str(changed))
+        _ensure(archive, lock_dir)
+        assert child.runs == 2
+    finally:
+        station_extract._code_signature.cache_clear()
+
+
+def station_extract_skip_file() -> str:
+    from app import station_extract_skip
+
+    return str(station_extract_skip.__file__)
+
+
+def test_a_wall_clock_stop_is_remembered_the_second_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """Review of #358: a niced child on a busy server may stop at its wall
+    clock before its processor time; tried once more, then remembered, so a
+    national archive does not hold the machine 45 minutes at every pass."""
+    wall = ExtractError("resource_limit", station_extract.WALL_CLOCK)
+    child = _Child(wall)
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    assert _ensure(archive, lock_dir) == ("resource_limit", station_extract.WALL_CLOCK)
+    assert _ensure(archive, lock_dir) == ("resource_limit", station_extract.WALL_CLOCK)
+    assert child.runs == 2
+    assert _ensure(archive, lock_dir) == ("resource_limit", "remembered")
+    assert child.runs == 2
+    (marker,) = lock_dir.glob("*.failed")
+    assert json.loads(marker.read_text())["walls"] == 2
+    # the count is the marker's: without it, one stop is tried again
+    marker.unlink()
+    _ensure(archive, lock_dir)
+    _ensure(archive, lock_dir)
+    assert child.runs == 4
 
 
 def test_a_damaged_marker_is_not_a_failure(

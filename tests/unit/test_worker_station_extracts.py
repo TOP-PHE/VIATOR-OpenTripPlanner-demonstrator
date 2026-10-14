@@ -312,8 +312,8 @@ def test_the_reason_is_shown_in_clear(tmp_path: Path, monkeypatch: pytest.Monkey
     big, waiting, refused, sent, odd, empty = _cells([*loaded, hostile, None])
     assert '<code class="feed-extract-reason">input_too_large</code>' in big
     assert (
-        '<div class="feed-extract-detail">the archive unpacks past VIATOR&#39;s bounds '
-        "(a zip bomb, or a damaged file)</div>" in big
+        '<div class="feed-extract-detail">the archive passes a reading bound: size, '
+        "record length, nesting or counts</div>" in big
     )
     assert '<code class="feed-extract-reason">not_cached</code>' in waiting
     assert "waiting for its extract; sent at the next pass" in waiting
