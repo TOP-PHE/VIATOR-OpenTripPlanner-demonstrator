@@ -790,7 +790,9 @@ def test_an_unexpected_error_ends_the_pass_with_one_warning(
             transport=httpx.MockTransport(module),
             record=False,
         )
-    assert _states(result) == [(up.HELD, None)]
+    # the feeds are read whole before the first is sent (they are ordered)
+    assert _states(result) == []
+    assert not module.requests
     assert "station_extract.failed reason=error type=RuntimeError" in caplog.text
     assert token not in caplog.text
 
@@ -1754,3 +1756,120 @@ def test_a_session_id_of_another_form_lists_no_folder(
         up._fetch_state_dir("zz.x")
     up.forget_outcomes_except("zz.x", set())
     assert kept.is_file()
+
+
+# ── the order of a pass: what is ready first, then the smallest files ────
+
+
+def _sized(setup: Setup, sizes: dict[str, int]) -> None:
+    for feed in setup.feeds:
+        assert feed.archive is not None
+        feed.archive.write_bytes(b"9" * sizes[feed.provider_id])
+
+
+def _send(setup: Setup, module: Module, clock: FakeClock, **kwargs: Any) -> up.PassResult:
+    return up.send_session_extracts(
+        SESSION,
+        setup.feeds,
+        clock=clock,
+        transport=httpx.MockTransport(module),
+        record=False,
+        **{"budget": 600.0, **kwargs},
+    )
+
+
+@pytest.mark.usefixtures("token")
+def test_ready_feeds_go_first_then_the_smallest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    setup = Setup(tmp_path, monkeypatch, n=4)
+    _sized(setup, {"ZZ0": 9_000, "ZZ1": 9, "ZZ2": 900, "ZZ3": 99_000})
+    result = _send(setup, module, clock, ready=lambda _sid, feed: feed.provider_id == "ZZ3")
+    assert [pid for pid, _sha in setup.extractor.calls] == ["ZZ3", "ZZ1", "ZZ2", "ZZ0"]
+    # recorded and returned in the session's order
+    assert [o.provider_id for o in result.outcomes] == ["ZZ0", "ZZ1", "ZZ2", "ZZ3"]
+    assert _states(result) == [(up.SENT, None)] * 4
+
+
+@pytest.mark.usefixtures("token")
+def test_the_order_asks_the_extractor_what_it_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    setup = Setup(tmp_path, monkeypatch, n=3)
+    _sized(setup, {"ZZ0": 99, "ZZ1": 9_999, "ZZ2": 999})
+    asked: list[tuple[str, str, str]] = []
+
+    def known(provider_cfg: dict[str, Any], sha: str, *, session_id: str) -> bool:
+        asked.append((provider_cfg["id"], sha, session_id))
+        if provider_cfg["id"] == "ZZ2":
+            raise OSError("stand-in")  # an ordering hint only: never stops the pass
+        return provider_cfg["id"] == "ZZ1"
+
+    monkeypatch.setattr(station_extract, "extract_known", known)
+    _send(setup, module, clock)
+    assert [pid for pid, _sha in setup.extractor.calls] == ["ZZ1", "ZZ0", "ZZ2"]
+    assert {(pid, session) for pid, _sha, session in asked} == {
+        ("ZZ0", SESSION),
+        ("ZZ1", SESSION),
+        ("ZZ2", SESSION),
+    }
+    shas = {feed.provider_id: feed.archive_sha256 for feed in setup.feeds}
+    assert all(sha == shas[pid] for pid, sha, _s in asked)
+
+
+def test_feeds_without_key_or_archive_need_no_extraction(tmp_path: Path) -> None:
+    archive = tmp_path / "zz.zip"
+    archive.write_bytes(b"9")
+    cfg = {"id": "ZZ0", "timetable": {"format": "gtfs"}}
+    assert up._ready(SESSION, up.Feed("ZZ0", cfg, None, archive, _sha()))
+    assert up._ready(SESSION, up.Feed("ZZ0", cfg, _url_key(), None, _sha()))
+    assert up._ready(SESSION, up.Feed("ZZ0", cfg, _url_key(), archive, None))
+    assert up._archive_size(up.Feed("ZZ0", cfg, _url_key(), tmp_path / "gone.zip", None)) == 0
+
+
+class _SlowFor:
+    """The extractor, slow for one provider: it moves the clock past the
+    budget, waits to be released, then makes its extract all the same (the
+    child process goes on after the pass gave up on it)."""
+
+    def __init__(self, real: FakeExtractor, clock: FakeClock, pid: str) -> None:
+        self.real = real
+        self.clock = clock
+        self.pid = pid
+        self.release = threading.Event()
+        self.made = threading.Event()
+
+    def __call__(self, provider_cfg: Any, *args: Any, **kwargs: Any) -> Any:
+        if provider_cfg["id"] != self.pid:
+            return self.real(provider_cfg, *args, **kwargs)
+        self.clock.now += 10_000
+        self.release.wait(10)
+        made = self.real(provider_cfg, *args, **kwargs)
+        self.made.set()
+        return made
+
+
+@pytest.mark.usefixtures("token")
+def test_a_long_extraction_never_starves_the_small_feeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    """The production case: a national archive and small feeds in one pass.
+    The small ones are sent; the national one alone is skipped `budget`; its
+    extraction goes on and its extract goes with the next pass, even the
+    worker's, which only takes extracts already made."""
+    setup = Setup(tmp_path, monkeypatch, n=3)
+    _sized(setup, {"ZZ0": 99_999, "ZZ1": 99, "ZZ2": 999})
+    slow = _SlowFor(setup.extractor, clock, "ZZ0")
+    monkeypatch.setattr(station_extract, "ensure_extract", slow)
+    monkeypatch.setattr(up, "EXTRACT_POLL_SECONDS", 0.01)
+    try:
+        result = _send(setup, module, clock, budget=up.REFRESH_BUDGET_SECONDS)
+    finally:
+        slow.release.set()
+    assert _states(result) == [(up.SKIPPED, up.BUDGET), (up.SENT, None), (up.SENT, None)]
+    assert len(module.put_requests) == 2
+    assert slow.made.wait(10)  # the extraction went on after the pass
+    monkeypatch.setattr(station_extract, "ensure_extract", setup.extractor)
+    setup.extractor.cached = True
+    later = _send(setup, module, clock, budget=up.BUILD_BUDGET_SECONDS, cache_only=True)
+    assert later.outcomes[0] == up.FeedOutcome("ZZ0", up.SENT)

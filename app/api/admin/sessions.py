@@ -1046,8 +1046,9 @@ class ProviderStatus(BaseModel):
     structure: dict[str, Any] | None = None
     # The last time this provider's stop extract went to the station module
     # (MSMM 22.3; app/station_extract_upload.py): {"at", "state", "reason",
-    # "text"}, the text one of "sent", "already held", "refused <reason>",
-    # "skipped", "module unavailable". None until a first try.
+    # "text", "detail"}, the text one of "sent", "already held", "refused
+    # <reason>", "skipped", "module unavailable", the detail a fixed sentence
+    # saying what the reason means (REASON_TEXTS) or None. None until a first try.
     station_extract: dict[str, Any] | None = None
 
 

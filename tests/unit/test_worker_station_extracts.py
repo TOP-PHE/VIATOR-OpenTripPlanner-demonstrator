@@ -9,6 +9,10 @@ it). Values are invented: `ZZ` ids, build numbers beginning with 99.
 from __future__ import annotations
 
 import inspect
+import json
+import re
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -263,8 +267,91 @@ def test_the_sessions_page_shows_the_outcome() -> None:
     html = TEMPLATE.read_text(encoding="utf-8")
     assert ">Station module</th>" in html
     assert "${feedStationExtractHTML(s.station_extract)}" in html
-    assert "escHTML(x.text)" in html
-    assert "escAttr(x.reason)" in html
+
+
+def _page_functions(html: str) -> str:
+    """The page's own code of the Station module column, cut out of the
+    template: the escaping helpers, the time text and the cell itself."""
+    parts = [
+        re.search(r"^function escAttr\(s\) \{.*?\}$", html, re.M),
+        re.search(r"^function escHTML\(s\) \{.*?^\}", html, re.S | re.M),
+        re.search(r"^function _relativeTimeShort\(isoUtc\) \{.*?^\}", html, re.S | re.M),
+        re.search(r"^const _STATION_EXTRACT_FLAVOURS = \{.*?^\};", html, re.S | re.M),
+        re.search(r"^function feedStationExtractHTML\(x\) \{.*?^\}", html, re.S | re.M),
+    ]
+    assert all(parts)
+    return "\n".join(part.group(0) for part in parts if part)
+
+
+def _cells(outcomes: list[dict[str, Any] | None]) -> list[str]:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    program = (
+        _page_functions(TEMPLATE.read_text(encoding="utf-8"))
+        + f"\nconsole.log(JSON.stringify({json.dumps(outcomes)}.map(feedStationExtractHTML)));"
+    )
+    done = subprocess.run(  # node, with the page's own code
+        [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert done.returncode == 0, done.stderr
+    cells: list[str] = json.loads(done.stdout)
+    return cells
+
+
+def test_the_reason_is_shown_in_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reason word beside the state, and the reason's sentence under them,
+    escaped; a refusal keeps its word in the text only; no reason, no line."""
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    up.record_outcome("zz", up.FeedOutcome("ZZ0", up.SKIPPED, "input_too_large"))
+    up.record_outcome("zz", up.FeedOutcome("ZZ1", up.SKIPPED, up.NOT_CACHED))
+    up.record_outcome("zz", up.FeedOutcome("ZZ2", up.REFUSED, "duplicate_stop"))
+    up.record_outcome("zz", up.FeedOutcome("ZZ3", up.SENT))
+    loaded = [up.load_outcome("zz", f"ZZ{n}") for n in range(4)]
+    hostile = {"state": "skipped", "text": "skipped", "reason": "<b>zz</b>", "detail": "<i>zz"}
+    big, waiting, refused, sent, odd, empty = _cells([*loaded, hostile, None])
+    assert '<code class="feed-extract-reason">input_too_large</code>' in big
+    assert (
+        '<div class="feed-extract-detail">the archive unpacks past VIATOR&#39;s bounds '
+        "(a zip bomb, or a damaged file)</div>" in big
+    )
+    assert '<code class="feed-extract-reason">not_cached</code>' in waiting
+    assert "waiting for its extract; sent at the next pass" in waiting
+    assert ">refused duplicate_stop</span>" in refused
+    assert "feed-extract-reason" not in refused
+    assert "feed-extract-reason" not in sent
+    assert "feed-extract-detail" not in sent
+    assert "&lt;b&gt;zz&lt;/b&gt;" in odd
+    assert "&lt;i&gt;zz" in odd
+    assert "<b>" not in odd
+    assert "<i>" not in odd
+    assert "title=" not in big  # in clear, not in a tooltip
+    assert empty == '<span class="hint">—</span>'
+
+
+def test_every_reason_text_is_short_and_plain() -> None:
+    """Fixed sentences: no path, no address, no markup; an unknown reason
+    word, or a refusal word of the module, has none."""
+    for word, text in up.REASON_TEXTS.items():
+        assert re.fullmatch(r"[a-z0-9_]{1,40}", word)
+        assert 10 <= len(text) <= 100, word
+        assert not re.search(r"[<>/\\]|https?:|inbox|token=", text), word
+
+
+def test_the_detail_comes_from_the_reason_word_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    up.record_outcome("zz", up.FeedOutcome("ZZ0", up.UNAVAILABLE, "status_500"))
+    up.record_outcome("zz", up.FeedOutcome("ZZ1", up.SKIPPED, up.BUDGET))
+    up.record_outcome("zz", up.FeedOutcome("ZZ2", up.SENT))
+    first, second, third = (up.load_outcome("zz", f"ZZ{n}") for n in range(3))
+    assert first is not None
+    assert first["detail"] is None
+    assert second is not None
+    assert second["detail"] == "the pass ran out of time before it; sent at the next pass"
+    assert third is not None
+    assert third["detail"] is None
 
 
 def test_an_upload_into_the_slot_forgets_the_status(
