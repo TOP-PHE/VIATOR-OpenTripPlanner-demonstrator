@@ -31,6 +31,7 @@ import json
 import os
 import random
 import signal
+import time
 import tracemalloc
 import zipfile
 from collections.abc import Iterator
@@ -678,6 +679,28 @@ def test_gtfs_lines_split_as_readline(monkeypatch: pytest.MonkeyPatch) -> None:
             got.append(line)
             size[0] = 0  # as the reader does after each record
         assert got == expected, text
+
+
+def test_gtfs_lines_split_in_linear_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostile block with no line ending, and a break `str.splitlines`
+    would take (so the slow path runs), is split in one pass: a regular
+    expression that scans each line from every position would take minutes
+    here (a quadratic 10^11 steps), this takes milliseconds."""
+    block = "\x85" + "9" * 400_000
+    started = time.monotonic()
+    lines, carry = gtfs._split(block)
+    assert time.monotonic() - started < 2
+    assert (lines, carry) == ([], block)
+    lines, carry = gtfs._split("a\x85b\r\nc\rd\ne\r")
+    assert (lines, carry) == (["a\x85b\r\n", "c\r", "d\n"], "e\r")
+    # and the whole reader, on such a file, refuses it at the record bound
+    monkeypatch.setattr(gtfs, "RECORD_MAX", 300_000)
+    size = [0]
+    stream = io.TextIOWrapper(io.BytesIO(block.encode()), encoding="utf-8", newline="")
+    started = time.monotonic()
+    with pytest.raises(ArchiveError, match="input_too_large"):
+        list(gtfs._lines(stream, size))
+    assert time.monotonic() - started < 2
 
 
 def test_gtfs_stop_times_rows_never_dictionaries(

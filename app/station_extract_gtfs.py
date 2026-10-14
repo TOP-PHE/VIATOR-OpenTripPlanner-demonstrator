@@ -93,8 +93,10 @@ def rail_mode(route_type: str) -> str | None:
 
 
 # The physical lines as `readline` of a text stream opened with `newline=""`
-# returns them: ended by `\r\n`, `\r` or `\n`, the ending kept.
-_PHYSICAL = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)")
+# returns them: ended by `\r\n`, `\r` or `\n`, the ending kept. Only the
+# endings are searched (each match takes constant time), never a line itself:
+# a long text without an ending costs one pass, not one per character.
+_ENDING = re.compile("\r\n|\r|\n")
 # `str.splitlines` splits there too, and also at these, faster: it is used on
 # a block that holds none of them.
 _OTHER_BREAKS = re.compile("[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
@@ -140,8 +142,11 @@ def _split(block: str) -> tuple[list[str], str]:
         lines = block.splitlines(keepends=True)
         carry = lines.pop() if lines and not lines[-1].endswith(("\n", "\r")) else ""
     else:
-        lines = _PHYSICAL.findall(block)
-        carry = block[sum(map(len, lines)) :]
+        lines, start = [], 0
+        for ending in _ENDING.finditer(block):
+            lines.append(block[start : ending.end()])
+            start = ending.end()
+        carry = block[start:]
     if not carry and lines and lines[-1].endswith("\r"):
         carry = lines.pop()
     return lines, carry
