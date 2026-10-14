@@ -988,19 +988,23 @@ huge archive can only end the child (`resource_limit`); `ensure_extract` raises 
 With `cache_only=True` it returns a valid cached extract or raises `not_cached`, never starting or
 waiting for an extraction (the worker before a graph build). A failure the same archive would meet
 again (`REMEMBERED_REASONS`: `bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`, the
-four MSMM limits, and a `resource_limit` of memory or processor time, never of the wall clock) is
-remembered in `<cache name>.failed` beside the cache, with the signature of every bound it was met
-under: the next caller (cache-only too) gets that reason at once, `"remembered"` as its detail, until
-the archive, the extractor version, the provider's columns or any bound changes.
+four MSMM limits, a `resource_limit` of memory or processor time, and one of the wall clock the
+second time in a row) is remembered in `<cache name>.failed` beside the cache, with the format it was
+read as and the signature of every bound and of the extraction's code (`_code_signature`: this module
+and the readers' files): the next caller (cache-only too) gets that reason at once, `"remembered"` as
+its detail, until the archive, the provider's format or columns, the extractor version, a bound or
+the readers' code changes.
 `build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
 key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
 fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
 `cross_border_filter` provider), derived from the configuration only, exactly as MSMM's
 `feed_intake.resolver_identity` / `url_identity`; `EXTRACTOR_VERSION` names the rules. The readers
 stream and **bound what they read**, not only what they write: the bytes a member unpacks to (at
-most 200 times its packed size, 64 MiB at least, 64 GiB at most) and the bytes of one reading pass
-(64 GiB), checked on the sizes the zip's central directory declares before anything is read, then
-counted as read; GTFS records of at most 1 MiB and 200 fields (counted
+most 200 times its packed size, 64 MiB at least, 160 GiB at most), the members read together (200
+times the packed bytes of the whole archive, 64 MiB at least) and one reading pass (160 GiB), only
+stored or deflated members (bzip2 and lzma: `bad_archive`), checked on the sizes the zip's central
+directory declares before anything is read (zipfile never gives more than a member's declared size),
+then counted as read; members a reader never opens are never checked; GTFS records of at most 1 MiB and 200 fields (counted
 before the csv module builds them, a quoted field may span lines), ids of at most 255 characters,
 1,000,000 called stops; NeTEx read with expat in three passes, building elements only inside the ones
 a pass reads (and not their passing times, links or equipment), refusing nesting past 64, a text run
@@ -1044,9 +1048,14 @@ the largest.
 same session waited behind it). Nothing is ever written unpacked, so the bytes an archive unpacks to
 cost processor time, not disk or memory: the bounds stop a zip bomb early (a member may unpack to
 200 times its packed size, where timetable XML and CSV pack 5 to 30 times and only a crafted member
-nears deflate's 1,000; refused from the central directory before a byte is read) and accept a
-national feed (64 GiB a member and a pass, 1.6 times the largest known); the child's processor time
-is the last stop. To read less, the NeTEx reader puts `station_extract_skip.SkipFilter` in front of
+nears deflate's 1,000, and the members read together at 200 times the whole archive; refused from
+the central directory before a byte is read) and accept a national feed (160 GiB a member and a pass:
+a 2 GB NeTEx packing 33 times is some 66 GB, and at 60 MB/s the child's 40 minutes end near 150 GB);
+the child's processor time is the last stop. The filter's searches inside a dropped element are each
+made once over a stretch of a chunk, so hostile markup there (many comments, processing instructions,
+nested self-closing tags) costs a few MB/s, as much as expat's own parsing of dense markup, never
+quadratic time; it takes over at a token boundary, reading first (`prime`) what expat parsed after
+the root's start tag. To read less, the NeTEx reader puts `station_extract_skip.SkipFilter` in front of
 expat once a document's root has begun: it drops from the raw bytes, with C searches, every element
 no pass reads (`_SKIPPED`: passing times, calendars, day types, links, scheduled stop points, notices,
 …), the elements only the other passes read (pass 2 never sees a ServiceJourney; passes 1 and 2 never

@@ -2917,29 +2917,35 @@ the extracts changes no graph build.
   (200,000 rows, 256 MiB unpacked, 32 MiB of gzip) is not written; the `web`
   log says `station extract not written: sid=… provider=… reason=<word>` at
   WARNING, where the word is `too_many_rows`, `too_large`, `line_too_long`,
-  `cell_too_long`, `input_too_large` (the archive passes a bound of what
-  VIATOR reads: a file in it that unpacks to more than 200 times its packed
-  size or past 64 GiB, which only a zip bomb or a damaged file does — real
-  timetables pack 5 to 30 times, a national feed of tens of GB is read; a
-  record or text over 1 MiB, nesting past 64, …), `resource_limit` (the
-  child passed its memory or time), `busy` (another extraction held the
-  server too long),
+  `cell_too_long`, `input_too_large` (the archive passes one of the bounds
+  of what VIATOR reads: its size — a file in it that unpacks to more than
+  200 times its packed size, the files read together past 200 times the
+  archive, or past 160 GiB, which only a zip bomb or a damaged file does;
+  real timetables pack 5 to 30 times, a national feed of tens of GB is
+  read —, a record or text over 1 MiB, nesting past 64, or counts: more
+  stations, assignments, Quays or journey groups than VIATOR keeps),
+  `resource_limit` (the child passed its memory, processor time or wall
+  clock, or was stopped), `busy` (another extraction held the server too
+  long),
   `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
   file whose rail journeys call but which defines no stop place, as some
   timetable-only exports do), `bad_archive` (the file cannot be read as its
-  declared format, or a NeTEx file declares an XML entity, which VIATOR
-  refuses), `unsupported_format` or `error`. The refresh and the graph are
+  declared format, a file in it is packed otherwise than deflate (bzip2,
+  lzma), or a NeTEx file declares an XML entity, which VIATOR refuses),
+  `unsupported_format` or `error`. The refresh and the graph are
   never affected. A cached file found damaged (after a crash) is made again.
 - **A failure is remembered.** When the same file would fail again the same
   way (`bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
   a module limit, or the child out of memory or processor time), VIATOR
   keeps the reason in `_extracts/<PROVIDER>.<sha256>.<16 hex>.csv.gz.failed`
   and does not read that file again: every later pass shows the same reason
-  at once. It is read again when a new file is downloaded, when VIATOR's
-  extractor or one of its bounds changes (a new release), or after you
-  delete that `.failed` file. A child stopped by its wall clock (a busy
-  server), `busy` and `error` are never remembered: the next pass tries
-  again.
+  at once. It is read again when a new file is downloaded, when the
+  provider's timetable format is corrected (GTFS ↔ NeTEx), when a VIATOR
+  release changes the extractor's version, one of its bounds or the code of
+  its readers, or after you delete that `.failed` file. A child stopped by
+  its wall clock (a busy server) is tried once more, and remembered the
+  second time in a row; `busy` and `error` are never remembered: the next
+  pass tries again.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).
@@ -3012,8 +3018,8 @@ provider's slot.
 
   Beside a "skipped" or "module unavailable" text the reason word is shown
   (for example `skipped input_too_large`), and under it a short sentence
-  saying what it means (for example *the archive unpacks past VIATOR's
-  bounds (a zip bomb, or a damaged file)*, *waiting for its extract; sent
+  saying what it means (for example *the archive passes a reading bound:
+  size, record length, nesting or counts*, *waiting for its extract; sent
   at the next pass*). The sentences are fixed texts of VIATOR, never a
   file name, an address or a value of the feed.
 

@@ -440,9 +440,10 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   one at a time on the machine (`flock` on
   `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
   `wait_seconds` is `busy`.
-- **Input bounds**: a member unpacks to at most 200 times its packed size (64 MiB at least) and
-  64 GiB, a reading pass to 64 GiB, checked first on the sizes the central directory declares (refused
-  before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
+- **Input bounds**: stored or deflated members only; a member read unpacks to at most 200 times its
+  packed size (64 MiB at least) and 160 GiB, the members read together to 200 times the archive's packed
+  bytes (64 MiB at least), a reading pass to 160 GiB, checked first on the sizes the central directory
+  declares (refused before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
   ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
   tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
   assignments and Quays, no entity declaration (internal ones included), no external DTD loaded;
@@ -459,9 +460,10 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   100 MiB. A national NeTEx of 2 GB zipped (~40 GB unpacked) takes about 11 minutes, so
   `RLIMIT_CPU` is 40 minutes (twice an archive packing 30 times, on a slower core).
 - **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,
-  `no_stop_place`, `no_rail_stop`, the MSMM limits, a `resource_limit` of memory or processor time)
-  is kept as `<cache name>.failed` with the signature of every bound; the next caller (cache-only
-  too) gets the reason at once until the archive, the extractor or a bound changes. The warm makes
+  `no_stop_place`, `no_rail_stop`, the MSMM limits, a `resource_limit` of memory or processor time,
+  of the wall clock the second time in a row) is kept as `<cache name>.failed` with the format read and
+  the signature of every bound and of the readers' code; the next caller (cache-only too) gets the
+  reason at once until the archive, the format, the extractor, a bound or the readers' code changes. The warm makes
   the smallest timetable files first; a send pass sends first the feeds that need no extraction,
   then by file size.
 - **Cache**: `inbox/<sid>/_extracts/<provider>.<archive sha256>.<16 hex of extractor version, feed
