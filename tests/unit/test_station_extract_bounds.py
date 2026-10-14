@@ -488,8 +488,8 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
         ("nice", 10),
     ]
     assert station_extract.CHILD_MEMORY_BYTES == 2 * 1024 * MIB
-    assert station_extract.CHILD_CPU_SECONDS == 25 * 60
-    assert station_extract.CHILD_WALL_SECONDS == 30 * 60
+    assert station_extract.CHILD_CPU_SECONDS == 40 * 60
+    assert station_extract.CHILD_WALL_SECONDS == 45 * 60
     assert station_extract.CHILD_NICE == 10
 
 
