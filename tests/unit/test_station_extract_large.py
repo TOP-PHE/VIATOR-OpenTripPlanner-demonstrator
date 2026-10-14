@@ -32,6 +32,7 @@ import json
 import os
 import random
 import signal
+import struct
 import time
 import tracemalloc
 import zipfile
@@ -222,6 +223,9 @@ def test_only_stored_or_deflated_members(tmp_path: Path, packing: int) -> None:
         for name, data in files.items():
             zf.writestr(name, data, compress_type=packing if name == "stop_times.txt" else None)
     assert _reason(_provider(), other, tmp_path) == "bad_archive"
+    with pytest.raises(ExtractError) as refused:
+        build_extract(_provider(), other, SHA_A, extracted_at=WHEN, cache_dir=tmp_path / "d")
+    assert refused.value.detail == "a member neither stored nor deflated"
     xml = tmp_path / "x.zip"
     with zipfile.ZipFile(xml, "w") as zf:
         zf.writestr("a.xml", _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE), packing)
@@ -253,6 +257,26 @@ def test_many_small_members_share_one_bound(
 
     monkeypatch.setattr(netex, "open_member", never)
     assert _reason(_provider("netex_epip"), archive, tmp_path) == "input_too_large"
+
+
+def test_a_declared_size_never_believed_past_the_file(tmp_path: Path) -> None:
+    """Confirm review of #358: a member never opened is never checked, so a
+    readme whose declared packed size is patched to 2 GB must not lift the
+    bound of the members read together (the central directory's offset caps
+    the packed bytes)."""
+    archive = _gtfs(tmp_path)
+    with zipfile.ZipFile(archive, "a") as zf:
+        zf.writestr("readme.txt", "zz")
+    data = bytearray(archive.read_bytes())
+    entry = data.rfind(b"PK\x01\x02")  # the readme's entry, the last one
+    assert data[entry + 46 : entry + 56] == b"readme.txt"
+    struct.pack_into("<I", data, entry + 20, 0x7FFFFFFF)
+    patched = tmp_path / "patched.zip"
+    patched.write_bytes(bytes(data))
+    with zipfile.ZipFile(patched) as zf:
+        assert zf.getinfo("readme.txt").compress_size == 0x7FFFFFFF
+        assert station_extract_common.archive_bound(zf) == 64 * MIB
+        assert zf.start_dir < len(data)
 
 
 def test_the_pass_budget_counts_every_read(tmp_path: Path) -> None:
@@ -1128,11 +1152,24 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     assert child.runs == 2
     (marker,) = lock_dir.glob("*.failed")
     assert json.loads(marker.read_text())["walls"] == 2
+    # a child killed in between starts the count again
+    marker.unlink()
+    _ensure(archive, lock_dir)  # one wall-clock stop
+    child.fail = ExtractError("resource_limit", f"the child ended with {-signal.SIGKILL}")
+    _ensure(archive, lock_dir)
+    assert not list(lock_dir.glob("*.failed"))
+    child.fail = wall
+    _ensure(archive, lock_dir)  # one again, not two
+    runs = child.runs
+    _ensure(archive, lock_dir)
+    assert child.runs == runs + 1
+    (marker,) = lock_dir.glob("*.failed")
     # the count is the marker's: without it, one stop is tried again
     marker.unlink()
+    runs = child.runs
     _ensure(archive, lock_dir)
     _ensure(archive, lock_dir)
-    assert child.runs == 4
+    assert child.runs == runs + 2
 
 
 @pytest.mark.parametrize(

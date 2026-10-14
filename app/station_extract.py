@@ -609,8 +609,9 @@ def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
 # The reasons the same archive would give again, read by the same extractor
 # under the same bounds: remembered, so that it is not read again. A child
 # killed from outside is not; one past its wall clock (a busy machine) is
-# remembered only the second time in a row (`WALL_CLOCK_TRIES`), so that a
-# national archive does not hold the machine 45 minutes at every pass.
+# remembered only the second time in a row (`WALL_CLOCK_TRIES`; a child that
+# fails otherwise in between starts the count again), so that a national
+# archive does not hold the machine 45 minutes at every pass.
 # `busy`, `cache` and `error` are never remembered.
 REMEMBERED_REASONS = frozenset(
     {
@@ -752,6 +753,11 @@ def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> N
         walls = before.get("walls") if before is not None else None
         record["walls"] = (walls if isinstance(walls, int) else 0) + 1
     elif error.reason not in REMEMBERED_REASONS and not _remembered_detail(error):
+        # Not remembered (killed from outside, an error): a wall-clock count
+        # begun before is not "in a row" any more.
+        before = _failure(final, fmt)
+        if before is not None and "walls" in before:
+            _failed_path(final).unlink(missing_ok=True)
         return
     target = _failed_path(final)
     try:

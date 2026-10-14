@@ -155,8 +155,12 @@ _TOO_LARGE_ARCHIVE = "the archive unpacks past VIATOR's bound"
 def archive_bound(zf: zipfile.ZipFile) -> int:
     """The most bytes the members read together may unpack to: `RATIO_MAX`
     times the packed bytes of the whole archive, at least
-    `RATIO_FLOOR_BYTES`, at most `ARCHIVE_MAX_BYTES`."""
-    packed = sum(info.compress_size for info in zf.infolist())
+    `RATIO_FLOOR_BYTES`, at most `ARCHIVE_MAX_BYTES`. The packed bytes are
+    those the central directory declares, never more than lie before it
+    (`start_dir`, its offset in the file): a member never opened is never
+    checked, so its declared size is not believed past the file itself."""
+    declared = sum(info.compress_size for info in zf.infolist())
+    packed = min(declared, max(0, int(getattr(zf, "start_dir", declared))))
     return min(ARCHIVE_MAX_BYTES, max(RATIO_FLOOR_BYTES, RATIO_MAX * packed))
 
 
@@ -169,7 +173,7 @@ def check_declared(zf: zipfile.ZipFile, names: list[str]) -> None:
     for name in names:
         info = zf.getinfo(name)
         if info.compress_type not in PACKINGS:
-            raise ArchiveError("bad_archive", "a member packed otherwise than deflate")
+            raise ArchiveError("bad_archive", "a member neither stored nor deflated")
         if info.file_size > member_bound(info):
             raise ArchiveError("input_too_large", _TOO_LARGE_MEMBER)
         total += info.file_size

@@ -2944,7 +2944,8 @@ the extracts changes no graph build.
   release changes the extractor's version, one of its bounds or the code of
   its readers, or after you delete that `.failed` file. A child stopped by
   its wall clock (a busy server) is tried once more, and remembered the
-  second time in a row; `busy` and `error` are never remembered: the next
+  second time in a row (a child killed or failing otherwise in between
+  starts the count again); `busy` and `error` are never remembered: the next
   pass tries again.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an

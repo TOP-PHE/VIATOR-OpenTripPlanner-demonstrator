@@ -989,7 +989,7 @@ With `cache_only=True` it returns a valid cached extract or raises `not_cached`,
 waiting for an extraction (the worker before a graph build). A failure the same archive would meet
 again (`REMEMBERED_REASONS`: `bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`, the
 four MSMM limits, a `resource_limit` of memory or processor time, and one of the wall clock the
-second time in a row) is remembered in `<cache name>.failed` beside the cache, with the format it was
+second time in a row, a child killed or failing otherwise in between starting the count again) is remembered in `<cache name>.failed` beside the cache, with the format it was
 read as and the signature of every bound and of the extraction's code (`_code_signature`: this module
 and the readers' files): the next caller (cache-only too) gets that reason at once, `"remembered"` as
 its detail, until the archive, the provider's format or columns, the extractor version, a bound or
@@ -1001,7 +1001,8 @@ fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothin
 `feed_intake.resolver_identity` / `url_identity`; `EXTRACTOR_VERSION` names the rules. The readers
 stream and **bound what they read**, not only what they write: the bytes a member unpacks to (at
 most 200 times its packed size, 64 MiB at least, 160 GiB at most), the members read together (200
-times the packed bytes of the whole archive, 64 MiB at least) and one reading pass (160 GiB), only
+times the packed bytes of the whole archive, never counted past the central directory's offset, 64
+MiB at least) and one reading pass (160 GiB), only
 stored or deflated members (bzip2 and lzma: `bad_archive`), checked on the sizes the zip's central
 directory declares before anything is read (zipfile never gives more than a member's declared size),
 then counted as read; members a reader never opens are never checked; GTFS records of at most 1 MiB and 200 fields (counted
