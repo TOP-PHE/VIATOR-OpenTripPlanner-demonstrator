@@ -39,6 +39,9 @@ MODULE_ROW = {
     "country_iso": "ZZ",
     "uic": "9900001",
 }
+# The fields of the module's referential a typeahead row carries, null when
+# the module gives none (here: a module from before them).
+NO_REFERENTIAL = {"viator_id": None, "uic_origin": None, "licence": None}
 VIATOR_ROW = {
     "name": "Zzton",
     "latitude": 46.0,
@@ -449,7 +452,7 @@ def test_the_module_rows_pass_through_tagged_msmm(
 
     answer = _post(client, {"q": "Zzville"}, cookies)
 
-    assert answer.json() == [{**MODULE_ROW, "source": "msmm"}]
+    assert answer.json() == [{**MODULE_ROW, **NO_REFERENTIAL, "source": "msmm"}]
     assert fallback.calls == []
 
 
@@ -471,7 +474,9 @@ def test_a_module_row_holding_a_lone_surrogate_is_dropped_never_a_500(
     answer = _post(client, {"q": "Zzville"}, cookies)
 
     assert answer.status_code == 200
-    assert json.loads(answer.content.decode("utf-8")) == [{**MODULE_ROW, "source": "msmm"}]
+    assert json.loads(answer.content.decode("utf-8")) == [
+        {**MODULE_ROW, **NO_REFERENTIAL, "source": "msmm"}
+    ]
     assert fallback.calls == []
 
 
@@ -610,7 +615,9 @@ def test_a_text_refused_by_the_module_is_viators_422_and_warns_without_the_text(
     ]
     assert "Zzmarker" not in caplog.text
     module.response = httpx.Response(200, json={"stations": [MODULE_ROW]})
-    assert _post(client, {"q": "Zzville"}, cookies).json() == [{**MODULE_ROW, "source": "msmm"}]
+    assert _post(client, {"q": "Zzville"}, cookies).json() == [
+        {**MODULE_ROW, **NO_REFERENTIAL, "source": "msmm"}
+    ]
     assert len(module.requests) == 2
 
 
