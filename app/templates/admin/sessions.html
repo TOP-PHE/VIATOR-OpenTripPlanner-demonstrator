@@ -1672,11 +1672,33 @@ function progressTime(iso) {
   return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
 }
 
+// "12.3 GB of 40.1 GB (31 %)", or "12.3 GB <unknownWord>" without a total.
+function progressAmount(done, total, unknownWord) {
+  if (!total) return `${progressBytes(done)} ${unknownWord}`;
+  const pct = Math.min(100, Math.floor((done * 100) / total));
+  return `${progressBytes(done)} of ${progressBytes(total)} (${pct} %)`;
+}
+
+// What the current task is doing. A record written before steps existed
+// (no `step`) reads as before: bytes of the download, or the label alone.
+function progressStepText(c) {
+  if (c.step === 'verifying') return 'verifying (format check)';
+  if (c.step === 'storing') return 'storing';
+  if (c.step === 'checking_structure') {
+    const scanned = c.scanned === null || c.scanned === undefined
+      ? '' : `, ${progressAmount(c.scanned, c.scan_total, 'scanned')}`;
+    return `checking structure${scanned}`;
+  }
+  if (c.bytes === null || c.bytes === undefined) return '';
+  const amount = progressAmount(c.bytes, c.expected, 'received');
+  return c.step === 'downloading' ? `downloading, ${amount}` : amount;
+}
+
 function progressCurrentLine(c) {
-  if (c.bytes === null || c.bytes === undefined) return `Now: ${c.key}`;
-  if (!c.expected) return `Now: ${c.key} — ${progressBytes(c.bytes)} received`;
-  const pct = Math.min(100, Math.floor((c.bytes * 100) / c.expected));
-  return `Now: ${c.key} — ${progressBytes(c.bytes)} of ${progressBytes(c.expected)} (${pct} %)`;
+  const what = progressStepText(c);
+  const since = c.elapsed_seconds === null || c.elapsed_seconds === undefined
+    ? '' : ` · for ${progressElapsed(c.elapsed_seconds)}`;
+  return what ? `Now: ${c.key} — ${what}${since}` : `Now: ${c.key}${since}`;
 }
 
 function progressHeadLine(rec) {

@@ -270,6 +270,85 @@ def test_failed_and_interrupted_refreshes_say_what_happened() -> None:
     )
 
 
+def _step(step: str | None, **changes: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "key": "provider[ZZRAIL].timetable(netex_epip)",
+        "bytes": 2_000_000_000,
+        "expected": 2_000_000_000,
+        "step": step,
+        "scanned": None,
+        "scan_total": None,
+        "elapsed_seconds": 18 * 60,
+    }
+    item.update(changes)
+    return item
+
+
+def _now_line(item: dict[str, Any]) -> str:
+    lines = _lines(_render({"providers": _record(current=[item], failed_keys=[])}))
+    return next(line for line in lines if line.startswith("Now: "))
+
+
+@pytest.mark.parametrize(
+    ("item", "line"),
+    [
+        (
+            _step("downloading", bytes=49_500_000, expected=99_000_000, elapsed_seconds=99),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — downloading, 49.5 MB of 99.0 MB"
+            " (50 %) · for 1 min 39 s",
+        ),
+        (
+            _step("verifying"),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — verifying (format check)"
+            " · for 18 min 0 s",
+        ),
+        (
+            _step("checking_structure", scanned=12_300_000_000, scan_total=40_100_000_000),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — checking structure,"
+            " 12.3 GB of 40.1 GB (30 %) · for 18 min 0 s",
+        ),
+        (
+            _step("checking_structure", scanned=990_000, scan_total=None),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — checking structure,"
+            " 990.0 KB scanned · for 18 min 0 s",
+        ),
+        (
+            _step("checking_structure"),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — checking structure · for 18 min 0 s",
+        ),
+        (
+            _step("storing", elapsed_seconds=None),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — storing",
+        ),
+        (
+            _step(None, key="cross-border filters", bytes=None, expected=None, elapsed_seconds=9),
+            "Now: cross-border filters · for 9 s",
+        ),
+    ],
+)
+def test_the_current_task_says_which_step_it_is_in(item: dict[str, Any], line: str) -> None:
+    assert _now_line(item) == line
+
+
+def test_a_record_written_before_steps_still_renders_as_before() -> None:
+    """Rows written by the previous version: no step, no elapsed per task."""
+    legacy = {"key": "provider[ZZRAIL].timetable(gtfs)", "bytes": 1_990_000_000, "expected": None}
+    assert _now_line(legacy) == "Now: provider[ZZRAIL].timetable(gtfs) — 2.0 GB received"
+    full = {**legacy, "expected": 1_990_000_000}
+    assert _now_line(full) == "Now: provider[ZZRAIL].timetable(gtfs) — 2.0 GB of 2.0 GB (100 %)"
+    bare = {"key": "osm_pbf"}
+    assert _now_line(bare) == "Now: osm_pbf"
+
+
+def test_a_step_line_never_parses_a_value_as_html() -> None:
+    hostile = '<img src=x onerror="alert(99)">'
+    item = _step("checking_structure", key=hostile, scanned=9, scan_total=99)
+    result = _render({"providers": _record(current=[item], failed_keys=[]), "osm": None})
+    lines = _lines(result)
+    assert f"Now: {hostile} — checking structure, 9 B of 99 B (9 %) · for 18 min 0 s" in lines
+    assert result["created"] == 2 + len(lines)
+
+
 def test_no_record_hides_the_block() -> None:
     assert _render({"providers": None, "osm": None})["hidden"] is True
 
