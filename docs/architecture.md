@@ -242,6 +242,7 @@ and is off unless both are set.
 | POST | `/api/sessions/{sid}/uploads` | Multipart feed upload → `ingestion.dispatch` | content_manager |
 | POST | `/api/sessions/{sid}/sources/refresh` | Download every non-OSM provider URL | content_manager |
 | POST | `/api/sessions/{sid}/sources/osm/refresh` | OSM **only** — kept separate on purpose | content_manager |
+| GET | `/api/sessions/{sid}/sources/progress` | The progress records of the latest provider refresh and OSM refresh (issue #359); both POSTs above answer 409 `refresh_already_running` while one of their kind runs | content_manager |
 | POST | `/api/sessions/{sid}/providers/import-from-nap` | Preview/commit bulk provider import | platform_admin |
 | POST | `/api/sessions/{sid}/providers/{pid}/refresh` | Refresh one provider | content_manager |
 | GET | `/api/sessions/{sid}/providers/status` | Per-provider file/staleness state; `station_extract`, the last time its stop extract went to the station module (sent / already held / refused <reason> / skipped / module unavailable) | content_manager |
@@ -823,6 +824,7 @@ went into which build; and stale files silently produce a build the operator thi
 | `app/staleness.py` | Two timestamps in `config._meta` answering "are the downloaded files in sync with the configured URLs?" |
 | `app/inbox_sweep.py` | Quarantines inbox files belonging to providers the operator has since removed. |
 | `app/station_extract.py` (+ `_gtfs`, `_netex`, `_skip`, `_common`) | The **stop extract** of each timetable feed for the station module (MSMM 22.2): one gzip CSV per feed version, the rail stations only, with their codes; the MSMM feed key of a provider; the cache in `inbox/<sid>/_extracts/`. Made at refresh and upload time; nothing in the graph build reads it. |
+| `app/refresh_progress.py` | The **progress record** of a session's provider refresh and OSM refresh (issue #359; table `source_refresh_progress`): claim (one refresh of a kind at a time, 409 otherwise), a 30 s heartbeat with a 5-minute lease, counts and the bytes of the download under way (fed by `feed_fetch.download_progress`), the station-module follow-up; read by `GET /api/sessions/{sid}/sources/progress` and the Sessions page's progress block. |
 
 ### How it works
 
@@ -1138,6 +1140,24 @@ GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall cloc
   *nothing* rather than quarantining everything. Silent no-op, by design.
 - **`record_snapshot` accepts `source_uploads` OR `source_inputs`, never both** (raises). The worker
   uses `source_inputs`.
+- **The refresh progress lives in the database, never in a process** (`app/refresh_progress.py`).
+  `web` runs one uvicorn process today, but a second one (or a second container) must see the same
+  record and the same refusal: the claim is one transaction (`INSERT … ON CONFLICT DO UPDATE …
+  WHERE state <> 'running'`, the row locked), the clock is PostgreSQL's `now()`, and every write
+  names the refresh's `run_id` and requires `running`. A refresh whose heartbeat stopped for
+  `LEASE_SECONDS` is `interrupted` and loses the row; if it was only blocked, its later writes change
+  nothing (one WARNING `refresh_progress.lease_lost`). Never block the event loop of a refresh for
+  minutes: the heartbeat is a task of that loop. The POST stays synchronous (the request still holds
+  the refresh, nginx's 600 s timeout and the page's gateway-error path unchanged); the page polls the
+  GET beside it. Bytes are written at most every 2 s or 5 % of a feed: never add a write per chunk.
+  The record holds labels and counts only: a skip reason can quote a URL, so reasons stay in the
+  feed-status store and never enter `detail`. A refresh that finds its lease lost (`run.lost`) starts no
+  further download. Inside `async with run` the progress writes go to one writer thread in order (the
+  loop never waits on the database); the end waits for them. The station-module follow-up is written
+  by the sender thread into the record of the refresh that queued it (`run_id` carried in the queue;
+  fenced by that `run_id` and `state = 'finished'`); a silent follow-up (queued 35 min, or running
+  5 min without its 30 s beat) reads `interrupted`. A per-provider Refresh writes no record but is
+  refused (409) while a whole-session provider refresh runs.
 
 ---
 
@@ -1863,7 +1883,7 @@ Two design commitments shape the whole schema:
 | `search.py` | `journey_searches`, `journey_search_executions`, `journey_trips` | The three-level record of one search |
 | `network_coverage.py` | `network_coverage_runs`, `network_coverage_results`, `network_coverage_hubs` | The N×N matrix: run, cell, and the axis stations |
 | `master.py` | `master_stations`, `route_aliases`, `master_carriers`, + 2 `*_pending_drift` mirrors | The UIC station registry and its upstream-drift inbox |
-| `runtime.py` | `stations_xref`, `mct_overrides` | Per-session bridge from a feed's stop IDs to UIC; minimum connection times |
+| `runtime.py` | `stations_xref`, `mct_overrides`, `source_refresh_progress` | Per-session bridge from a feed's stop IDs to UIC; minimum connection times; the progress of the latest provider and OSM refresh (issue #359) |
 | `credentials.py` | `user_credentials` | AES-256-GCM encrypted API keys for authenticated feeds |
 | `nap_catalogues.py` | `nap_catalogues` | Saved National Access Point endpoints |
 | `config.py` | `platform_config` | Runtime-tunable key/value knobs |

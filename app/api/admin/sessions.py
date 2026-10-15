@@ -5,6 +5,7 @@ Phase-A.5 wiring (this file):
 
 - `POST /<sid>/uploads`         multipart upload → ingestion.dispatch()
 - `POST /<sid>/sources/refresh` httpx-download URLs from config.sources
+- `GET  /<sid>/sources/progress` the refreshes' progress records (issue #359)
 - `POST /<sid>/rebuilds`        enqueue OTP build job (worker picks up)
 - `GET  /<sid>/rebuilds`        list this session's rebuild jobs
 - `POST /<sid>/promote`         regenerate compose+nginx fragments, signal
@@ -51,6 +52,7 @@ from ... import (
     inbox_sweep,
     ingestion,
     nap_source_map,
+    refresh_progress,
     sessions_orchestrator,
     staleness,
     station_builds,
@@ -1134,7 +1136,33 @@ class ProviderStatus(BaseModel):
 _PROVIDER_FRESHNESS_HOURS = 24
 
 
-@router.post("/{sid}/sources/refresh", response_model=RefreshSourcesResponse)
+def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) -> None:
+    """The session's state and staleness after a provider refresh."""
+    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        s.state = SessionState.POPULATED.value
+
+    # Staleness tracking (v0.1.7.1): mark refresh completed so the next
+    # rebuild is no longer flagged stale. Done only when at least one
+    # task fetched or confirmed its file current — if every URL failed,
+    # the on-disk data is still stale and the operator needs to know.
+    if fetched or unchanged:
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
+
+
+@router.post(
+    "/{sid}/sources/refresh",
+    responses={
+        400: {"description": "No JWT actor, or no sources configured."},
+        404: {"description": "Session not found."},
+        409: {
+            "description": "A refresh of this kind is already running for the session "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_sources(
     sid: str,
     request: Request,
@@ -1171,61 +1199,56 @@ async def refresh_sources(
     # endpoint so refreshing a GTFS feed doesn't accidentally bust the
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(s.config or {}, include_osm=False)
-    fetched, unchanged, skipped = await _gather_refresh_outcomes(
-        db, sid, staging, s.config or {}, work
+    # Issue #359: the progress record every page reads; 409 while one runs.
+    run = _claim_refresh(
+        sid, refresh_progress.PROVIDERS, len(work) + _derived_count(s.config or {})
     )
+    async with run:
+        fetched, unchanged, skipped = await _gather_refresh_outcomes(
+            db, sid, staging, s.config or {}, work, run
+        )
+        run.phase(refresh_progress.FINISHING)
 
-    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-        s.state = SessionState.POPULATED.value
+        _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
 
-    # Staleness tracking (v0.1.7.1): mark refresh completed so the next
-    # rebuild is no longer flagged stale. Done only when at least one
-    # task fetched or confirmed its file current — if every URL failed,
-    # the on-disk data is still stale and the operator needs to know.
-    if fetched or unchanged:
-        if s.config is None:
-            s.config = {}
-        staleness.mark_refresh_completed(s.config)
-        flag_modified(s, "config")
+        # §12 — single-source-of-truth cascade. When this session's feeds actually
+        # changed, re-derive every cross_border_filter provider (in other sessions)
+        # that's linked to a provider here. So refreshing the Renfe national feed
+        # automatically rebuilds the corridors cross-border view — no human has to
+        # remember the second one.
+        cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
 
-    # §12 — single-source-of-truth cascade. When this session's feeds actually
-    # changed, re-derive every cross_border_filter provider (in other sessions)
-    # that's linked to a provider here. So refreshing the Renfe national feed
-    # automatically rebuilds the corridors cross-border view — no human has to
-    # remember the second one.
-    cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
+        # PR #33 — sweep orphaned inbox files left behind by providers that
+        # used to be in `sources.providers` but no longer are. Without this,
+        # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
+        # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
+        # — operator thinks they removed BrittanyFerries, build still fails
+        # on BrittanyFerries' data. Surfaced 2026-05-11.
+        expected = inbox_sweep.expected_provider_filenames(s.config or {})
+        orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
 
-    # PR #33 — sweep orphaned inbox files left behind by providers that
-    # used to be in `sources.providers` but no longer are. Without this,
-    # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
-    # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
-    # — operator thinks they removed BrittanyFerries, build still fails
-    # on BrittanyFerries' data. Surfaced 2026-05-11.
-    expected = inbox_sweep.expected_provider_filenames(s.config or {})
-    orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
-
-    audit.record(
-        db,
-        action="session.sources.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
-            "fetched": [f["key"] for f in fetched],
-            "unchanged": [u["key"] for u in unchanged],
-            "skipped": [s_["key"] for s_ in skipped],
-            "orphaned": orphaned,  # PR #33
-            "cascaded": _cascade_keys(cascaded),
-        },
-    )
-    db.commit()
+        audit.record(
+            db,
+            action="session.sources.refreshed",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
+            metadata={
+                "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
+                "fetched": [f["key"] for f in fetched],
+                "unchanged": [u["key"] for u in unchanged],
+                "skipped": [s_["key"] for s_ in skipped],
+                "orphaned": orphaned,  # PR #33
+                "cascaded": _cascade_keys(cascaded),
+            },
+        )
+        db.commit()
     _queue_extracts(background, sid, s.config, bool(fetched or unchanged))
     # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
     # the stop extracts the station module lacks are sent, by the process's
     # sender thread (the refresh never waits on the module).
-    station_extract_upload.after_refresh(sid)
+    station_extract_upload.after_refresh(sid, run_id=run.run_id)
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -1233,6 +1256,23 @@ async def refresh_sources(
         orphaned=orphaned,
         cascaded=cascaded,
     )
+
+
+@router.get("/{sid}/sources/progress", responses={404: {"description": "Session not found."}})
+def get_refresh_progress(
+    sid: str,
+    db: Annotated[DbSession, Depends(get_db)],
+    actor: Annotated[CurrentUser, Depends(require_content_manager)],
+) -> dict[str, Any]:
+    """The progress of the session's latest provider refresh and OSM refresh
+    (issue #359; app/refresh_progress.py): `{"providers": record | None,
+    "osm": record | None, "now"}`. Read from the database, so it survives a
+    page reload and is the same for every tab, browser and web process. The
+    same role as the refresh buttons: whoever may start a refresh may watch
+    it. Labels and counts only: never a URL or a reason text."""
+    if db.get(SessionRow, sid) is None:
+        raise HTTPException(404, "Session not found")
+    return refresh_progress.read(sid)
 
 
 # ──── OSM-only refresh (v0.1.14) ────
@@ -1298,7 +1338,17 @@ class RefreshOsmResponse(BaseModel):
     rotated: list[str]
 
 
-@router.post("/{sid}/sources/osm/refresh", response_model=RefreshOsmResponse)
+@router.post(
+    "/{sid}/sources/osm/refresh",
+    responses={
+        400: {"description": "No JWT actor, or config.sources.osm_pbf is unset."},
+        404: {"description": "Session not found."},
+        409: {
+            "description": "A refresh of this kind is already running for the session "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_osm(
     sid: str,
     request: Request,
@@ -1344,47 +1394,54 @@ async def refresh_osm(
     # Rotate BEFORE downloading so a failed fetch leaves the previous
     # generation in place but recoverable from .old.1 (operator can mv it
     # back to osm.pbf if they need it).
-    rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
+    # Issue #359: claimed before the rotation, so a refused second click
+    # rotates nothing.
+    run = _claim_refresh(sid, refresh_progress.OSM, 1)
+    async with run:
+        rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
 
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+        fetched: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
 
-    # Pass staged_filename="osm.pbf" so dispatch uses the targeted-rotation
-    # branch (only rotates the exact file). The legacy "rotate everything
-    # not ending in .old" branch would re-rotate our .old.<N> generations,
-    # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
-    task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        outcome = await _refresh_one_task(client, db, sid, staging, task)
-        if outcome.get("status") == "fetched":
-            fetched.append({k: v for k, v in outcome.items() if k != "status"})
-        else:
-            skipped.append({k: v for k, v in outcome.items() if k != "status"})
+        # Pass staged_filename="osm.pbf" so dispatch uses the targeted-rotation
+        # branch (only rotates the exact file). The legacy "rotate everything
+        # not ending in .old" branch would re-rotate our .old.<N> generations,
+        # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
+        task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+            with run.task(task.label):
+                outcome = await _refresh_one_task(client, db, sid, staging, task)
+            run.done(task.label, outcome)
+            if outcome.get("status") == "fetched":
+                fetched.append({k: v for k, v in outcome.items() if k != "status"})
+            else:
+                skipped.append({k: v for k, v in outcome.items() if k != "status"})
+        run.phase(refresh_progress.FINISHING)
 
-    if fetched:
-        if s.config is None:
-            s.config = {}
-        staleness.mark_refresh_completed(s.config)
-        flag_modified(s, "config")
+        if fetched:
+            if s.config is None:
+                s.config = {}
+            staleness.mark_refresh_completed(s.config)
+            flag_modified(s, "config")
 
-    audit.record(
-        db,
-        action="session.osm.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "url": osm_url,
-            "rotated": rotated,
-            "fetched": [f["key"] for f in fetched],
-            "skipped": [s_["key"] for s_ in skipped],
-            # Flagged so monitoring can alert on osm refreshes (they're rare
-            # by intent — every one invalidates the streetGraph cache).
-            "invalidates_street_graph_cache": bool(fetched),
-        },
-    )
-    db.commit()
+        audit.record(
+            db,
+            action="session.osm.refreshed",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
+            metadata={
+                "url": osm_url,
+                "rotated": rotated,
+                "fetched": [f["key"] for f in fetched],
+                "skipped": [s_["key"] for s_ in skipped],
+                # Flagged so monitoring can alert on osm refreshes (they're rare
+                # by intent — every one invalidates the streetGraph cache).
+                "invalidates_street_graph_cache": bool(fetched),
+            },
+        )
+        db.commit()
     return RefreshOsmResponse(fetched=fetched, skipped=skipped, rotated=rotated)
 
 
@@ -1635,15 +1692,37 @@ async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> lis
     return outcomes
 
 
+def _derived_count(config: dict[str, Any]) -> int:
+    """How many outcomes `_run_derived_filters` gives for this config."""
+    try:
+        providers = ingestion.normalize_providers(config)
+    except ValueError:
+        return 0
+    return sum(
+        1 for p in providers if (p.get("timetable") or {}).get("source") == "cross_border_filter"
+    )
+
+
+def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
+    """The session's progress record for this refresh (issue #359); 409 with
+    the running refresh's start time while another one of `scope` runs."""
+    try:
+        return refresh_progress.claim(sid, scope, total)
+    except refresh_progress.RefreshRunning as exc:
+        raise HTTPException(409, detail=exc.detail()) from exc
+
+
 async def _gather_refresh_outcomes(
     db: DbSession,
     sid: str,
     staging: Path,
     config: dict[str, Any],
     work: list[_RefreshTask],
+    run: refresh_progress.RefreshRun | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Run the URL-download tasks then the derived (cross_border_filter)
     providers, partitioning every outcome into (fetched, unchanged, skipped).
+    `run`, when given, records each task's start, bytes and outcome.
 
     Derived providers are materialised after the URL downloads so a same-session
     national+derived pair resolves in one refresh (see
@@ -1651,8 +1730,24 @@ async def _gather_refresh_outcomes(
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
-            _bucket_outcome(buckets, await _refresh_one_task(client, db, sid, staging, task))
+            if run is not None and run.lost:
+                # Another refresh took the record over (this one stalled past
+                # its lease): start no more downloads.
+                return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
+            if run is None:
+                outcome = await _refresh_one_task(client, db, sid, staging, task)
+            else:
+                with run.task(task.label):
+                    outcome = await _refresh_one_task(client, db, sid, staging, task)
+                run.done(task.label, outcome)
+            _bucket_outcome(buckets, outcome)
+    if run is not None and run.lost:
+        return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
+    if run is not None and _derived_count(config):
+        run.phase(refresh_progress.DERIVED, refresh_progress.DERIVED_LABEL)
     for outcome in await _run_derived_filters(db, sid, config, staging):
+        if run is not None:
+            run.done(str(outcome.get("key")), outcome)
         _bucket_outcome(buckets, outcome)
     return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
 
@@ -2437,7 +2532,17 @@ async def _refresh_provider_urls(
     )
 
 
-@router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
+@router.post(
+    "/{sid}/providers/{pid}/refresh",
+    responses={
+        400: {"description": "No JWT actor, an invalid config, or no URL to refresh."},
+        404: {"description": "Session or provider not found."},
+        409: {
+            "description": "A whole-session provider refresh is running "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_provider(
     sid: str,
     pid: str,
@@ -2472,6 +2577,15 @@ async def refresh_provider(
             404,
             f"Provider {pid!r} not found in session {sid!r}. "
             f"Known providers: {[p['id'] for p in providers]}",
+        )
+
+    # Issue #359: not while a whole-session refresh of this session runs (it
+    # downloads this provider too). Read only: this refresh has no record.
+    running = refresh_progress.running_since(sid, refresh_progress.PROVIDERS)
+    if running is not None:
+        raise HTTPException(
+            409,
+            detail=refresh_progress.RefreshRunning(refresh_progress.PROVIDERS, running).detail(),
         )
 
     staging = settings.inbox_dir / sid / "_staging"
@@ -2867,7 +2981,14 @@ def suggest_osm_countries(
     )
 
 
-@router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
+@router.post(
+    "/{sid}/rebuilds",
+    status_code=201,
+    responses={
+        400: {"description": "No transit feed or no OSM PBF staged yet."},
+        404: {"description": "Session not found."},
+    },
+)
 def enqueue_rebuild(
     sid: str,
     request: Request,

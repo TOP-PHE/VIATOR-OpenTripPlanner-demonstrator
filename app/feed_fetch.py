@@ -42,6 +42,8 @@ import re
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -91,6 +93,17 @@ _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _STATE_NAME_MAX = 200
 _STATE_NAME_OK = re.compile(rf"[A-Za-z0-9_.-]{{1,{_STATE_NAME_MAX}}}")
 _DISPOSITION_RE = re.compile(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", re.IGNORECASE)
+
+
+# The download progress of the refresh task that runs in this context
+# (app/refresh_progress.py `RefreshRun.task`): called after each chunk with
+# the bytes received so far and the full file's size the server announced
+# (`_Transfer.total`: the Content-Length of a plain, not content-encoded 200,
+# kept across resumes; None when unknown). The callable throttles its own
+# writes; an exception in it never stops a download.
+download_progress: ContextVar[Callable[[int, int | None], None] | None] = ContextVar(
+    "download_progress", default=None
+)
 
 
 class FetchError(Exception):
@@ -314,6 +327,16 @@ def _download_error(exc: httpx.HTTPError, fetch_url: str, state_url: str) -> str
 # ──────────────────────────── download ────────────────────────────
 
 
+def _report_progress(received: int, expected: int | None) -> None:
+    report = download_progress.get()
+    if report is None:
+        return
+    try:
+        report(received, expected)
+    except Exception as exc:  # progress is shown, never needed
+        log.warning("download progress not reported: %s", type(exc).__name__)
+
+
 class _Restart(Exception):
     """The partial file cannot be continued (the server sent another version,
     another range, or no range at all): download again from byte 0."""
@@ -394,6 +417,8 @@ class _Transfer:
                 await asyncio.to_thread(out.write, chunk)
                 self.digest.update(chunk)
                 self.size += len(chunk)
+                # The full file's size, a resumed range included (issue #359).
+                _report_progress(self.size, self.total)
         finally:
             await asyncio.to_thread(out.close)
         if self.total is not None and self.size < self.total:

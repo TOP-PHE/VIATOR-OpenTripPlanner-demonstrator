@@ -7,7 +7,7 @@ Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `do
 (module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
 traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
 
-Last updated: 2026-10-14 (stop extracts of large national archives: ratio guard, NeTEx skip filter, remembered failures, smallest feeds first). §2/§3/§5/§7
+Last updated: 2026-10-15 (refresh progress record and block, #359; before it 2026-10-14: stop extracts of large national archives: ratio guard, NeTEx skip filter, remembered failures, smallest feeds first). §2/§3/§5/§7
 curated through #245; #206–#227 triaged in the same pass.
 
 **Rule: no query string and no token path in logs or spans.** Any URL that reaches a log line or an
@@ -196,6 +196,10 @@ app/
 ├── sessions_orchestrator.py             MOTIS/OTP docker container lifecycle (per-session); both templates carry viator.autoheal="true"
 ├── url_redaction.py                     The one rule for URLs in logs/spans (query values outside SAFE_QUERY_KEYS and
 │                                        token path segments → REDACTED); used by logging_config, worker and tracing
+├── refresh_progress.py                  Progress of provider / OSM refreshes in the DB (#359, `source_refresh_progress`):
+│                                        one refresh of a kind per session (409 `refresh_already_running`, never joined),
+│                                        30 s heartbeat / 5 min lease → `interrupted`, writes fenced by run_id, bytes ≤ 1
+│                                        write per 2 s or 5 %; labels and counts only, never a URL or a skip reason
 ├── api/
 │   ├── admin/network_coverage.py        Coverage matrix API (runs, results, cell-trips, verify-external, export,
 │   │                                    stop, delete). Also hosts _build_export_context / _build_cell_trips_response /

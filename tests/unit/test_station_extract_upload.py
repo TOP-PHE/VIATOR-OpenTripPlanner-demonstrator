@@ -1099,7 +1099,62 @@ def test_the_refresh_task_uses_the_refresh_budget(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(up, "send_session", send)
     up.send_after_refresh("zz", "ZZ0")
-    assert seen == {"sid": "zz", "budget": up.REFRESH_BUDGET_SECONDS, "only_provider": "ZZ0"}
+    # A one-provider refresh has no progress record to follow it (issue #359).
+    assert seen == {
+        "sid": "zz",
+        "budget": up.REFRESH_BUDGET_SECONDS,
+        "only_provider": "ZZ0",
+        "observer": None,
+    }
+
+
+def test_the_pass_of_a_session_refresh_is_followed_by_its_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+
+    from app import refresh_progress
+
+    seen: dict[str, Any] = {}
+
+    def send(sid: str, **kw: Any) -> up.PassResult:
+        seen.update(kw, sid=sid)
+        return up.PassResult()
+
+    monkeypatch.setattr(up, "send_session", send)
+    run_id = uuid.uuid4()
+    up.send_after_refresh("zz", run_id=run_id)
+    assert isinstance(seen["observer"], refresh_progress.ExtractFollowUp)
+    assert seen["observer"].run_id == run_id
+    assert seen["only_provider"] is None
+    up.send_after_refresh("zz")
+    assert seen["observer"] is None
+
+
+@pytest.mark.usefixtures("token")
+def test_a_waiting_pass_reports_to_the_latest_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    import uuid
+
+    ran: list[tuple[Any, ...]] = []
+    gate = threading.Event()
+    busy = threading.Event()
+
+    def send(sid: str, only_provider: str | None = None, run_id: Any = None) -> None:
+        if sid == "zz-busy":
+            busy.set()
+            gate.wait(5)
+        ran.append((sid, run_id))
+
+    monkeypatch.setattr(up, "send_after_refresh", send)
+    first, second = uuid.uuid4(), uuid.uuid4()
+    up.after_refresh("zz-busy")  # keeps the sender busy
+    assert busy.wait(5)
+    up.after_refresh("zz", run_id=first)
+    up.after_refresh("zz", run_id=second)  # still waiting: not queued twice
+    gate.set()
+    _drained()
+    assert ran == [("zz-busy", None), ("zz", second)]
 
 
 @pytest.mark.usefixtures("token")
@@ -1873,3 +1928,69 @@ def test_a_long_extraction_never_starves_the_small_feeds(
     setup.extractor.cached = True
     later = _send(setup, module, clock, budget=up.BUILD_BUDGET_SECONDS, cache_only=True)
     assert later.outcomes[0] == up.FeedOutcome("ZZ0", up.SENT)
+
+
+# ── the observer of a pass (the refresh progress record, issue #359) ─────
+
+
+class _Watcher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def started(self, total: int) -> None:
+        self.calls.append(("started", total))
+
+    def feed_started(self, provider_id: str) -> None:
+        self.calls.append(("feed", provider_id))
+
+    def outcome(self, outcome: up.FeedOutcome) -> None:
+        self.calls.append(("outcome", (outcome.provider_id, outcome.state, outcome.reason)))
+
+    def finished(self, end: str) -> None:
+        self.calls.append(("finished", end))
+
+
+@pytest.mark.usefixtures("token")
+def test_the_observer_is_told_each_feed_in_the_order_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    setup = Setup(tmp_path, monkeypatch, n=2)
+    _sized(setup, {"ZZ0": 9_999, "ZZ1": 99})
+    module.heads = [httpx.Response(200), httpx.Response(404)]
+    watcher = _Watcher()
+    _send(setup, module, clock, observer=watcher)
+    assert watcher.calls == [
+        ("started", 2),
+        ("feed", "ZZ1"),
+        ("outcome", ("ZZ1", up.HELD, None)),
+        ("feed", "ZZ0"),
+        ("outcome", ("ZZ0", up.SENT, None)),
+        ("finished", "finished"),
+    ]
+
+
+@pytest.mark.usefixtures("token")
+def test_the_observer_is_told_a_cancel_and_an_error(
+    setup: Setup, module: Module, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watcher = _Watcher()
+    _send(setup, module, clock, observer=watcher, should_stop=lambda: True)
+    assert watcher.calls == [("started", 1), ("finished", up.CANCELLED)]
+
+    def broken(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("stand-in")
+
+    monkeypatch.setattr(up, "_send_order", broken)
+    watcher = _Watcher()
+    _send(setup, module, clock, observer=watcher)
+    assert watcher.calls == [("finished", up.ERROR)]
+
+
+def test_the_observer_is_told_when_the_module_is_off(setup: Setup, clock: FakeClock) -> None:
+    watcher = _Watcher()
+    result = _send(setup, Module(), clock, observer=watcher)
+    assert result.off
+    assert watcher.calls == [("finished", up.OFF)]
+    watcher = _Watcher()
+    up.send_session("zz", budget=1.0, observer=watcher)
+    assert watcher.calls == [("finished", up.OFF)]

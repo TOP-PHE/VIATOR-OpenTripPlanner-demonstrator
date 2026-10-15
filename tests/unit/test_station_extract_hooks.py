@@ -52,6 +52,21 @@ def _response(**buckets: list[dict[str, Any]]) -> sessions_api.RefreshSourcesRes
     )
 
 
+@pytest.fixture
+def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`refresh_sources` claims a progress record in the database (issue
+    #359, app/refresh_progress.py); these tests have no database."""
+    from app import refresh_progress
+
+    def claim(sid: str, scope: str, total: int, **_k: Any) -> refresh_progress.RefreshRun:
+        detail = refresh_progress._initial_detail(total, None)
+        return refresh_progress.RefreshRun(sid, scope, uuid.uuid4(), detail)
+
+    monkeypatch.setattr(refresh_progress, "claim", claim)
+    monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
+    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
+
+
 @pytest.mark.parametrize(
     ("buckets", "queued"),
     [
@@ -60,6 +75,7 @@ def _response(**buckets: list[dict[str, Any]]) -> sessions_api.RefreshSourcesRes
         ({"skipped": [{"key": "t"}]}, False),
     ],
 )
+@pytest.mark.usefixtures("no_progress_record")
 async def test_refresh_provider_queues_the_extract(
     monkeypatch: pytest.MonkeyPatch, buckets: dict[str, list[dict[str, Any]]], queued: bool
 ) -> None:
@@ -86,6 +102,7 @@ async def test_refresh_provider_queues_the_extract(
     assert task.kwargs == {"only_provider": "ZZRAIL"}
 
 
+@pytest.mark.usefixtures("no_progress_record")
 @pytest.mark.parametrize("bucket", ["fetched", "unchanged", "skipped"])
 async def test_refresh_sources_queues_the_extracts(
     monkeypatch: pytest.MonkeyPatch, bucket: str
