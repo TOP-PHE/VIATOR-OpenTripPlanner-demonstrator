@@ -1154,7 +1154,6 @@ def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) 
 
 @router.post(
     "/{sid}/sources/refresh",
-    response_model=RefreshSourcesResponse,
     responses={
         400: {"description": "No JWT actor, or no sources configured."},
         404: {"description": "Session not found."},
@@ -1341,7 +1340,6 @@ class RefreshOsmResponse(BaseModel):
 
 @router.post(
     "/{sid}/sources/osm/refresh",
-    response_model=RefreshOsmResponse,
     responses={
         400: {"description": "No JWT actor, or config.sources.osm_pbf is unset."},
         404: {"description": "Session not found."},
@@ -2536,7 +2534,6 @@ async def _refresh_provider_urls(
 
 @router.post(
     "/{sid}/providers/{pid}/refresh",
-    response_model=RefreshSourcesResponse,
     responses={
         400: {"description": "No JWT actor, an invalid config, or no URL to refresh."},
         404: {"description": "Session or provider not found."},
@@ -2986,7 +2983,6 @@ def suggest_osm_countries(
 
 @router.post(
     "/{sid}/rebuilds",
-    response_model=RebuildJobResponse,
     status_code=201,
     responses={
         400: {"description": "No transit feed or no OSM PBF staged yet."},
