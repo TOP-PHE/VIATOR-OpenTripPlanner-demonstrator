@@ -1622,18 +1622,23 @@ Since this release a body cut part way is **resumed** instead of
 downloaded again from byte 0 (`app/feed_fetch.py`):
 
 - VIATOR keeps the bytes it has and asks for the rest with
-  `Range: bytes=<received>-`, under `If-Range` naming the file's ETag (or
-  its Last-Modified when the ETag is weak or missing). If the file changed
+  `Range: bytes=<received>-`, under `If-Range` naming the file's ETag (or,
+  when the ETag is weak or missing, its Last-Modified, only if that is at
+  least one second before the answer's `Date`). If the file changed
   on the server meanwhile, the server sends the new file whole and VIATOR
   starts again from byte 0: bytes of two versions are never put together.
 - A resume is used only when the server can do it: no
   `Accept-Ranges: none`, an ETag or Last-Modified, a known size
-  (`Content-Length`), and a body that is not content-encoded. Otherwise,
+  (`Content-Length`), and a body that is not content-encoded (feed
+  downloads ask for `Accept-Encoding: identity`). Otherwise,
   and when the server answers a range request with anything but a `206`
   that continues the file exactly (same start, same total size), the
   download starts again from byte 0, at most twice, as before.
 - Up to **8 resumes** per download (waits 2, 5, 10, 20, then 30 s), given
-  up after **2 resumes in a row that bring no new byte**. Each request
+  up after **2 resumes in a row that bring no new byte**. A busy answer
+  (429 or 5xx) to a resume is not counted as one: the bytes are kept and
+  the same range asked again after 10, 30, 60, 120 and 120 s, then the
+  download gives up (`server still busy after 5 waits`). Each request
   keeps the usual 600 s timeouts; there is no other time limit.
 - The file must end at exactly the announced size; its sha256 is that of
   the whole file. A server sending more than it announced is refused

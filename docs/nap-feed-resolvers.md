@@ -28,8 +28,9 @@ Every refresh then:
    with no validators (OURA) and servers whose ETag flaps between backends (Renfe);
 5. **retries** transport errors and 429/5xx twice (2 s, 10 s), from byte 0. A body **cut part
    way is resumed** instead (up to 8 times, waits 2–30 s, given up after 2 resumes in a row
-   with no new byte): `Range: bytes=<received>-` under `If-Range` (the strong ETag, else
-   Last-Modified), only when the server allows it (no `Accept-Ranges: none`, a validator, a
+   with no new byte; a 429/5xx answer to a resume is waited out on its own budget, 10–120 s,
+   five times, the bytes kept): `Range: bytes=<received>-` under `If-Range` (the strong ETag,
+   else a Last-Modified at least 1 s before the answer's `Date`), only when the server allows it (no `Accept-Ranges: none`, a validator, a
    `Content-Length`, no content coding). A `206` is appended only when its `Content-Range`
    starts at the first missing byte and names the same total; anything else (a `200`: ranges
    ignored or file changed; `416`; another range) starts again from byte 0. The final size must
@@ -198,11 +199,13 @@ default; `-Apply` to save).
   some servers ignore Range.
 - **Replay the ETag verbatim.** LIO's server sends it unquoted. Quoting it defeats the 304.
 - **A resume never carries If-None-Match.** The conditional-GET pair goes on the first request
-  only; on a range request it could turn the answer into a 304. Resumes ask for
-  `Accept-Encoding: identity`, and a content-encoded first answer is never resumed: httpx
-  decodes it, so its byte count is not an offset into the file.
-- **Never append without If-Range.** A range request without a validator could join bytes of two
-  versions of the file. No strong ETag and no Last-Modified: no resume.
+  only; on a range request it could turn the answer into a 304. Every feed download asks for
+  `Accept-Encoding: identity`, and a content-encoded answer is never resumed: httpx decodes it,
+  so its byte count is not an offset into the file.
+- **Never append without a strong If-Range.** A range request without a validator could join
+  bytes of two versions of the file. A Last-Modified within one second of the answer's `Date`
+  (or with no `Date`) can name two versions (RFC 9110 8.8.2.2): no strong ETag and no such
+  Last-Modified, no resume.
 - **A resolver error, rejected file or failed download never empties a timetable slot.** The
   previous file stays until a replacement has passed the format check. A 304 or hash match is
   only trusted when the slot still holds this task's file.
