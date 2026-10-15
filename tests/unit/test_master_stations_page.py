@@ -510,3 +510,34 @@ def test_the_page_explains_the_viator_id_origin_and_licence(
     assert "its VIATOR id" in html
     assert "share-alike" in html
     assert "attribution" in html
+
+
+LICENCE_STATES_SCENARIO = r"""
+(async () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const rows = () => ids.results.all('tbody').flatMap((b) => b.all('tr'));
+  const station = (licence) => ({name: 'Zz', latitude: 50.0, longitude: 4.0, country_iso: 'ZZ',
+    uic: '9900001', viator_id: 'ZZ-99001', uic_origin: 'TL',
+    uic_origin_text: 'from the Trainline list', licence});
+  answer = {origin: 'msmm', stations: [
+    station({name: null, position: null, uic: null, share_alike: [], attribution: [], unreadable: true}),
+    station({name: 'zz-crd', position: null, uic: null, share_alike: ['uic'], attribution: [], unreadable: false}),
+  ]};
+  document.getElementById('q').value = 'Zzstadt';
+  ids['search-form'].listeners.submit({preventDefault() {}});
+  await settle(); await settle();
+  process.stdout.write(JSON.stringify(rows().map((r) => r.children[7].textContent)));
+})();
+"""
+
+
+def test_an_unreadable_licence_and_a_mark_without_its_tag_are_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = page_script(render(monkeypatch, "content_manager", module=True))
+    out = run_node_program(DOM_PRELUDE + script + LICENCE_STATES_SCENARIO)
+
+    assert out == [
+        "given by the module but unreadable",
+        "Name: zz-crdCode: tag unreadable (share-alike)",
+    ]

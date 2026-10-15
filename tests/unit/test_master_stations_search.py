@@ -633,7 +633,7 @@ def test_a_module_station_comes_with_its_referential_and_the_origins_words(
         "viator_id": "ZZ-99001",
         "uic_origin": "TL",
         "uic_origin_text": "from the Trainline list",
-        "licence": licence,
+        "licence": {**licence, "unreadable": False},
     }
     assert (second["uic"], second["viator_id"], second["uic_origin_text"]) == (
         None,

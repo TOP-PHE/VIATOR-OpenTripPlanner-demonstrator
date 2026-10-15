@@ -123,12 +123,18 @@ function licenceCell(station) {
     td.textContent = '—';
     return td;
   }
+  if (licence.unreadable) {
+    td.textContent = 'given by the module but unreadable';
+    return td;
+  }
   const shareAlike = Array.isArray(licence.share_alike) ? licence.share_alike : [];
   for (const [field, label] of LICENCE_FIELDS) {
-    if (!licence[field]) continue;
+    // A value under a share-alike licence is shown even when its tag could
+    // not be read: the mark is what the licence asks to keep.
+    if (!licence[field] && !shareAlike.includes(field)) continue;
     const line = document.createElement('span');
     line.className = 'licence-line';
-    line.textContent = label + ': ' + licence[field];
+    line.textContent = label + ': ' + (licence[field] || 'tag unreadable');
     if (shareAlike.includes(field)) {
       const mark = document.createElement('span');
       mark.className = 'share-alike';
