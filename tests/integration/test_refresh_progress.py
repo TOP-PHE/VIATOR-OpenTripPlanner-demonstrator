@@ -126,15 +126,17 @@ def _url(name: str) -> str:
     return f"https://{_HOST}/{name}.zip?apikey={_SECRET_MARK}"
 
 
-def _provider(pid: str) -> dict[str, Any]:
+def _provider(pid: str, fmt: str = "gtfs") -> dict[str, Any]:
     return {
         "id": pid,
         "country_iso": "ZZ",
-        "timetable": {"format": "gtfs", "url": _url(pid.lower())},
+        "timetable": {"format": fmt, "url": _url(pid.lower())},
     }
 
 
-def _make_session(client: TestClient, admin: dict[str, str], pids: list[str]) -> None:
+def _make_session(
+    client: TestClient, admin: dict[str, str], pids: list[str], fmt: str = "gtfs"
+) -> None:
     r = client.post(
         "/api/sessions",
         headers=admin,
@@ -149,7 +151,7 @@ def _make_session(client: TestClient, admin: dict[str, str], pids: list[str]) ->
     with SessionLocal() as db:
         s = db.get(SessionRow, SID)
         assert s is not None
-        s.config = {"sources": {"providers": [_provider(p) for p in pids]}}
+        s.config = {"sources": {"providers": [_provider(p, fmt) for p in pids]}}
         flag_modified(s, "config")
         db.commit()
 
@@ -300,9 +302,14 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     assert first["state"] == "running"
     assert first["total"] == 3
     assert first["done"] == 0
-    assert first["current"] == [
-        {"key": "provider[ZZBIG].timetable(gtfs)", "bytes": MIB, "expected": len(big)}
-    ]
+    current = first["current"][0]
+    assert (current["key"], current["bytes"], current["expected"]) == (
+        "provider[ZZBIG].timetable(gtfs)",
+        MIB,
+        len(big),
+    )
+    assert current["step"] == "downloading"
+    assert current["elapsed_seconds"] >= 0
     assert [s["providers"]["current"][0]["bytes"] for s in seen] == [MIB, 2 * MIB, 3 * MIB]
     assert first["elapsed_seconds"] >= 0
     assert other_browser, "the other browser never saw the running refresh"
@@ -345,6 +352,125 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
         ).scalar_one()
     assert _HOST not in raw
     assert _SECRET_MARK not in raw
+
+
+# ── the steps after a download, and the page stays answered meanwhile ────
+
+_NETEX_XML = (
+    b'<?xml version="1.0"?><PublicationDelivery xmlns="http://www.netex.org.uk/netex" '
+    b'version="1.0"><ParticipantRef>ZZ</ParticipantRef><dataObjects>'
+    b'<ServiceJourney id="zz99"/></dataObjects></PublicationDelivery>'
+)
+
+
+def _netex_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(zipfile.ZipInfo("zz.xml", _ZIP_DATE), _NETEX_XML)
+    return buf.getvalue()
+
+
+def _shows(record: dict[str, Any], step: str) -> bool:
+    """The record shows `step`, with the structure check's scanned bytes
+    once that write (queued after the step's own) has landed too."""
+    current = record["current"]
+    if not current or current[0]["step"] != step:
+        return False
+    return step != "checking_structure" or current[0]["scanned"] == 50 * MIB
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+@pytest.mark.parametrize("slow", ["checking_structure", "storing"])
+def test_the_progress_api_answers_while_a_slow_step_runs(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch, slow: str
+) -> None:
+    """Production 15 Oct: after DB's 2 GB download the block stayed on
+    "100 %" for 20 minutes. The structure check and the copy into the slot
+    now show as steps, and they run off the event loop: a GET on the SAME
+    event loop as the refresh answers while the step is held (a step on the
+    loop would hold the GET until it ended, and the step would be gone)."""
+    from app import ingestion, netex_structure
+    from app.main import app
+
+    _make_session(client, admin, ["ZZNETEX"], fmt="netex_epip")
+    real_client = httpx.AsyncClient
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_netex_bytes()))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        # Released by the test once its GET has answered. The bound only
+        # matters when the step wrongly holds the event loop (the GET can
+        # then never run): longer than the reads below, so a loaded runner
+        # never releases it early.
+        entered.set()
+        release.wait(60)
+
+    real_fingerprint = netex_structure.fingerprint
+
+    def slow_fingerprint(path: Path, progress: Any = None) -> Any:
+        if slow == "checking_structure":
+            progress(0, 99 * MIB)
+            progress(50 * MIB, 99 * MIB)  # past a 5 % step: written
+            hold()
+        return real_fingerprint(path, progress)
+
+    real_place = ingestion.place
+
+    def slow_place(*args: Any, **kwargs: Any) -> bool:
+        if slow == "storing":
+            hold()
+        return real_place(*args, **kwargs)
+
+    monkeypatch.setattr(netex_structure, "fingerprint", slow_fingerprint)
+    monkeypatch.setattr(ingestion, "place", slow_place)
+    progress_url = f"/api/sessions/{SID}/sources/progress"
+
+    async def scenario() -> tuple[dict[str, Any], bool, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with real_client(transport=transport, base_url="http://zz.invalid") as web:
+            post = asyncio.create_task(
+                web.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30
+            while not (entered.is_set() or post.done()) and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "the slow step never started"
+            record: dict[str, Any] = {}
+            deadline = loop.time() + 30
+            while loop.time() < deadline:  # the step's write lands through the writer thread
+                r = await asyncio.wait_for(web.get(progress_url, headers=admin), timeout=15)
+                assert r.status_code == 200
+                record = r.json()["providers"]
+                if _shows(record, slow):
+                    break
+                await asyncio.sleep(0.01)
+            answered_while_held = not release.is_set()
+            release.set()
+            return record, answered_while_held, await post
+
+    record, answered_while_held, response = asyncio.run(scenario())
+    assert answered_while_held
+    assert record["state"] == "running"
+    current = record["current"][0]
+    assert current["key"] == "provider[ZZNETEX].timetable(netex_epip)"
+    assert current["step"] == slow
+    assert current["elapsed_seconds"] >= 0
+    if slow == "checking_structure":
+        assert (current["scanned"], current["scan_total"]) == (50 * MIB, 99 * MIB)
+    assert response.status_code == 200, response.text
+    assert [f["key"] for f in response.json()["fetched"]] == [
+        "provider[ZZNETEX].timetable(netex_epip)"
+    ]
+    done = _read()["providers"]
+    assert (done["state"], done["fetched"], done["current"]) == ("finished", 1, [])
+    # The file reached the slot and the rebuild was queued (on the loop's thread).
+    from app.db import SessionLocal
+    from app.models import RebuildJob
+
+    with SessionLocal() as db:
+        assert db.query(RebuildJob).filter(RebuildJob.session_id == SID).count() == 1
 
 
 @pytest.mark.usefixtures("inbox", "no_station_module")

@@ -460,7 +460,31 @@ def dispatch(
     session_id: str | None = None,
     staged_filename: str | None = None,
 ) -> bool:
-    """Move the stored file to its destination. Returns True if a rebuild was queued.
+    """Move the stored file to its destination (`place`), then queue a rebuild
+    when the kind warrants one (`queue_rebuild`). Returns True if a rebuild
+    was queued. An async caller runs `place` in a worker thread (it copies
+    files of up to a few GB) and `queue_rebuild` on its own thread, which
+    holds the request's database session."""
+    rebuild = place(stored_path, kind, session_id=session_id, staged_filename=staged_filename)
+    if rebuild:
+        queue_rebuild(db, session_id=session_id, kind=kind)
+    return rebuild
+
+
+def queue_rebuild(db: DbSession, *, session_id: str | None, kind: str) -> None:
+    """Queue a rebuild after a new `kind` file reached the session's slot."""
+    _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
+
+
+def place(
+    stored_path: Path,
+    kind: str,
+    *,
+    session_id: str | None = None,
+    staged_filename: str | None = None,
+) -> bool:
+    """Copy the stored file to its destination; files only, no database.
+    Returns True when the kind warrants a rebuild (`queue_rebuild`).
 
     `staged_filename` overrides the per-kind default (used by multi-feed GTFS
     to land each feed at `inbox/<sid>/gtfs/<feed_id_lower>.zip`). Other GTFS-
@@ -496,7 +520,6 @@ def dispatch(
                 existing_target.rename(existing_target.with_suffix(existing_target.suffix + ".old"))
         target = subdir / target_name
         shutil.copy2(stored_path, target)
-        _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
         return True
 
     if kind in ARCHIVE_ONLY:

@@ -65,7 +65,9 @@ def test_bytes_are_written_every_five_percent_at_most() -> None:
     assert len(bytes_writes) == 20
     steps = [w["current"][0]["bytes"] * 100 // expected for w in bytes_writes]
     assert steps == list(range(5, 101, 5))
-    assert bytes_writes[-1]["current"][0] == {"key": LABEL, "bytes": expected, "expected": expected}
+    last = bytes_writes[-1]["current"][0]
+    assert (last["key"], last["bytes"], last["expected"]) == (LABEL, expected, expected)
+    assert last["step"] == feed_fetch.STEP_DOWNLOADING
 
 
 def test_bytes_of_an_unknown_size_are_written_every_two_seconds() -> None:
@@ -242,7 +244,17 @@ def test_the_public_record_holds_only_known_shapes() -> None:
     assert (public["total"], public["done"], public["fetched"], public["unchanged"]) == (9, 0, 0, 0)
     assert public["failed"] == 2
     assert public["phase"] == "other"
-    assert public["current"] == [{"key": "task", "bytes": 99, "expected": None}]
+    assert public["current"] == [
+        {
+            "key": "task",
+            "bytes": 99,
+            "expected": None,
+            "step": None,
+            "scanned": None,
+            "scan_total": None,
+            "elapsed_seconds": None,
+        }
+    ]
     assert public["failed_keys"] == [LABEL, "task"]
     assert "unexpected" not in public
     assert public["extract"]["reasons"] == {"budget": 2, "other": 1}
@@ -519,3 +531,299 @@ def test_a_resumed_download_reports_the_full_size(
     assert seen[-1] == (len(BODY), len(BODY))
     received = [r for r, _e in seen]
     assert received == sorted(received)  # never back to 0 on a resume
+
+
+# ── steps after the download (production 15 Oct: "100 %" for 20 minutes) ──
+
+_NETEX_XML = (
+    b'<?xml version="1.0"?><PublicationDelivery xmlns="http://www.netex.org.uk/netex" '
+    b'version="1.0"><ParticipantRef>ZZ</ParticipantRef><dataObjects>'
+    + b'<ServiceJourney id="zz99"/>' * 99
+    + b"</dataObjects></PublicationDelivery>"
+)
+
+
+def _netex_zip(members: int = 2) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i in range(members):
+            z.writestr(f"zz{i}.xml", _NETEX_XML)
+    return buf.getvalue()
+
+
+def test_a_task_goes_through_its_steps_one_write_each() -> None:
+    run, writes = _run(FakeClock())
+    with run.task(LABEL):
+        assert writes[-1]["current"][0]["step"] == feed_fetch.STEP_DOWNLOADING
+        assert writes[-1]["current"][0]["started_at"]
+        for step in (feed_fetch.STEP_VERIFYING, feed_fetch.STEP_CHECKING_STRUCTURE):
+            run.step(step)
+            assert writes[-1]["current"][0]["step"] == step
+        run.step(feed_fetch.STEP_CHECKING_STRUCTURE)  # the same step again: no write
+        run.step(feed_fetch.STEP_STORING)
+    assert [w["current"][0]["step"] for w in writes] == [
+        feed_fetch.STEP_DOWNLOADING,
+        feed_fetch.STEP_VERIFYING,
+        feed_fetch.STEP_CHECKING_STRUCTURE,
+        feed_fetch.STEP_STORING,
+    ]
+    # The download's bytes stay beside the later steps.
+    assert writes[-1]["current"][0]["bytes"] == 0
+    run.done(LABEL, {"status": "fetched"})
+    assert writes[-1]["current"] == []
+
+
+def test_an_unknown_step_or_a_step_outside_a_task_writes_nothing() -> None:
+    run, writes = _run(FakeClock())
+    run.step(feed_fetch.STEP_VERIFYING)
+    assert writes == []
+    with run.task(LABEL):
+        run.step("zz_not_a_step")
+    assert len(writes) == 1
+    assert writes[0]["current"][0]["step"] == feed_fetch.STEP_DOWNLOADING
+
+
+def test_the_structure_check_progress_is_throttled_like_the_bytes() -> None:
+    clock = FakeClock()
+    run, writes = _run(clock)
+    total = 99 * 1000 * 1000
+    with run.task(LABEL):
+        run.step(feed_fetch.STEP_CHECKING_STRUCTURE)
+        first = len(writes)
+        for scanned in range(0, total + 1, 99_000):  # 1001 reads, no time passing
+            run.step(feed_fetch.STEP_CHECKING_STRUCTURE, scanned, total)
+    scans = writes[first:]
+    assert len(scans) == 20  # one per 5 % step, never one per read
+    assert [w["current"][0]["scanned"] * 100 // total for w in scans] == list(range(5, 101, 5))
+    assert scans[-1]["current"][0]["scan_total"] == total
+    # Without a known total: every two seconds.
+    run2, writes2 = _run(clock)
+    with run2.task(LABEL):
+        run2.step(feed_fetch.STEP_CHECKING_STRUCTURE)
+        first = len(writes2)
+        for i in range(1, 100):
+            clock.now += 0.1
+            run2.step(feed_fetch.STEP_CHECKING_STRUCTURE, i * 99, None)
+    assert len(writes2) - first == 4
+
+
+def test_the_downloads_bytes_throttle_does_not_starve_the_next_step() -> None:
+    """The structure check starts from 0 % with a fresh throttle: a download
+    that ended at 100 % does not hide its first 5 % step."""
+    run, writes = _run(FakeClock())
+    with run.task(LABEL):
+        run.bytes_received(99, 99)
+        run.step(feed_fetch.STEP_CHECKING_STRUCTURE)
+        before = len(writes)
+        run.step(feed_fetch.STEP_CHECKING_STRUCTURE, 5, 99)
+    assert len(writes) == before + 1
+
+
+def test_the_public_record_shows_the_step_and_how_long_the_task_runs() -> None:
+    started = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
+    item = {
+        "key": LABEL,
+        "bytes": 99,
+        "expected": 99,
+        "step": feed_fetch.STEP_CHECKING_STRUCTURE,
+        "scanned": 9,
+        "scan_total": 99,
+        "started_at": "2026-10-15T09:00:00+00:00",
+    }
+    public = refresh_progress._public_current([item], started + timedelta(minutes=18))
+    assert public == [
+        {
+            "key": LABEL,
+            "bytes": 99,
+            "expected": 99,
+            "step": "checking_structure",
+            "scanned": 9,
+            "scan_total": 99,
+            "elapsed_seconds": 18 * 60,
+        }
+    ]
+    odd = {**item, "step": "<b>", "scanned": -9, "started_at": "not a time"}
+    shown = refresh_progress._public_current([odd], started)[0]
+    assert (shown["step"], shown["scanned"], shown["elapsed_seconds"]) == (None, 0, None)
+
+
+def test_fetch_reports_verifying_then_the_structure_check_from_a_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from app import netex_structure
+
+    monkeypatch.setattr(netex_structure, "_CHUNK", 999)
+    body = _netex_zip()
+    calls: list[tuple[str, int | None, int | None, bool]] = []
+    loop_thread: list[int] = []
+
+    def report(step: str, done: int | None, total: int | None) -> None:
+        calls.append((step, done, total, threading.get_ident() == loop_thread[0]))
+
+    async def go() -> feed_fetch.FetchResult:
+        loop_thread.append(threading.get_ident())
+        token = feed_fetch.task_step.set(report)
+        try:
+            async with _client(httpx.Response(200, content=body)) as client:
+                return await feed_fetch.fetch_validated(
+                    client,
+                    fetch_url="https://zz.invalid/f",
+                    state_url="https://zz.invalid/f",
+                    extra_headers={},
+                    kind="NeTEx-EPIP",
+                    staging=tmp_path,
+                    base_name="zz-netex",
+                    suffix=".zip",
+                    previous={},
+                    have_current=False,
+                )
+        finally:
+            feed_fetch.task_step.reset(token)
+
+    result = asyncio.run(go())
+    assert result.status == "fetched"
+    total = 2 * len(_NETEX_XML)  # the uncompressed sizes of the zip directory
+    assert calls[0][:3] == (feed_fetch.STEP_VERIFYING, None, None)
+    assert calls[1][:3] == (feed_fetch.STEP_CHECKING_STRUCTURE, None, None)
+    scans = calls[2:]
+    assert scans[0][:3] == (feed_fetch.STEP_CHECKING_STRUCTURE, 0, total)
+    assert scans[-1][:3] == (feed_fetch.STEP_CHECKING_STRUCTURE, total, total)
+    assert len(scans) > 3  # reported per read: more than the start and the end
+    done = [d for _s, d, _t, _l in scans]
+    assert done == sorted(done)
+    # The scan runs in a worker thread, never on the event loop.
+    assert not any(on_loop for *_rest, on_loop in scans)
+
+
+def test_an_unchanged_feed_reports_no_step_after_its_download(tmp_path: Path) -> None:
+    calls: list[str] = []
+    body = _netex_zip()
+    import hashlib
+
+    async def go() -> feed_fetch.FetchResult:
+        token = feed_fetch.task_step.set(lambda step, _d, _t: calls.append(step))
+        try:
+            async with _client(httpx.Response(200, content=body)) as client:
+                return await feed_fetch.fetch_validated(
+                    client,
+                    fetch_url="https://zz.invalid/f",
+                    state_url="https://zz.invalid/f",
+                    extra_headers={},
+                    kind="NeTEx-EPIP",
+                    staging=tmp_path,
+                    base_name="zz-netex",
+                    suffix=".zip",
+                    previous={"sha256": hashlib.sha256(body).hexdigest()},
+                    have_current=True,
+                )
+        finally:
+            feed_fetch.task_step.reset(token)
+
+    assert asyncio.run(go()).status == "unchanged"
+    assert calls == []
+
+
+def test_a_broken_step_hook_never_stops_the_refresh(caplog: pytest.LogCaptureFixture) -> None:
+    def broken(_step: str, _done: int | None, _total: int | None) -> None:
+        raise RuntimeError("stand-in")
+
+    token = feed_fetch.task_step.set(broken)
+    try:
+        with caplog.at_level("WARNING", logger="app.feed_fetch"):
+            feed_fetch.report_step(feed_fetch.STEP_STORING)
+    finally:
+        feed_fetch.task_step.reset(token)
+    assert "task step not reported: RuntimeError" in caplog.text
+    feed_fetch.report_step(feed_fetch.STEP_STORING)  # no running task: nothing
+
+
+def test_the_task_context_routes_steps_to_the_run_and_restores_them() -> None:
+    run, writes = _run(FakeClock())
+    assert feed_fetch.task_step.get() is None
+    with run.task(LABEL):
+        feed_fetch.report_step(feed_fetch.STEP_STORING)
+    assert writes[-1]["current"][0]["step"] == feed_fetch.STEP_STORING
+    assert feed_fetch.task_step.get() is None
+    assert feed_fetch.download_progress.get() is None
+
+
+def test_storing_is_reported_and_the_copy_leaves_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from app import feed_resolvers
+    from app.api.admin import sessions as sessions_api
+
+    monkeypatch.setattr(sessions_api.settings, "inbox_dir", tmp_path)
+    monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", lambda url: url)
+    where: dict[str, bool] = {}
+    loop_thread: list[int] = []
+    steps: list[str] = []
+
+    def place(*_args: Any, **_kwargs: Any) -> bool:
+        where["place_on_loop"] = threading.get_ident() == loop_thread[0]
+        where["storing_reported_first"] = steps[-1:] == [feed_fetch.STEP_STORING]
+        return True
+
+    def queue_rebuild(db: Any, **_kwargs: Any) -> None:
+        where["queue_on_loop"] = threading.get_ident() == loop_thread[0]
+        where["db"] = db == "zz-db"
+
+    monkeypatch.setattr(sessions_api.ingestion, "place", place)
+    monkeypatch.setattr(sessions_api.ingestion, "queue_rebuild", queue_rebuild)
+    staging = tmp_path / "zz" / "_staging"
+    staging.mkdir(parents=True)
+    task = sessions_api._RefreshTask(LABEL, "NeTEx-EPIP", "https://zz.invalid/f.zip", None, None)
+
+    async def go() -> dict[str, Any]:
+        loop_thread.append(threading.get_ident())
+        token = feed_fetch.task_step.set(lambda step, _d, _t: steps.append(step))
+        try:
+            async with _client(httpx.Response(200, content=_netex_zip())) as client:
+                return await sessions_api._download_task(
+                    client,
+                    "zz-db",  # type: ignore[arg-type]
+                    "zz",
+                    staging,
+                    task,
+                    task.url,
+                )
+        finally:
+            feed_fetch.task_step.reset(token)
+
+    outcome = asyncio.run(go())
+    assert outcome["status"] == "fetched"
+    assert list(dict.fromkeys(steps)) == [
+        feed_fetch.STEP_VERIFYING,
+        feed_fetch.STEP_CHECKING_STRUCTURE,
+        feed_fetch.STEP_STORING,
+    ]
+    assert where == {
+        "place_on_loop": False,
+        "storing_reported_first": True,
+        "queue_on_loop": True,
+        "db": True,
+    }
+
+
+def test_no_rebuild_is_queued_when_the_kind_needs_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api.admin import sessions as sessions_api
+
+    queued: list[str] = []
+    monkeypatch.setattr(sessions_api.ingestion, "place", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        sessions_api.ingestion, "queue_rebuild", lambda *_a, **k: queued.append(k["kind"])
+    )
+    rebuild = asyncio.run(
+        sessions_api._dispatch_off_loop(None, tmp_path / "f", "SNCF-MCT", "zz", None)  # type: ignore[arg-type]
+    )
+    assert rebuild is False
+    assert queued == []

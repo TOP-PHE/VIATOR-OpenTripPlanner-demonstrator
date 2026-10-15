@@ -760,9 +760,8 @@ async def upload_to_session(
         provider_feed_id = provider_id
         upload_source = match["timetable"].get("source")
 
-    triggered = ingestion.dispatch(
-        staged_path, detected, db, session_id=sid, staged_filename=staged_filename
-    )
+    # The copy into the slot off the event loop (an upload can be GB).
+    triggered = await _dispatch_off_loop(db, staged_path, detected, sid, staged_filename)
     # The slot no longer holds the last downloaded file — forget the fetch
     # state of every task that writes it, so no refresh can call it "unchanged".
     _forget_fetch_state_for_slot(sid, detected, staged_filename)
@@ -1579,9 +1578,9 @@ async def _materialise_derived_provider(
     """Run the cross-border filter for one derived provider into `target_sid`'s slot.
 
     Returns an outcome dict (fetched/skipped), or None when `provider` isn't a
-    `cross_border_filter` provider. The CPU/IO filter runs in a worker thread (it
-    touches no DB); `dispatch` (which does) runs on the event loop. See
-    docs/provider-source-modes-design.md §12.
+    `cross_border_filter` provider. The CPU/IO filter and the copy into the slot
+    run in a worker thread (they touch no DB); the rebuild is queued on the
+    event loop (`_dispatch_off_loop`). See docs/provider-source-modes-design.md §12.
     """
     from app import gtfs_cross_border_filter as xb
 
@@ -1619,12 +1618,12 @@ async def _materialise_derived_provider(
         # (S5145). The full hint goes to the API response.
         log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
         return {"status": "skipped", "key": key, "error": f"filter failed: {exc}"}
-    ingestion.dispatch(
+    await _dispatch_off_loop(
+        db,
         out_tmp,
         ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
-        db,
-        session_id=target_sid,
-        staged_filename=ingestion.gtfs_staged_filename(pid),
+        target_sid,
+        ingestion.gtfs_staged_filename(pid),
     )
     return {
         "status": "fetched",
@@ -1701,6 +1700,22 @@ def _derived_count(config: dict[str, Any]) -> int:
     return sum(
         1 for p in providers if (p.get("timetable") or {}).get("source") == "cross_border_filter"
     )
+
+
+async def _dispatch_off_loop(
+    db: DbSession, path: Path, kind: str, sid: str, staged_filename: str | None
+) -> bool:
+    """`ingestion.dispatch` without blocking the event loop: the copy into the
+    slot (a national file is GB) runs in a worker thread, the rebuild is
+    queued here, on the thread that owns the request's database session (a
+    session is never used by two threads, even when the request is
+    cancelled while the copy runs). True when a rebuild was queued."""
+    rebuild = await asyncio.to_thread(
+        ingestion.place, path, kind, session_id=sid, staged_filename=staged_filename
+    )
+    if rebuild:
+        ingestion.queue_rebuild(db, session_id=sid, kind=kind)
+    return rebuild
 
 
 def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
@@ -2089,14 +2104,9 @@ async def _download_task(
         }
 
     assert result.path is not None  # "fetched" always carries the format-checked file
+    feed_fetch.report_step(feed_fetch.STEP_STORING)
     try:
-        ingestion.dispatch(
-            result.path,
-            kind,
-            db,
-            session_id=sid,
-            staged_filename=task.staged_filename,
-        )
+        await _dispatch_off_loop(db, result.path, kind, sid, task.staged_filename)
     except Exception as exc:
         result.path.unlink(missing_ok=True)
         return _skip(f"dispatch failed: {exc}")

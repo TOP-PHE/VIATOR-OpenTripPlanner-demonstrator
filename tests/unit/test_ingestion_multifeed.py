@@ -233,3 +233,43 @@ class TestDispatchStagedFilename:
         ingestion.dispatch(src, "OSM-PBF", fake_db, session_id=sid)
         osm_dir = ingestion.session_inbox(sid) / "osm"
         assert (osm_dir / "osm.pbf").exists()
+
+
+# ─────────────────────── place + queue_rebuild ───────────────────────
+
+
+class TestDispatchSplit:
+    """`dispatch` = `place` (files only: an async caller runs it in a worker
+    thread) then `queue_rebuild` (the database) when the kind warrants a
+    rebuild."""
+
+    def test_a_timetable_queues_one_rebuild(self, isolated_inbox, tmp_path, monkeypatch):
+        from app import ingestion
+
+        queued: list[dict] = []
+        monkeypatch.setattr(ingestion, "_enqueue_rebuild", lambda db, **k: queued.append(k))
+        src = tmp_path / "zz.zip"
+        src.write_bytes(b"zz")
+        assert ingestion.dispatch(src, "GTFS", "zz-db", session_id="zz-session") is True
+        assert queued == [{"session_id": "zz-session", "reason": "new GTFS uploaded"}]
+
+    def test_a_kind_without_a_rebuild_queues_none(self, isolated_inbox, tmp_path, monkeypatch):
+        from app import ingestion
+
+        queued: list[dict] = []
+        monkeypatch.setattr(ingestion, "_enqueue_rebuild", lambda db, **k: queued.append(k))
+        src = tmp_path / "zz.csv"
+        src.write_text("zz\n99\n")
+        assert ingestion.dispatch(src, "SNCF-MCT", "zz-db", session_id="zz-session") is False
+        assert ingestion.place(src, "NeTEx-FR-Arrets", session_id="zz-session") is False
+        assert queued == []
+        runtime = ingestion.session_inbox("zz-session") / "runtime" / "SNCF-MCT"
+        assert (runtime / "latest.csv").read_text() == "zz\n99\n"
+
+    def test_place_needs_no_database(self, isolated_inbox, tmp_path):
+        from app import ingestion
+
+        src = tmp_path / "zz.zip"
+        src.write_bytes(b"zz")
+        assert ingestion.place(src, "GTFS", session_id="zz-session", staged_filename="zz.zip")
+        assert (ingestion.session_inbox("zz-session") / "gtfs" / "zz.zip").read_bytes() == b"zz"

@@ -234,7 +234,7 @@ async def test_the_next_download_is_compared_with_the_previous_fingerprint(tmp_p
 async def test_a_failing_check_never_fails_the_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def boom(_path: Path) -> Fingerprint:
+    def boom(_path: Path, **_kwargs: Any) -> Fingerprint:
         raise ValueError("odd member")
 
     monkeypatch.setattr(netex_structure, "fingerprint", boom)
@@ -416,3 +416,38 @@ def test_a_file_without_day_types_has_no_calendar_finding(tmp_path: Path) -> Non
     fp = fingerprint(_zip(tmp_path, {"a.xml": SBB_HEAD + SBB_BODY}))
     assert fp.calendar["day_types"] == 0
     assert not any("day types" in m for m in assess(fp, None).messages)
+
+
+def test_progress_counts_uncompressed_xml_against_the_zip_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The structure check of a national file runs for minutes: it reports
+    the bytes of XML scanned and their total, read from the zip directory
+    (nothing unpacked to learn it); members that are not XML do not count."""
+    monkeypatch.setattr(netex_structure, "_CHUNK", 99)
+    one, two = SBB_HEAD + SBB_BODY, SI_HEAD + SI_BODY
+    path = tmp_path / "zz.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("b.xml", two)
+        z.writestr("a.xml", one)
+        z.writestr("readme.txt", b"9" * 999)
+    seen: list[tuple[int, int | None]] = []
+    fp = fingerprint(path, progress=lambda done, total: seen.append((done, total)))
+    total = len(one) + len(two)
+    assert seen[0] == (0, total)
+    assert seen[-1] == (total, total)
+    assert {t for _d, t in seen} == {total}
+    done = [d for d, _t in seen]
+    assert done == sorted(done)
+    assert len(seen) == 1 + -(-len(one) // 99) + -(-len(two) // 99)  # one call per read
+    # The same fingerprint as without progress.
+    assert fp.to_state() == fingerprint(path).to_state()
+
+
+def test_progress_of_a_bare_xml_file_uses_its_size(tmp_path: Path) -> None:
+    path = tmp_path / "zz.xml"
+    path.write_bytes(SI_HEAD + SI_BODY)
+    seen: list[tuple[int, int | None]] = []
+    fingerprint(path, progress=lambda done, total: seen.append((done, total)))
+    size = path.stat().st_size
+    assert seen == [(0, size), (size, size)]
