@@ -745,6 +745,7 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
     detail.hidden = expanded;
     e.target.setAttribute('aria-expanded', String(!expanded));
     e.target.textContent = expanded ? '▸' : '▾';
+    if (expanded) closeRefreshProgress(sid);
     if (!expanded) {
       // Pre-fill the configure form from the row's data-config attribute
       const cfg = JSON.parse(row.dataset.config || '{}');
@@ -759,7 +760,7 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // once the response lands. We don't await here because the rest of
       // the expand flow (staleness banner, jobs list) is independent.
       loadProviderStatuses(sid, cf);
-      loadRefreshProgress(sid);
+      openRefreshProgress(sid);
       loadNapSourcesPlan(sid);
       // OSM scope: default to transit-focused for sessions that don't have
       // it set yet (legacy / pre-v0.1.5). Stored at the top level of config,
@@ -1624,14 +1625,18 @@ document.addEventListener('click', e => {
 // and the latest OSM refresh (GET /sources/progress, app/refresh_progress.py):
 // read on every expand, so a reload or another browser shows the same; polled
 // every 2.5 s while a refresh runs, every 10 s while only the station-module
-// follow-up runs, never once everything has ended; on an error the wait
-// doubles up to 30 s. Built with createElement + textContent only: no value of
-// the record is ever parsed as HTML. Times shown are the server's.
+// follow-up runs, every 45 s while the row stays expanded and nothing runs (so
+// a refresh started from another tab shows up), and again when the tab comes
+// back to the front; nothing once the row is collapsed. On an error the wait
+// doubles up to 30 s. The refresh button of a running kind is disabled.
+// Built with createElement + textContent only: no value of the record is ever
+// parsed as HTML. Times shown are the server's.
 const _PROGRESS_POLL_MS = 2500;
 const _PROGRESS_FOLLOW_UP_MS = 10000;
+const _PROGRESS_IDLE_MS = 45000;
 const _PROGRESS_MAX_BACKOFF_MS = 30000;
 const _PROGRESS_START_WINDOW_MS = 15000;
-const _progressPolls = new Map();  // sid -> {timer, errorDelay, watchUntil}
+const _progressPolls = new Map();  // sid -> {timer, errorDelay, watchUntil, expanded}
 const _EXTRACT_COUNT_WORDS = [
   ['sent', 'sent'], ['held', 'already held'], ['refused', 'refused'],
   ['unavailable', 'module unavailable'], ['skipped', 'skipped'], ['cancelled', 'cancelled'],
@@ -1670,10 +1675,10 @@ function progressCurrentLine(c) {
 function progressHeadLine(rec) {
   const notReached = rec.not_reached || Math.max(0, rec.total - rec.done);
   if (rec.state === 'running') {
-    return `Running — ${rec.done} / ${rec.total} done · ${rec.failed} failed · ${progressElapsed(rec.elapsed_seconds)}`;
+    return `Running — ${rec.done} / ${rec.total} done · ${rec.failed} skipped (kept previous file) · ${progressElapsed(rec.elapsed_seconds)}`;
   }
   if (rec.state === 'finished') {
-    return `Finished ${progressTime(rec.finished_at)} — ${rec.fetched} fetched · ${rec.unchanged} unchanged · ${rec.failed} failed (took ${progressElapsed(rec.elapsed_seconds)})`;
+    return `Finished ${progressTime(rec.finished_at)} — ${rec.fetched} fetched · ${rec.unchanged} unchanged · ${rec.failed} skipped (kept previous file) (took ${progressElapsed(rec.elapsed_seconds)})`;
   }
   if (rec.state === 'failed') {
     return `Stopped by an unexpected error (${rec.error || 'error'}) at ${progressTime(rec.finished_at)} — ${rec.done} / ${rec.total} done, ${notReached} not reached; see the web log`;
@@ -1685,6 +1690,9 @@ function progressExtractLine(x) {
   if (!x) return null;
   if (x.state === 'queued') return 'Station module: queued — the extracts are sent after the refresh';
   if (x.state === 'off') return 'Station module: not configured — nothing sent';
+  if (x.state === 'interrupted') {
+    return `Station module: interrupted — no news since ${progressTime(x.updated_at)} (the web process restarted or the pass stopped); the next refresh or rebuild sends what is missing`;
+  }
   const counts = _EXTRACT_COUNT_WORDS
     .filter(([k]) => x[k]).map(([k, word]) => `${x[k]} ${word}`).join(' · ') || 'nothing yet';
   const reasons = Object.entries(x.reasons || {}).map(([word, n]) => `${word} ${n}`).join(', ');
@@ -1701,7 +1709,7 @@ function progressLines(rec, kind) {
   const lines = [[progressHeadLine(rec), '']];
   (rec.current || []).forEach(c => lines.push([progressCurrentLine(c), '']));
   if (rec.state !== 'running') lines.push([`Started ${progressTime(rec.started_at)}`, 'hint']);
-  if ((rec.failed_keys || []).length) lines.push([`Failed: ${rec.failed_keys.join(', ')}`, '']);
+  if ((rec.failed_keys || []).length) lines.push([`Skipped (kept previous file): ${rec.failed_keys.join(', ')}`, '']);
   if (rec.previous) {
     lines.push([`The refresh before this one was interrupted (started ${progressTime(rec.previous.started_at)}).`, 'hint']);
   }
@@ -1734,6 +1742,14 @@ function renderRefreshProgress(sid, body) {
   const blocks = ['providers', 'osm'].filter(k => body && body[k]).map(k => progressBlock(body[k], k));
   section.replaceChildren(...blocks);
   section.hidden = blocks.length === 0;
+  [['providers', 'refresh-providers'], ['osm', 'refresh-osm']].forEach(([kind, action]) => {
+    const btn = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"] button[data-action="${action}"]`);
+    if (!btn) return;
+    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title || '';
+    const running = Boolean(body && body[kind] && body[kind].state === 'running');
+    btn.disabled = running || btn.dataset.busy === '1';
+    btn.title = running ? 'A refresh of this kind is running: its progress is shown below.' : btn.dataset.idleTitle;
+  });
 }
 
 // How long until the next read: null once nothing runs.
@@ -1745,7 +1761,7 @@ function progressDelay(body) {
 }
 
 function progressPoll(sid) {
-  if (!_progressPolls.has(sid)) _progressPolls.set(sid, {timer: null, errorDelay: 0, watchUntil: 0});
+  if (!_progressPolls.has(sid)) _progressPolls.set(sid, {timer: null, errorDelay: 0, watchUntil: 0, expanded: false});
   return _progressPolls.get(sid);
 }
 
@@ -1768,8 +1784,33 @@ async function loadRefreshProgress(sid) {
   }
   // Just after a click the new record may not exist yet: keep reading.
   if (next === null && Date.now() < poll.watchUntil) next = _PROGRESS_POLL_MS;
-  if (next !== null) poll.timer = setTimeout(() => loadRefreshProgress(sid), next);
+  if (next === null) next = _PROGRESS_IDLE_MS;
+  if (!poll.expanded) return;  // collapsed meanwhile: read no more
+  clearTimeout(poll.timer);
+  poll.timer = setTimeout(() => loadRefreshProgress(sid), next);
 }
+
+// The session row was expanded: read now and keep reading while it stays open.
+function openRefreshProgress(sid) {
+  progressPoll(sid).expanded = true;
+  loadRefreshProgress(sid);
+}
+
+// The session row was collapsed: no more reads for it.
+function closeRefreshProgress(sid) {
+  const poll = progressPoll(sid);
+  poll.expanded = false;
+  clearTimeout(poll.timer);
+  poll.timer = null;
+}
+
+// Back to the front (another tab may have started a refresh): read again.
+function rereadExpandedProgress() {
+  if (document.visibilityState === 'hidden') return;
+  _progressPolls.forEach((poll, sid) => { if (poll.expanded) loadRefreshProgress(sid); });
+}
+document.addEventListener('visibilitychange', rereadExpandedProgress);
+window.addEventListener('focus', rereadExpandedProgress);
 
 // A refresh button was clicked on this page: read now, and keep reading for
 // a short while even if the record still shows the previous refresh.
@@ -2021,9 +2062,18 @@ function attemptSummary(statuses, pids) {
 // Shared tail of both Refresh buttons for a response that is not OK. A
 // gateway error waits for the server-side outcome; anything else is a real
 // failure. The pills are re-read either way — a failed attempt is a state.
+// A 409 `refresh_already_running` (issue #359): the start time in the
+// browser's own format, not the server's UTC text.
+function refreshRefusalText(body) {
+  const d = body && body.detail;
+  if (!d || d.error !== 'refresh_already_running') return null;
+  const what = d.scope === 'osm' ? 'An OSM refresh' : 'A provider refresh';
+  return `${what} of this session is already running (started ${progressTime(d.started_at)}). Its progress is shown under the buttons.`;
+}
+
 async function handleRefreshFailure(r, body, sid, form, marks) {
   if (!_GATEWAY_STATUSES.has(r.status)) {
-    showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
+    showToast('error', refreshRefusalText(body) || (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
     loadProviderStatuses(sid, form);
     return;
   }
@@ -2395,7 +2445,7 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
   btn.addEventListener('click', async () => {
     const form = btn.closest('form[data-form="config"]');
     const sid = form.dataset.sid;
-    btn.disabled = true; const original = btn.textContent; btn.textContent = 'Downloading…';
+    btn.disabled = true; btn.dataset.busy = '1'; const original = btn.textContent; btn.textContent = 'Downloading…';
     const known = _feedStatusCache.get(sid) || {};
     const downloaded = Object.keys(known).filter(pid => ['url', 'nap'].includes(known[pid].source));
     const marks = attemptMarks(sid, downloaded);
@@ -2403,7 +2453,6 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
     try {
       const r = await fetch(`/api/sessions/${sid}/sources/refresh`, {method:'POST'});
       const body = await r.json().catch(() => ({}));
-      loadRefreshProgress(sid);
       if (!r.ok) { await handleRefreshFailure(r, body, sid, form, marks); return; }
       showToast('success', refreshSummary(body, true));
       if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
@@ -2411,7 +2460,7 @@ document.querySelectorAll('button[data-action="refresh-providers"]').forEach(btn
       // mtimes / sizes are visible without a page reload.
       loadProviderStatuses(sid, form);
     } catch (err) { showToast('error', String(err)); }
-    finally { btn.disabled = false; btn.textContent = original; }
+    finally { delete btn.dataset.busy; btn.disabled = false; btn.textContent = original; loadRefreshProgress(sid); }
   });
 });
 
@@ -2430,13 +2479,12 @@ document.querySelectorAll('button[data-action="refresh-osm"]').forEach(btn => {
       'with `mv osm.pbf.old.1 osm.pbf` on the VPS if the new one regresses.\n\n' +
       'Proceed?'
     )) return;
-    btn.disabled = true; const original = btn.textContent; btn.textContent = 'Downloading OSM…';
+    btn.disabled = true; btn.dataset.busy = '1'; const original = btn.textContent; btn.textContent = 'Downloading OSM…';
     watchRefreshProgress(sid);
     try {
       const r = await fetch(`/api/sessions/${sid}/sources/osm/refresh`, {method:'POST'});
       const body = await r.json().catch(() => ({}));
-      loadRefreshProgress(sid);
-      if (!r.ok) { showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`); return; }
+      if (!r.ok) { showToast('error', refreshRefusalText(body) || (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`); return; }
       const fetched = (body.fetched || []).map(f => f.key).join(', ') || 'none';
       const skipped = (body.skipped || []).map(s => { const why = s.error || s.reason; return s.key + (why ? ` (${why})` : ''); }).join(', ');
       const rotated = (body.rotated || []).join('; ');
@@ -2446,7 +2494,7 @@ document.querySelectorAll('button[data-action="refresh-osm"]').forEach(btn => {
       showToast('success', parts.join(' | '));
       if ((body.fetched || []).length) markRefreshCompletedLocally(sid);
     } catch (err) { showToast('error', String(err)); }
-    finally { btn.disabled = false; btn.textContent = original; }
+    finally { delete btn.dataset.busy; btn.disabled = false; btn.textContent = original; loadRefreshProgress(sid); }
   });
 });
 

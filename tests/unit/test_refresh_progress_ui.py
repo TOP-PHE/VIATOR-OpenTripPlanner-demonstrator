@@ -38,10 +38,22 @@ class El {
   replaceChildren(...c) { this.children = c; this._text = ''; }
 }
 const section = new El('div'); section.hidden = true;
-const document = {
-  createElement: tag => new El(tag),
-  querySelector: sel => (sel.includes('refresh-progress') ? section : null),
+const buttons = {
+  'refresh-providers': {dataset: {}, title: 'Download every provider', disabled: false},
+  'refresh-osm': {dataset: {}, title: 'Re-download the OSM PBF', disabled: false},
 };
+const listeners = {};
+const document = {
+  visibilityState: 'visible',
+  createElement: tag => new El(tag),
+  querySelector: sel => {
+    if (sel.includes('refresh-progress')) return section;
+    const m = sel.match(/data-action="([a-z-]+)"/);
+    return m ? buttons[m[1]] : null;
+  },
+  addEventListener: (name, fn) => { listeners[name] = fn; },
+};
+const window = {addEventListener: (name, fn) => { listeners['window:' + name] = fn; }};
 const CSS = {escape: s => s};
 const dump = el => ({tag: el.tag, cls: el.className, state: el.dataset.state, text: el._text,
                      children: el.children.map(dump)});
@@ -52,7 +64,7 @@ _RENDER = (
     + """
 %(block)s
 renderRefreshProgress('zz', %(body)s);
-console.log(JSON.stringify({hidden: section.hidden, tree: dump(section), created}));
+console.log(JSON.stringify({hidden: section.hidden, tree: dump(section), created, buttons}));
 """
 )
 
@@ -71,9 +83,10 @@ async function fetch() {
 }
 %(block)s
 (async () => {
+  progressPoll('zz').expanded = %(expanded)s;
   for (let i = 0; i < answers.length; i++) {
     await loadRefreshProgress('zz');
-    if (delays[delays.length - 1] === undefined || delays.length < i + 1) break;
+    if (delays.length < i + 1) break;
   }
   console.log(JSON.stringify({delays, calls}));
 })();
@@ -145,7 +158,7 @@ def test_the_block_never_parses_a_value_as_html() -> None:
     )
     lines = _lines(result)
     assert f"Now: {hostile}" in lines
-    assert f"Failed: {hostile}" in lines
+    assert f"Skipped (kept previous file): {hostile}" in lines
     # One block, a title and its lines: no element was made from the value.
     assert result["created"] == 2 + len(lines)
 
@@ -157,9 +170,9 @@ def test_a_running_refresh_shows_counts_bytes_and_elapsed() -> None:
     assert block["state"] == "running"
     assert _lines(result) == [
         "Provider refresh",
-        "Running — 9 / 99 done · 1 failed · 3 min 19 s",
+        "Running — 9 / 99 done · 1 skipped (kept previous file) · 3 min 19 s",
         "Now: provider[ZZRAIL].timetable(gtfs) — 49.5 MB of 99.0 MB (50 %)",
-        "Failed: provider[ZZBUS].timetable(gtfs)",
+        "Skipped (kept previous file): provider[ZZBUS].timetable(gtfs)",
     ]
 
 
@@ -213,7 +226,9 @@ def test_the_end_result_and_the_follow_up() -> None:
     )
     lines = _lines(_render({"providers": finished, "osm": None}))
     assert lines[1].startswith("Finished ")
-    assert lines[1].endswith("— 90 fetched · 8 unchanged · 1 failed (took 33 min 0 s)")
+    assert lines[1].endswith(
+        "— 90 fetched · 8 unchanged · 1 skipped (kept previous file) (took 33 min 0 s)"
+    )
     assert lines[2].startswith("Started ")
     assert lines[-1] == (
         "Station module: 12 / 99 feeds handled — 5 sent · 6 already held · 1 skipped"
@@ -259,8 +274,11 @@ def test_no_record_hides_the_block() -> None:
     assert _render({"providers": None, "osm": None})["hidden"] is True
 
 
-def _poll(answers: list[Any]) -> dict[str, Any]:
-    return _node(_POLL % {"block": _block(), "answers": json.dumps(answers)})
+def _poll(answers: list[Any], expanded: bool = True) -> dict[str, Any]:
+    return _node(
+        _POLL
+        % {"block": _block(), "answers": json.dumps(answers), "expanded": json.dumps(expanded)}
+    )
 
 
 def test_polling_follows_the_refresh_then_stops() -> None:
@@ -276,9 +294,12 @@ def test_polling_follows_the_refresh_then_stops() -> None:
         "status": 200,
         "body": {"providers": _record(state="finished", extract={"state": "off"}), "osm": None},
     }
+    # Expanded: then a slow idle read, so another tab's refresh shows up.
     result = _poll([running, running, follow, ended])
-    assert result["delays"] == [2500, 2500, 10000]
+    assert result["delays"] == [2500, 2500, 10000, 45000]
     assert result["calls"] == 4
+    # Collapsed: no read is scheduled at all.
+    assert _poll([running], expanded=False) == {"delays": [], "calls": 1}
 
 
 def test_errors_back_off_up_to_thirty_seconds() -> None:
@@ -299,8 +320,106 @@ def test_the_page_restores_the_block_and_both_buttons_watch_it() -> None:
     ) in text
     # Restored from the server on every expand of a session row.
     expand = text[text.index("loadProviderStatuses(sid, cf);") :][:200]
-    assert "loadRefreshProgress(sid);" in expand
+    assert "openRefreshProgress(sid);" in expand
+    # Collapsing the row stops its reads.
+    assert "if (expanded) closeRefreshProgress(sid);" in text
     for url in ("/sources/refresh`", "/sources/osm/refresh`"):
         handler = text[: text.index(url)]
         handler = handler[handler.rindex("btn.disabled = true") :]
         assert "watchRefreshProgress(sid);" in handler
+
+
+_EVENTS = (
+    _FAKE_DOM
+    + """
+const reads = [];
+const timers = [];
+const setTimeout = (fn, ms) => { timers.push(ms); return timers.length; };
+const cleared = [];
+const clearTimeout = id => { cleared.push(id); };
+async function fetch(url) {
+  reads.push(url);
+  return {ok: true, status: 200, json: async () => ({providers: null, osm: null})};
+}
+%(block)s
+(async () => {
+  openRefreshProgress('zz');
+  openRefreshProgress('zz-b');
+  await new Promise(r => setImmediate(r));
+  closeRefreshProgress('zz-b');
+  const before = reads.length;
+  document.visibilityState = 'hidden';
+  listeners.visibilitychange();
+  const hidden = reads.length - before;
+  document.visibilityState = 'visible';
+  listeners.visibilitychange();
+  listeners['window:focus']();
+  await new Promise(r => setImmediate(r));
+  console.log(JSON.stringify({
+    hidden, after: reads.slice(before), polls: Object.fromEntries(
+      [..._progressPolls].map(([sid, p]) => [sid, {expanded: p.expanded, timer: p.timer}])),
+  }));
+})();
+"""
+)
+
+
+def test_a_tab_back_in_front_rereads_only_the_expanded_rows() -> None:
+    result = _node(_EVENTS % {"block": _block()})
+    assert result["hidden"] == 0
+    assert result["after"] == ["/api/sessions/zz/sources/progress"] * 2
+    assert result["polls"]["zz"]["expanded"] is True
+    assert result["polls"]["zz-b"] == {"expanded": False, "timer": None}
+
+
+def test_the_button_of_a_running_kind_is_disabled() -> None:
+    result = _render({"providers": _record(), "osm": None})
+    providers, osm = result["buttons"]["refresh-providers"], result["buttons"]["refresh-osm"]
+    assert providers["disabled"] is True
+    assert providers["title"].startswith("A refresh of this kind is running")
+    assert osm["disabled"] is False
+    assert osm["title"] == "Re-download the OSM PBF"
+    ended = _render({"providers": _record(state="finished"), "osm": None})
+    assert ended["buttons"]["refresh-providers"]["disabled"] is False
+    assert ended["buttons"]["refresh-providers"]["title"] == "Download every provider"
+
+
+def test_a_silent_follow_up_says_interrupted() -> None:
+    record = _record(
+        state="finished",
+        current=[],
+        extract={"state": "interrupted", "updated_at": "2026-10-15T09:40:00+00:00"},
+    )
+    line = _lines(_render({"providers": record}))[-1]
+    assert line.startswith("Station module: interrupted — no news since ")
+    assert line.endswith("the next refresh or rebuild sends what is missing")
+
+
+def _refusal_function() -> str:
+    text = TEMPLATE.read_text(encoding="utf-8")
+    start = text.index("function refreshRefusalText(body)")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+def test_the_refusal_toast_shows_the_start_in_the_browsers_format() -> None:
+    script = (
+        _FAKE_DOM
+        + _block()
+        + _refusal_function()
+        + """
+const body = {detail: {error: 'refresh_already_running', scope: 'osm',
+                       started_at: '2026-10-15T09:00:00+00:00', message: 'raw'}};
+console.log(JSON.stringify({
+  text: refreshRefusalText(body),
+  local: progressTime('2026-10-15T09:00:00+00:00'),
+  other: refreshRefusalText({detail: 'bad request'}),
+}));
+"""
+    )
+    result = _node(script)
+    assert result["text"] == (
+        f"An OSM refresh of this session is already running (started {result['local']})."
+        " Its progress is shown under the buttons."
+    )
+    assert "+00:00" not in result["text"]
+    assert result["other"] is None
