@@ -802,6 +802,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
       </label>
       <input type="text" id="hub-form-uic" name="uic" maxlength="20" autocomplete="off" spellcheck="false">
       <p class="hint" id="hub-form-uic-origin" style="margin: 0.2rem 0 0; font-size: 0.72rem"></p>
+      <label id="hub-form-forget-id-label" hidden style="font-weight: normal">
+        <input type="checkbox" id="hub-form-forget-id" name="forget_station_id">
+        Forget the station module's VIATOR id of this hub (its code, if any, stays)
+      </label>
       <p class="hub-form-error" id="hub-form-error"></p>
       <div class="hub-form-actions">
         <button type="button" data-action="hub-modal-close">Cancel</button>
@@ -2447,6 +2451,8 @@ function openHubModal(mode, hubId, prefillCountry) {
   form.reset();
   HUB_EDIT_UIC = '';
   document.getElementById('hub-form-uic-origin').textContent = '';
+  document.getElementById('hub-form-forget-id-label').hidden = true;
+  document.getElementById('hub-form-forget-id').checked = false;
 
   if (mode === 'create') {
     title.textContent = prefillCountry ? `Add ${prefillCountry} hub` : 'Add hub';
@@ -2476,6 +2482,8 @@ function openHubModal(mode, hubId, prefillCountry) {
         form.elements['uic'].value = h.uic || '';
         HUB_EDIT_UIC = h.uic || '';
         document.getElementById('hub-form-uic-origin').textContent = hubCodeLabel(h);
+        document.getElementById('hub-form-forget-id-label').hidden = !h.station_id;
+        document.getElementById('hub-form-forget-id').checked = false;
       });
   }
   modal.hidden = false;
@@ -2507,6 +2515,7 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       // confirmed from the station module into a "manual" one.
       body.uic = typedUic || null;
     }
+    if (document.getElementById('hub-form-forget-id').checked) body.forget_station_id = true;
     let url, method;
     if (HUB_EDIT_MODE === 'create') {
       body.id = fd.get('id');
@@ -2749,7 +2758,11 @@ function hubCandidateInput(proposal, candidate, kind) {
   input.dataset.hubId = proposal.hub_id;
   input.dataset.uic = candidate.uic || '';
   input.dataset.stationId = candidate.station_id || '';
-  label.append(input, ` ${candidate.name} · ${hubCandidateKey(candidate)} · ${candidate.country_iso || '?'} · ${hubCandidateOrigin(candidate)}`);
+  // The module's name in its own <bdi>: a name written right to left, or
+  // holding direction marks, cannot reorder the code and distance after it.
+  const name = document.createElement('bdi');
+  name.textContent = candidate.name;
+  label.append(input, ' ', name, ` · ${hubCandidateKey(candidate)} · ${candidate.country_iso || '?'} · ${hubCandidateOrigin(candidate)}`);
   if (!candidate.warning) return [label];
   const warning = hubCodesElement('div', `Warning: ${candidate.warning}`, 'hub-code-warning');
   HUB_CODES.warnings += 1;
@@ -2886,8 +2899,12 @@ async function confirmHubCodes() {
   const answer = await postHubCodes('confirm', { pairs });
   const results = answer.results || [];
   const stored = results.filter(r => r.state === 'stored').length;
-  const refused = results.length - stored;
-  showHubCodesAnswer(answer, `${stored} code(s) saved` + (refused ? `, ${refused} not served by the station module (left as they were).` : '.'));
+  const changed = results.filter(r => r.state === 'changed_meanwhile').length;
+  const refused = results.length - stored - changed;
+  showHubCodesAnswer(answer, `${stored} code(s) saved`
+    + (refused ? `, ${refused} not served by the station module (left as they were)` : '')
+    + (changed ? `, ${changed} not saved: the hub was changed meanwhile (propose again)` : '')
+    + '.');
   if (answer.status === 'ok') {
     ticked.forEach(input => { input.closest('.hub-code-item')?.remove(); });
     await loadHubs();
@@ -2900,10 +2917,11 @@ async function confirmHubCodes() {
 const HUB_LICENCE_FIELDS = [['name', 'Name'], ['position', 'Position'], ['uic', 'Code']];
 function hubLicenceLines(licence) {
   if (!licence) return ['Licence: none given by the station module.'];
+  if (licence.unreadable) return ['Licence: given by the station module but unreadable.'];
   const shareAlike = Array.isArray(licence.share_alike) ? licence.share_alike : [];
   const tags = HUB_LICENCE_FIELDS
-    .filter(([field]) => licence[field])
-    .map(([field, label]) => `${label}: ${licence[field]}` + (shareAlike.includes(field) ? ' (share-alike)' : ''));
+    .filter(([field]) => licence[field] || shareAlike.includes(field))
+    .map(([field, label]) => `${label}: ${licence[field] || 'tag unreadable'}` + (shareAlike.includes(field) ? ' (share-alike)' : ''));
   const lines = [`Licence: ${tags.join(' · ')}`];
   const attribution = Array.isArray(licence.attribution) ? licence.attribution : [];
   attribution.forEach(text => lines.push(`Attribution: ${text}`));
@@ -2920,7 +2938,12 @@ function hubCheckItem(result) {
   else if (result.state === 'name_differs') note = `The station module names it "${result.module_name}".`;
   item.append(hubCodesElement('div', note, 'hub-code-note'));
   if (result.state === 'not_served') return item;
-  if (result.replaced_id) {
+  if (result.changed_meanwhile) {
+    item.append(hubCodesElement('div', 'This hub was changed while the module was asked: nothing was written. Check it again.', 'hub-code-note'));
+  }
+  if (result.id_not_answered) {
+    item.append(hubCodesElement('div', `The station module no longer answers VIATOR id ${result.station_id}; its code is served. The hub keeps the id: confirm the station again, or forget the id in the hub form.`, 'hub-code-note'));
+  } else if (result.replaced_id) {
     item.append(hubCodesElement('div', `VIATOR id ${result.replaced_id} was merged into ${result.station_id} in the station module; the hub now keeps ${result.station_id}.`, 'hub-code-note'));
   } else if (result.station_id) {
     item.append(hubCodesElement('div', `VIATOR id ${result.station_id}`, 'hub-code-note'));
@@ -2941,12 +2964,14 @@ async function checkHubCodes() {
   results.forEach(r => HUB_CODES.skip.push(r.hub_id));
   // Every hub is listed, with the origin and the licence the module gives
   // its station now; those to look at are counted.
-  const toLook = results.filter(r => r.state !== 'ok');
+  const toLook = results.filter(r => r.state !== 'ok' || r.id_not_answered || r.changed_meanwhile);
   const moved = results.filter(r => r.replaced_id).length;
+  const changedMeanwhile = results.filter(r => r.changed_meanwhile).length;
   const list = document.getElementById('hub-codes-list');
   results.forEach(r => list.append(hubCheckItem(r)));
   const changed = moved ? ` ${moved} VIATOR id(s) moved to the station they were merged into.` : ' No code was changed.';
-  showHubCodesAnswer(answer, `${results.length} code(s) checked, ${toLook.length} to look at.${changed}`);
+  const again = changedMeanwhile ? ` ${changedMeanwhile} hub(s) changed meanwhile: check them again.` : '';
+  showHubCodesAnswer(answer, `${results.length} code(s) checked, ${toLook.length} to look at.${changed}${again}`);
   showHubCodesNext(answer.left, 'Check the next hubs');
 }
 

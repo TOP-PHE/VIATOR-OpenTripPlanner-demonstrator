@@ -60,7 +60,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, not_, or_, select
+from sqlalchemy import func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
@@ -380,6 +380,9 @@ class HubUpdate(BaseModel):
     # A station code typed by hand: stored with uic_origin = 'manual' when it
     # differs from the stored one; null clears the code and its origin.
     uic: TypedCode = None
+    # True forgets the hub's VIATOR id (the station module's), for a hub
+    # whose id no longer names its station; the code is left as it is.
+    forget_station_id: bool = False
 
     @field_validator("*")
     @classmethod
@@ -824,6 +827,8 @@ def update_hub(
         data["country"] = data["country"].upper()
     if "uic" in data:
         _set_typed_code(hub, data.pop("uic"))
+    if data.pop("forget_station_id", False):
+        hub.station_id = None
     for key, value in data.items():
         setattr(hub, key, value)
     hub.updated_at = datetime.now(UTC)
@@ -1010,12 +1015,14 @@ class HubConfirmRequest(BaseModel):
 class HubConfirmed(BaseModel):
     """What became of one pair: `stored` (with the module's name, and the
     VIATOR id stored, when the module gave one), `not_served` (the module
-    does not serve the code, or the id: the hub is left as it was) or
-    `unknown_hub`."""
+    does not serve the code, or the id: the hub is left as it was),
+    `unknown_hub`, or `changed_meanwhile` (the hub's code or VIATOR id was
+    changed by someone else while the module was asked: nothing written,
+    the hub keeps that change; propose again)."""
 
     hub_id: str
     uic: str | None
-    state: Literal["stored", "not_served", "unknown_hub"]
+    state: Literal["stored", "not_served", "unknown_hub", "changed_meanwhile"]
     module_name: str | None = None
     station_id: str | None = None
 
@@ -1041,7 +1048,9 @@ class HubChecked(BaseModel):
     code, and its words) and `licence` (the module's licence object: tags,
     share-alike fields, attribution texts). `station_id` is the hub's VIATOR
     id after the check; `replaced_id` the id it had when the module said it
-    was merged into `station_id`."""
+    was merged into `station_id`; `id_not_answered` that the module answered
+    the hub's code, not its id; `changed_meanwhile` that a change made
+    meanwhile kept the check from writing."""
 
     hub_id: str
     hub_name: str
@@ -1052,6 +1061,12 @@ class HubChecked(BaseModel):
     parent_uic: str | None = None
     station_id: str | None = None
     replaced_id: str | None = None
+    # The hub's VIATOR id got no answer, and its code was asked instead: the
+    # row shown is the code's (the id is kept; the administrator decides).
+    id_not_answered: bool = False
+    # The hub's code or VIATOR id was changed while the module was asked:
+    # the id the check would have written was not written; check again.
+    changed_meanwhile: bool = False
     module_uic: str | None = None
     code_origin: str | None = None
     code_origin_text: str | None = None
@@ -1598,20 +1613,25 @@ def _lookup_keys(pairs: list[HubConfirmPair]) -> tuple[list[str], list[str]]:
     return codes, ids
 
 
-def _by_key(
-    rows: list[dict[str, Any]], codes: list[str], ids: list[str]
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """The rows of a lookup by the code they answer and by the id they
-    answer (a row for an id names the id asked as its `viator_id`). A row
-    can answer both a code and an id: the client gives each key its own."""
-    by_code: dict[str, dict[str, Any]] = {}
-    by_id: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if row["uic"] in codes and row["uic"] not in by_code:
-            by_code[row["uic"]] = row
-        elif row["viator_id"] in ids and row["viator_id"] not in by_id:
-            by_id[row["viator_id"]] = row
-    return by_code, by_id
+def _guarded_write(
+    db: DbSession, hub_id: str, before: tuple[str | None, str | None], values: dict[str, Any]
+) -> bool:
+    """Write `values` to a hub only if its code and its VIATOR id are still
+    `before` (as read before the module was asked): one UPDATE whose WHERE
+    holds the two, so an edit made meanwhile (a code typed, another station
+    confirmed, a check that moved the id) is never overwritten by an answer
+    read for the hub as it was. True when the row was written."""
+    uic_before, id_before = before
+    written = db.execute(
+        update(NetworkCoverageHub)
+        .where(NetworkCoverageHub.id == hub_id)
+        .where(NetworkCoverageHub.is_active.is_(True))
+        .where(NetworkCoverageHub.uic.is_not_distinct_from(uic_before))
+        .where(NetworkCoverageHub.station_id.is_not_distinct_from(id_before))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return bool(getattr(written, "rowcount", 0) == 1)
 
 
 def _confirmed_row(
@@ -1646,7 +1666,9 @@ async def confirm_hub_codes(
     is stored (its code with uic_origin 'msmm', and the VIATOR id the module
     answered, the current one); a pair it does not serve is refused and its
     hub left as it was. A pair with an id alone stores the id and no code:
-    the module serves that station without one. On any failure nothing is
+    the module serves that station without one. Each write is guarded: a
+    hub whose code or id was changed while the module was asked is left
+    with that change (`changed_meanwhile`). On any failure nothing is
     written."""
     confirm = _body_or_422(HubConfirmRequest, body, _CONFIRM_REFUSED)
     user_id = _caller(admin)
@@ -1654,6 +1676,9 @@ async def confirm_hub_codes(
     if refusal is not None:
         return HubConfirmResponse(status="unavailable", message=refusal, results=[])
     hubs = _hubs_by_id(db, [pair.hub_id for pair in confirm.pairs])
+    # The hubs as they were before the module is asked: each write below is
+    # guarded by them (`_guarded_write`).
+    before = {hub_id: (hub.uic, hub.station_id) for hub_id, hub in hubs.items()}
     codes, ids = _lookup_keys([pair for pair in confirm.pairs if pair.hub_id in hubs])
     by_code: dict[str, dict[str, Any]] = {}
     by_id: dict[str, dict[str, Any]] = {}
@@ -1664,7 +1689,7 @@ async def confirm_hub_codes(
             return HubConfirmResponse(
                 status=status, message=message, retry_after=retry_after, results=[]
             )
-        by_code, by_id = _by_key(outcome.rows, codes, ids)
+        by_code, by_id = station_module.lookup_by_key(outcome.rows, codes, ids)
     now = datetime.now(UTC)
     results: list[HubConfirmed] = []
     for pair in confirm.pairs:
@@ -1674,11 +1699,21 @@ async def confirm_hub_codes(
             results.append(HubConfirmed(hub_id=pair.hub_id, uic=pair.uic, state="unknown_hub"))
         elif row is None:
             results.append(HubConfirmed(hub_id=pair.hub_id, uic=pair.uic, state="not_served"))
+        elif not _guarded_write(
+            db,
+            pair.hub_id,
+            before[pair.hub_id],
+            {
+                "uic": pair.uic,
+                "uic_origin": None if pair.uic is None else "msmm",
+                "station_id": station_id,
+                "updated_at": now,
+            },
+        ):
+            results.append(
+                HubConfirmed(hub_id=pair.hub_id, uic=pair.uic, state="changed_meanwhile")
+            )
         else:
-            hub.uic = pair.uic
-            hub.uic_origin = None if pair.uic is None else "msmm"
-            hub.station_id = station_id
-            hub.updated_at = now
             results.append(
                 HubConfirmed(
                     hub_id=pair.hub_id,
@@ -1710,23 +1745,28 @@ def _check_key(hub: NetworkCoverageHub, *, use_ids: bool = True) -> tuple[str, s
     return None
 
 
-def _id_after_check(hub: NetworkCoverageHub, row: dict[str, Any]) -> str | None:
-    """Move a hub's VIATOR id along the module's answer, and return the id it
-    had when an alias was moved to its survivor (`replaced_by`); a hub
-    without an id takes the one the module serves its code under (None
-    returned). Never cleared: a station the module does not answer keeps
-    its id."""
+def _new_id(hub: NetworkCoverageHub, row: dict[str, Any], via: str) -> str | None:
+    """The VIATOR id a check would give the hub, or None to leave it: asked
+    by its id, the survivor when the module says the id was merged
+    (`replaced_by`); asked by its code while it has no id, the id the module
+    serves the code under. Never cleared, and never moved by a row asked by
+    code for a hub whose id went unanswered (the administrator decides)."""
     found = station_module.current_id(row)
     if found is None or found == hub.station_id:
         return None
-    before = hub.station_id
-    hub.station_id = found
-    return before
+    if via == "id" or (via == "uic" and hub.station_id is None):
+        return found
+    return None
 
 
-def _checked(hub: NetworkCoverageHub, row: dict[str, Any] | None) -> HubChecked:
-    if row is None:
-        return HubChecked(
+def _checked(
+    hub: NetworkCoverageHub, found: tuple[dict[str, Any], str] | None
+) -> tuple[HubChecked, str | None]:
+    """What a check shows for a hub, and the VIATOR id it would write (None:
+    nothing to write). `found`: the module's row and how it was asked
+    (`id`, `uic`, or `code_after_id`: the hub's code, its id unanswered)."""
+    if found is None:
+        result = HubChecked(
             hub_id=hub.id,
             hub_name=hub.name,
             uic=hub.uic,
@@ -1734,11 +1774,13 @@ def _checked(hub: NetworkCoverageHub, row: dict[str, Any] | None) -> HubChecked:
             state="not_served",
             station_id=hub.station_id,
         )
-    replaced = _id_after_check(hub, row)
+        return result, None
+    row, via = found
+    new_id = _new_id(hub, row, via)
     state: Literal["ok", "name_differs"] = (
         "ok" if _same_name(hub.name, row["name"]) else "name_differs"
     )
-    return HubChecked(
+    result = HubChecked(
         hub_id=hub.id,
         hub_name=hub.name,
         uic=hub.uic,
@@ -1746,13 +1788,15 @@ def _checked(hub: NetworkCoverageHub, row: dict[str, Any] | None) -> HubChecked:
         state=state,
         module_name=row["name"],
         parent_uic=row.get("parent_uic"),
-        station_id=hub.station_id,
-        replaced_id=replaced,
+        station_id=new_id or hub.station_id,
+        replaced_id=hub.station_id if new_id is not None and hub.station_id is not None else None,
+        id_not_answered=via == "code_after_id",
         module_uic=row["uic"],
         code_origin=row["uic_origin"],
         code_origin_text=station_module.uic_origin_text(row["uic_origin"]),
         licence=row["licence"],
     )
+    return result, new_id
 
 
 @router.post("/hubs/check", responses=_HUB_CODE_RESPONSES)
@@ -1765,9 +1809,12 @@ async def check_hub_codes(
     module (a hub's VIATOR id when it has one, else its code; each distinct
     key once), and show each hub, with the origin and the licence of its
     station read live from the module (D-R11 A), and whether the module no
-    longer serves it or names it otherwise. Writes only the hubs' VIATOR
-    ids, one commit when one moved: an id the module says was merged moves
-    to the survivor, and a hub without an id takes the one the module
+    longer serves it or names it otherwise. A hub whose id gets no answer
+    but which has a code is asked again by its code, in a second lookup
+    (`id_not_answered`). Writes only the hubs' VIATOR ids, each guarded by
+    the hub as it was read (`_guarded_write`; `changed_meanwhile` when an
+    edit came in between), one commit: an id the module says was merged
+    moves to the survivor, and a hub without an id takes the one the module
     serves its code under. Clears nothing: the administrator decides."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
@@ -1776,48 +1823,97 @@ async def check_hub_codes(
     if refusal is not None:
         return HubCheckResponse(status="unavailable", message=refusal, results=[], left=len(hubs))
     batch = hubs[:CHECK_BATCH]
+    before = {hub.id: (hub.uic, hub.station_id) for hub in batch}
     found = await _check_lookup(batch, user_id)
     if isinstance(found, station_module.Outcome):
         status, message, retry_after = _failure(found)
         return HubCheckResponse(
             status=status, message=message, retry_after=retry_after, results=[], left=len(hubs)
         )
-    before = {hub.id: hub.station_id for hub in batch}
-    results = [_checked(hub, found.get(hub.id)) for hub in batch]
-    moved = [hub for hub in batch if hub.station_id != before[hub.id]]
-    if moved:
-        now = datetime.now(UTC)
-        for hub in moved:
-            hub.updated_at = now
+    checked = [_checked(hub, found.get(hub.id)) for hub in batch]
+    results = [_written(db, before, result, new_id) for result, new_id in checked]
+    if any(new_id is not None for _result, new_id in checked):
         db.commit()
     return HubCheckResponse(status="ok", results=results, left=len(hubs) - len(batch))
 
 
+def _written(
+    db: DbSession,
+    before: dict[str, tuple[str | None, str | None]],
+    result: HubChecked,
+    new_id: str | None,
+) -> HubChecked:
+    """Write the id a check found for one hub, guarded; the result as shown:
+    unchanged when there is nothing to write or the write went through,
+    else marked `changed_meanwhile`, with the id the hub had when read."""
+    if new_id is None:
+        return result
+    values = {"station_id": new_id, "updated_at": datetime.now(UTC)}
+    if _guarded_write(db, result.hub_id, before[result.hub_id], values):
+        return result
+    return result.model_copy(
+        update={
+            "station_id": before[result.hub_id][1],
+            "replaced_id": None,
+            "changed_meanwhile": True,
+        }
+    )
+
+
+async def _ask(
+    keys: dict[str, tuple[str, str] | None], user_id: uuid.UUID
+) -> dict[str, dict[str, Any]] | station_module.Outcome:
+    """One lookup with each distinct key of `keys` (hub id → key) once: the
+    module's row by hub id (a hub it does not answer is absent), or the
+    failed `Outcome`."""
+    codes = list(dict.fromkeys(key[1] for key in keys.values() if key and key[0] == "uic"))
+    ids = list(dict.fromkeys(key[1] for key in keys.values() if key and key[0] == "id"))
+    if not codes and not ids:
+        return {}
+    outcome = await station_module.lookup(codes, user_id, ids=ids)
+    if outcome.rows is None:
+        return outcome
+    by_code, by_id = station_module.lookup_by_key(outcome.rows, codes, ids)
+    rows = {hub_id: _row_of(key, by_code, by_id) for hub_id, key in keys.items()}
+    return {hub_id: row for hub_id, row in rows.items() if row is not None}
+
+
 async def _check_lookup(
     batch: list[NetworkCoverageHub], user_id: uuid.UUID
-) -> dict[str, dict[str, Any]] | station_module.Outcome:
-    """The module's row of each hub of a check click, by hub id (a hub the
-    module does not answer is absent), from one lookup with each distinct
-    key once; the failed `Outcome` when the lookup fails. A stored code the
-    module would refuse (only a hand edit of the table can store one) is
-    never sent. A module from before the VIATOR ids (its 422 on `ids`) is
-    asked once more with the codes alone."""
-    for use_ids in (True, False):
-        keys = {hub.id: _check_key(hub, use_ids=use_ids) for hub in batch}
-        codes = list(dict.fromkeys(key[1] for key in keys.values() if key and key[0] == "uic"))
-        ids = list(dict.fromkeys(key[1] for key in keys.values() if key and key[0] == "id"))
-        if not codes and not ids:
-            return {}
-        outcome = await station_module.lookup(codes, user_id, ids=ids)
-        if outcome.rows is None and ids and outcome.reason == _IDS_REFUSED:
-            continue
-        if outcome.rows is None:
-            return outcome
-        by_code, by_id = _by_key(outcome.rows, codes, ids)
-        rows = {hub_id: _row_of(key, by_code, by_id) for hub_id, key in keys.items()}
-        return {hub_id: row for hub_id, row in rows.items() if row is not None}
-    # Unreachable: the second round sends no ids, so it never continues.
-    return station_module.Outcome(None, _IDS_REFUSED)  # pragma: no cover
+) -> dict[str, tuple[dict[str, Any], str]] | station_module.Outcome:
+    """The module's row of each hub of a check click and how it was asked
+    (`id`, `uic`, `code_after_id`), by hub id; the failed `Outcome` when the
+    first lookup fails. A stored code the module would refuse (only a hand
+    edit of the table can store one) is never sent. A module from before
+    the VIATOR ids (its 422 on `ids`) is asked once more with the codes
+    alone. A hub asked by its id that gets no row but has a code is asked
+    by its code in a second lookup (at most 20 keys more); when that one
+    fails, those hubs are shown as not served."""
+    keys = {hub.id: _check_key(hub) for hub in batch}
+    first = await _ask(keys, user_id)
+    by_id_asked = {hub_id for hub_id, key in keys.items() if key and key[0] == "id"}
+    if isinstance(first, station_module.Outcome):
+        if not (by_id_asked and first.reason == _IDS_REFUSED):
+            return first
+        codes_only = {hub.id: _check_key(hub, use_ids=False) for hub in batch}
+        again = await _ask(codes_only, user_id)
+        if isinstance(again, station_module.Outcome):
+            return again
+        return {hub_id: (row, "uic") for hub_id, row in again.items()}
+    found = {
+        hub_id: (row, key[0]) for hub_id, row in first.items() if (key := keys[hub_id]) is not None
+    }
+    lost = {
+        hub.id: _check_key(hub, use_ids=False)
+        for hub in batch
+        if hub.id in by_id_asked and hub.id not in first
+    }
+    lost = {hub_id: key for hub_id, key in lost.items() if key is not None}
+    if lost:
+        again = await _ask(lost, user_id)
+        if not isinstance(again, station_module.Outcome):
+            found.update({hub_id: (row, "code_after_id") for hub_id, row in again.items()})
+    return found
 
 
 def _row_of(

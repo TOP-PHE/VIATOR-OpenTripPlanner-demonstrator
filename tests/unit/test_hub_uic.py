@@ -112,6 +112,24 @@ class Hubs:
     def by_id(self, _db: Any, ids: list[str]) -> dict[str, NetworkCoverageHub]:
         return {h.id: h for h in self.rows if h.id in ids and h.is_active}
 
+    def guarded(
+        self,
+        _db: Any,
+        hub_id: str,
+        before: tuple[str | None, str | None],
+        values: dict[str, Any],
+    ) -> bool:
+        """`_guarded_write` on the transient hubs, with its rule: written
+        only while the hub's code and VIATOR id are still `before` (the
+        statement itself is proved on PostgreSQL in
+        tests/integration/test_hub_uic_selection.py)."""
+        hub = next((h for h in self.rows if h.id == hub_id and h.is_active), None)
+        if hub is None or (hub.uic, hub.station_id) != before:
+            return False
+        for name, value in values.items():
+            setattr(hub, name, value)
+        return True
+
 
 def _near(name: str, uic: str, distance: int, parent: str | None = None) -> dict[str, Any]:
     """A row of a near answer: a station at `distance` metres of the hub."""
@@ -137,6 +155,8 @@ class Module:
         self.served_ids: dict[str, dict[str, Any]] = {}
         # A module from before the VIATOR ids: a body with `ids` is a 422.
         self.refuses_ids = False
+        # Run while a lookup is answered: an edit made meanwhile.
+        self.during_lookup: Callable[[], None] | None = None
         self.lookup_response: httpx.Response | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -146,6 +166,8 @@ class Module:
             return self.near(body)
         if request.url.path.endswith("/stations/search"):
             return self.search(body["q"])
+        if self.during_lookup is not None:
+            self.during_lookup()
         if self.lookup_response is not None:
             return self.lookup_response
         if self.refuses_ids and "ids" in body:
@@ -163,6 +185,7 @@ def hubs(monkeypatch: pytest.MonkeyPatch) -> Hubs:
     stand_in = Hubs()
     monkeypatch.setattr(network_coverage, "_hubs_to_look_at", stand_in.to_look_at)
     monkeypatch.setattr(network_coverage, "_hubs_by_id", stand_in.by_id)
+    monkeypatch.setattr(network_coverage, "_guarded_write", stand_in.guarded)
     return stand_in
 
 
@@ -2265,7 +2288,8 @@ def test_module_data_never_goes_through_inner_html(template_text: str) -> None:
     assert not any("innerHTML" in line or "insertAdjacentHTML" in line for line in code_lines)
     assert "textContent" in script
     # The candidates' and the check's names and codes are text nodes.
-    assert "label.append(input, ` ${candidate.name}" in script
+    assert "name.textContent = candidate.name;" in script
+    assert "label.append(input, ' ', name, ` · ${hubCandidateKey(candidate)}" in script
     assert "hubCodesElement('strong', proposal.hub_name)" in script
     assert '`The station module names it "${result.module_name}".`' in script
 
@@ -2345,7 +2369,9 @@ const shortNear = { name: 'ZZ Close', uic: '9900005', country_iso: 'ZZ', distanc
 const shortFar = { name: 'ZZ Beyond', uic: '9900006', country_iso: 'ZZ', distance_m: 1200, found_by: 'name', warning: `Found by the shortened name «${cut}», a looser match, 1.2 km`, shortened_name: cut };
 const shortenedItem = hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 2, candidates: [shortNear, shortFar] });
 out.shortened = lines(shortenedItem);
-out.shortenedTexts = shortenedItem.children.filter(c => c.tag === 'label').map(c => c.children.slice(1).every(k => typeof k === 'string'));
+// Text only: strings, and the module's name in a <bdi> holding text alone.
+out.shortenedTexts = shortenedItem.children.filter(c => c.tag === 'label').map(c => c.children.slice(1).every(k => typeof k === 'string' || (k.tag === 'bdi' && k.children.length === 0)));
+out.bdi = shortenedItem.children.filter(c => c.tag === 'label').map(c => c.children.filter(k => k.tag === 'bdi').map(k => k.textContent));
 out.shortenedNone = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 3, candidates: [] }));
 out.shortenedOne = lines(hubProposalItem({ ...base, state: 'to_pick', name_searched: true, shortened_searches: 1, candidates: [] }));
 // A name too long to search whole, searched shortened.
@@ -2447,6 +2473,7 @@ def test_the_page_shows_origin_and_warning_of_each_candidate(template_text: str)
         "[radio] Leave it",
     ]
     assert out["shortenedTexts"] == [True, True, True]
+    assert out["bdi"] == [["ZZ Close"], ["ZZ Beyond"], []]
     assert out["shortenedNone"][1] == (
         "No station of the module within 300 m of this hub's position, and none found by "
         "its name nor by 3 shortened forms of it: type the code in the hub form if you "
@@ -3002,13 +3029,11 @@ def test_check_asks_by_id_and_shows_origin_and_licence_read_live(
         "9900002",  # the hub's own code stays: id and code are not one to one
     )
     assert (first["code_origin"], first["code_origin_text"]) == ("TL", "from the Trainline list")
-    assert first["licence"] == _LICENCE
-    # An origin the module never serves (VU) and an empty licence: unknown.
-    assert (second["code_origin"], second["code_origin_text"], second["licence"]) == (
-        None,
-        None,
-        None,
-    )
+    assert first["licence"] == {**_LICENCE, "unreadable": False}
+    # An origin the module never serves (VU): unknown; a licence given empty:
+    # unreadable, told from none.
+    assert (second["code_origin"], second["code_origin_text"]) == (None, None)
+    assert second["licence"]["unreadable"] is True
     assert db.commits == 0  # no id moved
 
 
@@ -3199,3 +3224,179 @@ def test_the_confirm_sends_the_candidates_code_and_id(template_text: str) -> Non
     assert "input.dataset.stationId = candidate.station_id || '';" in script
     assert "uic: input.dataset.uic || null," in script
     assert "station_id: input.dataset.stationId || null," in script
+
+
+# ── repair round 1: guarded writes, the code after an unanswered id, forgetting an id ──
+
+
+def test_a_check_never_overwrites_an_edit_made_while_the_module_was_asked(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    """The administrator types a new code while a check waits on the module
+    (the typed code clears the id): the id the check found for the code it
+    read is not written, and the hub keeps the edit."""
+    hub = _hub(1, uic="9900001", origin="msmm")
+    hubs.rows = [hub]
+    module.served = {"9900001": _ref_station("ZZ Hub01", "9900001", "ZZ-99001")}
+    module.during_lookup = lambda: network_coverage._set_typed_code(hub, "9900002")
+
+    body = client.post(f"{BASE}/check", json={}).json()
+
+    assert len(module.of("lookup")) == 1
+    (result,) = body["results"]
+    assert result["changed_meanwhile"] is True
+    assert result["station_id"] is None
+    assert (hub.uic, hub.uic_origin, hub.station_id) == ("9900002", "manual", None)
+
+
+def test_a_confirm_never_erases_a_code_typed_while_the_module_was_asked(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    hub = _hub(1)
+    hubs.rows = [hub]
+    module.served_ids = {"ZZ-99004": _ref_station("ZZ Hub01", None, "ZZ-99004")}
+    module.during_lookup = lambda: network_coverage._set_typed_code(hub, "9900007")
+
+    body = client.post(
+        f"{BASE}/confirm", json={"pairs": [{"hub_id": hub.id, "station_id": "ZZ-99004"}]}
+    ).json()
+
+    assert body["results"][0]["state"] == "changed_meanwhile"
+    assert (hub.uic, hub.uic_origin, hub.station_id) == ("9900007", "manual", None)
+
+
+def test_a_check_moves_the_ids_of_unchanged_hubs_and_reports_the_changed_one(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    alias = _hub(1, uic="9900001", origin="msmm", station_id="ZZ-99003")
+    other = _hub(2, uic="9900002", origin="msmm", station_id="ZZ-99005")
+    hubs.rows = [alias, other]
+    module.served_ids = {
+        "ZZ-99003": _ref_station("ZZ Hub01", "9900001", "ZZ-99003", replaced_by="ZZ-99001"),
+        "ZZ-99005": _ref_station("ZZ Hub02", "9900002", "ZZ-99005", replaced_by="ZZ-99006"),
+    }
+
+    def confirm_meanwhile() -> None:
+        other.station_id = "ZZ-99007"  # another station confirmed meanwhile
+
+    module.during_lookup = confirm_meanwhile
+
+    body = client.post(f"{BASE}/check", json={}).json()
+
+    first, second = body["results"]
+    assert (first["station_id"], first["replaced_id"], first["changed_meanwhile"]) == (
+        "ZZ-99001",
+        "ZZ-99003",
+        False,
+    )
+    assert (second["station_id"], second["replaced_id"], second["changed_meanwhile"]) == (
+        "ZZ-99005",
+        None,
+        True,
+    )
+    assert (alias.station_id, other.station_id) == ("ZZ-99001", "ZZ-99007")
+    assert db.commits == 1
+
+
+def test_an_unanswered_id_is_asked_again_by_the_hubs_code(
+    client: TestClient, db: FakeDb, hubs: Hubs, module: Module
+) -> None:
+    """Item 4: an id the module no longer answers, on a hub with a code:
+    the code is asked in a second lookup and shown, the id kept, the page
+    told (`id_not_answered`); a hub with an id alone stays not served."""
+    coded = _hub(1, uic="9900001", origin="msmm", station_id="ZZ-99001")
+    uncoded = _hub(2, station_id="ZZ-99002")
+    hubs.rows = [coded, uncoded]
+    module.served = {"9900001": _ref_station("ZZ Hub01", "9900001", "ZZ-99008")}
+
+    body = client.post(f"{BASE}/check", json={}).json()
+
+    assert _lookup_bodies(module) == [{"ids": ["ZZ-99001", "ZZ-99002"]}, {"uics": ["9900001"]}]
+    first, second = body["results"]
+    assert (first["state"], first["id_not_answered"], first["station_id"]) == (
+        "ok",
+        True,
+        "ZZ-99001",
+    )
+    assert first["code_origin"] == "TL"
+    assert (second["state"], second["id_not_answered"]) == ("not_served", False)
+    assert coded.station_id == "ZZ-99001"  # never moved by the code's row
+    assert db.commits == 0
+
+
+def test_a_failed_second_lookup_shows_the_hub_not_served(
+    client: TestClient, hubs: Hubs, module: Module
+) -> None:
+    hub = _hub(1, uic="9900001", origin="msmm", station_id="ZZ-99001")
+    hubs.rows = [hub]
+    module.served = {"9900001": _ref_station("ZZ Hub01", "9900001", "ZZ-99008")}
+    calls = {"n": 0}
+
+    def second_fails() -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            module.lookup_response = httpx.Response(500, json={"error_id": "zz"})
+
+    module.during_lookup = second_fails
+
+    body = client.post(f"{BASE}/check", json={}).json()
+
+    assert calls["n"] == 2
+    assert body["status"] == "ok"
+    assert body["results"][0]["state"] == "not_served"
+    assert hub.station_id == "ZZ-99001"
+
+
+def test_the_hub_form_can_forget_the_viator_id() -> None:
+    hub = _hub(1, station_id="ZZ-99004")
+    db = MagicMock()
+    db.get.return_value = hub
+
+    update_hub(hub_id=hub.id, body={"forget_station_id": True}, db=db, _=MagicMock())
+
+    assert (hub.uic, hub.station_id) == (None, None)
+
+
+def test_the_hub_form_offers_to_forget_the_id(template_text: str) -> None:
+    assert 'id="hub-form-forget-id"' in template_text
+    assert "document.getElementById('hub-form-forget-id-label').hidden = !h.station_id;" in (
+        template_text
+    )
+    assert "body.forget_station_id = true;" in template_text
+
+
+_CHECK_NOTES_SCENARIO = """
+const base = { hub_id: 'zz-hub-01', hub_name: 'ZZ Hub 01', uic: '9900001', state: 'ok',
+  station_id: 'ZZ-99001', module_uic: '9900001', code_origin_text: 'from the Trainline list' };
+console.log(JSON.stringify({
+  meanwhile: lines(hubCheckItem({ ...base, changed_meanwhile: true, licence: null })),
+  lost: lines(hubCheckItem({ ...base, id_not_answered: true, licence: null })),
+  unreadable: hubLicenceLines({ unreadable: true }),
+  markOnly: hubLicenceLines({ name: 'zz-crd', position: null, uic: null, share_alike: ['uic'],
+    attribution: [], unreadable: false }),
+}));
+"""
+
+
+def test_the_check_says_changed_meanwhile_unanswered_id_and_unreadable_licence(
+    template_text: str,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    program = _RENDER_PRELUDE + _check_script(template_text) + _CHECK_NOTES_SCENARIO
+    result = subprocess.run(
+        [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+
+    assert out["meanwhile"][2] == (
+        "This hub was changed while the module was asked: nothing was written. Check it again."
+    )
+    assert out["lost"][2] == (
+        "The station module no longer answers VIATOR id ZZ-99001; its code is served. The hub "
+        "keeps the id: confirm the station again, or forget the id in the hub form."
+    )
+    assert out["unreadable"] == ["Licence: given by the station module but unreadable."]
+    assert out["markOnly"] == ["Licence: Name: zz-crd · Code: tag unreadable (share-alike)"]
