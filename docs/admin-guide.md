@@ -3053,8 +3053,10 @@ the extracts changes no graph build.
   `web` container, one at a time on the server, with at most 2 GiB of
   memory, 40 minutes of processor time and 45 minutes in all, at a lower
   priority, and it dies with the web process. A broken, hostile or oversized
-  archive can only end that child: the log says `reason=resource_limit` (or
-  `input_too_large`, below) and the web process carries on. At the module's
+  archive can only end that child: the log says which limit it passed
+  (`reason=memory_limit`, `cpu_limit` or `wall_clock_limit`, see "Which
+  limit, and what to do" below; or `input_too_large`) and the web process
+  carries on. At the module's
   200,000-row cap the child was measured at about 830 MiB (GTFS) and
   730 MiB (NeTEx): the 2 GiB cap leaves some 2.4 times that.
 - **National feeds.** Nothing is unpacked to disk: the archive is read as a
@@ -3112,8 +3114,8 @@ the extracts changes no graph build.
   real timetables pack 5 to 30 times, a national feed of tens of GB is
   read —, a record or text over 1 MiB, nesting past 64, or counts: more
   stations, assignments, Quays or journey groups than VIATOR keeps),
-  `resource_limit` (the child passed its memory, processor time or wall
-  clock, or was stopped), `busy` (another extraction held the server too
+  `memory_limit`, `cpu_limit`, `wall_clock_limit` (the child passed that
+  limit), `stopped` (the child was ended from outside), `busy` (another extraction held the server too
   long),
   `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
   file whose rail journeys call but which defines no stop place, as some
@@ -3124,7 +3126,7 @@ the extracts changes no graph build.
   never affected. A cached file found damaged (after a crash) is made again.
 - **A failure is remembered.** When the same file would fail again the same
   way (`bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
-  a module limit, or the child out of memory or processor time), VIATOR
+  a module limit, `memory_limit` or `cpu_limit`), VIATOR
   keeps the reason in `_extracts/<PROVIDER>.<sha256>.<16 hex>.csv.gz.failed`
   and does not read that file again: every later pass shows the same reason
   at once. It is read again when a new file is downloaded, when the
@@ -3135,6 +3137,34 @@ the extracts changes no graph build.
   second time in a row (a child killed or failing otherwise in between
   starts the count again); `busy` and `error` are never remembered: the next
   pass tries again.
+- **Which limit, and what to do.** The Sessions page's station-module
+  column and the `web` log give one word per limit (VIATOR releases before
+  15 October said `resource_limit` for all of them):
+  - `memory_limit` — the extraction needed more than its 2 GiB. Since the
+    fix of 15 October the NeTEx reader keeps about 250 bytes per scheduled
+    stop point and assignment and a few hundred MiB for a national feed,
+    so this should no longer happen with a real timetable. If it does: note the provider and the file size, do not raise
+    the limit, report it (a reader to fix). It is remembered: the same file
+    is not read again until a new file, or a VIATOR release changing the
+    reader, which retries it at the next refresh with nothing to delete.
+  - `cpu_limit` — more than 40 minutes of processor time (a national NeTEx
+    reads at some 25 to 60 MB of XML a second, so this means some 60 GB
+    unpacked or more, or a reader fault). Remembered, like `memory_limit`.
+    Report it with the file size.
+  - `wall_clock_limit` — 45 minutes in all, before the processor time ran
+    out: the server was busy (a graph build at the same time). Tried once
+    more at the next pass; remembered only the second time in a row. If it
+    stays, refresh again at a quiet time.
+  - `stopped` — the child was ended from outside (a restart of `web`, or
+    the kernel short of memory). Never remembered: the next pass tries
+    again. If it repeats, look at the server's memory (`docker stats`,
+    `dmesg` for the OOM killer).
+  - `input_too_large` — not a limit of the child but a bound of what VIATOR
+    reads (sizes, counts: more than 2 million assignments, Quays,
+    StopPlaces or called points, 1 million journey groups, …), refused at
+    once. Report it: raising a bound is a decision, with measures (an
+    export that gives every journey its own stop points passes 2 million
+    assignments near 3 GB of unpacked XML, at some 250 bytes each).
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).
@@ -3202,7 +3232,7 @@ provider's slot.
   | sent | the module recorded the extract as a new version |
   | already held | the module already had this file's extract (nothing sent, or the upload answered "unchanged") |
   | refused `<reason>` | the module refused the extract, with its reason word (`row`, `header`, `duplicate_stop`, `size`, `token` for a token the module refuses (`STATION_MODULE_TOKEN` is not its `MSMM_INTERNAL_TOKEN`), `source_taken`, …): see the module's runbook; the next refresh or rebuild tries again, and the module refuses it the same way until the file, the extractor or the module changes |
-  | skipped | nothing sent: no file in the slot yet (`no_archive`), no feed key (`no_feed_key`, a derived provider), no extract could be made (`too_large`, `no_rail_stop`, `input_too_large`, `resource_limit` when the extraction passed its memory or time limit, `busy` when another extraction held the machine too long, …), not yet made before a rebuild (`not_cached`: sent by the next pass once made), the file in the slot not the one its download recorded (`no_snapshot`, `archive_changed`: a refresh replaced it meanwhile; sent by the next pass), or the time was spent (`budget`) |
+  | skipped | nothing sent: no file in the slot yet (`no_archive`), no feed key (`no_feed_key`, a derived provider), no extract could be made (`too_large`, `no_rail_stop`, `input_too_large`, `memory_limit`, `cpu_limit` or `wall_clock_limit` when the extraction passed that limit, `stopped` when it was ended from outside, `busy` when another extraction held the machine too long, …), not yet made before a rebuild (`not_cached`: sent by the next pass once made), the file in the slot not the one its download recorded (`no_snapshot`, `archive_changed`: a refresh replaced it meanwhile; sent by the next pass), or the time was spent (`budget`) |
   | module unavailable | the module did not take it: unreachable (`network`), too slow (`timeout`), busy, its half-hour limit reached (`extract_window`), a 404 (a module older than these calls), a 5xx, a redirect or another unexpected answer (a wrong `STATION_MODULE_URL` or a proxy in the way), an answer of the wrong form (`shape`); sent again at the next refresh or rebuild |
 
   Beside a "skipped" or "module unavailable" text the reason word is shown

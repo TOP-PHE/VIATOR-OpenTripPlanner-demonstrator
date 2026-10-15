@@ -18,8 +18,12 @@ file with the StopPlaces and a calendar, and one file per line holding a
 ServiceFrame (Line, Route, scheduled stop points, links, assignments,
 patterns), a ServiceCalendarFrame (day types and their assignments) and a
 TimetableFrame whose journeys carry their passing times, which make up most
-of the bytes. One line in eight is rail. The GTFS archive has one route in
-eight rail, about 25 calls per trip.
+of the bytes. One line in eight is rail. With `--per-journey`, every
+journey has its own pattern and its own scheduled stop points, each
+assigned (as many points and assignments as calls: the shape that ran out
+of memory before the fix of 15 October); with `--no-mode`, neither the
+journeys nor the Lines give a mode (the railStation fallback decides). The
+GTFS archive has one route in eight rail, about 25 calls per trip.
 """
 
 from __future__ import annotations
@@ -95,16 +99,50 @@ def _shared(places: int, rng: random.Random) -> Iterator[bytes]:
     yield _DELIVERY_TAIL
 
 
-def _line_file(line: int, places: int, journeys: int, rng: random.Random) -> Iterator[bytes]:
+class Shape:
+    """`per_journey`: a pattern and scheduled stop points of each journey's
+    own; `mode`: whether the journeys and Lines give their mode."""
+
+    def __init__(self, per_journey: bool = False, mode: bool = True) -> None:
+        self.per_journey = per_journey
+        self.mode = mode
+
+
+def _keys(line: int, journeys: int, stops: int, shape: Shape) -> list[tuple[str, int]]:
+    """The scheduled stop points of a line: (key, stop index)."""
+    if shape.per_journey:
+        return [(f"{line}:{j}:{i}", i) for j in range(journeys) for i in range(stops)]
+    return [(f"{line}:{i}", i) for i in range(stops)]
+
+
+def _patterns(line: int, journeys: int, stops: int, shape: Shape) -> Iterator[str]:
+    for j in range(journeys) if shape.per_journey else (None,):
+        name = f"{line}:{j}" if j is not None else f"{line}"
+        points = "".join(
+            f'<StopPointInJourneyPattern id="ZZ:SPJP:{name}:{i}" order="{i + 1}" version="1">'
+            f'<ScheduledStopPointRef ref="ZZ:SSP:{name}:{i}"/></StopPointInJourneyPattern>'
+            for i in range(stops)
+        )
+        yield (
+            f'<ServiceJourneyPattern id="ZZ:SJP:{name}" version="1"><RouteRef '
+            f'ref="ZZ:Route:{line}"/><pointsInSequence>{points}</pointsInSequence>'
+            "</ServiceJourneyPattern>"
+        )
+
+
+def _line_file(
+    line: int, places: int, journeys: int, rng: random.Random, shape: Shape
+) -> Iterator[bytes]:
     rail = line % 8 == 0
     stops = rng.randint(15, 35)
     route = [rng.randrange(0, places, 8) if rail else rng.randrange(places) for _ in range(stops)]
-    mode = "rail" if rail else "bus"
+    mode = f"<TransportMode>{'rail' if rail else 'bus'}</TransportMode>" if shape.mode else ""
+    keys = _keys(line, journeys, stops, shape)
     yield _delivery_head()
     out = [f'<ServiceFrame id="ZZ:SVF:{line}" version="1"><lines>']
     out.append(
         f'<Line id="ZZ:Line:{line}" version="1"><Name>ZZ {line}</Name>'
-        f"<TransportMode>{mode}</TransportMode>"
+        f"{mode}"
         f'<OperatorRef ref="ZZ:Operator:{line % 97}"/></Line></lines>'
         f'<routes><Route id="ZZ:Route:{line}" version="1"><LineRef ref="ZZ:Line:{line}"/>'
         "<pointsInSequence>"
@@ -116,10 +154,10 @@ def _line_file(line: int, places: int, journeys: int, rng: random.Random) -> Ite
     )
     out.append("</pointsInSequence></Route></routes><scheduledStopPoints>")
     out.extend(
-        f'<ScheduledStopPoint id="ZZ:SSP:{line}:{i}" version="1"><Name>ZZ Ort {p}</Name>'
-        f"<Location><Longitude>9.{p}</Longitude><Latitude>50.{p}</Latitude></Location>"
-        "</ScheduledStopPoint>"
-        for i, p in enumerate(route)
+        f'<ScheduledStopPoint id="ZZ:SSP:{key}" version="1"><Name>ZZ Ort {route[i]}</Name>'
+        f"<Location><Longitude>9.{route[i]}</Longitude><Latitude>50.{route[i]}</Latitude>"
+        "</Location></ScheduledStopPoint>"
+        for key, i in keys
     )
     out.append("</scheduledStopPoints><serviceLinks>")
     out.extend(
@@ -133,22 +171,15 @@ def _line_file(line: int, places: int, journeys: int, rng: random.Random) -> Ite
     )
     out.append("</serviceLinks><stopAssignments>")
     out.extend(
-        f'<PassengerStopAssignment id="ZZ:PSA:{line}:{i}" order="1" version="1">'
-        f'<ScheduledStopPointRef ref="ZZ:SSP:{line}:{i}"/>'
-        f'<StopPlaceRef ref="ZZ:StopPlace:{p}"/><QuayRef ref="ZZ:Quay:{p}-1"/>'
+        f'<PassengerStopAssignment id="ZZ:PSA:{key}" order="1" version="1">'
+        f'<ScheduledStopPointRef ref="ZZ:SSP:{key}"/>'
+        f'<StopPlaceRef ref="ZZ:StopPlace:{route[i]}"/><QuayRef ref="ZZ:Quay:{route[i]}-1"/>'
         "</PassengerStopAssignment>"
-        for i, p in enumerate(route)
+        for key, i in keys
     )
-    out.append(
-        f'</stopAssignments><journeyPatterns><ServiceJourneyPattern id="ZZ:SJP:{line}" '
-        f'version="1"><RouteRef ref="ZZ:Route:{line}"/><pointsInSequence>'
-    )
-    out.extend(
-        f'<StopPointInJourneyPattern id="ZZ:SPJP:{line}:{i}" order="{i + 1}" version="1">'
-        f'<ScheduledStopPointRef ref="ZZ:SSP:{line}:{i}"/></StopPointInJourneyPattern>'
-        for i in range(stops)
-    )
-    out.append("</pointsInSequence></ServiceJourneyPattern></journeyPatterns></ServiceFrame>\n")
+    out.append("</stopAssignments><journeyPatterns>")
+    out.extend(_patterns(line, journeys, stops, shape))
+    out.append("</journeyPatterns></ServiceFrame>\n")
     yield "".join(out).encode()
     yield f'<ServiceCalendarFrame id="ZZ:SCF:{line}" version="1"><dayTypeAssignments>'.encode()
     for j in range(journeys):
@@ -162,20 +193,21 @@ def _line_file(line: int, places: int, journeys: int, rng: random.Random) -> Ite
     yield f'<TimetableFrame id="ZZ:TF:{line}" version="1"><vehicleJourneys>'.encode()
     for j in range(journeys):
         start = rng.randrange(4 * 60, 23 * 60)
+        name = f"{line}:{j}" if shape.per_journey else f"{line}"
         times = []
         for i in range(stops):
             minute = start + 3 * i
             clock = f"{(minute // 60) % 24:02d}:{minute % 60:02d}:00"
             times.append(
                 f'<TimetabledPassingTime id="ZZ:TPT:{line}:{j}:{i}" version="1">'
-                f'<StopPointInJourneyPatternRef ref="ZZ:SPJP:{line}:{i}"/>'
+                f'<StopPointInJourneyPatternRef ref="ZZ:SPJP:{name}:{i}"/>'
                 f"<ArrivalTime>{clock}</ArrivalTime><DepartureTime>{clock}</DepartureTime>"
                 "</TimetabledPassingTime>"
             )
         yield (
             f'<ServiceJourney id="ZZ:SJ:{line}:{j}" version="1"><dayTypes>'
             f'<DayTypeRef ref="ZZ:DayType:{line}:{j % 40}"/></dayTypes>'
-            f'<ServiceJourneyPatternRef ref="ZZ:SJP:{line}"/>'
+            f'<ServiceJourneyPatternRef ref="ZZ:SJP:{name}"/>'
             f'<OperatorRef ref="ZZ:Operator:{line % 97}"/><LineRef ref="ZZ:Line:{line}"/>'
             f"<passingTimes>{''.join(times)}</passingTimes></ServiceJourney>\n"
         ).encode()
@@ -192,9 +224,12 @@ def _write_member(zf: zipfile.ZipFile, name: str, chunks: Iterator[bytes]) -> in
     return size
 
 
-def make_netex(path: Path, target_mb: int, places: int = 30_000, seed: int = 99) -> int:
+def make_netex(
+    path: Path, target_mb: int, places: int = 30_000, seed: int = 99, shape: Shape | None = None
+) -> int:
     """A NeTEx archive of about `target_mb` MB unpacked, with `places`
-    StopPlaces; returns its unpacked size."""
+    StopPlaces, of `shape`; returns its unpacked size."""
+    shape = shape or Shape()
     rng = random.Random(seed)  # noqa: S311  # invented data, not a secret
     total = 0
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -202,7 +237,9 @@ def make_netex(path: Path, target_mb: int, places: int = 30_000, seed: int = 99)
         line = 0
         while total < target_mb * MB:
             total += _write_member(
-                zf, f"ZZ_line_{line}.xml", _line_file(line, places, rng.randint(80, 400), rng)
+                zf,
+                f"ZZ_line_{line}.xml",
+                _line_file(line, places, rng.randint(80, 400), rng, shape),
             )
             line += 1
     return total
@@ -299,6 +336,8 @@ def main() -> None:
     parser.add_argument("--mb", type=int, default=500, help="NeTEx: MB unpacked")
     parser.add_argument("--places", type=int, default=30_000, help="NeTEx: StopPlaces")
     parser.add_argument("--rows", type=int, default=5_000_000, help="GTFS: stop_times rows")
+    parser.add_argument("--per-journey", action="store_true", help="NeTEx: points per journey")
+    parser.add_argument("--no-mode", action="store_true", help="NeTEx: no TransportMode given")
     parser.add_argument("--heap", action="store_true", help="trace the Python heap (slower)")
     parser.add_argument("--keep", type=Path, help="keep the archive at this path")
     args = parser.parse_args()
@@ -306,7 +345,8 @@ def main() -> None:
         archive = args.keep or Path(folder) / "zz.zip"
         if not archive.exists():
             if args.format == "netex":
-                make_netex(archive, args.mb, args.places)
+                shape = Shape(per_journey=args.per_journey, mode=not args.no_mode)
+                make_netex(archive, args.mb, args.places, shape=shape)
             else:
                 make_gtfs(archive, args.rows)
         run(args.format, archive, args.heap)
