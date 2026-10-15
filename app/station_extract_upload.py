@@ -38,6 +38,18 @@ Per feed with a feed key: `HEAD`; on 200 nothing more ("already held"); on
 `EXTRACTOR_VERSION`, else, after a refresh, a resource-limited child
 process), then the `PUT`.
 
+**Order** (`_send_order`): the feeds whose outcome needs no extraction go
+first (no key, no archive, an extract already in the cache or a failure the
+extractor remembers), then the others from the smallest timetable file to
+the largest. A national archive whose extraction takes many minutes thus
+never keeps the small feeds of the same pass from being sent: they are sent
+before it, and when the budget ends while it is being made, it alone is
+"skipped budget"; its extraction goes on (the child process is not stopped,
+and the extractor's warm thread works through the remaining feeds, smallest
+first, with no budget), so its extract is in the cache and sent at the next
+pass, a refresh's or the worker's. The outcomes are still recorded and
+returned in the session's order.
+
 **Bounded.** Each call runs under `asyncio.timeout` on its own event loop
 (the per-call deadline of `app/station_builds.py`): `HEAD_SECONDS` for a
 `HEAD`, `PUT_SECONDS` for a `PUT`, never past the end of the pass's budget.
@@ -78,7 +90,10 @@ session's fetch-state folder (`inbox/<sid>/_fetch_state/`, the store of the
 feed-status panel), under its own key `provider[<id>].station_extract`, never
 in a fetch's own record, so a refresh writing the fetch state at the same
 moment loses nothing. The feed-status panel of the Sessions page shows it as
-a short text (`STATUS_TEXTS`). No migration.
+a short text (`STATUS_TEXTS`), the reason word beside it, and under them a
+sentence saying what the reason means (`REASON_TEXTS`: fixed texts written
+here, never an exception's text, a path, an address or a value of the
+extract). No migration.
 
 **Logs.** Reason words, counts and the provider id only (VIATOR's own
 configuration): never the token, the session id, a feed key, a body, a value
@@ -216,6 +231,38 @@ REFUSAL_CODES = frozenset(
         "invalid",
     }
 )
+# What a reason word means, in a few words, for the feed-status panel. Fixed
+# texts: a reason word has none when it explains itself (`status_<n>`, a
+# refusal word of the module).
+REASON_TEXTS = {
+    NO_FEED_KEY: "this feed is not sent to the station module",
+    NO_ARCHIVE: "no timetable file yet",
+    NOT_CACHED: "waiting for its extract; sent at the next pass",
+    BUDGET: "the pass ran out of time before it; sent at the next pass",
+    BUSY: "the station module or the extractor was busy; sent at the next pass",
+    "in_flight": "its extract is being made; sent at the next pass",
+    NO_SNAPSHOT: "the timetable file changed during the pass; sent at the next pass",
+    ARCHIVE_CHANGED: "the timetable file changed during the pass; sent at the next pass",
+    EXTRACT_GONE: "the extract was replaced during the upload; sent at the next pass",
+    NO_EXTRACT: "no usable extract was made",
+    EXTRACT_WINDOW: "the station module's half-hour window is full; sent later",
+    TIMEOUT: "the station module did not answer in time",
+    NETWORK: "the station module could not be reached",
+    SHAPE: "the station module's answer was not understood",
+    ERROR: "an unexpected error; see the web log",
+    "input_too_large": "the archive passes a reading bound: size, record length, nesting or counts",
+    "resource_limit": "the extraction passed its memory or time limit, or was stopped",
+    "bad_archive": "the archive cannot be read as GTFS or NeTEx",
+    "unsupported_format": "not a GTFS or NeTEx timetable",
+    "no_stop_place": "the NeTEx archive places no rail stop at a StopPlace",
+    "no_rail_stop": "no rail station in this feed",
+    "too_large": "the extract would pass the station module's size limit",
+    "too_many_rows": "the extract would pass the station module's row limit",
+    "line_too_long": "the extract would pass the station module's line limit",
+    "cell_too_long": "the extract would pass the station module's cell limit",
+    "cache": "the extract folder cannot be written",
+    "token": "the station module refused VIATOR's token",
+}
 PUT_STATUSES = frozenset({"recorded", "unchanged"})
 STATE_KEY = "provider[{pid}].station_extract"
 # Log lines written from more than one place.
@@ -828,8 +875,9 @@ def record_outcome(sid: str, outcome: FeedOutcome, *, at: datetime | None = None
 
 def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
     """A provider's last outcome as the Sessions page shows it, or None:
-    `{"at", "state", "reason", "text"}`, the text one of `STATUS_TEXTS`
-    (with the refusal's word)."""
+    `{"at", "state", "reason", "text", "detail"}`, the text one of
+    `STATUS_TEXTS` (with the refusal's word), the detail the reason's
+    sentence of `REASON_TEXTS` or None."""
     try:
         path = _outcome_path(sid, provider_id)
     except ValueError:
@@ -846,6 +894,7 @@ def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
         "state": word,
         "reason": reason,
         "text": FeedOutcome(provider_id, word, reason).text,
+        "detail": REASON_TEXTS.get(reason) if reason is not None else None,
     }
 
 
@@ -956,6 +1005,40 @@ def _extract(sid: str, feed: Feed, wait_seconds: float, cache_only: bool = False
         return ERROR
 
 
+def _ready(sid: str, feed: Feed) -> bool:
+    """Whether a feed's outcome needs no extraction: no key or no archive
+    (skipped at once), or an extract, or a remembered failure, in the
+    extractor's cache."""
+    if feed.feed_key is None or feed.archive is None or feed.archive_sha256 is None:
+        return True
+    return station_extract.extract_known(feed.provider_cfg, feed.archive_sha256, session_id=sid)
+
+
+def _archive_size(feed: Feed) -> int:
+    try:
+        return feed.archive.stat().st_size if feed.archive is not None else 0
+    except OSError:
+        return 0
+
+
+def _send_order(
+    sid: str, feeds: list[Feed], ready: Callable[[str, Feed], bool]
+) -> list[tuple[int, Feed]]:
+    """The feeds with their place in the session, in the order they are
+    sent: those that need no extraction first, then by the size of their
+    timetable file, smallest first; the session's order between equals."""
+
+    def key(item: tuple[int, Feed]) -> tuple[bool, int, int]:
+        place, feed = item
+        try:
+            known = ready(sid, feed)
+        except Exception:  # an ordering hint only
+            known = False
+        return (not known, 0 if known else _archive_size(feed), place)
+
+    return sorted(enumerate(feeds), key=key)
+
+
 def send_session_extracts(
     sid: str,
     feeds: Iterable[Feed],
@@ -967,8 +1050,10 @@ def send_session_extracts(
     extract: Callable[[str, Feed, float, bool], Any] = _extract,
     record: bool = True,
     cache_only: bool = False,
+    ready: Callable[[str, Feed], bool] = _ready,
 ) -> PassResult:
-    """Send what the module lacks of a session's feeds, within `budget` seconds.
+    """Send what the module lacks of a session's feeds, within `budget` seconds,
+    in the order of `_send_order` (`ready` says which need no extraction).
 
     Never raises an `Exception`: an unexpected one ends the pass (`error`,
     one WARNING). The caller goes on whatever the result (a graph is built,
@@ -979,6 +1064,7 @@ def send_session_extracts(
         log.info(_SKIPPED_OFF)
         return result
     clock = clock or SystemClock()
+    done: list[tuple[int, FeedOutcome]] = []
     try:
         work = _Pass(
             _Calls(transport, _session_header(sid)),
@@ -990,13 +1076,13 @@ def send_session_extracts(
             sid,
             cache_only,
         )
-        for feed in feeds:
+        for place, feed in _send_order(sid, list(feeds), ready):
             if should_stop():
                 raise _Stop
             outcome = work.feed(feed)
             _log_outcome(outcome)
             STATION_EXTRACT_FEEDS_TOTAL.labels(outcome=outcome.state).inc()
-            result.outcomes.append(outcome)
+            done.append((place, outcome))
             if record:
                 record_outcome(sid, outcome)
     except _Stop:
@@ -1006,6 +1092,8 @@ def send_session_extracts(
     except Exception as exc:
         log.warning(_FAILED, ERROR, type(exc).__name__)
         return result
+    finally:
+        result.outcomes = [outcome for _, outcome in sorted(done, key=lambda item: item[0])]
     counts = result.counts()
     log.info(
         "station_extract.done feeds=%d sent=%d held=%d refused=%d unavailable=%d skipped=%d",

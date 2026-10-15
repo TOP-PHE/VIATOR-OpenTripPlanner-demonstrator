@@ -822,7 +822,7 @@ went into which build; and stale files silently produce a build the operator thi
 | `app/graph_snapshots.py` | One row per successful build: what went in, which calendar period it covers, which build is current. |
 | `app/staleness.py` | Two timestamps in `config._meta` answering "are the downloaded files in sync with the configured URLs?" |
 | `app/inbox_sweep.py` | Quarantines inbox files belonging to providers the operator has since removed. |
-| `app/station_extract.py` (+ `_gtfs`, `_netex`, `_common`) | The **stop extract** of each timetable feed for the station module (MSMM 22.2): one gzip CSV per feed version, the rail stations only, with their codes; the MSMM feed key of a provider; the cache in `inbox/<sid>/_extracts/`. Made at refresh and upload time; nothing in the graph build reads it. |
+| `app/station_extract.py` (+ `_gtfs`, `_netex`, `_skip`, `_common`) | The **stop extract** of each timetable feed for the station module (MSMM 22.2): one gzip CSV per feed version, the rail stations only, with their codes; the MSMM feed key of a provider; the cache in `inbox/<sid>/_extracts/`. Made at refresh and upload time; nothing in the graph build reads it. |
 
 ### How it works
 
@@ -981,19 +981,31 @@ archive_sha256, *, extracted_at, session_id, cache_dir=None, wait_seconds=None, 
 ExtractResult(path_gz,
 feed_key, feed_version, extractor_version, rows, bytes, body_sha256, dropped)`**: a valid cached
 extract comes back at once; otherwise the extraction runs in a *spawned* child process with 2 GiB of
-address space (`RLIMIT_AS`), 25 minutes of processor time (`RLIMIT_CPU`), 30 minutes of wall-clock
+address space (`RLIMIT_AS`), 40 minutes of processor time (`RLIMIT_CPU`), 45 minutes of wall-clock
 time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
 `inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
 huge archive can only end the child (`resource_limit`); `ensure_extract` raises `ExtractError` only.
 With `cache_only=True` it returns a valid cached extract or raises `not_cached`, never starting or
-waiting for an extraction (the worker before a graph build).
+waiting for an extraction (the worker before a graph build). A failure the same archive would meet
+again (`REMEMBERED_REASONS`: `bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`, the
+four MSMM limits, a `resource_limit` of memory or processor time, and one of the wall clock the
+second time in a row, a child killed or failing otherwise in between starting the count again) is remembered in `<cache name>.failed` beside the cache, with the format it was
+read as and the signature of every bound and of the extraction's code (`_code_signature`: this module
+and the readers' files): the next caller (cache-only too) gets that reason at once, `"remembered"` as
+its detail, until the archive, the provider's format or columns, the extractor version, a bound or
+the readers' code changes.
 `build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
 key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
 fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
 `cross_border_filter` provider), derived from the configuration only, exactly as MSMM's
 `feed_intake.resolver_identity` / `url_identity`; `EXTRACTOR_VERSION` names the rules. The readers
-stream and **bound what they read**, not only what they write: the bytes unpacked per member (4 GiB)
-and per reading pass (8 GiB), counted as read; GTFS records of at most 1 MiB and 200 fields (counted
+stream and **bound what they read**, not only what they write: the bytes a member unpacks to (at
+most 200 times its packed size, 64 MiB at least, 160 GiB at most), the members read together (200
+times the packed bytes of the whole archive, never counted past the central directory's offset, 64
+MiB at least) and one reading pass (160 GiB), only
+stored or deflated members (bzip2 and lzma: `bad_archive`), checked on the sizes the zip's central
+directory declares before anything is read (zipfile never gives more than a member's declared size),
+then counted as read; members a reader never opens are never checked; GTFS records of at most 1 MiB and 200 fields (counted
 before the csv module builds them, a quoted field may span lines), ids of at most 255 characters,
 1,000,000 called stops; NeTEx read with expat in three passes, building elements only inside the ones
 a pass reads (and not their passing times, links or equipment), refusing nesting past 64, a text run
@@ -1029,7 +1041,36 @@ is neither snapshotted nor hashed), drops a (session, provider, sha256)
 already in progress, sweeps left-over `.tmp`/`.snap` files whose inode changed more than an hour ago
 (`st_ctime`: a snapshot's `st_mtime` is the slot's download time), and logs one line per provider with
 `sid=`, `provider=`, a reason word, and for a ready extract its rows, bytes and dropped counts (the
-child's own log lines go nowhere).
+child's own log lines go nowhere). The warm takes the providers from the smallest timetable file to
+the largest.
+
+**Stop extract: large archives** (production, 14 October: a national NeTEx of 1.95 GB zipped was
+`input_too_large` under the former caps of 4 GiB a member and 8 GiB a pass, and small feeds of the
+same session waited behind it). Nothing is ever written unpacked, so the bytes an archive unpacks to
+cost processor time, not disk or memory: the bounds stop a zip bomb early (a member may unpack to
+200 times its packed size, where timetable XML and CSV pack 5 to 30 times and only a crafted member
+nears deflate's 1,000, and the members read together at 200 times the whole archive; refused from
+the central directory before a byte is read) and accept a national feed (160 GiB a member and a pass:
+a 2 GB NeTEx packing 33 times is some 66 GB, and at 60 MB/s the child's 40 minutes end near 150 GB);
+the child's processor time is the last stop. The filter's searches inside a dropped element are each
+made once over a stretch of a chunk, so hostile markup there (many comments, processing instructions,
+nested self-closing tags) costs a few MB/s, as much as expat's own parsing of dense markup, never
+quadratic time; it takes over at a token boundary, reading first (`prime`) what expat parsed after
+the root's start tag. To read less, the NeTEx reader puts `station_extract_skip.SkipFilter` in front of
+expat once a document's root has begun: it drops from the raw bytes, with C searches, every element
+no pass reads (`_SKIPPED`: passing times, calendars, day types, links, scheduled stop points, notices,
+…), the elements only the other passes read (pass 2 never sees a ServiceJourney; passes 1 and 2 never
+see names, positions, key lists or codes; pass 1 never sees a Route's points), keeping a few bytes
+between chunks and exact on comments, CDATA, processing instructions, quoted `>` and nesting; what
+it drops of `_ALL` is still noted as held by the member. The GTFS reader reads `stop_times.txt` by
+column position (no dictionary per row, the other columns of a non-rail row never looked at) and
+splits text blocks in C (`str.splitlines` on a block with none of its extra line breaks, else the
+`readline` rule), handing csv whole quote-free blocks; the records, values, bounds and refusals stay
+those of the former reader (a test re-states it). Measured (`scripts/bench_station_extract.py`, one
+core, synthetic national shapes): NeTEx of 4 GB unpacked with 200,000 StopPlaces 67 s (60 MB/s,
+before 304 s), peak RSS 198 MiB; GTFS of 40 million stop times 57 s (0.7 million rows a second,
+before 127 s), peak RSS 100 MiB. A 2 GB national NeTEx (~40 GB) takes about 11 minutes, a 100-million
+GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall clock.
 
 ### Invariants & traps
 
@@ -1040,6 +1081,11 @@ child's own log lines go nowhere).
 - **Never call `build_extract` from the web process or the worker**: it has no memory, time or
   concurrency limit of its own; `ensure_extract` is the entry point. A damaged cached file (cut by a
   crash) is removed and made again; the temporary file is `fsync`ed before its rename.
+- **`_SKIPPED` must never name an element a pass reads, nor one that may hold such an element.**
+  Adding one is only safe for a frame or list that holds no element of `_ALL`; the
+  `tests/unit/test_station_extract_large.py` extracts with and without the filter must stay
+  byte-identical. Every new bound of a reader or of the child goes into
+  `station_extract._limits_signature`, or a failure remembered under the old bound keeps counting.
 - **The feed key must stay byte-for-byte MSMM's rule.** `tests/unit/test_station_extract.py` holds a
   copy of MSMM's `resolver_identity`/`url_identity` and pins literal keys; a change on one side
   only gives every feed a new key in the module (new `pending` feeds). Raise `EXTRACTOR_VERSION`
@@ -1253,13 +1299,21 @@ minutes, the passes one after the other, a pass already waiting for the same ses
 not queued twice. Not a FastAPI background task: the request's task list holds the extractor's own
 warm-up (`station_extract.warm_session_extracts`, PR 4), which its tests pin as the only task. Both
 go through `ensure_extract`, which makes one extraction at a time and reuses the cache, so one
-archive is never extracted twice. So an OTP session sends without a rebuild, and a refresh
+archive is never extracted twice (nor read twice when it fails the same way again: remembered). So an OTP session sends without a rebuild, and a refresh
 that found every file unchanged still sends what the module lacks (a first deploy, a new
 extractor version). The last outcome of each provider is written to
 `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` (`{"at", "state", "reason"}`), its
 own key beside the fetch state, so a refresh writing a fetch state at the same moment loses
 nothing; `GET /api/sessions/{sid}/providers/status` gives it back as `station_extract` with a
-fixed text, the "Station module" column of the feed-status panel. No migration. The file is removed
+fixed text and `detail`, the fixed sentence of `REASON_TEXTS` for its reason word (never an
+exception's text, a path or an address), the "Station module" column of the feed-status panel
+(the state, the reason word beside it, the sentence under them, all escaped). **A pass sends the
+feeds that need no extraction first** (no key, no archive, an extract or a remembered failure in
+the cache: `station_extract.extract_known`), then the others from the smallest timetable file to
+the largest; the outcomes stay in the session's order. A national extraction still running when
+the budget ends leaves that feed alone `skipped budget`: the child goes on, the warm thread works
+through the remaining feeds smallest first with no budget, and the next pass (the worker's
+cache-only one too) sends what is then in the cache. No migration. The file is removed
 when an upload replaces the provider's slot (`_forget_fetch_state_for_slot`) and when a saved config
 no longer names the provider (`patch_session`). The sender queue lives in the web process's memory: a
 restart of `web` loses the passes waiting there, and the next rebuild (or refresh) sends again.

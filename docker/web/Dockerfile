@@ -38,7 +38,7 @@ ENV PYTHONUNBUFFERED=1 \
 # fixed-upstream Debian CVEs to force the apt layer to re-evaluate. The
 # echo's stdout goes only to the build log; it does not affect the
 # runtime image.
-RUN echo "apt cache bust 2026-10-01 — refresh for OpenSSL CVE-2026-75804 (QUIC flow-control DoS) + CVE-2026-84782 (DTLS retransmission info disclosure); fixed in openssl/libssl3t64/openssl-provider-legacy 3.5.7-1~deb13u3. Previous bust 2026-06-26 for libssh2 CVE-2026-55200 + CVE-2026-7598." \
+RUN echo "apt cache bust 2026-10-14 — refresh for curl/libcurl4t64 CVE-2026-8286 (insecure TLS connection establishment) + CVE-2026-8927 (proxy credentials not cleared) + CVE-2026-92392 (HTTP/2 RST_STREAM during upload); fixed in curl/libcurl4t64 8.14.1-2+deb13u7. Previous bust 2026-10-01 for OpenSSL CVE-2026-75804 + CVE-2026-84782 (fixed in 3.5.7-1~deb13u3)." \
     && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl \

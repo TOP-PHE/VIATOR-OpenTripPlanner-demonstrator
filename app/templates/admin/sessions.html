@@ -566,6 +566,8 @@
   .feed-status-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.3rem; }
   .feed-status-table th, .feed-status-table td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid #d0d7de; vertical-align: top; }
   .feed-status-table .feed-reason { color: #cf222e; font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
+  .feed-status-table .feed-extract-reason { font-size: 0.8rem; }
+  .feed-status-table .feed-extract-detail { color: #57606a; font-size: 0.8rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
   .feed-format-ok { color: #1a7f37; }
   .feed-format-unknown { color: #5b6470; }
   /* NeTEx structure check (app/netex_structure.py): never blocks, only tells. */
@@ -1508,18 +1510,22 @@ function feedLastResultHTML(s) {
 
 // MSMM 22.3: the last time this provider's stop extract went to the station
 // module. The API gives a fixed short text ("sent", "already held",
-// "refused <reason>", "skipped", "module unavailable"), shown as written; a
-// reason word of a skip or an unavailable module goes in the tooltip.
+// "refused <reason>", "skipped", "module unavailable"), shown as written,
+// the reason word of a skip or an unavailable module beside it, and the
+// sentence that says what the reason means (`detail`, a fixed text of
+// app/station_extract_upload.py REASON_TEXTS) under them. All escaped.
 const _STATION_EXTRACT_FLAVOURS = {
   sent: 'ok', held: 'ok', refused: 'error', unavailable: 'stale', skipped: 'pending', cancelled: 'pending',
 };
 function feedStationExtractHTML(x) {
   if (!x || !x.text) return '<span class="hint">—</span>';
   const when = _relativeTimeShort(x.at);
-  const tip = x.reason && x.state !== 'refused' ? ` title="${escAttr(x.reason)}"` : '';
   const flavour = _STATION_EXTRACT_FLAVOURS[x.state] || 'pending';
-  const head = `<span class="prov-status-pill" data-state="${escAttr(flavour)}"${tip}>${escHTML(x.text)}</span>`;
-  return when ? `${head} <span class="hint">${escHTML(when)}</span>` : head;
+  const word = x.reason && x.state !== 'refused'
+    ? ` <code class="feed-extract-reason">${escHTML(x.reason)}</code>` : '';
+  const head = `<span class="prov-status-pill" data-state="${escAttr(flavour)}">${escHTML(x.text)}</span>${word}`;
+  const line = when ? `${head} <span class="hint">${escHTML(when)}</span>` : head;
+  return x.detail ? `${line}<div class="feed-extract-detail">${escHTML(x.detail)}</div>` : line;
 }
 
 function feedRowHTML(fid, s) {

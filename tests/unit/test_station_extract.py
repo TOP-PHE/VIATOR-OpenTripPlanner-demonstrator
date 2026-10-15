@@ -1090,6 +1090,10 @@ def test_warm_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         raise MemoryError
 
     monkeypatch.setattr(station_extract, "ensure_extract", boom)
+    # the failure is remembered: the archive is not read again
+    assert warm_session_extracts("s", config) == {"ZZRAIL": "bad_archive"}
+    for marker in (inbox / "s" / "_extracts").glob("*.failed"):
+        marker.unlink()
     assert warm_session_extracts("s", config) == {"ZZRAIL": "error"}
 
 

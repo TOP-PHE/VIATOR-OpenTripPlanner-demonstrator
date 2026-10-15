@@ -17,6 +17,7 @@ This module makes that file. Its public interface is small and stable:
                   bytes, body_sha256, dropped)
     ExtractError (with a `reason` word; the only exception it raises)
     provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)
+    extract_known(provider_cfg, archive_sha256, *, session_id) -> bool
     warm_session_extracts(session_id, config, *, only_provider=None,
                           upload_sha256=None)
     queue_warm(session_id, config, *, only_provider=None,
@@ -26,7 +27,13 @@ This module makes that file. Its public interface is small and stable:
 worker before a build): it returns a valid cached extract at once, and
 otherwise makes it in a child process with a memory, processor-time and
 wall-clock limit, one at a time on the machine, so that a hostile or huge
-archive can only end that child (`resource_limit`), never the caller.
+archive can only end that child (`resource_limit`), never the caller. A
+failure that the same archive would meet again (`REMEMBERED_REASONS`) is
+remembered beside the cache, so that a national archive that cannot be
+extracted is not read again by the next caller (the send pass after the
+warm thread, the next refresh): its reason is given at once, until the
+archive, the provider's format, the extractor, one of the bounds or the
+readers' code changes.
 `build_extract` is the extraction itself, in the calling process: the child
 runs it, and the tests; nothing else may call it.
 
@@ -43,6 +50,7 @@ import contextlib
 import csv
 import ctypes
 import fcntl
+import functools
 import gzip
 import hashlib
 import io
@@ -55,6 +63,7 @@ import queue
 import re
 import resource
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -68,7 +77,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import feed_fetch, ingestion, osm_geo, provider_catalogue
+from . import (
+    feed_fetch,
+    ingestion,
+    osm_geo,
+    provider_catalogue,
+    station_extract_common,
+    station_extract_gtfs,
+    station_extract_netex,
+    station_extract_skip,
+)
 from .feed_resolvers import validate_resolver
 from .settings import settings
 from .station_extract_common import ArchiveError, Station
@@ -578,10 +596,178 @@ def _cached(path: Path, meta: _Meta) -> ExtractResult | None:
 
 
 def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
-    """Remove the provider's older extracts: one kept per provider."""
-    for old in cache_dir.glob(f"{provider_id}.*.csv.gz"):
-        if old != keep:
-            old.unlink(missing_ok=True)
+    """Remove the provider's older extracts and remembered failures: one
+    file kept per provider."""
+    for pattern in (f"{provider_id}.*.csv.gz", f"{provider_id}.*{_FAILED_SUFFIX}"):
+        for old in cache_dir.glob(pattern):
+            if old != keep:
+                old.unlink(missing_ok=True)
+
+
+# ── Remembered failures ───────────────────────────────────────────────────
+
+# The reasons the same archive would give again, read by the same extractor
+# under the same bounds: remembered, so that it is not read again. A child
+# killed from outside is not; one past its wall clock (a busy machine) is
+# remembered only the second time in a row (`WALL_CLOCK_TRIES`; a child that
+# fails otherwise in between starts the count again), so that a national
+# archive does not hold the machine 45 minutes at every pass.
+# `busy`, `cache` and `error` are never remembered.
+REMEMBERED_REASONS = frozenset(
+    {
+        "bad_archive",
+        "input_too_large",
+        "no_stop_place",
+        "no_rail_stop",
+        "too_large",
+        "too_many_rows",
+        "line_too_long",
+        "cell_too_long",
+    }
+)
+_FAILED_SUFFIX = ".failed"
+# The details of a `resource_limit`: the child out of memory, past its wall
+# clock.
+OUT_OF_MEMORY = "out of memory"
+WALL_CLOCK = "wall-clock time"
+WALL_CLOCK_TRIES = 2
+_FAILED_MAX_BYTES = 1024
+# The code an extraction runs: a change to any of these files (a reader
+# fixed without a new `EXTRACTOR_VERSION`) makes every remembered failure
+# be tried again.
+_READER_MODULES = (
+    station_extract_common,
+    station_extract_gtfs,
+    station_extract_netex,
+    station_extract_skip,
+)
+
+
+def _remembered_detail(error: ExtractError) -> bool:
+    """A `resource_limit` the same archive meets again: out of memory, or the
+    processor-time signal (SIGXCPU)."""
+    return error.reason == "resource_limit" and error.detail in (
+        OUT_OF_MEMORY,
+        f"the child ended with {-signal.SIGXCPU}",
+    )
+
+
+def _wall_clock(error: ExtractError) -> bool:
+    return error.reason == "resource_limit" and error.detail == WALL_CLOCK
+
+
+@functools.cache
+def _code_signature() -> str:
+    """The sha256 of the extraction's own code (this module and the readers),
+    or of their names when a file cannot be read."""
+    digest = hashlib.sha256()
+    for module in (sys.modules[__name__], *_READER_MODULES):
+        try:
+            digest.update(Path(str(module.__file__)).read_bytes())
+        except OSError:
+            digest.update(module.__name__.encode())
+    return digest.hexdigest()
+
+
+def _limits_signature() -> str:
+    """The 16 hex of every bound an extraction runs under, and of its code:
+    a remembered failure counts only under the bounds and code it was met
+    with."""
+    common, gtfs, netex = station_extract_common, station_extract_gtfs, station_extract_netex
+    bounds = [
+        common.MEMBER_MAX_BYTES,
+        common.ARCHIVE_MAX_BYTES,
+        common.RATIO_MAX,
+        common.RATIO_FLOOR_BYTES,
+        common.STATIONS_MAX,
+        common.RAW_CODES_MAX,
+        gtfs.RECORD_MAX,
+        gtfs.FIELDS_MAX,
+        gtfs.ID_MAX,
+        gtfs.CALLED_STOPS_MAX,
+        netex.XML_DEPTH_MAX,
+        netex.XML_TEXT_MAX,
+        netex.XML_TOKEN_MAX,
+        netex.TARGET_ELEMENTS_MAX,
+        netex.GROUPS_MAX,
+        netex.ASSIGNMENTS_MAX,
+        netex.QUAYS_MAX,
+        CHILD_MEMORY_BYTES,
+        CHILD_CPU_SECONDS,
+        CHILD_WALL_SECONDS,
+        MAX_ROWS,
+        EXTRACT_MAX_BYTES,
+        UNPACKED_MAX_BYTES,
+        _code_signature(),
+    ]
+    return _sixteen_hex(json.dumps(bounds))
+
+
+def _failed_path(final: Path) -> Path:
+    return final.with_name(final.name + _FAILED_SUFFIX)
+
+
+def _failure(final: Path, fmt: str) -> dict[str, Any] | None:
+    """The failure recorded for the extract `final` read as `fmt`, when it
+    was met under the current bounds and code; else None (none, other
+    bounds, another format, unreadable)."""
+    try:
+        with _failed_path(final).open("rb") as fh:
+            record = json.loads(fh.read(_FAILED_MAX_BYTES))
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(record, dict)
+        or record.get("limits") != _limits_signature()
+        or record.get("format") != fmt
+    ):
+        return None
+    return record
+
+
+def _remembered(final: Path, fmt: str) -> str | None:
+    """The reason remembered for the extract `final` read as `fmt`, or None."""
+    record = _failure(final, fmt)
+    if record is None:
+        return None
+    reason = record.get("reason")
+    if not isinstance(reason, str) or reason not in _REMEMBERABLE:
+        return None
+    # Only a wall-clock stop carries a count; any other failure counts at once.
+    walls = record.get("walls", WALL_CLOCK_TRIES)
+    if not isinstance(walls, int) or walls < WALL_CLOCK_TRIES:
+        return None  # one wall-clock stop only: tried again
+    return reason
+
+
+_REMEMBERABLE = REMEMBERED_REASONS | {"resource_limit"}
+
+
+def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> None:
+    """Keep the reason of a failure the same archive would meet again, in
+    place of the provider's older files; a wall-clock stop is counted, and
+    remembered from the `WALL_CLOCK_TRIES`-th in a row. Best-effort."""
+    record: dict[str, Any] = {"reason": error.reason, "limits": _limits_signature(), "format": fmt}
+    if _wall_clock(error):
+        before = _failure(final, fmt)
+        walls = before.get("walls") if before is not None else None
+        record["walls"] = (walls if isinstance(walls, int) else 0) + 1
+    elif error.reason not in REMEMBERED_REASONS and not _remembered_detail(error):
+        # Not remembered (killed from outside, an error): a wall-clock count
+        # begun before is not "in a row" any more.
+        before = _failure(final, fmt)
+        if before is not None and "walls" in before:
+            _failed_path(final).unlink(missing_ok=True)
+        return
+    target = _failed_path(final)
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=final.parent, prefix=f".{provider_id}.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        Path(tmp_name).replace(target)
+    except OSError:
+        return
+    _prune(final.parent, provider_id, target)
 
 
 # Temporary files and archive snapshots older than this are left-overs of a
@@ -704,7 +890,7 @@ def build_extract(
     except ExtractError:
         raise
     except MemoryError:
-        raise ExtractError("resource_limit", "out of memory") from None
+        raise ExtractError("resource_limit", OUT_OF_MEMORY) from None
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
 
@@ -716,11 +902,20 @@ def build_extract(
 # runs at a lower priority than the web process.
 CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
 # Measured peaks at MSMM's 200,000-row cap: about 830 MiB RSS (GTFS) and
-# 730 MiB (NeTEx), so 2 GiB of address space leaves some 2.4 times that. A
-# stop_times.txt of 3 to 4 GB reads at about 12 MB/s, close to 15 minutes of
-# processor time: 25 minutes, and a wall clock to match, leave room for it.
-CHILD_CPU_SECONDS = 25 * 60
-CHILD_WALL_SECONDS = 30 * 60
+# 730 MiB (NeTEx), so 2 GiB of address space leaves some 2.4 times that; a
+# national-shaped NeTEx of 4 GB unpacked peaks at about 200 MiB, a GTFS of
+# 40 million stop times at about 100 MiB (what is kept grows with the rail
+# stations, not with the bytes). Processor time (`scripts/
+# bench_station_extract.py`, one core): NeTEx at about 60 MB/s, so a national
+# archive of 2 GB zipped (some 40 GB unpacked) takes about 11 minutes, 17 if
+# it packs 30 times; GTFS at about 0.7 million stop times a second, so
+# 100 million take under 3 minutes. 40 minutes leave twice the slowest of
+# those on a slower core; the child works niced, one at a time, in the
+# background (nothing waits for it: the send passes take what is ready), so
+# its wall clock is 45 minutes. A child past its processor time fails the
+# same way again (remembered, `REMEMBERED_REASONS`), so the margin matters.
+CHILD_CPU_SECONDS = 40 * 60
+CHILD_WALL_SECONDS = 45 * 60
 CHILD_NICE = 10
 # How long `ensure_extract` waits for another extraction to end by default.
 WAIT_SECONDS = CHILD_WALL_SECONDS + 60
@@ -766,7 +961,7 @@ def _child_main(
     except ExtractError as exc:
         conn.send(("error", exc.reason, exc.detail))
     except MemoryError:
-        conn.send(("error", "resource_limit", "out of memory"))
+        conn.send(("error", "resource_limit", OUT_OF_MEMORY))
     except Exception as exc:  # any other end is heard as a child that sent nothing
         conn.send(("error", "error", type(exc).__name__))
     finally:
@@ -788,7 +983,7 @@ def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> E
             with contextlib.suppress(EOFError, OSError):
                 message = receiver.recv()
         else:
-            message = ("error", "resource_limit", "wall-clock time")
+            message = ("error", "resource_limit", WALL_CLOCK)
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
     finally:
@@ -864,22 +1059,60 @@ def ensure_extract(
     folder = cache_dir if cache_dir is not None else extracts_dir(session_id)
     try:
         plan = _plan(provider_cfg, archive_path, archive_sha256, extracted_at, folder)
-        cached = _cached(plan.final, plan.meta)
-        if cached is not None:
-            return cached
+        _known(plan)
         if cache_only:
             raise ExtractError("not_cached", "no valid cached extract")
         deadline = time.monotonic() + (WAIT_SECONDS if wait_seconds is None else wait_seconds)
         with _machine_lock(settings.inbox_dir / _LOCK_NAME, deadline):
-            cached = _cached(plan.final, plan.meta)  # made while this one waited
-            if cached is not None:
-                return cached
+            _known(plan)  # made, or refused, while this one waited
             args = (dict(provider_cfg), archive_path, archive_sha256)
-            return _run_child(_child_build, (*args, extracted_at, folder))
+            try:
+                return _run_child(_child_build, (*args, extracted_at, folder))
+            except ExtractError as exc:
+                _remember(plan.final, plan.meta.provider_id, plan.fmt, exc)
+                raise
+    except _Known as known:
+        if known.result is not None:
+            return known.result
+        raise ExtractError(known.reason, "remembered") from None
     except ExtractError:
         raise
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
+
+
+class _Known(Exception):  # a way out of the checks, not an error
+    """What is known of an extract without making it: the cached extract, or
+    the reason remembered for the archive."""
+
+    def __init__(self, result: ExtractResult | None, reason: str = "") -> None:
+        super().__init__(reason)
+        self.result = result
+        self.reason = reason
+
+
+def _known(plan: _Plan) -> None:
+    """Raise `_Known` when the extract of `plan` is cached or its failure
+    remembered; return when it must be made."""
+    cached = _cached(plan.final, plan.meta)
+    if cached is not None:
+        raise _Known(cached)
+    reason = _remembered(plan.final, plan.fmt)
+    if reason is not None:
+        raise _Known(None, reason)
+
+
+def extract_known(provider_cfg: Mapping[str, Any], archive_sha256: str, *, session_id: str) -> bool:
+    """Whether the extract of an archive is in the cache, or its failure
+    remembered: what the send pass asks to send those feeds first. Cheap
+    (the file is not read back; `ensure_extract` checks it); never raises."""
+    try:
+        plan = _plan(
+            provider_cfg, Path(), archive_sha256, datetime.now(UTC), extracts_dir(session_id)
+        )
+        return plan.final.is_file() or _remembered(plan.final, plan.fmt) is not None
+    except Exception:  # an ordering hint only
+        return False
 
 
 def _child_build(
@@ -1075,19 +1308,23 @@ _IN_FLIGHT_LOCK = threading.Lock()
 
 def _cached_for(
     session_id: str, provider: Mapping[str, Any], upload_sha256: str | None
-) -> ExtractResult | None:
-    """The cached extract of the sha256 the state names, if any: then the
-    slot is neither snapshotted nor hashed (an extract of that sha256 was made
-    from a verified snapshot before)."""
+) -> ExtractResult | str | None:
+    """The cached extract of the sha256 the state names, or the reason
+    remembered for it, if any: then the slot is neither snapshotted nor
+    hashed (an extract of that sha256 was made, or refused, from a verified
+    snapshot before)."""
     found = _slot_and_source(session_id, provider)
     expected = _expected(session_id, found[1], found[2], upload_sha256) if found else None
     if expected is None:
         return None
     try:
         plan = _plan(provider, Path(), expected.sha256, datetime.now(UTC), extracts_dir(session_id))
+        _known(plan)
     except ExtractError:
         return None
-    return _cached(plan.final, plan.meta)
+    except _Known as known:
+        return known.result if known.result is not None else known.reason
+    return None
 
 
 def _warm_one(
@@ -1124,6 +1361,17 @@ def _warm_one(
                 _IN_FLIGHT.discard(key)
 
 
+def _slot_size(session_id: str, provider: Mapping[str, Any]) -> int:
+    """The size of the provider's timetable file, 0 when there is none: the
+    warm makes the smallest extracts first, so that one national archive
+    never keeps the small feeds of the session waiting."""
+    found = _slot_and_source(session_id, provider)
+    try:
+        return found[0].stat().st_size if found is not None else 0
+    except OSError:
+        return 0
+
+
 def warm_session_extracts(
     session_id: str,
     config: Mapping[str, Any],
@@ -1136,9 +1384,9 @@ def warm_session_extracts(
     the reason word when there is none (`skipped`, `in_flight` when the same
     archive is being made, or an `ExtractError` reason). Run after a refresh
     or an upload (on the warm thread, `queue_warm`), so that sending the extracts
-    later never waits for one to be made. Never raises; one line per
-    provider in the log, with the session and provider ids and a reason
-    word."""
+    later never waits for one to be made. The smallest timetable files go
+    first. Never raises; one line per provider in the log, with the session
+    and provider ids and a reason word."""
     outcome: dict[str, ExtractResult | str] = {}
     try:
         providers = ingestion.normalize_providers(dict(config))
@@ -1148,7 +1396,7 @@ def warm_session_extracts(
     with contextlib.suppress(OSError):
         _sweep(extracts_dir(session_id))
     uploads = upload_sha256 or {}
-    for provider in providers:
+    for provider in sorted(providers, key=lambda p: _slot_size(session_id, p)):
         pid = provider["id"]
         if only_provider is not None and pid != only_provider:
             continue

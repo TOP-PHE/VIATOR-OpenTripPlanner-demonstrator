@@ -33,11 +33,20 @@ members are read in three passes, each keeping only what the next one needs:
    which call themselves rail;
 3. the details (name, position, codes) of the stations and their children.
 
-A member that holds none of a pass's elements is not read again, and inside
-the elements a pass reads, the subtrees no pass reads (passing times, links,
-equipment) are not built. Measured on a synthetic single-file feed of 538 MB
-(200,000 journeys): about 56 s on one core; a national file of a few GB takes
-some minutes, within the child process's 25 minutes of processor time.
+A member that holds none of a pass's elements is not read again. **Most of
+the bytes never reach expat**: once a document's root element has begun,
+`station_extract_skip.SkipFilter` drops, from the raw bytes, every element
+of `_SKIPPED` (the passing times, calendars, links, scheduled stop points
+and the other subtrees no pass reads) and the elements only the other
+passes read (pass 2 never sees a ServiceJourney); what it drops of `_ALL` is
+still noted as held by the member. Inside the elements a pass builds, the
+subtrees of `_UNREAD` are not built either (an element written with a
+namespace prefix other than the root's is not cut, only not built).
+
+Measured on a synthetic national-shaped EPIP export (`scripts/
+bench_station_extract.py`; one shared file of StopPlaces, one file per line
+with its frames, the passing times most of the bytes, packed 20 times): see
+`docs/architecture.md`, "Stop extract: large archives".
 """
 
 from __future__ import annotations
@@ -61,10 +70,12 @@ from .station_extract_common import (
     ArchiveError,
     Budget,
     Station,
+    check_declared,
     coordinate,
     new_station,
     open_member,
 )
+from .station_extract_skip import SkipFilter, root_prefix, start_tag_end
 
 # A rail submode that MSMM's offline chain reads as suburban rail (its
 # `nap_modes.py`, `_SUBURBAN_SUBMODES`), compared in small letters.
@@ -104,6 +115,7 @@ XML_TOKEN_MAX = 2 * MEGABYTE
 TARGET_ELEMENTS_MAX = 200_000
 GROUPS_MAX = 1_000_000
 _CHUNK = 64 * 1024
+_PROLOG_PIECE = 1024
 # expat's own guard against amplification (a few KB that unfold to GB), when
 # the expat in use has it.
 _AMPLIFICATION_MAX = 100.0
@@ -132,6 +144,32 @@ _UNREAD = frozenset(
         "alternativeNames",
     }
 )
+# The elements dropped from the bytes before expat (`SkipFilter`): those of
+# `_UNREAD`, and the frames and lists no pass reads, which never hold an
+# element of `_ALL` (calendars, links, scheduled stop points, notices, ...).
+_SKIPPED = _UNREAD | frozenset(
+    {
+        "ServiceCalendarFrame",
+        "dayTypeAssignments",
+        "operatingPeriods",
+        "operatingDays",
+        "serviceLinks",
+        "scheduledStopPoints",
+        "routePoints",
+        "timingLinks",
+        "destinationDisplays",
+        "notices",
+        "journeyInterchanges",
+        "DeadRun",
+        "DatedServiceJourney",
+    }
+)
+# What only pass 3 reads (names, positions, codes): dropped in passes 1 and 2.
+_DETAIL_ONLY = frozenset(
+    {"keyList", "Name", "ShortName", "Description", "Centroid", "PrivateCode", "PublicCode"}
+)
+# Pass 1 drops the patterns, so a `pointsInSequence` it meets is a Route's.
+_PASS_1_SKIPPED = _DETAIL_ONLY | {"pointsInSequence"}
 
 
 def _local(tag: str) -> str:
@@ -228,6 +266,7 @@ class _Builder:
         self.last_event = 0  # byte index of the last event
         self.ready: list[Element] = []
         self.locals: dict[str, str] = {}
+        self.root_index: int | None = None  # where the root element's start tag begins
         parser.StartElementHandler = self.start
         parser.EndElementHandler = self.end
         parser.CharacterDataHandler = self.characters
@@ -242,6 +281,8 @@ class _Builder:
         self.last_event = self.parser.CurrentByteIndex
         self.run = 0
         self.depth += 1
+        if self.root_index is None:
+            self.root_index = self.last_event
         if self.depth > XML_DEPTH_MAX:
             raise ArchiveError("input_too_large", "XML nested deeper than 64 elements")
         if attrs and max(map(len, attrs.values())) > XML_TEXT_MAX:
@@ -289,21 +330,84 @@ class _Builder:
             self.texts[-1].append(data)
 
 
-def _walk(source: IO[bytes], targets: frozenset[str], seen: set[str]) -> Iterator[Element]:
+class _Pass:
+    """No filter: every byte to expat (a root start tag too long to see)."""
+
+    def feed(self, data: bytes) -> bytes:
+        return data
+
+    def finish(self) -> bytes:
+        return b""
+
+
+class _Feeder:
+    """Feeds one member to expat: the prolog as it is, `_PROLOG_PIECE` bytes
+    at a time until the root element begins (so that the filter takes over
+    close after the root's tag), then everything through `SkipFilter`, which
+    first reads the bytes expat parsed after the root's start tag (a token
+    boundary) to know its state."""
+
+    def __init__(self, parser: Any, builder: _Builder, skipped: frozenset[str]) -> None:
+        self.parser = parser
+        self.builder = builder
+        self.skipped = skipped
+        self.skip: SkipFilter | _Pass | None = None
+        self.window = b""  # the last bytes fed while the root element was not seen
+        self.fed = 0
+
+    def _note(self, name: str) -> None:
+        if name in _ALL:
+            self.builder.seen.add(name)
+
+    def _parse(self, data: bytes) -> None:
+        self.parser.Parse(data, False)
+        self.fed += len(data)
+
+    def _filter(self) -> SkipFilter | _Pass:
+        """The filter, primed with what expat parsed after the root's tag."""
+        start = self.builder.root_index - (self.fed - len(self.window))  # type: ignore[operator]
+        end = start_tag_end(self.window, start) if start >= 0 else None
+        if end is None:
+            return _Pass()
+        skip = SkipFilter(self.skipped, root_prefix(self.window, start), self._note)
+        skip.prime(self.window[end:])
+        return skip
+
+    def feed(self, chunk: bytes) -> None:
+        while self.skip is None and chunk:
+            piece, chunk = chunk[:_PROLOG_PIECE], chunk[_PROLOG_PIECE:]
+            self.window = self.window[-_CHUNK:] + piece
+            self._parse(piece)
+            if self.builder.root_index is not None:
+                self.skip = self._filter()
+        if self.skip is not None and chunk:
+            self._parse(self.skip.feed(chunk))
+
+    def finish(self) -> None:
+        if self.skip is not None:
+            self._parse(self.skip.finish())
+        self.parser.Parse(b"", True)
+
+
+def _walk(
+    source: IO[bytes], targets: frozenset[str], seen: set[str], skipped: frozenset[str]
+) -> Iterator[Element]:
     """The outermost elements of `targets` in document order, each whole.
-    The local names of `_ALL` met are added to `seen`."""
+    The local names of `_ALL` met, or dropped, are added to `seen`. Once the
+    root element has begun, the elements of `skipped` are dropped from the
+    bytes before expat sees them; before it (the prolog, a doctype) every
+    byte goes to expat as it is."""
     parser = _parser()
     builder = _Builder(parser, targets, seen)
-    fed = 0
+    feeder = _Feeder(parser, builder, skipped)
     try:
         while chunk := source.read(_CHUNK):
-            parser.Parse(chunk, False)
-            fed += len(chunk)
-            if fed - builder.last_event > XML_TOKEN_MAX:
+            feeder.feed(chunk)
+            if feeder.fed - builder.last_event > XML_TOKEN_MAX:
                 raise ArchiveError("input_too_large", "an XML token over 2 MiB")
             yield from builder.ready
             builder.ready.clear()
-        parser.Parse(b"", True)
+        feeder.finish()
     except expat.ExpatError as exc:
         raise ArchiveError("bad_archive", f"XML not well-formed at line {exc.lineno}") from None
     yield from builder.ready
@@ -321,18 +425,26 @@ class _Archive:
         ]
         if not self.names:
             raise ArchiveError("bad_archive", "NeTEx archive without an XML file")
+        check_declared(zf, self.names)
         self.holds: dict[str, set[str]] = {}
 
-    def walk(self, targets: frozenset[str]) -> Iterator[Element]:
-        """One reading pass: the unpacked bytes are counted from zero."""
+    def walk(
+        self, targets: frozenset[str], also_skipped: frozenset[str] = frozenset()
+    ) -> Iterator[Element]:
+        """One reading pass: the unpacked bytes are counted from zero. The
+        elements only other passes read are dropped with `_SKIPPED`: the
+        passes run in order, and a later pass never needs what an earlier
+        one dropped (pass 2 drops the journeys pass 1 read, pass 3 the
+        patterns and assignments pass 2 read)."""
         budget = Budget()
+        skipped = _SKIPPED | (_ALL - targets) | also_skipped
         for name in self.names:
             known = self.holds.get(name)
             if known is not None and not known & targets:
                 continue
             seen: set[str] = set()
             with open_member(self.zf, name, budget) as source:
-                yield from _walk(source, targets, seen)
+                yield from _walk(source, targets, seen, skipped)
             self.holds[name] = seen
 
 
@@ -433,7 +545,7 @@ def _read_journeys(archive: _Archive) -> _Journeys:
     points they call at). A journey read before its Line is filtered once
     every Line is known."""
     found = _Journeys()
-    for element in archive.walk(_JOURNEYS):
+    for element in archive.walk(_JOURNEYS, _PASS_1_SKIPPED):
         ident = element.get("id") or ""
         local = _local(element.tag)
         if local == "ServiceJourney":
@@ -560,7 +672,8 @@ def _read_structure(archive: _Archive, found: _Journeys) -> _Places:
     places = _Places()
     quays: dict[str, str] = {}
     counts = [0]
-    for element in archive.walk(_PATTERNS | _PLACES if found.by_pattern else _PLACES):
+    targets = _PATTERNS | _PLACES if found.by_pattern else _PLACES
+    for element in archive.walk(targets, _DETAIL_ONLY):
         local = _local(element.tag)
         if local == "PassengerStopAssignment":
             _note_assignment(element, assignments, counts)
