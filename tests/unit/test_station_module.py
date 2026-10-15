@@ -1210,7 +1210,7 @@ async def test_a_trickling_lookup_is_cut_at_the_deadline_without_a_pause(
 
 
 async def test_an_oversized_lookup_answer_is_refused_without_a_pause(module: Module) -> None:
-    big = b'{"stations": [' + b" " * (station_module.LOOKUP_MAX_BYTES + 1) + b"]}"
+    big = b'{"stations": [' + b" " * (station_module.SEARCH_MAX_BYTES + 1) + b"]}"
     module.handler = lambda _r: httpx.Response(200, content=big)
 
     outcome = await station_module.lookup(["9900001"], uuid.uuid4())
@@ -1865,7 +1865,7 @@ async def test_a_phase1_row_is_read_with_its_referential(module: Module) -> None
         "uic": "9900001",
         "viator_id": "ZZ-99001",
         "uic_origin": "TL",
-        "licence": _LICENCE,
+        "licence": {**_LICENCE, "unreadable": False},
     }
 
 
@@ -1980,45 +1980,121 @@ async def test_a_feed_licence_with_its_attribution_is_kept_as_text(module: Modul
     (row,) = await _searched(module, _phase1_row(licence=licence))
 
     # Kept as sent: every page puts it in as text (escaped), never as markup.
-    assert row["licence"] == licence
+    assert row["licence"] == {**licence, "unreadable": False}
 
 
-_BAD_LICENCES = [
-    pytest.param("odbl:trainline", id="a-text"),
-    pytest.param(["odbl:trainline"], id="a-list"),
-    pytest.param({**_LICENCE, "zz": 1}, id="an-extra-field"),
-    pytest.param({**_LICENCE, "uic": 7}, id="a-tag-not-text"),
-    pytest.param({**_LICENCE, "uic": ""}, id="an-empty-tag"),
-    pytest.param({**_LICENCE, "uic": "z" * 101}, id="a-tag-too-long"),
-    pytest.param({**_LICENCE, "name": "zz\x07crd"}, id="a-tag-with-a-control"),
-    pytest.param({**_LICENCE, "share_alike": "uic"}, id="share-alike-not-a-list"),
-    pytest.param({**_LICENCE, "share_alike": ["zz"]}, id="share-alike-unknown-field"),
-    pytest.param({**_LICENCE, "share_alike": ["uic", "uic"]}, id="share-alike-twice"),
-    pytest.param({**_LICENCE, "attribution": "Zz Rail"}, id="attribution-not-a-list"),
-    pytest.param({**_LICENCE, "attribution": [5]}, id="attribution-not-text"),
-    pytest.param({**_LICENCE, "attribution": [""]}, id="attribution-empty"),
-    pytest.param({**_LICENCE, "attribution": ["z" * 501]}, id="attribution-too-long"),
-    pytest.param({**_LICENCE, "attribution": ["Zz\nRail"]}, id="attribution-line-end"),
-    pytest.param({**_LICENCE, "attribution": ["Zz\x1b[31mRail"]}, id="attribution-escape"),
-    pytest.param({**_LICENCE, "attribution": ["Zz \u202eliaR"]}, id="attribution-bidi-override"),
-    pytest.param({**_LICENCE, "attribution": ["Zz \u2066Rail"]}, id="attribution-bidi-isolate"),
-    pytest.param({**_LICENCE, "attribution": ["Zz", "Zz"]}, id="attribution-twice"),
-    pytest.param({**_LICENCE, "attribution": [f"Zz {n}" for n in range(5)]}, id="five-texts"),
+_READ = {**_LICENCE, "unreadable": False}
+
+# Characters a third party's licence text may not hold, written as code
+# points (no raw invisible character in this file): bidirectional controls,
+# zero-width characters, marks and the byte order mark (category Cf), line
+# and paragraph separators (Zl, Zp), controls (Cc).
+_UNSAFE = {
+    "rlo": 0x202E,
+    "lri": 0x2066,
+    "zwsp": 0x200B,
+    "rlm": 0x200F,
+    "alm": 0x061C,
+    "bom": 0xFEFF,
+    "wj": 0x2060,
+    "line-sep": 0x2028,
+    "para-sep": 0x2029,
+    "line-end": 0x0A,
+    "escape": 0x1B,
+}
+
+
+@pytest.mark.parametrize("point", list(_UNSAFE.values()), ids=list(_UNSAFE))
+async def test_an_unsafe_attribution_text_is_left_out_and_the_rest_kept(
+    module: Module, point: int
+) -> None:
+    bad = "Zz " + chr(point) + "Rail"
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, "attribution": [bad, "Zz"]}))
+
+    assert row["licence"] == {**_READ, "attribution": ["Zz"]}
+
+
+@pytest.mark.parametrize("point", list(_UNSAFE.values()), ids=list(_UNSAFE))
+async def test_an_unsafe_tag_is_none_and_its_share_alike_mark_kept(
+    module: Module, point: int
+) -> None:
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, "uic": "odbl" + chr(point)}))
+
+    assert row["licence"] == {**_READ, "uic": None}
+
+
+_PARTS = [
+    pytest.param({"zz": 1}, {}, id="an-unknown-field-ignored"),
+    pytest.param({"uic": 7}, {"uic": None}, id="a-tag-not-text"),
+    pytest.param({"uic": ""}, {"uic": None}, id="an-empty-tag"),
+    pytest.param({"uic": "z" * 101}, {"uic": None}, id="a-tag-too-long"),
+    pytest.param({"share_alike": "uic"}, {"share_alike": []}, id="share-alike-not-a-list"),
+    pytest.param({"share_alike": ["zz", "uic"]}, {}, id="share-alike-unknown-field"),
+    pytest.param({"share_alike": ["uic", "uic"]}, {}, id="share-alike-twice"),
+    pytest.param({"attribution": "Zz Rail"}, {}, id="attribution-not-a-list"),
+    pytest.param({"attribution": [5, "Zz"]}, {"attribution": ["Zz"]}, id="attribution-not-text"),
+    pytest.param({"attribution": ["", "Zz"]}, {"attribution": ["Zz"]}, id="attribution-empty"),
     pytest.param(
-        {"name": None, "position": None, "uic": None, "share_alike": [], "attribution": []},
-        id="no-tag",
+        {"attribution": ["z" * 501, "Zz"]}, {"attribution": ["Zz"]}, id="attribution-too-long"
+    ),
+    pytest.param({"attribution": ["Zz", "Zz"]}, {"attribution": ["Zz"]}, id="attribution-twice"),
+    pytest.param(
+        {"attribution": [f"Zz {n}" for n in range(5)]},
+        {"attribution": [f"Zz {n}" for n in range(4)]},
+        id="five-texts-four-kept",
     ),
 ]
 
 
-@pytest.mark.parametrize("licence", _BAD_LICENCES)
-async def test_a_licence_out_of_shape_is_none_and_the_row_kept(
+@pytest.mark.parametrize(("part", "expected"), _PARTS)
+async def test_a_faulty_part_of_a_licence_never_hides_the_rest(
+    module: Module, part: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, **part}))
+
+    assert row["licence"] == {**_READ, **expected}
+    assert (row["uic"], row["viator_id"]) == ("9900001", "ZZ-99001")
+
+
+_UNREADABLE = {
+    "name": None,
+    "position": None,
+    "uic": None,
+    "share_alike": [],
+    "attribution": [],
+    "unreadable": True,
+}
+
+
+@pytest.mark.parametrize(
+    "licence",
+    [
+        pytest.param("odbl:trainline", id="a-text"),
+        pytest.param(["odbl:trainline"], id="a-list"),
+        pytest.param({}, id="an-empty-object"),
+        pytest.param(
+            {"name": None, "position": None, "uic": None, "share_alike": [], "attribution": []},
+            id="no-tag",
+        ),
+        pytest.param({"uic": 7, "share_alike": ["zz"], "attribution": [""]}, id="nothing-readable"),
+    ],
+)
+async def test_a_licence_given_but_unreadable_is_told_from_none(
     module: Module, licence: Any
 ) -> None:
     (row,) = await _searched(module, _phase1_row(licence=licence))
 
-    assert row["licence"] is None
-    assert (row["uic"], row["viator_id"]) == ("9900001", "ZZ-99001")
+    assert row["licence"] == _UNREADABLE
+
+
+async def test_no_licence_is_none(module: Module) -> None:
+    rows = await _searched(
+        module,
+        _phase1_row(licence=None),
+        {k: v for k, v in _phase1_row(name="Zz Old").items() if k != "licence"},
+    )
+
+    assert [r["licence"] for r in rows] == [None, None]
 
 
 async def test_a_licence_at_its_bounds_is_kept(module: Module) -> None:
@@ -2031,20 +2107,21 @@ async def test_a_licence_at_its_bounds_is_kept(module: Module) -> None:
     }
     (row,) = await _searched(module, _phase1_row(licence=licence))
 
-    assert row["licence"] == licence
+    assert row["licence"] == {**licence, "unreadable": False}
 
 
-async def test_a_lone_surrogate_in_an_attribution_drops_the_licence_never_a_500(
+async def test_a_lone_surrogate_in_an_attribution_leaves_that_text_out_never_a_500(
     module: Module,
 ) -> None:
-    raw = json.dumps({"stations": [_phase1_row(licence={**_LICENCE, "attribution": ["Zz"]})]})
-    raw = raw.replace('"Zz"', '"Zz\\ud800"')
+    licence = {**_LICENCE, "attribution": ["Zz", "Zz Bahn"]}
+    raw = json.dumps({"stations": [_phase1_row(licence=licence)]})
+    raw = raw.replace('"Zz"', '"Zz' + chr(92) + 'ud800"')
     module.handler = lambda _r: httpx.Response(200, content=raw.encode("ascii"))
 
     rows = await station_module.search("Zzstadt", uuid.uuid4())
 
     assert rows is not None
-    assert rows[0]["licence"] is None
+    assert rows[0]["licence"] == {**_READ, "attribution": ["Zz Bahn"]}
 
 
 def test_current_id_is_the_survivor_else_the_id() -> None:
@@ -2057,6 +2134,12 @@ def test_current_id_is_the_survivor_else_the_id() -> None:
 
 
 # ── the lookup by VIATOR ids ──
+
+
+def _read(row: dict[str, Any]) -> dict[str, Any]:
+    """A row of the module as the client gives it back: its licence with
+    `unreadable` false (the rows of these tests carry a readable one)."""
+    return {**row, "licence": {**row["licence"], "unreadable": False}}
 
 
 def _id_row(asked: str, uic: str | None, **extra: Any) -> dict[str, Any]:
@@ -2076,7 +2159,7 @@ async def test_a_lookup_by_ids_sends_ids_alone(module: Module) -> None:
     outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99001", "ZZ-99999"])
 
     assert json.loads(module.requests[0].content) == {"ids": ["ZZ-99001", "ZZ-99999"]}
-    assert outcome.rows == [_id_row("ZZ-99001", "9900001")]
+    assert outcome.rows == [_read(_id_row("ZZ-99001", "9900001"))]
 
 
 async def test_a_lookup_by_codes_still_sends_uics_alone(module: Module) -> None:
@@ -2097,7 +2180,30 @@ async def test_codes_and_ids_go_in_two_fields_and_a_station_asked_both_ways_give
     outcome = await station_module.lookup(["9900001"], uuid.uuid4(), ids=["ZZ-99001"])
 
     assert json.loads(module.requests[0].content) == {"uics": ["9900001"], "ids": ["ZZ-99001"]}
-    assert outcome.rows == [by_code, by_id]
+    assert outcome.rows == [by_code, _read(by_id)]
+    by_code_key, by_id_key = station_module.lookup_by_key(outcome.rows, ["9900001"], ["ZZ-99001"])
+    assert (by_code_key["9900001"]["licence"], by_id_key["ZZ-99001"]["licence"]["name"]) == (
+        None,
+        "zz-crd",
+    )
+
+
+async def test_the_codes_rows_end_at_the_first_row_of_an_id(module: Module) -> None:
+    """The module answers the codes' rows first, then the ids' (its 20.23):
+    a row met after an id's row is never read as a code's, so which key a
+    row answers follows the contract's order, not the codes' values."""
+    first = _lookup_row("9900001")
+    by_id = _id_row("ZZ-99003", "9900005")
+    late = _lookup_row("9900002")
+    module.answer(200, {"stations": [first, by_id, late]})
+
+    outcome = await station_module.lookup(["9900001", "9900002"], uuid.uuid4(), ids=["ZZ-99003"])
+
+    assert outcome.rows == [first, _read(by_id)]
+    by_code, by_id_key = station_module.lookup_by_key(
+        [first, by_id, late], ["9900001", "9900002"], ["ZZ-99003"]
+    )
+    assert (sorted(by_code), sorted(by_id_key)) == (["9900001"], ["ZZ-99003"])
 
 
 async def test_an_alias_answers_its_survivor_under_the_id_asked(module: Module) -> None:
@@ -2138,7 +2244,7 @@ async def test_lookup_rows_for_keys_not_asked_or_twice_are_dropped(module: Modul
 
     outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99001", "ZZ-99002"])
 
-    assert outcome.rows == [good]
+    assert outcome.rows == [_read(good)]
 
 
 async def test_malformed_parent_and_replaced_by_ids_are_none(module: Module) -> None:
@@ -2201,7 +2307,7 @@ async def test_a_lookup_answer_up_to_its_own_cap_is_read(module: Module) -> None
         for n in range(20)
     ]
     body = json.dumps({"stations": rows}, ensure_ascii=False).encode("utf-8")
-    assert station_module.SEARCH_MAX_BYTES < len(body) <= station_module.LOOKUP_MAX_BYTES
+    assert 64 * 1024 < len(body) <= station_module.SEARCH_MAX_BYTES
     module.handler = lambda _r: httpx.Response(200, content=body)
 
     outcome = await station_module.lookup(

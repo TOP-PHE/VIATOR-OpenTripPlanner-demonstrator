@@ -47,7 +47,8 @@ VIATOR id, `ZZ-99999` in form: `is_viator_id`), `uic_origin` (the origin
 label of the code: `MN`, `CM`, `VM`, `TL` or `FD`; any other word, `VU`
 included, is read as None) and `licence` (`_licence`: the licence tags of the
 name, the position and the code, the fields under a share-alike licence and
-the attribution texts, or None); a near row also `parent_viator_id`, a lookup
+the attribution texts, read part by part, with `unreadable` when a licence
+was given but nothing of it reads; None when none was given); a near row also `parent_viator_id`, a lookup
 row `parent_viator_id` and `replaced_by` (the id an alias was merged into).
 A module from before these fields answers rows without them: each is then
 None. A row's `uic` may be null when the row carries a valid `viator_id`
@@ -55,9 +56,11 @@ None. A row's `uic` may be null when the row carries a valid `viator_id`
 such a station has no stop-id routing and VIATOR uses its position. The
 current id of a station is `current_id(row)`: `replaced_by` when set, else
 `viator_id`; VIATOR stores that, never `viator_id` alone. A text of the
-licence is a third party's: kept only when it holds no control character,
-no surrogate and no bidirectional control, at most 500 characters, and put
-in a page as text only.
+licence is a third party's: kept only when it holds no character of the
+categories Cc, Cs, Cf, Zl and Zp (controls, surrogates, format characters
+such as the bidirectional and zero-width ones, line and paragraph
+separators), a tag of at most 100 characters, an attribution text of at
+most 500, and put in a page as text only.
 
 `search()` and `attribution()` return `None` on any failure, and the caller
 then uses VIATOR's own behaviour (the master_stations list; no notice); the
@@ -89,8 +92,8 @@ Rules this client keeps on purpose:
   search** (`admin_search_outcome`) **and the countries call**.
 - **A real deadline and a size cap**: 1 s for a whole search, lookup, near
   or countries call, 0.5 s for an attribution (httpx's timeouts bound each
-  read, not the call), and a body larger than 64 KiB (search, near,
-  countries), 128 KiB (lookup) or 256 KiB (attribution) is refused unread;
+  read, not the call), and a body larger than 128 KiB (search, lookup,
+  near, countries) or 256 KiB (attribution) is refused unread;
   so is a compressed answer, which could inflate past the cap at once.
   All count as failures that pause. Any other error (a bad address, a
   token httpx cannot encode) falls back too, as `network`.
@@ -166,9 +169,12 @@ UIC_ORIGIN_TEXTS = {
 LICENCE_FIELDS = ("name", "position", "uic")
 LICENCE_TAG_MAX = 100
 ATTRIBUTION_TEXTS_MAX = 4
-# Bidirectional controls (embeddings, overrides, isolates): a text holding one
-# could reorder what a page shows around it, so it is refused.
-_BIDI_CONTROLS = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+# The Unicode categories a third party's text of a licence may not hold:
+# controls (Cc), surrogates (Cs), format characters (Cf: the bidirectional
+# controls, which could reorder what a page shows around the text, the
+# zero-width characters, the byte order mark) and line and paragraph
+# separators (Zl, Zp).
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
 
 # A near call: a radius of 1 to 300 whole metres, at most five stations (the
 # module's rule, its design 21.13 and decision 62).
@@ -210,18 +216,20 @@ ATTRIBUTION_DEADLINE = 0.5
 ATTRIBUTION_TIMEOUT = httpx.Timeout(ATTRIBUTION_DEADLINE)
 
 # The largest body read from the module, decoded. A search answer is ten
-# short rows (a few KiB); an attribution is at most 20 groups of texts of 500
+# rows; an attribution is at most 20 groups of texts of 500
 # characters. Anything larger is refused without being read to its end. The
 # cap counts the bytes as they arrive: the client asks for no compression
 # and refuses a compressed answer, which could inflate far past the cap
 # inside a single chunk.
-SEARCH_MAX_BYTES = 64 * 1024
+# Search, near and lookup share this cap since the contract's phase 2: a
+# lookup answers up to 20 rows, each of which may carry attribution texts of
+# the timetable feeds (two of 500 characters, up to 4 bytes each, from the
+# module's phase 3: about 80 KiB with the rest of the rows, the module's
+# entry 713); a search of 10 rows or a near call of 5 stays well under it.
+# One cap for the three calls, so no answer of the contract is refused by
+# one call and taken by another.
+SEARCH_MAX_BYTES = 128 * 1024
 ATTRIBUTION_MAX_BYTES = 256 * 1024
-# A lookup answers up to 20 rows, each of which may carry attribution texts
-# of the timetable feeds (two of 500 characters, up to 4 bytes each, from the
-# module's phase 3): twice the search's cap, measured in the module's design
-# (entry 713).
-LOOKUP_MAX_BYTES = 128 * 1024
 
 COUNTRIES_PATH = "/internal/v1/countries"
 COUNTRIES_TTL_SECONDS = 60.0
@@ -522,61 +530,65 @@ def _origin_or_none(value: Any) -> str | None:
 
 def _third_party_text(value: Any, limit: int) -> bool:
     """True for a non-empty text of at most `limit` characters that holds no
-    control character, no surrogate and no bidirectional control."""
+    control character (Cc), no surrogate (Cs), no format character (Cf: the
+    bidirectional controls, the zero-width characters, the byte order mark;
+    the module refuses them too, its `has_format_character`) and no line or
+    paragraph separator (Zl, Zp)."""
     return (
         isinstance(value, str)
         and 0 < len(value) <= limit
-        and _plain(value)
-        and not any(character in _BIDI_CONTROLS for character in value)
+        and not any(unicodedata.category(character) in _UNSAFE_CATEGORIES for character in value)
     )
 
 
-class _BadLicence(Exception):
-    """A licence object out of shape: the row keeps its other fields."""
-
-
 def _licence_tag(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not _third_party_text(value, LICENCE_TAG_MAX):
-        raise _BadLicence
-    return str(value)
+    """A licence tag as sent, or None for an absent or unreadable one."""
+    return str(value) if _third_party_text(value, LICENCE_TAG_MAX) else None
 
 
-def _licence_list(value: Any, check: Callable[[Any], bool], most: int) -> list[str]:
-    """A list of distinct texts, each passing `check`, at most `most`."""
-    if not isinstance(value, list) or len(value) > most:
-        raise _BadLicence
-    if not all(check(item) for item in value) or len(set(value)) != len(value):
-        raise _BadLicence
-    return [str(item) for item in value]
+def _readable_list(value: Any, check: Callable[[Any], bool], most: int) -> list[str]:
+    """The items of a list that pass `check`, each once, at most `most`; an
+    item that does not pass is left out, the others kept."""
+    if not isinstance(value, list):
+        return []
+    kept: list[str] = []
+    for item in value:
+        if check(item) and item not in kept:
+            kept.append(str(item))
+    return kept[:most]
 
 
 def _licence(value: Any) -> dict[str, Any] | None:
-    """The licence of a row, checked, or None: absent, null, out of shape (a
-    tag that is not a short plain text, a share-alike field that is not one
-    of `LICENCE_FIELDS`, an attribution text that is not a plain text of at
-    most 500 characters, more than four of them, an extra field) or naming
-    no tag at all. A licence out of shape never drops the row."""
-    if not isinstance(value, dict):
+    """The licence of a row: None when absent or null (the module gives no
+    licence), else `{name, position, uic, share_alike, attribution,
+    unreadable}` with what can be read of it. A tag that is not a plain text
+    of at most 100 characters is None, an attribution text that is not a
+    plain text of at most 500 characters is left out (four kept at most), a
+    share-alike field not among `LICENCE_FIELDS` is left out, an unknown
+    field is ignored: a faulty part never hides the rest, the share-alike
+    marks above all (the module's design 22.8). `unreadable` is true when a
+    licence was given but nothing of it can be read (not an object, or no
+    readable part), so a page tells it from no licence. Never drops the
+    row."""
+    if value is None:
         return None
-    if set(value) - {*LICENCE_FIELDS, "share_alike", "attribution"}:
-        return None
-    try:
-        tags = {field: _licence_tag(value.get(field)) for field in LICENCE_FIELDS}
-        share_alike = _licence_list(
-            value.get("share_alike", []), lambda field: field in LICENCE_FIELDS, len(LICENCE_FIELDS)
-        )
-        attribution = _licence_list(
-            value.get("attribution", []),
-            lambda text: _third_party_text(text, MAX_TEXT),
-            ATTRIBUTION_TEXTS_MAX,
-        )
-    except _BadLicence:
-        return None
-    if all(tag is None for tag in tags.values()):
-        return None
-    return {**tags, "share_alike": share_alike, "attribution": attribution}
+    given = value if isinstance(value, dict) else {}
+    tags = {field: _licence_tag(given.get(field)) for field in LICENCE_FIELDS}
+    share_alike = _readable_list(
+        given.get("share_alike"), lambda field: field in LICENCE_FIELDS, len(LICENCE_FIELDS)
+    )
+    attribution = _readable_list(
+        given.get("attribution"),
+        lambda text: _third_party_text(text, MAX_TEXT),
+        ATTRIBUTION_TEXTS_MAX,
+    )
+    readable = any(tags.values()) or bool(share_alike) or bool(attribution)
+    return {
+        **tags,
+        "share_alike": share_alike,
+        "attribution": attribution,
+        "unreadable": not readable,
+    }
 
 
 def _station_row(item: Any) -> dict[str, Any] | None:
@@ -640,12 +652,9 @@ def _stations(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
-async def _post(
-    path: str, payload: dict[str, Any], user_id: uuid.UUID, limit: int | None = None
-) -> _Answer:
+async def _post(path: str, payload: dict[str, Any], user_id: uuid.UUID) -> _Answer:
     """One counted call (search, lookup or near): a POST of `payload` as JSON, on
-    behalf of `user_id`, within the search's deadline and the size cap `limit`
-    (the search's, `SEARCH_MAX_BYTES`, when None)."""
+    behalf of `user_id`, within the search's deadline and size cap."""
     headers = {
         **_headers(),
         USER_HEADER: str(user_id),
@@ -658,7 +667,7 @@ async def _post(
             httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client,
             client.stream("POST", _url(path), content=body, headers=headers) as response,
         ):
-            return await _read(response, SEARCH_MAX_BYTES if limit is None else limit)
+            return await _read(response, SEARCH_MAX_BYTES)
     except (TimeoutError, httpx.TimeoutException):
         raise _Failure("timeout", pause=True) from None
     except httpx.HTTPError:
@@ -754,23 +763,62 @@ def _lookup_body(codes: list[str], ids: list[str]) -> dict[str, Any]:
     return body
 
 
-def _lookup_row(item: Any, codes: set[str], ids: set[str]) -> dict[str, Any] | None:
-    """One row of a lookup answer: a search row whose code, or else whose
-    VIATOR id, was asked for and is not answered yet, plus `parent_uic` (a
-    string or null), `parent_viator_id` and `replaced_by` (VIATOR ids, None
-    when absent or malformed); None when it is not a usable row. The key
-    the row answers is taken out of `codes` or `ids`."""
+class _Keys:
+    """Which key of a lookup each row answers, in the module's order: the
+    rows of the codes first, in their order, then those of the ids (its
+    design 20.23). A row answers a code while the codes' rows run (its
+    `uic` is a code asked and not answered yet); once a row has answered an
+    id, the codes' rows are over, and a row answers an id when its
+    `viator_id` is an id asked and not answered yet (the module names an
+    alias's row by the id asked). A station asked both ways thus gives its
+    code's row and its id's row, even when the id's row (its anchor's)
+    carries a code that was asked too."""
+
+    def __init__(self, codes: list[str], ids: list[str]) -> None:
+        self.codes = set(codes)
+        self.ids = set(ids)
+        self.in_ids = False
+
+    def answered(self, row: dict[str, Any]) -> tuple[str, str] | None:
+        """`("uic", code)` or `("id", id)` for the key `row` answers, taken
+        out of those left; None when it answers none."""
+        if not self.in_ids and row["uic"] is not None and row["uic"] in self.codes:
+            self.codes.discard(row["uic"])
+            return ("uic", row["uic"])
+        if row["viator_id"] is not None and row["viator_id"] in self.ids:
+            self.ids.discard(row["viator_id"])
+            self.in_ids = True
+            return ("id", row["viator_id"])
+        return None
+
+
+def lookup_by_key(
+    rows: list[dict[str, Any]], codes: list[str], ids: list[str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """The rows of a lookup (as `lookup` gave them, for `codes` and `ids`) by
+    the code they answer and by the id they answer, by the rule of `_Keys`."""
+    keys = _Keys(codes, ids)
+    by_code: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        answered = keys.answered(row)
+        if answered is not None:
+            (by_code if answered[0] == "uic" else by_id)[answered[1]] = row
+    return by_code, by_id
+
+
+def _lookup_row(item: Any, keys: _Keys) -> dict[str, Any] | None:
+    """One row of a lookup answer: a search row that answers a key asked and
+    not answered yet (`_Keys`), plus `parent_uic` (a string or null),
+    `parent_viator_id` and `replaced_by` (VIATOR ids, None when absent or
+    malformed); None when it is not a usable row."""
     row = _station_row(item)
     if row is None:
         return None
     parent = item.get("parent_uic")
     if not _text_or_null(parent):
         return None
-    if row["uic"] is not None and row["uic"] in codes:
-        codes.discard(row["uic"])
-    elif row["viator_id"] is not None and row["viator_id"] in ids:
-        ids.discard(row["viator_id"])
-    else:
+    if keys.answered(row) is None:
         return None
     row["parent_uic"] = parent
     row["parent_viator_id"] = _viator_id_or_none(item.get("parent_viator_id"))
@@ -780,18 +828,15 @@ def _lookup_row(item: Any, codes: set[str], ids: set[str]) -> dict[str, Any] | N
 
 def _lookup_rows(payload: Any, codes: list[str], ids: list[str]) -> list[dict[str, Any]]:
     """The usable rows of a lookup answer, at most one per key asked, in the
-    module's order (the codes' rows, then the ids'); a wrong top-level shape
-    refuses the whole answer. A row answers a code when its `uic` is a code
-    asked and not answered yet, else an id when its `viator_id` is (the
-    module names an alias's row by the id asked)."""
+    module's order (`_Keys`); a wrong top-level shape refuses the whole
+    answer."""
     stations = payload.get("stations") if isinstance(payload, dict) else None
     if not isinstance(stations, list):
         raise _Failure("shape", pause=False)
-    codes_left = set(codes)
-    ids_left = set(ids)
+    keys = _Keys(codes, ids)
     rows: list[dict[str, Any]] = []
     for item in stations:
-        row = _lookup_row(item, codes_left, ids_left)
+        row = _lookup_row(item, keys)
         if row is not None:
             rows.append(row)
     return rows
@@ -823,7 +868,7 @@ async def lookup(uics: list[str], user_id: uuid.UUID, ids: list[str] | None = No
     body = _lookup_body(codes, wanted)
 
     async def call() -> list[dict[str, Any]]:
-        payload = _json_body(await _post(LOOKUP_PATH, body, user_id, LOOKUP_MAX_BYTES))
+        payload = _json_body(await _post(LOOKUP_PATH, body, user_id))
         return _lookup_rows(payload, codes, wanted)
 
     return await _without_pause("station_module.lookup_failed", call)
