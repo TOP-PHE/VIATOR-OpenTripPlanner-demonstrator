@@ -747,7 +747,7 @@ state) for forensics.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Save config returns `409 missing_master_stations_for_countries` | A provider declares `country_iso=X` but `master_stations` has zero rows for X | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline**. Then retry **Save config**. |
+| Save config returns `409 missing_master_stations_for_countries` | A provider declares `country_iso=X` but `master_stations` has zero rows for X and the station module does not serve X (or did not answer) | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline**. Then retry **Save config**. |
 | "Refresh sources now" returns `{"skipped": [{"reason": "unknown source key 'foo'"}]}` | You configured a key not in the recognised list (`gtfs`, `osm_pbf`, `netex_nordic`, `netex_epip`, `mct`, `stations`, or providers[]) | Use one of the recognised keys; the v0.1.6 UI emits providers[] form by default. |
 | Refresh succeeds for OSM PBF but build fails with "no GTFS found" | Provider's timetable URL returned a 404 / login page, not a real GTFS | `curl -sIL <url>` from the VPS to verify; some operators require a free account or have moved their endpoint. |
 | OTP build crashes with `OutOfMemoryError` (with `OTP_BUILD_PHASES=two_phase`, default) | `OTP_BUILD_HEAP` < what the bundle needs even after splitting phases | First check session's **OSM scope** — `transit-focused` cuts heap ~40%; bump down from `comprehensive` if currently set higher. If already `transit-focused` and still OOMs: bump `.env` `OTP_BUILD_HEAP=24g` + `OTP_BUILD_MEM_LIMIT=32g` for France-wide, `OTP_BUILD_HEAP=8g` + `OTP_BUILD_MEM_LIMIT=12g` for IDF. `docker compose up -d --force-recreate worker`. |
