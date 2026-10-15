@@ -334,6 +334,32 @@ def test_assignment_and_quay_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2_000_000)
     monkeypatch.setattr(netex, "QUAYS_MAX", 2)
     assert _reason(provider, archive, tmp_path) == "input_too_large"
+    monkeypatch.setattr(netex, "QUAYS_MAX", 2_000_000)
+    assert _reason(provider, archive, tmp_path) == "ok"
+    monkeypatch.setattr(netex, "STOP_PLACES_MAX", 1)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+    monkeypatch.setattr(netex, "STOP_PLACES_MAX", 2_000_000)
+    monkeypatch.setattr(netex, "POINTS_MAX", 1)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+
+
+def test_expat_out_of_memory_is_a_memory_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """expat that cannot allocate (the child's memory limit) raises an
+    ExpatError: a memory stop, not a malformed file."""
+    archive = _zip(
+        tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
+    )
+    code = netex.expat.errors.codes[netex.expat.errors.XML_ERROR_NO_MEMORY]
+
+    def failing(_self: Any, _chunk: bytes) -> None:
+        error = netex.expat.ExpatError("out of memory")
+        error.code, error.lineno = code, 1
+        raise error
+
+    monkeypatch.setattr(netex._Feeder, "feed", failing)
+    assert _reason(_provider("netex_epip"), archive, tmp_path) == "memory_limit"
 
 
 def test_lines_read_after_their_journeys(tmp_path: Path) -> None:
@@ -414,6 +440,14 @@ def _sleep() -> station_extract.ExtractResult:
     raise AssertionError("unreachable")
 
 
+def _spin() -> station_extract.ExtractResult:
+    """A child target that works past its processor time."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        pass
+    raise AssertionError("unreachable")
+
+
 def test_ensure_extract_in_a_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
     archive = _gtfs(tmp_path)
@@ -462,17 +496,39 @@ def test_ensure_extract_child_failures_are_extract_errors(
     monkeypatch.setattr(station_extract, "CHILD_MEMORY_BYTES", 512 * MIB)
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_allocate, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == ("memory_limit", "out of memory")
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_kill_self, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == (
+        "stopped",
+        f"the child ended with {-signal.SIGKILL}",
+    )
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_fail, ())
     assert caught.value.reason == "error"
+    monkeypatch.setattr(station_extract, "CHILD_CPU_SECONDS", 1)
+    with pytest.raises(ExtractError) as caught:
+        station_extract._run_child(_spin, ())
+    assert (caught.value.reason, caught.value.detail) == ("cpu_limit", "processor time")
     monkeypatch.setattr(station_extract, "CHILD_WALL_SECONDS", 1)
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_sleep, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == ("wall_clock_limit", "wall-clock time")
+
+
+@pytest.mark.parametrize(
+    ("exitcode", "reason"),
+    [
+        (-signal.SIGXCPU, "cpu_limit"),
+        (-signal.SIGKILL, "stopped"),
+        (-signal.SIGTERM, "stopped"),
+        (1, "error"),
+        (0, "error"),
+        (None, "error"),
+    ],
+)
+def test_a_silent_child_end_says_which(exitcode: int | None, reason: str) -> None:
+    assert station_extract._silent_end(exitcode).reason == reason
 
 
 def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -545,7 +601,7 @@ def test_build_extract_raises_only_extract_errors(
 
     archive = _gtfs(tmp_path)
     monkeypatch.setattr(station_extract, "_read_stations", oom)
-    assert _reason(_provider(), archive, tmp_path) == "resource_limit"
+    assert _reason(_provider(), archive, tmp_path) == "memory_limit"
     monkeypatch.setattr(station_extract, "_read_stations", other)
     assert _reason(_provider(), archive, tmp_path) == "error"
 
@@ -848,6 +904,108 @@ def test_direct_calls_without_a_pattern(tmp_path: Path) -> None:
         _build(provider, _netex(tmp_path, "c.zip", site, service, journeys), tmp_path), provider
     )
     assert rows["ZZ:SP:1"]["n_calls"] == "1"
+
+
+def test_a_point_assigned_to_several_places(tmp_path: Path) -> None:
+    """A scheduled stop point assigned three times: each place gets its
+    calls (the assignment keeps every place number)."""
+    site = (
+        '<SiteFrame id="S"><stopPlaces>'
+        + "".join(_place(f"ZZ:SP:{n}") for n in (1, 2, 3))
+        + "</stopPlaces></SiteFrame>"
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + "".join(_psa(n, "S1", f"ZZ:SP:{n}") for n in (1, 2, 3))
+        + "</stopAssignments>"
+        + _one_pattern(_point(1, "S1"))
+        + "</ServiceFrame>"
+    )
+    provider = _provider("netex_epip")
+    result = _build(provider, _netex(tmp_path, "m.zip", site, service, ONE_JOURNEY), tmp_path)
+    rows = _rows(result, provider)
+    assert {key: row["n_calls"] for key, row in rows.items()} == {
+        "ZZ:SP:1": "1",
+        "ZZ:SP:2": "1",
+        "ZZ:SP:3": "1",
+    }
+
+
+def test_journey_groups_counted_per_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One group of journeys over two patterns is two (pattern, group)
+    pairs: `GROUPS_MAX` bounds the pairs, not only the distinct groups."""
+    site = '<SiteFrame id="S"><stopPlaces>' + _place("ZZ:SP:1") + "</stopPlaces></SiteFrame>"
+    patterns = "".join(
+        f'<ServiceJourneyPattern id="ZZ:P{n}"><pointsInSequence>{_point(1, "S1")}'
+        "</pointsInSequence></ServiceJourneyPattern>"
+        for n in (1, 2)
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + _psa(1, "S1", "ZZ:SP:1")
+        + f"</stopAssignments><journeyPatterns>{patterns}</journeyPatterns></ServiceFrame>"
+    )
+    journeys = (
+        '<TimetableFrame id="T"><vehicleJourneys>'
+        + "".join(
+            f'<ServiceJourney id="J{n}"><LineRef ref="ZZ:L"/>'
+            f'<ServiceJourneyPatternRef ref="ZZ:P{n}"/></ServiceJourney>'
+            for n in (1, 2)
+        )
+        + "</vehicleJourneys></TimetableFrame>"
+    )
+    archive = _netex(tmp_path, "g.zip", site, service, journeys)
+    provider = _provider("netex_epip")
+    monkeypatch.setattr(netex, "GROUPS_MAX", 2)
+    assert _reason(provider, archive, tmp_path) == "ok"
+    monkeypatch.setattr(netex, "GROUPS_MAX", 1)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+
+
+def test_direct_calls_with_their_times(tmp_path: Path) -> None:
+    """A Call's Arrival and Departure are never read (dropped before
+    expat); every call of a point counts, a loop's twice."""
+    site = (
+        '<SiteFrame id="S"><stopPlaces>'
+        + _place("ZZ:SP:1")
+        + _place("ZZ:SP:2")
+        + "</stopPlaces></SiteFrame>"
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + _psa(1, "S1", "ZZ:SP:1")
+        + _psa(2, "S2", "ZZ:SP:2")
+        + "</stopAssignments></ServiceFrame>"
+    )
+    call = (
+        '<Call id="c{n}"><ScheduledStopPointRef ref="{point}"/><Arrival><Time>08:0{n}:00</Time>'
+        "<ForAlighting>false</ForAlighting></Arrival><Departure><Time>08:0{n}:30</Time>"
+        "</Departure></Call>"
+    )
+    calls = "".join(call.format(n=n, point=p) for n, p in enumerate(("S1", "S2", "S1")))
+    journeys = (
+        '<TimetableFrame id="T"><vehicleJourneys><ServiceJourney id="J"><LineRef ref="ZZ:L"/>'
+        f"<calls>{calls}</calls></ServiceJourney>"
+        '<ServiceJourney id="K"><LineRef ref="ZZ:L"/><OperatorRef ref="ZZ:Operator:9"/>'
+        f"<calls>{call.format(n=9, point='S2')}</calls></ServiceJourney>"
+        "</vehicleJourneys></TimetableFrame>"
+    )
+    provider = _provider("netex_epip")
+    rows = _rows(
+        _build(provider, _netex(tmp_path, "c.zip", site, service, journeys), tmp_path), provider
+    )
+    assert rows["ZZ:SP:1"]["n_calls"] == "2"
+    assert rows["ZZ:SP:2"]["n_calls"] == "2"  # two journeys, two groups
+    assert "ZZ:Operator:9" in rows["ZZ:SP:2"]["operators"]
+    assert "ZZ:Operator:9" not in rows["ZZ:SP:1"]["operators"]
 
 
 def test_netex_parents_and_positions(tmp_path: Path) -> None:

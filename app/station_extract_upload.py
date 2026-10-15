@@ -232,6 +232,10 @@ REFUSAL_CODES = frozenset(
         "invalid",
     }
 )
+# The extraction's limits, as the texts below give them.
+_GIB_OF_MEMORY = station_extract.CHILD_MEMORY_BYTES // (1024 * 1024 * 1024)
+_CPU_MINUTES = station_extract.CHILD_CPU_SECONDS // 60
+_WALL_MINUTES = station_extract.CHILD_WALL_SECONDS // 60
 # What a reason word means, in a few words, for the feed-status panel. Fixed
 # texts: a reason word has none when it explains itself (`status_<n>`, a
 # refusal word of the module).
@@ -252,6 +256,23 @@ REASON_TEXTS = {
     SHAPE: "the station module's answer was not understood",
     ERROR: "an unexpected error; see the web log",
     "input_too_large": "the archive passes a reading bound: size, record length, nesting or counts",
+    station_extract.MEMORY_LIMIT: (
+        f"the extraction passed its memory limit ({_GIB_OF_MEMORY} GiB); "
+        "retried once the file or VIATOR changes"
+    ),
+    station_extract.CPU_LIMIT: (
+        f"the extraction passed its processor-time limit ({_CPU_MINUTES} minutes); "
+        "retried once the file or VIATOR changes"
+    ),
+    station_extract.WALL_CLOCK_LIMIT: (
+        f"the extraction passed its wall-clock limit ({_WALL_MINUTES} minutes) on a busy "
+        "server; retried once"
+    ),
+    station_extract.STOPPED: (
+        "the extraction was stopped from outside (a restart, or the server short of memory)"
+    ),
+    # The one word of earlier releases for the four above, still in their
+    # recorded outcomes until the next pass.
     "resource_limit": "the extraction passed its memory or time limit, or was stopped",
     "bad_archive": "the archive cannot be read as GTFS or NeTEx",
     "unsupported_format": "not a GTFS or NeTEx timetable",

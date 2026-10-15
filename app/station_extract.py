@@ -27,7 +27,8 @@ This module makes that file. Its public interface is small and stable:
 worker before a build): it returns a valid cached extract at once, and
 otherwise makes it in a child process with a memory, processor-time and
 wall-clock limit, one at a time on the machine, so that a hostile or huge
-archive can only end that child (`resource_limit`), never the caller. A
+archive can only end that child (`memory_limit`, `cpu_limit`,
+`wall_clock_limit`: which limit it passed), never the caller. A
 failure that the same archive would meet again (`REMEMBERED_REASONS`) is
 remembered beside the cache, so that a national archive that cannot be
 extracted is not read again by the next caller (the send pass after the
@@ -128,9 +129,10 @@ class ExtractError(Exception):
     `bad_sha256`, `bad_provider`, `bad_time`, `unsupported_format`,
     `bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
     `too_large`, `too_many_rows`, `line_too_long`, `cell_too_long`,
-    `resource_limit` (the child process passed its memory, processor-time or
-    wall-clock limit), `busy` (another extraction held the machine for longer
-    than the wait), `not_cached` (`ensure_extract(cache_only=True)` found no
+    `memory_limit`, `cpu_limit`, `wall_clock_limit` (the child process
+    passed its memory, processor-time or wall-clock limit), `stopped` (the
+    child was ended from outside by a signal), `busy` (another extraction
+    held the machine for longer than the wait), `not_cached` (`ensure_extract(cache_only=True)` found no
     valid cached extract), `cache` (the cache folder cannot be written), `error`
     (anything else)."""
 
@@ -606,9 +608,26 @@ def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
 
 # ── Remembered failures ───────────────────────────────────────────────────
 
+# The reason words of a child that passed one of its limits, one per limit,
+# so that the log, the remembered failure and the feed status say which:
+# memory (`CHILD_MEMORY_BYTES`, a `MemoryError` in the child), processor
+# time (`CHILD_CPU_SECONDS`, the child killed by SIGXCPU) or wall clock
+# (`CHILD_WALL_SECONDS`, the parent stopped waiting). `stopped`: the child
+# was ended by another signal, from outside (a restart, the kernel short of
+# memory). `resource_limit`, the one word of earlier releases for all four,
+# is no longer given.
+MEMORY_LIMIT = "memory_limit"
+CPU_LIMIT = "cpu_limit"
+WALL_CLOCK_LIMIT = "wall_clock_limit"
+STOPPED = "stopped"
+# Their details.
+OUT_OF_MEMORY = "out of memory"
+PROCESSOR_TIME = "processor time"
+WALL_CLOCK = "wall-clock time"
+
 # The reasons the same archive would give again, read by the same extractor
 # under the same bounds: remembered, so that it is not read again. A child
-# killed from outside is not; one past its wall clock (a busy machine) is
+# stopped from outside is not; one past its wall clock (a busy machine) is
 # remembered only the second time in a row (`WALL_CLOCK_TRIES`; a child that
 # fails otherwise in between starts the count again), so that a national
 # archive does not hold the machine 45 minutes at every pass.
@@ -623,13 +642,11 @@ REMEMBERED_REASONS = frozenset(
         "too_many_rows",
         "line_too_long",
         "cell_too_long",
+        MEMORY_LIMIT,
+        CPU_LIMIT,
     }
 )
 _FAILED_SUFFIX = ".failed"
-# The details of a `resource_limit`: the child out of memory, past its wall
-# clock.
-OUT_OF_MEMORY = "out of memory"
-WALL_CLOCK = "wall-clock time"
 WALL_CLOCK_TRIES = 2
 _FAILED_MAX_BYTES = 1024
 # The code an extraction runs: a change to any of these files (a reader
@@ -643,17 +660,8 @@ _READER_MODULES = (
 )
 
 
-def _remembered_detail(error: ExtractError) -> bool:
-    """A `resource_limit` the same archive meets again: out of memory, or the
-    processor-time signal (SIGXCPU)."""
-    return error.reason == "resource_limit" and error.detail in (
-        OUT_OF_MEMORY,
-        f"the child ended with {-signal.SIGXCPU}",
-    )
-
-
 def _wall_clock(error: ExtractError) -> bool:
-    return error.reason == "resource_limit" and error.detail == WALL_CLOCK
+    return error.reason == WALL_CLOCK_LIMIT
 
 
 @functools.cache
@@ -692,6 +700,8 @@ def _limits_signature() -> str:
         netex.GROUPS_MAX,
         netex.ASSIGNMENTS_MAX,
         netex.QUAYS_MAX,
+        netex.STOP_PLACES_MAX,
+        netex.POINTS_MAX,
         CHILD_MEMORY_BYTES,
         CHILD_CPU_SECONDS,
         CHILD_WALL_SECONDS,
@@ -740,7 +750,7 @@ def _remembered(final: Path, fmt: str) -> str | None:
     return reason
 
 
-_REMEMBERABLE = REMEMBERED_REASONS | {"resource_limit"}
+_REMEMBERABLE = REMEMBERED_REASONS | {WALL_CLOCK_LIMIT}
 
 
 def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> None:
@@ -752,7 +762,7 @@ def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> N
         before = _failure(final, fmt)
         walls = before.get("walls") if before is not None else None
         record["walls"] = (walls if isinstance(walls, int) else 0) + 1
-    elif error.reason not in REMEMBERED_REASONS and not _remembered_detail(error):
+    elif error.reason not in REMEMBERED_REASONS:
         # Not remembered (killed from outside, an error): a wall-clock count
         # begun before is not "in a row" any more.
         before = _failure(final, fmt)
@@ -890,7 +900,7 @@ def build_extract(
     except ExtractError:
         raise
     except MemoryError:
-        raise ExtractError("resource_limit", OUT_OF_MEMORY) from None
+        raise ExtractError(MEMORY_LIMIT, OUT_OF_MEMORY) from None
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
 
@@ -905,7 +915,13 @@ CHILD_MEMORY_BYTES = 2 * 1024 * MEGABYTE
 # 730 MiB (NeTEx), so 2 GiB of address space leaves some 2.4 times that; a
 # national-shaped NeTEx of 4 GB unpacked peaks at about 200 MiB, a GTFS of
 # 40 million stop times at about 100 MiB (what is kept grows with the rail
-# stations, not with the bytes). Processor time (`scripts/
+# stations, not with the bytes). An export that gives every journey its own
+# scheduled stop points has as many points and assignments as calls: the
+# NeTEx reader keeps some 250 bytes for each (1.2 KB before the fix of
+# 15 October, which spent the 2 GiB near 1.6 million of them); a crafted
+# file reaching all its caps at once would still pass 2 GiB, and ends
+# `memory_limit` (`station_extract_netex`, "Memory").
+# Processor time (`scripts/
 # bench_station_extract.py`, one core): NeTEx at about 60 MB/s, so a national
 # archive of 2 GB zipped (some 40 GB unpacked) takes about 11 minutes, 17 if
 # it packs 30 times; GTFS at about 0.7 million stop times a second, so
@@ -961,7 +977,7 @@ def _child_main(
     except ExtractError as exc:
         conn.send(("error", exc.reason, exc.detail))
     except MemoryError:
-        conn.send(("error", "resource_limit", OUT_OF_MEMORY))
+        conn.send(("error", MEMORY_LIMIT, OUT_OF_MEMORY))
     except Exception as exc:  # any other end is heard as a child that sent nothing
         conn.send(("error", "error", type(exc).__name__))
     finally:
@@ -983,7 +999,7 @@ def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> E
             with contextlib.suppress(EOFError, OSError):
                 message = receiver.recv()
         else:
-            message = ("error", "resource_limit", WALL_CLOCK)
+            message = ("error", WALL_CLOCK_LIMIT, WALL_CLOCK)
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
     finally:
@@ -993,12 +1009,20 @@ def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> E
             child.kill()
             child.join(5)
     if message is None:
-        # The child ended without a word: killed by a limit (a signal) or worse.
-        reason = "resource_limit" if (child.exitcode or 0) < 0 else "error"
-        raise ExtractError(reason, f"the child ended with {child.exitcode}")
+        raise _silent_end(child.exitcode)
     if message[0] == "ok":
         return message[1]  # type: ignore[no-any-return]
     raise ExtractError(message[1], message[2])
+
+
+def _silent_end(exitcode: int | None) -> ExtractError:
+    """A child that ended without a word: killed by its processor-time
+    signal (SIGXCPU, at `CHILD_CPU_SECONDS`), by another signal (`stopped`),
+    or worse (`error`)."""
+    if exitcode == -signal.SIGXCPU:
+        return ExtractError(CPU_LIMIT, PROCESSOR_TIME)
+    reason = STOPPED if (exitcode or 0) < 0 else "error"
+    return ExtractError(reason, f"the child ended with {exitcode}")
 
 
 @contextlib.contextmanager
@@ -1053,8 +1077,9 @@ def ensure_extract(
     time and a lower priority, one extraction at a time on the machine; a
     caller that would wait more than `wait_seconds` (default
     `WAIT_SECONDS`) for another one gets `busy`. The arguments are those of
-    `build_extract`. Raises `ExtractError` only, `resource_limit` when the
-    child passed a limit.
+    `build_extract`. Raises `ExtractError` only: `memory_limit`,
+    `cpu_limit` or `wall_clock_limit` when the child passed that limit,
+    `stopped` when a signal from outside ended it.
     """
     folder = cache_dir if cache_dir is not None else extracts_dir(session_id)
     try:

@@ -995,6 +995,29 @@ def test_the_admin_text(
     assert (tmp_path / "zz" / "_fetch_state" / "provider_ZZ0_.station_extract.json").is_file()
 
 
+@pytest.mark.parametrize(
+    ("reason", "words"),
+    [
+        ("memory_limit", "memory limit (2 GiB)"),
+        ("cpu_limit", "processor-time limit (40 minutes)"),
+        ("wall_clock_limit", "wall-clock limit (45 minutes)"),
+        ("stopped", "stopped from outside"),
+        ("resource_limit", "memory or time limit"),  # recorded by an earlier release
+    ],
+)
+def test_the_feed_status_says_which_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, words: str
+) -> None:
+    """Production, 15 October: `resource_limit` did not say which limit was
+    passed; each limit now has its word, and its sentence names it."""
+    monkeypatch.setattr(settings, "inbox_dir", tmp_path)
+    up.record_outcome("zz", up.FeedOutcome("ZZ0", up.SKIPPED, reason))
+    loaded = up.load_outcome("zz", "ZZ0")
+    assert loaded is not None
+    assert (loaded["state"], loaded["reason"], loaded["text"]) == (up.SKIPPED, reason, "skipped")
+    assert words in loaded["detail"]
+
+
 def test_a_record_of_another_form_shows_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1271,7 +1294,18 @@ def test_the_extract_comes_from_ensure_extract_within_the_budget(
 @pytest.mark.usefixtures("token")
 @pytest.mark.parametrize(
     "reason",
-    ["resource_limit", "busy", "cache", "error", "bad_archive", "input_too_large", "no_rail_stop"],
+    [
+        "memory_limit",
+        "cpu_limit",
+        "wall_clock_limit",
+        "stopped",
+        "busy",
+        "cache",
+        "error",
+        "bad_archive",
+        "input_too_large",
+        "no_rail_stop",
+    ],
 )
 def test_every_extractor_reason_is_a_skip(
     setup: Setup, module: Module, clock: FakeClock, reason: str
