@@ -1147,7 +1147,13 @@ GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall cloc
   the refresh, nginx's 600 s timeout and the page's gateway-error path unchanged); the page polls the
   GET beside it. Bytes are written at most every 2 s or 5 % of a feed: never add a write per chunk.
   The record holds labels and counts only: a skip reason can quote a URL, so reasons stay in the
-  feed-status store and never enter `detail`. A per-provider Refresh is neither recorded nor blocked.
+  feed-status store and never enter `detail`. A refresh that finds its lease lost (`run.lost`) starts no
+  further download. Inside `async with run` the progress writes go to one writer thread in order (the
+  loop never waits on the database); the end waits for them. The station-module follow-up is written
+  by the sender thread into the record of the refresh that queued it (`run_id` carried in the queue;
+  fenced by that `run_id` and `state = 'finished'`); a silent follow-up (queued 35 min, or running
+  5 min without its 30 s beat) reads `interrupted`. A per-provider Refresh writes no record but is
+  refused (409) while a whole-session provider refresh runs.
 
 ---
 
