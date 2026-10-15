@@ -620,10 +620,26 @@ def test_the_extract_follow_up_is_counted_on_the_latest_refresh(
 
 @pytest.mark.usefixtures("inbox")
 def test_deleting_the_session_deletes_its_records(
-    client: TestClient, admin: dict[str, str]
+    client: TestClient, admin: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app import refresh_progress
+    from app import refresh_progress, sessions_orchestrator
+    from app.api.admin import sessions as sessions_api
     from app.db import SessionLocal
+    from app.settings import settings as live
+
+    # The delete regenerates the compose / nginx fragments, touches the
+    # worker's reload trigger and removes the session's graph folders: all
+    # under /data in production, here in the test's own folder (CI does not
+    # run as root).
+    monkeypatch.setattr(sessions_api, "_RELOAD_TRIGGER", tmp_path / "generated" / ".reload-trigger")
+    regenerate = sessions_orchestrator.regenerate
+    monkeypatch.setattr(
+        sessions_orchestrator,
+        "regenerate",
+        lambda db, **_k: regenerate(db, output_dir=tmp_path / "generated"),
+    )
+    monkeypatch.setattr(live, "graph_dir", tmp_path / "graphs")
+    (tmp_path / "generated").mkdir()
 
     _make_session(client, admin, ["ZZRAIL"])
     refresh_progress.claim(SID, refresh_progress.OSM, 1).finish(refresh_progress.FINISHED)
