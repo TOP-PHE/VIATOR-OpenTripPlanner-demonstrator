@@ -100,7 +100,7 @@ DERIVED_LABEL = "cross-border filters"
 EXTRACT_STATES = ("sent", "held", "refused", "unavailable", "skipped", "cancelled")
 _EXTRACT_ENDS = ("finished", "cancelled", "error", "off")
 _WORD = re.compile(r"[a-z0-9_]{1,40}", re.ASCII)
-_LABEL = re.compile(r"[A-Za-z0-9_\[\]().:\- ]{1,120}", re.ASCII)
+_LABEL = re.compile(r"[\w\[\]().:\- ]{1,120}", re.ASCII)
 
 _FAILED_WRITE = "refresh_progress.write_failed scope=%s type=%s"
 

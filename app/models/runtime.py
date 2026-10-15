@@ -21,13 +21,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
+SESSIONS_ID = "sessions.id"
+
 
 class McTOverride(Base):
     """Minimum connection times — per-session, per-station, per-carrier-pair."""
 
     __tablename__ = "mct_overrides"
 
-    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String, ForeignKey(SESSIONS_ID), primary_key=True)
     station_code: Mapped[str] = mapped_column(String, primary_key=True)
     carrier_a: Mapped[str] = mapped_column(String, primary_key=True)
     carrier_b: Mapped[str] = mapped_column(String, primary_key=True)
@@ -40,7 +42,7 @@ class StationXref(Base):
     __tablename__ = "stations_xref"
     __table_args__ = (ForeignKeyConstraint(["uic"], ["master_stations.uic"], name="fk_xref_uic"),)
 
-    session_id: Mapped[str] = mapped_column(String, ForeignKey("sessions.id"), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String, ForeignKey(SESSIONS_ID), primary_key=True)
     stop_id: Mapped[str] = mapped_column(String, primary_key=True)
     uic: Mapped[str | None] = mapped_column(String)
     trigramme: Mapped[str | None] = mapped_column(String)
@@ -73,7 +75,7 @@ class SourceRefreshProgress(Base):
     )
 
     session_id: Mapped[str] = mapped_column(
-        String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
+        String, ForeignKey(SESSIONS_ID, ondelete="CASCADE"), primary_key=True
     )
     scope: Mapped[str] = mapped_column(String(16), primary_key=True)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)

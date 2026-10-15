@@ -332,28 +332,28 @@ class PassObserver(Protocol):
     """Who follows a pass as it goes (the refresh progress record of
     `app/refresh_progress.py`, `ExtractFollowUp`). Its methods never raise."""
 
-    def started(self, total: int) -> None: ...
+    def started(self, total: int, /) -> None: ...
 
-    def feed_started(self, provider_id: str) -> None: ...
+    def feed_started(self, provider_id: str, /) -> None: ...
 
-    def outcome(self, outcome: FeedOutcome) -> None: ...
+    def outcome(self, outcome: FeedOutcome, /) -> None: ...
 
-    def finished(self, end: str) -> None: ...
+    def finished(self, end: str, /) -> None: ...
 
 
 class _Unobserved:
-    """A pass nobody follows."""
+    """A pass nobody follows: every call is ignored."""
 
-    def started(self, total: int) -> None:
+    def started(self, *_: object) -> None:
         """Nothing to tell."""
 
-    def feed_started(self, provider_id: str) -> None:
+    def feed_started(self, *_: object) -> None:
         """Nothing to tell."""
 
-    def outcome(self, outcome: FeedOutcome) -> None:
+    def outcome(self, *_: object) -> None:
         """Nothing to tell."""
 
-    def finished(self, end: str) -> None:
+    def finished(self, *_: object) -> None:
         """Nothing to tell."""
 
 
