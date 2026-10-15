@@ -316,15 +316,10 @@ def test_a_stored_country_still_gets_the_osm_warning(
     config = _providers("ZZ")
     config["sources"]["osm_pbf"] = "https://osm.invalid/yyland-latest.osm.pbf"
     response = _response()
+    patch = sessions.SessionPatch(config=config)
+    request, db, actor = _request(), _Db(row), _actor()
     with pytest.raises(_Reached):
-        sessions.patch_session(
-            "zz-session",
-            sessions.SessionPatch(config=config),
-            _request(),
-            response,
-            _Db(row),
-            _actor(),
-        )
+        sessions.patch_session("zz-session", patch, request, response, db, actor)
 
     (warning,) = json.loads(response.headers["X-Warnings"])
     assert "doesn't appear to cover ['ZZ']" in warning
