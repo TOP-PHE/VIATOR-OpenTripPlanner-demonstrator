@@ -1284,6 +1284,7 @@ def test_resolve_hubs_returns_db_rows_when_present() -> None:
         sort_order=0,
         uic=None,
         uic_origin=None,
+        station_id=None,
     )
     db = _MockDb(rows=[hub_row])
     out = _resolve_hubs(db)

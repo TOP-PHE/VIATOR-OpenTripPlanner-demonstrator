@@ -41,7 +41,7 @@ from typing import Any
 import httpx
 from sqlalchemy import func, select
 
-from app import audit, ingestion, provider_catalogue, staleness
+from app import audit, ingestion, provider_catalogue, staleness, station_module
 from app.db import SessionLocal
 from app.models import MasterStation
 from app.models import Session as SessionRow
@@ -135,12 +135,21 @@ def remove(db, s, ids: set[str], apply: bool) -> int:
 
 
 def _countries_without_stations(db, countries: set[str]) -> set[str]:
+    """The countries with no master_stations row that the station module
+    does not serve either: the session save's gate
+    (app/api/admin/sessions.py `_unserved`), the module asked only when the
+    Trainline list lacks a country, and the Trainline list alone when the
+    module does not answer."""
     rows = db.execute(
         select(MasterStation.country_iso, func.count())
         .where(MasterStation.country_iso.in_(countries))
         .group_by(MasterStation.country_iso)
     ).all()
-    return countries - {ci for ci, n in rows if n > 0}
+    missing = countries - {ci for ci, n in rows if n > 0}
+    if not missing:
+        return missing
+    served = station_module.countries_blocking()
+    return missing if served is None else missing - served
 
 
 def add(db, s, wanted: set[str] | None, apply: bool) -> int:
@@ -162,10 +171,18 @@ def add(db, s, wanted: set[str] | None, apply: bool) -> int:
     if not to_add:
         print("Nothing to add.")
         return 0
-    missing = _countries_without_stations(db, {e["country_iso"] for e in to_add})
+    # Only the countries this adds: those of the stored providers passed the
+    # gate when they were saved (app/api/admin/sessions.py `_stored_countries`).
+    stored = {
+        p["country_iso"].upper()
+        for p in providers
+        if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
+    }
+    missing = _countries_without_stations(db, {e["country_iso"] for e in to_add} - stored)
     if missing:
         print(
-            f"no master_stations rows for {', '.join(sorted(missing))} - import them from "
+            f"no master_stations rows for {', '.join(sorted(missing))}, and the station module "
+            "does not serve them (or did not answer) - import them from "
             "Trainline first (Admin > Stations, Refresh from Trainline), then re-run. Nothing written.",
             file=sys.stderr,
         )

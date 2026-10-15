@@ -21,6 +21,16 @@ platform administrators (`require_content_manager`):
   table cannot be read off the page. No slowapi limit, as on the typeahead
   (behind nginx it would be one counter for the whole site); the limits are
   the module's.
+
+  Each station has the five fields of the typeahead's rows (`name`,
+  `latitude`, `longitude`, `country_iso`, `uic`; `uic` null for a station
+  the module serves by its VIATOR id alone) and, from the module, the
+  fields of its referential (the contract's phase 2): `viator_id`,
+  `uic_origin` (the origin label of the code) with `uic_origin_text` (the
+  label in clear words) and `licence` (the licence tags of the name, the
+  position and the code, the share-alike fields, the attribution texts),
+  all null on a Trainline row or from a module that does not give them.
+  The page puts each of them in as text.
 - `POST /api/master/stations/refresh-trainline`: the Trainline import on
   demand, which keeps the fallback list and VIATOR's internal joins fresh.
 
@@ -36,7 +46,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session as DbSession
 
-from ... import audit
+from ... import audit, station_module
 from ...db import get_db
 from ...master import trainline
 from ...security import CurrentUser, client_ip, require_content_manager
@@ -45,15 +55,28 @@ from .. import station_suggest
 router = APIRouter(prefix="/api/master/stations", tags=["master", "stations"])
 
 # The fields of a station on the page, from either origin: those of the
-# typeahead's rows, the only ones the module gives.
-STATION_FIELDS = ("name", "latitude", "longitude", "country_iso", "uic")
+# typeahead's rows, then those of the module's referential (None on a
+# Trainline row); `uic_origin_text` is added from `uic_origin`.
+STATION_FIELDS = (
+    "name",
+    "latitude",
+    "longitude",
+    "country_iso",
+    "uic",
+    "viator_id",
+    "uic_origin",
+    "licence",
+)
 
 _FORBIDDEN = {"description": "Content-manager or platform-admin access required."}
 
 
 def _shown(row: dict[str, Any]) -> dict[str, Any]:
-    """A station row in the page's shape: the five fields, nothing else."""
-    return {field: row.get(field) for field in STATION_FIELDS}
+    """A station row in the page's shape: the fields of `STATION_FIELDS` and
+    the origin label in clear words, nothing else."""
+    shown = {field: row.get(field) for field in STATION_FIELDS}
+    shown["uic_origin_text"] = station_module.uic_origin_text(shown["uic_origin"])
+    return shown
 
 
 @router.post(

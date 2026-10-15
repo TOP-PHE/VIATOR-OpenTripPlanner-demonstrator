@@ -779,7 +779,7 @@ def test_deleting_the_session_deletes_its_records(
 # ── the revision ─────────────────────────────────────────────────────────
 
 _REVISION = "20261015_1800_refresh_progress"
-_BEFORE = "20261010_1200_edit_archive"
+_BEFORE = "20261015_1200_hub_station_id"
 
 
 def _revision_module() -> Any:

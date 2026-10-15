@@ -10,6 +10,8 @@
   .origin { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
   .origin-msmm { background: #e6f0fa; color: #174a78; }
   .origin-trainline { background: #eef0f3; color: #4a5562; }
+  .licence-line { display: block; font-size: 0.85rem; }
+  .share-alike { font-weight: 600; }
 {% endblock %}
 
 {% block content %}
@@ -21,6 +23,13 @@
   <a href="https://github.com/trainline-eu/stations" target="_blank" rel="noopener">Trainline open dataset</a>
   (ODbL), is the fallback when the module does not answer, and the key of
   VIATOR's internal joins. A search shows at most 10 stations.
+</p>
+<p class="hint" style="max-width: 760px">
+  For a station of the module, the page also shows its VIATOR id (the
+  module's own identifier of the station), where its code comes from, and
+  the licence of its name, position and code: a value under a share-alike
+  licence (such as the Trainline list's ODbL) is marked, and the attribution
+  a timetable feed asks for is shown with it.
 </p>
 
 <form id="search-form" class="station-search" role="search">
@@ -60,6 +69,8 @@ const NOTICES = {
   fallback: "The station module did not answer; these results come from VIATOR's Trainline list, used as a fallback.",
 };
 const LABELS = {msmm: 'MSMM', trainline: 'Trainline'};
+// The licence of a station's values, field by field (the module's words).
+const LICENCE_FIELDS = [['name', 'Name'], ['position', 'Position'], ['uic', 'Code']];
 
 const statusLine = document.getElementById('status');
 const notice = document.getElementById('notice');
@@ -97,6 +108,51 @@ function position(station) {
   return latitude.toFixed(5) + ', ' + longitude.toFixed(5);
 }
 
+function codeOrigin(station, origin) {
+  if (origin !== 'msmm') return '—';
+  if (station.uic_origin_text) return station.uic_origin_text;
+  return station.uic ? 'not given by the module' : 'no code';
+}
+
+// The licence cell: one line per value with a licence tag, "share-alike"
+// marked, then one line per attribution text. Every part is text.
+function licenceCell(station) {
+  const td = cell('');
+  const licence = station.licence;
+  if (!licence) {
+    td.textContent = '—';
+    return td;
+  }
+  if (licence.unreadable) {
+    td.textContent = 'given by the module but unreadable';
+    return td;
+  }
+  const shareAlike = Array.isArray(licence.share_alike) ? licence.share_alike : [];
+  for (const [field, label] of LICENCE_FIELDS) {
+    // A value under a share-alike licence is shown even when its tag could
+    // not be read: the mark is what the licence asks to keep.
+    if (!licence[field] && !shareAlike.includes(field)) continue;
+    const line = document.createElement('span');
+    line.className = 'licence-line';
+    line.textContent = label + ': ' + (licence[field] || 'tag unreadable');
+    if (shareAlike.includes(field)) {
+      const mark = document.createElement('span');
+      mark.className = 'share-alike';
+      mark.textContent = ' (share-alike)';
+      line.appendChild(mark);
+    }
+    td.appendChild(line);
+  }
+  const attribution = Array.isArray(licence.attribution) ? licence.attribution : [];
+  for (const text of attribution) {
+    const line = document.createElement('span');
+    line.className = 'licence-line';
+    line.textContent = 'Attribution: ' + text;
+    td.appendChild(line);
+  }
+  return td;
+}
+
 function stationRow(station, origin) {
   const tr = document.createElement('tr');
   tr.appendChild(cell(station.name || '—'));
@@ -117,6 +173,9 @@ function stationRow(station, origin) {
   const labelCell = cell('');
   labelCell.appendChild(label);
   tr.appendChild(labelCell);
+  tr.appendChild(cell(origin === 'msmm' && station.viator_id ? station.viator_id : '—'));
+  tr.appendChild(cell(codeOrigin(station, origin)));
+  tr.appendChild(origin === 'msmm' ? licenceCell(station) : cell('—'));
   if (MODULE_LINKS) {
     const linkCell = cell('');
     if (origin === 'msmm' && station.uic) linkCell.appendChild(moduleLink(station.uic));
@@ -139,7 +198,7 @@ function render(answer) {
   statusLine.textContent = stations.length + (stations.length === 1 ? ' station' : ' stations');
   const table = document.createElement('table');
   const head = table.createTHead().insertRow();
-  const headings = ['Name', 'Country', 'Code', 'Position', 'Origin'];
+  const headings = ['Name', 'Country', 'Code', 'Position', 'Origin', 'VIATOR id', 'Code origin', 'Licence'];
   if (MODULE_LINKS) headings.push('');
   for (const heading of headings) {
     const th = document.createElement('th');

@@ -11,11 +11,11 @@ from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
-from .. import concurrency, config_service
+from .. import concurrency, config_service, station_module
 from ..db import get_db
 from ..journey import (
     hafas_client,
@@ -51,6 +51,15 @@ class Coord(BaseModel):
     # Optional: searches without it fall through to coordinate routing
     # unchanged. See app/journey/otp_client.py and docs/nap-ch-rail.md §9.1.
     uic: str | None = None
+
+    @field_validator("uic")
+    @classmethod
+    def _never_a_viator_id(cls, value: str | None) -> str | None:
+        """A VIATOR id of the station module (`ZZ-99999`) is no station code:
+        it never enters stop-id routing nor the federated planner, which are
+        keyed by UIC (the module's design 22.12). Read as no code, so the
+        search routes by the coordinates, as for any station without one."""
+        return None if station_module.is_viator_id(value) else value
 
 
 class FanoutBody(BaseModel):

@@ -501,3 +501,84 @@ def test_the_admin_guides_psql_lines_read_the_archive(alembic_cfg: Config) -> No
         _EDITED: "name, country_iso, latitude, parent_uic",
         "9900011": "latitude, longitude, trigramme_sncf, db_code",
     }
+
+
+# ── 20261015_1200_hub_station_id: the station module's VIATOR id on the hubs ──
+
+_BEFORE_HUB_STATION_ID = "20261010_1200_edit_archive"
+_HUB_STATION_ID = "20261015_1200_hub_station_id"
+
+
+def _set_station_id(engine: Any, station_id: str | None) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE network_coverage_hubs SET station_id = :sid WHERE id = 'zz-hub'"),
+            {"sid": station_id},
+        )
+
+
+def test_hub_station_id_revision_up_down_up_and_its_check(alembic_cfg: Config) -> None:
+    """The revision adds one null column to the existing hubs and writes
+    nothing else; the CHECK takes null or the form `ZZ-99999` only; the
+    downgrade drops it and keeps the hub and its code; a second upgrade
+    works."""
+    url = _postgres_or_skip()
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+
+    command.upgrade(alembic_cfg, _BEFORE_HUB_STATION_ID)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO network_coverage_hubs (id, name, short, country, lat, lon, uic, "
+                "uic_origin) VALUES ('zz-hub', 'ZZ Hub Central', 'ZZ Hub', 'ZZ', 45.5, 6.25, "
+                "'9900001', 'msmm')"
+            )
+        )
+
+    command.upgrade(alembic_cfg, _HUB_STATION_ID)
+    assert "station_id" in _hub_columns(engine)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT uic, uic_origin, station_id FROM network_coverage_hubs WHERE id = 'zz-hub'"
+            )
+        ).one()
+    assert tuple(row) == ("9900001", "msmm", None)
+
+    for accepted in ("ZZ-99001", "YY-99999", None):
+        _set_station_id(engine, accepted)
+    for refused in ("zz-99001", "ZZ-9900", "ZZ99001", "9900001", "ZZ-9900A", "Z9-99001", ""):
+        with pytest.raises(IntegrityError):
+            _set_station_id(engine, refused)
+
+    _set_station_id(engine, "ZZ-99001")
+    command.downgrade(alembic_cfg, _BEFORE_HUB_STATION_ID)
+    assert "station_id" not in _hub_columns(engine)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT name, uic, uic_origin FROM network_coverage_hubs WHERE id = 'zz-hub'")
+        ).one()
+    assert tuple(row) == ("ZZ Hub Central", "9900001", "msmm")
+
+    command.upgrade(alembic_cfg, "head")
+    assert "station_id" in _hub_columns(engine)
+    _set_station_id(engine, "ZZ-99002")
+
+
+def test_the_models_station_id_check_is_the_revisions_check() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    from app.models.network_coverage import STATION_ID_CHECK
+
+    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / f"{_HUB_STATION_ID}.py"
+    spec = importlib.util.spec_from_file_location("hub_station_id_revision", path)
+    assert spec is not None
+    assert spec.loader is not None
+    revision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    assert revision._CHECK == STATION_ID_CHECK

@@ -321,3 +321,73 @@ def test_a_typed_code_is_stored_as_manual_and_cleared_by_null(
     assert test_client.patch(f"{BASE}/zz-b-1", json={"uic": None}).status_code == 200
     assert _row(fresh_db, "zz-b-1")[:2] == (None, None)
     assert module.requests == []  # a typed code is not looked up
+
+
+def test_a_hub_with_a_viator_id_and_no_code_counts_as_resolved(db: Session) -> None:
+    """The contract's phase 2: a hub may hold the module's VIATOR id alone
+    (a station the module serves without a code); a check looks at it, a
+    resolve does not."""
+    from app.api.admin.network_coverage import _hubs_to_look_at
+    from app.models import NetworkCoverageHub
+
+    hub = db.get(NetworkCoverageHub, "zz-a-2")
+    assert hub is not None
+    hub.station_id = "ZZ-99004"
+    db.commit()
+
+    assert "zz-a-2" not in _ids(_hubs_to_look_at(db, resolved=False, skip=[]))
+    assert _ids(_hubs_to_look_at(db, resolved=True, skip=[])) == ["zz-a-2", "zz-a-3", "zz-b-1"]
+
+
+def test_the_guarded_write_skips_a_hub_edited_meanwhile(db: Session, fresh_db: str) -> None:
+    """`_guarded_write` on PostgreSQL: the hub is read, another session
+    types a new code (the edit clears the id), then the write found for the
+    hub as it was read touches nothing; a hub left as read is written."""
+    from app.api.admin.network_coverage import _guarded_write
+    from app.models import NetworkCoverageHub
+
+    hub = db.get(NetworkCoverageHub, "zz-b-1")
+    assert hub is not None
+    before = (hub.uic, hub.station_id)
+    assert before == ("9900001", None)
+    with create_engine(fresh_db).begin() as other:
+        other.execute(
+            text(
+                "UPDATE network_coverage_hubs SET uic = '9900002', uic_origin = 'manual' "
+                "WHERE id = 'zz-b-1'"
+            )
+        )
+
+    assert _guarded_write(db, "zz-b-1", before, {"station_id": "ZZ-99001"}) is False
+    db.commit()
+    # The id alone changed meanwhile (another station confirmed): skipped too.
+    with create_engine(fresh_db).begin() as other:
+        other.execute(
+            text("UPDATE network_coverage_hubs SET station_id = 'ZZ-99009' WHERE id = 'zz-b-2'")
+        )
+    assert _guarded_write(db, "zz-b-2", (None, None), {"station_id": "ZZ-99008"}) is False
+    db.commit()
+    assert _guarded_write(db, "zz-a-3", ("9900002", None), {"station_id": "ZZ-99002"}) is True
+    # A soft-deleted hub is never written.
+    assert _guarded_write(db, "zz-a-4", ("9900003", None), {"station_id": "ZZ-99003"}) is False
+    db.commit()
+    with create_engine(fresh_db).connect() as conn:
+        rows = dict(
+            conn.execute(
+                text(
+                    "SELECT id, uic || '/' || coalesce(station_id, '-') FROM network_coverage_hubs "
+                    "WHERE id IN ('zz-b-1', 'zz-a-3', 'zz-a-4', 'zz-b-2')"
+                )
+            ).all()
+        )
+    assert rows == {
+        "zz-b-1": "9900002/-",
+        "zz-a-3": "9900002/ZZ-99002",
+        "zz-a-4": "9900003/-",
+        "zz-b-2": None,  # no code: the concatenation is null; its id checked below
+    }
+    with create_engine(fresh_db).connect() as conn:
+        kept = conn.execute(
+            text("SELECT station_id FROM network_coverage_hubs WHERE id = 'zz-b-2'")
+        ).scalar_one()
+    assert kept == "ZZ-99009"

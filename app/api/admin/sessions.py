@@ -58,6 +58,7 @@ from ... import (
     station_builds,
     station_extract,
     station_extract_upload,
+    station_module,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -175,6 +176,10 @@ def list_sessions(
         # `response_model=` dropped (S8409): FastAPI infers it from the
         # `-> SessionResponse` return annotation since 0.95+.
         400: {"description": "Slug / category / engine validation failed."},
+        409: {
+            "description": "The session exists already, or a provider declares a country "
+            "neither VIATOR's Trainline list nor the station module knows."
+        },
     },
 )
 def create_session(
@@ -194,6 +199,12 @@ def create_session(
 
     if actor.id is None:
         raise HTTPException(400, "Sessions can only be created by JWT-authenticated admins")
+    # The country gate of a save, on the providers a new session is created
+    # with: they become its stored providers, which later saves no longer
+    # gate (`_stored_countries`).
+    missing = _gate_blocking(db, _stored_countries(body.config))
+    if missing:
+        raise _gate_409(missing, _SAVE_ADVICE)
 
     s = SessionRow(
         id=body.id,
@@ -355,27 +366,20 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             # Country-gate: every provider that declares country_iso=X must
-            # have at least one master_stations row with country_iso=X.
+            # have at least one master_stations row with country_iso=X, or X
+            # must be a country the station module serves (D-R12 B; asked
+            # only when the Trainline list lacks one: `_unserved`).
             # Operator-driven: fail save with a clear message that includes
             # which countries are missing AND suggests the Trainline-import
             # action. UI surfaces this as a prompt with a one-click button.
+            # Only the countries this save adds are gated: a country already
+            # among the stored providers passed the gate when it was saved,
+            # and must not be refused because the module is down or paused
+            # now. Every declared country still feeds the OSM warning below.
             declared_countries = {p["country_iso"] for p in providers if p["country_iso"]}
-            if declared_countries:
-                missing = _countries_without_stations(db, declared_countries)
-                if missing:
-                    raise HTTPException(
-                        409,  # Conflict — semantically "preconditions not met"
-                        detail={
-                            "error": "missing_master_stations_for_countries",
-                            "missing_countries": sorted(missing),
-                            "message": (
-                                "Cannot save: no master_stations rows for "
-                                f"{sorted(missing)}. Import them from Trainline "
-                                "first (POST /api/master/stations/refresh-trainline), "
-                                "then retry this save."
-                            ),
-                        },
-                    )
+            missing = _gate_blocking(db, declared_countries - _stored_countries(s.config))
+            if missing:
+                raise _gate_409(missing, _SAVE_ADVICE)
             # All checks passed — write back the canonicalised provider
             # list (drops empty fields, normalises country to upper-case,
             # etc.). Operator never sees the cleanup; the next GET returns
@@ -908,6 +912,76 @@ def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
     ).all()
     present = {ci for ci, count in rows if count > 0}
     return declared - present
+
+
+# The country gate's refusal (HTTP 409): the error word the pages and the
+# PowerShell scripts read, and the advice of each kind of save.
+_GATE_ERROR = "missing_master_stations_for_countries"
+_SAVE_ADVICE = (
+    "Import them from Trainline first (POST /api/master/stations/refresh-trainline), "
+    "then retry this save."
+)
+_IMPORT_ADVICE = "Import them from Trainline first, then retry the bulk-import."
+
+
+def _gate_409(missing: set[str], advice: str) -> HTTPException:
+    """The country gate's refusal for the countries `missing`."""
+    return HTTPException(
+        409,  # Conflict — semantically "preconditions not met"
+        detail={
+            "error": _GATE_ERROR,
+            "missing_countries": sorted(missing),
+            "message": (
+                f"Cannot save: no master_stations rows for {sorted(missing)}, and "
+                f"{_module_side()}. {advice}"
+            ),
+        },
+    )
+
+
+def _gate_blocking(db: DbSession, added: set[str]) -> set[str]:
+    """The countries of `added` neither VIATOR's Trainline list nor the
+    station module knows (`_unserved`), from a caller outside the event
+    loop (a synchronous route); the module asked only for the Trainline
+    gap, and none of it when `added` is empty."""
+    missing = _countries_without_stations(db, added) if added else set()
+    if missing:
+        missing = _unserved(missing, station_module.countries_blocking())
+    return missing
+
+
+def _module_side() -> str:
+    """The country gate's words about the station module, for its 409."""
+    if not station_module.enabled():
+        return "VIATOR does not use the station module"
+    return "the station module does not serve them (or did not answer)"
+
+
+def _stored_countries(config: dict[str, Any] | None) -> set[str]:
+    """The countries the stored providers of a session already declare
+    (upper case), read as saved, without validating them: the country gate
+    checks only the countries a save adds."""
+    providers = ((config or {}).get("sources") or {}).get("providers") or []
+    if not isinstance(providers, list):
+        return set()
+    return {
+        p["country_iso"].upper()
+        for p in providers
+        if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
+    }
+
+
+def _unserved(missing: set[str], served: frozenset[str] | None) -> set[str]:
+    """The countries of `missing` (without a Trainline row) that the station
+    module does not serve either: D-R12 B of the module's design, "a
+    country the module serves" being one of its served stations' countries
+    (`station_module.countries`, its `GET /internal/v1/countries`). When
+    the module is not configured, paused or does not answer (`served` is
+    None), the gate is the Trainline list alone, as before: `missing` as it
+    is, never a country let through on a guess."""
+    if served is None:
+        return missing
+    return missing - served
 
 
 def _safe_float(v: str | None) -> float | None:
@@ -2264,23 +2338,16 @@ async def import_providers_from_nap(
         except ValueError as exc:
             raise HTTPException(400, f"Imported providers failed validation: {exc}") from exc
 
-        # Country-gate.
-        declared_countries = {p["country_iso"] for p in providers_canon if p["country_iso"]}
-        if declared_countries:
-            missing = _countries_without_stations(db, declared_countries)
-            if missing:
-                raise HTTPException(
-                    409,
-                    detail={
-                        "error": "missing_master_stations_for_countries",
-                        "missing_countries": sorted(missing),
-                        "message": (
-                            "Imported providers reference countries with no "
-                            f"master_stations rows: {sorted(missing)}. Import them "
-                            "from Trainline first, then retry the bulk-import."
-                        ),
-                    },
-                )
+        # Country-gate: only the countries the import adds (see the manual
+        # save). A coroutine, so the module is awaited, never blocked on.
+        added_countries = {
+            p["country_iso"] for p in providers_canon if p["country_iso"]
+        } - _stored_countries(s.config)
+        missing = _countries_without_stations(db, added_countries) if added_countries else set()
+        if missing:
+            missing = _unserved(missing, await station_module.countries())
+        if missing:
+            raise _gate_409(missing, _IMPORT_ADVICE)
 
         # Persist canonicalised providers + bump staleness.
         sources["providers"] = providers_canon

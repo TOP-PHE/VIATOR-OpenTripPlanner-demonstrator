@@ -309,6 +309,11 @@ UIC_ORIGIN_CHECK = (
     "AND uic_origin IS NOT NULL AND uic_origin IN ('msmm','manual'))"
 )
 
+# The CHECK of `network_coverage_hubs.station_id` (alembic
+# 20261015_1200_hub_station_id): null, or a VIATOR id of the station module's
+# form, `ZZ-99999` (app/station_module.py `is_viator_id`).
+STATION_ID_CHECK = "station_id IS NULL OR station_id ~ '^[A-Z]{2}-[0-9]{5}$'"
+
 
 class NetworkCoverageHub(Base):
     """v0.1.31 — operator-editable hub catalog.
@@ -361,6 +366,7 @@ class NetworkCoverageHub(Base):
         # code of 3 to 20 characters from the station module ('msmm') or typed
         # by hand ('manual').
         CheckConstraint(UIC_ORIGIN_CHECK, name="uic_origin_valid"),
+        CheckConstraint(STATION_ID_CHECK, name="station_id_valid"),
         Index("ix_network_coverage_hubs_country_tier", "country", "tier", "is_active"),
         Index("ix_network_coverage_hubs_active_sort", "is_active", "sort_order"),
     )
@@ -387,6 +393,14 @@ class NetworkCoverageHub(Base):
     # position); the cell dialog's re-run link carries it to /journey.
     uic: Mapped[str | None] = mapped_column(String(20))
     uic_origin: Mapped[str | None] = mapped_column(String(8))
+    # The station's VIATOR id in the station module (the contract's phase 2):
+    # the id the module answered for the confirmed station, always the
+    # current one (`station_module.current_id`: the survivor when the id
+    # was merged into another). Never written into `uic`, and a hub may have
+    # an id without a code (a station the module serves without one). Its
+    # origin and its licence are read live from the module ("Check station
+    # codes"), never stored. Null = no id known.
+    station_id: Mapped[str | None] = mapped_column(String(8))
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lon: Mapped[float] = mapped_column(Float, nullable=False)
     # Soft-delete flag. UI hides is_active=false by default; admin can

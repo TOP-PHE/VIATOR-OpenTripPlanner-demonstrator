@@ -21,7 +21,7 @@ and loses only these progress records (the refreshes' outcomes stay in the
 audit log and in the feed-status panel's store).
 
 Revision ID: 20261015_1800_refresh_progress
-Revises: 20261010_1200_edit_archive
+Revises: 20261015_1200_hub_station_id
 Create Date: 2026-10-15 18:00:00.000000
 """
 
@@ -35,7 +35,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "20261015_1800_refresh_progress"
-down_revision: str | Sequence[str] | None = "20261010_1200_edit_archive"
+down_revision: str | Sequence[str] | None = "20261015_1200_hub_station_id"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

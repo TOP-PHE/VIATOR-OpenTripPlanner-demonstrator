@@ -34,12 +34,18 @@ _HTTPX_DEFAULTS = {"host", "accept", "accept-encoding", "connection", "user-agen
 
 
 def _row(name: str = "Zzville Central", uic: str = "9900001", **extra: Any) -> dict[str, Any]:
+    """A row of the module's answer, phase 1 of its contract: the fields of
+    the referential present, null (a station with no VIATOR id yet). The
+    client reads it back exactly as sent."""
     return {
         "name": name,
         "latitude": 45.5,
         "longitude": 6.25,
         "country_iso": "ZZ",
         "uic": uic,
+        "viator_id": None,
+        "uic_origin": None,
+        "licence": None,
         **extra,
     }
 
@@ -205,7 +211,16 @@ async def test_bad_rows_are_dropped_and_the_others_kept(module: Module) -> None:
     assert rows[0]["name"] == "Zz <b>Markup</b> Halt"  # kept as sent; the page escapes it
     assert rows[2]["latitude"] == 45.0
     assert isinstance(rows[2]["latitude"], float)
-    assert set(rows[0]) == {"name", "latitude", "longitude", "country_iso", "uic"}
+    assert set(rows[0]) == {
+        "name",
+        "latitude",
+        "longitude",
+        "country_iso",
+        "uic",
+        "viator_id",
+        "uic_origin",
+        "licence",
+    }
 
 
 async def test_at_most_ten_rows_are_kept(module: Module) -> None:
@@ -1032,7 +1047,13 @@ async def test_paused_is_true_during_the_pause_and_false_after(
 
 
 def _lookup_row(uic: str, parent: str | None = None, **extra: Any) -> dict[str, Any]:
-    return {**_row(f"Zz Station {uic}", uic), "parent_uic": parent, **extra}
+    return {
+        **_row(f"Zz Station {uic}", uic),
+        "parent_uic": parent,
+        "parent_viator_id": None,
+        "replaced_by": None,
+        **extra,
+    }
 
 
 def _lookup_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -1371,7 +1392,13 @@ _SEA_LAT, _SEA_LON = -48.5, -123.25
 
 
 def _near_row(uic: str, distance: int, parent: str | None = None, **extra: Any) -> dict[str, Any]:
-    return {**_lookup_row(uic, parent), "distance_m": distance, **extra}
+    return {
+        **_row(f"Zz Station {uic}", uic),
+        "parent_uic": parent,
+        "distance_m": distance,
+        "parent_viator_id": None,
+        **extra,
+    }
 
 
 def _near_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -1782,3 +1809,629 @@ async def test_admin_search_makes_no_call_without_the_settings(
 
     assert outcome == station_module.Outcome(None, "off", None)
     assert module.requests == []
+
+
+# ─────────────── the contract with the module, phase 2 (its design 22.12) ───────────────
+#
+# The fields of the referential (the module's 20.23): `viator_id`,
+# `uic_origin`, `licence` on every row; `parent_viator_id` on near and
+# lookup rows; `replaced_by` on lookup rows. Invented values only: ids
+# `ZZ-99xxx`, codes `99xxxxx`, names "Zz...".
+
+_LICENCE = {
+    "name": "zz-crd",
+    "position": "zz-crd",
+    "uic": "odbl:trainline",
+    "share_alike": ["uic"],
+    "attribution": [],
+}
+
+
+def _phase1_row(**extra: Any) -> dict[str, Any]:
+    """The search row of the module's own example (its 20.23)."""
+    return {
+        "name": "Zzstadt Hbf",
+        "latitude": 50.0,
+        "longitude": 4.0,
+        "country_iso": "ZZ",
+        "uic": "9900001",
+        "viator_id": "ZZ-99001",
+        "uic_origin": "TL",
+        "licence": dict(_LICENCE),
+        **extra,
+    }
+
+
+def _old_row(uic: str = "9900001") -> dict[str, Any]:
+    """A row of a module from before the referential: the five fields only."""
+    return {"name": "Zzstadt", "latitude": 50.0, "longitude": 4.0, "country_iso": "ZZ", "uic": uic}
+
+
+async def _searched(module: Module, *rows: Any) -> list[dict[str, Any]]:
+    module.answer(200, {"stations": list(rows)})
+    found = await station_module.search("Zzstadt", uuid.uuid4())
+    assert found is not None
+    return found
+
+
+async def test_a_phase1_row_is_read_with_its_referential(module: Module) -> None:
+    (row,) = await _searched(module, _phase1_row(zz_extra="ZZ"))
+
+    assert row == {
+        "name": "Zzstadt Hbf",
+        "latitude": 50.0,
+        "longitude": 4.0,
+        "country_iso": "ZZ",
+        "uic": "9900001",
+        "viator_id": "ZZ-99001",
+        "uic_origin": "TL",
+        "licence": {**_LICENCE, "unreadable": False},
+    }
+
+
+async def test_a_row_of_an_older_module_gets_none_for_each_new_field(module: Module) -> None:
+    (row,) = await _searched(module, _old_row())
+
+    assert (row["uic"], row["viator_id"], row["uic_origin"], row["licence"]) == (
+        "9900001",
+        None,
+        None,
+        None,
+    )
+
+
+async def test_a_row_without_a_code_is_kept_with_a_viator_id_and_dropped_without(
+    module: Module,
+) -> None:
+    rows = await _searched(
+        module,
+        _phase1_row(uic=None, viator_id="ZZ-99002", name="Zz Kept", uic_origin="TL"),
+        _phase1_row(uic=None, viator_id=None, name="Zz No Key"),
+        _phase1_row(uic=None, viator_id="zz-99003", name="Zz Bad Key"),
+        {k: v for k, v in _phase1_row(name="Zz Absent").items() if k not in ("uic", "viator_id")},
+    )
+
+    assert [r["name"] for r in rows] == ["Zz Kept"]
+    # An origin labels a code: without a code it is None.
+    assert (rows[0]["uic"], rows[0]["viator_id"], rows[0]["uic_origin"]) == (
+        None,
+        "ZZ-99002",
+        None,
+    )
+    assert station_module.station_key(rows[0]) == "ZZ-99002"
+
+
+async def test_a_code_of_the_viator_id_form_is_no_code_and_the_row_is_dropped(
+    module: Module,
+) -> None:
+    rows = await _searched(module, _phase1_row(uic="ZZ-99001"), _phase1_row(name="Zz Good"))
+
+    assert [r["name"] for r in rows] == ["Zz Good"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "zz-99001",
+        "ZZ-9900",
+        "ZZ-990011",
+        "ZZ99001",
+        "ZZ_99001",
+        "Z-990011",
+        "ZZ-99001\n",
+        " ZZ-99001",
+        "\uff3a\uff3a-99001",  # full-width capitals
+        "ZZ-\u0669\u0669\u0660\u0660\u0661",  # Arabic-Indic digits
+        "ZZ-99001\u200b",  # a zero-width space
+        99001,
+        True,
+        ["ZZ-99001"],
+    ],
+    ids=lambda v: f"zz-{type(v).__name__}-{len(str(v))}",
+)
+async def test_a_malformed_viator_id_is_none_and_the_row_kept_by_its_code(
+    module: Module, value: Any
+) -> None:
+    (row,) = await _searched(module, _phase1_row(viator_id=value))
+
+    assert row["viator_id"] is None
+    assert row["uic"] == "9900001"
+    assert not station_module.is_viator_id(value)
+
+
+def test_is_viator_id_takes_the_form_of_the_modules_design() -> None:
+    assert station_module.is_viator_id("ZZ-99999")
+    assert station_module.is_viator_id("YY-99001")
+    assert not station_module.is_viator_id(None)
+    assert station_module.VIATOR_ID_LENGTH == 8
+
+
+@pytest.mark.parametrize("label", ["MN", "CM", "VM", "TL", "FD"])
+async def test_each_served_origin_label_is_kept_with_its_words(module: Module, label: str) -> None:
+    (row,) = await _searched(module, _phase1_row(uic_origin=label))
+
+    assert row["uic_origin"] == label
+    assert station_module.uic_origin_text(label) == station_module.UIC_ORIGIN_TEXTS[label]
+
+
+@pytest.mark.parametrize("label", ["VU", "tl", "ZZ", "", 4, None, ["TL"]])
+async def test_an_unknown_origin_label_is_none_never_a_failure(module: Module, label: Any) -> None:
+    (row,) = await _searched(module, _phase1_row(uic_origin=label))
+
+    assert row["uic_origin"] is None
+    assert row["uic"] == "9900001"
+
+
+def test_the_origin_words_say_where_the_code_comes_from() -> None:
+    assert station_module.uic_origin_text("TL") == "from the Trainline list"
+    assert station_module.uic_origin_text("VU") is None
+    assert station_module.uic_origin_text(None) is None
+    assert "VU" not in station_module.UIC_ORIGIN_TEXTS
+
+
+async def test_a_feed_licence_with_its_attribution_is_kept_as_text(module: Module) -> None:
+    licence = {
+        "name": "cc-by-4.0:feed",
+        "position": "cc-by-4.0:feed",
+        "uic": None,
+        "share_alike": [],
+        "attribution": ["<script>alert('zz')</script> Zz Rail & Co", "Zz Bahn"],
+    }
+    (row,) = await _searched(module, _phase1_row(licence=licence))
+
+    # Kept as sent: every page puts it in as text (escaped), never as markup.
+    assert row["licence"] == {**licence, "unreadable": False}
+
+
+_READ = {**_LICENCE, "unreadable": False}
+
+# Characters a third party's licence text may not hold, written as code
+# points (no raw invisible character in this file): bidirectional controls,
+# zero-width characters, marks and the byte order mark (category Cf), line
+# and paragraph separators (Zl, Zp), controls (Cc).
+_UNSAFE = {
+    "rlo": 0x202E,
+    "lri": 0x2066,
+    "zwsp": 0x200B,
+    "rlm": 0x200F,
+    "alm": 0x061C,
+    "bom": 0xFEFF,
+    "wj": 0x2060,
+    "line-sep": 0x2028,
+    "para-sep": 0x2029,
+    "line-end": 0x0A,
+    "escape": 0x1B,
+}
+
+
+@pytest.mark.parametrize("point", list(_UNSAFE.values()), ids=list(_UNSAFE))
+async def test_an_unsafe_attribution_text_is_left_out_and_the_rest_kept(
+    module: Module, point: int
+) -> None:
+    bad = "Zz " + chr(point) + "Rail"
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, "attribution": [bad, "Zz"]}))
+
+    assert row["licence"] == {**_READ, "attribution": ["Zz"]}
+
+
+@pytest.mark.parametrize("point", list(_UNSAFE.values()), ids=list(_UNSAFE))
+async def test_an_unsafe_tag_is_none_and_its_share_alike_mark_kept(
+    module: Module, point: int
+) -> None:
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, "uic": "odbl" + chr(point)}))
+
+    assert row["licence"] == {**_READ, "uic": None}
+
+
+_PARTS = [
+    pytest.param({"zz": 1}, {}, id="an-unknown-field-ignored"),
+    pytest.param({"uic": 7}, {"uic": None}, id="a-tag-not-text"),
+    pytest.param({"uic": ""}, {"uic": None}, id="an-empty-tag"),
+    pytest.param({"uic": "z" * 101}, {"uic": None}, id="a-tag-too-long"),
+    pytest.param({"share_alike": "uic"}, {"share_alike": []}, id="share-alike-not-a-list"),
+    pytest.param({"share_alike": ["zz", "uic"]}, {}, id="share-alike-unknown-field"),
+    pytest.param({"share_alike": ["uic", "uic"]}, {}, id="share-alike-twice"),
+    pytest.param({"attribution": "Zz Rail"}, {}, id="attribution-not-a-list"),
+    pytest.param({"attribution": [5, "Zz"]}, {"attribution": ["Zz"]}, id="attribution-not-text"),
+    pytest.param({"attribution": ["", "Zz"]}, {"attribution": ["Zz"]}, id="attribution-empty"),
+    pytest.param(
+        {"attribution": ["z" * 501, "Zz"]}, {"attribution": ["Zz"]}, id="attribution-too-long"
+    ),
+    pytest.param({"attribution": ["Zz", "Zz"]}, {"attribution": ["Zz"]}, id="attribution-twice"),
+    pytest.param(
+        {"attribution": [f"Zz {n}" for n in range(5)]},
+        {"attribution": [f"Zz {n}" for n in range(4)]},
+        id="five-texts-four-kept",
+    ),
+]
+
+
+@pytest.mark.parametrize(("part", "expected"), _PARTS)
+async def test_a_faulty_part_of_a_licence_never_hides_the_rest(
+    module: Module, part: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    (row,) = await _searched(module, _phase1_row(licence={**_LICENCE, **part}))
+
+    assert row["licence"] == {**_READ, **expected}
+    assert (row["uic"], row["viator_id"]) == ("9900001", "ZZ-99001")
+
+
+_UNREADABLE = {
+    "name": None,
+    "position": None,
+    "uic": None,
+    "share_alike": [],
+    "attribution": [],
+    "unreadable": True,
+}
+
+
+@pytest.mark.parametrize(
+    "licence",
+    [
+        pytest.param("odbl:trainline", id="a-text"),
+        pytest.param(["odbl:trainline"], id="a-list"),
+        pytest.param({}, id="an-empty-object"),
+        pytest.param(
+            {"name": None, "position": None, "uic": None, "share_alike": [], "attribution": []},
+            id="no-tag",
+        ),
+        pytest.param({"uic": 7, "share_alike": ["zz"], "attribution": [""]}, id="nothing-readable"),
+    ],
+)
+async def test_a_licence_given_but_unreadable_is_told_from_none(
+    module: Module, licence: Any
+) -> None:
+    (row,) = await _searched(module, _phase1_row(licence=licence))
+
+    assert row["licence"] == _UNREADABLE
+
+
+async def test_no_licence_is_none(module: Module) -> None:
+    rows = await _searched(
+        module,
+        _phase1_row(licence=None),
+        {k: v for k, v in _phase1_row(name="Zz Old").items() if k != "licence"},
+    )
+
+    assert [r["licence"] for r in rows] == [None, None]
+
+
+async def test_a_licence_at_its_bounds_is_kept(module: Module) -> None:
+    licence = {
+        "name": "z" * 100,
+        "position": None,
+        "uic": None,
+        "share_alike": ["name", "position", "uic"],
+        "attribution": ["z" * 500, "Zz 1", "Zz 2", "Zz 3"],
+    }
+    (row,) = await _searched(module, _phase1_row(licence=licence))
+
+    assert row["licence"] == {**licence, "unreadable": False}
+
+
+async def test_a_lone_surrogate_in_an_attribution_leaves_that_text_out_never_a_500(
+    module: Module,
+) -> None:
+    licence = {**_LICENCE, "attribution": ["Zz", "Zz Bahn"]}
+    raw = json.dumps({"stations": [_phase1_row(licence=licence)]})
+    raw = raw.replace('"Zz"', '"Zz' + chr(92) + 'ud800"')
+    module.handler = lambda _r: httpx.Response(200, content=raw.encode("ascii"))
+
+    rows = await station_module.search("Zzstadt", uuid.uuid4())
+
+    assert rows is not None
+    assert rows[0]["licence"] == {**_READ, "attribution": ["Zz Bahn"]}
+
+
+def test_current_id_is_the_survivor_else_the_id() -> None:
+    assert station_module.current_id({"viator_id": "ZZ-99003", "replaced_by": "ZZ-99001"}) == (
+        "ZZ-99001"
+    )
+    assert station_module.current_id({"viator_id": "ZZ-99003", "replaced_by": None}) == "ZZ-99003"
+    assert station_module.current_id({"viator_id": "ZZ-99003"}) == "ZZ-99003"
+    assert station_module.current_id({"viator_id": None, "replaced_by": None}) is None
+
+
+# ── the lookup by VIATOR ids ──
+
+
+def _read(row: dict[str, Any]) -> dict[str, Any]:
+    """A row of the module as the client gives it back: its licence with
+    `unreadable` false (the rows of these tests carry a readable one)."""
+    return {**row, "licence": {**row["licence"], "unreadable": False}}
+
+
+def _id_row(asked: str, uic: str | None, **extra: Any) -> dict[str, Any]:
+    """A lookup row answering the id `asked` (its anchor's code `uic`)."""
+    return {
+        **_phase1_row(uic=uic, viator_id=asked, name=f"Zz {asked}"),
+        "parent_uic": None,
+        "parent_viator_id": None,
+        "replaced_by": None,
+        **extra,
+    }
+
+
+async def test_a_lookup_by_ids_sends_ids_alone(module: Module) -> None:
+    module.answer(200, {"stations": [_id_row("ZZ-99001", "9900001")]})
+
+    outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99001", "ZZ-99999"])
+
+    assert json.loads(module.requests[0].content) == {"ids": ["ZZ-99001", "ZZ-99999"]}
+    assert outcome.rows == [_read(_id_row("ZZ-99001", "9900001"))]
+
+
+async def test_a_lookup_by_codes_still_sends_uics_alone(module: Module) -> None:
+    module.answer(200, {"stations": []})
+
+    await station_module.lookup(["9900001"], uuid.uuid4(), ids=[])
+
+    assert json.loads(module.requests[0].content) == {"uics": ["9900001"]}
+
+
+async def test_codes_and_ids_go_in_two_fields_and_a_station_asked_both_ways_gives_two_rows(
+    module: Module,
+) -> None:
+    by_code = {**_lookup_row("9900001"), "viator_id": "ZZ-99001"}
+    by_id = _id_row("ZZ-99001", "9900001")
+    module.answer(200, {"stations": [by_code, by_id]})
+
+    outcome = await station_module.lookup(["9900001"], uuid.uuid4(), ids=["ZZ-99001"])
+
+    assert json.loads(module.requests[0].content) == {"uics": ["9900001"], "ids": ["ZZ-99001"]}
+    assert outcome.rows == [by_code, _read(by_id)]
+    by_code_key, by_id_key = station_module.lookup_by_key(outcome.rows, ["9900001"], ["ZZ-99001"])
+    assert (by_code_key["9900001"]["licence"], by_id_key["ZZ-99001"]["licence"]["name"]) == (
+        None,
+        "zz-crd",
+    )
+
+
+async def test_the_codes_rows_end_at_the_first_row_of_an_id(module: Module) -> None:
+    """The module answers the codes' rows first, then the ids' (its 20.23):
+    a row met after an id's row is never read as a code's, so which key a
+    row answers follows the contract's order, not the codes' values."""
+    first = _lookup_row("9900001")
+    by_id = _id_row("ZZ-99003", "9900005")
+    late = _lookup_row("9900002")
+    module.answer(200, {"stations": [first, by_id, late]})
+
+    outcome = await station_module.lookup(["9900001", "9900002"], uuid.uuid4(), ids=["ZZ-99003"])
+
+    assert outcome.rows == [first, _read(by_id)]
+    by_code, by_id_key = station_module.lookup_by_key(
+        [first, by_id, late], ["9900001", "9900002"], ["ZZ-99003"]
+    )
+    assert (sorted(by_code), sorted(by_id_key)) == (["9900001"], ["ZZ-99003"])
+
+
+async def test_an_alias_answers_its_survivor_under_the_id_asked(module: Module) -> None:
+    alias = _id_row("ZZ-99003", "9900001", replaced_by="ZZ-99001")
+    module.answer(200, {"stations": [alias]})
+
+    outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99003"])
+
+    assert outcome.rows is not None
+    (row,) = outcome.rows
+    assert (row["viator_id"], row["replaced_by"]) == ("ZZ-99003", "ZZ-99001")
+    assert station_module.current_id(row) == "ZZ-99001"
+
+
+async def test_a_lookup_row_without_a_code_answers_its_id(module: Module) -> None:
+    module.answer(200, {"stations": [_id_row("ZZ-99004", None, parent_viator_id="ZZ-99001")]})
+
+    outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99004"])
+
+    assert outcome.rows is not None
+    (row,) = outcome.rows
+    assert (row["uic"], row["viator_id"], row["parent_viator_id"]) == (None, "ZZ-99004", "ZZ-99001")
+
+
+async def test_lookup_rows_for_keys_not_asked_or_twice_are_dropped(module: Module) -> None:
+    good = _id_row("ZZ-99001", "9900001")
+    module.answer(
+        200,
+        {
+            "stations": [
+                _id_row("ZZ-99005", "9900005"),  # an id not asked
+                good,
+                _id_row("ZZ-99001", "9900001"),  # a second row for the id
+                _id_row("ZZ-99002", None, parent_uic=5),  # a parent not text
+            ]
+        },
+    )
+
+    outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99001", "ZZ-99002"])
+
+    assert outcome.rows == [_read(good)]
+
+
+async def test_malformed_parent_and_replaced_by_ids_are_none(module: Module) -> None:
+    module.answer(
+        200,
+        {"stations": [_id_row("ZZ-99001", "9900001", parent_viator_id="zz", replaced_by=7)]},
+    )
+
+    outcome = await station_module.lookup([], uuid.uuid4(), ids=["ZZ-99001"])
+
+    assert outcome.rows is not None
+    assert (outcome.rows[0]["parent_viator_id"], outcome.rows[0]["replaced_by"]) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("codes", "ids"),
+    [
+        pytest.param([], [], id="no-key"),
+        pytest.param(
+            [f"99000{n:02d}" for n in range(11)],
+            [f"ZZ-990{n:02d}" for n in range(10)],
+            id="21-keys",
+        ),
+        pytest.param([f"99000{n:02d}" for n in range(21)], [], id="21-codes"),
+        pytest.param([], ["ZZ-99001", "ZZ-99001"], id="an-id-twice"),
+        pytest.param([], ["zz-99001"], id="an-id-of-another-form"),
+        pytest.param([], ["9900001"], id="a-code-as-an-id"),
+    ],
+)
+async def test_a_lookup_the_module_would_refuse_raises_before_any_call(
+    module: Module, codes: list[str], ids: list[str]
+) -> None:
+    with pytest.raises(ValueError):
+        await station_module.lookup(codes, uuid.uuid4(), ids=ids)
+
+    assert module.requests == []
+
+
+async def test_twenty_keys_in_all_are_one_call(module: Module) -> None:
+    module.answer(200, {"stations": []})
+    codes = [f"99000{n:02d}" for n in range(10)]
+    ids = [f"ZZ-990{n:02d}" for n in range(10)]
+
+    outcome = await station_module.lookup(codes, uuid.uuid4(), ids=ids)
+
+    assert outcome.reason == "ok"
+    assert len(module.requests) == 1
+
+
+async def test_a_lookup_answer_up_to_its_own_cap_is_read(module: Module) -> None:
+    # Larger than the search's cap, within the lookup's: 20 rows with
+    # attribution texts of the timetable feeds (the module's entry 713).
+    text = "\U0001d400" * 499  # four bytes each in UTF-8
+    rows = [
+        _id_row(
+            f"ZZ-990{n:02d}",
+            f"99000{n:02d}",
+            licence={**_LICENCE, "attribution": [text, text + "z"]},
+        )
+        for n in range(20)
+    ]
+    body = json.dumps({"stations": rows}, ensure_ascii=False).encode("utf-8")
+    assert 64 * 1024 < len(body) <= station_module.SEARCH_MAX_BYTES
+    module.handler = lambda _r: httpx.Response(200, content=body)
+
+    outcome = await station_module.lookup(
+        [], uuid.uuid4(), ids=[f"ZZ-990{n:02d}" for n in range(20)]
+    )
+
+    assert outcome.rows is not None
+    assert len(outcome.rows) == 20
+
+
+# ── near ──
+
+
+async def test_near_rows_carry_the_parents_id_and_a_row_without_a_code(module: Module) -> None:
+    coded = {
+        **_phase1_row(),
+        "parent_uic": "9900009",
+        "parent_viator_id": "ZZ-99009",
+        "distance_m": 10,
+    }
+    uncoded = {
+        **_phase1_row(uic=None, viator_id="ZZ-99002", name="Zz Halt"),
+        "parent_uic": None,
+        "distance_m": 20,
+    }
+    again = {**uncoded, "distance_m": 30}
+    module.answer(200, {"stations": [coded, uncoded, again]})
+
+    outcome = await station_module.near_outcome(_SEA_LAT, _SEA_LON, uuid.uuid4())
+
+    assert outcome.rows is not None
+    assert [(r["uic"], r["viator_id"], r["parent_viator_id"]) for r in outcome.rows] == [
+        ("9900001", "ZZ-99001", "ZZ-99009"),
+        (None, "ZZ-99002", None),
+    ]
+
+
+# ── the countries the module serves ──
+
+
+def _countries_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
+    prefix = "station_module.countries_failed reason="
+    return [
+        r.getMessage().removeprefix(prefix)
+        for r in caplog.records
+        if r.name == station_module.log.name and r.getMessage().startswith(prefix)
+    ]
+
+
+async def test_countries_reads_the_list_and_keeps_it_a_minute(
+    module: Module, clock: FakeClock, token: str
+) -> None:
+    module.answer(200, {"countries": ["YY", "ZZ"]})
+
+    assert await station_module.countries() == frozenset({"YY", "ZZ"})
+    assert await station_module.countries() == frozenset({"YY", "ZZ"})
+    (request,) = module.requests
+    assert request.method == "GET"
+    assert str(request.url) == f"{MODULE_URL}/internal/v1/countries"
+    assert request.headers["authorization"] == f"Bearer {token}"
+    assert "x-viator-user-id" not in request.headers
+
+    clock.now += station_module.COUNTRIES_TTL_SECONDS + 1
+    module.answer(200, {"countries": ["ZZ"]})
+    assert await station_module.countries() == frozenset({"ZZ"})
+    assert len(module.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"countries": "ZZ"}, id="not-a-list"),
+        pytest.param({"countries": ["zz"]}, id="small-letters"),
+        pytest.param({"countries": ["ZZZ"]}, id="three-letters"),
+        pytest.param({"countries": [None]}, id="a-null"),
+        pytest.param({"countries": ["ZZ"] * 301}, id="too-many"),
+        pytest.param({"rows": []}, id="no-field"),
+        pytest.param(["ZZ"], id="a-list"),
+    ],
+)
+async def test_a_countries_answer_out_of_shape_is_none_without_a_pause(
+    module: Module, caplog: pytest.LogCaptureFixture, body: Any
+) -> None:
+    module.answer(200, body)
+
+    with caplog.at_level(logging.INFO):
+        assert await station_module.countries() is None
+
+    assert _countries_reasons(caplog) == ["shape"]
+    assert not station_module.paused()
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ReadTimeout])
+async def test_a_failed_countries_call_is_none_forgets_the_cache_and_never_pauses(
+    module: Module, clock: FakeClock, error: type[httpx.HTTPError]
+) -> None:
+    module.answer(200, {"countries": ["ZZ"]})
+    assert await station_module.countries() == frozenset({"ZZ"})
+    clock.now += station_module.COUNTRIES_TTL_SECONDS + 1
+    module.fail(error)
+
+    assert await station_module.countries() is None
+    assert not station_module.paused()
+    module.answer(200, {"countries": ["YY"]})
+    assert await station_module.countries() == frozenset({"YY"})
+
+
+async def test_countries_makes_no_call_when_off_or_paused(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module.fail(httpx.ConnectError)
+    await station_module.search("Zzville", uuid.uuid4())  # starts the pause
+    calls = len(module.requests)
+
+    assert await station_module.countries() is None
+    assert len(module.requests) == calls
+
+    station_module.reset()
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(""))
+    assert await station_module.countries() is None
+    assert len(module.requests) == calls
+
+
+def test_countries_blocking_runs_outside_the_event_loop(module: Module) -> None:
+    module.answer(200, {"countries": ["ZZ"]})
+
+    assert station_module.countries_blocking() == frozenset({"ZZ"})
