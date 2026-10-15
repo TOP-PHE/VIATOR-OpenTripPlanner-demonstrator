@@ -1078,10 +1078,10 @@ which step the task is in:
 
 | Step | What the server does |
 |---|---|
-| downloading, *x* of *y* (*n* %) | the file arrives (its sha256 is computed on the way) |
+| downloading, *x* of *y* (*n* %) | the file arrives (its sha256 is computed on the way); "downloading" alone before the first bytes (a NAP lookup first, for example) |
 | verifying (format check) | the file is checked to be the declared kind of archive (zip / gzip / PBF magic bytes, then the format detection); a `.xml.gz` or bare `.xml` NeTEx is re-wrapped as a zip and hashed again |
 | checking structure, *x* of *y* (*n* %) | NeTEx only: the structure check of the Feed status panel (`app/netex_structure.py`): every XML member of the zip is read, uncompressed, and its elements counted; *y* is the total uncompressed size the zip's directory declares, *x* the part already read. It reads about 75 MB of XML a second, so a national file is long: a 2 GB NeTEx zip holds tens of GB of XML, which takes **many minutes** (production, 15 Oct: DB's file, 20+ minutes). This is normal: the line moves at least every few seconds, the block's elapsed time grows, the page and the rest of VIATOR keep answering |
-| storing | the checked file is copied into the session's slot (the previous one rotated to `.old`) and a rebuild is queued |
+| storing | the checked file is copied into the session's slot (the previous one rotated to `.old`) and, for timetable and OSM files, a rebuild is queued. The copy goes to a hidden name beside the slot and replaces the file in one rename: the slot always holds a whole file, and two copies into one slot (an upload during a refresh) run one after the other. If the page or the request goes away during the copy, the copy still finishes, its rebuild is queued and the feed's state saved |
 
 The step ends with the task: the line goes and the counts move on (fetched, unchanged or skipped).
 An unchanged file (HTTP 304 or the same sha256) has no step after its download. All steps run beside
