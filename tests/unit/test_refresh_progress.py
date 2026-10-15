@@ -263,10 +263,11 @@ def test_the_extract_follow_up_counts_states_and_reason_words(
     follow.outcome(up.FeedOutcome("ZZ0", up.SKIPPED, up.BUDGET))
     follow.outcome(up.FeedOutcome("ZZ1", up.REFUSED, "Row Text <x>"))
     follow.outcome(up.FeedOutcome("ZZ2", "strange", None))
+    follow.outcome(up.FeedOutcome("ZZ3", up.SENT, "zz_word"))  # no reason kept for a success
     follow.finished("weird")
     final = written[-1]
     assert final["state"] == "error"
-    assert (final["handled"], final["skipped"], final["refused"]) == (3, 2, 1)
+    assert (final["handled"], final["skipped"], final["refused"]) == (4, 2, 1)
     assert final["reasons"] == {"budget": 1, "other": 1}
 
 

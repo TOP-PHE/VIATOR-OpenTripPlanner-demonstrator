@@ -303,7 +303,8 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     for blob in (json.dumps(done), json.dumps(seen), json.dumps(other_browser)):
         assert _HOST not in blob
         assert _SECRET_MARK not in blob
-        assert "404" not in blob
+        assert "Not Found" not in blob
+        assert "download failed" not in blob
     from app.db import SessionLocal
 
     with SessionLocal() as db:
@@ -312,6 +313,42 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
         ).scalar_one()
     assert _HOST not in raw
     assert _SECRET_MARK not in raw
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_derived_providers_are_counted_and_recorded(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, [])
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "ZZXB",
+                        "timetable": {
+                            "format": "gtfs",
+                            "source": "cross_border_filter",
+                            "derived_from": {"session_id": "zz-none", "provider_id": "ZZRAIL"},
+                        },
+                    }
+                ]
+            }
+        }
+        flag_modified(s, "config")
+        db.commit()
+    r = client.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    record = _read()["providers"]
+    assert (record["total"], record["done"], record["failed"]) == (1, 1, 1)
+    assert record["failed_keys"] == ["provider[ZZXB].cross_border_filter"]
 
 
 @pytest.mark.usefixtures("inbox")
@@ -429,6 +466,20 @@ def test_a_dead_refresh_is_interrupted_and_taken_over(
     assert shown["finished_at"] == shown["heartbeat_at"]
     assert shown["done"] == 0
     assert shown["current"][0]["bytes"] == 99
+
+    # A claim takes the row over while the dead refresh's writes change
+    # nothing (the new refresh is running too: only the run_id tells them apart).
+    taker = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    dead.done("provider[ZZRAIL].timetable(gtfs)", {"status": "fetched"})
+    assert _read()["providers"]["done"] == 0
+    taker.finish(refresh_progress.FINISHED)
+    # A finished refresh's own late write changes nothing either.
+    taker.done("provider[ZZRAIL].timetable(gtfs)", {"status": "fetched"})
+    assert _read()["providers"]["done"] == 0
+    _age_heartbeat(0)
+    refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
+    shown = _read()["providers"]
 
     # The next refresh takes the row over and says what it replaced.
     _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
