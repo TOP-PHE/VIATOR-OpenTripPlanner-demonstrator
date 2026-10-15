@@ -3324,18 +3324,46 @@ def test_an_unanswered_id_is_asked_again_by_the_hubs_code(
     assert db.commits == 0
 
 
-def test_a_failed_second_lookup_shows_the_hub_not_served(
-    client: TestClient, hubs: Hubs, module: Module
+@pytest.mark.parametrize(
+    ("failure", "message", "retry_after"),
+    [
+        pytest.param(
+            httpx.Response(500, json={"error_id": "zz"}),
+            "The station module did not answer.",
+            None,
+            id="an-error",
+        ),
+        pytest.param(
+            _limited("17"),
+            "The station module's limit is reached; try again in 17 seconds.",
+            17,
+            id="a-limit",
+        ),
+    ],
+)
+def test_a_failed_second_lookup_says_the_module_did_not_answer(
+    client: TestClient,
+    db: FakeDb,
+    hubs: Hubs,
+    module: Module,
+    failure: httpx.Response,
+    message: str,
+    retry_after: int | None,
 ) -> None:
+    """The hub's code is served, but the second lookup that asks it fails:
+    the hub is shown as not answered (with the module's Retry-After), never
+    as not served, and nothing is written for it."""
     hub = _hub(1, uic="9900001", origin="msmm", station_id="ZZ-99001")
-    hubs.rows = [hub]
+    other = _hub(2, uic="9900002", origin="msmm", station_id="ZZ-99002")
+    hubs.rows = [hub, other]
     module.served = {"9900001": _ref_station("ZZ Hub01", "9900001", "ZZ-99008")}
+    module.served_ids = {"ZZ-99002": _ref_station("ZZ Hub02", "9900002", "ZZ-99002")}
     calls = {"n": 0}
 
     def second_fails() -> None:
         calls["n"] += 1
         if calls["n"] == 2:
-            module.lookup_response = httpx.Response(500, json={"error_id": "zz"})
+            module.lookup_response = failure
 
     module.during_lookup = second_fails
 
@@ -3343,8 +3371,16 @@ def test_a_failed_second_lookup_shows_the_hub_not_served(
 
     assert calls["n"] == 2
     assert body["status"] == "ok"
-    assert body["results"][0]["state"] == "not_served"
+    first, second = body["results"]
+    assert (first["state"], first["message"], first["retry_after"]) == (
+        "no_answer",
+        message,
+        retry_after,
+    )
+    assert (first["station_id"], first["id_not_answered"]) == ("ZZ-99001", True)
+    assert second["state"] == "ok"
     assert hub.station_id == "ZZ-99001"
+    assert db.commits == 0
 
 
 def test_the_hub_form_can_forget_the_viator_id() -> None:
@@ -3370,6 +3406,8 @@ const base = { hub_id: 'zz-hub-01', hub_name: 'ZZ Hub 01', uic: '9900001', state
   station_id: 'ZZ-99001', module_uic: '9900001', code_origin_text: 'from the Trainline list' };
 console.log(JSON.stringify({
   meanwhile: lines(hubCheckItem({ ...base, changed_meanwhile: true, licence: null })),
+  noAnswer: lines(hubCheckItem({ ...base, state: 'no_answer', id_not_answered: true,
+    message: 'The station module did not answer.', licence: null })),
   lost: lines(hubCheckItem({ ...base, id_not_answered: true, licence: null })),
   unreadable: hubLicenceLines({ unreadable: true }),
   markOnly: hubLicenceLines({ name: 'zz-crd', position: null, uic: null, share_alike: ['uic'],
@@ -3398,5 +3436,10 @@ def test_the_check_says_changed_meanwhile_unanswered_id_and_unreadable_licence(
         "The station module no longer answers VIATOR id ZZ-99001; its code is served. The hub "
         "keeps the id: confirm the station again, or forget the id in the hub form."
     )
+    assert out["noAnswer"] == [
+        "ZZ Hub 01 · 9900001",
+        "The station module no longer answers VIATOR id ZZ-99001; asked for its code, it gave "
+        "no answer: The station module did not answer. Nothing was changed for this hub.",
+    ]
     assert out["unreadable"] == ["Licence: given by the station module but unreadable."]
     assert out["markOnly"] == ["Licence: Name: zz-crd · Code: tag unreadable (share-alike)"]

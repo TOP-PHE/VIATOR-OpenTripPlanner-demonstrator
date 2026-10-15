@@ -2934,6 +2934,10 @@ function hubCheckItem(result) {
   const key = result.uic || (result.station_id ? `VIATOR id ${result.station_id}` : 'no code');
   item.append(hubCodesElement('strong', `${result.hub_name} · ${key}`));
   let note = 'The station module serves it under this name.';
+  if (result.state === 'no_answer') {
+    item.append(hubCodesElement('div', `The station module no longer answers VIATOR id ${result.station_id}; asked for its code, it gave no answer: ${result.message || 'try again later.'} Nothing was changed for this hub.`, 'hub-code-note'));
+    return item;
+  }
   if (result.state === 'not_served') note = 'The station module does not serve this station (any more).';
   else if (result.state === 'name_differs') note = `The station module names it "${result.module_name}".`;
   item.append(hubCodesElement('div', note, 'hub-code-note'));
