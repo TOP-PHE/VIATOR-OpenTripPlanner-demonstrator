@@ -1065,13 +1065,27 @@ What the block says:
 | Line | Meaning |
 |---|---|
 | Running — *done* / *total* done · *n* skipped (kept previous file) · *elapsed* | *total* counts every download of the refresh (timetable, MCT, stations CSV of each `url` or `nap` provider) and each derived (`cross_border_filter`) provider; *done* those already over |
-| Now: `provider[ZZRAIL].timetable(gtfs)` — 12.0 MB of 99.0 MB (12 %) | the download under way; "of …" only when the server announced the file's size, else "… received"; "Now: cross-border filters" while the derived providers are made |
+| Now: `provider[ZZRAIL].timetable(gtfs)` — downloading, 12.0 MB of 99.0 MB (12 %) · for 3 min 9 s | the task under way, the **step** it is in (below) and how long the task has run; "of …" only when the server announced the file's size, else "… received"; "Now: cross-border filters" while the derived providers are made. A record written before the steps existed shows the bytes without a step |
 | Finished *time* — *n* fetched · *n* unchanged · *n* skipped (kept previous file) (took …) | **fetched**: a new file went into the slot and a rebuild was queued; **unchanged**: the server's file is the one already in the slot (HTTP 304 or the same sha256), nothing rotated, no rebuild; **skipped (kept previous file)**: no new file (the download, the format check, the NAP lookup or the dispatch failed: the slot keeps its previous file), the same word as the refresh's toast and the Feed status panel's "⚠ skipped" (the API field is `failed`); the panel's **Last result** gives the reason, the block never does |
 | Skipped (kept previous file): … | the labels of those tasks (at most 50), never a reason or an address |
 | Stopped by an unexpected error (…) | the refresh itself broke (a 500): the type of the error, the tasks done and those **not reached** (never started); see the web log |
 | Interrupted — no news from the server since … | the record stopped being updated: the `web` process restarted or died while the refresh ran. A running refresh writes a heartbeat at least every 30 s; after **5 minutes** without one the record is shown interrupted and a new refresh may start. The downloads done before stay in their slots. Limit: a refresh that was only stuck that long (not dead) and then wakes up finds its record taken: it starts no further download and changes nothing in the record (the web log has `refresh_progress.lease_lost`) |
 | The refresh before this one was interrupted | the record a new refresh replaced was an interrupted one |
 | Station module: … | after a provider refresh, the stop extracts sent to the station module (11.5): **queued** (waiting for the web process's sender), then *handled* / *total* feeds with the counts **sent**, **already held**, **refused**, **module unavailable**, **skipped** and their reason words (for example `budget 1`), the provider being sent, and at the end **finished** (or **cancelled**, **stopped by an error**); **not configured** without `STATION_MODULE_URL` / `STATION_MODULE_TOKEN`; **interrupted** when it went silent: still queued 35 minutes after the refresh (longer than the pass's 30-minute budget: a restart of `web` lost its in-memory queue) or running with no news for 5 minutes (the pass beats every 30 s); the next refresh or rebuild sends what is missing. The follow-up is written only into the record of the refresh that queued it, never into a newer one. The column **Station module** of the Feed status panel still gives each provider's last outcome |
+
+**The steps of a task.** A download that reaches 100 % is not the end of its task. The line says
+which step the task is in:
+
+| Step | What the server does |
+|---|---|
+| downloading, *x* of *y* (*n* %) | the file arrives (its sha256 is computed on the way) |
+| verifying (format check) | the file is checked to be the declared kind of archive (zip / gzip / PBF magic bytes, then the format detection); a `.xml.gz` or bare `.xml` NeTEx is re-wrapped as a zip and hashed again |
+| checking structure, *x* of *y* (*n* %) | NeTEx only: the structure check of the Feed status panel (`app/netex_structure.py`): every XML member of the zip is read, uncompressed, and its elements counted; *y* is the total uncompressed size the zip's directory declares, *x* the part already read. It reads about 75 MB of XML a second, so a national file is long: a 2 GB NeTEx zip holds tens of GB of XML, which takes **many minutes** (production, 15 Oct: DB's file, 20+ minutes). This is normal: the line moves at least every few seconds, the block's elapsed time grows, the page and the rest of VIATOR keep answering |
+| storing | the checked file is copied into the session's slot (the previous one rotated to `.old`) and a rebuild is queued |
+
+The step ends with the task: the line goes and the counts move on (fetched, unchanged or skipped).
+An unchanged file (HTTP 304 or the same sha256) has no step after its download. All steps run beside
+the web server's event loop, never on it: a long check never holds other pages or API calls.
 
 **One refresh of a kind at a time per session.** A second **Refresh providers** while one runs (a
 double click, another admin, another tab) is refused: the toast says *A provider refresh of this
@@ -1086,7 +1100,8 @@ writes no record. The toast gives the running refresh's start in the browser's t
 The record holds labels (built from the session's provider ids) and counts only: never a URL, a
 token or a skip reason. Its table, `source_refresh_progress`, comes with migration
 `20261015_1800_refresh_progress` (back up before deploying, as for every migration, §5.2); a
-downgrade drops only this table. API: `GET /api/sessions/<sid>/sources/progress` (content managers,
+downgrade drops only this table. The steps and the time per task (#359 follow-up) are more fields
+of the same JSON column: no migration. API: `GET /api/sessions/<sid>/sources/progress` (content managers,
 like the buttons).
 
 ---
