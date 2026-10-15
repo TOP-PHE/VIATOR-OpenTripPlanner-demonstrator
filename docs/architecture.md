@@ -1101,7 +1101,11 @@ GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall cloc
   `detect.detect` to agree with the declared kind before the slot is touched. An HTML stub served
   with HTTP 200 is refused and the previous file stays. This is a format check only: it does not
   validate the feed's content, so UI text must say "format OK", never "validated". An unchanged upstream
-  file (304 / same sha256) is reported `unchanged` and queues no rebuild. OSM refresh is the
+  file (304 / same sha256) is reported `unchanged` and queues no rebuild. A body cut part way is
+  resumed (range under a strong If-Range, at most 8 resumes, 2 in a row without progress end it,
+  429/5xx answers to a resume waited out on their own budget) rather
+  than downloaded again from byte 0 (`feed_fetch._download`); the sha256 runs over the whole
+  file and its size must equal the announced one. OSM refresh is the
   exception to "the previous file stays": it rotates `osm.pbf` before downloading. See
   [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a

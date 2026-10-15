@@ -285,7 +285,13 @@ def _stream(tmp_path: Path, response: httpx.Response) -> list[tuple[int, int | N
         token = feed_fetch.download_progress.set(lambda r, e: seen.append((r, e)))
         try:
             async with _client(response) as client:
-                await feed_fetch._stream_to(client, "https://zz.invalid/f", {}, tmp_path / "f")
+                await feed_fetch._download(
+                    client,
+                    "https://zz.invalid/f",
+                    {},
+                    tmp_path / "f",
+                    state_url="https://zz.invalid/f",
+                )
         finally:
             feed_fetch.download_progress.reset(token)
 
@@ -316,10 +322,14 @@ def test_a_broken_hook_never_stops_a_download(tmp_path: Path) -> None:
         token = feed_fetch.download_progress.set(broken)
         try:
             async with _client(httpx.Response(200, content=b"9" * 99)) as client:
-                _status, _h, _sha, size = await feed_fetch._stream_to(
-                    client, "https://zz.invalid/f", {}, tmp_path / "f"
+                download = await feed_fetch._download(
+                    client,
+                    "https://zz.invalid/f",
+                    {},
+                    tmp_path / "f",
+                    state_url="https://zz.invalid/f",
                 )
-                return size
+                return download.size
         finally:
             feed_fetch.download_progress.reset(token)
 
@@ -331,7 +341,9 @@ def test_without_a_running_task_nothing_is_reported(tmp_path: Path) -> None:
 
     async def go() -> None:
         async with _client(httpx.Response(200, content=b"9" * 99)) as client:
-            await feed_fetch._stream_to(client, "https://zz.invalid/f", {}, tmp_path / "f")
+            await feed_fetch._download(
+                client, "https://zz.invalid/f", {}, tmp_path / "f", state_url="https://zz.invalid/f"
+            )
 
     asyncio.run(go())
 
@@ -475,3 +487,34 @@ def test_a_silent_follow_up_reads_interrupted(state: str, minutes: int | None, s
     if minutes is not None:
         extract["updated_at"] = (now - timedelta(minutes=minutes)).isoformat()
     assert refresh_progress._public_extract(extract, now)["state"] == shown  # type: ignore[index]
+
+
+def test_a_resumed_download_reports_the_full_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.unit.test_feed_fetch_resume import BODY, Server
+
+    monkeypatch.setattr(feed_fetch, "RESUME_DELAYS", (0.0,) * 8)
+    server = Server(cuts=[2 * 1024 * 1024 + 99])
+    seen: list[tuple[int, int | None]] = []
+
+    async def go() -> None:
+        token = feed_fetch.download_progress.set(lambda r, e: seen.append((r, e)))
+        try:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+                await feed_fetch._download(
+                    client,
+                    "https://zz.invalid/f",
+                    {},
+                    tmp_path / "f",
+                    state_url="https://zz.invalid/f",
+                )
+        finally:
+            feed_fetch.download_progress.reset(token)
+
+    asyncio.run(go())
+    assert any(r.headers.get("range") for r in server.requests)  # it was resumed
+    assert {e for _r, e in seen} == {len(BODY)}
+    assert seen[-1] == (len(BODY), len(BODY))
+    received = [r for r, _e in seen]
+    assert received == sorted(received)  # never back to 0 on a resume

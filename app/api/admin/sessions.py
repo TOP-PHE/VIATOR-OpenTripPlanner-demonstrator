@@ -1800,6 +1800,8 @@ def _record_attempt(sid: str, label: str, outcome: dict[str, Any]) -> None:
         "status": outcome.get("status"),
         "reason": outcome.get("reason"),
     }
+    if outcome.get("resumes"):
+        state["last_attempt"]["resumes"] = outcome["resumes"]
     feed_fetch.save_state(state_dir, label, state)
 
 
@@ -2010,6 +2012,10 @@ async def _download_task(
         "url": url,
         "size_bytes": result.size_bytes,
     }
+    if result.resumes:
+        # A cut body was resumed on the way (app/feed_fetch.py); shown in the
+        # feed status panel's "Last result".
+        outcome["resumes"] = result.resumes
     assessment = (result.state.get("structure") or {}).get("assessment") or {}
     if assessment.get("level") in ("warn", "red"):
         outcome["structure"] = assessment

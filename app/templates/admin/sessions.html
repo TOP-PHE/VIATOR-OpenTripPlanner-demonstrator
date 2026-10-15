@@ -1518,7 +1518,10 @@ function feedLastResultHTML(s) {
   if (!a) return '<span class="hint">—</span>';
   const label = FEED_RESULT_LABELS[a.status] || escHTML(a.status || '');
   const when = _relativeTimeShort(a.at);
-  const head = when ? `${label} · ${escHTML(when)}` : label;
+  let head = when ? `${label} · ${escHTML(when)}` : label;
+  // A cut download resumed on the way (app/feed_fetch.py): say how often.
+  const resumes = Number(a.resumes) || 0;
+  if (resumes > 0) head += ` · resumed ${escHTML(String(resumes))} time${resumes > 1 ? 's' : ''}`;
   if (a.status !== 'skipped' || !a.reason) return head;
   return `${head}<div class="feed-reason">${escHTML(a.reason)}</div>`;
 }
