@@ -193,7 +193,8 @@ def test_the_fixture_feeds_are_the_same_file_every_time() -> None:
     for info in zipfile.ZipFile(io.BytesIO(first)).infolist():
         assert info.date_time == _ZIP_DATE
     assert _gtfs_bytes(padding=99) == first
-    assert _gtfs_bytes() == _gtfs_bytes()
+    small = _gtfs_bytes()
+    assert _gtfs_bytes() == small
 
 
 def _read(sid: str = SID) -> dict[str, Any]:
