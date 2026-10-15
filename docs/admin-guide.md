@@ -1610,6 +1610,46 @@ typed text, nor do httpx's request lines or the uvicorn access line of
 
 ---
 
+### 6.14 A large feed refresh fails with "peer closed connection"
+
+Symptom (feed-status panel, **Last result**): `skipped` with
+`download failed: peer closed connection without sending complete message
+body (received N bytes, expected M)`, on a big national archive (the DB
+NeTEx, about 2 GB), at about the same N on every refresh. The previous
+file stays in the slot, so the session keeps an ageing timetable.
+
+Since this release a body cut part way is **resumed** instead of
+downloaded again from byte 0 (`app/feed_fetch.py`):
+
+- VIATOR keeps the bytes it has and asks for the rest with
+  `Range: bytes=<received>-`, under `If-Range` naming the file's ETag (or
+  its Last-Modified when the ETag is weak or missing). If the file changed
+  on the server meanwhile, the server sends the new file whole and VIATOR
+  starts again from byte 0: bytes of two versions are never put together.
+- A resume is used only when the server can do it: no
+  `Accept-Ranges: none`, an ETag or Last-Modified, a known size
+  (`Content-Length`), and a body that is not content-encoded. Otherwise,
+  and when the server answers a range request with anything but a `206`
+  that continues the file exactly (same start, same total size), the
+  download starts again from byte 0, at most twice, as before.
+- Up to **8 resumes** per download (waits 2, 5, 10, 20, then 30 s), given
+  up after **2 resumes in a row that bring no new byte**. Each request
+  keeps the usual 600 s timeouts; there is no other time limit.
+- The file must end at exactly the announced size; its sha256 is that of
+  the whole file. A server sending more than it announced is refused
+  (`size mismatch`). Every refusal leaves the previous file in the slot.
+- **Last result** then reads `fetched · … · resumed 2 times`. A failure
+  says why it stopped, for example `…; no progress in 2 resume attempts in
+  a row, stopped at byte N of M (resumed 2 times)`. The `web` log has one
+  line per resume, `fetch resume 1 from byte N of M after
+  RemoteProtocolError` (never the URL).
+
+What to do when it still fails: if the reason says `no progress`, the
+server stops at the same byte even on a range request; try later, or
+upload the file by hand (Upload source). If every attempt restarts from
+byte 0 (`fetch resume refused (…)` or `fetch retry` lines, no `fetch
+resume` line), the server does not offer ranges for that file.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:
