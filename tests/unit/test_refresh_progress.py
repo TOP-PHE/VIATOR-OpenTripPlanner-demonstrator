@@ -997,7 +997,8 @@ def test_a_failed_copy_removes_its_source_and_queues_nothing(
             after=lambda: after.append("x"),
         )
 
+    failing = go()
     with pytest.raises(OSError, match="stand-in"):
-        asyncio.run(go())
+        asyncio.run(failing)
     assert not source.exists()
     assert (queued, after) == ([], [])
