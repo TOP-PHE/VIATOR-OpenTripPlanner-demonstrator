@@ -56,6 +56,7 @@ from ... import (
     station_builds,
     station_extract,
     station_extract_upload,
+    station_module,
 )
 from ...db import get_db
 from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
@@ -353,13 +354,17 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             # Country-gate: every provider that declares country_iso=X must
-            # have at least one master_stations row with country_iso=X.
+            # have at least one master_stations row with country_iso=X, or X
+            # must be a country the station module serves (D-R12 B; asked
+            # only when the Trainline list lacks one: `_unserved`).
             # Operator-driven: fail save with a clear message that includes
             # which countries are missing AND suggests the Trainline-import
             # action. UI surfaces this as a prompt with a one-click button.
             declared_countries = {p["country_iso"] for p in providers if p["country_iso"]}
             if declared_countries:
                 missing = _countries_without_stations(db, declared_countries)
+                if missing:
+                    missing = _unserved(missing, station_module.countries_blocking())
                 if missing:
                     raise HTTPException(
                         409,  # Conflict — semantically "preconditions not met"
@@ -368,8 +373,9 @@ def patch_session(
                             "missing_countries": sorted(missing),
                             "message": (
                                 "Cannot save: no master_stations rows for "
-                                f"{sorted(missing)}. Import them from Trainline "
-                                "first (POST /api/master/stations/refresh-trainline), "
+                                f"{sorted(missing)}, and the station module does not "
+                                "serve them (or did not answer). Import them from "
+                                "Trainline first (POST /api/master/stations/refresh-trainline), "
                                 "then retry this save."
                             ),
                         },
@@ -906,6 +912,19 @@ def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
     ).all()
     present = {ci for ci, count in rows if count > 0}
     return declared - present
+
+
+def _unserved(missing: set[str], served: frozenset[str] | None) -> set[str]:
+    """The countries of `missing` (without a Trainline row) that the station
+    module does not serve either: D-R12 B of the module's design, "a
+    country the module serves" being one of its served stations' countries
+    (`station_module.countries`, its `GET /internal/v1/countries`). When
+    the module is not configured, paused or does not answer (`served` is
+    None), the gate is the Trainline list alone, as before: `missing` as it
+    is, never a country let through on a guess."""
+    if served is None:
+        return missing
+    return missing - served
 
 
 def _safe_float(v: str | None) -> float | None:
@@ -2193,6 +2212,8 @@ async def import_providers_from_nap(
         if declared_countries:
             missing = _countries_without_stations(db, declared_countries)
             if missing:
+                missing = _unserved(missing, await station_module.countries())
+            if missing:
                 raise HTTPException(
                     409,
                     detail={
@@ -2200,8 +2221,9 @@ async def import_providers_from_nap(
                         "missing_countries": sorted(missing),
                         "message": (
                             "Imported providers reference countries with no "
-                            f"master_stations rows: {sorted(missing)}. Import them "
-                            "from Trainline first, then retry the bulk-import."
+                            f"master_stations rows that the station module does not "
+                            f"serve either (or it did not answer): {sorted(missing)}. "
+                            "Import them from Trainline first, then retry the bulk-import."
                         ),
                     },
                 )
