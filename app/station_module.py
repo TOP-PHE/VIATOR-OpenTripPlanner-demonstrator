@@ -145,7 +145,8 @@ CODE_MAX = 20
 # at creation, a hyphen, five digits (`ZZ-99999`). Exactly 8 characters:
 # it can never be a 7-digit UIC code, nor a 7-character CRD location code.
 VIATOR_ID_LENGTH = 8
-_VIATOR_ID = re.compile(r"[A-Z]{2}-[0-9]{5}", re.ASCII)
+# `re.ASCII`: `\d` is the ten ASCII digits only, never digits of other scripts.
+_VIATOR_ID = re.compile(r"[A-Z]{2}-\d{5}", re.ASCII)
 
 # The origin labels of a station code the module serves (its design 22.7),
 # in clear words for the pages. `VU` (derived, unproven) is never served, and
