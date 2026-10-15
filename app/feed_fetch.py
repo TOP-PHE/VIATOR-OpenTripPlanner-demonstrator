@@ -43,7 +43,8 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,11 @@ _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RESUME_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0, 20.0, 30.0, 30.0, 30.0, 30.0)
 # Resume attempts in a row that bring no new byte before the download is given up.
 MAX_STALLED_RESUMES = 2
+# Seconds to wait after a 429/5xx answer to a resume request, before asking
+# again. A busy server is not a stalled transfer: these answers count neither
+# as a resume nor as "no progress", so two quick 503s never throw away the
+# gigabyte already on disk; they have this budget of their own.
+RESUME_BUSY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 120.0)
 _CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -418,11 +424,23 @@ def _full_length(response: httpx.Response) -> int | None:
 
 def _range_validator(headers: httpx.Headers) -> str | None:
     """What If-Range names: a strong ETag, else Last-Modified. A weak ETag
-    never matches an If-Range (RFC 9110 13.1.5), so it cannot serve."""
+    never matches an If-Range (RFC 9110 13.1.5), so it cannot serve. A
+    Last-Modified serves only when it is strong by RFC 9110 8.8.2.2: at least
+    one second before the response's Date (a file changed twice within that
+    second would carry the same date); no Date, no resume."""
     etag = str(headers.get("etag") or "")
     if etag and not etag.startswith("W/"):
         return etag
-    return str(headers.get("last-modified") or "") or None
+    modified = str(headers.get("last-modified") or "")
+    date = str(headers.get("date") or "")
+    if not modified:
+        return None
+    try:  # a missing Date parses as an error too
+        if parsedate_to_datetime(date) - parsedate_to_datetime(modified) < timedelta(seconds=1):
+            return None
+    except (TypeError, ValueError):  # unreadable date, or one with and one without a zone
+        return None
+    return modified
 
 
 def _ranges_offered(headers: httpx.Headers) -> bool:
@@ -445,7 +463,6 @@ def _resume_headers(headers: dict[str, str], transfer: _Transfer) -> dict[str, s
     }
     kept["Range"] = f"bytes={transfer.size}-"
     kept["If-Range"] = transfer.validator or ""
-    kept["Accept-Encoding"] = "identity"
     return kept
 
 
@@ -496,6 +513,7 @@ class _Attempts:
     restarts: int = 0
     resumes: int = 0
     stalled: int = 0  # consecutive resume attempts that brought no byte
+    busy: int = 0  # 429/5xx answers to resume requests (own budget, RESUME_BUSY_DELAYS)
 
 
 async def _download(
@@ -513,8 +531,10 @@ async def _download(
     `len(RETRY_DELAYS)` times, as before. A body cut after some bytes is
     resumed instead when the server allows it (see `_Transfer.resumable`): up
     to `len(RESUME_DELAYS)` resumes, each with its wait, given up after
-    `MAX_STALLED_RESUMES` resumes in a row that bring no new byte. Each
-    request keeps the client's own timeouts.
+    `MAX_STALLED_RESUMES` resumes in a row that bring no new byte. A 429/5xx
+    answer to a resume request is waited out on its own budget
+    (`RESUME_BUSY_DELAYS`), the partial file kept. Each request keeps the
+    client's own timeouts.
     """
     try:
         return await _download_into(client, url, headers, dest, state_url)
@@ -526,6 +546,10 @@ async def _download(
 async def _download_into(
     client: httpx.AsyncClient, url: str, headers: dict[str, str], dest: Path, state_url: str
 ) -> _Download:
+    # The file's own bytes, never a content-coded transfer, on every request:
+    # the byte count is then an offset into the file, so a cut can be resumed
+    # (a `.xml.gz` on the server is a file, not a coding: it arrives as is).
+    headers = {**headers, "Accept-Encoding": "identity"}
     transfer = _Transfer(dest)
     tried = _Attempts()
     while True:
@@ -543,6 +567,9 @@ async def _download_into(
             reason = _download_error(exc, url, state_url)
             if not _retryable(exc):
                 raise FetchError(f"{reason}{_resumed_note(tried.resumes)}") from exc
+            if resuming and isinstance(exc, httpx.HTTPStatusError):
+                await _wait_busy(tried, transfer, reason, exc)
+                continue
             if resuming or transfer.resumable:
                 await _next_resume(tried, transfer, before, reason, exc)
                 continue
@@ -589,7 +616,10 @@ async def _next_resume(
             f"{where}{_resumed_note(tried.resumes)}"
         ) from exc
     if tried.resumes >= len(RESUME_DELAYS):
-        raise FetchError(f"{reason}; gave up after {tried.resumes} resumes, {where}") from exc
+        raise FetchError(
+            f"{reason}; gave up after {tried.resumes} resumes, {where}"
+            f"{_resumed_note(tried.resumes)}"
+        ) from exc
     log.info(
         "fetch resume %d from byte %d of %d after %s",
         tried.resumes + 1,
@@ -599,6 +629,27 @@ async def _next_resume(
     )
     await asyncio.sleep(RESUME_DELAYS[tried.resumes])
     tried.resumes += 1
+
+
+async def _wait_busy(
+    tried: _Attempts, transfer: _Transfer, reason: str, exc: httpx.HTTPStatusError
+) -> None:
+    """A resume request answered 429/5xx: wait and ask again for the same
+    range, or give up once `RESUME_BUSY_DELAYS` is spent. Neither a resume
+    nor a stall: the server answered, it just could not serve now."""
+    if tried.busy >= len(RESUME_BUSY_DELAYS):
+        raise FetchError(
+            f"{reason}; server still busy after {tried.busy} waits, stopped at byte "
+            f"{transfer.size} of {transfer.total}{_resumed_note(tried.resumes)}"
+        ) from exc
+    log.info(
+        "fetch resume waits for a busy server (HTTP %d) at byte %d of %d",
+        exc.response.status_code,
+        transfer.size,
+        transfer.total,
+    )
+    await asyncio.sleep(RESUME_BUSY_DELAYS[tried.busy])
+    tried.busy += 1
 
 
 def _resumed_note(resumes: int) -> str:

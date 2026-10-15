@@ -38,6 +38,7 @@ STATE_URL = "https://zz-nap.example/feed"
 def _no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(feed_fetch, "RETRY_DELAYS", (0.0, 0.0))
     monkeypatch.setattr(feed_fetch, "RESUME_DELAYS", (0.0,) * 8)
+    monkeypatch.setattr(feed_fetch, "RESUME_BUSY_DELAYS", (0.0,) * 5)
 
 
 @pytest.fixture
@@ -73,7 +74,8 @@ class Server:
     offset `cuts[n]` with `RemoteProtocolError` (None: no cut).
 
     `bad_range` replaces the Content-Range of every 206 (a misbehaving
-    server); `on_range` answers range requests itself when given."""
+    server); `on_range` answers range requests itself when given (None:
+    the usual answer)."""
 
     def __init__(
         self,
@@ -87,7 +89,7 @@ class Server:
         next_body: bytes | None = None,
         next_etag: str | None = None,
         bad_range: Callable[[int, int], str] | None = None,
-        on_range: Callable[[httpx.Request], httpx.Response] | None = None,
+        on_range: Callable[[httpx.Request], httpx.Response | None] | None = None,
         extra: dict[str, str] | None = None,
     ) -> None:
         self.body = body
@@ -124,8 +126,9 @@ class Server:
         if len(self.requests) == 2 and self.next_body is not None:
             self.body, self.etag = self.next_body, self.next_etag
         wanted = request.headers.get("range")
-        if wanted and self.on_range is not None:
-            return self.on_range(request)
+        own = self.on_range(request) if wanted and self.on_range is not None else None
+        if own is not None:
+            return own
         cut = self.cuts.pop(0) if self.cuts else None
         headers = self._headers()
         size = len(self.body)
@@ -198,6 +201,9 @@ async def test_cut_body_is_resumed_and_the_hash_is_the_full_body(staging: Path) 
     assert _ranges(server) == [None, f"bytes={MIB}-"]
     resume = server.requests[1]
     assert resume.headers["if-range"] == '"zz-v1"'
+    # The first request asks for the file's own bytes too: a content-coded
+    # transfer could not be resumed.
+    assert server.requests[0].headers["accept-encoding"] == "identity"
     assert resume.headers["accept-encoding"] == "identity"
 
 
@@ -264,12 +270,47 @@ async def test_without_accept_ranges_a_range_is_still_tried(staging: Path) -> No
     assert result.sha256 == _sha(BODY)
 
 
-async def test_last_modified_serves_when_the_etag_is_weak(staging: Path) -> None:
-    lm = "Thu, 15 Oct 2026 03:00:00 GMT"
-    server = Server(cuts=[MIB + 3], etag='W/"zz-weak"', last_modified=lm)
+LAST_MODIFIED = "Thu, 15 Oct 2026 03:00:00 GMT"
+
+
+@pytest.mark.parametrize("etag", [None, 'W/"zz-weak"'])
+async def test_last_modified_serves_when_strong(staging: Path, etag: str | None) -> None:
+    """No strong ETag: Last-Modified names the version, when it is at least
+    one second before the response's Date (RFC 9110 8.8.2.2)."""
+    server = Server(
+        cuts=[MIB + 3],
+        etag=etag,
+        last_modified=LAST_MODIFIED,
+        extra={"Date": "Thu, 15 Oct 2026 03:00:01 GMT"},
+    )
     result = await _fetch(server, staging)
     assert result.resumes == 1
-    assert server.requests[1].headers["if-range"] == lm
+    assert server.requests[1].headers["if-range"] == LAST_MODIFIED
+
+
+@pytest.mark.parametrize(
+    "date",
+    [
+        pytest.param("Thu, 15 Oct 2026 03:00:00 GMT", id="same-second"),
+        pytest.param("Thu, 15 Oct 2026 02:59:59 GMT", id="date-before"),
+        pytest.param(None, id="no-date"),
+        pytest.param("not a date", id="unreadable-date"),
+        pytest.param("Thu, 15 Oct 2026 03:00:05 -0000", id="date-without-zone"),
+    ],
+)
+async def test_weak_last_modified_never_resumes(staging: Path, date: str | None) -> None:
+    """A Last-Modified within a second of the Date (or with no Date to
+    compare) may name two versions: download again from byte 0."""
+    server = Server(
+        cuts=[MIB + 3],
+        etag=None,
+        last_modified=LAST_MODIFIED,
+        extra={"Date": date} if date else None,
+    )
+    result = await _fetch(server, staging)
+    assert _ranges(server) == [None, None]
+    assert result.resumes == 0
+    assert result.sha256 == _sha(BODY)
 
 
 # ─────────────────────────── restarted ───────────────────────────
@@ -414,10 +455,46 @@ async def test_one_resume_without_progress_is_forgiven(staging: Path) -> None:
     assert result.sha256 == _sha(BODY)
 
 
-async def test_server_errors_on_resume_count_as_no_progress(staging: Path) -> None:
-    server = Server(cuts=[MIB + 3], on_range=lambda r: httpx.Response(503))
-    with pytest.raises(FetchError, match=r"HTTP 503.*no progress in 2 resume attempts"):
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_busy_answers_to_a_resume_keep_the_partial_file(staging: Path, status: int) -> None:
+    """Two quick 503s are not two stalls: the bytes on disk are kept, the
+    same range asked for again, and the download completes."""
+    busy = [status, status]
+
+    def busy_then_serve(request: httpx.Request) -> httpx.Response | None:
+        return httpx.Response(busy.pop()) if busy else None
+
+    server = Server(cuts=[2 * MIB + 3], on_range=busy_then_serve)
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+    assert result.resumes == 1
+    assert _ranges(server) == [None] + [f"bytes={2 * MIB}-"] * 3
+
+
+async def test_busy_answers_do_not_hide_a_stall(staging: Path) -> None:
+    """Busy answers neither count as nor clear a stall: two resumes that
+    bring nothing still end it, a 503 between them or not."""
+    answers: list[int | None] = [None, 503, None]  # popped: resume, 503, resume
+
+    def busy_between(request: httpx.Request) -> httpx.Response | None:
+        code = answers.pop() if answers else None
+        return httpx.Response(code) if code else None
+
+    server = Server(cuts=[2 * MIB + 3, 2 * MIB, 2 * MIB], on_range=busy_between)
+    with pytest.raises(FetchError, match="no progress in 2 resume attempts in a row"):
         await _fetch(server, staging)
+    assert len(server.requests) == 4
+
+
+async def test_a_server_busy_too_long_is_given_up(staging: Path) -> None:
+    server = Server(cuts=[MIB + 3], on_range=lambda r: httpx.Response(503))
+    with pytest.raises(FetchError) as exc:
+        await _fetch(server, staging)
+    assert str(exc.value) == (
+        "download failed: HTTP 503 Service Unavailable; server still busy after 5 waits, "
+        f"stopped at byte {MIB} of {len(BODY)} (resumed 1 time)"
+    )
+    assert len(server.requests) == 1 + 6
     assert list(staging.iterdir()) == []
 
 
@@ -434,7 +511,10 @@ async def test_refusal_on_resume_fails_at_once(staging: Path) -> None:
 async def test_resumes_are_bounded(staging: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(feed_fetch, "RESUME_DELAYS", (0.0, 0.0))
     server = Server(cuts=[MIB + 1, 2 * MIB + 1, 3 * MIB + 1, 4 * MIB + 1])
-    with pytest.raises(FetchError, match=rf"gave up after 2 resumes, stopped at byte {3 * MIB} "):
+    with pytest.raises(
+        FetchError,
+        match=rf"gave up after 2 resumes, stopped at byte {3 * MIB} of \d+ \(resumed 2 times\)$",
+    ):
         await _fetch(server, staging)
     assert len(server.requests) == 3
     assert list(staging.iterdir()) == []
