@@ -13,6 +13,7 @@ the bulk import's gate on a stand-in session; the module through
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 from collections.abc import Iterator
 from typing import Any
@@ -298,4 +299,73 @@ def test_the_bulk_import_does_not_gate_a_country_already_saved(
     module.response = httpx.Response(500, json={"error_id": "zz"})
 
     assert _import(monkeypatch, "XX", stored=("XX",)) is None
+    assert module.requests == []
+
+
+def test_a_stored_country_still_gets_the_osm_warning(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    """Review round 2: the gate checks only the countries a save adds, but
+    the OSM warning still covers every declared country: a stored ZZ
+    provider whose OSM file now names another region is warned about."""
+    from app.models import Session as SessionRow
+
+    monkeypatch.setattr(sessions, "_COUNTRY_TO_OSM_HINTS", {"ZZ": ("zzland",)})
+    monkeypatch.setattr(sessions.ingestion, "normalize_providers", _normalised)
+    row = SessionRow(id="zz-session", name="Zz", config=_providers("ZZ"))
+    config = _providers("ZZ")
+    config["sources"]["osm_pbf"] = "https://osm.invalid/yyland-latest.osm.pbf"
+    response = _response()
+    with pytest.raises(_Reached):
+        sessions.patch_session(
+            "zz-session",
+            sessions.SessionPatch(config=config),
+            _request(),
+            response,
+            _Db(row),
+            _actor(),
+        )
+
+    (warning,) = json.loads(response.headers["X-Warnings"])
+    assert "doesn't appear to cover ['ZZ']" in warning
+    assert module.requests == []  # ZZ was stored: not gated
+
+
+class _NoSession(_Db):
+    """A database where the new session does not exist yet."""
+
+    def get(self, *_args: Any) -> Any:
+        return None
+
+
+def _create(*countries: str) -> dict[str, Any] | None:
+    from fastapi import HTTPException
+
+    body = sessions.SessionCreate(
+        id="zz-new", name="Zz", category="MANUAL", config=_providers(*countries)
+    )
+    try:
+        sessions.create_session(body, _request(), _NoSession(None), _actor())
+    except HTTPException as refused:
+        assert refused.status_code == 409
+        return dict(refused.detail)
+    except _Reached:
+        return None
+    raise AssertionError("the creation neither passed the gate nor was refused")
+
+
+def test_creating_a_session_runs_the_country_gate(module: Module, trainline: set[str]) -> None:
+    """Review round 2: the providers a session is created with become its
+    stored providers, which later saves no longer gate: creation gates them."""
+    assert _create("ZZ", "YY") is None
+    detail = _create("XX")
+    assert detail is not None
+    assert detail["error"] == "missing_master_stations_for_countries"
+    assert detail["missing_countries"] == ["XX"]
+
+
+def test_creating_a_session_without_providers_asks_nothing(
+    module: Module, trainline: set[str]
+) -> None:
+    assert _create() is None
     assert module.requests == []
