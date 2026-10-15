@@ -171,7 +171,14 @@ def add(db, s, wanted: set[str] | None, apply: bool) -> int:
     if not to_add:
         print("Nothing to add.")
         return 0
-    missing = _countries_without_stations(db, {e["country_iso"] for e in to_add})
+    # Only the countries this adds: those of the stored providers passed the
+    # gate when they were saved (app/api/admin/sessions.py `_stored_countries`).
+    stored = {
+        p["country_iso"].upper()
+        for p in providers
+        if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
+    }
+    missing = _countries_without_stations(db, {e["country_iso"] for e in to_add} - stored)
     if missing:
         print(
             f"no master_stations rows for {', '.join(sorted(missing))}, and the station module "

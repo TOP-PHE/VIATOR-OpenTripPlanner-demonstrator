@@ -360,7 +360,12 @@ def patch_session(
             # Operator-driven: fail save with a clear message that includes
             # which countries are missing AND suggests the Trainline-import
             # action. UI surfaces this as a prompt with a one-click button.
-            declared_countries = {p["country_iso"] for p in providers if p["country_iso"]}
+            # Only the countries this save adds: a country already among the
+            # stored providers passed the gate when it was saved, and must
+            # not be refused because the module is down or paused now.
+            declared_countries = {
+                p["country_iso"] for p in providers if p["country_iso"]
+            } - _stored_countries(s.config)
             if declared_countries:
                 missing = _countries_without_stations(db, declared_countries)
                 if missing:
@@ -373,8 +378,7 @@ def patch_session(
                             "missing_countries": sorted(missing),
                             "message": (
                                 "Cannot save: no master_stations rows for "
-                                f"{sorted(missing)}, and the station module does not "
-                                "serve them (or did not answer). Import them from "
+                                f"{sorted(missing)}, and {_module_side()}. Import them from "
                                 "Trainline first (POST /api/master/stations/refresh-trainline), "
                                 "then retry this save."
                             ),
@@ -912,6 +916,27 @@ def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
     ).all()
     present = {ci for ci, count in rows if count > 0}
     return declared - present
+
+
+def _module_side() -> str:
+    """The country gate's words about the station module, for its 409."""
+    if not station_module.enabled():
+        return "VIATOR does not use the station module"
+    return "the station module does not serve them (or did not answer)"
+
+
+def _stored_countries(config: dict[str, Any] | None) -> set[str]:
+    """The countries the stored providers of a session already declare
+    (upper case), read as saved, without validating them: the country gate
+    checks only the countries a save adds."""
+    providers = ((config or {}).get("sources") or {}).get("providers") or []
+    if not isinstance(providers, list):
+        return set()
+    return {
+        p["country_iso"].upper()
+        for p in providers
+        if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
+    }
 
 
 def _unserved(missing: set[str], served: frozenset[str] | None) -> set[str]:
@@ -2208,7 +2233,10 @@ async def import_providers_from_nap(
             raise HTTPException(400, f"Imported providers failed validation: {exc}") from exc
 
         # Country-gate.
-        declared_countries = {p["country_iso"] for p in providers_canon if p["country_iso"]}
+        # Only the countries the import adds (see the manual save).
+        declared_countries = {
+            p["country_iso"] for p in providers_canon if p["country_iso"]
+        } - _stored_countries(s.config)
         if declared_countries:
             missing = _countries_without_stations(db, declared_countries)
             if missing:
@@ -2221,9 +2249,9 @@ async def import_providers_from_nap(
                         "missing_countries": sorted(missing),
                         "message": (
                             "Imported providers reference countries with no "
-                            f"master_stations rows that the station module does not "
-                            f"serve either (or it did not answer): {sorted(missing)}. "
-                            "Import them from Trainline first, then retry the bulk-import."
+                            f"master_stations rows: {sorted(missing)}, and "
+                            f"{_module_side()}. Import them "
+                            "from Trainline first, then retry the bulk-import."
                         ),
                     },
                 )

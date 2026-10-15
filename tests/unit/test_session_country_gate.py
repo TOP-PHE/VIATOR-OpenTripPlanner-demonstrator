@@ -85,12 +85,13 @@ def _providers(*countries: str) -> dict[str, Any]:
     }
 
 
-def _save(monkeypatch: pytest.MonkeyPatch, *countries: str) -> Any:
+def _save(monkeypatch: pytest.MonkeyPatch, *countries: str, stored: tuple[str, ...] = ()) -> Any:
     """The country gate of `patch_session`, as the route runs it (in a
-    worker thread, outside the event loop)."""
+    worker thread, outside the event loop), on a session whose stored
+    providers declare `stored`."""
     from app.models import Session as SessionRow
 
-    row = SessionRow(id="zz-session", name="Zz", config={})
+    row = SessionRow(id="zz-session", name="Zz", config=_providers(*stored))
     db = _Db(row)
     body = sessions.SessionPatch(config=_providers(*countries))
     monkeypatch.setattr(sessions.ingestion, "normalize_providers", _normalised)
@@ -138,12 +139,14 @@ def _actor() -> Any:
     return CurrentUser(id=uuid.uuid4(), username="zz@example.invalid", role="platform_admin")
 
 
-def _refusal(monkeypatch: pytest.MonkeyPatch, *countries: str) -> dict[str, Any] | None:
+def _refusal(
+    monkeypatch: pytest.MonkeyPatch, *countries: str, stored: tuple[str, ...] = ()
+) -> dict[str, Any] | None:
     """The 409 detail of the save, or None when the gate let it through."""
     from fastapi import HTTPException
 
     try:
-        _save(monkeypatch, *countries)
+        _save(monkeypatch, *countries, stored=stored)
     except HTTPException as refused:
         assert refused.status_code == 409
         return dict(refused.detail)
@@ -208,12 +211,91 @@ def test_without_the_module_configured_the_trainline_list_decides(
     assert module.requests == []
 
 
-def test_the_bulk_import_gate_awaits_the_same_rule(module: Module) -> None:
-    """`import_providers_from_nap` is a coroutine: it awaits
-    `station_module.countries()` (never the blocking form) for the gap."""
-    import inspect
+def test_a_country_already_saved_is_not_gated_again_when_the_module_is_down(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    """YY passed the gate when it was saved (the module served it then):
+    saving the session again while the module fails must not refuse it;
+    a country the save adds is still gated."""
+    module.response = httpx.Response(500, json={"error_id": "zz"})
 
-    source = inspect.getsource(sessions.import_providers_from_nap)
-    assert "_unserved(missing, await station_module.countries())" in source
-    assert asyncio.run(station_module.countries()) == frozenset({"YY"})
-    assert module.requests[0].method == "GET"
+    assert _refusal(monkeypatch, "YY", stored=("yy",)) is None
+    assert module.requests == []
+    detail = _refusal(monkeypatch, "YY", "XX", stored=("YY",))
+    assert detail is not None
+    assert detail["missing_countries"] == ["XX"]
+
+
+def test_the_message_tells_a_module_not_used_from_one_that_does_not_serve(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    module.response = httpx.Response(200, json={"countries": []})
+    served_not = _refusal(monkeypatch, "YY")
+    monkeypatch.setattr(settings, "station_module_url", "")
+    not_used = _refusal(monkeypatch, "YY")
+
+    assert served_not is not None
+    assert not_used is not None
+    assert "the station module does not serve them (or did not answer)" in served_not["message"]
+    assert "VIATOR does not use the station module" in not_used["message"]
+
+
+class _Imported:
+    """Stands in for `nap_importer.import_from_nap`: the providers it finds."""
+
+    def __init__(self, *countries: str) -> None:
+        self.providers = _providers(*countries)["sources"]["providers"]
+
+    async def __call__(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"providers": self.providers, "skipped": [], "warnings": []}
+
+
+def _import(monkeypatch: pytest.MonkeyPatch, *countries: str, stored: tuple[str, ...] = ()) -> Any:
+    """The bulk import's commit path, driven for real: the NAP fetch and the
+    allow-list stand in, the gate and everything before it run."""
+    from fastapi import HTTPException
+
+    from app.master import nap_importer
+    from app.models import Session as SessionRow
+
+    row = SessionRow(id="zz-session", name="Zz", config=_providers(*stored))
+    monkeypatch.setattr(nap_importer, "import_from_nap", _Imported(*countries))
+    monkeypatch.setattr(sessions, "_legacy_nap_url", lambda _db, _url: "https://nap.invalid/")
+    monkeypatch.setattr(sessions.ingestion, "normalize_providers", _normalised)
+    body = sessions.ImportFromNapBody(nap_url="https://nap.invalid/", preview=False)
+    try:
+        asyncio.run(
+            sessions.import_providers_from_nap("zz-session", body, _request(), _Db(row), _actor())
+        )
+    except HTTPException as refused:
+        assert refused.status_code == 409
+        return dict(refused.detail)
+    except _Reached:
+        return None
+    raise AssertionError("the import neither passed the gate nor was refused")
+
+
+def test_the_bulk_import_accepts_a_country_the_module_serves(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    assert _import(monkeypatch, "ZZ", "YY") is None
+    assert [r.url.path for r in module.requests] == ["/internal/v1/countries"]
+
+
+def test_the_bulk_import_refuses_a_country_served_by_neither(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    detail = _import(monkeypatch, "XX")
+
+    assert detail is not None
+    assert detail["error"] == "missing_master_stations_for_countries"
+    assert detail["missing_countries"] == ["XX"]
+
+
+def test_the_bulk_import_does_not_gate_a_country_already_saved(
+    monkeypatch: pytest.MonkeyPatch, module: Module, trainline: set[str]
+) -> None:
+    module.response = httpx.Response(500, json={"error_id": "zz"})
+
+    assert _import(monkeypatch, "XX", stored=("XX",)) is None
+    assert module.requests == []
