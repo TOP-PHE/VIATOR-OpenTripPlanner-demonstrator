@@ -53,8 +53,15 @@ VIATOR_ROW = {
     "uic": "9900002",
     "source": "viator",
 }
-# The same row on the page: the five fields.
-SHOWN_VIATOR_ROW = {key: value for key, value in VIATOR_ROW.items() if key != "source"}
+# The fields of the module's referential a row shows, all null when the
+# module gives none (a module from before them, or a Trainline row).
+NO_REFERENTIAL = {"viator_id": None, "uic_origin": None, "licence": None, "uic_origin_text": None}
+# The same rows on the page: the five fields, then the referential's.
+SHOWN_VIATOR_ROW = {
+    **{key: value for key, value in VIATOR_ROW.items() if key != "source"},
+    **NO_REFERENTIAL,
+}
+SHOWN_MODULE_ROW = {**MODULE_ROW, **NO_REFERENTIAL}
 
 LENGTH_REFUSED = "q must be 3 to 100 characters long"
 CONTROL_REFUSED = "q must not contain a control character or a lone surrogate"
@@ -174,7 +181,7 @@ def test_both_roles_of_the_page_are_served(
     answer = _post(client, {"q": "Zzville"}, cookies)
 
     assert answer.status_code == 200
-    assert answer.json() == {"origin": "msmm", "stations": [MODULE_ROW]}
+    assert answer.json() == {"origin": "msmm", "stations": [SHOWN_MODULE_ROW]}
 
 
 def test_an_end_user_is_refused_and_nothing_is_searched(
@@ -261,7 +268,7 @@ def test_the_module_rows_come_back_with_origin_msmm(
 
     answer = _post(client, {"q": "Zzville"}, cookies)
 
-    assert answer.json() == {"origin": "msmm", "stations": [MODULE_ROW]}
+    assert answer.json() == {"origin": "msmm", "stations": [SHOWN_MODULE_ROW]}
     assert fallback.calls == []
     assert json.loads(module.requests[0].content) == {"q": "Zzville"}
 
@@ -319,7 +326,7 @@ def test_a_station_has_the_five_fields_and_nothing_else(
 
     (row,) = _post(client, {"q": "Zzville"}, cookies).json()["stations"]
 
-    assert set(row) == set(stations.STATION_FIELDS)
+    assert set(row) == {*stations.STATION_FIELDS, "uic_origin_text"}
 
 
 # ───────────────────────────── the fallback ─────────────────────────────
@@ -537,7 +544,7 @@ def test_a_query_string_is_ignored(
         ROUTE, params={"page": "3", "size": "500", "country": "ZZ"}, json={"q": "Zzville"}
     )
 
-    assert answer.json() == {"origin": "msmm", "stations": [MODULE_ROW]}
+    assert answer.json() == {"origin": "msmm", "stations": [SHOWN_MODULE_ROW]}
     assert json.loads(module.requests[0].content) == {"q": "Zzville"}
     assert "page" not in str(module.requests[0].url)
 
@@ -599,3 +606,37 @@ def test_the_published_contract() -> None:
     assert schema["properties"] == {"q": {"type": "string", "title": "Q"}}
     assert schema["additionalProperties"] is False
     assert "parameters" not in operation
+
+
+# ── the contract with the module, phase 2 ──
+
+
+def test_a_module_station_comes_with_its_referential_and_the_origins_words(
+    client: TestClient, module_on: str, module: Module
+) -> None:
+    licence = {
+        "name": "zz-crd",
+        "position": "zz-crd",
+        "uic": "odbl:trainline",
+        "share_alike": ["uic"],
+        "attribution": ["Zz <b>Rail</b>"],
+    }
+    coded = {**MODULE_ROW, "viator_id": "ZZ-99001", "uic_origin": "TL", "licence": licence}
+    uncoded = {**MODULE_ROW, "uic": None, "viator_id": "ZZ-99004", "uic_origin": None}
+    module.response = httpx.Response(200, json={"stations": [coded, uncoded]})
+    _, cookies = _login()
+
+    first, second = _post(client, {"q": "Zzville"}, cookies).json()["stations"]
+
+    assert first == {
+        **MODULE_ROW,
+        "viator_id": "ZZ-99001",
+        "uic_origin": "TL",
+        "uic_origin_text": "from the Trainline list",
+        "licence": licence,
+    }
+    assert (second["uic"], second["viator_id"], second["uic_origin_text"]) == (
+        None,
+        "ZZ-99004",
+        None,
+    )
