@@ -26,6 +26,7 @@ import asyncio
 import io
 import json
 import os
+import random
 import threading
 import uuid
 import zipfile
@@ -153,27 +154,46 @@ def _make_session(client: TestClient, admin: dict[str, str], pids: list[str]) ->
         db.commit()
 
 
+# A fixed date for every zip entry: `writestr` with a bare name stamps the
+# current time (2-second resolution), so two builds of the "same" feed a
+# moment apart differ in their bytes and sha256, and a refresh rightly
+# downloads them as a new file. The fixtures must be the same file each time.
+_ZIP_DATE = (2026, 1, 1, 0, 0, 0)
+
+
 def _gtfs_bytes(padding: int = 0) -> bytes:
+    """An invented GTFS zip, byte-identical on every call for one `padding`."""
     buf = io.BytesIO()
+    members = {
+        "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n"
+        "ZZ,ZZ Rail,https://zz.invalid,UTC\n",
+        "stops.txt": "stop_id,stop_name,stop_lat,stop_lon\nZZ99,ZZ Halt,0.99,0.99\n",
+        "routes.txt": "route_id,agency_id,route_short_name,route_type\nR,ZZ,R,2\n",
+        "trips.txt": "route_id,service_id,trip_id\nR,WD,T\n",
+        "stop_times.txt": "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "T,1,ZZ99,08:00,08:00\n",
+    }
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(
-            "agency.txt",
-            "agency_id,agency_name,agency_url,agency_timezone\nZZ,ZZ Rail,https://zz.invalid,UTC\n",
-        )
-        z.writestr("stops.txt", "stop_id,stop_name,stop_lat,stop_lon\nZZ99,ZZ Halt,0.99,0.99\n")
-        z.writestr("routes.txt", "route_id,agency_id,route_short_name,route_type\nR,ZZ,R,2\n")
-        z.writestr("trips.txt", "route_id,service_id,trip_id\nR,WD,T\n")
-        z.writestr(
-            "stop_times.txt",
-            "trip_id,stop_sequence,stop_id,arrival_time,departure_time\nT,1,ZZ99,08:00,08:00\n",
-        )
+        for name, text in members.items():
+            z.writestr(zipfile.ZipInfo(name, _ZIP_DATE), text, compress_type=zipfile.ZIP_DEFLATED)
         if padding:
             z.writestr(
-                zipfile.ZipInfo("padding.bin"),
-                os.urandom(padding),
+                zipfile.ZipInfo("padding.bin", _ZIP_DATE),
+                random.Random(99).randbytes(padding),
                 compress_type=zipfile.ZIP_STORED,
             )
     return buf.getvalue()
+
+
+def test_the_fixture_feeds_are_the_same_file_every_time() -> None:
+    """The second refresh above expects "unchanged" (same sha256): a fixture
+    stamped with the current time would be a new file once the clock passes
+    a 2-second zip date step (main run 2d4de26 failed so)."""
+    first = _gtfs_bytes(padding=99)
+    for info in zipfile.ZipFile(io.BytesIO(first)).infolist():
+        assert info.date_time == _ZIP_DATE
+    assert _gtfs_bytes(padding=99) == first
+    assert _gtfs_bytes() == _gtfs_bytes()
 
 
 def _read(sid: str = SID) -> dict[str, Any]:
@@ -305,6 +325,10 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     assert r.status_code == 200, r.text
     again = _read()["providers"]
     assert (again["fetched"], again["unchanged"], again["failed"]) == (0, 2, 1)
+    assert sorted(u["key"] for u in r.json()["unchanged"]) == [
+        "provider[ZZBIG].timetable(gtfs)",
+        "provider[ZZRAIL].timetable(gtfs)",
+    ]
 
     # Never a URL, a token or a reason text, in the API or in the table.
     for blob in (json.dumps(done), json.dumps(seen), json.dumps(other_browser)):
