@@ -2610,9 +2610,10 @@ const HUB_CODES_API = '/api/admin/network-coverage/hubs';
 const HUB_CODES = { mode: null, skip: [], heldUntil: 0, proposeHeldUntil: 0, warnings: 0 };
 
 function hubCodeLabel(h) {
-  if (!h.uic) return 'No station code';
+  const id = h.station_id ? ` · VIATOR id ${h.station_id}` : '';
+  if (!h.uic) return h.station_id ? `No station code${id} (from the station module)` : 'No station code';
   const origin = h.uic_origin === 'msmm' ? 'from the station module' : 'typed by hand';
-  return `Station code ${h.uic} (${origin})`;
+  return `Station code ${h.uic} (${origin})${id}`;
 }
 
 // The code line of each hub row, as text (renderHubsTier leaves it empty).
@@ -2724,6 +2725,12 @@ function hubNameOrigin(candidate) {
   return candidate.shortened_name ? `by the shortened name «${candidate.shortened_name}»` : 'by name';
 }
 
+// What names a candidate's station: its code, or its VIATOR id when the
+// module serves it without a code.
+function hubCandidateKey(candidate) {
+  return candidate.uic || `VIATOR id ${candidate.station_id}`;
+}
+
 // Where a candidate comes from, and how far it stands from the hub.
 function hubCandidateOrigin(candidate) {
   const origin = candidate.found_by === 'name' ? hubNameOrigin(candidate) : 'by position';
@@ -2738,9 +2745,11 @@ function hubCandidateInput(proposal, candidate, kind) {
   const input = document.createElement('input');
   input.type = kind;
   input.name = `hub-code-${proposal.hub_id}`;
-  input.value = candidate.uic;
+  input.value = candidate.uic || candidate.station_id;
   input.dataset.hubId = proposal.hub_id;
-  label.append(input, ` ${candidate.name} · ${candidate.uic} · ${candidate.country_iso || '?'} · ${hubCandidateOrigin(candidate)}`);
+  input.dataset.uic = candidate.uic || '';
+  input.dataset.stationId = candidate.station_id || '';
+  label.append(input, ` ${candidate.name} · ${hubCandidateKey(candidate)} · ${candidate.country_iso || '?'} · ${hubCandidateOrigin(candidate)}`);
   if (!candidate.warning) return [label];
   const warning = hubCodesElement('div', `Warning: ${candidate.warning}`, 'hub-code-warning');
   HUB_CODES.warnings += 1;
@@ -2863,7 +2872,13 @@ async function resolveHubCodes() {
 async function confirmHubCodes() {
   const ticked = Array.from(document.querySelectorAll('#hub-codes-list input:checked'))
     .filter(input => input.value !== '');
-  const pairs = Array.from(ticked, input => ({ hub_id: input.dataset.hubId, uic: input.value }));
+  // The candidate's code and VIATOR id, each when it has one: the server
+  // stores the code and the current id the module answers.
+  const pairs = Array.from(ticked, input => ({
+    hub_id: input.dataset.hubId,
+    uic: input.dataset.uic || null,
+    station_id: input.dataset.stationId || null,
+  }));
   if (!pairs.length) {
     hubCodesStatus('Tick at least one code.', true);
     return;
@@ -2879,13 +2894,43 @@ async function confirmHubCodes() {
   }
 }
 
+// The licence of a station as the module answers it (read live, never
+// stored): each value's licence tag, share-alike flagged, then the
+// attribution texts of the timetable feeds. All text, never markup.
+const HUB_LICENCE_FIELDS = [['name', 'Name'], ['position', 'Position'], ['uic', 'Code']];
+function hubLicenceLines(licence) {
+  if (!licence) return ['Licence: none given by the station module.'];
+  const shareAlike = Array.isArray(licence.share_alike) ? licence.share_alike : [];
+  const tags = HUB_LICENCE_FIELDS
+    .filter(([field]) => licence[field])
+    .map(([field, label]) => `${label}: ${licence[field]}` + (shareAlike.includes(field) ? ' (share-alike)' : ''));
+  const lines = [`Licence: ${tags.join(' · ')}`];
+  const attribution = Array.isArray(licence.attribution) ? licence.attribution : [];
+  attribution.forEach(text => lines.push(`Attribution: ${text}`));
+  return lines;
+}
+
+// One hub of a check click: its station as the module answers it now.
 function hubCheckItem(result) {
   const item = hubCodesElement('div', undefined, 'hub-code-item');
-  item.append(hubCodesElement('strong', `${result.hub_name} · ${result.uic}`));
-  const note = result.state === 'not_served'
-    ? 'The station module does not serve this code (any more).'
-    : `The station module names it "${result.module_name}".`;
+  const key = result.uic || (result.station_id ? `VIATOR id ${result.station_id}` : 'no code');
+  item.append(hubCodesElement('strong', `${result.hub_name} · ${key}`));
+  let note = 'The station module serves it under this name.';
+  if (result.state === 'not_served') note = 'The station module does not serve this station (any more).';
+  else if (result.state === 'name_differs') note = `The station module names it "${result.module_name}".`;
   item.append(hubCodesElement('div', note, 'hub-code-note'));
+  if (result.state === 'not_served') return item;
+  if (result.replaced_id) {
+    item.append(hubCodesElement('div', `VIATOR id ${result.replaced_id} was merged into ${result.station_id} in the station module; the hub now keeps ${result.station_id}.`, 'hub-code-note'));
+  } else if (result.station_id) {
+    item.append(hubCodesElement('div', `VIATOR id ${result.station_id}`, 'hub-code-note'));
+  }
+  if (result.module_uic && result.module_uic !== result.uic) {
+    item.append(hubCodesElement('div', `The module gives this station the code ${result.module_uic}.`, 'hub-code-note'));
+  }
+  const origin = result.code_origin_text || (result.module_uic ? 'not given by the station module' : 'no code');
+  item.append(hubCodesElement('div', `Code origin: ${origin}`, 'hub-code-note'));
+  hubLicenceLines(result.licence).forEach(line => item.append(hubCodesElement('div', line, 'hub-code-note')));
   return item;
 }
 
@@ -2894,10 +2939,14 @@ async function checkHubCodes() {
   const answer = await postHubCodes('check', { skip: HUB_CODES.skip });
   const results = answer.results || [];
   results.forEach(r => HUB_CODES.skip.push(r.hub_id));
-  const shown = results.filter(r => r.state !== 'ok');
+  // Every hub is listed, with the origin and the licence the module gives
+  // its station now; those to look at are counted.
+  const toLook = results.filter(r => r.state !== 'ok');
+  const moved = results.filter(r => r.replaced_id).length;
   const list = document.getElementById('hub-codes-list');
-  shown.forEach(r => list.append(hubCheckItem(r)));
-  showHubCodesAnswer(answer, `${results.length} code(s) checked, ${shown.length} to look at. Nothing was changed.`);
+  results.forEach(r => list.append(hubCheckItem(r)));
+  const changed = moved ? ` ${moved} VIATOR id(s) moved to the station they were merged into.` : ' No code was changed.';
+  showHubCodesAnswer(answer, `${results.length} code(s) checked, ${toLook.length} to look at.${changed}`);
   showHubCodesNext(answer.left, 'Check the next hubs');
 }
 

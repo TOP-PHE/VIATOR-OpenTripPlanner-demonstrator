@@ -321,3 +321,19 @@ def test_a_typed_code_is_stored_as_manual_and_cleared_by_null(
     assert test_client.patch(f"{BASE}/zz-b-1", json={"uic": None}).status_code == 200
     assert _row(fresh_db, "zz-b-1")[:2] == (None, None)
     assert module.requests == []  # a typed code is not looked up
+
+
+def test_a_hub_with_a_viator_id_and_no_code_counts_as_resolved(db: Session) -> None:
+    """The contract's phase 2: a hub may hold the module's VIATOR id alone
+    (a station the module serves without a code); a check looks at it, a
+    resolve does not."""
+    from app.api.admin.network_coverage import _hubs_to_look_at
+    from app.models import NetworkCoverageHub
+
+    hub = db.get(NetworkCoverageHub, "zz-a-2")
+    assert hub is not None
+    hub.station_id = "ZZ-99004"
+    db.commit()
+
+    assert "zz-a-2" not in _ids(_hubs_to_look_at(db, resolved=False, skip=[]))
+    assert _ids(_hubs_to_look_at(db, resolved=True, skip=[])) == ["zz-a-2", "zz-a-3", "zz-b-1"]
