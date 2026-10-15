@@ -14,7 +14,9 @@ bit (or would bite) an automated download:
 
   1. conditional GET — the ETag / Last-Modified from the previous fetch of
      the same URL are replayed; a 304 means "unchanged";
-  2. retries with backoff on transport errors and 429/5xx;
+  2. retries with backoff on transport errors and 429/5xx; a body cut part
+     way is resumed with a range request from the first missing byte, under
+     If-Range so that bytes of two versions are never mixed (`_download`);
   3. a format check before anything touches the slot — zip / gzip / PBF
      magic bytes, then `detect.detect` must agree with the declared kind (a
      `.xml.gz` or plain `.xml` NeTEx, as the Italian NAP serves them, is
@@ -41,7 +43,8 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,8 +68,22 @@ _EMPTY_ZIP_MAGIC = b"PK\x05\x06"
 _GZIP_MAGIC = b"\x1f\x8b"
 
 # Seconds to wait before retry 1, 2, … — module-level so tests can zero it.
+# A retry downloads the file again from byte 0.
 RETRY_DELAYS: tuple[float, ...] = (2.0, 10.0)
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Seconds to wait before resume 1, 2, … of a body cut part way (a range
+# request from the first missing byte, see `_download`). More resumes than
+# retries: a national archive of ~2 GB that a server cuts at about the same
+# point every time can never arrive from byte 0.
+RESUME_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0, 20.0, 30.0, 30.0, 30.0, 30.0)
+# Resume attempts in a row that bring no new byte before the download is given up.
+MAX_STALLED_RESUMES = 2
+# Seconds to wait after a 429/5xx answer to a resume request, before asking
+# again. A busy server is not a stalled transfer: these answers count neither
+# as a resume nor as "no progress", so two quick 503s never throw away the
+# gigabyte already on disk; they have this budget of their own.
+RESUME_BUSY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 120.0)
+_CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 # What a fetch-state file name may be once unsafe characters are replaced:
@@ -88,6 +105,7 @@ class FetchResult:
     size_bytes: int = 0
     sha256: str | None = None
     state: dict[str, Any] = field(default_factory=dict)
+    resumes: int = 0  # resume requests (a range from the first missing byte) on the way
 
 
 # ──────────────────────────── fetch state ────────────────────────────
@@ -285,38 +303,167 @@ def _download_error(exc: httpx.HTTPError, fetch_url: str, state_url: str) -> str
     baked into it (query-param auth)."""
     if isinstance(exc, httpx.HTTPStatusError):
         response = exc.response
-        return f"download failed: HTTP {response.status_code} {response.reason_phrase}".rstrip()
-    message = str(exc) or type(exc).__name__
-    if fetch_url != state_url:
-        message = message.replace(fetch_url, state_url)
+        message = f"HTTP {response.status_code} {response.reason_phrase}".rstrip()
+    else:
+        message = str(exc) or type(exc).__name__
+        if fetch_url != state_url:
+            message = message.replace(fetch_url, state_url)
     return f"download failed: {message}"
 
 
 # ──────────────────────────── download ────────────────────────────
 
 
-async def _stream_to(
-    client: httpx.AsyncClient, url: str, headers: dict[str, str], dest: Path
-) -> tuple[int, httpx.Headers, str, int]:
-    """One GET attempt. Returns (status, headers, sha256, size); body lands in
-    `dest` only for a 2xx."""
-    async with client.stream("GET", url, headers=headers) as response:
-        if response.status_code == 304:
-            return 304, response.headers, "", 0
-        response.raise_for_status()
-        digest = hashlib.sha256()
-        size = 0
-        # File I/O off the event loop: feeds run to ~2 GB (DE DELFI) and a
-        # slow disk must not stall every other request the web process serves.
-        out = await asyncio.to_thread(dest.open, "wb")
+class _Restart(Exception):
+    """The partial file cannot be continued (the server sent another version,
+    another range, or no range at all): download again from byte 0."""
+
+
+@dataclass
+class _Download:
+    status: int  # 2xx, or 304 for "not modified"
+    headers: httpx.Headers  # of the response that started the kept bytes
+    sha256: str
+    size: int
+    resumes: int = 0
+
+
+@dataclass
+class _Transfer:
+    """The bytes of one version of the file written so far to `dest`.
+
+    `total` is the full size the server announced (Content-Length of a plain,
+    not content-encoded 200), `validator` the strong ETag or Last-Modified that
+    an If-Range must name so that a resume never appends bytes of another
+    version. Without both, a cut body cannot be resumed."""
+
+    dest: Path
+    status: int = 0
+    headers: httpx.Headers = field(default_factory=httpx.Headers)
+    digest: Any = field(default_factory=hashlib.sha256)
+    size: int = 0
+    total: int | None = None
+    validator: str | None = None
+    ranges: bool = False
+    limit: int | None = None  # byte offset the current response may not pass
+
+    def start(self, response: httpx.Response) -> None:
+        """A full response from byte 0, on a new `_Transfer` (a restart always
+        makes one, so no earlier byte is ever counted or hashed)."""
+        self.status = response.status_code
+        self.headers = response.headers
+        self.total = _full_length(response)
+        self.validator = _range_validator(response.headers)
+        self.ranges = _ranges_offered(response.headers)
+        self.limit = self.total
+
+    @property
+    def resumable(self) -> bool:
+        return (
+            self.ranges
+            and self.validator is not None
+            and self.total is not None
+            and 0 < self.size < self.total
+        )
+
+    def accept_range(self, response: httpx.Response) -> None:
+        """Check a 206 continues exactly where the file stops, for the same
+        full size; raise _Restart otherwise."""
+        m = _CONTENT_RANGE_RE.fullmatch(response.headers.get("content-range", "").strip())
+        if m is None:
+            raise _Restart("unreadable Content-Range")
+        start, end, total = int(m[1]), int(m[2]), m[3]
+        if start != self.size:
+            raise _Restart(f"range starts at byte {start}, not {self.size}")
+        if total != str(self.total) or end < start or end >= int(total):
+            raise _Restart(f"range {start}-{end}/{total} is not the announced file")
+        self.limit = end + 1
+
+    async def append(self, response: httpx.Response, mode: str) -> None:
+        """Stream the body to disk (never held in memory) and into the hash."""
+        out = await asyncio.to_thread(self.dest.open, mode)
         try:
             async for chunk in response.aiter_bytes(1024 * 1024):
+                if self.limit is not None and self.size + len(chunk) > self.limit:
+                    raise FetchError(
+                        f"download failed: size mismatch, the server sent more than "
+                        f"the {self.limit} bytes it announced"
+                    )
+                # File I/O off the event loop: feeds run to ~2 GB (DE DELFI) and
+                # a slow disk must not stall every other request the web serves.
                 await asyncio.to_thread(out.write, chunk)
-                digest.update(chunk)
-                size += len(chunk)
+                self.digest.update(chunk)
+                self.size += len(chunk)
         finally:
             await asyncio.to_thread(out.close)
-        return response.status_code, response.headers, digest.hexdigest(), size
+        if self.total is not None and self.size < self.total:
+            # The body ended early without a transport error (h11 normally
+            # raises this itself): the same case as a cut connection.
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body "
+                f"(received {self.size} bytes, expected {self.total})"
+            )
+
+    def result(self) -> _Download:
+        return _Download(self.status, self.headers, self.digest.hexdigest(), self.size)
+
+
+def _full_length(response: httpx.Response) -> int | None:
+    """Size of the full file, or None when unknown. A content-encoded body is
+    decoded by httpx, so its byte count says nothing about the file's size
+    and its ranges would count encoded bytes: never resumed."""
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    if encoding not in ("", "identity"):
+        return None
+    try:
+        length = int(response.headers.get("content-length", ""))
+    except ValueError:
+        return None
+    return length if length > 0 else None
+
+
+def _range_validator(headers: httpx.Headers) -> str | None:
+    """What If-Range names: a strong ETag, else Last-Modified. A weak ETag
+    never matches an If-Range (RFC 9110 13.1.5), so it cannot serve. A
+    Last-Modified serves only when it is strong by RFC 9110 8.8.2.2: at least
+    one second before the response's Date (a file changed twice within that
+    second would carry the same date); no Date, no resume."""
+    etag = str(headers.get("etag") or "")
+    if etag and not etag.startswith("W/"):
+        return etag
+    modified = str(headers.get("last-modified") or "")
+    date = str(headers.get("date") or "")
+    if not modified:
+        return None
+    try:  # a missing Date parses as an error too
+        if parsedate_to_datetime(date) - parsedate_to_datetime(modified) < timedelta(seconds=1):
+            return None
+    except (TypeError, ValueError):  # unreadable date, or one with and one without a zone
+        return None
+    return modified
+
+
+def _ranges_offered(headers: httpx.Headers) -> bool:
+    """`Accept-Ranges: bytes`, or no Accept-Ranges at all (then a Range
+    request is tried and the answer, 206 or 200, decides); `none` refuses."""
+    raw = headers.get("accept-ranges")
+    if raw is None:
+        return True
+    return "bytes" in {token.strip().lower() for token in raw.split(",")}
+
+
+def _resume_headers(headers: dict[str, str], transfer: _Transfer) -> dict[str, str]:
+    """The request headers minus the conditional-GET pair (an If-None-Match
+    could turn the resume into a 304), plus the range from the first missing
+    byte under If-Range: a changed file answers 200 and is never mixed in."""
+    kept = {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in ("if-none-match", "if-modified-since", "range", "if-range")
+    }
+    kept["Range"] = f"bytes={transfer.size}-"
+    kept["If-Range"] = transfer.validator or ""
+    return kept
 
 
 def _retryable(exc: Exception) -> bool:
@@ -325,20 +472,204 @@ def _retryable(exc: Exception) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
-async def _stream_with_retry(
-    client: httpx.AsyncClient, url: str, headers: dict[str, str], dest: Path
-) -> tuple[int, httpx.Headers, str, int]:
-    attempt = 0
+async def _get_full(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], transfer: _Transfer
+) -> bool:
+    """GET from byte 0. False for a 304 (nothing written)."""
+    async with client.stream("GET", url, headers=headers) as response:
+        if response.status_code == 304:
+            transfer.status, transfer.headers = 304, response.headers
+            return False
+        response.raise_for_status()
+        transfer.start(response)
+        await transfer.append(response, "wb")
+    return True
+
+
+async def _get_rest(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], transfer: _Transfer
+) -> None:
+    """GET the missing bytes and append them; _Restart when the answer is
+    not the continuation of the same file."""
+    on_disk = await asyncio.to_thread(lambda: transfer.dest.stat().st_size)
+    if on_disk != transfer.size:
+        raise _Restart(f"partial file holds {on_disk} bytes, not {transfer.size}")
+    async with client.stream("GET", url, headers=_resume_headers(headers, transfer)) as response:
+        if response.status_code == 206:
+            transfer.accept_range(response)
+            await transfer.append(response, "ab")
+            return
+        # 200: the server ignores ranges, or the file changed (If-Range).
+        # 416 or anything else but an error: start again rather than fail.
+        if response.status_code >= 400 and response.status_code != 416:
+            response.raise_for_status()
+        raise _Restart(f"server answered {response.status_code} to a range request")
+
+
+@dataclass
+class _Attempts:
+    """What the retries have used so far, for one download."""
+
+    restarts: int = 0
+    resumes: int = 0
+    stalled: int = 0  # consecutive resume attempts that brought no byte
+    busy: int = 0  # 429/5xx answers to resume requests (own budget, RESUME_BUSY_DELAYS)
+
+
+async def _download(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    dest: Path,
+    *,
+    state_url: str,
+) -> _Download:
+    """Download `url` into `dest`, riding out cuts. Raises FetchError (and
+    deletes `dest`) when it gives up.
+
+    A transport error or a retryable status restarts from byte 0 at most
+    `len(RETRY_DELAYS)` times, as before. A body cut after some bytes is
+    resumed instead when the server allows it (see `_Transfer.resumable`): up
+    to `len(RESUME_DELAYS)` resumes, each with its wait, given up after
+    `MAX_STALLED_RESUMES` resumes in a row that bring no new byte. A 429/5xx
+    answer to a resume request is waited out on its own budget
+    (`RESUME_BUSY_DELAYS`), the partial file kept. Each request keeps the
+    client's own timeouts.
+    """
+    try:
+        return await _download_into(client, url, headers, dest, state_url)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+async def _download_into(
+    client: httpx.AsyncClient, url: str, headers: dict[str, str], dest: Path, state_url: str
+) -> _Download:
+    # The file's own bytes, never a content-coded transfer, on every request:
+    # the byte count is then an offset into the file, so a cut can be resumed
+    # (a `.xml.gz` on the server is a file, not a coding: it arrives as is).
+    headers = {**headers, "Accept-Encoding": "identity"}
+    transfer = _Transfer(dest)
+    tried = _Attempts()
     while True:
+        before = transfer.size
+        resuming = transfer.resumable
         try:
-            return await _stream_to(client, url, headers, dest)
+            result = await _attempt(client, url, headers, transfer, resuming)
+            result.resumes = tried.resumes
+            return result
+        except _Restart as exc:
+            log.info("fetch resume refused (%s), restarting from byte 0", exc)
+            transfer = _Transfer(dest)
+            await _next_restart(tried, f"download failed: {exc}", exc)
         except httpx.HTTPError as exc:
-            dest.unlink(missing_ok=True)
-            if attempt >= len(RETRY_DELAYS) or not _retryable(exc):
-                raise
-            log.info("fetch retry %d after %s", attempt + 1, type(exc).__name__)
-            await asyncio.sleep(RETRY_DELAYS[attempt])
-            attempt += 1
+            reason = _download_error(exc, url, state_url)
+            if not await _ride_out(tried, transfer, before, resuming, reason, exc):
+                transfer = _Transfer(dest)
+
+
+async def _ride_out(
+    tried: _Attempts,
+    transfer: _Transfer,
+    before: int,
+    resuming: bool,
+    reason: str,
+    exc: httpx.HTTPError,
+) -> bool:
+    """Wait after a failed request, or raise FetchError to give up. True:
+    the next request continues `transfer`; False: it starts from byte 0."""
+    if not _retryable(exc):
+        raise FetchError(f"{reason}{_resumed_note(tried.resumes)}") from exc
+    if resuming and isinstance(exc, httpx.HTTPStatusError):
+        await _wait_busy(tried, transfer, reason, exc)
+        return True
+    if resuming or transfer.resumable:
+        await _next_resume(tried, transfer, before, reason, exc)
+        return True
+    await _next_restart(tried, reason, exc)
+    return False
+
+
+async def _attempt(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    transfer: _Transfer,
+    resuming: bool,
+) -> _Download:
+    """One request: the rest of the file, or all of it."""
+    if resuming:
+        await _get_rest(client, url, headers, transfer)
+    elif not await _get_full(client, url, headers, transfer):
+        return _Download(304, transfer.headers, "", 0)
+    return transfer.result()
+
+
+async def _next_restart(tried: _Attempts, reason: str, exc: Exception) -> None:
+    """Wait before the next download from byte 0, or give up with `reason`."""
+    if tried.restarts >= len(RETRY_DELAYS):
+        raise FetchError(f"{reason}{_resumed_note(tried.resumes)}") from exc
+    log.info("fetch retry %d after %s", tried.restarts + 1, type(exc).__name__)
+    await asyncio.sleep(RETRY_DELAYS[tried.restarts])
+    tried.restarts += 1
+    tried.stalled = 0
+
+
+async def _next_resume(
+    tried: _Attempts, transfer: _Transfer, before: int, reason: str, exc: Exception
+) -> None:
+    """Wait before resuming `transfer` at its first missing byte, or give up:
+    no resume left, or `MAX_STALLED_RESUMES` resumes in a row brought nothing.
+    `reason` is the operator-facing text of the last error."""
+    tried.stalled = tried.stalled + 1 if transfer.size == before else 0
+    where = f"stopped at byte {transfer.size} of {transfer.total}"
+    if tried.stalled >= MAX_STALLED_RESUMES:
+        raise FetchError(
+            f"{reason}; no progress in {tried.stalled} resume attempts in a row, "
+            f"{where}{_resumed_note(tried.resumes)}"
+        ) from exc
+    if tried.resumes >= len(RESUME_DELAYS):
+        raise FetchError(
+            f"{reason}; gave up after {tried.resumes} resumes, {where}"
+            f"{_resumed_note(tried.resumes)}"
+        ) from exc
+    log.info(
+        "fetch resume %d from byte %d of %d after %s",
+        tried.resumes + 1,
+        transfer.size,
+        transfer.total,
+        type(exc).__name__,
+    )
+    await asyncio.sleep(RESUME_DELAYS[tried.resumes])
+    tried.resumes += 1
+
+
+async def _wait_busy(
+    tried: _Attempts, transfer: _Transfer, reason: str, exc: httpx.HTTPStatusError
+) -> None:
+    """A resume request answered 429/5xx: wait and ask again for the same
+    range, or give up once `RESUME_BUSY_DELAYS` is spent. Neither a resume
+    nor a stall: the server answered, it just could not serve now."""
+    if tried.busy >= len(RESUME_BUSY_DELAYS):
+        raise FetchError(
+            f"{reason}; server still busy after {tried.busy} waits, stopped at byte "
+            f"{transfer.size} of {transfer.total}{_resumed_note(tried.resumes)}"
+        ) from exc
+    log.info(
+        "fetch resume waits for a busy server (HTTP %d) at byte %d of %d",
+        exc.response.status_code,
+        transfer.size,
+        transfer.total,
+    )
+    await asyncio.sleep(RESUME_BUSY_DELAYS[tried.busy])
+    tried.busy += 1
+
+
+def _resumed_note(resumes: int) -> str:
+    if not resumes:
+        return ""
+    return f" (resumed {resumes} time{'s' if resumes > 1 else ''})"
 
 
 async def fetch_validated(
@@ -371,10 +702,13 @@ async def fetch_validated(
             headers["If-Modified-Since"] = previous["last_modified"]
 
     raw = staging / f"{base_name}.download"
-    try:
-        status, resp_headers, sha, size = await _stream_with_retry(client, fetch_url, headers, raw)
-    except httpx.HTTPError as exc:
-        raise FetchError(_download_error(exc, fetch_url, state_url)) from exc
+    download = await _download(client, fetch_url, headers, raw, state_url=state_url)
+    status, resp_headers, sha, size = (
+        download.status,
+        download.headers,
+        download.sha256,
+        download.size,
+    )
 
     checked = {**previous, "checked_at": _now_iso()}
     if status == 304:
@@ -427,7 +761,14 @@ async def fetch_validated(
         new_state["structure"] = await asyncio.to_thread(
             _structure_check, final, previous.get("structure")
         )
-    return FetchResult(status="fetched", path=final, size_bytes=size, sha256=sha, state=new_state)
+    return FetchResult(
+        status="fetched",
+        path=final,
+        size_bytes=size,
+        sha256=sha,
+        state=new_state,
+        resumes=download.resumes,
+    )
 
 
 def _slot_identity(final: Path, size: int, sha: str) -> dict[str, Any]:
