@@ -1047,6 +1047,44 @@ log (`storage.cleanup`). Docker images are not covered: on the host, `docker ima
 old `viator-web` / `viator-otp` tags. Since PR #283 a failed build deletes its own folder; before it,
 failed Europe imports filled the disk on 2026-10-01 and took the site down.
 
+### 5.7 Watching a refresh (issue #359)
+
+**Refresh providers** on a large session (about a hundred feeds) runs for many minutes, and
+**Refresh OSM** downloads gigabytes. Under the two buttons (Sessions page, a session row expanded,
+Configure section) a **progress block** shows what the server is doing. The server keeps it in the
+database, one record per session for the latest provider refresh and one for the latest OSM
+refresh: a page reload, another tab or another browser shows the same block, and it stays after the
+refresh with its end result until the next refresh of the same kind. The page reads it when the row
+is expanded, every 2.5 s while a refresh runs, every 10 s while only the station-module follow-up
+runs, and stops once everything has ended.
+
+What the block says:
+
+| Line | Meaning |
+|---|---|
+| Running — *done* / *total* done · *n* failed · *elapsed* | *total* counts every download of the refresh (timetable, MCT, stations CSV of each `url` or `nap` provider) and each derived (`cross_border_filter`) provider; *done* those already over |
+| Now: `provider[ZZRAIL].timetable(gtfs)` — 12.0 MB of 99.0 MB (12 %) | the download under way; "of …" only when the server announced the file's size, else "… received"; "Now: cross-border filters" while the derived providers are made |
+| Finished *time* — *n* fetched · *n* unchanged · *n* failed (took …) | **fetched**: a new file went into the slot and a rebuild was queued; **unchanged**: the server's file is the one already in the slot (HTTP 304 or the same sha256), nothing rotated, no rebuild; **failed**: no new file (the download, the format check, the NAP lookup or the dispatch failed: the slot keeps its previous file). The refresh's answer and the Feed status panel call a failed task "⚠ skipped"; the panel's **Last result** gives the reason, the block never does |
+| Failed: … | the labels of the failed tasks (at most 50), never a reason or an address |
+| Stopped by an unexpected error (…) | the refresh itself broke (a 500): the type of the error, the tasks done and those **not reached** (never started); see the web log |
+| Interrupted — no news from the server since … | the record stopped being updated: the `web` process restarted or died while the refresh ran. A running refresh writes a heartbeat at least every 30 s; after **5 minutes** without one the record is shown interrupted and a new refresh may start. The downloads done before stay in their slots |
+| The refresh before this one was interrupted | the record a new refresh replaced was an interrupted one |
+| Station module: … | after a provider refresh, the stop extracts sent to the station module (11.5): **queued** (waiting for the web process's sender), then *handled* / *total* feeds with the counts **sent**, **already held**, **refused**, **module unavailable**, **skipped** and their reason words (for example `budget 1`), the provider being sent, and at the end **finished** (or **cancelled**, **stopped by an error**); **not configured** without `STATION_MODULE_URL` / `STATION_MODULE_TOKEN`. The column **Station module** of the Feed status panel still gives each provider's last outcome |
+
+**One refresh of a kind at a time per session.** A second **Refresh providers** while one runs (a
+double click, another admin, another tab) is refused: the toast says *A provider refresh of this
+session is already running (started at …)* and the block shows the running one (HTTP 409,
+`refresh_already_running`). It is not joined: the running refresh belongs to another request, and
+the block already shows everything. **Refresh OSM** has its own record: an OSM refresh may run
+beside a provider refresh, not beside another OSM refresh; a refused OSM click rotates nothing. The
+per-provider **Refresh** button of a card is not counted or blocked here.
+
+The record holds labels (built from the session's provider ids) and counts only: never a URL, a
+token or a skip reason. Its table, `source_refresh_progress`, comes with migration
+`20261015_1800_refresh_progress` (back up before deploying, as for every migration, §5.2); a
+downgrade drops only this table. API: `GET /api/sessions/<sid>/sources/progress` (content managers,
+like the buttons).
+
 ---
 
 ## 6. Troubleshooting

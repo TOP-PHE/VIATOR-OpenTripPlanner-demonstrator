@@ -390,6 +390,8 @@ The worker has an APScheduler-style cron that pulls fresh files on the configure
 
 For MERITS (when wired), the same shape applies — `kind: "MERITS-..."` with auth headers stored in `sessions.config.merits_credentials_ref` (a Postgres-stored encrypted secret reference).
 
+**Refresh progress (issue #359; `app/refresh_progress.py`, table `source_refresh_progress`).** One row per session and kind (`providers`, `osm`), overwritten by the next refresh of that kind: `run_id`, `state` (running / finished / failed / interrupted), `started_at`, `heartbeat_at`, `finished_at` (PostgreSQL's clock), `detail` (JSONB: `total`, `done`, `fetched`, `unchanged`, `failed`, `not_reached`, `phase`, `current` = the task label with `bytes` and `expected`, `failed_keys` ≤ 50 labels, `error` = an exception's type name, `previous` when it replaced an interrupted record) and `extract` (JSONB: the station-module pass that follows a whole-session provider refresh: queued / running / finished / cancelled / error / off, `total`, `handled`, counts per outcome, `reasons` = reason word → count, `current` provider). `refresh_sources` and `refresh_osm` claim the row before any work (`INSERT … ON CONFLICT DO UPDATE … WHERE state <> 'running'`, the row locked; refused with 409 `{"error": "refresh_already_running", "scope", "started_at", "message"}`, never joined), write each task's start and outcome, the bytes of the download under way (from `feed_fetch.download_progress`, at most every 2 s or 5 % of the file), beat a heartbeat every 30 s, and end finished, failed (an exception) or interrupted (cancelled). A running row with no heartbeat for 5 minutes is marked interrupted by the next read or claim, and a new refresh may take it; every write is fenced by `run_id` and `state = 'running'`, so the old refresh can no longer change it. The POST answers as before (synchronously); `GET /api/sessions/{sid}/sources/progress` returns `{providers, osm, now}` for the Sessions page, which polls it while something runs. Labels and counts only: never a URL, a token or a reason text. Migration `20261015_1800_refresh_progress` (re-runnable; downgrade drops the table).
+
 
 ### 5.2 The stop extract for the station module (MSMM 22.2)
 
@@ -1149,6 +1151,9 @@ The audit row records `action=user.created` with `metadata={email, role, name}` 
 | `GET /api/sessions/<id>/uploads` | — | `[ uploads ]` | logged-in |
 | `POST /api/sessions/<id>/rebuilds` | — | `201 { job }` | content_manager, platform_admin |
 | `GET /api/sessions/<id>/rebuilds` | — | `[ jobs ]` | logged-in |
+| `POST /api/sessions/<id>/sources/refresh` | — | `200 { fetched, unchanged, skipped, orphaned, cascaded }`; `409 refresh_already_running` while one runs | content_manager, platform_admin |
+| `POST /api/sessions/<id>/sources/osm/refresh` | — | `200 { fetched, skipped, rotated }`; `409 refresh_already_running` while one runs | content_manager, platform_admin |
+| `GET /api/sessions/<id>/sources/progress` | — | `200 { providers, osm, now }`: the latest refresh record of each kind (issue #359) | content_manager, platform_admin |
 
 ### 9.4 Journey
 
