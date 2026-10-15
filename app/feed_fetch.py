@@ -565,16 +565,30 @@ async def _download_into(
             await _next_restart(tried, f"download failed: {exc}", exc)
         except httpx.HTTPError as exc:
             reason = _download_error(exc, url, state_url)
-            if not _retryable(exc):
-                raise FetchError(f"{reason}{_resumed_note(tried.resumes)}") from exc
-            if resuming and isinstance(exc, httpx.HTTPStatusError):
-                await _wait_busy(tried, transfer, reason, exc)
-                continue
-            if resuming or transfer.resumable:
-                await _next_resume(tried, transfer, before, reason, exc)
-                continue
-            transfer = _Transfer(dest)
-            await _next_restart(tried, reason, exc)
+            if not await _ride_out(tried, transfer, before, resuming, reason, exc):
+                transfer = _Transfer(dest)
+
+
+async def _ride_out(
+    tried: _Attempts,
+    transfer: _Transfer,
+    before: int,
+    resuming: bool,
+    reason: str,
+    exc: httpx.HTTPError,
+) -> bool:
+    """Wait after a failed request, or raise FetchError to give up. True:
+    the next request continues `transfer`; False: it starts from byte 0."""
+    if not _retryable(exc):
+        raise FetchError(f"{reason}{_resumed_note(tried.resumes)}") from exc
+    if resuming and isinstance(exc, httpx.HTTPStatusError):
+        await _wait_busy(tried, transfer, reason, exc)
+        return True
+    if resuming or transfer.resumable:
+        await _next_resume(tried, transfer, before, reason, exc)
+        return True
+    await _next_restart(tried, reason, exc)
+    return False
 
 
 async def _attempt(
