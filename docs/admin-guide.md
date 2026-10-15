@@ -2580,15 +2580,17 @@ containers (the worker since MSMM decision 6, 11.3):
   for now (VIATOR issue #331). The daily Trainline import (04:00 UTC) keeps
   it fresh, as does **Refresh from Trainline** on the Stations page. No
   station of the module is copied into it.
-- **The country check of sessions.** Saving a session's providers (Save
-  config, or the bulk import from a NAP) checks the country each provider
-  declares. A country passes when VIATOR's Trainline list has stations in
+- **The country check of sessions.** Creating a session with providers,
+  saving a session's providers (Save config) and the bulk import from a
+  NAP check the country each provider declares. A country passes when VIATOR's Trainline list has stations in
   it, **or when the station module serves stations in it** (the module's
   design, decision D-R12 B): VIATOR asks the module for the countries of
   its served stations only when the Trainline list lacks one, and keeps the
   answer one minute. Only the countries a save adds are checked: a country
   already among the session's saved providers passed when it was saved,
-  and is never refused later because the module is down. A country neither
+  and is never refused later because the module is down (the warning that
+  the OSM file may not cover a country still looks at every declared
+  country). A country neither
   knows is refused as before, with the same message code
   (`missing_master_stations_for_countries`) and the same advice: refresh
   from Trainline; the message says whether VIATOR does not use the module,
@@ -2810,7 +2812,9 @@ uses the module (platform administrators only):
   and the hub has a code, the code is asked in a second lookup (up to 20
   more calls on your limits) and shown, with "The station module no longer
   answers VIATOR id …": the hub keeps the id; confirm the station again or
-  forget the id. When the module does not answer, the panel says so and
+  forget the id. When that second lookup fails (a limit, a timeout, an
+  error), the hub is shown as not answered, with the time to wait the
+  module gives, never as not served, and nothing is written for it. When the module does not answer, the panel says so and
   the hubs work as before (the coverage runner never asks the module).
   With a module older than this contract the check and the save ask by
   code only, as before; when a hub has an id, that module refuses the first
