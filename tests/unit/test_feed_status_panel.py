@@ -28,6 +28,14 @@ TEMPLATE = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin" /
 LABEL = "provider[SNCF].timetable(gtfs)"
 
 
+def _gtfs_zip_member_text() -> bytes:
+    """A GTFS file of 3 MiB of invented rows: big enough to be cut mid-body."""
+    row = b"ZZ1,ZZ invented agency,https://zz.example,Europe/Paris\n"
+    return b"agency_id,agency_name,agency_url,agency_timezone\n" + row * (
+        3 * 1024 * 1024 // len(row)
+    )
+
+
 def _gtfs_zip() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
@@ -101,6 +109,50 @@ async def test_a_recorded_failure_does_not_make_a_304_trusted(inbox: Path) -> No
         )  # type: ignore[arg-type]
     assert out["status"] == "fetched"
     assert "if-none-match" not in seen[0].headers
+
+
+async def test_a_resumed_download_records_how_often(
+    inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body cut part way and resumed (app/feed_fetch.py): the count reaches
+    the panel's "Last result"; a download without a cut records none."""
+    monkeypatch.setattr(feed_fetch, "RESUME_DELAYS", (0.0,))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(zipfile.ZipInfo("agency.txt"), _gtfs_zip_member_text())
+        for name in ("stops.txt", "routes.txt", "trips.txt", "stop_times.txt"):
+            z.writestr(name, "id\n1\n")
+    body = buf.getvalue()
+    cut = [True]
+
+    async def stream(data: bytes, cut_after: int | None) -> Any:
+        yield data[: cut_after if cut_after is not None else len(data)]
+        if cut_after is not None:
+            raise httpx.ReadError("zz cut")
+
+    def server(request: httpx.Request) -> httpx.Response:
+        headers = {"ETag": '"zz-v1"', "Accept-Ranges": "bytes"}
+        wanted = request.headers.get("range")
+        if wanted:
+            start = int(wanted.removeprefix("bytes=").removesuffix("-"))
+            headers["Content-Range"] = f"bytes {start}-{len(body) - 1}/{len(body)}"
+            headers["Content-Length"] = str(len(body) - start)
+            return httpx.Response(206, headers=headers, content=stream(body[start:], None))
+        headers["Content-Length"] = str(len(body))
+        cut_after = 2 * 1024 * 1024 if cut.pop() else None
+        return httpx.Response(200, headers=headers, content=stream(body, cut_after))
+
+    task = sessions_api._RefreshTask(LABEL, "GTFS", "https://x.example/sncf.zip", "sncf.zip", None)
+    staging = inbox / "s1" / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+        out = await sessions_api._refresh_one_task(client, None, "s1", staging, task)  # type: ignore[arg-type]
+    assert out["status"] == "fetched"
+    assert out["resumes"] == 1
+    assert _state(inbox)["last_attempt"]["resumes"] == 1
+
+    await _run(inbox, httpx.Response(200, content=_gtfs_zip()))
+    assert "resumes" not in _state(inbox)["last_attempt"]
 
 
 # ─────────────────────────── status fields ───────────────────────────
@@ -224,3 +276,13 @@ def test_panel_says_format_ok_never_validated(template_text: str) -> None:
 def test_skip_reasons_are_escaped(template_text: str) -> None:
     """Skip reasons quote upstream responses — never inject them raw."""
     assert "escHTML(a.reason)" in _panel_js(template_text)
+
+
+def test_resume_count_is_a_number_and_escaped(template_text: str) -> None:
+    """The "resumed N times" note reads the stored count as a number and
+    escapes it, like every other value of the panel."""
+    js = _panel_js(template_text)
+    body = js[js.index("function feedLastResultHTML") :]
+    body = body[: body.index("\n}\n")]
+    assert "Number(a.resumes)" in body
+    assert "escHTML(String(resumes))" in body
