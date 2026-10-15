@@ -360,11 +360,13 @@ class RefreshRun:
         self.detail["current"] = [
             {
                 "key": _label(label),
-                "bytes": 0,
+                # None until the first chunk: a NAP lookup may come first.
+                "bytes": None,
                 "expected": None,
                 "step": feed_fetch.STEP_DOWNLOADING,
                 "scanned": None,
                 "scan_total": None,
+                # The web process's clock, like the reader's (`_public_current`).
                 "started_at": _now_iso(),
             }
         ]
@@ -413,7 +415,8 @@ class RefreshRun:
         bytes. May run on a worker thread: the event loop leaves the record
         to the task while the step runs, and writes go to the writer thread."""
         current = self.detail.get("current") or []
-        if not current or name not in feed_fetch.STEPS:
+        if self._finishing or not current or name not in feed_fetch.STEPS:
+            # Finishing: a copy job outliving its cancelled request writes nothing.
             return
         item = current[0]
         item["scanned"] = done
@@ -669,7 +672,8 @@ def _seconds_since(value: object, now: datetime) -> int | None:
 def _public_current(items: object, now: datetime) -> list[dict[str, Any]]:
     """The current tasks: label, download bytes, step (None for a record
     written before steps, or an unknown word), the structure check's bytes,
-    and how long the task has run."""
+    and how long the task has run. `now` is the web process's clock, the
+    clock `started_at` was written with (never PostgreSQL's)."""
     if not isinstance(items, list):
         return []
     return [
@@ -733,7 +737,13 @@ def _public(row: Row, now: datetime) -> dict[str, Any]:
         "elapsed_seconds": max(0, int((end - row.started_at).total_seconds())),
         **{name: _count(detail.get(name)) for name in _COUNTS},
         "phase": _word(detail["phase"]) if detail.get("phase") else None,
-        "current": _public_current(detail.get("current"), now),
+        # Only a running refresh has a current task: an interrupted record
+        # keeps the task it died in, which is no longer "now".
+        "current": (
+            _public_current(detail.get("current"), datetime.now(UTC))
+            if row.state == RUNNING
+            else []
+        ),
         "failed_keys": [_label(k) for k in (detail.get("failed_keys") or [])][:FAILED_KEYS_MAX],
         "error": _word(detail["error"]) if detail.get("error") else None,
         "previous": None,

@@ -11,6 +11,7 @@ Covers the two units that decide where multi-feed files land and how
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -273,3 +274,186 @@ class TestDispatchSplit:
         src.write_bytes(b"zz")
         assert ingestion.place(src, "GTFS", session_id="zz-session", staged_filename="zz.zip")
         assert (ingestion.session_inbox("zz-session") / "gtfs" / "zz.zip").read_bytes() == b"zz"
+
+
+# ─────────────── place: one slot, several threads (repair round 1) ───────────────
+
+
+class TestPlaceIsAtomicAndLockedPerSlot:
+    """`place` runs in worker threads: an upload, a refresh's storing step and
+    a derived provider can meet on one slot. Copies into one slot directory
+    run one at a time, and the slot always holds a whole file."""
+
+    def _slow_copy(self, monkeypatch):
+        import shutil
+        import threading
+
+        from app import ingestion
+
+        state = {"active": 0, "max": 0}
+        guard = threading.Lock()
+        started = threading.Event()
+        release = threading.Event()
+        real = shutil.copy2
+
+        def copy2(src, dst, *a, **k):
+            with guard:
+                state["active"] += 1
+                state["max"] = max(state["max"], state["active"])
+            started.set()
+            release.wait(5)
+            try:
+                return real(src, dst, *a, **k)
+            finally:
+                with guard:
+                    state["active"] -= 1
+
+        monkeypatch.setattr(ingestion.shutil, "copy2", copy2)
+        return state, started, release
+
+    def test_two_places_on_one_slot_never_mix(self, isolated_inbox, tmp_path, monkeypatch):
+        import threading
+
+        from app import ingestion
+
+        slot = ingestion.session_inbox("zz") / "gtfs"
+        slot.mkdir(parents=True)
+        (slot / "zz.zip").write_bytes(b"zz old " * 99)
+        state, started, release = self._slow_copy(monkeypatch)
+        bodies = {name: name.encode() * 9999 for name in ("zzA", "zzB")}
+        for name, body in bodies.items():
+            (tmp_path / name).write_bytes(body)
+        threads = [
+            threading.Thread(
+                target=ingestion.place,
+                args=(tmp_path / name, "GTFS"),
+                kwargs={"session_id": "zz", "staged_filename": "zz.zip"},
+            )
+            for name in bodies
+        ]
+        for t in threads:
+            t.start()
+        assert started.wait(5)
+        # Time for the second thread to reach the copy too, were nothing to stop it.
+        time.sleep(0.3)
+        release.set()
+        for t in threads:
+            t.join(10)
+        assert state["max"] == 1  # one copy at a time into the slot
+        current = (slot / "zz.zip").read_bytes()
+        previous = (slot / "zz.zip.old").read_bytes()
+        assert current in bodies.values()
+        assert previous in bodies.values()  # the first placed, rotated whole
+        assert current != previous
+        assert sorted(p.name for p in slot.iterdir()) == ["zz.zip", "zz.zip.old"]
+
+    def test_the_slot_keeps_its_whole_file_while_the_copy_runs(
+        self, isolated_inbox, tmp_path, monkeypatch
+    ):
+        import threading
+
+        from app import ingestion
+
+        slot = ingestion.session_inbox("zz") / "gtfs"
+        slot.mkdir(parents=True)
+        (slot / "zz.zip").write_bytes(b"zz old")
+        (slot / "zzother.zip").write_bytes(b"zz other")
+        _state, started, release = self._slow_copy(monkeypatch)
+        (tmp_path / "new.zip").write_bytes(b"zz new")
+        # The legacy single-feed flow: every current file is rotated.
+        t = threading.Thread(
+            target=ingestion.place, args=(tmp_path / "new.zip", "GTFS"), kwargs={"session_id": "zz"}
+        )
+        t.start()
+        assert started.wait(5)
+        # Mid-copy: the slot is untouched, the copy goes to a hidden name no build globs.
+        assert (slot / "zz.zip").read_bytes() == b"zz old"
+        assert not list(slot.glob("*.zip.old"))
+        release.set()
+        t.join(10)
+        assert sorted(p.name for p in slot.iterdir()) == [
+            "gtfs.zip",
+            "zz.zip.old",
+            "zzother.zip.old",
+        ]
+        assert (slot / "gtfs.zip").read_bytes() == b"zz new"
+
+    def test_a_failed_copy_leaves_the_slot_and_no_temporary_file(
+        self, isolated_inbox, tmp_path, monkeypatch
+    ):
+        from app import ingestion
+
+        slot = ingestion.session_inbox("zz") / "gtfs"
+        slot.mkdir(parents=True)
+        (slot / "zz.zip").write_bytes(b"zz old")
+
+        def broken(src, dst, *a, **k):
+            Path(dst).write_bytes(b"half")
+            raise OSError("stand-in disk full")
+
+        monkeypatch.setattr(ingestion.shutil, "copy2", broken)
+        (tmp_path / "new.zip").write_bytes(b"zz new")
+        with pytest.raises(OSError, match="stand-in"):
+            ingestion.place(tmp_path / "new.zip", "GTFS", session_id="zz", staged_filename="zz.zip")
+        assert sorted(p.name for p in slot.iterdir()) == ["zz.zip"]
+        assert (slot / "zz.zip").read_bytes() == b"zz old"
+
+
+def test_the_legacy_upload_copies_off_the_event_loop(isolated_inbox, monkeypatch):
+    """`/upload` (app/main.py `_do_upload`): the copy into the slot runs in a
+    worker thread, the rebuild is queued on the request's thread."""
+    import asyncio
+    import threading
+
+    from app import main
+
+    loop_thread: list[int] = []
+    seen: dict[str, object] = {}
+
+    def place(path, kind, **_k):
+        seen["place_on_loop"] = threading.get_ident() == loop_thread[0]
+        return True
+
+    def queue_rebuild(db, *, session_id, kind):
+        seen["queue_on_loop"] = threading.get_ident() == loop_thread[0]
+        seen["queued"] = (session_id, kind)
+
+    class FakeDb:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return None
+
+        def add(self, row):
+            seen["row"] = row.triggered_rebuild
+
+        def commit(self):
+            return None
+
+    class FakeFile:
+        filename = "zz.zip"
+
+        def __init__(self):
+            self.chunks = [b"zz", b""]
+
+        async def read(self, _n):
+            return self.chunks.pop(0)
+
+    monkeypatch.setattr(main.ingestion, "place", place)
+    monkeypatch.setattr(main.ingestion, "queue_rebuild", queue_rebuild)
+    monkeypatch.setattr(main.detect, "detect", lambda _p: "GTFS")
+    monkeypatch.setattr(main, "SessionLocal", FakeDb)
+
+    async def go():
+        loop_thread.append(threading.get_ident())
+        return await main._do_upload("GTFS", "zz-v99", FakeFile())
+
+    response = asyncio.run(go())
+    assert response.status_code == 303
+    assert seen == {
+        "place_on_loop": False,
+        "queue_on_loop": True,
+        "queued": (None, "GTFS"),
+        "row": True,
+    }

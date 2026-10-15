@@ -397,6 +397,7 @@ def test_the_progress_api_answers_while_a_slow_step_runs(
     _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_netex_bytes()))
     entered = threading.Event()
     release = threading.Event()
+    held: list[bool] = []  # False: the wait timed out (the step held the loop)
 
     def hold() -> None:
         # Released by the test once its GET has answered. The bound only
@@ -404,7 +405,7 @@ def test_the_progress_api_answers_while_a_slow_step_runs(
         # then never run): longer than the reads below, so a loaded runner
         # never releases it early.
         entered.set()
-        release.wait(60)
+        held.append(release.wait(60))
 
     real_fingerprint = netex_structure.fingerprint
 
@@ -451,6 +452,7 @@ def test_the_progress_api_answers_while_a_slow_step_runs(
             return record, answered_while_held, await post
 
     record, answered_while_held, response = asyncio.run(scenario())
+    assert held == [True], "the step's wait timed out: it ran on the event loop"
     assert answered_while_held
     assert record["state"] == "running"
     current = record["current"][0]
@@ -679,7 +681,8 @@ def test_a_dead_refresh_is_interrupted_and_taken_over(
     assert shown["state"] == "interrupted"
     assert shown["finished_at"] == shown["heartbeat_at"]
     assert shown["done"] == 0
-    assert shown["current"][0]["bytes"] == 99
+    # The task it died in is no longer "now" (review round 1): no current task.
+    assert shown["current"] == []
 
     # A claim takes the row over while the dead refresh's writes change
     # nothing (the new refresh is running too: only the run_id tells them apart).

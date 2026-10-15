@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import secrets
@@ -363,8 +364,12 @@ async def _do_upload(
             f"Declared {declared_standard!r} but file looks like {detected_kind!r} — refusing.",
         )
 
+    # The copy into the slot off the event loop (an upload can be GB; atomic
+    # and locked per slot); the rebuild queued here, with this thread's session.
+    triggered = await asyncio.to_thread(ingestion.place, stored_path, detected_kind)
     with SessionLocal() as db:
-        triggered = ingestion.dispatch(stored_path, detected_kind, db)
+        if triggered:
+            ingestion.queue_rebuild(db, session_id=None, kind=detected_kind)
         record = Upload(
             # FIXME(step-3/-7): user_id and session_id wired up once auth + sessions land.
             user_id=None,

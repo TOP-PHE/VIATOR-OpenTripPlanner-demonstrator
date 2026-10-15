@@ -298,6 +298,10 @@ def _now_line(item: dict[str, Any]) -> str:
             " (50 %) · for 1 min 39 s",
         ),
         (
+            _step("downloading", bytes=None, expected=None, elapsed_seconds=9),
+            "Now: provider[ZZRAIL].timetable(netex_epip) — downloading · for 9 s",
+        ),
+        (
             _step("verifying"),
             "Now: provider[ZZRAIL].timetable(netex_epip) — verifying (format check)"
             " · for 18 min 0 s",

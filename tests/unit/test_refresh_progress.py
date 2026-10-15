@@ -570,8 +570,9 @@ def test_a_task_goes_through_its_steps_one_write_each() -> None:
         feed_fetch.STEP_CHECKING_STRUCTURE,
         feed_fetch.STEP_STORING,
     ]
-    # The download's bytes stay beside the later steps.
-    assert writes[-1]["current"][0]["bytes"] == 0
+    # No byte yet (a NAP lookup may come first); the field stays beside the later steps.
+    assert writes[0]["current"][0]["bytes"] is None
+    assert writes[-1]["current"][0]["bytes"] is None
     run.done(LABEL, {"status": "fetched"})
     assert writes[-1]["current"] == []
 
@@ -827,3 +828,176 @@ def test_no_rebuild_is_queued_when_the_kind_needs_none(
     )
     assert rebuild is False
     assert queued == []
+
+
+# ── repair round 1 ───────────────────────────────────────────────────────
+
+
+def test_a_finishing_run_takes_no_step() -> None:
+    """A copy job that outlives its cancelled request reports nothing once
+    the refresh is finishing: no write, so no spurious lease_lost."""
+    run, writes = _run(FakeClock())
+    with run.task(LABEL):
+        run._finishing = True
+        run.step(feed_fetch.STEP_STORING)
+    assert len(writes) == 1
+    assert run.detail["current"][0]["step"] == feed_fetch.STEP_DOWNLOADING
+
+
+@pytest.mark.parametrize(
+    ("state", "shown"),
+    [
+        (refresh_progress.RUNNING, 1),
+        (refresh_progress.INTERRUPTED, 0),
+        (refresh_progress.FAILED, 0),
+    ],
+)
+def test_only_a_running_record_has_a_current_task(state: str, shown: int) -> None:
+    """An interrupted record keeps the task it died in; shown as "Now: …
+    for 3 d" it would grow forever."""
+    started = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
+    row = SimpleNamespace(
+        scope="providers",
+        state=state,
+        started_at=started,
+        finished_at=None if state == refresh_progress.RUNNING else started,
+        heartbeat_at=started,
+        detail={
+            "total": 1,
+            "current": [{"key": LABEL, "step": "storing", "started_at": started.isoformat()}],
+        },
+        extract={},
+    )
+    public = refresh_progress._public(row, started + timedelta(days=3))  # type: ignore[arg-type]
+    assert len(public["current"]) == shown
+
+
+def test_the_task_time_is_measured_on_the_web_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """started_at is written with the web process's clock: the reader
+    measures with the same clock, never PostgreSQL's `now`."""
+    run, _writes = _run(FakeClock())
+    with run.task(LABEL):
+        pass
+    started = datetime.fromisoformat(run.detail["current"][0]["started_at"])
+    row = SimpleNamespace(
+        scope="providers",
+        state=refresh_progress.RUNNING,
+        started_at=started,
+        finished_at=None,
+        heartbeat_at=started,
+        detail=run.detail,
+        extract={},
+    )
+    db_clock_far_ahead = started + timedelta(hours=9)
+    public = refresh_progress._public(row, db_clock_far_ahead)  # type: ignore[arg-type]
+    assert public["current"][0]["elapsed_seconds"] < 60
+
+
+def _slow_place(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, list[str]]:
+    import threading
+
+    from app import ingestion
+
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+    real = ingestion.place
+
+    def place(path: Path, *args: Any, **kwargs: Any) -> bool:
+        entered.set()
+        assert release.wait(10)
+        calls.append("placed" if path.exists() else "source gone mid-copy")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion, "place", place)
+    return entered, release, calls
+
+
+def test_a_request_cancelled_during_the_copy_still_ends_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The client went away while the file was copied into the slot: the
+    copy is not cut, its source is removed only after it, the caller's file
+    bookkeeping runs, and the rebuild is queued with a session of its own."""
+    import threading
+
+    from app import ingestion
+    from app.api.admin import sessions as sessions_api
+
+    monkeypatch.setattr(ingestion.settings, "inbox_dir", tmp_path / "inbox")
+    entered, release, calls = _slow_place(monkeypatch)
+    queued = threading.Event()
+    queued_with: list[tuple[str, str]] = []
+
+    def own_session(sid: str, kind: str) -> None:
+        queued_with.append((sid, kind))
+        queued.set()
+
+    monkeypatch.setattr(sessions_api, "_queue_rebuild_own_session", own_session)
+    monkeypatch.setattr(
+        ingestion, "queue_rebuild", lambda *_a, **_k: pytest.fail("not on the request's session")
+    )
+    source = tmp_path / "zz-staged.zip"
+    source.write_bytes(b"zz new")
+    after: list[str] = []
+
+    async def go() -> None:
+        copy = asyncio.ensure_future(
+            sessions_api._dispatch_off_loop(
+                "zz-closed-db",  # type: ignore[arg-type]
+                source,
+                "GTFS",
+                "zz",
+                "zz.zip",
+                after=lambda: after.append("state saved"),
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        copy.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await copy
+        assert source.exists()  # the cancelled request did not pull it away
+        release.set()
+        for _ in range(500):
+            if queued.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(go())
+    assert calls == ["placed"]
+    assert after == ["state saved"]
+    assert queued_with == [("zz", "GTFS")]
+    assert not source.exists()
+    assert (tmp_path / "inbox" / "zz" / "gtfs" / "zz.zip").read_bytes() == b"zz new"
+
+
+def test_a_failed_copy_removes_its_source_and_queues_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import ingestion
+    from app.api.admin import sessions as sessions_api
+
+    def broken(*_a: Any, **_k: Any) -> bool:
+        raise OSError("stand-in disk full")
+
+    monkeypatch.setattr(ingestion, "place", broken)
+    queued: list[str] = []
+    monkeypatch.setattr(ingestion, "queue_rebuild", lambda *_a, **k: queued.append(k["kind"]))
+    source = tmp_path / "zz.zip"
+    source.write_bytes(b"zz")
+    after: list[str] = []
+
+    async def go() -> None:
+        await sessions_api._dispatch_off_loop(
+            None,  # type: ignore[arg-type]
+            source,
+            "GTFS",
+            "zz",
+            None,
+            after=lambda: after.append("x"),
+        )
+
+    with pytest.raises(OSError, match="stand-in"):
+        asyncio.run(go())
+    assert not source.exists()
+    assert (queued, after) == ([], [])

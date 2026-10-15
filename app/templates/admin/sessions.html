@@ -1689,7 +1689,7 @@ function progressStepText(c) {
       ? '' : `, ${progressAmount(c.scanned, c.scan_total, 'scanned')}`;
     return `checking structure${scanned}`;
   }
-  if (c.bytes === null || c.bytes === undefined) return '';
+  if (c.bytes === null || c.bytes === undefined) return c.step === 'downloading' ? 'downloading' : '';
   const amount = progressAmount(c.bytes, c.expected, 'received');
   return c.step === 'downloading' ? `downloading, ${amount}` : amount;
 }

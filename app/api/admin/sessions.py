@@ -16,12 +16,14 @@ Phase-A.5 wiring (this file):
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import re
 import uuid
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple
@@ -760,17 +762,21 @@ async def upload_to_session(
         provider_feed_id = provider_id
         upload_source = match["timetable"].get("source")
 
-    # The copy into the slot off the event loop (an upload can be GB).
-    triggered = await _dispatch_off_loop(db, staged_path, detected, sid, staged_filename)
-    # The slot no longer holds the last downloaded file — forget the fetch
-    # state of every task that writes it, so no refresh can call it "unchanged".
-    _forget_fetch_state_for_slot(sid, detected, staged_filename)
+    # The copy into the slot off the event loop (an upload can be GB); it
+    # removes the staging file. The slot no longer holds the last downloaded
+    # file — the job forgets the fetch state of every task that writes it, so
+    # no refresh can call it "unchanged", even if this request is cancelled.
+    triggered = await _dispatch_off_loop(
+        db,
+        staged_path,
+        detected,
+        sid,
+        staged_filename,
+        after=functools.partial(_forget_fetch_state_for_slot, sid, detected, staged_filename),
+    )
     # Where did dispatch end up putting it? Reconstruct from the rules. With
     # a provider slot the name is `<feed_id>.zip`; otherwise the legacy name.
     final_path = _reconstruct_dispatch_target(sid, detected, staged_filename or staged_path.name)
-
-    # Best-effort cleanup of the staging file (dispatch copy2's into final).
-    staged_path.unlink(missing_ok=True)
 
     upload = Upload(
         session_id=sid,
@@ -1703,19 +1709,65 @@ def _derived_count(config: dict[str, Any]) -> int:
 
 
 async def _dispatch_off_loop(
-    db: DbSession, path: Path, kind: str, sid: str, staged_filename: str | None
+    db: DbSession,
+    path: Path,
+    kind: str,
+    sid: str,
+    staged_filename: str | None,
+    *,
+    after: Callable[[], None] | None = None,
 ) -> bool:
-    """`ingestion.dispatch` without blocking the event loop: the copy into the
-    slot (a national file is GB) runs in a worker thread, the rebuild is
-    queued here, on the thread that owns the request's database session (a
-    session is never used by two threads, even when the request is
-    cancelled while the copy runs). True when a rebuild was queued."""
-    rebuild = await asyncio.to_thread(
-        ingestion.place, path, kind, session_id=sid, staged_filename=staged_filename
-    )
+    """`ingestion.dispatch` without blocking the event loop. One job in a
+    worker thread copies `path` into the slot (a national file is GB;
+    `ingestion.place`, atomic and locked per slot), then deletes `path`
+    (always: the source is this call's to remove, never the caller's while
+    the copy may still read it) and, after a placed file, runs `after` (the
+    caller's file bookkeeping, e.g. the fetch state). The rebuild is queued
+    here, on the thread that owns the request's database session. True when
+    a rebuild was queued.
+
+    Cancelled while the copy runs (the request went away), the job is
+    shielded and finishes on its own; once it has placed the file, the
+    rebuild is queued with a database session of its own, so the slot never
+    holds a new file that no build will pick up. Then the cancellation goes
+    on; nothing here awaits again."""
+
+    def job() -> bool:
+        try:
+            rebuild = ingestion.place(path, kind, session_id=sid, staged_filename=staged_filename)
+        finally:
+            path.unlink(missing_ok=True)
+        if after is not None:
+            after()
+        return rebuild
+
+    copy = asyncio.ensure_future(asyncio.to_thread(job))
+    try:
+        rebuild = await asyncio.shield(copy)
+    except asyncio.CancelledError:
+        copy.add_done_callback(functools.partial(_queue_after_cancelled_copy, sid=sid, kind=kind))
+        raise
     if rebuild:
         ingestion.queue_rebuild(db, session_id=sid, kind=kind)
     return rebuild
+
+
+def _queue_after_cancelled_copy(copy: asyncio.Future[bool], *, sid: str, kind: str) -> None:
+    """Done callback of a copy whose request was cancelled: queue its rebuild
+    off the event loop, with a database session of its own."""
+    if copy.cancelled() or copy.exception() is not None or not copy.result():
+        return
+    asyncio.get_running_loop().run_in_executor(None, _queue_rebuild_own_session, sid, kind)
+
+
+def _queue_rebuild_own_session(sid: str, kind: str) -> None:
+    from app.db import SessionLocal
+
+    try:
+        with SessionLocal() as db:
+            ingestion.queue_rebuild(db, session_id=sid, kind=kind)
+    except Exception as exc:  # a lost queue entry: the next refresh or build catches up
+        log.warning("rebuild not queued after a cancelled copy: %s", type(exc).__name__)
 
 
 def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
@@ -2106,14 +2158,19 @@ async def _download_task(
     assert result.path is not None  # "fetched" always carries the format-checked file
     feed_fetch.report_step(feed_fetch.STEP_STORING)
     try:
-        await _dispatch_off_loop(db, result.path, kind, sid, task.staged_filename)
-    except Exception as exc:
-        result.path.unlink(missing_ok=True)
+        # The fetch state is saved by the copy's own job once the file is in
+        # the slot, so a request cancelled meanwhile still leaves them paired.
+        await _dispatch_off_loop(
+            db,
+            result.path,
+            kind,
+            sid,
+            task.staged_filename,
+            after=functools.partial(feed_fetch.save_state, state_dir, label, result.state),
+        )
+    except Exception as exc:  # the job removed the staged file
         return _skip(f"dispatch failed: {exc}")
-    finally:
-        result.path.unlink(missing_ok=True)
 
-    feed_fetch.save_state(state_dir, label, result.state)
     outcome: dict[str, Any] = {
         "status": "fetched",
         "key": label,
