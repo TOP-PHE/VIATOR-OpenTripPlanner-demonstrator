@@ -25,7 +25,9 @@ process that died (a restart, a crash): it is marked `interrupted` (when the
 page reads it, or when the next refresh claims the row), and a new refresh is
 allowed. Every write names the refresh's `run_id` and requires `running`, so
 a refresh that lost its lease (an event loop blocked past the lease) changes
-nothing any more; it logs one WARNING and finishes its downloads as before.
+nothing any more; it logs one WARNING, finishes the download under way and
+starts no other (`RefreshRun.lost`). Inside `async with` the progress writes
+go to one writer thread, in order, so the event loop never waits on them.
 
 **What is written** (`detail`): the counts (`total`, `done`, `fetched`,
 `unchanged`, `failed`, `not_reached`), the phase, the task being downloaded
@@ -35,7 +37,9 @@ the labels of the failed tasks. Bytes are written at most every
 per chunk. `extract`: the station-module follow-up of a provider refresh
 (`ExtractFollowUp`, fed by the sender thread of `app/station_extract_upload.py`):
 queued, then running with its counts per outcome and reason word, then
-finished; `off` when the module is not configured.
+finished; `off` when the module is not configured; read as `interrupted` when
+it went silent (`EXTRACT_QUEUED_SECONDS`, `EXTRACT_LEASE_SECONDS`). It is
+written only into the record of the refresh that queued it.
 
 **Never a URL, a reason text or a secret.** Task labels such as
 `provider[ZZRAIL].timetable(gtfs)` (a provider id of the session's own
@@ -52,11 +56,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 import re
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Protocol
@@ -88,6 +95,14 @@ BYTES_EVERY_SECONDS = 2.0
 BYTES_STEP_PERCENT = 5
 # Labels of failed tasks kept in the record.
 FAILED_KEYS_MAX = 50
+# The station-module follow-up: a pass beats `updated_at` this often while it
+# runs; a running follow-up silent for `EXTRACT_LEASE_SECONDS`, or one still
+# queued after `EXTRACT_QUEUED_SECONDS` (longer than the pass's 30-minute
+# budget: the web process restarted and lost its in-memory queue), is shown
+# interrupted.
+EXTRACT_HEARTBEAT_SECONDS = 30.0
+EXTRACT_LEASE_SECONDS = 300
+EXTRACT_QUEUED_SECONDS = 35 * 60
 
 # Phases of a provider refresh.
 DOWNLOADING = "downloading"
@@ -277,9 +292,18 @@ class RefreshRun:
         self._factory = factory
         self._clock = clock
         self._lost = False
+        self._finishing = False
         self._beat_task: asyncio.Task[None] | None = None
+        # Inside `async with`: progress writes go to one thread of their own,
+        # in order, so the event loop never waits on the database.
+        self._writer: ThreadPoolExecutor | None = None
         self._last_bytes_write = 0.0
         self._last_step = 0
+
+    @property
+    def lost(self) -> bool:
+        """True once a write found the row taken over by another refresh."""
+        return self._lost
 
     # ── writes ──
 
@@ -291,7 +315,7 @@ class RefreshRun:
             Row.state == RUNNING,
         )
 
-    def _execute(self, statement: Any) -> None:
+    def _execute(self, statement: Any, *, beat: bool = False) -> None:
         try:
             with _session_factory(self._factory)() as db:
                 changed = db.execute(statement).rowcount
@@ -299,15 +323,25 @@ class RefreshRun:
         except Exception as exc:  # the record is best effort, the refresh is not
             log.warning(_FAILED_WRITE, self.scope, type(exc).__name__)
             return
-        if changed == 0 and not self._lost:
+        # A beat that lands after this refresh's own end found the row
+        # finished: not a lost lease.
+        if changed == 0 and not self._lost and not (beat and self._finishing):
             self._lost = True
             log.warning("refresh_progress.lease_lost scope=%s", self.scope)
 
     def _write(self) -> None:
-        self._execute(self._fenced().values(detail=dict(self.detail), heartbeat_at=func.now()))
+        statement = self._fenced().values(
+            detail=copy.deepcopy(self.detail), heartbeat_at=func.now()
+        )
+        if self._writer is not None:
+            self._writer.submit(self._execute, statement)
+        else:
+            self._execute(statement)
 
     def beat(self) -> None:
-        self._execute(self._fenced().values(heartbeat_at=func.now()))
+        if self._finishing:
+            return
+        self._execute(self._fenced().values(heartbeat_at=func.now()), beat=True)
 
     # ── progress ──
 
@@ -373,7 +407,7 @@ class RefreshRun:
             "state": state,
             "finished_at": func.now(),
             "heartbeat_at": func.now(),
-            "detail": dict(self.detail),
+            "detail": copy.deepcopy(self.detail),
         }
         if self.scope == PROVIDERS:
             values["extract"] = _extract_on_finish(state)
@@ -387,8 +421,16 @@ class RefreshRun:
             await asyncio.to_thread(self.beat)
 
     async def __aenter__(self) -> RefreshRun:
+        self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="refresh-progress")
         self._beat_task = asyncio.create_task(self._beat_forever())
         return self
+
+    def _end(self, state: str, error: str | None = None) -> None:
+        """The queued progress writes first, then the end (one thread)."""
+        if self._writer is not None:
+            self._writer.shutdown(wait=True)
+            self._writer = None
+        self.finish(state, error=error)
 
     async def __aexit__(
         self,
@@ -396,16 +438,21 @@ class RefreshRun:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        self._finishing = True
         if self._beat_task is not None:
             self._beat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._beat_task
         if exc_type is None:
-            self.finish(FINISHED)
+            state, error = FINISHED, None
         elif issubclass(exc_type, Exception):
-            self.finish(FAILED, error=exc_type.__name__)
+            state, error = FAILED, exc_type.__name__
         else:  # cancelled (shutdown, a lost client under some servers)
-            self.finish(INTERRUPTED)
+            state, error = INTERRUPTED, None
+        if state == INTERRUPTED:
+            self._end(state)  # a cancelled task must not await again
+        else:
+            await asyncio.to_thread(self._end, state, error)
 
 
 def _extract_on_finish(state: str) -> dict[str, Any]:
@@ -416,7 +463,24 @@ def _extract_on_finish(state: str) -> dict[str, Any]:
         return {}
     from . import station_module
 
-    return {"state": "queued"} if station_module.enabled() else {"state": "off"}
+    if not station_module.enabled():
+        return {"state": "off"}
+    return {"state": "queued", "updated_at": _now_iso()}
+
+
+def running_since(sid: str, scope: str, *, factory: Factory | None = None) -> datetime | None:
+    """When the session's running refresh of `scope` started, or None when
+    none runs (a record past its lease does not count). Read only."""
+    with _session_factory(factory)() as db:
+        started: datetime | None = db.execute(
+            select(Row.started_at).where(
+                Row.session_id == sid,
+                Row.scope == scope,
+                Row.state == RUNNING,
+                Row.heartbeat_at >= _lease_cutoff(),
+            )
+        ).scalar_one_or_none()
+    return started
 
 
 # ── the station-module follow-up ─────────────────────────────────────────
@@ -432,31 +496,24 @@ class _Outcome(Protocol):
 
 class ExtractFollowUp:
     """The pass of `app/station_extract_upload.py` that follows a provider
-    refresh, written to the session's latest provider record (fenced by its
-    `run_id`). One write when the pass starts, one when a feed starts, one per
-    outcome, one at the end. Never raises."""
+    refresh, written to that refresh's record: fenced by its `run_id` and by
+    `state = 'finished'` (a newer refresh owns the row otherwise). One write
+    when the pass starts, one when a feed starts, one per outcome, one at the
+    end, and a beat of `updated_at` every `EXTRACT_HEARTBEAT_SECONDS` while it
+    runs (an extraction can take many minutes). Never raises."""
 
     def __init__(self, sid: str, run_id: uuid.UUID, *, factory: Factory | None = None) -> None:
         self.sid = sid
         self.run_id = run_id
         self._factory = factory
         self.state: dict[str, Any] = {}
-
-    @classmethod
-    def for_session(cls, sid: str, *, factory: Factory | None = None) -> ExtractFollowUp | None:
-        """The follow-up of the session's latest provider refresh, or None
-        when there is none (or the record cannot be read)."""
-        try:
-            with _session_factory(factory)() as db:
-                run_id = db.execute(
-                    select(Row.run_id).where(Row.session_id == sid, Row.scope == PROVIDERS)
-                ).scalar_one_or_none()
-        except Exception as exc:
-            log.warning(_FAILED_WRITE, "extract", type(exc).__name__)
-            return None
-        return cls(sid, run_id, factory=factory) if run_id is not None else None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._beater: threading.Thread | None = None
 
     def _write(self) -> None:
+        """Write the state as it stands; the caller holds `_lock`."""
+        self.state["updated_at"] = _now_iso()
         try:
             with _session_factory(self._factory)() as db:
                 db.execute(
@@ -465,54 +522,70 @@ class ExtractFollowUp:
                         Row.session_id == self.sid,
                         Row.scope == PROVIDERS,
                         Row.run_id == self.run_id,
+                        Row.state == FINISHED,
                     )
-                    .values(extract=dict(self.state))
+                    .values(extract=copy.deepcopy(self.state))
                 )
                 db.commit()
         except Exception as exc:
             log.warning(_FAILED_WRITE, "extract", type(exc).__name__)
 
+    def _beat_until_stopped(self) -> None:
+        while not self._stop.wait(EXTRACT_HEARTBEAT_SECONDS):
+            with self._lock:
+                self._write()
+
     def started(self, total: int) -> None:
-        self.state = {
-            "state": RUNNING,
-            "total": total,
-            "handled": 0,
-            **dict.fromkeys(EXTRACT_STATES, 0),
-            "reasons": {},
-            "current": None,
-            "started_at": _now_iso(),
-            "finished_at": None,
-        }
-        self._write()
+        with self._lock:
+            self.state = {
+                "state": RUNNING,
+                "total": total,
+                "handled": 0,
+                **dict.fromkeys(EXTRACT_STATES, 0),
+                "reasons": {},
+                "current": None,
+                "started_at": _now_iso(),
+                "finished_at": None,
+            }
+            self._write()
+        if self._beater is None:
+            self._beater = threading.Thread(
+                target=self._beat_until_stopped, name="refresh-follow-up", daemon=True
+            )
+            self._beater.start()
 
     def feed_started(self, provider_id: str) -> None:
-        if not self.state:
-            return
-        self.state["current"] = _label(provider_id)
-        self._write()
+        with self._lock:
+            if not self.state:
+                return
+            self.state["current"] = _label(provider_id)
+            self._write()
 
     def outcome(self, outcome: _Outcome) -> None:
-        if not self.state:
-            return
-        state = outcome.state if outcome.state in EXTRACT_STATES else "skipped"
-        self.state[state] += 1
-        self.state["handled"] += 1
-        if outcome.reason and state not in ("sent", "held"):
-            reasons = self.state["reasons"]
-            word = _word(outcome.reason)
-            reasons[word] = reasons.get(word, 0) + 1
-        self.state["current"] = None
-        self._write()
+        with self._lock:
+            if not self.state:
+                return
+            state = outcome.state if outcome.state in EXTRACT_STATES else "skipped"
+            self.state[state] += 1
+            self.state["handled"] += 1
+            if outcome.reason and state not in ("sent", "held"):
+                reasons = self.state["reasons"]
+                word = _word(outcome.reason)
+                reasons[word] = reasons.get(word, 0) + 1
+            self.state["current"] = None
+            self._write()
 
     def finished(self, end: str) -> None:
         """`end`: finished, cancelled, error (the pass stopped early) or off
         (the module is not configured any more)."""
         if not self.state:
             self.started(0)
-        self.state["state"] = end if end in _EXTRACT_ENDS else "error"
-        self.state["current"] = None
-        self.state["finished_at"] = _now_iso()
-        self._write()
+        self._stop.set()
+        with self._lock:
+            self.state["state"] = end if end in _EXTRACT_ENDS else "error"
+            self.state["current"] = None
+            self.state["finished_at"] = _now_iso()
+            self._write()
 
 
 # ── the read ─────────────────────────────────────────────────────────────
@@ -543,10 +616,36 @@ def _public_current(items: object) -> list[dict[str, Any]]:
     ]
 
 
-def _public_extract(extract: object) -> dict[str, Any] | None:
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _extract_state(extract: dict[str, Any], now: datetime) -> str:
+    """The follow-up's state, `interrupted` when it went silent: still
+    queued after `EXTRACT_QUEUED_SECONDS`, or running with no beat for
+    `EXTRACT_LEASE_SECONDS` (a restart lost the queue, or the pass died)."""
+    state = _word(extract.get("state"))
+    limit = {"queued": EXTRACT_QUEUED_SECONDS, RUNNING: EXTRACT_LEASE_SECONDS}.get(state)
+    if limit is None:
+        return state
+    updated = _parse_time(extract.get("updated_at"))
+    if updated is None or (now - updated).total_seconds() > limit:
+        return INTERRUPTED
+    return state
+
+
+def _public_extract(extract: object, now: datetime) -> dict[str, Any] | None:
     if not isinstance(extract, dict) or not extract.get("state"):
         return None
-    public: dict[str, Any] = {"state": _word(extract.get("state"))}
+    public: dict[str, Any] = {"state": _extract_state(extract, now)}
+    updated = _parse_time(extract.get("updated_at"))
+    public["updated_at"] = _iso(updated) if updated else None
     if "total" in extract:
         public.update({name: _count(extract.get(name)) for name in _EXTRACT_COUNTS})
         reasons = extract.get("reasons")
@@ -577,7 +676,7 @@ def _public(row: Row, now: datetime) -> dict[str, Any]:
         "failed_keys": [_label(k) for k in (detail.get("failed_keys") or [])][:FAILED_KEYS_MAX],
         "error": _word(detail["error"]) if detail.get("error") else None,
         "previous": None,
-        "extract": _public_extract(row.extract),
+        "extract": _public_extract(row.extract, now),
     }
     previous = detail.get("previous")
     if isinstance(previous, dict):

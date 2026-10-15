@@ -121,6 +121,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1210,15 +1211,17 @@ def send_session(
         )
 
 
-def send_after_refresh(sid: str, only_provider: str | None = None) -> None:
+def send_after_refresh(
+    sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None
+) -> None:
     """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender
-    thread. The pass of a whole-session refresh is written to the session's
-    provider refresh record (issue #359), which the Sessions page shows."""
+    thread. The pass of a whole-session refresh is written to that refresh's
+    progress record (`run_id`, issue #359), which the Sessions page shows."""
     observer: PassObserver | None = None
-    if only_provider is None:
+    if only_provider is None and run_id is not None:
         from .refresh_progress import ExtractFollowUp
 
-        observer = ExtractFollowUp.for_session(sid)
+        observer = ExtractFollowUp(sid, run_id)
     send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider, observer=observer)
 
 
@@ -1229,10 +1232,11 @@ def send_after_refresh(sid: str, only_provider: str | None = None) -> None:
 # warm_session_extracts`, pull request 4), which its tests pin as the only
 # task. Both go through `station_extract.ensure_extract`, one extraction at
 # a time with its cache, so an archive is never extracted twice. A pass
-# already waiting for the same session and provider is
-# not queued twice.
+# already waiting for the same session and provider is not queued twice;
+# it then reports to the newer refresh's record (`_queued` keeps the
+# latest `run_id` of each waiting pass), since it has not started yet.
 _waiting: queue.Queue[tuple[str, str | None]] = queue.Queue()
-_queued: set[tuple[str, str | None]] = set()
+_queued: dict[tuple[str, str | None], uuid.UUID | None] = {}
 _queued_lock = threading.Lock()
 _sender: threading.Thread | None = None
 
@@ -1241,17 +1245,23 @@ def _send_queued() -> None:
     while True:
         item = _waiting.get()
         with _queued_lock:
-            _queued.discard(item)
+            run_id = _queued.pop(item, None)
         try:
-            send_after_refresh(*item)
+            if run_id is None:
+                send_after_refresh(*item)
+            else:
+                send_after_refresh(*item, run_id=run_id)
         except Exception as exc:  # the thread must outlive any one pass
             log.warning(_FAILED, ERROR, type(exc).__name__)
         finally:
             _waiting.task_done()
 
 
-def after_refresh(sid: str, only_provider: str | None = None) -> None:
-    """Queue the pass of a refresh; returns at once. Without the module
+def after_refresh(
+    sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None
+) -> None:
+    """Queue the pass of a refresh; returns at once. `run_id`: the progress
+    record of the whole-session refresh that queued it. Without the module
     configured nothing is queued (one INFO line)."""
     global _sender
     if not station_module.enabled():
@@ -1259,9 +1269,10 @@ def after_refresh(sid: str, only_provider: str | None = None) -> None:
         return
     item = (sid, only_provider)
     with _queued_lock:
-        if item in _queued:
+        waiting = item in _queued
+        _queued[item] = run_id
+        if waiting:
             return
-        _queued.add(item)
         if _sender is None or not _sender.is_alive():
             _sender = threading.Thread(target=_send_queued, name="station-extracts", daemon=True)
             _sender.start()

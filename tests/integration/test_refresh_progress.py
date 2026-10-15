@@ -227,9 +227,16 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     async def big_body() -> AsyncIterator[bytes]:
         for start in range(0, len(big), MIB):
             if start:
-                # The previous chunk was written and reported: a new request
-                # (a reload) reads it from the database.
-                seen.append(_read())
+                # The previous chunk was reported; its write goes through the
+                # run's writer thread: a new request (a reload) reads it from
+                # the database once it has landed.
+                for _ in range(300):
+                    record = _read()
+                    current = record["providers"]["current"]
+                    if current and current[0]["bytes"] == start:
+                        break
+                    await asyncio.sleep(0.01)
+                seen.append(record)
             yield big[start : start + MIB]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -289,7 +296,7 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     assert providers["failed_keys"] == ["provider[ZZFAIL].timetable(gtfs)"]
     assert providers["current"] == []
     assert providers["finished_at"] is not None
-    assert providers["extract"] == {"state": "off"}
+    assert providers["extract"]["state"] == "off"
     assert done["osm"] is None
 
     # A second refresh: the files are unchanged (sha256 match); the record is
@@ -414,6 +421,62 @@ def test_a_second_refresh_is_refused_while_one_runs(
     run.finish(refresh_progress.FINISHED)
     second = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
     assert second.run_id != run.run_id
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_provider_card_refresh_waits_for_the_session_refresh(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress
+
+    _make_session(client, admin, ["ZZRAIL"])
+    run = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    started = _read()["providers"]["started_at"]
+    r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "refresh_already_running"
+    assert r.json()["detail"]["started_at"] == started
+    # A dead session refresh (past its lease) does not block the card.
+    _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+    r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    # Nor does a finished one; the card's refresh writes no record.
+    run.finish(refresh_progress.FINISHED)
+    assert (
+        client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin).status_code
+        == 200
+    )
+    record = _read()["providers"]
+    assert (record["state"], record["done"], record["fetched"]) == ("finished", 0, 0)
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_an_osm_refresh_that_breaks_while_rotating_is_recorded_failed(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api.admin import sessions as sessions_api
+    from app.db import SessionLocal
+    from app.main import app
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL"])
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {**s.config, "sources": {**s.config["sources"], "osm_pbf": _url("osm")}}
+        db.commit()
+
+    def broken(_inbox: Path) -> list[str]:
+        raise OSError("stand-in")
+
+    monkeypatch.setattr(sessions_api, "_rotate_osm_pbf", broken)
+    with TestClient(app, raise_server_exceptions=False) as quiet:
+        r = quiet.post(f"/api/sessions/{SID}/sources/osm/refresh", headers=admin)
+    assert r.status_code == 500
+    osm = _read()["osm"]
+    assert osm["state"] == "failed"
+    assert osm["error"] == "oserror"
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -578,10 +641,11 @@ def test_the_extract_follow_up_is_counted_on_the_latest_refresh(
     monkeypatch.setattr(station_module, "enabled", lambda: True)
     run = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
     run.finish(refresh_progress.FINISHED)
-    assert _read()["providers"]["extract"] == {"state": "queued"}
+    queued = _read()["providers"]["extract"]
+    assert queued["state"] == "queued"
+    assert queued["updated_at"] is not None
 
-    follow = refresh_progress.ExtractFollowUp.for_session(SID)
-    assert follow is not None
+    follow = refresh_progress.ExtractFollowUp(SID, run.run_id)
     follow.started(5)
     follow.feed_started("ZZRAIL")
     running = _read()["providers"]["extract"]
@@ -609,10 +673,73 @@ def test_the_extract_follow_up_is_counted_on_the_latest_refresh(
     assert extract["current"] is None
     assert extract["finished_at"] is not None
 
-    # A new refresh: the pass of the old one writes nothing into it.
-    refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
-    follow.outcome(up.FeedOutcome("ZZRAIL", up.SENT))
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_pass_queued_by_one_refresh_never_writes_into_the_next(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress, station_module
+    from app import station_extract_upload as up
+
+    _make_session(client, admin, ["ZZRAIL"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    first = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
+    first.finish(refresh_progress.FINISHED)
+    late = refresh_progress.ExtractFollowUp(SID, first.run_id)
+
+    # Refresh B runs: neither A's pass nor a pass with B's id may write.
+    second = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
+    late.started(1)
+    early = refresh_progress.ExtractFollowUp(SID, second.run_id)
+    early.started(1)
     assert _read()["providers"]["extract"] is None
+    second.finish(refresh_progress.FINISHED)
+    late.outcome(up.FeedOutcome("ZZRAIL", up.SENT))
+    late.finished("finished")
+    assert _read()["providers"]["extract"]["state"] == "queued"
+
+
+def _age_extract(minutes: int) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from app.db import SessionLocal
+
+    when = (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                "UPDATE source_refresh_progress "
+                "SET extract = jsonb_set(extract, '{updated_at}', to_jsonb(CAST(:w AS text)))"
+            ),
+            {"w": when},
+        )
+        db.commit()
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_silent_follow_up_is_shown_interrupted(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress, station_module
+
+    _make_session(client, admin, ["ZZRAIL"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    run = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
+    run.finish(refresh_progress.FINISHED)
+    # Queued: the pass budget is 30 minutes, so 35 without a start means the
+    # web process lost its queue.
+    _age_extract(34)
+    assert _read()["providers"]["extract"]["state"] == "queued"
+    _age_extract(36)
+    assert _read()["providers"]["extract"]["state"] == "interrupted"
+
+    follow = refresh_progress.ExtractFollowUp(SID, run.run_id)
+    follow.started(3)
+    follow._stop.set()  # no beat in this test: the clock is moved by hand
+    _age_extract(4)
+    assert _read()["providers"]["extract"]["state"] == "running"
+    _age_extract(6)
+    assert _read()["providers"]["extract"]["state"] == "interrupted"
 
 
 # ── the table goes with its session ──────────────────────────────────────

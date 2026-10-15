@@ -1111,22 +1111,50 @@ def test_the_refresh_task_uses_the_refresh_budget(monkeypatch: pytest.MonkeyPatc
 def test_the_pass_of_a_session_refresh_is_followed_by_its_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import uuid
+
     from app import refresh_progress
 
     seen: dict[str, Any] = {}
-    follow = object()
 
     def send(sid: str, **kw: Any) -> up.PassResult:
         seen.update(kw, sid=sid)
         return up.PassResult()
 
     monkeypatch.setattr(up, "send_session", send)
-    monkeypatch.setattr(
-        refresh_progress.ExtractFollowUp, "for_session", classmethod(lambda cls, sid: follow)
-    )
-    up.send_after_refresh("zz")
-    assert seen["observer"] is follow
+    run_id = uuid.uuid4()
+    up.send_after_refresh("zz", run_id=run_id)
+    assert isinstance(seen["observer"], refresh_progress.ExtractFollowUp)
+    assert seen["observer"].run_id == run_id
     assert seen["only_provider"] is None
+    up.send_after_refresh("zz")
+    assert seen["observer"] is None
+
+
+@pytest.mark.usefixtures("token")
+def test_a_waiting_pass_reports_to_the_latest_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    import uuid
+
+    ran: list[tuple[Any, ...]] = []
+    gate = threading.Event()
+    busy = threading.Event()
+
+    def send(sid: str, only_provider: str | None = None, run_id: Any = None) -> None:
+        if sid == "zz-busy":
+            busy.set()
+            gate.wait(5)
+        ran.append((sid, run_id))
+
+    monkeypatch.setattr(up, "send_after_refresh", send)
+    first, second = uuid.uuid4(), uuid.uuid4()
+    up.after_refresh("zz-busy")  # keeps the sender busy
+    assert busy.wait(5)
+    up.after_refresh("zz", run_id=first)
+    up.after_refresh("zz", run_id=second)  # still waiting: not queued twice
+    gate.set()
+    _drained()
+    assert ran == [("zz-busy", None), ("zz", second)]
 
 
 @pytest.mark.usefixtures("token")

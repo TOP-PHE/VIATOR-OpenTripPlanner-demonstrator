@@ -63,7 +63,8 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
         return refresh_progress.RefreshRun(sid, scope, uuid.uuid4(), detail)
 
     monkeypatch.setattr(refresh_progress, "claim", claim)
-    monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt: None)
+    monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
+    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
 
 
 @pytest.mark.parametrize(
@@ -74,6 +75,7 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
         ({"skipped": [{"key": "t"}]}, False),
     ],
 )
+@pytest.mark.usefixtures("no_progress_record")
 async def test_refresh_provider_queues_the_extract(
     monkeypatch: pytest.MonkeyPatch, buckets: dict[str, list[dict[str, Any]]], queued: bool
 ) -> None:

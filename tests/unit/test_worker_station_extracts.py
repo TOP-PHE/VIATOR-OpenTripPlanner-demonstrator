@@ -211,13 +211,16 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
         return refresh_progress.RefreshRun(sid, scope, uuid.uuid4(), detail)
 
     monkeypatch.setattr(refresh_progress, "claim", claim)
-    monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt: None)
+    monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
+    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
 
 
 def _record_queue(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
     queued: list[tuple[Any, ...]] = []
     monkeypatch.setattr(
-        sessions_api.station_extract_upload, "after_refresh", lambda *a: queued.append(a)
+        sessions_api.station_extract_upload,
+        "after_refresh",
+        lambda *a, **k: queued.append((*a, *k)),
     )
     return queued
 
@@ -244,9 +247,11 @@ async def test_every_session_refresh_queues_the_pass(
     await sessions_api.refresh_sources(**_args(sessions_api.refresh_sources, sid="zz-session"))
     # Whatever the refresh found: a first deploy or a new extractor version
     # sends what the module lacks even when every file is unchanged.
-    assert queued == [("zz-session",)]
+    # The pass reports to this refresh's progress record (its run_id, issue #359).
+    assert queued == [("zz-session", "run_id")]
 
 
+@pytest.mark.usefixtures("no_progress_record")
 async def test_a_provider_refresh_queues_its_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     async def refreshed(*_a: Any, **_k: Any) -> sessions_api.RefreshSourcesResponse:
         return sessions_api.RefreshSourcesResponse(fetched=[], skipped=[{"key": "t"}])

@@ -44,7 +44,7 @@ def _run(clock: FakeClock, total: int = 3) -> tuple[refresh_progress.RefreshRun,
         refresh_progress._initial_detail(total, None),
         clock=clock,
     )
-    run._execute = lambda _statement: writes.append(  # type: ignore[method-assign]
+    run._execute = lambda _statement, **_k: writes.append(  # type: ignore[method-assign]
         {**run.detail, "current": [dict(c) for c in run.detail["current"]]}
     )
     return run, writes
@@ -334,3 +334,144 @@ def test_without_a_running_task_nothing_is_reported(tmp_path: Path) -> None:
             await feed_fetch._stream_to(client, "https://zz.invalid/f", {}, tmp_path / "f")
 
     asyncio.run(go())
+
+
+# ── repair round 1: lost lease, finishing, writer thread, follow-up beat ──
+
+
+def test_a_refresh_that_lost_its_lease_starts_no_more_downloads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.api.admin import sessions as sessions_api
+
+    run, _writes = _run(FakeClock(), total=3)
+    started: list[str] = []
+
+    async def one(_client: Any, _db: Any, _sid: str, _staging: Path, task: Any) -> dict:
+        started.append(task.label)
+        run._lost = True  # another refresh took the row over meanwhile
+        return {"status": "fetched", "key": task.label}
+
+    monkeypatch.setattr(sessions_api, "_refresh_one_task", one)
+    tasks = [
+        sessions_api._RefreshTask(f"provider[ZZ{i}].timetable(gtfs)", "GTFS", "u", None, None)
+        for i in range(3)
+    ]
+    derived = {
+        "sources": {
+            "providers": [
+                {"id": "ZZXB", "timetable": {"format": "gtfs", "source": "cross_border_filter"}}
+            ]
+        }
+    }
+    fetched, _unchanged, _skipped = asyncio.run(
+        sessions_api._gather_refresh_outcomes(None, "zz", tmp_path, derived, tasks, run)  # type: ignore[arg-type]
+    )
+    assert started == ["provider[ZZ0].timetable(gtfs)"]
+    assert len(fetched) == 1
+
+
+def test_a_beat_after_the_end_is_not_a_lost_lease(caplog: pytest.LogCaptureFixture) -> None:
+    run = refresh_progress.RefreshRun(
+        "zz", refresh_progress.OSM, uuid.uuid4(), refresh_progress._initial_detail(1, None)
+    )
+    executed: list[Any] = []
+    run._execute = lambda statement, **_k: executed.append(statement)  # type: ignore[method-assign]
+    run._finishing = True
+    run.beat()
+    assert executed == []
+
+    class NoRow:
+        rowcount = 0
+
+        def __enter__(self) -> NoRow:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def execute(self, _statement: Any) -> NoRow:
+            return self
+
+        def commit(self) -> None:
+            return None
+
+    quiet = refresh_progress.RefreshRun(
+        "zz",
+        refresh_progress.OSM,
+        uuid.uuid4(),
+        refresh_progress._initial_detail(1, None),
+        factory=NoRow,
+    )
+    quiet._finishing = True
+    with caplog.at_level("WARNING", logger="app.refresh_progress"):
+        quiet._execute("stand-in", beat=True)
+    assert not quiet.lost
+    assert "lease_lost" not in caplog.text
+    quiet._execute("stand-in")  # a progress write that finds no row: lost
+    assert quiet.lost
+
+
+def test_inside_the_context_writes_leave_the_event_loop_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    run = refresh_progress.RefreshRun(
+        "zz", refresh_progress.PROVIDERS, uuid.uuid4(), refresh_progress._initial_detail(2, None)
+    )
+    loop_thread = threading.get_ident()
+    seen: list[tuple[bool, Any]] = []
+
+    def execute(statement: Any, **_k: Any) -> None:
+        values = statement.compile().params
+        seen.append((threading.get_ident() == loop_thread, values.get("state")))
+
+    monkeypatch.setattr(run, "_execute", execute)
+    monkeypatch.setattr(refresh_progress, "_extract_on_finish", lambda _state: {})
+
+    async def body() -> None:
+        async with run:
+            run.done("provider[ZZ1].timetable(gtfs)", {"status": "fetched"})
+            run.done("provider[ZZ2].timetable(gtfs)", {"status": "unchanged"})
+
+    asyncio.run(body())
+    # Two progress writes, then the end, none on the loop's thread.
+    assert [state for _on_loop, state in seen] == [None, None, "finished"]
+    assert not any(on_loop for on_loop, _state in seen)
+
+
+def test_the_follow_up_beats_while_its_pass_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as _time
+
+    monkeypatch.setattr(refresh_progress, "EXTRACT_HEARTBEAT_SECONDS", 0.01)
+    follow = refresh_progress.ExtractFollowUp("zz", uuid.uuid4())
+    beats: list[str] = []
+    monkeypatch.setattr(follow, "_write", lambda: beats.append(follow.state["state"]))
+    follow.started(1)
+    _time.sleep(0.2)
+    follow.finished("finished")
+    count = len(beats)
+    _time.sleep(0.05)
+    assert count >= 5
+    assert len(beats) == count  # the beat stopped with the pass
+    assert beats[-1] == "finished"
+
+
+@pytest.mark.parametrize(
+    ("state", "minutes", "shown"),
+    [
+        ("queued", 34, "queued"),
+        ("queued", 36, "interrupted"),
+        ("running", 4, "running"),
+        ("running", 6, "interrupted"),
+        ("finished", 999, "finished"),
+        ("queued", None, "interrupted"),
+    ],
+)
+def test_a_silent_follow_up_reads_interrupted(state: str, minutes: int | None, shown: str) -> None:
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+    extract: dict[str, Any] = {"state": state}
+    if minutes is not None:
+        extract["updated_at"] = (now - timedelta(minutes=minutes)).isoformat()
+    assert refresh_progress._public_extract(extract, now)["state"] == shown  # type: ignore[index]

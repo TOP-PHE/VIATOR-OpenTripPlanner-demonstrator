@@ -1159,7 +1159,7 @@ async def refresh_sources(
     # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
     # the stop extracts the station module lacks are sent, by the process's
     # sender thread (the refresh never waits on the module).
-    station_extract_upload.after_refresh(sid)
+    station_extract_upload.after_refresh(sid, run_id=run.run_id)
     return RefreshSourcesResponse(
         fetched=fetched,
         unchanged=unchanged,
@@ -1298,49 +1298,51 @@ async def refresh_osm(
     # Issue #359: claimed before the rotation, so a refused second click
     # rotates nothing.
     run = _claim_refresh(sid, refresh_progress.OSM, 1)
-    rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
+    async with run:
+        rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
 
-    fetched: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
+        fetched: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
 
-    # Pass staged_filename="osm.pbf" so dispatch uses the targeted-rotation
-    # branch (only rotates the exact file). The legacy "rotate everything
-    # not ending in .old" branch would re-rotate our .old.<N> generations,
-    # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
-    task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
-    async with run, httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        with run.task(task.label):
-            outcome = await _refresh_one_task(client, db, sid, staging, task)
-        run.done(task.label, outcome)
-        if outcome.get("status") == "fetched":
-            fetched.append({k: v for k, v in outcome.items() if k != "status"})
-        else:
-            skipped.append({k: v for k, v in outcome.items() if k != "status"})
+        # Pass staged_filename="osm.pbf" so dispatch uses the targeted-rotation
+        # branch (only rotates the exact file). The legacy "rotate everything
+        # not ending in .old" branch would re-rotate our .old.<N> generations,
+        # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
+        task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+            with run.task(task.label):
+                outcome = await _refresh_one_task(client, db, sid, staging, task)
+            run.done(task.label, outcome)
+            if outcome.get("status") == "fetched":
+                fetched.append({k: v for k, v in outcome.items() if k != "status"})
+            else:
+                skipped.append({k: v for k, v in outcome.items() if k != "status"})
+        run.phase(refresh_progress.FINISHING)
 
-    if fetched:
-        if s.config is None:
-            s.config = {}
-        staleness.mark_refresh_completed(s.config)
-        flag_modified(s, "config")
+        if fetched:
+            if s.config is None:
+                s.config = {}
+            staleness.mark_refresh_completed(s.config)
+            flag_modified(s, "config")
 
-    audit.record(
-        db,
-        action="session.osm.refreshed",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="session",
-        target_id=sid,
-        metadata={
-            "url": osm_url,
-            "rotated": rotated,
-            "fetched": [f["key"] for f in fetched],
-            "skipped": [s_["key"] for s_ in skipped],
-            # Flagged so monitoring can alert on osm refreshes (they're rare
-            # by intent — every one invalidates the streetGraph cache).
-            "invalidates_street_graph_cache": bool(fetched),
-        },
-    )
-    db.commit()
+        audit.record(
+            db,
+            action="session.osm.refreshed",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
+            metadata={
+                "url": osm_url,
+                "rotated": rotated,
+                "fetched": [f["key"] for f in fetched],
+                "skipped": [s_["key"] for s_ in skipped],
+                # Flagged so monitoring can alert on osm refreshes (they're rare
+                # by intent — every one invalidates the streetGraph cache).
+                "invalidates_street_graph_cache": bool(fetched),
+            },
+        )
+        db.commit()
     return RefreshOsmResponse(fetched=fetched, skipped=skipped, rotated=rotated)
 
 
@@ -1629,6 +1631,10 @@ async def _gather_refresh_outcomes(
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
         for task in work:
+            if run is not None and run.lost:
+                # Another refresh took the record over (this one stalled past
+                # its lease): start no more downloads.
+                return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
             if run is None:
                 outcome = await _refresh_one_task(client, db, sid, staging, task)
             else:
@@ -1636,6 +1642,8 @@ async def _gather_refresh_outcomes(
                     outcome = await _refresh_one_task(client, db, sid, staging, task)
                 run.done(task.label, outcome)
             _bucket_outcome(buckets, outcome)
+    if run is not None and run.lost:
+        return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
     if run is not None and _derived_count(config):
         run.phase(refresh_progress.DERIVED, refresh_progress.DERIVED_LABEL)
     for outcome in await _run_derived_filters(db, sid, config, staging):
@@ -2461,6 +2469,15 @@ async def refresh_provider(
             404,
             f"Provider {pid!r} not found in session {sid!r}. "
             f"Known providers: {[p['id'] for p in providers]}",
+        )
+
+    # Issue #359: not while a whole-session refresh of this session runs (it
+    # downloads this provider too). Read only: this refresh has no record.
+    running = refresh_progress.running_since(sid, refresh_progress.PROVIDERS)
+    if running is not None:
+        raise HTTPException(
+            409,
+            detail=refresh_progress.RefreshRunning(refresh_progress.PROVIDERS, running).detail(),
         )
 
     staging = settings.inbox_dir / sid / "_staging"

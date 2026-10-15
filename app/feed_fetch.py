@@ -309,7 +309,9 @@ def _download_error(exc: httpx.HTTPError, fetch_url: str, state_url: str) -> str
 
 def _expected_bytes(response: httpx.Response) -> int | None:
     """The body's announced size, or None: unknown, or a content-encoded
-    body (httpx decodes it, so its byte count is not the Content-Length)."""
+    body (httpx decodes it, so its byte count is not the Content-Length).
+    A resumed download (206, PR #360) announces only the rest: its full size
+    is the total of Content-Range, which this must then use."""
     if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
         return None
     try:
