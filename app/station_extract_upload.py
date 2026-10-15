@@ -328,6 +328,38 @@ class PassResult:
         return found
 
 
+class PassObserver(Protocol):
+    """Who follows a pass as it goes (the refresh progress record of
+    `app/refresh_progress.py`, `ExtractFollowUp`). Its methods never raise."""
+
+    def started(self, total: int) -> None: ...
+
+    def feed_started(self, provider_id: str) -> None: ...
+
+    def outcome(self, outcome: FeedOutcome) -> None: ...
+
+    def finished(self, end: str) -> None: ...
+
+
+class _Unobserved:
+    """A pass nobody follows."""
+
+    def started(self, total: int) -> None:
+        """Nothing to tell."""
+
+    def feed_started(self, provider_id: str) -> None:
+        """Nothing to tell."""
+
+    def outcome(self, outcome: FeedOutcome) -> None:
+        """Nothing to tell."""
+
+    def finished(self, end: str) -> None:
+        """Nothing to tell."""
+
+
+_UNOBSERVED = _Unobserved()
+
+
 # ── one call ─────────────────────────────────────────────────────────────
 
 
@@ -1051,20 +1083,25 @@ def send_session_extracts(
     record: bool = True,
     cache_only: bool = False,
     ready: Callable[[str, Feed], bool] = _ready,
+    observer: PassObserver | None = None,
 ) -> PassResult:
     """Send what the module lacks of a session's feeds, within `budget` seconds,
     in the order of `_send_order` (`ready` says which need no extraction).
+    `observer`, when given, is told the pass's start, each feed and the end.
 
     Never raises an `Exception`: an unexpected one ends the pass (`error`,
     one WARNING). The caller goes on whatever the result (a graph is built,
     a refresh answers)."""
     result = PassResult()
+    follow = observer or _UNOBSERVED
     if not station_module.enabled():
         result.off = True
         log.info(_SKIPPED_OFF)
+        follow.finished(OFF)
         return result
     clock = clock or SystemClock()
     done: list[tuple[int, FeedOutcome]] = []
+    end = ERROR
     try:
         work = _Pass(
             _Calls(transport, _session_header(sid)),
@@ -1076,16 +1113,22 @@ def send_session_extracts(
             sid,
             cache_only,
         )
-        for place, feed in _send_order(sid, list(feeds), ready):
+        order = _send_order(sid, list(feeds), ready)
+        follow.started(len(order))
+        for place, feed in order:
             if should_stop():
                 raise _Stop
+            follow.feed_started(feed.provider_id)
             outcome = work.feed(feed)
             _log_outcome(outcome)
             STATION_EXTRACT_FEEDS_TOTAL.labels(outcome=outcome.state).inc()
             done.append((place, outcome))
             if record:
                 record_outcome(sid, outcome)
+            follow.outcome(outcome)
+        end = "finished"
     except _Stop:
+        end = CANCELLED
         result.cancelled = True
         log.info("station_extract.cancelled")
         return result
@@ -1094,6 +1137,7 @@ def send_session_extracts(
         return result
     finally:
         result.outcomes = [outcome for _, outcome in sorted(done, key=lambda item: item[0])]
+        follow.finished(end)
     counts = result.counts()
     log.info(
         "station_extract.done feeds=%d sent=%d held=%d refused=%d unavailable=%d skipped=%d",
@@ -1134,12 +1178,15 @@ def send_session(
     should_stop: Callable[[], bool] = lambda: False,
     session_factory: Callable[[], Any] | None = None,
     cache_only: bool = False,
+    observer: PassObserver | None = None,
 ) -> PassResult:
     """Read a session's feeds from the database, then send them. Never raises
     an `Exception`. Used by the worker before a graph build, and by the
     refresh endpoints in a background task (`send_after_refresh`)."""
+    follow = observer or _UNOBSERVED
     if not station_module.enabled():
         log.info(_SKIPPED_OFF)
+        follow.finished(OFF)
         return PassResult(off=True)
     try:
         if session_factory is None:
@@ -1150,16 +1197,29 @@ def send_session(
             feeds = _feeds_of(db, sid, only_provider)
     except Exception as exc:
         log.warning(_FAILED, ERROR, type(exc).__name__)
+        follow.finished(ERROR)
         return PassResult()
     with _one_at_a_time:
         return send_session_extracts(
-            sid, feeds, budget=budget, should_stop=should_stop, cache_only=cache_only
+            sid,
+            feeds,
+            budget=budget,
+            should_stop=should_stop,
+            cache_only=cache_only,
+            observer=observer,
         )
 
 
 def send_after_refresh(sid: str, only_provider: str | None = None) -> None:
-    """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender thread."""
-    send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider)
+    """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender
+    thread. The pass of a whole-session refresh is written to the session's
+    provider refresh record (issue #359), which the Sessions page shows."""
+    observer: PassObserver | None = None
+    if only_provider is None:
+        from .refresh_progress import ExtractFollowUp
+
+        observer = ExtractFollowUp.for_session(sid)
+    send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider, observer=observer)
 
 
 # The refresh endpoints hand their pass to one sender thread of the process,
