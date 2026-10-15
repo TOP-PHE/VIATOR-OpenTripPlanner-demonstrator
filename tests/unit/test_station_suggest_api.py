@@ -761,3 +761,22 @@ def test_a_token_httpx_cannot_encode_gives_viators_own_list_and_stays_out_of_the
     assert "station_module.fallback reason=network" in logged
     for character in ("\u00e9", "\u20ac", token[4:]):
         assert character not in logged
+
+
+def test_the_typeahead_gets_the_five_fields_never_the_referential(
+    client: TestClient, module_on: str, module: Module
+) -> None:
+    """The module's VIATOR id, origin and licence are for the Stations page:
+    the journey typeahead answers its five fields and its source only."""
+    licence = {
+        "name": "zz-crd",
+        "position": None,
+        "uic": None,
+        "share_alike": [],
+        "attribution": [],
+    }
+    referential = {**MODULE_ROW, "viator_id": "ZZ-99001", "uic_origin": "TL", "licence": licence}
+    module.response = httpx.Response(200, json={"stations": [referential]})
+    _, cookies = _login()
+
+    assert _post(client, {"q": "Zzville"}, cookies).json() == [{**MODULE_ROW, "source": "msmm"}]

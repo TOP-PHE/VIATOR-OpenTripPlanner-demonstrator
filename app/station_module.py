@@ -16,11 +16,16 @@ inside the network like VIATOR's calls to MOTIS):
   `admin_search_outcome(q, user_id)` is the same call made by an admin action (the coverage hubs' resolve route, when
   the near call finds nothing around a hub): it follows the lookup's pause
   rule below.
-- `lookup(uics, user_id)` — `POST /internal/v1/stations/lookup`, the served
-  stations of 1 to 20 distinct MERITS codes, each with its `parent_uic`;
-  every code counts as one call on the person's limits. An `Outcome` too.
-  Used by the coverage hubs' confirm and check routes
-  (app/api/admin/network_coverage.py), never by the typeahead.
+- `lookup(uics, user_id, ids=...)` — `POST /internal/v1/stations/lookup`,
+  the served stations of 1 to 20 distinct keys in all: MERITS codes
+  (`uics`) and VIATOR ids (`ids`), each row with its `parent_uic`; every key
+  counts as one call on the person's limits. An `Outcome` too. Used by the
+  coverage hubs' confirm and check routes (app/api/admin/network_coverage.py),
+  never by the typeahead.
+- `countries()` — `GET /internal/v1/countries`, the countries of the
+  module's served stations, kept 60 s; None on any failure. Read by the
+  country gate of a session's providers (app/api/admin/sessions.py), only
+  when VIATOR's Trainline list lacks a declared country.
 - `near_outcome(lat, lon, user_id, radius_m)` — `POST
   /internal/v1/stations/near`, at most five served stations within
   `radius_m` metres (1 to 300) of a position, nearest first, each with its
@@ -34,6 +39,28 @@ inside the network like VIATOR's calls to MOTIS):
   module's sources, kept 60 s. Asynchronous, like search, so that its
   deadline is real. Awaited by `journey_page` (app/api/pages.py) for the
   licence notice under the title of /journey.
+
+**The fields of a station** (the contract with the module, phase 2 of its
+design 22.12; its fields in 20.23). Every row keeps `name`, `latitude`,
+`longitude`, `country_iso` and `uic`, and gains `viator_id` (the module's
+VIATOR id, `ZZ-99999` in form: `is_viator_id`), `uic_origin` (the origin
+label of the code: `MN`, `CM`, `VM`, `TL` or `FD`; any other word, `VU`
+included, is read as None) and `licence` (`_licence`: the licence tags of the
+name, the position and the code, the fields under a share-alike licence and
+the attribution texts, read part by part, with `unreadable` when a licence
+was given but nothing of it reads; None when none was given); a near row also `parent_viator_id`, a lookup
+row `parent_viator_id` and `replaced_by` (the id an alias was merged into).
+A module from before these fields answers rows without them: each is then
+None. A row's `uic` may be null when the row carries a valid `viator_id`
+(the module serves such rows from phase 3; a row with neither is dropped);
+such a station has no stop-id routing and VIATOR uses its position. The
+current id of a station is `current_id(row)`: `replaced_by` when set, else
+`viator_id`; VIATOR stores that, never `viator_id` alone. A text of the
+licence is a third party's: kept only when it holds no character of the
+categories Cc, Cs, Cf, Zl and Zp (controls, surrogates, format characters
+such as the bidirectional and zero-width ones, line and paragraph
+separators), a tag of at most 100 characters, an attribution text of at
+most 500, and put in a page as text only.
 
 `search()` and `attribution()` return `None` on any failure, and the caller
 then uses VIATOR's own behaviour (the master_stations list; no notice); the
@@ -61,12 +88,12 @@ Rules this client keeps on purpose:
   hangs, and a rare admin action must not switch it off for everyone, in
   particular when an older module answers 404 for the lookup's path. **A
   near call follows the lookup's rule**, for the same reasons (an older
-  module answers 404 for `/stations/near`), **and so does an admin
-  search** (`admin_search_outcome`).
-- **A real deadline and a size cap**: 1 s for a whole search, lookup or near
-  call, 0.5 s for an attribution (httpx's timeouts bound each read, not the
-  call), and a body larger than 64 KiB (search, lookup, near) or 256 KiB
-  (attribution) is refused unread;
+  module answers 404 for `/stations/near`), **and so do an admin
+  search** (`admin_search_outcome`) **and the countries call**.
+- **A real deadline and a size cap**: 1 s for a whole search, lookup, near
+  or countries call, 0.5 s for an attribution (httpx's timeouts bound each
+  read, not the call), and a body larger than 128 KiB (search, lookup,
+  near, countries) or 256 KiB (attribution) is refused unread;
   so is a compressed answer, which could inflate past the cap at once.
   All count as failures that pause. Any other error (a bad address, a
   token httpx cannot encode) falls back too, as `network`.
@@ -79,7 +106,8 @@ Rules this client keeps on purpose:
   rule mirrors the module's, so a refusal means the two have drifted)
   (`station_module.lookup_failed reason=<word>` for a lookup,
   `station_module.near_failed reason=<word>` for a near call,
-  `station_module.admin_search_failed reason=<word>` for an admin search),
+  `station_module.admin_search_failed reason=<word>` for an admin search,
+  `station_module.countries_failed reason=<word>` for the countries call),
   never a code, never a name and never a position.
 """
 
@@ -115,6 +143,38 @@ USER_HEADER = "X-Viator-User-Id"
 LOOKUP_MAX = 20
 CODE_MIN = 3
 CODE_MAX = 20
+
+# The VIATOR id of the module's design 22.5: the ISO 3166-1 alpha-2 country
+# at creation, a hyphen, five digits (`ZZ-99999`). Exactly 8 characters:
+# it can never be a 7-digit UIC code, nor a 7-character CRD location code.
+VIATOR_ID_LENGTH = 8
+# `re.ASCII`: `\d` is the ten ASCII digits only, never digits of other scripts.
+_VIATOR_ID = re.compile(r"[A-Z]{2}-\d{5}", re.ASCII)
+
+# The origin labels of a station code the module serves (its design 22.7),
+# in clear words for the pages. `VU` (derived, unproven) is never served, and
+# any word not listed here is read as None.
+UIC_ORIGIN_TEXTS = {
+    "MN": "corrected by hand in the station module",
+    "CM": "copied from MERITS",
+    "VM": "derived by a proven rule of the station module",
+    "TL": "from the Trainline list",
+    "FD": "declared by a timetable feed",
+}
+
+# The licence of a row (the module's design 22.8 and 20.23): the tag of each
+# of these three values, the ones under a share-alike licence, and the
+# attribution texts of the timetable feeds behind them (two at most a row in
+# the module; four kept here, each of 500 characters at most).
+LICENCE_FIELDS = ("name", "position", "uic")
+LICENCE_TAG_MAX = 100
+ATTRIBUTION_TEXTS_MAX = 4
+# The Unicode categories a third party's text of a licence may not hold:
+# controls (Cc), surrogates (Cs), format characters (Cf: the bidirectional
+# controls, which could reorder what a page shows around the text, the
+# zero-width characters, the byte order mark) and line and paragraph
+# separators (Zl, Zp).
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cs", "Cf", "Zl", "Zp"})
 
 # A near call: a radius of 1 to 300 whole metres, at most five stations (the
 # module's rule, its design 21.13 and decision 62).
@@ -156,13 +216,26 @@ ATTRIBUTION_DEADLINE = 0.5
 ATTRIBUTION_TIMEOUT = httpx.Timeout(ATTRIBUTION_DEADLINE)
 
 # The largest body read from the module, decoded. A search answer is ten
-# short rows (a few KiB); an attribution is at most 20 groups of texts of 500
+# rows; an attribution is at most 20 groups of texts of 500
 # characters. Anything larger is refused without being read to its end. The
 # cap counts the bytes as they arrive: the client asks for no compression
 # and refuses a compressed answer, which could inflate far past the cap
 # inside a single chunk.
-SEARCH_MAX_BYTES = 64 * 1024
+# Search, near and lookup share this cap since the contract's phase 2: a
+# lookup answers up to 20 rows, each of which may carry attribution texts of
+# the timetable feeds (two of 500 characters, up to 4 bytes each, from the
+# module's phase 3: about 80 KiB with the rest of the rows, the module's
+# entry 713); a search of 10 rows or a near call of 5 stays well under it.
+# One cap for the three calls, so no answer of the contract is refused by
+# one call and taken by another.
+SEARCH_MAX_BYTES = 128 * 1024
 ATTRIBUTION_MAX_BYTES = 256 * 1024
+
+COUNTRIES_PATH = "/internal/v1/countries"
+COUNTRIES_TTL_SECONDS = 60.0
+# The module's countries are ISO codes; the list holds at most this many.
+COUNTRIES_MAX = 300
+_COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
 
 PAUSE_SECONDS = 30.0
 ATTRIBUTION_TTL_SECONDS = 60.0
@@ -251,16 +324,19 @@ class _State:
         self.lock = threading.Lock()
         self.paused_until = 0.0
         self.attribution: tuple[float, dict[str, Any]] | None = None
+        self.countries: tuple[float, frozenset[str]] | None = None
 
 
 _state = _State()
 
 
 def reset() -> None:
-    """Forget the pause and the cached attribution (tests, and nothing else)."""
+    """Forget the pause, the cached attribution and the cached countries
+    (tests, and nothing else)."""
     with _state.lock:
         _state.paused_until = 0.0
         _state.attribution = None
+        _state.countries = None
 
 
 def enabled() -> bool:
@@ -415,11 +491,115 @@ def _text_or_null(value: Any) -> bool:
     return value is None or (isinstance(value, str) and _plain(value))
 
 
+def is_viator_id(value: Any) -> TypeGuard[str]:
+    """True for a VIATOR id of the module's form (`ZZ-99999`: two capital
+    ASCII letters, a hyphen, five ASCII digits), and for nothing else."""
+    return (
+        isinstance(value, str)
+        and len(value) == VIATOR_ID_LENGTH
+        and _VIATOR_ID.fullmatch(value) is not None
+    )
+
+
+def _viator_id_or_none(value: Any) -> str | None:
+    """A VIATOR id as sent, or None for an absent, null or malformed one."""
+    return value if is_viator_id(value) else None
+
+
+def current_id(row: dict[str, Any]) -> str | None:
+    """The id VIATOR stores for a station row: `replaced_by` (the survivor of
+    a merge, when the row answered an alias) when set, else `viator_id`; None
+    when the row has neither (a module from before the VIATOR ids)."""
+    survivor = row.get("replaced_by")
+    if survivor is not None:
+        return str(survivor)
+    found = row.get("viator_id")
+    return None if found is None else str(found)
+
+
+def uic_origin_text(label: str | None) -> str | None:
+    """The origin label of a station code in clear words, or None."""
+    return None if label is None else UIC_ORIGIN_TEXTS.get(label)
+
+
+def _origin_or_none(value: Any) -> str | None:
+    """A known origin label (`UIC_ORIGIN_TEXTS`) as sent, else None: an
+    unknown word (`VU` included) never fails the row."""
+    return value if isinstance(value, str) and value in UIC_ORIGIN_TEXTS else None
+
+
+def _third_party_text(value: Any, limit: int) -> bool:
+    """True for a non-empty text of at most `limit` characters that holds no
+    control character (Cc), no surrogate (Cs), no format character (Cf: the
+    bidirectional controls, the zero-width characters, the byte order mark;
+    the module refuses them too, its `has_format_character`) and no line or
+    paragraph separator (Zl, Zp)."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= limit
+        and not any(unicodedata.category(character) in _UNSAFE_CATEGORIES for character in value)
+    )
+
+
+def _licence_tag(value: Any) -> str | None:
+    """A licence tag as sent, or None for an absent or unreadable one."""
+    return str(value) if _third_party_text(value, LICENCE_TAG_MAX) else None
+
+
+def _readable_list(value: Any, check: Callable[[Any], bool], most: int) -> list[str]:
+    """The items of a list that pass `check`, each once, at most `most`; an
+    item that does not pass is left out, the others kept."""
+    if not isinstance(value, list):
+        return []
+    kept: list[str] = []
+    for item in value:
+        if check(item) and item not in kept:
+            kept.append(str(item))
+    return kept[:most]
+
+
+def _licence(value: Any) -> dict[str, Any] | None:
+    """The licence of a row: None when absent or null (the module gives no
+    licence), else `{name, position, uic, share_alike, attribution,
+    unreadable}` with what can be read of it. A tag that is not a plain text
+    of at most 100 characters is None, an attribution text that is not a
+    plain text of at most 500 characters is left out (four kept at most), a
+    share-alike field not among `LICENCE_FIELDS` is left out, an unknown
+    field is ignored: a faulty part never hides the rest, the share-alike
+    marks above all (the module's design 22.8). `unreadable` is true when a
+    licence was given but nothing of it can be read (not an object, or no
+    readable part), so a page tells it from no licence. Never drops the
+    row."""
+    if value is None:
+        return None
+    given = value if isinstance(value, dict) else {}
+    tags = {field: _licence_tag(given.get(field)) for field in LICENCE_FIELDS}
+    share_alike = _readable_list(
+        given.get("share_alike"), lambda field: field in LICENCE_FIELDS, len(LICENCE_FIELDS)
+    )
+    attribution = _readable_list(
+        given.get("attribution"),
+        lambda text: _third_party_text(text, MAX_TEXT),
+        ATTRIBUTION_TEXTS_MAX,
+    )
+    readable = any(tags.values()) or bool(share_alike) or bool(attribution)
+    return {
+        **tags,
+        "share_alike": share_alike,
+        "attribution": attribution,
+        "unreadable": not readable,
+    }
+
+
 def _station_row(item: Any) -> dict[str, Any] | None:
     """One row of the module's answer as the typeahead reads it, or None when
     it is not a usable row. The name is kept as sent (it may hold markup: the
     page escapes it), but a row whose name, code or country holds a surrogate
-    or a control character is dropped."""
+    or a control character is dropped. The code may be null when the row
+    carries a valid VIATOR id; a code of the VIATOR id's form is refused (it
+    is no code). The fields of the referential (`viator_id`, `uic_origin`,
+    `licence`) are None when absent or malformed; an origin without a code
+    is None."""
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -427,13 +607,16 @@ def _station_row(item: Any) -> dict[str, Any] | None:
     longitude = item.get("longitude")
     country = item.get("country_iso")
     uic = item.get("uic")
+    viator_id = _viator_id_or_none(item.get("viator_id"))
     if not isinstance(name, str) or not name or not _plain(name):
         return None
     if not (_is_number(latitude) and _is_number(longitude)):
         return None
     if not _text_or_null(country):
         return None
-    if not isinstance(uic, str) or not _plain(uic):
+    if uic is None and viator_id is None:
+        return None
+    if uic is not None and (not isinstance(uic, str) or not _plain(uic) or is_viator_id(uic)):
         return None
     return {
         "name": name,
@@ -441,7 +624,16 @@ def _station_row(item: Any) -> dict[str, Any] | None:
         "longitude": float(longitude),
         "country_iso": country,
         "uic": uic,
+        "viator_id": viator_id,
+        "uic_origin": None if uic is None else _origin_or_none(item.get("uic_origin")),
+        "licence": _licence(item.get("licence")),
     }
+
+
+def station_key(row: dict[str, Any]) -> str:
+    """What tells one station of an answer from another: its code, or its
+    VIATOR id when it has no code (a parsed row always has one of them)."""
+    return str(row["uic"] if row["uic"] is not None else row["viator_id"])
 
 
 def _stations(payload: Any) -> list[dict[str, Any]]:
@@ -534,11 +726,11 @@ async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
 
 
 def _checked_codes(uics: list[str]) -> list[str]:
-    """The codes of a lookup, or ValueError: 1 to 20 codes, all distinct as
+    """The codes of a lookup, or ValueError: at most 20 codes, all distinct as
     written (capitals included), each passing `code_refused`. The module
     would refuse the whole call otherwise, after counting it."""
-    if not 1 <= len(uics) <= LOOKUP_MAX:
-        raise ValueError(f"a lookup takes 1 to {LOOKUP_MAX} codes")
+    if len(uics) > LOOKUP_MAX:
+        raise ValueError(f"a lookup takes 1 to {LOOKUP_MAX} keys")
     if len(set(uics)) != len(uics):
         raise ValueError("a lookup takes each code once")
     for code in uics:
@@ -547,54 +739,137 @@ def _checked_codes(uics: list[str]) -> list[str]:
     return list(uics)
 
 
-def _lookup_row(item: Any, asked: set[str]) -> dict[str, Any] | None:
-    """One row of a lookup answer: a search row whose code was asked for,
-    plus `parent_uic` (a string or null); None when it is not a usable row."""
+def _checked_ids(ids: list[str]) -> list[str]:
+    """The VIATOR ids of a lookup, or ValueError: each once, each of the form
+    `is_viator_id` accepts (the module refuses the call otherwise)."""
+    if len(set(ids)) != len(ids):
+        raise ValueError("a lookup takes each id once")
+    if not all(is_viator_id(found) for found in ids):
+        raise ValueError("an id of the lookup is not a VIATOR id")
+    return list(ids)
+
+
+def _lookup_body(codes: list[str], ids: list[str]) -> dict[str, Any]:
+    """The body of a lookup: `uics` and `ids`, each only when it holds a key
+    (a module from before the VIATOR ids refuses any field but `uics`, and
+    the module refuses an empty field), 1 to 20 keys in all."""
+    if not 1 <= len(codes) + len(ids) <= LOOKUP_MAX:
+        raise ValueError(f"a lookup takes 1 to {LOOKUP_MAX} keys")
+    body: dict[str, Any] = {}
+    if codes:
+        body["uics"] = codes
+    if ids:
+        body["ids"] = ids
+    return body
+
+
+class _Keys:
+    """Which key of a lookup each row answers, in the module's order: the
+    rows of the codes first, in their order, then those of the ids (its
+    design 20.23). A row answers a code while the codes' rows run (its
+    `uic` is a code asked and not answered yet); once a row has answered an
+    id, the codes' rows are over, and a row answers an id when its
+    `viator_id` is an id asked and not answered yet (the module names an
+    alias's row by the id asked). A station asked both ways thus gives its
+    code's row and its id's row, even when the id's row (its anchor's)
+    carries a code that was asked too."""
+
+    def __init__(self, codes: list[str], ids: list[str]) -> None:
+        self.codes = set(codes)
+        self.ids = set(ids)
+        self.in_ids = False
+
+    def answered(self, row: dict[str, Any]) -> tuple[str, str] | None:
+        """`("uic", code)` or `("id", id)` for the key `row` answers, taken
+        out of those left; None when it answers none."""
+        if not self.in_ids and row["uic"] is not None and row["uic"] in self.codes:
+            self.codes.discard(row["uic"])
+            return ("uic", row["uic"])
+        if row["viator_id"] is not None and row["viator_id"] in self.ids:
+            self.ids.discard(row["viator_id"])
+            self.in_ids = True
+            return ("id", row["viator_id"])
+        return None
+
+
+def lookup_by_key(
+    rows: list[dict[str, Any]], codes: list[str], ids: list[str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """The rows of a lookup (as `lookup` gave them, for `codes` and `ids`) by
+    the code they answer and by the id they answer, by the rule of `_Keys`."""
+    keys = _Keys(codes, ids)
+    by_code: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        answered = keys.answered(row)
+        if answered is not None:
+            (by_code if answered[0] == "uic" else by_id)[answered[1]] = row
+    return by_code, by_id
+
+
+def _lookup_row(item: Any, keys: _Keys) -> dict[str, Any] | None:
+    """One row of a lookup answer: a search row that answers a key asked and
+    not answered yet (`_Keys`), plus `parent_uic` (a string or null),
+    `parent_viator_id` and `replaced_by` (VIATOR ids, None when absent or
+    malformed); None when it is not a usable row."""
     row = _station_row(item)
-    if row is None or row["uic"] not in asked:
+    if row is None:
         return None
     parent = item.get("parent_uic")
     if not _text_or_null(parent):
         return None
+    if keys.answered(row) is None:
+        return None
     row["parent_uic"] = parent
+    row["parent_viator_id"] = _viator_id_or_none(item.get("parent_viator_id"))
+    row["replaced_by"] = _viator_id_or_none(item.get("replaced_by"))
     return row
 
 
-def _lookup_rows(payload: Any, codes: list[str]) -> list[dict[str, Any]]:
-    """The usable rows of a lookup answer, at most one per code asked; a
-    wrong top-level shape refuses the whole answer."""
+def _lookup_rows(payload: Any, codes: list[str], ids: list[str]) -> list[dict[str, Any]]:
+    """The usable rows of a lookup answer, at most one per key asked, in the
+    module's order (`_Keys`); a wrong top-level shape refuses the whole
+    answer."""
     stations = payload.get("stations") if isinstance(payload, dict) else None
     if not isinstance(stations, list):
         raise _Failure("shape", pause=False)
-    asked = set(codes)
+    keys = _Keys(codes, ids)
     rows: list[dict[str, Any]] = []
     for item in stations:
-        row = _lookup_row(item, asked)
+        row = _lookup_row(item, keys)
         if row is not None:
-            asked.discard(row["uic"])
             rows.append(row)
     return rows
 
 
-async def lookup(uics: list[str], user_id: uuid.UUID) -> Outcome:
-    """The module's served stations of `uics` (1 to 20 distinct codes), on
-    behalf of the VIATOR user `user_id`, as an `Outcome`: at most one row per
-    code, with its `parent_uic`; a code the module does not serve is simply
-    absent. Each code counts as one call on the person's limits.
+async def lookup(uics: list[str], user_id: uuid.UUID, ids: list[str] | None = None) -> Outcome:
+    """The module's served stations of `uics` (MERITS codes) and `ids`
+    (VIATOR ids), 1 to 20 distinct keys in all, on behalf of the VIATOR user
+    `user_id`, as an `Outcome`: at most one row per key, with its
+    `parent_uic`, `parent_viator_id` and `replaced_by`; a key the module does
+    not serve is simply absent. Each key counts as one call on the person's
+    limits. A row for an id names the id asked as `viator_id`; when that id
+    was merged into another, `replaced_by` names the survivor, the id to
+    store (`current_id`). The row answered for an id is the row of its
+    anchor: its `uic` need not be the code a search showed beside that id.
 
-    Codes the module would refuse (more than 20, a repeated code, a code that
-    fails `code_refused`) raise ValueError before any call: the caller sends
-    codes it stored or that the module proposed, each once.
+    Keys the module would refuse (none, more than 20, a repeated key, a code
+    that fails `code_refused`, an id `is_viator_id` refuses) raise
+    ValueError before any call: the caller sends keys it stored or that the
+    module proposed, each once. Without ids, the body is `{"uics": [...]}`
+    as before, which a module from before the VIATOR ids accepts.
 
     **A failure never starts the pause** (the typeahead of every user must
     not switch to the fallback because of an admin action); a pause that runs
     is honoured (`paused`, no call). Failures are logged as
-    `station_module.lookup_failed reason=<word>`, never a code."""
+    `station_module.lookup_failed reason=<word>`, never a key."""
     codes = _checked_codes(uics)
+    wanted = _checked_ids(ids or [])
+    body = _lookup_body(codes, wanted)
 
     async def call() -> list[dict[str, Any]]:
-        payload = _json_body(await _post(LOOKUP_PATH, {"uics": codes}, user_id))
-        return _lookup_rows(payload, codes)
+        payload = _json_body(await _post(LOOKUP_PATH, body, user_id))
+        return _lookup_rows(payload, codes, wanted)
 
     return await _without_pause("station_module.lookup_failed", call)
 
@@ -654,7 +929,8 @@ def _checked_position(lat: float, lon: float, radius_m: int) -> dict[str, Any]:
 
 def _near_row(item: Any, radius_m: int) -> dict[str, Any] | None:
     """One row of a near answer: a search row with `parent_uic` (a string or
-    null) and `distance_m` (a whole number of metres, 0 to the radius); None
+    null), `distance_m` (a whole number of metres, 0 to the radius) and
+    `parent_viator_id` (a VIATOR id, None when absent or malformed); None
     when it is not a usable row."""
     row = _station_row(item)
     if row is None:
@@ -669,13 +945,14 @@ def _near_row(item: Any, radius_m: int) -> dict[str, Any] | None:
         return None
     row["parent_uic"] = parent
     row["distance_m"] = distance
+    row["parent_viator_id"] = _viator_id_or_none(item.get("parent_viator_id"))
     return row
 
 
 def _near_rows(payload: Any, radius_m: int) -> list[dict[str, Any]]:
     """The usable rows of a near answer, in the module's order (nearest
-    first), each code once, at most five; a wrong top-level shape refuses
-    the whole answer."""
+    first), each station once (`station_key`), at most five; a wrong
+    top-level shape refuses the whole answer."""
     stations = payload.get("stations") if isinstance(payload, dict) else None
     if not isinstance(stations, list):
         raise _Failure("shape", pause=False)
@@ -683,9 +960,9 @@ def _near_rows(payload: Any, radius_m: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in stations:
         row = _near_row(item, radius_m)
-        if row is None or row["uic"] in seen:
+        if row is None or station_key(row) in seen:
             continue
-        seen.add(row["uic"])
+        seen.add(station_key(row))
         rows.append(row)
         if len(rows) >= NEAR_MAX_ROWS:
             break
@@ -804,3 +1081,81 @@ async def attribution() -> dict[str, Any] | None:
     with _state.lock:
         _state.attribution = (clock(), answer)
     return answer
+
+
+def _countries_of(payload: Any) -> frozenset[str]:
+    """The countries of a countries answer: `{"countries": [...]}`, at most
+    300 codes of two capital ASCII letters; anything else is a shape failure."""
+    found = payload.get("countries") if isinstance(payload, dict) else None
+    if not isinstance(found, list) or len(found) > COUNTRIES_MAX:
+        raise _Failure("shape", pause=False)
+    if not all(isinstance(code, str) and _COUNTRY.fullmatch(code) for code in found):
+        raise _Failure("shape", pause=False)
+    return frozenset(found)
+
+
+async def _get_countries() -> _Answer:
+    try:
+        async with (
+            asyncio.timeout(SEARCH_DEADLINE),
+            httpx.AsyncClient(timeout=SEARCH_TIMEOUT, trust_env=False) as client,
+            client.stream("GET", _url(COUNTRIES_PATH), headers=_headers()) as response,
+        ):
+            return await _read(response, SEARCH_MAX_BYTES)
+    except (TimeoutError, httpx.TimeoutException):
+        raise _Failure("timeout", pause=False) from None
+    except httpx.HTTPError:
+        raise _Failure("network", pause=False) from None
+
+
+def _cached_countries() -> frozenset[str] | None:
+    with _state.lock:
+        cached = _state.countries
+    if cached is not None and clock() - cached[0] < COUNTRIES_TTL_SECONDS:
+        return cached[1]
+    return None
+
+
+async def countries() -> frozenset[str] | None:
+    """The countries of the module's served stations (`GET
+    /internal/v1/countries`: no identity, no limit, no station), cached
+    60 s; None when the module is not configured, is paused or fails.
+
+    Read by the country gate of a session's providers: "a country the
+    module serves" (the module's design 22.12, decision D-R12 B). An admin
+    action like the lookup: **a failure never starts the pause** and is
+    logged as `station_module.countries_failed reason=<word>`; a pause that
+    runs is honoured, without a call. A failure forgets the cache."""
+    try:
+        if not enabled():
+            raise _Failure("off", pause=False)
+        if _paused():
+            raise _Failure("paused", pause=False)
+        cached = _cached_countries()
+        if cached is not None:
+            return cached
+        found = _countries_of(_json_body(await _get_countries()))
+    except _Failure as failure:
+        _forget_countries()
+        _log_failure("station_module.countries_failed", failure.reason)
+        return None
+    except Exception:
+        # As in search(): its text is never logged; and no pause.
+        _forget_countries()
+        _log_failure("station_module.countries_failed", "network")
+        return None
+    with _state.lock:
+        _state.countries = (clock(), found)
+    return found
+
+
+def _forget_countries() -> None:
+    with _state.lock:
+        _state.countries = None
+
+
+def countries_blocking() -> frozenset[str] | None:
+    """`countries()` for a caller that runs outside the event loop (a
+    synchronous route, run in a worker thread, or a script): its own short
+    event loop, the same deadline. Never call it from a coroutine."""
+    return asyncio.run(countries())

@@ -296,6 +296,9 @@ def test_the_placeholder_says_the_text_rule(monkeypatch: pytest.MonkeyPatch) -> 
     assert 'placeholder="at least 3 letters or digits"' in html
 
 
+HEADINGS = ["Name", "Country", "Code", "Position", "Origin", "VIATOR id", "Code origin", "Licence"]
+
+
 def run_page(monkeypatch: pytest.MonkeyPatch, role: str, *, module: bool) -> Any:
     script = page_script(render(monkeypatch, role, module=module))
     return run_node_program(DOM_PRELUDE + script + DOM_SCENARIO)
@@ -311,7 +314,7 @@ def test_an_administrator_with_the_module_sees_labels_notices_and_links(
 
     msmm = out["msmm"]
     assert msmm["notice"] == NOTICE_MSMM
-    assert msmm["heads"] == ["Name", "Country", "Code", "Position", "Origin", ""]
+    assert msmm["heads"] == [*HEADINGS, ""]
     # Markup from the module stays text.
     assert msmm["cells"][0][:5] == [
         "<img src=x onerror=alert(1)>Zz Halt",
@@ -331,7 +334,9 @@ def test_an_administrator_with_the_module_sees_labels_notices_and_links(
     trainline = out["trainline"]
     assert trainline["notice"] == NOTICE_FALLBACK
     assert "warning" in trainline["noticeClass"]
-    assert trainline["cells"] == [["Zz Trainline", "—", "9900003", "—", "Trainline", ""]]
+    assert trainline["cells"] == [
+        ["Zz Trainline", "—", "9900003", "—", "Trainline", "—", "—", "—", ""]
+    ]
     assert trainline["links"] == [[]]  # no module link on a Trainline row
 
     assert out["empty"]["status"] == "No station found."
@@ -351,9 +356,10 @@ def test_a_content_manager_never_gets_a_module_link(
 ) -> None:
     out = run_page(monkeypatch, "content_manager", module=module)
 
-    assert out["msmm"]["heads"] == ["Name", "Country", "Code", "Position", "Origin"]
+    assert out["msmm"]["heads"] == HEADINGS
     assert out["msmm"]["links"] == [[], []]
-    assert out["msmm"]["cells"][0][-1] == "MSMM"
+    assert out["msmm"]["cells"][0][4] == "MSMM"
+    assert len(out["msmm"]["cells"][0]) == len(HEADINGS)
 
 
 def test_without_the_module_trainline_results_carry_no_notice(
@@ -420,3 +426,118 @@ def test_no_other_template_defines_an_unscoped_hint_or_flag() -> None:
         assert not re.search(r"^\s*\.flag\s*\{", text, re.MULTILINE), path.name
         if path.name != "journey.html":
             assert not re.search(r"^\s*\.hint\s*\{", text, re.MULTILINE), path.name
+
+
+# ── the contract with the module, phase 2: VIATOR id, code origin, licence ──
+
+REFERENTIAL_SCENARIO = r"""
+(async () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const rows = () => ids.results.all('tbody').flatMap((b) => b.all('tr'));
+  answer = {origin: 'msmm', stations: [
+    {name: 'Zzstadt Hbf', latitude: 50.0, longitude: 4.0, country_iso: 'ZZ', uic: '9900001',
+     viator_id: 'ZZ-99001', uic_origin: 'TL', uic_origin_text: 'from the Trainline list',
+     licence: {name: 'zz-crd', position: 'zz-crd', uic: 'odbl:trainline', share_alike: ['uic'],
+               attribution: ['<img src=x onerror=alert(1)>Zz Rail & Co']}},
+    {name: 'Zz Halt', latitude: 50.1, longitude: 4.1, country_iso: 'ZZ', uic: null,
+     viator_id: 'ZZ-99004', uic_origin: null, uic_origin_text: null,
+     licence: {name: 'cc-by-sa-4.0:feed', position: 'cc-by-sa-4.0:feed', uic: null,
+               share_alike: ['name', 'position'], attribution: ['Zz Bahn']}},
+    {name: 'Zz Old', latitude: 50.2, longitude: 4.2, country_iso: 'ZZ', uic: '9900003',
+     viator_id: null, uic_origin: null, uic_origin_text: null, licence: null},
+  ]};
+  document.getElementById('q').value = 'Zzstadt';
+  ids['search-form'].listeners.submit({preventDefault() {}});
+  await settle(); await settle();
+  const msmm = rows().map((r) => r.children.map((c) => c.textContent));
+  const marks = rows().map((r) => r.all('span').filter((s) => s.className === 'share-alike').length);
+  const lines = rows().map((r) => r.all('span').filter((s) => s.className === 'licence-line').map((s) => s.textContent));
+  const links = rows().map((r) => r.all('a').map((a) => a.href));
+  answer = {origin: 'trainline', stations: [
+    {name: 'Zz Trainline', latitude: 50.0, longitude: 4.0, country_iso: 'ZZ', uic: '9900005',
+     viator_id: 'ZZ-99005', uic_origin: 'TL', uic_origin_text: 'from the Trainline list',
+     licence: {name: 'zz', position: null, uic: null, share_alike: [], attribution: []}},
+  ]};
+  ids['search-form'].listeners.submit({preventDefault() {}});
+  await settle(); await settle();
+  const trainline = rows().map((r) => r.children.map((c) => c.textContent));
+  process.stdout.write(JSON.stringify({msmm, marks, lines, links, trainline}));
+})();
+"""
+
+
+def test_a_module_station_shows_its_viator_id_code_origin_and_licence_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = page_script(render(monkeypatch, "platform_admin", module=True))
+    out = run_node_program(DOM_PRELUDE + script + REFERENTIAL_SCENARIO)
+
+    first, uncoded, old = out["msmm"]
+    assert first[5:8] == [
+        "ZZ-99001",
+        "from the Trainline list",
+        "Name: zz-crdPosition: zz-crdCode: odbl:trainline (share-alike)"
+        "Attribution: <img src=x onerror=alert(1)>Zz Rail & Co",
+    ]
+    assert out["lines"][0] == [
+        "Name: zz-crd",
+        "Position: zz-crd",
+        "Code: odbl:trainline (share-alike)",
+        "Attribution: <img src=x onerror=alert(1)>Zz Rail & Co",
+    ]
+    assert out["marks"] == [1, 2, 0]
+    # A station served by its VIATOR id alone: no code, no origin.
+    assert uncoded[2] == "—"
+    assert uncoded[5:7] == ["ZZ-99004", "no code"]
+    assert out["lines"][1][-1] == "Attribution: Zz Bahn"
+    # A module that gives no referential for a station.
+    assert old[5:8] == ["—", "not given by the module", "—"]
+    # The module link needs a code.
+    assert out["links"] == [
+        ["/msmm/admin/stations/reference?q=9900001"],
+        [],
+        ["/msmm/admin/stations/reference?q=9900003"],
+    ]
+    # A Trainline row never shows the module's fields, whatever it carries.
+    assert out["trainline"][0][5:8] == ["—", "—", "—"]
+
+
+def test_the_page_explains_the_viator_id_origin_and_licence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = render(monkeypatch, "content_manager", module=True)
+
+    assert "its VIATOR id" in html
+    assert "share-alike" in html
+    assert "attribution" in html
+
+
+LICENCE_STATES_SCENARIO = r"""
+(async () => {
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const rows = () => ids.results.all('tbody').flatMap((b) => b.all('tr'));
+  const station = (licence) => ({name: 'Zz', latitude: 50.0, longitude: 4.0, country_iso: 'ZZ',
+    uic: '9900001', viator_id: 'ZZ-99001', uic_origin: 'TL',
+    uic_origin_text: 'from the Trainline list', licence});
+  answer = {origin: 'msmm', stations: [
+    station({name: null, position: null, uic: null, share_alike: [], attribution: [], unreadable: true}),
+    station({name: 'zz-crd', position: null, uic: null, share_alike: ['uic'], attribution: [], unreadable: false}),
+  ]};
+  document.getElementById('q').value = 'Zzstadt';
+  ids['search-form'].listeners.submit({preventDefault() {}});
+  await settle(); await settle();
+  process.stdout.write(JSON.stringify(rows().map((r) => r.children[7].textContent)));
+})();
+"""
+
+
+def test_an_unreadable_licence_and_a_mark_without_its_tag_are_shown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = page_script(render(monkeypatch, "content_manager", module=True))
+    out = run_node_program(DOM_PRELUDE + script + LICENCE_STATES_SCENARIO)
+
+    assert out == [
+        "given by the module but unreadable",
+        "Name: zz-crdCode: tag unreadable (share-alike)",
+    ]

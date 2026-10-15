@@ -2595,8 +2595,9 @@ containers (the worker since MSMM decision 6, 11.3):
   reason=status_422` (11.1). The hub
   station-code buttons (11.2) log their own failures the same way, as
   `station_module.lookup_failed`, `station_module.near_failed` and
-  `station_module.admin_search_failed`, and never start the 30 seconds
-  without calls.
+  `station_module.admin_search_failed`, and the country check of sessions
+  (11.1) as `station_module.countries_failed`; none of them starts the 30
+  seconds without calls.
 - **After changing either setting**, recreate the `web` **and `worker`**
   containers so they read the new environment, from `/opt/viator/docker`,
   when no graph build is running (the Sessions page shows none "running":
@@ -2620,10 +2621,28 @@ containers (the worker since MSMM decision 6, 11.3):
   administrator.
 - **VIATOR's `master_stations` stays as the Trainline list**: the fallback
   when the module does not answer, and the key of VIATOR's internal joins
-  (the federated planner, the country check of sessions, `stations_xref`),
-  which stay on Trainline's codes for now (VIATOR issue #331). The daily
-  Trainline import (04:00 UTC) keeps it fresh, as does **Refresh from
-  Trainline** on the Stations page.
+  (the federated planner, `stations_xref`), which stay on Trainline's codes
+  for now (VIATOR issue #331). The daily Trainline import (04:00 UTC) keeps
+  it fresh, as does **Refresh from Trainline** on the Stations page. No
+  station of the module is copied into it.
+- **The country check of sessions.** Creating a session with providers,
+  saving a session's providers (Save config) and the bulk import from a
+  NAP check the country each provider declares. A country passes when VIATOR's Trainline list has stations in
+  it, **or when the station module serves stations in it** (the module's
+  design, decision D-R12 B): VIATOR asks the module for the countries of
+  its served stations only when the Trainline list lacks one, and keeps the
+  answer one minute. Only the countries a save adds are checked: a country
+  already among the session's saved providers passed when it was saved,
+  and is never refused later because the module is down (the warning that
+  the OSM file may not cover a country still looks at every declared
+  country). A country neither
+  knows is refused as before, with the same message code
+  (`missing_master_stations_for_countries`) and the same advice: refresh
+  from Trainline; the message says whether VIATOR does not use the module,
+  or the module does not serve the country (or did not answer). When the
+  module is not used or does not answer, the Trainline list alone decides,
+  as before, and the `web` log says `station_module.countries_failed
+  reason=<word>`.
 - **A text the module would refuse is not sent.** The typeahead and the
   Stations page search a text of 3 to 100 characters that still holds 3
   once the module reads its punctuation (`, ; : . / \ ( ) [ ] { } " ! ? * +
@@ -2644,7 +2663,39 @@ containers (the worker since MSMM decision 6, 11.3):
   as his journey typeahead. Each result says where it comes from: **MSMM**, or
   **Trainline** when the module is not used or did not answer (a notice says
   so). When VIATOR uses the module, a platform administrator gets an "open in
-  the module" link on each MSMM result. Nothing can be edited on the page.
+  the module" link on each MSMM result that has a code. Nothing can be
+  edited on the page.
+- **What an MSMM result shows** (the contract with the module, phase 2),
+  besides its name, country, code and position:
+  - **VIATOR id**: the module's own identifier of the station, two letters,
+    a hyphen and five digits (`ZZ-99999` in the examples). An id is never
+    reused for another station (when the module merges two stations, the
+    id of the one merged in names the survivor: VIATOR then keeps the
+    survivor's id) and is never a station code. A station may have an id and **no code**
+    (the module serves such stations from a later release): its Code
+    column shows "—", and a journey from or to it is searched by its
+    position, as for any station without a code.
+  - **Code origin**: where the station's code comes from, in words:
+    "corrected by hand in the station module", "copied from MERITS",
+    "derived by a proven rule of the station module", "from the Trainline
+    list" or "declared by a timetable feed"; "not given by the module" when
+    the module gives no origin (a module older than this contract), "no
+    code" for a station without one.
+  - **Licence**: the licence of the station's name, position and code, one
+    line each that has one (such as `odbl:trainline` for a code from the
+    Trainline list), each **marked "(share-alike)"** when that value is
+    under a share-alike licence (reusing it means sharing alike), then the
+    **attribution** a timetable feed asks for, one line each. These texts
+    come from third parties: the page shows them as plain text. VIATOR
+    leaves out a tag over 100 characters and an attribution text over 500
+    characters (four kept at most), and any of them that holds an invisible
+    or control character (a control, a text-direction or zero-width mark, a
+    byte order mark, a line or paragraph separator); the rest of the licence
+    is kept, and a value under a share-alike licence keeps its mark even
+    when its tag was left out ("tag unreadable (share-alike)"). "—" when the
+    module gives no licence; "given by the module but unreadable" when it
+    gives one of which nothing can be read.
+  A Trainline result shows none of these ("—").
 
 #### The archive of the edits made in VIATOR
 
@@ -2781,8 +2832,39 @@ uses the module (platform administrators only):
   unknown. Its name is **not shortened**: without a distance, the stations
   of a single word could not be ordered or filtered.
 - Nothing is stored before **Save ticked codes**, which checks the codes
-  with the module first.
-- **Check station codes** re-reads the stored codes of up to 20 hubs a click.
+  with the module first. It also stores the station's **VIATOR id** (the
+  module's identifier, 11.1) beside the code, as the hub's
+  "· VIATOR id ZZ-99999" on its row: always the current one (when the id
+  asked was merged into another station, the one it was merged into). A
+  station the module serves without a code is offered by its VIATOR id and
+  saved without a code. Typing a code in the hub form clears the VIATOR id
+  (it named the station of the code before); the hub form also offers
+  **Forget the station module's VIATOR id** for a hub that has one (its
+  code stays). A hub changed by someone else while the module was asked
+  (a code typed, another station saved) is not saved over: the panel says
+  "changed meanwhile (propose again)".
+- **Check station codes** re-reads up to 20 hubs a click: by their VIATOR
+  id when they have one (the module then names the code it gives that
+  station, which may differ from the hub's own: the hub keeps its code),
+  else by their code. Every hub checked is listed, with the **origin of its
+  code** and the **licence** of its station (share-alike marked, the
+  attribution texts), **read from the module at that moment**, never
+  stored. It changes no code. It writes only VIATOR ids: an id the module
+  says was merged into another moves to that one (the panel says so), and
+  a hub without an id takes the one the module serves its code under. A
+  hub changed meanwhile is not written ("changed while the module was
+  asked … check it again"). When the module no longer answers a hub's id
+  and the hub has a code, the code is asked in a second lookup (up to 20
+  more calls on your limits) and shown, with "The station module no longer
+  answers VIATOR id …": the hub keeps the id; confirm the station again or
+  forget the id. When that second lookup fails (a limit, a timeout, an
+  error), the hub is shown as not answered, with the time to wait the
+  module gives, never as not served, and nothing is written for it. When the module does not answer, the panel says so and
+  the hubs work as before (the coverage runner never asks the module).
+  With a module older than this contract the check and the save ask by
+  code only, as before; when a hub has an id, that module refuses the first
+  lookup (a 422) and the codes are asked again: two lookups a click, each
+  key counted.
 
 Each hub looked at is one call on your own limits at the module, and also on
 the module's limits for this call (by default 30 a minute and 200 a day for
@@ -2811,6 +2893,25 @@ codes, and your searches go on. When it is a limit of every call, all the
 buttons wait for the time the module gives. This needs a module that
 answers this call (MSMM v0.3.4 or later); with an older one the button
 says so ("needs MSMM v0.3.4 or later") and proposes nothing.
+
+#### Deploying the contract's phase 2 (VIATOR, MSMM referential pull request 10)
+
+- **Take a database backup before deploying it** (5.2): the `web`
+  container runs one revision when it starts,
+  `20261015_1200_hub_station_id`, which adds a column `station_id` (empty)
+  to `network_coverage_hubs`, with a check of its form. It writes no row.
+  To go back, `alembic downgrade 20261010_1200_edit_archive` drops the
+  column and the ids stored since; the hubs and their codes stay. A hub
+  saved with an id and no code would be left with neither (unresolved):
+  none can exist before the module serves stations without a code (its
+  phase 3, a later release).
+- **The journey typeahead** still gets the five fields of a station only;
+  the VIATOR id, origin and licence are for the Stations page and the hubs.
+- **Order.** This VIATOR version works with the module before and after
+  its contract's phase 1 (MSMM referential pull request 9): before, the
+  results have no VIATOR id, no origin and no licence ("—", "not given by
+  the module"), and the hubs keep codes only; after, they show. It can be
+  deployed before or after that module release. No new setting.
 
 ### 11.3 A station build before each MOTIS graph build (MSMM decision 6)
 

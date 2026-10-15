@@ -203,6 +203,7 @@ def test_update_hub_can_set_modes():
     hub.sort_order = 100
     hub.uic = None
     hub.uic_origin = None
+    hub.station_id = None
     db = MagicMock()
     db.get.return_value = hub
 

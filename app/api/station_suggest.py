@@ -267,6 +267,9 @@ def fallback_rows(db: DbSession, q: str) -> list[dict[str, Any]]:
     ]
 
 
+# The fields of a station the journey typeahead answers, from either origin.
+TYPEAHEAD_FIELDS = ("name", "latitude", "longitude", "country_iso", "uic")
+
 # Where an answer's stations come from: the module, or VIATOR's own
 # Trainline list (the fallback).
 Origin = Literal["msmm", "trainline"]
@@ -314,5 +317,10 @@ async def suggest(
     """At most ten stations whose name contains `q`, or whose UIC is `q`."""
     origin, rows = await find_stations(db, query_or_422(given), user)
     if origin == "msmm":
-        return [{**row, "source": "msmm"} for row in rows]
+        # The typeahead's five fields and its source tag only: the module's
+        # referential (VIATOR id, origin, licence) is for the Stations page,
+        # and the journey page needs none of it.
+        return [
+            {**{field: row[field] for field in TYPEAHEAD_FIELDS}, "source": "msmm"} for row in rows
+        ]
     return rows
