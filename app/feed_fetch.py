@@ -40,6 +40,8 @@ import re
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -74,6 +76,16 @@ _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _STATE_NAME_MAX = 200
 _STATE_NAME_OK = re.compile(rf"[A-Za-z0-9_.-]{{1,{_STATE_NAME_MAX}}}")
 _DISPOSITION_RE = re.compile(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", re.IGNORECASE)
+
+
+# The download progress of the refresh task that runs in this context
+# (app/refresh_progress.py `RefreshRun.task`): called after each chunk with
+# the bytes received so far and the bytes expected (the Content-Length of a
+# body that is not content-encoded, else None). The callable throttles its own
+# writes; an exception in it never stops a download.
+download_progress: ContextVar[Callable[[int, int | None], None] | None] = ContextVar(
+    "download_progress", default=None
+)
 
 
 class FetchError(Exception):
@@ -295,6 +307,28 @@ def _download_error(exc: httpx.HTTPError, fetch_url: str, state_url: str) -> str
 # ──────────────────────────── download ────────────────────────────
 
 
+def _expected_bytes(response: httpx.Response) -> int | None:
+    """The body's announced size, or None: unknown, or a content-encoded
+    body (httpx decodes it, so its byte count is not the Content-Length)."""
+    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+        return None
+    try:
+        length = int(response.headers.get("content-length", ""))
+    except ValueError:
+        return None
+    return length if length > 0 else None
+
+
+def _report_progress(received: int, expected: int | None) -> None:
+    report = download_progress.get()
+    if report is None:
+        return
+    try:
+        report(received, expected)
+    except Exception as exc:  # progress is shown, never needed
+        log.warning("download progress not reported: %s", type(exc).__name__)
+
+
 async def _stream_to(
     client: httpx.AsyncClient, url: str, headers: dict[str, str], dest: Path
 ) -> tuple[int, httpx.Headers, str, int]:
@@ -306,6 +340,7 @@ async def _stream_to(
         response.raise_for_status()
         digest = hashlib.sha256()
         size = 0
+        expected = _expected_bytes(response)
         # File I/O off the event loop: feeds run to ~2 GB (DE DELFI) and a
         # slow disk must not stall every other request the web process serves.
         out = await asyncio.to_thread(dest.open, "wb")
@@ -314,6 +349,7 @@ async def _stream_to(
                 await asyncio.to_thread(out.write, chunk)
                 digest.update(chunk)
                 size += len(chunk)
+                _report_progress(size, expected)
         finally:
             await asyncio.to_thread(out.close)
         return response.status_code, response.headers, digest.hexdigest(), size

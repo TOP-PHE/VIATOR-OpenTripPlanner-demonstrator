@@ -24,7 +24,7 @@ from .master import (
 )
 from .nap_catalogues import NapCatalogue
 from .network_coverage import NetworkCoverageHub, NetworkCoverageResult, NetworkCoverageRun
-from .runtime import McTOverride, StationXref
+from .runtime import McTOverride, SourceRefreshProgress, StationXref
 from .search import JourneySearch, JourneySearchExecution, JourneyTrip
 from .sessions import Session, SessionCategory, SessionState
 
@@ -55,6 +55,7 @@ __all__ = [
     "Session",
     "SessionCategory",
     "SessionState",
+    "SourceRefreshProgress",
     "StationXref",
     "Upload",
     "User",
