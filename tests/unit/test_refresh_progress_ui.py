@@ -322,7 +322,9 @@ def test_the_page_restores_the_block_and_both_buttons_watch_it() -> None:
     expand = text[text.index("loadProviderStatuses(sid, cf);") :][:200]
     assert "openRefreshProgress(sid);" in expand
     # Collapsing the row stops its reads.
-    assert "if (expanded) closeRefreshProgress(sid);" in text
+    assert (
+        "if (e.target.getAttribute('aria-expanded') === 'false') closeRefreshProgress(sid);" in text
+    )
     for url in ("/sources/refresh`", "/sources/osm/refresh`"):
         handler = text[: text.index(url)]
         handler = handler[handler.rindex("btn.disabled = true") :]

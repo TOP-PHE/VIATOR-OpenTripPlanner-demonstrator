@@ -745,7 +745,6 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
     detail.hidden = expanded;
     e.target.setAttribute('aria-expanded', String(!expanded));
     e.target.textContent = expanded ? '▸' : '▾';
-    if (expanded) closeRefreshProgress(sid);
     if (!expanded) {
       // Pre-fill the configure form from the row's data-config attribute
       const cfg = JSON.parse(row.dataset.config || '{}');
@@ -832,6 +831,11 @@ document.querySelectorAll('tr[data-sid]').forEach(row => {
       // Auto-load the jobs list on first expand
       loadJobs(sid);
     }
+  });
+  // Registered after the toggle above: a row it just collapsed stops reading
+  // its refresh progress (issue #359).
+  row.querySelector('button[data-action="expand"]')?.addEventListener('click', (e) => {
+    if (e.target.getAttribute('aria-expanded') === 'false') closeRefreshProgress(sid);
   });
   // v0.1.40 — populate the geographic-scope country checklist on expand, in a
   // *separate* listener so the (pre-existing, already-complex) expand handler
@@ -1987,6 +1991,8 @@ async function loadProviderStatuses(sid, formEl) {
     }
     statuses = await r.json();
   } catch (err) {
+    // Network error: the pills stay as they are, like a refused read above.
+    console.debug('provider statuses not loaded', err);
     return;
   }
   renderFeedStatusPanel(sid, statuses);

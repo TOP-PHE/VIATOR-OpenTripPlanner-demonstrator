@@ -151,11 +151,12 @@ def test_the_end_state_follows_how_the_body_ended(
             if raised is not None:
                 raise raised
 
+    refresh = body()
     if raised is None:
-        asyncio.run(body())
+        asyncio.run(refresh)
     else:
         with pytest.raises(raised):
-            asyncio.run(body())
+            asyncio.run(refresh)
     assert ended == [state]
 
 

@@ -1136,7 +1136,34 @@ class ProviderStatus(BaseModel):
 _PROVIDER_FRESHNESS_HOURS = 24
 
 
-@router.post("/{sid}/sources/refresh", response_model=RefreshSourcesResponse)
+def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) -> None:
+    """The session's state and staleness after a provider refresh."""
+    if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        s.state = SessionState.POPULATED.value
+
+    # Staleness tracking (v0.1.7.1): mark refresh completed so the next
+    # rebuild is no longer flagged stale. Done only when at least one
+    # task fetched or confirmed its file current — if every URL failed,
+    # the on-disk data is still stale and the operator needs to know.
+    if fetched or unchanged:
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
+
+
+@router.post(
+    "/{sid}/sources/refresh",
+    response_model=RefreshSourcesResponse,
+    responses={
+        400: {"description": "No JWT actor, or no sources configured."},
+        404: {"description": "Session not found."},
+        409: {
+            "description": "A refresh of this kind is already running for the session "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_sources(
     sid: str,
     request: Request,
@@ -1183,18 +1210,7 @@ async def refresh_sources(
         )
         run.phase(refresh_progress.FINISHING)
 
-        if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-            s.state = SessionState.POPULATED.value
-
-        # Staleness tracking (v0.1.7.1): mark refresh completed so the next
-        # rebuild is no longer flagged stale. Done only when at least one
-        # task fetched or confirmed its file current — if every URL failed,
-        # the on-disk data is still stale and the operator needs to know.
-        if fetched or unchanged:
-            if s.config is None:
-                s.config = {}
-            staleness.mark_refresh_completed(s.config)
-            flag_modified(s, "config")
+        _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
 
         # §12 — single-source-of-truth cascade. When this session's feeds actually
         # changed, re-derive every cross_border_filter provider (in other sessions)
@@ -1243,7 +1259,7 @@ async def refresh_sources(
     )
 
 
-@router.get("/{sid}/sources/progress")
+@router.get("/{sid}/sources/progress", responses={404: {"description": "Session not found."}})
 def get_refresh_progress(
     sid: str,
     db: Annotated[DbSession, Depends(get_db)],
@@ -1323,7 +1339,18 @@ class RefreshOsmResponse(BaseModel):
     rotated: list[str]
 
 
-@router.post("/{sid}/sources/osm/refresh", response_model=RefreshOsmResponse)
+@router.post(
+    "/{sid}/sources/osm/refresh",
+    response_model=RefreshOsmResponse,
+    responses={
+        400: {"description": "No JWT actor, or config.sources.osm_pbf is unset."},
+        404: {"description": "Session not found."},
+        409: {
+            "description": "A refresh of this kind is already running for the session "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_osm(
     sid: str,
     request: Request,
@@ -2507,7 +2534,18 @@ async def _refresh_provider_urls(
     )
 
 
-@router.post("/{sid}/providers/{pid}/refresh", response_model=RefreshSourcesResponse)
+@router.post(
+    "/{sid}/providers/{pid}/refresh",
+    response_model=RefreshSourcesResponse,
+    responses={
+        400: {"description": "No JWT actor, an invalid config, or no URL to refresh."},
+        404: {"description": "Session or provider not found."},
+        409: {
+            "description": "A whole-session provider refresh is running "
+            "(`refresh_already_running`, with its start time; issue #359)."
+        },
+    },
+)
 async def refresh_provider(
     sid: str,
     pid: str,
@@ -2946,7 +2984,15 @@ def suggest_osm_countries(
     )
 
 
-@router.post("/{sid}/rebuilds", response_model=RebuildJobResponse, status_code=201)
+@router.post(
+    "/{sid}/rebuilds",
+    response_model=RebuildJobResponse,
+    status_code=201,
+    responses={
+        400: {"description": "No transit feed or no OSM PBF staged yet."},
+        404: {"description": "Session not found."},
+    },
+)
 def enqueue_rebuild(
     sid: str,
     request: Request,

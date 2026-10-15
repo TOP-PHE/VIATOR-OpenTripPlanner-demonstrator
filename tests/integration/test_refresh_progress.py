@@ -620,8 +620,9 @@ def test_a_cancelled_refresh_is_recorded_interrupted(
             run.done("provider[ZZRAIL].timetable(gtfs)", {"status": "fetched"})
             raise asyncio.CancelledError
 
+    refresh = cancelled()
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(cancelled())
+        asyncio.run(refresh)
     record = _read()["providers"]
     assert record["state"] == "interrupted"
     assert (record["done"], record["not_reached"]) == (1, 1)
@@ -836,8 +837,9 @@ def test_the_revision_goes_up_down_up_and_reruns() -> None:
         )
         detail = conn.execute(text("SELECT detail, extract FROM source_refresh_progress")).one()
     assert tuple(detail) == ({}, {})
-    with pytest.raises(IntegrityError), engine.begin() as conn:
-        conn.execute(text("UPDATE source_refresh_progress SET state = 'zz'"))
+    refused_state = text("UPDATE source_refresh_progress SET state = 'zz'")
+    with engine.connect() as conn, pytest.raises(IntegrityError):
+        conn.execute(refused_state)
 
     # A re-run of the upgrade over the existing table changes nothing.
     command.stamp(cfg, _BEFORE)
