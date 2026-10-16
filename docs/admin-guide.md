@@ -3192,6 +3192,70 @@ the extracts changes no graph build.
     assignments near 3 GB of unpacked XML, measured at 951 MiB; the caps
     of assignments and called points were raised from 2 to 4 million by
     the owner's decision of 16 October, the child's 2 GiB unchanged).
+- **A feed without a rail station: what the extractor saw.** For
+  `no_rail_stop` and `no_stop_place` the station-module column shows, under
+  the reason's sentence, a line `saw: …` of at most 100 characters (kept
+  with the remembered failure, so it stays on every later pass), and the
+  `web` log has the whole census once, when the file is read:
+  `station extract census: provider=<id> format=<format> reason=<word>
+  <name>=<value> …`. Counts and mode words only, never a name, an id or a
+  URL: a value that is not one word of letters (`rail`, `bus`, `unknown`)
+  is counted as `unreadable`, and at most 8 distinct values are kept per
+  count (the rest as `other_values`). How to read it:
+  - NeTEx, `saw: 3,210 lines (bus 3,000, none 210), 41,002 journeys (0 kept),
+    0 stations, …`: `lines` the Lines and their own `TransportMode`
+    (`none`: no mode given); `journeys` the ServiceJourneys and how many
+    were kept, that is rail, or without any mode yet (their stop place
+    then decides: a stop place whose mode is rail, or that gives none and
+    is a `railStation`); `without a line` the kept journeys whose Line is
+    not known (no `LineRef`, or one the file does not define, and none
+    through their pattern or route); `stop places (… rail)` the StopPlaces
+    and how many call themselves rail; `stations (not written: no_position
+    2)` stations found whose rows could not be written, and why. In the
+    log: `line_modes`, `journey_modes`, `kept` (by the mode they end with:
+    `rail`, `suburban`, `none`), `no_line_ref`, `line_undefined`,
+    `line_from_pattern`, `patterns`/`patterns_used`, `points` (scheduled
+    stop points with calls), `assignments`, `stop_places`,
+    `stop_place_modes`, `stop_place_types`, `rail_stop_places`,
+    `places_called`, `stations`, `dropped`; `unread` when the step that
+    counts it did not run (no journey kept for it).
+  - GTFS, `saw: 40 routes (route_type 3: 38, 700: 2), 0 rail routes, 0
+    stations`: the routes by `route_type` (rail is 2 and 100 to 117), then
+    the rail routes, the stations, the rail trips and the stops they call
+    at. A bus-only feed reads like this, and is right.
+  - What it tells: journeys with a mode other than rail (`kept` 0, the
+    modes in `journey_modes` or `line_modes`) — the feed is not a rail
+    feed, or says rail with a word VIATOR does not read (report it with the
+    census); journeys kept but `0 rail` stop places and `0 stations` —
+    neither the journeys nor the stop places say rail; stations found but
+    not written — the reason is in `not written` (a position in a system
+    VIATOR does not read, for one).
+  - A NeTEx `TransportMode` that names no mode — `unknown`, `other`, `all`,
+    `anyMode` and the deprecated `urbanRail` — counts as none (the stop
+    place decides), and the deprecated `intercityRail` as rail (since
+    16 October, extractor version 2; before, such journeys were dropped as
+    not rail). The new extractor version makes every feed's extract again
+    once, smallest files first, and sends each to the module as a new
+    version; a remembered `no_rail_stop` is read again at the next refresh,
+    nothing to delete.
+  - **When the census is not enough** (a NeTEx feed that should have rail
+    stations), run the census script on the feed's zip, on your own machine
+    or the server, with any Python 3.9 or later and nothing else installed
+    (it only reads the zip, a few kilobytes of memory, a minute or two for
+    a large national file):
+
+    ```bash
+    python3 scripts/netex_mode_census.py <the feed's zip> > census.txt
+    ```
+
+    and send back the whole `census.txt`. It lists, per member (numbered,
+    never named), its size and the counts of the elements the extractor
+    reads; where each `TransportMode`, `...Submode`, `VehicleMode` and
+    `StopPlaceType` appears (the element holding it) with its values; and
+    how journeys, patterns and routes reach their Line (`LineRef`,
+    `RouteRef`, `RouteView/LineRef`, ... and how many elements of each
+    kind hold each). Element names, counts and mode words only; a document
+    that declares an XML entity is refused.
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).

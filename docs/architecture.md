@@ -997,8 +997,10 @@ four MSMM limits, `memory_limit`, `cpu_limit`, and `wall_clock_limit` the
 second time in a row, a child killed or failing otherwise in between starting the count again) is remembered in `<cache name>.failed` beside the cache, with the format it was
 read as and the signature of every bound and of the extraction's code (`_code_signature`: this module
 and the readers' files): the next caller (cache-only too) gets that reason at once, `"remembered"` as
-its detail, until the archive, the provider's format or columns, the extractor version, a bound or
-the readers' code changes.
+its detail (with the summary of what the reader saw, for `no_rail_stop` and `no_stop_place`: a
+`station_extract_common.Census` of counts and one-word mode values, ≤100 characters, shown on the
+Sessions page; the whole census is logged once when the file is read), until the archive, the
+provider's format or columns, the extractor version, a bound or the readers' code changes.
 `build_extract` is the extraction in the calling process, for the child and the tests; `feed_key_for(provider_cfg, *, upload_sha256=None)` gives the feed
 key (`nap:tdg:<resource id>`, `nap:<udata|permalink|dated|json_api>:<16 hex>` of the resolver's own
 fields, `url:<16 hex>` of host, path and sorted query, `upload:<sha256>`, nothing for a
@@ -1021,7 +1023,8 @@ available); 200,000 stations and 1,000 raw codes a station everywhere. Past a bo
 suburban (`_is_rail_route_type` of the cross-border filter is deliberately *not* reused: it drops
 the S-Bahn types), and NeTEx `TransportMode` rail on the journey or its Line, a journey with no mode
 at all counting at a StopPlace whose mode is rail, or that gives no other mode and is a
-`railStation`; a rail journey without a submode takes its Line's. One row per station: the GTFS
+`railStation` (a value that names no mode, `unknown`, `other`, `all`, `anyMode`, `urbanRail`, is
+none; the deprecated `intercityRail` is rail); a rail journey without a submode takes its Line's. One row per station: the GTFS
 `parent_station` (the stop itself when it has none or names an undefined one), the NeTEx root
 StopPlace through `ParentSiteRef` (a dangling or cyclic parent is no parent); an assignment that names
 a Quay and a StopPlace places the call at the Quay's StopPlace when the Quay is known, else at the
