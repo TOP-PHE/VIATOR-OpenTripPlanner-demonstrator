@@ -1189,8 +1189,12 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   loop never waits on the database); the end waits for them. The station-module follow-up is written
   by the sender thread into the record of the refresh that queued it (`run_id` carried in the queue;
   fenced by that `run_id` and `state = 'finished'`); a silent follow-up (queued 35 min, or running
-  5 min without its 30 s beat) reads `interrupted`. A per-provider Refresh writes no record but is
-  refused (409) while a whole-session provider refresh runs.
+  5 min without its 30 s beat) reads `interrupted`. A per-provider Refresh writes a record of its
+  own whose `scope` is the feed id (`refresh_progress.provider_scope`; fits `String(16)`, no
+  migration), with its follow-up fenced by that scope and its `run_id`. Claims of one session are
+  serialised by `pg_advisory_xact_lock`, so the cross-record rules hold: same provider twice, a card
+  during the whole-session refresh, and the whole-session refresh during a card are refused (409;
+  the last `provider_refresh_running`); two different providers may run together.
 
 ---
 
