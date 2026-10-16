@@ -54,13 +54,16 @@ def inbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sessions_api.settings, "inbox_dir", root)
     monkeypatch.setattr(feed_resolvers, "_validate_safe_http_url", lambda url: url)
 
-    def fake_dispatch(path: Path, kind: str, db: Any, *, session_id: str, staged_filename: str):
+    def fake_place(path: Path, kind: str, *, session_id: str, staged_filename: str) -> bool:
         target = root / session_id / "gtfs" / staged_filename
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(path.read_bytes())
         return True
 
-    monkeypatch.setattr(sessions_api.ingestion, "dispatch", fake_dispatch)
+    # The copy into the slot (ingestion.place, run off the event loop); the
+    # rebuild queue needs a database these tests do not have.
+    monkeypatch.setattr(sessions_api.ingestion, "place", fake_place)
+    monkeypatch.setattr(sessions_api.ingestion, "queue_rebuild", lambda *_a, **_k: None)
     return root
 
 

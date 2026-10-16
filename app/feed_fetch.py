@@ -106,6 +106,35 @@ download_progress: ContextVar[Callable[[int, int | None], None] | None] = Contex
 )
 
 
+# The step of the refresh task that runs in this context, after its download
+# (app/refresh_progress.py `RefreshRun.task` sets it; issue #359 follow-up):
+# called with the step word and, for the NeTEx structure check, the bytes of
+# uncompressed XML scanned so far and their total from the zip directory. The
+# download itself is the first step (`STEP_DOWNLOADING`, bytes through
+# `download_progress`). It may be called from a worker thread (the structure
+# check runs in one); it throttles its own writes, and an exception in it
+# never stops the refresh.
+STEP_DOWNLOADING = "downloading"
+STEP_VERIFYING = "verifying"  # format check (and the slot hash of a re-wrapped file)
+STEP_CHECKING_STRUCTURE = "checking_structure"  # app/netex_structure.py byte scan
+STEP_STORING = "storing"  # ingestion.place: the file copied into the session's slot
+STEPS: tuple[str, ...] = (STEP_DOWNLOADING, STEP_VERIFYING, STEP_CHECKING_STRUCTURE, STEP_STORING)
+task_step: ContextVar[Callable[[str, int | None, int | None], None] | None] = ContextVar(
+    "task_step", default=None
+)
+
+
+def report_step(step: str, done: int | None = None, total: int | None = None) -> None:
+    """Tell the running refresh task's progress record which step it is in."""
+    report = task_step.get()
+    if report is None:
+        return
+    try:
+        report(step, done, total)
+    except Exception as exc:  # progress is shown, never needed
+        log.warning("task step not reported: %s", type(exc).__name__)
+
+
 class FetchError(Exception):
     """The download failed or the file was rejected. The slot is untouched."""
 
@@ -758,6 +787,7 @@ async def fetch_validated(
             state={**previous, **new_state, "fetched_at": previous.get("fetched_at")},
         )
 
+    report_step(STEP_VERIFYING)
     try:
         final = await asyncio.to_thread(
             _validate,
@@ -783,6 +813,9 @@ async def fetch_validated(
     # older sha256.
     new_state.update(await asyncio.to_thread(_slot_identity, final, size, sha))
     if kind in _NETEX_KINDS:
+        # Minutes on a national file (tens of GB of XML): off the event loop,
+        # its progress reported (contextvars follow the call into the thread).
+        report_step(STEP_CHECKING_STRUCTURE)
         new_state["structure"] = await asyncio.to_thread(
             _structure_check, final, previous.get("structure")
         )
@@ -810,12 +843,16 @@ def _slot_identity(final: Path, size: int, sha: str) -> dict[str, Any]:
     return {"slot_size_bytes": slot_size, "slot_sha256": digest.hexdigest()}
 
 
+def _structure_progress(scanned: int, total: int | None) -> None:
+    report_step(STEP_CHECKING_STRUCTURE, scanned, total)
+
+
 def _structure_check(path: Path, previous: Any) -> dict[str, Any]:
     """Fingerprint + assessment of a downloaded NeTEx file (app/netex_structure.py).
     Never fails the download: a check that cannot run is itself a warning."""
     before = previous.get("fingerprint") if isinstance(previous, dict) else None
     try:
-        fp = netex_structure.fingerprint(path)
+        fp = netex_structure.fingerprint(path, progress=_structure_progress)
         result = netex_structure.assess(fp, before)
     except Exception as exc:  # corrupt member, odd encoding… the format check already passed
         log.warning("NeTEx structure check failed for %s: %s", path.name, exc)
