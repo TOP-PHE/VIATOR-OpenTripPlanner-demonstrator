@@ -48,6 +48,21 @@ finished; `off` when the module is not configured; read as `interrupted` when
 it went silent (`EXTRACT_QUEUED_SECONDS`, `EXTRACT_LEASE_SECONDS`). It is
 written only into the record of the refresh that queued it.
 
+**One provider alone** ("Refresh this provider" on a provider card): a
+record of its own, whose scope is the provider's feed id (`provider_scope`;
+a feed id begins with a capital letter, the two kinds above never do, and it
+fits the column), one per provider of the session, with the same steps,
+bytes, lease and fencing, and its own station-module follow-up. Claims of one
+session are taken one at a time (a transaction-level advisory lock), so the
+rules between records hold: a second refresh of the same provider is refused
+(409 `refresh_already_running`), a provider alone is refused while the whole
+session's refresh runs (it downloads that provider too), and the whole
+session's refresh is refused while a provider alone runs (409
+`provider_refresh_running`): both would download the same feed into the same
+slot, fetch state and staging folder, and waiting instead would hold the
+request with no record for as long as that download takes. Refreshes of two
+different providers may run together; OSM is independent of all of them.
+
 **Never a URL, a reason text or a secret.** Task labels such as
 `provider[ZZRAIL].timetable(gtfs)` (a provider id of the session's own
 configuration), counts, reason words that match `_WORD`, the type name of an
@@ -86,6 +101,11 @@ log = logging.getLogger(__name__)
 PROVIDERS = "providers"
 OSM = "osm"
 SCOPES = (PROVIDERS, OSM)
+# The scope of a single provider's refresh is its feed id: the pattern of
+# app/ingestion.py `_FEED_ID_RE` (2 to 16 characters, the column's width).
+_FEED_ID = re.compile(r"[A-Z][A-Z0-9_-]{1,15}", re.ASCII)
+# Single-provider records shown at most (running ones first).
+SINGLE_SHOWN_MAX = 4
 
 RUNNING = "running"
 FINISHED = "finished"
@@ -160,6 +180,25 @@ def _word(value: object) -> str:
     return value if isinstance(value, str) and _WORD.fullmatch(value) else "other"
 
 
+def provider_scope(pid: str) -> str:
+    """The scope of the refresh of provider `pid` alone: its feed id. Raises
+    ValueError for anything that is not a feed id (never a free text)."""
+    if not isinstance(pid, str) or not _FEED_ID.fullmatch(pid):
+        raise ValueError("not a feed id")
+    return pid
+
+
+def is_provider_scope(scope: object) -> bool:
+    """True for the scope of a single provider's refresh."""
+    return isinstance(scope, str) and _FEED_ID.fullmatch(scope) is not None
+
+
+def refresh_scope(only_provider: str | None) -> str:
+    """The scope of the refresh that queued a station-module pass: the whole
+    session's provider refresh, or that provider's alone."""
+    return PROVIDERS if only_provider is None else provider_scope(only_provider)
+
+
 def _expire(db: Any, sid: str, scope: str | None = None) -> None:
     """Mark interrupted the session's running records (of `scope`, or every
     kind) whose heartbeat is older than the lease; they end at their last
@@ -178,25 +217,44 @@ def _expire(db: Any, sid: str, scope: str | None = None) -> None:
 
 
 class RefreshRunning(Exception):
-    """A refresh of this kind already runs for the session (HTTP 409)."""
+    """A refresh that forbids this one already runs for the session (HTTP
+    409). `scope` is the running refresh's, `requested` the refused one's."""
 
-    def __init__(self, scope: str, started_at: datetime | None) -> None:
-        super().__init__(f"a {scope} refresh is already running")
+    def __init__(
+        self, scope: str, started_at: datetime | None, requested: str | None = None
+    ) -> None:
+        super().__init__("a refresh is already running")
         self.scope = scope
         self.started_at = started_at
+        self.requested = requested if requested is not None else scope
 
     def detail(self) -> dict[str, Any]:
+        """The 409 body: `error` `refresh_already_running` (the same record
+        is running, or the whole session's while a provider alone was asked)
+        or `provider_refresh_running` (a provider alone, while the whole
+        session's was asked); `scope` `providers`, `osm` or `provider` (with
+        `provider_id`)."""
         started = _iso(self.started_at)
-        what = "An OSM refresh" if self.scope == OSM else "A provider refresh"
         since = f" (started at {started})" if started else ""
+        single = is_provider_scope(self.scope)
+        tail = "Its progress is shown on the page; start a new one when it has ended."
+        if single and self.requested == PROVIDERS:
+            error = "provider_refresh_running"
+            message = (
+                f"A refresh of provider {self.scope} alone is running{since}. Refresh "
+                f"providers downloads that provider too. {tail}"
+            )
+        else:
+            error = "refresh_already_running"
+            what = {OSM: "An OSM refresh", PROVIDERS: "A provider refresh"}.get(self.scope)
+            subject = f"{what} of this session" if what else f"A refresh of provider {self.scope}"
+            message = f"{subject} is already running{since}. {tail}"
         return {
-            "error": "refresh_already_running",
-            "scope": self.scope,
+            "error": error,
+            "scope": "provider" if single else self.scope,
+            "provider_id": self.scope if single else None,
             "started_at": started,
-            "message": (
-                f"{what} of this session is already running{since}. Its progress "
-                "is shown on the page; start a new one when it has ended."
-            ),
+            "message": message,
         }
 
 
@@ -218,16 +276,42 @@ def _initial_detail(total: int, previous: datetime | None) -> dict[str, Any]:
     return detail
 
 
+def _blocker(db: Any, sid: str, scope: str) -> RefreshRunning | None:
+    """The running refresh of another record that forbids `scope`: the whole
+    session's for a provider alone, any provider alone for the whole
+    session's (the oldest). None for OSM, and when nothing forbids it."""
+    if scope == PROVIDERS:
+        others = select(Row.scope, Row.started_at).where(
+            Row.session_id == sid, Row.state == RUNNING, Row.scope.not_in(SCOPES)
+        )
+    elif is_provider_scope(scope):
+        others = select(Row.scope, Row.started_at).where(
+            Row.session_id == sid, Row.state == RUNNING, Row.scope == PROVIDERS
+        )
+    else:
+        return None
+    found = db.execute(others.order_by(Row.started_at).limit(1)).one_or_none()
+    return RefreshRunning(found.scope, found.started_at, scope) if found else None
+
+
 def claim(sid: str, scope: str, total: int, *, factory: Factory | None = None) -> RefreshRun:
     """Make this request the session's running refresh of `scope`, or raise
-    `RefreshRunning`. One transaction: a stale running row (no heartbeat for
-    `LEASE_SECONDS`) is first marked interrupted, then the row is taken only
-    when it is not running; a concurrent claim waits on the row lock and then
-    finds it running. A replaced interrupted refresh is named in the new
+    `RefreshRunning`. One transaction, one claim of the session at a time (an
+    advisory lock held until it ends): stale running rows (no heartbeat for
+    `LEASE_SECONDS`) are first marked interrupted, a running record that
+    forbids this one refuses it (`_blocker`), then the row is taken only when
+    it is not running. A replaced interrupted refresh is named in the new
     record (`previous`)."""
+    if scope not in SCOPES:
+        provider_scope(scope)
     run_id = uuid.uuid4()
     with _session_factory(factory)() as db:
-        _expire(db, sid, scope)
+        db.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"refresh_progress:{sid}"))))
+        _expire(db, sid)
+        blocker = _blocker(db, sid, scope)
+        if blocker is not None:
+            db.rollback()
+            raise blocker
         # The row as it stands, locked until the claim commits or fails.
         replaced = db.execute(
             select(Row.state, Row.started_at)
@@ -273,6 +357,26 @@ def claim(sid: str, scope: str, total: int, *, factory: Factory | None = None) -
     return RefreshRun(sid, scope, run_id, detail, factory=factory)
 
 
+def check_free(sid: str, scope: str, *, factory: Factory | None = None) -> None:
+    """Raise `RefreshRunning` when a claim of `scope` would be refused now,
+    without claiming (a request that will answer another error first says
+    the refresh is running, as before). Stale running rows are marked
+    interrupted on the way, like a read does."""
+    with _session_factory(factory)() as db:
+        _expire(db, sid)
+        db.commit()
+        started = db.execute(
+            select(Row.started_at).where(
+                Row.session_id == sid, Row.scope == scope, Row.state == RUNNING
+            )
+        ).scalar_one_or_none()
+        if started is not None:
+            raise RefreshRunning(scope, started)
+        blocker = _blocker(db, sid, scope)
+    if blocker is not None:
+        raise blocker
+
+
 # ── the running refresh ──────────────────────────────────────────────────
 
 
@@ -300,6 +404,10 @@ class RefreshRun:
         self._clock = clock
         self._lost = False
         self._finishing = False
+        # A provider refresh leaves its station-module follow-up in the
+        # record when it ends (`_extract_on_finish`); a caller that queues no
+        # pass (a derived provider alone) turns it off.
+        self.follow_up = scope != OSM
         self._beat_task: asyncio.Task[None] | None = None
         # Inside `async with`: progress writes go to one thread of their own,
         # in order, so the event loop never waits on the database.
@@ -461,7 +569,7 @@ class RefreshRun:
             "heartbeat_at": func.now(),
             "detail": copy.deepcopy(self.detail),
         }
-        if self.scope == PROVIDERS:
+        if self.follow_up:
             values["extract"] = _extract_on_finish(state)
         self._execute(self._fenced().values(**values))
 
@@ -520,21 +628,6 @@ def _extract_on_finish(state: str) -> dict[str, Any]:
     return {"state": "queued", "updated_at": _now_iso()}
 
 
-def running_since(sid: str, scope: str, *, factory: Factory | None = None) -> datetime | None:
-    """When the session's running refresh of `scope` started, or None when
-    none runs (a record past its lease does not count). Read only."""
-    with _session_factory(factory)() as db:
-        started: datetime | None = db.execute(
-            select(Row.started_at).where(
-                Row.session_id == sid,
-                Row.scope == scope,
-                Row.state == RUNNING,
-                Row.heartbeat_at >= _lease_cutoff(),
-            )
-        ).scalar_one_or_none()
-    return started
-
-
 # ── the station-module follow-up ─────────────────────────────────────────
 
 
@@ -548,15 +641,25 @@ class _Outcome(Protocol):
 
 class ExtractFollowUp:
     """The pass of `app/station_extract_upload.py` that follows a provider
-    refresh, written to that refresh's record: fenced by its `run_id` and by
-    `state = 'finished'` (a newer refresh owns the row otherwise). One write
+    refresh (the whole session's, `scope` PROVIDERS, or one provider's alone,
+    `scope` its feed id), written to that refresh's record: fenced by its
+    scope, its `run_id` and by `state = 'finished'` (a newer refresh owns the
+    row otherwise). One write
     when the pass starts, one when a feed starts, one per outcome, one at the
     end, and a beat of `updated_at` every `EXTRACT_HEARTBEAT_SECONDS` while it
     runs (an extraction can take many minutes). Never raises."""
 
-    def __init__(self, sid: str, run_id: uuid.UUID, *, factory: Factory | None = None) -> None:
+    def __init__(
+        self,
+        sid: str,
+        run_id: uuid.UUID,
+        *,
+        scope: str = PROVIDERS,
+        factory: Factory | None = None,
+    ) -> None:
         self.sid = sid
         self.run_id = run_id
+        self.scope = scope
         self._factory = factory
         self.state: dict[str, Any] = {}
         self._lock = threading.Lock()
@@ -572,7 +675,7 @@ class ExtractFollowUp:
                     update(Row)
                     .where(
                         Row.session_id == self.sid,
-                        Row.scope == PROVIDERS,
+                        Row.scope == self.scope,
                         Row.run_id == self.run_id,
                         Row.state == FINISHED,
                     )
@@ -728,8 +831,10 @@ def _public_extract(extract: object, now: datetime) -> dict[str, Any] | None:
 def _public(row: Row, now: datetime) -> dict[str, Any]:
     detail = row.detail if isinstance(row.detail, dict) else {}
     end = row.finished_at or now
+    single = is_provider_scope(row.scope)
     public: dict[str, Any] = {
-        "scope": row.scope,
+        "scope": "provider" if single else row.scope,
+        "provider_id": row.scope if single else None,
         "state": row.state,
         "started_at": _iso(row.started_at),
         "finished_at": _iso(row.finished_at),
@@ -759,17 +864,69 @@ def _public(row: Row, now: datetime) -> dict[str, Any]:
     return public
 
 
-def read(sid: str, *, factory: Factory | None = None) -> dict[str, Any]:
-    """`{"providers": record | None, "osm": record | None, "now": iso}` for
-    the page. A running record past its lease is first marked interrupted
-    (the process that wrote it is gone), so every reader sees the same."""
+def _follow_up_active(row: Row, now: datetime) -> bool:
+    """The record's station-module pass is still queued or running (one that
+    went silent reads interrupted and no longer counts)."""
+    extract = row.extract if isinstance(row.extract, dict) else {}
+    return bool(extract.get("state")) and _extract_state(extract, now) in ("queued", RUNNING)
+
+
+def _superseded(row: Row, whole: Row | None) -> bool:
+    """A whole-session provider refresh that started after `row` and
+    finished downloaded its provider too. One that failed or was interrupted
+    may never have reached it: it supersedes nothing."""
+    return whole is not None and whole.state == FINISHED and whole.started_at > row.started_at
+
+
+def _singles_shown(rows: list[Row], whole: Row | None, now: datetime) -> list[Row]:
+    """The single-provider records the page shows, newest first: every
+    running one (at most `SINGLE_SHOWN_MAX`), every ended one whose
+    station-module pass is still queued or running (at most as many: the
+    page polls until it ends), and the newest ended one unless it is
+    superseded (`_superseded`)."""
+    newest_first = sorted(rows, key=lambda r: r.started_at, reverse=True)
+    running = [r for r in newest_first if r.state == RUNNING][:SINGLE_SHOWN_MAX]
+    ended = [r for r in newest_first if r.state != RUNNING]
+    kept = [r for r in ended if _follow_up_active(r, now)][:SINGLE_SHOWN_MAX]
+    if ended and ended[0] not in kept and not _superseded(ended[0], whole):
+        kept.insert(0, ended[0])
+    return running + kept
+
+
+def provider_ids(config: object) -> set[str]:
+    """The provider ids of a session's config as saved (no validation): a
+    record of a provider removed or renamed since is not shown."""
+    sources = config.get("sources") if isinstance(config, dict) else None
+    providers = sources.get("providers") if isinstance(sources, dict) else None
+    if not isinstance(providers, list):
+        return set()
+    return {p["id"] for p in providers if isinstance(p, dict) and isinstance(p.get("id"), str)}
+
+
+def read(
+    sid: str, *, providers: set[str] | None = None, factory: Factory | None = None
+) -> dict[str, Any]:
+    """`{"providers": record | None, "osm": record | None, "single":
+    [record, ...], "now": iso}` for the page; `single` holds the records of
+    one provider's refresh alone (`_singles_shown`), of the session's
+    current `providers` only when given. A running record past its lease is
+    first marked interrupted (the process that wrote it is gone), so every
+    reader sees the same."""
     with _session_factory(factory)() as db:
         _expire(db, sid)
         db.commit()
         now = db.execute(select(func.now())).scalar_one()
-        rows = {r.scope: r for r in db.execute(select(Row).where(Row.session_id == sid)).scalars()}
+        rows = list(db.execute(select(Row).where(Row.session_id == sid)).scalars())
+        kinds = {r.scope: r for r in rows if r.scope in SCOPES}
+        singles = [
+            r
+            for r in rows
+            if is_provider_scope(r.scope) and (providers is None or r.scope in providers)
+        ]
         result: dict[str, Any] = {
-            scope: _public(rows[scope], now) if scope in rows else None for scope in SCOPES
+            scope: _public(kinds[scope], now) if scope in kinds else None for scope in SCOPES
         }
+        shown = _singles_shown(singles, kinds.get(PROVIDERS), now)
+        result["single"] = [_public(r, now) for r in shown]
     result["now"] = _iso(now)
     return result

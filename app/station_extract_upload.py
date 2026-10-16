@@ -1237,13 +1237,14 @@ def send_after_refresh(
     sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None
 ) -> None:
     """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender
-    thread. The pass of a whole-session refresh is written to that refresh's
-    progress record (`run_id`, issue #359), which the Sessions page shows."""
+    thread. The pass is written to the progress record of the refresh that
+    queued it (`run_id`, issue #359: the whole session's, or the provider's
+    alone), which the Sessions page shows."""
     observer: PassObserver | None = None
-    if only_provider is None and run_id is not None:
-        from .refresh_progress import ExtractFollowUp
+    if run_id is not None:
+        from .refresh_progress import ExtractFollowUp, refresh_scope
 
-        observer = ExtractFollowUp(sid, run_id)
+        observer = ExtractFollowUp(sid, run_id, scope=refresh_scope(only_provider))
     send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider, observer=observer)
 
 
@@ -1283,7 +1284,7 @@ def after_refresh(
     sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None
 ) -> None:
     """Queue the pass of a refresh; returns at once. `run_id`: the progress
-    record of the whole-session refresh that queued it. Without the module
+    record of the refresh that queued it. Without the module
     configured nothing is queued (one INFO line)."""
     global _sender
     if not station_module.enabled():

@@ -1058,7 +1058,24 @@ refresh with its end result until the next refresh of the same kind. The page re
 is expanded, every 2.5 s while a refresh runs, every 10 s while only the station-module follow-up
 runs, every 45 s while the row stays expanded and nothing runs (a refresh started from another tab
 or browser shows up), and again when the tab comes back to the front; a collapsed row is not read.
-While a refresh runs, its button is disabled.
+While a refresh runs, its button is disabled. When everything in the block has ended after something
+ran (a refresh, then its station-module follow-up), the page reads the Feed status panel once more,
+so its **Station module** column shows each feed's new outcome without a reload.
+
+**A provider card's Refresh** ("Refresh this provider") has a record of its own, one per provider:
+its block is titled **Provider refresh — ZZRAIL only** and shows the same lines as below (its
+downloads with their steps and bytes, the end result), then its own **Station module** line for that
+one feed: **queued**, **running** (with the provider being sent), then **finished — sent**, **—
+already held**, **— skipped (budget)** (the outcome and its reason word), or **— nothing to send**;
+**not configured** or **interrupted** as below. A derived (`cross_border_filter`) provider's card
+shows the filter as its one task and no station-module line (no pass follows it). The blocks are, top
+to bottom: the card refreshes (the running ones, up to 4; the ended ones whose station-module pass is
+still queued or running, up to 4, so the page keeps following them; and the newest ended one unless a
+**Refresh providers** started after it and **finished**, which downloaded that provider too: one that
+failed or was interrupted supersedes nothing), the last **Refresh providers** with its result, and the
+last **Refresh OSM**. A card refresh of a provider since removed from the session, or renamed, is not
+shown. While a card's refresh or a whole-session **Refresh providers** runs, that card's **Refresh**
+button is disabled.
 
 What the block says:
 
@@ -1093,16 +1110,29 @@ session is already running (started at …)* and the block shows the running one
 `refresh_already_running`). It is not joined: the running refresh belongs to another request, and
 the block already shows everything. **Refresh OSM** has its own record: an OSM refresh may run
 beside a provider refresh, not beside another OSM refresh; a refused OSM click rotates nothing. The
-per-provider **Refresh** button of a card is refused the same way (409) while a whole-session
-**Refresh providers** runs (it would download the same file); otherwise it runs as before and
-writes no record. The toast gives the running refresh's start in the browser's time format.
+per-provider **Refresh** button of a card is refused the same way (409 `refresh_already_running`)
+while the same provider's card refresh runs, and while a whole-session **Refresh providers** runs
+(it would download the same file). The other way round, **Refresh providers** is refused while a
+card refresh runs (409 `provider_refresh_running`: *A refresh of provider ZZRAIL alone is running
+(started at …)*; the button is disabled meanwhile): both would download that feed into the same
+slot, fetch state and staging folder, and waiting instead would hold the click, with no block, for
+as long as that provider's download and check take (many minutes for a national NeTEx file). Cards
+of two different providers may refresh together. A card refresh past its 5-minute lease blocks
+nothing, like any other. A card with nothing to download still answers the 409 first when a refresh
+is running, then its 400. Two refreshes running together each write the session's config at their
+end (the staleness mark, the state): each re-reads the session row under a row lock just before, so
+neither overwrites the other's change nor a **Save config** made during its download. The toast gives the running refresh's start in the browser's time format.
 
 The record holds labels (built from the session's provider ids) and counts only: never a URL, a
 token or a skip reason. Its table, `source_refresh_progress`, comes with migration
 `20261015_1800_refresh_progress` (back up before deploying, as for every migration, §5.2); a
 downgrade drops only this table. The steps and the time per task (#359 follow-up) are more fields
-of the same JSON column: no migration. API: `GET /api/sessions/<sid>/sources/progress` (content managers,
-like the buttons).
+of the same JSON column: no migration. A card refresh's record is a row of the same table whose
+`scope` is the provider's feed id (it fits the column; the two kinds are lowercase words, a feed id
+begins with a capital letter): no migration either, and a downgrade to the version before only
+leaves those rows unread. API: `GET /api/sessions/<sid>/sources/progress` (content managers,
+like the buttons): `providers`, `osm` and `single` (the card refreshes shown, each with `scope:
+"provider"` and its `provider_id`).
 
 ---
 
