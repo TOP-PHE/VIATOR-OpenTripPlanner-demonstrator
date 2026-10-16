@@ -457,8 +457,10 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   declares (refused before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
   ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
   tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 distinct journey groups and as
-  many (pattern, group) pairs, ≤2,000,000
-  assignments, Quays, StopPlaces and called scheduled stop points, no entity declaration (internal ones included), no external DTD loaded;
+  many (pattern, group) pairs, ≤4,000,000 assignments and called scheduled stop points
+  (4 million, the owner's decision of 16 October: measured 951 MiB peak for 2.85 GB of
+  per-journey points, about 4 million, under the unchanged 2 GiB child limit), ≤2,000,000
+  Quays and StopPlaces, no entity declaration (internal ones included), no external DTD loaded;
   ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
 - **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
   rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
@@ -482,12 +484,12 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   pattern and point tables are freed before pass 3. Measured per entry: about 250 bytes for a point
   with its assignment (before: about 1.2 KB, a `Counter`, a dict of sets and a list of tuples), about
   130 bytes for a pattern (before: about 500). The caps were set before this model: a crafted file reaching every
-  one of them at once (1 million pattern groups and distinct groups, 2 million points, assignments
-  to as many distinct places, Quays and StopPlaces) would take about 2.8 GB and end `memory_limit`
+  one of them at once (1 million pattern groups and distinct groups, 4 million points and assignments
+  to as many distinct places, 2 million Quays and StopPlaces) would take about 4.6 GB and end `memory_limit`
   (remembered); a national feed, whose points and places are shared, takes a few hundred MiB. A synthetic export that gives every journey its own pattern and scheduled stop
   points (1 GB unpacked, 1.4 million assignments) peaked at 1,758 MiB RSS before, 372 MiB now; at
-  3 GB it ran out of memory before, and now stops `input_too_large` (over 2 million assignments) at
-  554 MiB
+  2.85 GB (about 4 million assignments) it ran out of memory before, and is extracted now at
+  951 MiB, 120 s
   (`scripts/bench_station_extract.py --per-journey --no-mode`); the shapes that share their points
   are unchanged (about 100 MiB). A Call's `Arrival` and `Departure` are dropped before expat.
 - **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,

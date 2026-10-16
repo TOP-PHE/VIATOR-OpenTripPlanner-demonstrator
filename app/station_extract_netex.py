@@ -565,7 +565,10 @@ def _with_line(mode: str, submode: str, info: _LineInfo | None) -> tuple[str, st
 # such points are dropped at the end of pass 1, but counted until then).
 # Past it the archive is refused (`input_too_large`) before their tallies
 # take more memory.
-POINTS_MAX = 2_000_000
+# 4 million (owner's decision, 16 October): an export that gives every
+# journey its own scheduled stop points has one per call; measured 951 MiB
+# for 2.85 GB of such XML (some 4 million), under the child's 2 GiB.
+POINTS_MAX = 4_000_000
 
 
 @dataclass
@@ -741,7 +744,8 @@ def _pattern(element: Element, found: _Journeys) -> None:
 
 # The assignments, the Quays and the StopPlaces kept from that pass, each at
 # most.
-ASSIGNMENTS_MAX = 2_000_000
+# The assignments with `POINTS_MAX` (one per point in such an export).
+ASSIGNMENTS_MAX = 4_000_000
 QUAYS_MAX = 2_000_000
 STOP_PLACES_MAX = 2_000_000
 

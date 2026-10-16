@@ -93,8 +93,8 @@ def test_the_bounds_are_the_documented_ones() -> None:
     assert sorted(station_extract_common.PACKINGS) == [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
     # the NeTEx reader's tables (its memory model: technical spec, admin guide)
     assert netex.GROUPS_MAX == 1_000_000
-    assert netex.ASSIGNMENTS_MAX == 2_000_000
-    assert netex.POINTS_MAX == netex.QUAYS_MAX == netex.STOP_PLACES_MAX == 2_000_000
+    assert netex.ASSIGNMENTS_MAX == netex.POINTS_MAX == 4_000_000
+    assert netex.QUAYS_MAX == netex.STOP_PLACES_MAX == 2_000_000
 
 
 def test_member_bound() -> None:

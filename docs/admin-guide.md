@@ -3184,12 +3184,14 @@ the extracts changes no graph build.
     once more; remembered the second time in a row. Report it with the
     provider and the signal: a reader or library to fix.
   - `input_too_large` — not a limit of the child but a bound of what VIATOR
-    reads (sizes, counts: more than 2 million assignments, Quays,
-    StopPlaces or called points, 1 million journey groups or (pattern,
+    reads (sizes, counts: more than 4 million assignments or called points,
+    2 million Quays or StopPlaces, 1 million journey groups or (pattern,
     group) pairs, …), refused at
     once. Report it: raising a bound is a decision, with measures (an
-    export that gives every journey its own stop points passes 2 million
-    assignments near 3 GB of unpacked XML, at some 250 bytes each).
+    export that gives every journey its own stop points reaches 4 million
+    assignments near 3 GB of unpacked XML, measured at 951 MiB; the caps
+    of assignments and called points were raised from 2 to 4 million by
+    the owner's decision of 16 October, the child's 2 GiB unchanged).
 - **Checking by hand.** `scripts/check_extract_with_msmm.py --msmm <MSMM
   checkout> --feed-key <key> <file>` runs the module's own check on an
   extract (it prints OK or the refusal word, never a value).

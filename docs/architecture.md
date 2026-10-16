@@ -1015,7 +1015,7 @@ before the csv module builds them, a quoted field may span lines), ids of at mos
 1,000,000 called stops; NeTEx read with expat in three passes, building elements only inside the ones
 a pass reads (and not their passing times, links or equipment), refusing nesting past 64, a text run
 or attribute over 1 MiB, a token over 2 MiB, 200,000 elements in one read element, 1,000,000 journey
-groups, 2,000,000 assignments or Quays, any entity declaration (expat's amplification guard set when
+groups, 4,000,000 assignments and called points, 2,000,000 Quays and StopPlaces, any entity declaration (expat's amplification guard set when
 available); 200,000 stations and 1,000 raw codes a station everywhere. Past a bound:
 `ExtractError` `input_too_large` or `too_many_rows`. Rail is GTFS `route_type` 2 and 100–117, with 109/300/400/403/404 as
 suburban (`_is_rail_route_type` of the cross-border filter is deliberately *not* reused: it drops
@@ -1081,17 +1081,19 @@ GTFS under 3: hence the child's 40 minutes of processor time and 45 of wall cloc
 stopped at the child's limit while a larger one passed: the shape, not the size). An export may give every journey its own pattern and its own scheduled stop points,
 each assigned: then points and assignments are as many as the calls, and the reader kept some 1.2 KB
 for each (a `_Use` with a `Counter` and a dict of sets per point, a list of tuples per assignment)
-and some 500 bytes per pattern, so the 2 GiB were spent long before the 2 million assignments cap
+and some 500 bytes per pattern, so the 2 GiB were spent long before the 2 million assignments cap of the time
 (a 1 GB synthetic export of that shape, 1.4 million assignments: 1,758 MiB). Now journeys are
 grouped once by number (`_Groups`), patterns, points and places hold a *tally* (one int,
 `count << 32 | group`, or a small dict once a second group comes), an assignment the number of its
 (Quay, StopPlace) pair, a direct-`calls` journey adds to its points at once, and the operators and
 modes are resolved per group only when the stations are made: about 250 bytes a point, 130 a
-pattern; the same export peaks at 372 MiB. `GROUPS_MAX` now bounds the distinct groups as well
+pattern; the same export peaks at 372 MiB. With these measures the owner decided on 16 October to
+raise `ASSIGNMENTS_MAX` and `POINTS_MAX` from 2 to 4 million (one point per assignment in such an
+export): 2.85 GB of it, about 4 million assignments, peaks at 951 MiB under the unchanged 2 GiB. `GROUPS_MAX` now bounds the distinct groups as well
 as the (pattern, group) pairs (a group without a Line that takes its pattern's in pass 2 is a new
 group). Every table has a cap (`GROUPS_MAX`, `POINTS_MAX`,
 `ASSIGNMENTS_MAX`, `QUAYS_MAX`, `STOP_PLACES_MAX`); a crafted file reaching all of them at once
-(every assignment to a distinct place) would still take about 2.8 GB and end `memory_limit`, the
+(every assignment to a distinct place) would still take about 4.6 GB and end `memory_limit`, the
 child's limit being the last stop, as for processor time. The extracts
 are byte-identical to the former reader's (compared on every synthetic shape). The reason of a
 stopped child now says which limit (`memory_limit`, `cpu_limit`, `wall_clock_limit`, `stopped`,
