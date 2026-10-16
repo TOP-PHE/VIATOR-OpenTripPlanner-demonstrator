@@ -624,16 +624,21 @@ def _journey(element: Element, found: _Journeys) -> None:
 
 
 def _keep_rail(table: dict[str, _Tally], found: _Journeys) -> None:
-    """Drop the groups whose Line, read after them, says they are not rail."""
-    for key in list(table):
-        kept = {g: c for g, c in _tally_items(table[key]) if found.rail(g) is not None}
+    """Drop the groups whose Line, read after them, says they are not rail.
+    A key left with none is removed after the loop (the table never changes
+    size while it is iterated; replacing a value does not)."""
+    emptied: list[str] = []
+    for key, tally in table.items():
+        kept = {g: c for g, c in _tally_items(tally) if found.rail(g) is not None}
         if not kept:
-            del table[key]
+            emptied.append(key)
         elif len(kept) == 1:
             ((group, count),) = kept.items()
             table[key] = count << _SHIFT | group
         else:
             table[key] = kept
+    for key in emptied:
+        del table[key]
 
 
 def _read_journeys(archive: _Archive) -> _Journeys:
