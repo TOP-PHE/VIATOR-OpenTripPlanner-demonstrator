@@ -133,6 +133,7 @@ import httpx
 from . import feed_fetch, ingestion, station_extract, station_module
 from .metrics import STATION_EXTRACT_FEEDS_TOTAL
 from .settings import settings
+from .station_extract_common import SUMMARY
 
 log = logging.getLogger(__name__)
 
@@ -324,9 +325,15 @@ class Feed:
 
 @dataclass(frozen=True)
 class FeedOutcome:
+    """One feed's end. `summary`: for a feed that gave no extract because
+    it has no rail station (`no_rail_stop`, `no_stop_place`), what the
+    extractor saw, in at most 100 characters of counts and mode words
+    (`station_extract.ExtractError.summary`)."""
+
     provider_id: str
     state: str
     reason: str | None = None
+    summary: str | None = None
 
     @property
     def text(self) -> str:
@@ -703,6 +710,8 @@ class _Pass:
         made = self._extract_within(feed)
         if isinstance(made, str):
             return FeedOutcome(pid, SKIPPED, made)
+        if isinstance(made, NoExtract):
+            return FeedOutcome(pid, SKIPPED, made.reason, made.summary)
         path = Path(made.path_gz)
         size = int(made.bytes)
         if (
@@ -920,6 +929,8 @@ def record_outcome(sid: str, outcome: FeedOutcome, *, at: datetime | None = None
         "state": outcome.state,
         "reason": outcome.reason,
     }
+    if outcome.summary:
+        state["summary"] = outcome.summary
     try:
         path = _outcome_path(sid, outcome.provider_id)
     except ValueError:
@@ -930,9 +941,11 @@ def record_outcome(sid: str, outcome: FeedOutcome, *, at: datetime | None = None
 
 def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
     """A provider's last outcome as the Sessions page shows it, or None:
-    `{"at", "state", "reason", "text", "detail"}`, the text one of
-    `STATUS_TEXTS` (with the refusal's word), the detail the reason's
-    sentence of `REASON_TEXTS` or None."""
+    `{"at", "state", "reason", "text", "detail", "summary"}`, the text one
+    of `STATUS_TEXTS` (with the refusal's word), the detail the reason's
+    sentence of `REASON_TEXTS` or None, the summary what the extractor saw
+    of a feed without a rail station (counts and mode words, checked again
+    against `SUMMARY`) or None."""
     try:
         path = _outcome_path(sid, provider_id)
     except ValueError:
@@ -944,12 +957,14 @@ def load_outcome(sid: str, provider_id: str) -> dict[str, Any] | None:
     reason = state.get("reason")
     reason = reason if isinstance(reason, str) and _WORD.fullmatch(reason) else None
     at = state.get("at") if isinstance(state.get("at"), str) else None
+    summary = state.get("summary")
     return {
         "at": at,
         "state": word,
         "reason": reason,
         "text": FeedOutcome(provider_id, word, reason).text,
         "detail": REASON_TEXTS.get(reason) if reason is not None else None,
+        "summary": summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else None,
     }
 
 
@@ -999,8 +1014,30 @@ def _log_outcome(outcome: FeedOutcome) -> None:
         )
     elif outcome.state == SKIPPED and outcome.reason not in (NO_FEED_KEY, NO_ARCHIVE):
         log.warning(
-            "station_extract.skipped provider=%s reason=%s", outcome.provider_id, outcome.reason
+            "station_extract.skipped provider=%s reason=%s%s",
+            outcome.provider_id,
+            outcome.reason,
+            f" saw: {outcome.summary}" if outcome.summary else "",
         )
+
+
+@dataclass(frozen=True)
+class NoExtract:
+    """What `_extract` gives for an extractor's refusal that says what the
+    reader saw: its reason word and its summary."""
+
+    reason: str
+    summary: str
+
+
+def _refusal(refused: station_extract.ExtractError) -> str | NoExtract:
+    """The reason word of an extractor's refusal, with its summary when it
+    has one of the summary's form."""
+    if not _WORD.fullmatch(refused.reason):
+        return NO_EXTRACT
+    if refused.summary and SUMMARY.fullmatch(refused.summary):
+        return NoExtract(refused.reason, refused.summary)
+    return refused.reason
 
 
 def _source(provider_cfg: dict[str, Any]) -> str:
@@ -1054,7 +1091,7 @@ def _extract(sid: str, feed: Feed, wait_seconds: float, cache_only: bool = False
                 wait_seconds=wait_seconds,
             )
     except station_extract.ExtractError as refused:
-        return refused.reason if _WORD.fullmatch(refused.reason) else NO_EXTRACT
+        return _refusal(refused)
     except Exception as exc:  # the snapshot's file system, never the extraction
         log.warning(_FAILED, ERROR, type(exc).__name__)
         return ERROR

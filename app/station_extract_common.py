@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import io
 import math
+import re
 import zipfile
 from dataclasses import dataclass, field
 from typing import IO
@@ -234,3 +235,126 @@ def coordinate(text: str | None) -> float | None:
     except ValueError:
         return None
     return value if math.isfinite(value) else None
+
+
+# ── The census: what a reader saw, for a feed that gives no extract ──────
+
+# When a feed ends `no_rail_stop` or `no_stop_place`, the readers say what
+# they saw (`Census`): a short summary for the admin status and the
+# remembered failure (`SUMMARY_MAX` characters), the whole census for the
+# web log. Counts and enumerated words only, never an id, a name or a URL: a
+# value read from the feed (a NeTEx `TransportMode`, a GTFS `route_type`) is
+# kept only when it is one word of letters and `_` (digits for a
+# `route_type`) of at most `CENSUS_VALUE_MAX` characters, as the words of an
+# enumeration are, and counted as `unreadable` otherwise (an id, a URL, a
+# text with spaces are never cut down to a part of themselves); at most
+# `CENSUS_VALUES_MAX` distinct values are kept, the others counted together.
+# Cheap: a few counters, never one entry per element.
+CENSUS_VALUES_MAX = 8
+CENSUS_VALUE_MAX = 24
+SUMMARY_MAX = 100
+NO_VALUE = "none"  # no value given
+NOT_A_WORD = "unreadable"  # a value that is not one such word
+OTHER_VALUES = "other_values"  # past `CENSUS_VALUES_MAX` distinct values
+# What a summary may hold, checked again wherever one is read back.
+SUMMARY = re.compile(r"[\w ,:()]{1,100}", re.ASCII)
+CENSUS_REASONS = frozenset({"no_rail_stop", "no_stop_place"})
+_WORD = re.compile(rf"[A-Za-z_]{{1,{CENSUS_VALUE_MAX}}}", re.ASCII)
+_NUMBER = re.compile(rf"\d{{1,{CENSUS_VALUE_MAX}}}", re.ASCII)
+
+
+class ValueTally:
+    """Counts by value, the values checked and bounded (see above)."""
+
+    def __init__(self, *, digits: bool = False) -> None:
+        self.counts: dict[str, int] = {}
+        self._form = _NUMBER if digits else _WORD
+        self._between = ": " if digits else " "
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts.values())
+
+    def add(self, raw: str, count: int = 1) -> None:
+        value = NO_VALUE
+        if raw:
+            value = raw if self._form.fullmatch(raw) else NOT_A_WORD
+        if value not in self.counts and len(self.counts) >= CENSUS_VALUES_MAX:
+            value = OTHER_VALUES
+        self.counts[value] = self.counts.get(value, 0) + count
+
+    def top(self) -> list[tuple[str, int]]:
+        """The (value, count) pairs with a count, the most frequent first."""
+        found = [item for item in self.counts.items() if item[1]]
+        return sorted(found, key=lambda item: (-item[1], item[0]))
+
+    def text(self, limit: int) -> str:
+        """The `limit` most frequent values: "bus 3,000, none 210" ("3: 38,
+        700: 2" for numbers)."""
+        return ", ".join(f"{value}{self._between}{count:,}" for value, count in self.top()[:limit])
+
+
+def _field(value: object) -> str:
+    """A value of the whole census: a number, `value:count,...`, or `unread`."""
+    if value is None:
+        return "unread"
+    if isinstance(value, ValueTally):
+        value = dict(value.top())
+    if isinstance(value, dict):
+        return ",".join(f"{word}:{count}" for word, count in value.items()) or "0"
+    return str(value)
+
+
+def pack(segments: list[list[str]]) -> str:
+    """The segments joined with ", " within `SUMMARY_MAX` characters: of each
+    segment, its first form that still fits; a segment none of whose forms
+    fits is left out."""
+    parts: list[str] = []
+    for forms in segments:
+        for form in forms:
+            if len(", ".join([*parts, form])) <= SUMMARY_MAX:
+                parts.append(form)
+                break
+    return ", ".join(parts)
+
+
+def tally_forms(count: int, noun: str, tally: ValueTally, label: str = "") -> list[str]:
+    """`count noun (label v1 n1, v2 n2, v3 n3)`, with fewer values when it is
+    too long, last without any."""
+    forms = [f"{count:,} {noun} ({label}{tally.text(n)})" for n in (3, 2, 1) if tally.top()]
+    return [*forms, f"{count:,} {noun}"]
+
+
+@dataclass
+class Census:
+    """What a reader saw, and what writing made of it: `stations` the
+    stations read, `dropped` the rows not written by reason word (the
+    reasons that drop a row only). The readers fill their own fields."""
+
+    stations: int | None = None
+    dropped: collections.Counter[str] = field(default_factory=collections.Counter)
+
+    def segments(self) -> list[list[str]]:
+        """The summary's segments, most telling first (one list of forms each)."""
+        return [self.stations_forms()]
+
+    def fields(self) -> list[tuple[str, object]]:
+        """The whole census, as (name, value) pairs."""
+        return [("stations", self.stations), ("dropped", dict(self.dropped))]
+
+    def stations_forms(self) -> list[str]:
+        if self.stations is None:
+            return []
+        plain = f"{self.stations:,} stations"
+        if not self.dropped:
+            return [plain]
+        most = ", ".join(f"{word} {count:,}" for word, count in self.dropped.most_common(2))
+        return [f"{plain} (not written: {most})", plain]
+
+    def summary(self) -> str:
+        """At most `SUMMARY_MAX` characters, for the admin status."""
+        return pack(self.segments())
+
+    def full(self) -> str:
+        """Every count, `name=value` separated by spaces, for the web log."""
+        return " ".join(f"{name}={_field(value)}" for name, value in self.fields())
