@@ -1069,9 +1069,13 @@ one feed: **queued**, **running** (with the provider being sent), then **finishe
 already held**, **— skipped (budget)** (the outcome and its reason word), or **— nothing to send**;
 **not configured** or **interrupted** as below. A derived (`cross_border_filter`) provider's card
 shows the filter as its one task and no station-module line (no pass follows it). The blocks are, top
-to bottom: the card refreshes (every running one, then the newest ended one when it is newer than the
-last **Refresh providers**; an older one is superseded, since that refresh downloaded the provider
-too), the last **Refresh providers** with its result, and the last **Refresh OSM**.
+to bottom: the card refreshes (the running ones, up to 4; the ended ones whose station-module pass is
+still queued or running, up to 4, so the page keeps following them; and the newest ended one unless a
+**Refresh providers** started after it and **finished**, which downloaded that provider too: one that
+failed or was interrupted supersedes nothing), the last **Refresh providers** with its result, and the
+last **Refresh OSM**. A card refresh of a provider since removed from the session, or renamed, is not
+shown. While a card's refresh or a whole-session **Refresh providers** runs, that card's **Refresh**
+button is disabled.
 
 What the block says:
 
@@ -1114,7 +1118,10 @@ card refresh runs (409 `provider_refresh_running`: *A refresh of provider ZZRAIL
 slot, fetch state and staging folder, and waiting instead would hold the click, with no block, for
 as long as that provider's download and check take (many minutes for a national NeTEx file). Cards
 of two different providers may refresh together. A card refresh past its 5-minute lease blocks
-nothing, like any other. The toast gives the running refresh's start in the browser's time format.
+nothing, like any other. A card with nothing to download still answers the 409 first when a refresh
+is running, then its 400. Two refreshes running together each write the session's config at their
+end (the staleness mark, the state): each re-reads the session row under a row lock just before, so
+neither overwrites the other's change nor a **Save config** made during its download. The toast gives the running refresh's start in the browser's time format.
 
 The record holds labels (built from the session's provider ids) and counts only: never a URL, a
 token or a skip reason. Its table, `source_refresh_progress`, comes with migration

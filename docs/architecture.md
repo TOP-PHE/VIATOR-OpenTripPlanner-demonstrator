@@ -1195,6 +1195,10 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   serialised by `pg_advisory_xact_lock`, so the cross-record rules hold: same provider twice, a card
   during the whole-session refresh, and the whole-session refresh during a card are refused (409;
   the last `provider_refresh_running`); two different providers may run together.
+  Both provider refreshes write the session's config at their end only after
+  `sessions._relock_session` (SELECT … FOR UPDATE): the row loaded at request start may be stale
+  after a long download (another card, a Save config). Never write `s.config` after a download
+  without it, and never hold that lock over the cascade or a download.
 
 ---
 

@@ -357,6 +357,26 @@ def claim(sid: str, scope: str, total: int, *, factory: Factory | None = None) -
     return RefreshRun(sid, scope, run_id, detail, factory=factory)
 
 
+def check_free(sid: str, scope: str, *, factory: Factory | None = None) -> None:
+    """Raise `RefreshRunning` when a claim of `scope` would be refused now,
+    without claiming (a request that will answer another error first says
+    the refresh is running, as before). Stale running rows are marked
+    interrupted on the way, like a read does."""
+    with _session_factory(factory)() as db:
+        _expire(db, sid)
+        db.commit()
+        started = db.execute(
+            select(Row.started_at).where(
+                Row.session_id == sid, Row.scope == scope, Row.state == RUNNING
+            )
+        ).scalar_one_or_none()
+        if started is not None:
+            raise RefreshRunning(scope, started)
+        blocker = _blocker(db, sid, scope)
+    if blocker is not None:
+        raise blocker
+
+
 # ── the running refresh ──────────────────────────────────────────────────
 
 
@@ -844,35 +864,69 @@ def _public(row: Row, now: datetime) -> dict[str, Any]:
     return public
 
 
-def _singles_shown(rows: list[Row], whole: Row | None) -> list[Row]:
+def _follow_up_active(row: Row, now: datetime) -> bool:
+    """The record's station-module pass is still queued or running (one that
+    went silent reads interrupted and no longer counts)."""
+    extract = row.extract if isinstance(row.extract, dict) else {}
+    return bool(extract.get("state")) and _extract_state(extract, now) in ("queued", RUNNING)
+
+
+def _superseded(row: Row, whole: Row | None) -> bool:
+    """A whole-session provider refresh that started after `row` and
+    finished downloaded its provider too. One that failed or was interrupted
+    may never have reached it: it supersedes nothing."""
+    return whole is not None and whole.state == FINISHED and whole.started_at > row.started_at
+
+
+def _singles_shown(rows: list[Row], whole: Row | None, now: datetime) -> list[Row]:
     """The single-provider records the page shows, newest first: every
-    running one (at most `SINGLE_SHOWN_MAX`), then the newest ended one when
-    it started after the whole session's provider refresh (an older one is
-    superseded: that refresh downloaded its provider too)."""
+    running one (at most `SINGLE_SHOWN_MAX`), every ended one whose
+    station-module pass is still queued or running (at most as many: the
+    page polls until it ends), and the newest ended one unless it is
+    superseded (`_superseded`)."""
     newest_first = sorted(rows, key=lambda r: r.started_at, reverse=True)
-    shown = [r for r in newest_first if r.state == RUNNING][:SINGLE_SHOWN_MAX]
-    ended = next((r for r in newest_first if r.state != RUNNING), None)
-    if ended is not None and (whole is None or ended.started_at > whole.started_at):
-        shown.append(ended)
-    return shown
+    running = [r for r in newest_first if r.state == RUNNING][:SINGLE_SHOWN_MAX]
+    ended = [r for r in newest_first if r.state != RUNNING]
+    kept = [r for r in ended if _follow_up_active(r, now)][:SINGLE_SHOWN_MAX]
+    if ended and ended[0] not in kept and not _superseded(ended[0], whole):
+        kept.insert(0, ended[0])
+    return running + kept
 
 
-def read(sid: str, *, factory: Factory | None = None) -> dict[str, Any]:
+def provider_ids(config: object) -> set[str]:
+    """The provider ids of a session's config as saved (no validation): a
+    record of a provider removed or renamed since is not shown."""
+    sources = config.get("sources") if isinstance(config, dict) else None
+    providers = sources.get("providers") if isinstance(sources, dict) else None
+    if not isinstance(providers, list):
+        return set()
+    return {p["id"] for p in providers if isinstance(p, dict) and isinstance(p.get("id"), str)}
+
+
+def read(
+    sid: str, *, providers: set[str] | None = None, factory: Factory | None = None
+) -> dict[str, Any]:
     """`{"providers": record | None, "osm": record | None, "single":
     [record, ...], "now": iso}` for the page; `single` holds the records of
-    one provider's refresh alone (`_singles_shown`). A running record past
-    its lease is first marked interrupted (the process that wrote it is
-    gone), so every reader sees the same."""
+    one provider's refresh alone (`_singles_shown`), of the session's
+    current `providers` only when given. A running record past its lease is
+    first marked interrupted (the process that wrote it is gone), so every
+    reader sees the same."""
     with _session_factory(factory)() as db:
         _expire(db, sid)
         db.commit()
         now = db.execute(select(func.now())).scalar_one()
         rows = list(db.execute(select(Row).where(Row.session_id == sid)).scalars())
         kinds = {r.scope: r for r in rows if r.scope in SCOPES}
-        singles = [r for r in rows if is_provider_scope(r.scope)]
+        singles = [
+            r
+            for r in rows
+            if is_provider_scope(r.scope) and (providers is None or r.scope in providers)
+        ]
         result: dict[str, Any] = {
             scope: _public(kinds[scope], now) if scope in kinds else None for scope in SCOPES
         }
-        result["single"] = [_public(r, now) for r in _singles_shown(singles, kinds.get(PROVIDERS))]
+        shown = _singles_shown(singles, kinds.get(PROVIDERS), now)
+        result["single"] = [_public(r, now) for r in shown]
     result["now"] = _iso(now)
     return result

@@ -1730,7 +1730,10 @@ function progressSingleOutcome(x) {
 }
 
 function progressSingleExtractLine(x) {
-  if (x.state === 'running') return `Station module: running${x.current ? ` · now ${x.current}` : ''}`;
+  if (x.state === 'running') {
+    const now = x.current ? ` · now ${x.current}` : '';
+    return `Station module: running${now}`;
+  }
   const end = {finished: 'finished', cancelled: 'cancelled', error: 'stopped by an error'}[x.state] || x.state;
   return `Station module: ${end} ${progressTime(x.finished_at)} — ${progressSingleOutcome(x)}`;
 }
@@ -1814,6 +1817,29 @@ function progressButtonBusy(body, kind) {
   return null;
 }
 
+// A card's Refresh is refused while that provider's refresh or the whole
+// session's provider refresh runs (409): disabled meanwhile, with the reason.
+function progressCardBusy(body, pid) {
+  if (body && body.providers && body.providers.state === 'running') {
+    return 'A provider refresh of the whole session is running: its progress is shown under the buttons.';
+  }
+  const mine = progressRecords(body).some(([rec, k]) => k === 'single' && rec.state === 'running' && rec.provider_id === pid);
+  return mine ? "This provider's refresh is running: its progress is shown under the buttons." : null;
+}
+
+function renderCardButtons(sid, body) {
+  const form = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"]`);
+  if (!form) return;
+  form.querySelectorAll('button[data-action="refresh-provider"]').forEach(btn => {
+    const card = btn.closest('.provider-card');
+    const idInput = card && card.querySelector('.prov-id');
+    const busy = progressCardBusy(body, idInput ? idInput.value.trim() : '');
+    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title || '';
+    btn.disabled = Boolean(busy) || btn.dataset.busy === '1';
+    btn.title = busy || btn.dataset.idleTitle;
+  });
+}
+
 function renderRefreshProgress(sid, body) {
   const section = document.querySelector(`[data-role="refresh-progress"][data-sid="${CSS.escape(sid)}"]`);
   if (!section) return;
@@ -1828,6 +1854,7 @@ function renderRefreshProgress(sid, body) {
     btn.disabled = Boolean(busy) || btn.dataset.busy === '1';
     btn.title = busy || btn.dataset.idleTitle;
   });
+  renderCardButtons(sid, body);
 }
 
 // How long until the next read: null once nothing runs.
@@ -2225,6 +2252,7 @@ async function refreshOneProvider(form, refreshBtn) {
   if (!pid) { showToast('error', 'Provider ID is required to refresh'); return; }
   const sid = form.dataset.sid;
   refreshBtn.disabled = true;
+  refreshBtn.dataset.busy = '1';
   const original = refreshBtn.textContent;
   refreshBtn.textContent = 'Downloading…';
   const marks = attemptMarks(sid, [pid]);
@@ -2240,7 +2268,12 @@ async function refreshOneProvider(form, refreshBtn) {
     if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
   } catch (err) { showToast('error', String(err)); }
-  finally { refreshBtn.disabled = false; refreshBtn.textContent = original; loadRefreshProgress(sid); }
+  finally {
+    delete refreshBtn.dataset.busy;
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = original;
+    loadRefreshProgress(sid);
+  }
 }
 
 async function uploadToProvider(form, uploadBtn) {

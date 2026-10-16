@@ -1141,6 +1141,15 @@ class ProviderStatus(BaseModel):
 _PROVIDER_FRESHNESS_HOURS = 24
 
 
+def _relock_session(db: DbSession, s: SessionRow) -> None:
+    """Re-read the session row under a row lock (SELECT … FOR UPDATE), just
+    before a refresh writes its state and config: the row was loaded when
+    the request began, and during a long download another card's refresh or
+    a config save may have changed it. The refresh then changes only its own
+    keys on the current config, and the lock holds until its commit."""
+    db.refresh(s, with_for_update=True)
+
+
 def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) -> None:
     """The session's state and staleness after a provider refresh."""
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
@@ -1216,8 +1225,6 @@ async def refresh_sources(
         )
         run.phase(refresh_progress.FINISHING)
 
-        _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
-
         # §12 — single-source-of-truth cascade. When this session's feeds actually
         # changed, re-derive every cross_border_filter provider (in other sessions)
         # that's linked to a provider here. So refreshing the Renfe national feed
@@ -1233,6 +1240,10 @@ async def refresh_sources(
         # on BrittanyFerries' data. Surfaced 2026-05-11.
         expected = inbox_sweep.expected_provider_filenames(s.config or {})
         orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
+
+        # Last, under the row lock until the commit (never held over the cascade).
+        _relock_session(db, s)
+        _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
 
         audit.record(
             db,
@@ -1279,9 +1290,10 @@ def get_refresh_progress(
     tab, browser and web process. The
     same role as the refresh buttons: whoever may start a refresh may watch
     it. Labels and counts only: never a URL or a reason text."""
-    if db.get(SessionRow, sid) is None:
+    s = db.get(SessionRow, sid)
+    if s is None:
         raise HTTPException(404, "Session not found")
-    return refresh_progress.read(sid)
+    return refresh_progress.read(sid, providers=refresh_progress.provider_ids(s.config))
 
 
 # ──── OSM-only refresh (v0.1.14) ────
@@ -1772,6 +1784,14 @@ def _queue_rebuild_own_session(sid: str, kind: str) -> None:
             ingestion.queue_rebuild(db, session_id=sid, kind=kind)
     except Exception as exc:  # a lost queue entry: the next refresh or build catches up
         log.warning("rebuild not queued after a cancelled copy: %s", type(exc).__name__)
+
+
+def _refuse_if_running(sid: str, scope: str) -> None:
+    """409, as `_claim_refresh` would answer, without claiming."""
+    try:
+        refresh_progress.check_free(sid, scope)
+    except refresh_progress.RefreshRunning as exc:
+        raise HTTPException(409, detail=exc.detail()) from exc
 
 
 def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
@@ -2524,6 +2544,7 @@ def _finalise_provider_refresh(
     """Shared tail for both per-provider refresh paths: advance state, clear the
     staleness flag (lossy-by-design — see refresh_sources), audit, commit."""
     unchanged = unchanged or []
+    _relock_session(db, session)
     if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
         session.state = SessionState.POPULATED.value
     if fetched or unchanged:
@@ -2670,8 +2691,10 @@ async def refresh_provider(
     if (provider.get("timetable") or {}).get("source") == "cross_border_filter":
         return await _refresh_one_derived(db, request, actor, s, sid, provider)
 
+    scope = refresh_progress.provider_scope(pid)
     work = _build_refresh_tasks(s.config or {}, only_provider=pid)
     if not work:
+        _refuse_if_running(sid, scope)  # a running refresh says so first, as before
         raise HTTPException(
             400,
             f"Provider {pid!r} has no URLs to refresh "
@@ -2679,7 +2702,7 @@ async def refresh_provider(
         )
     # Issue #359: this provider's own progress record; 409 while it, or the
     # whole session's provider refresh (it downloads this provider too), runs.
-    run = _claim_refresh(sid, refresh_progress.provider_scope(pid), len(work))
+    run = _claim_refresh(sid, scope, len(work))
     async with run:
         result = await _refresh_provider_urls(
             db,

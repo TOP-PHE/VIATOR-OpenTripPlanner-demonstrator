@@ -752,8 +752,9 @@ def test_who_may_run_beside_a_provider_card_refresh(
     # A dead card refresh blocks nothing; the next one says what it replaced.
     _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
     whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 2)
+    scope = refresh_progress.provider_scope("ZZRAIL")
     with pytest.raises(refresh_progress.RefreshRunning) as refused:
-        refresh_progress.claim(SID, refresh_progress.provider_scope("ZZRAIL"), 1)
+        refresh_progress.claim(SID, scope, 1)
     assert refused.value.detail()["error"] == "refresh_already_running"
     assert refused.value.detail()["scope"] == "providers"
     whole.finish(refresh_progress.FINISHED)
@@ -765,6 +766,182 @@ def test_who_may_run_beside_a_provider_card_refresh(
     single.finish(refresh_progress.FINISHED)
     assert (_read()["single"][0]["state"], _read()["single"][0]["done"]) == ("running", 0)
     taker.finish(refresh_progress.FINISHED)
+
+
+def _edit_config_meanwhile(note: int) -> None:
+    """Another request saves the session's config (a key of its own)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    with SessionLocal() as other:
+        row = other.get(SessionRow, SID)
+        assert row is not None
+        row.config = {**row.config, f"zz_note_{note}": 99}
+        flag_modified(row, "config")
+        other.commit()
+
+
+@pytest.mark.parametrize("route", ["providers/ZZRAIL/refresh", "sources/refresh"])
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_config_saved_during_a_download_is_kept(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """The refresh writes the session's config after its downloads: it
+    re-reads the row under a lock first, so a save made meanwhile (another
+    card's refresh, the config form) is not overwritten."""
+    from app.api.admin import sessions as sessions_api
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL"])
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+    assert client.post(f"/api/sessions/{SID}/{route}", headers=admin).status_code == 200
+    # The same file again ("unchanged": nothing in the request commits before
+    # the refresh writes the config); the config is saved while it runs.
+    edits = iter(range(99))
+    real_task = sessions_api._refresh_one_task
+
+    async def task_then_save(*args: Any) -> dict[str, Any]:
+        outcome = await real_task(*args)
+        _edit_config_meanwhile(next(edits))
+        return outcome
+
+    monkeypatch.setattr(sessions_api, "_refresh_one_task", task_then_save)
+    r = client.post(f"/api/sessions/{SID}/{route}", headers=admin)
+    assert r.status_code == 200, r.text
+    assert [u["key"] for u in r.json()["unchanged"]] == ["provider[ZZRAIL].timetable(gtfs)"]
+    with SessionLocal() as db:
+        row = db.get(SessionRow, SID)
+        assert row is not None
+        assert row.config["zz_note_0"] == 99
+        # The refresh's own change is there too.
+        assert row.config["_meta"]["last_refresh_completed_at"]
+        assert row.config["sources"]["providers"][0]["id"] == "ZZRAIL"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_card_record_stays_while_its_follow_up_runs(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 1: a card's record whose station-module pass is still
+    queued or running is shown (and so polled) whatever the session's
+    refresh does; only a finished session refresh supersedes it."""
+    from app import refresh_progress, station_module
+
+    _make_session(client, admin, ["ZZRAIL"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    card = refresh_progress.claim(SID, "ZZRAIL", 1)
+    card.finish(refresh_progress.FINISHED)
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+
+    def single() -> list[tuple[str, str | None]]:
+        return [(r["provider_id"], (r["extract"] or {}).get("state")) for r in _read()["single"]]
+
+    # The session's refresh runs: the card's queued pass is still shown.
+    assert single() == [("ZZRAIL", "queued")]
+    body = client.get(f"/api/sessions/{SID}/sources/progress", headers=admin).json()
+    assert body["providers"]["state"] == "running"
+    follow = refresh_progress.ExtractFollowUp(SID, card.run_id, scope="ZZRAIL")
+    follow.started(1)
+    follow._stop.set()  # no beat in this test
+    # Finished after the card, while the card's pass runs: still shown.
+    whole.finish(refresh_progress.FINISHED)
+    assert single() == [("ZZRAIL", "running")]
+    # The pass ended: the finished session refresh supersedes the card.
+    follow.finished("finished")
+    assert single() == []
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_only_a_finished_session_refresh_supersedes_a_card(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    from app import refresh_progress
+
+    _make_session(client, admin, ["ZZRAIL"])
+    refresh_progress.claim(SID, "ZZRAIL", 1).finish(refresh_progress.FINISHED)
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 2)
+    whole.finish(refresh_progress.FAILED, error="ZzError")
+    # Failed (it may never have reached ZZRAIL): the card stays.
+    assert [r["provider_id"] for r in _read()["single"]] == ["ZZRAIL"]
+    refresh_progress.claim(SID, refresh_progress.PROVIDERS, 2)
+    _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
+    assert _read()["providers"]["state"] == "interrupted"
+    assert [r["provider_id"] for r in _read()["single"]] == ["ZZRAIL"]
+
+
+@pytest.mark.usefixtures("inbox")
+def test_a_removed_provider_s_record_is_not_shown(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import refresh_progress
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL", "ZZBUS"])
+    refresh_progress.claim(SID, "ZZRAIL", 1).finish(refresh_progress.FINISHED)
+
+    def shown() -> list[str]:
+        body = client.get(f"/api/sessions/{SID}/sources/progress", headers=admin).json()
+        return [r["provider_id"] for r in body["single"]]
+
+    assert shown() == ["ZZRAIL"]
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {"sources": {"providers": [_provider("ZZBUS")]}}
+        flag_modified(s, "config")
+        db.commit()
+    assert shown() == []
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_running_refresh_is_said_before_a_card_with_nothing_to_download(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    """The order before this change: 409 first, then the 400 "no URLs"."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import refresh_progress
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, [])
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "ZZEMPTY",
+                        "country_iso": "ZZ",
+                        "timetable": {"format": "gtfs", "source": "upload"},
+                    }
+                ]
+            }
+        }
+        flag_modified(s, "config")
+        db.commit()
+    route = f"/api/sessions/{SID}/providers/ZZEMPTY/refresh"
+    first = client.post(route, headers=admin)
+    assert first.status_code == 400, first.text
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    r = client.post(route, headers=admin)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["scope"] == "providers"
+    whole.finish(refresh_progress.FINISHED)
+    card = refresh_progress.claim(SID, "ZZEMPTY", 1)
+    r = client.post(route, headers=admin)
+    assert (r.status_code, r.json()["detail"]["provider_id"]) == (409, "ZZEMPTY")
+    card.finish(refresh_progress.FINISHED)
+    assert client.post(route, headers=admin).status_code == 400
+    # Never claimed by the refused requests: the card record is the test's own.
+    assert _read()["single"][0]["total"] == 1
 
 
 @pytest.mark.usefixtures("fresh_db")

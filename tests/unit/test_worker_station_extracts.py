@@ -188,7 +188,9 @@ _CONFIG = {
 
 def _fake_db() -> SimpleNamespace:
     row = SimpleNamespace(id="zz-session", config=dict(_CONFIG), state="populated")
-    return SimpleNamespace(get=lambda _model, _sid: row, commit=lambda: None)
+    return SimpleNamespace(
+        get=lambda _model, _sid: row, commit=lambda: None, refresh=lambda *_a, **_k: None
+    )
 
 
 def _args(endpoint: Any, **given: Any) -> dict[str, Any]:

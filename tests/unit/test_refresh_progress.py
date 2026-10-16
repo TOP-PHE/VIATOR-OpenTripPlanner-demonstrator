@@ -1121,3 +1121,23 @@ def test_a_failed_copy_removes_its_source_and_queues_nothing(
         asyncio.run(failing)
     assert not source.exists()
     assert (queued, after) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("config", "ids"),
+    [
+        (
+            {
+                "sources": {
+                    "providers": [{"id": "ZZRAIL"}, {"id": "ZZBUS"}, {"x": 1}, "ZZ", {"id": 9}]
+                }
+            },
+            {"ZZRAIL", "ZZBUS"},
+        ),
+        ({"sources": {"providers": "ZZRAIL"}}, set()),
+        ({"sources": []}, set()),
+        (None, set()),
+    ],
+)
+def test_the_shown_card_records_follow_the_saved_providers(config: Any, ids: set[str]) -> None:
+    assert refresh_progress.provider_ids(config) == ids

@@ -39,7 +39,9 @@ def _session() -> SimpleNamespace:
 
 
 def _db(session: SimpleNamespace) -> SimpleNamespace:
-    return SimpleNamespace(get=lambda _model, _sid: session, commit=lambda: None)
+    return SimpleNamespace(
+        get=lambda _model, _sid: session, commit=lambda: None, refresh=lambda *_a, **_k: None
+    )
 
 
 def _response(**buckets: list[dict[str, Any]]) -> sessions_api.RefreshSourcesResponse:

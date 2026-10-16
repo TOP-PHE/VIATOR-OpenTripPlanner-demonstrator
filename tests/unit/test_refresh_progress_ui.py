@@ -665,7 +665,7 @@ _FINISH = (
 const answers = %(answers)s;
 let calls = 0;
 const statusReads = [];
-const form = {tag: 'form'};
+const form = {tag: 'form', querySelectorAll: () => []};
 const pageQuery = document.querySelector;
 document.querySelector = sel => (sel === 'form[data-form="config"][data-sid="zz"]' ? form : pageQuery(sel));
 function loadProviderStatuses(sid, f) { statusReads.push([sid, f === form, calls]); }
@@ -732,3 +732,92 @@ console.log(JSON.stringify({
         " downloads it too. Its progress is shown under the buttons."
     )
     assert result["session"].startswith("A provider refresh of this session is already running")
+
+
+def test_a_card_whose_pass_is_queued_stays_while_the_session_refresh_runs() -> None:
+    """Review round 1: the server keeps the card's record while its pass is
+    queued or running; the page shows it beside the session's refresh and
+    keeps polling until the pass ends."""
+    card = _ended_single({"state": "queued"})
+    result = _render({"providers": _record(), "osm": None, "single": [card]})
+    assert _titles(result) == [
+        ("Provider refresh — ZZRAIL only", "finished"),
+        ("Provider refresh", "running"),
+    ]
+    assert _lines(result, 0)[-1] == (
+        "Station module: queued — the extracts are sent after the refresh"
+    )
+    whole_done = _record(state="finished", current=[])
+    answers = [
+        {"status": 200, "body": {"providers": _record(), "osm": None, "single": [card]}},
+        {
+            "status": 200,
+            "body": {
+                "providers": whole_done,
+                "osm": None,
+                "single": [_ended_single(_pass("running"))],
+            },
+        },
+        {"status": 200, "body": {"providers": whole_done, "osm": None, "single": []}},
+    ]
+    assert _poll(answers)["delays"] == [2500, 10000, 45000]
+
+
+_CARDS = (
+    _FAKE_DOM
+    + """
+const cards = %(pids)s.map(pid => {
+  const btn = {dataset: {}, title: 'Refresh this provider', disabled: false};
+  const card = {querySelector: () => ({value: ' ' + pid + ' '})};
+  btn.closest = () => card;
+  return btn;
+});
+cards[2].dataset.busy = '1';
+const form = {querySelectorAll: () => cards};
+const pageQuery = document.querySelector;
+document.querySelector = sel => (sel === 'form[data-form="config"][data-sid="zz"]' ? form : pageQuery(sel));
+%(block)s
+const states = [];
+for (const body of %(bodies)s) {
+  renderRefreshProgress('zz', body);
+  states.push(cards.map(b => [b.disabled, b.title]));
+}
+console.log(JSON.stringify(states));
+"""
+)
+
+
+def test_a_card_button_is_disabled_while_its_refresh_or_the_session_s_runs() -> None:
+    bodies = [
+        {"providers": None, "osm": None, "single": [_single()]},
+        {"providers": _record(), "osm": None, "single": []},
+        {"providers": None, "osm": None, "single": [_ended_single({"state": "off"})]},
+    ]
+    script = _CARDS % {
+        "block": _block(),
+        "pids": json.dumps(["ZZRAIL", "ZZBUS", "ZZTRAM"]),
+        "bodies": json.dumps(bodies),
+    }
+    mine, whole, ended = _node(script)
+    idle = "Refresh this provider"
+    assert mine[0] == [
+        True,
+        "This provider's refresh is running: its progress is shown under the buttons.",
+    ]
+    assert mine[1] == [False, idle]
+    # A card already clicked on this page stays disabled until its answer.
+    assert mine[2] == [True, idle]
+    assert [state[0] for state in whole] == [True, True, True]
+    assert whole[0][1].startswith("A provider refresh of the whole session is running")
+    assert ended[:2] == [[False, idle], [False, idle]]
+
+
+def test_a_card_click_marks_its_button_busy_until_the_answer() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+    start = text.index("async function refreshOneProvider(form, refreshBtn)")
+    handler = text[start : text.index("\n}\n", start)]
+    assert handler.index("refreshBtn.dataset.busy = '1';") < handler.index("await fetch(")
+    finally_part = handler[handler.index("finally") :]
+    assert finally_part.index("delete refreshBtn.dataset.busy;") < finally_part.index(
+        "loadRefreshProgress(sid);"
+    )
