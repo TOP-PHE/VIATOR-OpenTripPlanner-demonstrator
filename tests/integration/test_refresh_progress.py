@@ -11,6 +11,10 @@ On a real PostgreSQL (`app/refresh_progress.py`, table
 - a second refresh of the same kind is refused with 409
   `refresh_already_running` and its start time, the claim holds against two
   threads at once, and the OSM refresh rotates nothing when refused;
+- a provider card's refresh writes a record of its own (scope: its feed id)
+  with its station-module follow-up bound to its run; the same provider
+  twice, a card refresh during the session's and the session's during a card
+  refresh are refused, two providers may run together;
 - a record whose heartbeat stopped for longer than the lease is shown
   `interrupted`, a new refresh takes it over, and the old refresh's writes
   change nothing;
@@ -587,21 +591,353 @@ def test_a_provider_card_refresh_waits_for_the_session_refresh(
     started = _read()["providers"]["started_at"]
     r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
     assert r.status_code == 409
-    assert r.json()["detail"]["error"] == "refresh_already_running"
-    assert r.json()["detail"]["started_at"] == started
+    detail = r.json()["detail"]
+    assert (detail["error"], detail["scope"], detail["provider_id"]) == (
+        "refresh_already_running",
+        "providers",
+        None,
+    )
+    assert detail["started_at"] == started
+    # Refused before anything was written: no record of its own.
+    assert _read()["single"] == []
     # A dead session refresh (past its lease) does not block the card.
     _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
     _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
     r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
     assert r.status_code == 200, r.text
-    # Nor does a finished one; the card's refresh writes no record.
-    run.finish(refresh_progress.FINISHED)
+    assert _read()["providers"]["state"] == "interrupted"
+    # Nor does a finished one.
+    second = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    second.finish(refresh_progress.FINISHED)
+    assert run.run_id != second.run_id
     assert (
         client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin).status_code
         == 200
     )
+    # The card's refresh wrote its own record, never the session's.
     record = _read()["providers"]
     assert (record["state"], record["done"], record["fetched"]) == ("finished", 0, 0)
+    [single] = _read()["single"]
+    assert (single["provider_id"], single["state"], single["unchanged"]) == (
+        "ZZRAIL",
+        "finished",
+        1,
+    )
+
+
+# ── one provider alone (the provider card's Refresh) ─────────────────────
+
+
+def _run_id(scope: str) -> uuid.UUID:
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        found: uuid.UUID = db.execute(
+            text("SELECT run_id FROM source_refresh_progress WHERE session_id = :s AND scope = :c"),
+            {"s": SID, "c": scope},
+        ).scalar_one()
+    return found
+
+
+@pytest.mark.usefixtures("inbox")
+def test_a_provider_card_refresh_has_its_own_record_and_follow_up(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress, station_module
+    from app import station_extract_upload as up
+
+    _make_session(client, admin, ["ZZRAIL", "ZZBUS"])
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 2)
+    whole.finish(refresh_progress.FAILED, error="ZzError")
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    queued: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(up, "after_refresh", lambda *a, **k: queued.append((a, k)))
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        # While its download runs, the card's refresh is read back as running.
+        record = _read()["single"][0]
+        assert (record["state"], record["scope"], record["provider_id"]) == (
+            "running",
+            "provider",
+            "ZZRAIL",
+        )
+        assert record["current"][0]["key"] == "provider[ZZRAIL].timetable(gtfs)"
+        return httpx.Response(200, content=_gtfs_bytes(padding=99_999))
+
+    _mock_downloads(monkeypatch, handler)
+    r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    assert seen == ["/zzrail.zip"]
+    body = client.get(f"/api/sessions/{SID}/sources/progress", headers=admin).json()
+    [single] = body["single"]
+    assert (single["state"], single["total"], single["done"], single["fetched"]) == (
+        "finished",
+        1,
+        1,
+        1,
+    )
+    assert single["extract"]["state"] == "queued"
+    # The whole session's last result stays as it was.
+    assert (body["providers"]["state"], body["providers"]["error"]) == ("failed", "zzerror")
+    assert _SECRET_MARK not in json.dumps(body)
+    assert _HOST not in json.dumps(body)
+
+    # Its station-module pass is bound to this refresh's run, not the session's.
+    run_id = _run_id("ZZRAIL")
+    assert queued == [((SID, "ZZRAIL"), {"run_id": run_id})]
+
+    def one_feed(sid: str, *, observer: Any, only_provider: str | None, **_k: Any) -> Any:
+        assert (sid, only_provider) == (SID, "ZZRAIL")
+        observer.started(1)
+        observer.feed_started("ZZRAIL")
+        assert _read()["single"][0]["extract"]["current"] == "ZZRAIL"
+        observer.outcome(up.FeedOutcome("ZZRAIL", up.SKIPPED, up.BUDGET))
+        observer.finished("finished")
+        return up.PassResult()
+
+    monkeypatch.setattr(up, "send_session", one_feed)
+    up.send_after_refresh(SID, "ZZRAIL", run_id=run_id)
+    after = _read()
+    extract = after["single"][0]["extract"]
+    assert (extract["state"], extract["total"], extract["skipped"]) == ("finished", 1, 1)
+    assert extract["reasons"] == {"budget": 1}
+    assert after["providers"]["extract"] is None
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_who_may_run_beside_a_provider_card_refresh(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress
+
+    _make_session(client, admin, ["ZZRAIL", "ZZBUS"])
+    single = refresh_progress.claim(SID, refresh_progress.provider_scope("ZZRAIL"), 1)
+    started = _read()["single"][0]["started_at"]
+
+    # The same provider again: refused, its record untouched.
+    r = client.post(f"/api/sessions/{SID}/providers/ZZRAIL/refresh", headers=admin)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert (detail["error"], detail["scope"], detail["provider_id"]) == (
+        "refresh_already_running",
+        "provider",
+        "ZZRAIL",
+    )
+    assert detail["started_at"] == started
+    assert "provider ZZRAIL" in detail["message"]
+    assert _read()["single"][0]["state"] == "running"
+
+    # The whole session's refresh: refused (it would download ZZRAIL too).
+    r = client.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert (detail["error"], detail["scope"], detail["provider_id"]) == (
+        "provider_refresh_running",
+        "provider",
+        "ZZRAIL",
+    )
+    assert detail["started_at"] == started
+    assert _read()["providers"] is None
+
+    # Another provider alone, and OSM, may run beside it.
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+    r = client.post(f"/api/sessions/{SID}/providers/ZZBUS/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    refresh_progress.claim(SID, refresh_progress.OSM, 1).finish(refresh_progress.FINISHED)
+    shown = [(rec["provider_id"], rec["state"]) for rec in _read()["single"]]
+    assert shown == [("ZZRAIL", "running"), ("ZZBUS", "finished")]
+
+    # A dead card refresh blocks nothing; the next one says what it replaced.
+    _age_heartbeat(refresh_progress.LEASE_SECONDS // 60 + 1)
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 2)
+    with pytest.raises(refresh_progress.RefreshRunning) as refused:
+        refresh_progress.claim(SID, refresh_progress.provider_scope("ZZRAIL"), 1)
+    assert refused.value.detail()["error"] == "refresh_already_running"
+    assert refused.value.detail()["scope"] == "providers"
+    whole.finish(refresh_progress.FINISHED)
+    taker = refresh_progress.claim(SID, refresh_progress.provider_scope("ZZRAIL"), 1)
+    record = _read()["single"][0]
+    assert record["previous"]["state"] == "interrupted"
+    # The dead refresh's late writes change nothing.
+    single.done("provider[ZZRAIL].timetable(gtfs)", {"status": "fetched"})
+    single.finish(refresh_progress.FINISHED)
+    assert (_read()["single"][0]["state"], _read()["single"][0]["done"]) == ("running", 0)
+    taker.finish(refresh_progress.FINISHED)
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_session_claim_and_a_card_claim_at_once_have_one_winner(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    from app import refresh_progress
+
+    _make_session(client, admin, ["ZZRAIL"])
+    scopes = [refresh_progress.PROVIDERS, "ZZRAIL"] * 3
+    barrier = threading.Barrier(len(scopes))
+    won: list[str] = []
+    refused: list[str] = []
+
+    def contend(scope: str) -> None:
+        barrier.wait()
+        try:
+            refresh_progress.claim(SID, scope, 1)
+            won.append(scope)
+        except refresh_progress.RefreshRunning as exc:
+            refused.append(exc.scope)
+
+    threads = [threading.Thread(target=contend, args=(scope,)) for scope in scopes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(won) == 1
+    assert refused == [won[0]] * (len(scopes) - 1)
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_claim_waits_for_the_sessions_claim_lock(
+    client: TestClient, admin: dict[str, str]
+) -> None:
+    """The rules between records hold because a claim checks the other
+    records and takes its row under the session's advisory lock: while
+    another transaction holds that lock, a claim waits."""
+    from app import refresh_progress
+    from app.db import SessionLocal
+
+    _make_session(client, admin, ["ZZRAIL"])
+    claimed = threading.Event()
+    with SessionLocal() as holder:
+        holder.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"refresh_progress:{SID}"}
+        )
+        waiter = threading.Thread(
+            target=lambda: (refresh_progress.claim(SID, "ZZRAIL", 1), claimed.set())
+        )
+        waiter.start()
+        assert not claimed.wait(0.5)
+        holder.commit()
+    assert claimed.wait(10)
+    waiter.join()
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_a_card_pass_never_writes_into_another_record(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import refresh_progress, station_module
+
+    _make_session(client, admin, ["ZZRAIL"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    first = refresh_progress.claim(SID, "ZZRAIL", 0)
+    first.finish(refresh_progress.FINISHED)
+    # The right run under the wrong scope, and the session's scope: nothing.
+    refresh_progress.ExtractFollowUp(SID, first.run_id).started(1)
+    refresh_progress.ExtractFollowUp(SID, first.run_id, scope="ZZBUS").started(1)
+    assert _read()["single"][0]["extract"]["state"] == "queued"
+    # A newer card refresh of the same provider owns the row: the older
+    # refresh's pass writes nothing into it.
+    late = refresh_progress.ExtractFollowUp(SID, first.run_id, scope="ZZRAIL")
+    second = refresh_progress.claim(SID, "ZZRAIL", 0)
+    late.started(1)
+    assert _read()["single"][0]["extract"] is None
+    second.finish(refresh_progress.FINISHED)
+    late.finished("finished")
+    assert _read()["single"][0]["extract"]["state"] == "queued"
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_derived_provider_card_refresh_is_recorded_without_a_follow_up(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import station_module
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, [])
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "ZZXB",
+                        "timetable": {
+                            "format": "gtfs",
+                            "source": "cross_border_filter",
+                            "derived_from": {"session_id": "zz-none", "provider_id": "ZZRAIL"},
+                        },
+                    }
+                ]
+            }
+        }
+        flag_modified(s, "config")
+        db.commit()
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    r = client.post(f"/api/sessions/{SID}/providers/ZZXB/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    [record] = _read()["single"]
+    assert (record["provider_id"], record["total"], record["done"], record["failed"]) == (
+        "ZZXB",
+        1,
+        1,
+        1,
+    )
+    assert record["failed_keys"] == ["provider[ZZXB].cross_border_filter"]
+    assert record["extract"] is None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_which_card_records_the_page_shows(client: TestClient, admin: dict[str, str]) -> None:
+    from app import refresh_progress
+    from app.db import SessionLocal
+
+    _make_session(client, admin, ["ZZRAIL"])
+
+    def started(scope: str, minutes: int) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                text(
+                    "UPDATE source_refresh_progress SET started_at = now() - "
+                    "make_interval(mins => :m) WHERE scope = :c"
+                ),
+                {"m": minutes, "c": scope},
+            )
+            db.commit()
+
+    for pid, minutes in (("ZZOLD", 50), ("ZZNEW", 30)):
+        refresh_progress.claim(SID, pid, 1).finish(refresh_progress.FINISHED)
+        started(pid, minutes)
+    # The newest ended one only.
+    assert [r["provider_id"] for r in _read()["single"]] == ["ZZNEW"]
+    # Older than the whole session's latest refresh: superseded, not shown.
+    refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1).finish(refresh_progress.FINISHED)
+    started(refresh_progress.PROVIDERS, 10)
+    assert _read()["single"] == []
+    # Running ones are always shown, newest first, at most SINGLE_SHOWN_MAX.
+    for n in range(refresh_progress.SINGLE_SHOWN_MAX + 1):
+        refresh_progress.claim(SID, f"ZZRUN{n}", 1)
+        started(f"ZZRUN{n}", 9 - n)
+    shown = [r["provider_id"] for r in _read()["single"]]
+    assert shown == [f"ZZRUN{n}" for n in range(refresh_progress.SINGLE_SHOWN_MAX, 0, -1)]
+    # A row of a scope this version does not know is never shown.
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                "INSERT INTO source_refresh_progress (session_id, scope, run_id, state, "
+                "started_at, heartbeat_at, finished_at) VALUES (:s, 'zzlegacy', :r, "
+                "'finished', now(), now(), now())"
+            ),
+            {"s": SID, "r": uuid.uuid4()},
+        )
+        db.commit()
+    body = _read()
+    assert "zzlegacy" not in json.dumps(body)
+    assert body["providers"]["provider_id"] is None
 
 
 @pytest.mark.usefixtures("inbox", "no_station_module")

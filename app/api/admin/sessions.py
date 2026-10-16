@@ -1164,7 +1164,9 @@ def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) 
         404: {"description": "Session not found."},
         409: {
             "description": "A refresh of this kind is already running for the session "
-            "(`refresh_already_running`, with its start time; issue #359)."
+            "(`refresh_already_running`, with its start time; issue #359), or a "
+            "refresh of one provider alone (`provider_refresh_running`, with its "
+            "provider id and start time)."
         },
     },
 )
@@ -1271,8 +1273,10 @@ def get_refresh_progress(
 ) -> dict[str, Any]:
     """The progress of the session's latest provider refresh and OSM refresh
     (issue #359; app/refresh_progress.py): `{"providers": record | None,
-    "osm": record | None, "now"}`. Read from the database, so it survives a
-    page reload and is the same for every tab, browser and web process. The
+    "osm": record | None, "single": [record, ...], "now"}`, `single` the
+    refreshes of one provider alone (a provider card's Refresh). Read from
+    the database, so it survives a page reload and is the same for every
+    tab, browser and web process. The
     same role as the refresh buttons: whoever may start a refresh may watch
     it. Labels and counts only: never a URL or a reason text."""
     if db.get(SessionRow, sid) is None:
@@ -1795,19 +1799,7 @@ async def _gather_refresh_outcomes(
     national+derived pair resolves in one refresh (see
     docs/provider-source-modes-design.md §12)."""
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            if run is not None and run.lost:
-                # Another refresh took the record over (this one stalled past
-                # its lease): start no more downloads.
-                return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
-            if run is None:
-                outcome = await _refresh_one_task(client, db, sid, staging, task)
-            else:
-                with run.task(task.label):
-                    outcome = await _refresh_one_task(client, db, sid, staging, task)
-                run.done(task.label, outcome)
-            _bucket_outcome(buckets, outcome)
+    await _run_url_tasks(db, sid, staging, work, run, buckets)
     if run is not None and run.lost:
         return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
     if run is not None and _derived_count(config):
@@ -1817,6 +1809,32 @@ async def _gather_refresh_outcomes(
             run.done(str(outcome.get("key")), outcome)
         _bucket_outcome(buckets, outcome)
     return buckets["fetched"], buckets["unchanged"], buckets["skipped"]
+
+
+async def _run_url_tasks(
+    db: DbSession,
+    sid: str,
+    staging: Path,
+    work: list[_RefreshTask],
+    run: refresh_progress.RefreshRun | None,
+    buckets: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Download `work` one task after the other into `buckets`; `run`, when
+    given, records each task's start, steps, bytes and outcome. Used by the
+    whole session's refresh and by one provider's alone."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        for task in work:
+            if run is not None and run.lost:
+                # Another refresh took the record over (this one stalled past
+                # its lease): start no more downloads.
+                return
+            if run is None:
+                outcome = await _refresh_one_task(client, db, sid, staging, task)
+            else:
+                with run.task(task.label):
+                    outcome = await _refresh_one_task(client, db, sid, staging, task)
+                run.done(task.label, outcome)
+            _bucket_outcome(buckets, outcome)
 
 
 def _bucket_outcome(buckets: dict[str, list[dict[str, Any]]], outcome: dict[str, Any]) -> None:
@@ -2541,14 +2559,20 @@ async def _refresh_derived_provider(
     sid: str,
     provider: dict[str, Any],
     staging: Path,
+    run: refresh_progress.RefreshRun | None = None,
 ) -> RefreshSourcesResponse:
     """Per-provider 'Refresh' for a cross_border_filter provider: re-run the
     filter on the linked national feed into this provider's slot (it owns no URL
-    to download)."""
+    to download). `run`: its progress record (one task, the filter)."""
     fetched: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    key = f"provider[{provider['id']}].cross_border_filter"
+    if run is not None:
+        run.phase(refresh_progress.DERIVED, key)
     outcome = await _materialise_derived_provider(db, sid, provider, staging)
     if outcome is not None:
+        if run is not None:
+            run.done(key, outcome)
         bucket = fetched if outcome.get("status") == "fetched" else skipped
         bucket.append({k: v for k, v in outcome.items() if k != "status"})
     return _finalise_provider_refresh(
@@ -2572,20 +2596,14 @@ async def _refresh_provider_urls(
     sid: str,
     pid: str,
     staging: Path,
+    work: list[_RefreshTask],
+    run: refresh_progress.RefreshRun | None = None,
 ) -> RefreshSourcesResponse:
     """Per-provider 'Refresh' for a url- or nap-source provider: download its
-    timetable + optional MCT + stations CSV into the slot."""
-    work = _build_refresh_tasks(session.config or {}, only_provider=pid)
-    if not work:
-        raise HTTPException(
-            400,
-            f"Provider {pid!r} has no URLs to refresh "
-            "(no timetable, MCT, or stations CSV configured).",
-        )
+    timetable + optional MCT + stations CSV (`work`) into the slot, each task
+    recorded in `run`, its progress record."""
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-        for task in work:
-            _bucket_outcome(buckets, await _refresh_one_task(client, db, sid, staging, task))
+    await _run_url_tasks(db, sid, staging, work, run, buckets)
     return _finalise_provider_refresh(
         db,
         request=request,
@@ -2605,8 +2623,9 @@ async def _refresh_provider_urls(
         400: {"description": "No JWT actor, an invalid config, or no URL to refresh."},
         404: {"description": "Session or provider not found."},
         409: {
-            "description": "A whole-session provider refresh is running "
-            "(`refresh_already_running`, with its start time; issue #359)."
+            "description": "A refresh of this provider alone, or the whole session's "
+            "provider refresh, is running (`refresh_already_running`, with its scope "
+            "and start time; issue #359)."
         },
     },
 )
@@ -2646,31 +2665,70 @@ async def refresh_provider(
             f"Known providers: {[p['id'] for p in providers]}",
         )
 
-    # Issue #359: not while a whole-session refresh of this session runs (it
-    # downloads this provider too). Read only: this refresh has no record.
-    running = refresh_progress.running_since(sid, refresh_progress.PROVIDERS)
-    if running is not None:
-        raise HTTPException(
-            409,
-            detail=refresh_progress.RefreshRunning(refresh_progress.PROVIDERS, running).detail(),
-        )
-
-    staging = settings.inbox_dir / sid / "_staging"
-    staging.mkdir(parents=True, exist_ok=True)
-
     # Derived providers own no URL — "Refresh this provider" re-runs the filter
     # instead of downloading (without this the URL path 400s "no URLs to refresh").
     if (provider.get("timetable") or {}).get("source") == "cross_border_filter":
-        return await _refresh_derived_provider(
-            db, request=request, actor=actor, session=s, sid=sid, provider=provider, staging=staging
+        return await _refresh_one_derived(db, request, actor, s, sid, provider)
+
+    work = _build_refresh_tasks(s.config or {}, only_provider=pid)
+    if not work:
+        raise HTTPException(
+            400,
+            f"Provider {pid!r} has no URLs to refresh "
+            "(no timetable, MCT, or stations CSV configured).",
         )
-    result = await _refresh_provider_urls(
-        db, request=request, actor=actor, session=s, sid=sid, pid=pid, staging=staging
-    )
+    # Issue #359: this provider's own progress record; 409 while it, or the
+    # whole session's provider refresh (it downloads this provider too), runs.
+    run = _claim_refresh(sid, refresh_progress.provider_scope(pid), len(work))
+    async with run:
+        result = await _refresh_provider_urls(
+            db,
+            request=request,
+            actor=actor,
+            session=s,
+            sid=sid,
+            pid=pid,
+            staging=_staging_dir(sid),
+            work=work,
+            run=run,
+        )
     _queue_extracts(background, sid, s.config, bool(result.fetched or result.unchanged), pid)
-    # MSMM 22.3: this provider's extract, if the module lacks it (sender thread).
-    station_extract_upload.after_refresh(sid, pid)
+    # MSMM 22.3: this provider's extract, if the module lacks it (sender
+    # thread), followed in this refresh's record.
+    station_extract_upload.after_refresh(sid, pid, run_id=run.run_id)
     return result
+
+
+def _staging_dir(sid: str) -> Path:
+    staging = settings.inbox_dir / sid / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+async def _refresh_one_derived(
+    db: DbSession,
+    request: Request,
+    actor: CurrentUser,
+    session: SessionRow,
+    sid: str,
+    provider: dict[str, Any],
+) -> RefreshSourcesResponse:
+    """A derived provider's card refresh, in its own progress record (one
+    task, the filter). No station-module pass follows it, so the record has
+    no follow-up line."""
+    run = _claim_refresh(sid, refresh_progress.provider_scope(provider["id"]), 1)
+    run.follow_up = False
+    async with run:
+        return await _refresh_derived_provider(
+            db,
+            request=request,
+            actor=actor,
+            session=session,
+            sid=sid,
+            provider=provider,
+            staging=_staging_dir(sid),
+            run=run,
+        )
 
 
 # ───────────────────────── per-provider status (v0.1.19) ─────────────────────

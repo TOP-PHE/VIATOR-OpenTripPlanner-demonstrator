@@ -64,7 +64,6 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(refresh_progress, "claim", claim)
     monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
-    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
 
 
 @pytest.mark.parametrize(
