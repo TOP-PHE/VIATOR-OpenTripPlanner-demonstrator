@@ -31,7 +31,6 @@ import io
 import json
 import os
 import random
-import signal
 import struct
 import time
 import tracemalloc
@@ -92,6 +91,10 @@ def test_the_bounds_are_the_documented_ones() -> None:
     assert station_extract_common.MEMBER_MAX_BYTES == 160 * GIB
     assert station_extract_common.ARCHIVE_MAX_BYTES == 160 * GIB
     assert sorted(station_extract_common.PACKINGS) == [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
+    # the NeTEx reader's tables (its memory model: technical spec, admin guide)
+    assert netex.GROUPS_MAX == 1_000_000
+    assert netex.ASSIGNMENTS_MAX == 2_000_000
+    assert netex.POINTS_MAX == netex.QUAYS_MAX == netex.STOP_PLACES_MAX == 2_000_000
 
 
 def test_member_bound() -> None:
@@ -1158,7 +1161,8 @@ def test_extract_known(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ("memory_limit", "out of memory", True),
         ("cpu_limit", "processor time", True),
         ("wall_clock_limit", "wall-clock time", False),
-        ("stopped", f"the child ended with {-signal.SIGKILL}", False),
+        ("stopped", "the child ended with SIGKILL", False),
+        ("crashed", "the child ended with SIGSEGV", False),  # remembered the 2nd time
         ("busy", "another extraction runs", False),
         ("error", "OSError", False),
         ("cache", "OSError", False),
@@ -1300,11 +1304,11 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     assert _ensure(archive, lock_dir) == ("wall_clock_limit", "remembered")
     assert child.runs == 2
     (marker,) = lock_dir.glob("*.failed")
-    assert json.loads(marker.read_text())["walls"] == 2
+    assert json.loads(marker.read_text())["tries"] == 2
     # a child killed in between starts the count again
     marker.unlink()
     _ensure(archive, lock_dir)  # one wall-clock stop
-    child.fail = ExtractError("stopped", f"the child ended with {-signal.SIGKILL}")
+    child.fail = ExtractError("stopped", "the child ended with SIGKILL")
     _ensure(archive, lock_dir)
     assert not list(lock_dir.glob("*.failed"))
     child.fail = wall
@@ -1321,13 +1325,47 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     assert child.runs == runs + 2
 
 
+def test_a_crash_is_remembered_the_second_time_in_a_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """A child killed by its own fault (SIGSEGV, SIGABRT): an archive that
+    makes the reader crash does so every time, so it is remembered, but only
+    the second time in a row with the same reason (a crash under a passing
+    shortage may not come back); a wall-clock stop in between starts the
+    count again, and the reverse."""
+    crash = ExtractError("crashed", "the child ended with SIGSEGV")
+    wall = ExtractError("wall_clock_limit", station_extract.WALL_CLOCK)
+    child = _Child(crash)
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    assert _ensure(archive, lock_dir) == ("crashed", "the child ended with SIGSEGV")
+    child.fail = wall
+    assert _ensure(archive, lock_dir) == ("wall_clock_limit", station_extract.WALL_CLOCK)
+    child.fail = crash
+    _ensure(archive, lock_dir)  # one crash in a row, not two
+    assert child.runs == 3
+    _ensure(archive, lock_dir)  # the second in a row
+    assert _ensure(archive, lock_dir) == ("crashed", "remembered")
+    assert child.runs == 4
+    (marker,) = lock_dir.glob("*.failed")
+    assert json.loads(marker.read_text()) == {
+        "reason": "crashed",
+        "limits": station_extract._limits_signature(),
+        "format": "gtfs",
+        "tries": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ("record", "remembered"),
     [
         ({"reason": "bad_archive"}, "bad_archive"),  # no count: at once
-        ({"reason": "wall_clock_limit", "walls": 1}, None),  # one wall-clock stop
-        ({"reason": "wall_clock_limit", "walls": 2}, "wall_clock_limit"),
-        ({"reason": "wall_clock_limit", "walls": "2"}, None),
+        ({"reason": "wall_clock_limit", "tries": 1}, None),  # one wall-clock stop
+        ({"reason": "wall_clock_limit", "tries": 2}, "wall_clock_limit"),
+        ({"reason": "wall_clock_limit", "tries": "2"}, None),
+        ({"reason": "wall_clock_limit"}, None),  # a count is needed
+        ({"reason": "crashed", "tries": 1}, None),  # one crash
+        ({"reason": "crashed", "tries": 2}, "crashed"),
         ({"reason": "memory_limit"}, "memory_limit"),
         ({"reason": "cpu_limit"}, "cpu_limit"),
         ({"reason": "stopped"}, None),

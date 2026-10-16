@@ -258,19 +258,20 @@ REASON_TEXTS = {
     "input_too_large": "the archive passes a reading bound: size, record length, nesting or counts",
     station_extract.MEMORY_LIMIT: (
         f"the extraction passed its memory limit ({_GIB_OF_MEMORY} GiB); "
-        "retried once the file or VIATOR changes"
+        "retried with a new file or extractor"
     ),
     station_extract.CPU_LIMIT: (
         f"the extraction passed its processor-time limit ({_CPU_MINUTES} minutes); "
-        "retried once the file or VIATOR changes"
+        "retried with a new file or extractor"
     ),
     station_extract.WALL_CLOCK_LIMIT: (
         f"the extraction passed its wall-clock limit ({_WALL_MINUTES} minutes) on a busy "
         "server; retried once"
     ),
     station_extract.STOPPED: (
-        "the extraction was stopped from outside (a restart, or the server short of memory)"
+        "the extraction was killed from outside (out-of-memory killer, or by hand)"
     ),
+    station_extract.CRASHED: "the extraction crashed (a signal, in the log); retried once",
     # The one word of earlier releases for the four above, still in their
     # recorded outcomes until the next pass.
     "resource_limit": "the extraction passed its memory or time limit, or was stopped",
@@ -1022,7 +1023,7 @@ def _extract(sid: str, feed: Feed, wait_seconds: float, cache_only: bool = False
     refresh meanwhile, not yet described by its state) gives no snapshot
     (`no_snapshot`); a snapshot of another version than the one the module
     was asked about is `archive_changed`. Both go with the next pass. Every
-    reason of the extractor (`resource_limit`, `busy`, `too_large`,
+    reason of the extractor (`memory_limit`, `busy`, `too_large`,
     `no_rail_stop`, ...) is a skip: none says the module is unavailable."""
     sha = str(feed.archive_sha256)
     try:

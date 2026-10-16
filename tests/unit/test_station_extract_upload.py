@@ -1001,7 +1001,8 @@ def test_the_admin_text(
         ("memory_limit", "memory limit (2 GiB)"),
         ("cpu_limit", "processor-time limit (40 minutes)"),
         ("wall_clock_limit", "wall-clock limit (45 minutes)"),
-        ("stopped", "stopped from outside"),
+        ("stopped", "killed from outside"),
+        ("crashed", "crashed"),
         ("resource_limit", "memory or time limit"),  # recorded by an earlier release
     ],
 )
@@ -1299,6 +1300,7 @@ def test_the_extract_comes_from_ensure_extract_within_the_budget(
         "cpu_limit",
         "wall_clock_limit",
         "stopped",
+        "crashed",
         "busy",
         "cache",
         "error",

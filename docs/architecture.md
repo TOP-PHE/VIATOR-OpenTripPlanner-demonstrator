@@ -987,7 +987,8 @@ address space (`RLIMIT_AS`), 40 minutes of processor time (`RLIMIT_CPU`), 45 min
 time, `nice 10` and `PR_SET_PDEATHSIG`, one at a time on the machine (a thread lock plus an `flock` on
 `inbox/.station-extract.lock`, which `web` and `worker` share; `busy` past the wait). A hostile or
 huge archive can only end the child, with the word of the limit it passed (`memory_limit`,
-`cpu_limit`, `wall_clock_limit`; `stopped` for another signal from outside); `ensure_extract` raises
+`cpu_limit`, `wall_clock_limit`; `stopped` for SIGKILL, SIGTERM, SIGINT or SIGHUP from outside,
+`crashed` for any other signal, named; no core file, `oom_score_adj` 1000); `ensure_extract` raises
 `ExtractError` only.
 With `cache_only=True` it returns a valid cached extract or raises `not_cached`, never starting or
 waiting for an extraction (the worker before a graph build). A failure the same archive would meet
@@ -1085,13 +1086,16 @@ and some 500 bytes per pattern, so the 2 GiB were spent long before the 2 millio
 grouped once by number (`_Groups`), patterns, points and places hold a *tally* (one int,
 `count << 32 | group`, or a small dict once a second group comes), an assignment the number of its
 (Quay, StopPlace) pair, a direct-`calls` journey adds to its points at once, and the operators and
-modes are resolved per group only when the stations are made: about 250 bytes a point, 150 a
-pattern; the same export peaks at 372 MiB. Every table has a cap (`GROUPS_MAX`, `POINTS_MAX`,
+modes are resolved per group only when the stations are made: about 250 bytes a point, 130 a
+pattern; the same export peaks at 372 MiB. `GROUPS_MAX` now bounds the distinct groups as well
+as the (pattern, group) pairs (a group without a Line that takes its pattern's in pass 2 is a new
+group). Every table has a cap (`GROUPS_MAX`, `POINTS_MAX`,
 `ASSIGNMENTS_MAX`, `QUAYS_MAX`, `STOP_PLACES_MAX`); a crafted file reaching all of them at once
 (every assignment to a distinct place) would still take about 2.8 GB and end `memory_limit`, the
 child's limit being the last stop, as for processor time. The extracts
 are byte-identical to the former reader's (compared on every synthetic shape). The reason of a
-stopped child now says which limit (`memory_limit`, `cpu_limit`, `wall_clock_limit`, `stopped`),
+stopped child now says which limit (`memory_limit`, `cpu_limit`, `wall_clock_limit`, `stopped`,
+`crashed`),
 and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
 
 ### Invariants & traps
@@ -1325,7 +1329,7 @@ module down**: once a call got no answer after its retries (`network`, `timeout`
 answered 404 (intake off, module older than MSMM #42), the feeds left are "module unavailable" without
 a call, so a module that is down costs one feed's retries (at most 40 s for a silent one), not the
 budget. Every reason of the extractor
-(`memory_limit`, `cpu_limit`, `wall_clock_limit`, `stopped`, `busy`, `too_large`, `no_rail_stop`, …) is a skip, never "module unavailable";
+(`memory_limit`, `cpu_limit`, `wall_clock_limit`, `stopped`, `crashed`, `busy`, `too_large`, `no_rail_stop`, …) is a skip, never "module unavailable";
 an extract file that goes away before its `PUT` is `extract_gone`. 503 `busy` and 429 `extract_window` are sent again after their
 `Retry-After` when it fits in the budget (and is at most 120 s), each pause at least 1 s, at most six
 waits for one call; a 429 that cannot be waited ends every `PUT` of the pass; a `HEAD` 403 (no body)

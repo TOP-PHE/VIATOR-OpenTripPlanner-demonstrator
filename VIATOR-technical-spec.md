@@ -445,15 +445,19 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   one at a time on the machine (`flock` on
   `inbox/.station-extract.lock`); a child that passes a limit ends with the word of that limit:
   `memory_limit` (a `MemoryError`, expat's "out of memory" included), `cpu_limit` (killed by SIGXCPU)
-  or `wall_clock_limit` (the parent stopped waiting); `stopped` when another signal ended it from
-  outside; a wait past `wait_seconds` is `busy`. (`resource_limit`, the one word of earlier releases
+  or `wall_clock_limit` (the parent stopped waiting); `stopped` when a signal from outside ended it
+  (SIGKILL, SIGTERM, SIGINT, SIGHUP); `crashed` for any other signal (SIGSEGV, SIGBUS, SIGABRT, …,
+  named in the detail; remembered the second time in a row, like a wall-clock stop). The child
+  writes no core file (`RLIMIT_CORE` 0) and sets its `oom_score_adj` to 1000, so that the kernel's
+  out-of-memory killer takes it first; a wait past `wait_seconds` is `busy`. (`resource_limit`, the one word of earlier releases
   for all four, is no longer given.)
 - **Input bounds**: stored or deflated members only; a member read unpacks to at most 200 times its
   packed size (64 MiB at least) and 160 GiB, the members read together to 200 times the archive's packed
   bytes (64 MiB at least), a reading pass to 160 GiB, checked first on the sizes the central directory
   declares (refused before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
   ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
-  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
+  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 distinct journey groups and as
+  many (pattern, group) pairs, ≤2,000,000
   assignments, Quays, StopPlaces and called scheduled stop points, no entity declaration (internal ones included), no external DTD loaded;
   ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
 - **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
@@ -477,7 +481,7 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   tally, the StopPlace structure and the Quays; the tallies go to the places at the end, and the
   pattern and point tables are freed before pass 3. Measured per entry: about 250 bytes for a point
   with its assignment (before: about 1.2 KB, a `Counter`, a dict of sets and a list of tuples), about
-  150 bytes for a pattern (before: about 500). The caps were set before this model: a crafted file reaching every
+  130 bytes for a pattern (before: about 500). The caps were set before this model: a crafted file reaching every
   one of them at once (1 million pattern groups and distinct groups, 2 million points, assignments
   to as many distinct places, Quays and StopPlaces) would take about 2.8 GB and end `memory_limit`
   (remembered); a national feed, whose points and places are shared, takes a few hundred MiB. A synthetic export that gives every journey its own pattern and scheduled stop
@@ -487,8 +491,8 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   (`scripts/bench_station_extract.py --per-journey --no-mode`); the shapes that share their points
   are unchanged (about 100 MiB). A Call's `Arrival` and `Departure` are dropped before expat.
 - **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,
-  `no_stop_place`, `no_rail_stop`, the MSMM limits, `memory_limit`, `cpu_limit`, `wall_clock_limit`
-  the second time in a row) is kept as `<cache name>.failed` with the format read and
+  `no_stop_place`, `no_rail_stop`, the MSMM limits, `memory_limit`, `cpu_limit`; `wall_clock_limit` and
+  `crashed` the second time in a row with the same reason) is kept as `<cache name>.failed` with the format read and
   the signature of every bound and of the readers' code; the next caller (cache-only too) gets the
   reason at once until the archive, the format, the extractor, a bound or the readers' code changes. The warm makes
   the smallest timetable files first; a send pass sends first the feeds that need no extraction,

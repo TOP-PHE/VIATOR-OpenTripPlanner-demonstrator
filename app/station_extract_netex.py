@@ -559,8 +559,12 @@ def _with_line(mode: str, submode: str, info: _LineInfo | None) -> tuple[str, st
     return mode, submode
 
 
-# The scheduled stop points with rail calls, at most: past it the archive is
-# refused (`input_too_large`) before their tallies take more memory.
+# The scheduled stop points kept with calls, at most: those of the rail
+# patterns, and those a journey without a pattern calls at whose mode is not
+# yet known to be other than rail (its Line may come later in the archive;
+# such points are dropped at the end of pass 1, but counted until then).
+# Past it the archive is refused (`input_too_large`) before their tallies
+# take more memory.
 POINTS_MAX = 2_000_000
 
 
@@ -587,6 +591,7 @@ class _Journeys:
                 raise ArchiveError("input_too_large", _TOO_MANY_GROUPS)
 
     def add_point(self, point: str, group: int, count: int) -> None:
+        """Add calls to a point; past `POINTS_MAX` points, refuse."""
         if _tally_add(self.points, point, group, count) and len(self.points) > POINTS_MAX:
             raise ArchiveError("input_too_large", "more called points than VIATOR keeps")
 
@@ -799,6 +804,7 @@ def _read_structure(archive: _Archive, found: _Journeys) -> _Places:
     places.called = bool(found.points)
     found.points.clear()
     places.assignments.clear()
+    places.pair_ids.clear()
     wanted = {places.pairs[number][0] for number in places.use if places.pairs[number][0]}
     places.quay_place = {q: p for q, p in quays.items() if q in wanted}
     return places

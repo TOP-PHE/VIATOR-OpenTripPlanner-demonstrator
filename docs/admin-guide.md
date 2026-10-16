@@ -3115,7 +3115,8 @@ the extracts changes no graph build.
   read —, a record or text over 1 MiB, nesting past 64, or counts: more
   stations, assignments, Quays or journey groups than VIATOR keeps),
   `memory_limit`, `cpu_limit`, `wall_clock_limit` (the child passed that
-  limit), `stopped` (the child was ended from outside), `busy` (another extraction held the server too
+  limit), `stopped` (the child was killed from outside), `crashed` (the
+  child died of its own fault), `busy` (another extraction held the server too
   long),
   `no_rail_stop` (no rail station in the feed), `no_stop_place` (a NeTEx
   file whose rail journeys call but which defines no stop place, as some
@@ -3126,7 +3127,8 @@ the extracts changes no graph build.
   never affected. A cached file found damaged (after a crash) is made again.
 - **A failure is remembered.** When the same file would fail again the same
   way (`bad_archive`, `input_too_large`, `no_stop_place`, `no_rail_stop`,
-  a module limit, `memory_limit` or `cpu_limit`), VIATOR
+  a module limit, `memory_limit` or `cpu_limit`; `wall_clock_limit` and
+  `crashed` the second time in a row), VIATOR
   keeps the reason in `_extracts/<PROVIDER>.<sha256>.<16 hex>.csv.gz.failed`
   and does not read that file again: every later pass shows the same reason
   at once. It is read again when a new file is downloaded, when the
@@ -3155,13 +3157,21 @@ the extracts changes no graph build.
     out: the server was busy (a graph build at the same time). Tried once
     more at the next pass; remembered only the second time in a row. If it
     stays, refresh again at a quiet time.
-  - `stopped` — the child was ended from outside (a restart of `web`, or
-    the kernel short of memory). Never remembered: the next pass tries
-    again. If it repeats, look at the server's memory (`docker stats`,
-    `dmesg` for the OOM killer).
+  - `stopped` — the child was killed from outside: the kernel's
+    out-of-memory killer (the server short of memory; the child asks to be
+    its first choice, before the database or a build) or someone by hand.
+    A restart of `web` cannot leave this word: the child dies with it and
+    nothing is recorded. Never remembered: the next pass tries again. If
+    it repeats, look at the server's memory (`docker stats`, `dmesg` for
+    the OOM killer).
+  - `crashed` — the child died of its own fault (a signal such as SIGSEGV
+    or SIGABRT, named in the log's detail; no core file is written). Tried
+    once more; remembered the second time in a row. Report it with the
+    provider and the signal: a reader or library to fix.
   - `input_too_large` — not a limit of the child but a bound of what VIATOR
     reads (sizes, counts: more than 2 million assignments, Quays,
-    StopPlaces or called points, 1 million journey groups, …), refused at
+    StopPlaces or called points, 1 million journey groups or (pattern,
+    group) pairs, …), refused at
     once. Report it: raising a bound is a decision, with measures (an
     export that gives every journey its own stop points passes 2 million
     assignments near 3 GB of unpacked XML, at some 250 bytes each).

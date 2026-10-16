@@ -329,18 +329,11 @@ def test_assignment_and_quay_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
     )
     provider = _provider("netex_epip")
-    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
-    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2_000_000)
-    monkeypatch.setattr(netex, "QUAYS_MAX", 2)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
-    monkeypatch.setattr(netex, "QUAYS_MAX", 2_000_000)
     assert _reason(provider, archive, tmp_path) == "ok"
-    monkeypatch.setattr(netex, "STOP_PLACES_MAX", 1)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
-    monkeypatch.setattr(netex, "STOP_PLACES_MAX", 2_000_000)
-    monkeypatch.setattr(netex, "POINTS_MAX", 1)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
+    for name in ("ASSIGNMENTS_MAX", "QUAYS_MAX", "STOP_PLACES_MAX", "POINTS_MAX"):
+        with monkeypatch.context() as patch:
+            patch.setattr(netex, name, 1)
+            assert _reason(provider, archive, tmp_path) == "input_too_large", name
 
 
 def test_expat_out_of_memory_is_a_memory_stop(
@@ -440,6 +433,10 @@ def _sleep() -> station_extract.ExtractResult:
     raise AssertionError("unreachable")
 
 
+def _crash() -> station_extract.ExtractResult:
+    os.abort()
+
+
 def _spin() -> station_extract.ExtractResult:
     """A child target that works past its processor time."""
     deadline = time.monotonic() + 30
@@ -501,11 +498,17 @@ def test_ensure_extract_child_failures_are_extract_errors(
         station_extract._run_child(_kill_self, ())
     assert (caught.value.reason, caught.value.detail) == (
         "stopped",
-        f"the child ended with {-signal.SIGKILL}",
+        "the child ended with SIGKILL",
     )
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_fail, ())
     assert caught.value.reason == "error"
+    with pytest.raises(ExtractError) as caught:
+        station_extract._run_child(_crash, ())
+    assert (caught.value.reason, caught.value.detail) == (
+        "crashed",
+        "the child ended with SIGABRT",
+    )
     monkeypatch.setattr(station_extract, "CHILD_CPU_SECONDS", 1)
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_spin, ())
@@ -517,18 +520,26 @@ def test_ensure_extract_child_failures_are_extract_errors(
 
 
 @pytest.mark.parametrize(
-    ("exitcode", "reason"),
+    ("exitcode", "reason", "detail"),
     [
-        (-signal.SIGXCPU, "cpu_limit"),
-        (-signal.SIGKILL, "stopped"),
-        (-signal.SIGTERM, "stopped"),
-        (1, "error"),
-        (0, "error"),
-        (None, "error"),
+        (-signal.SIGXCPU, "cpu_limit", "processor time"),
+        (-signal.SIGKILL, "stopped", "the child ended with SIGKILL"),
+        (-signal.SIGTERM, "stopped", "the child ended with SIGTERM"),
+        (-signal.SIGINT, "stopped", "the child ended with SIGINT"),
+        (-signal.SIGHUP, "stopped", "the child ended with SIGHUP"),
+        (-signal.SIGSEGV, "crashed", "the child ended with SIGSEGV"),
+        (-signal.SIGBUS, "crashed", "the child ended with SIGBUS"),
+        (-signal.SIGABRT, "crashed", "the child ended with SIGABRT"),
+        (-signal.SIGUSR1, "crashed", "the child ended with SIGUSR1"),
+        (-99, "crashed", "the child ended with signal 99"),
+        (1, "error", "the child ended with 1"),
+        (0, "error", "the child ended with 0"),
+        (None, "error", "the child ended with None"),
     ],
 )
-def test_a_silent_child_end_says_which(exitcode: int | None, reason: str) -> None:
-    assert station_extract._silent_end(exitcode).reason == reason
+def test_a_silent_child_end_says_which(exitcode: int | None, reason: str, detail: str) -> None:
+    ended = station_extract._silent_end(exitcode)
+    assert (ended.reason, ended.detail) == (reason, detail)
 
 
 def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -536,9 +547,12 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(station_extract.resource, "setrlimit", lambda *a: calls.append(a))
     monkeypatch.setattr(station_extract.os, "nice", lambda n: calls.append(("nice", n)))
     monkeypatch.setattr(station_extract, "_die_with_parent", lambda: calls.append("pdeathsig"))
+    monkeypatch.setattr(station_extract, "_first_to_kill", lambda: calls.append("oom"))
     station_extract._limit_self(station_extract._Limits(9, 99, 10))
     assert calls == [
+        (station_extract.resource.RLIMIT_CORE, (0, 0)),
         "pdeathsig",
+        "oom",
         (station_extract.resource.RLIMIT_AS, (9, 9)),
         (station_extract.resource.RLIMIT_CPU, (99, 129)),
         ("nice", 10),
@@ -547,6 +561,19 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert station_extract.CHILD_CPU_SECONDS == 40 * 60
     assert station_extract.CHILD_WALL_SECONDS == 45 * 60
     assert station_extract.CHILD_NICE == 10
+
+
+def test_the_child_asks_to_be_killed_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child raises its own out-of-memory score to the most, so that a
+    machine short of memory ends it rather than the database; a refusal
+    (another system, no such file) is ignored."""
+    score = tmp_path / "oom_score_adj"
+    score.write_text("0")
+    monkeypatch.setattr(station_extract, "_OOM_SCORE_ADJ", score)
+    station_extract._first_to_kill()
+    assert score.read_text() == "1000"
+    monkeypatch.setattr(station_extract, "_OOM_SCORE_ADJ", tmp_path / "missing" / "score")
+    station_extract._first_to_kill()  # no error
 
 
 def test_one_extraction_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -906,6 +933,16 @@ def test_direct_calls_without_a_pattern(tmp_path: Path) -> None:
     assert rows["ZZ:SP:1"]["n_calls"] == "1"
 
 
+def test_a_tally_holds_every_group_number() -> None:
+    """A tally packs the group number under `_MASK`: every number
+    `GROUPS_MAX` allows fits, and the count above it."""
+    assert netex.GROUPS_MAX <= netex._MASK
+    table: dict[str, Any] = {}
+    netex._tally_add(table, "p", netex.GROUPS_MAX - 1, 3)
+    netex._tally_add(table, "p", netex.GROUPS_MAX - 1, 4)
+    assert list(netex._tally_items(table["p"])) == [(netex.GROUPS_MAX - 1, 7)]
+
+
 def test_a_point_assigned_to_several_places(tmp_path: Path) -> None:
     """A scheduled stop point assigned three times: each place gets its
     calls (the assignment keeps every place number)."""
@@ -969,8 +1006,9 @@ def test_journey_groups_counted_per_pattern(
 
 
 def test_direct_calls_with_their_times(tmp_path: Path) -> None:
-    """A Call's Arrival and Departure are never read (dropped before
-    expat); every call of a point counts, a loop's twice."""
+    """Direct calls with their Arrival and Departure: every call of a point
+    counts (a loop's twice), and a journey's operator goes to the points it
+    calls at only."""
     site = (
         '<SiteFrame id="S"><stopPlaces>'
         + _place("ZZ:SP:1")
