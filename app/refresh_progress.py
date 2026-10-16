@@ -34,7 +34,14 @@ go to one writer thread, in order, so the event loop never waits on them.
 with its bytes received and expected (when the server announced a length), and
 the labels of the failed tasks. Bytes are written at most every
 `BYTES_EVERY_SECONDS` or every `BYTES_STEP_PERCENT` % of a feed, never once
-per chunk. `extract`: the station-module follow-up of a provider refresh
+per chunk. Each current task also carries its `step` (`feed_fetch.STEPS`):
+downloading, then verifying (format check), checking_structure (the NeTEx
+structure check, with the bytes of uncompressed XML scanned and their total
+from the zip directory, throttled like the bytes) and storing (the copy into
+the slot), and the time it started (`elapsed_seconds` when read): after a
+download of a national file the structure check alone runs for many minutes,
+and a block frozen on "100 %" looked stuck (production, 15 Oct). A step change
+is one write; a record written before steps existed reads `step: null`. `extract`: the station-module follow-up of a provider refresh
 (`ExtractFollowUp`, fed by the sender thread of `app/station_extract_upload.py`):
 queued, then running with its counts per outcome and reason word, then
 finished; `off` when the module is not configured; read as `interrupted` when
@@ -347,17 +354,48 @@ class RefreshRun:
 
     @contextlib.contextmanager
     def task(self, label: str) -> Iterator[None]:
-        """One download: the label is shown as the current task and the
-        download's bytes reach `bytes_received` (feed_fetch.download_progress)."""
-        self.detail["current"] = [{"key": _label(label), "bytes": 0, "expected": None}]
-        self._last_bytes_write = self._clock()
-        self._last_step = 0
+        """One download: the label is shown as the current task, the
+        download's bytes reach `bytes_received` (feed_fetch.download_progress)
+        and the steps after it reach `step` (feed_fetch.task_step)."""
+        self.detail["current"] = [
+            {
+                "key": _label(label),
+                # None until the first chunk: a NAP lookup may come first.
+                "bytes": None,
+                "expected": None,
+                "step": feed_fetch.STEP_DOWNLOADING,
+                "scanned": None,
+                "scan_total": None,
+                # The web process's clock, like the reader's (`_public_current`).
+                "started_at": _now_iso(),
+            }
+        ]
+        self._restart_throttle()
         self._write()
-        token = feed_fetch.download_progress.set(self.bytes_received)
+        bytes_token = feed_fetch.download_progress.set(self.bytes_received)
+        step_token = feed_fetch.task_step.set(self.step)
         try:
             yield
         finally:
-            feed_fetch.download_progress.reset(token)
+            feed_fetch.task_step.reset(step_token)
+            feed_fetch.download_progress.reset(bytes_token)
+
+    def _restart_throttle(self) -> None:
+        self._last_bytes_write = self._clock()
+        self._last_step = 0
+
+    def _throttled_write(self, done: int, total: int | None) -> None:
+        """Write at most every `BYTES_EVERY_SECONDS`, or when another
+        `BYTES_STEP_PERCENT` % of `total` is done."""
+        now = self._clock()
+        step = 0
+        if total:
+            percent = min(100, done * 100 // total)
+            step = percent - percent % BYTES_STEP_PERCENT
+        if now - self._last_bytes_write >= BYTES_EVERY_SECONDS or step > self._last_step:
+            self._last_bytes_write = now
+            self._last_step = max(step, self._last_step)
+            self._write()
 
     def bytes_received(self, received: int, expected: int | None) -> None:
         """Called by the download after each chunk: written at most every
@@ -368,15 +406,27 @@ class RefreshRun:
             return
         current[0]["bytes"] = received
         current[0]["expected"] = expected
-        now = self._clock()
-        step = 0
-        if expected:
-            percent = min(100, received * 100 // expected)
-            step = percent - percent % BYTES_STEP_PERCENT
-        if now - self._last_bytes_write >= BYTES_EVERY_SECONDS or step > self._last_step:
-            self._last_bytes_write = now
-            self._last_step = max(step, self._last_step)
+        self._throttled_write(received, expected)
+
+    def step(self, name: str, done: int | None = None, total: int | None = None) -> None:
+        """The current task moved to step `name` (feed_fetch.STEPS), or
+        reports how far that step got (`done` of `total` bytes scanned, the
+        structure check). A new step is written at once; its progress like the
+        bytes. May run on a worker thread: the event loop leaves the record
+        to the task while the step runs, and writes go to the writer thread."""
+        current = self.detail.get("current") or []
+        if self._finishing or not current or name not in feed_fetch.STEPS:
+            # Finishing: a copy job outliving its cancelled request writes nothing.
+            return
+        item = current[0]
+        item["scanned"] = done
+        item["scan_total"] = total
+        if item.get("step") != name:
+            item["step"] = name
+            self._restart_throttle()
             self._write()
+        elif done is not None:
+            self._throttled_write(done, total)
 
     def done(self, label: str, outcome: dict[str, Any]) -> None:
         """A task ended: `fetched`, `unchanged`, or anything else (the
@@ -393,7 +443,9 @@ class RefreshRun:
     def phase(self, name: str, label: str | None = None) -> None:
         self.detail["phase"] = name
         self.detail["current"] = (
-            [{"key": _label(label), "bytes": None, "expected": None}] if label else []
+            [{"key": _label(label), "bytes": None, "expected": None, "started_at": _now_iso()}]
+            if label
+            else []
         )
         self._write()
 
@@ -602,20 +654,6 @@ def _optional_count(value: object) -> int | None:
     return _count(value) if value is not None else None
 
 
-def _public_current(items: object) -> list[dict[str, Any]]:
-    if not isinstance(items, list):
-        return []
-    return [
-        {
-            "key": _label(item.get("key")),
-            "bytes": _optional_count(item.get("bytes")),
-            "expected": _optional_count(item.get("expected")),
-        }
-        for item in items[:4]
-        if isinstance(item, dict)
-    ]
-
-
 def _parse_time(value: object) -> datetime | None:
     if not isinstance(value, str) or len(value) > 40:
         return None
@@ -624,6 +662,33 @@ def _parse_time(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def _seconds_since(value: object, now: datetime) -> int | None:
+    started = _parse_time(value)
+    return max(0, int((now - started).total_seconds())) if started else None
+
+
+def _public_current(items: object, now: datetime) -> list[dict[str, Any]]:
+    """The current tasks: label, download bytes, step (None for a record
+    written before steps, or an unknown word), the structure check's bytes,
+    and how long the task has run. `now` is the web process's clock, the
+    clock `started_at` was written with (never PostgreSQL's)."""
+    if not isinstance(items, list):
+        return []
+    return [
+        {
+            "key": _label(item.get("key")),
+            "bytes": _optional_count(item.get("bytes")),
+            "expected": _optional_count(item.get("expected")),
+            "step": item.get("step") if item.get("step") in feed_fetch.STEPS else None,
+            "scanned": _optional_count(item.get("scanned")),
+            "scan_total": _optional_count(item.get("scan_total")),
+            "elapsed_seconds": _seconds_since(item.get("started_at"), now),
+        }
+        for item in items[:4]
+        if isinstance(item, dict)
+    ]
 
 
 def _extract_state(extract: dict[str, Any], now: datetime) -> str:
@@ -672,7 +737,13 @@ def _public(row: Row, now: datetime) -> dict[str, Any]:
         "elapsed_seconds": max(0, int((end - row.started_at).total_seconds())),
         **{name: _count(detail.get(name)) for name in _COUNTS},
         "phase": _word(detail["phase"]) if detail.get("phase") else None,
-        "current": _public_current(detail.get("current")),
+        # Only a running refresh has a current task: an interrupted record
+        # keeps the task it died in, which is no longer "now".
+        "current": (
+            _public_current(detail.get("current"), datetime.now(UTC))
+            if row.state == RUNNING
+            else []
+        ),
         "failed_keys": [_label(k) for k in (detail.get("failed_keys") or [])][:FAILED_KEYS_MAX],
         "error": _word(detail["error"]) if detail.get("error") else None,
         "previous": None,

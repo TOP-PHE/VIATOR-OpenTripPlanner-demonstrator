@@ -29,6 +29,7 @@ from __future__ import annotations
 import collections
 import re
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -322,11 +323,38 @@ def _calendar_cut(buf: bytes, cut: int) -> int:
     return cut if close.search(buf, last.end(), cut) else last.start()
 
 
-def _count(stream: Any, counts: collections.Counter[bytes], calendar: _CalendarScan) -> bytes:
+Progress = Callable[[int, int | None], None]
+
+
+class _Scanned:
+    """Bytes of XML read so far across the members, reported after each
+    read to `progress` with the total announced by the zip directory (or the
+    bare file's size). The caller throttles what it does with them."""
+
+    def __init__(self, progress: Progress | None, total: int | None) -> None:
+        self.progress = progress
+        self.total = total
+        self.done = 0
+        self.add(0)
+
+    def add(self, n: int) -> None:
+        self.done += n
+        if self.progress is not None:
+            self.progress(self.done, self.total)
+
+
+def _count(
+    stream: Any,
+    counts: collections.Counter[bytes],
+    calendar: _CalendarScan,
+    scanned: _Scanned | None = None,
+) -> bytes:
     """Count start tags of one XML stream; returns its first bytes."""
     head = b""
     tail = b""
     while chunk := stream.read(_CHUNK):
+        if scanned is not None:
+            scanned.add(len(chunk))
         if not head:
             head = chunk[:8192]
         buf = tail + chunk
@@ -342,23 +370,31 @@ def _count(stream: Any, counts: collections.Counter[bytes], calendar: _CalendarS
     return head
 
 
-def fingerprint(path: Path) -> Fingerprint:
-    """Fingerprint a NeTEx zip (or a bare XML file)."""
+def fingerprint(path: Path, progress: Progress | None = None) -> Fingerprint:
+    """Fingerprint a NeTEx zip (or a bare XML file). `progress`, when given,
+    is called with the bytes of XML scanned so far and their total (the
+    uncompressed sizes the zip directory declares, read without unpacking
+    anything; the file's size for a bare XML), first with 0."""
     counts: collections.Counter[bytes] = collections.Counter()
     calendar = _CalendarScan()
     fp = Fingerprint()
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
-            names = sorted(n for n in z.namelist() if n.lower().endswith(".xml"))
-            for name in names:
-                with z.open(name) as f:
-                    head = _count(f, counts, calendar)
+            members = sorted(
+                (i for i in z.infolist() if i.filename.lower().endswith(".xml")),
+                key=lambda i: i.filename,
+            )
+            scanned = _Scanned(progress, sum(i.file_size for i in members))
+            for info in members:
+                with z.open(info) as f:
+                    head = _count(f, counts, calendar, scanned)
                 if not fp.header:
                     fp.header = _header(head)
-            fp.xml_files = len(names)
+            fp.xml_files = len(members)
     else:
+        scanned = _Scanned(progress, path.stat().st_size)
         with path.open("rb") as f:
-            fp.header = _header(_count(f, counts, calendar))
+            fp.header = _header(_count(f, counts, calendar, scanned))
         fp.xml_files = 1
     merged: collections.Counter[str] = collections.Counter()
     prefixes: collections.Counter[str] = collections.Counter()

@@ -824,7 +824,7 @@ went into which build; and stale files silently produce a build the operator thi
 | `app/staleness.py` | Two timestamps in `config._meta` answering "are the downloaded files in sync with the configured URLs?" |
 | `app/inbox_sweep.py` | Quarantines inbox files belonging to providers the operator has since removed. |
 | `app/station_extract.py` (+ `_gtfs`, `_netex`, `_skip`, `_common`) | The **stop extract** of each timetable feed for the station module (MSMM 22.2): one gzip CSV per feed version, the rail stations only, with their codes; the MSMM feed key of a provider; the cache in `inbox/<sid>/_extracts/`. Made at refresh and upload time; nothing in the graph build reads it. |
-| `app/refresh_progress.py` | The **progress record** of a session's provider refresh and OSM refresh (issue #359; table `source_refresh_progress`): claim (one refresh of a kind at a time, 409 otherwise), a 30 s heartbeat with a 5-minute lease, counts and the bytes of the download under way (fed by `feed_fetch.download_progress`), the station-module follow-up; read by `GET /api/sessions/{sid}/sources/progress` and the Sessions page's progress block. |
+| `app/refresh_progress.py` | The **progress record** of a session's provider refresh and OSM refresh (issue #359; table `source_refresh_progress`): claim (one refresh of a kind at a time, 409 otherwise), a 30 s heartbeat with a 5-minute lease, counts, the bytes of the download under way (fed by `feed_fetch.download_progress`) and the step of the current task after it (`feed_fetch.task_step`: verifying, checking structure with its bytes, storing), the station-module follow-up; read by `GET /api/sessions/{sid}/sources/progress` and the Sessions page's progress block. |
 
 ### How it works
 
@@ -1177,6 +1177,10 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   minutes: the heartbeat is a task of that loop. The POST stays synchronous (the request still holds
   the refresh, nginx's 600 s timeout and the page's gateway-error path unchanged); the page polls the
   GET beside it. Bytes are written at most every 2 s or 5 % of a feed: never add a write per chunk.
+  Each current task carries its step (`downloading` → `verifying` → `checking_structure` →
+  `storing`, `feed_fetch.task_step`); a new long step after a download gets a step word of its own
+  and runs in a worker thread (`asyncio.to_thread`; the slot copy through
+  `sessions._dispatch_off_loop`, which keeps the database session on the request's thread).
   The record holds labels and counts only: a skip reason can quote a URL, so reasons stay in the
   feed-status store and never enter `detail`. A refresh that finds its lease lost (`run.lost`) starts no
   further download. Inside `async with run` the progress writes go to one writer thread in order (the

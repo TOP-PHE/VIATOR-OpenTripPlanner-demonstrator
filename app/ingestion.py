@@ -20,8 +20,10 @@ Multi-feed GTFS:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -460,7 +462,31 @@ def dispatch(
     session_id: str | None = None,
     staged_filename: str | None = None,
 ) -> bool:
-    """Move the stored file to its destination. Returns True if a rebuild was queued.
+    """Move the stored file to its destination (`place`), then queue a rebuild
+    when the kind warrants one (`queue_rebuild`). Returns True if a rebuild
+    was queued. An async caller runs `place` in a worker thread (it copies
+    files of up to a few GB) and `queue_rebuild` on its own thread, which
+    holds the request's database session."""
+    rebuild = place(stored_path, kind, session_id=session_id, staged_filename=staged_filename)
+    if rebuild:
+        queue_rebuild(db, session_id=session_id, kind=kind)
+    return rebuild
+
+
+def queue_rebuild(db: DbSession, *, session_id: str | None, kind: str) -> None:
+    """Queue a rebuild after a new `kind` file reached the session's slot."""
+    _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
+
+
+def place(
+    stored_path: Path,
+    kind: str,
+    *,
+    session_id: str | None = None,
+    staged_filename: str | None = None,
+) -> bool:
+    """Copy the stored file to its destination; files only, no database.
+    Returns True when the kind warrants a rebuild (`queue_rebuild`).
 
     `staged_filename` overrides the per-kind default (used by multi-feed GTFS
     to land each feed at `inbox/<sid>/gtfs/<feed_id_lower>.zip`). Other GTFS-
@@ -479,42 +505,94 @@ def dispatch(
     if kind in STAGE_INTO_OTP_INBOX:
         subdir = base / STAGE_INTO_OTP_INBOX[kind]
         subdir.mkdir(parents=True, exist_ok=True)
-        target_name = staged_filename or STAGE_INTO_OTP_INBOX_FILENAME[kind]
-        if staged_filename is None:
-            # Legacy: rotate everything (single-feed sessions). Defensive
-            # match against `.old` AND `.old.N` (v0.1.14 introduced numeric
-            # OSM rotation generations) so we don't double-rotate already-
-            # archived files into `osm.pbf.old.1.old` etc.
-            _OLD_RE = re.compile(r"\.old(?:\.\d+)?$")
-            for existing in subdir.iterdir():
-                if existing.is_file() and not _OLD_RE.search(existing.name):
-                    existing.rename(existing.with_suffix(existing.suffix + ".old"))
-        else:
-            # Multi-feed: rotate only the matching feed's prior file.
-            existing_target = subdir / target_name
-            if existing_target.exists():
-                existing_target.rename(existing_target.with_suffix(existing_target.suffix + ".old"))
-        target = subdir / target_name
-        shutil.copy2(stored_path, target)
-        _enqueue_rebuild(db, session_id=session_id, reason=f"new {kind} uploaded")
+        _place_in_slot(
+            stored_path,
+            subdir,
+            staged_filename or STAGE_INTO_OTP_INBOX_FILENAME[kind],
+            rotate_all=staged_filename is None,
+        )
         return True
 
     if kind in ARCHIVE_ONLY:
         archive = base / "archive" / kind
         archive.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(stored_path, archive / stored_path.name)
+        _copy_into(stored_path, archive / stored_path.name)
         return False
 
     if kind in LOAD_TO_DB:
         runtime = base / "runtime" / kind
         runtime.mkdir(parents=True, exist_ok=True)
-        target = runtime / f"latest{stored_path.suffix}"
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        shutil.copy2(stored_path, tmp)
-        tmp.replace(target)
+        _copy_into(stored_path, runtime / f"latest{stored_path.suffix}")
         return False
 
     raise ValueError(f"No dispatch rule for kind={kind}")
+
+
+# One lock per slot directory and process: `place` runs in worker threads
+# (an upload, a refresh's "storing" step and a derived provider writing into
+# another session can meet on one slot), and the legacy rotation renames every
+# file of the directory, so the directory is the unit. Only `web` places files.
+_SLOT_LOCKS: dict[str, threading.Lock] = {}
+_SLOT_LOCKS_GUARD = threading.Lock()
+# Rotation generations: `.old` and `.old.N` (v0.1.14 numeric OSM generations).
+_OLD_RE = re.compile(r"\.old(?:\.\d+)?$")
+_TMP_SUFFIX = ".placing.tmp"
+
+
+def _slot_lock(directory: Path) -> threading.Lock:
+    key = os.path.realpath(directory)
+    with _SLOT_LOCKS_GUARD:
+        return _SLOT_LOCKS.setdefault(key, threading.Lock())
+
+
+def _copy_beside(src: Path, target: Path) -> Path:
+    """Copy `src` to a temporary name beside `target` (never matched by a
+    build's `*.zip` / `*.pbf` glob nor rotated) and return it."""
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}{_TMP_SUFFIX}")
+    try:
+        shutil.copy2(src, tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+def _copy_into(src: Path, target: Path) -> None:
+    """Replace `target` by a copy of `src` in one rename, under its directory's lock."""
+    with _slot_lock(target.parent):
+        tmp = _copy_beside(src, target)
+        try:
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def _place_in_slot(stored_path: Path, subdir: Path, target_name: str, *, rotate_all: bool) -> None:
+    """Copy into `subdir/target_name`, the previous file rotated to `.old`
+    (every current file of the directory in the legacy single-feed flow).
+    The new file is copied beside the slot first: the slot keeps its current
+    file until two renames replace it, all under the directory's lock."""
+    target = subdir / target_name
+    with _slot_lock(subdir):
+        tmp = _copy_beside(stored_path, target)
+        try:
+            if rotate_all:
+                _rotate_all(subdir)
+            elif target.exists():
+                # Multi-feed: rotate only the matching feed's prior file.
+                target.rename(target.with_suffix(target.suffix + ".old"))
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def _rotate_all(subdir: Path) -> None:
+    """Legacy single-feed flow: every current file of the directory becomes
+    `.old` (already rotated generations and files being placed excepted)."""
+    for existing in subdir.iterdir():
+        name = existing.name
+        if existing.is_file() and not _OLD_RE.search(name) and not name.endswith(_TMP_SUFFIX):
+            existing.rename(existing.with_suffix(existing.suffix + ".old"))
 
 
 def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> None:
