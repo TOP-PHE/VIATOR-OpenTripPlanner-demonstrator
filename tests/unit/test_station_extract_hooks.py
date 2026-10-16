@@ -39,7 +39,9 @@ def _session() -> SimpleNamespace:
 
 
 def _db(session: SimpleNamespace) -> SimpleNamespace:
-    return SimpleNamespace(get=lambda _model, _sid: session, commit=lambda: None)
+    return SimpleNamespace(
+        get=lambda _model, _sid: session, commit=lambda: None, refresh=lambda *_a, **_k: None
+    )
 
 
 def _response(**buckets: list[dict[str, Any]]) -> sessions_api.RefreshSourcesResponse:
@@ -64,7 +66,6 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(refresh_progress, "claim", claim)
     monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
-    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
 
 
 @pytest.mark.parametrize(

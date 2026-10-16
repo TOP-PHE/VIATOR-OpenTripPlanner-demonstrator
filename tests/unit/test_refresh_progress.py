@@ -207,6 +207,125 @@ def test_the_refusal_names_the_running_refresh() -> None:
     assert "2026-10-15T09:59:00+00:00" in detail["message"]
 
 
+# ── one provider alone ───────────────────────────────────────────────────
+
+
+def test_a_provider_alone_is_named_in_its_refusals() -> None:
+    started = datetime(2026, 10, 15, 9, 59, tzinfo=UTC)
+    same = refresh_progress.RefreshRunning("ZZRAIL", started).detail()
+    assert (same["error"], same["scope"], same["provider_id"]) == (
+        "refresh_already_running",
+        "provider",
+        "ZZRAIL",
+    )
+    assert same["message"].startswith("A refresh of provider ZZRAIL is already running")
+    assert "2026-10-15T09:59:00+00:00" in same["message"]
+    blocks_whole = refresh_progress.RefreshRunning(
+        "ZZRAIL", started, refresh_progress.PROVIDERS
+    ).detail()
+    assert (blocks_whole["error"], blocks_whole["provider_id"]) == (
+        "provider_refresh_running",
+        "ZZRAIL",
+    )
+    assert "Refresh providers downloads that provider too" in blocks_whole["message"]
+    whole_blocks = refresh_progress.RefreshRunning(
+        refresh_progress.PROVIDERS, None, "ZZRAIL"
+    ).detail()
+    assert (whole_blocks["error"], whole_blocks["scope"], whole_blocks["provider_id"]) == (
+        "refresh_already_running",
+        "providers",
+        None,
+    )
+    assert whole_blocks["started_at"] is None
+    assert "started at" not in whole_blocks["message"]
+
+
+@pytest.mark.parametrize("pid", ["ZZ", "ZZRAIL", "ZZ-99_RAIL", "Z" * 16])
+def test_a_feed_id_is_its_own_scope(pid: str) -> None:
+    assert refresh_progress.provider_scope(pid) == pid
+    assert refresh_progress.is_provider_scope(pid) is True
+    assert refresh_progress.refresh_scope(pid) == pid
+
+
+@pytest.mark.parametrize(
+    "value", ["providers", "osm", "Z", "Z" * 17, "zzrail", "ZZ RAIL", "ZZ\u202eX", "ZZ\n", None]
+)
+def test_anything_else_is_never_a_provider_scope(value: Any) -> None:
+    assert refresh_progress.is_provider_scope(value) is False
+    with pytest.raises(ValueError, match="not a feed id"):
+        refresh_progress.provider_scope(value)
+
+
+def test_the_feed_id_rule_is_the_configs() -> None:
+    from app import ingestion
+
+    assert refresh_progress._FEED_ID.pattern == ingestion._FEED_ID_RE.pattern.strip("^$")
+    assert refresh_progress.refresh_scope(None) == refresh_progress.PROVIDERS
+
+
+def test_a_claim_of_an_unknown_scope_is_refused_before_the_database() -> None:
+    def no_database() -> Any:
+        raise AssertionError("the database was opened")
+
+    with pytest.raises(ValueError, match="not a feed id"):
+        refresh_progress.claim("zz", "zzjunk", 1, factory=no_database)
+
+
+@pytest.mark.parametrize(
+    ("scope", "follow_up", "extract"),
+    [
+        (refresh_progress.PROVIDERS, True, {"state": "off"}),
+        ("ZZRAIL", True, {"state": "off"}),
+        ("ZZRAIL", False, None),
+        (refresh_progress.OSM, None, None),
+    ],
+)
+def test_the_end_writes_the_follow_up_only_when_a_pass_follows(
+    monkeypatch: pytest.MonkeyPatch, scope: str, follow_up: bool | None, extract: Any
+) -> None:
+    from app import station_module
+
+    monkeypatch.setattr(station_module, "enabled", lambda: False)
+    run = refresh_progress.RefreshRun(
+        "zz", scope, uuid.uuid4(), refresh_progress._initial_detail(1, None)
+    )
+    if follow_up is not None:
+        run.follow_up = follow_up
+    written: list[Any] = []
+    run._execute = lambda statement, **_k: written.append(  # type: ignore[method-assign]
+        statement.compile().params
+    )
+    run.finish(refresh_progress.FINISHED)
+    [params] = written
+    assert params.get("extract") == extract
+
+
+def test_the_follow_up_is_fenced_by_its_refresh_scope() -> None:
+    whole = refresh_progress.ExtractFollowUp("zz", uuid.uuid4())
+    card = refresh_progress.ExtractFollowUp("zz", uuid.uuid4(), scope="ZZRAIL")
+    assert (whole.scope, card.scope) == (refresh_progress.PROVIDERS, "ZZRAIL")
+
+
+def test_the_public_record_names_the_provider_alone() -> None:
+    started = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
+
+    def row(scope: str) -> Any:
+        return SimpleNamespace(
+            scope=scope,
+            state="finished",
+            started_at=started,
+            finished_at=started,
+            heartbeat_at=started,
+            detail={},
+            extract={},
+        )
+
+    card = refresh_progress._public(row("ZZRAIL"), started)
+    assert (card["scope"], card["provider_id"]) == ("provider", "ZZRAIL")
+    whole = refresh_progress._public(row("providers"), started)
+    assert (whole["scope"], whole["provider_id"]) == ("providers", None)
+
+
 # ── what a reader gets ───────────────────────────────────────────────────
 
 
@@ -1002,3 +1121,23 @@ def test_a_failed_copy_removes_its_source_and_queues_nothing(
         asyncio.run(failing)
     assert not source.exists()
     assert (queued, after) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("config", "ids"),
+    [
+        (
+            {
+                "sources": {
+                    "providers": [{"id": "ZZRAIL"}, {"id": "ZZBUS"}, {"x": 1}, "ZZ", {"id": 9}]
+                }
+            },
+            {"ZZRAIL", "ZZBUS"},
+        ),
+        ({"sources": {"providers": "ZZRAIL"}}, set()),
+        ({"sources": []}, set()),
+        (None, set()),
+    ],
+)
+def test_the_shown_card_records_follow_the_saved_providers(config: Any, ids: set[str]) -> None:
+    assert refresh_progress.provider_ids(config) == ids

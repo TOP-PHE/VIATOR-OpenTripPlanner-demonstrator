@@ -188,7 +188,9 @@ _CONFIG = {
 
 def _fake_db() -> SimpleNamespace:
     row = SimpleNamespace(id="zz-session", config=dict(_CONFIG), state="populated")
-    return SimpleNamespace(get=lambda _model, _sid: row, commit=lambda: None)
+    return SimpleNamespace(
+        get=lambda _model, _sid: row, commit=lambda: None, refresh=lambda *_a, **_k: None
+    )
 
 
 def _args(endpoint: Any, **given: Any) -> dict[str, Any]:
@@ -212,7 +214,6 @@ def no_progress_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(refresh_progress, "claim", claim)
     monkeypatch.setattr(refresh_progress.RefreshRun, "_execute", lambda _self, _stmt, **_k: None)
-    monkeypatch.setattr(refresh_progress, "running_since", lambda *_a, **_k: None)
 
 
 def _record_queue(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
@@ -261,7 +262,8 @@ async def test_a_provider_refresh_queues_its_pass(monkeypatch: pytest.MonkeyPatc
     await sessions_api.refresh_provider(
         **_args(sessions_api.refresh_provider, sid="zz-session", pid="ZZRAIL")
     )
-    assert queued == [("zz-session", "ZZRAIL")]
+    # Its pass reports to this provider's own progress record (its run_id).
+    assert queued == [("zz-session", "ZZRAIL", "run_id")]
 
 
 # ── what the Sessions page shows ─────────────────────────────────────────
