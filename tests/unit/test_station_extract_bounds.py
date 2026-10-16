@@ -329,11 +329,30 @@ def test_assignment_and_quay_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
     )
     provider = _provider("netex_epip")
-    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
-    monkeypatch.setattr(netex, "ASSIGNMENTS_MAX", 2_000_000)
-    monkeypatch.setattr(netex, "QUAYS_MAX", 2)
-    assert _reason(provider, archive, tmp_path) == "input_too_large"
+    assert _reason(provider, archive, tmp_path) == "ok"
+    for name in ("ASSIGNMENTS_MAX", "QUAYS_MAX", "STOP_PLACES_MAX", "POINTS_MAX"):
+        with monkeypatch.context() as patch:
+            patch.setattr(netex, name, 1)
+            assert _reason(provider, archive, tmp_path) == "input_too_large", name
+
+
+def test_expat_out_of_memory_is_a_memory_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """expat that cannot allocate (the child's memory limit) raises an
+    ExpatError: a memory stop, not a malformed file."""
+    archive = _zip(
+        tmp_path / "n.zip", {"a.xml": _delivery(EPIP_SITE + EPIP_SERVICE + EPIP_TIMETABLE)}
+    )
+    code = netex.expat.errors.codes[netex.expat.errors.XML_ERROR_NO_MEMORY]
+
+    def failing(_self: Any, _chunk: bytes) -> None:
+        error = netex.expat.ExpatError("out of memory")
+        error.code, error.lineno = code, 1
+        raise error
+
+    monkeypatch.setattr(netex._Feeder, "feed", failing)
+    assert _reason(_provider("netex_epip"), archive, tmp_path) == "memory_limit"
 
 
 def test_lines_read_after_their_journeys(tmp_path: Path) -> None:
@@ -414,6 +433,18 @@ def _sleep() -> station_extract.ExtractResult:
     raise AssertionError("unreachable")
 
 
+def _crash() -> station_extract.ExtractResult:
+    os.abort()
+
+
+def _spin() -> station_extract.ExtractResult:
+    """A child target that works past its processor time."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        pass
+    raise AssertionError("unreachable")
+
+
 def test_ensure_extract_in_a_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(station_extract.settings, "inbox_dir", tmp_path / "inbox")
     archive = _gtfs(tmp_path)
@@ -462,17 +493,53 @@ def test_ensure_extract_child_failures_are_extract_errors(
     monkeypatch.setattr(station_extract, "CHILD_MEMORY_BYTES", 512 * MIB)
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_allocate, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == ("memory_limit", "out of memory")
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_kill_self, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == (
+        "stopped",
+        "the child ended with SIGKILL",
+    )
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_fail, ())
     assert caught.value.reason == "error"
+    with pytest.raises(ExtractError) as caught:
+        station_extract._run_child(_crash, ())
+    assert (caught.value.reason, caught.value.detail) == (
+        "crashed",
+        "the child ended with SIGABRT",
+    )
+    monkeypatch.setattr(station_extract, "CHILD_CPU_SECONDS", 1)
+    with pytest.raises(ExtractError) as caught:
+        station_extract._run_child(_spin, ())
+    assert (caught.value.reason, caught.value.detail) == ("cpu_limit", "processor time")
     monkeypatch.setattr(station_extract, "CHILD_WALL_SECONDS", 1)
     with pytest.raises(ExtractError) as caught:
         station_extract._run_child(_sleep, ())
-    assert caught.value.reason == "resource_limit"
+    assert (caught.value.reason, caught.value.detail) == ("wall_clock_limit", "wall-clock time")
+
+
+@pytest.mark.parametrize(
+    ("exitcode", "reason", "detail"),
+    [
+        (-signal.SIGXCPU, "cpu_limit", "processor time"),
+        (-signal.SIGKILL, "stopped", "the child ended with SIGKILL"),
+        (-signal.SIGTERM, "stopped", "the child ended with SIGTERM"),
+        (-signal.SIGINT, "stopped", "the child ended with SIGINT"),
+        (-signal.SIGHUP, "stopped", "the child ended with SIGHUP"),
+        (-signal.SIGSEGV, "crashed", "the child ended with SIGSEGV"),
+        (-signal.SIGBUS, "crashed", "the child ended with SIGBUS"),
+        (-signal.SIGABRT, "crashed", "the child ended with SIGABRT"),
+        (-signal.SIGUSR1, "crashed", "the child ended with SIGUSR1"),
+        (-99, "crashed", "the child ended with signal 99"),
+        (1, "error", "the child ended with 1"),
+        (0, "error", "the child ended with 0"),
+        (None, "error", "the child ended with None"),
+    ],
+)
+def test_a_silent_child_end_says_which(exitcode: int | None, reason: str, detail: str) -> None:
+    ended = station_extract._silent_end(exitcode)
+    assert (ended.reason, ended.detail) == (reason, detail)
 
 
 def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -480,9 +547,12 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(station_extract.resource, "setrlimit", lambda *a: calls.append(a))
     monkeypatch.setattr(station_extract.os, "nice", lambda n: calls.append(("nice", n)))
     monkeypatch.setattr(station_extract, "_die_with_parent", lambda: calls.append("pdeathsig"))
+    monkeypatch.setattr(station_extract, "_first_to_kill", lambda: calls.append("oom"))
     station_extract._limit_self(station_extract._Limits(9, 99, 10))
     assert calls == [
+        (station_extract.resource.RLIMIT_CORE, (0, 0)),
         "pdeathsig",
+        "oom",
         (station_extract.resource.RLIMIT_AS, (9, 9)),
         (station_extract.resource.RLIMIT_CPU, (99, 129)),
         ("nice", 10),
@@ -491,6 +561,19 @@ def test_child_limits_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert station_extract.CHILD_CPU_SECONDS == 40 * 60
     assert station_extract.CHILD_WALL_SECONDS == 45 * 60
     assert station_extract.CHILD_NICE == 10
+
+
+def test_the_child_asks_to_be_killed_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child raises its own out-of-memory score to the most, so that a
+    machine short of memory ends it rather than the database; a refusal
+    (another system, no such file) is ignored."""
+    score = tmp_path / "oom_score_adj"
+    score.write_text("0")
+    monkeypatch.setattr(station_extract, "_OOM_SCORE_ADJ", score)
+    station_extract._first_to_kill()
+    assert score.read_text() == "1000"
+    monkeypatch.setattr(station_extract, "_OOM_SCORE_ADJ", tmp_path / "missing" / "score")
+    station_extract._first_to_kill()  # no error
 
 
 def test_one_extraction_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -545,7 +628,7 @@ def test_build_extract_raises_only_extract_errors(
 
     archive = _gtfs(tmp_path)
     monkeypatch.setattr(station_extract, "_read_stations", oom)
-    assert _reason(_provider(), archive, tmp_path) == "resource_limit"
+    assert _reason(_provider(), archive, tmp_path) == "memory_limit"
     monkeypatch.setattr(station_extract, "_read_stations", other)
     assert _reason(_provider(), archive, tmp_path) == "error"
 
@@ -848,6 +931,119 @@ def test_direct_calls_without_a_pattern(tmp_path: Path) -> None:
         _build(provider, _netex(tmp_path, "c.zip", site, service, journeys), tmp_path), provider
     )
     assert rows["ZZ:SP:1"]["n_calls"] == "1"
+
+
+def test_a_tally_holds_every_group_number() -> None:
+    """A tally packs the group number under `_MASK`: every number
+    `GROUPS_MAX` allows fits, and the count above it."""
+    assert netex.GROUPS_MAX <= netex._MASK
+    table: dict[str, Any] = {}
+    netex._tally_add(table, "p", netex.GROUPS_MAX - 1, 3)
+    netex._tally_add(table, "p", netex.GROUPS_MAX - 1, 4)
+    assert list(netex._tally_items(table["p"])) == [(netex.GROUPS_MAX - 1, 7)]
+
+
+def test_a_point_assigned_to_several_places(tmp_path: Path) -> None:
+    """A scheduled stop point assigned three times: each place gets its
+    calls (the assignment keeps every place number)."""
+    site = (
+        '<SiteFrame id="S"><stopPlaces>'
+        + "".join(_place(f"ZZ:SP:{n}") for n in (1, 2, 3))
+        + "</stopPlaces></SiteFrame>"
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + "".join(_psa(n, "S1", f"ZZ:SP:{n}") for n in (1, 2, 3))
+        + "</stopAssignments>"
+        + _one_pattern(_point(1, "S1"))
+        + "</ServiceFrame>"
+    )
+    provider = _provider("netex_epip")
+    result = _build(provider, _netex(tmp_path, "m.zip", site, service, ONE_JOURNEY), tmp_path)
+    rows = _rows(result, provider)
+    assert {key: row["n_calls"] for key, row in rows.items()} == {
+        "ZZ:SP:1": "1",
+        "ZZ:SP:2": "1",
+        "ZZ:SP:3": "1",
+    }
+
+
+def test_journey_groups_counted_per_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One group of journeys over two patterns is two (pattern, group)
+    pairs: `GROUPS_MAX` bounds the pairs, not only the distinct groups."""
+    site = '<SiteFrame id="S"><stopPlaces>' + _place("ZZ:SP:1") + "</stopPlaces></SiteFrame>"
+    patterns = "".join(
+        f'<ServiceJourneyPattern id="ZZ:P{n}"><pointsInSequence>{_point(1, "S1")}'
+        "</pointsInSequence></ServiceJourneyPattern>"
+        for n in (1, 2)
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + _psa(1, "S1", "ZZ:SP:1")
+        + f"</stopAssignments><journeyPatterns>{patterns}</journeyPatterns></ServiceFrame>"
+    )
+    journeys = (
+        '<TimetableFrame id="T"><vehicleJourneys>'
+        + "".join(
+            f'<ServiceJourney id="J{n}"><LineRef ref="ZZ:L"/>'
+            f'<ServiceJourneyPatternRef ref="ZZ:P{n}"/></ServiceJourney>'
+            for n in (1, 2)
+        )
+        + "</vehicleJourneys></TimetableFrame>"
+    )
+    archive = _netex(tmp_path, "g.zip", site, service, journeys)
+    provider = _provider("netex_epip")
+    monkeypatch.setattr(netex, "GROUPS_MAX", 2)
+    assert _reason(provider, archive, tmp_path) == "ok"
+    monkeypatch.setattr(netex, "GROUPS_MAX", 1)
+    assert _reason(provider, archive, tmp_path) == "input_too_large"
+
+
+def test_direct_calls_with_their_times(tmp_path: Path) -> None:
+    """Direct calls with their Arrival and Departure: every call of a point
+    counts (a loop's twice), and a journey's operator goes to the points it
+    calls at only."""
+    site = (
+        '<SiteFrame id="S"><stopPlaces>'
+        + _place("ZZ:SP:1")
+        + _place("ZZ:SP:2")
+        + "</stopPlaces></SiteFrame>"
+    )
+    service = (
+        '<ServiceFrame id="F">'
+        + RAIL_LINE
+        + "<stopAssignments>"
+        + _psa(1, "S1", "ZZ:SP:1")
+        + _psa(2, "S2", "ZZ:SP:2")
+        + "</stopAssignments></ServiceFrame>"
+    )
+    call = (
+        '<Call id="c{n}"><ScheduledStopPointRef ref="{point}"/><Arrival><Time>08:0{n}:00</Time>'
+        "<ForAlighting>false</ForAlighting></Arrival><Departure><Time>08:0{n}:30</Time>"
+        "</Departure></Call>"
+    )
+    calls = "".join(call.format(n=n, point=p) for n, p in enumerate(("S1", "S2", "S1")))
+    journeys = (
+        '<TimetableFrame id="T"><vehicleJourneys><ServiceJourney id="J"><LineRef ref="ZZ:L"/>'
+        f"<calls>{calls}</calls></ServiceJourney>"
+        '<ServiceJourney id="K"><LineRef ref="ZZ:L"/><OperatorRef ref="ZZ:Operator:9"/>'
+        f"<calls>{call.format(n=9, point='S2')}</calls></ServiceJourney>"
+        "</vehicleJourneys></TimetableFrame>"
+    )
+    provider = _provider("netex_epip")
+    rows = _rows(
+        _build(provider, _netex(tmp_path, "c.zip", site, service, journeys), tmp_path), provider
+    )
+    assert rows["ZZ:SP:1"]["n_calls"] == "2"
+    assert rows["ZZ:SP:2"]["n_calls"] == "2"  # two journeys, two groups
+    assert "ZZ:Operator:9" in rows["ZZ:SP:2"]["operators"]
+    assert "ZZ:Operator:9" not in rows["ZZ:SP:1"]["operators"]
 
 
 def test_netex_parents_and_positions(tmp_path: Path) -> None:

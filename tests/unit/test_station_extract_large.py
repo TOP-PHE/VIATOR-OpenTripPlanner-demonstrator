@@ -31,7 +31,6 @@ import io
 import json
 import os
 import random
-import signal
 import struct
 import time
 import tracemalloc
@@ -92,6 +91,10 @@ def test_the_bounds_are_the_documented_ones() -> None:
     assert station_extract_common.MEMBER_MAX_BYTES == 160 * GIB
     assert station_extract_common.ARCHIVE_MAX_BYTES == 160 * GIB
     assert sorted(station_extract_common.PACKINGS) == [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
+    # the NeTEx reader's tables (its memory model: technical spec, admin guide)
+    assert netex.GROUPS_MAX == 1_000_000
+    assert netex.ASSIGNMENTS_MAX == netex.POINTS_MAX == 4_000_000
+    assert netex.QUAYS_MAX == netex.STOP_PLACES_MAX == 2_000_000
 
 
 def test_member_bound() -> None:
@@ -713,6 +716,44 @@ def test_netex_filter_drops_the_bulk(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert 300 <= seen["ServiceJourney"] <= 302  # pass 1, and not pass 2
 
 
+def test_netex_filter_drops_the_times_of_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journey that calls without a pattern: only the call's point is
+    read; its Arrival and Departure never reach expat."""
+    seen: collections.Counter[str] = collections.Counter()
+    start = netex._Builder.start
+
+    def counting(self: Any, name: str, attrs: dict[str, str]) -> None:
+        seen[self._local(name)] += 1
+        start(self, name, attrs)
+
+    monkeypatch.setattr(netex._Builder, "start", counting)
+    call = (
+        '<Call id="ZZ:C:{n}"><ScheduledStopPointRef ref="ZZ:SSP:1"/><Arrival><Time>08:00:00'
+        "</Time></Arrival><Departure><Time>08:01:00</Time></Departure></Call>"
+    )
+    journeys = "".join(
+        f'<ServiceJourney id="ZZ:SJ:{j}"><LineRef ref="ZZ:Line:R"/><calls>'
+        + "".join(call.format(n=c) for c in range(20))
+        + "</calls></ServiceJourney>"
+        for j in range(50)
+    )
+    padding = " " * 2048  # past the first kilobyte, which goes to expat as it is
+    archive = _zip(
+        tmp_path / "calls.zip",
+        {
+            "zz.xml": _delivery(
+                f'<TimetableFrame id="ZZ:TF">{padding}<vehicleJourneys>{journeys}'
+                "</vehicleJourneys></TimetableFrame>" + EPIP_SERVICE + EPIP_SITE
+            )
+        },
+    )
+    _extract_bytes(_provider("netex_epip"), archive, tmp_path / "x")
+    assert seen["Call"] == 1_000
+    assert seen["Arrival"] == seen["Departure"] == seen["Time"] == 0
+
+
 def test_netex_filter_uses_the_root_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A document written with a prefix is cut with that prefix."""
     seen: collections.Counter[str] = collections.Counter()
@@ -747,6 +788,90 @@ def test_netex_memory_flat_on_a_national_shape(tmp_path: Path) -> None:
             tracemalloc.stop()
     assert peaks[1] < 8 * MIB, peaks
     assert peaks[1] < 2 * peaks[0] + MIB, peaks
+
+
+def _per_journey_netex(path: Path, journeys: int, stops: int = 20) -> Path:
+    """An export that gives every journey its own pattern and its own
+    scheduled stop points, each assigned: points and assignments as many as
+    the calls of the timetable. Neither the journeys nor their Line give a
+    mode (the railStation fallback decides), 50 stations."""
+    sites = "".join(
+        f'<StopPlace id="ZZ:SP:{n}"><Name>ZZ Gare {n}</Name><Centroid><Location>'
+        f"<Longitude>9.{n:04d}</Longitude><Latitude>45.{n:04d}</Latitude></Location></Centroid>"
+        f'<StopPlaceType>railStation</StopPlaceType><quays><Quay id="ZZ:Q:{n}"/></quays>'
+        "</StopPlace>"
+        for n in range(50)
+    )
+    batches = range(0, journeys, 500)
+
+    def assignments(first: int) -> bytes:
+        return "".join(
+            f'<PassengerStopAssignment id="A{j}-{s}" order="1"><ScheduledStopPointRef '
+            f'ref="P{j}-{s}"/><QuayRef ref="ZZ:Q:{(j + s) % 50}"/></PassengerStopAssignment>'
+            for j in range(first, min(first + 500, journeys))
+            for s in range(stops)
+        ).encode()
+
+    def patterns(first: int) -> bytes:
+        return "".join(
+            f'<ServiceJourneyPattern id="J{j}"><pointsInSequence>'
+            + "".join(
+                f'<StopPointInJourneyPattern id="X{j}-{s}" order="{s + 1}">'
+                f'<ScheduledStopPointRef ref="P{j}-{s}"/></StopPointInJourneyPattern>'
+                for s in range(stops)
+            )
+            + "</pointsInSequence></ServiceJourneyPattern>"
+            for j in range(first, min(first + 500, journeys))
+        ).encode()
+
+    with (
+        zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf,
+        zf.open("zz.xml", "w", force_zip64=True) as out,
+    ):
+        out.write(f'<PublicationDelivery {NS}><dataObjects><SiteFrame id="ZZ:SF">'.encode())
+        out.write(f"<stopPlaces>{sites}</stopPlaces></SiteFrame>".encode())
+        out.write(b'<ServiceFrame id="ZZ:SVF"><lines><Line id="ZZ:L"/></lines>')
+        out.write(b"<stopAssignments>")
+        for first in batches:
+            out.write(assignments(first))
+        out.write(b"</stopAssignments><journeyPatterns>")
+        for first in batches:
+            out.write(patterns(first))
+        out.write(b'</journeyPatterns></ServiceFrame><TimetableFrame id="ZZ:TF">')
+        out.write(b"<vehicleJourneys>")
+        out.write(
+            "".join(
+                f'<ServiceJourney id="S{j}"><LineRef ref="ZZ:L"/>'
+                f'<ServiceJourneyPatternRef ref="J{j}"/></ServiceJourney>'
+                for j in range(journeys)
+            ).encode()
+        )
+        out.write(b"</vehicleJourneys></TimetableFrame></dataObjects></PublicationDelivery>")
+    return path
+
+
+def test_points_and_assignments_of_every_journey_fit_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """Production, 15 October: two national NeTEx archives stopped at the
+    child's memory limit. An export that gives every journey its own
+    scheduled stop points has as many points and assignments as calls; the
+    reader kept some 1.2 KB for each (1.4 million assignments of a 1 GB
+    synthetic export: 1.76 GiB), now some 250 bytes. At a seventh of that
+    scale, in a child of a seventh of the memory (384 MiB, some 100 of them
+    the interpreter's), the reader before ran out of memory; now the
+    extract is made, in a real child under that limit."""
+    monkeypatch.setattr(station_extract, "CHILD_MEMORY_BYTES", 384 * MIB)
+    archive = _per_journey_netex(tmp_path / "pj.zip", journeys=15_000)
+    result = ensure_extract(
+        _provider("netex_epip"),
+        archive,
+        SHA_A,
+        extracted_at=WHEN,
+        session_id="zz",
+        cache_dir=lock_dir,
+    )
+    assert result.rows == 50
 
 
 # ── GTFS: the same stations, and the same refusals, as the reader before ──
@@ -1033,10 +1158,11 @@ def test_extract_known(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ("bad_archive", "BadZipFile", True),
         ("no_rail_stop", "", True),
         ("too_many_rows", "", True),
-        ("resource_limit", "out of memory", True),
-        ("resource_limit", f"the child ended with {-signal.SIGXCPU}", True),
-        ("resource_limit", "wall-clock time", False),
-        ("resource_limit", f"the child ended with {-signal.SIGKILL}", False),
+        ("memory_limit", "out of memory", True),
+        ("cpu_limit", "processor time", True),
+        ("wall_clock_limit", "wall-clock time", False),
+        ("stopped", "the child ended with SIGKILL", False),
+        ("crashed", "the child ended with SIGSEGV", False),  # remembered the 2nd time
         ("busy", "another extraction runs", False),
         ("error", "OSError", False),
         ("cache", "OSError", False),
@@ -1071,6 +1197,8 @@ def test_a_remembered_failure_counts_under_its_bounds_only(
         (station_extract, "CHILD_CPU_SECONDS", 99),
         (station_extract, "CHILD_MEMORY_BYTES", 99),
         (netex, "TARGET_ELEMENTS_MAX", 99),
+        (netex, "POINTS_MAX", 99),
+        (netex, "STOP_PLACES_MAX", 99),
         (gtfs, "RECORD_MAX", 99),
     ):
         # under the bounds of the release: remembered after one reading
@@ -1130,6 +1258,30 @@ def test_a_changed_reader_reads_the_archive_again(
         station_extract._code_signature.cache_clear()
 
 
+def test_a_memory_stop_is_read_again_after_the_reader_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """Production, 15 October: the national archives stopped at the memory
+    limit are remembered. The NeTEx reader fixed since is part of the code
+    signature, so the next pass reads them again, with nothing to delete."""
+    child = _Child(ExtractError("memory_limit", "out of memory"))
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    assert _ensure(archive, lock_dir) == ("memory_limit", "out of memory")
+    assert _ensure(archive, lock_dir) == ("memory_limit", "remembered")
+    assert child.runs == 1
+    fixed = tmp_path / "fixed_netex.py"
+    fixed.write_text(Path(str(netex.__file__)).read_text() + "\n# a fix\n")
+    station_extract._code_signature.cache_clear()
+    try:
+        monkeypatch.setattr(netex, "__file__", str(fixed))
+        child.fail = None
+        assert isinstance(_ensure(archive, lock_dir), station_extract.ExtractResult)
+        assert child.runs == 2
+    finally:
+        station_extract._code_signature.cache_clear()
+
+
 def station_extract_skip_file() -> str:
     from app import station_extract_skip
 
@@ -1142,21 +1294,21 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     """Review of #358: a niced child on a busy server may stop at its wall
     clock before its processor time; tried once more, then remembered, so a
     national archive does not hold the machine 45 minutes at every pass."""
-    wall = ExtractError("resource_limit", station_extract.WALL_CLOCK)
+    wall = ExtractError("wall_clock_limit", station_extract.WALL_CLOCK)
     child = _Child(wall)
     monkeypatch.setattr(station_extract, "_run_child", child)
     archive = _gtfs(tmp_path)
-    assert _ensure(archive, lock_dir) == ("resource_limit", station_extract.WALL_CLOCK)
-    assert _ensure(archive, lock_dir) == ("resource_limit", station_extract.WALL_CLOCK)
+    assert _ensure(archive, lock_dir) == ("wall_clock_limit", station_extract.WALL_CLOCK)
+    assert _ensure(archive, lock_dir) == ("wall_clock_limit", station_extract.WALL_CLOCK)
     assert child.runs == 2
-    assert _ensure(archive, lock_dir) == ("resource_limit", "remembered")
+    assert _ensure(archive, lock_dir) == ("wall_clock_limit", "remembered")
     assert child.runs == 2
     (marker,) = lock_dir.glob("*.failed")
-    assert json.loads(marker.read_text())["walls"] == 2
+    assert json.loads(marker.read_text())["tries"] == 2
     # a child killed in between starts the count again
     marker.unlink()
     _ensure(archive, lock_dir)  # one wall-clock stop
-    child.fail = ExtractError("resource_limit", f"the child ended with {-signal.SIGKILL}")
+    child.fail = ExtractError("stopped", "the child ended with SIGKILL")
     _ensure(archive, lock_dir)
     assert not list(lock_dir.glob("*.failed"))
     child.fail = wall
@@ -1173,13 +1325,51 @@ def test_a_wall_clock_stop_is_remembered_the_second_time(
     assert child.runs == runs + 2
 
 
+def test_a_crash_is_remembered_the_second_time_in_a_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_dir: Path
+) -> None:
+    """A child killed by its own fault (SIGSEGV, SIGABRT): an archive that
+    makes the reader crash does so every time, so it is remembered, but only
+    the second time in a row with the same reason (a crash under a passing
+    shortage may not come back); a wall-clock stop in between starts the
+    count again, and the reverse."""
+    crash = ExtractError("crashed", "the child ended with SIGSEGV")
+    wall = ExtractError("wall_clock_limit", station_extract.WALL_CLOCK)
+    child = _Child(crash)
+    monkeypatch.setattr(station_extract, "_run_child", child)
+    archive = _gtfs(tmp_path)
+    assert _ensure(archive, lock_dir) == ("crashed", "the child ended with SIGSEGV")
+    child.fail = wall
+    assert _ensure(archive, lock_dir) == ("wall_clock_limit", station_extract.WALL_CLOCK)
+    child.fail = crash
+    _ensure(archive, lock_dir)  # one crash in a row, not two
+    assert child.runs == 3
+    _ensure(archive, lock_dir)  # the second in a row
+    assert _ensure(archive, lock_dir) == ("crashed", "remembered")
+    assert child.runs == 4
+    (marker,) = lock_dir.glob("*.failed")
+    assert json.loads(marker.read_text()) == {
+        "reason": "crashed",
+        "limits": station_extract._limits_signature(),
+        "format": "gtfs",
+        "tries": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ("record", "remembered"),
     [
         ({"reason": "bad_archive"}, "bad_archive"),  # no count: at once
-        ({"reason": "resource_limit", "walls": 1}, None),  # one wall-clock stop
-        ({"reason": "resource_limit", "walls": 2}, "resource_limit"),
-        ({"reason": "resource_limit", "walls": "2"}, None),
+        ({"reason": "wall_clock_limit", "tries": 1}, None),  # one wall-clock stop
+        ({"reason": "wall_clock_limit", "tries": 2}, "wall_clock_limit"),
+        ({"reason": "wall_clock_limit", "tries": "2"}, None),
+        ({"reason": "wall_clock_limit"}, None),  # a count is needed
+        ({"reason": "crashed", "tries": 1}, None),  # one crash
+        ({"reason": "crashed", "tries": 2}, "crashed"),
+        ({"reason": "memory_limit"}, "memory_limit"),
+        ({"reason": "cpu_limit"}, "cpu_limit"),
+        ({"reason": "stopped"}, None),
+        ({"reason": "resource_limit"}, None),  # the word of earlier releases
         ({"reason": "bad_archive", "format": "netex_epip"}, None),  # another format
         ({"reason": "busy"}, None),
     ],
@@ -1320,7 +1510,7 @@ def test_the_warm_thread_works_through_every_feed(
         order.append(provider_cfg["id"])
         if provider_cfg["id"] == "ZZMID":
             long_one.wait(0.5)  # a long extraction: the ones after it still come
-        raise ExtractError("resource_limit", "wall-clock time")
+        raise ExtractError("wall_clock_limit", "wall-clock time")
 
     monkeypatch.setattr(station_extract, "ensure_extract", making)
     assert station_extract.queue_warm("s", {"sources": {"providers": providers}})

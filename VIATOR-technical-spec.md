@@ -443,15 +443,24 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
 - **Isolation**: `ensure_extract` runs the extraction in a spawned child (`RLIMIT_AS` 2 GiB,
   `RLIMIT_CPU` 40 min, 45 min wall clock, `nice 10`, `PR_SET_PDEATHSIG` so it dies with its parent),
   one at a time on the machine (`flock` on
-  `inbox/.station-extract.lock`); a child that passes a limit ends with `resource_limit`, a wait past
-  `wait_seconds` is `busy`.
+  `inbox/.station-extract.lock`); a child that passes a limit ends with the word of that limit:
+  `memory_limit` (a `MemoryError`, expat's "out of memory" included), `cpu_limit` (killed by SIGXCPU)
+  or `wall_clock_limit` (the parent stopped waiting); `stopped` when a signal from outside ended it
+  (SIGKILL, SIGTERM, SIGINT, SIGHUP); `crashed` for any other signal (SIGSEGV, SIGBUS, SIGABRT, …,
+  named in the detail; remembered the second time in a row, like a wall-clock stop). The child
+  writes no core file (`RLIMIT_CORE` 0) and sets its `oom_score_adj` to 1000, so that the kernel's
+  out-of-memory killer takes it first; a wait past `wait_seconds` is `busy`. (`resource_limit`, the one word of earlier releases
+  for all four, is no longer given.)
 - **Input bounds**: stored or deflated members only; a member read unpacks to at most 200 times its
   packed size (64 MiB at least) and 160 GiB, the members read together to 200 times the archive's packed
   bytes (64 MiB at least), a reading pass to 160 GiB, checked first on the sizes the central directory
   declares (refused before a byte is read), then as read; GTFS records ≤1 MiB and ≤200 fields,
   ids ≤255 characters, ≤1,000,000 called stops; NeTEx nesting ≤64, text runs and attributes ≤1 MiB,
-  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 journey groups, ≤2,000,000
-  assignments and Quays, no entity declaration (internal ones included), no external DTD loaded;
+  tokens ≤2 MiB, ≤200,000 elements in a read element, ≤1,000,000 distinct journey groups and as
+  many (pattern, group) pairs, ≤4,000,000 assignments and called scheduled stop points
+  (4 million, the owner's decision of 16 October: measured 951 MiB peak for 2.85 GB of
+  per-journey points, about 4 million, under the unchanged 2 GiB child limit), ≤2,000,000
+  Quays and StopPlaces, no entity declaration (internal ones included), no external DTD loaded;
   ≤200,000 stations and ≤1,000 raw codes a station. Past one: `input_too_large` / `too_many_rows`.
 - **Streaming and time**: no archive is unpacked or held. Measured: GTFS 291 MiB unpacked (200,000
   rail trips) in 24 s, peak RSS 99 MiB; a single-file NeTEx of 538 MiB (200,000 journeys) in 56 s,
@@ -464,9 +473,28 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   304 s), peak RSS 198 MiB; a GTFS of 40 million stop times in 57 s (before, 127 s), peak RSS
   100 MiB. A national NeTEx of 2 GB zipped (~40 GB unpacked) takes about 11 minutes, so
   `RLIMIT_CPU` is 40 minutes (twice an archive packing 30 times, on a slower core).
+- **NeTEx memory model** (production, 15 October: two national NeTEx archives stopped at the memory
+  limit): what the reader keeps grows with the network, never with the journeys or their passing
+  times, and every structure is capped. Pass 1 keeps the Lines and Routes, each distinct journey
+  group (Line, mode, submode, operators) once, by number, and per pattern a *tally* of rail journeys
+  by group number (one int, `count << 32 | group`, until a second group comes, then a small dict);
+  a journey with direct `calls` adds to the tally of each called point at once (nothing per journey).
+  Pass 2 keeps per assignment only the number of its (Quay, StopPlace) pair, per called point its
+  tally, the StopPlace structure and the Quays; the tallies go to the places at the end, and the
+  pattern and point tables are freed before pass 3. Measured per entry: about 250 bytes for a point
+  with its assignment (before: about 1.2 KB, a `Counter`, a dict of sets and a list of tuples), about
+  130 bytes for a pattern (before: about 500). The caps were set before this model: a crafted file reaching every
+  one of them at once (1 million pattern groups and distinct groups, 4 million points and assignments
+  to as many distinct places, 2 million Quays and StopPlaces) would take about 4.6 GB and end `memory_limit`
+  (remembered); a national feed, whose points and places are shared, takes a few hundred MiB. A synthetic export that gives every journey its own pattern and scheduled stop
+  points (1 GB unpacked, 1.4 million assignments) peaked at 1,758 MiB RSS before, 372 MiB now; at
+  2.85 GB (about 4 million assignments) it ran out of memory before, and is extracted now at
+  951 MiB, 120 s
+  (`scripts/bench_station_extract.py --per-journey --no-mode`); the shapes that share their points
+  are unchanged (about 100 MiB). A Call's `Arrival` and `Departure` are dropped before expat.
 - **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,
-  `no_stop_place`, `no_rail_stop`, the MSMM limits, a `resource_limit` of memory or processor time,
-  of the wall clock the second time in a row) is kept as `<cache name>.failed` with the format read and
+  `no_stop_place`, `no_rail_stop`, the MSMM limits, `memory_limit`, `cpu_limit`; `wall_clock_limit` and
+  `crashed` the second time in a row with the same reason) is kept as `<cache name>.failed` with the format read and
   the signature of every bound and of the readers' code; the next caller (cache-only too) gets the
   reason at once until the archive, the format, the extractor, a bound or the readers' code changes. The warm makes
   the smallest timetable files first; a send pass sends first the feeds that need no extraction,

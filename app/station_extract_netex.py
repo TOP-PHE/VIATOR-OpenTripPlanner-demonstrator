@@ -43,6 +43,18 @@ still noted as held by the member. Inside the elements a pass builds, the
 subtrees of `_UNREAD` are not built either (an element written with a
 namespace prefix other than the root's is not cut, only not built).
 
+**Memory.** What is kept grows with the network, never with the journeys
+or their passing times: each distinct journey group (Line, mode, submode,
+operators) once, by number (`_Groups`); per pattern, per called point and
+per place a tally (`_Tally`: one int until a second group comes); per
+assignment the number of its (Quay, StopPlace) pair; a journey with direct
+calls adds to its points at once. Some 250 bytes per point with its
+assignment (1.2 KB before 15 October: an export that gives every journey its
+own scheduled stop points has as many as calls, and spent the child's 2 GiB
+near 1.6 million). Every table has its cap (`GROUPS_MAX`, `POINTS_MAX`,
+`ASSIGNMENTS_MAX`, `QUAYS_MAX`, `STOP_PLACES_MAX`); a crafted file reaching
+all of them at once would still pass 2 GiB, and ends `memory_limit`.
+
 Measured on a synthetic national-shaped EPIP export (`scripts/
 bench_station_extract.py`; one shared file of StopPlaces, one file per line
 with its frames, the passing times most of the bytes, packed 20 times): see
@@ -119,6 +131,7 @@ _PROLOG_PIECE = 1024
 # expat's own guard against amplification (a few KB that unfold to GB), when
 # the expat in use has it.
 _AMPLIFICATION_MAX = 100.0
+_EXPAT_NO_MEMORY = expat.errors.codes[expat.errors.XML_ERROR_NO_MEMORY]
 
 # The elements each pass reads.
 _JOURNEYS = frozenset({"Line", "Route", "ServiceJourney"})
@@ -127,7 +140,8 @@ _PLACES = frozenset({"PassengerStopAssignment", "StopPlace"})
 _DETAILS = frozenset({"StopPlace"})
 _ALL = _JOURNEYS | _PATTERNS | _PLACES
 # Inside the elements read, the subtrees no pass reads (the bulk of a
-# timetable: passing times, links, equipment) are not built.
+# timetable: passing times, links, equipment, a Call's Arrival and Departure)
+# are not built.
 _UNREAD = frozenset(
     {
         "passingTimes",
@@ -142,6 +156,8 @@ _UNREAD = frozenset(
         "levels",
         "facilities",
         "alternativeNames",
+        "Arrival",
+        "Departure",
     }
 )
 # The elements dropped from the bytes before expat (`SkipFilter`): those of
@@ -409,6 +425,10 @@ def _walk(
             builder.ready.clear()
         feeder.finish()
     except expat.ExpatError as exc:
+        if exc.code == _EXPAT_NO_MEMORY:
+            # expat could not allocate (the child's memory limit): a memory
+            # stop, never a malformed file.
+            raise MemoryError from None
         raise ArchiveError("bad_archive", f"XML not well-formed at line {exc.lineno}") from None
     yield from builder.ready
 
@@ -448,6 +468,68 @@ class _Archive:
             self.holds[name] = seen
 
 
+# ── Journey groups and tallies ────────────────────────────────────────────
+
+# A group of journeys: (line ref, mode, submode, operators).
+_Group = tuple[str, str, str, tuple[str, ...]]
+
+# A tally: the rail calls kept for a pattern, a point or a place, by group
+# number. Most hold one group: then one int, `count << _SHIFT | group`
+# (some 30 bytes, where a Counter takes 200); a dict {group: count} once a
+# second group comes. This is what keeps memory small when an export gives
+# every journey its own pattern, or its own scheduled stop points.
+_Tally = int | dict[int, int]
+_SHIFT = 32
+_MASK = (1 << _SHIFT) - 1
+
+
+def _tally_add(table: dict[Any, _Tally], key: Any, group: int, count: int) -> bool:
+    """Add `count` calls of `group` to `table[key]`; True when `key` is new."""
+    old = table.get(key)
+    if old is None:
+        table[key] = count << _SHIFT | group
+        return True
+    if isinstance(old, int):
+        if old & _MASK == group:
+            table[key] = old + (count << _SHIFT)
+            return False
+        old = table[key] = {old & _MASK: old >> _SHIFT}
+    old[group] = old.get(group, 0) + count
+    return False
+
+
+def _tally_items(tally: _Tally) -> Iterable[tuple[int, int]]:
+    """The (group, count) pairs of a tally."""
+    if isinstance(tally, int):
+        return ((tally & _MASK, tally >> _SHIFT),)
+    return tally.items()
+
+
+def _tally_groups(tally: _Tally) -> int:
+    return 1 if isinstance(tally, int) else len(tally)
+
+
+class _Groups:
+    """Every distinct journey group, by number: a tally holds the number,
+    never the group's strings."""
+
+    def __init__(self) -> None:
+        self.ids: dict[_Group, int] = {}
+        self.groups: list[_Group] = []
+
+    def id_of(self, group: _Group) -> int:
+        number = self.ids.get(group)
+        if number is None:
+            if len(self.groups) >= GROUPS_MAX:
+                raise ArchiveError("input_too_large", _TOO_MANY_GROUPS)
+            number = self.ids[group] = len(self.groups)
+            self.groups.append(group)
+        return number
+
+
+_TOO_MANY_GROUPS = "more journey groups than VIATOR keeps"
+
+
 # ── Pass 1: lines, routes and journeys ────────────────────────────────────
 
 
@@ -477,71 +559,99 @@ def _with_line(mode: str, submode: str, info: _LineInfo | None) -> tuple[str, st
     return mode, submode
 
 
-# A group of journeys: (line ref, mode, submode, operators) -> count.
-_Group = tuple[str, str, str, tuple[str, ...]]
+# The scheduled stop points kept with calls, at most: those of the rail
+# patterns, and those a journey without a pattern calls at whose mode is not
+# yet known to be other than rail (its Line may come later in the archive;
+# such points are dropped at the end of pass 1, but counted until then).
+# Past it the archive is refused (`input_too_large`) before their tallies
+# take more memory.
+# 4 million (owner's decision, 16 October): an export that gives every
+# journey its own scheduled stop points has one per call; measured 951 MiB
+# for 2.85 GB of such XML (some 4 million), under the child's 2 GiB.
+POINTS_MAX = 4_000_000
 
 
 @dataclass
 class _Journeys:
+    """What pass 1 keeps: the Lines and Routes (their few fields), the groups,
+    and the rail calls by pattern (`by_pattern`) or, for the journeys that
+    name no pattern, already by scheduled stop point (`points`)."""
+
     lines: dict[str, _LineInfo] = field(default_factory=dict)
     routes: dict[str, str] = field(default_factory=dict)
-    by_pattern: dict[str, collections.Counter[_Group]] = field(default_factory=dict)
-    by_points: dict[tuple[str, ...], collections.Counter[_Group]] = field(default_factory=dict)
-    groups: int = 0
+    groups: _Groups = field(default_factory=_Groups)
+    by_pattern: dict[str, _Tally] = field(default_factory=dict)
+    points: dict[str, _Tally] = field(default_factory=dict)
+    pairs: int = 0  # (pattern, group) pairs in `by_pattern`
 
-    def add(self, table: dict[Any, collections.Counter[_Group]], key: Any, group: _Group) -> None:
-        counter = table.setdefault(key, collections.Counter())
-        if group not in counter:
-            self.groups += 1
-            if self.groups > GROUPS_MAX:
-                raise ArchiveError("input_too_large", "more journey groups than VIATOR keeps")
-        counter[group] += 1
+    def add_pattern(self, pattern: str, group: int) -> None:
+        old = self.by_pattern.get(pattern)
+        before = 0 if old is None else _tally_groups(old)
+        _tally_add(self.by_pattern, pattern, group, 1)
+        if _tally_groups(self.by_pattern[pattern]) > before:
+            self.pairs += 1
+            if self.pairs > GROUPS_MAX:
+                raise ArchiveError("input_too_large", _TOO_MANY_GROUPS)
+
+    def add_point(self, point: str, group: int, count: int) -> None:
+        """Add calls to a point; past `POINTS_MAX` points, refuse."""
+        if _tally_add(self.points, point, group, count) and len(self.points) > POINTS_MAX:
+            raise ArchiveError("input_too_large", "more called points than VIATOR keeps")
+
+    def rail(self, group: int) -> str | None:
+        """The MSMM mode of a group (its Line's mode when it has none), None
+        when it is not rail, `_UNKNOWN` when no mode is given."""
+        line, mode, submode, _ = self.groups.groups[group]
+        return _mode_of(*_with_line(mode, submode, self.lines.get(line)))
+
+    def operators_of(self, group: int) -> tuple[str, ...]:
+        line, _, _, operators = self.groups.groups[group]
+        info = self.lines.get(line)
+        return operators + (info.operators if info else ())
 
 
 def _journey(element: Element, found: _Journeys) -> None:
     """A ServiceJourney, kept unless its mode (its own, or its Line's when
-    that Line was read already) is not rail."""
+    that Line was read already) is not rail. One that names no pattern adds
+    its calls to its points at once: nothing is kept per journey."""
     line = _ref(element, "LineRef")
     mode, submode = _with_line(
         _text(element, "TransportMode"), _submode(element), found.lines.get(line)
     )
     if _mode_of(mode, submode) is None:
         return
-    group = (line, mode, submode, _operators(element))
+    group = found.groups.id_of((line, mode, submode, _operators(element)))
     pattern = _ref(element, "ServiceJourneyPatternRef", "JourneyPatternRef")
     if pattern:
-        found.add(found.by_pattern, pattern, group)
+        found.add_pattern(pattern, group)
         return
     calls = _child(element, "calls")
-    points = tuple(
-        ref
-        for call in (calls if calls is not None else ())
-        if (ref := _ref(call, "ScheduledStopPointRef"))
-    )
-    if points:
-        found.add(found.by_points, points, group)
+    for call in calls if calls is not None else ():
+        if ref := _ref(call, "ScheduledStopPointRef"):
+            found.add_point(ref, group, 1)
 
 
-def _keep_rail(table: dict[Any, collections.Counter[_Group]], lines: dict[str, _LineInfo]) -> None:
-    """Drop the groups whose Line, read after them, says they are not rail."""
-    kept_table = {}
-    for key, groups in table.items():
-        kept = collections.Counter(
-            {
-                group: count
-                for group, count in groups.items()
-                if _mode_of(*_with_line(group[1], group[2], lines.get(group[0]))) is not None
-            }
-        )
-        if kept:
-            kept_table[key] = kept
-    table.clear()
-    table.update(kept_table)
+def _keep_rail(table: dict[str, _Tally], found: _Journeys) -> None:
+    """Drop the groups whose Line, read after them, says they are not rail.
+    A key left with none is removed after the loop (the table never changes
+    size while it is iterated; replacing a value does not)."""
+    emptied: list[str] = []
+    for key, tally in table.items():
+        kept = {g: c for g, c in _tally_items(tally) if found.rail(g) is not None}
+        if not kept:
+            emptied.append(key)
+        elif len(kept) == 1:
+            ((group, count),) = kept.items()
+            table[key] = count << _SHIFT | group
+        else:
+            table[key] = kept
+    for key in emptied:
+        del table[key]
 
 
 def _read_journeys(archive: _Archive) -> _Journeys:
     """Lines, Routes and the rail journeys (or those whose mode is still
-    unknown), grouped by the pattern they follow (or, without one, by the
+    unknown), counted by the pattern they follow (or, without one, at the
     points they call at). A journey read before its Line is filtered once
     every Line is known."""
     found = _Journeys()
@@ -556,8 +666,8 @@ def _read_journeys(archive: _Archive) -> _Journeys:
             )
         elif ident and (line := _ref(element, "LineRef")):
             found.routes[ident] = line
-    _keep_rail(found.by_pattern, found.lines)
-    _keep_rail(found.by_points, found.lines)
+    _keep_rail(found.by_pattern, found)
+    _keep_rail(found.points, found)
     return found
 
 
@@ -566,7 +676,7 @@ def _read_journeys(archive: _Archive) -> _Journeys:
 
 @dataclass
 class _Use:
-    """Rail calls at one point or place, by mode (`_UNKNOWN` included)."""
+    """Rail calls at one place, by mode (`_UNKNOWN` included)."""
 
     calls: collections.Counter[str] = field(default_factory=collections.Counter)
     operators: dict[str, set[str]] = field(default_factory=dict)
@@ -574,10 +684,6 @@ class _Use:
     def add(self, mode: str, count: int, operators: Iterable[str]) -> None:
         self.calls[mode] += count
         self.operators.setdefault(mode, set()).update(operators)
-
-    def merge(self, other: _Use) -> None:
-        for mode, count in other.calls.items():
-            self.add(mode, count, other.operators.get(mode, ()))
 
 
 def _served(point: Element) -> bool:
@@ -596,50 +702,52 @@ def _pattern_line(element: Element, routes: dict[str, str]) -> str:
     return line
 
 
-def _add_groups(
-    use: dict[str, _Use],
-    points: Iterable[str],
-    groups: collections.Counter[_Group],
-    pattern_line: str,
-    lines: dict[str, _LineInfo],
-) -> None:
-    resolved: list[tuple[str, int, tuple[str, ...]]] = []
-    for (line, mode, submode, operators), count in groups.items():
-        info = lines.get(line or pattern_line)
-        rail = _mode_of(*_with_line(mode, submode, info))
-        if rail is None:
+def _rail_groups(tally: _Tally, pattern_line: str, found: _Journeys) -> list[tuple[int, int]]:
+    """The rail (group, count) pairs of a pattern's tally; a group without a
+    Line takes the pattern's."""
+    resolved: list[tuple[int, int]] = []
+    for group, count in _tally_items(tally):
+        line, mode, submode, operators = found.groups.groups[group]
+        if not line and pattern_line:
+            group = found.groups.id_of((pattern_line, mode, submode, operators))
+        if found.rail(group) is not None:
+            resolved.append((group, count))
+    return resolved
+
+
+def _served_points(element: Element) -> Iterator[str]:
+    """The scheduled stop points of a pattern where passengers may board or
+    alight."""
+    holder = _child(element, "pointsInSequence")
+    for point in holder if holder is not None else ():
+        if _local(point.tag) != "StopPointInJourneyPattern" or not _served(point):
             continue
-        resolved.append((rail, count, operators + (info.operators if info else ())))
-    if not resolved:
-        return
-    for point in points:
-        target = use.setdefault(point, _Use())
-        for rail, count, operators in resolved:
-            target.add(rail, count, operators)
+        if ref := _ref(point, "ScheduledStopPointRef"):
+            yield ref
 
 
-def _pattern(element: Element, found: _Journeys, use: dict[str, _Use]) -> None:
+def _pattern(element: Element, found: _Journeys) -> None:
     """A journey pattern a rail journey follows: its served points get the
     calls of those journeys."""
-    pattern_groups = found.by_pattern.get(element.get("id") or "")
-    if not pattern_groups:
+    tally = found.by_pattern.get(element.get("id") or "")
+    if tally is None:
         return
-    holder = _child(element, "pointsInSequence")
-    points = [
-        ref
-        for point in (holder if holder is not None else ())
-        if _local(point.tag) == "StopPointInJourneyPattern"
-        and _served(point)
-        and (ref := _ref(point, "ScheduledStopPointRef"))
-    ]
-    _add_groups(use, points, pattern_groups, _pattern_line(element, found.routes), found.lines)
+    resolved = _rail_groups(tally, _pattern_line(element, found.routes), found)
+    if not resolved:
+        return
+    for ref in _served_points(element):
+        for group, count in resolved:
+            found.add_point(ref, group, count)
 
 
 # ── Pass 2: patterns, assignments and the StopPlace structure ─────────────
 
-# The assignments and the Quays kept from that pass, each at most.
-ASSIGNMENTS_MAX = 2_000_000
+# The assignments, the Quays and the StopPlaces kept from that pass, each at
+# most.
+# The assignments with `POINTS_MAX` (one per point in such an export).
+ASSIGNMENTS_MAX = 4_000_000
 QUAYS_MAX = 2_000_000
+STOP_PLACES_MAX = 2_000_000
 
 # An assignment's place: (Quay ref, StopPlace ref), either may be empty.
 _Place = tuple[str, str]
@@ -647,12 +755,27 @@ _Place = tuple[str, str]
 
 @dataclass
 class _Places:
-    use: dict[_Place, _Use] = field(default_factory=dict)
+    """What pass 2 keeps. A place is known by its number in `pairs`; an
+    assignment keeps the number (an int, or a list for a point assigned more
+    than once), never its own copy of the refs."""
+
+    pairs: list[_Place] = field(default_factory=list)
+    pair_ids: dict[_Place, int] = field(default_factory=dict)
+    assignments: dict[str, int | list[int]] = field(default_factory=dict)
+    assigned: int = 0
+    use: dict[int, _Tally] = field(default_factory=dict)  # place number -> rail calls
     called: bool = False  # whether any scheduled stop point has a rail call
     defined: set[str] = field(default_factory=set)  # every StopPlace id of the archive
     parent: dict[str, str] = field(default_factory=dict)  # StopPlace -> ParentSiteRef
     quay_place: dict[str, str] = field(default_factory=dict)  # Quay -> StopPlace
     rail_places: set[str] = field(default_factory=set)  # StopPlaces that call themselves rail
+
+    def place_id(self, place: _Place) -> int:
+        number = self.pair_ids.get(place)
+        if number is None:
+            number = self.pair_ids[place] = len(self.pairs)
+            self.pairs.append(place)
+        return number
 
 
 def _quays(element: Element) -> list[Element]:
@@ -665,44 +788,50 @@ def _read_structure(archive: _Archive, found: _Journeys) -> _Places:
     its rail calls), every PassengerStopAssignment (point -> Quay and
     StopPlace) and the StopPlace structure; then the calls go to the places
     their points are assigned to."""
-    use: dict[str, _Use] = {}
-    for called, groups in found.by_points.items():
-        _add_groups(use, called, groups, "", found.lines)
-    assignments: dict[str, list[_Place]] = {}
     places = _Places()
     quays: dict[str, str] = {}
-    counts = [0]
     targets = _PATTERNS | _PLACES if found.by_pattern else _PLACES
     for element in archive.walk(targets, _DETAIL_ONLY):
         local = _local(element.tag)
         if local == "PassengerStopAssignment":
-            _note_assignment(element, assignments, counts)
+            _note_assignment(element, places)
         elif local == "StopPlace":
             _note_stop_place(element, places, quays)
         else:
-            _pattern(element, found, use)
-    for point, calls in use.items():
-        for place in assignments.get(point, ()):
-            places.use.setdefault(place, _Use()).merge(calls)
-    places.called = bool(use)
-    wanted = {place[0] for place in places.use if place[0]}
+            _pattern(element, found)
+    found.by_pattern.clear()
+    for point, tally in found.points.items():
+        numbers = places.assignments.get(point, ())
+        for number in (numbers,) if isinstance(numbers, int) else numbers:
+            for group, count in _tally_items(tally):
+                _tally_add(places.use, number, group, count)
+    places.called = bool(found.points)
+    found.points.clear()
+    places.assignments.clear()
+    places.pair_ids.clear()
+    wanted = {places.pairs[number][0] for number in places.use if places.pairs[number][0]}
     places.quay_place = {q: p for q, p in quays.items() if q in wanted}
     return places
 
 
-def _note_assignment(
-    element: Element, assignments: dict[str, list[_Place]], counts: list[int]
-) -> None:
+def _note_assignment(element: Element, places: _Places) -> None:
     """A PassengerStopAssignment: its point and its (Quay, StopPlace); which
     of the two places the point is settled once the Quays are known."""
     point = _ref(element, "ScheduledStopPointRef")
     place = (_ref(element, "QuayRef"), _ref(element, "StopPlaceRef"))
     if not point or not any(place):
         return
-    counts[0] += 1
-    if counts[0] > ASSIGNMENTS_MAX:
+    places.assigned += 1
+    if places.assigned > ASSIGNMENTS_MAX:
         raise ArchiveError("input_too_large", "more assignments than VIATOR keeps")
-    assignments.setdefault(point, []).append(place)
+    number = places.place_id(place)
+    old = places.assignments.get(point)
+    if old is None:
+        places.assignments[point] = number
+    elif isinstance(old, int):
+        places.assignments[point] = [old, number]
+    else:
+        old.append(number)
 
 
 def _calls_itself_rail(element: Element) -> bool:
@@ -720,6 +849,8 @@ def _note_stop_place(element: Element, places: _Places, quays: dict[str, str]) -
     if not ident:
         return
     places.defined.add(ident)
+    if len(places.defined) > STOP_PLACES_MAX:
+        raise ArchiveError("input_too_large", "more StopPlaces than VIATOR keeps")
     if parent := _ref(element, "ParentSiteRef"):
         places.parent[ident] = parent
     if _calls_itself_rail(element):
@@ -754,15 +885,26 @@ def _stop_place(place: _Place, places: _Places) -> str:
     return places.quay_place.get(quay) or stop_place
 
 
-def _stations(places: _Places) -> dict[str, Station]:
+def _use_of(tally: _Tally, found: _Journeys) -> _Use:
+    """The rail calls of a place by mode, with the operators of each mode."""
+    use = _Use()
+    for group, count in _tally_items(tally):
+        mode = found.rail(group)
+        if mode is not None:
+            use.add(mode, count, found.operators_of(group))
+    return use
+
+
+def _stations(places: _Places, found: _Journeys) -> dict[str, Station]:
     """Root StopPlace -> Station, with its calls, modes and operators."""
     stations: dict[str, Station] = {}
-    for place, use in places.use.items():
-        stop_place = _stop_place(place, places)
+    for number, tally in places.use.items():
+        stop_place = _stop_place(places.pairs[number], places)
         if not stop_place:
             continue
         rail_place = stop_place in places.rail_places
         root = _root(stop_place, places)
+        use = _use_of(tally, found)
         for mode, count in use.calls.items():
             if mode == _UNKNOWN:
                 if not rail_place:
@@ -911,15 +1053,15 @@ def read_netex(zf: zipfile.ZipFile) -> dict[str, Station]:
     archive defines no StopPlace or assigns no called point to one."""
     archive = _Archive(zf)
     found = _read_journeys(archive)
-    if not found.by_pattern and not found.by_points:
+    if not found.by_pattern and not found.points:
         return {}
     places = _read_structure(archive, found)
-    del found
     if not places.called:
         return {}
     if not places.defined or not places.use:
         raise ArchiveError("no_stop_place", "no StopPlace, or no assignment to one")
-    stations = _stations(places)
+    stations = _stations(places, found)
+    del found
     if stations:
         _read_details(archive, stations, places)
     return stations
