@@ -435,10 +435,14 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   (RAIL_SUBURBAN), a call where a trip neither picks up nor drops off not counted, rolled up to the
   `parent_station`; NeTEx `TransportMode` rail on the ServiceJourney or its Line (suburban by the
   chain's submodes), a journey with no mode counted at a StopPlace whose mode is rail or type
-  `railStation` and gives no other mode (since version 2 a value that names no mode, `unknown`,
-  `other`, `all`, `anyMode` and the deprecated `urbanRail`, is read as none, as MSMM's chain reads
-  every value it does not map, and the deprecated `intercityRail` as rail:
-  `station_extract_netex._mode`), rolled up through `ParentSiteRef` to a defined StopPlace,
+  `railStation` and gives no other mode (since version 2 a value that gives no information on the
+  mode, `unknown`, `all`, `anyMode`, is read as none, as MSMM's chain reads every value it does not
+  map (`import/offline-chain/nap_modes_be-it-netex.py`: `netex_mode_to_primitive` gives None,
+  `_prim_of` then takes the child StopPlace's mode or type); the deprecated `urbanRail` too, by
+  policy: NeTEx says "metro with MetroSubmode urbanRail, or in some few cases rail with RailSubmode
+  local", so the stop place decides, and a journey counted that way is RAIL_MAIN like any other
+  modeless one; the deprecated `intercityRail` is rail; `other`, a mode outside the list, stays not
+  rail, unlike MSMM's chain: `station_extract_netex._mode`), rolled up through `ParentSiteRef` to a defined StopPlace,
   positions from `Latitude`/`Longitude` or a `gml:pos` in EPSG:4326/4258, CRS84 or EPSG:2154 (the code
   matched exactly), or without a system (WGS84, latitude first, when the first value is ≤ 90).
 - **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072

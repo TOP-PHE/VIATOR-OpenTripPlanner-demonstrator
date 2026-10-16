@@ -273,7 +273,7 @@ class ValueTally:
 
     @property
     def total(self) -> int:
-        return sum(self.counts.values())
+        return sum(max(0, count) for count in self.counts.values())
 
     def add(self, raw: str, count: int = 1) -> None:
         value = NO_VALUE
@@ -285,7 +285,7 @@ class ValueTally:
 
     def top(self) -> list[tuple[str, int]]:
         """The (value, count) pairs with a count, the most frequent first."""
-        found = [item for item in self.counts.items() if item[1]]
+        found = [item for item in self.counts.items() if item[1] > 0]
         return sorted(found, key=lambda item: (-item[1], item[0]))
 
     def text(self, limit: int) -> str:

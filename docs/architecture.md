@@ -1023,8 +1023,8 @@ available); 200,000 stations and 1,000 raw codes a station everywhere. Past a bo
 suburban (`_is_rail_route_type` of the cross-border filter is deliberately *not* reused: it drops
 the S-Bahn types), and NeTEx `TransportMode` rail on the journey or its Line, a journey with no mode
 at all counting at a StopPlace whose mode is rail, or that gives no other mode and is a
-`railStation` (a value that names no mode, `unknown`, `other`, `all`, `anyMode`, `urbanRail`, is
-none; the deprecated `intercityRail` is rail); a rail journey without a submode takes its Line's. One row per station: the GTFS
+`railStation` (a value that gives no information on the mode, `unknown`, `all`, `anyMode`,
+`urbanRail`, is none; the deprecated `intercityRail` is rail; `other` stays not rail); a rail journey without a submode takes its Line's. One row per station: the GTFS
 `parent_station` (the stop itself when it has none or names an undefined one), the NeTEx root
 StopPlace through `ParentSiteRef` (a dangling or cyclic parent is no parent); an assignment that names
 a Quay and a StopPlace places the call at the Quay's StopPlace when the Quay is known, else at the

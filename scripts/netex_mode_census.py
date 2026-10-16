@@ -10,7 +10,7 @@ Send back the whole of `census.txt`.
 
 Read-only and standard library only (Python 3.9 or later): every XML member
 of the zip is streamed through expat, never unpacked to disk and never held
-whole (a few kilobytes of memory whatever the size). It prints counts and
+whole (a few megabytes of memory whatever the size). It prints counts and
 the names of NeTEx elements only, and the values of the mode elements
 (`TransportMode`, `VehicleMode`, `StopPlaceType`, the `...Submode`s) when a
 value is one word of letters, as the words of an enumeration are; any other
@@ -87,8 +87,16 @@ class Refused(Exception):
     """A document this census does not read (an entity declared)."""
 
 
+OTHER_NAMESPACE = "(other ns)"
+
+
 def _local(name: str) -> str:
-    return name.rpartition("}")[2]
+    """The local name of a NeTEx element (or of one without a namespace);
+    `(other ns)` for an element of any other namespace."""
+    namespace, _, local = name.rpartition("}")
+    if namespace and "netex" not in namespace:
+        return OTHER_NAMESPACE
+    return local
 
 
 def _namespace(name: str) -> str:
@@ -307,7 +315,8 @@ def main(argv: list[str] | None = None, out: IO[str] | None = None) -> int:
     stream = out if out is not None else sys.stdout
     try:
         census, members, others = read_archive(args.archive)
-    except (OSError, zipfile.BadZipFile, expat.ExpatError, Refused) as exc:
+    except Exception as exc:  # any end, an encrypted or oddly packed member too: its type only,
+        # never a traceback, which would name the member
         print(f"netex mode census: cannot read the archive ({type(exc).__name__})", file=stream)
         return 1
     for line in report(census, members, others):

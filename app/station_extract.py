@@ -99,9 +99,9 @@ log = logging.getLogger(__name__)
 # The version of the rules below. MSMM keeps one version of an archive per
 # extractor version (MSMM 22.3, point 1): raise it whenever the rows written
 # for the same archive would change, so the module receives the new extract.
-# 2 (16 October): a NeTEx `TransportMode` that names no mode (`unknown`,
-# `other`, `all`, `anyMode`, `urbanRail`) is read as none, `intercityRail`
-# as rail (`station_extract_netex._mode`).
+# 2 (16 October): a NeTEx `TransportMode` that gives no information on the
+# mode (`unknown`, `all`, `anyMode`, `urbanRail`) is read as none,
+# `intercityRail` as rail (`station_extract_netex._mode`).
 EXTRACTOR_VERSION = "viator-stop-extract-2"
 
 # The feed keys MSMM accepts (MSMM `feed_intake.FEED_KEY_PATTERN`).

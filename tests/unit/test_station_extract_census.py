@@ -16,6 +16,8 @@ import importlib.util
 import io
 import json
 import logging
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ from tests.unit.test_station_extract import (
 )
 
 SHA = "a" * 64
+TEMPLATE = Path(__file__).resolve().parents[2] / "app" / "templates" / "admin" / "sessions.html"
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "netex_mode_census.py"
 
 
@@ -344,7 +347,7 @@ def _one_station(tmp_path: Path, journey: str, line: str, place: str, kind: str 
 BOTH = {"ZZ:StopPlace:991", "ZZ:StopPlace:992"}
 
 
-@pytest.mark.parametrize("mode", ["unknown", "other", "all", "anyMode", "urbanRail"])
+@pytest.mark.parametrize("mode", ["unknown", "all", "anyMode", "urbanRail"])
 def test_a_journey_mode_that_names_no_mode_lets_the_station_decide(
     tmp_path: Path, mode: str
 ) -> None:
@@ -352,6 +355,16 @@ def test_a_journey_mode_that_names_no_mode_lets_the_station_decide(
     assert _one_station(tmp_path / "b", mode, "", "", "busStation") == set()
     assert _one_station(tmp_path / "c", "", mode, "", "railStation") == BOTH  # the Line's
     assert _one_station(tmp_path / "d", mode, "rail", "", "") == BOTH  # the Line says rail
+
+
+def test_other_is_a_mode_that_is_not_rail(tmp_path: Path) -> None:
+    """`other` says a mode outside NeTEx's list: not rail, at a railway
+    station too; a journey that says `unknown` takes its Line's bus."""
+    assert _one_station(tmp_path, "", "other", "", "railStation") == set()
+    assert _one_station(tmp_path / "b", "other", "", "", "railStation") == set()
+    assert _one_station(tmp_path / "c", "unknown", "bus", "", "railStation") == set()
+    assert station_extract_netex._mode("other") == "other"
+    assert station_extract_netex._mode("unknown") == ""
 
 
 def test_intercity_rail_is_rail(tmp_path: Path) -> None:
@@ -385,6 +398,52 @@ def test_the_census_follows_the_line_a_pattern_gives(tmp_path: Path) -> None:
     )
     rail = _delivery(_site(_place(1), _place(2)) + _lines("rail") + patterns + _journeys(2))
     assert set(_rows(tmp_path / "r", {"zz.xml": rail})) == BOTH
+
+
+def test_a_pattern_defined_twice_is_counted_once(tmp_path: Path) -> None:
+    """A pattern id defined twice (a versioned export), naming a bus Line,
+    followed by journeys that name none: the census moves them once, never
+    below zero, and the summary stays of its form."""
+    patterns = _bus_pattern()
+    document = _delivery(
+        _site(_place(1), _place(2)) + _lines("bus") + patterns + patterns + _journeys(1)
+    )
+    error = _refused(tmp_path, {"zz.xml": document})
+    fields = _fields(error.census)
+    assert (fields["patterns"], fields["patterns_used"]) == ("2", "1")
+    assert (fields["line_from_pattern"], fields["kept"]) == ("1", "0")
+    assert (
+        error.summary == "1 lines (bus 1), 1 journeys (0 kept), 0 stations, 2 stop places (0 rail)"
+    )
+    assert SUMMARY.fullmatch(error.summary)
+
+
+def test_a_pattern_naming_an_undefined_line_gives_none(tmp_path: Path) -> None:
+    document = _delivery(_site(_place(1), _place(2)) + _bus_pattern() + _journeys(2))
+    error = _refused(tmp_path, {"zz.xml": document})
+    fields = _fields(error.census)
+    assert (fields["no_line_ref"], fields["line_from_pattern"], fields["kept"]) == (
+        "2",
+        "0",
+        "none:2",
+    )
+    assert "2 without a line" in error.summary
+
+
+def test_a_tally_never_shows_a_negative_count() -> None:
+    tally = ValueTally()
+    tally.add("rail", 2)
+    tally.add("none", -1)
+    assert tally.total == 2
+    assert tally.top() == [("rail", 2)]
+
+
+def _bus_pattern() -> str:
+    """The pattern, naming the Line ZZ:Line:91 through its RouteView."""
+    return PATTERNS.replace(
+        '<ServiceJourneyPattern id="ZZ:SJP:1">',
+        '<ServiceJourneyPattern id="ZZ:SJP:1"><RouteView><LineRef ref="ZZ:Line:91"/></RouteView>',
+    )
 
 
 # ── Remembered, logged, sent to the admin status ──────────────────────────
@@ -663,7 +722,70 @@ def test_the_script_bounds_what_it_keeps(tmp_path: Path) -> None:
     assert "Line/.../c/d/e/TransportMode: rail 1" in out
 
 
-def test_the_extractor_names_the_mode_words_it_reads() -> None:
-    """The values read as no mode are words of NeTEx's enumeration."""
-    assert {"unknown", "other", "all", "anyMode", "urbanRail"} == station_extract_netex._NO_MODE
-    assert {"intercityRail"} == station_extract_netex._RAIL_ALIASES
+def test_the_script_never_names_a_member_on_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An encrypted member (RuntimeError) or one packed in a way zipfile
+    cannot read (NotImplementedError): the type only, never the message,
+    which names the member."""
+    module = _script()
+    for error in (RuntimeError, NotImplementedError, KeyError):
+
+        def fail(_path: str, error: type[Exception] = error) -> Any:
+            raise error("File zz_Zzstadt.xml is encrypted")
+
+        monkeypatch.setattr(module, "read_archive", fail)
+        out = io.StringIO()
+        assert module.main([str(tmp_path / "zz.zip")], out=out) == 1
+        assert out.getvalue() == f"netex mode census: cannot read the archive ({error.__name__})\n"
+
+
+def test_the_script_names_no_other_namespace(tmp_path: Path) -> None:
+    foreign = (
+        '<zz:extension xmlns:zz="https://zz.example.invalid/ns">'
+        "<TransportMode>rail</TransportMode></zz:extension>"
+    )
+    document = _delivery(_lines("bus").replace("</Line>", foreign + "</Line>"))
+    code, out = _run_script(_zip(tmp_path / "f.zip", {"a.xml": document}))
+    assert code == 0
+    assert "Line/(other ns)/TransportMode: rail 1" in out
+    assert "Line/TransportMode: bus 1" in out
+    assert "extension" not in "\n".join(out)
+
+
+_RENDER = """
+const escHTML = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const escAttr = escHTML;
+const _relativeTimeShort = () => '';
+%(block)s
+console.log(JSON.stringify(%(cases)s.map(feedStationExtractHTML)));
+"""
+
+
+def test_the_station_module_column_shows_what_the_extractor_saw() -> None:
+    """The Sessions page's JS, run in Node: `saw: <summary>` under the
+    reason's sentence, escaped; nothing without a summary."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    text = TEMPLATE.read_text(encoding="utf-8")
+    block = text[text.index("const _STATION_EXTRACT_FLAVOURS") : text.index("function feedRowHTML")]
+    base = {"text": "skipped", "state": "skipped", "reason": "no_rail_stop"}
+    cases = [
+        {**base, "detail": "no rail station in this feed", "summary": "1 lines (bus 1)"},
+        {**base, "detail": None, "summary": "<b>zz</b>"},
+        {**base, "detail": "no rail station in this feed", "summary": None},
+    ]
+    script = _RENDER % {"block": block, "cases": json.dumps(cases)}
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+    saw, escaped, without = json.loads(out.stdout)
+    assert saw.endswith(
+        '<div class="feed-extract-detail">no rail station in this feed</div>'
+        '<div class="feed-extract-detail" title="What the extractor saw in this feed">'
+        "saw: 1 lines (bus 1)</div>"
+    )
+    assert "saw: &lt;b&gt;zz&lt;/b&gt;</div>" in escaped
+    assert "<b>" not in escaped
+    assert "saw:" not in without
+    assert without.endswith("no rail station in this feed</div>")

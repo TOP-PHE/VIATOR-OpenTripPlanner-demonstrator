@@ -3230,18 +3230,33 @@ the extracts changes no graph build.
     neither the journeys nor the stop places say rail; stations found but
     not written — the reason is in `not written` (a position in a system
     VIATOR does not read, for one).
-  - A NeTEx `TransportMode` that names no mode — `unknown`, `other`, `all`,
-    `anyMode` and the deprecated `urbanRail` — counts as none (the stop
-    place decides), and the deprecated `intercityRail` as rail (since
-    16 October, extractor version 2; before, such journeys were dropped as
-    not rail). The new extractor version makes every feed's extract again
-    once, smallest files first, and sends each to the module as a new
-    version; a remembered `no_rail_stop` is read again at the next refresh,
-    nothing to delete.
+  - A NeTEx `TransportMode` that gives no information on the mode —
+    `unknown`, `all`, `anyMode` and the deprecated `urbanRail` (metro or
+    rail, the stop place tells) — counts as none (the stop place decides),
+    and the deprecated `intercityRail` as rail (since 16 October, extractor
+    version 2; before, such journeys were dropped as not rail); `other` (a
+    mode outside NeTEx's list) stays not rail. The new extractor version
+    makes every feed's extract again once, smallest files first, and sends
+    each to the module as a new version; a remembered `no_rail_stop` is
+    read again at the next refresh, nothing to delete.
+  - **How long that takes.** One extraction at a time, in the background:
+    the small feeds (most GTFS) are made and sent again within the first
+    pass after the release's first refresh; a large national NeTEx takes
+    minutes each (some 60 MB of XML a second), ends `skipped budget` in a
+    pass whose time it outlasts and is sent by a later pass from the cache,
+    so allow a few refreshes or rebuilds (some hours for a session with
+    several national feeds) before every feed shows `sent` again. In the
+    module a feed it already knows keeps its state (an accepted feed stays
+    accepted: the intake never changes the state of a known feed); the new
+    version passes the module's guard and becomes the active one, or is
+    held for review there when it differs (fewer stations, other
+    operators). A feed new to the module (one that never gave an extract,
+    such as a national feed that ended `no_rail_stop`) arrives `pending` and
+    waits for an administrator's acceptance in the module.
   - **When the census is not enough** (a NeTEx feed that should have rail
     stations), run the census script on the feed's zip, on your own machine
     or the server, with any Python 3.9 or later and nothing else installed
-    (it only reads the zip, a few kilobytes of memory, a minute or two for
+    (it only reads the zip, a few megabytes of memory, a minute or two for
     a large national file):
 
     ```bash
