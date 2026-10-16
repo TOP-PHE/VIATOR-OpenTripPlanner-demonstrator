@@ -508,3 +508,227 @@ console.log(JSON.stringify({
     )
     assert "+00:00" not in result["text"]
     assert result["other"] is None
+
+
+# ── one provider alone (the provider card's Refresh) ─────────────────────
+
+
+def _single(**changes: Any) -> dict[str, Any]:
+    record = _record(
+        scope="provider",
+        provider_id="ZZRAIL",
+        total=1,
+        done=0,
+        fetched=0,
+        unchanged=0,
+        failed=0,
+        failed_keys=[],
+        elapsed_seconds=99,
+        current=[_step("checking_structure", scanned=9_900_000, scan_total=99_000_000)],
+    )
+    record.update(changes)
+    return record
+
+
+def _titles(result: dict[str, Any]) -> list[tuple[str, str]]:
+    return [(block["children"][0]["text"], block["state"]) for block in result["tree"]["children"]]
+
+
+def test_a_provider_alone_shows_its_steps_above_the_session_result() -> None:
+    whole = _record(state="finished", finished_at="2026-10-15T08:00:00+00:00", current=[])
+    result = _render({"providers": whole, "osm": None, "single": [_single()]})
+    assert _titles(result) == [
+        ("Provider refresh — ZZRAIL only", "running"),
+        ("Provider refresh", "finished"),
+    ]
+    assert _lines(result, 0) == [
+        "Provider refresh — ZZRAIL only",
+        "Running — 0 / 1 done · 0 skipped (kept previous file) · 1 min 39 s",
+        "Now: provider[ZZRAIL].timetable(netex_epip) — checking structure,"
+        " 9.9 MB of 99.0 MB (10 %) · for 18 min 0 s",
+    ]
+    assert _lines(result, 1)[1].startswith("Finished ")
+
+
+def _ended_single(extract: dict[str, Any]) -> dict[str, Any]:
+    return _single(
+        state="finished",
+        finished_at="2026-10-15T09:01:39+00:00",
+        done=1,
+        fetched=1,
+        current=[],
+        extract=extract,
+    )
+
+
+def _single_extract_line(extract: dict[str, Any]) -> str:
+    return _lines(_render({"single": [_ended_single(extract)]}))[-1]
+
+
+def _pass(state: str, **counts: Any) -> dict[str, Any]:
+    extract: dict[str, Any] = {
+        "state": state,
+        "total": 1,
+        "handled": 1 if state != "running" else 0,
+        "sent": 0,
+        "held": 0,
+        "refused": 0,
+        "unavailable": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "reasons": {},
+        "current": None,
+        "started_at": "2026-10-15T09:01:40+00:00",
+        "finished_at": "2026-10-15T09:02:00+00:00",
+    }
+    extract.update(counts)
+    return extract
+
+
+def test_a_provider_alone_follows_its_station_module_line() -> None:
+    lines = _lines(_render({"single": [_ended_single({"state": "queued"})]}))
+    assert lines[1].startswith("Finished ")
+    assert lines[1].endswith(
+        "— 1 fetched · 0 unchanged · 0 skipped (kept previous file) (took 1 min 39 s)"
+    )
+    assert lines[-1] == "Station module: queued — the extracts are sent after the refresh"
+    assert _single_extract_line(_pass("running", current="ZZRAIL")) == (
+        "Station module: running · now ZZRAIL"
+    )
+    assert _single_extract_line(_pass("running")) == "Station module: running"
+    for counts, outcome in (
+        ({"sent": 1}, "sent"),
+        ({"held": 1}, "already held"),
+        ({"skipped": 1, "reasons": {"budget": 1}}, "skipped (budget)"),
+        ({"refused": 1, "reasons": {"duplicate_stop": 1}}, "refused (duplicate_stop)"),
+        ({"handled": 0, "total": 0}, "nothing to send"),
+    ):
+        line = _single_extract_line(_pass("finished", **counts))
+        assert line.startswith("Station module: finished ")
+        assert line.endswith(f" — {outcome}")
+    assert _single_extract_line(_pass("error")).startswith("Station module: stopped by an error ")
+    assert _single_extract_line({"state": "off"}) == "Station module: not configured — nothing sent"
+    silent = _single_extract_line(
+        {"state": "interrupted", "updated_at": "2026-10-15T09:40:00+00:00"}
+    )
+    assert silent.startswith("Station module: interrupted — no news since ")
+
+
+def test_a_provider_alone_never_parses_a_value_as_html() -> None:
+    hostile = '<img src=x onerror="alert(99)">'
+    record = _ended_single(_pass("finished", skipped=1, reasons={hostile: 1}, current=hostile))
+    record["provider_id"] = hostile
+    result = _render({"single": [record]})
+    lines = _lines(result)
+    assert lines[0] == f"Provider refresh — {hostile} only"
+    assert lines[-1].endswith(f"— skipped ({hostile})")
+    assert result["created"] == 2 + len(lines)
+    nameless = _render({"single": [{**record, "provider_id": None}]})
+    assert _lines(nameless)[0] == "Provider refresh — one provider only"
+
+
+def test_a_record_without_single_providers_renders_as_before() -> None:
+    """A server of the previous version sends no `single`."""
+    result = _render({"providers": _record(), "osm": None})
+    assert _titles(result) == [("Provider refresh", "running")]
+    assert _render({"providers": None, "osm": None, "single": []})["hidden"] is True
+
+
+def test_refresh_providers_waits_for_a_provider_alone() -> None:
+    result = _render({"providers": None, "osm": None, "single": [_single()]})
+    providers, osm = result["buttons"]["refresh-providers"], result["buttons"]["refresh-osm"]
+    assert providers["disabled"] is True
+    assert providers["title"].startswith("A refresh of one provider is running")
+    assert osm["disabled"] is False
+    ended = _render({"single": [_ended_single({"state": "queued"})]})
+    assert ended["buttons"]["refresh-providers"]["disabled"] is False
+
+
+def test_polling_follows_a_provider_alone_then_stops() -> None:
+    def answer(single: dict[str, Any]) -> dict[str, Any]:
+        return {"status": 200, "body": {"providers": None, "osm": None, "single": [single]}}
+
+    result = _poll(
+        [
+            answer(_single()),
+            answer(_ended_single({"state": "queued"})),
+            answer(_ended_single(_pass("running"))),
+            answer(_ended_single(_pass("finished", sent=1))),
+        ]
+    )
+    assert result["delays"] == [2500, 10000, 10000, 45000]
+
+
+_FINISH = (
+    _FAKE_DOM
+    + """
+const answers = %(answers)s;
+let calls = 0;
+const statusReads = [];
+const form = {tag: 'form'};
+const pageQuery = document.querySelector;
+document.querySelector = sel => (sel === 'form[data-form="config"][data-sid="zz"]' ? form : pageQuery(sel));
+function loadProviderStatuses(sid, f) { statusReads.push([sid, f === form, calls]); }
+const setTimeout = () => 1;
+const clearTimeout = () => {};
+async function fetch() {
+  const a = answers[Math.min(calls++, answers.length - 1)];
+  return {ok: true, status: 200, json: async () => a};
+}
+%(block)s
+(async () => {
+  progressPoll('zz').expanded = true;
+  for (let i = 0; i < answers.length; i++) await loadRefreshProgress('zz');
+  console.log(JSON.stringify({statusReads}));
+})();
+"""
+)
+
+
+def test_the_feed_status_table_is_read_once_when_everything_has_ended() -> None:
+    running = {"single": [_single()]}
+    follow = {"single": [_ended_single({"state": "queued"})]}
+    ended = {"single": [_ended_single(_pass("finished", sent=1))]}
+    answers = [ended, running, follow, ended, ended, running, ended]
+    result = _node(_FINISH % {"block": _block(), "answers": json.dumps(answers)})
+    # Not on the first read (nothing ran on this page), once after each end.
+    assert result["statusReads"] == [["zz", True, 4], ["zz", True, 7]]
+
+
+def test_a_provider_card_refresh_watches_the_block() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+    start = text.index("async function refreshOneProvider(form, refreshBtn)")
+    handler = text[start : text.index("\n}\n", start)]
+    assert handler.index("watchRefreshProgress(sid);") < handler.index("await fetch(")
+    assert "loadRefreshProgress(sid);" in handler[handler.index("finally") :]
+
+
+def test_the_refusal_toast_names_the_provider_alone() -> None:
+    script = (
+        _FAKE_DOM
+        + _block()
+        + _refusal_function()
+        + """
+const at = '2026-10-15T09:00:00+00:00';
+console.log(JSON.stringify({
+  local: progressTime(at),
+  same: refreshRefusalText({detail: {error: 'refresh_already_running', scope: 'provider',
+                                     provider_id: 'ZZRAIL', started_at: at}}),
+  whole: refreshRefusalText({detail: {error: 'provider_refresh_running', scope: 'provider',
+                                      provider_id: 'ZZRAIL', started_at: at}}),
+  session: refreshRefusalText({detail: {error: 'refresh_already_running', scope: 'providers',
+                                        provider_id: null, started_at: at}}),
+}));
+"""
+    )
+    result = _node(script)
+    local = result["local"]
+    assert result["same"] == (
+        f"A refresh of provider ZZRAIL is already running (started {local})."
+        " Its progress is shown under the buttons."
+    )
+    assert result["whole"] == (
+        f"A refresh of provider ZZRAIL alone is running (started {local}); Refresh providers"
+        " downloads it too. Its progress is shown under the buttons."
+    )
+    assert result["session"].startswith("A provider refresh of this session is already running")

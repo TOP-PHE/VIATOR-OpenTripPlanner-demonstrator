@@ -1629,7 +1629,13 @@ document.addEventListener('click', e => {
 
 // ── Refresh progress (issue #359) ─────────────────────────────────────
 // The server keeps one record per session for the latest provider refresh
-// and the latest OSM refresh (GET /sources/progress, app/refresh_progress.py):
+// and the latest OSM refresh, and one per provider for a provider card's
+// "Refresh" (`single`: the running ones and the newest ended one when it is
+// newer than the whole session's; GET /sources/progress, app/refresh_progress.py).
+// Blocks, top to bottom: the single-provider refreshes ("Provider refresh —
+// ZZRAIL only", newest first), the whole session's provider refresh, the OSM
+// refresh. When everything has ended after something ran, the feed status
+// table is read once more (its Station module column changed meanwhile):
 // read on every expand, so a reload or another browser shows the same; polled
 // every 2.5 s while a refresh runs, every 10 s while only the station-module
 // follow-up runs, every 45 s while the row stays expanded and nothing runs (so
@@ -1715,13 +1721,28 @@ function progressHeadLine(rec) {
   return `Interrupted — no news from the server since ${progressTime(rec.finished_at)} (it restarted or stopped) — ${rec.done} / ${rec.total} done, ${notReached} not reached; a new refresh may start`;
 }
 
-function progressExtractLine(x) {
+// One provider alone: its one feed's outcome, "sent", "skipped (budget)"…
+function progressSingleOutcome(x) {
+  const found = _EXTRACT_COUNT_WORDS.find(([k]) => x[k]);
+  if (!found) return 'nothing to send';
+  const reasons = Object.keys(x.reasons || {}).join(', ');
+  return reasons ? `${found[1]} (${reasons})` : found[1];
+}
+
+function progressSingleExtractLine(x) {
+  if (x.state === 'running') return `Station module: running${x.current ? ` · now ${x.current}` : ''}`;
+  const end = {finished: 'finished', cancelled: 'cancelled', error: 'stopped by an error'}[x.state] || x.state;
+  return `Station module: ${end} ${progressTime(x.finished_at)} — ${progressSingleOutcome(x)}`;
+}
+
+function progressExtractLine(x, single) {
   if (!x) return null;
   if (x.state === 'queued') return 'Station module: queued — the extracts are sent after the refresh';
   if (x.state === 'off') return 'Station module: not configured — nothing sent';
   if (x.state === 'interrupted') {
     return `Station module: interrupted — no news since ${progressTime(x.updated_at)} (the web process restarted or the pass stopped); the next refresh or rebuild sends what is missing`;
   }
+  if (single) return progressSingleExtractLine(x);
   const counts = _EXTRACT_COUNT_WORDS
     .filter(([k]) => x[k]).map(([k, word]) => `${x[k]} ${word}`).join(' · ') || 'nothing yet';
   const reasons = Object.entries(x.reasons || {}).map(([word, n]) => `${word} ${n}`).join(', ');
@@ -1742,19 +1763,26 @@ function progressLines(rec, kind) {
   if (rec.previous) {
     lines.push([`The refresh before this one was interrupted (started ${progressTime(rec.previous.started_at)}).`, 'hint']);
   }
-  if (kind === 'providers') {
-    const extract = progressExtractLine(rec.extract);
+  if (kind !== 'osm') {
+    const extract = progressExtractLine(rec.extract, kind === 'single');
     if (extract) lines.push([extract, '']);
   }
   return lines;
+}
+
+function progressTitle(rec, kind) {
+  if (kind === 'osm') return 'OSM refresh';
+  if (kind === 'single') return `Provider refresh — ${rec.provider_id || 'one provider'} only`;
+  return 'Provider refresh';
 }
 
 function progressBlock(rec, kind) {
   const block = document.createElement('div');
   block.className = 'refresh-progress-block';
   block.dataset.state = rec.state;
+  block.dataset.kind = kind;
   const title = document.createElement('strong');
-  title.textContent = kind === 'osm' ? 'OSM refresh' : 'Provider refresh';
+  title.textContent = progressTitle(rec, kind);
   block.append(title);
   progressLines(rec, kind).forEach(([text, cls]) => {
     const line = document.createElement('div');
@@ -1765,32 +1793,63 @@ function progressBlock(rec, kind) {
   return block;
 }
 
+// [record, kind] of every block, top to bottom.
+function progressRecords(body) {
+  if (!body) return [];
+  const singles = Array.isArray(body.single) ? body.single : [];
+  return [
+    ...singles.filter(Boolean).map(rec => [rec, 'single']),
+    ...['providers', 'osm'].filter(k => body[k]).map(k => [body[k], k]),
+  ];
+}
+
+// Why a refresh button is refused now, or null: its own kind runs, or (for
+// Refresh providers) a provider card's refresh runs (the server says 409).
+function progressButtonBusy(body, kind) {
+  const running = rec => Boolean(rec && rec.state === 'running');
+  if (running(body && body[kind])) return 'A refresh of this kind is running: its progress is shown below.';
+  if (kind === 'providers' && progressRecords(body).some(([rec, k]) => k === 'single' && running(rec))) {
+    return 'A refresh of one provider is running: Refresh providers can start when it has ended.';
+  }
+  return null;
+}
+
 function renderRefreshProgress(sid, body) {
   const section = document.querySelector(`[data-role="refresh-progress"][data-sid="${CSS.escape(sid)}"]`);
   if (!section) return;
-  const blocks = ['providers', 'osm'].filter(k => body && body[k]).map(k => progressBlock(body[k], k));
+  const blocks = progressRecords(body).map(([rec, kind]) => progressBlock(rec, kind));
   section.replaceChildren(...blocks);
   section.hidden = blocks.length === 0;
   [['providers', 'refresh-providers'], ['osm', 'refresh-osm']].forEach(([kind, action]) => {
     const btn = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"] button[data-action="${action}"]`);
     if (!btn) return;
     if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title || '';
-    const running = Boolean(body && body[kind] && body[kind].state === 'running');
-    btn.disabled = running || btn.dataset.busy === '1';
-    btn.title = running ? 'A refresh of this kind is running: its progress is shown below.' : btn.dataset.idleTitle;
+    const busy = progressButtonBusy(body, kind);
+    btn.disabled = Boolean(busy) || btn.dataset.busy === '1';
+    btn.title = busy || btn.dataset.idleTitle;
   });
 }
 
 // How long until the next read: null once nothing runs.
 function progressDelay(body) {
-  const recs = ['providers', 'osm'].map(k => body && body[k]).filter(Boolean);
+  const recs = progressRecords(body).map(([rec]) => rec);
   if (recs.some(r => r.state === 'running')) return _PROGRESS_POLL_MS;
   if (recs.some(r => r.extract && ['queued', 'running'].includes(r.extract.state))) return _PROGRESS_FOLLOW_UP_MS;
   return null;
 }
 
+// Something ran and now everything has ended: read the feed status table
+// once (its Station module column shows each feed's new outcome).
+function noteProgressActivity(sid, poll, active) {
+  const ended = poll.active && !active;
+  poll.active = active;
+  if (!ended) return;
+  const form = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"]`);
+  if (form) loadProviderStatuses(sid, form);
+}
+
 function progressPoll(sid) {
-  if (!_progressPolls.has(sid)) _progressPolls.set(sid, {timer: null, errorDelay: 0, watchUntil: 0, expanded: false});
+  if (!_progressPolls.has(sid)) _progressPolls.set(sid, {timer: null, errorDelay: 0, watchUntil: 0, expanded: false, active: false});
   return _progressPolls.get(sid);
 }
 
@@ -1807,6 +1866,7 @@ async function loadRefreshProgress(sid) {
     renderRefreshProgress(sid, body);
     poll.errorDelay = 0;
     next = progressDelay(body);
+    noteProgressActivity(sid, poll, next !== null);
   } catch (err) {
     poll.errorDelay = Math.min(poll.errorDelay ? poll.errorDelay * 2 : _PROGRESS_POLL_MS * 2, _PROGRESS_MAX_BACKOFF_MS);
     next = poll.errorDelay;
@@ -2095,11 +2155,19 @@ function attemptSummary(statuses, pids) {
 // failure. The pills are re-read either way — a failed attempt is a state.
 // A 409 `refresh_already_running` (issue #359): the start time in the
 // browser's own format, not the server's UTC text.
+// A 409 `provider_refresh_running`: Refresh providers while a provider
+// card's refresh runs (it would download that provider too).
 function refreshRefusalText(body) {
   const d = body && body.detail;
-  if (!d || d.error !== 'refresh_already_running') return null;
+  if (!d || !['refresh_already_running', 'provider_refresh_running'].includes(d.error)) return null;
+  const since = `(started ${progressTime(d.started_at)})`;
+  const tail = 'Its progress is shown under the buttons.';
+  if (d.error === 'provider_refresh_running') {
+    return `A refresh of provider ${d.provider_id} alone is running ${since}; Refresh providers downloads it too. ${tail}`;
+  }
+  if (d.scope === 'provider') return `A refresh of provider ${d.provider_id} is already running ${since}. ${tail}`;
   const what = d.scope === 'osm' ? 'An OSM refresh' : 'A provider refresh';
-  return `${what} of this session is already running (started ${progressTime(d.started_at)}). Its progress is shown under the buttons.`;
+  return `${what} of this session is already running ${since}. ${tail}`;
 }
 
 async function handleRefreshFailure(r, body, sid, form, marks) {
@@ -2160,6 +2228,7 @@ async function refreshOneProvider(form, refreshBtn) {
   const original = refreshBtn.textContent;
   refreshBtn.textContent = 'Downloading…';
   const marks = attemptMarks(sid, [pid]);
+  watchRefreshProgress(sid);
   try {
     const r = await fetch(`/api/sessions/${sid}/providers/${encodeURIComponent(pid)}/refresh`, {method: 'POST'});
     const body = await r.json().catch(() => ({}));
@@ -2171,7 +2240,7 @@ async function refreshOneProvider(form, refreshBtn) {
     if (refreshSucceeded(body)) markRefreshCompletedLocally(sid);
     loadProviderStatuses(sid, form);
   } catch (err) { showToast('error', String(err)); }
-  finally { refreshBtn.disabled = false; refreshBtn.textContent = original; }
+  finally { refreshBtn.disabled = false; refreshBtn.textContent = original; loadRefreshProgress(sid); }
 }
 
 async function uploadToProvider(form, uploadBtn) {
