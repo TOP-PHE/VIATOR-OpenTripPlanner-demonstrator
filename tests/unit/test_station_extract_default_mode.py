@@ -13,6 +13,7 @@ the Sessions page. Every archive is invented (ids with ZZ, numbers of 9s).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import subprocess
@@ -156,6 +157,68 @@ def test_an_explicit_rail_mode_stays_rail(
     assert _stations(tmp_path, document) == BOTH
 
 
+def _submode(kind: str, word: str) -> str:
+    return f"<TransportSubmode><{kind}>{word}</{kind}></TransportSubmode>"
+
+
+@pytest.mark.parametrize(
+    ("kind", "word"),
+    [
+        pytest.param("BusSubmode", "localBus", id="bus"),
+        pytest.param("TramSubmode", "cityTram", id="tram"),
+        pytest.param("MetroSubmode", "urbanRailway", id="metro-urban-railway"),
+    ],
+)
+def test_a_submode_of_another_mode_is_not_rail_by_default(
+    tmp_path: Path, kind: str, word: str
+) -> None:
+    """Review round 1 of #369: a journey or Line without a mode but with a
+    bus or tram submode is not rail; a StopPlace with one is not modeless."""
+    sub = _submode(kind, word)
+    on_journey = _document().replace("<ServiceJourneyPatternRef", sub + "<ServiceJourneyPatternRef")
+    assert _stations(tmp_path / "j", on_journey) == set()
+    line = f'<ServiceFrame id="ZZ:SVF:L"><lines><Line id="ZZ:Line:91">{sub}</Line></lines></ServiceFrame>'
+    on_line = _delivery(
+        _site(_place(1), _place(2)) + line + PATTERNS + _journeys(2, line="ZZ:Line:91")
+    )
+    assert _stations(tmp_path / "l", on_line) == set()
+    on_place = _document().replace("<Name>Zzstadt", f"<{kind}>{word}</{kind}><Name>Zzstadt")
+    assert _stations(tmp_path / "p", on_place) == set()
+    wrapped = _document().replace("<Name>Zzstadt", sub + "<Name>Zzstadt")
+    assert _stations(tmp_path / "w", wrapped) == set()
+
+
+def test_a_rail_submode_stays_rail_by_default(tmp_path: Path) -> None:
+    on_place = _document().replace("<Name>Zzstadt", "<RailSubmode>local</RailSubmode><Name>Zzstadt")
+    assert _stations(tmp_path / "p", on_place) == BOTH
+    assert _stations(tmp_path / "j", _document(sub="local")) == BOTH
+
+
+def test_a_bus_submode_still_counts_at_a_railway_station(tmp_path: Path) -> None:
+    """Without the setting nothing changes: the railStation fallback counts
+    a journey without a mode whatever its submode, as before."""
+    document = _document(place_kind="railStation").replace(
+        "<ServiceJourneyPatternRef",
+        _submode("BusSubmode", "localBus") + "<ServiceJourneyPatternRef",
+    )
+    assert _stations(tmp_path / "off", document, default=False) == BOTH
+    assert _stations(tmp_path / "on", document, default=True) == BOTH
+
+
+def test_the_journeys_own_submode_counts_under_a_line_without_mode(tmp_path: Path) -> None:
+    document = _delivery(
+        _site(_place(1), _place(2))
+        + '<ServiceFrame id="ZZ:SVF:L"><lines><Line id="ZZ:Line:91"><Name>Zz</Name></Line></lines>'
+        "</ServiceFrame>"
+        + PATTERNS
+        + _journeys(2, line="ZZ:Line:91").replace(
+            "<ServiceJourneyPatternRef",
+            _submode("BusSubmode", "localBus") + "<ServiceJourneyPatternRef",
+        )
+    )
+    assert _stations(tmp_path, document) == set()
+
+
 def test_a_suburban_submode_is_suburban_rail_by_default(tmp_path: Path) -> None:
     rows = _extract(tmp_path, _document(sub="suburbanRailway"), default=True)
     assert not isinstance(rows, ExtractError)
@@ -182,6 +245,35 @@ def test_the_operators_of_journeys_without_a_mode_are_kept(tmp_path: Path) -> No
     rows = _extract(tmp_path, document, default=True)
     assert not isinstance(rows, ExtractError)
     assert {row["operators"] for row in rows.values()} == {"ZZ:Operator:99"}
+
+
+def test_main_rail_takes_the_operators_of_journeys_without_a_mode_as_before(
+    tmp_path: Path,
+) -> None:
+    """Rows of every other feed unchanged: a station's main-rail calls take
+    the operators of the journeys without a mode that call there too, even
+    where those calls do not count (the reader's behaviour before rail by
+    default, kept so that EXTRACTOR_VERSION stays 2)."""
+    rail = (
+        '<ServiceJourney id="ZZ:SJ:91"><TransportMode>rail</TransportMode>'
+        '<OperatorRef ref="ZZ:Operator:91"/><ServiceJourneyPatternRef ref="ZZ:SJP:1"/>'
+        "</ServiceJourney>"
+    )
+    modeless = (
+        '<ServiceJourney id="ZZ:SJ:92"><OperatorRef ref="ZZ:Operator:92"/>'
+        '<ServiceJourneyPatternRef ref="ZZ:SJP:1"/></ServiceJourney>'
+    )
+    document = _delivery(
+        _site(_place(1, kind="busStation"), _place(2, kind="busStation"))
+        + PATTERNS
+        + f'<TimetableFrame id="ZZ:TF"><vehicleJourneys>{rail}{modeless}</vehicleJourneys>'
+        "</TimetableFrame>"
+    )
+    for default in (False, True):
+        rows = _extract(tmp_path / str(default), document, default=default)
+        assert not isinstance(rows, ExtractError)
+        assert {row["n_calls"] for row in rows.values()} == {"1"}
+        assert {row["operators"] for row in rows.values()} == {"ZZ:Operator:91|ZZ:Operator:92"}
 
 
 def test_the_census_says_how_many_calls_were_rail_by_default(tmp_path: Path) -> None:
@@ -338,31 +430,97 @@ def test_a_remembered_failure_is_not_reused_once_the_box_is_ticked(tmp_path: Pat
 
 
 @pytest.mark.usefixtures("token")
-@pytest.mark.parametrize("held", [True, False], ids=["held", "sent"])
-def test_the_module_is_asked_for_the_version_rail_by_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: bool
+@pytest.mark.parametrize(
+    ("summary", "shown"),
+    [
+        pytest.param("rail by default: 9 calls at 2 stop places", True, id="some"),
+        pytest.param("", False, id="none"),
+        pytest.param("<b>zz</b>", False, id="other-form"),
+    ],
+)
+def test_a_sent_extract_says_what_rail_by_default_made_rail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, summary: str, shown: bool
 ) -> None:
+    """Review round 1 of #369: the counts of the extract itself, nothing
+    when the setting made nothing rail; the module asked for the version
+    rail by default."""
     setup = Setup(tmp_path, monkeypatch)
     setup.feeds[0].provider_cfg["timetable"]["default_mode"] = "rail"
+    made = setup.extractor
+
+    def with_summary(*args: Any, **kwargs: Any) -> station_extract.ExtractResult:
+        return dataclasses.replace(made(*args, **kwargs), summary=summary)
+
+    monkeypatch.setattr(station_extract, "ensure_extract", with_summary)
     module = Module()
-    if held:
-        module.heads = [httpx.Response(200)]
     result = _run(setup, module, FakeClock())
     (head,) = module.head_requests
     assert dict(head.url.params) == {"extractor_version": "viator-stop-extract-2+rail-default"}
     (outcome,) = result.outcomes
-    assert outcome.state == (up.HELD if held else up.SENT)
-    assert outcome.summary == up.RAIL_BY_DEFAULT_SUMMARY
-    assert SUMMARY.fullmatch(up.RAIL_BY_DEFAULT_SUMMARY)
+    assert outcome.state == up.SENT
+    assert outcome.summary == (summary if shown else None)
 
 
 @pytest.mark.usefixtures("token")
-def test_a_plain_provider_shows_no_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_held_extract_shows_no_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEAD 200: nothing was made, so nothing is known of what it made rail."""
     setup = Setup(tmp_path, monkeypatch)
+    setup.feeds[0].provider_cfg["timetable"]["default_mode"] = "rail"
     module = Module()
     module.heads = [httpx.Response(200)]
     (outcome,) = _run(setup, module, FakeClock()).outcomes
-    assert outcome.summary is None
+    assert (outcome.state, outcome.summary) == (up.HELD, None)
+
+
+def test_the_result_carries_the_counts_and_the_cache_keeps_them(tmp_path: Path) -> None:
+    archive = _zip(tmp_path / "zz.zip", {"zz.xml": _document()})
+    provider = _provider("netex_epip", **RAIL_DEFAULT)
+    made = build_extract(provider, archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "x")
+    assert made.summary == "rail by default: 4 calls at 2 stop places"
+    cached = build_extract(provider, archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "x")
+    assert cached.dropped == {}  # from the cache
+    assert cached.summary == made.summary
+    station_extract._counts_path(made.path_gz).write_text('{"summary": "<b>zz</b>"}')
+    again = build_extract(provider, archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "x")
+    assert again.summary == ""
+    station_extract._counts_path(made.path_gz).write_text("zz")
+    assert (
+        build_extract(provider, archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "x").summary
+        == ""
+    )
+
+
+def test_nothing_made_rail_gives_no_summary(tmp_path: Path) -> None:
+    """Ticked, but every station calls itself rail: nothing by default."""
+    archive = _zip(tmp_path / "zz.zip", {"zz.xml": _document(place_kind="railStation")})
+    provider = _provider("netex_epip", **RAIL_DEFAULT)
+    made = build_extract(provider, archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "x")
+    assert made.summary == ""
+    assert not station_extract._counts_path(made.path_gz).exists()
+    plain = build_extract(
+        _provider("netex_epip"), archive, SHA, extracted_at=WHEN, cache_dir=tmp_path / "y"
+    )
+    assert plain.summary == ""
+
+
+def test_the_kept_summary_is_pruned_with_its_extract(tmp_path: Path) -> None:
+    folder = tmp_path / "x"
+    provider = _provider("netex_epip", **RAIL_DEFAULT)
+    first = _zip(tmp_path / "a.zip", {"zz.xml": _document()})
+    old = build_extract(provider, first, SHA, extracted_at=WHEN, cache_dir=folder)
+    assert station_extract._counts_path(old.path_gz).exists()
+    new = build_extract(provider, first, "d" * 64, extracted_at=WHEN, cache_dir=folder)
+    assert sorted(p.name for p in folder.iterdir()) == sorted(
+        [new.path_gz.name, station_extract._counts_path(new.path_gz).name]
+    )
+
+
+def test_a_feed_that_ends_before_its_stations_says_the_setting_was_on(tmp_path: Path) -> None:
+    """No journey kept at all (every journey a bus): the summary still says
+    rail by default was on, with 0."""
+    error = _extract(tmp_path, _document(journey="bus"), default=True)
+    assert isinstance(error, ExtractError)
+    assert error.summary.startswith("rail by default: 0 calls at 0 stop places, ")
 
 
 @pytest.fixture
@@ -406,6 +564,20 @@ def test_any_other_default_mode_is_refused(value: Any) -> None:
         _validated(default_mode=value)
 
 
+def test_a_derived_feed_takes_no_default_mode() -> None:
+    raw = {
+        "id": "ZZX",
+        "country_iso": "ZZ",
+        "timetable": {
+            "format": "gtfs",
+            "source": "cross_border_filter",
+            "derived_from": {"session_id": "zz", "provider_id": "ZZRAIL"},
+            "default_mode": "rail",
+        },
+    }
+    assert "default_mode" not in ingestion._validate_provider(raw, 0)["timetable"]
+
+
 def test_a_nap_source_switch_keeps_rail_by_default() -> None:
     config = {
         "sources": {
@@ -442,17 +614,24 @@ def test_a_nap_source_switch_keeps_rail_by_default() -> None:
 # ── The provider card ─────────────────────────────────────────────────────
 
 
-def _card_script(tt: dict[str, Any], checked: bool) -> str:
+_READ = (
+    "if (ttSource !== 'cross_border_filter' && card.querySelector('.prov-tt-default-rail')?.checked) {"
+    "\n    timetable.default_mode = 'rail';\n  }"
+)
+
+
+def _card_script(tt: dict[str, Any], checked: bool, source: str = "url") -> str:
     text = TEMPLATE.read_text(encoding="utf-8")
-    start = text.index("function timetableDefaultRailHTML(tt)")
+    start = text.index("function timetableDefaultRailHTML(tt, ttSource)")
     function = text[start : text.index("\n}\n", start) + 3]
     return f"""
 function escAttr(s) {{ return String(s); }}
 {function}
-const html = timetableDefaultRailHTML({json.dumps(tt)});
+const ttSource = {json.dumps(source)};
+const html = timetableDefaultRailHTML({json.dumps(tt)}, ttSource);
 const card = {{querySelector: sel => sel === '.prov-tt-default-rail' ? {{checked: {json.dumps(checked)}}} : null}};
 const timetable = {{}};
-if (card.querySelector('.prov-tt-default-rail')?.checked) timetable.default_mode = 'rail';
+{_READ}
 console.log(JSON.stringify({{html, timetable}}));
 """
 
@@ -472,17 +651,23 @@ def test_the_card_shows_the_checkbox_ticked_as_saved() -> None:
     assert 'class="prov-tt-default-rail" type="checkbox" checked' in ticked["html"]
     assert 'type="checkbox" >' in plain["html"]
     assert "Never for a feed" in plain["html"]
+    assert '<div class="prov-tt-default-rail-row" >' in plain["html"]
     assert ticked["timetable"] == {"default_mode": "rail"}
     assert plain["timetable"] == {}
+
+
+def test_a_derived_card_hides_the_checkbox_and_sends_no_default() -> None:
+    derived = _node(_card_script({"default_mode": "rail"}, True, "cross_border_filter"))
+    assert '<div class="prov-tt-default-rail-row" hidden>' in derived["html"]
+    assert derived["timetable"] == {}
+    text = TEMPLATE.read_text(encoding="utf-8")
+    assert "if (defaultRailRow) defaultRailRow.hidden = src === 'cross_border_filter';" in text
 
 
 def test_the_card_reads_the_checkbox_back() -> None:
     text = TEMPLATE.read_text(encoding="utf-8")
     start = text.index("function readProviderCard(card)")
     reader = text[start : text.index("\n}\n", start)]
-    assert (
-        "if (card.querySelector('.prov-tt-default-rail')?.checked) timetable.default_mode = 'rail';"
-        in reader
-    )
+    assert _READ in reader
     html = text[text.index("function providerCardHTML(p, opts)") :]
-    assert "${timetableDefaultRailHTML(tt)}" in html[: html.index("\n}\n")]
+    assert "${timetableDefaultRailHTML(tt, ttSource)}" in html[: html.index("\n}\n")]

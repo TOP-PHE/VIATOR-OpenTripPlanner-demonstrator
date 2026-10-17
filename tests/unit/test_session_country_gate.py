@@ -205,7 +205,7 @@ def test_a_new_country_is_accepted_with_a_warning_when_the_module_is_used(
     (warning,) = warnings
     assert _new_country(warnings, ["XX"])
     assert "once the feed is accepted there" in warning
-    assert "the session's graph is not built" in warning
+    assert "the graph is built and these countries route by coordinates" in warning
 
 
 @pytest.mark.parametrize(

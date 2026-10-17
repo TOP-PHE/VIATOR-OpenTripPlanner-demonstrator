@@ -376,8 +376,8 @@ def patch_session(
             # only when the Trainline list lacks one: `_unserved`). A country
             # neither knows is accepted with a warning when VIATOR uses the
             # module (the module serves it only after accepting a feed that
-            # VIATOR sends once this save is done; the graph build is gated,
-            # `country_gate.build_blocked`); without the module, refused with
+            # VIATOR sends once this save is done; the graph is built and warns,
+            # `country_gate.build_warning`); without the module, refused with
             # a clear message and the Trainline-import advice, as before.
             # Only the countries this save adds are gated: a country already
             # among the stored providers passed the gate when it was saved,
@@ -908,7 +908,7 @@ def _osm_coverage_warning(osm_url: str | None, declared_countries: set[str]) -> 
 # The country gate (`app/country_gate.py`): the Trainline rows, then the
 # station module for the gap.
 _countries_without_stations = country_gate.countries_without_stations
-_unserved = country_gate.unserved
+_unserved = country_gate.unserved_by_module
 # The countries the stored providers of a session already declare: a save
 # gates only the countries it adds.
 _stored_countries = country_gate.declared_countries

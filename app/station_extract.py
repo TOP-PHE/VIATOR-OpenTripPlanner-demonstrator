@@ -187,6 +187,10 @@ class ExtractResult:
     # What was cleaned or dropped while writing, by reason word; empty when
     # the extract came from the cache.
     dropped: Mapping[str, int] = field(default_factory=dict)
+    # What rail by default made rail ("rail by default: N calls at M stop
+    # places"), '' when nothing or the setting is off; kept beside the cached
+    # file (`_COUNTS_SUFFIX`), so a cached extract says it too.
+    summary: str = ""
 
 
 # ── The feed key (MSMM 22.2, point 6) ──────────────────────────────────────
@@ -631,9 +635,36 @@ def _cache_name(meta: _Meta) -> str:
     return f"{meta.provider_id}.{meta.feed_version}.{_sixteen_hex(ident)}.csv.gz"
 
 
-def _describe(path: Path, meta: _Meta, dropped: Counter[str]) -> ExtractResult:
+def _counts_path(final: Path) -> Path:
+    return final.with_name(final.name + _COUNTS_SUFFIX)
+
+
+def _write_counts(final: Path, summary: str) -> None:
+    """Keep what rail by default made rail beside the extract. Best-effort."""
+    if not summary:
+        return
+    with contextlib.suppress(OSError):
+        _counts_path(final).write_text(json.dumps({"summary": summary}), encoding="utf-8")
+
+
+def _read_counts(final: Path) -> str:
+    """The summary kept beside a cached extract ('' when none, or not of
+    the summary's form)."""
+    try:
+        with _counts_path(final).open("rb") as fh:
+            record = json.loads(fh.read(_FAILED_MAX_BYTES))
+    except (OSError, ValueError):
+        return ""
+    summary = record.get("summary") if isinstance(record, dict) else None
+    return summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else ""
+
+
+def _describe(
+    path: Path, meta: _Meta, dropped: Counter[str], summary: str | None = None
+) -> ExtractResult:
     """The result for a written extract: its size, sha256 and rows, read back
-    (a whole gzip stream, or an exception)."""
+    (a whole gzip stream, or an exception); `summary` None: the one kept
+    beside it, for an extract rail by default."""
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(MEGABYTE):
@@ -651,6 +682,9 @@ def _describe(path: Path, meta: _Meta, dropped: Counter[str]) -> ExtractResult:
         bytes=path.stat().st_size,
         body_sha256=digest.hexdigest(),
         dropped=dict(dropped),
+        summary=summary
+        if summary is not None
+        else (_read_counts(path) if meta.default_rail else ""),
     )
 
 
@@ -669,11 +703,17 @@ def _cached(path: Path, meta: _Meta) -> ExtractResult | None:
 
 
 def _prune(cache_dir: Path, provider_id: str, keep: Path) -> None:
-    """Remove the provider's older extracts and remembered failures: one
-    file kept per provider."""
-    for pattern in (f"{provider_id}.*.csv.gz", f"{provider_id}.*{_FAILED_SUFFIX}"):
+    """Remove the provider's older extracts, their kept summaries and the
+    remembered failures: one file kept per provider (with its summary)."""
+    kept = {keep, _counts_path(keep)}
+    patterns = (
+        f"{provider_id}.*.csv.gz",
+        f"{provider_id}.*{_FAILED_SUFFIX}",
+        f"{provider_id}.*{_COUNTS_SUFFIX}",
+    )
+    for pattern in patterns:
         for old in cache_dir.glob(pattern):
-            if old != keep:
+            if old not in kept:
                 old.unlink(missing_ok=True)
 
 
@@ -725,6 +765,8 @@ REMEMBERED_REASONS = frozenset(
 )
 COUNTED_REASONS = frozenset({WALL_CLOCK_LIMIT, CRASHED})
 _FAILED_SUFFIX = ".failed"
+# Beside an extract rail by default, what that made rail (its summary).
+_COUNTS_SUFFIX = ".rail-default.json"
 TRIES = 2
 _FAILED_MAX_BYTES = 1024
 # The code an extraction runs: a change to any of these files (a reader
@@ -941,6 +983,7 @@ def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
     try:
         rows = _write(stations, meta, tmp, dropped)
         tmp.replace(plan.final)
+        _write_counts(plan.final, census.default_summary())
     except ExtractError as exc:
         census.dropped.update({word: dropped[word] for word in ROW_DROPS if dropped[word]})
         raise _with_census(exc, census) from None
@@ -948,7 +991,7 @@ def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
         tmp.unlink(missing_ok=True)
     del stations
     _prune(plan.final.parent, meta.provider_id, plan.final)
-    result = _describe(plan.final, meta, dropped)
+    result = _describe(plan.final, meta, dropped, census.default_summary())
     log.info(
         "station extract written: provider=%s format=%s rows=%d bytes=%d dropped=%s",
         meta.provider_id,

@@ -142,7 +142,7 @@ def _countries_without_stations(db, countries: set[str]) -> set[str]:
     missing = country_gate.countries_without_stations(db, countries)
     if not missing:
         return missing
-    return country_gate.unserved(missing, station_module.countries_blocking())
+    return country_gate.unserved_by_module(missing, station_module.countries_blocking())
 
 
 def add(db, s, wanted: set[str] | None, apply: bool) -> int:

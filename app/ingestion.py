@@ -408,7 +408,8 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
         timetable["resolver"] = validate_resolver(
             tt.get("resolver"), f"providers[{index}].timetable.resolver"
         )
-    if _default_mode(tt.get("default_mode"), index):
+    # A derived (cross-border) feed gives no stop extract: no default mode.
+    if _default_mode(tt.get("default_mode"), index) and source != "cross_border_filter":
         timetable["default_mode"] = DEFAULT_MODE_RAIL
 
     # ── gtfs_rt (optional) ───────────────────────────────────────────

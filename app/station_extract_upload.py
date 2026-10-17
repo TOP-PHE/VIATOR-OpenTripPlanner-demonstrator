@@ -328,8 +328,8 @@ class FeedOutcome:
     """One feed's end. `summary`: for a feed that gave no extract because
     it has no rail station (`no_rail_stop`, `no_stop_place`), what the
     extractor saw, in at most 100 characters of counts and mode words
-    (`station_extract.ExtractError.summary`); for an extract of a provider
-    that is rail by default, held or sent, `RAIL_BY_DEFAULT_SUMMARY`."""
+    (`station_extract.ExtractError.summary`); for a sent extract, what rail
+    by default made rail, when it made some (`ExtractResult.summary`)."""
 
     provider_id: str
     state: str
@@ -658,7 +658,7 @@ class _Pass:
         except _Failure as failure:
             return self._unreached(pid, failure.reason)
         if answer.status == 200:
-            return FeedOutcome(pid, HELD, summary=_made_as(feed))
+            return FeedOutcome(pid, HELD)
         if answer.status == 403:
             # A HEAD answer has no body (the server drops it), and the token is
             # the one thing VIATOR's HEAD can be refused for (the module's i4;
@@ -731,7 +731,7 @@ class _Pass:
             if answer.status == 200:
                 uploaded = _put_answer(answer, made.body_sha256, size, int(made.rows))
                 state = SENT if uploaded.status == "recorded" else HELD
-                return FeedOutcome(pid, state, summary=_made_as(feed))
+                return FeedOutcome(pid, state, summary=_made_as(made))
         except _Failure as failure:
             return self._unreached(pid, failure.reason)
         if answer.status == 429:
@@ -742,14 +742,12 @@ class _Pass:
         return _refused(pid, answer)
 
 
-# The summary of an extract made rail by default, held or sent: the Sessions
-# page says the provider's setting made it (its census, with the counts, is
-# given when such a feed still has no rail station).
-RAIL_BY_DEFAULT_SUMMARY = "rail by default (the feed names no mode)"
-
-
-def _made_as(feed: Feed) -> str | None:
-    return RAIL_BY_DEFAULT_SUMMARY if station_extract.default_rail(feed.provider_cfg) else None
+def _made_as(made: Any) -> str | None:
+    """What rail by default made rail in a sent extract ("rail by default:
+    N calls at M stop places", `ExtractResult.summary`), for the Sessions
+    page; None when it made nothing rail, or the setting is off."""
+    summary = getattr(made, "summary", "")
+    return summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else None
 
 
 def _size_on_disk(path: Path) -> int | None:

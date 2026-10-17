@@ -16,10 +16,12 @@ maps to nothing and the stop place decides).
 "rail"`, for a single-operator rail feed that names no mode anywhere, as
 the Belgian export): a journey that carries no mode, on itself or on its
 Line, also counts at a StopPlace that gives neither a `TransportMode` nor a
-`StopPlaceType` (`_Places.modeless`), as main rail unless the journey's
-submode is suburban. An explicit mode stays what it says, on the journey,
-its Line or the StopPlace (bus, tram, coach, `other`, ...: never rail; rail:
-rail), and so does a StopPlace whose type is given. The census counts the
+`StopPlaceType` nor a submode of another mode (`_Places.modeless`), as main
+rail unless the journey's submode is suburban. An explicit mode stays what
+it says, on the journey, its Line or the StopPlace (bus, tram, coach,
+`other`, ...: never rail; rail: rail), and so do a submode of another mode
+(`BusSubmode`, `TramSubmode`, ...: `_UNKNOWN_NOT_RAIL`) and a StopPlace
+whose type is given. The census counts the
 calls taken as rail so (`rail_by_default`).
 
 **Census.** As it reads, the reader counts what it sees in a `NetexCensus`
@@ -159,6 +161,13 @@ _UNKNOWN = "?"
 # default reads it (suburban rail); the railStation fallback reads it as
 # `_UNKNOWN`, as before.
 _UNKNOWN_SUBURBAN = "?s"
+# The same, for a journey whose submode is of another mode than rail (a
+# `BusSubmode`, a `TramSubmode`, ...): never rail by default; the railStation
+# fallback reads it as `_UNKNOWN`, as before (review round 1 of #369).
+_UNKNOWN_NOT_RAIL = "?x"
+_UNKNOWN_MARKERS = (_UNKNOWN, _UNKNOWN_SUBURBAN, _UNKNOWN_NOT_RAIL)
+_RAIL_SUBMODE = "RailSubmode"
+_SUBMODE = "Submode"
 _TRANSPORT_MODE = "TransportMode"
 _STOP_PLACE_TYPE = "StopPlaceType"
 # How far a `ParentSiteRef` chain is followed.
@@ -264,14 +273,49 @@ def _mode(mode: str) -> str:
 
 
 def _submode(element: Element) -> str:
-    """The value of `TransportSubmode`, whatever its inner element."""
+    """The value of `TransportSubmode`, whatever its inner element; the
+    value of an inner element of another mode than rail (`BusSubmode`,
+    `TramSubmode`, ...) is kept with its element's name, `BusSubmode:localBus`
+    (`_not_rail_submode`; `_submode_word` gives the value alone)."""
     holder = _child(element, "TransportSubmode")
     if holder is None:
         return ""
     for inner in holder:
         if inner.text and inner.text.strip():
-            return inner.text.strip()
+            name = _local(inner.tag)
+            word = inner.text.strip()
+            not_rail = name.endswith(_SUBMODE) and name != _RAIL_SUBMODE
+            return f"{name}:{word}" if not_rail else word
     return (holder.text or "").strip()
+
+
+def _submode_word(submode: str) -> str:
+    """A submode's value, without the element's name `_submode` may give."""
+    return submode.rpartition(":")[2]
+
+
+def _not_rail_submode(submode: str) -> bool:
+    """A submode given in an element of another mode than rail."""
+    name, sep, _ = submode.partition(":")
+    return bool(sep) and name.endswith(_SUBMODE)
+
+
+def _suburban(submode: str) -> bool:
+    return _submode_word(submode).lower() in _SUBURBAN_SUBMODES
+
+
+def _place_submode_not_rail(element: Element) -> bool:
+    """A StopPlace that gives a submode of another mode than rail: its own
+    `BusSubmode`, `TramSubmode`, ... (as NeTEx gives a StopPlace's
+    submode), or one inside a `TransportSubmode`."""
+    for child in element:
+        name = _local(child.tag)
+        if name == "TransportSubmode":
+            if _not_rail_submode(_submode(element)):
+                return True
+        elif name.endswith(_SUBMODE) and name != _RAIL_SUBMODE and (child.text or "").strip():
+            return True
+    return False
 
 
 def _mode_of(mode: str, submode: str) -> str | None:
@@ -281,7 +325,7 @@ def _mode_of(mode: str, submode: str) -> str | None:
         return _UNKNOWN
     if mode != "rail":
         return None
-    return RAIL_SUBURBAN if submode.lower() in _SUBURBAN_SUBMODES else RAIL_MAIN
+    return RAIL_SUBURBAN if _suburban(submode) else RAIL_MAIN
 
 
 # ── Streaming ────────────────────────────────────────────────────────────
@@ -616,6 +660,12 @@ class NetexCensus(Census):
     rail_by_default: int | None = None
     rail_by_default_places: int | None = None
 
+    def default_summary(self) -> str:
+        if not self.rail_by_default:
+            return ""
+        places = self.rail_by_default_places or 0
+        return f"rail by default: {self.rail_by_default:,} calls at {places:,} stop places"
+
     @property
     def without_line(self) -> int:
         return max(0, self.no_line_ref + self.line_undefined - self.line_from_pattern)
@@ -686,12 +736,13 @@ def _operators(element: Element) -> tuple[str, ...]:
 
 def _with_line(mode: str, submode: str, info: _LineInfo | None) -> tuple[str, str]:
     """A journey's mode and submode, completed from its Line: the Line's mode
-    when the journey has none, the Line's submode when the journey is rail
-    without one."""
+    when the journey has none (with the Line's submode, or, when the Line
+    gives no mode either, the journey's own submode if it has one), the
+    Line's submode when the journey is rail without one."""
     if info is None:
         return mode, submode
     if not mode:
-        return info.mode, info.submode
+        return info.mode, info.submode if info.mode or not submode else submode
     if mode == info.mode and not submode:
         return mode, info.submode
     return mode, submode
@@ -747,15 +798,18 @@ class _Journeys:
         return _mode_of(*_with_line(mode, submode, self.lines.get(line)))
 
     def use_mode(self, group: int) -> str | None:
-        """`rail(group)`, with `_UNKNOWN_SUBURBAN` for a group without a mode
-        whose submode (its own, or its Line's) is suburban rail."""
+        """`rail(group)`, with, for a group without a mode,
+        `_UNKNOWN_NOT_RAIL` when its submode (its own, or its Line's) is of
+        another mode than rail, `_UNKNOWN_SUBURBAN` when it is suburban
+        rail."""
         mode = self.rail(group)
         if mode != _UNKNOWN:
             return mode
-        line, _, submode, _ = self.groups.groups[group]
-        info = self.lines.get(line)
-        submode = submode or (info.submode if info else "")
-        return _UNKNOWN_SUBURBAN if submode.lower() in _SUBURBAN_SUBMODES else _UNKNOWN
+        line, own_mode, submode, _ = self.groups.groups[group]
+        _, submode = _with_line(own_mode, submode, self.lines.get(line))
+        if _not_rail_submode(submode):
+            return _UNKNOWN_NOT_RAIL
+        return _UNKNOWN_SUBURBAN if _suburban(submode) else _UNKNOWN
 
     def operators_of(self, group: int) -> tuple[str, ...]:
         line, _, _, operators = self.groups.groups[group]
@@ -1078,7 +1132,12 @@ def _note_stop_place(
         places.parent[ident] = parent
     if _calls_itself_rail(element):
         places.rail_places.add(ident)
-    elif places.default_rail and not _mode(own_mode) and not own_type:
+    elif (
+        places.default_rail
+        and not _mode(own_mode)
+        and not own_type
+        and not _place_submode_not_rail(element)
+    ):
         places.modeless.add(ident)
     for quay in _quays(element):
         if quay.get("id"):
@@ -1125,12 +1184,13 @@ def _unknown_mode(mode: str, stop_place: str, places: _Places) -> str | None:
     unknown markers) take at `stop_place`: main rail at a StopPlace that
     calls itself rail (the railStation fallback, whatever the submode);
     with rail by default, at a StopPlace that gives no mode and no type,
-    main rail, or suburban rail for a suburban submode; else None."""
+    main rail, or suburban rail for a suburban submode, never for a submode
+    of another mode; else None."""
     if stop_place in places.rail_places:
         return RAIL_MAIN
-    if stop_place in places.modeless:
-        return RAIL_SUBURBAN if mode == _UNKNOWN_SUBURBAN else RAIL_MAIN
-    return None
+    if stop_place not in places.modeless or mode == _UNKNOWN_NOT_RAIL:
+        return None
+    return RAIL_SUBURBAN if mode == _UNKNOWN_SUBURBAN else RAIL_MAIN
 
 
 @dataclass
@@ -1147,7 +1207,7 @@ def _call_mode(
     """The mode of `count` calls of mode `given` at `stop_place`: a known
     mode as it is; for journeys without a mode, `_unknown_mode`, counted in
     `by_default` when rail by default made them rail."""
-    if given not in (_UNKNOWN, _UNKNOWN_SUBURBAN):
+    if given not in _UNKNOWN_MARKERS:
         return given
     mode = _unknown_mode(given, stop_place, places)
     if mode is not None and stop_place in places.modeless:
@@ -1156,13 +1216,14 @@ def _call_mode(
     return mode
 
 
-def _operator_keys(mode: str, given: str) -> tuple[str, ...]:
+def _operator_keys(mode: str, given: str) -> list[str]:
     """The modes of `_Use.operators` a station's calls of `mode` (given as
     `given`) take their operators from: as before rail by default, main
     rail takes those of the journeys without a mode too."""
+    keys = [mode, given]
     if mode == RAIL_MAIN:
-        return (mode, given, _UNKNOWN, _UNKNOWN_SUBURBAN)
-    return (mode, given)
+        keys.extend(_UNKNOWN_MARKERS)
+    return keys
 
 
 def _stations(places: _Places, found: _Journeys) -> dict[str, Station]:
@@ -1328,6 +1389,10 @@ def read_netex(
     reading went. `default_rail`: rail by default (the module's docstring)."""
     archive = _Archive(zf)
     found = _read_journeys(archive, census)
+    if default_rail:
+        # Zero until the stations are reached: the summary of a feed that
+        # ends before them still says the setting was on.
+        found.census.rail_by_default = found.census.rail_by_default_places = 0
     if not found.by_pattern and not found.points:
         return {}
     places = _read_structure(archive, found, default_rail)

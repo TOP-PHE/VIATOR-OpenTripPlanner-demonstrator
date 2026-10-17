@@ -351,6 +351,12 @@ class Census:
         most = ", ".join(f"{word} {count:,}" for word, count in self.dropped.most_common(2))
         return [f"{plain} (not written: {most})", plain]
 
+    def default_summary(self) -> str:
+        """What rail by default made rail, for the admin status of a written
+        extract (`station_extract.ExtractResult.summary`); '' when it made
+        nothing rail or the setting is off. The readers say it."""
+        return ""
+
     def summary(self) -> str:
         """At most `SUMMARY_MAX` characters, for the admin status."""
         return pack(self.segments())

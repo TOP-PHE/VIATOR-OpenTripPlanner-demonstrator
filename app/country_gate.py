@@ -17,21 +17,23 @@ Where it is asked:
   17 October). When VIATOR does not use the module, nothing could ever
   serve it but the Trainline list: refused, as before (409
   `GATE_ERROR`).
-- **Building a session's graph** (`build_blocked`, the worker), for every
+- **Building a session's graph** (`unserved`, the worker), for every
   country the session declares, after the stop extracts were sent and the
-  module's station build waited for: a country neither knows stops the
-  build, with the same word and what to do (`build_refusal`). The graph of
-  a country without a station reference is what the gate protects. When
-  the module is used but does not answer, the build is not stopped (the
-  saved countries passed when they were saved; a module that is down must
-  not stop every graph); the Trainline list alone decides only when VIATOR
-  does not use the module.
+  module's station build waited for: the graph is **built all the same**
+  (it reads no station list; such a country routes by coordinates), and
+  the job's log gets a warning that says what to do (`build_warning`). The
+  same when the module did not answer (the countries are then "not
+  checked"): up or down, a build is never stopped by the gate (owner's
+  decision 6: the module never stops a rebuild).
+- **The Sessions page** (`page_notices`), at each load: a lasting notice on
+  each session that declares such a country. Nothing is stored.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select
@@ -72,7 +74,7 @@ def countries_without_stations(db: Any, declared: set[str]) -> set[str]:
     return declared - present
 
 
-def unserved(missing: set[str], served: frozenset[str] | None) -> set[str]:
+def unserved_by_module(missing: set[str], served: frozenset[str] | None) -> set[str]:
     """The countries of `missing` (without a Trainline row) that the station
     module does not serve either; `served` None (the module not used,
     paused or not answering): `missing` as it is."""
@@ -89,37 +91,105 @@ def new_country_warning(countries: set[str]) -> str:
         "the station module does not serve it yet. Its stations will come from the station "
         "module once the feed is accepted there: refresh the provider (its stop extract is "
         "sent to the module), accept the feed in the module and let its station build run. "
-        "Until then, the session's graph is not built."
+        "Until then, the graph is built and these countries route by coordinates."
     )
 
 
-def build_blocked(db: Any, config: Mapping[str, Any] | None) -> set[str]:
-    """The countries the session declares that block its graph build: no
-    Trainline row and, when VIATOR uses the station module, not served by
-    it (asked now, not from the cache: the module's build may just have
-    ended). The module used but not answering: nothing blocks."""
-    missing = countries_without_stations(db, declared_countries(config))
+@dataclass(frozen=True)
+class Unserved:
+    """Countries without a station reference: `countries` (sorted);
+    `checked` False when the module is used but did not answer (they lack
+    Trainline rows; whether the module serves them is not known)."""
+
+    countries: tuple[str, ...] = ()
+    checked: bool = True
+
+
+def _unserved_of(missing: set[str], served: frozenset[str] | None) -> Unserved:
+    """`missing` (no Trainline row) less what the module serves, as an
+    `Unserved`; the module not used: `missing`, checked."""
     if not missing:
-        return set()
+        return Unserved()
     if not station_module.enabled():
-        return missing
-    served = station_module.countries_blocking(fresh=True)
+        return Unserved(tuple(sorted(missing)))
     if served is None:
-        log.warning("country_gate.not_checked reason=module_unanswered")
-        return set()
-    return unserved(missing, served)
+        return Unserved(tuple(sorted(missing)), checked=False)
+    return Unserved(tuple(sorted(missing - served)))
 
 
-def build_refusal(countries: set[str]) -> str:
-    """The build log's line for a graph not built for `countries`."""
-    module = (
-        "the station module does not serve them"
-        if station_module.enabled()
-        else "VIATOR does not use the station module"
-    )
+def unserved(db: Any, config: Mapping[str, Any] | None) -> Unserved:
+    """The countries a session declares that have no station reference, for
+    its graph build: no Trainline row and, when VIATOR uses the station
+    module, not served by it (asked now, not from the cache: the module's
+    build may just have ended)."""
+    missing = countries_without_stations(db, declared_countries(config))
+    if not missing or not station_module.enabled():
+        return _unserved_of(missing, None)
+    return _unserved_of(missing, station_module.countries_blocking(fresh=True))
+
+
+def build_warning(found: Unserved) -> str:
+    """The build log's warning line for `found` ('' when none): the graph
+    is built, and what to do."""
+    if not found.countries:
+        return ""
+    names = list(found.countries)
+    if not station_module.enabled():
+        return (
+            f"[viator] warning: {GATE_ERROR} {names}: no Trainline stations, and VIATOR does "
+            "not use the station module; the graph is built, these countries route by "
+            "coordinates until imported from Trainline (Admin > Stations, Refresh from "
+            "Trainline).\n"
+        )
+    if not found.checked:
+        return (
+            f"[viator] warning: {GATE_ERROR} {names} not checked: no Trainline stations, and "
+            "the station module did not answer; the graph is built, these countries route by "
+            "coordinates until the station module serves them.\n"
+        )
     return (
-        f"[viator] graph not built: {GATE_ERROR} {sorted(countries)}: no Trainline stations, "
-        f"and {module}. Accept the feed of each in the station module and let its station "
-        "build run, or import them from Trainline (Admin > Stations, Refresh from Trainline); "
-        "then Rebuild graph.\n"
+        f"[viator] warning: {GATE_ERROR} {names}: routes by coordinates until the station "
+        "module serves it; accept the feed in the module and let its station build run.\n"
+    )
+
+
+def page_notices(
+    db: Any, configs: Iterable[tuple[str, Mapping[str, Any] | None]]
+) -> dict[str, str]:
+    """The Sessions page's lasting notice of each session (by id) that
+    declares a country without a station reference, computed at each load
+    from the declared countries, the Trainline rows and the module's
+    countries (one query, the module asked at most once, its 60 s cache
+    allowed). Nothing is stored; a failure gives no notice."""
+    declared = {sid: declared_countries(config) for sid, config in configs}
+    every = set().union(*declared.values()) if declared else set()
+    try:
+        missing = countries_without_stations(db, every)
+        served = station_module.countries_blocking() if missing else None
+    except Exception as exc:  # a notice must never break the page
+        log.warning("country_gate.notices_failed reason=%s", type(exc).__name__)
+        return {}
+    notices: dict[str, str] = {}
+    for sid, countries in declared.items():
+        found = _unserved_of(countries & missing, served)
+        if found.countries:
+            notices[sid] = _notice(found)
+    return notices
+
+
+def _notice(found: Unserved) -> str:
+    names = ", ".join(found.countries)
+    if not station_module.enabled():
+        return (
+            f"Country {names}: no Trainline stations, and VIATOR does not use the station "
+            "module. It routes by coordinates until imported from Trainline."
+        )
+    if not found.checked:
+        return (
+            f"Country {names}: no Trainline stations; the station module did not answer, so "
+            "whether it serves it is not known."
+        )
+    return (
+        f"New country {names}: not yet served by the station module. It routes by coordinates "
+        "until its feed is accepted in the module and the module's station build has run."
     )

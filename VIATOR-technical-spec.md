@@ -364,7 +364,7 @@ A session can declare an optional `sources` config — the operator-facing shape
 }
 ```
 
-Country-gate (`app/country_gate.py`): at session-save time (creation, Save config, bulk import, `scripts/session_providers.py`), the API checks, for every country X a save adds, that `master_stations` has at least one row with `country_iso = X` or that the station module serves X (D-R12 B). A country neither knows: when VIATOR uses the station module, the save is **accepted with a warning** (`X-Warnings`, or the bulk import's `warnings`: "New country [...]: ... its stations will come from the station module once the feed is accepted there"), since the module serves a country only after accepting a feed that VIATOR sends once the provider is saved and fetched; when VIATOR does not use the module, save returns HTTP 409 with `{error: "missing_master_stations_for_countries", missing_countries: [...]}` — operator-driven; UI surfaces a "Import from Trainline" prompt. Operator clicks `/admin/master/stations → Refresh from Trainline`, then retries the save. **The graph build is gated** (the worker, after the stop extracts are sent and the module's station build waited for): a declared country with no Trainline row that the module does not serve (asked afresh, not from the 60 s cache) fails the rebuild job before any build container, its log `[viator] graph not built: missing_master_stations_for_countries [...]` with what to do; the module used but not answering does not block a build.
+Country-gate (`app/country_gate.py`): at session-save time (creation, Save config, bulk import, `scripts/session_providers.py`), the API checks, for every country X a save adds, that `master_stations` has at least one row with `country_iso = X` or that the station module serves X (D-R12 B). A country neither knows: when VIATOR uses the station module, the save is **accepted with a warning** (`X-Warnings`, or the bulk import's `warnings`: "New country [...]: ... its stations will come from the station module once the feed is accepted there"), since the module serves a country only after accepting a feed that VIATOR sends once the provider is saved and fetched; when VIATOR does not use the module, save returns HTTP 409 with `{error: "missing_master_stations_for_countries", missing_countries: [...]}` — operator-driven; UI surfaces a "Import from Trainline" prompt. Operator clicks `/admin/master/stations → Refresh from Trainline`, then retries the save. **The graph build is never stopped by it** (build and warn, review of #369): the worker, after the stop extracts are sent and the module's station build waited for, checks every declared country (the module asked afresh, not from the 60 s cache); one with no Trainline row that the module does not serve (or "not checked", the module not answering) gets a warning line in the job's log, `[viator] warning: missing_master_stations_for_countries [...]: routes by coordinates until the station module serves it; …`, the worker logs `rebuild.country_unserved`, and the job ends `done`. The Sessions page shows a lasting notice for such a session, computed at each load (`country_gate.page_notices`; nothing stored).
 
 NeTEx-FR is intentionally excluded from the timetable formats — OTP can't read it. NeTEx-FR archives use the manual upload path (`declared_standard=NeTEx-FR-Horaires`), which dispatches to `inbox/<sid>/archive/` for compliance and never touches OTP.
 
@@ -450,7 +450,9 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   when the file names no mode"; `ingestion` accepts only `"rail"` or nothing): for a single-operator
   rail feed whose file names no mode anywhere (no `TransportMode` on journey, Line or StopPlace, no
   `StopPlaceType`), a journey without a mode, on itself and its Line, also counts at a StopPlace that
-  gives neither a mode nor a type, as RAIL_MAIN, or RAIL_SUBURBAN for a suburban submode; a GTFS route
+  gives neither a mode nor a type nor a submode of another mode, as RAIL_MAIN, or RAIL_SUBURBAN for a
+  suburban submode, never for a submode of another mode (`BusSubmode`, `TramSubmode`, …: `_submode`
+  keeps such a value as `BusSubmode:localBus`); a GTFS route
   whose `route_type` is absent or empty is RAIL_MAIN. An explicit mode always wins (bus, tram, coach,
   `other`: not rail), and so does a StopPlace whose type is given (`busStation`: not rail;
   `railStation`: rail as before). Such an extract carries `extractor_version`
@@ -458,7 +460,9 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   remembered failure (a remembered `no_rail_stop` is read again once the box is ticked) and its own
   version in MSMM (identity: feed, archive, extractor version; the upload's `HEAD` asks for it). The
   census counts `rail_by_default` (calls, and `rail_by_default_places`; GTFS: routes), first in the
-  summary; a held or sent extract of such a provider shows "rail by default (the feed names no mode)".
+  summary; a sent extract carries "rail by default: N calls at M stop places" (`ExtractResult.summary`,
+  kept beside the cached file as `<extract>.rail-default.json`), nothing when N is 0. Hidden and not
+  stored on a cross-border derived provider (no extract).
   Kept when a NAP source switch replaces the provider's timetable (`nap_source_map.apply`).
 - **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072
   characters, ≤500 items a list, texts ≤200 characters; over a row/size/line/cell limit nothing is

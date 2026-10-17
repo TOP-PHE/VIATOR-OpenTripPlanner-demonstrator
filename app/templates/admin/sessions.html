@@ -43,7 +43,7 @@
     <tr data-sid="{{ s.id }}" data-state="{{ s.state }}" data-config='{{ (s.config or {}) | tojson }}'>
       <td><button type="button" class="secondary" data-action="expand" aria-expanded="false">▸</button></td>
       <td><code>{{ s.id }}</code></td>
-      <td data-role="session-name">{{ s.name }}</td>
+      <td data-role="session-name">{{ s.name }}{% if country_notices and country_notices.get(s.id) %} <span class="country-notice-flag" title="{{ country_notices[s.id] }}">⚠ country not served</span>{% endif %}</td>
       <td>{{ s.category }}</td>
       <td><span class="engine-badge engine-{{ s.engine or 'otp' }}">{{ (s.engine or 'otp') | upper }}</span></td>
       <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span></td>
@@ -60,6 +60,10 @@
     <tr class="detail-row" data-sid-detail="{{ s.id }}" hidden>
       <td colspan="9" style="padding: 0">
         <div class="detail-panel">
+          <!-- Country notice: a declared country without a station reference
+               (app/country_gate.py page_notices), and after a save the new-country
+               warning of its answer, so it stays once the toast is gone. -->
+          <div data-role="country-notice" {% if not (country_notices and country_notices.get(s.id)) %}hidden{% endif %} style="margin: 0 0 0.75rem; padding: 0.6rem 0.9rem; background: #fff8e1; color: #6f5100; border: 1px solid #f0d77a; border-radius: 4px; font-size: 0.9rem">{{ country_notices.get(s.id, '') if country_notices else '' }}</div>
           <!-- Feed status: read-only overview of every provider timetable -->
           <section class="detail-section" data-role="feed-status" data-sid="{{ s.id }}">
             <h3>Feed status</h3>
@@ -992,9 +996,11 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
 
 // "Rail by default" (timetable.default_mode = "rail"): for a single-operator
 // rail feed whose file names no mode anywhere (app/station_extract_netex.py).
-function timetableDefaultRailHTML(tt) {
+// Hidden on a cross-border derived card: it gives no stop extract.
+function timetableDefaultRailHTML(tt, ttSource) {
   return `
-          <label class="prov-tt-default-rail-row" style="display:inline-flex;align-items:center;gap:.4rem;margin-top:.45rem"
+          <div class="prov-tt-default-rail-row" ${ttSource === 'cross_border_filter' ? 'hidden' : ''}>
+          <label style="display:inline-flex;align-items:center;gap:.4rem;margin-top:.45rem"
                  title="For the station module's stop extract: a journey whose file gives no mode, at a stop place that gives none either, is read as rail">
             <input class="prov-tt-default-rail" type="checkbox" ${tt.default_mode === 'rail' ? 'checked' : ''}>
             This feed is rail when the file names no mode
@@ -1004,7 +1010,8 @@ function timetableDefaultRailHTML(tt) {
             its lines, journeys or stop places), so that its stations reach the station module. A mode
             the file does give always wins (bus, tram, coach… stay what they are). Never for a feed
             that mixes rail with other modes.
-          </p>`;
+          </p>
+          </div>`;
 }
 
 // §12 — derived-card pickers. The "From session / From provider" fields are
@@ -1219,7 +1226,7 @@ function providerCardHTML(p, opts) {
           </div>
           ${timetableSourceRowsHTML(tt, ttSource, df, railOnly)}
           ${timetableCredentialRowHTML(p.timetable_credential_id, ttSource)}
-          ${timetableDefaultRailHTML(tt)}
+          ${timetableDefaultRailHTML(tt, ttSource)}
           <p class="hint" style="margin: 0.25rem 0 0">
             NeTEx-FR is intentionally absent — OTP can't read it. For NeTEx-FR archive-only
             (compliance), use the <em>Upload a file</em> form below with declared standard
@@ -1391,7 +1398,9 @@ function readProviderCard(card) {
   }
   const timetable = {format: ttFormat, source: ttSource};
   if (!collectTimetableSource(card, id, ttSource, timetable)) return null;
-  if (card.querySelector('.prov-tt-default-rail')?.checked) timetable.default_mode = 'rail';
+  if (ttSource !== 'cross_border_filter' && card.querySelector('.prov-tt-default-rail')?.checked) {
+    timetable.default_mode = 'rail';
+  }
   const provider = {
     id,
     label: label || id,
@@ -2017,6 +2026,16 @@ function markCardsSaved(form) {
   form.querySelectorAll('.provider-card').forEach(card => { delete card.dataset.dirty; });
   syncSaveFirst(form);
 }
+
+// The new-country warning of a save's answer stays in the session's notice
+// once the toast is gone (app/country_gate.py new_country_warning).
+function showCountryNotice(sid, warnings) {
+  const text = warnings.find(w => typeof w === 'string' && w.startsWith('New country '));
+  const box = document.querySelector(`tr.detail-row[data-sid-detail="${CSS.escape(sid)}"] [data-role="country-notice"]`);
+  if (!text || !box) return;
+  box.textContent = text;
+  box.hidden = false;
+}
 // ── end save first ────────────────────────────────────────────────────
 
 // ── Automated NAP sources (per-country switch) ─────────────────────────
@@ -2507,6 +2526,8 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     if (urlRow) urlRow.hidden = src !== 'url';
     if (upRow) upRow.hidden = src !== 'upload';
     if (derivedRow) derivedRow.hidden = src !== 'cross_border_filter';
+    const defaultRailRow = card.querySelector('.prov-tt-default-rail-row');
+    if (defaultRailRow) defaultRailRow.hidden = src === 'cross_border_filter';
     const credRow = card.querySelector('.prov-tt-cred-row');
     if (credRow) credRow.hidden = !CREDENTIAL_SOURCES.has(src);
     // First switch to cross_border_filter on a card that hasn't been populated
@@ -2654,6 +2675,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
         if (Array.isArray(warnings) && warnings.length) {
           // Stagger so the success toast doesn't get clobbered immediately.
           setTimeout(() => showToast('warning', warnings.join('\n')), 600);
+          showCountryNotice(sid, warnings);
         }
       } catch (_) {
         // Malformed header; ignore.

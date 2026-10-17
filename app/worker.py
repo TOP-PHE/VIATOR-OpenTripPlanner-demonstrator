@@ -522,15 +522,14 @@ def _run_engine_build(
     after the station module's build has ended (MSMM decision 6): the wait
     comes after the upload, so that the build sees the new extracts, and
     whatever ends the upload or the wait the graph is built, unless the
-    operator cancelled the job meanwhile, or a country of the session has
-    no station reference (`_country_refusal`)."""
+    operator cancelled the job meanwhile. A country of the session without a
+    station reference never stops it: the job's log gets a warning
+    (`_note_country_warning`)."""
     if session_id is not None and _sending_cancelled(job_id, session_id):
         return _CANCELLED_WHILE_SENDING, False, ""
     if engine == "motis" and _waiting_cancelled(job_id):
         return _CANCELLED_WHILE_WAITING, False, ""
-    refusal = _country_refusal(session_id)
-    if refusal:
-        return refusal, False, ""
+    _note_country_warning(job_id, session_id)
     if engine == "motis":
         return run_build_motis(
             session_id=session_id, max_memory=max_memory, container_name=container
@@ -563,31 +562,32 @@ def _waiting_cancelled(job_id: uuid.UUID) -> bool:
     return not waited.build_graph
 
 
-def _country_refusal(session_id: str | None) -> str:
-    """The country gate of a graph build (`country_gate.build_blocked`):
-    the log text of a build refused for a country neither VIATOR's Trainline
-    list nor the station module knows, or '' to build. Asked after the stop
-    extracts were sent and the module's station build waited for, so that a
-    feed accepted in the module meanwhile counts. A failure of the check
-    itself never stops the build."""
+def _note_country_warning(job_id: uuid.UUID, session_id: str | None) -> None:
+    """The country gate of a graph build (`country_gate.unserved`), asked
+    after the stop extracts were sent and the module's station build waited
+    for: a declared country neither VIATOR's Trainline list nor the station
+    module knows (or not checked, the module not answering) gets a warning
+    line in the job's log at once, and the graph is built all the same (it
+    routes such a country by coordinates). A failure of the check is logged
+    and changes nothing."""
     if session_id is None:
-        return ""
+        return
     try:
         with SessionLocal() as db:
             session = db.get(SessionRow, session_id)
-            blocked = country_gate.build_blocked(db, session.config if session else None)
+            found = country_gate.unserved(db, session.config if session else None)
     except Exception as exc:
         log.warning("country gate not checked for %s (%s)", session_id, type(exc).__name__)
-        return ""
-    if not blocked:
-        return ""
+        return
+    if not found.countries:
+        return
     log.warning(
-        "rebuild refused session=%s reason=%s countries=%s",
+        "rebuild.country_unserved session=%s countries=%s checked=%s",
         session_id,
-        country_gate.GATE_ERROR,
-        ",".join(sorted(blocked)),
+        ",".join(found.countries),
+        str(found.checked).lower(),
     )
-    return country_gate.build_refusal(blocked)
+    _note_station_build(job_id, country_gate.build_warning(found))
 
 
 def _send_station_extracts(job_id: uuid.UUID, session_id: str) -> station_extract_upload.PassResult:

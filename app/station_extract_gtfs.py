@@ -90,6 +90,11 @@ class GtfsCensus(Census):
     # route_type taken as rail. None: the setting is off.
     rail_by_default: int | None = None
 
+    def default_summary(self) -> str:
+        if not self.rail_by_default:
+            return ""
+        return f"rail by default: {self.rail_by_default:,} routes"
+
     def segments(self) -> list[list[str]]:
         segments: list[list[str]] = []
         if self.rail_by_default is not None:

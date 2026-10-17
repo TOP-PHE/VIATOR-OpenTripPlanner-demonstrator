@@ -2748,21 +2748,31 @@ containers (the worker since MSMM decision 6, 11.3):
   nothing but the Trainline list could give the country its stations: the
   save is refused as before (409 `missing_master_stations_for_countries`,
   advice: refresh from Trainline).
-- **The graph build checks it again.** Before building a session's graph
-  (after the stop extracts were sent and, for MOTIS, the module's station
-  build waited for), the worker checks every country the session declares
-  the same way. A country neither the Trainline list nor the module knows
-  stops the build: the job ends **failed**, no build container started,
-  with the log line `[viator] graph not built:
-  missing_master_stations_for_countries ['EE']: …` and what to do (accept
-  the feed in the module and let its station build run, or import the
-  country from Trainline; then Rebuild graph); the worker's log says
-  `rebuild refused session=<sid> reason=missing_master_stations_for_countries
-  countries=EE`. When the module is used but does not answer, the build is
-  not stopped (`country_gate.not_checked reason=module_unanswered` in the
-  worker's log): a module that is down must not stop every graph. The
-  `web` log says `station_module.countries_failed reason=<word>` whenever
-  the module did not answer.
+- **The graph build checks it again, and builds.** Before building a
+  session's graph (after the stop extracts were sent and, for MOTIS, the
+  module's station build waited for), the worker checks every country the
+  session declares the same way. A country neither the Trainline list nor
+  the module knows **never stops the build** (the graph reads no station
+  list; such a country routes by coordinates, and the module never stops a
+  rebuild): the job's log gets, at once, `[viator] warning:
+  missing_master_stations_for_countries ['EE']: routes by coordinates until
+  the station module serves it; accept the feed in the module and let its
+  station build run.`, the job ends **done**, and the worker's log says
+  `rebuild.country_unserved session=<sid> countries=EE checked=true`. When
+  the module did not answer, the same with "not checked" (`checked=false`):
+  up or down, the build goes on. Without the module, the warning says to
+  import the country from Trainline. The `web` log says
+  `station_module.countries_failed reason=<word>` whenever the module did
+  not answer.
+- **A lasting notice on the Sessions page.** Each session that declares
+  such a country shows "⚠ country not served" beside its name and, in its
+  detail, "New country EE: not yet served by the station module. It routes
+  by coordinates until its feed is accepted in the module and the module's
+  station build has run." It is worked out at each load of the page (the
+  declared countries, the Trainline rows, the module's countries: nothing
+  is stored) and goes away by itself once the module serves the country.
+  The warning of a save that adds such a country also stays in that notice
+  after its toast is gone.
 - **A text the module would refuse is not sent.** The typeahead and the
   Stations page search a text of 3 to 100 characters that still holds 3
   once the module reads its punctuation (`, ; : . / \ ( ) [ ] { } " ! ? * +
@@ -3258,7 +3268,7 @@ the extracts changes no graph build.
 - **A feed that names no mode: "This feed is rail when the file names no
   mode".** Some national exports name no mode anywhere: no
   `TransportMode` on their Lines, journeys or stop places, no
-  `StopPlaceType` (the Belgian railway's NeTEx, for one). The extractor
+  `StopPlaceType` (a national railway's NeTEx export, for one). The extractor
   cannot tell their stations are rail and the feed ends `no_rail_stop`,
   its census showing `kept none:…`, `stop_place_modes none:…` and
   `stop_place_types none:…`. Tick the provider card's checkbox **This
@@ -3271,17 +3281,37 @@ the extracts changes no graph build.
   that mixes modes** (a regional network with buses, a multimodal NAP
   aggregate): its buses would be taken for trains wherever the file says
   nothing. A mode the file does give always wins: a journey, Line or stop
-  place that says bus, tram, coach, metro or `other` stays not rail, and a
-  stop place typed `busStation` too. Such an extract carries its own
-  extractor version (`viator-stop-extract-2+rail-default`): it is made
-  again at the next refresh even when the file is unchanged (a remembered
-  `no_rail_stop` is not reused), reaches the module as a new version of
-  the feed, and the station-module column says `rail by default (the feed
-  names no mode)`; a feed that still has no rail station shows `saw: rail
-  by default: <n> calls at <m> stop places, …` first. Unticking it makes
-  the plain extract again; in the module, the version made rail by
-  default stays the active one for that same file until the feed's next
-  file (the module prefers the newer extractor of one file).
+  place that says bus, tram, coach, metro or `other` stays not rail, and so
+  does one that gives a submode of another mode (a `BusSubmode`, a
+  `TramSubmode`, …) or a stop place typed `busStation`. The values that
+  name no mode (`unknown`, `all`, `anyMode`, and the deprecated `urbanRail`)
+  count as no mode here too: a journey or stop place that says `urbanRail`
+  becomes rail by default at a stop place that gives nothing else. The
+  checkbox is hidden on a cross-border derived card (it gives no stop
+  extract). Such an extract carries its own extractor version
+  (`viator-stop-extract-2+rail-default`): it is made again at the next
+  refresh even when the file is unchanged (a remembered `no_rail_stop` is
+  not reused) and reaches the module as a new version of the feed. When it
+  is sent, the station-module column says what the setting made rail,
+  `rail by default: <n> calls at <m> stop places` (nothing when it made
+  nothing rail); a feed that still has no rail station shows `saw: rail
+  by default: <n> calls at <m> stop places, …` first.
+- **A box ticked by mistake.** Unticking it makes the plain extract
+  again at the next refresh, but in the module the version made rail by
+  default ranks above the plain one of the same file (the module prefers
+  the newer extractor of one file), so it stays the active one until the
+  feed's next file. To be rid of it sooner, in the module's **Timetable
+  feeds** screen: if that version is **held** (it differed too much from
+  the active one), **reject** it; if it already became the active one,
+  either wait for the feed's next file (the plain extract of a newer file
+  wins) or **retire** the feed there (its stations leave the module's next
+  build; a decision taken in the module, by hand).
+- **After this release: remembered failures are tried once more.** The
+  readers' code changed, so every remembered failure (`no_rail_stop`,
+  `memory_limit`, `cpu_limit`, …) counts no longer and each such feed is
+  read again once, one at a time in the background; a large national
+  NeTEx can hold the extraction child up to 45 minutes. Extracts already
+  made and cached are not made again (`EXTRACTOR_VERSION` is unchanged).
 - **A feed without a rail station: what the extractor saw.** For
   `no_rail_stop` and `no_stop_place` the station-module column shows, under
   the reason's sentence, a line `saw: …` of at most 100 characters (kept

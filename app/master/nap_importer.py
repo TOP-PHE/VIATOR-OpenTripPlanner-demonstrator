@@ -329,7 +329,7 @@ def select_gtfs_rt_urls(dataset: dict[str, Any]) -> dict[str, str]:
 
 _PROVIDER_ID_RE = re.compile(r"[A-Z][A-Z0-9_-]{1,15}")
 
-# The letters NFKD does not split into an ASCII letter and its accents, as
+# The letters NFD does not split into an ASCII letter and its accents, as
 # a reader of the name would write them in ASCII.
 _UNSPLIT_LETTERS = str.maketrans(
     {
@@ -362,10 +362,13 @@ _UNSPLIT_LETTERS = str.maketrans(
 
 def ascii_letters(text: str) -> str:
     """`text` with its accented Latin letters written in ASCII (É → E,
-    ö → o, ł → l, ß → ss, ...): NFKD, its combining marks dropped, and
-    `_UNSPLIT_LETTERS` for the letters NFKD does not split. Any other
-    character is left as it is."""
-    decomposed = unicodedata.normalize("NFKD", text.translate(_UNSPLIT_LETTERS))
+    ö → o, ł → l, ß → ss, ...): NFD, its combining marks dropped, and
+    `_UNSPLIT_LETTERS` for the letters NFD does not split. Any other
+    character is left as it is. NFD, not NFKD: only the accents change;
+    NFKD would also rewrite compatibility characters into letters and
+    digits (the trade mark sign to TM, one half to 1/2, a superscript two
+    to 2), changing ids beyond what was asked."""
+    decomposed = unicodedata.normalize("NFD", text.translate(_UNSPLIT_LETTERS))
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
