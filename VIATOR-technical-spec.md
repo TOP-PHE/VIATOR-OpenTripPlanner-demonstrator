@@ -387,7 +387,7 @@ The build pipeline materializes this config:
 
 **The contract with the station module, phase 2 (MSMM 22.12, 20.23; `app/station_module.py`).** Search, near and lookup rows are read with the module's referential: `viator_id` (exactly `^[A-Z]{2}-[0-9]{5}$`, ASCII, else None), `uic_origin` (`MN`, `CM`, `VM`, `TL`, `FD`; any other word, `VU` included, None; None without a code), `licence` (null/absent → None; else `{name, position, uic, share_alike, attribution, unreadable}` read part by part: a tag ≤100 characters, `share_alike` ⊆ {name, position, uic}, ≤4 distinct attribution texts of ≤500 characters, no character of category Cc, Cs, Cf, Zl or Zp; a faulty part is left out, unknown fields ignored, `unreadable` true when nothing reads; the row kept); near and lookup `parent_viator_id`, lookup `replaced_by` (malformed ids None). A row whose `uic` is null is kept only with a valid `viator_id`; a `uic` of the id's form drops the row. Fields absent (a module before phase 1) are None; unknown fields are ignored. The lookup body is `{"uics": [...], "ids": [...]}`, each field only when non-empty, 1–20 keys in all, each counted by the module; search, near and lookup share a 128 KiB cap (attribution texts of 20 rows); rows answer their keys in the module's order (codes' rows, then ids', `lookup_by_key`). The typeahead answers the five fields only. `current_id(row)` = `replaced_by or viator_id` is what VIATOR stores. `countries()` reads `GET /internal/v1/countries` (cached 60 s, never pauses) for the session country gate (D-R12 B). The hubs' `station_id` holds the id; their origin and licence are read live by "Check station codes" (D-R11 A). No station of the module is stored in `master_stations`; a station without a code routes by coordinates.
 
-**Stop extracts to the station module (MSMM 22.3, D-R15 A; `app/station_extract_upload.py`).** Every session, OTP or MOTIS, sends the station module one rail-only stop extract per feed version (made by `app/station_extract.py`). When: after every refresh (`refresh_sources`, `refresh_provider`; queued for one sender thread of the web process, 30-minute budget) and at the start of every rebuild job in the worker, before the MOTIS station build wait (5-minute budget, cached extracts only: `ensure_extract(..., cache_only=True)`, `skipped not_cached` otherwise; a MOTIS rebuild can wait about 35 minutes in all before its build starts). Per provider with a feed key: `HEAD /internal/v1/feeds/{feed_key}/{sha256}?extractor_version=<v>` (the archive's sha256 is the downloaded bytes', from the fetch state, or the upload's); on 404 the extract comes from `station_extract.ensure_extract` (cached by archive sha256 and extractor version, else made in a resource-limited child process, one at a time; waited for at most until the budget ends; its reasons are skips) and is `PUT` to `/internal/v1/feeds/{feed_key}/extract` as `application/gzip`, streamed from its file with its `Content-Length`. Headers: the machine token, `Accept-Encoding: identity`, `X-Viator-Session-Id: <sid>`; no user id. Per-call deadline 10 s / 120 s (`asyncio.timeout`); `Retry-After` honoured for 503 `busy` and 429 `extract_window` within the budget (each pause ≥1 s, ≤6 waits a call, ≤120 s); no answer after the retries, or a PUT 404, marks the feeds left unavailable without a call; 408/5xx/timeouts tried twice more; other 4xx are refusals, logged with their reason word. A failure never blocks a refresh or a graph build. Order: the feeds whose outcome needs no extraction first (an extract, or a remembered failure, in the cache), then from the smallest timetable file to the largest, so one national extraction never keeps the small feeds of a pass waiting; it alone ends `skipped budget`, goes on, and is sent at the next pass. The last outcome per provider (sent / already held / refused <reason> / skipped / module unavailable) is kept in `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` and shown in the feed-status panel with the reason word and a fixed sentence saying what it means (`REASON_TEXTS`); no migration. The module keeps a new feed `pending` until an administrator accepts it there.
+**Stop extracts to the station module (MSMM 22.3, D-R15 A; `app/station_extract_upload.py`).** Every session, OTP or MOTIS, sends the station module one rail-only stop extract per feed version (made by `app/station_extract.py`). When: after every refresh (`refresh_sources`, `refresh_provider`; queued for one sender thread of the web process, 30-minute budget) and at the start of every rebuild job in the worker, before the MOTIS station build wait (5-minute budget, cached extracts only: `ensure_extract(..., cache_only=True)`, `skipped not_cached` otherwise; a MOTIS rebuild can wait about 35 minutes in all before its build starts). Per provider with a feed key: `HEAD /internal/v1/feeds/{feed_key}/{sha256}?extractor_version=<v>` (the archive's sha256 is the downloaded bytes', from the fetch state, or the upload's); on 404 the extract comes from `station_extract.ensure_extract` (cached by archive sha256 and extractor version, else made in a resource-limited child process, one at a time; waited for at most until the budget ends; its reasons are skips) and is `PUT` to `/internal/v1/feeds/{feed_key}/extract` as `application/gzip`, streamed from its file with its `Content-Length`. Headers: the machine token, `Accept-Encoding: identity`, `X-Viator-Session-Id: <sid>`; no user id. Per-call deadline 10 s / 120 s (`asyncio.timeout`); `Retry-After` honoured for 503 `busy` and 429 `extract_window` within the budget (each pause ≥1 s, ≤6 waits a call, ≤120 s); no answer after the retries, or a PUT 404, marks the feeds left unavailable without a call; 408/5xx/timeouts tried twice more; other 4xx are refusals, logged with their reason word. A failure never blocks a refresh or a graph build. Order: the feeds whose outcome needs no extraction first (an extract, or a remembered failure, in the cache), then from the smallest timetable file to the largest, so one national extraction never keeps the small feeds of a pass waiting; it alone ends `skipped budget`, goes on, and is sent at the next pass. The last outcome per provider (sent / already held / refused <reason> / skipped / module unavailable) is kept in `inbox/<sid>/_fetch_state/provider[<id>].station_extract.json` and shown in the feed-status panel with the reason word and a fixed sentence saying what it means (`REASON_TEXTS`), and for `no_rail_stop` / `no_stop_place` the extractor's summary of what it saw (`summary`, 5.2); no migration. The module keeps a new feed `pending` until an administrator accepts it there.
 
 The worker has an APScheduler-style cron that pulls fresh files on the configured cadence and feeds them through the same dispatcher as a manual upload would. Audit rows mark the actor as `system:auto-pull`.
 
@@ -403,14 +403,15 @@ referential reads (MSMM `docs/service-design.md` 22.2 point 6; 22.3 point 3). Pu
 for the upload step:
 
 ```python
-EXTRACTOR_VERSION: str                                   # "viator-stop-extract-1"
+EXTRACTOR_VERSION: str                                   # "viator-stop-extract-2" (16 October)
 feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
 ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, session_id,
                cache_dir=None, wait_seconds=None, cache_only=False) -> ExtractResult
 #   the one entry point; cache_only=True returns a valid cached extract or raises
 #   ExtractError("not_cached") without starting or waiting for any extraction
 # ExtractResult(path_gz, feed_key, feed_version, extractor_version, rows, bytes,
-#               body_sha256, dropped); ExtractError(reason) when nothing is written
+#               body_sha256, dropped); ExtractError(reason, detail, summary=, census=)
+#   when nothing is written (summary and census: what the reader saw, below)
 provider_archive_snapshot(session_id, provider_cfg, *, upload_sha256=None)  # context manager:
 # the slot hard-linked, checked to be the file opened and the file the fetch state describes
 # (slot_size_bytes, then the streamed slot_sha256 that feed_fetch records), else None
@@ -434,7 +435,14 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   (RAIL_SUBURBAN), a call where a trip neither picks up nor drops off not counted, rolled up to the
   `parent_station`; NeTEx `TransportMode` rail on the ServiceJourney or its Line (suburban by the
   chain's submodes), a journey with no mode counted at a StopPlace whose mode is rail or type
-  `railStation` and gives no other mode, rolled up through `ParentSiteRef` to a defined StopPlace,
+  `railStation` and gives no other mode (since version 2 a value that gives no information on the
+  mode, `unknown`, `all`, `anyMode`, is read as none, as MSMM's chain reads every value it does not
+  map (`import/offline-chain/nap_modes_be-it-netex.py`: `netex_mode_to_primitive` gives None,
+  `_prim_of` then takes the child StopPlace's mode or type); the deprecated `urbanRail` too, by
+  policy: NeTEx says "metro with MetroSubmode urbanRail, or in some few cases rail with RailSubmode
+  local", so the stop place decides, and a journey counted that way is RAIL_MAIN like any other
+  modeless one; the deprecated `intercityRail` is rail; `other`, a mode outside the list, stays not
+  rail, unlike MSMM's chain: `station_extract_netex._mode`), rolled up through `ParentSiteRef` to a defined StopPlace,
   positions from `Latitude`/`Longitude` or a `gml:pos` in EPSG:4326/4258, CRS84 or EPSG:2154 (the code
   matched exactly), or without a system (WGS84, latitude first, when the first value is ≤ 90).
 - **Limits** (MSMM's): ≤200,000 rows, ≤256 MiB unpacked, ≤32 MiB gzip, a line ≤1 MiB, a cell ≤131,072
@@ -492,6 +500,28 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   951 MiB, 120 s
   (`scripts/bench_station_extract.py --per-journey --no-mode`); the shapes that share their points
   are unchanged (about 100 MiB). A Call's `Arrival` and `Departure` are dropped before expat.
+- **Census of a feed without a rail station** (`no_rail_stop`, `no_stop_place`; production,
+  16 October: a national railway's NeTEx ended `no_rail_stop` with nothing to go on). The readers
+  fill a `station_extract_common.Census` as they read (`GtfsCensus`: routes by `route_type`, rail
+  routes, trips, rail trips, rail calls, called stops; `NetexCensus`: members, Lines by their own
+  `TransportMode`, journeys by theirs, journeys kept by the mode they end with, kept journeys without
+  a known Line, those given one by their pattern or route, patterns read and followed, called points,
+  assignments, StopPlaces by `TransportMode` and `StopPlaceType`, those that call themselves rail,
+  places with calls), plus the stations read and the rows not written by reason (`ROW_DROPS`).
+  Counters only (one int per journey group, never one entry per element); a value read from the feed
+  is kept only as one word of letters and `_` (digits for a `route_type`) of at most 24 characters,
+  else `unreadable`, at most 8 distinct values per count (`other_values` for the rest), so no id,
+  name or URL reaches it. `ExtractError.summary` (≤100 characters, `SUMMARY` form
+  `[\w ,:()]`, the parts that fit, most telling first) goes back from the child, is kept in the
+  `.failed` record (and given again with `"remembered"`), reaches `FeedOutcome.summary` through
+  `station_extract_upload._refusal` (`NoExtract`), the outcome record and `load_outcome()["summary"]`
+  (checked again against `SUMMARY`), shown as `saw: …` in the station-module column;
+  `ExtractError.census` (every count, `name=value` words) is logged once by the process that asked
+  for the extraction (`station extract census: provider=… format=… reason=… …`). The owner's
+  `scripts/netex_mode_census.py <zip>` (standard library only, read-only, expat streamed, entities
+  refused) prints, per numbered member and over the archive, the counts of the elements the reader
+  reads, where each mode element appears with its one-word values, and which references
+  (`LineRef`, `RouteRef`, `RouteView/LineRef`, …) each kind of element holds.
 - **Remembered failures**: a failure the same archive meets again (`bad_archive`, `input_too_large`,
   `no_stop_place`, `no_rail_stop`, the MSMM limits, `memory_limit`, `cpu_limit`; `wall_clock_limit` and
   `crashed` the second time in a row with the same reason) is kept as `<cache name>.failed` with the format read and

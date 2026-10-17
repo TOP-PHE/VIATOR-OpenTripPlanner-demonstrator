@@ -7,7 +7,14 @@ without a submode takes its Line's); a journey that carries no mode at all,
 on itself or on its Line, counts at a StopPlace whose own `TransportMode` is
 rail, or that gives no mode and whose `StopPlaceType` is `railStation`
 (22.2, point 2: the railStation fallback, read as MSMM's chain reads it; the
-Belgian export, for one, gives its journeys no mode).
+Belgian export, for one, gives its journeys no mode). A `TransportMode` that
+gives no information (`unknown`, `all`, ...: `_NO_MODE`) is no mode, the
+deprecated `intercityRail` is rail (`_mode`).
+
+**Census.** As it reads, the reader counts what it sees in a `NetexCensus`
+(Lines and journeys by their mode, journeys kept, patterns, points,
+assignments, StopPlaces by mode and type): counters only, so that a feed
+that gives no station says why (`station_extract_common.Census`).
 
 **Streaming, bounded.** Every XML member is read in chunks with expat, never
 whole: an element is built only inside the elements a pass reads (a Line, a
@@ -81,11 +88,14 @@ from .station_extract_common import (
     RAIL_SUBURBAN,
     ArchiveError,
     Budget,
+    Census,
     Station,
+    ValueTally,
     check_declared,
     coordinate,
     new_station,
     open_member,
+    tally_forms,
 )
 from .station_extract_skip import SkipFilter, root_prefix, start_tag_end
 
@@ -115,9 +125,26 @@ _OTHER_MODES = frozenset(
         "ferry",
     }
 )
+# The values of NeTEx's `AllVehicleModesOfTransportEnumeration` that give
+# no information on the mode: `unknown` ("use only when no other entry
+# applies"), `all`, `anyMode` ("to be avoided"), and the deprecated
+# `urbanRail` ("use mode metro with MetroSubmode urbanRail, or in some few
+# cases rail with RailSubmode local": metro or rail, the stop place tells).
+# Read as no mode: the StopPlace decides (the railStation fallback), as
+# MSMM's chain does for every value it does not map
+# (`import/offline-chain/nap_modes_be-it-netex.py`, `netex_mode_to_primitive`
+# gives None, then `_prim_of` takes the child StopPlace's mode or type).
+# Before, such a journey was dropped as not rail. `other` ("a mode not in
+# the list") stays not rail, unlike MSMM's chain.
+_NO_MODE = frozenset({"unknown", "all", "anyMode", "urbanRail"})
+# The deprecated `intercityRail` ("use mode rail with RailSubmode
+# longDistance") is rail.
+_RAIL_ALIASES = frozenset({"intercityRail"})
 # A mode not yet known: the journey's StopPlace decides (the railStation
 # fallback).
 _UNKNOWN = "?"
+_TRANSPORT_MODE = "TransportMode"
+_STOP_PLACE_TYPE = "StopPlaceType"
 # How far a `ParentSiteRef` chain is followed.
 _PARENT_DEPTH = 16
 # The bounds of what is read (review of pull request 4).
@@ -210,6 +237,14 @@ def _ref(element: Element, *names: str) -> str:
         if child is not None and child.get("ref"):
             return str(child.get("ref")).strip()
     return ""
+
+
+def _mode(mode: str) -> str:
+    """A `TransportMode` as the reader takes it: `rail` for a deprecated
+    name of rail, '' for a value that names no mode."""
+    if mode in _RAIL_ALIASES:
+        return "rail"
+    return "" if mode in _NO_MODE else mode
 
 
 def _submode(element: Element) -> str:
@@ -516,6 +551,7 @@ class _Groups:
     def __init__(self) -> None:
         self.ids: dict[_Group, int] = {}
         self.groups: list[_Group] = []
+        self.journeys: list[int] = []  # the journeys of each group, for the census
 
     def id_of(self, group: _Group) -> int:
         number = self.ids.get(group)
@@ -524,10 +560,80 @@ class _Groups:
                 raise ArchiveError("input_too_large", _TOO_MANY_GROUPS)
             number = self.ids[group] = len(self.groups)
             self.groups.append(group)
+            self.journeys.append(0)
         return number
 
 
 _TOO_MANY_GROUPS = "more journey groups than VIATOR keeps"
+
+
+# The words of the modes a kept journey ends with, for the census.
+_KEPT_WORDS = {RAIL_MAIN: "rail", RAIL_SUBURBAN: "suburban", _UNKNOWN: "none"}
+
+
+@dataclass
+class NetexCensus(Census):
+    """What the NeTEx reader saw (`station_extract_common.Census`). None:
+    the pass that counts it did not run (no journey kept for it)."""
+
+    members: int = 0
+    lines: ValueTally = field(default_factory=ValueTally)  # by the Line's TransportMode
+    journeys: ValueTally = field(default_factory=ValueTally)  # by the journey's own
+    # The journeys kept (rail, or no mode yet), by the mode they end with
+    # once their Line is known (from their pattern or route too).
+    kept: ValueTally = field(default_factory=ValueTally)
+    no_line_ref: int = 0  # kept journeys that name no Line
+    line_undefined: int = 0  # kept journeys naming a Line the archive does not define
+    line_from_pattern: int = 0  # of those naming none, given one by their pattern or route
+    patterns: int | None = None  # journey patterns read
+    patterns_used: int | None = None  # of them, followed by a kept journey
+    points: int | None = None  # scheduled stop points with calls of kept journeys
+    assignments: int | None = None
+    stop_places: int | None = None
+    stop_place_modes: ValueTally = field(default_factory=ValueTally)
+    stop_place_types: ValueTally = field(default_factory=ValueTally)
+    rail_stop_places: int | None = None  # StopPlaces that call themselves rail
+    places_called: int | None = None  # assigned places with calls
+
+    @property
+    def without_line(self) -> int:
+        return max(0, self.no_line_ref + self.line_undefined - self.line_from_pattern)
+
+    def segments(self) -> list[list[str]]:
+        kept = self.kept.total
+        segments = [
+            tally_forms(self.lines.total, "lines", self.lines),
+            [f"{self.journeys.total:,} journeys ({kept:,} kept)"],
+            self.stations_forms(),
+        ]
+        if self.without_line:
+            segments.append([f"{self.without_line:,} without a line"])
+        if self.stop_places is not None:
+            segments.append([f"{self.stop_places:,} stop places ({self.rail_stop_places:,} rail)"])
+        return segments
+
+    def fields(self) -> list[tuple[str, object]]:
+        return [
+            ("members", self.members),
+            ("lines", self.lines.total),
+            ("line_modes", self.lines),
+            ("journeys", self.journeys.total),
+            ("journey_modes", self.journeys),
+            ("kept", self.kept),
+            ("no_line_ref", self.no_line_ref),
+            ("line_undefined", self.line_undefined),
+            ("line_from_pattern", self.line_from_pattern),
+            ("patterns", self.patterns),
+            ("patterns_used", self.patterns_used),
+            ("points", self.points),
+            ("assignments", self.assignments),
+            ("stop_places", self.stop_places),
+            ("stop_place_modes", self.stop_place_modes if self.stop_places is not None else None),
+            ("stop_place_types", self.stop_place_types if self.stop_places is not None else None),
+            ("rail_stop_places", self.rail_stop_places),
+            ("places_called", self.places_called),
+            *super().fields(),
+        ]
 
 
 # ── Pass 1: lines, routes and journeys ────────────────────────────────────
@@ -583,6 +689,10 @@ class _Journeys:
     by_pattern: dict[str, _Tally] = field(default_factory=dict)
     points: dict[str, _Tally] = field(default_factory=dict)
     pairs: int = 0  # (pattern, group) pairs in `by_pattern`
+    # The patterns of `by_pattern` the census has counted (pass 2): a pattern
+    # id defined twice is counted once. At most the keys of `by_pattern`.
+    counted: set[str] = field(default_factory=set)
+    census: NetexCensus = field(default_factory=NetexCensus)
 
     def add_pattern(self, pattern: str, group: int) -> None:
         old = self.by_pattern.get(pattern)
@@ -615,12 +725,13 @@ def _journey(element: Element, found: _Journeys) -> None:
     that Line was read already) is not rail. One that names no pattern adds
     its calls to its points at once: nothing is kept per journey."""
     line = _ref(element, "LineRef")
-    mode, submode = _with_line(
-        _text(element, "TransportMode"), _submode(element), found.lines.get(line)
-    )
+    own = _text(element, _TRANSPORT_MODE)
+    found.census.journeys.add(own)
+    mode, submode = _with_line(_mode(own), _submode(element), found.lines.get(line))
     if _mode_of(mode, submode) is None:
         return
     group = found.groups.id_of((line, mode, submode, _operators(element)))
+    found.groups.journeys[group] += 1
     pattern = _ref(element, "ServiceJourneyPatternRef", "JourneyPatternRef")
     if pattern:
         found.add_pattern(pattern, group)
@@ -649,26 +760,45 @@ def _keep_rail(table: dict[str, _Tally], found: _Journeys) -> None:
         del table[key]
 
 
-def _read_journeys(archive: _Archive) -> _Journeys:
+def _read_journeys(archive: _Archive, census: NetexCensus | None = None) -> _Journeys:
     """Lines, Routes and the rail journeys (or those whose mode is still
     unknown), counted by the pattern they follow (or, without one, at the
     points they call at). A journey read before its Line is filtered once
     every Line is known."""
-    found = _Journeys()
+    found = _Journeys(census=census if census is not None else NetexCensus())
+    found.census.members = len(archive.names)
     for element in archive.walk(_JOURNEYS, _PASS_1_SKIPPED):
         ident = element.get("id") or ""
         local = _local(element.tag)
         if local == "ServiceJourney":
             _journey(element, found)
-        elif ident and local == "Line":
-            found.lines[ident] = _LineInfo(
-                _text(element, "TransportMode"), _submode(element), _operators(element)
-            )
+        elif local == "Line":
+            own = _text(element, _TRANSPORT_MODE)
+            found.census.lines.add(own)
+            if ident:
+                found.lines[ident] = _LineInfo(_mode(own), _submode(element), _operators(element))
         elif ident and (line := _ref(element, "LineRef")):
             found.routes[ident] = line
     _keep_rail(found.by_pattern, found)
     _keep_rail(found.points, found)
+    _count_kept(found)
     return found
+
+
+def _count_kept(found: _Journeys) -> None:
+    """The census of the journeys kept: by the mode they end with, and those
+    whose Line is not known."""
+    census = found.census
+    for group, (line, _, _, _) in enumerate(found.groups.groups):
+        mode = found.rail(group)
+        if mode is None:
+            continue
+        count = found.groups.journeys[group]
+        census.kept.add(_KEPT_WORDS[mode], count)
+        if not line:
+            census.no_line_ref += count
+        elif line not in found.lines:
+            census.line_undefined += count
 
 
 # ── Pass 2: patterns -> points ────────────────────────────────────────────
@@ -702,17 +832,36 @@ def _pattern_line(element: Element, routes: dict[str, str]) -> str:
     return line
 
 
-def _rail_groups(tally: _Tally, pattern_line: str, found: _Journeys) -> list[tuple[int, int]]:
+def _rail_groups(
+    tally: _Tally, pattern_line: str, found: _Journeys, counted: bool
+) -> list[tuple[int, int]]:
     """The rail (group, count) pairs of a pattern's tally; a group without a
-    Line takes the pattern's."""
+    Line takes the pattern's. `counted`: the census has counted this pattern
+    already (a pattern id defined twice)."""
     resolved: list[tuple[int, int]] = []
     for group, count in _tally_items(tally):
         line, mode, submode, operators = found.groups.groups[group]
         if not line and pattern_line:
+            before = found.rail(group)
             group = found.groups.id_of((pattern_line, mode, submode, operators))
+            if not counted:
+                _count_from_pattern(found, before, group, count)
         if found.rail(group) is not None:
             resolved.append((group, count))
     return resolved
+
+
+def _count_from_pattern(found: _Journeys, before: str | None, group: int, count: int) -> None:
+    """The census of journeys given their Line by their pattern: moved to
+    the mode they end with (none when that Line is not rail)."""
+    census = found.census
+    if found.groups.groups[group][0] in found.lines:
+        census.line_from_pattern += count
+    after = found.rail(group)
+    if before is not None and after != before:
+        census.kept.add(_KEPT_WORDS[before], -count)
+        if after is not None:
+            census.kept.add(_KEPT_WORDS[after], count)
 
 
 def _served_points(element: Element) -> Iterator[str]:
@@ -729,10 +878,17 @@ def _served_points(element: Element) -> Iterator[str]:
 def _pattern(element: Element, found: _Journeys) -> None:
     """A journey pattern a rail journey follows: its served points get the
     calls of those journeys."""
-    tally = found.by_pattern.get(element.get("id") or "")
+    census = found.census
+    census.patterns = (census.patterns or 0) + 1
+    ident = element.get("id") or ""
+    tally = found.by_pattern.get(ident)
     if tally is None:
         return
-    resolved = _rail_groups(tally, _pattern_line(element, found.routes), found)
+    counted = ident in found.counted
+    if not counted:
+        found.counted.add(ident)
+        census.patterns_used = (census.patterns_used or 0) + 1
+    resolved = _rail_groups(tally, _pattern_line(element, found.routes), found, counted)
     if not resolved:
         return
     for ref in _served_points(element):
@@ -796,22 +952,35 @@ def _read_structure(archive: _Archive, found: _Journeys) -> _Places:
         if local == "PassengerStopAssignment":
             _note_assignment(element, places)
         elif local == "StopPlace":
-            _note_stop_place(element, places, quays)
+            _note_stop_place(element, places, quays, found.census)
         else:
             _pattern(element, found)
     found.by_pattern.clear()
+    found.counted.clear()
+    _count_places(found, places)
     for point, tally in found.points.items():
         numbers = places.assignments.get(point, ())
         for number in (numbers,) if isinstance(numbers, int) else numbers:
             for group, count in _tally_items(tally):
                 _tally_add(places.use, number, group, count)
     places.called = bool(found.points)
+    found.census.places_called = len(places.use)
     found.points.clear()
     places.assignments.clear()
     places.pair_ids.clear()
     wanted = {places.pairs[number][0] for number in places.use if places.pairs[number][0]}
     places.quay_place = {q: p for q, p in quays.items() if q in wanted}
     return places
+
+
+def _count_places(found: _Journeys, places: _Places) -> None:
+    census = found.census
+    census.patterns = census.patterns or 0
+    census.patterns_used = census.patterns_used or 0
+    census.points = len(found.points)
+    census.assignments = places.assigned
+    census.stop_places = len(places.defined)
+    census.rail_stop_places = len(places.rail_places)
 
 
 def _note_assignment(element: Element, places: _Places) -> None:
@@ -837,14 +1006,18 @@ def _note_assignment(element: Element, places: _Places) -> None:
 def _calls_itself_rail(element: Element) -> bool:
     """A StopPlace's own mode is rail, or it gives none (or one MSMM's chain
     does not know) and its type is `railStation`."""
-    mode = _text(element, "TransportMode")
+    mode = _mode(_text(element, _TRANSPORT_MODE))
     if mode == "rail":
         return True
-    return mode not in _OTHER_MODES and _text(element, "StopPlaceType") == "railStation"
+    return mode not in _OTHER_MODES and _text(element, _STOP_PLACE_TYPE) == "railStation"
 
 
-def _note_stop_place(element: Element, places: _Places, quays: dict[str, str]) -> None:
+def _note_stop_place(
+    element: Element, places: _Places, quays: dict[str, str], census: NetexCensus
+) -> None:
     """A StopPlace's id, parent, whether it calls itself rail, and its Quays."""
+    census.stop_place_modes.add(_text(element, _TRANSPORT_MODE))
+    census.stop_place_types.add(_text(element, _STOP_PLACE_TYPE))
     ident = element.get("id") or ""
     if not ident:
         return
@@ -1047,12 +1220,14 @@ def _read_details(archive: _Archive, stations: dict[str, Station], places: _Plac
         stations[root].place("", lat, lon)
 
 
-def read_netex(zf: zipfile.ZipFile) -> dict[str, Station]:
+def read_netex(zf: zipfile.ZipFile, census: NetexCensus | None = None) -> dict[str, Station]:
     """The rail stations of the NeTEx archive `zf`, by root StopPlace id.
     Raises `ArchiveError` `no_stop_place` when rail journeys call but the
-    archive defines no StopPlace or assigns no called point to one."""
+    archive defines no StopPlace or assigns no called point to one.
+    `census`, when given, is filled with what was seen, as far as the
+    reading went."""
     archive = _Archive(zf)
-    found = _read_journeys(archive)
+    found = _read_journeys(archive, census)
     if not found.by_pattern and not found.points:
         return {}
     places = _read_structure(archive, found)

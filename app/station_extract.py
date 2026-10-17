@@ -90,16 +90,19 @@ from . import (
 )
 from .feed_resolvers import validate_resolver
 from .settings import settings
-from .station_extract_common import ArchiveError, Station
-from .station_extract_gtfs import provider_operator, read_gtfs
-from .station_extract_netex import read_netex
+from .station_extract_common import CENSUS_REASONS, SUMMARY, ArchiveError, Census, Station
+from .station_extract_gtfs import GtfsCensus, provider_operator, read_gtfs
+from .station_extract_netex import NetexCensus, read_netex
 
 log = logging.getLogger(__name__)
 
 # The version of the rules below. MSMM keeps one version of an archive per
 # extractor version (MSMM 22.3, point 1): raise it whenever the rows written
 # for the same archive would change, so the module receives the new extract.
-EXTRACTOR_VERSION = "viator-stop-extract-1"
+# 2 (16 October): a NeTEx `TransportMode` that gives no information on the
+# mode (`unknown`, `all`, `anyMode`, `urbanRail`) is read as none,
+# `intercityRail` as rail (`station_extract_netex._mode`).
+EXTRACTOR_VERSION = "viator-stop-extract-2"
 
 # The feed keys MSMM accepts (MSMM `feed_intake.FEED_KEY_PATTERN`).
 FEED_KEY_PATTERN = (
@@ -135,12 +138,22 @@ class ExtractError(Exception):
     killed by another signal, its own fault), `busy` (another extraction
     held the machine for longer than the wait), `not_cached` (`ensure_extract(cache_only=True)` found no
     valid cached extract), `cache` (the cache folder cannot be written), `error`
-    (anything else)."""
+    (anything else).
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    For `no_rail_stop` and `no_stop_place` (`CENSUS_REASONS`), what the
+    reader saw: `summary` in at most 100 characters (the admin status, the
+    remembered failure; also when remembered) and `census`, every count
+    (the web log; only when the archive was read). Counts and enumerated
+    words only (`station_extract_common.Census`)."""
+
+    def __init__(
+        self, reason: str, detail: str = "", *, summary: str = "", census: str = ""
+    ) -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
         self.detail = detail
+        self.summary = summary
+        self.census = census
 
 
 @dataclass(frozen=True)
@@ -338,6 +351,10 @@ class _Meta:
     provider_provenance: str
 
 
+# The reasons that drop a whole row (`_station_row`), for the census.
+ROW_DROPS = ("stop_key", "no_name", "no_position", "no_rail_call", "no_code")
+
+
 def _station_row(station: Station, meta: _Meta, dropped: Counter[str]) -> list[str] | None:
     """The row of one station, or None (counted) when MSMM could not take it."""
     key = station.key
@@ -514,14 +531,30 @@ def _meta(
 # ── Reading the archive ───────────────────────────────────────────────────
 
 
-def _read_stations(fmt: str, archive_path: Path, provider_id: str) -> dict[str, Station]:
+def _census_of(fmt: str) -> Census:
+    return GtfsCensus() if fmt == "gtfs" else NetexCensus()
+
+
+def _with_census(error: ExtractError, census: Census) -> ExtractError:
+    """`error` with what the reader saw, when its reason is one of
+    `CENSUS_REASONS`; else `error` as it is."""
+    if error.reason not in CENSUS_REASONS:
+        return error
+    return ExtractError(error.reason, error.detail, summary=census.summary(), census=census.full())
+
+
+def _read_stations(
+    fmt: str, archive_path: Path, provider_id: str, census: Census
+) -> dict[str, Station]:
     try:
         with zipfile.ZipFile(archive_path) as zf:
             if fmt == "gtfs":
-                return read_gtfs(zf, provider_id)
-            return read_netex(zf)
+                return read_gtfs(
+                    zf, provider_id, census if isinstance(census, GtfsCensus) else None
+                )
+            return read_netex(zf, census if isinstance(census, NetexCensus) else None)
     except ArchiveError as exc:
-        raise ExtractError(exc.reason, exc.detail) from None
+        raise _with_census(ExtractError(exc.reason, exc.detail), census) from None
     except (
         OSError,
         EOFError,
@@ -741,18 +774,26 @@ def _failure(final: Path, fmt: str) -> dict[str, Any] | None:
 
 def _remembered(final: Path, fmt: str) -> str | None:
     """The reason remembered for the extract `final` read as `fmt`, or None."""
+    found = _remembered_failure(final, fmt)
+    return found[0] if found is not None else None
+
+
+def _remembered_failure(final: Path, fmt: str) -> tuple[str, str] | None:
+    """The reason remembered for the extract `final` read as `fmt` and its
+    summary ('' when none was kept, or when it is not of the summary's
+    form), or None."""
     record = _failure(final, fmt)
     if record is None:
         return None
     reason = record.get("reason")
     if not isinstance(reason, str) or reason not in _REMEMBERABLE:
         return None
-    if reason not in COUNTED_REASONS:
-        return reason  # remembered at once
-    tries = record.get("tries")
-    if not isinstance(tries, int) or tries < TRIES:
-        return None  # one wall-clock stop or crash only: tried again
-    return reason
+    if reason in COUNTED_REASONS:
+        tries = record.get("tries")
+        if not isinstance(tries, int) or tries < TRIES:
+            return None  # one wall-clock stop or crash only: tried again
+    summary = record.get("summary")
+    return reason, summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else ""
 
 
 _REMEMBERABLE = REMEMBERED_REASONS | COUNTED_REASONS
@@ -764,6 +805,8 @@ def _remember(final: Path, provider_id: str, fmt: str, error: ExtractError) -> N
     counted, and remembered from the `TRIES`-th in a row with the same
     reason. Best-effort."""
     record: dict[str, Any] = {"reason": error.reason, "limits": _limits_signature(), "format": fmt}
+    if error.summary and SUMMARY.fullmatch(error.summary):
+        record["summary"] = error.summary
     if error.reason in COUNTED_REASONS:
         before = _failure(final, fmt)
         same = before is not None and before.get("reason") == error.reason
@@ -849,7 +892,9 @@ def _plan(
 def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
     """Read the archive and write the extract of `plan`, atomically."""
     meta = plan.meta
-    stations = _read_stations(plan.fmt, archive_path, meta.provider_id)
+    census = _census_of(plan.fmt)
+    stations = _read_stations(plan.fmt, archive_path, meta.provider_id, census)
+    census.stations = len(stations)
     dropped: Counter[str] = Counter()
     fd, tmp_name = tempfile.mkstemp(
         dir=plan.final.parent, prefix=f".{meta.provider_id}.", suffix=".tmp"
@@ -859,6 +904,9 @@ def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
     try:
         rows = _write(stations, meta, tmp, dropped)
         tmp.replace(plan.final)
+    except ExtractError as exc:
+        census.dropped.update({word: dropped[word] for word in ROW_DROPS if dropped[word]})
+        raise _with_census(exc, census) from None
     finally:
         tmp.unlink(missing_ok=True)
     del stations
@@ -997,7 +1045,7 @@ def _child_main(
         _limit_self(limits)
         conn.send(("ok", target(*args)))
     except ExtractError as exc:
-        conn.send(("error", exc.reason, exc.detail))
+        conn.send(("error", exc.reason, exc.detail, exc.summary, exc.census))
     except MemoryError:
         conn.send(("error", MEMORY_LIMIT, OUT_OF_MEMORY))
     except Exception as exc:  # any other end is heard as a child that sent nothing
@@ -1034,7 +1082,14 @@ def _run_child(target: Callable[..., ExtractResult], args: tuple[Any, ...]) -> E
         raise _silent_end(child.exitcode)
     if message[0] == "ok":
         return message[1]  # type: ignore[no-any-return]
-    raise ExtractError(message[1], message[2])
+    raise _child_error(message)
+
+
+def _child_error(message: tuple[Any, ...]) -> ExtractError:
+    """The error a child sent: ("error", reason, detail), with the summary
+    and the census of what the reader saw when it sent them."""
+    reason, detail, summary, census = (*message[1:], "", "")[:4]
+    return ExtractError(reason, detail, summary=summary, census=census)
 
 
 def _silent_end(exitcode: int | None) -> ExtractError:
@@ -1124,26 +1179,41 @@ def ensure_extract(
             try:
                 return _run_child(_child_build, (*args, extracted_at, folder))
             except ExtractError as exc:
+                _log_census(plan, exc)
                 _remember(plan.final, plan.meta.provider_id, plan.fmt, exc)
                 raise
     except _Known as known:
         if known.result is not None:
             return known.result
-        raise ExtractError(known.reason, "remembered") from None
+        raise ExtractError(known.reason, "remembered", summary=known.summary) from None
     except ExtractError:
         raise
     except Exception as exc:
         raise ExtractError("error", type(exc).__name__) from None
 
 
+def _log_census(plan: _Plan, error: ExtractError) -> None:
+    """The whole census of a feed that gave no extract, in the log of the
+    process that asked for it (counts and enumerated words only)."""
+    if error.census:
+        log.warning(
+            "station extract census: provider=%s format=%s reason=%s %s",
+            plan.meta.provider_id,
+            plan.fmt,
+            error.reason,
+            error.census,
+        )
+
+
 class _Known(Exception):  # a way out of the checks, not an error
     """What is known of an extract without making it: the cached extract, or
-    the reason remembered for the archive."""
+    the reason remembered for the archive (with its summary)."""
 
-    def __init__(self, result: ExtractResult | None, reason: str = "") -> None:
+    def __init__(self, result: ExtractResult | None, reason: str = "", summary: str = "") -> None:
         super().__init__(reason)
         self.result = result
         self.reason = reason
+        self.summary = summary
 
 
 def _known(plan: _Plan) -> None:
@@ -1152,9 +1222,9 @@ def _known(plan: _Plan) -> None:
     cached = _cached(plan.final, plan.meta)
     if cached is not None:
         raise _Known(cached)
-    reason = _remembered(plan.final, plan.fmt)
-    if reason is not None:
-        raise _Known(None, reason)
+    found = _remembered_failure(plan.final, plan.fmt)
+    if found is not None:
+        raise _Known(None, *found)
 
 
 def extract_known(provider_cfg: Mapping[str, Any], archive_sha256: str, *, session_id: str) -> bool:

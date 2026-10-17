@@ -1535,7 +1535,9 @@ function feedLastResultHTML(s) {
 // "refused <reason>", "skipped", "module unavailable"), shown as written,
 // the reason word of a skip or an unavailable module beside it, and the
 // sentence that says what the reason means (`detail`, a fixed text of
-// app/station_extract_upload.py REASON_TEXTS) under them. All escaped.
+// app/station_extract_upload.py REASON_TEXTS) under them, and, for a feed
+// without a rail station, what the extractor saw (`summary`: counts and mode
+// words, at most 100 characters). All escaped.
 const _STATION_EXTRACT_FLAVOURS = {
   sent: 'ok', held: 'ok', refused: 'error', unavailable: 'stale', skipped: 'pending', cancelled: 'pending',
 };
@@ -1547,7 +1549,10 @@ function feedStationExtractHTML(x) {
     ? ` <code class="feed-extract-reason">${escHTML(x.reason)}</code>` : '';
   const head = `<span class="prov-status-pill" data-state="${escAttr(flavour)}">${escHTML(x.text)}</span>${word}`;
   const line = when ? `${head} <span class="hint">${escHTML(when)}</span>` : head;
-  return x.detail ? `${line}<div class="feed-extract-detail">${escHTML(x.detail)}</div>` : line;
+  const detail = x.detail ? `<div class="feed-extract-detail">${escHTML(x.detail)}</div>` : '';
+  const saw = x.summary
+    ? `<div class="feed-extract-detail" title="What the extractor saw in this feed">saw: ${escHTML(x.summary)}</div>` : '';
+  return `${line}${detail}${saw}`;
 }
 
 function feedRowHTML(fid, s) {

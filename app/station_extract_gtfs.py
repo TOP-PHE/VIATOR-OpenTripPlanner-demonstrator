@@ -39,6 +39,7 @@ import io
 import re
 import zipfile
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 
 from .station_extract_common import (
     MEGABYTE,
@@ -46,12 +47,15 @@ from .station_extract_common import (
     RAIL_SUBURBAN,
     ArchiveError,
     Budget,
+    Census,
     Station,
+    ValueTally,
     check_declared,
     coordinate,
     members,
     new_station,
     open_member,
+    tally_forms,
 )
 
 _STOPS = "stops.txt"
@@ -67,6 +71,43 @@ ID_MAX = 255
 _ID_COLUMNS = ("stop_id", "trip_id", "route_id", "agency_id", "parent_station")
 # The distinct stops at which rail calls that are kept, platforms included.
 CALLED_STOPS_MAX = 1_000_000
+
+
+@dataclass
+class GtfsCensus(Census):
+    """What the GTFS reader saw (`station_extract_common.Census`). None: the
+    step that counts it did not run (no rail route, no rail trip)."""
+
+    routes: ValueTally = field(default_factory=lambda: ValueTally(digits=True))  # by route_type
+    rail_routes: int = 0
+    trips: int | None = None
+    rail_trips: int | None = None
+    rail_calls: int | None = None
+    called_stops: int | None = None
+
+    def segments(self) -> list[list[str]]:
+        segments = [
+            tally_forms(self.routes.total, "routes", self.routes, "route_type "),
+            [f"{self.rail_routes:,} rail routes"],
+            self.stations_forms(),
+        ]
+        if self.rail_trips is not None:
+            segments.append([f"{self.rail_trips:,} rail trips"])
+        if self.called_stops is not None:
+            segments.append([f"{self.called_stops:,} called stops"])
+        return segments
+
+    def fields(self) -> list[tuple[str, object]]:
+        return [
+            ("routes", self.routes.total),
+            ("route_types", self.routes),
+            ("rail_routes", self.rail_routes),
+            ("trips", self.trips),
+            ("rail_trips", self.rail_trips),
+            ("rail_calls", self.rail_calls),
+            ("called_stops", self.called_stops),
+            *super().fields(),
+        ]
 
 
 def provider_operator(provider_id: str) -> str:
@@ -245,7 +286,7 @@ def _agencies(
 
 
 def _rail_profiles(
-    zf: zipfile.ZipFile, files: dict[str, str], provider_id: str, budget: Budget
+    zf: zipfile.ZipFile, files: dict[str, str], provider_id: str, budget: Budget, census: GtfsCensus
 ) -> tuple[dict[str, int], list[tuple[str, str]]]:
     """Rail route id -> index of its (mode, operator) profile."""
     agencies, only_agency = _agencies(zf, files, budget)
@@ -253,6 +294,7 @@ def _rail_profiles(
     index: dict[tuple[str, str], int] = {}
     routes: dict[str, int] = {}
     for row in _rows(zf, files["routes.txt"], budget):
+        census.routes.add(row.get("route_type", ""))
         mode = rail_mode(row.get("route_type", ""))
         if mode is None:
             continue
@@ -266,17 +308,25 @@ def _rail_profiles(
         routes[row.get("route_id", "")] = index.setdefault(profile, len(profiles))
         if len(index) > len(profiles):
             profiles.append(profile)
+    census.rail_routes = len(routes)
     return routes, profiles
 
 
 def _rail_trips(
-    zf: zipfile.ZipFile, files: dict[str, str], routes: dict[str, int], budget: Budget
+    zf: zipfile.ZipFile,
+    files: dict[str, str],
+    routes: dict[str, int],
+    budget: Budget,
+    census: GtfsCensus,
 ) -> dict[str, int]:
     trips: dict[str, int] = {}
+    read = 0
     for row in _rows(zf, files["trips.txt"], budget):
+        read += 1
         profile = routes.get(row.get("route_id", ""))
         if profile is not None:
             trips[row.get("trip_id", "")] = profile
+    census.trips, census.rail_trips = read, len(trips)
     return trips
 
 
@@ -398,19 +448,26 @@ def _add_codes(station: Station, row: dict[str, str]) -> None:
         station.add_code(name, row.get(name))
 
 
-def read_gtfs(zf: zipfile.ZipFile, provider_id: str) -> dict[str, Station]:
-    """The rail stations of the GTFS archive `zf`, by station key."""
+def read_gtfs(
+    zf: zipfile.ZipFile, provider_id: str, census: GtfsCensus | None = None
+) -> dict[str, Station]:
+    """The rail stations of the GTFS archive `zf`, by station key. `census`,
+    when given, is filled with what was seen, as far as the reading went."""
     files = members(zf)
     missing = [name for name in _REQUIRED if name not in files]
     if missing:
         raise ArchiveError("bad_archive", f"GTFS without {', '.join(missing)}")
     check_declared(zf, [files[name] for name in ("agency.txt", *_REQUIRED) if name in files])
+    census = census if census is not None else GtfsCensus()
     budget = Budget()
-    routes, profiles = _rail_profiles(zf, files, provider_id, budget)
-    trips = _rail_trips(zf, files, routes, budget) if routes else {}
+    routes, profiles = _rail_profiles(zf, files, provider_id, budget, census)
+    trips = _rail_trips(zf, files, routes, budget, census) if routes else {}
     del routes
     calls = _calls(zf, files, trips, budget) if trips else {}
     del trips
+    if census.rail_trips is not None:
+        census.called_stops = len(calls)
+        census.rail_calls = sum(sum(counts.values()) for counts in calls.values())
     if not calls:
         return {}
     stations = _stations(zf, files[_STOPS], calls, profiles, budget)
