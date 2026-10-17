@@ -673,6 +673,8 @@ def _describe(
         rows = sum(1 for _ in fh) - 1
     if rows < 1:
         raise ExtractError("cache", "an extract without a row")
+    if summary is None:
+        summary = _read_counts(path) if meta.default_rail else ""
     return ExtractResult(
         path_gz=path,
         feed_key=meta.feed_key,
@@ -682,9 +684,7 @@ def _describe(
         bytes=path.stat().st_size,
         body_sha256=digest.hexdigest(),
         dropped=dict(dropped),
-        summary=summary
-        if summary is not None
-        else (_read_counts(path) if meta.default_rail else ""),
+        summary=summary,
     )
 
 
