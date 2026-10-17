@@ -317,6 +317,26 @@ def _validate_cross_border_filter(tt: dict[str, Any], index: int) -> dict[str, A
     return out
 
 
+# A timetable's `default_mode`: "rail" (the feed is rail when the file names
+# no mode, `station_extract.default_rail`), or absent. Only rail: the stop
+# extract is of rail stations.
+DEFAULT_MODE_RAIL = "rail"
+
+
+def _default_mode(raw: object, index: int) -> bool:
+    """Whether a timetable's `default_mode` is rail: True for "rail" (any
+    case, spaces around), False when absent (None, "", false); anything
+    else is refused."""
+    if raw is None or raw is False or raw == "":
+        return False
+    if isinstance(raw, str) and raw.strip().lower() == DEFAULT_MODE_RAIL:
+        return True
+    raise ValueError(
+        f'providers[{index}].timetable.default_mode={raw!r} must be "rail" or absent '
+        "(the feed is rail when the file names no mode)"
+    )
+
+
 def _validate_provider(raw: object, index: int) -> dict[str, Any]:
     """Validate one provider entry, returning the cleaned dict.
 
@@ -388,6 +408,9 @@ def _validate_provider(raw: object, index: int) -> dict[str, Any]:
         timetable["resolver"] = validate_resolver(
             tt.get("resolver"), f"providers[{index}].timetable.resolver"
         )
+    # A derived (cross-border) feed gives no stop extract: no default mode.
+    if _default_mode(tt.get("default_mode"), index) and source != "cross_border_filter":
+        timetable["default_mode"] = DEFAULT_MODE_RAIL
 
     # ── gtfs_rt (optional) ───────────────────────────────────────────
     gtfs_rt_raw = raw.get("gtfs_rt") or {}

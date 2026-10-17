@@ -26,7 +26,9 @@ stay in the inbox until the next "Refresh providers", which renames them to
 (`all`, or comma-separated ids) and is a dry run unless `--apply` is given.
 Each line shows the entry's provenance - NAP, official (no NAP listing
 confirmed) or COMMUNITY - which the labels also carry. Countries with no
-master_stations rows are refused, as on the admin page: import them from
+master_stations rows that the station module does not serve are accepted with a
+warning when VIATOR uses the module (their stations come from it once their feed
+is accepted there), and refused otherwise, as on the admin page: import them from
 Trainline first. Saving writes a `session.providers.added` audit row.
 """
 
@@ -39,11 +41,9 @@ from collections import defaultdict
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
 
-from app import audit, ingestion, provider_catalogue, staleness, station_module
+from app import audit, country_gate, ingestion, provider_catalogue, staleness, station_module
 from app.db import SessionLocal
-from app.models import MasterStation
 from app.models import Session as SessionRow
 
 TDG_API = "https://transport.data.gouv.fr/api/datasets"
@@ -136,20 +136,13 @@ def remove(db, s, ids: set[str], apply: bool) -> int:
 
 def _countries_without_stations(db, countries: set[str]) -> set[str]:
     """The countries with no master_stations row that the station module
-    does not serve either: the session save's gate
-    (app/api/admin/sessions.py `_unserved`), the module asked only when the
-    Trainline list lacks a country, and the Trainline list alone when the
-    module does not answer."""
-    rows = db.execute(
-        select(MasterStation.country_iso, func.count())
-        .where(MasterStation.country_iso.in_(countries))
-        .group_by(MasterStation.country_iso)
-    ).all()
-    missing = countries - {ci for ci, n in rows if n > 0}
+    does not serve either: the session save's gate (app/country_gate.py),
+    the module asked only when the Trainline list lacks a country, and the
+    Trainline list alone when the module does not answer."""
+    missing = country_gate.countries_without_stations(db, countries)
     if not missing:
         return missing
-    served = station_module.countries_blocking()
-    return missing if served is None else missing - served
+    return country_gate.unserved_by_module(missing, station_module.countries_blocking())
 
 
 def add(db, s, wanted: set[str] | None, apply: bool) -> int:
@@ -179,10 +172,15 @@ def add(db, s, wanted: set[str] | None, apply: bool) -> int:
         if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
     }
     missing = _countries_without_stations(db, {e["country_iso"] for e in to_add} - stored)
-    if missing:
+    if missing and station_module.enabled():
+        # As on the admin page: a new country is accepted with a warning;
+        # its stations come from the station module once its feed is
+        # accepted there (app/country_gate.py).
+        print(f"WARNING: {country_gate.new_country_warning(missing)}", file=sys.stderr)
+    elif missing:
         print(
-            f"no master_stations rows for {', '.join(sorted(missing))}, and the station module "
-            "does not serve them (or did not answer) - import them from "
+            f"no master_stations rows for {', '.join(sorted(missing))}, and VIATOR does not use "
+            "the station module - import them from "
             "Trainline first (Admin > Stations, Refresh from Trainline), then re-run. Nothing written.",
             file=sys.stderr,
         )

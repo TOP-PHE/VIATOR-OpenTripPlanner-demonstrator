@@ -821,6 +821,39 @@ def test_a_config_saved_during_a_download_is_kept(
         assert row.config["sources"]["providers"][0]["id"] == "ZZRAIL"
 
 
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_config_saved_during_an_osm_download_is_kept(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #366: the OSM refresh writes the config after its download
+    too (the refresh time): it re-reads the row under a lock first."""
+    from app.api.admin import sessions as sessions_api
+    from app.db import SessionLocal
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL"])
+    with SessionLocal() as db:
+        s = db.get(SessionRow, SID)
+        assert s is not None
+        s.config = {**s.config, "sources": {**s.config["sources"], "osm_pbf": _url("osm")}}
+        db.commit()
+
+    async def fetched_while_saved(*_args: Any) -> dict[str, Any]:
+        _edit_config_meanwhile(0)
+        return {"status": "fetched", "key": "osm_pbf"}
+
+    monkeypatch.setattr(sessions_api, "_refresh_one_task", fetched_while_saved)
+    r = client.post(f"/api/sessions/{SID}/sources/osm/refresh", headers=admin)
+    assert r.status_code == 200, r.text
+    assert [f["key"] for f in r.json()["fetched"]] == ["osm_pbf"]
+    with SessionLocal() as db:
+        row = db.get(SessionRow, SID)
+        assert row is not None
+        assert row.config["zz_note_0"] == 99
+        assert row.config["_meta"]["last_refresh_completed_at"]
+        assert row.config["sources"]["osm_pbf"] == _url("osm")
+
+
 @pytest.mark.usefixtures("fresh_db")
 def test_a_card_record_stays_while_its_follow_up_runs(
     client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch

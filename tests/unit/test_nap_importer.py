@@ -264,6 +264,63 @@ class TestSlugToProviderId:
         assert slug_to_provider_id("###") == ""
         assert slug_to_provider_id("") == ""
 
+    # 17 October: accented letters were dropped ("Région ..." gave "RGION...").
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RÉGION ZZÉLAND", "REGION"),  # the first all-caps word, whole
+            ("Région Zzéland", "REGIONZZELAND"),
+            ("Zzölstadt Bahn", "ZZOLSTADTBAHN"),
+            ("Łzz Kolej", "LZZKOLEJ"),
+            ("Øzz Tog", "OZZTOG"),
+            ("Đzzovo", "DZZOVO"),
+            ("Zzstraße", "ZZSTRASSE"),
+            ("\u00e6zz \u0153zz", "AEZZOEZZ"),
+            ("ÉZZ", "EZZ"),
+            ("zzz\u0301", "ZZZ"),  # a combining accent on its own
+        ],
+        ids=lambda value: value.encode("ascii", "backslashreplace").decode(),
+    )
+    def test_accented_letters_are_written_in_ascii(self, name: str, expected: str) -> None:
+        from app.master.nap_importer import slug_to_provider_id
+
+        assert slug_to_provider_id(name) == expected
+
+    def test_ascii_letters_leaves_other_characters(self) -> None:
+        from app.master.nap_importer import ascii_letters
+
+        assert ascii_letters("Zz-99 \u00ff \u014b \u0131") == "Zz-99 y n i"
+        assert (
+            ascii_letters("\u0396\u03b6") == "\u0396\u03b6"
+        )  # not Latin: left as it is (then dropped from an id)
+
+    def test_the_letters_upper_case_would_hide(self) -> None:
+        """`.upper()` already turns ß into SS and the dotless i into I: the
+        map is tested on its own."""
+        from app.master.nap_importer import ascii_letters
+
+        assert ascii_letters("\u00df") == "ss"
+        assert ascii_letters("\u1e9e") == "SS"
+        assert ascii_letters("\u0131") == "i"
+        assert ascii_letters("\u00f0\u00fe\u0127") == "dthh"
+
+    def test_compatibility_characters_are_not_rewritten(self) -> None:
+        """NFD, not NFKD: the trade mark sign, one half or a superscript two
+        are not turned into letters or digits (then dropped from an id)."""
+        from app.master.nap_importer import ascii_letters, slug_to_provider_id
+
+        assert ascii_letters("Zz\u2122 \u00bd \u00b2") == "Zz\u2122 \u00bd \u00b2"
+        assert slug_to_provider_id("zzbahn\u2122") == "ZZBAHN"
+        assert slug_to_provider_id("zzbahn \u00bd") == "ZZBAHN"
+
+    def test_a_new_id_dedupes_against_the_old_form(self) -> None:
+        """A provider saved before keeps its id; the new form of the same
+        publisher's name is a different id, and dedupes as any other."""
+        from app.master.nap_importer import slug_to_provider_id
+
+        existing = {"RGIONZZLAND", "REGIONZZELAND"}
+        assert slug_to_provider_id("Région Zzéland", existing=existing) == "REGIONZZELAND-2"
+
 
 # ─────────────────── make_provider_from_dataset ───────────────────
 

@@ -212,7 +212,7 @@ def admin_sessions_page(
     # footgun where adding "rail-focused" worked at the API/runner
     # layer but the UI dropdown didn't expose it (form was hand-written
     # with three options and missed the new one).
-    from .. import osm_filter
+    from .. import country_gate, osm_filter
 
     return templates.TemplateResponse(
         request,
@@ -221,6 +221,9 @@ def admin_sessions_page(
             "current_user": user,
             "sessions": sessions,
             "osm_scope_presets": osm_filter.OSM_SCOPE_PRESETS,
+            # A lasting notice per session that declares a country without a
+            # station reference (computed at each load, nothing stored).
+            "country_notices": country_gate.page_notices(db, [(s.id, s.config) for s in sessions]),
         },
     )
 

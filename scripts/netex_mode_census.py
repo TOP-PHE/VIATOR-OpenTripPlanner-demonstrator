@@ -14,9 +14,13 @@ whole (a few megabytes of memory whatever the size). It prints counts and
 the names of NeTEx elements only, and the values of the mode elements
 (`TransportMode`, `VehicleMode`, `StopPlaceType`, the `...Submode`s) when a
 value is one word of letters, as the words of an enumeration are; any other
-value is counted as `unreadable`. Never an id, a name, a URL or a file name:
-the members are numbered, not named. A document that declares an entity is
-refused, and nothing outside the zip is ever loaded.
+value is counted as `unreadable`. An element name is printed only when it is
+one of letters, digits and `_` (at most 64, not starting with a digit), as
+NeTEx's are; any other is printed `(odd name)`. Never an id, a name, a URL
+or a file name: the members are numbered, not named. A document that
+declares an entity is refused, and nothing outside the zip is ever loaded.
+The output is UTF-8 whatever the console's encoding (a character it cannot
+show is replaced, never a traceback).
 
 What it prints:
 
@@ -34,6 +38,8 @@ What it prints:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import re
 import sys
 import zipfile
 from collections import Counter
@@ -71,16 +77,21 @@ _MODE_NAMES = frozenset({"TransportMode", "VehicleMode", "StopPlaceType", "MainT
 _REF_NAMES = frozenset({"RouteView", "LinesInFrame"})
 # Elements between an owner and what is counted, at most.
 PATH_DEPTH = 3
-# Distinct paths, and distinct values of one path, kept at most; the others
-# are counted together.
+# Distinct paths, distinct Frame names, and distinct values of one path, kept
+# at most; the others are counted together.
 PATHS_MAX = 2000
 VALUES_MAX = 30
 WORD_MAX = 32
 _CHUNK = 1 << 20
 OTHER = "(other)"
+OTHER_FRAME = "(other)Frame"
 UNREADABLE = "unreadable"
 EMPTY = "empty"
 _LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+# An element name as printed: else `ODD_NAME` (a crafted name could carry
+# text that is not an element's name).
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
+ODD_NAME = "(odd name)"
 
 
 class Refused(Exception):
@@ -92,11 +103,12 @@ OTHER_NAMESPACE = "(other ns)"
 
 def _local(name: str) -> str:
     """The local name of a NeTEx element (or of one without a namespace);
-    `(other ns)` for an element of any other namespace."""
+    `(other ns)` for an element of any other namespace, `(odd name)` for a
+    name that is not of `_NAME`'s form."""
     namespace, _, local = name.rpartition("}")
     if namespace and "netex" not in namespace:
         return OTHER_NAMESPACE
-    return local
+    return local if _NAME.fullmatch(local) else ODD_NAME
 
 
 def _namespace(name: str) -> str:
@@ -137,6 +149,18 @@ class Census:
     refs: Counter[str] = field(default_factory=Counter)  # reference path -> count
     holders: dict[str, Counter[str]] = field(default_factory=dict)  # owner -> held path -> count
     namespaces: Counter[str] = field(default_factory=Counter)
+    frames: int = 0  # distinct Frame names in `elements`
+
+    def element(self, local: str) -> str:
+        """Count an owner or a frame; past `PATHS_MAX` distinct Frame names,
+        a new one counts as `(other)Frame`. The name counted."""
+        if local not in self.elements and local not in _OWNERS:
+            if self.frames >= PATHS_MAX:
+                local = OTHER_FRAME
+            else:
+                self.frames += 1
+        self.elements[local] += 1
+        return local
 
     def value(self, path: str, value: str) -> None:
         if path not in self.values and len(self.values) >= PATHS_MAX:
@@ -199,8 +223,7 @@ class _Reader:
             self.member.root = local
         self.stack.append(local)
         if local in _OWNERS or local.endswith("Frame"):
-            self.member.owners[local] += 1
-            self.census.elements[local] += 1
+            self.member.owners[self.census.element(local)] += 1
         if local in _MODE_NAMES or local.endswith("Submode"):
             self.text, self.text_size = [], 0
         elif _is_counted(local):
@@ -234,11 +257,18 @@ def _refuse(*_args: Any) -> None:
     raise Refused("the document declares an entity")
 
 
+def _refuse_external(
+    _context: str, _base: str | None, _system_id: str | None, _public_id: str | None
+) -> int:
+    """expat's `ExternalEntityRefHandler`, of its type: never loads anything."""
+    raise Refused("the document names an external entity")
+
+
 def _parser(reader: _Reader) -> Any:
     parser = expat.ParserCreate(namespace_separator="}")  # nosec B314 - hardened below
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
     parser.EntityDeclHandler = _refuse
-    parser.ExternalEntityRefHandler = _refuse
+    parser.ExternalEntityRefHandler = _refuse_external
     parser.buffer_text = True
     parser.StartElementHandler = reader.start
     parser.EndElementHandler = reader.end
@@ -308,11 +338,23 @@ def report(census: Census, members: list[Member], others: int) -> list[str]:
     return lines
 
 
+def _utf8(stream: IO[str]) -> IO[str]:
+    """`stream` writing UTF-8, a character it cannot write replaced: a
+    console of another encoding (a Windows code page) never ends the census
+    with a traceback."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        # A stream that cannot change is written as it is.
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
+    return stream
+
+
 def main(argv: list[str] | None = None, out: IO[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0] if __doc__ else None)
     parser.add_argument("archive", help="the NeTEx zip")
     args = parser.parse_args(argv)
-    stream = out if out is not None else sys.stdout
+    stream = _utf8(out if out is not None else sys.stdout)
     try:
         census, members, others = read_archive(args.archive)
     except Exception as exc:  # any end, an encrypted or oddly packed member too: its type only,

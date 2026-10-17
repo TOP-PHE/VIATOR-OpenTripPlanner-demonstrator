@@ -136,6 +136,11 @@ def apply(
         if status == "applied":
             skipped.append({"id": pid, "reason": "already uses this source"})
             continue
+        default_mode = (provider.get("timetable") or {}).get("default_mode")
         provider["timetable"] = copy.deepcopy(proposed)
+        if default_mode:
+            # The same feed from another source: the operator's "rail when
+            # the file names no mode" stays.
+            provider["timetable"]["default_mode"] = default_mode
         changed.append(pid)
     return new_config, changed, skipped
