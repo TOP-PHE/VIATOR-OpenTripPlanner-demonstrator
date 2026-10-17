@@ -121,6 +121,17 @@ from NAP** button on the Configure section opens a modal that:
 5. **Confirm** — providers persisted to `session.config.sources.providers[]`,
    country-gate runs, staleness banner appears
 
+Each new provider's **id** comes from the publisher's name (else the
+dataset's title): its first all-caps word, else the whole name in capitals
+without the characters an id cannot hold. Since 17 October the accented
+letters are first written in ASCII (É → E, ö → o, ł → l, ß → SS, …):
+"Région Zzéland" gives `REGIONZZELAND`, where it gave `RGIONZZLAND`
+before. **The ids of providers already saved never change** (an id keys
+the provider's stored file, its fetch state, its stop extracts and its
+feed in the station module): only providers imported from then on get the
+new form, so a later import of another dataset of the same publisher may
+read `REGIONZZELAND` beside an older `RGIONZZLAND`.
+
 Same machinery works against any DCAT-AP-style NAP — just paste the
 endpoint URL (e.g. German `mobilithek.info`, Trafiklab Sweden). API
 responses cached 5 min in-process to keep preview→confirm cycles snappy.
@@ -747,7 +758,7 @@ state) for forensics.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Save config returns `409 missing_master_stations_for_countries` | A provider declares `country_iso=X` but `master_stations` has zero rows for X and the station module does not serve X (or did not answer) | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline**. Then retry **Save config**. |
+| Save config returns `409 missing_master_stations_for_countries` | A provider declares `country_iso=X` but `master_stations` has zero rows for X and VIATOR does not use the station module (with the module, such a new country is accepted with a warning and the graph build waits for the module to serve it: admin guide §11.1) | Operator-driven prerequisite: go to `/admin/master/stations` → click **Refresh from Trainline**. Then retry **Save config**. |
 | "Refresh sources now" returns `{"skipped": [{"reason": "unknown source key 'foo'"}]}` | You configured a key not in the recognised list (`gtfs`, `osm_pbf`, `netex_nordic`, `netex_epip`, `mct`, `stations`, or providers[]) | Use one of the recognised keys; the v0.1.6 UI emits providers[] form by default. |
 | Refresh succeeds for OSM PBF but build fails with "no GTFS found" | Provider's timetable URL returned a 404 / login page, not a real GTFS | `curl -sIL <url>` from the VPS to verify; some operators require a free account or have moved their endpoint. |
 | OTP build crashes with `OutOfMemoryError` (with `OTP_BUILD_PHASES=two_phase`, default) | `OTP_BUILD_HEAP` < what the bundle needs even after splitting phases | First check session's **OSM scope** — `transit-focused` cuts heap ~40%; bump down from `comprehensive` if currently set higher. If already `transit-focused` and still OOMs: bump `.env` `OTP_BUILD_HEAP=24g` + `OTP_BUILD_MEM_LIMIT=32g` for France-wide, `OTP_BUILD_HEAP=8g` + `OTP_BUILD_MEM_LIMIT=12g` for IDF. `docker compose up -d --force-recreate worker`. |

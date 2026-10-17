@@ -1077,6 +1077,14 @@ last **Refresh OSM**. A card refresh of a provider since removed from the sessio
 shown. While a card's refresh or a whole-session **Refresh providers** runs, that card's **Refresh**
 button is disabled.
 
+**Save config first.** A card's **Refresh** and **Upload to this provider** act on the provider as
+it is *saved*: they are disabled, with the tooltip "Save config first", on a card that was never
+saved (a card just added, or whose Provider ID was changed) and on a card with changes not saved yet
+(any field edited; choosing the file to upload is not a change). **Save config** enables them again.
+Asked directly for a provider that is not in the saved configuration, the server answers 404 "This
+provider is not in the saved configuration of the session: save the configuration first." (it no
+longer lists every provider id of the session).
+
 What the block says:
 
 | Line | Meaning |
@@ -2713,8 +2721,9 @@ containers (the worker since MSMM decision 6, 11.3):
   it fresh, as does **Refresh from Trainline** on the Stations page. No
   station of the module is copied into it.
 - **The country check of sessions.** Creating a session with providers,
-  saving a session's providers (Save config) and the bulk import from a
-  NAP check the country each provider declares. A country passes when VIATOR's Trainline list has stations in
+  saving a session's providers (Save config), the bulk import from a NAP
+  and `scripts/session_providers.py --add` check the country each provider
+  declares. A country passes when VIATOR's Trainline list has stations in
   it, **or when the station module serves stations in it** (the module's
   design, decision D-R12 B): VIATOR asks the module for the countries of
   its served stations only when the Trainline list lacks one, and keeps the
@@ -2722,14 +2731,38 @@ containers (the worker since MSMM decision 6, 11.3):
   already among the session's saved providers passed when it was saved,
   and is never refused later because the module is down (the warning that
   the OSM file may not cover a country still looks at every declared
-  country). A country neither
-  knows is refused as before, with the same message code
-  (`missing_master_stations_for_countries`) and the same advice: refresh
-  from Trainline; the message says whether VIATOR does not use the module,
-  or the module does not serve the country (or did not answer). When the
-  module is not used or does not answer, the Trainline list alone decides,
-  as before, and the `web` log says `station_module.countries_failed
-  reason=<word>`.
+  country).
+- **A new country** (one neither knows yet, such as a first Estonian
+  feed): the module serves a country only after it has received a feed of
+  it from VIATOR and an administrator accepted that feed there, and VIATOR
+  sends the feed only once the provider is saved. So, **when VIATOR uses
+  the station module, the save is accepted with a warning** (a toast on
+  the page, `X-Warnings` in the answer, a line of `warnings` for the bulk
+  import): "New country ['EE']: … Its stations will come from the station
+  module once the feed is accepted there …". Then: **Refresh** the
+  provider (its stop extract is sent to the module), **accept the feed**
+  on the module's Timetable feeds screen, let the module's station build
+  run (a Rebuild graph asks for one), and the country is served. When the
+  module did not answer at the save, the country is taken as new too
+  (never as served on a guess). **When VIATOR does not use the module**,
+  nothing but the Trainline list could give the country its stations: the
+  save is refused as before (409 `missing_master_stations_for_countries`,
+  advice: refresh from Trainline).
+- **The graph build checks it again.** Before building a session's graph
+  (after the stop extracts were sent and, for MOTIS, the module's station
+  build waited for), the worker checks every country the session declares
+  the same way. A country neither the Trainline list nor the module knows
+  stops the build: the job ends **failed**, no build container started,
+  with the log line `[viator] graph not built:
+  missing_master_stations_for_countries ['EE']: …` and what to do (accept
+  the feed in the module and let its station build run, or import the
+  country from Trainline; then Rebuild graph); the worker's log says
+  `rebuild refused session=<sid> reason=missing_master_stations_for_countries
+  countries=EE`. When the module is used but does not answer, the build is
+  not stopped (`country_gate.not_checked reason=module_unanswered` in the
+  worker's log): a module that is down must not stop every graph. The
+  `web` log says `station_module.countries_failed reason=<word>` whenever
+  the module did not answer.
 - **A text the module would refuse is not sent.** The typeahead and the
   Stations page search a text of 3 to 100 characters that still holds 3
   once the module reads its punctuation (`, ; : . / \ ( ) [ ] { } " ! ? * +
@@ -3222,6 +3255,33 @@ the extracts changes no graph build.
     assignments near 3 GB of unpacked XML, measured at 951 MiB; the caps
     of assignments and called points were raised from 2 to 4 million by
     the owner's decision of 16 October, the child's 2 GiB unchanged).
+- **A feed that names no mode: "This feed is rail when the file names no
+  mode".** Some national exports name no mode anywhere: no
+  `TransportMode` on their Lines, journeys or stop places, no
+  `StopPlaceType` (the Belgian railway's NeTEx, for one). The extractor
+  cannot tell their stations are rail and the feed ends `no_rail_stop`,
+  its census showing `kept none:…`, `stop_place_modes none:…` and
+  `stop_place_types none:…`. Tick the provider card's checkbox **This
+  feed is rail when the file names no mode** (`timetable.default_mode:
+  "rail"`), Save config, then Refresh the provider. A journey that gives
+  no mode, on itself and on its Line, then counts at a stop place that
+  gives no mode and no type as main rail (suburban rail when its submode
+  says so); for GTFS, a route without a `route_type`. **Safe for a feed of
+  one rail operator**: every journey in it is a train. **Never for a feed
+  that mixes modes** (a regional network with buses, a multimodal NAP
+  aggregate): its buses would be taken for trains wherever the file says
+  nothing. A mode the file does give always wins: a journey, Line or stop
+  place that says bus, tram, coach, metro or `other` stays not rail, and a
+  stop place typed `busStation` too. Such an extract carries its own
+  extractor version (`viator-stop-extract-2+rail-default`): it is made
+  again at the next refresh even when the file is unchanged (a remembered
+  `no_rail_stop` is not reused), reaches the module as a new version of
+  the feed, and the station-module column says `rail by default (the feed
+  names no mode)`; a feed that still has no rail station shows `saw: rail
+  by default: <n> calls at <m> stop places, …` first. Unticking it makes
+  the plain extract again; in the module, the version made rail by
+  default stays the active one for that same file until the feed's next
+  file (the module prefers the newer extractor of one file).
 - **A feed without a rail station: what the extractor saw.** For
   `no_rail_stop` and `no_stop_place` the station-module column shows, under
   the reason's sentence, a line `saw: …` of at most 100 characters (kept
@@ -3264,7 +3324,9 @@ the extracts changes no graph build.
     `unknown`, `all`, `anyMode` and the deprecated `urbanRail` (metro or
     rail, the stop place tells) — counts as none (the stop place decides),
     and the deprecated `intercityRail` as rail (since 16 October, extractor
-    version 2; before, such journeys were dropped as not rail); `other` (a
+    version 2; before, such journeys were dropped as not rail; unlike the
+    module's offline chain, where `intercityRail` maps to nothing and the
+    stop place decides); `other` (a
     mode outside NeTEx's list) stays not rail. The new extractor version
     makes every feed's extract again once, smallest files first, and sends
     each to the module as a new version; a remembered `no_rail_stop` is
@@ -3279,8 +3341,9 @@ the extracts changes no graph build.
     module a feed it already knows keeps its state (an accepted feed stays
     accepted: the intake never changes the state of a known feed); the new
     version passes the module's guard and becomes the active one, or is
-    held for review there when it differs (fewer stations, other
-    operators). A feed new to the module (one that never gave an extract,
+    held for review there when it differs enough: far fewer stations
+    (below 80 % of the active version's; a smaller drop passes), a
+    station only this feed supported gone, or another set of operators. A feed new to the module (one that never gave an extract,
     such as a national feed that ended `no_rail_stop`) arrives `pending` and
     waits for an administrator's acceptance in the module.
   - **When the census is not enough** (a NeTEx feed that should have rail
