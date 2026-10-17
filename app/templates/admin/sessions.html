@@ -990,6 +990,23 @@ function timetableSourceRowsHTML(tt, ttSource, df, railOnly) {
           </div>`;
 }
 
+// "Rail by default" (timetable.default_mode = "rail"): for a single-operator
+// rail feed whose file names no mode anywhere (app/station_extract_netex.py).
+function timetableDefaultRailHTML(tt) {
+  return `
+          <label class="prov-tt-default-rail-row" style="display:inline-flex;align-items:center;gap:.4rem;margin-top:.45rem"
+                 title="For the station module's stop extract: a journey whose file gives no mode, at a stop place that gives none either, is read as rail">
+            <input class="prov-tt-default-rail" type="checkbox" ${tt.default_mode === 'rail' ? 'checked' : ''}>
+            This feed is rail when the file names no mode
+          </label>
+          <p class="hint" style="margin: 0.15rem 0 0">
+            Tick it only for a single-operator rail feed whose file names no mode anywhere (no mode on
+            its lines, journeys or stop places), so that its stations reach the station module. A mode
+            the file does give always wins (bus, tram, coach… stay what they are). Never for a feed
+            that mixes rail with other modes.
+          </p>`;
+}
+
 // §12 — derived-card pickers. The "From session / From provider" fields are
 // <select>s filled from the live session list (one cached fetch), so the link
 // can't be mistyped. The saved value is preserved even if it's no longer in the
@@ -1202,6 +1219,7 @@ function providerCardHTML(p, opts) {
           </div>
           ${timetableSourceRowsHTML(tt, ttSource, df, railOnly)}
           ${timetableCredentialRowHTML(p.timetable_credential_id, ttSource)}
+          ${timetableDefaultRailHTML(tt)}
           <p class="hint" style="margin: 0.25rem 0 0">
             NeTEx-FR is intentionally absent — OTP can't read it. For NeTEx-FR archive-only
             (compliance), use the <em>Upload a file</em> form below with declared standard
@@ -1373,6 +1391,7 @@ function readProviderCard(card) {
   }
   const timetable = {format: ttFormat, source: ttSource};
   if (!collectTimetableSource(card, id, ttSource, timetable)) return null;
+  if (card.querySelector('.prov-tt-default-rail')?.checked) timetable.default_mode = 'rail';
   const provider = {
     id,
     label: label || id,
@@ -1425,6 +1444,7 @@ function populateProvidersList(form, sources) {
     rows.insertAdjacentHTML('beforeend', providerCardHTML(p, {openByDefault: i === 0})),
   );
   syncProvidersToolbar(form);
+  syncSaveFirst(form);
   // §12 — fill any derived-card session/provider dropdowns from the live list.
   rows.querySelectorAll('.provider-card').forEach((c) => {
     if (c.querySelector('.prov-derived-session')) populateDerivedCard(c);
@@ -1832,16 +1852,24 @@ function progressCardBusy(body, pid) {
   return mine ? "This provider's refresh is running: its progress is shown under the buttons." : null;
 }
 
+// A card button's state from its reasons: an unsaved card (`dataset.unsaved`,
+// the save-first block below), a refresh running (`dataset.progressBusy`), a
+// click waiting for its answer (`dataset.busy`); the reason is its tooltip.
+function cardButtonState(btn) {
+  if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title || '';
+  const why = btn.dataset.unsaved || btn.dataset.progressBusy || '';
+  btn.disabled = Boolean(why) || btn.dataset.busy === '1';
+  btn.title = why || btn.dataset.idleTitle;
+}
+
 function renderCardButtons(sid, body) {
   const form = document.querySelector(`form[data-form="config"][data-sid="${CSS.escape(sid)}"]`);
   if (!form) return;
   form.querySelectorAll('button[data-action="refresh-provider"]').forEach(btn => {
     const card = btn.closest('.provider-card');
     const idInput = card && card.querySelector('.prov-id');
-    const busy = progressCardBusy(body, idInput ? idInput.value.trim() : '');
-    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title || '';
-    btn.disabled = Boolean(busy) || btn.dataset.busy === '1';
-    btn.title = busy || btn.dataset.idleTitle;
+    btn.dataset.progressBusy = progressCardBusy(body, idInput ? idInput.value.trim() : '') || '';
+    cardButtonState(btn);
   });
 }
 
@@ -1940,6 +1968,56 @@ function watchRefreshProgress(sid) {
   setTimeout(() => loadRefreshProgress(sid), 500);
 }
 // ── end refresh progress ──────────────────────────────────────────────
+
+// ── Save first (a provider card's Refresh and Upload) ─────────────────
+// Both act on the provider as SAVED: the server does not know a card that was
+// never saved (404 / 400), and would fetch or check with the saved settings of
+// a card whose changes are not saved yet. Disabled meanwhile, "Save config
+// first" as the tooltip, until Save config succeeds.
+const SAVE_FIRST = 'Save config first: this provider card has changes that are not saved yet.';
+const _SAVE_FIRST_BUTTONS = 'button[data-action="refresh-provider"],button[data-action="upload-provider"]';
+
+function savedProviderIds(sid) {
+  const row = document.querySelector(`tr[data-sid="${CSS.escape(sid)}"]`);
+  let config = {};
+  try { config = JSON.parse((row && row.dataset.config) || '{}'); } catch (err) {
+    console.warn('saved session config unreadable', err);
+  }
+  const providers = (config && config.sources && config.sources.providers) || [];
+  return new Set(Array.isArray(providers) ? providers.map(p => p && p.id).filter(Boolean) : []);
+}
+
+function cardSaveFirst(card, savedIds) {
+  const idInput = card.querySelector('.prov-id');
+  const id = idInput ? idInput.value.trim() : '';
+  return card.dataset.dirty === '1' || !savedIds.has(id) ? SAVE_FIRST : '';
+}
+
+function syncSaveFirst(form) {
+  const savedIds = savedProviderIds(form.dataset.sid);
+  form.querySelectorAll('.provider-card').forEach(card => {
+    const reason = cardSaveFirst(card, savedIds);
+    card.querySelectorAll(_SAVE_FIRST_BUTTONS).forEach(btn => {
+      btn.dataset.unsaved = reason;
+      cardButtonState(btn);
+    });
+  });
+}
+
+// Any edit of a card (the file picked for an upload is not a setting).
+function markCardEdited(form, target) {
+  const card = target.closest ? target.closest('.provider-card') : null;
+  if (!card || target.matches('.prov-tt-file')) return;
+  card.dataset.dirty = '1';
+  syncSaveFirst(form);
+}
+
+// After a successful Save config (the row holds the saved config).
+function markCardsSaved(form) {
+  form.querySelectorAll('.provider-card').forEach(card => { delete card.dataset.dirty; });
+  syncSaveFirst(form);
+}
+// ── end save first ────────────────────────────────────────────────────
 
 // ── Automated NAP sources (per-country switch) ─────────────────────────
 // GET /nap-sources groups the session's mapped providers by country; POST
@@ -2275,7 +2353,7 @@ async function refreshOneProvider(form, refreshBtn) {
   } catch (err) { showToast('error', String(err)); }
   finally {
     delete refreshBtn.dataset.busy;
-    refreshBtn.disabled = false;
+    cardButtonState(refreshBtn);
     refreshBtn.textContent = original;
     loadRefreshProgress(sid);
   }
@@ -2304,6 +2382,7 @@ async function uploadToProvider(form, uploadBtn) {
   fd2.append('provider_id', pid);
   fd2.append('file', file);
   uploadBtn.disabled = true;
+  uploadBtn.dataset.busy = '1';
   const original = uploadBtn.textContent;
   uploadBtn.textContent = 'Uploading…';
   try {
@@ -2320,7 +2399,11 @@ async function uploadToProvider(form, uploadBtn) {
     loadProviderStatuses(sid, form);
     loadJobs(sid);
   } catch (err) { showToast('error', String(err)); }
-  finally { uploadBtn.disabled = false; uploadBtn.textContent = original; }
+  finally {
+    delete uploadBtn.dataset.busy;
+    cardButtonState(uploadBtn);
+    uploadBtn.textContent = original;
+  }
 }
 
 // ─── Geographic OSM scope checklist (v0.1.40) ────────────────────────
@@ -2372,6 +2455,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       ),
     );
     syncProvidersToolbar(form);
+    syncSaveFirst(form);
     fillCredentialPickers(rows.lastElementChild);
   });
 
@@ -2455,6 +2539,9 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     const summaryLabel = (label || id || '(unnamed)') + (country ? ` — ${country}` : '');
     card.querySelector('.prov-summary-label').textContent = summaryLabel;
   });
+  // Save first: an edited card's Refresh and Upload wait for Save config.
+  form.addEventListener('input', (e) => markCardEdited(form, e.target));
+  form.addEventListener('change', (e) => markCardEdited(form, e.target));
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2531,6 +2618,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     }
     const updated = await r.json();
     row.dataset.config = JSON.stringify(updated.config);
+    markCardsSaved(form);
     // Refresh the staleness banner — saving a URL change should make it
     // appear; saving a non-sources change (osm_scope only) should leave
     // it as-is (server only bumps sources_changed_at when sources change).

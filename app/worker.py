@@ -28,6 +28,7 @@ from typing import Any
 from sqlalchemy import func, update
 
 from . import (
+    country_gate,
     engine_versions,
     graph_snapshots,
     netex_calendar,
@@ -521,30 +522,72 @@ def _run_engine_build(
     after the station module's build has ended (MSMM decision 6): the wait
     comes after the upload, so that the build sees the new extracts, and
     whatever ends the upload or the wait the graph is built, unless the
-    operator cancelled the job meanwhile."""
-    if session_id is not None:
-        try:
-            sent = _send_station_extracts(job_id, session_id)
-        except Exception as exc:
-            # The upload must never keep the graph from being built.
-            log.warning("station extracts not sent for job %s (%s)", job_id, type(exc).__name__)
-        else:
-            if sent.cancelled:
-                return _CANCELLED_WHILE_SENDING, False, ""
+    operator cancelled the job meanwhile, or a country of the session has
+    no station reference (`_country_refusal`)."""
+    if session_id is not None and _sending_cancelled(job_id, session_id):
+        return _CANCELLED_WHILE_SENDING, False, ""
+    if engine == "motis" and _waiting_cancelled(job_id):
+        return _CANCELLED_WHILE_WAITING, False, ""
+    refusal = _country_refusal(session_id)
+    if refusal:
+        return refusal, False, ""
     if engine == "motis":
-        try:
-            waited = _wait_for_station_build(job_id)
-        except Exception as exc:
-            # The wait must never leave the job `running` nor keep the graph
-            # from being built: build it anyway.
-            log.warning("station build wait failed for job %s (%s)", job_id, type(exc).__name__)
-        else:
-            if not waited.build_graph:
-                return _CANCELLED_WHILE_WAITING, False, ""
         return run_build_motis(
             session_id=session_id, max_memory=max_memory, container_name=container
         )
     return run_build(session_id=session_id, max_memory=max_memory, container_name=container)
+
+
+def _sending_cancelled(job_id: uuid.UUID, session_id: str) -> bool:
+    """Send the session's stop extracts the module lacks; True when the
+    operator cancelled the job meanwhile. The upload must never keep the
+    graph from being built: a failure is logged, and the build goes on."""
+    try:
+        sent = _send_station_extracts(job_id, session_id)
+    except Exception as exc:
+        log.warning("station extracts not sent for job %s (%s)", job_id, type(exc).__name__)
+        return False
+    return sent.cancelled
+
+
+def _waiting_cancelled(job_id: uuid.UUID) -> bool:
+    """Wait for the module's station build (MOTIS); True when the operator
+    cancelled the job meanwhile. The wait must never leave the job `running`
+    nor keep the graph from being built: a failure is logged, and the build
+    goes on."""
+    try:
+        waited = _wait_for_station_build(job_id)
+    except Exception as exc:
+        log.warning("station build wait failed for job %s (%s)", job_id, type(exc).__name__)
+        return False
+    return not waited.build_graph
+
+
+def _country_refusal(session_id: str | None) -> str:
+    """The country gate of a graph build (`country_gate.build_blocked`):
+    the log text of a build refused for a country neither VIATOR's Trainline
+    list nor the station module knows, or '' to build. Asked after the stop
+    extracts were sent and the module's station build waited for, so that a
+    feed accepted in the module meanwhile counts. A failure of the check
+    itself never stops the build."""
+    if session_id is None:
+        return ""
+    try:
+        with SessionLocal() as db:
+            session = db.get(SessionRow, session_id)
+            blocked = country_gate.build_blocked(db, session.config if session else None)
+    except Exception as exc:
+        log.warning("country gate not checked for %s (%s)", session_id, type(exc).__name__)
+        return ""
+    if not blocked:
+        return ""
+    log.warning(
+        "rebuild refused session=%s reason=%s countries=%s",
+        session_id,
+        country_gate.GATE_ERROR,
+        ",".join(sorted(blocked)),
+    )
+    return country_gate.build_refusal(blocked)
 
 
 def _send_station_extracts(job_id: uuid.UUID, session_id: str) -> station_extract_upload.PassResult:

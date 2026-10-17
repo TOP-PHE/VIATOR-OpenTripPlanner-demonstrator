@@ -42,12 +42,13 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ... import (
     audit,
+    country_gate,
     detect,
     feed_fetch,
     feed_resolvers,
@@ -63,7 +64,7 @@ from ... import (
     station_module,
 )
 from ...db import get_db
-from ...models import AuditEvent, GraphSnapshot, MasterStation, RebuildJob, Upload
+from ...models import AuditEvent, GraphSnapshot, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionEngine, SessionState
 from ...security import (
@@ -187,6 +188,7 @@ def list_sessions(
 def create_session(
     body: SessionCreate,
     request: Request,
+    response: Response,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> SessionResponse:
@@ -203,10 +205,11 @@ def create_session(
         raise HTTPException(400, "Sessions can only be created by JWT-authenticated admins")
     # The country gate of a save, on the providers a new session is created
     # with: they become its stored providers, which later saves no longer
-    # gate (`_stored_countries`).
-    missing = _gate_blocking(db, _stored_countries(body.config))
-    if missing:
-        raise _gate_409(missing, _SAVE_ADVICE)
+    # gate (`_stored_countries`). A new country is accepted with a warning
+    # when VIATOR uses the station module (`_new_countries`).
+    warning = _new_countries(_gate_blocking(db, _stored_countries(body.config)), _SAVE_ADVICE)
+    if warning:
+        response.headers["X-Warnings"] = json.dumps([warning])
 
     s = SessionRow(
         id=body.id,
@@ -370,18 +373,19 @@ def patch_session(
             # Country-gate: every provider that declares country_iso=X must
             # have at least one master_stations row with country_iso=X, or X
             # must be a country the station module serves (D-R12 B; asked
-            # only when the Trainline list lacks one: `_unserved`).
-            # Operator-driven: fail save with a clear message that includes
-            # which countries are missing AND suggests the Trainline-import
-            # action. UI surfaces this as a prompt with a one-click button.
+            # only when the Trainline list lacks one: `_unserved`). A country
+            # neither knows is accepted with a warning when VIATOR uses the
+            # module (the module serves it only after accepting a feed that
+            # VIATOR sends once this save is done; the graph build is gated,
+            # `country_gate.build_blocked`); without the module, refused with
+            # a clear message and the Trainline-import advice, as before.
             # Only the countries this save adds are gated: a country already
             # among the stored providers passed the gate when it was saved,
             # and must not be refused because the module is down or paused
             # now. Every declared country still feeds the OSM warning below.
             declared_countries = {p["country_iso"] for p in providers if p["country_iso"]}
             missing = _gate_blocking(db, declared_countries - _stored_countries(s.config))
-            if missing:
-                raise _gate_409(missing, _SAVE_ADVICE)
+            new_country = _new_countries(missing, _SAVE_ADVICE)
             # All checks passed — write back the canonicalised provider
             # list (drops empty fields, normalises country to upper-case,
             # etc.). Operator never sees the cleanup; the next GET returns
@@ -396,8 +400,9 @@ def patch_session(
                 body.config["sources"].get("osm_pbf"),
                 declared_countries,
             )
-            if osm_warning:
-                response.headers["X-Warnings"] = json.dumps([osm_warning])
+            warnings = [text for text in (new_country, osm_warning) if text]
+            if warnings:
+                response.headers["X-Warnings"] = json.dumps(warnings)
 
         # Track staleness: bump `sources_changed_at` if (and only if) the
         # `sources` subtree actually changed. Edits that only touch
@@ -900,28 +905,17 @@ def _osm_coverage_warning(osm_url: str | None, declared_countries: set[str]) -> 
     )
 
 
-def _countries_without_stations(db: DbSession, declared: set[str]) -> set[str]:
-    """Return the subset of `declared` ISO codes that have ZERO rows in
-    master_stations. Used by the country-gate at session-config-save time.
-
-    Empty input → empty output (cheap path; spares the round-trip).
-    Cheap-ish single SELECT GROUP BY query — covers the common case (all
-    countries already imported, returns no missing) at near-zero cost.
-    """
-    if not declared:
-        return set()
-    rows = db.execute(
-        select(MasterStation.country_iso, func.count())
-        .where(MasterStation.country_iso.in_(declared))
-        .group_by(MasterStation.country_iso)
-    ).all()
-    present = {ci for ci, count in rows if count > 0}
-    return declared - present
-
+# The country gate (`app/country_gate.py`): the Trainline rows, then the
+# station module for the gap.
+_countries_without_stations = country_gate.countries_without_stations
+_unserved = country_gate.unserved
+# The countries the stored providers of a session already declare: a save
+# gates only the countries it adds.
+_stored_countries = country_gate.declared_countries
 
 # The country gate's refusal (HTTP 409): the error word the pages and the
 # PowerShell scripts read, and the advice of each kind of save.
-_GATE_ERROR = "missing_master_stations_for_countries"
+_GATE_ERROR = country_gate.GATE_ERROR
 _SAVE_ADVICE = (
     "Import them from Trainline first (POST /api/master/stations/refresh-trainline), "
     "then retry this save."
@@ -930,7 +924,8 @@ _IMPORT_ADVICE = "Import them from Trainline first, then retry the bulk-import."
 
 
 def _gate_409(missing: set[str], advice: str) -> HTTPException:
-    """The country gate's refusal for the countries `missing`."""
+    """The country gate's refusal for the countries `missing`: given only
+    when VIATOR does not use the station module (`_new_countries`)."""
     return HTTPException(
         409,  # Conflict — semantically "preconditions not met"
         detail={
@@ -938,7 +933,7 @@ def _gate_409(missing: set[str], advice: str) -> HTTPException:
             "missing_countries": sorted(missing),
             "message": (
                 f"Cannot save: no master_stations rows for {sorted(missing)}, and "
-                f"{_module_side()}. {advice}"
+                f"VIATOR does not use the station module. {advice}"
             ),
         },
     )
@@ -955,38 +950,18 @@ def _gate_blocking(db: DbSession, added: set[str]) -> set[str]:
     return missing
 
 
-def _module_side() -> str:
-    """The country gate's words about the station module, for its 409."""
+def _new_countries(missing: set[str], advice: str) -> str | None:
+    """What a save does with the countries `missing` it adds that neither
+    the Trainline list nor the station module knows: with the module used,
+    accepted, and the warning to give (`country_gate`: the module serves a
+    country only after it accepted a feed VIATOR sends once the provider is
+    saved); without it, refused (409), as before. None for none."""
+    if not missing:
+        return None
     if not station_module.enabled():
-        return "VIATOR does not use the station module"
-    return "the station module does not serve them (or did not answer)"
-
-
-def _stored_countries(config: dict[str, Any] | None) -> set[str]:
-    """The countries the stored providers of a session already declare
-    (upper case), read as saved, without validating them: the country gate
-    checks only the countries a save adds."""
-    providers = ((config or {}).get("sources") or {}).get("providers") or []
-    if not isinstance(providers, list):
-        return set()
-    return {
-        p["country_iso"].upper()
-        for p in providers
-        if isinstance(p, dict) and isinstance(p.get("country_iso"), str) and p["country_iso"]
-    }
-
-
-def _unserved(missing: set[str], served: frozenset[str] | None) -> set[str]:
-    """The countries of `missing` (without a Trainline row) that the station
-    module does not serve either: D-R12 B of the module's design, "a
-    country the module serves" being one of its served stations' countries
-    (`station_module.countries`, its `GET /internal/v1/countries`). When
-    the module is not configured, paused or does not answer (`served` is
-    None), the gate is the Trainline list alone, as before: `missing` as it
-    is, never a country let through on a guess."""
-    if served is None:
-        return missing
-    return missing - served
+        raise _gate_409(missing, advice)
+    log.info("session.new_countries countries=%s", ",".join(sorted(missing)))
+    return country_gate.new_country_warning(missing)
 
 
 def _safe_float(v: str | None) -> float | None:
@@ -1442,6 +1417,9 @@ async def refresh_osm(
         run.phase(refresh_progress.FINISHING)
 
         if fetched:
+            # Under the row lock until the commit: a config saved during the
+            # download (a provider card's refresh, the config form) is kept.
+            _relock_session(db, s)
             if s.config is None:
                 s.config = {}
             staleness.mark_refresh_completed(s.config)
@@ -2344,10 +2322,11 @@ async def import_providers_from_nap(
     tracking) so the operator gets the "click Refresh sources before
     Rebuild" reminder.
 
-    Country-gate (v0.1.6) runs on each new provider: if any declares a
-    country with no master_stations rows, the save fails with the same
-    409 the manual save uses. Operator imports master_stations first,
-    then re-runs the bulk import.
+    Country-gate (v0.1.6) runs on each new provider, as on the manual save:
+    a country with no master_stations rows that the station module does
+    not serve is accepted with a warning (in `warnings`) when VIATOR uses
+    the module; without it, the import fails with the same 409 the manual
+    save uses (import master_stations first, then re-run the import).
     """
     s = db.get(SessionRow, sid)
     if s is None:
@@ -2478,8 +2457,9 @@ async def import_providers_from_nap(
         missing = _countries_without_stations(db, added_countries) if added_countries else set()
         if missing:
             missing = _unserved(missing, await station_module.countries())
-        if missing:
-            raise _gate_409(missing, _IMPORT_ADVICE)
+        new_country = _new_countries(missing, _IMPORT_ADVICE)
+        if new_country:
+            result["warnings"] = [*result["warnings"], new_country]
 
         # Persist canonicalised providers + bump staleness.
         sources["providers"] = providers_canon
@@ -2640,11 +2620,19 @@ async def _refresh_provider_urls(
     )
 
 
+_PROVIDER_NOT_SAVED = (
+    "This provider is not in the saved configuration of the session: save the configuration first."
+)
+
+
 @router.post(
     "/{sid}/providers/{pid}/refresh",
     responses={
         400: {"description": "No JWT actor, an invalid config, or no URL to refresh."},
-        404: {"description": "Session or provider not found."},
+        404: {
+            "description": "Session not found, or the provider is not in the saved "
+            "configuration (save the configuration first)."
+        },
         409: {
             "description": "A refresh of this provider alone, or the whole session's "
             "provider refresh, is running (`refresh_already_running`, with its scope "
@@ -2682,11 +2670,9 @@ async def refresh_provider(
         raise HTTPException(400, f"Session config is invalid: {exc}") from exc
     provider = next((p for p in providers if p["id"] == pid), None)
     if provider is None:
-        raise HTTPException(
-            404,
-            f"Provider {pid!r} not found in session {sid!r}. "
-            f"Known providers: {[p['id'] for p in providers]}",
-        )
+        # Short, and never the list of every provider id (a NAP-imported
+        # session has hundreds): the page refreshes only saved cards.
+        raise HTTPException(404, _PROVIDER_NOT_SAVED)
 
     # Derived providers own no URL — "Refresh this provider" re-runs the filter
     # instead of downloading (without this the URL path 400s "no URLs to refresh").

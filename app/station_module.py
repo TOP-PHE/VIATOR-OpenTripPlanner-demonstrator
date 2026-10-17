@@ -1154,8 +1154,12 @@ def _forget_countries() -> None:
         _state.countries = None
 
 
-def countries_blocking() -> frozenset[str] | None:
+def countries_blocking(*, fresh: bool = False) -> frozenset[str] | None:
     """`countries()` for a caller that runs outside the event loop (a
     synchronous route, run in a worker thread, or a script): its own short
-    event loop, the same deadline. Never call it from a coroutine."""
+    event loop, the same deadline. Never call it from a coroutine.
+    `fresh`: the cache is forgotten first (the graph build's country gate,
+    right after the module's station build)."""
+    if fresh:
+        _forget_countries()
     return asyncio.run(countries())
