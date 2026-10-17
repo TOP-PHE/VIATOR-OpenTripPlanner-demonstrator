@@ -20,7 +20,9 @@ has it.
 Order of reading:
 
 1. `agency.txt`: agency id -> name (the operators, 22.2 point 1);
-2. `routes.txt`: rail routes only, by `route_type` (22.2, point 2);
+2. `routes.txt`: rail routes only, by `route_type` (22.2, point 2); with
+   rail by default (the provider's `timetable.default_mode: "rail"`), a
+   route without a route_type too (`_route_mode`);
 3. `trips.txt`: the trips of those routes;
 4. `stop_times.txt`: the calls of those trips, counted per stop;
 5. `stops.txt` twice: first which station each called stop belongs to (its
@@ -84,9 +86,15 @@ class GtfsCensus(Census):
     rail_trips: int | None = None
     rail_calls: int | None = None
     called_stops: int | None = None
+    # Rail by default (the provider's setting): the routes without a
+    # route_type taken as rail. None: the setting is off.
+    rail_by_default: int | None = None
 
     def segments(self) -> list[list[str]]:
-        segments = [
+        segments: list[list[str]] = []
+        if self.rail_by_default is not None:
+            segments.append([f"rail by default: {self.rail_by_default:,} routes"])
+        segments += [
             tally_forms(self.routes.total, "routes", self.routes, "route_type "),
             [f"{self.rail_routes:,} rail routes"],
             self.stations_forms(),
@@ -106,6 +114,7 @@ class GtfsCensus(Census):
             ("rail_trips", self.rail_trips),
             ("rail_calls", self.rail_calls),
             ("called_stops", self.called_stops),
+            ("rail_by_default", self.rail_by_default),
             *super().fields(),
         ]
 
@@ -285,6 +294,15 @@ def _agencies(
     return names, only
 
 
+def _route_mode(route_type: str, census: GtfsCensus) -> str | None:
+    """`rail_mode`, and with rail by default (`census.rail_by_default` not
+    None) main rail for a route that gives no route_type, counted."""
+    if census.rail_by_default is not None and not route_type.strip():
+        census.rail_by_default += 1
+        return RAIL_MAIN
+    return rail_mode(route_type)
+
+
 def _rail_profiles(
     zf: zipfile.ZipFile, files: dict[str, str], provider_id: str, budget: Budget, census: GtfsCensus
 ) -> tuple[dict[str, int], list[tuple[str, str]]]:
@@ -295,7 +313,7 @@ def _rail_profiles(
     routes: dict[str, int] = {}
     for row in _rows(zf, files["routes.txt"], budget):
         census.routes.add(row.get("route_type", ""))
-        mode = rail_mode(row.get("route_type", ""))
+        mode = _route_mode(row.get("route_type", ""), census)
         if mode is None:
             continue
         agency_id = row.get("agency_id", "")
@@ -449,16 +467,25 @@ def _add_codes(station: Station, row: dict[str, str]) -> None:
 
 
 def read_gtfs(
-    zf: zipfile.ZipFile, provider_id: str, census: GtfsCensus | None = None
+    zf: zipfile.ZipFile,
+    provider_id: str,
+    census: GtfsCensus | None = None,
+    *,
+    default_rail: bool = False,
 ) -> dict[str, Station]:
     """The rail stations of the GTFS archive `zf`, by station key. `census`,
-    when given, is filled with what was seen, as far as the reading went."""
+    when given, is filled with what was seen, as far as the reading went.
+    `default_rail`: a route without a `route_type` (the column absent or
+    the cell empty: the feed names no mode) is main rail; a route_type
+    given keeps its meaning (3, bus: never rail)."""
     files = members(zf)
     missing = [name for name in _REQUIRED if name not in files]
     if missing:
         raise ArchiveError("bad_archive", f"GTFS without {', '.join(missing)}")
     check_declared(zf, [files[name] for name in ("agency.txt", *_REQUIRED) if name in files])
     census = census if census is not None else GtfsCensus()
+    if default_rail:
+        census.rail_by_default = 0
     budget = Budget()
     routes, profiles = _rail_profiles(zf, files, provider_id, budget, census)
     trips = _rail_trips(zf, files, routes, budget, census) if routes else {}

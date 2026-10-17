@@ -9,6 +9,7 @@ step (MSMM pull request 5 on the VIATOR side) sends it to the module.
 This module makes that file. Its public interface is small and stable:
 
     EXTRACTOR_VERSION
+    extractor_version_for(provider_cfg) -> str
     feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
     ensure_extract(provider_cfg, archive_path, archive_sha256, *,
                    extracted_at, session_id, cache_dir=None,
@@ -104,6 +105,18 @@ log = logging.getLogger(__name__)
 # `intercityRail` as rail (`station_extract_netex._mode`).
 EXTRACTOR_VERSION = "viator-stop-extract-2"
 
+# Rail by default (a provider's `timetable.default_mode: "rail"`, the one
+# value `ingestion` accepts): the readers take a journey (a GTFS route) that
+# names no mode, at a stop that names none either, as rail
+# (`station_extract_netex`, `station_extract_gtfs`). The same archive then
+# gives other rows, so such an extract carries its own extractor version,
+# `EXTRACTOR_VERSION` and this suffix: a version of its own in MSMM (whose
+# identity is the feed, the archive and the extractor version, 22.3 point
+# 1), its own cached file and its own remembered failure, so that a feed
+# remembered `no_rail_stop` is read again once the box is ticked.
+DEFAULT_MODE_RAIL = "rail"
+RAIL_BY_DEFAULT_SUFFIX = "+rail-default"
+
 # The feed keys MSMM accepts (MSMM `feed_intake.FEED_KEY_PATTERN`).
 FEED_KEY_PATTERN = (
     r"(?:nap:tdg:[1-9][0-9]{0,17}"
@@ -177,6 +190,20 @@ class ExtractResult:
 
 
 # ── The feed key (MSMM 22.2, point 6) ──────────────────────────────────────
+
+
+def default_rail(provider_cfg: Mapping[str, Any]) -> bool:
+    """Whether the provider's timetable is rail by default."""
+    timetable = provider_cfg.get("timetable")
+    return isinstance(timetable, Mapping) and timetable.get("default_mode") == DEFAULT_MODE_RAIL
+
+
+def extractor_version_for(provider_cfg: Mapping[str, Any], base: str | None = None) -> str:
+    """The extractor version of the provider's extracts: `base` (by default
+    `EXTRACTOR_VERSION`), with `RAIL_BY_DEFAULT_SUFFIX` when the provider is
+    rail by default."""
+    version = EXTRACTOR_VERSION if base is None else base
+    return version + RAIL_BY_DEFAULT_SUFFIX if default_rail(provider_cfg) else version
 
 
 def _sixteen_hex(text: str) -> str:
@@ -349,6 +376,8 @@ class _Meta:
     provider_label: str
     provider_country_iso: str
     provider_provenance: str
+    extractor_version: str
+    default_rail: bool
 
 
 # The reasons that drop a whole row (`_station_row`), for the census.
@@ -416,7 +445,7 @@ def _station_row(station: Station, meta: _Meta, dropped: Counter[str]) -> list[s
         meta.feed_key,
         meta.feed_version,
         meta.extracted_at,
-        EXTRACTOR_VERSION,
+        meta.extractor_version,
         key,
         name,
         _decimal(lat),
@@ -525,6 +554,8 @@ def _meta(
         provider_label=_clean_label(str(provider_cfg.get("label") or ""), Counter()),
         provider_country_iso=country if _ISO2.fullmatch(country) else "",
         provider_provenance=_provenance(provider_cfg, feed_key),
+        extractor_version=extractor_version_for(provider_cfg),
+        default_rail=default_rail(provider_cfg),
     )
 
 
@@ -544,15 +575,20 @@ def _with_census(error: ExtractError, census: Census) -> ExtractError:
 
 
 def _read_stations(
-    fmt: str, archive_path: Path, provider_id: str, census: Census
+    fmt: str, archive_path: Path, provider_id: str, census: Census, default_rail: bool = False
 ) -> dict[str, Station]:
     try:
         with zipfile.ZipFile(archive_path) as zf:
             if fmt == "gtfs":
                 return read_gtfs(
-                    zf, provider_id, census if isinstance(census, GtfsCensus) else None
+                    zf,
+                    provider_id,
+                    census if isinstance(census, GtfsCensus) else None,
+                    default_rail=default_rail,
                 )
-            return read_netex(zf, census if isinstance(census, NetexCensus) else None)
+            return read_netex(
+                zf, census if isinstance(census, NetexCensus) else None, default_rail=default_rail
+            )
     except ArchiveError as exc:
         raise _with_census(ExtractError(exc.reason, exc.detail), census) from None
     except (
@@ -578,11 +614,12 @@ def extracts_dir(session_id: str) -> Path:
 
 def _cache_name(meta: _Meta) -> str:
     """`<provider id>.<archive sha256>.<16 hex>.csv.gz`, the 16 hex of the
-    extractor version, the feed key and the provider's columns: an extract is
-    made again when any of them changes, never for the same archive."""
+    extractor version (rail by default included), the feed key and the
+    provider's columns: an extract is made again when any of them changes,
+    never for the same archive."""
     ident = json.dumps(
         [
-            EXTRACTOR_VERSION,
+            meta.extractor_version,
             meta.feed_key,
             meta.provider_id,
             meta.provider_label,
@@ -609,7 +646,7 @@ def _describe(path: Path, meta: _Meta, dropped: Counter[str]) -> ExtractResult:
         path_gz=path,
         feed_key=meta.feed_key,
         feed_version=meta.feed_version,
-        extractor_version=EXTRACTOR_VERSION,
+        extractor_version=meta.extractor_version,
         rows=rows,
         bytes=path.stat().st_size,
         body_sha256=digest.hexdigest(),
@@ -893,7 +930,7 @@ def _make(plan: _Plan, archive_path: Path) -> ExtractResult:
     """Read the archive and write the extract of `plan`, atomically."""
     meta = plan.meta
     census = _census_of(plan.fmt)
-    stations = _read_stations(plan.fmt, archive_path, meta.provider_id, census)
+    stations = _read_stations(plan.fmt, archive_path, meta.provider_id, census, meta.default_rail)
     census.stations = len(stations)
     dropped: Counter[str] = Counter()
     fd, tmp_name = tempfile.mkstemp(
