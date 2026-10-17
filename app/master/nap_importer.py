@@ -35,6 +35,7 @@ import logging
 import re
 import socket
 import time
+import unicodedata
 from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
@@ -328,10 +329,55 @@ def select_gtfs_rt_urls(dataset: dict[str, Any]) -> dict[str, str]:
 
 _PROVIDER_ID_RE = re.compile(r"[A-Z][A-Z0-9_-]{1,15}")
 
+# The letters NFKD does not split into an ASCII letter and its accents, as
+# a reader of the name would write them in ASCII.
+_UNSPLIT_LETTERS = str.maketrans(
+    {
+        "ł": "l",
+        "Ł": "L",
+        "ø": "o",
+        "Ø": "O",
+        "đ": "d",
+        "Đ": "D",
+        "ð": "d",
+        "Ð": "D",
+        "ß": "ss",
+        "ẞ": "SS",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "þ": "th",
+        "Þ": "TH",
+        "ħ": "h",
+        "Ħ": "H",
+        "\u0131": "i",  # dotless i
+        "ŧ": "t",
+        "Ŧ": "T",
+        "ŋ": "n",
+        "Ŋ": "N",
+    }
+)
+
+
+def ascii_letters(text: str) -> str:
+    """`text` with its accented Latin letters written in ASCII (É → E,
+    ö → o, ł → l, ß → ss, ...): NFKD, its combining marks dropped, and
+    `_UNSPLIT_LETTERS` for the letters NFKD does not split. Any other
+    character is left as it is."""
+    decomposed = unicodedata.normalize("NFKD", text.translate(_UNSPLIT_LETTERS))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
 
 def slug_to_provider_id(text: str, *, existing: set[str] | None = None) -> str:
     """Generate a stable, regex-compliant provider id from a publisher name
     or dataset title.
+
+    The accented letters are first written in ASCII (`ascii_letters`:
+    "Région Zzéland" → "REGIONZZELAND", where the letters were dropped
+    before 17 October: "RGIONZZLAND"). Only ids derived from now on change: a saved provider keeps
+    its id, which keys its stored file, its fetch state, its stop extracts
+    and its feed in the station module.
 
     Tries in order:
       1. The first all-caps token (e.g. "SNCF Voyageurs" → "SNCF")
@@ -342,7 +388,7 @@ def slug_to_provider_id(text: str, *, existing: set[str] | None = None) -> str:
     unique. Returns empty string only on truly pathological input.
     """
     existing = existing or set()
-    text = (text or "").strip()
+    text = ascii_letters((text or "").strip())
     if not text:
         return ""
 

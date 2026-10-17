@@ -753,6 +753,82 @@ def test_the_script_names_no_other_namespace(tmp_path: Path) -> None:
     assert "extension" not in "\n".join(out)
 
 
+def test_the_script_prints_an_odd_element_name_as_such(tmp_path: Path) -> None:
+    """Review of #367: an element name is printed only when it is of NeTEx's
+    form (letters, digits, `_`, at most 64); a crafted one could carry text."""
+    module = _script()
+    long_name = "Zz" + "z" * 70
+    odd = (
+        f"<Zz\u00e9Ref/><zz-99Ref/><{long_name}Ref/><Zz.Frame/>"
+        "<Zz\u00e9Submode>rail</Zz\u00e9Submode>"
+    )
+    document = _delivery(_lines("rail").replace("</Line>", odd + "</Line>"))
+    code, out = _run_script(_zip(tmp_path / "o.zip", {"a.xml": document}))
+    assert code == 0
+    text = "\n".join(out)
+    for leak in ("Zz", "zz", "99", "\u00e9"):
+        assert leak not in text
+    assert "Line/(odd name) 3" not in out  # an odd name is not a reference
+    assert "Line (1): TransportMode 1" in out
+    assert module._local("Zz\u00e9Frame") == module.ODD_NAME
+    assert module._local("{http://www.netex.org.uk/netex}" + "A" * 64) == "A" * 64
+    assert module._local("{http://www.netex.org.uk/netex}" + "A" * 65) == module.ODD_NAME
+    assert module._local("9Line") == module.ODD_NAME
+    assert module._local("_Line9") == "_Line9"
+
+
+def test_the_script_caps_the_distinct_frame_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _script()
+    monkeypatch.setattr(module, "PATHS_MAX", 3)
+    frames = "".join(f'<Zz{n}Frame id="ZZ:F:{n}"/>' for n in "ABCDE")
+    archive = _zip(tmp_path / "f.zip", {"a.xml": _delivery(frames)})
+    out = io.StringIO()
+    assert module.main([str(archive)], out=out) == 0
+    lines = out.getvalue().splitlines()
+    (frames_line,) = [line for line in lines if line.startswith("frames: ")]
+    # CompositeFrame and two of the five: three distinct names, the rest together.
+    assert frames_line == "frames: (other)Frame 3, CompositeFrame 1, ZzAFrame 1, ZzBFrame 1"
+    census = module.Census()
+    for n in range(10):
+        census.element(f"Zz{n}Frame")
+    census.element("Line")
+    assert census.frames == 3
+    assert census.elements["Line"] == 1
+    assert census.elements[module.OTHER_FRAME] == 7
+
+
+def test_the_script_writes_utf8_whatever_the_console(tmp_path: Path) -> None:
+    module = _script()
+    raw = io.BytesIO()
+    ascii_console = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+    stream = module._utf8(ascii_console)
+    stream.write("\u00e9\n")
+    stream.flush()
+    assert raw.getvalue() == "\u00e9\n".encode()
+    plain = io.StringIO()
+    assert module._utf8(plain) is plain  # no reconfigure: as it is
+    archive = _zip(tmp_path / "a.zip", {"a.xml": _delivery(_lines("rail"))})
+    run = subprocess.run(
+        [sys.executable, str(SCRIPT), str(archive)],
+        capture_output=True,
+        env={"PYTHONIOENCODING": "ascii:strict", "PATH": "/usr/bin:/bin"},
+        check=False,
+    )
+    assert run.returncode == 0
+    assert run.stderr == b""
+    assert run.stdout.startswith(b"netex mode census: 1 XML members")
+
+
+def test_the_script_refuses_an_external_entity_with_expats_type(tmp_path: Path) -> None:
+    module = _script()
+    parser = module._parser(module._Reader(module.Census(), module.Member(1, 0, 0)))
+    assert parser.ExternalEntityRefHandler is module._refuse_external
+    with pytest.raises(module.Refused):
+        module._refuse_external("zz", None, "zz.dtd", None)
+
+
 _RENDER = """
 const escHTML = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
   .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
