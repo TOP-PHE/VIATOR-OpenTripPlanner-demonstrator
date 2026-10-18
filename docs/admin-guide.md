@@ -3312,6 +3312,18 @@ the extracts changes no graph build.
   read again once, one at a time in the background; a large national
   NeTEx can hold the extraction child up to 45 minutes. Extracts already
   made and cached are not made again (`EXTRACTOR_VERSION` is unchanged).
+- **NeTEx exports that put a Quay id in `StopPlaceRef`.** Some exports
+  (the Belgian one, for one) give each stop assignment a `StopPlaceRef`
+  that names a Quay, not a StopPlace, and no `QuayRef`. The extractor reads
+  such a ref through the Quay's StopPlace, as it reads a `QuayRef`; a
+  `StopPlaceRef` that names a StopPlace keeps its meaning. The
+  station-module column says so on a sent extract, `stop place refs naming
+  a quay: <n>` (after `rail by default: …` when both apply; `quay refs:
+  <n>` when the line is short of room), and the census of a feed that still
+  has no rail station counts them too (`stop_place_ref_quays` in the log).
+  A feed remembered `no_rail_stop` for this reason is read again at the
+  next refresh after the release: the reader's code changed, so its
+  remembered failure counts no longer.
 - **A feed without a rail station: what the extractor saw.** For
   `no_rail_stop` and `no_stop_place` the station-module column shows, under
   the reason's sentence, a line `saw: …` of at most 100 characters (kept
@@ -3337,7 +3349,9 @@ the extracts changes no graph build.
     `line_from_pattern`, `patterns`/`patterns_used`, `points` (scheduled
     stop points with calls), `assignments`, `stop_places`,
     `stop_place_modes`, `stop_place_types`, `rail_stop_places`,
-    `places_called`, `stations`, `dropped`; `unread` when the step that
+    `places_called`, `stop_place_ref_quays` (assigned places whose
+    `StopPlaceRef` names a Quay, read through its StopPlace), `stations`,
+    `dropped`; `unread` when the step that
     counts it did not run (no journey kept for it).
   - GTFS, `saw: 40 routes (route_type 3: 38, 700: 2), 0 rail routes, 0
     stations`: the routes by `route_type` (rail is 2 and 100 to 117), then
