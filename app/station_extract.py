@@ -103,6 +103,11 @@ log = logging.getLogger(__name__)
 # 2 (16 October): a NeTEx `TransportMode` that gives no information on the
 # mode (`unknown`, `all`, `anyMode`, `urbanRail`) is read as none,
 # `intercityRail` as rail (`station_extract_netex._mode`).
+# 18 October, not raised for #371 (a NeTEx StopPlaceRef that names a Quay is
+# read through the Quay's StopPlace): the rows of every other archive are
+# unchanged and a remembered failure is retried on the code signature; only
+# an archive mixing StopPlaceRef→Quay with other assignments that already
+# had an extract keeps it until its next file.
 EXTRACTOR_VERSION = "viator-stop-extract-2"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one
@@ -189,7 +194,7 @@ class ExtractResult:
     dropped: Mapping[str, int] = field(default_factory=dict)
     # What rail by default made rail ("rail by default: N calls at M stop
     # places") and the NeTEx StopPlaceRefs read through their Quay ("stop
-    # place refs naming a quay: N"), '' when neither; kept beside the cached
+    # places read through a quay: N"), '' when neither; kept beside the cached
     # file (`_COUNTS_SUFFIX`), so a cached extract says it too.
     summary: str = ""
 
@@ -767,7 +772,9 @@ REMEMBERED_REASONS = frozenset(
 )
 COUNTED_REASONS = frozenset({WALL_CLOCK_LIMIT, CRASHED})
 _FAILED_SUFFIX = ".failed"
-# Beside an extract, its summary when it has one (`ExtractResult.summary`).
+# Beside an extract, its summary when it has one (`ExtractResult.summary`):
+# what rail by default made rail and, since #371, the places read through a
+# quay, for every provider. The name is kept so existing files stay valid.
 _COUNTS_SUFFIX = ".rail-default.json"
 TRIES = 2
 _FAILED_MAX_BYTES = 1024

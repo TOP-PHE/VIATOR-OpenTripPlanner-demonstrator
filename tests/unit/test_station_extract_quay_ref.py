@@ -19,8 +19,14 @@ import pytest
 
 from app import station_extract
 from app.station_extract import ExtractError, build_extract
-from app.station_extract_common import RAIL_MAIN, SUMMARY
-from app.station_extract_netex import NetexCensus, read_netex
+from app.station_extract_common import RAIL_MAIN, SUMMARY, ValueTally
+from app.station_extract_netex import (
+    NetexCensus,
+    _Archive,
+    _read_journeys,
+    _read_structure,
+    read_netex,
+)
 from tests.unit.test_station_extract import (
     WHEN,
     _by_key,
@@ -37,7 +43,7 @@ from tests.unit.test_station_extract_default_mode import RAIL_DEFAULT, _journeys
 
 SHA = "e" * 64
 PARENTS = {"ZZ:StopPlace:991", "ZZ:StopPlace:992"}
-QUAY_REFS = "stop place refs naming a quay: 2"
+QUAY_REFS = "places read through a quay: 2"
 
 
 def _parent(n: int, kind: str = "") -> str:
@@ -129,9 +135,9 @@ def test_an_untyped_parent_without_rail_by_default_still_has_no_rail_stop(
     error = _extract(tmp_path, {"zz.xml": _document()})
     assert isinstance(error, ExtractError)
     assert error.reason == "no_rail_stop"
-    assert _fields(error.census)["stop_place_ref_quays"] == "2"
+    assert _fields(error.census)["places_via_quay"] == "2"
     assert SUMMARY.fullmatch(error.summary)
-    assert error.summary.endswith(", 2 stop places (0 rail), quay refs: 2")  # the short form
+    assert error.summary.startswith(f"{QUAY_REFS}, 0 lines, 2 journeys (2 kept), ")
 
 
 def test_rail_journeys_are_placed_at_the_quays_stop_place() -> None:
@@ -171,12 +177,22 @@ def test_rail_journeys_are_placed_at_the_quays_stop_place() -> None:
             },
             id="site-frame-after-in-the-same-member",
         ),
+        pytest.param(
+            {
+                "zz.xml": _delivery(
+                    _site(_parent(1, "railStation"), _parent(2, "railStation"))
+                    + QUAY_PATTERNS
+                    + _journeys(2)
+                )
+            },
+            id="site-frame-before-in-the-same-member",
+        ),
     ],
 )
 def test_the_order_of_frames_and_members_does_not_matter(files: dict[str, str]) -> None:
     stations, census = _read(files)
     assert set(stations) == PARENTS
-    assert census.stop_place_ref_quays == 2
+    assert census.places_via_quay == 2
 
 
 def test_a_stop_place_ref_naming_neither_stays_as_it_was() -> None:
@@ -186,7 +202,7 @@ def test_a_stop_place_ref_naming_neither_stays_as_it_was() -> None:
     patterns = _patterns("ZZ:Elsewhere:991", "ZZ:Elsewhere:992")
     stations, census = _read(_document(mode="rail", patterns=patterns))
     assert set(stations) == {"ZZ:Elsewhere:991", "ZZ:Elsewhere:992"}
-    assert census.stop_place_ref_quays == 0
+    assert census.places_via_quay == 0
     nothing, _ = _read(_document(kind="railStation", patterns=patterns))
     assert nothing == {}
 
@@ -213,7 +229,7 @@ def test_a_stop_place_ref_naming_a_stop_place_keeps_its_meaning() -> None:
     assert set(stations) == PARENTS
     assert stations["ZZ:StopPlace:991"].calls[RAIL_MAIN] == 2
     assert stations["ZZ:StopPlace:992"].calls[RAIL_MAIN] == 2
-    assert census.stop_place_ref_quays == 0
+    assert census.places_via_quay == 0
 
 
 def test_a_known_quay_ref_wins_over_a_stop_place_ref_naming_another_quay() -> None:
@@ -221,14 +237,14 @@ def test_a_known_quay_ref_wins_over_a_stop_place_ref_naming_another_quay() -> No
     stations, census = _read(_document(kind="railStation", patterns=patterns))
     assert set(stations) == PARENTS
     assert stations["ZZ:StopPlace:991"].calls[RAIL_MAIN] == 2
-    assert census.stop_place_ref_quays == 1  # the second assignment only
+    assert census.places_via_quay == 1  # the second assignment only
 
 
 def test_an_unknown_quay_ref_falls_back_on_the_stop_place_ref() -> None:
     patterns = _patterns("ZZ:Quay:9911", "ZZ:Quay:9922", quay="ZZ:Quay:999")
     stations, census = _read(_document(kind="railStation", patterns=patterns))
     assert set(stations) == PARENTS
-    assert census.stop_place_ref_quays == 2
+    assert census.places_via_quay == 2
 
 
 def test_a_feed_without_such_refs_counts_none_and_says_nothing(tmp_path: Path) -> None:
@@ -236,7 +252,7 @@ def test_a_feed_without_such_refs_counts_none_and_says_nothing(tmp_path: Path) -
     document = _document(kind="railStation", patterns=patterns)
     stations, census = _read(document)
     assert set(stations) == PARENTS
-    assert census.stop_place_ref_quays == 0
+    assert census.places_via_quay == 0
     assert census.default_summary() == ""
     found = _extract(tmp_path, {"zz.xml": document})
     assert not isinstance(found, ExtractError)
@@ -279,7 +295,7 @@ def test_rail_by_default_and_the_quay_refs_share_the_summary(tmp_path: Path) -> 
             999_999_999,
             999_999_999,
             999_999_999,
-            "rail by default: 999,999,999 calls at 999,999,999 stop places, quay refs: 999,999,999",
+            "rail by default: 999,999,999 calls at 999,999,999 stop places, via quay: 999,999,999",
             id="long-counts-take-the-short-form",
         ),
     ],
@@ -287,9 +303,7 @@ def test_rail_by_default_and_the_quay_refs_share_the_summary(tmp_path: Path) -> 
 def test_the_summary_stays_within_its_bound(
     calls: int, places: int, refs: int | None, expected: str
 ) -> None:
-    census = NetexCensus(
-        rail_by_default=calls, rail_by_default_places=places, stop_place_ref_quays=refs
-    )
+    census = NetexCensus(rail_by_default=calls, rail_by_default_places=places, places_via_quay=refs)
     summary = census.default_summary()
     assert summary == expected
     assert summary == "" or SUMMARY.fullmatch(summary)
@@ -297,5 +311,84 @@ def test_the_summary_stays_within_its_bound(
 
 def test_the_whole_census_names_the_count() -> None:
     _, census = _read(_document(kind="railStation"))
-    assert "stop_place_ref_quays=2" in census.full().split(" ")
-    assert NetexCensus().full().count("stop_place_ref_quays=unread") == 1
+    assert "places_via_quay=2" in census.full().split(" ")
+    assert NetexCensus().full().count("places_via_quay=unread") == 1
+
+
+def _tally(value: str, count: int) -> ValueTally:
+    tally = ValueTally()
+    tally.add(value, count)
+    return tally
+
+
+@pytest.mark.parametrize("by_default", [False, True], ids=["plain", "rail-by-default"])
+def test_the_count_stays_in_a_national_scale_failure_summary(by_default: bool) -> None:
+    """Review round 1: the lines and journeys of a national feed fill the
+    100 characters; the count comes before them."""
+    census = NetexCensus(
+        lines=_tally("", 999),
+        journeys=_tally("", 99_999),
+        kept=_tally("none", 99_999),
+        stations=0,
+        stop_places=99_999,
+        rail_stop_places=0,
+        places_via_quay=99_999,
+        rail_by_default=99_999 if by_default else None,
+        rail_by_default_places=9_999 if by_default else None,
+    )
+    summary = census.summary()
+    assert SUMMARY.fullmatch(summary)
+    assert "places read through a quay: 99,999" in summary or "via quay: 99,999" in summary
+    assert summary.startswith("rail by default: ") is by_default
+
+
+def test_a_quay_of_a_child_stop_place_gives_the_root_station_as_a_quay_ref_does() -> None:
+    """Parent P, child C (ParentSiteRef P) holding Quay Q: a StopPlaceRef Q
+    gives one station keyed P, with P's name and position and C's codes,
+    the same station as a QuayRef Q."""
+    site = _site(
+        '<StopPlace id="ZZ:StopPlace:990"><Name>Zzstadt Centre</Name>'
+        "<Centroid><Location><Longitude>9.4</Longitude><Latitude>45.4</Latitude></Location>"
+        "</Centroid><StopPlaceType>railStation</StopPlaceType></StopPlace>"
+        '<StopPlace id="ZZ:StopPlace:991"><keyList><KeyValue><Key>zzcode</Key>'
+        "<Value>9901</Value></KeyValue></keyList><Name>Zzstadt Quai</Name>"
+        '<ParentSiteRef ref="ZZ:StopPlace:990"/><quays><Quay id="ZZ:Quay:9911"/></quays>'
+        "</StopPlace>"
+    )
+    by_ref, census = _read(_delivery(site + _patterns("ZZ:Quay:9911", "") + _journeys(2, "rail")))
+    by_quay, _ = _read(
+        _delivery(site + _patterns("", "", quay="ZZ:Quay:9911") + _journeys(2, "rail"))
+    )
+    assert set(by_ref) == {"ZZ:StopPlace:990"}
+    station = by_ref["ZZ:StopPlace:990"]
+    assert (station.name, station.lat, station.lon) == ("Zzstadt Centre", 45.4, 9.4)
+    assert ("StopPlace/zzcode", "9901") in station.code_pairs()
+    assert ("Quay/@id", "ZZ:Quay:9911") in station.code_pairs()
+    assert by_ref == by_quay
+    assert census.places_via_quay == 1
+
+
+def test_an_uncalled_place_is_not_counted() -> None:
+    """The count is of the called places read through a quay: an
+    assignment of a point no journey calls at is left out."""
+    patterns = QUAY_PATTERNS.replace(
+        "</stopAssignments>", _psa(3, "ZZ:SSP:9", "ZZ:Quay:9912") + "</stopAssignments>"
+    )
+    stations, census = _read(_document(kind="railStation", patterns=patterns))
+    assert set(stations) == PARENTS
+    assert census.places_via_quay == 2
+
+
+def test_only_the_quays_the_called_places_need_are_kept() -> None:
+    files = {"zz.xml": _document(kind="railStation")}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    with zipfile.ZipFile(buffer) as zf:
+        archive = _Archive(zf)
+        places = _read_structure(archive, _read_journeys(archive))
+    assert places.quay_place == {
+        "ZZ:Quay:9911": "ZZ:StopPlace:991",
+        "ZZ:Quay:9922": "ZZ:StopPlace:992",
+    }

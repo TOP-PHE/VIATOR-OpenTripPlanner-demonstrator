@@ -29,8 +29,8 @@ one) give every PassengerStopAssignment a `StopPlaceRef` whose `ref` is the
 id of a Quay, and no `QuayRef`. Such a ref is read as a `QuayRef` would be:
 the call is placed at the Quay's StopPlace (`_ref_place`). A `StopPlaceRef`
 that names a StopPlace the archive defines keeps its meaning; one that
-names neither stays as it was. The census counts the assigned places so
-read (`stop_place_ref_quays`), and the summary of a written extract says it
+names neither stays as it was. The census counts the called places so
+read (`places_via_quay`), and the summary of a written extract says it
 (`NetexCensus.default_summary`).
 
 **Census.** As it reads, the reader counts what it sees in a `NetexCensus`
@@ -669,16 +669,17 @@ class NetexCensus(Census):
     # the setting is off, or the stations were not reached.
     rail_by_default: int | None = None
     rail_by_default_places: int | None = None
-    # The assigned places (distinct QuayRef and StopPlaceRef pairs) whose
-    # StopPlaceRef names a Quay, read through that Quay's StopPlace
-    # (`_ref_place`). None: the assignments were not read.
-    stop_place_ref_quays: int | None = None
+    # The called places (distinct QuayRef and StopPlaceRef pairs of the
+    # assignments of called points) whose StopPlaceRef names a Quay, read
+    # through that Quay's StopPlace (`_ref_place`); a place no rail journey
+    # calls at is not counted. None: the assignments were not read.
+    places_via_quay: int | None = None
 
     def _quay_ref_forms(self) -> list[str]:
-        count = self.stop_place_ref_quays
+        count = self.places_via_quay
         if not count:
             return []
-        return [f"stop place refs naming a quay: {count:,}", f"quay refs: {count:,}"]
+        return [f"places read through a quay: {count:,}", f"via quay: {count:,}"]
 
     def default_summary(self) -> str:
         """What a written extract says: what rail by default made rail, and
@@ -702,6 +703,9 @@ class NetexCensus(Census):
     def segments(self) -> list[list[str]]:
         kept = self.kept.total
         segments: list[list[str]] = []
+        # Before the lines and journeys: at national scale those fill the
+        # summary, and this says why stations were found at all.
+        quay_forms = self._quay_ref_forms()
         if self.rail_by_default is not None:
             segments.append(
                 [
@@ -711,6 +715,7 @@ class NetexCensus(Census):
                 ]
             )
         segments += [
+            quay_forms,
             tally_forms(self.lines.total, "lines", self.lines),
             [f"{self.journeys.total:,} journeys ({kept:,} kept)"],
             self.stations_forms(),
@@ -719,7 +724,6 @@ class NetexCensus(Census):
             segments.append([f"{self.without_line:,} without a line"])
         if self.stop_places is not None:
             segments.append([f"{self.stop_places:,} stop places ({self.rail_stop_places:,} rail)"])
-        segments.append(self._quay_ref_forms())
         return segments
 
     def fields(self) -> list[tuple[str, object]]:
@@ -744,7 +748,7 @@ class NetexCensus(Census):
             ("places_called", self.places_called),
             ("rail_by_default", self.rail_by_default),
             ("rail_by_default_places", self.rail_by_default_places),
-            ("stop_place_ref_quays", self.stop_place_ref_quays),
+            ("places_via_quay", self.places_via_quay),
             *super().fields(),
         ]
 
@@ -1107,23 +1111,18 @@ def _read_structure(archive: _Archive, found: _Journeys, default_rail: bool = Fa
 def _keep_quays(places: _Places, quays: dict[str, str], census: NetexCensus) -> None:
     """Keep the Quays the called places need (`places.quay_place`): those
     their QuayRef names, and those a StopPlaceRef names in place of a
-    StopPlace (`_ref_place`), which the census counts."""
-    census.stop_place_ref_quays = sum(
-        1 for quay, ref in places.pairs if quay not in quays and _names_a_quay(ref, places, quays)
-    )
+    StopPlace (`_ref_place`); the census counts the called places read so."""
     wanted: set[str] = set()
+    via_quay = 0
     for number in places.use:
         quay, ref = places.pairs[number]
         wanted.add(quay)
         if ref not in places.defined:
             wanted.add(ref)
+            if quay not in quays and ref in quays:
+                via_quay += 1
+    census.places_via_quay = via_quay
     places.quay_place = {q: p for q, p in quays.items() if q in wanted}
-
-
-def _names_a_quay(ref: str, places: _Places, quays: dict[str, str]) -> bool:
-    """A StopPlaceRef `ref` that names no StopPlace of the archive but a
-    Quay (`_ref_place`)."""
-    return ref not in places.defined and ref in quays
 
 
 def _count_places(found: _Journeys, places: _Places) -> None:

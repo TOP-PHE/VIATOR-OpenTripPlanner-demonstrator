@@ -3317,13 +3317,16 @@ the extracts changes no graph build.
   that names a Quay, not a StopPlace, and no `QuayRef`. The extractor reads
   such a ref through the Quay's StopPlace, as it reads a `QuayRef`; a
   `StopPlaceRef` that names a StopPlace keeps its meaning. The
-  station-module column says so on a sent extract, `stop place refs naming
-  a quay: <n>` (after `rail by default: …` when both apply; `quay refs:
-  <n>` when the line is short of room), and the census of a feed that still
-  has no rail station counts them too (`stop_place_ref_quays` in the log).
-  A feed remembered `no_rail_stop` for this reason is read again at the
-  next refresh after the release: the reader's code changed, so its
-  remembered failure counts no longer.
+  station-module column says so on a sent extract, `places read through a
+  quay: <n>` (the called places so read; after `rail by default: …` when
+  both apply; `via quay: <n>` when the line is short of room), and the
+  census of a feed that still has no rail station shows it before the
+  lines and journeys (`places_via_quay` in the log). A feed remembered
+  `no_rail_stop` for this reason is read again at the next refresh after
+  the release: the reader's code changed, so its remembered failure counts
+  no longer. The extractor version is not raised for this change: only an
+  archive mixing StopPlaceRef→Quay with other assignments that already had
+  an extract keeps it until its next file.
 - **A feed without a rail station: what the extractor saw.** For
   `no_rail_stop` and `no_stop_place` the station-module column shows, under
   the reason's sentence, a line `saw: …` of at most 100 characters (kept
@@ -3349,7 +3352,7 @@ the extracts changes no graph build.
     `line_from_pattern`, `patterns`/`patterns_used`, `points` (scheduled
     stop points with calls), `assignments`, `stop_places`,
     `stop_place_modes`, `stop_place_types`, `rail_stop_places`,
-    `places_called`, `stop_place_ref_quays` (assigned places whose
+    `places_called`, `places_via_quay` (called places whose
     `StopPlaceRef` names a Quay, read through its StopPlace), `stations`,
     `dropped`; `unread` when the step that
     counts it did not run (no journey kept for it).

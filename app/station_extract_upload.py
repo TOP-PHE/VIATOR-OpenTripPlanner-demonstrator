@@ -745,7 +745,7 @@ class _Pass:
 
 def _made_as(made: Any) -> str | None:
     """What a sent extract says ("rail by default: N calls at M stop
-    places", "stop place refs naming a quay: N", `ExtractResult.summary`),
+    places", "places read through a quay: N", `ExtractResult.summary`),
     for the Sessions page; None when it says nothing."""
     summary = getattr(made, "summary", "")
     return summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else None
