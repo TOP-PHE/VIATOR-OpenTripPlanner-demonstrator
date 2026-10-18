@@ -202,6 +202,13 @@ default; `-Apply` to save).
   only; on a range request it could turn the answer into a 304. Every feed download asks for
   `Accept-Encoding: identity`, and a content-encoded answer is never resumed: httpx decodes it,
   so its byte count is not an offset into the file.
+- **A 406 to identity is asked again once in gzip.** Some servers (Fintraffic Digitraffic) refuse
+  `Accept-Encoding: identity` with 406. The download then starts again from byte 0 with
+  `Accept-Encoding: gzip` (no retry used), is never resumed (a cut restarts from byte 0), and its
+  decoded size is capped (`CODED_MAX_BYTES`, 8 GiB: a gzip bomb never fills the disk). The fetch
+  state keeps `content_coding: gzip` for that URL, so the next refresh asks in gzip at once. A
+  second 406 gives up: `HTTP 406 Not Acceptable (refused with Accept-Encoding identity and gzip)`.
+  The resolvers' own lookups never force identity (httpx's default Accept-Encoding).
 - **Never append without a strong If-Range.** A range request without a validator could join
   bytes of two versions of the file. A Last-Modified within one second of the answer's `Date`
   (or with no `Date`) can name two versions (RFC 9110 8.8.2.2): no strong ETag and no such

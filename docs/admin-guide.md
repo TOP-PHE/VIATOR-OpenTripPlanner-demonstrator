@@ -1725,7 +1725,8 @@ downloaded again from byte 0 (`app/feed_fetch.py`):
 - A resume is used only when the server can do it: no
   `Accept-Ranges: none`, an ETag or Last-Modified, a known size
   (`Content-Length`), and a body that is not content-encoded (feed
-  downloads ask for `Accept-Encoding: identity`). Otherwise,
+  downloads ask for `Accept-Encoding: identity`, or for gzip only when the
+  server refuses that, §6.15). Otherwise,
   and when the server answers a range request with anything but a `206`
   that continues the file exactly (same start, same total size), the
   download starts again from byte 0, at most twice, as before.
@@ -1749,6 +1750,43 @@ server stops at the same byte even on a range request; try later, or
 upload the file by hand (Upload source). If every attempt restarts from
 byte 0 (`fetch resume refused (…)` or `fetch retry` lines, no `fetch
 resume` line), the server does not offer ranges for that file.
+
+### 6.15 A feed refresh failed with "HTTP 406 Not Acceptable"
+
+Symptom (feed-status panel, **Last result**; from the release that
+brought resumed downloads, §6.14, until this fix): `skipped` with
+`download failed: HTTP 406 Not Acceptable`, on a feed that used to
+download fine. Seen on the Finnish rail GTFS (Fintraffic Digitraffic).
+
+What it meant: to be able to resume a cut download, VIATOR asks for the
+file's own bytes (`Accept-Encoding: identity`). A few servers refuse to
+send anything not compressed in transit and answer `406`.
+
+It is now handled (`app/feed_fetch.py`):
+
+- On a `406`, VIATOR asks once more, from byte 0, with
+  `Accept-Encoding: gzip`; the body is unpacked on the fly and the file
+  is checked as usual (format check, conditional GET, same-sha256
+  "unchanged"). The switch uses neither a retry nor a resume.
+- Such a download is never resumed (its byte count is not an offset into
+  the file): a cut starts it again from byte 0, at most twice, as before
+  resumes existed. Its unpacked size is capped at 8 GiB
+  (`CODED_MAX_BYTES`), so a small compressed body that unpacks to a huge
+  one is refused (`the compressed body decodes to more than … bytes`).
+- The fetch state remembers it for that URL (`content_coding: gzip`), so
+  later refreshes ask in gzip at once, without the wasted `406`. A file
+  uploaded by hand into that slot clears the fetch state and this with
+  it; the next refresh finds it again with one `406`. If a remembered
+  server later refuses gzip but
+  serves identity, VIATOR switches back the same way and forgets it.
+- The `web` log has one line for the switch, `fetch: server refused
+  Accept-Encoding identity (HTTP 406), asking for gzip from byte 0`
+  (never the URL).
+
+If it still fails with `download failed: HTTP 406 Not Acceptable (refused
+with Accept-Encoding identity and gzip)`, the server refuses both: the
+cause is elsewhere (another header it wants, or it blocks the address);
+upload the file by hand (Upload source) and check the provider's terms.
 
 ## 7. Rollback
 

@@ -1137,7 +1137,10 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   resumed (range under a strong If-Range, at most 8 resumes, 2 in a row without progress end it,
   429/5xx answers to a resume waited out on their own budget) rather
   than downloaded again from byte 0 (`feed_fetch._download`); the sha256 runs over the whole
-  file and its size must equal the announced one. OSM refresh is the
+  file and its size must equal the announced one. Downloads ask for `Accept-Encoding: identity`;
+  a server that refuses it (406) is asked again once in gzip from byte 0, never resumed, its
+  decoded size capped (`CODED_MAX_BYTES`), and remembered in the fetch state
+  (`content_coding`). OSM refresh is the
   exception to "the previous file stays": it rotates `osm.pbf` before downloading. See
   [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a
