@@ -1764,21 +1764,35 @@ send anything not compressed in transit and answer `406`.
 
 It is now handled (`app/feed_fetch.py`):
 
-- On a `406`, VIATOR asks once more, from byte 0, with
-  `Accept-Encoding: gzip`; the body is unpacked on the fly and the file
-  is checked as usual (format check, conditional GET, same-sha256
-  "unchanged"). The switch uses neither a retry nor a resume.
+- On a `406` to a download request, VIATOR asks once more, from byte 0,
+  with `Accept-Encoding: gzip`; the file is checked as usual (format
+  check, conditional GET, same-sha256 "unchanged"). The switch uses
+  neither a retry nor a resume. A `406` to a resume (range) request is
+  not a switch: that server already sent the file's own bytes, so the
+  download starts again from byte 0 as for any refused range.
 - Such a download is never resumed (its byte count is not an offset into
   the file): a cut starts it again from byte 0, at most twice, as before
-  resumes existed. Its unpacked size is capped at 8 GiB
-  (`CODED_MAX_BYTES`), so a small compressed body that unpacks to a huge
-  one is refused (`the compressed body decodes to more than … bytes`).
-- The fetch state remembers it for that URL (`content_coding: gzip`), so
-  later refreshes ask in gzip at once, without the wasted `406`. A file
-  uploaded by hand into that slot clears the fetch state and this with
-  it; the next refresh finds it again with one `406`. If a remembered
-  server later refuses gzip but
-  serves identity, VIATOR switches back the same way and forgets it.
+  resumes existed. A gzip body that ends before its gzip trailer counts as
+  a cut.
+- VIATOR unpacks the gzip body itself, 1 MiB at a time, so memory stays
+  small whatever the body packs. The unpacked bytes are stopped at
+  160 GiB (`CODED_MAX_BYTES`, the station extractor's own limit for one
+  unpacked member): `the gzip body unpacks to more than … bytes`. As for
+  a plain body sent without a size, nothing else bounds the disk.
+- Only a single gzip coding is unpacked. An answer coded otherwise
+  (`deflate`, `br`, `zstd`, or gzip twice) is refused before its body is
+  read: `unsupported content coding 'gzip, gzip' (only a single gzip is
+  unpacked)`. VIATOR never asks for those codings; a server sending one
+  unasked is misbehaving.
+- The fetch state remembers it **per URL** (`content_coding: gzip`), so
+  later refreshes of the same URL ask in gzip at once, without the wasted
+  `406`. It is reset when the URL changes (a resolver that builds a new
+  dated URL for each file costs one `406` per new URL), when a file is
+  uploaded by hand into that slot (the upload clears the slot's fetch
+  state), or when the fetch-state file under `inbox/<sid>/_fetch_state/`
+  is deleted; the next refresh then finds it again with one `406`. If a
+  remembered server later refuses gzip but serves identity, VIATOR
+  switches back the same way and forgets it.
 - The `web` log has one line for the switch, `fetch: server refused
   Accept-Encoding identity (HTTP 406), asking for gzip from byte 0`
   (never the URL).
