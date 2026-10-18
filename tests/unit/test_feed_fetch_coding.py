@@ -19,6 +19,7 @@ import hashlib
 import io
 import logging
 import random
+import tracemalloc
 import zipfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -27,7 +28,7 @@ from typing import Any
 import httpx
 import pytest
 
-from app import feed_fetch
+from app import feed_fetch, station_extract_common
 from app.feed_fetch import FetchError, fetch_validated
 
 MIB = 1024 * 1024
@@ -318,7 +319,7 @@ async def test_gzip_bomb_is_stopped_at_the_cap(
     with pytest.raises(FetchError) as exc:
         await _fetch(server, staging)
     assert str(exc.value) == (
-        f"download failed: the compressed body decodes to more than {2 * MIB} bytes, "
+        f"download failed: the gzip body unpacks to more than {2 * MIB} bytes, "
         "the limit for a content-coded download"
     )
     assert list(staging.iterdir()) == []
@@ -334,7 +335,7 @@ async def test_cap_counts_decoded_bytes(
         result = await _fetch(server, staging)
         assert result.size_bytes == len(BODY)
         return
-    with pytest.raises(FetchError, match="decodes to more than"):
+    with pytest.raises(FetchError, match="unpacks to more than"):
         await _fetch(server, staging)
 
 
@@ -432,3 +433,203 @@ async def test_identity_content_encoding_is_a_plain_body(
     assert result.sha256 == _sha(BODY)
     assert result.resumes == 1
     assert plain.ranges() == [None, f"bytes={MIB}-"]
+
+
+def test_cap_is_the_extractors_member_limit() -> None:
+    """No file the station extractor would read is refused here."""
+    assert feed_fetch.CODED_MAX_BYTES == station_extract_common.MEMBER_MAX_BYTES
+
+
+# ─────────────────────────── codings refused ───────────────────────────
+
+
+@pytest.mark.parametrize("asked", ["identity", "gzip"])
+@pytest.mark.parametrize("coding", ["gzip, gzip", "deflate", "br", "zstd", "gzip, br"])
+async def test_other_codings_are_refused_unread(staging: Path, coding: str, asked: str) -> None:
+    """Only a single gzip is unpacked: any other coding is refused before a
+    byte of its body is read (httpx would decode it whole, read by read)."""
+    read: list[bytes] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        read.append(b"zz")
+        yield b"zz"
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("accept-encoding") != asked:
+            return httpx.Response(406)
+        return httpx.Response(200, headers={"Content-Encoding": coding}, content=body())
+
+    with pytest.raises(FetchError) as exc:
+        await _fetch(server, staging, previous={"url": STATE_URL, "content_coding": asked})
+    assert str(exc.value) == (
+        f"download failed: unsupported content coding {coding!r} (only a single gzip is unpacked)"
+    )
+    assert read == []
+    assert list(staging.iterdir()) == []
+
+
+async def test_identity_listed_beside_gzip_is_one_gzip(staging: Path) -> None:
+    encoded = gzip.compress(BODY, compresslevel=1)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Encoding": "identity, gzip"}, content=_chunks(encoded, None)
+        )
+
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+
+
+# ─────────────────────────── bounded unpacking ───────────────────────────
+
+
+async def test_unpacking_keeps_memory_bounded(tmp_path: Path) -> None:
+    """64 MiB of zeros packed into some 64 KiB, sent in one network read:
+    unpacked in steps of at most 1 MiB, never all at once."""
+    unpacked = 64 * MIB
+    encoded = gzip.compress(bytes(unpacked), compresslevel=9)
+    assert len(encoded) < MIB // 8
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=_once(encoded))
+
+    dest = tmp_path / "zz.download"
+    tracemalloc.start()
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+            download = await feed_fetch._download(
+                client, FETCH_URL, {}, dest, state_url=STATE_URL, coded=True
+            )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert download.size == unpacked
+    assert download.sha256 == _sha(bytes(unpacked))
+    assert dest.stat().st_size == unpacked
+    assert peak < 8 * MIB
+
+
+async def test_each_unpacked_step_is_at_most_one_mib(staging: Path) -> None:
+    sizes: list[int] = []
+
+    async def collect(raw: AsyncIterator[bytes]) -> None:
+        async for piece in feed_fetch._gunzipped(raw):
+            sizes.append(len(piece))
+
+    await collect(_once(gzip.compress(bytes(5 * MIB + 7))))
+    assert max(sizes) == MIB
+    assert sum(sizes) == 5 * MIB + 7
+
+
+async def _once(data: bytes) -> AsyncIterator[bytes]:
+    yield data
+
+
+async def test_gzip_body_without_its_trailer_is_a_cut(staging: Path) -> None:
+    """A gzip stream that ends cleanly but before its trailer is a cut:
+    downloaded again from byte 0, in gzip, never resumed."""
+    encoded = gzip.compress(BODY, compresslevel=1)
+    bodies = [encoded[:-8], encoded]
+    seen: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip", "ETag": '"zz-v1"', "Accept-Ranges": "bytes"},
+            content=_once(bodies.pop(0)),
+        )
+
+    result = await _fetch(server, staging, previous={"url": STATE_URL, "content_coding": "gzip"})
+    assert result.sha256 == _sha(BODY)
+    assert [r.headers.get("range") for r in seen] == [None, None]
+
+
+async def test_gzip_body_always_cut_short_fails_as_a_cut(staging: Path) -> None:
+    encoded = gzip.compress(BODY, compresslevel=1)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, content=_once(encoded[: len(encoded) // 2])
+        )
+
+    with pytest.raises(FetchError) as exc:
+        await _fetch(server, staging, previous={"url": STATE_URL, "content_coding": "gzip"})
+    assert str(exc.value) == (
+        "download failed: peer closed connection before the end of the gzip body"
+    )
+    assert list(staging.iterdir()) == []
+
+
+async def test_corrupt_gzip_body_fails_at_once(staging: Path) -> None:
+    calls: list[httpx.Request] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, content=_once(b"\x1f\x8bZZ-not-gzip" * 9)
+        )
+
+    with pytest.raises(FetchError, match=r"^download failed: gzip body could not be unpacked: "):
+        await _fetch(server, staging, previous={"url": STATE_URL, "content_coding": "gzip"})
+    assert len(calls) == 1
+    assert list(staging.iterdir()) == []
+
+
+# ─────────────────────────── resumes stay identity ───────────────────────────
+
+
+async def test_406_to_a_resume_restarts_in_identity(staging: Path) -> None:
+    """The server sent the file's own bytes to the plain request: a 406 to
+    the range refuses the range, not the coding. Start again from byte 0
+    in identity; gzip is neither asked for nor remembered."""
+    server = CodingServer(refuse=frozenset(), cuts=[MIB + MIB // 2])
+    real = server.__call__
+
+    def refuse_range(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("range"):
+            server.requests.append(request)
+            return httpx.Response(406)
+        return real(request)
+
+    result = await _fetch(refuse_range, staging)
+    assert result.sha256 == _sha(BODY)
+    assert server.codings() == ["identity", "identity", "identity"]
+    assert server.ranges() == [None, f"bytes={MIB}-", None]
+    assert "content_coding" not in result.state
+
+
+async def test_content_coded_206_restarts(staging: Path) -> None:
+    """A 206 sent content-coded counts no file offsets: start again."""
+    server = CodingServer(refuse=frozenset(), cuts=[MIB + MIB // 2])
+    real = server.__call__
+
+    def coded_range(request: httpx.Request) -> httpx.Response:
+        response = real(request)
+        if response.status_code == 206:
+            response.headers["Content-Encoding"] = "gzip"
+        return response
+
+    result = await _fetch(coded_range, staging)
+    assert result.sha256 == _sha(BODY)
+    assert server.ranges() == [None, f"bytes={MIB}-", None]
+
+
+async def test_bytes_after_the_gzip_trailer_are_ignored_unheld() -> None:
+    """Bytes after the end of the gzip stream are ignored (as httpx does),
+    and never piled up in memory."""
+    packed = gzip.compress(b"ZZ-file")
+
+    async def body() -> AsyncIterator[bytes]:
+        yield packed
+        for _ in range(32):
+            yield b"Z" * MIB
+
+    tracemalloc.start()
+    try:
+        pieces = [piece async for piece in feed_fetch._gunzipped(body())]
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert b"".join(pieces) == b"ZZ-file"
+    assert peak < 8 * MIB
