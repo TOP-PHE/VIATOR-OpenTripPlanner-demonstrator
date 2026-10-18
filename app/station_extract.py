@@ -103,6 +103,11 @@ log = logging.getLogger(__name__)
 # 2 (16 October): a NeTEx `TransportMode` that gives no information on the
 # mode (`unknown`, `all`, `anyMode`, `urbanRail`) is read as none,
 # `intercityRail` as rail (`station_extract_netex._mode`).
+# 18 October, not raised for #371 (a NeTEx StopPlaceRef that names a Quay is
+# read through the Quay's StopPlace): the rows of every other archive are
+# unchanged and a remembered failure is retried on the code signature; only
+# an archive mixing StopPlaceRef→Quay with other assignments that already
+# had an extract keeps it until its next file.
 EXTRACTOR_VERSION = "viator-stop-extract-2"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one
@@ -188,7 +193,8 @@ class ExtractResult:
     # the extract came from the cache.
     dropped: Mapping[str, int] = field(default_factory=dict)
     # What rail by default made rail ("rail by default: N calls at M stop
-    # places"), '' when nothing or the setting is off; kept beside the cached
+    # places") and the NeTEx StopPlaceRefs read through their Quay ("stop
+    # places read through a quay: N"), '' when neither; kept beside the cached
     # file (`_COUNTS_SUFFIX`), so a cached extract says it too.
     summary: str = ""
 
@@ -640,7 +646,8 @@ def _counts_path(final: Path) -> Path:
 
 
 def _write_counts(final: Path, summary: str) -> None:
-    """Keep what rail by default made rail beside the extract. Best-effort."""
+    """Keep the extract's summary (`ExtractResult.summary`) beside it.
+    Best-effort."""
     if not summary:
         return
     with contextlib.suppress(OSError):
@@ -664,7 +671,7 @@ def _describe(
 ) -> ExtractResult:
     """The result for a written extract: its size, sha256 and rows, read back
     (a whole gzip stream, or an exception); `summary` None: the one kept
-    beside it, for an extract rail by default."""
+    beside it, if any."""
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(MEGABYTE):
@@ -674,7 +681,7 @@ def _describe(
     if rows < 1:
         raise ExtractError("cache", "an extract without a row")
     if summary is None:
-        summary = _read_counts(path) if meta.default_rail else ""
+        summary = _read_counts(path)
     return ExtractResult(
         path_gz=path,
         feed_key=meta.feed_key,
@@ -765,7 +772,9 @@ REMEMBERED_REASONS = frozenset(
 )
 COUNTED_REASONS = frozenset({WALL_CLOCK_LIMIT, CRASHED})
 _FAILED_SUFFIX = ".failed"
-# Beside an extract rail by default, what that made rail (its summary).
+# Beside an extract, its summary when it has one (`ExtractResult.summary`):
+# what rail by default made rail and, since #371, the places read through a
+# quay, for every provider. The name is kept so existing files stay valid.
 _COUNTS_SUFFIX = ".rail-default.json"
 TRIES = 2
 _FAILED_MAX_BYTES = 1024

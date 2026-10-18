@@ -24,6 +24,15 @@ it says, on the journey, its Line or the StopPlace (bus, tram, coach,
 whose type is given. The census counts the
 calls taken as rail so (`rail_by_default`).
 
+**A StopPlaceRef that names a Quay.** Some exports (the Belgian one, for
+one) give every PassengerStopAssignment a `StopPlaceRef` whose `ref` is the
+id of a Quay, and no `QuayRef`. Such a ref is read as a `QuayRef` would be:
+the call is placed at the Quay's StopPlace (`_ref_place`). A `StopPlaceRef`
+that names a StopPlace the archive defines keeps its meaning; one that
+names neither stays as it was. The census counts the called places so
+read (`places_via_quay`), and the summary of a written extract says it
+(`NetexCensus.default_summary`).
+
 **Census.** As it reads, the reader counts what it sees in a `NetexCensus`
 (Lines and journeys by their mode, journeys kept, patterns, points,
 assignments, StopPlaces by mode and type): counters only, so that a feed
@@ -108,6 +117,7 @@ from .station_extract_common import (
     coordinate,
     new_station,
     open_member,
+    pack,
     tally_forms,
 )
 from .station_extract_skip import SkipFilter, root_prefix, start_tag_end
@@ -659,12 +669,32 @@ class NetexCensus(Census):
     # the setting is off, or the stations were not reached.
     rail_by_default: int | None = None
     rail_by_default_places: int | None = None
+    # The called places (distinct QuayRef and StopPlaceRef pairs of the
+    # assignments of called points) whose StopPlaceRef names a Quay, read
+    # through that Quay's StopPlace (`_ref_place`); a place no rail journey
+    # calls at is not counted. None: the assignments were not read.
+    places_via_quay: int | None = None
+
+    def _quay_ref_forms(self) -> list[str]:
+        count = self.places_via_quay
+        if not count:
+            return []
+        return [f"places read through a quay: {count:,}", f"via quay: {count:,}"]
 
     def default_summary(self) -> str:
-        if not self.rail_by_default:
-            return ""
-        places = self.rail_by_default_places or 0
-        return f"rail by default: {self.rail_by_default:,} calls at {places:,} stop places"
+        """What a written extract says: what rail by default made rail, and
+        how many StopPlaceRefs were read through their Quay."""
+        segments: list[list[str]] = []
+        if self.rail_by_default:
+            places = self.rail_by_default_places or 0
+            segments.append(
+                [
+                    f"rail by default: {self.rail_by_default:,} calls at {places:,} stop places",
+                    f"rail by default: {self.rail_by_default:,} calls",
+                ]
+            )
+        segments.append(self._quay_ref_forms())
+        return pack(segments)
 
     @property
     def without_line(self) -> int:
@@ -673,6 +703,9 @@ class NetexCensus(Census):
     def segments(self) -> list[list[str]]:
         kept = self.kept.total
         segments: list[list[str]] = []
+        # Before the lines and journeys: at national scale those fill the
+        # summary, and this says why stations were found at all.
+        quay_forms = self._quay_ref_forms()
         if self.rail_by_default is not None:
             segments.append(
                 [
@@ -682,6 +715,7 @@ class NetexCensus(Census):
                 ]
             )
         segments += [
+            quay_forms,
             tally_forms(self.lines.total, "lines", self.lines),
             [f"{self.journeys.total:,} journeys ({kept:,} kept)"],
             self.stations_forms(),
@@ -714,6 +748,7 @@ class NetexCensus(Census):
             ("places_called", self.places_called),
             ("rail_by_default", self.rail_by_default),
             ("rail_by_default_places", self.rail_by_default_places),
+            ("places_via_quay", self.places_via_quay),
             *super().fields(),
         ]
 
@@ -1069,9 +1104,25 @@ def _read_structure(archive: _Archive, found: _Journeys, default_rail: bool = Fa
     found.points.clear()
     places.assignments.clear()
     places.pair_ids.clear()
-    wanted = {places.pairs[number][0] for number in places.use if places.pairs[number][0]}
-    places.quay_place = {q: p for q, p in quays.items() if q in wanted}
+    _keep_quays(places, quays, found.census)
     return places
+
+
+def _keep_quays(places: _Places, quays: dict[str, str], census: NetexCensus) -> None:
+    """Keep the Quays the called places need (`places.quay_place`): those
+    their QuayRef names, and those a StopPlaceRef names in place of a
+    StopPlace (`_ref_place`); the census counts the called places read so."""
+    wanted: set[str] = set()
+    via_quay = 0
+    for number in places.use:
+        quay, ref = places.pairs[number]
+        wanted.add(quay)
+        if ref not in places.defined:
+            wanted.add(ref)
+            if quay not in quays and ref in quays:
+                via_quay += 1
+    census.places_via_quay = via_quay
+    places.quay_place = {q: p for q, p in quays.items() if q in wanted}
 
 
 def _count_places(found: _Journeys, places: _Places) -> None:
@@ -1164,9 +1215,21 @@ def _root(place: str, places: _Places) -> str:
 
 def _stop_place(place: _Place, places: _Places) -> str:
     """The StopPlace of an assignment: its Quay's when that Quay is known,
-    else the StopPlace it names, else '' (nothing to place it at)."""
+    else the StopPlace its StopPlaceRef names (`_ref_place`), else ''
+    (nothing to place it at)."""
     quay, stop_place = place
-    return places.quay_place.get(quay) or stop_place
+    return places.quay_place.get(quay) or _ref_place(stop_place, places)
+
+
+def _ref_place(ref: str, places: _Places) -> str:
+    """The StopPlace a StopPlaceRef names: itself when the archive defines
+    such a StopPlace; else, when it names a Quay, that Quay's StopPlace, as a
+    QuayRef would (an export that puts Quay ids in StopPlaceRef); else the
+    ref as it is. Every map is complete once pass 2 has read the whole
+    archive, so the order of the frames and members does not matter."""
+    if ref in places.defined:
+        return ref
+    return places.quay_place.get(ref) or ref
 
 
 def _use_of(tally: _Tally, found: _Journeys) -> _Use:

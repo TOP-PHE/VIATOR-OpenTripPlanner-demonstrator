@@ -329,7 +329,8 @@ class FeedOutcome:
     it has no rail station (`no_rail_stop`, `no_stop_place`), what the
     extractor saw, in at most 100 characters of counts and mode words
     (`station_extract.ExtractError.summary`); for a sent extract, what rail
-    by default made rail, when it made some (`ExtractResult.summary`)."""
+    by default made rail and the NeTEx StopPlaceRefs read through their
+    Quay, when there are some (`ExtractResult.summary`)."""
 
     provider_id: str
     state: str
@@ -743,9 +744,9 @@ class _Pass:
 
 
 def _made_as(made: Any) -> str | None:
-    """What rail by default made rail in a sent extract ("rail by default:
-    N calls at M stop places", `ExtractResult.summary`), for the Sessions
-    page; None when it made nothing rail, or the setting is off."""
+    """What a sent extract says ("rail by default: N calls at M stop
+    places", "places read through a quay: N", `ExtractResult.summary`),
+    for the Sessions page; None when it says nothing."""
     summary = getattr(made, "summary", "")
     return summary if isinstance(summary, str) and SUMMARY.fullmatch(summary) else None
 
