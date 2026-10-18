@@ -29,7 +29,8 @@ bit (or would bite) an automated download:
 A download asks for the file's own bytes (`Accept-Encoding: identity`) so
 that a cut can be resumed. A server that refuses that with HTTP 406
 (Fintraffic's Digitraffic does) is asked again once in gzip, from byte 0,
-never resumed, its decoded size capped (`CODED_MAX_BYTES`); the fetch state
+never resumed, unpacked by VIATOR itself in bounded steps and capped
+(`CODED_MAX_BYTES`); any other content coding is refused. The fetch state
 remembers it (`content_coding`) so later refreshes ask in gzip at once.
 
 Per-task fetch state lives in `inbox/<sid>/_fetch_state/<key>.json`, outside
@@ -48,7 +49,8 @@ import re
 import shutil
 import tempfile
 import zipfile
-from collections.abc import Callable
+import zlib
+from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -58,7 +60,7 @@ from typing import Any
 
 import httpx
 
-from . import detect, netex_structure
+from . import detect, netex_structure, station_extract_common
 
 log = logging.getLogger(__name__)
 
@@ -97,11 +99,16 @@ RESUME_BUSY_DELAYS: tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 120.0)
 IDENTITY_ENCODING = "identity"
 CODED_ENCODING = "gzip"
 CODING_STATE_KEY = "content_coding"
-# Most bytes a content-coded body may decode to (httpx decodes it, so no
-# Content-Length bounds it): a gzip bomb ends here instead of filling the
-# disk. Far above any timetable archive (the largest, a national NeTEx, is
-# about 2 GB); module-level so tests can lower it.
-CODED_MAX_BYTES = 8 * 1024 * 1024 * 1024
+# Most bytes a gzip body may unpack to (no Content-Length bounds them): the
+# station extractor's own limit for one unpacked member, so that no file the
+# extractor would read is refused here (a bare-XML NeTEx can be tens of GB).
+# Like a plain body without Content-Length, nothing else bounds the disk.
+# Module-level so tests can lower it.
+CODED_MAX_BYTES = station_extract_common.MEMBER_MAX_BYTES
+# Bytes read from the network, and bytes unpacked, per step: a gzip body is
+# unpacked here (`_gunzipped`), never by httpx, so that one step never makes
+# more than this however much the body packs.
+_CHUNK = 1024 * 1024
 _CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 _STATE_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -407,7 +414,8 @@ class _Transfer:
     an If-Range must name so that a resume never appends bytes of another
     version. Without both, a cut body cannot be resumed. `coded` says the
     request asked for gzip: then the bytes are never resumed, whatever the
-    answer says, and `cap` bounds the decoded size of a content-coded body."""
+    answer says. `gunzip` says the answer is gzip-coded (unpacked here, its
+    unpacked size bounded by `cap`)."""
 
     dest: Path
     status: int = 0
@@ -419,18 +427,22 @@ class _Transfer:
     ranges: bool = False
     limit: int | None = None  # byte offset the current response may not pass
     coded: bool = False
-    cap: int | None = None  # decoded bytes a content-coded body may not pass
+    gunzip: bool = False
+    cap: int | None = None  # unpacked bytes a gzip body may not pass
 
     def start(self, response: httpx.Response) -> None:
         """A full response from byte 0, on a new `_Transfer` (a restart always
-        makes one, so no earlier byte is ever counted or hashed)."""
+        makes one, so no earlier byte is ever counted or hashed). Raises
+        FetchError for a content coding other than one gzip, before any byte
+        of the body is read."""
+        self.gunzip = _gzip_coded(response.headers)
         self.status = response.status_code
         self.headers = response.headers
         self.total = _full_length(response)
         self.validator = _range_validator(response.headers)
         self.ranges = _ranges_offered(response.headers)
         self.limit = self.total
-        self.cap = CODED_MAX_BYTES if _content_coded(response.headers) else None
+        self.cap = CODED_MAX_BYTES if self.gunzip else None
 
     @property
     def resumable(self) -> bool:
@@ -444,7 +456,10 @@ class _Transfer:
 
     def accept_range(self, response: httpx.Response) -> None:
         """Check a 206 continues exactly where the file stops, for the same
-        full size; raise _Restart otherwise."""
+        full size, as the file's own bytes; raise _Restart otherwise."""
+        if _content_coded(response.headers):
+            # Coded bytes are no offsets into the file (and never decoded here).
+            raise _Restart("the range came back content-coded")
         m = _CONTENT_RANGE_RE.fullmatch(response.headers.get("content-range", "").strip())
         if m is None:
             raise _Restart("unreadable Content-Range")
@@ -459,7 +474,7 @@ class _Transfer:
         """Stream the body to disk (never held in memory) and into the hash."""
         out = await asyncio.to_thread(self.dest.open, mode)
         try:
-            async for chunk in response.aiter_bytes(1024 * 1024):
+            async for chunk in self._body(response):
                 self._check_room(len(chunk))
                 # File I/O off the event loop: feeds run to ~2 GB (DE DELFI) and
                 # a slow disk must not stall every other request the web serves.
@@ -478,9 +493,15 @@ class _Transfer:
                 f"(received {self.size} bytes, expected {self.total})"
             )
 
+    def _body(self, response: httpx.Response) -> AsyncIterator[bytes]:
+        """The file's bytes: as sent, or unpacked here from a gzip body."""
+        if self.gunzip:
+            return _gunzipped(response.aiter_raw(_CHUNK))
+        return response.aiter_bytes(_CHUNK)
+
     def _check_room(self, more: int) -> None:
-        """Refuse a chunk that would pass the announced size, or the decoded
-        size cap of a content-coded body (checked before it is written)."""
+        """Refuse a chunk that would pass the announced size, or the unpacked
+        size cap of a gzip body (checked before it is written)."""
         if self.limit is not None and self.size + more > self.limit:
             raise FetchError(
                 f"download failed: size mismatch, the server sent more than "
@@ -488,7 +509,7 @@ class _Transfer:
             )
         if self.cap is not None and self.size + more > self.cap:
             raise FetchError(
-                f"download failed: the compressed body decodes to more than "
+                f"download failed: the gzip body unpacks to more than "
                 f"{self.cap} bytes, the limit for a content-coded download"
             )
 
@@ -498,10 +519,54 @@ class _Transfer:
         )
 
 
+def _codings(headers: httpx.Headers) -> list[str]:
+    """The content codings of an answer, in order, identity left out."""
+    raw = headers.get("content-encoding", "")
+    tokens = (token.strip().lower() for token in raw.split(","))
+    return [token for token in tokens if token and token != IDENTITY_ENCODING]
+
+
 def _content_coded(headers: httpx.Headers) -> bool:
-    """A Content-Encoding other than identity: httpx decodes the body."""
-    encoding = headers.get("content-encoding", "").strip().lower()
-    return encoding not in ("", IDENTITY_ENCODING)
+    """A Content-Encoding other than identity."""
+    return bool(_codings(headers))
+
+
+def _gzip_coded(headers: httpx.Headers) -> bool:
+    """True for a body coded with exactly one gzip, False for a plain one.
+    Any other coding (deflate, br, zstd, gzip twice…) is refused before its
+    body is read: httpx would decode it whole, one network read at a time,
+    and a few hundred bytes coded twice unpack to hundreds of MiB at once."""
+    codings = _codings(headers)
+    if not codings:
+        return False
+    if codings == [CODED_ENCODING]:
+        return True
+    raise FetchError(
+        f"download failed: unsupported content coding "
+        f"{headers.get('content-encoding', '').strip()!r} (only a single gzip is unpacked)"
+    )
+
+
+async def _gunzipped(raw: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Unpack a gzip body read as sent, at most `_CHUNK` bytes per step, so
+    memory stays bounded whatever the ratio. A body that ends before the
+    gzip trailer is a cut (RemoteProtocolError); bytes after the trailer are
+    ignored, as httpx does; corrupt data is a DecodingError."""
+    unpacker = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    async for data in raw:
+        pending = data
+        while not unpacker.eof:
+            try:
+                piece = unpacker.decompress(pending, _CHUNK)
+            except zlib.error as exc:
+                raise httpx.DecodingError(f"gzip body could not be unpacked: {exc}") from exc
+            pending = unpacker.unconsumed_tail
+            if piece:
+                yield piece
+            if not pending and len(piece) < _CHUNK:
+                break
+    if not unpacker.eof:
+        raise httpx.RemoteProtocolError("peer closed connection before the end of the gzip body")
 
 
 def _full_length(response: httpx.Response) -> int | None:
@@ -596,7 +661,10 @@ async def _get_rest(
             return
         # 200: the server ignores ranges, or the file changed (If-Range).
         # 416 or anything else but an error: start again rather than fail.
-        if response.status_code >= 400 and response.status_code != 416:
+        # A 406 too: this server already sent the file's own bytes to the
+        # same request without a range, so it refuses the range, not the
+        # coding; never a switch to gzip (`_coding_refused` sees full GETs only).
+        if response.status_code >= 400 and response.status_code not in (406, 416):
             response.raise_for_status()
         raise _Restart(f"server answered {response.status_code} to a range request")
 
@@ -634,8 +702,9 @@ async def _download(
     (`RESUME_BUSY_DELAYS`), the partial file kept. Each request keeps the
     client's own timeouts.
 
-    A 406 answer switches the coding once (identity to gzip, or back) and
-    starts again from byte 0; it uses no retry. A second 406 gives up.
+    A 406 answer to a request from byte 0 switches the coding once
+    (identity to gzip, or back) and starts again from byte 0; it uses no
+    retry. A second 406 gives up. (A 406 to a resume is a refused range.)
     """
     try:
         return await _download_into(client, url, headers, dest, state_url, coded)
@@ -657,8 +726,9 @@ def _coding_headers(headers: dict[str, str], coded: bool) -> dict[str, str]:
 
 
 def _coding_refused(exc: httpx.HTTPError, tried: _Attempts) -> bool:
-    """A 406 Not Acceptable, the first of this download: the server will not
-    send the body in the coding asked for. Mark the switch as used."""
+    """A 406 Not Acceptable, the first of this download, to a request from
+    byte 0 (`_get_rest` turns a 406 to a range into a restart): the server
+    will not send the body in the coding asked for. Mark the switch as used."""
     if tried.switched or not isinstance(exc, httpx.HTTPStatusError):
         return False
     if exc.response.status_code != 406:
@@ -695,7 +765,8 @@ async def _download_into(
             return result
         except _Restart as exc:
             log.info("fetch resume refused (%s), restarting from byte 0", exc)
-            transfer = _Transfer(dest, coded=transfer.coded)
+            # A _Restart comes only from a resume, and only identity transfers resume.
+            transfer = _Transfer(dest)
             await _next_restart(tried, f"download failed: {exc}", exc)
         except httpx.HTTPError as exc:
             if _coding_refused(exc, tried):
@@ -838,7 +909,7 @@ async def fetch_validated(
     ignored. Its `content_coding` (same URL) starts the download in gzip.
     """
     headers = dict(extra_headers)
-    coded = previous.get("url") == state_url and previous.get(CODING_STATE_KEY) == CODED_ENCODING
+    coded = _remembered_gzip(previous, state_url)
     same_source = have_current and previous.get("url") == state_url
     if same_source:
         if previous.get("etag"):
@@ -861,17 +932,18 @@ async def fetch_validated(
             raise FetchError("server answered 304 to an unconditional request")
         return FetchResult(status="unchanged", reason="not modified (HTTP 304)", state=checked)
 
-    new_state = {
-        "url": state_url,
-        "etag": resp_headers.get("etag"),
-        "last_modified": resp_headers.get("last-modified"),
-        "sha256": sha,
-        "size_bytes": size,
-        "fetched_at": _now_iso(),
-        "checked_at": _now_iso(),
-    }
-    if download.coded:
-        new_state[CODING_STATE_KEY] = CODED_ENCODING
+    new_state = _coding_state(
+        {
+            "url": state_url,
+            "etag": resp_headers.get("etag"),
+            "last_modified": resp_headers.get("last-modified"),
+            "sha256": sha,
+            "size_bytes": size,
+            "fetched_at": _now_iso(),
+            "checked_at": _now_iso(),
+        },
+        download.coded,
+    )
     if have_current and sha and sha == previous.get("sha256"):
         raw.unlink(missing_ok=True)
         return FetchResult(
@@ -923,6 +995,11 @@ async def fetch_validated(
         state=new_state,
         resumes=download.resumes,
     )
+
+
+def _remembered_gzip(previous: dict[str, Any], state_url: str) -> bool:
+    """The last fetch of this same URL had to ask for gzip (HTTP 406)."""
+    return previous.get("url") == state_url and previous.get(CODING_STATE_KEY) == CODED_ENCODING
 
 
 def _coding_state(state: dict[str, Any], coded: bool) -> dict[str, Any]:
