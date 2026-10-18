@@ -202,6 +202,20 @@ default; `-Apply` to save).
   only; on a range request it could turn the answer into a 304. Every feed download asks for
   `Accept-Encoding: identity`, and a content-encoded answer is never resumed: httpx decodes it,
   so its byte count is not an offset into the file.
+- **A 406 to identity is asked again once in gzip.** Some servers (Fintraffic Digitraffic) refuse
+  `Accept-Encoding: identity` with 406. The download then starts again from byte 0 with
+  `Accept-Encoding: gzip` (no retry used) and is never resumed (a cut, or a gzip stream without
+  its trailer, restarts from byte 0). VIATOR unpacks the body itself in 1 MiB steps (never httpx,
+  which decodes a whole network read at once) and stops it at `CODED_MAX_BYTES` (160 GiB, the
+  extractor's `MEMBER_MAX_BYTES`). Any coding but one gzip (deflate, br, zstd, gzip twice) is
+  refused unread (other values such as `none` are plain bytes); past 64 MiB the unpacked bytes may
+  not pass 200 times the packed bytes read. Redirects are followed one hop at a time by
+  `feed_fetch._open` (at most 10, each redirect closed unread, httpx's own next request: no
+  Authorization to another host, the SSRF guard on every hop). A 406 to a range request is a refused range (restart from byte 0 in identity),
+  never a switch. The fetch state keeps `content_coding: gzip` for that URL, so the next refresh
+  asks in gzip at once. A second 406 gives up: `HTTP 406 Not Acceptable (refused with
+  Accept-Encoding identity and gzip)`.
+  The resolvers' own lookups never force identity (httpx's default Accept-Encoding).
 - **Never append without a strong If-Range.** A range request without a validator could join
   bytes of two versions of the file. A Last-Modified within one second of the answer's `Date`
   (or with no `Date`) can name two versions (RFC 9110 8.8.2.2): no strong ETag and no such

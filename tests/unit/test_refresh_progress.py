@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -440,9 +441,12 @@ def test_the_download_reports_bytes_and_the_announced_size(tmp_path: Path) -> No
 def test_a_content_encoded_body_has_no_expected_size(tmp_path: Path) -> None:
     import gzip
 
-    response = httpx.Response(
-        200, content=gzip.compress(b"9" * 999), headers={"Content-Encoding": "gzip"}
-    )
+    async def body() -> AsyncIterator[bytes]:
+        # Streamed as a server sends it: a gzip body is read raw and unpacked
+        # by feed_fetch itself (a bytes body would be read and decoded at once).
+        yield gzip.compress(b"9" * 999)
+
+    response = httpx.Response(200, content=body(), headers={"Content-Encoding": "gzip"})
     assert _stream(tmp_path, response) == [(999, None)]
 
 
