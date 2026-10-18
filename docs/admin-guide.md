@@ -1777,13 +1777,25 @@ It is now handled (`app/feed_fetch.py`):
 - VIATOR unpacks the gzip body itself, 1 MiB at a time, so memory stays
   small whatever the body packs. The unpacked bytes are stopped at
   160 GiB (`CODED_MAX_BYTES`, the station extractor's own limit for one
-  unpacked member): `the gzip body unpacks to more than … bytes`. As for
-  a plain body sent without a size, nothing else bounds the disk.
-- Only a single gzip coding is unpacked. An answer coded otherwise
-  (`deflate`, `br`, `zstd`, or gzip twice) is refused before its body is
-  read: `unsupported content coding 'gzip, gzip' (only a single gzip is
-  unpacked)`. VIATOR never asks for those codings; a server sending one
-  unasked is misbehaving.
+  unpacked member): `the gzip body unpacks to more than … bytes`; and,
+  past the first 64 MiB, at 200 times the packed bytes read (the
+  extractor's ratio limit): `the gzip body unpacks to more than 200 times
+  its packed size`. As for a plain body sent without a size, nothing else
+  bounds the disk.
+- Only a single gzip coding is unpacked. A compression VIATOR does not
+  unpack (`deflate`, `br`, `zstd`, `compress`, `x-gzip`, `x-compress`, or
+  gzip twice, on one header line or several) is refused before its body
+  is read: `unsupported content coding 'gzip, gzip' (only a single gzip is
+  unpacked)`. VIATOR never asks for those; a server sending one unasked is
+  misbehaving. Any other value (`none`, `binary`, `UTF-8`…) names no
+  compression: the bytes are kept as sent, as before, and the format check
+  judges them.
+- Redirects are followed by VIATOR itself, one hop at a time, at most 10
+  (`more than 10 redirects`). A redirect's own body is never read, so it
+  cannot weigh on memory. `Authorization` is not sent on to another host,
+  the SSRF guard checks every hop of a NAP task, and a resume or a
+  conditional GET goes through the redirect as before; the fetch state
+  keeps the URL the provider names.
 - The fetch state remembers it **per URL** (`content_coding: gzip`), so
   later refreshes of the same URL ask in gzip at once, without the wasted
   `406`. It is reset when the URL changes (a resolver that builds a new

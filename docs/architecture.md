@@ -1140,7 +1140,9 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   file and its size must equal the announced one. Downloads ask for `Accept-Encoding: identity`;
   a server that refuses it (406) is asked again once in gzip from byte 0, never resumed, unpacked
   by VIATOR in 1 MiB steps and stopped at `CODED_MAX_BYTES` (160 GiB), and remembered in the
-  fetch state (`content_coding`); any other content coding is refused unread. OSM refresh is the
+  fetch state (`content_coding`); any other compression is refused unread. Feed downloads follow
+  redirects themselves (`feed_fetch._open`, at most 10 hops, each redirect closed unread), since
+  httpx reads and decodes a redirect's whole body before following it. OSM refresh is the
   exception to "the previous file stays": it rotates `osm.pbf` before downloading. See
   [nap-feed-resolvers.md](nap-feed-resolvers.md).
 - **`dispatch(staged_filename=None)` rotates every file in the subdir.** That is correct for a
