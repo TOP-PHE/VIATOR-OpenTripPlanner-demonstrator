@@ -19,6 +19,7 @@ import hashlib
 import io
 import logging
 import random
+import secrets
 import tracemalloc
 import zipfile
 from collections.abc import AsyncIterator
@@ -150,7 +151,11 @@ async def _fetch(
     have_current: bool = False,
     extra_headers: dict[str, str] | None = None,
 ) -> feed_fetch.FetchResult:
-    async with httpx.AsyncClient(transport=httpx.MockTransport(server)) as client:
+    # follow_redirects=True as the refresh's own client (app/api/admin/sessions.py):
+    # feed_fetch must follow redirects itself all the same.
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), follow_redirects=True
+    ) as client:
         return await fetch_validated(
             client,
             fetch_url=FETCH_URL,
@@ -633,3 +638,276 @@ async def test_bytes_after_the_gzip_trailer_are_ignored_unheld() -> None:
         tracemalloc.stop()
     assert b"".join(pieces) == b"ZZ-file"
     assert peak < 8 * MIB
+
+
+# ─────────────────────────── odd Content-Encoding values ───────────────────────────
+
+
+@pytest.mark.parametrize("value", ["none", "binary", "UTF-8", "identity"])
+async def test_values_that_name_no_compression_are_plain(staging: Path, value: str) -> None:
+    """httpx ignored them and kept the bytes: so does VIATOR, reading raw."""
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": value}, content=_chunks(BODY, None))
+
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+
+
+@pytest.mark.parametrize("value", ["GZIP", " gzip ", "Gzip, identity"])
+async def test_gzip_is_read_whatever_its_case_and_spaces(staging: Path, value: str) -> None:
+    encoded = gzip.compress(BODY, compresslevel=1)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Encoding": value}, content=_chunks(encoded, None)
+        )
+
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+
+
+@pytest.mark.parametrize("value", ["x-gzip", "x-compress", "compress", "DEFLATE", "Br"])
+async def test_other_compressions_are_refused_whatever_their_case(
+    staging: Path, value: str
+) -> None:
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": value}, content=_chunks(BODY, None))
+
+    with pytest.raises(FetchError, match=r"^download failed: unsupported content coding "):
+        await _fetch(server, staging)
+
+
+@pytest.mark.parametrize(
+    ("lines", "fits"),
+    [(["gzip", "gzip"], False), (["gzip", "identity"], True), (["identity", "br"], False)],
+)
+async def test_codings_on_two_header_lines_count_as_one_list(
+    staging: Path, lines: list[str], fits: bool
+) -> None:
+    encoded = gzip.compress(BODY, compresslevel=1)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        headers = [("Content-Encoding", line) for line in lines]
+        return httpx.Response(200, headers=headers, content=_chunks(encoded, None))
+
+    if fits:
+        result = await _fetch(server, staging)
+        assert result.sha256 == _sha(BODY)
+        return
+    with pytest.raises(FetchError, match="unsupported content coding"):
+        await _fetch(server, staging)
+
+
+# ─────────────────────────── unpacking ratio ───────────────────────────
+
+
+async def test_ratio_past_the_extractors_limit_is_stopped(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the floor, the unpacked bytes may not pass RATIO_MAX times the
+    packed bytes read (the extractor's own bounds)."""
+    monkeypatch.setattr(station_extract_common, "RATIO_FLOOR_BYTES", MIB)
+    encoded = gzip.compress(bytes(16 * MIB), compresslevel=9)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=_once(encoded))
+
+    with pytest.raises(FetchError) as exc:
+        await _fetch(server, staging)
+    assert str(exc.value).startswith(
+        "download failed: the gzip body unpacks to more than 200 times its packed size ("
+    )
+    assert list(staging.iterdir()) == []
+
+
+RATIO_DATA = b"Z" * 9999
+RATIO_PACKED = gzip.compress(RATIO_DATA)
+RATIO_FITS = -(-len(RATIO_DATA) // len(RATIO_PACKED))  # the smallest ratio that lets it through
+
+
+async def test_ratio_counts_every_packed_byte_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ratio is over all the packed bytes read so far, not the last
+    read: with the floor one byte short of the whole, only the ratio over
+    both reads lets the last byte through."""
+    monkeypatch.setattr(station_extract_common, "RATIO_MAX", RATIO_FITS)
+    monkeypatch.setattr(station_extract_common, "RATIO_FLOOR_BYTES", len(RATIO_DATA) - 1)
+
+    async def two_reads() -> AsyncIterator[bytes]:
+        yield RATIO_PACKED[:10]  # the gzip header alone: nothing unpacked
+        yield RATIO_PACKED[10:]
+
+    pieces = [p async for p in feed_fetch._gunzipped(two_reads())]
+    assert b"".join(pieces) == RATIO_DATA
+
+
+@pytest.mark.parametrize(
+    ("ratio", "floor", "fits"),
+    [
+        (RATIO_FITS, 0, True),
+        (RATIO_FITS - 1, 0, False),
+        (0, len(RATIO_DATA), True),
+        (0, len(RATIO_DATA) - 1, False),
+    ],
+    ids=["ratio-at-limit", "ratio-past-limit", "floor-at-limit", "floor-past-limit"],
+)
+async def test_ratio_and_floor_limits_are_exact(
+    monkeypatch: pytest.MonkeyPatch, ratio: int, floor: int, fits: bool
+) -> None:
+    monkeypatch.setattr(station_extract_common, "RATIO_MAX", ratio)
+    monkeypatch.setattr(station_extract_common, "RATIO_FLOOR_BYTES", floor)
+
+    async def unpack() -> bytes:
+        return b"".join([p async for p in feed_fetch._gunzipped(_once(RATIO_PACKED))])
+
+    if fits:
+        assert await unpack() == RATIO_DATA
+        return
+    with pytest.raises(FetchError, match=f"more than {ratio} times its packed size"):
+        await unpack()
+
+
+# ─────────────────────────── redirects ───────────────────────────
+
+
+class Redirects:
+    """Every request to the feed's host (zz-rail.example) is redirected to
+    `to`, with `hop_headers` and a body from `hop_body` (never to be read);
+    `final` serves every other request."""
+
+    def __init__(
+        self,
+        final: Any,
+        *,
+        hop_headers: dict[str, str] | None = None,
+        hop_body: Any = None,
+        to: str = "https://zz-b.example/gtfs.zip",
+    ) -> None:
+        self.final = final
+        self.hop_headers = hop_headers or {}
+        self.hop_body = hop_body
+        self.to = to
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.url.host == "zz-rail.example":
+            headers = {"Location": self.to, **self.hop_headers}
+            content = self.hop_body() if self.hop_body else b""
+            return httpx.Response(302, headers=headers, content=content)
+        return self.final(request)
+
+
+async def test_stacked_gzip_redirect_is_never_read(staging: Path) -> None:
+    """A 302 whose body is coded twice would unpack to 64 MiB in one go:
+    closed unread, and the file comes from the next hop."""
+    bomb = gzip.compress(gzip.compress(bytes(64 * MIB), compresslevel=9), compresslevel=9)
+    read: list[int] = []
+
+    async def bomb_body() -> AsyncIterator[bytes]:
+        read.append(1)
+        yield bomb
+
+    server = Redirects(
+        CodingServer(refuse=frozenset()),
+        hop_headers={"Content-Encoding": "gzip, gzip"},
+        hop_body=bomb_body,
+    )
+    tracemalloc.start()
+    try:
+        result = await _fetch(server, staging)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result.sha256 == _sha(BODY)
+    assert read == []
+    assert peak < 32 * MIB
+    assert result.state["url"] == STATE_URL
+
+
+async def test_large_plain_redirect_body_is_never_read(staging: Path) -> None:
+    pieces: list[int] = []
+
+    async def big_body() -> AsyncIterator[bytes]:
+        for _ in range(64):
+            pieces.append(1)
+            yield bytes(MIB)
+
+    server = Redirects(CodingServer(refuse=frozenset()), hop_body=big_body)
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+    assert pieces == []
+
+
+async def test_redirect_loop_is_given_up_after_the_hop_cap(staging: Path) -> None:
+    server = Redirects(CodingServer(refuse=frozenset()), to=FETCH_URL)
+    with pytest.raises(FetchError) as exc:
+        await _fetch(server, staging)
+    assert str(exc.value) == f"download failed: more than {feed_fetch.MAX_REDIRECTS} redirects"
+    assert len(server.requests) == feed_fetch.MAX_REDIRECTS + 1
+    assert list(staging.iterdir()) == []
+
+
+async def test_redirects_up_to_the_cap_are_followed(staging: Path) -> None:
+    hops = iter(range(feed_fetch.MAX_REDIRECTS))
+    final = CodingServer(refuse=frozenset())
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if next(hops, None) is not None:
+            return httpx.Response(302, headers={"Location": FETCH_URL})
+        return final(request)
+
+    result = await _fetch(server, staging)
+    assert result.sha256 == _sha(BODY)
+
+
+@pytest.mark.parametrize(
+    ("to", "kept"),
+    [("https://zz-b.example/gtfs.zip", False), ("https://zz-rail.example/other.zip", True)],
+    ids=["other-host", "same-host"],
+)
+async def test_authorization_never_follows_to_another_host(
+    staging: Path, to: str, kept: bool
+) -> None:
+    token = f"Bearer zz-{secrets.token_urlsafe(8)}"
+    final = CodingServer(refuse=frozenset())
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gtfs.zip" and request.url.host == "zz-rail.example":
+            return httpx.Response(302, headers={"Location": to})
+        return final(request)
+
+    await _fetch(server, staging, extra_headers={"Authorization": token})
+    assert (final.requests[0].headers.get("authorization") == token) is kept
+
+
+async def test_resume_across_a_redirect(staging: Path) -> None:
+    """Every request is redirected to a file host that cuts the body: the
+    resume, Range and If-Range kept, goes through the redirect too."""
+    final = CodingServer(refuse=frozenset(), cuts=[MIB + MIB // 2])
+    read: list[int] = []
+
+    async def hop_body() -> AsyncIterator[bytes]:
+        read.append(1)
+        yield b"zz"
+
+    server = Redirects(final, hop_body=hop_body)
+    previous = {"url": STATE_URL, "etag": '"zz-v0"', "sha256": "zz"}
+    result = await _fetch(server, staging, previous=previous, have_current=True)
+    assert result.sha256 == _sha(BODY)
+    assert result.resumes == 1
+    assert final.ranges() == [None, f"bytes={MIB}-"]
+    assert final.requests[0].headers["if-none-match"] == '"zz-v0"'
+    assert final.requests[1].headers["if-range"] == '"zz-v1"'
+    assert result.state["url"] == STATE_URL
+    assert len(server.requests) == 4  # two redirects, each closed unread
+    assert read == []
+
+
+async def test_conditional_get_across_a_redirect_answers_unchanged(staging: Path) -> None:
+    final = CodingServer(refuse=frozenset())
+    server = Redirects(final)
+    previous = {"url": STATE_URL, "etag": '"zz-v1"', "sha256": _sha(BODY)}
+    result = await _fetch(server, staging, previous=previous, have_current=True)
+    assert result.status == "unchanged"
+    assert result.reason == "not modified (HTTP 304)"
