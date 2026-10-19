@@ -113,7 +113,7 @@ services:
       # Issue #374 — memory caps with no swap on the per-session serve
       # containers, which web writes into generated/docker-compose.sessions.yml
       # (app/sessions_orchestrator.py). OTP: on by default, cap = serve heap +
-      # max(headroom, heap/3, 3g). MOTIS: empty = no cap. A changed value
+      # max(headroom, heap/3, 4g). MOTIS: empty = no cap. A changed value
       # reaches a session container when compose next recreates it.
       OTP_SERVE_MEM_CAP: ${OTP_SERVE_MEM_CAP:-true}
       OTP_SERVE_MEM_HEADROOM_GB: ${OTP_SERVE_MEM_HEADROOM_GB:-6}
@@ -180,6 +180,9 @@ services:
       INBOX_DIR: /data/inbox
       GRAPH_DIR: /data/graphs
       OTP_BUILD_HEAP: ${OTP_BUILD_HEAP:-12g}
+      # Issue #374 — widens the build cap (heap + max(4, heap/6, this)), which
+      # has no swap behind it. Integer GB.
+      OTP_BUILD_MEM_HEADROOM_GB: ${OTP_BUILD_MEM_HEADROOM_GB:-4}
       DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-1800}
       # MOTIS version overrides (app/engine_versions.py). Empty = the pinned version.
       # The build one defaults to the serve one; set it alone to try a candidate.
@@ -240,6 +243,10 @@ services:
     # no swap at all. Without it the "hard cap" above was soft: a build at its
     # cap went on into the host swap (and iowait) instead of being killed.
     memswap_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
+    # Host-level OOM (the whole server out of memory): the kernel kills a
+    # build before a serving router, web or postgres (oom_score_adj 0).
+    # Same value as the MOTIS build's `--oom-score-adj` (app/memory_caps.py).
+    oom_score_adj: 500
     environment:
       OTP_MODE: build
       OTP_INBOX_DIR: ${OTP_INBOX_DIR:-/var/otp/inbox}

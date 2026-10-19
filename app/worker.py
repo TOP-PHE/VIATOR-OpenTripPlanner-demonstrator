@@ -1220,7 +1220,11 @@ def run_build(
     host_gb = _host_total_gb()
     stopped_services: list[str] = []
     if max_memory:
-        auto = otp_heap.auto_build_heap(host_gb) if host_gb is not None else None
+        auto = (
+            otp_heap.auto_build_heap(host_gb, headroom_gb=settings.otp_build_mem_headroom_gb)
+            if host_gb is not None
+            else None
+        )
         if auto is not None:
             log.info(
                 "max-memory rebuild: host=%dGB → auto build heap %s (was %s)",
@@ -1249,7 +1253,9 @@ def run_build(
     # the JVM never even reaches its own -Xmx. Injected via the subprocess
     # environment so docker-compose's `mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}`
     # interpolation picks it up (a process env var beats the project's .env).
-    mem_limit_value = otp_heap.mem_limit_for_heap(otp_heap_value)
+    mem_limit_value = otp_heap.mem_limit_for_heap(
+        otp_heap_value, headroom_gb=settings.otp_build_mem_headroom_gb
+    )
     needed_gb = otp_heap.heap_to_gb(mem_limit_value)
     if host_gb is not None and needed_gb > host_gb:
         log.warning(
@@ -1576,6 +1582,9 @@ def run_build_motis(
             # Issue #374: `--memory X --memory-swap X` when MOTIS_BUILD_MEM_LIMIT
             # is set (cap, no swap); nothing when it is empty (the default).
             *memory_caps.docker_run_memory_args(build_mem_limit),
+            # Issue #374: if the HOST runs out of memory, the kernel kills a
+            # build first rather than a serving router or postgres.
+            *memory_caps.BUILD_OOM_SCORE_ARGS,
             "--user",
             worker_user,
             "--network",

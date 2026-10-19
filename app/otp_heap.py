@@ -175,18 +175,27 @@ def heap_to_gb(heap: str) -> int:
     return max(1, -(-qty // 1024))
 
 
-def mem_limit_for_heap(heap: str, *, default: str = DEFAULT_HEAP) -> str:
+MIN_BUILD_HEADROOM_GB = 4
+
+
+def mem_limit_for_heap(
+    heap: str, *, default: str = DEFAULT_HEAP, headroom_gb: int = MIN_BUILD_HEADROOM_GB
+) -> str:
     """Return the cgroup `mem_limit` (e.g. '28g') the build container needs for `heap`.
 
-    `mem_limit = heap_gb + max(4, heap_gb // 6)` — the JVM -Xmx plus native
-    headroom. None/empty/malformed falls back to deriving from `default` so a
-    legacy session with no heap configured still gets a sane, matched cap.
+    `mem_limit = heap_gb + max(4, heap_gb // 6, headroom_gb)` — the JVM -Xmx
+    plus native headroom. `headroom_gb` is the operator's
+    OTP_BUILD_MEM_HEADROOM_GB (issue #374): since the cap has no swap behind
+    it, a build that ran just over it now fails, and the setting widens the
+    cap (it can never narrow it below the 4g / heap/6 rule).
+    None/empty/malformed falls back to deriving from `default` so a legacy
+    session with no heap configured still gets a sane, matched cap.
     """
     try:
         gb = heap_to_gb(heap) if heap else heap_to_gb(default)
     except ValueError:
         gb = heap_to_gb(default)
-    headroom = max(4, gb // 6)
+    headroom = max(MIN_BUILD_HEADROOM_GB, gb // 6, headroom_gb)
     return f"{gb + headroom}g"
 
 
@@ -202,6 +211,7 @@ def auto_build_heap(
     *,
     reserve_gb: int = MAX_MEMORY_RESERVE_GB,
     min_gb: int = 8,
+    headroom_gb: int = MIN_BUILD_HEADROOM_GB,
 ) -> str | None:
     """Largest build heap whose derived cgroup cap still fits the host.
 
@@ -221,9 +231,12 @@ def auto_build_heap(
     if avail < min_gb:
         return None
     heap = max(min_gb, (avail * 6) // 7)
-    while heap > min_gb and heap_to_gb(mem_limit_for_heap(f"{heap}g")) > avail:
+    while (
+        heap > min_gb
+        and heap_to_gb(mem_limit_for_heap(f"{heap}g", headroom_gb=headroom_gb)) > avail
+    ):
         heap -= 1
-    if heap_to_gb(mem_limit_for_heap(f"{heap}g")) > avail:
+    if heap_to_gb(mem_limit_for_heap(f"{heap}g", headroom_gb=headroom_gb)) > avail:
         return None
     return f"{heap}g"
 
@@ -237,9 +250,9 @@ def auto_build_heap(
 #
 # Headroom on top of -Xmx: the serve JVM runs with -XX:MaxDirectMemorySize=2g
 # (docker/otp/entrypoint.sh) and also needs metaspace, code cache, thread
-# stacks and the G1 structures that grow with the heap. The serve process
-# lives for weeks with the whole graph loaded, so the headroom is wider than
-# the build's: `max(configured, heap // 3)`, never below
+# stacks and the G1 structures that grow with the heap. The floor is the
+# build's 4g; the serve process lives for weeks with the whole graph loaded,
+# so the default headroom is wider: `max(configured, heap // 3)`, never below
 # MIN_SERVE_HEADROOM_GB. A cap that is too tight kills a router that worked;
 # a generous one still turns a runaway into a visible OOM kill instead of
 # hours of host swapping.
@@ -248,7 +261,7 @@ def auto_build_heap(
 #   16g -> 22g
 #   24g -> 32g
 #   48g -> 64g
-MIN_SERVE_HEADROOM_GB = 3  # MaxDirectMemorySize=2g + ~1g metaspace/threads/code cache
+MIN_SERVE_HEADROOM_GB = 4  # same floor as the build: 2g direct buffers + metaspace, threads, GC
 DEFAULT_SERVE_HEADROOM_GB = 6
 
 
@@ -258,8 +271,8 @@ def serve_mem_limit_for_heap(
     """Return the cgroup cap (e.g. '18g') of an OTP serve container whose -Xmx is `heap`.
 
     `cap = heap_gb + max(headroom_gb, heap_gb // 3, MIN_SERVE_HEADROOM_GB)`.
-    The floor means no setting can cap a container below what its heap plus
-    the 2g direct buffers need. Returns None for a missing or malformed heap:
+    The 4g floor means no setting can cap a container below what its heap
+    plus the 2g direct buffers and the JVM's own structures need. Returns None for a missing or malformed heap:
     the cap is then left off rather than guessed (the JVM would refuse that
     heap anyway, and a guessed cap could be below what it needs).
     """

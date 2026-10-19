@@ -54,9 +54,9 @@ def test_serve_cap_follows_the_heap(heap: str, cap: str) -> None:
         ("12g", 0, "16g"),
         ("12g", 4, "16g"),
         ("12g", 9, "21g"),
-        # heap 2g: heap // 3 = 0 → the 3g floor holds whatever the setting
-        ("2g", 0, "5g"),
-        ("2g", 2, "5g"),
+        # heap 2g: heap // 3 = 0 → the 4g floor holds whatever the setting
+        ("2g", 0, "6g"),
+        ("2g", 4, "6g"),
         ("2g", 5, "7g"),
     ],
 )
@@ -69,7 +69,8 @@ def test_serve_headroom_setting_only_widens_the_cap(heap: str, headroom: int, ca
 def test_serve_cap_is_never_below_heap_plus_direct_buffers(heap: str, headroom: int) -> None:
     cap = serve_mem_limit_for_heap(heap, headroom_gb=headroom)
     assert cap is not None
-    assert heap_to_gb(cap) - heap_to_gb(heap) >= MIN_SERVE_HEADROOM_GB == 3
+    assert MIN_SERVE_HEADROOM_GB == 4  # the build's floor too
+    assert heap_to_gb(cap) - heap_to_gb(heap) >= MIN_SERVE_HEADROOM_GB
 
 
 @pytest.mark.parametrize("heap", [None, "", "lots", "12", "12k", "1.5g"])
@@ -82,16 +83,30 @@ def test_malformed_serve_heap_gets_no_cap(heap: str | None) -> None:
 
 @pytest.mark.parametrize(
     "value,expected",
-    [(None, None), ("", None), ("  ", None), ("32g", "32g"), (" 32G ", "32g"), ("9900m", "9900m")],
+    [
+        (None, None),
+        ("", None),
+        ("  ", None),
+        ("32g", "32g"),
+        (" 32G ", "32g"),
+        ("9900m", "9900m"),
+        ("64m", "64m"),  # the smallest accepted
+        ("1g", "1g"),
+    ],
 )
 def test_validate_mem_limit(value: str | None, expected: str | None) -> None:
     assert memory_caps.validate_mem_limit(value) == expected
 
 
-@pytest.mark.parametrize("value", ["0g", "32", "32gb", "-1g", "1.5g", "lots"])
+@pytest.mark.parametrize("value", ["0g", "32", "32gb", "-1g", "1.5g", "lots", "63m", "32m"])
 def test_validate_mem_limit_refuses(value: str) -> None:
     with pytest.raises(ValueError, match="memory limit"):
         memory_caps.validate_mem_limit(value)
+
+
+def test_validate_mem_limit_says_zero_means_no_limit() -> None:
+    with pytest.raises(ValueError, match="means no limit"):
+        memory_caps.validate_mem_limit("0m")
 
 
 def test_compose_lines_set_swap_equal_to_memory() -> None:
@@ -237,6 +252,8 @@ def test_motis_build_argv_caps_memory_with_no_swap(
         assert cmd[cmd.index("--memory-swap") + 1] == "99g"
         # flags of `docker run`, so before the image name
         assert cmd.index("--memory-swap") < cmd.index(worker._MOTIS_IMAGE)
+        assert cmd[cmd.index("--oom-score-adj") + 1] == "500"
+        assert cmd.index("--oom-score-adj") < cmd.index(worker._MOTIS_IMAGE)
     assert "[viator] build memory cap: 99g (no swap)" in log
 
 
@@ -249,6 +266,8 @@ def test_motis_build_argv_without_a_valid_cap_has_no_memory_flags(
     for cmd in seen:
         assert "--memory" not in cmd
         assert "--memory-swap" not in cmd
+        # host-level OOM order holds with or without a cap
+        assert cmd[cmd.index("--oom-score-adj") + 1] == "500"
     assert "build memory cap" not in log
 
 
@@ -280,3 +299,92 @@ def test_killed_otp_build_names_the_signal_and_the_cap(
         "[viator] otp build failed: exit 137 - killed (SIGKILL) - usually out of memory, "
         "or the container was stopped (memory cap 12g, no swap)"
     )
+
+
+# ── build headroom (issue #374 repair: the build cap is a hard edge now) ─────
+
+
+@pytest.mark.parametrize(
+    "heap,headroom,cap",
+    [
+        ("8g", 0, "12g"),  # never below the 4g floor
+        ("8g", 4, "12g"),  # the default: unchanged pairing
+        ("8g", 6, "14g"),
+        ("48g", 4, "56g"),  # heap // 6 = 8 still wins
+        ("48g", 10, "58g"),
+    ],
+)
+def test_build_headroom_setting_only_widens_the_cap(heap: str, headroom: int, cap: str) -> None:
+    from app.otp_heap import mem_limit_for_heap
+
+    assert mem_limit_for_heap(heap, headroom_gb=headroom) == cap
+
+
+def test_auto_build_heap_keeps_the_wider_cap_inside_the_host() -> None:
+    from app.otp_heap import auto_build_heap, mem_limit_for_heap
+
+    heap = auto_build_heap(99, headroom_gb=20)
+    assert heap is not None
+    assert heap_to_gb(mem_limit_for_heap(heap, headroom_gb=20)) <= 99 - 8
+    assert heap_to_gb(heap) < heap_to_gb(auto_build_heap(99) or "0g")
+
+
+def test_build_cap_uses_the_headroom_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "graph_dir", tmp_path / "graphs")
+    monkeypatch.setattr(settings, "otp_build_heap", "8g")
+    monkeypatch.setattr(settings, "otp_build_mem_headroom_gb", 7)
+    monkeypatch.setattr(worker, "_host_total_gb", lambda: None)
+    seen_env: list[dict[str, str]] = []
+
+    class _Proc:
+        stdout = ""
+        stderr = ""
+        returncode = 137
+
+    def _fake_run(_cmd: list[str], **kw: Any) -> _Proc:
+        seen_env.append(kw["env"])
+        return _Proc()
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    log, _ok, _path = worker.run_build(session_id=None)
+    assert seen_env[0]["OTP_BUILD_MEM_LIMIT"] == "15g"
+    assert "(memory cap 15g, no swap)" in log
+
+
+# ── a typo in a headroom setting must not stop web or the worker ────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("8", 8), ("8g", 8), (" 10G ", 10), ("0", 0), ("lots", 6), ("8gb", 6), ("-2", 6), ("", 6)],
+)
+def test_serve_headroom_setting_is_tolerant(raw: str, expected: int) -> None:
+    from app.settings import Settings
+
+    assert Settings(otp_serve_mem_headroom_gb=raw).otp_serve_mem_headroom_gb == expected
+
+
+@pytest.mark.parametrize("raw,expected", [("9", 9), ("9g", 9), ("nine", 4), ("1.5", 4)])
+def test_build_headroom_setting_is_tolerant(raw: str, expected: int) -> None:
+    from app.settings import Settings
+
+    assert Settings(otp_build_mem_headroom_gb=raw).otp_build_mem_headroom_gb == expected
+
+
+def test_tolerant_headroom_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.settings import Settings
+
+    monkeypatch.setenv("OTP_SERVE_MEM_HEADROOM_GB", "8g")
+    monkeypatch.setenv("OTP_BUILD_MEM_HEADROOM_GB", "zz")
+    fresh = Settings()
+    assert fresh.otp_serve_mem_headroom_gb == 8
+    assert fresh.otp_build_mem_headroom_gb == 4
+
+
+def test_bad_headroom_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    from app.settings import headroom_gb_or_default
+
+    assert headroom_gb_or_default("lots", 6, "otp_serve_mem_headroom_gb") == 6
+    assert "OTP_SERVE_MEM_HEADROOM_GB='lots' is not a whole number of GB; using 6" in caplog.text
