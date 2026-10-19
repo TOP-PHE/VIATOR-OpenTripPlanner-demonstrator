@@ -116,36 +116,22 @@ def _check_brackets(expr: str) -> None:
     assert not stack, f"unclosed {stack} in {expr!r}"
 
 
-def check_expr(expr: str) -> set[str]:
-    """Raise AssertionError unless `expr` is well formed and uses only exported
-    metrics and labels. Returns the metric names it reads."""
-    _check_brackets(expr)
+def _check_matchers(metric: str, body: str, expr: str) -> None:
+    """Each label matcher of a selector parses and names an exported label."""
+    allowed = _labels_of(metric)
+    pos = 0
+    while body[pos:].strip():
+        mm = _MATCHER.match(body, pos)
+        assert mm, f"bad label matcher {body[pos:]!r} in {expr!r}"
+        assert mm.group(1) in allowed, f"{metric} has no label {mm.group(1)!r}"
+        if mm.group(2) in ("=~", "!~"):
+            re.compile(json.loads(mm.group(3)))
+        pos = mm.end()
+
+
+def _bare_words(rest: str, expr: str) -> set[str]:
+    """Metrics named outside selectors; every word before "(" is a function."""
     metrics: set[str] = set()
-    rest = expr
-    # 1. Selectors with label matchers: each matcher must parse and name a
-    #    label the metric's exporter exports.
-    for m in _SELECTOR.finditer(expr):
-        metric, body = m.group(1), m.group(2)
-        assert metric, f"selector without a metric name in {expr!r}"
-        allowed = _labels_of(metric)
-        pos = 0
-        while pos < len(body) and body[pos:].strip():
-            mm = _MATCHER.match(body, pos)
-            assert mm, f"bad label matcher {body[pos:]!r} in {expr!r}"
-            assert mm.group(1) in allowed, f"{metric} has no label {mm.group(1)!r}"
-            if mm.group(2) in ("=~", "!~"):
-                re.compile(json.loads(mm.group(3)))
-            pos = mm.end()
-        metrics.add(metric)
-    rest = _SELECTOR.sub(lambda m: f" {m.group(1)} ", _STRING.sub('""', rest))
-    # 2. Grouping clauses: labels of the series being grouped or matched.
-    grouping_labels: list[str] = []
-    for g in _GROUP_CLAUSE.finditer(rest):
-        grouping_labels += [x.strip() for x in g.group(2).split(",") if x.strip()]
-    rest = _GROUP_CLAUSE.sub(" ", rest)
-    rest = _RANGE.sub(" ", rest)
-    rest = _NUMBER.sub(" ", rest)
-    # 3. What is left: functions (followed by "("), keywords and bare metrics.
     for t in _IDENT.finditer(rest):
         word = t.group(0)
         if word in KEYWORDS:
@@ -155,6 +141,27 @@ def check_expr(expr: str) -> set[str]:
         else:
             _labels_of(word)
             metrics.add(word)
+    return metrics
+
+
+def check_expr(expr: str) -> set[str]:
+    """Raise AssertionError unless `expr` is well formed and uses only exported
+    metrics and labels. Returns the metric names it reads."""
+    _check_brackets(expr)
+    metrics: set[str] = set()
+    # 1. Selectors with label matchers.
+    for m in _SELECTOR.finditer(expr):
+        assert m.group(1), f"selector without a metric name in {expr!r}"
+        _check_matchers(m.group(1), m.group(2), expr)
+        metrics.add(m.group(1))
+    rest = _SELECTOR.sub(lambda m: f" {m.group(1)} ", _STRING.sub('""', expr))
+    # 2. Grouping clauses: labels of the series being grouped or matched.
+    grouping_labels = [
+        x.strip() for g in _GROUP_CLAUSE.finditer(rest) for x in g.group(2).split(",") if x.strip()
+    ]
+    rest = _NUMBER.sub(" ", _RANGE.sub(" ", _GROUP_CLAUSE.sub(" ", rest)))
+    # 3. What is left: functions (followed by "("), keywords and bare metrics.
+    metrics |= _bare_words(rest, expr)
     assert metrics, f"no metric in {expr!r}"
     known = set().union(*(_labels_of(m) for m in metrics))
     for label in grouping_labels:
