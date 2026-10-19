@@ -4,76 +4,71 @@ The per-container panels of the "VIATOR — Resources" dashboard showed No data
 for days without any test or alert noticing. These checks pin the static half
 of the fix (the live half is the CadvisorNoContainerNames alert):
 
-  * every dashboard and alert expression is well formed and uses only metrics
-    and labels that cAdvisor, node-exporter and Prometheus itself export (the
+  * every expression of the Resources dashboard and of the alert rules is read
+    by tests/unit/promql_reader.py (a recursive-descent reader of the PromQL
+    subset used here: operators between operands, range functions with a
+    range, known functions) and uses only metrics and labels cAdvisor,
+    node-exporter and Prometheus export, label by label per metric (the
     cAdvisor container labels come from the compose whitelist);
-  * the rule files have the shape Prometheus loads (no promtool in CI, so a
-    structural check);
+  * the rule files have the shape Prometheus loads. Prometheus's own parser
+    runs in CI: the "promtool" step checks prometheus.yml, every rule file and
+    every dashboard query (scripts/dashboard_queries_as_rules.py); the tests
+    below keep that step and its image tag in place;
   * every capped container in docker-compose.yml has no swap behind its cap;
   * cAdvisor is pinned to an exact release on ghcr.io, keeps its label
-    whitelist and is told where containerd listens.
-
-The expression check is a small structural reader, not a full PromQL parser:
-it checks brackets, label matchers, grouping clauses, function names and
-metric names, which is what went wrong in practice (a label that is not
-exported matches nothing, silently).
+    whitelist and is told where containerd listens;
+  * the deploy script waits for web to rewrite the session compose file
+    before it recreates the session containers.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from scripts.dashboard_queries_as_rules import dashboard_rules
+from tests.unit.promql_reader import read_expr
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "docker" / "docker-compose.yml"
 DASHBOARD = ROOT / "docker" / "grafana" / "dashboards" / "viator-resources.json"
 RULES_DIR = ROOT / "docker" / "prometheus" / "rules"
 PROMETHEUS_YML = ROOT / "docker" / "prometheus" / "prometheus.yml"
+CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
+DEPLOY_SH = ROOT / "bin" / "viator-deploy.sh"
 
-# ── what each exporter exports (the subset VIATOR queries) ───────────────────
-
-CADVISOR_METRICS = {
-    "container_cpu_usage_seconds_total",
-    "container_memory_swap",
-    "container_memory_working_set_bytes",
-    "container_oom_events_total",
-    "container_spec_memory_limit_bytes",
-    "container_start_time_seconds",
-}
-NODE_METRICS = {
-    "node_cpu_seconds_total",
-    "node_filesystem_avail_bytes",
-    "node_memory_MemAvailable_bytes",
-    "node_memory_MemTotal_bytes",
-    "node_memory_SwapFree_bytes",
-    "node_memory_SwapTotal_bytes",
-}
-PROMETHEUS_METRICS = {"up"}
+# ── what each exporter exports (the subset VIATOR queries), per metric ───────
 
 # Labels Prometheus adds to every scraped series, plus the static `service`
 # label prometheus.yml sets on each job.
 TARGET_LABELS = {"job", "instance", "service"}
-# cAdvisor's own labels (lib/metrics/prometheus.go: id, name, image; `cpu` on
-# the CPU counters). Container labels are added from the compose whitelist.
-CADVISOR_BASE_LABELS = {"id", "name", "image", "cpu"}
-NODE_LABELS = {"cpu", "mode", "mountpoint", "device", "fstype"}
-
-FUNCTIONS = {"absent", "avg", "changes", "count", "increase", "irate", "max", "min", "rate", "sum"}
-KEYWORDS = {"and", "or", "unless", "bool", "offset"}
-GROUPING = ("by", "without", "on", "ignoring", "group_left", "group_right")
-
-_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
-_SELECTOR = re.compile(r"([A-Za-z_:][A-Za-z0-9_:]*)?\s*\{([^{}]*)\}")
-_MATCHER = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*(=~|!~|!=|=)\s*("(?:[^"\\]|\\.)*")\s*(,|$)')
-_GROUP_CLAUSE = re.compile(r"\b(" + "|".join(GROUPING) + r")\s*\(([^()]*)\)")
-_RANGE = re.compile(r"\[\s*\d+[smhdw]\s*\]")
-_IDENT = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
-_NUMBER = re.compile(r"(?<![A-Za-z_:])\d+(?:\.\d+)?(?:e[+-]?\d+)?")
+# cAdvisor's own labels (lib/metrics/prometheus.go: id, name, image) plus the
+# whitelisted container labels; `cpu` only on the CPU counter.
+CADVISOR_BASE_LABELS = {"id", "name", "image"}
+CADVISOR_METRICS: dict[str, set[str]] = {
+    "container_cpu_usage_seconds_total": {"cpu"},
+    "container_memory_swap": set(),
+    "container_memory_working_set_bytes": set(),
+    "container_oom_events_total": set(),
+    "container_spec_memory_limit_bytes": set(),
+    "container_start_time_seconds": set(),
+}
+NODE_METRICS: dict[str, set[str]] = {
+    "node_cpu_seconds_total": {"cpu", "mode"},
+    "node_filesystem_avail_bytes": {"mountpoint", "device", "fstype"},
+    "node_memory_MemAvailable_bytes": set(),
+    "node_memory_MemTotal_bytes": set(),
+    "node_memory_SwapFree_bytes": set(),
+    "node_memory_SwapTotal_bytes": set(),
+}
+PROMETHEUS_METRICS: dict[str, set[str]] = {"up": set()}
 
 
 def _compose() -> dict[str, Any]:
@@ -96,78 +91,20 @@ def _whitelisted_labels() -> set[str]:
 
 def _labels_of(metric: str) -> set[str]:
     if metric in CADVISOR_METRICS:
-        return CADVISOR_BASE_LABELS | _whitelisted_labels() | TARGET_LABELS
+        return (
+            CADVISOR_BASE_LABELS | _whitelisted_labels() | CADVISOR_METRICS[metric] | TARGET_LABELS
+        )
     if metric in NODE_METRICS:
-        return NODE_LABELS | TARGET_LABELS
+        return NODE_METRICS[metric] | TARGET_LABELS
     if metric in PROMETHEUS_METRICS:
-        return set(TARGET_LABELS)
+        return PROMETHEUS_METRICS[metric] | TARGET_LABELS
     raise AssertionError(f"metric {metric!r} is not exported by cadvisor/node-exporter/prometheus")
 
 
-def _check_brackets(expr: str) -> None:
-    pairs = {")": "(", "]": "[", "}": "{"}
-    stack: list[str] = []
-    for ch in _STRING.sub('""', expr):
-        if ch in "([{":
-            stack.append(ch)
-        elif ch in pairs:
-            assert stack, f"unbalanced {ch!r} in {expr!r}"
-            assert stack[-1] == pairs[ch], f"unbalanced {ch!r} in {expr!r}"
-            stack.pop()
-    assert not stack, f"unclosed {stack} in {expr!r}"
-
-
-def _check_matchers(metric: str, body: str, expr: str) -> None:
-    """Each label matcher of a selector parses and names an exported label."""
-    allowed = _labels_of(metric)
-    pos = 0
-    while body[pos:].strip():
-        mm = _MATCHER.match(body, pos)
-        assert mm, f"bad label matcher {body[pos:]!r} in {expr!r}"
-        assert mm.group(1) in allowed, f"{metric} has no label {mm.group(1)!r}"
-        if mm.group(2) in ("=~", "!~"):
-            re.compile(json.loads(mm.group(3)))
-        pos = mm.end()
-
-
-def _bare_words(rest: str, expr: str) -> set[str]:
-    """Metrics named outside selectors; every word before "(" is a function."""
-    metrics: set[str] = set()
-    for t in _IDENT.finditer(rest):
-        word = t.group(0)
-        if word in KEYWORDS:
-            continue
-        if rest[t.end() :].lstrip().startswith("("):
-            assert word in FUNCTIONS, f"unknown function {word!r} in {expr!r}"
-        else:
-            _labels_of(word)
-            metrics.add(word)
-    return metrics
-
-
 def check_expr(expr: str) -> set[str]:
-    """Raise AssertionError unless `expr` is well formed and uses only exported
-    metrics and labels. Returns the metric names it reads."""
-    _check_brackets(expr)
-    metrics: set[str] = set()
-    # 1. Selectors with label matchers.
-    for m in _SELECTOR.finditer(expr):
-        assert m.group(1), f"selector without a metric name in {expr!r}"
-        _check_matchers(m.group(1), m.group(2), expr)
-        metrics.add(m.group(1))
-    rest = _SELECTOR.sub(lambda m: f" {m.group(1)} ", _STRING.sub('""', expr))
-    # 2. Grouping clauses: labels of the series being grouped or matched.
-    grouping_labels = [
-        x.strip() for g in _GROUP_CLAUSE.finditer(rest) for x in g.group(2).split(",") if x.strip()
-    ]
-    rest = _NUMBER.sub(" ", _RANGE.sub(" ", _GROUP_CLAUSE.sub(" ", rest)))
-    # 3. What is left: functions (followed by "("), keywords and bare metrics.
-    metrics |= _bare_words(rest, expr)
-    assert metrics, f"no metric in {expr!r}"
-    known = set().union(*(_labels_of(m) for m in metrics))
-    for label in grouping_labels:
-        assert label in known, f"grouping label {label!r} is not exported in {expr!r}"
-    return metrics
+    """Raise AssertionError unless `expr` reads and uses only exported metrics
+    and labels. Returns the metric names it reads."""
+    return read_expr(expr, _labels_of)
 
 
 # ── the checker itself refuses what it must refuse ──────────────────────────
@@ -183,6 +120,19 @@ def check_expr(expr: str) -> set[str]:
         "summ(container_memory_swap)",  # unknown function
         'container_memory_swap{name=~"("}',  # regex that does not compile
         'node_cpu_seconds_total{mode="idle" name="zz"}',  # matchers without comma
+        "rate(container_cpu_usage_seconds_total)",  # range function without a range
+        "absent(up[5m])",  # instant function given a range
+        "container_memory_swap[5m]",  # a range as the result
+        "container_memory_swap[5m] > 0",  # operator on a range
+        "1 + container_memory_swap[5m]",  # range on the right of an operator
+        "container_memory_swap container_memory_swap",  # two operands, no operator
+        "container_memory_swap + * 2",  # two operators in a row
+        "container_memory_swap +",  # operator without its right operand
+        'node_memory_MemTotal_bytes{mode="idle"}',  # label of another node metric
+        'container_memory_swap{cpu="total"}',  # cpu is on the CPU counter only
+        "sum by (mountpoint) (node_memory_MemTotal_bytes)",  # grouping label of no metric here
+        "container_memory_swap + bool 1",  # bool after a non-comparison
+        "sum(rate(container_cpu_usage_seconds_total[2m])",  # unclosed paren
     ],
 )
 def test_expression_checker_refuses(bad: str) -> None:
@@ -190,11 +140,27 @@ def test_expression_checker_refuses(bad: str) -> None:
         check_expr(bad)
 
 
-def test_expression_checker_accepts_the_vector_matching_forms() -> None:
-    expr = (
+@pytest.mark.parametrize(
+    "good",
+    [
         'container_memory_working_set_bytes{name!=""} / on(name) '
         '((container_spec_memory_limit_bytes{name!=""} > 0) '
-        "< on() group_left() max(node_memory_MemTotal_bytes)) * 100"
+        "< on() group_left() max(node_memory_MemTotal_bytes)) * 100",
+        '100 - (avg(irate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)',
+        'up{job="zz"} == 0 or absent(up{job="zz"})',
+        "sum by (name) (changes(container_start_time_seconds[1h])) > 3",
+        "count(container_memory_swap) by (name) >= bool 1",
+    ],
+)
+def test_expression_checker_accepts(good: str) -> None:
+    assert check_expr(good)
+
+
+def test_expression_checker_returns_the_metrics() -> None:
+    expr = (
+        'container_memory_working_set_bytes{name!=""} / on(name) '
+        '(container_spec_memory_limit_bytes{name!=""} < on() group_left() '
+        "max(node_memory_MemTotal_bytes))"
     )
     assert check_expr(expr) == {
         "container_memory_working_set_bytes",
@@ -416,7 +382,143 @@ def test_the_autoheal_alert_label_is_whitelisted() -> None:
         ("web", "OTP_SERVE_MEM_HEADROOM_GB"),
         ("web", "MOTIS_SERVE_MEM_LIMIT"),
         ("worker", "MOTIS_BUILD_MEM_LIMIT"),
+        ("worker", "OTP_BUILD_MEM_HEADROOM_GB"),
     ],
 )
 def test_memory_settings_reach_the_container_that_reads_them(service: str, variable: str) -> None:
     assert variable in _compose()["services"][service]["environment"]
+
+
+def test_builds_are_killed_first_when_the_host_runs_out_of_memory() -> None:
+    from app.memory_caps import BUILD_OOM_SCORE_ADJ
+
+    services = _compose()["services"]
+    assert BUILD_OOM_SCORE_ADJ == 500
+    assert services["otp-build"]["oom_score_adj"] == BUILD_OOM_SCORE_ADJ
+    for name in ("web", "worker", "postgres", "nginx"):
+        assert "oom_score_adj" not in services[name]
+
+
+# ── restart signal for long-running containers ──────────────────────────────
+
+
+def test_restart_alert_watches_the_serve_containers_only() -> None:
+    rule = _rule("SessionContainerRestarted")
+    assert rule["expr"] == (
+        'changes(container_start_time_seconds{name=~"viator-(otp|motis)-.+"}[15m]) > 0'
+    )
+    pattern = re.compile(r"viator-(otp|motis)-.+")
+    for name in ("viator-otp-zz-rail-1", "viator-motis-zz-motis-1"):
+        assert pattern.fullmatch(name)
+    for name in ("viator-web-1", "viator-build-99", "viator-postgres-1"):
+        assert not pattern.fullmatch(name)
+
+
+def test_restart_alert_does_not_duplicate_the_autoheal_alert() -> None:
+    autoheal = _rule("AutohealExcessiveRestarts")
+    assert autoheal["expr"].rstrip().endswith("> 3")
+    assert "[1h]" in autoheal["expr"]
+    assert "[15m]" in _rule("SessionContainerRestarted")["expr"]
+
+
+# ── promtool in CI ───────────────────────────────────────────────────────────
+
+
+def _promtool_step() -> dict[str, Any]:
+    workflow = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["python"]["steps"]
+    step: dict[str, Any] = next(s for s in steps if s.get("name", "").startswith("promtool"))
+    return step
+
+
+def test_ci_checks_config_rules_and_dashboard_queries_with_promtool() -> None:
+    run = _promtool_step()["run"]
+    assert "python scripts/dashboard_queries_as_rules.py" in run
+    assert "check config /etc/prometheus/prometheus.yml" in run
+    assert 'check rules "${rule_files[@]}" /promql/dashboard-queries.yml' in run
+    assert "set -euo pipefail" in run
+
+
+def test_ci_promtool_is_the_prometheus_that_runs() -> None:
+    image = _compose()["services"]["prometheus"]["image"]
+    assert re.fullmatch(r"prom/prometheus:v\d+\.\d+\.\d+", image)
+    assert f" {image})" in _promtool_step()["run"]
+
+
+def test_every_dashboard_query_becomes_a_rule_for_promtool() -> None:
+    rules = dashboard_rules()["groups"][0]["rules"]  # type: ignore[index]
+    exprs = [r["expr"] for r in rules]
+    assert set(_dashboard_exprs()) <= set(exprs)
+    names = [r["record"] for r in rules]
+    assert len(names) == len(set(names))
+    assert all(re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*", n) for n in names)
+
+
+def test_dashboard_rules_skip_non_prometheus_panels(tmp_path: Path) -> None:
+    board = {
+        "panels": [
+            {"id": 1, "datasource": {"type": "loki"}, "targets": [{"expr": '{zz="a"}'}]},
+            {
+                "id": 2,
+                "datasource": {"type": "prometheus"},
+                "targets": [{"refId": "B", "expr": "up"}],
+            },
+        ]
+    }
+    (tmp_path / "zz-board.json").write_text(json.dumps(board), encoding="utf-8")
+    rules = dashboard_rules(tmp_path)["groups"][0]["rules"]  # type: ignore[index]
+    assert rules == [{"record": "dashboard:zz_board:panel2_B", "expr": "up"}]
+
+
+# ── deploy: caps reach the session containers at deploy time ─────────────────
+
+
+def _deploy_lines() -> list[str]:
+    script = DEPLOY_SH.read_text(encoding="utf-8")
+    return [line.split("#", 1)[0].strip() for line in script.splitlines()]
+
+
+def test_deploy_waits_for_web_before_recreating_the_sessions() -> None:
+    lines = _deploy_lines()
+    recreate_web = lines.index("docker compose up -d --force-recreate web worker")
+    wait = next(i for i, line in enumerate(lines) if line.startswith("WEB_REGEN_TIMEOUT="))
+    plain_up = lines.index("docker compose up -d")
+    assert recreate_web < wait
+    assert wait < plain_up
+    assert lines.index("web_recreated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)") < recreate_web
+
+
+def _wait_block() -> str:
+    script = DEPLOY_SH.read_text(encoding="utf-8")
+    start = script.index("WEB_REGEN_TIMEOUT=")
+    end = script.index("done\n", start) + len("done\n")
+    return (
+        script[start:end]
+        .replace("WEB_REGEN_TIMEOUT=300", "WEB_REGEN_TIMEOUT=2")
+        .replace("sleep 5", "sleep 0.01")
+    )
+
+
+@pytest.mark.parametrize(
+    "web_log,code,said",
+    [
+        ("zz\nsessions_orchestrator.regenerated_at_boot\n", 0, ""),
+        ("zz\nsessions_orchestrator.boot_regenerate_failed\n", 5, "boot_regenerate_failed"),
+        ("zz still starting\n", 5, "no regenerated_at_boot from web after 2s"),
+    ],
+)
+def test_deploy_wait_block(tmp_path: Path, web_log: str, code: int, said: str) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text('#!/bin/sh\nprintf "%s" "$ZZ_WEB_LOG"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    script = tmp_path / "wait.sh"
+    script.write_text(
+        "set -euo pipefail\nweb_recreated_at=2026-01-01T00:00:00Z\n" + _wait_block(),
+        encoding="utf-8",
+    )
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "ZZ_WEB_LOG": web_log}
+    done = subprocess.run(
+        ["/bin/bash", str(script)], env=env, capture_output=True, text=True, check=False, timeout=60
+    )
+    assert done.returncode == code, done.stderr
+    assert said in done.stderr

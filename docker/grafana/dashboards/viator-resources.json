@@ -201,7 +201,7 @@
           "custom": { "drawStyle": "line", "fillOpacity": 10 }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"], "sortBy": "Max", "sortDesc": true } }
     },
     {
       "id": 7,
@@ -223,7 +223,7 @@
           "custom": { "drawStyle": "line", "fillOpacity": 10 }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"], "sortBy": "Max", "sortDesc": true } }
     },
     {
       "id": 10,
@@ -245,13 +245,13 @@
           "custom": { "drawStyle": "line", "fillOpacity": 10 }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"], "sortBy": "Max", "sortDesc": true } }
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "Capped containers — % of memory cap used",
-      "description": "Working set as % of the container's memory cap, for containers that have one (OTP build and serve, MSMM, MOTIS when MOTIS_*_MEM_LIMIT is set; uncapped containers report a limit at or above the host RAM and are left out). There is no swap behind a cap: at 100 % the kernel OOM-kills the container and ContainerOOMKilled fires. Past 90 % during a build, give the session a bigger heap (the cap follows it); for a serve container raise OTP_SERVE_MEM_HEADROOM_GB.",
+      "description": "Working set as % of the container's memory cap, for containers that have one (OTP build and serve, MSMM, MOTIS when MOTIS_*_MEM_LIMIT is set; uncapped containers report a limit of 0 and are dropped by `> 0`; the comparison with the host RAM also drops any that report the host's size). There is no swap behind a cap: at 100 % the kernel OOM-kills the container (a serve container restarts and SessionContainerRestarted fires; a build fails with exit 137 in its log). Past 90 % during a build, give the session a bigger heap (the cap follows it) or raise OTP_BUILD_MEM_HEADROOM_GB; for a serve container raise OTP_SERVE_MEM_HEADROOM_GB.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
@@ -277,7 +277,7 @@
           }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"], "sortBy": "Max", "sortDesc": true } }
     },
     {
       "id": 9,
