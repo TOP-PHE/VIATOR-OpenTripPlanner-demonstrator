@@ -1097,7 +1097,7 @@ What the block says:
 | Now: `provider[ZZRAIL].timetable(gtfs)` — downloading, 12.0 MB of 99.0 MB (12 %) · for 3 min 9 s | the task under way, the **step** it is in (below) and how long the task has run; "of …" only when the server announced the file's size, else "… received"; "Now: cross-border filters" while the derived providers are made. A record written before the steps existed shows the bytes without a step |
 | Finished *time* — *n* fetched · *n* unchanged · *n* skipped (kept previous file) (took …) | **fetched**: a new file went into the slot and a rebuild was queued; **unchanged**: the server's file is the one already in the slot (HTTP 304 or the same sha256), nothing rotated, no rebuild; **skipped (kept previous file)**: no new file (the download, the format check, the NAP lookup or the dispatch failed: the slot keeps its previous file), the same word as the refresh's toast and the Feed status panel's "⚠ skipped" (the API field is `failed`); the panel's **Last result** gives the reason, the block never does |
 | Skipped (kept previous file): … | the labels of those tasks (at most 50), never a reason or an address |
-| Stopped by an unexpected error (…) | the refresh itself broke (a 500): the type of the error, the tasks done and those **not reached** (never started); see the web log |
+| Stopped by an unexpected error (…) | the refresh itself broke (a 500): the type of the error, the tasks done and those **not reached** (never started); see the web log. Since §6.16 an unexpected error in **one** task (a download, a NAP lookup, a cross-border filter) no longer stops the refresh: that task is skipped (kept previous file) and the others run, so this line means the refresh's own code broke |
 | Interrupted — no news from the server since … | the record stopped being updated: the `web` process restarted or died while the refresh ran. A running refresh writes a heartbeat at least every 30 s; after **5 minutes** without one the record is shown interrupted and a new refresh may start. The downloads done before stay in their slots. Limit: a refresh that was only stuck that long (not dead) and then wakes up finds its record taken: it starts no further download and changes nothing in the record (the web log has `refresh_progress.lease_lost`) |
 | The refresh before this one was interrupted | the record a new refresh replaced was an interrupted one |
 | Station module: … | after a provider refresh, the stop extracts sent to the station module (11.5): **queued** (waiting for the web process's sender), then *handled* / *total* feeds with the counts **sent**, **already held**, **refused**, **module unavailable**, **skipped** and their reason words (for example `budget 1`), the provider being sent, and at the end **finished** (or **cancelled**, **stopped by an error**); **not configured** without `STATION_MODULE_URL` / `STATION_MODULE_TOKEN`; **interrupted** when it went silent: still queued 35 minutes after the refresh (longer than the pass's 30-minute budget: a restart of `web` lost its in-memory queue) or running with no news for 5 minutes (the pass beats every 30 s); the next refresh or rebuild sends what is missing. The follow-up is written only into the record of the refresh that queued it, never into a newer one. The column **Station module** of the Feed status panel still gives each provider's last outcome |
@@ -1991,6 +1991,61 @@ If it still fails with `download failed: HTTP 406 Not Acceptable (refused
 with Accept-Encoding identity and gzip)`, the server refuses both: the
 cause is elsewhere (another header it wants, or it blocks the address);
 upload the file by hand (Upload source) and check the provider's terms.
+
+### 6.16 A refresh "stopped by an unexpected error (timeouterror)" after one task
+
+Symptom (production, 19 Oct, a session of about a hundred feeds): the
+progress block (§5.7) said **Stopped by an unexpected error (timeouterror)
+… 1 / 104 done, 103 not reached**. The `web` log showed, just before, dozens
+of `GET /api/sessions` from one browser within a few seconds, many answering
+500 with `sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow 10
+reached`, a `refresh_progress.write_failed … type=TimeoutError` warning, then
+the refresh's own 500 with the same error raised while a NAP lookup read its
+credential.
+
+Cause, two faults together:
+
+- **The Sessions page asked for the session list once per provider card.**
+  Every card carries the (hidden) "From session" picker of the cross-border
+  filter source, and the page filled it for each card when the provider
+  list was drawn; the list was cached only once its answer had arrived, so
+  every card asking before then sent its own `GET /api/sessions`, each
+  answer carrying every session's full configuration. Each of these
+  requests held a database connection while it built its answer: about a
+  hundred of them at once took every connection of the pool (5, plus 10
+  overflow) for longer than its 30-second wait.
+- **One task's unexpected exception ended the whole refresh.** A task
+  caught only the expected failures (download, NAP lookup, format check);
+  the pool's `TimeoutError`, raised when the task read its credential, went
+  up to the refresh, which stopped and recorded the error with every other
+  task not reached.
+
+Fix (the release after v0.1.44.33):
+
+- The page sends one `GET /api/sessions` (and one `GET /api/credentials`)
+  however many cards ask, and only for the cards whose source is
+  **Cross-border filter**; a failed answer is not kept, so the next card or
+  a source switch asks again. `GET /api/sessions` hands its connection back
+  before it builds the answers.
+- An unexpected exception in one task (a download, a NAP lookup, the copy
+  into the slot, a cross-border filter), in a **Refresh providers**, a
+  card's **Refresh** or a **Refresh OSM**, skips that task only: it counts
+  as **skipped (kept previous file)**, the Feed status panel's **Last
+  result** says `unexpected error (TimeoutError); see the web log` (the
+  type of the error only, never its text, which can quote an address with
+  its key), and the `web` log has one ERROR line
+  `refresh.task_failed_unexpectedly key=provider[…].timetable(…) type=…`.
+  The request's database session is rolled back, so the next tasks, the
+  audit entry and the final commit still work. The other tasks run, and
+  the block ends **Finished** with every task done.
+
+What to do if a feed shows `unexpected error (…)`: read the ERROR line of
+the `web` log at that time and the lines just before it (a `QueuePool
+limit` there means the database pool was full again: look for what else
+was asking at the same moment), then refresh that feed alone with its
+card's **Refresh**. A refresh holds up to three connections at once (the
+request's own, the progress writes, the heartbeat), well within the pool;
+the pool size is not configurable and was not changed.
 
 ## 7. Rollback
 

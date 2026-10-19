@@ -742,6 +742,16 @@ confirm `git rev-list --count origin/main..main` is 0 and no tracked file is mod
   `# NOSONAR python:S5145` on the log-call line (established convention in `nap_importer.py`) rather
   than "fixing" the sanitizer.
 
+**A refresh "stopped by an unexpected error" (19 Oct, admin guide §6.16).** One task's unexpected
+exception (there: the DB pool's `TimeoutError` while a NAP lookup read its credential) now skips that
+task only (`_refresh_one_task`, `_materialise_derived_provider`: reason `unexpected error (<Type>);
+see the web log`, one ERROR line, rollback of the request's session); a CancelledError still ends the
+refresh. So "stopped by an unexpected error" in the progress block now means the refresh's own code
+broke. The pool ran out because the Sessions page sent one `GET /api/sessions` per provider card: a
+fetch shared by many callers caches its in-flight promise and drops a failed one
+(`derivedSessions`, `loadCredentialList` in `admin/sessions.html`), and a read endpoint that builds
+large answers closes its session first (`list_sessions`).
+
 **Two front-end traps no test and no code review will catch** — both found only in a real browser:
 
 - **A valid lat/lon refused when promoting a station to a hub**, with a NATIVE browser bubble (not
