@@ -1031,7 +1031,7 @@ Three things to watch as you onboard more sessions:
 | `viator_pgdata` size | Search history grows; audit log grows | At 50% disk free, set up retention pruning more aggressively (Admin → Configuration) |
 | `viator_graphs-<sid>` count | Each `serving` session keeps `current` + 2 historical graphs | At 80% disk free, drop unused sessions (Admin → Sessions → Delete) |
 | Free RAM during a build | OTP build needs `OTP_BUILD_HEAP + ~4 GB` headroom | If a build OOMs, raise `OTP_BUILD_MEM_LIMIT` (≥ heap + 4) OR upgrade VPS RAM. France-wide builds need 32 GB minimum. |
-| Sum of the serve caps | Since #374 each OTP serve container has a cap (serve heap + headroom, §5.8); MOTIS is uncapped unless set | Keep the sum of the caps plus the largest build cap below the host RAM; the "Swap by container" panel shows who swaps |
+| Serve working sets | Since #374 each OTP serve container has a cap (serve heap + headroom, §5.8). A cap is a ceiling, not a reservation: a router uses what its graph needs, usually well under its cap | Size the host on the typical working sets ("Container memory" panel, a few days) of the serving sessions plus the largest build cap, with a margin; not on the sum of the caps. "Swap by container" shows who swaps |
 
 **Admin → Storage** (`/admin/storage`) shows the data disk's use, a warning from 85 % full, the
 space each session takes (graphs, feeds and OSM), and a list of what can be deleted:
@@ -1166,44 +1166,85 @@ nobody could see which container held the memory. Two causes, two fixes:
 
 **The caps.** Every container that has a cap now has **no swap behind it**: `memswap_limit` equal
 to `mem_limit` in compose, `--memory-swap` equal to `--memory` on `docker run` (Docker reads the
-swap limit as memory plus swap). A container that reaches its cap is OOM-killed at once and seen
-(alert `ContainerOOMKilled`, exit 137), instead of slowing the whole server. Docker's per-container
-`mem_swappiness` is not used: Docker ignores it on cgroup v2 hosts.
+swap limit as memory plus swap). A container that reaches its cap is OOM-killed at once and seen,
+instead of slowing the whole server. Docker's per-container `mem_swappiness` is not used: Docker
+ignores it on cgroup v2 hosts.
 
 | Container | Cap | Setting in `docker/.env` |
 |---|---|---|
-| `otp-build` (OTP graph build) | heap + max(4, heap/6), derived by the worker for each build | `OTP_BUILD_MEM_LIMIT` (overridden per build) |
-| `otp-<sid>` (OTP serve) | serve heap + max(headroom, heap/3, 3 GB), on by default; e.g. heap 4g → 10g, 12g → 18g, 24g → 32g | `OTP_SERVE_MEM_CAP=true`, `OTP_SERVE_MEM_HEADROOM_GB=6` |
+| `otp-build` (OTP graph build) | heap + max(4 GB, heap/6, build headroom), derived by the worker for each build | `OTP_BUILD_MEM_HEADROOM_GB=4` (`OTP_BUILD_MEM_LIMIT` is overridden per build) |
+| `otp-<sid>` (OTP serve) | serve heap + max(serve headroom, heap/3, 4 GB), on by default; e.g. heap 4g → 10g, 12g → 18g, 24g → 32g | `OTP_SERVE_MEM_CAP=true`, `OTP_SERVE_MEM_HEADROOM_GB=6` |
 | `motis-<sid>` (MOTIS serve) | none by default | `MOTIS_SERVE_MEM_LIMIT=` (e.g. `32g`) |
 | MOTIS build (`motis config` / `motis import`) | none by default | `MOTIS_BUILD_MEM_LIMIT=` |
 
-- The OTP serve cap follows the session's serve heap (the *OTP serve heap* field, or a third of the
-  build heap, at least 4g). The 3 GB floor covers the 2 GB of direct buffers the serve JVM is allowed
-  (`-XX:MaxDirectMemorySize=2g`) plus metaspace and threads, so no setting can cap a container below
-  what its heap needs; `OTP_SERVE_MEM_HEADROOM_GB` can only widen the cap. If a serve container is
-  OOM-killed, raise it (or the session's serve heap). `OTP_SERVE_MEM_CAP=false` removes the caps.
-- MOTIS has no heap to derive a cap from: its memory follows the imported timetables. A wrong cap
-  would kill a router that works, so it stays opt-in. To set one, read the container's peak on the
-  "Container memory" panel over a few days, add a margin (half as much again is a safe start), and
-  write it as an integer + `g` or `m`. A malformed value is logged and ignored.
-- Uncapped containers can still swap; the "Swap by container" panel shows which.
+- **The 4 GB floor** (build and serve) covers the 2 GB of direct buffers the JVM is allowed
+  (`-XX:MaxDirectMemorySize=2g`) plus metaspace, threads and the garbage collector, so no setting
+  can cap a container below what its heap needs; the two headroom settings can only widen a cap.
+  They are whole numbers of GB without a unit; `8g` is read as 8, anything else is logged
+  (`… is not a whole number of GB; using …`) and the default used, so a typo never stops web or the
+  worker. `OTP_SERVE_MEM_CAP=false` removes the serve caps.
+- **The build cap is now a hard edge.** A build that used to run a little over its cap went on in
+  swap; now it fails with exit 137. If that happens, give the session a bigger build heap (the cap
+  follows it) or raise `OTP_BUILD_MEM_HEADROOM_GB`.
+- **MOTIS** has no heap to derive a cap from: its memory follows the imported timetables. A wrong
+  cap would kill a router that works, so it stays opt-in. To set one, read the container's peak on
+  the "Container memory" panel over a few days, add a margin (half as much again is a safe start),
+  and write it as an integer + `g` or `m` (at least `64m`). A malformed value is logged and ignored.
+- **Uncapped containers can still swap**; the "Swap by container" panel shows which.
+- **Host-level OOM.** The caps protect the host from one container; if the host as a whole still
+  runs out of memory (several containers near their caps at once), the kernel kills the process
+  with the highest OOM score. Build containers get `oom_score_adj` 500 (`otp-build` in compose,
+  `--oom-score-adj 500` on the MOTIS build runs), so a build is killed before a serving router,
+  web or postgres.
+
+**Before the deploy: will the serve caps fit?** (read-only, prints names and sizes only). For each
+OTP serve container it reads the heap from the container's environment, applies the formula
+above (default headroom 6) and compares the cap with what the Java process holds now, resident
+plus swapped:
+
+```bash
+for c in $(docker ps --format '{{.Names}}' --filter name=viator-otp-); do
+  heap=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | sed -n 's/^OTP_HEAP=//p')
+  pid=$(docker inspect -f '{{.State.Pid}}' "$c")
+  sudo awk -v c="$c" -v heap="$heap" -v room=6 '
+    /^VmRSS:/ {rss=$2} /^VmSwap:/ {swp=$2}
+    END { h=heap+0; if (heap ~ /[mM]$/) h=int((h+1023)/1024)
+          r=int(h/3); if (r<room) r=room; if (r<4) r=4; cap=h+r
+          use=(rss+swp)/1048576
+          printf "%-40s heap %3dg  cap %3dg  rss+swap %5.1fg  %s\n", c, h, cap, use, (use>0.9*cap ? "CLOSE TO CAP" : "ok") }' \
+    "/proc/$pid/status"
+done
+```
+
+The container's first process is the JVM (`exec java` in `docker/otp/entrypoint.sh`), so its
+`/proc/<pid>/status` is the router's. A `CLOSE TO CAP` line means that session would be OOM-killed
+soon after the deploy: raise `OTP_SERVE_MEM_HEADROOM_GB` first (or the session's serve heap). The
+same `awk` without the cap part gives MOTIS's size (`--filter name=viator-motis-`) to choose
+`MOTIS_SERVE_MEM_LIMIT`.
 
 **When a change applies.** Web writes the per-session compose file (`docker/generated/
-docker-compose.sessions.yml`) at start and at each session promote or archive; a container gets a new
-cap only when compose **recreates** it (`docker restart` keeps the old limits). Compose recreates
-every session container whose definition changed at the next `docker compose up -d`: the deploy's
-own `up -d` step, or the worker's next reload. Deploying this release therefore **restarts every
-serving OTP container once** (each reloads its graph, a few minutes without that session's
-journeys); MOTIS containers are not touched while `MOTIS_SERVE_MEM_LIMIT` is empty. To postpone the
-OTP restarts, set `OTP_SERVE_MEM_CAP=false` in `.env` before the deploy; later set it back to `true`
-and recreate the sessions one at a time (`docker compose up -d --no-deps otp-<sid>`) after the next
-web start (`docker compose up -d --force-recreate web`, which rewrites the file).
+docker-compose.sessions.yml`) at start and at each session promote or archive; a container gets a
+new cap only when compose **recreates** it (`docker restart` keeps the old limits).
+
+- **Every deploy recreates every serving session container**, with or without this release: their
+  image tag is `VIATOR_VERSION`, which each deploy changes. Each OTP router then reloads its graph
+  (a few minutes without that session's journeys); the same holds for MOTIS. `OTP_SERVE_MEM_CAP`
+  does not postpone that restart; it only decides whether the OTP containers come back capped.
+- Since this release `bin/viator-deploy.sh` **waits for web's `regenerated_at_boot`** (5 minutes at
+  most) before its plain `docker compose up -d`, so the containers are recreated from the new file
+  and come back with their caps at the deploy itself. Before, the plain `up -d` could run first and
+  recreate them from the previous file, the caps then arriving at the worker's next, unplanned
+  reload. If web reports `boot_regenerate_failed` or the wait times out, the deploy stops (exit 5)
+  before recreating anything; fix web, then `docker compose up -d`.
+- A changed setting later (headroom, a MOTIS cap) needs `docker compose up -d --force-recreate web`
+  (web reads `.env` and rewrites the file), then `docker compose up -d --no-deps <otp-|motis-><sid>`
+  for each session, at a quiet moment.
 
 **Dashboard.** The container panels now select every container cAdvisor names (`name!=""`), so
 MSMM and the build containers (`viator-build-<job>`) show too, and an empty panel means one thing
-only: cAdvisor lost the names. New: a **Host iowait** stat in the top row and a **Swap by
-container** panel (`container_memory_swap`; capped containers stay at zero). The "% of memory cap"
-panel now covers every capped container, not just the build.
+only: cAdvisor lost the names. Legends are sorted by maximum. New: a **Host iowait** stat in the
+top row and a **Swap by container** panel (`container_memory_swap`; capped containers stay at
+zero). The "% of memory cap" panel now covers every capped container, not just the build.
 
 **Alerts** (`docker/prometheus/rules/resources.yml`):
 
@@ -1213,35 +1254,52 @@ panel now covers every capped container, not just the build.
 | `HostIowaitHigh` | iowait above 30 % for 10 min |
 | `CadvisorDown` | the cadvisor scrape target is down or missing for 5 min |
 | `CadvisorNoContainerNames` | cadvisor is up but exports no series with a non-empty `name` for 10 min (this incident's blind spot) |
-| `ContainerOOMKilled` | a container was OOM-killed in the last 15 min (`container_oom_events_total`) |
+| `ContainerOOMKilled` | cAdvisor counted an OOM kill in the last 15 min (`container_oom_events_total`) |
+| `SessionContainerRestarted` | an OTP or MOTIS serve container restarted in the last 15 min |
 
-As for `AutohealExcessiveRestarts`, no Alertmanager is deployed: the alerts show at
-`/prometheus/alerts` and in Grafana's Alerting tab, and nobody is paged.
+- **How an OOM kill shows.** For a **build**, in its rebuild log: the last line reads
+  `[viator] otp build failed: exit 137 - killed (SIGKILL) - usually out of memory, … (memory cap <n>g,
+  no swap)` (MOTIS: `motis import failed: exit 137 …`). `ContainerOOMKilled` may miss it: a `--rm`
+  build container is gone before cAdvisor's counter is read. For a **long-running** container,
+  Docker restarts it at once: `SessionContainerRestarted` fires on that first restart
+  (`AutohealExcessiveRestarts` only fires past 3 restarts in an hour), and `docker inspect` shows
+  `State.OOMKilled`. A deploy or reload that recreates a container starts a new series and does not
+  fire it.
+- **`HostSwapUsageHigh` keeps firing after the fix** until the pages already in swap come back:
+  they return when their container is recreated (the next deploy) or when the owner chooses to run
+  `sudo swapoff -a && sudo swapon -a` (needs enough free RAM for everything in swap).
+- As for `AutohealExcessiveRestarts`, no Alertmanager is deployed: the alerts show at
+  `/prometheus/alerts` and in Grafana's Alerting tab, and nobody is paged.
+- CI checks `prometheus.yml`, every rule file and every dashboard query with `promtool` from the
+  same `prom/prometheus` image the stack runs, so a file Prometheus would refuse cannot be merged.
 
 **Checks after the deploy** (all read-only). In `/prometheus/` (Graph tab):
 
 ```
-count by (name) (container_memory_working_set_bytes)        # one row per container, each with its name
-count(container_memory_working_set_bytes{name!=""})          # > 0
-container_spec_memory_limit_bytes{name=~"viator-otp-.+"}      # the caps of the OTP serve containers
-container_spec_memory_swap_limit_bytes{name=~"viator-otp-.+"} # equal to the line above
-container_memory_swap{name!=""} > 0                           # only uncapped containers
-up{job="cadvisor"}                                            # 1
+count by (name) (container_memory_working_set_bytes)   # one row per container with its name, plus ONE row with an empty name
+count(container_memory_working_set_bytes{name!=""})     # > 0
+container_spec_memory_limit_bytes{name=~"viator-otp-.+"} # the OTP serve caps, in bytes
+container_memory_swap{name!=""} > 0                      # only uncapped containers (MOTIS by default) can appear
+up{job="cadvisor"}                                       # 1
 ```
 
-Then on the server:
+The row with an empty `name` in the first query is expected: it sums the host's own cgroups
+(system services), which stay exported because `--docker_only` is off. Do not read the swap limit
+from `container_spec_memory_swap_limit_bytes`: with swap off it is 0, the same value an uncapped
+container shows. Read it from Docker instead, on the server:
 
 ```bash
-docker logs viator-cadvisor-1 2>&1 | tail -50      # no "failed to identify" / docker factory errors
-docker inspect -f '{{.Name}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' \
-  $(docker ps -q --filter name=viator-otp-)          # two equal numbers per OTP container
+docker logs viator-cadvisor-1 2>&1 | tail -50      # no "failed to identify" / docker factory / containerd errors
+docker inspect -f '{{.Name}} Memory={{.HostConfig.Memory}} MemorySwap={{.HostConfig.MemorySwap}}' \
+  $(docker ps -q --filter name=viator-otp-)          # the two numbers equal (no swap) and non-zero
 ```
 
-`/prometheus/alerts` should list the five new rules, inactive. In Grafana, *Container memory* and
-*Container CPU* show one line per container, including an OTP build while one runs. If
-`count by (name)` returns only an empty `name`, run `count by (id)
-(container_memory_working_set_bytes)`: `id="/system.slice/docker-<id>.scope"` rows mean cAdvisor
-sees the cgroups but not Docker; its log says why (the Docker socket or the containerd socket).
+`/prometheus/alerts` should list the six new rules, inactive (`HostSwapUsageHigh` may stay firing
+until the swapped pages come back, see above). In Grafana, *Container memory* and *Container CPU*
+show one line per container, including an OTP build while one runs. If `count by (name)` returns
+only the empty name, run `count by (id) (container_memory_working_set_bytes)`:
+`id="/system.slice/docker-<id>.scope"` rows mean cAdvisor sees the cgroups but not Docker; its log
+says why (the Docker socket or the containerd socket).
 
 ---
 
@@ -1271,10 +1329,13 @@ echo 'ghp_YOUR_TOKEN' | sudo docker login ghcr.io -u TOP-PHE --password-stdin
 
 Since #374 the build's cap has no swap behind it (§5.8), so a build that outgrows it ends at once
 with this last line in its rebuild log: `[viator] otp build failed: exit 137 - killed (SIGKILL) -
-usually out of memory, or the container was stopped (memory cap <n>g, no swap)`, and the
-`ContainerOOMKilled` alert fires. Before, the same build went on into the host swap. The cap
-follows the session's build heap, so the fix is a bigger heap (or a smaller graph), not
-`OTP_BUILD_MEM_LIMIT`.
+usually out of memory, or the container was stopped (memory cap <n>g, no swap)`. That log line is
+the report: the `ContainerOOMKilled` alert can miss a `--rm` build container. Before, the same build
+went on into the host swap, so a build that ran a little over its cap used to succeed slowly and
+now fails. The cap is heap + max(4 GB, heap/6, `OTP_BUILD_MEM_HEADROOM_GB`): give the session a
+bigger build heap (the cap follows it), or raise `OTP_BUILD_MEM_HEADROOM_GB` in `.env` and recreate
+the worker (`docker compose up -d --force-recreate worker`). `OTP_BUILD_MEM_LIMIT` is overridden by
+the worker and changes nothing.
 
 Sequence of checks:
 
