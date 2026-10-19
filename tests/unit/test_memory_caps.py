@@ -388,3 +388,59 @@ def test_bad_headroom_is_logged(caplog: pytest.LogCaptureFixture) -> None:
 
     assert headroom_gb_or_default("lots", 6, "otp_serve_mem_headroom_gb") == 6
     assert "OTP_SERVE_MEM_HEADROOM_GB='lots' is not a whole number of GB; using 6" in caplog.text
+
+
+def test_max_memory_build_sizes_the_heap_with_the_build_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker passes OTP_BUILD_MEM_HEADROOM_GB to the auto heap too, so the
+    widened cap still fits the host (40 GB host, 8 GB reserved: 32 GB for the cap)."""
+    monkeypatch.setattr(settings, "graph_dir", tmp_path / "graphs")
+    monkeypatch.setattr(settings, "otp_build_mem_headroom_gb", 20)
+    monkeypatch.setattr(worker, "_host_total_gb", lambda: 40)
+    monkeypatch.setattr(worker, "_serving_session_services", list)
+    monkeypatch.setattr(worker, "_stop_services", lambda _s: None)
+    monkeypatch.setattr(worker, "_start_services", lambda _s: None)
+    monkeypatch.setattr(worker, "_MAXMEM_MARKER", tmp_path / "marker")
+    seen: list[tuple[list[str], dict[str, str]]] = []
+
+    class _Proc:
+        stdout = ""
+        stderr = ""
+        returncode = 1
+
+    def _fake_run(cmd: list[str], **kw: Any) -> _Proc:
+        seen.append((list(cmd), kw["env"]))
+        return _Proc()
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    worker.run_build(session_id=None, max_memory=True)
+    cmd, env = seen[0]
+    # heap 12g + headroom 20g = 32g; without the setting the auto heap is 27g
+    assert "OTP_HEAP=12g" in cmd
+    assert env["OTP_BUILD_MEM_LIMIT"] == "32g"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("true", True),
+        ("False", False),
+        ("0", False),
+        ("yes", True),
+        (" off ", False),
+        ("ture", True),
+        ("", True),
+    ],
+)
+def test_serve_cap_switch_is_tolerant(raw: str, expected: bool) -> None:
+    from app.settings import Settings
+
+    assert Settings(otp_serve_mem_cap=raw).otp_serve_mem_cap is expected
+
+
+def test_bad_cap_switch_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    from app.settings import switch_or_default
+
+    assert switch_or_default("ture", True, "otp_serve_mem_cap") is True
+    assert "OTP_SERVE_MEM_CAP='ture' is not true or false; using true" in caplog.text

@@ -1204,7 +1204,9 @@ plus swapped:
 
 ```bash
 for c in $(docker ps --format '{{.Names}}' --filter name=viator-otp-); do
+  case "$c" in viator-otp-build-*) continue ;; esac     # a build run, not a router
   heap=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | sed -n 's/^OTP_HEAP=//p')
+  if [ -z "$heap" ]; then printf '%-40s no heap\n' "$c"; continue; fi
   pid=$(docker inspect -f '{{.State.Pid}}' "$c")
   sudo awk -v c="$c" -v heap="$heap" -v room=6 '
     /^VmRSS:/ {rss=$2} /^VmSwap:/ {swp=$2}
@@ -1226,10 +1228,15 @@ same `awk` without the cap part gives MOTIS's size (`--filter name=viator-motis-
 docker-compose.sessions.yml`) at start and at each session promote or archive; a container gets a
 new cap only when compose **recreates** it (`docker restart` keeps the old limits).
 
-- **Every deploy recreates every serving session container**, with or without this release: their
-  image tag is `VIATOR_VERSION`, which each deploy changes. Each OTP router then reloads its graph
-  (a few minutes without that session's journeys); the same holds for MOTIS. `OTP_SERVE_MEM_CAP`
-  does not postpone that restart; it only decides whether the OTP containers come back capped.
+- **Every deploy recreates every OTP serve container**, with or without this release: their image
+  tag is `VIATOR_VERSION`, which each deploy changes. Each OTP router then reloads its graph (a few
+  minutes without that session's journeys). `OTP_SERVE_MEM_CAP` does not postpone that restart; it
+  only decides whether the OTP containers come back capped.
+- **MOTIS serve containers are not recreated by a deploy**: their image is the pinned
+  `engine_versions.MOTIS_IMAGE`, and their definition does not change while
+  `MOTIS_SERVE_MEM_LIMIT` is empty. Compose recreates one only when its definition changes: a MOTIS
+  version bump, or a limit set (then web rewrites the file and the next `up -d` or reload applies
+  it).
 - Since this release `bin/viator-deploy.sh` **waits for web's `regenerated_at_boot`** (5 minutes at
   most) before its plain `docker compose up -d`, so the containers are recreated from the new file
   and come back with their caps at the deploy itself. Before, the plain `up -d` could run first and
@@ -1264,10 +1271,12 @@ zero). The "% of memory cap" panel now covers every capped container, not just t
   Docker restarts it at once: `SessionContainerRestarted` fires on that first restart
   (`AutohealExcessiveRestarts` only fires past 3 restarts in an hour), and `docker inspect` shows
   `State.OOMKilled`. A deploy or reload that recreates a container starts a new series and does not
-  fire it.
-- **`HostSwapUsageHigh` keeps firing after the fix** until the pages already in swap come back:
-  they return when their container is recreated (the next deploy) or when the owner chooses to run
-  `sudo swapoff -a && sudo swapon -a` (needs enough free RAM for everything in swap).
+  fire it; a max-memory rebuild, which stops the serve containers and starts the same ones again
+  afterwards, does fire it once per container (expected).
+- **`HostSwapUsageHigh` keeps firing after the fix** until the pages already in swap come back.
+  The OTP routers' pages return at the deploy, which recreates them. MOTIS's swapped pages stay
+  until MOTIS is recreated (a version bump, or `MOTIS_SERVE_MEM_LIMIT` set) or until the owner
+  chooses to run `sudo swapoff -a && sudo swapon -a` (needs enough free RAM for everything in swap).
 - As for `AutohealExcessiveRestarts`, no Alertmanager is deployed: the alerts show at
   `/prometheus/alerts` and in Grafana's Alerting tab, and nobody is paged.
 - CI checks `prometheus.yml`, every rule file and every dashboard query with `promtool` from the

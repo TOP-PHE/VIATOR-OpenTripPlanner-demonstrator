@@ -509,7 +509,13 @@ def _wait_block() -> str:
 )
 def test_deploy_wait_block(tmp_path: Path, web_log: str, code: int, said: str) -> None:
     fake = tmp_path / "docker"
-    fake.write_text('#!/bin/sh\nprintf "%s" "$ZZ_WEB_LOG"\n', encoding="utf-8")
+    # Answers only `docker compose logs ... web`: reading another service's
+    # log (or none) makes the fake fail, so the wait would time out.
+    fake.write_text(
+        '#!/bin/sh\ncase "$*" in\n  "compose logs "*" web") printf "%s" "$ZZ_WEB_LOG" ;;\n'
+        '  *) echo "zz unexpected: $*" >&2; exit 9 ;;\nesac\n',
+        encoding="utf-8",
+    )
     fake.chmod(0o755)
     script = tmp_path / "wait.sh"
     script.write_text(

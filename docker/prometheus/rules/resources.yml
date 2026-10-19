@@ -115,7 +115,9 @@ groups:
         # container_start_time_seconds is the runtime start time (cAdvisor
         # v0.57+), so it changes on every restart of the same container. A
         # deploy or reload that *recreates* the container starts a new series
-        # and does not fire. Names: viator-otp-<sid>-1, viator-motis-<sid>-1.
+        # and does not fire. A max-memory rebuild stops the serve containers
+        # and starts the same ones afterwards: it fires once for each, as
+        # expected. Names: viator-otp-<sid>-1, viator-motis-<sid>-1.
         expr: changes(container_start_time_seconds{name=~"viator-(otp|motis)-.+"}[15m]) > 0
         labels:
           severity: warning
@@ -125,5 +127,6 @@ groups:
             {{ $labels.name }} restarted in the last 15 minutes. With a memory
             cap and no swap the usual cause is an OOM kill: check
             State.OOMKilled in `docker inspect {{ $labels.name }}` and the
-            "% of memory cap" panel. If it repeats, raise
+            "% of memory cap" panel. Expected once after a max-memory
+            rebuild (the worker stopped and restarted it). If it repeats, raise
             OTP_SERVE_MEM_HEADROOM_GB (OTP) or MOTIS_SERVE_MEM_LIMIT (MOTIS).

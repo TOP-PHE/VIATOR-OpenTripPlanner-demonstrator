@@ -34,6 +34,23 @@ def headroom_gb_or_default(value: Any, default: int, name: str) -> int:
     return default
 
 
+_TRUE_WORDS = {"true", "1", "yes", "on"}
+_FALSE_WORDS = {"false", "0", "no", "off"}
+
+
+def switch_or_default(value: Any, default: bool, name: str) -> bool:
+    """A boolean from `value` (bool or true/false, 1/0, yes/no, on/off), else `default` (logged)."""
+    if isinstance(value, bool):
+        return value
+    word = value.strip().lower() if isinstance(value, str) else None
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    _log.warning("%s=%r is not true or false; using %s", name.upper(), value, str(default).lower())
+    return default
+
+
 class Settings(BaseSettings):
     # Persistence
     database_url: str = "postgresql+psycopg://otp:otp@postgres:5432/otp"
@@ -111,6 +128,12 @@ class Settings(BaseSettings):
     # the module refuses any unknown `MSMM_` name in its own environment.
     station_module_url: str = ""
     station_module_token: SecretStr = Field(default=SecretStr(""), repr=False)
+
+    @field_validator("otp_serve_mem_cap", mode="before")
+    @classmethod
+    def _tolerant_cap_switch(cls, value: Any) -> Any:
+        """A typo in OTP_SERVE_MEM_CAP must not stop web: the caps stay on."""
+        return switch_or_default(value, True, "otp_serve_mem_cap")
 
     @field_validator("otp_serve_mem_headroom_gb", "otp_build_mem_headroom_gb", mode="before")
     @classmethod
