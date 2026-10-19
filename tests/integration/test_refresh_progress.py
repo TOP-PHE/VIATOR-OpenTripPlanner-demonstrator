@@ -32,9 +32,10 @@ import json
 import os
 import random
 import threading
+import time
 import uuid
 import zipfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +210,30 @@ def _read(sid: str = SID) -> dict[str, Any]:
     return refresh_progress.read(sid)
 
 
+# A running refresh writes its progress through a writer thread of its own
+# (`RefreshRun._write` inside `async with`): a read made while the refresh
+# runs may come before that write has landed, more so on a loaded runner
+# (main run 39225159844 read `current == []`, issue #373 item 1).
+_WAIT_STEP_SECONDS = 0.05
+_WAIT_DEADLINE_SECONDS = 5.0
+
+
+def _wait_for_record(wanted: Callable[[dict[str, Any]], bool], what: str) -> dict[str, Any]:
+    """Read the record until `wanted(record)` holds, and return it; fail
+    with the last record read when it does not hold within the deadline."""
+    deadline = time.monotonic() + _WAIT_DEADLINE_SECONDS
+    while True:
+        record = _read()
+        if wanted(record):
+            return record
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"{what}: not in the record after {_WAIT_DEADLINE_SECONDS} s; "
+                f"last record read: {record!r}"
+            )
+        time.sleep(_WAIT_STEP_SECONDS)
+
+
 def _age_heartbeat(minutes: int) -> None:
     from app.db import SessionLocal
 
@@ -251,19 +276,20 @@ def test_progress_is_server_state_seen_by_every_reader_while_it_runs(
     seen: list[dict[str, Any]] = []
     other_browser: list[dict[str, Any]] = []
 
+    def bytes_shown(received: int) -> Callable[[dict[str, Any]], bool]:
+        def shown(record: dict[str, Any]) -> bool:
+            current = record["providers"]["current"]
+            return bool(current) and current[0]["bytes"] == received
+
+        return shown
+
     async def big_body() -> AsyncIterator[bytes]:
         for start in range(0, len(big), MIB):
             if start:
                 # The previous chunk was reported; its write goes through the
                 # run's writer thread: a new request (a reload) reads it from
                 # the database once it has landed.
-                for _ in range(300):
-                    record = _read()
-                    current = record["providers"]["current"]
-                    if current and current[0]["bytes"] == start:
-                        break
-                    await asyncio.sleep(0.01)
-                seen.append(record)
+                seen.append(_wait_for_record(bytes_shown(start), f"{start} bytes received"))
             yield big[start : start + MIB]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -656,8 +682,12 @@ def test_a_provider_card_refresh_has_its_own_record_and_follow_up(
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
-        # While its download runs, the card's refresh is read back as running.
-        record = _read()["single"][0]
+        # While its download runs, the card's refresh is read back as running,
+        # its task once the writer thread has written it.
+        record = _wait_for_record(
+            lambda rec: bool(rec["single"]) and bool(rec["single"][0]["current"]),
+            "the card refresh's current task",
+        )["single"][0]
         assert (record["state"], record["scope"], record["provider_id"]) == (
             "running",
             "provider",
