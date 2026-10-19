@@ -15,7 +15,7 @@
       "type": "stat",
       "title": "Host CPU usage",
       "description": "Aggregate across all cores. 100% = every core fully busy.",
-      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
@@ -46,7 +46,7 @@
       "type": "stat",
       "title": "Host RAM in use",
       "description": "MemTotal − MemAvailable. Excludes page cache (Linux uses cache opportunistically; that's not 'used' for capacity purposes).",
-      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
@@ -77,7 +77,7 @@
       "type": "stat",
       "title": "Host swap in use",
       "description": "Swap should normally be 0 on a VPS sized for the workload. Non-zero = the host is dipping into disk and you'll feel it in latency.",
-      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
@@ -95,6 +95,37 @@
               { "color": "green", "value": null },
               { "color": "yellow", "value": 1 },
               { "color": "red", "value": 1073741824 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "colorMode": "background" }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Host iowait",
+      "description": "Share of CPU time spent waiting for the disk, averaged over all cores. Above 30 % for 10 minutes fires HostIowaitHigh (docker/prometheus/rules/resources.yml): usually swapping (see Swap by container) or a big OSM/feed read.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg(irate(node_cpu_seconds_total{mode=\"iowait\"}[2m])) * 100",
+          "legendFormat": "iowait"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 30 }
             ]
           }
         }
@@ -154,13 +185,13 @@
       "id": 6,
       "type": "timeseries",
       "title": "Container memory — by container",
-      "description": "Working-set memory per container. The `otp-build-<sid>` row is what you watch during a build — should plateau below its cgroup cap (`OTP_BUILD_MEM_LIMIT` in .env).",
+      "description": "Working-set memory of every Docker container on the host (series with a non-empty `name` label, so MSMM and build containers such as `viator-build-<job>` show too). A build should plateau below its cgroup cap (`OTP_BUILD_MEM_LIMIT`, derived from the heap). Empty panel = cAdvisor lost the Docker names: the CadvisorNoContainerNames alert fires and admin guide §5.8 says what to check.",
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 13 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "container_memory_working_set_bytes{name=~\"/?viator-.+|/?otp-build-.+\"}",
+          "expr": "container_memory_working_set_bytes{name!=\"\"}",
           "legendFormat": "{{name}}"
         }
       ],
@@ -182,7 +213,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"/?viator-.+|/?otp-build-.+\"}[2m])) * 100",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name!=\"\"}[2m])) * 100",
           "legendFormat": "{{name}}"
         }
       ],
@@ -195,16 +226,38 @@
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
     },
     {
-      "id": 8,
+      "id": 10,
       "type": "timeseries",
-      "title": "OTP build — % of cgroup memory cap used",
-      "description": "Per-container RSS as % of the cgroup hard cap. Watch this during a build — when it approaches 100%, OOM-kill is imminent. Bump `OTP_BUILD_MEM_LIMIT` in .env if you see this spike past 90%.",
+      "title": "Swap by container",
+      "description": "Swap each container holds (cAdvisor container_memory_swap). A capped container has no swap at all (memswap_limit = mem_limit), so a line above zero is an uncapped container: by default MOTIS, unless MOTIS_SERVE_MEM_LIMIT is set. Zero lines are kept on purpose: an empty panel then means cAdvisor lost the Docker names, not \"no swap\". `docker stats` does not show swap.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "container_memory_working_set_bytes{name=~\"/?viator-.+|/?otp-build-.+\"} / on(name) container_spec_memory_limit_bytes{name=~\"/?viator-.+|/?otp-build-.+\"} * 100",
+          "expr": "container_memory_swap{name!=\"\"}",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Capped containers — % of memory cap used",
+      "description": "Working set as % of the container's memory cap, for containers that have one (OTP build and serve, MSMM, MOTIS when MOTIS_*_MEM_LIMIT is set; uncapped containers report a limit at or above the host RAM and are left out). There is no swap behind a cap: at 100 % the kernel OOM-kills the container and ContainerOOMKilled fires. Past 90 % during a build, give the session a bigger heap (the cap follows it); for a serve container raise OTP_SERVE_MEM_HEADROOM_GB.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "container_memory_working_set_bytes{name!=\"\"} / on(name) ((container_spec_memory_limit_bytes{name!=\"\"} > 0) < on() group_left() max(node_memory_MemTotal_bytes)) * 100",
           "legendFormat": "{{name}}"
         }
       ],
@@ -231,7 +284,7 @@
       "type": "timeseries",
       "title": "Host disk — free space by mountpoint",
       "description": "Watch / and any /data mount during builds — graphs.tar can be tens of GB, and Postgres WAL grows during heavy session activity.",
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 39 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 47 },
       "datasource": { "type": "prometheus", "uid": "Prometheus" },
       "targets": [
         {

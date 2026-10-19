@@ -316,7 +316,19 @@ services:
   # network from prometheus. That keeps the host's attack surface unchanged.
 
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    # Issue #374: v0.49.1 left every container without its `name` label (the
+    # container panels showed No data). With Docker's containerd image store
+    # (`docker info --format '{{.Driver}}'` prints `overlayfs`), cAdvisor
+    # before v0.54.0 cannot find a container's read-write layer under
+    # /var/lib/docker/image/, its Docker handler fails for every container,
+    # and the raw cgroup handler takes over: same metrics, no Docker name or
+    # labels. v0.54.0 added containerd-snapshotter support (it asks
+    # containerd, namespace "moby", instead), v0.56.0 stopped that breaking
+    # hosts without the containerd store (cadvisor #3772), v0.56.2 fixed a
+    # crash when Docker reports no GraphDriver. v0.60.6 (2026-09-18) is the
+    # latest release and carries all three. Images from v0.53.0 on are
+    # published on ghcr.io only; gcr.io/cadvisor stops at v0.55.1.
+    image: ghcr.io/google/cadvisor:v0.60.6
     restart: unless-stopped
     # cAdvisor needs read access to host paths to enumerate containers and
     # their cgroup stats. `privileged: true` is the standard wiring per
@@ -361,7 +373,21 @@ services:
       - "--whitelisted_container_labels=com.docker.compose.service,viator.session_id,viator.category,viator.autoheal"
       # Disable the on-disk WAL — we don't need historical metrics inside
       # cAdvisor itself, prometheus is the long-term store.
+      # `memory` (working set, swap) and `oom_event`
+      # (container_oom_events_total, the ContainerOOMKilled alert) stay on.
       - "--disable_metrics=disk,network,tcp,udp,advtcp,sched,process,hugetlb,referenced_memory,cpu_topology,resctrl"
+      # Issue #374: where the Docker handler reaches containerd when the
+      # containerd image store is on. Docker's containerd listens on
+      # /run/containerd/containerd.sock on the host; the /var/run mount above
+      # shows it here (Ubuntu's /var/run is /run). Spelled out so it does not
+      # depend on the image's own /run layout. Without the containerd store
+      # cAdvisor never dials it.
+      - "--containerd=/var/run/containerd/containerd.sock"
+      # `--docker_only` is left at its default (false) on purpose: the raw
+      # cgroups (system.slice, ...) stay exported, so when names go missing
+      # again `count by (id) (container_memory_working_set_bytes)` still
+      # shows what cAdvisor sees. The dashboard and the alerts select
+      # `name!=""`, so the extra series cost nothing on the panels.
 
   node-exporter:
     image: prom/node-exporter:v1.8.2

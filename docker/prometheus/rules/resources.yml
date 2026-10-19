@@ -1,0 +1,103 @@
+# Host and container resource alerts — issue #374.
+#
+# Written after the 2026-10-18 freeze: the host swap was full and iowait was
+# high, while the per-container panels of the "VIATOR — Resources" dashboard
+# showed No data because cAdvisor had stopped attaching Docker names to its
+# series. Each rule below covers one part of that blind spot:
+#
+#   HostSwapUsageHigh        swap more than half used for 10 min
+#   HostIowaitHigh           CPUs waiting on the disk more than 30 % for 10 min
+#   CadvisorDown             the cadvisor scrape target is down (or missing)
+#   CadvisorNoContainerNames cadvisor is up but exports no series with a
+#                            non-empty `name` label: the per-container panels
+#                            are blind again (the #374 failure itself)
+#   ContainerOOMKilled       a container was OOM-killed. Capped containers have
+#                            no swap (memswap_limit = mem_limit), so reaching
+#                            the cap ends in an OOM kill; this makes it seen.
+#
+# Labels used: node-exporter `mode`; cadvisor `name` (the Docker container
+# name, present only when cadvisor sees Docker metadata); Prometheus `job`.
+# tests/unit/test_monitoring_config.py checks every expression uses only
+# labels these exporters export.
+#
+# NOTE: no Alertmanager is deployed and no Grafana alerting/contact point is
+# provisioned (same gap as rules/autoheal.yml). These alerts are visible at
+# /prometheus/alerts and in Grafana's Alerting tab, but nobody is paged
+# externally until a notification channel is configured.
+
+groups:
+  - name: viator-resources
+    rules:
+      - alert: HostSwapUsageHigh
+        # `> 0` on the divisor drops hosts without swap (no division by 0).
+        expr: (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / (node_memory_SwapTotal_bytes > 0) * 100 > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host swap more than 50 % used for 10 minutes"
+          description: >-
+            {{ $value | printf "%.0f" }} % of the host swap is in use. See
+            the "Swap by container" panel of the Resources dashboard: capped
+            containers have no swap, so the holder is an uncapped one (MOTIS
+            by default). Cold pages in swap make the next requests slow.
+
+      - alert: HostIowaitHigh
+        expr: avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[5m])) * 100 > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host iowait above 30 % for 10 minutes"
+          description: >-
+            The CPUs spend {{ $value | printf "%.0f" }} % of their time
+            waiting for the disk. During the 2026-10-18 freeze this came from
+            swapping; check the swap panels, then the running builds.
+
+      - alert: CadvisorDown
+        # `absent` also fires when the cadvisor job disappears from the
+        # scrape config altogether.
+        expr: up{job="cadvisor"} == 0 or absent(up{job="cadvisor"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cAdvisor scrape target down"
+          description: >-
+            Prometheus cannot scrape cadvisor:8080, so every per-container
+            panel and alert is blind. Check `docker ps --filter
+            name=viator-cadvisor` and `docker logs viator-cadvisor-1 2>&1 | tail -50`.
+
+      - alert: CadvisorNoContainerNames
+        # cadvisor answers but none of its memory series carries a Docker
+        # container name: its Docker handler failed (#374 was v0.49.1 against
+        # Docker's containerd image store). `absent(...)` is 1 exactly when no
+        # such series exists; `and on() up == 1` leaves "cadvisor down" to
+        # the rule above.
+        expr: absent(container_memory_working_set_bytes{name!=""}) and on() (up{job="cadvisor"} == 1)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cAdvisor exports no series with a container name"
+          description: >-
+            cAdvisor is up but no series has a non-empty `name` label, so the
+            per-container panels show No data. Check `docker logs
+            viator-cadvisor-1 2>&1 | tail -50` for Docker or containerd
+            errors, and `count by (id) (container_memory_working_set_bytes)`
+            (admin guide §5.8).
+
+      - alert: ContainerOOMKilled
+        # cadvisor's oom_event metric (left on in docker-compose.yml); it
+        # reads the kernel's OOM kills from /dev/kmsg.
+        expr: increase(container_oom_events_total{name!=""}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} was OOM-killed"
+          description: >-
+            {{ $labels.name }} reached its memory cap and the kernel killed
+            it (there is no swap behind a cap). Docker restarts serve
+            containers; a build fails with exit 137 in its rebuild log. Raise
+            the session heap (build), OTP_SERVE_MEM_HEADROOM_GB (OTP serve)
+            or MOTIS_*_MEM_LIMIT (MOTIS) if it happens again.
