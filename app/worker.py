@@ -31,6 +31,7 @@ from . import (
     country_gate,
     engine_versions,
     graph_snapshots,
+    memory_caps,
     netex_calendar,
     station_builds,
     station_extract_upload,
@@ -1219,7 +1220,11 @@ def run_build(
     host_gb = _host_total_gb()
     stopped_services: list[str] = []
     if max_memory:
-        auto = otp_heap.auto_build_heap(host_gb) if host_gb is not None else None
+        auto = (
+            otp_heap.auto_build_heap(host_gb, headroom_gb=settings.otp_build_mem_headroom_gb)
+            if host_gb is not None
+            else None
+        )
         if auto is not None:
             log.info(
                 "max-memory rebuild: host=%dGB → auto build heap %s (was %s)",
@@ -1248,7 +1253,9 @@ def run_build(
     # the JVM never even reaches its own -Xmx. Injected via the subprocess
     # environment so docker-compose's `mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}`
     # interpolation picks it up (a process env var beats the project's .env).
-    mem_limit_value = otp_heap.mem_limit_for_heap(otp_heap_value)
+    mem_limit_value = otp_heap.mem_limit_for_heap(
+        otp_heap_value, headroom_gb=settings.otp_build_mem_headroom_gb
+    )
     needed_gb = otp_heap.heap_to_gb(mem_limit_value)
     if host_gb is not None and needed_gb > host_gb:
         log.warning(
@@ -1319,7 +1326,17 @@ def run_build(
         )
 
         if proc.returncode != 0:
-            return output, False, ""
+            # Issue #374: the cap has no swap behind it any more, so a build
+            # that outgrows it is OOM-killed at once — say so in the log
+            # instead of leaving a bare non-zero exit (the JVM prints
+            # nothing when the kernel kills it).
+            return (
+                output
+                + f"\n[viator] otp build failed: {_describe_exit(proc.returncode)}"
+                + f" (memory cap {mem_limit_value}, no swap)\n",
+                False,
+                "",
+            )
 
         built = Path(str(settings.graph_dir)) / "graph.obj"
         if not built.exists():
@@ -1388,6 +1405,21 @@ def _describe_exit(code: int) -> str:
     """`exit 137 - killed (SIGKILL) - ...` for a rebuild log line."""
     meaning = _SIGNAL_EXITS.get(code)
     return f"exit {code}" + (f" - {meaning}" if meaning else "")
+
+
+def _motis_build_mem_limit() -> str | None:
+    """The MOTIS build containers' cap (MOTIS_BUILD_MEM_LIMIT), None for none.
+
+    Issue #374: opt-in, and with `--memory-swap` equal to it (no swap), so a
+    MOTIS import that outgrows it is OOM-killed (exit 137 in the build log)
+    instead of filling the host swap. A malformed value is logged and ignored:
+    a typo in `.env` must not stop every MOTIS build.
+    """
+    try:
+        return memory_caps.validate_mem_limit(settings.motis_build_mem_limit)
+    except ValueError as exc:
+        log.warning("MOTIS_BUILD_MEM_LIMIT ignored: %s", exc)
+        return None
 
 
 def _strip_tiles_block(config_yml: Path) -> None:
@@ -1541,11 +1573,18 @@ def run_build_motis(
         # crashed with PermissionError on its rewrite. Matching uids
         # closes that loop.
         worker_user = f"{os.getuid()}:{os.getgid()}"
+        build_mem_limit = _motis_build_mem_limit()
         common_cmd = [
             "docker",
             "run",
             "--rm",
             *_name_args(container_name),
+            # Issue #374: `--memory X --memory-swap X` when MOTIS_BUILD_MEM_LIMIT
+            # is set (cap, no swap); nothing when it is empty (the default).
+            *memory_caps.docker_run_memory_args(build_mem_limit),
+            # Issue #374: if the HOST runs out of memory, the kernel kills a
+            # build first rather than a serving router or postgres.
+            *memory_caps.BUILD_OOM_SCORE_ARGS,
             "--user",
             worker_user,
             "--network",
@@ -1661,6 +1700,11 @@ def run_build_motis(
             # the complete answer is the resolved *digest*, which belongs with the
             # `engine_build` row (MCT design ch.10.2), not a per-build shell-out.
             f"[viator] engine: {_MOTIS_IMAGE}\n"
+            + (
+                f"[viator] build memory cap: {build_mem_limit} (no swap)\n"
+                if build_mem_limit
+                else ""
+            )
             + "".join(f"[viator] {note}\n" for note in netex_notes)
             + "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")

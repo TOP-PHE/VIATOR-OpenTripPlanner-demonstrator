@@ -17,9 +17,10 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
-from . import engine_versions
+from . import engine_versions, memory_caps
 from .models import Session as SessionRow
 from .models.sessions import SessionState
+from .settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
       # docker-compose.yml's otp-build service.
       context: ../otp
     restart: unless-stopped
-    environment:
+{memory}    environment:
       OTP_MODE: serve
       # Per-session subdirectory under the shared graphs volume — the
       # entrypoint loads $OTP_GRAPH_DIR/current/graph.obj.
@@ -116,7 +117,7 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
 _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
     image: {motis_image}
     restart: unless-stopped
-    user: "0:0"
+{memory}    user: "0:0"
     volumes:
       # Shared graphs volume — the worker writes per-session MOTIS
       # imported data under graphs/motis/<sid>/current/; this mount
@@ -180,6 +181,40 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
 
 """
 
+
+def _otp_memory_lines(heap: str) -> str:
+    """`mem_limit` + `memswap_limit` lines of an OTP serve service (issue #374).
+
+    The cap follows the serve heap (app/otp_heap.serve_mem_limit_for_heap) and
+    swap is off (memswap = mem). Empty when caps are switched off in `.env`
+    (OTP_SERVE_MEM_CAP=false) or the heap is malformed.
+    """
+    from . import otp_heap as _otp_heap
+
+    if not settings.otp_serve_mem_cap:
+        return ""
+    limit = _otp_heap.serve_mem_limit_for_heap(heap, headroom_gb=settings.otp_serve_mem_headroom_gb)
+    if limit is None:
+        log.warning("OTP serve heap %r is malformed; that container gets no memory cap", heap)
+    return memory_caps.compose_memory_lines(limit)
+
+
+def _motis_memory_lines() -> str:
+    """`mem_limit` + `memswap_limit` lines of a MOTIS serve service (issue #374).
+
+    Opt-in: MOTIS has no heap to derive a cap from, so the cap is the
+    operator's MOTIS_SERVE_MEM_LIMIT, empty (the default) for none. A
+    malformed value is logged and ignored rather than breaking the render
+    of every session.
+    """
+    try:
+        limit = memory_caps.validate_mem_limit(settings.motis_serve_mem_limit)
+    except ValueError as exc:
+        log.warning("MOTIS_SERVE_MEM_LIMIT ignored: %s", exc)
+        return ""
+    return memory_caps.compose_memory_lines(limit)
+
+
 # No per-session volumes are declared — sessions share the `graphs` and
 # `inbox` volumes already declared in the main docker-compose.yml.
 # The empty `volumes: {}` mapping below keeps the rendered fragment
@@ -214,6 +249,7 @@ def render_compose(sessions: list[SessionRow]) -> str:
                 _MOTIS_SVC_TEMPLATE.format(
                     sid=s.id,
                     motis_image=engine_versions.MOTIS_IMAGE,
+                    memory=_motis_memory_lines(),
                     # MOTIS imports the full year up front; cold-start is
                     # dominated by data-mmap, not query warmup. Reuse the
                     # OTP knob so operators tune both planners the same way.
@@ -224,21 +260,23 @@ def render_compose(sessions: list[SessionRow]) -> str:
                 )
             )
         else:
+            # Serve heap: explicit operator choice from the session-edit form
+            # if set, otherwise a sensible default derived from the build
+            # heap (~1/3 of build heap, floored at 4g). This prevents the
+            # silent-4g-default trap that surfaced on 2026-05-10 — operator
+            # picks 64g build heap, build succeeds, OTP serve container
+            # crash-loops at the old hardcoded 4g default. Audit follow-up
+            # to #14 Phase 2 (the rest of the observability + operations
+            # arc that closed in v0.1.32.21).
+            heap = (s.config or {}).get("otp_heap") or _otp_heap.default_serve_heap_for_build(
+                (s.config or {}).get("otp_build_heap")
+            )
             parts.append(
                 _OTP_SVC_TEMPLATE.format(
                     sid=s.id,
-                    # Serve heap: explicit operator choice from the session-edit form
-                    # if set, otherwise a sensible default derived from the build
-                    # heap (~1/3 of build heap, floored at 4g). This prevents the
-                    # silent-4g-default trap that surfaced on 2026-05-10 — operator
-                    # picks 64g build heap, build succeeds, OTP serve container
-                    # crash-loops at the old hardcoded 4g default. Audit follow-up
-                    # to #14 Phase 2 (the rest of the observability + operations
-                    # arc that closed in v0.1.32.21).
-                    heap=(s.config or {}).get("otp_heap")
-                    or _otp_heap.default_serve_heap_for_build(
-                        (s.config or {}).get("otp_build_heap")
-                    ),
+                    heap=heap,
+                    # Issue #374: cap derived from that heap, no swap.
+                    memory=_otp_memory_lines(heap),
                     # Healthcheck start_period: explicit operator choice if set,
                     # otherwise 300s (5 min) — covers most graphs while keeping
                     # genuinely-stuck JVMs visible quickly. PR #32 fix for the
