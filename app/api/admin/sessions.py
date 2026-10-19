@@ -1588,14 +1588,33 @@ async def _materialise_derived_provider(
     `cross_border_filter` provider. The CPU/IO filter and the copy into the slot
     run in a worker thread (they touch no DB); the rebuild is queued on the
     event loop (`_dispatch_off_loop`). See docs/provider-source-modes-design.md §12.
+    An unexpected exception (the copy, the rebuild queue's database) skips
+    this provider alone, like a download task (`_unexpected_skip`); a
+    cancellation still ends the refresh.
     """
-    from app import gtfs_cross_border_filter as xb
-
     tt = provider.get("timetable") or {}
     if tt.get("source") != "cross_border_filter":
         return None
+    key = f"provider[{provider['id']}].cross_border_filter"
+    try:
+        return await _filter_derived_provider(db, target_sid, provider, tt, staging, key)
+    except Exception as exc:  # one provider's surprise must not end the batch
+        return {"status": "skipped", "key": key, "error": _unexpected_skip(db, key, exc)}
+
+
+async def _filter_derived_provider(
+    db: DbSession,
+    target_sid: str,
+    provider: dict[str, Any],
+    tt: dict[str, Any],
+    staging: Path,
+    key: str,
+) -> dict[str, Any]:
+    """`_materialise_derived_provider`'s work, for a derived provider whose
+    timetable block is `tt` and whose outcome key is `key`."""
+    from app import gtfs_cross_border_filter as xb
+
     pid = provider["id"]
-    key = f"provider[{pid}].cross_border_filter"
     df = tt.get("derived_from") or {}
     src_session, src_provider = df.get("session_id"), df.get("provider_id")
     src_slot = (
@@ -2073,11 +2092,44 @@ async def _refresh_one_task(
     the response — `status` is `fetched` (new file dispatched, rebuild
     queued), `unchanged` (upstream file identical to the one in the slot —
     nothing rotated, no rebuild) or `skipped` (failed; the slot keeps its
-    previous file). Per-task failures never abort the rest of the batch.
+    previous file). Per-task failures never abort the rest of the batch: an
+    unexpected exception (a database pool timeout, a bug) skips this task
+    alone (`_unexpected_skip`); a cancellation still ends the refresh.
     """
-    outcome = await _resolve_and_download(client, db, sid, staging, task)
+    try:
+        outcome = await _resolve_and_download(client, db, sid, staging, task)
+    except Exception as exc:  # one task's surprise must not end the batch
+        outcome = _skipped(task, task.url, _unexpected_skip(db, task.label, exc))
     _record_attempt(sid, task.label, outcome)
     return outcome
+
+
+def _unexpected_skip(db: DbSession, label: str, exc: Exception) -> str:
+    """The skip reason of a task (or a derived provider) that raised an
+    unexpected exception, after one ERROR line and a rollback of the
+    request's session. The reason and the log name the exception type only:
+    its text can quote a URL with its query string or a token. The rollback
+    leaves the session usable by the next task and by the refresh's own end
+    (row lock, audit, commit) whatever the failure left it in, such as a
+    PostgreSQL transaction aborted by a failed statement; a pool timeout
+    leaves nothing to roll back."""
+    kind = type(exc).__name__
+    log.error(
+        "refresh.task_failed_unexpectedly key=%s type=%s",
+        refresh_progress.task_label(label),
+        kind,
+    )
+    _rollback_quietly(db)
+    return f"unexpected error ({kind}); see the web log"
+
+
+def _rollback_quietly(db: DbSession) -> None:
+    """Roll the request's session back so its next statement can run; a
+    failed rollback logs its type (the next statement then says more)."""
+    try:
+        db.rollback()
+    except Exception as exc:  # best effort: the refresh goes on
+        log.warning("refresh.rollback_failed type=%s", type(exc).__name__)
 
 
 async def _resolve_and_download(
@@ -2167,6 +2219,9 @@ async def _download_task(
             db.flush()
         except Exception as exc:
             log.warning("could not stamp last_used_at on credential %s: %s", cred.id, exc)
+            # A failed flush leaves the session needing a rollback before
+            # the next task, or the refresh's end, can use it.
+            _rollback_quietly(db)
 
     if result.status == "unchanged":
         feed_fetch.save_state(state_dir, label, result.state)
@@ -2192,6 +2247,9 @@ async def _download_task(
             after=functools.partial(feed_fetch.save_state, state_dir, label, result.state),
         )
     except Exception as exc:  # the job removed the staged file
+        # The rebuild queue's statement may have failed in the request's
+        # session: roll it back for the next task.
+        _rollback_quietly(db)
         return _skip(f"dispatch failed: {exc}")
 
     outcome: dict[str, Any] = {
