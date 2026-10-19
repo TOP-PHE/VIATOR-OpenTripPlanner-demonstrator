@@ -165,6 +165,11 @@ def list_sessions(
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> list[SessionResponse]:
     rows = db.execute(select(SessionRow).order_by(SessionRow.created_at)).scalars().all()
+    # Hand the pooled connection back before building the answers (every
+    # session's full config): the rows stay loaded, detached, and the page
+    # can ask for this list many times at once. Same pattern as the login
+    # check of app/api/credentials.py.
+    db.close()
     return [SessionResponse.from_orm_session(s) for s in rows]
 
 

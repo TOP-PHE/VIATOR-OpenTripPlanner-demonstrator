@@ -110,6 +110,48 @@ def test_sessions_crud(client: TestClient, admin: dict[str, str]) -> None:
     assert r.status_code == 204
 
 
+def test_the_session_list_hands_its_connection_back_before_building_the_answers(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Sessions page could ask for this list many times at once (issue
+    of 19 Oct): each request held a pooled connection while it built every
+    answer. The rows are now loaded, the connection handed back, then the
+    answers built from the detached rows."""
+    from app.api.admin import sessions as sessions_api
+    from app.db import engine
+
+    for sid, meta in (
+        ("zz-one", {}),
+        ("zz-two", {"_meta": {"sources_changed_at": "2026-01-01T00:00:00+00:00"}}),
+    ):
+        r = client.post(
+            "/api/sessions",
+            headers=admin,
+            json={"id": sid, "name": sid.upper(), "category": "NAP", "config": meta},
+        )
+        assert r.status_code == 201, r.text
+    real = sessions_api.SessionResponse.from_orm_session
+    held: list[int] = []
+
+    def recording(row: object) -> object:
+        held.append(engine.pool.checkedout())  # type: ignore[attr-defined]
+        return real(row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sessions_api.SessionResponse, "from_orm_session", recording)
+
+    r = client.get("/api/sessions", headers=admin)
+
+    assert r.status_code == 200, r.text
+    assert held == [0, 0]
+    body = {s["id"]: s for s in r.json()}
+    assert sorted(body) == ["zz-one", "zz-two"]
+    assert body["zz-one"]["name"] == "ZZ-ONE"
+    assert body["zz-one"]["staleness_warning"] is None
+    assert body["zz-two"]["config"]["_meta"]["sources_changed_at"].startswith("2026-01-01")
+    assert "never refreshed" in body["zz-two"]["staleness_warning"]
+    assert body["zz-two"]["created_at"]
+
+
 def test_session_id_must_be_slug(client: TestClient, admin: dict[str, str]) -> None:
     r = client.post(
         "/api/sessions",
