@@ -102,8 +102,43 @@ echo ""
 # new $VERSION even when no compose-file fields changed (e.g. version-only
 # bumps). Force-recreate is needed here because plain `up -d` doesn't recreate
 # containers when only the env/.env-resolved image tag changed.
+web_recreated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo ">>> docker compose up -d --force-recreate web worker"
 docker compose up -d --force-recreate web worker
+echo ""
+
+# ─── Wait for web to rewrite the per-session compose file ──────────────────────
+# Web writes generated/docker-compose.sessions.yml at start-up (after alembic,
+# app/main.py `regenerated_at_boot`). The plain `up -d` below recreates every
+# serving session container — the image tag changes on every deploy — from
+# whatever that file holds at that moment. Run before web has rewritten it,
+# the containers come back with the previous release's definition (issue #374:
+# without their memory caps), and the new one only lands at the worker's next,
+# unplanned reload. So wait for the signal, at most WEB_REGEN_TIMEOUT seconds.
+WEB_REGEN_TIMEOUT=300
+echo ">>> waiting for web to rewrite the session compose file (max ${WEB_REGEN_TIMEOUT}s)"
+regen_waited=0
+while true; do
+    # Read the log into a variable first: `logs | grep -q` under pipefail can
+    # fail on SIGPIPE even when grep matched.
+    web_log=$(docker compose logs --no-log-prefix --since "$web_recreated_at" web 2>/dev/null || true)
+    if grep -q "regenerated_at_boot" <<<"$web_log"; then
+        break
+    fi
+    if grep -q "boot_regenerate_failed" <<<"$web_log"; then
+        echo "ERROR: web could not rewrite the session compose file (boot_regenerate_failed in its log)." >&2
+        echo "       Session containers were NOT recreated. Fix web, then run: docker compose up -d" >&2
+        exit 5
+    fi
+    if [[ "$regen_waited" -ge "$WEB_REGEN_TIMEOUT" ]]; then
+        echo "ERROR: no regenerated_at_boot from web after ${WEB_REGEN_TIMEOUT}s." >&2
+        echo "       Session containers were NOT recreated. Check: docker compose logs web" >&2
+        exit 5
+    fi
+    sleep 5
+    regen_waited=$((regen_waited + 5))
+done
+echo "  ✓ regenerated_at_boot after ~${regen_waited}s"
 echo ""
 
 # ─── Bring up any new services declared in compose ─────────────────────────────

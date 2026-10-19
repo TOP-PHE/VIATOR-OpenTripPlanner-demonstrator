@@ -134,6 +134,30 @@ jobs:
         run: bandit -r app/ -ll
         continue-on-error: false
 
+      # Issue #374. Prometheus refuses to start on a rule file it cannot
+      # parse, and a dashboard query it cannot parse is an empty panel. Both
+      # are checked here with Prometheus's own parser: promtool from the same
+      # image docker-compose.yml runs (tests/unit/test_monitoring_config.py
+      # keeps the two tags equal). `check config` also loads every rule file
+      # prometheus.yml names; the dashboard queries are written as a rule
+      # file first (scripts/dashboard_queries_as_rules.py).
+      - name: promtool (Prometheus config, alert rules, dashboard queries)
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/promql"
+          mkdir -p "$out"
+          python scripts/dashboard_queries_as_rules.py "$out/dashboard-queries.yml"
+          rule_files=()
+          for f in docker/prometheus/rules/*.yml; do
+            rule_files+=("/etc/prometheus/rules/$(basename "$f")")
+          done
+          promtool=(docker run --rm --entrypoint promtool
+            -v "$PWD/docker/prometheus:/etc/prometheus:ro"
+            -v "$out:/promql:ro"
+            prom/prometheus:v3.0.1)
+          "${promtool[@]}" check config /etc/prometheus/prometheus.yml
+          "${promtool[@]}" check rules "${rule_files[@]}" /promql/dashboard-queries.yml
+
       # Audit-2026-05 P0 #3. pip-audit is in requirements-dev.txt; this
       # step gates the build on Python-layer CVEs (Trivy in docker.yml
       # only catches OS-layer findings inside built images, not the

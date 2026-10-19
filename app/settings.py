@@ -10,10 +10,45 @@ Anything that's an infrastructure invariant (DB URL, JWT secret, paths) belongs 
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings
+
+_log = logging.getLogger(__name__)
+_HEADROOM_RE = re.compile(r"^(\d+)\s*[gG]?$")
+_HEADROOM_DEFAULTS = {"otp_serve_mem_headroom_gb": 6, "otp_build_mem_headroom_gb": 4}
+
+
+def headroom_gb_or_default(value: Any, default: int, name: str) -> int:
+    """Whole gigabytes from `value` (int, "8" or "8g"), else `default` (logged)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    match = _HEADROOM_RE.match(value.strip()) if isinstance(value, str) else None
+    if match:
+        return int(match.group(1))
+    _log.warning("%s=%r is not a whole number of GB; using %d", name.upper(), value, default)
+    return default
+
+
+_TRUE_WORDS = {"true", "1", "yes", "on"}
+_FALSE_WORDS = {"false", "0", "no", "off"}
+
+
+def switch_or_default(value: Any, default: bool, name: str) -> bool:
+    """A boolean from `value` (bool or true/false, 1/0, yes/no, on/off), else `default` (logged)."""
+    if isinstance(value, bool):
+        return value
+    word = value.strip().lower() if isinstance(value, str) else None
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    _log.warning("%s=%r is not true or false; using %s", name.upper(), value, str(default).lower())
+    return default
 
 
 class Settings(BaseSettings):
@@ -36,6 +71,22 @@ class Settings(BaseSettings):
     # The .env's OTP_BUILD_HEAP override still wins; this only affects
     # the fallback when neither env nor session config sets a value.
     otp_build_heap: str = "24g"
+
+    # Issue #374 — memory caps with no swap (app/memory_caps.py). Read by web,
+    # which renders the per-session compose file, and by the worker.
+    # OTP serve containers: capped by default at their -Xmx plus headroom
+    # (app/otp_heap.serve_mem_limit_for_heap); the headroom setting can widen
+    # the cap, never narrow it below heap + 4g. False = no cap (as before #374).
+    otp_serve_mem_cap: bool = True
+    otp_serve_mem_headroom_gb: int = 6
+    # The build cap (app/otp_heap.mem_limit_for_heap) has no swap behind it
+    # either; this widens it (never below heap + max(4g, heap/6)).
+    otp_build_mem_headroom_gb: int = 4
+    # MOTIS has no heap to derive a cap from (its memory follows the imported
+    # data), so its caps are opt-in: empty = no cap. Set them from the
+    # "Container memory" panel (peak plus a margin), e.g. "32g".
+    motis_serve_mem_limit: str = ""
+    motis_build_mem_limit: str = ""
 
     # JWT-based auth (step 3+)
     jwt_secret: str = "change-me-in-prod-use-32-bytes-random"  # noqa: S105 — placeholder default; .env JWT_SECRET MUST override in any non-dev environment
@@ -77,6 +128,22 @@ class Settings(BaseSettings):
     # the module refuses any unknown `MSMM_` name in its own environment.
     station_module_url: str = ""
     station_module_token: SecretStr = Field(default=SecretStr(""), repr=False)
+
+    @field_validator("otp_serve_mem_cap", mode="before")
+    @classmethod
+    def _tolerant_cap_switch(cls, value: Any) -> Any:
+        """A typo in OTP_SERVE_MEM_CAP must not stop web: the caps stay on."""
+        return switch_or_default(value, True, "otp_serve_mem_cap")
+
+    @field_validator("otp_serve_mem_headroom_gb", "otp_build_mem_headroom_gb", mode="before")
+    @classmethod
+    def _tolerant_headroom(cls, value: Any, info: Any) -> Any:
+        """A headroom typo in `.env` must not stop web or the worker.
+
+        Accepts an integer, or one followed by "g" ("8g" is read as 8); any
+        other value is logged and replaced by the field's default.
+        """
+        return headroom_gb_or_default(value, _HEADROOM_DEFAULTS[info.field_name], info.field_name)
 
     class Config:
         env_file = ".env"

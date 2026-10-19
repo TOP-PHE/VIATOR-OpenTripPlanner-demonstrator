@@ -110,6 +110,14 @@ services:
       # worker below gets the same two (app/station_builds.py).
       STATION_MODULE_URL: ${STATION_MODULE_URL:-}
       STATION_MODULE_TOKEN: ${STATION_MODULE_TOKEN:-}
+      # Issue #374 — memory caps with no swap on the per-session serve
+      # containers, which web writes into generated/docker-compose.sessions.yml
+      # (app/sessions_orchestrator.py). OTP: on by default, cap = serve heap +
+      # max(headroom, heap/3, 4g). MOTIS: empty = no cap. A changed value
+      # reaches a session container when compose next recreates it.
+      OTP_SERVE_MEM_CAP: ${OTP_SERVE_MEM_CAP:-true}
+      OTP_SERVE_MEM_HEADROOM_GB: ${OTP_SERVE_MEM_HEADROOM_GB:-6}
+      MOTIS_SERVE_MEM_LIMIT: ${MOTIS_SERVE_MEM_LIMIT:-}
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -172,11 +180,17 @@ services:
       INBOX_DIR: /data/inbox
       GRAPH_DIR: /data/graphs
       OTP_BUILD_HEAP: ${OTP_BUILD_HEAP:-12g}
+      # Issue #374 — widens the build cap (heap + max(4, heap/6, this)), which
+      # has no swap behind it. Integer GB.
+      OTP_BUILD_MEM_HEADROOM_GB: ${OTP_BUILD_MEM_HEADROOM_GB:-4}
       DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-1800}
       # MOTIS version overrides (app/engine_versions.py). Empty = the pinned version.
       # The build one defaults to the serve one; set it alone to try a candidate.
       VIATOR_MOTIS_VERSION: ${VIATOR_MOTIS_VERSION:-}
       VIATOR_MOTIS_BUILD_VERSION: ${VIATOR_MOTIS_BUILD_VERSION:-}
+      # Issue #374 — cap (with no swap) of the MOTIS build containers the
+      # worker starts with `docker run`. Empty = no cap.
+      MOTIS_BUILD_MEM_LIMIT: ${MOTIS_BUILD_MEM_LIMIT:-}
       JWT_SECRET: ${JWT_SECRET}
       DOCKER_HOST: unix:///var/run/docker.sock
       # Multimodal Station Mapping module: the same two settings as web. Before
@@ -222,7 +236,17 @@ services:
     # the host. Should be `-Xmx` plus ~4 GB of native headroom (Direct
     # buffers, metaspace, threads, GC). Default 12g pairs with the default
     # 8g heap (IDF). For France-wide bump both: heap=24g, limit=28g.
+    # The worker overrides OTP_BUILD_MEM_LIMIT per build from the heap
+    # (app/otp_heap.mem_limit_for_heap).
     mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
+    # Issue #374: memswap_limit is memory + swap, so equal to mem_limit means
+    # no swap at all. Without it the "hard cap" above was soft: a build at its
+    # cap went on into the host swap (and iowait) instead of being killed.
+    memswap_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
+    # Host-level OOM (the whole server out of memory): the kernel kills a
+    # build before a serving router, web or postgres (oom_score_adj 0).
+    # Same value as the MOTIS build's `--oom-score-adj` (app/memory_caps.py).
+    oom_score_adj: 500
     environment:
       OTP_MODE: build
       OTP_INBOX_DIR: ${OTP_INBOX_DIR:-/var/otp/inbox}
@@ -299,7 +323,19 @@ services:
   # network from prometheus. That keeps the host's attack surface unchanged.
 
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    # Issue #374: v0.49.1 left every container without its `name` label (the
+    # container panels showed No data). With Docker's containerd image store
+    # (`docker info --format '{{.Driver}}'` prints `overlayfs`), cAdvisor
+    # before v0.54.0 cannot find a container's read-write layer under
+    # /var/lib/docker/image/, its Docker handler fails for every container,
+    # and the raw cgroup handler takes over: same metrics, no Docker name or
+    # labels. v0.54.0 added containerd-snapshotter support (it asks
+    # containerd, namespace "moby", instead), v0.56.0 stopped that breaking
+    # hosts without the containerd store (cadvisor #3772), v0.56.2 fixed a
+    # crash when Docker reports no GraphDriver. v0.60.6 (2026-09-18) is the
+    # latest release and carries all three. Images from v0.53.0 on are
+    # published on ghcr.io only; gcr.io/cadvisor stops at v0.55.1.
+    image: ghcr.io/google/cadvisor:v0.60.6
     restart: unless-stopped
     # cAdvisor needs read access to host paths to enumerate containers and
     # their cgroup stats. `privileged: true` is the standard wiring per
@@ -344,7 +380,21 @@ services:
       - "--whitelisted_container_labels=com.docker.compose.service,viator.session_id,viator.category,viator.autoheal"
       # Disable the on-disk WAL — we don't need historical metrics inside
       # cAdvisor itself, prometheus is the long-term store.
+      # `memory` (working set, swap) and `oom_event`
+      # (container_oom_events_total, the ContainerOOMKilled alert) stay on.
       - "--disable_metrics=disk,network,tcp,udp,advtcp,sched,process,hugetlb,referenced_memory,cpu_topology,resctrl"
+      # Issue #374: where the Docker handler reaches containerd when the
+      # containerd image store is on. Docker's containerd listens on
+      # /run/containerd/containerd.sock on the host; the /var/run mount above
+      # shows it here (Ubuntu's /var/run is /run). Spelled out so it does not
+      # depend on the image's own /run layout. Without the containerd store
+      # cAdvisor never dials it.
+      - "--containerd=/var/run/containerd/containerd.sock"
+      # `--docker_only` is left at its default (false) on purpose: the raw
+      # cgroups (system.slice, ...) stay exported, so when names go missing
+      # again `count by (id) (container_memory_working_set_bytes)` still
+      # shows what cAdvisor sees. The dashboard and the alerts select
+      # `name!=""`, so the extra series cost nothing on the panels.
 
   node-exporter:
     image: prom/node-exporter:v1.8.2
