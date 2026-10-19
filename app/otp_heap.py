@@ -226,3 +226,48 @@ def auto_build_heap(
     if heap_to_gb(mem_limit_for_heap(f"{heap}g")) > avail:
         return None
     return f"{heap}g"
+
+
+# ───────────────────── Serve cgroup mem_limit derivation (#374) ─────────────
+# The per-session OTP *serve* containers had no memory cap: `docker stats`
+# showed the host's RAM as their limit, and on 2026-10-19 their idle JVMs held
+# most of the host's swap. They now get a cap derived from their own -Xmx, the
+# same way the build does, with `memswap_limit` equal to it (no swap at all;
+# see app/memory_caps.py).
+#
+# Headroom on top of -Xmx: the serve JVM runs with -XX:MaxDirectMemorySize=2g
+# (docker/otp/entrypoint.sh) and also needs metaspace, code cache, thread
+# stacks and the G1 structures that grow with the heap. The serve process
+# lives for weeks with the whole graph loaded, so the headroom is wider than
+# the build's: `max(configured, heap // 3)`, never below
+# MIN_SERVE_HEADROOM_GB. A cap that is too tight kills a router that worked;
+# a generous one still turns a runaway into a visible OOM kill instead of
+# hours of host swapping.
+#   4g  -> 10g   (default serve heap, 6g headroom)
+#   12g -> 18g
+#   16g -> 22g
+#   24g -> 32g
+#   48g -> 64g
+MIN_SERVE_HEADROOM_GB = 3  # MaxDirectMemorySize=2g + ~1g metaspace/threads/code cache
+DEFAULT_SERVE_HEADROOM_GB = 6
+
+
+def serve_mem_limit_for_heap(
+    heap: str | None, *, headroom_gb: int = DEFAULT_SERVE_HEADROOM_GB
+) -> str | None:
+    """Return the cgroup cap (e.g. '18g') of an OTP serve container whose -Xmx is `heap`.
+
+    `cap = heap_gb + max(headroom_gb, heap_gb // 3, MIN_SERVE_HEADROOM_GB)`.
+    The floor means no setting can cap a container below what its heap plus
+    the 2g direct buffers need. Returns None for a missing or malformed heap:
+    the cap is then left off rather than guessed (the JVM would refuse that
+    heap anyway, and a guessed cap could be below what it needs).
+    """
+    if not heap:
+        return None
+    try:
+        gb = heap_to_gb(heap)
+    except ValueError:
+        return None
+    headroom = max(headroom_gb, gb // 3, MIN_SERVE_HEADROOM_GB)
+    return f"{gb + headroom}g"

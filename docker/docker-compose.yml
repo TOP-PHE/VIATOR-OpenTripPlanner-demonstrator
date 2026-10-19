@@ -110,6 +110,14 @@ services:
       # worker below gets the same two (app/station_builds.py).
       STATION_MODULE_URL: ${STATION_MODULE_URL:-}
       STATION_MODULE_TOKEN: ${STATION_MODULE_TOKEN:-}
+      # Issue #374 — memory caps with no swap on the per-session serve
+      # containers, which web writes into generated/docker-compose.sessions.yml
+      # (app/sessions_orchestrator.py). OTP: on by default, cap = serve heap +
+      # max(headroom, heap/3, 3g). MOTIS: empty = no cap. A changed value
+      # reaches a session container when compose next recreates it.
+      OTP_SERVE_MEM_CAP: ${OTP_SERVE_MEM_CAP:-true}
+      OTP_SERVE_MEM_HEADROOM_GB: ${OTP_SERVE_MEM_HEADROOM_GB:-6}
+      MOTIS_SERVE_MEM_LIMIT: ${MOTIS_SERVE_MEM_LIMIT:-}
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -177,6 +185,9 @@ services:
       # The build one defaults to the serve one; set it alone to try a candidate.
       VIATOR_MOTIS_VERSION: ${VIATOR_MOTIS_VERSION:-}
       VIATOR_MOTIS_BUILD_VERSION: ${VIATOR_MOTIS_BUILD_VERSION:-}
+      # Issue #374 — cap (with no swap) of the MOTIS build containers the
+      # worker starts with `docker run`. Empty = no cap.
+      MOTIS_BUILD_MEM_LIMIT: ${MOTIS_BUILD_MEM_LIMIT:-}
       JWT_SECRET: ${JWT_SECRET}
       DOCKER_HOST: unix:///var/run/docker.sock
       # Multimodal Station Mapping module: the same two settings as web. Before
@@ -222,7 +233,13 @@ services:
     # the host. Should be `-Xmx` plus ~4 GB of native headroom (Direct
     # buffers, metaspace, threads, GC). Default 12g pairs with the default
     # 8g heap (IDF). For France-wide bump both: heap=24g, limit=28g.
+    # The worker overrides OTP_BUILD_MEM_LIMIT per build from the heap
+    # (app/otp_heap.mem_limit_for_heap).
     mem_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
+    # Issue #374: memswap_limit is memory + swap, so equal to mem_limit means
+    # no swap at all. Without it the "hard cap" above was soft: a build at its
+    # cap went on into the host swap (and iowait) instead of being killed.
+    memswap_limit: ${OTP_BUILD_MEM_LIMIT:-12g}
     environment:
       OTP_MODE: build
       OTP_INBOX_DIR: ${OTP_INBOX_DIR:-/var/otp/inbox}

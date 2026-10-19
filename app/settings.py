@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     # the fallback when neither env nor session config sets a value.
     otp_build_heap: str = "24g"
 
+    # Issue #374 — memory caps with no swap (app/memory_caps.py). Read by web,
+    # which renders the per-session compose file, and by the worker.
+    # OTP serve containers: capped by default at their -Xmx plus headroom
+    # (app/otp_heap.serve_mem_limit_for_heap); the headroom setting can widen
+    # the cap, never narrow it below heap + 3g. False = no cap (as before #374).
+    otp_serve_mem_cap: bool = True
+    otp_serve_mem_headroom_gb: int = 6
+    # MOTIS has no heap to derive a cap from (its memory follows the imported
+    # data), so its caps are opt-in: empty = no cap. Set them from the
+    # "Container memory" panel (peak plus a margin), e.g. "32g".
+    motis_serve_mem_limit: str = ""
+    motis_build_mem_limit: str = ""
+
     # JWT-based auth (step 3+)
     jwt_secret: str = "change-me-in-prod-use-32-bytes-random"  # noqa: S105 — placeholder default; .env JWT_SECRET MUST override in any non-dev environment
     jwt_alg: str = "HS256"
