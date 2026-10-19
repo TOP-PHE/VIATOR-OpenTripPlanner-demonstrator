@@ -111,7 +111,8 @@ def _check_brackets(expr: str) -> None:
         if ch in "([{":
             stack.append(ch)
         elif ch in pairs:
-            assert stack and stack[-1] == pairs[ch], f"unbalanced {ch!r} in {expr!r}"
+            assert stack, f"unbalanced {ch!r} in {expr!r}"
+            assert stack[-1] == pairs[ch], f"unbalanced {ch!r} in {expr!r}"
             stack.pop()
     assert not stack, f"unclosed {stack} in {expr!r}"
 
@@ -268,7 +269,8 @@ def _rules() -> list[dict[str, Any]]:
         assert set(doc) == {"groups"}, path
         for group in doc["groups"]:
             assert set(group) <= {"name", "interval", "rules"}, path
-            assert group["name"] and group["rules"], path
+            assert group["name"], path
+            assert group["rules"], path
             rules += group["rules"]
     return rules
 
