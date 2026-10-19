@@ -194,7 +194,7 @@ async def test_dispatch_failure_is_skipped_and_state_not_saved(
     monkeypatch.setattr(sessions_api.ingestion, "place", boom)
     outcome = await _run(_portal(lambda r: httpx.Response(200, content=_gtfs_zip())), inbox)
     assert outcome["status"] == "skipped"
-    assert "dispatch failed: disk full" in outcome["reason"]
+    assert outcome["reason"] == "dispatch failed (OSError); see the web log"
     assert sessions_api._fetch_checked_at("s1", LABEL) is None
     assert list((inbox / "s1" / "_staging").iterdir()) == []
 
@@ -433,6 +433,8 @@ class _CredDb:
         return self.cred
 
     def flush(self) -> None: ...
+
+    def commit(self) -> None: ...
 
 
 def _login_cred(plaintext: str, auth_type: str = "oauth2_password") -> Any:

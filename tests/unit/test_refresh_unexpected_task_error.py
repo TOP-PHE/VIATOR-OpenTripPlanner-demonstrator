@@ -49,20 +49,32 @@ _NAP_RESOLVER = {
 class _Db:
     """The request's session, as far as a refresh task uses it."""
 
-    def __init__(self, *, get_raises: BaseException | None = None) -> None:
+    def __init__(
+        self, *, get_raises: BaseException | None = None, rows: list[Any] | None = None
+    ) -> None:
         self.get_raises = get_raises
+        self.rows = rows or []
         self.rollbacks = 0
-        self.flush_raises: Exception | None = None
+        self.commits = 0
+        self.commit_raises: Exception | None = None
+        self.execute_raises: Exception | None = None
         self.rollback_raises: Exception | None = None
+
+    def execute(self, _statement: Any) -> Any:
+        if self.execute_raises is not None:
+            raise self.execute_raises
+        rows = self.rows
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
     def get(self, _model: Any, _key: Any) -> Any:
         if self.get_raises is not None:
             raise self.get_raises
         return None
 
-    def flush(self) -> None:
-        if self.flush_raises is not None:
-            raise self.flush_raises
+    def commit(self) -> None:
+        if self.commit_raises is not None:
+            raise self.commit_raises
+        self.commits += 1
 
     def rollback(self) -> None:
         self.rollbacks += 1
@@ -230,17 +242,14 @@ async def test_a_failed_rollback_is_logged_and_the_task_is_still_skipped(
     assert _SECRET not in caplog.text
 
 
-async def test_a_failed_credential_stamp_rolls_the_session_back(
-    staging: Path, placed: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def _stamped(monkeypatch: pytest.MonkeyPatch, staging: Path, db: _Db) -> Any:
+    """A task whose credential is used: its `last_used_at` is stamped."""
     cred = SimpleNamespace(id=uuid.uuid4(), last_used_at=None)
 
     async def authorize(_client: Any, _db: Any, _cid: Any, url: str) -> Any:
         return url, {}, cred
 
     monkeypatch.setattr(sessions_api, "_authorize", authorize)
-    db = _Db()
-    db.flush_raises = RuntimeError("stand-in flush")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=_gtfs_zip()))
     ) as c:
@@ -251,25 +260,82 @@ async def test_a_failed_credential_stamp_rolls_the_session_back(
             staging,
             _task("ZZONE", credential="zz-cred"),
         )
+    assert cred.last_used_at is not None
+    return outcome
+
+
+async def test_the_credential_stamp_is_committed_at_once(
+    staging: Path, placed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later task's rollback cannot discard it (it is not only flushed)."""
+    db = _Db()
+    outcome = await _stamped(monkeypatch, staging, db)
+    assert outcome["status"] == "fetched"
+    assert (db.commits, db.rollbacks) == (1, 0)
+
+
+async def test_a_failed_credential_stamp_rolls_back_and_logs_its_type_only(
+    staging: Path,
+    placed: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = _Db()
+    db.commit_raises = RuntimeError(f"stand-in commit {_SECRET}")
+    outcome = await _stamped(monkeypatch, staging, db)
     assert outcome["status"] == "fetched"
     assert db.rollbacks == 1
+    assert "refresh.credential_stamp_failed type=RuntimeError" in caplog.text
+    assert _SECRET not in caplog.text
 
 
-async def test_a_failed_dispatch_rolls_the_session_back(
-    staging: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def broken(*_a: Any, **_k: Any) -> bool:
-        raise PoolTimeout("stand-in")
-
-    monkeypatch.setattr(sessions_api.ingestion, "place", broken)
-    db = _Db()
+async def _fetch_one(db: _Db, staging: Path) -> dict[str, Any]:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=_gtfs_zip()))
     ) as c:
-        outcome = await sessions_api._refresh_one_task(c, db, "zz", staging, _task("ZZONE"))  # type: ignore[arg-type]
+        return await sessions_api._refresh_one_task(c, db, "zz", staging, _task("ZZONE"))  # type: ignore[arg-type]
+
+
+async def test_a_failed_dispatch_names_its_type_only_and_rolls_back(
+    staging: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(*_a: Any, **_k: Any) -> bool:
+        raise OSError(f"stand-in /zz/{_SECRET}/slot")
+
+    monkeypatch.setattr(sessions_api.ingestion, "place", broken)
+    db = _Db()
+    outcome = await _fetch_one(db, staging)
     assert outcome["status"] == "skipped"
-    assert outcome["reason"].startswith("dispatch failed")
+    assert outcome["reason"] == "dispatch failed (OSError); see the web log"
     assert db.rollbacks == 1
+    assert "refresh.dispatch_failed key=provider[ZZONE].timetable(gtfs) type=OSError" in (
+        caplog.text
+    )
+    assert _SECRET not in caplog.text
+
+
+_NOT_QUEUED = "stored, but no rebuild was queued (TimeoutError); start a rebuild by hand"
+
+
+async def test_a_stored_file_whose_rebuild_was_not_queued_says_so(
+    staging: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file is in the slot and its fetch state saved: the next refresh
+    finds it unchanged, so the outcome must say a rebuild is still due."""
+    monkeypatch.setattr(sessions_api.ingestion, "place", lambda *_a, **_k: True)
+
+    def queue(*_a: Any, **_k: Any) -> None:
+        raise PoolTimeout(_POOL_TEXT)
+
+    monkeypatch.setattr(sessions_api.ingestion, "queue_rebuild", queue)
+    db = _Db()
+    outcome = await _fetch_one(db, staging)
+    assert (outcome["status"], outcome["reason"]) == ("fetched", _NOT_QUEUED)
+    assert db.rollbacks == 1
+    assert "refresh.rebuild_not_queued key=provider[ZZONE].timetable(gtfs) type=TimeoutError" in (
+        caplog.text
+    )
+    assert _SECRET not in caplog.text
 
 
 # ── cross-border filters (derived providers) ──
@@ -355,3 +421,165 @@ async def test_a_label_of_an_unexpected_shape_is_not_logged_as_is(
             task,
         )
     assert _errors(caplog) == ["refresh.task_failed_unexpectedly key=task type=TimeoutError"]
+
+
+async def test_a_derived_provider_whose_rebuild_was_not_queued_says_so(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import gtfs_cross_border_filter as xb
+    from app import ingestion
+
+    source = sessions_api.settings.inbox_dir / "zz-national" / "gtfs"
+    source.mkdir(parents=True)
+    (source / ingestion.gtfs_staged_filename("ZZNAT")).write_bytes(b"zz")
+    stats = SimpleNamespace(routes_kept=1, trips_kept=2, summary_line=lambda: "zz")
+    monkeypatch.setattr(xb, "filter_to_cross_border", lambda *_a, **_k: stats)
+    monkeypatch.setattr(sessions_api.ingestion, "place", lambda *_a, **_k: True)
+
+    def queue(*_a: Any, **_k: Any) -> None:
+        raise PoolTimeout(_POOL_TEXT)
+
+    monkeypatch.setattr(sessions_api.ingestion, "queue_rebuild", queue)
+    db = _Db()
+    (outcome,) = await sessions_api._run_derived_filters(
+        db,  # type: ignore[arg-type]
+        "zz",
+        _derived_config("ZZXA"),
+        staging,
+    )
+    assert (outcome["status"], outcome["reason"]) == ("fetched", _NOT_QUEUED)
+    assert outcome["routes_kept"] == 1
+    assert db.rollbacks == 1
+
+
+# ── the cascade into other sessions ──
+
+
+def _session_row(sid: str, *pids: str) -> Any:
+    config = _derived_config(*pids)
+    for p in config["sources"]["providers"]:
+        p["timetable"]["derived_from"]["session_id"] = "zz"
+    return SimpleNamespace(id=sid, config=config)
+
+
+async def test_an_unexpected_error_in_one_cascade_target_skips_that_target_only(
+    staging: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    real = sessions_api._cascade_into
+    seen: list[str] = []
+
+    async def into(db: Any, source: str, target_id: str, config: Any) -> Any:
+        seen.append(target_id)
+        if target_id == "zz-bad":
+            raise PoolTimeout(_POOL_TEXT)
+        return await real(db, source, target_id, config)
+
+    async def filtering(_db: Any, _sid: str, _p: Any, _tt: Any, _st: Path, key: str) -> Any:
+        return {"status": "fetched", "key": key}
+
+    monkeypatch.setattr(sessions_api, "_cascade_into", into)
+    monkeypatch.setattr(sessions_api, "_filter_derived_provider", filtering)
+    rows = [_session_row("zz"), _session_row("zz-bad", "ZZXA"), _session_row("zz-ok", "ZZXB")]
+    db = _Db(rows=rows)
+    outcomes = await sessions_api._cascade_derived_refresh(db, "zz")  # type: ignore[arg-type]
+    assert seen == ["zz-bad", "zz-ok"]
+    assert outcomes == [
+        {
+            "status": "skipped",
+            "key": "cascade",
+            "target_session": "zz-bad",
+            "error": _REASON.format("TimeoutError"),
+        },
+        {
+            "status": "fetched",
+            "key": "provider[ZZXB].cross_border_filter",
+            "target_session": "zz-ok",
+        },
+    ]
+    assert db.rollbacks == 1
+    assert _errors(caplog) == ["refresh.task_failed_unexpectedly key=cascade type=TimeoutError"]
+
+
+async def test_the_cascade_reads_each_session_once_before_any_filter(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filter's rollback expires the rows: their values were copied first."""
+
+    class Expiring:
+        def __init__(self, row: Any) -> None:
+            self._row, self.reads = row, 0
+
+        @property
+        def id(self) -> str:
+            self.reads += 1
+            return str(self._row.id)
+
+        @property
+        def config(self) -> Any:
+            self.reads += 1
+            return self._row.config
+
+    rows = [Expiring(_session_row("zz-a", "ZZXA")), Expiring(_session_row("zz-b", "ZZXB"))]
+    before: list[int] = []
+
+    async def filtering(_db: Any, _sid: str, _p: Any, _tt: Any, _st: Path, key: str) -> Any:
+        before.append(sum(r.reads for r in rows))
+        raise PoolTimeout(_POOL_TEXT)
+
+    monkeypatch.setattr(sessions_api, "_filter_derived_provider", filtering)
+    db = _Db(rows=rows)
+    outcomes = await sessions_api._cascade_derived_refresh(db, "zz")  # type: ignore[arg-type]
+    assert [o["status"] for o in outcomes] == ["skipped", "skipped"]
+    assert before[0] == before[1]  # nothing read again after the first rollback
+    assert db.rollbacks == 2
+
+
+async def test_a_failed_read_of_the_sessions_skips_the_cascade_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = _Db()
+    db.execute_raises = PoolTimeout(_POOL_TEXT)
+    assert await sessions_api._cascade_derived_refresh(db, "zz") == []  # type: ignore[arg-type]
+    assert db.rollbacks == 1
+    assert _errors(caplog) == ["refresh.task_failed_unexpectedly key=cascade type=TimeoutError"]
+
+
+# ── the OSM refresh ──
+
+
+async def test_an_unexpected_error_in_the_osm_refresh_skips_its_task_and_it_finishes(
+    staging: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = refresh_progress.RefreshRun(
+        "zz", refresh_progress.OSM, uuid.uuid4(), refresh_progress._initial_detail(1, None)
+    )
+    ends: list[Any] = []
+    run._execute = lambda statement, **_k: ends.append(statement)  # type: ignore[method-assign]
+    monkeypatch.setattr(sessions_api, "_claim_refresh", lambda *_a: run)
+    audits: list[dict[str, Any]] = []
+    monkeypatch.setattr(sessions_api.audit, "record", lambda _db, **kw: audits.append(kw))
+    monkeypatch.setattr(sessions_api, "client_ip", lambda _r: "203.0.113.9")
+
+    async def broken(*_a: Any, **_k: Any) -> Any:
+        raise PoolTimeout(_POOL_TEXT)
+
+    monkeypatch.setattr(sessions_api, "_resolve_and_download", broken)
+    db = _Db()
+    session = SimpleNamespace(config={"sources": {"osm_pbf": "https://zz.invalid/zz.osm.pbf"}})
+    db.get = lambda _model, _key: session  # type: ignore[method-assign]
+
+    result = await sessions_api.refresh_osm(
+        "zz",
+        SimpleNamespace(),  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+        SimpleNamespace(id=uuid.uuid4()),  # type: ignore[arg-type]
+    )
+
+    assert result.fetched == []
+    assert [(s["key"], s["reason"]) for s in result.skipped] == [
+        ("osm_pbf", _REASON.format("TimeoutError"))
+    ]
+    assert (run.detail["done"], run.detail["failed"], run.detail["not_reached"]) == (1, 1, 0)
+    assert run.detail.get("error") is None
+    assert [a["action"] for a in audits] == ["session.osm.refreshed"]
+    assert (db.rollbacks, db.commits) == (1, 1)

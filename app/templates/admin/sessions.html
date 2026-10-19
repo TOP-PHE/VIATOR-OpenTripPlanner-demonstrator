@@ -1037,6 +1037,12 @@ function derivedSessions() {
   return derivedSessionsPromise;
 }
 
+// A saved configuration changes the list (providers of this session, the
+// links of the others): the next picker asks again.
+function forgetSessionList() {
+  derivedSessionsPromise = null;
+}
+
 function providersOfSession(session) {
   const provs = session && session.config && session.config.sources
     ? session.config.sources.providers : null;
@@ -1067,6 +1073,9 @@ async function populateDerivedCard(card) {
   const savedSession = sessSel.dataset.value || '';
   const savedProvider = provSel.dataset.value || '';
   const sessions = await derivedSessions();
+  // An empty list means it could not be loaded (it always holds this
+  // session): keep the saved link as drawn rather than mark it "(not found)".
+  if (!sessions.length) return;
   const items = sessions.map(s => ({
     value: s.id, label: (s.name && s.name !== s.id) ? `${s.id} — ${s.name}` : s.id,
   }));
@@ -2191,6 +2200,7 @@ async function applyNapSources(sid, btn) {
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('error', napErrorText(body, r.status)); return; }
+    forgetSessionList();
     napSyncSessionRow(sid, body.config);
     const skipped = (body.skipped || []).map(s => `${s.id} (${s.reason})`).join(', ');
     showToast('success', `Switched ${body.changed.length}: ${body.changed.join(', ') || 'none'}${skipped ? ' | skipped ' + skipped : ''}. Next: Refresh providers.`);
@@ -2568,6 +2578,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     e.target.dataset.value = e.target.value;  // remember the new pick
     provSel.dataset.value = '';
     const sessions = await derivedSessions();
+    if (!sessions.length) return;  // list unavailable: leave the provider pick as it is
     fillDerivedProviderSelect(provSel, sessions.find(s => s.id === e.target.value), '');
   });
   // Live-update each provider card's summary as id/label/country change.
@@ -2659,6 +2670,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       return;
     }
     const updated = await r.json();
+    forgetSessionList();
     row.dataset.config = JSON.stringify(updated.config);
     markCardsSaved(form);
     // Refresh the staleness banner — saving a URL change should make it
@@ -3348,6 +3360,7 @@ async function napCall(preview, includeDatasetIds) {
     }
     throw new Error(out.detail || `Failed (${r.status})`);
   }
+  if (!preview) forgetSessionList();
   return out;
 }
 

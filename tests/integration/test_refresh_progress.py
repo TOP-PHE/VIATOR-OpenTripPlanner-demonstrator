@@ -1413,6 +1413,80 @@ def test_an_unexpected_task_error_skips_that_task_and_the_refresh_finishes(
 
 
 @pytest.mark.usefixtures("inbox", "no_station_module")
+def test_an_unexpected_error_in_the_cascade_still_finishes_audits_and_commits(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cascade into the sessions derived from this one runs after the
+    downloads and before the audit entry and the commit: an error there
+    skips that target only."""
+    from sqlalchemy import select
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    from app.api.admin import sessions as sessions_api
+    from app.db import SessionLocal
+    from app.models import AuditEvent
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL"])
+    r = client.post(
+        "/api/sessions",
+        headers=admin,
+        json={"id": "zz-derived", "name": "ZZ derived", "category": "NAP", "config": {}},
+    )
+    assert r.status_code == 201, r.text
+    with SessionLocal() as db:
+        derived = db.get(SessionRow, "zz-derived")
+        assert derived is not None
+        derived.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "ZZXB",
+                        "country_iso": "ZZ",
+                        "timetable": {
+                            "format": "gtfs",
+                            "source": "cross_border_filter",
+                            "derived_from": {"session_id": SID, "provider_id": "ZZRAIL"},
+                        },
+                    }
+                ]
+            }
+        }
+        db.commit()
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+
+    async def broken(*_a: Any, **_k: Any) -> Any:
+        raise PoolTimeout(f"QueuePool limit reached {_url('zz')}")
+
+    monkeypatch.setattr(sessions_api, "_cascade_into", broken)
+
+    r = client.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [f["key"] for f in body["fetched"]] == ["provider[ZZRAIL].timetable(gtfs)"]
+    assert body["cascaded"] == [
+        {
+            "status": "skipped",
+            "key": "cascade",
+            "target_session": "zz-derived",
+            "error": _UNEXPECTED.format("TimeoutError"),
+        }
+    ]
+    record = _read()["providers"]
+    assert (record["state"], record["done"], record["error"]) == ("finished", 1, None)
+    with SessionLocal() as db:
+        audit = db.execute(
+            select(AuditEvent).where(AuditEvent.action == "session.sources.refreshed")
+        ).scalar_one()
+        session = db.get(SessionRow, SID)
+        assert session is not None
+        assert session.state == "populated"  # the refresh's own change was committed
+    assert audit.metadata_ is not None
+    assert audit.metadata_["cascaded"] == ["zz-derived:cascade"]
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
 def test_a_provider_card_refresh_survives_an_unexpected_task_error(
     client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
