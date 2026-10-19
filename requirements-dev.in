@@ -25,7 +25,7 @@ pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.16.10               # also our formatter — black was dropped in audit
+ruff==0.17.1               # also our formatter — black was dropped in audit
                             # #21 closure (drop-in replacement, eliminates
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
@@ -44,12 +44,12 @@ pip-audit==2.10.1
 # pre-commit-hooks replaced the remote hooks at v5.0.0. 6.0.0 removed only two hooks
 # VIATOR never used (check-byte-order-marker, fix-encoding-pragma) and left the seven
 # it runs as they were (tests/unit/test_dev_tool_pins_stay_in_step.py).
-pre-commit==4.6.2
+pre-commit==4.7.0
 pre-commit-hooks==6.0.0
 
 # The compiler of the lock files; CI runs it too, to check that each lock matches
 # its source (same version as the Multimodal Station Mapping module's lock files).
-uv==0.12.24
+uv==0.13.1
 
 # Stubs for mypy strict mode
 types-requests==2.33.0.20261006
