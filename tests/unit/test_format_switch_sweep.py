@@ -294,8 +294,9 @@ def test_a_refused_save_renames_nothing(
     monkeypatch.setattr(settings, "inbox_dir", tmp_path)
     row = _row(_config(("ZZ-A", "netex_epip")))
     db = _Db(row)
+    answer = SimpleNamespace(headers={})
     with pytest.raises(HTTPException) as refused:
-        api.patch_session(SID, body, REQUEST, SimpleNamespace(headers={}), db, ACTOR)  # type: ignore[arg-type]
+        api.patch_session(SID, body, REQUEST, answer, db, ACTOR)  # type: ignore[arg-type]
     assert refused.value.status_code == 400
     assert not db.committed
     assert _names(root) == set(files)
