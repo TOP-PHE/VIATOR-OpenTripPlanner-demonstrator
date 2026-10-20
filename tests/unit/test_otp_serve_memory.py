@@ -355,7 +355,9 @@ const rows = %(rows)s.map(([sid, heap]) => {
 const document = {
   createElement: tag => new El(tag),
   querySelectorAll: sel => (sel.includes('"serve-memory"') ? rows : []),
+  addEventListener: (name, fn, opts) => { if (name === 'DOMContentLoaded' && opts.once) loaded.push(fn); },
 };
+const loaded = [];
 const console = {warn: () => {}, log: (...a) => process.stdout.write(a.join(' ') + '\\n')};
 const calls = [];
 async function fetch(url) {
@@ -365,6 +367,7 @@ async function fetch(url) {
   return {ok: a.status === 200, json: async () => a.body};
 }
 %(block)s
+loaded.forEach(fn => fn());
 setTimeout(() => console.log(JSON.stringify({
   calls,
   rows: rows.map(r => ({text: r.use.textContent,

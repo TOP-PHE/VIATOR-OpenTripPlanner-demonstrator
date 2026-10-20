@@ -3557,7 +3557,9 @@ async function loadServeMemory() {
   rows.forEach(el => renderServeMemory(el, available, sessions[el.dataset.sid]));
 }
 
-loadServeMemory();
+// Once the rows are parsed (this inline script runs before DOMContentLoaded);
+// a classic script cannot use a top-level await.
+document.addEventListener('DOMContentLoaded', loadServeMemory, {once: true});
 // ── end serve memory
 
 // Click on backdrop closes the modal (but not clicks inside the card).
