@@ -1041,7 +1041,7 @@ space each session takes (graphs, feeds and OSM), and a list of what can be dele
 | Incomplete build | A build or MOTIS import that failed or was interrupted | Yes, never usable |
 | Previous build | An earlier complete build, not the one served | Yes; you lose that rollback point |
 | Rollback copy | `*.zip.old`, `osm.pbf.old.N`, the previous version of a feed or OSM file | Yes; recreated at the next refresh |
-| Orphaned feed | `*.orphaned`, the file of a provider removed from its session | Yes |
+| Orphaned feed | `*.orphaned`, the file of a provider removed from its session, or of a format it no longer uses (#381) | Yes |
 | Staging leftover | A `_staging/` file older than a day, from an interrupted refresh | Yes |
 | Deleted session | Folders of a session that no longer exists | Yes |
 
@@ -2021,6 +2021,57 @@ What to do: read the ERROR line and the lines just before it (a `QueuePool
 limit` means the pool was full again: look for what else was asking), then
 refresh that feed with its card's **Refresh**. The pool size was not
 changed.
+
+### 6.17 A provider's feed is read twice after a format switch (issue #381)
+
+Symptom (20 Oct): after a provider was switched from NeTEx to GTFS (or the
+reverse), the next build's input list showed `<id>.zip` twice, once under
+GTFS and once under NeTEx, for a single provider; the same trains can then
+appear twice.
+
+Cause: both formats name the file `<id>.zip`; only the folder differs
+(`gtfs/` or `netex/`). The orphan sweep compared the name only, so the file
+of the old format stayed, and every build reads both folders.
+
+Fix (the release after v0.1.44.33): the sweep compares the folder with the
+name. **A format switch now quarantines the old file**:
+
+- **Refresh providers** renames, at its end, every `*.zip` of `gtfs/` and
+  `netex/` that is not a current provider's file in its current format. It
+  reads the configuration stored at that moment, so a switch saved (and its
+  new file uploaded) while the refresh was downloading keeps its new file.
+- A **save of the session's configuration** that changes it renames, once
+  saved, the file bearing a provider's name in the other format's folder
+  (`netex/<id>.zip` for a GTFS provider, and the reverse). The renames are
+  recorded in a second audit row, `session.format_switch.quarantined`, after
+  the save's own `session.updated`. A refused save renames nothing.
+- The file becomes `<id>.zip.orphaned`; when that name is already taken by
+  an earlier orphan, `<id>.zip.<UTC time>.orphaned`, so nothing is ever
+  overwritten. Rename it back (drop the suffix) to undo. Admin → Storage
+  lists every form.
+- A removed provider's file still waits for the next refresh, as before. A
+  provider list that cannot be read now renames nothing (before, it renamed
+  every feed).
+- A **Cross-border filter (derived)** provider's file is always GTFS
+  (`gtfs/<id>.zip`), whatever format its card shows: the filter reads and
+  writes GTFS only. A save refuses another format for a new derived provider;
+  one saved before keeps working. When the national provider it reads moves
+  to NeTEx, its refresh says "source provider … is not GTFS"; its earlier
+  GTFS output stays in place until it is refreshed or removed.
+
+**After switching a provider's format, refresh that provider (its card's
+Refresh, or upload its file) before rebuilding.** A save fetches nothing: a
+build started in between runs without that provider. A save made while a
+build is running can rename a file that build is about to read; that build
+fails, and you run it again.
+
+What to do after the deploy: a stale `<id>.zip` left from before the release
+is quarantined by one **Refresh providers**, or by hand as issue #381 says
+(inside the container that holds the inbox:
+`mv /data/inbox/<sid>/netex/<id>.zip /data/inbox/<sid>/netex/<id>.zip.orphaned`).
+A save that changes the configuration also renames it, when the file bears a
+current provider's name in the other folder; a save that changes nothing, or
+a provider no longer in the session, leaves it. Then rebuild the session.
 
 ## 7. Rollback
 

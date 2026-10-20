@@ -752,6 +752,19 @@ fetch shared by many callers caches its in-flight promise and drops a failed one
 (`derivedSessions`, `loadCredentialList` in `admin/sessions.html`), and a read endpoint that builds
 large answers closes its session first (`list_sessions`).
 
+**A format switch left the old file in the inbox (20 Oct, issue #381, admin guide §6.17).** GTFS and
+NeTEx slots share the name `<id>.zip`; only the subdir differs, and every build (OTP entrypoint, MOTIS
+`worker._motis_timetable_files`, snapshot inputs) globs both `gtfs/*.zip` and `netex/*.zip`. The orphan
+sweep (`app/inbox_sweep.py`) therefore compares `(subdir, filename)` slots from
+`ingestion.provider_slot` — the subdir is `STAGE_INTO_OTP_INBOX[kind]`, the mapping `place` uses (never
+write a second format→folder table), and a derived (`cross_border_filter`) provider is always GTFS
+whatever it declares. The refresh sweeps **after `_relock_session`**, from the config re-read under that
+lock (never the one captured at its start, never a lazy `s.config` after a rollback). A config save
+(`patch_session`, row locked `with_for_update`) plans its renames before the commit and renames only
+**after** it (`plan_save_quarantine` / `apply_save_quarantine`, then a `session.format_switch.quarantined`
+audit row). An unreadable provider list (`None`) renames nothing; an empty one means every file is an
+orphan; a taken `.orphaned` name gets a UTC time stamp, never overwritten.
+
 **Two front-end traps no test and no code review will catch** — both found only in a real browser:
 
 - **A valid lat/lon refused when promoting a station to a hub**, with a NATIVE browser bubble (not

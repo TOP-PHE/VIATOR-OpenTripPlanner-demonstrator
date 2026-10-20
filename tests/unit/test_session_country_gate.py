@@ -118,7 +118,7 @@ class _Db:
     def __init__(self, row: Any) -> None:
         self.row = row
 
-    def get(self, *_args: Any) -> Any:
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
         return self.row
 
     def __getattr__(self, name: str) -> Any:
@@ -404,7 +404,7 @@ def test_a_stored_country_still_gets_the_osm_warning(
 class _NoSession(_Db):
     """A database where the new session does not exist yet."""
 
-    def get(self, *_args: Any) -> Any:
+    def get(self, *_args: Any, **_kwargs: Any) -> Any:
         return None
 
 

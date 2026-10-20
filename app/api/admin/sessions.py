@@ -265,7 +265,10 @@ def patch_session(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> SessionResponse:
-    s = db.get(SessionRow, sid)
+    # Row lock until the commit: two saves of one session run one after the
+    # other, so each save's quarantine plan (issue #381) sees the config the
+    # other one stored.
+    s = db.get(SessionRow, sid, with_for_update=True)
     if s is None:
         raise HTTPException(404, "Session not found")
 
@@ -375,6 +378,7 @@ def patch_session(
                 providers = ingestion.normalize_providers(body.config)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
+            _refuse_new_derived_formats(providers, s.config or {})
             # Country-gate: every provider that declares country_iso=X must
             # have at least one master_stations row with country_iso=X, or X
             # must be a country the station module serves (D-R12 B; asked
@@ -427,6 +431,8 @@ def patch_session(
         changes["state"] = {"from": s.state, "to": body.state}
         s.state = body.state
 
+    # Every check passed: plan the quarantine now, rename after the commit.
+    plan = _save_quarantine_plan(changes)
     if changes:
         audit.record(
             db,
@@ -438,10 +444,82 @@ def patch_session(
             metadata={"changes": changes},
         )
     db.commit()
+    if plan is not None:
+        _quarantine_after_save(db, request, actor, sid, plan)
     if "config" in changes:
         # A provider removed from the session shows no station module status.
         station_extract_upload.forget_outcomes_except(sid, _provider_ids(s.config or {}))
     return SessionResponse.from_orm_session(s)
+
+
+def _refuse_new_derived_formats(providers: list[dict[str, Any]], stored: dict[str, Any]) -> None:
+    """400 when a save declares a derived (cross-border) provider in a format
+    other than GTFS: the filter writes GTFS only (issue #381). A derived
+    provider stored before with that same format is let through, so an
+    existing session stays savable; its file is GTFS all the same
+    (`ingestion.provider_slot`)."""
+    try:
+        before = {
+            (p["id"], (p.get("timetable") or {}).get("format"))
+            for p in ingestion.normalize_providers(stored)
+            if (p.get("timetable") or {}).get("source") == ingestion.DERIVED_SOURCE
+        }
+    except ValueError:
+        before = set()
+    for p in providers:
+        tt = p.get("timetable") or {}
+        fmt = tt.get("format")
+        if (
+            tt.get("source") == ingestion.DERIVED_SOURCE
+            and fmt != ingestion.DERIVED_TIMETABLE_FORMAT
+            and (p["id"], fmt) not in before
+        ):
+            raise HTTPException(
+                400,
+                f"provider {p['id']!r}: a cross-border filter (derived) provider is GTFS "
+                f"(the filter reads and writes GTFS only); set its format to gtfs, not {fmt!r}",
+            )
+
+
+def _save_quarantine_plan(changes: dict[str, dict[str, Any]]) -> inbox_sweep.SavePlan | None:
+    """The files a config save will quarantine (issue #381), from the two
+    configs the save compared (`changes`, never read again from the row);
+    None when the config did not change. Touches no file."""
+    config_change = changes.get("config")
+    if config_change is None:
+        return None
+    return inbox_sweep.plan_save_quarantine(config_change["from"] or {}, config_change["to"] or {})
+
+
+def _quarantine_after_save(
+    db: DbSession,
+    request: Request,
+    actor: CurrentUser,
+    sid: str,
+    plan: inbox_sweep.SavePlan,
+) -> None:
+    """After a save's commit: rename the planned other-format files (GTFS and
+    NeTEx share `<id>.zip`; the one in the other subdir would reach the next
+    build, which can start before any refresh) and record them in a
+    follow-up audit row, `session.format_switch.quarantined`. A failure to
+    record logs a WARNING; the files are right either way."""
+    orphaned = inbox_sweep.apply_save_quarantine(settings.inbox_dir / sid, plan)
+    if not orphaned:
+        return
+    try:
+        audit.record(
+            db,
+            action="session.format_switch.quarantined",
+            actor_user_id=actor.id,
+            actor_ip=client_ip(request),
+            target_kind="session",
+            target_id=sid,
+            metadata={"orphaned": orphaned},
+        )
+        db.commit()
+    except Exception as exc:  # the renames are done; only their audit row is lost
+        log.warning("session.quarantine_audit_failed type=%s", type(exc).__name__)
+        _rollback_quietly(db)
 
 
 def _provider_ids(config: dict[str, Any]) -> set[str] | None:
@@ -1132,6 +1210,25 @@ def _relock_session(db: DbSession, s: SessionRow) -> None:
     db.refresh(s, with_for_update=True)
 
 
+def _sweep_orphans(sid: str, s: SessionRow) -> list[str]:
+    """PR #33 — sweep orphaned inbox files left behind by providers that
+    used to be in `sources.providers` but no longer are. Without this,
+    removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
+    and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
+    — operator thinks they removed BrittanyFerries, build still fails
+    on BrittanyFerries' data. Surfaced 2026-05-11. A file of a format the
+    provider no longer uses (`netex/<id>.zip` once it is GTFS) is an
+    orphan too: the sweep compares the subdir with the name (issue #381).
+
+    Called right after `_relock_session`: the expected slots come from the
+    config stored now, re-read under the row lock, not the one captured when
+    the refresh began — a format switch saved (and its new file uploaded)
+    during the download keeps its new file, and a stale file the refresh
+    downloaded after that switch is quarantined."""
+    expected = inbox_sweep.expected_provider_filenames(s.config or {})
+    return inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
+
+
 def _mark_providers_refreshed(s: SessionRow, *, fetched: bool, unchanged: bool) -> None:
     """The session's state and staleness after a provider refresh."""
     if fetched and s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
@@ -1216,17 +1313,9 @@ async def refresh_sources(
         # remember the second one.
         cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
 
-        # PR #33 — sweep orphaned inbox files left behind by providers that
-        # used to be in `sources.providers` but no longer are. Without this,
-        # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
-        # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
-        # — operator thinks they removed BrittanyFerries, build still fails
-        # on BrittanyFerries' data. Surfaced 2026-05-11.
-        expected = inbox_sweep.expected_provider_filenames(config)
-        orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
-
         # Last, under the row lock until the commit (never held over the cascade).
         _relock_session(db, s)
+        orphaned = _sweep_orphans(sid, s)
         _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
         saved_config = s.config  # the commit below expires `s`
 
@@ -1620,18 +1709,12 @@ async def _filter_derived_provider(
     pid = provider["id"]
     df = tt.get("derived_from") or {}
     src_session, src_provider = df.get("session_id"), df.get("provider_id")
-    src_slot = (
-        settings.inbox_dir
-        / str(src_session)
-        / "gtfs"
-        / ingestion.gtfs_staged_filename(str(src_provider))
+    src_subdir, src_name = ingestion.staged_slot_for_format(
+        str(src_provider), ingestion.DERIVED_TIMETABLE_FORMAT
     )
+    src_slot = settings.inbox_dir / str(src_session) / src_subdir / src_name
     if not src_slot.exists():
-        return {
-            "status": "skipped",
-            "key": key,
-            "error": f"source feed not found: {src_session}/{src_provider} (refresh that session first)",
-        }
+        return {"status": "skipped", "key": key, "error": _missing_source_reason(db, df)}
     out_tmp = staging / f"{pid.lower()}-xb.zip"
     try:
         stats = await asyncio.to_thread(
@@ -1658,13 +1741,37 @@ async def _filter_derived_provider(
         await _dispatch_off_loop(
             db,
             out_tmp,
-            ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
+            ingestion.TIMETABLE_FORMAT_DETAILS[ingestion.DERIVED_TIMETABLE_FORMAT]["kind"],
             target_sid,
-            ingestion.gtfs_staged_filename(pid),
+            ingestion.provider_slot(provider)[1],
         )
     except _RebuildNotQueued as exc:
         outcome["reason"] = _rebuild_not_queued(db, key, exc)
     return outcome
+
+
+def _missing_source_reason(db: DbSession, derived_from: dict[str, Any]) -> str:
+    """Why a derived provider has no source feed: the source provider is
+    declared in another format than GTFS (the filter reads GTFS only; its
+    earlier file was quarantined at the switch, issue #381), or its GTFS
+    file is not there yet."""
+    src_session = str(derived_from.get("session_id"))
+    src_provider = str(derived_from.get("provider_id"))
+    row = db.get(SessionRow, src_session)
+    try:
+        providers = ingestion.normalize_providers((row.config if row else None) or {})
+    except ValueError:
+        providers = []
+    fmt = next(
+        (ingestion.provider_timetable_format(p) for p in providers if p["id"] == src_provider),
+        ingestion.DERIVED_TIMETABLE_FORMAT,
+    )
+    if fmt != ingestion.DERIVED_TIMETABLE_FORMAT:
+        return (
+            f"source provider {src_session}/{src_provider} is not GTFS (format {fmt}); "
+            "the cross-border filter reads GTFS only"
+        )
+    return f"source feed not found: {src_session}/{src_provider} (refresh that session first)"
 
 
 async def _run_derived_filters(
@@ -2968,7 +3075,8 @@ def get_providers_status(
         )
         status = _derive_provider_status(
             feed_id=p["id"],
-            timetable_format=fmt,
+            # The file's format: GTFS for a derived provider (issue #381).
+            timetable_format=ingestion.provider_timetable_format(p),
             inbox_root=inbox_root,
             latest_audit_meta=latest_meta,
             now=now,

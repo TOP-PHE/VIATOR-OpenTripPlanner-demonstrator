@@ -186,6 +186,41 @@ def staged_filename_for_format(feed_id: str, fmt: str) -> str:
     return f"{feed_id.lower()}.zip"
 
 
+def staged_slot_for_format(feed_id: str, fmt: str) -> tuple[str, str]:
+    """The `(subdir, filename)` slot a provider's timetable is placed in.
+
+    The subdir is the one `place` (called by `dispatch`) picks for the kind
+    the format is fetched as: `STAGE_INTO_OTP_INBOX[kind]`. GTFS and NeTEx
+    share the file name, so the pair, not the name alone, tells one slot
+    from the other (issue #381). ValueError for an unknown format.
+    """
+    filename = staged_filename_for_format(feed_id, fmt)
+    return STAGE_INTO_OTP_INBOX[TIMETABLE_FORMAT_DETAILS[fmt]["kind"]], filename
+
+
+# A derived (`cross_border_filter`) provider's file is always GTFS: the filter
+# reads a GTFS feed and writes GTFS (app/gtfs_cross_border_filter.py), whatever
+# format the provider declares. Saves refuse another format for a new derived
+# provider; configs stored before keep loading (issue #381).
+DERIVED_SOURCE = "cross_border_filter"
+DERIVED_TIMETABLE_FORMAT = "gtfs"
+
+
+def provider_timetable_format(provider: dict[str, Any]) -> str:
+    """The format of the file in a provider's slot: its declared format, or
+    GTFS for a derived provider (`DERIVED_TIMETABLE_FORMAT`)."""
+    tt = provider.get("timetable") or {}
+    if tt.get("source") == DERIVED_SOURCE:
+        return DERIVED_TIMETABLE_FORMAT
+    return str(tt.get("format") or "gtfs")
+
+
+def provider_slot(provider: dict[str, Any]) -> tuple[str, str]:
+    """The `(subdir, filename)` slot of a normalised provider's timetable.
+    ValueError for an unknown format."""
+    return staged_slot_for_format(provider["id"], provider_timetable_format(provider))
+
+
 # ──────────────────── Provider-bundle schema (v0.1.6) ────────────────────
 
 

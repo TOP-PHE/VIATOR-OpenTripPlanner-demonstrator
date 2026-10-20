@@ -37,7 +37,7 @@ class _FakeDb:
         self.row = row
         self.committed = False
 
-    def get(self, _model: object, sid: str) -> Any:
+    def get(self, _model: object, sid: str, **_kwargs: Any) -> Any:
         return self.row if sid == self.row.id else None
 
     def commit(self) -> None:

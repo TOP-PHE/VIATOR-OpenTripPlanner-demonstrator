@@ -53,7 +53,7 @@ def test_expected_filenames_for_v016_provider_list():
             ]
         }
     }
-    assert expected_provider_filenames(config) == {"sncf.zip", "renfe.zip"}
+    assert expected_provider_filenames(config) == {("gtfs", "sncf.zip"), ("gtfs", "renfe.zip")}
 
 
 def test_expected_filenames_empty_when_no_providers():
@@ -65,13 +65,13 @@ def test_expected_filenames_empty_when_no_providers():
     assert expected_provider_filenames({"sources": {"providers": []}}) == set()
 
 
-def test_expected_filenames_returns_empty_on_malformed_config():
+def test_expected_filenames_returns_none_on_malformed_config():
     """Defensive: a malformed provider list shouldn't crash the sweep —
-    we return empty so nothing gets renamed (rather than aggressively
+    we return None so nothing gets renamed (rather than aggressively
     quarantining everything because of one bad provider)."""
     # Missing required `id` field — normalize_providers raises ValueError
     config = {"sources": {"providers": [{"label": "Anonymous", "country_iso": "FR"}]}}
-    assert expected_provider_filenames(config) == set()
+    assert expected_provider_filenames(config) is None
 
 
 def test_expected_filenames_lowercases_feed_id():
@@ -90,7 +90,7 @@ def test_expected_filenames_lowercases_feed_id():
             ]
         }
     }
-    assert expected_provider_filenames(config) == {"eurostarinternat.zip"}
+    assert expected_provider_filenames(config) == {("gtfs", "eurostarinternat.zip")}
 
 
 # ────────────────────────── sweep_orphaned_provider_files ──────────────────────────
@@ -121,7 +121,7 @@ def test_sweep_renames_orphans_in_gtfs_subdir(tmp_path):
         tmp_path,
         gtfs_files=["sncf.zip", "eurostarinternat.zip", "brittanyferries.zip"],
     )
-    expected = {"sncf.zip", "eurostarinternat.zip"}
+    expected = {("gtfs", "sncf.zip"), ("gtfs", "eurostarinternat.zip")}
     events = sweep_orphaned_provider_files(inbox, expected)
 
     assert (inbox / "gtfs" / "sncf.zip").exists()
@@ -136,7 +136,7 @@ def test_sweep_is_no_op_when_no_orphans(tmp_path):
     does nothing and returns an empty events list — important so a clean
     refresh doesn't add noise to the audit log / API response."""
     inbox = _make_session_inbox(tmp_path, gtfs_files=["sncf.zip", "renfe.zip"])
-    events = sweep_orphaned_provider_files(inbox, {"sncf.zip", "renfe.zip"})
+    events = sweep_orphaned_provider_files(inbox, {("gtfs", "sncf.zip"), ("gtfs", "renfe.zip")})
 
     assert events == []
     assert (inbox / "gtfs" / "sncf.zip").exists()
@@ -149,7 +149,7 @@ def test_sweep_is_idempotent(tmp_path):
     the second run sees only the .orphaned file (which doesn't end in
     just `.zip`) and ignores it."""
     inbox = _make_session_inbox(tmp_path, gtfs_files=["sncf.zip", "brittanyferries.zip"])
-    expected = {"sncf.zip"}
+    expected = {("gtfs", "sncf.zip")}
 
     events_first = sweep_orphaned_provider_files(inbox, expected)
     events_second = sweep_orphaned_provider_files(inbox, expected)
@@ -177,7 +177,7 @@ def test_sweep_ignores_non_zip_files(tmp_path):
     # drop notes in there)
     (inbox / "gtfs" / "README.txt").write_text("notes")
 
-    events = sweep_orphaned_provider_files(inbox, {"sncf.zip"})
+    events = sweep_orphaned_provider_files(inbox, {("gtfs", "sncf.zip")})
 
     # Nothing should be renamed — only `<x>.zip` files are candidates
     assert events == []
@@ -195,24 +195,33 @@ def test_sweep_handles_netex_subdir_symmetrically(tmp_path):
     inbox = _make_session_inbox(
         tmp_path,
         gtfs_files=["sncf.zip"],
-        netex_files=["sncf.zip", "removed_netex_provider.zip"],
+        netex_files=["zznetex.zip", "removed_netex_provider.zip"],
     )
 
     events = sweep_orphaned_provider_files(
         inbox,
-        # Only SNCF in expected; the netex provider was removed
-        {"sncf.zip"},
+        # SNCF (GTFS) and ZZNETEX (NeTEx) expected; the other one was removed
+        {("gtfs", "sncf.zip"), ("netex", "zznetex.zip")},
     )
 
-    # gtfs/sncf.zip survives because it matches expected
     assert (inbox / "gtfs" / "sncf.zip").exists()
-    # netex/sncf.zip ALSO survives — same filename matches expected,
-    # regardless of which subdir it lives in (matches the entrypoint's
-    # scan logic exactly: filename equality, not subdir-qualified)
-    assert (inbox / "netex" / "sncf.zip").exists()
+    assert (inbox / "netex" / "zznetex.zip").exists()
     # netex/removed_netex_provider.zip gets quarantined
     assert (inbox / "netex" / "removed_netex_provider.zip.orphaned").exists()
     assert events == ["netex/removed_netex_provider.zip → removed_netex_provider.zip.orphaned"]
+
+
+def test_sweep_compares_the_subdir_with_the_name(tmp_path):
+    """Issue #381: GTFS and NeTEx share `<id>.zip`. A provider expected in
+    gtfs/ leaves its netex/ file of the same name an orphan (before, the
+    name alone matched and both files reached the build)."""
+    inbox = _make_session_inbox(tmp_path, gtfs_files=["sncf.zip"], netex_files=["sncf.zip"])
+
+    events = sweep_orphaned_provider_files(inbox, {("gtfs", "sncf.zip")})
+
+    assert (inbox / "gtfs" / "sncf.zip").exists()
+    assert (inbox / "netex" / "sncf.zip.orphaned").exists()
+    assert events == ["netex/sncf.zip → sncf.zip.orphaned"]
 
 
 def test_sweep_handles_missing_subdirs_gracefully(tmp_path):
