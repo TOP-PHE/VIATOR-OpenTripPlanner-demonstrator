@@ -118,6 +118,11 @@ services:
       OTP_SERVE_MEM_CAP: ${OTP_SERVE_MEM_CAP:-true}
       OTP_SERVE_MEM_HEADROOM_GB: ${OTP_SERVE_MEM_HEADROOM_GB:-6}
       MOTIS_SERVE_MEM_LIMIT: ${MOTIS_SERVE_MEM_LIMIT:-}
+      # Issue #384 — how the OTP serve JVMs give unused heap back to the host,
+      # also written into each otp-<sid> service: g1-uncommit (default) | zgc |
+      # legacy; the soft max heap is read by ZGC only. Admin guide §5.9.
+      OTP_SERVE_GC_MODE: ${OTP_SERVE_GC_MODE:-g1-uncommit}
+      OTP_SERVE_SOFT_MAX_HEAP: ${OTP_SERVE_SOFT_MAX_HEAP:-}
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}

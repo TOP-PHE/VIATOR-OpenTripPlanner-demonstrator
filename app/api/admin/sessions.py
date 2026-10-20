@@ -56,6 +56,7 @@ from ... import (
     ingestion,
     nap_source_map,
     refresh_progress,
+    serve_memory,
     sessions_orchestrator,
     staleness,
     station_builds,
@@ -171,6 +172,38 @@ def list_sessions(
     # check of app/api/credentials.py.
     db.close()
     return [SessionResponse.from_orm_session(s) for s in rows]
+
+
+class MeasuredServeMemory(BaseModel):
+    used_bytes: float
+    # Seconds since the container started; missing when cAdvisor gave none.
+    uptime_seconds: float | None = None
+
+
+class ServeMemoryResponse(BaseModel):
+    # False when Prometheus is not set or did not answer: the page then shows
+    # each OTP session's heap and cap only.
+    available: bool
+    # Keyed by session id: the OTP serve containers cAdvisor sees right now.
+    sessions: dict[str, MeasuredServeMemory] = Field(default_factory=dict)
+
+
+@router.get("/serve-memory", summary="Measured memory of the OTP serve containers")
+async def serve_memory_usage(
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> ServeMemoryResponse:
+    """What each OTP serve container uses now (issue #384), for the Sessions page.
+
+    Read from Prometheus (cAdvisor's working set, the "Container memory"
+    panel), cached a minute for the whole process: the page asks once per load.
+    """
+    measured = await serve_memory.measured_by_session()
+    if measured is None:
+        return ServeMemoryResponse(available=False)
+    return ServeMemoryResponse(
+        available=True,
+        sessions={sid: MeasuredServeMemory(**values) for sid, values in measured.items()},
+    )
 
 
 @router.post(

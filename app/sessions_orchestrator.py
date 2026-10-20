@@ -12,7 +12,9 @@ docker socket mounted) — see `app/worker.py`.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
@@ -61,6 +63,9 @@ _OTP_SVC_TEMPLATE = """  otp-{sid}:
       # entrypoint loads $OTP_GRAPH_DIR/current/graph.obj.
       OTP_GRAPH_DIR: /var/otp/graph/{sid}
       OTP_HEAP: "{heap}"
+      # Issue #384: how the serve JVM gives unused heap back (entrypoint.sh).
+      OTP_SERVE_GC_MODE: "{gc_mode}"
+      OTP_SERVE_SOFT_MAX_HEAP: "{soft_max_heap}"
     volumes:
       # Shared graphs volume — same one the worker writes to. The worker
       # creates per-session subdirs under /data/graphs/<sid>/<timestamp>/
@@ -182,6 +187,69 @@ _MOTIS_SVC_TEMPLATE = """  motis-{sid}:
 """
 
 
+# Issue #384 — the values docker/otp/entrypoint.sh accepts for OTP_SERVE_GC_MODE.
+OTP_SERVE_GC_MODES = ("g1-uncommit", "zgc", "legacy")
+DEFAULT_OTP_SERVE_GC_MODE = "g1-uncommit"
+_SOFT_MAX_HEAP_RE = re.compile(r"^\d+[gGmM]$")
+
+
+def otp_serve_gc_mode() -> str:
+    """OTP_SERVE_GC_MODE to render: the setting if known, else the default (logged).
+
+    The entrypoint falls back the same way; checking here too keeps a typo out
+    of the rendered compose file and puts the warning in web's log.
+    """
+    mode = (settings.otp_serve_gc_mode or "").strip().lower()
+    if mode in OTP_SERVE_GC_MODES:
+        return mode
+    log.warning(
+        "OTP_SERVE_GC_MODE=%r is unknown (expected %s); rendering %s",
+        settings.otp_serve_gc_mode,
+        " | ".join(OTP_SERVE_GC_MODES),
+        DEFAULT_OTP_SERVE_GC_MODE,
+    )
+    return DEFAULT_OTP_SERVE_GC_MODE
+
+
+def otp_serve_soft_max_heap() -> str:
+    """OTP_SERVE_SOFT_MAX_HEAP to render: a JVM size like '24g', or '' (malformed: logged).
+
+    Whether it is below a session's heap is the entrypoint's check, which
+    knows the heap it starts with and leaves the flag out otherwise.
+    """
+    value = (settings.otp_serve_soft_max_heap or "").strip()
+    if not value or _SOFT_MAX_HEAP_RE.match(value):
+        return value
+    log.warning("OTP_SERVE_SOFT_MAX_HEAP=%r ignored: expected an integer + g or m", value)
+    return ""
+
+
+def otp_serve_heap(config: dict[str, Any] | None) -> str:
+    """The -Xmx of a session's OTP serve container, as render_compose writes it.
+
+    Explicit operator choice from the session-edit form if set, otherwise a
+    default derived from the build heap (~1/3 of it, floored at 4g). This
+    prevents the silent-4g-default trap that surfaced on 2026-05-10: operator
+    picks 64g build heap, build succeeds, OTP serve container crash-loops at
+    the old hardcoded 4g default.
+    """
+    from . import otp_heap as _otp_heap
+
+    config = config or {}
+    return config.get("otp_heap") or _otp_heap.default_serve_heap_for_build(
+        config.get("otp_build_heap")
+    )
+
+
+def otp_serve_mem_limit(heap: str) -> str | None:
+    """The cap render_compose gives an OTP serve container with that heap, or None (no cap)."""
+    from . import otp_heap as _otp_heap
+
+    if not settings.otp_serve_mem_cap:
+        return None
+    return _otp_heap.serve_mem_limit_for_heap(heap, headroom_gb=settings.otp_serve_mem_headroom_gb)
+
+
 def _otp_memory_lines(heap: str) -> str:
     """`mem_limit` + `memswap_limit` lines of an OTP serve service (issue #374).
 
@@ -189,11 +257,9 @@ def _otp_memory_lines(heap: str) -> str:
     swap is off (memswap = mem). Empty when caps are switched off in `.env`
     (OTP_SERVE_MEM_CAP=false) or the heap is malformed.
     """
-    from . import otp_heap as _otp_heap
-
     if not settings.otp_serve_mem_cap:
         return ""
-    limit = _otp_heap.serve_mem_limit_for_heap(heap, headroom_gb=settings.otp_serve_mem_headroom_gb)
+    limit = otp_serve_mem_limit(heap)
     if limit is None:
         log.warning("OTP serve heap %r is malformed; that container gets no memory cap", heap)
     return memory_caps.compose_memory_lines(limit)
@@ -236,9 +302,11 @@ def render_compose(sessions: list[SessionRow]) -> str:
     service from the parallel template; everything else renders the
     legacy `otp-<sid>` block.
     """
-    from . import otp_heap as _otp_heap
     from . import otp_start_period as _otp_start_period
 
+    # Read once per render, so a bad value is logged once, not per session.
+    gc_mode = otp_serve_gc_mode()
+    soft_max_heap = otp_serve_soft_max_heap()
     parts: list[str] = []
     for s in sessions:
         if s.state != SessionState.SERVING.value:
@@ -260,21 +328,14 @@ def render_compose(sessions: list[SessionRow]) -> str:
                 )
             )
         else:
-            # Serve heap: explicit operator choice from the session-edit form
-            # if set, otherwise a sensible default derived from the build
-            # heap (~1/3 of build heap, floored at 4g). This prevents the
-            # silent-4g-default trap that surfaced on 2026-05-10 — operator
-            # picks 64g build heap, build succeeds, OTP serve container
-            # crash-loops at the old hardcoded 4g default. Audit follow-up
-            # to #14 Phase 2 (the rest of the observability + operations
-            # arc that closed in v0.1.32.21).
-            heap = (s.config or {}).get("otp_heap") or _otp_heap.default_serve_heap_for_build(
-                (s.config or {}).get("otp_build_heap")
-            )
+            # Serve heap: see otp_serve_heap (audit follow-up to #14 Phase 2).
+            heap = otp_serve_heap(s.config)
             parts.append(
                 _OTP_SVC_TEMPLATE.format(
                     sid=s.id,
                     heap=heap,
+                    gc_mode=gc_mode,
+                    soft_max_heap=soft_max_heap,
                     # Issue #374: cap derived from that heap, no swap.
                     memory=_otp_memory_lines(heap),
                     # Healthcheck start_period: explicit operator choice if set,
