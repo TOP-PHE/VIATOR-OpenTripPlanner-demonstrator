@@ -123,6 +123,10 @@ services:
       # legacy; the soft max heap is read by ZGC only. Admin guide §5.9.
       OTP_SERVE_GC_MODE: ${OTP_SERVE_GC_MODE:-g1-uncommit}
       OTP_SERVE_SOFT_MAX_HEAP: ${OTP_SERVE_SOFT_MAX_HEAP:-}
+      # Prometheus as web reaches it, for the peak memory shown on the Sessions
+      # page (#384). Unset = the in-network default; set empty = do not ask
+      # (hence `-`, not `:-`).
+      PROMETHEUS_URL: ${PROMETHEUS_URL-http://prometheus:9090/prometheus}
       # Phase-1 transitional — basic-auth upload UI on `/`. Optional.
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}

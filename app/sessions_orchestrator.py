@@ -214,7 +214,7 @@ def otp_serve_gc_mode() -> str:
 def otp_serve_soft_max_heap() -> str:
     """OTP_SERVE_SOFT_MAX_HEAP to render: a JVM size like '24g', or '' (malformed: logged).
 
-    Whether it is below a session's heap is the entrypoint's check, which
+    Whether it is not above a session's heap is the entrypoint's check, which
     knows the heap it starts with and leaves the flag out otherwise.
     """
     value = (settings.otp_serve_soft_max_heap or "").strip()

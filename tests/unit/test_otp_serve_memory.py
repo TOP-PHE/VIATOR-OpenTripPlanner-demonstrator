@@ -187,7 +187,7 @@ async def test_fetch_posts_both_queries_in_the_body() -> None:
     def answer(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         query = parse_qs(request.content.decode())["query"][0]
-        if query == serve_memory.USED_QUERY:
+        if query == serve_memory.PEAK_QUERY:
             return httpx.Response(
                 200, json=_vector({"otp-zz-one": 2.5 * 1024**3, "otp-zz-two": 99})
             )
@@ -196,8 +196,8 @@ async def test_fetch_posts_both_queries_in_the_body() -> None:
     measured = await serve_memory._fetch(httpx.MockTransport(answer))
 
     assert measured == {
-        "zz-one": {"used_bytes": 2.5 * 1024**3, "uptime_seconds": 90000.0},
-        "zz-two": {"used_bytes": 99.0},
+        "zz-one": {"peak_bytes": 2.5 * 1024**3, "uptime_seconds": 90000.0},
+        "zz-two": {"peak_bytes": 99.0},
     }
     assert [r.method for r in seen] == ["POST", "POST"]
     assert all(r.url.query == b"" for r in seen)
@@ -205,11 +205,24 @@ async def test_fetch_posts_both_queries_in_the_body() -> None:
 
 
 def test_queries_select_the_serve_containers_not_the_build() -> None:
-    for query in (serve_memory.USED_QUERY, serve_memory.UPTIME_QUERY):
+    for query in (serve_memory.PEAK_QUERY, serve_memory.UPTIME_QUERY):
         assert 'container_label_com_docker_compose_service=~"otp-.+"' in query
         assert 'container_label_com_docker_compose_service!="otp-build"' in query
-    assert "container_memory_working_set_bytes" in serve_memory.USED_QUERY
     assert "container_start_time_seconds" in serve_memory.UPTIME_QUERY
+
+
+def test_peak_query_is_the_running_containers_max_over_a_day() -> None:
+    service = (
+        'container_label_com_docker_compose_service=~"otp-.+",'
+        'container_label_com_docker_compose_service!="otp-build"'
+    )
+    working_set = f"container_memory_working_set_bytes{{{service}}}"
+    expected = (
+        "max by (container_label_com_docker_compose_service) "
+        f"(max_over_time({working_set}[1d]) and on (id) {working_set})"
+    )
+    peak_query = serve_memory.PEAK_QUERY
+    assert peak_query == expected
 
 
 @pytest.mark.parametrize(
@@ -220,6 +233,79 @@ def test_queries_select_the_serve_containers_not_the_build() -> None:
 def test_a_malformed_answer_is_refused(body: Any) -> None:
     with pytest.raises((ValueError, KeyError)):
         serve_memory._vector(body)
+
+
+@pytest.mark.parametrize(
+    "row",
+    ["zz", {"metric": "zz", "value": [1, "2"]}, {"metric": None}],
+    ids=["str", "metric-str", "metric-none"],
+)
+def test_an_unexpected_row_shape_is_refused(row: Any) -> None:
+    body = {"status": "success", "data": {"result": [row]}}
+    with pytest.raises(ValueError, match="unexpected shape"):
+        serve_memory._vector(body)
+
+
+def _real_fetch_with(
+    monkeypatch: pytest.MonkeyPatch, transport: httpx.AsyncBaseTransport
+) -> list[int]:
+    """Run the real _fetch through `transport`, counting the calls."""
+    real = serve_memory._fetch
+    calls: list[int] = []
+
+    async def fetch(transport_arg: Any = None) -> Any:
+        calls.append(1)
+        return await real(transport)
+
+    monkeypatch.setattr(serve_memory, "_fetch", fetch)
+    return calls
+
+
+async def test_a_malformed_reply_shape_is_a_cached_failure_not_a_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"status": "success", "data": {"result": [{"metric": "zz"}]}}
+        )
+
+    calls = _real_fetch_with(monkeypatch, httpx.MockTransport(answer))
+    assert await serve_memory.measured_by_session() is None
+    assert await serve_memory.measured_by_session() is None
+    assert len(calls) == 1
+
+
+async def test_a_stalled_prometheus_is_cut_off_and_cached(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def stall(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)  # a mock transport ignores the per-request timeout
+        return httpx.Response(200, json=_vector({"otp-zz-one": 1.0}))
+
+    calls = _real_fetch_with(monkeypatch, httpx.MockTransport(stall))
+    monkeypatch.setattr(serve_memory, "FETCH_LIMIT_SECONDS", 0.2)
+    started = asyncio.get_running_loop().time()
+    with caplog.at_level(logging.WARNING, logger="app.serve_memory"):
+        assert await serve_memory.measured_by_session() is None
+    assert asyncio.get_running_loop().time() - started < 2
+    assert await serve_memory.measured_by_session() is None
+    assert len(calls) == 1
+    assert "Prometheus not available (TimeoutError)" in caplog.text
+
+
+async def test_both_queries_run_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    in_flight: list[int] = []
+    most = [0]
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        in_flight.append(1)
+        most[0] = max(most[0], len(in_flight))
+        await asyncio.sleep(0.05)
+        in_flight.pop()
+        return httpx.Response(200, json=_vector({"otp-zz-one": 1.0}))
+
+    await serve_memory._fetch(httpx.MockTransport(slow))
+    assert most[0] == 2
 
 
 def _counting_fetch(monkeypatch: pytest.MonkeyPatch, result: Any) -> list[int]:
@@ -237,14 +323,14 @@ def _counting_fetch(monkeypatch: pytest.MonkeyPatch, result: Any) -> list[int]:
 
 
 async def test_answer_is_cached_for_a_minute(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _counting_fetch(monkeypatch, {"zz-one": {"used_bytes": 1.0}})
+    calls = _counting_fetch(monkeypatch, {"zz-one": {"peak_bytes": 1.0}})
     clock = [1000.0]
     monkeypatch.setattr(serve_memory.time, "monotonic", lambda: clock[0])
 
     first = await serve_memory.measured_by_session()
     clock[0] += serve_memory.CACHE_SECONDS - 1
     second = await serve_memory.measured_by_session()
-    assert first == second == {"zz-one": {"used_bytes": 1.0}}
+    assert first == second == {"zz-one": {"peak_bytes": 1.0}}
     assert len(calls) == 1
 
     clock[0] += 2
@@ -253,10 +339,10 @@ async def test_answer_is_cached_for_a_minute(monkeypatch: pytest.MonkeyPatch) ->
 
 
 async def test_concurrent_askers_share_one_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _counting_fetch(monkeypatch, {"zz-one": {"used_bytes": 1.0}})
+    calls = _counting_fetch(monkeypatch, {"zz-one": {"peak_bytes": 1.0}})
     answers = await asyncio.gather(*(serve_memory.measured_by_session() for _ in range(8)))
     assert len(calls) == 1
-    assert all(a == {"zz-one": {"used_bytes": 1.0}} for a in answers)
+    assert all(a == {"zz-one": {"peak_bytes": 1.0}} for a in answers)
 
 
 async def test_a_failure_is_cached_and_logged_without_the_url(
@@ -300,8 +386,8 @@ def test_endpoint_returns_the_measure(
 ) -> None:
     async def measured() -> dict[str, dict[str, float]]:
         return {
-            "zz-one": {"used_bytes": 99.0, "uptime_seconds": 9.0},
-            "zz-two": {"used_bytes": 1.0},
+            "zz-one": {"peak_bytes": 99.0, "uptime_seconds": 9.0},
+            "zz-two": {"peak_bytes": 1.0},
         }
 
     monkeypatch.setattr(serve_memory, "measured_by_session", measured)
@@ -310,8 +396,8 @@ def test_endpoint_returns_the_measure(
     assert answer.json() == {
         "available": True,
         "sessions": {
-            "zz-one": {"used_bytes": 99.0, "uptime_seconds": 9.0},
-            "zz-two": {"used_bytes": 1.0, "uptime_seconds": None},
+            "zz-one": {"peak_bytes": 99.0, "uptime_seconds": 9.0},
+            "zz-two": {"peak_bytes": 1.0, "uptime_seconds": None},
         },
     }
 
@@ -333,6 +419,19 @@ def test_endpoint_needs_a_platform_admin() -> None:
     from app.main import app
 
     assert TestClient(app).get("/api/sessions/serve-memory").status_code in (401, 403)
+
+
+def test_endpoint_refuses_a_content_manager() -> None:
+    from app.main import app
+    from app.security import CurrentUser, current_user_jwt
+
+    app.dependency_overrides[current_user_jwt] = lambda: CurrentUser(
+        id=None, username="zz-editor", role="content_manager"
+    )
+    try:
+        assert TestClient(app).get("/api/sessions/serve-memory").status_code == 403
+    finally:
+        app.dependency_overrides.pop(current_user_jwt, None)
 
 
 # ── the page's script ───────────────────────────────────────────────────────
@@ -397,20 +496,21 @@ def test_page_asks_once_for_all_rows_and_writes_the_use() -> None:
     body = {
         "available": True,
         "sessions": {
-            "zz-big": {"used_bytes": 2.5 * _GIB, "uptime_seconds": 90000},
-            "zz-fit": {"used_bytes": 5 * _GIB, "uptime_seconds": 90000},
-            "zz-new": {"used_bytes": 2.5 * _GIB, "uptime_seconds": 600},
+            "zz-big": {"peak_bytes": 2.5 * _GIB, "uptime_seconds": 90000},
+            "zz-fit": {"peak_bytes": 5 * _GIB, "uptime_seconds": 90000},
+            "zz-new": {"peak_bytes": 2.5 * _GIB, "uptime_seconds": 600},
         },
     }
     result = _page(_ROWS, {"status": 200, "body": body})
 
     assert result["calls"] == ["/api/sessions/serve-memory"]
     big, fit, new, gone = result["rows"]
-    assert big["text"] == " · uses 2.5 GiBheap > 4\u00d7 use"
+    assert big["text"] == " · peak 24h 2.5 GiBheap > 4\u00d7 peak"
     assert big["badges"][0][0] == "serve-memory-oversized"
-    assert "about twice the use" in big["badges"][0][1]
-    assert fit == {"text": " · uses 5.0 GiB", "badges": []}  # 8g is not more than 4 x 5 GiB
-    assert new == {"text": " · uses 2.5 GiB", "badges": []}  # not a day of serving yet
+    assert "about twice that peak" in big["badges"][0][1]
+    assert fit == {"text": " · peak 24h 5.0 GiB", "badges": []}  # 8g is not > 4 x 5 GiB
+    # Not a day of serving yet: the peak is since the start, and no badge.
+    assert new == {"text": " · peak since start 2.5 GiB", "badges": []}
     assert gone == {"text": " · use not measured", "badges": []}
 
 
@@ -419,14 +519,16 @@ def test_badge_needs_more_than_four_times_the_use() -> None:
     body = {
         "available": True,
         "sessions": {
-            "zz-fit": {"used_bytes": 2 * _GIB, **day},
-            "zz-mb": {"used_bytes": 3 * _GIB, **day},  # 8192m is 8 GiB, not 8192
-            "zz-mb-big": {"used_bytes": 1.5 * _GIB, **day},
+            "zz-fit": {"peak_bytes": 2 * _GIB, **day},
+            "zz-mb": {"peak_bytes": 3 * _GIB, **day},  # 8192m is 8 GiB, not 8192
+            "zz-mb-big": {"peak_bytes": 1.5 * _GIB, **day},
+            # 4 x 1.99 GiB = 7.96 GiB: below 8192 MiB (8 GiB), above 8192 MB (7.63 GiB).
+            "zz-mib": {"peak_bytes": 1.99 * _GIB, **day},
         },
     }
-    rows = [["zz-fit", "8g"], ["zz-mb", "8192m"], ["zz-mb-big", "8192m"]]
+    rows = [["zz-fit", "8g"], ["zz-mb", "8192m"], ["zz-mb-big", "8192m"], ["zz-mib", "8192m"]]
     result = _page(rows, {"status": 200, "body": body})
-    assert [len(r["badges"]) for r in result["rows"]] == [0, 0, 1]
+    assert [len(r["badges"]) for r in result["rows"]] == [0, 0, 1, 1]
 
 
 @pytest.mark.parametrize(

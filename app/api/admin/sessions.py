@@ -175,7 +175,9 @@ def list_sessions(
 
 
 class MeasuredServeMemory(BaseModel):
-    used_bytes: float
+    # Peak working set of the running container over the last day, or since
+    # it started when that is shorter (uptime_seconds says which).
+    peak_bytes: float
     # Seconds since the container started; missing when cAdvisor gave none.
     uptime_seconds: float | None = None
 
@@ -192,10 +194,11 @@ class ServeMemoryResponse(BaseModel):
 async def serve_memory_usage(
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> ServeMemoryResponse:
-    """What each OTP serve container uses now (issue #384), for the Sessions page.
+    """The peak use of each OTP serve container (issue #384), for the Sessions page.
 
     Read from Prometheus (cAdvisor's working set, the "Container memory"
-    panel), cached a minute for the whole process: the page asks once per load.
+    panel; its peak over a day or since the start), cached a minute for the
+    whole process: the page asks once per load.
     """
     measured = await serve_memory.measured_by_session()
     if measured is None:

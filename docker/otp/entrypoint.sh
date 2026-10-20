@@ -47,18 +47,38 @@ JVM_OPTS="-XX:+UseStringDeduplication -XX:MaxDirectMemorySize=2g -XX:+ExitOnOutO
 #     -XX:G1PeriodicGCInterval=300000: when no GC ran for 5 minutes, G1 starts
 #       a concurrent cycle (G1PeriodicGCInvokesConcurrent defaults to true);
 #       its Remark resizes and uncommits the heap. The default, 0, disables it.
-#     -XX:MinHeapFreeRatio=10 / -XX:MaxHeapFreeRatio=30 (defaults 40 / 70):
-#       after a GC, G1 shrinks the heap when more than 30 % of it is free.
+#     -XX:G1PeriodicGCSystemLoadThreshold=<CPUs seen by nproc>: the periodic
+#       cycle is skipped while the host's 1-minute load average is above the
+#       CPU count (a build or a coverage run keeps every core busy). Default 0
+#       (no check); left out when nproc gives nothing usable.
+#     -XX:MinHeapFreeRatio=10 / -XX:MaxHeapFreeRatio=50 (defaults 40 / 70):
+#       read only after a Full GC and at the Remark of a concurrent cycle,
+#       where G1 sizes the heap on the old generation (eden is not counted):
+#       it shrinks the heap above twice the old-generation use, and grows it
+#       below 1.11 times. Young GCs grow the heap by GC time (GCTimeRatio),
+#       not by these ratios. 50 rather than lower: a busy router's eden is
+#       large, and a tighter ratio would cut its heap at every marking cycle
+#       only for young GCs to grow it back.
 #   zgc — generational ZGC (the only ZGC mode since JDK 24). It uncommits on
-#     its own (ZUncommit on, ZUncommitDelay 300 s by default) and is the only
-#     collector of JDK 25 that reads OTP_SERVE_SOFT_MAX_HEAP.
+#     its own (ZUncommit on, ZUncommitDelay 300 s by default) and, of the
+#     collectors offered here, is the only one that reads
+#     OTP_SERVE_SOFT_MAX_HEAP (-XX:SoftMaxHeapSize).
 #   legacy — the flags before #384, exactly.
 # An unknown mode is logged and the default used: a typo never stops a router.
 # Sources: JDK 25 `java` man page; hotspot g1_globals.hpp, globals.hpp,
-# z_globals.hpp; JEP 346 (G1 periodic GC), JEP 474 / JEP 490 (ZGC).
+# z_globals.hpp, g1HeapSizingPolicy.cpp, g1ConcurrentMark.cpp; JEP 346 (G1 periodic GC), JEP 474 / JEP 490 (ZGC).
 SERVE_GC_MODE="${OTP_SERVE_GC_MODE:-g1-uncommit}"
 SERVE_SOFT_MAX_HEAP="${OTP_SERVE_SOFT_MAX_HEAP:-}"
-G1_UNCOMMIT_OPTS="-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"
+G1_UNCOMMIT_OPTS="-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=50"
+
+# -XX:G1PeriodicGCSystemLoadThreshold=<CPU count>, or nothing.
+_g1_load_threshold_opt() {
+    local cpus
+    cpus="$(nproc 2>/dev/null)" || return 0
+    if [[ "$cpus" =~ ^[1-9][0-9]*$ ]]; then
+        echo "-XX:G1PeriodicGCSystemLoadThreshold=$cpus"
+    fi
+}
 
 # Print a JVM size ("12g", "4096m", either case) in MB; fail on anything else.
 _size_mb() {
@@ -74,14 +94,14 @@ _size_mb() {
 }
 
 # -XX:SoftMaxHeapSize for ZGC, or nothing. The JVM refuses to start when the
-# soft limit is above -Xmx, so a value that is malformed or not below the heap
-# is logged and left out rather than passed on.
+# soft limit is above -Xmx, so a value that is malformed or above the heap is
+# logged and left out rather than passed on.
 _soft_max_opt() {
     local soft_mb heap_mb
     [ -n "$SERVE_SOFT_MAX_HEAP" ] || return 0
     if ! soft_mb="$(_size_mb "$SERVE_SOFT_MAX_HEAP")" || ! heap_mb="$(_size_mb "$HEAP")" \
-       || [ "$soft_mb" -le 0 ] || [ "$soft_mb" -ge "$heap_mb" ]; then
-        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP='$SERVE_SOFT_MAX_HEAP' ignored: it must be a size like 24g, below the heap ($HEAP)" >&2
+       || [ "$soft_mb" -le 0 ] || [ "$soft_mb" -gt "$heap_mb" ]; then
+        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP='$SERVE_SOFT_MAX_HEAP' ignored: it must be a size like 24g, not above the heap ($HEAP)" >&2
         return 0
     fi
     echo "-XX:SoftMaxHeapSize=$SERVE_SOFT_MAX_HEAP"
@@ -97,10 +117,10 @@ _serve_jvm_opts() {
             ;;
     esac
     if [ "$SERVE_GC_MODE" != zgc ] && [ -n "$SERVE_SOFT_MAX_HEAP" ]; then
-        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP ignored with OTP_SERVE_GC_MODE=$SERVE_GC_MODE: in JDK 25 only ZGC uses it" >&2
+        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP ignored with OTP_SERVE_GC_MODE=$SERVE_GC_MODE: of the collectors offered here, only ZGC uses it" >&2
     fi
     case "$SERVE_GC_MODE" in
-        g1-uncommit) SERVE_JVM_OPTS="$JVM_OPTS $G1_UNCOMMIT_OPTS" ;;
+        g1-uncommit) SERVE_JVM_OPTS="$JVM_OPTS $G1_UNCOMMIT_OPTS $(_g1_load_threshold_opt)" ;;
         zgc) SERVE_JVM_OPTS="-XX:+UseZGC $JVM_OPTS $(_soft_max_opt)" ;;
         legacy) SERVE_JVM_OPTS="$JVM_OPTS" ;;
     esac

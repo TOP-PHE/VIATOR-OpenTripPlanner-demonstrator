@@ -52,7 +52,7 @@
         <!-- Issue #384: serve heap and cap as rendered into the compose file;
              the measured use is added by the "Serve memory" script below. -->
         <div class="serve-memory" data-role="serve-memory" data-sid="{{ s.id }}" data-heap="{{ mem.heap }}"
-             title="OTP serve container: JVM heap (-Xmx), memory cap, and what it uses now (admin guide §5.9)">heap {{ mem.heap }} · cap {{ mem.cap or 'none' }}<span data-role="serve-memory-use"></span></div>
+             title="OTP serve container: JVM heap (-Xmx), memory cap, and its peak use over 24 h or since it started (admin guide §5.9)">heap {{ mem.heap }} · cap {{ mem.cap or 'none' }}<span data-role="serve-memory-use"></span></div>
         {%- endif %}</td>
       <td style="text-align: center">
         <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
@@ -3507,11 +3507,13 @@ document.querySelector('button[data-action="nap-confirm"]')?.addEventListener('c
 
 // ── Serve memory (issue #384)
 // Each serving OTP row shows its heap and cap (server-rendered); this adds
-// what the container uses now. ONE request per page load for all the rows,
+// the container's PEAK use over the last 24 h, or since it started when that
+// is shorter (a router that gives memory back is at its lowest when idle, so
+// a heap is sized on the peak). ONE request per page load for all the rows,
 // never one per row (the /api/sessions flood of #380); the server caches the
 // Prometheus answer a minute. No answer: the rows keep heap and cap only.
 const SERVE_MEMORY_DAY_SECONDS = 86400;
-const SERVE_MEMORY_OVERSIZED = 4;  // heap more than 4x the use after a day
+const SERVE_MEMORY_OVERSIZED = 4;  // heap more than 4x the 24 h peak
 
 function serveMemoryBytes(size) {
   const m = /^(\d+)([gGmM])$/.exec(size ?? '');
@@ -3521,9 +3523,13 @@ function serveMemoryBytes(size) {
 
 function serveMemoryOversized(heap, measured) {
   const heapBytes = serveMemoryBytes(heap);
-  return heapBytes !== null && measured.used_bytes > 0
-    && (measured.uptime_seconds ?? 0) >= SERVE_MEMORY_DAY_SECONDS
-    && heapBytes > SERVE_MEMORY_OVERSIZED * measured.used_bytes;
+  return heapBytes !== null && measured.peak_bytes > 0
+    && serveMemoryFullDay(measured)
+    && heapBytes > SERVE_MEMORY_OVERSIZED * measured.peak_bytes;
+}
+
+function serveMemoryFullDay(measured) {
+  return (measured.uptime_seconds ?? 0) >= SERVE_MEMORY_DAY_SECONDS;
 }
 
 function renderServeMemory(el, available, measured) {
@@ -3531,13 +3537,14 @@ function renderServeMemory(el, available, measured) {
   if (!use) return;
   if (!available) { use.textContent = ''; return; }
   if (!measured) { use.textContent = ' · use not measured'; return; }
-  use.textContent = ` · uses ${(measured.used_bytes / 1024 ** 3).toFixed(1)} GiB`;
+  const span = serveMemoryFullDay(measured) ? 'peak 24h' : 'peak since start';
+  use.textContent = ` · ${span} ${(measured.peak_bytes / 1024 ** 3).toFixed(1)} GiB`;
   if (serveMemoryOversized(el.dataset.heap, measured)) {
     const badge = document.createElement('span');
     badge.className = 'serve-memory-oversized';
-    badge.textContent = 'heap > 4× use';
-    badge.title = 'After a day of serving, the heap is more than 4 times what the container uses: '
-      + 'a heap of about twice the use is enough (admin guide §5.9).';
+    badge.textContent = 'heap > 4× peak';
+    badge.title = 'The heap is more than 4 times the container\'s peak use over the last 24 h: '
+      + 'a heap of about twice that peak is enough (admin guide §5.9).';
     use.append(badge);
   }
 }

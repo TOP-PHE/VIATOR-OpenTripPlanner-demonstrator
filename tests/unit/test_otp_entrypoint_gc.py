@@ -5,7 +5,8 @@ that records its arguments; serve mode `exec`s it, build mode runs it once
 per phase. Checks:
 - serve: the exact command of each OTP_SERVE_GC_MODE, the fallback of an
   unknown mode (logged once, the router still starts), and the soft max heap
-  (ZGC only, below the heap, malformed or too large values left out);
+  (ZGC only, not above the heap, malformed or too large values left out);
+  the G1 periodic GC load threshold from the CPU count;
 - build: the command lines before #384, byte for byte, whatever the serve
   knobs say.
 """
@@ -23,7 +24,11 @@ ENTRYPOINT = Path(__file__).resolve().parents[2] / "docker" / "otp" / "entrypoin
 
 # The flags every otp.jar run had before #384 (and build runs still have).
 BASE = "-XX:+UseStringDeduplication -XX:MaxDirectMemorySize=2g -XX:+ExitOnOutOfMemoryError"
-G1_UNCOMMIT = "-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"
+# The stub nproc below says 18 CPUs: the periodic GC's load threshold.
+G1_UNCOMMIT = (
+    "-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=50"
+    " -XX:G1PeriodicGCSystemLoadThreshold=18"
+)
 
 _STUB_JAVA = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$JAVA_LOG"
@@ -47,7 +52,14 @@ def stub_bin(tmp_path: Path) -> Path:
     java = bin_dir / "java"
     java.write_text(_STUB_JAVA, encoding="utf-8")
     java.chmod(0o755)
+    _stub(bin_dir, "nproc", "echo 18")
     return bin_dir
+
+
+def _stub(bin_dir: Path, name: str, body: str) -> None:
+    tool = bin_dir / name
+    tool.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
+    tool.chmod(0o755)
 
 
 def _run(tmp_path: Path, stub_bin: Path, env: dict[str, str]) -> tuple[list[str], str]:
@@ -134,9 +146,18 @@ def test_unknown_mode_falls_back_to_the_default_and_says_so_once(
 
 @pytest.mark.parametrize(
     "heap,soft",
-    [("8g", "6g"), ("8192m", "6g"), ("9g", "08g"), ("8g", "7168M"), ("8G", "7g")],
+    [
+        ("8g", "6g"),
+        ("8192m", "6g"),
+        ("9g", "08g"),
+        ("8g", "7168M"),
+        ("8G", "7g"),
+        ("8g", "8g"),  # equal to -Xmx: the JVM accepts it
+        ("8g", "8100m"),  # base 2: 8g is 8192m, not 8000m
+        ("8192m", "8g"),
+    ],
 )
-def test_zgc_takes_a_soft_max_heap_below_the_heap(
+def test_zgc_takes_a_soft_max_heap_not_above_the_heap(
     tmp_path: Path, stub_bin: Path, graph: Path, heap: str, soft: str
 ) -> None:
     line, stderr = _serve(
@@ -150,7 +171,6 @@ def test_zgc_takes_a_soft_max_heap_below_the_heap(
 @pytest.mark.parametrize(
     "heap,soft",
     [
-        ("8g", "8g"),
         ("8g", "9g"),
         ("8g", "8193m"),
         ("8g", "0g"),
@@ -159,7 +179,7 @@ def test_zgc_takes_a_soft_max_heap_below_the_heap(
         ("8gb", "6g"),
     ],
 )
-def test_zgc_leaves_out_a_soft_max_heap_that_is_not_below_the_heap(
+def test_zgc_leaves_out_a_soft_max_heap_above_the_heap_or_malformed(
     tmp_path: Path, stub_bin: Path, graph: Path, heap: str, soft: str
 ) -> None:
     line, stderr = _serve(
@@ -196,6 +216,27 @@ def test_serve_log_line_names_the_mode(tmp_path: Path, stub_bin: Path, graph: Pa
         check=False,
     )
     assert "(heap=8g, gc=zgc)" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "nproc_body", ["exit 1", "echo 0", "echo zz"], ids=["fails", "zero", "garbage"]
+)
+def test_load_threshold_is_left_out_without_a_usable_cpu_count(
+    tmp_path: Path, stub_bin: Path, graph: Path, nproc_body: str
+) -> None:
+    _stub(stub_bin, "nproc", nproc_body)
+    line, stderr = _serve(tmp_path, stub_bin, graph)
+    flags = "-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=50"
+    assert line.split() == _serve_line("8g", f"{BASE} {flags}", graph).split()
+    assert "WARNING" not in stderr
+
+
+@pytest.mark.parametrize("mode", ["zgc", "legacy"])
+def test_load_threshold_is_g1_uncommit_only(
+    tmp_path: Path, stub_bin: Path, graph: Path, mode: str
+) -> None:
+    line, _ = _serve(tmp_path, stub_bin, graph, OTP_SERVE_GC_MODE=mode)
+    assert "G1Periodic" not in line
 
 
 # ── build: unchanged ────────────────────────────────────────────────────────

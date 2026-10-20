@@ -86,12 +86,12 @@ class Settings(BaseSettings):
     # rendered by web into each otp-<sid> service (docker/otp/entrypoint.sh
     # reads it): g1-uncommit (default), zgc or legacy. An unknown value is
     # logged and the default rendered. The soft max heap (e.g. "24g") is read
-    # by ZGC only and ignored, with a log line, where it is not below a
-    # session's heap. Both apply when compose next recreates the container.
+    # by ZGC only and ignored, with a log line, where it is above a session's
+    # heap. Both apply when compose next recreates the container.
     otp_serve_gc_mode: str = "g1-uncommit"
     otp_serve_soft_max_heap: str = ""
     # Prometheus as web reaches it on the compose network (no host port, no
-    # credentials), for the measured memory on the Sessions page (#384).
+    # credentials), for the peak memory on the Sessions page (#384).
     # Empty = do not ask; the page then shows each heap and cap only.
     prometheus_url: str = "http://prometheus:9090/prometheus"
     # MOTIS has no heap to derive a cap from (its memory follows the imported
