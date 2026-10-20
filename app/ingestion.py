@@ -186,6 +186,18 @@ def staged_filename_for_format(feed_id: str, fmt: str) -> str:
     return f"{feed_id.lower()}.zip"
 
 
+def staged_slot_for_format(feed_id: str, fmt: str) -> tuple[str, str]:
+    """The `(subdir, filename)` slot a provider's timetable is placed in.
+
+    The subdir is the one `place` (called by `dispatch`) picks for the kind
+    the format is fetched as: `STAGE_INTO_OTP_INBOX[kind]`. GTFS and NeTEx
+    share the file name, so the pair, not the name alone, tells one slot
+    from the other (issue #381). ValueError for an unknown format.
+    """
+    filename = staged_filename_for_format(feed_id, fmt)
+    return STAGE_INTO_OTP_INBOX[TIMETABLE_FORMAT_DETAILS[fmt]["kind"]], filename
+
+
 # ──────────────────── Provider-bundle schema (v0.1.6) ────────────────────
 
 

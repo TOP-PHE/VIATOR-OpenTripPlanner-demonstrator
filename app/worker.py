@@ -1508,18 +1508,9 @@ def run_build_motis(
 
     inbox_root = settings.inbox_dir / sid
     pbf = inbox_root / "osm" / "osm.pbf"
-    # MOTIS auto-detects timetable format by file content — its README
-    # explicitly lists GTFS + NeTEx as supported static timetables. VIATOR
-    # writes uploaded NeTEx zips to `inbox/<sid>/netex/` and GTFS zips to
-    # `inbox/<sid>/gtfs/` (the upload endpoint routes by Format field);
-    # we feed both directories into `motis config` and let MOTIS decide
-    # what each file is. Sorted independently then concatenated so the
-    # ordering across rebuilds stays deterministic.
     gtfs_dir = inbox_root / "gtfs"
     netex_dir = inbox_root / "netex"
-    timetable_files = (sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []) + (
-        sorted(netex_dir.glob("*.zip")) if netex_dir.is_dir() else []
-    )
+    timetable_files = _motis_timetable_files(inbox_root)
 
     if not pbf.exists():
         return f"ERROR: no osm.pbf at {pbf} — upload or refresh first", False, ""
@@ -1777,6 +1768,27 @@ def _discard_failed_build(build_dir: Path) -> None:
 
 _NETEX_CACHE_DIR = "_netex"
 _BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def _motis_timetable_files(inbox_root: Path) -> list[Path]:
+    """The timetable files a MOTIS build reads: every `*.zip` of the
+    session's `gtfs/` and `netex/` subdirs.
+
+    MOTIS auto-detects timetable format by file content — its README
+    explicitly lists GTFS + NeTEx as supported static timetables. VIATOR
+    places GTFS zips in `inbox/<sid>/gtfs/` and NeTEx zips in
+    `inbox/<sid>/netex/` (`ingestion.staged_slot_for_format`); we feed both
+    directories into `motis config` and let MOTIS decide what each file is.
+    Sorted independently then concatenated so the ordering across rebuilds
+    stays deterministic. A provider's file of a format it no longer uses is
+    renamed `*.zip.orphaned` at the save or refresh (`app/inbox_sweep.py`,
+    issue #381), so the glob never reads it.
+    """
+    gtfs_dir = inbox_root / "gtfs"
+    netex_dir = inbox_root / "netex"
+    return (sorted(gtfs_dir.glob("*.zip")) if gtfs_dir.is_dir() else []) + (
+        sorted(netex_dir.glob("*.zip")) if netex_dir.is_dir() else []
+    )
 
 
 def _motis_timetable_path(sid: str, f: Path, motis_root: Path, notes: list[str]) -> str:
