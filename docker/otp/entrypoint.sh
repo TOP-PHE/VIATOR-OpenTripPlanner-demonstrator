@@ -27,7 +27,7 @@ OSM_COUNTRIES="${OTP_OSM_COUNTRIES:-}"
 # 'one_shot' to fall back to the legacy single-JVM path (debugging only).
 BUILD_PHASES="${OTP_BUILD_PHASES:-two_phase}"
 
-# JVM flags applied to every otp.jar invocation:
+# JVM flags applied to every otp.jar invocation (serve adds its GC flags below):
 #   +UseStringDeduplication: 5-10% heap saving on duplicated OSM road names
 #   MaxDirectMemorySize=2g:  bounds NIO/Netty direct buffers — predictable
 #                            native footprint so `mem_limit` on the container
@@ -37,6 +37,74 @@ BUILD_PHASES="${OTP_BUILD_PHASES:-two_phase}"
 #                            multi-hour stop-the-world GC death spiral that
 #                            looks like the build is "stuck" with no logs.
 JVM_OPTS="-XX:+UseStringDeduplication -XX:MaxDirectMemorySize=2g -XX:+ExitOnOutOfMemoryError"
+
+# Serve mode only (issue #384): give unused heap back to the host. A serve JVM
+# lives for weeks; with the flags above alone, G1 keeps the heap it once
+# committed and the container's memory only grows toward -Xmx. Builds keep
+# JVM_OPTS exactly as they are: they are short and peak by nature.
+# OTP_SERVE_GC_MODE (rendered by web into each otp-<sid> service from .env):
+#   g1-uncommit (default) — G1, the JDK 25 default collector, plus
+#     -XX:G1PeriodicGCInterval=300000: when no GC ran for 5 minutes, G1 starts
+#       a concurrent cycle (G1PeriodicGCInvokesConcurrent defaults to true);
+#       its Remark resizes and uncommits the heap. The default, 0, disables it.
+#     -XX:MinHeapFreeRatio=10 / -XX:MaxHeapFreeRatio=30 (defaults 40 / 70):
+#       after a GC, G1 shrinks the heap when more than 30 % of it is free.
+#   zgc — generational ZGC (the only ZGC mode since JDK 24). It uncommits on
+#     its own (ZUncommit on, ZUncommitDelay 300 s by default) and is the only
+#     collector of JDK 25 that reads OTP_SERVE_SOFT_MAX_HEAP.
+#   legacy — the flags before #384, exactly.
+# An unknown mode is logged and the default used: a typo never stops a router.
+# Sources: JDK 25 `java` man page; hotspot g1_globals.hpp, globals.hpp,
+# z_globals.hpp; JEP 346 (G1 periodic GC), JEP 474 / JEP 490 (ZGC).
+SERVE_GC_MODE="${OTP_SERVE_GC_MODE:-g1-uncommit}"
+SERVE_SOFT_MAX_HEAP="${OTP_SERVE_SOFT_MAX_HEAP:-}"
+G1_UNCOMMIT_OPTS="-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"
+
+# Print a JVM size ("12g", "4096m", either case) in MB; fail on anything else.
+_size_mb() {
+    if [[ "$1" =~ ^([0-9]+)([gGmM])$ ]]; then
+        local qty=$((10#${BASH_REMATCH[1]}))
+        case "${BASH_REMATCH[2]}" in
+            g|G) echo $((qty * 1024)) ;;
+            *) echo "$qty" ;;
+        esac
+    else
+        return 1
+    fi
+}
+
+# -XX:SoftMaxHeapSize for ZGC, or nothing. The JVM refuses to start when the
+# soft limit is above -Xmx, so a value that is malformed or not below the heap
+# is logged and left out rather than passed on.
+_soft_max_opt() {
+    local soft_mb heap_mb
+    [ -n "$SERVE_SOFT_MAX_HEAP" ] || return 0
+    if ! soft_mb="$(_size_mb "$SERVE_SOFT_MAX_HEAP")" || ! heap_mb="$(_size_mb "$HEAP")" \
+       || [ "$soft_mb" -le 0 ] || [ "$soft_mb" -ge "$heap_mb" ]; then
+        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP='$SERVE_SOFT_MAX_HEAP' ignored: it must be a size like 24g, below the heap ($HEAP)" >&2
+        return 0
+    fi
+    echo "-XX:SoftMaxHeapSize=$SERVE_SOFT_MAX_HEAP"
+}
+
+# Set SERVE_JVM_OPTS from OTP_SERVE_GC_MODE.
+_serve_jvm_opts() {
+    case "$SERVE_GC_MODE" in
+        g1-uncommit|zgc|legacy) ;;
+        *)
+            echo "WARNING: unknown OTP_SERVE_GC_MODE='$SERVE_GC_MODE' (expected g1-uncommit | zgc | legacy); using g1-uncommit" >&2
+            SERVE_GC_MODE=g1-uncommit
+            ;;
+    esac
+    if [ "$SERVE_GC_MODE" != zgc ] && [ -n "$SERVE_SOFT_MAX_HEAP" ]; then
+        echo "WARNING: OTP_SERVE_SOFT_MAX_HEAP ignored with OTP_SERVE_GC_MODE=$SERVE_GC_MODE: in JDK 25 only ZGC uses it" >&2
+    fi
+    case "$SERVE_GC_MODE" in
+        g1-uncommit) SERVE_JVM_OPTS="$JVM_OPTS $G1_UNCOMMIT_OPTS" ;;
+        zgc) SERVE_JVM_OPTS="-XX:+UseZGC $JVM_OPTS $(_soft_max_opt)" ;;
+        legacy) SERVE_JVM_OPTS="$JVM_OPTS" ;;
+    esac
+}
 
 case "$MODE" in
     build)
@@ -362,9 +430,10 @@ JSON
             # Block instead of exiting so docker doesn't restart-loop.
             while [ ! -e "$GRAPH_DIR/current/graph.obj" ]; do sleep 30; done
         fi
-        echo "Serving graph from $GRAPH_DIR/current (heap=$HEAP) ..."
-        # shellcheck disable=SC2086
-        exec java -Xmx"$HEAP" $JVM_OPTS -jar /opt/otp/otp.jar --load --serve "$GRAPH_DIR/current"
+        _serve_jvm_opts
+        echo "Serving graph from $GRAPH_DIR/current (heap=$HEAP, gc=$SERVE_GC_MODE) ..."
+        # shellcheck disable=SC2086  # SERVE_JVM_OPTS is intentionally word-split
+        exec java -Xmx"$HEAP" $SERVE_JVM_OPTS -jar /opt/otp/otp.jar --load --serve "$GRAPH_DIR/current"
         ;;
 
     *)
