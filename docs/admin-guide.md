@@ -1041,7 +1041,7 @@ space each session takes (graphs, feeds and OSM), and a list of what can be dele
 | Incomplete build | A build or MOTIS import that failed or was interrupted | Yes, never usable |
 | Previous build | An earlier complete build, not the one served | Yes; you lose that rollback point |
 | Rollback copy | `*.zip.old`, `osm.pbf.old.N`, the previous version of a feed or OSM file | Yes; recreated at the next refresh |
-| Orphaned feed | `*.orphaned`, the file of a provider removed from its session | Yes |
+| Orphaned feed | `*.orphaned`, the file of a provider removed from its session, or of a format it no longer uses (#381) | Yes |
 | Staging leftover | A `_staging/` file older than a day, from an interrupted refresh | Yes |
 | Deleted session | Folders of a session that no longer exists | Yes |
 
@@ -2021,6 +2021,33 @@ What to do: read the ERROR line and the lines just before it (a `QueuePool
 limit` means the pool was full again: look for what else was asking), then
 refresh that feed with its card's **Refresh**. The pool size was not
 changed.
+
+### 6.17 A provider's feed is read twice after a format switch (issue #381)
+
+Symptom (20 Oct): after a provider was switched from NeTEx to GTFS (or the
+reverse), the next build's input list showed `<id>.zip` twice, once under
+GTFS and once under NeTEx, for a single provider; the same trains can then
+appear twice.
+
+Cause: both formats name the file `<id>.zip`; only the folder differs
+(`gtfs/` or `netex/`). The orphan sweep compared the name only, so the file
+of the old format stayed, and every build reads both folders.
+
+Fix (the release after v0.1.44.33): the sweep compares the folder with the
+name. **A format switch now quarantines the old file**: saving the session's
+configuration with the new format renames the old-format file to
+`<id>.zip.orphaned` at once (listed under `orphaned` in the save's audit
+row, `session.updated`), and every **Refresh providers** does the same at its
+end. The rename is lossless: rename the file back to undo it. A removed
+provider's file still waits for the next refresh, as before. A provider list
+that cannot be read now renames nothing (before, it renamed every feed).
+
+What to do after the deploy: a stale `<id>.zip` left from before the release
+is quarantined by one save of the session's configuration with a change, or
+one **Refresh providers**; or rename it by hand, as issue #381 says (inside
+the container that holds the inbox:
+`mv /data/inbox/<sid>/netex/<id>.zip /data/inbox/<sid>/netex/<id>.zip.orphaned`),
+then rebuild the session.
 
 ## 7. Rollback
 

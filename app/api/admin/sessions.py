@@ -435,13 +435,34 @@ def patch_session(
             actor_ip=client_ip(request),
             target_kind="session",
             target_id=sid,
-            metadata={"changes": changes},
+            metadata=_save_audit_metadata(sid, changes),
         )
     db.commit()
     if "config" in changes:
         # A provider removed from the session shows no station module status.
         station_extract_upload.forget_outcomes_except(sid, _provider_ids(s.config or {}))
     return SessionResponse.from_orm_session(s)
+
+
+def _save_audit_metadata(sid: str, changes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """The audit metadata of a session save, run once every check passed.
+
+    A save that moves a provider's timetable to another format quarantines
+    its old-format file now (issue #381): GTFS and NeTEx share the name
+    `<id>.zip`, and the file left in the other subdir would reach the next
+    build, which can start before any refresh. The renames are listed under
+    `orphaned`, as a refresh does. The configs are the ones the save
+    compared (`changes`), never read again from the row.
+    """
+    metadata: dict[str, Any] = {"changes": changes}
+    config_change = changes.get("config")
+    if config_change is not None:
+        orphaned = inbox_sweep.quarantine_format_switch(
+            settings.inbox_dir / sid, config_change["from"] or {}, config_change["to"] or {}
+        )
+        if orphaned:
+            metadata["orphaned"] = orphaned
+    return metadata
 
 
 def _provider_ids(config: dict[str, Any]) -> set[str] | None:
@@ -1221,7 +1242,9 @@ async def refresh_sources(
         # removing a provider via the UI leaves its `<id>.zip` in inbox/gtfs/
         # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
         # — operator thinks they removed BrittanyFerries, build still fails
-        # on BrittanyFerries' data. Surfaced 2026-05-11.
+        # on BrittanyFerries' data. Surfaced 2026-05-11. A file of a format the
+        # provider no longer uses (`netex/<id>.zip` once it is GTFS) is an
+        # orphan too: the sweep compares the subdir with the name (issue #381).
         expected = inbox_sweep.expected_provider_filenames(config)
         orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
 
