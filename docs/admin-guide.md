@@ -1243,7 +1243,9 @@ new cap only when compose **recreates** it (`docker restart` keeps the old limit
   recreate them from the previous file, the caps then arriving at the worker's next, unplanned
   reload. If web reports `boot_regenerate_failed` or the wait times out, the deploy stops (exit 5)
   before recreating anything; fix web, then `docker compose up -d`.
-- A changed setting later (headroom, a MOTIS cap) needs `docker compose up -d --force-recreate web`
+- The serve JVM's garbage-collector mode (`OTP_SERVE_GC_MODE`, §5.9) is written into the same
+  file and reaches each OTP router the same way: at once with a deploy.
+- A changed setting later (headroom, a MOTIS cap, the GC mode) needs `docker compose up -d --force-recreate web`
   (web reads `.env` and rewrites the file), then `docker compose up -d --no-deps <otp-|motis-><sid>`
   for each session, at a quiet moment.
 
@@ -1309,6 +1311,83 @@ show one line per container, including an OTP build while one runs. If `count by
 only the empty name, run `count by (id) (container_memory_working_set_bytes)`:
 `id="/system.slice/docker-<id>.scope"` rows mean cAdvisor sees the cgroups but not Docker; its log
 says why (the Docker socket or the containerd socket).
+
+### 5.9 OTP serve heaps: giving memory back, and sizing them (issue #384)
+
+**Why a JVM keeps memory.** `-Xmx` is a ceiling, not what the router needs. The garbage
+collector grows the heap it has *committed* (taken from the host) when it is busy, and with the
+flags VIATOR used before #384 G1 almost never gave it back: a serve container's memory only went
+up toward `-Xmx`. Measured on 2026-10-20: one idle router went from about 18 GiB to about 24 GiB in
+an evening; another used 2.5 GiB under a 53 GiB cap because its heap was set about 40g. The caps of
+§5.8 stop one router from taking the host, but over days the free RAM still shrank with no real
+need behind it, leaving less for MOTIS, builds and coverage runs.
+
+**What changed (serve containers only).** `docker/otp/entrypoint.sh` adds garbage-collector flags
+to the serve command, chosen by `OTP_SERVE_GC_MODE` in `docker/.env`. Graph builds keep their
+flags byte for byte: they are short and peak by nature.
+
+| `OTP_SERVE_GC_MODE` | Flags added to `-Xmx<heap> -XX:+UseStringDeduplication -XX:MaxDirectMemorySize=2g -XX:+ExitOnOutOfMemoryError` |
+|---|---|
+| `g1-uncommit` (default) | `-XX:G1PeriodicGCInterval=300000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30` |
+| `zgc` | `-XX:+UseZGC`, and `-XX:SoftMaxHeapSize=<OTP_SERVE_SOFT_MAX_HEAP>` when set and below the heap |
+| `legacy` | none: the command before #384, exactly |
+
+- **`g1-uncommit`.** G1 stays the collector (the JDK 25 default of the `eclipse-temurin:25-jre`
+  image). `G1PeriodicGCInterval=300000`: when no collection ran for 5 minutes, G1 starts one
+  (concurrent by default, `G1PeriodicGCInvokesConcurrent=true`; the default interval is 0, off) and
+  at its end resizes the heap and gives the freed regions back (JEP 346, JDK 12). The free ratios
+  (defaults 40 and 70 %): after a collection G1 shrinks the heap when more than 30 % of it is free,
+  and grows it when less than 10 % is. A busy router collects often anyway, so the periodic one only
+  runs when it is idle; the price is one concurrent cycle per idle 5 minutes.
+- **`zgc`.** Generational ZGC (generational by default since JDK 23, the only ZGC since JDK 24). It
+  gives memory back on its own: `ZUncommit` is on and `ZUncommitDelay` is 300 s by default. It also
+  reads `OTP_SERVE_SOFT_MAX_HEAP` (`-XX:SoftMaxHeapSize`): the collector then aims to stay below it
+  but may still grow up to `-Xmx` under a burst. G1 does not read that flag in JDK 25, so it is
+  ignored, with a log line, in the other modes. ZGC is opt-in: it has not been measured with OTP
+  here. Its own structures (mark and remembered-set bitmaps, forwarding tables) grow with the heap
+  like G1's; the serve cap keeps `max(6 GB, heap/3)` above the heap for them, the 2 GB of direct
+  buffers, metaspace and threads, so the formula of §5.8 is unchanged. After switching, watch
+  *Capped containers — % of memory cap used* for a day; past 90 %, raise
+  `OTP_SERVE_MEM_HEADROOM_GB` or go back to `g1-uncommit`.
+- **Typos never stop a router.** An unknown mode is logged (in web's log at render time and in the
+  container's log at start: `WARNING: unknown OTP_SERVE_GC_MODE=…; using g1-uncommit`) and the default
+  used. A soft max heap that is malformed or not below a session's heap is left out with
+  `WARNING: OTP_SERVE_SOFT_MAX_HEAP='…' ignored`, since the JVM would refuse to start with it. The
+  container's first log line names the mode: `Serving graph from … (heap=40g, gc=g1-uncommit) ...`.
+- Sources: the JDK 25 `java` man page (`MaxHeapFreeRatio`, `MinHeapFreeRatio`, `ZUncommit`,
+  `ZUncommitDelay`), and the flag definitions and defaults in HotSpot's `g1_globals.hpp`,
+  `globals.hpp`, `gc_globals.hpp` and `z_globals.hpp` at tag `jdk-25+36`; JEP 346, JEP 474, JEP 490.
+
+**When it applies.** At the next recreation of each `otp-<sid>` container, which **every deploy
+does** (their image tag changes, §5.8), so the release that carries #384 applies it at once (each
+router reloads its graph: a few minutes without that session's journeys). A changed mode later:
+`docker compose up -d --force-recreate web`, then `docker compose up -d --no-deps otp-<sid>` per
+session, at a quiet moment. `docker restart` keeps the old environment.
+
+**Going back.** `OTP_SERVE_GC_MODE=legacy` in `docker/.env`, then recreate as above. The serve
+command is then exactly the one before #384.
+
+**Checking it works.** On *Container memory — by container*, an idle router's line should come down
+within minutes of a quiet period instead of only growing. The flags a container runs with
+(read-only): `docker exec viator-otp-<sid>-1 cat /proc/1/cmdline | tr '\0' ' '`.
+
+**Sizing a heap.** The Sessions page shows, under the state of each serving OTP session, its heap,
+its cap and what its container uses now (`heap 40g · cap 53g · uses 2.5 GiB`), read from Prometheus
+(cAdvisor's working set, the same figure as *Container memory*) once per page load and cached a
+minute for everyone. After a day of serving, a row whose heap is more than 4 times that use gets a
+`heap > 4× use` badge. If Prometheus does not answer, the rows show heap and cap only; compare
+with the panel, or with this read-only query in `/prometheus/`:
+
+```
+max by (container_label_com_docker_compose_service) (container_memory_working_set_bytes{container_label_com_docker_compose_service=~"otp-.+"})
+```
+
+To choose a heap: let the router serve for a day (with `g1-uncommit` or `zgc`, so the figure is
+what it needs, not what it once took), read its use, and set the session's *OTP serve heap* to about
+**twice** that, never below **4 GB** (the floor of the serve heap). Example: 2.5 GiB used → 5g or 6g
+instead of 40g; the cap follows the heap (6g → 12g). The new heap applies at the session's next
+*Promote to serving* (allowed again on a serving session; it rewrites the compose file and the
+worker recreates the container) or at the next deploy.
 
 ---
 
