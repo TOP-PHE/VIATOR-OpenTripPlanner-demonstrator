@@ -943,10 +943,12 @@ session visible to fanout.
 `sources_changed_at` (bumped only when the `sources` subtree actually changed — not on `osm_scope`
 edits or renames) versus `last_refresh_completed_at`. Stale ⇒ a UI warning, never a block; the
 Rebuild API's own input-presence check is the hard guard. `inbox_sweep` renames `<feed>.zip` files
-whose `(subdir, filename)` slot isn't one of the current providers' (`ingestion.staged_slot_for_format`,
-the mapping `dispatch` places with; GTFS and NeTEx share the name, #381) to `<feed>.zip.orphaned`; a
-config save that moves a provider to another format renames its old-format file at once
-(`quarantine_format_switch`, listed under `orphaned` in the `session.updated` audit row) — added after a removed
+whose `(subdir, filename)` slot isn't one of the current providers' (`ingestion.provider_slot`: the
+subdir `dispatch` places the format with, GTFS for a derived provider; GTFS and NeTEx share the name, #381)
+to `<feed>.zip.orphaned` (time-stamped when that name is taken). The refresh sweeps after its row relock,
+against the config stored then; a config save plans its renames before the commit
+(`plan_save_quarantine`: each current file name in the other subdir) and applies them after it, with a
+follow-up `session.format_switch.quarantined` audit row — added after a removed
 BrittanyFerries provider left its file behind and the build's `gtfs/*.zip` glob baked it in anyway
 (2026-05-11), failing on that feed's malformed `stop_desc`.
 

@@ -756,10 +756,14 @@ large answers closes its session first (`list_sessions`).
 NeTEx slots share the name `<id>.zip`; only the subdir differs, and every build (OTP entrypoint, MOTIS
 `worker._motis_timetable_files`, snapshot inputs) globs both `gtfs/*.zip` and `netex/*.zip`. The orphan
 sweep (`app/inbox_sweep.py`) therefore compares `(subdir, filename)` slots from
-`ingestion.staged_slot_for_format` — the subdir is `STAGE_INTO_OTP_INBOX[kind]`, the mapping `place`
-uses; never write a second format→folder table. It runs at the refresh end and, for format switches
-only, at the config save (`quarantine_format_switch`, after every check, before the audit row). An
-unreadable provider list (`None`) renames nothing; an empty one means every file is an orphan.
+`ingestion.provider_slot` — the subdir is `STAGE_INTO_OTP_INBOX[kind]`, the mapping `place` uses (never
+write a second format→folder table), and a derived (`cross_border_filter`) provider is always GTFS
+whatever it declares. The refresh sweeps **after `_relock_session`**, from the config re-read under that
+lock (never the one captured at its start, never a lazy `s.config` after a rollback). A config save
+(`patch_session`, row locked `with_for_update`) plans its renames before the commit and renames only
+**after** it (`plan_save_quarantine` / `apply_save_quarantine`, then a `session.format_switch.quarantined`
+audit row). An unreadable provider list (`None`) renames nothing; an empty one means every file is an
+orphan; a taken `.orphaned` name gets a UTC time stamp, never overwritten.
 
 **Two front-end traps no test and no code review will catch** — both found only in a real browser:
 

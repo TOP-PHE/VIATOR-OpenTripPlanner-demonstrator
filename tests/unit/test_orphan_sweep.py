@@ -65,7 +65,7 @@ def test_expected_filenames_empty_when_no_providers():
     assert expected_provider_filenames({"sources": {"providers": []}}) == set()
 
 
-def test_expected_filenames_returns_empty_on_malformed_config():
+def test_expected_filenames_returns_none_on_malformed_config():
     """Defensive: a malformed provider list shouldn't crash the sweep —
     we return None so nothing gets renamed (rather than aggressively
     quarantining everything because of one bad provider)."""
