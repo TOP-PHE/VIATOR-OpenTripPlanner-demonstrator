@@ -165,6 +165,11 @@ def list_sessions(
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> list[SessionResponse]:
     rows = db.execute(select(SessionRow).order_by(SessionRow.created_at)).scalars().all()
+    # Hand the pooled connection back before building the answers (every
+    # session's full config): the rows stay loaded, detached, and the page
+    # can ask for this list many times at once. Same pattern as the login
+    # check of app/api/credentials.py.
+    db.close()
     return [SessionResponse.from_orm_session(s) for s in rows]
 
 
@@ -1181,7 +1186,11 @@ async def refresh_sources(
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
-    sources: dict[str, Any] = (s.config or {}).get("sources", {})
+    # Read once: a task's unexpected error rolls the session back, which
+    # expires `s`, and reading it again would need a pooled connection
+    # outside any task's boundary (`_unexpected_skip`).
+    config: dict[str, Any] = s.config or {}
+    sources: dict[str, Any] = config.get("sources", {})
     if not sources:
         raise HTTPException(400, "No sources configured. Set config.sources first.")
 
@@ -1191,14 +1200,12 @@ async def refresh_sources(
     # v0.1.14: providers-only by default. OSM PBF lives behind its own
     # endpoint so refreshing a GTFS feed doesn't accidentally bust the
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
-    work = _build_refresh_tasks(s.config or {}, include_osm=False)
+    work = _build_refresh_tasks(config, include_osm=False)
     # Issue #359: the progress record every page reads; 409 while one runs.
-    run = _claim_refresh(
-        sid, refresh_progress.PROVIDERS, len(work) + _derived_count(s.config or {})
-    )
+    run = _claim_refresh(sid, refresh_progress.PROVIDERS, len(work) + _derived_count(config))
     async with run:
         fetched, unchanged, skipped = await _gather_refresh_outcomes(
-            db, sid, staging, s.config or {}, work, run
+            db, sid, staging, config, work, run
         )
         run.phase(refresh_progress.FINISHING)
 
@@ -1215,12 +1222,13 @@ async def refresh_sources(
         # and the OTP entrypoint's `gtfs/*.zip` glob picks it up at build time
         # — operator thinks they removed BrittanyFerries, build still fails
         # on BrittanyFerries' data. Surfaced 2026-05-11.
-        expected = inbox_sweep.expected_provider_filenames(s.config or {})
+        expected = inbox_sweep.expected_provider_filenames(config)
         orphaned = inbox_sweep.sweep_orphaned_provider_files(settings.inbox_dir / sid, expected)
 
         # Last, under the row lock until the commit (never held over the cascade).
         _relock_session(db, s)
         _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
+        saved_config = s.config  # the commit below expires `s`
 
         audit.record(
             db,
@@ -1239,7 +1247,7 @@ async def refresh_sources(
             },
         )
         db.commit()
-    _queue_extracts(background, sid, s.config, bool(fetched or unchanged))
+    _queue_extracts(background, sid, saved_config, bool(fetched or unchanged))
     # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
     # the stop extracts the station module lacks are sent, by the process's
     # sender thread (the refresh never waits on the module).
@@ -1583,14 +1591,33 @@ async def _materialise_derived_provider(
     `cross_border_filter` provider. The CPU/IO filter and the copy into the slot
     run in a worker thread (they touch no DB); the rebuild is queued on the
     event loop (`_dispatch_off_loop`). See docs/provider-source-modes-design.md §12.
+    An unexpected exception (the copy, the rebuild queue's database) skips
+    this provider alone, like a download task (`_unexpected_skip`); a
+    cancellation still ends the refresh.
     """
-    from app import gtfs_cross_border_filter as xb
-
     tt = provider.get("timetable") or {}
     if tt.get("source") != "cross_border_filter":
         return None
+    key = f"provider[{provider['id']}].cross_border_filter"
+    try:
+        return await _filter_derived_provider(db, target_sid, provider, tt, staging, key)
+    except Exception as exc:  # one provider's surprise must not end the batch
+        return {"status": "skipped", "key": key, "error": _unexpected_skip(db, key, exc)}
+
+
+async def _filter_derived_provider(
+    db: DbSession,
+    target_sid: str,
+    provider: dict[str, Any],
+    tt: dict[str, Any],
+    staging: Path,
+    key: str,
+) -> dict[str, Any]:
+    """`_materialise_derived_provider`'s work, for a derived provider whose
+    timetable block is `tt` and whose outcome key is `key`."""
+    from app import gtfs_cross_border_filter as xb
+
     pid = provider["id"]
-    key = f"provider[{pid}].cross_border_filter"
     df = tt.get("derived_from") or {}
     src_session, src_provider = df.get("session_id"), df.get("provider_id")
     src_slot = (
@@ -1620,20 +1647,24 @@ async def _materialise_derived_provider(
         # (S5145). The full hint goes to the API response.
         log.warning("cross-border filter failed for a derived provider: %s", type(exc).__name__)
         return {"status": "skipped", "key": key, "error": f"filter failed: {exc}"}
-    await _dispatch_off_loop(
-        db,
-        out_tmp,
-        ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
-        target_sid,
-        ingestion.gtfs_staged_filename(pid),
-    )
-    return {
+    outcome: dict[str, Any] = {
         "status": "fetched",
         "key": key,
         "routes_kept": stats.routes_kept,
         "trips_kept": stats.trips_kept,
         "summary": stats.summary_line(),
     }
+    try:
+        await _dispatch_off_loop(
+            db,
+            out_tmp,
+            ingestion.TIMETABLE_FORMAT_DETAILS["gtfs"]["kind"],
+            target_sid,
+            ingestion.gtfs_staged_filename(pid),
+        )
+    except _RebuildNotQueued as exc:
+        outcome["reason"] = _rebuild_not_queued(db, key, exc)
+    return outcome
 
 
 async def _run_derived_filters(
@@ -1672,24 +1703,57 @@ async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> lis
     The single-source-of-truth cascade: when a national feed refreshes, the
     cross-border views derived from it rebuild automatically — no operator has
     to remember to refresh the second feed. See provider-source-modes-design.md §12.
+
+    The sessions are read once, as plain values, before the first filter:
+    an unexpected error in one target (`_unexpected_skip`) rolls the request's
+    session back and expires every row it loaded. Such an error, in the read
+    or in one target, skips that part only, never the refresh: its audit
+    entry and commit come after the cascade.
     """
+    try:
+        targets = [
+            (t.id, t.config or {})
+            for t in db.execute(select(SessionRow)).scalars().all()
+            if t.id != source_session_id
+        ]
+    except Exception as exc:  # the cascade is skipped, the refresh goes on
+        _unexpected_skip(db, "cascade", exc)
+        return []
     outcomes: list[dict[str, Any]] = []
-    for target in db.execute(select(SessionRow)).scalars().all():
-        if target.id == source_session_id:
-            continue
+    for target_id, config in targets:
         try:
-            providers = ingestion.normalize_providers(target.config or {})
-        except ValueError:
-            continue
-        linked = [p for p in providers if _is_derived_from(p, source_session_id)]
-        if not linked:
-            continue
-        staging = settings.inbox_dir / target.id / "_staging"
-        staging.mkdir(parents=True, exist_ok=True)
-        for p in linked:
-            outcome = await _materialise_derived_provider(db, target.id, p, staging)
-            if outcome is not None:
-                outcomes.append({**outcome, "target_session": target.id})
+            outcomes.extend(await _cascade_into(db, source_session_id, target_id, config))
+        except Exception as exc:  # this target is skipped, the others go on
+            outcomes.append(
+                {
+                    "status": "skipped",
+                    "key": "cascade",
+                    "target_session": target_id,
+                    "error": _unexpected_skip(db, "cascade", exc),
+                }
+            )
+    return outcomes
+
+
+async def _cascade_into(
+    db: DbSession, source_session_id: str, target_id: str, config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The cascade's outcomes for one target session (its configuration
+    `config`): each of its providers derived from `source_session_id`."""
+    try:
+        providers = ingestion.normalize_providers(config)
+    except ValueError:
+        return []
+    linked = [p for p in providers if _is_derived_from(p, source_session_id)]
+    if not linked:
+        return []
+    staging = settings.inbox_dir / target_id / "_staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    outcomes: list[dict[str, Any]] = []
+    for p in linked:
+        outcome = await _materialise_derived_provider(db, target_id, p, staging)
+        if outcome is not None:
+            outcomes.append({**outcome, "target_session": target_id})
     return outcomes
 
 
@@ -1744,8 +1808,29 @@ async def _dispatch_off_loop(
         copy.add_done_callback(functools.partial(_queue_after_cancelled_copy, sid=sid, kind=kind))
         raise
     if rebuild:
-        ingestion.queue_rebuild(db, session_id=sid, kind=kind)
+        try:
+            ingestion.queue_rebuild(db, session_id=sid, kind=kind)
+        except Exception as exc:
+            raise _RebuildNotQueued(type(exc).__name__) from exc
     return rebuild
+
+
+class _RebuildNotQueued(Exception):
+    """`_dispatch_off_loop` placed the file in its slot (and ran `after`),
+    then could not queue its rebuild; the argument is the type name of the
+    error. The file is stored: the next refresh finds it unchanged and
+    queues nothing, so the caller says a rebuild must be started by hand."""
+
+
+def _rebuild_not_queued(db: DbSession, label: str, exc: _RebuildNotQueued) -> str:
+    """The note of a stored file whose rebuild was not queued, after one
+    WARNING line (label and type) and a rollback of the request's session
+    (the rebuild queue's statement failed in it)."""
+    log.warning(
+        "refresh.rebuild_not_queued key=%s type=%s", refresh_progress.task_label(label), exc
+    )
+    _rollback_quietly(db)
+    return f"stored, but no rebuild was queued ({exc}); start a rebuild by hand"
 
 
 def _queue_after_cancelled_copy(copy: asyncio.Future[bool], *, sid: str, kind: str) -> None:
@@ -2068,11 +2153,44 @@ async def _refresh_one_task(
     the response — `status` is `fetched` (new file dispatched, rebuild
     queued), `unchanged` (upstream file identical to the one in the slot —
     nothing rotated, no rebuild) or `skipped` (failed; the slot keeps its
-    previous file). Per-task failures never abort the rest of the batch.
+    previous file). Per-task failures never abort the rest of the batch: an
+    unexpected exception (a database pool timeout, a bug) skips this task
+    alone (`_unexpected_skip`); a cancellation still ends the refresh.
     """
-    outcome = await _resolve_and_download(client, db, sid, staging, task)
+    try:
+        outcome = await _resolve_and_download(client, db, sid, staging, task)
+    except Exception as exc:  # one task's surprise must not end the batch
+        outcome = _skipped(task, task.url, _unexpected_skip(db, task.label, exc))
     _record_attempt(sid, task.label, outcome)
     return outcome
+
+
+def _unexpected_skip(db: DbSession, label: str, exc: Exception) -> str:
+    """The skip reason of a task (or a derived provider) that raised an
+    unexpected exception, after one ERROR line and a rollback of the
+    request's session. The reason and the log name the exception type only:
+    its text can quote a URL with its query string or a token. The rollback
+    leaves the session usable by the next task and by the refresh's own end
+    (row lock, audit, commit) whatever the failure left it in, such as a
+    PostgreSQL transaction aborted by a failed statement; a pool timeout
+    leaves nothing to roll back."""
+    kind = type(exc).__name__
+    log.error(
+        "refresh.task_failed_unexpectedly key=%s type=%s",
+        refresh_progress.task_label(label),
+        kind,
+    )
+    _rollback_quietly(db)
+    return f"unexpected error ({kind}); see the web log"
+
+
+def _rollback_quietly(db: DbSession) -> None:
+    """Roll the request's session back so its next statement can run; a
+    failed rollback logs its type (the next statement then says more)."""
+    try:
+        db.rollback()
+    except Exception as exc:  # best effort: the refresh goes on
+        log.warning("refresh.rollback_failed type=%s", type(exc).__name__)
 
 
 async def _resolve_and_download(
@@ -2156,12 +2274,17 @@ async def _download_task(
 
     # Stamp last_used_at on the credential so users can see "this hasn't
     # been used in months — maybe drop it." Best-effort.
+    # Committed at once: a later task's unexpected error rolls the session
+    # back (`_unexpected_skip`), which would discard a stamp only flushed.
     if cred is not None:
         try:
             cred.last_used_at = datetime.now(UTC)
-            db.flush()
+            db.commit()
         except Exception as exc:
-            log.warning("could not stamp last_used_at on credential %s: %s", cred.id, exc)
+            log.warning("refresh.credential_stamp_failed type=%s", type(exc).__name__)
+            # A failed commit leaves the session needing a rollback before
+            # the next task, or the refresh's end, can use it.
+            _rollback_quietly(db)
 
     if result.status == "unchanged":
         feed_fetch.save_state(state_dir, label, result.state)
@@ -2175,19 +2298,17 @@ async def _download_task(
 
     assert result.path is not None  # "fetched" always carries the format-checked file
     feed_fetch.report_step(feed_fetch.STEP_STORING)
-    try:
-        # The fetch state is saved by the copy's own job once the file is in
-        # the slot, so a request cancelled meanwhile still leaves them paired.
-        await _dispatch_off_loop(
-            db,
-            result.path,
-            kind,
-            sid,
-            task.staged_filename,
-            after=functools.partial(feed_fetch.save_state, state_dir, label, result.state),
-        )
-    except Exception as exc:  # the job removed the staged file
-        return _skip(f"dispatch failed: {exc}")
+    # The fetch state is saved by the copy's own job once the file is in
+    # the slot, so a request cancelled meanwhile still leaves them paired.
+    failed, note = await _store_fetched(
+        db,
+        task,
+        sid,
+        result.path,
+        functools.partial(feed_fetch.save_state, state_dir, label, result.state),
+    )
+    if failed is not None:
+        return _skip(failed)
 
     outcome: dict[str, Any] = {
         "status": "fetched",
@@ -2196,6 +2317,8 @@ async def _download_task(
         "url": url,
         "size_bytes": result.size_bytes,
     }
+    if note is not None:
+        outcome["reason"] = note
     if result.resumes:
         # A cut body was resumed on the way (app/feed_fetch.py); shown in the
         # feed status panel's "Last result".
@@ -2204,6 +2327,29 @@ async def _download_task(
     if assessment.get("level") in ("warn", "red"):
         outcome["structure"] = assessment
     return outcome
+
+
+async def _store_fetched(
+    db: DbSession, task: _RefreshTask, sid: str, path: Path, after: Callable[[], None]
+) -> tuple[str | None, str | None]:
+    """Copy a fetched, checked file into the task's slot and queue its
+    rebuild (`_dispatch_off_loop`). Returns (skip reason, note): a skip
+    reason when the file did not reach the slot (the job removed it), a note
+    when it did but its rebuild could not be queued. Both name the error's
+    type only (its text can hold a path or a query); the request's session
+    is rolled back after either."""
+    try:
+        await _dispatch_off_loop(db, path, task.kind, sid, task.staged_filename, after=after)
+    except _RebuildNotQueued as exc:
+        return None, _rebuild_not_queued(db, task.label, exc)
+    except Exception as exc:
+        kind = type(exc).__name__
+        log.warning(
+            "refresh.dispatch_failed key=%s type=%s", refresh_progress.task_label(task.label), kind
+        )
+        _rollback_quietly(db)
+        return f"dispatch failed ({kind}); see the web log", None
+    return None, None
 
 
 # ──── bulk import providers from a National Access Point (v0.1.8) ────

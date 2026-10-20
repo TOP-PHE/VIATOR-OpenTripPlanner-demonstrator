@@ -176,6 +176,12 @@ def _label(value: object) -> str:
     return value if isinstance(value, str) and _LABEL.fullmatch(value) else "task"
 
 
+def task_label(value: object) -> str:
+    """`_label` for the refresh code: a task label fit for the record and
+    for a log line (its expected shape, else the word "task")."""
+    return _label(value)
+
+
 def _word(value: object) -> str:
     return value if isinstance(value, str) and _WORD.fullmatch(value) else "other"
 

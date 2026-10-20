@@ -1336,6 +1336,172 @@ def test_a_refresh_that_raises_is_recorded_failed(
     assert _SECRET_MARK not in json.dumps(record)
 
 
+def _unexpected_in_authorize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The request's credential lookup (`_authorize`) breaks for two feeds,
+    as on the night the pool ran out: ZZPOOL's raises the pool's timeout,
+    ZZSQL's runs a failing statement in the request's own session first (the
+    PostgreSQL transaction is then aborted until a rollback)."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    from app.api.admin import sessions as sessions_api
+
+    real = sessions_api._authorize
+
+    async def breaking(client: Any, db: Any, credential_id: Any, url: str) -> Any:
+        if "/zzpool." in url:
+            raise PoolTimeout(f"QueuePool limit reached for {url}")
+        if "/zzsql." in url:
+            db.execute(text("SELECT 1 / 0"))
+        return await real(client, db, credential_id, url)
+
+    monkeypatch.setattr(sessions_api, "_authorize", breaking)
+
+
+_UNEXPECTED = "unexpected error ({}); see the web log"
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_an_unexpected_task_error_skips_that_task_and_the_refresh_finishes(
+    client: TestClient,
+    admin: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue of 19 Oct: one task's pool timeout ended the whole refresh
+    (1 done, the rest not reached). Now that task is skipped with a reason
+    naming the exception type only, the next ones run, and the refresh's end
+    (row lock, audit, commit) still works after a statement failed in the
+    request's session."""
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models import AuditEvent
+
+    _make_session(client, admin, ["ZZPOOL", "ZZONE", "ZZSQL"])
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+    _unexpected_in_authorize(monkeypatch)
+
+    r = client.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [f["key"] for f in body["fetched"]] == ["provider[ZZONE].timetable(gtfs)"]
+    assert [(s["key"], s["reason"]) for s in body["skipped"]] == [
+        ("provider[ZZPOOL].timetable(gtfs)", _UNEXPECTED.format("TimeoutError")),
+        ("provider[ZZSQL].timetable(gtfs)", _UNEXPECTED.format("DataError")),
+    ]
+    record = _read()["providers"]
+    assert record["state"] == "finished"
+    assert (record["done"], record["total"], record["not_reached"]) == (3, 3, 0)
+    assert (record["fetched"], record["failed"], record["error"]) == (1, 2, None)
+    with SessionLocal() as db:
+        audit = db.execute(
+            select(AuditEvent).where(AuditEvent.action == "session.sources.refreshed")
+        ).scalar_one()
+    assert audit.metadata_ is not None
+    assert audit.metadata_["skipped"] == [
+        "provider[ZZPOOL].timetable(gtfs)",
+        "provider[ZZSQL].timetable(gtfs)",
+    ]
+    errors = [rec.getMessage() for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors == [
+        "refresh.task_failed_unexpectedly key=provider[ZZPOOL].timetable(gtfs) type=TimeoutError",
+        "refresh.task_failed_unexpectedly key=provider[ZZSQL].timetable(gtfs) type=DataError",
+    ]
+    assert _SECRET_MARK not in caplog.text
+    assert _SECRET_MARK not in json.dumps(body["skipped"][0]["reason"])
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_an_unexpected_error_in_the_cascade_still_finishes_audits_and_commits(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cascade into the sessions derived from this one runs after the
+    downloads and before the audit entry and the commit: an error there
+    skips that target only."""
+    from sqlalchemy import select
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    from app.api.admin import sessions as sessions_api
+    from app.db import SessionLocal
+    from app.models import AuditEvent
+    from app.models import Session as SessionRow
+
+    _make_session(client, admin, ["ZZRAIL"])
+    r = client.post(
+        "/api/sessions",
+        headers=admin,
+        json={"id": "zz-derived", "name": "ZZ derived", "category": "NAP", "config": {}},
+    )
+    assert r.status_code == 201, r.text
+    with SessionLocal() as db:
+        derived = db.get(SessionRow, "zz-derived")
+        assert derived is not None
+        derived.config = {
+            "sources": {
+                "providers": [
+                    {
+                        "id": "ZZXB",
+                        "country_iso": "ZZ",
+                        "timetable": {
+                            "format": "gtfs",
+                            "source": "cross_border_filter",
+                            "derived_from": {"session_id": SID, "provider_id": "ZZRAIL"},
+                        },
+                    }
+                ]
+            }
+        }
+        db.commit()
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+
+    async def broken(*_a: Any, **_k: Any) -> Any:
+        raise PoolTimeout(f"QueuePool limit reached {_url('zz')}")
+
+    monkeypatch.setattr(sessions_api, "_cascade_into", broken)
+
+    r = client.post(f"/api/sessions/{SID}/sources/refresh", headers=admin)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [f["key"] for f in body["fetched"]] == ["provider[ZZRAIL].timetable(gtfs)"]
+    assert body["cascaded"] == [
+        {
+            "status": "skipped",
+            "key": "cascade",
+            "target_session": "zz-derived",
+            "error": _UNEXPECTED.format("TimeoutError"),
+        }
+    ]
+    record = _read()["providers"]
+    assert (record["state"], record["done"], record["error"]) == ("finished", 1, None)
+    with SessionLocal() as db:
+        audit = db.execute(
+            select(AuditEvent).where(AuditEvent.action == "session.sources.refreshed")
+        ).scalar_one()
+        session = db.get(SessionRow, SID)
+        assert session is not None
+        assert session.state == "populated"  # the refresh's own change was committed
+    assert audit.metadata_ is not None
+    assert audit.metadata_["cascaded"] == ["zz-derived:cascade"]
+
+
+@pytest.mark.usefixtures("inbox", "no_station_module")
+def test_a_provider_card_refresh_survives_an_unexpected_task_error(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_session(client, admin, ["ZZSQL"])
+    _mock_downloads(monkeypatch, lambda _r: httpx.Response(200, content=_gtfs_bytes()))
+    _unexpected_in_authorize(monkeypatch)
+
+    r = client.post(f"/api/sessions/{SID}/providers/ZZSQL/refresh", headers=admin)
+
+    assert r.status_code == 200, r.text
+    assert [s["reason"] for s in r.json()["skipped"]] == [_UNEXPECTED.format("DataError")]
+    single = _read()["single"]
+    assert [(x["state"], x["done"], x["failed"]) for x in single] == [("finished", 1, 1)]
+
+
 @pytest.mark.usefixtures("fresh_db")
 def test_a_cancelled_refresh_is_recorded_interrupted(
     client: TestClient, admin: dict[str, str]

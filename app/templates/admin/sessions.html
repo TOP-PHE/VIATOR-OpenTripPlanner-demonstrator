@@ -1018,14 +1018,29 @@ function timetableDefaultRailHTML(tt, ttSource) {
 // <select>s filled from the live session list (one cached fetch), so the link
 // can't be mistyped. The saved value is preserved even if it's no longer in the
 // list (renders as "<id> (not found)") so a bad/stale link is visible, not lost.
-let _derivedSessionsCache = null;
-async function derivedSessions() {
-  if (_derivedSessionsCache) return _derivedSessionsCache;
-  try {
-    const r = await fetch('/api/sessions');
-    _derivedSessionsCache = r.ok ? await r.json() : [];
-  } catch { _derivedSessionsCache = []; }
-  return _derivedSessionsCache;
+// The request itself is cached, not its answer: every card asking while the
+// list is on its way shares the one GET /api/sessions (each answer carries
+// every session's full config; one GET per card once exhausted the database
+// pool). A failed answer is not kept, so a later call asks again.
+let derivedSessionsPromise = null;
+function derivedSessions() {
+  derivedSessionsPromise ??= fetch('/api/sessions')
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .catch(err => {
+      console.warn('loading /api/sessions failed', err);
+      derivedSessionsPromise = null;
+      return [];
+    });
+  return derivedSessionsPromise;
+}
+
+// A saved configuration changes the list (providers of this session, the
+// links of the others): the next picker asks again.
+function forgetSessionList() {
+  derivedSessionsPromise = null;
 }
 
 function providersOfSession(session) {
@@ -1058,6 +1073,9 @@ async function populateDerivedCard(card) {
   const savedSession = sessSel.dataset.value || '';
   const savedProvider = provSel.dataset.value || '';
   const sessions = await derivedSessions();
+  // An empty list means it could not be loaded (it always holds this
+  // session): keep the saved link as drawn rather than mark it "(not found)".
+  if (!sessions.length) return;
   const items = sessions.map(s => ({
     value: s.id, label: (s.name && s.name !== s.id) ? `${s.id} — ${s.name}` : s.id,
   }));
@@ -1101,10 +1119,19 @@ function credentialOptionLabel(c) {
   return c.auth_type === 'oauth2_password' ? `${c.name} (login)` : `${c.name} (${c.auth_type})`;
 }
 
-async function loadCredentialList() {
+// One request shared by every picker, like `derivedSessions`; a failed
+// answer is not kept, so a later call asks again.
+function loadCredentialList() {
   credentialListPromise ??= fetch('/api/credentials')
-    .then(r => (r.ok ? r.json() : []))
-    .catch(err => { console.warn('loading /api/credentials failed', err); return []; });
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .catch(err => {
+      console.warn('loading /api/credentials failed', err);
+      credentialListPromise = null;
+      return [];
+    });
   return credentialListPromise;
 }
 
@@ -1454,9 +1481,12 @@ function populateProvidersList(form, sources) {
   );
   syncProvidersToolbar(form);
   syncSaveFirst(form);
-  // §12 — fill any derived-card session/provider dropdowns from the live list.
+  // §12 — fill the derived cards' session/provider dropdowns from the live
+  // list. Only the cards whose source is cross_border_filter: every card
+  // carries the (hidden) dropdowns, and the source toggle fills them on a
+  // later switch.
   rows.querySelectorAll('.provider-card').forEach((c) => {
-    if (c.querySelector('.prov-derived-session')) populateDerivedCard(c);
+    if (c.querySelector('.prov-tt-source')?.value === 'cross_border_filter') populateDerivedCard(c);
   });
   fillCredentialPickers(rows);
 }
@@ -2170,6 +2200,7 @@ async function applyNapSources(sid, btn) {
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { showToast('error', napErrorText(body, r.status)); return; }
+    forgetSessionList();
     napSyncSessionRow(sid, body.config);
     const skipped = (body.skipped || []).map(s => `${s.id} (${s.reason})`).join(', ');
     showToast('success', `Switched ${body.changed.length}: ${body.changed.join(', ') || 'none'}${skipped ? ' | skipped ' + skipped : ''}. Next: Refresh providers.`);
@@ -2547,6 +2578,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
     e.target.dataset.value = e.target.value;  // remember the new pick
     provSel.dataset.value = '';
     const sessions = await derivedSessions();
+    if (!sessions.length) return;  // list unavailable: leave the provider pick as it is
     fillDerivedProviderSelect(provSel, sessions.find(s => s.id === e.target.value), '');
   });
   // Live-update each provider card's summary as id/label/country change.
@@ -2638,6 +2670,7 @@ document.querySelectorAll('form[data-form="config"]').forEach(form => {
       return;
     }
     const updated = await r.json();
+    forgetSessionList();
     row.dataset.config = JSON.stringify(updated.config);
     markCardsSaved(form);
     // Refresh the staleness banner — saving a URL change should make it
@@ -3327,6 +3360,7 @@ async function napCall(preview, includeDatasetIds) {
     }
     throw new Error(out.detail || `Failed (${r.status})`);
   }
+  if (!preview) forgetSessionList();
   return out;
 }
 
