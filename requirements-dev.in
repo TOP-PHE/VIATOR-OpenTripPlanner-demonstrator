@@ -49,7 +49,7 @@ pre-commit-hooks==6.0.0
 
 # The compiler of the lock files; CI runs it too, to check that each lock matches
 # its source (same version as the Multimodal Station Mapping module's lock files).
-uv==0.13.1
+uv==0.13.4
 
 # Stubs for mypy strict mode
 types-requests==2.33.0.20261006

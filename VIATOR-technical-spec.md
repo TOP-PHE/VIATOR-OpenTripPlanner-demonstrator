@@ -2091,7 +2091,7 @@ Every Python package VIATOR installs comes from a hashed lock file. Each source 
 
 Every install is `pip install --require-hashes --only-binary :all: -r <lock>`: pip refuses a file whose hash is not in the lock and never builds a source archive (no package's build script runs). `tests/unit/test_hashed_lock_files.py` fails on any `pip install` in a workflow or Dockerfile that does otherwise.
 
-The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.12.24), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
+The locks are compiled by `uv pip compile`, at the uv version `requirements-dev.in` pins (0.13.4), installed by the dev lock (CI runs it as `python -m uv`, so a different uv found first on PATH is never used; do the same if your PATH holds another uv). One lock serves every platform it is installed on: CI (Linux x86-64), the web image (linux/amd64; `docker.yml` builds no other platform, the arm64 wheels' hashes are in the locks too) and a Windows workstation (15.2.2). Every pinned package has a wheel for CPython 3.14 on all three, so `--only-binary :all:` holds for every package, without exception. From the repository root:
 
 ```bash
 uv pip compile --universal --python-version 3.14 --generate-hashes --emit-build-options requirements.in -o requirements.txt
@@ -2419,7 +2419,7 @@ Python tool versions are the pins of `requirements-dev.in` (and `requirements.in
 | Container scan | Trivy (via aquasecurity/trivy-action) | v0.36.0 | `.trivyignore`, `ci/trivy-config-ignore.rego` |
 | Dockerfile lint | hadolint (via hadolint/hadolint-action) | v3.5.0 | `ignore:` list in `docker.yml` |
 | Pre-commit | pre-commit + pre-commit-hooks | 4.6.2 / 6.0.0 | `.pre-commit-config.yaml` |
-| Lock files | uv (`uv pip compile`) | 0.12.24 | the commands of 15.2.5; checked by `ci.yml` |
+| Lock files | uv (`uv pip compile`) | 0.13.4 | the commands of 15.2.5; checked by `ci.yml` |
 | Migrations | Alembic | 1.20.0 | `alembic.ini` + `alembic/env.py` |
 | Code quality (cloud) | SonarCloud | n/a | `sonar-project.properties` |
 | Type stubs | types-requests, types-passlib, types-defusedxml (SQLAlchemy 2.1 ships its own types; no `[mypy]` extra) | see `requirements-dev.in` | `requirements-dev.in` |
