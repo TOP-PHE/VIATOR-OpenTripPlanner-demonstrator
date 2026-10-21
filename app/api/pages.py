@@ -12,6 +12,7 @@ the JSON API's 401: an unauthenticated browser hitting `/admin/users` lands on
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
@@ -224,8 +225,25 @@ def admin_sessions_page(
             # A lasting notice per session that declares a country without a
             # station reference (computed at each load, nothing stored).
             "country_notices": country_gate.page_notices(db, [(s.id, s.config) for s in sessions]),
+            # Issue #384: each OTP serve session's heap and cap, as the
+            # compose render gives them; the page adds the measured use.
+            "serve_memory": _otp_serve_memory(sessions),
         },
     )
+
+
+def _otp_serve_memory(sessions: Sequence[SessionRow]) -> dict[str, dict[str, str | None]]:
+    """`{sid: {"heap": "40g", "cap": "53g" or None}}` for the serving OTP sessions."""
+    from .. import sessions_orchestrator
+    from ..models.sessions import SessionState
+
+    out: dict[str, dict[str, str | None]] = {}
+    for s in sessions:
+        if s.state != SessionState.SERVING.value or (s.engine or "otp") != "otp":
+            continue
+        heap = sessions_orchestrator.otp_serve_heap(s.config)
+        out[s.id] = {"heap": heap, "cap": sessions_orchestrator.otp_serve_mem_limit(heap)}
+    return out
 
 
 @router.get("/admin/reports", response_class=HTMLResponse)

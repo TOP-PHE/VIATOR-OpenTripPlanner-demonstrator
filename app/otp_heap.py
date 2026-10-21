@@ -256,6 +256,9 @@ def auto_build_heap(
 # MIN_SERVE_HEADROOM_GB. A cap that is too tight kills a router that worked;
 # a generous one still turns a runaway into a visible OOM kill instead of
 # hours of host swapping.
+# Issue #384: the serve JVM may run ZGC instead of G1 (OTP_SERVE_GC_MODE=zgc,
+# opt-in). Its own structures also grow with the heap and fit in the same
+# `heap // 3` headroom, so the formula does not depend on the mode.
 #   4g  -> 10g   (default serve heap, 6g headroom)
 #   12g -> 18g
 #   16g -> 22g

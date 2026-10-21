@@ -46,7 +46,14 @@
       <td data-role="session-name">{{ s.name }}{% if country_notices and country_notices.get(s.id) %} <span class="country-notice-flag" title="{{ country_notices[s.id] }}">⚠ country not served</span>{% endif %}</td>
       <td>{{ s.category }}</td>
       <td><span class="engine-badge engine-{{ s.engine or 'otp' }}">{{ (s.engine or 'otp') | upper }}</span></td>
-      <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span></td>
+      <td><span class="state-badge state-{{ s.state }}">{{ s.state }}</span>
+        {%- if serve_memory and serve_memory.get(s.id) %}
+        {%- set mem = serve_memory[s.id] %}
+        <!-- Issue #384: serve heap and cap as rendered into the compose file;
+             the measured use is added by the "Serve memory" script below. -->
+        <div class="serve-memory" data-role="serve-memory" data-sid="{{ s.id }}" data-heap="{{ mem.heap }}"
+             title="OTP serve container: JVM heap (-Xmx), memory cap, and its peak use over 24 h or since it started (admin guide §5.9)">heap {{ mem.heap }} · cap {{ mem.cap or 'none' }}<span data-role="serve-memory-use"></span></div>
+        {%- endif %}</td>
       <td style="text-align: center">
         <input type="checkbox" data-action="fanout" {% if s.include_in_fanout %}checked{% endif %} {% if s.state != 'serving' %}disabled title="Only serving sessions can be in fanout"{% endif %}>
       </td>
@@ -509,6 +516,8 @@
 <div id="toast" class="msg" style="position: fixed; right: 1rem; bottom: 1rem; min-width: 240px; max-width: 480px"></div>
 
 <style>
+  .serve-memory { margin-top: 0.25rem; font-size: 0.75rem; color: var(--rail-steel); white-space: nowrap; }
+  .serve-memory-oversized { margin-left: 0.3rem; padding: 0 4px; border-radius: 3px; background: #fff3cd; color: #6f5100; }
   .state-badge { display: inline-block; padding: 2px 8px; font-size: 0.75rem; border-radius: 3px; background: var(--rail-bg, #eef); }
   .state-serving      { background: #c8e6c9; color: #1b5e20; }
   .state-graph_built  { background: #fff9c4; color: #6f6000; }
@@ -3495,6 +3504,70 @@ document.querySelector('button[data-action="nap-confirm"]')?.addEventListener('c
     btn.disabled = false; btn.textContent = original;
   }
 });
+
+// ── Serve memory (issue #384)
+// Each serving OTP row shows its heap and cap (server-rendered); this adds
+// the container's PEAK use over the last 24 h, or since it started when that
+// is shorter (a router that gives memory back is at its lowest when idle, so
+// a heap is sized on the peak). ONE request per page load for all the rows,
+// never one per row (the /api/sessions flood of #380); the server caches the
+// Prometheus answer a minute. No answer: the rows keep heap and cap only.
+const SERVE_MEMORY_DAY_SECONDS = 86400;
+const SERVE_MEMORY_OVERSIZED = 4;  // heap more than 4x the 24 h peak
+
+function serveMemoryBytes(size) {
+  const m = /^(\d+)([gGmM])$/.exec(size ?? '');
+  if (!m) return null;
+  return Number(m[1]) * (m[2].toLowerCase() === 'g' ? 1024 ** 3 : 1024 ** 2);
+}
+
+function serveMemoryOversized(heap, measured) {
+  const heapBytes = serveMemoryBytes(heap);
+  return heapBytes !== null && measured.peak_bytes > 0
+    && serveMemoryFullDay(measured)
+    && heapBytes > SERVE_MEMORY_OVERSIZED * measured.peak_bytes;
+}
+
+function serveMemoryFullDay(measured) {
+  return (measured.uptime_seconds ?? 0) >= SERVE_MEMORY_DAY_SECONDS;
+}
+
+function renderServeMemory(el, available, measured) {
+  const use = el.querySelector('[data-role="serve-memory-use"]');
+  if (!use) return;
+  if (!available) { use.textContent = ''; return; }
+  if (!measured) { use.textContent = ' · use not measured'; return; }
+  const span = serveMemoryFullDay(measured) ? 'peak 24h' : 'peak since start';
+  use.textContent = ` · ${span} ${(measured.peak_bytes / 1024 ** 3).toFixed(1)} GiB`;
+  if (serveMemoryOversized(el.dataset.heap, measured)) {
+    const badge = document.createElement('span');
+    badge.className = 'serve-memory-oversized';
+    badge.textContent = 'heap > 4× peak';
+    badge.title = 'The heap is more than 4 times the container\'s peak use over the last 24 h: '
+      + 'a heap of about twice that peak is enough (admin guide §5.9).';
+    use.append(badge);
+  }
+}
+
+async function loadServeMemory() {
+  const rows = document.querySelectorAll('[data-role="serve-memory"]');
+  if (!rows.length) return;
+  let body = null;
+  try {
+    const r = await fetch('/api/sessions/serve-memory');
+    if (r.ok) body = await r.json();
+  } catch (err) {
+    console.warn('serve memory not available', err);  // the rows keep heap and cap
+  }
+  const available = body?.available === true;
+  const sessions = (available && body.sessions) || {};
+  rows.forEach(el => renderServeMemory(el, available, sessions[el.dataset.sid]));
+}
+
+// Once the rows are parsed (this inline script runs before DOMContentLoaded);
+// a classic script cannot use a top-level await.
+document.addEventListener('DOMContentLoaded', loadServeMemory, {once: true});
+// ── end serve memory
 
 // Click on backdrop closes the modal (but not clicks inside the card).
 document.getElementById('nap-modal')?.addEventListener('click', (e) => {
