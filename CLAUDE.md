@@ -7,7 +7,7 @@ Companion to: `README.md`, `VIATOR-strategy.md`, `VIATOR-technical-spec.md`, `do
 (module map, runtime topology, the three principal flows) and every chapter ends with *Invariants &
 traps*. This file is the operator's log: state, incidents and recipes. That one is the reference.
 
-Last updated: 2026-10-15 (refresh progress steps after a download: verifying, checking structure with its bytes, storing, time per task; the slot copy off the event loop; before it the refresh progress record and block, #359; before it 2026-10-14: stop extracts of large national archives: ratio guard, NeTEx skip filter, remembered failures, smallest feeds first). §2/§3/§5/§7
+Last updated: 2026-10-22 (#392: a coverage run makes no blocking call on the web's event loop; startup WARNING names the runs a web restart ended). Before it 2026-10-15 (refresh progress steps after a download: verifying, checking structure with its bytes, storing, time per task; the slot copy off the event loop; before it the refresh progress record and block, #359; before it 2026-10-14: stop extracts of large national archives: ratio guard, NeTEx skip filter, remembered failures, smallest feeds first). §2/§3/§5/§7
 curated through #245; #206–#227 triaged in the same pass.
 
 **Rule: no query string and no token path in logs or spans.** Any URL that reaches a log line or an
@@ -42,6 +42,7 @@ Operator-driven (no end-user surface). Multi-session: each MOTIS/OTP session = o
 |---|---|---|
 | Multi-MOTIS/OTP-session orchestrator | One docker container per session; sessions hot-swap on rebuild | `app/sessions_orchestrator.py` |
 | FastAPI BackgroundTask for coverage runs (in web container, NOT worker) | Simpler than queue; `worker` only does GTFS rebuilds | `app/api/admin/network_coverage.py` |
+| **A coverage run makes no blocking call on the web's event loop** (#392): every DB call of the runner goes through `runner._off_loop` (dedicated 2-thread executor `_DB_EXECUTOR`: phase 1, the DB cancel check `_run_stopped`, the recorder `_record_pair_journey_search`, the result row + counters, the fan-out merge, the terminal writes); the completion phase (recount + verify sweep, one shared ORM session) runs whole on a private loop in its own thread (`_run_on_private_loop`); `/healthz` and `/healthz/version` are `async def` constants (no request thread, never the DB) | The run shares web's loop with every request and the HEALTHCHECK (10 s timeout, 3 retries). The recorder makes 2–3 SELECTs per leg (trip signature: `stations_xref`, `route_aliases`), ~550 statements a pair, all on the loop: on 22 Oct health checks took 9–17 s mid-run, then an unrequested restart (origin under investigation in #392) ended a 3h40 run. Harness `tests/integration/test_coverage_web_health.py` (real runner, real Postgres, fake MOTIS): before, 30 590 statements on the loop and ~2 s worst health latency; after, none and ≤0.14 s. Results, order (recorder then result row), counters and cancel are unchanged. **Never call `SessionLocal()` or any blocking function from a coroutine in the runner**; the harness counts SQL on the loop thread and fails on one. A deploy or restart of web still ends a running run (the durable fix, coverage in the worker, is the open part of #392); at startup web logs WARNING `network_coverage.orphans_marked_failed` with the run ids and a hint | `runner.py` `_off_loop` / `_run_on_private_loop`, `main.py::_fail_orphaned_coverage_runs` — #392 |
 | Cooperative cancel = in-memory `asyncio.Event` + DB-status check | SQL UPDATE alone wasn't reaching the runner; PR-186 added DB check | `app/network_coverage/runner.py` |
 | K-slot time-slicing (K=6 default, 4h slots) | Apples-to-apples cross-engine + avoids per-pair timeout cliffs | PR-3 (#184); knobs in `CONFIG_SCHEMA` |
 | `platform_config` table for runtime tuning | Operator can tune 14 `COVERAGE_*` knobs without redeploy | `app/config_schema.py` + `/admin/config` UI |
@@ -590,6 +591,14 @@ docker compose -p viator kill motis-<sid> && docker compose -p viator up -d moti
 # 5. Verify calm
 docker logs viator-motis-<sid>-1 --tail 5 --since 30s  # should be empty
 ```
+
+**A coverage run ended `failed` with `summary.orphaned_by_restart = true`** (#392): web restarted while it
+ran. Since #392 the web log at the restart says which runs: `docker compose -p viator logs web | grep
+orphans_marked_failed` (run ids + hint). Then find who restarted web: `docker inspect viator-web-1` (`StartedAt`,
+`RestartCount` stays 0 for an API restart), the dockerd journal at that time (`stopping restart-manager`, `failed to
+exit within 10s`), `docker logs viator-autoheal-1`, and the web log's `healthz` lines just before (gaps over 30 s =
+slow checks). `failed to exit within 10s` is expected for ANY stop of web during a run, pair or completion phase (uvicorn waits
+for the background task until Docker's 10 s force-kill, same as before #392); it does not identify the sender. Start the run again; until coverage moves to the worker, a deploy also ends a running run.
 
 **Diagnosing "is this a MOTIS-health problem or a real routing gap?"** — curl MOTIS directly, bypassing the runner entirely:
 ```bash

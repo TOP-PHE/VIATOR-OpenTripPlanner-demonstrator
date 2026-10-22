@@ -820,6 +820,48 @@ The system rejects searches whose original `graph_snapshot.timetable_main_versio
 | Per-session timing strip | Below the trip list: "NAP responded in 312 ms with 5 trips · MERITS responded in 287 ms with 4 trips · 2 trips matched, 4 unique" |
 | Itinerary detail | Click a card → side-by-side panels showing the trip as each session reported it (legs, departures, arrivals); deltas highlighted |
 
+### 6.10 Network coverage runs — where they run, and the web's health (#392)
+
+A coverage run (`app/network_coverage/runner.py::execute_run`, the N×N matrix of
+`/admin/network-coverage`) is started by `POST /api/admin/network-coverage/runs` as a FastAPI
+background task **in the `web` process**, on the event loop that also answers every request and the
+image HEALTHCHECK (`GET /healthz/version`, interval 30 s, timeout 10 s, 3 retries).
+
+**Nothing of the run blocks that loop.** The engine calls are awaited I/O and stay on it. Every
+database call goes to a dedicated executor of two threads (`runner._off_loop`): phase 1 (run row to
+`running`, config, window, hubs), the DB cancel check (3 s cache answered on the loop, the SELECT in
+the executor), per pair the recorder (journey search, execution, trips, whose trip signatures make
+two to three SELECTs per leg) and then the result row with its counter increments, the fan-out merge,
+and the terminal writes (failed, cancelled). The calls of one pair are awaited one after the other,
+so their order is unchanged; a run holds at most two of the web's fifteen pooled connections. The
+completion phase (counter recount, optional ÖBB verify sweep, one commit) shares one ORM session
+across its cells, so it runs whole on a private event loop in its own thread
+(`runner._run_on_private_loop`). `/healthz` and `/healthz/version` are `async def` handlers returning
+constants: they need no request thread and never touch the database.
+
+Before #392 those calls ran on the loop: about 550 SQL statements a pair (trip signatures mostly).
+On 22 Oct, mid-run, health checks took 9–17 s against the 10 s timeout before web was restarted.
+The harness `tests/integration/test_coverage_web_health.py` (real runner, PostgreSQL 16, a fake MOTIS
+answering like the engine, 56 pairs, 6 in parallel, 2 slots at a time) measures it:
+
+| | SQL statements on the loop thread | worst `/healthz/version` latency | worst loop lag |
+|---|---|---|---|
+| before | 30 590 | 1.9–3.0 s | 1.1–2.8 s |
+| after | 0 | 20–140 ms | 10–135 ms |
+
+Results, counters, the order of the writes and the cancel paths (Stop button, status written by SQL)
+are the same; the harness and `tests/unit/test_coverage_off_loop.py` check them.
+
+**A web restart still ends a running run.** The task lives in the process: a deploy, a manual restart
+or any other restart of `web` kills it, and at the next start `mark_orphaned_runs_as_failed` marks it
+`failed` with `summary.orphaned_by_restart = true`; web then logs one WARNING
+`network_coverage.orphans_marked_failed` with the run ids and a hint (a deploy, an autoheal restart
+after failed health checks, or a manual restart). A stop of web during a run (SIGTERM), in the pair
+phase or in the completion phase, still ends in Docker's force-kill after its 10 s stop timeout, as
+before #392 (uvicorn waits for the background task): `Container failed to exit within 10s of signal 15`
+in the dockerd journal is expected then and does not by itself say who stopped web. Moving runs to the
+worker, with a heartbeat and resume, is the durable fix and remains open in #392.
+
 ---
 
 ## 7. Master data management
@@ -1779,11 +1821,11 @@ Master-data rows with `source='manual'` are **never** overwritten by the Trainli
 
 | Endpoint | What it reports |
 |---|---|
-| `GET /api/healthz` | Web liveness — returns `200 {"ok": true}` if the process is alive |
-| `GET /api/readyz` | Web + DB readiness — checks Postgres connectivity |
+| `GET /healthz` | Web liveness — returns `200 {"status": "ok"}` while the process answers. `async def` returning a constant; never touches the database (#392) |
+| `GET /healthz/version` | The deployed version (`{"version": …}`). The image HEALTHCHECK reads it (`curl`, 30 s / 10 s / 3 retries). `async def` returning a constant: answers while a coverage run is busy and while every request thread is taken (#392, §6.10) |
 | `GET /otp/<sid>/actuators/health` | Per-session OTP — `{"status":"UP"}` once graph loaded |
 
-External monitoring (UptimeRobot, Better Stack, etc.) should hit `readyz`, not `healthz` — readyz fails closed if the DB is down, healthz only fails if the process crashed.
+Neither web endpoint checks the database (there is no `readyz`): external monitoring (UptimeRobot, Better Stack, etc.) sees web's liveness only. Database health is visible in Prometheus and Grafana.
 
 #### 11.8.2 Logs
 
@@ -1828,6 +1870,7 @@ Scrape from a Prometheus running outside the VPS — don't run Prometheus on the
 | Symptom | Likely cause | First-response fix |
 |---|---|---|
 | `web` container restart-loops | Migration failure on startup | `docker compose logs web` — look for alembic error. If "table already exists" mismatch, manually run `alembic stamp head` and investigate. |
+| A coverage run ends `failed`, `summary.orphaned_by_restart = true` | `web` restarted during the run (deploy, autoheal after failed health checks, manual); the run lives in the web process (§6.10) | `docker compose logs web \| grep orphans_marked_failed` names the runs; find the restart in `docker inspect viator-web-1` (`StartedAt`) and the dockerd journal; start the run again. |
 | `otp-<sid>` restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, `docker compose up -d otp-<sid>`. Long-term: that session's graph has grown — consider splitting it. |
 | `otp-build` killed by OOM-killer (exit 137) | VPS RAM too small for that bundle | Either upgrade VPS, use a regional GTFS only, or temporarily raise swap (`fallocate -l 16G /swapfile && mkswap /swapfile && swapon /swapfile`). |
 | First request to OTP returns 503 | Graph not loaded yet | Wait for `Grizzly server running.` in `docker compose logs otp-<sid>`. Cold load takes 30–90 s for national. |

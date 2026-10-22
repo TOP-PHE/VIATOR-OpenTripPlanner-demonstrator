@@ -730,6 +730,14 @@ polylines stay out.
   kills every in-flight run with no DB cleanup. That is exactly why `main.py::_startup`
   calls `mark_orphaned_runs_as_failed` — anything `running`/`pending` at boot is orphaned
   by definition.
+- **The runner never blocks the web's event loop (#392).** It runs on the loop that answers
+  every request and the HEALTHCHECK, so every DB call goes through `runner._off_loop` (a
+  2-thread executor; the calls of one pair are awaited in order: recorder, then result row and
+  counters) and the completion phase runs on a private loop in its own thread
+  (`_run_on_private_loop`), because its verify sweep shares one ORM session. A `SessionLocal()`
+  in a coroutine of the runner is a regression: `tests/integration/test_coverage_web_health.py`
+  counts SQL statements on the loop thread and fails on one. `/healthz*` are `async def`
+  constants and must never touch the DB.
 - **`CoverageConfig` is frozen for the run's lifetime.** Editing a `COVERAGE_*` knob in
   `/admin/config` mid-run does nothing. This is deliberate — half-the-pairs-used-the-old-
   timeout makes post-mortems impossible.
