@@ -1662,17 +1662,36 @@ _CONNECT_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
     # class of transient session-bounce symptom (a restart landing mid-
     # request instead of before it), so it gets the same retry treatment.
     httpx.RemoteProtocolError,
+    # 2026-10-22 (#388) — eu19 run with 6 pairs in parallel: one pair failed
+    # with ConnectTimeout while MOTIS stayed up. A connect timeout means the
+    # request never reached the engine (its accept queue was briefly full,
+    # or it was busy for a moment), so like ConnectError it says nothing
+    # about the pair itself. httpx makes it a TimeoutException, not a
+    # ConnectError, so it must be named here on its own.
+    #
+    # Deliberately NOT retried, and why:
+    # - ReadTimeout: the engine accepted the request and is too slow to
+    #   answer it; that is the pair's own result and must report fast.
+    # - WriteTimeout: the engine accepted the connection but stopped
+    #   reading the request; retrying would only delay a broken pair.
+    # - PoolTimeout: the planner clients open a fresh AsyncClient for each
+    #   call (default pool, one request at a time), so the pool never makes
+    #   a call wait; if it ever did, it would be contention inside VIATOR,
+    #   not a sign of the engine's health.
+    httpx.ConnectTimeout,
 )
 
 
 async def _call_with_connect_retry[T](fetch: Callable[[], Awaitable[T]]) -> T:
-    """Retry `fetch()` on connection-level session-bounce errors only
-    (`_CONNECT_RETRY_EXCEPTIONS`), with growing backoff.
+    """Retry `fetch()` on connection-level errors only
+    (`_CONNECT_RETRY_EXCEPTIONS`: ConnectError, RemoteProtocolError,
+    ConnectTimeout), with growing backoff.
 
-    Every other exception (timeout, HTTP error, bad response shape, ...)
-    propagates on the first attempt — those aren't caused by a session
-    bounce and retrying wouldn't change the outcome, it would just make a
-    genuinely-broken pair take longer to report as such.
+    Every other exception (read, write or pool timeout, HTTP error, bad
+    response shape, ...) propagates on the first attempt — those aren't
+    caused by a session bounce or a full accept queue, and retrying
+    wouldn't change the outcome, it would just make a genuinely-broken
+    pair take longer to report as such.
     """
     for delay_s in _CONNECT_RETRY_DELAYS_S:
         try:

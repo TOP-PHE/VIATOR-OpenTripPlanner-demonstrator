@@ -4,12 +4,14 @@ Before this, a MOTIS/OTP session restarting mid-run (autoheal or
 otherwise) caused every pair scheduled during its 90-180s cold-boot
 window to fail *instantly* with `httpx.ConnectError` and get persisted
 as a wrong 'error' cell. `_call_with_connect_retry` retries on
-ConnectError only, with growing backoff, giving the session a real
-chance to come back before the pair is given up on.
+connection-level errors only (ConnectError, RemoteProtocolError and,
+since #388, ConnectTimeout), with growing backoff, giving the session a
+real chance to come back before the pair is given up on.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -127,6 +129,73 @@ async def test_does_not_retry_non_connect_errors(_no_real_sleep):
 
     assert attempts == 1
     assert _no_real_sleep == []
+
+
+@pytest.mark.parametrize(
+    "exc_type",
+    [httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout],
+    ids=["read-timeout", "write-timeout", "pool-timeout"],
+)
+@pytest.mark.asyncio
+async def test_does_not_retry_read_write_or_pool_timeouts(_no_real_sleep, exc_type):
+    """#388 — only the connect timeout joined the retried errors. A read
+    timeout is the pair's own answer (the engine took the request and is
+    too slow), a write timeout means the engine stopped reading, and a
+    pool timeout would be contention inside VIATOR: none is retried."""
+    attempts = 0
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        raise exc_type("zz")
+
+    with pytest.raises(exc_type):
+        await runner._call_with_connect_retry(_fetch)
+
+    assert attempts == 1
+    assert _no_real_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_backoff_sleep_propagates(monkeypatch):
+    """Cancelling a run while a pair waits in the backoff must stop the
+    pair at once: the retry must neither swallow the CancelledError nor
+    try the engine again. Its own `asyncio.sleep` stub replaces the
+    autouse one."""
+    attempts = 0
+    sleeping = asyncio.Event()
+    never = asyncio.Event()
+    delays: list[float] = []
+
+    async def _blocking_sleep(delay_s: float) -> None:
+        delays.append(delay_s)
+        sleeping.set()
+        await never.wait()
+
+    monkeypatch.setattr(runner.asyncio, "sleep", _blocking_sleep)
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout("zz")
+
+    task = asyncio.ensure_future(runner._call_with_connect_retry(_fetch))
+    # Bounded, like the wait below: if the ConnectTimeout were not retried
+    # the task would end without sleeping, and this test must fail, not hang.
+    await asyncio.wait_for(sleeping.wait(), timeout=5)
+    task.cancel()
+    # Bounded wait: a retry that swallowed the cancellation would block in
+    # its next backoff sleep, and this test must fail, not hang. Releasing
+    # the stub afterwards lets such a task run to its end at teardown.
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=5)
+    finally:
+        never.set()
+
+    assert task in done
+    assert task.cancelled()
+    assert attempts == 1
+    assert delays == [runner._CONNECT_RETRY_DELAYS_S[0]]
 
 
 # ─────────────────────── wiring into the pair-execution call sites ───────────────────────
@@ -360,3 +429,96 @@ def test_failure_status_names_timeouts_apart(exc: BaseException, status: str) ->
 def test_elapsed_ms_counts_whole_milliseconds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner.time, "monotonic", lambda: 12.3456)
     assert runner._elapsed_ms(10.0) == 2345
+
+
+# ─────────────────────── connect timeout (#388) through `_execute_pair` ───────────────────────
+
+
+def _zz_hubs():
+    origin = Hub(id="ZZ-A", name="Zzstadt", short="ZZA", region="", lat=0.0, lon=0.0)
+    dest = Hub(id="ZZ-B", name="Zzdorf", short="ZZB", region="", lat=1.0, lon=1.0)
+    return origin, dest
+
+
+async def _execute_zz_pair():
+    origin, dest = _zz_hubs()
+    await runner._execute_pair(
+        run_id=uuid.uuid4(),
+        session_id="zz-sess",
+        engine="motis",
+        origin=origin,
+        dest=dest,
+        depart_at=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
+        window=_resolved_window(),
+    )
+    return runner._persist_pair_coverage_result.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_execute_pair_connect_timeout_then_success_gives_ok_cell(monkeypatch, _no_real_sleep):
+    """The 22 Oct case: the engine does not accept the connection in time
+    once, then answers. The cell must be `ok`, not a failure."""
+    attempts = 0
+
+    async def _fake_sliced(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectTimeout("zz")
+        return {}, [{"duration_seconds": 100, "num_transfers": 0, "legs": []}]
+
+    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    _patch_execute_pair_db_layer(monkeypatch)
+
+    persisted = await _execute_zz_pair()
+
+    assert attempts == 2
+    assert persisted["status"] == "ok"
+    assert persisted["error_message"] is None
+    assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+
+
+@pytest.mark.asyncio
+async def test_execute_pair_repeated_connect_timeouts_fail_after_last_retry(
+    monkeypatch, _no_real_sleep
+):
+    """An engine that never accepts the connection: every backoff delay is
+    waited, then the cell fails. `_failure_status` still files it under
+    `timeout` (the class name says so), with the ConnectTimeout named in
+    the message."""
+    attempts = 0
+
+    async def _fake_sliced(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout("zz")
+
+    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    _patch_execute_pair_db_layer(monkeypatch)
+
+    persisted = await _execute_zz_pair()
+
+    assert attempts == len(runner._CONNECT_RETRY_DELAYS_S) + 1
+    assert _no_real_sleep == [5.0, 15.0, 40.0]
+    assert persisted["status"] == "timeout"
+    assert persisted["error_message"].startswith("ConnectTimeout: ")
+
+
+@pytest.mark.asyncio
+async def test_execute_pair_read_timeout_is_not_retried(monkeypatch, _no_real_sleep):
+    attempts = 0
+
+    async def _fake_sliced(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("zz")
+
+    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    _patch_execute_pair_db_layer(monkeypatch)
+
+    persisted = await _execute_zz_pair()
+
+    assert attempts == 1
+    assert _no_real_sleep == []
+    assert persisted["status"] == "timeout"
+    assert persisted["error_message"].startswith("ReadTimeout: ")
