@@ -884,8 +884,11 @@ def _merge_slot_results(
         if raw:
             last_raw = raw  # last successful payload wins
         _accumulate_slot_trips(trips, window, deduped)
-    if successes == 0 and failures:
-        raise _slot_failure(failures)
+    # Declared optional, then narrowed: the slot's own exception (its exact
+    # httpx or asyncio class) is re-raised as it is, never wrapped.
+    failure: BaseException | None = _slot_failure(failures) if successes == 0 and failures else None
+    if failure is not None:
+        raise failure
     return last_raw, list(deduped.values())
 
 
