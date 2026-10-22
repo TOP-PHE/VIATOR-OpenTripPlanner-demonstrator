@@ -451,6 +451,33 @@ def test_gtfs_extract(tmp_path: Path) -> None:
     assert result.extractor_version == EXTRACTOR_VERSION
 
 
+def test_the_country_of_a_stop_is_any_european_country_or_the_nearest_coast(
+    tmp_path: Path,
+) -> None:
+    """Extractor version 3 (`osm_geo.country_of_position`): a stop in Serbia
+    is in Serbia, one on a coast the 1:50m boundaries miss takes the nearest
+    country, one far out at sea none."""
+    stops = (
+        "stop_id,stop_code,stop_name,stop_lat,stop_lon,location_type,parent_station,platform_code\n"
+        "ZZ:S1,,ZZ Beograd,44.8170000,20.4570000,1,,\n"
+        "ZZ:S1:P1,9901,ZZ quai 1,44.81701,20.45701,0,ZZ:S1,1\n"
+        "ZZ:S1:P2,,ZZ quai 2,44.81702,20.45702,0,ZZ:S1,2\n"
+        "ZZ:S2,,ZZ Mallaig,57.006,-5.830,0,,\n"
+        "ZZ:B1,,ZZ Arret bus,48.7,2.2,0,,\n"
+        "ZZ:S3,,ZZ Scilly,49.916,-6.318,0,,\n"
+    )
+    result = _build(_provider(), _gtfs(tmp_path, stops=stops), tmp_path)
+    key = feed_key_for(_provider())
+    assert key is not None
+    rows = _by_key(_msmm_check(result.path_gz, key))
+    assert {stop: row["iso2_point"] for stop, row in rows.items()} == {
+        "ZZ:S1": "RS",
+        "ZZ:S2": "GB",
+        "ZZ:S3": "",
+    }
+    assert EXTRACTOR_VERSION == "viator-stop-extract-3"
+
+
 def test_quoting_round_trips(tmp_path: Path) -> None:
     stops = STOPS.replace('"Gare, ZZ Nord"', '"Gare ""ZZ"", Nord"')
     result = _build(_provider(), _gtfs(tmp_path, stops=stops), tmp_path)

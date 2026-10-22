@@ -71,6 +71,112 @@ def test_country_for_point(name, lat, lon, expected):
     assert g.country_for_point(lat, lon) == expected, name
 
 
+@pytest.mark.parametrize(
+    "name,lat,lon",
+    [
+        ("Belgrade", 44.817, 20.457),
+        ("Skopje", 41.997, 21.428),
+        ("Podgorica", 42.441, 19.263),
+        ("Kyiv", 50.450, 30.523),
+    ],
+)
+def test_country_for_point_keeps_to_the_v1_list(name, lat, lon):
+    # Bundled for the stop extract only: the OSM crop and the hubs never see them.
+    assert g.country_for_point(lat, lon) is None, name
+
+
+# ──────────────────────── country_of_position (the stop extract) ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        ("Paris", 48.853, 2.349, "FR"),
+        ("Genève", 46.210, 6.140, "CH"),
+        ("Belgrade", 44.817, 20.457, "RS"),
+        ("Novi Sad", 45.267, 19.833, "RS"),
+        # By the Bulgarian and Romanian borders: Serbia, never its neighbours.
+        ("Negotin", 44.228, 22.531, "RS"),
+        ("Zaječar", 43.903, 22.275, "RS"),
+        ("Subotica", 46.100, 19.666, "RS"),
+        ("Kelebia", 46.198, 19.616, "HU"),
+        ("Skopje", 41.997, 21.428, "MK"),
+        ("Podgorica", 42.441, 19.263, "ME"),
+        ("Sarajevo", 43.856, 18.413, "BA"),
+        ("Tirana", 41.327, 19.819, "AL"),
+        ("Pristina", 42.663, 21.165, "XK"),
+        # Across the Hungarian and Slovak borders: Ukraine.
+        ("Chop", 48.432, 22.201, "UA"),
+        ("Chișinău", 47.011, 28.863, "MD"),
+        ("Minsk", 53.902, 27.561, "BY"),
+        ("Monaco", 43.739, 7.420, "MC"),
+        ("Istanbul Sirkeci", 41.015, 28.977, "TR"),
+        ("Kaliningrad", 54.710, 20.452, "RU"),
+    ],
+)
+def test_country_of_position_knows_every_european_country(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        # Outside the 1:50m coast by some 7 km: the nearest boundary's country.
+        ("Mallaig", 57.006, -5.830, "GB"),
+        ("Sheerness-on-Sea", 51.441, 0.758, "GB"),
+        ("Split", 43.504, 16.441, "HR"),
+        # Farther than COAST_TOLERANCE_KM from any boundary: none.
+        ("St Mary's, Isles of Scilly", 49.916, -6.318, None),
+        ("mid-Atlantic", 45.0, -30.0, None),
+        ("null island", 0.0, 0.0, None),
+    ],
+)
+def test_country_of_position_takes_the_nearest_boundary_on_a_coast(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+def test_a_position_just_inside_the_tolerance_has_a_country_and_just_beyond_none():
+    # Due north of Scotland's northernmost 1:50m point, over open sea.
+    north = max(
+        (lat, lon)
+        for iso, _bbox, poly in g._polygons()
+        if iso == "GB"
+        for ring in poly
+        for lon, lat in ring
+    )
+    km_per_degree = 110.57
+    inside = north[0] + (g.COAST_TOLERANCE_KM - 0.5) / km_per_degree
+    beyond = north[0] + (g.COAST_TOLERANCE_KM + 0.5) / km_per_degree
+    assert g.country_of_position(inside, north[1]) == "GB"
+    assert g.country_of_position(beyond, north[1]) is None
+
+
+def test_the_bundled_boundaries_are_the_v1_list_and_the_other_countries():
+    bundled = {iso for iso, _bbox, _geom in g._features()}
+    assert bundled == g.VALID_COUNTRIES | g.OTHER_COUNTRIES
+    assert not g.VALID_COUNTRIES & g.OTHER_COUNTRIES
+
+
+def test_the_other_countries_are_never_offered_for_the_crop():
+    with pytest.raises(ValueError):
+        g.validate_countries(["RS"])
+    every = g.crop_geojson(sorted(g.VALID_COUNTRIES))
+    v1_polygons = sum(1 for iso, _bbox, _poly in g._polygons() if iso in g.VALID_COUNTRIES)
+    assert len(every["geometry"]["coordinates"]) == v1_polygons
+
+
+def test_detection_counts_no_stop_in_another_country():
+    # Coordinates only, no UIC-shaped id: Belgrade and Skopje count nowhere.
+    stops = [("ZZ-1", 44.817, 20.457), ("ZZ-2", 41.997, 21.428), ("ZZ-3", 48.853, 2.349)]
+    assert g.detect_from_stops(stops) == {"FR": 1}
+
+
+def test_the_distance_to_a_segment_takes_its_nearest_point():
+    assert g._segment_km(3.0, 4.0, 3.0, 4.0) == pytest.approx(5.0)  # a point
+    assert g._segment_km(-1.0, 2.0, 1.0, 2.0) == pytest.approx(2.0)  # the foot inside
+    assert g._segment_km(1.0, 0.0, 2.0, 0.0) == pytest.approx(1.0)  # beyond an end
+
+
 # ──────────────────────── country_of_stop ────────────────────────
 
 

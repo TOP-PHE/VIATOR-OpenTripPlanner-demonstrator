@@ -379,7 +379,7 @@ def test_other_modes_stay_what_they_were(tmp_path: Path) -> None:
     assert _one_station(tmp_path / "b", "metro", "", "rail", "railStation") == set()
     assert _one_station(tmp_path / "c", "", "", "", "") == set()
     assert _one_station(tmp_path / "d", "", "", "bus", "railStation") == set()
-    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-2"
+    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-3"
 
 
 def test_the_census_follows_the_line_a_pattern_gives(tmp_path: Path) -> None:
