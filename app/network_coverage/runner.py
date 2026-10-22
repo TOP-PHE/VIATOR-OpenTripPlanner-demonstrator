@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -866,27 +867,47 @@ def _merge_slot_results(
     """Filter + dedup K-slot outcomes into one ``(last_raw, trips)`` pair.
 
     Extracted from `_fetch_plan_sliced` so that function stays under
-    Sonar's cognitive-complexity ceiling. Re-raises the first slot
-    exception ONLY when no slot succeeded — otherwise partial coverage
-    is more useful than an error status (matches PR-E's
-    one-bad-cell-doesn't-abort-the-run posture)."""
+    Sonar's cognitive-complexity ceiling. Raises a slot exception ONLY
+    when no slot succeeded — otherwise partial coverage is more useful
+    than an error status (matches PR-E's one-bad-cell-doesn't-abort-the-
+    run posture). Which exception is raised: see `_slot_failure`."""
     deduped: dict[tuple[str, str, tuple[str, ...], str], dict[str, Any]] = {}
     last_raw: dict[str, Any] = {}
-    first_exc: BaseException | None = None
+    failures: list[BaseException] = []
     successes = 0
     for outcome in results:
         if isinstance(outcome, BaseException):
-            if first_exc is None:
-                first_exc = outcome
+            failures.append(outcome)
             continue
         successes += 1
         raw, trips = outcome
         if raw:
             last_raw = raw  # last successful payload wins
         _accumulate_slot_trips(trips, window, deduped)
-    if successes == 0 and first_exc is not None:
-        raise first_exc
+    # Declared optional, then narrowed: the slot's own exception (its exact
+    # httpx or asyncio class) is re-raised as it is, never wrapped.
+    failure: BaseException | None = _slot_failure(failures) if successes == 0 and failures else None
+    if failure is not None:
+        raise failure
     return last_raw, list(deduped.values())
+
+
+def _slot_failure(failures: list[BaseException]) -> BaseException:
+    """The exception a pair whose every slot failed reports (#388 review).
+
+    `_call_with_connect_retry` wraps the whole K-slot fetch and retries
+    it when this exception is a connection-level one. So a connection-
+    level exception is reported only when EVERY slot failed with one:
+    the engine accepted none of the slots. When any slot failed another
+    way (an outer `wait_for` timeout, a read timeout, an HTTP error...),
+    the engine did take requests and the pair's failure is its own: the
+    first such exception is reported and the pair is not retried. Before,
+    the first exception in slot order was raised, so the same failure
+    was retried (minutes held on a pair slot) or not, by slot order."""
+    for exc in failures:
+        if not isinstance(exc, _CONNECT_RETRY_EXCEPTIONS):
+            return exc
+    return failures[0]
 
 
 def _load_active_hubs(db: DbSession, countries: list[str] | None = None) -> list[Hub]:
@@ -1651,7 +1672,25 @@ async def _run_external_verify_sweep(
 # Growing backoff gives the session a real chance to come back before
 # giving up; cost is near-zero for the overwhelming common case (no
 # ConnectError at all, so no retry ever happens).
+#
+# Scope (#388 review): the retry wraps the WHOLE K-slot fetch
+# (`_fetch_plan_sliced`) and fires only when every slot failed to connect
+# (see `_slot_failure`). A connection error on only SOME slots is not
+# retried: those slots' trips are missing from the pair's partial result,
+# as before. A per-slot retry would eat into the slot budget and is left
+# for a follow-up.
+#
+# Worst case for a pair whose engine accepts no connection: 4 attempts,
+# each ceil(slots / slots in parallel) x the 5 s connect timeout (MOTIS
+# and OTP alike), plus 60 s of backoff (+-20 % jitter). With the defaults
+# (6 slots, 3 at a time) about 90-110 s; with 2 at a time about 110-130 s.
 _CONNECT_RETRY_DELAYS_S: tuple[float, ...] = (5.0, 15.0, 40.0)
+
+# +-20 % jitter on each backoff delay so pairs that failed together (one
+# engine hiccup under 6 parallel pairs) do not all retry in the same second.
+_CONNECT_RETRY_JITTER = (0.8, 1.2)
+# Not used for anything secret: a plain PRNG is right for spreading retries.
+_BACKOFF_RANDOM = random.Random()  # noqa: S311  # nosec B311
 
 _CONNECT_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
     httpx.ConnectError,
@@ -1662,23 +1701,58 @@ _CONNECT_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
     # class of transient session-bounce symptom (a restart landing mid-
     # request instead of before it), so it gets the same retry treatment.
     httpx.RemoteProtocolError,
+    # 2026-10-22 (#388) — eu19 run with 6 pairs in parallel: one pair failed
+    # with ConnectTimeout while MOTIS stayed up. A connect timeout means the
+    # request never reached the engine (its accept queue was briefly full,
+    # or it was busy for a moment), so like ConnectError it says nothing
+    # about the pair itself. httpx makes it a TimeoutException, not a
+    # ConnectError, so it must be named here on its own.
+    #
+    # Deliberately NOT retried, and why:
+    # - ReadTimeout: the engine accepted the request and is too slow to
+    #   answer it; that is the pair's own result and must report fast.
+    # - WriteTimeout: the engine accepted the connection but stopped
+    #   reading the request; retrying would only delay a broken pair.
+    # - PoolTimeout: the planner clients open a fresh AsyncClient for each
+    #   call (default pool, one request at a time), so the pool never makes
+    #   a call wait; if it ever did, it would be contention inside VIATOR,
+    #   not a sign of the engine's health.
+    httpx.ConnectTimeout,
 )
 
 
-async def _call_with_connect_retry[T](fetch: Callable[[], Awaitable[T]]) -> T:
-    """Retry `fetch()` on connection-level session-bounce errors only
-    (`_CONNECT_RETRY_EXCEPTIONS`), with growing backoff.
+def _backoff_delay_s(base_s: float) -> float:
+    """One backoff delay: `base_s` with +-20 % jitter."""
+    low, high = _CONNECT_RETRY_JITTER
+    return base_s * _BACKOFF_RANDOM.uniform(low, high)
 
-    Every other exception (timeout, HTTP error, bad response shape, ...)
-    propagates on the first attempt — those aren't caused by a session
-    bounce and retrying wouldn't change the outcome, it would just make a
-    genuinely-broken pair take longer to report as such.
+
+async def _call_with_connect_retry[T](
+    fetch: Callable[[], Awaitable[T]], run_id: uuid.UUID | None = None
+) -> T:
+    """Retry `fetch()` on connection-level errors only
+    (`_CONNECT_RETRY_EXCEPTIONS`: ConnectError, RemoteProtocolError,
+    ConnectTimeout), with growing, jittered backoff.
+
+    Every other exception (read, write or pool timeout, HTTP error, bad
+    response shape, ...) propagates on the first attempt — those aren't
+    caused by a session bounce or a full accept queue, and retrying
+    wouldn't change the outcome, it would just make a genuinely-broken
+    pair take longer to report as such.
+
+    With `run_id`, a Stop of that run (its in-process cancel event) is
+    checked before each backoff sleep and before each retry: the last
+    connection error is raised at once instead of waiting and retrying.
     """
-    for delay_s in _CONNECT_RETRY_DELAYS_S:
+    for base_s in _CONNECT_RETRY_DELAYS_S:
         try:
             return await fetch()
         except _CONNECT_RETRY_EXCEPTIONS:
-            await asyncio.sleep(delay_s)
+            if run_id is not None and is_cancelled(run_id):
+                raise
+            await asyncio.sleep(_backoff_delay_s(base_s))
+            if run_id is not None and is_cancelled(run_id):
+                raise
     return await fetch()
 
 
@@ -1751,7 +1825,7 @@ async def _execute_pair(
         )
 
     try:
-        raw, trips = await _call_with_connect_retry(_fetch)
+        raw, trips = await _call_with_connect_retry(_fetch, run_id)
         response_ms = _elapsed_ms(started)
         num_itineraries = len(trips)
         if trips:
@@ -1934,7 +2008,7 @@ async def _query_one_session_for_pair(
         )
 
     try:
-        raw, trips = await _call_with_connect_retry(_fetch)
+        raw, trips = await _call_with_connect_retry(_fetch, run_id)
         response_ms = _elapsed_ms(sub_start)
         sub_status = "ok" if trips else "no_route"
         return sid, sub_status, raw, trips, response_ms
