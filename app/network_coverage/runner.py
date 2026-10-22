@@ -110,13 +110,13 @@ _DB_EXECUTOR = ThreadPoolExecutor(max_workers=_DB_THREADS, thread_name_prefix="c
 async def _off_loop[T](fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     """Run the blocking `fn(*args, **kwargs)` on the coverage DB executor and
     await its result, so the event loop stays free meanwhile. The calls of
-    one pair are awaited one after the other, so they keep their order
-    (recorder, then result row and counters).
+    one pair are awaited one after the other, so they keep their order.
 
     The caller's context variables (structlog's request-free bindings, the
     OpenTelemetry span) go with the call, as `asyncio.to_thread` does. A
-    cancelled await does not stop the call: a write that has started ends
-    (commit or rollback), as it did when it ran on the loop."""
+    cancelled await does not stop a call that has started (a write ends in
+    commit or rollback), but drops one still queued: writes that must
+    happen together go in one call, shielded (`_write_pair`)."""
     loop = asyncio.get_running_loop()
     call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
     return await loop.run_in_executor(_DB_EXECUTOR, call)
@@ -367,9 +367,9 @@ def _is_cancelled_in_db(
     the primary signal; this is a backstop for cross-process cancels.
     """
     now = time.monotonic()
-    hit = cache.get(run_id)
-    if hit is not None and hit[0] > now:
-        return hit[1]
+    fresh = _fresh_cancel_answer(run_id, cache, now)
+    if fresh is not None:
+        return fresh
     try:
         with SessionLocal() as db:
             row = db.execute(
@@ -383,17 +383,32 @@ def _is_cancelled_in_db(
     return cancelled
 
 
+def _fresh_cancel_answer(
+    run_id: uuid.UUID, cache: dict[uuid.UUID, tuple[float, bool]], now: float
+) -> bool | None:
+    """The cached DB cancel answer for `run_id` while it is fresh (3 s),
+    else None. The one freshness rule of `_is_cancelled_in_db` and
+    `_run_stopped`."""
+    hit = cache.get(run_id)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    return None
+
+
 async def _run_stopped(run_id: uuid.UUID, cache: dict[uuid.UUID, tuple[float, bool]]) -> bool:
     """The per-pair cancel check: the in-process Stop event, then the DB
     status (`_is_cancelled_in_db`, same 3 s cache). A fresh cache entry is
     answered here; only an expired one costs a trip to the DB executor, so
-    the SELECT never runs on the event loop (#392)."""
+    the SELECT never runs on the event loop (#392). The Stop event is read
+    again once the DB answer is back: a click made while the SELECT waited
+    for a thread still stops this pair."""
     if is_cancelled(run_id):
         return True
-    hit = cache.get(run_id)
-    if hit is not None and hit[0] > time.monotonic():
-        return hit[1]
-    return await _off_loop(_is_cancelled_in_db, run_id, cache)
+    fresh = _fresh_cancel_answer(run_id, cache, time.monotonic())
+    if fresh is not None:
+        return fresh
+    stopped_in_db = await _off_loop(_is_cancelled_in_db, run_id, cache)
+    return stopped_in_db or is_cancelled(run_id)
 
 
 # ─────────────────── PR-3 — day window + K-slot helpers ────────────────────
@@ -1872,7 +1887,6 @@ async def _execute_pair(
     best_num_transfers: int | None = None
     best_operators: str | None = None
     error_message: str | None = None
-    journey_search_id: uuid.UUID | None = None
     raw: dict[str, Any] = {}
     trips: list[dict[str, Any]] = []
 
@@ -1934,40 +1948,64 @@ async def _execute_pair(
 
     # Persist into journey_searches + journey_trips (best-effort, so the
     # click-cell drilldown can reuse the v0.1.26 trip-card UI), then the
-    # result row. Both are blocking database work: off the event loop, in
-    # this order (#392). See `_record_pair_journey_search`.
-    journey_search_id, error_message = await _off_loop(
+    # result row. Always persist the coverage result, even when the recorder
+    # write failed — the matrix is the canonical artifact. Both writes are
+    # one off-loop unit (#392), see `_write_pair`.
+    await _write_pair(
         _record_pair_journey_search,
-        run_id=run_id,
-        session_id=session_id,
-        origin=origin,
-        dest=dest,
-        depart_at=depart_at,
-        status=status,
-        response_ms=response_ms,
-        raw=raw,
-        trips=trips,
-        error_message=error_message,
+        record_kwargs={
+            "run_id": run_id,
+            "session_id": session_id,
+            "origin": origin,
+            "dest": dest,
+            "depart_at": depart_at,
+            "status": status,
+            "response_ms": response_ms,
+            "raw": raw,
+            "trips": trips,
+            "error_message": error_message,
+        },
+        result_kwargs={
+            "run_id": run_id,
+            "origin": origin,
+            "dest": dest,
+            "status": status,
+            "response_ms": response_ms,
+            "num_itineraries": num_itineraries,
+            "best_duration_seconds": best_duration_seconds,
+            "best_num_transfers": best_num_transfers,
+            "best_operators": best_operators,
+        },
     )
 
-    # Always persist the coverage result, even when the recorder write
-    # failed — the matrix is the canonical artifact. Shared with the
-    # fanout path so both modes write the result row + counters update
-    # via exactly one code path (Sonar duplication metric was flagging
-    # the previous copy-paste).
-    await _off_loop(
-        _persist_pair_coverage_result,
-        run_id=run_id,
-        origin=origin,
-        dest=dest,
-        status=status,
-        response_ms=response_ms,
-        num_itineraries=num_itineraries,
-        best_duration_seconds=best_duration_seconds,
-        best_num_transfers=best_num_transfers,
-        best_operators=best_operators,
-        error_message=error_message,
-        journey_search_id=journey_search_id,
+
+async def _write_pair(
+    record: Callable[..., tuple[uuid.UUID | None, str | None]],
+    *,
+    record_kwargs: dict[str, Any],
+    result_kwargs: dict[str, Any],
+) -> None:
+    """Write one pair: its journey search (`record`, which returns the
+    search id and the pair's error message), then its result row and
+    counters (`_persist_pair_coverage_result`, shared by both modes so the
+    matrix wire-format and the counter updates live in one place).
+
+    Both writes are ONE call on the coverage DB executor, shielded: once
+    started, a cancellation of the run's task (e.g. a web shutdown) cannot
+    leave a journey search without its result row, as when both ran on the
+    loop with no await between them (#392)."""
+    await asyncio.shield(_off_loop(_record_then_persist, record, record_kwargs, result_kwargs))
+
+
+def _record_then_persist(
+    record: Callable[..., tuple[uuid.UUID | None, str | None]],
+    record_kwargs: dict[str, Any],
+    result_kwargs: dict[str, Any],
+) -> None:
+    """The blocking body of `_write_pair`, in one executor thread."""
+    journey_search_id, error_message = record(**record_kwargs)
+    _persist_pair_coverage_result(
+        **result_kwargs, error_message=error_message, journey_search_id=journey_search_id
     )
 
 
@@ -2421,32 +2459,32 @@ async def _execute_pair_fanout(
     )
     response_ms = _elapsed_ms(pair_start)
 
-    journey_search_id, error_message = await _off_loop(
+    await _write_pair(
         _record_fanout_journey_search,
-        run_id=run_id,
-        per_session=per_session,
-        origin=origin,
-        dest=dest,
-        depart_at=depart_at,
-        response_ms=response_ms,
-        status=status,
-        total_trips_unique=len(by_signature),
-    )
-
-    await _off_loop(
-        _persist_pair_coverage_result,
-        run_id=run_id,
-        origin=origin,
-        dest=dest,
-        status=status,
-        response_ms=response_ms,
-        num_itineraries=len(by_signature) if by_signature else 0,
-        best_duration_seconds=(int(best_trip.get("duration_seconds") or 0) if best_trip else None),
-        best_num_transfers=(int(best_trip.get("num_transfers") or 0) if best_trip else None),
-        best_operators=",".join(operators_union) if operators_union else None,
-        session_ids=sessions_with_trips or None,
-        error_message=error_message,
-        journey_search_id=journey_search_id,
+        record_kwargs={
+            "run_id": run_id,
+            "per_session": per_session,
+            "origin": origin,
+            "dest": dest,
+            "depart_at": depart_at,
+            "response_ms": response_ms,
+            "status": status,
+            "total_trips_unique": len(by_signature),
+        },
+        result_kwargs={
+            "run_id": run_id,
+            "origin": origin,
+            "dest": dest,
+            "status": status,
+            "response_ms": response_ms,
+            "num_itineraries": len(by_signature) if by_signature else 0,
+            "best_duration_seconds": (
+                int(best_trip.get("duration_seconds") or 0) if best_trip else None
+            ),
+            "best_num_transfers": (int(best_trip.get("num_transfers") or 0) if best_trip else None),
+            "best_operators": ",".join(operators_union) if operators_union else None,
+            "session_ids": sessions_with_trips or None,
+        },
     )
 
 

@@ -57,12 +57,14 @@ WITHIN_PAIR_PARALLELISM = 2
 SLOT_LATENCY_S = 0.15  # one fake MOTIS slot call
 ITINERARIES_PER_SLOT = 10
 # The HEALTHCHECK timeout is 10 s; production stalled 9-17 s. The bound here
-# is that timeout scaled down 20 times: 0.5 s. Measured on PostgreSQL 16 with
+# is that timeout scaled down 10 times: 1.0 s. Measured on PostgreSQL 16 with
 # this file's sizes, worst health latency: 1.9-3.0 s before #392 (the loop
-# held by the recorder's SELECTs), 20-100 ms after. The deterministic check
-# is the SQL count on the loop thread; this bound leaves CI runners room.
-HEALTH_LATENCY_BOUND_S = 0.5
-LOOP_LAG_BOUND_S = 0.5
+# held by the recorder's SELECTs), 20-140 ms after (up to ~270 ms with
+# coverage tracing and four CPU hogs on four cores). The deterministic check
+# is the SQL count on the loop thread; this bound leaves shared CI runners
+# room and still fails before #392.
+HEALTH_LATENCY_BOUND_S = 1.0
+LOOP_LAG_BOUND_S = 1.0
 
 
 def _postgres_or_skip() -> str:
@@ -237,6 +239,7 @@ class _Probe:
         self.loop_thread = threading.get_ident()
         self.done = asyncio.Event()
         self.run_s = 0.0
+        self.probe_error: Exception | None = None
 
     def on_sql(self, _conn: Any, _cursor: Any, statement: str, *_a: Any) -> None:
         if threading.get_ident() == self.loop_thread:
@@ -256,14 +259,21 @@ class _Probe:
         from outside: the request is handed to the web loop and the clock runs
         until the answer is back, so the time the loop takes to get to it
         counts. (A client coroutine on the same loop would start its clock
-        only once the loop is free again and would miss the stall.)"""
-        while not self.done.is_set():
-            t0 = time.perf_counter()
-            future = asyncio.run_coroutine_threadsafe(client.get("/healthz/version"), loop)
-            r = future.result(timeout=60)
-            self.health_latencies.append(time.perf_counter() - t0)
-            assert r.status_code == 200
-            time.sleep(0.02)
+        only once the loop is free again and would miss the stall.)
+
+        Any failure here (a status other than 200, a timeout, an exception)
+        is kept and re-raised by the test once the thread is joined."""
+        try:
+            while not self.done.is_set():
+                t0 = time.perf_counter()
+                future = asyncio.run_coroutine_threadsafe(client.get("/healthz/version"), loop)
+                r = future.result(timeout=60)
+                self.health_latencies.append(time.perf_counter() - t0)
+                if r.status_code != 200:
+                    raise AssertionError(f"/healthz/version answered {r.status_code}")
+                time.sleep(0.02)
+        except Exception as exc:  # handed to the test thread, see _run_and_measure
+            self.probe_error = exc
 
 
 def _create_run() -> uuid.UUID:
@@ -325,6 +335,8 @@ async def _run_and_measure(run_id: uuid.UUID) -> _Probe:
                 await asyncio.to_thread(prober.join)
         finally:
             event.remove(engine, "before_cursor_execute", probe.on_sql)
+    if probe.probe_error is not None:
+        raise AssertionError("the health probe thread failed") from probe.probe_error
     return probe
 
 

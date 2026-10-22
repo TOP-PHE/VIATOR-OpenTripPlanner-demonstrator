@@ -856,8 +856,11 @@ are the same; the harness and `tests/unit/test_coverage_off_loop.py` check them.
 or any other restart of `web` kills it, and at the next start `mark_orphaned_runs_as_failed` marks it
 `failed` with `summary.orphaned_by_restart = true`; web then logs one WARNING
 `network_coverage.orphans_marked_failed` with the run ids and a hint (a deploy, an autoheal restart
-after failed health checks, or a manual restart). Moving runs to the worker, with a heartbeat and
-resume, is the durable fix and remains open in #392.
+after failed health checks, or a manual restart). A stop of web during a run (SIGTERM), in the pair
+phase or in the completion phase, still ends in Docker's force-kill after its 10 s stop timeout, as
+before #392 (uvicorn waits for the background task): `Container failed to exit within 10s of signal 15`
+in the dockerd journal is expected then and does not by itself say who stopped web. Moving runs to the
+worker, with a heartbeat and resume, is the durable fix and remains open in #392.
 
 ---
 
@@ -1818,12 +1821,11 @@ Master-data rows with `source='manual'` are **never** overwritten by the Trainli
 
 | Endpoint | What it reports |
 |---|---|
-| `GET /api/healthz` | Web liveness — returns `200 {"ok": true}` if the process is alive |
-| `GET /api/readyz` | Web + DB readiness — checks Postgres connectivity |
+| `GET /healthz` | Web liveness — returns `200 {"status": "ok"}` while the process answers. `async def` returning a constant; never touches the database (#392) |
 | `GET /healthz/version` | The deployed version (`{"version": …}`). The image HEALTHCHECK reads it (`curl`, 30 s / 10 s / 3 retries). `async def` returning a constant: answers while a coverage run is busy and while every request thread is taken (#392, §6.10) |
 | `GET /otp/<sid>/actuators/health` | Per-session OTP — `{"status":"UP"}` once graph loaded |
 
-External monitoring (UptimeRobot, Better Stack, etc.) should hit `readyz`, not `healthz` — readyz fails closed if the DB is down, healthz only fails if the process crashed.
+Neither web endpoint checks the database (there is no `readyz`): external monitoring (UptimeRobot, Better Stack, etc.) sees web's liveness only. Database health is visible in Prometheus and Grafana.
 
 #### 11.8.2 Logs
 

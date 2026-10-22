@@ -597,7 +597,8 @@ ran. Since #392 the web log at the restart says which runs: `docker compose -p v
 orphans_marked_failed` (run ids + hint). Then find who restarted web: `docker inspect viator-web-1` (`StartedAt`,
 `RestartCount` stays 0 for an API restart), the dockerd journal at that time (`stopping restart-manager`, `failed to
 exit within 10s`), `docker logs viator-autoheal-1`, and the web log's `healthz` lines just before (gaps over 30 s =
-slow checks). Start the run again; until coverage moves to the worker, a deploy also ends a running run.
+slow checks). `failed to exit within 10s` is expected for ANY stop of web during a run, pair or completion phase (uvicorn waits
+for the background task until Docker's 10 s force-kill, same as before #392); it does not identify the sender. Start the run again; until coverage moves to the worker, a deploy also ends a running run.
 
 **Diagnosing "is this a MOTIS-health problem or a real routing gap?"** — curl MOTIS directly, bypassing the runner entirely:
 ```bash

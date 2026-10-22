@@ -240,6 +240,67 @@ async def test_execute_pair_hands_the_recorders_error_to_the_result_row(monkeypa
     assert persist["status"] == "error"
 
 
+async def test_a_cancelled_pair_still_writes_its_result_row(monkeypatch) -> None:
+    """The run's task cancelled while the recorder writes (a web shutdown):
+    the result row and counters are written anyway, in the same thread, so
+    no journey search is left without its result row."""
+    calls = _Calls()
+    started, release = threading.Event(), threading.Event()
+    search_id = uuid.uuid4()
+
+    def _slow_record(**kwargs: Any) -> tuple[uuid.UUID, None]:
+        calls.recorder("record")(**kwargs)
+        started.set()
+        release.wait(5)
+        return search_id, None
+
+    monkeypatch.setattr(runner.planner_dispatch, "planner_for_engine", lambda _e: _Planner([]))
+    monkeypatch.setattr(runner, "_record_pair_journey_search", _slow_record)
+    persisted = threading.Event()
+
+    def _persist(**kwargs: Any) -> None:
+        calls.recorder("persist")(**kwargs)
+        persisted.set()
+
+    monkeypatch.setattr(runner, "_persist_pair_coverage_result", _persist)
+
+    task = asyncio.create_task(
+        runner._execute_pair(
+            run_id=uuid.uuid4(),
+            session_id="zz-s",
+            engine="motis",
+            origin=ORIGIN,
+            dest=DEST,
+            depart_at=DEPART,
+        )
+    )
+    await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await asyncio.to_thread(persisted.wait, 5)
+    assert calls.names() == ["record", "persist"]
+    assert len(calls.threads()) == 1  # one executor call, recorder then result
+    assert calls.kwargs("persist")["journey_search_id"] == search_id
+    assert calls.kwargs("persist")["status"] == "no_route"
+
+
+async def test_a_stop_click_during_the_db_check_stops_the_pair(monkeypatch) -> None:
+    rid = uuid.uuid4()
+    runner.register_cancel(rid)
+
+    def _db_check(_rid: uuid.UUID, _cache: Any) -> bool:
+        runner.request_cancel(rid)  # clicked while the SELECT ran
+        return False
+
+    monkeypatch.setattr(runner, "_is_cancelled_in_db", _db_check)
+    try:
+        assert await runner._run_stopped(rid, {}) is True
+    finally:
+        runner.clear_cancel(rid)
+
+
 class _FailingDb:
     def __init__(self, fail_on: str) -> None:
         self.fail_on = fail_on

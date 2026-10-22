@@ -2215,6 +2215,10 @@ What you see now, and what to do:
   `docker inspect viator-web-1` (`StartedAt`), the Docker journal at that
   time (`journalctl -u docker --since …`: `stopping restart-manager`,
   `failed to exit within 10s`), and `docker logs viator-autoheal-1`.
+  A stop of web while a run is in progress (including its last step) still
+  ends with Docker forcing it after 10 s, as before: web waits for the run,
+  which does not end by itself. So `failed to exit within 10s` is expected
+  for any stop of web during a run; it does not tell who stopped it.
 - The health check, its timeout and retries and the autoheal label are
   unchanged.
 
