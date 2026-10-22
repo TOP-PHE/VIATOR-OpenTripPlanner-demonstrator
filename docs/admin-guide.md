@@ -3556,14 +3556,63 @@ the extracts changes no graph build.
   (Serbia, North Macedonia, Montenegro, Bosnia and Herzegovina, Albania,
   Kosovo, Ukraine, Moldova, Belarus, Russia, the microstates…), not only the
   countries offered for the OSM crop. A stop on a coast, an estuary or an
-  island the bundled boundaries miss (they are simplified: up to some 9 km
-  in western Scotland) takes the country of the nearest boundary within
-  10 km; farther out, none. Before, such stops had no country, and the
-  module made each one a review item "A stop in no country". **After
-  deploying this version, press Refresh (all providers) on each session**:
-  every extract is made again once (a new extractor version), sent, and the
-  module's next build gives these stops their country; their review items
-  become obsolete.
+  island the bundled boundaries miss (they are Natural Earth's 1:50m, a
+  coarse scale: coasts up to some 9 km off in western Scotland, borders up
+  to some 3 km) takes the country of the nearest boundary within 10 km;
+  farther out, none. Before, such stops had no country, and the module made
+  each one a review item "A stop in no country". Still **no country**, on
+  purpose, for:
+  - a stop whose country would be one of these newly added countries while
+    a border of an OSM-crop country passes within 3 km: the 1:50m line
+    cannot tell the side, and a wrong country is worse than none (the module
+    mints its id with that country). So Narva (Estonia), Záhony (Hungary),
+    Medyka (Poland), Idomeni, Pythio and Kastanies (Greece), Tovarnik and
+    Metković (Croatia), Cap-d'Ail (France) stay without a country, as
+    before; so do Chop (Ukraine), Gevgelija (North Macedonia) and Monaco on
+    the other side. Negotin, Zaječar and Subotica (Serbia) are Serbian;
+  - a stop in a country beyond the bundled ones' land borders (Georgia,
+    Armenia, Azerbaijan, Syria, Iraq, Iran, Kazakhstan, Mongolia, China,
+    North Korea, Japan, Brazil, Suriname, Gibraltar): bundled only to be
+    known as none of ours; and a station of a bundled country that its
+    1:50m line puts there (Nusaybin, Turkey, in the 1:50m Syria).
+
+  **Crimea is Ukraine** (`UA`, Sevastopol included): the position of the EU
+  and the UN, as Natural Earth's Ukrainian point of view draws it (its
+  default view, de facto, gave Russia). Kosovo is `XK`, a user-assigned code
+  the module accepts. Northern Cyprus is not decided apart: a stop within
+  10 km of the 1:50m Cyprus is `CY`, one farther (Kyrenia) has none.
+
+  **After deploying this version**, what you will see:
+  - **Refresh (all providers) on each session, one session after the
+    other.** It is the only thing that makes the new extracts: every extract
+    is made again once (a new extractor version), sent, and reaches the
+    module as a new version of its feed. A refresh also fetches every
+    timetable as usual, and one that downloads a new file queues that
+    session's rebuild: if a coverage run on that session matters, refresh
+    after it ends (the extract itself does not touch the hubs or a running
+    coverage run: they keep the crop's countries).
+  - **Until a session is refreshed**, its rebuilds (OTP or MOTIS) show
+    `skipped not_cached` for every feed in the Station module column:
+    before a rebuild only an extract already made is sent, and none is made
+    yet for the new version. This is expected, nothing is wrong.
+  - **One extraction at a time on the whole server**, smallest files first,
+    and each session's sending stops after 30 minutes: a session with large
+    national NeTEx feeds shows `budget`, `busy` or `not_cached` for them
+    after its first refresh. Refresh it again later (or let the next rebuild
+    send them), until the column says `sent` or `already held` for every
+    feed (11.5). A feed shared by several sessions is extracted once per
+    session.
+  - **The module's build gives the stops their country.** The module has
+    no schedule and an extract starts no build there: its next build runs
+    when a MOTIS session is rebuilt (VIATOR asks for it first, 11.3) or when
+    an administrator presses Rebuild in the module. The open "A stop in no
+    country" items of stops that now have a country become obsolete.
+  - **Countries already given by hand in the module.** The module applies
+    an administrator's country to a "no country" stop only while the
+    extract gives that stop none. Stops that keep no country (the border
+    cases above) keep the administrator's answer. A stop that now gets a
+    country from the extract takes that one, and the answer is no longer
+    applied (it stays in the item's history).
 - **When.** After "Refresh" (all providers or one) that fetched a timetable
   or found it unchanged, and after an upload attached to an upload
   provider, queued once the page has its answer for one thread of the `web`

@@ -424,10 +424,19 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   provider_id,provider_label,provider_country_iso,provider_provenance`, `format_version` `1` on every
   row; `modes`/`operators`/`codes` joined by `|`; a code `field=value`; `lat`/`lon` `format(x, ".7f")`;
   `feed_version` the sha256 of the downloaded bytes (`FetchResult.sha256`, from the fetch state) or of
-  the uploaded file; `iso2_point` from `osm_geo.country_of_position` (since version 3: any bundled
-  country, the v1 list and `osm_geo.OTHER_COUNTRIES`, else the nearest boundary within
-  `COAST_TOLERANCE_KM` = 10 km for a stop on a coast or an island the 1:50m boundaries miss, else
-  empty; `country_for_point`, the OSM crop's, keeps to the v1 list); `provider_provenance` the
+  the uploaded file; `iso2_point` from `osm_geo.country_of_position` (since version 3: the bundled
+  country whose boundary holds the position, the v1 list or `osm_geo.OTHER_COUNTRIES`, else the
+  nearest boundary within `COAST_TOLERANCE_KM` = 10 km for a stop on a coast or an island the 1:50m
+  boundaries miss, else empty; empty too when that country is one of
+  `osm_geo.NEIGHBOUR_COUNTRIES` — the countries beyond the bundled ones' land borders (Georgia,
+  Syria, China, Gibraltar…), bundled only to be known as none of ours — and when it is one of
+  `OTHER_COUNTRIES` while a v1 boundary lies within `BORDER_DOUBT_KM` = 3 km beyond its distance:
+  the 1:50m borders lie up to 2.6 km off, and an empty country is an administrator's question in
+  the module where a wrong one is acted upon (Narva, Estonia, falls 2.5 km inside the 1:50m
+  Russia). Crimea, Sevastopol included, is `UA` (the EU and UN position; Natural Earth's
+  Ukrainian point of view: its 1:50m Crimea polygon is Ukraine's in the bundled file). XK
+  (Kosovo) is a user-assigned code, which MSMM accepts (`[A-Z]{2}`). `country_for_point`, the OSM
+  crop's, detection's and hubs', keeps to the v1 list); `provider_provenance` the
   provider's own, else the catalogue's for the same id and feed, else `nap` for a NAP-resolved one,
   else empty.
 - **Feed key**: `nap:tdg:<resource id>`; `nap:<udata|permalink|dated|json_api>:` + 16 hex of the
