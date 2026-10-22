@@ -26,11 +26,14 @@ State machine:
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import logging
 import random
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
@@ -45,6 +48,7 @@ from .. import config_service
 from ..db import SessionLocal
 from ..journey import planner_dispatch, recorder
 from ..models import (
+    JourneySearch,
     JourneySearchExecution,
     JourneyTrip,
     NetworkCoverageHub,
@@ -72,6 +76,62 @@ VALID_MODES = (MODE_SINGLE_SESSION, MODE_FANOUT)
 FANOUT_SESSION_LABEL = "fanout"
 
 log = logging.getLogger(__name__)
+
+# ──────────────── #392 — no blocking work on the web's event loop ────────────────
+#
+# `execute_run` is a FastAPI background task: it runs on the web's event
+# loop, the loop that also answers every request and the image HEALTHCHECK
+# (`GET /healthz/version`, 10 s timeout, 3 retries). Every database call of
+# the runner is synchronous SQLAlchemy, and the recorder alone makes two to
+# three SELECTs per leg of every trip (the trip signature). Made on the loop,
+# six pairs finishing together held it for seconds: on 22 Oct the health
+# checks took 9-17 s during a run, and the harness
+# (tests/integration/test_coverage_web_health.py: 56 pairs, 6 at a time)
+# measured 30 590 statements on the loop and 1-3 s of loop lag.
+#
+# So the runner never calls the database from a coroutine: every blocking
+# call goes through `_off_loop` (a small dedicated executor), and the
+# completion phase, whose verify sweep shares one ORM session across its
+# cells, runs whole on a private event loop in a thread of its own
+# (`_run_on_private_loop`). The engine calls stay on the web loop: they are
+# awaited I/O.
+#
+# Two threads, shared by every run of the process. The recorder's work is
+# mostly Python (ORM objects, statement building) and holds the GIL, so more
+# threads do not write faster: the harness measured the same run time and
+# loop lag with 1, 2 and 4. Two let one pair's database round trips overlap
+# another's Python work, and a run holds at most two of the web's fifteen
+# pooled connections (SQLAlchemy's default pool, 5 + 10 overflow), so
+# requests keep theirs.
+_DB_THREADS = 2
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=_DB_THREADS, thread_name_prefix="coverage-db")
+
+
+async def _off_loop[T](fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    """Run the blocking `fn(*args, **kwargs)` on the coverage DB executor and
+    await its result, so the event loop stays free meanwhile. The calls of
+    one pair are awaited one after the other, so they keep their order
+    (recorder, then result row and counters).
+
+    The caller's context variables (structlog's request-free bindings, the
+    OpenTelemetry span) go with the call, as `asyncio.to_thread` does. A
+    cancelled await does not stop the call: a write that has started ends
+    (commit or rollback), as it did when it ran on the loop."""
+    loop = asyncio.get_running_loop()
+    call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+    return await loop.run_in_executor(_DB_EXECUTOR, call)
+
+
+async def _run_on_private_loop[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Run `coro` to its end on a new event loop in a thread of its own.
+
+    For a phase that interleaves its own awaited I/O with blocking calls on
+    one shared ORM session (the completion phase and its verify sweep): the
+    blocking calls then hold that private loop, never the web's. The thread
+    is the default executor's (`asyncio.to_thread`), not `_DB_EXECUTOR`'s,
+    so a sweep of hours does not take one of the pair writers."""
+    return await asyncio.to_thread(asyncio.run, coro)
+
 
 # ─────────────────── operator-tunable knobs (platform_config) ───────────────────
 #
@@ -321,6 +381,19 @@ def _is_cancelled_in_db(
     cancelled = row is not None and row in _DB_CANCEL_TERMINAL_STATUSES
     cache[run_id] = (now + _DB_CANCEL_CACHE_TTL_SECONDS, cancelled)
     return cancelled
+
+
+async def _run_stopped(run_id: uuid.UUID, cache: dict[uuid.UUID, tuple[float, bool]]) -> bool:
+    """The per-pair cancel check: the in-process Stop event, then the DB
+    status (`_is_cancelled_in_db`, same 3 s cache). A fresh cache entry is
+    answered here; only an expired one costs a trip to the DB executor, so
+    the SELECT never runs on the event loop (#392)."""
+    if is_cancelled(run_id):
+        return True
+    hit = cache.get(run_id)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
+    return await _off_loop(_is_cancelled_in_db, run_id, cache)
 
 
 # ─────────────────── PR-3 — day window + K-slot helpers ────────────────────
@@ -1245,10 +1318,10 @@ async def _process_pair_with_cancel(
     across runs. Default `None` keeps direct unit-test callers working
     without threading a cache through every call site."""
     cache = cancel_cache if cancel_cache is not None else {}
-    if is_cancelled(run_id) or _is_cancelled_in_db(run_id, cache):
+    if await _run_stopped(run_id, cache):
         return
     async with semaphore:
-        if is_cancelled(run_id) or _is_cancelled_in_db(run_id, cache):
+        if await _run_stopped(run_id, cache):
             return
         if snap.run_mode == MODE_FANOUT:
             await _execute_pair_fanout(
@@ -1374,7 +1447,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
     started = time.monotonic()
     register_cancel(run_id)
     try:
-        snap = _phase1_snapshot_and_start(run_id)
+        snap = await _off_loop(_phase1_snapshot_and_start, run_id)
         if snap is None or not snap.pairs:
             log.error("run %s has no pairs to execute", run_id)
             return
@@ -1404,7 +1477,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
             )
         except Exception:
             log.exception("network-coverage run %s failed mid-loop", run_id)
-            _mark_run_failed(run_id)
+            await _off_loop(_mark_run_failed, run_id)
             return
 
         elapsed_s = time.monotonic() - started
@@ -1413,7 +1486,7 @@ async def execute_run(run_id: uuid.UUID) -> None:
         # the partial state under status='cancelled' instead of running
         # Phase 3. The cells already processed survive.
         if is_cancelled(run_id):
-            _persist_cancelled_run(run_id=run_id, elapsed_s=elapsed_s)
+            await _off_loop(_persist_cancelled_run, run_id=run_id, elapsed_s=elapsed_s)
             log.info(
                 "network-coverage run %s cancelled by operator after %.1fs",
                 run_id,
@@ -1427,7 +1500,11 @@ async def execute_run(run_id: uuid.UUID) -> None:
             elapsed_s,
             len(snap.pairs),
         )
-        await _finalise_completed_run(run_id=run_id, elapsed_s=elapsed_s, cfg=snap.cfg)
+        # #392 — the completion phase (counter recount, optional verify sweep,
+        # one commit) on a private loop: its blocking calls share one session.
+        await _run_on_private_loop(
+            _finalise_completed_run(run_id=run_id, elapsed_s=elapsed_s, cfg=snap.cfg)
+        )
     finally:
         clear_cancel(run_id)
 
@@ -1856,35 +1933,82 @@ async def _execute_pair(
         )
 
     # Persist into journey_searches + journey_trips (best-effort, so the
-    # click-cell drilldown can reuse the v0.1.26 trip-card UI).
-    #
-    # v0.1.29.4 — endpoint must be one of ('plan','compare','fanout') and
-    # requested_time_kind must be one of ('depart_at','arrive_by') per the
-    # CheckConstraints on journey_searches. v0.1.27 shipped with
-    # endpoint='network-coverage' / requested_time_kind='depart' which
-    # silently violated both constraints — every coverage row's INSERT
-    # rolled back, leaving journey_search_id NULL on every result and
-    # the modal forever showing "No linked journey-search row". The
-    # coverage-vs-live distinction is preserved via
-    # network_coverage_results.journey_search_id (the FK from the
-    # coverage row pins it back to its parent run), so flattening
-    # endpoint='plan' loses no analytical signal.
+    # click-cell drilldown can reuse the v0.1.26 trip-card UI), then the
+    # result row. Both are blocking database work: off the event loop, in
+    # this order (#392). See `_record_pair_journey_search`.
+    journey_search_id, error_message = await _off_loop(
+        _record_pair_journey_search,
+        run_id=run_id,
+        session_id=session_id,
+        origin=origin,
+        dest=dest,
+        depart_at=depart_at,
+        status=status,
+        response_ms=response_ms,
+        raw=raw,
+        trips=trips,
+        error_message=error_message,
+    )
+
+    # Always persist the coverage result, even when the recorder write
+    # failed — the matrix is the canonical artifact. Shared with the
+    # fanout path so both modes write the result row + counters update
+    # via exactly one code path (Sonar duplication metric was flagging
+    # the previous copy-paste).
+    await _off_loop(
+        _persist_pair_coverage_result,
+        run_id=run_id,
+        origin=origin,
+        dest=dest,
+        status=status,
+        response_ms=response_ms,
+        num_itineraries=num_itineraries,
+        best_duration_seconds=best_duration_seconds,
+        best_num_transfers=best_num_transfers,
+        best_operators=best_operators,
+        error_message=error_message,
+        journey_search_id=journey_search_id,
+    )
+
+
+def _record_pair_journey_search(
+    *,
+    run_id: uuid.UUID,
+    session_id: str,
+    origin: Hub,
+    dest: Hub,
+    depart_at: datetime,
+    status: str,
+    response_ms: int,
+    raw: dict[str, Any],
+    trips: list[dict[str, Any]],
+    error_message: str | None,
+) -> tuple[uuid.UUID | None, str | None]:
+    """Single-session twin of `_record_fanout_journey_search`: write the
+    journey_searches row, the execution and its trips for one pair.
+
+    Returns ``(journey_search_id, error_message)``: the search id (None when
+    the write failed) and the pair's error message, with the recorder's
+    failure appended to it when the write failed. Blocking: called through
+    `_off_loop`, never on the event loop (#392).
+
+    v0.1.29.4 — endpoint must be one of ('plan','compare','fanout') and
+    requested_time_kind must be one of ('depart_at','arrive_by') per the
+    CheckConstraints on journey_searches. v0.1.27 shipped with
+    endpoint='network-coverage' / requested_time_kind='depart' which
+    silently violated both constraints — every coverage row's INSERT
+    rolled back, leaving journey_search_id NULL on every result and
+    the modal forever showing "No linked journey-search row". The
+    coverage-vs-live distinction is preserved via
+    network_coverage_results.journey_search_id (the FK from the
+    coverage row pins it back to its parent run), so flattening
+    endpoint='plan' loses no analytical signal.
+    """
+    journey_search_id: uuid.UUID | None = None
     with SessionLocal() as db:
         try:
-            search = recorder.begin_search(
-                db,
-                user_id=None,  # ran from a background task
-                ip=None,
-                endpoint="plan",
-                origin_lat=origin.lat,
-                origin_lon=origin.lon,
-                origin_label=origin.name,
-                dest_lat=dest.lat,
-                dest_lon=dest.lon,
-                dest_label=dest.name,
-                requested_time_kind="depart_at",
-                requested_time=depart_at,
-                modes="TRANSIT,WALK",
+            search = _begin_coverage_search(
+                db, endpoint="plan", origin=origin, dest=dest, depart_at=depart_at
             )
             session_row = db.get(SessionRow, session_id)
             if session_row is not None:
@@ -1923,24 +2047,29 @@ async def _execute_pair(
             # an existing OTP-side error_message; append/keep both.
             recorder_msg = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
             error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
+    return journey_search_id, error_message
 
-    # Always persist the coverage result, even when the recorder write
-    # failed — the matrix is the canonical artifact. Shared with the
-    # fanout path so both modes write the result row + counters update
-    # via exactly one code path (Sonar duplication metric was flagging
-    # the previous copy-paste).
-    _persist_pair_coverage_result(
-        run_id=run_id,
-        origin=origin,
-        dest=dest,
-        status=status,
-        response_ms=response_ms,
-        num_itineraries=num_itineraries,
-        best_duration_seconds=best_duration_seconds,
-        best_num_transfers=best_num_transfers,
-        best_operators=best_operators,
-        error_message=error_message,
-        journey_search_id=journey_search_id,
+
+def _begin_coverage_search(
+    db: DbSession, *, endpoint: str, origin: Hub, dest: Hub, depart_at: datetime
+) -> JourneySearch:
+    """The journey_searches row of one coverage pair (both modes): no user
+    or IP (a background task), the hubs as endpoints, departing at the run's
+    `depart_at`."""
+    return recorder.begin_search(
+        db,
+        user_id=None,
+        ip=None,
+        endpoint=endpoint,
+        origin_lat=origin.lat,
+        origin_lon=origin.lon,
+        origin_label=origin.name,
+        dest_lat=dest.lat,
+        dest_lon=dest.lon,
+        dest_label=dest.name,
+        requested_time_kind="depart_at",
+        requested_time=depart_at,
+        modes="TRANSIT,WALK",
     )
 
 
@@ -2122,20 +2251,8 @@ def _record_fanout_journey_search(
     """
     with SessionLocal() as db:
         try:
-            search = recorder.begin_search(
-                db,
-                user_id=None,
-                ip=None,
-                endpoint="fanout",
-                origin_lat=origin.lat,
-                origin_lon=origin.lon,
-                origin_label=origin.name,
-                dest_lat=dest.lat,
-                dest_lon=dest.lon,
-                dest_label=dest.name,
-                requested_time_kind="depart_at",
-                requested_time=depart_at,
-                modes="TRANSIT,WALK",
+            search = _begin_coverage_search(
+                db, endpoint="fanout", origin=origin, dest=dest, depart_at=depart_at
             )
             for sid, sub_status, raw, trips, _ms in per_session:
                 session_row = db.get(SessionRow, sid)
@@ -2288,7 +2405,11 @@ async def _execute_pair_fanout(
         )
     )
 
-    status, by_signature, sessions_with_trips, operators_union = _merge_fanout_results(per_session)
+    # #392 — the merge (trip signatures read the DB), the recorder and the
+    # result write are blocking: off the event loop, in this order.
+    status, by_signature, sessions_with_trips, operators_union = await _off_loop(
+        _merge_fanout_results, per_session
+    )
 
     best_trip: dict[str, Any] | None = (
         min(
@@ -2300,7 +2421,8 @@ async def _execute_pair_fanout(
     )
     response_ms = _elapsed_ms(pair_start)
 
-    journey_search_id, error_message = _record_fanout_journey_search(
+    journey_search_id, error_message = await _off_loop(
+        _record_fanout_journey_search,
         run_id=run_id,
         per_session=per_session,
         origin=origin,
@@ -2311,7 +2433,8 @@ async def _execute_pair_fanout(
         total_trips_unique=len(by_signature),
     )
 
-    _persist_pair_coverage_result(
+    await _off_loop(
+        _persist_pair_coverage_result,
         run_id=run_id,
         origin=origin,
         dest=dest,
@@ -2368,7 +2491,7 @@ def list_recent_runs(db: DbSession, *, limit: int = 20) -> list[NetworkCoverageR
     )
 
 
-def mark_orphaned_runs_as_failed(db: DbSession) -> int:
+def mark_orphaned_runs_as_failed(db: DbSession) -> list[uuid.UUID]:
     """v0.1.29.3 — terminate any runs left mid-flight by a web restart.
 
     `execute_run` is scheduled via FastAPI BackgroundTasks, which are
@@ -2386,9 +2509,10 @@ def mark_orphaned_runs_as_failed(db: DbSession) -> int:
     stamp `summary.orphaned_by_restart=true` so the matrix view can
     explain the state instead of showing a phantom progress bar.
 
-    Returns the number of runs marked. Caller is responsible for the
-    txn boundary (commit/rollback) — keeps this composable with
-    startup-hook error handling.
+    Returns the ids of the runs marked (#392: the startup hook names them
+    in its WARNING). Caller is responsible for the txn boundary
+    (commit/rollback) — keeps this composable with startup-hook error
+    handling.
     """
     orphans = list(
         db.execute(
@@ -2398,7 +2522,7 @@ def mark_orphaned_runs_as_failed(db: DbSession) -> int:
         .all()
     )
     if not orphans:
-        return 0
+        return []
     now = datetime.now(UTC)
     for run in orphans:
         run.status = "failed"
@@ -2410,4 +2534,4 @@ def mark_orphaned_runs_as_failed(db: DbSession) -> int:
             "completed_pairs_at_restart": run.completed_pairs or 0,
             "total_pairs_at_restart": run.total_pairs or 0,
         }
-    return len(orphans)
+    return [run.id for run in orphans]

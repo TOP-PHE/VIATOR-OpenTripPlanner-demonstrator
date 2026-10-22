@@ -501,6 +501,10 @@ After the install completes:
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
+> **A deploy restarts web, and a restart of web ends a running coverage run**
+> (it is marked failed and must be started again, §6.18). Look at the coverage
+> page first and deploy when no run is in progress.
+
 > **Fresh-install only**: see [`docker/INSTALL.md` §5.5](../docker/INSTALL.md) — run `bin/viator-bootstrap-stubs.sh` once before the first `docker compose up`. After that, the orchestrator regenerates `docker/generated/*` from DB state on every web-container boot.
 >
 > **Existing VPS clones provisioned before v0.1.32.10**: do the one-time migration in §5.1.0 below as part of the v0.1.32.10 deploy. After that migration, `git pull` works cleanly on every subsequent deploy and §5.1.1's stash/pop dance is permanently obsolete.
@@ -2170,6 +2174,49 @@ is quarantined by one **Refresh providers**, or by hand as issue #381 says
 A save that changes the configuration also renames it, when the file bears a
 current provider's name in the other folder; a save that changes nothing, or
 a provider no longer in the session, leaves it. Then rebuild the session.
+
+### 6.18 A coverage run ended "failed" after a restart of web (issue #392)
+
+Symptom (21 and 22 Oct): a long coverage run (single session, both
+directions) shows **failed** on the coverage page after hours of progress;
+its summary carries `orphaned_by_restart: true`. `docker inspect
+viator-web-1` shows a recent `StartedAt` while the container was not
+recreated. On 22 Oct the `web` log showed the health checks (every 30 s)
+coming 39–47 s apart in the minutes before the restart, i.e. each check took
+9–17 s against its 10 s limit. Who sent the restart is still being
+investigated in issue #392.
+
+Cause: a coverage run runs **inside the web process**, on the same loop that
+answers every page and the health check. Its database work (for each pair,
+about 550 short queries to record the trips) ran on that loop, so while
+several pairs finished together web answered nothing for seconds. A web that
+stalls like this can be restarted, and any restart of web ends the run.
+
+Fix (the release after v0.1.44.35): the run does its database work in two
+threads of its own and its final step (counts, optional ÖBB check) on a loop
+of its own; the health check needs no thread and no database. Measured on a
+test run: health answers within about 0.1 s during the run (2–3 s before).
+Results, counts and **Stop** behave as before. When web starts and finds runs
+that a restart interrupted, its log says which, with one WARNING:
+
+```bash
+docker compose -p viator logs web | grep orphans_marked_failed
+# network_coverage.orphans_marked_failed count=1 run_ids=['…'] hint='web restarted while …'
+```
+
+What you see now, and what to do:
+
+- A run interrupted by a restart is still marked **failed**: it cannot be
+  resumed. Start it again from the coverage page.
+- **A deploy still ends a running run** (a deploy restarts web). Until runs
+  move to the worker (the open part of issue #392), deploy when no coverage
+  run is in progress, or start the run again after the deploy.
+- To find what restarted web: the WARNING's time is the restart; then
+  `docker inspect viator-web-1` (`StartedAt`), the Docker journal at that
+  time (`journalctl -u docker --since …`: `stopping restart-manager`,
+  `failed to exit within 10s`), and `docker logs viator-autoheal-1`.
+- The health check, its timeout and retries and the autoheal label are
+  unchanged.
 
 ## 7. Rollback
 

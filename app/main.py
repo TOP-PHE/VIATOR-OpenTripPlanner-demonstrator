@@ -173,6 +173,47 @@ def _warn_if_legacy_basic_auth_is_locked() -> None:
         )
 
 
+# #392 — what the WARNING below tells the operator. A coverage run lives in the
+# web process (a FastAPI background task), so a run found unfinished at startup
+# was ended by a restart of web; the log alone cannot say which kind.
+_ORPHANED_RUNS_HINT = (
+    "web restarted while these coverage runs were in progress: a deploy, an "
+    "autoheal restart after failed health checks, or a manual restart; the "
+    "runs are marked failed and must be started again"
+)
+
+
+def _fail_orphaned_coverage_runs() -> None:
+    """v0.1.29.3 — mark any in-flight network-coverage runs as failed.
+
+    FastAPI BackgroundTasks are in-process; a container restart kills them
+    with no DB state cleanup, leaving runs in 'running' status forever. By
+    the time we get here, no `execute_run` from a prior container instance is
+    alive, so anything still 'running' or 'pending' is by definition
+    orphaned. Done in its own try/except so a malformed run row can't keep
+    VIATOR from booting.
+
+    #392 — the WARNING names the runs and the likely causes, so a run ended
+    by an unrequested restart is found in the web log at the restart, not
+    only later on the coverage page.
+    """
+    try:
+        from .network_coverage import runner as _coverage_runner
+
+        with SessionLocal() as db:
+            run_ids = _coverage_runner.mark_orphaned_runs_as_failed(db)
+            if run_ids:
+                db.commit()
+                log.warning(
+                    "network_coverage.orphans_marked_failed",
+                    count=len(run_ids),
+                    run_ids=[str(run_id) for run_id in run_ids],
+                    hint=_ORPHANED_RUNS_HINT,
+                )
+    except Exception:
+        log.exception("network_coverage.orphan_cleanup_failed", fatal=False)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     """Run once per worker. Schema is owned by Alembic and applied by the
@@ -207,23 +248,7 @@ def _startup() -> None:
     except Exception:
         log.exception("sessions_orchestrator.boot_regenerate_failed", fatal=False)
 
-    # v0.1.29.3 — mark any in-flight network-coverage runs as failed.
-    # FastAPI BackgroundTasks are in-process; a container restart kills
-    # them with no DB state cleanup, leaving runs in 'running' status
-    # forever. By the time we get here, no `execute_run` from a prior
-    # container instance is alive, so anything still 'running' or
-    # 'pending' is by definition orphaned. Done in its own try/except
-    # so a malformed run row can't keep VIATOR from booting.
-    try:
-        from .network_coverage import runner as _coverage_runner
-
-        with SessionLocal() as db:
-            n = _coverage_runner.mark_orphaned_runs_as_failed(db)
-            if n:
-                db.commit()
-                log.warning("network_coverage.orphans_marked_failed", count=n)
-    except Exception:
-        log.exception("network_coverage.orphan_cleanup_failed", fatal=False)
+    _fail_orphaned_coverage_runs()
 
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os
@@ -389,13 +414,21 @@ async def _do_upload(
     return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
+# #392 — both health endpoints are `async def` returning constants: they run
+# on the event loop itself and never wait for a thread of the request pool
+# (anyio's 40 threads, which sync handlers can all hold, e.g. while they wait
+# for a database connection). They must never touch the database or do any
+# blocking work: the image HEALTHCHECK (10 s timeout, 3 retries) reads
+# /healthz/version, and a stalled web is restarted.
+
+
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+async def healthz() -> dict[str, str]:  # NOSONAR python:S7503 - async on purpose (#392)
     return {"status": "ok"}
 
 
 @app.get("/healthz/version")
-def healthz_version() -> dict[str, str]:
+async def healthz_version() -> dict[str, str]:  # NOSONAR python:S7503 - async on purpose (#392)
     """Reports which build of VIATOR is actually running.
 
     Use this to verify the deployed container without opening the UI:
