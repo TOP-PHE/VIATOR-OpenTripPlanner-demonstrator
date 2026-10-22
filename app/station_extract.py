@@ -108,7 +108,14 @@ log = logging.getLogger(__name__)
 # unchanged and a remembered failure is retried on the code signature; only
 # an archive mixing StopPlaceRef→Quay with other assignments that already
 # had an extract keeps it until its next file.
-EXTRACTOR_VERSION = "viator-stop-extract-2"
+# 3 (22 October): the country of a stop's position (`iso2_point`) is any
+# bundled country, no longer the v1 list only (Serbia, North Macedonia,
+# Montenegro and the other European countries, Turkey), and a stop on a coast,
+# an estuary or an island the 1:50m boundaries leave out takes the country of
+# the nearest boundary within 10 km (`osm_geo.country_of_position`). Such
+# stops were in no country, so the station module could neither match nor
+# mint them: each was a review item for an administrator.
+EXTRACTOR_VERSION = "viator-stop-extract-3"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one
 # value `ingestion` accepts): the readers take a journey (a GTFS route) that
@@ -449,7 +456,7 @@ def _station_row(station: Station, meta: _Meta, dropped: Counter[str]) -> list[s
         if empty:
             dropped[reason] += 1
             return None
-    iso = osm_geo.country_for_point(lat, lon) or ""
+    iso = osm_geo.country_of_position(lat, lon) or ""
     return [
         FORMAT_VERSION,
         meta.feed_key,

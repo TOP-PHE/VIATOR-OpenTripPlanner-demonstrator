@@ -3551,6 +3551,19 @@ the extracts changes no graph build.
   resolver, its URL, or `upload:` and the sha256 of the uploaded file; a
   cross-border filter provider has none and writes none) and the sha256 of
   the file VIATOR downloaded.
+- **The country of a stop (extractor version 3, 22 October).** The country
+  whose boundary holds the stop's position, any European country and Turkey
+  (Serbia, North Macedonia, Montenegro, Bosnia and Herzegovina, Albania,
+  Kosovo, Ukraine, Moldova, Belarus, Russia, the microstates…), not only the
+  countries offered for the OSM crop. A stop on a coast, an estuary or an
+  island the bundled boundaries miss (they are simplified: up to some 9 km
+  in western Scotland) takes the country of the nearest boundary within
+  10 km; farther out, none. Before, such stops had no country, and the
+  module made each one a review item "A stop in no country". **After
+  deploying this version, press Refresh (all providers) on each session**:
+  every extract is made again once (a new extractor version), sent, and the
+  module's next build gives these stops their country; their review items
+  become obsolete.
 - **When.** After "Refresh" (all providers or one) that fetched a timetable
   or found it unchanged, and after an upload attached to an upload
   provider, queued once the page has its answer for one thread of the `web`
@@ -3710,7 +3723,7 @@ the extracts changes no graph build.
   becomes rail by default at a stop place that gives nothing else. The
   checkbox is hidden on a cross-border derived card (it gives no stop
   extract). Such an extract carries its own extractor version
-  (`viator-stop-extract-2+rail-default`): it is made again at the next
+  (`viator-stop-extract-3+rail-default`): it is made again at the next
   refresh even when the file is unchanged (a remembered `no_rail_stop` is
   not reused) and reaches the module as a new version of the feed. When it
   is sent, the station-module column says what the setting made rail,
