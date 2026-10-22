@@ -268,7 +268,7 @@ async def fetch_plan(
     # legacy (Entur/HSL) path served at `/otp/routers/default/index/graphql`
     # which OTP 2.x dropped. Mismatching this returns 404.
     url = f"{_otp_base(session_id)}/otp/gtfs/v1"
-    timeout = max(timeout_ms / 1000.0, 1.0)
+    timeout = _plan_timeout(timeout_ms)
     has_stop_ids = bool(from_stop_id or to_stop_id)
 
     async with httpx.AsyncClient(timeout=timeout) as c:
@@ -291,6 +291,24 @@ async def fetch_plan(
             raw = r.json()
 
     return raw, _normalise(raw)
+
+
+# Phase budgets other than the read (#388 review), as in `motis_client`.
+# OTP is a session-internal hop: a connection it does not accept within
+# 5 s is not coming, and before this the connect budget was the whole
+# read budget, so the coverage runner's outer `wait_for` (same length)
+# fired first and the connect-timeout retry never got a chance. The
+# request body is a small GraphQL query and every call opens its own
+# client, so 5 s also bounds write and pool. Never longer than before.
+_CONNECT_WRITE_POOL_TIMEOUT_S = 5.0
+
+
+def _plan_timeout(timeout_ms: int) -> httpx.Timeout:
+    """httpx timeouts for one plan call: read as before (`timeout_ms`, at
+    least 1 s), connect / write / pool at most 5 s."""
+    read_s = max(timeout_ms / 1000.0, 1.0)
+    short_s = min(_CONNECT_WRITE_POOL_TIMEOUT_S, read_s)
+    return httpx.Timeout(connect=short_s, read=read_s, write=short_s, pool=short_s)
 
 
 def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
