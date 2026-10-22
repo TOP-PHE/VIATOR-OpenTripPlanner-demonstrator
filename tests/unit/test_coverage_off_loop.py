@@ -407,11 +407,14 @@ async def test_execute_run_phases_run_off_the_loop(monkeypatch) -> None:
 
     await runner.execute_run(rid)
 
-    assert seen["phase1"][0] == rid and seen["phase1"][1] != web_thread
+    assert seen["phase1"][0] == rid
+    assert seen["phase1"][1] != web_thread
     # The engine calls stay on the web loop: awaited I/O.
     assert seen["pair_loop"] is web_loop
     run_id, thread, loop = seen["finalise"]
-    assert run_id == rid and thread != web_thread and loop is not web_loop
+    assert run_id == rid
+    assert thread != web_thread
+    assert loop is not web_loop
     assert rid not in runner._CANCEL_EVENTS
 
 
@@ -479,7 +482,8 @@ def test_mark_orphaned_runs_returns_their_ids() -> None:
     assert runner.mark_orphaned_runs_as_failed(_OrphanDb(runs)) == [r.id for r in runs]  # type: ignore[arg-type]
     for run in runs:
         assert run.status == "failed"
-        assert run.summary is not None and run.summary["orphaned_by_restart"] is True
+        assert run.summary is not None
+        assert run.summary["orphaned_by_restart"] is True
         assert run.summary["zz"] == 99
         assert run.summary["completed_pairs_at_restart"] == 99
     assert runner.mark_orphaned_runs_as_failed(_OrphanDb([])) == []  # type: ignore[arg-type]

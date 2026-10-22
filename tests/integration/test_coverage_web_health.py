@@ -38,7 +38,6 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -79,7 +78,7 @@ def _postgres_or_skip() -> str:
 
 
 @pytest.fixture
-def fresh_db() -> Iterator[str]:
+def fresh_db() -> str:
     url = _postgres_or_skip()
     engine = create_engine(url)
     with engine.begin() as conn:
@@ -125,7 +124,7 @@ def fresh_db() -> Iterator[str]:
                 },
             )
     engine.dispose()
-    yield url
+    return url
 
 
 # ─────────────────────────── the fake MOTIS engine ───────────────────────────
