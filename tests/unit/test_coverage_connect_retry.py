@@ -38,6 +38,19 @@ def _no_real_sleep(monkeypatch):
     return calls
 
 
+# The backoff schedule, pinned here on purpose: 5 s, 15 s, 40 s, each with
+# +-20 % jitter (#388 review). The ranges do not overlap, so a changed or
+# reordered delay fails the check.
+_SCHEDULE_S = (5.0, 15.0, 40.0)
+
+
+def _assert_backoff(calls: list[float], n: int) -> None:
+    """`calls` are the first `n` backoff delays, each within +-20 %."""
+    assert len(calls) == n
+    for got, base in zip(calls, _SCHEDULE_S[:n], strict=True):
+        assert base * 0.8 <= got <= base * 1.2, (got, base)
+
+
 @pytest.mark.asyncio
 async def test_succeeds_immediately_without_retry_on_happy_path():
     calls = 0
@@ -70,7 +83,7 @@ async def test_retries_on_connect_error_then_succeeds(_no_real_sleep):
     assert attempts == 3
     # Two failures → two backoff sleeps, matching the first two entries
     # of the configured delay schedule.
-    assert _no_real_sleep == list(runner._CONNECT_RETRY_DELAYS_S[:2])
+    _assert_backoff(_no_real_sleep, 2)
 
 
 @pytest.mark.asyncio
@@ -87,7 +100,7 @@ async def test_gives_up_and_raises_after_exhausting_all_retries(_no_real_sleep):
 
     # len(delays) retries + the final attempt after the last sleep.
     assert attempts == len(runner._CONNECT_RETRY_DELAYS_S) + 1
-    assert _no_real_sleep == list(runner._CONNECT_RETRY_DELAYS_S)
+    _assert_backoff(_no_real_sleep, 3)
 
 
 @pytest.mark.asyncio
@@ -109,7 +122,7 @@ async def test_retries_on_remote_protocol_error_then_succeeds(_no_real_sleep):
 
     assert result == "recovered"
     assert attempts == 2
-    assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+    _assert_backoff(_no_real_sleep, 1)
 
 
 @pytest.mark.asyncio
@@ -158,8 +171,8 @@ async def test_does_not_retry_read_write_or_pool_timeouts(_no_real_sleep, exc_ty
 
 @pytest.mark.asyncio
 async def test_cancellation_during_backoff_sleep_propagates(monkeypatch):
-    """Cancelling a run while a pair waits in the backoff must stop the
-    pair at once: the retry must neither swallow the CancelledError nor
+    """A task cancellation (e.g. web shutdown) while a pair waits in the
+    backoff must stop the pair at once: the retry must neither swallow the CancelledError nor
     try the engine again. Its own `asyncio.sleep` stub replaces the
     autouse one."""
     attempts = 0
@@ -195,7 +208,139 @@ async def test_cancellation_during_backoff_sleep_propagates(monkeypatch):
     assert task in done
     assert task.cancelled()
     assert attempts == 1
-    assert delays == [runner._CONNECT_RETRY_DELAYS_S[0]]
+    _assert_backoff(delays, 1)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_the_engine_call_propagates(_no_real_sleep):
+    """A task cancellation (e.g. web shutdown) while the engine call is in
+    flight is not a connection error: the task is cancelled, the engine
+    was called once and no backoff sleep happens."""
+    attempts = 0
+    calling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        calling.set()
+        await release.wait()
+        return "late"
+
+    task = asyncio.ensure_future(runner._call_with_connect_retry(_fetch))
+    await asyncio.wait_for(calling.wait(), timeout=5)
+    task.cancel()
+    # Bounded: a retry that swallowed the cancellation would call the
+    # engine again and wait there; releasing it lets that task end.
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=5)
+    finally:
+        release.set()
+
+    assert task in done
+    assert task.cancelled()
+    assert attempts == 1
+    assert _no_real_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_backoff_delays_are_jittered_within_twenty_percent(monkeypatch, _no_real_sleep):
+    """The jitter draws from the module's PRNG, between 0.8 and 1.2 of
+    each delay; pinned at both ends."""
+    draws = iter([0.8, 1.2, 1.0])
+    seen: list[tuple[float, float]] = []
+
+    def _uniform(low: float, high: float) -> float:
+        seen.append((low, high))
+        return next(draws)
+
+    monkeypatch.setattr(runner._BACKOFF_RANDOM, "uniform", _uniform)
+
+    async def _fetch():
+        raise httpx.ConnectError("zz")
+
+    with pytest.raises(httpx.ConnectError):
+        await runner._call_with_connect_retry(_fetch)
+
+    assert seen == [(0.8, 1.2)] * 3
+    assert _no_real_sleep == pytest.approx([4.0, 18.0, 40.0])
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_run_skips_the_backoff_and_the_retry(monkeypatch, _no_real_sleep):
+    """Stop pressed before the first failure: the connection error is
+    raised at once, without sleeping or calling the engine again."""
+    run_id = uuid.uuid4()
+    monkeypatch.setattr(runner, "is_cancelled", lambda rid: rid == run_id)
+    attempts = 0
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout("zz")
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await runner._call_with_connect_retry(_fetch, run_id)
+
+    assert attempts == 1
+    assert _no_real_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_stopped_during_the_backoff_is_not_retried(monkeypatch):
+    """Stop pressed while the pair waits in the backoff: after the sleep
+    the engine is not called again."""
+    run_id = uuid.uuid4()
+    stopped = False
+    monkeypatch.setattr(runner, "is_cancelled", lambda rid: stopped and rid == run_id)
+
+    async def _sleep_then_stop(_delay_s: float) -> None:
+        nonlocal stopped
+        stopped = True
+
+    monkeypatch.setattr(runner.asyncio, "sleep", _sleep_then_stop)
+    attempts = 0
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("zz")
+
+    with pytest.raises(httpx.ConnectError):
+        await runner._call_with_connect_retry(_fetch, run_id)
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_another_runs_stop_does_not_cut_the_retry(monkeypatch, _no_real_sleep):
+    other = uuid.uuid4()
+    monkeypatch.setattr(runner, "is_cancelled", lambda rid: rid == other)
+    attempts = 0
+
+    async def _fetch():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectTimeout("zz")
+        return "ok"
+
+    assert await runner._call_with_connect_retry(_fetch, uuid.uuid4()) == "ok"
+    assert attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("failures", "expected"),
+    [
+        ([httpx.ConnectTimeout("a"), httpx.ConnectError("b")], 0),
+        ([httpx.ConnectTimeout("a"), TimeoutError()], 1),
+        ([httpx.ConnectError("a"), httpx.ReadTimeout("b"), TimeoutError()], 1),
+        ([TimeoutError(), httpx.ConnectTimeout("b")], 0),
+    ],
+    ids=["all-connect", "connect-then-outer-timeout", "first-non-connect", "non-connect-first"],
+)
+def test_slot_failure_reports_a_connection_error_only_when_every_slot_had_one(failures, expected):
+    assert runner._slot_failure(failures) is failures[expected]
 
 
 # ─────────────────────── wiring into the pair-execution call sites ───────────────────────
@@ -409,7 +554,7 @@ async def test_query_one_session_retries_connect_error_via_shared_helper(
 
     assert attempts == 2
     assert status == "ok"
-    assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+    _assert_backoff(_no_real_sleep, 1)
 
 
 @pytest.mark.parametrize(
@@ -417,10 +562,11 @@ async def test_query_one_session_retries_connect_error_via_shared_helper(
     [
         (httpx.ReadTimeout("zz"), "timeout"),
         (TimeoutError(), "timeout"),
+        (httpx.ConnectTimeout("zz"), "timeout"),
         (httpx.ConnectError("zz"), "error"),
         (ValueError("zz"), "error"),
     ],
-    ids=["httpx-read-timeout", "builtin-timeout", "connect-error", "other"],
+    ids=["httpx-read-timeout", "builtin-timeout", "connect-timeout", "connect-error", "other"],
 )
 def test_failure_status_names_timeouts_apart(exc: BaseException, status: str) -> None:
     assert runner._failure_status(exc) == status
@@ -475,7 +621,7 @@ async def test_execute_pair_connect_timeout_then_success_gives_ok_cell(monkeypat
     assert attempts == 2
     assert persisted["status"] == "ok"
     assert persisted["error_message"] is None
-    assert _no_real_sleep == [runner._CONNECT_RETRY_DELAYS_S[0]]
+    _assert_backoff(_no_real_sleep, 1)
 
 
 @pytest.mark.asyncio
@@ -499,7 +645,7 @@ async def test_execute_pair_repeated_connect_timeouts_fail_after_last_retry(
     persisted = await _execute_zz_pair()
 
     assert attempts == len(runner._CONNECT_RETRY_DELAYS_S) + 1
-    assert _no_real_sleep == [5.0, 15.0, 40.0]
+    _assert_backoff(_no_real_sleep, 3)
     assert persisted["status"] == "timeout"
     assert persisted["error_message"].startswith("ConnectTimeout: ")
 
@@ -522,3 +668,176 @@ async def test_execute_pair_read_timeout_is_not_retried(monkeypatch, _no_real_sl
     assert _no_real_sleep == []
     assert persisted["status"] == "timeout"
     assert persisted["error_message"].startswith("ReadTimeout: ")
+
+
+# ─────────────────────── real K-slot fetch (#388 review) ───────────────────────
+#
+# These run the real `_fetch_plan_sliced` and stub only the engine, so the
+# slot merge decides whether the whole pair is retried.
+
+_WINDOW_START = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+
+
+class _SlotPlanner:
+    """Fake engine: slot 0 (the window start) does `first`, every other
+    slot does `others` ("connect": ConnectTimeout, "hang": never answers,
+    so the slot's outer wait_for fires, "empty": answers no trip)."""
+
+    def __init__(self, first: str, others: str) -> None:
+        self.first = first
+        self.others = others
+        self.calls = 0
+
+    async def fetch_plan(self, *, when, **_kwargs):
+        self.calls += 1
+        mode = self.first if when == _WINDOW_START else self.others
+        if mode == "connect":
+            raise httpx.ConnectTimeout("zz")
+        if mode == "hang":
+            await asyncio.Event().wait()
+        return {"zz": True}, []
+
+
+async def _execute_sliced_zz_pair(monkeypatch, planner: _SlotPlanner):
+    monkeypatch.setattr(runner.planner_dispatch, "planner_for_engine", lambda _engine: planner)
+    _patch_execute_pair_db_layer(monkeypatch)
+    origin, dest = _zz_hubs()
+    await runner._execute_pair(
+        run_id=uuid.uuid4(),
+        session_id="zz-sess",
+        engine="motis",
+        origin=origin,
+        dest=dest,
+        depart_at=_WINDOW_START,
+        cfg=runner.CoverageConfig(slot_count=6, within_pair_parallelism=6, slot_timeout_ms=50),
+        window=_resolved_window(),
+    )
+    return runner._persist_pair_coverage_result.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_sliced_pair_with_every_slot_failing_to_connect_is_retried(
+    monkeypatch, _no_real_sleep
+):
+    planner = _SlotPlanner(first="connect", others="connect")
+
+    persisted = await _execute_sliced_zz_pair(monkeypatch, planner)
+
+    assert planner.calls == 6 * 4  # every slot, on each of the 4 attempts
+    _assert_backoff(_no_real_sleep, 3)
+    assert persisted["status"] == "timeout"
+    assert persisted["error_message"].startswith("ConnectTimeout: ")
+
+
+@pytest.mark.asyncio
+async def test_sliced_pair_with_connect_timeout_and_slot_timeouts_is_not_retried(
+    monkeypatch, _no_real_sleep
+):
+    """Slot 0 cannot connect, the others time out: the engine took those
+    requests, so the pair's failure is its own and is not retried, whatever
+    the slot order (#388 review)."""
+    planner = _SlotPlanner(first="connect", others="hang")
+
+    persisted = await _execute_sliced_zz_pair(monkeypatch, planner)
+
+    assert planner.calls == 6
+    assert _no_real_sleep == []
+    assert persisted["status"] == "timeout"
+    assert persisted["error_message"].startswith("TimeoutError")
+
+
+@pytest.mark.asyncio
+async def test_sliced_pair_with_one_slot_failing_to_connect_keeps_the_partial_result(
+    monkeypatch, _no_real_sleep
+):
+    """Slot 0 cannot connect, the others answer: partial result as before,
+    no retry (a per-slot retry is a follow-up)."""
+    planner = _SlotPlanner(first="connect", others="empty")
+
+    persisted = await _execute_sliced_zz_pair(monkeypatch, planner)
+
+    assert planner.calls == 6
+    assert _no_real_sleep == []
+    assert persisted["status"] == "no_route"
+    assert persisted["error_message"] is None
+
+
+# ─────────────────────── OTP phase timeouts (#388 review) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("timeout_ms", "read_s", "short_s"),
+    [(60_000, 60.0, 5.0), (20_000, 20.0, 5.0), (3_000, 3.0, 3.0), (200, 1.0, 1.0)],
+    ids=["coverage-legacy", "coverage-slot", "short-live", "below-floor"],
+)
+def test_otp_plan_timeout_shortens_connect_write_pool_only(timeout_ms, read_s, short_s):
+    from app.journey import otp_client
+
+    t = otp_client._plan_timeout(timeout_ms)
+
+    assert (t.connect, t.read, t.write, t.pool) == (short_s, read_s, short_s, short_s)
+
+
+@pytest.mark.asyncio
+async def test_otp_fetch_plan_uses_the_phase_timeouts(monkeypatch):
+    """The plan call itself builds its client with those timeouts."""
+    from app.journey import otp_client
+
+    real_client = httpx.AsyncClient
+    seen: list[httpx.Timeout] = []
+
+    def _client(*, timeout, **kwargs):
+        seen.append(timeout)
+        transport = httpx.MockTransport(
+            lambda _req: httpx.Response(200, json={"data": {"planConnection": {"edges": []}}})
+        )
+        return real_client(timeout=timeout, transport=transport, **kwargs)
+
+    monkeypatch.setattr(otp_client.httpx, "AsyncClient", _client)
+    monkeypatch.setattr(otp_client, "_otp_base", lambda _sid: "http://zz-otp.invalid")
+
+    _raw, trips = await otp_client.fetch_plan(
+        session_id="zz-sess",
+        from_lat=0.0,
+        from_lon=0.0,
+        to_lat=1.0,
+        to_lon=1.0,
+        when=datetime(2026, 7, 1, 8, 0, tzinfo=UTC),
+        timeout_ms=20_000,
+    )
+
+    assert trips == []
+    assert seen == [httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)]
+
+
+@pytest.mark.asyncio
+async def test_both_call_sites_pass_the_run_id_to_the_retry(monkeypatch, _no_real_sleep):
+    """A stopped run cuts the retry in the single-session and the fanout
+    path alike, so both hand their run id to the retry helper."""
+    monkeypatch.setattr(runner, "is_cancelled", lambda _rid: True)
+    attempts = 0
+
+    async def _fake_sliced(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout("zz")
+
+    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    _patch_execute_pair_db_layer(monkeypatch)
+    origin, dest = _zz_hubs()
+
+    persisted = await _execute_zz_pair()
+    _sid, status, _raw, _trips, _ms = await runner._query_one_session_for_pair(
+        sid="zz-sess",
+        engine="motis",
+        origin=origin,
+        dest=dest,
+        depart_at=_WINDOW_START,
+        run_id=uuid.uuid4(),
+        window=_resolved_window(),
+    )
+
+    assert attempts == 2
+    assert _no_real_sleep == []
+    assert persisted["status"] == "timeout"
+    assert status == "timeout"
