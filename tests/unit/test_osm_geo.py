@@ -7,9 +7,17 @@ suggestion threshold, and the osmium crop polygon.
 
 from __future__ import annotations
 
+import hashlib
+import math
+
 import pytest
 
 from app import osm_geo as g
+from app import station_extract
+
+# The sha256 of app/data/country_borders.geojson (see
+# test_the_boundaries_file_changes_with_the_extractor_version).
+BOUNDARIES_SHA256 = "b5ca4ef32d12062b03572fd269d5e1400a43fdc20cc8148b6a366b92fa0d0f6d"
 
 # ──────────────────────── validate_countries ────────────────────────
 
@@ -95,7 +103,7 @@ def test_country_for_point_keeps_to_the_v1_list(name, lat, lon):
         ("Genève", 46.210, 6.140, "CH"),
         ("Belgrade", 44.817, 20.457, "RS"),
         ("Novi Sad", 45.267, 19.833, "RS"),
-        # By the Bulgarian and Romanian borders: Serbia, never its neighbours.
+        # By the Bulgarian and Hungarian borders, beyond BORDER_DOUBT_KM: Serbia.
         ("Negotin", 44.228, 22.531, "RS"),
         ("Zaječar", 43.903, 22.275, "RS"),
         ("Subotica", 46.100, 19.666, "RS"),
@@ -105,13 +113,13 @@ def test_country_for_point_keeps_to_the_v1_list(name, lat, lon):
         ("Sarajevo", 43.856, 18.413, "BA"),
         ("Tirana", 41.327, 19.819, "AL"),
         ("Pristina", 42.663, 21.165, "XK"),
-        # Across the Hungarian and Slovak borders: Ukraine.
-        ("Chop", 48.432, 22.201, "UA"),
+        ("Edirne", 41.677, 26.555, "TR"),
+        ("Brest (Belarus)", 52.098, 23.735, "BY"),
         ("Chișinău", 47.011, 28.863, "MD"),
         ("Minsk", 53.902, 27.561, "BY"),
-        ("Monaco", 43.739, 7.420, "MC"),
         ("Istanbul Sirkeci", 41.015, 28.977, "TR"),
         ("Kaliningrad", 54.710, 20.452, "RU"),
+        ("Andorra la Vella", 42.507, 1.522, "AD"),
     ],
 )
 def test_country_of_position_knows_every_european_country(name, lat, lon, expected):
@@ -121,14 +129,108 @@ def test_country_of_position_knows_every_european_country(name, lat, lon, expect
 @pytest.mark.parametrize(
     "name,lat,lon,expected",
     [
+        # Stations of v1 countries that fall inside their neighbour's 1:50m
+        # polygon: no country, as before the neighbours were bundled — never
+        # the neighbour's (review of #389).
+        ("Narva, EE", 59.3727, 28.1953, None),
+        ("Záhony, HU", 48.4093, 22.1748, None),
+        ("Medyka, PL", 49.803, 22.937, None),
+        ("Idomeni, GR", 41.1237, 22.5128, None),
+        ("Pythio, GR", 41.3718, 26.6209, None),
+        ("Kastanies, GR", 41.66, 26.47, None),
+        ("Tovarnik, HR", 45.1645, 19.1525, None),
+        ("Metković, HR", 43.0537, 17.6488, None),
+        ("Cap-d'Ail, FR", 43.720, 7.403, None),
+        # The other side of the same lines, within BORDER_DOUBT_KM: none too.
+        ("Chop, UA", 48.432, 22.201, None),
+        ("Gevgelija, MK", 41.140, 22.503, None),
+        ("Monaco-Monte-Carlo", 43.739, 7.420, None),
+        # At sea 7 km off Monaco, in no polygon: Monaco's line is the nearest,
+        # France's 0.2 km farther (the band counts from the nearest line).
+        ("at sea off Monaco", 43.68, 7.43, None),
+        # Inside their own v1 country: unchanged.
+        ("Terespol, PL", 52.075, 23.62, "PL"),
+        ("Valga, EE", 57.776, 26.045, "EE"),
+        ("Svilengrad, BG", 41.77, 26.20, "BG"),
+    ],
+)
+def test_a_position_by_a_v1_border_is_never_the_neighbours(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+def test_the_border_doubt_is_measured_from_the_v1_boundary():
+    # Due east of Narva, Russia's side: in doubt within BORDER_DOUBT_KM of the
+    # 1:50m Estonian line, Russia beyond it (fixed distances, not the constant).
+    lat, lon = 59.3727, 28.1953
+    k_lon = 111.32 * math.cos(math.radians(lat))
+    estonia = g._boundaries_within(lat, lon, 10.0, g.VALID_COUNTRIES)["EE"]
+    assert estonia == pytest.approx(2.52, abs=0.05)
+    assert g.country_of_position(lat, lon + (2.6 - estonia) / k_lon) is None
+    assert g.country_of_position(lat, lon + (3.6 - estonia) / k_lon) == "RU"
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        # Crimea is Ukraine's (EU and UN position; Natural Earth's Ukrainian
+        # point of view), the rest of Russia Russia's.
+        ("Simferopol", 44.952, 34.102, "UA"),
+        ("Sevastopol", 44.616, 33.525, "UA"),
+        ("Kerch", 45.357, 36.468, "UA"),
+        ("Krasnodar", 45.035, 38.975, "RU"),
+        ("Rostov-on-Don", 47.222, 39.718, "RU"),
+        ("Port Kavkaz", 45.33, 36.67, "RU"),
+    ],
+)
+def test_crimea_is_ukraine(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+def test_the_crimea_polygon_is_ukraines_in_the_bundled_boundaries():
+    holders = [
+        iso
+        for iso, _bbox, poly in g._polygons()
+        if iso in ("RU", "UA") and g._polygon_contains(34.102, 44.952, poly)
+    ]
+    assert holders == ["UA"]
+    assert g.country_for_point(44.952, 34.102) is None  # not a v1 country
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon",
+    [
+        # In a country beyond the bundled ones' land borders: none, never the
+        # nearest bundled country (the coast fallback is for a coast).
+        ("Gibraltar", 36.14, -5.353),
+        ("Qamishli, SY", 37.05, 41.22),
+        ("Sarpi, GE", 41.52, 41.55),
+        ("Batumi, GE", 41.65, 41.64),
+        ("Samur, AZ", 41.83, 48.57),
+        ("Manzhouli, CN", 49.6, 117.43),
+        ("Sükhbaatar, MN", 50.23, 106.2),
+        ("Oiapoque, BR", 3.84, -51.83),
+    ],
+)
+def test_a_position_in_a_neighbour_country_is_in_none(name, lat, lon):
+    assert g.country_of_position(lat, lon) is None, name
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
         # Outside the 1:50m coast by some 7 km: the nearest boundary's country.
         ("Mallaig", 57.006, -5.830, "GB"),
         ("Sheerness-on-Sea", 51.441, 0.758, "GB"),
         ("Split", 43.504, 16.441, "HR"),
+        ("Algeciras, beside Gibraltar", 36.129, -5.447, "ES"),
+        ("La Línea, beside Gibraltar", 36.165, -5.347, "ES"),
+        ("Kirkenes", 69.727, 30.045, "NO"),
         # Farther than COAST_TOLERANCE_KM from any boundary: none.
         ("St Mary's, Isles of Scilly", 49.916, -6.318, None),
         ("mid-Atlantic", 45.0, -30.0, None),
         ("null island", 0.0, 0.0, None),
+        ("not a number", math.nan, 2.349, None),
+        ("infinite", math.inf, 2.349, None),
     ],
 )
 def test_country_of_position_takes_the_nearest_boundary_on_a_coast(name, lat, lon, expected):
@@ -136,7 +238,9 @@ def test_country_of_position_takes_the_nearest_boundary_on_a_coast(name, lat, lo
 
 
 def test_a_position_just_inside_the_tolerance_has_a_country_and_just_beyond_none():
-    # Due north of Scotland's northernmost 1:50m point, over open sea.
+    # Due north of Scotland's northernmost 1:50m point, over open sea, at
+    # fixed distances (not derived from COAST_TOLERANCE_KM, so a changed
+    # tolerance fails here).
     north = max(
         (lat, lon)
         for iso, _bbox, poly in g._polygons()
@@ -145,29 +249,96 @@ def test_a_position_just_inside_the_tolerance_has_a_country_and_just_beyond_none
         for lon, lat in ring
     )
     km_per_degree = 110.57
-    inside = north[0] + (g.COAST_TOLERANCE_KM - 0.5) / km_per_degree
-    beyond = north[0] + (g.COAST_TOLERANCE_KM + 0.5) / km_per_degree
-    assert g.country_of_position(inside, north[1]) == "GB"
-    assert g.country_of_position(beyond, north[1]) is None
+    assert g.country_of_position(north[0] + 9.5 / km_per_degree, north[1]) == "GB"
+    assert g.country_of_position(north[0] + 10.5 / km_per_degree, north[1]) is None
+    assert g.country_of_position(north[0] + 12.5 / km_per_degree, north[1]) is None
 
 
-def test_the_bundled_boundaries_are_the_v1_list_and_the_other_countries():
-    bundled = {iso for iso, _bbox, _geom in g._features()}
-    assert bundled == g.VALID_COUNTRIES | g.OTHER_COUNTRIES
+def test_the_tolerance_runs_east_west_at_high_latitude():
+    # Due west of Jan Mayen (Norway, 70.9°N), whose westernmost 1:50m vertex is
+    # its nearest point: a degree of longitude is some 36.5 km there, not 111.
+    lon, lat = min(
+        (lon, lat)
+        for iso, _bbox, poly in g._polygons()
+        if iso == "NO"
+        for ring in poly
+        for lon, lat in ring
+        if lat > 69.0
+    )
+    assert lat == pytest.approx(70.85, abs=0.05)
+    k_lon = 111.32 * math.cos(math.radians(lat))
+    assert g.country_of_position(lat, lon - 9.5 / k_lon) == "NO"
+    assert g.country_of_position(lat, lon - 10.5 / k_lon) is None
+    assert g.country_of_position(lat, lon - 12.5 / k_lon) is None
+
+
+def test_an_enclave_is_a_hole_in_its_surrounding_country():
+    # San Marino and the Vatican are holes in Italy's 1:50m polygon: in Italy
+    # only when the holes are ignored.
+    vatican = next(poly for iso, _bbox, poly in g._polygons() if iso == "VA")[0]
+    middle = (
+        sum(lat for _lon, lat in vatican[:-1]) / (len(vatican) - 1),
+        sum(lon for lon, _lat in vatican[:-1]) / (len(vatican) - 1),
+    )
+    for lat, lon, own in ((43.936, 12.447, "SM"), (*middle, "VA")):
+        assert g.country_for_point(lat, lon) is None
+        assert g._containing(lat, lon, None) == own
+    assert g.country_of_position(43.936, 12.447) == "SM"  # 3.2 km from Italy's line
+
+
+def test_the_bundled_polygons_do_not_overlap():
+    polygons = g._polygons()
+    for i in range(int((72.0 - 34.0) / 0.5)):
+        lat = 34.0 + 0.25 + 0.5 * i
+        for j in range(int((50.0 + 25.0) / 0.5)):
+            lon = -25.0 + 0.25 + 0.5 * j
+            holders = [
+                iso
+                for iso, (min_lon, min_lat, max_lon, max_lat), poly in polygons
+                if min_lon <= lon <= max_lon
+                and min_lat <= lat <= max_lat
+                and g._polygon_contains(lon, lat, poly)
+            ]
+            assert len(holders) <= 1, (lat, lon, holders)
+
+
+def test_the_bundled_boundaries_are_the_v1_list_the_other_countries_and_neighbours():
+    bundled = [iso for iso, _bbox, _geom in g._features()]
+    assert set(bundled) == g.VALID_COUNTRIES | g.OTHER_COUNTRIES | g.NEIGHBOUR_COUNTRIES
+    assert len(bundled) == len(set(bundled))
     assert not g.VALID_COUNTRIES & g.OTHER_COUNTRIES
+    assert not (g.VALID_COUNTRIES | g.OTHER_COUNTRIES) & g.NEIGHBOUR_COUNTRIES
+    # The v1 features first, as before: a v1 position stops at its own polygon.
+    assert set(bundled[: len(g.VALID_COUNTRIES)]) == g.VALID_COUNTRIES
+
+
+def test_the_boundaries_file_changes_with_the_extractor_version():
+    # The rows of the stop extract follow this file: a change to it changes
+    # `iso2_point`, so raise station_extract.EXTRACTOR_VERSION with it and
+    # update both values here.
+    digest = hashlib.sha256(g._GEOJSON_PATH.read_bytes()).hexdigest()
+    assert digest == BOUNDARIES_SHA256
+    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-3"
+    assert g._GEOJSON_PATH.stat().st_size < 1024 * 1024  # the pre-commit large-file cap
 
 
 def test_the_other_countries_are_never_offered_for_the_crop():
-    with pytest.raises(ValueError):
-        g.validate_countries(["RS"])
+    for code in ("RS", "UA", "GE", "GI"):
+        with pytest.raises(ValueError):
+            g.validate_countries([code])
     every = g.crop_geojson(sorted(g.VALID_COUNTRIES))
     v1_polygons = sum(1 for iso, _bbox, _poly in g._polygons() if iso in g.VALID_COUNTRIES)
     assert len(every["geometry"]["coordinates"]) == v1_polygons
 
 
 def test_detection_counts_no_stop_in_another_country():
-    # Coordinates only, no UIC-shaped id: Belgrade and Skopje count nowhere.
-    stops = [("ZZ-1", 44.817, 20.457), ("ZZ-2", 41.997, 21.428), ("ZZ-3", 48.853, 2.349)]
+    # Coordinates only, no UIC-shaped id: Belgrade, Skopje and Tbilisi count nowhere.
+    stops = [
+        ("ZZ-1", 44.817, 20.457),
+        ("ZZ-2", 41.997, 21.428),
+        ("ZZ-3", 48.853, 2.349),
+        ("ZZ-4", 41.716, 44.783),
+    ]
     assert g.detect_from_stops(stops) == {"FR": 1}
 
 

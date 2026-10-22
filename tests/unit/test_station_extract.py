@@ -455,8 +455,9 @@ def test_the_country_of_a_stop_is_any_european_country_or_the_nearest_coast(
     tmp_path: Path,
 ) -> None:
     """Extractor version 3 (`osm_geo.country_of_position`): a stop in Serbia
-    is in Serbia, one on a coast the 1:50m boundaries miss takes the nearest
-    country, one far out at sea none."""
+    is in Serbia, one in Crimea in Ukraine, one on a coast the 1:50m
+    boundaries miss takes the nearest country, one far out at sea none, and
+    one by a v1 border inside its neighbour's 1:50m polygon (Narva) none."""
     stops = (
         "stop_id,stop_code,stop_name,stop_lat,stop_lon,location_type,parent_station,platform_code\n"
         "ZZ:S1,,ZZ Beograd,44.8170000,20.4570000,1,,\n"
@@ -465,8 +466,11 @@ def test_the_country_of_a_stop_is_any_european_country_or_the_nearest_coast(
         "ZZ:S2,,ZZ Mallaig,57.006,-5.830,0,,\n"
         "ZZ:B1,,ZZ Arret bus,48.7,2.2,0,,\n"
         "ZZ:S3,,ZZ Scilly,49.916,-6.318,0,,\n"
+        "ZZ:S4,,ZZ Narva,59.3727,28.1953,0,,\n"
+        "ZZ:S5,,ZZ Simferopol,44.952,34.102,0,,\n"
     )
-    result = _build(_provider(), _gtfs(tmp_path, stops=stops), tmp_path)
+    stop_times = STOP_TIMES + ("T1,09:30:00,09:30:00,ZZ:S4,3,,\nT1,10:00:00,10:00:00,ZZ:S5,4,,\n")
+    result = _build(_provider(), _gtfs(tmp_path, stops=stops, stop_times=stop_times), tmp_path)
     key = feed_key_for(_provider())
     assert key is not None
     rows = _by_key(_msmm_check(result.path_gz, key))
@@ -474,6 +478,8 @@ def test_the_country_of_a_stop_is_any_european_country_or_the_nearest_coast(
         "ZZ:S1": "RS",
         "ZZ:S2": "GB",
         "ZZ:S3": "",
+        "ZZ:S4": "",
+        "ZZ:S5": "UA",
     }
     assert EXTRACTOR_VERSION == "viator-stop-extract-3"
 

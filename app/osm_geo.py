@@ -8,11 +8,12 @@ It is the single source of truth for:
   - the v1 country list (EU-27 + EFTA + UK) + display names,
   - `validate_countries()` — the config-write gate (mirrors osm_filter),
   - point-in-polygon country lookup for a coordinate (auto-detect), backed by
-    a bundled simplified country-boundary GeoJSON (Natural Earth 50m,
-    public domain — see NOTICE),
+    the bundled country boundaries (Natural Earth 1:50m, coarse; public
+    domain — see NOTICE),
   - `country_of_position()` — the country of a stop for the station module's
-    stop extract (MSMM 22.2, `iso2_point`): any bundled country, not only the
-    v1 list, and the nearest one for a stop on a coast the boundaries miss,
+    stop extract (MSMM 22.2, `iso2_point`): any bundled European country, not
+    only the v1 list, and the nearest one for a stop on a coast the boundaries
+    miss; none where 1:50m cannot tell (by a v1 border, in a neighbour),
   - `detect_from_stops()` — count a GTFS feed's stops per country (UIC prefix
     primary, point-in-polygon fallback), and the ≥5-stop suggestion,
   - `crop_geojson()` — the merged polygon the build hands to `osmium extract`.
@@ -74,12 +75,12 @@ COUNTRY_NAMES: dict[str, str] = {
 VALID_COUNTRIES: frozenset[str] = frozenset(COUNTRY_NAMES)
 
 # The other countries of the bundled boundaries: Natural Earth's other European
-# countries (the Western Balkans, Ukraine, Belarus, Moldova, Russia, the
-# microstates, Åland, the Faroes and the Crown dependencies) and Turkey. Only
-# `country_of_position` returns them — a stop in Serbia is in Serbia, not in no
-# country, and a stop just across a border of the v1 list is never taken for
-# its neighbour's. They are never offered for the OSM crop (`validate_countries`
-# refuses them), and `country_for_point` keeps to the v1 list.
+# countries (the Western Balkans, Ukraine with Crimea, Belarus, Moldova, Russia,
+# the microstates, Åland, the Faroes and the Crown dependencies) and Turkey.
+# Only `country_of_position` returns them — a stop in Serbia is in Serbia, not
+# in no country — and only away from a v1 border (`BORDER_DOUBT_KM`). They are
+# never offered for the OSM crop (`validate_countries` refuses them), and
+# `country_for_point` keeps to the v1 list.
 OTHER_COUNTRIES: frozenset[str] = frozenset(
     {
         "AD", "AL", "AX", "BA", "BY", "FO", "GG", "IM", "JE", "MC",
@@ -87,11 +88,29 @@ OTHER_COUNTRIES: frozenset[str] = frozenset(
     }
 )  # fmt: skip
 
+# The countries beyond the land borders of the bundled ones (and of French
+# Guiana, Sakhalin, Gibraltar): bundled so that a stop on their land is known
+# to be in none of ours, never returned. Without them the coast fallback gave
+# Gibraltar to Spain, Qamishli to Turkey, Manzhouli to Russia.
+NEIGHBOUR_COUNTRIES: frozenset[str] = frozenset(
+    {"AM", "AZ", "BR", "CN", "GE", "GI", "IQ", "IR", "JP", "KP", "KZ", "MN", "SR", "SY"}
+)
+
 # A position in no country's boundary — on a coast, an estuary or an island the
 # 1:50m boundaries leave out (up to some 9 km on the sea lochs and islands of
 # western Scotland, 7 km on the Thames estuary) — is in the country whose
 # boundary is nearest, within this distance; farther, in none.
 COAST_TOLERANCE_KM = 10.0
+
+# The 1:50m borders lie up to some 2.6 km from the real ones (measured on rail
+# stations of v1 countries that fall inside their neighbour's polygon: Narva
+# 2.5 km inside Russia's, Cap-d'Ail 2.4 km inside Monaco's, Metković 2.3 km
+# inside Bosnia's). A position whose country would be one of
+# `OTHER_COUNTRIES` while a v1 boundary passes within this distance (beyond
+# the distance to that country, for the coast fallback) is in none: 1:50m
+# cannot tell, and an empty country is a question for an administrator in the
+# station module, where a wrong one is acted upon.
+BORDER_DOUBT_KM = 3.0
 
 # A country is *pre-ticked* in the UI only when it has at least this many
 # stops — a flat threshold so a stray / (0,0) coordinate can't drag in a
@@ -209,8 +228,9 @@ def _polygons() -> list[tuple[str, tuple[float, float, float, float], list[list[
 
 def _containing(lat: float, lon: float, allowed: frozenset[str] | None) -> str | None:
     """The country of the first bundled polygon holding (lat, lon), among the
-    `allowed` countries (every bundled one when None). The polygons of Natural
-    Earth do not overlap, so the first is the only one."""
+    `allowed` countries (every bundled one when None). The bundled polygons do
+    not overlap (Natural Earth's shared borders are the same lines; checked by
+    a test), so the first is the only one."""
     for iso, (min_lon, min_lat, max_lon, max_lat), poly in _polygons():
         if allowed is not None and iso not in allowed:
             continue
@@ -228,35 +248,53 @@ def _segment_km(ax: float, ay: float, bx: float, by: float) -> float:
     return math.hypot(ax + t * dx, ay + t * dy)
 
 
-def _nearest_within(lat: float, lon: float, km: float) -> str | None:
-    """The country whose bundled boundary passes nearest to (lat, lon), when
-    at most `km` away; else None. Distances on a plane tangent at the point
-    (exact enough within tens of km)."""
-    k_lat = 110.57
-    k_lon = 111.32 * max(math.cos(math.radians(lat)), 0.05)
-    d_lat, d_lon = km / k_lat, km / k_lon
-    best_iso, best = None, math.inf
+def _polygon_km(
+    lat: float, lon: float, poly: list[list[list[float]]], k: tuple[float, float]
+) -> float:
+    """Distance in km from (lat, lon) to the nearest ring of a polygon, with
+    `k` the km of a degree of latitude and of longitude at the point."""
+    k_lat, k_lon = k
+    best = math.inf
+    for ring in poly:
+        for (x1, y1, *_), (x2, y2, *_) in itertools.pairwise(ring):
+            best = min(
+                best,
+                _segment_km(
+                    (x1 - lon) * k_lon, (y1 - lat) * k_lat, (x2 - lon) * k_lon, (y2 - lat) * k_lat
+                ),
+            )
+    return best
+
+
+def _boundaries_within(
+    lat: float, lon: float, km: float, allowed: frozenset[str] | None = None
+) -> dict[str, float]:
+    """The bundled countries (among `allowed`, every one when None) whose
+    boundary passes at most `km` from (lat, lon), each with its distance, in
+    the file's order. Distances on a plane tangent at the point (exact enough
+    within tens of km)."""
+    k = (110.57, 111.32 * max(math.cos(math.radians(lat)), 0.05))
+    d_lat, d_lon = km / k[0], km / k[1]
+    out: dict[str, float] = {}
     for iso, (min_lon, min_lat, max_lon, max_lat), poly in _polygons():
+        if allowed is not None and iso not in allowed:
+            continue
         if not (
             min_lon - d_lon <= lon <= max_lon + d_lon and min_lat - d_lat <= lat <= max_lat + d_lat
         ):
             continue
-        for ring in poly:
-            for (x1, y1, *_), (x2, y2, *_) in itertools.pairwise(ring):
-                distance = _segment_km(
-                    (x1 - lon) * k_lon, (y1 - lat) * k_lat, (x2 - lon) * k_lon, (y2 - lat) * k_lat
-                )
-                if distance < best:
-                    best_iso, best = iso, distance
-    return best_iso if best <= km else None
+        distance = _polygon_km(lat, lon, poly, k)
+        if distance <= km and distance < out.get(iso, math.inf):
+            out[iso] = distance
+    return out
 
 
 def country_for_point(lat: float, lon: float) -> str | None:
     """ISO code of the v1 country containing (lat, lon), or None.
 
     Pure geographic lookup against the bundled boundaries, the v1 countries
-    only (a point in another bundled country is in none here, as before they
-    were bundled). bbox pre-filter keeps it cheap. Coarse 50m borders mean a
+    only (a point in another bundled country, or in a neighbour, is in none
+    here, as before they were bundled). bbox pre-filter keeps it cheap. Coarse 50m borders mean a
     point within a few km of a border may resolve to the neighbour — fine for
     the suggestion (the UIC cross-check in `detect_from_stops` is the precise
     signal where present).
@@ -266,15 +304,37 @@ def country_for_point(lat: float, lon: float) -> str | None:
 
 def country_of_position(lat: float, lon: float) -> str | None:
     """The country of a stop's position for the station module's stop extract
-    (MSMM 22.2, `iso2_point`): the bundled country whose boundary holds it,
-    v1 or not (`OTHER_COUNTRIES`); else, for a stop on a coast, an estuary or
-    an island the 1:50m boundaries leave out, the country whose boundary is
-    nearest within `COAST_TOLERANCE_KM`; else None. None too for the GTFS
-    placeholder (0, 0).
+    (MSMM 22.2, `iso2_point`), or None:
+
+    1. the bundled country whose boundary holds it, v1 or not
+       (`OTHER_COUNTRIES`); else, for a stop on a coast, an estuary or an
+       island the 1:50m boundaries leave out, the country whose boundary is
+       nearest within `COAST_TOLERANCE_KM`;
+    2. None when that country is one of `NEIGHBOUR_COUNTRIES` (a stop in
+       Georgia or Gibraltar is in none of ours);
+    3. None when it is one of `OTHER_COUNTRIES` and a v1 boundary lies within
+       `BORDER_DOUBT_KM` beyond it (a station of Narva, Estonia, inside the
+       1:50m Russia): as before those countries were bundled.
+
+    None too for the GTFS placeholder (0, 0) and a position not finite.
     """
-    if abs(lat) <= 1e-7 and abs(lon) <= 1e-7:
+    if not (math.isfinite(lat) and math.isfinite(lon)) or (abs(lat) <= 1e-7 and abs(lon) <= 1e-7):
         return None
-    return _containing(lat, lon, None) or _nearest_within(lat, lon, COAST_TOLERANCE_KM)
+    iso = _containing(lat, lon, None)
+    distance = 0.0
+    if iso is None:
+        near = _boundaries_within(lat, lon, COAST_TOLERANCE_KM)
+        if not near:
+            return None
+        iso = min(near, key=near.__getitem__)
+        distance = near[iso]
+    if iso in NEIGHBOUR_COUNTRIES:
+        return None
+    if iso in OTHER_COUNTRIES and _boundaries_within(
+        lat, lon, distance + BORDER_DOUBT_KM, VALID_COUNTRIES
+    ):
+        return None
+    return iso
 
 
 # ─────────────────────────── detection from stops ──────────────────────────

@@ -23,10 +23,19 @@ This product includes software developed by third parties:
     Licensed under the Open Database License (ODbL).
 
   * Natural Earth 1:50m Admin-0 country boundaries
-    (https://www.naturalearthdata.com, version 5.1.2) — bundled (the European
-    countries and Turkey) as app/data/country_borders.geojson for the OSM
-    geographic-scope feature and the country of a stop in the station
-    module's stop extract.
+    (https://www.naturalearthdata.com, version 5.1.2) — bundled as
+    app/data/country_borders.geojson for the OSM geographic-scope feature
+    and the country of a stop in the station module's stop extract: the
+    European countries and Turkey, and the countries beyond their land
+    borders (Armenia, Azerbaijan, Brazil, China, Georgia, Iran, Iraq, Japan,
+    Kazakhstan, Mongolia, North Korea, Suriname, Syria), with their
+    coordinates as published (the 1:50m scale is coarse: borders up to some
+    3 km off). Gibraltar is Natural Earth's 1:10m polygon (absent at 1:50m).
+    Changes made: ISO codes normalised where Natural Earth gives -99 (France
+    FR, Norway NO, Kosovo XK; XK is a user-assigned code, not ISO 3166-1);
+    Crimea is Ukraine's, as in Natural Earth's Ukrainian point of view and
+    the view of the EU and the UN (its breakaway/disputed area "Crimea",
+    whose 1:50m polygon is the one moved from Russia to Ukraine).
     Public domain; no attribution required, credited here as a courtesy.
 
   * MapLibre GL JS (when wired in step 14 of the implementation order)

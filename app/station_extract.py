@@ -114,7 +114,12 @@ log = logging.getLogger(__name__)
 # an estuary or an island the 1:50m boundaries leave out takes the country of
 # the nearest boundary within 10 km (`osm_geo.country_of_position`). Such
 # stops were in no country, so the station module could neither match nor
-# mint them: each was a review item for an administrator.
+# mint them: each was a review item for an administrator. Still none (follow-
+# up to #389, before any release carried version 3): a position by a v1
+# border whose country would be a non-v1 neighbour (within 3 km), one in a
+# country beyond the bundled ones (Georgia, Syria, Gibraltar…); Crimea is UA.
+# Any change to `app/data/country_borders.geojson` changes these rows: raise
+# this version with it (tests/unit/test_osm_geo.py pins the file's sha256).
 EXTRACTOR_VERSION = "viator-stop-extract-3"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one

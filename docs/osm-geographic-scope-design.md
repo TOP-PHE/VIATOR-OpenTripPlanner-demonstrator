@@ -107,8 +107,8 @@ raw PBF
   → OTP --buildStreet
 ```
 
-One new **data dependency**: a simplified country-boundary GeoJSON (Natural
-Earth admin-0, ODbL/public-domain, a few hundred KB simplified) baked into
+One new **data dependency**: a coarse country-boundary GeoJSON (Natural
+Earth admin-0 at 1:50m, public domain, a few hundred KB) baked into
 the otp image. It serves **both** the crop (polygon for `osmium extract`)
 **and** the auto-detect (point-in-polygon for stops → country).
 
@@ -238,7 +238,11 @@ existing **OSM scope** dropdown, gains a **Countries** checklist:
 **Resolved (review 2026-05-21):**
 
 1. **Country list (v1):** **EU-27 + EFTA (CH/NO/IS/LI) + UK.** Extend to
-   Balkans / Turkey / Ukraine / Morocco on demand later.
+   Balkans / Turkey / Ukraine / Morocco on demand later. (22 October, #389
+   and its follow-up: the other European countries and Turkey are now in
+   the bundled boundaries, with their non-European neighbours, for the
+   station module's stop extract only — `osm_geo.country_of_position`;
+   the crop and the detection still refuse them.)
 2. **Detection threshold:** flat **5 stops** to pre-tick a country. It's a
    suggestion only — the operator overrides via the checklist, and the UI
    shows the per-country stop count (incl. below-threshold like UK=2) so the
@@ -248,7 +252,7 @@ existing **OSM scope** dropdown, gains a **Countries** checklist:
 
 **Implementation notes (to verify during build):**
 
-- **Boundary polygon fidelity.** Simplified Natural Earth is fine for cropping
+- **Boundary polygon fidelity.** Natural Earth 1:50m is fine for cropping
   (a few km of border slop is harmless — we keep slightly more than needed).
   Verify the simplification doesn't drop small but served territories
   (Monaco, Liechtenstein, Luxembourg).
