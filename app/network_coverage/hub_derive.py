@@ -80,7 +80,8 @@ def slugify(name: str) -> str:
 
     Rules (mirrors `HubCreate.id` validator):
       - Lowercase, accent-stripped.
-      - Collapse runs of non-alphanumeric chars to a single hyphen.
+      - Collapse runs of characters other than a-z, 0-9 and the hyphen to
+        a single hyphen (the name's own hyphens stay as they are).
       - Trim leading/trailing hyphens.
       - Empty input → empty output (caller falls back to manual entry).
       - Truncate at 60 chars to leave headroom under the 64-char DB limit.
@@ -88,7 +89,7 @@ def slugify(name: str) -> str:
     Examples:
       `Saint-Louis Gare`            -> `saint-louis-gare`
       `Firenze Santa Maria Novella` -> `firenze-santa-maria-novella`
-      `Latour-de-Carol - Enveitg`   -> `latour-de-carol-enveitg`
+      `Latour-de-Carol - Enveitg`   -> `latour-de-carol---enveitg`
       `Saint-Exupery`               -> `saint-exupery`
       `Burgfelderhof`               -> `burgfelderhof`
     """

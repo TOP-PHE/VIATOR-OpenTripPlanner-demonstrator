@@ -236,6 +236,35 @@ COUNTRIES_TTL_SECONDS = 60.0
 # The module's countries are ISO codes; the list holds at most this many.
 COUNTRIES_MAX = 300
 _COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
+# The countries a search's `country` may name (the module's rule, MSMM issue
+# #69): the 249 officially assigned ISO 3166-1 alpha-2 codes, and XK
+# (Kosovo, user-assigned but used by the module). Any other code, `UK` or
+# `ZZ` for instance, is refused with the module's 422.
+SEARCH_COUNTRIES: frozenset[str] = frozenset(
+    {
+        "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT",
+        "AU", "AW", "AX", "AZ", "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI",
+        "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS", "BT", "BV", "BW", "BY",
+        "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN",
+        "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM",
+        "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK",
+        "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL",
+        "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM",
+        "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR",
+        "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN",
+        "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS",
+        "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK",
+        "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW",
+        "MX", "MY", "MZ", "NA", "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP",
+        "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM",
+        "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW",
+        "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM",
+        "SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF",
+        "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW",
+        "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
+        "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW", "XK",
+    }
+)  # fmt: skip
 
 PAUSE_SECONDS = 30.0
 ATTRIBUTION_TTL_SECONDS = 60.0
@@ -708,10 +737,29 @@ async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
     return (await search_outcome(q, user_id)).rows
 
 
-async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
+def _search_body(q: str, country: str | None) -> dict[str, Any]:
+    """The body of a search: `{"q": q}`, with `"country"` when one is given,
+    or ValueError for a country that is not two capital ASCII letters (the
+    module would refuse it after counting the call)."""
+    if country is None:
+        return {"q": q}
+    if not isinstance(country, str) or not _COUNTRY.fullmatch(country):
+        raise ValueError("a search takes a country of two capital letters (ISO 3166-1 alpha-2)")
+    return {"q": q, "country": country}
+
+
+async def admin_search_outcome(q: str, user_id: uuid.UUID, country: str | None = None) -> Outcome:
     """The same search as `search_outcome` (at most ten stations for `q`,
     already normalised by the caller), made by an admin action: the coverage
-    hubs' resolve route, when the near call found nothing around a hub.
+    hubs' resolve route, when the near call found nothing around a hub, and
+    the hub picker of the Add/Edit hub dialog.
+
+    `country` (two capital letters, `XK` included): only the stations of
+    that country (the module's optional `country` field, MSMM issue #69).
+    Sent only when given: a module without the field refuses a body that
+    holds it with a 422 (`TEXT_REFUSED`, its body check forbids unknown
+    fields), and the caller then asks again without it. A country that is
+    not two capital letters raises ValueError before any call.
 
     **A failure never starts the pause**, as for `lookup` and `near_outcome`:
     the typeahead of every user must not switch to the fallback because of a
@@ -719,8 +767,10 @@ async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
     Failures are logged as `station_module.admin_search_failed reason=<word>`,
     never the text."""
 
+    body = _search_body(q, country)
+
     async def call() -> list[dict[str, Any]]:
-        return _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
+        return _stations(_json_body(await _post(SEARCH_PATH, body, user_id)))
 
     return await _without_pause("station_module.admin_search_failed", call)
 

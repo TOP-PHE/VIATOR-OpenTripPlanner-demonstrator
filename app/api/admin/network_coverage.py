@@ -20,6 +20,11 @@ Endpoints:
                                                          one lookup in the module
   POST   /api/admin/network-coverage/hubs/check        — re-read the stored codes of at
                                                          most 20 hubs a click; writes nothing
+  POST   /api/admin/network-coverage/hubs/pick         — the hub picker (#398): at most 10
+                                                         stations of the module for a typed
+                                                         name in one country; writes nothing
+  GET    /api/admin/network-coverage/hubs/countries    — the picker's countries (the module's,
+                                                         else VIATOR's list)
 
   GET    /api/admin/network-coverage/runs              — list past runs
                                                          (newest first)
@@ -64,7 +69,7 @@ from sqlalchemy import func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
-from ... import station_module
+from ... import osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...models import (
@@ -1957,6 +1962,284 @@ def _row_of(
     if key is None:
         return None
     return (by_id if key[0] == "id" else by_code).get(key[1])
+
+
+# ───────── the hub picker: a station of the module for Add / Edit hub (#398) ─────────
+#
+# The Add hub and Edit hub dialog picks the hub's station in the module
+# instead of having every field typed: a country (the module's countries,
+# else VIATOR's list), a city or station name of 3 characters or more, then
+# one of at most 10 stations. The dialog fills in the name, a short label, a
+# slug (create only), the position and the country; on save it stores the
+# hub (POST or PATCH, as typed by hand) and then its station through POST
+# /hubs/confirm, exactly as a code confirmed from "Propose station codes"
+# (origin 'msmm', the current VIATOR id from the module's lookup). One search
+# per keystroke pause on the administrator's own limits at the module (the
+# admin search: a failure never pauses the typeahead of every user), two
+# with an older module (below), and one lookup when the hub is saved.
+
+# The most stations one search offers (the module's own maximum).
+PICK_MAX = station_module.MAX_ROWS
+# The short label proposed for a picked station: the matrix header's width.
+PICK_SHORT_MAX = 12
+# The slug proposed when a station's name gives no Latin letter or digit.
+_SLUG_FALLBACK = "hub"
+_HYPHENS = re.compile(r"-{2,}")
+_ISO_COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
+_PICK_REFUSED = (
+    'The body must be {"q": <text>, "country": <two capital letters>} and nothing else; '
+    "the text 3 to 100 characters with no control character and no lone surrogate."
+)
+_PICK_MODULE_OFF = "The station module is not configured; fill in the hub by hand."
+_PICK_TEXT_REFUSED = (
+    "The station module does not take this text; try other words, or fill in the hub by hand."
+)
+# The text rule of the typeahead in plain words (its own sentences name the
+# field `q`): nothing is sent to the module for such a text.
+_PICK_TEXT_LENGTH = "Type 3 to 100 characters, at least 3 of them letters or digits."
+_PICK_TEXT_CONTROL = (
+    "The text holds an invisible character the search does not take; type it again."
+)
+# A country the module would refuse: never sent (the module would count the
+# call and answer 422, which reads as an older module).
+_PICK_COUNTRY_NOT_LISTED = (
+    "The station module does not list this country; choose a country in the list, "
+    "or fill in the hub by hand."
+)
+_PICK_COUNTRY_NOT_ISO = (
+    "This country code is not one the station module takes (an assigned ISO code, or XK); "
+    "choose a country in the list, or fill in the hub by hand."
+)
+# An older module refuses the `country` field (MSMM issue #69): it was asked
+# without it, and only the stations of the country are kept from its ten.
+_PICK_INCOMPLETE = (
+    "The station module is older than this search: it was asked without the country, and "
+    "only its stations in this country are listed, so the list may be incomplete."
+)
+
+
+class HubPickRequest(BaseModel):
+    """Body of POST /hubs/pick: the typed text and the chosen country."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    q: str
+    country: str = Field(pattern=r"^[A-Z]{2}$")
+
+
+class HubPickStation(BaseModel):
+    """A station offered by the picker, with the hub fields it fills in:
+    `short` (at most 12 characters) and `slug` (lowercase and hyphens,
+    unique among the hubs, the soft-deleted ones included, and within the
+    answer) are proposals the administrator may edit; `uic` and
+    `station_id` (the station's current VIATOR id) are what the dialog
+    sends to POST /hubs/confirm once the hub is saved."""
+
+    name: str
+    short: str
+    slug: str
+    country: str
+    lat: float
+    lon: float
+    uic: str | None
+    station_id: str | None
+
+
+class HubPickResponse(BaseModel):
+    """`status`: `ok`; `refused` (the module does not take the text);
+    `limited` (the module's limit is reached: `retry_after` seconds, or None
+    when it gave none); `unavailable` (not configured, paused or failed).
+    `incomplete`: the module did not take the country (an older module), so
+    the list holds only the country's stations among its ten."""
+
+    status: Literal["ok", "refused", "limited", "unavailable"]
+    message: str | None = None
+    retry_after: int | None = None
+    stations: list[HubPickStation] = Field(default_factory=list)
+    incomplete: bool = False
+
+
+class HubCountry(BaseModel):
+    code: str
+    name: str
+
+
+class HubCountriesResponse(BaseModel):
+    """The countries of the picker: `module` (the module's served
+    countries) or `viator` (VIATOR's own list, when the module is not
+    configured or did not answer)."""
+
+    source: Literal["module", "viator"]
+    countries: list[HubCountry]
+
+
+def _pick_query_or_422(text: str) -> str:
+    """The typed text as the module searches for it (the typeahead's rule,
+    `station_suggest.normalise_query`), or a 422 with a sentence in plain
+    words: never sent when the module would refuse it."""
+    try:
+        return station_suggest.normalise_query(text)
+    except ValueError:
+        invisible = any(unicodedata.category(character) in ("Cc", "Cs") for character in text)
+        detail = _PICK_TEXT_CONTROL if invisible else _PICK_TEXT_LENGTH
+        raise HTTPException(status_code=422, detail=detail) from None
+
+
+def _pick_country_refusal(country: str, served: frozenset[str] | None) -> str | None:
+    """Why `country` is not sent to the module, or None to send it: a country
+    the module's own list does not hold, or, when that list could not be
+    read, a code outside the assigned ISO codes and XK (the module's rule).
+    So a 422 of the module means an older module, not a refused country."""
+    if served:
+        return None if country in served else _PICK_COUNTRY_NOT_LISTED
+    return None if country in station_module.SEARCH_COUNTRIES else _PICK_COUNTRY_NOT_ISO
+
+
+def _pick_rows(
+    rows: list[dict[str, Any]], country: str, *, only_country: bool
+) -> list[dict[str, Any]]:
+    """The rows a hub can take: a code the lookup accepts or a VIATOR id
+    (`_confirmable`), a position the hub form accepts, each station once,
+    in the module's order, at most PICK_MAX. `only_country`: the rows of
+    other countries are dropped (an older module, asked without it)."""
+    kept: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = station_module.station_key(row)
+        if key in seen or not _confirmable(row):
+            continue
+        if station_module.position_refused(row["latitude"], row["longitude"]) is not None:
+            continue
+        if only_country and row["country_iso"] != country:
+            continue
+        seen.add(key)
+        kept.append(row)
+    return kept[:PICK_MAX]
+
+
+def slug_base(name: str) -> str:
+    """The slug a station's name proposes before uniqueness: lowercase,
+    accents off, every other run of characters one hyphen
+    (`hub_derive.slugify`, whose hyphens of the name stay, so `ZZ - Zzville`
+    would give three: they are made one), or `hub` when nothing is left."""
+    return _HYPHENS.sub("-", hub_derive.slugify(name)).strip("-") or _SLUG_FALLBACK
+
+
+def unique_slug(base: str, taken: set[str]) -> str:
+    """`base` when no hub holds it, else `base-2`, `base-3`, …: the first free."""
+    if base not in taken:
+        return base
+    number = 2
+    while f"{base}-{number}" in taken:
+        number += 1
+    return f"{base}-{number}"
+
+
+def _taken_slugs(db: DbSession, bases: set[str]) -> set[str]:
+    """The hub ids (soft-deleted hubs included: the id is the primary key)
+    equal to one of `bases` or of the form `<base>-<anything>`. A slug holds
+    only small letters, digits and hyphens: nothing LIKE reads specially."""
+    if not bases:
+        return set()
+    matches = [
+        or_(NetworkCoverageHub.id == base, NetworkCoverageHub.id.like(f"{base}-%"))
+        for base in sorted(bases)
+    ]
+    return set(db.execute(select(NetworkCoverageHub.id).where(or_(*matches))).scalars().all())
+
+
+def _pick_stations(db: DbSession, rows: list[dict[str, Any]], country: str) -> list[HubPickStation]:
+    """The offered stations with their proposed short labels and slugs."""
+    bases = [slug_base(row["name"]) for row in rows]
+    taken = _taken_slugs(db, set(bases))
+    stations: list[HubPickStation] = []
+    for row, base in zip(rows, bases, strict=True):
+        slug = unique_slug(base, taken)
+        taken.add(slug)
+        found = row["country_iso"]
+        stations.append(
+            HubPickStation(
+                name=row["name"],
+                short=hub_derive.shorten(row["name"], PICK_SHORT_MAX),
+                slug=slug,
+                country=found
+                if isinstance(found, str) and _ISO_COUNTRY.fullmatch(found)
+                else country,
+                lat=row["latitude"],
+                lon=row["longitude"],
+                uic=row["uic"],
+                station_id=station_module.current_id(row),
+            )
+        )
+    return stations
+
+
+def _pick_failure(outcome: station_module.Outcome) -> HubPickResponse:
+    """The answer of a failed picker search: the module's refusal of the
+    text, its limit with its Retry-After, or that it did not answer."""
+    if outcome.reason == _TEXT_REFUSED:
+        return HubPickResponse(status="refused", message=_PICK_TEXT_REFUSED)
+    if outcome.reason == "off":
+        return HubPickResponse(status="unavailable", message=_PICK_MODULE_OFF)
+    status, message, retry_after = _failure(outcome)
+    return HubPickResponse(status=status, message=message, retry_after=retry_after)
+
+
+@router.post("/hubs/pick", responses=_HUB_CODE_RESPONSES)
+async def pick_hub_station(
+    body: Annotated[Any, Body()],
+    db: Annotated[DbSession, Depends(get_db)],
+    admin: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HubPickResponse:
+    """At most 10 stations of the module for a typed city or station name in
+    one country, for the Add hub / Edit hub dialog: one admin search
+    (`station_module.admin_search_outcome`, with `country`) on behalf of the
+    administrator. A country the module does not list (or, without its
+    list, not an assigned ISO code or XK) is refused with no call. A module
+    without the `country` field answers 422: it is asked once more without
+    it, and only the rows of the country are kept (`incomplete`). Writes
+    nothing; the text is never logged."""
+    asked = _body_or_422(HubPickRequest, body, _PICK_REFUSED)
+    query = _pick_query_or_422(asked.q)
+    if not station_module.enabled():
+        return HubPickResponse(status="unavailable", message=_PICK_MODULE_OFF)
+    refusal = _pick_country_refusal(asked.country, await station_module.countries())
+    if refusal is not None:
+        return HubPickResponse(status="refused", message=refusal)
+    user_id = _caller(admin)
+    outcome = await station_module.admin_search_outcome(query, user_id, country=asked.country)
+    incomplete = outcome.reason == _TEXT_REFUSED
+    if incomplete:
+        outcome = await station_module.admin_search_outcome(query, user_id)
+    if outcome.rows is None:
+        return _pick_failure(outcome)
+    rows = _pick_rows(outcome.rows, asked.country, only_country=incomplete)
+    return HubPickResponse(
+        status="ok",
+        message=_PICK_INCOMPLETE if incomplete else None,
+        stations=_pick_stations(db, rows, asked.country),
+        incomplete=incomplete,
+    )
+
+
+@router.get("/hubs/countries")
+async def hub_countries(
+    _: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> HubCountriesResponse:
+    """The picker's countries: those of the module's served stations
+    (`station_module.countries`, cached 60 s, no limit counted), or VIATOR's
+    own list (`osm_geo.COUNTRY_NAMES`) when the module is not configured,
+    paused, failed or serves none; by code, each with its name when VIATOR
+    knows it."""
+    served = await station_module.countries()
+    source: Literal["module", "viator"] = "module" if served else "viator"
+    codes = sorted(served) if served else sorted(osm_geo.COUNTRY_NAMES)
+    return HubCountriesResponse(
+        source=source,
+        countries=[
+            HubCountry(code=code, name=osm_geo.COUNTRY_NAMES.get(code, code)) for code in codes
+        ],
+    )
 
 
 @router.get("/runs", response_model=list[RunSummary])

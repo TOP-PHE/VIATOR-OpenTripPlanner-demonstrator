@@ -3496,6 +3496,53 @@ buttons wait for the time the module gives. This needs a module that
 answers this call (MSMM v0.3.4 or later); with an older one the button
 says so ("needs MSMM v0.3.4 or later") and proposes nothing.
 
+#### Adding or editing a hub by picking its station (#398)
+
+When VIATOR uses the module, **+ Add hub** (and the ✏️ of a hub) opens with
+**Pick the station in the station module** at the top:
+
+1. **Country**: the module's countries (the list it serves stations in);
+   when the module does not answer, VIATOR's own list, and the dialog says
+   so. The country of the hub (or of the "+ Add" you clicked) is chosen at
+   first. A hub saved with a code the list does not hold (`UK` instead of
+   `GB`, say) gets no country chosen: the dialog says so, and you pick one.
+   On ✏️ the picker is greyed out until the hub's fields are loaded.
+2. **City or station name**, 3 characters or more. A short pause in typing
+   (or Enter) searches the module in that country and lists at most 10
+   stations, each with its country, code (or "no code"), VIATOR id and
+   position. Tab or the arrow keys (from the name field) move through the
+   list; Enter or a click picks one. The same text in the same country is
+   not searched twice in a row.
+3. **Picking a station fills in** the name, a short label (12 characters at
+   most), a slug (new hub only: lowercase and hyphens, made unique among
+   every hub, the soft-deleted ones included, by adding `-2`, `-3`, …), the
+   latitude, the longitude, the country and the station code. Check the
+   short label and the slug; both stay editable before you save, and the
+   slug cannot change once saved (as before). Tier, transport modes and
+   sort order stay yours to set.
+4. **Save** stores the hub, then its station exactly as **Save ticked
+   codes** does: one lookup in the module, the code marked "from the
+   station module" and the station's current VIATOR id. When that lookup
+   fails (a limit, the module down, a station no longer served), the hub
+   is saved without its station and a message says so (an edited hub keeps
+   its previous code): use **Propose station codes** later. Typing another code over the picked one makes it
+   a code typed by hand, as before.
+
+**All fields by hand (special cases)**, folded under the picker, is the
+former form: open it to type or correct any field; it opens by itself when
+a required field is empty. Without the module the dialog shows only that
+form.
+
+The picker's calls count on your own limits at the module: one search per
+pause in typing, and one lookup when you save. A country the module does
+not list is never sent to it. A module without the
+`country` field (before MSMM issue #69 is released) refuses it: VIATOR
+then searches again without it (two calls), keeps only the stations of the
+chosen country among the module's ten, and says "the list may be
+incomplete". At a limit the dialog says how long to wait and searches
+nothing until then; a text the module does not take is answered "try other
+words". There is no list of a whole country and no paging.
+
 #### Deploying the contract's phase 2 (VIATOR, MSMM referential pull request 10)
 
 - **Take a database backup before deploying it** (5.2): the `web`
