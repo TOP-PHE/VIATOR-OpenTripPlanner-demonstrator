@@ -1984,6 +1984,7 @@ PICK_MAX = station_module.MAX_ROWS
 PICK_SHORT_MAX = 12
 # The slug proposed when a station's name gives no Latin letter or digit.
 _SLUG_FALLBACK = "hub"
+_HYPHENS = re.compile(r"-{2,}")
 _ISO_COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
 _PICK_REFUSED = (
     'The body must be {"q": <text>, "country": <two capital letters>} and nothing else; '
@@ -1992,6 +1993,22 @@ _PICK_REFUSED = (
 _PICK_MODULE_OFF = "The station module is not configured; fill in the hub by hand."
 _PICK_TEXT_REFUSED = (
     "The station module does not take this text; try other words, or fill in the hub by hand."
+)
+# The text rule of the typeahead in plain words (its own sentences name the
+# field `q`): nothing is sent to the module for such a text.
+_PICK_TEXT_LENGTH = "Type 3 to 100 characters, at least 3 of them letters or digits."
+_PICK_TEXT_CONTROL = (
+    "The text holds an invisible character the search does not take; type it again."
+)
+# A country the module would refuse: never sent (the module would count the
+# call and answer 422, which reads as an older module).
+_PICK_COUNTRY_NOT_LISTED = (
+    "The station module does not list this country; choose a country in the list, "
+    "or fill in the hub by hand."
+)
+_PICK_COUNTRY_NOT_ISO = (
+    "This country code is not one the station module takes (an assigned ISO code, or XK); "
+    "choose a country in the list, or fill in the hub by hand."
 )
 # An older module refuses the `country` field (MSMM issue #69): it was asked
 # without it, and only the stations of the country are kept from its ten.
@@ -2058,12 +2075,24 @@ class HubCountriesResponse(BaseModel):
 
 def _pick_query_or_422(text: str) -> str:
     """The typed text as the module searches for it (the typeahead's rule,
-    `station_suggest.normalise_query`), or a 422 with its fixed sentence:
-    never sent when the module would refuse it."""
+    `station_suggest.normalise_query`), or a 422 with a sentence in plain
+    words: never sent when the module would refuse it."""
     try:
         return station_suggest.normalise_query(text)
-    except ValueError as refused:
-        raise HTTPException(status_code=422, detail=str(refused)) from None
+    except ValueError:
+        invisible = any(unicodedata.category(character) in ("Cc", "Cs") for character in text)
+        detail = _PICK_TEXT_CONTROL if invisible else _PICK_TEXT_LENGTH
+        raise HTTPException(status_code=422, detail=detail) from None
+
+
+def _pick_country_refusal(country: str, served: frozenset[str] | None) -> str | None:
+    """Why `country` is not sent to the module, or None to send it: a country
+    the module's own list does not hold, or, when that list could not be
+    read, a code outside the assigned ISO codes and XK (the module's rule).
+    So a 422 of the module means an older module, not a refused country."""
+    if served:
+        return None if country in served else _PICK_COUNTRY_NOT_LISTED
+    return None if country in station_module.SEARCH_COUNTRIES else _PICK_COUNTRY_NOT_ISO
 
 
 def _pick_rows(
@@ -2091,8 +2120,9 @@ def _pick_rows(
 def slug_base(name: str) -> str:
     """The slug a station's name proposes before uniqueness: lowercase,
     accents off, every other run of characters one hyphen
-    (`hub_derive.slugify`), or `hub` when nothing is left."""
-    return hub_derive.slugify(name).strip("-") or _SLUG_FALLBACK
+    (`hub_derive.slugify`, whose hyphens of the name stay, so `ZZ - Zzville`
+    would give three: they are made one), or `hub` when nothing is left."""
+    return _HYPHENS.sub("-", hub_derive.slugify(name)).strip("-") or _SLUG_FALLBACK
 
 
 def unique_slug(base: str, taken: set[str]) -> str:
@@ -2164,11 +2194,18 @@ async def pick_hub_station(
     """At most 10 stations of the module for a typed city or station name in
     one country, for the Add hub / Edit hub dialog: one admin search
     (`station_module.admin_search_outcome`, with `country`) on behalf of the
-    administrator. A module without the `country` field answers 422: it is
-    asked once more without it, and only the rows of the country are kept
-    (`incomplete`). Writes nothing; the text is never logged."""
+    administrator. A country the module does not list (or, without its
+    list, not an assigned ISO code or XK) is refused with no call. A module
+    without the `country` field answers 422: it is asked once more without
+    it, and only the rows of the country are kept (`incomplete`). Writes
+    nothing; the text is never logged."""
     asked = _body_or_422(HubPickRequest, body, _PICK_REFUSED)
     query = _pick_query_or_422(asked.q)
+    if not station_module.enabled():
+        return HubPickResponse(status="unavailable", message=_PICK_MODULE_OFF)
+    refusal = _pick_country_refusal(asked.country, await station_module.countries())
+    if refusal is not None:
+        return HubPickResponse(status="refused", message=refusal)
     user_id = _caller(admin)
     outcome = await station_module.admin_search_outcome(query, user_id, country=asked.country)
     incomplete = outcome.reason == _TEXT_REFUSED

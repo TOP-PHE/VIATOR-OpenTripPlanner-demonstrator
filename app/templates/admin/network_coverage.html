@@ -529,7 +529,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
    manual fields. */
 .hub-pick { margin: 0 0 0.4rem; padding: 0.3rem 0.6rem 0.5rem; border: 1px solid #d0d7de; border-radius: 4px; }
 .hub-pick legend { font-size: 0.85rem; font-weight: 600; padding: 0 0.3rem; }
-.hub-pick .hub-pick-country { flex: 0 0 11rem; }
+.hub-pick .form-row, .hub-form .form-row.hub-form-wrap { flex-wrap: wrap; }
+.hub-pick .form-row > .hub-pick-country { flex: 1 1 9rem; }
+.hub-pick .form-row > .hub-pick-name { flex: 2 1 12rem; }
+.hub-form .form-row.hub-form-wrap > div { flex: 1 1 7rem; }
 .hub-pick-note { margin: 0.2rem 0 0; font-size: 0.72rem; }
 .hub-pick-status { display: block; margin-top: 0.3rem; font-size: 0.78rem; color: #5b6470; }
 .hub-pick-status.error { color: #cf222e; }
@@ -782,7 +785,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
               <option value="">Loading…</option>
             </select>
           </div>
-          <div>
+          <div class="hub-pick-name">
             <label for="hub-pick-q">City or station name <span class="hint" style="font-weight: normal">(3 characters or more)</span></label>
             <input type="search" id="hub-pick-q" maxlength="100" autocomplete="off" spellcheck="false"
                    aria-describedby="hub-pick-status" aria-controls="hub-pick-list">
@@ -791,14 +794,16 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         <p class="hint hub-pick-note" id="hub-pick-countries-note"></p>
         <output id="hub-pick-status" class="hub-pick-status" aria-live="polite"></output>
         <ul id="hub-pick-list" class="hub-pick-list" aria-label="Stations found"></ul>
-        <p class="hub-pick-chosen" id="hub-pick-chosen" aria-live="polite"></p>
+        {# Not a live region: after a pick, focus moves to Short, which
+           this sentence describes, so it is read once. #}
+        <p class="hub-pick-chosen" id="hub-pick-chosen"></p>
       </fieldset>
       {% endif %}
       <div id="hub-id-row">
         <label for="hub-form-id">Slug <span class="hint" style="font-weight: normal">(lowercase, hyphens only — immutable once saved)</span></label>
         <input type="text" id="hub-form-id" name="id" pattern="[a-z0-9][a-z0-9-]*" required>
       </div>
-      <div class="form-row">
+      <div class="form-row hub-form-wrap">
         <div>
           <label for="hub-form-short">Short <span class="hint" style="font-weight: normal">(matrix header — keep ≤12 chars)</span></label>
           <input type="text" id="hub-form-short" name="short" maxlength="16" required>
@@ -2503,6 +2508,7 @@ function openHubModal(mode, hubId, prefillCountry) {
   document.getElementById('hub-form-forget-id-label').hidden = true;
   document.getElementById('hub-form-forget-id').checked = false;
   hubPickReset();
+  hubPickEnable(mode === 'create');
 
   if (mode === 'create') {
     title.textContent = prefillCountry ? `Add ${prefillCountry} hub` : 'Add hub';
@@ -2536,9 +2542,40 @@ function openHubModal(mode, hubId, prefillCountry) {
         document.getElementById('hub-form-forget-id-label').hidden = !h.station_id;
         document.getElementById('hub-form-forget-id').checked = false;
         hubPickLoadCountries(h.country);
+        // Only now: a station picked earlier would be overwritten above.
+        hubPickEnable(true);
       });
   }
   modal.hidden = false;
+}
+
+// The body of the hub form's POST or PATCH, and the station picked in the
+// station module (#398) while the code field still holds its code.
+function hubFormBody(fd) {
+  const body = {
+    name: fd.get('name'),
+    short: fd.get('short'),
+    country: (fd.get('country') || '').toUpperCase(),
+    region: fd.get('region') || null,
+    tier: fd.get('tier') || 'main',
+    modes: fd.get('modes') || null,
+    lat: parseFloat(fd.get('lat')),
+    lon: parseFloat(fd.get('lon')),
+    sort_order: parseInt(fd.get('sort_order') || '100', 10),
+  };
+  const typedUic = (fd.get('uic') || '').trim();
+  // A station picked in the station module (#398) is stored after the
+  // hub, through POST /hubs/confirm, as a confirmed code: never sent here
+  // as a typed one. A code typed over the picked one is a typed code.
+  const picked = hubPickedFor(typedUic);
+  if (!picked && typedUic !== HUB_EDIT_UIC) {
+    // Sent only when changed, so saving a hub never turns a code
+    // confirmed from the station module into a "manual" one.
+    body.uic = typedUic || null;
+  }
+  if (!picked && document.getElementById('hub-form-forget-id').checked) body.forget_station_id = true;
+  if (HUB_EDIT_MODE === 'create') body.id = fd.get('id');
+  return { body, picked };
 }
 
 document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
@@ -2550,39 +2587,14 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
   submitBtn.disabled = true;
   submitBtn.textContent = 'Saving…';
   try {
-    const body = {
-      name: fd.get('name'),
-      short: fd.get('short'),
-      country: (fd.get('country') || '').toUpperCase(),
-      region: fd.get('region') || null,
-      tier: fd.get('tier') || 'main',
-      modes: fd.get('modes') || null,
-      lat: parseFloat(fd.get('lat')),
-      lon: parseFloat(fd.get('lon')),
-      sort_order: parseInt(fd.get('sort_order') || '100', 10),
-    };
-    const typedUic = (fd.get('uic') || '').trim();
-    // A station picked in the station module (#398) is stored after the
-    // hub, through POST /hubs/confirm, as a confirmed code: never sent here
-    // as a typed one. A code typed over the picked one is a typed code.
-    const picked = hubPickedFor(typedUic);
-    if (!picked && typedUic !== HUB_EDIT_UIC) {
-      // Sent only when changed, so saving a hub never turns a code
-      // confirmed from the station module into a "manual" one.
-      body.uic = typedUic || null;
-    }
-    if (!picked && document.getElementById('hub-form-forget-id').checked) body.forget_station_id = true;
-    let url, method;
-    if (HUB_EDIT_MODE === 'create') {
-      body.id = fd.get('id');
-      url = '/api/admin/network-coverage/hubs';
-      method = 'POST';
-    } else {
-      url = `/api/admin/network-coverage/hubs/${encodeURIComponent(HUB_EDIT_ID)}`;
-      method = 'PATCH';
-    }
+    const { body, picked } = hubFormBody(fd);
+    const creating = HUB_EDIT_MODE === 'create';
+    const url = creating
+      ? '/api/admin/network-coverage/hubs'
+      : `/api/admin/network-coverage/hubs/${encodeURIComponent(HUB_EDIT_ID)}`;
     const r = await fetch(url, {
-      method, headers: {'Content-Type': 'application/json'},
+      method: creating ? 'POST' : 'PATCH',
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -2590,20 +2602,25 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       errEl.textContent = hubFormError(j.detail, r.status);
       return;
     }
-    const savedId = HUB_EDIT_MODE === 'create' ? body.id : HUB_EDIT_ID;
-    const warning = picked ? await hubPickConfirm(savedId, picked) : null;
-    document.getElementById('hub-modal').hidden = true;
-    if (warning) {
-      showToast('error', warning);
-    } else {
-      showToast('success', HUB_EDIT_MODE === 'create' ? 'Hub created' : 'Hub updated');
-    }
-    await loadHubs();
+    await hubSaveFinish(creating ? body.id : HUB_EDIT_ID, picked);
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = 'Save';
   }
 });
+
+// After the hub is saved: its picked station stored (POST /hubs/confirm),
+// the dialog closed, one message, the list read again.
+async function hubSaveFinish(savedId, picked) {
+  const warning = picked ? await hubPickConfirm(savedId, picked, HUB_EDIT_MODE !== 'create') : null;
+  document.getElementById('hub-modal').hidden = true;
+  if (warning) {
+    showToast('error', warning);
+  } else {
+    showToast('success', HUB_EDIT_MODE === 'create' ? 'Hub created' : 'Hub updated');
+  }
+  await loadHubs();
+}
 
 // The error of a refused hub form: FastAPI's 422 detail is a list of
 // messages (the station code's rule among them), any other a sentence.
@@ -2679,7 +2696,14 @@ document.getElementById('hubs-add-new')?.addEventListener('click', () => openHub
 const HUB_PICK_DELAY_MS = 350;
 // seq: the number of the latest search, so an older answer arriving late
 // is dropped. heldUntil: no search before this time (the module's limit).
-const HUB_PICK = { seq: 0, timer: null, heldUntil: 0, station: null, stations: [], countriesLoaded: false };
+// lastAsked: the country and text of the search asked last, not asked
+// again. countriesLoading: the countries request on its way, shared by the
+// dialogs opened meanwhile; countryTicket: the latest dialog's, whose
+// country is the one selected.
+const HUB_PICK = {
+  seq: 0, timer: null, heldUntil: 0, lastAsked: '', station: null, stations: [],
+  countriesLoaded: false, countriesLoading: null, countryTicket: 0,
+};
 
 function hubPickStatus(text, isError) {
   const el = document.getElementById('hub-pick-status');
@@ -2691,6 +2715,8 @@ function hubPickStatus(text, isError) {
 function hubPickReset() {
   clearTimeout(HUB_PICK.timer);
   HUB_PICK.seq += 1;
+  HUB_PICK.lastAsked = '';
+  HUB_PICK.countryTicket += 1;
   HUB_PICK.station = null;
   HUB_PICK.stations = [];
   const q = document.getElementById('hub-pick-q');
@@ -2698,8 +2724,16 @@ function hubPickReset() {
   q.value = '';
   document.getElementById('hub-pick-list').replaceChildren();
   document.getElementById('hub-pick-chosen').textContent = '';
+  document.getElementById('hub-form-short').removeAttribute('aria-describedby');
   hubPickStatus('');
   document.getElementById('hub-manual').open = false;
+}
+
+// Edit hub: the picker stays disabled until the hub's fields are filled in,
+// which would otherwise overwrite a station picked meanwhile.
+function hubPickEnable(on) {
+  const fieldset = document.getElementById('hub-pick');
+  if (fieldset) fieldset.disabled = !on;
 }
 
 // The country list: the module's, else VIATOR's (the route says which).
@@ -2717,34 +2751,51 @@ function hubPickCountriesNote(answer) {
   return '';
 }
 
+async function hubPickFetchCountries(select) {
+  let answer = null;
+  try {
+    const r = await fetch(`${HUB_CODES_API}/countries`);
+    if (r.ok) answer = await r.json();
+  } catch (err) {
+    console.warn('hub picker: the countries failed', err);
+  }
+  select.replaceChildren(...hubPickCountryOptions(answer).map(o => {
+    const option = document.createElement('option');
+    option.value = o.value;
+    option.textContent = o.label;
+    return option;
+  }));
+  document.getElementById('hub-pick-countries-note').textContent = hubPickCountriesNote(answer);
+  // VIATOR's list (the module did not answer) is asked again at the next opening.
+  HUB_PICK.countriesLoaded = Boolean(answer) && answer.source === 'module';
+}
+
+// Selects `wanted` when the list holds it. A code it does not hold (a hub
+// saved with "UK", say) is never selected, so never sent: the module would
+// refuse it. The administrator picks a country.
+function hubPickSelectCountry(select, wanted) {
+  const code = (wanted || '').toUpperCase();
+  const listed = [...select.options].some(o => o.value === code);
+  select.value = listed ? code : '';
+  if (code && !listed) {
+    hubPickStatus(`The hub's country (${code}) is not in the list of countries; pick a country.`);
+  }
+}
+
 async function hubPickLoadCountries(wanted) {
   const select = document.getElementById('hub-pick-country');
   if (!select) return;
+  const ticket = ++HUB_PICK.countryTicket;
   if (!HUB_PICK.countriesLoaded) {
-    let answer = null;
-    try {
-      const r = await fetch(`${HUB_CODES_API}/countries`);
-      if (r.ok) answer = await r.json();
-    } catch (err) {
-      console.warn('hub picker: the countries failed', err);
+    if (!HUB_PICK.countriesLoading) {
+      HUB_PICK.countriesLoading = hubPickFetchCountries(select).finally(() => {
+        HUB_PICK.countriesLoading = null;
+      });
     }
-    select.replaceChildren(...hubPickCountryOptions(answer).map(o => {
-      const option = document.createElement('option');
-      option.value = o.value;
-      option.textContent = o.label;
-      return option;
-    }));
-    document.getElementById('hub-pick-countries-note').textContent = hubPickCountriesNote(answer);
-    HUB_PICK.countriesLoaded = Boolean(answer);
+    await HUB_PICK.countriesLoading;
   }
-  const code = (wanted || '').toUpperCase();
-  if (code && ![...select.options].some(o => o.value === code)) {
-    const option = document.createElement('option');
-    option.value = code;
-    option.textContent = code;
-    select.append(option);
-  }
-  select.value = code;
+  // A dialog opened meanwhile selects its own country.
+  if (ticket === HUB_PICK.countryTicket) hubPickSelectCountry(select, wanted);
 }
 
 function hubPickSchedule() {
@@ -2783,15 +2834,25 @@ async function hubPickAsk(q, country) {
 async function hubPickSearch() {
   const q = document.getElementById('hub-pick-q').value.trim();
   const country = document.getElementById('hub-pick-country').value;
-  const seq = ++HUB_PICK.seq;
   const blocked = hubPickBlocked(q, country, Date.now());
   if (blocked !== null) {
+    HUB_PICK.seq += 1;
+    HUB_PICK.lastAsked = '';
     hubPickRender({ status: 'ok', stations: [] }, blocked);
     return;
   }
+  // The country and text of the search asked last (listed, or still on
+  // its way): not asked again.
+  const asked = `${country}\n${q}`;
+  if (asked === HUB_PICK.lastAsked) return;
+  HUB_PICK.lastAsked = asked;
+  const seq = ++HUB_PICK.seq;
   hubPickStatus('Searching…');
   const answer = await hubPickAsk(q, country);
   if (seq !== HUB_PICK.seq) return;  // a newer search was started meanwhile
+  // Only a list is kept: after a refusal, the limit or a failure, the same
+  // search may be asked again.
+  if (answer.status !== 'ok') HUB_PICK.lastAsked = '';
   if (answer.status === 'limited') HUB_PICK.heldUntil = Date.now() + (answer.retry_after || 60) * 1000;
   hubPickRender(answer);
 }
@@ -2854,7 +2915,10 @@ function hubPickChoose(index) {
     `${hubCodeLabel({ uic: station.uic, uic_origin: 'msmm', station_id: station.station_id })} — stored when you save`;
   document.getElementById('hub-pick-chosen').textContent =
     `Picked: ${station.name} (${hubPickMeta(station)}). Check the short label${HUB_EDIT_MODE === 'create' ? ' and the slug' : ''}, then save.`;
-  document.getElementById('hub-form-short').focus();
+  // One announcement: Short, focused, is described by the sentence above.
+  const short = document.getElementById('hub-form-short');
+  short.setAttribute('aria-describedby', 'hub-pick-chosen');
+  short.focus();
 }
 
 // The picked station, while the code field still holds its code.
@@ -2864,10 +2928,12 @@ function hubPickedFor(typedUic) {
 }
 
 // The sentence to show when the saved hub did not get its station, or null.
-function hubPickConfirmText(answer) {
+// `editing`: an edited hub keeps the code it had.
+function hubPickConfirmText(answer, editing) {
   const lead = 'Hub saved, but its station was not stored';
+  const kept = editing ? " The hub's previous code stays." : '';
   if (!answer || answer.status !== 'ok') {
-    return `${lead}: ${(answer && answer.message) || 'the station module did not answer.'} Use "Propose station codes" later.`;
+    return `${lead}: ${(answer && answer.message) || 'the station module did not answer.'}${kept} Use "Propose station codes" later.`;
   }
   const result = (answer.results || [])[0];
   if (result && result.state === 'stored') return null;
@@ -2876,10 +2942,10 @@ function hubPickConfirmText(answer) {
     changed_meanwhile: 'the hub was changed meanwhile',
     unknown_hub: 'the hub was not found',
   }[result && result.state] || 'no answer for it';
-  return `${lead}: ${why}.`;
+  return `${lead}: ${why}.${kept}`;
 }
 
-async function hubPickConfirm(hubId, station) {
+async function hubPickConfirm(hubId, station, editing) {
   const pair = { hub_id: hubId };
   if (station.uic) pair.uic = station.uic;
   if (station.station_id) pair.station_id = station.station_id;
@@ -2894,19 +2960,22 @@ async function hubPickConfirm(hubId, station) {
   } catch (err) {
     console.warn('hub picker: storing the station failed', err);
   }
-  return hubPickConfirmText(answer);
+  return hubPickConfirmText(answer, editing);
 }
 
-// Keyboard: Enter in the text searches at once (never submits the form),
-// the arrow keys move between the text and the stations.
+// Keyboard: Enter in the text searches at once (never submits the form;
+// a held key searches once), the arrow keys move between the text and the
+// stations (never from the Country list, whose arrows choose a country).
 function hubPickKeys(e) {
   const buttons = [...document.querySelectorAll('#hub-pick-list [data-pick-index]')];
-  const at = buttons.indexOf(document.activeElement);
-  if (e.target.id === 'hub-pick-q' && e.key === 'Enter') {
+  const at = buttons.indexOf(e.target);
+  const inText = e.target.id === 'hub-pick-q';
+  if (inText && e.key === 'Enter') {
     e.preventDefault();
+    if (e.repeat) return;
     clearTimeout(HUB_PICK.timer);
     hubPickSearch();
-  } else if (e.key === 'ArrowDown' && buttons.length) {
+  } else if (e.key === 'ArrowDown' && buttons.length && (inText || at >= 0)) {
     e.preventDefault();
     buttons[Math.min(at + 1, buttons.length - 1)].focus();
   } else if (e.key === 'ArrowUp' && at >= 0) {
