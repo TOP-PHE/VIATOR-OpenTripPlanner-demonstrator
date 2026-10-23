@@ -172,8 +172,10 @@ def test_the_admin_search_sends_the_country_only_when_given(module: Module) -> N
 def test_the_admin_search_refuses_a_malformed_country_before_any_call(
     module: Module, country: str
 ) -> None:
+    # An async function's body runs when awaited: the refusal is raised by asyncio.run.
+    search = station_module.admin_search_outcome("ZZ Zzville", uuid.uuid4(), country)
     with pytest.raises(ValueError, match="two capital letters"):
-        asyncio.run(station_module.admin_search_outcome("ZZ Zzville", uuid.uuid4(), country))
+        asyncio.run(search)
     assert module.requests == []
 
 
