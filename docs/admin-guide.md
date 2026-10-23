@@ -3666,19 +3666,32 @@ the extracts changes no graph build.
     mints its id with that country). So Narva (Estonia), Záhony (Hungary),
     Medyka (Poland), Idomeni, Pythio and Kastanies (Greece), Tovarnik and
     Metković (Croatia), Cap-d'Ail (France) stay without a country, as
-    before; so do Chop (Ukraine), Gevgelija (North Macedonia) and Monaco on
-    the other side. Negotin, Zaječar and Subotica (Serbia) are Serbian;
+    before; so do Chop (Ukraine), Gevgelija (North Macedonia), Monaco and
+    the Vatican (every point of it lies within 3 km of Italy) on the other
+    side. Kapıkule (Turkey), Mamonovo (Russia), Ungheni and Giurgiulești
+    (Moldova) get no country under this rule either: in the module each
+    becomes a review item "A stop in no country", for an administrator to
+    answer. Negotin, Zaječar and Subotica (Serbia) are Serbian;
   - a stop in a country beyond the bundled ones' land borders (Georgia,
     Armenia, Azerbaijan, Syria, Iraq, Iran, Kazakhstan, Mongolia, China,
     North Korea, Japan, Brazil, Suriname, Gibraltar): bundled only to be
     known as none of ours; and a station of a bundled country that its
-    1:50m line puts there (Nusaybin, Turkey, in the 1:50m Syria).
+    1:50m line puts there (Nusaybin, Turkey, in the 1:50m Syria);
+  - a stop on a coast the boundaries miss when the line of one of those
+    countries passes within 3 km beyond the nearest boundary: the gap
+    between Gibraltar's boundary and Spain's (Gibraltar airport, La Línea;
+    neither has a rail station) has no country. Algeciras stays Spanish.
+    The rule does not reach a stop inside a bundled boundary: Albina
+    (Suriname) lies inside the 1:50m French Guiana, 3.0 to 3.3 km from
+    Suriname's line, and is `FR` (it has no rail station).
 
-  **Crimea is Ukraine** (`UA`, Sevastopol included): the position of the EU
-  and the UN, as Natural Earth's Ukrainian point of view draws it (its
-  default view, de facto, gave Russia). Kosovo is `XK`, a user-assigned code
-  the module accepts. Northern Cyprus is not decided apart: a stop within
-  10 km of the 1:50m Cyprus is `CY`, one farther (Kyrenia) has none.
+  **Crimea is Ukraine** (`UA`, Sevastopol included): the EU position
+  (Natural Earth EU point of view: the views of the EU members and of
+  Ukraine draw it so; its default view, de facto, gave Russia). Kosovo is
+  `XK`, a user-assigned code the module accepts. **Northern Cyprus is an
+  open question for the owner**, not decided yet: the boundaries carry no
+  polygon for it, so a stop within 10 km of the 1:50m Cyprus is `CY`
+  (Famagusta, northern Nicosia), one farther (Kyrenia) has none.
 
   **After deploying this version**, what you will see:
   - **Refresh (all providers) on each session, one session after the

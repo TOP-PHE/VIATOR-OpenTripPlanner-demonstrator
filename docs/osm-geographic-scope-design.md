@@ -254,7 +254,7 @@ existing **OSM scope** dropdown, gains a **Countries** checklist:
 
 - **Boundary polygon fidelity.** Natural Earth 1:50m is fine for cropping
   (a few km of border slop is harmless — we keep slightly more than needed).
-  Verify the simplification doesn't drop small but served territories
+  Verify the 1:50m scale doesn't drop small but served territories
   (Monaco, Liechtenstein, Luxembourg).
 - **Interaction with `comprehensive` tag scope.** Geo-crop is orthogonal and
   must still apply — the entrypoint runs the crop even when `tags-filter` is

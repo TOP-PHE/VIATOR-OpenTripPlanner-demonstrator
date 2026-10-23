@@ -167,13 +167,37 @@ def test_the_border_doubt_is_measured_from_the_v1_boundary():
     assert estonia == pytest.approx(2.52, abs=0.05)
     assert g.country_of_position(lat, lon + (2.6 - estonia) / k_lon) is None
     assert g.country_of_position(lat, lon + (3.6 - estonia) / k_lon) == "RU"
+    # Just inside the band, beyond 2.7 km: still in doubt (a narrower band fails).
+    near_edge = lon + (2.9 - estonia) / k_lon
+    assert g._boundaries_within(lat, near_edge, 10.0, g.VALID_COUNTRIES)["EE"] == pytest.approx(
+        2.9, abs=0.02
+    )
+    assert g.country_of_position(lat, near_edge) is None
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,neighbour",
+    [
+        # Invented positions in Serbia, by the 1:50m lines of North Macedonia
+        # and Bosnia and Herzegovina, more than 10 km from any v1 boundary.
+        ("by North Macedonia", 42.3, 21.8, "MK"),
+        ("by Bosnia and Herzegovina", 43.7, 19.5, "BA"),
+    ],
+)
+def test_the_border_doubt_counts_only_v1_boundaries(name, lat, lon, neighbour):
+    # A border between two countries outside the v1 list puts no stop in
+    # doubt: neither side is minted from a wrong v1 country.
+    near = g._boundaries_within(lat, lon, 10.0)
+    assert near.get(neighbour, math.inf) < g.BORDER_DOUBT_KM
+    assert not set(near) & g.VALID_COUNTRIES
+    assert g.country_of_position(lat, lon) == "RS", name
 
 
 @pytest.mark.parametrize(
     "name,lat,lon,expected",
     [
-        # Crimea is Ukraine's (EU and UN position; Natural Earth's Ukrainian
-        # point of view), the rest of Russia Russia's.
+        # Crimea is Ukraine's (the EU position; Natural Earth EU point of
+        # view), the rest of Russia Russia's.
         ("Simferopol", 44.952, 34.102, "UA"),
         ("Sevastopol", 44.616, 33.525, "UA"),
         ("Kerch", 45.357, 36.468, "UA"),
@@ -223,7 +247,6 @@ def test_a_position_in_a_neighbour_country_is_in_none(name, lat, lon):
         ("Sheerness-on-Sea", 51.441, 0.758, "GB"),
         ("Split", 43.504, 16.441, "HR"),
         ("Algeciras, beside Gibraltar", 36.129, -5.447, "ES"),
-        ("La Línea, beside Gibraltar", 36.165, -5.347, "ES"),
         ("Kirkenes", 69.727, 30.045, "NO"),
         # Farther than COAST_TOLERANCE_KM from any boundary: none.
         ("St Mary's, Isles of Scilly", 49.916, -6.318, None),
@@ -235,6 +258,46 @@ def test_a_position_in_a_neighbour_country_is_in_none(name, lat, lon):
 )
 def test_country_of_position_takes_the_nearest_boundary_on_a_coast(name, lat, lon, expected):
     assert g.country_of_position(lat, lon) == expected, name
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,spain_km,gibraltar_km",
+    [
+        # In the gap between Gibraltar's 1:10m polygon and Spain's 1:50m one:
+        # Spain's line is the nearest, Gibraltar's within BORDER_DOUBT_KM
+        # beyond it. 1:50m cannot tell Spain from Gibraltar there, so none,
+        # like Cap-d'Ail inside the polygons. Neither has a rail station.
+        ("Gibraltar airport", 36.151, -5.347, 0.78, 1.09),
+        ("La Línea, beside Gibraltar", 36.165, -5.347, 0.40, 2.64),
+    ],
+)
+def test_the_coast_fallback_gives_none_by_a_neighbours_line(name, lat, lon, spain_km, gibraltar_km):
+    near = g._boundaries_within(lat, lon, 10.0)
+    assert g._containing(lat, lon, None) is None
+    assert near["ES"] == pytest.approx(spain_km, abs=0.02)
+    assert near["GI"] == pytest.approx(gibraltar_km, abs=0.02)
+    assert g.country_of_position(lat, lon) is None, name
+
+
+def test_the_neighbour_doubt_is_for_the_coast_fallback_only():
+    # In the gap west of Albina (invented position): France's 1:50m line the
+    # nearest, Suriname's 2.7 km off — none. Albina itself lies inside
+    # France's 1:50m French Guiana, 3.0 km from Suriname's line: a position
+    # inside a polygon keeps its country (a known limit of 1:50m).
+    near = g._boundaries_within(5.496, -54.057, 10.0)
+    assert near["SR"] - near["FR"] < g.BORDER_DOUBT_KM
+    assert g.country_of_position(5.496, -54.057) is None
+    assert g._containing(5.4975, -54.0533, None) == "FR"
+    assert g.country_of_position(5.4975, -54.0533) == "FR"
+    # Invented positions by Georgia's 1:50m line: inside Turkey's polygon,
+    # 1.9 km from it, Turkish; off Turkey's coast, Turkey's line 0.5 km and
+    # Georgia's 3.3 km away, none (the band holds for every country there).
+    assert g._boundaries_within(41.46, 41.67, 3.0, g.NEIGHBOUR_COUNTRIES)["GE"] < 2.0
+    assert g.country_of_position(41.46, 41.67) == "TR"
+    near = g._boundaries_within(41.497, 41.481, 10.0)
+    assert g._containing(41.497, 41.481, None) is None
+    assert near["GE"] - near["TR"] < g.BORDER_DOUBT_KM
+    assert g.country_of_position(41.497, 41.481) is None
 
 
 def test_a_position_just_inside_the_tolerance_has_a_country_and_just_beyond_none():
@@ -284,6 +347,7 @@ def test_an_enclave_is_a_hole_in_its_surrounding_country():
         assert g.country_for_point(lat, lon) is None
         assert g._containing(lat, lon, None) == own
     assert g.country_of_position(43.936, 12.447) == "SM"  # 3.2 km from Italy's line
+    assert g.country_of_position(*middle) is None  # the Vatican: within 3 km of Italy's
 
 
 def test_the_bundled_polygons_do_not_overlap():
@@ -340,6 +404,21 @@ def test_detection_counts_no_stop_in_another_country():
         ("ZZ-4", 41.716, 44.783),
     ]
     assert g.detect_from_stops(stops) == {"FR": 1}
+
+
+def test_the_distance_to_a_country_is_its_nearest_polygons():
+    # An invented position off Croatia's islands: two Croatian polygons within
+    # 10 km, the first in the file's order the farther. The country's distance
+    # is the nearer one, whatever the order.
+    lat, lon = 43.3, 16.6
+    k = (110.57, 111.32 * math.cos(math.radians(lat)))
+    croatian = [
+        g._polygon_km(lat, lon, poly, k)
+        for iso, _bbox, poly in g._polygons()
+        if iso == "HR" and g._polygon_km(lat, lon, poly, k) <= 10.0
+    ]
+    assert len(croatian) >= 2 and croatian[0] > min(croatian) + 1.0
+    assert g._boundaries_within(lat, lon, 10.0)["HR"] == pytest.approx(min(croatian))
 
 
 def test_the_distance_to_a_segment_takes_its_nearest_point():

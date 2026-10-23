@@ -433,8 +433,14 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   `OTHER_COUNTRIES` while a v1 boundary lies within `BORDER_DOUBT_KM` = 3 km beyond its distance:
   the 1:50m borders lie up to 2.6 km off, and an empty country is an administrator's question in
   the module where a wrong one is acted upon (Narva, Estonia, falls 2.5 km inside the 1:50m
-  Russia). Crimea, Sevastopol included, is `UA` (the EU and UN position; Natural Earth's
-  Ukrainian point of view: its 1:50m Crimea polygon is Ukraine's in the bundled file). XK
+  Russia); empty too when the position comes from the coast fallback and a boundary of
+  `NEIGHBOUR_COUNTRIES` lies within `BORDER_DOUBT_KM` beyond the nearest (the gap between
+  Gibraltar's 1:10m polygon and Spain's 1:50m one: Gibraltar airport, La Línea). The band never
+  applies inside a polygon: Albina (Suriname), inside the 1:50m French Guiana 3.0–3.3 km from
+  Suriname's line, is `FR`. Crimea, Sevastopol included, is `UA` (the EU position; Natural
+  Earth EU point of view: its 1:50m Crimea polygon is Ukraine's in the bundled file). Northern
+  Cyprus is an open question for the owner (no polygon of its own: `CY` within 10 km of the 1:50m
+  Cyprus, else empty). XK
   (Kosovo) is a user-assigned code, which MSMM accepts (`[A-Z]{2}`). `country_for_point`, the OSM
   crop's, detection's and hubs', keeps to the v1 list); `provider_provenance` the
   provider's own, else the catalogue's for the same id and feed, else `nap` for a NAP-resolved one,

@@ -33,9 +33,9 @@ This product includes software developed by third parties:
     3 km off). Gibraltar is Natural Earth's 1:10m polygon (absent at 1:50m).
     Changes made: ISO codes normalised where Natural Earth gives -99 (France
     FR, Norway NO, Kosovo XK; XK is a user-assigned code, not ISO 3166-1);
-    Crimea is Ukraine's, as in Natural Earth's Ukrainian point of view and
-    the view of the EU and the UN (its breakaway/disputed area "Crimea",
-    whose 1:50m polygon is the one moved from Russia to Ukraine).
+    Crimea is Ukraine's, the EU position (Natural Earth EU point of view:
+    the views of the EU members and of Ukraine; its breakaway/disputed area
+    "Crimea", whose 1:50m polygon is the one moved from Russia to Ukraine).
     Public domain; no attribution required, credited here as a courtesy.
 
   * MapLibre GL JS (when wired in step 14 of the implementation order)
