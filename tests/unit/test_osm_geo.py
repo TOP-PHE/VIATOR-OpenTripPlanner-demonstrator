@@ -417,7 +417,8 @@ def test_the_distance_to_a_country_is_its_nearest_polygons():
         for iso, _bbox, poly in g._polygons()
         if iso == "HR" and g._polygon_km(lat, lon, poly, k) <= 10.0
     ]
-    assert len(croatian) >= 2 and croatian[0] > min(croatian) + 1.0
+    assert len(croatian) >= 2
+    assert croatian[0] > min(croatian) + 1.0
     assert g._boundaries_within(lat, lon, 10.0)["HR"] == pytest.approx(min(croatian))
 
 
