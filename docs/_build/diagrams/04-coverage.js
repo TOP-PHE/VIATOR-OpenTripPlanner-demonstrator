@@ -1,7 +1,7 @@
 /* A network coverage run, in three phases.
  * Facts from facts-coverage.md (runner.py + api/admin/network_coverage.py).
  * The two things prose keeps getting wrong and this diagram fixes:
- *   - it runs in the web container, after the HTTP response has been sent
+ *   - it runs in the worker (the coverage executor, #392), never in web: web only creates the row
  *   - external verification is Phase 3, after ALL routing, and a cancel skips it
  */
 const { Svg } = require('../svgkit');
@@ -16,7 +16,7 @@ exports.svg = () => {
   s.box('create', 150, 74, 500, 54, 'runner.create_run()', { kind: 'module', sub: 'validate · load hubs · enumerate pairs · INSERT pending' });
   s.text(776, 148, 'HTTP 200 returns here — the run is still “pending” and nothing has been routed yet',
     { size: 10.5, anchor: 'end', italic: true, fill: '#A9691A' });
-  s.box('bg',     230, 158, 340, 48, 'bg.add_task(execute_run)', { kind: 'container', sub: 'in the web container', size: 12.5 });
+  s.box('bg',     230, 158, 340, 48, 'worker claims the run', { kind: 'container', sub: 'coverage executor · heartbeat 30 s', size: 12.5 });
 
   // ---- phase 1
   s.frame(20, 232, 760, 88, 'Phase 1 — snapshot and start');
@@ -62,8 +62,8 @@ exports.svg = () => {
 
   s.step(1, 52, 396); s.step(2, 346, 396); s.step(3, 72, 568);
 
-  s.text(24, 780, 'The whole run executes inside the web container as a FastAPI background task. Killing web kills the run in flight;', { size: 10.5 });
-  s.text(24, 796, 'a startup hook marks any run left “running” as failed.', { size: 10.5 });
+  s.text(24, 780, 'The run executes in the worker’s coverage executor (#392). Restarting web touches nothing; restarting the worker pauses it:', { size: 10.5 });
+  s.text(24, 796, 'the next worker claims it again and resumes it, skipping the pairs that already have a result.', { size: 10.5 });
   s.text(24, 820, 'Phase 1 re-reads the hub list, so a hub edited between creating and starting a run changes what actually gets tested.',
     { size: 10.5, italic: true, fill: '#8A96A3' });
 

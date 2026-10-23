@@ -102,6 +102,10 @@ echo ""
 # new $VERSION even when no compose-file fields changed (e.g. version-only
 # bumps). Force-recreate is needed here because plain `up -d` doesn't recreate
 # containers when only the env/.env-resolved image tag changed.
+#
+# A coverage run in progress is paused, not ended (#392): the worker releases
+# it at SIGTERM and the new worker resumes it where it stopped (the page shows
+# "resuming" meanwhile). Web runs no coverage run any more.
 web_recreated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo ">>> docker compose up -d --force-recreate web worker"
 docker compose up -d --force-recreate web worker

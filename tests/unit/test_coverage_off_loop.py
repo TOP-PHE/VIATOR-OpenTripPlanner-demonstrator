@@ -459,7 +459,9 @@ async def test_execute_run_phases_run_off_the_loop(monkeypatch) -> None:
     async def _pair(**_kw: Any) -> None:
         seen["pair_loop"] = asyncio.get_running_loop()
 
-    async def _finalise(*, run_id: uuid.UUID, elapsed_s: float, cfg: Any) -> None:
+    async def _finalise(
+        *, run_id: uuid.UUID, elapsed_s: float, cfg: Any, executor_id: str | None = None
+    ) -> None:
         seen["finalise"] = (run_id, threading.get_ident(), asyncio.get_running_loop())
 
     monkeypatch.setattr(runner, "_phase1_snapshot_and_start", _phase1)
@@ -504,47 +506,5 @@ async def test_execute_run_terminal_writes_run_off_the_loop(monkeypatch) -> None
 
     assert calls.names() == ["cancelled", "failed"]
     assert calls.kwargs("cancelled")["run_id"] == stopped
-    assert calls.kwargs("failed")["args"] == (crashed,)
+    assert calls.kwargs("failed")["args"] == (crashed, None)
     assert web_thread not in calls.threads()
-
-
-# ───────────────────────────── orphaned runs at startup ─────────────────────────────
-
-
-class _Run:
-    def __init__(self, status: str) -> None:
-        self.id = uuid.uuid4()
-        self.status = status
-        self.summary: dict[str, Any] | None = {"zz": 99}
-        self.completed_pairs = 99
-        self.total_pairs = 199
-        self.finished_at: datetime | None = None
-
-
-class _OrphanDb:
-    def __init__(self, runs: list[_Run]) -> None:
-        self.runs = runs
-
-    def execute(self, _stmt: Any) -> Any:
-        runs = self.runs
-
-        class _Result:
-            def scalars(self) -> Any:
-                return self
-
-            def all(self) -> list[_Run]:
-                return runs
-
-        return _Result()
-
-
-def test_mark_orphaned_runs_returns_their_ids() -> None:
-    runs = [_Run("running"), _Run("pending")]
-    assert runner.mark_orphaned_runs_as_failed(_OrphanDb(runs)) == [r.id for r in runs]  # type: ignore[arg-type]
-    for run in runs:
-        assert run.status == "failed"
-        assert run.summary is not None
-        assert run.summary["orphaned_by_restart"] is True
-        assert run.summary["zz"] == 99
-        assert run.summary["completed_pairs_at_restart"] == 99
-    assert runner.mark_orphaned_runs_as_failed(_OrphanDb([])) == []  # type: ignore[arg-type]

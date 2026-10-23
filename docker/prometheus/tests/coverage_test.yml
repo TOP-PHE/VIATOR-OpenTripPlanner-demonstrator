@@ -1,0 +1,69 @@
+# promtool unit tests of rules/coverage.yml (issue #392). Run in CI:
+#   promtool test rules /etc/prometheus/tests/coverage_test.yml
+# Series values are invented (seconds), sampled every minute.
+
+rule_files:
+  - ../rules/coverage.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A run paused by a deploy is resumed within minutes: no alert. A heartbeat
+  # that stays old past 15 min fires 5 min later.
+  - interval: 1m
+    input_series:
+      - series: 'viator_coverage_heartbeat_age_seconds{job="viator-web"}'
+        values: '30 200 30 30+60x30'
+      - series: 'viator_coverage_oldest_queued_age_seconds{job="viator-web"}'
+        values: '0x33'
+      - series: 'viator_coverage_runs_running{job="viator-web"}'
+        values: '1x33'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: viator-web
+            exp_annotations:
+              summary: "A coverage run has had no executor heartbeat for more than 15 minutes"
+              description: "A running coverage run's heartbeat is 22m 30s old. No coverage executor is holding or resuming it: check that the worker container is up (docker compose -p viator ps worker) and its log (grep coverage_executor). The run is paused, not lost: it resumes when the worker is back."
+      - eval_time: 25m
+        alertname: CoverageRunNotClaimed
+        exp_alerts: []
+
+  # A queued run behind a running one is normal; once nothing runs and it
+  # still waits past 15 min, the alert fires 5 min later.
+  - interval: 1m
+    input_series:
+      - series: 'viator_coverage_oldest_queued_age_seconds{job="viator-web"}'
+        values: '0+60x40'
+      - series: 'viator_coverage_runs_running{job="viator-web"}'
+        values: '1x20 0x20'
+      - series: 'viator_coverage_heartbeat_age_seconds{job="viator-web"}'
+        values: '20x20 0x20'
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: CoverageRunNotClaimed
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: CoverageRunNotClaimed
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: CoverageRunNotClaimed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: viator-web
+            exp_annotations:
+              summary: "A queued coverage run has not been claimed for more than 15 minutes"
+              description: "A coverage run has waited 26m 0s in status pending while no run is running: the worker's coverage executor is not claiming runs. Check the worker container and its log (grep coverage_executor)."
+      - eval_time: 26m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts: []

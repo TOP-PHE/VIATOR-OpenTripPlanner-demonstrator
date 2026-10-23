@@ -72,6 +72,13 @@ main {
 .cov-pill[data-status="completed"] { background: #dafbe1; color: #1a7f37; border-color: #aceebb; }
 .cov-pill[data-status="running"]   { background: #fff8c5; color: #9a6700; border-color: #f5d56b; }
 .cov-pill[data-status="pending"]   { background: #f6f8fa; color: #57606a; }
+/* #392 — display statuses from the coverage executor's bookkeeping: queued
+   (pending, not yet claimed by the worker), resuming (its executor stopped,
+   e.g. a deploy; the next one resumes it), stopping (Stop clicked, not yet
+   confirmed). */
+.cov-pill[data-status="queued"]    { background: #f6f8fa; color: #57606a; }
+.cov-pill[data-status="resuming"]  { background: #ddf4ff; color: #0550ae; border-color: #b6e3ff; }
+.cov-pill[data-status="stopping"]  { background: #eef0f2; color: #57606a; border-color: #d0d7de; }
 .cov-pill[data-status="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
 /* PR-1 — operator-cancelled runs render in a distinct subdued slate so
    operators can tell at a glance "this was stopped on purpose" vs the
@@ -1094,6 +1101,24 @@ function buildRunWindowWarning(run) {
 // branching doesn't count against that function's cognitive
 // complexity. Extending to new statuses (e.g. 'rate_limited') is a
 // one-line addition here without touching the cell builder.
+// #392 — the run's status pill: the API's display status (queued, resuming,
+// stopping) when it has one, else the status; the tooltip says what it means.
+const RUN_STATUS_HINTS = {
+  queued: 'Waiting for the worker to start it.',
+  resuming: 'Paused: the worker restarted (e.g. a deploy). It continues where it stopped once the worker is back.',
+  stopping: 'Stop requested; the worker is ending the run.',
+};
+function runStatusPill(run) {
+  const shown = run.display_status || run.status;
+  const hint = RUN_STATUS_HINTS[shown];
+  const resumes = run.resume_count ? ` · resumed ${run.resume_count}×` : '';
+  const title = hint ? ` title="${escHTML(hint)}"` : '';
+  return `<span class="cov-pill" data-status="${escHTML(shown)}"${title}>${escHTML(shown)}</span>${escHTML(resumes)}`;
+}
+function runIsLive(run) {
+  return run.status === 'running' || run.status === 'pending';
+}
+
 function statusGlyph(status) {
   if (status === 'no_route') return '∅';
   if (status === 'timeout') return '⏱';
@@ -1294,8 +1319,8 @@ async function reloadRunList(activeId) {
       // PR-1 — Stop button visible only while the run is in-flight.
       // Click handler is wired below with stopPropagation so it doesn't
       // also trigger the row's "load this run" handler.
-      const stopBtn = r.status === 'running'
-        ? `<button type="button" class="stop-btn" data-action="stop-run" title="Cancel this in-flight coverage run. Cells already processed will stay in the DB.">Stop</button>`
+      const stopBtn = runIsLive(r)
+        ? `<button type="button" class="stop-btn" data-action="stop-run" title="Cancel this in-flight or queued coverage run. Cells already processed will stay in the DB.">Stop</button>`
         : '';
       // Delete is only meaningful once a run is done moving — the API
       // itself also rejects 'running' with 409, this just keeps the
@@ -1307,7 +1332,7 @@ async function reloadRunList(activeId) {
         <div class="top">
           <strong>${escHTML(r.session_label)}</strong>
           ${countryBadge}
-          <span class="cov-pill" data-status="${escHTML(r.status)}">${escHTML(r.status)}</span>
+          ${runStatusPill(r)}
           ${stopBtn}
           ${deleteBtn}
         </div>
@@ -1608,7 +1633,7 @@ function renderRun(run) {
   const summary = `<div class="cov-summary">
     <div><strong>${escHTML(run.session_label)}</strong></div>
     <div>· ${escHTML(run.depart_at.replace('T',' ').slice(0,16))}</div>
-    <div>· <span class="cov-pill" data-status="${escHTML(run.status)}">${escHTML(run.status)}</span></div>
+    <div>· ${runStatusPill(run)}</div>
     <div>· ${run.completed_pairs}/${run.total_pairs} pairs (${pct}%)</div>
     <div>· <span style="color:#1a7f37">${run.ok_pairs} ok</span></div>
     ${run.no_route_pairs ? `<div>· <span style="color:#9a6700">${run.no_route_pairs} no-route</span></div>` : ''}

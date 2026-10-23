@@ -582,3 +582,80 @@ def test_the_models_station_id_check_is_the_revisions_check() -> None:
     spec.loader.exec_module(revision)
 
     assert revision._CHECK == STATION_ID_CHECK
+
+
+# ── 20261023_1200_coverage_claim: coverage runs claimed by the executor (#392) ──
+
+_BEFORE_COVERAGE_CLAIM = "20261015_1800_refresh_progress"
+_COVERAGE_CLAIM = "20261023_1200_coverage_claim"
+_CLAIM_COLUMNS = {
+    "claimed_by",
+    "heartbeat_at",
+    "resume_count",
+    "cancel_requested_at",
+    "execution_snapshot",
+}
+
+
+def _run_columns(engine: Any) -> set[str]:
+    return {column["name"] for column in inspect(engine).get_columns("network_coverage_runs")}
+
+
+def _run_indexes(engine: Any) -> set[str]:
+    return {i["name"] for i in inspect(engine).get_indexes("network_coverage_runs")}
+
+
+def test_coverage_claim_revision_up_down_up(alembic_cfg: Config) -> None:
+    """The revision adds the claim columns (nulls, resume_count 0) and the
+    status index to the existing runs and changes nothing else; the
+    (run, origin, dest) uniqueness guard of a result is there; the
+    downgrade drops the columns and keeps the runs; a second upgrade works."""
+    url = _postgres_or_skip()
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+
+    command.upgrade(alembic_cfg, _BEFORE_COVERAGE_CLAIM)
+    run_id = "99999999-9999-4999-8999-999999999399"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO network_coverage_runs (id, session_label, depart_at, status, "
+                "total_pairs, completed_pairs, summary) VALUES (:id, 'zz-cov-99', "
+                "'2099-09-09T00:00:00Z', 'failed', 99, 9, '{\"orphaned_by_restart\": true}')"
+            ),
+            {"id": run_id},
+        )
+    assert not (_CLAIM_COLUMNS & _run_columns(engine))
+
+    command.upgrade(alembic_cfg, _COVERAGE_CLAIM)
+    assert _run_columns(engine) >= _CLAIM_COLUMNS
+    assert "ix_network_coverage_runs_status" in _run_indexes(engine)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, completed_pairs, summary, claimed_by, heartbeat_at, "
+                "resume_count, cancel_requested_at, execution_snapshot "
+                "FROM network_coverage_runs WHERE id = :id"
+            ),
+            {"id": run_id},
+        ).one()
+    assert tuple(row) == ("failed", 9, {"orphaned_by_restart": True}, None, None, 0, None, None)
+    uniques = {
+        tuple(u["column_names"])
+        for u in inspect(engine).get_unique_constraints("network_coverage_results")
+    }
+    assert ("run_id", "origin_hub_id", "dest_hub_id") in uniques
+
+    command.downgrade(alembic_cfg, _BEFORE_COVERAGE_CLAIM)
+    assert not (_CLAIM_COLUMNS & _run_columns(engine))
+    assert "ix_network_coverage_runs_status" not in _run_indexes(engine)
+    with engine.connect() as conn:
+        status = conn.execute(
+            text("SELECT status FROM network_coverage_runs WHERE id = :id"), {"id": run_id}
+        ).scalar_one()
+    assert status == "failed"
+
+    command.upgrade(alembic_cfg, "head")
+    assert _run_columns(engine) >= _CLAIM_COLUMNS

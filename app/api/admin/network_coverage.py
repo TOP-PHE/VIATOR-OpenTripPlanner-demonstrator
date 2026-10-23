@@ -35,10 +35,12 @@ Authorization: platform_admin (the matrix consumes serious OTP capacity
 when running, and old runs persist forever — content-manager doesn't
 need this surface).
 
-Background execution: POST /runs creates the row in pending state and
-schedules `runner.execute_run` via FastAPI's BackgroundTasks. The UI
-polls GET /runs/{id} every 5s to render progress; status flips to
-"completed" when all 650 (or 325) pairs have processed.
+Execution (#392): POST /runs creates the row in pending state and returns;
+web never executes a run. The worker's coverage executor
+(`app/network_coverage/executor.py`) claims it, executes it and resumes it
+after a restart. Stop writes `cancel_requested_at` (or cancels a run still
+queued). The UI polls GET /runs/{id} every 5s to render progress from the
+database; status flips to "completed" when all pairs have processed.
 """
 
 from __future__ import annotations
@@ -54,7 +56,7 @@ from datetime import time as dtime
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import (
     AfterValidator,
@@ -81,6 +83,7 @@ from ...models import (
 )
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
+from ...network_coverage import executor as coverage_executor
 from ...network_coverage import external_verify, hub_derive, runner
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
@@ -591,6 +594,14 @@ class RunSummary(BaseModel):
     response_ms_min: int | None = None
     response_ms_avg: float | None = None
     response_ms_max: int | None = None
+    # #392 — what the page shows in the status pill, from the executor's
+    # bookkeeping on the row: "queued" (pending, no executor holds it yet),
+    # "resuming" (running, but its executor stopped: a deploy or a worker
+    # restart; the next executor resumes it), "stopping" (Stop clicked, the
+    # executor has not confirmed yet), else `status`.
+    display_status: str = ""
+    resume_count: int = 0
+    heartbeat_age_seconds: float | None = None
 
 
 # PR-196a — the alignment-tier vocabulary the scorer in
@@ -2288,7 +2299,6 @@ def list_runs(
 )
 def create_run(
     body: RunCreate,
-    bg: BackgroundTasks,
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> RunSummary:
@@ -2305,9 +2315,10 @@ def create_run(
                                    At least one serving + fanout-enabled
                                    session must exist.
 
-    Validates pre-flight, creates the run row in pending state, schedules
-    `execute_run` as a background task, and returns the summary so the
-    UI can start polling immediately.
+    Validates pre-flight, creates the run row in pending state and returns
+    the summary so the UI can start polling immediately. #392: nothing is
+    executed here; the worker's coverage executor claims the run (it shows
+    "queued" until then).
     """
     if body.direction not in ("both", "single"):
         raise HTTPException(400, "direction must be 'both' or 'single'")
@@ -2352,10 +2363,8 @@ def create_run(
         raise HTTPException(400, str(e)) from e
     db.commit()
     db.refresh(run)
-    # Schedule the actual work. FastAPI BackgroundTasks runs after the
-    # response is sent — the operator gets the run id immediately and
-    # the UI starts polling.
-    bg.add_task(runner.execute_run, run.id)
+    # #392 — the run stays `pending` until the worker's coverage executor
+    # claims it; a restart of web can no longer end it.
     return _run_to_summary(run, cfg=runner._load_coverage_config(db))
 
 
@@ -2914,9 +2923,9 @@ def export_run_html(
         404: {"description": _RUN_NOT_FOUND},
         409: {
             "description": (
-                "Run is not in 'running' state — stop is only meaningful for "
-                "in-flight runs. Terminal-state runs (completed / failed / "
-                "cancelled) return 409 unchanged."
+                "Run is not in 'running' or 'pending' state — stop is only "
+                "meaningful for in-flight or queued runs. Terminal-state runs "
+                "(completed / failed / cancelled) return 409 unchanged."
             )
         },
     },
@@ -2928,36 +2937,75 @@ def stop_run(
 ) -> RunSummary:
     """PR-1 — operator-driven cancel for an in-flight coverage run.
 
-    Fires a cooperative cancel signal the runner checks between each
-    pair; the worker exits the per-pair loop cleanly, persists the cells
-    already processed, and flips the row to status='cancelled' with a
-    `cancelled_by_operator` marker on `summary`.
+    #392 — the run executes in the worker, so the signal goes through the
+    database: `cancel_requested_at` is stamped, the runner's per-pair DB
+    check reads it (within ~3 s) and stops the run exactly as the old
+    in-process signal did: the cells already processed stay, the row flips
+    to status='cancelled' with a `cancelled_by_operator` marker on
+    `summary`. A run still queued (`pending`, no executor holds it) is
+    cancelled here at once, with the same marker.
 
-    Returns the updated run summary (status reads 'running' on the
-    initial response — the runner observes the signal a beat later when
-    the next pair-check fires). The UI polls /runs/{id} every 5s so the
-    'cancelled' flip surfaces within one polling tick.
+    Returns the updated run summary (a running run reads 'running' with
+    display status 'stopping' until the executor confirms). The UI polls
+    /runs/{id} every 5s so the 'cancelled' flip surfaces within a tick.
 
     Status codes:
-      200 — signal accepted, runner is in-flight and will stop
+      200 — stop recorded (or the queued run cancelled)
       404 — run id unknown
-      409 — run is not in 'running' state
+      409 — run is neither running nor queued
     """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
+    if run.status == "pending" and _cancel_queued_run(db, run_id):
+        db.refresh(run)
+        return _run_to_summary(run, cfg=runner._load_coverage_config(db))
+    db.refresh(run)
     if run.status != "running":
         raise HTTPException(
             409,
-            f"Run is in state {run.status!r} — stop is only valid for 'running' runs",
+            f"Run is in state {run.status!r} — stop is only valid for running or queued runs",
         )
-    # Fire-and-forget — the runner's per-pair cooperative check picks
-    # this up between the in-flight pair's persist and the next pair's
-    # fetch_plan call. The DB write to status='cancelled' happens in the
-    # runner, NOT here, so the row's terminal-state guarantee holds
-    # (status='running' until the worker confirms it has stopped).
-    runner.request_cancel(run_id)
+    # The DB write to status='cancelled' happens in the runner, NOT here, so
+    # the row's terminal-state guarantee holds (status='running' until the
+    # executor confirms it has stopped).
+    db.execute(
+        update(NetworkCoverageRun)
+        .where(
+            NetworkCoverageRun.id == run_id,
+            NetworkCoverageRun.status == "running",
+            NetworkCoverageRun.cancel_requested_at.is_(None),
+        )
+        .values(cancel_requested_at=func.now())
+    )
+    db.commit()
+    db.refresh(run)
     return _run_to_summary(run, cfg=runner._load_coverage_config(db))
+
+
+def _cancel_queued_run(db: DbSession, run_id: uuid.UUID) -> bool:
+    """#392 — cancel a run no executor has claimed yet, in one conditional
+    UPDATE (False when an executor claimed it meanwhile: it is running now
+    and is stopped through `cancel_requested_at`)."""
+    now = datetime.now(UTC)
+    cancelled = db.execute(
+        update(NetworkCoverageRun)
+        .where(NetworkCoverageRun.id == run_id, NetworkCoverageRun.status == "pending")
+        .values(
+            status="cancelled",
+            finished_at=now,
+            cancel_requested_at=now,
+            summary={
+                "elapsed_seconds": 0.0,
+                "cancelled_by_operator": True,
+                "cancelled_at": now.isoformat(),
+                "cancelled_while_queued": True,
+            },
+        )
+        .returning(NetworkCoverageRun.id)
+    ).scalar_one_or_none()
+    db.commit()
+    return cancelled is not None
 
 
 @router.get(
@@ -3049,7 +3097,10 @@ def delete_run(
     endpoint first so the background worker isn't racing a delete of
     the row it's about to write terminal-state fields onto.
     """
-    run = db.get(NetworkCoverageRun, run_id)
+    # #392 — the row is locked while its status is checked, so a queued run
+    # the worker's executor claims at this moment (it skips locked rows) is
+    # either deleted before the claim or seen running here, never both.
+    run = db.get(NetworkCoverageRun, run_id, with_for_update=True)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
     if run.status == "running":
@@ -3460,6 +3511,32 @@ def _aggregate_response_ms(
     return out
 
 
+def _int_or_zero(value: Any) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def _display_status(run: Any) -> tuple[str, float | None]:
+    """#392 — (pill text, heartbeat age in seconds) for a run row. A running
+    run with no heartbeat, or one older than the executor's stale limit, is
+    "resuming": its executor stopped and the next one takes it over."""
+    status = str(run.status)
+    heartbeat_at = getattr(run, "heartbeat_at", None)
+    age = (
+        max(0.0, (datetime.now(UTC) - heartbeat_at).total_seconds())
+        if isinstance(heartbeat_at, datetime)
+        else None
+    )
+    if status == "pending":
+        return "queued", age
+    if status != "running":
+        return status, age
+    if isinstance(getattr(run, "cancel_requested_at", None), datetime):
+        return "stopping", age
+    if age is None or age > coverage_executor.STALE_AFTER_SECONDS:
+        return "resuming", age
+    return status, age
+
+
 def _run_to_summary(
     run: Any,
     *,
@@ -3486,7 +3563,11 @@ def _run_to_summary(
         rmax: int | None = None
     else:
         rmin, ravg, rmax = response_ms_stats
+    display_status, heartbeat_age = _display_status(run)
     return RunSummary(
+        display_status=display_status,
+        resume_count=_int_or_zero(getattr(run, "resume_count", 0)),
+        heartbeat_age_seconds=heartbeat_age,
         id=str(run.id),
         session_id=run.session_id,
         session_label=run.session_label,

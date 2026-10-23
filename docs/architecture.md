@@ -45,8 +45,10 @@ depend on cross-cutting concerns, which depend on the leaves.
 
 Two things are worth fixing in your head now, because both regularly mislead people:
 
-- **The web container and the worker share no Python.** Neither imports the other. They coordinate
-  through a file on a shared volume and a row in Postgres. See 2.1.
+- **The web container and the worker share no Python, except the coverage runner.** Neither imports
+  the other. They coordinate through a file on a shared volume and rows in Postgres. Since #392 the
+  worker also imports `app/network_coverage` (it executes coverage runs) and web keeps importing it to
+  create and read runs; the two still meet only in the database. See 2.1.
 - **`network_coverage` and `journey` look mutually dependent but are not.** The forward direction is
   real and heavily used. The reverse is a single line — `hafas_client` reaching into
   `external_verify` — and because `external_verify` imports nothing internal, no import chain ever
@@ -58,20 +60,21 @@ Two long-running Python processes, plus a fleet of engine containers.
 
 | Process | Container | Entry point | Owns |
 |---|---|---|---|
-| Web | `web` | `app/main.py` | All HTTP, the APScheduler crons, **and** network-coverage background runs |
-| Worker | `worker` | `app/worker.py` (`main()` → `tick()` loop) | Feed→graph builds, docker/nginx reloads |
+| Web | `web` | `app/main.py` | All HTTP, the APScheduler crons; creates coverage runs (`pending`) |
+| Worker | `worker` | `app/worker.py` (`main()` → `tick()` loop, plus the coverage executor thread) | Feed→graph builds, docker/nginx reloads, **network-coverage runs** |
 
-**Trap:** coverage runs execute in the *web* container as FastAPI `BackgroundTasks`, not in the worker. Killing `web` kills in-flight coverage runs. The worker only does rebuilds. Getting this backwards sends operators debugging the wrong container.
+**Trap:** since #392 coverage runs execute in the *worker* container (the coverage executor, `app/network_coverage/executor.py`, a thread with its own event loop), not in web. Restarting `web` touches no run. Restarting the `worker` pauses a run: it is released at SIGTERM (or its heartbeat goes stale after 3 min) and the next worker resumes it, skipping the pairs already done. Before #392 it was the other way round; old notes and incident reports say "web".
 
 ![Runtime topology — one host, one Docker project, with only nginx reachable from outside](diagrams/arch-topology.svg)
 
 Three details in that picture are easy to get backwards and expensive to debug:
 
-- **All outbound HTTP leaves from `web`** — the reference planners, the NAP feed downloads, the OSM
-  extracts. The worker's only egress is the Docker socket.
+- **Most outbound HTTP leaves from `web`** — the reference planners, the NAP feed downloads, the OSM
+  extracts. The worker also calls the station module before a MOTIS build and, since #392, the
+  engine containers and ÖBB HAFAS for the coverage runs it executes (not drawn in the picture).
 - **`web` cannot restart containers.** It has no Docker socket. It writes the generated compose and
   nginx fragments plus a `.reload-trigger` sentinel; the worker picks them up on its next tick.
-- **`web` reaches the engine containers directly by DNS**, not through nginx. The nginx
+- **`web` (and the worker's coverage executor) reach the engine containers directly by DNS**, not through nginx. The nginx
   `/otp/<sid>/` and `/motis/<sid>/` routes exist for the operator's browser.
 
 ### 2.2 Layers
@@ -124,13 +127,13 @@ Three details in that picture are easy to get backwards and expensive to debug:
 1. `/admin/network-coverage` (`api/pages.py`) renders the matrix. Hubs come from `GET /api/admin/network-coverage/hubs` → `list_hubs` reading `network_coverage_hubs`; `network_coverage/hubs.py::HUBS` is the static fallback/seed.
 2. `POST /api/admin/network-coverage/runs` → `api/admin/network_coverage.py::create_run` (`require_platform_admin`). `_validate_run_create_mode` branches to `_validate_single_session_mode` or `_validate_fanout_mode`.
 3. `runner.create_run(...)`: `_load_active_hubs(db, countries)` → `_hub_pairs(hubs, direction)` → `_hub_set_signature(hubs)`; inserts a `network_coverage_runs` row at `status='pending'`. **The country filter is stored on the run**, because `execute_run` re-derives the pair list independently (PR-187 fixed a regression where the filter was applied at creation but dropped at execution).
-4. The route schedules `background_tasks.add_task(runner.execute_run, run.id)` — in the *web* process.
-5. `execute_run` calls `register_cancel(run_id)` (an in-memory `asyncio.Event`), then `_phase1_snapshot_and_start`: loads `CoverageConfig` from `platform_config` and **freezes it for the run's lifetime**, resolves the session engine, resolves the day window via `_resolve_run_window` + `_slot_boundaries`, flips status to `running`.
+4. The route returns; nothing runs in web (#392). The worker's coverage executor (`executor.CoverageExecutor.poll_once`, every 10 s) claims the row atomically (`claim_next_run`: `SELECT … FOR UPDATE SKIP LOCKED`, then `status='running'`, `claimed_by`, `heartbeat_at`) and calls `runner.execute_run(run_id, executor_id=…)`, beating the heartbeat every 30 s meanwhile.
+5. `execute_run` calls `register_cancel(run_id)` (an in-memory `asyncio.Event`), then `_phase1_snapshot_and_start`: loads `CoverageConfig` from `platform_config` and the active hubs, and **freezes both on the row** (`execution_snapshot`) at the first execution, resolves the session engine, resolves the day window via `_resolve_run_window` + `_slot_boundaries`. On a resumed run it reads the snapshot instead and leaves out the pairs that already have a result row (and recounts the counters from those rows).
 6. Phase 2 — `asyncio.gather` over `_process_pair_with_cancel`, bounded by `asyncio.Semaphore(cfg.pair_parallelism)` (default 5). Each pair checks cancellation **twice**: the in-memory `Event` and `_is_cancelled_in_db` (TTL-cached SELECT) — the in-memory event alone doesn't survive an operator's `UPDATE ... SET status='cancelled'` issued from psql or another worker.
 7. Each pair runs `_execute_pair` (single-session) or `_execute_pair_fanout`. Both go through `_fetch_plan_sliced`, which splits the day window into K slots (default 6 × 4 h), issues one `planner_dispatch.planner_for_engine(engine).fetch_plan` per slot with `COVERAGE_WITHIN_PAIR_PARALLELISM`, then `_trip_belongs_to_window` / `_coverage_dedup_key` / `_merge_slot_results`. Slicing exists to avoid per-pair timeout cliffs and to make engines comparable on identical windows. Results land in `journey_searches`/`_executions`/`_trips` via `recorder` (so cell-click drilldown reuses the journey trip-card UI) plus one `network_coverage_results` row via `_persist_pair_coverage_result`.
 8. Phase 3 — `_finalise_completed_run` → `_maybe_run_external_verify_sweep`. When the run set `verify_externally`, it sweeps **every non-`skipped` row** (PR-196a removed the old failures-only filter — the graduated heatmap needs a score on `ok` cells too, and the old filter was what produced the all-white matrix). Each cell: `external_verify` two-step ÖBB call, then `alignment.compute_alignment` → `_persist_alignment_on_row` writing `external_alignment_score` / `external_alignment_tier`.
-9. UI polls `GET .../runs/{id}` (`get_run` → `_run_to_summary` + `_stats_from_results`). Cell click → `get_cell_trips`. Stop → `stop_run` sets DB status *and* calls `runner.request_cancel`; `_persist_cancelled_run` keeps the partial results.
-10. Crash recovery: a container restart kills in-flight BackgroundTasks with no DB cleanup, so `main.py::_startup` calls `runner.mark_orphaned_runs_as_failed(db)` — anything still `running`/`pending` at boot is orphaned by definition.
+9. UI polls `GET .../runs/{id}` (`get_run` → `_run_to_summary` + `_stats_from_results`; `display_status` queued / resuming / stopping). Cell click → `get_cell_trips`. Stop → `stop_run` stamps `cancel_requested_at` (a queued run is cancelled at once); the runner's DB check reads it and raises the in-process Stop; `_persist_cancelled_run` keeps the partial results.
+10. Crash recovery (#392): a worker restart leaves the run `running`. A graceful stop releases it (`release_claims`); otherwise its heartbeat is stale after 180 s. Either way the next executor claims it again (`resume_count` + 1, `summary.resumes`) and resumes it; past `COVERAGE_MAX_RESUMES` (5) it is marked failed with `summary.resume_limit_reached`. Web's startup no longer touches runs.
 
 #### (c) A data feed is ingested and a routing graph is built and promoted
 
@@ -257,7 +260,7 @@ and is off unless both are set.
 | POST | `.../hubs/pick` | The hub picker of Add/Edit hub (#398): body `{"q", "country"}` (extra forbidden, the typeahead's text rules, else 422 in plain words without a call); a country outside the module's `countries()` (without that list: outside the assigned ISO codes and XK, `station_module.SEARCH_COUNTRIES`) is `refused` without a call; one admin search with `country` (`station_module.admin_search_outcome`, never pauses); a 422 (a module without `country`, MSMM #69) is asked again without it and only the country's rows kept (`incomplete`); ≤10 rows a hub can take, each with a proposed `short` (≤12, `hub_derive.shorten`) and `slug` (`hub_derive.slugify`, runs of hyphens made one, unique among every hub id and within the answer) and `station_id` = `current_id(row)`; `refused`/`limited`/`unavailable` as plain sentences; writes nothing (the page saves the hub, then the station through `.../hubs/confirm`) | platform_admin |
 | GET | `.../hubs/countries` | The picker's countries: `station_module.countries()` (`source: module`), else `osm_geo.COUNTRY_NAMES` (`source: viator`) | platform_admin |
 | POST | `.../hubs/check` | Re-read ≤20 hubs a click with one lookup, by `station_id` when set, else by code (an unanswered id with a code: the code in a second lookup, `id_not_answered`; that lookup failing gives `no_answer` with `retry_after`, never `not_served`); shows every hub with the code origin and licence read live (D-R11 A), unserved stations and differing names; writes only `station_id` (an alias moved to its survivor, a missing id filled), guarded (`changed_meanwhile`), never a code | platform_admin |
-| GET/POST | `.../runs` | List runs / start a run (schedules `execute_run` as BackgroundTask) | platform_admin |
+| GET/POST | `.../runs` | List runs / start a run (creates it `pending`; the worker's coverage executor runs it, #392) | platform_admin |
 | GET | `.../runs/{id}` | Run summary + every cell — the matrix poll (5 s) | platform_admin |
 | POST | `.../runs/{id}/stop` | Cooperative cancel; 409 if not `running` | platform_admin |
 | GET | `.../runs/{id}/export.html` | Self-contained offline HTML report | platform_admin |
@@ -370,8 +373,8 @@ Fanout response:
   when no snapshot existed, making every search render "(error)" with perfect itineraries. Also gone:
   `_placeholder_snapshot_id()` returning the all-zero UUID — an FK-violation footgun that crashed
   every fanout against a freshly-built session. Leave `graph_snapshot_id` NULL.
-- **Coverage runs execute in the `web` container** as FastAPI `BackgroundTasks`, not in the worker.
-  `docker kill web` kills them.
+- **Coverage runs execute in the `worker` container** (the coverage executor, #392), not in web.
+  `docker kill web` touches no run; `docker kill worker` pauses it until the next worker resumes it.
 - **`/api/auth/logout` builds its own `Response`.** The auto-injected `response: Response` parameter
   is a trap — cookies set on it are discarded when you return a fresh object.
 - **Generic-204 is deliberate.** `register-request` and `password-reset-request` always return 204 to
@@ -626,22 +629,26 @@ other — are forced into view because all-pairs enumeration leaves nowhere to h
 country), expands them with `_hub_pairs(hubs, direction)` — `both` gives N×(N−1) ordered
 pairs, `single` gives the N×(N−1)/2 unordered half — hashes the hub set into a
 `live:<count>:<sha256[:8]>` signature so historical runs can be grouped even after hubs
-are edited, and inserts a `pending` row. The API layer then schedules
-`execute_run(run_id)` as a FastAPI `BackgroundTask` **in the web container**.
+are edited, and inserts a `pending` row. Since #392 the API layer only returns: the worker's
+coverage executor claims the row (`executor.claim_next_run`, `FOR UPDATE SKIP LOCKED`) and calls
+`execute_run(run_id, executor_id=…)` **in the worker container**, beating `heartbeat_at` every 30 s.
 
 `execute_run` runs three phases:
 
-1. `_phase1_snapshot_and_start` flips the row to `running`, reads every `COVERAGE_*` key
-   from `platform_config` into a frozen `CoverageConfig`, resolves the session engine (or
-   snapshots the fanout session list), and resolves the day window. Everything the pair
-   loop needs lives in a frozen `_Phase1Snapshot` — Phase 2 does no further config lookups.
+1. `_phase1_snapshot_and_start` reads every `COVERAGE_*` key from `platform_config` into a
+   frozen `CoverageConfig` and the active hubs, both frozen on the row at the first execution
+   (`execution_snapshot`, so a resume asks the same pairs on the same grid), resolves the
+   session engine (or snapshots the fanout session list), and resolves the day window. On a
+   resume it drops the pairs that already have a result row. Everything the pair loop needs
+   lives in a frozen `_Phase1Snapshot` — Phase 2 does no further config lookups.
 2. `asyncio.gather` over `_process_pair_with_cancel`, bounded by
    `Semaphore(cfg.pair_parallelism)` (default 5; sequential would take ~42 min for 506
    pairs, 5-way ≈ 10 min). Each pair dispatches to `_execute_pair` or `_execute_pair_fanout`.
 3. `_finalise_completed_run` recomputes counters, calls
-   `_maybe_run_external_verify_sweep`, writes `run.summary`, and flips to `completed`
-   **last** — so a sweep that dies leaves the run in `running` and the boot-time
-   `mark_orphaned_runs_as_failed` catches it.
+   `_maybe_run_external_verify_sweep`, writes `run.summary` (keeping `resume_count` /
+   `resumes`), and flips to `completed` **last**, in one commit and only while its executor
+   still holds the run — so a completion that dies leaves the run `running`, and the resume
+   runs it again from the start (idempotent: no pair left, the same recount and sweep).
 
 **K-slot time-slicing.** `_fetch_plan_sliced` splits the run's day window into K equal
 slots (default 6 × 4 h) and fires `cfg.within_pair_parallelism` concurrent `fetch_plan`
@@ -728,20 +735,24 @@ polylines stay out.
 
 ### Invariants & traps
 
-- **Coverage runs execute in the `web` container, not `worker`.** `docker compose kill web`
-  kills every in-flight run with no DB cleanup. That is exactly why `main.py::_startup`
-  calls `mark_orphaned_runs_as_failed` — anything `running`/`pending` at boot is orphaned
-  by definition.
-- **The runner never blocks the web's event loop (#392).** It runs on the loop that answers
-  every request and the HEALTHCHECK, so every DB call goes through `runner._off_loop` (a
+- **Coverage runs execute in the `worker` container, not `web` (#392).** The executor claims a
+  run atomically and keeps a heartbeat; a stale heartbeat means resume, never fail. Resume is
+  exact because a pair's result row and its counter increments are one transaction and the
+  (run, origin, dest) unique constraint refuses a second row: never split that transaction,
+  never drop the skip of done pairs in `_phase1_snapshot_and_start`. A run that lost its claim
+  (`runner.abandon_run`) writes no terminal state. Web never fails a run at startup.
+- **The runner never blocks its event loop (#392).** In the worker that loop also carries the
+  executor's heartbeat (a blocked loop makes the run look abandoned and another executor
+  takes it); the harness runs it on a loop serving HTTP, the strictest case. So every DB call goes through `runner._off_loop` (a
   2-thread executor; the calls of one pair are awaited in order: recorder, then result row and
   counters) and the completion phase runs on a private loop in its own thread
   (`_run_on_private_loop`), because its verify sweep shares one ORM session. A `SessionLocal()`
   in a coroutine of the runner is a regression: `tests/integration/test_coverage_web_health.py`
   counts SQL statements on the loop thread and fails on one. `/healthz*` are `async def`
   constants and must never touch the DB.
-- **`CoverageConfig` is frozen for the run's lifetime.** Editing a `COVERAGE_*` knob in
-  `/admin/config` mid-run does nothing. This is deliberate — half-the-pairs-used-the-old-
+- **`CoverageConfig` is frozen for the run's lifetime**, across resumes (`execution_snapshot`).
+  Editing a `COVERAGE_*` knob in `/admin/config` mid-run does nothing (except the executor's own
+  `COVERAGE_MAX_CONCURRENT_RUNS` / `COVERAGE_MAX_RESUMES`, read at each poll). This is deliberate — half-the-pairs-used-the-old-
   timeout makes post-mortems impossible.
 - **The country filter must be threaded through both `create_run` and `execute_run`.**
   `execute_run` re-derives the pair list from `run.countries` independently; PR-187 fixed a
@@ -1302,7 +1313,8 @@ MOTIS image ships no curl, so the previous probe always failed and every MOTIS c
 reported unhealthy — which meant Docker never auto-restarted MOTIS when its HTTP server
 actually died silently.
 
-**The worker loop.** `main()` → cleanup → `while True: tick(); handle_reload_trigger(); sleep`.
+**The worker loop.** `main()` → cleanup → start the coverage executor thread (#392, its own event
+loop, SIGTERM releases its runs) → `while True: tick(); handle_reload_trigger(); sleep`.
 `tick()` takes the *oldest* `pending` row from `rebuild_jobs`, checks it is older than
 `REBUILD_DEBOUNCE_SECONDS`, flips it to `running`, re-reads `sessions.engine` in its own short
 transaction (the operator may have edited it since enqueue), then calls `run_build` or
@@ -1746,7 +1758,7 @@ keys whose value actually changed, writes one `config.update` audit row per chan
 `concurrency.semaphores.reload_from_config(...)` so `MAX_CONCURRENT_JOURNEYS` and friends take
 effect on the next request without a restart.
 
-The reason this table exists is written into the schema comments: fourteen `COVERAGE_*` knobs, the
+The reason this table exists is written into the schema comments: sixteen `COVERAGE_*` knobs (two since #392 for the coverage executor), the
 OTP query-depth pair, the OJP/HAFAS reference toggles, the worker's debounce and tick, registration
 policy, and four retention windows are all things an operator wants to tune *while a demo is
 running*. Setting `COVERAGE_PAIR_PARALLELISM` from 5 to 2 because MOTIS is thrashing should not
@@ -1857,8 +1869,9 @@ Rate limits, all on `/api/auth/*` and nowhere else: `register-request` 5/hour,
   request that reads config. The psql fallback documented in `CLAUDE.md` is real, but insert values you
   know satisfy the schema's `min`/`max`/`choices`.
 - **You cannot set a secret to the literal string `********`** — it is the no-change sentinel.
-- **Coverage runs freeze their config.** `execute_run` reads `CoverageConfig` once and holds it for the
-  run's lifetime; changing a `COVERAGE_*` knob mid-run does nothing.
+- **Coverage runs freeze their config.** `execute_run` reads `CoverageConfig` once, freezes it on the
+  row (`execution_snapshot`) and holds it for the run's lifetime, resumes included; changing a
+  `COVERAGE_*` knob mid-run does nothing.
 - **Insecure `settings.py` defaults must be overridden in `.env`.** `jwt_secret="change-me-in-prod-…"`
   and `jwt_cookie_secure=False` (the session cookie will be sent over plaintext until this is `True`
   behind TLS). `admin_user` and `admin_password` default to empty, which leaves the legacy surface off.
@@ -2257,7 +2270,7 @@ That is a deliberate constraint, and it has consequences a contributor must inte
 | `/journey` | `journey.html` | `require_logged_in` (redirect to `/login`) | **Product surface.** Run one OD query across every fanout session + optional OJP/HAFAS references |
 | `/admin/network-coverage` | `admin/network_coverage.html` | platform_admin | **Product surface.** Create/monitor N×N coverage runs, read the alignment heatmap, drill into a cell |
 | `/admin/sessions` | `admin/sessions.html` | platform_admin | Configure a session's providers, OSM scope, timezone, heap; refresh feeds; promote to `serving` |
-| `/admin/config` | `admin/config.html` | platform_admin | Edit `platform_config` keys (SMTP, concurrency, the 14 `COVERAGE_*` knobs) live |
+| `/admin/config` | `admin/config.html` | platform_admin | Edit `platform_config` keys (SMTP, concurrency, the 16 `COVERAGE_*` knobs) live |
 | `/admin/users` | `admin/users.html` | platform_admin | Create users, change roles, deactivate |
 | `/admin/nap-catalogues` | `admin/nap_catalogues.html` | platform_admin | CRUD the National Access Point endpoints that feed the Import-from-NAP picker |
 | `/admin/reports` | `admin/reports.html` | platform_admin | Volume/latency per session and per user; CSV download |

@@ -1,0 +1,53 @@
+# Coverage executor alerts — issue #392 (durable part).
+#
+# Coverage runs execute in the worker's coverage executor
+# (app/network_coverage/executor.py), which refreshes `heartbeat_at` on the
+# run it holds every 30 s. A run whose heartbeat is older than 180 s is taken
+# as abandoned (its executor stopped: deploy, worker restart, crash) and the
+# next executor resumes it; a graceful worker stop releases the run so it is
+# resumed at the next poll (10 s). So a heartbeat stays old only when no
+# executor is there to resume the run: the worker is down, crash-looping, or
+# cannot reach the database.
+#
+#   CoverageRunHeartbeatStale  a running run's heartbeat (its start when it has
+#                              none) is older than 15 min, for 5 min
+#   CoverageRunNotClaimed      a queued run has waited more than 15 min while no
+#                              run is running (with one run at a time, a queued
+#                              run behind a running one is normal), for 5 min
+#
+# Metrics: web's DB collector (app/metrics.py, `viator_coverage_*`), computed
+# at scrape time with the database's clock. Unit tests of the expressions:
+# docker/prometheus/tests/coverage_test.yml (`promtool test rules`, CI).
+#
+# NOTE: no Alertmanager and no Grafana contact point is provisioned yet (see
+# autoheal.yml): these alerts show as firing at /prometheus/alerts and in
+# Grafana's Alerting tab, and page nobody until a channel is configured.
+
+groups:
+  - name: viator-coverage
+    rules:
+      - alert: CoverageRunHeartbeatStale
+        expr: viator_coverage_heartbeat_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A coverage run has had no executor heartbeat for more than 15 minutes"
+          description: >-
+            A running coverage run's heartbeat is {{ $value | humanizeDuration }}
+            old. No coverage executor is holding or resuming it: check that the
+            worker container is up (docker compose -p viator ps worker) and its
+            log (grep coverage_executor). The run is paused, not lost: it resumes
+            when the worker is back.
+      - alert: CoverageRunNotClaimed
+        expr: viator_coverage_oldest_queued_age_seconds > 900 and viator_coverage_runs_running == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A queued coverage run has not been claimed for more than 15 minutes"
+          description: >-
+            A coverage run has waited {{ $value | humanizeDuration }} in status
+            pending while no run is running: the worker's coverage executor is
+            not claiming runs. Check the worker container and its log
+            (grep coverage_executor).

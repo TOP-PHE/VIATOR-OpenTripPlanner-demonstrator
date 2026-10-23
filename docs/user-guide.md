@@ -126,9 +126,12 @@ across a set of countries, across a whole day, and see where coverage exists.
    (00:00–24:00) on the departure date.
 9. **Run coverage.**
 
-The run executes in the background; the page shows progress. External verification happens
+The run executes in the background, in the worker; the page shows progress. It reads `queued`
+until the worker starts it (one run at a time by default). External verification happens
 **at the end**, after every pair has been routed — so a verify-enabled run stays in `running`
-state for a while with the matrix already visible.
+state for a while with the matrix already visible. If the worker restarts (a deploy, for
+instance), the run reads `resuming` for a moment and then continues where it stopped; nothing is
+lost and nothing is asked twice.
 
 ### Reading the matrix
 

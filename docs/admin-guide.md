@@ -501,9 +501,11 @@ After the install completes:
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
-> **A deploy restarts web, and a restart of web ends a running coverage run**
-> (it is marked failed and must be started again, §6.18). Look at the coverage
-> page first and deploy when no run is in progress.
+> **A deploy pauses a running coverage run; it no longer ends it** (§6.19). The
+> deploy recreates web and the worker; the worker releases the run, the page
+> shows it **resuming**, and the new worker continues it where it stopped,
+> usually within a minute of starting. Nothing to do before or after. (Before
+> the release that moved runs into the worker, a deploy ended the run, §6.18.)
 
 > **Fresh-install only**: see [`docker/INSTALL.md` §5.5](../docker/INSTALL.md) — run `bin/viator-bootstrap-stubs.sh` once before the first `docker compose up`. After that, the orchestrator regenerates `docker/generated/*` from DB state on every web-container boot.
 >
@@ -2206,11 +2208,10 @@ docker compose -p viator logs web | grep orphans_marked_failed
 
 What you see now, and what to do:
 
-- A run interrupted by a restart is still marked **failed**: it cannot be
-  resumed. Start it again from the coverage page.
-- **A deploy still ends a running run** (a deploy restarts web). Until runs
-  move to the worker (the open part of issue #392), deploy when no coverage
-  run is in progress, or start the run again after the deploy.
+- **Superseded by §6.19**: runs now execute in the worker and resume after a
+  restart, and web no longer marks runs failed at startup (the WARNING above
+  is gone). A run already marked **failed** with `orphaned_by_restart` stays
+  so: start it again from the coverage page.
 - To find what restarted web: the WARNING's time is the restart; then
   `docker inspect viator-web-1` (`StartedAt`), the Docker journal at that
   time (`journalctl -u docker --since …`: `stopping restart-manager`,
@@ -2221,6 +2222,51 @@ What you see now, and what to do:
   for any stop of web during a run; it does not tell who stopped it.
 - The health check, its timeout and retries and the autoheal label are
   unchanged.
+
+### 6.19 Coverage runs run in the worker and resume after a restart (issue #392)
+
+Since this release a coverage run no longer runs in web. **Run coverage**
+creates the run and returns; the worker (`viator-worker-1`) picks it up within
+about 10 s and runs it. A restart of web (deploy, autoheal, manual) does not
+touch it. A restart of the worker pauses it, and it continues where it
+stopped: the pairs already in the matrix are not asked again, and the counts
+stay exact.
+
+What the coverage page shows, in the status pill:
+
+| Pill | Meaning | What to do |
+|---|---|---|
+| **queued** | Created, waiting for the worker (one run at a time by default; a second run waits for the first) | Nothing. **Stop** cancels it at once |
+| **running** | The worker is running it | **Stop** ends it after the pairs in flight, as before |
+| **stopping** | Stop clicked; the worker ends it within a few seconds | Wait for **cancelled** |
+| **resuming** | The worker stopped (a deploy, a restart, a crash) and no worker holds the run yet. The cells stay; "resumed N×" counts the resumes | Nothing after a deploy: it continues once the new worker runs (about 10 s after it starts; about 3 min if the worker was killed). If it lasts longer, see below |
+
+During a deploy (§5.1) you therefore see the run go **running → resuming →
+running**, with the cell count going on from where it was. The summary of a
+finished run lists its resumes (`summary.resumes`: when, which worker it
+replaced, how many pairs were done).
+
+**A run that stays "resuming"** has no worker: check `docker compose -p viator
+ps worker` and `docker compose -p viator logs worker | grep coverage_executor`
+(`claimed`, `resumed`, `released`, `poll_failed`, `heartbeat_failed`). The
+Prometheus alert `CoverageRunHeartbeatStale` fires after 15 min of this, and
+`CoverageRunNotClaimed` when a queued run waits 15 min while none runs (no
+notification channel is configured yet: see them at `/prometheus/alerts`).
+
+**A run that ends failed with `resume_limit_reached`**: its worker stopped
+more than `COVERAGE_MAX_RESUMES` times (default 5) during the run, so it was
+not resumed again. Look at the worker log at the times in `summary.resumes`
+(an out-of-memory kill, a crash loop), fix that, and start the run again.
+
+Two settings in **Admin → Configuration → Network coverage matrix**, read by
+the worker every 10 s: `COVERAGE_MAX_CONCURRENT_RUNS` (default 1: how many
+runs run at once; more runs share the engines) and `COVERAGE_MAX_RESUMES`
+(default 5). The other coverage settings are frozen for a run at its start
+and stay frozen across resumes.
+
+To stop a run by hand (no web page), `UPDATE network_coverage_runs SET
+cancel_requested_at = now() WHERE status = 'running';` does what **Stop**
+does. Killing the worker no longer stops a run: it resumes.
 
 ## 7. Rollback
 
