@@ -2513,7 +2513,8 @@ def test_the_code_on_each_hub_row_is_written_as_text(template_text: str) -> None
 
 def test_the_form_sends_the_code_only_when_it_changed(template_text: str) -> None:
     assert 'id="hub-form-uic" name="uic" maxlength="20"' in template_text
-    assert "if (typedUic !== HUB_EDIT_UIC) {" in template_text
+    # A station picked in the module (#398) is stored through confirm instead.
+    assert "if (!picked && typedUic !== HUB_EDIT_UIC) {" in template_text
     assert "body.uic = typedUic || null;" in template_text
     assert "HUB_EDIT_UIC = h.uic || '';" in template_text
 

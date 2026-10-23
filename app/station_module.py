@@ -708,10 +708,29 @@ async def search(q: str, user_id: uuid.UUID) -> list[dict[str, Any]] | None:
     return (await search_outcome(q, user_id)).rows
 
 
-async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
+def _search_body(q: str, country: str | None) -> dict[str, Any]:
+    """The body of a search: `{"q": q}`, with `"country"` when one is given,
+    or ValueError for a country that is not two capital ASCII letters (the
+    module would refuse it after counting the call)."""
+    if country is None:
+        return {"q": q}
+    if not isinstance(country, str) or not _COUNTRY.fullmatch(country):
+        raise ValueError("a search takes a country of two capital letters (ISO 3166-1 alpha-2)")
+    return {"q": q, "country": country}
+
+
+async def admin_search_outcome(q: str, user_id: uuid.UUID, country: str | None = None) -> Outcome:
     """The same search as `search_outcome` (at most ten stations for `q`,
     already normalised by the caller), made by an admin action: the coverage
-    hubs' resolve route, when the near call found nothing around a hub.
+    hubs' resolve route, when the near call found nothing around a hub, and
+    the hub picker of the Add/Edit hub dialog.
+
+    `country` (two capital letters, `XK` included): only the stations of
+    that country (the module's optional `country` field, MSMM issue #69).
+    Sent only when given: a module without the field refuses a body that
+    holds it with a 422 (`TEXT_REFUSED`, its body check forbids unknown
+    fields), and the caller then asks again without it. A country that is
+    not two capital letters raises ValueError before any call.
 
     **A failure never starts the pause**, as for `lookup` and `near_outcome`:
     the typeahead of every user must not switch to the fallback because of a
@@ -719,8 +738,10 @@ async def admin_search_outcome(q: str, user_id: uuid.UUID) -> Outcome:
     Failures are logged as `station_module.admin_search_failed reason=<word>`,
     never the text."""
 
+    body = _search_body(q, country)
+
     async def call() -> list[dict[str, Any]]:
-        return _stations(_json_body(await _post(SEARCH_PATH, {"q": q}, user_id)))
+        return _stations(_json_body(await _post(SEARCH_PATH, body, user_id)))
 
     return await _without_pause("station_module.admin_search_failed", call)
 

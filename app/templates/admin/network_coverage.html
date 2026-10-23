@@ -525,6 +525,24 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 .hub-form-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.8rem; }
 .hub-form-actions button { padding: 0.4rem 1rem; font-size: 0.85rem; cursor: pointer; }
 .hub-form-error { color: #cf222e; font-size: 0.8rem; margin-top: 0.4rem; min-height: 1.1em; }
+/* #398 — the hub picker of the Add / Edit hub dialog, and the folded
+   manual fields. */
+.hub-pick { margin: 0 0 0.4rem; padding: 0.3rem 0.6rem 0.5rem; border: 1px solid #d0d7de; border-radius: 4px; }
+.hub-pick legend { font-size: 0.85rem; font-weight: 600; padding: 0 0.3rem; }
+.hub-pick .hub-pick-country { flex: 0 0 11rem; }
+.hub-pick-note { margin: 0.2rem 0 0; font-size: 0.72rem; }
+.hub-pick-status { display: block; margin-top: 0.3rem; font-size: 0.78rem; color: #5b6470; }
+.hub-pick-status.error { color: #cf222e; }
+.hub-pick-list { list-style: none; margin: 0.3rem 0 0; padding: 0; max-height: 14rem; overflow-y: auto; }
+.hub-pick-list li { border-bottom: 1px dotted #eaeef2; }
+.hub-pick-list li:last-child { border-bottom: none; }
+.hub-pick-list button { display: block; width: 100%; text-align: left; padding: 0.3rem 0.4rem; font-size: 0.8rem; background: none; border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
+.hub-pick-list button:hover, .hub-pick-list button:focus-visible { border-color: var(--brand-blue); background: #f6f8fa; }
+.hub-pick-list button[aria-pressed="true"] { border-color: var(--brand-blue); background: #ddf4ff; }
+.hub-pick-list .hub-pick-meta { display: block; color: #5b6470; font-family: ui-monospace, monospace; font-size: 0.72rem; }
+.hub-pick-chosen { margin: 0.3rem 0 0; font-size: 0.78rem; }
+.hub-manual { margin-top: 0.6rem; }
+.hub-manual summary { cursor: pointer; font-size: 0.8rem; font-weight: 600; }
 /* MSMM step 3 — station codes of the hubs: the code on each row, and the
    proposals / check results of the station module under the tools. */
 .hub-row .hub-code { color: #5b6470; font-family: ui-monospace, monospace; font-size: 0.72rem; }
@@ -750,53 +768,83 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
       <button type="button" class="secondary" data-action="hub-modal-close" style="padding: 0.2rem 0.6rem">×</button>
     </div>
     <form id="hub-form" class="hub-form">
+      {% if station_module_enabled %}
+      {# #398 — the hub picker: a station of the station module fills in the
+         hub. Each pause in typing is one search on the administrator's own
+         limits at the module (two with an older module); saving a picked
+         station makes one lookup more (POST /hubs/confirm). #}
+      <fieldset id="hub-pick" class="hub-pick">
+        <legend>Pick the station in the station module</legend>
+        <div class="form-row">
+          <div class="hub-pick-country">
+            <label for="hub-pick-country">Country</label>
+            <select id="hub-pick-country" aria-describedby="hub-pick-countries-note">
+              <option value="">Loading…</option>
+            </select>
+          </div>
+          <div>
+            <label for="hub-pick-q">City or station name <span class="hint" style="font-weight: normal">(3 characters or more)</span></label>
+            <input type="search" id="hub-pick-q" maxlength="100" autocomplete="off" spellcheck="false"
+                   aria-describedby="hub-pick-status" aria-controls="hub-pick-list">
+          </div>
+        </div>
+        <p class="hint hub-pick-note" id="hub-pick-countries-note"></p>
+        <output id="hub-pick-status" class="hub-pick-status" aria-live="polite"></output>
+        <ul id="hub-pick-list" class="hub-pick-list" aria-label="Stations found"></ul>
+        <p class="hub-pick-chosen" id="hub-pick-chosen" aria-live="polite"></p>
+      </fieldset>
+      {% endif %}
       <div id="hub-id-row">
-        <label>Slug <span class="hint" style="font-weight: normal">(lowercase, hyphens only — immutable)</span></label>
-        <input type="text" name="id" pattern="[a-z0-9][a-z0-9-]*" required>
+        <label for="hub-form-id">Slug <span class="hint" style="font-weight: normal">(lowercase, hyphens only — immutable once saved)</span></label>
+        <input type="text" id="hub-form-id" name="id" pattern="[a-z0-9][a-z0-9-]*" required>
       </div>
       <div class="form-row">
         <div>
-          <label>Country <span class="hint" style="font-weight: normal">(ISO 2-letter)</span></label>
-          <input type="text" name="country" maxlength="2" pattern="[A-Za-z]{2}" required style="text-transform: uppercase">
+          <label for="hub-form-short">Short <span class="hint" style="font-weight: normal">(matrix header — keep ≤12 chars)</span></label>
+          <input type="text" id="hub-form-short" name="short" maxlength="16" required>
         </div>
         <div>
-          <label>Tier</label>
-          <select name="tier">
+          <label for="hub-form-tier">Tier</label>
+          <select id="hub-form-tier" name="tier">
             <option value="main">main</option>
             <option value="regional">regional</option>
           </select>
         </div>
-      </div>
-      <label>Name <span class="hint" style="font-weight: normal">(operator-facing label)</span></label>
-      <input type="text" name="name" maxlength="120" required>
-      <div class="form-row">
         <div>
-          <label>Short <span class="hint" style="font-weight: normal">(matrix header — keep ≤12 chars)</span></label>
-          <input type="text" name="short" maxlength="16" required>
-        </div>
-        <div>
-          <label for="hub-form-region">Region <span class="hint" style="font-weight: normal">(optional, informational)</span></label>
-          <input type="text" id="hub-form-region" name="region" maxlength="40">
-        </div>
-      </div>
-      <div class="form-row">
-        <div>
-          <label>Latitude</label>
-          <input type="number" name="lat" step="0.0001" min="-90" max="90" required>
-        </div>
-        <div>
-          <label>Longitude</label>
-          <input type="number" name="lon" step="0.0001" min="-180" max="180" required>
-        </div>
-        <div>
-          <label>Sort order <span class="hint" style="font-weight: normal">(lower = earlier)</span></label>
-          <input type="number" name="sort_order" value="100" min="0" max="10000">
+          <label for="hub-form-sort">Sort order <span class="hint" style="font-weight: normal">(lower = earlier)</span></label>
+          <input type="number" id="hub-form-sort" name="sort_order" value="100" min="0" max="10000">
         </div>
       </div>
       <label for="hub-form-modes">Transport modes
         <span class="hint" style="font-weight: normal">(matrix type band — e.g. "R+M"; blank = not yet classified)</span>
       </label>
       <input type="text" id="hub-form-modes" name="modes" maxlength="20" placeholder="R, T, M, B, C, or a combination like R+T">
+      {# The fields a picked station fills in, typed by hand for special
+         cases: folded while the picker is offered, open without it. #}
+      <details id="hub-manual" class="hub-manual"{% if not station_module_enabled %} open{% endif %}>
+        <summary>All fields by hand <span class="hint" style="font-weight: normal">(special cases)</span></summary>
+      <div class="form-row">
+        <div>
+          <label for="hub-form-country">Country <span class="hint" style="font-weight: normal">(ISO 2-letter)</span></label>
+          <input type="text" id="hub-form-country" name="country" maxlength="2" pattern="[A-Za-z]{2}" required style="text-transform: uppercase">
+        </div>
+        <div>
+          <label for="hub-form-region">Region <span class="hint" style="font-weight: normal">(optional, informational)</span></label>
+          <input type="text" id="hub-form-region" name="region" maxlength="40">
+        </div>
+      </div>
+      <label for="hub-form-name">Name <span class="hint" style="font-weight: normal">(operator-facing label)</span></label>
+      <input type="text" id="hub-form-name" name="name" maxlength="120" required>
+      <div class="form-row">
+        <div>
+          <label for="hub-form-lat">Latitude</label>
+          <input type="number" id="hub-form-lat" name="lat" step="any" min="-90" max="90" required>
+        </div>
+        <div>
+          <label for="hub-form-lon">Longitude</label>
+          <input type="number" id="hub-form-lon" name="lon" step="any" min="-180" max="180" required>
+        </div>
+      </div>
       <label for="hub-form-uic">Station code
         <span class="hint" style="font-weight: normal">(the station module's code; a code typed here is marked "manual"; blank = none)</span>
       </label>
@@ -806,6 +854,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         <input type="checkbox" id="hub-form-forget-id" name="forget_station_id">
         Forget the station module's VIATOR id of this hub (its code, if any, stays)
       </label>
+      </details>
       <p class="hub-form-error" id="hub-form-error"></p>
       <div class="hub-form-actions">
         <button type="button" data-action="hub-modal-close">Cancel</button>
@@ -2453,6 +2502,7 @@ function openHubModal(mode, hubId, prefillCountry) {
   document.getElementById('hub-form-uic-origin').textContent = '';
   document.getElementById('hub-form-forget-id-label').hidden = true;
   document.getElementById('hub-form-forget-id').checked = false;
+  hubPickReset();
 
   if (mode === 'create') {
     title.textContent = prefillCountry ? `Add ${prefillCountry} hub` : 'Add hub';
@@ -2460,6 +2510,7 @@ function openHubModal(mode, hubId, prefillCountry) {
     form.elements['id'].required = true;
     form.elements['sort_order'].value = 100;
     if (prefillCountry) form.elements['country'].value = prefillCountry;
+    hubPickLoadCountries(prefillCountry);
   } else {
     title.textContent = `Edit hub · ${hubId}`;
     idRow.style.display = 'none';
@@ -2484,6 +2535,7 @@ function openHubModal(mode, hubId, prefillCountry) {
         document.getElementById('hub-form-uic-origin').textContent = hubCodeLabel(h);
         document.getElementById('hub-form-forget-id-label').hidden = !h.station_id;
         document.getElementById('hub-form-forget-id').checked = false;
+        hubPickLoadCountries(h.country);
       });
   }
   modal.hidden = false;
@@ -2510,12 +2562,16 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       sort_order: parseInt(fd.get('sort_order') || '100', 10),
     };
     const typedUic = (fd.get('uic') || '').trim();
-    if (typedUic !== HUB_EDIT_UIC) {
+    // A station picked in the station module (#398) is stored after the
+    // hub, through POST /hubs/confirm, as a confirmed code: never sent here
+    // as a typed one. A code typed over the picked one is a typed code.
+    const picked = hubPickedFor(typedUic);
+    if (!picked && typedUic !== HUB_EDIT_UIC) {
       // Sent only when changed, so saving a hub never turns a code
       // confirmed from the station module into a "manual" one.
       body.uic = typedUic || null;
     }
-    if (document.getElementById('hub-form-forget-id').checked) body.forget_station_id = true;
+    if (!picked && document.getElementById('hub-form-forget-id').checked) body.forget_station_id = true;
     let url, method;
     if (HUB_EDIT_MODE === 'create') {
       body.id = fd.get('id');
@@ -2534,8 +2590,14 @@ document.getElementById('hub-form')?.addEventListener('submit', async (e) => {
       errEl.textContent = hubFormError(j.detail, r.status);
       return;
     }
+    const savedId = HUB_EDIT_MODE === 'create' ? body.id : HUB_EDIT_ID;
+    const warning = picked ? await hubPickConfirm(savedId, picked) : null;
     document.getElementById('hub-modal').hidden = true;
-    showToast('success', HUB_EDIT_MODE === 'create' ? 'Hub created' : 'Hub updated');
+    if (warning) {
+      showToast('error', warning);
+    } else {
+      showToast('success', HUB_EDIT_MODE === 'create' ? 'Hub created' : 'Hub updated');
+    }
     await loadHubs();
   } finally {
     submitBtn.disabled = false;
@@ -2602,6 +2664,270 @@ if (_hubsPanel) {
 }
 document.getElementById('hubs-show-inactive')?.addEventListener('change', loadHubs);
 document.getElementById('hubs-add-new')?.addEventListener('click', () => openHubModal('create'));
+
+// ──────────────────────────────────────────────────────────────────
+// #398 — the hub picker: a station of the station module fills in the hub
+// ──────────────────────────────────────────────────────────────────
+// A country, then a city or station name (3 characters or more): each
+// pause in typing asks POST /hubs/pick for at most 10 stations. Picking one
+// fills in the name, the short label, the slug (create only), the position,
+// the country and the code; tier, modes and sort order stay typed. The
+// station is stored after the hub, by POST /hubs/confirm (as a code
+// confirmed through "Propose station codes"). The module's names are put
+// in the page as text or as an input's value, never through innerHTML.
+
+const HUB_PICK_DELAY_MS = 350;
+// seq: the number of the latest search, so an older answer arriving late
+// is dropped. heldUntil: no search before this time (the module's limit).
+const HUB_PICK = { seq: 0, timer: null, heldUntil: 0, station: null, stations: [], countriesLoaded: false };
+
+function hubPickStatus(text, isError) {
+  const el = document.getElementById('hub-pick-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('error', Boolean(isError));
+}
+
+function hubPickReset() {
+  clearTimeout(HUB_PICK.timer);
+  HUB_PICK.seq += 1;
+  HUB_PICK.station = null;
+  HUB_PICK.stations = [];
+  const q = document.getElementById('hub-pick-q');
+  if (!q) return;
+  q.value = '';
+  document.getElementById('hub-pick-list').replaceChildren();
+  document.getElementById('hub-pick-chosen').textContent = '';
+  hubPickStatus('');
+  document.getElementById('hub-manual').open = false;
+}
+
+// The country list: the module's, else VIATOR's (the route says which).
+function hubPickCountryOptions(answer) {
+  const countries = answer && Array.isArray(answer.countries) ? answer.countries : [];
+  return [{ value: '', label: 'Choose a country' }].concat(countries.map(c => ({
+    value: c.code,
+    label: c.name && c.name !== c.code ? `${c.code} · ${c.name}` : c.code,
+  })));
+}
+
+function hubPickCountriesNote(answer) {
+  if (!answer) return 'The countries could not be loaded; fill in the hub by hand.';
+  if (answer.source === 'viator') return "The station module did not answer: VIATOR's own list of countries is shown.";
+  return '';
+}
+
+async function hubPickLoadCountries(wanted) {
+  const select = document.getElementById('hub-pick-country');
+  if (!select) return;
+  if (!HUB_PICK.countriesLoaded) {
+    let answer = null;
+    try {
+      const r = await fetch(`${HUB_CODES_API}/countries`);
+      if (r.ok) answer = await r.json();
+    } catch (err) {
+      console.warn('hub picker: the countries failed', err);
+    }
+    select.replaceChildren(...hubPickCountryOptions(answer).map(o => {
+      const option = document.createElement('option');
+      option.value = o.value;
+      option.textContent = o.label;
+      return option;
+    }));
+    document.getElementById('hub-pick-countries-note').textContent = hubPickCountriesNote(answer);
+    HUB_PICK.countriesLoaded = Boolean(answer);
+  }
+  const code = (wanted || '').toUpperCase();
+  if (code && ![...select.options].some(o => o.value === code)) {
+    const option = document.createElement('option');
+    option.value = code;
+    option.textContent = code;
+    select.append(option);
+  }
+  select.value = code;
+}
+
+function hubPickSchedule() {
+  clearTimeout(HUB_PICK.timer);
+  HUB_PICK.timer = setTimeout(hubPickSearch, HUB_PICK_DELAY_MS);
+}
+
+// Why no search is made for this text and country, or null to search.
+function hubPickBlocked(q, country, now) {
+  if (!country) return q ? 'Choose a country first.' : '';
+  if (q.length < 3) return q ? 'Type 3 characters or more.' : '';
+  if (now < HUB_PICK.heldUntil) {
+    const seconds = Math.ceil((HUB_PICK.heldUntil - now) / 1000);
+    return `The station module's limit is reached; try again in ${seconds} seconds.`;
+  }
+  return null;
+}
+
+async function hubPickAsk(q, country) {
+  try {
+    const r = await fetch(`${HUB_CODES_API}/pick`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ q, country }),
+    });
+    if (r.ok) return await r.json();
+    const j = await r.json().catch(() => ({}));
+    const detail = r.status === 422 && typeof j.detail === 'string' ? j.detail : `The request failed (${r.status}).`;
+    return { status: 'refused', message: detail };
+  } catch (err) {
+    console.warn('hub picker: the search failed', err);
+    return { status: 'unavailable', message: 'The request failed; fill in the hub by hand or try again.' };
+  }
+}
+
+async function hubPickSearch() {
+  const q = document.getElementById('hub-pick-q').value.trim();
+  const country = document.getElementById('hub-pick-country').value;
+  const seq = ++HUB_PICK.seq;
+  const blocked = hubPickBlocked(q, country, Date.now());
+  if (blocked !== null) {
+    hubPickRender({ status: 'ok', stations: [] }, blocked);
+    return;
+  }
+  hubPickStatus('Searching…');
+  const answer = await hubPickAsk(q, country);
+  if (seq !== HUB_PICK.seq) return;  // a newer search was started meanwhile
+  if (answer.status === 'limited') HUB_PICK.heldUntil = Date.now() + (answer.retry_after || 60) * 1000;
+  hubPickRender(answer);
+}
+
+function hubPickAnswerText(answer) {
+  if (answer.status !== 'ok') return answer.message || 'The station module did not answer.';
+  const n = (answer.stations || []).length;
+  let found = `${n} stations found; pick one to fill in the hub.`;
+  if (n === 0) found = 'No station found.';
+  else if (n === 1) found = '1 station found; pick it to fill in the hub.';
+  return answer.incomplete && answer.message ? `${found} ${answer.message}` : found;
+}
+
+function hubPickMeta(station) {
+  const code = station.uic ? `code ${station.uic}` : 'no code';
+  const id = station.station_id ? ` · VIATOR id ${station.station_id}` : '';
+  return `${station.country} · ${code}${id} · ${Number(station.lat).toFixed(4)}, ${Number(station.lon).toFixed(4)}`;
+}
+
+function hubPickItem(station, index) {
+  const item = document.createElement('li');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.dataset.pickIndex = String(index);
+  button.setAttribute('aria-pressed', 'false');
+  button.append(hubCodesElement('span', station.name), hubCodesElement('span', hubPickMeta(station), 'hub-pick-meta'));
+  item.append(button);
+  return item;
+}
+
+// `text`: a sentence of the page itself (no search made), else the answer's.
+function hubPickRender(answer, text) {
+  const stations = answer.status === 'ok' ? answer.stations || [] : [];
+  HUB_PICK.stations = stations;
+  document.getElementById('hub-pick-list').replaceChildren(...stations.map(hubPickItem));
+  hubPickStatus(text === undefined ? hubPickAnswerText(answer) : text, answer.status !== 'ok');
+}
+
+// The hub fields a picked station fills in (the slug only for a new hub:
+// a saved hub's slug never changes).
+function hubPickFill(form, station, withSlug) {
+  form.elements['name'].value = station.name;
+  form.elements['short'].value = station.short;
+  if (withSlug) form.elements['id'].value = station.slug;
+  form.elements['lat'].value = station.lat;
+  form.elements['lon'].value = station.lon;
+  form.elements['country'].value = station.country;
+  form.elements['uic'].value = station.uic || '';
+}
+
+function hubPickChoose(index) {
+  const station = HUB_PICK.stations[index];
+  if (!station) return;
+  HUB_PICK.station = station;
+  hubPickFill(document.getElementById('hub-form'), station, HUB_EDIT_MODE === 'create');
+  document.querySelectorAll('#hub-pick-list [data-pick-index]').forEach(b => {
+    b.setAttribute('aria-pressed', String(b.dataset.pickIndex === String(index)));
+  });
+  document.getElementById('hub-form-uic-origin').textContent =
+    `${hubCodeLabel({ uic: station.uic, uic_origin: 'msmm', station_id: station.station_id })} — stored when you save`;
+  document.getElementById('hub-pick-chosen').textContent =
+    `Picked: ${station.name} (${hubPickMeta(station)}). Check the short label${HUB_EDIT_MODE === 'create' ? ' and the slug' : ''}, then save.`;
+  document.getElementById('hub-form-short').focus();
+}
+
+// The picked station, while the code field still holds its code.
+function hubPickedFor(typedUic) {
+  const station = HUB_PICK.station;
+  return station && typedUic === (station.uic || '') ? station : null;
+}
+
+// The sentence to show when the saved hub did not get its station, or null.
+function hubPickConfirmText(answer) {
+  const lead = 'Hub saved, but its station was not stored';
+  if (!answer || answer.status !== 'ok') {
+    return `${lead}: ${(answer && answer.message) || 'the station module did not answer.'} Use "Propose station codes" later.`;
+  }
+  const result = (answer.results || [])[0];
+  if (result && result.state === 'stored') return null;
+  const why = {
+    not_served: 'the station module does not serve it any more',
+    changed_meanwhile: 'the hub was changed meanwhile',
+    unknown_hub: 'the hub was not found',
+  }[result && result.state] || 'no answer for it';
+  return `${lead}: ${why}.`;
+}
+
+async function hubPickConfirm(hubId, station) {
+  const pair = { hub_id: hubId };
+  if (station.uic) pair.uic = station.uic;
+  if (station.station_id) pair.station_id = station.station_id;
+  let answer = null;
+  try {
+    const r = await fetch(`${HUB_CODES_API}/confirm`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pairs: [pair] }),
+    });
+    answer = r.ok ? await r.json() : { status: 'unavailable', message: `the request failed (${r.status}).` };
+  } catch (err) {
+    console.warn('hub picker: storing the station failed', err);
+  }
+  return hubPickConfirmText(answer);
+}
+
+// Keyboard: Enter in the text searches at once (never submits the form),
+// the arrow keys move between the text and the stations.
+function hubPickKeys(e) {
+  const buttons = [...document.querySelectorAll('#hub-pick-list [data-pick-index]')];
+  const at = buttons.indexOf(document.activeElement);
+  if (e.target.id === 'hub-pick-q' && e.key === 'Enter') {
+    e.preventDefault();
+    clearTimeout(HUB_PICK.timer);
+    hubPickSearch();
+  } else if (e.key === 'ArrowDown' && buttons.length) {
+    e.preventDefault();
+    buttons[Math.min(at + 1, buttons.length - 1)].focus();
+  } else if (e.key === 'ArrowUp' && at >= 0) {
+    e.preventDefault();
+    (at === 0 ? document.getElementById('hub-pick-q') : buttons[at - 1]).focus();
+  }
+}
+
+document.getElementById('hub-pick-q')?.addEventListener('input', hubPickSchedule);
+document.getElementById('hub-pick-country')?.addEventListener('change', hubPickSchedule);
+document.getElementById('hub-pick')?.addEventListener('keydown', hubPickKeys);
+document.getElementById('hub-pick-list')?.addEventListener('click', (e) => {
+  const button = e.target.closest('[data-pick-index]');
+  if (button) hubPickChoose(Number(button.dataset.pickIndex));
+});
+// A required field left empty in the folded part: unfold it, so the
+// browser can show which one.
+document.getElementById('hub-form')?.addEventListener('invalid', (e) => {
+  const manual = document.getElementById('hub-manual');
+  if (manual && manual.contains(e.target)) manual.open = true;
+}, true);
 
 // ──────────────────────────────────────────────────────────────────
 // MSMM step 3 — station codes of the hubs

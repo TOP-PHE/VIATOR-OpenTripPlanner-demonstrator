@@ -162,6 +162,23 @@ class _Module:
                     ]
                 },
             )
+        if request.url.path.endswith("/stations/search") and "country" in body:
+            # The hub picker (#398): a station of the typed name in the
+            # chosen country, served by the lookup below.
+            return httpx.Response(
+                200,
+                json={
+                    "stations": [
+                        {
+                            "name": body["q"],
+                            "latitude": 45.0123456,
+                            "longitude": 6.0123456,
+                            "country_iso": body["country"],
+                            "uic": "9900042",
+                        }
+                    ]
+                },
+            )
         if request.url.path.endswith("/stations/search"):
             # The name fallback: a station of the hub's name, 0.01° north.
             return httpx.Response(
@@ -391,3 +408,60 @@ def test_the_guarded_write_skips_a_hub_edited_meanwhile(db: Session, fresh_db: s
             text("SELECT station_id FROM network_coverage_hubs WHERE id = 'zz-b-2'")
         ).scalar_one()
     assert kept == "ZZ-99009"
+
+
+def test_the_slugs_taken_include_soft_deleted_hubs_and_suffixed_ones(db: Session) -> None:
+    from app.api.admin.network_coverage import _taken_slugs
+
+    assert _taken_slugs(db, set()) == set()
+    # zz-a-0 is soft-deleted, still the primary key of a row; "zz-a" matches
+    # every "zz-a-…" id and never "zz-b-…"; "zz" alone matches no id itself.
+    assert _taken_slugs(db, {"zz-a-0", "zz-b-1"}) == {"zz-a-0", "zz-b-1"}
+    assert _taken_slugs(db, {"zz-a"}) == {
+        "zz-a-0",
+        "zz-a-1",
+        "zz-a-2",
+        "zz-a-3",
+        "zz-a-4",
+        "zz-a-9",
+    }
+    assert _taken_slugs(db, {"zz-c"}) == set()
+
+
+def test_a_picked_station_is_saved_as_a_hub_with_its_confirmed_code(
+    fresh_db: str, client: tuple[TestClient, _Module]
+) -> None:
+    """#398: the picker proposes a slug free in the table (a soft-deleted
+    hub's included), the dialog saves the hub as typed, then stores its
+    station through confirm, as a code confirmed from the module."""
+    test_client, module = client
+
+    picked = test_client.post(f"{BASE}/pick", json={"q": "ZZ A 0", "country": "ZA"}).json()
+
+    (station,) = picked["stations"]
+    assert station["slug"] == "zz-a-0-2"  # zz-a-0 is a soft-deleted hub
+    assert (station["country"], station["uic"]) == ("ZA", "9900042")
+    created = test_client.post(
+        BASE,
+        json={
+            "id": station["slug"],
+            "name": station["name"],
+            "short": station["short"],
+            "country": station["country"],
+            "lat": station["lat"],
+            "lon": station["lon"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert _row(fresh_db, "zz-a-0-2")[:2] == (None, None)
+
+    confirmed = test_client.post(
+        f"{BASE}/confirm", json={"pairs": [{"hub_id": "zz-a-0-2", "uic": station["uic"]}]}
+    ).json()
+
+    assert [r["state"] for r in confirmed["results"]] == ["stored"]
+    assert _row(fresh_db, "zz-a-0-2") == ("9900042", "msmm", True)
+    listed = {h["id"]: h for h in test_client.get(BASE).json()}
+    assert (listed["zz-a-0-2"]["lat"], listed["zz-a-0-2"]["lon"]) == (45.0123456, 6.0123456)
+    searched = [json.loads(r.content) for r in module.requests if r.url.path.endswith("/search")]
+    assert searched == [{"q": "ZZ A 0", "country": "ZA"}]
