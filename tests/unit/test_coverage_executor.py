@@ -108,6 +108,36 @@ async def test_poll_once_respects_the_concurrency_limit(monkeypatch: pytest.Monk
     assert claims == [1]
 
 
+def test_the_executor_loop_closes_its_motis_client_when_it_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#397 — `start()` runs `serve()` then closes the loop's shared MOTIS
+    client, also when `serve()` ends with an error."""
+    from app.journey import motis_client
+
+    ex = executor.CoverageExecutor("zz:99:a", session_factory=_no_db)
+    clients: list[Any] = []
+    fail = False
+
+    async def _serve() -> None:
+        await asyncio.sleep(0)
+        clients.append(motis_client._shared_client())  # a run's MOTIS calls
+        if fail:
+            raise RuntimeError("zz-99")
+
+    monkeypatch.setattr(ex, "serve", _serve)
+    ex.start().join(timeout=5)
+    assert len(clients) == 1
+    assert clients[0].is_closed
+
+    fail = True
+    serve_then_close = ex._serve_then_close()
+    with pytest.raises(RuntimeError, match="zz-99"):
+        asyncio.run(serve_then_close)
+    assert len(clients) == 2
+    assert clients[1].is_closed
+
+
 async def test_serve_survives_a_failing_poll_and_stops(monkeypatch: pytest.MonkeyPatch) -> None:
     ex = executor.CoverageExecutor("zz:99:a", poll_s=0.01, session_factory=_no_db)
     polls: list[int] = []
@@ -422,7 +452,10 @@ def test_alert_rules_read_the_gauges_web_exports() -> None:
     from app.metrics import _COVERAGE_GAUGES
     from tests.unit.test_monitoring_config import VIATOR_WEB_METRICS
 
-    assert set(VIATOR_WEB_METRICS) == {name for name, _ in _COVERAGE_GAUGES}
+    # #397 added web's own event-loop gauge beside the coverage gauges.
+    assert set(VIATOR_WEB_METRICS) == {name for name, _ in _COVERAGE_GAUGES} | {
+        "viator_web_event_loop_lag_seconds"
+    }
     rules = yaml.safe_load((ROOT / "docker/prometheus/rules/coverage.yml").read_text())
     exprs = {r["alert"]: r["expr"] for g in rules["groups"] for r in g["rules"]}
     assert exprs["CoverageRunHeartbeatStale"] == "viator_coverage_heartbeat_age_seconds > 900"

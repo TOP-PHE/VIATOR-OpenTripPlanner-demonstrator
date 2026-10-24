@@ -375,6 +375,24 @@ Fanout response:
   every fanout against a freshly-built session. Leave `graph_snapshot_id` NULL.
 - **Coverage runs execute in the `worker` container** (the coverage executor, #392), not in web.
   `docker kill web` touches no run; `docker kill worker` pauses it until the next worker resumes it.
+- **No blocking call in an `async def` handler (#397).** Every async route shares web's one event
+  loop with `/healthz` (the HEALTHCHECK). A handler that awaits nothing is a plain `def` (FastAPI
+  runs it in its thread pool: login, register-confirm, password-reset-confirm, check-token,
+  bootstrap); one that awaits an engine or the station module runs each database step with
+  `db_steps.db_step` on the request's session, one at a time (never two threads on one session),
+  and reads the values it needs later before a commit expires the rows (`fanout`, `plan`, `replay`,
+  the hub routes, the refreshes, the uploads). `tests/integration/test_web_loop_health.py` drives
+  those routes on a slow database and fails on one SQL statement on the loop thread;
+  `tests/integration/test_web_loop_steps.py` does the same for the steps it does not drive; the gauge
+  `viator_web_event_loop_lag_seconds` and the alert `WebEventLoopLagHigh` watch it in production.
+  **Three thread pools.** anyio's (40 tokens, shared with the sync handlers and `get_db`) runs the
+  steps whose session holds no connection yet; a limiter of 16 (`db_steps.DB_STEP_TOKENS`, one more
+  than the pool's 5 + 10 connections) runs the steps whose session already holds one, so a commit
+  that would give a connection back never queues behind sync handlers waiting for the pool (with
+  the pool exhausted it did: they timed out after 30 s); asyncio's default executor
+  (`asyncio.to_thread`) runs work with no database (CSV parse, GTFS reads, file copies). Never send
+  a step that opens its own session through `db_step`, and never wait for the pool on the limiter.
+  The pool itself (5 + 10) is unchanged and a request holds its connection as before.
 - **`/api/auth/logout` builds its own `Response`.** The auto-injected `response: Response` parameter
   is a trap — cookies set on it are discarded when you return a fresh object.
 - **Generic-204 is deliberate.** `register-request` and `password-reset-request` always return 204 to
@@ -1216,7 +1234,8 @@ and expat's own "out of memory" is a `memory_limit`, no longer a `bad_archive`.
   Each current task carries its step (`downloading` → `verifying` → `checking_structure` →
   `storing`, `feed_fetch.task_step`); a new long step after a download gets a step word of its own
   and runs in a worker thread (`asyncio.to_thread`; the slot copy through
-  `sessions._dispatch_off_loop`, which keeps the database session on the request's thread).
+  `sessions._dispatch_off_loop`, which queues the rebuild in the thread pool with the request's
+  session, never on the event loop).
   The record holds labels and counts only: a skip reason can quote a URL, so reasons stay in the
   feed-status store and never enter `detail`. A refresh that finds its lease lost (`run.lost`) starts no
   further download. Inside `async with run` the progress writes go to one writer thread in order (the

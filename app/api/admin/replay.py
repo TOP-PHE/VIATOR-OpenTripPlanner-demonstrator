@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from ... import audit, config_service
 from ...db import get_db
+from ...db_steps import db_step
 from ...journey import planner_dispatch, recorder
 from ...models import (
     GraphSnapshot,
@@ -52,6 +54,40 @@ class ReplayBody(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class _Queued:
+    """One search to replay, read before the first commit: the values the
+    replay needs, so nothing is loaded again later on the event loop."""
+
+    id: uuid.UUID
+    user_id: uuid.UUID | None
+    origin_lat: float
+    origin_lon: float
+    origin_label: str | None
+    dest_lat: float
+    dest_lon: float
+    dest_label: str | None
+    requested_time_kind: str
+    requested_time: datetime
+    modes: str
+    status: str
+
+
+@dataclass(frozen=True)
+class _ReplayPlan:
+    target_id: uuid.UUID
+    target_session_id: str
+    # None for a session whose engine is unknown: each search then fails as
+    # an engine error, counted per search as before #397 (`_planner_of`).
+    planner: planner_dispatch._Planner | None
+    cfg: dict[str, Any]
+    cap: int
+    rps: int
+    queued: list[_Queued]
+    skipped_main_version: list[uuid.UUID]
+    truncated: bool
+
+
 @router.post("")
 async def replay(
     body: ReplayBody,
@@ -59,6 +95,119 @@ async def replay(
     db: Annotated[DbSession, Depends(get_db)],
     actor: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> dict[str, Any]:
+    """#397 — every database step runs in the thread pool, one after the
+    other on the request's session; the event loop awaits the engine and
+    the throttle only."""
+    plan = await db_step(_replay_plan, db, body)
+
+    if body.dry_run:
+        return {
+            "would_replay": len(plan.queued),
+            "would_skip_main_version_mismatch": len(plan.skipped_main_version),
+            "truncated": plan.truncated,
+            "cap": plan.cap,
+        }
+
+    # Execute. Throttle to ~rps queries/sec.
+    delay = 1.0 / max(plan.rps, 1)
+    outcomes = {"now_ok": 0, "still_failing": 0, "different_result": 0, "errors": 0}
+    ip = client_ip(request)
+    await db_step(
+        _audit,
+        db,
+        "replay.started",
+        actor.id,
+        ip,
+        plan.target_id,
+        {"queued": len(plan.queued), "filter": body.filter.model_dump(mode="json")},
+    )
+
+    cfg = plan.cfg
+    knobs = _Knobs(
+        timeout_ms=int(cfg["JOURNEY_TIMEOUT_MS"]),
+        num_itineraries=int(cfg["OTP_NUM_ITINERARIES"]),
+        search_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
+    )
+    for s in plan.queued:
+        try:
+            outcomes[await _replay_one(db, plan, knobs, s)] += 1
+            await db_step(_commit, db)
+        except Exception:
+            outcomes["errors"] += 1
+        await asyncio.sleep(delay)
+
+    await db_step(
+        _audit, db, "replay.finished", actor.id, ip, plan.target_id, {"outcomes": outcomes}
+    )
+
+    return {
+        "queued": len(plan.queued),
+        "skipped_main_version_mismatch": len(plan.skipped_main_version),
+        "truncated": plan.truncated,
+        "outcomes": outcomes,
+    }
+
+
+@dataclass(frozen=True)
+class _Knobs:
+    timeout_ms: int
+    num_itineraries: int
+    search_window_seconds: int
+
+
+async def _replay_one(db: DbSession, plan: _ReplayPlan, knobs: _Knobs, s: _Queued) -> str:
+    """Replay one search against the target and record it (the caller
+    commits); the outcome to count (`now_ok`, `still_failing`,
+    `different_result`, `errors`). An exception (a database error) is
+    counted as an error by the caller."""
+    replay_search = await db_step(_begin_replay, db, s)
+    t0 = time.monotonic()
+    try:
+        _, trips = await _planner_of(plan).fetch_plan(
+            session_id=plan.target_session_id,
+            from_lat=s.origin_lat,
+            from_lon=s.origin_lon,
+            to_lat=s.dest_lat,
+            to_lon=s.dest_lon,
+            when=s.requested_time,
+            timeout_ms=knobs.timeout_ms,
+            num_itineraries=knobs.num_itineraries,
+            search_window_seconds=knobs.search_window_seconds,
+        )
+        status = "ok" if trips else "no_route"
+    except Exception:
+        status = "error"
+        trips = []
+    elapsed = int((time.monotonic() - t0) * 1000)
+    await db_step(_record_replay, db, plan, replay_search, status, elapsed, trips)
+    return _replay_outcome(status, s.status)
+
+
+def _planner_of(plan: _ReplayPlan) -> planner_dispatch._Planner:
+    """The target's planner; ValueError for an unknown engine."""
+    if plan.planner is None:
+        raise ValueError(f"Unknown session engine for {plan.target_session_id!r}")
+    return plan.planner
+
+
+def _commit(db: DbSession) -> None:
+    db.commit()
+
+
+def _replay_outcome(status: str, original_status: str) -> str:
+    """How a replayed search compares with its original."""
+    if status == "ok" and original_status != "ok":
+        return "now_ok"
+    if status != "ok" and original_status != "ok":
+        return "still_failing"
+    if status == "ok" and original_status == "ok":
+        return "different_result"  # both ok — coarse-grained, refine later
+    return "errors"
+
+
+def _replay_plan(db: DbSession, body: ReplayBody) -> _ReplayPlan:
+    """The target, the config and the searches to replay (404 for a missing
+    target snapshot or session)."""
     target = db.get(GraphSnapshot, body.against_graph_snapshot_id)
     if target is None:
         raise HTTPException(404, "Target snapshot not found")
@@ -94,7 +243,7 @@ async def replay(
         candidates = candidates[:cap]
 
     # Same-main-version filter — load each candidate's execution to compare.
-    queued: list[JourneySearch] = []
+    queued: list[_Queued] = []
     skipped_main_version: list[uuid.UUID] = []
     for s in candidates:
         exe = db.execute(
@@ -113,40 +262,10 @@ async def replay(
         ):
             skipped_main_version.append(s.id)
             continue
-        queued.append(s)
-
-    if body.dry_run:
-        return {
-            "would_replay": len(queued),
-            "would_skip_main_version_mismatch": len(skipped_main_version),
-            "truncated": truncated,
-            "cap": cap,
-        }
-
-    # Execute. Throttle to ~rps queries/sec.
-    delay = 1.0 / max(rps, 1)
-    outcomes = {"now_ok": 0, "still_failing": 0, "different_result": 0, "errors": 0}
-    audit.record(
-        db,
-        action="replay.started",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="graph_snapshot",
-        target_id=str(target.id),
-        metadata={"queued": len(queued), "filter": body.filter.model_dump(mode="json")},
-    )
-    db.commit()
-
-    timeout_ms = int(cfg["JOURNEY_TIMEOUT_MS"])
-    num_itineraries = int(cfg["OTP_NUM_ITINERARIES"])
-    search_window_seconds = int(cfg["OTP_SEARCH_WINDOW_SECONDS"])
-    for s in queued:
-        try:
-            replay_search = recorder.begin_search(
-                db,
+        queued.append(
+            _Queued(
+                id=s.id,
                 user_id=s.user_id,
-                ip=None,
-                endpoint="plan",
                 origin_lat=s.origin_lat,
                 origin_lon=s.origin_lon,
                 origin_label=s.origin_label,
@@ -156,74 +275,92 @@ async def replay(
                 requested_time_kind=s.requested_time_kind,
                 requested_time=s.requested_time,
                 modes=s.modes,
-                replay_of_search_id=s.id,
+                status=s.status,
             )
-            t0 = time.monotonic()
-            try:
-                _, trips = await planner_dispatch.get_planner(target_session).fetch_plan(
-                    session_id=target.session_id,
-                    from_lat=s.origin_lat,
-                    from_lon=s.origin_lon,
-                    to_lat=s.dest_lat,
-                    to_lon=s.dest_lon,
-                    when=s.requested_time,
-                    timeout_ms=timeout_ms,
-                    num_itineraries=num_itineraries,
-                    search_window_seconds=search_window_seconds,
-                )
-                status = "ok" if trips else "no_route"
-            except Exception:
-                status = "error"
-                trips = []
-            elapsed = int((time.monotonic() - t0) * 1000)
+        )
 
-            recorder.record_execution(
-                db,
-                search_id=replay_search.id,
-                session_id=target.session_id,
-                graph_snapshot_id=target.id,
-                status=status,
-                response_ms=elapsed,
-                raw_response=None,
-                error_message=None,
-                trips=trips,
-            )
-            recorder.finish_search(
-                db,
-                replay_search,
-                total_response_ms=elapsed,
-                total_trips_unique=len(trips),
-                status=status,
-            )
+    try:
+        planner: planner_dispatch._Planner | None = planner_dispatch.get_planner(target_session)
+    except ValueError:
+        planner = None
+    return _ReplayPlan(
+        target_id=target.id,
+        target_session_id=target.session_id,
+        planner=planner,
+        cfg=cfg,
+        cap=cap,
+        rps=rps,
+        queued=queued,
+        skipped_main_version=skipped_main_version,
+        truncated=truncated,
+    )
 
-            if status == "ok" and s.status != "ok":
-                outcomes["now_ok"] += 1
-            elif status != "ok" and s.status != "ok":
-                outcomes["still_failing"] += 1
-            elif status == "ok" and s.status == "ok":
-                outcomes["different_result"] += 1  # both ok — coarse-grained, refine later
-            else:
-                outcomes["errors"] += 1
 
-            db.commit()
-        except Exception:
-            outcomes["errors"] += 1
-        await asyncio.sleep(delay)
-
+def _audit(
+    db: DbSession,
+    action: str,
+    actor_id: uuid.UUID | None,
+    ip: str | None,
+    target_id: uuid.UUID,
+    metadata: dict[str, Any],
+) -> None:
+    """A replay's audit event, committed."""
     audit.record(
         db,
-        action="replay.finished",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
+        action=action,
+        actor_user_id=actor_id,
+        actor_ip=ip,
         target_kind="graph_snapshot",
-        target_id=str(target.id),
-        metadata={"outcomes": outcomes},
+        target_id=str(target_id),
+        metadata=metadata,
     )
     db.commit()
 
-    return {
-        "queued": len(queued),
-        "skipped_main_version_mismatch": len(skipped_main_version),
-        "truncated": truncated,
-        "outcomes": outcomes,
-    }
+
+def _begin_replay(db: DbSession, s: _Queued) -> JourneySearch:
+    """The journey_searches row of one replayed search."""
+    return recorder.begin_search(
+        db,
+        user_id=s.user_id,
+        ip=None,
+        endpoint="plan",
+        origin_lat=s.origin_lat,
+        origin_lon=s.origin_lon,
+        origin_label=s.origin_label,
+        dest_lat=s.dest_lat,
+        dest_lon=s.dest_lon,
+        dest_label=s.dest_label,
+        requested_time_kind=s.requested_time_kind,
+        requested_time=s.requested_time,
+        modes=s.modes,
+        replay_of_search_id=s.id,
+    )
+
+
+def _record_replay(
+    db: DbSession,
+    plan: _ReplayPlan,
+    replay_search: JourneySearch,
+    status: str,
+    elapsed: int,
+    trips: list[dict[str, Any]],
+) -> None:
+    """One replayed search's execution and its finish (committed by the caller)."""
+    recorder.record_execution(
+        db,
+        search_id=replay_search.id,
+        session_id=plan.target_session_id,
+        graph_snapshot_id=plan.target_id,
+        status=status,
+        response_ms=elapsed,
+        raw_response=None,
+        error_message=None,
+        trips=trips,
+    )
+    recorder.finish_search(
+        db,
+        replay_search,
+        total_response_ms=elapsed,
+        total_trips_unique=len(trips),
+        status=status,
+    )

@@ -928,10 +928,12 @@ def test_storing_is_reported_and_the_copy_leaves_the_event_loop(
         feed_fetch.STEP_CHECKING_STRUCTURE,
         feed_fetch.STEP_STORING,
     ]
+    # #397: the rebuild is queued with the request's session in the thread
+    # pool too, not on the event loop.
     assert where == {
         "place_on_loop": False,
         "storing_reported_first": True,
-        "queue_on_loop": True,
+        "queue_on_loop": False,
         "db": True,
     }
 

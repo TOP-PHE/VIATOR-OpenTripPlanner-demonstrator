@@ -64,6 +64,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import config_service
 from ..db import SessionLocal
+from ..journey import motis_client
 from ..models import NetworkCoverageResult, NetworkCoverageRun
 from . import runner
 
@@ -589,10 +590,20 @@ class CoverageExecutor:
         if self._stop is not None:
             self._stop.set()
 
+    async def _serve_then_close(self) -> None:
+        """`serve()`, then the loop's shared MOTIS client is closed (#397)."""
+        try:
+            await self.serve()
+        finally:
+            await motis_client.aclose_shared_client()
+
     def start(self) -> threading.Thread:
         """Run `serve()` on a new event loop in a daemon thread."""
         thread = threading.Thread(
-            target=asyncio.run, args=(self.serve(),), name="coverage-executor", daemon=True
+            target=asyncio.run,
+            args=(self._serve_then_close(),),
+            name="coverage-executor",
+            daemon=True,
         )
         thread.start()
         return thread

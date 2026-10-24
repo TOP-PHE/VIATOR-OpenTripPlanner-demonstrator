@@ -21,12 +21,13 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import uuid
 import zipfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, NamedTuple
+from typing import Annotated, Any, BinaryIO, NamedTuple
 
 import httpx
 from fastapi import (
@@ -45,6 +46,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm.attributes import flag_modified
+from starlette.concurrency import run_in_threadpool
 
 from ... import (
     audit,
@@ -65,6 +67,7 @@ from ... import (
     station_module,
 )
 from ...db import get_db
+from ...db_steps import db_step
 from ...models import AuditEvent, GraphSnapshot, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionEngine, SessionState
@@ -827,9 +830,7 @@ async def upload_to_session(
     declared timetable format. Omit it for the legacy per-session upload.
     See docs/provider-source-modes-design.md.
     """
-    s = db.get(SessionRow, sid)
-    if s is None:
-        raise HTTPException(404, "Session not found")
+    s = await db_step(_session_or_404, db, sid)
     if declared_standard not in detect.KNOWN_KINDS:
         raise HTTPException(400, f"Unknown standard: {declared_standard}")
     if actor.id is None:
@@ -845,13 +846,13 @@ async def upload_to_session(
     size = 0
     with staged_path.open("wb") as out:
         while chunk := await file.read(1024 * 1024):  # 1 MiB at a time
-            sha.update(chunk)
-            out.write(chunk)
+            # The hash and the write in the thread pool (#397).
+            await run_in_threadpool(_hash_and_write, sha, out, chunk)
             size += len(chunk)
 
     # Verify the format matches what the user said. dispatch() can move it
-    # only if detect agrees.
-    detected = _detected_kind(staged_path, declared_standard)
+    # only if detect agrees. The detection reads the file: thread pool.
+    detected = await run_in_threadpool(_detected_kind, staged_path, declared_standard)
 
     # Optional: attach this upload to a configured provider (v0.1.37). The
     # file then lands at the provider's own slot (`<feed_id>.zip`) and the
@@ -914,24 +915,21 @@ async def upload_to_session(
         triggered_rebuild=triggered,
         provider_feed_id=provider_feed_id,
     )
-    db.add(upload)
-
-    if s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
-        s.state = SessionState.POPULATED.value
+    await db_step(_add_upload, db, s, upload)
 
     # §12 — uploading a national feed cascades to any cross-border views derived
     # from it (same single-source-of-truth rule as refresh). The scan is cheap and
     # finds nothing when this upload wasn't a provider feed something links to.
     cascaded = await _cascade_derived_refresh(db, sid)
 
-    audit.record(
+    answer, config = await db_step(
+        _commit_upload,
         db,
-        action="session.upload",
-        actor_user_id=actor.id,
-        actor_ip=client_ip(request),
-        target_kind="upload",
-        target_id=str(s.id),
-        metadata={
+        s,
+        upload,
+        actor.id,
+        client_ip(request),
+        {
             "session_id": sid,
             "kind": detected,
             "declared": declared_standard,
@@ -941,10 +939,46 @@ async def upload_to_session(
             "cascaded": _cascade_keys(cascaded),
         },
     )
+    _queue_upload_extract(background, sid, config, provider_feed_id, upload_source, upload.sha256)
+    return answer
+
+
+def _hash_and_write(sha: Any, out: BinaryIO, chunk: bytes) -> None:
+    sha.update(chunk)
+    out.write(chunk)
+
+
+def _add_upload(db: DbSession, s: SessionRow, upload: Upload) -> None:
+    """The Upload row added, and the session state moved on to populated
+    (thread pool, #397: reading `s.state` may load it again)."""
+    db.add(upload)
+    if s.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
+        s.state = SessionState.POPULATED.value
+
+
+def _commit_upload(
+    db: DbSession,
+    s: SessionRow,
+    upload: Upload,
+    actor_id: uuid.UUID | None,
+    ip: str | None,
+    metadata: dict[str, Any],
+) -> tuple[UploadResponse, dict[str, Any] | None]:
+    """`upload_to_session`'s end, in the thread pool (#397): the audit entry,
+    the commit, the answer from the stored row, and the session's config
+    (both loaded again after the commit, here rather than on the loop)."""
+    audit.record(
+        db,
+        action="session.upload",
+        actor_user_id=actor_id,
+        actor_ip=ip,
+        target_kind="upload",
+        target_id=str(s.id),
+        metadata=metadata,
+    )
     db.commit()
     db.refresh(upload)
-    _queue_upload_extract(background, sid, s.config, provider_feed_id, upload_source, upload.sha256)
-    return UploadResponse(
+    answer = UploadResponse(
         id=str(upload.id),
         filename=upload.filename,
         declared_kind=upload.declared_kind,
@@ -953,6 +987,7 @@ async def upload_to_session(
         triggered_rebuild=upload.triggered_rebuild,
         provider_feed_id=upload.provider_feed_id,
     )
+    return answer, s.config
 
 
 _COUNTRY_TO_OSM_HINTS: dict[str, set[str]] = {
@@ -1237,6 +1272,15 @@ class ProviderStatus(BaseModel):
 _PROVIDER_FRESHNESS_HOURS = 24
 
 
+def _session_or_404(db: DbSession, sid: str) -> SessionRow:
+    """The session row, or 404. Blocking: the async routes run it in the
+    thread pool (#397)."""
+    s = db.get(SessionRow, sid)
+    if s is None:
+        raise HTTPException(404, "Session not found")
+    return s
+
+
 def _relock_session(db: DbSession, s: SessionRow) -> None:
     """Re-read the session row under a row lock (SELECT … FOR UPDATE), just
     before a refresh writes its state and config: the row was loaded when
@@ -1313,9 +1357,7 @@ async def refresh_sources(
     queues a rebuild for kinds that warrant one. Existing files of the
     same kind are rotated (`.old` suffix) by dispatch.
     """
-    s = db.get(SessionRow, sid)
-    if s is None:
-        raise HTTPException(404, "Session not found")
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -1335,7 +1377,7 @@ async def refresh_sources(
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(config, include_osm=False)
     # Issue #359: the progress record every page reads; 409 while one runs.
-    run = _claim_refresh(sid, refresh_progress.PROVIDERS, len(work) + _derived_count(config))
+    run = await _claim_off_loop(sid, refresh_progress.PROVIDERS, len(work) + _derived_count(config))
     async with run:
         fetched, unchanged, skipped = await _gather_refresh_outcomes(
             db, sid, staging, config, work, run
@@ -1350,28 +1392,18 @@ async def refresh_sources(
         cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
 
         # Last, under the row lock until the commit (never held over the cascade).
-        _relock_session(db, s)
-        orphaned = _sweep_orphans(sid, s)
-        _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
-        saved_config = s.config  # the commit below expires `s`
-
-        audit.record(
+        orphaned, saved_config = await db_step(
+            _finish_sources_refresh,
             db,
-            action="session.sources.refreshed",
-            actor_user_id=actor.id,
-            actor_ip=client_ip(request),
-            target_kind="session",
-            target_id=sid,
-            metadata={
-                "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
-                "fetched": [f["key"] for f in fetched],
-                "unchanged": [u["key"] for u in unchanged],
-                "skipped": [s_["key"] for s_ in skipped],
-                "orphaned": orphaned,  # PR #33
-                "cascaded": _cascade_keys(cascaded),
-            },
+            s,
+            sid,
+            client_ip(request),
+            actor.id,
+            fetched,
+            unchanged,
+            skipped,
+            cascaded,
         )
-        db.commit()
     _queue_extracts(background, sid, saved_config, bool(fetched or unchanged))
     # MSMM 22.3 (D-R15 A): at the end of every refresh, whatever the engine,
     # the stop extracts the station module lacks are sent, by the process's
@@ -1384,6 +1416,46 @@ async def refresh_sources(
         orphaned=orphaned,
         cascaded=cascaded,
     )
+
+
+def _finish_sources_refresh(
+    db: DbSession,
+    s: SessionRow,
+    sid: str,
+    ip: str | None,
+    actor_id: uuid.UUID | None,
+    fetched: list[dict[str, Any]],
+    unchanged: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    cascaded: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, Any] | None]:
+    """`refresh_sources`'s end, in the thread pool (#397): the session row
+    re-read under its lock until the commit, the orphan sweep, the state and
+    staleness, the audit entry, the commit. Returns (orphaned files, the
+    config as saved)."""
+    _relock_session(db, s)
+    orphaned = _sweep_orphans(sid, s)
+    _mark_providers_refreshed(s, fetched=bool(fetched), unchanged=bool(unchanged))
+    saved_config = s.config  # the commit below expires `s`
+
+    audit.record(
+        db,
+        action="session.sources.refreshed",
+        actor_user_id=actor_id,
+        actor_ip=ip,
+        target_kind="session",
+        target_id=sid,
+        metadata={
+            "scope": "providers",  # v0.1.14: distinguishes from osm-only refreshes
+            "fetched": [f["key"] for f in fetched],
+            "unchanged": [u["key"] for u in unchanged],
+            "skipped": [s_["key"] for s_ in skipped],
+            "orphaned": orphaned,  # PR #33
+            "cascaded": _cascade_keys(cascaded),
+        },
+    )
+    db.commit()
+    return orphaned, saved_config
 
 
 @router.get("/{sid}/sources/progress", responses={404: {"description": "Session not found."}})
@@ -1508,9 +1580,7 @@ async def refresh_osm(
         `skipped`  — non-empty only if the OSM URL is unset or download failed
         `rotated`  — list of rotation events for the audit trail / UI display
     """
-    s = db.get(SessionRow, sid)
-    if s is None:
-        raise HTTPException(404, "Session not found")
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -1527,7 +1597,7 @@ async def refresh_osm(
     # back to osm.pbf if they need it).
     # Issue #359: claimed before the rotation, so a refused second click
     # rotates nothing.
-    run = _claim_refresh(sid, refresh_progress.OSM, 1)
+    run = await _claim_off_loop(sid, refresh_progress.OSM, 1)
     async with run:
         rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
 
@@ -1548,24 +1618,15 @@ async def refresh_osm(
             else:
                 skipped.append({k: v for k, v in outcome.items() if k != "status"})
         run.phase(refresh_progress.FINISHING)
-
-        if fetched:
-            # Under the row lock until the commit: a config saved during the
-            # download (a provider card's refresh, the config form) is kept.
-            _relock_session(db, s)
-            if s.config is None:
-                s.config = {}
-            staleness.mark_refresh_completed(s.config)
-            flag_modified(s, "config")
-
-        audit.record(
+        await db_step(
+            _finish_osm_refresh,
             db,
-            action="session.osm.refreshed",
-            actor_user_id=actor.id,
-            actor_ip=client_ip(request),
-            target_kind="session",
-            target_id=sid,
-            metadata={
+            s,
+            sid,
+            client_ip(request),
+            actor.id,
+            bool(fetched),
+            {
                 "url": osm_url,
                 "rotated": rotated,
                 "fetched": [f["key"] for f in fetched],
@@ -1575,8 +1636,39 @@ async def refresh_osm(
                 "invalidates_street_graph_cache": bool(fetched),
             },
         )
-        db.commit()
     return RefreshOsmResponse(fetched=fetched, skipped=skipped, rotated=rotated)
+
+
+def _finish_osm_refresh(
+    db: DbSession,
+    s: SessionRow,
+    sid: str,
+    ip: str | None,
+    actor_id: uuid.UUID | None,
+    fetched: bool,
+    metadata: dict[str, Any],
+) -> None:
+    """`refresh_osm`'s end, in the thread pool (#397): after a fetch, the
+    staleness mark on the session row re-read under its lock until the
+    commit (a config saved during the download, by a provider card's
+    refresh or the config form, is kept); the audit entry; the commit."""
+    if fetched:
+        _relock_session(db, s)
+        if s.config is None:
+            s.config = {}
+        staleness.mark_refresh_completed(s.config)
+        flag_modified(s, "config")
+
+    audit.record(
+        db,
+        action="session.osm.refreshed",
+        actor_user_id=actor_id,
+        actor_ip=ip,
+        target_kind="session",
+        target_id=sid,
+        metadata=metadata,
+    )
+    db.commit()
 
 
 def _url_suffix(url: str) -> str:
@@ -1750,7 +1842,8 @@ async def _filter_derived_provider(
     )
     src_slot = settings.inbox_dir / str(src_session) / src_subdir / src_name
     if not src_slot.exists():
-        return {"status": "skipped", "key": key, "error": _missing_source_reason(db, df)}
+        reason = await db_step(_missing_source_reason, db, df)
+        return {"status": "skipped", "key": key, "error": reason}
     out_tmp = staging / f"{pid.lower()}-xb.zip"
     try:
         stats = await asyncio.to_thread(
@@ -1854,11 +1947,7 @@ async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> lis
     entry and commit come after the cascade.
     """
     try:
-        targets = [
-            (t.id, t.config or {})
-            for t in db.execute(select(SessionRow)).scalars().all()
-            if t.id != source_session_id
-        ]
+        targets = await db_step(_cascade_targets, db, source_session_id)
     except Exception as exc:  # the cascade is skipped, the refresh goes on
         _unexpected_skip(db, "cascade", exc)
         return []
@@ -1876,6 +1965,15 @@ async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> lis
                 }
             )
     return outcomes
+
+
+def _cascade_targets(db: DbSession, source_session_id: str) -> list[tuple[str, dict[str, Any]]]:
+    """Every other session as (id, config), read in the thread pool (#397)."""
+    return [
+        (t.id, t.config or {})
+        for t in db.execute(select(SessionRow)).scalars().all()
+        if t.id != source_session_id
+    ]
 
 
 async def _cascade_into(
@@ -1925,9 +2023,10 @@ async def _dispatch_off_loop(
     `ingestion.place`, atomic and locked per slot), then deletes `path`
     (always: the source is this call's to remove, never the caller's while
     the copy may still read it) and, after a placed file, runs `after` (the
-    caller's file bookkeeping, e.g. the fetch state). The rebuild is queued
-    here, on the thread that owns the request's database session. True when
-    a rebuild was queued.
+    caller's file bookkeeping, e.g. the fetch state). The rebuild is then
+    queued with the request's database session, in the thread pool (#397;
+    a cancellation arriving meanwhile waits for that thread, so the rebuild
+    is queued all the same). True when a rebuild was queued.
 
     Cancelled while the copy runs (the request went away), the job is
     shielded and finishes on its own; once it has placed the file, the
@@ -1952,7 +2051,7 @@ async def _dispatch_off_loop(
         raise
     if rebuild:
         try:
-            ingestion.queue_rebuild(db, session_id=sid, kind=kind)
+            await db_step(ingestion.queue_rebuild, db, session_id=sid, kind=kind)
         except Exception as exc:
             raise _RebuildNotQueued(type(exc).__name__) from exc
     return rebuild
@@ -2009,6 +2108,48 @@ def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.Refresh
         return refresh_progress.claim(sid, scope, total)
     except refresh_progress.RefreshRunning as exc:
         raise HTTPException(409, detail=exc.detail()) from exc
+
+
+class _ClaimHandoff:
+    """Hands a claim from its thread to the request, or, when the request
+    was cancelled first, has the thread end it (`_claim_off_loop`)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.run: refresh_progress.RefreshRun | None = None
+        self.abandoned = False
+
+
+async def _claim_off_loop(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
+    """`_claim_refresh` in the thread pool (#397), the caller entering the
+    run's context right after. A request cancelled while the claim thread
+    runs gets its CancelledError at once and the thread goes on: the claim
+    it commits would stay RUNNING with no heartbeat, and refuse every
+    refresh of that scope with 409 for `LEASE_SECONDS`. So the claim is
+    ended as interrupted, by the claim thread when the request was cancelled
+    first, by another worker thread when the claim was made first."""
+    handoff = _ClaimHandoff()
+
+    def _claim() -> refresh_progress.RefreshRun:
+        run = _claim_refresh(sid, scope, total)
+        with handoff.lock:
+            handoff.run = run
+            abandoned = handoff.abandoned
+        if abandoned:
+            run.finish(refresh_progress.INTERRUPTED)
+        return run
+
+    try:
+        return await run_in_threadpool(_claim)
+    except asyncio.CancelledError:
+        with handoff.lock:
+            handoff.abandoned = True
+            claimed = handoff.run
+        if claimed is not None:
+            asyncio.get_running_loop().run_in_executor(
+                None, claimed.finish, refresh_progress.INTERRUPTED
+            )
+        raise
 
 
 async def _gather_refresh_outcomes(
@@ -2256,6 +2397,13 @@ def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | Non
         station_extract_upload.forget_outcome(sid, Path(staged_filename).stem.upper())
 
 
+def _credential_row(db: DbSession, credential_id: str) -> Any:
+    """The user_credentials row, or None (in a worker thread, #397)."""
+    from ...models import UserCredential
+
+    return db.get(UserCredential, uuid.UUID(credential_id))
+
+
 async def _authorize(
     client: httpx.AsyncClient, db: DbSession, credential_id: str | None, url: str
 ) -> tuple[str, dict[str, str], Any]:
@@ -2269,9 +2417,8 @@ async def _authorize(
     # `app.credentials` (the crypto module) and `app.models`. Single-dot
     # would resolve to `app.api.credentials` (the router).
     from ... import credentials as crypto_module
-    from ...models import UserCredential
 
-    cred = db.get(UserCredential, uuid.UUID(credential_id))
+    cred = await db_step(_credential_row, db, credential_id)
     if cred is None:
         raise ValueError(f"credential {credential_id} not found (was it deleted?)")
     try:
@@ -2420,14 +2567,7 @@ async def _download_task(
     # Committed at once: a later task's unexpected error rolls the session
     # back (`_unexpected_skip`), which would discard a stamp only flushed.
     if cred is not None:
-        try:
-            cred.last_used_at = datetime.now(UTC)
-            db.commit()
-        except Exception as exc:
-            log.warning("refresh.credential_stamp_failed type=%s", type(exc).__name__)
-            # A failed commit leaves the session needing a rollback before
-            # the next task, or the refresh's end, can use it.
-            _rollback_quietly(db)
+        await db_step(_stamp_credential, db, cred)
 
     if result.status == "unchanged":
         feed_fetch.save_state(state_dir, label, result.state)
@@ -2470,6 +2610,19 @@ async def _download_task(
     if assessment.get("level") in ("warn", "red"):
         outcome["structure"] = assessment
     return outcome
+
+
+def _stamp_credential(db: DbSession, cred: Any) -> None:
+    """Stamp and commit the credential's last use, in the thread pool (#397);
+    best-effort."""
+    try:
+        cred.last_used_at = datetime.now(UTC)
+        db.commit()
+    except Exception as exc:
+        log.warning("refresh.credential_stamp_failed type=%s", type(exc).__name__)
+        # A failed commit leaves the session needing a rollback before
+        # the next task, or the refresh's end, can use it.
+        _rollback_quietly(db)
 
 
 async def _store_fetched(
@@ -2579,6 +2732,77 @@ def _legacy_nap_url(db: DbSession, requested: str) -> str:
     return str(stored)
 
 
+_NapAuth = tuple[str, str, str | None]  # (auth_type, plaintext, param_name)
+
+
+def _nap_source(db: DbSession, body: ImportFromNapBody) -> tuple[str, _NapAuth | None, str | None]:
+    """`import_providers_from_nap`'s NAP, read in the thread pool (#397):
+    (url, auth, catalogue name). v0.1.12: resolve the catalogue → (url,
+    credential). Legacy `nap_url` path stays as an anonymous-only escape
+    hatch for CLI callers; UI always sends nap_catalogue_id."""
+    if body.nap_catalogue_id:
+        return _catalogue_source(db, body.nap_catalogue_id)
+    if body.nap_url:
+        # Legacy field, allow-listed (CodeQL py/full-ssrf): it may only name
+        # the default FR NAP or a saved catalogue, and the URL fetched is the
+        # stored one, never the request's string. Catalogues are created by
+        # platform admins at /admin/nap-catalogues.
+        return _legacy_nap_url(db, body.nap_url), None, None
+    raise HTTPException(
+        400,
+        "Either nap_catalogue_id (preferred) or nap_url (legacy) must be set.",
+    )
+
+
+def _catalogue_source(db: DbSession, catalogue_id: str) -> tuple[str, _NapAuth | None, str]:
+    """A saved catalogue's (url, auth, name); 400 for a malformed id, 404
+    for an unknown one."""
+    from ...models import NapCatalogue, UserCredential
+
+    try:
+        cat_uuid = uuid.UUID(catalogue_id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, f"nap_catalogue_id={catalogue_id!r} is not a UUID") from exc
+    cat = db.get(NapCatalogue, cat_uuid)
+    if cat is None:
+        raise HTTPException(404, f"NAP catalogue {catalogue_id!r} not found")
+    if cat.credential_id is None:
+        return cat.url, None, cat.name
+    cred = db.get(UserCredential, cat.credential_id)
+    return cat.url, _catalogue_auth(cat, cred), cat.name
+
+
+def _catalogue_auth(cat: Any, cred: Any) -> _NapAuth | None:
+    """The catalogue's credential as (auth_type, plaintext, param_name); None
+    (anonymous) when it is gone; 400 for a login, 500 when undecryptable."""
+    from ... import credentials as crypto_module
+
+    if cred is None:
+        # SET NULL cascade fired but the catalogue row hasn't been
+        # re-saved yet — fall back to anonymous + warn in audit.
+        log.warning(
+            "catalogue %s references missing credential %s; falling back to anonymous NAP fetch",
+            cat.name,
+            cat.credential_id,
+        )
+        return None
+    if cred.auth_type in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
+        raise HTTPException(
+            400,
+            f"NAP credential {cred.name!r} is a login ({cred.auth_type}); "
+            "catalogue imports support static keys and tokens only.",
+        )
+    try:
+        plaintext = crypto_module.decrypt(cred.ciphertext, cred.nonce, settings.jwt_secret)
+    except crypto_module.CredentialDecryptError as exc:
+        raise HTTPException(
+            500,
+            f"NAP credential {cred.name!r} cannot be decrypted: {exc}. "
+            "Recreate the credential at /credentials.",
+        ) from exc
+    return cred.auth_type, plaintext, cred.param_name
+
+
 @router.post(
     "/{sid}/providers/import-from-nap",
     response_model=ImportFromNapResponse,
@@ -2617,75 +2841,12 @@ async def import_providers_from_nap(
     the module; without it, the import fails with the same 409 the manual
     save uses (import master_stations first, then re-run the import).
     """
-    s = db.get(SessionRow, sid)
-    if s is None:
-        raise HTTPException(404, "Session not found")
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Bulk-import requires a JWT-authenticated actor")
+    nap_url, nap_auth, catalogue_name = await db_step(_nap_source, db, body)
 
-    from ... import credentials as crypto_module
     from ...master import nap_importer
-    from ...models import NapCatalogue, UserCredential
-
-    # v0.1.12: resolve the catalogue → (url, credential). Legacy `nap_url`
-    # path stays as an anonymous-only escape hatch for CLI callers; UI
-    # always sends nap_catalogue_id.
-    nap_url: str
-    nap_auth: tuple[str, str, str | None] | None = None  # (auth_type, plaintext, param_name)
-    catalogue_name: str | None = None
-
-    if body.nap_catalogue_id:
-        try:
-            cat_uuid = uuid.UUID(body.nap_catalogue_id)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(
-                400, f"nap_catalogue_id={body.nap_catalogue_id!r} is not a UUID"
-            ) from exc
-        cat = db.get(NapCatalogue, cat_uuid)
-        if cat is None:
-            raise HTTPException(404, f"NAP catalogue {body.nap_catalogue_id!r} not found")
-        nap_url = cat.url
-        catalogue_name = cat.name
-        if cat.credential_id is not None:
-            cred = db.get(UserCredential, cat.credential_id)
-            if cred is None:
-                # SET NULL cascade fired but the catalogue row hasn't been
-                # re-saved yet — fall back to anonymous + warn in audit.
-                log.warning(
-                    "catalogue %s references missing credential %s; "
-                    "falling back to anonymous NAP fetch",
-                    cat.name,
-                    cat.credential_id,
-                )
-            elif cred.auth_type in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
-                raise HTTPException(
-                    400,
-                    f"NAP credential {cred.name!r} is a login ({cred.auth_type}); "
-                    "catalogue imports support static keys and tokens only.",
-                )
-            else:
-                try:
-                    plaintext = crypto_module.decrypt(
-                        cred.ciphertext, cred.nonce, settings.jwt_secret
-                    )
-                except crypto_module.CredentialDecryptError as exc:
-                    raise HTTPException(
-                        500,
-                        f"NAP credential {cred.name!r} cannot be decrypted: {exc}. "
-                        "Recreate the credential at /credentials.",
-                    ) from exc
-                nap_auth = (cred.auth_type, plaintext, cred.param_name)
-    elif body.nap_url:
-        # Legacy field, allow-listed (CodeQL py/full-ssrf): it may only name
-        # the default FR NAP or a saved catalogue, and the URL fetched is the
-        # stored one, never the request's string. Catalogues are created by
-        # platform admins at /admin/nap-catalogues.
-        nap_url = _legacy_nap_url(db, body.nap_url)
-    else:
-        raise HTTPException(
-            400,
-            "Either nap_catalogue_id (preferred) or nap_url (legacy) must be set.",
-        )
 
     existing_providers = (s.config or {}).get("sources", {}).get("providers") or []
 
@@ -2738,15 +2899,7 @@ async def import_providers_from_nap(
         except ValueError as exc:
             raise HTTPException(400, f"Imported providers failed validation: {exc}") from exc
 
-        # Country-gate: only the countries the import adds (see the manual
-        # save). A coroutine, so the module is awaited, never blocked on.
-        added_countries = {
-            p["country_iso"] for p in providers_canon if p["country_iso"]
-        } - _stored_countries(s.config)
-        missing = _countries_without_stations(db, added_countries) if added_countries else set()
-        if missing:
-            missing = _unserved(missing, await station_module.countries())
-        new_country = _new_countries(missing, _IMPORT_ADVICE)
+        new_country = await _import_country_warning(db, s, providers_canon)
         if new_country:
             result["warnings"] = [*result["warnings"], new_country]
 
@@ -2754,17 +2907,14 @@ async def import_providers_from_nap(
         sources["providers"] = providers_canon
         new_config["sources"] = sources
         staleness.mark_sources_changed(new_config)
-        s.config = new_config
-        flag_modified(s, "config")
-
-        audit.record(
+        await db_step(
+            _save_imported,
             db,
-            action="session.providers.bulk_imported",
-            actor_user_id=actor.id,
-            actor_ip=client_ip(request),
-            target_kind="session",
-            target_id=sid,
-            metadata={
+            s,
+            new_config,
+            actor.id,
+            client_ip(request),
+            {
                 "nap_url": nap_url,
                 "nap_catalogue_id": body.nap_catalogue_id,
                 "nap_catalogue_name": catalogue_name,
@@ -2784,7 +2934,6 @@ async def import_providers_from_nap(
                 "skipped_count": len(result["skipped"]),
             },
         )
-        db.commit()
 
     return ImportFromNapResponse(
         providers=result["providers"],
@@ -2792,6 +2941,47 @@ async def import_providers_from_nap(
         warnings=result["warnings"],
         preview=False,
     )
+
+
+async def _import_country_warning(
+    db: DbSession, s: SessionRow, providers_canon: list[dict[str, Any]]
+) -> str | None:
+    """Country-gate of a NAP import: only the countries the import adds (see
+    the manual save). The master_stations read runs in the thread pool
+    (#397); the module is awaited, never blocked on."""
+    added_countries = {
+        p["country_iso"] for p in providers_canon if p["country_iso"]
+    } - _stored_countries(s.config)
+    if not added_countries:
+        return None
+    missing = await db_step(_countries_without_stations, db, added_countries)
+    if missing:
+        missing = _unserved(missing, await station_module.countries())
+    return _new_countries(missing, _IMPORT_ADVICE)
+
+
+def _save_imported(
+    db: DbSession,
+    s: SessionRow,
+    new_config: dict[str, Any],
+    actor_id: uuid.UUID | None,
+    ip: str | None,
+    metadata: dict[str, Any],
+) -> None:
+    """The imported providers saved on the session, audited and committed,
+    in the thread pool (#397)."""
+    s.config = new_config
+    flag_modified(s, "config")
+    audit.record(
+        db,
+        action="session.providers.bulk_imported",
+        actor_user_id=actor_id,
+        actor_ip=ip,
+        target_kind="session",
+        target_id=s.id,
+        metadata=metadata,
+    )
+    db.commit()
 
 
 # ──── per-provider refresh endpoint (v0.1.6) ────
@@ -2813,7 +3003,8 @@ def _finalise_provider_refresh(
     unchanged: list[dict[str, Any]] | None = None,
 ) -> RefreshSourcesResponse:
     """Shared tail for both per-provider refresh paths: advance state, clear the
-    staleness flag (lossy-by-design — see refresh_sources), audit, commit."""
+    staleness flag (lossy-by-design — see refresh_sources), audit, commit.
+    Blocking: run in the thread pool (#397)."""
     unchanged = unchanged or []
     _relock_session(db, session)
     if fetched and session.state in (SessionState.CREATED.value, SessionState.CONFIGURED.value):
@@ -2867,7 +3058,8 @@ async def _refresh_derived_provider(
             run.done(key, outcome)
         bucket = fetched if outcome.get("status") == "fetched" else skipped
         bucket.append({k: v for k, v in outcome.items() if k != "status"})
-    return _finalise_provider_refresh(
+    return await db_step(
+        _finalise_provider_refresh,
         db,
         request=request,
         actor=actor,
@@ -2896,7 +3088,8 @@ async def _refresh_provider_urls(
     recorded in `run`, its progress record."""
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     await _run_url_tasks(db, sid, staging, work, run, buckets)
-    return _finalise_provider_refresh(
+    return await db_step(
+        _finalise_provider_refresh,
         db,
         request=request,
         actor=actor,
@@ -2945,9 +3138,7 @@ async def refresh_provider(
     Use case: operator just added IDFM to a session that already has SNCF
     serving live. They click "Refresh" on IDFM's card and only IDFM is touched.
     """
-    s = db.get(SessionRow, sid)
-    if s is None:
-        raise HTTPException(404, "Session not found")
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -2971,7 +3162,8 @@ async def refresh_provider(
     scope = refresh_progress.provider_scope(pid)
     work = _build_refresh_tasks(s.config or {}, only_provider=pid)
     if not work:
-        _refuse_if_running(sid, scope)  # a running refresh says so first, as before
+        # A running refresh says so first, as before.
+        await run_in_threadpool(_refuse_if_running, sid, scope)
         raise HTTPException(
             400,
             f"Provider {pid!r} has no URLs to refresh "
@@ -2979,7 +3171,7 @@ async def refresh_provider(
         )
     # Issue #359: this provider's own progress record; 409 while it, or the
     # whole session's provider refresh (it downloads this provider too), runs.
-    run = _claim_refresh(sid, scope, len(work))
+    run = await _claim_off_loop(sid, scope, len(work))
     async with run:
         result = await _refresh_provider_urls(
             db,
@@ -3016,7 +3208,7 @@ async def _refresh_one_derived(
     """A derived provider's card refresh, in its own progress record (one
     task, the filter). No station-module pass follows it, so the record has
     no follow-up line."""
-    run = _claim_refresh(sid, refresh_progress.provider_scope(provider["id"]), 1)
+    run = await _claim_off_loop(sid, refresh_progress.provider_scope(provider["id"]), 1)
     run.follow_up = False
     async with run:
         return await _refresh_derived_provider(

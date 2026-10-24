@@ -1731,6 +1731,12 @@ async def _run_pairs(run_id: uuid.UUID, snap: _Phase1Snapshot, executor_id: str 
     # across runs); shared across every pair coroutine so the cheap
     # SELECT is amortised.
     cancel_cache: dict[uuid.UUID, tuple[float, bool]] = {}
+    # #397 — one DB cancel check before the pairs start. It fills the cache,
+    # so each pair's first check is answered from it; without it every pair
+    # coroutine saw the empty cache at once and queued its own SELECT on the
+    # 2-thread DB executor (~0.5 s at the start of a large run). The pairs
+    # still check as before (fresh answers within 3 s, then the DB again).
+    await _run_stopped(run_id, cancel_cache)
     try:
         await asyncio.gather(
             *(

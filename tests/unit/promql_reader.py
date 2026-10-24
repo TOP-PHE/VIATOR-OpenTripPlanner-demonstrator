@@ -24,7 +24,7 @@ import json
 import re
 from collections.abc import Callable
 
-RANGE_FUNCTIONS = {"rate", "irate", "increase", "changes"}
+RANGE_FUNCTIONS = {"rate", "irate", "increase", "changes", "max_over_time"}
 INSTANT_FUNCTIONS = {"absent"}
 AGGREGATIONS = {"sum", "avg", "max", "min", "count"}
 SET_OPERATORS = {"and", "or", "unless"}

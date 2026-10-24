@@ -76,6 +76,8 @@ VIATOR_WEB_METRICS: dict[str, set[str]] = {
     "viator_coverage_oldest_queued_age_seconds": set(),
     "viator_coverage_heartbeat_age_seconds": set(),
     "viator_coverage_resumes_total": set(),
+    # #397 — LoopLagMonitor's gauge.
+    "viator_web_event_loop_lag_seconds": set(),
 }
 
 
@@ -318,6 +320,24 @@ def test_oom_alert_reads_cadvisor_oom_events() -> None:
     groups = disabled.split("=", 1)[1].split(",")
     assert "oom_event" not in groups
     assert "memory" not in groups
+
+
+def test_web_loop_lag_alert_and_panel() -> None:
+    """#397 — the alert reads LoopLagMonitor's gauge, its largest value over
+    2 min above 1 s for 5 min (a range vector: a scrape lost to a stall
+    leaves a stale marker that an instant vector would read as no value, and
+    the alert's pending state would restart); the Resources dashboard shows
+    the same gauge; the metric name is the one app/metrics.py exports."""
+    from app import metrics
+
+    rule = _rule("WebEventLoopLagHigh")
+    assert rule["expr"] == "max_over_time(viator_web_event_loop_lag_seconds[2m]) > 1"
+    assert rule["for"] == "5m"
+    by_title = {p["title"]: p for p in _dashboard()["panels"]}
+    panel = by_title["Web event-loop lag"]
+    assert panel["targets"][0]["expr"] == "viator_web_event_loop_lag_seconds"
+    assert panel["fieldConfig"]["defaults"]["unit"] == "s"
+    assert metrics.WEB_EVENT_LOOP_LAG_SECONDS._name == "viator_web_event_loop_lag_seconds"
 
 
 @pytest.mark.parametrize("path", _rule_files(), ids=lambda p: p.name)

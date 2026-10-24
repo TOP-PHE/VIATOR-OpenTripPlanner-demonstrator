@@ -34,7 +34,9 @@ captured live response to compare against.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -48,6 +50,41 @@ log = logging.getLogger(__name__)
 
 
 _INTERNAL_SCHEME = "http"
+
+# #397 — one httpx.AsyncClient per event loop, shared by every MOTIS call on
+# that loop, instead of a new client (and its SSL context, built eagerly by
+# httpx even for plain http) per call. Per loop because an AsyncClient belongs
+# to the loop it first ran on: web's loop, the worker's coverage executor loop
+# and each test's loop get their own. No connection pool to contend for: every
+# request still says `Connection: close` (PR-188, passed with each request,
+# not as a client default) and the client keeps no idle
+# connection and sets no connection cap, as the per-call clients did (a capped
+# pool would add a PoolTimeout under a large fan-out). The per-request
+# timeouts are passed with each request, unchanged. Closed by
+# `aclose_shared_client` (web's shutdown, the executor's loop end).
+_HEADERS = {"Connection": "close"}
+_LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=0)
+_SHARED_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _shared_client() -> httpx.AsyncClient:
+    """The running loop's MOTIS client, created on first use (or again after
+    it was closed)."""
+    loop = asyncio.get_running_loop()
+    client = _SHARED_CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(limits=_LIMITS)
+        _SHARED_CLIENTS[loop] = client
+    return client
+
+
+async def aclose_shared_client() -> None:
+    """Close the running loop's MOTIS client, if it has one (shutdown)."""
+    client = _SHARED_CLIENTS.pop(asyncio.get_running_loop(), None)
+    if client is not None:
+        await client.aclose()
 
 
 def _base_url_for(session_id: str, base_url: str | None) -> str:
@@ -127,12 +164,10 @@ async def fetch_plan(
                 "unknown session_timezone for session_id=%s; treating naive `when` as UTC",
                 session_id,
             )
-    # TEMP DEBUG (2026-07) — investigating a reported large VIATOR/ÖBB
-    # time-window divergence in the journey-search side-by-side. Logs the
-    # exact anchor sent to MOTIS so it can be diffed against
-    # external_verify's equivalent HAFAS log for the same search. Safe to
-    # remove once that investigation concludes.
-    log.info("motis.plan.request session_id=%s time=%s", session_id, when.isoformat())
+    # The exact anchor sent to MOTIS, to diff against external_verify's HAFAS
+    # log for the same search (2026-07). DEBUG since #397: one line per call
+    # was an INFO line per K-slot of every coverage pair.
+    log.debug("motis.plan.request session_id=%s time=%s", session_id, when.isoformat())
     params: dict[str, Any] = {
         "fromPlace": from_place,
         "toPlace": to_place,
@@ -167,9 +202,7 @@ async def fetch_plan(
     # connect/write hangs without burning the whole slot budget.
     read_timeout_s = timeout_ms / 1000.0
     timeout = httpx.Timeout(connect=5.0, read=read_timeout_s, write=5.0, pool=5.0)
-    headers = {"Connection": "close"}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-        r = await client.get(url, params=params)
+    r = await _shared_client().get(url, params=params, timeout=timeout, headers=_HEADERS)
     r.raise_for_status()
     raw: dict[str, Any] = r.json()
 

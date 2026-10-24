@@ -6,6 +6,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import concurrency, config_service, station_module
 from ..db import get_db
+from ..db_steps import db_step
 from ..journey import (
     hafas_client,
     ojp_client,
@@ -25,7 +27,7 @@ from ..journey import (
     timetable_window,
     trip_normalize,
 )
-from ..models import GraphSnapshot
+from ..models import GraphSnapshot, JourneySearch
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from ..security import CurrentUser, client_ip, require_logged_in
@@ -611,52 +613,24 @@ async def fanout(
     db: Annotated[DbSession, Depends(get_db)],
     user: Annotated[CurrentUser, Depends(require_logged_in)],
 ) -> dict[str, Any]:
-    cfg = config_service.get_all(db)
-    _validate_engine_filter(body.engine)
-    sessions = _select_fanout_sessions(db, body.engine)
-    if not sessions:
-        raise HTTPException(409, _no_serving_sessions_message(body.engine))
+    """#397 — every database step (the sessions, the search row, the
+    executions and their trip signatures, the commit) runs in the thread
+    pool, one after the other on the request's session; the event loop only
+    awaits the engines."""
+    cfg, sessions = await db_step(_fanout_sessions, db, body.engine)
 
     when_kind, when = _resolve_when(body)
     overall_start = time.monotonic()
+    ip = client_ip(request)
 
     try:
         async with concurrency.semaphores.journey.acquire_or_fail():
-            search = recorder.begin_search(
-                db,
-                user_id=user.id,
-                ip=client_ip(request),
-                endpoint="fanout",
-                origin_lat=body.from_.lat,
-                origin_lon=body.from_.lon,
-                origin_label=body.from_.label,
-                dest_lat=body.to.lat,
-                dest_lon=body.to.lon,
-                dest_label=body.to.label,
-                requested_time_kind=when_kind,
-                requested_time=when,
-                modes=",".join(body.modes),
-            )
+            search = await db_step(_begin_search, db, body, user.id, ip, "fanout", when_kind, when)
             timeout_ms = int(cfg["FANOUT_TIMEOUT_MS"])
             num_itineraries = int(cfg["OTP_NUM_ITINERARIES"])
             search_window_seconds = int(cfg["OTP_SEARCH_WINDOW_SECONDS"])
 
-            # v0.1.35 — optional external OJP reference comparison. Kicked
-            # off as a task so it runs concurrently with the OTP session
-            # calls; awaited after. Only when the operator opted in AND
-            # the platform has the feature enabled with a token set.
-            ojp_task: asyncio.Task[dict[str, Any]] | None = None
-            if body.compare_ojp and cfg.get("OJP_COMPARISON_ENABLED") and cfg.get("OJP_API_TOKEN"):
-                ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
-
-            # Sibling — ÖBB HAFAS comparison. Same concurrent-task model
-            # as OJP. No API-token gate (HAFAS credentials embedded in
-            # external_verify are public), so only the per-search opt-in
-            # + the platform-level enabled flag govern whether it runs.
-            hafas_task: asyncio.Task[dict[str, Any]] | None = None
-            if body.compare_hafas and cfg.get("HAFAS_COMPARISON_ENABLED"):
-                hafas_task = asyncio.create_task(_query_hafas_reference(cfg, body, when))
-
+            ojp_task, hafas_task = _start_reference_tasks(cfg, body, when)
             results = await asyncio.gather(
                 *[
                     _query_session(
@@ -678,98 +652,15 @@ async def fanout(
     except concurrency.ConcurrencyExceeded as exc:
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
-    by_signature: dict[str, dict[str, Any]] = {}
-    executions_summary: list[dict[str, Any]] = []
-    any_error = False
-    any_ok = False
     sids_in_fanout = [s.id for s in sessions]
-
-    for session, (status, raw, trips, response_ms, refusal) in zip(sessions, results, strict=True):
-        snap = _current_snapshot(db, session.id)
-        # Note: a missing graph_snapshots row is NOT an error — it just
-        # means the worker hasn't written a snapshot record yet (Phase-3
-        # wiring). The OTP query itself succeeded. Pre-this-fix we forced
-        # status="error" whenever snap was None, which made every search
-        # render "(error)" in the journey UI even when the itineraries
-        # were perfect. Now we just leave snapshot_id NULL on the
-        # execution row and trust `status` from `_query_session`.
-        if status == "ok":
-            any_ok = True
-        else:
-            any_error = True
-
-        exe = recorder.record_execution(
-            db,
-            search_id=search.id,
-            session_id=session.id,
-            graph_snapshot_id=snap.id if snap else None,
-            status=status,
-            response_ms=response_ms,
-            raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
-            error_message=refusal.detail() if refusal else None,
-            trips=trips,
-        )
-        summary: dict[str, Any] = {
-            "session_id": session.id,
-            # P2 MOTIS — engine surfaced so the journey UI can switch
-            # into the OTP-vs-MOTIS comparison view when both engines
-            # actually participated in the fanout (rather than guessing
-            # from session id naming conventions).
-            "engine": getattr(session, "engine", "otp") or "otp",
-            "graph_snapshot_id": (str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None),
-            "status": status,
-            "num_itineraries": exe.num_itineraries,
-            "response_ms": response_ms,
-        }
-        summary.update(_refusal_fields(refusal))
-        executions_summary.append(summary)
-
-        # Merge trips by signature for the response payload.
-        for trip in trips:
-            from .. import journey as journey_pkg  # noqa: F401  (keep package import explicit)
-            from ..journey.signature import trip_signature
-
-            sig = trip_signature(db, session_id=session.id, legs=trip.get("legs", []))
-            slot = by_signature.setdefault(
-                sig,
-                {
-                    "signature": sig,
-                    "found_in_sessions": [],
-                    "by_session": {},
-                    "best": trip,
-                },
-            )
-            slot["found_in_sessions"].append(session.id)
-            slot["by_session"][session.id] = {
-                "duration_seconds": trip["duration_seconds"],
-                "departure_at": trip["departure_at"],
-                "arrival_at": trip["arrival_at"],
-            }
-            if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
-                slot["best"] = trip
-
-    overall_ms = int((time.monotonic() - overall_start) * 1000)
-
-    if any_ok and any_error:
-        status = "partial"
-    elif any_ok or by_signature:
-        status = "ok"
-    elif not any_error:
-        status = "no_route"
-    else:
-        status = "error"
-
-    recorder.finish_search(
-        db,
-        search,
-        total_response_ms=overall_ms,
-        total_trips_unique=len(by_signature),
-        status=status,
+    federate = bool(body.from_.uic and body.to.uic)
+    recorded = await db_step(
+        _record_fanout, db, search, sessions, results, cfg, overall_start=overall_start
     )
-    db.commit()
+    status = recorded.status
 
     merged_trips = []
-    for slot in by_signature.values():
+    for slot in recorded.by_signature.values():
         merged_trips.append(
             {
                 **slot,
@@ -791,26 +682,8 @@ async def fanout(
     # UIC. Best-effort: a failure here never 500s the whole search.
     # See docs/federated-planner-design.md.
     federated_trips: list[dict[str, Any]] = []
-    if not merged_trips and body.from_.uic and body.to.uic:
-        import logging
-
-        from ..journey import federated_planner
-
-        try:
-            federated_trips = await federated_planner.plan_federated(
-                db,
-                origin_uic=body.from_.uic,
-                dest_uic=body.to.uic,
-                when=when,
-                sessions=list(sessions),
-                timeout_ms=timeout_ms,
-                session_timezone_for={s.id: _session_timezone(s) for s in sessions},
-                origin_position=(body.from_.lat, body.from_.lon),
-                dest_position=(body.to.lat, body.to.lon),
-            )
-        except Exception:
-            logging.getLogger(__name__).exception("federated planner failed (non-fatal)")
-            federated_trips = []
+    if not merged_trips and federate:
+        federated_trips = await _federated_fallback(db, body, when, sessions, timeout_ms)
         if federated_trips and status != "error":
             status = "ok"
 
@@ -828,10 +701,10 @@ async def fanout(
     comparison_summary = _build_comparison(merged_trips, ojp_reference)
 
     response: dict[str, Any] = {
-        "search_id": str(search.id),
+        "search_id": str(recorded.search_id),
         "status": status,
         "trips": merged_trips,
-        "executions": executions_summary,
+        "executions": recorded.executions,
     }
     # Present only when the operator opted into the OJP comparison and the
     # feature is configured — the journey UI renders it as a separate
@@ -854,48 +727,266 @@ async def fanout(
     return response
 
 
-@router.post("/plan", summary="Plan against a single explicit session")
-async def plan(
-    body: PlanBody,
-    request: Request,
-    db: Annotated[DbSession, Depends(get_db)],
-    user: Annotated[CurrentUser, Depends(require_logged_in)],
-) -> dict[str, Any]:
-    s = db.get(SessionRow, body.session_id)
-    if s is None or s.state != SessionState.SERVING.value:
-        raise HTTPException(404, f"No serving session {body.session_id!r}")
+# ───────────── #397 — the routes' database steps, run in the thread pool ─────────────
+#
+# `fanout` and `plan` stay `async def` (they await the engines) but make no
+# database call on the event loop: each blocking step below is one
+# `db_step` call on the request's session (app/db_steps.py), never two at once.
 
-    cfg = config_service.get_all(db)
-    when_kind, when = _resolve_when(body)
+
+def _start_reference_tasks(
+    cfg: dict[str, Any], body: FanoutBody, when: datetime
+) -> tuple[asyncio.Task[dict[str, Any]] | None, asyncio.Task[dict[str, Any]] | None]:
+    """The reference comparisons a fanout runs beside its sessions, as tasks
+    (awaited after the sessions): (OJP, ÖBB HAFAS), None for one not asked."""
+    # v0.1.35 — optional external OJP reference comparison. Kicked
+    # off as a task so it runs concurrently with the OTP session
+    # calls; awaited after. Only when the operator opted in AND
+    # the platform has the feature enabled with a token set.
+    ojp_task: asyncio.Task[dict[str, Any]] | None = None
+    if body.compare_ojp and cfg.get("OJP_COMPARISON_ENABLED") and cfg.get("OJP_API_TOKEN"):
+        ojp_task = asyncio.create_task(_query_ojp_reference(cfg, body, when))
+
+    # Sibling — ÖBB HAFAS comparison. Same concurrent-task model
+    # as OJP. No API-token gate (HAFAS credentials embedded in
+    # external_verify are public), so only the per-search opt-in
+    # + the platform-level enabled flag govern whether it runs.
+    hafas_task: asyncio.Task[dict[str, Any]] | None = None
+    if body.compare_hafas and cfg.get("HAFAS_COMPARISON_ENABLED"):
+        hafas_task = asyncio.create_task(_query_hafas_reference(cfg, body, when))
+    return ojp_task, hafas_task
+
+
+async def _federated_fallback(
+    db: DbSession,
+    body: FanoutBody,
+    when: datetime,
+    sessions: list[SessionRow],
+    timeout_ms: int,
+) -> list[dict[str, Any]]:
+    """The federated planner's stitched trips; `[]` when it fails (logged,
+    never a 500)."""
+    import logging
+
+    from ..journey import federated_planner
 
     try:
-        async with concurrency.semaphores.journey.acquire_or_fail():
-            search = recorder.begin_search(
-                db,
-                user_id=user.id,
-                ip=client_ip(request),
-                endpoint="plan",
-                origin_lat=body.from_.lat,
-                origin_lon=body.from_.lon,
-                origin_label=body.from_.label,
-                dest_lat=body.to.lat,
-                dest_lon=body.to.lon,
-                dest_label=body.to.label,
-                requested_time_kind=when_kind,
-                requested_time=when,
-                modes=",".join(body.modes),
-            )
-            status, raw, trips, response_ms, refusal = await _query_session(
-                db,
-                s,
-                body,
-                int(cfg["JOURNEY_TIMEOUT_MS"]),
-                num_itineraries=int(cfg["OTP_NUM_ITINERARIES"]),
-                search_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
-            )
-    except concurrency.ConcurrencyExceeded as exc:
-        raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
+        # `_record_fanout`'s commit expired the session rows: loaded again in
+        # the thread pool, never lazily on the event loop, and inside the try
+        # (a session deleted since the commit gives `[]`, not a 500).
+        await db_step(_reload_sessions, db, sessions)
+        return await federated_planner.plan_federated(
+            db,
+            origin_uic=body.from_.uic,
+            dest_uic=body.to.uic,
+            when=when,
+            sessions=list(sessions),
+            timeout_ms=timeout_ms,
+            session_timezone_for={s.id: _session_timezone(s) for s in sessions},
+            origin_position=(body.from_.lat, body.from_.lon),
+            dest_position=(body.to.lat, body.to.lon),
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("federated planner failed (non-fatal)")
+        return []
 
+
+def _reload_sessions(db: DbSession, sessions: list[SessionRow]) -> None:
+    """Load the session rows again (a commit expired them)."""
+    for session in sessions:
+        db.refresh(session)
+
+
+_QueryResult = tuple[
+    str, dict[str, Any], list[dict[str, Any]], int, timetable_window.OutsideTimetable | None
+]
+
+
+def _fanout_sessions(db: DbSession, engine: str | None) -> tuple[dict[str, Any], list[SessionRow]]:
+    """The platform config and the sessions to fan out to; 400 for an unknown
+    engine, 409 when no session matches."""
+    cfg = config_service.get_all(db)
+    _validate_engine_filter(engine)
+    sessions = _select_fanout_sessions(db, engine)
+    if not sessions:
+        raise HTTPException(409, _no_serving_sessions_message(engine))
+    return cfg, sessions
+
+
+def _begin_search(
+    db: DbSession,
+    body: FanoutBody,
+    user_id: uuid.UUID | None,
+    ip: str | None,
+    endpoint: str,
+    when_kind: str,
+    when: datetime,
+) -> JourneySearch:
+    """The pending journey_searches row of a fanout or a plan."""
+    return recorder.begin_search(
+        db,
+        user_id=user_id,
+        ip=ip,
+        endpoint=endpoint,
+        origin_lat=body.from_.lat,
+        origin_lon=body.from_.lon,
+        origin_label=body.from_.label,
+        dest_lat=body.to.lat,
+        dest_lon=body.to.lon,
+        dest_label=body.to.label,
+        requested_time_kind=when_kind,
+        requested_time=when,
+        modes=",".join(body.modes),
+    )
+
+
+@dataclass(frozen=True)
+class _RecordedFanout:
+    search_id: uuid.UUID
+    status: str
+    by_signature: dict[str, dict[str, Any]]
+    executions: list[dict[str, Any]]
+
+
+def _record_fanout(
+    db: DbSession,
+    search: JourneySearch,
+    sessions: list[SessionRow],
+    results: list[_QueryResult],
+    cfg: dict[str, Any],
+    *,
+    overall_start: float,
+) -> _RecordedFanout:
+    """Record each session's execution (with its trips' signatures), merge
+    the trips by signature, finish the search and commit."""
+    by_signature: dict[str, dict[str, Any]] = {}
+    executions_summary: list[dict[str, Any]] = []
+    statuses: list[str] = []
+
+    for session, result in zip(sessions, results, strict=True):
+        statuses.append(result[0])
+        executions_summary.append(_record_session_execution(db, search, session, result, cfg))
+        _merge_by_signature(db, by_signature, session.id, result[2])
+
+    overall_ms = int((time.monotonic() - overall_start) * 1000)
+    status = _fanout_status(statuses, bool(by_signature))
+    recorder.finish_search(
+        db,
+        search,
+        total_response_ms=overall_ms,
+        total_trips_unique=len(by_signature),
+        status=status,
+    )
+    search_id = search.id
+    db.commit()
+    return _RecordedFanout(search_id, status, by_signature, executions_summary)
+
+
+def _record_session_execution(
+    db: DbSession,
+    search: JourneySearch,
+    session: SessionRow,
+    result: _QueryResult,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """One session's execution row (and its trips), and its summary for the
+    response."""
+    status, raw, trips, response_ms, refusal = result
+    snap = _current_snapshot(db, session.id)
+    # Note: a missing graph_snapshots row is NOT an error — it just
+    # means the worker hasn't written a snapshot record yet (Phase-3
+    # wiring). The OTP query itself succeeded. Pre-this-fix we forced
+    # status="error" whenever snap was None, which made every search
+    # render "(error)" in the journey UI even when the itineraries
+    # were perfect. Now we just leave snapshot_id NULL on the
+    # execution row and trust `status` from `_query_session`.
+    exe = recorder.record_execution(
+        db,
+        search_id=search.id,
+        session_id=session.id,
+        graph_snapshot_id=snap.id if snap else None,
+        status=status,
+        response_ms=response_ms,
+        raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
+        error_message=refusal.detail() if refusal else None,
+        trips=trips,
+    )
+    summary: dict[str, Any] = {
+        "session_id": session.id,
+        # P2 MOTIS — engine surfaced so the journey UI can switch
+        # into the OTP-vs-MOTIS comparison view when both engines
+        # actually participated in the fanout (rather than guessing
+        # from session id naming conventions).
+        "engine": getattr(session, "engine", "otp") or "otp",
+        "graph_snapshot_id": (str(exe.graph_snapshot_id) if exe.graph_snapshot_id else None),
+        "status": status,
+        "num_itineraries": exe.num_itineraries,
+        "response_ms": response_ms,
+    }
+    summary.update(_refusal_fields(refusal))
+    return summary
+
+
+def _merge_by_signature(
+    db: DbSession,
+    by_signature: dict[str, dict[str, Any]],
+    session_id: str,
+    trips: list[dict[str, Any]],
+) -> None:
+    """Merge one session's trips by signature for the response payload."""
+    from ..journey.signature import trip_signature
+
+    for trip in trips:
+        sig = trip_signature(db, session_id=session_id, legs=trip.get("legs", []))
+        slot = by_signature.setdefault(
+            sig,
+            {
+                "signature": sig,
+                "found_in_sessions": [],
+                "by_session": {},
+                "best": trip,
+            },
+        )
+        slot["found_in_sessions"].append(session_id)
+        slot["by_session"][session_id] = {
+            "duration_seconds": trip["duration_seconds"],
+            "departure_at": trip["departure_at"],
+            "arrival_at": trip["arrival_at"],
+        }
+        if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
+            slot["best"] = trip
+
+
+def _fanout_status(statuses: list[str], any_trip: bool) -> str:
+    """The search's status from its executions': partial, ok, no_route or error."""
+    any_ok = "ok" in statuses
+    any_error = any(status != "ok" for status in statuses)
+    if any_ok and any_error:
+        return "partial"
+    if any_ok or any_trip:
+        return "ok"
+    if not any_error:
+        return "no_route"
+    return "error"
+
+
+def _plan_session(db: DbSession, session_id: str) -> tuple[SessionRow, dict[str, Any]]:
+    """The serving session of a plan (404 otherwise) and the platform config."""
+    s = db.get(SessionRow, session_id)
+    if s is None or s.state != SessionState.SERVING.value:
+        raise HTTPException(404, f"No serving session {session_id!r}")
+    return s, config_service.get_all(db)
+
+
+def _record_plan(
+    db: DbSession,
+    search: JourneySearch,
+    s: SessionRow,
+    result: _QueryResult,
+    cfg: dict[str, Any],
+) -> uuid.UUID:
+    """Record a plan's execution, finish its search and commit; the search id."""
+    status, raw, trips, response_ms, refusal = result
     snap = _current_snapshot(db, s.id)
     # Same as the fanout path — missing graph_snapshots row isn't an error,
     # just deferred Phase-3 wiring. Don't poison status with "error" here.
@@ -917,10 +1008,41 @@ async def plan(
         total_trips_unique=len(trips),
         status=status,
     )
+    search_id = search.id
     db.commit()
+    return search_id
 
+
+@router.post("/plan", summary="Plan against a single explicit session")
+async def plan(
+    body: PlanBody,
+    request: Request,
+    db: Annotated[DbSession, Depends(get_db)],
+    user: Annotated[CurrentUser, Depends(require_logged_in)],
+) -> dict[str, Any]:
+    """#397 — the database steps run in the thread pool (see `fanout`)."""
+    s, cfg = await db_step(_plan_session, db, body.session_id)
+    when_kind, when = _resolve_when(body)
+    ip = client_ip(request)
+
+    try:
+        async with concurrency.semaphores.journey.acquire_or_fail():
+            search = await db_step(_begin_search, db, body, user.id, ip, "plan", when_kind, when)
+            result = await _query_session(
+                db,
+                s,
+                body,
+                int(cfg["JOURNEY_TIMEOUT_MS"]),
+                num_itineraries=int(cfg["OTP_NUM_ITINERARIES"]),
+                search_window_seconds=int(cfg["OTP_SEARCH_WINDOW_SECONDS"]),
+            )
+    except concurrency.ConcurrencyExceeded as exc:
+        raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
+
+    search_id = await db_step(_record_plan, db, search, s, result, cfg)
+    status, _raw, trips, _response_ms, refusal = result
     return {
-        "search_id": str(search.id),
+        "search_id": str(search_id),
         "status": status,
         "trips": trips,
         **_refusal_fields(refusal),

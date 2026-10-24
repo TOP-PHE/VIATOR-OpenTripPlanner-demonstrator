@@ -6,7 +6,7 @@ import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, BinaryIO
 
 import structlog
 from fastapi import (
@@ -23,8 +23,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.concurrency import run_in_threadpool
 
-from . import concurrency, config_service, detect, ingestion
+from . import concurrency, config_service, detect, ingestion, metrics
 from .api import coverage_share as coverage_share_routes
 from .api import credentials as credentials_routes
 from .api import geocode as geocode_routes
@@ -248,6 +249,21 @@ def _startup() -> None:
         log.exception("scheduler.startup_failed", crons_enabled=False)
 
 
+@app.on_event("startup")
+async def _start_loop_lag_monitor() -> None:
+    """#397 — `viator_web_event_loop_lag_seconds`, measured on this loop."""
+    metrics.LOOP_LAG_MONITOR.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Stop the loop-lag monitor; close the loop's shared MOTIS client (#397)."""
+    from .journey import motis_client
+
+    await metrics.LOOP_LAG_MONITOR.stop()
+    await motis_client.aclose_shared_client()
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
@@ -298,16 +314,9 @@ async def upload(
         async with concurrency.semaphores.upload.acquire_or_fail():
             return await _do_upload(declared_standard, version_label, file)
     except concurrency.ConcurrencyExceeded as exc:
-        # Caller is expected to retry per Retry-After header.
-        from . import audit  # local import to keep startup graph small
-
-        with SessionLocal() as db:
-            audit.record(
-                db,
-                action="concurrency.rejected.upload",
-                metadata={"limit": exc.limit, "user": user},
-            )
-            db.commit()
+        # Caller is expected to retry per Retry-After header. The audit row
+        # is written in the thread pool (#397).
+        await run_in_threadpool(_audit_upload_rejected, exc.limit, user)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
@@ -315,11 +324,30 @@ async def upload(
         ) from exc
 
 
+def _audit_upload_rejected(limit: int, user: str) -> None:
+    from . import audit  # local import to keep startup graph small
+
+    with SessionLocal() as db:
+        audit.record(
+            db,
+            action="concurrency.rejected.upload",
+            metadata={"limit": limit, "user": user},
+        )
+        db.commit()
+
+
+def _write_chunk(out: BinaryIO, sha: Any, chunk: bytes) -> None:
+    sha.update(chunk)
+    out.write(chunk)
+
+
 async def _do_upload(
     declared_standard: str,
     version_label: str,
     file: UploadFile,
 ) -> RedirectResponse:
+    """#397 — the file writes, the detection and the database work run in
+    worker threads; the event loop only awaits them."""
     # Persist to a per-upload folder so concurrent uploads don't collide.
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     staging = settings.inbox_dir / "_staging" / f"{stamp}-{secrets.token_hex(4)}"
@@ -336,11 +364,10 @@ async def _do_upload(
                 out.close()
                 stored_path.unlink(missing_ok=True)
                 raise HTTPException(413, f"Upload exceeds {settings.max_upload_mb} MB")
-            sha.update(chunk)
-            out.write(chunk)
+            await run_in_threadpool(_write_chunk, out, sha, chunk)
 
     try:
-        detected_kind = detect.detect(stored_path)
+        detected_kind = await run_in_threadpool(detect.detect, stored_path)
     except ValueError as exc:
         raise HTTPException(400, f"Detection failed: {exc}") from exc
 
@@ -353,10 +380,9 @@ async def _do_upload(
     # The copy into the slot off the event loop (an upload can be GB; atomic
     # and locked per slot); the rebuild queued here, with this thread's session.
     triggered = await asyncio.to_thread(ingestion.place, stored_path, detected_kind)
-    with SessionLocal() as db:
-        if triggered:
-            ingestion.queue_rebuild(db, session_id=None, kind=detected_kind)
-        record = Upload(
+    await run_in_threadpool(
+        _record_upload,
+        Upload(
             # FIXME(step-3/-7): user_id and session_id wired up once auth + sessions land.
             user_id=None,
             session_id=None,
@@ -368,11 +394,18 @@ async def _do_upload(
             stored_path=str(stored_path),
             version_label=version_label,
             triggered_rebuild=triggered,
-        )
+        ),
+    )
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _record_upload(record: Upload) -> None:
+    """The Upload row, and the rebuild it triggered, in one transaction."""
+    with SessionLocal() as db:
+        if record.triggered_rebuild:
+            ingestion.queue_rebuild(db, session_id=None, kind=record.detected_kind)
         db.add(record)
         db.commit()
-
-    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # #392 — both health endpoints are `async def` returning constants: they run
