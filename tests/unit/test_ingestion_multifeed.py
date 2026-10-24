@@ -401,7 +401,8 @@ class TestPlaceIsAtomicAndLockedPerSlot:
 
 def test_the_legacy_upload_copies_off_the_event_loop(isolated_inbox, monkeypatch):
     """`/upload` (app/main.py `_do_upload`): the copy into the slot runs in a
-    worker thread, the rebuild is queued on the request's thread."""
+    worker thread, and so does the rebuild queue with the Upload row (#397:
+    no database call on the event loop)."""
     import asyncio
     import threading
 
@@ -453,7 +454,7 @@ def test_the_legacy_upload_copies_off_the_event_loop(isolated_inbox, monkeypatch
     assert response.status_code == 303
     assert seen == {
         "place_on_loop": False,
-        "queue_on_loop": True,
+        "queue_on_loop": False,
         "queued": (None, "GTFS"),
         "row": True,
     }

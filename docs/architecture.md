@@ -375,6 +375,17 @@ Fanout response:
   every fanout against a freshly-built session. Leave `graph_snapshot_id` NULL.
 - **Coverage runs execute in the `worker` container** (the coverage executor, #392), not in web.
   `docker kill web` touches no run; `docker kill worker` pauses it until the next worker resumes it.
+- **No blocking call in an `async def` handler (#397).** Every async route shares web's one event
+  loop with `/healthz` (the HEALTHCHECK). A handler that awaits nothing is a plain `def` (FastAPI
+  runs it in its thread pool: login, register-confirm, password-reset-confirm, check-token,
+  bootstrap); one that awaits an engine or the station module runs each database step with
+  `run_in_threadpool` on the request's session, one at a time (never two threads on one session),
+  and reads the values it needs later before a commit expires the rows (`fanout`, `plan`, `replay`,
+  the hub routes, the refreshes, the uploads). `tests/integration/test_web_loop_health.py` drives
+  those routes on a slow database and fails on one SQL statement on the loop thread; the gauge
+  `viator_web_event_loop_lag_seconds` and the alert `WebEventLoopLagHigh` watch it in production.
+  The threads are anyio's (40 tokens, shared with the sync handlers and `get_db`); the database
+  pool (5 + 10) is unchanged and a request holds its connection as before.
 - **`/api/auth/logout` builds its own `Response`.** The auto-injected `response: Response` parameter
   is a trap — cookies set on it are discarded when you return a fresh object.
 - **Generic-204 is deliberate.** `register-request` and `password-reset-request` always return 204 to

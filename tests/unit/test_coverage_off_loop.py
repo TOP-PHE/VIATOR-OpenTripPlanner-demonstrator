@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
 import threading
 import time
 import uuid
@@ -161,6 +162,42 @@ async def test_a_pair_is_skipped_when_the_db_says_the_run_ended(monkeypatch) -> 
         origin=ORIGIN,
         dest=DEST,
     )
+
+
+def _db_check(checks: list[uuid.UUID], *, stopped: bool) -> Any:
+    """Stands in for `_is_cancelled_in_db`: counts the calls, takes the time
+    of a SELECT and fills the 3 s cache as the real one does."""
+
+    def _check(run_id: uuid.UUID, cache: dict[uuid.UUID, tuple[float, bool]]) -> bool:
+        checks.append(run_id)
+        time.sleep(0.02)
+        cache[run_id] = (time.monotonic() + runner._DB_CANCEL_CACHE_TTL_SECONDS, stopped)
+        return stopped
+
+    return _check
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+async def test_one_db_cancel_check_before_the_pairs_start(monkeypatch, stopped: bool) -> None:
+    """#397 — the run checks the DB once before the pairs start, so the pairs'
+    first checks are answered from the cache. Before, every pair coroutine
+    saw the empty cache at once and queued its own SELECT on the 2-thread DB
+    executor (one per pair at the start of a run)."""
+    rid = uuid.uuid4()
+    checks: list[uuid.UUID] = []
+    asked: list[str] = []
+    monkeypatch.setattr(runner, "_is_cancelled_in_db", _db_check(checks, stopped=stopped))
+
+    async def _pair(**kw: Any) -> None:
+        await asyncio.sleep(0)
+        asked.append(kw["origin"].id)
+
+    monkeypatch.setattr(runner, "_execute_pair", _pair)
+    snap = dataclasses.replace(_snapshot(), pairs=[(ORIGIN, DEST)] * 40)
+
+    assert await runner._run_pairs(rid, snap, None) is True
+    assert checks == [rid]
+    assert len(asked) == (0 if stopped else 40)
 
 
 # ─────────────────────────── single-session pair ───────────────────────────

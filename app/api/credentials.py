@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from .. import audit
 from .. import credentials as crypto_module
@@ -364,15 +365,7 @@ async def check_login(
 
     Owner-only, like PATCH. The token itself is never returned.
     """
-    cred = db.get(UserCredential, cred_id)
-    if cred is None or cred.user_id != actor.id:
-        raise HTTPException(404, _NOT_FOUND)
-    if cred.auth_type not in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
-        raise HTTPException(400, f"auth_type {cred.auth_type!r} has no login to test")
-    # Read what the exchange needs, then hand the connection back: the
-    # login may wait on a slow portal for up to the timeout.
-    ciphertext, nonce = cred.ciphertext, cred.nonce
-    db.close()
+    ciphertext, nonce = await run_in_threadpool(_login_secret, db, cred_id, actor)
     try:
         plaintext = crypto_module.decrypt(ciphertext, nonce, settings.jwt_secret)
         login = crypto_module.parse_oauth2_password_secret(plaintext)
@@ -383,3 +376,18 @@ async def check_login(
     except ValueError as exc:
         return LoginCheckResponse(ok=False, detail=f"stored login is unusable: {exc}")
     return LoginCheckResponse(ok=True, detail=f"login OK — token valid for {int(ttl)} s")
+
+
+def _login_secret(db: Session, cred_id: uuid.UUID, actor: CurrentUser) -> tuple[bytes, bytes]:
+    """The stored login of `check_login`'s credential (404 when it is not the
+    actor's, 400 when it is no login), read in the thread pool (#397); the
+    connection is handed back at once, as the login may wait on a slow
+    portal for up to the timeout."""
+    cred = db.get(UserCredential, cred_id)
+    if cred is None or cred.user_id != actor.id:
+        raise HTTPException(404, _NOT_FOUND)
+    if cred.auth_type not in crypto_module.AUTH_TYPES_NEEDING_LOGIN:
+        raise HTTPException(400, f"auth_type {cred.auth_type!r} has no login to test")
+    ciphertext, nonce = cred.ciphertext, cred.nonce
+    db.close()
+    return ciphertext, nonce

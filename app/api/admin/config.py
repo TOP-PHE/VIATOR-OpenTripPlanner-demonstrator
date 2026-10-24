@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from ... import audit, config_service
 from ...auth import email as email_sender
@@ -89,38 +91,47 @@ async def smtp_test(
     Always 200; the body indicates success/failure so the admin UI can show a
     nice toast either way. Both outcomes are audit-logged.
     """
+    ip = client_ip(request)
     try:
         await email_sender.send_test_email(to_email=str(body.to))
     except email_sender.SmtpNotConfiguredError as exc:
-        audit.record(
+        await run_in_threadpool(
+            _audit_smtp_test,
             db,
-            action="smtp.test.unconfigured",
-            actor_user_id=user.id,
-            actor_ip=client_ip(request),
-            metadata={"to": str(body.to), "error": str(exc)},
+            "smtp.test.unconfigured",
+            user.id,
+            ip,
+            {"to": str(body.to), "error": str(exc)},
         )
-        db.commit()
         return {"ok": False, "error": "SMTP is not configured (SMTP_HOST is empty)."}
     except email_sender.EmailSendError as exc:
-        audit.record(
+        await run_in_threadpool(
+            _audit_smtp_test,
             db,
-            action="smtp.test.failed",
-            actor_user_id=user.id,
-            actor_ip=client_ip(request),
-            metadata={"to": str(body.to), "error": str(exc)},
+            "smtp.test.failed",
+            user.id,
+            ip,
+            {"to": str(body.to), "error": str(exc)},
         )
-        db.commit()
         # Fixed text only: the exception message comes from the SMTP server
         # and the transport stack (CodeQL py/stack-trace-exposure). The full
         # detail is in the audit event above and the server log.
         return {"ok": False, "error": _smtp_failure_message(exc)}
 
-    audit.record(
-        db,
-        action="smtp.test.sent",
-        actor_user_id=user.id,
-        actor_ip=client_ip(request),
-        metadata={"to": str(body.to)},
+    await run_in_threadpool(
+        _audit_smtp_test, db, "smtp.test.sent", user.id, ip, {"to": str(body.to)}
     )
-    db.commit()
     return {"ok": True}
+
+
+def _audit_smtp_test(
+    db: Session,
+    action: str,
+    user_id: uuid.UUID | None,
+    ip: str | None,
+    metadata: dict[str, Any],
+) -> None:
+    """The SMTP test's audit event, committed: blocking database work, so
+    `smtp_test` runs it in the thread pool (#397)."""
+    audit.record(db, action=action, actor_user_id=user_id, actor_ip=ip, metadata=metadata)
+    db.commit()

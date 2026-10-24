@@ -34,6 +34,7 @@ when a child row is inserted before its parent):
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -298,12 +299,16 @@ async def fetch_csv() -> str:
 
 
 async def refresh(db: DbSession) -> dict[str, int]:
-    """Fetch + parse + upsert. Used by the admin "refresh Trainline" button + cron."""
+    """Fetch + parse + upsert. Used by the admin "refresh Trainline" button + cron.
+
+    #397 — the parse (a CSV of tens of thousands of rows) and the upsert
+    (blocking database work) run in a worker thread, one after the other,
+    never on the event loop; only the download is awaited there."""
     content = await fetch_csv()
-    parsed, parent_uic_map = parse_csv(content)
+    parsed, parent_uic_map = await asyncio.to_thread(parse_csv, content)
     log.info(
         "Trainline CSV: parsed %d stations, %d parent links to resolve",
         len(parsed),
         len(parent_uic_map),
     )
-    return upsert_with_drift_protection(db, parsed, parent_uic_map)
+    return await asyncio.to_thread(upsert_with_drift_protection, db, parsed, parent_uic_map)

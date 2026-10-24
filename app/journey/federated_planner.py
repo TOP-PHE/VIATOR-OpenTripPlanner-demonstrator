@@ -23,6 +23,7 @@ The pure helpers (`served_uics`, `connection_hubs`, `rank_hubs`, `assemble_stitc
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -283,6 +284,11 @@ def _session_served_uics(session: SessionRow) -> set[str]:
     return uics
 
 
+def _served_by_session(sessions: list[SessionRow]) -> dict[str, set[str]]:
+    """Each session's served-UIC set, by session id."""
+    return {s.id: _session_served_uics(s) for s in sessions}
+
+
 def invalidate_served_uics_cache(session_id: str | None = None) -> None:
     """Drop the served-UIC cache (a session was rebuilt). None ⇒ drop all."""
     if session_id is None:
@@ -528,7 +534,10 @@ async def plan_federated(
     if not origin_uic or not dest_uic or origin_uic == dest_uic:
         return []
 
-    served = {s.id: _session_served_uics(s) for s in sessions}
+    # #397 — the served-stop sets (a GTFS read on a cache miss) and the
+    # coordinates (a database query) are blocking: worker threads, one after
+    # the other, never the event loop.
+    served = await asyncio.to_thread(_served_by_session, sessions)
     origin_sessions = [s for s in sessions if origin_uic in served[s.id]]
     dest_sessions = [s for s in sessions if dest_uic in served[s.id]]
     if not origin_sessions or not dest_sessions:
@@ -540,7 +549,7 @@ async def plan_federated(
         _record_outcome("no_shared_hub")
         return []
 
-    coords = _resolve_coords(db, {origin_uic, dest_uic} | candidate_hubs)
+    coords = await asyncio.to_thread(_resolve_coords, db, {origin_uic, dest_uic} | candidate_hubs)
     from_request = _fill_endpoint_positions(
         coords, [(origin_uic, origin_position), (dest_uic, dest_position)]
     )

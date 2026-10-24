@@ -70,6 +70,7 @@ from pydantic import (
 from sqlalchemy import func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
+from starlette.concurrency import run_in_threadpool
 
 from ... import osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
@@ -1584,7 +1585,7 @@ async def resolve_hub_codes(
     found with the module's Retry-After, never retrying."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = _hubs_to_look_at(db, resolved=False, skip=asked.skip)
+    hubs = await run_in_threadpool(_hubs_to_look_at, db, resolved=False, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubResolveResponse(
@@ -1700,7 +1701,7 @@ async def confirm_hub_codes(
     refusal = _module_refusal()
     if refusal is not None:
         return HubConfirmResponse(status="unavailable", message=refusal, results=[])
-    hubs = _hubs_by_id(db, [pair.hub_id for pair in confirm.pairs])
+    hubs = await run_in_threadpool(_hubs_by_id, db, [pair.hub_id for pair in confirm.pairs])
     # The hubs as they were before the module is asked: each write below is
     # guarded by them (`_guarded_write`).
     before = {hub_id: (hub.uic, hub.station_id) for hub_id, hub in hubs.items()}
@@ -1715,6 +1716,20 @@ async def confirm_hub_codes(
                 status=status, message=message, retry_after=retry_after, results=[]
             )
         by_code, by_id = station_module.lookup_by_key(outcome.rows, codes, ids)
+    results = await run_in_threadpool(_store_confirmed, db, confirm, hubs, before, by_code, by_id)
+    return HubConfirmResponse(status="ok", results=results)
+
+
+def _store_confirmed(
+    db: DbSession,
+    confirm: HubConfirmRequest,
+    hubs: dict[str, NetworkCoverageHub],
+    before: dict[str, tuple[str | None, str | None]],
+    by_code: dict[str, dict[str, Any]],
+    by_id: dict[str, dict[str, Any]],
+) -> list[HubConfirmed]:
+    """A confirm's guarded writes and their commit, in the thread pool (#397);
+    one result per pair."""
     now = datetime.now(UTC)
     results: list[HubConfirmed] = []
     for pair in confirm.pairs:
@@ -1749,7 +1764,7 @@ async def confirm_hub_codes(
                 )
             )
     db.commit()
-    return HubConfirmResponse(status="ok", results=results)
+    return results
 
 
 def _same_name(ours: str, theirs: str) -> bool:
@@ -1862,7 +1877,7 @@ async def check_hub_codes(
     serves its code under. Clears nothing: the administrator decides."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = _hubs_to_look_at(db, resolved=True, skip=asked.skip)
+    hubs = await run_in_threadpool(_hubs_to_look_at, db, resolved=True, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubCheckResponse(status="unavailable", message=refusal, results=[], left=len(hubs))
@@ -1876,10 +1891,21 @@ async def check_hub_codes(
         )
     rows, unanswered = found
     checked = [_checked(hub, rows.get(hub.id), unanswered.get(hub.id)) for hub in batch]
+    results = await run_in_threadpool(_write_checked, db, before, checked)
+    return HubCheckResponse(status="ok", results=results, left=len(hubs) - len(batch))
+
+
+def _write_checked(
+    db: DbSession,
+    before: dict[str, tuple[str | None, str | None]],
+    checked: list[tuple[HubChecked, str | None]],
+) -> list[HubChecked]:
+    """A check's guarded writes and their one commit (when any hub has an id
+    to write), in the thread pool (#397); the results as shown."""
     results = [_written(db, before, result, new_id) for result, new_id in checked]
     if any(new_id is not None for _result, new_id in checked):
         db.commit()
-    return HubCheckResponse(status="ok", results=results, left=len(hubs) - len(batch))
+    return results
 
 
 def _written(
@@ -2231,7 +2257,7 @@ async def pick_hub_station(
     return HubPickResponse(
         status="ok",
         message=_PICK_INCOMPLETE if incomplete else None,
-        stations=_pick_stations(db, rows, asked.country),
+        stations=await run_in_threadpool(_pick_stations, db, rows, asked.country),
         incomplete=incomplete,
     )
 
@@ -3264,6 +3290,23 @@ async def verify_cell_external(
     `external_verify.verify_via_oebb_hafas` and returns its result
     verbatim.
     """
+    origin_hub, dest_hub, run = await run_in_threadpool(
+        _verify_inputs, db, run_id, origin_id, dest_id
+    )
+    return await external_verify.verify_via_oebb_hafas(
+        from_lat=origin_hub.lat,
+        from_lon=origin_hub.lon,
+        to_lat=dest_hub.lat,
+        to_lon=dest_hub.lon,
+        depart_at=run.depart_at,
+    )
+
+
+def _verify_inputs(
+    db: DbSession, run_id: uuid.UUID, origin_id: str, dest_id: str
+) -> tuple[NetworkCoverageHub, NetworkCoverageHub, NetworkCoverageRun]:
+    """`verify_cell_external`'s reads, in the thread pool (#397): the two hubs
+    and the run, or the 404 of the first one missing."""
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
@@ -3289,13 +3332,7 @@ async def verify_cell_external(
         # coords. Surface as 404 — operator restores the hub if they
         # want this verifiable.
         raise HTTPException(404, _HUB_NOT_FOUND)
-    return await external_verify.verify_via_oebb_hafas(
-        from_lat=origin_hub.lat,
-        from_lon=origin_hub.lon,
-        to_lat=dest_hub.lat,
-        to_lon=dest_hub.lon,
-        depart_at=run.depart_at,
-    )
+    return origin_hub, dest_hub, run
 
 
 # ─────────────────────────── helpers ───────────────────────────

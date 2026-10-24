@@ -31,12 +31,15 @@ ask for build-duration distributions, not before.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.registry import REGISTRY, Collector
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -111,6 +114,82 @@ STATION_EXTRACT_FEEDS_TOTAL = Counter(
 )
 for _outcome in STATION_EXTRACT_OUTCOMES:
     STATION_EXTRACT_FEEDS_TOTAL.labels(outcome=_outcome)
+
+# ─── Web event-loop lag (#397) ─────────────────────────────────────────────
+
+# How late web's event loop runs. Every async handler, the health endpoints
+# included, shares that one loop: blocking work on it (a synchronous query in
+# an `async def` handler, #392's 9-17 s health checks) delays every request.
+# A timer asks to wake every LOOP_LAG_INTERVAL_S; how much later it wakes is
+# the lag. The gauge holds the largest lag of the last LOOP_LAG_WINDOW_S, so a
+# stall between two scrapes (15 s) or two rule evaluations (1 min) is still
+# seen. A loop blocked through a scrape answers no scrape at all (`up` drops);
+# the first tick after it records the whole stall. Alert: rules/web.yml.
+LOOP_LAG_INTERVAL_S = 0.25
+LOOP_LAG_WINDOW_S = 60.0
+
+WEB_EVENT_LOOP_LAG_SECONDS = Gauge(
+    "viator_web_event_loop_lag_seconds",
+    "Largest delay of web's event loop over the last 60 s: how much later than "
+    "asked a 0.25 s timer fired. Every request, /healthz included, waits that long.",
+)
+
+
+class LoopLagMonitor:
+    """Measures the event loop it runs on and keeps `gauge` at the largest
+    lag of the last `window_s` seconds. `start()` on the loop to measure
+    (web's startup), `stop()` at shutdown."""
+
+    def __init__(
+        self,
+        gauge: Gauge = WEB_EVENT_LOOP_LAG_SECONDS,
+        *,
+        interval_s: float = LOOP_LAG_INTERVAL_S,
+        window_s: float = LOOP_LAG_WINDOW_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.gauge = gauge
+        self.interval_s = interval_s
+        self.window_s = window_s
+        self._clock = clock
+        self._samples: deque[tuple[float, float]] = deque()
+        self._task: asyncio.Task[None] | None = None
+
+    def record(self, now: float, lag: float) -> float:
+        """Add one lag measured at `now`; set and return the window's largest."""
+        self._samples.append((now, lag))
+        while self._samples[0][0] < now - self.window_s:
+            self._samples.popleft()
+        worst = max(sample for _at, sample in self._samples)
+        self.gauge.set(worst)
+        return worst
+
+    async def _run(self) -> None:
+        while True:
+            asked = self._clock()
+            await asyncio.sleep(self.interval_s)
+            now = self._clock()
+            self.record(now, max(0.0, now - asked - self.interval_s))
+
+    def start(self) -> None:
+        """Measure the running loop. A task left on another loop (an app
+        started again on a new loop without its shutdown, as tests do) is
+        replaced, never touched."""
+        loop = asyncio.get_running_loop()
+        task = self._task
+        if task is None or task.done() or task.get_loop() is not loop:
+            self.gauge.set(0)
+            self._task = loop.create_task(self._run(), name="viator-loop-lag")
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None and task.get_loop() is asyncio.get_running_loop():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+LOOP_LAG_MONITOR = LoopLagMonitor()
 
 # These regexes match the route templates we want to keep out of the HTTP
 # histograms. Compiled once. Match against the matched-route's `path`

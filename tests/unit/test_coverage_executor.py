@@ -422,7 +422,10 @@ def test_alert_rules_read_the_gauges_web_exports() -> None:
     from app.metrics import _COVERAGE_GAUGES
     from tests.unit.test_monitoring_config import VIATOR_WEB_METRICS
 
-    assert set(VIATOR_WEB_METRICS) == {name for name, _ in _COVERAGE_GAUGES}
+    # #397 added web's own event-loop gauge beside the coverage gauges.
+    assert set(VIATOR_WEB_METRICS) == {name for name, _ in _COVERAGE_GAUGES} | {
+        "viator_web_event_loop_lag_seconds"
+    }
     rules = yaml.safe_load((ROOT / "docker/prometheus/rules/coverage.yml").read_text())
     exprs = {r["alert"]: r["expr"] for g in rules["groups"] for r in g["rules"]}
     assert exprs["CoverageRunHeartbeatStale"] == "viator_coverage_heartbeat_age_seconds > 900"

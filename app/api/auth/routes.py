@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from ... import audit, config_service
 from ...auth import email as email_sender
@@ -118,10 +119,27 @@ async def register_request(
     - If registration is closed → no-op (still 204).
     - If a user already exists for this email → no-op (still 204).
     - Otherwise: create / refresh a verification token, send email magic link.
+
+    #397 — the database work runs in the thread pool; only the email send
+    is awaited on the event loop.
     """
+    raw = await run_in_threadpool(_register_token, db, body, client_ip(request))
+    if raw is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    magic_link = f"{settings.public_base_url.rstrip('/')}/confirm/{raw}"
+    await email_sender.send_verification_email(
+        to_email=str(body.email), name=body.name, magic_link=magic_link
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _register_token(db: Session, body: RegisterRequestBody, ip: str | None) -> str | None:
+    """`register_request`'s database work: the raw verification token to
+    mail, or None when nothing is sent (registration closed, or a user
+    already has this email: audited)."""
     cfg = config_service.get_all(db)
     if not cfg["REGISTRATION_OPEN"]:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return None
 
     existing = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
     if existing is not None:
@@ -129,12 +147,12 @@ async def register_request(
         audit.record(
             db,
             action="register.requested.already_exists",
-            actor_ip=client_ip(request),
+            actor_ip=ip,
             target_kind="email",
             target_id=str(body.email),
         )
         db.commit()
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return None
 
     # Drop any prior pending tokens for this email.
     db.execute(delete(VerificationToken).where(VerificationToken.email == body.email))
@@ -151,22 +169,17 @@ async def register_request(
     audit.record(
         db,
         action="register.requested",
-        actor_ip=client_ip(request),
+        actor_ip=ip,
         target_kind="email",
         target_id=str(body.email),
         metadata={"name": body.name},
     )
     db.commit()
-
-    magic_link = f"{settings.public_base_url.rstrip('/')}/confirm/{raw}"
-    await email_sender.send_verification_email(
-        to_email=str(body.email), name=body.name, magic_link=magic_link
-    )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return raw
 
 
 @router.get("/check-token", response_model=CheckTokenResponse)
-async def check_token(
+def check_token(
     t: str,
     db: Annotated[Session, Depends(get_db)],
 ) -> CheckTokenResponse:
@@ -181,7 +194,7 @@ async def check_token(
 
 @router.post("/register-confirm")
 @limiter.limit("10/hour")
-async def register_confirm(
+def register_confirm(
     request: Request,
     body: RegisterConfirmBody,
     response: Response,
@@ -226,7 +239,7 @@ async def register_confirm(
 
 @router.post("/login", response_model=LoginResponse)
 @limiter.limit("20/15minute")
-async def login(
+def login(
     request: Request,
     body: LoginBody,
     response: Response,
@@ -344,35 +357,51 @@ async def password_reset_request(
     body: PasswordResetRequestBody,
     db: Annotated[Session, Depends(get_db)],
 ) -> Response:
-    user = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
-    if user is not None and user.is_active:
-        # Drop any prior pending tokens for this user.
-        db.execute(delete(PasswordResetToken).where(PasswordResetToken.user_id == user.id))
-        raw, hashed = tokens.make_verification_token()
-        db.add(
-            PasswordResetToken(
-                token_hash=hashed,
-                user_id=user.id,
-                expires_at=_now() + timedelta(hours=2),
-            )
-        )
-        audit.record(
-            db,
-            action="password_reset.requested",
-            actor_user_id=user.id,
-            actor_ip=client_ip(request),
-        )
-        db.commit()
+    """#397 — the database work runs in the thread pool; only the email send
+    is awaited on the event loop."""
+    reset = await run_in_threadpool(_reset_token, db, body, client_ip(request))
+    if reset is not None:
+        to_email, name, raw = reset
         magic_link = f"{settings.public_base_url.rstrip('/')}/reset/{raw}"
         await email_sender.send_password_reset_email(
-            to_email=user.email, name=user.name, magic_link=magic_link
+            to_email=to_email, name=name, magic_link=magic_link
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def _reset_token(
+    db: Session, body: PasswordResetRequestBody, ip: str | None
+) -> tuple[str, str, str] | None:
+    """`password_reset_request`'s database work: (email, name, raw token) to
+    mail to an active user, or None when nothing is sent."""
+    user = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
+    if user is None or not user.is_active:
+        return None
+    # Drop any prior pending tokens for this user.
+    db.execute(delete(PasswordResetToken).where(PasswordResetToken.user_id == user.id))
+    raw, hashed = tokens.make_verification_token()
+    db.add(
+        PasswordResetToken(
+            token_hash=hashed,
+            user_id=user.id,
+            expires_at=_now() + timedelta(hours=2),
+        )
+    )
+    audit.record(
+        db,
+        action="password_reset.requested",
+        actor_user_id=user.id,
+        actor_ip=ip,
+    )
+    # Read before the commit expires the row.
+    to_email, name = user.email, user.name
+    db.commit()
+    return to_email, name, raw
+
+
 @router.post("/password-reset-confirm", status_code=status.HTTP_204_NO_CONTENT)
 @limiter.limit("10/hour")
-async def password_reset_confirm(
+def password_reset_confirm(
     request: Request,
     body: PasswordResetConfirmBody,
     db: Annotated[Session, Depends(get_db)],
@@ -405,7 +434,7 @@ async def password_reset_confirm(
 
 @router.post("/bootstrap-platform-user")
 @limiter.limit("3/hour")
-async def bootstrap_platform_user(
+def bootstrap_platform_user(
     request: Request,
     body: BootstrapBody,
     response: Response,

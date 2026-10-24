@@ -19,6 +19,7 @@ from typing import Any
 
 import aiosmtplib
 from jinja2 import Environment, PackageLoader, select_autoescape
+from starlette.concurrency import run_in_threadpool
 
 from .. import config_service
 from ..db import SessionLocal
@@ -93,7 +94,7 @@ async def send_test_email(*, to_email: str) -> None:
     html = _env.get_template("smtp_test.html").render(to=to_email, sent_at=sent_at)
     text = _env.get_template("smtp_test.txt").render(to=to_email, sent_at=sent_at)
 
-    cfg = _read_smtp_config()
+    cfg = await run_in_threadpool(_read_smtp_config)
     if not cfg["SMTP_HOST"]:
         raise SmtpNotConfiguredError("SMTP_HOST is empty in platform_config")
 
@@ -110,6 +111,7 @@ async def send_test_email(*, to_email: str) -> None:
 
 
 def _read_smtp_config() -> dict[str, Any]:
+    """platform_config (30 s cache); blocking, so awaited in the thread pool (#397)."""
     with SessionLocal() as db:
         return config_service.get_all(db)
 
@@ -127,7 +129,7 @@ async def _deliver(
     Used by the magic-link helpers, which must not break the registration flow
     when SMTP isn't set up locally — devs see the link in the log instead.
     """
-    cfg = _read_smtp_config()
+    cfg = await run_in_threadpool(_read_smtp_config)
     if not cfg["SMTP_HOST"]:
         # Find the magic link by scanning the text for the URL — best-effort;
         # if not present (e.g. SMTP test), just log the subject.

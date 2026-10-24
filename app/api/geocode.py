@@ -30,6 +30,7 @@ import httpx
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
+from starlette.concurrency import run_in_threadpool
 
 from ..db import get_db
 from ..models import Session as SessionRow
@@ -44,6 +45,15 @@ log = logging.getLogger(__name__)
 # If MOTIS is slow we'd rather return master_stations alone than make
 # every keystroke wait. 1.5 s is generous for an in-cluster HTTP hop.
 _GEOCODE_TIMEOUT_S = 1.5
+
+
+def _motis_session_id(db: DbSession) -> str | None:
+    """The id of `_pick_motis_session`'s session; the pooled connection is
+    handed back before the geocoder call (#397, the #380 pattern)."""
+    motis = _pick_motis_session(db)
+    motis_id = None if motis is None else motis.id
+    db.close()
+    return motis_id
 
 
 def _pick_motis_session(db: DbSession) -> SessionRow | None:
@@ -229,8 +239,10 @@ async def geocode(
     The endpoint never raises — a missing or unhealthy MOTIS session
     returns `[]` so the typeahead degrades to master_stations alone.
     """
-    motis = _pick_motis_session(db)
-    if motis is None:
+    # The session read runs in the thread pool (#397): a typeahead calls this
+    # on every keystroke, on the event loop every request shares.
+    motis_id = await run_in_threadpool(_motis_session_id, db)
+    if motis_id is None:
         return []
-    payload = await _fetch_motis_geocode(motis.id, q, lambda: _client_gone(request))
+    payload = await _fetch_motis_geocode(motis_id, q, lambda: _client_gone(request))
     return _extract_stops(payload, size)

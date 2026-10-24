@@ -300,6 +300,30 @@
         }
       },
       "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "min"] } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Web event-loop lag",
+      "description": "How late web's event loop runs (issue #397): the largest delay of a 0.25 s timer over the last 60 s. Every async request and /healthz wait that long; the HEALTHCHECK fails past 10 s. Near zero when healthy; a rise means blocking work in an async handler. Alert WebEventLoopLagHigh: above 1 s for 5 min. A gap in the line is a scrape web did not answer.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "viator_web_event_loop_lag_seconds",
+          "legendFormat": "web"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
     }
   ]
 }
