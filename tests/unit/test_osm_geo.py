@@ -196,8 +196,9 @@ def test_the_border_doubt_counts_only_v1_boundaries(name, lat, lon, neighbour):
 @pytest.mark.parametrize(
     "name,lat,lon,expected",
     [
-        # Crimea is Ukraine's (the EU position; Natural Earth EU point of
-        # view), the rest of Russia Russia's.
+        # Crimea is Ukraine's (the EU position; Natural Earth's points of
+        # view for Ukraine and the EU members it covers), the rest of Russia
+        # Russia's.
         ("Simferopol", 44.952, 34.102, "UA"),
         ("Sevastopol", 44.616, 33.525, "UA"),
         ("Kerch", 45.357, 36.468, "UA"),
@@ -347,7 +348,8 @@ def test_an_enclave_is_a_hole_in_its_surrounding_country():
         assert g.country_for_point(lat, lon) is None
         assert g._containing(lat, lon, None) == own
     assert g.country_of_position(43.936, 12.447) == "SM"  # 3.2 km from Italy's line
-    assert g.country_of_position(*middle) is None  # the Vatican: within 3 km of Italy's
+    # Inside the 1:50m Vatican (about 1 km west of the real one): within 3 km of Italy's line.
+    assert g.country_of_position(*middle) is None
 
 
 def test_the_bundled_polygons_do_not_overlap():

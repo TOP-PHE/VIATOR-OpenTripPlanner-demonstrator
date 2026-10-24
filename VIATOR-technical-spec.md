@@ -435,10 +435,15 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   the module where a wrong one is acted upon (Narva, Estonia, falls 2.5 km inside the 1:50m
   Russia); empty too when the position comes from the coast fallback and a boundary of
   `NEIGHBOUR_COUNTRIES` lies within `BORDER_DOUBT_KM` beyond the nearest (the gap between
-  Gibraltar's 1:10m polygon and Spain's 1:50m one: Gibraltar airport, La Línea). The band never
-  applies inside a polygon: Albina (Suriname), inside the 1:50m French Guiana 3.0–3.3 km from
-  Suriname's line, is `FR`. Crimea, Sevastopol included, is `UA` (the EU position; Natural
-  Earth EU point of view: its 1:50m Crimea polygon is Ukraine's in the bundled file). Northern
+  Gibraltar's 1:10m polygon and Spain's 1:50m one: Gibraltar airport, La Línea; added after
+  version 3 without a new version, #395: no v1 country is affected, and the other places it
+  touches are French Guiana's coast by BR and SR, Turkey's coasts by GE and SY (Hatay), Russia's
+  by GE (Adler, Imeretinsky Kurort: two real stations, RU to empty; no feed of Russia exists),
+  AZ, KZ (Volga delta), KP (Tumen mouth) and JP (Kunashir)). This neighbour band never applies
+  inside a polygon: Albina (Suriname), inside the 1:50m French Guiana 3.0–3.3 km from Suriname's
+  line, is `FR`. Crimea, Sevastopol included, is `UA` (the EU position; Natural Earth's points
+  of view for Ukraine and the EU members it covers: its 1:50m Crimea polygon is Ukraine's in the
+  bundled file). Northern
   Cyprus is an open question for the owner (no polygon of its own: `CY` within 10 km of the 1:50m
   Cyprus, else empty). XK
   (Kosovo) is a user-assigned code, which MSMM accepts (`[A-Z]{2}`). `country_for_point`, the OSM
