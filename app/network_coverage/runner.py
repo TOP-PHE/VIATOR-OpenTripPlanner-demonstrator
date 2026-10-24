@@ -44,7 +44,9 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import func, literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session as DbSession
 
 from .. import config_service
@@ -80,32 +82,34 @@ FANOUT_SESSION_LABEL = "fanout"
 
 log = logging.getLogger(__name__)
 
-# ──────────────── #392 — no blocking work on the web's event loop ────────────────
+# ──────────────── #392 — no blocking work on the run's event loop ────────────────
 #
-# `execute_run` is a FastAPI background task: it runs on the web's event
-# loop, the loop that also answers every request and the image HEALTHCHECK
-# (`GET /healthz/version`, 10 s timeout, 3 retries). Every database call of
-# the runner is synchronous SQLAlchemy, and the recorder alone makes two to
-# three SELECTs per leg of every trip (the trip signature). Made on the loop,
-# six pairs finishing together held it for seconds: on 22 Oct the health
-# checks took 9-17 s during a run, and the harness
+# `execute_run` runs on the event loop of the worker's coverage executor
+# (app/network_coverage/executor.py), the loop that also keeps the run's
+# heartbeat. Before #392 it was a FastAPI background task on web's loop, the
+# one that answers every request and the image HEALTHCHECK. Every database
+# call of the runner is synchronous SQLAlchemy, and the recorder alone makes
+# two to three SELECTs per leg of every trip (the trip signature). Made on
+# the loop, six pairs finishing together held it for seconds: on 22 Oct the
+# health checks took 9-17 s during a run, and the harness
 # (tests/integration/test_coverage_web_health.py: 56 pairs, 6 at a time)
-# measured 30 590 statements on the loop and 1-3 s of loop lag.
+# measured 30 590 statements on the loop and 1-3 s of loop lag. In the
+# worker a held loop would delay the heartbeat instead.
 #
 # So the runner never calls the database from a coroutine: every blocking
 # call goes through `_off_loop` (a small dedicated executor), and the
 # completion phase, whose verify sweep shares one ORM session across its
 # cells, runs whole on a private event loop in a thread of its own
-# (`_run_on_private_loop`). The engine calls stay on the web loop: they are
-# awaited I/O.
+# (`_run_on_private_loop`). The engine calls stay on the executor's loop:
+# they are awaited I/O.
 #
 # Two threads, shared by every run of the process. The recorder's work is
 # mostly Python (ORM objects, statement building) and holds the GIL, so more
 # threads do not write faster: the harness measured the same run time and
 # loop lag with 1, 2 and 4. Two let one pair's database round trips overlap
-# another's Python work, and a run holds at most two of the web's fifteen
-# pooled connections (SQLAlchemy's default pool, 5 + 10 overflow), so
-# requests keep theirs.
+# another's Python work, and the runs hold at most two of the worker's
+# fifteen pooled connections (SQLAlchemy's default pool, 5 + 10 overflow),
+# so the executor's poll and heartbeat keep theirs.
 _DB_THREADS = 2
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=_DB_THREADS, thread_name_prefix="coverage-db")
 
@@ -130,7 +134,7 @@ async def _run_on_private_loop[T](coro: Coroutine[Any, Any, T]) -> T:
 
     For a phase that interleaves its own awaited I/O with blocking calls on
     one shared ORM session (the completion phase and its verify sweep): the
-    blocking calls then hold that private loop, never the web's. The thread
+    blocking calls then hold that private loop, never the run's. The thread
     is the default executor's (`asyncio.to_thread`), not `_DB_EXECUTOR`'s,
     so a sweep of hours does not take one of the pair writers."""
     return await asyncio.to_thread(asyncio.run, coro)
@@ -346,6 +350,26 @@ def abandon_run(run_id: uuid.UUID) -> None:
 def is_abandoned(run_id: uuid.UUID) -> bool:
     """True once `abandon_run(run_id)` was called in this process."""
     return run_id in _ABANDONED
+
+
+class RunNeedsResume(Exception):
+    """#392 — the run cannot go on in this execution, but it has not failed:
+    a transient database error kept it from starting, or pairs still have no
+    result row at the completion. The executor leaves it `running` and
+    claimed, with no terminal write; once its heartbeat is stale an executor
+    resumes it (a crash resume, bounded by COVERAGE_MAX_RESUMES) and asks the
+    pairs that have no result."""
+
+
+# #392 — database errors worth a retry: the connection dropped or the server
+# is restarting. Anything else (a constraint, a bug) is not retried.
+_TRANSIENT_DB_ERRORS: tuple[type[Exception], ...] = (OperationalError, InterfaceError)
+# Waits between the attempts of the start of a run (phase 1) and of a pair's
+# write. The total stays short: a longer outage is left to the resume.
+_PHASE1_RETRY_DELAYS_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+_WRITE_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+# The result-row guard of `network_coverage_results` (20260505_1500).
+_UNIQUE_RESULT_CONSTRAINT = "unique_result_per_run_pair"
 
 
 # ────────────────────── PR-187 — DB-status cancel check ──────────────────────
@@ -1133,8 +1157,8 @@ def create_run(
 ) -> NetworkCoverageRun:
     """Create a pending coverage run and return it.
 
-    Caller is responsible for kicking off the background task that
-    processes the run (see `execute_run`).
+    #392 — nothing executes it here: the run stays `pending` until the
+    worker's coverage executor claims it and calls `execute_run`.
 
     v0.1.31 — hubs read from `network_coverage_hubs` (operator-editable)
     instead of the static `hubs.py` constant.
@@ -1521,15 +1545,23 @@ async def _process_pair_with_cancel(
         )
 
 
-def _mark_run_failed(run_id: uuid.UUID, executor_id: str | None = None) -> None:
+def _mark_run_failed(
+    run_id: uuid.UUID, executor_id: str | None = None, reason: str | None = None
+) -> None:
     """Stamp `status='failed' + finished_at=now()` in its own short txn.
     Used by `execute_run` when the per-pair gather raises. With
-    `executor_id` (#392), only while that executor still holds the run."""
+    `executor_id` (#392), only while that executor still holds the run;
+    `reason` goes to `summary.failure_reason` (shown on the page)."""
+    now = datetime.now(UTC)
     stmt = update(NetworkCoverageRun).where(NetworkCoverageRun.id == run_id)
     if executor_id is not None:
         stmt = stmt.where(NetworkCoverageRun.claimed_by == executor_id)
+    extra = {"failure_reason": reason or "the run failed", "failed_at": now.isoformat()}
+    summary = func.coalesce(NetworkCoverageRun.summary, literal({}, JSONB)).op("||")(
+        literal(extra, JSONB)
+    )
     with SessionLocal() as db:
-        db.execute(stmt.values(status="failed", finished_at=datetime.now(UTC)))
+        db.execute(stmt.values(status="failed", finished_at=now, summary=summary))
         db.commit()
 
 
@@ -1560,7 +1592,12 @@ def _persist_cancelled_run(*, run_id: uuid.UUID, elapsed_s: float) -> None:
 
 # #392 — what the completion keeps of the summary it replaces: the record of
 # the resumes the executor wrote at each claim of a running run.
-_RESUME_SUMMARY_KEYS = ("resume_count", "resumes")
+_RESUME_SUMMARY_KEYS = (
+    "resume_count",
+    "crash_resume_count",
+    "release_resume_count",
+    "resumes",
+)
 
 
 def _kept_resume_summary(summary: Any) -> dict[str, Any]:
@@ -1580,12 +1617,38 @@ def _still_claimed_by(db: DbSession, run_id: uuid.UUID, executor_id: str) -> boo
     return holder == executor_id
 
 
+def _missing_pair_count(rows: Sequence[Any], expected: frozenset[tuple[str, str]] | None) -> int:
+    """#392 — how many of the run's pairs have no result row (0 when the
+    expected pair set is not given)."""
+    if expected is None:
+        return 0
+    return len(expected - {(r.origin_hub_id, r.dest_hub_id) for r in rows})
+
+
+def _hold_for_resume(
+    db: DbSession, run: NetworkCoverageRun, missing: int, executor_id: str | None
+) -> None:
+    """#392 — pairs have no result row at the completion (their write failed
+    after its retries): note it on the run, while this executor still holds
+    it, and leave the run `running` for a resume, which asks those pairs."""
+    if executor_id is not None and not _still_claimed_by(db, run.id, executor_id):
+        db.rollback()
+        return
+    run.summary = {
+        **(run.summary or {}),
+        "missing_pairs": missing,
+        "missing_pairs_at": datetime.now(UTC).isoformat(),
+    }
+    db.commit()
+
+
 async def _finalise_completed_run(
     *,
     run_id: uuid.UUID,
     elapsed_s: float,
     cfg: CoverageConfig,
     executor_id: str | None = None,
+    expected_pairs: frozenset[tuple[str, str]] | None = None,
 ) -> None:
     """Phase-3 — recompute summary counters, optionally run the PR-E
     external-verify sweep, flip to 'completed' in one transaction.
@@ -1593,18 +1656,31 @@ async def _finalise_completed_run(
     #392 — idempotent, so resume-safe: nothing is written before the one
     commit, and an interrupted completion leaves the run `running`, to be
     resumed with no pair left and completed again. With `executor_id`, the
-    commit happens only while that executor still holds the run."""
+    commit happens only while that executor still holds the run.
+
+    #392 — recount guard: with `expected_pairs` (the run's frozen pair set),
+    the run is completed only when every pair has its result row; else it
+    raises `RunNeedsResume` and the resume asks the missing pairs."""
     with SessionLocal() as db:
         run = db.get(NetworkCoverageRun, run_id)
         if run is None:
             return
-        run.finished_at = datetime.now(UTC)
+        if run.status != "running":
+            # #392 — ended meanwhile by someone else (a status written by
+            # SQL, PR-187): nothing to complete, and no completed over it.
+            log.warning("network-coverage run %s is %s: not completed", run_id, run.status)
+            return
         rows = (
             db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
             .scalars()
             .all()
         )
         _apply_counters(run, [r.status for r in rows])
+        missing = _missing_pair_count(rows, expected_pairs)
+        if missing:
+            _hold_for_resume(db, run, missing, executor_id)
+            raise RunNeedsResume(f"{missing} pairs have no result row yet")
+        run.finished_at = datetime.now(UTC)
 
         verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows, cfg=cfg)
 
@@ -1670,12 +1746,38 @@ async def _run_pairs(run_id: uuid.UUID, snap: _Phase1Snapshot, executor_id: str 
             ),
             return_exceptions=False,
         )
-    except Exception:
+    except Exception as exc:
         log.exception("network-coverage run %s failed mid-loop", run_id)
         if not is_abandoned(run_id):
-            await _off_loop(_mark_run_failed, run_id, executor_id)
+            reason = f"an error stopped the pairs: {type(exc).__name__}: {exc}"[:500]
+            await _off_loop(_mark_run_failed, run_id, executor_id, reason)
         return False
     return True
+
+
+async def _phase1_with_retry(run_id: uuid.UUID) -> _Phase1Snapshot | None:
+    """#392 — phase 1, retried on a transient database error (a DB blip as
+    a resumed run starts must not fail a run of hours). Still failing after
+    `_PHASE1_RETRY_DELAYS_S`, the run is left for a resume (`RunNeedsResume`)."""
+    attempt = 0
+    while True:
+        try:
+            return await _off_loop(_phase1_snapshot_and_start, run_id)
+        except _TRANSIENT_DB_ERRORS as exc:
+            if attempt >= len(_PHASE1_RETRY_DELAYS_S):
+                raise RunNeedsResume(
+                    f"a database error kept the run from starting: {type(exc).__name__}"
+                ) from exc
+            delay = _PHASE1_RETRY_DELAYS_S[attempt]
+            attempt += 1
+            log.warning(
+                "coverage run %s: database error while starting, retry %d in %.1f s",
+                run_id,
+                attempt,
+                delay,
+                exc_info=True,
+            )
+            await asyncio.sleep(delay)
 
 
 async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> None:
@@ -1685,7 +1787,8 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
     (`executor_id`); never by web. Manages its own DB sessions. Idempotent
     in the loose sense: re-running on a completed run is a no-op, and
     re-running a `running` run (a resume) asks only the pairs that have no
-    result yet. `executor_id=None` (tests) skips the claim checks.
+    result yet. `executor_id=None` (tests) skips the claim checks. Raises
+    `RunNeedsResume` when the run must be resumed rather than ended.
 
     PR-1 — wraps the whole body in try/finally so the cancel-event
     registration set by `register_cancel(run_id)` is always cleared, even
@@ -1696,7 +1799,7 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
     started = time.monotonic()
     register_cancel(run_id)
     try:
-        snap = await _off_loop(_phase1_snapshot_and_start, run_id)
+        snap = await _phase1_with_retry(run_id)
         if snap is None or not snap.pairs:
             log.error("run %s has no pairs to execute", run_id)
             return
@@ -1735,7 +1838,11 @@ async def execute_run(run_id: uuid.UUID, *, executor_id: str | None = None) -> N
         # one commit) on a private loop: its blocking calls share one session.
         await _run_on_private_loop(
             _finalise_completed_run(
-                run_id=run_id, elapsed_s=elapsed_s, cfg=snap.cfg, executor_id=executor_id
+                run_id=run_id,
+                elapsed_s=elapsed_s,
+                cfg=snap.cfg,
+                executor_id=executor_id,
+                expected_pairs=frozenset((o.id, d.id) for o, d in snap.pairs),
             )
         )
     finally:
@@ -2204,33 +2311,85 @@ async def _write_pair(
     *,
     record_kwargs: dict[str, Any],
     result_kwargs: dict[str, Any],
-) -> None:
+) -> bool:
     """Write one pair: its journey search (`record`, which returns the
     search id and the pair's error message), then its result row and
     counters (`_persist_pair_coverage_result`, shared by both modes so the
     matrix wire-format and the counter updates live in one place).
 
     Both writes are ONE call on the coverage DB executor, shielded: once
-    started, a cancellation of the run's task (e.g. a web shutdown) cannot
-    leave a journey search without its result row, as when both ran on the
-    loop with no await between them (#392)."""
-    await asyncio.shield(_off_loop(_record_then_persist, record, record_kwargs, result_kwargs))
+    started, a cancellation of the run's task (e.g. a worker shutdown) does
+    not stop it halfway (#392). True when the pair has its result row."""
+    return await asyncio.shield(
+        _off_loop(_record_then_persist, record, record_kwargs, result_kwargs)
+    )
 
 
 def _record_then_persist(
     record: Callable[..., tuple[uuid.UUID | None, str | None]],
     record_kwargs: dict[str, Any],
     result_kwargs: dict[str, Any],
-) -> None:
-    """The blocking body of `_write_pair`, in one executor thread."""
-    journey_search_id, error_message = record(**record_kwargs)
-    _persist_pair_coverage_result(
-        **result_kwargs, error_message=error_message, journey_search_id=journey_search_id
+) -> bool:
+    """The blocking body of `_write_pair`, in one executor thread.
+
+    #392 — the journey search and the result row are ONE transaction (the
+    recorder's part in a savepoint, so its failure still leaves the result
+    row): a process killed in between commits neither, so a resumed run
+    never finds an orphan search for a pair without a result and asks it
+    once more with exactly one search in the end. A transient database
+    error is retried (`_WRITE_RETRY_DELAYS_S`); if the write still fails
+    the pair simply has no result row: the completion sees it missing and
+    the run is resumed instead of completed (`RunNeedsResume`). A result
+    row already there (written by an earlier holder of the run) counts as
+    written; the second one is refused by the unique guard."""
+    origin, dest = result_kwargs["origin"], result_kwargs["dest"]
+    where = f"coverage run {result_kwargs['run_id']} pair {origin.id}→{dest.id}"
+    for attempt in range(len(_WRITE_RETRY_DELAYS_S) + 1):
+        try:
+            _write_pair_once(record, record_kwargs, result_kwargs)
+            return True
+        except IntegrityError as exc:
+            if _UNIQUE_RESULT_CONSTRAINT in str(exc):
+                log.warning("%s: already has a result row (an earlier holder); kept", where)
+                return True
+            log.exception("%s: result write failed", where)
+            return False
+        except _TRANSIENT_DB_ERRORS:
+            if attempt == len(_WRITE_RETRY_DELAYS_S):
+                break
+            log.warning("%s: database error on the result write, retrying", where, exc_info=True)
+            time.sleep(_WRITE_RETRY_DELAYS_S[attempt])
+        except Exception:
+            log.exception("%s: result write failed", where)
+            return False
+    log.error(
+        "%s: result write failed after %d attempts; the pair stays without a result "
+        "and is asked again when the run resumes",
+        where,
+        len(_WRITE_RETRY_DELAYS_S) + 1,
     )
+    return False
+
+
+def _write_pair_once(
+    record: Callable[..., tuple[uuid.UUID | None, str | None]],
+    record_kwargs: dict[str, Any],
+    result_kwargs: dict[str, Any],
+) -> None:
+    with SessionLocal() as db:
+        journey_search_id, error_message = record(db=db, **record_kwargs)
+        _persist_pair_coverage_result(
+            db=db,
+            **result_kwargs,
+            error_message=error_message,
+            journey_search_id=journey_search_id,
+        )
+        db.commit()
 
 
 def _record_pair_journey_search(
     *,
+    db: DbSession,
     run_id: uuid.UUID,
     session_id: str,
     origin: Hub,
@@ -2248,7 +2407,10 @@ def _record_pair_journey_search(
     Returns ``(journey_search_id, error_message)``: the search id (None when
     the write failed) and the pair's error message, with the recorder's
     failure appended to it when the write failed. Blocking: called through
-    `_off_loop`, never on the event loop (#392).
+    `_off_loop`, never on the event loop (#392). #392 — writes in a savepoint
+    of `db`, the transaction that also writes the result row (see
+    `_record_then_persist`); a transient database error is raised so the
+    whole pair write is retried.
 
     v0.1.29.4 — endpoint must be one of ('plan','compare','fanout') and
     requested_time_kind must be one of ('depart_at','arrive_by') per the
@@ -2263,8 +2425,8 @@ def _record_pair_journey_search(
     endpoint='plan' loses no analytical signal.
     """
     journey_search_id: uuid.UUID | None = None
-    with SessionLocal() as db:
-        try:
+    try:
+        with db.begin_nested():
             search = _begin_coverage_search(
                 db, endpoint="plan", origin=origin, dest=dest, depart_at=depart_at
             )
@@ -2288,23 +2450,23 @@ def _record_pair_journey_search(
                 total_trips_unique=len(trips),
                 status=status,
             )
-            journey_search_id = search.id
-            db.commit()
-        except Exception as recorder_exc:
-            log.exception(
-                "coverage run %s pair %s→%s: recorder write failed (continuing)",
-                run_id,
-                origin.id,
-                dest.id,
-            )
-            db.rollback()
-            # v0.1.29.4 — surface the recorder failure into the matrix row
-            # so the operator can see *why* the drilldown link is missing
-            # (e.g. CheckConstraint violation) instead of the generic
-            # "recorder write failed" message in the modal. Don't clobber
-            # an existing OTP-side error_message; append/keep both.
-            recorder_msg = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
-            error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
+        journey_search_id = search.id
+    except _TRANSIENT_DB_ERRORS:
+        raise
+    except Exception as recorder_exc:
+        log.exception(
+            "coverage run %s pair %s→%s: recorder write failed (continuing)",
+            run_id,
+            origin.id,
+            dest.id,
+        )
+        # v0.1.29.4 — surface the recorder failure into the matrix row
+        # so the operator can see *why* the drilldown link is missing
+        # (e.g. CheckConstraint violation) instead of the generic
+        # "recorder write failed" message in the modal. Don't clobber
+        # an existing OTP-side error_message; append/keep both.
+        recorder_msg = f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+        error_message = f"{error_message} | {recorder_msg}" if error_message else recorder_msg
     return journey_search_id, error_message
 
 
@@ -2488,6 +2650,7 @@ def _merge_fanout_results(
 
 def _record_fanout_journey_search(
     *,
+    db: DbSession,
     run_id: uuid.UUID,
     per_session: list[_FanoutSub],
     origin: Hub,
@@ -2505,10 +2668,11 @@ def _record_fanout_journey_search(
     `error_message` so the operator can see *why* the modal link is
     missing instead of the generic "recorder write failed" message.
 
-    Returns ``(journey_search_id, error_message_or_None)``.
+    Returns ``(journey_search_id, error_message_or_None)``. #392 — writes in
+    a savepoint of `db`, as `_record_pair_journey_search` does.
     """
-    with SessionLocal() as db:
-        try:
+    try:
+        with db.begin_nested():
             search = _begin_coverage_search(
                 db, endpoint="fanout", origin=origin, dest=dest, depart_at=depart_at
             )
@@ -2534,22 +2698,22 @@ def _record_fanout_journey_search(
                 total_trips_unique=total_trips_unique,
                 status=status,
             )
-            journey_search_id = search.id
-            db.commit()
-            return journey_search_id, None
-        except Exception as recorder_exc:
-            log.exception(
-                "coverage run %s pair %s→%s: recorder write failed (continuing)",
-                run_id,
-                origin.id,
-                dest.id,
-            )
-            db.rollback()
-            return None, f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
+        return search.id, None
+    except _TRANSIENT_DB_ERRORS:
+        raise
+    except Exception as recorder_exc:
+        log.exception(
+            "coverage run %s pair %s→%s: recorder write failed (continuing)",
+            run_id,
+            origin.id,
+            dest.id,
+        )
+        return None, f"[recorder] {type(recorder_exc).__name__}: {recorder_exc}"[:500]
 
 
 def _persist_pair_coverage_result(
     *,
+    db: DbSession,
     run_id: uuid.UUID,
     origin: Hub,
     dest: Hub,
@@ -2563,54 +2727,43 @@ def _persist_pair_coverage_result(
     journey_search_id: uuid.UUID | None,
     session_ids: list[str] | None = None,
 ) -> None:
-    """Write one NetworkCoverageResult row and increment the run-level
-    counters. Shared by `_execute_pair` (single-session) and
-    `_execute_pair_fanout` so the matrix wire-format stays bit-equivalent
-    across both code paths and the counter updates are written in exactly
-    one place.
+    """Add one NetworkCoverageResult row and increment the run-level
+    counters, in `db`'s transaction (#392: the caller commits it with the
+    pair's journey search, see `_record_then_persist`). Shared by
+    `_execute_pair` (single-session) and `_execute_pair_fanout` so the
+    matrix wire-format stays bit-equivalent across both code paths and the
+    counter updates are written in exactly one place.
 
     `session_ids` is fanout-only (list of sessions that returned ≥1 trip);
     `_execute_pair` passes None.
     """
-    with SessionLocal() as db:
-        try:
-            db.add(
-                NetworkCoverageResult(
-                    run_id=run_id,
-                    origin_hub_id=origin.id,
-                    dest_hub_id=dest.id,
-                    status=status,
-                    response_ms=response_ms,
-                    num_itineraries=num_itineraries,
-                    best_duration_seconds=best_duration_seconds,
-                    best_num_transfers=best_num_transfers,
-                    best_operators=best_operators,
-                    session_ids=session_ids,
-                    error_message=error_message,
-                    journey_search_id=journey_search_id,
-                )
-            )
-            db.execute(
-                update(NetworkCoverageRun)
-                .where(NetworkCoverageRun.id == run_id)
-                .values(
-                    completed_pairs=NetworkCoverageRun.completed_pairs + 1,
-                    ok_pairs=NetworkCoverageRun.ok_pairs + (1 if status == "ok" else 0),
-                    no_route_pairs=NetworkCoverageRun.no_route_pairs
-                    + (1 if status == "no_route" else 0),
-                    error_pairs=NetworkCoverageRun.error_pairs
-                    + (1 if status not in ("ok", "no_route", "skipped") else 0),
-                )
-            )
-            db.commit()
-        except Exception:
-            log.exception(
-                "coverage run %s pair %s→%s: result write failed",
-                run_id,
-                origin.id,
-                dest.id,
-            )
-            db.rollback()
+    db.add(
+        NetworkCoverageResult(
+            run_id=run_id,
+            origin_hub_id=origin.id,
+            dest_hub_id=dest.id,
+            status=status,
+            response_ms=response_ms,
+            num_itineraries=num_itineraries,
+            best_duration_seconds=best_duration_seconds,
+            best_num_transfers=best_num_transfers,
+            best_operators=best_operators,
+            session_ids=session_ids,
+            error_message=error_message,
+            journey_search_id=journey_search_id,
+        )
+    )
+    db.execute(
+        update(NetworkCoverageRun)
+        .where(NetworkCoverageRun.id == run_id)
+        .values(
+            completed_pairs=NetworkCoverageRun.completed_pairs + 1,
+            ok_pairs=NetworkCoverageRun.ok_pairs + (1 if status == "ok" else 0),
+            no_route_pairs=NetworkCoverageRun.no_route_pairs + (1 if status == "no_route" else 0),
+            error_pairs=NetworkCoverageRun.error_pairs
+            + (1 if status not in ("ok", "no_route", "skipped") else 0),
+        )
+    )
 
 
 async def _execute_pair_fanout(

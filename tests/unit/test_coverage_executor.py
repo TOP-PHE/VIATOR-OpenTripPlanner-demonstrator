@@ -203,14 +203,26 @@ def test_heartbeat_age_and_resume_record() -> None:
         summary={"zz": 99},
     )
     assert executor._heartbeat_age_s(run, now) == 199  # type: ignore[arg-type]
-    executor._record_resume(run, now)  # type: ignore[arg-type]
+    executor._record_resume(run, now, crash=True)  # type: ignore[arg-type]
     assert run.resume_count == 1
     assert run.summary["zz"] == 99
     assert run.summary["resume_count"] == 1
-    assert run.summary["resumes"][0]["previous_executor"] == "zz:99:a"
-    assert run.summary["resumes"][0]["completed_pairs"] == 99
+    assert run.summary["crash_resume_count"] == 1
+    assert run.summary["release_resume_count"] == 0
+    first = run.summary["resumes"][0]
+    assert first["kind"] == "crash"
+    assert first["previous_executor"] == "zz:99:a"
+    assert first["completed_pairs"] == 99
+    run.claimed_by = None
+    executor._record_resume(run, now, crash=False)  # type: ignore[arg-type]
+    assert run.resume_count == 2
+    assert run.summary["crash_resume_count"] == 1
+    assert run.summary["release_resume_count"] == 1
+    assert run.summary["resumes"][1]["kind"] == "release"
     run.heartbeat_at = None
     assert executor._heartbeat_age_s(run, now) is None  # type: ignore[arg-type]
+    assert executor._crash_resume_count({"crash_resume_count": "zz"}) == 0
+    assert executor._crash_resume_count(None) == 0
 
 
 # ─────────────────────────────── runner: snapshot, summary ───────────────────────────────
@@ -285,27 +297,53 @@ async def test_an_abandoned_run_writes_no_terminal_state(monkeypatch: pytest.Mon
 
 
 @pytest.mark.parametrize(
-    ("status", "heartbeat_s", "stop", "shown"),
+    ("status", "heartbeat_s", "holder", "stop", "shown"),
     [
-        ("pending", None, False, "queued"),
-        ("running", 9, False, "running"),
-        ("running", 199, False, "resuming"),
-        ("running", None, False, "resuming"),
-        ("running", 9, True, "stopping"),
-        ("completed", 9, True, "completed"),
-        ("failed", None, False, "failed"),
+        ("pending", None, None, False, "queued"),
+        ("running", 9, "zz:99:a", False, "running"),
+        ("running", 199, "zz:99:a", False, "resuming"),
+        ("running", None, "zz:99:a", False, "resuming"),
+        # Released at a deploy: no holder, heartbeat = the release time.
+        ("running", 9, None, False, "resuming"),
+        ("running", 9, "zz:99:a", True, "stopping"),
+        ("completed", 9, "zz:99:a", True, "completed"),
+        ("failed", None, None, False, "failed"),
     ],
 )
-def test_display_status(status: str, heartbeat_s: int | None, stop: bool, shown: str) -> None:
+def test_display_status(
+    status: str, heartbeat_s: int | None, holder: str | None, stop: bool, shown: str
+) -> None:
     from app.api.admin.network_coverage import _display_status
 
     now = datetime.now(UTC)
     run = SimpleNamespace(
         status=status,
+        claimed_by=holder,
         heartbeat_at=None if heartbeat_s is None else now - timedelta(seconds=heartbeat_s),
         cancel_requested_at=now if stop else None,
     )
     assert _display_status(run)[0] == shown
+
+
+@pytest.mark.parametrize(
+    ("status", "summary", "reason"),
+    [
+        ("failed", {"failure_reason": "zz-99 why"}, "zz-99 why"),
+        ("failed", {"orphaned_by_restart": True}, "web restarted during the run"),
+        ("failed", None, None),
+        ("failed", {"failure_reason": ""}, None),
+        ("completed", {"failure_reason": "zz-99 stale"}, None),
+    ],
+)
+def test_failure_reason_of_a_run(status: str, summary: Any, reason: str | None) -> None:
+    from app.api.admin.network_coverage import _failure_reason
+
+    got = _failure_reason(SimpleNamespace(status=status, summary=summary))
+    if reason is None:
+        assert got is None
+    else:
+        assert got is not None
+        assert got.startswith(reason)
 
 
 def test_run_summary_carries_the_executor_fields() -> None:
@@ -332,14 +370,19 @@ def test_run_summary_carries_the_executor_fields() -> None:
         resume_count=2,
     )
     summary = _run_to_summary(run)
-    assert (summary.display_status, summary.resume_count) == ("resuming", 2)
-    assert summary.heartbeat_age_seconds is not None and summary.heartbeat_age_seconds >= 299
+    assert summary.display_status == "resuming"
+    assert summary.resume_count == 2
+    assert summary.heartbeat_age_seconds is not None
+    assert summary.heartbeat_age_seconds >= 299
+    assert summary.failure_reason is None
 
 
 def test_page_shows_the_display_status_and_stops_queued_runs() -> None:
     page = (ROOT / "app/templates/admin/network_coverage.html").read_text(encoding="utf-8")
     assert "function runStatusPill(run)" in page
     assert "run.display_status || run.status" in page
+    assert "const reason = run.failure_reason || '';" in page
+    assert 'class="cov-fail-reason"' in page
     assert "const stopBtn = runIsLive(r)" in page
     for shown in ("queued", "resuming", "stopping"):
         assert f'.cov-pill[data-status="{shown}"]' in page
@@ -427,7 +470,8 @@ def test_start_runs_serve_in_a_daemon_thread(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(ex, "poll_once", _poll)
     thread = ex.start()
     thread.join(timeout=5)
-    assert thread.daemon and not thread.is_alive()
+    assert thread.daemon
+    assert not thread.is_alive()
     assert polls == [1]
 
 
@@ -464,3 +508,109 @@ async def test_completion_commits_nothing_once_the_claim_is_lost(
     assert run.status == "running"
     db.rollback.assert_called_once()
     db.commit.assert_not_called()
+
+
+# ─────────────────────────────── review round 1 (#402) ───────────────────────────────
+
+
+async def test_a_failing_abandoned_run_is_not_marked_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pair loop raises after the claim was lost: no failure write, the
+    run belongs to the other executor (S4: the abandon check before
+    `_mark_run_failed`)."""
+    rid = uuid.uuid4()
+    snap = runner._Phase1Snapshot(
+        run_mode=runner.MODE_SINGLE_SESSION,
+        session_id_for_pairs="zz-s",
+        engine_for_pairs="motis",
+        fanout_session_ids=[],
+        engine_by_session={},
+        depart_at_for_pairs=datetime(2099, 9, 9, tzinfo=UTC),
+        pairs=[(MagicMock(), MagicMock())],
+        cfg=runner.CoverageConfig(),
+        window=None,  # type: ignore[arg-type]
+    )
+    failed: list[Any] = []
+
+    async def _pair(**_kw: Any) -> None:
+        runner.abandon_run(rid)
+        raise RuntimeError("zz-99 after the takeover")
+
+    monkeypatch.setattr(runner, "_process_pair_with_cancel", _pair)
+    monkeypatch.setattr(runner, "_mark_run_failed", lambda *a: failed.append(a))
+    try:
+        assert await runner._run_pairs(rid, snap, "zz:99:a") is False
+    finally:
+        runner._ABANDONED.discard(rid)
+        runner.clear_cancel(rid)
+    assert failed == []
+
+
+async def test_a_run_needing_a_resume_is_left_claimed_not_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = executor.CoverageExecutor("zz:99:a", heartbeat_s=60, session_factory=_no_db)
+    settled: list[uuid.UUID] = []
+    noted: list[tuple[uuid.UUID, str]] = []
+
+    async def _needs_resume(_run_id: uuid.UUID, *, executor_id: str) -> None:
+        raise runner.RunNeedsResume("zz-99 pairs have no result row yet")
+
+    def _note(_db: Any, rid: uuid.UUID, _ex: str, reason: str) -> None:
+        noted.append((rid, reason))
+        raise RuntimeError("zz-99 the note fails too")  # logged, nothing else
+
+    monkeypatch.setattr(runner, "execute_run", _needs_resume)
+    monkeypatch.setattr(executor, "settle_unfinished", lambda _db, rid, _ex: settled.append(rid))
+    monkeypatch.setattr(executor, "note_interruption", _note)
+    claim = executor.Claim(run_id=uuid.uuid4(), resumed=True, resume_count=1)
+    ex._active[claim.run_id] = asyncio.ensure_future(asyncio.sleep(0))
+    await ex._execute(claim)
+    assert settled == []
+    assert noted == [(claim.run_id, "zz-99 pairs have no result row yet")]
+    assert ex.active_run_ids == []
+
+
+def test_the_resume_limit_reason_names_the_missing_pairs_and_the_last_interruption() -> None:
+    now = datetime(2099, 9, 9, 9, 9, tzinfo=UTC)
+    run = SimpleNamespace(
+        status="running",
+        finished_at=None,
+        claimed_by="zz:99:a",
+        completed_pairs=99,
+        summary={
+            "crash_resume_count": 5,
+            "missing_pairs": 9,
+            "last_interruption": {"reason": "zz-99 a database error"},
+        },
+    )
+    executor._fail_resume_limit(run, now, 5)  # type: ignore[arg-type]
+    reason = run.summary["failure_reason"]
+    assert run.status == "failed"
+    assert "6 times" in reason
+    assert "9 pairs still had no result row" in reason
+    assert "last interruption: zz-99 a database error" in reason
+    assert run.claimed_by is None
+
+
+def test_the_claim_takes_a_released_run_as_a_release_resume() -> None:
+    now = datetime(2099, 9, 9, 9, 9, tzinfo=UTC)
+    run = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="running",
+        claimed_by=None,
+        heartbeat_at=now,
+        completed_pairs=9,
+        resume_count=0,
+        summary=None,
+    )
+    claim = executor._take(run, now, "zz:99:b")  # type: ignore[arg-type]
+    assert claim.resumed is True
+    assert claim.crash is False
+    assert run.claimed_by == "zz:99:b"
+    queued = SimpleNamespace(id=uuid.uuid4(), status="pending", claimed_by=None, resume_count=0)
+    claim = executor._take(queued, now, "zz:99:b")  # type: ignore[arg-type]
+    assert claim.resumed is False
+    assert queued.status == "running"
+    assert queued.started_at == now

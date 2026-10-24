@@ -602,6 +602,9 @@ class RunSummary(BaseModel):
     display_status: str = ""
     resume_count: int = 0
     heartbeat_age_seconds: float | None = None
+    # #392 — why a failed run failed (`summary.failure_reason`: the resume
+    # limit, an error in the pair loop, ...), shown next to the pill.
+    failure_reason: str | None = None
 
 
 # PR-196a — the alignment-tier vocabulary the scorer in
@@ -2943,7 +2946,10 @@ def stop_run(
     in-process signal did: the cells already processed stay, the row flips
     to status='cancelled' with a `cancelled_by_operator` marker on
     `summary`. A run still queued (`pending`, no executor holds it) is
-    cancelled here at once, with the same marker.
+    cancelled here at once, with the same marker, and so is a running run
+    no live executor holds (paused by a deploy, or its worker is down):
+    it ends `cancelled` now instead of showing "stopping" until a worker
+    is back (`executor.cancel_unheld_run`).
 
     Returns the updated run summary (a running run reads 'running' with
     display status 'stopping' until the executor confirms). The UI polls
@@ -2979,6 +2985,7 @@ def stop_run(
         .values(cancel_requested_at=func.now())
     )
     db.commit()
+    coverage_executor.cancel_unheld_run(db, run_id)
     db.refresh(run)
     return _run_to_summary(run, cfg=runner._load_coverage_config(db))
 
@@ -3515,10 +3522,24 @@ def _int_or_zero(value: Any) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _failure_reason(run: Any) -> str | None:
+    """#392 — why a failed run failed, from its summary; None otherwise."""
+    summary = getattr(run, "summary", None)
+    if getattr(run, "status", None) != "failed" or not isinstance(summary, dict):
+        return None
+    reason = summary.get("failure_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    if summary.get("orphaned_by_restart"):
+        return "web restarted during the run (before runs moved to the worker, #392)"
+    return None
+
+
 def _display_status(run: Any) -> tuple[str, float | None]:
     """#392 — (pill text, heartbeat age in seconds) for a run row. A running
-    run with no heartbeat, or one older than the executor's stale limit, is
-    "resuming": its executor stopped and the next one takes it over."""
+    run that no executor holds (released at a deploy), or whose heartbeat is
+    missing or older than the executor's stale limit, is "resuming": its
+    executor stopped and the next one takes it over."""
     status = str(run.status)
     heartbeat_at = getattr(run, "heartbeat_at", None)
     age = (
@@ -3532,7 +3553,8 @@ def _display_status(run: Any) -> tuple[str, float | None]:
         return status, age
     if isinstance(getattr(run, "cancel_requested_at", None), datetime):
         return "stopping", age
-    if age is None or age > coverage_executor.STALE_AFTER_SECONDS:
+    unheld = getattr(run, "claimed_by", None) is None
+    if unheld or age is None or age > coverage_executor.STALE_AFTER_SECONDS:
         return "resuming", age
     return status, age
 
@@ -3568,6 +3590,7 @@ def _run_to_summary(
         display_status=display_status,
         resume_count=_int_or_zero(getattr(run, "resume_count", 0)),
         heartbeat_age_seconds=heartbeat_age,
+        failure_reason=_failure_reason(run),
         id=str(run.id),
         session_id=run.session_id,
         session_label=run.session_label,

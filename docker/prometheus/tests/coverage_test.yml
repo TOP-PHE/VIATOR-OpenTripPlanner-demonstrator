@@ -38,6 +38,33 @@ tests:
         alertname: CoverageRunNotClaimed
         exp_alerts: []
 
+  # A run released at a graceful worker stop (a deploy) keeps the release time
+  # as its heartbeat (#402 review, S8), so the age counts from the release,
+  # not from the run's start hours earlier: when no worker comes back, the
+  # alert fires 15 + 5 minutes after the release, not 5 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'viator_coverage_heartbeat_age_seconds{job="viator-web"}'
+        values: '0+60x30'
+      - series: 'viator_coverage_runs_running{job="viator-web"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: CoverageRunHeartbeatStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: viator-web
+            exp_annotations:
+              summary: "A coverage run has had no executor heartbeat for more than 15 minutes"
+              description: "A running coverage run's heartbeat is 22m 0s old. No coverage executor is holding or resuming it: check that the worker container is up (docker compose -p viator ps worker) and its log (grep coverage_executor). The run is paused, not lost: it resumes when the worker is back."
+
   # A queued run behind a running one is normal; once nothing runs and it
   # still waits past 15 min, the alert fires 5 min later.
   - interval: 1m

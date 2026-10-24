@@ -12,9 +12,10 @@ rarely survived. Now:
   (`python -m app.worker`, started by `worker.main`), polls for work and
   claims a run atomically: `SELECT ... FOR UPDATE SKIP LOCKED` on the oldest
   claimable row, then `claimed_by` / `heartbeat_at` set in the same
-  transaction. Claimable means `pending`, or `running` with a heartbeat
-  older than `STALE_AFTER_SECONDS` (or none: released at a graceful
-  shutdown, or a run left by web before this change);
+  transaction. Claimable means `pending`, or `running` and paused: no
+  holder (released at a graceful shutdown, or a run left by web before this
+  change) or a heartbeat older than `STALE_AFTER_SECONDS` (its executor
+  died). An executor never claims a run it is executing itself;
 - while it executes a run (`runner.execute_run`, unchanged pair logic and
   knobs: COVERAGE_PAIR_PARALLELISM, COVERAGE_WITHIN_PAIR_PARALLELISM) it
   refreshes `heartbeat_at` every `HEARTBEAT_SECONDS` (the database's clock).
@@ -22,13 +23,20 @@ rarely survived. Now:
   this process with no terminal write (`runner.abandon_run`);
 - a `running` run claimed again is a **resume**: `resume_count` + 1 and a
   line in `summary.resumes`; the runner skips the pairs that already have a
-  result row (one transaction writes a result row and its counter
-  increments, and the (run, origin, dest) unique constraint refuses a
-  second row), so the counters stay exact. Past COVERAGE_MAX_RESUMES the run
-  is marked failed with `summary.resume_limit_reached` instead;
+  result row (one transaction writes a pair's journey search, its result
+  row and its counter increments, and the (run, origin, dest) unique
+  constraint refuses a second row), so the counters stay exact. A resume
+  after a release is a `release` resume and costs nothing; one after a
+  stale heartbeat (a crash, a kill, a run left for a resume after a
+  database error) is a `crash` resume, and past COVERAGE_MAX_RESUMES of
+  those the run is marked failed with `summary.resume_limit_reached`
+  instead (a run that keeps killing its worker must not loop forever);
 - at SIGTERM (a deploy recreates the worker) the worker releases its claims
-  (`release_claims`) so the next executor resumes at once instead of
-  waiting for the heartbeat to go stale.
+  (`release_claims`: no holder, `heartbeat_at` = the release time) so the
+  next executor resumes at once instead of waiting for the heartbeat to go
+  stale;
+- a Stop clicked while no executor holds the run ends it `cancelled` at
+  once (`cancel_unheld_run`, called by web's Stop; and at the claim).
 
 Web never fails a run at startup any more: the executor decides. The page
 reads everything from the database (`display_status`: queued, resuming,
@@ -46,7 +54,7 @@ import os
 import socket
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -56,7 +64,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from .. import config_service
 from ..db import SessionLocal
-from ..models import NetworkCoverageRun
+from ..models import NetworkCoverageResult, NetworkCoverageRun
 from . import runner
 
 log = logging.getLogger(__name__)
@@ -85,11 +93,13 @@ def new_executor_id() -> str:
 
 @dataclass(frozen=True)
 class Claim:
-    """One run this executor now holds."""
+    """One run this executor now holds. `crash`: a resume after a stale
+    heartbeat (its previous executor did not release it)."""
 
     run_id: uuid.UUID
     resumed: bool
     resume_count: int
+    crash: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,22 +120,37 @@ def read_limits(db: DbSession) -> Limits:
     )
 
 
-def _claimable(stale_after_s: float) -> Any:
+def _unheld(stale_after_s: float) -> Any:
+    """A `running` run no live executor holds: released (no holder), or
+    its holder's heartbeat is missing or older than `stale_after_s`."""
     stale_before = func.now() - timedelta(seconds=stale_after_s)
-    running_and_stale = (NetworkCoverageRun.status == "running") & (
-        NetworkCoverageRun.heartbeat_at.is_(None) | (NetworkCoverageRun.heartbeat_at < stale_before)
+    return (NetworkCoverageRun.status == "running") & (
+        NetworkCoverageRun.claimed_by.is_(None)
+        | NetworkCoverageRun.heartbeat_at.is_(None)
+        | (NetworkCoverageRun.heartbeat_at < stale_before)
     )
-    return (NetworkCoverageRun.status == "pending") | running_and_stale
 
 
-def select_claimable(db: DbSession, stale_after_s: float) -> NetworkCoverageRun | None:
+def _claimable(stale_after_s: float, exclude: Collection[uuid.UUID] = ()) -> Any:
+    claimable = (NetworkCoverageRun.status == "pending") | _unheld(stale_after_s)
+    if exclude:
+        # The runs this executor is executing itself: its own heartbeat may
+        # be late (a DB outage), but the run is not abandoned.
+        claimable = claimable & NetworkCoverageRun.id.notin_(list(exclude))
+    return claimable
+
+
+def select_claimable(
+    db: DbSession, stale_after_s: float, exclude: Collection[uuid.UUID] = ()
+) -> NetworkCoverageRun | None:
     """The next run to take, row-locked (FOR UPDATE SKIP LOCKED): a resume
-    first, then the oldest queued run. A row another executor is claiming
-    is skipped, never waited for, and Postgres re-checks the condition on
-    the locked row, so a heartbeat written meanwhile makes it unclaimable."""
+    first, then the oldest queued run, never one of `exclude`. A row another
+    executor is claiming is skipped, never waited for, and Postgres
+    re-checks the condition on the locked row, so a heartbeat written
+    meanwhile makes it unclaimable."""
     return db.execute(
         select(NetworkCoverageRun)
-        .where(_claimable(stale_after_s))
+        .where(_claimable(stale_after_s, exclude))
         .order_by(
             case((NetworkCoverageRun.status == "running", 0), else_=1),
             NetworkCoverageRun.started_at,
@@ -141,35 +166,157 @@ def _heartbeat_age_s(run: NetworkCoverageRun, now: datetime) -> float | None:
     return max(0.0, (now - run.heartbeat_at).total_seconds())
 
 
+def _crash_resume_count(summary: Any) -> int:
+    value = summary.get("crash_resume_count") if isinstance(summary, dict) else None
+    return value if isinstance(value, int) else 0
+
+
 def _fail_resume_limit(run: NetworkCoverageRun, now: datetime, max_resumes: int) -> None:
+    summary = run.summary if isinstance(run.summary, dict) else {}
+    reason = (
+        f"the coverage executor stopped without releasing the run "
+        f"{_crash_resume_count(summary) + 1} times (COVERAGE_MAX_RESUMES = {max_resumes}); "
+        "marked failed instead of resumed again"
+    )
+    missing = summary.get("missing_pairs")
+    if isinstance(missing, int) and missing > 0:
+        reason += f"; {missing} pairs still had no result row"
+    last = summary.get("last_interruption")
+    if isinstance(last, dict) and last.get("reason"):
+        reason += f"; last interruption: {last['reason']}"
     run.status = "failed"
     run.finished_at = now
     run.claimed_by = None
     run.summary = {
-        **(run.summary or {}),
+        **summary,
         "resume_limit_reached": True,
-        "failure_reason": (
-            f"the coverage executor stopped {run.resume_count + 1} times during this run "
-            f"(COVERAGE_MAX_RESUMES = {max_resumes}); marked failed instead of resumed again"
-        ),
+        "failure_reason": reason[:500],
         "failed_at": now.isoformat(),
         "completed_pairs_at_failure": run.completed_pairs or 0,
     }
 
 
-def _record_resume(run: NetworkCoverageRun, now: datetime) -> None:
+def _record_resume(run: NetworkCoverageRun, now: datetime, *, crash: bool) -> None:
     previous = run.summary if isinstance(run.summary, dict) else {}
     resumes = list(previous.get("resumes") or [])
     resumes.append(
         {
             "resumed_at": now.isoformat(),
+            "kind": "crash" if crash else "release",
             "previous_executor": run.claimed_by,
             "last_heartbeat_at": run.heartbeat_at.isoformat() if run.heartbeat_at else None,
             "completed_pairs": run.completed_pairs or 0,
         }
     )
     run.resume_count = (run.resume_count or 0) + 1
-    run.summary = {**previous, "resume_count": run.resume_count, "resumes": resumes}
+    crashes = _crash_resume_count(previous) + (1 if crash else 0)
+    run.summary = {
+        **previous,
+        "resume_count": run.resume_count,
+        "crash_resume_count": crashes,
+        "release_resume_count": run.resume_count - crashes,
+        "resumes": resumes,
+    }
+
+
+def cancel_on_row(db: DbSession, run: NetworkCoverageRun, now: datetime) -> None:
+    """End a run no executor holds as `cancelled` (its Stop was clicked):
+    the counters recounted from its result rows, the summary marked as the
+    runner's Stop marks it. The caller holds the row lock and commits."""
+    statuses = db.execute(
+        select(NetworkCoverageResult.status).where(NetworkCoverageResult.run_id == run.id)
+    ).scalars()
+    runner._apply_counters(run, list(statuses))
+    started = run.started_at
+    run.status = "cancelled"
+    run.finished_at = now
+    run.claimed_by = None
+    run.summary = {
+        **(run.summary if isinstance(run.summary, dict) else {}),
+        "elapsed_seconds": (now - started).total_seconds() if started else 0.0,
+        "cancelled_by_operator": True,
+        "cancelled_at": now.isoformat(),
+        "cancelled_while_paused": True,
+    }
+
+
+def cancel_unheld_run(
+    db: DbSession, run_id: uuid.UUID, stale_after_s: float = STALE_AFTER_SECONDS
+) -> bool:
+    """Web's Stop on a running run that no live executor holds (paused by
+    a deploy, or its worker is down): end it `cancelled` now instead of
+    showing "stopping" until a worker comes back. The row lock and the
+    re-checked condition make it exclusive with a claim: a run an executor
+    claimed meanwhile is left to that executor (it reads the Stop click).
+    True when it was cancelled here."""
+    run = db.execute(
+        select(NetworkCoverageRun)
+        .where(NetworkCoverageRun.id == run_id, _unheld(stale_after_s))
+        .with_for_update()
+    ).scalar_one_or_none()
+    if run is None:
+        db.rollback()
+        return False
+    cancel_on_row(db, run, datetime.now(UTC))
+    db.commit()
+    log.warning("coverage_executor.cancelled_while_paused run_id=%s", run_id)
+    return True
+
+
+def _settle_instead_of_claim(
+    db: DbSession, run: NetworkCoverageRun, now: datetime, max_resumes: int
+) -> bool:
+    """A paused run that must not be resumed: its Stop was clicked (it ends
+    `cancelled`), or it is past its crash-resume limit (it ends `failed`
+    with the reason). True when the run was settled and committed."""
+    if run.cancel_requested_at is not None:
+        cancel_on_row(db, run, now)
+        db.commit()
+        log.warning("coverage_executor.cancelled_while_paused run_id=%s", run.id)
+        return True
+    crashes = _crash_resume_count(run.summary)
+    if run.claimed_by is None or crashes < max_resumes:
+        return False
+    run_id = run.id
+    _fail_resume_limit(run, now, max_resumes)
+    db.commit()
+    log.warning(
+        "coverage_executor.resume_limit_reached run_id=%s crash_resumes=%d limit=%d",
+        run_id,
+        crashes,
+        max_resumes,
+    )
+    return True
+
+
+def _take(run: NetworkCoverageRun, now: datetime, executor_id: str) -> Claim:
+    """Make `executor_id` the run's holder (a queued run starts, a paused
+    one is resumed). The caller commits."""
+    resumed = run.status == "running"
+    crash = resumed and run.claimed_by is not None
+    if resumed:
+        _record_resume(run, now, crash=crash)
+    else:
+        run.status = "running"
+        run.started_at = now
+    run.claimed_by = executor_id
+    run.heartbeat_at = func.now()
+    return Claim(run_id=run.id, resumed=resumed, resume_count=run.resume_count or 0, crash=crash)
+
+
+def _log_claim(claim: Claim, age: float | None, executor_id: str) -> None:
+    if not claim.resumed:
+        log.info("coverage_executor.claimed run_id=%s executor=%s", claim.run_id, executor_id)
+        return
+    log.warning(
+        "coverage_executor.resumed run_id=%s kind=%s resume_count=%d heartbeat_age_s=%s "
+        "executor=%s",
+        claim.run_id,
+        "crash" if claim.crash else "release",
+        claim.resume_count,
+        "none" if age is None else f"{age:.0f}",
+        executor_id,
+    )
 
 
 def claim_next_run(
@@ -178,52 +325,27 @@ def claim_next_run(
     executor_id: str,
     max_resumes: int = DEFAULT_MAX_RESUMES,
     stale_after_s: float = STALE_AFTER_SECONDS,
+    exclude: Collection[uuid.UUID] = (),
 ) -> Claim | None:
     """Claim the next run for `executor_id`, or None when there is none.
 
     One transaction per run looked at: the row is locked by
-    `select_claimable`, updated, committed. A stale `running` run past its
-    resume limit is marked failed (with the reason) and the next one is
-    looked at."""
+    `select_claimable`, updated, committed. A paused run whose Stop was
+    clicked is cancelled, and one past its crash-resume limit is marked
+    failed (with the reason); then the next one is looked at. `exclude`:
+    the runs this executor is executing (never claimed again by it)."""
     while True:
-        run = select_claimable(db, stale_after_s)
+        run = select_claimable(db, stale_after_s, exclude)
         if run is None:
             db.rollback()
             return None
         now = datetime.now(UTC)
-        resumed = run.status == "running"
-        if resumed and (run.resume_count or 0) >= max_resumes:
-            failed_id, resumes = run.id, run.resume_count or 0
-            _fail_resume_limit(run, now, max_resumes)
-            db.commit()
-            log.warning(
-                "coverage_executor.resume_limit_reached run_id=%s resumes=%d limit=%d",
-                failed_id,
-                resumes,
-                max_resumes,
-            )
+        if run.status == "running" and _settle_instead_of_claim(db, run, now, max_resumes):
             continue
         age = _heartbeat_age_s(run, now)
-        if resumed:
-            _record_resume(run, now)
-        else:
-            run.status = "running"
-            run.started_at = now
-        run.claimed_by = executor_id
-        run.heartbeat_at = func.now()
-        claim = Claim(run_id=run.id, resumed=resumed, resume_count=run.resume_count or 0)
+        claim = _take(run, now, executor_id)
         db.commit()
-        if resumed:
-            log.warning(
-                "coverage_executor.resumed run_id=%s resume_count=%d heartbeat_age_s=%s "
-                "executor=%s",
-                claim.run_id,
-                claim.resume_count,
-                "none" if age is None else f"{age:.0f}",
-                executor_id,
-            )
-        else:
-            log.info("coverage_executor.claimed run_id=%s executor=%s", claim.run_id, executor_id)
+        _log_claim(claim, age, executor_id)
         return claim
 
 
@@ -256,8 +378,11 @@ def claim_taken_over(db: DbSession, run_id: uuid.UUID, executor_id: str) -> bool
 
 def release_claims(db: DbSession, executor_id: str) -> list[uuid.UUID]:
     """Release every running run `executor_id` holds (graceful shutdown):
-    no holder, no heartbeat, so the next executor resumes it at its first
-    poll. The run stays `running`; it is paused, not failed."""
+    no holder, so the next executor resumes it at its first poll, and
+    `heartbeat_at` set to the release time, so the heartbeat-age gauge and
+    its alert count from the release, not from the run's start. The run
+    stays `running`; it is paused, not failed, and the resume after a
+    release does not count toward COVERAGE_MAX_RESUMES."""
     released = list(
         db.execute(
             update(NetworkCoverageRun)
@@ -265,7 +390,7 @@ def release_claims(db: DbSession, executor_id: str) -> list[uuid.UUID]:
                 NetworkCoverageRun.claimed_by == executor_id,
                 NetworkCoverageRun.status == "running",
             )
-            .values(claimed_by=None, heartbeat_at=None)
+            .values(claimed_by=None, heartbeat_at=func.now())
             .returning(NetworkCoverageRun.id)
         ).scalars()
     )
@@ -301,6 +426,25 @@ def settle_unfinished(db: DbSession, run_id: uuid.UUID, executor_id: str) -> boo
     db.commit()
     log.warning("coverage_executor.unfinished_marked_failed run_id=%s", run_id)
     return True
+
+
+def note_interruption(db: DbSession, run_id: uuid.UUID, executor_id: str, reason: str) -> None:
+    """Record on the run why this execution left it for a resume
+    (`summary.last_interruption`, named in the failure reason if the resume
+    limit is reached). Only while `executor_id` holds the run."""
+    run = db.execute(
+        select(NetworkCoverageRun)
+        .where(NetworkCoverageRun.id == run_id, NetworkCoverageRun.claimed_by == executor_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if run is None:
+        db.rollback()
+        return
+    run.summary = {
+        **(run.summary if isinstance(run.summary, dict) else {}),
+        "last_interruption": {"at": datetime.now(UTC).isoformat(), "reason": reason[:300]},
+    }
+    db.commit()
 
 
 class CoverageExecutor:
@@ -340,7 +484,9 @@ class CoverageExecutor:
         return await asyncio.to_thread(self._db, fn, *args)
 
     async def poll_once(self) -> Claim | None:
-        """Claim one run if this executor has room, and start it."""
+        """Claim one run if this executor has room, and start it. A run this
+        executor is executing is never claimed again by it, even when its
+        own heartbeat is late (with COVERAGE_MAX_CONCURRENT_RUNS >= 2)."""
         limits: Limits = await self._call(read_limits)
         if len(self._active) >= limits.max_concurrent_runs:
             return None
@@ -356,6 +502,7 @@ class CoverageExecutor:
                 executor_id=self.executor_id,
                 max_resumes=max_resumes,
                 stale_after_s=self.stale_after_s,
+                exclude=frozenset(self._active),
             )
 
     async def _execute(self, claim: Claim) -> None:
@@ -368,6 +515,13 @@ class CoverageExecutor:
             beat.cancel()
             self._active.pop(claim.run_id, None)
             raise
+        except runner.RunNeedsResume as exc:
+            # Not failed: left `running` and claimed, with no heartbeat any
+            # more; an executor resumes it once the heartbeat is stale (a
+            # crash resume, so a run that never gets through is bounded).
+            beat.cancel()
+            await self._leave_for_resume(claim.run_id, str(exc))
+            return
         except Exception:
             log.exception("coverage_executor.run_crashed run_id=%s", claim.run_id)
         beat.cancel()
@@ -376,6 +530,20 @@ class CoverageExecutor:
         except Exception:
             log.exception("coverage_executor.settle_failed run_id=%s", claim.run_id)
         self._active.pop(claim.run_id, None)
+
+    async def _leave_for_resume(self, run_id: uuid.UUID, reason: str) -> None:
+        log.warning(
+            "coverage_executor.left_for_resume run_id=%s reason=%s (resumed once its "
+            "heartbeat is %.0f s old)",
+            run_id,
+            reason,
+            self.stale_after_s,
+        )
+        try:
+            await self._call(note_interruption, run_id, self.executor_id, reason)
+        except Exception:
+            log.warning("coverage_executor.note_failed run_id=%s", run_id, exc_info=True)
+        self._active.pop(run_id, None)
 
     async def _heartbeat_loop(self, run_id: uuid.UUID) -> None:
         while True:
@@ -413,8 +581,8 @@ class CoverageExecutor:
                 log.warning("coverage_executor.poll_failed", exc_info=True)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self.poll_s)
-        for task in list(self._active.values()):
-            task.cancel()
+        for task in self._active.values():
+            task.cancel()  # a task leaves `_active` only when it next runs
 
     def stop(self) -> None:
         if self._stop is not None:

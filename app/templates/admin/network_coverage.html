@@ -80,6 +80,7 @@ main {
 .cov-pill[data-status="resuming"]  { background: #ddf4ff; color: #0550ae; border-color: #b6e3ff; }
 .cov-pill[data-status="stopping"]  { background: #eef0f2; color: #57606a; border-color: #d0d7de; }
 .cov-pill[data-status="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+.cov-fail-reason { color: #cf222e; font-size: 12px; }
 /* PR-1 — operator-cancelled runs render in a distinct subdued slate so
    operators can tell at a glance "this was stopped on purpose" vs the
    red 'failed' badge for unexpected crashes. */
@@ -1103,17 +1104,24 @@ function buildRunWindowWarning(run) {
 // one-line addition here without touching the cell builder.
 // #392 — the run's status pill: the API's display status (queued, resuming,
 // stopping) when it has one, else the status; the tooltip says what it means.
+// A failed run also shows why ("failed · resumed 5× · <reason>"), cut short
+// here and whole in the tooltip.
 const RUN_STATUS_HINTS = {
   queued: 'Waiting for the worker to start it.',
   resuming: 'Paused: the worker restarted (e.g. a deploy). It continues where it stopped once the worker is back.',
   stopping: 'Stop requested; the worker is ending the run.',
 };
+const FAILURE_REASON_SHOWN_CHARS = 90;
 function runStatusPill(run) {
   const shown = run.display_status || run.status;
-  const hint = RUN_STATUS_HINTS[shown];
+  const reason = run.failure_reason || '';
+  const hint = RUN_STATUS_HINTS[shown] || reason;
   const resumes = run.resume_count ? ` · resumed ${run.resume_count}×` : '';
+  const short = reason.length > FAILURE_REASON_SHOWN_CHARS
+    ? `${reason.slice(0, FAILURE_REASON_SHOWN_CHARS)}…` : reason;
+  const why = reason ? ` · <span class="cov-fail-reason" title="${escHTML(reason)}">${escHTML(short)}</span>` : '';
   const title = hint ? ` title="${escHTML(hint)}"` : '';
-  return `<span class="cov-pill" data-status="${escHTML(shown)}"${title}>${escHTML(shown)}</span>${escHTML(resumes)}`;
+  return `<span class="cov-pill" data-status="${escHTML(shown)}"${title}>${escHTML(shown)}</span>${escHTML(resumes)}${why}`;
 }
 function runIsLive(run) {
   return run.status === 'running' || run.status === 'pending';

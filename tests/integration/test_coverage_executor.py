@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
-from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -55,7 +54,7 @@ EXEC_B = "zz-host:99:bbbb"
 
 
 @pytest.fixture
-def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[_FakeMotis]:  # noqa: F811
+def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:  # noqa: F811
     from app.journey import planner_dispatch
     from app.network_coverage import runner
 
@@ -65,7 +64,7 @@ def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[_FakeMoti
         pair_parallelism=PAIR_PARALLELISM, within_pair_parallelism=WITHIN_PAIR_PARALLELISM
     )
     monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: cfg)
-    yield fake
+    return fake
 
 
 def _session() -> Any:
@@ -184,14 +183,17 @@ def test_a_row_being_claimed_is_skipped_not_taken_twice(engine: _FakeMotis) -> N
     holder = _session()
     try:
         locked = executor.select_claimable(holder, executor.STALE_AFTER_SECONDS)
-        assert locked is not None and locked.id == run_id
+        assert locked is not None
+        assert locked.id == run_id
         # Another executor, while the first has the row locked: nothing to take.
         assert _claim(EXEC_B) is None
     finally:
         holder.rollback()
         holder.close()
     claim = _claim(EXEC_B)
-    assert claim is not None and claim.run_id == run_id and claim.resumed is False
+    assert claim is not None
+    assert claim.run_id == run_id
+    assert claim.resumed is False
 
 
 def test_racing_executors_only_one_wins(engine: _FakeMotis) -> None:
@@ -237,7 +239,9 @@ def test_fresh_heartbeat_is_not_taken_stale_one_is(engine: _FakeMotis) -> None:
         r=run_id,
     )
     claim = _claim(EXEC_B)
-    assert claim is not None and claim.resumed is True and claim.resume_count == 1
+    assert claim is not None
+    assert claim.resumed is True
+    assert claim.resume_count == 1
     run = _run_row(run_id)
     assert run.claimed_by == EXEC_B
     assert run.summary["resume_count"] == 1
@@ -330,7 +334,8 @@ def test_kill_mid_run_then_resume_gives_the_uninterrupted_results(engine: _FakeM
     resumed_run = _create_run()
     engine.calls = 0
     claim = _claim(EXEC_A)
-    assert claim is not None and claim.run_id == resumed_run
+    assert claim is not None
+    assert claim.run_id == resumed_run
 
     async def _killed() -> None:
         task = asyncio.create_task(runner.execute_run(resumed_run, executor_id=EXEC_A))
@@ -350,7 +355,8 @@ def test_kill_mid_run_then_resume_gives_the_uninterrupted_results(engine: _FakeM
     async def _resume() -> None:
         await asyncio.sleep(0.6)  # A's heartbeat is stale for B
         claim_b = await b.poll_once()
-        assert claim_b is not None and claim_b.resumed is True
+        assert claim_b is not None
+        assert claim_b.resumed is True
         await asyncio.gather(*b._active.values())
 
     asyncio.run(_resume())
@@ -494,13 +500,24 @@ def test_stop_of_a_queued_run_cancels_it_and_nothing_claims_it(engine: _FakeMoti
 # ─────────────────────────────── resume limit, release ───────────────────────────────
 
 
-def test_resume_limit_reached_marks_the_run_failed_with_its_reason(engine: _FakeMotis) -> None:
-    run_id = _create_run()
-    assert _claim(EXEC_A) is not None
+def _crashed_resumes(run_id: uuid.UUID, crashes: int, *, holder: str | None = EXEC_A) -> None:
+    """The run's record says `crashes` crash resumes so far; its holder
+    (None: released) has no heartbeat."""
     _sql(
-        "UPDATE network_coverage_runs SET resume_count = 5, heartbeat_at = NULL WHERE id = :r",
+        "UPDATE network_coverage_runs SET resume_count = :n, claimed_by = :h, heartbeat_at = NULL, "
+        "summary = jsonb_build_object('resume_count', :n, 'crash_resume_count', :n) WHERE id = :r",
+        n=crashes,
+        h=holder,
         r=run_id,
     )
+
+
+def test_resume_limit_reached_marks_the_run_failed_with_its_reason(engine: _FakeMotis) -> None:
+    from app.api.admin.network_coverage import _run_to_summary
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    _crashed_resumes(run_id, 5)
     assert _claim(EXEC_B, max_resumes=5) is None
     run = _run_row(run_id)
     assert run.status == "failed"
@@ -509,30 +526,98 @@ def test_resume_limit_reached_marks_the_run_failed_with_its_reason(engine: _Fake
     assert "COVERAGE_MAX_RESUMES = 5" in run.summary["failure_reason"]
     assert "6 times" in run.summary["failure_reason"]
     assert engine.calls == 0
+    # The page gets the reason with the run (#392 review, S7).
+    summary = _run_to_summary(run)
+    assert summary.failure_reason == run.summary["failure_reason"]
+    assert summary.display_status == "failed"
 
 
 def test_one_resume_under_the_limit_is_still_resumed(engine: _FakeMotis) -> None:
     run_id = _create_run()
     assert _claim(EXEC_A) is not None
-    _sql(
-        "UPDATE network_coverage_runs SET resume_count = 4, heartbeat_at = NULL WHERE id = :r",
-        r=run_id,
-    )
+    _crashed_resumes(run_id, 4)
     claim = _claim(EXEC_B, max_resumes=5)
-    assert claim is not None and claim.resume_count == 5
+    assert claim is not None
+    assert claim.resume_count == 5
+    assert claim.crash is True
+    assert _run_row(run_id).summary["crash_resume_count"] == 5
+
+
+def test_a_released_run_is_resumed_past_the_crash_limit(engine: _FakeMotis) -> None:
+    """A release at a deploy is not a crash: a run at its crash limit is
+    still resumed after a release."""
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    _crashed_resumes(run_id, 5, holder=None)
+    claim = _claim(EXEC_B, max_resumes=5)
+    assert claim is not None
+    assert claim.crash is False
+    run = _run_row(run_id)
+    assert run.status == "running"
+    assert run.summary["crash_resume_count"] == 5
+    assert run.summary["release_resume_count"] == 1
 
 
 def test_release_makes_the_run_claimable_at_once(engine: _FakeMotis) -> None:
+    from app.db import SessionLocal
+    from app.metrics import _coverage_metrics
     from app.network_coverage import executor
 
     run_id = _create_run()
     a = executor.CoverageExecutor(EXEC_A)
     assert _claim(EXEC_A) is not None
+    # A run of hours: its start is long before the release.
+    _sql(
+        "UPDATE network_coverage_runs SET started_at = now() - interval '9 hours' WHERE id = :r",
+        r=run_id,
+    )
     assert a.release() == [run_id]
     run = _run_row(run_id)
-    assert (run.status, run.claimed_by, run.heartbeat_at) == ("running", None, None)
+    assert run.status == "running"
+    assert run.claimed_by is None
+    # The heartbeat keeps the release time, so the gauge (and the
+    # CoverageRunHeartbeatStale alert) count from the release (S8).
+    assert run.heartbeat_at is not None
+    values = {m.name: m.samples[0].value for m in _coverage_metrics(SessionLocal)}
+    assert values["viator_coverage_heartbeat_age_seconds"] < 60
     claim = _claim(EXEC_B)
-    assert claim is not None and claim.resumed is True
+    assert claim is not None
+    assert claim.resumed is True
+    assert claim.crash is False
+
+
+def test_six_releases_then_a_resume_still_complete(engine: _FakeMotis) -> None:
+    """Six deploys during one run (six releases and resumes, over the
+    default COVERAGE_MAX_RESUMES of 5) and the run still completes: only
+    crash resumes count toward the limit (S1)."""
+    from app.network_coverage import executor
+
+    run_id = _create_run()
+    holder = EXEC_A
+    assert _claim(holder) is not None
+    for i in range(6):
+        executor.CoverageExecutor(holder).release()
+        holder = f"zz-host:99:{i:04d}"
+        claim = _claim(holder, max_resumes=5)
+        assert claim is not None
+        assert claim.crash is False
+    executor.CoverageExecutor(holder).release()
+    b = executor.CoverageExecutor(EXEC_B)
+
+    async def _resume() -> None:
+        claim_b = await b.poll_once()
+        assert claim_b is not None
+        assert claim_b.resume_count == 7
+        await asyncio.gather(*b._active.values())
+
+    asyncio.run(_resume())
+    run = _run_row(run_id)
+    assert run.status == "completed"
+    assert run.resume_count == 7
+    assert run.summary["crash_resume_count"] == 0
+    assert run.summary["release_resume_count"] == 7
+    assert [r["kind"] for r in run.summary["resumes"]] == ["release"] * 7
+    _assert_results_unchanged(run_id, engine)
 
 
 def test_a_run_ending_without_a_result_state_is_marked_failed(engine: _FakeMotis) -> None:
@@ -592,4 +677,398 @@ def test_display_status_of_a_paused_run_is_resuming(engine: _FakeMotis) -> None:
     )
     status, age = _display_status(_run_row(run_id))
     assert status == "resuming"
-    assert age is not None and age > 180
+    assert age is not None
+    assert age > 180
+
+
+# ─────────────────────────────── review round 1 (#402) ───────────────────────────────
+
+
+def _stale_heartbeat(run_id: uuid.UUID) -> None:
+    _sql(
+        "UPDATE network_coverage_runs SET heartbeat_at = now() - interval '999 seconds' "
+        "WHERE id = :r",
+        r=run_id,
+    )
+
+
+async def _until_idle(ex: Any) -> None:
+    for _ in range(600):
+        if not ex.active_run_ids:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the executor did not finish its run")
+
+
+def _operational_error() -> Exception:
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError("SELECT 1", {}, Exception("zz-99 server closed the connection"))
+
+
+def test_a_db_blip_as_a_resumed_run_starts_is_retried(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One transient database error in phase 1 of a resume: retried, the run
+    completes in the same execution (S2)."""
+    from app.network_coverage import executor, runner
+
+    monkeypatch.setattr(runner, "_PHASE1_RETRY_DELAYS_S", (0.05,))
+    real = runner._done_pairs_and_recount
+    failures: list[int] = []
+
+    def _once(db: Any, run: Any) -> Any:
+        if not failures:
+            failures.append(1)
+            raise _operational_error()
+        return real(db, run)
+
+    monkeypatch.setattr(runner, "_done_pairs_and_recount", _once)
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    executor.CoverageExecutor(EXEC_A).release()
+    b = executor.CoverageExecutor(EXEC_B)
+
+    async def _resume() -> None:
+        await b.poll_once()
+        await _until_idle(b)
+
+    asyncio.run(_resume())
+    assert failures == [1]
+    run = _run_row(run_id)
+    assert run.status == "completed"
+    assert run.resume_count == 1
+    _assert_results_unchanged(run_id, engine)
+
+
+def test_a_lasting_db_error_as_a_run_starts_leaves_it_for_a_crash_resume(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The database stays unreachable past the retries while a resumed run
+    starts: the run is not failed; it stays running and claimed, and once
+    its heartbeat is stale another executor resumes it (a crash resume) and
+    completes it (S2)."""
+    from app.network_coverage import executor, runner
+
+    monkeypatch.setattr(runner, "_PHASE1_RETRY_DELAYS_S", (0.01, 0.01))
+    real = runner._done_pairs_and_recount
+    down = threading.Event()
+    down.set()
+    attempts: list[int] = []
+
+    def _maybe_down(db: Any, run: Any) -> Any:
+        if down.is_set():
+            attempts.append(1)
+            raise _operational_error()
+        return real(db, run)
+
+    monkeypatch.setattr(runner, "_done_pairs_and_recount", _maybe_down)
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    executor.CoverageExecutor(EXEC_A).release()
+    b = executor.CoverageExecutor(EXEC_B, heartbeat_s=0.1, stale_after_s=0.5)
+
+    async def _left() -> None:
+        assert (await b.poll_once()) is not None
+        await _until_idle(b)
+
+    asyncio.run(_left())
+    assert len(attempts) == 3  # the first try and two retries
+    run = _run_row(run_id)
+    assert run.status == "running"
+    assert run.claimed_by == EXEC_B
+    assert run.finished_at is None
+    assert "database error" in run.summary["last_interruption"]["reason"]
+
+    down.clear()
+    c = executor.CoverageExecutor(EXEC_A, heartbeat_s=0.1, stale_after_s=0.5)
+
+    async def _resume() -> None:
+        await asyncio.sleep(0.7)
+        claim = await c.poll_once()
+        assert claim is not None
+        assert claim.crash is True
+        await _until_idle(c)
+
+    asyncio.run(_resume())
+    run = _run_row(run_id)
+    assert run.status == "completed"
+    assert run.summary["crash_resume_count"] == 1
+    assert run.summary["release_resume_count"] == 1
+    _assert_results_unchanged(run_id, engine)
+
+
+def test_an_executor_never_reclaims_a_run_it_is_executing(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """COVERAGE_MAX_CONCURRENT_RUNS = 2 and the executor's own heartbeat is
+    late (stale for itself): its next poll does not claim its own run again
+    (S3)."""
+    from app.network_coverage import executor
+
+    monkeypatch.setattr("tests.integration.test_coverage_web_health.SLOT_LATENCY_S", 0.5)
+    monkeypatch.setattr(executor, "read_limits", lambda _db: executor.Limits(2, 5))
+    run_id = _create_run()
+    a = executor.CoverageExecutor(EXEC_A, heartbeat_s=60, stale_after_s=0.5)
+
+    async def _scenario() -> Any:
+        assert (await a.poll_once()) is not None
+        await asyncio.to_thread(_stale_heartbeat, run_id)
+        second = await a.poll_once()
+        await _stop_with_stop_click(run_id, a)
+        return second
+
+    assert asyncio.run(_scenario()) is None
+    run = _run_row(run_id)
+    assert run.resume_count == 0
+    assert run.status == "cancelled"
+
+
+def test_a_stop_click_after_the_last_pair_check_still_cancels(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stop clicked once every pair has passed its check (here: when the
+    pairs are done, before the completion): the run ends cancelled, not
+    completed (S4: the final Stop check)."""
+    from app.network_coverage import executor, runner
+
+    real = runner._run_pairs
+
+    async def _pairs_then_click(run_id: uuid.UUID, snap: Any, executor_id: Any) -> bool:
+        ok = await real(run_id, snap, executor_id)
+        await asyncio.to_thread(
+            _sql,
+            "UPDATE network_coverage_runs SET cancel_requested_at = now() WHERE id = :r",
+            r=run_id,
+        )
+        return ok
+
+    monkeypatch.setattr(runner, "_run_pairs", _pairs_then_click)
+    run_id = _create_run()
+    a = executor.CoverageExecutor(EXEC_A)
+
+    async def _scenario() -> None:
+        await a.poll_once()
+        await _until_idle(a)
+
+    asyncio.run(_scenario())
+    run = _run_row(run_id)
+    assert run.status == "cancelled"
+    assert run.summary["cancelled_by_operator"] is True
+    assert run.completed_pairs == PAIRS
+
+
+def test_mark_run_failed_only_while_the_executor_holds_the_run(engine: _FakeMotis) -> None:
+    """S4: the holder guard of the failure write, and its reason."""
+    from app.network_coverage import runner
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    _sql("UPDATE network_coverage_runs SET claimed_by = :b WHERE id = :r", b=EXEC_B, r=run_id)
+    runner._mark_run_failed(run_id, EXEC_A, "zz-99 not mine")
+    run = _run_row(run_id)
+    assert run.status == "running"
+    assert run.finished_at is None
+    runner._mark_run_failed(run_id, EXEC_B, "zz-99 mine")
+    run = _run_row(run_id)
+    assert run.status == "failed"
+    assert run.summary["failure_reason"] == "zz-99 mine"
+    assert "failed_at" in run.summary
+
+
+def test_a_resume_asks_the_frozen_pairs_with_the_frozen_knobs(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hub deactivated and a knob changed between the kill and the resume:
+    the resumed run still asks the pairs and the K-slot grid frozen at its
+    first execution (`execution_snapshot`; S4)."""
+    from app.network_coverage import executor, runner
+
+    reference = _create_run()
+    b = executor.CoverageExecutor(EXEC_B, heartbeat_s=0.1, stale_after_s=0.5)
+
+    async def _uninterrupted() -> None:
+        await b.poll_once()
+        await _until_idle(b)
+
+    asyncio.run(_uninterrupted())
+    expected = _results(reference)
+
+    run_id = _create_run()
+    engine.calls = 0
+    assert _claim(EXEC_A) is not None
+
+    async def _killed() -> None:
+        task = asyncio.create_task(runner.execute_run(run_id, executor_id=EXEC_A))
+        await _wait_for_pairs(run_id, PAIR_PARALLELISM)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _drain_db_executor()
+
+    asyncio.run(_killed())
+    done_at_kill, _rows = _counts(run_id)
+    calls_before_resume = engine.calls
+    _sql("UPDATE network_coverage_hubs SET is_active = FALSE WHERE id = 'zz-hub-7'")
+    changed = runner.CoverageConfig(
+        pair_parallelism=PAIR_PARALLELISM,
+        within_pair_parallelism=WITHIN_PAIR_PARALLELISM,
+        slot_count=3,
+    )
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: changed)
+
+    async def _resume() -> None:
+        await asyncio.sleep(0.6)
+        assert (await b.poll_once()) is not None
+        await _until_idle(b)
+
+    asyncio.run(_resume())
+    run = _run_row(run_id)
+    assert run.status == "completed"
+    assert run.completed_pairs == PAIRS
+    assert engine.calls - calls_before_resume == (PAIRS - done_at_kill) * 6
+    assert _results(run_id) == expected
+
+
+def test_a_pair_whose_write_never_commits_is_asked_again_with_one_search(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One pair's result write fails after its journey search was written in
+    the same transaction (as when the process dies between the two): nothing
+    of the pair is committed, so no orphan search. The completion finds the
+    pair missing and leaves the run for a resume instead of completing it;
+    the resume asks that pair alone, and the run ends with every result row
+    and exactly one journey search per pair (S5, S6)."""
+    from app.network_coverage import executor, runner
+
+    real = runner._persist_pair_coverage_result
+    broken: list[str] = []
+
+    def _fails_once_for_one_pair(**kw: Any) -> None:
+        if kw["origin"].id == "zz-hub-1" and kw["dest"].id == "zz-hub-2" and not broken:
+            broken.append("zz-hub-1→zz-hub-2")
+            raise RuntimeError("zz-99 the write dies here")
+        real(**kw)
+
+    monkeypatch.setattr(runner, "_persist_pair_coverage_result", _fails_once_for_one_pair)
+    searches_before = _journey_searches()
+    run_id = _create_run()
+    a = executor.CoverageExecutor(EXEC_A, heartbeat_s=0.1, stale_after_s=0.5)
+
+    async def _first() -> None:
+        await a.poll_once()
+        await _until_idle(a)
+
+    asyncio.run(_first())
+    assert broken == ["zz-hub-1→zz-hub-2"]
+    run = _run_row(run_id)
+    assert run.status == "running"
+    assert run.completed_pairs == PAIRS - 1
+    assert run.summary["missing_pairs"] == 1
+    assert _journey_searches() - searches_before == PAIRS - 1
+    calls_before_resume = engine.calls
+
+    async def _resume() -> None:
+        await asyncio.sleep(0.7)
+        claim = await a.poll_once()
+        assert claim is not None
+        assert claim.crash is True
+        await _until_idle(a)
+
+    asyncio.run(_resume())
+    run = _run_row(run_id)
+    assert run.status == "completed"
+    assert engine.calls - calls_before_resume == 6
+    assert _journey_searches() - searches_before == PAIRS
+    _assert_results_unchanged(run_id, _FakeMotisCalls(PAIRS * 6))
+
+
+def test_a_transient_error_on_a_pair_write_is_retried(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S6: a dropped connection while a pair is written is retried; the run
+    completes in one execution with every pair once."""
+    from app.network_coverage import executor, runner
+
+    monkeypatch.setattr(runner, "_WRITE_RETRY_DELAYS_S", (0.01, 0.01))
+    real = runner._persist_pair_coverage_result
+    blips: list[int] = []
+
+    def _blip(**kw: Any) -> None:
+        if kw["origin"].id == "zz-hub-3" and len(blips) < 2:
+            blips.append(1)
+            raise _operational_error()
+        real(**kw)
+
+    monkeypatch.setattr(runner, "_persist_pair_coverage_result", _blip)
+    searches_before = _journey_searches()
+    run_id = _create_run()
+    a = executor.CoverageExecutor(EXEC_A)
+
+    async def _scenario() -> None:
+        await a.poll_once()
+        await _until_idle(a)
+
+    asyncio.run(_scenario())
+    assert blips == [1, 1]
+    _assert_results_unchanged(run_id, engine)
+    assert _journey_searches() - searches_before == PAIRS
+
+
+def test_stop_of_a_paused_run_cancels_it_at_once(engine: _FakeMotis) -> None:
+    """Stop clicked while no executor holds the run (released at a deploy,
+    or its holder's heartbeat is stale): web ends it cancelled at once, with
+    exact counters, instead of "stopping" until a worker is back (S9)."""
+    from app.network_coverage import executor, runner
+
+    released = _create_run()
+    assert _claim(EXEC_A) is not None
+
+    async def _some_pairs() -> None:
+        task = asyncio.create_task(runner.execute_run(released, executor_id=EXEC_A))
+        await _wait_for_pairs(released, PAIR_PARALLELISM)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _drain_db_executor()
+
+    asyncio.run(_some_pairs())
+    executor.CoverageExecutor(EXEC_A).release()
+    summary = _stop(released)
+    assert summary.status == "cancelled"
+    run = _run_row(released)
+    assert run.summary["cancelled_by_operator"] is True
+    assert run.summary["cancelled_while_paused"] is True
+    completed, rows = _counts(released)
+    assert 0 < completed == sum(rows.values()) == run.ok_pairs < PAIRS
+
+    stale = _create_run()
+    assert _claim(EXEC_B) is not None
+    _stale_heartbeat(stale)
+    assert _stop(stale).status == "cancelled"
+    assert _claim(EXEC_A) is None
+
+
+def test_stop_of_a_held_run_is_left_to_its_executor(engine: _FakeMotis) -> None:
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    summary = _stop(run_id)
+    assert summary.status == "running"
+    assert summary.display_status == "stopping"
+
+
+def test_a_stopped_run_whose_executor_died_is_cancelled_not_resumed(
+    engine: _FakeMotis,
+) -> None:
+    """Stop clicked while held, then the holder died before it stopped the
+    run: the next claim cancels it instead of resuming it (even at its
+    crash limit, where it would otherwise end failed)."""
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    _crashed_resumes(run_id, 5)
+    _sql("UPDATE network_coverage_runs SET cancel_requested_at = now() WHERE id = :r", r=run_id)
+    assert _claim(EXEC_B, max_resumes=5) is None
+    run = _run_row(run_id)
+    assert run.status == "cancelled"
+    assert run.summary["cancelled_by_operator"] is True
+    assert engine.calls == 0

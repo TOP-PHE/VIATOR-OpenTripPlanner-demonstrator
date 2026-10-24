@@ -9,8 +9,11 @@
 # executor is there to resume the run: the worker is down, crash-looping, or
 # cannot reach the database.
 #
-#   CoverageRunHeartbeatStale  a running run's heartbeat (its start when it has
-#                              none) is older than 15 min, for 5 min
+#   CoverageRunHeartbeatStale  a running run's heartbeat is older than 15 min,
+#                              for 5 min. A released run keeps its release time
+#                              as heartbeat, so the age counts from the release
+#                              (only a run left by web before #392 has none, and
+#                              counts from its start)
 #   CoverageRunNotClaimed      a queued run has waited more than 15 min while no
 #                              run is running (with one run at a time, a queued
 #                              run behind a running one is normal), for 5 min

@@ -301,46 +301,70 @@ async def test_a_stop_click_during_the_db_check_stops_the_pair(monkeypatch) -> N
         runner.clear_cancel(rid)
 
 
+class _Savepoint:
+    def __init__(self, db: _FailingDb) -> None:
+        self.db = db
+
+    def __enter__(self) -> _Savepoint:
+        return self
+
+    def __exit__(self, exc_type: object, *_exc: object) -> None:
+        if exc_type is not None:
+            self.db.rolled_back = True
+            return
+        if self.db.fail_on == "release":
+            self.db.rolled_back = True
+            raise RuntimeError("zz release")
+
+
 class _FailingDb:
+    """The pair write's session: the recorder writes in a savepoint of it
+    (#392), so its failure rolls back the savepoint only."""
+
     def __init__(self, fail_on: str) -> None:
         self.fail_on = fail_on
         self.rolled_back = False
 
-    def __enter__(self) -> _FailingDb:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        return None
+    def begin_nested(self) -> _Savepoint:
+        return _Savepoint(self)
 
     def get(self, *_a: Any) -> None:
         return None
-
-    def commit(self) -> None:
-        if self.fail_on == "commit":
-            raise RuntimeError("zz commit")
-
-    def rollback(self) -> None:
-        self.rolled_back = True
 
 
 class _Search:
     id = uuid.UUID("99999999-9999-4999-8999-999999999999")
 
 
+def _record(db: _FailingDb, prior: str | None = None, status: str = "ok") -> Any:
+    return runner._record_pair_journey_search(
+        db=db,  # type: ignore[arg-type]
+        run_id=uuid.uuid4(),
+        session_id="zz-s",
+        origin=ORIGIN,
+        dest=DEST,
+        depart_at=DEPART,
+        status=status,
+        response_ms=99,
+        raw={},
+        trips=[],
+        error_message=prior,
+    )
+
+
 @pytest.mark.parametrize(
-    ("fail_on", "prior", "expected_id", "expected_message"),
+    ("fail_on", "prior", "expected_message"),
     [
-        ("begin", None, None, "[recorder] RuntimeError: zz begin"),
-        ("begin", "ValueError: zz", None, "ValueError: zz | [recorder] RuntimeError: zz begin"),
-        # As before #392: the id was taken before the commit failed.
-        ("commit", None, _Search.id, "[recorder] RuntimeError: zz commit"),
+        ("begin", None, "[recorder] RuntimeError: zz begin"),
+        ("begin", "ValueError: zz", "ValueError: zz | [recorder] RuntimeError: zz begin"),
+        # #392 — the savepoint is rolled back: no search id for the result row.
+        ("release", None, "[recorder] RuntimeError: zz release"),
     ],
 )
 def test_record_pair_journey_search_reports_a_failed_write(
-    monkeypatch, fail_on, prior, expected_id, expected_message
+    monkeypatch, fail_on, prior, expected_message
 ) -> None:
     db = _FailingDb(fail_on)
-    monkeypatch.setattr(runner, "SessionLocal", lambda: db)
 
     def _begin(_db: Any, **_kw: Any) -> _Search:
         if fail_on == "begin":
@@ -350,25 +374,25 @@ def test_record_pair_journey_search_reports_a_failed_write(
     monkeypatch.setattr(runner.recorder, "begin_search", _begin)
     monkeypatch.setattr(runner.recorder, "finish_search", lambda *_a, **_kw: None)
 
-    result = runner._record_pair_journey_search(
-        run_id=uuid.uuid4(),
-        session_id="zz-s",
-        origin=ORIGIN,
-        dest=DEST,
-        depart_at=DEPART,
-        status="ok",
-        response_ms=99,
-        raw={},
-        trips=[],
-        error_message=prior,
-    )
-    assert result == (expected_id, expected_message)
+    assert _record(db, prior) == (None, expected_message)
     assert db.rolled_back is True
+
+
+def test_record_pair_journey_search_raises_a_transient_db_error(monkeypatch) -> None:
+    """#392 — a dropped connection is not a recorder failure: it is raised so
+    the whole pair write (search + result row) is retried."""
+    from sqlalchemy.exc import OperationalError
+
+    def _begin(_db: Any, **_kw: Any) -> _Search:
+        raise OperationalError("SELECT 1", {}, Exception("zz-99 server closed"))
+
+    monkeypatch.setattr(runner.recorder, "begin_search", _begin)
+    with pytest.raises(OperationalError):
+        _record(_FailingDb("none"))
 
 
 def test_record_pair_journey_search_returns_the_search_id(monkeypatch) -> None:
     db = _FailingDb("none")
-    monkeypatch.setattr(runner, "SessionLocal", lambda: db)
     begun: list[dict[str, Any]] = []
 
     def _begin(_db: Any, **kw: Any) -> _Search:
@@ -378,19 +402,7 @@ def test_record_pair_journey_search_returns_the_search_id(monkeypatch) -> None:
     monkeypatch.setattr(runner.recorder, "begin_search", _begin)
     monkeypatch.setattr(runner.recorder, "finish_search", lambda *_a, **_kw: None)
 
-    result = runner._record_pair_journey_search(
-        run_id=uuid.uuid4(),
-        session_id="zz-s",
-        origin=ORIGIN,
-        dest=DEST,
-        depart_at=DEPART,
-        status="no_route",
-        response_ms=99,
-        raw={},
-        trips=[],
-        error_message=None,
-    )
-    assert result == (_Search.id, None)
+    assert _record(db, status="no_route") == (_Search.id, None)
     assert begun[0]["endpoint"] == "plan"
     assert (begun[0]["origin_label"], begun[0]["dest_label"]) == ("ZZ A", "ZZ B")
     assert begun[0]["requested_time"] == DEPART
@@ -459,9 +471,7 @@ async def test_execute_run_phases_run_off_the_loop(monkeypatch) -> None:
     async def _pair(**_kw: Any) -> None:
         seen["pair_loop"] = asyncio.get_running_loop()
 
-    async def _finalise(
-        *, run_id: uuid.UUID, elapsed_s: float, cfg: Any, executor_id: str | None = None
-    ) -> None:
+    async def _finalise(*, run_id: uuid.UUID, elapsed_s: float, cfg: Any, **_kw: Any) -> None:
         seen["finalise"] = (run_id, threading.get_ident(), asyncio.get_running_loop())
 
     monkeypatch.setattr(runner, "_phase1_snapshot_and_start", _phase1)
@@ -506,5 +516,103 @@ async def test_execute_run_terminal_writes_run_off_the_loop(monkeypatch) -> None
 
     assert calls.names() == ["cancelled", "failed"]
     assert calls.kwargs("cancelled")["run_id"] == stopped
-    assert calls.kwargs("failed")["args"] == (crashed, None)
+    assert calls.kwargs("failed")["args"][:2] == (crashed, None)
+    assert "RuntimeError: zz-99" in calls.kwargs("failed")["args"][2]
     assert web_thread not in calls.threads()
+
+
+# ─────────────────── #402 review — one transaction per pair, retried ───────────────────
+
+
+class _PairSession:
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    def __enter__(self) -> _PairSession:
+        self.log.append("open")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.log.append("close")
+
+    def commit(self) -> None:
+        self.log.append("commit")
+
+
+def _pair_write(monkeypatch, persist) -> tuple[bool, list[str]]:
+    log: list[str] = []
+    monkeypatch.setattr(runner, "SessionLocal", lambda: _PairSession(log))
+    monkeypatch.setattr(runner, "_WRITE_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(runner, "_persist_pair_coverage_result", persist)
+
+    def _record(*, db: Any, **_kw: Any) -> tuple[uuid.UUID, None]:
+        log.append("record")
+        return _Search.id, None
+
+    ok = runner._record_then_persist(
+        _record, {"run_id": uuid.uuid4()}, {"run_id": uuid.uuid4(), "origin": ORIGIN, "dest": DEST}
+    )
+    return ok, log
+
+
+def _db_error(kind: str) -> Exception:
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    orig = Exception(f"zz-99 {kind}")
+    if kind == "unique":
+        return IntegrityError("INSERT", {}, Exception("unique_result_per_run_pair"))
+    if kind == "check":
+        return IntegrityError("INSERT", {}, Exception("zz_check"))
+    return OperationalError("INSERT", {}, orig)
+
+
+def test_pair_write_is_one_transaction(monkeypatch) -> None:
+    seen: list[dict[str, Any]] = []
+    ok, log = _pair_write(monkeypatch, lambda **kw: seen.append(kw))
+    assert ok is True
+    assert log == ["open", "record", "commit", "close"]
+    assert seen[0]["journey_search_id"] == _Search.id
+    assert "db" in seen[0]
+
+
+def test_pair_write_retries_a_dropped_connection(monkeypatch) -> None:
+    failures: list[int] = []
+
+    def _persist(**_kw: Any) -> None:
+        if len(failures) < 2:
+            failures.append(1)
+            raise _db_error("transient")
+
+    ok, log = _pair_write(monkeypatch, _persist)
+    assert ok is True
+    assert log.count("record") == 3
+    assert log.count("commit") == 1
+
+
+def test_pair_write_gives_up_after_the_retries(monkeypatch) -> None:
+    def _persist(**_kw: Any) -> None:
+        raise _db_error("transient")
+
+    ok, log = _pair_write(monkeypatch, _persist)
+    assert ok is False
+    assert log.count("record") == 3
+    assert "commit" not in log
+
+
+@pytest.mark.parametrize(("kind", "written"), [("unique", True), ("check", False)])
+def test_pair_write_integrity_errors(monkeypatch, kind: str, written: bool) -> None:
+    def _persist(**_kw: Any) -> None:
+        raise _db_error(kind)
+
+    ok, log = _pair_write(monkeypatch, _persist)
+    assert ok is written
+    assert log.count("record") == 1
+
+
+def test_pair_write_other_errors_are_not_retried(monkeypatch) -> None:
+    def _persist(**_kw: Any) -> None:
+        raise RuntimeError("zz-99")
+
+    ok, log = _pair_write(monkeypatch, _persist)
+    assert ok is False
+    assert log.count("record") == 1

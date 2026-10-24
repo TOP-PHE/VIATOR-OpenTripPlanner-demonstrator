@@ -228,6 +228,19 @@ fi
 echo "  ✓ regenerated_at_boot event present"
 echo ""
 
+# #392 — coverage runs execute in the worker's coverage executor. Advisory
+# only (a warning, the deploy goes on): without it runs stay queued, and a
+# run paused by this deploy is not resumed.
+echo ">>> coverage executor started in the worker (advisory)"
+worker_log=$(docker compose logs --no-log-prefix --since "$web_recreated_at" worker 2>/dev/null || true)
+if grep -q "coverage_executor.started" <<<"$worker_log"; then
+    echo "  ✓ coverage_executor.started present"
+else
+    echo "WARNING: no coverage_executor.started in the worker log since the recreate:" >&2
+    echo "         coverage runs stay queued (or paused). Check: docker compose logs worker" >&2
+fi
+echo ""
+
 echo ">>> per-session OTP sanity (audit §6.11 step 7)"
 db_sessions=$(docker exec viator-web-1 \
     python -c "from app.worker import _list_serving_sessions; print(_list_serving_sessions())")
