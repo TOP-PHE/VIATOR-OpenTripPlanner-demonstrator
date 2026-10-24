@@ -12,6 +12,7 @@ real chance to come back before the pair is given up on.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -374,6 +375,9 @@ class _NoopFakeDb:
 
     def get(self, *_a, **_kw):
         return None
+
+    def begin_nested(self):
+        return contextlib.nullcontext()
 
     def commit(self):
         pass

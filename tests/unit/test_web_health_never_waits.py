@@ -1,5 +1,5 @@
 """#392 — the health endpoints answer even when every request thread is busy,
-and a run ended by a web restart is named in the web log at startup.
+and web's startup no longer fails coverage runs (they execute in the worker).
 
 `/healthz/version` is the image HEALTHCHECK (10 s timeout, 3 retries). A sync
 handler runs in anyio's request thread pool (40 threads); while sync handlers
@@ -16,8 +16,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
-import uuid
-from typing import Any
 
 import anyio
 import anyio.to_thread
@@ -56,82 +54,18 @@ async def test_health_answers_while_every_request_thread_is_busy() -> None:
         limiter.total_tokens = saved
 
 
-# ───────────────────────────── orphaned runs at startup ─────────────────────────────
+# ─────────────────────── no coverage-run cleanup at startup ───────────────────────
 
 
-class _Log:
-    def __init__(self) -> None:
-        self.warnings: list[tuple[str, dict[str, Any]]] = []
-        self.exceptions: list[str] = []
-
-    def warning(self, event: str, **fields: Any) -> None:
-        self.warnings.append((event, fields))
-
-    def exception(self, event: str, **_fields: Any) -> None:
-        self.exceptions.append(event)
-
-
-class _Db:
-    def __init__(self) -> None:
-        self.commits = 0
-
-    def __enter__(self) -> _Db:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        return None
-
-    def commit(self) -> None:
-        self.commits += 1
-
-
-def _patch(
-    monkeypatch: pytest.MonkeyPatch, run_ids: list[uuid.UUID] | Exception
-) -> tuple[_Log, _Db]:
+def test_web_startup_no_longer_fails_coverage_runs() -> None:
+    """#392 (durable part) — a coverage run executes in the worker's coverage
+    executor, which resumes a run whose heartbeat went stale. Web's startup
+    must not touch coverage runs any more: failing them there is what ended
+    the runs of 21 and 22 Oct."""
+    source = inspect.getsource(main._startup)
+    assert "runner" not in source
+    assert "orphan" not in source
+    assert not hasattr(main, "_fail_orphaned_coverage_runs")
     from app.network_coverage import runner
 
-    log, db = _Log(), _Db()
-
-    def _mark(_db: Any) -> list[uuid.UUID]:
-        if isinstance(run_ids, Exception):
-            raise run_ids
-        return run_ids
-
-    monkeypatch.setattr(main, "log", log)
-    monkeypatch.setattr(main, "SessionLocal", lambda: db)
-    monkeypatch.setattr(runner, "mark_orphaned_runs_as_failed", _mark)
-    return log, db
-
-
-def test_startup_names_the_orphaned_runs_with_a_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    ids = [uuid.UUID(int=99), uuid.UUID(int=199)]
-    log, db = _patch(monkeypatch, ids)
-
-    main._fail_orphaned_coverage_runs()
-
-    ((event, fields),) = log.warnings
-    assert event == "network_coverage.orphans_marked_failed"
-    assert fields["count"] == 2
-    assert fields["run_ids"] == [str(i) for i in ids]
-    for cause in ("deploy", "autoheal", "manual restart"):
-        assert cause in fields["hint"]
-    assert db.commits == 1
-
-
-def test_startup_is_quiet_without_orphaned_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    log, db = _patch(monkeypatch, [])
-
-    main._fail_orphaned_coverage_runs()
-
-    assert log.warnings == []
-    assert db.commits == 0
-
-
-def test_startup_survives_a_failed_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    log, db = _patch(monkeypatch, RuntimeError("zz-99"))
-
-    main._fail_orphaned_coverage_runs()
-
-    assert log.exceptions == ["network_coverage.orphan_cleanup_failed"]
-    assert log.warnings == []
-    assert db.commits == 0
+    assert not hasattr(runner, "mark_orphaned_runs_as_failed")

@@ -72,7 +72,7 @@ exports.svg = () => {
   s.arrow(['worker', 'r'], ['nap', 'r'], { route: 'orth', mid: 786 });
 
   s.text(24, 508, 'Dependencies point downward only. models/ and settings.py import nothing at all — they are the sink of the whole graph.', { size: 10.5 });
-  s.text(24, 526, 'The worker never imports api, journey or network_coverage. Coverage runs execute in the web container, not the worker.', { size: 10.5 });
+  s.text(24, 526, 'The worker never imports api. Since #392 it imports network_coverage (and so journey) to execute coverage runs.', { size: 10.5 });
   s.text(24, 544, 'app/templates and app/static hold no Python; they are assets reached through templating. About a third of api’s imports are function-scope.', { size: 10.5 });
   s.text(24, 570, 'Second exception, not shown: osm_geo ⇄ gtfs_cross_border_filter, a real cycle deliberately broken by a lazy import.', { size: 10.5, italic: true, fill: '#8A96A3' });
 

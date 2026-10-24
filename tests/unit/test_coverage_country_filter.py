@@ -360,7 +360,6 @@ def test_api_post_runs_forwards_countries_to_runner(monkeypatch):
     """The endpoint just plumbs body.countries through — exercise the
     full request → runner pipe so a future refactor that drops the
     kwarg is caught at this layer."""
-    from fastapi import BackgroundTasks
 
     from app.api.admin import network_coverage as api
 
@@ -401,7 +400,6 @@ def test_api_post_runs_forwards_countries_to_runner(monkeypatch):
 
     result = api.create_run(
         body=_make_body(countries=["fr", "CH"]),
-        bg=BackgroundTasks(),
         db=db,
         actor=_fake_actor(),
     )
@@ -414,7 +412,7 @@ def test_api_post_runs_translates_no_matching_hubs_to_400(monkeypatch):
     """runner.create_run raises ValueError when the filter matches no
     hubs. The endpoint should surface that as a 400 with the runner's
     message — operator gets actionable feedback under the picker."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
@@ -429,12 +427,10 @@ def test_api_post_runs_translates_no_matching_hubs_to_400(monkeypatch):
     db.get.return_value = serving_session
 
     body = _make_body(countries=["AT"])
-    bg = BackgroundTasks()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )

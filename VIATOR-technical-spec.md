@@ -834,11 +834,14 @@ The system rejects searches whose original `graph_snapshot.timetable_main_versio
 ### 6.10 Network coverage runs — where they run, and the web's health (#392)
 
 A coverage run (`app/network_coverage/runner.py::execute_run`, the N×N matrix of
-`/admin/network-coverage`) is started by `POST /api/admin/network-coverage/runs` as a FastAPI
-background task **in the `web` process**, on the event loop that also answers every request and the
-image HEALTHCHECK (`GET /healthz/version`, interval 30 s, timeout 10 s, 3 retries).
+`/admin/network-coverage`) is created by `POST /api/admin/network-coverage/runs` (status `pending`)
+and **executed by the worker's coverage executor** (§6.10.1). Until the durable part of #392 it was a
+FastAPI background task in the `web` process, on the event loop that also answers every request and
+the image HEALTHCHECK (`GET /healthz/version`, interval 30 s, timeout 10 s, 3 retries). This section
+first describes that short-term fix, which still holds: the run's loop is now the executor's, which
+also carries the heartbeat.
 
-**Nothing of the run blocks that loop.** The engine calls are awaited I/O and stay on it. Every
+**Nothing of the run blocks its loop.** The engine calls are awaited I/O and stay on it. Every
 database call goes to a dedicated executor of two threads (`runner._off_loop`): phase 1 (run row to
 `running`, config, window, hubs), the DB cancel check (3 s cache answered on the loop, the SELECT in
 the executor), per pair the recorder (journey search, execution, trips, whose trip signatures make
@@ -863,15 +866,94 @@ answering like the engine, 56 pairs, 6 in parallel, 2 slots at a time) measures 
 Results, counters, the order of the writes and the cancel paths (Stop button, status written by SQL)
 are the same; the harness and `tests/unit/test_coverage_off_loop.py` check them.
 
-**A web restart still ends a running run.** The task lives in the process: a deploy, a manual restart
-or any other restart of `web` kills it, and at the next start `mark_orphaned_runs_as_failed` marks it
-`failed` with `summary.orphaned_by_restart = true`; web then logs one WARNING
-`network_coverage.orphans_marked_failed` with the run ids and a hint (a deploy, an autoheal restart
-after failed health checks, or a manual restart). A stop of web during a run (SIGTERM), in the pair
-phase or in the completion phase, still ends in Docker's force-kill after its 10 s stop timeout, as
-before #392 (uvicorn waits for the background task): `Container failed to exit within 10s of signal 15`
-in the dockerd journal is expected then and does not by itself say who stopped web. Moving runs to the
-worker, with a heartbeat and resume, is the durable fix and remains open in #392.
+#### 6.10.1 Runs execute in the worker, and resume after a restart (#392, durable part)
+
+A full run takes many hours (an eu19 run with both directions is 8 742 pairs, ~14 h), so a run inside
+web rarely survived a deploy, an autoheal restart or the unexplained restart of 22 Oct; web's startup
+then marked it failed. Now web never executes a run, and no restart of web ends one.
+
+- **Create.** The route writes the row `pending` and returns. The page shows it **queued** until it is
+  claimed (`RunSummary.display_status`).
+- **Claim.** The coverage executor (`app/network_coverage/executor.py`) is a thread of the worker
+  process (`python -m app.worker`) with its own event loop, so a long graph build never delays a run
+  and a run never delays a build. Every 10 s it reads `COVERAGE_MAX_CONCURRENT_RUNS` (default 1) and,
+  with room, claims one run atomically: `SELECT … FOR UPDATE SKIP LOCKED` on the oldest claimable row
+  (a resume first, then the oldest `pending`), then `status='running'`, `claimed_by` (host:pid:random),
+  `heartbeat_at = now()` and, for a first claim, `started_at`, in the same transaction. A row another
+  executor is claiming is skipped, never waited for; Postgres re-checks the condition on the locked
+  row, so a heartbeat written meanwhile makes it unclaimable. An executor never claims a run it is
+  executing itself (its own `_active` runs are excluded), even when its own heartbeat is late.
+- **Heartbeat.** While it executes the run the executor sets `heartbeat_at = now()` (the database's
+  clock) every 30 s, `WHERE claimed_by = me AND status = 'running'`. If that matches nothing and
+  another executor holds the run, this one stops it with no terminal write (`runner.abandon_run`);
+  the completion phase commits only while its executor still holds the run (row lock).
+- **Resume.** A `running` run with no holder, or whose heartbeat is older than 180 s or missing, is
+  claimable again. It has no holder when the worker released it at SIGTERM (`release_claims`, bounded
+  to 3 s: `claimed_by = NULL`, `heartbeat_at` = the release time; the worker then exits at once, as
+  Docker's force-kill did 10 s later before), or when web started it before this change. The claim
+  of a running run is a resume: `resume_count + 1` and an entry in `summary.resumes` (`resumed_at`,
+  `kind`, `previous_executor`, `last_heartbeat_at`, `completed_pairs`), plus `summary.resume_count`,
+  `crash_resume_count` and `release_resume_count`; the completion keeps them. A **release** resume
+  follows a release; a **crash** resume follows a holder whose heartbeat went stale (killed, crashed,
+  or a run left for a resume, below). `_phase1_snapshot_and_start` then reads the
+  hub ids and runner knobs frozen at the first execution (`execution_snapshot`), so the same pairs are
+  asked on the same K-slot grid with the same `COVERAGE_PAIR_PARALLELISM` /
+  `COVERAGE_WITHIN_PAIR_PARALLELISM`, and the window and depart time come from the row as before. It
+  leaves out the pairs that already have a result row and recomputes the counters from those rows.
+- **Exact counters.** A pair's journey search (in a savepoint, so a recorder failure still leaves the
+  result row), its result row and its counter increments are one transaction
+  (`runner._record_then_persist`), and the unique constraint (run, origin, dest)
+  (`unique_result_per_run_pair`) refuses a second row: a pair in flight at the kill either wrote all
+  of it or nothing, and is asked again in the second case, with no orphan journey search left behind.
+  No pair is counted twice, none is lost, and the results equal an uninterrupted run's
+  (`tests/integration/test_coverage_executor.py` kills a run, resumes it and compares).
+- **Completion** (recount, optional verify sweep, one commit) runs in the executor and is idempotent:
+  interrupted, it leaves the run `running`; the resume finds no pair left and runs it again. It
+  completes the run only when every pair of the frozen pair set has its result row; otherwise it
+  notes `summary.missing_pairs` and leaves the run for a resume, which asks those pairs.
+- **Transient database errors.** Phase 1 (the start, or a resume) is retried after 1, 2 and 4 s, and a
+  pair's write after 0.5, 1 and 2 s, on a dropped connection (`OperationalError`, `InterfaceError`).
+  Past that the execution ends with `runner.RunNeedsResume`: no terminal write, the run stays
+  `running` and claimed (`summary.last_interruption`), and once its heartbeat is stale an executor
+  resumes it as a crash resume. A pair whose write still failed has no result row and is asked again.
+- **Bound.** Past `COVERAGE_MAX_RESUMES` crash resumes (default 5, read at each poll) the next stale
+  claim marks the run `failed` with `summary.resume_limit_reached = true` and a `failure_reason`
+  (naming `missing_pairs` and the last interruption when set), instead of resuming it again: a run that
+  keeps killing its worker must not loop forever. Release resumes (deploys) never count.
+- **Stop.** `POST …/stop` stamps `cancel_requested_at` on a running run (display **stopping**); the
+  runner's per-pair DB check (3 s cache) reads it and raises the in-process Stop, so the run ends
+  `cancelled` with `summary.cancelled_by_operator` as before. A queued run is cancelled by the route at
+  once (`summary.cancelled_while_queued`), and so is a running run no live executor holds
+  (`executor.cancel_unheld_run`: released or stale, under the row lock, counters recounted,
+  `summary.cancelled_while_paused`); a claim that finds a paused run with a Stop click cancels it
+  instead of resuming it. As before, a Stop during the completion phase does not
+  interrupt it (the run ends `completed`). Delete stays refused for a running run and locks the row,
+  so it cannot race a claim.
+- **Web startup** no longer touches runs: `mark_orphaned_runs_as_failed` and its WARNING are gone. Runs
+  already failed with `summary.orphaned_by_restart` stay as they are.
+- **Migration** `20261023_1200_coverage_claim` adds `claimed_by`, `heartbeat_at`, `resume_count`
+  (default 0), `cancel_requested_at`, `execution_snapshot` and the index on `status`; nulls on existing
+  rows, reversible.
+- **What the owner sees at a deploy.** The deploy recreates web and the worker. The run is released
+  (or goes stale), shows **resuming** while no worker holds it (a running row with no holder, or a
+  heartbeat older than 180 s), and continues where it stopped once the new worker polls (about 10 s after it
+  starts; ~3 min plus a poll if the release failed). The matrix keeps its cells meanwhile; the cell
+  count goes on from where it was.
+- **Failure reason.** `RunSummary.failure_reason` carries `summary.failure_reason` of a failed run;
+  the page shows "failed · resumed N× · *reason*" (the whole text in the tooltip).
+- **Observability.** Worker log lines `coverage_executor.started`, `.claimed`, `.resumed` (kind and
+  heartbeat age), `.resume_skips` (pairs done / to run), `.resume_limit_reached`, `.left_for_resume`,
+  `.cancelled_while_paused`, `.claim_lost`, `.released`, `.heartbeat_failed`, `.poll_failed`. Web's DB collector exports `viator_coverage_runs_queued`,
+  `viator_coverage_runs_running`, `viator_coverage_oldest_queued_age_seconds`,
+  `viator_coverage_heartbeat_age_seconds` and `viator_coverage_resumes_total` (computed at scrape time
+  with the database's clock). Alerts (`docker/prometheus/rules/coverage.yml`, unit-tested by
+  `promtool test rules` in CI): `CoverageRunHeartbeatStale` (heartbeat older than 15 min for 5 min: no
+  worker to resume the run; a released run's age counts from its release) and `CoverageRunNotClaimed` (a queued run waiting 15 min while none runs).
+
+Why a thread of the worker rather than a separate compose service: one process and one image to
+deploy, no new service in `bin/viator-deploy.sh` or the install guide, and the two loops are
+independent (builds are synchronous `docker run` calls on the main thread). The price is that the
+coverage code shares a process with the Docker socket; it parses only engine and ÖBB answers.
 
 ---
 
@@ -1881,7 +1963,9 @@ Scrape from a Prometheus running outside the VPS — don't run Prometheus on the
 | Symptom | Likely cause | First-response fix |
 |---|---|---|
 | `web` container restart-loops | Migration failure on startup | `docker compose logs web` — look for alembic error. If "table already exists" mismatch, manually run `alembic stamp head` and investigate. |
-| A coverage run ends `failed`, `summary.orphaned_by_restart = true` | `web` restarted during the run (deploy, autoheal after failed health checks, manual); the run lives in the web process (§6.10) | `docker compose logs web \| grep orphans_marked_failed` names the runs; find the restart in `docker inspect viator-web-1` (`StartedAt`) and the dockerd journal; start the run again. |
+| A coverage run ends `failed`, `summary.orphaned_by_restart = true` | Only runs from before #392's durable part: `web` restarted during the run, which then lived in the web process (§6.10) | Start the run again; a run started now survives restarts (§6.10.1). |
+| A coverage run shows "resuming" for more than a few minutes | No worker holds it: the worker is down, crash-looping or cannot reach the database (alert `CoverageRunHeartbeatStale` at 15 min) | `docker compose -p viator ps worker`; `docker compose -p viator logs worker \| grep coverage_executor`; the run resumes when the worker is back. |
+| A coverage run ends `failed`, `summary.resume_limit_reached = true` | Its worker stopped without releasing it more than `COVERAGE_MAX_RESUMES` times during the run (crash loop, OOM, a database outage; deploys do not count). The page shows the reason | Read `summary.resumes` and the worker log at those times; fix the cause, or raise the knob, and start the run again. |
 | `otp-<sid>` restart-loops with `OutOfMemoryError` | `OTP_SERVE_HEAP` < graph size | Raise `OTP_SERVE_HEAP` in `.env`, `docker compose up -d otp-<sid>`. Long-term: that session's graph has grown — consider splitting it. |
 | `otp-build` killed by OOM-killer (exit 137) | VPS RAM too small for that bundle | Either upgrade VPS, use a regional GTFS only, or temporarily raise swap (`fallocate -l 16G /swapfile && mkswap /swapfile && swapon /swapfile`). |
 | First request to OTP returns 503 | Graph not loaded yet | Wait for `Grizzly server running.` in `docker compose logs otp-<sid>`. Cold load takes 30–90 s for national. |

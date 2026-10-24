@@ -8,6 +8,12 @@ The worker also watches for the reload-trigger file written by
 `POST /api/sessions/<sid>/promote` — when present, runs `docker compose up`
 and `nginx -s reload` so per-session planner containers (otp-<sid> /
 motis-<sid>) come online without the operator having to shell in.
+
+#392 — the worker also executes network coverage runs: the coverage executor
+(`app/network_coverage/executor.py`) is a thread with its own event loop,
+started by `main()`, so a long build never delays a run and a run never
+delays a build. At SIGTERM (a deploy recreates the worker) it releases its
+runs, which the next worker resumes.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -335,6 +342,9 @@ def main() -> None:
     # previous worker died mid-build before its `finally` could run.
     _recover_max_memory_stopped()
 
+    # #392 — coverage runs execute here, beside the build loop.
+    _start_coverage_executor()
+
     while True:
         try:
             tick()
@@ -345,6 +355,29 @@ def main() -> None:
         # timing (v0.1.11). config_service caches for 30 s so a save in the
         # UI takes up to ~30 s + the previous tick's interval to take effect.
         time.sleep(_tick_seconds())
+
+
+def _start_coverage_executor() -> None:
+    """Start the coverage executor thread and release its runs at SIGTERM.
+
+    The handler releases the claims (bounded wait, see
+    `CoverageExecutor.release`), then ends the process at once. Before #392
+    SIGTERM did nothing to this process (PID 1 of its container, no handler)
+    and Docker killed it 10 s later; ending now has the same effect, sooner:
+    a build's `docker run` is abandoned as before and its container is
+    killed by the next worker's startup. Without the release a run would
+    resume anyway, once its heartbeat is stale (3 minutes)."""
+    from .network_coverage.executor import CoverageExecutor
+
+    executor = CoverageExecutor()
+    executor.start()
+
+    def _on_sigterm(signum: int, _frame: object) -> None:
+        executor.release()
+        logging.shutdown()
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 def _tick_seconds() -> int:

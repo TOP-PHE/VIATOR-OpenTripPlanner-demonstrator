@@ -67,6 +67,40 @@ def _make_run_row(run_id: uuid.UUID | None = None, *, status: str = "running"):
     return r
 
 
+@pytest.fixture
+def stop_endpoint(monkeypatch):
+    """The Stop endpoint without a database: the coverage config (read for
+    the returned summary) is a constant, so no `SELECT platform_config` lands
+    on the MagicMock session whatever the config cache holds, and the
+    cancel of an unheld run (its own SQL, tested on PostgreSQL in
+    tests/integration/test_coverage_executor.py) is recorded, answering
+    "held"."""
+    from app.network_coverage import executor
+
+    unheld_calls: list[uuid.UUID] = []
+
+    def _cancel_unheld(_db, run_id):
+        unheld_calls.append(run_id)
+        return False
+
+    monkeypatch.setattr(runner, "_load_coverage_config", lambda _db: runner.CoverageConfig())
+    monkeypatch.setattr(executor, "cancel_unheld_run", _cancel_unheld)
+    return unheld_calls
+
+
+def _executed_sql(db) -> list[str]:
+    """Every statement the endpoint executed on the MagicMock session."""
+    return [_compiled(c.args[0]) for c in db.execute.call_args_list]
+
+
+def _stop_click_updates(db) -> list[str]:
+    return [
+        sql
+        for sql in _executed_sql(db)
+        if sql.startswith("UPDATE network_coverage_runs SET cancel_requested_at=now()")
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_cancel_registry():
     """Ensure no stale cancel events leak between tests — the registry
@@ -146,12 +180,11 @@ def test_stop_endpoint_404_when_run_unknown():
     assert "run" in str(exc.value.detail).lower()
 
 
-@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled", "pending"])
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
 def test_stop_endpoint_409_when_run_not_running(terminal_status):
-    """Stop is only meaningful for in-flight runs. Terminal states +
-    'pending' (queued but not yet picked up by the worker) get 409 with
-    a descriptive message — operators can see WHY their click bounced
-    instead of guessing whether the endpoint is broken."""
+    """Stop is only meaningful for in-flight or queued runs. Terminal states
+    get 409 with a descriptive message — operators can see WHY their click
+    bounced instead of guessing whether the endpoint is broken."""
     from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
@@ -169,53 +202,103 @@ def test_stop_endpoint_409_when_run_not_running(terminal_status):
         )
     assert exc.value.status_code == 409
     assert terminal_status in str(exc.value.detail)
+    db.execute.assert_not_called()
 
 
-def test_stop_endpoint_200_fires_cancel_signal_and_returns_summary():
-    """The happy path — a 'running' run with a registered cancel event:
-    the endpoint sets the event AND returns the run summary so the UI
-    can re-render the row immediately."""
+def _compiled(stmt) -> str:
+    from sqlalchemy.dialects import postgresql
+
+    return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+def test_stop_endpoint_records_the_stop_click_in_the_db_and_returns_summary(stop_endpoint):
+    """#392 — the run executes in the worker, so the Stop click goes through
+    the database: one conditional UPDATE stamps `cancel_requested_at` on a
+    running run; the endpoint returns the row's summary, still 'running'
+    (the executor confirms the stop a beat later). No in-process signal.
+    Then, as the run may be paused with no executor holding it, the endpoint
+    asks for it to be cancelled at once if so (here it is held)."""
     from app.api.admin import network_coverage as api
 
     run = _make_run_row(status="running")
     db = MagicMock()
     db.get.return_value = run
-    runner.register_cancel(run.id)
 
     resp = api.stop_run(run_id=run.id, db=db, _=_fake_actor())
 
-    # The runner's cancel event must now be set so the next per-pair
-    # check observes it. This is the contract that makes the Stop
-    # button actually stop anything.
-    assert runner.is_cancelled(run.id) is True
-    # The endpoint returns the row's current summary verbatim — status
-    # still reads 'running' here because the runner hasn't observed the
-    # signal yet. The UI's 5s poll picks up the 'cancelled' flip shortly.
+    (sql,) = _stop_click_updates(db)
+    assert "network_coverage_runs.status = %(status_1)s" in sql
+    assert "cancel_requested_at IS NULL" in sql
+    db.commit.assert_called_once()
+    assert stop_endpoint == [run.id]
     assert resp.id == str(run.id)
     assert resp.status == "running"
+    assert runner.is_cancelled(run.id) is False
 
 
-def test_stop_endpoint_does_not_mutate_run_status_directly():
-    """Defensive — the endpoint MUST NOT flip status='cancelled' on the
-    row itself. That write belongs to the runner, which makes it once
-    it has observed the signal and finished the in-flight pair's persist.
-    If the endpoint wrote it, the row could read 'cancelled' while the
-    worker was still mid-pair, leaving a fresh cell row attached to a
-    'cancelled' parent run."""
+def test_stop_endpoint_does_not_mutate_run_status_directly(stop_endpoint):
+    """Defensive — the endpoint MUST NOT flip status='cancelled' on a
+    running row itself. That write belongs to the runner, which makes it
+    once it has observed the signal and finished the in-flight pair's
+    persist. If the endpoint wrote it, the row could read 'cancelled' while
+    the worker was still mid-pair."""
     from app.api.admin import network_coverage as api
 
     run = _make_run_row(status="running")
     db = MagicMock()
     db.get.return_value = run
-    runner.register_cancel(run.id)
 
     api.stop_run(run_id=run.id, db=db, _=_fake_actor())
 
-    # The mock attr is still the original 'running' string — no
-    # endpoint-side assignment took place.
     assert run.status == "running"
-    # And the endpoint does NOT call db.commit() — no DB write at all.
-    db.commit.assert_not_called()
+    for sql in _executed_sql(db):
+        assert "status=" not in sql.split(" WHERE ")[0]
+
+
+def test_stop_endpoint_cancels_a_queued_run_at_once(stop_endpoint):
+    """#392 — a run no executor has claimed yet (`pending`, shown queued)
+    is cancelled by the endpoint in one conditional UPDATE, with the same
+    `cancelled_by_operator` marker the runner writes."""
+    from app.api.admin import network_coverage as api
+
+    run = _make_run_row(status="pending")
+    db = MagicMock()
+    db.get.return_value = run
+    db.execute.return_value.scalar_one_or_none.return_value = run.id
+
+    api.stop_run(run_id=run.id, db=db, _=_fake_actor())
+
+    (stmt,) = db.execute.call_args.args
+    sql = _compiled(stmt)
+    assert stop_endpoint == []
+    assert "status=%(status)s" in sql
+    assert "WHERE network_coverage_runs.id = %(id_1)s::UUID AND network_coverage_runs.status" in sql
+    params = stmt.compile().params
+    assert params["status"] == "cancelled"
+    assert params["summary"]["cancelled_by_operator"] is True
+    assert params["summary"]["cancelled_while_queued"] is True
+    db.commit.assert_called_once()
+
+
+def test_stop_endpoint_queued_run_claimed_meanwhile_gets_the_stop_click(stop_endpoint):
+    """The conditional UPDATE of a queued run found nothing (an executor
+    claimed it meanwhile): the run is running now and gets the stop click."""
+    from app.api.admin import network_coverage as api
+
+    run = _make_run_row(status="pending")
+    db = MagicMock()
+    db.get.return_value = run
+    db.execute.return_value.scalar_one_or_none.return_value = None
+
+    def _now_running(_row):
+        run.status = "running"
+
+    db.refresh.side_effect = _now_running
+
+    api.stop_run(run_id=run.id, db=db, _=_fake_actor())
+
+    assert len(_stop_click_updates(db)) == 1
+    assert stop_endpoint == [run.id]
 
 
 # ─────────────────────── runner cancel-loop integration ───────────────────────
@@ -670,7 +753,7 @@ async def test_execute_run_cancelled_mid_loop_persists_partial(monkeypatch):
 
     finalise_calls: list[float] = []
 
-    async def _finalise(*, run_id, elapsed_s, cfg):
+    async def _finalise(*, run_id, elapsed_s, cfg, **_kw):
         finalise_calls.append(elapsed_s)
 
     monkeypatch.setattr(runner, "_persist_cancelled_run", _persist)
@@ -699,7 +782,7 @@ async def test_execute_run_happy_path_calls_finalise(monkeypatch):
 
     finalise_calls: list[float] = []
 
-    async def _finalise(*, run_id, elapsed_s, cfg):
+    async def _finalise(*, run_id, elapsed_s, cfg, **_kw):
         finalise_calls.append(elapsed_s)
 
     monkeypatch.setattr(runner, "_finalise_completed_run", _finalise)
@@ -725,8 +808,9 @@ class _StatusFakeSession:
     query, and counts how many times `.execute()` is called so the
     cache-TTL test can assert hit/miss behaviour."""
 
-    def __init__(self, status: str | None):
+    def __init__(self, status: str | None, cancel_requested_at: datetime | None = None):
         self.status = status
+        self.cancel_requested_at = cancel_requested_at
         self.execute_call_count = 0
 
     def __call__(self):
@@ -741,7 +825,8 @@ class _StatusFakeSession:
     def execute(self, _stmt):
         self.execute_call_count += 1
         result = MagicMock()
-        result.scalar_one_or_none.return_value = self.status
+        row = None if self.status is None else (self.status, self.cancel_requested_at)
+        result.one_or_none.return_value = row
         return result
 
 
@@ -755,6 +840,39 @@ def test_is_cancelled_in_db_returns_true_for_cancelled_status(monkeypatch):
     cache: dict = {}
     rid = uuid.uuid4()
     assert runner._is_cancelled_in_db(rid, cache) is True
+
+
+def test_is_cancelled_in_db_reads_a_stop_click_written_by_web(monkeypatch):
+    """#392 — web's Stop writes `cancel_requested_at` on a running run: the
+    DB check answers True and records the run, so `_run_stopped` turns it
+    into the in-process Stop (the run then ends `cancelled`)."""
+    fake_session = _StatusFakeSession(status="running", cancel_requested_at=datetime.now(UTC))
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+    rid = uuid.uuid4()
+    try:
+        assert runner._is_cancelled_in_db(rid, {}) is True
+        assert rid in runner._STOP_REQUESTED_IN_DB
+    finally:
+        runner._STOP_REQUESTED_IN_DB.discard(rid)
+
+
+@pytest.mark.asyncio
+async def test_run_stopped_turns_a_db_stop_click_into_the_in_process_stop(monkeypatch):
+    fake_session = _StatusFakeSession(status="running", cancel_requested_at=datetime.now(UTC))
+    monkeypatch.setattr(runner, "SessionLocal", fake_session)
+    rid = uuid.uuid4()
+    runner.register_cancel(rid)
+    try:
+        assert await runner._run_stopped(rid, {}) is True
+        assert runner.is_cancelled(rid) is True
+    finally:
+        runner.clear_cancel(rid)
+        runner._STOP_REQUESTED_IN_DB.discard(rid)
+
+
+def test_is_cancelled_in_db_unknown_run_is_not_cancelled(monkeypatch):
+    monkeypatch.setattr(runner, "SessionLocal", _StatusFakeSession(status=None))
+    assert runner._is_cancelled_in_db(uuid.uuid4(), {}) is False
 
 
 def test_is_cancelled_in_db_returns_false_for_running_status(monkeypatch):
@@ -807,8 +925,9 @@ async def test_execute_run_gather_exception_routes_to_mark_failed(monkeypatch):
 
     failed_calls: list[uuid.UUID] = []
 
-    def _mark(run_id):
+    def _mark(run_id, executor_id=None, reason=None):
         failed_calls.append(run_id)
+        assert "simulated planner crash" in reason
 
     monkeypatch.setattr(runner, "_mark_run_failed", _mark)
 

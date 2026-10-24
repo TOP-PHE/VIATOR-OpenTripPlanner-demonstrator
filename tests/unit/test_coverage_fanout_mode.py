@@ -427,18 +427,16 @@ def _fake_run_row(**overrides):
 def test_api_post_runs_rejects_invalid_direction():
     """The route checks direction BEFORE any DB lookups, so a bad value
     fast-fails with 400 and no session_id resolution."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
     body = _make_run_create_body(direction="sideways")
-    bg = BackgroundTasks()
     db = MagicMock()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -449,18 +447,16 @@ def test_api_post_runs_rejects_invalid_direction():
 def test_api_post_runs_single_session_missing_session_id_400():
     """mode=single_session with no session_id → 400 from the API
     layer (before the runner sees it)."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
     body = _make_run_create_body(session_id=None)
-    bg = BackgroundTasks()
     db = MagicMock()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -470,19 +466,17 @@ def test_api_post_runs_single_session_missing_session_id_400():
 
 def test_api_post_runs_single_session_unknown_session_404():
     """db.get(SessionRow, ...) returns None → 404."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
     db = MagicMock()
     db.get.return_value = None
     body = _make_run_create_body(session_id="missing-session")
-    bg = BackgroundTasks()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -491,7 +485,7 @@ def test_api_post_runs_single_session_unknown_session_404():
 
 def test_api_post_runs_single_session_not_serving_400():
     """Session exists but its state isn't 'serving' → 400 with explanation."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
@@ -500,12 +494,10 @@ def test_api_post_runs_single_session_not_serving_400():
     session_row.state = "building"
     db.get.return_value = session_row
     body = _make_run_create_body()
-    bg = BackgroundTasks()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -515,18 +507,16 @@ def test_api_post_runs_single_session_not_serving_400():
 
 def test_api_post_runs_fanout_with_session_id_400():
     """mode=fanout MUST NOT carry a session_id."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
     body = _make_run_create_body(mode="fanout", session_id="nap-fr-rail")
-    bg = BackgroundTasks()
     db = MagicMock()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -539,7 +529,7 @@ def test_api_post_runs_fanout_no_eligible_session_409(monkeypatch):
     The route runs the SELECT for an eligible session at create time so
     the UI gets a meaningful "you have no fanout sessions" failure
     instead of a 'failed' run row in the sidebar."""
-    from fastapi import BackgroundTasks, HTTPException
+    from fastapi import HTTPException
 
     from app.api.admin import network_coverage as api
 
@@ -549,12 +539,10 @@ def test_api_post_runs_fanout_no_eligible_session_409(monkeypatch):
     eligible_chain.scalars.return_value.first.return_value = None
     db.execute.return_value = eligible_chain
     body = _make_run_create_body(mode="fanout", session_id=None)
-    bg = BackgroundTasks()
     actor = _fake_actor()
     with pytest.raises(HTTPException) as exc:
         api.create_run(
             body=body,
-            bg=bg,
             db=db,
             actor=actor,
         )
@@ -564,7 +552,6 @@ def test_api_post_runs_fanout_no_eligible_session_409(monkeypatch):
 def test_api_post_runs_single_session_happy_path_returns_summary(monkeypatch):
     """All gates pass → runner.create_run is called and the response
     summary echoes the run row's mode and session_id."""
-    from fastapi import BackgroundTasks
 
     from app.api.admin import network_coverage as api
     from app.models.sessions import SessionState
@@ -580,7 +567,6 @@ def test_api_post_runs_single_session_happy_path_returns_summary(monkeypatch):
 
     summary = api.create_run(
         body=_make_run_create_body(),
-        bg=BackgroundTasks(),
         db=db,
         actor=_fake_actor(),
     )
@@ -591,7 +577,6 @@ def test_api_post_runs_single_session_happy_path_returns_summary(monkeypatch):
 def test_api_post_runs_fanout_happy_path_returns_summary(monkeypatch):
     """mode=fanout, eligible session exists → runner.create_run gets the
     fanout mode and the response carries mode='fanout'."""
-    from fastapi import BackgroundTasks
 
     from app.api.admin import network_coverage as api
 
@@ -606,7 +591,6 @@ def test_api_post_runs_fanout_happy_path_returns_summary(monkeypatch):
 
     summary = api.create_run(
         body=_make_run_create_body(mode="fanout", session_id=None),
-        bg=BackgroundTasks(),
         db=db,
         actor=_fake_actor(),
     )
