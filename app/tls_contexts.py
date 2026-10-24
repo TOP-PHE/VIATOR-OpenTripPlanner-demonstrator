@@ -109,8 +109,10 @@ def _env_proxy(url: str) -> str | None:
     if not proxy:
         return None
     # As httpx does for its own environment proxies: a value without a scheme
-    # (`p.example:3128`) means an http:// proxy, never a ValueError.
-    return proxy if "://" in proxy else f"http://{proxy}"
+    # (`p.example:3128`) means an http:// proxy, never a ValueError (httpx.Proxy
+    # refuses a value without a scheme). S5332 false positive: the TLS session
+    # to the AT host goes end to end through this proxy's CONNECT tunnel.
+    return proxy if "://" in proxy else f"http://{proxy}"  # NOSONAR python:S5332
 
 
 def mounts_for(
