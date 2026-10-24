@@ -257,9 +257,10 @@ def cancel_unheld_run(
     if run is None:
         db.rollback()
         return False
+    cancelled_id = run.id  # the row's id, not the request's value (log injection)
     cancel_on_row(db, run, datetime.now(UTC))
     db.commit()
-    log.warning("coverage_executor.cancelled_while_paused run_id=%s", run_id)
+    log.warning("coverage_executor.cancelled_while_paused run_id=%s", cancelled_id)
     return True
 
 

@@ -387,8 +387,9 @@ def test_record_pair_journey_search_raises_a_transient_db_error(monkeypatch) -> 
         raise OperationalError("SELECT 1", {}, Exception("zz-99 server closed"))
 
     monkeypatch.setattr(runner.recorder, "begin_search", _begin)
+    db = _FailingDb("none")
     with pytest.raises(OperationalError):
-        _record(_FailingDb("none"))
+        _record(db)
 
 
 def test_record_pair_journey_search_returns_the_search_id(monkeypatch) -> None:
