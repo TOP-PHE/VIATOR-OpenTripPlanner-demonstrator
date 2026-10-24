@@ -131,8 +131,9 @@ def test_the_executor_loop_closes_its_motis_client_when_it_stops(
     assert clients[0].is_closed
 
     fail = True
+    serve_then_close = ex._serve_then_close()
     with pytest.raises(RuntimeError, match="zz-99"):
-        asyncio.run(ex._serve_then_close())
+        asyncio.run(serve_then_close)
     assert len(clients) == 2
     assert clients[1].is_closed
 
