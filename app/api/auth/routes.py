@@ -17,13 +17,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from ... import audit, config_service
 from ...auth import email as email_sender
 from ...auth import passwords, tokens
 from ...auth.grafana_role_map import viator_role_to_grafana
 from ...db import get_db
+from ...db_steps import db_step
 from ...models import PasswordResetToken, User, VerificationToken
 from ...rate_limit import limiter
 from ...security import CurrentUser, client_ip, current_user_jwt
@@ -123,7 +123,7 @@ async def register_request(
     #397 — the database work runs in the thread pool; only the email send
     is awaited on the event loop.
     """
-    raw = await run_in_threadpool(_register_token, db, body, client_ip(request))
+    raw = await db_step(_register_token, db, body, client_ip(request))
     if raw is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     magic_link = f"{settings.public_base_url.rstrip('/')}/confirm/{raw}"
@@ -359,7 +359,7 @@ async def password_reset_request(
 ) -> Response:
     """#397 — the database work runs in the thread pool; only the email send
     is awaited on the event loop."""
-    reset = await run_in_threadpool(_reset_token, db, body, client_ip(request))
+    reset = await db_step(_reset_token, db, body, client_ip(request))
     if reset is not None:
         to_email, name, raw = reset
         magic_link = f"{settings.public_base_url.rstrip('/')}/reset/{raw}"

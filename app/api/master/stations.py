@@ -45,10 +45,10 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session as DbSession
-from starlette.concurrency import run_in_threadpool
 
 from ... import audit, station_module
 from ...db import get_db
+from ...db_steps import db_step
 from ...master import trainline
 from ...security import CurrentUser, client_ip, require_content_manager
 from .. import station_suggest
@@ -116,7 +116,7 @@ async def refresh_trainline(
     actor: Annotated[CurrentUser, Depends(require_content_manager)],
 ) -> dict[str, int]:
     counts = await trainline.refresh(db)
-    await run_in_threadpool(_audit_refresh, db, actor, client_ip(request), counts)
+    await db_step(_audit_refresh, db, actor, client_ip(request), counts)
     return counts
 
 

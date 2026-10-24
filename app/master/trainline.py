@@ -44,6 +44,7 @@ import httpx
 from sqlalchemy import CursorResult, select, update
 from sqlalchemy.orm import Session as DbSession
 
+from ..db_steps import db_step
 from ..models import MasterStation, MasterStationPendingDrift
 
 log = logging.getLogger(__name__)
@@ -301,9 +302,10 @@ async def fetch_csv() -> str:
 async def refresh(db: DbSession) -> dict[str, int]:
     """Fetch + parse + upsert. Used by the admin "refresh Trainline" button + cron.
 
-    #397 — the parse (a CSV of tens of thousands of rows) and the upsert
-    (blocking database work) run in a worker thread, one after the other,
-    never on the event loop; only the download is awaited there."""
+    #397 — the parse (a CSV of tens of thousands of rows, asyncio's default
+    executor) and the upsert (blocking database work on `db`, `db_step`) run
+    in worker threads, one after the other, never on the event loop; only
+    the download is awaited there."""
     content = await fetch_csv()
     parsed, parent_uic_map = await asyncio.to_thread(parse_csv, content)
     log.info(
@@ -311,4 +313,4 @@ async def refresh(db: DbSession) -> dict[str, int]:
         len(parsed),
         len(parent_uic_map),
     )
-    return await asyncio.to_thread(upsert_with_drift_protection, db, parsed, parent_uic_map)
+    return await db_step(upsert_with_drift_protection, db, parsed, parent_uic_map)

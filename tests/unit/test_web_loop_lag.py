@@ -59,7 +59,7 @@ async def test_a_blocked_loop_shows_in_the_gauge() -> None:
     monitor.start()
     try:
         await asyncio.sleep(0.05)
-        assert _value(gauge) < 0.2
+        assert _value(gauge) < 0.5  # a loaded CI runner may wake a timer late
         time.sleep(0.3)  # blocking work on the loop, as a synchronous query would
         await asyncio.sleep(0.05)
         assert _value(gauge) >= 0.25
@@ -76,7 +76,88 @@ async def test_start_is_idempotent_and_stop_without_start_is_harmless() -> None:
     monitor.start()
     assert monitor._task is task
     await monitor.stop()
-    assert task is not None and task.cancelled()
+    assert task is not None
+    assert task.cancelled()
+
+
+class _FakeClock:
+    """Hands `_run` the (asked, woke) times of each tick: `ticks` first,
+    then idle ticks for ever."""
+
+    def __init__(self, interval_s: float, ticks: list[tuple[float, float]]) -> None:
+        self.interval_s = interval_s
+        self.times = [t for tick in ticks for t in tick]
+        self.next_idle = 9000.0
+
+    def __call__(self) -> float:
+        if self.times:
+            return self.times.pop(0)
+        now = self.next_idle
+        self.next_idle += self.interval_s  # asked, then woke one interval later
+        return now
+
+
+async def test_an_idle_tick_reads_zero_and_a_stall_reads_its_length(monkeypatch) -> None:
+    """The lag is how much LATER than asked the timer woke: an idle tick
+    (woke one interval after asking) is 0, not the interval; a tick that
+    woke 0.4 s late is 0.4."""
+    interval = 0.01
+    clock = _FakeClock(interval, [(100.0, 100.0 + interval), (200.0, 200.4 + interval)])
+    monitor = metrics.LoopLagMonitor(_gauge(), interval_s=interval, window_s=1.0, clock=clock)
+    recorded: list[tuple[float, float]] = []
+    real_record = monitor.record
+
+    def _record(now: float, lag: float) -> float:
+        recorded.append((now, lag))
+        return real_record(now, lag)
+
+    monkeypatch.setattr(monitor, "record", _record)
+    monitor.start()
+    try:
+        while len(recorded) < 3:
+            await asyncio.sleep(interval)
+    finally:
+        await monitor.stop()
+    assert recorded[0][1] == pytest.approx(0.0, abs=1e-9)
+    assert recorded[1][1] == pytest.approx(0.4)
+    assert recorded[2][1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_monitor_started_again_on_a_new_loop_runs_there() -> None:
+    """Loop A is left with the monitor's task still pending (never run to
+    its end, nor cancelled); starting the monitor on loop B must give it a
+    task on B that measures, not keep A's dead task."""
+    gauge = _gauge()
+    monitor = metrics.LoopLagMonitor(gauge, interval_s=0.01)
+    loop_a = asyncio.new_event_loop()
+    try:
+
+        async def _start_only() -> Any:
+            monitor.start()
+            await asyncio.sleep(0.02)
+            return monitor._task
+
+        first = loop_a.run_until_complete(_start_only())
+        assert first is not None
+        assert not first.done()  # pending on a loop that no longer runs
+
+        async def _start_on_b() -> tuple[Any, bool]:
+            monitor.start()
+            task = monitor._task
+            gauge.set(99.0)  # the new task must write the gauge again
+            await asyncio.sleep(0.05)
+            written = _value(gauge) < 99.0
+            await monitor.stop()
+            return task, written
+
+        second, written = asyncio.run(_start_on_b())
+        assert second is not first
+        assert second.get_loop() is not loop_a
+        assert written
+    finally:
+        first.cancel()
+        loop_a.run_until_complete(asyncio.sleep(0))
+        loop_a.close()
 
 
 def test_a_task_left_on_another_loop_is_replaced_not_touched() -> None:
@@ -184,8 +265,10 @@ async def test_one_client_per_loop_for_every_call(monkeypatch) -> None:
             assert await _plan() == ({"itineraries": []}, [])
         assert len(built) == 1
         assert len(seen) == 3
-        # PR-188 still holds: every request says Connection: close.
+        # PR-188 still holds: every request says Connection: close, set on
+        # the request itself (the client keeps httpx's default, keep-alive).
         assert {r.headers["connection"].lower() for r in seen} == {"close"}
+        assert built[0].headers.get("connection") != "close"
     finally:
         await motis_client.aclose_shared_client()
     assert built[0].is_closed

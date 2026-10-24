@@ -8,15 +8,19 @@
 # that work to threads. This alert says when the loop is late again, before
 # the HEALTHCHECK and autoheal restart web.
 #
-#   WebEventLoopLagHigh  web's event loop ran more than 1 s late within each
-#                        minute, for 5 min
+#   WebEventLoopLagHigh  web's event loop ran more than 1 s late, again and
+#                        again (at least once every 2 min), for 5 min
 #
 # Metric: `viator_web_event_loop_lag_seconds` (app/metrics.py, LoopLagMonitor):
 # the largest delay of a 0.25 s timer over the last 60 s, so a stall between
 # two scrapes or rule evaluations is not missed. A loop blocked through a
-# whole scrape answers no scrape (the series pauses); the first sample after
-# it carries the stall. Unit tests: docker/prometheus/tests/web_test.yml
-# (`promtool test rules`, CI).
+# whole scrape (10 s, scrape_timeout) answers no scrape: Prometheus writes a
+# stale marker, and an instant vector read at that moment is empty, which
+# would drop the pending alert and restart its 5 min. The rule therefore
+# reads the largest sample of the last 2 min (`max_over_time`; range vectors
+# skip stale markers), which the first scrape after the stall carries. Unit
+# tests: docker/prometheus/tests/web_test.yml (`promtool test rules`, CI),
+# with a stall every minute that times a scrape out each time.
 #
 # NOTE: no Alertmanager and no Grafana contact point is provisioned yet (see
 # autoheal.yml): this alert shows as firing at /prometheus/alerts and in
@@ -26,15 +30,16 @@ groups:
   - name: viator-web
     rules:
       - alert: WebEventLoopLagHigh
-        expr: viator_web_event_loop_lag_seconds > 1
+        expr: max_over_time(viator_web_event_loop_lag_seconds[2m]) > 1
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "web's event loop has been running more than 1 s late for 5 minutes"
+          summary: "web's event loop has kept running more than 1 s late for 5 minutes"
           description: >-
             web's event loop ran {{ $value | humanizeDuration }} late within
-            the last minute, and has been more than 1 s late for 5 minutes.
+            the last 3 minutes, and more than 1 s late at least every 2 minutes
+            for 5 minutes.
             Every async request and the health check wait that long; past
             10 s the HEALTHCHECK fails and autoheal restarts web. Look for
             blocking work in an async handler: the web log at the time, the

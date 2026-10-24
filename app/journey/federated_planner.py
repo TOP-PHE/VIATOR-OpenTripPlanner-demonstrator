@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..db_steps import db_step
 from ..logging_config import one_line
 from ..metrics import FEDERATED_PLANNER_TRIES_TOTAL
 from .signature import _uic_from_stop_id, transit_fingerprint
@@ -534,9 +535,10 @@ async def plan_federated(
     if not origin_uic or not dest_uic or origin_uic == dest_uic:
         return []
 
-    # #397 — the served-stop sets (a GTFS read on a cache miss) and the
-    # coordinates (a database query) are blocking: worker threads, one after
-    # the other, never the event loop.
+    # #397 — the served-stop sets (a GTFS read on a cache miss, asyncio's
+    # default executor) and the coordinates (a query on the request's
+    # session, `db_step`) are blocking: worker threads, one after the other,
+    # never the event loop.
     served = await asyncio.to_thread(_served_by_session, sessions)
     origin_sessions = [s for s in sessions if origin_uic in served[s.id]]
     dest_sessions = [s for s in sessions if dest_uic in served[s.id]]
@@ -549,7 +551,7 @@ async def plan_federated(
         _record_outcome("no_shared_hub")
         return []
 
-    coords = await asyncio.to_thread(_resolve_coords, db, {origin_uic, dest_uic} | candidate_hubs)
+    coords = await db_step(_resolve_coords, db, {origin_uic, dest_uic} | candidate_hubs)
     from_request = _fill_endpoint_positions(
         coords, [(origin_uic, origin_position), (dest_uic, dest_position)]
     )

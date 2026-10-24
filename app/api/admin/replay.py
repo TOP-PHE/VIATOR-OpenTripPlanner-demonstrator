@@ -21,10 +21,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
-from starlette.concurrency import run_in_threadpool
 
 from ... import audit, config_service
 from ...db import get_db
+from ...db_steps import db_step
 from ...journey import planner_dispatch, recorder
 from ...models import (
     GraphSnapshot,
@@ -77,7 +77,9 @@ class _Queued:
 class _ReplayPlan:
     target_id: uuid.UUID
     target_session_id: str
-    planner: planner_dispatch._Planner
+    # None for a session whose engine is unknown: each search then fails as
+    # an engine error, counted per search as before #397 (`_planner_of`).
+    planner: planner_dispatch._Planner | None
     cfg: dict[str, Any]
     cap: int
     rps: int
@@ -96,7 +98,7 @@ async def replay(
     """#397 — every database step runs in the thread pool, one after the
     other on the request's session; the event loop awaits the engine and
     the throttle only."""
-    plan = await run_in_threadpool(_replay_plan, db, body)
+    plan = await db_step(_replay_plan, db, body)
 
     if body.dry_run:
         return {
@@ -110,7 +112,7 @@ async def replay(
     delay = 1.0 / max(plan.rps, 1)
     outcomes = {"now_ok": 0, "still_failing": 0, "different_result": 0, "errors": 0}
     ip = client_ip(request)
-    await run_in_threadpool(
+    await db_step(
         _audit,
         db,
         "replay.started",
@@ -129,12 +131,12 @@ async def replay(
     for s in plan.queued:
         try:
             outcomes[await _replay_one(db, plan, knobs, s)] += 1
-            await run_in_threadpool(db.commit)
+            await db_step(_commit, db)
         except Exception:
             outcomes["errors"] += 1
         await asyncio.sleep(delay)
 
-    await run_in_threadpool(
+    await db_step(
         _audit, db, "replay.finished", actor.id, ip, plan.target_id, {"outcomes": outcomes}
     )
 
@@ -158,10 +160,10 @@ async def _replay_one(db: DbSession, plan: _ReplayPlan, knobs: _Knobs, s: _Queue
     commits); the outcome to count (`now_ok`, `still_failing`,
     `different_result`, `errors`). An exception (a database error) is
     counted as an error by the caller."""
-    replay_search = await run_in_threadpool(_begin_replay, db, s)
+    replay_search = await db_step(_begin_replay, db, s)
     t0 = time.monotonic()
     try:
-        _, trips = await plan.planner.fetch_plan(
+        _, trips = await _planner_of(plan).fetch_plan(
             session_id=plan.target_session_id,
             from_lat=s.origin_lat,
             from_lon=s.origin_lon,
@@ -177,8 +179,19 @@ async def _replay_one(db: DbSession, plan: _ReplayPlan, knobs: _Knobs, s: _Queue
         status = "error"
         trips = []
     elapsed = int((time.monotonic() - t0) * 1000)
-    await run_in_threadpool(_record_replay, db, plan, replay_search, status, elapsed, trips)
+    await db_step(_record_replay, db, plan, replay_search, status, elapsed, trips)
     return _replay_outcome(status, s.status)
+
+
+def _planner_of(plan: _ReplayPlan) -> planner_dispatch._Planner:
+    """The target's planner; ValueError for an unknown engine."""
+    if plan.planner is None:
+        raise ValueError(f"Unknown session engine for {plan.target_session_id!r}")
+    return plan.planner
+
+
+def _commit(db: DbSession) -> None:
+    db.commit()
 
 
 def _replay_outcome(status: str, original_status: str) -> str:
@@ -266,10 +279,14 @@ def _replay_plan(db: DbSession, body: ReplayBody) -> _ReplayPlan:
             )
         )
 
+    try:
+        planner: planner_dispatch._Planner | None = planner_dispatch.get_planner(target_session)
+    except ValueError:
+        planner = None
     return _ReplayPlan(
         target_id=target.id,
         target_session_id=target.session_id,
-        planner=planner_dispatch.get_planner(target_session),
+        planner=planner,
         cfg=cfg,
         cap=cap,
         rps=rps,

@@ -323,13 +323,15 @@ def test_oom_alert_reads_cadvisor_oom_events() -> None:
 
 
 def test_web_loop_lag_alert_and_panel() -> None:
-    """#397 — the alert reads LoopLagMonitor's gauge, above 1 s for 5 min; the
-    Resources dashboard shows the same gauge; the metric name is the one
-    app/metrics.py exports."""
+    """#397 — the alert reads LoopLagMonitor's gauge, its largest value over
+    2 min above 1 s for 5 min (a range vector: a scrape lost to a stall
+    leaves a stale marker that an instant vector would read as no value, and
+    the alert's pending state would restart); the Resources dashboard shows
+    the same gauge; the metric name is the one app/metrics.py exports."""
     from app import metrics
 
     rule = _rule("WebEventLoopLagHigh")
-    assert rule["expr"] == "viator_web_event_loop_lag_seconds > 1"
+    assert rule["expr"] == "max_over_time(viator_web_event_loop_lag_seconds[2m]) > 1"
     assert rule["for"] == "5m"
     by_title = {p["title"]: p for p in _dashboard()["panels"]}
     panel = by_title["Web event-loop lag"]

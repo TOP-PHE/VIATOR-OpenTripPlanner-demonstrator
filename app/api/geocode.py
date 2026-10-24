@@ -30,9 +30,9 @@ import httpx
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
-from starlette.concurrency import run_in_threadpool
 
 from ..db import get_db
+from ..db_steps import db_step
 from ..models import Session as SessionRow
 from ..models import SessionState
 from ..security import CurrentUser, require_logged_in
@@ -241,7 +241,7 @@ async def geocode(
     """
     # The session read runs in the thread pool (#397): a typeahead calls this
     # on every keystroke, on the event loop every request shares.
-    motis_id = await run_in_threadpool(_motis_session_id, db)
+    motis_id = await db_step(_motis_session_id, db)
     if motis_id is None:
         return []
     payload = await _fetch_motis_geocode(motis_id, q, lambda: _client_gone(request))

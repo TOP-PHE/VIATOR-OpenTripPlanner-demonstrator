@@ -8,11 +8,11 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from ... import audit, config_service
 from ...auth import email as email_sender
 from ...db import get_db
+from ...db_steps import db_step
 from ...security import CurrentUser, client_ip, require_platform_admin
 
 router = APIRouter(prefix="/api/admin/config", tags=["admin", "config"])
@@ -95,7 +95,7 @@ async def smtp_test(
     try:
         await email_sender.send_test_email(to_email=str(body.to))
     except email_sender.SmtpNotConfiguredError as exc:
-        await run_in_threadpool(
+        await db_step(
             _audit_smtp_test,
             db,
             "smtp.test.unconfigured",
@@ -105,7 +105,7 @@ async def smtp_test(
         )
         return {"ok": False, "error": "SMTP is not configured (SMTP_HOST is empty)."}
     except email_sender.EmailSendError as exc:
-        await run_in_threadpool(
+        await db_step(
             _audit_smtp_test,
             db,
             "smtp.test.failed",
@@ -118,9 +118,7 @@ async def smtp_test(
         # detail is in the audit event above and the server log.
         return {"ok": False, "error": _smtp_failure_message(exc)}
 
-    await run_in_threadpool(
-        _audit_smtp_test, db, "smtp.test.sent", user.id, ip, {"to": str(body.to)}
-    )
+    await db_step(_audit_smtp_test, db, "smtp.test.sent", user.id, ip, {"to": str(body.to)})
     return {"ok": True}
 
 

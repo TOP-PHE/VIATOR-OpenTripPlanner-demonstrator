@@ -393,7 +393,7 @@ The worker has an APScheduler-style cron that pulls fresh files on the configure
 
 For MERITS (when wired), the same shape applies — `kind: "MERITS-..."` with auth headers stored in `sessions.config.merits_credentials_ref` (a Postgres-stored encrypted secret reference).
 
-**Refresh progress (issue #359; `app/refresh_progress.py`, table `source_refresh_progress`).** One row per session and kind (`providers`, `osm`), overwritten by the next refresh of that kind: `run_id`, `state` (running / finished / failed / interrupted), `started_at`, `heartbeat_at`, `finished_at` (PostgreSQL's clock), `detail` (JSONB: `total`, `done`, `fetched`, `unchanged`, `failed`, `not_reached`, `phase`, `current` = the task label with `bytes` and `expected`, its `step` (`feed_fetch.STEPS`: `downloading` → `verifying` (format check) → `checking_structure` (NeTEx only, `scanned` / `scan_total` = bytes of uncompressed XML read by `netex_structure.fingerprint` / the members' uncompressed sizes from the zip directory) → `storing` (`ingestion.place`, the copy into the slot)) and `started_at` (read as `elapsed_seconds`; a record written before steps reads `step: null`, `elapsed_seconds: null`), `failed_keys` ≤ 50 labels, `error` = an exception's type name, `previous` when it replaced an interrupted record) and `extract` (JSONB: the station-module pass that follows a whole-session provider refresh: queued / running / finished / cancelled / error / off, `total`, `handled`, counts per outcome, `reasons` = reason word → count, `current` provider, `updated_at` beaten every 30 s; read as `interrupted` when queued for 35 min or running 5 min without a beat; written only into the record of the refresh that queued it: `run_id` travels with the queued pass, writes fenced by it and `state = 'finished'`). `refresh_sources` and `refresh_osm` claim the row before any work (`INSERT … ON CONFLICT DO UPDATE … WHERE state <> 'running'`, the row locked; refused with 409 `{"error": "refresh_already_running", "scope", "started_at", "message"}`, never joined), write each task's start and outcome, the bytes of the download under way (from `feed_fetch.download_progress`, at most every 2 s or 5 % of the file), each step change of the task (from `feed_fetch.task_step`, one write; the structure check's bytes throttled like the download's, written from its worker thread through the run's writer thread), beat a heartbeat every 30 s, and end finished, failed (an exception) or interrupted (cancelled); a refresh that lost its lease starts no further download; `refresh_provider` answers the same 409 while a whole-session provider refresh runs. A running row with no heartbeat for 5 minutes is marked interrupted by the next read or claim, and a new refresh may take it; every write is fenced by `run_id` and `state = 'running'`, so the old refresh can no longer change it. The POST answers as before (synchronously); `GET /api/sessions/{sid}/sources/progress` returns `{providers, osm, now}` for the Sessions page, which polls it while something runs. Labels and counts only: never a URL, a token or a reason text. Migration `20261015_1800_refresh_progress` (re-runnable; downgrade drops the table); the steps added no migration. **Off the event loop:** after the download (itself streamed with its file writes in threads), the format check, the structure check (minutes on a national NeTEx: ~75 MB/s of XML) and the copy into the slot run in worker threads (`asyncio.to_thread`); `ingestion.dispatch` is split into `place` (files only, in a thread) and `queue_rebuild` (database, on the request's thread, which owns the session) by `sessions._dispatch_off_loop`, used by the refresh, the derived providers and the session upload (the legacy `/upload` form calls `place` in a thread too), so the progress API and every other request keep answering. `place` copies to a hidden `.<name>.<hex>.placing.tmp` beside the slot and renames it over the slot under a per-directory, per-process lock (the legacy rotation renames the whole directory), so the slot always holds a whole file and concurrent copies run in turn. The job also removes its source and runs the caller's file bookkeeping (fetch state saved, or forgotten after an upload); it is shielded from the request's cancellation, and when cancelled its rebuild is queued from a done callback with a database session of its own. Only a running record has `current` tasks (an interrupted one shows none); `elapsed_seconds` is measured on the web process's clock, the one `started_at` is written with.
+**Refresh progress (issue #359; `app/refresh_progress.py`, table `source_refresh_progress`).** One row per session and kind (`providers`, `osm`), overwritten by the next refresh of that kind: `run_id`, `state` (running / finished / failed / interrupted), `started_at`, `heartbeat_at`, `finished_at` (PostgreSQL's clock), `detail` (JSONB: `total`, `done`, `fetched`, `unchanged`, `failed`, `not_reached`, `phase`, `current` = the task label with `bytes` and `expected`, its `step` (`feed_fetch.STEPS`: `downloading` → `verifying` (format check) → `checking_structure` (NeTEx only, `scanned` / `scan_total` = bytes of uncompressed XML read by `netex_structure.fingerprint` / the members' uncompressed sizes from the zip directory) → `storing` (`ingestion.place`, the copy into the slot)) and `started_at` (read as `elapsed_seconds`; a record written before steps reads `step: null`, `elapsed_seconds: null`), `failed_keys` ≤ 50 labels, `error` = an exception's type name, `previous` when it replaced an interrupted record) and `extract` (JSONB: the station-module pass that follows a whole-session provider refresh: queued / running / finished / cancelled / error / off, `total`, `handled`, counts per outcome, `reasons` = reason word → count, `current` provider, `updated_at` beaten every 30 s; read as `interrupted` when queued for 35 min or running 5 min without a beat; written only into the record of the refresh that queued it: `run_id` travels with the queued pass, writes fenced by it and `state = 'finished'`). `refresh_sources` and `refresh_osm` claim the row before any work (`INSERT … ON CONFLICT DO UPDATE … WHERE state <> 'running'`, the row locked; refused with 409 `{"error": "refresh_already_running", "scope", "started_at", "message"}`, never joined), write each task's start and outcome, the bytes of the download under way (from `feed_fetch.download_progress`, at most every 2 s or 5 % of the file), each step change of the task (from `feed_fetch.task_step`, one write; the structure check's bytes throttled like the download's, written from its worker thread through the run's writer thread), beat a heartbeat every 30 s, and end finished, failed (an exception) or interrupted (cancelled); a refresh that lost its lease starts no further download; `refresh_provider` answers the same 409 while a whole-session provider refresh runs. A running row with no heartbeat for 5 minutes is marked interrupted by the next read or claim, and a new refresh may take it; every write is fenced by `run_id` and `state = 'running'`, so the old refresh can no longer change it. The POST answers as before (synchronously); `GET /api/sessions/{sid}/sources/progress` returns `{providers, osm, now}` for the Sessions page, which polls it while something runs. Labels and counts only: never a URL, a token or a reason text. Migration `20261015_1800_refresh_progress` (re-runnable; downgrade drops the table); the steps added no migration. **Off the event loop:** after the download (itself streamed with its file writes in threads), the format check, the structure check (minutes on a national NeTEx: ~75 MB/s of XML) and the copy into the slot run in worker threads (`asyncio.to_thread`); `ingestion.dispatch` is split into `place` (files only, in a thread) and `queue_rebuild` (database, in the thread pool with the request's session, §6.10.2) by `sessions._dispatch_off_loop`, used by the refresh, the derived providers and the session upload (the legacy `/upload` form calls `place` in a thread too), so the progress API and every other request keep answering. `place` copies to a hidden `.<name>.<hex>.placing.tmp` beside the slot and renames it over the slot under a per-directory, per-process lock (the legacy rotation renames the whole directory), so the slot always holds a whole file and concurrent copies run in turn. The job also removes its source and runs the caller's file bookkeeping (fetch state saved, or forgotten after an upload); it is shielded from the request's cancellation, and when cancelled its rebuild is queued from a done callback with a database session of its own. Only a running record has `current` tasks (an interrupted one shows none); `elapsed_seconds` is measured on the web process's clock, the one `started_at` is written with.
 
 
 ### 5.2 The stop extract for the station module (MSMM 22.2)
@@ -937,13 +937,63 @@ then marked it failed. Now web never executes a run, and no restart of web ends 
   `viator_coverage_heartbeat_age_seconds` and `viator_coverage_resumes_total` (computed at scrape time
   with the database's clock). Alerts (`docker/prometheus/rules/coverage.yml`, unit-tested by
   `promtool test rules` in CI): `CoverageRunHeartbeatStale` (heartbeat older than 15 min for 5 min: no
-  worker to resume the run; a released run's age counts from its release) and `CoverageRunNotClaimed` (a queued run waiting 15 min while none runs).
+  worker to resume the run; a released run's age counts from its release) and `CoverageRunNotClaimed` (a queued run waiting 15 min while none runs). Web's own loop is watched as well (§6.10.2): the gauge `viator_web_event_loop_lag_seconds` (the
+  largest delay of a 0.25 s timer over the last 60 s, measured on web's event loop) and the alert
+  `WebEventLoopLagHigh` (`docker/prometheus/rules/web.yml`: its largest value over 2 min above 1 s
+  for 5 min), with the panel "Web event-loop lag" of "VIATOR — Resources". The coverage executor's
+  loop in the worker is not measured (the worker has no `/metrics`).
 
 Why a thread of the worker rather than a separate compose service: one process and one image to
 deploy, no new service in `bin/viator-deploy.sh` or the install guide, and the two loops are
 independent (builds are synchronous `docker run` calls on the main thread). The price is that the
 coverage code shares a process with the Docker socket; it parses only engine and ÖBB answers.
 
+
+#### 6.10.2 No blocking work in web's async handlers (#397)
+
+The rest of web shares the same loop as the health endpoints. #397 applies the rule of §6.10 to every
+`async def` handler: none makes a blocking call (a query, a file write, a bcrypt check) on the loop.
+
+- A handler that awaits nothing is a plain `def`, which FastAPI runs in anyio's thread pool (40
+  threads): `login`, `register-confirm`, `password-reset-confirm`, `check-token`,
+  `bootstrap-platform-user`.
+- A handler that awaits an engine, the station module, SMTP or ÖBB runs each database step in a worker
+  thread with `app.db_steps.db_step`, on the request's session, one step at a time (never two threads
+  on one session): fanout, plan, replay, geocode, the hub routes, verify-external, the refreshes, the
+  uploads, the NAP import, the SMTP test, the credential login check, the Trainline refresh. A value
+  needed after a commit is read in the thread before it (a lazy reload on the loop is a query there);
+  the fanout reloads its sessions in a thread before the federated fallback, inside its `try`.
+- Which thread: a step whose session holds no pooled connection yet goes to anyio's pool; a step whose
+  session already holds one (the commit after an engine call, for instance) goes to a limiter of its
+  own, 16 threads, one more than the pool's 5 + 10 connections. When the pool is exhausted, up to 40
+  sync handlers can hold every anyio thread while they wait for a connection (30 s `pool_timeout`);
+  the step that would give a connection back must not queue behind them. Scaled down (one connection,
+  3 s timeout, four threads, one async holder, eight sync handlers), the holder's commit in anyio's
+  pool waited 6.1 s and 7 of the 8 handlers timed out; on the limiter all 8 are served
+  (`tests/integration/test_web_loop_steps.py`). Work with no database (a CSV parse, GTFS served-stop
+  sets, file copies) runs on asyncio's default executor.
+- `motis_client` shares one `httpx.AsyncClient` per event loop (a new client and its SSL context cost
+  ~19 ms of loop time per call), closed at web's shutdown and at the coverage executor loop's end;
+  every request still says `Connection: close`, no connection cap, no idle connection, per-request
+  timeouts unchanged.
+
+The harness `tests/integration/test_web_loop_health.py` (PostgreSQL 16, fake engines, station module
+and ÖBB, every SQL statement slowed by 30 ms in the thread that runs it) drives fanout, plan, login,
+geocode, hub resolve, verify-external and replay while a thread probes `/healthz`:
+
+| | SQL statements on the loop thread | worst `/healthz` latency | worst loop lag |
+|---|---|---|---|
+| before | 324 (fanout 164, replay 102, plan 48, login 4, verify-external 4, geocode 1, hub resolve 1) | 5 069 ms | 5 081 ms |
+| after | 0 | 4–8 ms | 3 ms |
+
+With no slowdown the worst before was 304 ms (one login's bcrypt check). The steps the harness does
+not drive (the OSM refresh's end, the federated planner's coordinates, the Trainline upsert, the
+sessions' reload before the federated fallback, geocode handing its connection back before the
+geocoder call) each have a test in `tests/integration/test_web_loop_steps.py` that fails when the step
+runs on the loop again. A request cancelled while its refresh claim is being made has the claim ended
+as interrupted by a worker thread, so the scope is not refused (409) until the lease runs out. Left on
+the loop on purpose: the ROLLBACK of a refresh's error paths, the small JSON fetch-state files, Jinja
+rendering.
 ---
 
 ## 7. Master data management

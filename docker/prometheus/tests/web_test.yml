@@ -1,6 +1,6 @@
 # promtool unit tests of rules/web.yml (issue #397). Run in CI:
 #   promtool test rules /etc/prometheus/tests/web_test.yml
-# Series values are invented (seconds of lag), sampled every minute.
+# Series values are invented (seconds of lag).
 
 rule_files:
   - ../rules/web.yml
@@ -28,8 +28,8 @@ tests:
               severity: warning
               job: viator-web
             exp_annotations:
-              summary: "web's event loop has been running more than 1 s late for 5 minutes"
-              description: "web's event loop ran 2.5s late within the last minute, and has been more than 1 s late for 5 minutes. Every async request and the health check wait that long; past 10 s the HEALTHCHECK fails and autoheal restarts web. Look for blocking work in an async handler: the web log at the time, the \"HTTP latency p95 (per route)\" panel of \"VIATOR — Overview\", and the \"Web event-loop lag\" panel of \"VIATOR — Resources\"."
+              summary: "web's event loop has kept running more than 1 s late for 5 minutes"
+              description: "web's event loop ran 2.5s late within the last 3 minutes, and more than 1 s late at least every 2 minutes for 5 minutes. Every async request and the health check wait that long; past 10 s the HEALTHCHECK fails and autoheal restarts web. Look for blocking work in an async handler: the web log at the time, the \"HTTP latency p95 (per route)\" panel of \"VIATOR — Overview\", and the \"Web event-loop lag\" panel of \"VIATOR — Resources\"."
       - eval_time: 19m
         alertname: WebEventLoopLagHigh
         exp_alerts: []
@@ -43,3 +43,25 @@ tests:
       - eval_time: 12m
         alertname: WebEventLoopLagHigh
         exp_alerts: []
+
+  # A loop that stalls 12 s once a minute: each stall times a scrape out
+  # (15 s scrapes, 10 s timeout), so a stale marker follows, and the next
+  # scrape carries the 12 s lag. Rule evaluations that land on the stale
+  # marker must not restart the alert's 5 min (lens-B review of #405).
+  - interval: 15s
+    input_series:
+      - series: 'viator_web_event_loop_lag_seconds{job="viator-web"}'
+        values: '0.01x3 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12 stale 12 12 12'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: WebEventLoopLagHigh
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WebEventLoopLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: viator-web
+            exp_annotations:
+              summary: "web's event loop has kept running more than 1 s late for 5 minutes"
+              description: "web's event loop ran 12s late within the last 3 minutes, and more than 1 s late at least every 2 minutes for 5 minutes. Every async request and the health check wait that long; past 10 s the HEALTHCHECK fails and autoheal restarts web. Look for blocking work in an async handler: the web log at the time, the \"HTTP latency p95 (per route)\" panel of \"VIATOR — Overview\", and the \"Web event-loop lag\" panel of \"VIATOR — Resources\"."

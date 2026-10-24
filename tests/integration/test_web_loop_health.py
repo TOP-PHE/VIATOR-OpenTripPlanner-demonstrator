@@ -486,7 +486,8 @@ def _assert_recorded(fanout_id: str, plan_id: str) -> None:
     with SessionLocal() as db:
         fanout = db.get(JourneySearch, uuid.UUID(fanout_id))
         plan = db.get(JourneySearch, uuid.UUID(plan_id))
-        assert fanout is not None and plan is not None
+        assert fanout is not None
+        assert plan is not None
         assert (fanout.endpoint, fanout.status) == ("fanout", "ok")
         assert fanout.total_trips_unique == TRIPS_PER_SESSION * len(SIDS)
         assert (plan.endpoint, plan.status, plan.total_trips_unique) == (

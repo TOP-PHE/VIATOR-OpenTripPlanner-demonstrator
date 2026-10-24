@@ -35,11 +35,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from .. import audit
 from .. import credentials as crypto_module
 from ..db import get_db
+from ..db_steps import db_step
 from ..models import UserCredential
 from ..security import CurrentUser, client_ip, require_logged_in
 from ..settings import settings
@@ -365,7 +365,7 @@ async def check_login(
 
     Owner-only, like PATCH. The token itself is never returned.
     """
-    ciphertext, nonce = await run_in_threadpool(_login_secret, db, cred_id, actor)
+    ciphertext, nonce = await db_step(_login_secret, db, cred_id, actor)
     try:
         plaintext = crypto_module.decrypt(ciphertext, nonce, settings.jwt_secret)
         login = crypto_module.parse_oauth2_password_secret(plaintext)

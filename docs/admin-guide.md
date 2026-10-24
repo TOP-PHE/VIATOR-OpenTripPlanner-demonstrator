@@ -923,8 +923,9 @@ tables. Default Prometheus scrape interval (15 s) is fine.
   largest delay of a 0.25 s timer over the last 60 s. Every async request and
   `/healthz` wait that long. Near zero when healthy. The panel "Web event-loop
   lag" of "VIATOR — Resources" shows it; the alert `WebEventLoopLagHigh`
-  (`docker/prometheus/rules/web.yml`) fires when it stays above 1 s for 5 min,
-  before the HEALTHCHECK (10 s) fails and autoheal restarts web. A rise means
+  (`docker/prometheus/rules/web.yml`) fires when its largest value over 2 min
+  stays above 1 s for 5 min (so repeated stalls that each make a scrape fail
+  still fire it), before the HEALTHCHECK (10 s) fails and autoheal restarts web. A rise means
   blocking work in an `async def` handler (the case of #392's 9-17 s health
   checks): find the route in "HTTP latency p95 (per route)" and in the web
   log at that time. As for the other alerts, nobody is paged (no

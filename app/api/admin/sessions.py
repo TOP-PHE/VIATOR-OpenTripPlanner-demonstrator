@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import uuid
 import zipfile
 from collections.abc import Callable
@@ -66,6 +67,7 @@ from ... import (
     station_module,
 )
 from ...db import get_db
+from ...db_steps import db_step
 from ...models import AuditEvent, GraphSnapshot, RebuildJob, Upload
 from ...models import Session as SessionRow
 from ...models.sessions import SessionCategory, SessionEngine, SessionState
@@ -828,7 +830,7 @@ async def upload_to_session(
     declared timetable format. Omit it for the legacy per-session upload.
     See docs/provider-source-modes-design.md.
     """
-    s = await run_in_threadpool(_session_or_404, db, sid)
+    s = await db_step(_session_or_404, db, sid)
     if declared_standard not in detect.KNOWN_KINDS:
         raise HTTPException(400, f"Unknown standard: {declared_standard}")
     if actor.id is None:
@@ -913,14 +915,14 @@ async def upload_to_session(
         triggered_rebuild=triggered,
         provider_feed_id=provider_feed_id,
     )
-    await run_in_threadpool(_add_upload, db, s, upload)
+    await db_step(_add_upload, db, s, upload)
 
     # §12 — uploading a national feed cascades to any cross-border views derived
     # from it (same single-source-of-truth rule as refresh). The scan is cheap and
     # finds nothing when this upload wasn't a provider feed something links to.
     cascaded = await _cascade_derived_refresh(db, sid)
 
-    answer, config = await run_in_threadpool(
+    answer, config = await db_step(
         _commit_upload,
         db,
         s,
@@ -1355,7 +1357,7 @@ async def refresh_sources(
     queues a rebuild for kinds that warrant one. Existing files of the
     same kind are rotated (`.old` suffix) by dispatch.
     """
-    s = await run_in_threadpool(_session_or_404, db, sid)
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -1375,9 +1377,7 @@ async def refresh_sources(
     # streetGraph cache. See `_build_refresh_tasks`'s `include_osm` doc.
     work = _build_refresh_tasks(config, include_osm=False)
     # Issue #359: the progress record every page reads; 409 while one runs.
-    run = await run_in_threadpool(
-        _claim_refresh, sid, refresh_progress.PROVIDERS, len(work) + _derived_count(config)
-    )
+    run = await _claim_off_loop(sid, refresh_progress.PROVIDERS, len(work) + _derived_count(config))
     async with run:
         fetched, unchanged, skipped = await _gather_refresh_outcomes(
             db, sid, staging, config, work, run
@@ -1392,7 +1392,7 @@ async def refresh_sources(
         cascaded = await _cascade_derived_refresh(db, sid) if fetched else []
 
         # Last, under the row lock until the commit (never held over the cascade).
-        orphaned, saved_config = await run_in_threadpool(
+        orphaned, saved_config = await db_step(
             _finish_sources_refresh,
             db,
             s,
@@ -1580,7 +1580,7 @@ async def refresh_osm(
         `skipped`  — non-empty only if the OSM URL is unset or download failed
         `rotated`  — list of rotation events for the audit trail / UI display
     """
-    s = await run_in_threadpool(_session_or_404, db, sid)
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -1597,7 +1597,7 @@ async def refresh_osm(
     # back to osm.pbf if they need it).
     # Issue #359: claimed before the rotation, so a refused second click
     # rotates nothing.
-    run = await run_in_threadpool(_claim_refresh, sid, refresh_progress.OSM, 1)
+    run = await _claim_off_loop(sid, refresh_progress.OSM, 1)
     async with run:
         rotated = _rotate_osm_pbf(settings.inbox_dir / sid)
 
@@ -1618,7 +1618,7 @@ async def refresh_osm(
             else:
                 skipped.append({k: v for k, v in outcome.items() if k != "status"})
         run.phase(refresh_progress.FINISHING)
-        await run_in_threadpool(
+        await db_step(
             _finish_osm_refresh,
             db,
             s,
@@ -1842,7 +1842,7 @@ async def _filter_derived_provider(
     )
     src_slot = settings.inbox_dir / str(src_session) / src_subdir / src_name
     if not src_slot.exists():
-        reason = await run_in_threadpool(_missing_source_reason, db, df)
+        reason = await db_step(_missing_source_reason, db, df)
         return {"status": "skipped", "key": key, "error": reason}
     out_tmp = staging / f"{pid.lower()}-xb.zip"
     try:
@@ -1947,7 +1947,7 @@ async def _cascade_derived_refresh(db: DbSession, source_session_id: str) -> lis
     entry and commit come after the cascade.
     """
     try:
-        targets = await run_in_threadpool(_cascade_targets, db, source_session_id)
+        targets = await db_step(_cascade_targets, db, source_session_id)
     except Exception as exc:  # the cascade is skipped, the refresh goes on
         _unexpected_skip(db, "cascade", exc)
         return []
@@ -2051,7 +2051,7 @@ async def _dispatch_off_loop(
         raise
     if rebuild:
         try:
-            await run_in_threadpool(ingestion.queue_rebuild, db, session_id=sid, kind=kind)
+            await db_step(ingestion.queue_rebuild, db, session_id=sid, kind=kind)
         except Exception as exc:
             raise _RebuildNotQueued(type(exc).__name__) from exc
     return rebuild
@@ -2108,6 +2108,48 @@ def _claim_refresh(sid: str, scope: str, total: int) -> refresh_progress.Refresh
         return refresh_progress.claim(sid, scope, total)
     except refresh_progress.RefreshRunning as exc:
         raise HTTPException(409, detail=exc.detail()) from exc
+
+
+class _ClaimHandoff:
+    """Hands a claim from its thread to the request, or, when the request
+    was cancelled first, has the thread end it (`_claim_off_loop`)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.run: refresh_progress.RefreshRun | None = None
+        self.abandoned = False
+
+
+async def _claim_off_loop(sid: str, scope: str, total: int) -> refresh_progress.RefreshRun:
+    """`_claim_refresh` in the thread pool (#397), the caller entering the
+    run's context right after. A request cancelled while the claim thread
+    runs gets its CancelledError at once and the thread goes on: the claim
+    it commits would stay RUNNING with no heartbeat, and refuse every
+    refresh of that scope with 409 for `LEASE_SECONDS`. So the claim is
+    ended as interrupted, by the claim thread when the request was cancelled
+    first, by another worker thread when the claim was made first."""
+    handoff = _ClaimHandoff()
+
+    def _claim() -> refresh_progress.RefreshRun:
+        run = _claim_refresh(sid, scope, total)
+        with handoff.lock:
+            handoff.run = run
+            abandoned = handoff.abandoned
+        if abandoned:
+            run.finish(refresh_progress.INTERRUPTED)
+        return run
+
+    try:
+        return await run_in_threadpool(_claim)
+    except asyncio.CancelledError:
+        with handoff.lock:
+            handoff.abandoned = True
+            claimed = handoff.run
+        if claimed is not None:
+            asyncio.get_running_loop().run_in_executor(
+                None, claimed.finish, refresh_progress.INTERRUPTED
+            )
+        raise
 
 
 async def _gather_refresh_outcomes(
@@ -2355,6 +2397,13 @@ def _forget_fetch_state_for_slot(sid: str, kind: str, staged_filename: str | Non
         station_extract_upload.forget_outcome(sid, Path(staged_filename).stem.upper())
 
 
+def _credential_row(db: DbSession, credential_id: str) -> Any:
+    """The user_credentials row, or None (in a worker thread, #397)."""
+    from ...models import UserCredential
+
+    return db.get(UserCredential, uuid.UUID(credential_id))
+
+
 async def _authorize(
     client: httpx.AsyncClient, db: DbSession, credential_id: str | None, url: str
 ) -> tuple[str, dict[str, str], Any]:
@@ -2368,9 +2417,8 @@ async def _authorize(
     # `app.credentials` (the crypto module) and `app.models`. Single-dot
     # would resolve to `app.api.credentials` (the router).
     from ... import credentials as crypto_module
-    from ...models import UserCredential
 
-    cred = await run_in_threadpool(db.get, UserCredential, uuid.UUID(credential_id))
+    cred = await db_step(_credential_row, db, credential_id)
     if cred is None:
         raise ValueError(f"credential {credential_id} not found (was it deleted?)")
     try:
@@ -2519,7 +2567,7 @@ async def _download_task(
     # Committed at once: a later task's unexpected error rolls the session
     # back (`_unexpected_skip`), which would discard a stamp only flushed.
     if cred is not None:
-        await run_in_threadpool(_stamp_credential, db, cred)
+        await db_step(_stamp_credential, db, cred)
 
     if result.status == "unchanged":
         feed_fetch.save_state(state_dir, label, result.state)
@@ -2793,10 +2841,10 @@ async def import_providers_from_nap(
     the module; without it, the import fails with the same 409 the manual
     save uses (import master_stations first, then re-run the import).
     """
-    s = await run_in_threadpool(_session_or_404, db, sid)
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Bulk-import requires a JWT-authenticated actor")
-    nap_url, nap_auth, catalogue_name = await run_in_threadpool(_nap_source, db, body)
+    nap_url, nap_auth, catalogue_name = await db_step(_nap_source, db, body)
 
     from ...master import nap_importer
 
@@ -2859,7 +2907,7 @@ async def import_providers_from_nap(
         sources["providers"] = providers_canon
         new_config["sources"] = sources
         staleness.mark_sources_changed(new_config)
-        await run_in_threadpool(
+        await db_step(
             _save_imported,
             db,
             s,
@@ -2906,7 +2954,7 @@ async def _import_country_warning(
     } - _stored_countries(s.config)
     if not added_countries:
         return None
-    missing = await run_in_threadpool(_countries_without_stations, db, added_countries)
+    missing = await db_step(_countries_without_stations, db, added_countries)
     if missing:
         missing = _unserved(missing, await station_module.countries())
     return _new_countries(missing, _IMPORT_ADVICE)
@@ -3010,7 +3058,7 @@ async def _refresh_derived_provider(
             run.done(key, outcome)
         bucket = fetched if outcome.get("status") == "fetched" else skipped
         bucket.append({k: v for k, v in outcome.items() if k != "status"})
-    return await run_in_threadpool(
+    return await db_step(
         _finalise_provider_refresh,
         db,
         request=request,
@@ -3040,7 +3088,7 @@ async def _refresh_provider_urls(
     recorded in `run`, its progress record."""
     buckets: dict[str, list[dict[str, Any]]] = {"fetched": [], "unchanged": [], "skipped": []}
     await _run_url_tasks(db, sid, staging, work, run, buckets)
-    return await run_in_threadpool(
+    return await db_step(
         _finalise_provider_refresh,
         db,
         request=request,
@@ -3090,7 +3138,7 @@ async def refresh_provider(
     Use case: operator just added IDFM to a session that already has SNCF
     serving live. They click "Refresh" on IDFM's card and only IDFM is touched.
     """
-    s = await run_in_threadpool(_session_or_404, db, sid)
+    s = await db_step(_session_or_404, db, sid)
     if actor.id is None:
         raise HTTPException(400, "Refresh requires a JWT-authenticated actor")
 
@@ -3123,7 +3171,7 @@ async def refresh_provider(
         )
     # Issue #359: this provider's own progress record; 409 while it, or the
     # whole session's provider refresh (it downloads this provider too), runs.
-    run = await run_in_threadpool(_claim_refresh, sid, scope, len(work))
+    run = await _claim_off_loop(sid, scope, len(work))
     async with run:
         result = await _refresh_provider_urls(
             db,
@@ -3160,9 +3208,7 @@ async def _refresh_one_derived(
     """A derived provider's card refresh, in its own progress record (one
     task, the filter). No station-module pass follows it, so the record has
     no follow-up line."""
-    run = await run_in_threadpool(
-        _claim_refresh, sid, refresh_progress.provider_scope(provider["id"]), 1
-    )
+    run = await _claim_off_loop(sid, refresh_progress.provider_scope(provider["id"]), 1)
     run.follow_up = False
     async with run:
         return await _refresh_derived_provider(

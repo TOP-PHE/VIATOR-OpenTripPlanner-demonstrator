@@ -15,10 +15,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
-from starlette.concurrency import run_in_threadpool
 
 from .. import concurrency, config_service, station_module
 from ..db import get_db
+from ..db_steps import db_step
 from ..journey import (
     hafas_client,
     ojp_client,
@@ -617,7 +617,7 @@ async def fanout(
     executions and their trip signatures, the commit) runs in the thread
     pool, one after the other on the request's session; the event loop only
     awaits the engines."""
-    cfg, sessions = await run_in_threadpool(_fanout_sessions, db, body.engine)
+    cfg, sessions = await db_step(_fanout_sessions, db, body.engine)
 
     when_kind, when = _resolve_when(body)
     overall_start = time.monotonic()
@@ -625,9 +625,7 @@ async def fanout(
 
     try:
         async with concurrency.semaphores.journey.acquire_or_fail():
-            search = await run_in_threadpool(
-                _begin_search, db, body, user.id, ip, "fanout", when_kind, when
-            )
+            search = await db_step(_begin_search, db, body, user.id, ip, "fanout", when_kind, when)
             timeout_ms = int(cfg["FANOUT_TIMEOUT_MS"])
             num_itineraries = int(cfg["OTP_NUM_ITINERARIES"])
             search_window_seconds = int(cfg["OTP_SEARCH_WINDOW_SECONDS"])
@@ -656,15 +654,8 @@ async def fanout(
 
     sids_in_fanout = [s.id for s in sessions]
     federate = bool(body.from_.uic and body.to.uic)
-    recorded = await run_in_threadpool(
-        _record_fanout,
-        db,
-        search,
-        sessions,
-        results,
-        cfg,
-        overall_start=overall_start,
-        reload_sessions=federate,
+    recorded = await db_step(
+        _record_fanout, db, search, sessions, results, cfg, overall_start=overall_start
     )
     status = recorded.status
 
@@ -740,7 +731,7 @@ async def fanout(
 #
 # `fanout` and `plan` stay `async def` (they await the engines) but make no
 # database call on the event loop: each blocking step below is one
-# `run_in_threadpool` call on the request's session, never two at once.
+# `db_step` call on the request's session (app/db_steps.py), never two at once.
 
 
 def _start_reference_tasks(
@@ -780,6 +771,10 @@ async def _federated_fallback(
     from ..journey import federated_planner
 
     try:
+        # `_record_fanout`'s commit expired the session rows: loaded again in
+        # the thread pool, never lazily on the event loop, and inside the try
+        # (a session deleted since the commit gives `[]`, not a 500).
+        await db_step(_reload_sessions, db, sessions)
         return await federated_planner.plan_federated(
             db,
             origin_uic=body.from_.uic,
@@ -794,6 +789,12 @@ async def _federated_fallback(
     except Exception:
         logging.getLogger(__name__).exception("federated planner failed (non-fatal)")
         return []
+
+
+def _reload_sessions(db: DbSession, sessions: list[SessionRow]) -> None:
+    """Load the session rows again (a commit expired them)."""
+    for session in sessions:
+        db.refresh(session)
 
 
 _QueryResult = tuple[
@@ -855,12 +856,9 @@ def _record_fanout(
     cfg: dict[str, Any],
     *,
     overall_start: float,
-    reload_sessions: bool,
 ) -> _RecordedFanout:
     """Record each session's execution (with its trips' signatures), merge
-    the trips by signature, finish the search and commit. `reload_sessions`:
-    load the session rows again after the commit expired them, here rather
-    than lazily on the event loop, for the federated planner."""
+    the trips by signature, finish the search and commit."""
     by_signature: dict[str, dict[str, Any]] = {}
     executions_summary: list[dict[str, Any]] = []
     statuses: list[str] = []
@@ -881,9 +879,6 @@ def _record_fanout(
     )
     search_id = search.id
     db.commit()
-    if reload_sessions and not by_signature:
-        for session in sessions:
-            db.refresh(session)
     return _RecordedFanout(search_id, status, by_signature, executions_summary)
 
 
@@ -1026,15 +1021,13 @@ async def plan(
     user: Annotated[CurrentUser, Depends(require_logged_in)],
 ) -> dict[str, Any]:
     """#397 — the database steps run in the thread pool (see `fanout`)."""
-    s, cfg = await run_in_threadpool(_plan_session, db, body.session_id)
+    s, cfg = await db_step(_plan_session, db, body.session_id)
     when_kind, when = _resolve_when(body)
     ip = client_ip(request)
 
     try:
         async with concurrency.semaphores.journey.acquire_or_fail():
-            search = await run_in_threadpool(
-                _begin_search, db, body, user.id, ip, "plan", when_kind, when
-            )
+            search = await db_step(_begin_search, db, body, user.id, ip, "plan", when_kind, when)
             result = await _query_session(
                 db,
                 s,
@@ -1046,7 +1039,7 @@ async def plan(
     except concurrency.ConcurrencyExceeded as exc:
         raise HTTPException(503, str(exc), headers={"Retry-After": "5"}) from exc
 
-    search_id = await run_in_threadpool(_record_plan, db, search, s, result, cfg)
+    search_id = await db_step(_record_plan, db, search, s, result, cfg)
     status, _raw, trips, _response_ms, refusal = result
     return {
         "search_id": str(search_id),

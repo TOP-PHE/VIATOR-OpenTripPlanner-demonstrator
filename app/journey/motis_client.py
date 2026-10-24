@@ -56,7 +56,8 @@ _INTERNAL_SCHEME = "http"
 # httpx even for plain http) per call. Per loop because an AsyncClient belongs
 # to the loop it first ran on: web's loop, the worker's coverage executor loop
 # and each test's loop get their own. No connection pool to contend for: every
-# request still says `Connection: close` (PR-188) and the client keeps no idle
+# request still says `Connection: close` (PR-188, passed with each request,
+# not as a client default) and the client keeps no idle
 # connection and sets no connection cap, as the per-call clients did (a capped
 # pool would add a PoolTimeout under a large fan-out). The per-request
 # timeouts are passed with each request, unchanged. Closed by
@@ -74,7 +75,7 @@ def _shared_client() -> httpx.AsyncClient:
     loop = asyncio.get_running_loop()
     client = _SHARED_CLIENTS.get(loop)
     if client is None or client.is_closed:
-        client = httpx.AsyncClient(headers=_HEADERS, limits=_LIMITS)
+        client = httpx.AsyncClient(limits=_LIMITS)
         _SHARED_CLIENTS[loop] = client
     return client
 

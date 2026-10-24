@@ -70,11 +70,11 @@ from pydantic import (
 from sqlalchemy import func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
-from starlette.concurrency import run_in_threadpool
 
 from ... import osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
+from ...db_steps import db_step
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -1585,7 +1585,7 @@ async def resolve_hub_codes(
     found with the module's Retry-After, never retrying."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = await run_in_threadpool(_hubs_to_look_at, db, resolved=False, skip=asked.skip)
+    hubs = await db_step(_hubs_to_look_at, db, resolved=False, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubResolveResponse(
@@ -1701,7 +1701,7 @@ async def confirm_hub_codes(
     refusal = _module_refusal()
     if refusal is not None:
         return HubConfirmResponse(status="unavailable", message=refusal, results=[])
-    hubs = await run_in_threadpool(_hubs_by_id, db, [pair.hub_id for pair in confirm.pairs])
+    hubs = await db_step(_hubs_by_id, db, [pair.hub_id for pair in confirm.pairs])
     # The hubs as they were before the module is asked: each write below is
     # guarded by them (`_guarded_write`).
     before = {hub_id: (hub.uic, hub.station_id) for hub_id, hub in hubs.items()}
@@ -1716,7 +1716,7 @@ async def confirm_hub_codes(
                 status=status, message=message, retry_after=retry_after, results=[]
             )
         by_code, by_id = station_module.lookup_by_key(outcome.rows, codes, ids)
-    results = await run_in_threadpool(_store_confirmed, db, confirm, hubs, before, by_code, by_id)
+    results = await db_step(_store_confirmed, db, confirm, hubs, before, by_code, by_id)
     return HubConfirmResponse(status="ok", results=results)
 
 
@@ -1877,7 +1877,7 @@ async def check_hub_codes(
     serves its code under. Clears nothing: the administrator decides."""
     asked = _body_or_422(HubBatchRequest, body, _BATCH_REFUSED)
     user_id = _caller(admin)
-    hubs = await run_in_threadpool(_hubs_to_look_at, db, resolved=True, skip=asked.skip)
+    hubs = await db_step(_hubs_to_look_at, db, resolved=True, skip=asked.skip)
     refusal = _module_refusal()
     if refusal is not None:
         return HubCheckResponse(status="unavailable", message=refusal, results=[], left=len(hubs))
@@ -1891,7 +1891,7 @@ async def check_hub_codes(
         )
     rows, unanswered = found
     checked = [_checked(hub, rows.get(hub.id), unanswered.get(hub.id)) for hub in batch]
-    results = await run_in_threadpool(_write_checked, db, before, checked)
+    results = await db_step(_write_checked, db, before, checked)
     return HubCheckResponse(status="ok", results=results, left=len(hubs) - len(batch))
 
 
@@ -2257,7 +2257,7 @@ async def pick_hub_station(
     return HubPickResponse(
         status="ok",
         message=_PICK_INCOMPLETE if incomplete else None,
-        stations=await run_in_threadpool(_pick_stations, db, rows, asked.country),
+        stations=await db_step(_pick_stations, db, rows, asked.country),
         incomplete=incomplete,
     )
 
@@ -3290,9 +3290,7 @@ async def verify_cell_external(
     `external_verify.verify_via_oebb_hafas` and returns its result
     verbatim.
     """
-    origin_hub, dest_hub, run = await run_in_threadpool(
-        _verify_inputs, db, run_id, origin_id, dest_id
-    )
+    origin_hub, dest_hub, run = await db_step(_verify_inputs, db, run_id, origin_id, dest_id)
     return await external_verify.verify_via_oebb_hafas(
         from_lat=origin_hub.lat,
         from_lon=origin_hub.lon,
