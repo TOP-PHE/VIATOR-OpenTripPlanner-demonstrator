@@ -1,8 +1,15 @@
 """Integration: the web stays healthy while a coverage run is busy (issue #392).
 
-A coverage run (`runner.execute_run`) is a FastAPI background task, so it
-shares the web's event loop with every request, `GET /healthz/version` (the
-image HEALTHCHECK: 10 s timeout, 3 retries) included. Before #392 the run
+Since the durable part of #392 a run executes in the worker's coverage
+executor, not in web; this harness still runs it on a loop that serves HTTP,
+the strictest case, and the rule it checks (no blocking call on the run's
+loop) now also keeps the executor's heartbeat, which shares that loop, on
+time (tests/integration/test_coverage_executor.py tests the executor).
+
+Before the durable part a coverage run (`runner.execute_run`) was a FastAPI
+background task, so it shared the web's event loop with every request,
+`GET /healthz/version` (the image HEALTHCHECK: 10 s timeout, 3 retries)
+included. Before #392 the run
 made its database calls synchronously on that loop: per pair, the recorder
 write (two to three SELECTs per leg for the trip signature, then the trips),
 the result row and the counters, the DB cancel check, and at the end the

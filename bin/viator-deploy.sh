@@ -102,6 +102,10 @@ echo ""
 # new $VERSION even when no compose-file fields changed (e.g. version-only
 # bumps). Force-recreate is needed here because plain `up -d` doesn't recreate
 # containers when only the env/.env-resolved image tag changed.
+#
+# A coverage run in progress is paused, not ended (#392): the worker releases
+# it at SIGTERM and the new worker resumes it where it stopped (the page shows
+# "resuming" meanwhile). Web runs no coverage run any more.
 web_recreated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo ">>> docker compose up -d --force-recreate web worker"
 docker compose up -d --force-recreate web worker
@@ -222,6 +226,19 @@ if ! docker compose logs --no-log-prefix --tail 200 web \
     exit 5
 fi
 echo "  ✓ regenerated_at_boot event present"
+echo ""
+
+# #392 — coverage runs execute in the worker's coverage executor. Advisory
+# only (a warning, the deploy goes on): without it runs stay queued, and a
+# run paused by this deploy is not resumed.
+echo ">>> coverage executor started in the worker (advisory)"
+worker_log=$(docker compose logs --no-log-prefix --since "$web_recreated_at" worker 2>/dev/null || true)
+if grep -q "coverage_executor.started" <<<"$worker_log"; then
+    echo "  ✓ coverage_executor.started present"
+else
+    echo "WARNING: no coverage_executor.started in the worker log since the recreate:" >&2
+    echo "         coverage runs stay queued (or paused). Check: docker compose logs worker" >&2
+fi
 echo ""
 
 echo ">>> per-session OTP sanity (audit §6.11 step 7)"

@@ -64,6 +64,8 @@ class NetworkCoverageRun(Base):
     __table_args__ = (
         Index("ix_network_coverage_runs_started_at", "started_at"),
         Index("ix_network_coverage_runs_session_id", "session_id"),
+        # #392 — the coverage executor's poll (pending, or running and stale).
+        Index("ix_network_coverage_runs_status", "status"),
         # PR #36 — mode controls whether each pair is queried against one
         # session (the run's session_id) or fanned out across every
         # fanout-enabled session at execute time. The validity of the
@@ -193,6 +195,26 @@ class NetworkCoverageRun(Base):
     # fix still carry the old default; the admin API badges them via
     # `RunSummary.depart_at_outside_window`.
     reference_date: Mapped[date | None] = mapped_column(Date(), nullable=True)
+
+    # #392 — the run is executed by the worker's coverage executor
+    # (`app/network_coverage/executor.py`), never by web (alembic
+    # 20261023_1200_coverage_claim). The executor claims a `pending` run, or a
+    # `running` one whose heartbeat went stale (its executor was restarted),
+    # atomically (SELECT ... FOR UPDATE SKIP LOCKED) and keeps `heartbeat_at`
+    # fresh (the database's clock). `claimed_by` names the holder and stays on
+    # a finished run; a graceful worker shutdown clears both so the next
+    # executor resumes at once. `resume_count` counts the claims of a run that
+    # was already running (bounded by COVERAGE_MAX_RESUMES). Web's Stop writes
+    # `cancel_requested_at`; the executor reads it and stops the run as the
+    # in-process Stop did. `execution_snapshot` freezes the hub ids and the
+    # runner knobs at the first claim, so a resumed run asks the same pairs.
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resume_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    execution_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class NetworkCoverageResult(Base):

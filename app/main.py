@@ -173,47 +173,6 @@ def _warn_if_legacy_basic_auth_is_locked() -> None:
         )
 
 
-# #392 — what the WARNING below tells the operator. A coverage run lives in the
-# web process (a FastAPI background task), so a run found unfinished at startup
-# was ended by a restart of web; the log alone cannot say which kind.
-_ORPHANED_RUNS_HINT = (
-    "web restarted while these coverage runs were in progress: a deploy, an "
-    "autoheal restart after failed health checks, or a manual restart; the "
-    "runs are marked failed and must be started again"
-)
-
-
-def _fail_orphaned_coverage_runs() -> None:
-    """v0.1.29.3 — mark any in-flight network-coverage runs as failed.
-
-    FastAPI BackgroundTasks are in-process; a container restart kills them
-    with no DB state cleanup, leaving runs in 'running' status forever. By
-    the time we get here, no `execute_run` from a prior container instance is
-    alive, so anything still 'running' or 'pending' is by definition
-    orphaned. Done in its own try/except so a malformed run row can't keep
-    VIATOR from booting.
-
-    #392 — the WARNING names the runs and the likely causes, so a run ended
-    by an unrequested restart is found in the web log at the restart, not
-    only later on the coverage page.
-    """
-    try:
-        from .network_coverage import runner as _coverage_runner
-
-        with SessionLocal() as db:
-            run_ids = _coverage_runner.mark_orphaned_runs_as_failed(db)
-            if run_ids:
-                db.commit()
-                log.warning(
-                    "network_coverage.orphans_marked_failed",
-                    count=len(run_ids),
-                    run_ids=[str(run_id) for run_id in run_ids],
-                    hint=_ORPHANED_RUNS_HINT,
-                )
-    except Exception:
-        log.exception("network_coverage.orphan_cleanup_failed", fatal=False)
-
-
 @app.on_event("startup")
 def _startup() -> None:
     """Run once per worker. Schema is owned by Alembic and applied by the
@@ -248,7 +207,9 @@ def _startup() -> None:
     except Exception:
         log.exception("sessions_orchestrator.boot_regenerate_failed", fatal=False)
 
-    _fail_orphaned_coverage_runs()
+    # #392 — no coverage-run cleanup here any more: runs execute in the
+    # worker's coverage executor, which resumes a run whose heartbeat went
+    # stale (app/network_coverage/executor.py). A restart of web ends nothing.
 
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os

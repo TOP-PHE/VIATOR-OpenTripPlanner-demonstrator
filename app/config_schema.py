@@ -142,6 +142,17 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "COVERAGE_NUM_ITINERARIES_PER_SLOT": {"type": "int", "default": 10, "min": 1, "max": 50},
     "COVERAGE_SLOT_TIMEOUT_MS": {"type": "int", "default": 20000, "min": 5000, "max": 120000},
     "COVERAGE_WITHIN_PAIR_PARALLELISM": {"type": "int", "default": 3, "min": 1, "max": 10},
+    # ── Coverage executor (#392) ──────────────────────────────────────
+    # Runs are executed by the worker's coverage executor
+    # (app/network_coverage/executor.py), read at each poll (not frozen per
+    # run). MAX_CONCURRENT_RUNS: how many runs one executor holds at once
+    # (the others wait `pending`, shown "queued"). MAX_RESUMES: how many
+    # times a run whose executor stopped (deploy, worker restart, crash) is
+    # claimed again and resumed; one more stop marks it failed with
+    # `summary.resume_limit_reached` instead (a run that keeps killing its
+    # worker must not loop forever).
+    "COVERAGE_MAX_CONCURRENT_RUNS": {"type": "int", "default": 1, "min": 1, "max": 4},
+    "COVERAGE_MAX_RESUMES": {"type": "int", "default": 5, "min": 0, "max": 50},
     # Day-window defaults (per-run overridable via the create-run form).
     # The string-time format is "HH:MM" 24-hour; "24:00" is special-cased
     # server-side to mean "end of day" so 00:00-24:00 = full day. Per-

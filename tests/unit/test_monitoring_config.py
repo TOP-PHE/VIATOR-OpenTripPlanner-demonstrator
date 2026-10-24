@@ -69,6 +69,14 @@ NODE_METRICS: dict[str, set[str]] = {
     "node_memory_SwapTotal_bytes": set(),
 }
 PROMETHEUS_METRICS: dict[str, set[str]] = {"up": set()}
+# web's DB collector (app/metrics.py): gauges with no labels of their own.
+VIATOR_WEB_METRICS: dict[str, set[str]] = {
+    "viator_coverage_runs_queued": set(),
+    "viator_coverage_runs_running": set(),
+    "viator_coverage_oldest_queued_age_seconds": set(),
+    "viator_coverage_heartbeat_age_seconds": set(),
+    "viator_coverage_resumes_total": set(),
+}
 
 
 def _compose() -> dict[str, Any]:
@@ -98,7 +106,11 @@ def _labels_of(metric: str) -> set[str]:
         return NODE_METRICS[metric] | TARGET_LABELS
     if metric in PROMETHEUS_METRICS:
         return PROMETHEUS_METRICS[metric] | TARGET_LABELS
-    raise AssertionError(f"metric {metric!r} is not exported by cadvisor/node-exporter/prometheus")
+    if metric in VIATOR_WEB_METRICS:
+        return VIATOR_WEB_METRICS[metric] | TARGET_LABELS
+    raise AssertionError(
+        f"metric {metric!r} is not exported by cadvisor/node-exporter/prometheus/web"
+    )
 
 
 def check_expr(expr: str) -> set[str]:

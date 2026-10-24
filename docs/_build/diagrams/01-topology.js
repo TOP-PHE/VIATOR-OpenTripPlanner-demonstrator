@@ -5,7 +5,8 @@
  *   - outbound SMTP from `web` was missing and is the only egress carrying PII
  * The three claims this diagram exists to get right, because prose keeps
  * getting them wrong:
- *   - coverage runs and ALL outbound traffic happen in `web`, not `worker`
+ *   - coverage runs execute in `worker` (since #392), so its outbound calls
+ *     (ÖBB HAFAS, the engine containers) leave from there; the rest from `web`
  *   - `web` has no docker socket; it hands config to `worker` through a file
  *   - serve containers are dialled directly by DNS, not through nginx
  */
@@ -30,8 +31,8 @@ exports.svg = () => {
   s.frame(237, 76, 578, 440, 'Docker project “viator” — single host');
 
   s.box('nginx', 392, 96, 250, 44, 'nginx', { kind: 'container', sub: ':80 → 301  ·  :443 TLS' });
-  s.box('web',   257, 166, 230, 78, 'web',  { kind: 'container', sub: 'uvicorn + FastAPI', badge: 'coverage runs here' });
-  s.box('worker',567, 166, 230, 78, 'worker',{ kind: 'container', sub: 'same image, other command' });
+  s.box('web',   257, 166, 230, 78, 'web',  { kind: 'container', sub: 'uvicorn + FastAPI' });
+  s.box('worker',567, 166, 230, 78, 'worker',{ kind: 'container', sub: 'same image, other command', badge: 'coverage runs here' });
   s.box('pg',    413, 280, 220, 46, 'postgres', { kind: 'store', sub: 'jobs · sessions · results' });
   s.box('serve', 257, 360, 230, 76, ['otp-<sid>  /  motis-<sid>'], { kind: 'engine', sub: '0..N  ·  :8080' });
   s.box('dockerd',567, 360, 230, 46, 'host docker daemon', { kind: 'muted', sub: '/var/run/docker.sock' });
@@ -39,25 +40,38 @@ exports.svg = () => {
   s.box('inbox', 567, 455, 230, 44, 'inbox volume', { kind: 'store', sub: 'feeds · PBFs' });
 
   // ---- traffic in
-  s.arrow(['browser', 'b'], ['nginx', 't'], { label: 'HTTPS 443' });
+  s.arrow(['browser', 'b'], ['nginx', 't'], { label: 'HTTPS 443', ly: 89 });
   s.arrow(['nginx', 'b', -60], ['web', 't', -55], { route: 'orth', label: 'HTTP :8000', ly: 158 });
 
-  // ---- web is the only thing that talks to the outside world.
-  // Nested mids keep the four lines in the 200..237 channel, left of the frame.
+  // ---- outbound: web for OJP, the NAPs and SMTP; the worker for ÖBB HAFAS
+  // (the coverage verify sweep, #392). Nested mids keep the lines in the
+  // 200..237 channel, left of the frame.
   s.arrow(['web', 'l', -24], ['ojp', 'r'],  { route: 'orth', mid: 230, color: '#A9691A' });
-  s.arrow(['web', 'l', -8],  ['oebb', 'r'], { route: 'orth', mid: 222, color: '#A9691A' });
   s.arrow(['web', 'l', 8],   ['naps', 'r'], { route: 'orth', mid: 214, color: '#A9691A' });
   s.arrow(['web', 'l', 24],  ['smtp', 'r'], { route: 'orth', mid: 206, color: '#A9691A' });
-  s.text(207, 142, 'every outbound connection', { size: 10.5, anchor: 'end', fill: '#A9691A', italic: true });
-  s.text(207, 155, 'originates in web', { size: 10.5, anchor: 'end', fill: '#A9691A', italic: true });
+  s.arrow(['web', 'l', -8],  ['oebb', 'r'], { route: 'orth', mid: 222, color: '#A9691A' });
+  // The worker's coverage runs call ÖBB too (the verify sweep, #392): a lane
+  // above the project frame, then down the outer edge of the channel.
+  const [wx, wy] = s._pt('worker', 't', -20);
+  const [ox, oy] = s._pt('oebb', 'r', -8);
+  s.body.push(
+    `<path d="M ${wx} ${wy} V 66 H 234 V ${oy} H ${ox}" fill="none" stroke="#A9691A" ` +
+    'stroke-width="1.5" marker-end="url(#ah_A9691A)"/>'
+  );
+  s.text(318, 62, 'coverage verify sweep', { size: 10.5, anchor: 'middle', fill: '#A9691A', italic: true });
+  s.text(207, 142, 'outbound from web, and', { size: 10.5, anchor: 'end', fill: '#A9691A', italic: true });
+  s.text(207, 155, 'from worker for coverage', { size: 10.5, anchor: 'end', fill: '#A9691A', italic: true });
 
   // ---- the config handoff: web writes, worker applies
   s.arrow(['web', 'r'], ['worker', 'l'], {
     dashed: true, label: ['config files +', 'reload trigger'], ly: 196,
   });
 
-  // ---- routing traffic, straight to the container by DNS
+  // ---- routing traffic, straight to the container by DNS: web's searches
+  // and the worker's coverage runs
   s.arrow(['web', 'b', -70], ['serve', 't', -70], {});
+  s.arrow(['worker', 'b', -32], ['serve', 't', 80], { route: 'orth', mid: 345 });
+  s.text(658, 340, 'coverage pairs', { size: 10.5, anchor: 'start' });
   s.text(298, 300, 'HTTP :8080', { size: 10.5, anchor: 'end' });
   s.text(298, 313, 'direct DNS,', { size: 10.5, anchor: 'end' });
   s.text(298, 326, 'not via nginx', { size: 10.5, anchor: 'end', fill: '#A9691A' });

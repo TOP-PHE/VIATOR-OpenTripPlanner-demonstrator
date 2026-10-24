@@ -501,9 +501,22 @@ After the install completes:
 
 When CI is green for `v0.1.x` and you want it on the VPS:
 
-> **A deploy restarts web, and a restart of web ends a running coverage run**
-> (it is marked failed and must be started again, §6.18). Look at the coverage
-> page first and deploy when no run is in progress.
+> **A deploy pauses a running coverage run; it no longer ends it** (§6.19). The
+> deploy recreates web and the worker; the worker releases the run, the page
+> shows it **resuming**, and the new worker continues it where it stopped,
+> usually within a minute of starting. Nothing to do before or after, and a
+> deploy costs the run nothing: a release does not count toward
+> `COVERAGE_MAX_RESUMES`. (Before the release that moved runs into the worker,
+> a deploy ended the run, §6.18.)
+>
+> **The deploy that ships this change** (issue #392) is the last one that
+> stops a run in old web: old web is replaced, the new worker finds the run
+> `running` with no holder and resumes it, skipping the pairs already in the
+> matrix. That run has no frozen settings yet, so the hubs and the coverage
+> settings are read again at that resume. Until web's start-up has applied
+> the migration, the new worker logs `coverage_executor.poll_failed` every
+> 10 s; that stops by itself. The deploy script ends with an advisory check
+> that the worker logged `coverage_executor.started`.
 
 > **Fresh-install only**: see [`docker/INSTALL.md` §5.5](../docker/INSTALL.md) — run `bin/viator-bootstrap-stubs.sh` once before the first `docker compose up`. After that, the orchestrator regenerates `docker/generated/*` from DB state on every web-container boot.
 >
@@ -2206,11 +2219,10 @@ docker compose -p viator logs web | grep orphans_marked_failed
 
 What you see now, and what to do:
 
-- A run interrupted by a restart is still marked **failed**: it cannot be
-  resumed. Start it again from the coverage page.
-- **A deploy still ends a running run** (a deploy restarts web). Until runs
-  move to the worker (the open part of issue #392), deploy when no coverage
-  run is in progress, or start the run again after the deploy.
+- **Superseded by §6.19**: runs now execute in the worker and resume after a
+  restart, and web no longer marks runs failed at startup (the WARNING above
+  is gone). A run already marked **failed** with `orphaned_by_restart` stays
+  so: start it again from the coverage page.
 - To find what restarted web: the WARNING's time is the restart; then
   `docker inspect viator-web-1` (`StartedAt`), the Docker journal at that
   time (`journalctl -u docker --since …`: `stopping restart-manager`,
@@ -2221,6 +2233,72 @@ What you see now, and what to do:
   for any stop of web during a run; it does not tell who stopped it.
 - The health check, its timeout and retries and the autoheal label are
   unchanged.
+
+### 6.19 Coverage runs run in the worker and resume after a restart (issue #392)
+
+Since this release a coverage run no longer runs in web. **Run coverage**
+creates the run and returns; the worker (`viator-worker-1`) picks it up within
+about 10 s and runs it. A restart of web (deploy, autoheal, manual) does not
+touch it. A restart of the worker pauses it, and it continues where it
+stopped: the pairs already in the matrix are not asked again, and the counts
+stay exact.
+
+What the coverage page shows, in the status pill:
+
+| Pill | Meaning | What to do |
+|---|---|---|
+| **queued** | Created, waiting for the worker (one run at a time by default; a second run waits for the first) | Nothing. **Stop** cancels it at once |
+| **running** | The worker is running it | **Stop** ends it after the pairs in flight, as before |
+| **stopping** | Stop clicked; the worker ends it within a few seconds | Wait for **cancelled** |
+| **resuming** | The worker stopped (a deploy, a restart, a crash) and no worker holds the run yet. The cells stay; "resumed N×" counts the resumes | Nothing after a deploy: it continues once the new worker runs (about 10 s after it starts; about 3 min if the worker was killed). If it lasts longer, see below. **Stop** cancels it at once (no worker needed) |
+| **failed · resumed N× · *reason*** | The run failed; the page says why (hover for the whole text): the resume limit, an error in the pair loop, a run that ended without a result | See below |
+
+During a deploy (§5.1) you therefore see the run go **running → resuming →
+running**, with the cell count going on from where it was. The run's summary
+in the database lists its resumes (`summary.resumes`: when, of which kind,
+which worker it replaced, how many pairs were done; `crash_resume_count` and
+`release_resume_count` count each kind):
+
+```sql
+SELECT status, resume_count, summary->'crash_resume_count' AS crashes,
+       summary->'release_resume_count' AS releases, summary->>'failure_reason' AS reason,
+       summary->'resumes' AS resumes
+FROM network_coverage_runs ORDER BY started_at DESC LIMIT 5;
+```
+
+Two kinds of resume: a **release** resume follows a graceful worker stop (a
+deploy, `docker compose restart worker`): the worker hands the run back at
+SIGTERM. A **crash** resume follows a worker that stopped without handing it
+back (killed, out of memory, crashed), once its heartbeat is 3 minutes old.
+Only crash resumes count toward `COVERAGE_MAX_RESUMES`. A database outage
+while the run starts or while it writes a pair is retried for a few seconds;
+past that the worker leaves the run for a crash resume rather than failing
+it, and a pair whose write never succeeded is asked again at that resume (the
+run is completed only when every pair has its result).
+
+**A run that stays "resuming"** has no worker: check `docker compose -p viator
+ps worker` and `docker compose -p viator logs worker | grep coverage_executor`
+(`claimed`, `resumed`, `released`, `poll_failed`, `heartbeat_failed`). The
+Prometheus alert `CoverageRunHeartbeatStale` fires after 15 min of this, and
+`CoverageRunNotClaimed` when a queued run waits 15 min while none runs (no
+notification channel is configured yet: see them at `/prometheus/alerts`).
+
+**A run that ends failed with `resume_limit_reached`**: its worker stopped
+without handing it back more than `COVERAGE_MAX_RESUMES` times (default 5)
+during the run, so it was not resumed again. The page shows the reason, with
+the pairs still missing and the last interruption when there was one. Look at
+the worker log at the times in `summary.resumes` (an out-of-memory kill, a
+crash loop, a database outage), fix that, and start the run again.
+
+Two settings in **Admin → Configuration → Network coverage matrix**, read by
+the worker every 10 s: `COVERAGE_MAX_CONCURRENT_RUNS` (default 1: how many
+runs run at once; more runs share the engines) and `COVERAGE_MAX_RESUMES`
+(default 5, crash resumes only). The other coverage settings are frozen for
+a run at its start and stay frozen across resumes.
+
+To stop a run by hand (no web page), `UPDATE network_coverage_runs SET
+cancel_requested_at = now() WHERE status = 'running';` does what **Stop**
+does. Killing the worker no longer stops a run: it resumes.
 
 ## 7. Rollback
 
@@ -2242,6 +2320,15 @@ sudo docker compose up -d --force-recreate web worker
 # 4. Verify.
 curl -s http://localhost/healthz/version    # → {"version": "v0.1.8"}
 ```
+
+**Rolling back past the release that moved coverage runs into the worker
+(issue #392)**: the old image runs coverage in web again. At its start-up old
+web marks every coverage run that is `running` **or** `pending` as `failed`
+(`orphaned_by_restart`), and the old worker never runs a queued run. So look
+at the coverage page first: let a run finish, or accept that it must be
+started again after the rollback. The migration of that release only adds
+columns (with defaults), so the old image runs on the new schema; no database
+step is needed.
 
 **About database migrations on rollback**: Alembic migrations are forward-
 only by default. If `v0.1.9 → v0.1.10` added a column, rolling back to

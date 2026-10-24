@@ -158,6 +158,57 @@ class PrometheusHttpMiddleware(BaseHTTPMiddleware):
 # ─── DB-derived gauges (queried at scrape time) ────────────────────────────
 
 
+# #392 — the coverage executor's state, read from `network_coverage_runs` at
+# scrape time (the executor runs in the worker, which has no /metrics; the
+# database is where web and worker meet). The ages use the database's clock,
+# the one `heartbeat_at` is written with. Alert rules: rules/coverage.yml.
+_COVERAGE_GAUGES: tuple[tuple[str, str], ...] = (
+    ("viator_coverage_runs_queued", "Coverage runs waiting for the executor (status pending)."),
+    ("viator_coverage_runs_running", "Coverage runs in status running (held or being resumed)."),
+    (
+        "viator_coverage_oldest_queued_age_seconds",
+        "Seconds the oldest queued coverage run has waited for a claim; 0 when none.",
+    ),
+    (
+        "viator_coverage_heartbeat_age_seconds",
+        "Largest heartbeat age of a running coverage run (since its start when it "
+        "has none); 0 when no run is running. Over 180 s the run is resumed.",
+    ),
+    (
+        "viator_coverage_resumes_total",
+        "Resumes recorded on coverage runs (sum of resume_count; a deleted run "
+        "takes its resumes with it).",
+    ),
+)
+
+_COVERAGE_SQL = """
+SELECT
+  count(*) FILTER (WHERE status = 'pending'),
+  count(*) FILTER (WHERE status = 'running'),
+  coalesce(extract(epoch FROM now() - min(started_at) FILTER (WHERE status = 'pending')), 0),
+  coalesce(extract(epoch FROM now() - min(coalesce(heartbeat_at, started_at))
+                   FILTER (WHERE status = 'running')), 0),
+  coalesce(sum(resume_count), 0)
+FROM network_coverage_runs
+"""
+
+
+def _coverage_metrics(session_factory: Callable[[], Any]) -> Iterable[Metric]:
+    """The `viator_coverage_*` gauges; none on a DB error (the other
+    metrics still emit), like the rest of the collector."""
+    from sqlalchemy import text
+
+    try:
+        with session_factory() as db:
+            values = [max(0.0, float(v or 0)) for v in db.execute(text(_COVERAGE_SQL)).one()]
+    except Exception:
+        return
+    if len(values) != len(_COVERAGE_GAUGES):
+        return
+    for (name, help_text), value in zip(_COVERAGE_GAUGES, values, strict=True):
+        yield GaugeMetricFamily(name, help_text, value=value)
+
+
 class _ViatorDbCollector(Collector):
     """Custom collector that queries the DB on each Prometheus scrape.
 
@@ -192,6 +243,8 @@ class _ViatorDbCollector(Collector):
         yield GaugeMetricFamily("viator_active_sessions_total", "")
         yield GaugeMetricFamily("viator_rebuilds_total", "")
         yield GaugeMetricFamily("viator_rebuilds_failed_total", "")
+        for name, _help in _COVERAGE_GAUGES:
+            yield GaugeMetricFamily(name, "")
 
     def collect(self) -> Iterable[Metric]:
         # Lazy import — see module-level rationale.
@@ -207,6 +260,8 @@ class _ViatorDbCollector(Collector):
         from .models import RebuildJob
         from .models import Session as SessionRow
         from .models.sessions import SessionState
+
+        yield from _coverage_metrics(session_factory)
 
         try:
             with session_factory() as db:

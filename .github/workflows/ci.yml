@@ -140,7 +140,8 @@ jobs:
       # image docker-compose.yml runs (tests/unit/test_monitoring_config.py
       # keeps the two tags equal). `check config` also loads every rule file
       # prometheus.yml names; the dashboard queries are written as a rule
-      # file first (scripts/dashboard_queries_as_rules.py).
+      # file first (scripts/dashboard_queries_as_rules.py). `test rules` runs
+      # the alert rules' unit tests in docker/prometheus/tests/ (#392).
       - name: promtool (Prometheus config, alert rules, dashboard queries)
         run: |
           set -euo pipefail
@@ -157,6 +158,10 @@ jobs:
             prom/prometheus:v3.0.1)
           "${promtool[@]}" check config /etc/prometheus/prometheus.yml
           "${promtool[@]}" check rules "${rule_files[@]}" /promql/dashboard-queries.yml
+          # Issue #392 — unit tests of the alert rules (series in, alerts out).
+          for f in docker/prometheus/tests/*_test.yml; do
+            "${promtool[@]}" test rules "/etc/prometheus/tests/$(basename "$f")"
+          done
 
       # Audit-2026-05 P0 #3. pip-audit is in requirements-dev.txt; this
       # step gates the build on Python-layer CVEs (Trivy in docker.yml
