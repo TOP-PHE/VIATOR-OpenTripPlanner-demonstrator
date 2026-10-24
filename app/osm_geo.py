@@ -13,7 +13,8 @@ It is the single source of truth for:
   - `country_of_position()` — the country of a stop for the station module's
     stop extract (MSMM 22.2, `iso2_point`): any bundled European country, not
     only the v1 list, and the nearest one for a stop on a coast the boundaries
-    miss; none where 1:50m cannot tell (by a v1 border, in a neighbour),
+    miss; none where 1:50m cannot tell (by a v1 border, by a neighbour's on a
+    coast, in a neighbour),
   - `detect_from_stops()` — count a GTFS feed's stops per country (UIC prefix
     primary, point-in-polygon fallback), and the ≥5-stop suggestion,
   - `crop_geojson()` — the merged polygon the build hands to `osmium extract`.
@@ -109,7 +110,13 @@ COAST_TOLERANCE_KM = 10.0
 # `OTHER_COUNTRIES` while a v1 boundary passes within this distance (beyond
 # the distance to that country, for the coast fallback) is in none: 1:50m
 # cannot tell, and an empty country is a question for an administrator in the
-# station module, where a wrong one is acted upon.
+# station module, where a wrong one is acted upon. Likewise a position the
+# coast fallback places while a boundary of `NEIGHBOUR_COUNTRIES` passes within
+# this distance beyond the nearest (Gibraltar's airport, 0.8 km from Spain's
+# 1:50m line and 1.1 km from Gibraltar's 1:10m one). A position inside a
+# bundled polygon keeps that polygon's country however near a neighbour:
+# Albina (Suriname) lies inside France's 1:50m French Guiana, 3.0 km from
+# Suriname's line, and stays FR.
 BORDER_DOUBT_KM = 3.0
 
 # A country is *pre-ticked* in the UI only when it has at least this many
@@ -314,7 +321,11 @@ def country_of_position(lat: float, lon: float) -> str | None:
        Georgia or Gibraltar is in none of ours);
     3. None when it is one of `OTHER_COUNTRIES` and a v1 boundary lies within
        `BORDER_DOUBT_KM` beyond it (a station of Narva, Estonia, inside the
-       1:50m Russia): as before those countries were bundled.
+       1:50m Russia): as before those countries were bundled;
+    4. None when it comes from the coast fallback and a boundary of
+       `NEIGHBOUR_COUNTRIES` lies within `BORDER_DOUBT_KM` beyond it: the
+       gap between Gibraltar's 1:10m polygon and Spain's 1:50m one (its
+       airport, La Línea) is Spain's or Gibraltar's, 1:50m cannot tell.
 
     None too for the GTFS placeholder (0, 0) and a position not finite.
     """
@@ -322,17 +333,19 @@ def country_of_position(lat: float, lon: float) -> str | None:
         return None
     iso = _containing(lat, lon, None)
     distance = 0.0
+    doubt: frozenset[str] = frozenset()
     if iso is None:
         near = _boundaries_within(lat, lon, COAST_TOLERANCE_KM)
         if not near:
             return None
         iso = min(near, key=near.__getitem__)
         distance = near[iso]
+        doubt = NEIGHBOUR_COUNTRIES
     if iso in NEIGHBOUR_COUNTRIES:
         return None
-    if iso in OTHER_COUNTRIES and _boundaries_within(
-        lat, lon, distance + BORDER_DOUBT_KM, VALID_COUNTRIES
-    ):
+    if iso in OTHER_COUNTRIES:
+        doubt = doubt | VALID_COUNTRIES
+    if doubt and _boundaries_within(lat, lon, distance + BORDER_DOUBT_KM, doubt):
         return None
     return iso
 
