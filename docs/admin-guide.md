@@ -3767,18 +3767,43 @@ the extracts changes no graph build.
     Medyka (Poland), Idomeni, Pythio and Kastanies (Greece), Tovarnik and
     Metković (Croatia), Cap-d'Ail (France) stay without a country, as
     before; so do Chop (Ukraine), Gevgelija (North Macedonia) and Monaco on
-    the other side. Negotin, Zaječar and Subotica (Serbia) are Serbian;
+    the other side, and a position inside the 1:50m Vatican (all of that
+    polygon lies within 3 km of Italy's line). That polygon lies about 1 km
+    west of the real Vatican: Città del Vaticano station and St Peter's fall
+    inside Italy's polygon and are `IT`. Kapıkule (Turkey), Ungheni and
+    Giurgiulești (Moldova), and part of Mamonovo (Russia, at the edge of the
+    band: Poland's line 2.9 to 3.6 km away) get no country under this rule
+    either: they had none before version 3 too, so in the module each stays
+    a review item "A stop in no country", for an administrator to answer.
+    Negotin, Zaječar and Subotica (Serbia) are Serbian;
   - a stop in a country beyond the bundled ones' land borders (Georgia,
     Armenia, Azerbaijan, Syria, Iraq, Iran, Kazakhstan, Mongolia, China,
     North Korea, Japan, Brazil, Suriname, Gibraltar): bundled only to be
     known as none of ours; and a station of a bundled country that its
-    1:50m line puts there (Nusaybin, Turkey, in the 1:50m Syria).
+    1:50m line puts there (Nusaybin, Turkey, in the 1:50m Syria);
+  - a stop on a coast the boundaries miss when the line of one of those
+    countries passes within 3 km beyond the nearest boundary (a rule added
+    after version 3, #395, without a new version: it needs no Refresh at
+    deploy). The gap between Gibraltar's boundary and Spain's (Gibraltar
+    airport, La Línea; neither has a rail station) has no country;
+    Algeciras stays Spanish. The rule touches eight more places, none in an
+    OSM-crop country: French Guiana's coast by Brazil and Suriname, Turkey's
+    coasts by Georgia and by Syria (Hatay), Russia's Black Sea coast by
+    Georgia (Adler, the Psou), its Caspian coast by Azerbaijan, the Volga
+    delta by Kazakhstan, the Tumen mouth by North Korea and Kunashir by
+    Japan. Two real stations go from Russia to no country there, Adler and
+    Imeretinsky Kurort (Sochi); no feed of Russia exists. The rule does not
+    reach a stop inside a bundled boundary: Albina (Suriname) lies inside
+    the 1:50m French Guiana, 3.0 to 3.3 km from Suriname's line, and is
+    `FR` (it has no rail station).
 
-  **Crimea is Ukraine** (`UA`, Sevastopol included): the position of the EU
-  and the UN, as Natural Earth's Ukrainian point of view draws it (its
-  default view, de facto, gave Russia). Kosovo is `XK`, a user-assigned code
-  the module accepts. Northern Cyprus is not decided apart: a stop within
-  10 km of the 1:50m Cyprus is `CY`, one farther (Kyrenia) has none.
+  **Crimea is Ukraine** (`UA`, Sevastopol included): the EU position
+  (Natural Earth's points of view for Ukraine and the EU members it covers
+  draw it so; its default view, de facto, gave Russia). Kosovo is
+  `XK`, a user-assigned code the module accepts. **Northern Cyprus is an
+  open question for the owner**, not decided yet: the boundaries carry no
+  polygon for it, so a stop within 10 km of the 1:50m Cyprus is `CY`
+  (Famagusta, northern Nicosia), one farther (Kyrenia) has none.
 
   **After deploying this version**, what you will see:
   - **Refresh (all providers) on each session, one session after the

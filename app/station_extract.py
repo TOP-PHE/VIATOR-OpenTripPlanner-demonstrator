@@ -118,6 +118,16 @@ log = logging.getLogger(__name__)
 # up to #389, before any release carried version 3): a position by a v1
 # border whose country would be a non-v1 neighbour (within 3 km), one in a
 # country beyond the bundled ones (Georgia, Syria, Gibraltar…); Crimea is UA.
+# 23 October, not raised for #395 (none from the coast fallback when a
+# boundary of a country beyond ours lies within 3 km beyond the nearest): it
+# changes only positions in no polygon, in nine places: by Gibraltar (its
+# airport, La Línea), on French Guiana's coast by Brazil and Suriname, on
+# Turkey's coasts by Georgia and by Syria (Hatay), on Russia's Black Sea coast
+# by Georgia (Adler, the Psou), its Caspian coast by Azerbaijan, the Volga
+# delta by Kazakhstan, the Tumen mouth by North Korea and Kunashir by Japan.
+# No v1 country is affected (Algeciras and San Roque-La Línea keep ES); two
+# real stations go from RU to none, Adler and Imeretinsky Kurort (Sochi), and
+# no feed of Russia exists. The file is the same.
 # Any change to `app/data/country_borders.geojson` changes these rows: raise
 # this version with it (tests/unit/test_osm_geo.py pins the file's sha256).
 EXTRACTOR_VERSION = "viator-stop-extract-3"
