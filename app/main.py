@@ -25,7 +25,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from starlette.concurrency import run_in_threadpool
 
-from . import concurrency, config_service, detect, ingestion, metrics
+from . import concurrency, config_service, detect, ingestion, metrics, tls_contexts
 from .api import coverage_share as coverage_share_routes
 from .api import credentials as credentials_routes
 from .api import geocode as geocode_routes
@@ -181,6 +181,8 @@ def _startup() -> None:
     """
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
     _warn_if_legacy_basic_auth_is_locked()
+    # #407 — the bundled TLS intermediate of the AT NAP hosts, near expiry.
+    tls_contexts.log_expiry_warning()
     # Initialise concurrency gates from the live platform_config. If the DB is
     # unreachable at boot (rare; the entrypoint just ran a migration on it),
     # we fall back to schema defaults so the app still starts.

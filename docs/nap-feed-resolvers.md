@@ -137,6 +137,8 @@ given file is decided by the data server, and shows as an HTTP 401 on refresh.
   2026-10-01; the catalogue is public, so a lookup succeeding proves nothing about the token).
   The account must have accepted each dataset's licence on the portal. The provider's documentation page is titled "only until November 22nd": the API may
   change after that date; re-run the probe if lookups start failing.
+  `user.mobilitaetsverbuende.at` omits its TLS intermediate: VIATOR bundles it for the two AT
+  hosts only (`app/tls_contexts.py`, admin guide §6.20, #407).
 - **Spain** (nap.transportes.gob.es): *Custom header* `ApiKey`, the key from the portal's
   account page. Catalogue `GET /api/Fichero/GetList`; file `GET /api/Fichero/download/{id}`.
 - **Belgium**: no credential needed for the SNCB/NMBS NeTEx (public blob URL). A transportdata.be
