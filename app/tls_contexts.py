@@ -59,8 +59,8 @@ INTERMEDIATE_HOSTS: Final[frozenset[str]] = frozenset(
     }
 )
 
-# A log line at web startup once the bundled certificate is this close to
-# its expiry (it would then fail those hosts again, with the same error).
+# A log line (web startup, then daily) once the bundled certificate is this
+# close to its expiry (it would then fail those hosts again, with the same error).
 EXPIRY_WARNING_DAYS: Final[int] = 60
 
 
@@ -74,6 +74,7 @@ def build_context(extra_pem: str, cafile: str | None = None) -> ssl.SSLContext:
     anchor. Without it the chain must reach a self-signed root of the store.
     """
     ctx = ssl.create_default_context(cafile=cafile) if cafile else httpx.create_ssl_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_verify_locations(cadata=extra_pem)
     ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
     return ctx
@@ -104,7 +105,12 @@ def _env_proxy(url: str) -> str | None:
     if urllib.request.proxy_bypass(_host(url)):
         return None
     proxies = urllib.request.getproxies()
-    return proxies.get("https") or proxies.get("all")
+    proxy = proxies.get("https") or proxies.get("all")
+    if not proxy:
+        return None
+    # As httpx does for its own environment proxies: a value without a scheme
+    # (`p.example:3128`) means an http:// proxy, never a ValueError.
+    return proxy if "://" in proxy else f"http://{proxy}"
 
 
 def mounts_for(
@@ -123,7 +129,12 @@ def mounts_for(
 def tls_mounts() -> dict[str, httpx.AsyncBaseTransport | None]:
     """`httpx.AsyncClient(mounts=tls_mounts())`: the hosts of
     `INTERMEDIATE_HOSTS` verify with the bundled intermediate, every other
-    URL with the client's default context."""
+    URL with the client's default context.
+
+    Every refresh client calls this (any provider, the OSM refresh, NAP
+    catalogue imports, Test login), so the PEM file must ship with the app:
+    moving or dropping `EXTRA_INTERMEDIATES_PATH` breaks all refreshes, not
+    only the AT ones."""
     return mounts_for(INTERMEDIATE_HOSTS, _bundled_context())
 
 
@@ -148,7 +159,8 @@ def expiry_warning(now: datetime | None = None) -> str | None:
 
 
 def log_expiry_warning() -> None:
-    """One WARNING at startup when `expiry_warning` has something to say."""
+    """One WARNING when `expiry_warning` has something to say: at web startup
+    and from the daily scheduler job (`app/main.py`)."""
     message = expiry_warning()
     if message is not None:
         log.warning(message)

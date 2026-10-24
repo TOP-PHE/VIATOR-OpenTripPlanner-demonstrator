@@ -2350,9 +2350,18 @@ Workaround in VIATOR (`app/tls_contexts.py`), verification never weakened:
   feed downloads and NAP lookups of a refresh, and NAP catalogue imports
   (`httpx.AsyncClient(..., mounts=tls_contexts.tls_mounts())`). A test fails
   if any code adds `verify=False`.
-- `web` logs `tls.extra_intermediate_expiring …` at startup once the bundled
-  certificate is within 60 days of its expiry. Replace the file then (and
+- `web` logs `tls.extra_intermediate_expiring …` at startup, and daily at
+  03:30 UTC from its scheduler, once the bundled certificate is within 60
+  days of its expiry. Replace the file then (and
   the fingerprint pinned in `tests/unit/test_tls_contexts.py`).
+
+**After a deploy**: on /credentials, run **Test login** on the AT NAP
+credential; it should answer `login OK — token valid for … s`. That is the
+first check of VIATOR's own TLS code against the real server (the fix was
+verified there with `openssl s_client`).
+
+Every refresh client loads the PEM file (`tls_mounts()`), so moving or
+dropping it breaks all refreshes, not only the AT ones.
 
 **Removing it**: once `openssl s_client` above answers `Verify return code:
 0 (ok)` for both hosts, the server sends its full chain. Remove the hosts

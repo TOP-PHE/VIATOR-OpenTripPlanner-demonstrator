@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import inspect
 import re
 import ssl
 import threading
@@ -19,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import certifi
+import httpcore
 import httpx
 import pytest
 from cryptography import x509
@@ -35,6 +37,26 @@ REPO = Path(__file__).resolve().parents[2]
 BUNDLED_SHA256 = "973a41276ffd01e027a2aad49e34c37846d3e976ff6a620b6712e33832041aa6"
 GODADDY_G2_INTERMEDIATE = "Go Daddy Secure Certificate Authority - G2"
 GODADDY_G2_ROOT = "Go Daddy Root Certificate Authority - G2"
+
+
+_PROXY_VARS = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mounted transports read the proxy environment (`_env_proxy`): the
+    local-server tests must not depend on the runner's proxy settings."""
+    for name in _PROXY_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 # ───────────────────────────── test PKI ─────────────────────────────
@@ -144,6 +166,7 @@ class _Ok(http.server.BaseHTTPRequestHandler):
 def leaf_only_server(pki: Pki) -> Iterator[str]:
     """https://localhost:<port>/ serving only the leaf (no intermediate)."""
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     server_ctx.load_cert_chain(pki.leaf_chain_file)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Ok)
     httpd.socket = server_ctx.wrap_socket(httpd.socket, server_side=True)
@@ -154,6 +177,13 @@ def leaf_only_server(pki: Pki) -> Iterator[str]:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def _default_context(pki: Pki) -> ssl.SSLContext:
+    """What a client without the helper uses: the test root alone."""
+    ctx = ssl.create_default_context(cafile=pki.root_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
 def _get(url: str, *, verify: ssl.SSLContext, mounts: dict | None = None) -> int:
@@ -168,13 +198,13 @@ def _get(url: str, *, verify: ssl.SSLContext, mounts: dict | None = None) -> int
 
 
 def test_default_context_fails_on_a_leaf_only_server(pki: Pki, leaf_only_server: str) -> None:
-    default = ssl.create_default_context(cafile=pki.root_file)
+    default = _default_context(pki)
     with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
         _get(leaf_only_server, verify=default)
 
 
 def test_helper_context_validates_a_leaf_only_server(pki: Pki, leaf_only_server: str) -> None:
-    default = ssl.create_default_context(cafile=pki.root_file)
+    default = _default_context(pki)
     helper = tls_contexts.build_context(pki.intermediate_pem, cafile=pki.root_file)
     mounts = tls_contexts.mounts_for(frozenset({"localhost"}), helper)
     assert _get(leaf_only_server, verify=default, mounts=mounts) == 200
@@ -183,7 +213,7 @@ def test_helper_context_validates_a_leaf_only_server(pki: Pki, leaf_only_server:
 def test_host_outside_the_allow_list_keeps_the_default_context(
     pki: Pki, leaf_only_server: str
 ) -> None:
-    default = ssl.create_default_context(cafile=pki.root_file)
+    default = _default_context(pki)
     helper = tls_contexts.build_context(pki.intermediate_pem, cafile=pki.root_file)
     mounts = tls_contexts.mounts_for(frozenset({"zz.example"}), helper)
     with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
@@ -204,6 +234,7 @@ def test_helper_context_still_checks_the_host_name(pki: Pki, leaf_only_server: s
     helper = tls_contexts.build_context(pki.intermediate_pem, cafile=pki.root_file)
     assert helper.check_hostname
     assert helper.verify_mode == ssl.CERT_REQUIRED
+    assert helper.minimum_version >= ssl.TLSVersion.TLSv1_2
     by_ip = leaf_only_server.replace("localhost", "127.0.0.1")
     mounts = tls_contexts.mounts_for(frozenset({"127.0.0.1"}), helper)
     with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
@@ -263,14 +294,58 @@ def test_the_at_nap_hosts_in_use_are_allow_listed() -> None:
 def test_mounted_transport_follows_the_environment_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for name in ("https_proxy", "all_proxy", "no_proxy", "ALL_PROXY"):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.zz.example:3128")
     monkeypatch.setenv("NO_PROXY", "data.mobilitaetsverbuende.at")
     assert tls_contexts._env_proxy("https://user.mobilitaetsverbuende.at") == (
         "http://proxy.zz.example:3128"
     )
     assert tls_contexts._env_proxy("https://data.mobilitaetsverbuende.at") is None
+    mounts = tls_contexts.tls_mounts()
+    via_proxy = mounts["https://user.mobilitaetsverbuende.at"]
+    direct = mounts["https://data.mobilitaetsverbuende.at"]
+    assert isinstance(via_proxy, httpx.AsyncHTTPTransport)
+    assert isinstance(direct, httpx.AsyncHTTPTransport)
+    assert isinstance(via_proxy._pool, httpcore.AsyncHTTPProxy)
+    assert not isinstance(direct._pool, httpcore.AsyncHTTPProxy)
+
+
+def test_no_environment_proxy_means_a_direct_transport() -> None:
+    assert tls_contexts._env_proxy("https://user.mobilitaetsverbuende.at") is None
+
+
+def test_a_proxy_without_a_scheme_is_an_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """As httpx reads it: `p.zz.example:3128` must not raise in tls_mounts()."""
+    monkeypatch.setenv("HTTPS_PROXY", "p.zz.example:3128")
+    assert tls_contexts._env_proxy("https://user.mobilitaetsverbuende.at") == (
+        "http://p.zz.example:3128"
+    )
+    transport = tls_contexts.tls_mounts()["https://user.mobilitaetsverbuende.at"]
+    assert isinstance(transport, httpx.AsyncHTTPTransport)
+    assert isinstance(transport._pool, httpcore.AsyncHTTPProxy)
+
+
+def test_production_context_trusts_certifis_root_and_knows_the_intermediate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The context of the AT hosts, built as in production (httpx's default:
+    certifi), holds the GoDaddy Root G2 and the bundled G2 intermediate."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    tls_contexts._bundled_context.cache_clear()
+    try:
+        ctx = tls_contexts.context_for("https://user.mobilitaetsverbuende.at/")
+        assert ctx is not None
+        common_names = {
+            value
+            for cert in ctx.get_ca_certs()
+            for rdn in cert["subject"]
+            for key, value in rdn
+            if key == "commonName"
+        }
+    finally:
+        tls_contexts._bundled_context.cache_clear()
+    assert {GODADDY_G2_ROOT, GODADDY_G2_INTERMEDIATE} <= common_names
+    assert len(common_names) > 100  # certifi's roots, not an empty store
 
 
 # ─────────────────────────── the bundled PEM ───────────────────────────
@@ -351,6 +426,14 @@ def test_expiry_warning_names_an_unreadable_file(
     assert tls_contexts.expiry_warning() == (
         "tls.extra_intermediates_unreadable type=FileNotFoundError"
     )
+
+
+def test_web_checks_the_expiry_at_startup_and_daily() -> None:
+    from app import main
+
+    startup = inspect.getsource(main._startup)
+    assert "tls_contexts.log_expiry_warning()" in startup
+    assert 'tls_contexts.log_expiry_warning, "cron"' in startup
 
 
 # ───────────────────────────── guard ─────────────────────────────

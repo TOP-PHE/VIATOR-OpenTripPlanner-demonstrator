@@ -198,6 +198,11 @@ app/
 ├── sessions_orchestrator.py             MOTIS/OTP docker container lifecycle (per-session); both templates carry viator.autoheal="true"
 ├── url_redaction.py                     The one rule for URLs in logs/spans (query values outside SAFE_QUERY_KEYS and
 │                                        token path segments → REDACTED); used by logging_config, worker and tracing
+├── tls_contexts.py                      Bundled TLS intermediates for hosts that omit them (#407): allow-list
+│                                        INTERMEDIATE_HOSTS only (the AT NAP user./data.mobilitaetsverbuende.at),
+│                                        via httpx mounts=tls_mounts(); chain still ends at certifi's root; never verify=False
+├── data/tls/extra-intermediates.pem     GoDaddy G2 intermediate (public; provenance, SHA-256, expiry 2031-05-03 in its
+│                                        header + NOTICE); every refresh client loads it — never move it
 ├── refresh_progress.py                  Progress of provider / OSM refreshes in the DB (#359, `source_refresh_progress`):
 │                                        one refresh of a kind per session (409 `refresh_already_running`, never joined),
 │                                        30 s heartbeat / 5 min lease → `interrupted`, writes fenced by run_id, bytes ≤ 1

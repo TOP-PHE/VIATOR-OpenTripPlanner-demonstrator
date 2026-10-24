@@ -229,6 +229,11 @@ def _startup() -> None:
         sched = AsyncIOScheduler(timezone="UTC")
         # Daily retention prune at 03:00 UTC.
         sched.add_job(retention.prune_once, "cron", hour=3, minute=0, id="retention")
+        # #407 — the bundled TLS intermediate near expiry, for a web that runs
+        # for weeks without a restart.
+        sched.add_job(
+            tls_contexts.log_expiry_warning, "cron", hour=3, minute=30, id="tls_expiry_check"
+        )
 
         # Trainline refresh — daily check, but only acts when the configured
         # MASTER_STATIONS_REFRESH_DAYS interval has elapsed (handled in trainline.refresh()).
@@ -246,7 +251,10 @@ def _startup() -> None:
         )
         sched.start()
         _scheduler = sched
-        log.info("scheduler.started", jobs=["retention", "master_stations_refresh"])
+        log.info(
+            "scheduler.started",
+            jobs=["retention", "tls_expiry_check", "master_stations_refresh"],
+        )
     except Exception:
         log.exception("scheduler.startup_failed", crons_enabled=False)
 
