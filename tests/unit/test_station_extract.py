@@ -481,7 +481,7 @@ def test_the_country_of_a_stop_is_any_european_country_or_the_nearest_coast(
         "ZZ:S4": "",
         "ZZ:S5": "UA",
     }
-    assert EXTRACTOR_VERSION == "viator-stop-extract-3"
+    assert EXTRACTOR_VERSION == "viator-stop-extract-4"
 
 
 def test_quoting_round_trips(tmp_path: Path) -> None:

@@ -79,7 +79,7 @@ VALID_COUNTRIES: frozenset[str] = frozenset(COUNTRY_NAMES)
 # countries (the Western Balkans, Ukraine with Crimea, Belarus, Moldova, Russia,
 # the microstates, Åland, the Faroes and the Crown dependencies) and Turkey.
 # Only `country_of_position` returns them — a stop in Serbia is in Serbia, not
-# in no country — and only away from a v1 border (`BORDER_DOUBT_KM`). They are
+# in no country — and only away from a border (`BORDER_DOUBT_KM`). They are
 # never offered for the OSM crop (`validate_countries` refuses them), and
 # `country_for_point` keeps to the v1 list.
 OTHER_COUNTRIES: frozenset[str] = frozenset(
@@ -104,20 +104,24 @@ NEIGHBOUR_COUNTRIES: frozenset[str] = frozenset(
 COAST_TOLERANCE_KM = 10.0
 
 # The 1:50m borders lie up to some 2.6 km from the real ones (measured on rail
-# stations of v1 countries that fall inside their neighbour's polygon: Narva
-# 2.5 km inside Russia's, Cap-d'Ail 2.4 km inside Monaco's, Metković 2.3 km
-# inside Bosnia's). A position whose country would be one of
-# `OTHER_COUNTRIES` while a v1 boundary passes within this distance (beyond
-# the distance to that country, for the coast fallback) is in none: 1:50m
-# cannot tell, and an empty country is a question for an administrator in the
-# station module, where a wrong one is acted upon. Likewise a position the
-# coast fallback places while a boundary of `NEIGHBOUR_COUNTRIES` passes within
-# this distance beyond the nearest (Gibraltar's airport, 0.8 km from Spain's
-# 1:50m line and 1.1 km from Gibraltar's 1:10m one). A position inside a
-# bundled polygon keeps that polygon's country however near a neighbour:
-# Albina (Suriname) lies inside France's 1:50m French Guiana, 3.0 km from
-# Suriname's line, and stays FR.
+# stations that fall inside their neighbour's polygon: Narva 2.5 km inside
+# Russia's, Cap-d'Ail 2.4 km inside Monaco's, Metković 2.3 km inside
+# Bosnia's; the station module's review queue of 25 October showed it between
+# two v1 countries too: Kehl in France, Menton in Italy, Hendaye in Spain,
+# Wissembourg in Germany, Vallorcine in Switzerland, Riksgränsen in Norway). A
+# position is in none while the boundary of another bundled country passes
+# within this distance (beyond the distance to its own country, for the coast
+# fallback): 1:50m cannot tell, and an empty country is not a wrong one. The
+# station module takes then the country of the station a stop matches (its
+# name agreeing, within 300 m), and asks an administrator for a stop it cannot
+# match. A small share of the stations lies within it, and the 1:50m polygon
+# puts a good part of those in the wrong country. Until 25 October it applied only to a position whose country would
+# be one of `OTHER_COUNTRIES` near a v1 boundary, or placed by the coast
+# fallback near one of `NEIGHBOUR_COUNTRIES` (Gibraltar's airport).
 BORDER_DOUBT_KM = 3.0
+
+# Every bundled country: a boundary of any of them makes the border band.
+BUNDLED_COUNTRIES: frozenset[str] = VALID_COUNTRIES | OTHER_COUNTRIES | NEIGHBOUR_COUNTRIES
 
 # A country is *pre-ticked* in the UI only when it has at least this many
 # stops — a flat threshold so a stray / (0,0) coordinate can't drag in a
@@ -319,13 +323,10 @@ def country_of_position(lat: float, lon: float) -> str | None:
        nearest within `COAST_TOLERANCE_KM`;
     2. None when that country is one of `NEIGHBOUR_COUNTRIES` (a stop in
        Georgia or Gibraltar is in none of ours);
-    3. None when it is one of `OTHER_COUNTRIES` and a v1 boundary lies within
-       `BORDER_DOUBT_KM` beyond it (a station of Narva, Estonia, inside the
-       1:50m Russia): as before those countries were bundled;
-    4. None when it comes from the coast fallback and a boundary of
-       `NEIGHBOUR_COUNTRIES` lies within `BORDER_DOUBT_KM` beyond it: the
-       gap between Gibraltar's 1:10m polygon and Spain's 1:50m one (its
-       airport, La Línea) is Spain's or Gibraltar's, 1:50m cannot tell.
+    3. None when the boundary of another bundled country lies within
+       `BORDER_DOUBT_KM` beyond it (Kehl inside the 1:50m France, Narva inside
+       Russia, Gibraltar's airport between Spain and Gibraltar): 1:50m cannot
+       tell which side of a border the position is on.
 
     None too for the GTFS placeholder (0, 0) and a position not finite.
     """
@@ -333,19 +334,16 @@ def country_of_position(lat: float, lon: float) -> str | None:
         return None
     iso = _containing(lat, lon, None)
     distance = 0.0
-    doubt: frozenset[str] = frozenset()
     if iso is None:
         near = _boundaries_within(lat, lon, COAST_TOLERANCE_KM)
         if not near:
             return None
         iso = min(near, key=near.__getitem__)
         distance = near[iso]
-        doubt = NEIGHBOUR_COUNTRIES
     if iso in NEIGHBOUR_COUNTRIES:
         return None
-    if iso in OTHER_COUNTRIES:
-        doubt = doubt | VALID_COUNTRIES
-    if doubt and _boundaries_within(lat, lon, distance + BORDER_DOUBT_KM, doubt):
+    others = BUNDLED_COUNTRIES - {iso}
+    if _boundaries_within(lat, lon, distance + BORDER_DOUBT_KM, others):
         return None
     return iso
 
