@@ -41,6 +41,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from .. import tls_contexts
+
 log = logging.getLogger(__name__)
 
 # Default NAP URL — French National Access Point. Swap for other countries
@@ -684,7 +686,9 @@ async def fetch_datasets(
     # see _fetch_with_redirect_validation. Cannot rely on httpx's automatic
     # redirect following: it would happily chase a public URL into
     # http://localhost or http://169.254.169.254/ via a 302.
-    async with httpx.AsyncClient(timeout=60, follow_redirects=False) as c:
+    async with httpx.AsyncClient(
+        timeout=60, follow_redirects=False, mounts=tls_contexts.tls_mounts()
+    ) as c:
         r = await _fetch_with_redirect_validation(c, safe_url, headers)
         r.raise_for_status()
         data = r.json()

@@ -41,6 +41,14 @@ This product includes software developed by third parties:
   * MapLibre GL JS (when wired in step 14 of the implementation order)
     Licensed under the BSD-3-Clause License.
 
+  * "Go Daddy Secure Certificate Authority - G2", GoDaddy's public
+    intermediate CA certificate, as published at
+    https://certs.godaddy.com/repository/gdig2.crt — bundled unchanged as
+    app/data/tls/extra-intermediates.pem (issue #407) for the AT NAP hosts,
+    which omit it from their TLS chain. SHA-256
+    97:3A:41:27:6F:FD:01:E0:27:A2:AA:D4:9E:34:C3:78:46:D3:E9:76:FF:6A:62:0B:67:12:E3:38:32:04:1A:A6,
+    valid until 2031-05-03 07:00 UTC. A public certificate; no licence terms.
+
 This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for the full licence text.
 

@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .. import audit
+from .. import audit, tls_contexts
 from .. import credentials as crypto_module
 from ..db import get_db
 from ..db_steps import db_step
@@ -369,7 +369,7 @@ async def check_login(
     try:
         plaintext = crypto_module.decrypt(ciphertext, nonce, settings.jwt_secret)
         login = crypto_module.parse_oauth2_password_secret(plaintext)
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, mounts=tls_contexts.tls_mounts()) as client:
             _, ttl = await crypto_module.fetch_oauth2_token(client, login)
     except (crypto_module.CredentialDecryptError, crypto_module.CredentialLoginError) as exc:
         return LoginCheckResponse(ok=False, detail=str(exc))

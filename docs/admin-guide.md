@@ -2313,6 +2313,66 @@ To stop a run by hand (no web page), `UPDATE network_coverage_runs SET
 cancel_requested_at = now() WHERE status = 'running';` does what **Stop**
 does. Killing the worker no longer stops a run: it resumes.
 
+### 6.20 The AT NAP login fails with "unable to get local issuer certificate" (issue #407)
+
+Symptom (24 Oct refresh; the ÖBB NeTEx provider skipped, or **Test login**
+on /credentials): `credential 'AT NAP credential': login request to
+https://user.mobilitaetsverbuende.at/auth/realms/dbp-public/protocol/openid-connect/token
+failed: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable
+to get local issuer certificate`.
+
+Cause (server side): `user.mobilitaetsverbuende.at` sends its leaf
+certificate (`*.mobilitaetsverbuende.at`, issued by "Go Daddy Secure
+Certificate Authority - G2") **without** that intermediate certificate.
+`openssl s_client -connect user.mobilitaetsverbuende.at:443 -servername
+user.mobilitaetsverbuende.at` shows a single certificate and `Verify return
+code: 21 (unable to verify the first certificate)`. A browser fetches the
+missing intermediate through the certificate's AIA link; Python and httpx
+do not. certifi is not at fault. It is reported to Mobilitätsverbünde
+Österreich.
+
+Workaround in VIATOR (`app/tls_contexts.py`), verification never weakened:
+
+- `app/data/tls/extra-intermediates.pem` holds the public GoDaddy G2
+  intermediate, from GoDaddy's repository
+  (`https://certs.godaddy.com/repository/gdig2.crt`), SHA-256
+  `97:3A:41:27:6F:FD:01:E0:27:A2:AA:D4:9E:34:C3:78:46:D3:E9:76:FF:6A:62:0B:67:12:E3:38:32:04:1A:A6`,
+  valid until 2031-05-03 07:00 UTC (also in NOTICE). The owner downloaded it on the server
+  (the DER file, converted to PEM with openssl); `openssl verify` against certifi's roots: OK.
+- For the hosts of `INTERMEDIATE_HOSTS` only — `user.mobilitaetsverbuende.at`
+  (login) and `data.mobilitaetsverbuende.at` (dataset lookup and download)
+  — the TLS context is httpx's default (certifi's roots) plus that
+  intermediate. The chain must still end at certifi's "Go Daddy Root
+  Certificate Authority - G2" (partial chains are refused) and the host
+  name is still checked. Every other host keeps the default context; the
+  process-wide trust store is unchanged.
+- It applies to the credential login (feed refresh and **Test login**), the
+  feed downloads and NAP lookups of a refresh, and NAP catalogue imports
+  (`httpx.AsyncClient(..., mounts=tls_contexts.tls_mounts())`). A test fails
+  if any code adds `verify=False`.
+- `web` logs `tls.extra_intermediate_expiring …` at startup, and daily at
+  03:30 UTC from its scheduler, once the bundled certificate is within 60
+  days of its expiry. Replace the file then (and
+  the fingerprint pinned in `tests/unit/test_tls_contexts.py`).
+
+**After a deploy**: on /credentials, run **Test login** on the AT NAP
+credential; it should answer `login OK — token valid for … s`. That is the
+first check of VIATOR's own TLS code against the real server (the fix was
+verified there with `openssl s_client`).
+
+Every refresh client loads the PEM file (`tls_mounts()`), so moving or
+dropping it breaks all refreshes, not only the AT ones.
+
+**Removing it**: once `openssl s_client` above answers `Verify return code:
+0 (ok)` for both hosts, the server sends its full chain. Remove the hosts
+from `INTERMEDIATE_HOSTS` (and, when the list is empty, the PEM file, its
+NOTICE entry and the helper's call sites).
+
+If another host shows the same error, check it the same way; add it to
+`INTERMEDIATE_HOSTS` (and its issuing intermediate to the PEM file, from
+the CA's own repository) only when the server is confirmed to omit the
+intermediate.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

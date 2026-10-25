@@ -65,6 +65,7 @@ from ... import (
     station_extract,
     station_extract_upload,
     station_module,
+    tls_contexts,
 )
 from ...db import get_db
 from ...db_steps import db_step
@@ -1609,7 +1610,9 @@ async def refresh_osm(
         # not ending in .old" branch would re-rotate our .old.<N> generations,
         # producing garbage like osm.pbf.old.1.old. See app/ingestion.py.
         task = _RefreshTask("osm_pbf", "OSM-PBF", osm_url, "osm.pbf", None)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=600.0, mounts=tls_contexts.tls_mounts()
+        ) as client:
             with run.task(task.label):
                 outcome = await _refresh_one_task(client, db, sid, staging, task)
             run.done(task.label, outcome)
@@ -2191,7 +2194,9 @@ async def _run_url_tasks(
     """Download `work` one task after the other into `buckets`; `run`, when
     given, records each task's start, steps, bytes and outcome. Used by the
     whole session's refresh and by one provider's alone."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=600.0, mounts=tls_contexts.tls_mounts()
+    ) as client:
         for task in work:
             if run is not None and run.lost:
                 # Another refresh took the record over (this one stalled past

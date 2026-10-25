@@ -40,6 +40,8 @@ Thumbs.db
 docker/.env
 *.pem
 *.key
+# A public CA certificate, not a secret (#407).
+!app/data/tls/extra-intermediates.pem
 
 # Local volumes / runtime data
 /data/

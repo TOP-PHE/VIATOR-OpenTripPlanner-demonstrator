@@ -25,7 +25,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from starlette.concurrency import run_in_threadpool
 
-from . import concurrency, config_service, detect, ingestion, metrics
+from . import concurrency, config_service, detect, ingestion, metrics, tls_contexts
 from .api import coverage_share as coverage_share_routes
 from .api import credentials as credentials_routes
 from .api import geocode as geocode_routes
@@ -181,6 +181,8 @@ def _startup() -> None:
     """
     settings.inbox_dir.mkdir(parents=True, exist_ok=True)
     _warn_if_legacy_basic_auth_is_locked()
+    # #407 — the bundled TLS intermediate of the AT NAP hosts, near expiry.
+    tls_contexts.log_expiry_warning()
     # Initialise concurrency gates from the live platform_config. If the DB is
     # unreachable at boot (rare; the entrypoint just ran a migration on it),
     # we fall back to schema defaults so the app still starts.
@@ -227,6 +229,11 @@ def _startup() -> None:
         sched = AsyncIOScheduler(timezone="UTC")
         # Daily retention prune at 03:00 UTC.
         sched.add_job(retention.prune_once, "cron", hour=3, minute=0, id="retention")
+        # #407 — the bundled TLS intermediate near expiry, for a web that runs
+        # for weeks without a restart.
+        sched.add_job(
+            tls_contexts.log_expiry_warning, "cron", hour=3, minute=30, id="tls_expiry_check"
+        )
 
         # Trainline refresh — daily check, but only acts when the configured
         # MASTER_STATIONS_REFRESH_DAYS interval has elapsed (handled in trainline.refresh()).
@@ -244,7 +251,10 @@ def _startup() -> None:
         )
         sched.start()
         _scheduler = sched
-        log.info("scheduler.started", jobs=["retention", "master_stations_refresh"])
+        log.info(
+            "scheduler.started",
+            jobs=["retention", "tls_expiry_check", "master_stations_refresh"],
+        )
     except Exception:
         log.exception("scheduler.startup_failed", crons_enabled=False)
 
