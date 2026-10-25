@@ -148,13 +148,50 @@ def test_country_of_position_knows_every_european_country(name, lat, lon, expect
         # At sea 7 km off Monaco, in no polygon: Monaco's line is the nearest,
         # France's 0.2 km farther (the band counts from the nearest line).
         ("at sea off Monaco", 43.68, 7.43, None),
-        # Inside their own v1 country: unchanged.
-        ("Terespol, PL", 52.075, 23.62, "PL"),
-        ("Valga, EE", 57.776, 26.045, "EE"),
-        ("Svilengrad, BG", 41.77, 26.20, "BG"),
+        # Inside their own v1 country, within BORDER_DOUBT_KM of another
+        # country's line: none too since 25 October (every border).
+        ("Terespol, PL", 52.075, 23.62, None),
+        ("Valga, EE", 57.776, 26.045, None),
+        ("Svilengrad, BG", 41.77, 26.20, None),
     ],
 )
 def test_a_position_by_a_v1_border_is_never_the_neighbours(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,wrong",
+    [
+        # Stations by a border between two v1 countries, which the 1:50m
+        # polygons put on the wrong side (the station module's review queue of
+        # 25 October): no country rather than the neighbour's.
+        ("Kehl", 48.5747, 7.8148, None),
+        ("Menton", 43.7747, 7.4925, None),
+        ("Menton-Garavan", 43.7826, 7.5094, "IT"),
+        ("Hendaye", 43.3537, -1.7820, "ES"),
+        ("Wissembourg", 49.0367, 7.9416, "DE"),
+        ("Vallorcine", 46.0326, 6.9311, "CH"),
+        ("Riksgränsen", 68.4253, 18.1250, "NO"),
+        ("Irun", 43.3393, -1.8013, None),
+    ],
+)
+def test_a_position_by_a_border_between_v1_countries_is_in_none(name, lat, lon, wrong):
+    if wrong is not None:
+        assert g.country_for_point(lat, lon) == wrong, name  # the 1:50m polygon's side
+    assert g.country_of_position(lat, lon) is None, name
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        ("Strasbourg", 48.5849, 7.7343, "FR"),
+        ("Offenburg", 48.4766, 7.9461, "DE"),
+        ("Nancy", 48.6894, 6.1744, "FR"),
+        # 0.8 km from the coast, more than 3 km from France's line: Italian.
+        ("Ventimiglia", 43.7920, 7.6086, "IT"),
+    ],
+)
+def test_a_position_farther_than_the_band_keeps_its_country(name, lat, lon, expected):
     assert g.country_of_position(lat, lon) == expected, name
 
 
@@ -184,13 +221,14 @@ def test_the_border_doubt_is_measured_from_the_v1_boundary():
         ("by Bosnia and Herzegovina", 43.7, 19.5, "BA"),
     ],
 )
-def test_the_border_doubt_counts_only_v1_boundaries(name, lat, lon, neighbour):
-    # A border between two countries outside the v1 list puts no stop in
-    # doubt: neither side is minted from a wrong v1 country.
+def test_the_border_doubt_counts_every_bundled_boundary(name, lat, lon, neighbour):
+    # Since 25 October a border between two countries outside the v1 list
+    # puts a stop in doubt too: 1:50m cannot tell its side either.
     near = g._boundaries_within(lat, lon, 10.0)
     assert near.get(neighbour, math.inf) < g.BORDER_DOUBT_KM
     assert not set(near) & g.VALID_COUNTRIES
-    assert g.country_of_position(lat, lon) == "RS", name
+    assert g._containing(lat, lon, None) == "RS", name
+    assert g.country_of_position(lat, lon) is None, name
 
 
 @pytest.mark.parametrize(
@@ -280,21 +318,23 @@ def test_the_coast_fallback_gives_none_by_a_neighbours_line(name, lat, lon, spai
     assert g.country_of_position(lat, lon) is None, name
 
 
-def test_the_neighbour_doubt_is_for_the_coast_fallback_only():
+def test_the_neighbour_doubt_holds_inside_a_polygon_and_on_the_coast():
     # In the gap west of Albina (invented position): France's 1:50m line the
     # nearest, Suriname's 2.7 km off — none. Albina itself lies inside
-    # France's 1:50m French Guiana, 3.0 km from Suriname's line: a position
-    # inside a polygon keeps its country (a known limit of 1:50m).
+    # France's 1:50m French Guiana, just over 3 km from Suriname's line:
+    # beyond the band, French.
     near = g._boundaries_within(5.496, -54.057, 10.0)
     assert near["SR"] - near["FR"] < g.BORDER_DOUBT_KM
     assert g.country_of_position(5.496, -54.057) is None
     assert g._containing(5.4975, -54.0533, None) == "FR"
+    assert g._boundaries_within(5.4975, -54.0533, 10.0)["SR"] > g.BORDER_DOUBT_KM
     assert g.country_of_position(5.4975, -54.0533) == "FR"
     # Invented positions by Georgia's 1:50m line: inside Turkey's polygon,
-    # 1.9 km from it, Turkish; off Turkey's coast, Turkey's line 0.5 km and
-    # Georgia's 3.3 km away, none (the band holds for every country there).
+    # 1.9 km from it, none since 25 October (every border); off Turkey's
+    # coast, Turkey's line 0.5 km and Georgia's 3.3 km away, none.
     assert g._boundaries_within(41.46, 41.67, 3.0, g.NEIGHBOUR_COUNTRIES)["GE"] < 2.0
-    assert g.country_of_position(41.46, 41.67) == "TR"
+    assert g._containing(41.46, 41.67, None) == "TR"
+    assert g.country_of_position(41.46, 41.67) is None
     near = g._boundaries_within(41.497, 41.481, 10.0)
     assert g._containing(41.497, 41.481, None) is None
     assert near["GE"] - near["TR"] < g.BORDER_DOUBT_KM
@@ -384,7 +424,7 @@ def test_the_boundaries_file_changes_with_the_extractor_version():
     # update both values here.
     digest = hashlib.sha256(g._GEOJSON_PATH.read_bytes()).hexdigest()
     assert digest == BOUNDARIES_SHA256
-    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-3"
+    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-4"
     assert g._GEOJSON_PATH.stat().st_size < 1024 * 1024  # the pre-commit large-file cap
 
 

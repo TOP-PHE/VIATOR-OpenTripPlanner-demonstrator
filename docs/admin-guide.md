@@ -3820,6 +3820,17 @@ the extracts changes no graph build.
   farther out, none. Before, such stops had no country, and the module made
   each one a review item "A stop in no country". Still **no country**, on
   purpose, for:
+  - **a stop within 3 km of any border** (extractor version 4, 25 October):
+    the 1:50m lines put border stations on the wrong side (Kehl in France,
+    Menton in Italy, Hendaye in Spain, Wissembourg in Germany, Vallorcine in
+    Switzerland), and the module held them back as "in another country".
+    The module (from its version with the same rule) matches a stop without
+    a country to the station of agreeing name within 300 m, whose country it
+    takes; a border stop it cannot match stays a review item "A stop in no
+    country". **After
+    deploying it, press Refresh (all providers) on each session again**:
+    every extract is made once more (a new extractor version). The rules
+    below hold as before inside that band;
   - a stop whose country would be one of these newly added countries while
     a border of an OSM-crop country passes within 3 km: the 1:50m line
     cannot tell the side, and a wrong country is worse than none (the module
@@ -4055,7 +4066,7 @@ the extracts changes no graph build.
   becomes rail by default at a stop place that gives nothing else. The
   checkbox is hidden on a cross-border derived card (it gives no stop
   extract). Such an extract carries its own extractor version
-  (`viator-stop-extract-3+rail-default`): it is made again at the next
+  (`viator-stop-extract-4+rail-default`): it is made again at the next
   refresh even when the file is unchanged (a remembered `no_rail_stop` is
   not reused) and reaches the module as a new version of the feed. When it
   is sent, the station-module column says what the setting made rail,

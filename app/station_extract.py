@@ -128,9 +128,15 @@ log = logging.getLogger(__name__)
 # No v1 country is affected (Algeciras and San Roque-La Línea keep ES); two
 # real stations go from RU to none, Adler and Imeretinsky Kurort (Sochi), and
 # no feed of Russia exists. The file is the same.
+# 4 (25 October): no country within 3 km of the line of another bundled
+# country, every border included (`osm_geo.BORDER_DOUBT_KM`): the 1:50m
+# polygons put border stations on the wrong side (Kehl in France, Menton in
+# Italy, Hendaye in Spain), and the station module then held them back as
+# "in another country". It now matches a stop without a country to the
+# station of agreeing name next to it, which gives the country.
 # Any change to `app/data/country_borders.geojson` changes these rows: raise
 # this version with it (tests/unit/test_osm_geo.py pins the file's sha256).
-EXTRACTOR_VERSION = "viator-stop-extract-3"
+EXTRACTOR_VERSION = "viator-stop-extract-4"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one
 # value `ingestion` accepts): the readers take a journey (a GTFS route) that
