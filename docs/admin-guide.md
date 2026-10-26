@@ -2322,8 +2322,9 @@ completed only when every pair has its result, so the owner sees:
   the export.
 
 What to do: find the pair in the worker log, `docker compose -p viator logs
-worker | grep "result write failed"` (each line names the run and the pair,
-`origin→dest`, followed by the database error). Fix the cause (usually the
+worker | grep -A 40 "result write failed"`. Each matching line names the run
+and the pair (`origin→dest`); the traceback below it ends with the database
+error, on its last line. Fix the cause (usually the
 hub's data, under **Manage hubs** on the coverage page), then start a new
 run. Raising `COVERAGE_MAX_RESUMES` does not help: the same pair fails at
 every resume.

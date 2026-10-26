@@ -1721,7 +1721,12 @@ async def _finalise_completed_run(
             # #406 — ended by someone else during the verify sweep (a status
             # written by SQL, PR-187): keep it, write nothing over it.
             db.rollback()
-            log.warning("network-coverage run %s is %s: not completed", run_id, status)
+            log.warning(
+                "coverage_executor.status_changed run_id=%s status=%s phase=completion: "
+                "kept, not completed",
+                run_id,
+                status,
+            )
             return
         if executor_id is not None and holder != executor_id:
             db.rollback()

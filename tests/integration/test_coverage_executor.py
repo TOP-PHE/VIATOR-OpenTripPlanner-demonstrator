@@ -16,7 +16,8 @@ Checked here:
   lost claim stops the old holder without a terminal write;
 - Stop during the pairs, during the completion phase, and of a queued run;
 - a status written by SQL before or during the completion is kept, never
-  overwritten with `completed` (#406);
+  overwritten with `completed`; the status read before the flip holds the
+  row lock, and a claim lost during the sweep commits nothing (#406);
 - cancelling a paused run recounts its counters from its rows (#406);
 - the resume limit marks the run failed with its reason;
 - the release at a graceful shutdown makes the run claimable at once;
@@ -548,6 +549,93 @@ def test_a_run_cancelled_before_its_completion_is_neither_swept_nor_completed(
     assert sweeps == []
     run = _run_row(run_id)
     assert (run.status, run.finished_at) == ("cancelled", None)
+
+
+_NO_SWEEP = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+
+
+def _finalise_as(executor_id: str, run_id: uuid.UUID) -> None:
+    from app.network_coverage import runner
+
+    asyncio.run(
+        runner._finalise_completed_run(
+            run_id=run_id, elapsed_s=1.0, cfg=runner.CoverageConfig(), executor_id=executor_id
+        )
+    )
+
+
+def test_the_status_read_before_the_flip_holds_the_row_lock(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#406 — the completion reads the status under the row lock and keeps
+    it until its commit: the runbook's SQL cancel issued right after that
+    read waits for the commit, then changes no row (the run is completed)."""
+    from app.network_coverage import runner
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    real_read = runner._locked_status_and_holder
+    seen: dict[str, Any] = {}
+    cancels: list[threading.Thread] = []
+
+    def _sql_cancel() -> None:
+        with _session() as db:
+            result = db.execute(
+                text(
+                    "UPDATE network_coverage_runs SET status = 'cancelled', finished_at = now() "
+                    "WHERE status = 'running' AND id = :r"
+                ),
+                {"r": run_id},
+            )
+            seen["rowcount"] = result.rowcount
+            db.commit()
+
+    def _read_then_sql_cancel(db: Any, rid: uuid.UUID) -> Any:
+        read = real_read(db, rid)
+        cancel = threading.Thread(target=_sql_cancel)
+        cancel.start()
+        cancel.join(1.0)
+        seen["waited"] = cancel.is_alive()
+        cancels.append(cancel)
+        return read
+
+    async def _sweep(**_kw: Any) -> dict[str, int]:
+        return dict(_NO_SWEEP)
+
+    monkeypatch.setattr(runner, "_maybe_run_external_verify_sweep", _sweep)
+    monkeypatch.setattr(runner, "_locked_status_and_holder", _read_then_sql_cancel)
+    _finalise_as(EXEC_A, run_id)
+    cancels[0].join(10)
+    assert not cancels[0].is_alive()
+    assert seen["waited"] is True
+    assert seen["rowcount"] == 0
+    assert _run_row(run_id).status == "completed"
+
+
+def test_a_claim_lost_during_the_verify_sweep_commits_nothing(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#392/#406 — another executor took the run over during the sweep: the
+    completion commits nothing, the run stays running under its new holder."""
+    from app.network_coverage import runner
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+
+    async def _sweep_then_takeover(**_kw: Any) -> dict[str, int]:
+        await asyncio.to_thread(
+            _sql,
+            "UPDATE network_coverage_runs SET claimed_by = :b WHERE id = :r",
+            b=EXEC_B,
+            r=run_id,
+        )
+        return dict(_NO_SWEEP)
+
+    monkeypatch.setattr(runner, "_maybe_run_external_verify_sweep", _sweep_then_takeover)
+    _finalise_as(EXEC_A, run_id)
+    run = _run_row(run_id)
+    assert (run.status, run.claimed_by, run.finished_at) == ("running", EXEC_B, None)
+    assert "external_verified_count" not in (run.summary or {})
 
 
 def test_stop_of_a_queued_run_cancels_it_and_nothing_claims_it(engine: _FakeMotis) -> None:
