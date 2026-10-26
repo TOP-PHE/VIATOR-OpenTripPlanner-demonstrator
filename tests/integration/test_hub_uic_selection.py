@@ -465,3 +465,38 @@ def test_a_picked_station_is_saved_as_a_hub_with_its_confirmed_code(
     assert (listed["zz-a-0-2"]["lat"], listed["zz-a-0-2"]["lon"]) == (45.0123456, 6.0123456)
     searched = [json.loads(r.content) for r in module.requests if r.url.path.endswith("/search")]
     assert searched == [{"q": "ZZ A 0", "country": "ZA"}]
+
+
+def test_a_cyrillic_or_greek_name_proposes_a_free_latin_slug_and_no_saved_slug_changes(
+    fresh_db: str, client: tuple[TestClient, _Module]
+) -> None:
+    """#411: a station named in Cyrillic or Greek script proposes a slug of
+    its Latin letters, free in the table (the soft-deleted hubs included),
+    never the bare `hub`; the saved hubs keep their slugs."""
+    test_client, _module = client
+    with create_engine(fresh_db).connect() as conn:
+        before = conn.execute(text("SELECT id FROM network_coverage_hubs ORDER BY id")).all()
+
+    # Words of letters that look Latin on purpose: they must give zz-a-0 and
+    # zz-a-1, slugs the table holds.
+    cyrillic_name = "ЗЗ А 0"  # noqa: RUF001
+    greek_name = "ΖΖ Α 1"  # noqa: RUF001
+    cyrillic = test_client.post(f"{BASE}/pick", json={"q": cyrillic_name, "country": "ZA"})
+    greek = test_client.post(f"{BASE}/pick", json={"q": greek_name, "country": "ZA"})
+
+    (first,) = cyrillic.json()["stations"]
+    (second,) = greek.json()["stations"]
+    assert (first["name"], first["latin_name"], first["slug"]) == (
+        cyrillic_name,
+        "ZZ A 0",
+        "zz-a-0-2",
+    )
+    assert (second["name"], second["latin_name"], second["slug"]) == (
+        greek_name,
+        "ZZ A 1",
+        "zz-a-1-2",
+    )
+    assert not first["slug_placeholder"] and not second["slug_placeholder"]
+    with create_engine(fresh_db).connect() as conn:
+        after = conn.execute(text("SELECT id FROM network_coverage_hubs ORDER BY id")).all()
+    assert after == before == sorted((hub[0],) for hub in HUBS)

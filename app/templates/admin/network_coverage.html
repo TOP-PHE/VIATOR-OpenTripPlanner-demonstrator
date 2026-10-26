@@ -887,6 +887,7 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
    escHTML}; see app/static/js/compare_grid.js for the contract. #}
 <link rel="stylesheet" href="/static/app/css/compare_grid.css">
 <script src="/static/app/js/compare_grid.js"></script>
+<script id="hub-country-names" type="application/json">{{ hub_country_names|tojson }}</script>
 <script>
 // v0.1.27 — Network coverage admin page.
 
@@ -2404,16 +2405,19 @@ document.addEventListener('keydown', (e) => {
 // v0.1.31 — Manage Hubs: load / render / add / edit / delete
 // ──────────────────────────────────────────────────────────────────
 
-// ISO country names for the headers. Add as the operator expands the
-// network — unknown codes fall back to the code itself, no error.
-const COUNTRY_NAMES = {
-  'FR': 'France', 'UK': 'United Kingdom', 'BE': 'Belgium',
-  'NL': 'Netherlands', 'LU': 'Luxembourg', 'DE': 'Germany',
-  'AT': 'Austria', 'CH': 'Switzerland', 'IT': 'Italy', 'ES': 'Spain',
-  'PT': 'Portugal', 'IE': 'Ireland', 'DK': 'Denmark', 'SE': 'Sweden',
-  'NO': 'Norway', 'FI': 'Finland', 'PL': 'Poland', 'CZ': 'Czechia',
-  'SK': 'Slovakia', 'HU': 'Hungary', 'SI': 'Slovenia', 'HR': 'Croatia',
-};
+// ISO country names for the headers (#411): every bundled country, from
+// the server (`osm_geo.BUNDLED_COUNTRY_NAMES`), plus the "UK" some older
+// hubs were saved with. An unknown code falls back to the code itself.
+function hubCountryNames() {
+  let names = {};
+  try {
+    names = JSON.parse(document.getElementById('hub-country-names')?.textContent || '{}');
+  } catch (err) {
+    console.warn('hubs: the country names could not be read', err);
+  }
+  return Object.assign({ 'UK': 'United Kingdom' }, names);
+}
+const COUNTRY_NAMES = hubCountryNames();
 
 let HUB_EDIT_MODE = 'create';   // 'create' | 'edit'
 let HUB_EDIT_ID = null;          // when 'edit', the slug being edited
@@ -2905,13 +2909,19 @@ function hubPickMeta(station) {
   return `${station.country} · ${code}${id} · ${Number(station.lat).toFixed(4)}, ${Number(station.lon).toFixed(4)}`;
 }
 
+// The module's name, and its Latin letters when it is in Cyrillic or Greek
+// script (#411: the short label and the slug are made from them).
+function hubPickName(station) {
+  return station.latin_name ? `${station.name} · ${station.latin_name}` : station.name;
+}
+
 function hubPickItem(station, index) {
   const item = document.createElement('li');
   const button = document.createElement('button');
   button.type = 'button';
   button.dataset.pickIndex = String(index);
   button.setAttribute('aria-pressed', 'false');
-  button.append(hubCodesElement('span', station.name), hubCodesElement('span', hubPickMeta(station), 'hub-pick-meta'));
+  button.append(hubCodesElement('span', hubPickName(station)), hubCodesElement('span', hubPickMeta(station), 'hub-pick-meta'));
   item.append(button);
   return item;
 }
@@ -2936,6 +2946,17 @@ function hubPickFill(form, station, withSlug) {
   form.elements['uic'].value = station.uic || '';
 }
 
+// The sentence under the picker once a station is picked. `creating`: a new
+// hub, whose slug is proposed (#411: a name with no Latin letter or digit
+// gives only the bare "hub", so the slug must be typed).
+function hubPickChosenText(station, creating) {
+  let text = `Picked: ${hubPickName(station)} (${hubPickMeta(station)}). Check the short label${creating ? ' and the slug' : ''}, then save.`;
+  if (creating && station.slug_placeholder) {
+    text += ` The name gives no Latin letter or digit, so "${station.slug}" is only a placeholder: type a slug.`;
+  }
+  return text;
+}
+
 function hubPickChoose(index) {
   const station = HUB_PICK.stations[index];
   if (!station) return;
@@ -2947,7 +2968,7 @@ function hubPickChoose(index) {
   document.getElementById('hub-form-uic-origin').textContent =
     `${hubCodeLabel({ uic: station.uic, uic_origin: 'msmm', station_id: station.station_id })} — stored when you save`;
   document.getElementById('hub-pick-chosen').textContent =
-    `Picked: ${station.name} (${hubPickMeta(station)}). Check the short label${HUB_EDIT_MODE === 'create' ? ' and the slug' : ''}, then save.`;
+    hubPickChosenText(station, HUB_EDIT_MODE === 'create');
   // One announcement: Short, focused, is described by the sentence above.
   const short = document.getElementById('hub-form-short');
   short.setAttribute('aria-describedby', 'hub-pick-chosen');
