@@ -10,11 +10,19 @@ It is the single source of truth for:
   - point-in-polygon country lookup for a coordinate (auto-detect), backed by
     the bundled country boundaries (Natural Earth 1:50m, coarse; public
     domain — see NOTICE),
+  - the finer v1 border patch (`country_borders_v1_patch.geojson`, #404):
+    the v1 countries within 10 km of their land borders with each other,
+    from the U.S. State Department's LSIB lines via geoBoundaries CGAZ and
+    Natural Earth 1:10m land (see NOTICE and
+    scripts/build_v1_border_patch.py); only `country_of_position` reads it
+    (the stop extract's `iso2_point`, and the hub dialog's choice of the
+    transliteration rules, `network_coverage.hub_derive.derive`),
   - `country_of_position()` — the country of a stop for the station module's
     stop extract (MSMM 22.2, `iso2_point`): any bundled European country, not
     only the v1 list, and the nearest one for a stop on a coast the boundaries
-    miss; none where 1:50m cannot tell (by a v1 border, by a neighbour's on a
-    coast, in a neighbour),
+    miss; by a border between two v1 countries the patch decides, none within
+    `V1_BORDER_DOUBT_KM` of its line; none where 1:50m cannot tell (by another
+    border, by a neighbour's on a coast, in a neighbour),
   - `detect_from_stops()` — count a GTFS feed's stops per country (UIC prefix
     primary, point-in-polygon fallback), and the ≥5-stop suggestion,
   - `crop_geojson()` — the merged polygon the build hands to `osmium extract`.
@@ -120,6 +128,22 @@ COAST_TOLERANCE_KM = 10.0
 # fallback near one of `NEIGHBOUR_COUNTRIES` (Gibraltar's airport).
 BORDER_DOUBT_KM = 3.0
 
+# #404 — by a land border between two v1 countries, the finer patch decides:
+# its lines lie a median 50 m and some 380 m at worst (p99) from the national
+# ones (the study of #404, on 103,290 points along those borders), so a
+# position is in none only while another v1 country's patch polygon passes
+# within this distance. 0.5 km covers that error and some 120 m of a
+# station's coordinates (a building, not its platforms): no wrong country on
+# the 173 probes of the reviews nor on 1,501 stations within 10 km of such a
+# border, against 6% of those in none (3 km on 1:50m: 25%, and still wrong
+# ones). Three pairs lie above it at p95 in the study (DE-DK 963 m at the
+# Flensburg Fjord, DE-BE 682 m on the Vennbahn, FI-SE 619 m on the Torne
+# islands): a station 0.5-1 km from those lines could still take the wrong
+# side. The patch holds no line of a country outside the v1 list, so towards
+# those countries the 1:50m rules stay inside it too: none in such a
+# country's 1:50m polygon, none within `BORDER_DOUBT_KM` (3 km) of its line.
+V1_BORDER_DOUBT_KM = 0.5
+
 # Every bundled country: a boundary of any of them makes the border band.
 BUNDLED_COUNTRIES: frozenset[str] = VALID_COUNTRIES | OTHER_COUNTRIES | NEIGHBOUR_COUNTRIES
 
@@ -173,6 +197,10 @@ BUNDLED_COUNTRY_NAMES: dict[str, str] = {**COUNTRY_NAMES, **_OTHER_COUNTRY_NAMES
 SUGGEST_MIN_STOPS = 5
 
 _GEOJSON_PATH = Path(__file__).parent / "data" / "country_borders.geojson"
+_PATCH_PATH = Path(__file__).parent / "data" / "country_borders_v1_patch.geojson"
+
+# A polygon with its country and its bbox (min_lon, min_lat, max_lon, max_lat).
+_Polygon = tuple[str, tuple[float, float, float, float], list[list[list[float]]]]
 
 
 # ─────────────────────────── config validation ─────────────────────────────
@@ -268,23 +296,47 @@ def _polygon_contains(lon: float, lat: float, polygon: list[list[list[float]]]) 
     return inside
 
 
-@lru_cache(maxsize=1)
-def _polygons() -> list[tuple[str, tuple[float, float, float, float], list[list[list[float]]]]]:
-    """Every polygon of the bundled boundaries with its country and its bbox,
-    in the file's order: a lookup tests a polygon's bbox before its rings."""
-    out: list[tuple[str, tuple[float, float, float, float], list[list[list[float]]]]] = []
-    for iso, _bbox, geom in _features():
+def _polygons_of(features: Iterable[tuple[str, Any]]) -> list[_Polygon]:
+    out: list[_Polygon] = []
+    for iso, geom in features:
         for poly in _iter_polygons(geom):
             out.append((iso, _geom_bbox({"type": "Polygon", "coordinates": poly}), poly))
     return out
 
 
-def _containing(lat: float, lon: float, allowed: frozenset[str] | None) -> str | None:
-    """The country of the first bundled polygon holding (lat, lon), among the
-    `allowed` countries (every bundled one when None). The bundled polygons do
-    not overlap (Natural Earth's shared borders are the same lines; checked by
-    a test), so the first is the only one."""
-    for iso, (min_lon, min_lat, max_lon, max_lat), poly in _polygons():
+@lru_cache(maxsize=1)
+def _polygons() -> list[_Polygon]:
+    """Every polygon of the bundled boundaries with its country and its bbox,
+    in the file's order: a lookup tests a polygon's bbox before its rings."""
+    return _polygons_of((iso, geom) for iso, _bbox, geom in _features())
+
+
+@lru_cache(maxsize=1)
+def _patch_polygons() -> list[_Polygon]:
+    """Every polygon of the v1 border patch (#404), v1 countries only (a
+    feature of another country would be ignored)."""
+    data = json.loads(_PATCH_PATH.read_text(encoding="utf-8"))
+    return _polygons_of(
+        (feat["properties"]["ISO_A2"], feat["geometry"])
+        for feat in data.get("features", [])
+        if (feat.get("properties") or {}).get("ISO_A2") in VALID_COUNTRIES and feat.get("geometry")
+    )
+
+
+def _containing(
+    lat: float,
+    lon: float,
+    allowed: frozenset[str] | None,
+    polygons: list[_Polygon] | None = None,
+) -> str | None:
+    """The country of the first polygon holding (lat, lon), among the
+    `allowed` countries (every one when None), of the bundled boundaries
+    (or of `polygons`). The bundled polygons do not overlap (Natural Earth's
+    shared borders are the same lines; checked by a test), so the first is
+    the only one; nor do the patch's (one topology)."""
+    for iso, (min_lon, min_lat, max_lon, max_lat), poly in (
+        _polygons() if polygons is None else polygons
+    ):
         if allowed is not None and iso not in allowed:
             continue
         inside_bbox = min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
@@ -342,6 +394,54 @@ def _boundaries_within(
     return out
 
 
+def _ring_within(
+    lat: float, lon: float, ring: list[list[float]], k: tuple[float, float], km: float
+) -> bool:
+    """Does a segment of `ring` pass at most `km` from (lat, lon)? Skips a
+    segment whose two ends lie beyond `km` on the same side (a patch ring
+    runs along hundreds of km of border)."""
+    k_lat, k_lon = k
+    for (x1, y1, *_), (x2, y2, *_) in itertools.pairwise(ring):
+        ax, ay = (x1 - lon) * k_lon, (y1 - lat) * k_lat
+        bx, by = (x2 - lon) * k_lon, (y2 - lat) * k_lat
+        if (ax > km and bx > km) or (ax < -km and bx < -km):
+            continue
+        if (ay > km and by > km) or (ay < -km and by < -km):
+            continue
+        if _segment_km(ax, ay, bx, by) <= km:
+            return True
+    return False
+
+
+def _patch_line_within(lat: float, lon: float, km: float, iso: str) -> bool:
+    """Does the patch polygon of a v1 country other than `iso` pass at most
+    `km` from (lat, lon)?"""
+    k = (110.57, 111.32 * max(math.cos(math.radians(lat)), 0.05))
+    d_lat, d_lon = km / k[0], km / k[1]
+    for other, (min_lon, min_lat, max_lon, max_lat), poly in _patch_polygons():
+        if other == iso or not (
+            min_lon - d_lon <= lon <= max_lon + d_lon and min_lat - d_lat <= lat <= max_lat + d_lat
+        ):
+            continue
+        if any(_ring_within(lat, lon, ring, k, km) for ring in poly):
+            return True
+    return False
+
+
+def _patch_in_doubt(lat: float, lon: float, iso: str) -> bool:
+    """Is a position inside the patch polygon of `iso` in doubt? When another
+    v1 country's patch line lies within `V1_BORDER_DOUBT_KM`, when the 1:50m
+    polygon holding it is a country's outside the v1 list (never the v1
+    country over a non-v1 answer), or when such a country's 1:50m line lies
+    within `BORDER_DOUBT_KM` (the patch knows only the v1 lines)."""
+    if _patch_line_within(lat, lon, V1_BORDER_DOUBT_KM, iso):
+        return True
+    non_v1 = BUNDLED_COUNTRIES - VALID_COUNTRIES
+    if _containing(lat, lon, non_v1) is not None:
+        return True
+    return bool(_boundaries_within(lat, lon, BORDER_DOUBT_KM, non_v1))
+
+
 def country_for_point(lat: float, lon: float) -> str | None:
     """ISO code of the v1 country containing (lat, lon), or None.
 
@@ -359,6 +459,12 @@ def country_of_position(lat: float, lon: float) -> str | None:
     """The country of a stop's position for the station module's stop extract
     (MSMM 22.2, `iso2_point`), or None:
 
+    0. inside the v1 border patch (#404, a v1 country within 10 km of its
+       land border with another): that country, None when another v1
+       country's patch polygon lies within `V1_BORDER_DOUBT_KM`, when the
+       1:50m polygon holding it is a country's outside the v1 list, or
+       when such a country's 1:50m boundary lies within `BORDER_DOUBT_KM`
+       (the patch knows only the v1 lines);
     1. the bundled country whose boundary holds it, v1 or not
        (`OTHER_COUNTRIES`); else, for a stop on a coast, an estuary or an
        island the 1:50m boundaries leave out, the country whose boundary is
@@ -366,14 +472,17 @@ def country_of_position(lat: float, lon: float) -> str | None:
     2. None when that country is one of `NEIGHBOUR_COUNTRIES` (a stop in
        Georgia or Gibraltar is in none of ours);
     3. None when the boundary of another bundled country lies within
-       `BORDER_DOUBT_KM` beyond it (Kehl inside the 1:50m France, Narva inside
-       Russia, Gibraltar's airport between Spain and Gibraltar): 1:50m cannot
-       tell which side of a border the position is on.
+       `BORDER_DOUBT_KM` beyond it (Narva inside Russia, Gibraltar's
+       airport between Spain and Gibraltar): 1:50m cannot tell which side
+       of a border the position is on.
 
     None too for the GTFS placeholder (0, 0) and a position not finite.
     """
     if not (math.isfinite(lat) and math.isfinite(lon)) or (abs(lat) <= 1e-7 and abs(lon) <= 1e-7):
         return None
+    patch = _containing(lat, lon, None, _patch_polygons())
+    if patch is not None:
+        return None if _patch_in_doubt(lat, lon, patch) else patch
     iso = _containing(lat, lon, None)
     distance = 0.0
     if iso is None:

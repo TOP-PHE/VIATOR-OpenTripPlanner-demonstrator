@@ -217,6 +217,8 @@ def derive(
     country = country_from_stop_id(stop_id) or country_from_coords(lat, lon)
     # The Cyrillic rules of the station's country (#411): beyond the v1 list
     # (Serbia, North Macedonia, Ukraine) from the position's bundled country.
+    # `country_of_position` here only picks the transliteration rules (it
+    # reads the v1 border patch, #404); the hub's country stays 1:50m's.
     script_country = country
     if script_country is None and lat is not None and lon is not None:
         script_country = country_of_position(lat, lon)

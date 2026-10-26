@@ -116,7 +116,7 @@ def test_a_feed_that_names_no_mode_gives_its_stations_rail_by_default(tmp_path: 
     for row in rows.values():
         assert row["modes"] == RAIL_MAIN
         assert row["n_calls"] == "2"
-        assert row["extractor_version"] == "viator-stop-extract-4+rail-default"
+        assert row["extractor_version"] == "viator-stop-extract-5+rail-default"
 
 
 @pytest.mark.parametrize(
@@ -233,8 +233,8 @@ def test_without_the_setting_the_rows_of_other_feeds_do_not_change(tmp_path: Pat
     )
     assert not isinstance(rows, ExtractError)
     assert {row["modes"] for row in rows.values()} == {RAIL_MAIN}
-    assert {row["extractor_version"] for row in rows.values()} == {"viator-stop-extract-4"}
-    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-4"
+    assert {row["extractor_version"] for row in rows.values()} == {"viator-stop-extract-5"}
+    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-5"
 
 
 def test_the_operators_of_journeys_without_a_mode_are_kept(tmp_path: Path) -> None:
@@ -390,10 +390,10 @@ def test_the_gtfs_census_counts_the_routes_taken_as_rail(tmp_path: Path) -> None
 
 
 def test_the_extractor_version_names_the_setting() -> None:
-    assert station_extract.extractor_version_for(_provider("netex_epip")) == "viator-stop-extract-4"
+    assert station_extract.extractor_version_for(_provider("netex_epip")) == "viator-stop-extract-5"
     assert (
         station_extract.extractor_version_for(_provider("netex_epip", **RAIL_DEFAULT))
-        == "viator-stop-extract-4+rail-default"
+        == "viator-stop-extract-5+rail-default"
     )
     assert station_extract.extractor_version_for(_provider(), "zz-9") == "zz-9"
     assert not station_extract.default_rail({"timetable": "zz"})
@@ -422,7 +422,7 @@ def test_a_remembered_failure_is_not_reused_once_the_box_is_ticked(tmp_path: Pat
         extracted_at=WHEN,
         cache_dir=tmp_path / "x",
     )
-    assert result.extractor_version == "viator-stop-extract-4+rail-default"
+    assert result.extractor_version == "viator-stop-extract-5+rail-default"
     assert result.path_gz == ticked.final
     # Rail by default keeps the archive's one file: the remembered failure
     # of the plain extract is pruned with the provider's older files.
@@ -455,7 +455,7 @@ def test_a_sent_extract_says_what_rail_by_default_made_rail(
     module = Module()
     result = _run(setup, module, FakeClock())
     (head,) = module.head_requests
-    assert dict(head.url.params) == {"extractor_version": "viator-stop-extract-4+rail-default"}
+    assert dict(head.url.params) == {"extractor_version": "viator-stop-extract-5+rail-default"}
     (outcome,) = result.outcomes
     assert outcome.state == up.SENT
     assert outcome.summary == (summary if shown else None)

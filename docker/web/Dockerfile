@@ -89,6 +89,9 @@ COPY app ./app
 COPY branding ./branding
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
+# The attributions of the bundled data (app/data: geoBoundaries CGAZ is CC BY
+# 4.0, #404) travel with the image; the worker runs from this image too.
+COPY NOTICE ./NOTICE
 
 # ─────────────────────── non-root user ───────────────────────
 # Runtime UID/GID 1000:1000. Two services run from this image:

@@ -38,6 +38,34 @@ This product includes software developed by third parties:
     "Crimea", whose 1:50m polygon is the one moved from Russia to Ukraine).
     Public domain; no attribution required, credited here as a courtesy.
 
+  * app/data/country_borders_v1_patch.geojson (issue #404), the finer
+    borders between the countries offered for the OSM crop, within 10 km
+    of their land borders with each other, used for the country of a stop
+    in the station module's stop extract. Built by
+    scripts/build_v1_border_patch.py, which records each source's URL,
+    version and sha256, from:
+    - geoBoundaries CGAZ ADM0 (www.geoboundaries.org; GitHub
+      wmgeolab/geoBoundaries, commit
+      5c25134028196d43ce97b5071934fd0cfc92f09f). Runfola, D. et al. (2020)
+      geoBoundaries: A global database of political administrative
+      boundaries. PLoS ONE 15(4): e0231866.
+      https://doi.org/10.1371/journal.pone.0231866
+      Licensed under the Creative Commons Attribution 4.0 International
+      License (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/).
+      Its international boundaries are those of the U.S. Department of
+      State's Large Scale International Boundaries (LSIB), a work of the
+      U.S. Government in the public domain.
+    - Natural Earth 1:10m land (https://www.naturalearthdata.com, version
+      5.1.2), public domain: the land and the coast.
+    Changes made: only the land within 10 km of those borders (and Borkum
+    and a shore of the Flensburg Fjord, which the 1:50m file gives to the
+    neighbour) is kept, with 2 km of sea along Natural Earth's coast,
+    divided between the countries by CGAZ's boundaries (land CGAZ leaves
+    out going to the nearest country); CGAZ's own coasts are not kept;
+    Gibraltar and the Sovereign Base Areas on Cyprus are not counted as
+    the United Kingdom; simplified at 200 m (mapshaper, topology kept) and
+    rounded to 5 decimals.
+
   * MapLibre GL JS (when wired in step 14 of the implementation order)
     Licensed under the BSD-3-Clause License.
 
