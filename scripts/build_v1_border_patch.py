@@ -151,13 +151,21 @@ def fetch(cache: Path) -> dict[str, Path]:
     for name, (url, sha256) in SOURCES.items():
         path = cache / name
         if not path.exists():
+            # Into a .part file, renamed only once its sha256 is right: an
+            # interrupted download never stays as the cached file.
+            part = path.with_name(name + ".part")
             print(f"downloading {url}", flush=True)
             # Fixed https URLs above (S310 / B310).
-            with urllib.request.urlopen(url, timeout=600) as r, path.open("wb") as f:  # noqa: S310  # nosec B310
+            with urllib.request.urlopen(url, timeout=600) as r, part.open("wb") as f:  # noqa: S310  # nosec B310
                 shutil.copyfileobj(r, f)
+            digest = hashlib.sha256(part.read_bytes()).hexdigest()
+            if digest != sha256:
+                part.unlink()
+                raise SystemExit(f"{name}: downloaded sha256 {digest}, expected {sha256}")
+            part.replace(path)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != sha256:
-            raise SystemExit(f"{name}: sha256 {digest}, expected {sha256}")
+            raise SystemExit(f"{name}: sha256 {digest}, expected {sha256}; delete {path}")
         out[name] = path
     return out
 

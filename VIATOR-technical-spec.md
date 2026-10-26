@@ -427,8 +427,9 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   the uploaded file; `iso2_point` from `osm_geo.country_of_position` (since version 5, #404: within
   10 km of a land border between two v1 countries the finer patch `app/data/country_borders_v1_patch.geojson`
   decides first: the v1 country whose patch polygon holds the position, empty while another v1
-  country's patch polygon lies within `V1_BORDER_DOUBT_KM` = 0.5 km or the 1:50m line of a country
-  outside the v1 list within `BORDER_DOUBT_KM` = 3 km; the patch is the U.S. State Department's LSIB
+  country's patch polygon lies within `V1_BORDER_DOUBT_KM` = 0.5 km, when the 1:50m polygon holding
+  it is a country's outside the v1 list, or when such a country's 1:50m line lies within
+  `BORDER_DOUBT_KM` = 3 km; the patch is the U.S. State Department's LSIB
   lines via geoBoundaries CGAZ on Natural Earth 1:10m land with 2 km of its sea, simplified at 200 m,
   built by `scripts/build_v1_border_patch.py` (not in CI), its lines a median 50 m and p99 ~380 m
   from the national ones; Kehl is `DE`, Menton and Wissembourg `FR`, Venlo `NL`, Basel Bad Bf `CH`

@@ -14,7 +14,9 @@ It is the single source of truth for:
     the v1 countries within 10 km of their land borders with each other,
     from the U.S. State Department's LSIB lines via geoBoundaries CGAZ and
     Natural Earth 1:10m land (see NOTICE and
-    scripts/build_v1_border_patch.py); only `country_of_position` reads it,
+    scripts/build_v1_border_patch.py); only `country_of_position` reads it
+    (the stop extract's `iso2_point`, and the hub dialog's choice of the
+    transliteration rules, `network_coverage.hub_derive.derive`),
   - `country_of_position()` — the country of a stop for the station module's
     stop extract (MSMM 22.2, `iso2_point`): any bundled European country, not
     only the v1 list, and the nearest one for a stop on a coast the boundaries
@@ -134,8 +136,12 @@ BORDER_DOUBT_KM = 3.0
 # station's coordinates (a building, not its platforms): no wrong country on
 # the 173 probes of the reviews nor on 1,501 stations within 10 km of such a
 # border, against 6% of those in none (3 km on 1:50m: 25%, and still wrong
-# ones). The 3 km band (`BORDER_DOUBT_KM`) towards the countries outside the
-# v1 list stays, on 1:50m: the patch knows none of their lines.
+# ones). Three pairs lie above it at p95 in the study (DE-DK 963 m at the
+# Flensburg Fjord, DE-BE 682 m on the Vennbahn, FI-SE 619 m on the Torne
+# islands): a station 0.5-1 km from those lines could still take the wrong
+# side. The patch holds no line of a country outside the v1 list, so towards
+# those countries the 1:50m rules stay inside it too: none in such a
+# country's 1:50m polygon, none within `BORDER_DOUBT_KM` (3 km) of its line.
 V1_BORDER_DOUBT_KM = 0.5
 
 # Every bundled country: a boundary of any of them makes the border band.
@@ -313,7 +319,7 @@ def _patch_polygons() -> list[_Polygon]:
     return _polygons_of(
         (feat["properties"]["ISO_A2"], feat["geometry"])
         for feat in data.get("features", [])
-        if feat.get("properties", {}).get("ISO_A2") in VALID_COUNTRIES and feat.get("geometry")
+        if (feat.get("properties") or {}).get("ISO_A2") in VALID_COUNTRIES and feat.get("geometry")
     )
 
 
@@ -441,9 +447,10 @@ def country_of_position(lat: float, lon: float) -> str | None:
 
     0. inside the v1 border patch (#404, a v1 country within 10 km of its
        land border with another): that country, None when another v1
-       country's patch polygon lies within `V1_BORDER_DOUBT_KM` or the
-       1:50m boundary of a country outside the v1 list within
-       `BORDER_DOUBT_KM` (the patch knows only the v1 lines);
+       country's patch polygon lies within `V1_BORDER_DOUBT_KM`, when the
+       1:50m polygon holding it is a country's outside the v1 list, or
+       when such a country's 1:50m boundary lies within `BORDER_DOUBT_KM`
+       (the patch knows only the v1 lines);
     1. the bundled country whose boundary holds it, v1 or not
        (`OTHER_COUNTRIES`); else, for a stop on a coast, an estuary or an
        island the 1:50m boundaries leave out, the country whose boundary is
@@ -463,7 +470,10 @@ def country_of_position(lat: float, lon: float) -> str | None:
     if patch is not None:
         if _patch_line_within(lat, lon, V1_BORDER_DOUBT_KM, patch):
             return None
-        if _boundaries_within(lat, lon, BORDER_DOUBT_KM, BUNDLED_COUNTRIES - VALID_COUNTRIES):
+        non_v1 = BUNDLED_COUNTRIES - VALID_COUNTRIES
+        if _containing(lat, lon, non_v1) is not None:
+            return None  # 1:50m says another country: in doubt, never the v1 one
+        if _boundaries_within(lat, lon, BORDER_DOUBT_KM, non_v1):
             return None
         return patch
     iso = _containing(lat, lon, None)

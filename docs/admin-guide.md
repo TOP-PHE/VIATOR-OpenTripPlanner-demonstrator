@@ -3893,8 +3893,9 @@ the extracts changes no graph build.
   DB). Konstanz, Kreuzlingen, Hendaye, Chiasso, Brennero, Lauterbourg,
   Bad Nieuweschans, Büsingen, Baarle-Nassau and the Moselle stations of
   Schengen and Remich lie within 0.5 km and have no country, as before; the
-  module matches them by name as in version 4. The 3 km band towards a
-  country outside the OSM-crop list stays (Záhony, by Ukraine, has none).
+  module matches them by name as in version 4. Towards a country outside
+  the OSM-crop list the coarse rules stay: no country inside its coarse
+  boundary nor within 3 km of it (Záhony, by Ukraine, has none).
   Gibraltar is not treated as the United Kingdom: the airport and La Línea
   keep no country. On a lake or an estuary the fine file follows the
   State Department's lines (Lake Constance, the Moselle, the Flensburg

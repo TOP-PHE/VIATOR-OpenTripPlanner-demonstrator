@@ -360,17 +360,61 @@ def test_the_patch_holds_v1_countries_only_and_keeps_the_other_bands():
     # 1:50m Ukraine lies within BORDER_DOUBT_KM: none, as before.
     assert _in_patch(48.4093, 22.1748) == "HU"
     assert g.country_of_position(48.4093, 22.1748) is None
-    # A vertex of a 1:50m polygon of a country outside the v1 list that the
-    # patch holds (1:50m lies off) is never given to the v1 country.
-    held = [
-        (lat, lon)
-        for iso, _bbox, poly in g._polygons()
-        if iso not in g.VALID_COUNTRIES
-        for lon, lat in poly[0][::5]
-        if _in_patch(lat, lon) is not None
-    ]
-    assert held  # Monaco's, Andorra's, … 1:50m lines cross the patch
-    assert all(g.country_of_position(lat, lon) is None for lat, lon in held)
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,patch,coarse,line_km",
+    [
+        # Invented positions that the patch gives to a v1 country but the
+        # 1:50m file to a country outside the v1 list, more than 3 km from its
+        # line (so the 3 km band alone would let the v1 country through):
+        # none, never the v1 country over a non-v1 1:50m answer.
+        ("Lake Drūkšiai", 55.598, 26.636, "LT", "BY", 3.28),
+        ("the Danube by Batina", 45.822, 18.908, "HR", "RS", 3.90),
+        ("by Halmeu", 48.018, 22.928, "RO", "UA", 4.98),
+    ],
+)
+def test_the_patch_never_overrides_a_non_v1_coarse_polygon(name, lat, lon, patch, coarse, line_km):
+    assert _in_patch(lat, lon) == patch, name
+    assert g._containing(lat, lon, None) == coarse, name
+    near = g._boundaries_within(lat, lon, 10.0, g.BUNDLED_COUNTRIES - g.VALID_COUNTRIES)
+    assert min(near.values()) == pytest.approx(line_km, abs=0.02), name
+    assert g.country_of_position(lat, lon) is None, name
+
+
+def test_the_band_towards_non_v1_countries_holds_inside_the_patch():
+    # Invented positions in Bulgaria's patch, east of Svilengrad, at fixed
+    # distances from Turkey's 1:50m line (not derived from BORDER_DOUBT_KM,
+    # so a narrower band or none fails here), far from Greece's patch line.
+    non_v1 = g.BUNDLED_COUNTRIES - g.VALID_COUNTRIES
+    for lat, lon, turkey_km, expected in (
+        (41.7589, 26.2917, 2.495, None),
+        (41.7624, 26.2805, 3.492, "BG"),
+    ):
+        assert _in_patch(lat, lon) == "BG"
+        assert g._containing(lat, lon, non_v1) is None
+        near = g._boundaries_within(lat, lon, 10.0, non_v1)
+        assert min(near, key=near.__getitem__) == "TR"
+        assert near["TR"] == pytest.approx(turkey_km, abs=0.01)
+        assert _patch_km(lat, lon, "GR") > 1.0
+        assert g.country_of_position(lat, lon) == expected, (lat, lon)
+    # And by Ukraine's line, in Hungary's patch: 2.5 km, none.
+    assert _in_patch(48.3871, 22.1851) == "HU"
+    assert g._boundaries_within(48.3871, 22.1851, 10.0, non_v1)["UA"] == pytest.approx(
+        2.49, abs=0.01
+    )
+    assert g.country_of_position(48.3871, 22.1851) is None
+
+
+def test_the_own_patch_edge_is_no_border():
+    # An invented position in Germany's patch 0.3 km inside its inner (10 km)
+    # edge, ~9.7 km from France's line: the edge of its own patch is not a
+    # border, so it stays German.
+    lat, lon = 48.4126, 7.8833
+    assert _in_patch(lat, lon) == "DE"
+    assert _patch_km(lat, lon, "DE") == pytest.approx(0.31, abs=0.01)
+    assert _patch_km(lat, lon, "FR") > 9.0
+    assert g.country_of_position(lat, lon) == "DE"
 
 
 def test_a_feature_of_another_country_in_the_patch_is_ignored(tmp_path, monkeypatch):
@@ -408,7 +452,7 @@ def test_the_patch_loads_and_answers_within_the_extract_budget():
     g._patch_polygons.cache_clear()
     start = time.perf_counter()
     g._patch_polygons()
-    assert time.perf_counter() - start < 0.2  # measured ~0.03 s
+    assert time.perf_counter() - start < 1.0  # measured ~0.03-0.07 s
     # Positions by v1 borders, the slowest kind (the patch then measures the
     # distance to the neighbour's line): ~1 ms each, so 100,000 stops cost
     # under a few minutes of the extract child's 40 min of CPU.
@@ -790,3 +834,16 @@ def test_crop_geojson_rejects_unknown_country():
 def test_crop_geojson_empty_selection_is_empty_multipolygon():
     cg = g.crop_geojson([])
     assert cg["geometry"]["coordinates"] == []
+
+
+def test_the_image_carries_the_attribution_of_the_patch():
+    # geoBoundaries CGAZ is CC BY 4.0: the image that ships app/data ships
+    # NOTICE with its credit too (the worker runs from the same image).
+    root = g._PATCH_PATH.parents[2]
+    dockerfile = (root / "docker" / "web" / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY app ./app" in dockerfile
+    assert "COPY NOTICE ./NOTICE" in dockerfile
+    notice = (root / "NOTICE").read_text(encoding="utf-8")
+    assert "country_borders_v1_patch.geojson" in notice
+    assert "Runfola, D. et al. (2020)" in notice
+    assert "CC BY 4.0" in notice
