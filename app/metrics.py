@@ -250,8 +250,9 @@ _COVERAGE_GAUGES: tuple[tuple[str, str], ...] = (
     ),
     (
         "viator_coverage_heartbeat_age_seconds",
-        "Largest heartbeat age of a running coverage run (since its start when it "
-        "has none); 0 when no run is running. Over 180 s the run is resumed.",
+        "Largest heartbeat age of a running coverage run (since its release when "
+        "a shutdown released it; since its start only for a run an old web left "
+        "with no heartbeat); 0 when no run is running. Over 180 s the run is resumed.",
     ),
     (
         "viator_coverage_resumes_total",

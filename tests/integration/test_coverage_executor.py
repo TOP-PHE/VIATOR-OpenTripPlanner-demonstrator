@@ -15,6 +15,9 @@ Checked here:
 - a live heartbeat keeps the run from being taken; a stale one does not; a
   lost claim stops the old holder without a terminal write;
 - Stop during the pairs, during the completion phase, and of a queued run;
+- a status written by SQL before or during the completion is kept, never
+  overwritten with `completed` (#406);
+- cancelling a paused run recounts its counters from its rows (#406);
 - the resume limit marks the run failed with its reason;
 - the release at a graceful shutdown makes the run claimable at once;
 - the `viator_coverage_*` gauges read the claim state.
@@ -484,6 +487,67 @@ def test_stop_during_the_completion_phase_lets_it_complete(
 
     asyncio.run(_scenario())
     _assert_results_unchanged(run_id, engine)
+
+
+def test_a_cancel_written_by_sql_during_the_verify_sweep_is_kept(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#406 — a `cancelled` set by SQL (PR-187) while the completion runs
+    its verify sweep is not overwritten with `completed`: the status is read
+    again under the row lock just before the flip."""
+    from app.network_coverage import executor, runner
+
+    run_id = _create_run()
+    real_sweep = runner._maybe_run_external_verify_sweep
+
+    async def _sweep_then_sql_cancel(**kw: Any) -> dict[str, int]:
+        counters = await real_sweep(**kw)
+        # The ORM session of the completion read the row `running` before
+        # the sweep; this UPDATE commits in another session meanwhile.
+        await asyncio.to_thread(
+            _sql, "UPDATE network_coverage_runs SET status = 'cancelled' WHERE id = :r", r=run_id
+        )
+        return counters
+
+    monkeypatch.setattr(runner, "_maybe_run_external_verify_sweep", _sweep_then_sql_cancel)
+    a = executor.CoverageExecutor(EXEC_A)
+
+    async def _scenario() -> None:
+        await a.poll_once()
+        await asyncio.gather(*a._active.values())
+
+    asyncio.run(_scenario())
+    run = _run_row(run_id)
+    assert run.status == "cancelled"
+    assert run.finished_at is None  # nothing of the completion was committed
+    assert "external_verified_count" not in (run.summary or {})
+
+
+def test_a_run_cancelled_before_its_completion_is_neither_swept_nor_completed(
+    engine: _FakeMotis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#406 — a run already ended (here `cancelled` by SQL) when the
+    completion starts: no verify sweep is run for it and nothing is written."""
+    from app.network_coverage import runner
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+    _sql("UPDATE network_coverage_runs SET status = 'cancelled' WHERE id = :r", r=run_id)
+    sweeps: list[Any] = []
+
+    async def _sweep(**kw: Any) -> dict[str, int]:
+        sweeps.append(kw)
+        return {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+
+    monkeypatch.setattr(runner, "_maybe_run_external_verify_sweep", _sweep)
+    asyncio.run(
+        runner._finalise_completed_run(
+            run_id=run_id, elapsed_s=1.0, cfg=runner.CoverageConfig(), executor_id=EXEC_A
+        )
+    )
+    assert sweeps == []
+    run = _run_row(run_id)
+    assert (run.status, run.finished_at) == ("cancelled", None)
 
 
 def test_stop_of_a_queued_run_cancels_it_and_nothing_claims_it(engine: _FakeMotis) -> None:
@@ -1047,6 +1111,63 @@ def test_stop_of_a_paused_run_cancels_it_at_once(engine: _FakeMotis) -> None:
     _stale_heartbeat(stale)
     assert _stop(stale).status == "cancelled"
     assert _claim(EXEC_A) is None
+
+
+def _drift_counters(run_id: uuid.UUID) -> None:
+    """Counters that disagree with the result rows, as a run an old web
+    left `running` can carry (its counters were not written with its rows)."""
+    _sql(
+        "UPDATE network_coverage_runs SET completed_pairs = 99, ok_pairs = 0, "
+        "no_route_pairs = 9, error_pairs = 90 WHERE id = :r",
+        r=run_id,
+    )
+
+
+def _assert_counters_match_rows(run_id: uuid.UUID) -> None:
+    run = _run_row(run_id)
+    completed, rows = _counts(run_id)
+    assert completed == sum(rows.values()) == rows.get("ok", 0) == run.ok_pairs
+    assert (run.no_route_pairs, run.error_pairs) == (0, 0)
+
+
+def _paused_run_with_some_pairs() -> uuid.UUID:
+    from app.network_coverage import executor, runner
+
+    run_id = _create_run()
+    assert _claim(EXEC_A) is not None
+
+    async def _some_pairs() -> None:
+        task = asyncio.create_task(runner.execute_run(run_id, executor_id=EXEC_A))
+        await _wait_for_pairs(run_id, PAIR_PARALLELISM)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _drain_db_executor()
+
+    asyncio.run(_some_pairs())
+    executor.CoverageExecutor(EXEC_A).release()
+    return run_id
+
+
+def test_cancelling_a_paused_run_recounts_its_counters_from_its_rows(
+    engine: _FakeMotis,
+) -> None:
+    """#406 — `cancel_on_row` recounts the counters from the result rows
+    (web's Stop of a paused run, and a claim that meets a stopped paused
+    run): a paused run left by an old web has counters that were not
+    written with its rows, and it can be cancelled before any resume
+    recounts them."""
+    by_web = _paused_run_with_some_pairs()
+    _drift_counters(by_web)
+    assert _stop(by_web).status == "cancelled"
+    _assert_counters_match_rows(by_web)
+
+    by_claim = _paused_run_with_some_pairs()
+    _drift_counters(by_claim)
+    _sql("UPDATE network_coverage_runs SET cancel_requested_at = now() WHERE id = :r", r=by_claim)
+    assert _claim(EXEC_B) is None
+    assert _run_row(by_claim).status == "cancelled"
+    _assert_counters_match_rows(by_claim)
 
 
 def test_stop_of_a_held_run_is_left_to_its_executor(engine: _FakeMotis) -> None:
