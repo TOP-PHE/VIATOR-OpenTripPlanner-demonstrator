@@ -82,8 +82,10 @@ exports.svg = () => {
 
   // ---- the build lane
   s.arrow(['worker', 'b', 70], ['dockerd', 't', 70], {});
-  s.text(690, 300, 'spawns one-shot', { size: 10.5, anchor: 'start' });
-  s.text(690, 313, 'build containers', { size: 10.5, anchor: 'start' });
+  // Left of the build arrow (x 752) and right of the coverage-pairs lane
+  // (x 650), so neither line crosses the label.
+  s.text(745, 300, 'spawns one-shot', { size: 10.5, anchor: 'end' });
+  s.text(745, 313, 'build containers', { size: 10.5, anchor: 'end' });
   s.arrow(['dockerd', 'b', 60], ['inbox', 't', 60], { soft: true });
   s.arrow(['dockerd', 'l', -12], ['serve', 'r', 8], { dashed: true, route: 'orth', mid: 527, label: 'starts / stops', ly: 372 });
   s.arrow(['inbox', 'l'], ['graphs', 'r'], { color: '#2E6B3E', label: 'build writes', ly: 472 });

@@ -3021,9 +3021,11 @@ def stop_run(
             409,
             f"Run is in state {run.status!r} — stop is only valid for running or queued runs",
         )
-    # The DB write to status='cancelled' happens in the runner, NOT here, so
-    # the row's terminal-state guarantee holds (status='running' until the
-    # executor confirms it has stopped).
+    # A run an executor holds is cancelled by that executor, NOT here, so the
+    # row's terminal-state guarantee holds (status='running' until the
+    # executor confirms it has stopped). Only a run no live executor holds
+    # (paused at a deploy, or its holder's heartbeat is stale) is cancelled
+    # here, by `cancel_unheld_run` under the row lock (#392).
     db.execute(
         update(NetworkCoverageRun)
         .where(

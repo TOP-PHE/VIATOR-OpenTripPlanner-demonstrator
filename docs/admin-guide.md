@@ -2303,6 +2303,32 @@ the pairs still missing and the last interruption when there was one. Look at
 the worker log at the times in `summary.resumes` (an out-of-memory kill, a
 crash loop, a database outage), fix that, and start the run again.
 
+**A run that ends failed with "N pairs still had no result row"** (a change
+of behaviour since issue #392): one or more pairs could not be written, for a
+reason that is not a passing database outage (a data error on that pair's
+row, say), so a retry does not help. Before #392 such a run ended
+**completed** with those cells silently missing from the matrix. Now a run is
+completed only when every pair has its result, so the owner sees:
+
+- once all the other pairs are done, the run stays **running** with its cell
+  count stuck short of the total for about 3 minutes (its worker has let it
+  go and stopped its heartbeat), may show **resuming** for a few seconds, then
+  is taken again by a crash resume that asks only the missing pairs, and so
+  on;
+- after `COVERAGE_MAX_RESUMES` (default 5) of these, so about 20 minutes
+  later, **failed · resumed N× · *reason***, where the reason says how many
+  pairs still had no result row and gives the last interruption (*"N pairs have
+  no result row yet"*). The cells that were written stay on the page and in
+  the export.
+
+What to do: find the pair in the worker log, `docker compose -p viator logs
+worker | grep -A 40 "result write failed"`. Each matching line names the run
+and the pair (`origin→dest`); the traceback below it ends with the database
+error, on its last line. Fix the cause (usually the
+hub's data, under **Manage hubs** on the coverage page), then start a new
+run. Raising `COVERAGE_MAX_RESUMES` does not help: the same pair fails at
+every resume.
+
 Two settings in **Admin → Configuration → Network coverage matrix**, read by
 the worker every 10 s: `COVERAGE_MAX_CONCURRENT_RUNS` (default 1: how many
 runs run at once; more runs share the engines) and `COVERAGE_MAX_RESUMES`

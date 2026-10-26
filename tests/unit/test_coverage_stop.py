@@ -344,6 +344,12 @@ class _CountingFakeSession:
         scalars.all.return_value = self.captured_results
         result = MagicMock()
         result.scalars.return_value = scalars
+        # The completion's locked `SELECT status, claimed_by` (#406) reads
+        # the run row as it stands.
+        row = self.run_row
+        result.one_or_none.return_value = (
+            None if row is None else (row.status, getattr(row, "claimed_by", None))
+        )
         return result
 
 

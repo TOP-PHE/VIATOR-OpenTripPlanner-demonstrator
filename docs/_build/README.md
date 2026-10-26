@@ -26,6 +26,9 @@ node md2docx.js ../user-guide.md   ../VIATOR-User-Guide.docx   "VIATOR User Guid
   `check-added-large-files --maxkb=1024`. The diagram PNGs are the bulk of the file, which is why
   `build-diagrams.js` quantises them to a 128-colour palette — that halves them with no visible loss
   on flat-colour artwork. If you raise the render density, re-check the resulting `.docx` size.
+  The headroom is small: `VIATOR-Architecture.docx` is 1015.9 KB since #406 (about 8 KB left).
+  Commit only the PNGs whose diagram changed: another `sharp` version re-encodes the others a few
+  KB larger, which alone can push the `.docx` past the limit.
 - **The Markdown references `.svg`; Word embeds the `.png`.** `md2docx.js` swaps the extension when
   it meets a block image. Keep both outputs in `docs/diagrams/`.
 - **Images under `brand/` are skipped in the body** — the logo is already on the generated title page.

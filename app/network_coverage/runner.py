@@ -1617,6 +1617,20 @@ def _still_claimed_by(db: DbSession, run_id: uuid.UUID, executor_id: str) -> boo
     return holder == executor_id
 
 
+def _locked_status_and_holder(db: DbSession, run_id: uuid.UUID) -> tuple[str | None, str | None]:
+    """#406 — the run's `status` and `claimed_by` as committed now, read
+    under a row lock so neither can change before this transaction commits
+    ((None, None) when the row is gone)."""
+    row = db.execute(
+        select(NetworkCoverageRun.status, NetworkCoverageRun.claimed_by)
+        .where(NetworkCoverageRun.id == run_id)
+        .with_for_update()
+    ).one_or_none()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
 def _missing_pair_count(rows: Sequence[Any], expected: frozenset[tuple[str, str]] | None) -> int:
     """#392 — how many of the run's pairs have no result row (0 when the
     expected pair set is not given)."""
@@ -1658,6 +1672,10 @@ async def _finalise_completed_run(
     resumed with no pair left and completed again. With `executor_id`, the
     commit happens only while that executor still holds the run.
 
+    #406 — the commit happens only while the run is still `running`, read
+    under the row lock just before the flip: a status written meanwhile (a
+    `cancelled` set by SQL during the verify sweep) is kept.
+
     #392 — recount guard: with `expected_pairs` (the run's frozen pair set),
     the run is completed only when every pair has its result row; else it
     raises `RunNeedsResume` and the resume asks the missing pairs."""
@@ -1698,7 +1716,19 @@ async def _finalise_completed_run(
             "external_error_count": verify_counters["error"],
             **_kept_resume_summary(run.summary),
         }
-        if executor_id is not None and not _still_claimed_by(db, run_id, executor_id):
+        status, holder = _locked_status_and_holder(db, run_id)
+        if status != "running":
+            # #406 — ended by someone else during the verify sweep (a status
+            # written by SQL, PR-187): keep it, write nothing over it.
+            db.rollback()
+            log.warning(
+                "coverage_executor.status_changed run_id=%s status=%s phase=completion: "
+                "kept, not completed",
+                run_id,
+                status,
+            )
+            return
+        if executor_id is not None and holder != executor_id:
             db.rollback()
             log.warning(
                 "coverage_executor.claim_lost run_id=%s executor=%s phase=completion",
