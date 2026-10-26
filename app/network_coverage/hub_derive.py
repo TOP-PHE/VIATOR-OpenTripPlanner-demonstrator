@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 
 from ..gtfs_cross_border_filter import UIC_COUNTRY_NAMES, country_prefix
-from ..osm_geo import country_for_point
+from ..osm_geo import country_for_point, country_of_position
 from .translit import fold_ascii, to_latin
 
 # Hub slug regex from `app/api/admin/network_coverage.py::HubCreate.id`:
@@ -215,8 +215,13 @@ def derive(
     return `""` and let the operator pick country manually.
     """
     country = country_from_stop_id(stop_id) or country_from_coords(lat, lon)
-    slug = slugify(name, country)
-    short = latin_short(name, country)
+    # The Cyrillic rules of the station's country (#411): beyond the v1 list
+    # (Serbia, North Macedonia, Ukraine) from the position's bundled country.
+    script_country = country
+    if script_country is None and lat is not None and lon is not None:
+        script_country = country_of_position(lat, lon)
+    slug = slugify(name, script_country)
+    short = latin_short(name, script_country)
     return {
         "name": name,
         "slug": slug,

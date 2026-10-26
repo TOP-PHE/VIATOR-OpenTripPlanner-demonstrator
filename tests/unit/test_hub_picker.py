@@ -211,6 +211,7 @@ def test_a_search_offers_the_stations_with_the_fields_they_fill_in(
         "short": first["short"],
         "slug": "zz-zzville-zzcentral-zzstation",
         "slug_placeholder": False,
+        "latin_incomplete": False,
         "country": "ZZ",
         "lat": 45.5,
         "lon": 6.25,
@@ -291,8 +292,30 @@ def test_a_cyrillic_or_greek_name_proposes_a_latin_slug_and_short_label(
         ("Ззщ", "Zzsht", "zzsht", "Zzsht"),
         ("ZZ Zzł", None, "zz-zzl", "ZZ Zzł"),
     ]
-    assert not any(s["slug_placeholder"] for s in stations)
+    assert not any(s["slug_placeholder"] or s["latin_incomplete"] for s in stations)
     assert taken.asked == [{"zzia", "zthiza-zddd", "zzsht", "zz-zzl"}]
+
+
+def test_letters_with_no_latin_form_or_no_short_label_are_told(
+    client: TestClient, module: Module, taken: Taken
+) -> None:
+    """Review round 1: a Kazakh letter (no table holds it) is kept and the
+    station says so; a name of signs only gives no short label."""
+    module.countries = httpx.Response(200, json={"countries": ["KZ", "RU"]})
+    module.search = lambda _b: _answer(
+        _row("Қзз Ззз", "9900001", country="KZ"), _row("ЪЬ 99", "9900002", country="RU")
+    )
+
+    kazakh, signs = _pick(client, country="KZ")["stations"]
+
+    assert (kazakh["latin_name"], kazakh["slug"], kazakh["latin_incomplete"]) == (
+        "Қzz Zzz",
+        "zz-zzz",
+        True,
+    )
+    assert kazakh["slug_placeholder"] is False
+    assert (signs["latin_name"], signs["short"], signs["slug"]) == (" 99", "99", "99")
+    assert signs["latin_incomplete"] is False
 
 
 def test_a_name_with_no_latin_form_says_its_slug_is_a_placeholder(
@@ -648,14 +671,16 @@ def test_the_hubs_country_headers_name_every_bundled_country(template_text: str)
     assert '"hub_country_names": osm_geo.BUNDLED_COUNTRY_NAMES' in Path(pages.__file__).read_text(
         encoding="utf-8"
     )
-    block = re.search(
-        r'<script id="hub-country-names" type="application/json">.*?</script>', template_text
-    )
-    assert block is not None
-    rendered = templates.env.from_string(block.group(0)).render(
+    # The JSON block, found as fixed text: its content is the Jinja
+    # expression the page renders.
+    opening = '<script id="hub-country-names" type="application/json">'
+    assert template_text.count(opening) == 1
+    inner_start = template_text.index(opening) + len(opening)
+    inner = template_text[inner_start : template_text.index("</script>", inner_start)]
+    assert inner == "{{ hub_country_names|tojson }}"
+    payload = templates.env.from_string(inner).render(
         hub_country_names=osm_geo.BUNDLED_COUNTRY_NAMES
     )
-    payload = re.sub(r"^<script[^>]*>|</script>$", "", rendered)
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
@@ -784,6 +809,10 @@ out.chosenCreate = hubPickChosenText(cyrillic, true);
 out.chosenEdit = hubPickChosenText(cyrillic, false);
 out.chosenPlaceholder = hubPickChosenText(placeholder, true);
 out.chosenPlaceholderEdit = hubPickChosenText(placeholder, false);
+const incomplete = Object.assign({}, station, { latin_incomplete: true });
+out.chosenIncomplete = hubPickChosenText(incomplete, true);
+out.chosenIncompleteEdit = hubPickChosenText(incomplete, false);
+out.chosenNoShort = hubPickChosenText(Object.assign({}, station, { short: '' }), true);
 console.log(JSON.stringify(out));
 """
 
@@ -859,6 +888,14 @@ def test_the_picker_script_fills_the_form_and_words_its_answers(template_text: s
         'The name gives no Latin letter or digit, so "hub-2" is only a placeholder: type a slug.'
     )
     assert "placeholder" not in out["chosenPlaceholderEdit"]  # a saved hub's slug stays
+    assert out["chosenIncomplete"].endswith(
+        "Some letters of the name have no Latin form here: the short label and the slug "
+        "lack them; correct them."
+    )
+    assert out["chosenIncompleteEdit"].endswith(
+        "Some letters of the name have no Latin form here: the short label lacks them; correct it."
+    )
+    assert out["chosenNoShort"].endswith("The name gives no short label: type one.")
 
 
 # A page of fake elements and a fake fetch: the picker's searches, keys,

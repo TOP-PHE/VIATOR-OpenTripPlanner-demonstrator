@@ -7,6 +7,8 @@ station: each case pins one rule of the table.
 
 from __future__ import annotations
 
+import unicodedata
+
 import pytest
 
 from app.network_coverage import hub_derive, translit
@@ -120,3 +122,82 @@ def test_derive_transliterates_by_the_country_it_finds(monkeypatch: pytest.Monke
         "Zzhia",
         "BG",
     )
+
+
+# ─────────────────────────── review round 1 ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("name", "country", "slug", "short"),
+    [
+        ("Йошкар-Ола", "RU", "yoshkar-ola", "Yoshkar-Ola"),
+        ("Ѓевгелија", "MK", "gjevgelija", "Gjevgelija"),
+        ("Ззїй", "UA", "zzii", "Zzii"),
+        ("Ζζίζζζζζζζζζ", None, "zzizzzzzzzzz", "Zzizzzzzzzzz"),
+    ],
+)
+def test_a_name_sent_decomposed_reads_as_its_letters(
+    name: str, country: str | None, slug: str, short: str
+) -> None:
+    decomposed = unicodedata.normalize("NFD", name)
+    assert decomposed != name
+    assert hub_derive.slugify(decomposed, country) == slug
+    label = hub_derive.latin_short(decomposed, country)
+    assert label == short
+    assert not any(unicodedata.category(ch) == "Mn" for ch in label)
+    assert translit.to_latin(decomposed, country) == translit.to_latin(name, country)
+
+
+def test_the_letters_with_a_grave_and_a_letter_no_table_holds() -> None:
+    assert translit.to_latin("Ѐзеро", "MK") == "Ezero"
+    assert translit.to_latin("Ѝзз", "BG") == "Izz"
+    assert hub_derive.slugify("Ѐзеро", "MK") == "ezero"
+    # A letter no table holds takes its base letter's form (Chuvash `ӑ`).
+    assert translit.to_latin("Ӑзз", "RU") == "Azz"
+    assert not translit.has_foreign_letters("Azz")
+
+
+def test_a_letter_with_no_latin_form_is_kept_and_told() -> None:
+    """Kazakh letters (KZ takes the Russian table): kept, never dropped
+    silently; the picker says the slug lacks them."""
+    latin = translit.to_latin("Қзғз Өзз", "KZ")
+    assert latin == "Қzғz Өzz"
+    assert translit.has_foreign_letters(latin)
+    assert not translit.has_foreign_letters(translit.to_latin("ЗЗИЯ Ζζ", "BG"))
+    assert not translit.has_foreign_letters("Zzé Zzł 99 - ()")
+    assert translit.has_foreign_letters("〇〇") is False  # no letter: a placeholder
+
+
+def test_a_word_mixing_scripts_or_a_dotted_capital_i() -> None:
+    # `İ` lowers to two characters: no IndexError, the word stays aligned.
+    assert translit.to_latin("ЗЗИЯİ", "BG") == "ZZIYAİ"
+    assert translit.to_latin("Ззиİз", "RU") == "Zziİz"
+    assert hub_derive.slugify("ЗЗИЯİ", "BG") == "zziyai"
+    # Greek and Cyrillic in one word: each by its own rules.
+    assert translit.to_latin("ΖΘБЩ", "BG") == "ZTHBSHT"
+    assert translit.to_latin("Ζουщ", "RU") == "Zoushch"
+
+
+def test_montenegro_takes_the_serbian_table() -> None:
+    assert translit.to_latin("Ђзжћчџш", "ME") == "Đzžćčdžš"
+    assert hub_derive.slugify("Ђзжћ", "ME") == "djzzc"
+    # Kosovo's Cyrillic takes the default (Russian) table.
+    assert translit.to_latin("Ззжћ", "XK") == "Zzzhc"
+
+
+def test_a_name_of_signs_only_gives_an_empty_short_label() -> None:
+    assert translit.to_latin("ЪЬ", "RU") == ""
+    assert hub_derive.latin_short("ЪЬ", "RU") == ""
+    assert hub_derive.slugify("ЪЬ", "RU") == ""
+
+
+def test_derive_takes_the_positions_bundled_country_beyond_the_v1_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hub_derive, "country_from_coords", lambda _lat, _lon: None)
+    monkeypatch.setattr(hub_derive, "country_of_position", lambda _lat, _lon: "MK")
+
+    out = hub_derive.derive("Цзз", 45.0, 6.0)
+
+    assert (out["slug"], out["short"], out["country"]) == ("czz", "Czz", "")
+    assert hub_derive.derive("Цзз", None, None)["slug"] == "tszz"  # no position: the default

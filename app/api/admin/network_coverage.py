@@ -2077,7 +2077,10 @@ class HubPickStation(BaseModel):
     name in Latin letters (#411); `latin_name` is that form when the
     module's `name` is in Cyrillic or Greek script (else None), and
     `slug_placeholder` says that the name gave no Latin letter or digit, so
-    the slug is the bare `hub` (numbered) and one must be typed; `uic` and
+    the slug is the bare `hub` (numbered) and one must be typed;
+    `latin_incomplete` that some letters of the name have no Latin form
+    here (a Kazakh letter, say), so the slug and the short label lack them;
+    an empty `short` (a name of signs only, `ъ` or `ь`) must be typed; `uic` and
     `station_id` (the station's current VIATOR id) are what the dialog
     sends to POST /hubs/confirm once the hub is saved."""
 
@@ -2086,6 +2089,7 @@ class HubPickStation(BaseModel):
     short: str
     slug: str
     slug_placeholder: bool = False
+    latin_incomplete: bool = False
     country: str
     lat: float
     lon: float
@@ -2213,13 +2217,15 @@ def _pick_stations(db: DbSession, rows: list[dict[str, Any]], country: str) -> l
         slug = unique_slug(base, taken)
         taken.add(slug)
         name = row["name"]
+        latin = translit.to_latin(name, code)
         stations.append(
             HubPickStation(
                 name=name,
-                latin_name=None if translit.is_latin(name) else translit.to_latin(name, code),
+                latin_name=None if translit.is_latin(name) else latin,
                 short=hub_derive.latin_short(name, code, PICK_SHORT_MAX),
                 slug=slug,
                 slug_placeholder=not hub_derive.slugify(name, code),
+                latin_incomplete=translit.has_foreign_letters(latin),
                 country=code,
                 lat=row["latitude"],
                 lon=row["longitude"],

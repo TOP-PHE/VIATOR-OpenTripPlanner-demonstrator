@@ -496,7 +496,8 @@ def test_a_cyrillic_or_greek_name_proposes_a_free_latin_slug_and_no_saved_slug_c
         "ZZ A 1",
         "zz-a-1-2",
     )
-    assert not first["slug_placeholder"] and not second["slug_placeholder"]
+    assert not first["slug_placeholder"]
+    assert not second["slug_placeholder"]
     with create_engine(fresh_db).connect() as conn:
         after = conn.execute(text("SELECT id FROM network_coverage_hubs ORDER BY id")).all()
     assert after == before == sorted((hub[0],) for hub in HUBS)

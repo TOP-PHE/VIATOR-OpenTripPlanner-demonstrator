@@ -2415,7 +2415,7 @@ function hubCountryNames() {
   } catch (err) {
     console.warn('hubs: the country names could not be read', err);
   }
-  return Object.assign({ 'UK': 'United Kingdom' }, names);
+  return { 'UK': 'United Kingdom', ...names };
 }
 const COUNTRY_NAMES = hubCountryNames();
 
@@ -2953,7 +2953,10 @@ function hubPickChosenText(station, creating) {
   let text = `Picked: ${hubPickName(station)} (${hubPickMeta(station)}). Check the short label${creating ? ' and the slug' : ''}, then save.`;
   if (creating && station.slug_placeholder) {
     text += ` The name gives no Latin letter or digit, so "${station.slug}" is only a placeholder: type a slug.`;
+  } else if (station.latin_incomplete) {
+    text += ` Some letters of the name have no Latin form here: the short label${creating ? ' and the slug lack' : ' lacks'} them; correct ${creating ? 'them' : 'it'}.`;
   }
+  if (!station.short) text += ' The name gives no short label: type one.';
   return text;
 }
 

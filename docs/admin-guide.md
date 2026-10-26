@@ -3664,7 +3664,8 @@ When VIATOR uses the module, **+ Add hub** (and the ✏️ of a hub) opens with
 1. **Country**: the module's countries (the list it serves stations in);
    when the module does not answer, VIATOR's own list, and the dialog says
    so. Every country VIATOR bundles has its name, here and in the hubs
-   list's country headers (`BG · Bulgaria`, `RS · Serbia`, `XK · Kosovo`). The country of the hub (or of the "+ Add" you clicked) is chosen at
+   list's country headers (`BG · Bulgaria`, `RS · Serbia`, `XK · Kosovo`).
+   The country of the hub (or of the "+ Add" you clicked) is chosen at
    first. A hub saved with a code the list does not hold (`UK` instead of
    `GB`, say) gets no country chosen: the dialog says so, and you pick one.
    On ✏️ the picker is greyed out until the hub's fields are loaded.
@@ -3695,14 +3696,23 @@ When VIATOR uses the module, **+ Add hub** (and the ✏️ of a hub) opens with
    letters with no accent to strip also have their usual ASCII form in
    the slug (`ß` ss, `ł` l, `ø` o, `æ` ae, `þ` th, `ı` i). When a name
    gives no Latin letter or digit at all, the proposed slug is only
-   `hub` (numbered), and the dialog asks you to type one.
+   `hub` (numbered), and the dialog asks you to type one. When some of its
+   letters have no Latin form here (a Kazakh `қ`, say), the dialog says the
+   slug and the short label lack them; when it gives no short label at
+   all, it asks you to type one.
 
    **A hub saved with a bad slug** (such as `hub` or `hub-2`, saved before
    #411 for a Cyrillic or Greek name): a slug never changes once saved.
    Soft-delete the hub (🗑: it leaves the matrix and new runs, past runs
    still show it, and its slug stays taken), then add it again with
    **+ Add hub** and pick its station: the new hub gets the proposed slug
-   (`sofia`).
+   (`sofia`). The new hub starts with no history: past runs keep their
+   results under the old slug (`hub`). Do not restore (↺) the old hub
+   afterwards: the station would then appear twice in the matrix, since
+   nothing stops two hubs from holding one station. The same holds for a
+   station saved before #411 under a slug that lost a letter such as `ł`
+   or `ø` (`krakow-g-owny`): picked again, it now proposes `krakow-glowny`,
+   with no `-2` to warn that it is already a hub.
 4. **Save** stores the hub, then its station exactly as **Save ticked
    codes** does: one lookup in the module, the code marked "from the
    station module" and the station's current VIATOR id. When that lookup
