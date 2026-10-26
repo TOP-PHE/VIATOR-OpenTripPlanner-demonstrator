@@ -55,4 +55,4 @@ uv==0.13.4
 types-requests==2.33.0.20261006
 types-passlib==1.7.7.20260211
 types-defusedxml==0.7.0.20260504   # defusedxml ships no inline types — needed for app/journey/ojp_client.py under mypy strict
-sqlalchemy==2.1.4             # MUST match the pin in requirements.in — pip rejects on conflict (audit-2026-05 #23). No [mypy] extra: 2.1 removed the plugin; typing is native
+sqlalchemy==2.1.6             # MUST match the pin in requirements.in — pip rejects on conflict (audit-2026-05 #23). No [mypy] extra: 2.1 removed the plugin; typing is native
