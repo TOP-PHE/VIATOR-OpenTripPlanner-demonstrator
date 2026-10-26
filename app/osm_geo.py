@@ -428,6 +428,20 @@ def _patch_line_within(lat: float, lon: float, km: float, iso: str) -> bool:
     return False
 
 
+def _patch_in_doubt(lat: float, lon: float, iso: str) -> bool:
+    """Is a position inside the patch polygon of `iso` in doubt? When another
+    v1 country's patch line lies within `V1_BORDER_DOUBT_KM`, when the 1:50m
+    polygon holding it is a country's outside the v1 list (never the v1
+    country over a non-v1 answer), or when such a country's 1:50m line lies
+    within `BORDER_DOUBT_KM` (the patch knows only the v1 lines)."""
+    if _patch_line_within(lat, lon, V1_BORDER_DOUBT_KM, iso):
+        return True
+    non_v1 = BUNDLED_COUNTRIES - VALID_COUNTRIES
+    if _containing(lat, lon, non_v1) is not None:
+        return True
+    return bool(_boundaries_within(lat, lon, BORDER_DOUBT_KM, non_v1))
+
+
 def country_for_point(lat: float, lon: float) -> str | None:
     """ISO code of the v1 country containing (lat, lon), or None.
 
@@ -468,14 +482,7 @@ def country_of_position(lat: float, lon: float) -> str | None:
         return None
     patch = _containing(lat, lon, None, _patch_polygons())
     if patch is not None:
-        if _patch_line_within(lat, lon, V1_BORDER_DOUBT_KM, patch):
-            return None
-        non_v1 = BUNDLED_COUNTRIES - VALID_COUNTRIES
-        if _containing(lat, lon, non_v1) is not None:
-            return None  # 1:50m says another country: in doubt, never the v1 one
-        if _boundaries_within(lat, lon, BORDER_DOUBT_KM, non_v1):
-            return None
-        return patch
+        return None if _patch_in_doubt(lat, lon, patch) else patch
     iso = _containing(lat, lon, None)
     distance = 0.0
     if iso is None:
