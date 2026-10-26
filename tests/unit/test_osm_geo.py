@@ -8,7 +8,9 @@ suggestion threshold, and the osmium crop polygon.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import time
 
 import pytest
 
@@ -18,6 +20,22 @@ from app import station_extract
 # The sha256 of app/data/country_borders.geojson (see
 # test_the_boundaries_file_changes_with_the_extractor_version).
 BOUNDARIES_SHA256 = "b5ca4ef32d12062b03572fd269d5e1400a43fdc20cc8148b6a366b92fa0d0f6d"
+# The sha256 of app/data/country_borders_v1_patch.geojson (#404; built by
+# scripts/build_v1_border_patch.py, see the same test).
+PATCH_SHA256 = "4fba61b2c430d8ccfbceda2e7249dba15c1de30b0ad62c0ed4d411ec15f52caa"
+
+
+def _patch_km(lat: float, lon: float, iso: str) -> float:
+    """Distance in km from (lat, lon) to the v1 border patch polygon of `iso`."""
+    k = (110.57, 111.32 * math.cos(math.radians(lat)))
+    return min(
+        g._polygon_km(lat, lon, poly, k) for c, _bbox, poly in g._patch_polygons() if c == iso
+    )
+
+
+def _in_patch(lat: float, lon: float) -> str | None:
+    return g._containing(lat, lon, None, g._patch_polygons())
+
 
 # ──────────────────────── validate_countries ────────────────────────
 
@@ -148,11 +166,15 @@ def test_country_of_position_knows_every_european_country(name, lat, lon, expect
         # At sea 7 km off Monaco, in no polygon: Monaco's line is the nearest,
         # France's 0.2 km farther (the band counts from the nearest line).
         ("at sea off Monaco", 43.68, 7.43, None),
-        # Inside their own v1 country, within BORDER_DOUBT_KM of another
-        # country's line: none too since 25 October (every border).
+        # Inside their own v1 country, within BORDER_DOUBT_KM of the line of
+        # a country outside the v1 list: none too since 25 October (every
+        # border).
         ("Terespol, PL", 52.075, 23.62, None),
-        ("Valga, EE", 57.776, 26.045, None),
-        ("Svilengrad, BG", 41.77, 26.20, None),
+        # By a border between two v1 countries the patch decides (#404):
+        # Valga 0.8 km from Latvia's line, Svilengrad 3.2 km from Greece's
+        # (and some 7 km from Turkey's 1:50m line).
+        ("Valga, EE", 57.776, 26.045, "EE"),
+        ("Svilengrad, BG", 41.77, 26.20, "BG"),
     ],
 )
 def test_a_position_by_a_v1_border_is_never_the_neighbours(name, lat, lon, expected):
@@ -160,25 +182,244 @@ def test_a_position_by_a_v1_border_is_never_the_neighbours(name, lat, lon, expec
 
 
 @pytest.mark.parametrize(
-    "name,lat,lon,wrong",
+    "name,lat,lon,wrong,expected",
     [
         # Stations by a border between two v1 countries, which the 1:50m
         # polygons put on the wrong side (the station module's review queue of
-        # 25 October): no country rather than the neighbour's.
-        ("Kehl", 48.5747, 7.8148, None),
-        ("Menton", 43.7747, 7.4925, None),
-        ("Menton-Garavan", 43.7826, 7.5094, "IT"),
-        ("Hendaye", 43.3537, -1.7820, "ES"),
-        ("Wissembourg", 49.0367, 7.9416, "DE"),
-        ("Vallorcine", 46.0326, 6.9311, "CH"),
-        ("Riksgränsen", 68.4253, 18.1250, "NO"),
-        ("Irun", 43.3393, -1.8013, None),
+        # 25 October): no country in version 4; their own from the patch since
+        # version 5 (#404), beyond V1_BORDER_DOUBT_KM of the other's line.
+        ("Kehl", 48.5747, 7.8148, None, "DE"),
+        ("Menton", 43.7747, 7.4925, None, "FR"),
+        ("Menton-Garavan", 43.7826, 7.5094, "IT", "FR"),
+        ("Wissembourg", 49.0367, 7.9416, "DE", "FR"),
+        ("Vallorcine", 46.0326, 6.9311, "CH", "FR"),
+        ("Riksgränsen", 68.4253, 18.1250, "NO", "SE"),
+        ("Irun", 43.3393, -1.8013, None, "ES"),
+        # Within 0.5 km of Spain's line: still none.
+        ("Hendaye", 43.3537, -1.7820, "ES", None),
     ],
 )
-def test_a_position_by_a_border_between_v1_countries_is_in_none(name, lat, lon, wrong):
+def test_a_position_by_a_border_between_v1_countries_takes_the_patch(
+    name, lat, lon, wrong, expected
+):
     if wrong is not None:
         assert g.country_for_point(lat, lon) == wrong, name  # the 1:50m polygon's side
-    assert g.country_of_position(lat, lon) is None, name
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+# ──────────────────────── the v1 border patch (#404) ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,truth,wrong,expected,other_km",
+    [
+        # The 14 review probes of #394/#403 that the 1:50m polygons put in the
+        # neighbour (the study of #404; approximate public coordinates): the
+        # patch holds each in its own country. Beyond V1_BORDER_DOUBT_KM of the
+        # neighbour's patch line, that is the result; within it, none.
+        ("Hendaye", 43.353, -1.7836, "FR", "ES", None, 0.18),
+        ("Puigcerdà", 42.431, 1.93, "ES", "FR", "ES", 0.91),
+        ("Valença", 42.028, -8.643, "PT", "ES", "PT", 0.91),
+        ("Riksgränsen", 68.425, 18.13, "SE", "NO", "SE", 1.04),
+        ("Kornsjø", 58.933, 11.649, "NO", "SE", "NO", 0.56),
+        ("Gorizia", 45.93, 13.617, "IT", "SI", "IT", 0.94),
+        ("Chiasso", 45.832, 9.031, "CH", "IT", None, 0.31),
+        ("Freilassing", 47.837, 12.977, "DE", "AT", "DE", 1.09),
+        ("Brennero", 47.003, 11.505, "IT", "AT", None, 0.37),
+        ("Venlo", 51.364, 6.172, "NL", "DE", "NL", 2.87),
+        ("Essen (BE)", 51.464, 4.452, "BE", "NL", "BE", 0.63),
+        ("Menton", 43.773, 7.493, "FR", "IT", "FR", 2.78),
+        ("Konstanz", 47.659, 9.177, "DE", "CH", None, 0.44),
+        ("Lauterbourg", 48.975, 8.18, "FR", "DE", None, 0.35),
+    ],
+)
+def test_the_patch_puts_the_review_probes_in_their_country(
+    name, lat, lon, truth, wrong, expected, other_km
+):
+    assert g.country_for_point(lat, lon) == wrong, name  # 1:50m: the neighbour's polygon
+    assert _in_patch(lat, lon) == truth, name
+    assert _patch_km(lat, lon, wrong) == pytest.approx(other_km, abs=0.01), name
+    assert g.country_of_position(lat, lon) == expected, name
+    assert (expected is None) == (other_km <= g.V1_BORDER_DOUBT_KM), name
+
+
+def test_basel_bad_bf_is_swiss():
+    # Basel Badischer Bahnhof stands on Swiss soil, run by DB: the review
+    # probe's label DE (#403) was wrong; every fine dataset of the study of
+    # #404, and the swisstopo/BKG lines, put it in Switzerland.
+    lat, lon = 47.567, 7.607
+    assert _in_patch(lat, lon) == "CH"
+    assert _patch_km(lat, lon, "DE") == pytest.approx(1.21, abs=0.01)
+    assert g.country_of_position(lat, lon) == "CH"
+
+
+def test_the_v1_border_doubt_is_half_a_kilometre_of_the_patch_line():
+    # Due north of the Konstanz probe, away from Switzerland's patch line, at
+    # fixed distances (not derived from the constant, so a changed band fails).
+    lon = 9.177
+    for lat, swiss_km, expected in (
+        (47.659, 0.444, None),
+        (47.65945, 0.489, None),  # a band of 0.45 km fails here
+        (47.65972, 0.517, "DE"),
+        (47.6599, 0.535, "DE"),  # a band of 0.55 km fails here
+    ):
+        assert _in_patch(lat, lon) == "DE"
+        assert _patch_km(lat, lon, "CH") == pytest.approx(swiss_km, abs=0.002)
+        assert g.country_of_position(lat, lon) == expected, (lat, swiss_km)
+    assert g.V1_BORDER_DOUBT_KM == 0.5
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        # Water borders (#404; approximate public positions, a few invented
+        # ones in the water). Lake Constance: the patch follows the LSIB lines
+        # through the lake; Konstanz and Kreuzlingen lie 0.4 km from them.
+        ("Konstanz Bf", 47.6589, 9.1777, None),
+        ("Kreuzlingen", 47.6503, 9.1747, None),
+        ("Lindau-Insel", 47.5442, 9.6812, "DE"),
+        ("Bregenz", 47.5028, 9.7375, "AT"),
+        ("Romanshorn", 47.5654, 9.3796, "CH"),
+        ("Friedrichshafen Stadt", 47.6532, 9.4740, "DE"),
+        # The Moselle (a DE-LU condominium; the line mid-river): the river
+        # bank stations within 0.5 km of it have none.
+        ("Schengen, LU", 49.4700, 6.3640, None),
+        ("Remich, LU", 49.5450, 6.3670, None),
+        ("Temmels, DE", 49.6890, 6.4730, None),
+        ("Perl, DE", 49.4720, 6.3810, "DE"),
+        ("Nennig, DE", 49.5280, 6.3850, "DE"),
+        # The Ems-Dollard (its line disputed): Bad Nieuweschans by the land
+        # border; Delfzijl on the Ems, outside the band (1:50m, as before).
+        ("Bad Nieuweschans, NL", 53.1849, 7.2030, None),
+        ("Weener, DE", 53.1630, 7.3540, "DE"),
+        ("Delfzijl, NL", 53.3306, 6.9230, "NL"),
+        # Borkum: in the 1:50m Netherlands, far from the land border; the
+        # patch's fix area gives it to Germany.
+        ("Borkum", 53.5874, 6.6628, "DE"),
+        # The Flensburg Fjord.
+        ("Flensburg", 54.7740, 9.4370, "DE"),
+        ("Glücksburg", 54.8340, 9.5500, "DE"),
+        ("Kollund, DK", 54.8430, 9.4600, "DK"),
+        ("Padborg", 54.8250, 9.3640, "DK"),
+        ("the fjord, invented", 54.835, 9.50, "DE"),
+        # The Vennbahn: the Belgian railway strip and the German enclaves
+        # west of it.
+        ("Mützenich (enclave)", 50.5620, 6.2190, "DE"),
+        ("Roetgen", 50.6470, 6.1940, "DE"),
+        ("Kalterherberg", 50.5240, 6.2210, "DE"),
+        ("Raeren, BE", 50.6740, 6.1150, "BE"),
+        ("Sourbrodt, BE", 50.4890, 6.1130, "BE"),
+        ("Ruitzhof (enclave)", 50.5835, 6.2125, None),
+        # Other enclaves: Büsingen and Baarle by their lines, Campione and
+        # Llívia beyond 0.5 km.
+        ("Büsingen", 47.6966, 8.6897, None),
+        ("Baarle-Nassau", 51.4452, 4.9286, None),
+        ("Campione d'Italia", 45.9690, 8.9710, "IT"),
+        ("Llívia", 42.4640, 1.9800, "ES"),
+    ],
+)
+def test_the_patch_at_water_borders_and_enclaves(name, lat, lon, expected):
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+def test_borkum_was_dutch_in_the_coarse_boundaries():
+    assert g.country_for_point(53.5874, 6.6628) == "NL"
+    assert _in_patch(53.5874, 6.6628) == "DE"
+
+
+@pytest.mark.parametrize(
+    "name,lat,lon,expected",
+    [
+        # Positions in a country outside the v1 list by a v1 border: the patch
+        # holds none of them; the 1:50m rules give what they gave.
+        ("Andorra la Vella", 42.507, 1.522, "AD"),
+        ("Pas de la Casa, AD", 42.542, 1.733, None),
+        ("Monaco-Monte-Carlo", 43.739, 7.420, None),
+        ("Kaliningrad", 54.710, 20.452, "RU"),
+        ("Ivangorod, RU", 59.375, 28.215, "RU"),
+        ("Brest (Belarus)", 52.098, 23.735, "BY"),
+        ("Subotica", 46.100, 19.666, "RS"),
+        ("Chop, UA", 48.432, 22.201, None),
+    ],
+)
+def test_the_patch_never_applies_to_a_country_outside_the_v1_list(name, lat, lon, expected):
+    assert _in_patch(lat, lon) is None, name
+    assert g.country_of_position(lat, lon) == expected, name
+
+
+def test_the_patch_holds_v1_countries_only_and_keeps_the_other_bands():
+    codes = [iso for iso, _bbox, _poly in g._patch_polygons()]
+    assert set(codes) <= g.VALID_COUNTRIES
+    feature_codes = [
+        f["properties"]["ISO_A2"]
+        for f in json.loads(g._PATCH_PATH.read_text(encoding="utf-8"))["features"]
+    ]
+    assert len(feature_codes) == len(set(feature_codes))
+    assert set(feature_codes) <= g.VALID_COUNTRIES
+    # Záhony (HU, at the HU-SK-UA tripoint) is in Hungary's patch, but the
+    # 1:50m Ukraine lies within BORDER_DOUBT_KM: none, as before.
+    assert _in_patch(48.4093, 22.1748) == "HU"
+    assert g.country_of_position(48.4093, 22.1748) is None
+    # A vertex of a 1:50m polygon of a country outside the v1 list that the
+    # patch holds (1:50m lies off) is never given to the v1 country.
+    held = [
+        (lat, lon)
+        for iso, _bbox, poly in g._polygons()
+        if iso not in g.VALID_COUNTRIES
+        for lon, lat in poly[0][::5]
+        if _in_patch(lat, lon) is not None
+    ]
+    assert held  # Monaco's, Andorra's, … 1:50m lines cross the patch
+    assert all(g.country_of_position(lat, lon) is None for lat, lon in held)
+
+
+def test_a_feature_of_another_country_in_the_patch_is_ignored(tmp_path, monkeypatch):
+    square = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}
+    path = tmp_path / "patch.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "properties": {"ISO_A2": "GI"}, "geometry": square},
+                    {"type": "Feature", "properties": {"ISO_A2": "FR"}, "geometry": square},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(g, "_PATCH_PATH", path)
+    g._patch_polygons.cache_clear()
+    try:
+        assert [iso for iso, _bbox, _poly in g._patch_polygons()] == ["FR"]
+    finally:
+        g._patch_polygons.cache_clear()
+
+
+def test_country_for_point_never_reads_the_patch():
+    # The OSM crop, the detection and the hubs keep to 1:50m (v1 only).
+    assert g.country_for_point(49.0367, 7.9416) == "DE"  # Wissembourg, in 1:50m Germany
+    assert g.country_of_position(49.0367, 7.9416) == "FR"
+    assert g.country_for_point(43.7826, 7.5094) == "IT"  # Menton-Garavan
+    assert g.country_of_position(43.7826, 7.5094) == "FR"
+
+
+def test_the_patch_loads_and_answers_within_the_extract_budget():
+    g._patch_polygons.cache_clear()
+    start = time.perf_counter()
+    g._patch_polygons()
+    assert time.perf_counter() - start < 0.2  # measured ~0.03 s
+    # Positions by v1 borders, the slowest kind (the patch then measures the
+    # distance to the neighbour's line): ~1 ms each, so 100,000 stops cost
+    # under a few minutes of the extract child's 40 min of CPU.
+    positions = [
+        (47.659, 9.177), (43.353, -1.7836), (45.832, 9.031), (51.364, 6.172),
+        (68.425, 18.13), (49.47, 6.364), (50.562, 6.219), (54.835, 9.50),
+    ] * 25  # fmt: skip
+    start = time.process_time()
+    for lat, lon in positions:
+        g.country_of_position(lat, lon)
+    assert (time.process_time() - start) / len(positions) < 0.01
 
 
 @pytest.mark.parametrize(
@@ -306,6 +547,11 @@ def test_country_of_position_takes_the_nearest_boundary_on_a_coast(name, lat, lo
         # Spain's line is the nearest, Gibraltar's within BORDER_DOUBT_KM
         # beyond it. 1:50m cannot tell Spain from Gibraltar there, so none,
         # like Cap-d'Ail inside the polygons. Neither has a rail station.
+        # Not in the v1 border patch (#404): its build gives CGAZ's Gibraltar
+        # to GI, not to the United Kingdom, so no border between two v1
+        # countries passes there. La Línea lies in Spain (0.8 km from
+        # Gibraltar's LSIB line), but Gibraltar is outside the v1 list: the
+        # 3 km band towards it stays, on 1:50m, so none, as before.
         ("Gibraltar airport", 36.151, -5.347, 0.78, 1.09),
         ("La Línea, beside Gibraltar", 36.165, -5.347, 0.40, 2.64),
     ],
@@ -315,6 +561,7 @@ def test_the_coast_fallback_gives_none_by_a_neighbours_line(name, lat, lon, spai
     assert g._containing(lat, lon, None) is None
     assert near["ES"] == pytest.approx(spain_km, abs=0.02)
     assert near["GI"] == pytest.approx(gibraltar_km, abs=0.02)
+    assert _in_patch(lat, lon) is None
     assert g.country_of_position(lat, lon) is None, name
 
 
@@ -419,13 +666,21 @@ def test_the_bundled_boundaries_are_the_v1_list_the_other_countries_and_neighbou
 
 
 def test_the_boundaries_file_changes_with_the_extractor_version():
-    # The rows of the stop extract follow this file: a change to it changes
-    # `iso2_point`, so raise station_extract.EXTRACTOR_VERSION with it and
-    # update both values here.
+    # The rows of the stop extract follow this file and the v1 border patch:
+    # a change to either changes `iso2_point`, so raise
+    # station_extract.EXTRACTOR_VERSION with it and update the values here.
     digest = hashlib.sha256(g._GEOJSON_PATH.read_bytes()).hexdigest()
     assert digest == BOUNDARIES_SHA256
-    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-4"
+    assert hashlib.sha256(g._PATCH_PATH.read_bytes()).hexdigest() == PATCH_SHA256
+    assert station_extract.EXTRACTOR_VERSION == "viator-stop-extract-5"
     assert g._GEOJSON_PATH.stat().st_size < 1024 * 1024  # the pre-commit large-file cap
+
+
+def test_the_patch_file_stays_under_the_large_file_cap():
+    # The pre-commit large-file cap is 1024 KB; the patch is ~540 KB
+    # (simplified at 200 m, 5 decimals). A finer one must stay under it.
+    assert g._PATCH_PATH.stat().st_size < 1024 * 1024
+    assert g._PATCH_PATH.stat().st_size < 600 * 1024
 
 
 def test_the_other_countries_are_never_offered_for_the_crop():

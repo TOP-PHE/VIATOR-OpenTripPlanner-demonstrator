@@ -403,7 +403,7 @@ referential reads (MSMM `docs/service-design.md` 22.2 point 6; 22.3 point 3). Pu
 for the upload step:
 
 ```python
-EXTRACTOR_VERSION: str                                   # "viator-stop-extract-4" (25 October)
+EXTRACTOR_VERSION: str                                   # "viator-stop-extract-5" (26 October, #404)
 feed_key_for(provider_cfg, *, upload_sha256=None) -> str | None
 ensure_extract(provider_cfg, archive_path, archive_sha256, *, extracted_at, session_id,
                cache_dir=None, wait_seconds=None, cache_only=False) -> ExtractResult
@@ -424,7 +424,18 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   provider_id,provider_label,provider_country_iso,provider_provenance`, `format_version` `1` on every
   row; `modes`/`operators`/`codes` joined by `|`; a code `field=value`; `lat`/`lon` `format(x, ".7f")`;
   `feed_version` the sha256 of the downloaded bytes (`FetchResult.sha256`, from the fetch state) or of
-  the uploaded file; `iso2_point` from `osm_geo.country_of_position` (since version 4, 25 October: empty within
+  the uploaded file; `iso2_point` from `osm_geo.country_of_position` (since version 5, #404: within
+  10 km of a land border between two v1 countries the finer patch `app/data/country_borders_v1_patch.geojson`
+  decides first: the v1 country whose patch polygon holds the position, empty while another v1
+  country's patch polygon lies within `V1_BORDER_DOUBT_KM` = 0.5 km or the 1:50m line of a country
+  outside the v1 list within `BORDER_DOUBT_KM` = 3 km; the patch is the U.S. State Department's LSIB
+  lines via geoBoundaries CGAZ on Natural Earth 1:10m land with 2 km of its sea, simplified at 200 m,
+  built by `scripts/build_v1_border_patch.py` (not in CI), its lines a median 50 m and p99 ~380 m
+  from the national ones; Kehl is `DE`, Menton and Wissembourg `FR`, Venlo `NL`, Basel Bad Bf `CH`
+  (it stands on Swiss soil), Konstanz, Hendaye, Chiasso, Brennero and Lauterbourg empty (within
+  0.5 km); Gibraltar is not the United Kingdom in the build (no v1 border there: La Línea and the
+  airport stay empty), nor are the Sovereign Base Areas on Cyprus; the 1:50m rules below apply
+  everywhere else, unchanged, and `country_for_point` never reads the patch; since version 4, 25 October: empty within
   `BORDER_DOUBT_KM` = 3 km of the line of another bundled country, at every border, beyond the
   distance to its own for the coast fallback: the 1:50m polygons put Kehl in France, Menton in
   Italy, Hendaye in Spain, and the station module, which now matches a stop without a country to
@@ -483,7 +494,7 @@ build_extract(...)   # in-process: the child of ensure_extract and the tests onl
   whose `route_type` is absent or empty is RAIL_MAIN. An explicit mode always wins (bus, tram, coach,
   `other`: not rail), and so does a StopPlace whose type is given (`busStation`: not rail;
   `railStation`: rail as before). Such an extract carries `extractor_version`
-  `viator-stop-extract-4+rail-default` (`station_extract.extractor_version_for`): its own cache file and
+  `viator-stop-extract-5+rail-default` (`station_extract.extractor_version_for`): its own cache file and
   remembered failure (a remembered `no_rail_stop` is read again once the box is ticked) and its own
   version in MSMM (identity: feed, archive, extractor version; the upload's `HEAD` asks for it). The
   census counts `rail_by_default` (calls, and `rail_by_default_places`; GTFS: routes), first in the

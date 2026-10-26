@@ -3877,9 +3877,36 @@ the extracts changes no graph build.
   coarse scale: coasts up to some 9 km off in western Scotland, borders up
   to some 3 km) takes the country of the nearest boundary within 10 km;
   farther out, none. Before, such stops had no country, and the module made
-  each one a review item "A stop in no country". Still **no country**, on
-  purpose, for:
-  - **a stop within 3 km of any border** (extractor version 4, 25 October):
+  each one a review item "A stop in no country".
+- **By a border between two OSM-crop countries: finer lines (extractor
+  version 5, #404).** Within 10 km of a land border between two of the
+  countries offered for the OSM crop, a second, finer boundary file decides
+  first (`app/data/country_borders_v1_patch.geojson`: the U.S. State
+  Department's border lines, through geoBoundaries, on Natural Earth's
+  1:10m land; its lines lie a median 50 m from the national ones, some
+  380 m at worst). A stop there takes the country whose fine polygon holds
+  it, and **no country only within 0.5 km of the other country's line**
+  (before: 3 km of the coarse line). So Kehl is German, Menton, Wissembourg
+  and Vallorcine French, Irun Spanish, Riksgränsen Swedish, Venlo Dutch,
+  Valga Estonian, Borkum German (the coarse file put it in the
+  Netherlands), and Basel Bad Bf Swiss: it stands on Swiss soil (run by
+  DB). Konstanz, Kreuzlingen, Hendaye, Chiasso, Brennero, Lauterbourg,
+  Bad Nieuweschans, Büsingen, Baarle-Nassau and the Moselle stations of
+  Schengen and Remich lie within 0.5 km and have no country, as before; the
+  module matches them by name as in version 4. The 3 km band towards a
+  country outside the OSM-crop list stays (Záhony, by Ukraine, has none).
+  Gibraltar is not treated as the United Kingdom: the airport and La Línea
+  keep no country. On a lake or an estuary the fine file follows the
+  State Department's lines (Lake Constance, the Moselle, the Flensburg
+  Fjord, the Vennbahn enclaves are in it); the open water of the Dollard,
+  more than 2 km from the coast, keeps the coarse rules below. **After
+  deploying it, press Refresh (all providers) on each session again**
+  (version 5: every extract is made once more), **then rebuild the station
+  referential in the module** so that the border stations it held back or
+  matched by name take their new country.
+- Still **no country**, on purpose, for:
+  - **a stop within 3 km of any other border** (extractor version 4, 25 October;
+    since version 5 not between two OSM-crop countries, above):
     the 1:50m lines put border stations on the wrong side (Kehl in France,
     Menton in Italy, Hendaye in Spain, Wissembourg in Germany, Vallorcine in
     Switzerland), and the module held them back as "in another country".
@@ -4125,7 +4152,7 @@ the extracts changes no graph build.
   becomes rail by default at a stop place that gives nothing else. The
   checkbox is hidden on a cross-border derived card (it gives no stop
   extract). Such an extract carries its own extractor version
-  (`viator-stop-extract-4+rail-default`): it is made again at the next
+  (`viator-stop-extract-5+rail-default`): it is made again at the next
   refresh even when the file is unchanged (a remembered `no_rail_stop` is
   not reused) and reaches the module as a new version of the feed. When it
   is sent, the station-module column says what the setting made rail,

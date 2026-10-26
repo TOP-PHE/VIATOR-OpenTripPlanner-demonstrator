@@ -134,9 +134,16 @@ log = logging.getLogger(__name__)
 # Italy, Hendaye in Spain), and the station module then held them back as
 # "in another country". It now matches a stop without a country to the
 # station of agreeing name next to it, which gives the country.
-# Any change to `app/data/country_borders.geojson` changes these rows: raise
-# this version with it (tests/unit/test_osm_geo.py pins the file's sha256).
-EXTRACTOR_VERSION = "viator-stop-extract-4"
+# 5 (26 October, #404): within 10 km of a land border between two v1
+# countries the finer patch (`app/data/country_borders_v1_patch.geojson`,
+# LSIB lines via geoBoundaries CGAZ) decides, none only within 0.5 km of
+# the other v1 country's line (`osm_geo.V1_BORDER_DOUBT_KM`): Kehl is DE,
+# Menton FR, Venlo NL, Basel Bad Bf CH again, Konstanz and Hendaye stay
+# none. The 3 km band towards the countries outside the v1 list stays.
+# Any change to `app/data/country_borders.geojson` or to the patch changes
+# these rows: raise this version with it (tests/unit/test_osm_geo.py pins
+# both files' sha256).
+EXTRACTOR_VERSION = "viator-stop-extract-5"
 
 # Rail by default (a provider's `timetable.default_mode: "rail"`, the one
 # value `ingestion` accepts): the readers take a journey (a GTFS route) that
