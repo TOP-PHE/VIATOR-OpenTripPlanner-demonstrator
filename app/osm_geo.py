@@ -123,6 +123,48 @@ BORDER_DOUBT_KM = 3.0
 # Every bundled country: a boundary of any of them makes the border band.
 BUNDLED_COUNTRIES: frozenset[str] = VALID_COUNTRIES | OTHER_COUNTRIES | NEIGHBOUR_COUNTRIES
 
+# #411 — a display name for every bundled country, not only the v1 list: the
+# station module serves countries beyond it (the Western Balkans, Turkey,
+# Kosovo, …), and the hubs page and its picker show "BG · Bulgaria", never
+# "RS · RS". Only names: `VALID_COUNTRIES` stays the v1 list.
+_OTHER_COUNTRY_NAMES: dict[str, str] = {
+    "AD": "Andorra",
+    "AL": "Albania",
+    "AM": "Armenia",
+    "AX": "Åland",
+    "AZ": "Azerbaijan",
+    "BA": "Bosnia and Herzegovina",
+    "BR": "Brazil",
+    "BY": "Belarus",
+    "CN": "China",
+    "FO": "Faroe Islands",
+    "GE": "Georgia",
+    "GG": "Guernsey",
+    "GI": "Gibraltar",
+    "IM": "Isle of Man",
+    "IQ": "Iraq",
+    "IR": "Iran",
+    "JE": "Jersey",
+    "JP": "Japan",
+    "KP": "North Korea",
+    "KZ": "Kazakhstan",
+    "MC": "Monaco",
+    "MD": "Moldova",
+    "ME": "Montenegro",
+    "MK": "North Macedonia",
+    "MN": "Mongolia",
+    "RS": "Serbia",
+    "RU": "Russia",
+    "SM": "San Marino",
+    "SR": "Suriname",
+    "SY": "Syria",
+    "TR": "Turkey",
+    "UA": "Ukraine",
+    "VA": "Vatican City",
+    "XK": "Kosovo",
+}
+BUNDLED_COUNTRY_NAMES: dict[str, str] = {**COUNTRY_NAMES, **_OTHER_COUNTRY_NAMES}
+
 # A country is *pre-ticked* in the UI only when it has at least this many
 # stops — a flat threshold so a stray / (0,0) coordinate can't drag in a
 # whole country. It's only the suggestion; the operator overrides, and the

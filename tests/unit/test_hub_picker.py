@@ -28,7 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from app import station_module
+from app import osm_geo, station_module
 from app.api.admin import network_coverage
 from app.auth import tokens
 from app.db import get_db
@@ -207,8 +207,11 @@ def test_a_search_offers_the_stations_with_the_fields_they_fill_in(
     first, second = answer["stations"]
     assert first == {
         "name": "ZZ Zzville Zzcentral Zzstation",
+        "latin_name": None,
         "short": first["short"],
         "slug": "zz-zzville-zzcentral-zzstation",
+        "slug_placeholder": False,
+        "latin_incomplete": False,
         "country": "ZZ",
         "lat": 45.5,
         "lon": 6.25,
@@ -249,7 +252,10 @@ def test_the_proposed_slug_is_unique_among_the_hubs_and_the_answer(
 
 def test_the_slug_helpers() -> None:
     assert network_coverage.slug_base("Zz Zzbahnhof (Zzplatz)") == "zz-zzbahnhof-zzplatz"
-    assert network_coverage.slug_base("Ζζ Ζζ") == "hub"  # no Latin letter or digit
+    assert network_coverage.slug_base("Ζζ Ζζ") == "zz-zz"  # Greek in Latin letters (#411)
+    assert network_coverage.slug_base("Ззщ", "BG") == "zzsht"
+    assert network_coverage.slug_base("Ззщ", "RU") == "zzshch"
+    assert network_coverage.slug_base("\u3007\u3007") == "hub"  # no letter to transliterate
     assert network_coverage.slug_base("-Zz-") == "zz"
     # The name's own hyphens and the spaces around them: one hyphen.
     assert network_coverage.slug_base("ZZ - Zzville") == "zz-zzville"
@@ -259,6 +265,75 @@ def test_the_slug_helpers() -> None:
     assert network_coverage.unique_slug("zz", set()) == "zz"
     assert network_coverage.unique_slug("zz", {"zz", "zz-2"}) == "zz-3"
     assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", network_coverage.slug_base("99 Zz"))
+
+
+def test_a_cyrillic_or_greek_name_proposes_a_latin_slug_and_short_label(
+    client: TestClient, module: Module, taken: Taken
+) -> None:
+    """#411: the module's name stays as it is; the slug and the short label
+    are made from its Latin letters, by the rules of the station's country,
+    and stay unique (a Cyrillic and a Latin name of one sound included)."""
+    taken.ids = {"zzia"}
+    module.countries = httpx.Response(200, json={"countries": ["BG", "GR"]})
+    module.search = lambda _b: _answer(
+        _row("ЗЗИЯ", "9900001", country="BG"),
+        _row("Ззия", "9900002", country="BG"),
+        _row("ΖΘΗΖΑ ΖΔΔΔ", "9900003", country="GR"),
+        _row("Ззщ", "9900004", country=None),  # takes the chosen country's rules
+        _row("ZZ Zzł", "9900005", country="BG"),
+    )
+
+    stations = _pick(client, country="BG")["stations"]
+
+    assert [(s["name"], s["latin_name"], s["slug"], s["short"]) for s in stations] == [
+        ("ЗЗИЯ", "ZZIA", "zzia-2", "ZZIA"),
+        ("Ззия", "Zzia", "zzia-3", "Zzia"),
+        ("ΖΘΗΖΑ ΖΔΔΔ", "ZTHIZA ZDDD", "zthiza-zddd", "ZTHIZA ZDDD"),
+        ("Ззщ", "Zzsht", "zzsht", "Zzsht"),
+        ("ZZ Zzł", None, "zz-zzl", "ZZ Zzł"),
+    ]
+    assert not any(s["slug_placeholder"] or s["latin_incomplete"] for s in stations)
+    assert taken.asked == [{"zzia", "zthiza-zddd", "zzsht", "zz-zzl"}]
+
+
+def test_letters_with_no_latin_form_or_no_short_label_are_told(
+    client: TestClient, module: Module, taken: Taken
+) -> None:
+    """Review round 1: a Kazakh letter (no table holds it) is kept and the
+    station says so; a name of signs only gives no short label."""
+    module.countries = httpx.Response(200, json={"countries": ["KZ", "RU"]})
+    module.search = lambda _b: _answer(
+        _row("Қзз Ззз", "9900001", country="KZ"), _row("ЪЬ 99", "9900002", country="RU")
+    )
+
+    kazakh, signs = _pick(client, country="KZ")["stations"]
+
+    assert (kazakh["latin_name"], kazakh["slug"], kazakh["latin_incomplete"]) == (
+        "Қzz Zzz",
+        "zz-zzz",
+        True,
+    )
+    assert kazakh["slug_placeholder"] is False
+    assert (signs["latin_name"], signs["short"], signs["slug"]) == (" 99", "99", "99")
+    assert signs["latin_incomplete"] is False
+
+
+def test_a_name_with_no_latin_form_says_its_slug_is_a_placeholder(
+    client: TestClient, module: Module, taken: Taken
+) -> None:
+    module.search = lambda _b: _answer(
+        _row("\u3007\u3007\u3007", "9900001"),
+        _row("\u3007\u3007", "9900002"),
+        _row("Hub", "9900003"),
+    )
+
+    stations = _pick(client)["stations"]
+
+    assert [(s["slug"], s["slug_placeholder"]) for s in stations] == [
+        ("hub", True),
+        ("hub-2", True),
+        ("hub-3", False),  # a name that is "Hub" is no placeholder
+    ]
 
 
 @pytest.mark.parametrize(
@@ -495,6 +570,41 @@ def test_the_countries_are_the_modules(client: TestClient, module: Module) -> No
     }
 
 
+def test_the_modules_countries_beyond_the_v1_list_have_their_names(
+    client: TestClient, module: Module
+) -> None:
+    module.countries = httpx.Response(200, json={"countries": ["XK", "RS", "TR", "BG", "ZZ"]})
+
+    answer = client.get(f"{BASE}/countries").json()
+
+    assert answer["countries"] == [
+        {"code": "BG", "name": "Bulgaria"},
+        {"code": "RS", "name": "Serbia"},
+        {"code": "TR", "name": "Turkey"},
+        {"code": "XK", "name": "Kosovo"},
+        {"code": "ZZ", "name": "ZZ"},
+    ]
+
+
+def test_every_bundled_country_has_a_name() -> None:
+    """#411: the countries of `country_borders.geojson` (the module serves
+    stations of them), the v1 list, the other European ones with TR and XK,
+    each with a display name; the module's search takes each of them."""
+    borders = json.loads(
+        (TEMPLATE.parents[2] / "data" / "country_borders.geojson").read_text(encoding="utf-8")
+    )
+    codes = {feature["properties"]["ISO_A2"] for feature in borders["features"]}
+    names = osm_geo.BUNDLED_COUNTRY_NAMES
+    assert codes == osm_geo.BUNDLED_COUNTRIES == set(names)
+    assert set(COUNTRY_NAMES) | osm_geo.OTHER_COUNTRIES <= set(names)
+    assert {"TR", "XK"} <= set(names)
+    assert set(names) <= station_module.SEARCH_COUNTRIES
+    assert all(name and name != code for code, name in names.items())
+    # The v1 list is unchanged: only names were added.
+    assert {code: names[code] for code in COUNTRY_NAMES} == COUNTRY_NAMES
+    assert frozenset(COUNTRY_NAMES) == osm_geo.VALID_COUNTRIES
+
+
 def test_the_countries_fall_back_to_viators_list(client: TestClient, module: Module) -> None:
     module.countries = httpx.Response(503, json={"code": "down"})
 
@@ -549,6 +659,54 @@ def _picker_script(text: str) -> str:
     start = text.index("// #398 — the hub picker")
     end = text.index("// MSMM step 3 — station codes of the hubs", start)
     return text[start:end]
+
+
+def test_the_hubs_country_headers_name_every_bundled_country(template_text: str) -> None:
+    """#411: the hubs list groups by country under "BG · Bulgaria": the
+    names come from the server (every bundled country), in a JSON block
+    the page reads, never a list of the page's own."""
+    from app.api import pages
+    from app.templating import templates
+
+    assert '"hub_country_names": osm_geo.BUNDLED_COUNTRY_NAMES' in Path(pages.__file__).read_text(
+        encoding="utf-8"
+    )
+    # The JSON block, found as fixed text: its content is the Jinja
+    # expression the page renders.
+    opening = '<script id="hub-country-names" type="application/json">'
+    assert template_text.count(opening) == 1
+    inner_start = template_text.index(opening) + len(opening)
+    inner = template_text[inner_start : template_text.index("</script>", inner_start)]
+    assert inner == "{{ hub_country_names|tojson }}"
+    payload = templates.env.from_string(inner).render(
+        hub_country_names=osm_geo.BUNDLED_COUNTRY_NAMES
+    )
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    start = template_text.index("function hubCountryNames()")
+    end = template_text.index("const COUNTRY_NAMES = hubCountryNames();", start)
+    program = (
+        "globalThis.document = { getElementById: () => ({ textContent: "
+        + json.dumps(payload)
+        + " }) };\n"
+        + template_text[start:end]
+        + "const n = hubCountryNames();\n"
+        + "console.log(JSON.stringify([n.BG, n.RS, n.XK, n.TR, n.UK, n.ZZ, Object.keys(n).length]));"
+    )
+    result = subprocess.run(
+        [node, "-e", program], capture_output=True, text=True, check=False, encoding="utf-8"
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        "Bulgaria",
+        "Serbia",
+        "Kosovo",
+        "Turkey",
+        "United Kingdom",  # older hubs saved with "UK"
+        None,  # an unknown code: the page shows the code
+        len(osm_geo.BUNDLED_COUNTRY_NAMES) + 1,
+    ]
 
 
 def test_the_picker_is_shown_only_with_the_module_and_the_manual_form_stays(
@@ -643,6 +801,18 @@ out.noteViator = hubPickCountriesNote({ source: 'viator', countries: [] });
 out.noteModule = hubPickCountriesNote({ source: 'module', countries: [] });
 out.noteNone = hubPickCountriesNote(null);
 out.meta = hubPickMeta(station);
+const cyrillic = Object.assign({}, station, { name: 'ЗЗИЯ', latin_name: 'ZZIA', slug: 'zzia' });
+const placeholder = Object.assign({}, station, { name: '--', slug: 'hub-2', slug_placeholder: true });
+out.nameLatin = hubPickName(station);
+out.nameCyrillic = hubPickName(cyrillic);
+out.chosenCreate = hubPickChosenText(cyrillic, true);
+out.chosenEdit = hubPickChosenText(cyrillic, false);
+out.chosenPlaceholder = hubPickChosenText(placeholder, true);
+out.chosenPlaceholderEdit = hubPickChosenText(placeholder, false);
+const incomplete = Object.assign({}, station, { latin_incomplete: true });
+out.chosenIncomplete = hubPickChosenText(incomplete, true);
+out.chosenIncompleteEdit = hubPickChosenText(incomplete, false);
+out.chosenNoShort = hubPickChosenText(Object.assign({}, station, { short: '' }), true);
 console.log(JSON.stringify(out));
 """
 
@@ -706,6 +876,26 @@ def test_the_picker_script_fills_the_form_and_words_its_answers(template_text: s
     assert out["noteModule"] == ""
     assert out["noteNone"].startswith("The countries could not be loaded")
     assert out["meta"] == "ZZ · no code · VIATOR id ZZ-99001 · 45.5000, 6.2500"
+    # #411: the Latin letters of a Cyrillic or Greek name are shown beside it.
+    assert out["nameLatin"] == "ZZ Zzville"
+    assert out["nameCyrillic"] == "ЗЗИЯ · ZZIA"
+    meta = "ZZ · no code · VIATOR id ZZ-99001 · 45.5000, 6.2500"
+    assert out["chosenCreate"] == (
+        f"Picked: ЗЗИЯ · ZZIA ({meta}). Check the short label and the slug, then save."
+    )
+    assert out["chosenEdit"] == f"Picked: ЗЗИЯ · ZZIA ({meta}). Check the short label, then save."
+    assert out["chosenPlaceholder"].endswith(
+        'The name gives no Latin letter or digit, so "hub-2" is only a placeholder: type a slug.'
+    )
+    assert "placeholder" not in out["chosenPlaceholderEdit"]  # a saved hub's slug stays
+    assert out["chosenIncomplete"].endswith(
+        "Some letters of the name have no Latin form here: the short label and the slug "
+        "lack them; correct them."
+    )
+    assert out["chosenIncompleteEdit"].endswith(
+        "Some letters of the name have no Latin form here: the short label lacks them; correct it."
+    )
+    assert out["chosenNoShort"].endswith("The name gives no short label: type one.")
 
 
 # A page of fake elements and a fake fetch: the picker's searches, keys,

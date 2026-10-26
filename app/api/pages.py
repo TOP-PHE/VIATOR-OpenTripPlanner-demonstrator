@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from .. import config_service, station_module
+from .. import config_service, osm_geo, station_module
 from ..db import get_db
 from ..models import Session as SessionRow
 from ..models import User
@@ -306,6 +306,8 @@ def admin_network_coverage_page(
             "coverage_window_end_default": cov_cfg.get("COVERAGE_DEFAULT_WINDOW_END", "24:00"),
             "coverage_timezone_default": cov_cfg.get("COVERAGE_DEFAULT_TIMEZONE", "UTC"),
             "coverage_timezone_choices": tz_spec.get("choices", ["UTC"]),
+            # #411 — the hubs list's country headers: every bundled country.
+            "hub_country_names": osm_geo.BUNDLED_COUNTRY_NAMES,
         },
     )
 

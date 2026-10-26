@@ -15,10 +15,10 @@ Latour-de-Carol-Enveitg, Santiago de Compostela, …).
 from __future__ import annotations
 
 import re
-import unicodedata
 
 from ..gtfs_cross_border_filter import UIC_COUNTRY_NAMES, country_prefix
-from ..osm_geo import country_for_point
+from ..osm_geo import country_for_point, country_of_position
+from .translit import fold_ascii, to_latin
 
 # Hub slug regex from `app/api/admin/network_coverage.py::HubCreate.id`:
 # /^[a-z0-9][a-z0-9-]*$/ with max length 64. We mirror it here so the
@@ -70,16 +70,14 @@ _SHORT_ABBREV: dict[str, str] = {
 }
 
 
-def _strip_accents(s: str) -> str:
-    """Diacritics off — `Genève` → `Geneve`, `Saint-Exupéry` → `Saint-Exupery`."""
-    return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
-
-
-def slugify(name: str) -> str:
+def slugify(name: str, country: str | None = None) -> str:
     """Hub slug from a free-text station name.
 
     Rules (mirrors `HubCreate.id` validator):
-      - Lowercase, accent-stripped.
+      - A Cyrillic or Greek name in Latin letters first (`translit.to_latin`,
+        the Cyrillic rules of `country` when it has its own, #411).
+      - Lowercase, accent-stripped, the Latin letters without an accent to
+        strip by their ASCII forms (`ß` ss, `ł` l, `ø` o: `translit.fold_ascii`).
       - Collapse runs of characters other than a-z, 0-9 and the hyphen to
         a single hyphen (the name's own hyphens stay as they are).
       - Trim leading/trailing hyphens.
@@ -95,9 +93,16 @@ def slugify(name: str) -> str:
     """
     if not name:
         return ""
-    s = _strip_accents(name).lower()
+    s = fold_ascii(to_latin(name, country)).lower()
     s = _NON_SLUG_CHAR.sub("-", s).strip("-")
     return s[:60]
+
+
+def latin_short(name: str, country: str | None = None, max_len: int = 12) -> str:
+    """`shorten` of the name in Latin letters (`translit.to_latin`, #411): a
+    Cyrillic or Greek name gives a readable matrix header; a Latin name is
+    shortened as it is, accents kept."""
+    return shorten(to_latin(name, country), max_len)
 
 
 def shorten(name: str, max_len: int = 12) -> str:
@@ -209,9 +214,14 @@ def derive(
     can lose ~200 m of precision near a border). When neither resolves,
     return `""` and let the operator pick country manually.
     """
-    slug = slugify(name)
-    short = shorten(name)
     country = country_from_stop_id(stop_id) or country_from_coords(lat, lon)
+    # The Cyrillic rules of the station's country (#411): beyond the v1 list
+    # (Serbia, North Macedonia, Ukraine) from the position's bundled country.
+    script_country = country
+    if script_country is None and lat is not None and lon is not None:
+        script_country = country_of_position(lat, lon)
+    slug = slugify(name, script_country)
+    short = latin_short(name, script_country)
     return {
         "name": name,
         "slug": slug,

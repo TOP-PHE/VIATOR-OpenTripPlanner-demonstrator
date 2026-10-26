@@ -85,7 +85,7 @@ from ...models import (
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import executor as coverage_executor
-from ...network_coverage import external_verify, hub_derive, runner
+from ...network_coverage import external_verify, hub_derive, runner, translit
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
@@ -2022,7 +2022,9 @@ def _row_of(
 PICK_MAX = station_module.MAX_ROWS
 # The short label proposed for a picked station: the matrix header's width.
 PICK_SHORT_MAX = 12
-# The slug proposed when a station's name gives no Latin letter or digit.
+# The slug proposed when a station's name gives no Latin letter or digit, even
+# in Latin letters (#411: a Cyrillic or Greek name is transliterated first);
+# the station says so (`slug_placeholder`) and the dialog asks for a slug.
 _SLUG_FALLBACK = "hub"
 _HYPHENS = re.compile(r"-{2,}")
 _ISO_COUNTRY = re.compile(r"[A-Z]{2}", re.ASCII)
@@ -2071,13 +2073,23 @@ class HubPickStation(BaseModel):
     """A station offered by the picker, with the hub fields it fills in:
     `short` (at most 12 characters) and `slug` (lowercase and hyphens,
     unique among the hubs, the soft-deleted ones included, and within the
-    answer) are proposals the administrator may edit; `uic` and
+    answer) are proposals the administrator may edit, both made from the
+    name in Latin letters (#411); `latin_name` is that form when the
+    module's `name` is in Cyrillic or Greek script (else None), and
+    `slug_placeholder` says that the name gave no Latin letter or digit, so
+    the slug is the bare `hub` (numbered) and one must be typed;
+    `latin_incomplete` that some letters of the name have no Latin form
+    here (a Kazakh letter, say), so the slug and the short label lack them;
+    an empty `short` (a name of signs only, `ъ` or `ь`) must be typed; `uic` and
     `station_id` (the station's current VIATOR id) are what the dialog
     sends to POST /hubs/confirm once the hub is saved."""
 
     name: str
+    latin_name: str | None = None
     short: str
     slug: str
+    slug_placeholder: bool = False
+    latin_incomplete: bool = False
     country: str
     lat: float
     lon: float
@@ -2157,12 +2169,13 @@ def _pick_rows(
     return kept[:PICK_MAX]
 
 
-def slug_base(name: str) -> str:
-    """The slug a station's name proposes before uniqueness: lowercase,
-    accents off, every other run of characters one hyphen
-    (`hub_derive.slugify`, whose hyphens of the name stay, so `ZZ - Zzville`
-    would give three: they are made one), or `hub` when nothing is left."""
-    return _HYPHENS.sub("-", hub_derive.slugify(name)).strip("-") or _SLUG_FALLBACK
+def slug_base(name: str, country: str | None = None) -> str:
+    """The slug a station's name proposes before uniqueness: in Latin
+    letters (Cyrillic by the rules of `country`), lowercase, accents off,
+    every other run of characters one hyphen (`hub_derive.slugify`, whose
+    hyphens of the name stay, so `ZZ - Zzville` would give three: they are
+    made one), or `hub` when nothing is left."""
+    return _HYPHENS.sub("-", hub_derive.slugify(name, country)).strip("-") or _SLUG_FALLBACK
 
 
 def unique_slug(base: str, taken: set[str]) -> str:
@@ -2189,22 +2202,31 @@ def _taken_slugs(db: DbSession, bases: set[str]) -> set[str]:
 
 
 def _pick_stations(db: DbSession, rows: list[dict[str, Any]], country: str) -> list[HubPickStation]:
-    """The offered stations with their proposed short labels and slugs."""
-    bases = [slug_base(row["name"]) for row in rows]
+    """The offered stations with their proposed short labels and slugs,
+    made from the name in Latin letters by the rules of its country (#411)."""
+    countries = [
+        row["country_iso"]
+        if isinstance(row["country_iso"], str) and _ISO_COUNTRY.fullmatch(row["country_iso"])
+        else country
+        for row in rows
+    ]
+    bases = [slug_base(row["name"], code) for row, code in zip(rows, countries, strict=True)]
     taken = _taken_slugs(db, set(bases))
     stations: list[HubPickStation] = []
-    for row, base in zip(rows, bases, strict=True):
+    for row, base, code in zip(rows, bases, countries, strict=True):
         slug = unique_slug(base, taken)
         taken.add(slug)
-        found = row["country_iso"]
+        name = row["name"]
+        latin = translit.to_latin(name, code)
         stations.append(
             HubPickStation(
-                name=row["name"],
-                short=hub_derive.shorten(row["name"], PICK_SHORT_MAX),
+                name=name,
+                latin_name=None if translit.is_latin(name) else latin,
+                short=hub_derive.latin_short(name, code, PICK_SHORT_MAX),
                 slug=slug,
-                country=found
-                if isinstance(found, str) and _ISO_COUNTRY.fullmatch(found)
-                else country,
+                slug_placeholder=not hub_derive.slugify(name, code),
+                latin_incomplete=translit.has_foreign_letters(latin),
+                country=code,
                 lat=row["latitude"],
                 lon=row["longitude"],
                 uic=row["uic"],
@@ -2270,14 +2292,15 @@ async def hub_countries(
     (`station_module.countries`, cached 60 s, no limit counted), or VIATOR's
     own list (`osm_geo.COUNTRY_NAMES`) when the module is not configured,
     paused, failed or serves none; by code, each with its name when VIATOR
-    knows it."""
+    knows it (`osm_geo.BUNDLED_COUNTRY_NAMES`: every bundled country, #411)."""
     served = await station_module.countries()
     source: Literal["module", "viator"] = "module" if served else "viator"
     codes = sorted(served) if served else sorted(osm_geo.COUNTRY_NAMES)
     return HubCountriesResponse(
         source=source,
         countries=[
-            HubCountry(code=code, name=osm_geo.COUNTRY_NAMES.get(code, code)) for code in codes
+            HubCountry(code=code, name=osm_geo.BUNDLED_COUNTRY_NAMES.get(code, code))
+            for code in codes
         ],
     )
 
