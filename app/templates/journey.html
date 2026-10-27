@@ -689,10 +689,14 @@ document.getElementById('depart').addEventListener('input', _updateDepartWarning
     const uic = qs.get(prefix + '_uic') || '';
     document.getElementById(prefix + '-name').value = name;
     document.getElementById(prefix + '-uic').value = uic;
-    // The visible <input id="from"|"to"> shown to the user (the
-    // autocomplete textbox) lives separately from the hidden coord
-    // fields. Set it so the operator sees what they're searching for.
-    const visible = document.getElementById(prefix);
+    // The visible <input id="from-input"|"to-input"> shown to the user
+    // (the autocomplete textbox) lives separately from the hidden coord
+    // fields. Set it so the operator sees what they're searching for: it
+    // is `required`, so left empty the browser refuses the submit too.
+    // (It used to look up id "from"/"to", which no element has, so the
+    // Re-run link never showed its stations.) Its value equals the hidden
+    // name, so the typeahead's input handler keeps the coordinates.
+    const visible = document.getElementById(prefix + '-input');
     if (visible && name) visible.value = name;
   }
   setPair('from');
