@@ -507,7 +507,8 @@ When CI is green for `v0.1.x` and you want it on the VPS:
 > usually within a minute of starting. Nothing to do before or after, and a
 > deploy costs the run nothing: a release does not count toward
 > `COVERAGE_MAX_RESUMES`. (Before the release that moved runs into the worker,
-> a deploy ended the run, §6.18.)
+> a deploy ended the run, §6.18.) A run in its ÖBB check (**verifying**)
+> keeps the answers already saved and goes on with the cells left (§6.21).
 >
 > **The deploy that ships this change** (issue #392) is the last one that
 > stops a run in old web: old web is replaced, the new worker finds the run
@@ -2263,6 +2264,7 @@ What the coverage page shows, in the status pill:
 | **queued** | Created, waiting for the worker (one run at a time by default; a second run waits for the first) | Nothing. **Stop** cancels it at once |
 | **running** | The worker is running it | **Stop** ends it after the pairs in flight, as before |
 | **stopping** | Stop clicked; the worker ends it within a few seconds | Wait for **cancelled** |
+| **verifying** | Every pair is done; the worker is asking ÖBB about each cell ("Verify externally", §6.21). The page shows how far it is and the time left; the cells fill in as the answers come | Nothing: the run completes when the check ends. Stop does not interrupt the check |
 | **resuming** | The worker stopped (a deploy, a restart, a crash) and no worker holds the run yet. The cells stay; "resumed N×" counts the resumes | Nothing after a deploy: it continues once the new worker runs (about 10 s after it starts; about 3 min if the worker was killed). If it lasts longer, see below. **Stop** cancels it at once (no worker needed) |
 | **failed · resumed N× · *reason*** | The run failed; the page says why (hover for the whole text): the resume limit, an error in the pair loop, a run that ended without a result | See below |
 
@@ -2398,6 +2400,60 @@ If another host shows the same error, check it the same way; add it to
 `INTERMEDIATE_HOSTS` (and its issuing intermediate to the PEM file, from
 the CA's own repository) only when the server is confirmed to omit the
 intermediate.
+
+### 6.21 The ÖBB check of a coverage run ("Verify externally"): how long, what the page shows
+
+With **Verify externally on completion** ticked, once every pair is done the
+worker asks ÖBB HAFAS about **every** cell but the skipped ones (since
+PR-196a; it was only the failed cells before), so the alignment heatmap can
+score every cell. It asks two cells at a time with a half-second pause, about
+**one cell a second**: roughly 1–2 h more per 3 600 pairs, so a full eu19
+matrix of 12 882 pairs takes 4 to 7 hours after its last pair. (The checkbox
+used to promise "~1–5 min": that was true only of the failed cells of a small
+run.)
+
+What the page shows meanwhile:
+
+- the status pill reads **verifying** (§6.19);
+- under the run's summary: *Checking every cell with ÖBB HAFAS: N of M cells
+  (P %) · started … · about … left*, with a bar. The time left is measured on
+  the current attempt's pace and reads *measuring* for its first minute; the
+  run list shows *ÖBB N/M* and the same bar;
+- the cells fill in as the answers come: each answer is saved on its cell
+  within about 5 s (every 25 answers or 5 s, whichever first), so the
+  alignment heatmap and the cell modal show it while the check runs. A cell
+  not asked yet says so in the modal (*ÖBB not asked yet for this cell*),
+  instead of *no itineraries found*, which read as ÖBB having no route;
+- once completed: *ÖBB check: M cells in …*.
+
+**A deploy during the check** (or any worker restart) pauses it (**resuming**,
+*ÖBB check paused at N of M*), and the new worker goes on with the cells left:
+the answers saved stay, and only the cells without one are asked again (at
+most the last few seconds' answers, not yet saved, are asked twice). Before
+this release nothing was saved until the last cell, so a restart started the
+check again from zero, and a run could look stuck at 100 % of its pairs for
+hours. **The deploy that ships this change** restarts any check under way from
+zero one last time, since the old code had saved none of its answers: let
+such a run complete first if its answers matter.
+
+**Stop does not interrupt the check** (the completion phase always completes,
+§6.19), and the pill stays **verifying** after a Stop click. To end a check
+early, cancel the run by SQL: `UPDATE network_coverage_runs SET status =
+'cancelled' WHERE id = '<run id>';`. The worker stops asking ÖBB within
+about 5 s, keeps the cancel, and the answers already saved stay on the cells.
+
+Following it in the worker log: one `hafas.trip_search.request` line per cell
+asked, and every 500 saved answers `external-verify progress run=… done=…
+total=…`:
+
+```bash
+docker compose -p viator logs worker --since 10m | grep -c hafas.trip_search.request
+docker compose -p viator logs worker | grep "external-verify"
+```
+
+About 300–600 cells in 10 minutes is the normal pace. A *progress write
+failed* warning (the database briefly away) loses nothing: those answers go
+with the next write, and the final commit writes every answer anyway.
 
 ## 7. Rollback
 

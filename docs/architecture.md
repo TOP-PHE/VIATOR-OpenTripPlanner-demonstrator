@@ -637,6 +637,7 @@ other — are forced into view because all-pairs enumeration leaves nowhere to h
 |---|---|---|
 | `runner.py` | 2110 | Run lifecycle, K-slot slicing, cooperative cancel, per-pair execution (single-session + fanout), the external-verify sweep |
 | `external_verify.py` | 802 | The ÖBB HAFAS adapter: LocGeoPos → TripSearch two-step, response parsing, `VerifyResult` / `VerifyItinerary` |
+| `verify_progress.py` | 230 | `SweepWriter`: saves the sweep's answers on the result rows as they come and its progress on the run, fenced on the run being running and held |
 | `alignment.py` | 320 | Scores one (VIATOR trips, ÖBB itineraries) pair into a `(score, tier)` |
 | `hubs.py` | — | Static French preset (26 entries, though its docstring still says 23). **Fallback/seed only** — the DB table wins |
 | `hub_derive.py` | — | Pure functions behind "Promote to hub": slug, short label, country from UIC prefix or point-in-polygon |
@@ -666,7 +667,11 @@ coverage executor claims the row (`executor.claim_next_run`, `FOR UPDATE SKIP LO
    `_maybe_run_external_verify_sweep`, writes `run.summary` (keeping `resume_count` /
    `resumes`), and flips to `completed` **last**, in one commit and only while its executor
    still holds the run — so a completion that dies leaves the run `running`, and the resume
-   runs it again from the start (idempotent: no pair left, the same recount and sweep).
+   runs it again from the start (idempotent: no pair left, the same recount and sweep). The
+   sweep's answers are the exception: `verify_progress.SweepWriter` saves them on the result
+   rows as they come, with the check's progress on the run (`verify_*` columns), each write
+   fenced on the run being `running` and held by this executor; the resumed sweep asks only
+   the cells without an answer (`external_verified_at` NULL).
 
 **K-slot time-slicing.** `_fetch_plan_sliced` splits the run's day window into K equal
 slots (default 6 × 4 h) and fires `cfg.within_pair_parallelism` concurrent `fetch_plan`
@@ -821,6 +826,21 @@ polylines stay out.
 - **`_VERIFY_STATUSES = ("no_route", "timeout", "error")` is dead code** — defined with a
   comment insisting it is not operator-tunable, but no longer read anywhere after PR-196a
   removed the candidate filter. Do not assume it still gates the sweep.
+- **The sweep's answers are saved as they come, outside the completion's commit.** The
+  completion's ORM session holds the rows for hours (about one cell a second, 12 882 cells
+  take 4–7 h), so `verify_progress.SweepWriter` writes each answer, every 25 answers or 5 s,
+  in a short transaction of its own that first UPDATEs the run row (`verify_done`,
+  `verify_progress_at`) `WHERE status = 'running' AND claimed_by = <executor>`: that UPDATE
+  is the fence, and its row lock keeps a cancel or a claim from slipping in before the
+  answers. A fence that matches nothing stops the writer and the sweep (a SQL cancel ends the
+  check within seconds; before, it ran to its end). This works only because `SessionLocal`
+  has `autoflush=False`: the completion's session never flushes its dirty run row during the
+  sweep, so it holds no lock the writer would wait on; with autoflush on, every write would
+  wait on the completion's own transaction until its `lock_timeout` (5 s) and fail. Only the sweep sets `external_verified_at`
+  (the modal's Verify button saves nothing), which is what lets a resume skip a cell. The
+  completion's commit still writes every answer (the session's objects are dirty), so a failed
+  progress write loses nothing; `SAVED_FIELDS` must list every `external_*` field the sweep
+  fills (`test_every_field_the_sweep_fills_is_saved` checks it).
 - **`_load_active_hubs` returns `[]` — never the static `HUBS` — when a country filter
   matches nothing.** Falling back would build the matrix against the wrong country set.
   The empty-table fallback to `hubs.py` only fires when *no* filter was supplied, and logs
@@ -2140,6 +2160,8 @@ predicate `_select_fanout_sessions` uses.
 | `summary` | `JSONB` | Post-run catch-all |
 | `countries` | `JSONB` (list of ISO-3166-1 alpha-2), nullable | Axis filter; NULL = all active hubs |
 | `verify_externally` | `Boolean` | Opt-in to the ÖBB sweep in phase 3 |
+| `verify_total`, `verify_done`, `verify_done_at_start` | `Integer`, nullable | The ÖBB sweep's progress: cells asked about, cells with a saved answer, those already saved when the current attempt started; NULL until the sweep starts (`verify_progress.SweepWriter`) |
+| `verify_started_at`, `verify_progress_at` | `timestamptz`, nullable | The database's clock at the current sweep attempt's start and at its last write; the page's "time left" is the attempt's pace between them |
 | `window_start_local`, `window_end_local` | `Time`, nullable | Origin-local day window; `"24:00"` is stored as `00:00` |
 | `window_timezone` | `String(64)` | IANA name; NULL → `COVERAGE_DEFAULT_TIMEZONE` |
 | `reference_date` | `Date` | Day the K slots anchor on; NULL → tomorrow at create time |

@@ -120,18 +120,23 @@ across a set of countries, across a whole day, and see where coverage exists.
 5. **Direction** — *Both* tests A→B and B→A; *Single* halves the work.
 6. **Countries** — tick the countries whose hub stations to include. Leaving all unticked means
    the full matrix, which is large; pick two neighbours for a fast cross-border probe.
-7. **Verify externally on completion** — when ticked, VIATOR asks ÖBB about the cells after the
-   run and scores agreement. This adds time (roughly 1 request per second).
+7. **Verify externally on completion** — when ticked, VIATOR asks ÖBB about every cell after the
+   run and scores agreement. This adds time: about one cell a second, so roughly 1–2 hours more
+   per 3 600 pairs (a full 12 882-pair matrix takes 4 to 7 hours more).
 8. **Advanced** *(optional)* — day window, timezone, reference date. Defaults to a full day
    (00:00–24:00) on the departure date.
 9. **Run coverage.**
 
 The run executes in the background, in the worker; the page shows progress. It reads `queued`
 until the worker starts it (one run at a time by default). External verification happens
-**at the end**, after every pair has been routed — so a verify-enabled run stays in `running`
-state for a while with the matrix already visible. If the worker restarts (a deploy, for
-instance), the run reads `resuming` for a moment and then continues where it stopped; nothing is
-lost and nothing is asked twice. **Stop** on a `resuming` run cancels it at once. A run that
+**at the end**, after every pair has been routed: the run then reads `verifying`, and under its
+summary the page shows how many cells ÖBB has answered, when the check started and about how
+long is left. Each answer is saved as it comes, so the cells fill in while the check runs; a cell
+ÖBB was not asked about yet says so in its detail window. Stop does not interrupt this check:
+the run completes when it ends. If the worker restarts (a deploy, for instance), the run reads
+`resuming` for a moment and then continues where it stopped, the ÖBB check included: no pair
+is routed twice, and ÖBB is asked again only about the few cells whose answers came in the last
+seconds before the restart. **Stop** on a `resuming` run cancels it at once. A run that
 fails says why next to its status (hover for the whole text).
 
 ### Reading the matrix
