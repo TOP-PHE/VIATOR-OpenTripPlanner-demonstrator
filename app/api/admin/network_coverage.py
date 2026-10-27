@@ -3493,7 +3493,7 @@ def _remember_oebb_stop(
     return station
 
 
-@router.post("/oebb-stops/resolve")
+@router.post("/oebb-stops/resolve", responses=_HUB_CODE_RESPONSES)
 async def resolve_oebb_stops(
     body: Annotated[Any, Body()],
     db: Annotated[DbSession, Depends(get_db)],

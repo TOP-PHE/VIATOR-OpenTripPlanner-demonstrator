@@ -282,7 +282,8 @@ async def test_the_first_failure_stops_the_rest(
 
     assert answer.status == "limited"
     assert answer.retry_after == 17
-    assert answer.message is not None and "17 seconds" in answer.message
+    assert answer.message is not None
+    assert "17 seconds" in answer.message
     assert list(answer.stations) == ["8199041"]
     assert answer.unanswered == ["8199042", "8199043"]
     assert len(module.requests) == 2  # never retried, the rest never asked
@@ -316,7 +317,8 @@ async def test_a_series_the_module_refuses_is_said_and_nothing_asked(
     series("x" * 101)
     answer = await _resolve(["8199042"])
     assert answer.status == "unavailable"
-    assert answer.message is not None and "COVERAGE_OEBB_STOP_SERIES" in answer.message
+    assert answer.message is not None
+    assert "COVERAGE_OEBB_STOP_SERIES" in answer.message
     assert module.requests == []
 
 
