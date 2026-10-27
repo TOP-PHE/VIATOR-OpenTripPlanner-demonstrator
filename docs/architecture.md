@@ -1449,13 +1449,20 @@ exception's text, a path or an address), the "Station module" column of the feed
 (the state, the reason word beside it, the sentence under them, all escaped). **A pass sends the
 feeds that need no extraction first** (no key, no archive, an extract or a remembered failure in
 the cache: `station_extract.extract_known`), then the others from the smallest timetable file to
-the largest; the outcomes stay in the session's order. A national extraction still running when
-the budget ends leaves that feed alone `skipped budget`: the child goes on, the warm thread works
-through the remaining feeds smallest first with no budget, and the next pass (the worker's
-cache-only one too) sends what is then in the cache. No migration. The file is removed
+the largest; the outcomes stay in the session's order. **A refresh's pass waits for every feed**
+(2026-10-27: `REFRESH_BUDGET_SECONDS` = 12 h, a ceiling only, and `REFRESH_PATIENCE`: `Retry-After`
+up to 31 min, 48 waits a call, 12 retries 30 s apart for a module restarting), so one Refresh sends
+every extract; the worker's pass keeps `build_patience()` (120 s, 6 waits, 2 retries 5 s apart) and
+its 5-minute budget, and a national extraction still running when a budget ends leaves that feed
+alone `skipped budget` there. `FeedOutcome.complete` (sent, held, or nothing to send:
+`NOTHING_TO_SEND`) tells the progress record which feeds the module still lacks (`problems`, by
+provider id and words), for the page's verdict line. No migration. The file is removed
 when an upload replaces the provider's slot (`_forget_fetch_state_for_slot`) and when a saved config
-no longer names the provider (`patch_session`). The sender queue lives in the web process's memory: a
-restart of `web` loses the passes waiting there, and the next rebuild (or refresh) sends again.
+no longer names the provider (`patch_session`). The sender queue lives in the web process's memory
+(web runs one process): a beater thread keeps each waiting pass's record alive
+(`refresh_progress.touch_queued`), and web's startup queues again every pass the previous process left
+queued or running (`resume_after_restart` → `refresh_progress.resume_passes`, refreshes ended in the
+last 24 h, marked `resumed`).
 
 `run_build` resolves every per-session knob defensively — each validator is wrapped so a bad
 value logs a warning and falls back to the default rather than failing the build — writes

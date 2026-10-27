@@ -90,7 +90,8 @@ from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Protocol
 
-from sqlalchemy import ColumnElement, func, select, update
+from sqlalchemy import ColumnElement, func, literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from . import feed_fetch
@@ -123,13 +124,20 @@ BYTES_STEP_PERCENT = 5
 # Labels of failed tasks kept in the record.
 FAILED_KEYS_MAX = 50
 # The station-module follow-up: a pass beats `updated_at` this often while it
-# runs; a running follow-up silent for `EXTRACT_LEASE_SECONDS`, or one still
-# queued after `EXTRACT_QUEUED_SECONDS` (longer than the pass's 30-minute
-# budget: the web process restarted and lost its in-memory queue), is shown
-# interrupted.
+# runs, and so does a pass waiting in the sender's queue (`touch_queued`,
+# since 2026-10-27: a refresh's pass waits for every feed, so one may wait
+# hours behind another); a follow-up running or queued and silent for
+# `EXTRACT_LEASE_SECONDS` (the web process restarted and lost its in-memory
+# queue, or the pass died) is shown interrupted, and web's next start queues
+# it again (`resume_passes`).
 EXTRACT_HEARTBEAT_SECONDS = 30.0
 EXTRACT_LEASE_SECONDS = 300
-EXTRACT_QUEUED_SECONDS = 35 * 60
+EXTRACT_QUEUED_SECONDS = EXTRACT_LEASE_SECONDS
+# A pass the previous web process left unfinished is queued again at the
+# next start when its refresh ended within this many hours.
+RESUME_HOURS = 24
+# Feeds of a pass that did not reach the module, named in the record.
+EXTRACT_PROBLEMS_MAX = 50
 
 # Phases of a provider refresh.
 DOWNLOADING = "downloading"
@@ -639,10 +647,67 @@ def _extract_on_finish(state: str) -> dict[str, Any]:
 
 class _Outcome(Protocol):
     @property
+    def provider_id(self) -> str: ...
+
+    @property
     def state(self) -> str: ...
 
     @property
     def reason(self) -> str | None: ...
+
+    @property
+    def complete(self) -> bool: ...
+
+
+def touch_queued(
+    sid: str, scope: str, run_id: uuid.UUID, *, factory: Factory | None = None
+) -> None:
+    """The beat of a pass waiting in the sender's queue: `updated_at` of the
+    follow-up of refresh `run_id`, while it is still queued. Never raises."""
+    try:
+        with _session_factory(factory)() as db:
+            db.execute(
+                update(Row)
+                .where(
+                    Row.session_id == sid,
+                    Row.scope == scope,
+                    Row.run_id == run_id,
+                    Row.state == FINISHED,
+                    Row.extract["state"].astext == "queued",
+                )
+                .values(extract=Row.extract.op("||")(literal({"updated_at": _now_iso()}, JSONB)))
+            )
+            db.commit()
+    except Exception as exc:
+        log.warning(_FAILED_WRITE, "extract", type(exc).__name__)
+
+
+def resume_passes(*, factory: Factory | None = None) -> list[tuple[str, str | None, uuid.UUID]]:
+    """The passes to queue again at the start of web: every provider refresh
+    (the whole session's or one provider's) that finished in the last
+    `RESUME_HOURS` and whose follow-up is still queued or running in the
+    record (the process that ran it is gone: web runs one process). Each is
+    marked queued again, `resumed`, in the same statement. Returns (session,
+    provider or None, run id) for `station_extract_upload.after_refresh`."""
+    queued = {"state": "queued", "updated_at": _now_iso(), "resumed": True}
+    with _session_factory(factory)() as db:
+        rows = db.execute(
+            update(Row)
+            .where(
+                Row.state == FINISHED,
+                Row.scope != OSM,
+                Row.extract["state"].astext.in_(("queued", RUNNING)),
+                Row.finished_at > func.now() - func.make_interval(0, 0, 0, 0, RESUME_HOURS),
+            )
+            .values(extract=queued)
+            .returning(Row.session_id, Row.scope, Row.run_id)
+        ).all()
+        db.commit()
+    return [
+        (sid, None if scope == PROVIDERS else scope, run_id)
+        for sid, scope, run_id in rows
+        if scope == PROVIDERS or is_provider_scope(scope)
+    ]
 
 
 class ExtractFollowUp:
@@ -704,7 +769,9 @@ class ExtractFollowUp:
                 "handled": 0,
                 **dict.fromkeys(EXTRACT_STATES, 0),
                 "reasons": {},
+                "problems": [],
                 "current": None,
+                "current_started_at": None,
                 "started_at": _now_iso(),
                 "finished_at": None,
             }
@@ -720,6 +787,7 @@ class ExtractFollowUp:
             if not self.state:
                 return
             self.state["current"] = _label(provider_id)
+            self.state["current_started_at"] = _now_iso()
             self._write()
 
     def outcome(self, outcome: _Outcome) -> None:
@@ -729,11 +797,22 @@ class ExtractFollowUp:
             state = outcome.state if outcome.state in EXTRACT_STATES else "skipped"
             self.state[state] += 1
             self.state["handled"] += 1
-            if outcome.reason and state not in ("sent", "held"):
+            word = _word(outcome.reason) if outcome.reason else None
+            if word and state not in ("sent", "held"):
                 reasons = self.state["reasons"]
-                word = _word(outcome.reason)
                 reasons[word] = reasons.get(word, 0) + 1
+            problems = self.state.setdefault("problems", [])
+            if not getattr(outcome, "complete", False) and len(problems) < EXTRACT_PROBLEMS_MAX:
+                # A feed the module still lacks, by its provider id and words.
+                problems.append(
+                    {
+                        "provider": _label(getattr(outcome, "provider_id", None)),
+                        "state": state,
+                        "reason": word,
+                    }
+                )
             self.state["current"] = None
+            self.state["current_started_at"] = None
             self._write()
 
     def finished(self, end: str) -> None:
@@ -745,6 +824,7 @@ class ExtractFollowUp:
         with self._lock:
             self.state["state"] = end if end in _EXTRACT_ENDS else "error"
             self.state["current"] = None
+            self.state["current_started_at"] = None
             self.state["finished_at"] = _now_iso()
             self._write()
 
@@ -821,17 +901,45 @@ def _public_extract(extract: object, now: datetime) -> dict[str, Any] | None:
     updated = _parse_time(extract.get("updated_at"))
     public["updated_at"] = _iso(updated) if updated else None
     if "total" in extract:
-        public.update({name: _count(extract.get(name)) for name in _EXTRACT_COUNTS})
-        reasons = extract.get("reasons")
-        public["reasons"] = (
-            {_word(k): _count(v) for k, v in reasons.items()} if isinstance(reasons, dict) else {}
-        )
-        current = extract.get("current")
-        public["current"] = _label(current) if current else None
-        for name in ("started_at", "finished_at"):
-            value = extract.get(name)
-            public[name] = value if isinstance(value, str) and len(value) <= 40 else None
+        public.update(_public_extract_pass(extract))
+    public["resumed"] = extract.get("resumed") is True
     return public
+
+
+def _public_extract_pass(extract: dict[str, Any]) -> dict[str, Any]:
+    """What a started pass wrote: counts, reasons, current feed, times, problems."""
+    public: dict[str, Any] = {name: _count(extract.get(name)) for name in _EXTRACT_COUNTS}
+    reasons = extract.get("reasons")
+    public["reasons"] = (
+        {_word(k): _count(v) for k, v in reasons.items()} if isinstance(reasons, dict) else {}
+    )
+    current = extract.get("current")
+    public["current"] = _label(current) if current else None
+    # How long the current feed has taken (an extraction can take many
+    # minutes), on the web process's clock, the one it was written with.
+    public["current_elapsed_seconds"] = (
+        _seconds_since(extract.get("current_started_at"), datetime.now(UTC)) if current else None
+    )
+    for name in ("started_at", "finished_at"):
+        value = extract.get(name)
+        public[name] = value if isinstance(value, str) and len(value) <= 40 else None
+    public["problems"] = _public_problems(extract.get("problems"))
+    return public
+
+
+def _public_problems(items: object) -> list[dict[str, Any]]:
+    """The feeds the module still lacks: provider id and words only."""
+    if not isinstance(items, list):
+        return []
+    return [
+        {
+            "provider": _label(item.get("provider")),
+            "state": _word(item.get("state")),
+            "reason": _word(item["reason"]) if item.get("reason") else None,
+        }
+        for item in items[:EXTRACT_PROBLEMS_MAX]
+        if isinstance(item, dict)
+    ]
 
 
 def _public(row: Row, now: datetime) -> dict[str, Any]:

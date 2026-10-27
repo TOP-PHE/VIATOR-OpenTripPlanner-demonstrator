@@ -371,7 +371,7 @@ def test_the_detail_comes_from_the_reason_word_only(
     assert first is not None
     assert first["detail"] is None
     assert second is not None
-    assert second["detail"] == "the pass ran out of time before it; sent at the next pass"
+    assert second["detail"] == "the pass reached its time limit before it; sent at the next pass"
     assert third is not None
     assert third["detail"] is None
 

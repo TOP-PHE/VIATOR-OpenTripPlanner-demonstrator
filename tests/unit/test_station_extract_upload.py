@@ -264,7 +264,14 @@ def test_the_numbers() -> None:
     assert up.HEAD_SECONDS == 10.0
     assert up.PUT_SECONDS == 120.0
     assert up.BUILD_BUDGET_SECONDS == 300.0
-    assert up.REFRESH_BUDGET_SECONDS == 1800.0
+    assert up.REFRESH_BUDGET_SECONDS == 12 * 3600.0
+    assert up.Patience(31 * 60.0, 48, 12, 30.0) == up.REFRESH_PATIENCE
+    assert up.build_patience() == up.Patience(
+        up.RETRY_AFTER_MAX_SECONDS,
+        up.WAITS_PER_CALL,
+        up.TRANSIENT_RETRIES,
+        up.TRANSIENT_PAUSE_SECONDS,
+    )
     assert up.EXTRACT_MAX_BYTES == 32 * 1024 * 1024
     assert up.TRANSIENT_RETRIES == 2
     assert up.SESSION_ID.pattern == r"[A-Za-z0-9._-]{1,64}"
@@ -1129,6 +1136,7 @@ def test_the_refresh_task_uses_the_refresh_budget(monkeypatch: pytest.MonkeyPatc
         "budget": up.REFRESH_BUDGET_SECONDS,
         "only_provider": "ZZ0",
         "observer": None,
+        "patience": up.REFRESH_PATIENCE,
     }
 
 
@@ -1944,7 +1952,8 @@ class _SlowFor:
 def test_a_long_extraction_never_starves_the_small_feeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
 ) -> None:
-    """The production case: a national archive and small feeds in one pass.
+    """A national archive and small feeds in a pass whose budget the
+    extraction overruns (the refresh's pass of before 2026-10-27, 30 min).
     The small ones are sent; the national one alone is skipped `budget`; its
     extraction goes on and its extract goes with the next pass, even the
     worker's, which only takes extracts already made."""
@@ -1954,7 +1963,7 @@ def test_a_long_extraction_never_starves_the_small_feeds(
     monkeypatch.setattr(station_extract, "ensure_extract", slow)
     monkeypatch.setattr(up, "EXTRACT_POLL_SECONDS", 0.01)
     try:
-        result = _send(setup, module, clock, budget=up.REFRESH_BUDGET_SECONDS)
+        result = _send(setup, module, clock, budget=1800.0)
     finally:
         slow.release.set()
     assert _states(result) == [(up.SKIPPED, up.BUDGET), (up.SENT, None), (up.SENT, None)]
@@ -2030,3 +2039,150 @@ def test_the_observer_is_told_when_the_module_is_off(setup: Setup, clock: FakeCl
     watcher = _Watcher()
     up.send_session("zz", budget=1.0, observer=watcher)
     assert watcher.calls == [("finished", up.OFF)]
+
+
+# ── one Refresh sends everything (2026-10-27) ────────────────────────────
+
+
+@pytest.mark.usefixtures("token")
+def test_after_a_refresh_a_long_extraction_is_waited_for_and_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: Module, clock: FakeClock
+) -> None:
+    """The national archive whose extraction takes hours is sent in the same
+    pass as the small feeds: nothing is left for a second Refresh."""
+    setup = Setup(tmp_path, monkeypatch, n=3)
+    _sized(setup, {"ZZ0": 99_999, "ZZ1": 99, "ZZ2": 999})
+    slow = _SlowFor(setup.extractor, clock, "ZZ0")
+    slow.release.set()  # the extraction ends once the clock has moved on
+    monkeypatch.setattr(station_extract, "ensure_extract", slow)
+    monkeypatch.setattr(up, "EXTRACT_POLL_SECONDS", 0.01)
+    result = _send(
+        setup, module, clock, budget=up.REFRESH_BUDGET_SECONDS, patience=up.REFRESH_PATIENCE
+    )
+    assert _states(result) == [(up.SENT, None)] * 3
+    assert len(module.put_requests) == 3
+    assert all(outcome.complete for outcome in result.outcomes)
+
+
+@pytest.mark.usefixtures("token")
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (_refusal(429, "extract_window", "1500"), up.EXTRACT_WINDOW),
+        (_refusal(503, "busy", "300"), up.BUSY),
+    ],
+    ids=["half_hour_window", "busy"],
+)
+def test_after_a_refresh_the_module_s_window_is_waited_out(
+    setup: Setup, module: Module, clock: FakeClock, answer: httpx.Response, reason: str
+) -> None:
+    """The module's half-hour window full (60 extracts) or the module busy:
+    the refresh's pass waits the `Retry-After`, the build's gives up."""
+    wait = float(answer.headers["retry-after"])
+    module.puts = [answer, None]
+    result = _send(
+        setup, module, clock, budget=up.REFRESH_BUDGET_SECONDS, patience=up.REFRESH_PATIENCE
+    )
+    assert _states(result) == [(up.SENT, None)]
+    assert clock.slept == [wait]
+    later = Module()
+    later.puts = [answer, None]
+    built = _send(setup, later, FakeClock(), budget=up.BUILD_BUDGET_SECONDS)
+    assert _states(built) == [(up.UNAVAILABLE, reason)]
+
+
+@pytest.mark.usefixtures("token")
+def test_after_a_refresh_a_module_restarting_is_waited_for(
+    setup: Setup, module: Module, clock: FakeClock
+) -> None:
+    """The module refuses connections for a couple of minutes (its deploy):
+    the refresh's pass tries again every 30 s, the build's twice."""
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("stand-in refusal", request=request)
+
+    module.heads = [refused] * 5 + [httpx.Response(404)]
+    result = _send(
+        setup, module, clock, budget=up.REFRESH_BUDGET_SECONDS, patience=up.REFRESH_PATIENCE
+    )
+    assert _states(result) == [(up.SENT, None)]
+    assert clock.slept == [30.0] * 5
+    later = Module()
+    later.heads = [refused] * 5 + [httpx.Response(404)]
+    built = _send(setup, later, FakeClock(), budget=up.BUILD_BUDGET_SECONDS)
+    assert _states(built) == [(up.UNAVAILABLE, up.NETWORK)]
+
+
+@pytest.mark.parametrize(
+    ("state", "reason", "complete"),
+    [
+        (up.SENT, None, True),
+        (up.HELD, None, True),
+        (up.SKIPPED, up.NO_FEED_KEY, True),
+        (up.SKIPPED, "no_rail_stop", True),
+        (up.SKIPPED, "no_stop_place", True),
+        (up.SKIPPED, up.BUDGET, False),
+        (up.SKIPPED, "memory_limit", False),
+        (up.SKIPPED, up.NO_ARCHIVE, False),
+        (up.REFUSED, "duplicate_stop", False),
+        (up.UNAVAILABLE, up.TIMEOUT, False),
+        (up.CANCELLED, None, False),
+    ],
+)
+def test_an_outcome_says_whether_the_module_has_what_the_feed_gives(
+    state: str, reason: str | None, complete: bool
+) -> None:
+    assert up.FeedOutcome("ZZ0", state, reason).complete is complete
+
+
+def test_the_passes_waiting_in_the_queue_keep_their_record_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+
+    from app import refresh_progress
+
+    run_a, run_b = uuid.uuid4(), uuid.uuid4()
+    waiting = {("zz", None): run_a, ("zz", "ZZ1"): run_b, ("yy", None): None}
+    monkeypatch.setattr(up, "_queued", waiting)
+    touched: list[tuple[str, str, uuid.UUID]] = []
+
+    def touch(sid: str, scope: str, run_id: uuid.UUID) -> None:
+        touched.append((sid, scope, run_id))
+
+    monkeypatch.setattr(refresh_progress, "touch_queued", touch)
+    up.beat_queued_once()
+    # A pass queued without a record (no run id) has nothing to keep alive.
+    assert sorted(touched, key=str) == sorted(
+        [("zz", refresh_progress.PROVIDERS, run_a), ("zz", "ZZ1", run_b)], key=str
+    )
+
+
+def test_web_s_start_queues_again_the_passes_the_last_process_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+
+    from app import refresh_progress, station_module
+
+    run = uuid.uuid4()
+    left = [("zz", None, run), ("zz", "ZZ1", run)]
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    monkeypatch.setattr(refresh_progress, "resume_passes", lambda factory=None: left)
+    queued: list[tuple[str, str | None, uuid.UUID | None]] = []
+
+    def after(sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None) -> None:
+        queued.append((sid, only_provider, run_id))
+
+    monkeypatch.setattr(up, "after_refresh", after)
+    assert up.resume_after_restart() == 2
+    assert queued == left
+
+    def unreadable(factory: Any = None) -> list[Any]:
+        raise RuntimeError("stand-in")
+
+    monkeypatch.setattr(refresh_progress, "resume_passes", unreadable)
+    assert up.resume_after_restart() == 0  # logged, never raised
+    monkeypatch.setattr(station_module, "enabled", lambda: False)
+    assert up.resume_after_restart() == 0
+    assert len(queued) == 2
