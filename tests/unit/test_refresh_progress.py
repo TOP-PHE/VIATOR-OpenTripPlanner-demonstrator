@@ -404,6 +404,74 @@ def test_the_extract_follow_up_counts_states_and_reason_words(
     assert final["reasons"] == {"budget": 1, "other": 1}
 
 
+def test_the_follow_up_names_the_feeds_the_module_lacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    follow = refresh_progress.ExtractFollowUp("zz", uuid.uuid4())
+    written: list[dict[str, Any]] = []
+    monkeypatch.setattr(follow, "_write", lambda: written.append(dict(follow.state)))
+    follow.started(6)
+    follow.feed_started("ZZ0")
+    assert written[-1]["current_started_at"] is not None
+    follow.outcome(up.FeedOutcome("ZZ0", up.SENT))
+    assert written[-1]["current_started_at"] is None
+    follow.outcome(up.FeedOutcome("ZZ1", up.HELD))
+    follow.outcome(up.FeedOutcome("ZZ2", up.SKIPPED, "no_rail_stop"))  # nothing to send
+    follow.outcome(up.FeedOutcome("ZZ3", up.SKIPPED, "memory_limit"))
+    follow.outcome(up.FeedOutcome("ZZ4", up.UNAVAILABLE, up.TIMEOUT))
+    follow.outcome(up.FeedOutcome("a free text <b>", up.REFUSED, "Row Text <x>"))
+    follow.finished("finished")
+    assert written[-1]["problems"] == [
+        {"provider": "ZZ3", "state": "skipped", "reason": "memory_limit"},
+        {"provider": "ZZ4", "state": "unavailable", "reason": "timeout"},
+        {"provider": "task", "state": "refused", "reason": "other"},
+    ]
+
+
+def test_the_follow_up_names_at_most_fifty_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    follow = refresh_progress.ExtractFollowUp("zz", uuid.uuid4())
+    monkeypatch.setattr(follow, "_write", lambda: None)
+    follow.started(99)
+    for i in range(99):
+        follow.outcome(up.FeedOutcome(f"ZZ{i}", up.SKIPPED, up.BUDGET))
+    assert len(follow.state["problems"]) == refresh_progress.EXTRACT_PROBLEMS_MAX
+    assert follow.state["skipped"] == 99
+
+
+def test_the_public_follow_up_gives_the_problems_the_current_feed_s_time_and_a_resume() -> None:
+    now = datetime.now(UTC)
+    started = (now - timedelta(minutes=12)).isoformat()
+    extract = {
+        "state": "running",
+        "updated_at": now.isoformat(),
+        "total": 3,
+        "handled": 1,
+        "skipped": 1,
+        "reasons": {"memory_limit": 1},
+        "problems": [
+            {"provider": "ZZ3", "state": "skipped", "reason": "memory_limit"},
+            {"provider": "<script>", "state": "Weird Word", "reason": "a free text"},
+            "not a dict",
+        ],
+        "current": "ZZRAIL",
+        "current_started_at": started,
+    }
+    public = refresh_progress._public_extract(extract, now)
+    assert public is not None
+    assert public["problems"] == [
+        {"provider": "ZZ3", "state": "skipped", "reason": "memory_limit"},
+        {"provider": "task", "state": "other", "reason": "other"},
+    ]
+    assert 12 * 60 <= public["current_elapsed_seconds"] < 12 * 60 + 60
+    assert public["resumed"] is False
+    queued = refresh_progress._public_extract(
+        {"state": "queued", "updated_at": now.isoformat(), "resumed": True}, now
+    )
+    assert queued == {"state": "queued", "updated_at": queued["updated_at"], "resumed": True}  # type: ignore[index]
+    # A record written before these fields: no problems, no time, not resumed.
+    old = refresh_progress._public_extract({**extract, "problems": None, "current": None}, now)
+    assert old is not None
+    assert (old["problems"], old["current_elapsed_seconds"], old["resumed"]) == ([], None, False)
+
+
 # ── the download hook of app/feed_fetch.py ───────────────────────────────
 
 
@@ -609,8 +677,9 @@ def test_the_follow_up_beats_while_its_pass_runs(monkeypatch: pytest.MonkeyPatch
 @pytest.mark.parametrize(
     ("state", "minutes", "shown"),
     [
-        ("queued", 34, "queued"),
-        ("queued", 36, "interrupted"),
+        # A queued pass beats too since 2026-10-27 (`touch_queued`): the same lease.
+        ("queued", 4, "queued"),
+        ("queued", 6, "interrupted"),
         ("running", 4, "running"),
         ("running", 6, "interrupted"),
         ("finished", 999, "finished"),

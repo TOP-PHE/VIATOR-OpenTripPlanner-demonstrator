@@ -585,6 +585,14 @@
   .refresh-progress-block[data-state="interrupted"] { border-left-color: #9a6700; }
   .refresh-progress-line { overflow-wrap: anywhere; }
   .refresh-progress-line.hint { color: #57606a; }
+  /* The verdict of a provider refresh (first line): its colour on the block too. */
+  .refresh-progress-line.verdict { font-weight: 600; }
+  .refresh-progress-line.verdict.complete { color: #1a7f37; }
+  .refresh-progress-line.verdict.problems { color: #9a6700; }
+  .refresh-progress-line.verdict.running { color: #0969da; }
+  .refresh-progress-block[data-verdict="complete"] { border-left-color: #1a7f37; }
+  .refresh-progress-block[data-verdict="problems"] { border-left-color: #9a6700; }
+  .refresh-progress-block[data-verdict="running"] { border-left-color: #0969da; }
   /* Feed status panel */
   .feed-status-toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
   .feed-status-country { margin: 0.4rem 0; }
@@ -1727,6 +1735,11 @@ const _EXTRACT_COUNT_WORDS = [
   ['sent', 'sent'], ['held', 'already held'], ['refused', 'refused'],
   ['unavailable', 'module unavailable'], ['skipped', 'skipped'], ['cancelled', 'cancelled'],
 ];
+// Skip words that leave nothing missing in the module (a feed never sent, a
+// feed without a rail station): app/station_extract_upload.py NOTHING_TO_SEND.
+const _EXTRACT_NOTHING_TO_SEND = ['no_feed_key', 'no_rail_stop', 'no_stop_place'];
+// Feeds named in the "not with the station module" line; the rest are counted.
+const _EXTRACT_PROBLEMS_SHOWN = 10;
 
 function progressBytes(n) {
   if (n === null || n === undefined) return '';
@@ -1802,21 +1815,31 @@ function progressSingleOutcome(x) {
   return reasons ? `${found[1]} (${reasons})` : found[1];
 }
 
+// " · now ZZRAIL for 12 min 3 s": the feed being extracted or sent, and for
+// how long (a national archive takes many minutes).
+function progressNow(x) {
+  if (!x.current) return '';
+  const since = x.current_elapsed_seconds === null || x.current_elapsed_seconds === undefined
+    ? '' : ` for ${progressElapsed(x.current_elapsed_seconds)}`;
+  return ` · now ${x.current}${since}`;
+}
+
 function progressSingleExtractLine(x) {
-  if (x.state === 'running') {
-    const now = x.current ? ` · now ${x.current}` : '';
-    return `Station module: running${now}`;
-  }
+  if (x.state === 'running') return `Station module: running${progressNow(x)}`;
   const end = {finished: 'finished', cancelled: 'cancelled', error: 'stopped by an error'}[x.state] || x.state;
   return `Station module: ${end} ${progressTime(x.finished_at)} — ${progressSingleOutcome(x)}`;
 }
 
 function progressExtractLine(x, single) {
   if (!x) return null;
-  if (x.state === 'queued') return 'Station module: queued — the extracts are sent after the refresh';
+  if (x.state === 'queued') {
+    return x.resumed
+      ? 'Station module: queued again after a restart of the web process — the extracts are sent now'
+      : 'Station module: queued — the extracts are sent after the refresh';
+  }
   if (x.state === 'off') return 'Station module: not configured — nothing sent';
   if (x.state === 'interrupted') {
-    return `Station module: interrupted — no news since ${progressTime(x.updated_at)} (the web process restarted or the pass stopped); the next refresh or rebuild sends what is missing`;
+    return `Station module: interrupted — no news since ${progressTime(x.updated_at)} (the pass stopped, or the web process is down); it is queued again when the web process starts, or a refresh sends what is missing`;
   }
   if (single) return progressSingleExtractLine(x);
   const counts = _EXTRACT_COUNT_WORDS
@@ -1824,15 +1847,77 @@ function progressExtractLine(x, single) {
   const reasons = Object.entries(x.reasons || {}).map(([word, n]) => `${word} ${n}`).join(', ');
   const why = reasons ? ` (${reasons})` : '';
   if (x.state === 'running') {
-    const now = x.current ? ` · now ${x.current}` : '';
-    return `Station module: ${x.handled} / ${x.total} feeds handled — ${counts}${why}${now}`;
+    return `Station module: ${x.handled} / ${x.total} feeds handled — ${counts}${why}${progressNow(x)}`;
   }
   const end = {finished: 'finished', cancelled: 'cancelled', error: 'stopped by an error', off: 'not configured'}[x.state] || x.state;
   return `Station module: ${end} ${progressTime(x.finished_at)} — ${x.handled} / ${x.total} feeds — ${counts}${why}`;
 }
 
+// How many feeds of an ended pass the module still lacks: every feed handled
+// but those sent, already held, or with nothing to send (also for a record
+// written before the list of problems existed: from the reason words).
+function progressMissing(x) {
+  const reasons = x.reasons || {};
+  const nothing = _EXTRACT_NOTHING_TO_SEND.reduce((n, w) => n + (reasons[w] || 0), 0);
+  return Math.max(0, (x.handled || 0) - (x.sent || 0) - (x.held || 0) - nothing);
+}
+
+function progressProblemText(p) {
+  const word = p.state === 'unavailable' ? 'module unavailable' : p.state;
+  return p.reason ? `${p.provider} (${word}: ${p.reason})` : `${p.provider} (${word})`;
+}
+
+// "Not with the station module: ZZRAIL (skipped: memory_limit), …", or null.
+function progressMissingLine(x) {
+  if (!x || x.state !== 'finished' || !progressMissing(x)) return null;
+  const problems = Array.isArray(x.problems) ? x.problems : [];
+  if (!problems.length) return null;
+  const named = problems.slice(0, _EXTRACT_PROBLEMS_SHOWN).map(progressProblemText).join(', ');
+  const more = problems.length > _EXTRACT_PROBLEMS_SHOWN ? ` and ${problems.length - _EXTRACT_PROBLEMS_SHOWN} more` : '';
+  return `Not with the station module: ${named}${more}`;
+}
+
+function progressPlural(n, one, many) {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+// The first line of a provider refresh's block, its colour as the block's
+// `data-verdict` (running, complete, problems): whether the refresh has
+// ended, and whether every provider is downloaded and with the station
+// module. Its time is the station module's end, else the refresh's.
+function progressVerdict(rec, kind) {
+  const x = rec.extract;
+  if (rec.state === 'running') return ['In progress — downloading the timetables', 'running'];
+  if (rec.state !== 'finished') {
+    return ['Not complete — the refresh stopped before its end (see below)', 'problems'];
+  }
+  if (x && ['queued', 'running'].includes(x.state)) {
+    return ['In progress — sending the stop extracts to the station module', 'running'];
+  }
+  if (x && ['interrupted', 'error', 'cancelled'].includes(x.state)) {
+    return ['Not complete — the station module did not get every extract (see below)', 'problems'];
+  }
+  const at = progressTime((x && x.finished_at) || rec.finished_at);
+  const kept = rec.failed || 0;
+  const missing = x && x.state === 'finished' ? progressMissing(x) : 0;
+  const parts = [];
+  if (kept) parts.push(`${progressPlural(kept, 'provider', 'providers')} not downloaded (kept the previous file)`);
+  if (missing) parts.push(`${progressPlural(missing, 'feed', 'feeds')} not with the station module`);
+  if (parts.length) return [`Complete with problems ${at} — ${parts.join(' · ')} (see below)`, 'problems'];
+  const who = kind === 'single' ? 'the provider is' : 'every provider is';
+  let tail = `${who} downloaded and with the station module`;
+  if (!x) tail = `${who} downloaded`;
+  else if (x.state === 'off') tail = `${who} downloaded (the station module is not configured)`;
+  return [`Complete ${at} — ${tail}`, 'complete'];
+}
+
 function progressLines(rec, kind) {
-  const lines = [[progressHeadLine(rec), '']];
+  const lines = [];
+  if (kind !== 'osm') {
+    const [text, verdict] = progressVerdict(rec, kind);
+    lines.push([text, `verdict ${verdict}`]);
+  }
+  lines.push([progressHeadLine(rec), '']);
   (rec.current || []).forEach(c => lines.push([progressCurrentLine(c), '']));
   if (rec.state !== 'running') lines.push([`Started ${progressTime(rec.started_at)}`, 'hint']);
   if ((rec.failed_keys || []).length) lines.push([`Skipped (kept previous file): ${rec.failed_keys.join(', ')}`, '']);
@@ -1842,6 +1927,11 @@ function progressLines(rec, kind) {
   if (kind !== 'osm') {
     const extract = progressExtractLine(rec.extract, kind === 'single');
     if (extract) lines.push([extract, '']);
+    const missing = progressMissingLine(rec.extract);
+    if (missing) {
+      lines.push([missing, '']);
+      lines.push(['The Station module column of the feed table gives each reason. A refresh sends again what the module was busy or unreachable for; an extractor limit or a refusal needs a new file or a fix.', 'hint']);
+    }
   }
   return lines;
 }
@@ -1857,6 +1947,7 @@ function progressBlock(rec, kind) {
   block.className = 'refresh-progress-block';
   block.dataset.state = rec.state;
   block.dataset.kind = kind;
+  if (kind !== 'osm') block.dataset.verdict = progressVerdict(rec, kind)[1];
   const title = document.createElement('strong');
   title.textContent = progressTitle(rec, kind);
   block.append(title);

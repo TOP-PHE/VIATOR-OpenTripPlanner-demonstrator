@@ -1123,6 +1123,7 @@ What the block says:
 
 | Line | Meaning |
 |---|---|
+| **In progress** / **Complete** / **Complete with problems** / **Not complete** (the first line of a provider refresh, in colour; the block's edge takes the same colour) | the verdict of the whole refresh, its downloads **and** its station-module pass (since 27 October): **In progress — downloading the timetables**, then **In progress — sending the stop extracts to the station module** while the station-module line below is queued or running; **Complete** *time* **— every provider is downloaded and with the station module** when nothing is missing (a feed with nothing to send, such as a cross-border filter or a feed without a rail station, counts as with the module); **Complete with problems** *time* **—** *n* **providers not downloaded (kept the previous file) ·** *n* **feeds not with the station module (see below)**; **Not complete** when the refresh or its station-module pass stopped before its end. The time is the end of the station-module pass. One click on **Refresh providers** is enough: wait for this line, there is nothing to click again |
 | Running — *done* / *total* done · *n* skipped (kept previous file) · *elapsed* | *total* counts every download of the refresh (timetable, MCT, stations CSV of each `url` or `nap` provider) and each derived (`cross_border_filter`) provider; *done* those already over |
 | Now: `provider[ZZRAIL].timetable(gtfs)` — downloading, 12.0 MB of 99.0 MB (12 %) · for 3 min 9 s | the task under way, the **step** it is in (below) and how long the task has run; "of …" only when the server announced the file's size, else "… received"; "Now: cross-border filters" while the derived providers are made. A record written before the steps existed shows the bytes without a step |
 | Finished *time* — *n* fetched · *n* unchanged · *n* skipped (kept previous file) (took …) | **fetched**: a new file went into the slot and a rebuild was queued; **unchanged**: the server's file is the one already in the slot (HTTP 304 or the same sha256), nothing rotated, no rebuild; **skipped (kept previous file)**: no new file (the download, the format check, the NAP lookup or the dispatch failed: the slot keeps its previous file), the same word as the refresh's toast and the Feed status panel's "⚠ skipped" (the API field is `failed`); the panel's **Last result** gives the reason, the block never does |
@@ -1130,7 +1131,8 @@ What the block says:
 | Stopped by an unexpected error (…) | the refresh itself broke (a 500): the type of the error, the tasks done and those **not reached** (never started); see the web log. Since the release after v0.1.44.33 (§6.16) an unexpected error in **one** task (a download, a NAP lookup, a cross-border filter) no longer stops the refresh: that task is skipped (kept previous file) and the others run, so this line means the refresh's own code broke |
 | Interrupted — no news from the server since … | the record stopped being updated: the `web` process restarted or died while the refresh ran. A running refresh writes a heartbeat at least every 30 s; after **5 minutes** without one the record is shown interrupted and a new refresh may start. The downloads done before stay in their slots. Limit: a refresh that was only stuck that long (not dead) and then wakes up finds its record taken: it starts no further download and changes nothing in the record (the web log has `refresh_progress.lease_lost`) |
 | The refresh before this one was interrupted | the record a new refresh replaced was an interrupted one |
-| Station module: … | after a provider refresh, the stop extracts sent to the station module (11.5): **queued** (waiting for the web process's sender), then *handled* / *total* feeds with the counts **sent**, **already held**, **refused**, **module unavailable**, **skipped** and their reason words (for example `budget 1`), the provider being sent, and at the end **finished** (or **cancelled**, **stopped by an error**); **not configured** without `STATION_MODULE_URL` / `STATION_MODULE_TOKEN`; **interrupted** when it went silent: still queued 35 minutes after the refresh (longer than the pass's 30-minute budget: a restart of `web` lost its in-memory queue) or running with no news for 5 minutes (the pass beats every 30 s); the next refresh or rebuild sends what is missing. The follow-up is written only into the record of the refresh that queued it, never into a newer one. The column **Station module** of the Feed status panel still gives each provider's last outcome |
+| Station module: … | after a provider refresh, the stop extracts sent to the station module (11.5): **queued** (waiting for the web process's sender; **queued again after a restart of the web process** when `web` restarted meanwhile and took the pass back at its start), then *handled* / *total* feeds with the counts **sent**, **already held**, **refused**, **module unavailable**, **skipped** and their reason words (for example `memory_limit 1`), the provider being extracted or sent and for how long (**now ZZRAIL for 25 min 3 s**: a national file takes many minutes), and at the end **finished** (or **cancelled**, **stopped by an error**); **not configured** without `STATION_MODULE_URL` / `STATION_MODULE_TOKEN`; **interrupted** when it went silent for 5 minutes (a queued or running pass beats every 30 s): the pass stopped, or `web` is down; `web`'s next start queues it again, or a refresh sends what is missing. The follow-up is written only into the record of the refresh that queued it, never into a newer one. The column **Station module** of the Feed status panel still gives each provider's last outcome |
+| Not with the station module: ZZRAIL (skipped: memory_limit), ZZBUS (module unavailable: timeout) | after a finished pass, the feeds the module still lacks, each with its state and reason word (at most ten named, the others counted), then a hint: the **Station module** column of the feed table gives each reason; a refresh sends again what the module was busy or unreachable for, while an extractor limit (`memory_limit`, `cpu_limit`, …) or a refusal needs a new file or a fix |
 
 **The steps of a task.** A download that reaches 100 % is not the end of its task. The line says
 which step the task is in:
@@ -4243,12 +4245,14 @@ the extracts changes no graph build.
     each to the module as a new version; a remembered `no_rail_stop` is
     read again at the next refresh, nothing to delete.
   - **How long that takes.** One extraction at a time, in the background:
-    the small feeds (most GTFS) are made and sent again within the first
-    pass after the release's first refresh; a large national NeTEx takes
-    minutes each (some 60 MB of XML a second), ends `skipped budget` in a
-    pass whose time it outlasts and is sent by a later pass from the cache,
-    so allow a few refreshes or rebuilds (some hours for a session with
-    several national feeds) before every feed shows `sent` again. In the
+    a large national NeTEx takes minutes each (some 60 MB of XML a second),
+    some hours in all for a session with several national feeds. Since 27
+    October the pass of a refresh waits for each one (11.5), so **one
+    Refresh providers sends every feed**: the small ones first, the
+    national ones as their extracts are made; the refresh block says
+    **Complete** when the last one is with the module. (Before, a pass
+    stopped after 30 minutes and a national feed waited for a later
+    refresh, `skipped budget`.) In the
     module a feed it already knows keeps its state (an accepted feed stays
     accepted: the intake never changes the state of a known feed); the new
     version passes the module's guard and becomes the active one, or is
@@ -4312,22 +4316,28 @@ provider's slot.
   than 30 s left. A module that does not answer at all costs one feed's
   tries (at most 40 s): the feeds after it are marked "module unavailable"
   without a call; so does a 404 to an upload (a module without the intake
-  calls). After a refresh nothing waits on it: it may take up to 30
-  minutes in the background. The feeds whose extract is ready go first,
-  then the others from the smallest file to the largest: a national feed
-  whose extraction is still running when the 30 minutes end is the only
-  one "skipped budget"; its extraction goes on, the extracts of the
-  remaining feeds are still made in the background, and the next refresh
-  or rebuild sends them. Those refresh passes wait in the `web`
-  process's memory: a restart of `web` loses the ones not done yet, and
-  the next rebuild or refresh sends again.
+  calls). **After a refresh nothing waits on it, and it waits for
+  everything** (since 27 October): each extraction however long (one at
+  a time on the machine, each bounded by the extractor's own limits,
+  11.4), the module's busy answers and its half-hour window (up to 31
+  minutes a wait), and a module that does not answer for a few minutes
+  (its deploy: tried again every 30 s, twelve times). Its only time
+  limit is 12 hours, a ceiling against a pass that never ends. The feeds
+  whose extract is ready go first, then the others from the smallest
+  file to the largest. The passes wait in the `web` process's memory,
+  one after the other: a pass waiting behind a long one keeps its record
+  alive (it reads queued, not interrupted), and one that a restart of
+  `web` cut short is queued again when `web` starts (the refresh block
+  says *queued again after a restart of the web process*): a deploy
+  never asks for a second Refresh.
 - **The graph is always built.** The module unreachable, older than these
   calls (it answers 404), busy, refusing an extract, too slow: VIATOR logs a
   warning and goes on. When the module says it is busy (503) or that its
   limit of 60 extracts in the half hour is reached (429), VIATOR waits the
-  time the module gives and sends again, only when that time is at most
-  120 s and fits in the 5 minutes (each wait at least 1 s, at most six for
-  one upload); otherwise the next refresh or rebuild sends it.
+  time the module gives and sends again: before a rebuild only when that
+  time is at most 120 s and fits in the 5 minutes (each wait at least 1 s,
+  at most six for one upload), otherwise the next refresh or rebuild sends
+  it; after a refresh up to 31 minutes a wait (at most 48 for one upload).
 - **The module keeps new feeds pending.** An extract of a feed the module
   has never seen creates that feed as **pending**: the module uses it only
   once an administrator has accepted it there (with its licence), on the

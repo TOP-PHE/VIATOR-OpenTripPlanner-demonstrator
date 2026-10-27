@@ -151,9 +151,14 @@ HEAD_SECONDS = 10.0
 # 32 MiB at 300 KB/s; the module itself cuts a body after 600 s in all.
 PUT_SECONDS = 120.0
 # The worker, before a graph build: what an upload may add to a MOTIS
-# session's station build and graph. Nothing waits on a refresh's pass.
+# session's station build and graph.
 BUILD_BUDGET_SECONDS = 5 * 60.0
-REFRESH_BUDGET_SECONDS = 30 * 60.0
+# The pass of a refresh (2026-10-27): every feed is waited for, its
+# extraction however long (one at a time on the machine, each child bounded
+# by `station_extract.CHILD_WALL_SECONDS`) and the module's busy answers and
+# half-hour window however full, so that one Refresh sends everything. This
+# is only a ceiling against a pass that never ends; nothing waits on it.
+REFRESH_BUDGET_SECONDS = 12 * 3600.0
 RETRY_AFTER_MAX_SECONDS = 120.0
 TRANSIENT_RETRIES = 2
 # A 503 `busy` or 429 without a usable `Retry-After` (the module always sends one).
@@ -165,6 +170,41 @@ EXTRACT_POLL_SECONDS = 1.0
 PAUSE_FLOOR_SECONDS = 1.0
 # At most this many busy or 429 waits for one call, whatever their length.
 WAITS_PER_CALL = 6
+
+
+@dataclass(frozen=True)
+class Patience:
+    """How long one call of a pass waits for the module: the longest
+    `Retry-After` it honours (503 `busy`, 429 `extract_window`), how many such
+    waits, and how often and how far apart it tries again after a call that
+    got no answer, a 408 or a 5xx."""
+
+    retry_after_max: float
+    waits_per_call: int
+    transient_retries: int
+    transient_pause: float
+
+
+def build_patience() -> Patience:
+    """Before a graph build: short, the build must not wait for the module.
+    Read from the constants above when a pass starts."""
+    return Patience(
+        retry_after_max=RETRY_AFTER_MAX_SECONDS,
+        waits_per_call=WAITS_PER_CALL,
+        transient_retries=TRANSIENT_RETRIES,
+        transient_pause=TRANSIENT_PAUSE_SECONDS,
+    )
+
+
+# After a refresh: the module's whole half-hour window (60 extracts in a UTC
+# half hour, `Retry-After` up to 30 min) and a restart of the module (its
+# deploy takes a minute or two: 12 tries 30 s apart cover six).
+REFRESH_PATIENCE = Patience(
+    retry_after_max=31 * 60.0,
+    waits_per_call=48,
+    transient_retries=12,
+    transient_pause=30.0,
+)
 # No upload starts with less of the budget left (an extract of 32 MiB needs time).
 MIN_PUT_SECONDS = 30.0
 
@@ -208,6 +248,9 @@ NOT_CACHED = "not_cached"
 FORBIDDEN_WORD = "token"  # the reason word of a 403: the token refused
 # Failures that are never sent again in a pass: the same file, the same answer.
 _FINAL_FAILURES = frozenset({EXTRACT_GONE, SHAPE})
+# Skips that leave nothing missing in the module: a feed it is never sent
+# (no key) or one without a rail station.
+NOTHING_TO_SEND = frozenset({NO_FEED_KEY, "no_rail_stop", "no_stop_place"})
 
 # The refusal words of the module's 4xx answers (its design 20.6, 22.3), kept
 # when an answer names one; any other code gives `status_<n>`.
@@ -244,7 +287,7 @@ REASON_TEXTS = {
     NO_FEED_KEY: "this feed is not sent to the station module",
     NO_ARCHIVE: "no timetable file yet",
     NOT_CACHED: "waiting for its extract; sent at the next pass",
-    BUDGET: "the pass ran out of time before it; sent at the next pass",
+    BUDGET: "the pass reached its time limit before it; sent at the next pass",
     BUSY: "the station module or the extractor was busy; sent at the next pass",
     "in_flight": "its extract is being made; sent at the next pass",
     NO_SNAPSHOT: "the timetable file changed during the pass; sent at the next pass",
@@ -342,6 +385,14 @@ class FeedOutcome:
         """The short state the admin sees: "refused row", "skipped", ..."""
         base = STATUS_TEXTS[self.state]
         return f"{base} {self.reason}" if self.state == REFUSED and self.reason else base
+
+    @property
+    def complete(self) -> bool:
+        """The module has what this feed gives: its extract sent or already
+        held, or nothing to send (no feed key, no rail station)."""
+        if self.state in (SENT, HELD):
+            return True
+        return self.state == SKIPPED and self.reason in NOTHING_TO_SEND
 
 
 @dataclass
@@ -590,9 +641,11 @@ class _Pass:
         extractor_version: str,
         sid: str = "",
         cache_only: bool = False,
+        patience: Patience | None = None,
     ) -> None:
         self.sid = sid
         self.cache_only = cache_only
+        self.patience = patience or build_patience()
         self.calls = calls
         self.clock = clock
         self.deadline = clock.monotonic() + budget
@@ -611,10 +664,11 @@ class _Pass:
         return max(0.0, min(call_seconds, self.left()))
 
     def pause(self, seconds: float) -> bool:
-        """Sleep `seconds`, at least `PAUSE_FLOOR_SECONDS`, when they fit in the
-        budget; False when they do not."""
+        """Sleep `seconds`, at least `PAUSE_FLOOR_SECONDS`, when they are no
+        longer than the pass's patience allows and fit in the budget; False
+        when they do not."""
         seconds = max(PAUSE_FLOOR_SECONDS, seconds)
-        if seconds > RETRY_AFTER_MAX_SECONDS or seconds >= self.left():
+        if seconds > self.patience.retry_after_max or seconds >= self.left():
             return False
         self.clock.sleep(seconds)
         if self.should_stop():
@@ -763,13 +817,13 @@ class _Retries:
 
     def __init__(self, work: _Pass) -> None:
         self.work = work
-        self.left = TRANSIENT_RETRIES
-        self.waits = WAITS_PER_CALL
+        self.left = work.patience.transient_retries
+        self.waits = work.patience.waits_per_call
 
     def transient(self) -> bool:
         """After a transient failure: True once the pause is over, while
         retries are left and the pause fits in the budget."""
-        if self.left > 0 and self.work.pause(TRANSIENT_PAUSE_SECONDS):
+        if self.left > 0 and self.work.pause(self.work.patience.transient_pause):
             self.left -= 1
             return True
         return False
@@ -1157,9 +1211,11 @@ def send_session_extracts(
     cache_only: bool = False,
     ready: Callable[[str, Feed], bool] = _ready,
     observer: PassObserver | None = None,
+    patience: Patience | None = None,
 ) -> PassResult:
     """Send what the module lacks of a session's feeds, within `budget` seconds,
-    in the order of `_send_order` (`ready` says which need no extraction).
+    in the order of `_send_order` (`ready` says which need no extraction),
+    each call waiting for the module as `patience` allows.
     `observer`, when given, is told the pass's start, each feed and the end.
 
     Never raises an `Exception`: an unexpected one ends the pass (`error`,
@@ -1185,6 +1241,7 @@ def send_session_extracts(
             station_extract.EXTRACTOR_VERSION,
             sid,
             cache_only,
+            patience,
         )
         order = _send_order(sid, list(feeds), ready)
         follow.started(len(order))
@@ -1252,6 +1309,7 @@ def send_session(
     session_factory: Callable[[], Any] | None = None,
     cache_only: bool = False,
     observer: PassObserver | None = None,
+    patience: Patience | None = None,
 ) -> PassResult:
     """Read a session's feeds from the database, then send them. Never raises
     an `Exception`. Used by the worker before a graph build, and by the
@@ -1280,22 +1338,30 @@ def send_session(
             should_stop=should_stop,
             cache_only=cache_only,
             observer=observer,
+            patience=patience,
         )
 
 
 def send_after_refresh(
     sid: str, only_provider: str | None = None, run_id: uuid.UUID | None = None
 ) -> None:
-    """The pass of a refresh (`REFRESH_BUDGET_SECONDS`), run by the sender
-    thread. The pass is written to the progress record of the refresh that
-    queued it (`run_id`, issue #359: the whole session's, or the provider's
-    alone), which the Sessions page shows."""
+    """The pass of a refresh, run by the sender thread: every feed waited for
+    (`REFRESH_BUDGET_SECONDS`, `REFRESH_PATIENCE`), so that one Refresh sends
+    all the module lacks. The pass is written to the progress record of the
+    refresh that queued it (`run_id`, issue #359: the whole session's, or the
+    provider's alone), which the Sessions page shows."""
     observer: PassObserver | None = None
     if run_id is not None:
         from .refresh_progress import ExtractFollowUp, refresh_scope
 
         observer = ExtractFollowUp(sid, run_id, scope=refresh_scope(only_provider))
-    send_session(sid, budget=REFRESH_BUDGET_SECONDS, only_provider=only_provider, observer=observer)
+    send_session(
+        sid,
+        budget=REFRESH_BUDGET_SECONDS,
+        only_provider=only_provider,
+        observer=observer,
+        patience=REFRESH_PATIENCE,
+    )
 
 
 # The refresh endpoints hand their pass to one sender thread of the process,
@@ -1312,6 +1378,35 @@ _waiting: queue.Queue[tuple[str, str | None]] = queue.Queue()
 _queued: dict[tuple[str, str | None], uuid.UUID | None] = {}
 _queued_lock = threading.Lock()
 _sender: threading.Thread | None = None
+# A pass waits in the queue while another one runs, for hours since a
+# refresh's pass waits for every feed: the beater keeps the record of each
+# waiting pass alive (`refresh_progress.touch_queued`), so that the page
+# shows it queued, not interrupted.
+_beater: threading.Thread | None = None
+
+
+def _queued_runs() -> list[tuple[str, str | None, uuid.UUID]]:
+    with _queued_lock:
+        return [(sid, only, run) for (sid, only), run in _queued.items() if run is not None]
+
+
+def beat_queued_once() -> None:
+    """Write the beat of every pass still waiting in the queue. Never raises."""
+    from .refresh_progress import refresh_scope, touch_queued
+
+    for sid, only_provider, run_id in _queued_runs():
+        touch_queued(sid, refresh_scope(only_provider), run_id)
+
+
+def _beat_queued_forever() -> None:
+    from .refresh_progress import EXTRACT_HEARTBEAT_SECONDS
+
+    while True:
+        time.sleep(EXTRACT_HEARTBEAT_SECONDS)
+        try:
+            beat_queued_once()
+        except Exception as exc:  # the thread must outlive any one beat
+            log.warning(_FAILED, ERROR, type(exc).__name__)
 
 
 def _send_queued() -> None:
@@ -1336,7 +1431,7 @@ def after_refresh(
     """Queue the pass of a refresh; returns at once. `run_id`: the progress
     record of the refresh that queued it. Without the module
     configured nothing is queued (one INFO line)."""
-    global _sender
+    global _sender, _beater
     if not station_module.enabled():
         log.info(_SKIPPED_OFF)
         return
@@ -1349,7 +1444,35 @@ def after_refresh(
         if _sender is None or not _sender.is_alive():
             _sender = threading.Thread(target=_send_queued, name="station-extracts", daemon=True)
             _sender.start()
+        if _beater is None or not _beater.is_alive():
+            _beater = threading.Thread(
+                target=_beat_queued_forever, name="station-extracts-beat", daemon=True
+            )
+            _beater.start()
     _waiting.put(item)
+
+
+def resume_after_restart(factory: Callable[[], Any] | None = None) -> int:
+    """At the start of web: queue again the pass of every refresh that the
+    previous process left queued or running (its queue and its sender thread
+    live in memory: a deploy or a restart lost them), so that a Refresh never
+    has to be clicked again for that. Only the record's own refresh, from
+    the last `refresh_progress.RESUME_HOURS`: a newer refresh owns the row
+    otherwise. Returns how many were queued; never raises."""
+    if not station_module.enabled():
+        return 0
+    from .refresh_progress import resume_passes
+
+    try:
+        found = resume_passes(factory=factory)
+    except Exception as exc:
+        log.warning(_FAILED, ERROR, type(exc).__name__)
+        return 0
+    for sid, only_provider, run_id in found:
+        after_refresh(sid, only_provider, run_id)
+    if found:
+        log.info("station_extract.resumed passes=%d", len(found))
+    return len(found)
 
 
 LOG_MARKER = "[viator] station-extracts:"

@@ -918,6 +918,94 @@ def test_a_card_record_stays_while_its_follow_up_runs(
 
 
 @pytest.mark.usefixtures("fresh_db")
+def test_a_pass_waiting_in_the_queue_keeps_its_follow_up_alive(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-27: a refresh's pass waits for every feed, so another pass may
+    wait hours behind it; the sender's beat keeps the queued one from being
+    shown interrupted. Only the record's own refresh, while still queued."""
+    from app import refresh_progress, station_module
+    from app.db import SessionLocal
+
+    _make_session(client, admin, ["ZZRAIL"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 1)
+    whole.finish(refresh_progress.FINISHED)
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                "UPDATE source_refresh_progress SET extract = jsonb_set(extract, '{updated_at}',"
+                " to_jsonb(CAST(:old AS text))) WHERE session_id = :sid AND scope = 'providers'"
+            ),
+            {"old": "2026-10-15T09:00:00+00:00", "sid": SID},
+        )
+        db.commit()
+    assert _read()["providers"]["extract"]["state"] == "interrupted"
+    refresh_progress.touch_queued(SID, refresh_progress.PROVIDERS, uuid.uuid4())  # another run
+    assert _read()["providers"]["extract"]["state"] == "interrupted"
+    refresh_progress.touch_queued(SID, refresh_progress.PROVIDERS, whole.run_id)
+    assert _read()["providers"]["extract"]["state"] == "queued"
+    follow = refresh_progress.ExtractFollowUp(SID, whole.run_id)
+    follow.started(1)
+    follow._stop.set()  # no beat in this test
+    before = _read()["providers"]["extract"]
+    refresh_progress.touch_queued(SID, refresh_progress.PROVIDERS, whole.run_id)
+    assert _read()["providers"]["extract"] == before  # running: not a queued beat's
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_web_s_start_takes_back_the_passes_the_last_process_left(
+    client: TestClient, admin: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The passes of refreshes that finished in the last day and whose
+    follow-up is still queued or running are marked queued again (resumed)
+    and given back; an ended pass, an older refresh, an unfinished refresh
+    and the OSM record are not."""
+    from app import refresh_progress, station_module
+    from app.db import SessionLocal
+
+    _make_session(client, admin, ["ZZRAIL", "ZZBUS", "ZZOLD"])
+    monkeypatch.setattr(station_module, "enabled", lambda: True)
+    whole = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 3)
+    whole.finish(refresh_progress.FINISHED)  # queued
+    card = refresh_progress.claim(SID, "ZZRAIL", 1)
+    card.finish(refresh_progress.FINISHED)
+    running = refresh_progress.ExtractFollowUp(SID, card.run_id, scope="ZZRAIL")
+    running.started(1)
+    running._stop.set()  # left running by a process that died
+    ended = refresh_progress.claim(SID, "ZZBUS", 1)
+    ended.finish(refresh_progress.FINISHED)
+    done = refresh_progress.ExtractFollowUp(SID, ended.run_id, scope="ZZBUS")
+    done.finished("finished")
+    old = refresh_progress.claim(SID, "ZZOLD", 1)
+    old.finish(refresh_progress.FINISHED)
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                "UPDATE source_refresh_progress SET finished_at = now() - interval '2 days'"
+                " WHERE session_id = :sid AND scope = 'ZZOLD'"
+            ),
+            {"sid": SID},
+        )
+        db.commit()
+    refresh_progress.claim(SID, refresh_progress.OSM, 1)  # still running: never a pass
+
+    found = refresh_progress.resume_passes()
+
+    assert sorted(found, key=str) == sorted(
+        [(SID, None, whole.run_id), (SID, "ZZRAIL", card.run_id)], key=str
+    )
+    body = _read()
+    assert body["providers"]["extract"]["state"] == "queued"
+    assert body["providers"]["extract"]["resumed"] is True
+    shown = {r["provider_id"]: r["extract"] for r in body["single"]}
+    assert shown["ZZRAIL"]["state"] == "queued"
+    assert shown["ZZRAIL"]["resumed"] is True
+    # Still queued (no process took them yet): a second start gives them again.
+    assert sorted(refresh_progress.resume_passes(), key=str) == sorted(found, key=str)
+
+
+@pytest.mark.usefixtures("fresh_db")
 def test_only_a_finished_session_refresh_supersedes_a_card(
     client: TestClient, admin: dict[str, str]
 ) -> None:
@@ -1623,11 +1711,11 @@ def test_a_silent_follow_up_is_shown_interrupted(
     monkeypatch.setattr(station_module, "enabled", lambda: True)
     run = refresh_progress.claim(SID, refresh_progress.PROVIDERS, 0)
     run.finish(refresh_progress.FINISHED)
-    # Queued: the pass budget is 30 minutes, so 35 without a start means the
-    # web process lost its queue.
-    _age_extract(34)
+    # Queued: a waiting pass beats too since 2026-10-27 (`touch_queued`), so 5
+    # minutes without a beat means the web process lost its queue.
+    _age_extract(4)
     assert _read()["providers"]["extract"]["state"] == "queued"
-    _age_extract(36)
+    _age_extract(6)
     assert _read()["providers"]["extract"]["state"] == "interrupted"
 
     follow = refresh_progress.ExtractFollowUp(SID, run.run_id)

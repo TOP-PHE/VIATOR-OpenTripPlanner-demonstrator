@@ -55,7 +55,8 @@ const document = {
 };
 const window = {addEventListener: (name, fn) => { listeners['window:' + name] = fn; }};
 const CSS = {escape: s => s};
-const dump = el => ({tag: el.tag, cls: el.className, state: el.dataset.state, text: el._text,
+const dump = el => ({tag: el.tag, cls: el.className, state: el.dataset.state,
+                     verdict: el.dataset.verdict, text: el._text,
                      children: el.children.map(dump)});
 """
 
@@ -168,8 +169,10 @@ def test_a_running_refresh_shows_counts_bytes_and_elapsed() -> None:
     assert result["hidden"] is False
     block = result["tree"]["children"][0]
     assert block["state"] == "running"
+    assert block["verdict"] == "running"
     assert _lines(result) == [
         "Provider refresh",
+        "In progress — downloading the timetables",
         "Running — 9 / 99 done · 1 skipped (kept previous file) · 3 min 19 s",
         "Now: provider[ZZRAIL].timetable(gtfs) — 49.5 MB of 99.0 MB (50 %)",
         "Skipped (kept previous file): provider[ZZBUS].timetable(gtfs)",
@@ -225,11 +228,12 @@ def test_the_end_result_and_the_follow_up() -> None:
         },
     )
     lines = _lines(_render({"providers": finished, "osm": None}))
-    assert lines[1].startswith("Finished ")
-    assert lines[1].endswith(
+    assert lines[1] == "In progress — sending the stop extracts to the station module"
+    assert lines[2].startswith("Finished ")
+    assert lines[2].endswith(
         "— 90 fetched · 8 unchanged · 1 skipped (kept previous file) (took 33 min 0 s)"
     )
-    assert lines[2].startswith("Started ")
+    assert lines[3].startswith("Started ")
     assert lines[-1] == (
         "Station module: 12 / 99 feeds handled — 5 sent · 6 already held · 1 skipped"
         " (budget 1) · now ZZRAIL"
@@ -246,8 +250,10 @@ def test_failed_and_interrupted_refreshes_say_what_happened() -> None:
     failed = _render(
         {"providers": _record(state="failed", error="runtimeerror", not_reached=90, current=[])}
     )
-    assert "unexpected error (runtimeerror)" in _lines(failed)[1]
-    assert "9 / 99 done, 90 not reached; see the web log" in _lines(failed)[1]
+    assert _lines(failed)[1] == "Not complete — the refresh stopped before its end (see below)"
+    assert "unexpected error (runtimeerror)" in _lines(failed)[2]
+    assert "9 / 99 done, 90 not reached; see the web log" in _lines(failed)[2]
+    assert failed["tree"]["children"][0]["verdict"] == "problems"
     assert failed["tree"]["children"][0]["state"] == "failed"
     interrupted = _render(
         {
@@ -259,7 +265,7 @@ def test_failed_and_interrupted_refreshes_say_what_happened() -> None:
             )
         }
     )
-    head = _lines(interrupted)[1]
+    head = _lines(interrupted)[2]
     assert head.startswith("Interrupted — no news from the server since ")
     assert head.endswith("9 / 99 done, 90 not reached; a new refresh may start")
     replaced = _render(
@@ -477,7 +483,11 @@ def test_a_silent_follow_up_says_interrupted() -> None:
     )
     line = _lines(_render({"providers": record}))[-1]
     assert line.startswith("Station module: interrupted — no news since ")
-    assert line.endswith("the next refresh or rebuild sends what is missing")
+    assert line.endswith(
+        "it is queued again when the web process starts, or a refresh sends what is missing"
+    )
+    verdict = _lines(_render({"providers": record}))[1]
+    assert verdict == "Not complete — the station module did not get every extract (see below)"
 
 
 def _refusal_function() -> str:
@@ -543,11 +553,12 @@ def test_a_provider_alone_shows_its_steps_above_the_session_result() -> None:
     ]
     assert _lines(result, 0) == [
         "Provider refresh — ZZRAIL only",
+        "In progress — downloading the timetables",
         "Running — 0 / 1 done · 0 skipped (kept previous file) · 1 min 39 s",
         "Now: provider[ZZRAIL].timetable(netex_epip) — checking structure,"
         " 9.9 MB of 99.0 MB (10 %) · for 18 min 0 s",
     ]
-    assert _lines(result, 1)[1].startswith("Finished ")
+    assert _lines(result, 1)[2].startswith("Finished ")
 
 
 def _ended_single(extract: dict[str, Any]) -> dict[str, Any]:
@@ -587,8 +598,9 @@ def _pass(state: str, **counts: Any) -> dict[str, Any]:
 
 def test_a_provider_alone_follows_its_station_module_line() -> None:
     lines = _lines(_render({"single": [_ended_single({"state": "queued"})]}))
-    assert lines[1].startswith("Finished ")
-    assert lines[1].endswith(
+    assert lines[1] == "In progress — sending the stop extracts to the station module"
+    assert lines[2].startswith("Finished ")
+    assert lines[2].endswith(
         "— 1 fetched · 0 unchanged · 0 skipped (kept previous file) (took 1 min 39 s)"
     )
     assert lines[-1] == "Station module: queued — the extracts are sent after the refresh"
@@ -821,3 +833,148 @@ def test_a_card_click_marks_its_button_busy_until_the_answer() -> None:
     assert finally_part.index("delete refreshBtn.dataset.busy;") < finally_part.index(
         "loadRefreshProgress(sid);"
     )
+
+
+# ── the verdict: one Refresh, one clear end (2026-10-27) ──────────────────
+
+
+def _ended_pass(**counts: Any) -> dict[str, Any]:
+    return {**_pass("finished", total=4, handled=4), **counts}
+
+
+def _ended_whole(extract: dict[str, Any] | None, **changes: Any) -> dict[str, Any]:
+    record = _record(
+        state="finished",
+        finished_at="2026-10-27T09:33:00+00:00",
+        done=99,
+        fetched=90,
+        unchanged=9,
+        failed=0,
+        failed_keys=[],
+        current=[],
+        extract=extract,
+    )
+    record.update(changes)
+    return record
+
+
+def _render_whole(record: dict[str, Any]) -> tuple[list[str], str]:
+    result = _render({"providers": record})
+    return _lines(result), result["tree"]["children"][0]["verdict"]
+
+
+def test_everything_with_the_module_is_complete() -> None:
+    extract = _ended_pass(sent=2, held=1, skipped=1, reasons={"no_rail_stop": 1}, problems=[])
+    lines, verdict = _render_whole(_ended_whole(extract))
+    assert verdict == "complete"
+    assert lines[1].startswith("Complete ")
+    assert lines[1].endswith(" — every provider is downloaded and with the station module")
+    assert not any(line.startswith("Not with the station module") for line in lines)
+
+
+def test_feeds_the_module_lacks_are_named_with_their_reason() -> None:
+    problems = [
+        {"provider": "ZZRAIL", "state": "skipped", "reason": "memory_limit"},
+        {"provider": "ZZBUS", "state": "unavailable", "reason": "timeout"},
+    ]
+    extract = _ended_pass(
+        sent=2,
+        skipped=1,
+        unavailable=1,
+        reasons={"memory_limit": 1, "timeout": 1},
+        problems=problems,
+    )
+    lines, verdict = _render_whole(_ended_whole(extract, failed=1))
+    assert verdict == "problems"
+    assert lines[1].startswith("Complete with problems ")
+    assert lines[1].endswith(
+        " — 1 provider not downloaded (kept the previous file) · 2 feeds not with the station"
+        " module (see below)"
+    )
+    assert lines[-2] == (
+        "Not with the station module: ZZRAIL (skipped: memory_limit),"
+        " ZZBUS (module unavailable: timeout)"
+    )
+    assert lines[-1].startswith("The Station module column of the feed table gives each reason.")
+
+
+def test_more_than_ten_missing_feeds_are_counted() -> None:
+    problems = [{"provider": f"ZZ{i}", "state": "skipped", "reason": "busy"} for i in range(12)]
+    extract = _ended_pass(total=12, handled=12, skipped=12, reasons={"busy": 12}, problems=problems)
+    lines, _ = _render_whole(_ended_whole(extract))
+    missing = next(line for line in lines if line.startswith("Not with the station module"))
+    assert missing.endswith("ZZ9 (skipped: busy) and 2 more")
+
+
+def test_a_record_before_the_list_of_problems_still_gives_its_verdict() -> None:
+    """Written by the previous version: counts and reason words only."""
+    extract = _ended_pass(sent=2, skipped=2, reasons={"no_feed_key": 1, "budget": 1})
+    lines, verdict = _render_whole(_ended_whole(extract))
+    assert verdict == "problems"
+    assert lines[1].endswith(" — 1 feed not with the station module (see below)")
+    assert not any(line.startswith("Not with the station module") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("extract", "first", "verdict"),
+    [
+        (None, "every provider is downloaded", "complete"),
+        (
+            {"state": "off"},
+            "every provider is downloaded (the station module is not configured)",
+            "complete",
+        ),
+        (
+            _pass("cancelled"),
+            "Not complete — the station module did not get every extract",
+            "problems",
+        ),
+        (_pass("error"), "Not complete — the station module did not get every extract", "problems"),
+    ],
+    ids=["no_follow_up", "off", "cancelled", "error"],
+)
+def test_every_end_of_the_follow_up_has_its_verdict(
+    extract: dict[str, Any] | None, first: str, verdict: str
+) -> None:
+    lines, shown = _render_whole(_ended_whole(extract))
+    assert first in lines[1]
+    assert shown == verdict
+
+
+def test_a_provider_alone_says_the_provider_is_complete() -> None:
+    lines = _lines(_render({"single": [_ended_single(_pass("finished", sent=1))]}))
+    assert lines[1].endswith(" — the provider is downloaded and with the station module")
+
+
+def test_the_feed_being_sent_says_for_how_long() -> None:
+    running = {
+        **_pass("running", total=9, handled=3, sent=3),
+        "current": "ZZRAIL",
+        "current_elapsed_seconds": 25 * 60 + 3,
+    }
+    lines, _ = _render_whole(_ended_whole(running))
+    assert lines[-1].endswith("— 3 sent · now ZZRAIL for 25 min 3 s")
+    assert _single_extract_line(running) == "Station module: running · now ZZRAIL for 25 min 3 s"
+
+
+def test_a_pass_queued_again_after_a_restart_says_so() -> None:
+    lines, verdict = _render_whole(_ended_whole({"state": "queued", "resumed": True}))
+    assert lines[-1] == (
+        "Station module: queued again after a restart of the web process — the extracts are"
+        " sent now"
+    )
+    assert verdict == "running"
+
+
+def test_a_missing_feed_never_parses_a_value_as_html() -> None:
+    hostile = '<img src=x onerror="alert(99)">'
+    extract = _ended_pass(
+        sent=3,
+        skipped=1,
+        reasons={"busy": 1},
+        problems=[{"provider": hostile, "state": "skipped", "reason": hostile}],
+    )
+    result = _render({"providers": _ended_whole(extract)})
+    lines = _lines(result)
+    assert f"Not with the station module: {hostile} (skipped: {hostile})" in lines
+    assert result["created"] == 2 + len(lines)

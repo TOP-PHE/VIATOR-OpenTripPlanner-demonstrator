@@ -214,6 +214,16 @@ def _startup() -> None:
     # worker's coverage executor, which resumes a run whose heartbeat went
     # stale (app/network_coverage/executor.py). A restart of web ends nothing.
 
+    # The station-module pass of a refresh lives in this process's memory (its
+    # queue and sender thread): one the previous process left queued or running
+    # is queued again, so that a deploy never asks for a second Refresh.
+    try:
+        from . import station_extract_upload
+
+        station_extract_upload.resume_after_restart()
+    except Exception:
+        log.exception("station_extract.resume_failed", fatal=False)
+
     # Optional in-process schedulers — disable in tests via VIATOR_DISABLE_CRONS env var.
     import os as _os
 
