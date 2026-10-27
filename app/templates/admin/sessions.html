@@ -1929,8 +1929,10 @@ function progressLines(rec, kind) {
     if (extract) lines.push([extract, '']);
     const missing = progressMissingLine(rec.extract);
     if (missing) {
-      lines.push([missing, '']);
-      lines.push(['The Station module column of the feed table gives each reason. A refresh sends again what the module was busy or unreachable for; an extractor limit or a refusal needs a new file or a fix.', 'hint']);
+      lines.push(
+        [missing, ''],
+        ['The Station module column of the feed table gives each reason. A refresh sends again what the module was busy or unreachable for; an extractor limit or a refusal needs a new file or a fix.', 'hint'],
+      );
     }
   }
   return lines;

@@ -901,25 +901,29 @@ def _public_extract(extract: object, now: datetime) -> dict[str, Any] | None:
     updated = _parse_time(extract.get("updated_at"))
     public["updated_at"] = _iso(updated) if updated else None
     if "total" in extract:
-        public.update({name: _count(extract.get(name)) for name in _EXTRACT_COUNTS})
-        reasons = extract.get("reasons")
-        public["reasons"] = (
-            {_word(k): _count(v) for k, v in reasons.items()} if isinstance(reasons, dict) else {}
-        )
-        current = extract.get("current")
-        public["current"] = _label(current) if current else None
-        # How long the current feed has taken (an extraction can take many
-        # minutes), on the web process's clock, the one it was written with.
-        public["current_elapsed_seconds"] = (
-            _seconds_since(extract.get("current_started_at"), datetime.now(UTC))
-            if current
-            else None
-        )
-        for name in ("started_at", "finished_at"):
-            value = extract.get(name)
-            public[name] = value if isinstance(value, str) and len(value) <= 40 else None
-        public["problems"] = _public_problems(extract.get("problems"))
+        public.update(_public_extract_pass(extract))
     public["resumed"] = extract.get("resumed") is True
+    return public
+
+
+def _public_extract_pass(extract: dict[str, Any]) -> dict[str, Any]:
+    """What a started pass wrote: counts, reasons, current feed, times, problems."""
+    public: dict[str, Any] = {name: _count(extract.get(name)) for name in _EXTRACT_COUNTS}
+    reasons = extract.get("reasons")
+    public["reasons"] = (
+        {_word(k): _count(v) for k, v in reasons.items()} if isinstance(reasons, dict) else {}
+    )
+    current = extract.get("current")
+    public["current"] = _label(current) if current else None
+    # How long the current feed has taken (an extraction can take many
+    # minutes), on the web process's clock, the one it was written with.
+    public["current_elapsed_seconds"] = (
+        _seconds_since(extract.get("current_started_at"), datetime.now(UTC)) if current else None
+    )
+    for name in ("started_at", "finished_at"):
+        value = extract.get(name)
+        public[name] = value if isinstance(value, str) and len(value) <= 40 else None
+    public["problems"] = _public_problems(extract.get("problems"))
     return public
 
 
