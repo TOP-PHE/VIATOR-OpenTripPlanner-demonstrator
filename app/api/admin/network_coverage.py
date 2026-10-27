@@ -606,6 +606,18 @@ class RunSummary(BaseModel):
     # #392 — why a failed run failed (`summary.failure_reason`: the resume
     # limit, an error in the pair loop, ...), shown next to the pill.
     failure_reason: str | None = None
+    # The ÖBB check's progress (`verify_progress.SweepWriter`), all None until
+    # the check starts: the cells it asks about, those with a saved answer,
+    # the start of its current attempt and its last write (the database's
+    # clock), the time it has taken so far (start to last write), and an
+    # estimate of the time left at the current attempt's pace (None until
+    # `_VERIFY_ETA_MIN_CELLS` answers and `_VERIFY_ETA_MIN_SECONDS`).
+    verify_total: int | None = None
+    verify_done: int | None = None
+    verify_started_at: str | None = None
+    verify_progress_at: str | None = None
+    verify_elapsed_seconds: float | None = None
+    verify_seconds_left: float | None = None
 
 
 # PR-196a — the alignment-tier vocabulary the scorer in
@@ -3599,7 +3611,12 @@ def _display_status(run: Any) -> tuple[str, float | None]:
     """#392 — (pill text, heartbeat age in seconds) for a run row. A running
     run that no executor holds (released at a deploy), or whose heartbeat is
     missing or older than the executor's stale limit, is "resuming": its
-    executor stopped and the next one takes it over."""
+    executor stopped and the next one takes it over.
+
+    A held running run whose ÖBB check has started is "verifying": every
+    pair is done and the check runs to its end. A Stop clicked then does
+    not interrupt it (the completion phase completes, #392), so the pill
+    does not say "stopping" during the check."""
     status = str(run.status)
     heartbeat_at = getattr(run, "heartbeat_at", None)
     age = (
@@ -3611,12 +3628,53 @@ def _display_status(run: Any) -> tuple[str, float | None]:
         return "queued", age
     if status != "running":
         return status, age
-    if isinstance(getattr(run, "cancel_requested_at", None), datetime):
+    verifying = isinstance(getattr(run, "verify_started_at", None), datetime)
+    if not verifying and isinstance(getattr(run, "cancel_requested_at", None), datetime):
         return "stopping", age
     unheld = getattr(run, "claimed_by", None) is None
     if unheld or age is None or age > coverage_executor.STALE_AFTER_SECONDS:
         return "resuming", age
+    if verifying:
+        return "verifying", age
     return status, age
+
+
+# The time-left estimate needs this many answers of the current attempt and
+# this long a measure: the first cells of a check are no guide to its pace.
+_VERIFY_ETA_MIN_CELLS = 20
+_VERIFY_ETA_MIN_SECONDS = 60.0
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _verify_elapsed_seconds(run: Any) -> float | None:
+    """The ÖBB check's current attempt, from its start to its last write."""
+    started = getattr(run, "verify_started_at", None)
+    progress = getattr(run, "verify_progress_at", None)
+    if not isinstance(started, datetime) or not isinstance(progress, datetime):
+        return None
+    return max(0.0, (progress - started).total_seconds())
+
+
+def _verify_seconds_left(run: Any) -> float | None:
+    """Time left in the ÖBB check at the pace of its current attempt: the
+    answers saved since the attempt started, over the time between its start
+    and its last write (both the database's clock, so no clock skew). 0 once
+    every cell has its answer; None while there is too little to measure."""
+    total = _int_or_none(getattr(run, "verify_total", None))
+    done = _int_or_none(getattr(run, "verify_done", None))
+    if total is None or done is None:
+        return None
+    if done >= total:
+        return 0.0
+    at_start = _int_or_none(getattr(run, "verify_done_at_start", None)) or 0
+    elapsed = _verify_elapsed_seconds(run)
+    checked = done - at_start
+    if elapsed is None or checked < _VERIFY_ETA_MIN_CELLS or elapsed < _VERIFY_ETA_MIN_SECONDS:
+        return None
+    return (total - done) * elapsed / checked
 
 
 def _run_to_summary(
@@ -3696,6 +3754,14 @@ def _run_to_summary(
         response_ms_min=rmin,
         response_ms_avg=ravg,
         response_ms_max=rmax,
+        # The ÖBB check's progress; getattr fallbacks for the MagicMock rows of
+        # the unit fixtures, like the fields above.
+        verify_total=_int_or_none(getattr(run, "verify_total", None)),
+        verify_done=_int_or_none(getattr(run, "verify_done", None)),
+        verify_started_at=_safe_iso_datetime(getattr(run, "verify_started_at", None)),
+        verify_progress_at=_safe_iso_datetime(getattr(run, "verify_progress_at", None)),
+        verify_elapsed_seconds=_verify_elapsed_seconds(run),
+        verify_seconds_left=_verify_seconds_left(run),
     )
 
 
@@ -3715,3 +3781,9 @@ def _safe_iso_date(value: Any) -> str | None:
     if isinstance(value, _date_cls):
         return value.isoformat()
     return None
+
+
+def _safe_iso_datetime(value: Any) -> str | None:
+    """`datetime.isoformat()` for an actual `datetime`; None for everything
+    else (MagicMock-shaped test fixtures, a NULL column)."""
+    return value.isoformat() if isinstance(value, datetime) else None
