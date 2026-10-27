@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -71,7 +72,7 @@ from sqlalchemy import func, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
-from ... import osm_geo, station_module
+from ... import config_service, osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
@@ -3368,6 +3369,173 @@ def _verify_inputs(
         # want this verifiable.
         raise HTTPException(404, _HUB_NOT_FOUND)
     return origin_hub, dest_hub, run
+
+
+# ─────────────── ÖBB stop numbers → the station module's stations ───────────────
+#
+# The cell modal shows an ÖBB leg's stops by ÖBB HAFAS's stop number (its
+# `extId`, kept on the leg as `from_id_raw` / `to_id_raw`, or the number of
+# the `UIC:` / `OEBB:` token of an older row). To check the station mapping
+# against VIATOR's own legs, the page asks which station of the station module
+# each number is linked to: one resolve call of the module per number not
+# known yet, in the series `COVERAGE_OEBB_STOP_SERIES` (where the module files
+# these numbers: see that key in app/config_schema.py). An answer is kept per
+# (series, number) for OEBB_STOP_CACHE_SECONDS, so the stations seen on every
+# cell (Wien, München, Frankfurt) cost one call a few times a day, not one per
+# modal. Every number is one call on the administrator's module limits.
+
+OEBB_STOPS_MAX = 40
+OEBB_STOP_CACHE_SECONDS = 6 * 3600.0
+OEBB_STOP_CACHE_MAX = 5000
+_OEBB_STOP_NUMBER = re.compile(r"[0-9A-Za-z._-]{1,40}", re.ASCII)
+_OEBB_STOPS_REFUSED = (
+    'The body must be {"codes": [...]}: 1 to 40 distinct ÖBB stop numbers '
+    "(letters, digits, '.', '_' or '-', at most 40 characters each)."
+)
+_OEBB_SERIES_REFUSED = (
+    "The setting COVERAGE_OEBB_STOP_SERIES holds a series the station module does not "
+    "take; correct it under Admin, Configuration."
+)
+
+
+class OebbStopsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    codes: list[str] = Field(min_length=1, max_length=OEBB_STOPS_MAX)
+
+    @field_validator("codes")
+    @classmethod
+    def _numbers(cls, codes: list[str]) -> list[str]:
+        if len(set(codes)) != len(codes):
+            raise ValueError("each number once")
+        if not all(_OEBB_STOP_NUMBER.fullmatch(code) for code in codes):
+            raise ValueError("not an ÖBB stop number")
+        return codes
+
+
+class OebbStopStation(BaseModel):
+    """The station of the module an ÖBB stop number is linked to: its name,
+    MERITS code (None for a station without one) and country; how it matched
+    and, for a link, whether it is asserted and its tier; `others`, how many
+    more stations carry the same number (at most 9: the module answers ten)."""
+
+    name: str
+    uic: str | None = None
+    country_iso: str | None = None
+    matched_by: str | None = None
+    asserted: bool | None = None
+    tier: str | None = None
+    others: int = 0
+
+
+class OebbStopsResponse(BaseModel):
+    """`stations`: each number answered, with its station, or None when no
+    station of the module carries it. `unanswered`: the numbers not asked,
+    because the module stopped answering (`status` and `message` say why) or
+    is not configured."""
+
+    status: Literal["ok", "limited", "unavailable"]
+    message: str | None = None
+    retry_after: int | None = None
+    series: str | None = None
+    stations: dict[str, OebbStopStation | None]
+    unanswered: list[str]
+
+
+_oebb_stop_cache: dict[tuple[str | None, str], tuple[float, OebbStopStation | None]] = {}
+
+
+def _oebb_stop_series(db: DbSession) -> str | None:
+    """The series the module files ÖBB's stop numbers under; None (no series)
+    when the setting is empty."""
+    value = config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES")
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _cached_oebb_stops(
+    series: str | None, codes: list[str], now: float
+) -> tuple[dict[str, OebbStopStation | None], list[str]]:
+    """The numbers' stations still in the cache, and the numbers to ask."""
+    known: dict[str, OebbStopStation | None] = {}
+    todo: list[str] = []
+    for code in codes:
+        cached = _oebb_stop_cache.get((series, code))
+        if cached is not None and cached[0] > now:
+            known[code] = cached[1]
+        else:
+            todo.append(code)
+    return known, todo
+
+
+def _remember_oebb_stop(
+    series: str | None, code: str, rows: list[dict[str, Any]], now: float
+) -> OebbStopStation | None:
+    """The station of a resolve answer (its best row) and the count of the
+    others, kept in the cache; the oldest entries go past the cap."""
+    station = None
+    if rows:
+        best = rows[0]
+        station = OebbStopStation(
+            name=best["name"],
+            uic=best["uic"],
+            country_iso=best["country_iso"],
+            matched_by=best["matched_by"],
+            asserted=best["asserted"],
+            tier=best["tier"],
+            others=len(rows) - 1,
+        )
+    _oebb_stop_cache.pop((series, code), None)
+    _oebb_stop_cache[(series, code)] = (now + OEBB_STOP_CACHE_SECONDS, station)
+    while len(_oebb_stop_cache) > OEBB_STOP_CACHE_MAX:
+        _oebb_stop_cache.pop(next(iter(_oebb_stop_cache)))
+    return station
+
+
+@router.post("/oebb-stops/resolve", responses=_HUB_CODE_RESPONSES)
+async def resolve_oebb_stops(
+    body: Annotated[Any, Body()],
+    db: Annotated[DbSession, Depends(get_db)],
+    admin: Annotated[CurrentUser, Depends(require_platform_admin)],
+) -> OebbStopsResponse:
+    """The station of the module each ÖBB HAFAS stop number is linked to, for
+    the cell modal: the numbers in the body's JSON (never in the URL), one
+    module call per number not in the cache, one after the other, on behalf
+    of the administrator. Stops at the first failure (a 429 of the person's
+    limit, the module unreachable) and answers what it has, the rest
+    `unanswered`, never retrying. Writes nothing."""
+    asked = _body_or_422(OebbStopsRequest, body, _OEBB_STOPS_REFUSED)
+    user_id = _caller(admin)
+    series = await db_step(_oebb_stop_series, db)
+    if series is not None and station_module.resolve_text_refused(series) is not None:
+        return OebbStopsResponse(
+            status="unavailable",
+            message=_OEBB_SERIES_REFUSED,
+            series=series,
+            stations={},
+            unanswered=asked.codes,
+        )
+    stations, todo = _cached_oebb_stops(series, asked.codes, time.monotonic())
+    refusal = _module_refusal() if todo else None
+    if refusal is not None:
+        return OebbStopsResponse(
+            status="unavailable", message=refusal, series=series, stations=stations, unanswered=todo
+        )
+    for index, code in enumerate(todo):
+        outcome = await station_module.resolve_code_outcome(series, code, user_id)
+        if outcome.rows is None:
+            status, message, retry_after = _failure(outcome)
+            return OebbStopsResponse(
+                status=status,
+                message=message,
+                retry_after=retry_after,
+                series=series,
+                stations=stations,
+                unanswered=todo[index:],
+            )
+        stations[code] = _remember_oebb_stop(series, code, outcome.rows, time.monotonic())
+    return OebbStopsResponse(status="ok", series=series, stations=stations, unanswered=[])
 
 
 # ─────────────────────────── helpers ───────────────────────────

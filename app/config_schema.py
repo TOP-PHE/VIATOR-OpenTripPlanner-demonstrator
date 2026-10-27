@@ -110,6 +110,17 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "COVERAGE_VERIFY_PARALLELISM": {"type": "int", "default": 2, "min": 1, "max": 10},
     "COVERAGE_VERIFY_TIMEOUT_S": {"type": "int", "default": 30, "min": 5, "max": 300},
     "COVERAGE_VERIFY_SLEEP_MS": {"type": "int", "default": 500, "min": 0, "max": 10000},
+    # The code series of the station module under which ÖBB HAFAS's own stop
+    # numbers (its `extId`, an EVA number such as 8100042 for Bischofshofen)
+    # are filed. The cell modal asks the module, by `POST /stops/resolve
+    # {series, code}`, which station each ÖBB stop number is linked to, and
+    # shows that station's name. ÖBB's own NAP feed files its stops under
+    # their NeTEx ids (series `OeBB_NAP_stop_key`, `at:45:52099`), which HAFAS
+    # does not return; the EVA numbers reach the module as the stop keys of the
+    # German DELFI feed (`DELFI_stop_key`), with ÖBB's GeoNetz as the link's
+    # evidence. A series is the module's data (its links file), never guessed:
+    # change it here when the module files them under another one.
+    "COVERAGE_OEBB_STOP_SERIES": {"type": "str", "default": "DELFI_stop_key"},
     # ── Coverage K-slot time-slicing (PR-3) ───────────────────────────
     # The legacy per-pair coverage call was one numItineraries=50,
     # window=4h request. That worked for the 08:00 "morning peak"

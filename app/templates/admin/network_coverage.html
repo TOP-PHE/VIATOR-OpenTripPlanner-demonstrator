@@ -336,6 +336,10 @@ main {
 .cov-leg-mode { font-weight: 600; font-size: 0.7rem; padding: 0 4px; background: #eef0f2; border-radius: 2px; text-align: center; align-self: center; overflow-wrap: anywhere; }
 .cov-leg-when { color: var(--rail-steel); font-variant-numeric: tabular-nums; }
 .cov-leg-stops { color: #1f2328; }
+/* An ÖBB stop named by the station module, and one no station of the module carries. */
+.cov-leg-stops .oebb-stop.msmm { text-decoration: underline dotted #57606a; cursor: help; }
+.cov-leg-stops .oebb-stop.unmapped { color: #9a6700; cursor: help; }
+.cov-oebb-legend { font-size: 0.75rem; margin: 0.2rem 0 0.4rem; }
 .cov-leg-service { color: #57606a; font-style: italic; }
 .cov-leg-agency { color: #8a939d; font-size: 0.72rem; }
 /* Filter-badge pill colour — distinct from the run-status pills so the
@@ -1895,6 +1899,7 @@ async function openDetailModal(originId, destId, result) {
   document.getElementById('cov-modal').hidden = false;
   const tripsHtml = await fetchCellTripsHtml(originId, destId, orig, dest);
   modalBody.innerHTML = tripsHtml + rerunLink;
+  resolveModalOebbStops(modalBody);
 }
 
 // Render the modal's top "Status · 775ms · 3 itineraries …" meta strip.
@@ -2078,8 +2083,14 @@ function renderModalControls(dir) {
       <input type="checkbox" data-action="modal-show-walks" id="modal-show-walks" ${checked}>
       Show walk legs
     </label>
-  </div>`;
+  </div>
+  ${OEBB_STOPS_LEGEND}`;
 }
+
+// What the ÖBB column's stop names are, under the modal's controls.
+const OEBB_STOPS_LEGEND = '<p class="hint cov-oebb-legend">ÖBB stops: the station module\'s station'
+  + ' for ÖBB\'s stop number (underlined dotted); ⚠ = no station of the module carries that'
+  + ' number (ÖBB\'s own name shown). Hover a stop for both names and the codes.</p>';
 
 // PR-196b — VIATOR column body for the side-by-side modal grid. Each
 // trip renders as a `cov-cell-trip` card (variant of the existing
@@ -2208,10 +2219,37 @@ function renderModalLeg(leg) {
   </div>`;
 }
 
+// ÖBB's stop number of one end of an ÖBB leg (`from` or `to`): HAFAS's own
+// `extId` as the sweep kept it (`*_id_raw`), else the number of the leg's
+// token (`UIC:8100042`, `OEBB:904050`) on a row from before the raw ids.
+// null when there is none or it is not a number the API takes.
+const OEBB_STOP_NUMBER_RE = /^[0-9A-Za-z._-]{1,40}$/;
+function oebbStopNumber(leg, end) {
+  const raw = leg[end + '_id_raw'];
+  const token = leg[end + '_uic'];
+  let number = typeof raw === 'string' ? raw.trim() : '';
+  if (!number && typeof token === 'string') number = token.replace(/^(UIC|OEBB):/, '');
+  return OEBB_STOP_NUMBER_RE.test(number) ? number : null;
+}
+
+// One stop of an ÖBB leg: ÖBB's own name (its token on a row without one)
+// until the station module says which station ÖBB's stop number is linked to
+// (`resolveModalOebbStops`); the number stays on the span for that.
+function oebbStopHtml(leg, end) {
+  const number = oebbStopNumber(leg, end);
+  const oebbName = leg[end + '_name'] || '';
+  const label = oebbName || leg[end + '_uic'] || '?';
+  const title = number ? 'ÖBB stop number ' + number : 'ÖBB gave no stop number';
+  const numberAttr = number ? ' data-oebb-code="' + escHTML(number) + '"' : '';
+  return '<span class="oebb-stop"' + numberAttr + ' data-oebb-name="' + escHTML(oebbName)
+    + '" title="' + escHTML(title) + '">' + escHTML(label) + '</span>';
+}
+
 // PR-196b — ÖBB-side leg row. VerifyLeg carries (mode, from_uic,
-// to_uic, dep_utc, arr_utc, route_name) — narrower than VIATOR's leg
-// shape, so the column body shows UIC tokens where VIATOR shows
-// station names. Walk legs honour the same modal-only toggle.
+// to_uic, dep_utc, arr_utc, route_name, and since the provenance fields
+// ÖBB's own stop names and numbers) — narrower than VIATOR's leg shape.
+// Its stops are named by the station module from ÖBB's stop numbers
+// (`oebbStopHtml`). Walk legs honour the same modal-only toggle.
 function renderModalOebbLeg(leg) {
   const mode = leg.mode || 'TRANSIT';
   const service = leg.route_name || (mode === 'WALK' ? 'walk' : '');
@@ -2219,14 +2257,81 @@ function renderModalOebbLeg(leg) {
   const isWalk = !isModalTransitLeg(leg);
   const walkClass = isWalk ? ' walk-leg' : '';
   const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
-  const fromTok = leg.from_uic || '?';
-  const toTok = leg.to_uic || '?';
   return `<div class="cov-leg${walkClass}"${hiddenAttr}>
     <span class="cov-leg-mode">${escHTML(mode)}</span>
     <span class="cov-leg-when">${fmtTime(leg.dep_utc)} → ${fmtTime(leg.arr_utc)}</span>
-    <span class="cov-leg-stops">${escHTML(fromTok)} → ${escHTML(toTok)}</span>
+    <span class="cov-leg-stops">${oebbStopHtml(leg, 'from')} → ${oebbStopHtml(leg, 'to')}</span>
     <span class="cov-leg-service">${escHTML(service)}</span>
   </div>`;
+}
+
+// The stations of the module ÖBB's stop numbers are linked to, per page
+// (number → station, or null when no station carries it), from POST
+// /api/admin/network-coverage/oebb-stops/resolve; and the series it named.
+const OEBB_STOP_STATIONS = new Map();
+let OEBB_STOP_SERIES = null;
+const OEBB_STOPS_PER_CALL = 40;
+
+// Ask for the numbers of the modal's ÖBB stops not known yet (at most 40),
+// then name every stop it can. A failure leaves ÖBB's own names.
+async function resolveModalOebbStops(root) {
+  const spans = [...root.querySelectorAll('.oebb-stop[data-oebb-code]')];
+  const numbers = [...new Set(spans.map((span) => span.dataset.oebbCode))]
+    .filter((number) => !OEBB_STOP_STATIONS.has(number))
+    .slice(0, OEBB_STOPS_PER_CALL);
+  if (numbers.length) {
+    try {
+      const r = await fetch('/api/admin/network-coverage/oebb-stops/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codes: numbers }),
+      });
+      if (r.ok) {
+        const answer = await r.json();
+        OEBB_STOP_SERIES = answer.series || null;
+        Object.entries(answer.stations || {}).forEach(([number, station]) => {
+          OEBB_STOP_STATIONS.set(number, station);
+        });
+      } else {
+        console.warn('ÖBB stop names: the request was refused', r.status);
+      }
+    } catch (err) {
+      console.warn('ÖBB stop names: the request failed', err);
+    }
+  }
+  spans.forEach(applyOebbStopStation);
+}
+
+// The hover text of a stop the module named: ÖBB's number and name, then the
+// module's station, its MERITS code and how it is linked.
+function oebbStopTitle(number, oebbName, station) {
+  const parts = ['ÖBB stop number ' + number + (oebbName ? ' (ÖBB: ' + oebbName + ')' : '')];
+  const link = [station.matched_by, station.tier, station.asserted ? 'asserted' : ''].filter(Boolean);
+  parts.push('station module: ' + station.name + (station.uic ? ', MERITS ' + station.uic : ', no MERITS code')
+    + (link.length ? ' (' + link.join(', ') + ')' : ''));
+  if (station.others) parts.push(station.others + ' more station(s) carry this number');
+  if (OEBB_STOP_SERIES) parts.push('series ' + OEBB_STOP_SERIES);
+  return parts.join(' · ');
+}
+
+// Name one stop: the module's station when the number is linked to one; ÖBB's
+// own name marked ⚠ when no station carries it; unchanged when not answered.
+function applyOebbStopStation(span) {
+  const number = span.dataset.oebbCode;
+  if (!OEBB_STOP_STATIONS.has(number)) return;
+  const station = OEBB_STOP_STATIONS.get(number);
+  const oebbName = span.dataset.oebbName || '';
+  if (station) {
+    span.textContent = station.name;
+    span.classList.add('msmm');
+    span.title = oebbStopTitle(number, oebbName, station);
+    return;
+  }
+  span.textContent = (oebbName || number) + ' ⚠';
+  span.classList.add('unmapped');
+  span.title = 'ÖBB stop number ' + number + (oebbName ? ' (ÖBB: ' + oebbName + ')' : '')
+    + ': no station of the station module carries it'
+    + (OEBB_STOP_SERIES ? ' in series ' + OEBB_STOP_SERIES : '');
 }
 
 // PR-196b — build the side-by-side VIATOR vs ÖBB grid for one
@@ -2445,6 +2550,7 @@ function refreshModalOebbColumn(verifyBlock, liveItineraries) {
   // rows (renderModalOebbLeg sets the initial hidden attr from
   // MODAL_SHOW_WALKS, so this is belt-and-braces).
   applyModalShowWalks();
+  resolveModalOebbStops(oebbBody);
 }
 
 // Render one VerifyResult inline. Three visual states:
