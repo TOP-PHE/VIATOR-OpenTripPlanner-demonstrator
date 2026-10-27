@@ -150,11 +150,12 @@ class NetworkCoverageRun(Base):
     countries: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
     # PR-E — operator opt-in to run external-planner verification (ÖBB
-    # HAFAS) automatically at run-completion time on every no_route /
-    # timeout / error cell. Default False keeps legacy behaviour. The
-    # Phase-3 sweep in `runner.execute_run` reads this flag and, if true,
-    # populates the `NetworkCoverageResult.external_*` columns inside the
-    # same txn that flips `run.status='completed'`.
+    # HAFAS) automatically at run-completion time. Default False keeps
+    # legacy behaviour. The completion's sweep reads this flag and, if
+    # true, asks ÖBB about every cell but the skipped ones (PR-196a; it was
+    # only no_route / timeout / error cells before) and fills the
+    # `NetworkCoverageResult.external_*` columns, saving each answer as it
+    # goes (see the `verify_*` columns below).
     verify_externally: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
@@ -215,6 +216,28 @@ class NetworkCoverageRun(Base):
         DateTime(timezone=True), nullable=True
     )
     execution_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    # The ÖBB check's progress (alembic 20261027_1200_verify_progress). Once
+    # every pair is done, a run with `verify_externally` asks ÖBB HAFAS about
+    # each cell (`runner._run_external_verify_sweep`), about one a second, and
+    # saves each answer on its result row as it goes
+    # (`verify_progress.SweepWriter`, a short transaction of its own every few
+    # seconds, fenced on the run being `running` and held by its executor).
+    # These columns are written in the same transaction and read by the page:
+    # the cells asked about, those saved, those already saved when the current
+    # attempt started (a resumed check skips them), and the database's clock
+    # at the attempt's start and at the last write. All null until the check
+    # starts; kept on a finished run. The completion's own session never
+    # writes them.
+    verify_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verify_done: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verify_done_at_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verify_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    verify_progress_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class NetworkCoverageResult(Base):

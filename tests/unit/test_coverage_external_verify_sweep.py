@@ -439,7 +439,7 @@ async def test_maybe_sweep_verifies_status_ok_cells_not_just_failures():
     `_run_external_verify_sweep`."""
     captured: list = []
 
-    async def _capture_sweep(*, db, run, rows, cfg):
+    async def _capture_sweep(*, db, run, rows, cfg, writer=None):
         captured.extend(rows)
         return {"verified": len(rows), "ok": 0, "no_route": 0, "error": 0}
 
@@ -473,7 +473,7 @@ async def test_maybe_sweep_returns_zero_when_run_did_not_opt_in():
     accidentally start sweeping every legacy run."""
     captured: list = []
 
-    async def _capture_sweep(*, db, run, rows, cfg):
+    async def _capture_sweep(*, db, run, rows, cfg, writer=None):
         captured.extend(rows)
         return {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
 

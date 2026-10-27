@@ -79,6 +79,7 @@ main {
 .cov-pill[data-status="queued"]    { background: #f6f8fa; color: #57606a; }
 .cov-pill[data-status="resuming"]  { background: #ddf4ff; color: #0550ae; border-color: #b6e3ff; }
 .cov-pill[data-status="stopping"]  { background: #eef0f2; color: #57606a; border-color: #d0d7de; }
+.cov-pill[data-status="verifying"] { background: #fbefff; color: #6639ba; border-color: #e8d5ff; }
 .cov-pill[data-status="failed"]    { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
 .cov-fail-reason { color: #cf222e; font-size: 12px; }
 /* PR-1 — operator-cancelled runs render in a distinct subdued slate so
@@ -126,6 +127,10 @@ main {
 /* Progress bar for a running run. */
 .cov-progress { background: #eef0f2; border-radius: 4px; height: 8px; margin-top: 0.4rem; overflow: hidden; }
 .cov-progress-bar { background: var(--brand-blue); height: 100%; transition: width 0.3s; }
+/* The ÖBB check's bar: the "verifying" pill's colour, so the two read as one phase. */
+.cov-progress-bar.verify { background: #6639ba; }
+.cov-verify-progress { font-size: 0.8rem; color: #57606a; margin-top: 0.35rem; flex-basis: 100%; }
+.cov-verify-progress .cov-progress { max-width: 28rem; }
 
 /* The matrix. Sticky first row + first column so headers stay visible
    while scrolling 23×23 cells. Cell colour = status / duration. */
@@ -645,17 +650,21 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
             or {FR, CH} for a fast cross-border probe.
           </p>
         </fieldset>
-        {# PR-E — opt-in checkbox: after the run flips to 'completed' the
-           worker calls ÖBB HAFAS for every no_route / timeout / error cell
-           and persists the verdict on the cell row. The matrix then shows
-           a coloured dot per cell. Adds ~5-10 min wall-clock for a
-           ~200-cell matrix; default off keeps legacy behaviour. #}
+        {# PR-E — opt-in checkbox: once every pair is done, the worker asks
+           ÖBB HAFAS about every cell but the skipped ones (PR-196a; it was
+           only no_route / timeout / error cells before) and saves each
+           answer on the cell row as it comes, about one cell a second, so
+           12 882 pairs take hours. The run stays "verifying" meanwhile and
+           the page shows the check's progress. Default off keeps legacy
+           behaviour. #}
         <label style="display: flex; gap: 0.4rem; align-items: center; margin-top: 0.6rem; font-size: 0.85rem">
           <input type="checkbox" name="verify_externally" id="cov-verify-externally" />
           <span>
             Verify externally on completion
-            <span class="hint" style="font-weight: normal; display: block; font-size: 0.72rem">
-              (calls ÖBB HAFAS for every no_route / timeout / error cell — adds ~1–5&nbsp;min)
+            <span class="hint" id="cov-verify-externally-hint" style="font-weight: normal; display: block; font-size: 0.72rem">
+              (once every pair is done, asks ÖBB HAFAS about every cell, about one a second:
+              roughly 1–2&nbsp;h more per 3&nbsp;600 pairs; the run shows the check's progress
+              and fills the cells in as the answers come)
             </span>
           </span>
         </label>
@@ -1111,7 +1120,47 @@ const RUN_STATUS_HINTS = {
   queued: 'Waiting for the worker to start it.',
   resuming: 'Paused: the worker restarted (e.g. a deploy). It continues where it stopped once the worker is back.',
   stopping: 'Stop requested; the worker is ending the run.',
+  verifying: 'Every pair is done; the worker is asking ÖBB HAFAS about each cell and saves each answer as it comes. The run completes when the check ends (Stop does not interrupt it).',
 };
+
+// The ÖBB check's progress (RunSummary.verify_*), under the run's summary:
+// while it runs, its count, start and time left with a bar; paused, where it
+// stands; finished, how long it took. '' for a run whose check never started.
+function verifyPct(run) {
+  return run.verify_total ? Math.floor(100 * (run.verify_done || 0) / run.verify_total) : 0;
+}
+function verifyCountText(run) {
+  return `${run.verify_done || 0} of ${run.verify_total} cells (${verifyPct(run)}%)`;
+}
+function verifyLiveText(run) {
+  const parts = [`Checking every cell with ÖBB HAFAS: ${verifyCountText(run)}`];
+  if (run.verify_started_at) {
+    parts.push(`started ${run.verify_started_at.replace('T', ' ').slice(0, 16)}`);
+  }
+  const left = fmtRunDuration(run.verify_seconds_left);
+  parts.push(left === null ? 'time left: measuring' : `about ${left} left`);
+  return `${parts.join(' · ')}. Each answer is saved as it comes, so the cells fill in while the check runs.`;
+}
+function buildVerifyProgressLine(run) {
+  if (run.verify_total === null || run.verify_total === undefined) return '';
+  const shown = run.display_status || run.status;
+  let text;
+  if (shown === 'verifying') {
+    text = verifyLiveText(run);
+  } else if (run.status === 'running') {
+    text = `ÖBB check paused at ${verifyCountText(run)}: it goes on with the cells left once the worker is back.`;
+  } else if (run.status === 'completed') {
+    const took = fmtRunDuration(run.verify_elapsed_seconds);
+    const tookText = took === null ? '' : ' in ' + took;
+    text = `ÖBB check: ${run.verify_total} cells${tookText}.`;
+  } else {
+    text = `ÖBB check stopped at ${verifyCountText(run)}.`;
+  }
+  const bar = shown === 'verifying'
+    ? `<div class="cov-progress"><div class="cov-progress-bar verify" style="width:${verifyPct(run)}%"></div></div>`
+    : '';
+  return `<div class="cov-verify-progress">${escHTML(text)}${bar}</div>`;
+}
 const FAILURE_REASON_SHOWN_CHARS = 90;
 function runStatusPill(run) {
   const shown = run.display_status || run.status;
@@ -1305,6 +1354,20 @@ function updateCoveragePairHint() {
   }
 }
 
+// A run-list row's bar and extra text: during the ÖBB check they follow the
+// check, not the pairs (all done by then).
+function runListProgress(r) {
+  if (r.display_status === 'verifying') {
+    return {
+      pct: verifyPct(r),
+      barCls: 'cov-progress-bar verify',
+      verifyMeta: ` · <span title="Cells with an ÖBB answer saved">ÖBB ${r.verify_done || 0}/${r.verify_total}</span>`,
+    };
+  }
+  const pct = r.total_pairs ? Math.round(100 * r.completed_pairs / r.total_pairs) : 0;
+  return { pct, barCls: 'cov-progress-bar', verifyMeta: '' };
+}
+
 async function reloadRunList(activeId) {
   const el = document.getElementById('run-list');
   try {
@@ -1318,7 +1381,7 @@ async function reloadRunList(activeId) {
     el.innerHTML = runs.map(r => {
       const isActive = r.id === activeId;
       const cls = isActive ? 'run-row active' : 'run-row';
-      const pct = r.total_pairs ? Math.round(100 * r.completed_pairs / r.total_pairs) : 0;
+      const { pct, barCls, verifyMeta } = runListProgress(r);
       // Country-filter badge ("FR+CH") for runs that were restricted to
       // a subset of countries; full-matrix runs get no badge so the row
       // stays uncluttered.
@@ -1351,8 +1414,9 @@ async function reloadRunList(activeId) {
           <span style="color:#1a7f37">${r.ok_pairs} ok</span>
           ${r.no_route_pairs ? ` · <span style="color:#9a6700">${r.no_route_pairs} no-route</span>` : ''}
           ${r.error_pairs ? ` · <span style="color:#cf222e">${r.error_pairs} err</span>` : ''}
+          ${verifyMeta}
           ${r.status === 'running' ? `
-            <div class="cov-progress"><div class="cov-progress-bar" style="width:${pct}%"></div></div>
+            <div class="cov-progress"><div class="${barCls}" style="width:${pct}%"></div></div>
           ` : ''}
         </div>
       </div>`;
@@ -1662,6 +1726,7 @@ function renderRun(run) {
     <button type="button" class="cov-download" id="cov-share-btn" data-run-id="${escHTML(run.id)}"
        title="Copy a link anyone can open (no login) to view this same report in their browser — no need to email the file.">🔗 Copy share link</button>
     ${buildRunStatsSubline(run)}
+    ${buildVerifyProgressLine(run)}
     ${buildRunWindowWarning(run)}
   </div>`;
 
@@ -2001,8 +2066,14 @@ function renderModalControls(dir) {
     dir.external_alignment_score,
   );
   const checked = MODAL_SHOW_WALKS ? 'checked' : '';
+  // A cell ÖBB was not asked about yet (the check still running, or a run
+  // without it) has no score because there is no answer, not a bad match.
+  const noPill = dir.external_verified_at
+    ? 'No alignment data recorded for this cell.'
+    : 'Not compared with ÖBB yet: ÖBB was not asked about this cell.';
+  const noPillHtml = '<span class="hint" style="font-style:italic">' + noPill + '</span>';
   return `<div class="cov-modal-controls">
-    ${pill || '<span class="hint" style="font-style:italic">No alignment data recorded for this cell.</span>'}
+    ${pill || noPillHtml}
     <label title="Display-only — does NOT recompute the alignment score (which stays canonical from the sweep).">
       <input type="checkbox" data-action="modal-show-walks" id="modal-show-walks" ${checked}>
       Show walk legs
@@ -2164,9 +2235,15 @@ function renderModalOebbLeg(leg) {
 // the per-source trip cards (or a styled "no itineraries found"
 // placeholder when one side is empty so the operator can tell which
 // engine returned what).
+// The ÖBB column of a cell ÖBB was not asked about yet: say so, rather than
+// the grid's "no itineraries found", which reads as ÖBB having no route.
+const OEBB_NOT_ASKED_HTML = '<div class="compare-cell empty">ÖBB not asked yet for this cell'
+  + ' ("Verify externally" below asks now).</div>';
 function renderDirectionCompareGrid(dir) {
   const viatorBody = renderModalViatorColumn(dir.trips || []);
-  const oebbBody = renderModalOebbColumn(dir.external_itineraries || []);
+  const oebbBody = dir.external_verified_at
+    ? renderModalOebbColumn(dir.external_itineraries || [])
+    : OEBB_NOT_ASKED_HTML;
   const cols = [
     { key: 'viator', label: 'VIATOR · MOTIS / OTP', pillClass: 'viator', body: viatorBody },
     { key: 'oebb',   label: 'ÖBB HAFAS',            pillClass: 'oebb',   body: oebbBody },

@@ -659,3 +659,63 @@ def test_coverage_claim_revision_up_down_up(alembic_cfg: Config) -> None:
 
     command.upgrade(alembic_cfg, "head")
     assert _run_columns(engine) >= _CLAIM_COLUMNS
+
+
+# ── 20261027_1200_verify_progress: the ÖBB check's progress on the run ──
+
+_VERIFY_PROGRESS = "20261027_1200_verify_progress"
+_VERIFY_COLUMNS = {
+    "verify_total",
+    "verify_done",
+    "verify_done_at_start",
+    "verify_started_at",
+    "verify_progress_at",
+}
+
+
+def test_verify_progress_revision_up_down_up(alembic_cfg: Config) -> None:
+    """The revision adds the progress columns as nulls to the existing runs
+    and changes nothing else; the downgrade drops them and keeps the runs;
+    a second upgrade works."""
+    url = _postgres_or_skip()
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
+        conn.execute(text("CREATE SCHEMA public;"))
+
+    command.upgrade(alembic_cfg, _COVERAGE_CLAIM)
+    run_id = "99999999-9999-4999-8999-999999999499"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO network_coverage_runs (id, session_label, depart_at, status, "
+                "total_pairs, completed_pairs, verify_externally, claimed_by) VALUES (:id, "
+                "'zz-cov-99', '2099-09-09T00:00:00Z', 'running', 99, 99, true, 'zz-host:99:a')"
+            ),
+            {"id": run_id},
+        )
+    assert not (_VERIFY_COLUMNS & _run_columns(engine))
+
+    command.upgrade(alembic_cfg, _VERIFY_PROGRESS)
+    assert _run_columns(engine) >= _VERIFY_COLUMNS
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, completed_pairs, claimed_by, verify_total, verify_done, "
+                "verify_done_at_start, verify_started_at, verify_progress_at "
+                "FROM network_coverage_runs WHERE id = :id"
+            ),
+            {"id": run_id},
+        ).one()
+    assert tuple(row) == ("running", 99, "zz-host:99:a", None, None, None, None, None)
+
+    command.downgrade(alembic_cfg, _COVERAGE_CLAIM)
+    assert not (_VERIFY_COLUMNS & _run_columns(engine))
+    with engine.connect() as conn:
+        status = conn.execute(
+            text("SELECT status FROM network_coverage_runs WHERE id = :id"), {"id": run_id}
+        ).scalar_one()
+    assert status == "running"
+
+    command.upgrade(alembic_cfg, "head")
+    assert _run_columns(engine) >= _VERIFY_COLUMNS

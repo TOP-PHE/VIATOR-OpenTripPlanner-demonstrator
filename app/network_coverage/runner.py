@@ -62,7 +62,10 @@ from ..models import (
 )
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
-from . import external_verify  # PR-E — auto-verify-on-completion sweep
+from . import (
+    external_verify,  # PR-E — auto-verify-on-completion sweep
+    verify_progress,  # the sweep's per-cell saving and progress
+)
 from .alignment import (
     compute_alignment,  # PR-196a — graduated heatmap scorer
     filter_trips_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
@@ -1667,10 +1670,15 @@ async def _finalise_completed_run(
     """Phase-3 — recompute summary counters, optionally run the PR-E
     external-verify sweep, flip to 'completed' in one transaction.
 
-    #392 — idempotent, so resume-safe: nothing is written before the one
-    commit, and an interrupted completion leaves the run `running`, to be
-    resumed with no pair left and completed again. With `executor_id`, the
-    commit happens only while that executor still holds the run.
+    #392 — idempotent, so resume-safe: the run's status, counters and
+    summary are written only by the one commit, and an interrupted
+    completion leaves the run `running`, to be resumed with no pair left and
+    completed again. With `executor_id`, the commit happens only while that
+    executor still holds the run. The verify sweep's answers are the one
+    exception: `verify_progress.SweepWriter` saves them on the result rows as
+    they come (fenced on this executor holding the running run), with the
+    check's progress, so the page shows both and a resumed completion asks
+    ÖBB only about the cells still without an answer.
 
     #406 — the commit happens only while the run is still `running`, read
     under the row lock just before the flip: a status written meanwhile (a
@@ -1700,7 +1708,10 @@ async def _finalise_completed_run(
             raise RunNeedsResume(f"{missing} pairs have no result row yet")
         run.finished_at = datetime.now(UTC)
 
-        verify_counters = await _maybe_run_external_verify_sweep(db=db, run=run, rows=rows, cfg=cfg)
+        writer = verify_progress.SweepWriter(run_id, executor_id)
+        verify_counters = await _maybe_run_external_verify_sweep(
+            db=db, run=run, rows=rows, cfg=cfg, writer=writer
+        )
 
         run.summary = {
             "elapsed_seconds": elapsed_s,
@@ -1893,11 +1904,20 @@ async def _maybe_run_external_verify_sweep(
     run: NetworkCoverageRun,
     rows: Sequence[NetworkCoverageResult],
     cfg: CoverageConfig | None = None,
+    writer: verify_progress.SweepWriter | None = None,
 ) -> dict[str, int]:
     """PR-E — opt-in entry point for the external-verify sweep. Returns
     the zero-fill counters if the run didn't opt in or has no candidate
     cells, otherwise dispatches to `_run_external_verify_sweep` and
-    returns its counters.
+    returns the counters of every candidate cell with an answer.
+
+    With `writer`, each answer is saved as it comes and the check's
+    progress is recorded on the run (see `verify_progress`). The cells that
+    already have an answer, saved by an earlier attempt of this completion
+    (a resume after a worker restart, #392), are not asked again; they count
+    as done from the start. A writer that finds the run ended, or held by
+    another executor, stops the sweep: the completion then reads that under
+    the row lock and writes nothing (#406).
 
     Extracted from `execute_run` so that function stays under Sonar's
     cognitive-complexity ceiling — the verify-sweep dispatch alone
@@ -1925,15 +1945,43 @@ async def _maybe_run_external_verify_sweep(
     # ok-cells too (the bug being fixed). 'skipped' rows stay out
     # because they never got a real VIATOR answer to compare against.
     candidate_rows = [r for r in rows if r.status != "skipped"]
+    to_check = [r for r in candidate_rows if not verify_progress.already_checked(r)]
+    already = len(candidate_rows) - len(to_check)
     log.info(
-        "PR-196a external-verify sweep starting for run %s - %d candidate cells",
+        "PR-196a external-verify sweep starting for run %s - %d candidate cells, %d already checked",
         run.id,
         len(candidate_rows),
+        already,
     )
     if not candidate_rows:
         return zero
-    counters = await _run_external_verify_sweep(db=db, run=run, rows=candidate_rows, cfg=cfg)
+    if writer is not None:
+        writer.start(total=len(candidate_rows), already_saved=already)
+    if to_check and not (writer is not None and writer.stopped):
+        await _run_external_verify_sweep(db=db, run=run, rows=to_check, cfg=cfg, writer=writer)
+    if writer is not None:
+        writer.flush()  # the last answers and the final progress
+    counters = _verify_counters(candidate_rows)
     log.info("PR-196a external-verify sweep done for run %s - %s", run.id, counters)
+    return counters
+
+
+def _verify_counters(rows: Sequence[NetworkCoverageResult]) -> dict[str, int]:
+    """The run summary's external_* counters, from the answers on the rows:
+    those saved by an earlier attempt and those of this one alike. Same
+    split as the sweep's own counters: an error first, then ok, else
+    no_route."""
+    counters = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    for row in rows:
+        if not verify_progress.already_checked(row):
+            continue
+        counters["verified"] += 1
+        if row.external_error is not None:
+            counters["error"] += 1
+        elif row.external_ok:
+            counters["ok"] += 1
+        else:
+            counters["no_route"] += 1
     return counters
 
 
@@ -2008,6 +2056,7 @@ async def _run_external_verify_sweep(
     run: NetworkCoverageRun,
     rows: list[NetworkCoverageResult],
     cfg: CoverageConfig | None = None,
+    writer: verify_progress.SweepWriter | None = None,
 ) -> dict[str, int]:
     """PR-E — sweep `rows` through ÖBB HAFAS and mutate each row's
     external_* columns in place on the attached ORM objects. Caller's
@@ -2028,6 +2077,11 @@ async def _run_external_verify_sweep(
     row so the matrix UI's viridis heatmap renders without a second
     round-trip.
 
+    With `writer`, each cell's answer is also handed to it as soon as it is
+    on the row, and saved by it in its own short transaction (the page shows
+    it, a resume keeps it); once the writer has stopped (the run ended, or
+    another executor holds it) the cells not yet started are not asked.
+
     Returns rollup counters for run.summary."""
     cfg = cfg or CoverageConfig()
     counters: dict[str, int] = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
@@ -2038,69 +2092,15 @@ async def _run_external_verify_sweep(
 
         async def _verify_one(row: NetworkCoverageResult) -> None:
             async with semaphore:
-                try:
-                    origin_hub = db.get(NetworkCoverageHub, row.origin_hub_id)
-                    dest_hub = db.get(NetworkCoverageHub, row.dest_hub_id)
-                    if origin_hub is None or dest_hub is None:
-                        # Hub was soft-deleted (or never existed) between
-                        # the original run and the verify sweep — same
-                        # surface as the click-verify endpoint's 404 path
-                        # but persisted so the matrix UI can render it
-                        # rather than the operator hitting a stale state.
-                        row.external_source = external_verify._SOURCE_OEBB_HAFAS
-                        row.external_error = "hub_missing"
-                        row.external_verified_at = datetime.now(UTC)
-                        counters["error"] += 1
-                        counters["verified"] += 1
-                        return
-                    verdict = await external_verify.verify_via_oebb_hafas(
-                        from_lat=origin_hub.lat,
-                        from_lon=origin_hub.lon,
-                        to_lat=dest_hub.lat,
-                        to_lon=dest_hub.lon,
-                        depart_at=run.depart_at,
-                        client=client,
-                    )
-                    row.external_source = verdict.source
-                    row.external_ok = verdict.ok
-                    row.external_num_connections = verdict.num_connections
-                    row.external_best_duration_seconds = verdict.best_duration_seconds
-                    row.external_best_transfers = verdict.best_transfers
-                    row.external_error = verdict.error
-                    row.external_verified_at = datetime.now(UTC)
-                    # PR-196a — score the (VIATOR, ÖBB) overlap + persist
-                    # itineraries / score / tier for the heatmap. Errored
-                    # verdicts get an empty ÖBB side ("we couldn't ask")
-                    # which the scorer maps to no_service / one_sided
-                    # based on whether VIATOR returned anything.
-                    viator_trips = _fetch_viator_trips_for_search(
-                        db, row.journey_search_id, run.depart_at
-                    )
-                    _persist_alignment_on_row(row, viator_trips, verdict.itineraries)
-                    counters["verified"] += 1
-                    if verdict.error is not None:
-                        counters["error"] += 1
-                    elif verdict.ok:
-                        counters["ok"] += 1
-                    else:
-                        counters["no_route"] += 1
-                except Exception:
-                    # Broad-except mirrors the recorder-write-failure
-                    # escape valve elsewhere in this file — one bad
-                    # cell never aborts the run. The exception is
-                    # captured + persisted so operators can see WHICH
-                    # cell broke and why in the matrix UI.
-                    log.exception(
-                        "PR-E external verify failed for cell %s->%s in run %s",
-                        row.origin_hub_id,
-                        row.dest_hub_id,
-                        run.id,
-                    )
-                    row.external_source = external_verify._SOURCE_OEBB_HAFAS
-                    row.external_error = "sweep_exception"
-                    row.external_verified_at = datetime.now(UTC)
-                    counters["error"] += 1
-                    counters["verified"] += 1
+                if writer is not None and writer.stopped:
+                    return
+                asked = await _verify_cell(
+                    db=db, run=run, row=row, client=client, counters=counters
+                )
+                if writer is not None:
+                    writer.cell_checked(row)
+                if not asked:
+                    return
                 # Throttle inside the slot so concurrent slots don't
                 # burst-saturate HAFAS at startup. Effective rate
                 # ≈ parallelism / sleep_seconds = 2 / 0.5 = 4 req/s
@@ -2116,6 +2116,81 @@ async def _run_external_verify_sweep(
         await asyncio.gather(*(_verify_one(r) for r in rows), return_exceptions=False)
 
     return counters
+
+
+async def _verify_cell(
+    *,
+    db: DbSession,
+    run: NetworkCoverageRun,
+    row: NetworkCoverageResult,
+    client: httpx.AsyncClient,
+    counters: dict[str, int],
+) -> bool:
+    """One cell of the sweep: ask ÖBB, put the answer (or the error) on
+    the row, count it. False when ÖBB was not asked (a hub is gone), so
+    the caller skips the throttle sleep, as before."""
+    try:
+        origin_hub = db.get(NetworkCoverageHub, row.origin_hub_id)
+        dest_hub = db.get(NetworkCoverageHub, row.dest_hub_id)
+        if origin_hub is None or dest_hub is None:
+            # Hub was soft-deleted (or never existed) between
+            # the original run and the verify sweep — same
+            # surface as the click-verify endpoint's 404 path
+            # but persisted so the matrix UI can render it
+            # rather than the operator hitting a stale state.
+            row.external_source = external_verify._SOURCE_OEBB_HAFAS
+            row.external_error = "hub_missing"
+            row.external_verified_at = datetime.now(UTC)
+            counters["error"] += 1
+            counters["verified"] += 1
+            return False
+        verdict = await external_verify.verify_via_oebb_hafas(
+            from_lat=origin_hub.lat,
+            from_lon=origin_hub.lon,
+            to_lat=dest_hub.lat,
+            to_lon=dest_hub.lon,
+            depart_at=run.depart_at,
+            client=client,
+        )
+        row.external_source = verdict.source
+        row.external_ok = verdict.ok
+        row.external_num_connections = verdict.num_connections
+        row.external_best_duration_seconds = verdict.best_duration_seconds
+        row.external_best_transfers = verdict.best_transfers
+        row.external_error = verdict.error
+        row.external_verified_at = datetime.now(UTC)
+        # PR-196a — score the (VIATOR, ÖBB) overlap + persist
+        # itineraries / score / tier for the heatmap. Errored
+        # verdicts get an empty ÖBB side ("we couldn't ask")
+        # which the scorer maps to no_service / one_sided
+        # based on whether VIATOR returned anything.
+        viator_trips = _fetch_viator_trips_for_search(db, row.journey_search_id, run.depart_at)
+        _persist_alignment_on_row(row, viator_trips, verdict.itineraries)
+        counters["verified"] += 1
+        if verdict.error is not None:
+            counters["error"] += 1
+        elif verdict.ok:
+            counters["ok"] += 1
+        else:
+            counters["no_route"] += 1
+    except Exception:
+        # Broad-except mirrors the recorder-write-failure
+        # escape valve elsewhere in this file — one bad
+        # cell never aborts the run. The exception is
+        # captured + persisted so operators can see WHICH
+        # cell broke and why in the matrix UI.
+        log.exception(
+            "PR-E external verify failed for cell %s->%s in run %s",
+            row.origin_hub_id,
+            row.dest_hub_id,
+            run.id,
+        )
+        row.external_source = external_verify._SOURCE_OEBB_HAFAS
+        row.external_error = "sweep_exception"
+        row.external_verified_at = datetime.now(UTC)
+        counters["error"] += 1
+        counters["verified"] += 1
+    return True
 
 
 # 2026-07-01 eu19 incident: a MOTIS/OTP session that flips unhealthy
