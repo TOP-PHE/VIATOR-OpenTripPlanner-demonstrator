@@ -179,7 +179,8 @@ def test_answers_and_progress_are_visible_while_the_check_runs(
     assert seen["status"] == "running"
     assert seen["finished"] is None  # the completion has not committed
     assert (seen["total"], seen["done"], seen["at_start"]) == (PAIRS, SAVED_AT_HOLD, 0)
-    assert seen["started"] and seen["progressed"]
+    assert seen["started"]
+    assert seen["progressed"]
     assert seen["answered"] == SAVED_AT_HOLD  # visible to another session mid-check
     assert seen["display"] == "verifying"
     _assert_completed_with_every_answer(run_id, at_start=0)

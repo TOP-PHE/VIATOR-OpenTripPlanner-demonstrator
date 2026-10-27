@@ -1151,7 +1151,8 @@ function buildVerifyProgressLine(run) {
     text = `ÖBB check paused at ${verifyCountText(run)}: it goes on with the cells left once the worker is back.`;
   } else if (run.status === 'completed') {
     const took = fmtRunDuration(run.verify_elapsed_seconds);
-    text = `ÖBB check: ${run.verify_total} cells${took === null ? '' : ` in ${took}`}.`;
+    const tookText = took === null ? '' : ' in ' + took;
+    text = `ÖBB check: ${run.verify_total} cells${tookText}.`;
   } else {
     text = `ÖBB check stopped at ${verifyCountText(run)}.`;
   }
@@ -2070,8 +2071,9 @@ function renderModalControls(dir) {
   const noPill = dir.external_verified_at
     ? 'No alignment data recorded for this cell.'
     : 'Not compared with ÖBB yet: ÖBB was not asked about this cell.';
+  const noPillHtml = '<span class="hint" style="font-style:italic">' + noPill + '</span>';
   return `<div class="cov-modal-controls">
-    ${pill || `<span class="hint" style="font-style:italic">${noPill}</span>`}
+    ${pill || noPillHtml}
     <label title="Display-only — does NOT recompute the alignment score (which stays canonical from the sweep).">
       <input type="checkbox" data-action="modal-show-walks" id="modal-show-walks" ${checked}>
       Show walk legs
