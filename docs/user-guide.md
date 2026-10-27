@@ -153,6 +153,12 @@ Rows are origins, columns are destinations. Each cell is one station pair.
 Click any cell for the detail modal: the itineraries VIATOR found, the reference planner's
 itineraries beside them, and the agreement score.
 
+The stops of ÖBB's itineraries are named by the station module: for each stop, the station that
+ÖBB's own stop number is linked to there, so you can set it against the station VIATOR's engine
+names on the left. Hover a stop to see ÖBB's number and its own name, the module's station and its
+MERITS code. A stop marked **⚠** keeps ÖBB's own name: no station of the module carries that
+number (a bus stop, often).
+
 In the modal, **"Show walk legs"** toggles the access/egress walking segments. With it off, the
 card headers recompute to show the *train's* own departure, arrival and duration — which is
 usually what you want when comparing against another planner, because the two will resolve

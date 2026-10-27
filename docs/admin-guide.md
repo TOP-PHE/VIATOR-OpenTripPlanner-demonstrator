@@ -4440,6 +4440,42 @@ provider's slot.
   "module unavailable" and builds its graphs as before. Nothing else
   changes on the server: no migration, no new setting.
 
+### 11.6 The ÖBB stops of the coverage cell modal, named by the module
+
+The ÖBB column of a coverage cell lists ÖBB HAFAS's itineraries. Each stop
+there is ÖBB's own stop number (HAFAS's `extId`: 8100042 for Bischofshofen,
+8100173 for Graz Hbf, 8000105 for Frankfurt(Main)Hbf; a bus stop has its own,
+904050) with ÖBB's own name. To check the station mapping against the stations
+VIATOR's engine names in the left column, the modal asks the module which
+station each number is linked to and shows that station's name:
+
+- `POST /api/admin/network-coverage/oebb-stops/resolve` with `{"codes": [...]}`
+  (at most 40 numbers, in the body), then one call of the module per number not
+  answered in the last 6 hours: `POST /internal/v1/stops/resolve {"series",
+  "code"}`. Each number is **one call on your module limits**; the stations seen
+  on most cells (Wien, München, Frankfurt) are answered from VIATOR's cache.
+  The first refusal (the limit, the module unreachable) stops the rest: those
+  stops keep ÖBB's own name.
+- The series is the setting **`COVERAGE_OEBB_STOP_SERIES`** (Admin →
+  Configuration → Network coverage matrix), `DELFI_stop_key` by default. The
+  module files ÖBB's stop numbers there: they are EVA numbers, which the
+  German DELFI feed uses as its stop keys, and the module's links tie them to
+  ÖBB's stations through ÖBB's GeoNetz. ÖBB's own NAP feed does not carry
+  them: it files its stops under their NeTEx ids (series `OeBB_NAP_stop_key`,
+  `at:45:52099`), which ÖBB HAFAS never returns. Change the setting if the
+  module ever files the EVA numbers under another series (empty = no series).
+- What the modal shows: the module's station name (underlined dotted), and on
+  hover ÖBB's number and name, the module's station, its MERITS code and how
+  it matched (`code`, or a link with its tier). **⚠** after ÖBB's own name =
+  no station of the module carries that number in that series. A module
+  station whose MERITS code differs from the hub's or from VIATOR's is a
+  mapping to look at (Graz Hbf: the module's MERITS code is 8103171, while
+  ÖBB HAFAS gives `U×8103172` for its station).
+
+Nothing is written: no migration. The worker log has no line for it; the web
+log has `station_module.resolve_failed reason=<word>` when a call fails (never
+a number).
+
 ---
 
 ## Index of related guides

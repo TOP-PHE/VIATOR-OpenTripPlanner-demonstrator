@@ -22,6 +22,13 @@ inside the network like VIATOR's calls to MOTIS):
   counts as one call on the person's limits. An `Outcome` too. Used by the
   coverage hubs' confirm and check routes (app/api/admin/network_coverage.py),
   never by the typeahead.
+- `resolve_code_outcome(series, code, user_id)` — `POST
+  /internal/v1/stops/resolve {"series", "code"}`, at most ten served stations
+  that carry a code in a code series (its design 20.8), one per MERITS code,
+  with how each matched. One call on the person's limits; a failure never
+  starts the pause. Used by the coverage cell modal to name the station an
+  ÖBB HAFAS stop number is linked to
+  (`POST /api/admin/network-coverage/oebb-stops/resolve`).
 - `countries()` — `GET /internal/v1/countries`, the countries of the
   module's served stations, kept 60 s; None on any failure. Read by the
   country gate of a session's providers (app/api/admin/sessions.py), only
@@ -135,6 +142,7 @@ log = logging.getLogger(__name__)
 SEARCH_PATH = "/internal/v1/stations/search"
 LOOKUP_PATH = "/internal/v1/stations/lookup"
 NEAR_PATH = "/internal/v1/stations/near"
+RESOLVE_PATH = "/internal/v1/stops/resolve"
 ATTRIBUTION_PATH = "/internal/v1/attribution"
 USER_HEADER = "X-Viator-User-Id"
 
@@ -1039,6 +1047,106 @@ async def near_outcome(
         return _near_rows(_json_body(await _post(NEAR_PATH, body, user_id)), radius_m)
 
     return await _without_pause("station_module.near_failed", call)
+
+
+# A resolve's series and code: 1 to 100 characters each (the module's
+# `ResolveBody`, its design 20.8), neither holding a NUL nor a surrogate.
+RESOLVE_TEXT_MAX = 100
+# How a resolve row matched: by a code of the station, or by a link of a feed's stop.
+_MATCHED_BY = frozenset({"code", "link"})
+# A link's tier word (`T0_code`, `T2_probable`): kept when short and plain.
+_TIER_MAX = 40
+
+
+def resolve_text_refused(value: str) -> str | None:
+    """Why the module's resolve would refuse `value` as a series or a code, as
+    one word, or None: the module's rule mirrored (a surrogate, a NUL, which no
+    PostgreSQL text holds, and a length outside 1 to 100 characters)."""
+    if any(unicodedata.category(character) == "Cs" for character in value):
+        return "surrogate"
+    if "\x00" in value:
+        return "control character"
+    if not 1 <= len(value) <= RESOLVE_TEXT_MAX:
+        return "length"
+    return None
+
+
+def _resolve_row(item: Any) -> dict[str, Any] | None:
+    """One match of a resolve answer, or None when it is not a usable row: the
+    name, the position, the country and the MERITS code (null for a station
+    without one) as a search row has them, plus how it matched (`matched_by`:
+    `code` or `link`), and for a link whether it is asserted and its tier
+    (None when absent or malformed)."""
+    if not isinstance(item, dict):
+        return None
+    name = item.get("name")
+    latitude = item.get("latitude")
+    longitude = item.get("longitude")
+    country = item.get("country_iso")
+    uic = item.get("uic")
+    if not isinstance(name, str) or not name or not _plain(name):
+        return None
+    if not (_is_number(latitude) and _is_number(longitude)):
+        return None
+    if not _text_or_null(country):
+        return None
+    if uic is not None and (not isinstance(uic, str) or not _plain(uic)):
+        return None
+    matched_by = item.get("matched_by")
+    asserted = item.get("asserted")
+    tier = item.get("tier")
+    plain_tier = isinstance(tier, str) and 0 < len(tier) <= _TIER_MAX and _plain(tier)
+    return {
+        "name": name,
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "country_iso": country,
+        "uic": uic,
+        "matched_by": matched_by if matched_by in _MATCHED_BY else None,
+        "asserted": asserted if isinstance(asserted, bool) else None,
+        "tier": tier if plain_tier else None,
+    }
+
+
+def _resolve_rows(payload: Any) -> list[dict[str, Any]]:
+    """The usable rows of a resolve answer (`{"matches": [...]}`), at most ten;
+    a wrong top-level shape refuses the whole answer."""
+    matches = payload.get("matches") if isinstance(payload, dict) else None
+    if not isinstance(matches, list):
+        raise _Failure("shape", pause=False)
+    rows: list[dict[str, Any]] = []
+    for item in matches:
+        row = _resolve_row(item)
+        if row is not None:
+            rows.append(row)
+        if len(rows) >= MAX_ROWS:
+            break
+    return rows
+
+
+async def resolve_code_outcome(series: str | None, code: str, user_id: uuid.UUID) -> Outcome:
+    """The module's served stations that carry `code` in the code series
+    `series` (in no series when None), on behalf of the VIATOR user `user_id`,
+    as an `Outcome`: `POST /internal/v1/stops/resolve {"series", "code"}` (its
+    design 20.8), at most ten rows, one per MERITS code, the best first; no row
+    when no served station carries it. One call on the person's limits.
+
+    Used by the coverage cell modal to say which station an ÖBB HAFAS stop
+    number is linked to (`COVERAGE_OEBB_STOP_SERIES`). A series or code the
+    module would refuse (`resolve_text_refused`) raises ValueError before any
+    call. **A failure never starts the pause**, as for the lookup: an admin
+    page's call must not switch every user's typeahead to the fallback.
+    Failures are logged as `station_module.resolve_failed reason=<word>`, never
+    the series or the code."""
+    for value in (code,) if series is None else (series, code):
+        if not isinstance(value, str) or resolve_text_refused(value) is not None:
+            raise ValueError("a series or a code the module's resolve refuses")
+    body = {"series": series, "code": code}
+
+    async def call() -> list[dict[str, Any]]:
+        return _resolve_rows(_json_body(await _post(RESOLVE_PATH, body, user_id)))
+
+    return await _without_pause("station_module.resolve_failed", call)
 
 
 def _short_text(value: Any) -> str:
