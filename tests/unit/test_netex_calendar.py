@@ -255,7 +255,7 @@ def test_build_uses_a_cached_converted_copy(
     path = worker._motis_timetable_path("eu19", src, motis_root, notes)
     assert path == "/graphs/motis/eu19/_netex/si-nap.zip"
     assert notes == [
-        "netex calendar: si-nap.zip converted for MOTIS "
+        "netex for MOTIS: si-nap.zip rewritten "
         "(4 day-type assignments rewritten as 3 UicOperatingPeriod)"
     ]
     calls: list[Path] = []
@@ -297,7 +297,7 @@ def test_build_falls_back_to_the_original_on_a_conversion_error(
         worker._motis_timetable_path("eu19", src, motis_root, notes)
         == "/inbox/eu19/netex/si-nap.zip"
     )
-    assert notes == ["netex calendar: si-nap.zip conversion failed, original used"]
+    assert notes == ["netex for MOTIS: si-nap.zip not rewritten (failed), original used"]
 
 
 def test_pruning_old_builds_keeps_the_conversion_cache(

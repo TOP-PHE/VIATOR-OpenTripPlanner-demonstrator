@@ -24,14 +24,20 @@ day type, inside each `ServiceCalendarFrame`. Everything else in the file is
 streamed through byte for byte. Feeds already in the Swiss model are left
 alone (`convert_zip` returns None).
 
+The same pass repairs the forms MOTIS drops a whole file for: a course that
+skips points of its pattern, a Line defined in another file, a dangling
+ParentSiteRef (app/netex_motis_repair.py; ÖBB, 2026-10-28).
+
 Only the MOTIS build uses the converted copy (`worker.run_build_motis`); the
 inbox keeps the published file, which OTP reads as it is.
 """
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -43,8 +49,10 @@ from xml.sax.saxutils import quoteattr
 from defusedxml.ElementTree import ParseError
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from . import netex_motis_repair
+
 # Bumped whenever the output changes, so cached conversions are redone.
-CONVERTER_VERSION = 3
+CONVERTER_VERSION = 4
 
 _CHUNK = 8 * 1024 * 1024
 _FRAME_START_RE = re.compile(rb"<(?:([A-Za-z_][\w.-]*):)?ServiceCalendarFrame\b")
@@ -77,13 +85,19 @@ class FrameStats:
 @dataclass
 class ConvertStats:
     frames: list[FrameStats] = field(default_factory=list)
+    repairs: netex_motis_repair.RepairStats = field(default_factory=netex_motis_repair.RepairStats)
 
     def summary(self) -> str:
-        dt = sum(f.day_types for f in self.frames)
-        a = sum(f.assignments_in for f in self.frames)
-        u = sum(f.unresolved for f in self.frames)
-        text = f"{a} day-type assignments rewritten as {dt} UicOperatingPeriod"
-        return text + (f" ({u} unresolved, ignored)" if u else "")
+        parts = []
+        if self.frames:
+            dt = sum(f.day_types for f in self.frames)
+            a = sum(f.assignments_in for f in self.frames)
+            u = sum(f.unresolved for f in self.frames)
+            text = f"{a} day-type assignments rewritten as {dt} UicOperatingPeriod"
+            parts.append(text + (f" ({u} unresolved, ignored)" if u else ""))
+        if repaired := self.repairs.summary():
+            parts.append(repaired)
+        return "; ".join(parts)
 
 
 # ─────────────────────────── calendar model ───────────────────────────
@@ -344,20 +358,92 @@ def _rewrite_stream(src: IO[bytes], dst: IO[bytes], stats: ConvertStats) -> bool
 
 
 def convert_zip(src: Path, dest: Path) -> ConvertStats | None:
-    """Write a converted copy of the NeTEx zip `src` to `dest`. Returns None —
-    and leaves `dest` absent — when no calendar needed converting."""
+    """Write a converted copy of the NeTEx zip `src` to `dest`: calendars
+    rewritten, and the forms MOTIS drops a whole file for repaired
+    (app/netex_motis_repair.py). Returns None — and leaves `dest` absent —
+    when nothing needed either.
+
+    One pass. An XML member up to `netex_motis_repair.MAX_MEMBER_BYTES` is read
+    whole and repaired; a larger one, or any member of a zip with base files,
+    is streamed with its calendar rewritten only. A member that names a Line
+    it does not define waits in a temporary folder until every member has been
+    seen, then is repaired with the Line copied from its file."""
     stats = ConvertStats()
     tmp = dest.with_name(dest.name + ".part")
     changed = False
-    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+    with (
+        zipfile.ZipFile(src) as zin,
+        zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout,
+        tempfile.TemporaryDirectory(dir=dest.parent) as held_dir,
+    ):
+        repairable = not netex_motis_repair.has_base_files(zin.namelist())
+        homes: dict[bytes, str] = {}  # Line id -> the member defining it
+        held: list[tuple[zipfile.ZipInfo, Path]] = []
         for info in zin.infolist():
-            with zin.open(info) as fin, zout.open(info.filename, "w", force_zip64=True) as fout:
-                if info.filename.lower().endswith(".xml"):
-                    changed |= _rewrite_stream(fin, fout, stats)
-                else:
-                    shutil.copyfileobj(fin, fout, _CHUNK)
+            is_xml = info.filename.lower().endswith(".xml")
+            if not (
+                repairable and is_xml and info.file_size <= netex_motis_repair.MAX_MEMBER_BYTES
+            ):
+                stats.repairs.too_large += int(repairable and is_xml)
+                changed |= _stream_member(zin, zout, info, stats)
+                continue
+            data = zin.read(info)
+            for line_id in netex_motis_repair.line_ids(data):
+                homes.setdefault(line_id, info.filename)
+            if netex_motis_repair.missing_lines(data):
+                path = Path(held_dir) / str(len(held))
+                path.write_bytes(data)
+                held.append((info, path))
+                continue
+            changed |= _write_member(zout, info, data, None, stats)
+        lines = _line_source(zin, homes)
+        for info, path in held:
+            changed |= _write_member(zout, info, path.read_bytes(), lines, stats)
     if not changed:
         tmp.unlink(missing_ok=True)
         return None
     tmp.replace(dest)
     return stats
+
+
+def _stream_member(
+    zin: zipfile.ZipFile, zout: zipfile.ZipFile, info: zipfile.ZipInfo, stats: ConvertStats
+) -> bool:
+    """Copy a member as it streams, an XML one with its calendars rewritten;
+    True if anything changed."""
+    with zin.open(info) as fin, zout.open(info.filename, "w", force_zip64=True) as fout:
+        if info.filename.lower().endswith(".xml"):
+            return _rewrite_stream(fin, fout, stats)
+        shutil.copyfileobj(fin, fout, _CHUNK)
+        return False
+
+
+def _write_member(
+    zout: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    data: bytes,
+    lines: netex_motis_repair.LineSource | None,
+    stats: ConvertStats,
+) -> bool:
+    """Repair `data`, rewrite its calendars, write it; True if anything changed."""
+    repaired = netex_motis_repair.repair(data, lines, stats.repairs)
+    with zout.open(info.filename, "w", force_zip64=True) as fout:
+        rewritten = _rewrite_stream(io.BytesIO(repaired), fout, stats)
+    return rewritten or repaired is not data
+
+
+def _line_source(zin: zipfile.ZipFile, homes: dict[bytes, str]) -> netex_motis_repair.LineSource:
+    """A Line and what it names, read from the member that defines it."""
+    cache: dict[str, bytes] = {}
+
+    def source(line_id: bytes) -> netex_motis_repair.LineCopy | None:
+        name = homes.get(line_id)
+        if name is None:
+            return None
+        if name not in cache:
+            if len(cache) >= 8:
+                cache.pop(next(iter(cache)))
+            cache[name] = zin.read(name)
+        return netex_motis_repair.line_copy(cache[name], line_id)
+
+    return source

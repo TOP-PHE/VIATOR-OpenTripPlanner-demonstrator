@@ -2485,8 +2485,26 @@ Since this change:
   (FrameDefaults/DefaultLocale/TimeZone)** for such a file, at its next
   download.
 
-So: give every NeTEx provider a **Country**, then rebuild. To read MOTIS's
-errors of the live build by hand:
+So: give every NeTEx provider a **Country**, then rebuild.
+
+**Then, the same day: most ÖBB trains were still missing.** With its zone,
+MOTIS read ÖBB's stations but still dropped **247 of its 431 line files**, for
+three forms valid in NeTEx that MOTIS (2.11.2, and 2.11.4 too) does not read:
+
+| MOTIS error in `logs/tt.txt` | Cause in the file | What the build copy now does |
+|---|---|---|
+| `utl::zip container size mismatch 7 vs 8` | a course has no passing time for some points of its pattern (it runs through them) | gives the course a pattern of its own with only its points; drops a course it cannot read (passing times out of order, fewer than two), with the meetings that name it, instead of the whole file |
+| `"…" key "…" not found` | a pattern names a `Line` defined in another file of the zip | copies the Line in, with its operator, authority and category |
+| `ankerl::unordered_dense::map::at(): key not found` | a station's `ParentSiteRef` names a site the file does not define | removes that reference |
+
+The end of the rebuild log says what was rewritten, for example
+`[viator] netex for MOTIS: obb.zip rewritten (… courses given one of …
+patterns without the points they skip, … lines copied from another file, …
+dangling ParentSiteRef removed)`. The inbox keeps ÖBB's file as published
+(OTP reads it as it is). A feed in SBB's layout (shared "base" files) is never
+rewritten this way.
+
+To read MOTIS's errors of the live build by hand:
 
 ```bash
 docker compose -p viator exec worker sh -c 'grep ERROR /data/graphs/motis/<sid>/current/logs/tt.txt | sort | uniq -c | sort -rn | head'
