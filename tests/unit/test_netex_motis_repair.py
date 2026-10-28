@@ -67,13 +67,24 @@ def _doc(
     sites: str = "",
     meetings: str = "",
     points: int = 4,
+    route_view: str | None = None,
+    service_extra: str = "",
+    calendar: str | None = None,
 ) -> bytes:
+    view = (
+        f'<RouteView><LineRef ref="{line_ref}"/></RouteView>' if route_view is None else route_view
+    )
+    frame = (
+        ""
+        if calendar is None
+        else f"<ServiceCalendarFrame id='scf'>{calendar}</ServiceCalendarFrame>"
+    )
     return (
         f'<?xml version="1.0" encoding="UTF-8"?><PublicationDelivery xmlns="{NETEX}" version="1.10">'
         "<dataObjects><CompositeFrame id='c'><frames>"
-        f"{resources}"
-        f"<ServiceFrame id='sf'><lines>{lines}</lines><journeyPatterns>"
-        f'<ServiceJourneyPattern id="P1" version="1"><RouteView><LineRef ref="{line_ref}"/></RouteView>'
+        f"{resources}{frame}"
+        f"<ServiceFrame id='sf'>{service_extra}<lines>{lines}</lines><journeyPatterns>"
+        f'<ServiceJourneyPattern id="P1" version="1">{view}'
         f"<pointsInSequence>{_points('P1', points)}</pointsInSequence></ServiceJourneyPattern>"
         "</journeyPatterns></ServiceFrame>"
         f"<SiteFrame id='st'><stopPlaces>{sites}</stopPlaces></SiteFrame>"
@@ -125,7 +136,29 @@ def _motis_problems(data: bytes) -> list[str]:
         problems += [
             f"{tag} {r.get('ref')}" for r in root.iter(NS + tag) if r.get("ref") not in defined
         ]
+    # A stay-seated meeting's condition is read from the ServiceCalendarFrame only.
+    readable = {
+        ac.get("id")
+        for frame in root.iter(NS + "ServiceCalendarFrame")
+        for vc in frame.findall(NS + "validityConditions")
+        for ac in vc.findall(NS + "AvailabilityCondition")
+    }
+    problems += [
+        f"condition {r.get('ref')}"
+        for m in root.iter(NS + "JourneyMeeting")
+        for r in m.iter(NS + "AvailabilityConditionRef")
+        if r.get("ref") not in readable
+    ]
     return problems
+
+
+def _lineless_patterns(data: bytes) -> list[str]:
+    """Patterns MOTIS would give its empty default line (shown as a tram)."""
+    return [
+        p.get("id")
+        for p in fromstring(data).iter(NS + "ServiceJourneyPattern")
+        if p.find(f"{NS}RouteView/{NS}LineRef") is None
+    ]
 
 
 def _course_pattern(data: bytes, jid: str) -> str | None:
@@ -288,6 +321,132 @@ def test_line_copy_of_an_unknown_line_is_none() -> None:
 def test_base_files_are_recognised_as_motis_does() -> None:
     assert rp.has_base_files(["PROD_NETEX_TT_1_1_SCHWEIZ_SITE.xml", "line.xml"])
     assert not rp.has_base_files(["NX-PI_01_at_obb_LINE_obb_EU_PI_STOP_OFFER_20261022.xml"])
+
+
+# ── AvailabilityConditions outside the ServiceCalendarFrame ─────────
+
+
+def _condition(ident: str, bits: bool = True) -> str:
+    days = "<ValidDayBits>0110</ValidDayBits>" if bits else ""
+    return (
+        f'<AvailabilityCondition id="{ident}" version="any">'
+        f"<FromDate>2025-12-14T00:00:00</FromDate>{days}</AvailabilityCondition>"
+    )
+
+
+def _meeting(ident: str, condition: str) -> str:
+    return (
+        f'<JourneyMeeting id="{ident}"><validityConditions>'
+        f'<AvailabilityConditionRef ref="{condition}"/></validityConditions>'
+        '<FromJourneyRef ref="J"/><ToJourneyRef ref="J"/><StaySeated>true</StaySeated>'
+        "</JourneyMeeting>"
+    )
+
+
+def test_conditions_in_the_service_frame_are_copied_into_the_calendar_frame() -> None:
+    """ÖBB, 2026-10-28: 1 116 conditions under ServiceFrame/validityConditions,
+    named by stay-seated meetings; MOTIS 2.11.2 dropped 44 files on them."""
+    data = _doc(
+        courses=_course("J", "P1", [1, 2, 3, 4]),
+        service_extra="<validityConditions>"
+        + _condition("AC1")
+        + _condition("AC-no-bits", bits=False)
+        + _condition("AC-known")
+        + "</validityConditions>",
+        calendar="<validityConditions>" + _condition("AC-known") + "</validityConditions>",
+        meetings=_meeting("M1", "AC1"),
+    )
+    assert _motis_problems(data) == ["condition AC1"]
+    stats = rp.RepairStats()
+    out = rp.repair(data, None, stats)
+    assert _motis_problems(out) == []
+    assert stats.conditions_copied == 1  # neither the one without days nor the known one
+    assert out.count(b'id="AC-known"') == 2
+    assert out.count(b'id="AC-no-bits"') == 1
+    assert "1 validity conditions copied into the ServiceCalendarFrame" in stats.summary()
+
+
+def test_conditions_are_left_alone_without_a_calendar_frame() -> None:
+    data = _doc(
+        courses=_course("J", "P1", [1, 2, 3, 4]),
+        service_extra="<validityConditions>" + _condition("AC1") + "</validityConditions>",
+    )
+    stats = rp.RepairStats()
+    assert rp.repair(data, None, stats) is data
+    assert stats.conditions_copied == 0
+
+
+# ── a pattern without RouteView/LineRef ─────────────────────────────
+
+
+def _course_on_line(jid: str, line: str) -> str:
+    return _course(jid, "P1", [1, 2, 3, 4]).replace(
+        "<ServiceJourneyPatternRef", f'<LineRef ref="{line}"/><ServiceJourneyPatternRef'
+    )
+
+
+@pytest.mark.parametrize(
+    "view",
+    ["", "<RouteView/>", "<RouteView><Name>x</Name></RouteView>"],
+    ids=["no RouteView", "empty RouteView", "RouteView without LineRef"],
+)
+def test_a_pattern_gets_the_line_its_courses_name(view: str) -> None:
+    """ÖBB, 2026-10-28: every train came out as a tram with no name, its
+    patterns naming no line (MOTIS's default line has route type 0)."""
+    lines = LINE_L1 + LINE_L1.replace('"L1"', '"L2"')
+    courses = (
+        _course_on_line("J1", "L2") + _course_on_line("J2", "L2") + _course_on_line("J3", "L1")
+    )
+    data = _doc(route_view=view, lines=lines, courses=courses)
+    assert _lineless_patterns(data) == ["P1"]
+    stats = rp.RepairStats()
+    out = rp.repair(data, None, stats)
+    assert _lineless_patterns(out) == []
+    root = fromstring(out)
+    pattern = next(root.iter(NS + "ServiceJourneyPattern"))
+    assert pattern.find(f"{NS}RouteView/{NS}LineRef").get("ref") == "L2"  # most courses
+    assert _motis_problems(out) == []
+    assert stats.lines_given == 1
+    assert "1 patterns given their line" in stats.summary()
+
+
+def test_a_pattern_gets_its_routes_line_first() -> None:
+    lines = LINE_L1 + LINE_L1.replace('"L1"', '"L2"')
+    route = '<routes><Route id="R1"><LineRef ref="L2"/></Route></routes>'
+    data = _doc(
+        route_view='<RouteRef ref="R1"/>',
+        lines=lines,
+        service_extra=route,
+        courses=_course_on_line("J1", "L1"),
+    )
+    out = rp.repair(data, None, rp.RepairStats())
+    pattern = next(fromstring(out).iter(NS + "ServiceJourneyPattern"))
+    assert pattern.find(f"{NS}RouteView/{NS}LineRef").get("ref") == "L2"
+
+
+def test_a_pattern_gets_the_files_only_line_last() -> None:
+    data = _doc(route_view="", courses=_course("J", "P1", [1, 2, 3, 4]))
+    out = rp.repair(data, None, rp.RepairStats())
+    assert _lineless_patterns(out) == []
+
+
+def test_a_pattern_with_no_clue_is_counted() -> None:
+    lines = LINE_L1 + LINE_L1.replace('"L1"', '"L2"')
+    data = _doc(route_view="", lines=lines, courses=_course("J", "P1", [1, 2, 3, 4]))
+    stats = rp.RepairStats()
+    assert rp.repair(data, None, stats) is data
+    assert stats.patterns_without_line == 1
+    assert stats.summary() == "1 patterns with no line"
+
+
+def test_a_derived_pattern_keeps_the_line_given() -> None:
+    data = _doc(route_view="", courses=_course("J", "P1", [1, 2, 4]))
+    stats = rp.RepairStats()
+    out = rp.repair(data, None, stats)
+    assert _lineless_patterns(out) == []
+    assert _course_pattern(out, "J") == "P1-viator-1"
+    assert stats.lines_given == 1
+    assert stats.journeys_refitted == 1
 
 
 # ── the build copy (netex_calendar.convert_zip) ────────────────────
