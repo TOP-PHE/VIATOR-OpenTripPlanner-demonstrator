@@ -80,7 +80,8 @@ class Rule:
 # commit. `nigiri:N` = line N there. Each element is a valid NeTEx form
 # (NeTEx-CEN XSD v2.0) that the loader does not read, or reads in a way that
 # can drop the whole file: any unresolved reference throws, and the file is
-# discarded with one `ERROR:` line on stderr (nigiri:1249).
+# discarded with one `ERROR:` line (nigiri:1249), which MOTIS writes to the build's
+# logs/tt.txt, not its console (app/motis_timezones.py brings it to the rebuild log).
 RULES: tuple[Rule, ...] = (
     Rule(
         "OperatingDayRef",
@@ -183,6 +184,15 @@ def _ratio_rules(el: dict[str, int]) -> list[tuple[str, str]]:
                     "file or a declared base file (nigiri:88-106, 1278), file may be dropped",
                 )
             )
+    if el.get("ServiceJourney") and not el.get("TimeZone") and not el.get("SummerTimeZoneOffset"):
+        out.append(
+            (
+                WARN,
+                "no time zone (FrameDefaults/DefaultLocale/TimeZone): MOTIS drops every file "
+                "without one (nigiri get_intermediate) unless the feed has a default_timezone, "
+                "which the build sets from the provider's country",
+            )
+        )
     if el.get("Line") and not el.get("additionalOperators"):
         out.append(
             (
