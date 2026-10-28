@@ -36,7 +36,8 @@ SI_HEAD = (
     b"<ParticipantRef>NAP</ParticipantRef>"
 )
 SBB_BODY = (
-    b"<dataObjects><CompositeFrame><frames><TimetableFrame><vehicleJourneys>"
+    b"<dataObjects><CompositeFrame><FrameDefaults><DefaultLocale><TimeZone>Europe/Zurich"
+    b"</TimeZone></DefaultLocale></FrameDefaults><frames><TimetableFrame><vehicleJourneys>"
     b'<ServiceJourney id="j1"><validityConditions><AvailabilityConditionRef ref="n1"/>'
     b"</validityConditions></ServiceJourney></vehicleJourneys></TimetableFrame>"
     b"<ServiceCalendarFrame><validityConditions>"
@@ -163,15 +164,17 @@ def test_new_and_vanished_elements_since_the_last_download_are_warned() -> None:
 
 
 def test_a_header_change_is_warned() -> None:
-    before = _fp({"ServiceJourney": 1, "UicOperatingPeriod": 1}).to_state()
-    now = _fp({"ServiceJourney": 1, "UicOperatingPeriod": 1}, version="2.0:EU_PI-1.0")
+    before = _fp({"ServiceJourney": 1, "UicOperatingPeriod": 1, "TimeZone": 1}).to_state()
+    now = _fp(
+        {"ServiceJourney": 1, "UicOperatingPeriod": 1, "TimeZone": 1}, version="2.0:EU_PI-1.0"
+    )
     result = assess(now, before)
     assert result.messages == ["header version changed: 1.10 → 2.0:EU_PI-1.0"]
 
 
 def test_an_older_fingerprint_format_is_not_compared() -> None:
     before = {**_fp({"calls": 1}).to_state(), "version": 0}
-    result = assess(_fp({"ServiceJourney": 1, "UicOperatingPeriod": 1}), before)
+    result = assess(_fp({"ServiceJourney": 1, "UicOperatingPeriod": 1, "TimeZone": 1}), before)
     assert result.level == "ok"
 
 
@@ -268,7 +271,7 @@ def test_the_page_shows_structure_findings() -> None:
 
 
 def _messages(elements: dict[str, int], prefixes: dict[str, int] | None = None) -> list[str]:
-    base = {"ServiceJourney": 1, "UicOperatingPeriod": 1, "DayTypeAssignment": 1}
+    base = {"ServiceJourney": 1, "UicOperatingPeriod": 1, "DayTypeAssignment": 1, "TimeZone": 1}
     fp = _fp({**base, **elements})
     fp.prefixes = prefixes or {}
     return assess(fp, None).messages
@@ -294,6 +297,23 @@ def test_references_without_their_target_in_the_file_are_flagged() -> None:
     assert any(m.startswith("lines without additionalOperators") for m in msgs)
     ok = _messages({"TrainNumberRef": 4, "TrainNumber": 4, "OperatorRef": 2, "Operator": 1})
     assert not any("TrainNumber" in m or "Operator" in m for m in ok)
+
+
+def test_courses_without_a_time_zone_are_flagged() -> None:
+    """ÖBB's NAP file (2026-10-28) declares no zone in any file: MOTIS drops
+    each one unless its feed has a default_timezone."""
+    no_zone = assess(_fp({"ServiceJourney": 3, "UicOperatingPeriod": 1}), None)
+    assert no_zone.level == WARN
+    assert any(
+        m.startswith("no time zone (FrameDefaults/DefaultLocale/TimeZone)")
+        for m in no_zone.messages
+    )
+    assert not any("no time zone" in m for m in _messages({}))
+    # nigiri reads SummerTimeZoneOffset=2 as CET, with no TimeZone.
+    summer = _fp({"ServiceJourney": 3, "UicOperatingPeriod": 1, "SummerTimeZoneOffset": 1})
+    assert not any("no time zone" in m for m in assess(summer, None).messages)
+    # No course, no time-zone line: the red "no ServiceJourney" says it all.
+    assert not any("no time zone" in m for m in assess(_fp({"StopPlace": 2}), None).messages)
 
 
 def test_product_categories_outside_a_value_set_are_flagged() -> None:

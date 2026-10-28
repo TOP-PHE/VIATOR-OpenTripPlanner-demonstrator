@@ -2457,6 +2457,48 @@ About 300–600 cells in 10 minutes is the normal pace. A *progress write
 failed* warning (the database briefly away) loses nothing: those answers go
 with the next write, and the final commit writes every answer anyway.
 
+### 6.22 A NeTEx feed's trains are missing from a MOTIS graph: no time zone
+
+Symptom (28 Oct, eu19): no ÖBB train inside Austria (Graz Hbf → Salzburg Hbf
+found only the ÖBB trains DB's German file carries), although the rebuild
+succeeded and ÖBB's file was in the inbox and in MOTIS's `config.yml`.
+
+Cause: MOTIS takes a NeTEx file's time zone from its
+`FrameDefaults/DefaultLocale/TimeZone`, else from the feed's
+`default_timezone` in `config.yml`. With neither it **drops the whole file**.
+ÖBB's NAP file declares no zone in any of its 432 files, so MOTIS kept no ÖBB
+stop. MOTIS writes that error (`ERROR:  not found in timezone database` in
+2.11.2) to **`logs/tt.txt` in the build folder**, never to its console, so the
+rebuild log did not show it.
+
+Since this change:
+
+- The build gives every NeTEx feed **its provider's country zone** (Country on
+  the provider card: AT → Europe/Vienna). A file that declares its own zone
+  keeps it. GTFS feeds are left alone: their zone is mandatory.
+- The **end of the rebuild log** gives one line per NeTEx feed
+  (`[viator] motis time zone: obb.zip → Europe/Vienna, …`, or `… gets no default
+  (its provider declares no country)`), then MOTIS's errors:
+  `[viator] motis import errors (logs/tt.txt): N` and the most frequent
+  messages. After a rebuild, *no such line* means MOTIS dropped nothing.
+- The Feed status panel's structure check warns **no time zone
+  (FrameDefaults/DefaultLocale/TimeZone)** for such a file, at its next
+  download.
+
+So: give every NeTEx provider a **Country**, then rebuild. To read MOTIS's
+errors of the live build by hand:
+
+```bash
+docker compose -p viator exec worker sh -c 'grep ERROR /data/graphs/motis/<sid>/current/logs/tt.txt | sort | uniq -c | sort -rn | head'
+```
+
+To check whether a feed is in the graph, list the stops MOTIS holds around a
+station, per feed (the dataset name is the inbox file's name, `obb`):
+
+```bash
+docker compose -p viator exec web python3 -c "import json,urllib.request; s=json.load(urllib.request.urlopen('http://motis-<sid>:8080/api/v6/map/stops?min=47.067,15.410&max=47.077,15.424')); print(sorted({x['stopId'].split('_')[0] for x in s}))"
+```
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

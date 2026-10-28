@@ -38,7 +38,9 @@ from . import (
     country_gate,
     engine_versions,
     graph_snapshots,
+    ingestion,
     memory_caps,
+    motis_timezones,
     netex_calendar,
     station_builds,
     station_extract_upload,
@@ -1692,6 +1694,15 @@ def run_build_motis(
                 "",
             )
         _strip_tiles_block(config_yml)
+        # A NeTEx file declaring no time zone is dropped whole by MOTIS unless
+        # its dataset has a default_timezone (app/motis_timezones.py).
+        try:
+            tz_notes = motis_timezones.set_default_timezones(
+                config_yml, _motis_dataset_timezones(sid)
+            )
+        except Exception as exc:  # never fail the build over this
+            log.warning("MOTIS time zones not written for %s (%s)", sid, type(exc).__name__)
+            tz_notes = [f"motis time zone: not written ({type(exc).__name__})"]
 
         # `/motis import --data <dir>` reads <dir>/config.yml and writes
         # preprocessed data flat into <dir>. Without `--data` it defaults to
@@ -1736,6 +1747,15 @@ def run_build_motis(
             + (import_proc.stdout or "")
             + _STDERR_SEP
             + (import_proc.stderr or "")
+            # Last, so that `tick()`, which keeps the output's last 32 000
+            # characters in the job log, keeps them:
+            # MOTIS writes its loader errors to logs/tt.txt, never to stdout.
+            + "\n"
+            + "".join(
+                f"[viator] {line}\n"
+                for line in tz_notes
+                + motis_timezones.import_error_lines(staging / "logs" / "tt.txt")
+            )
         )
 
         if import_proc.returncode != 0:
@@ -1801,6 +1821,20 @@ def _discard_failed_build(build_dir: Path) -> None:
 
 _NETEX_CACHE_DIR = "_netex"
 _BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def _motis_dataset_timezones(session_id: str) -> dict[str, str]:
+    """`{inbox file name: zone}` of the session's NeTEx providers with a
+    country (`motis_timezones.dataset_timezones`). Never fails the build: a
+    database or config error gives none, the behaviour before."""
+    try:
+        with SessionLocal() as db:
+            row = db.get(SessionRow, session_id)
+            config = dict(row.config) if row is not None and row.config else {}
+        return motis_timezones.dataset_timezones(ingestion.normalize_providers(config))
+    except Exception as exc:
+        log.warning("MOTIS dataset time zones not read for %s (%s)", session_id, type(exc).__name__)
+        return {}
 
 
 def _motis_timetable_files(inbox_root: Path) -> list[Path]:

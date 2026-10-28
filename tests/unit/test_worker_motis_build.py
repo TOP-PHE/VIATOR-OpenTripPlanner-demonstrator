@@ -15,10 +15,20 @@ docker socket is never touched.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app import worker
+
+_DATASET_TIMEZONES = worker._motis_dataset_timezones
+
+
+@pytest.fixture(autouse=True)
+def _no_session_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The build reads the session's providers for their time zones; these
+    tests have no database."""
+    monkeypatch.setattr(worker, "_motis_dataset_timezones", lambda _sid: {})
 
 
 def test_strip_tiles_block_removes_top_level_section(tmp_path: Path):
@@ -550,3 +560,138 @@ def test_discard_never_removes_the_current_build(tmp_path: Path):
     (tmp_path / "current").symlink_to(live.name, target_is_directory=True)
     worker._discard_failed_build(live)
     assert live.is_dir()
+
+
+# ── time zones of NeTEx feeds, MOTIS's import errors (app/motis_timezones.py) ──
+
+
+def _netex_build_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, import_exit: int = 0
+) -> tuple[str, dict[str, str]]:
+    """A session with ÖBB's NeTEx file; the fake import records the config it
+    was given and writes MOTIS's loader log (logs/tt.txt), as 2.11.2 does."""
+    inbox = tmp_path / "inbox"
+    graphs = tmp_path / "graphs"
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "inbox_dir", inbox)
+    monkeypatch.setattr(settings, "graph_dir", graphs)
+    sid = "eu19-transit-motis"
+    (inbox / sid / "osm").mkdir(parents=True)
+    (inbox / sid / "osm" / "osm.pbf").write_bytes(b"dummy")
+    (inbox / sid / "netex").mkdir(parents=True)
+    (inbox / sid / "netex" / "obb.zip").write_bytes(b"dummy")
+    monkeypatch.setattr(worker.netex_calendar, "convert_zip", lambda _src, _dest: None)
+    seen: dict[str, str] = {}
+
+    class _Proc:
+        stdout = "ok"
+        stderr = ""
+
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def _fake_run(cmd, **_kwargs):
+        for i, arg in enumerate(cmd):
+            if arg == "-w" and i + 1 < len(cmd):
+                _, _, rel = cmd[i + 1].partition("/graphs/")
+                staging = graphs / rel
+                if "config" in cmd:
+                    staging.joinpath("config.yml").write_text(
+                        "timetable:\n  datasets:\n    obb:\n"
+                        f"      path: /inbox/{sid}/netex/obb.zip\n"
+                        "      extend_calendar: false\n"
+                    )
+                    return _Proc(0)
+                seen["config"] = staging.joinpath("config.yml").read_text()
+                (staging / "logs").mkdir()
+                (staging / "logs" / "tt.txt").write_text(
+                    "ERROR:  not found in timezone database\n" * 2
+                )
+                staging.joinpath("tt.bin").write_bytes(b"dummy")
+                return _Proc(import_exit)
+        return _Proc(0)
+
+    monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    return sid, seen
+
+
+def test_the_import_reads_each_netex_feed_with_its_countrys_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """2026-10-28: ÖBB's files declare no time zone and MOTIS dropped all of
+    them; the build now gives the feed its provider's country zone."""
+    sid, seen = _netex_build_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        worker, "_motis_dataset_timezones", lambda _sid: {"obb.zip": "Europe/Vienna"}
+    )
+
+    log, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok, log
+    assert (
+        f"      path: /inbox/{sid}/netex/obb.zip\n      default_timezone: Europe/Vienna\n"
+        in seen["config"]
+    )
+    tail = log.splitlines()[-4:]
+    assert tail[0].startswith("[viator] motis time zone: obb.zip → Europe/Vienna")
+    assert tail[1] == "[viator] motis import errors (logs/tt.txt): 2"
+    assert tail[2] == "[viator]         2  not found in timezone database"
+    assert tail[3].startswith("[viator]   a NeTEx file declares no time zone")
+
+
+def test_a_failed_import_still_shows_motis_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    sid, _seen = _netex_build_setup(tmp_path, monkeypatch, import_exit=1)
+    log, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok is False
+    assert "[viator] motis import errors (logs/tt.txt): 2\n" in log
+    assert "[viator] motis time zone: obb.zip gets no default" in log
+    assert log.rstrip().endswith("[viator] motis import failed: exit 1")
+
+
+def test_a_time_zone_failure_never_stops_the_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    sid, seen = _netex_build_setup(tmp_path, monkeypatch)
+
+    def _boom(_cfg, _zones):
+        raise OSError("disk")
+
+    monkeypatch.setattr(worker.motis_timezones, "set_default_timezones", _boom)
+    log, ok, _ = worker.run_build_motis(session_id=sid)
+    assert ok, log
+    assert "default_timezone" not in seen["config"]
+    assert "[viator] motis time zone: not written (OSError)" in log
+
+
+class _FakeDb:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+    def get(self, _model, _sid):
+        return self._row
+
+
+def test_the_zones_come_from_the_sessions_providers(monkeypatch: pytest.MonkeyPatch):
+    def _url_provider(pid: str, country: str, fmt: str) -> dict:
+        timetable = {"format": fmt, "source": "url", "url": f"https://x/{pid}.zip"}
+        return {"id": pid, "country_iso": country, "timetable": timetable}
+
+    providers = [_url_provider("OBB", "AT", "netex_epip"), _url_provider("SNCF", "FR", "gtfs")]
+    row = SimpleNamespace(config={"sources": {"providers": providers}})
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: _FakeDb(row))
+    assert _DATASET_TIMEZONES("eu19-transit-motis") == {"obb.zip": "Europe/Vienna"}
+    monkeypatch.setattr(worker, "SessionLocal", lambda: _FakeDb(None))
+    assert _DATASET_TIMEZONES("gone") == {}
+
+
+def test_a_database_error_gives_no_zones(monkeypatch: pytest.MonkeyPatch):
+    def _down():
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(worker, "SessionLocal", _down)
+    assert _DATASET_TIMEZONES("eu19-transit-motis") == {}

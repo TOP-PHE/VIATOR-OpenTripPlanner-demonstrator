@@ -1487,6 +1487,16 @@ silently create an empty host directory and MOTIS would see no data. `--user` ma
 worker's uid/gid, not root — root-owned `config.yml` made `_strip_tiles_block` crash with
 `PermissionError`.
 
+Between the two steps `motis_timezones.set_default_timezones` also writes a `default_timezone`
+into the `config.yml` block of every NeTEx dataset whose provider declares a country (`country_iso`
+→ `COUNTRY_TIMEZONES`). MOTIS takes a NeTEx file's zone from `FrameDefaults/DefaultLocale/TimeZone`,
+else from that key, and with neither **drops the whole file**: ÖBB's NAP file declares none, and
+on 2026-10-28 eu19 held no ÖBB stop. **Trap: MOTIS writes its loader errors to
+`<build>/logs/tt.txt`, never to its console**, so the import's stdout/stderr never show a dropped
+file. `motis_timezones.import_error_lines` adds their count and most frequent messages at the
+**end** of the build output (the job log keeps only its last 32 000 characters), with the zone
+notes.
+
 **Promotion.** On success the graph moves to `graphs/<sid>/<timestamp>/`, `current` is
 repointed, and `_prune_old_graphs(keep=3)` runs. Promote (`POST /api/sessions/<sid>/promote`)
 sets `serving`, calls `regenerate`, and touches `/data/generated/.reload-trigger`. The worker's

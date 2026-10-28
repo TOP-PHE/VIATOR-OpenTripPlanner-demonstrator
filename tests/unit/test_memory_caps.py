@@ -236,6 +236,7 @@ def _run_motis_build(
         return _Proc()
 
     monkeypatch.setattr(worker.subprocess, "run", _fake_run)
+    monkeypatch.setattr(worker, "_motis_dataset_timezones", lambda _sid: {})  # no database
     log, ok, _path = worker.run_build_motis(session_id=sid)
     assert ok, log
     return log, seen
