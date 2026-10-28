@@ -82,7 +82,7 @@ COUNTRY_TIMEZONES: dict[str, str] = {
 
 _NETEX_DIRS = frozenset({"netex", "_netex"})
 # A dataset's `path:` line as `motis config` writes it (6 spaces, unquoted).
-_PATH_LINE_RE = re.compile(r"""^(?P<indent>[ ]+)path:[ ]*["']?(?P<path>[^"'\s]+)["']?[ ]*$""")
+_PATH_LINE_RE = re.compile(r"""^(?P<indent> +)path: *["']?(?P<path>[^"'\s]+)["']? *$""")
 _TZ_KEY = "default_timezone:"
 
 # MOTIS's message for a file without a time zone (2.11.2, then later nigiri).
@@ -125,6 +125,32 @@ def _netex_file(path: str) -> str | None:
     return None
 
 
+def _block_line(line: str, block_indent: int | None) -> tuple[bool, int | None]:
+    """Whether `line` is kept, and the indent of the dataset block it leaves
+    open. `block_indent` is the keys' indent of the dataset whose zone was
+    just written, None outside one: there an older `default_timezone:` line is
+    dropped, and a line less indented ends the block."""
+    if block_indent is None:
+        return True, None
+    body = line.lstrip(" ")
+    indent = len(line) - len(body)
+    if body.strip() and indent < block_indent:
+        return True, None
+    return not (indent == block_indent and body.startswith(_TZ_KEY)), block_indent
+
+
+def _zone_note(name: str, zone: str | None) -> str:
+    if zone is None:
+        return (
+            f"motis time zone: {name} gets no default (its provider declares no "
+            "country): a file of it without a time zone of its own is dropped"
+        )
+    return (
+        f"motis time zone: {name} → {zone}, for its files that declare none "
+        "(from the provider's country)"
+    )
+
+
 def set_default_timezones(config_yml: Path, zones: dict[str, str]) -> list[str]:
     """Write `default_timezone` into the config.yml block of each NeTEx
     dataset, and return one log note per NeTEx dataset.
@@ -137,32 +163,19 @@ def set_default_timezones(config_yml: Path, zones: dict[str, str]) -> list[str]:
     notes: list[str] = []
     block_indent: int | None = None
     for line in config_yml.read_text(encoding="utf-8").splitlines(keepends=True):
-        if block_indent is not None:
-            body = line.lstrip(" ")
-            indent = len(line) - len(body)
-            if body.strip() and indent < block_indent:
-                block_indent = None
-            elif indent == block_indent and body.startswith(_TZ_KEY):
-                continue
+        keep, block_indent = _block_line(line, block_indent)
+        if not keep:
+            continue
         out.append(line)
         m = _PATH_LINE_RE.match(line.rstrip("\r\n"))
         name = _netex_file(m.group("path")) if m else None
         if m is None or name is None:
             continue
         zone = zones.get(name)
-        if zone is None:
-            notes.append(
-                f"motis time zone: {name} gets no default (its provider declares no "
-                "country): a file of it without a time zone of its own is dropped"
-            )
-            continue
-        indent_str = m.group("indent")
-        out.append(f"{indent_str}{_TZ_KEY} {zone}\n")
-        block_indent = len(indent_str)
-        notes.append(
-            f"motis time zone: {name} → {zone}, for its files that declare none "
-            "(from the provider's country)"
-        )
+        notes.append(_zone_note(name, zone))
+        if zone is not None:
+            out.append(f"{m.group('indent')}{_TZ_KEY} {zone}\n")
+            block_indent = len(m.group("indent"))
     # `config_yml` is the build's own staging file (see `_strip_tiles_block`):
     # a validated session id and a timestamp. pythonsecurity:S2083 suppressed.
     config_yml.write_text("".join(out), encoding="utf-8")  # NOSONAR
