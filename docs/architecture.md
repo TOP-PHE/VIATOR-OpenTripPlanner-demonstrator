@@ -1503,10 +1503,19 @@ repairs the forms nigiri drops a whole file for, or misreads (`netex_motis_repai
 passing times skip points of its pattern gets a derived pattern; a `LineRef` to another file's
 Line gets the Line copied in; a dangling `ParentSiteRef` is removed; an AvailabilityCondition
 outside the ServiceCalendarFrame is copied into it; a pattern without `RouteView/LineRef` gets its
-line (else MOTIS's empty default line, route type 0, shows every train as a tram). **Traps:** nigiri resolves references
+line (else MOTIS's empty default line, route type 0, shows every train as a tram). In a zip
+without base files, the shared files (no `ServiceJourney`) are renamed `_1_1_SCHWEIZ_<name>`
+when a line file names a DayType only they define (NMBS: `stops.xml`, `common.xml`), so nigiri
+reads them first, as base files. A day type given a `UicOperatingPeriod` *and* single `Date`
+assignments is rewritten like the EPIP forms: nigiri keeps a day type's first assignment only
+(`days.emplace`). A ServiceCalendarFrame over `_FRAME_IN_MEMORY` (64 MiB) is spooled to a temp
+file and read with `iterparse`, each definition freed once used; it applies assignments in file
+order, not sorted by `order` (counted when they disagree). **Traps:** nigiri resolves references
 only within a file or its base files (`SCHWEIZ` + `_1_1_`), so a zip with base files is never
-repaired; a course whose pattern is not in its own file is left alone; dropping a course means
-dropping the journey meetings that name it, or MOTIS aborts the whole import.
+repaired; a base file that fails to parse aborts the whole import (`failed to parse base`), so
+renaming stays tied to a measured dependency; a course whose pattern is not in its own file is
+left alone; dropping a course means dropping the journey meetings that name it, or MOTIS aborts
+the whole import.
 
 **Promotion.** On success the graph moves to `graphs/<sid>/<timestamp>/`, `current` is
 repointed, and `_prune_old_graphs(keep=3)` runs. Promote (`POST /api/sessions/<sid>/promote`)
