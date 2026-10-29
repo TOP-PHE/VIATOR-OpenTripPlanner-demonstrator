@@ -70,12 +70,13 @@ _OTHER_POINT_RE = re.compile(
 _LINE_REF_RE = re.compile(rb"<LineRef\b([^>]*)>")
 _LINES_END = b"</lines>"
 _ORGANISATIONS_END = b"</organisations>"
+_VALUES_END = b"</values>"
 
 # What a Line names, and where its definition goes in a file that lacks it.
 _DEPENDENCIES: dict[bytes, tuple[bytes, bytes]] = {
     b"OperatorRef": (b"Operator", _ORGANISATIONS_END),
     b"AuthorityRef": (b"Authority", _ORGANISATIONS_END),
-    b"TypeOfProductCategoryRef": (b"TypeOfProductCategory", b"</values>"),
+    b"TypeOfProductCategoryRef": (b"TypeOfProductCategory", _VALUES_END),
 }
 
 
@@ -349,20 +350,11 @@ def _drop_dangling_parents(data: bytes, stats: RepairStats) -> bytes:
     if b"<ParentSiteRef" not in data:
         return data
     sites = _ids(data, _SITE_TAGS)
-    dropped = 0
-
-    def keep_or_drop(m: re.Match[bytes]) -> bytes:
-        nonlocal dropped
-        if m.group(2) in sites:
-            return m.group(0)
-        dropped += 1
-        return b""
-
-    out = _PARENT_RE.sub(keep_or_drop, data)
-    if not dropped:
+    dangling = [m for m in _PARENT_RE.finditer(data) if m.group(2) not in sites]
+    if not dangling:
         return data
-    stats.parents_dropped += dropped
-    return out
+    stats.parents_dropped += len(dangling)
+    return _apply(data, [(m.start(), m.end(), b"") for m in dangling])
 
 
 # ─────────────────────────────────── Line ───────────────────────────────────
@@ -371,7 +363,7 @@ def _drop_dangling_parents(data: bytes, stats: RepairStats) -> bytes:
 def _values_end(data: bytes) -> int:
     """Where a product category goes: the end of a ValueSet's `values`."""
     start = data.find(b"<typesOfValue")
-    return data.find(b"</values>", start) if start >= 0 else -1
+    return data.find(_VALUES_END, start) if start >= 0 else -1
 
 
 def _drop_ref(block: bytes, ref_tag: bytes, ident: bytes) -> bytes:
@@ -394,7 +386,7 @@ def _copy_missing_lines(data: bytes, lines: LineSource, stats: RepairStats) -> b
     if not copies:
         return data
     target = _Target(
-        ends={_ORGANISATIONS_END: data.find(_ORGANISATIONS_END), b"</values>": _values_end(data)},
+        ends={_ORGANISATIONS_END: data.find(_ORGANISATIONS_END), _VALUES_END: _values_end(data)},
         have={kind: _ids(data, _start_tags((kind,))) for kind, _end in _DEPENDENCIES.values()},
     )
     for copy in copies:
