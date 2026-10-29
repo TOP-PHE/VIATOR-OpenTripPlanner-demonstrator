@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
+from defusedxml.ElementTree import fromstring
 
 from app import netex_calendar as nc
 
@@ -334,7 +335,7 @@ def test_generated_ids_are_named_after_the_day_type(tmp_path: Path) -> None:
 def test_a_reference_to_a_period_defined_elsewhere_is_not_a_reason_to_rewrite(
     tmp_path: Path,
 ) -> None:
-    """DB, CFL, CIS-CZ and NMBS assign by OperatingPeriodRef to UicOperatingPeriods;
+    """DB, CFL and CIS-CZ assign by OperatingPeriodRef to UicOperatingPeriods;
     when the period sits in another frame or file the frame alone cannot see
     it, and rewriting would empty those day types."""
     split = """<ServiceCalendarFrame id="DE:SCF:2">
@@ -344,3 +345,165 @@ def test_a_reference_to_a_period_defined_elsewhere_is_not_a_reason_to_rewrite(
       </dayTypeAssignments></ServiceCalendarFrame>"""
     stats, _ = _convert(tmp_path, _doc(split))
     assert stats is None
+
+
+# ── NMBS: single dates beside a UicOperatingPeriod (2026-10-29) ─────────
+
+# Each NMBS day type has a period whose ValidDayBits are all 0 (FromDate the
+# UTC instant of local midnight), then one Date assignment per service day.
+# MOTIS keeps a day type's first assignment only: the empty period.
+NMBS = """<ServiceCalendarFrame id="enRoute:ServiceCalendarFrame:1" version="any">
+  <ServiceCalendar id="1" version="any"><FromDate>2025-12-29</FromDate><ToDate>2026-12-12</ToDate></ServiceCalendar>
+  <dayTypes><DayType id="gc:nmbssncb:000000" version="any"/><DayType id="gc:nmbssncb:000001" version="any"/></dayTypes>
+  <operatingPeriods>
+    <UicOperatingPeriod id="gc:nmbssncb:000000" version="any"><FromDate>2025-12-28T23:00:00Z</FromDate>
+      <ToDate>2026-01-03T23:00:00Z</ToDate><ValidDayBits>0000000</ValidDayBits></UicOperatingPeriod>
+    <UicOperatingPeriod id="gc:nmbssncb:000001" version="any"><FromDate>2025-12-28T23:00:00Z</FromDate>
+      <ToDate>2026-01-03T23:00:00Z</ToDate><ValidDayBits>0000001</ValidDayBits></UicOperatingPeriod>
+  </operatingPeriods>
+  <dayTypeAssignments>
+    <DayTypeAssignment id="gc:nmbssncb:000000-1" version="any" order="1">
+      <OperatingPeriodRef ref="gc:nmbssncb:000000"/><DayTypeRef ref="gc:nmbssncb:000000"/></DayTypeAssignment>
+    <DayTypeAssignment id="gc:nmbssncb:000000-2" version="any" order="2">
+      <Date>2025-12-29</Date><DayTypeRef ref="gc:nmbssncb:000000"/><isAvailable>true</isAvailable></DayTypeAssignment>
+    <DayTypeAssignment id="gc:nmbssncb:000000-3" version="any" order="3">
+      <Date>2025-12-31</Date><DayTypeRef ref="gc:nmbssncb:000000"/><isAvailable>true</isAvailable></DayTypeAssignment>
+    <DayTypeAssignment id="gc:nmbssncb:000001-1" version="any" order="1">
+      <OperatingPeriodRef ref="gc:nmbssncb:000001"/><DayTypeRef ref="gc:nmbssncb:000001"/></DayTypeAssignment>
+    <DayTypeAssignment id="gc:nmbssncb:000001-2" version="any" order="2">
+      <Date>2026-01-01</Date><DayTypeRef ref="gc:nmbssncb:000001"/><isAvailable>true</isAvailable></DayTypeAssignment>
+    <DayTypeAssignment id="gc:nmbssncb:000001-3" version="any" order="3">
+      <Date>2026-01-03</Date><DayTypeRef ref="gc:nmbssncb:000001"/><isAvailable>false</isAvailable></DayTypeAssignment>
+  </dayTypeAssignments>
+</ServiceCalendarFrame>"""
+
+SWISS = """<ServiceCalendarFrame id="CH:SCF">
+  <operatingPeriods><UicOperatingPeriod id="CH:UOP:1"><FromDate>2026-10-01T00:00:00</FromDate>
+    <ToDate>2026-10-03T00:00:00</ToDate><ValidDayBits>101</ValidDayBits></UicOperatingPeriod>
+  </operatingPeriods>
+  <dayTypeAssignments><DayTypeAssignment id="CH:DTA:1" order="1">
+    <OperatingPeriodRef ref="CH:UOP:1"/><DayTypeRef ref="CH:DT:1"/></DayTypeAssignment>
+  </dayTypeAssignments></ServiceCalendarFrame>"""
+
+
+def test_dates_beside_an_empty_period_become_valid_day_bits(tmp_path: Path) -> None:
+    stats, out = _convert(tmp_path, _doc(NMBS))
+    assert stats is not None
+    got = {dt: _days(*p) for dt, p in _periods(out.decode()).items()}
+    assert got["gc:nmbssncb:000000"] == {date(2025, 12, 29), date(2025, 12, 31)}
+    # The period's one day (FromDate's date, as MOTIS reads it: 28 Dec + 6),
+    # a date added, then the period's day removed again.
+    assert got["gc:nmbssncb:000001"] == {date(2026, 1, 1)}
+    assert stats.summary() == "6 day-type assignments rewritten as 2 UicOperatingPeriod"
+
+
+def test_dates_beside_a_period_of_another_file_are_left_alone(tmp_path: Path) -> None:
+    split = NMBS.replace(
+        '<OperatingPeriodRef ref="gc:nmbssncb:000001"', '<OperatingPeriodRef ref="elsewhere"'
+    )
+    stats, _ = _convert(tmp_path, _doc(split))
+    assert stats is None
+
+
+# ── a calendar frame too large for memory (NMBS: 1.1 GB) ────────────────
+
+
+@pytest.mark.parametrize("calendar", [CALENDAR, NMBS], ids=["slovenia", "nmbs"])
+def test_a_large_frame_read_from_disk_gives_the_same_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calendar: str
+) -> None:
+    (tmp_path / "whole").mkdir()
+    whole_stats, whole = _convert(tmp_path / "whole", _doc(calendar))
+    monkeypatch.setattr(nc, "_FRAME_IN_MEMORY", 100)
+    monkeypatch.setattr(nc, "_CHUNK", 64)  # the end tag and every searched tag across reads
+    stats, streamed = _convert(tmp_path, _doc(calendar))
+    assert stats is not None
+    assert whole_stats is not None
+    assert streamed == whole
+    assert stats.frames[0].streamed
+    assert stats.summary() == whole_stats.summary() + " (1 large calendar frames read from disk)"
+    assert [p.name for p in (tmp_path / "out").iterdir()] == ["si-nap.zip"]  # no temp left
+
+
+def test_a_large_frame_applies_its_assignments_as_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read as a stream, assignments are applied in file order; an assignment
+    listed after one of a higher `order` for its day type is counted."""
+    cal = """<ServiceCalendarFrame id="X">
+      <operatingDays><OperatingDay id="D1"><CalendarDate>2026-11-02</CalendarDate></OperatingDay></operatingDays>
+      <dayTypeAssignments>
+        <DayTypeAssignment id="A2" order="2"><OperatingDayRef ref="D1"/><DayTypeRef ref="T"/>
+          <isAvailable>false</isAvailable></DayTypeAssignment>
+        <DayTypeAssignment id="A1" order="1"><OperatingDayRef ref="D1"/><DayTypeRef ref="T"/></DayTypeAssignment>
+      </dayTypeAssignments></ServiceCalendarFrame>"""
+    (tmp_path / "whole").mkdir()
+    _, whole = _convert(tmp_path / "whole", _doc(cal))
+    assert _days(*_periods(whole.decode())["T"]) == set()  # by order: added, then removed
+    monkeypatch.setattr(nc, "_FRAME_IN_MEMORY", 100)
+    monkeypatch.setattr(nc, "_CHUNK", 64)  # else the whole frame arrives in one read
+    stats, streamed = _convert(tmp_path, _doc(cal))
+    assert stats is not None
+    assert _days(*_periods(streamed.decode())["T"]) == {date(2026, 11, 2)}
+    assert "1 out of order, applied as listed" in stats.summary()
+
+
+def test_a_large_frame_needing_nothing_is_copied_as_it_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(nc, "_FRAME_IN_MEMORY", 100)
+    body = _doc(SWISS)
+    out = io.BytesIO()
+    assert nc._rewrite_stream(io.BytesIO(body), out, nc.ConvertStats()) is False
+    assert out.getvalue() == body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_doc(CALENDAR.replace("</dayTypes>", "")), _doc().split(b"</ServiceCalendarFrame>")[0]],
+    ids=["malformed", "truncated"],
+)
+def test_a_large_frame_malformed_or_truncated_is_passed_through(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    monkeypatch.setattr(nc, "_FRAME_IN_MEMORY", 100)
+    monkeypatch.setattr(nc, "_CHUNK", 64)
+    out = io.BytesIO()
+    assert nc._rewrite_stream(io.BytesIO(body), out, nc.ConvertStats()) is False
+    assert out.getvalue() == body
+
+
+def test_a_frame_whose_block_cannot_be_found_again_is_not_written() -> None:
+    frame = b"<ServiceCalendarFrame><!-- <dayTypeAssignments> --></ServiceCalendarFrame>"
+    out = io.BytesIO()
+    assert nc._write_converted(io.BytesIO(frame), 0, len(frame), "", nc._Calendar(), out) is False
+    assert out.getvalue() == b""
+
+
+def test_a_self_closing_block_is_replaced() -> None:
+    cal = nc._Calendar()
+    assert cal.define(fromstring('<DayType xmlns="http://www.netex.org.uk/netex" id="T"/>'))
+    frame = b"<ServiceCalendarFrame><dayTypeAssignments/></ServiceCalendarFrame>"
+    out = io.BytesIO()
+    assert nc._write_converted(io.BytesIO(frame), 0, len(frame), "", cal, out)
+    text = out.getvalue().decode()
+    assert "<dayTypeAssignments/>" not in text
+    assert text.startswith("<ServiceCalendarFrame><operatingPeriods><UicOperatingPeriod ")
+    assert text.endswith("</dayTypeAssignments></ServiceCalendarFrame>")
+
+
+def test_day_bits_grow_both_ways_and_ignore_removals_outside() -> None:
+    bits = nc._DayBits()
+    bits.set(10, False)  # nothing to remove yet
+    assert bits.span() is None
+    d = date(2026, 1, 10).toordinal()
+    bits.set(d, True)
+    bits.set(d - 3, True)  # before the first day: grows to the left
+    bits.set(d + 2, True)
+    bits.set(d - 9, False)  # outside: nothing to remove
+    bits.set(d + 9, False)
+    bits.set(d, False)
+    assert bits.span() == (date(2026, 1, 7), "100001")
+
+
+def test_an_order_that_is_not_a_number_sorts_first() -> None:
+    assert nc._order(fromstring('<DayTypeAssignment order="first"/>')) == 0
+    assert nc._order(fromstring('<DayTypeAssignment order="12"/>')) == 12
