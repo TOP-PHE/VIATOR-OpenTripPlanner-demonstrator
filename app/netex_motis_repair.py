@@ -65,8 +65,11 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-# A member larger than this is passed through unrepaired (it is read whole).
-MAX_MEMBER_BYTES = 256 * 1024 * 1024
+# A member larger than this is passed through unrepaired (it is read whole,
+# a few copies of it at a time). 512 MiB covers Slovenia's national file
+# (~495 MB, all its trains a nameless "tram" until repaired) and Trenitalia's
+# (~426 MB); the conversion runs before MOTIS's own import, much larger.
+MAX_MEMBER_BYTES = 512 * 1024 * 1024
 
 _ID_RE = re.compile(rb"""\bid\s*=\s*(["'])(.*?)\1""", re.S)
 _REF_RE = re.compile(rb"""\bref\s*=\s*(["'])(.*?)\1""", re.S)
@@ -370,10 +373,13 @@ def _give_lines_their_operator(
     """MOTIS reads a Line's operator only from `additionalOperators/OperatorRef`,
     never from the Line's own `OperatorRef`, NeTEx's main operator (measured
     2026-10-29: ÖBB, SBB, SI-NAP, Trenitalia, Trenord and Italo name theirs
-    only there; DB and CFL use additionalOperators): such a Line gets an
-    `additionalOperators` naming it. A Line with no operator gets the zip's
-    only Operator (NMBS). Only an Operator MOTIS will find, in the file or in
-    a base file: it drops the whole file on one it cannot resolve."""
+    only there; DB and CFL use additionalOperators). It is the operator of a
+    course that names none itself: ÖBB's (75 % of departures at ÖBB stops
+    had none) and NMBS's; SBB's, SI-NAP's, Trenitalia's and Italo's courses
+    name theirs. Such a Line gets an `additionalOperators` naming it; a Line
+    with no operator gets the zip's only Operator (NMBS). Only an Operator
+    MOTIS will find, in the file or in a base file: it drops the whole file
+    on one it cannot resolve."""
     if _LINE_START not in data:
         return data
     reachable = operator_ids(data) | (operators.reachable if operators else set())
