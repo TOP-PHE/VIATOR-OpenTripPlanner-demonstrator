@@ -61,7 +61,7 @@ from defusedxml.ElementTree import iterparse as _xml_iterparse
 from . import netex_motis_repair
 
 # Bumped whenever the output changes, so cached conversions are redone.
-CONVERTER_VERSION = 5
+CONVERTER_VERSION = 6
 
 _CHUNK = 8 * 1024 * 1024
 # A ServiceCalendarFrame larger than this is converted from a temporary file,
@@ -691,6 +691,9 @@ class _ZipPass:
         self.held: list[_Held] = []
         self.foreign: set[bytes] = set()  # DayTypes line files name but do not define
         self.shared_day_types: set[bytes] = set()  # DayTypes the shared files define
+        self.operators: set[bytes] = set()  # every Operator of the zip
+        self.shared_operators: set[bytes] = set()
+        self.operators_known = True  # False once a member too large was not scanned
 
     def member(self, info: zipfile.ZipInfo) -> None:
         if not info.filename.lower().endswith(".xml"):
@@ -703,26 +706,36 @@ class _ZipPass:
     def _large(self, info: zipfile.ZipInfo) -> None:
         """Too large to read whole: its calendars rewritten as it streams."""
         self.stats.repairs.too_large += 1
-        courses, day_types = _scan_member(self.zin, info)
-        if courses:
+        scan = _scan_member(self.zin, info)
+        if scan is None:  # a line file: streamed, its Operators unknown
+            self.operators_known = False
             self.changed |= _stream_member(self.zin, self.zout, info, self.stats, self.work)
             return
         path = self._path()
         with self.zin.open(info) as fin, path.open("wb") as fout:
             self.changed |= _rewrite_stream(fin, fout, self.stats, self.work)
-        self.shared_day_types |= day_types
+        self.shared_day_types |= scan.day_types
+        self.operators |= scan.operators
+        self.shared_operators |= scan.operators
         self.held.append(_Held(info, path, shared=True, raw=False))
 
     def _whole(self, info: zipfile.ZipInfo) -> None:
         data = self.zin.read(info)
         for line_id in netex_motis_repair.line_ids(data):
             self.homes.setdefault(line_id, info.filename)
+        operators = netex_motis_repair.operator_ids(data)
+        self.operators |= operators
         shared = not netex_motis_repair.has_courses(data)
         if shared:
             self.shared_day_types |= netex_motis_repair.day_type_ids(data)
+            self.shared_operators |= operators
         else:
             self.foreign |= netex_motis_repair.foreign_day_types(data)
-        if shared or netex_motis_repair.missing_lines(data):
+        if (
+            shared
+            or netex_motis_repair.missing_lines(data)
+            or netex_motis_repair.needs_zip_operators(data)
+        ):
             path = self._path()
             path.write_bytes(data)
             self.held.append(_Held(info, path, shared=shared))
@@ -736,6 +749,12 @@ class _ZipPass:
         define (NMBS: every line file's calendar is in common.xml)."""
         lines = _line_source(self.zin, self.homes)
         as_base = bool(self.foreign & self.shared_day_types)
+        operators = netex_motis_repair.OperatorContext(
+            reachable=self.shared_operators if as_base else set(),
+            only=next(iter(self.operators))
+            if self.operators_known and len(self.operators) == 1
+            else None,
+        )
         for held in self.held:
             name = held.info.filename
             if as_base and held.shared:
@@ -746,26 +765,38 @@ class _ZipPass:
                 continue
             with self.zout.open(name, "w", force_zip64=True) as fout:
                 data = held.path.read_bytes()
-                self.changed |= _write_member(fout, data, lines, self.stats, self.work)
+                self.changed |= _write_member(fout, data, lines, self.stats, self.work, operators)
         return self.changed or bool(self.stats.base_files)
 
     def _path(self) -> Path:
         return self.work / f"held-{len(self.held)}"
 
 
-def _scan_member(zin: zipfile.ZipFile, info: zipfile.ZipInfo) -> tuple[bool, set[bytes]]:
-    """(does the member hold a course, the DayTypes it defines), read as a stream."""
-    day_types: set[bytes] = set()
+@dataclass
+class _Scan:
+    """What a shared member too large to read whole defines."""
+
+    day_types: set[bytes] = field(default_factory=set)
+    operators: set[bytes] = field(default_factory=set)
+
+
+def _scan_member(zin: zipfile.ZipFile, info: zipfile.ZipInfo) -> _Scan | None:
+    """The DayTypes and Operators a member defines, read as a stream; None for
+    a member holding a course (a line file)."""
+    scan = _Scan()
     carry = b""
     with zin.open(info) as f:
         while chunk := f.read(_CHUNK):
             buf = carry + chunk
             if netex_motis_repair.has_courses(buf):
-                return True, set()
+                return None
             cut = max(0, len(buf) - _TAIL_KEEP)
-            day_types |= netex_motis_repair.day_type_ids(buf, before=cut)
+            scan.day_types |= netex_motis_repair.day_type_ids(buf, before=cut)
+            scan.operators |= netex_motis_repair.operator_ids(buf, before=cut)
             carry = buf[cut:]
-    return False, day_types | netex_motis_repair.day_type_ids(carry)
+    scan.day_types |= netex_motis_repair.day_type_ids(carry)
+    scan.operators |= netex_motis_repair.operator_ids(carry)
+    return scan
 
 
 def _stream_member(
@@ -790,9 +821,10 @@ def _write_member(
     lines: netex_motis_repair.LineSource | None,
     stats: ConvertStats,
     work: Path,
+    operators: netex_motis_repair.OperatorContext | None = None,
 ) -> bool:
     """Repair `data`, rewrite its calendars, write it; True if anything changed."""
-    repaired = netex_motis_repair.repair(data, lines, stats.repairs)
+    repaired = netex_motis_repair.repair(data, lines, stats.repairs, operators)
     rewritten = _rewrite_stream(io.BytesIO(repaired), fout, stats, work)
     return rewritten or repaired is not data
 

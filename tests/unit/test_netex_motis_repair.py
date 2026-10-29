@@ -53,7 +53,8 @@ RESOURCES = (
     "</values></ValueSet></typesOfValue></ResourceFrame>"
 )
 LINE_L1 = (
-    '<Line id="L1" version="1"><Name>S1</Name><TypeOfProductCategoryRef ref="CAT-S"/>'
+    '<Line id="L1" version="1"><Name>S1</Name><TransportMode>rail</TransportMode>'
+    '<TypeOfProductCategoryRef ref="CAT-S"/>'
     '<additionalOperators><OperatorRef ref="OP1"/></additionalOperators></Line>'
 )
 
@@ -615,7 +616,7 @@ def test_shared_files_keep_their_name_otherwise(tmp_path: Path, members: dict[st
 def test_a_large_shared_file_is_scanned_as_a_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    common, line = _common(extra_day_types=200), _line_file()
+    common, line = _common(extra_day_types=200), _nmbs_line_file()
     assert len(common) > len(line)
     monkeypatch.setattr(rp, "MAX_MEMBER_BYTES", len(line))
     monkeypatch.setattr(nc, "_CHUNK", 64)  # DayType tags across reads
@@ -628,6 +629,8 @@ def test_a_large_shared_file_is_scanned_as_a_stream(
     with zipfile.ZipFile(dest) as z:
         assert sorted(z.namelist()) == ["_1_1_SCHWEIZ_common.xml", "line-1.xml"]
         assert "VIATOR:UicOperatingPeriod:gc:DT1" in z.read("_1_1_SCHWEIZ_common.xml").decode()
+        # The stream scan found the zip's only Operator too.
+        assert b'<OperatorRef ref="nmbssncb"/>' in z.read("line-1.xml")
     assert stats.base_files == ["common.xml"]
     assert stats.repairs.too_large == 1
 
@@ -647,3 +650,129 @@ def test_base_file_names_and_member_kinds() -> None:
     assert rp.foreign_day_types(data) == {b"Z"}
     assert rp.foreign_day_types(b"<x/>") == set()
     assert rp.day_type_ids(b"<x/>") == set()
+    assert rp.operator_ids(b'<Operator id="O1"/><OperatorRef ref="O2"/>') == {b"O1"}
+
+
+# ── a Line's mode and operator, where MOTIS reads them (2026-10-29) ────
+
+
+def _lines(lines: str, resources: str = RESOURCES) -> bytes:
+    return _doc(resources=resources, lines=lines, line_ref="L-IC")
+
+
+def test_a_line_without_mode_gets_rail_or_bus_by_its_name() -> None:
+    """NMBS: no Line has a TransportMode; MOTIS shows them as OTHER (1700)."""
+    data = _lines(
+        '<Line id="L-IC" version="any"><Name>Luxembourg (LU) -- Ottignies</Name>'
+        "<ShortName>IC</ShortName></Line>"
+        '<Line id="L-BUS"><Name>Vervangbus</Name><ShortName>BUS</ShortName></Line>'
+        '<Line id="L-T"><TransportMode>tram</TransportMode></Line><Line id="L-empty"/>',
+        resources="",
+    )
+    stats = rp.RepairStats()
+    out = rp.repair(data, None, stats).decode()
+    assert "<ShortName>IC</ShortName><TransportMode>rail</TransportMode></Line>" in out
+    assert "<ShortName>BUS</ShortName><TransportMode>bus</TransportMode></Line>" in out
+    assert '<Line id="L-T"><TransportMode>tram</TransportMode></Line><Line id="L-empty"/>' in out
+    assert (stats.rail_given, stats.bus_given) == (1, 1)
+    assert "2 lines without a mode given one (1 rail, 1 bus by their name)" in stats.summary()
+
+
+def test_a_lines_own_operator_ref_is_copied_where_motis_reads_it() -> None:
+    """ÖBB, SBB, SI-NAP, Trenitalia, Trenord, Italo: the Line's own OperatorRef,
+    which MOTIS never reads; one it could not resolve is left alone."""
+    data = _lines(
+        '<Line id="L-IC"><TransportMode>rail</TransportMode><OperatorRef ref="OP1"/></Line>'
+        '<Line id="L-X"><TransportMode>rail</TransportMode><OperatorRef ref="OP-elsewhere"/></Line>'
+        '<Line id="L-A"><TransportMode>rail</TransportMode>'
+        '<additionalOperators><OperatorRef ref="OP1"/></additionalOperators></Line>'
+    )
+    assert rp.needs_zip_operators(data)  # L-X's operator is not in the file
+    stats = rp.RepairStats()
+    out = rp.repair(data, None, stats).decode()
+    assert (
+        '<OperatorRef ref="OP1"/><additionalOperators><OperatorRef ref="OP1"/>'
+        "</additionalOperators></Line>"
+    ) in out
+    assert '<OperatorRef ref="OP-elsewhere"/></Line>' in out
+    assert stats.operators_given == 1
+    assert stats.summary() == "1 lines given their operator"
+
+
+def test_a_line_without_operator_gets_the_zips_only_one_it_can_reach() -> None:
+    data = _lines('<Line id="L-IC"><TransportMode>rail</TransportMode></Line>', resources="")
+    assert rp.needs_zip_operators(data)
+    for context, given in (
+        (None, False),
+        (rp.OperatorContext(only=b"nmbssncb"), False),  # in no file MOTIS reads first
+        (rp.OperatorContext(reachable={b"nmbssncb"}, only=b"nmbssncb"), True),
+    ):
+        stats = rp.RepairStats()
+        out = rp.repair(data, None, stats, context)
+        assert (b'<OperatorRef ref="nmbssncb"/>' in out) is given
+        assert stats.operators_given == int(given)
+
+
+def test_needs_zip_operators_only_for_lines_their_file_cannot_serve() -> None:
+    assert not rp.needs_zip_operators(b"<x/>")
+    assert not rp.needs_zip_operators(_doc())  # additionalOperators already
+    own = '<Line id="L-IC"><TransportMode>rail</TransportMode><OperatorRef ref="OP1"/></Line>'
+    assert not rp.needs_zip_operators(_lines(own))
+
+
+def _nmbs_line_file() -> bytes:
+    """NMBS's line file: no ResourceFrame, a Line with neither mode nor operator."""
+    course = _course("J", "P1", [1, 2, 3, 4]).replace(
+        "<ServiceJourneyPatternRef",
+        '<dayTypes><DayTypeRef ref="gc:DT1"/></dayTypes><ServiceJourneyPatternRef',
+    )
+    line = '<Line id="L1" version="any"><Name>Luxembourg (LU) -- Ottignies</Name><ShortName>IC</ShortName></Line>'
+    return _doc(resources="", lines=line, courses=course)
+
+
+def test_nmbs_lines_get_rail_and_the_operator_of_the_shared_file(tmp_path: Path) -> None:
+    src = _zip(tmp_path / "nmbs.zip", {"line-1.xml": _nmbs_line_file(), "common.xml": _common()})
+    dest = tmp_path / "out" / "nmbs.zip"
+    dest.parent.mkdir()
+
+    stats = nc.convert_zip(src, dest)
+    assert stats is not None
+    with zipfile.ZipFile(dest) as z:
+        assert sorted(z.namelist()) == ["_1_1_SCHWEIZ_common.xml", "line-1.xml"]
+        line = z.read("line-1.xml")
+    assert (
+        b"<ShortName>IC</ShortName><TransportMode>rail</TransportMode>"
+        b'<additionalOperators><OperatorRef ref="nmbssncb"/></additionalOperators></Line>'
+    ) in line
+    assert _motis_problems(line) == ["OperatorRef nmbssncb"]  # defined in the base file
+    assert stats.repairs.operators_given == 1
+
+
+def test_no_operator_is_guessed_when_the_zip_has_several(tmp_path: Path) -> None:
+    common = _common().replace(
+        b"<Operator id='nmbssncb'/>", b"<Operator id='a'/><Operator id='b'/>"
+    )
+    src = _zip(tmp_path / "x.zip", {"line-1.xml": _nmbs_line_file(), "common.xml": common})
+    dest = tmp_path / "out" / "x.zip"
+    dest.parent.mkdir()
+    stats = nc.convert_zip(src, dest)
+    assert stats is not None
+    with zipfile.ZipFile(dest) as z:
+        assert b"<additionalOperators" not in z.read("line-1.xml")
+    assert stats.repairs.operators_given == 0
+
+
+def test_no_operator_is_guessed_when_a_line_file_was_too_large_to_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    line, common = _nmbs_line_file(), _common()
+    big = _doc(courses=_course("J", "P1", [1, 2, 3, 4]) * 4)  # its Operators go unseen
+    monkeypatch.setattr(rp, "MAX_MEMBER_BYTES", max(len(line), len(common)))
+    assert len(big) > rp.MAX_MEMBER_BYTES
+    members = {"big.xml": big, "line-1.xml": line, "common.xml": common}
+    dest = tmp_path / "out" / "x.zip"
+    dest.parent.mkdir()
+    stats = nc.convert_zip(_zip(tmp_path / "x.zip", members), dest)
+    assert stats is not None
+    assert stats.repairs.operators_given == 0
+    assert stats.repairs.rail_given == 1

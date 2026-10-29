@@ -2547,6 +2547,26 @@ disk); 2 shared files read as base files (stops.xml, common.xml); …)`.
 **It takes about 10 minutes** for that file. It runs again only when the file
 changes; otherwise the copy is reused.
 
+**Mode and operator, for NMBS and five other feeds.** MOTIS reads a line's
+mode only from its `TransportMode`, and its operator only from
+`additionalOperators/OperatorRef`. Measured on 29 Oct across eu19's NeTEx
+feeds:
+
+| Feed | What MOTIS showed | What the build copy now does |
+|---|---|---|
+| NMBS: no `TransportMode` on any of its 2 182 lines | every train as **OTHER** (route type 1700) | gives the line `rail`, or `bus` when its short name is `BUS` (285 replacement-bus lines) |
+| NMBS: no operator on its lines | no operator name | gives each line the file's only operator (NMBS/SNCB) |
+| ÖBB, SBB, SI-NAP, Trenitalia, Trenord, Italo: the operator named in the line's own `OperatorRef` (NeTEx's main operator field) | no operator name on any train | copies it into `additionalOperators`, where MOTIS reads it |
+
+An operator is added only when MOTIS will find it, in the same file or in a
+base file, because MOTIS drops the whole file on an operator it cannot find.
+Two cases stay as they are, so their trains still have no operator name in
+MOTIS:
+- SBB's file has base files of its own, and such a file is never rewritten.
+- A file over 256 MB inside a feed's zip is not repaired.
+
+NMBS gives no train numbers, so its trains show number 0.
+
 A base file that MOTIS cannot parse **stops the whole import**
 (`failed to parse base` in `logs/tt.txt`, and the rebuild fails, so the graph
 being served stays). That is why a shared file is renamed only when line files
