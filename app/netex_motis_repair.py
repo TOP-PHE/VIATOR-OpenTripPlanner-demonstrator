@@ -113,6 +113,7 @@ _PARENT_RE = re.compile(
 )
 _SITE_TAGS = _start_tags((b"StopPlace", b"Quay"))
 _LINE_TAGS = _start_tags((b"Line",))
+_LINE_START = b"<Line"  # also the start of <LineRef: a cheap first test only
 _COURSE_RE = re.compile(rb"<ServiceJourney[\s/>]")
 _DAY_TYPE_TAGS = _start_tags((b"DayType",))
 _OPERATOR_TAGS = _start_tags((b"Operator",))
@@ -264,7 +265,7 @@ def foreign_day_types(data: bytes) -> set[bytes]:
 
 def line_ids(data: bytes) -> set[bytes]:
     """The ids of the Lines a member defines."""
-    return _ids(data, _LINE_TAGS) if b"<Line" in data else set()
+    return _ids(data, _LINE_TAGS) if _LINE_START in data else set()
 
 
 def missing_lines(data: bytes) -> set[bytes]:
@@ -328,7 +329,7 @@ def _give_lines_their_mode(data: bytes, stats: RepairStats) -> bytes:
     1700, shown as OTHER (NMBS, 2026-10-29: none of its 2 182 Lines has one).
     VIATOR's sessions are rail: rail, or bus for a Line whose ShortName says
     so (NMBS's 285 replacement-bus lines are `BUS`)."""
-    if b"<Line" not in data:
+    if _LINE_START not in data:
         return data
     edits = []
     for m in _LINE_RE.finditer(data):
@@ -350,7 +351,7 @@ def _give_lines_their_mode(data: bytes, stats: RepairStats) -> bytes:
 def needs_zip_operators(data: bytes) -> bool:
     """True when a Line of the member has no operator MOTIS reads and its own
     file cannot give it one: it names none, or one defined elsewhere."""
-    if b"<Line" not in data:
+    if _LINE_START not in data:
         return False
     local = operator_ids(data)
     for m in _LINE_RE.finditer(data):
@@ -373,7 +374,7 @@ def _give_lines_their_operator(
     `additionalOperators` naming it. A Line with no operator gets the zip's
     only Operator (NMBS). Only an Operator MOTIS will find, in the file or in
     a base file: it drops the whole file on one it cannot resolve."""
-    if b"<Line" not in data:
+    if _LINE_START not in data:
         return data
     reachable = operator_ids(data) | (operators.reachable if operators else set())
     only = operators.only if operators else None
