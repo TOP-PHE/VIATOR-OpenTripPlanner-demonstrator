@@ -1740,7 +1740,6 @@ def run_build_motis(
                 if build_mem_limit
                 else ""
             )
-            + "".join(f"[viator] {note}\n" for note in netex_notes)
             + "[viator] motis config OK (tiles block stripped)\n"
             + (config_proc.stdout or "")
             + "\n--- motis import ---\n"
@@ -1748,12 +1747,14 @@ def run_build_motis(
             + _STDERR_SEP
             + (import_proc.stderr or "")
             # Last, so that `tick()`, which keeps the output's last 32 000
-            # characters in the job log, keeps them:
-            # MOTIS writes its loader errors to logs/tt.txt, never to stdout.
+            # characters in the job log, keeps them: what the NeTEx copies
+            # changed, the time zones, then MOTIS's loader errors (written to
+            # logs/tt.txt, never to stdout).
             + "\n"
             + "".join(
                 f"[viator] {line}\n"
-                for line in tz_notes
+                for line in netex_notes
+                + tz_notes
                 + motis_timezones.import_error_lines(staging / "logs" / "tt.txt")
             )
         )
@@ -1882,13 +1883,13 @@ def _motis_timetable_path(sid: str, f: Path, motis_root: Path, notes: list[str])
             cached = marker.read_text(encoding="utf-8")
     except Exception:
         # Never fail the build over this: MOTIS reads the published file.
-        log.exception("NeTEx calendar conversion failed for %s; using the original", f.name)
-        notes.append(f"netex calendar: {f.name} conversion failed, original used")
+        log.exception("NeTEx copy for MOTIS failed for %s; using the original", f.name)
+        notes.append(f"netex for MOTIS: {f.name} not rewritten (failed), original used")
         return original
     if not dest.exists():
         return original
     summary = cached.split("\n", 1)[1] if "\n" in cached else ""
-    notes.append(f"netex calendar: {f.name} converted for MOTIS ({summary})")
+    notes.append(f"netex for MOTIS: {f.name} rewritten ({summary})")
     rel = dest.relative_to(Path(str(settings.graph_dir)))
     return f"/graphs/{rel.as_posix()}"
 
