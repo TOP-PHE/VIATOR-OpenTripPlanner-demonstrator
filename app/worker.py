@@ -28,9 +28,11 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import func, update
 
@@ -38,6 +40,7 @@ from . import (
     country_gate,
     engine_versions,
     graph_snapshots,
+    gtfs_motis_clean,
     ingestion,
     memory_caps,
     motis_timezones,
@@ -1640,8 +1643,9 @@ def run_build_motis(
         # Preserve each file's source subdir (gtfs/ or netex/) in the
         # in-container path so MOTIS auto-detects the right loader per
         # file. f.parent.name is "gtfs" or "netex" from the glob above.
-        # NeTEx calendars MOTIS cannot read are rewritten into a copy under the
-        # graphs volume (app/netex_calendar.py); the inbox keeps the original.
+        # What MOTIS cannot read is rewritten into a copy under the graphs
+        # volume: NeTEx calendars and files (app/netex_calendar.py), padded
+        # GTFS fields (app/gtfs_motis_clean.py); the inbox keeps the original.
         netex_notes: list[str] = []
         in_container_timetables = [
             _motis_timetable_path(sid, f, motis_root, netex_notes) for f in timetable_files
@@ -1824,6 +1828,38 @@ _NETEX_CACHE_DIR = "_netex"
 _BUILD_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
 
 
+class _Summarised(Protocol):
+    def summary(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class _MotisCopy:
+    """How the MOTIS build makes its copy of one timetable format."""
+
+    cache_dir: str  # under graphs/motis/<sid>/, kept by the prune
+    version: int  # part of the cache key: a new version redoes every copy
+    make: Callable[[Path, Path], _Summarised | None]  # (src, dest) -> stats, or None for no copy
+    label: str  # "netex" / "gtfs" in the build log's notes
+
+
+# GTFS and NeTEx slots share a file name (`<id>.zip`): one cache folder each.
+# The converters are looked up at each call (tests replace them).
+_MOTIS_COPIES = {
+    "netex": _MotisCopy(
+        _NETEX_CACHE_DIR,
+        netex_calendar.CONVERTER_VERSION,
+        lambda src, dest: netex_calendar.convert_zip(src, dest),
+        "netex",
+    ),
+    "gtfs": _MotisCopy(
+        "_gtfs",
+        gtfs_motis_clean.CLEANER_VERSION,
+        lambda src, dest: gtfs_motis_clean.clean_zip(src, dest),
+        "gtfs",
+    ),
+}
+
+
 def _motis_dataset_timezones(session_id: str) -> dict[str, str]:
     """`{inbox file name: zone}` of the session's NeTEx providers with a
     country (`motis_timezones.dataset_timezones`). Never fails the build: a
@@ -1860,36 +1896,39 @@ def _motis_timetable_files(inbox_root: Path) -> list[Path]:
 
 
 def _motis_timetable_path(sid: str, f: Path, motis_root: Path, notes: list[str]) -> str:
-    """In-container path MOTIS reads `f` from: the inbox file itself, or for a
-    NeTEx zip whose calendar MOTIS cannot read, a converted copy kept in
-    `graphs/motis/<sid>/_netex/` under the same file name (MOTIS names the
-    dataset after it). The copy is redone only when the source changes."""
+    """In-container path MOTIS reads `f` from: the inbox file itself, or a
+    copy MOTIS can read, kept in `graphs/motis/<sid>/_netex/` or `_gtfs/`
+    under the same file name (MOTIS names the dataset after it): a NeTEx zip
+    with its calendar rewritten and its files repaired (app/netex_calendar.py),
+    a GTFS zip with its padded fields trimmed (app/gtfs_motis_clean.py). The
+    copy is redone only when the source changes."""
     original = f"/inbox/{sid}/{f.parent.name}/{f.name}"
-    if f.parent.name != "netex":
+    copy = _MOTIS_COPIES.get(f.parent.name)
+    if copy is None:
         return original
-    cache = motis_root / _NETEX_CACHE_DIR
+    cache = motis_root / copy.cache_dir
     dest = cache / f.name
     marker = cache / f"{f.name}.source"
-    st = f.stat()
-    key = f"{netex_calendar.CONVERTER_VERSION}:{st.st_size}:{st.st_mtime_ns}"
     try:
+        st = f.stat()
+        key = f"{copy.version}:{st.st_size}:{st.st_mtime_ns}"
         cache.mkdir(parents=True, exist_ok=True)
         cached = marker.read_text(encoding="utf-8") if marker.exists() else None
         if cached is None or cached.split("\n", 1)[0] != key:
             dest.unlink(missing_ok=True)
-            stats = netex_calendar.convert_zip(f, dest)
-            summary = stats.summary() if stats else ""
+            stats = copy.make(f, dest)
+            summary = stats.summary() if stats is not None else ""
             marker.write_text(f"{key}\n{summary}", encoding="utf-8")
             cached = marker.read_text(encoding="utf-8")
     except Exception:
         # Never fail the build over this: MOTIS reads the published file.
-        log.exception("NeTEx copy for MOTIS failed for %s; using the original", f.name)
-        notes.append(f"netex for MOTIS: {f.name} not rewritten (failed), original used")
+        log.exception("%s copy for MOTIS failed for %s; using the original", copy.label, f.name)
+        notes.append(f"{copy.label} for MOTIS: {f.name} not rewritten (failed), original used")
         return original
     if not dest.exists():
         return original
     summary = cached.split("\n", 1)[1] if "\n" in cached else ""
-    notes.append(f"netex for MOTIS: {f.name} rewritten ({summary})")
+    notes.append(f"{copy.label} for MOTIS: {f.name} rewritten ({summary})")
     rel = dest.relative_to(Path(str(settings.graph_dir)))
     return f"/graphs/{rel.as_posix()}"
 

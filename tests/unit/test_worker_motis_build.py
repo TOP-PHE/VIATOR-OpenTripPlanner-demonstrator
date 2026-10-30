@@ -538,7 +538,8 @@ def test_failed_import_removes_its_build_folder(tmp_path: Path, monkeypatch: pyt
     root, sid = _failing_import_setup(tmp_path, monkeypatch)
     _, ok, _ = worker.run_build_motis(session_id=sid)
     assert ok is False
-    assert not [p for p in root.iterdir() if p.name != "current"]
+    # The copy caches (`_netex`, `_gtfs`) are kept on purpose, like the live build.
+    assert not [p for p in root.iterdir() if p.name != "current" and not p.name.startswith("_")]
 
 
 def test_failed_import_keeps_the_live_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -550,7 +551,8 @@ def test_failed_import_keeps_the_live_build(tmp_path: Path, monkeypatch: pytest.
 
     _, ok, _ = worker.run_build_motis(session_id=sid)
     assert ok is False
-    assert sorted(p.name for p in root.iterdir()) == ["20260629-213457", "current"]
+    builds = sorted(p.name for p in root.iterdir() if not p.name.startswith("_"))
+    assert builds == ["20260629-213457", "current"]
     assert (root / "current" / "tt.bin").read_bytes() == b"live"
 
 
