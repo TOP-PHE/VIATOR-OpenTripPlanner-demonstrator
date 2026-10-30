@@ -1510,7 +1510,11 @@ reads them first, as base files. A day type given a `UicOperatingPeriod` *and* s
 assignments is rewritten like the EPIP forms: nigiri keeps a day type's first assignment only
 (`days.emplace`). A ServiceCalendarFrame over `_FRAME_IN_MEMORY` (64 MiB) is spooled to a temp
 file and read with `iterparse`, each definition freed once used; it applies assignments in file
-order, not sorted by `order` (counted when they disagree). **Traps:** nigiri resolves references
+order, not sorted by `order` (counted when they disagree). A Line without `TransportMode` gets
+`rail` (or `bus` by its ShortName), else route type 1700 (OTHER); a Line's own `OperatorRef` is
+copied into `additionalOperators`, the only place nigiri reads a Line's operator, and an
+operator-less Line gets the zip's only Operator, provided nigiri can resolve it (same file or
+base file; a line file needing a base file's Operator is held until the end). **Traps:** nigiri resolves references
 only within a file or its base files (`SCHWEIZ` + `_1_1_`), so a zip with base files is never
 repaired; a base file that fails to parse aborts the whole import (`failed to parse base`), so
 renaming stays tied to a measured dependency; a course whose pattern is not in its own file is

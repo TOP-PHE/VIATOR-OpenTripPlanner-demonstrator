@@ -2547,6 +2547,40 @@ disk); 2 shared files read as base files (stops.xml, common.xml); …)`.
 **It takes about 10 minutes** for that file. It runs again only when the file
 changes; otherwise the copy is reused.
 
+**Mode and operator.** MOTIS reads a line's mode only from its
+`TransportMode`, and a line's operator only from
+`additionalOperators/OperatorRef`. The line's operator is what a train shows
+when the train itself names none. Measured on 29 Oct across eu19's NeTEx
+feeds:
+
+| Feed | What MOTIS showed | What the build copy now does |
+|---|---|---|
+| NMBS: no `TransportMode` on any of its 2 182 lines | every train as **OTHER** (route type 1700) | gives the line `rail`, or `bus` when its short name is `BUS` (285 replacement-bus lines) |
+| NMBS: no operator on its lines or its trains | no operator name | gives each line the file's only operator (NMBS/SNCB) |
+| ÖBB: the operator only in the line's own `OperatorRef` (NeTEx's main operator field), and on few trains | no operator on three quarters of the departures | copies it into `additionalOperators`, where MOTIS reads it |
+
+SBB, SI-NAP, Trenitalia, Trenord and Italo also name the line's operator only
+in its own `OperatorRef`. SBB's, SI-NAP's, Trenitalia's and Italo's trains
+name it too, so they already showed it; the copy fills in the line's for them
+as well.
+
+**Trenord** was missing from eu19 altogether: its zip is one file, and 1 384
+of its 16 911 courses name points that are not in their pattern, so MOTIS
+dropped the whole file (`utl::zip container size mismatch`). The course
+repair of §6.22 drops those 1 384 and keeps the other 15 527.
+
+**Slovenia (SI-NAP)** showed every train as a **tram** with no line name: its
+patterns name no line, as ÖBB's did (§6.22), but its national file (about
+495 MB) was over the size the copy repairs, then 256 MB. Since 29 Oct that
+size is 512 MB, which also covers Trenitalia's file (about 426 MB).
+
+An operator is added only when MOTIS will find it, in the same file or in a
+base file, because MOTIS drops the whole file on an operator it cannot find.
+A file over 512 MB inside a feed's zip is not repaired, and a feed with base
+files of its own (SBB) is never rewritten.
+
+NMBS gives no train numbers, so its trains show number 0.
+
 A base file that MOTIS cannot parse **stops the whole import**
 (`failed to parse base` in `logs/tt.txt`, and the rebuild fails, so the graph
 being served stays). That is why a shared file is renamed only when line files

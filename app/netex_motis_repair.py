@@ -65,8 +65,11 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-# A member larger than this is passed through unrepaired (it is read whole).
-MAX_MEMBER_BYTES = 256 * 1024 * 1024
+# A member larger than this is passed through unrepaired (it is read whole,
+# a few copies of it at a time). 512 MiB covers Slovenia's national file
+# (~495 MB, all its trains a nameless "tram" until repaired) and Trenitalia's
+# (~426 MB); the conversion runs before MOTIS's own import, much larger.
+MAX_MEMBER_BYTES = 512 * 1024 * 1024
 
 _ID_RE = re.compile(rb"""\bid\s*=\s*(["'])(.*?)\1""", re.S)
 _REF_RE = re.compile(rb"""\bref\s*=\s*(["'])(.*?)\1""", re.S)
@@ -113,8 +116,19 @@ _PARENT_RE = re.compile(
 )
 _SITE_TAGS = _start_tags((b"StopPlace", b"Quay"))
 _LINE_TAGS = _start_tags((b"Line",))
+_LINE_START = b"<Line"  # also the start of <LineRef: a cheap first test only
 _COURSE_RE = re.compile(rb"<ServiceJourney[\s/>]")
 _DAY_TYPE_TAGS = _start_tags((b"DayType",))
+_OPERATOR_TAGS = _start_tags((b"Operator",))
+_OPERATOR_REF_RE = re.compile(rb"<OperatorRef\b([^>]*?)(?:/>|>\s*</OperatorRef\s*>)", re.S)
+# What a Line starts with, before its TransportMode in the schema's order.
+_LINE_HEAD_RE = re.compile(
+    rb"\s*(?:<Name\b.*?</Name\s*>\s*)?(?:<ShortName\b.*?</ShortName\s*>\s*)?"
+    rb"(?:<Description\b.*?</Description\s*>\s*)?",
+    re.S,
+)
+_SHORT_NAME_RE = re.compile(rb"<ShortName\b[^>]*>([^<]*)</ShortName")
+_BUS_NAME_RE = re.compile(rb"\s*(?:bus|coach)\b", re.I)
 _DAY_TYPE_REF_RE = re.compile(rb"<DayTypeRef\b([^>]*)>")
 
 # MOTIS reads a file as a base file when its path holds "SCHWEIZ" and "_1_1_".
@@ -145,6 +159,9 @@ class RepairStats:
     conditions_copied: int = 0
     lines_given: int = 0
     patterns_without_line: int = 0
+    rail_given: int = 0  # Lines without TransportMode
+    bus_given: int = 0
+    operators_given: int = 0
     too_large: int = 0
 
     def summary(self) -> str:
@@ -166,6 +183,12 @@ class RepairStats:
                 f"{self.conditions_copied} validity conditions copied into the ServiceCalendarFrame",
             ),
             (self.parents_dropped, f"{self.parents_dropped} dangling ParentSiteRef removed"),
+            (
+                self.rail_given + self.bus_given,
+                f"{self.rail_given + self.bus_given} lines without a mode given one "
+                f"({self.rail_given} rail, {self.bus_given} bus by their name)",
+            ),
+            (self.operators_given, f"{self.operators_given} lines given their operator"),
             (self.too_large, f"{self.too_large} files too large to repair"),
         ]
         return ", ".join(text for count, text in parts if count)
@@ -181,6 +204,16 @@ class LineCopy:
 
 
 LineSource = Callable[[bytes], "LineCopy | None"]
+
+
+@dataclass
+class OperatorContext:
+    """What a member's Lines may name as their operator besides the file's
+    own Operators: those of the zip's base files (visible to every file), and
+    the zip's only Operator when it defines exactly one."""
+
+    reachable: set[bytes] = field(default_factory=set)
+    only: bytes | None = None
 
 
 def has_base_files(names: list[str]) -> bool:
@@ -206,12 +239,21 @@ def has_courses(data: bytes) -> bool:
 def day_type_ids(data: bytes, before: int | None = None) -> set[bytes]:
     """The ids of the DayTypes a member (or a chunk of one) defines; with
     `before`, of those whose tag starts before that offset."""
-    if b"<DayType" not in data:
+    return _defined(data, b"<DayType", _DAY_TYPE_TAGS, before)
+
+
+def operator_ids(data: bytes, before: int | None = None) -> set[bytes]:
+    """The ids of the Operators a member (or a chunk of one) defines."""
+    return _defined(data, b"<Operator", _OPERATOR_TAGS, before)
+
+
+def _defined(data: bytes, needle: bytes, tags: re.Pattern[bytes], before: int | None) -> set[bytes]:
+    if needle not in data:
         return set()
     limit = len(data) if before is None else before
     return {
         v
-        for m in _DAY_TYPE_TAGS.finditer(data)
+        for m in tags.finditer(data)
         if m.start() < limit and (v := _value(_ID_RE, m.group(1))) is not None
     }
 
@@ -226,7 +268,7 @@ def foreign_day_types(data: bytes) -> set[bytes]:
 
 def line_ids(data: bytes) -> set[bytes]:
     """The ids of the Lines a member defines."""
-    return _ids(data, _LINE_TAGS) if b"<Line" in data else set()
+    return _ids(data, _LINE_TAGS) if _LINE_START in data else set()
 
 
 def missing_lines(data: bytes) -> set[bytes]:
@@ -260,8 +302,14 @@ def _definition(data: bytes, kind: bytes, ident: bytes) -> bytes | None:
     return None
 
 
-def repair(data: bytes, lines: LineSource | None, stats: RepairStats) -> bytes:
-    """`data` repaired, or `data` itself when nothing needed it."""
+def repair(
+    data: bytes,
+    lines: LineSource | None,
+    stats: RepairStats,
+    operators: OperatorContext | None = None,
+) -> bytes:
+    """`data` repaired, or `data` itself when nothing needed it. Without
+    `operators`, a Line gets an operator only from its own file."""
     own_lines = line_ids(data)
     out = _drop_dangling_parents(data, stats)
     if lines is not None:
@@ -269,9 +317,89 @@ def repair(data: bytes, lines: LineSource | None, stats: RepairStats) -> bytes:
     out = _copy_conditions(out, stats)
     out = _give_patterns_their_line(out, own_lines, stats)
     out = _refit_courses(out, stats)
+    out = _give_lines_their_mode(out, stats)
+    out = _give_lines_their_operator(out, operators, stats)
     if out is not data:
         stats.members += 1
     return out
+
+
+# ─────────────────────────── a Line's mode and operator ───────────────────────────
+
+
+def _give_lines_their_mode(data: bytes, stats: RepairStats) -> bytes:
+    """A Line without `TransportMode` gets one: MOTIS gives it route type
+    1700, shown as OTHER (NMBS, 2026-10-29: none of its 2 182 Lines has one).
+    VIATOR's sessions are rail: rail, or bus for a Line whose ShortName says
+    so (NMBS's 285 replacement-bus lines are `BUS`)."""
+    if _LINE_START not in data:
+        return data
+    edits = []
+    for m in _LINE_RE.finditer(data):
+        body = m.group("body")
+        if body is None or b"<TransportMode" in body:
+            continue
+        short = _SHORT_NAME_RE.search(body)
+        bus = short is not None and _BUS_NAME_RE.match(short.group(1)) is not None
+        stats.bus_given += bus
+        stats.rail_given += not bus
+        head = _LINE_HEAD_RE.match(body)
+        at = m.start("body") + (head.end() if head else 0)
+        edits.append(
+            (at, at, b"<TransportMode>" + (b"bus" if bus else b"rail") + b"</TransportMode>")
+        )
+    return _apply(data, edits) if edits else data
+
+
+def needs_zip_operators(data: bytes) -> bool:
+    """True when a Line of the member has no operator MOTIS reads and its own
+    file cannot give it one: it names none, or one defined elsewhere."""
+    if _LINE_START not in data:
+        return False
+    local = operator_ids(data)
+    for m in _LINE_RE.finditer(data):
+        body = m.group("body")
+        if body is None or b"<additionalOperators" in body:
+            continue
+        ref_m = _OPERATOR_REF_RE.search(body)
+        if ref_m is None or _value(_REF_RE, ref_m.group(1)) not in local:
+            return True
+    return False
+
+
+def _give_lines_their_operator(
+    data: bytes, operators: OperatorContext | None, stats: RepairStats
+) -> bytes:
+    """MOTIS reads a Line's operator only from `additionalOperators/OperatorRef`,
+    never from the Line's own `OperatorRef`, NeTEx's main operator (measured
+    2026-10-29: ÖBB, SBB, SI-NAP, Trenitalia, Trenord and Italo name theirs
+    only there; DB and CFL use additionalOperators). It is the operator of a
+    course that names none itself: ÖBB's (75 % of departures at ÖBB stops
+    had none) and NMBS's; SBB's, SI-NAP's, Trenitalia's and Italo's courses
+    name theirs. Such a Line gets an `additionalOperators` naming it; a Line
+    with no operator gets the zip's only Operator (NMBS). Only an Operator
+    MOTIS will find, in the file or in a base file: it drops the whole file
+    on one it cannot resolve."""
+    if _LINE_START not in data:
+        return data
+    reachable = operator_ids(data) | (operators.reachable if operators else set())
+    only = operators.only if operators else None
+    edits = []
+    for m in _LINE_RE.finditer(data):
+        body = m.group("body")
+        if body is None or b"<additionalOperators" in body:
+            continue
+        ref_m = _OPERATOR_REF_RE.search(body)
+        if ref_m is not None:
+            ref, at = _value(_REF_RE, ref_m.group(1)), m.start("body") + ref_m.end()
+        else:
+            ref, at = only, m.end("body")
+        if ref is None or ref not in reachable or b'"' in ref:
+            continue
+        add = b'<additionalOperators><OperatorRef ref="' + ref + b'"/></additionalOperators>'
+        edits.append((at, at, add))
+    stats.operators_given += len(edits)
+    return _apply(data, edits) if edits else data
 
 
 # ─────────────────────────── AvailabilityCondition ───────────────────────────
