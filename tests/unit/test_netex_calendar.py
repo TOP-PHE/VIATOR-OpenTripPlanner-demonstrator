@@ -280,9 +280,13 @@ def test_build_reads_the_original_when_nothing_to_convert(
     )
     assert notes == []
     gtfs = tmp_path / "inbox" / "eu19" / "gtfs" / "zou.zip"
+    gtfs.parent.mkdir()
+    with zipfile.ZipFile(gtfs, "w") as z:  # a GTFS feed without padded fields
+        z.writestr("stops.txt", "stop_id,stop_name\nS1,Nice\n")
     assert (
         worker._motis_timetable_path("eu19", gtfs, motis_root, notes) == "/inbox/eu19/gtfs/zou.zip"
     )
+    assert notes == []
 
 
 def test_build_falls_back_to_the_original_on_a_conversion_error(

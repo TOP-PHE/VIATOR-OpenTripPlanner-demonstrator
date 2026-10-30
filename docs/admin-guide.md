@@ -2588,6 +2588,39 @@ depend on it for their day types. If that happens, the error names the file:
 take that feed out of the session, rebuild, and look at the file with the
 structure check.
 
+### 6.24 A GTFS feed loads but serves no station: padded fields (Renfe Cercanías)
+
+Symptom (29 Oct, eu19): no Renfe Cercanías train, and none of its stations
+in MOTIS, although the file was valid for 28 Oct – 26 Nov (140 000 trips) and
+MOTIS loaded it without an error.
+
+Cause: Renfe pads every line of every file with spaces, to about 150
+characters. MOTIS matches GTFS column names and ids exactly and trims
+nothing:
+- `calendar.txt`'s header ends in `end_date` followed by spaces, so MOTIS
+  finds no `end_date` column and no service runs on any day;
+- `routes.txt` gives `10T0001C1  ` where `trips.txt` names `10T0001C1`, so
+  no trip finds its route.
+
+Since this change the build gives MOTIS a **trimmed copy** of such a zip
+(`graphs/motis/<sid>/_gtfs/`, `app/gtfs_motis_clean.py`): every field of a
+padded file loses the spaces around it, other files are copied as they are.
+A file counts as padded when one of its first 20 rows is. The end of the
+rebuild log says `[viator] gtfs for MOTIS: renfe-cerc.zip rewritten (…
+padded fields trimmed in 7 files …)`. A feed without padding goes to MOTIS
+as published, and the inbox keeps Renfe's file as published (OTP reads it).
+
+**A feed whose dates are over** also serves no station, silently. Corsica's
+second feed (`collectivitdec-2`) covered 3–9 March 2026 only. Nothing in
+VIATOR can fix that: ask the provider, or take the feed out of the session.
+To read a GTFS feed's dates:
+
+```bash
+docker compose -p viator exec -T worker python3 -c "import csv,io,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); r=list(csv.DictReader(io.TextIOWrapper(z.open('calendar.txt'),'utf-8-sig'))); print(min(x['start_date'] for x in r), max(x['end_date'] for x in r))" /data/inbox/<sid>/gtfs/<feed>.zip
+```
+
+(no `calendar.txt`: read `calendar_dates.txt`'s `date` column instead.)
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

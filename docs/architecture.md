@@ -1510,7 +1510,12 @@ reads them first, as base files. A day type given a `UicOperatingPeriod` *and* s
 assignments is rewritten like the EPIP forms: nigiri keeps a day type's first assignment only
 (`days.emplace`). A ServiceCalendarFrame over `_FRAME_IN_MEMORY` (64 MiB) is spooled to a temp
 file and read with `iterparse`, each definition freed once used; it applies assignments in file
-order, not sorted by `order` (counted when they disagree). A Line without `TransportMode` gets
+order, not sorted by `order` (counted when they disagree). A GTFS zip gets a copy too, under
+`graphs/motis/<sid>/_gtfs/` (`gtfs_motis_clean.clean_zip`), when one of its files has fields
+padded with spaces in its first rows (Renfe Cercanías pads every line): nigiri matches column
+names and ids exactly, so a padded `end_date` header or route id makes every trip vanish without
+an error. `worker._MOTIS_COPIES` holds the two kinds of copy (cache folder, version, converter).
+A Line without `TransportMode` gets
 `rail` (or `bus` by its ShortName), else route type 1700 (OTHER); a Line's own `OperatorRef` is
 copied into `additionalOperators`, the only place nigiri reads a Line's operator, and an
 operator-less Line gets the zip's only Operator, provided nigiri can resolve it (same file or
