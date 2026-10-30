@@ -521,4 +521,129 @@ def test_the_build_reads_the_repaired_copy(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_a_new_converter_version_redoes_cached_copies() -> None:
-    assert nc.CONVERTER_VERSION >= 4
+    assert nc.CONVERTER_VERSION >= 5
+
+
+# ── shared files read as MOTIS base files (NMBS, 2026-10-29) ───────────
+
+
+def _publication(frames: str) -> bytes:
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?><PublicationDelivery xmlns="{NETEX}">'
+        f"<dataObjects><CompositeFrame id='c'><frames>{frames}</frames></CompositeFrame>"
+        "</dataObjects></PublicationDelivery>"
+    ).encode()
+
+
+STOPS = _publication(
+    "<SiteFrame id='s'><stopPlaces><StopPlace id='gs:S1'><Name>Evere</Name></StopPlace>"
+    "</stopPlaces></SiteFrame>"
+)
+
+
+def _common(extra_day_types: int = 0) -> bytes:
+    """NMBS's common.xml: the operator, every DayType, a period of zeros + dates."""
+    extra = "".join(f'<DayType id="gc:unused-{i}"/>' for i in range(extra_day_types))
+    return _publication(
+        "<ResourceFrame id='r'><organisations><Operator id='nmbssncb'/></organisations>"
+        f"</ResourceFrame><ServiceCalendarFrame id='scf'><dayTypes><DayType id=\"gc:DT1\"/>{extra}"
+        '</dayTypes><operatingPeriods><UicOperatingPeriod id="gc:DT1">'
+        "<FromDate>2026-11-01T23:00:00Z</FromDate><ToDate>2026-11-03T23:00:00Z</ToDate>"
+        "<ValidDayBits>000</ValidDayBits></UicOperatingPeriod></operatingPeriods>"
+        '<dayTypeAssignments><DayTypeAssignment id="a1" order="1"><OperatingPeriodRef ref="gc:DT1"/>'
+        '<DayTypeRef ref="gc:DT1"/></DayTypeAssignment><DayTypeAssignment id="a2" order="2">'
+        '<Date>2026-11-02</Date><DayTypeRef ref="gc:DT1"/></DayTypeAssignment>'
+        "</dayTypeAssignments></ServiceCalendarFrame>"
+    )
+
+
+def _line_file(own_day_types: str = "") -> bytes:
+    """A line file whose course runs on DayType gc:DT1, defined here or not."""
+    course = _course("J", "P1", [1, 2, 3, 4]).replace(
+        "<ServiceJourneyPatternRef",
+        '<dayTypes><DayTypeRef ref="gc:DT1"/></dayTypes><ServiceJourneyPatternRef',
+    )
+    calendar = f"<dayTypes>{own_day_types}</dayTypes>" if own_day_types else None
+    return _doc(courses=course, calendar=calendar)
+
+
+def test_shared_files_become_base_files_when_line_files_take_their_day_types(
+    tmp_path: Path,
+) -> None:
+    line = _line_file()
+    src = _zip(
+        tmp_path / "nmbs.zip", {"stops.xml": STOPS, "common.xml": _common(), "line-1.xml": line}
+    )
+    dest = tmp_path / "out" / "nmbs.zip"
+    dest.parent.mkdir()
+
+    stats = nc.convert_zip(src, dest)
+    assert stats is not None
+    with zipfile.ZipFile(dest) as z:
+        names = sorted(z.namelist())
+        assert names == ["_1_1_SCHWEIZ_common.xml", "_1_1_SCHWEIZ_stops.xml", "line-1.xml"]
+        assert rp.has_base_files(names)
+        assert z.read("line-1.xml") == line
+        assert z.read("_1_1_SCHWEIZ_stops.xml") == STOPS
+        common = z.read("_1_1_SCHWEIZ_common.xml").decode()
+    assert '<UicOperatingPeriod version="1" id="VIATOR:UicOperatingPeriod:gc:DT1">' in common
+    assert "<FromDate>2026-11-02T00:00:00</FromDate>" in common
+    assert "<ValidDayBits>1</ValidDayBits>" in common
+    assert stats.summary() == (
+        "2 day-type assignments rewritten as 1 UicOperatingPeriod; "
+        "2 shared files read as base files (stops.xml, common.xml)"
+    )
+    assert [p.name for p in dest.parent.iterdir()] == ["nmbs.zip"]  # no temp left
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        # ÖBB-like: each line file defines its own day types.
+        {"EU_PI_STOP_OFFER.xml": STOPS, "line-1.xml": _line_file('<DayType id="gc:DT1"/>')},
+        # The DayType named is defined in no shared file.
+        {"stops.xml": STOPS, "line-1.xml": _line_file()},
+    ],
+    ids=["own-day-types", "day-type-nowhere"],
+)
+def test_shared_files_keep_their_name_otherwise(tmp_path: Path, members: dict[str, bytes]) -> None:
+    src = _zip(tmp_path / "x.zip", members)
+    assert nc.convert_zip(src, tmp_path / "out.zip") is None
+    assert not (tmp_path / "out.zip").exists()
+
+
+def test_a_large_shared_file_is_scanned_as_a_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    common, line = _common(extra_day_types=200), _line_file()
+    assert len(common) > len(line)
+    monkeypatch.setattr(rp, "MAX_MEMBER_BYTES", len(line))
+    monkeypatch.setattr(nc, "_CHUNK", 64)  # DayType tags across reads
+    src = _zip(tmp_path / "nmbs.zip", {"common.xml": common, "line-1.xml": line})
+    dest = tmp_path / "out" / "nmbs.zip"
+    dest.parent.mkdir()
+
+    stats = nc.convert_zip(src, dest)
+    assert stats is not None
+    with zipfile.ZipFile(dest) as z:
+        assert sorted(z.namelist()) == ["_1_1_SCHWEIZ_common.xml", "line-1.xml"]
+        assert "VIATOR:UicOperatingPeriod:gc:DT1" in z.read("_1_1_SCHWEIZ_common.xml").decode()
+    assert stats.base_files == ["common.xml"]
+    assert stats.repairs.too_large == 1
+
+
+def test_base_file_names_and_member_kinds() -> None:
+    assert rp.base_file_name("common.xml") == "_1_1_SCHWEIZ_common.xml"
+    assert rp.base_file_name("nmbs/common.xml") == "nmbs/_1_1_SCHWEIZ_common.xml"
+    assert rp.has_base_files([rp.base_file_name("x.xml")])
+    assert rp.has_courses(b'<ServiceJourney id="J">')
+    assert not rp.has_courses(b'<ServiceJourneyPattern id="P"/>')
+    data = (
+        b'<DayType id="A"/><DayType id="B"><Name/></DayType><DayTypeAssignment id="C"/>'
+        b'<DayTypeRef ref="A"/><DayTypeRef ref="Z"/>'
+    )
+    assert rp.day_type_ids(data) == {b"A", b"B"}
+    assert rp.day_type_ids(data, before=data.index(b'<DayType id="B"')) == {b"A"}
+    assert rp.foreign_day_types(data) == {b"Z"}
+    assert rp.foreign_day_types(b"<x/>") == set()
+    assert rp.day_type_ids(b"<x/>") == set()

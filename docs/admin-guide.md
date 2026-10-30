@@ -2520,6 +2520,40 @@ station, per feed (the dataset name is the inbox file's name, `obb`):
 docker compose -p viator exec web python3 -c "import json,urllib.request; s=json.load(urllib.request.urlopen('http://motis-<sid>:8080/api/v6/map/stops?min=47.067,15.410&max=47.077,15.424')); print(sorted({x['stopId'].split('_')[0] for x in s}))"
 ```
 
+`map/stops` lists only the stations some train serves: a feed whose stations
+load but whose trains run on no day shows nothing there (see §6.23).
+
+### 6.23 A NeTEx feed loads but no train runs: shared files and per-date calendars (NMBS)
+
+Symptom (29 Oct, eu19): no Belgian train. MOTIS's `logs/tt.txt` showed one
+error per NMBS line file (2 182). Once those were gone, MOTIS loaded Belgium's
+2 959 stations but wrote **no train**, with no error at all.
+
+Belgium's file (published by enRoute) has three features MOTIS 2.11 does not
+read, all valid NeTEx:
+
+| Cause in the file | What MOTIS does | What the build copy now does |
+|---|---|---|
+| the line files take their stations, operator and day types from two **shared files** without trains (`stops.xml`, `common.xml`) | resolves a reference only in the same file or in a *base file*, which it recognises by SBB's naming (`SCHWEIZ` and `_1_1_` in the name): every line file is dropped | renames the shared files `_1_1_SCHWEIZ_stops.xml`, `_1_1_SCHWEIZ_common.xml`, when a line file names a day type only they define |
+| each day type gets an **operating period of zeros**, then **one assignment per date** (5 million in all) | keeps only a day type's first assignment, the empty period: every train runs on no day, silently | rebuilds each day type's dates into one `UicOperatingPeriod`, as for Slovenia |
+| the calendar is **1.1 GB** | — | reads a calendar frame over 64 MB from a temporary file, in one pass, without loading it whole (peak 760 MB) |
+
+The same pass applies the repairs of §6.22. On Belgium's file of 22 Oct it
+also gave all 51 943 patterns their line and dropped 429 courses whose passing
+times are not in the order of their pattern. The end of the rebuild log says:
+`[viator] netex for MOTIS: nmbs.zip rewritten (5065213 day-type assignments
+rewritten as 59838 UicOperatingPeriod (1 large calendar frames read from
+disk); 2 shared files read as base files (stops.xml, common.xml); …)`.
+**It takes about 10 minutes** for that file. It runs again only when the file
+changes; otherwise the copy is reused.
+
+A base file that MOTIS cannot parse **stops the whole import**
+(`failed to parse base` in `logs/tt.txt`, and the rebuild fails, so the graph
+being served stays). That is why a shared file is renamed only when line files
+depend on it for their day types. If that happens, the error names the file:
+take that feed out of the session, rebuild, and look at the file with the
+structure check.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

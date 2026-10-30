@@ -46,6 +46,16 @@ Byte edits, like app/netex_calendar.py: the rest of the file is passed through
 byte for byte. Unprefixed elements only, the only ones MOTIS reads. A zip with
 base files (SBB's layout, `has_base_files`) is never repaired: what a file
 lacks may be defined there. `netex_calendar.convert_zip` runs these repairs.
+
+Measured 2026-10-29 on NMBS's file (enRoute, 2 182 line files): every line
+file was dropped, because its stations, operator and day types sit in two
+shared files (`stops.xml`, `common.xml`, no course), and MOTIS resolves a
+reference only in the same file or in a base file. MOTIS's base files are
+SBB's by name only (`SCHWEIZ` + `_1_1_` in the path; its other way,
+`base_paths`, has no MOTIS setting), so `convert_zip` renames the shared
+files `_1_1_SCHWEIZ_<name>` (`base_file_name`) when a line file names a
+DayType only they define. MOTIS aborts the whole import when a base file
+fails to parse (`failed to parse base`), hence that narrow rule.
 """
 
 from __future__ import annotations
@@ -103,6 +113,12 @@ _PARENT_RE = re.compile(
 )
 _SITE_TAGS = _start_tags((b"StopPlace", b"Quay"))
 _LINE_TAGS = _start_tags((b"Line",))
+_COURSE_RE = re.compile(rb"<ServiceJourney[\s/>]")
+_DAY_TYPE_TAGS = _start_tags((b"DayType",))
+_DAY_TYPE_REF_RE = re.compile(rb"<DayTypeRef\b([^>]*)>")
+
+# MOTIS reads a file as a base file when its path holds "SCHWEIZ" and "_1_1_".
+BASE_FILE_MARK = "_1_1_SCHWEIZ_"
 
 
 def _value(rx: re.Pattern[bytes], attrs: bytes) -> bytes | None:
@@ -172,6 +188,40 @@ def has_base_files(names: list[str]) -> bool:
     a path holding both "SCHWEIZ" and "_1_1_", SBB's layout): their
     definitions are visible to every file, so nothing here is repaired."""
     return any("SCHWEIZ" in n and "_1_1_" in n for n in names)
+
+
+def base_file_name(name: str) -> str:
+    """`name` renamed, in its folder of the zip, so that MOTIS reads it as a
+    base file (before every other file, its definitions visible to all)."""
+    folder, sep, file = name.rpartition("/")
+    return f"{folder}{sep}{BASE_FILE_MARK}{file}"
+
+
+def has_courses(data: bytes) -> bool:
+    """True for a member holding a ServiceJourney (a line file); a member
+    without one is a shared file (NMBS: stops.xml, common.xml)."""
+    return _COURSE_RE.search(data) is not None
+
+
+def day_type_ids(data: bytes, before: int | None = None) -> set[bytes]:
+    """The ids of the DayTypes a member (or a chunk of one) defines; with
+    `before`, of those whose tag starts before that offset."""
+    if b"<DayType" not in data:
+        return set()
+    limit = len(data) if before is None else before
+    return {
+        v
+        for m in _DAY_TYPE_TAGS.finditer(data)
+        if m.start() < limit and (v := _value(_ID_RE, m.group(1))) is not None
+    }
+
+
+def foreign_day_types(data: bytes) -> set[bytes]:
+    """The DayTypes a member names but does not define."""
+    if b"<DayTypeRef" not in data:
+        return set()
+    refs = {v for m in _DAY_TYPE_REF_RE.finditer(data) if (v := _value(_REF_RE, m.group(1)))}
+    return refs - day_type_ids(data)
 
 
 def line_ids(data: bytes) -> set[bytes]:
