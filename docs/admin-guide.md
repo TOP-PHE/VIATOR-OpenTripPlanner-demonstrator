@@ -2621,6 +2621,41 @@ docker compose -p viator exec -T worker python3 -c "import csv,io,sys,zipfile; z
 
 (no `calendar.txt`: read `calendar_dates.txt`'s `date` column instead.)
 
+### 6.25 A plain rebuild runs beside the max-memory one: a refresh's rebuild
+
+Symptom (30 Oct, eu19): after a refresh, the history shows two jobs, a plain
+one `running` and the max-memory one the operator asked for `pending`; the
+plain one had to be cancelled by hand. Both logs begin `queued at … — new
+GTFS uploaded`: the refresh queued them, not the click.
+
+Cause: a refresh stores its files one at a time and queues a rebuild with the
+first new one. With `REBUILD_DEBOUNCE_SECONDS` at 60, the worker started that
+job while the refresh was still storing files, so it built on half of them,
+in normal mode. The next file found no pending job to join and queued a
+second one, which the max-memory click upgraded.
+
+Since this change:
+- **No rebuild starts while a refresh of its session runs** (the whole
+  session's, OSM's, or one provider's; `refresh_progress.running_for`). The
+  job stays `pending`, takes every file the refresh stores and a max-memory
+  click, and starts at the first tick after the refresh ends. Its log says
+  `[viator] waiting for the session's refresh to end (<time>)`, once. A refresh
+  whose process died holds nothing back after its 5-minute lease. Another
+  session's jobs start as before.
+- **"Always for this session"**, under the Max-memory rebuild box of the
+  Rebuild section: every rebuild of the session runs in max-memory mode, the
+  ones a refresh or an upload queues included (config `build_max_memory`,
+  saved at once, true or false only). While it is on, the one-off box reads
+  checked and is locked. Its jobs say `(max-memory: the session's setting)` in
+  their log and carry the 🧠 max-memory badge. The worker also applies it to
+  a job queued before it was turned on.
+
+To see which jobs were held back and why:
+
+```bash
+docker compose -p viator exec -T postgres psql -U viator -d viator -c "SELECT created_at, started_at, status, max_memory, left(log, 120) FROM rebuild_jobs ORDER BY created_at DESC LIMIT 5;"
+```
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:
