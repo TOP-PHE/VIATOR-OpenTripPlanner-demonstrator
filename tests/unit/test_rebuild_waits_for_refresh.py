@@ -358,15 +358,12 @@ class _PatchDb:
 @pytest.mark.parametrize("value", ["yes", 1, None, {"on": True}])
 def test_saving_anything_but_true_or_false_is_refused(value: object) -> None:
     body = api.SessionPatch(config={"build_max_memory": value})
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+    response = SimpleNamespace(headers={})
+    db = _PatchDb({})
+    actor = SimpleNamespace(id=None)
     with pytest.raises(HTTPException) as exc:
-        api.patch_session(
-            SID,
-            body,
-            SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1")),  # type: ignore[arg-type]
-            SimpleNamespace(headers={}),  # type: ignore[arg-type]
-            _PatchDb({}),  # type: ignore[arg-type]
-            SimpleNamespace(id=None),  # type: ignore[arg-type]
-        )
+        api.patch_session(SID, body, request, response, db, actor)  # type: ignore[arg-type]
     assert exc.value.status_code == 400
     assert "build_max_memory must be true or false" in str(exc.value.detail)
 
