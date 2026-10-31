@@ -143,7 +143,7 @@ Three details in that picture are easy to get backwards and expensive to debug:
 2. `POST /api/sessions/{sid}/sources/refresh` → `refresh_sources` → `_build_refresh_tasks(config, include_osm=False)` → `_refresh_one_task` httpx-downloads into `inbox/<sid>/_staging/`. **OSM is deliberately excluded** and has its own `POST /{sid}/sources/osm/refresh`, so a GTFS tweak doesn't invalidate the streetGraph cache and add 30 min to the next build.
 3. `detect.detect(path)` sniffs the real format (GTFS / NeTEx variants / CSV) and refuses a mismatch against what the operator declared. `ingestion.dispatch(...)` rotates the prior file to `.old` (per-feed only when `staged_filename` is given — otherwise every feed in a multi-feed session gets rotated), copies into `inbox/<sid>/gtfs/<feed>.zip`, and calls `_enqueue_rebuild`, which **coalesces**: it silently skips if a pending job for that session already exists.
 4. Session state advances to `populated`. `staleness.mark_refresh_completed`. `_cascade_derived_refresh` re-derives any `cross_border_filter` provider in *other* sessions built from this one (via `gtfs_cross_border_filter.py`, which keeps only routes whose stops span 2+ UIC country prefixes). `inbox_sweep.sweep_orphaned_provider_files` renames to `*.zip.orphaned` the files of providers the operator removed, and a provider's file in the folder of a format it no longer uses (#381) — otherwise the build's `gtfs/*.zip` / `netex/*.zip` globs keep consuming a feed that's no longer in the config.
-5. `worker.py::tick()` (every `WORKER_TICK_SECONDS`, default 15) picks the oldest `rebuild_jobs` row at `status='pending'`, waits out `REBUILD_DEBOUNCE_SECONDS` (default 1800 — so a burst of feed refreshes produces one build), flips it to `running`.
+5. `worker.py::tick()` (every `WORKER_TICK_SECONDS`, default 15) picks the oldest `rebuild_jobs` row at `status='pending'` whose session has no refresh running (`refresh_progress.running_for`), waits out `REBUILD_DEBOUNCE_SECONDS` (default 1800 — so a burst of feed refreshes produces one build), flips it to `running`.
 6. `tick` re-reads `sessions.engine` in its own short transaction and dispatches to `run_build` or `run_build_motis`. `run_build` resolves every per-session knob (`osm_filter.validate_scope`, `osm_geo.validate_countries`, `otp_timezone.validate_timezone`, `otp_heap.validate_heap`, `otp_api_timeout.validate_timeout`, `ingestion.normalize_providers`), decrypts GTFS-RT credentials via `app/credentials.py`, and renders `router-config.json` with `router_config.render_router_config`.
 7. It shells out: `docker compose -p viator run --rm -e OTP_HEAP=… -e OTP_OSM_SCOPE=… otp-build`, cwd `/srv/docker`, via the mounted docker socket (`_DOCKER = "/usr/local/bin/docker"` — a single constant so every subprocess call is auditable). With `max_memory` set it first stops the observability stack and the serving session containers, and restores them in a `finally`.
 8. On success: move `graph.obj` to `graphs/<sid>/<timestamp>/`, repoint `graphs/<sid>/current` as a **relative** symlink, `_prune_old_graphs(keep=3)`.
@@ -1354,8 +1354,11 @@ actually died silently.
 
 **The worker loop.** `main()` → cleanup → start the coverage executor thread (#392, its own event
 loop, SIGTERM releases its runs) → `while True: tick(); handle_reload_trigger(); sleep`.
-`tick()` takes the *oldest* `pending` row from `rebuild_jobs`, checks it is older than
-`REBUILD_DEBOUNCE_SECONDS`, flips it to `running`, re-reads `sessions.engine` in its own short
+`tick()` takes the *oldest* `pending` row from `rebuild_jobs` whose session has no refresh
+running (`_next_pending_job`, `refresh_progress.running_for`: a `running` record of any scope
+within its lease; held-back jobs get one `[viator] waiting for the session's refresh to end`
+line), checks it is older than `REBUILD_DEBOUNCE_SECONDS`, flips it to `running` (the claim
+re-checks the refresh, and sets `max_memory` when the session's `build_max_memory` asks), re-reads `sessions.engine` in its own short
 transaction (the operator may have edited it since enqueue), then calls `run_build` or
 `run_build_motis` (through `_run_engine_build`). Both return the same `(log, success, path)`
 triple so everything past the dispatch point stays engine-agnostic.
@@ -1534,7 +1537,9 @@ orphaned OTP services, warns about non-compose containers running the VIATOR OTP
 `nginx -s reload`, and deletes the trigger. If compose-up fails the trigger is **not** deleted,
 so the next tick retries.
 
-**Max-memory rebuild.** A per-job checkbox (`rebuild_jobs.max_memory`) for the worst-case
+**Max-memory rebuild.** A per-job checkbox (`rebuild_jobs.max_memory`), or a session's
+`build_max_memory` ("Always for this session": every job of the session, those a refresh or an
+upload queues included, `ingestion.wants_max_memory`), for the worst-case
 all-Europe build on one VPS: stop the autoheal watchdog (first, so it cannot restart an
 unhealthy session container mid-stop), the serving session containers and the observability
 stack, then check with `compose ps` that they are down, retry once, and log an error naming any
@@ -1602,8 +1607,13 @@ Heap → cgroup cap derivation (`mem_limit_for_heap` = `heap_gb + max(4, heap_gb
   the job's `created_at`). Operators regularly conclude the worker is dead. Lower
   `REBUILD_DEBOUNCE_SECONDS` if you need a fast loop.
 - **Enqueue coalesces silently.** `_enqueue_rebuild` returns without doing anything if a pending
-  job for that session exists, and the debounce clock runs from the *first* enqueue, not the
-  last. `max_memory` only ever upgrades on coalesce.
+  job for that session exists (it only upgrades it to max-memory when the session asks), and the
+  debounce clock runs from the *first* enqueue, not the last. `max_memory` only ever upgrades on
+  coalesce.
+- **A refresh queues its rebuild with its first new file, and the worker waits for the refresh.**
+  Never drop the `running_for` condition from `_next_pending_job` or from the claim: with a short
+  debounce a build started mid-refresh read half the new files, and the next file queued a second
+  job beside it (30 Oct, eu19, admin-guide §6.25). A refresh past its lease holds nothing back.
 - **Orphan cleanup is OTP-only, by design.** The `docker ps` filter is `name=^viator-otp-`, and
   the expected-set is filtered to the `otp-` prefix so a MOTIS name can't mask a removed OTP
   session. Consequence: a deleted MOTIS session's `motis-<sid>` container is never torn down.

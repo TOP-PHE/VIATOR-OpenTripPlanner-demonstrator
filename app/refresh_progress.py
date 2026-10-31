@@ -90,7 +90,7 @@ from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Protocol
 
-from sqlalchemy import ColumnElement, func, literal, select, update
+from sqlalchemy import ColumnElement, exists, func, literal, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -225,6 +225,27 @@ def _expire(db: Any, sid: str, scope: str | None = None) -> None:
     if scope is not None:
         stale = stale.where(Row.scope == scope)
     db.execute(stale.values(state=INTERRUPTED, finished_at=Row.heartbeat_at))
+
+
+def running_for(session_id: Any) -> ColumnElement[bool]:
+    """SQL condition, true while a refresh of the session named by
+    `session_id` (a column, such as `RebuildJob.session_id`) is running: a
+    `running` record of any scope (the whole session, OSM, one provider) whose
+    heartbeat is within the lease.
+
+    The worker starts no rebuild of such a session (`worker._next_pending_job`):
+    a refresh stores its files one at a time and queues a rebuild with the
+    first, so a build started then reads half the new files, and the next file
+    queues a second job (production, 30 Oct: a plain job running beside the
+    max-memory one the operator asked for). A record past its lease belongs to
+    a dead process and holds nothing back. The station-module follow-up of a
+    finished refresh is not a refresh: it holds no build. Reads only (a stale
+    record is marked interrupted by the page and the next claim, `_expire`)."""
+    return exists().where(
+        Row.session_id == session_id,
+        Row.state == RUNNING,
+        Row.heartbeat_at >= _lease_cutoff(),
+    )
 
 
 # ── the claim ────────────────────────────────────────────────────────────

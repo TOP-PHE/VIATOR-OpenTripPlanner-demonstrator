@@ -389,7 +389,10 @@ class _TickDb:
         return chain
 
     def execute(self, statement: Any) -> Any:
-        if str(statement).startswith("UPDATE rebuild_jobs SET log="):
+        sql = str(statement)
+        # The note of jobs held back by a running refresh applies only while a
+        # refresh runs (its WHERE reads source_refresh_progress): none here.
+        if sql.startswith("UPDATE rebuild_jobs SET log=") and "source_refresh_progress" not in sql:
             params = statement.compile().params.values()
             for value in params:
                 if isinstance(value, str) and value.startswith("[viator]"):

@@ -33,7 +33,14 @@ from sqlalchemy.orm import Session as DbSession
 
 from .feed_resolvers import validate_resolver
 from .models import RebuildJob
+from .models import Session as SessionRow
 from .settings import settings
+
+# A session's config key: true = every rebuild of the session in max-memory
+# mode, the ones a refresh or an upload queues included (`wants_max_memory`).
+BUILD_MAX_MEMORY = "build_max_memory"
+# Said in a job's log when the max-memory mode came from that setting.
+_MAX_MEMORY_SETTING = " (max-memory: the session's setting)"
 
 # Which detected kinds get staged into OTP's build inbox vs. stored elsewhere.
 STAGE_INTO_OTP_INBOX: dict[str, str] = {
@@ -653,8 +660,26 @@ def _rotate_all(subdir: Path) -> None:
             existing.rename(existing.with_suffix(existing.suffix + ".old"))
 
 
+def wants_max_memory(config: object) -> bool:
+    """True when a session's config asks for every rebuild in max-memory mode
+    (`BUILD_MAX_MEMORY` set to true, the Sessions page's "Always for this
+    session"): the rebuilds a refresh or an upload queues, which no operator
+    clicks, included. Anything but a literal true is off."""
+    return isinstance(config, dict) and config.get(BUILD_MAX_MEMORY) is True
+
+
+def _session_wants_max_memory(db: DbSession, session_id: str | None) -> bool:
+    if session_id is None:
+        return False
+    row = db.get(SessionRow, session_id)
+    return row is not None and wants_max_memory(row.config)
+
+
 def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> None:
-    """Coalesce: skip if a pending job for the same session already exists."""
+    """Coalesce: a pending job for the same session takes this request (and
+    becomes max-memory when the session asks for it, `wants_max_memory`);
+    otherwise a new pending job, max-memory when the session asks for it."""
+    max_memory = _session_wants_max_memory(db, session_id)
     pending = (
         db.query(RebuildJob)
         .filter(RebuildJob.status == "pending")
@@ -662,11 +687,19 @@ def _enqueue_rebuild(db: DbSession, *, session_id: str | None, reason: str) -> N
         .first()
     )
     if pending is not None:
+        if max_memory and not pending.max_memory:
+            pending.max_memory = True
+            pending.log = (pending.log or "") + (
+                f"upgraded to max-memory at {datetime.now(UTC).isoformat()}{_MAX_MEMORY_SETTING}\n"
+            )
+            db.commit()
         return
+    setting = _MAX_MEMORY_SETTING if max_memory else ""
     job = RebuildJob(
         session_id=session_id,
         status="pending",
-        log=f"queued at {datetime.now(UTC).isoformat()} — {reason}\n",
+        max_memory=max_memory,
+        log=f"queued at {datetime.now(UTC).isoformat()} — {reason}{setting}\n",
     )
     db.add(job)
     db.commit()

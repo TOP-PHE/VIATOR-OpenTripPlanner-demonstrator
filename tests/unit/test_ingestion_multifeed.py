@@ -25,6 +25,9 @@ def fake_db():
     by passing a session whose .query() returns nothing."""
 
     class _DBStub:
+        def get(self, *a, **kw):
+            return None  # no session row: no max-memory setting
+
         def query(self, *a, **kw):
             class _Q:
                 def filter(self, *a, **kw):

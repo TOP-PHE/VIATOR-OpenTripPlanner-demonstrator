@@ -392,6 +392,14 @@ def patch_session(
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
 
+        # Every rebuild in max-memory mode (the Rebuild section's "Always for
+        # this session"): true or false only, so a stray string never turns
+        # it on (`ingestion.wants_max_memory` reads only a literal true).
+        if ingestion.BUILD_MAX_MEMORY in body.config and not isinstance(
+            body.config[ingestion.BUILD_MAX_MEMORY], bool
+        ):
+            raise HTTPException(400, f"{ingestion.BUILD_MAX_MEMORY} must be true or false")
+
         # v0.1.40 — validate osm_countries (the GEOGRAPHIC scope: crop the OSM
         # street graph to these served countries, orthogonal to osm_scope's
         # tag filter). Same fail-fast pattern; an unknown ISO code 400s here
@@ -3670,7 +3678,12 @@ def enqueue_rebuild(
         .filter(RebuildJob.session_id == sid)
         .first()
     )
+    # A session that asks for every rebuild in max-memory mode gets it without
+    # the click's checkbox (`ingestion.wants_max_memory`).
     suffix = " (max-memory)" if max_memory else ""
+    if not max_memory and ingestion.wants_max_memory(s.config):
+        max_memory = True
+        suffix = " (max-memory: the session's setting)"
     if pending is None:
         pending = RebuildJob(
             session_id=sid,
