@@ -45,6 +45,7 @@ from . import (
     memory_caps,
     motis_timezones,
     netex_calendar,
+    refresh_progress,
     station_builds,
     station_extract_upload,
 )
@@ -102,6 +103,10 @@ def _host_total_gb() -> int | None:
         return None
     return None
 
+
+# Said once in the log of a pending job held back by a running refresh of its
+# session (`_note_jobs_waiting_for_refresh`).
+WAITING_FOR_REFRESH = "[viator] waiting for the session's refresh to end"
 
 # ───────────────────── Max-memory rebuild (v0.1.38) ─────────────────────────
 # Observability containers stopped during a max-memory rebuild and restarted
@@ -410,30 +415,70 @@ def _debounce_seconds() -> int:
         return settings.debounce_seconds
 
 
+def _note_jobs_waiting_for_refresh(db: Any) -> None:
+    """One line in the log of each pending job held back by a running refresh
+    of its session (`refresh_progress.running_for`), written once: the job
+    list then says why a pending job does not start."""
+    log_text = func.coalesce(RebuildJob.log, "")
+    db.execute(
+        update(RebuildJob)
+        .where(
+            RebuildJob.status == "pending",
+            refresh_progress.running_for(RebuildJob.session_id),
+            ~log_text.contains(WAITING_FOR_REFRESH, autoescape=True),
+        )
+        .values(log=log_text + f"{WAITING_FOR_REFRESH} ({datetime.now(UTC).isoformat()})\n")
+    )
+    db.commit()
+
+
+def _next_pending_job(db: Any) -> RebuildJob | None:
+    """The oldest pending job that may start now, or None: no refresh of its
+    session is running (a refresh stores its files one at a time and queues a
+    rebuild with the first: a build started then reads half the new files,
+    and the next file queues a second job; `refresh_progress.running_for`),
+    and its debounce has passed. A job held back by a refresh starts at the
+    first tick after the refresh ends, with every file it stored."""
+    _note_jobs_waiting_for_refresh(db)
+    job: RebuildJob | None = (
+        db.query(RebuildJob)
+        .filter(RebuildJob.status == "pending")
+        .filter(~refresh_progress.running_for(RebuildJob.session_id))
+        .order_by(RebuildJob.created_at.asc())
+        .first()
+    )
+    if job is None:
+        return None
+    if datetime.now(UTC) < job.created_at + timedelta(seconds=_debounce_seconds()):
+        return None
+    return job
+
+
 def tick() -> None:
     with SessionLocal() as db:
-        job = (
-            db.query(RebuildJob)
-            .filter(RebuildJob.status == "pending")
-            .order_by(RebuildJob.created_at.asc())
-            .first()
-        )
+        job = _next_pending_job(db)
         if job is None:
-            return
-
-        deadline = job.created_at + timedelta(seconds=_debounce_seconds())
-        if datetime.now(UTC) < deadline:
             return
 
         job_id = job.id
         sid = job.session_id
-        max_memory = bool(job.max_memory)
+        # Max-memory when the job asked for it, or when its session asks for
+        # it now (`ingestion.wants_max_memory`: set after the job was queued).
+        row = db.get(SessionRow, sid) if sid is not None else None
+        max_memory = bool(job.max_memory) or ingestion.wants_max_memory(
+            getattr(row, "config", None)
+        )
         # Conditional claim: an operator may have cancelled the job since the
-        # SELECT above, and that must win over starting it.
+        # SELECT above, and that must win over starting it; a refresh that
+        # began in between holds it back too.
         claimed = db.execute(
             update(RebuildJob)
-            .where(RebuildJob.id == job_id, RebuildJob.status == "pending")
-            .values(status="running", started_at=datetime.now(UTC))
+            .where(
+                RebuildJob.id == job_id,
+                RebuildJob.status == "pending",
+                ~refresh_progress.running_for(RebuildJob.session_id),
+            )
+            .values(status="running", started_at=datetime.now(UTC), max_memory=max_memory)
             .returning(RebuildJob.id)
         ).scalar_one_or_none()
         db.commit()

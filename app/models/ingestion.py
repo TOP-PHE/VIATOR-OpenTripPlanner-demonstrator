@@ -82,7 +82,9 @@ class RebuildJob(TimestampMixin, Base):
     # v0.1.38 — operator opted into a "max-memory rebuild" for this job: the
     # worker stops serving sessions + the observability stack to free the box,
     # auto-sizes the build heap to host RAM, then restarts them when done.
-    # One-off per job (UI checkbox next to Rebuild), not a session default.
+    # Per job (UI checkbox next to Rebuild); a session whose config sets
+    # `build_max_memory` gets it on every job, the ones a refresh queues
+    # included (`ingestion.wants_max_memory`, applied again at the claim).
     max_memory: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
     # Set by the web app when an operator cancels a RUNNING job. The worker owns
     # the build container, so it watches this column, kills the container and

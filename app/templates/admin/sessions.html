@@ -435,6 +435,15 @@
               stack and sizes the build heap to host RAM, then restarts them when done. For the
               worst-case (e.g. all-Europe) build on a single box. Other sessions are briefly offline.</span>
             </label>
+            {# Every rebuild of the session in max-memory mode (config
+               `build_max_memory`, ingestion.wants_max_memory): the rebuilds a
+               refresh or an upload queues included, which no one clicks.
+               Saved at once; the one-off box above then reads checked. #}
+            <label class="hint" style="display: flex; align-items: center; gap: 0.4rem; margin-top: 0.2rem; margin-left: 1.4rem">
+              <input type="checkbox" data-role="maxmem-always" data-sid="{{ s.id }}"{% if s.config and s.config.get('build_max_memory') is sameas true %} checked{% endif %}>
+              <span><strong>Always for this session</strong> — every rebuild, including the ones a
+              refresh or an upload queues. Saved at once.</span>
+            </label>
             <div data-role="jobs" data-sid="{{ s.id }}" style="margin-top: 0.75rem">
               <em class="hint">Job list will load when this section is expanded.</em>
             </div>
@@ -2965,6 +2974,66 @@ document.querySelectorAll('button[data-action="rebuild"]').forEach(btn => {
     showToast('success', `Rebuild queued for ${sid}${maxmem ? ' (max-memory)' : ''} (job ${body.id?.slice(0,8) ?? '—'})`);
     loadJobs(sid);
   });
+});
+
+// ─── Max-memory for every rebuild of a session ─────────────────────
+// config.build_max_memory: the rebuilds a refresh or an upload queues are
+// max-memory too. Saved at once (PATCH of the session's config); while it is
+// on, the one-off "Max-memory rebuild" box reads checked and is locked.
+function syncMaxmemBoxes(sid) {
+  const always = document.querySelector(`input[data-role="maxmem-always"][data-sid="${sid}"]`);
+  const once = document.querySelector(`input[data-role="maxmem"][data-sid="${sid}"]`);
+  if (!always || !once) return;
+  if (always.checked) {
+    once.checked = true;
+    once.disabled = true;
+  } else if (once.disabled) {
+    once.checked = false;
+    once.disabled = false;
+  }
+}
+
+async function saveMaxmemAlways(box) {
+  const sid = box.dataset.sid;
+  const on = box.checked;
+  if (on && !confirm(
+    `Every rebuild of ${sid} will run in max-memory mode, including the ones a ` +
+    `refresh or an upload queues: each one STOPS the other serving sessions and ` +
+    `the observability stack while it builds. Continue?`
+  )) {
+    box.checked = false;
+    return;
+  }
+  const row = document.querySelector(`tr[data-sid="${sid}"]`);
+  const cfg = { ...JSON.parse(row?.dataset.config || '{}') };
+  if (on) cfg.build_max_memory = true;
+  else delete cfg.build_max_memory;
+  box.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${sid}`, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({config: cfg}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      box.checked = !on;
+      showToast('error', (body.detail && body.detail.message) || body.detail || `Failed (${r.status})`);
+      return;
+    }
+    if (row) row.dataset.config = JSON.stringify(body.config);
+    forgetSessionList();
+    showToast('success', on
+      ? `Every rebuild of ${sid} now runs in max-memory mode`
+      : `Rebuilds of ${sid} run in normal mode again`);
+  } finally {
+    box.disabled = false;
+    syncMaxmemBoxes(sid);
+  }
+}
+
+document.querySelectorAll('input[data-role="maxmem-always"]').forEach(box => {
+  syncMaxmemBoxes(box.dataset.sid);
+  box.addEventListener('change', () => saveMaxmemAlways(box));
 });
 
 // ─── Promote ────────────────────────────────────────────────────────
