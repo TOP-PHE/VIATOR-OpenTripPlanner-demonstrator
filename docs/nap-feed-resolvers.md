@@ -183,10 +183,51 @@ default; `-Apply` to save).
 | TRENITALIA | `url` | Italian NAP public catalogue, asset 1080596, `/checkedResource` = the last *validated* version. It serves `.xml.gz` with no validators, so change detection relies on the hash. **This corrects eu19-providers.md, which says CCISS is SPID-walled** |
 | TRENORD | `url` | Italian NAP dataset IT-ITC4-TRENORD_336 (NeTEx, Italian profile level 1, Trenord only), asset 131494 `/checkedResource`. Anonymous, like TRENITALIA. The session declares GTFS (dati.lombardia.it), so the panel shows *format differs*: switch it by hand |
 | NMBS | `url` | Belgian NAP (transportdata.be) blob `netex-nmbssncb-latest.zip`, anonymous. Probed from the VPS 2026-10-01: 141 MB, 2,184 files (`common.xml` about 1 GB + one `line-gr:nmbssncb:*.xml` per line, 7.8 GB uncompressed), enRoute export, regenerated daily, sends ETag and Last-Modified (an unchanged file is a 304). Calendar 2025-12-29 → 2026-12-12. A different export from the old hand-uploaded file (which expired 2025-12-13): watch the first MOTIS import. **Licence marked "Other (Non-Commercial)"** (see eu19-compliance-summary.md) |
-| OBB | `nap/permalink` | Dataset 67, "Railway Timetable Data (NeTEx) - Current Reference Data" (not 71, the changeover snapshot; not 66, GTFS). **Needs the AT *Login* credential** with client id `dbp-public-ui`, and the dataset licence accepted on the portal. The catalogue is public, so only the file request tests the token |
+| OBB | `nap/permalink` | Dataset 67, "Railway Timetable Data (NeTEx) - Current Reference Data" (not 71, the changeover snapshot; not 66, GTFS). **Needs the AT *Login* credential** with client id `dbp-public-ui`, and the dataset licence accepted on the portal. The catalogue is public, so only the file request tests the token. **Holds ÖBB-Personenverkehr (with the ÖBB Intercity bus), Raaberbahn/GYSEV, Montafonerbahn, WESTbahn and ÖGEG only**: GKB, Steiermarkbahn and every other operator are in a regional data set (next section) |
 | SBB | `nap/permalink` | `timetablenetex_<year>/permalink` redirects to a 60-second presigned R2 URL; never store it. About 660 MB, new file roughly twice a week. The CKAN API is blocked (403) or needs a key; the permalink needs neither |
 | CFL | `nap/udata` | Publisher is ATP (national multimodal), CC0. The local `netex-20260618-20260823.zip` is byte-size identical to this dataset's resource, which settles eu19-providers.md's "cannot be traced" |
 | DB | `nap/dated` | `YYYYMMDD_fahrplaene_gesamtdeutschland.zip`, about 2 GB. No `latest` alias; old files are pruned. The file URL answers anonymously, but the dataset page states download is for registered users. **Register once on opendata-oepnv.de before relying on this** (CC-BY). Refresh at most weekly |
+
+### Austria: the regional data sets
+
+Data set 67 (OBB above) holds only the railways it names. Its description says that every other
+railway is in the data package of its regional transport authority: on 2 Nov 2026 eu19 had **no
+GKB (Graz-Köflacher Bahn) train** for that reason (admin guide §6.26). Each authority publishes
+one NeTEx file on the same portal, with ÖBB left out, so it adds no train the OBB file already
+holds. Checked 2026-11-02 (`GET https://data.mobilitaetsverbuende.at/api/public/v1/data-sets/<id>`,
+public):
+
+| Id | Region (authority) | Left out | File on 2026-11-02 |
+|---|---|---|---|
+| 59 | Vienna, Lower Austria, Burgenland (VOR) | ÖBB, WESTbahn, Raaberbahn | `…_netex_vor_2026.zip`, 177 MB |
+| 60 | Styria (Verbundlinie: GKB, Steiermarkbahn, Graz Linien, regional buses) | ÖBB | `…_netex_verbundlinie_2026.zip`, 126 MB |
+| 61 | Salzburg | ÖBB, WESTbahn | about 37 MB |
+| 62 | Carinthia (Kärntner Linien) | ÖBB | about 31 MB |
+| 63 | Upper Austria (OÖVV) | ÖBB, WESTbahn | — |
+| 64 | Tyrol (VVT) | ÖBB, WESTbahn | `…_netex_vvt_2026.zip`, 39 MB |
+| 65 | Vorarlberg | ÖBB, Montafonerbahn | — |
+
+Prefer these NeTEx files to the GTFS editions. Styria's GTFS (72) is one zip in nine parts
+(`gkb-at`, `stb-at`, `grazholding-at`, …) and VIATOR reads one feed per file. The other GTFS
+editions are Tyrol 57, Vorarlberg 58, Linz AG 69, plus the *Flex* (demand-responsive) sets 73–76.
+Linz AG also has its own NeTEx (68).
+
+**Adding one to a session.** The map above replaces existing providers only, so a regional set is
+a new provider, added by hand on the session's page:
+
+- **Country** `AT`. ÖBB's file from the same portal declares no time zone; a file without one
+  gets its provider's country zone, and with neither MOTIS drops it (§6.22 of the admin guide);
+- **format** NeTEx-EPIP (the detection's EPIP fallback);
+- **source** NAP, resolver
+  `{"type": "permalink", "url": "https://data.mobilitaetsverbuende.at/api/public/v1/data-sets/<id>/{timetable_year}/file"}`;
+- **credential**: the AT *Login* (the one the OBB card uses). **Accept that data set's licence on
+  the portal with the same account first**: a licence not accepted answers 401 at the refresh;
+- leave **Rail by default** unticked: these files hold buses and trams too.
+
+Save, then refresh the provider. Its first refresh queues a rebuild: on eu19, turn on **Always for
+this session** (max-memory) before it (admin guide §6.25), as every file added makes MOTIS's
+import larger. The end of the rebuild log then names it (`netex for MOTIS: <feed>.zip rewritten`,
+`motis time zone: <feed>.zip → Europe/Vienna`).
 
 ### Still manual (not in the map)
 

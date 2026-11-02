@@ -890,7 +890,7 @@ provider list — give them country-scoped feed_ids:
 
 | File | Filename hint | Reality |
 |---|---|---|
-| AT-NAP | OBB (legacy assumption) | OBB + Westbahn + private RUs + Montafonerbahn |
+| AT-NAP | OBB (legacy assumption) | OBB + Westbahn + Raaberbahn/GYSEV + Montafonerbahn + ÖGEG — not the other private railways (GKB, Steiermarkbahn, …), which are in the regional data sets (`nap-feed-resolvers.md`, "Austria: the regional data sets") |
 | CH-NAP | (no hint) | SBB + BLS + RhB + MOB + 482 unique operators incl. funiculars |
 | DE-NAP | "gesamtdeutschland" | DB + Flixtrain + every regional concession |
 | LU-NAP | (no hint) | Mostly AVL bus authority; CFL likely included in unsampled XMLs |
@@ -998,7 +998,7 @@ skip them, or fork a transit-focused-scope session for urban modes.
 | LU | LU NAP NeTEx bundle | NeTEx-EPIP (via EPIP fallback) | Multi (AVL + likely CFL) | Bus-heavy; check CFL coverage if rail is the priority |
 | NL | `gtfs.ovapi.nl/nl/gtfs-nl.zip` (OpenOV) | GTFS | **Multi-operator** (NS + Eurosleeper + Eurostar NL + Arriva + ICE Intl + …) | Skip the IFF on NDOV — use OpenOV |
 | DE | DE NAP gesamtdeutschland NeTEx | NeTEx-EPIP (via EPIP fallback) | Multi (DB + Flixtrain + all regional) | 1.5 GB+ file, 27k+ XMLs — heavy |
-| AT | AT NAP NeTEx EVU bundle | NeTEx-EPIP (via EPIP fallback) | Multi (OBB + Westbahn + private RUs) | — |
+| AT | AT NAP NeTEx EVU bundle (data set 67) + the regional data sets 59–65 | NeTEx-EPIP (via EPIP fallback) | Multi (OBB + Westbahn + Raaberbahn/GYSEV + Montafonerbahn + ÖGEG); the regional sets: every other operator, ÖBB left out | Data set 67 has no GKB, Steiermarkbahn or local transport (`nap-feed-resolvers.md`, "Austria: the regional data sets") |
 | IT | Trenitalia NAP NeTEx + Trenord regional GTFS | NeTEx-EPIP + GTFS | Per-operator | **Italo not available** (no public feed) |
 | LI | (folded into CH extract) | — | — | LI ≈ 5 MB; CH covers it |
 | CH | CH NAP NeTEx (single bundle of every operator) | NeTEx-EPIP (via EPIP fallback) | **Multi (482 operators!)** | Codespace is `ch:1:` — was being rejected pre-2026-06 detect fix |
