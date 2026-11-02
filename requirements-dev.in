@@ -19,20 +19,20 @@
 # pytest-asyncio 1.x is the pytest-9-compatible line; we keep
 # `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
 # to be re-decorated with @pytest.mark.asyncio.
-pytest==9.1.1
-pytest-asyncio==1.4.0
+pytest==9.2.0
+pytest-asyncio==1.4.1
 pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
 # Lint / format / type
-ruff==0.17.2               # also our formatter — black was dropped in audit
+ruff==0.17.3               # also our formatter — black was dropped in audit
                             # #21 closure (drop-in replacement, eliminates
                             # ruff-format ↔ black flip-flop on Alembic files).
                             # GHSA-3936-cmfr-pm3m (the black ReDoS) is moot
                             # once black is removed.
                             # The ruff hooks of .pre-commit-config.yaml are
                             # local and run this one: nothing to bump by hand.
-mypy==2.4.0                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
+mypy==2.4.1                 # major bump — 2.0 narrows `str | int` more strictly + drops some redundant ignores
 
 # Security
 bandit==1.9.4
@@ -49,7 +49,7 @@ pre-commit-hooks==6.0.0
 
 # The compiler of the lock files; CI runs it too, to check that each lock matches
 # its source (same version as the Multimodal Station Mapping module's lock files).
-uv==0.13.5
+uv==0.13.6
 
 # Stubs for mypy strict mode
 types-requests==2.33.0.20261006
