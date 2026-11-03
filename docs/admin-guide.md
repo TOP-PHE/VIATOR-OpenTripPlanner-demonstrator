@@ -2656,6 +2656,36 @@ To see which jobs were held back and why:
 docker compose -p viator exec -T postgres psql -U viator -d viator -c "SELECT created_at, started_at, status, max_memory, left(log, 120) FROM rebuild_jobs ORDER BY created_at DESC LIMIT 5;"
 ```
 
+### 6.26 An Austrian railway has no train: the national rail file leaves it out (GKB)
+
+Symptom (2 Nov, eu19): from Wien to a station of the Graz-Köflacher Bahn,
+ÖBB HAFAS's fastest trips use GKB trains (operator *GKB - Graz-Köflacher Bahn
+und Busbetrieb GmbH*, about 4 h, 2 to 5 legs). VIATOR finds none of them: it
+detours with ÖBB trains and buses, 5 to 9 legs, 15 min to 3 h longer. The
+rebuild log shows no ÖBB course dropped.
+
+Cause: the Austrian file VIATOR reads (`obb.zip`, data set 67) holds only
+ÖBB-Personenverkehr, Raaberbahn/GYSEV, Montafonerbahn, WESTbahn and the ÖGEG
+heritage railways. Every other railway, and all local transport, is in its
+regional authority's data set. The graph is right about the file it was
+given.
+
+To check whether a feed names an operator at all (here: `GKB` in eu19's
+`obb.zip`; `0 of 431` on 2 Nov):
+
+```bash
+docker compose -p viator exec -T worker python3 -c "import glob,sys,zipfile; f=glob.glob('/data/inbox/'+sys.argv[1]+'/**/'+sys.argv[2], recursive=True)[0]; z=zipfile.ZipFile(f); print(f, sum(1 for m in z.namelist() if sys.argv[3].encode() in z.read(m)), 'of', len(z.namelist()), 'files name', sys.argv[3])" <sid> obb.zip GKB
+```
+
+`0 of N`: the operator is not in that file; find its regional data set.
+More than 0: it is in the file, so look at the rebuild log's
+`motis import errors` and §6.22 to §6.24.
+
+Fix: add the region's data set as a new provider of the session (Styria, for
+GKB: data set 60). The list of regional data sets and the provider settings
+are in `docs/nap-feed-resolvers.md`, "Austria: the regional data sets". Then
+search the same journey again.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:
