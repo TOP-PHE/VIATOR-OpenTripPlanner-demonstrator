@@ -270,7 +270,7 @@ to re-onboard from scratch.
 - **Official NAP**: http://www.mobilitydata.gv.at/ (note: HTTP not HTTPS in PDF — operator should verify whether it redirects to HTTPS)
 - **Currently onboarded**: `AT-NAP_netex_evu_2026.zip` (NeTEx-EPIP), data set 67 on data.mobilitaetsverbuende.at — ÖBB-Personenverkehr (with the ÖBB Intercity bus), Raaberbahn/GYSEV, Montafonerbahn, WESTbahn and the ÖGEG heritage railways **only**. *(Corrected 2026-11-02: this line said "+ regional Verkehrsverbünde"; it never held them.)* The other railways (GKB, Steiermarkbahn, …) and all local transport are in the regional authorities' data sets, one NeTEx file per region with ÖBB left out: see `docs/nap-feed-resolvers.md`, "Austria: the regional data sets". eu19 had no GKB train until one was added (admin guide §6.26)
 - **Compliance check**: Confirm the AT-NAP bundle on mobilitydata.gv.at. AT also has a separate `mobilitaetsdaten.gv.at` (with the 's') — those are the two faces of the same federal NAP.
-- **Auth**: Login (*Corrected 2026-11-02*: the file needs the AT *Login* credential and each data set's licence accepted on the portal; `docs/nap-feed-resolvers.md`, "Portals that need an account")
+- **Auth**: Login (*Corrected 2026-11-02*: the file needs the AT *Login* credential and the portal's data licence, accepted once per account for every data set; `docs/nap-feed-resolvers.md`, "Portals that need an account")
 - **Refresh**: Annual major + weekly minor
 
 ### 🇮🇹 IT — Italy · ⚠ Compliance check needed
