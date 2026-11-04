@@ -117,18 +117,29 @@ def test_fanout_surfaces_federated_trips_when_no_single_session_result(
         return ({}, [])
 
     monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
 
-    fake_stitch = {
-        "departure_at": "2026-05-22T08:00:00Z",
-        "arrival_at": "2026-05-22T12:00:00Z",
-        "duration_seconds": 14400,
-        "num_transfers": 2,
-        "modes": "RAIL",
-        "legs": [],
-        "via_hubs": ["8500010"],
-        "stitched_from_sessions": ["nap-eu-corridors", "nap-ch-rail"],
-        "federated": True,
-    }
+    from datetime import datetime
+
+    from app.journey.canonical import CanonicalJourney, CanonicalTiming, JourneySource
+
+    # A stitched journey as the planner gives it since #303 (canonical, its hubs and
+    # sessions in its source).
+    fake_stitch = CanonicalJourney(
+        id="federated:8500010:otp:a:0+otp:b:0",
+        source=JourneySource(
+            provider="otp",
+            role="viator",
+            adapter_version=1,
+            via_hubs=["8500010"],
+            stitched_from_sessions=["nap-eu-corridors", "nap-ch-rail"],
+        ),
+        legs=[],
+        departure=CanonicalTiming(timetabled=datetime.fromisoformat("2026-05-22T08:00:00+00:00")),
+        arrival=CanonicalTiming(timetabled=datetime.fromisoformat("2026-05-22T12:00:00+00:00")),
+        duration_seconds=14400,
+        source_transfer_count=2,
+    )
 
     async def _fake_plan_federated(*_a, **_k):
         return [fake_stitch]
@@ -148,9 +159,10 @@ def test_fanout_surfaces_federated_trips_when_no_single_session_result(
     body = r.json()
     assert body["trips"] == []  # no single-session itinerary
     assert body["federated_trips"], "federated fallback should have produced a stitch"
-    stitch = body["federated_trips"][0]
-    assert stitch["via_hubs"] == ["8500010"]
-    assert stitch["stitched_from_sessions"] == ["nap-eu-corridors", "nap-ch-rail"]
+    stitch = body["federated_trips"][0]  # canonical JSON
+    assert stitch["source"]["via_hubs"] == ["8500010"]
+    assert stitch["source"]["stitched_from_sessions"] == ["nap-eu-corridors", "nap-ch-rail"]
+    assert stitch["schema_version"] == "1"
 
 
 def test_fanout_skips_federated_without_uic(
@@ -163,6 +175,7 @@ def test_fanout_skips_federated_without_uic(
         return ({}, [])
 
     monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
 
     called = {"hit": False}
 
@@ -199,6 +212,7 @@ def test_fanout_hands_the_request_positions_to_the_federated_planner(
         return ({}, [])
 
     monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
 
     seen: dict = {}
 

@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 
 from ..models import Session as SessionRow
 from . import motis_client, otp_client
+from .canonical import CanonicalJourney
 
 
 class _FetchPlan(Protocol):
@@ -53,10 +54,34 @@ class _FetchPlan(Protocol):
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]: ...
 
 
+class _FetchJourneys(Protocol):
+    """`fetch_journeys`: the same arguments as `fetch_plan`, the answer as canonical journeys
+    (#303). `fetch_plan` gives the same answer as today's trip dicts, for the callers not on
+    canonical journeys yet (coverage and replay, #303 PR 4)."""
+
+    async def __call__(
+        self,
+        *,
+        session_id: str,
+        from_lat: float,
+        from_lon: float,
+        to_lat: float,
+        to_lon: float,
+        when: datetime,
+        timeout_ms: int,
+        num_itineraries: int = ...,
+        search_window_seconds: int = ...,
+        from_stop_id: str | None = ...,
+        to_stop_id: str | None = ...,
+        session_timezone: str | None = ...,
+    ) -> tuple[dict[str, Any], list[CanonicalJourney]]: ...
+
+
 class _Planner(Protocol):
     """Either `otp_client` or `motis_client`, narrowed to what we use."""
 
     fetch_plan: _FetchPlan
+    fetch_journeys: _FetchJourneys
 
 
 def get_planner(session: SessionRow) -> _Planner:

@@ -407,6 +407,7 @@
    below and the new VIATOR-vs-ÖBB modal in network_coverage.html both
    consume one source of truth. #}
 <link rel="stylesheet" href="/static/app/css/compare_grid.css">
+<script src="/static/app/js/canonical_view.js"></script>
 <script src="/static/app/js/compare_grid.js"></script>
 <script>
 const SUGGEST_MIN = 2;
@@ -779,7 +780,8 @@ document.getElementById('journey-form').addEventListener('submit', async (e) => 
       results.innerHTML = `<p style="color: var(--fail)">Search failed: ${j.detail || r.status}</p>`;
       return;
     }
-    render(await r.json());
+    // #303: the API answers in canonical journeys; the page renders their display model.
+    render(CanonicalView.fromFanout(await r.json()));
   } catch (err) {
     // Network / parse exceptions land here. Without this catch, a thrown
     // error left the "Searching…" placeholder visible forever — and,
@@ -928,7 +930,7 @@ function comparisonPill(tag) {
 // — return '' so nothing renders. OJP trips share the normalised trip
 // shape, so legsHTML / operatorsForTrip / fmt / dur all just work; the
 // cards carry class `trip-card` so render()'s expand-wiring catches
-// them too. No {} JSON button — OJP trips carry no _raw_itinerary.
+// them too. Their {} button shows the OJP journey's canonical JSON.
 function renderOjpReference(ref) {
   if (!ref) return '';
   let head;
@@ -989,8 +991,8 @@ function renderOjpReference(ref) {
 // as the OJP renderer (`renderOjpReference`); the cards carry class
 // `trip-card` so render()'s expand-wiring catches them, plus the
 // distinct `hafas-ref-card` class for the amber left-accent border.
-// No {} JSON button on these cards — HAFAS trips don't carry a
-// _raw_itinerary slice (the raw mgate payload isn't persisted).
+// No {} JSON button on these cards (the raw mgate payload isn't
+// persisted, and ÖBB journeys are shown in the comparison grid).
 // v0.1.44 — ÖBB HAFAS trip card markup, extracted out of
 // renderHafasReference()'s inline builder so renderViatorOebbPairedGrid
 // can render one card at a time (paired-grid rows interleave VIATOR
@@ -1037,7 +1039,7 @@ function renderHafasReference(ref) {
 }
 
 // v0.1.26 — JSON inspector. Stash the full payload globally so the
-// click handler can pull the matching trip's _raw_itinerary on demand.
+// click handler can show the matching journey's canonical JSON on demand.
 let _LAST_PAYLOAD = null;
 
 // v0.1.41 — cross-session (federated) itineraries: stitched from 2+ sessions
@@ -1226,7 +1228,7 @@ function _renderComparisonCell(trip, engine, tripIndex) {
         <div class="top-actions">
           <button type="button" class="json-btn" data-action="show-json"
                   data-trip-index="${tripIndex}"
-                  title="Show OTP JSON for this itinerary">{}</button>
+                  title="Show this journey's JSON">{}</button>
         </div>
       </div>
       <div style="font-size: 0.8rem; color: var(--rail-steel); margin-top: 0.3rem">
@@ -1461,7 +1463,7 @@ function _viatorTripCardHtml(t, i, isDuplicate) {
       <div class="top-actions">
         ${tripOps ? `<span style="margin-right:0.3rem">${tripOps}</span>` : ''}
         <button type="button" class="json-btn" data-action="show-json" data-trip-index="${i}"
-                title="Show OTP JSON for this itinerary">{}</button>
+                title="Show this journey's JSON">{}</button>
         ${cmp}
         ${dupBadge}
         <span class="flag ${flag}">${t.origin_flag}</span>
@@ -1823,30 +1825,27 @@ function showJsonInspector(tripIndex) {
   if (!payload) return;
   const t = payload.trips[tripIndex];
   if (!t) return;
-  // Prefer the raw OTP itinerary slice (v0.1.26 _raw_itinerary). Fall
-  // back to the normalised trip if missing — works for legacy snapshots
-  // pre-v0.1.26 that don't carry _raw_itinerary.
-  const raw = t.best._raw_itinerary || t.best;
-  const text = JSON.stringify(raw, null, 2);
+  // #303: the journey as the API sent it (canonical JSON); the engines' own
+  // answers stay in the database (design D3).
+  const shown = t.best._canonical || t.best;
+  const text = JSON.stringify(shown, null, 2);
   document.getElementById('json-modal-title').textContent =
-    `OTP itinerary #${tripIndex + 1} — ${t.origin_flag} · found in: ${t.found_in_sessions.join(', ')}`;
+    `Journey #${tripIndex + 1} — ${t.origin_flag} · found in: ${t.found_in_sessions.join(', ')}`;
   document.getElementById('json-modal-pre').textContent = text;
   document.getElementById('json-modal').hidden = false;
 }
 
-// v0.1.35.02 — same modal, OJP side. Pulls the normalised trip dict
-// from payload.ojp_reference.trips[i] (no _raw_itinerary on the OJP
-// side — the OJP adapter only stores the normalised shape, not the
-// raw TripResult XML). Comparison tag rides along so we can see at a
-// glance why this trip is in its bucket.
+// v0.1.35.02 — same modal, OJP side: the OJP journey as the API sent it
+// (canonical JSON, #303). Its comparison tag rides along in the title so
+// we can see at a glance why this journey is in its bucket.
 function showOjpJsonInspector(tripIndex) {
   const payload = _LAST_PAYLOAD;
   if (!payload || !payload.ojp_reference) return;
   const t = (payload.ojp_reference.trips || [])[tripIndex];
   if (!t) return;
-  const text = JSON.stringify(t, null, 2);
+  const text = JSON.stringify(t._canonical || t, null, 2);
   document.getElementById('json-modal-title').textContent =
-    `OJP itinerary #${tripIndex + 1}${t.comparison ? ' — ' + t.comparison : ''}`;
+    `OJP journey #${tripIndex + 1}${t.comparison ? ' — ' + t.comparison : ''}`;
   document.getElementById('json-modal-pre').textContent = text;
   document.getElementById('json-modal').hidden = false;
 }

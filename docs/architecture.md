@@ -343,16 +343,19 @@ each step is worth reading in the source, but the shape is:
 | `compare_ojp` / `compare_hafas` | bool | per-search opt-in, both default false |
 | `engine` | `"otp"` \| `"motis"` \| null | null = no filter |
 
-Fanout response:
+Fanout response — every journey in it is a **CanonicalJourney** as JSON (#303;
+`docs/schemas/canonical-journey-v1.schema.json`, times in UTC `…Z`). The page turns them into its
+display model in one place, `app/static/js/canonical_view.js`; no engine payload is sent
+(`_raw_itinerary` is gone, the `{}` button shows the canonical journey):
 
 | Key | Present when | Shape |
 |---|---|---|
 | `search_id`, `status` | always | `ok` \| `partial` \| `no_route` \| `error` |
-| `trips[]` | always | `{signature, found_in_sessions[], by_session{}, best, origin_flag, comparison?}` |
+| `trips[]` | always | `{signature, found_in_sessions[], by_session{}, best, origin_flag, comparison?}`; `best` is the slot's shortest canonical journey |
 | `executions[]` | always | `{session_id, engine, graph_snapshot_id?, status, num_itineraries, response_ms, reason?, detail?, timetable_window?}`; the last three only when the engine refused the date (#338): `reason` = `outside_timetable`, `timetable_window` = `{from, until}` (UTC, end excluded) when MOTIS named it |
-| `ojp_reference` / `hafas_reference` | opt-in + configured | `{status, trips[], response_ms, error?, pages?}` |
+| `ojp_reference` / `hafas_reference` | opt-in + configured | `{status, trips[], response_ms, error?, pages?}`; `trips[]` canonical journeys, ids unique across pages; OJP also `comparison{journey id: tag}` |
 | `comparison_summary` | OJP returned `ok` | `{common, otp_only, ojp_only}` |
-| `federated_trips[]` | nothing merged + both UICs | hub-stitched itineraries, rendered separately |
+| `federated_trips[]` | nothing merged + both UICs | hub-stitched canonical journeys (`source.via_hubs`, `source.stitched_from_sessions`), rendered separately |
 
 ### Invariants & traps
 
@@ -485,7 +488,7 @@ Federated stitches add `via_hubs: list[str]`, `stitched_from_sessions: list[str]
 
 ### Data shapes — the canonical leg dict
 
-Same 22 keys from all four clients (`ojp_client._blank_leg()` is the literal reference definition):
+Same 22 keys from all four clients. Since #303 PR 3a every client builds them the same way: its canonical adapter (`app/journey/canonical_adapters/`) reads the engine's answer into a `CanonicalJourney`, and the temporary bridge `canonical_adapters/trip_dict.py` writes this dict from it (the bridge is the reference definition until PR 4 stores canonical journeys):
 
 | Key | Type | Notes / per-engine quirks |
 |---|---|---|
@@ -587,8 +590,9 @@ lat/lon stands in. Each try that reaches a decision is counted by how it ended i
 ### Invariants & traps
 
 - **The canonical leg dict is a contract, not a convention.** Add a key to one client and you have
-  silently created a two-shape system; `ojp_client._blank_leg()` is the de-facto schema and the
-  legs are stored verbatim in `journey_trips.legs` (JSONB) for replay and audit.
+  silently created a two-shape system; `canonical_adapters/trip_dict.py` writes it for all four
+  clients (#303 PR 3a) and the legs are stored verbatim in `journey_trips.legs` (JSONB) for replay
+  and audit.
 - **UIC is the cross-engine identity.** If `_uic_from_stop_id` stops parsing a feed's stop-id
   dialect, `transit_fingerprint` silently degrades to a 110 m coordinate match — no error, just a
   comparison that reports everything as `*_only`. Test new feeds against it.
@@ -2764,8 +2768,8 @@ OJP 2.0 XML**, verified on the wire against the live opentransportdata.swiss end
 
 **Serving OJP is the inverse of code that already exists and is proven against a real endpoint.**
 Stage 2 is therefore *marshalling, not protocol research*: parse the inbound request into the
-existing fanout call, then emit `TripResult`s from the canonical trip dicts that `_blank_leg()`
-(chapter 4) already defines. Scope discipline matters more than speed here: **`OJPTripRequest` only**
+existing fanout call, then emit `TripResult`s from the canonical journeys (#303:
+`app/journey/canonical/mappers/ojp.py` is the proof of concept). Scope discipline matters more than speed here: **`OJPTripRequest` only**
 to start, with `OJPLocationInformationRequest` second because `app/api/geocode.py` already performs
 that lookup. Responses will be validated against the official XSDs from the VDVde/OJP repository
 using lxml - the same technique already used for NeTEx XSD validation in this project.

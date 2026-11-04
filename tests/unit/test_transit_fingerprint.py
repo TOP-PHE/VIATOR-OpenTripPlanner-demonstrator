@@ -26,6 +26,7 @@ import pytest
 
 from app.api.journey import _build_comparison
 from app.journey.signature import _fingerprint_stop_token, transit_fingerprint
+from tests.unit.canonical_fixtures import journey_from_legs
 
 # ─────────────────── canonical-token passthrough ───────────────────
 
@@ -568,13 +569,19 @@ class TestCrossEngineMatching:
 
 def _merged_trip(legs: list[dict[str, Any]]) -> dict[str, Any]:
     """Build the merged_trip shape `journey.fanout` produces — only
-    `best.legs` is read by `_build_comparison`, the rest is irrelevant
-    here."""
-    return {"best": {"legs": legs}}
+    `best` (a canonical journey since #303) is read by `_build_comparison`,
+    the rest is irrelevant here."""
+    return {"best": journey_from_legs(legs, provider="otp")}
 
 
 def _ojp_ref(*trips: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"status": "ok", "trips": [{"legs": legs} for legs in trips]}
+    journeys = [journey_from_legs(legs, provider="ojp", rank=i) for i, legs in enumerate(trips)]
+    return {"status": "ok", "trips": journeys}
+
+
+def _ojp_tags(ref: dict[str, Any]) -> list[str]:
+    """The reference's tags, in journey order (they are keyed by journey id)."""
+    return [ref["comparison"][journey.id] for journey in ref["trips"]]
 
 
 class TestBuildComparison:
@@ -602,8 +609,7 @@ class TestBuildComparison:
         # Per-trip tags attached for the UI badge.
         tags_otp = [t["comparison"] for t in otp]
         assert tags_otp == ["common", "otp_only"]
-        tags_ojp = [t["comparison"] for t in ref["trips"]]
-        assert tags_ojp == ["common", "ojp_only"]
+        assert _ojp_tags(ref) == ["common", "ojp_only"]
 
     def test_walk_only_otp_trip_tagged_uncomparable(self):
         # Degenerate case: an OTP itinerary that's all walking (very
@@ -640,7 +646,7 @@ class TestBuildComparison:
         summary = _build_comparison(otp, ref)
         assert summary == {"common": 1, "otp_only": 0, "ojp_only": 0}
         assert otp[0]["comparison"] == "common"
-        assert ref["trips"][0]["comparison"] == "common"
+        assert _ojp_tags(ref) == ["common"]
 
 
 # ─────────────────── module wiring sanity ───────────────────

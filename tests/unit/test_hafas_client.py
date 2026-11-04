@@ -3,9 +3,10 @@ top of ÖBB's public HAFAS backend.
 
 Three layers, mirroring `test_external_verify.py`:
 
-  1. Pure normaliser helpers (`_index_locations`, `_index_products`,
-     `_index_operators`, `_hafas_dt_to_utc_iso`, `_map_cat_to_mode`,
-     `_section_duration_seconds`) — no network, deterministic.
+  1. Pure normaliser helpers, in `canonical_adapters.hafas_adapter` since
+     #303 PR 3a (`_index_locations`, `_index_products`, `_index_operators`,
+     `hafas_time_to_utc_iso`, `map_category_to_mode`,
+     `section_duration_seconds`) — no network, deterministic.
   2. `_normalise_payload` end-to-end: a HAFAS-shaped TripSearch
      payload → canonical trip dicts (matches OTP / MOTIS / OJP shape,
      including the PR-3 `first_transit_leg_departure_utc` field).
@@ -25,7 +26,9 @@ import httpx
 import pytest
 
 from app.journey import hafas_client
+from app.journey.canonical_adapters import hafas_adapter
 from app.network_coverage import external_verify
+from tests.unit.canonical_fixtures import reference_journey
 
 # ─────────────────────── pure helpers ───────────────────────
 
@@ -46,7 +49,7 @@ def test_index_locations_inverts_micro_degrees_to_decimals() -> None:
             "crd": {"x": 13_046_700, "y": 47_812_700},
         },
     ]
-    out = hafas_client._index_locations(loc_l)
+    out = hafas_adapter._index_locations(loc_l)
     assert out[0]["name"] == "Wien Hbf"
     assert out[0]["lid"] == "A=1@L=8103000@"
     # lat = y / 1e6, lon = x / 1e6 — inverting LocGeoPos's swap.
@@ -59,7 +62,7 @@ def test_index_locations_handles_missing_coords() -> None:
     """Some HAFAS entries (e.g. category-only sentinels in the common
     pool) lack `crd`. The normaliser must default lat/lon to None so
     a card without coords renders rather than crashing."""
-    out = hafas_client._index_locations([{"name": "no coords"}])
+    out = hafas_adapter._index_locations([{"name": "no coords"}])
     assert out[0]["name"] == "no coords"
     assert out[0]["lat"] is None
     assert out[0]["lon"] is None
@@ -77,7 +80,7 @@ def test_index_products_pulls_name_line_cat_oprx() -> None:
             "oprX": 0,
         }
     ]
-    out = hafas_client._index_products(prod_l)
+    out = hafas_adapter._index_products(prod_l)
     assert out[0]["name"] == "RJ 1141"
     assert out[0]["line"] == "RJ"
     assert out[0]["cat"] == "RAIL"
@@ -86,7 +89,7 @@ def test_index_products_pulls_name_line_cat_oprx() -> None:
 
 def test_index_operators_extracts_name_id() -> None:
     op_l = [{"name": "ÖBB-Personenverkehr AG", "id": "OBB"}]
-    out = hafas_client._index_operators(op_l)
+    out = hafas_adapter._index_operators(op_l)
     assert out[0]["name"] == "ÖBB-Personenverkehr AG"
     assert out[0]["id"] == "OBB"
 
@@ -117,7 +120,7 @@ def test_map_cat_to_mode(category: str | int | None, expected_mode: str) -> None
     vocabulary. The pass-through case is deliberate — a new category
     we haven't classified should still be visible in diagnostics
     rather than silently collapsed to a wrong bucket."""
-    assert hafas_client._map_cat_to_mode(category) == expected_mode
+    assert hafas_adapter.map_category_to_mode(category) == expected_mode
 
 
 def test_hafas_dt_to_utc_iso_localises_vienna_time_to_utc() -> None:
@@ -125,7 +128,7 @@ def test_hafas_dt_to_utc_iso_localises_vienna_time_to_utc() -> None:
     must convert to UTC for cross-engine consistency with the recorder
     (which expects `+00:00`-suffixed strings)."""
     # 2026-06-28 08:30:15 Europe/Vienna (CEST, UTC+2) → 06:30:15 UTC
-    iso = hafas_client._hafas_dt_to_utc_iso("20260628", "083015")
+    iso = hafas_adapter.hafas_time_to_utc_iso("20260628", "083015")
     assert iso == "2026-06-28T06:30:15+00:00"
 
 
@@ -134,7 +137,7 @@ def test_hafas_dt_to_utc_iso_handles_day_roll_prefix() -> None:
     prefix on the time field (e.g. "01024500" = next-day 02:45:00).
     The normaliser must add the offset to the date — silently dropping
     the prefix would put a +1 day train on yesterday."""
-    iso = hafas_client._hafas_dt_to_utc_iso("20260628", "01024500")
+    iso = hafas_adapter.hafas_time_to_utc_iso("20260628", "01024500")
     # 2026-06-29 02:45:00 Europe/Vienna (CEST) → 00:45:00 UTC same day.
     assert iso == "2026-06-29T00:45:00+00:00"
 
@@ -143,19 +146,19 @@ def test_hafas_dt_to_utc_iso_handles_day_roll_prefix() -> None:
 def test_hafas_dt_to_utc_iso_returns_none_on_bad_date(bad_date: str) -> None:
     """Malformed date must return None rather than crash the
     normaliser — one bad row shouldn't drop the whole panel."""
-    assert hafas_client._hafas_dt_to_utc_iso(bad_date, "083015") is None
+    assert hafas_adapter.hafas_time_to_utc_iso(bad_date, "083015") is None
 
 
 @pytest.mark.parametrize("bad_time", [None, "", "abcdef"])
 def test_hafas_dt_to_utc_iso_returns_none_on_bad_time(bad_time) -> None:
-    assert hafas_client._hafas_dt_to_utc_iso("20260628", bad_time) is None
+    assert hafas_adapter.hafas_time_to_utc_iso("20260628", bad_time) is None
 
 
 def test_section_duration_seconds_prefers_gis_dur() -> None:
     """`gis.dur` is the walk-time HAFAS computed — prefer it over a
     derived dep/arr difference when both are present."""
     sec = {"gis": {"dur": "000300"}}  # 3 minutes
-    out = hafas_client._section_duration_seconds(
+    out = hafas_adapter.section_duration_seconds(
         sec, "2026-06-28T08:00:00+00:00", "2026-06-28T08:15:00+00:00"
     )
     assert out == 180
@@ -165,7 +168,7 @@ def test_section_duration_seconds_falls_back_to_iso_diff() -> None:
     """No gis.dur → compute from dep/arr ISO strings. Useful when
     HAFAS omits the gis block on a transit section (where the
     duration comes from the train timetable, not a walk routing)."""
-    out = hafas_client._section_duration_seconds(
+    out = hafas_adapter.section_duration_seconds(
         {}, "2026-06-28T08:00:00+00:00", "2026-06-28T10:30:00+00:00"
     )
     assert out == 2 * 3600 + 30 * 60
@@ -174,7 +177,7 @@ def test_section_duration_seconds_falls_back_to_iso_diff() -> None:
 def test_section_duration_seconds_zero_when_unparseable() -> None:
     """Neither gis nor ISO inputs → 0, not None — keeps the canonical
     leg dict's `duration_seconds` type stable for downstream consumers."""
-    assert hafas_client._section_duration_seconds({}, None, None) == 0
+    assert hafas_adapter.section_duration_seconds({}, None, None) == 0
 
 
 # ─────────────────────── _normalise_payload end-to-end ───────────────────────
@@ -326,7 +329,7 @@ def test_normalise_payload_walking_section_marked_walk() -> None:
 def test_normalise_payload_missing_secl_drops_connection() -> None:
     """A connection with neither `dep` nor `arr` populated isn't usable
     — better to drop the row than render a card with empty fields."""
-    # date is required by `_normalise_connection`; missing → drop.
+    # date is required by the HAFAS adapter; missing → drop.
     trips = hafas_client._normalise_payload(_hafas_payload([{"dep": {}, "arr": {}, "secL": []}]))
     assert trips == []
 
@@ -431,8 +434,9 @@ async def test_fetch_plan_happy_returns_ok_and_trips() -> None:
     assert raw["from_lid"] == "A=1@L=8103000@"
     assert raw["to_lid"] == "A=1@L=8100002@"
     assert len(trips) == 1
-    assert trips[0]["modes"] == "RAIL"
-    assert trips[0]["first_transit_leg_departure_utc"]
+    # Canonical journeys since #303: a rail ride with a boarding time.
+    assert [str(m) for m in trips[0].modes] == ["RAIL"]
+    assert trips[0].first_boarding is not None
 
 
 @pytest.mark.asyncio
@@ -657,33 +661,12 @@ async def test_external_verify_facade_unchanged_after_refactor() -> None:
 # test, not the wire format underneath a single page.
 
 
-def _make_hafas_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str) -> dict:
-    """A minimal trip dict whose transit_fingerprint is determined by
-    (route, from_uic, to_uic, dep_minute) — same shape convention as
-    test_ojp_client.py's _make_trip."""
-    return {
-        "duration_seconds": 1800,
-        "num_transfers": 0,
-        "departure_at": dep_iso,
-        "arrival_at": dep_iso,
-        "modes": "RAIL",
-        "legs": [
-            {
-                "mode": "RAIL",
-                "from_lat": 48.1859,
-                "from_lon": 16.3754,
-                "to_lat": 47.8127,
-                "to_lon": 13.0467,
-                "from_stop_id": f"HAFAS:{from_uic}",
-                "to_stop_id": f"HAFAS:{to_uic}",
-                "departure": dep_iso,
-                "arrival": dep_iso,
-                "route_short_name": route,
-                "feed_id": "fahrplan.oebb.at",
-            }
-        ],
-        "feed_id": "fahrplan.oebb.at",
-    }
+def _make_hafas_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str):
+    """A one-ride hafas journey whose `transit_fingerprint` is set by
+    (route, from_uic, to_uic, dep_minute), for the pagination tests."""
+    return reference_journey(
+        "hafas", dep_iso=dep_iso, route=route, from_uic=from_uic, to_uic=to_uic
+    )
 
 
 class TestFetchPlanPaginated:
