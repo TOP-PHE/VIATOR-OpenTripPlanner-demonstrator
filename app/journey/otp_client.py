@@ -39,8 +39,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from .trip_normalize import clean_operator_name
-from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+from .canonical import CanonicalJourney
+from .canonical_adapters import otp_adapter
+from .canonical_adapters._common import source_rank
+from .canonical_adapters.trip_dict import to_trip_dict
 
 log = logging.getLogger(__name__)
 
@@ -184,7 +186,7 @@ def _plan_location(stop_id: str | None, lat: float, lon: float) -> dict[str, Any
     return {"location": {"coordinate": {"latitude": lat, "longitude": lon}}}
 
 
-async def fetch_plan(
+async def fetch_journeys(
     *,
     session_id: str,
     from_lat: float,
@@ -198,7 +200,7 @@ async def fetch_plan(
     from_stop_id: str | None = None,
     to_stop_id: str | None = None,
     session_timezone: str | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[CanonicalJourney]]:
     """Call OTP's `planConnection`. Returns (raw_response, trips_for_recorder).
 
     Raises httpx.HTTPError on transport / HTTP failure (caller maps to 'error').
@@ -290,7 +292,15 @@ async def fetch_plan(
             r.raise_for_status()
             raw = r.json()
 
-    return raw, _normalise(raw)
+    return raw, otp_adapter.journeys_from_plan(raw, session_id=session_id)
+
+
+async def fetch_plan(**kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """`fetch_journeys`, as today's trip dicts with OTP's own itinerary under
+    `_raw_itinerary`: for the callers not on canonical journeys yet (coverage and replay,
+    #303 PR 4). Same arguments as `fetch_journeys`."""
+    raw, journeys = await fetch_journeys(**kwargs)
+    return raw, _with_raw_itineraries(raw, journeys)
 
 
 # Phase budgets other than the read (#388 review), as in `motis_client`.
@@ -311,142 +321,23 @@ def _plan_timeout(timeout_ms: int) -> httpx.Timeout:
     return httpx.Timeout(connect=short_s, read=read_s, write=short_s, pool=short_s)
 
 
+def _with_raw_itineraries(
+    raw: dict[str, Any], journeys: list[CanonicalJourney]
+) -> list[dict[str, Any]]:
+    """Today's trip dicts of `journeys` (the temporary `trip_dict` bridge, #303), each with
+    OTP's own itinerary node under `_raw_itinerary` for the journey page's JSON inspector; the
+    recorder stores only the named keys."""
+    edges = (((raw or {}).get("data") or {}).get("planConnection") or {}).get("edges") or []
+    return [
+        {
+            **to_trip_dict(journey),
+            "_raw_itinerary": (edges[source_rank(journey)] or {}).get("node") or {},
+        }
+        for journey in journeys
+    ]
+
+
 def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Translate OTP's `planConnection` response into the recorder's `trips` format.
-
-    Per-leg fields captured (all optional — defensively coerced):
-
-      mode               WALK / RAIL / SUBWAY / BUS / etc.
-      departure / arrival  ISO 8601 UTC; OTP gives epoch ms, we convert
-      duration_seconds   leg duration; useful for expandable detail UI
-      distance_meters    leg distance (walking only meaningful for WALK)
-      from_name/lat/lon/stop_id  origin endpoint
-      to_name/lat/lon/stop_id    destination endpoint
-      route_short_name / route_long_name  e.g. "601A" / "Paris - Lyon TGV"
-      route_id           "<feed>:<route>" — full namespaced GTFS id (v0.1.26)
-      agency_name        operator-facing name e.g. "SNCF", "Trenitalia" (v0.1.26)
-      agency_id          "<feed>:<agency_id>" full GTFS id (v0.1.26)
-      feed_id            extracted from trip.gtfsId prefix — answers
-                         "which session-level feed did this leg come from"
-                         even when agency.name is null (v0.1.26)
-      trip_headsign      e.g. "Marseille via Lyon" (v0.1.26)
-      trip_id            "<feed>:<trip>" — full namespaced GTFS trip id (v0.1.26)
-
-    The journey UI's expandable detail (v0.1.7.x) reads these directly.
-    Keep the field shapes stable — they're stored verbatim in
-    `journey_trips.legs` (JSONB) for replay / audit.
-
-    v0.1.26 also attaches the raw OTP itinerary slice as `_raw_itinerary`
-    on each trip so the UI's JSON inspector can show OTP's exact reply
-    without an extra round-trip. The `_` prefix marks it as
-    presentation-layer-only — the recorder ignores fields starting with
-    underscore when persisting trips to journey_trips.legs.
-
-    v0.1.34 — reads `data.planConnection.edges[].node` (was
-    `data.plan.itineraries[]`). The itinerary node's `start` / `end` are
-    ISO-8601 OffsetDateTime strings (converted to UTC ISO here); its
-    `duration` is already seconds. Per-leg fields are unchanged from the
-    legacy `plan` query — leg `startTime` / `endTime` remain epoch-ms.
-    """
-    pc = ((raw or {}).get("data") or {}).get("planConnection") or {}
-    edges = pc.get("edges") or []
-    out: list[dict[str, Any]] = []
-    for edge in edges:
-        it = (edge or {}).get("node") or {}
-        legs_norm = []
-        modes_set = []
-        for leg in it.get("legs", []):
-            f = leg.get("from") or {}
-            t = leg.get("to") or {}
-            route = leg.get("route") or {}
-            agency = route.get("agency") or {}
-            trip_obj = leg.get("trip") or {}
-            # Derive feed_id from trip.gtfsId. Format is "<feedId>:<localId>"
-            # — same convention OTP uses for stop_id, route_id, agency_id.
-            # When the feed itself doesn't populate agency, this gives us
-            # a reliable fallback indicator of which provider ingested
-            # this leg.
-            trip_gtfs_id = trip_obj.get("gtfsId") or ""
-            feed_id_from_trip = trip_gtfs_id.split(":", 1)[0] if ":" in trip_gtfs_id else None
-            legs_norm.append(
-                {
-                    "mode": leg.get("mode"),
-                    "departure": _ms_to_iso(leg.get("startTime")),
-                    "arrival": _ms_to_iso(leg.get("endTime")),
-                    "duration_seconds": int(leg.get("duration") or 0),
-                    "distance_meters": float(leg.get("distance") or 0.0),
-                    "from_name": f.get("name"),
-                    "from_lat": f.get("lat"),
-                    "from_lon": f.get("lon"),
-                    "from_stop_id": ((f.get("stop") or {}).get("gtfsId")),
-                    "to_name": t.get("name"),
-                    "to_lat": t.get("lat"),
-                    "to_lon": t.get("lon"),
-                    "to_stop_id": ((t.get("stop") or {}).get("gtfsId")),
-                    "route_short_name": route.get("shortName"),
-                    "route_long_name": route.get("longName"),
-                    "route_id": route.get("gtfsId"),
-                    # v0.1.26 — operator visibility on each leg.
-                    "agency_name": clean_operator_name(agency.get("name")),
-                    "agency_id": agency.get("gtfsId"),
-                    "agency_url": agency.get("url"),
-                    "feed_id": feed_id_from_trip,
-                    "trip_id": trip_gtfs_id or None,
-                    "trip_headsign": trip_obj.get("tripHeadsign"),
-                }
-            )
-            if leg.get("mode"):
-                modes_set.append(leg["mode"])
-        out.append(
-            {
-                "duration_seconds": int(it.get("duration") or 0),
-                "num_transfers": max(
-                    0, len([lg for lg in legs_norm if lg.get("mode") not in (None, "WALK")]) - 1
-                ),
-                "departure_at": _iso_to_utc_iso(it.get("start")) or "",
-                "arrival_at": _iso_to_utc_iso(it.get("end")) or "",
-                "modes": ",".join(sorted(set(modes_set))),
-                "legs": legs_norm,
-                # PR-3 — first transit-leg boarding time in UTC ISO.
-                # The coverage runner uses this (NOT the itinerary-level
-                # `departure_at` which is the trip START — often a walk
-                # leg) to decide whether the trip belongs in a day-window
-                # slice. See app/journey/trip_normalize.py for the
-                # cross-client contract.
-                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
-                # v0.1.26 — raw OTP itinerary slice for the JSON inspector
-                # in the journey UI. Underscore prefix marks it as
-                # presentation-layer-only; recorder.persist_trip() drops
-                # any keys starting with underscore before INSERTing into
-                # journey_trips so the JSONB column stays stable.
-                "_raw_itinerary": it,
-            }
-        )
-    return out
-
-
-def _ms_to_iso(ms: Any) -> str | None:
-    """OTP leg times are epoch millis; render as ISO so the DB can store
-    them as TIMESTAMPTZ."""
-    if ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    except (TypeError, ValueError, OverflowError, OSError):  # pragma: no cover
-        return None
-
-
-def _iso_to_utc_iso(value: Any) -> str | None:
-    """Convert a `planConnection` itinerary `start`/`end` (ISO-8601 with
-    offset, e.g. "2026-05-18T11:03:00+02:00") to UTC ISO — matching the
-    shape `_ms_to_iso` produces for legs, so the recorder sees one
-    consistent format. Naive input is assumed UTC."""
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    """Today's trip dicts for a `planConnection` answer (field mapping in
+    `canonical_adapters.otp_adapter`); stored verbatim in `journey_trips.legs`."""
+    return _with_raw_itineraries(raw, otp_adapter.journeys_from_plan(raw))

@@ -1,0 +1,796 @@
+{
+  "$defs": {
+    "CanonicalLeg": {
+      "additionalProperties": false,
+      "properties": {
+        "arrival": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalTiming"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "continuous_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Continuous Mode"
+        },
+        "departure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalTiming"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "destination": {
+          "$ref": "#/$defs/CanonicalLocation"
+        },
+        "distance_meters": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Distance Meters"
+        },
+        "duration_seconds": {
+          "minimum": 0,
+          "title": "Duration Seconds",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "timed",
+            "transfer",
+            "continuous"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/CanonicalLocation"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalService"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Mode"
+        }
+      },
+      "required": [
+        "kind",
+        "origin",
+        "destination",
+        "duration_seconds"
+      ],
+      "title": "CanonicalLeg",
+      "type": "object"
+    },
+    "CanonicalLocation": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "stop",
+            "coordinate"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeoPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "quay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalQuay"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "stop_place": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalStopPlace"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "CanonicalLocation",
+      "type": "object"
+    },
+    "CanonicalOperator": {
+      "additionalProperties": false,
+      "description": "`ref` is the source's id (GTFS agency id, HAFAS operator id, OJP `OperatorRef`); `name`\nis for display; `code` is a RICS code once `master_carriers` has a loader.",
+      "properties": {
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ref"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        }
+      },
+      "title": "CanonicalOperator",
+      "type": "object"
+    },
+    "CanonicalQuay": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeoPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "public_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Public Code"
+        },
+        "ref": {
+          "minLength": 1,
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "title": "CanonicalQuay",
+      "type": "object"
+    },
+    "CanonicalService": {
+      "additionalProperties": false,
+      "description": "What runs on a timed leg.",
+      "properties": {
+        "destination_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Destination Text"
+        },
+        "feed": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Feed"
+        },
+        "journey_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Journey Ref"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "line_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line Ref"
+        },
+        "mode": {
+          "$ref": "#/$defs/TransportMode"
+        },
+        "operator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalOperator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "product_category": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductCategory"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "published_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Published Name"
+        },
+        "route_long_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Route Long Name"
+        },
+        "train_number": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Train Number"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "CanonicalService",
+      "type": "object"
+    },
+    "CanonicalStopPlace": {
+      "additionalProperties": false,
+      "properties": {
+        "codes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Codes",
+          "type": "object"
+        },
+        "country": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Country"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "parent_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Ref"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeoPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ref": {
+          "minLength": 1,
+          "title": "Ref",
+          "type": "string"
+        },
+        "source": {
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "station_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{2}-[0-9]{5}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Station Id"
+        },
+        "station_parent_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{2}-[0-9]{5}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Station Parent Id"
+        },
+        "uic": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{7}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uic"
+        },
+        "unresolved_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unresolved Token"
+        }
+      },
+      "required": [
+        "ref",
+        "source"
+      ],
+      "title": "CanonicalStopPlace",
+      "type": "object"
+    },
+    "CanonicalTiming": {
+      "additionalProperties": false,
+      "properties": {
+        "estimated": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimated"
+        },
+        "local_timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Timezone"
+        },
+        "timetabled": {
+          "format": "date-time",
+          "title": "Timetabled",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timetabled"
+      ],
+      "title": "CanonicalTiming",
+      "type": "object"
+    },
+    "GeoPosition": {
+      "additionalProperties": false,
+      "properties": {
+        "lat": {
+          "maximum": 90.0,
+          "minimum": -90.0,
+          "title": "Lat",
+          "type": "number"
+        },
+        "lon": {
+          "maximum": 180.0,
+          "minimum": -180.0,
+          "title": "Lon",
+          "type": "number"
+        }
+      },
+      "required": [
+        "lat",
+        "lon"
+      ],
+      "title": "GeoPosition",
+      "type": "object"
+    },
+    "JourneySource": {
+      "additionalProperties": false,
+      "description": "Where a journey comes from. For labels and provenance only: no business code branches\non `provider` (design §2, rule 4).",
+      "properties": {
+        "adapter_version": {
+          "minimum": 1,
+          "title": "Adapter Version",
+          "type": "integer"
+        },
+        "engine": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Engine"
+        },
+        "provider": {
+          "enum": [
+            "motis",
+            "otp",
+            "hafas",
+            "ojp"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "viator",
+            "reference"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "stitched_from_sessions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Stitched From Sessions",
+          "type": "array"
+        },
+        "via_hubs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Via Hubs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider",
+        "role",
+        "adapter_version"
+      ],
+      "title": "JourneySource",
+      "type": "object"
+    },
+    "ProductCategory": {
+      "additionalProperties": false,
+      "description": "OJP `ProductCategory`: `code` (`RJ`, `ICE`, `S`) and its name (`Railjet`).",
+      "properties": {
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        }
+      },
+      "title": "ProductCategory",
+      "type": "object"
+    },
+    "TransportMode": {
+      "description": "Mode families, OJP `PtMode` granularity. Engine detail (MOTIS `REGIONAL_RAIL`) is kept\nin `CanonicalLeg.source_mode`, never compared by default.",
+      "enum": [
+        "RAIL",
+        "BUS",
+        "COACH",
+        "TRAM",
+        "SUBWAY",
+        "FERRY",
+        "CABLEWAY",
+        "FUNICULAR",
+        "AIR",
+        "TAXI",
+        "OTHER"
+      ],
+      "title": "TransportMode",
+      "type": "string"
+    }
+  },
+  "$id": "https://viator.trackonpath.com/schemas/canonical-journey-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arrival": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CanonicalTiming"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "departure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CanonicalTiming"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "duration_seconds": {
+      "minimum": 0,
+      "title": "Duration Seconds",
+      "type": "integer"
+    },
+    "id": {
+      "minLength": 1,
+      "title": "Id",
+      "type": "string"
+    },
+    "legs": {
+      "items": {
+        "$ref": "#/$defs/CanonicalLeg"
+      },
+      "title": "Legs",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/JourneySource"
+    },
+    "source_transfer_count": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Transfer Count"
+    }
+  },
+  "required": [
+    "id",
+    "source",
+    "legs",
+    "duration_seconds"
+  ],
+  "title": "CanonicalJourney",
+  "type": "object"
+}
