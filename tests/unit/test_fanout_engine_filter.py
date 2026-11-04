@@ -214,18 +214,19 @@ async def test_query_hafas_reference_returns_ok_with_trips_on_success():
     from unittest.mock import AsyncMock, patch
 
     from app.api.journey import _query_hafas_reference
+    from tests.unit.canonical_fixtures import reference_journey
 
     body = _minimal_body(compare_hafas=True)
+    # Since #303 the HAFAS client answers in canonical journeys, which the
+    # helper keeps until the fanout writes the response.
     fake_trips = [
-        {
-            "duration_seconds": 9900,
-            "num_transfers": 0,
-            "departure_at": "2026-06-28T08:00:00+00:00",
-            "arrival_at": "2026-06-28T10:45:00+00:00",
-            "modes": "RAIL",
-            "legs": [],
-            "first_transit_leg_departure_utc": "2026-06-28T08:00:00+00:00",
-        }
+        reference_journey(
+            "hafas",
+            dep_iso="2026-06-28T08:00:00+00:00",
+            route="RJ 1141",
+            from_uic="8103000",
+            to_uic="8100002",
+        )
     ]
     fake_raw = {"status": "ok", "format": "hafas-mgate", "response_ms": 123}
     fake_fetch = AsyncMock(return_value=(fake_raw, fake_trips))

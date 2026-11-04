@@ -13,7 +13,7 @@ coordinates":
     _earliest_departure — naive datetime → ISO-8601 OffsetDateTime
     _plan_location      — PlanLabeledLocationInput (stop vs coordinate)
     _safe_log_token     — sanitise user-influenced stop_ids for logging
-    _iso_to_utc_iso     — itinerary start/end ISO → UTC ISO
+    parse_instant       — itinerary start/end ISO → UTC (canonical adapters, #303 PR 3a)
     _normalise          — planConnection edges[].node → recorder trips
 
 The data feeding TestNormalisePlanConnection is the verbatim response
@@ -259,27 +259,28 @@ class TestSafeLogToken:
         assert len(_safe_log_token("A" * 500)) == 64
 
 
-# ─────────────────── _iso_to_utc_iso ───────────────────
+# ─────────────────── itinerary start/end (parse_instant) ───────────────────
+# OTP's itinerary times are read by the canonical adapter since #303 PR 3a.
 
 
-class TestIsoToUtcIso:
+class TestParseInstant:
     def test_offset_converted_to_utc(self):
-        from app.journey.otp_client import _iso_to_utc_iso
+        from app.journey.canonical_adapters._common import parse_instant
 
-        assert _iso_to_utc_iso("2026-05-18T11:03:00+02:00") == "2026-05-18T09:03:00+00:00"
+        assert parse_instant("2026-05-18T11:03:00+02:00") == datetime(2026, 5, 18, 9, 3, tzinfo=UTC)
 
     def test_naive_assumed_utc(self):
-        from app.journey.otp_client import _iso_to_utc_iso
+        from app.journey.canonical_adapters._common import parse_instant
 
-        assert _iso_to_utc_iso("2026-05-18T09:03:00") == "2026-05-18T09:03:00+00:00"
+        assert parse_instant("2026-05-18T09:03:00") == datetime(2026, 5, 18, 9, 3, tzinfo=UTC)
 
     def test_none_and_garbage(self):
-        from app.journey.otp_client import _iso_to_utc_iso
+        from app.journey.canonical_adapters._common import parse_instant
 
-        assert _iso_to_utc_iso(None) is None
-        assert _iso_to_utc_iso("") is None
-        assert _iso_to_utc_iso("not-a-date") is None
-        assert _iso_to_utc_iso(12345) is None  # type: ignore[arg-type]
+        assert parse_instant(None) is None
+        assert parse_instant("") is None
+        assert parse_instant("not-a-date") is None
+        assert parse_instant(12345) is None
 
 
 # ─────────────────── _normalise (planConnection) ───────────────────

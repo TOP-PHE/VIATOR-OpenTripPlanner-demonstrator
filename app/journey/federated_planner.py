@@ -29,11 +29,14 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ..db_steps import db_step
 from ..logging_config import one_line
 from ..metrics import FEDERATED_PLANNER_TRIES_TOTAL
+from .canonical import CanonicalJourney, CanonicalLeg, JourneySource
+from .canonical.canonical_transfer import mark_transfers
+from .canonical_adapters.trip_dict import to_trip_dict
 from .signature import _uic_from_stop_id, transit_fingerprint
 
 if TYPE_CHECKING:
@@ -136,105 +139,118 @@ def rank_hubs(
     return [uic for _tier, _detour, uic in scored]
 
 
-def _parse_iso(value: str) -> datetime:
-    """Parse an ISO-8601 instant (otp_client emits `…Z`) to an aware datetime."""
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-
-
 def earliest_next_departure(
-    prev_arrival_iso: str, mct_seconds: int = DEFAULT_MCT_SECONDS
+    prev_arrival: datetime, mct_seconds: int = DEFAULT_MCT_SECONDS
 ) -> datetime:
-    """When the onward leg may earliest depart: previous arrival + MCT."""
-    return _parse_iso(prev_arrival_iso) + timedelta(seconds=mct_seconds)
+    """When the onward leg may earliest depart: previous arrival + MCT, in UTC."""
+    return prev_arrival.astimezone(UTC) + timedelta(seconds=mct_seconds)
 
 
-def _join_legs_dropping_hub_walks(leg_trips: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Concatenate the per-leg trips' legs, dropping the phantom walks at each
-    stitch boundary.
+def _join_legs_dropping_hub_walks(pieces: list[CanonicalJourney]) -> list[CanonicalLeg]:
+    """Concatenate the pieces' legs, dropping the phantom walks at each stitch boundary.
 
-    Each non-final trip's trailing WALK (egress to the hub) and each non-first
-    trip's leading WALK (access from the hub) are the two halves of a single
-    platform change — real inside OTP's per-leg search, but doubled and
-    mislabelled ("-> Destination" / "Origin ->") once stitched, since each leg
-    treats the hub as its own endpoint. The genuine origin-access and
-    destination-egress walks (first trip's first leg, last trip's last leg) are
-    kept. The hub change itself still counts as one transfer (see assemble_stitch).
+    Each non-final piece's trailing walk (egress to the hub) and each non-first piece's
+    leading walk (access from the hub) are the two halves of a single platform change —
+    real inside OTP's per-leg search, but doubled and mislabelled ("-> Destination" /
+    "Origin ->") once stitched, since each leg treats the hub as its own endpoint. The
+    genuine origin-access and destination-egress walks (first piece's first leg, last
+    piece's last leg) are kept. The hub change itself still counts as one transfer (see
+    assemble_stitch).
     """
-    last_index = len(leg_trips) - 1
-    joined: list[dict[str, Any]] = []
-    for i, trip in enumerate(leg_trips):
-        legs = list(trip.get("legs", []))
-        if i > 0 and legs and legs[0].get("mode") == "WALK":
+    last_index = len(pieces) - 1
+    joined: list[CanonicalLeg] = []
+    for i, piece in enumerate(pieces):
+        legs = list(piece.legs)
+        if i > 0 and legs and not legs[0].is_timed:
             legs = legs[1:]
-        if i < last_index and legs and legs[-1].get("mode") == "WALK":
+        if i < last_index and legs and not legs[-1].is_timed:
             legs = legs[:-1]
         joined.extend(legs)
-    return joined
+    return mark_transfers(joined)
+
+
+def _changes(journey: CanonicalJourney) -> int:
+    """The changes of one journey: the source's own count when it gave one."""
+    if journey.source_transfer_count is not None:
+        return journey.source_transfer_count
+    return journey.transfer_count
 
 
 def assemble_stitch(
-    leg_trips: list[dict[str, Any]],
+    pieces: list[CanonicalJourney],
     *,
     via_hubs: list[str],
     session_ids: list[str],
-) -> dict[str, Any]:
-    """Join a chain of per-leg trips into a single stitched itinerary.
+) -> CanonicalJourney:
+    """Join a chain of per-leg journeys into one stitched journey.
 
-    Total duration is wall-clock (last arrival minus first departure, so transfer
-    wait is counted); transfers = the sum within each leg plus one per stitch. The
-    phantom egress/access walks at each hub are dropped (see
-    `_join_legs_dropping_hub_walks`) so the change reads as one platform change.
+    Total duration is wall-clock (last arrival minus first departure, so transfer wait is
+    counted); changes = the sum within each piece plus one per stitch. The phantom
+    egress/access walks at each hub are dropped (see `_join_legs_dropping_hub_walks`) so the
+    change reads as one platform change. The journey's source says where it comes from:
+    the sessions it was stitched from and the hubs it goes through.
     """
-    first, last = leg_trips[0], leg_trips[-1]
-    departure_at = first["departure_at"]
-    arrival_at = last["arrival_at"]
-    legs = _join_legs_dropping_hub_walks(leg_trips)
-    modes = sorted({m for t in leg_trips for m in (t.get("modes") or "").split(",") if m})
-    internal_transfers = sum(int(t.get("num_transfers", 0)) for t in leg_trips)
-    return {
-        "departure_at": departure_at,
-        "arrival_at": arrival_at,
-        "duration_seconds": int(
-            (_parse_iso(arrival_at) - _parse_iso(departure_at)).total_seconds()
+    first, last = pieces[0], pieces[-1]
+    duration = sum(piece.duration_seconds for piece in pieces)
+    if first.departure is not None and last.arrival is not None:
+        duration = int((last.arrival.timetabled - first.departure.timetabled).total_seconds())
+    engines = {piece.source.engine for piece in pieces}
+    return CanonicalJourney(
+        id="federated:" + "/".join(via_hubs) + ":" + "+".join(piece.id for piece in pieces),
+        source=JourneySource(
+            provider=first.source.provider,
+            role="viator",
+            engine=first.source.engine if len(engines) == 1 else None,
+            adapter_version=first.source.adapter_version,
+            stitched_from_sessions=list(session_ids),
+            via_hubs=list(via_hubs),
         ),
-        "num_transfers": internal_transfers + (len(leg_trips) - 1),
-        "modes": ",".join(modes),
-        "legs": legs,
-        "via_hubs": list(via_hubs),
-        "stitched_from_sessions": list(session_ids),
-        "federated": True,
-    }
+        legs=_join_legs_dropping_hub_walks(pieces),
+        departure=first.departure,
+        arrival=last.arrival,
+        duration_seconds=max(0, duration),
+        source_transfer_count=sum(_changes(piece) for piece in pieces) + len(pieces) - 1,
+    )
 
 
-def _rank_key(stitch: dict[str, Any]) -> tuple[int, str]:
+def _arrival_text(journey: CanonicalJourney) -> str:
+    return journey.arrival.timetabled.isoformat() if journey.arrival is not None else ""
+
+
+def _rank_key(stitch: CanonicalJourney) -> tuple[int, str]:
     """Sort key: generalized time (ride seconds + a penalty per change), then
     earliest arrival as the tie-break. A clean 1-change journey thus outranks a
     transfer-heavy one that merely arrives a little earlier."""
-    transfers = int(stitch.get("num_transfers", 0))
-    generalized = int(stitch.get("duration_seconds", 0)) + TRANSFER_PENALTY_SECONDS * transfers
-    return (generalized, stitch.get("arrival_at", ""))
+    generalized = stitch.duration_seconds + TRANSFER_PENALTY_SECONDS * _changes(stitch)
+    return (generalized, _arrival_text(stitch))
+
+
+def journey_transit_fingerprint(journey: CanonicalJourney) -> str:
+    """`transit_fingerprint` of a journey's legs as today's dicts: the key the fanout
+    and the stitches have been deduplicated by since before #303 (its successor,
+    `JourneyFingerprint`, is #304's to switch to)."""
+    return transit_fingerprint(to_trip_dict(journey)["legs"])
 
 
 def dedup_and_rank(
-    stitches: list[dict[str, Any]],
+    stitches: list[CanonicalJourney],
     *,
     existing_fingerprints: set[str] | None = None,
     limit: int = MAX_RESULTS,
-) -> list[dict[str, Any]]:
-    """Rank stitched itineraries by generalized time (ride time plus a fixed
-    penalty per change, so a clean journey beats a transfer-heavy one that merely
-    arrives a touch earlier), then drop any that duplicate each other or an
-    itinerary a session already returned (by `transit_fingerprint`)."""
+) -> list[CanonicalJourney]:
+    """Rank stitched journeys by generalized time (ride time plus a fixed penalty per
+    change, so a clean journey beats a transfer-heavy one that merely arrives a touch
+    earlier), then drop any that duplicate each other or a journey a session already
+    returned (by `transit_fingerprint`)."""
     seen = set(existing_fingerprints or set())
-    out: list[dict[str, Any]] = []
-    for s in sorted(stitches, key=_rank_key):
-        fp = transit_fingerprint(s.get("legs", []))
+    out: list[CanonicalJourney] = []
+    for stitch in sorted(stitches, key=_rank_key):
+        fp = journey_transit_fingerprint(stitch)
         if fp and fp in seen:
             continue
         if fp:
             seen.add(fp)
-        out.append(s)
+        out.append(stitch)
         if len(out) >= limit:
             break
     return out
@@ -403,8 +419,8 @@ def _stop_id(feed_id: str | None, uic: str) -> str | None:
 
 async def _fetch_leg(
     ctx: _LegContext, session: SessionRow, frm: str, to: str, dep: datetime
-) -> list[dict[str, Any]]:
-    """One per-session OTP query (by stop-id with coordinate fallback); `[]` on
+) -> list[CanonicalJourney]:
+    """One per-session engine query (by stop-id with coordinate fallback); `[]` on
     a missing endpoint or error."""
     if frm not in ctx.coords or to not in ctx.coords:
         return []
@@ -413,7 +429,7 @@ async def _fetch_leg(
     (flat, flon), (tlat, tlon) = ctx.coords[frm], ctx.coords[to]
     feed_id = _primary_feed_id(session)
     try:
-        _raw, trips = await planner_dispatch.get_planner(session).fetch_plan(
+        _raw, journeys = await planner_dispatch.get_planner(session).fetch_journeys(
             session_id=session.id,
             from_lat=flat,
             from_lon=flon,
@@ -430,7 +446,7 @@ async def _fetch_leg(
             "federated leg %s %s->%s failed: %s", session.id, one_line(frm), one_line(to), exc
         )
         return []
-    return trips
+    return journeys
 
 
 async def _stitch_pair(
@@ -443,13 +459,15 @@ async def _stitch_pair(
     dest_uic: str,
     when: datetime,
     mct_seconds: int,
-) -> list[dict[str, Any]]:
+) -> list[CanonicalJourney]:
     """Stitches for one session pair: origin->hub (so) then hub->dest (sd), per hub."""
-    out: list[dict[str, Any]] = []
+    out: list[CanonicalJourney] = []
     for hub in hubs:
         leg1 = await _fetch_leg(ctx, so, origin_uic, hub, when)
         for t1 in leg1[:MAX_LEG1_OPTIONS]:
-            nxt = earliest_next_departure(t1["arrival_at"], mct_seconds)
+            if t1.arrival is None:
+                continue
+            nxt = earliest_next_departure(t1.arrival.timetabled, mct_seconds)
             leg2 = await _fetch_leg(ctx, sd, hub, dest_uic, nxt)
             if leg2:
                 out.append(
@@ -468,11 +486,11 @@ async def _collect_stitches(
     dest_uic: str,
     when: datetime,
     mct_seconds: int,
-) -> list[dict[str, Any]]:
+) -> list[CanonicalJourney]:
     """Drive each distinct session pair through `_stitch_pair`, trying the
     MAX_HUBS most on-route shared hubs (proximity-ranked, so the natural
     gateway — e.g. Basel SBB on Paris->Fribourg — is always among them)."""
-    stitches: list[dict[str, Any]] = []
+    stitches: list[CanonicalJourney] = []
     for so in origin_sessions:
         for sd in dest_sessions:
             if so.id == sd.id:
@@ -511,8 +529,8 @@ async def plan_federated(
     mct_seconds: int = DEFAULT_MCT_SECONDS,
     origin_position: tuple[float, float] | None = None,
     dest_position: tuple[float, float] | None = None,
-) -> list[dict[str, Any]]:
-    """Phase-1 single-transfer stitch. Returns ranked stitched itineraries.
+) -> list[CanonicalJourney]:
+    """Phase-1 single-transfer stitch. Returns ranked stitched journeys.
 
     Requires UIC origin/destination (the form sends them when the operator picks
     from the station dropdown). Returns `[]` when there's no UIC, no hub, or no

@@ -14,7 +14,8 @@ from datetime import UTC, datetime
 import pytest
 
 from app.journey import federated_planner as fp
-from app.journey.signature import transit_fingerprint
+from app.journey.canonical import TransportMode
+from tests.unit.canonical_fixtures import journey_from_legs
 
 
 def _leg(frm: str, to: str, route: str, dep: str, arr: str, mode: str = "RAIL") -> dict:
@@ -32,14 +33,36 @@ def _leg(frm: str, to: str, route: str, dep: str, arr: str, mode: str = "RAIL") 
     }
 
 
-def _trip(dep: str, arr: str, transfers: int, legs: list[dict], modes: str = "RAIL,WALK") -> dict:
-    return {
-        "departure_at": dep,
-        "arrival_at": arr,
-        "num_transfers": transfers,
-        "modes": modes,
-        "legs": legs,
-    }
+def _trip(dep: str, arr: str, transfers: int, legs: list[dict], modes: str = "RAIL,WALK"):
+    """A per-leg journey (canonical since #303) from the simple leg dicts below; `modes` is
+    kept for the call sites' readability, the journey derives its own."""
+    return journey_from_legs(legs, departure_at=dep, arrival_at=arr, transfers=transfers)
+
+
+def _z(timing) -> str:
+    """A journey time as these tests write it (`…Z`)."""
+    return timing.timetabled.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _as_journeys(fake):
+    """The fakes below answer in today's trip dicts; since #303 the planner calls
+    `fetch_journeys`, so their trips are handed over as canonical journeys."""
+
+    async def fetch_journeys(**kw):
+        raw, trips = await fake(**kw)
+        journeys = [
+            journey_from_legs(
+                trip["legs"],
+                departure_at=trip["departure_at"],
+                arrival_at=trip["arrival_at"],
+                transfers=trip.get("num_transfers"),
+                rank=rank,
+            )
+            for rank, trip in enumerate(trips)
+        ]
+        return raw, journeys
+
+    return fetch_journeys
 
 
 # ──────────────────────── served_uics ────────────────────────
@@ -163,20 +186,20 @@ def test_rank_hubs_within_dest_country_orders_by_detour():
 
 
 def test_earliest_next_departure_adds_mct_utc():
-    assert fp.earliest_next_departure("2026-05-22T10:00:00Z", 600) == datetime(
-        2026, 5, 22, 10, 10, tzinfo=UTC
-    )
+    assert fp.earliest_next_departure(
+        datetime.fromisoformat("2026-05-22T10:00:00Z"), 600
+    ) == datetime(2026, 5, 22, 10, 10, tzinfo=UTC)
 
 
 def test_earliest_next_departure_normalises_offset():
     # 10:00+02:00 == 08:00Z; +5 min → 08:05Z
-    assert fp.earliest_next_departure("2026-05-22T10:00:00+02:00", 300) == datetime(
-        2026, 5, 22, 8, 5, tzinfo=UTC
-    )
+    assert fp.earliest_next_departure(
+        datetime.fromisoformat("2026-05-22T10:00:00+02:00"), 300
+    ) == datetime(2026, 5, 22, 8, 5, tzinfo=UTC)
 
 
 def test_earliest_next_departure_default_mct():
-    assert fp.earliest_next_departure("2026-05-22T10:00:00Z") == datetime(
+    assert fp.earliest_next_departure(datetime.fromisoformat("2026-05-22T10:00:00Z")) == datetime(
         2026, 5, 22, 10, 10, tzinfo=UTC
     )  # DEFAULT_MCT_SECONDS == 600
 
@@ -200,15 +223,15 @@ def test_assemble_stitch_two_legs():
         modes="RAIL",
     )
     s = fp.assemble_stitch([t1, t2], via_hubs=["8500010"], session_ids=["corr", "ch"])
-    assert s["departure_at"] == "2026-05-22T08:00:00Z"
-    assert s["arrival_at"] == "2026-05-22T12:00:00Z"
-    assert s["duration_seconds"] == 4 * 3600  # 08:00 → 12:00, includes the transfer wait
-    assert s["num_transfers"] == 1 + 0 + 1  # internal + one per stitch
-    assert len(s["legs"]) == 2
-    assert s["modes"] == "RAIL,WALK"
-    assert s["via_hubs"] == ["8500010"]
-    assert s["stitched_from_sessions"] == ["corr", "ch"]
-    assert s["federated"] is True
+    assert _z(s.departure) == "2026-05-22T08:00:00Z"
+    assert _z(s.arrival) == "2026-05-22T12:00:00Z"
+    assert s.duration_seconds == 4 * 3600  # 08:00 → 12:00, includes the transfer wait
+    assert s.source_transfer_count == 1 + 0 + 1  # internal + one per stitch
+    assert len(s.legs) == 2
+    assert s.modes == [TransportMode.RAIL]
+    assert s.source.via_hubs == ["8500010"]
+    assert s.source.stitched_from_sessions == ["corr", "ch"]
+    assert s.id.startswith("federated:")
 
 
 def test_assemble_stitch_drops_phantom_hub_walks():
@@ -242,24 +265,25 @@ def test_assemble_stitch_drops_phantom_hub_walks():
         modes="WALK,RAIL",
     )
     s = fp.assemble_stitch([t1, t2], via_hubs=["8501120"], session_ids=["fr", "ch"])
-    assert [leg["mode"] for leg in s["legs"]] == ["WALK", "RAIL", "RAIL", "WALK"]
-    assert s["departure_at"] == "2026-05-22T07:49:00Z"  # endpoints unchanged
-    assert s["arrival_at"] == "2026-05-22T13:08:00Z"
-    assert s["num_transfers"] == 1  # 0 internal + 1 per stitch (the hub change)
+    assert [leg.source_mode for leg in s.legs] == ["WALK", "RAIL", "RAIL", "WALK"]
+    assert [leg.kind for leg in s.legs] == ["continuous", "timed", "timed", "continuous"]
+    assert _z(s.departure) == "2026-05-22T07:49:00Z"  # endpoints unchanged
+    assert _z(s.arrival) == "2026-05-22T13:08:00Z"
+    assert s.source_transfer_count == 1  # 0 internal + 1 per stitch (the hub change)
 
 
 # ──────────────────────── dedup_and_rank ────────────────────────
 
 
-def _stitch(arr: str, route: str, dur_h: int = 4, transfers: int = 1) -> dict:
+def _stitch(arr: str, route: str, dur_h: int = 4, transfers: int = 1):
     dep = "2026-05-22T08:00:00Z"
-    return {
-        "departure_at": dep,
-        "arrival_at": arr,
-        "duration_seconds": dur_h * 3600,
-        "num_transfers": transfers,
-        "legs": [_leg("87271007", "8500010", route, dep, arr)],
-    }
+    return journey_from_legs(
+        [_leg("87271007", "8500010", route, dep, arr)],
+        departure_at=dep,
+        arrival_at=arr,
+        duration_seconds=dur_h * 3600,
+        transfers=transfers,
+    )
 
 
 def test_dedup_and_rank_orders_by_arrival():
@@ -267,7 +291,7 @@ def test_dedup_and_rank_orders_by_arrival():
     late = _stitch("2026-05-22T13:00:00Z", "A")
     early = _stitch("2026-05-22T12:00:00Z", "B")
     out = fp.dedup_and_rank([late, early])
-    assert [s["arrival_at"] for s in out] == [
+    assert [_z(s.arrival) for s in out] == [
         "2026-05-22T12:00:00Z",
         "2026-05-22T13:00:00Z",
     ]
@@ -280,7 +304,7 @@ def test_dedup_and_rank_prefers_fewer_changes_over_earliest_arrival():
     slog = _stitch("2026-05-22T12:30:00Z", "SLOG", dur_h=6, transfers=3)
     clean = _stitch("2026-05-22T13:00:00Z", "CLEAN", dur_h=5, transfers=1)
     out = fp.dedup_and_rank([slog, clean])
-    assert [s["num_transfers"] for s in out] == [1, 3]  # clean first despite later arrival
+    assert [s.source_transfer_count for s in out] == [1, 3]  # clean first despite later arrival
 
 
 def test_dedup_and_rank_collapses_identical_itineraries():
@@ -292,7 +316,7 @@ def test_dedup_and_rank_collapses_identical_itineraries():
 
 def test_dedup_and_rank_drops_existing_fingerprint():
     s = _stitch("2026-05-22T12:00:00Z", "TGV")
-    fp_existing = transit_fingerprint(s["legs"])
+    fp_existing = fp.journey_transit_fingerprint(s)
     out = fp.dedup_and_rank([s], existing_fingerprints={fp_existing})
     assert out == []
 
@@ -302,7 +326,7 @@ def test_dedup_and_rank_respects_limit():
     out = fp.dedup_and_rank(stitches, limit=3)
     assert len(out) == 3
     # kept the three earliest arrivals
-    assert [s["arrival_at"] for s in out] == [
+    assert [_z(s.arrival) for s in out] == [
         "2026-05-22T10:00:00Z",
         "2026-05-22T11:00:00Z",
         "2026-05-22T12:00:00Z",
@@ -398,7 +422,7 @@ async def test_plan_federated_forwards_namespaced_stop_ids(monkeypatch):
             ],
         )
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _fake)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _as_journeys(_fake))
     await fp.plan_federated(
         _FakeDb(rows),
         origin_uic=origin,
@@ -464,7 +488,7 @@ async def test_plan_federated_stitches_paris_fribourg(monkeypatch):
             )
         return ({}, [])
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _as_journeys(_fake_fetch_plan))
 
     out = await fp.plan_federated(
         _FakeDb(rows),
@@ -476,12 +500,12 @@ async def test_plan_federated_stitches_paris_fribourg(monkeypatch):
     )
     assert len(out) == 1
     s = out[0]
-    assert s["departure_at"] == "2026-05-22T08:00:00Z"
-    assert s["arrival_at"] == "2026-05-22T12:00:00Z"
-    assert s["via_hubs"] == [hub]
-    assert s["stitched_from_sessions"] == ["nap-eu-corridors", "nap-ch-rail"]
-    assert len(s["legs"]) == 2
-    assert s["federated"] is True
+    assert _z(s.departure) == "2026-05-22T08:00:00Z"
+    assert _z(s.arrival) == "2026-05-22T12:00:00Z"
+    assert s.source.via_hubs == [hub]
+    assert s.source.stitched_from_sessions == ["nap-eu-corridors", "nap-ch-rail"]
+    assert len(s.legs) == 2
+    assert s.id.startswith("federated:")
 
 
 async def test_plan_federated_no_uic_returns_empty():
@@ -610,7 +634,7 @@ def _recording_otp(monkeypatch):
         }
         return ({}, [trip])
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _fake)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _as_journeys(_fake))
     return calls
 
 
@@ -650,8 +674,8 @@ async def test_plan_federated_uses_request_positions_for_codes_master_lacks(monk
         dest_position=_REQUEST_DEST,
     )
     assert len(out) == 1
-    assert out[0]["via_hubs"] == [_HUB]
-    assert out[0]["stitched_from_sessions"] == ["zz-origin", "zz-dest"]
+    assert out[0].source.via_hubs == [_HUB]
+    assert out[0].source.stitched_from_sessions == ["zz-origin", "zz-dest"]
     leg1, leg2 = calls
     assert leg1["from"] == _REQUEST_ORIGIN
     assert leg1["to"] == _MASTER_HUB

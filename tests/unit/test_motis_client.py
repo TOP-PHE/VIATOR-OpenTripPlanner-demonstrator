@@ -13,11 +13,20 @@ from datetime import UTC, datetime
 import httpx
 
 from app.journey import motis_client
+from app.journey.canonical_adapters.motis_adapter import (
+    feed_id_from_motis_id as _feed_id_from_motis_id,
+)
 from app.journey.motis_client import (
     _base_url_for,
     _itineraries_to_trips,
-    _leg_to_canonical,
 )
+
+
+def _leg_to_canonical(leg: dict) -> dict:
+    """One leg through the client's normaliser: since #303 PR 3a the canonical adapter and
+    the `trip_dict` bridge, which write times as UTC `+00:00`."""
+    return _itineraries_to_trips({"itineraries": [{"legs": [leg]}]})[0]["legs"][0]
+
 
 # ──────────────────────────── _base_url_for ────────────────────────────
 
@@ -67,8 +76,8 @@ def test_leg_canonical_maps_motis_fields_to_otp_shape():
     }
     out = _leg_to_canonical(leg)
     assert out["mode"] == "HIGHSPEED_RAIL"
-    assert out["departure"] == "2026-06-20T09:27:00Z"
-    assert out["arrival"] == "2026-06-20T13:11:00Z"
+    assert out["departure"] == "2026-06-20T09:27:00+00:00"
+    assert out["arrival"] == "2026-06-20T13:11:00+00:00"
     assert out["duration_seconds"] == 13440
     assert out["from_name"] == "Madrid-Puerta de Atocha-Almudena Grandes"
     assert out["from_lat"] == 40.406442
@@ -170,8 +179,6 @@ def test_leg_canonical_tolerates_missing_optional_fields():
 
 def test_feed_id_extraction_handles_edge_cases():
     """Stop ids without `_` (synthetic legs, malformed feeds) must not raise."""
-    from app.journey.motis_client import _feed_id_from_motis_id
-
     assert _feed_id_from_motis_id("renfe-ld_60000") == "renfe-ld"
     # Multi-underscore feed id: only the LAST `_` splits feed from local.
     assert _feed_id_from_motis_id("eu_corridors_TGV6603") == "eu_corridors"
