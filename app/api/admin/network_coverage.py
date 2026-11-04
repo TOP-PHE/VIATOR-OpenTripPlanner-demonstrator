@@ -2869,7 +2869,10 @@ _CANONICAL_VIEW_JS = (
 ).read_text(encoding="utf-8")
 # The whole <script> element, built here from that file (our own code, never request data), so
 # the template prints it as it is: no `|safe` there, and no template expression inside a script.
-_CANONICAL_VIEW_SCRIPT = Markup(f"<script>{_CANONICAL_VIEW_JS}</script>")  # noqa: S704
+# Bandit B704 / ruff S704 warn about Markup on untrusted data; this is our own static file.
+_CANONICAL_VIEW_SCRIPT = Markup(  # noqa: S704  # nosec B704
+    f"<script>{_CANONICAL_VIEW_JS}</script>"
+)
 
 
 def canonical_view_js() -> str:
