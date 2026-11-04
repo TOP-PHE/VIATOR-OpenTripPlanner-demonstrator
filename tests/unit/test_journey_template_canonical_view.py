@@ -49,3 +49,29 @@ def test_the_view_gives_each_display_field_one_meaning() -> None:
 def test_the_view_module_exports_on_globalthis() -> None:
     assert "})(globalThis);" in VIEW
     assert "root.CanonicalView = { fromFanout: fromFanout, journey: journey, leg: leg };" in VIEW
+
+
+def test_the_view_gives_the_walk_free_span_from_instants() -> None:
+    # #303 PR 4b: the coverage modal's walk-free header (#227's review). Instants, never a
+    # wall clock, so a night train past midnight or a change of daylight saving time cannot bend
+    # the duration.
+    assert "rides_departure: ridesDeparture," in VIEW
+    assert "rides_arrival: ridesArrival," in VIEW
+    assert (
+        "ridesDeparture && ridesArrival ? secondsBetween(ridesDeparture, ridesArrival) : null"
+        in VIEW
+    )
+    assert "Math.round((end - start) / 1000)" in VIEW
+
+
+def test_the_view_keeps_the_label_and_the_stop_places_a_page_may_need() -> None:
+    # The ÖBB column shows the label ÖBB shows; the admin modal asks the station module about
+    # ÖBB's stop numbers, read from the stop place's codes.
+    assert "published_name: service ? service.published_name || null : null," in VIEW
+    assert "from_stop: stopOf(canonicalLeg.origin)," in VIEW
+    assert "to_stop: stopOf(canonicalLeg.destination)," in VIEW
+
+
+def test_the_view_module_has_no_closing_script_tag() -> None:
+    # The downloaded report embeds the file's text in a <script>: a closing tag would end it.
+    assert "</script" not in VIEW.lower()

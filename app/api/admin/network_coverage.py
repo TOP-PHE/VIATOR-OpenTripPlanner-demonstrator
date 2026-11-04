@@ -54,6 +54,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from datetime import time as dtime
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -76,8 +77,6 @@ from ... import config_service, osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
-from ...journey.canonical import CanonicalJourney
-from ...journey.canonical_adapters.trip_dict import to_trip_dict
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -711,7 +710,7 @@ class CellTripsDirection(BaseModel):
     # journey_trips rows materialised through the
     # search → executions → trips chain. Each entry mirrors the shape
     # produced by `_fetch_trips_by_search` (rank, duration_seconds,
-    # num_transfers, departure_at, arrival_at, modes, legs).
+    # num_transfers, departure_at, arrival_at, modes, journey: the canonical JSON).
     trips: list[dict[str, Any]] = []
     # PR-E — pre-rendered external-verify verdict so the modal can show
     # ÖBB's answer on open without an extra click. The manual "Verify
@@ -726,11 +725,11 @@ class CellTripsDirection(BaseModel):
     external_verified_at: datetime | None = None
     # PR-196a — graduated alignment heatmap data. The matrix UI reads
     # tier + score per cell to colour the viridis-palette background;
-    # the modal renders external_itineraries side-by-side against
-    # `trips` (VIATOR) so the operator sees both planners' answers
-    # without a second round-trip. NULL on legacy rows (renders as
-    # 'no_data' tier — light grey, distinguishable from no_service).
-    external_itineraries: list[dict[str, Any]] | None = None
+    # the modal renders `external_journeys` (ÖBB's answer as canonical
+    # journey JSON, #303) side-by-side against `trips` (VIATOR) so the
+    # operator sees both planners' answers without a second round-trip.
+    # NULL until ÖBB was asked about the cell.
+    external_journeys: list[dict[str, Any]] | None = None
     external_alignment_score: float | None = None
     external_alignment_tier: AlignmentTier | None = None
 
@@ -2543,10 +2542,14 @@ def _fetch_trips_by_search(
     behaviour for callers with no natural depart_at to compare against.
 
     `include_legs=False` (large exports — see `_EXPORT_LEG_DETAIL_MAX_PAIRS`)
-    projects explicit columns instead of full ORM rows so the legs JSON is
+    projects explicit columns instead of full ORM rows so the journey JSON is
     never even pulled out of Postgres — on the 8742-pair run that's ~372MB
     of wire traffic skipped, not just dropped after fetching. Trips then
-    carry `"legs": []`, which the export modal renders as a summary row.
+    carry `"journey": None`, which the export modal renders as a summary row.
+
+    With leg detail, each trip carries `journey`: the canonical journey as stored
+    (`journey_trips.journey`, #303), which the pages read through
+    `app/static/js/canonical_view.js`.
     """
     if not search_ids:
         return {}
@@ -2584,12 +2587,12 @@ def _fetch_trips_by_search(
                 t.departure_at,
                 t.arrival_at,
                 t.modes,
-                _stored_legs(t.journey),
+                t.journey,
             )
             for search_id, t in rows
         )
     else:
-        records = ((*row, []) for row in rows)
+        records = ((*row, None) for row in rows)
     out: dict[str, list[dict[str, Any]]] = {}
     for (
         search_id,
@@ -2599,7 +2602,7 @@ def _fetch_trips_by_search(
         departure_at,
         arrival_at,
         modes,
-        legs,
+        journey,
     ) in records:
         bucket = out.setdefault(str(search_id), [])
         if len(bucket) >= _MAX_TRIPS_PER_CELL_EXPORT:
@@ -2612,17 +2615,10 @@ def _fetch_trips_by_search(
                 "departure_at": departure_at.isoformat() if departure_at else None,
                 "arrival_at": arrival_at.isoformat() if arrival_at else None,
                 "modes": modes,
-                "legs": legs,
+                "journey": journey,
             }
         )
     return out
-
-
-def _stored_legs(journey: dict[str, Any]) -> list[dict[str, Any]]:
-    """A stored journey's legs as the cell modal and the export read them (today's leg dicts,
-    through the trip dict bridge, until #303 PR 4b moves them onto canonical journeys)."""
-    legs: list[dict[str, Any]] = to_trip_dict(CanonicalJourney.model_validate(journey))["legs"]
-    return legs
 
 
 def _depart_at_outside_window(run: NetworkCoverageRun, cfg: runner.CoverageConfig) -> bool:
@@ -2766,7 +2762,7 @@ def _build_export_context(
     trips_by_search: dict[str, list[dict[str, Any]]],
     lazy_trips: bool = False,
     legs_omitted: bool = False,
-    include_external_itineraries: bool = False,
+    include_external_journeys: bool = False,
     cfg: runner.CoverageConfig | None = None,
 ) -> dict[str, Any]:
     """Pure data-shaping from DB rows → template context dict.
@@ -2785,8 +2781,8 @@ def _build_export_context(
     leg detail so the modal can explain the gap. Both default False so
     the small-run download keeps its historical full-detail behaviour.
 
-    `include_external_itineraries` embeds the verify sweep's persisted
-    ÖBB itineraries per cell so the downloaded file can render the
+    `include_external_journeys` embeds the verify sweep's persisted
+    ÖBB journeys per cell so the downloaded file can render the
     VIATOR-vs-ÖBB side-by-side offline. Only the small-run download
     turns it on (same tier as leg detail — the payloads are compact but
     there's no reason to grow the large export the slimming just
@@ -2826,13 +2822,11 @@ def _build_export_context(
             # PR-E green/blue/yellow verdict dot.
             "external_alignment_tier": getattr(r, "external_alignment_tier", None),
             "external_alignment_score": getattr(r, "external_alignment_score", None),
-            # Persisted ÖBB itineraries for the offline side-by-side —
+            # Persisted ÖBB journeys for the offline side-by-side —
             # None (key always present, for a stable raw-JSON schema)
             # unless the caller opted in; see the docstring.
-            "external_itineraries": (
-                oebb_journeys.stored_itineraries(getattr(r, "external_journeys", None))
-                if include_external_itineraries
-                else None
+            "external_journeys": (
+                getattr(r, "external_journeys", None) if include_external_journeys else None
             ),
         }
     run_meta = {
@@ -2862,7 +2856,21 @@ def _build_export_context(
         "cells": cells,
         "lazy_trips": lazy_trips,
         "legs_omitted": legs_omitted,
+        "canonical_view_js": canonical_view_js(),
     }
+
+
+# The journey display model the coverage pages share (#303). The live modal loads it from
+# /static/app; the downloaded report and the share page embed its text, since the report must
+# work offline (no external asset). Read at import, so no request reads a file.
+_CANONICAL_VIEW_JS = (
+    Path(__file__).resolve().parents[2] / "static" / "js" / "canonical_view.js"
+).read_text(encoding="utf-8")
+
+
+def canonical_view_js() -> str:
+    """The text of `app/static/js/canonical_view.js`, as embedded in the report."""
+    return _CANONICAL_VIEW_JS
 
 
 def _export_filename(run: Any) -> str:
@@ -2985,7 +2993,7 @@ def export_run_html(
         ),
         legs_omitted=not include_legs,
         # ÖBB side-by-side rides the same small-run tier as leg detail.
-        include_external_itineraries=include_legs,
+        include_external_journeys=include_legs,
         cfg=cfg,
     )
     response = templates.TemplateResponse(request, "admin/network_coverage_export.html", context)
@@ -3290,10 +3298,9 @@ def _build_cell_trips_response(
             external_source=r.external_source,
             external_error=r.external_error,
             external_verified_at=r.external_verified_at,
-            # PR-196a — ÖBB's persisted journeys (in the modal's itinerary
-            # shape) + alignment so the modal can render the two planners'
-            # answers side by side.
-            external_itineraries=oebb_journeys.stored_itineraries(r.external_journeys),
+            # PR-196a — ÖBB's persisted journeys + alignment so the modal
+            # can render the two planners' answers side by side.
+            external_journeys=r.external_journeys,
             external_alignment_score=r.external_alignment_score,
             external_alignment_tier=r.external_alignment_tier,
         )
@@ -3335,7 +3342,7 @@ async def verify_cell_external(
     confirm it exists (and bind the pair to a real coverage cell, not
     a typed-in URL), the two hub rows for coordinates, then asks ÖBB
     (`external_verify.fetch_oebb_two_step`) and returns its verdict with
-    ÖBB's journeys in the modal's itinerary shape (`oebb_journeys`).
+    ÖBB's journeys as canonical JSON (`oebb_journeys`).
     """
     origin_hub, dest_hub, run = await db_step(_verify_inputs, db, run_id, origin_id, dest_id)
     answer = await external_verify.fetch_oebb_two_step(
@@ -3345,8 +3352,8 @@ async def verify_cell_external(
         to_lon=dest_hub.lon,
         depart_at=run.depart_at,
     )
-    itineraries = [oebb_journeys.itinerary(j) for j in oebb_journeys.journeys_from_answer(answer)]
-    return answer.verdict.model_copy(update={"itineraries": itineraries})
+    journeys = [j.model_dump(mode="json") for j in oebb_journeys.journeys_from_answer(answer)]
+    return answer.verdict.model_copy(update={"journeys": journeys})
 
 
 def _verify_inputs(

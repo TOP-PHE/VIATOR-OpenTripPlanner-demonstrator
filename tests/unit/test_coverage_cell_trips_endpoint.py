@@ -30,6 +30,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.journey.canonical import CanonicalJourney
 from app.network_coverage import oebb_journeys
 from tests.unit import canonical_fixtures as fx
 
@@ -335,17 +336,15 @@ def test_get_cell_trips_round_trips_alignment_fields_into_response(monkeypatch):
     assert resp.outbound is not None
     assert resp.outbound.external_alignment_score == 0.7
     assert resp.outbound.external_alignment_tier == "mostly_agree"
-    # Served in the itinerary shape the modal reads (until PR 4b), times as Vienna wall clock.
-    assert resp.outbound.external_itineraries == oebb_journeys.stored_itineraries(stored)
-    (itinerary,) = resp.outbound.external_itineraries
-    assert (itinerary["departure_at"], itinerary["arrival_at"]) == (
-        "2026-06-28T08:00",
-        "2026-06-28T12:30",
-    )
-    (leg,) = itinerary["legs"]
-    assert (leg["mode"], leg["route_name"]) == ("RAIL", "ICE 24")
-    assert (leg["from_uic"], leg["to_uic"]) == ("UIC:8014441", "UIC:8503000")
-    assert (leg["dep_utc"], leg["arr_utc"]) == ("2026-06-28T08:00", "2026-06-28T12:30")
+    # Served as stored: ÖBB's canonical journeys, which the modal reads through
+    # canonical_view.js (#303 PR 4b).
+    assert resp.outbound.external_journeys == stored
+    (journey,) = [CanonicalJourney.model_validate(item) for item in resp.outbound.external_journeys]
+    (leg,) = oebb_journeys.scoring_legs(journey)
+    assert (leg["mode"], leg["route_short_name"]) == ("RAIL", "ICE 24")
+    assert (leg["from_stop_id"], leg["to_stop_id"]) == ("UIC:8014441", "UIC:8503000")
+    # 08:00 Vienna (CEST) is 06:00 UTC.
+    assert leg["departure"] == "2026-06-28T06:00:00+00:00"
 
 
 def test_get_cell_trips_rejects_unknown_alignment_tier(monkeypatch):

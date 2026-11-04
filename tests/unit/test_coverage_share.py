@@ -251,30 +251,100 @@ def test_shared_cell_trips_404_for_unknown_run():
     assert resp.status_code == 404
 
 
-def test_shared_cell_trips_includes_external_itineraries_for_side_by_side(monkeypatch):
+def _viator_journey() -> dict:
+    from tests.unit import canonical_fixtures as fx
+
+    return fx.journey_from_legs(
+        [
+            {
+                "mode": "RAIL",
+                "from_stop_id": "SBB:8507000:0:7",
+                "to_stop_id": "SBB:8503000:0:3",
+                "from_name": "Bern",
+                "to_name": "Zürich HB",
+                "from_lat": 46.94883,
+                "from_lon": 7.43913,
+                "departure": "2026-07-05T06:02:00+00:00",
+                "arrival": "2026-07-05T06:58:00+00:00",
+                "route_short_name": "IC 1",
+            }
+        ]
+    ).model_dump(mode="json")
+
+
+def _oebb_journey() -> dict:
+    from tests.unit import canonical_fixtures as fx
+
+    (journey,) = fx.oebb_journeys(
+        [
+            {
+                "mode": "RAIL",
+                "from_uic": "UIC:8103000",
+                "to_uic": "OEBB:904050",
+                "dep": "2026-07-05T08:00",
+                "arr": "2026-07-05T10:30",
+                "route": "RJ 1141",
+                "line": "RJ",
+            }
+        ]
+    )
+    return journey.model_dump(mode="json")
+
+
+def _keys(node) -> set[str]:
+    if isinstance(node, dict):
+        return set(node) | {k for value in node.values() for k in _keys(value)}
+    if isinstance(node, list):
+        return {k for value in node for k in _keys(value)}
+    return set()
+
+
+# What a canonical journey carries but the share page never draws (#303 PR 4b).
+_NOT_RENDERED = {
+    "stop_place",
+    "quay",
+    "position",
+    "codes",
+    "uic",
+    "ref",
+    "unresolved_token",
+    "station_id",
+    "journey_ref",
+    "line_ref",
+    "train_number",
+    "distance_meters",
+    "source_mode",
+    "session_id",
+    "adapter_version",
+}
+
+
+def test_shared_cell_trips_includes_oebb_journeys_for_side_by_side(monkeypatch):
     """Deliberate product decision (2026-07-05): the share page renders
     the same VIATOR-vs-ÖBB side-by-side as the admin matrix modal, so
-    the public endpoint passes the verify sweep's persisted ÖBB
-    itineraries through. (An earlier revision stripped them on the
-    'page never rendered it' argument — that premise no longer holds;
-    the docstrings in coverage_share.py document the expanded scope.)"""
+    the public endpoint passes the verify sweep's persisted ÖBB journeys
+    through. (An earlier revision stripped them on the 'page never
+    rendered it' argument — that premise no longer holds; the docstrings
+    in coverage_share.py document the expanded scope.) Since #303 every
+    journey goes out projected to what the page draws."""
     from app.api.admin.network_coverage import CellTripsDirection, CellTripsResponse
 
     run = _stub_run()
+    viator, oebb = _viator_journey(), _oebb_journey()
     loaded = CellTripsResponse(
         direction="both",
         outbound=CellTripsDirection(
             origin_hub_id="p-nord",
             dest_hub_id="bxl-mid",
             status="ok",
-            trips=[{"rank": 0, "duration_seconds": 5000, "legs": []}],
-            external_itineraries=[{"duration_seconds": 5100, "legs": []}],
+            trips=[{"rank": 0, "duration_seconds": 3360, "journey": viator}],
+            external_journeys=[oebb],
         ),
         return_=CellTripsDirection(
             origin_hub_id="bxl-mid",
             dest_hub_id="p-nord",
             status="ok",
-            external_itineraries=[{"duration_seconds": 5200, "legs": []}],
+            external_journeys=[],
         ),
     )
     monkeypatch.setattr(
@@ -286,9 +356,51 @@ def test_shared_cell_trips_includes_external_itineraries_for_side_by_side(monkey
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["outbound"]["external_itineraries"] == [{"duration_seconds": 5100, "legs": []}]
-    assert body["return"]["external_itineraries"] == [{"duration_seconds": 5200, "legs": []}]
-    assert len(body["outbound"]["trips"]) == 1
+    assert body["outbound"]["external_journeys"] == [coverage_share.shared_journey(oebb)]
+    assert body["return"]["external_journeys"] == []
+    (trip,) = body["outbound"]["trips"]
+    assert trip["journey"] == coverage_share.shared_journey(viator)
+    assert not (_keys(body) & _NOT_RENDERED)
+
+
+def test_the_share_projection_keeps_what_the_page_draws():
+    shared = coverage_share.shared_journey(_oebb_journey())
+    assert shared is not None
+    (leg,) = shared["legs"]
+    assert leg["kind"] == "timed"
+    assert leg["origin"] == {"name": "Stop 8103000"}
+    assert leg["departure"] == {"timetabled": "2026-07-05T06:00:00Z"}
+    assert leg["service"]["published_name"] == "RJ 1141"
+    assert leg["service"]["line"] == "RJ"
+    assert leg["service"]["mode"] == "RAIL"
+    assert shared["source"] == {"provider": "hafas"}
+    assert shared["duration_seconds"] == 3600
+    assert not (_keys(shared) & _NOT_RENDERED)
+
+
+def test_the_share_projection_of_no_journey_is_none():
+    assert coverage_share.shared_journey(None) is None
+
+
+def test_a_large_report_trip_without_journey_stays_without():
+    """A trip of a large report carries no journey (`journey: None`): nothing to project."""
+    from app.api.admin.network_coverage import CellTripsDirection, CellTripsResponse
+
+    response = CellTripsResponse(
+        direction="single",
+        outbound=CellTripsDirection(
+            origin_hub_id="p-nord",
+            dest_hub_id="bxl-mid",
+            status="ok",
+            trips=[{"rank": 0, "duration_seconds": 1, "journey": None}],
+            external_journeys=None,
+        ),
+    )
+    shared = coverage_share._shared_response(response)
+    assert shared.outbound is not None
+    assert shared.outbound.trips == [{"rank": 0, "duration_seconds": 1, "journey": None}]
+    assert shared.outbound.external_journeys is None
+    assert shared.return_ is None
 
 
 def test_shared_cell_trips_has_no_current_user_dependency():

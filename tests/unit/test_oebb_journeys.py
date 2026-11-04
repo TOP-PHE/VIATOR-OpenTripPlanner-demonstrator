@@ -1,8 +1,9 @@
 """#303 PR 4a — ÖBB's answer in a coverage cell as canonical journeys (`oebb_journeys`).
 
 The check's own HAFAS parser is gone; its answer goes through the HAFAS adapter. These tests pin
-what the scorer and the modal still read from those journeys: the values the old parser gave
-(design D5), and the two fixes the adapter brings (times past midnight, dateless connections).
+what the scorer reads from those journeys: the values the old parser gave (design D5), and the
+two fixes the adapter brings (times past midnight, dateless connections). The pages read the
+journeys themselves since PR 4b (`app/static/js/canonical_view.js`).
 """
 
 from __future__ import annotations
@@ -126,45 +127,6 @@ def test_a_connection_without_a_date_is_dropped() -> None:
     payload = fx.oebb_payload([_leg()])
     payload["svcResL"][0]["res"]["outConL"][0].pop("date")
     assert hafas_adapter.journeys_from_trip_search(payload) == []
-
-
-# ─────────────── the modal's itinerary (until PR 4b) ───────────────
-
-
-def test_the_itinerary_keeps_the_modal_fields() -> None:
-    itinerary = oebb_journeys.itinerary(_journey(_leg(from_uic="OEBB:904050")))
-    (leg,) = itinerary.legs
-    assert leg.mode == "RAIL"
-    assert (leg.from_uic, leg.to_uic) == ("OEBB:904050", "UIC:8100002")
-    assert (leg.from_id_raw, leg.from_id_source) == ("904050", "extid")
-    assert leg.from_name == "Stop 904050"
-    assert leg.route_name == "RJ 1141"
-    # Vienna wall clock to the minute, the form the modal's ÖBB column reads.
-    assert (leg.dep_utc, leg.arr_utc) == ("2026-06-30T08:00", "2026-06-30T10:30")
-    assert (itinerary.departure_at, itinerary.arrival_at) == (
-        "2026-06-30T08:00",
-        "2026-06-30T10:30",
-    )
-    assert itinerary.num_transfers == 0
-
-
-def test_an_end_without_id_has_no_token_in_the_itinerary() -> None:
-    (leg,) = oebb_journeys.itinerary(_journey(_leg(from_uic=None))).legs
-    assert (leg.from_uic, leg.from_id_raw, leg.from_id_source) == (None, None, None)
-
-
-def test_stored_journeys_come_back_as_itinerary_dicts() -> None:
-    journeys = fx.oebb_journeys([_leg()], [_leg(dep="2026-06-30T09:00", arr="2026-06-30T11:30")])
-    stored = [journey.model_dump(mode="json") for journey in journeys]
-    out = oebb_journeys.stored_itineraries(stored)
-    assert out is not None
-    assert [it["departure_at"] for it in out] == ["2026-06-30T08:00", "2026-06-30T09:00"]
-    assert out[0]["legs"][0]["from_uic"] == "UIC:8103000"
-
-
-def test_not_asked_yet_stays_none_and_asked_with_no_answer_stays_empty() -> None:
-    assert oebb_journeys.stored_itineraries(None) is None
-    assert oebb_journeys.stored_itineraries([]) == []
 
 
 # ─────────────── journeys_from_answer ───────────────

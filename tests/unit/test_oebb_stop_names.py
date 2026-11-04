@@ -388,9 +388,12 @@ def test_each_oebb_stop_carries_its_number_escaped(page: str) -> None:
     assert "' data-oebb-code=\"' + escHTML(number) + '\"'" in stop
     assert "escHTML(oebbName)" in stop
     assert "escHTML(label)" in stop
+    # Since #303 PR 4b the number comes from the leg's stop place: ÖBB's extId, else the
+    # number its token gave.
     number = _function(page, "oebbStopNumber")
-    assert "leg[end + '_id_raw']" in number
-    assert "token.replace(/^(UIC|OEBB):/, '')" in number
+    assert "leg[end + '_stop']" in number
+    assert "codes.OEBB_EXT" in number
+    assert "stop.unresolved_token.replace(/^OEBB:/, '')" in number
 
 
 def test_the_page_asks_in_the_body_and_names_stops_as_text(page: str) -> None:

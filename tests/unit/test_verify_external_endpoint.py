@@ -259,10 +259,11 @@ async def test_verify_external_returns_adapter_result_verbatim(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_verify_external_answers_oebbs_connections_in_the_modal_shape(monkeypatch):
-    """The modal's ÖBB column is refreshed from `itineraries`: ÖBB's answer goes through the
-    HAFAS adapter (#303 PR 4a) and comes back in the shape the column reads — stop tokens,
-    Vienna wall clock to the minute, the label HAFAS shows."""
+async def test_verify_external_answers_oebbs_connections_as_canonical_journeys(monkeypatch):
+    """The modal's ÖBB column is refreshed from `journeys`: ÖBB's answer goes through the
+    HAFAS adapter (#303 PR 4a) and comes back as canonical journey JSON (PR 4b), which the
+    column reads through `canonical_view.js` — the stop places, UTC instants, the label HAFAS
+    shows."""
     from app.api.admin import network_coverage as api
     from app.network_coverage import external_verify
     from tests.unit import canonical_fixtures as fx
@@ -298,8 +299,15 @@ async def test_verify_external_answers_oebbs_connections_in_the_modal_shape(monk
     )
 
     assert (result.ok, result.num_connections) == (True, 1)
-    (itinerary,) = result.itineraries
-    (shown,) = itinerary.legs
-    assert (shown.from_uic, shown.to_uic) == ("UIC:8814001", "OEBB:904050")
-    assert (shown.dep_utc, shown.arr_utc) == ("2026-06-28T10:02", "2026-06-28T14:30")
-    assert shown.route_name == "EC 41"
+    (journey,) = result.journeys
+    assert journey["schema_version"] == "1"
+    assert journey["source"]["provider"] == "hafas"
+    (leg,) = journey["legs"]
+    assert leg["origin"]["stop_place"]["uic"] == "8814001"
+    assert leg["destination"]["stop_place"]["unresolved_token"] == "OEBB:904050"
+    # 10:02 and 14:30 Vienna (CEST) are 08:02 and 12:30 UTC.
+    assert (leg["departure"]["timetabled"], leg["arrival"]["timetabled"]) == (
+        "2026-06-28T08:02:00Z",
+        "2026-06-28T12:30:00Z",
+    )
+    assert leg["service"]["published_name"] == "EC 41"

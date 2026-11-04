@@ -122,16 +122,17 @@ def test_leg_endpoints_are_station_ids_not_longitudes() -> None:
     (scored,) = oebb_journeys.scoring_legs(journey)
     assert scored["from_stop_id"] == "UIC:8400058", "Amsterdam Centraal, from extId"
     assert scored["to_stop_id"] == "UIC:8800004", "Bruxelles Midi, from extId"
-    # Provenance survives to the stored journey, and to the modal's itinerary.
-    stop = journey.legs[0].origin.stop_place
+    # Provenance survives to the stored journey, which the modal reads (#303 PR 4b): ÖBB's
+    # extId for the station module, the UIC the token gave, ÖBB's own name.
+    origin = journey.legs[0].origin
+    stop = origin.stop_place
     assert stop is not None
     assert stop.codes == {"OEBB_EXT": "8400058"}
-    (leg,) = oebb_journeys.itinerary(journey).legs
-    assert leg.from_uic == "UIC:8400058"
-    assert leg.to_uic == "UIC:8800004"
-    assert leg.from_id_raw == "8400058"
-    assert leg.from_name == "Amsterdam Centraal"
-    assert leg.from_id_source == "extid"
+    assert stop.uic == "8400058"
+    assert origin.name == "Amsterdam Centraal"
+    destination = journey.legs[0].destination.stop_place
+    assert destination is not None
+    assert destination.uic == "8800004"
 
 
 @pytest.mark.parametrize(
@@ -342,8 +343,9 @@ def test_index_hafas_locations_keeps_ext_id() -> None:
 
 
 def test_no_token_reaching_the_scorer_is_derivable_from_a_coordinate() -> None:
-    """Generalisable trip-wire: no token the scorer or the modal reads may have
-    digits equal to any `X=` or `Y=` value appearing anywhere in the payload."""
+    """Generalisable trip-wire: no token the scorer or the modal reads (the scorer's
+    stop tokens, the stop places' UIC and unresolved token) may have digits equal to
+    any `X=` or `Y=` value appearing anywhere in the payload."""
     payload = _hafas_payload()
     coords = set(re.findall(r"[XY]=(\d+)", json.dumps(payload)))
     assert coords, "fixture must actually contain coordinate fields"
@@ -354,9 +356,11 @@ def test_no_token_reaching_the_scorer_is_derivable_from_a_coordinate() -> None:
     for journey in journeys:
         scored = oebb_journeys.scoring_legs(journey)
         tokens += [t for leg in scored for t in (leg["from_stop_id"], leg["to_stop_id"])]
-        tokens += [
-            t for leg in oebb_journeys.itinerary(journey).legs for t in (leg.from_uic, leg.to_uic)
-        ]
+        for leg in journey.legs:
+            for end in (leg.origin, leg.destination):
+                stop = end.stop_place
+                if stop is not None:
+                    tokens.append(f"UIC:{stop.uic}" if stop.uic else stop.unresolved_token)
     assert tokens
     for token in tokens:
         if not token:

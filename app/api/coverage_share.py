@@ -12,11 +12,15 @@ id IS the capability token. `NetworkCoverageRun.id` is a Postgres
 run's id is equivalent to holding an unguessable bearer token, and there
 is no listing/enumeration endpoint here to discover one. This is
 "unlisted, not secret," matching the actual sensitivity of the data
-(coverage timing/alignment figures and the ÖBB verify itineraries used
+(coverage timing/alignment figures and the ÖBB verify journeys used
 for the side-by-side comparison — nothing confidential), not a
 login-gated share. The per-cell trips endpoint below shares the same
 model: everything it returns is rendered by the page at `/{run_id}`,
-so knowing the run id already grants it.
+so knowing the run id already grants it. Since the journeys are
+canonical JSON (#303), which carries more than the page draws (stop ids
+and codes, coordinates, journey and operator references), that endpoint
+returns each journey through `shared_journey`, a projection to what the
+page renders.
 
 Kept on its own router rather than as one dependency-less route bolted
 onto the admin router, so its lack of auth is a property of *which
@@ -28,7 +32,7 @@ future admin-wide auth change to silently start blocking it.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -116,19 +120,104 @@ def shared_cell_trips(
     budget (vs 60 for the page) is because a reader exploring a matrix
     legitimately clicks many cells in quick succession.
 
-    `external_itineraries` (ÖBB's journeys captured by the verify
-    sweep, in the modal's itinerary shape) IS included — a deliberate product decision (2026-07-05):
-    the share page renders the same VIATOR-vs-ÖBB side-by-side the
-    admin matrix modal shows, because the comparison is the point of
-    sharing a verified coverage report with a stakeholder. This means a
-    share URL grants read access to the run's persisted ÖBB verify data,
-    not only VIATOR's own results — accepted: the VerifyItinerary shape
-    is deliberately narrow (times, UIC codes, route names; no fares or
-    personal data), the same low sensitivity as the coverage figures.
-    An earlier revision stripped the field; the strip was removed when
-    the side-by-side landed on the share page.
+    `external_journeys` (ÖBB's journeys captured by the verify sweep)
+    IS included — a deliberate product decision (2026-07-05): the share
+    page renders the same VIATOR-vs-ÖBB side-by-side the admin matrix
+    modal shows, because the comparison is the point of sharing a
+    verified coverage report with a stakeholder. This means a share URL
+    grants read access to the run's persisted ÖBB verify data, not only
+    VIATOR's own results — accepted: the same low sensitivity as the
+    coverage figures. An earlier revision stripped the field; the strip
+    was removed when the side-by-side landed on the share page. Every
+    journey, VIATOR's and ÖBB's, goes out through `shared_journey`: only
+    what the page draws.
     """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
-    return _build_cell_trips_response(db, run, origin_id, dest_id)
+    return _shared_response(_build_cell_trips_response(db, run, origin_id, dest_id))
+
+
+def _shared_response(response: CellTripsResponse) -> CellTripsResponse:
+    """The cell's answer with every journey projected by `shared_journey`."""
+    directions = {}
+    for name in ("outbound", "return_"):
+        direction = getattr(response, name)
+        if direction is None:
+            continue
+        trips = [
+            {**trip, "journey": shared_journey(trip.get("journey"))} for trip in direction.trips
+        ]
+        oebb = direction.external_journeys
+        directions[name] = direction.model_copy(
+            update={
+                "trips": trips,
+                "external_journeys": [shared_journey(j) for j in oebb]
+                if oebb is not None
+                else None,
+            }
+        )
+    return response.model_copy(update=directions)
+
+
+# The service fields the share page draws (`canonical_view.js` → the modal's legs).
+_SHARED_SERVICE_FIELDS = (
+    "mode",
+    "line",
+    "published_name",
+    "route_long_name",
+    "destination_text",
+    "feed",
+)
+
+
+def shared_journey(journey: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A canonical journey's JSON reduced to what the share page renders: times, durations,
+    stop names, the service's labels and mode, its operator's name. Stop ids and codes,
+    coordinates, journey / line / operator references and distances stay out (the invariant of
+    this router: it reveals only what the page renders). Same structure as the full JSON, so the
+    page reads both the same way."""
+    if journey is None:
+        return None
+    source = journey.get("source") or {}
+    return {
+        "id": journey.get("id"),
+        "source": {"provider": source.get("provider")},
+        "departure": _shared_timing(journey.get("departure")),
+        "arrival": _shared_timing(journey.get("arrival")),
+        "duration_seconds": journey.get("duration_seconds"),
+        "source_transfer_count": journey.get("source_transfer_count"),
+        "legs": [_shared_leg(leg) for leg in journey.get("legs") or []],
+    }
+
+
+def _shared_timing(timing: dict[str, Any] | None) -> dict[str, Any] | None:
+    return {"timetabled": timing.get("timetabled")} if timing else None
+
+
+def _shared_end(end: dict[str, Any] | None) -> dict[str, Any]:
+    return {"name": (end or {}).get("name")}
+
+
+def _shared_leg(leg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": leg.get("kind"),
+        "origin": _shared_end(leg.get("origin")),
+        "destination": _shared_end(leg.get("destination")),
+        "departure": _shared_timing(leg.get("departure")),
+        "arrival": _shared_timing(leg.get("arrival")),
+        "duration_seconds": leg.get("duration_seconds"),
+        "continuous_mode": leg.get("continuous_mode"),
+        "service": _shared_service(leg.get("service")),
+    }
+
+
+def _shared_service(service: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not service:
+        return None
+    out: dict[str, Any] = {field: service.get(field) for field in _SHARED_SERVICE_FIELDS}
+    category = service.get("product_category") or {}
+    operator = service.get("operator") or {}
+    out["product_category"] = {"name": category.get("name")} if category else None
+    out["operator"] = {"name": operator.get("name")} if operator else None
+    return out

@@ -711,6 +711,13 @@ Risks:
   searches and coverage runs deleted in PR 4, legacy adapters dropped); D5 approved; D8 stations
   compared by MSMM station (`station_id`, resolver PR 5); go for PR 2 with the other
   recommendations as written.
+- 2026-11-04 — as built in PR 4b: the cell modal, the downloaded report and the share page read
+  canonical journeys through `canonical_view.js` (the report embeds its text); the share endpoint
+  projects each journey to what its page draws (`coverage_share.shared_journey`); #227's walk-free
+  header is the first ride's departure → the last ride's arrival and the time between, from UTC
+  instants. #227's review asked for `total − Σ(walk durations)` because the ÖBB side was naive
+  Vienna wall clock with no date past midnight; with instants the span is exact and matches the
+  times the header shows (a transfer walk between two rides stays inside it).
 - 2026-11-04 — PR 4 split into 4a (storage + coverage backend) and 4b (coverage UI). The
   `trip_dict` bridge is **kept until #304**, not deleted by PR 4: the rules D5 keeps unchanged
   (`trip_signature`, `transit_fingerprint`, the coverage scorer's VIATOR side) are written on its

@@ -156,47 +156,6 @@ _HAFAS_ERROR_MESSAGES: dict[str, str] = {
 }
 
 
-class VerifyLeg(BaseModel):
-    """One leg of ÖBB's answer as the coverage cell modal reads it (until #303 PR 4b).
-
-    Built from ÖBB's canonical journey by `oebb_journeys.itinerary`, never stored: since #303
-    PR 4a the result row keeps the journeys (`external_journeys`). The fields keep the names the
-    modal reads:
-
-    - `from_uic` / `to_uic`: a stop **token** from :func:`oebb_stop_id`, not necessarily a UIC:
-      `UIC:NNNNNNN`, or `OEBB:<payload>` for a real ÖBB id we could not place in the shared
-      namespace, or None for no id at all;
-    - `dep_utc` / `arr_utc`: **Europe/Vienna wall clock** to the minute, despite the names (the
-      modal was written for that form);
-    - `*_id_raw` / `*_id_source`: the id the token came from and its field (`extid`, `lid_L`),
-      which the modal sends to the station module to name the stop.
-    """
-
-    mode: str
-    from_uic: str | None = None
-    to_uic: str | None = None
-    dep_utc: str | None = None
-    arr_utc: str | None = None
-    route_name: str | None = None
-    from_id_raw: str | None = None
-    to_id_raw: str | None = None
-    from_name: str | None = None
-    to_name: str | None = None
-    from_id_source: str | None = None
-    to_id_source: str | None = None
-
-
-class VerifyItinerary(BaseModel):
-    """One ÖBB connection as the coverage cell modal reads it (until #303 PR 4b); built by
-    `oebb_journeys.itinerary`. `legs` is ordered start→end and includes the walks."""
-
-    legs: list[VerifyLeg] = Field(default_factory=list)
-    departure_at: str | None = None
-    arrival_at: str | None = None
-    duration_seconds: int | None = None
-    num_transfers: int | None = None
-
-
 class VerifyResult(BaseModel):
     """Outcome of one external-planner check for one coverage cell.
 
@@ -207,8 +166,9 @@ class VerifyResult(BaseModel):
     `ok=False` with `error` set means we couldn't reach the external
     backend; the verdict is "unknown" not "no route".
 
-    `itineraries` is filled only by the click-to-verify endpoint, from ÖBB's canonical journeys
-    (`oebb_journeys.itinerary`), for the modal; the verdict itself carries none (#303 PR 4a).
+    `journeys` is filled only by the click-to-verify endpoint: ÖBB's connections as canonical
+    journeys (`CanonicalJourney.model_dump(mode="json")`, through the HAFAS adapter), for the
+    modal. The verdict itself carries none (#303 PR 4).
     """
 
     source: str
@@ -220,8 +180,8 @@ class VerifyResult(BaseModel):
     # "external said no". UI renders this as a yellow warning, not a
     # red/green verdict.
     error: str | None = None
-    # ÖBB's connections in the modal's shape (click-to-verify only).
-    itineraries: list[VerifyItinerary] = Field(default_factory=list)
+    # ÖBB's connections as canonical journey JSON (click-to-verify only).
+    journeys: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ─────────────────────── HAFAS protocol bits ───────────────────────
@@ -303,7 +263,7 @@ def oebb_stop_id(ext_id: object, *, lid: str | None = None) -> OebbStopId:
       scheme). It exists, it is identifiable, and it is comparable to nothing.
     - ``None`` — there was no id at all.
 
-    Collapsing the middle case into `None` would be actively unsafe: VerifyLeg
+    Collapsing the middle case into `None` would be actively unsafe: the scorer's ÖBB legs
     carries no lat/lon, so a None endpoint reaches
     `signature._round_latlon_coarse(None, None)` and becomes the literal
     `"?,?"` — which a VIATOR leg missing both id and coordinates also produces.

@@ -637,8 +637,8 @@ other — are forced into view because all-pairs enumeration leaves nowhere to h
 | Module | Lines | What it owns |
 |---|---|---|
 | `runner.py` | 2110 | Run lifecycle, K-slot slicing, cooperative cancel, per-pair execution (single-session + fanout), the external-verify sweep |
-| `external_verify.py` | 770 | The ÖBB HAFAS transport: LocGeoPos → TripSearch two-step, the verdict (`VerifyResult`), `oebb_stop_id`; `VerifyItinerary` is now only the modal's display shape |
-| `oebb_journeys.py` | 170 | ÖBB's answer as canonical journeys (through the HAFAS adapter), the legs the scorer reads (`scoring_legs`, today's tokens and mode rule) and the modal's `VerifyItinerary` (#303 PR 4a) |
+| `external_verify.py` | 720 | The ÖBB HAFAS transport: LocGeoPos → TripSearch two-step, the verdict (`VerifyResult`), `oebb_stop_id` |
+| `oebb_journeys.py` | 120 | ÖBB's answer as canonical journeys (through the HAFAS adapter) and the legs the scorer reads (`scoring_legs`, today's tokens and mode rule) (#303 PR 4) |
 | `verify_progress.py` | 230 | `SweepWriter`: saves the sweep's answers on the result rows as they come and its progress on the run, fenced on the run being running and held |
 | `alignment.py` | 320 | Scores one (VIATOR journeys, ÖBB journeys) pair into a `(score, tier)` |
 | `hubs.py` | — | Static French preset (26 entries, though its docstring still says 23). **Fallback/seed only** — the DB table wins |
@@ -755,11 +755,11 @@ scorer — it is how the UI renders a NULL tier.)
 canonical journeys, #303 PR 4a; `external_itineraries` before it), `external_alignment_score`
 (float, nullable), `external_alignment_tier` (varchar 32).
 
-The cell modal and the export still read ÖBB's side as **`VerifyItinerary`** (`legs[]`,
-`departure_at`, `arrival_at`, `duration_seconds`, `num_transfers`) of **`VerifyLeg`** (`mode`,
-`from_uic`/`to_uic` stop tokens, `dep_utc`/`arr_utc` Vienna wall clock despite the names,
-`route_name`, raw ids and names), built from the stored journeys by `oebb_journeys.itinerary`
-until #303 PR 4b moves the templates onto canonical journeys.
+The cell modal, the downloaded report and the share page read both sides as canonical journey
+JSON (#303 PR 4b): the cell-trips API sends each VIATOR trip's `journey` (with its summary
+columns) and ÖBB's `external_journeys`, and the pages turn them into their display model with
+`app/static/js/canonical_view.js` (the report embeds its text). The share endpoint sends every
+journey through `coverage_share.shared_journey`, a projection to what the page draws.
 
 ### Invariants & traps
 
@@ -2478,9 +2478,10 @@ for runs without a sweep, otherwise a legacy status-colour matrix would render e
 
 Cell click opens the detail modal: per direction (Outbound open, Return collapsed) an alignment-tier
 pill, a display-only "Show walk legs" toggle, then a two-column `CompareGrid` of VIATOR vs ÖBB HAFAS.
-The ÖBB column reads the **persisted** `external_journeys` JSONB from the PR-196a sweep (served
-as `external_itineraries` until #303 PR 4b) — no HAFAS call at modal-open time — so the columns show
-exactly the data the alignment scorer used.
+The ÖBB column reads the **persisted** `external_journeys` JSONB from the PR-196a sweep — no
+HAFAS call at modal-open time — so the columns show exactly the data the alignment scorer used.
+"Show walk legs" off, a card's header is the first ride's departure → the last ride's arrival
+(`CanonicalView` `rides_*`, from UTC instants); on, the door-to-door one.
 
 ### Data shapes
 

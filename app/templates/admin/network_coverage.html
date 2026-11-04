@@ -900,6 +900,8 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
    escHTML}; see app/static/js/compare_grid.js for the contract. #}
 <link rel="stylesheet" href="/static/app/css/compare_grid.css">
 <script src="/static/app/js/compare_grid.js"></script>
+{# #303: canonical journey JSON → display model (the cell modal reads only this). #}
+<script src="/static/app/js/canonical_view.js"></script>
 <script id="hub-country-names" type="application/json">{{ hub_country_names|tojson }}</script>
 <script>
 // v0.1.27 — Network coverage admin page.
@@ -1919,7 +1921,7 @@ function renderModalMeta(result) {
 
 // Pluralisation helper — single, leaf-level ternary (S3358 prefers ternaries
 // not to nest). Centralising it kills the "n transfer + (n===1 ? '' : 's')"
-// nested-ternary pattern Sonar flagged in renderTripCard.
+// nested-ternary pattern Sonar flagged in the old trip card.
 function pluralize(n, singular) {
   return n === 1 ? singular : singular + 's';
 }
@@ -1997,44 +1999,22 @@ let MODAL_SHOW_WALKS = (function () {
   }
 })();
 
-// Modes that are not a train. Mirrors the canonical set the backend uses
-// everywhere else — `alignment._strip_walk_legs`, `signature.py`,
-// `trip_normalize._NON_TRANSIT_MODES`, `journey.html` — so the rows this
-// modal hides are exactly the rows the alignment scorer ignores. A bare
-// `mode !== 'WALK'` would keep a MOTIS `TRANSFER` leg (and a HAFAS section
-// with `mode: null`), leaving the recomputed header disagreeing with the
-// legs drawn beneath it.
-const MODAL_NON_TRANSIT_MODES = new Set(['WALK', 'TRANSFER', '']);
-
+// A ride is a timed leg (a service runs it); every other leg (a walk, a transfer) is what the
+// "Show walk legs" toggle hides. The row's chip comes from the same leg (`CanonicalView.leg`:
+// the ride's mode family, else WALK), so a row can never print a mode and be hidden as a walk
+// (#227's review, finding 6).
 function isModalTransitLeg(leg) {
-  return !MODAL_NON_TRANSIT_MODES.has(String((leg && leg.mode) || '').toUpperCase());
+  return Boolean(leg) && leg.kind === 'timed';
 }
 
-// First train's departure → last train's arrival, walks excluded.
-// `depKey`/`arrKey` differ per engine: VIATOR legs carry `departure` /
-// `arrival` (true UTC instants); ÖBB VerifyLegs carry `dep_utc` / `arr_utc`
-// (naive Europe/Vienna — the `_utc` name is aspirational, see
-// `external_verify._hafas_time_to_utc_iso`). We read whichever field the leg
-// ROW already renders, so the header can never disagree with the legs on
-// screen. A duration is a difference, so it is offset-invariant either way.
-//
-// Returns null when there is no train at all, or the timestamps can't be
-// parsed — the caller then keeps the door-to-door header rather than
-// inventing one.
-function modalTransitBounds(legs, depKey, arrKey) {
-  const transit = (legs || []).filter(isModalTransitLeg);
-  if (!transit.length) return null;
-  const dep = transit[0][depKey];
-  const arr = transit[transit.length - 1][arrKey];
-  if (!dep || !arr) return null;
-  let seconds = (new Date(arr) - new Date(dep)) / 1000;
-  if (!Number.isFinite(seconds)) return null;
-  // Overnight: HAFAS anchors every leg to the connection's single `date` and
-  // `_hafas_time_to_utc_iso` drops the day-roll prefix, so an arrival after
-  // midnight parses as EARLIER than its departure. A train cannot arrive
-  // before it leaves; roll the arrival forward one day.
-  if (seconds < 0) seconds += 86400;
-  return { dep, arr, seconds };
+// The walk-free header of a journey: the first ride's departure → the last ride's arrival, and
+// the time between, from the journey's own instants (`CanonicalView`: UTC, real dates). A night
+// train past midnight, the viewer's time zone or a change of daylight saving time cannot bend it,
+// which is what sank #227's timestamp arithmetic on ÖBB's Vienna wall clock. null when the journey
+// has no ride: the caller then keeps the door-to-door header.
+function modalRideBounds(view) {
+  if (!view || view.rides_duration_seconds == null) return null;
+  return { dep: view.rides_departure, arr: view.rides_arrival, seconds: view.rides_duration_seconds };
 }
 
 // PR-196b — apply or remove the modal-only "show walks" class on the
@@ -2059,6 +2039,10 @@ function applyModalShowWalks() {
   modalBody.querySelectorAll('[data-walks]').forEach((el) => {
     el.hidden = (el.dataset.walks === '1') !== MODAL_SHOW_WALKS;
   });
+  // One toggle per direction section (Outbound, Return): keep them all in step.
+  modalBody.querySelectorAll('[data-action="modal-show-walks"]').forEach((box) => {
+    box.checked = MODAL_SHOW_WALKS;
+  });
 }
 
 // PR-196b — render the modal-only control strip: alignment-tier pill +
@@ -2080,7 +2064,7 @@ function renderModalControls(dir) {
   return `<div class="cov-modal-controls">
     ${pill || noPillHtml}
     <label title="Display-only — does NOT recompute the alignment score (which stays canonical from the sweep).">
-      <input type="checkbox" data-action="modal-show-walks" id="modal-show-walks" ${checked}>
+      <input type="checkbox" data-action="modal-show-walks" ${checked}>
       Show walk legs
     </label>
   </div>
@@ -2093,8 +2077,7 @@ const OEBB_STOPS_LEGEND = '<p class="hint cov-oebb-legend">ÖBB stops: the stati
   + ' number (ÖBB\'s own name shown). Hover a stop for both names and the codes.</p>';
 
 // PR-196b — VIATOR column body for the side-by-side modal grid. Each
-// trip renders as a `cov-cell-trip` card (variant of the existing
-// renderTripCard). The shared CompareGrid.renderGrid primitive
+// trip renders as a `cov-cell-trip` card. The shared CompareGrid.renderGrid primitive
 // supplies the surrounding column markup.
 function renderModalViatorColumn(trips) {
   if (!trips || !trips.length) return '';
@@ -2102,16 +2085,15 @@ function renderModalViatorColumn(trips) {
 }
 
 // PR-196b — ÖBB HAFAS column body. Reads the persisted
-// external_itineraries (PR-196a JSONB column) so there's no extra
+// external_journeys (ÖBB's canonical journeys, #303) so there's no extra
 // HAFAS HTTP call at modal-open time — the same data the alignment
 // scorer used renders the column.
-function renderModalOebbColumn(itineraries) {
-  if (!itineraries || !itineraries.length) return '';
-  return itineraries.map(renderModalOebbTripCard).join('');
+function renderModalOebbColumn(journeys) {
+  if (!journeys || !journeys.length) return '';
+  return journeys.map((journey) => renderModalOebbTripCard(CanonicalView.journey(journey))).join('');
 }
 
-// PR-196b — VIATOR trip card variant for the compare-grid cell. Same
-// shape as the legacy renderTripCard but `.cov-cell-trip.viator`
+// PR-196b — VIATOR trip card for the compare-grid cell; `.cov-cell-trip.viator`
 // styling sits tighter for the two-column layout. WALK legs carry the
 // `walk-leg` class so the modal-only toggle can hide them in-place.
 //
@@ -2156,9 +2138,11 @@ function modalTripHeadTimes(fullDep, fullArr, fullSeconds, bounds) {
 }
 
 function renderModalViatorTripCard(trip, idx) {
-  const legs = (trip.legs || []).map(renderModalLeg).join('');
+  // The trip's canonical journey through the one view module (#303).
+  const view = trip.journey ? CanonicalView.journey(trip.journey) : null;
+  const legs = view ? view.legs.map(renderModalLeg).join('') : '';
   const transfers = fmtCount(trip.num_transfers, 'transfer');
-  const bounds = modalTransitBounds(trip.legs, 'departure', 'arrival');
+  const bounds = modalRideBounds(view);
   return `<div class="cov-trip cov-cell-trip viator">
     <div class="cov-trip-head">
       <span class="cov-trip-rank">#${idx + 1}</span>
@@ -2169,26 +2153,21 @@ function renderModalViatorTripCard(trip, idx) {
   </div>`;
 }
 
-// PR-196b — ÖBB itinerary card. The persisted VerifyItinerary shape is
-// narrower than the VIATOR trip shape (no rank, no
-// route_short_name / route_long_name — just `route_name`). We render
-// what's there and elide the rest so the column stays compact.
-function renderModalOebbTripCard(it) {
-  // Per-leg walk-hiding is set by renderModalOebbLeg using the current
-  // MODAL_SHOW_WALKS state, so the initial render honours the
-  // operator's persisted preference without a flicker. Subsequent
-  // flips of the toggle go through applyModalShowWalks() which mutates
-  // the `hidden` attr in place.
-  const legs = (it.legs || []).map(renderModalOebbLeg).join('');
-  const transfers = fmtCount(it.num_transfers, 'transfer');
-  // ÖBB brackets its itineraries with WALK sections whose minutes live in
-  // HAFAS's `dur` (hence `duration_seconds`), so the door-to-door header can
-  // exceed the train by the better part of an hour at a hub like
-  // Bruxelles-Midi International.
-  const bounds = modalTransitBounds(it.legs, 'dep_utc', 'arr_utc');
+// PR-196b — ÖBB journey card, from `CanonicalView.journey` of one of ÖBB's
+// canonical journeys. Per-leg walk-hiding is set by renderModalOebbLeg using
+// the current MODAL_SHOW_WALKS state, so the initial render honours the
+// operator's persisted preference without a flicker. Subsequent flips of the
+// toggle go through applyModalShowWalks() which mutates the `hidden` attr.
+function renderModalOebbTripCard(view) {
+  const legs = view.legs.map(renderModalOebbLeg).join('');
+  const transfers = fmtCount(view.num_transfers, 'transfer');
+  // ÖBB brackets its connections with walk sections (Eurostar's check-in
+  // allowance at Bruxelles-Midi International is an hour), so the door-to-door
+  // header can exceed the train by the better part of an hour.
+  const bounds = modalRideBounds(view);
   return `<div class="cov-trip cov-cell-trip oebb">
     <div class="cov-trip-head">
-      ${modalTripHeadTimes(it.departure_at, it.arrival_at, it.duration_seconds, bounds)}
+      ${modalTripHeadTimes(view.departure_at, view.arrival_at, view.duration_seconds, bounds)}
       <span class="hint">${escHTML(transfers)}</span>
     </div>
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
@@ -2205,7 +2184,7 @@ function renderModalLeg(leg) {
   const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
   const headsign = leg.trip_headsign ? ' (' + escHTML(leg.trip_headsign) + ')' : '';
   const agency = leg.agency_name || leg.feed_id || '';
-  // Hide exactly the legs `modalTransitBounds` excludes, so the recomputed
+  // Hide exactly the legs `modalRideBounds` leaves out, so the walk-free
   // header always describes the rows still on screen.
   const isWalk = !isModalTransitLeg(leg);
   const walkClass = isWalk ? ' walk-leg' : '';
@@ -2219,16 +2198,20 @@ function renderModalLeg(leg) {
   </div>`;
 }
 
-// ÖBB's stop number of one end of an ÖBB leg (`from` or `to`): HAFAS's own
-// `extId` as the sweep kept it (`*_id_raw`), else the number of the leg's
-// token (`UIC:8100042`, `OEBB:904050`) on a row from before the raw ids.
-// null when there is none or it is not a number the API takes.
+// ÖBB's stop number of one end of an ÖBB leg (`from` or `to`), from the leg's
+// stop place (`CanonicalView.leg`'s `from_stop` / `to_stop`): HAFAS's own `extId`
+// (`codes.OEBB_EXT`), else the number its token gave (`uic`, or the payload of an
+// `OEBB:` token). null when there is none or it is not a number the API takes.
 const OEBB_STOP_NUMBER_RE = /^[0-9A-Za-z._-]{1,40}$/;
 function oebbStopNumber(leg, end) {
-  const raw = leg[end + '_id_raw'];
-  const token = leg[end + '_uic'];
-  let number = typeof raw === 'string' ? raw.trim() : '';
-  if (!number && typeof token === 'string') number = token.replace(/^(UIC|OEBB):/, '');
+  const stop = leg[end + '_stop'];
+  if (!stop) return null;
+  const codes = stop.codes || {};
+  let number = typeof codes.OEBB_EXT === 'string' ? codes.OEBB_EXT.trim() : '';
+  if (!number && stop.uic) number = String(stop.uic);
+  if (!number && typeof stop.unresolved_token === 'string') {
+    number = stop.unresolved_token.replace(/^OEBB:/, '');
+  }
   return OEBB_STOP_NUMBER_RE.test(number) ? number : null;
 }
 
@@ -2238,28 +2221,27 @@ function oebbStopNumber(leg, end) {
 function oebbStopHtml(leg, end) {
   const number = oebbStopNumber(leg, end);
   const oebbName = leg[end + '_name'] || '';
-  const label = oebbName || leg[end + '_uic'] || '?';
+  const label = oebbName || '?';
   const title = number ? 'ÖBB stop number ' + number : 'ÖBB gave no stop number';
   const numberAttr = number ? ' data-oebb-code="' + escHTML(number) + '"' : '';
   return '<span class="oebb-stop"' + numberAttr + ' data-oebb-name="' + escHTML(oebbName)
     + '" title="' + escHTML(title) + '">' + escHTML(label) + '</span>';
 }
 
-// PR-196b — ÖBB-side leg row. VerifyLeg carries (mode, from_uic,
-// to_uic, dep_utc, arr_utc, route_name, and since the provenance fields
-// ÖBB's own stop names and numbers) — narrower than VIATOR's leg shape.
-// Its stops are named by the station module from ÖBB's stop numbers
-// (`oebbStopHtml`). Walk legs honour the same modal-only toggle.
+// PR-196b — ÖBB-side leg row (`CanonicalView.leg`). Its label is the one ÖBB
+// shows (`RJ 1141`), else its line; its stops are named by the station module
+// from ÖBB's stop numbers (`oebbStopHtml`). Walk legs honour the same
+// modal-only toggle.
 function renderModalOebbLeg(leg) {
   const mode = leg.mode || 'TRANSIT';
-  const service = leg.route_name || (mode === 'WALK' ? 'walk' : '');
+  const service = leg.published_name || leg.route_short_name || (mode === 'WALK' ? 'walk' : '');
   // Same rule as the VIATOR row — see renderModalLeg.
   const isWalk = !isModalTransitLeg(leg);
   const walkClass = isWalk ? ' walk-leg' : '';
   const hiddenAttr = (isWalk && !MODAL_SHOW_WALKS) ? ' hidden' : '';
   return `<div class="cov-leg${walkClass}"${hiddenAttr}>
     <span class="cov-leg-mode">${escHTML(mode)}</span>
-    <span class="cov-leg-when">${fmtTime(leg.dep_utc)} → ${fmtTime(leg.arr_utc)}</span>
+    <span class="cov-leg-when">${fmtTime(leg.departure)} → ${fmtTime(leg.arrival)}</span>
     <span class="cov-leg-stops">${oebbStopHtml(leg, 'from')} → ${oebbStopHtml(leg, 'to')}</span>
     <span class="cov-leg-service">${escHTML(service)}</span>
   </div>`;
@@ -2347,7 +2329,7 @@ const OEBB_NOT_ASKED_HTML = '<div class="compare-cell empty">ÖBB not asked yet 
 function renderDirectionCompareGrid(dir) {
   const viatorBody = renderModalViatorColumn(dir.trips || []);
   const oebbBody = dir.external_verified_at
-    ? renderModalOebbColumn(dir.external_itineraries || [])
+    ? renderModalOebbColumn(dir.external_journeys || [])
     : OEBB_NOT_ASKED_HTML;
   const cols = [
     { key: 'viator', label: 'VIATOR · MOTIS / OTP', pillClass: 'viator', body: viatorBody },
@@ -2360,7 +2342,7 @@ function renderDirectionSection(label, subtitle, dir) {
   // PR-196b — modal layout flip: instead of stacking the VIATOR trips
   // above the verify-block, we render a two-column compare-grid with
   // VIATOR on the left and ÖBB HAFAS on the right (using
-  // external_itineraries persisted by PR-196a). Above the grid sits a
+  // external_journeys persisted by the sweep). Above the grid sits a
   // control strip with the alignment-tier pill + the display-only
   // "Show walk legs" toggle. The Re-verify button is preserved below
   // the grid for one-click re-query (and updates the modal in-place
@@ -2377,7 +2359,7 @@ function renderDirectionSection(label, subtitle, dir) {
         <span class="hint">(${escHTML(subtitle)})</span>
         <span class="cov-pill" data-status="${escHTML(dir.status)}">${escHTML(dir.status)}</span>
         ${itinSuffix ? '· ' + itinSuffix : ''}
-        ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) : ''}
+        ${dir.best_duration_seconds ? '· best ' + fmtDuration(dir.best_duration_seconds) + ' door to door' : ''}
       </summary>`;
     const controls = renderModalControls(dir);
     const grid = renderDirectionCompareGrid(dir);
@@ -2405,34 +2387,6 @@ function fmtTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-}
-
-function renderLeg(leg) {
-  const mode = leg.mode || 'TRANSIT';
-  const service = leg.route_short_name || leg.route_long_name || (mode === 'WALK' ? 'walk' : '');
-  const headsign = leg.trip_headsign ? ' (' + escHTML(leg.trip_headsign) + ')' : '';
-  const agency = leg.agency_name || leg.feed_id || '';
-  return `<div class="cov-leg">
-    <span class="cov-leg-mode">${escHTML(mode)}</span>
-    <span class="cov-leg-when">${fmtTime(leg.departure)} → ${fmtTime(leg.arrival)}</span>
-    <span class="cov-leg-stops">${escHTML(leg.from_name || '?')} → ${escHTML(leg.to_name || '?')}</span>
-    <span class="cov-leg-service">${escHTML(service)}${headsign}</span>
-    ${agency ? '<span class="cov-leg-agency">' + escHTML(agency) + '</span>' : ''}
-  </div>`;
-}
-
-function renderTripCard(trip) {
-  const legs = (trip.legs || []).map(renderLeg).join('');
-  const transfers = fmtCount(trip.num_transfers, 'transfer');
-  return `<div class="cov-trip">
-    <div class="cov-trip-head">
-      <span class="cov-trip-rank">#${(trip.rank || 0) + 1}</span>
-      <span>${fmtTime(trip.departure_at)} → ${fmtTime(trip.arrival_at)}</span>
-      <span class="cov-trip-duration">${fmtDuration(trip.duration_seconds)}</span>
-      <span class="hint">${escHTML(transfers)}</span>
-    </div>
-    <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
-  </div>`;
 }
 
 document.addEventListener('click', (e) => {
@@ -2484,7 +2438,7 @@ document.addEventListener('change', (e) => {
 // gives the operator an at-a-glance "did the picture change?" view.
 //
 // PR-196b followup (deferred): persisting the live re-verify back to
-// external_itineraries + recomputing alignment_score would require a
+// external_journeys + recomputing alignment_score would require a
 // backend change to the verify-external endpoint (write through to
 // the cell row, recompute via compute_alignment). Out of scope for
 // PR-196b — file a follow-up before shipping if operators ask for it.
@@ -2514,7 +2468,7 @@ async function handleVerifyExternal(btn) {
       // outbound + return sections stay independent. No-op if the
       // section isn't a compare-grid (legacy "no coverage row"
       // branch) or if the live result carried zero itineraries.
-      refreshModalOebbColumn(block, payload.itineraries || []);
+      refreshModalOebbColumn(block, payload.journeys || []);
     } else {
       const detail = await r.text();
       resultEl.innerHTML = `<p class="hint cov-verify-warn">Verify request failed (${r.status}): ${escHTML(detail.slice(0, 200))}</p>`;
@@ -2528,12 +2482,12 @@ async function handleVerifyExternal(btn) {
 }
 
 // PR-196b — replace the ÖBB column body inside the surrounding
-// compare-grid with a fresh render from the live-query itineraries.
+// compare-grid with a fresh render from the live query's journeys.
 // Locates the column body by walking up to the direction section
 // and selecting the second .compare-cell (column 1 is VIATOR, column
 // 2 is ÖBB — see renderDirectionCompareGrid). Safe no-op for the
 // legacy "no coverage row" branch which has no compare-grid.
-function refreshModalOebbColumn(verifyBlock, liveItineraries) {
+function refreshModalOebbColumn(verifyBlock, liveJourneys) {
   const section = verifyBlock.closest('[data-direction-section]');
   if (!section) return;
   const cells = section.querySelectorAll('.compare-grid > .compare-cell');
@@ -2544,7 +2498,7 @@ function refreshModalOebbColumn(verifyBlock, liveItineraries) {
   // differs (older render or no-grid section).
   if (cells.length < 4) return;
   const oebbBody = cells[3];
-  const fresh = renderModalOebbColumn(liveItineraries);
+  const fresh = renderModalOebbColumn(liveJourneys);
   oebbBody.innerHTML = fresh || '<div class="compare-cell empty">no itineraries found</div>';
   // Honour the current "show walks" toggle on the freshly-rendered
   // rows (renderModalOebbLeg sets the initial hidden attr from

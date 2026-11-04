@@ -164,14 +164,26 @@ def test_hafas_adapter_gives_coverage_what_its_own_parser_gave() -> None:
     and a time past midnight is the next day's (`01020000` was read as 01:02 on the same day).
     """
     vienna = ZoneInfo("Europe/Vienna")
+
+    def wall_clock(instant: str) -> str:
+        # The old parser kept Vienna wall clock; the scorer now reads UTC instants.
+        return datetime.fromisoformat(instant).astimezone(vienna).strftime("%Y-%m-%dT%H:%M")
+
     journeys = _hafas()
-    shown = [oebb_journeys.itinerary(journey) for journey in journeys]
+    scored = [oebb_journeys.scoring_legs(journey) for journey in journeys]
     assert [
         [
-            (leg.mode, leg.from_uic, leg.to_uic, leg.dep_utc, leg.arr_utc, leg.route_name)
-            for leg in it.legs
+            (
+                leg["mode"],
+                leg["from_stop_id"],
+                leg["to_stop_id"],
+                wall_clock(leg["departure"]),
+                wall_clock(leg["arrival"]),
+                leg["route_short_name"],
+            )
+            for leg in legs
         ]
-        for it in shown
+        for legs in scored
     ] == [
         [("RAIL", "UIC:8103000", "UIC:8100002", "2026-06-28T08:00", "2026-06-28T10:45", "RJ 1141")],
         [
@@ -201,11 +213,11 @@ def test_hafas_adapter_gives_coverage_what_its_own_parser_gave() -> None:
             ),
         ],
     ]
-    # The modal's Vienna wall clock is the canonical leg's instant, localised.
-    for journey, itinerary in zip(journeys, shown, strict=True):
-        for leg, shown_leg in zip(journey.legs, itinerary.legs, strict=True):
-            local = leg.departure.timetabled.astimezone(vienna).strftime("%Y-%m-%dT%H:%M")
-            assert local == shown_leg.dep_utc
+    # The scorer's instants are the canonical legs' own.
+    for journey, legs in zip(journeys, scored, strict=True):
+        for leg, scored_leg in zip(journey.legs, legs, strict=True):
+            assert leg.departure is not None
+            assert datetime.fromisoformat(scored_leg["departure"]) == leg.departure.timetabled
 
 
 def test_hafas_empty_or_malformed_payloads_give_no_journey() -> None:
