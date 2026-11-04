@@ -189,12 +189,11 @@ def _place(stop: str, lat: float, lon: float) -> dict[str, Any]:
     return {"name": f"ZZ Stop {stop}", "stopId": f"zz_{stop}", "lat": lat, "lon": lon}
 
 
-def _trips(session_id: str, when: datetime) -> list[dict[str, Any]]:
+def _trips(session_id: str, when: datetime) -> dict[str, Any]:
     """TRIPS_PER_SESSION itineraries of two rail legs, distinct per session,
-    as a MOTIS answer through the real MOTIS normalisation: the fanout
-    records them and signs every leg (the signature's SELECTs)."""
-    from app.journey import motis_client
-
+    as a MOTIS answer; the fake engine reads it through the real MOTIS
+    adapter, then the fanout records them and signs every leg (the
+    signature's SELECTs)."""
     base = when if when.tzinfo else when.replace(tzinfo=UTC)
     shift = SIDS.index(session_id) * 0.099
     itineraries = []
@@ -236,7 +235,7 @@ def _trips(session_id: str, when: datetime) -> list[dict[str, Any]]:
                 "legs": legs,
             }
         )
-    return motis_client._itineraries_to_trips({"itineraries": itineraries})
+    return {"itineraries": itineraries}
 
 
 class _FakeMotis:
@@ -245,7 +244,21 @@ class _FakeMotis:
     async def fetch_plan(self, **kw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         self.calls += 1
         await asyncio.sleep(ENGINE_LATENCY_S)
-        return {"itineraries": []}, _trips(kw["session_id"], kw["when"])
+        from app.journey import motis_client
+
+        answer = _trips(kw["session_id"], kw["when"])
+        return {"itineraries": []}, motis_client._itineraries_to_trips(answer)
+
+    async def fetch_journeys(self, **kw: Any) -> tuple[dict[str, Any], list[Any]]:
+        """The fanout's call since #303: the same answer as canonical journeys."""
+        self.calls += 1
+        await asyncio.sleep(ENGINE_LATENCY_S)
+        from app.journey.canonical_adapters import motis_adapter
+
+        answer = _trips(kw["session_id"], kw["when"])
+        return {"itineraries": []}, motis_adapter.journeys_from_plan(
+            answer, session_id=kw["session_id"]
+        )
 
 
 def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:

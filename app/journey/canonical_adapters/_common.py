@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from ..canonical import (
     CanonicalJourney,
-    CanonicalLeg,
     CanonicalLocation,
     CanonicalStopPlace,
     CanonicalTiming,
     GeoPosition,
 )
+from ..canonical.canonical_transfer import mark_transfers as mark_transfers
 from ..signature import stop_token
 
 ADAPTER_VERSION = 1
@@ -137,18 +136,3 @@ def source_rank(journey: CanonicalJourney) -> int:
     """The journey's position in its source's answer: the last part of the id every adapter
     gives (`<provider>:<scope>:<rank>`)."""
     return int(journey.id.rsplit(":", 1)[1])
-
-
-def mark_transfers(legs: Sequence[CanonicalLeg]) -> list[CanonicalLeg]:
-    """A non-timed leg between two timed legs is a `transfer`, any other one `continuous`
-    (OJP's `TransferLeg` vs `ContinuousLeg`), for sources that do not say which."""
-    timed = [index for index, leg in enumerate(legs) if leg.is_timed]
-    if len(timed) < 2:
-        return list(legs)
-    first, last = timed[0], timed[-1]
-    return [
-        leg.model_copy(update={"kind": "transfer"})
-        if not leg.is_timed and first < index < last
-        else leg
-        for index, leg in enumerate(legs)
-    ]
