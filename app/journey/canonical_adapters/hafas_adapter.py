@@ -1,7 +1,7 @@
 """ÖBB HAFAS `TripSearch` → CanonicalJourney: one adapter for `/journey` and for coverage.
 
 Times are Europe/Vienna local (`date` + `HHMMSS`, with a day-roll prefix past midnight) and are
-converted to UTC here, once; coverage's `VerifyLeg` kept them naive. A station's identity comes
+converted to UTC here, once (coverage's check kept them naive before #303 PR 4a). A station's identity comes
 from `extId`, then the lid's `L=` field read by name (`external_verify.oebb_stop_id`), never from
 a scan of the lid, which returns a longitude (CLAUDE.md §3).
 
@@ -232,8 +232,8 @@ def map_category_to_mode(cat: str | int | None) -> str:
     """
     # HAFAS occasionally returns `cat` as an int (a numeric product code)
     # rather than a string abbreviation — str() first so `.upper()` never
-    # raises AttributeError on those responses. Mirrors the same fix in
-    # app/network_coverage/external_verify.py's _hafas_cat_to_mode.
+    # raises AttributeError on those responses (#213; coverage's own mode rule,
+    # `network_coverage.oebb_journeys.oebb_mode`, does the same).
     cat_upper = str(cat or "").upper()
     if not cat_upper:
         return "TRANSIT"

@@ -1,17 +1,23 @@
 """Search recording — `journey_searches` + executions + trips writers.
 
-Used by the fanout endpoint (step 14) and the journey/plan endpoint.
+Used by the fanout endpoint (step 14), the journey/plan endpoint, the replay and the coverage
+runner. A trip row stores the canonical journey (`journey_trips.journey`, #303 PR 4a); its summary
+columns and `trip_signature` are written from the journey with today's rules, through the trip
+dict bridge, so the fanout merge and the reports keep their behaviour (design D5).
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session as DbSession
 
 from ..models import JourneySearch, JourneySearchExecution, JourneyTrip
+from .canonical import CanonicalJourney
+from .canonical_adapters.trip_dict import to_trip_dict
 from .signature import trip_signature
 
 
@@ -69,15 +75,15 @@ def record_execution(
     response_ms: int,
     raw_response: dict[str, Any] | None,
     error_message: str | None,
-    trips: list[dict[str, Any]],
+    journeys: Sequence[CanonicalJourney],
 ) -> JourneySearchExecution:
-    """Record one (search x session) execution + its trips."""
+    """Record one (search x session) execution + its journeys, in answer order."""
     exe = JourneySearchExecution(
         search_id=search_id,
         session_id=session_id,
         graph_snapshot_id=graph_snapshot_id,
         status=status,
-        num_itineraries=len(trips),
+        num_itineraries=len(journeys),
         response_ms=response_ms,
         raw_response=raw_response,
         error_message=error_message,
@@ -85,23 +91,36 @@ def record_execution(
     db.add(exe)
     db.flush()
 
-    for rank, t in enumerate(trips):
-        sig = trip_signature(db, session_id=session_id, legs=t.get("legs", []))
+    for rank, journey in enumerate(journeys):
         db.add(
-            JourneyTrip(
-                execution_id=exe.id,
-                trip_signature=sig,
-                rank_in_response=rank,
-                duration_seconds=int(t["duration_seconds"]),
-                num_transfers=int(t.get("num_transfers", 0)),
-                departure_at=t["departure_at"],
-                arrival_at=t["arrival_at"],
-                modes=t.get("modes", ""),
-                legs=t.get("legs", []),
-                fare=t.get("fare"),
-            )
+            journey_trip(db, execution_id=exe.id, session_id=session_id, rank=rank, journey=journey)
         )
     return exe
+
+
+def journey_trip(
+    db: DbSession,
+    *,
+    execution_id: uuid.UUID,
+    session_id: str,
+    rank: int,
+    journey: CanonicalJourney,
+) -> JourneyTrip:
+    """The `journey_trips` row of one journey: the canonical JSON, and the summary columns the
+    reports and the coverage export read without it."""
+    trip = to_trip_dict(journey)
+    return JourneyTrip(
+        execution_id=execution_id,
+        trip_signature=trip_signature(db, session_id=session_id, legs=trip["legs"]),
+        rank_in_response=rank,
+        duration_seconds=int(trip["duration_seconds"]),
+        num_transfers=int(trip["num_transfers"]),
+        departure_at=trip["departure_at"],
+        arrival_at=trip["arrival_at"],
+        modes=trip["modes"],
+        journey=journey.model_dump(mode="json"),
+        fare=None,
+    )
 
 
 def finish_search(

@@ -4,8 +4,10 @@ time normalisation.
 These tests pin the contracts the runner depends on without standing up
 a full DB. The helpers under test (`_resolve_run_window`,
 `_slot_boundaries`, `_trip_belongs_to_window`, `_coverage_dedup_key`,
-`_fetch_plan_sliced`) are all DB-free by design — see the docstrings on
+`_fetch_journeys_sliced`) are all DB-free by design — see the docstrings on
 each in `app/network_coverage/runner.py` for the per-helper rationale.
+Since #303 PR 4a the runner works on canonical journeys: the fixtures below
+build them from the old leg dicts (`canonical_fixtures.journey_from_legs`).
 
 Coverage:
   - K=1 parity: legacy single-call behaviour is bit-identical to PR-2.
@@ -14,8 +16,8 @@ Coverage:
     falls in the day-D window even though arrival is on day D+1.
   - Cross-TZ origin: a window 06:00-12:00 Europe/Vienna excludes a
     train boarding 12:30 UTC (= 14:30 Vienna in summer = outside).
-  - Missing `first_transit_leg_departure_utc`: walk-only trips do NOT
-    pass the day-D filter (no boarding event to anchor against).
+  - No first boarding (`CanonicalJourney.first_boarding`): walk-only
+    journeys do NOT pass the day-D filter (no boarding event to anchor against).
 """
 
 from __future__ import annotations
@@ -27,31 +29,23 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.journey.canonical import CanonicalJourney
 from app.network_coverage import runner
 from app.network_coverage.hubs import Hub
+from tests.unit.canonical_fixtures import journey_from_legs
 
 
-# Minimal helper: build a synthetic trip dict matching the canonical
-# shape the planner clients emit (see app/journey/trip_normalize.py).
-# Keeps the test data legible inline without forcing every test to
-# stand up a fake fetch_plan response.
+# Minimal helper: a synthetic journey from the old leg dicts (mode,
+# from_stop_id, to_stop_id, route_short_name, departure, arrival). Keeps the
+# test data legible inline without forcing every test to stand up a fake
+# fetch_journeys response.
 def _make_trip(
     *,
     legs: list[dict[str, Any]],
-    first_transit_dep_utc: str | None,
     duration_seconds: int = 3600,
-) -> dict[str, Any]:
-    """Synthetic trip dict. `legs` is a list of canonical-shape legs
-    (mode, from_stop_id, to_stop_id, route_short_name, departure)."""
-    return {
-        "duration_seconds": duration_seconds,
-        "num_transfers": max(0, len([lg for lg in legs if lg.get("mode") != "WALK"]) - 1),
-        "departure_at": legs[0].get("departure", "") if legs else "",
-        "arrival_at": "",
-        "modes": ",".join(sorted({lg["mode"] for lg in legs if lg.get("mode") != "WALK"})),
-        "legs": legs,
-        "first_transit_leg_departure_utc": first_transit_dep_utc,
-    }
+) -> CanonicalJourney:
+    """Synthetic journey; its first boarding is its first ride's departure."""
+    return journey_from_legs(legs, duration_seconds=duration_seconds)
 
 
 def _transit_leg(
@@ -159,7 +153,7 @@ def test_resolve_run_window_unknown_tz_falls_back_to_utc():
 
 def test_slot_boundaries_k_equals_one_returns_window_endpoints():
     """K=1 — the legacy single-call rollback path. Boundaries are just
-    [start_utc, end_utc] so `_fetch_plan_sliced` can dispatch one call
+    [start_utc, end_utc] so `_fetch_journeys_sliced` can dispatch one call
     bit-identical to PR-2."""
     window = runner.ResolvedWindow(
         start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
@@ -203,7 +197,6 @@ def test_trip_belongs_to_window_overnight_train_boards_day_d():
                 arrival="2026-07-02T07:30:00+00:00",
             )
         ],
-        first_transit_dep_utc="2026-07-01T23:50:00+00:00",
     )
     assert runner._trip_belongs_to_window(trip, window) is True
 
@@ -220,7 +213,6 @@ def test_trip_belongs_to_window_excludes_train_boarding_outside_vienna_window():
     )
     trip = _make_trip(
         legs=[_transit_leg(departure="2026-07-01T12:30:00+00:00")],
-        first_transit_dep_utc="2026-07-01T12:30:00+00:00",
     )
     assert runner._trip_belongs_to_window(trip, window) is False
 
@@ -236,26 +228,29 @@ def test_trip_belongs_to_window_walk_only_returns_false():
     )
     trip = _make_trip(
         legs=[{"mode": "WALK", "departure": "2026-07-01T08:00:00+00:00"}],
-        first_transit_dep_utc=None,
     )
+    assert trip.first_boarding is None
     assert runner._trip_belongs_to_window(trip, window) is False
 
 
-def test_trip_belongs_to_window_missing_field_returns_false():
-    """A trip dict that genuinely lacks `first_transit_leg_departure_utc`
-    (legacy fixture, malformed input) is excluded rather than guessed
-    against `departure_at` — guessing would silently let the
-    walk-then-train edge case slip through."""
+def test_trip_belongs_to_window_ride_without_a_time_returns_false():
+    """A ride the source gave no time for has no boarding instant: it is
+    excluded rather than guessed against the door-to-door departure —
+    guessing would silently let the walk-then-train edge case slip through."""
     window = runner.ResolvedWindow(
         start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
         end_utc=datetime(2026, 7, 2, 0, 0, tzinfo=UTC),
         tz_name="UTC",
     )
-    trip = {
-        "departure_at": "2026-07-01T08:00:00+00:00",
-        "legs": [_transit_leg()],
-        # No 'first_transit_leg_departure_utc' field at all
+    walk = {
+        "mode": "WALK",
+        "departure": "2026-07-01T08:00:00+00:00",
+        "arrival": "2026-07-01T08:10:00+00:00",
     }
+    ride = {"mode": "RAIL", "from_stop_id": "feed:A", "to_stop_id": "feed:B"}
+    trip = _make_trip(legs=[walk, ride])
+    assert trip.departure is not None
+    assert trip.first_boarding is None
     assert runner._trip_belongs_to_window(trip, window) is False
 
 
@@ -266,33 +261,32 @@ def test_coverage_dedup_key_collapses_same_train_across_slots():
     """The whole point of K-slot dedup: same train surfaced by two
     adjacent slots must produce the same dedup key so it's counted
     once. The synthetic case: a TGV 08:00 → 09:00 returned by both
-    the 06:00-anchored and 08:00-anchored slot calls."""
-    trip = _make_trip(
-        legs=[
-            _transit_leg(
-                from_stop_id="sncf:8727100",
-                to_stop_id="sncf:8727101",
-                route="TGV-6601",
-                departure="2026-07-01T08:00:00+00:00",
-            )
-        ],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
-    )
-    key_a = runner._coverage_dedup_key(trip)
-    key_b = runner._coverage_dedup_key(trip)
+    the 06:00-anchored and 08:00-anchored slot calls (two journey objects)."""
+
+    def tgv() -> CanonicalJourney:
+        return _make_trip(
+            legs=[
+                _transit_leg(
+                    from_stop_id="sncf:8727100",
+                    to_stop_id="sncf:8727101",
+                    route="TGV-6601",
+                    departure="2026-07-01T08:00:00+00:00",
+                )
+            ],
+        )
+
+    key_a = runner._coverage_dedup_key(tgv())
+    key_b = runner._coverage_dedup_key(tgv())
     assert key_a == key_b
-    # Verify the tuple shape is what we documented.
-    assert key_a[0] == "8727100"  # from_stop_id_normalised
-    assert "2026-07-01T08:00" in key_a[1]  # truncated-to-minute UTC
-    assert key_a[2] == ("TGV-6601",)  # route signature
-    assert key_a[3] == "8727101"  # to_stop_id_normalised
+    # The fingerprint's strict key: 16 hex of the spine (modes, stations) and its minutes.
+    assert len(key_a) == 16
+    int(key_a, 16)
 
 
 def test_coverage_dedup_key_cross_engine_normalisation():
     """OTP uses `<feed>:<local>` and MOTIS uses `<feed>_<local>` for
     stop ids. A train surfaced by both engines on a fanout coverage
-    run must dedup — `_normalise_stop_id` strips the prefix on both
-    forms."""
+    run must dedup — both ids name the same station (UIC 8727100)."""
     trip_otp = _make_trip(
         legs=[
             _transit_leg(
@@ -301,46 +295,75 @@ def test_coverage_dedup_key_cross_engine_normalisation():
                 route="TGV-1",
             )
         ],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
     )
-    trip_motis = _make_trip(
-        legs=[
+    trip_motis = journey_from_legs(
+        [
             _transit_leg(
                 from_stop_id="sncf_8727100",
                 to_stop_id="sncf_8727101",
                 route="TGV-1",
             )
         ],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
+        provider="motis",
     )
     assert runner._coverage_dedup_key(trip_otp) == runner._coverage_dedup_key(trip_motis)
 
 
+def test_coverage_dedup_key_keeps_two_stations_with_the_same_platform_apart():
+    """#303 PR 4a fix: the old key read a stop id's last `:` part, so
+    `SBB:8507000:0:7` (Bern) and `SBB:8503000:0:7` (Zürich HB) both became
+    `7` (the platform) and two trains from two stations, same minute and
+    same route name, were merged into one. The strict key compares stations."""
+    bern = _make_trip(
+        legs=[_transit_leg(from_stop_id="SBB:8507000:0:7", to_stop_id="SBB:8508000:0:2")]
+    )
+    zurich = _make_trip(
+        legs=[_transit_leg(from_stop_id="SBB:8503000:0:7", to_stop_id="SBB:8508000:0:2")]
+    )
+    assert runner._coverage_dedup_key(bern) != runner._coverage_dedup_key(zurich)
+
+
+def test_coverage_dedup_key_separates_a_different_minute():
+    """Same stations, a train an hour later: two journeys."""
+    first = _make_trip(legs=[_transit_leg(departure="2026-07-01T08:00:00+00:00")])
+    later = _make_trip(
+        legs=[
+            _transit_leg(departure="2026-07-01T09:00:00+00:00", arrival="2026-07-01T10:00:00+00:00")
+        ]
+    )
+    assert runner._coverage_dedup_key(first) != runner._coverage_dedup_key(later)
+
+
+def test_coverage_dedup_key_ignores_the_route_name():
+    """The strict key holds no route name (`JourneyFingerprint`): two rides
+    at the same stations and the same boarding and alighting minutes are one
+    journey even if their labels differ (the old key kept them apart)."""
+    s7 = _make_trip(legs=[_transit_leg(route="S7")])
+    s_7 = _make_trip(legs=[_transit_leg(route="S 7")])
+    assert runner._coverage_dedup_key(s7) == runner._coverage_dedup_key(s_7)
+
+
 def test_coverage_dedup_key_walk_only_collapses_to_sentinel():
-    """A walk-only trip has no transit legs → returns the (\"\", \"\", (), \"\")
-    sentinel so multiple walk-only trips collapse to one entry. Not
-    that this matters in practice — `_trip_belongs_to_window` already
-    excludes walk-only trips upstream."""
+    """A walk-only journey has no ride → the empty key, so walk-only
+    journeys collapse to one entry. Not that this matters in practice —
+    `_trip_belongs_to_window` already excludes walk-only journeys upstream."""
     trip = _make_trip(
         legs=[{"mode": "WALK", "from_stop_id": "", "to_stop_id": ""}],
-        first_transit_dep_utc=None,
     )
-    assert runner._coverage_dedup_key(trip) == ("", "", (), "")
+    assert runner._coverage_dedup_key(trip) == ""
 
 
-# ─────────────────────────── _fetch_plan_sliced ───────────────────────────
+# ─────────────────────────── _fetch_journeys_sliced ───────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_fetch_plan_sliced_k_equals_one_is_legacy_single_call():
-    """K=1 — bit-identical to PR-2's single fetch_plan call. The
+async def test_fetch_journeys_sliced_k_equals_one_is_legacy_single_call():
+    """K=1 — bit-identical to PR-2's single fetch call. The
     rollback flag: set COVERAGE_SLOT_COUNT=1 in /admin/config and
     PR-3's behaviour collapses to the pre-PR-3 single-call shape.
     """
     fake_planner = AsyncMock()
-    fake_planner.fetch_plan = AsyncMock(
-        return_value=({"raw": "single"}, [_make_trip(legs=[], first_transit_dep_utc=None)])
-    )
+    fake_planner.fetch_journeys = AsyncMock(return_value=({"raw": "single"}, [_make_trip(legs=[])]))
     cfg = runner.CoverageConfig(slot_count=1)
     window = runner.ResolvedWindow(
         start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
@@ -349,7 +372,7 @@ async def test_fetch_plan_sliced_k_equals_one_is_legacy_single_call():
     )
 
     with patch.object(runner.planner_dispatch, "planner_for_engine", return_value=fake_planner):
-        raw, trips = await runner._fetch_plan_sliced(
+        raw, trips = await runner._fetch_journeys_sliced(
             engine="otp",
             session_id="sess-1",
             origin=Hub(id="orig", name="O", short="O", region="", lat=0.0, lon=0.0),
@@ -358,11 +381,11 @@ async def test_fetch_plan_sliced_k_equals_one_is_legacy_single_call():
             cfg=cfg,
         )
 
-    # Exactly one fetch_plan call. The K=1 branch passes the legacy
+    # Exactly one fetch call. The K=1 branch passes the legacy
     # COVERAGE_NUM_ITINERARIES / COVERAGE_SEARCH_WINDOW_SECONDS so the
     # rollback to pre-PR-3 search depth is preserved.
-    assert fake_planner.fetch_plan.call_count == 1
-    call_kwargs = fake_planner.fetch_plan.call_args.kwargs
+    assert fake_planner.fetch_journeys.call_count == 1
+    call_kwargs = fake_planner.fetch_journeys.call_args.kwargs
     assert call_kwargs["num_itineraries"] == cfg.num_itineraries
     assert call_kwargs["search_window_seconds"] == cfg.search_window_seconds
     # No filtering on K=1 — the raw payload's trips pass through
@@ -372,7 +395,7 @@ async def test_fetch_plan_sliced_k_equals_one_is_legacy_single_call():
 
 
 @pytest.mark.asyncio
-async def test_fetch_plan_sliced_k_equals_six_dedups_and_filters():
+async def test_fetch_journeys_sliced_k_equals_six_dedups_and_filters():
     """K=6 — every slot returns a trip with the same dedup key (= same
     train). After filter + dedup the result must be exactly one trip
     (not six)."""
@@ -385,10 +408,9 @@ async def test_fetch_plan_sliced_k_equals_six_dedups_and_filters():
                 departure="2026-07-01T08:00:00+00:00",
             )
         ],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
     )
     fake_planner = AsyncMock()
-    fake_planner.fetch_plan = AsyncMock(return_value=({"raw": "slot"}, [same_train_trip]))
+    fake_planner.fetch_journeys = AsyncMock(return_value=({"raw": "slot"}, [same_train_trip]))
     cfg = runner.CoverageConfig(slot_count=6, within_pair_parallelism=3, slot_timeout_ms=5000)
     window = runner.ResolvedWindow(
         start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
@@ -397,7 +419,7 @@ async def test_fetch_plan_sliced_k_equals_six_dedups_and_filters():
     )
 
     with patch.object(runner.planner_dispatch, "planner_for_engine", return_value=fake_planner):
-        _raw, trips = await runner._fetch_plan_sliced(
+        _raw, trips = await runner._fetch_journeys_sliced(
             engine="otp",
             session_id="sess-1",
             origin=Hub(id="orig", name="O", short="O", region="", lat=0.0, lon=0.0),
@@ -406,24 +428,23 @@ async def test_fetch_plan_sliced_k_equals_six_dedups_and_filters():
             cfg=cfg,
         )
 
-    # Six fetch_plan calls (K=6), one per slot.
-    assert fake_planner.fetch_plan.call_count == 6
+    # Six fetch calls (K=6), one per slot.
+    assert fake_planner.fetch_journeys.call_count == 6
     # Six identical trips collapse to one via the dedup pass.
     assert len(trips) == 1
     # Per-slot num_itineraries is the per-slot knob, not the legacy one.
-    first_call_kwargs = fake_planner.fetch_plan.call_args_list[0].kwargs
+    first_call_kwargs = fake_planner.fetch_journeys.call_args_list[0].kwargs
     assert first_call_kwargs["num_itineraries"] == cfg.num_itineraries_per_slot
 
 
 @pytest.mark.asyncio
-async def test_fetch_plan_sliced_filters_out_of_window_trips():
+async def test_fetch_journeys_sliced_filters_out_of_window_trips():
     """Trips returned by a slot but landing OUTSIDE the window (e.g.
     OTP/MOTIS returned a "next train" past the upper bound) must be
     filtered out. Otherwise the matrix would inflate with trips the
     operator's window deliberately excluded."""
     in_window = _make_trip(
         legs=[_transit_leg(departure="2026-07-01T08:00:00+00:00")],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
     )
     out_of_window = _make_trip(
         legs=[
@@ -432,12 +453,14 @@ async def test_fetch_plan_sliced_filters_out_of_window_trips():
                 from_stop_id="x:9",
                 to_stop_id="x:10",
                 departure="2026-07-02T01:30:00+00:00",
+                arrival="2026-07-02T02:30:00+00:00",
             )
         ],
-        first_transit_dep_utc="2026-07-02T01:30:00+00:00",
     )
     fake_planner = AsyncMock()
-    fake_planner.fetch_plan = AsyncMock(return_value=({"raw": "slot"}, [in_window, out_of_window]))
+    fake_planner.fetch_journeys = AsyncMock(
+        return_value=({"raw": "slot"}, [in_window, out_of_window])
+    )
     cfg = runner.CoverageConfig(slot_count=2, within_pair_parallelism=2, slot_timeout_ms=5000)
     window = runner.ResolvedWindow(
         start_utc=datetime(2026, 7, 1, 0, 0, tzinfo=UTC),
@@ -446,7 +469,7 @@ async def test_fetch_plan_sliced_filters_out_of_window_trips():
     )
 
     with patch.object(runner.planner_dispatch, "planner_for_engine", return_value=fake_planner):
-        _raw, trips = await runner._fetch_plan_sliced(
+        _raw, trips = await runner._fetch_journeys_sliced(
             engine="otp",
             session_id="sess-1",
             origin=Hub(id="orig", name="O", short="O", region="", lat=0.0, lon=0.0),
@@ -457,21 +480,22 @@ async def test_fetch_plan_sliced_filters_out_of_window_trips():
 
     # Only the in-window trip survives the day-D filter.
     assert len(trips) == 1
-    assert trips[0]["first_transit_leg_departure_utc"] == "2026-07-01T08:00:00+00:00"
+    boarding = trips[0].first_boarding
+    assert boarding is not None
+    assert boarding.timetabled == datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
-async def test_fetch_plan_sliced_tolerates_partial_slot_failure():
+async def test_fetch_journeys_sliced_tolerates_partial_slot_failure():
     """One slot raising shouldn't kill the pair — the rest of the slots
     contribute their trips and the pair gets partial coverage. Only
     when EVERY slot fails do we re-raise (so the caller can mark the
     pair as error/timeout)."""
     in_window = _make_trip(
         legs=[_transit_leg(departure="2026-07-01T08:00:00+00:00")],
-        first_transit_dep_utc="2026-07-01T08:00:00+00:00",
     )
     fake_planner = AsyncMock()
-    fake_planner.fetch_plan = AsyncMock(
+    fake_planner.fetch_journeys = AsyncMock(
         side_effect=[
             TimeoutError("slot 1 timed out"),
             ({"raw": "slot2"}, [in_window]),
@@ -485,7 +509,7 @@ async def test_fetch_plan_sliced_tolerates_partial_slot_failure():
     )
 
     with patch.object(runner.planner_dispatch, "planner_for_engine", return_value=fake_planner):
-        _raw, trips = await runner._fetch_plan_sliced(
+        _raw, trips = await runner._fetch_journeys_sliced(
             engine="otp",
             session_id="sess-1",
             origin=Hub(id="orig", name="O", short="O", region="", lat=0.0, lon=0.0),
@@ -591,17 +615,24 @@ def test_accumulate_slot_trips_filters_outside_window_and_dedups():
     )
 
     in_window = _make_trip(
-        legs=[_transit_leg(departure="2026-07-01T09:00:00+00:00")],
-        first_transit_dep_utc="2026-07-01T09:00:00+00:00",
+        legs=[
+            _transit_leg(departure="2026-07-01T09:00:00+00:00", arrival="2026-07-01T10:00:00+00:00")
+        ],
     )
     # Same trip from an adjacent slot — same dedup key, must collapse.
     duplicate_from_neighbour_slot = _make_trip(
-        legs=[_transit_leg(departure="2026-07-01T09:00:00+00:00")],
-        first_transit_dep_utc="2026-07-01T09:00:00+00:00",
+        legs=[
+            _transit_leg(departure="2026-07-01T09:00:00+00:00", arrival="2026-07-01T10:00:00+00:00")
+        ],
     )
     outside_window = _make_trip(
-        legs=[_transit_leg(departure="2026-07-01T13:00:00+00:00", route="TGV-2")],
-        first_transit_dep_utc="2026-07-01T13:00:00+00:00",
+        legs=[
+            _transit_leg(
+                departure="2026-07-01T13:00:00+00:00",
+                arrival="2026-07-01T14:00:00+00:00",
+                route="TGV-2",
+            )
+        ],
     )
 
     deduped: dict = {}

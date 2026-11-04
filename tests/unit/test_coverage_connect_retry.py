@@ -21,8 +21,15 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from app.journey.canonical import CanonicalJourney
 from app.network_coverage import runner
 from app.network_coverage.hubs import Hub
+from tests.unit.canonical_fixtures import journey_from_legs
+
+
+def _journey(duration_seconds: int, *, transfers: int = 0) -> CanonicalJourney:
+    """A journey without legs: all the pair paths here read is its duration and transfers."""
+    return journey_from_legs([], duration_seconds=duration_seconds, transfers=transfers)
 
 
 @pytest.fixture(autouse=True)
@@ -408,17 +415,17 @@ def _patch_execute_pair_db_layer(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_pair_sliced_path_routes_through_fetch_plan_sliced(monkeypatch):
+async def test_execute_pair_sliced_path_routes_through_fetch_journeys_sliced(monkeypatch):
     """The runner always supplies `window` in production — `_execute_pair`'s
-    _fetch closure must dispatch to `_fetch_plan_sliced` (K-slot fan-out),
+    _fetch closure must dispatch to `_fetch_journeys_sliced` (K-slot fan-out),
     not the legacy single-call path."""
     captured: dict = {}
 
     async def _fake_sliced(**kwargs):
         captured.update(kwargs)
-        return {}, [{"duration_seconds": 100, "num_transfers": 0, "legs": []}]
+        return {}, [_journey(100)]
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     _patch_execute_pair_db_layer(monkeypatch)
     origin, dest = _origin_dest()
 
@@ -441,12 +448,12 @@ async def test_execute_pair_sliced_path_routes_through_fetch_plan_sliced(monkeyp
 @pytest.mark.asyncio
 async def test_execute_pair_legacy_path_routes_through_planner_dispatch(monkeypatch):
     """window=None (test-only path — see docstring) must still dispatch to
-    `planner_dispatch.planner_for_engine(...).fetch_plan`, matching the
+    `planner_dispatch.planner_for_engine(...).fetch_journeys`, matching the
     pre-refactor behaviour."""
     captured: dict = {}
 
     class _FakePlanner:
-        async def fetch_plan(self, **kwargs):
+        async def fetch_journeys(self, **kwargs):
             captured.update(kwargs)
             return {}, []
 
@@ -472,14 +479,14 @@ async def test_execute_pair_legacy_path_routes_through_planner_dispatch(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_query_one_session_sliced_path_routes_through_fetch_plan_sliced(monkeypatch):
+async def test_query_one_session_sliced_path_routes_through_fetch_journeys_sliced(monkeypatch):
     captured: dict = {}
 
     async def _fake_sliced(**kwargs):
         captured.update(kwargs)
-        return {}, [{"duration_seconds": 200, "num_transfers": 1, "legs": []}]
+        return {}, [_journey(200, transfers=1)]
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     origin, dest = _origin_dest()
 
     sid, status, _raw, trips, _ms = await runner._query_one_session_for_pair(
@@ -503,7 +510,7 @@ async def test_query_one_session_legacy_path_routes_through_planner_dispatch(mon
     captured: dict = {}
 
     class _FakePlanner:
-        async def fetch_plan(self, **kwargs):
+        async def fetch_journeys(self, **kwargs):
             captured.update(kwargs)
             return {}, []
 
@@ -541,9 +548,9 @@ async def test_query_one_session_retries_connect_error_via_shared_helper(
         attempts += 1
         if attempts < 2:
             raise httpx.ConnectError("All connection attempts failed")
-        return {}, [{"duration_seconds": 50, "num_transfers": 0, "legs": []}]
+        return {}, [_journey(50)]
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     origin, dest = _origin_dest()
 
     _sid, status, _raw, _trips, _ms = await runner._query_one_session_for_pair(
@@ -615,9 +622,9 @@ async def test_execute_pair_connect_timeout_then_success_gives_ok_cell(monkeypat
         attempts += 1
         if attempts == 1:
             raise httpx.ConnectTimeout("zz")
-        return {}, [{"duration_seconds": 100, "num_transfers": 0, "legs": []}]
+        return {}, [_journey(100)]
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     _patch_execute_pair_db_layer(monkeypatch)
 
     persisted = await _execute_zz_pair()
@@ -643,7 +650,7 @@ async def test_execute_pair_repeated_connect_timeouts_fail_after_last_retry(
         attempts += 1
         raise httpx.ConnectTimeout("zz")
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     _patch_execute_pair_db_layer(monkeypatch)
 
     persisted = await _execute_zz_pair()
@@ -663,7 +670,7 @@ async def test_execute_pair_read_timeout_is_not_retried(monkeypatch, _no_real_sl
         attempts += 1
         raise httpx.ReadTimeout("zz")
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     _patch_execute_pair_db_layer(monkeypatch)
 
     persisted = await _execute_zz_pair()
@@ -676,7 +683,7 @@ async def test_execute_pair_read_timeout_is_not_retried(monkeypatch, _no_real_sl
 
 # ─────────────────────── real K-slot fetch (#388 review) ───────────────────────
 #
-# These run the real `_fetch_plan_sliced` and stub only the engine, so the
+# These run the real `_fetch_journeys_sliced` and stub only the engine, so the
 # slot merge decides whether the whole pair is retried.
 
 _WINDOW_START = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
@@ -692,7 +699,7 @@ class _SlotPlanner:
         self.others = others
         self.calls = 0
 
-    async def fetch_plan(self, *, when, **_kwargs):
+    async def fetch_journeys(self, *, when, **_kwargs):
         self.calls += 1
         mode = self.first if when == _WINDOW_START else self.others
         if mode == "connect":
@@ -783,7 +790,7 @@ def test_otp_plan_timeout_shortens_connect_write_pool_only(timeout_ms, read_s, s
 
 
 @pytest.mark.asyncio
-async def test_otp_fetch_plan_uses_the_phase_timeouts(monkeypatch):
+async def test_otp_fetch_journeys_uses_the_phase_timeouts(monkeypatch):
     """The plan call itself builds its client with those timeouts."""
     from app.journey import otp_client
 
@@ -800,7 +807,7 @@ async def test_otp_fetch_plan_uses_the_phase_timeouts(monkeypatch):
     monkeypatch.setattr(otp_client.httpx, "AsyncClient", _client)
     monkeypatch.setattr(otp_client, "_otp_base", lambda _sid: "http://zz-otp.invalid")
 
-    _raw, trips = await otp_client.fetch_plan(
+    _raw, trips = await otp_client.fetch_journeys(
         session_id="zz-sess",
         from_lat=0.0,
         from_lon=0.0,
@@ -826,7 +833,7 @@ async def test_both_call_sites_pass_the_run_id_to_the_retry(monkeypatch, _no_rea
         attempts += 1
         raise httpx.ConnectTimeout("zz")
 
-    monkeypatch.setattr(runner, "_fetch_plan_sliced", _fake_sliced)
+    monkeypatch.setattr(runner, "_fetch_journeys_sliced", _fake_sliced)
     _patch_execute_pair_db_layer(monkeypatch)
     origin, dest = _zz_hubs()
 

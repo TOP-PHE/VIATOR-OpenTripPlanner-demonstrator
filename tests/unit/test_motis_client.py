@@ -1,7 +1,7 @@
 """Smoke tests for the MOTIS Phase-0 client.
 
 Covers the pure translator helpers (deterministic, easy to pin) plus the
-async `fetch_plan` driven by an httpx `MockTransport` (no network) so we
+async `fetch_journeys` driven by an httpx `MockTransport` (no network) so we
 exercise the URL/parameter shaping and the timezone-localisation branch
 without standing up an actual MOTIS container.
 """
@@ -13,13 +13,18 @@ from datetime import UTC, datetime
 import httpx
 
 from app.journey import motis_client
+from app.journey.canonical_adapters import motis_adapter
 from app.journey.canonical_adapters.motis_adapter import (
     feed_id_from_motis_id as _feed_id_from_motis_id,
 )
-from app.journey.motis_client import (
-    _base_url_for,
-    _itineraries_to_trips,
-)
+from app.journey.canonical_adapters.trip_dict import to_trip_dicts
+from app.journey.motis_client import _base_url_for
+
+
+def _itineraries_to_trips(raw: dict) -> list[dict]:
+    """A `/api/v6/plan` answer as today's trip dicts: the MOTIS adapter, then the bridge
+    (what the client's own normaliser gave before #303)."""
+    return to_trip_dicts(motis_adapter.journeys_from_plan(raw))
 
 
 def _leg_to_canonical(leg: dict) -> dict:
@@ -244,9 +249,6 @@ def test_itineraries_to_trips_maps_top_level_fields_and_mode_summary():
     # Modes are sorted, deduped, WALK stripped (same convention as OTP).
     assert t["modes"] == "RAIL"
     assert len(t["legs"]) == 3
-    # The raw itinerary is preserved under the underscore-prefixed key the UI
-    # inspector + recorder.persist_trip contract already agrees on.
-    assert t["_raw_itinerary"] is raw["itineraries"][0]
 
 
 def test_itineraries_to_trips_derives_transfers_when_missing():
@@ -276,11 +278,11 @@ def test_itineraries_to_trips_derives_transfers_when_missing():
     assert _itineraries_to_trips(raw)[0]["num_transfers"] == 1
 
 
-# ─────────────────────────── fetch_plan (mocked) ───────────────────────────
+# ─────────────────────────── fetch_journeys (mocked) ───────────────────────────
 
 
 def _install_mock(monkeypatch, handler):
-    """Wire an httpx.MockTransport into every httpx.AsyncClient `fetch_plan`
+    """Wire an httpx.MockTransport into every httpx.AsyncClient `fetch_journeys`
     constructs, so the test exercises the real URL/param shaping without
     requiring a live MOTIS container."""
     transport = httpx.MockTransport(handler)
@@ -293,7 +295,7 @@ def _install_mock(monkeypatch, handler):
     monkeypatch.setattr(motis_client.httpx, "AsyncClient", factory)
 
 
-async def test_fetch_plan_hits_motis_endpoint_with_canonical_params(monkeypatch):
+async def test_fetch_journeys_hits_motis_endpoint_with_canonical_params(monkeypatch):
     seen: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -303,7 +305,7 @@ async def test_fetch_plan_hits_motis_endpoint_with_canonical_params(monkeypatch)
 
     _install_mock(monkeypatch, handler)
 
-    raw, trips = await motis_client.fetch_plan(
+    raw, trips = await motis_client.fetch_journeys(
         session_id="x",
         from_lat=48.844,
         from_lon=2.374,
@@ -327,7 +329,7 @@ async def test_fetch_plan_hits_motis_endpoint_with_canonical_params(monkeypatch)
     assert trips == []
 
 
-async def test_fetch_plan_ignores_otp_style_stop_ids_and_uses_coords(monkeypatch):
+async def test_fetch_journeys_ignores_otp_style_stop_ids_and_uses_coords(monkeypatch):
     """Phase-1 fix (2026-06-21): OTP-style stop ids (`<provider>:<UIC>`) do
     not match MOTIS's index format (`<gtfs_feed_id>_<localId>`), so passing
     them produces 404 Not Found. Until we have a session-level feed_id map
@@ -339,7 +341,7 @@ async def test_fetch_plan_ignores_otp_style_stop_ids_and_uses_coords(monkeypatch
         return httpx.Response(200, json={"itineraries": []})
 
     _install_mock(monkeypatch, handler)
-    await motis_client.fetch_plan(
+    await motis_client.fetch_journeys(
         session_id="x",
         from_lat=48.844,
         from_lon=2.374,
@@ -360,7 +362,7 @@ async def test_fetch_plan_ignores_otp_style_stop_ids_and_uses_coords(monkeypatch
     assert seen["params"]["toPlace"] != "RENFE-CERCA:7171801"
 
 
-async def test_fetch_plan_localises_naive_when_with_session_timezone(monkeypatch):
+async def test_fetch_journeys_localises_naive_when_with_session_timezone(monkeypatch):
     seen: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -368,7 +370,7 @@ async def test_fetch_plan_localises_naive_when_with_session_timezone(monkeypatch
         return httpx.Response(200, json={"itineraries": []})
 
     _install_mock(monkeypatch, handler)
-    await motis_client.fetch_plan(
+    await motis_client.fetch_journeys(
         session_id="x",
         from_lat=0.0,
         from_lon=0.0,
@@ -387,7 +389,7 @@ async def test_fetch_plan_localises_naive_when_with_session_timezone(monkeypatch
     assert "+02:00" in seen["time"]
 
 
-async def test_fetch_plan_unknown_timezone_falls_through_without_raising(monkeypatch, caplog):
+async def test_fetch_journeys_unknown_timezone_falls_through_without_raising(monkeypatch, caplog):
     seen: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -395,7 +397,7 @@ async def test_fetch_plan_unknown_timezone_falls_through_without_raising(monkeyp
         return httpx.Response(200, json={"itineraries": []})
 
     _install_mock(monkeypatch, handler)
-    await motis_client.fetch_plan(
+    await motis_client.fetch_journeys(
         session_id="x",
         from_lat=0.0,
         from_lon=0.0,
@@ -413,7 +415,7 @@ async def test_fetch_plan_unknown_timezone_falls_through_without_raising(monkeyp
     assert "+" not in seen["time"]  # no offset attached
 
 
-async def test_fetch_plan_sets_connection_close_header(monkeypatch):
+async def test_fetch_journeys_sets_connection_close_header(monkeypatch):
     """PR-188 regression: every MOTIS request must carry `Connection: close`.
 
     Without it, an asyncio.wait_for slot-timeout closes the TCP socket
@@ -434,7 +436,7 @@ async def test_fetch_plan_sets_connection_close_header(monkeypatch):
         return httpx.Response(200, json={"itineraries": []})
 
     _install_mock(monkeypatch, handler)
-    await motis_client.fetch_plan(
+    await motis_client.fetch_journeys(
         session_id="x",
         from_lat=0.0,
         from_lon=0.0,
@@ -450,13 +452,13 @@ async def test_fetch_plan_sets_connection_close_header(monkeypatch):
     assert seen["connection_header"].lower() == "close"
 
 
-async def test_fetch_plan_propagates_http_errors(monkeypatch):
+async def test_fetch_journeys_propagates_http_errors(monkeypatch):
     def handler(_req: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "kaboom"})
 
     _install_mock(monkeypatch, handler)
     try:
-        await motis_client.fetch_plan(
+        await motis_client.fetch_journeys(
             session_id="x",
             from_lat=0.0,
             from_lon=0.0,

@@ -3,8 +3,8 @@
 The runner's `create_run()` does upfront validation BEFORE touching the
 DB, so we can exercise the mode + session_id pairing rules with no real
 database. The async fanout-pair execution + result merging is covered
-via mocked `otp_client.fetch_plan` so the trip-signature merge logic is
-exercised without standing up Postgres.
+via mocked `otp_client.fetch_journeys` (canonical journeys, #303 PR 4a) so
+the trip-signature merge logic is exercised without standing up Postgres.
 
 Out of scope (covered in integration tests once those land):
   - End-to-end POST /runs with mode=fanout via TestClient
@@ -19,7 +19,32 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.journey import otp_client
+from app.journey.canonical import CanonicalJourney
 from app.network_coverage import runner
+from tests.unit.canonical_fixtures import journey_from_legs
+
+
+def _journey(*, duration_seconds: int, feed: str, transfers: int = 0) -> CanonicalJourney:
+    """A one-ride journey of `feed`: what the merge reads (duration, transfers, the feed of
+    its legs) through the trip dict bridge."""
+    journey = journey_from_legs(
+        [
+            {
+                "mode": "RAIL",
+                "from_stop_id": "x:1",
+                "to_stop_id": "x:2",
+                "departure": "2026-05-18T06:00:00+00:00",
+                "arrival": "2026-05-18T08:00:00+00:00",
+            }
+        ],
+        duration_seconds=duration_seconds,
+        transfers=transfers,
+    )
+    (leg,) = journey.legs
+    assert leg.service is not None
+    service = leg.service.model_copy(update={"feed": feed})
+    return journey.model_copy(update={"legs": [leg.model_copy(update={"service": service})]})
+
 
 # ─────────────────────── create_run validation ───────────────────────
 
@@ -136,18 +161,18 @@ def test_fanout_merges_same_signature_across_sessions(monkeypatch):
     # (same signature). C returns nothing.
     captured: dict[str, object] = {}
 
-    async def fake_fetch_plan(*, session_id, **_kwargs):
+    async def fake_fetch_journeys(*, session_id, **_kwargs):
         if session_id == "session-c":
             return {}, []
         return {}, [
-            {
-                "duration_seconds": 7200 if session_id == "session-a" else 7000,
-                "num_transfers": 1,
-                "legs": [{"feed_id": "SNCF" if session_id == "session-a" else "DB"}],
-            }
+            _journey(
+                duration_seconds=7200 if session_id == "session-a" else 7000,
+                feed="SNCF" if session_id == "session-a" else "DB",
+                transfers=1,
+            )
         ]
 
-    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_journeys", fake_fetch_journeys)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
 
     # Trip signature stub: ignore the legs, return a fixed signature
@@ -184,6 +209,9 @@ def test_fanout_merges_same_signature_across_sessions(monkeypatch):
     assert row.num_itineraries == 1, "same signature must merge to one trip"
     assert row.best_duration_seconds == 7000, "shortest-duration trip wins"
     assert sorted(row.session_ids or []) == ["session-a", "session-b"]
+    assert row.best_num_transfers == 1
+    # The operators column unions every merged journey's feeds, in session order.
+    assert row.best_operators == "SNCF,DB"
     # session-c found nothing, so it's NOT in session_ids
     assert "session-c" not in (row.session_ids or [])
 
@@ -193,10 +221,10 @@ def test_fanout_status_is_no_route_when_no_session_returns_trips(monkeypatch):
     (legitimate, no service on this date), session_ids is None."""
     captured: dict[str, object] = {}
 
-    async def fake_fetch_plan(**_kwargs):
+    async def fake_fetch_journeys(**_kwargs):
         return {}, []
 
-    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_journeys", fake_fetch_journeys)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
     _stub_recorder(monkeypatch)
 
@@ -227,18 +255,12 @@ def test_fanout_status_is_ok_when_any_session_returns_trips(monkeypatch):
     Status should follow ok > error/timeout > no_route — i.e. ok wins."""
     captured: dict[str, object] = {}
 
-    async def fake_fetch_plan(*, session_id, **_kwargs):
+    async def fake_fetch_journeys(*, session_id, **_kwargs):
         if session_id == "session-error":
             raise TimeoutError("simulated OTP timeout")
-        return {}, [
-            {
-                "duration_seconds": 4800,
-                "num_transfers": 0,
-                "legs": [{"feed_id": "SBB"}],
-            }
-        ]
+        return {}, [_journey(duration_seconds=4800, feed="SBB")]
 
-    monkeypatch.setattr(otp_client, "fetch_plan", fake_fetch_plan)
+    monkeypatch.setattr(otp_client, "fetch_journeys", fake_fetch_journeys)
     monkeypatch.setattr(runner, "SessionLocal", _FakeSessionLocal(captured))
 
     import app.journey.signature as sig_module
@@ -265,6 +287,7 @@ def test_fanout_status_is_ok_when_any_session_returns_trips(monkeypatch):
     row = added_rows[0]
     assert row.status == "ok"
     assert row.session_ids == ["session-ok"]
+    assert row.best_operators == "SBB"
 
 
 # ─────────────────────── extracted-helper tests ───────────────────────

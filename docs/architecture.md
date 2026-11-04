@@ -114,8 +114,8 @@ Three details in that picture are easy to get backwards and expensive to debug:
 3. `config_service.get_all(db)` loads `platform_config` (30 s in-process cache). `_validate_engine_filter(body.engine)` 400s on a bad engine; `_select_fanout_sessions(db, engine)` selects sessions where `state='serving' AND include_in_fanout`. Empty → 409 with a message distinguishing "no sessions at all" from "none with that engine".
 4. `concurrency.semaphores.journey.acquire_or_fail()` — `MAX_CONCURRENT_JOURNEYS` (default 20). **Rejects rather than queues**; caller gets 503 + `Retry-After`. `recorder.begin_search()` writes the `journey_searches` row.
 5. Reference engines fire first, as concurrent tasks: `asyncio.create_task(_query_ojp_reference)` → `ojp_client.fetch_reference_paginated` (up to 4 time-anchored pages, deduped by `transit_fingerprint`, because OJP caps by alternative-count while OTP caps by time window); `asyncio.create_task(_query_hafas_reference)` → `hafas_client.fetch_plan`. Neither ever raises — both convert failure into a `status` field, so a dead reference can't break the search.
-6. `asyncio.gather` of `_query_session(...)` per session. Each calls `planner_dispatch.get_planner(session).fetch_plan(...)` → `otp_client.fetch_plan` or `motis_client.fetch_plan`. When the form supplied a UIC, `_stop_id_for()` builds `<feedId>:<uic>` and routes by stop rather than coordinate — this bypasses the lat/lon→walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering.
-7. Per session: `_current_snapshot()`, then `recorder.record_execution()` writes `journey_search_executions` + `journey_trips`. Trips are merged into `by_signature` keyed on `signature.trip_signature`, and `_origin_flag()` labels each merged trip `ALL` / `<SESSION>_ONLY` / `SUBSET`.
+6. `asyncio.gather` of `_query_session(...)` per session. Each calls `planner_dispatch.get_planner(session).fetch_journeys(...)` → `otp_client.fetch_journeys` or `motis_client.fetch_journeys` (the raw answer and its canonical journeys). When the form supplied a UIC, `_stop_id_for()` builds `<feedId>:<uic>` and routes by stop rather than coordinate — this bypasses the lat/lon→walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering.
+7. Per session: `_current_snapshot()`, then `recorder.record_execution()` writes `journey_search_executions` + `journey_trips` (each trip row stores the canonical journey in `journey`, #303 PR 4a). Trips are merged into `by_signature` keyed on `signature.trip_signature`, and `_origin_flag()` labels each merged trip `ALL` / `<SESSION>_ONLY` / `SUBSET`.
 8. If **nothing** merged and both endpoints carried UICs, `federated_planner.plan_federated()` attempts a hub-stitch: find a UIC both sessions serve, route origin→hub in one and hub→dest in the other. Fallback only — wrapped in try/except, never 500s the search.
 9. `_build_comparison(merged_trips, ojp_reference)` fingerprints the transit-leg spine on both sides, buckets into `common / otp_only / ojp_only`, and **mutates the trip dicts** to attach a per-card `comparison` tag (`uncomparable` when the fingerprint is empty).
 10. `recorder.finish_search()`, `db.commit()`, response: `{search_id, status, trips, executions, ojp_reference?, hafas_reference?, comparison_summary?, federated_trips?}`.
@@ -130,8 +130,8 @@ Three details in that picture are easy to get backwards and expensive to debug:
 4. The route returns; nothing runs in web (#392). The worker's coverage executor (`executor.CoverageExecutor.poll_once`, every 10 s) claims the row atomically (`claim_next_run`: `SELECT … FOR UPDATE SKIP LOCKED`, then `status='running'`, `claimed_by`, `heartbeat_at`) and calls `runner.execute_run(run_id, executor_id=…)`, beating the heartbeat every 30 s meanwhile.
 5. `execute_run` calls `register_cancel(run_id)` (an in-memory `asyncio.Event`), then `_phase1_snapshot_and_start`: loads `CoverageConfig` from `platform_config` and the active hubs, and **freezes both on the row** (`execution_snapshot`) at the first execution, resolves the session engine, resolves the day window via `_resolve_run_window` + `_slot_boundaries`. On a resumed run it reads the snapshot instead and leaves out the pairs that already have a result row (and recounts the counters from those rows).
 6. Phase 2 — `asyncio.gather` over `_process_pair_with_cancel`, bounded by `asyncio.Semaphore(cfg.pair_parallelism)` (default 5). Each pair checks cancellation **twice**: the in-memory `Event` and `_is_cancelled_in_db` (TTL-cached SELECT) — the in-memory event alone doesn't survive an operator's `UPDATE ... SET status='cancelled'` issued from psql or another worker.
-7. Each pair runs `_execute_pair` (single-session) or `_execute_pair_fanout`. Both go through `_fetch_plan_sliced`, which splits the day window into K slots (default 6 × 4 h), issues one `planner_dispatch.planner_for_engine(engine).fetch_plan` per slot with `COVERAGE_WITHIN_PAIR_PARALLELISM`, then `_trip_belongs_to_window` / `_coverage_dedup_key` / `_merge_slot_results`. Slicing exists to avoid per-pair timeout cliffs and to make engines comparable on identical windows. Results land in `journey_searches`/`_executions`/`_trips` via `recorder` (so cell-click drilldown reuses the journey trip-card UI) plus one `network_coverage_results` row via `_persist_pair_coverage_result`, in **one transaction** (`_record_then_persist`, the recorder in a savepoint; a transient DB error is retried, #392).
-8. Phase 3 — `_finalise_completed_run` → `_maybe_run_external_verify_sweep`. When the run set `verify_externally`, it sweeps **every non-`skipped` row** (PR-196a removed the old failures-only filter — the graduated heatmap needs a score on `ok` cells too, and the old filter was what produced the all-white matrix). Each cell: `external_verify` two-step ÖBB call, then `alignment.compute_alignment` → `_persist_alignment_on_row` writing `external_alignment_score` / `external_alignment_tier`.
+7. Each pair runs `_execute_pair` (single-session) or `_execute_pair_fanout`. Both go through `_fetch_journeys_sliced`, which splits the day window into K slots (default 6 × 4 h), issues one `planner_dispatch.planner_for_engine(engine).fetch_journeys` per slot with `COVERAGE_WITHIN_PAIR_PARALLELISM`, then `_trip_belongs_to_window` (first boarding in the window) / `_coverage_dedup_key` (the fingerprint's `strict_key`) / `_merge_slot_results`, all on canonical journeys (#303 PR 4a). Slicing exists to avoid per-pair timeout cliffs and to make engines comparable on identical windows. Results land in `journey_searches`/`_executions`/`_trips` via `recorder` (so cell-click drilldown reuses the journey trip-card UI) plus one `network_coverage_results` row via `_persist_pair_coverage_result`, in **one transaction** (`_record_then_persist`, the recorder in a savepoint; a transient DB error is retried, #392).
+8. Phase 3 — `_finalise_completed_run` → `_maybe_run_external_verify_sweep`. When the run set `verify_externally`, it sweeps **every non-`skipped` row** (PR-196a removed the old failures-only filter — the graduated heatmap needs a score on `ok` cells too, and the old filter was what produced the all-white matrix). Each cell: `external_verify.fetch_oebb_two_step` (the two-step ÖBB call), its answer made canonical journeys by `oebb_journeys.journeys_from_answer` (the HAFAS adapter), then `alignment.compute_alignment` → `_persist_alignment_on_row` writing `external_journeys` / `external_alignment_score` / `external_alignment_tier`.
 9. UI polls `GET .../runs/{id}` (`get_run` → `_run_to_summary` + `_stats_from_results`; `display_status` queued / resuming / stopping). Cell click → `get_cell_trips`. Stop → `stop_run` stamps `cancel_requested_at` (a queued run, or a running one no live executor holds, is cancelled at once: `executor.cancel_unheld_run`); the runner's DB check reads it and raises the in-process Stop; `_persist_cancelled_run` keeps the partial results. A failed run's `failure_reason` is shown next to its pill.
 10. Crash recovery (#392): a worker restart leaves the run `running`. A graceful stop releases it (`release_claims`); otherwise its heartbeat is stale after 180 s. Either way the next executor claims it again (`resume_count` + 1, `summary.resumes` with the kind, release or crash) and resumes it; past `COVERAGE_MAX_RESUMES` (5) crash resumes it is marked failed with `summary.resume_limit_reached` (releases at deploys do not count). A transient DB error at the start, or pairs left without a result row at the completion, end the execution with `RunNeedsResume`: the run waits for a crash resume instead of failing. Web's startup no longer touches runs.
 
@@ -448,17 +448,17 @@ fired as side tasks, displayed live, and thrown away — `ojp_client`'s docstrin
 
 ### How it works — the engine seam
 
-`planner_dispatch` declares two `Protocol` classes. `_FetchPlan` spells out the exact keyword-only
-`fetch_plan` signature both engine modules expose; `_Planner` is "a module with that `fetch_plan`
-on it". The dispatcher `cast`s the module to `_Planner`. The docstring says why the Protocol exists
-at all: without it, "the dispatched call decays to `Any` (`ModuleType.fetch_plan` is untyped) and
-breaks `--strict` callers". So the seam is a **structural contract enforced by mypy, not a base
-class** — adding a third engine means writing a module whose `fetch_plan` matches `_FetchPlan`, then
-one `if` in `planner_for_engine`.
+`planner_dispatch` declares two `Protocol` classes. `_FetchJourneys` spells out the exact
+keyword-only `fetch_journeys` signature both engine modules expose; `_Planner` is "a module with that
+`fetch_journeys` on it". The dispatcher `cast`s the module to `_Planner`: without the Protocol the
+dispatched call would decay to `Any` (module attributes are untyped) and break `--strict` callers.
+So the seam is a **structural contract enforced by mypy, not a base class** — adding a third engine
+means writing a module whose `fetch_journeys` matches `_FetchJourneys` (its answer turned into
+canonical journeys by a new adapter in `canonical_adapters/`), then one `if` in `planner_for_engine`.
 
 ```python
 planner = planner_dispatch.get_planner(session)
-raw, trips = await planner.fetch_plan(session_id=..., from_lat=..., when=..., timeout_ms=...)
+raw, journeys = await planner.fetch_journeys(session_id=..., from_lat=..., when=..., timeout_ms=...)
 ```
 
 `planner_for_engine` raises `ValueError` on anything but `"otp"` / `"motis"` — deliberately, so a
@@ -479,8 +479,7 @@ Every one of the four clients returns `(raw, trips)`, where `trips` is a list of
 | `modes` | `str` | Comma-joined sorted mode set. OTP includes `WALK`; MOTIS and HAFAS deliberately exclude it. |
 | `legs` | `list[dict]` | The legs, in order (table below). |
 | `first_transit_leg_departure_utc` | `str \| None` | Boarding time of the first non-walk leg. `None` for walk-only itineraries. |
-| `_raw_itinerary` | `dict` | OTP/MOTIS only. The engine's untouched slice, for the UI's JSON inspector. Underscore = presentation-only. |
-| `fare` | absent | Read by `recorder` (`t.get("fare")`) but emitted by no client today — reserved column. |
+| `fare` | absent | Emitted by no client; the recorder writes the reserved `journey_trips.fare` column as NULL. |
 
 Federated stitches add `via_hubs: list[str]`, `stitched_from_sessions: list[str]`, `federated: True`.
 `app/api/journey.py::_build_comparison` later *mutates* trips to add `comparison`
@@ -488,7 +487,7 @@ Federated stitches add `via_hubs: list[str]`, `stitched_from_sessions: list[str]
 
 ### Data shapes — the canonical leg dict
 
-Same 22 keys from all four clients. Since #303 PR 3a every client builds them the same way: its canonical adapter (`app/journey/canonical_adapters/`) reads the engine's answer into a `CanonicalJourney`, and the temporary bridge `canonical_adapters/trip_dict.py` writes this dict from it (the bridge is the reference definition until PR 4 stores canonical journeys):
+Same 22 keys from all four clients. Since #303 PR 3a every client builds them the same way: its canonical adapter (`app/journey/canonical_adapters/`) reads the engine's answer into a `CanonicalJourney`, and the bridge `canonical_adapters/trip_dict.py` writes this dict from it. Since PR 4a storage holds the canonical journeys; the bridge remains the definition of these dicts for the rules still written on them (trip signature, `transit_fingerprint`, the coverage scorer's VIATOR side, the coverage modal), until #304's matching engine replaces those rules:
 
 | Key | Type | Notes / per-engine quirks |
 |---|---|---|
@@ -591,8 +590,8 @@ lat/lon stands in. Each try that reaches a decision is counted by how it ended i
 
 - **The canonical leg dict is a contract, not a convention.** Add a key to one client and you have
   silently created a two-shape system; `canonical_adapters/trip_dict.py` writes it for all four
-  clients (#303 PR 3a) and the legs are stored verbatim in `journey_trips.legs` (JSONB) for replay
-  and audit.
+  clients (#303 PR 3a). What is stored is the canonical journey (`journey_trips.journey`, JSONB,
+  #303 PR 4a); the dict is derived from it, never stored.
 - **UIC is the cross-engine identity.** If `_uic_from_stop_id` stops parsing a feed's stop-id
   dialect, `transit_fingerprint` silently degrades to a 110 m coordinate match — no error, just a
   comparison that reports everything as `*_only`. Test new feeds against it.
@@ -602,7 +601,8 @@ lat/lon stands in. Each try that reaches a decision is counted by how it ended i
 - **An empty fingerprint means "uncomparable", not "matches other empties".** Both
   `transit_fingerprint` callers guard with `if fp` — dropping that guard makes every walk-only
   itinerary match every other one.
-- **References must never raise into the search path.** `hafas_client.fetch_plan` swallows
+- **References must never raise into the search path.** `hafas_client.fetch_plan` (ÖBB, returns
+  canonical journeys) swallows
   everything into `raw.status`; the OJP wrappers in `api/journey.py` convert exceptions to a status
   field. Preserve that or a dead third party takes down VIATOR's own results.
 - **Reference results are not persisted.** `journey_search_executions.session_id` is FK'd to
@@ -610,11 +610,8 @@ lat/lon stands in. Each try that reaches a decision is counted by how it ended i
 - **MOTIS ignores stop ids and always emits `distance_meters: 0.0`.** Code that assumes stop-id
   routing worked, or that leg distance is meaningful, is wrong on MOTIS sessions.
 - **`planner_dispatch` raising on an unknown engine is intentional.** Do not add a fallback branch.
-- **Doc drift to be aware of:** `otp_client._normalise`'s docstring refers to
-  `recorder.persist_trip()` stripping underscore-prefixed keys — no such function exists.
-  `_raw_itinerary` simply never reaches the DB because `recorder.record_execution` copies named
-  columns only. Likewise `recorder.begin_search`'s docstring says the row starts `'pending'`; the
-  code writes `status="ok"` and `finish_search` overwrites it.
+- **Doc drift to be aware of:** `recorder.begin_search`'s docstring says the row starts
+  `'pending'`; the code writes `status="ok"` and `finish_search` overwrites it.
 
 ---
 
@@ -640,9 +637,10 @@ other — are forced into view because all-pairs enumeration leaves nowhere to h
 | Module | Lines | What it owns |
 |---|---|---|
 | `runner.py` | 2110 | Run lifecycle, K-slot slicing, cooperative cancel, per-pair execution (single-session + fanout), the external-verify sweep |
-| `external_verify.py` | 802 | The ÖBB HAFAS adapter: LocGeoPos → TripSearch two-step, response parsing, `VerifyResult` / `VerifyItinerary` |
+| `external_verify.py` | 770 | The ÖBB HAFAS transport: LocGeoPos → TripSearch two-step, the verdict (`VerifyResult`), `oebb_stop_id`; `VerifyItinerary` is now only the modal's display shape |
+| `oebb_journeys.py` | 170 | ÖBB's answer as canonical journeys (through the HAFAS adapter), the legs the scorer reads (`scoring_legs`, today's tokens and mode rule) and the modal's `VerifyItinerary` (#303 PR 4a) |
 | `verify_progress.py` | 230 | `SweepWriter`: saves the sweep's answers on the result rows as they come and its progress on the run, fenced on the run being running and held |
-| `alignment.py` | 320 | Scores one (VIATOR trips, ÖBB itineraries) pair into a `(score, tier)` |
+| `alignment.py` | 320 | Scores one (VIATOR journeys, ÖBB journeys) pair into a `(score, tier)` |
 | `hubs.py` | — | Static French preset (26 entries, though its docstring still says 23). **Fallback/seed only** — the DB table wins |
 | `hub_derive.py` | — | Pure functions behind "Promote to hub": slug, short label, country from UIC prefix or point-in-polygon |
 
@@ -677,14 +675,16 @@ coverage executor claims the row (`executor.claim_next_run`, `FOR UPDATE SKIP LO
    fenced on the run being `running` and held by this executor; the resumed sweep asks only
    the cells without an answer (`external_verified_at` NULL).
 
-**K-slot time-slicing.** `_fetch_plan_sliced` splits the run's day window into K equal
-slots (default 6 × 4 h) and fires `cfg.within_pair_parallelism` concurrent `fetch_plan`
+**K-slot time-slicing.** `_fetch_journeys_sliced` splits the run's day window into K equal
+slots (default 6 × 4 h) and fires `cfg.within_pair_parallelism` concurrent `fetch_journeys`
 calls, one per slot boundary, each asking for `num_itineraries_per_slot` (10) itineraries
 inside `slot_seconds`. Two reasons: it avoids per-pair timeout cliffs (RAPTOR's work
 scales near-quadratically with `searchWindow` on dense graphs — a 24 h window blew OTP's
 60 s `apiProcessingTimeout`), and it makes engines comparable on *identical* windows.
-Returned trips are filtered by `_trip_belongs_to_window` (first **transit** leg departure
-inside `[start, end)`) and deduplicated on `_coverage_dedup_key`. A single failed slot is
+Returned journeys are filtered by `_trip_belongs_to_window` (first **boarding** inside
+`[start, end)`) and deduplicated on `_coverage_dedup_key`, the `JourneyFingerprint`'s `strict_key`
+(every ride's modes, stations and minutes; before #303 PR 4a a key that read a stop id's last `:`
+part, so `SBB:8507000:0:7` became the platform `7`). A single failed slot is
 tolerated; only an all-slots-failed pair re-raises.
 
 **Cooperative cancel is two-channel.** `_CANCEL_EVENTS` is a module-local dict, therefore
@@ -751,14 +751,15 @@ scorer — it is how the UI renders a NULL tier.)
 
 **Per-cell external columns:** `external_source`, `external_ok`,
 `external_num_connections`, `external_best_duration_seconds`, `external_best_transfers`,
-`external_error`, `external_verified_at`, plus PR-196a's `external_itineraries` (JSONB
-list of `VerifyItinerary`), `external_alignment_score` (float, nullable),
-`external_alignment_tier` (varchar 32).
+`external_error`, `external_verified_at`, plus `external_journeys` (JSONB list of ÖBB's
+canonical journeys, #303 PR 4a; `external_itineraries` before it), `external_alignment_score`
+(float, nullable), `external_alignment_tier` (varchar 32).
 
-**`VerifyLeg`** — `mode`, `from_uic`, `to_uic`, `dep_utc`, `arr_utc`, `route_name`.
-**`VerifyItinerary`** — `legs[]`, `departure_at`, `arrival_at`, `duration_seconds`,
-`num_transfers`. Deliberately narrow: these are persisted on every cell, so fares and
-polylines stay out.
+The cell modal and the export still read ÖBB's side as **`VerifyItinerary`** (`legs[]`,
+`departure_at`, `arrival_at`, `duration_seconds`, `num_transfers`) of **`VerifyLeg`** (`mode`,
+`from_uic`/`to_uic` stop tokens, `dep_utc`/`arr_utc` Vienna wall clock despite the names,
+`route_name`, raw ids and names), built from the stored journeys by `oebb_journeys.itinerary`
+until #303 PR 4b moves the templates onto canonical journeys.
 
 ### Invariants & traps
 
@@ -818,7 +819,7 @@ polylines stay out.
 - **The tier vocabulary is hardcoded to ÖBB.** `one_sided_oebb` is a literal in
   `_classify_score` and a `String(32)` value in the DB. Adding a second reference planner
   (OJP, SNCF) means either a migration or a per-oracle tier namespace.
-- **One oracle per cell.** `_run_external_verify_sweep` calls `verify_via_oebb_hafas` and
+- **One oracle per cell.** `_run_external_verify_sweep` calls `fetch_oebb_two_step` and
   nothing else; a cell holds exactly one external verdict. There is no place to store "OJP
   agreed but ÖBB didn't".
 - **PR-196a made the sweep score every non-`skipped` row, not just failures.** The old
@@ -2076,7 +2077,7 @@ down:
 ```
 journey_searches          one row per user request        (id, ts, origin/dest, requested_time)
   └─ journey_search_executions   one row per (search × session)   (session_id, graph_snapshot_id, raw_response)
-       └─ journey_trips          one row per itinerary that session returned  (legs JSONB, trip_signature)
+       └─ journey_trips          one row per itinerary that session returned  (journey JSONB, trip_signature)
 ```
 
 `app/journey/recorder.py` writes all three: `begin_search()` → `record_execution()` (once per
@@ -2199,7 +2200,7 @@ predicate `_select_fanout_sessions` uses.
 | `duration_seconds`, `num_transfers` | `Integer` | |
 | `departure_at`, `arrival_at` | `timestamptz` | |
 | `modes` | `String` | Upper-case, e.g. `RAIL,WALK` |
-| `legs` | `JSONB` NOT NULL | The normalised leg list — the actual payload |
+| `journey` | `JSONB` NOT NULL | The canonical journey, `CanonicalJourney.model_dump(mode="json")` (#303 PR 4a; `legs`, today's leg dicts, before it) — the actual payload; the columns above are written from it |
 | `fare` | `JSONB` | Nullable |
 
 #### `network_coverage_runs` — one "Run" click
@@ -2242,7 +2243,7 @@ predicate `_select_fanout_sessions` uses.
 | `journey_search_id` | `UUID` FK→`journey_searches.id` **SET NULL** | **The drilldown link** |
 | `created_at` | `timestamptz` | |
 | `external_verified_at`, `external_ok`, `external_num_connections`, `external_best_duration_seconds`, `external_best_transfers`, `external_source`, `external_error` | mixed | ÖBB HAFAS verdict for this cell |
-| `external_itineraries` | `JSONB` | Full normalised ÖBB itinerary list, so the side-by-side modal never re-queries HAFAS |
+| `external_journeys` | `JSONB` | ÖBB's answer as canonical journeys (#303 PR 4a), so the side-by-side modal never re-queries HAFAS |
 | `external_alignment_score` | `Float` | 0.0–1.0; NULL when not computable |
 | `external_alignment_tier` | `String(32)` | `agree` \| `mostly_agree` \| `partial` \| `disagree` \| `no_overlap` \| `one_sided_viator` \| `one_sided_oebb` \| `no_service` \| `no_data` |
 
@@ -2477,8 +2478,9 @@ for runs without a sweep, otherwise a legacy status-colour matrix would render e
 
 Cell click opens the detail modal: per direction (Outbound open, Return collapsed) an alignment-tier
 pill, a display-only "Show walk legs" toggle, then a two-column `CompareGrid` of VIATOR vs ÖBB HAFAS.
-The ÖBB column reads the **persisted** `external_itineraries` JSONB from the PR-196a sweep — no
-HAFAS call at modal-open time — so the columns show exactly the data the alignment scorer used.
+The ÖBB column reads the **persisted** `external_journeys` JSONB from the PR-196a sweep (served
+as `external_itineraries` until #303 PR 4b) — no HAFAS call at modal-open time — so the columns show
+exactly the data the alignment scorer used.
 
 ### Data shapes
 
@@ -2947,7 +2949,7 @@ HAFAS. Low effort.
 them: the coverage *sweep* tests every origin-destination pair in a grid; each pair is a *cell*; and
 each cell is assigned a *tier* describing how well the two systems agreed (chapter 5 has the eight
 tier strings). This is where the work is. The sweep calls
-`verify_via_oebb_hafas` directly, `_SOURCE_OEBB_HAFAS` is a module constant, the tier vocabulary
+`fetch_oebb_two_step` directly, `_SOURCE_OEBB_HAFAS` is a module constant, the tier vocabulary
 contains `one_sided_oebb`, and `external_*` is a *single* column set - so a cell cannot record "ÖBB
 said X *and* Digitransit said Y".
 

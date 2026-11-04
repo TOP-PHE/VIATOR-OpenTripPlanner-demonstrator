@@ -29,6 +29,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.journey.canonical_adapters import otp_adapter
+from app.journey.canonical_adapters.trip_dict import to_trip_dicts
+
+
+def _normalise(raw: dict) -> list[dict]:
+    """A `planConnection` answer as today's trip dicts: the OTP adapter, then the bridge
+    (what the client's own normaliser gave before #303)."""
+    return to_trip_dicts(otp_adapter.journeys_from_plan(raw))
+
+
 # ─────────────────── app.api.journey helpers ───────────────────
 
 
@@ -344,8 +354,6 @@ _VERIFIED_PLANCONNECTION = {
 
 class TestNormalisePlanConnection:
     def test_verified_response_shape(self):
-        from app.journey.otp_client import _normalise
-
         trips = _normalise(_VERIFIED_PLANCONNECTION)
         assert len(trips) == 1
         trip = trips[0]
@@ -357,10 +365,6 @@ class TestNormalisePlanConnection:
         assert trip["arrival_at"] == "2026-05-18T09:28:00+00:00"
         assert trip["num_transfers"] == 0  # single RAIL leg
         assert trip["modes"] == "RAIL"
-        assert (
-            trip["_raw_itinerary"]
-            == _VERIFIED_PLANCONNECTION["data"]["planConnection"]["edges"][0]["node"]
-        )
 
         # Single leg — leg times are epoch-ms, same as the legacy API.
         assert len(trip["legs"]) == 1
@@ -386,14 +390,10 @@ class TestNormalisePlanConnection:
         assert leg["trip_headsign"] == "Neuchâtel"
 
     def test_empty_edges(self):
-        from app.journey.otp_client import _normalise
-
         raw = {"data": {"planConnection": {"edges": [], "routingErrors": []}}}
         assert _normalise(raw) == []
 
     def test_missing_data_is_safe(self):
-        from app.journey.otp_client import _normalise
-
         assert _normalise({}) == []
         assert _normalise({"data": None}) == []
         assert _normalise({"data": {"planConnection": None}}) == []
@@ -402,8 +402,6 @@ class TestNormalisePlanConnection:
         assert _normalise({"errors": [{"message": "boom"}]}) == []
 
     def test_multi_leg_transfer_count(self):
-        from app.journey.otp_client import _normalise
-
         raw = {
             "data": {
                 "planConnection": {

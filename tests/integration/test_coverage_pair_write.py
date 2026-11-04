@@ -101,14 +101,12 @@ ORIGIN = _hub("a", 45.99)
 DEST = _hub("b", 46.99)
 
 
-def _trip() -> dict[str, Any]:
-    return {
-        "departure_at": "2099-09-09T09:09:00Z",
-        "arrival_at": "2099-09-09T10:39:00Z",
-        "duration_seconds": 5400,
-        "num_transfers": 0,
-        "modes": "RAIL",
-        "legs": [
+def _trip() -> Any:
+    """The pair's one journey, canonical as the engines answer since #303."""
+    from tests.unit.canonical_fixtures import journey_from_legs
+
+    return journey_from_legs(
+        [
             {
                 "mode": "RAIL",
                 "from_stop_id": "zz_a",
@@ -117,13 +115,14 @@ def _trip() -> dict[str, Any]:
                 "to_stop_id": "zz_b",
                 "to_lat": 46.99,
                 "to_lon": 9.99,
-                "departure": "2099-09-09T09:09:00Z",
-                "arrival": "2099-09-09T10:39:00Z",
+                "departure": "2099-09-09T09:09:00+00:00",
+                "arrival": "2099-09-09T10:39:00+00:00",
                 "route_short_name": "ZZ 99",
-                "feed_id": "ZZ-99",
             }
         ],
-    }
+        duration_seconds=5400,
+        transfers=0,
+    )
 
 
 def _write(run_id: uuid.UUID) -> bool:

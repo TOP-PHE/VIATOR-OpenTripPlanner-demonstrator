@@ -53,7 +53,7 @@ SAVED_FIELDS: tuple[str, ...] = (
     "external_best_transfers",
     "external_error",
     "external_verified_at",
-    "external_itineraries",
+    "external_journeys",
     "external_alignment_score",
     "external_alignment_tier",
 )

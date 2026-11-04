@@ -1,7 +1,8 @@
 """PR-196a — graduated alignment scorer for coverage matrix cells.
 
-Reduces a (VIATOR trips, ÖBB itineraries) pair to a single (score, tier)
-that drives the viridis heatmap in the matrix UI.
+Reduces a (VIATOR journeys, ÖBB journeys) pair to a single (score, tier)
+that drives the viridis heatmap in the matrix UI. Both sides are canonical journeys since #303
+PR 4a; the rules below are unchanged (design D5).
 
 Scoring is hybrid by design:
 
@@ -52,32 +53,15 @@ keep the matrix legend scannable, not a per-percentile gradient:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from datetime import UTC, datetime
+from collections.abc import Iterable, Sequence
+from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
+from ..journey.canonical import CanonicalJourney
+from ..journey.canonical_adapters.trip_dict import to_trip_dict
 from ..journey.signature import _CANONICAL_TOKEN_RE, transit_fingerprint
-from .external_verify import VerifyItinerary, extract_uic
-
-# An ÖBB endpoint with NO id at all. VerifyLeg carries no lat/lon, so a bare
-# None here reaches `signature._round_latlon_coarse(None, None)` and becomes
-# the literal "?,?" — which a VIATOR leg missing BOTH stop_id and coordinates
-# also produces. Same mode + same rounded minutes + same route name would then
-# hash identically and score a 1.00 `agree` on ZERO endpoint evidence.
-#
-# This sentinel makes that collision impossible: it lives in the `OEBB:`
-# namespace, which no VIATOR-side token can ever occupy. It is not defensive
-# noise — it is the reason this fix is not #226. Do not delete it as unused.
-# Pinned by `test_two_id_less_itineraries_do_not_exact_match`.
-_OEBB_UNKNOWN_ENDPOINT = "OEBB:?"
-
-# `external_verify._hafas_time_to_utc_iso` persists VerifyLeg/VerifyItinerary
-# dep_utc/arr_utc as NAIVE Europe/Vienna wall-clock strings (the "_utc" name
-# is aspirational — see that function's own docstring). This is the zone
-# `_verify_itinerary_to_legs` localizes them from before comparing against
-# VIATOR's genuinely UTC-instant leg times.
-_OEBB_REFERENCE_TZ = ZoneInfo("Europe/Vienna")
+from .external_verify import extract_uic
+from .oebb_journeys import scoring_legs
 
 # Threshold constants — kept at module scope so the test that exercises
 # tier boundaries can import + assert against the same values, and a
@@ -104,10 +88,10 @@ def _strip_walk_legs(legs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [leg for leg in legs if (leg.get("mode") or "").upper() not in ("", "WALK", "TRANSFER")]
 
 
-def filter_trips_from_depart_at(
-    trips: list[dict[str, Any]], depart_at: datetime
-) -> list[dict[str, Any]]:
-    """Keep only trips departing at/after `depart_at`, sorted
+def journeys_from_depart_at(
+    journeys: Sequence[CanonicalJourney], depart_at: datetime
+) -> list[CanonicalJourney]:
+    """Keep only journeys departing at/after `depart_at`, sorted
     chronologically (earliest first).
 
     ÖBB HAFAS's TripSearch is a forward "depart after" query — `numF=5`
@@ -120,88 +104,26 @@ def filter_trips_from_depart_at(
     was never asked about — comparing a whole-day aggregate against a
     single-instant snapshot. That scope mismatch is independent of (and
     was found to be larger in practice than) the clock-basis mismatch
-    `_oebb_naive_to_utc_iso` fixes.
+    of ÖBB's Vienna wall clock (#220), which the HAFAS adapter now fixes.
 
     Used both by the alignment scorer (so a persisted score reflects a
-    comparable window — see `runner._fetch_viator_trips_for_search`)
+    comparable window — see `runner._fetch_viator_journeys_for_search`)
     and by the cell-detail display (so the VIATOR and ÖBB columns shown
     side by side represent the same search scope — see
     `network_coverage._fetch_trips_by_search`), rather than duplicating
     this filter in each caller.
 
-    Trips with a missing/unparseable `departure_at` are dropped — with
-    no placement in the window, there's no basis to call them
-    comparable to ÖBB's answer either way.
+    A journey's departure is its door-to-door start (`CanonicalJourney.departure`, today's
+    `departure_at`), as before #303 (design D5). A journey without one is dropped: with no
+    placement in the window, there's no basis to call it comparable to ÖBB's answer either way.
     """
-    dated: list[tuple[datetime, dict[str, Any]]] = []
-    for t in trips:
-        dep_str = t.get("departure_at")
-        if not dep_str:
-            continue
-        try:
-            dep = datetime.fromisoformat(dep_str)
-        except ValueError:
-            continue
-        if dep >= depart_at:
-            dated.append((dep, t))
-    dated.sort(key=lambda pair: pair[0])
-    return [t for _, t in dated]
-
-
-def _oebb_naive_to_utc_iso(value: str | None) -> str | None:
-    """Convert a persisted VerifyLeg/VerifyItinerary naive Vienna-local
-    timestamp to a genuine UTC-instant ISO string — the same basis
-    VIATOR's own leg `departure`/`arrival` values are already on.
-
-    Without this, `transit_fingerprint`'s minute-rounding (exact-match
-    tier) and `_first_transit_dep_dt`'s ±5min fuzzy comparison both
-    compared VIATOR's true-UTC digits against ÖBB's local-clock digits
-    verbatim — a systematic 1-2h (CET/CEST) skew that made a genuine
-    train-for-train match nearly impossible to detect on either tier,
-    silently pushing real matches toward 'no_overlap'/'disagree'. This
-    went uncaught because the existing tests built BOTH sides' fixture
-    legs with the same naive-looking timestamp, which isn't
-    representative of production data (only the ÖBB side is naive).
-
-    Returns None on unparseable/missing input so the caller treats the
-    leg as unmatchable rather than guessing at a time.
-    """
-    if not value:
-        return None
-    try:
-        naive = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return naive.replace(tzinfo=_OEBB_REFERENCE_TZ).astimezone(UTC).isoformat()
-
-
-def _verify_itinerary_to_legs(it: VerifyItinerary) -> list[dict[str, Any]]:
-    """Translate a persisted VerifyItinerary into the leg-dict shape
-    :func:`transit_fingerprint` expects.
-
-    `transit_fingerprint` reads (mode, from_stop_id, to_stop_id, lat,
-    lon, departure, arrival, route_short_name) per leg. Our
-    VerifyItinerary stores a :func:`external_verify.oebb_stop_id` TOKEN in
-    `from_uic` / `to_uic` — `UIC:NNNNNNN`, or `OEBB:…` for an ÖBB id that does
-    not normalise into the shared namespace — which
-    `signature._fingerprint_stop_token` passes through verbatim at its step 0.
-    A missing id becomes `_OEBB_UNKNOWN_ENDPOINT` rather than None; see that
-    constant for why the difference is load-bearing.
-    """
-    return [
-        {
-            "mode": leg.mode,
-            # Already-canonical tokens; `_fingerprint_stop_token` returns them
-            # unchanged, so an ÖBB `UIC:8503000` agrees with a VIATOR-side
-            # `SBB:8503000:0:5`, while an `OEBB:` token agrees with nothing.
-            "from_stop_id": leg.from_uic or _OEBB_UNKNOWN_ENDPOINT,
-            "to_stop_id": leg.to_uic or _OEBB_UNKNOWN_ENDPOINT,
-            "departure": _oebb_naive_to_utc_iso(leg.dep_utc),
-            "arrival": _oebb_naive_to_utc_iso(leg.arr_utc),
-            "route_short_name": leg.route_name,
-        }
-        for leg in it.legs
+    dated = [
+        (journey.departure.timetabled, journey)
+        for journey in journeys
+        if journey.departure is not None and journey.departure.timetabled >= depart_at
     ]
+    dated.sort(key=lambda pair: pair[0])
+    return [journey for _, journey in dated]
 
 
 def _endpoint_token(stop_id: str | None) -> str | None:
@@ -376,15 +298,16 @@ def _exact_pass(viator_fps: list[str], oebb_fps: list[str]) -> tuple[set[int], l
 
 
 def compute_alignment(
-    viator_trips: list[dict[str, Any]],
-    oebb_itineraries: list[VerifyItinerary],
+    viator_journeys: Sequence[CanonicalJourney],
+    oebb_journeys: Sequence[CanonicalJourney],
 ) -> tuple[float | None, str]:
-    """PR-196a — score + tier the agreement between VIATOR and ÖBB trips.
+    """PR-196a — score + tier the agreement between VIATOR and ÖBB journeys.
 
-    `viator_trips` is the canonical trip-dict list (the shape
-    :func:`_fetch_trips_by_search` emits per cell — legs[], duration,
-    modes, etc.). `oebb_itineraries` is the persisted
-    :class:`VerifyItinerary` list captured by the sweep.
+    `viator_journeys` are a cell's VIATOR journeys (already narrowed to ÖBB's window by
+    `journeys_from_depart_at`), `oebb_journeys` ÖBB's answer (`oebb_journeys.journeys_from_answer`).
+    Since #303 both are canonical journeys; the rules read the leg dicts they read before
+    (design D5): VIATOR's through the trip dict bridge, ÖBB's through
+    `oebb_journeys.scoring_legs` (the check's own tokens, mode rule and UTC times).
 
     Returns ``(score, tier)``. ``score`` is None when both sides are
     empty (no_service) or when one side is empty (the tier carries the
@@ -392,18 +315,16 @@ def compute_alignment(
 
     See module docstring for the full scoring + tier-mapping rules.
     """
-    v_n = len(viator_trips)
-    o_n = len(oebb_itineraries)
+    v_n = len(viator_journeys)
+    o_n = len(oebb_journeys)
+
     if v_n == 0 and o_n == 0:
         return None, _classify_score(None, 0, 0)
     if v_n == 0 or o_n == 0:
         return 0.0, _classify_score(0.0, v_n, o_n)
 
-    # Pre-compute transit-only spines + exact fingerprints for both sides
-    # in one pass — same data feeds both the exact pass and the fuzzy
-    # fallback so we don't strip + parse legs twice.
-    viator_spines = [_strip_walk_legs(t.get("legs") or []) for t in viator_trips]
-    oebb_legs_lists = [_strip_walk_legs(_verify_itinerary_to_legs(it)) for it in oebb_itineraries]
+    viator_spines = [_strip_walk_legs(to_trip_dict(j)["legs"]) for j in viator_journeys]
+    oebb_legs_lists = [_strip_walk_legs(scoring_legs(j)) for j in oebb_journeys]
     viator_fps = [transit_fingerprint(legs) for legs in viator_spines]
     oebb_fps = [transit_fingerprint(legs) for legs in oebb_legs_lists]
 

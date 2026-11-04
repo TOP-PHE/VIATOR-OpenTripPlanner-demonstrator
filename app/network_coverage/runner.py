@@ -9,8 +9,8 @@ isn't on the journey path, but we want to leave headroom for live
 journey searches submitted by operators in parallel).
 
 The runner reuses `app.journey.planner_dispatch` to call the engine-
-appropriate `fetch_plan` (OTP or MOTIS) — same plumbing the live journey
-UI uses. Each pair is recorded into the
+appropriate `fetch_journeys` (OTP or MOTIS) — same plumbing the live journey
+UI uses; the answer is canonical journeys (#303 PR 4a). Each pair is recorded into the
 existing `journey_searches` + `journey_search_executions` +
 `journey_trips` infrastructure so the v0.1.26 trip-card UI works as the
 click-cell drilldown out of the box.
@@ -52,6 +52,9 @@ from sqlalchemy.orm import Session as DbSession
 from .. import config_service
 from ..db import SessionLocal
 from ..journey import planner_dispatch, recorder
+from ..journey.canonical import CanonicalJourney
+from ..journey.canonical.journey_fingerprint import fingerprint_of
+from ..journey.canonical_adapters.trip_dict import to_trip_dict
 from ..models import (
     JourneySearch,
     JourneySearchExecution,
@@ -64,11 +67,12 @@ from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from . import (
     external_verify,  # PR-E — auto-verify-on-completion sweep
+    oebb_journeys,  # ÖBB's answer as canonical journeys (#303 PR 4a)
     verify_progress,  # the sweep's per-cell saving and progress
 )
 from .alignment import (
     compute_alignment,  # PR-196a — graduated heatmap scorer
-    filter_trips_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
+    journeys_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
 )
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
@@ -487,7 +491,7 @@ async def _run_stopped(run_id: uuid.UUID, cache: dict[uuid.UUID, tuple[float, bo
 @dataclass(frozen=True)
 class ResolvedWindow:
     """Resolved per-run day-window — UTC anchor instants + the IANA zone
-    used to compute them. Threaded through `_fetch_plan_sliced` so the
+    used to compute them. Threaded through `_fetch_journeys_sliced` so the
     K-slot grid + the trip-belongs filter agree on the same boundaries.
 
     `start_utc` / `end_utc` bracket the calendar-day window in UTC; the
@@ -560,9 +564,9 @@ def _anchor_depart_at_and_reference_date(
        `reference_date` + `window_*_local` (see `_resolve_run_window`);
        `depart_at` is never passed to the planner. Meanwhile every
        downstream comparison anchors on `depart_at`: the ÖBB verify sweep
-       (`verify_via_oebb_hafas(..., depart_at=run.depart_at)`) and the
+       (`fetch_oebb_two_step(..., depart_at=run.depart_at)`) and the
        trip filters in `_fetch_trips_by_search` /
-       `alignment.filter_trips_from_depart_at`.
+       `alignment.journeys_from_depart_at`.
 
        Defaulting `reference_date` to "tomorrow at create time" let the
        two name different calendar days. An operator asking for
@@ -806,102 +810,32 @@ def _slot_boundaries(window: ResolvedWindow, slot_count: int) -> list[datetime]:
     ]
 
 
-def _coverage_dedup_key(trip: dict[str, Any]) -> tuple[str, str, tuple[str, ...], str]:
-    """4-tuple identity for a trip in the K-slot dedup pass.
+def _coverage_dedup_key(journey: CanonicalJourney) -> str:
+    """Identity of a journey in the K-slot dedup pass: its fingerprint's `strict_key`, the
+    modes and stations of every ride with their boarding and alighting minutes (#303 PR 4a).
 
-    (from_stop_id_norm, first_transit_leg_dep_utc_minute, route_signature,
-    to_stop_id_norm) where:
-      - from/to stop ids come from the first/last TRANSIT leg (NOT the
-        itinerary endpoints, which on a walk-then-train trip would be
-        the operator's coords)
-      - dep is truncated to the minute (departure times that differ by
-        seconds are the same train in practice)
-      - route_signature is the tuple of (route_short_name or mode) for
-        every transit leg in order — same train sequence == same route
-
-    A walk-only trip (no transit legs) returns ("", "", (), "") which
-    naturally collapses all walk-only trips to one entry — they're not
-    distinguishable as separate "services" anyway.
+    Two slots overlap at their edges, so the same train comes back twice; this key folds them.
+    It replaced a key of (first stop, first boarding minute, route names, last stop) that read a
+    stop id's last `:` part, so `SBB:8507000:0:7` became `7`, the platform: two stations could
+    merge (design D5, the one approved change: a cell can keep a journey the old key merged).
+    A journey without a ride never gets here (`_trip_belongs_to_window` drops it).
     """
-    legs = trip.get("legs") or []
-    transit_legs = [
-        lg for lg in legs if (lg.get("mode") or "").upper() not in ("WALK", "TRANSFER", "")
-    ]
-    if not transit_legs:
-        return ("", "", (), "")
-
-    first = transit_legs[0]
-    last = transit_legs[-1]
-    from_stop = _normalise_stop_id(first.get("from_stop_id"))
-    to_stop = _normalise_stop_id(last.get("to_stop_id"))
-
-    dep = trip.get("first_transit_leg_departure_utc") or first.get("departure") or ""
-    dep_minute = _truncate_iso_to_minute(dep)
-
-    route_sig = tuple(
-        (lg.get("route_short_name") or lg.get("mode") or "").strip().upper() for lg in transit_legs
-    )
-    return (from_stop, dep_minute, route_sig, to_stop)
+    return fingerprint_of(journey).strict_key
 
 
-def _normalise_stop_id(stop_id: str | Any) -> str:
-    """Strip the OTP/MOTIS feed-id prefix so cross-engine dedup works.
+def _trip_belongs_to_window(journey: CanonicalJourney, window: ResolvedWindow) -> bool:
+    """True iff the journey's FIRST RIDE boards (UTC) in [window.start_utc, window.end_utc).
 
-    OTP stop ids are `<feed>:<local>`; MOTIS uses `<feed>_<local>`. A
-    train surfaced by both engines should dedup, so we collapse both
-    forms onto `<local>` — the local part is the canonical identifier
-    that survives engine swap. Missing / None returns "" so the
-    dedup tuple stays a plain string."""
-    if not stop_id:
-        return ""
-    s = str(stop_id)
-    # OTP form first (colon), then MOTIS (underscore). Prefer the
-    # right-most separator so a `<feed>_<local_with_underscores>` id
-    # keeps the locally-meaningful portion intact.
-    if ":" in s:
-        return s.rsplit(":", 1)[-1]
-    if "_" in s:
-        return s.rsplit("_", 1)[-1]
-    return s
-
-
-def _truncate_iso_to_minute(value: str) -> str:
-    """`YYYY-MM-DDTHH:MM:SS+00:00` → `YYYY-MM-DDTHH:MM+00:00`. Defensive
-    against malformed input — returns the string unchanged if the seconds
-    field isn't where we expect it."""
-    if not value or "T" not in value:
-        return value
-    try:
-        dt = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return value
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M%z")
-
-
-def _trip_belongs_to_window(trip: dict[str, Any], window: ResolvedWindow) -> bool:
-    """True iff the trip's FIRST TRANSIT LEG departure (UTC) falls in
-    [window.start_utc, window.end_utc).
-
-    Trips with no `first_transit_leg_departure_utc` (walk-only, or a
-    client that hasn't been upgraded to emit the field) return False —
-    they have no boarding event to anchor against the window. The
-    runner treats those as "doesn't count" rather than guessing.
+    A journey without a ride (walk only) returns False: it has no boarding event to anchor
+    against the window. The runner treats those as "doesn't count" rather than guessing.
     """
-    dep_str = trip.get("first_transit_leg_departure_utc")
-    if not dep_str or not isinstance(dep_str, str):
+    boarding = journey.first_boarding
+    if boarding is None:
         return False
-    try:
-        dep_utc = datetime.fromisoformat(dep_str)
-    except (TypeError, ValueError):
-        return False
-    if dep_utc.tzinfo is None:
-        dep_utc = dep_utc.replace(tzinfo=UTC)
-    return window.start_utc <= dep_utc < window.end_utc
+    return window.start_utc <= boarding.timetabled < window.end_utc
 
 
-async def _fetch_plan_sliced(
+async def _fetch_journeys_sliced(
     *,
     engine: str,
     session_id: str,
@@ -909,11 +843,11 @@ async def _fetch_plan_sliced(
     dest: Hub,
     window: ResolvedWindow,
     cfg: CoverageConfig,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """K-slot fetch_plan dispatch + dedup. Returns ``(last_raw, deduped_trips)``.
+) -> tuple[dict[str, Any], list[CanonicalJourney]]:
+    """K-slot fetch_journeys dispatch + dedup. Returns ``(last_raw, deduped_journeys)``.
 
     K = `cfg.slot_count`. K=1 is bit-identical to the legacy single
-    fetch_plan call (= the rollback flag — set COVERAGE_SLOT_COUNT=1 in
+    fetch call (= the rollback flag — set COVERAGE_SLOT_COUNT=1 in
     /admin/config to revert PR-3 behaviour). K>1 fires `cfg.within_pair_
     parallelism` concurrent calls, each anchored at a slot boundary,
     each requesting `cfg.num_itineraries_per_slot` itineraries within
@@ -939,7 +873,7 @@ async def _fetch_plan_sliced(
     # — IMPORTANT not to add any deviation here (filter, dedup, etc.) or
     # the "set slot_count=1" rollback story breaks.
     if cfg.slot_count == 1:
-        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_plan(
+        raw, trips = await planner_dispatch.planner_for_engine(engine).fetch_journeys(
             session_id=session_id,
             from_lat=origin.lat,
             from_lon=origin.lon,
@@ -955,11 +889,11 @@ async def _fetch_plan_sliced(
     semaphore = asyncio.Semaphore(cfg.within_pair_parallelism)
     slot_seconds = int((window.end_utc - window.start_utc).total_seconds() / cfg.slot_count)
 
-    async def _one_slot(slot_start: datetime) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async def _one_slot(slot_start: datetime) -> tuple[dict[str, Any], list[CanonicalJourney]]:
         async with semaphore:
             try:
                 raw, trips = await asyncio.wait_for(
-                    planner_dispatch.planner_for_engine(engine).fetch_plan(
+                    planner_dispatch.planner_for_engine(engine).fetch_journeys(
                         session_id=session_id,
                         from_lat=origin.lat,
                         from_lon=origin.lon,
@@ -994,15 +928,15 @@ async def _fetch_plan_sliced(
 
 
 def _accumulate_slot_trips(
-    trips: list[dict[str, Any]],
+    trips: list[CanonicalJourney],
     window: ResolvedWindow,
-    deduped: dict[tuple[str, str, tuple[str, ...], str], dict[str, Any]],
+    deduped: dict[str, CanonicalJourney],
 ) -> None:
     """Merge one slot's trips into the accumulating dedup map (in place).
 
     Extracted from `_merge_slot_results` so the parent's nested for/if
     chain stays under Sonar's cognitive-complexity ceiling. Walk-only
-    trips and trips whose first transit-leg boards outside the run's
+    journeys and journeys whose first ride boards outside the run's
     day window are dropped here so the caller can stay agnostic to the
     filter rules — see `_trip_belongs_to_window` for the exact rule."""
     for trip in trips:
@@ -1016,15 +950,15 @@ def _accumulate_slot_trips(
 def _merge_slot_results(
     results: list[Any],
     window: ResolvedWindow,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[CanonicalJourney]]:
     """Filter + dedup K-slot outcomes into one ``(last_raw, trips)`` pair.
 
-    Extracted from `_fetch_plan_sliced` so that function stays under
+    Extracted from `_fetch_journeys_sliced` so that function stays under
     Sonar's cognitive-complexity ceiling. Raises a slot exception ONLY
     when no slot succeeded — otherwise partial coverage is more useful
     than an error status (matches PR-E's one-bad-cell-doesn't-abort-the-
     run posture). Which exception is raised: see `_slot_failure`."""
-    deduped: dict[tuple[str, str, tuple[str, ...], str], dict[str, Any]] = {}
+    deduped: dict[str, CanonicalJourney] = {}
     last_raw: dict[str, Any] = {}
     failures: list[BaseException] = []
     successes = 0
@@ -1985,32 +1919,25 @@ def _verify_counters(rows: Sequence[NetworkCoverageResult]) -> dict[str, int]:
     return counters
 
 
-def _fetch_viator_trips_for_search(
+def _fetch_viator_journeys_for_search(
     db: DbSession, search_id: uuid.UUID | None, depart_at: datetime
-) -> list[dict[str, Any]]:
-    """PR-196a — pull the VIATOR-side trip dicts for one search_id.
+) -> list[CanonicalJourney]:
+    """PR-196a — the VIATOR-side journeys of one search_id, for the alignment scorer to compare
+    against ÖBB's. Empty list when search_id is NULL or the JOIN finds no rows (status='ok' but
+    no trips = the alignment treats VIATOR as one-sided empty).
 
-    Used by the alignment scorer to compare against ÖBB's itineraries.
-    Returns the canonical (legs[], duration_seconds, num_transfers,
-    departure_at, arrival_at, modes) shape `_fetch_trips_by_search`
-    emits in the admin API — the alignment scorer only reads `legs`,
-    but threading the full dict keeps the data contract identical to
-    what the modal renders. Empty list when search_id is NULL or the
-    JOIN finds no rows (status='ok' but no trips = the alignment
-    treats VIATOR as one-sided empty).
+    Read from `journey_trips.journey`, the canonical JSON the recorder stored (#303 PR 4a).
 
-    Filtered to `filter_trips_from_depart_at(..., depart_at)` — a
-    cell's VIATOR trips span the whole K-slot day window (see that
-    function's docstring), while ÖBB's `verify_via_oebb_hafas` call is
-    a single forward-looking search anchored at `depart_at`. Without
-    this, the scorer compared ÖBB's few depart_at-anchored itineraries
-    against ALL of VIATOR's day-spanning ones and would rarely find a
-    real match even when one exists."""
+    Filtered by `journeys_from_depart_at(..., depart_at)` — a cell's VIATOR journeys span the
+    whole K-slot day window (see that function's docstring), while ÖBB's check is a single
+    forward-looking search anchored at `depart_at`. Without this, the scorer compared ÖBB's few
+    depart_at-anchored itineraries against ALL of VIATOR's day-spanning ones and would rarely
+    find a real match even when one exists."""
     if search_id is None:
         return []
-    rows = (
+    stored = (
         db.execute(
-            select(JourneyTrip)
+            select(JourneyTrip.journey)
             .join(JourneySearchExecution, JourneyTrip.execution_id == JourneySearchExecution.id)
             .where(JourneySearchExecution.search_id == search_id)
             .order_by(JourneyTrip.rank_in_response)
@@ -2018,34 +1945,20 @@ def _fetch_viator_trips_for_search(
         .scalars()
         .all()
     )
-    trips = [
-        {
-            "duration_seconds": t.duration_seconds,
-            "num_transfers": t.num_transfers,
-            "departure_at": t.departure_at.isoformat() if t.departure_at else None,
-            "arrival_at": t.arrival_at.isoformat() if t.arrival_at else None,
-            "modes": t.modes,
-            "legs": t.legs or [],
-        }
-        for t in rows
-    ]
-    return filter_trips_from_depart_at(trips, depart_at)
+    journeys = [CanonicalJourney.model_validate(item) for item in stored]
+    return journeys_from_depart_at(journeys, depart_at)
 
 
 def _persist_alignment_on_row(
     row: NetworkCoverageResult,
-    viator_trips: list[dict[str, Any]],
-    itineraries: list[external_verify.VerifyItinerary],
+    viator_journeys: list[CanonicalJourney],
+    oebb: list[CanonicalJourney],
 ) -> None:
-    """PR-196a — score the (VIATOR, ÖBB) pair, persist itineraries +
-    score + tier onto the row in-place. Extracted from the per-cell
-    coroutine so the sweep stays under Sonar's cognitive-complexity
-    ceiling."""
-    score, tier = compute_alignment(viator_trips, itineraries)
-    # JSONB column — Pydantic dump keeps the shape stable across
-    # writes / reads. `mode="json"` resolves any datetime / UUID
-    # fields to ISO strings so the column round-trips losslessly.
-    row.external_itineraries = [it.model_dump(mode="json") for it in itineraries]
+    """PR-196a — score the (VIATOR, ÖBB) pair, persist ÖBB's journeys + score + tier onto the
+    row in-place. Extracted from the per-cell coroutine so the sweep stays under Sonar's
+    cognitive-complexity ceiling."""
+    score, tier = compute_alignment(viator_journeys, oebb)
+    row.external_journeys = [journey.model_dump(mode="json") for journey in oebb]
     row.external_alignment_score = score
     row.external_alignment_tier = tier
 
@@ -2071,9 +1984,9 @@ async def _run_external_verify_sweep(
     verify_timeout_s, verify_sleep_ms). Defaults to `CoverageConfig()`
     when called directly from a test that doesn't supply one.
 
-    PR-196a — additionally fetches VIATOR-side trips per cell, computes
+    PR-196a — additionally fetches VIATOR-side journeys per cell, computes
     a graduated alignment score + tier via `compute_alignment`, and
-    persists those (plus the per-itinerary ÖBB detail) onto the same
+    persists those (plus ÖBB's journeys) onto the same
     row so the matrix UI's viridis heatmap renders without a second
     round-trip.
 
@@ -2144,7 +2057,7 @@ async def _verify_cell(
             counters["error"] += 1
             counters["verified"] += 1
             return False
-        verdict = await external_verify.verify_via_oebb_hafas(
+        answer = await external_verify.fetch_oebb_two_step(
             from_lat=origin_hub.lat,
             from_lon=origin_hub.lon,
             to_lat=dest_hub.lat,
@@ -2152,6 +2065,7 @@ async def _verify_cell(
             depart_at=run.depart_at,
             client=client,
         )
+        verdict = answer.verdict
         row.external_source = verdict.source
         row.external_ok = verdict.ok
         row.external_num_connections = verdict.num_connections
@@ -2160,12 +2074,12 @@ async def _verify_cell(
         row.external_error = verdict.error
         row.external_verified_at = datetime.now(UTC)
         # PR-196a — score the (VIATOR, ÖBB) overlap + persist
-        # itineraries / score / tier for the heatmap. Errored
+        # ÖBB's journeys / score / tier for the heatmap. Errored
         # verdicts get an empty ÖBB side ("we couldn't ask")
         # which the scorer maps to no_service / one_sided
         # based on whether VIATOR returned anything.
-        viator_trips = _fetch_viator_trips_for_search(db, row.journey_search_id, run.depart_at)
-        _persist_alignment_on_row(row, viator_trips, verdict.itineraries)
+        viator = _fetch_viator_journeys_for_search(db, row.journey_search_id, run.depart_at)
+        _persist_alignment_on_row(row, viator, oebb_journeys.journeys_from_answer(answer))
         counters["verified"] += 1
         if verdict.error is not None:
             counters["error"] += 1
@@ -2204,7 +2118,7 @@ async def _verify_cell(
 # ConnectError at all, so no retry ever happens).
 #
 # Scope (#388 review): the retry wraps the WHOLE K-slot fetch
-# (`_fetch_plan_sliced`) and fires only when every slot failed to connect
+# (`_fetch_journeys_sliced`) and fires only when every slot failed to connect
 # (see `_slot_failure`). A connection error on only SOME slots is not
 # retried: those slots' trips are missing from the pair's partial result,
 # as before. A per-slot retry would eat into the slot budget and is left
@@ -2299,7 +2213,7 @@ async def _execute_pair(
 ) -> None:
     """Run a single A→B search and persist the result row.
 
-    Wraps the engine-appropriate `fetch_plan` (the same call the live
+    Wraps the engine-appropriate `fetch_journeys` (the same call the live
     journey UI makes) so coverage results are bit-equivalent to what an
     operator would see via the Search page — modulo the lat/lon coords
     which come from the hub preset rather than master_stations geocoding.
@@ -2311,9 +2225,9 @@ async def _execute_pair(
     test that doesn't thread one in.
 
     `window` is PR-3's resolved per-run day-window. When supplied, the
-    fetch goes through `_fetch_plan_sliced` (K time-slot dispatch +
+    fetch goes through `_fetch_journeys_sliced` (K time-slot dispatch +
     filter + dedup); when None, falls back to the legacy single
-    fetch_plan call so direct unit-test callers keep working. The
+    fetch call so direct unit-test callers keep working. The
     runner always supplies `window`; only tests rely on the None path.
     """
     cfg = cfg or CoverageConfig()
@@ -2326,12 +2240,12 @@ async def _execute_pair(
     best_operators: str | None = None
     error_message: str | None = None
     raw: dict[str, Any] = {}
-    trips: list[dict[str, Any]] = []
+    trips: list[CanonicalJourney] = []
 
-    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async def _fetch() -> tuple[dict[str, Any], list[CanonicalJourney]]:
         if window is not None:
             # PR-3 — K-slot dispatch via the resolved per-run window.
-            return await _fetch_plan_sliced(
+            return await _fetch_journeys_sliced(
                 engine=engine,
                 session_id=session_id,
                 origin=origin,
@@ -2339,7 +2253,7 @@ async def _execute_pair(
                 window=window,
                 cfg=cfg,
             )
-        return await planner_dispatch.planner_for_engine(engine).fetch_plan(
+        return await planner_dispatch.planner_for_engine(engine).fetch_journeys(
             session_id=session_id,
             from_lat=origin.lat,
             from_lon=origin.lon,
@@ -2359,14 +2273,10 @@ async def _execute_pair(
         num_itineraries = len(trips)
         if trips:
             status = "ok"
-            best = min(trips, key=lambda t: t.get("duration_seconds") or 1 << 30)
-            best_duration_seconds = int(best.get("duration_seconds") or 0)
-            best_num_transfers = int(best.get("num_transfers") or 0)
-            seen_ops: list[str] = []
-            for lg in best.get("legs", []):
-                feed = lg.get("feed_id")
-                if feed and feed not in seen_ops:
-                    seen_ops.append(feed)
+            best = to_trip_dict(min(trips, key=lambda j: j.duration_seconds or 1 << 30))
+            best_duration_seconds = int(best["duration_seconds"] or 0)
+            best_num_transfers = int(best["num_transfers"] or 0)
+            seen_ops = _feeds_of(best, [])
             best_operators = ",".join(seen_ops) if seen_ops else None
         else:
             status = "no_route"
@@ -2415,6 +2325,16 @@ async def _execute_pair(
             "best_operators": best_operators,
         },
     )
+
+
+def _feeds_of(trip: dict[str, Any], seen: list[str]) -> list[str]:
+    """`seen` extended, in leg order, by the feeds of a trip's legs (the matrix's operators
+    column: the trip dict's `feed_id`, today's value for every engine)."""
+    for leg in trip["legs"]:
+        feed = leg.get("feed_id")
+        if feed and feed not in seen:
+            seen.append(feed)
+    return seen
 
 
 async def _write_pair(
@@ -2509,7 +2429,7 @@ def _record_pair_journey_search(
     status: str,
     response_ms: int,
     raw: dict[str, Any],
-    trips: list[dict[str, Any]],
+    trips: list[CanonicalJourney],
     error_message: str | None,
 ) -> tuple[uuid.UUID | None, str | None]:
     """Single-session twin of `_record_fanout_journey_search`: write the
@@ -2552,7 +2472,7 @@ def _record_pair_journey_search(
                     response_ms=response_ms,
                     raw_response=raw or None,
                     error_message=error_message,
-                    trips=trips,
+                    journeys=trips,
                 )
             recorder.finish_search(
                 db,
@@ -2616,7 +2536,7 @@ def _begin_coverage_search(
 # flagged at 3.1% on this PR.
 
 # Type alias for the per-session tuple — keeps signatures readable.
-_FanoutSub = tuple[str, str, dict[str, Any], list[dict[str, Any]], int]
+_FanoutSub = tuple[str, str, dict[str, Any], list[CanonicalJourney], int]
 
 
 async def _query_one_session_for_pair(
@@ -2630,7 +2550,7 @@ async def _query_one_session_for_pair(
     cfg: CoverageConfig | None = None,
     window: ResolvedWindow | None = None,
 ) -> _FanoutSub:
-    """One fetch_plan call for one (session, pair). Tolerates its own
+    """One fetch_journeys call for one (session, pair). Tolerates its own
     exception so a planner container being down doesn't poison the pair —
     the caller treats the returned status as "this session contributed
     nothing useful" and moves on. `engine` is the snapshotted backend
@@ -2640,14 +2560,14 @@ async def _query_one_session_for_pair(
     search window). Defaults to `CoverageConfig()` for direct test use.
 
     `window` is PR-3's resolved per-run day-window — when supplied the
-    call goes through `_fetch_plan_sliced` (K-slot dispatch); when None
-    the legacy single fetch_plan call is used."""
+    call goes through `_fetch_journeys_sliced` (K-slot dispatch); when None
+    the legacy single fetch call is used."""
     cfg = cfg or CoverageConfig()
     sub_start = time.monotonic()
 
-    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async def _fetch() -> tuple[dict[str, Any], list[CanonicalJourney]]:
         if window is not None:
-            return await _fetch_plan_sliced(
+            return await _fetch_journeys_sliced(
                 engine=engine,
                 session_id=sid,
                 origin=origin,
@@ -2655,7 +2575,7 @@ async def _query_one_session_for_pair(
                 window=window,
                 cfg=cfg,
             )
-        return await planner_dispatch.planner_for_engine(engine).fetch_plan(
+        return await planner_dispatch.planner_for_engine(engine).fetch_journeys(
             session_id=sid,
             from_lat=origin.lat,
             from_lon=origin.lon,
@@ -2707,18 +2627,15 @@ def _merge_one_trip_into_signatures(
     by_signature: dict[str, dict[str, Any]],
     operators_union: list[str],
 ) -> None:
-    """Merge one trip into the by-signature map and update the operator
-    union. Same-signature trips collapse; the shortest-duration wins the
-    'best' slot for that signature."""
+    """Merge one trip (a journey's trip dict) into the by-signature map and update the
+    operator union. Same-signature trips collapse; the shortest-duration wins the 'best' slot
+    for that signature."""
     slot = by_signature.setdefault(sig, {"signature": sig, "session_ids": [], "best": trip})
     if sid not in slot["session_ids"]:
         slot["session_ids"].append(sid)
     if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
         slot["best"] = trip
-    for lg in trip.get("legs", []):
-        feed = lg.get("feed_id")
-        if feed and feed not in operators_union:
-            operators_union.append(feed)
+    _feeds_of(trip, operators_union)
 
 
 def _merge_fanout_results(
@@ -2745,8 +2662,9 @@ def _merge_fanout_results(
             elif sub_status in ("error", "timeout"):
                 any_error_or_timeout = True
 
-            for trip in trips:
-                sig = trip_signature(db, session_id=sid, legs=trip.get("legs", []))
+            for journey in trips:
+                trip = to_trip_dict(journey)
+                sig = trip_signature(db, session_id=sid, legs=trip["legs"])
                 _merge_one_trip_into_signatures(
                     sid=sid,
                     trip=trip,
@@ -2800,7 +2718,7 @@ def _record_fanout_journey_search(
                     response_ms=_ms,
                     raw_response=raw or None,
                     error_message=None,
-                    trips=trips,
+                    journeys=trips,
                 )
             recorder.finish_search(
                 db,
@@ -2896,7 +2814,7 @@ async def _execute_pair_fanout(
     independently testable.
 
     Behaviour vs `_execute_pair`:
-      1. Calls the engine-appropriate `fetch_plan` once per session in
+      1. Calls the engine-appropriate `fetch_journeys` once per session in
          parallel via `asyncio.gather`. Each call is independent.
       2. Trips merge by `trip_signature` so the same itinerary surfaced
          by multiple sessions counts once; shortest-duration wins the

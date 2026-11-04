@@ -91,7 +91,7 @@ def test_fingerprint_stop_token_keeps_oebb_tokens_out_of_the_coordinate_fallback
     """An `OEBB:` token names a real station we could not place in the UIC
     namespace. It must survive verbatim rather than collapsing into the `"?,?"`
     coordinate sentinel, which is what a leg with no id AND no coordinates
-    produces — see `alignment._OEBB_UNKNOWN_ENDPOINT`."""
+    produces — see `oebb_journeys.UNKNOWN_ENDPOINT`."""
     assert _fingerprint_stop_token("OEBB:904050", None, None) == "OEBB:904050"
     assert _fingerprint_stop_token("OEBB:904050", None, None) != "?,?"
     # And a genuinely id-less, coordinate-less leg still yields the sentinel.

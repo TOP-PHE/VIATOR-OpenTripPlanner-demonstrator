@@ -7,8 +7,9 @@ Four layers under test:
   2. `runner.create_run(..., verify_externally=...)` — propagates the
      flag onto the NetworkCoverageRun row.
   3. `runner._run_external_verify_sweep(db, run, rows)` — calls
-     `external_verify.verify_via_oebb_hafas` with the right kwargs,
-     persists the VerifyResult fields onto each row, handles
+     `external_verify.fetch_oebb_two_step` with the right kwargs,
+     persists the VerifyResult fields (and, since #303 PR 4a, ÖBB's
+     answer as canonical journeys) onto each row, handles
      soft-deleted hubs and per-cell exceptions, returns the rollup
      counters.
   4. Phase-3 dispatch — execute_run skips the sweep when
@@ -30,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.network_coverage import external_verify, runner
+from tests.unit import canonical_fixtures as fx
 
 # ─────────────────────── RunCreate.verify_externally validator ───────────────────────
 
@@ -134,10 +136,10 @@ def _make_row(origin="bxl-mid", dest="gva-c", status="no_route"):
     # when the VIATOR side is empty (one-sided tiers), so the stub has
     # to leave them as plain `None` rather than the auto-MagicMock
     # default that would confuse equality assertions in tests.
-    r.external_itineraries = None
+    r.external_journeys = None
     r.external_alignment_score = None
     r.external_alignment_tier = None
-    # PR-196a — the sweep fetches VIATOR trips by journey_search_id;
+    # PR-196a — the sweep fetches VIATOR journeys by journey_search_id;
     # None bypasses the fetch (returns []), matching every legacy test
     # that pre-dated the alignment hook.
     r.journey_search_id = None
@@ -167,6 +169,18 @@ def _make_db_with_hubs(hubs: dict[str, MagicMock]):
     return db
 
 
+def _answer(
+    verdict: external_verify.VerifyResult, payload=None
+) -> external_verify.HafasTripPayload:
+    """What `fetch_oebb_two_step` returns: the verdict, and ÖBB's raw answer when it gave one."""
+    return external_verify.HafasTripPayload(verdict=verdict, payload=payload)
+
+
+def _answering(*verdicts: external_verify.VerifyResult) -> AsyncMock:
+    """A `fetch_oebb_two_step` stand-in answering `verdicts` in turn (no payload)."""
+    return AsyncMock(side_effect=[_answer(v) for v in verdicts])
+
+
 def _make_run(verify_externally=True):
     run = MagicMock()
     run.id = uuid.uuid4()
@@ -179,7 +193,7 @@ def _make_run(verify_externally=True):
 async def test_sweep_calls_verify_with_run_depart_at_and_hub_coords():
     """The single most important wiring assertion: the sweep passes the
     run's depart_at and each hub's lat/lon coords into
-    verify_via_oebb_hafas — NOT, say, slug strings or now() — so HAFAS
+    fetch_oebb_two_step — NOT, say, slug strings or now() — so HAFAS
     actually answers the right question."""
     hubs = {
         "bxl-mid": _make_hub("bxl-mid", 50.8358, 4.3361),
@@ -189,8 +203,8 @@ async def test_sweep_calls_verify_with_run_depart_at_and_hub_coords():
     run = _make_run()
     rows = [_make_row("bxl-mid", "gva-c", "no_route")]
 
-    fake_verify = AsyncMock(
-        return_value=external_verify.VerifyResult(
+    fake_verify = _answering(
+        external_verify.VerifyResult(
             source="fahrplan.oebb.at",
             ok=True,
             num_connections=3,
@@ -202,7 +216,7 @@ async def test_sweep_calls_verify_with_run_depart_at_and_hub_coords():
     # completes instantly (replaces the old `patch.object(_VERIFY_SLEEP_BETWEEN_MS, 0)`
     # idiom now that those constants live on the CoverageConfig dataclass).
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
-    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+    with patch.object(external_verify, "fetch_oebb_two_step", fake_verify):
         counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     fake_verify.assert_awaited_once()
@@ -229,8 +243,8 @@ async def test_sweep_persists_verify_result_onto_row():
     row = _make_row()
     rows = [row]
 
-    fake_verify = AsyncMock(
-        return_value=external_verify.VerifyResult(
+    fake_verify = _answering(
+        external_verify.VerifyResult(
             source="fahrplan.oebb.at",
             ok=True,
             num_connections=5,
@@ -239,7 +253,7 @@ async def test_sweep_persists_verify_result_onto_row():
         )
     )
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
-    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+    with patch.object(external_verify, "fetch_oebb_two_step", fake_verify):
         await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert row.external_source == "fahrplan.oebb.at"
@@ -277,9 +291,9 @@ async def test_sweep_counters_split_by_verdict_class():
         external_verify.VerifyResult(source="fahrplan.oebb.at", ok=False, num_connections=0),
         external_verify.VerifyResult(source="fahrplan.oebb.at", ok=False, error="HTTP 500"),
     ]
-    fake_verify = AsyncMock(side_effect=verdicts)
+    fake_verify = _answering(*verdicts)
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
-    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+    with patch.object(external_verify, "fetch_oebb_two_step", fake_verify):
         counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert counters["verified"] == 3
@@ -305,7 +319,7 @@ async def test_sweep_handles_soft_deleted_hub():
 
     fake_verify = AsyncMock()  # should NOT be called
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
-    with patch.object(external_verify, "verify_via_oebb_hafas", fake_verify):
+    with patch.object(external_verify, "fetch_oebb_two_step", fake_verify):
         counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     fake_verify.assert_not_awaited()
@@ -318,7 +332,7 @@ async def test_sweep_handles_soft_deleted_hub():
 @pytest.mark.asyncio
 async def test_sweep_writes_alignment_fields_on_successful_verify():
     """PR-196a — after a successful verify the sweep MUST also persist
-    the alignment trio (external_itineraries / score / tier) so the
+    the alignment trio (external_journeys / score / tier) so the
     heatmap has something to render. Without this assertion a refactor
     that drops the `_persist_alignment_on_row` call would silently leave
     the matrix grey on rows that have a verdict but no tier."""
@@ -331,96 +345,101 @@ async def test_sweep_writes_alignment_fields_on_successful_verify():
     row = _make_row()
     rows = [row]
 
-    # ÖBB returns one itinerary; the scorer would normally pull VIATOR
-    # trips via the search_id JOIN — we stub _fetch_viator_trips_for_search
+    # ÖBB returns one connection; the scorer would normally pull VIATOR
+    # journeys via the search_id JOIN — we stub _fetch_viator_journeys_for_search
     # to skip the DB hop, and compute_alignment to pin the (score, tier)
     # output independent of the actual scoring algorithm.
-    fake_itinerary = external_verify.VerifyItinerary(
-        legs=[
-            external_verify.VerifyLeg(
-                mode="RAIL",
-                from_uic="UIC:8014441",
-                to_uic="UIC:8503000",
-                dep_utc="2026-06-28T08:00",
-                arr_utc="2026-06-28T12:30",
-                route_name="ICE 24",
-            )
-        ],
-        departure_at="2026-06-28T08:00",
-        arrival_at="2026-06-28T12:30",
-        duration_seconds=4 * 3600 + 30 * 60,
-        num_transfers=0,
+    payload = fx.oebb_payload(
+        [
+            {
+                "mode": "RAIL",
+                "from_uic": "UIC:8014441",
+                "to_uic": "UIC:8503000",
+                "dep": "2026-06-28T08:00",
+                "arr": "2026-06-28T12:30",
+                "route": "ICE 24",
+            }
+        ]
     )
     fake_verify = AsyncMock(
-        return_value=external_verify.VerifyResult(
-            source="fahrplan.oebb.at",
-            ok=True,
-            num_connections=1,
-            best_duration_seconds=4 * 3600 + 30 * 60,
-            best_transfers=0,
-            itineraries=[fake_itinerary],
+        return_value=_answer(
+            external_verify.VerifyResult(
+                source="fahrplan.oebb.at",
+                ok=True,
+                num_connections=1,
+                best_duration_seconds=4 * 3600 + 30 * 60,
+                best_transfers=0,
+            ),
+            payload,
         )
     )
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
     with (
-        patch.object(external_verify, "verify_via_oebb_hafas", fake_verify),
-        patch.object(runner, "_fetch_viator_trips_for_search", return_value=[]),
+        patch.object(external_verify, "fetch_oebb_two_step", fake_verify),
+        patch.object(runner, "_fetch_viator_journeys_for_search", return_value=[]),
         patch.object(runner, "compute_alignment", return_value=(0.7, "mostly_agree")),
     ):
         await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert row.external_alignment_score == 0.7
     assert row.external_alignment_tier == "mostly_agree"
-    # JSONB column was populated with the dumped itinerary list — pin the
-    # length, not the exact shape, so a future field addition doesn't
-    # break the test.
-    assert isinstance(row.external_itineraries, list)
-    assert len(row.external_itineraries) == 1
+    # JSONB column was populated with ÖBB's journey as canonical JSON — pin
+    # the length and the identity, not the exact shape, so a future field
+    # addition doesn't break the test.
+    assert isinstance(row.external_journeys, list)
+    assert len(row.external_journeys) == 1
+    (stored,) = row.external_journeys
+    assert stored["schema_version"] == "1"
+    assert stored["source"]["provider"] == "hafas"
+    assert stored["legs"][0]["origin"]["stop_place"]["uic"] == "8014441"
 
 
-# ─────── _fetch_viator_trips_for_search (apples-to-apples window fix) ───────
+# ─────── _fetch_viator_journeys_for_search (apples-to-apples window fix) ───────
 
 
-def _make_trip_row(departure_at):
-    row = MagicMock()
-    row.duration_seconds = 1800
-    row.num_transfers = 0
-    row.departure_at = departure_at
-    row.arrival_at = departure_at
-    row.modes = "RAIL"
-    row.legs = []
-    return row
+def _stored_journey(departure_at: datetime) -> dict:
+    """A `journey_trips.journey` value: a canonical journey departing (door to door) at
+    `departure_at`, as the recorder stores it."""
+    at = departure_at.isoformat()
+    leg = {
+        "mode": "RAIL",
+        "from_stop_id": "SBB:8503000:0:5",
+        "to_stop_id": "SBB:8100002:0:5",
+        "departure": at,
+        "arrival": at,
+    }
+    return fx.journey_from_legs([leg]).model_dump(mode="json")
 
 
-def _db_returning_trips(rows):
+def _db_returning_journeys(stored):
     db = MagicMock()
-    db.execute.return_value.scalars.return_value.all.return_value = rows
+    db.execute.return_value.scalars.return_value.all.return_value = stored
     return db
 
 
-def test_fetch_viator_trips_for_search_excludes_trips_before_depart_at():
+def test_fetch_viator_journeys_for_search_excludes_journeys_before_depart_at():
     """The scope-mismatch bug: a cell's VIATOR trips span the whole
     K-slot day window while ÖBB's verify call is one forward-looking
     search anchored at run.depart_at — trips departing before that
     anchor were never comparable to what ÖBB was actually asked and
     must be excluded from the scorer's input, not merely deprioritised."""
     depart_at = datetime(2026, 7, 13, 6, 0, 0, tzinfo=UTC)
-    db = _db_returning_trips(
+    db = _db_returning_journeys(
         [
-            _make_trip_row(datetime(2026, 7, 13, 2, 34, 0, tzinfo=UTC)),  # before — dropped
-            _make_trip_row(datetime(2026, 7, 13, 6, 0, 0, tzinfo=UTC)),  # exact boundary — kept
-            _make_trip_row(datetime(2026, 7, 13, 7, 20, 0, tzinfo=UTC)),  # after — kept
+            _stored_journey(datetime(2026, 7, 13, 2, 34, 0, tzinfo=UTC)),  # before — dropped
+            _stored_journey(datetime(2026, 7, 13, 6, 0, 0, tzinfo=UTC)),  # exact boundary — kept
+            _stored_journey(datetime(2026, 7, 13, 7, 20, 0, tzinfo=UTC)),  # after — kept
         ]
     )
-    out = runner._fetch_viator_trips_for_search(db, uuid.uuid4(), depart_at)
-    assert [t["departure_at"] for t in out] == [
+    out = runner._fetch_viator_journeys_for_search(db, uuid.uuid4(), depart_at)
+    assert [j.departure.timetabled.isoformat() for j in out if j.departure] == [
         "2026-07-13T06:00:00+00:00",
         "2026-07-13T07:20:00+00:00",
     ]
 
 
-def test_fetch_viator_trips_for_search_none_when_no_search_id():
-    assert runner._fetch_viator_trips_for_search(MagicMock(), None, datetime.now(UTC)) == []
+def test_fetch_viator_journeys_for_search_none_when_no_search_id():
+    assert runner._fetch_viator_journeys_for_search(MagicMock(), None, datetime.now(UTC)) == []
 
 
 # ─────────────────────── _maybe_run_external_verify_sweep candidate filter ───────────────────────
@@ -508,10 +527,12 @@ async def test_sweep_continues_when_one_cell_raises():
     async def _fake(**kwargs):
         if kwargs["from_lat"] == 52.0:  # the row_explode call
             raise RuntimeError("simulated adapter explosion")
-        return external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+        return _answer(
+            external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+        )
 
     fast_cfg = runner.CoverageConfig(verify_sleep_ms=0)
-    with patch.object(external_verify, "verify_via_oebb_hafas", side_effect=_fake):
+    with patch.object(external_verify, "fetch_oebb_two_step", side_effect=_fake):
         counters = await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     # row_ok got its verdict cleanly

@@ -612,15 +612,16 @@ async def test_fetch_plan_aware_when_converted_to_vienna_wall_clock() -> None:
     assert captured["depart_at"].strftime("%H%M%S") == "100000"
 
 
-# ─────────────────────── verify_via_oebb_hafas façade still works ───────────────────────
+# ─────────────────────── fetch_oebb_two_step: what both callers read ───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_external_verify_facade_unchanged_after_refactor() -> None:
-    """`verify_via_oebb_hafas` is now a thin wrapper around
-    `fetch_oebb_two_step` — must still return exactly a VerifyResult,
-    same shape as before the refactor. Guards against journey-API or
-    coverage-runner callers being broken by the refactor."""
+async def test_fetch_oebb_two_step_gives_the_verdict_and_the_raw_answer() -> None:
+    """Both callers of `fetch_oebb_two_step` read it: the coverage check its
+    `verdict` (a VerifyResult, stored on the cell), the journey client its
+    `payload` (turned into canonical journeys). The yes/no façade
+    `verify_via_oebb_hafas` is gone since #303 PR 4a; this guards the shape both
+    callers rely on."""
     handler = _two_step_handler(
         resolve_response=_locgeopos_response([("A=1@L=1@", "A"), ("A=1@L=2@", "B")]),
         trip_response={
@@ -636,7 +637,7 @@ async def test_external_verify_facade_unchanged_after_refactor() -> None:
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as c:
-        result = await external_verify.verify_via_oebb_hafas(
+        answer = await external_verify.fetch_oebb_two_step(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -644,10 +645,14 @@ async def test_external_verify_facade_unchanged_after_refactor() -> None:
             depart_at=datetime(2026, 6, 28, 8, 0, 0),
             client=c,
         )
+    result = answer.verdict
     assert isinstance(result, external_verify.VerifyResult)
     assert result.ok is True
     assert result.num_connections == 1
     assert result.best_duration_seconds == 2 * 3600
+    assert answer.payload is not None
+    assert answer.payload["svcResL"][0]["res"]["outConL"] == [{"dur": "020000", "chg": 1}]
+    assert (answer.from_lid, answer.to_lid) == ("A=1@L=1@", "A=1@L=2@")
 
 
 # ─────────────────────── fetch_plan_paginated ───────────────────────

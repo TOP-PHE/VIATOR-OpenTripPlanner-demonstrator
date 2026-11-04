@@ -129,5 +129,7 @@ class JourneyTrip(Base):
     departure_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     arrival_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     modes: Mapped[str] = mapped_column(String, nullable=False)
-    legs: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    # The journey as `CanonicalJourney.model_dump(mode="json")` (#303 PR 4a,
+    # docs/schemas/canonical-journey-v1.schema.json); the columns above are written from it.
+    journey: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     fare: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

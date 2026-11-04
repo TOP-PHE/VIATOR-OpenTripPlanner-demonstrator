@@ -116,8 +116,7 @@ def test_fanout_surfaces_federated_trips_when_no_single_session_result(
     async def _no_trips(**_kw):
         return ({}, [])
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
-    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)
 
     from datetime import datetime
 
@@ -174,8 +173,7 @@ def test_fanout_skips_federated_without_uic(
     async def _no_trips(**_kw):
         return ({}, [])
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
-    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)
 
     called = {"hit": False}
 
@@ -211,8 +209,7 @@ def test_fanout_hands_the_request_positions_to_the_federated_planner(
     async def _no_trips(**_kw):
         return ({}, [])
 
-    monkeypatch.setattr(otp_client, "fetch_plan", _no_trips)
-    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)  # the fanout's call (#303)
+    monkeypatch.setattr(otp_client, "fetch_journeys", _no_trips)
 
     seen: dict = {}
 

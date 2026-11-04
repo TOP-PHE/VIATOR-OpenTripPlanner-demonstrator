@@ -76,6 +76,8 @@ from ... import config_service, osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
+from ...journey.canonical import CanonicalJourney
+from ...journey.canonical_adapters.trip_dict import to_trip_dict
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -86,7 +88,7 @@ from ...models import (
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
 from ...network_coverage import executor as coverage_executor
-from ...network_coverage import external_verify, hub_derive, runner, translit
+from ...network_coverage import external_verify, hub_derive, oebb_journeys, runner, translit
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
@@ -2533,7 +2535,7 @@ def _fetch_trips_by_search(
     at the run's depart_at, while a cell's VIATOR trips span the whole
     K-slot day window (runner.py) — without this filter, the side-by-side
     comparison (and the persisted alignment score — see
-    `runner._fetch_viator_trips_for_search`, which applies the same
+    `runner._fetch_viator_journeys_for_search`, which applies the same
     filter Python-side since that path isn't a bulk/streaming query)
     could pit ÖBB's few depart_at-anchored itineraries against VIATOR
     trips from hours before or after, an apples-to-oranges scope
@@ -2582,7 +2584,7 @@ def _fetch_trips_by_search(
                 t.departure_at,
                 t.arrival_at,
                 t.modes,
-                t.legs,
+                _stored_legs(t.journey),
             )
             for search_id, t in rows
         )
@@ -2614,6 +2616,13 @@ def _fetch_trips_by_search(
             }
         )
     return out
+
+
+def _stored_legs(journey: dict[str, Any]) -> list[dict[str, Any]]:
+    """A stored journey's legs as the cell modal and the export read them (today's leg dicts,
+    through the trip dict bridge, until #303 PR 4b moves them onto canonical journeys)."""
+    legs: list[dict[str, Any]] = to_trip_dict(CanonicalJourney.model_validate(journey))["legs"]
+    return legs
 
 
 def _depart_at_outside_window(run: NetworkCoverageRun, cfg: runner.CoverageConfig) -> bool:
@@ -2821,7 +2830,9 @@ def _build_export_context(
             # None (key always present, for a stable raw-JSON schema)
             # unless the caller opted in; see the docstring.
             "external_itineraries": (
-                getattr(r, "external_itineraries", None) if include_external_itineraries else None
+                oebb_journeys.stored_itineraries(getattr(r, "external_journeys", None))
+                if include_external_itineraries
+                else None
             ),
         }
     run_meta = {
@@ -3279,12 +3290,10 @@ def _build_cell_trips_response(
             external_source=r.external_source,
             external_error=r.external_error,
             external_verified_at=r.external_verified_at,
-            # PR-196a — persisted ÖBB itineraries + alignment so the
-            # modal can render the two planners' answers side by side.
-            # Direct attribute access matches the PR-E reads above;
-            # the migration ships in the same release as the writer so
-            # the columns are always present on rows the modal queries.
-            external_itineraries=r.external_itineraries,
+            # PR-196a — ÖBB's persisted journeys (in the modal's itinerary
+            # shape) + alignment so the modal can render the two planners'
+            # answers side by side.
+            external_itineraries=oebb_journeys.stored_itineraries(r.external_journeys),
             external_alignment_score=r.external_alignment_score,
             external_alignment_tier=r.external_alignment_tier,
         )
@@ -3324,18 +3333,20 @@ async def verify_cell_external(
 
     Implementation: looks up the run for depart_at, the cell row to
     confirm it exists (and bind the pair to a real coverage cell, not
-    a typed-in URL), the two hub rows for coordinates, then calls
-    `external_verify.verify_via_oebb_hafas` and returns its result
-    verbatim.
+    a typed-in URL), the two hub rows for coordinates, then asks ÖBB
+    (`external_verify.fetch_oebb_two_step`) and returns its verdict with
+    ÖBB's journeys in the modal's itinerary shape (`oebb_journeys`).
     """
     origin_hub, dest_hub, run = await db_step(_verify_inputs, db, run_id, origin_id, dest_id)
-    return await external_verify.verify_via_oebb_hafas(
+    answer = await external_verify.fetch_oebb_two_step(
         from_lat=origin_hub.lat,
         from_lon=origin_hub.lon,
         to_lat=dest_hub.lat,
         to_lon=dest_hub.lon,
         depart_at=run.depart_at,
     )
+    itineraries = [oebb_journeys.itinerary(j) for j in oebb_journeys.journeys_from_answer(answer)]
+    return answer.verdict.model_copy(update={"itineraries": itineraries})
 
 
 def _verify_inputs(

@@ -116,8 +116,8 @@ def shared_cell_trips(
     budget (vs 60 for the page) is because a reader exploring a matrix
     legitimately clicks many cells in quick succession.
 
-    `external_itineraries` (the ÖBB itineraries captured by the verify
-    sweep) IS included — a deliberate product decision (2026-07-05):
+    `external_itineraries` (ÖBB's journeys captured by the verify
+    sweep, in the modal's itinerary shape) IS included — a deliberate product decision (2026-07-05):
     the share page renders the same VIATOR-vs-ÖBB side-by-side the
     admin matrix modal shows, because the comparison is the point of
     sharing a verified coverage report with a stakeholder. This means a

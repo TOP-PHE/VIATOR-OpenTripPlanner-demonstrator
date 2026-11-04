@@ -721,14 +721,34 @@ def test_build_export_context_defaults_alignment_fields_to_none() -> None:
     assert cell["external_alignment_score"] is None
 
 
+def _stored_oebb_journeys() -> list[dict]:
+    """ÖBB's answer as the sweep stores it since #303 PR 4a (`external_journeys`)."""
+    from tests.unit import canonical_fixtures as fx
+
+    leg = {
+        "mode": "RAIL",
+        "from_uic": "UIC:8727100",
+        "to_uic": "UIC:8814001",
+        "dep": "2026-06-29T08:13",
+        "arr": "2026-06-29T09:38",
+        "route": "EST 9317",
+    }
+    return [journey.model_dump(mode="json") for journey in fx.oebb_journeys([leg])]
+
+
 def test_build_export_context_embeds_external_itineraries_only_when_opted_in() -> None:
     """The ÖBB side-by-side data rides the small-run download tier: the
     key is ALWAYS present (stable raw-JSON schema) but carries the
     persisted itineraries only when the caller opts in — the share page
-    leaves it off and lazy-fetches per cell instead."""
+    leaves it off and lazy-fetches per cell instead. The stored journeys
+    are served in the modal's itinerary shape (`oebb_journeys`, until PR 4b)."""
     from app.api.admin.network_coverage import _build_export_context
+    from app.network_coverage import oebb_journeys
 
-    oebb = [{"duration_seconds": 5100, "num_transfers": 1, "legs": []}]
+    stored = _stored_oebb_journeys()
+    oebb = oebb_journeys.stored_itineraries(stored)
+    assert oebb is not None
+    assert oebb[0]["legs"][0]["route_name"] == "EST 9317"
     results = [
         _StubResult(
             origin_hub_id="p-nord",
@@ -742,7 +762,7 @@ def test_build_export_context_embeds_external_itineraries_only_when_opted_in() -
             error_message=None,
             journey_search_id=None,
             session_ids=None,
-            external_itineraries=oebb,
+            external_journeys=stored,
         ),
     ]
     common = {"run": _stub_run(), "results": results, "hubs": [_stub_hub_info()]}
@@ -759,8 +779,10 @@ def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypa
     from fastapi.responses import HTMLResponse
 
     from app.api.admin import network_coverage as mod
+    from app.network_coverage import oebb_journeys
 
-    oebb = [{"duration_seconds": 5100, "legs": []}]
+    stored = _stored_oebb_journeys()
+    oebb = oebb_journeys.stored_itineraries(stored)
     captured: dict = {}
     monkeypatch.setattr(
         mod, "_fetch_trips_by_search", lambda _db, _ids, _depart_at=None, *, include_legs=True: {}
@@ -776,7 +798,7 @@ def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypa
 
     def result(i):
         r = _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
-        r.external_itineraries = oebb
+        r.external_journeys = stored
         return r
 
     for count, expect in (
@@ -1007,11 +1029,16 @@ class _MockDb:
         return _MockExecuteResult(self._rows)
 
 
-def _trip_stub(execution_id, rank=0, **overrides):
+def _trip_stub(execution_id, rank=0, legs=None, **overrides):
     """Build a JourneyTrip-shaped row stub with sensible defaults so the
-    individual tests stay focused on what they're actually asserting."""
+    individual tests stay focused on what they're actually asserting.
+    `legs` are old-style leg dicts; the row stores them as the canonical
+    journey (`journey_trips.journey`, #303 PR 4a)."""
     from datetime import datetime
 
+    from tests.unit import canonical_fixtures as fx
+
+    journey = fx.journey_from_legs([{"mode": "RAIL"}] if legs is None else legs)
     base = {
         "execution_id": execution_id,
         "rank_in_response": rank,
@@ -1020,10 +1047,14 @@ def _trip_stub(execution_id, rank=0, **overrides):
         "departure_at": datetime(2026, 6, 29, 6, 25),
         "arrival_at": datetime(2026, 6, 29, 7, 48),
         "modes": "RAIL",
-        "legs": [{"mode": "RAIL"}],
+        "journey": journey.model_dump(mode="json"),
     }
     base.update(overrides)
     return _StubResult(**base)
+
+
+def _modes_of(trip: dict) -> list[str]:
+    return [leg["mode"] for leg in trip["legs"]]
 
 
 def test_fetch_trips_by_search_returns_empty_when_no_search_ids() -> None:
@@ -1068,7 +1099,9 @@ def test_fetch_trips_by_search_groups_rows_by_search_id() -> None:
     assert len(out[str(search_a)]) == 2
     assert len(out[str(search_b)]) == 1
     assert out[str(search_a)][0]["rank"] == 0
-    assert out[str(search_a)][0]["legs"] == [{"mode": "RAIL"}]
+    # The stored journey's legs, as today's leg dicts (the modal reads them until PR 4b).
+    assert _modes_of(out[str(search_a)][0]) == ["RAIL"]
+    assert _modes_of(out[str(search_a)][1]) == ["RAIL", "WALK"]
     assert out[str(search_a)][1]["num_transfers"] == 1
 
 

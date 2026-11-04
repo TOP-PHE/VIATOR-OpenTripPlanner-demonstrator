@@ -56,7 +56,7 @@ def test_resolve_session_engine_defaults_otp_when_engine_is_none():
 def test_snapshot_fanout_sessions_returns_ids_and_engine_map():
     """The fanout snapshot must enumerate every serving + include_in_fanout
     session AND record each one's engine, so the per-pair runner doesn't
-    need to round-trip the DB per fetch_plan call."""
+    need to round-trip the DB per fetch_journeys call."""
     fake_rows = [
         SimpleNamespace(id="session-a", engine="otp"),
         SimpleNamespace(id="session-b", engine="motis"),

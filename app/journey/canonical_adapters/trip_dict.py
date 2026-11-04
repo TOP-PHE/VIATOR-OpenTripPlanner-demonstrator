@@ -1,8 +1,10 @@
 """CanonicalJourney → today's trip dict (architecture.md ch. 4, "the canonical trip dict").
 
-**Temporary bridge, deleted by #303 PR 4.** Until storage and coverage read canonical journeys,
-the recorder keeps writing `journey_trips.legs` in today's format (PR 3) and the comparison
-functions keep reading it, so results do not change (design D5). It is also what proves the
+**Bridge, kept until #304 replaces the rules written on these dicts.** Since #303 PR 4a storage
+holds canonical journeys; the rules still written on the old dicts read them from here, so their
+results do not change (design D5): `trip_signature` and the summary columns (the recorder),
+`transit_fingerprint` (the `/journey` comparison, the federated dedup), the coverage scorer's VIATOR
+side and the coverage modal's legs (until PR 4b). It is also what proves the
 adapters lose nothing: `to_trip_dict(adapter(raw))` equals the client's own normaliser, key for
 key (`tests/unit/test_canonical_adapters.py`), times compared as instants.
 

@@ -13,21 +13,39 @@ Three concern groups:
      0.39, 0.0) so a future refactor that nudges a threshold breaks
      a single test rather than silently shifting cell colours.
 
+Since #303 PR 4a both sides are canonical journeys: VIATOR's built from the old leg dicts
+(`canonical_fixtures.journey_from_legs`, whose bridge gives those legs back), ÖBB's from a HAFAS
+answer through the real adapter (`canonical_fixtures.oebb_journeys`). Every score and tier below
+is the one these tests pinned on the old dicts and `VerifyItinerary` (design D5): this file is the
+characterisation of the port.
+
 Out of scope (covered elsewhere):
-  - HAFAS payload parsing → tests/unit/test_external_verify.py
+  - ÖBB's answer → journeys → the scorer's legs → tests/unit/test_oebb_journeys.py
   - Sweep dispatch + persistence → tests/unit/test_coverage_external_verify_sweep.py
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.network_coverage import alignment, external_verify
-from app.network_coverage.alignment import _oebb_naive_to_utc_iso as _vienna_local_to_utc
-from app.network_coverage.alignment import compute_alignment, filter_trips_from_depart_at
-from app.network_coverage.external_verify import VerifyItinerary, VerifyLeg, extract_uic
+from app.journey.canonical import CanonicalJourney
+from app.journey.canonical_adapters import hafas_adapter
+from app.network_coverage import alignment, oebb_journeys
+from app.network_coverage.alignment import compute_alignment, journeys_from_depart_at
+from app.network_coverage.external_verify import extract_uic
+from tests.unit import canonical_fixtures as fx
+
+_VIENNA = ZoneInfo("Europe/Vienna")
+
+
+def _vienna_local_to_utc(value: str) -> str:
+    """A Vienna wall-clock `YYYY-MM-DDTHH:MM` as the UTC instant VIATOR's legs carry."""
+    return datetime.fromisoformat(value).replace(tzinfo=_VIENNA).astimezone(UTC).isoformat()
+
 
 # ─────────────────────── extract_uic ───────────────────────
 
@@ -75,9 +93,9 @@ def test_extract_uic_returns_none_on_unparseable(stop_id: str | None) -> None:
 # ─────────────────────── compute_alignment — edges ───────────────────────
 
 
-def _viator_trip(legs: list[dict]) -> dict:
-    """Minimal VIATOR trip dict — only `legs` matters to the scorer."""
-    return {"legs": legs}
+def _viator_trip(legs: list[dict[str, Any]]) -> CanonicalJourney:
+    """A VIATOR journey whose bridge legs are `legs` (only the legs matter to the scorer)."""
+    return fx.journey_from_legs(legs)
 
 
 def _v_leg(
@@ -114,33 +132,31 @@ def _v_leg(
     }
 
 
-def _o_itin(*, legs: list[VerifyLeg]) -> VerifyItinerary:
-    """Build an ÖBB-side VerifyItinerary from raw VerifyLeg list."""
-    return VerifyItinerary(
-        legs=legs,
-        departure_at=legs[0].dep_utc if legs else None,
-        arrival_at=legs[-1].arr_utc if legs else None,
-        duration_seconds=0,
-        num_transfers=max(len(legs) - 1, 0),
-    )
+def _o_itin(*, legs: list[dict[str, Any]]) -> CanonicalJourney:
+    """An ÖBB journey from `_o_leg` specs, through a HAFAS answer and the real adapter."""
+    (journey,) = fx.oebb_journeys(legs)
+    return journey
 
 
 def _o_leg(
     *,
     mode: str = "RAIL",
-    from_uic: str = "UIC:8503000",
-    to_uic: str = "UIC:8100002",
+    from_uic: str | None = "UIC:8503000",
+    to_uic: str | None = "UIC:8100002",
     dep: str = "2026-06-30T08:00",
     arr: str = "2026-06-30T13:30",
     route: str = "RJ 1141",
-) -> VerifyLeg:
-    """Build an ÖBB-side leg already in canonical-UIC form (the
-    captured shape extract_uic emits). Default mode is RAIL — mirrors
-    what the sweep persists for a JNY section with a typical
-    long-distance rail product cat (ICE/RJ/EC/...)."""
-    return VerifyLeg(
-        mode=mode, from_uic=from_uic, to_uic=to_uic, dep_utc=dep, arr_utc=arr, route_name=route
-    )
+) -> dict[str, Any]:
+    """An ÖBB leg: the stop tokens its ids give, Vienna wall-clock times (ÖBB's form), the label
+    HAFAS shows. Default mode RAIL is a `RJ` product, a typical long-distance category."""
+    return {
+        "mode": mode,
+        "from_uic": from_uic,
+        "to_uic": to_uic,
+        "dep": dep,
+        "arr": arr,
+        "route": route,
+    }
 
 
 # ───────────────── endpoint identity: tokens, not coordinates ─────────────────
@@ -156,12 +172,12 @@ def test_two_id_less_itineraries_do_not_exact_match() -> None:
     """**The #226 test — read this one first.**
 
     A VIATOR leg with no stop_id AND no coordinates fingerprints its endpoints
-    as the literal `"?,?"`. VerifyLeg carries no lat/lon at all, so if the ÖBB
-    side passed a bare None it would produce the SAME `"?,?"` — and with equal
+    as the literal `"?,?"`. The ÖBB scorer legs carry no lat/lon at all, so if the
+    ÖBB side passed a bare None it would produce the SAME `"?,?"` — and with equal
     mode, equal rounded minutes and equal route name the two would hash
     identically and score a 1.00 `agree` on zero endpoint evidence.
 
-    `alignment._OEBB_UNKNOWN_ENDPOINT` is what makes that impossible. Note
+    `oebb_journeys.UNKNOWN_ENDPOINT` is what makes that impossible. Note
     `test_compute_alignment_empty_route_same_minute_still_exact_matches` proves
     an empty route name does NOT save us here — only the sentinel does.
     """
@@ -200,29 +216,32 @@ def test_guard_rejects_cross_namespace_endpoints() -> None:
 
 def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
     """The one case the fix is allowed to NEWLY accept — without it the fix is
-    unfalsifiable. The ÖBB side is built through the real leg builder from a
+    unfalsifiable. The ÖBB side is built through the real adapter from a
     zero-padded extId, so this exercises the whole path, not just the scorer."""
-    o_leg = external_verify._build_leg_from_section(
+    section = {
+        "type": "JNY",
+        "dep": {"locX": 0, "dTimeS": "080000"},
+        "arr": {"locX": 1, "aTimeS": "133000"},
+        "jny": {"prodX": 0},
+    }
+    connection = {"date": "20260630", "dur": "053000", "chg": 0, "secL": [section]}
+    connection.update(dep=section["dep"], arr=section["arr"])
+    payload = fx._hafas_payload(
+        [connection],
         {
-            "type": "JNY",
-            "dep": {"locX": 0, "dTimeS": "080000"},
-            "arr": {"locX": 1, "aTimeS": "133000"},
-            "jny": {"prodX": 0},
-        },
-        "20260630",
-        external_verify._index_hafas_locations(
-            [
+            "locL": [
                 {"lid": "A=1@O=Wien Hbf@X=16375526@L=008103000@", "extId": "008103000"},
                 {"lid": "A=1@O=Zuerich HB@X=8540192@L=8503000@", "extId": "8503000"},
-            ]
-        ),
-        external_verify._index_hafas_products([{"name": "RJ 1141", "prodCtx": {"catOut": "RJ"}}]),
+            ],
+            "prodL": [{"name": "RJ 1141", "prodCtx": {"catOut": "RJ"}}],
+        },
     )
-    assert o_leg is not None
-    assert o_leg.from_uic == "UIC:8103000", "zero padding absorbed"
+    (o_journey,) = hafas_adapter.journeys_from_trip_search(payload)
+    (o_leg,) = oebb_journeys.scoring_legs(o_journey)
+    assert o_leg["from_stop_id"] == "UIC:8103000", "zero padding absorbed"
 
     v = [_viator_trip([_v_leg(from_uic="8103000", to_uic="8503000")])]
-    _score, tier = compute_alignment(v, [_o_itin(legs=[o_leg])])
+    _score, tier = compute_alignment(v, [o_journey])
 
     assert tier == "agree"
 
@@ -454,36 +473,33 @@ def test_compute_alignment_caps_score_at_one_when_overcounting() -> None:
     assert tier == "disagree"
 
 
-# ─────────────── _oebb_naive_to_utc_iso (cross-engine timezone fix) ───────────────
+# ─────────────── ÖBB's Vienna wall clock (cross-engine timezone fix, #220) ───────────────
 
 
-def test_oebb_naive_to_utc_iso_converts_cest_summer_date() -> None:
+def test_oebb_times_reach_the_scorer_in_utc_in_summer() -> None:
     """June is CEST (UTC+2) — 08:00 Vienna-local is 06:00 UTC."""
-    assert _vienna_local_to_utc("2026-06-30T08:00") == "2026-06-30T06:00:00+00:00"
+    (leg,) = oebb_journeys.scoring_legs(_o_itin(legs=[_o_leg(dep="2026-06-30T08:00")]))
+    assert leg["departure"] == "2026-06-30T06:00:00+00:00"
 
 
-def test_oebb_naive_to_utc_iso_converts_cet_winter_date() -> None:
+def test_oebb_times_reach_the_scorer_in_utc_in_winter() -> None:
     """January is CET (UTC+1), not CEST — the conversion must be
     DST-aware (via zoneinfo), not a hardcoded +2h offset."""
-    assert _vienna_local_to_utc("2026-01-15T08:00") == "2026-01-15T07:00:00+00:00"
-
-
-@pytest.mark.parametrize("value", [None, "", "not-a-date"])
-def test_oebb_naive_to_utc_iso_returns_none_on_unparseable(value: str | None) -> None:
-    assert _vienna_local_to_utc(value) is None
+    (leg,) = oebb_journeys.scoring_legs(
+        _o_itin(legs=[_o_leg(dep="2026-01-15T08:00", arr="2026-01-15T13:30")])
+    )
+    assert leg["departure"] == "2026-01-15T07:00:00+00:00"
 
 
 def test_compute_alignment_exact_match_across_summer_dst_boundary() -> None:
     """Regression lock for the cross-engine timezone bug: `_o_leg`'s
-    ÖBB-shaped fixture keeps naive Vienna-local strings PASSED THROUGH
-    UNCHANGED (matching production — external_verify persists them
-    naive), while `_v_leg` now converts to genuine UTC. Before the fix
-    in `_verify_itinerary_to_legs`/`_oebb_naive_to_utc_iso`, the exact
-    fingerprint compared VIATOR's raw UTC digits against ÖBB's raw
-    local digits verbatim — a same-train, same-minute pair like this
-    one would NOT have exact-matched (fingerprints differ whenever the
-    CEST offset is nonzero), silently scoring 'no_overlap' instead of
-    'agree'."""
+    ÖBB answer carries Vienna wall clock (as ÖBB sends it), while `_v_leg`
+    carries genuine UTC. Before #220 the exact fingerprint compared
+    VIATOR's raw UTC digits against ÖBB's raw local digits verbatim — a
+    same-train, same-minute pair like this one would NOT have exact-matched
+    (fingerprints differ whenever the CEST offset is nonzero), silently
+    scoring 'no_overlap' instead of 'agree'. The HAFAS adapter now makes
+    ÖBB's times UTC once."""
     v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
     o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
     score, tier = compute_alignment(v, o)
@@ -504,53 +520,60 @@ def test_compute_alignment_fuzzy_match_survives_cest_offset() -> None:
     assert tier == "mostly_agree"
 
 
-# ─────────── filter_trips_from_depart_at (VIATOR/ÖBB search-scope fix) ───────────
+# ─────────── journeys_from_depart_at (VIATOR/ÖBB search-scope fix) ───────────
 
 
-def _trip(dep_iso: str | None, tag: str) -> dict:
-    """Minimal trip dict — only departure_at matters to the filter; `tag`
-    lets assertions identify which trips survived without depending on
-    dict identity."""
-    return {"departure_at": dep_iso, "tag": tag}
+def _trip(dep_iso: str | None) -> CanonicalJourney:
+    """A journey departing (door to door) at `dep_iso`; no departure at all when None."""
+    leg = {"mode": "RAIL", "from_stop_id": "SBB:8503000:0:5", "to_stop_id": "SBB:8100002:0:5"}
+    if dep_iso is not None:
+        leg.update(departure=dep_iso, arrival=dep_iso)
+    return fx.journey_from_legs([leg])
 
 
-def test_filter_trips_from_depart_at_drops_earlier_trips() -> None:
+def _departures(journeys: list[CanonicalJourney]) -> list[str]:
+    return [j.departure.timetabled.isoformat() for j in journeys if j.departure is not None]
+
+
+def test_journeys_from_depart_at_drops_earlier_journeys() -> None:
     """The bug this fixes: a cell's VIATOR trips span the WHOLE K-slot
     day window, while ÖBB's verify-sweep call is one forward-looking
     search anchored at depart_at — so trips departing before that
     anchor were never comparable to what ÖBB was asked and must be
     excluded, not just deprioritised."""
     depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
-    trips = [
-        _trip("2026-07-13T02:34:00+00:00", "too-early"),
-        _trip("2026-07-13T05:59:00+00:00", "one-minute-too-early"),
-        _trip("2026-07-13T06:00:00+00:00", "exact-boundary"),
-        _trip("2026-07-13T07:20:00+00:00", "later"),
+    journeys = [
+        _trip("2026-07-13T02:34:00+00:00"),
+        _trip("2026-07-13T05:59:00+00:00"),
+        _trip("2026-07-13T06:00:00+00:00"),
+        _trip("2026-07-13T07:20:00+00:00"),
     ]
-    out = filter_trips_from_depart_at(trips, depart_at)
-    assert [t["tag"] for t in out] == ["exact-boundary", "later"]
+    out = journeys_from_depart_at(journeys, depart_at)
+    assert _departures(out) == ["2026-07-13T06:00:00+00:00", "2026-07-13T07:20:00+00:00"]
 
 
-def test_filter_trips_from_depart_at_sorts_chronologically() -> None:
-    """Kept trips come back earliest-first regardless of input order —
+def test_journeys_from_depart_at_sorts_chronologically() -> None:
+    """Kept journeys come back earliest-first regardless of input order —
     matching HAFAS's own next-N-departures-from-depart_at ordering, not
     VIATOR's internal quality/duration rank_in_response order."""
     depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
-    trips = [
-        _trip("2026-07-13T09:00:00+00:00", "third"),
-        _trip("2026-07-13T06:05:00+00:00", "first"),
-        _trip("2026-07-13T07:30:00+00:00", "second"),
+    journeys = [
+        _trip("2026-07-13T09:00:00+00:00"),
+        _trip("2026-07-13T06:05:00+00:00"),
+        _trip("2026-07-13T07:30:00+00:00"),
     ]
-    out = filter_trips_from_depart_at(trips, depart_at)
-    assert [t["tag"] for t in out] == ["first", "second", "third"]
+    out = journeys_from_depart_at(journeys, depart_at)
+    assert _departures(out) == [
+        "2026-07-13T06:05:00+00:00",
+        "2026-07-13T07:30:00+00:00",
+        "2026-07-13T09:00:00+00:00",
+    ]
 
 
-@pytest.mark.parametrize("dep_iso", [None, "", "not-a-date"])
-def test_filter_trips_from_depart_at_drops_unparseable_departure(dep_iso: str | None) -> None:
+def test_journeys_from_depart_at_drops_a_journey_without_departure() -> None:
     depart_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
-    out = filter_trips_from_depart_at([_trip(dep_iso, "bad")], depart_at)
-    assert out == []
+    assert journeys_from_depart_at([_trip(None)], depart_at) == []
 
 
-def test_filter_trips_from_depart_at_empty_input() -> None:
-    assert filter_trips_from_depart_at([], datetime(2026, 7, 13, 6, 0, tzinfo=UTC)) == []
+def test_journeys_from_depart_at_empty_input() -> None:
+    assert journeys_from_depart_at([], datetime(2026, 7, 13, 6, 0, tzinfo=UTC)) == []

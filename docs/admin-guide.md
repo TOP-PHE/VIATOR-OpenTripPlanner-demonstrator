@@ -2686,6 +2686,23 @@ GKB: data set 60). The list of regional data sets and the provider settings
 are in `docs/nap-feed-resolvers.md`, "Austria: the regional data sets". Then
 search the same journey again.
 
+### 6.27 Deploying canonical journey storage: recorded searches and coverage runs are deleted
+
+The version with #303 PR 4a (`alembic` revision `20261104_1200_canonical_storage`) stores every
+journey as a canonical journey. Its migration **deletes every recorded journey search and every
+coverage run** (with their results and trips), as the owner decided on 4 Nov: the journey tests
+and the coverage runs start again from scratch. Hubs, sessions, settings and users are kept.
+
+Before deploying:
+
+1. Stop every coverage run (Stop on the coverage page, or the SQL of §8 of `CLAUDE.md`): a run the
+   worker holds would be deleted mid-run.
+2. Download the HTML report of any run you want to keep: the report is the only copy left after
+   the migration.
+
+After deploying, start the coverage runs again. A rollback (§7) brings back the code and the old
+columns, not the deleted rows.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

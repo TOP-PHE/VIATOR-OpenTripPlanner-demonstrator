@@ -239,8 +239,8 @@ def _install(monkeypatch, handler) -> list[Any]:
     return built
 
 
-async def _plan(timeout_ms: int = 9900) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    return await motis_client.fetch_plan(
+async def _plan(timeout_ms: int = 9900) -> tuple[dict[str, Any], list[Any]]:
+    return await motis_client.fetch_journeys(
         session_id="zz-99",
         from_lat=45.99,
         from_lon=9.99,

@@ -25,8 +25,10 @@ from typing import Any
 
 import pytest
 
+from app.journey.canonical import CanonicalJourney
 from app.network_coverage import runner
 from app.network_coverage.hubs import Hub
+from tests.unit.canonical_fixtures import journey_from_legs
 
 ORIGIN = Hub(id="zz-a", name="ZZ A", short="ZZA", region="", lat=45.99, lon=9.99)
 DEST = Hub(id="zz-b", name="ZZ B", short="ZZB", region="", lat=46.99, lon=10.99)
@@ -204,18 +206,35 @@ async def test_one_db_cancel_check_before_the_pairs_start(monkeypatch, stopped: 
 
 
 class _Planner:
-    def __init__(self, trips: list[dict[str, Any]] | None = None, exc: Exception | None = None):
+    def __init__(self, trips: list[CanonicalJourney] | None = None, exc: Exception | None = None):
         self.trips = trips or []
         self.exc = exc
 
-    async def fetch_plan(self, **_kw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    async def fetch_journeys(self, **_kw: Any) -> tuple[dict[str, Any], list[CanonicalJourney]]:
         if self.exc is not None:
             raise self.exc
         return {"zz": 99}, self.trips
 
 
-def _trip(duration: int, feed: str) -> dict[str, Any]:
-    return {"duration_seconds": duration, "num_transfers": 1, "legs": [{"feed_id": feed}]}
+def _trip(duration: int, feed: str) -> CanonicalJourney:
+    """A one-ride journey of `feed` lasting `duration` seconds."""
+    journey = journey_from_legs(
+        [
+            {
+                "mode": "RAIL",
+                "from_stop_id": "zz:1",
+                "to_stop_id": "zz:2",
+                "departure": "2099-09-09T09:00:00+00:00",
+                "arrival": "2099-09-09T10:00:00+00:00",
+            }
+        ],
+        duration_seconds=duration,
+        transfers=1,
+    )
+    (leg,) = journey.legs
+    assert leg.service is not None
+    service = leg.service.model_copy(update={"feed": feed})
+    return journey.model_copy(update={"legs": [leg.model_copy(update={"service": service})]})
 
 
 async def test_execute_pair_writes_off_the_loop_in_order(monkeypatch) -> None:
@@ -242,6 +261,7 @@ async def test_execute_pair_writes_off_the_loop_in_order(monkeypatch) -> None:
     assert persist["status"] == "ok"
     assert persist["num_itineraries"] == 2
     assert (persist["best_duration_seconds"], persist["best_operators"]) == (5999, "zz-fast")
+    assert persist["best_num_transfers"] == 1
     assert persist["journey_search_id"] == search_id
     assert persist["run_id"] == rid
 

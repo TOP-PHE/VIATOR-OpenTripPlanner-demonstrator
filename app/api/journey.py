@@ -27,7 +27,7 @@ from ..journey import (
     timetable_window,
 )
 from ..journey.canonical import CanonicalJourney, CanonicalTiming
-from ..journey.canonical_adapters.trip_dict import to_trip_dict, to_trip_dicts
+from ..journey.canonical_adapters.trip_dict import to_trip_dict
 from ..journey.federated_planner import journey_transit_fingerprint
 from ..models import GraphSnapshot, JourneySearch
 from ..models import Session as SessionRow
@@ -185,7 +185,7 @@ async def _query_session(
 
     `num_itineraries` / `search_window_seconds` come from platform_config
     (OTP_NUM_ITINERARIES / OTP_SEARCH_WINDOW_SECONDS, both runtime-editable).
-    Both engines accept the knobs (motis_client.fetch_plan mirrors otp_client's
+    Both engines accept the knobs (motis_client.fetch_journeys mirrors otp_client's
     signature) so the comparison view can show the same time window on each side.
     """
     start = time.monotonic()
@@ -922,8 +922,7 @@ def _record_session_execution(
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
         error_message=refusal.detail() if refusal else None,
-        # Stored as today's trip dicts until storage holds canonical journeys (#303 PR 4).
-        trips=to_trip_dicts(trips),
+        journeys=trips,
     )
     summary: dict[str, Any] = {
         "session_id": session.id,
@@ -1015,8 +1014,7 @@ def _record_plan(
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
         error_message=refusal.detail() if refusal else None,
-        # Stored as today's trip dicts until storage holds canonical journeys (#303 PR 4).
-        trips=to_trip_dicts(trips),
+        journeys=trips,
     )
     recorder.finish_search(
         db,
@@ -1115,7 +1113,7 @@ def get_search(
                         "departure_at": t.departure_at.isoformat(),
                         "arrival_at": t.arrival_at.isoformat(),
                         "modes": t.modes,
-                        "legs": t.legs,
+                        "journey": t.journey,
                     }
                     for t in trips
                 ],
