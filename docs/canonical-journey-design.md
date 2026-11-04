@@ -1,8 +1,9 @@
 # CanonicalJourney — analysis and design proposal (#303, phase 1)
 
-**Status**: PROPOSAL for review, 2026-11-04. This document contains no code change. Issue #303's
+**Status**: PROPOSAL under review, 2026-11-04. This document contains no code change. Issue #303's
 execution rule says: analyse first, propose the design, **wait for review**, then migrate. The
-implementation PRs (§8) start once the owner has answered the decisions in §0.2.
+implementation PRs (§8) start once the owner has answered the decisions in §0.2. The owner decided
+D1 (no backward compatibility) and D5 on 2026-11-04.
 **Audience**: the owner (review), implementers of #303 and #304.
 **Pairs with**:
 - [journey-matching-engine-design.md](journey-matching-engine-design.md) — #304, built on this model.
@@ -35,20 +36,20 @@ Everything above them (federation, recording, coverage, alignment, comparison, A
 
 | When | Visible effect |
 |---|---|
-| PR 2 (model + adapters) | Nothing. Golden tests prove the adapters reproduce today's dicts exactly. |
+| PR 2 (model + adapters) | Nothing. Characterisation tests prove the adapters carry every value today's normalisers give. |
 | PR 3 (journey layer + API + `/journey`) | The page reads the new JSON; same display. The `{}` button shows the canonical journey instead of the engine's raw JSON (D3). |
-| PR 4 (coverage) | Same matrix, modal and share page, fed by canonical journeys. Scores unchanged (same scorer, golden-tested). |
+| PR 4 (storage + coverage) | **All recorded journey searches and coverage runs are deleted** by the migration (D1); new ones are stored as canonical journeys. Same matrix, modal and share page. The scorer keeps today's rules (D5). |
 | #304 | The comparison verdicts change: tolerant pairing, "S7" = "S 7", reasons shown. See the #304 design. |
 
 ### 0.2 Decisions requested from the review
 
 | # | Question | Recommendation |
 |---|---|---|
-| D1 | Storage of journeys already persisted (`journey_trips.legs`, `network_coverage_results.external_itineraries`) | **Keep both formats as they are, convert on read** through two legacy adapters. No backfill, no new column in #303. New rows keep the same storage format (written from the canonical journey), so replays, `trip_signature` and the reports keep working across the change. |
+| D1 | Storage of journeys already persisted (`journey_trips.legs`, `network_coverage_results.external_itineraries`) | **Decided 2026-11-04: no backward compatibility.** Journeys are stored as canonical JSON only. PR 4's migration deletes every recorded journey search and coverage run (the owner restarts the journey tests and coverage runs from scratch). No legacy adapter, no old format to read, no backfill. |
 | D2 | API shape | **Change `/api/journey/fanout` and the coverage cell/share endpoints in place**, together with the pages that read them, one PR each. Their only consumers are VIATOR's own pages; the versioned public API is ch. 12's `/api/v1/plan`, which will expose this model from day one. |
 | D3 | Raw engine JSON in the UI (`_raw_itinerary`, the `{}` button) | **Remove it from the API**; the `{}` button shows the canonical journey. The raw answer stays in `journey_search_executions.raw_response` (database only). #303 rejects "provider DTOs exposed through public APIs". |
 | D4 | Model technology | **Pydantic v2 frozen models** (`extra="forbid"`): validation at the adapter boundary, JSON Schema generated, already a dependency (2.14.1). |
-| D5 | Does #303 change any comparison result? | **No, with one exception.** #303 keeps `transit_fingerprint` and the alignment scorer's rules, ported to canonical input and golden-tested. The new `JourneyFingerprint` is introduced alongside; consumers switch to it in #304, where verdicts are meant to change. The exception: PR 4 fixes the coverage dedup key (§11 item 2), so a cell no longer merges trips of two stations that share a platform number, minute and route names (rare); such a cell then keeps one more trip than before. |
+| D5 | Does #303 change any comparison result? | **Decided 2026-11-04: no, with one exception.** #303 keeps `transit_fingerprint` and the alignment scorer's rules, ported to canonical input and golden-tested. The new `JourneyFingerprint` is introduced alongside; consumers switch to it in #304, where verdicts are meant to change. The exception: PR 4 fixes the coverage dedup key (§11 item 2), so a cell no longer merges trips of two stations that share a platform number, minute and route names (rare); such a cell then keeps one more trip than before. |
 | D6 | Fingerprint and train numbers | Per #303, **`JourneyFingerprint` ignores train numbers and route names** (today's `transit_fingerprint` hashes `route_short_name`). Train identity becomes a matching feature in #304, not part of identity. |
 | D7 | OJP/OSDM mappers | **Proof of concept in PR 2** (AC5): CanonicalJourney → OJP 2.0 `Trip` XML and JSON, → OSDM `Trip` JSON, for the fixture journeys, validated against the OJP XSD in a test. The full export layers stay #306 / #307. |
 | D8 | Station identity | **No new runtime station resolution in #303.** The adapters move today's token rules (`UIC:` / `OEBB:` / coordinates) into `CanonicalStopPlace` unchanged. Resolution through the station module (CLAUDE.md §7 item 7) stays its own work; the model has the fields it needs (`codes`, `parent`). |
@@ -185,13 +186,12 @@ flowchart LR
   end
   subgraph Adapters["app/journey/canonical_adapters/ — only provider-aware code"]
     AM[motis_adapter]; AO[otp_adapter]; AH[hafas_adapter]; AJ[ojp_adapter]
-    AL[legacy_adapters: stored leg dict, VerifyItinerary]
   end
   RM --> AM; RO --> AO; RH --> AH; RJ --> AJ
-  AM & AO & AH & AJ & AL --> CJ[[CanonicalJourney]]
+  AM & AO & AH & AJ --> CJ[[CanonicalJourney]]
   CJ --> FED[federated_planner]
-  CJ --> STORE[recorder: storage writer v1]
-  STORE -.read back.-> AL
+  CJ --> STORE[(journey_trips.journey,<br/>external_journeys: canonical JSON)]
+  STORE -.read back, validated.-> CJ
   CJ --> FP[JourneyFingerprint]
   CJ --> MATCH[matching engine #304]
   FP --> MATCH
@@ -209,8 +209,8 @@ Rules:
    returns the raw payload. The adapter turns it into `list[CanonicalJourney]`.
 2. `CanonicalJourney` is immutable. Derived values (first boarding, transit duration, transfers,
    fingerprint) are computed once, by the model, never by a consumer.
-3. Storage formats are VIATOR formats with a version (`storage_v1` = today's leg dict). Reading a
-   stored row goes through a legacy adapter, like any other source.
+3. A stored journey is the canonical journey's JSON, `schema_version` included, and nothing else.
+   Reading it back is `CanonicalJourney.model_validate_json`. There is no older format (D1).
 4. Nothing above the adapters imports an engine client's normaliser or tests a provider name.
    `JourneySource.provider` exists for labels and provenance, never for branching (enforced by a
    test that greps the business modules, the way `test_extract_uic_must_never_be_called_on_a_hafas_lid` does).
@@ -379,10 +379,13 @@ committed file differs from the models (the lock-file pattern). Abbreviated:
 
 ## 5. Provider → CanonicalJourney mappings
 
-The adapters absorb today's normalisers. **Golden rule for PR 2**: for every captured fixture,
-`storage_v1(adapter(raw)) == <today's normaliser>(raw)` key by key. That proves nothing was lost
-and lets PR 3 delete the old normalisers. Fixtures are built from captured live shapes, never
-stripped ones (the stripped lid fixtures are what hid the `extract_uic` bug).
+The adapters absorb today's normalisers. **Characterisation rule for PR 2**: for every captured
+fixture, a test maps each key of today's trip/leg dict to its canonical field and checks that the
+adapter's journey carries the same value, and that the comparison functions (`transit_fingerprint`,
+`compute_alignment`, `_build_comparison`) give the same result on both (D5). That proves nothing
+was lost; PR 3 then deletes the old normalisers and freezes the expected values in the tests.
+Fixtures are built from captured live shapes, never stripped ones (the stripped lid fixtures are
+what hid the `extract_uic` bug).
 
 ### 5.1 MOTIS (`/api/v6/plan`, `motis_adapter.py`)
 
@@ -429,9 +432,9 @@ stripped ones (the stripped lid fixtures are what hid the `extract_uic` bug).
 | operator | `opL[oprX].{name, id}` |
 | stop place | `locL[locX]`: `extId` → `codes.OEBB_EXT`, `uic` / `unresolved_token` by `oebb_stop_id` (never `extract_uic` on a lid), `name`, `crd` → position |
 
-The coverage sweep keeps calling `external_verify.fetch_oebb_two_step` (transport) and persists
-`VerifyItinerary` as today (D1), built from the canonical journey by a storage writer, so the
-`external_*` columns, `SAVED_FIELDS` and the share page see no format change in #303.
+The coverage sweep keeps calling `external_verify.fetch_oebb_two_step` (transport); the adapter
+turns its answer into canonical journeys, which PR 4 stores in `external_journeys` (§5.5).
+`VerifyLeg` and `VerifyItinerary` are deleted; `VerifyResult` keeps its verdict fields.
 
 ### 5.4 Swiss OJP (`ojp_adapter.py`)
 
@@ -448,17 +451,29 @@ The coverage sweep keeps calling `external_verify.fetch_oebb_two_step` (transpor
 | `line_ref`, `journey_ref`, operator | `siri:LineRef`, `JourneyRef`, `siri:OperatorRef` (no name in the answer) |
 | transfer / continuous | `TransferLeg`, `ContinuousLeg` (`Length` → distance) |
 
-### 5.5 Legacy adapters (`legacy_adapters.py`)
+### 5.5 Storage (PR 4)
 
-- **`from_storage_v1(trip_row, legs_json, *, session_engine)`**: a `journey_trips` row (or any R5/R10
-  dict) → `CanonicalJourney`. The engine of the session that recorded it says how to read the ids;
-  the field meaning per engine is the §1.3 table. Old rows read back the same as before.
-- **`from_verify_itinerary(it)`**: R9 → `CanonicalJourney` with `role="reference"`, `provider="hafas"`.
-  Localises `dep_utc`/`arr_utc` from Vienna (the `_oebb_naive_to_utc_iso` step, moved here), keeps
-  `OEBB:` tokens in `unresolved_token`, a missing id → an unresolved stop that equals nothing (the
-  `OEBB:?` sentinel's property, pinned by `test_two_id_less_itineraries_do_not_exact_match`).
-- **`to_storage_v1(journey)`**: the writer. Produces today's dict exactly (golden-tested), so new
-  rows and old rows share one format.
+No backward compatibility (D1), so storage is the canonical JSON:
+
+| Table | Today | After PR 4 |
+|---|---|---|
+| `journey_trips` | `legs` JSONB (R5 leg dicts) + summary columns | `journey` JSONB = `CanonicalJourney.model_dump(mode="json")`; `legs` dropped. Summary columns kept for the reports (`duration_seconds`, `num_transfers`, `departure_at`, `arrival_at`, `modes`, `trip_signature`), written from the journey |
+| `network_coverage_results` | `external_itineraries` JSONB (`VerifyItinerary` list) | `external_journeys` JSONB (list of canonical journeys, `role="reference"`); `external_itineraries` dropped; `verify_progress.SAVED_FIELDS` follows |
+| `journey_search_executions` | `raw_response` JSONB | unchanged (database only, D3) |
+
+The migration first deletes every `network_coverage_runs` row (their results go by cascade), then
+every `journey_searches` row (executions and trips go by cascade), then changes the columns. Hubs,
+sessions and settings are kept. The owner agreed to restart the journey tests and coverage runs
+from scratch (2026-11-04); the PR description says it again before merge.
+
+What the deleted legacy code did moves into the adapters: the HAFAS adapter localises Vienna times
+(today `_oebb_naive_to_utc_iso`), keeps `OEBB:` tokens in `unresolved_token`, and gives a stop with
+no id a key that equals nothing (the `OEBB:?` sentinel's property, still pinned by
+`test_two_id_less_itineraries_do_not_exact_match`).
+
+`trip_signature` is computed from the canonical journey with today's fragment rules, so the fanout
+merge and the reports keep their behaviour (D5). It no longer needs to match rows written before
+PR 4, since there are none.
 
 ---
 
@@ -535,9 +550,9 @@ class JourneyFingerprint(BaseModel, frozen=True):
 hash cannot be tolerant: two times 1 minute apart can fall on either side of any rounding boundary.
 `spine_key` is the hashable part (group, index); the times are then compared with the tolerance.
 
-`trip_signature` stays as it is, frozen, for `journey_trips.trip_signature`, the reports and the
-replay diff (computed from `to_storage_v1(journey)`, so bit-identical). `transit_fingerprint` stays
-for its four consumers until #304 switches them (D5).
+`trip_signature` keeps today's rules, computed from the canonical journey, for
+`journey_trips.trip_signature`, the fanout merge, the reports and the replay diff (D5).
+`transit_fingerprint` stays for its four consumers until #304 switches them.
 
 ### 7.2 `JourneyMatchFeatures`
 
@@ -568,12 +583,13 @@ Each PR leaves `main` working; AC1 (no regression, all tests green) is checked a
 | PR | Content | Behaviour change | Gate |
 |---|---|---|---|
 | **1** (this) | the two design documents | none | owner review of §0.2 and #304 §0.2 |
-| **2** | `app/journey/canonical/` (models, `JourneyFingerprint`, `JourneyMatchFeatures` structure), `canonical_adapters/` (4 providers + legacy + storage writer), JSON Schema + sync test, OJP/OSDM mapper PoC + XSD/schema tests, provider-neutrality test | none (nothing calls it yet) | golden tests: `to_storage_v1(adapter(raw)) == old normaliser(raw)` for every fixture; `from_verify_itinerary` round trip |
-| **3** | journey layer on canonical: clients return raw, adapters convert, `planner_dispatch` returns `list[CanonicalJourney]`, `federated_planner`, recorder (writes `to_storage_v1`), `/fanout` + `/plan` return canonical JSON, `journey.html` + `compare_grid.js` read it (one JS view helper module, so templates stop reading engine fields), `{}` shows the canonical journey (D3); old normalisers deleted | display identical; `{}` content changes | template tests updated; `test_journey_api_canonical.py`; manual check on `/journey` (OTP, MOTIS, OJP, HAFAS, federated) |
-| **4** | coverage on canonical: runner, `_coverage_dedup_key` → `strict_key` (fixes the `SBB:…:0:7` → `7` bug), read-back through `from_storage_v1`, ÖBB through `hafas_adapter` / `from_verify_itinerary`, `compute_alignment(list[CanonicalJourney], list[CanonicalJourney])` with **the same rules**, cell / export / share JSON canonical (projected to what the share page renders), modal on the JS helper | scorer unchanged (golden test on `test_oebb_alignment` fixtures and a recorded run); the dedup fix can keep an extra trip in a cell (D5); share payload re-checked against the "reveals only what the page renders" invariant | integration tests (`test_coverage_executor`, `test_coverage_pair_write`) green |
+| **2** | `app/journey/canonical/` (models, `JourneyFingerprint`, `JourneyMatchFeatures` structure), `canonical_adapters/` (the 4 providers), JSON Schema + sync test, OJP/OSDM mapper PoC + XSD/schema tests, provider-neutrality test | none (nothing calls it yet) | characterisation tests (§5): every old dict value present in the adapter's journey; same comparison results on both |
+| **3** | journey layer on canonical: clients return raw, adapters convert, `planner_dispatch` returns `list[CanonicalJourney]`, `federated_planner`, `/fanout` + `/plan` return canonical JSON, `journey.html` + `compare_grid.js` read it (one JS view helper module, so templates stop reading engine fields), `{}` shows the canonical journey (D3); old normalisers deleted. The recorder still writes `journey_trips.legs` in today's format through a temporary `to_legs(journey)`, because coverage reads them back until PR 4 | display identical; `{}` content changes | template tests updated; `test_journey_api_canonical.py`; manual check on `/journey` (OTP, MOTIS, OJP, HAFAS, federated) |
+| **4** | storage + coverage on canonical: the migration of §5.5 (**deletes all recorded searches and coverage runs**), `journey_trips.journey` and `external_journeys`, `to_legs` and `VerifyLeg`/`VerifyItinerary` deleted; runner, `_coverage_dedup_key` → `strict_key` (fixes the `SBB:…:0:7` → `7` bug), ÖBB through `hafas_adapter`, `compute_alignment(list[CanonicalJourney], list[CanonicalJourney])` with **the same rules**, cell / export / share JSON canonical (projected to what the share page renders), modal on the JS helper | data deleted (D1); scorer unchanged (characterisation test on the `test_oebb_alignment` fixtures); the dedup fix can keep an extra trip in a cell (D5); share payload re-checked against the "reveals only what the page renders" invariant | integration tests (`test_coverage_executor`, `test_coverage_pair_write`) green; a fresh coverage run on a small hub set before the eu19 one |
 | then #304 | matching engine, then its wiring | intended | see #304 design |
 
-Rollback: each PR is one squash commit with no migration, so a revert is enough.
+Rollback: PR 2 and PR 3 are one squash commit each with no migration, so a revert is enough. PR 4's
+migration deletes data: a revert restores the code and the columns, not the deleted runs.
 
 ---
 
@@ -582,7 +598,9 @@ Rollback: each PR is one squash commit with no migration, so a revert is enough.
 | File | PR | Change |
 |---|---|---|
 | `app/journey/canonical/*` (13 modules) | 2 | new |
-| `app/journey/canonical_adapters/{motis,otp,hafas,ojp}_adapter.py`, `legacy_adapters.py` | 2 | new; absorb the normalisers |
+| `app/journey/canonical_adapters/{motis,otp,hafas,ojp}_adapter.py` | 2 | new; absorb the normalisers |
+| `alembic/versions/2026MMDD_HHMM_canonical_storage.py` | 4 | deletes runs and searches, `journey_trips.journey`, `external_journeys` |
+| `app/models/search.py`, `app/models/network_coverage.py` | 4 | the new columns |
 | `app/journey/canonical/mappers/{ojp,osdm}.py` | 2 | new (PoC) |
 | `docs/schemas/canonical-journey-v1.schema.json` | 2 | new, generated |
 | `app/journey/motis_client.py`, `otp_client.py`, `ojp_client.py`, `hafas_client.py` | 3 | normalisers removed; return raw; pagination dedup on `strict_key` |
@@ -590,12 +608,12 @@ Rollback: each PR is one squash commit with no migration, so a revert is enough.
 | `app/journey/signature.py` | 3–4 | stop-token rules move to the adapters; `trip_signature` kept (frozen); `transit_fingerprint` kept until #304 |
 | `app/journey/planner_dispatch.py` | 3 | `_FetchPlan` returns `tuple[dict, list[CanonicalJourney]]` |
 | `app/journey/federated_planner.py` | 3 | stitches canonical journeys; `via_hubs` → `JourneySource` |
-| `app/journey/recorder.py` | 3 | writes `to_storage_v1` |
+| `app/journey/recorder.py` | 3, 4 | PR 3: `to_legs(journey)`; PR 4: the canonical JSON |
 | `app/api/journey.py` | 3 | canonical response; `_build_comparison`, HAFAS clipping on canonical |
 | `app/templates/journey.html`, `app/static/js/compare_grid.js` (+ new `canonical_view.js`) | 3 | read canonical JSON through helpers |
 | `app/network_coverage/runner.py` | 4 | canonical throughout; dedup key |
 | `app/network_coverage/alignment.py` | 4 | canonical input, same rules |
-| `app/network_coverage/external_verify.py` | 4 | transport + `VerifyItinerary` writer from canonical; category twin removed |
+| `app/network_coverage/external_verify.py` | 4 | transport + verdict only; `VerifyLeg`/`VerifyItinerary` and the category twin removed |
 | `app/api/admin/network_coverage.py`, `app/api/coverage_share.py`, `app/api/reports.py` | 4 | canonical read-back; share projection |
 | `app/templates/admin/network_coverage.html`, `network_coverage_export.html` | 4 | helpers; one time key for both columns (`modalTransitBounds` stops needing `dep_utc`) |
 | tests | 2–4 | §10 |
@@ -607,7 +625,8 @@ Rollback: each PR is one squash commit with no migration, so a revert is enough.
 
 New (names from #303): `test_canonical_journey.py` (model invariants, computed fields, frozen,
 schema sync), `test_motis_adapter.py`, `test_otp_adapter.py`, `test_hafas_adapter.py`,
-`test_ojp_adapter.py`, `test_legacy_adapters.py`, `test_journey_fingerprint.py` (AC6: ±2 min,
+`test_ojp_adapter.py`, `test_canonical_storage.py` (round trip through the JSONB columns),
+`test_journey_fingerprint.py` (AC6: ±2 min,
 different train numbers, different provider ids, walks stripped, MOTIS sub-modes folded,
 `UNRESOLVED` equal to nothing), `test_journey_similarity.py` (structures; behaviour in #304),
 `test_journey_api_canonical.py` (no provider key such as `_raw_itinerary`, `lid`, `gtfsId` in any
@@ -644,8 +663,7 @@ Found during this analysis, not fixed by this PR *(read from code)*:
 6. `_route_canonical` ignores `route_aliases`' dates and scope; `stations_xref` and `mct_overrides`
    have no writer; `master_carriers` has no loader. Out of scope; the model has the fields.
 7. `20260908_1200_null_pre_extid` nulled old scores but left `UIC:<longitude>` tokens inside old
-   `external_itineraries`. `from_verify_itinerary` must not trust a `UIC:` token from a row
-   verified before 2026-09-08 (it reads `external_verified_at`).
+   `external_itineraries`. Gone with D1: PR 4 deletes those rows.
 
 Risks:
 - **Template pins.** The `journey.html` / modal tests are string checks on source text; PR 3–4
@@ -653,11 +671,12 @@ Risks:
   each PR gets a manual browser check (CLAUDE.md §8: two front-end traps no test catches).
 - **Public share blast radius** (`coverage_share.py`). A canonical journey carries more than the page
   renders (codes, refs). PR 4 projects it explicitly and extends `test_coverage_share.py`.
-- **Old rows.** Stored legs differ by engine and age; `from_storage_v1` is tested on rows of each
-  engine, of federated stitches, and of pre-#220 / pre-#224 runs.
+- **Data deletion.** PR 4's migration cannot be undone. It deletes runs and searches only (hubs,
+  sessions, settings, users stay), and the PR says so in its title.
+- **A run in progress at deploy time.** A coverage run held by the worker when PR 4 deploys would
+  be deleted mid-run. The deploy note says: stop runs first.
 - **Size.** `runner.py` (3 013 lines) and the two templates (2 000 and 3 650 lines) are the bulk of
-  PR 3–4. Splitting PR 3 into "backend + API with a temporary legacy view" and "page" is possible if
-  review prefers smaller PRs.
+  PR 3–4. Splitting PR 3 into "backend + API" and "page" is possible if review prefers smaller PRs.
 
 ---
 
@@ -681,3 +700,5 @@ Risks:
 ## Changelog
 
 - 2026-11-04 — first version, for review (#303 phase 1).
+- 2026-11-04 — owner decisions: D1 no backward compatibility (canonical JSON storage, recorded
+  searches and coverage runs deleted in PR 4, legacy adapters dropped); D5 approved.
