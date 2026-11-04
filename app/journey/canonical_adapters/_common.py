@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..canonical import (
+    CanonicalJourney,
     CanonicalLeg,
     CanonicalLocation,
     CanonicalStopPlace,
@@ -130,6 +131,12 @@ def location(
     if stop is None:
         return CanonicalLocation(kind="coordinate", name=name, position=at)
     return CanonicalLocation(kind="stop", name=name, stop_place=stop, position=at)
+
+
+def source_rank(journey: CanonicalJourney) -> int:
+    """The journey's position in its source's answer: the last part of the id every adapter
+    gives (`<provider>:<scope>:<rank>`)."""
+    return int(journey.id.rsplit(":", 1)[1])
 
 
 def mark_transfers(legs: Sequence[CanonicalLeg]) -> list[CanonicalLeg]:

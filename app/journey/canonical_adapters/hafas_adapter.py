@@ -12,7 +12,9 @@ the category (`prodCtx.catOut`) and the train number (`prodCtx.num`) when HAFAS 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...network_coverage.external_verify import _parse_hafas_duration, oebb_stop_id
 from ..canonical import (
@@ -26,7 +28,6 @@ from ..canonical import (
     ProductCategory,
     mode_family,
 )
-from ..hafas_client import _hafas_dt_to_utc_iso, _map_cat_to_mode, _section_duration_seconds
 from ._common import (
     ADAPTER_VERSION,
     location,
@@ -39,6 +40,8 @@ from ._common import (
 )
 
 STOP_SOURCE = "hafas:oebb"
+# HAFAS gives ÖBB times as Europe/Vienna wall clock.
+REFERENCE_TZ = "Europe/Vienna"
 
 
 def journeys_from_trip_search(payload: Mapping[str, Any]) -> list[CanonicalJourney]:
@@ -114,8 +117,8 @@ def _journey(
         for section in connection.get("secL") or []
         if (leg := _leg(section, str(date), locations, products, operators)) is not None
     ]
-    departure = _hafas_dt_to_utc_iso(str(date), (connection.get("dep") or {}).get("dTimeS"))
-    arrival = _hafas_dt_to_utc_iso(str(date), (connection.get("arr") or {}).get("aTimeS"))
+    departure = hafas_time_to_utc_iso(str(date), (connection.get("dep") or {}).get("dTimeS"))
+    arrival = hafas_time_to_utc_iso(str(date), (connection.get("arr") or {}).get("aTimeS"))
     return CanonicalJourney(
         id=f"hafas:oebb:{rank}",
         source=source,
@@ -158,7 +161,7 @@ def _service(
     """The service of a `JNY` section, and the mode string the old dicts carried."""
     product = _indexed(products, journey.get("prodX"))
     category = str(product.get("cat") or "").strip()
-    source_mode = _map_cat_to_mode(category)
+    source_mode = map_category_to_mode(category)
     operator = _indexed(operators, product.get("oprX"))
     number = product.get("num")
     return (
@@ -192,8 +195,8 @@ def _leg(
     arr = section.get("arr") or {}
     if not dep or not arr:
         return None
-    dep_iso = _hafas_dt_to_utc_iso(date, dep.get("dTimeS"))
-    arr_iso = _hafas_dt_to_utc_iso(date, arr.get("aTimeS"))
+    dep_iso = hafas_time_to_utc_iso(date, dep.get("dTimeS"))
+    arr_iso = hafas_time_to_utc_iso(date, arr.get("aTimeS"))
     service: CanonicalService | None = None
     source_mode: str | None = None
     if kind == "JNY":
@@ -207,9 +210,141 @@ def _leg(
         destination=_end(_indexed(locations, arr.get("locX"))),
         departure=timing(parse_instant(dep_iso)),
         arrival=timing(parse_instant(arr_iso)),
-        duration_seconds=_section_duration_seconds(dict(section), dep_iso, arr_iso),
+        duration_seconds=section_duration_seconds(dict(section), dep_iso, arr_iso),
         distance_meters=distance if distance is not None and distance >= 0 else None,
         service=service,
         continuous_mode=source_mode if service is None else None,
         source_mode=source_mode,
     )
+
+
+# ── HAFAS value helpers (moved from hafas_client, #303 PR 3a) ─────────────────────────
+
+
+def map_category_to_mode(cat: str | int | None) -> str:
+    """Map a HAFAS product category to VIATOR's mode vocabulary.
+
+    HAFAS categories are operator-specific shorthand ("ICE", "EC",
+    "RJ", "S", "Bus", "Tram", …) — we collapse them to OTP's broader
+    families ("RAIL", "BUS", "TRAM", "SUBWAY", "FERRY"). Unrecognised
+    categories pass through as upper-cased so they're still visible
+    in diagnostics.
+    """
+    # HAFAS occasionally returns `cat` as an int (a numeric product code)
+    # rather than a string abbreviation — str() first so `.upper()` never
+    # raises AttributeError on those responses. Mirrors the same fix in
+    # app/network_coverage/external_verify.py's _hafas_cat_to_mode.
+    cat_upper = str(cat or "").upper()
+    if not cat_upper:
+        return "TRANSIT"
+    # Order matters — check the most specific buckets first.
+    if cat_upper in ("BUS",) or "BUS" in cat_upper:
+        return "BUS"
+    if cat_upper in ("TRAM", "STR") or "TRAM" in cat_upper:
+        return "TRAM"
+    if cat_upper in ("U", "U-BAHN", "METRO") or "METRO" in cat_upper or "SUBWAY" in cat_upper:
+        return "SUBWAY"
+    if cat_upper in ("S", "S-BAHN") or "S-BAHN" in cat_upper:
+        return "RAIL"
+    if cat_upper in ("SHIP", "FERRY", "BOAT") or "FERRY" in cat_upper:
+        return "FERRY"
+    # The big rail bucket — anything that looks like a train.
+    if cat_upper in (
+        "ICE",
+        "IC",
+        "EC",
+        "RJ",
+        "RJX",
+        "NJ",
+        "EN",
+        "TGV",
+        "AVE",
+        "AVLO",
+        "EUROSTAR",
+        "RE",
+        "R",
+        "REX",
+        "D",
+        "EUR",
+        "WB",
+        "IR",
+        "FB",
+    ):
+        return "RAIL"
+    if "RAIL" in cat_upper or "TRAIN" in cat_upper:
+        return "RAIL"
+    return cat_upper
+
+
+def section_duration_seconds(
+    sec: dict[str, Any],
+    dep_iso: str | None,
+    arr_iso: str | None,
+) -> int:
+    """Derive a leg duration in seconds.
+
+    Prefers HAFAS's `gisDur` (walk/transfer duration) when present;
+    otherwise computes from the parsed dep/arr ISO times. Returns 0
+    when neither source is usable rather than raising — a stray "0s"
+    leg is recoverable; a crash on a degenerate response is not.
+    """
+    gis = sec.get("gis") or {}
+    gis_dur = gis.get("dur")
+    parsed = _parse_hafas_duration(gis_dur)
+    if parsed is not None:
+        return parsed
+    if dep_iso and arr_iso:
+        try:
+            dep_dt = datetime.fromisoformat(dep_iso)
+            arr_dt = datetime.fromisoformat(arr_iso)
+            return max(0, int((arr_dt - dep_dt).total_seconds()))
+        except ValueError:  # pragma: no cover — defensive
+            return 0
+    return 0
+
+
+def hafas_time_to_utc_iso(date: str, hhmmss: str | None) -> str | None:
+    """Convert a HAFAS (date, HHMMSS) pair to UTC ISO.
+
+    HAFAS expresses times in Europe/Vienna for ÖBB. Date is YYYYMMDD;
+    time is HHMMSS (occasionally with a day-roll prefix like "01024500"
+    for "next-day 02:45:00"). Returns None on unparseable input.
+    """
+    if not date or not hhmmss:
+        return None
+    s = str(hhmmss)
+    # Day-roll prefix: leading two digits are a day offset (HAFAS
+    # convention for connections that cross midnight). Pad to a known
+    # width then slice.
+    s = s.zfill(6)
+    day_offset = 0
+    hms = s
+    if len(s) > 6:
+        try:
+            day_offset = int(s[:-6])
+            hms = s[-6:]
+        except ValueError:
+            return None
+    try:
+        year = int(date[0:4])
+        month = int(date[4:6])
+        day = int(date[6:8])
+        hours = int(hms[0:2])
+        minutes = int(hms[2:4])
+        seconds = int(hms[4:6])
+    except (ValueError, IndexError):
+        return None
+    try:
+        tz: Any = ZoneInfo(REFERENCE_TZ)
+    except (ZoneInfoNotFoundError, ValueError):  # pragma: no cover
+        tz = UTC
+    try:
+        local = datetime(year, month, day, hours, minutes, seconds, tzinfo=tz)
+    except ValueError:
+        return None
+    if day_offset:
+        # `datetime(..., day=day+offset)` would mis-handle month
+        # boundaries; use timedelta semantics via the `replace` round-
+        # trip. Simpler: add seconds.
+        local = local + timedelta(days=day_offset)
+    return local.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")

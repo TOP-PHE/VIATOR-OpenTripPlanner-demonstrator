@@ -95,7 +95,7 @@ def _v_leg(
     readability — same literal format `_o_leg` takes — and converted to
     genuine UTC-instant ISO strings here, the shape real VIATOR leg
     timestamps actually carry in production (both OTP and MOTIS return
-    offset-aware times; see `hafas_client._hafas_dt_to_utc_iso` for the
+    offset-aware times; see `hafas_adapter.hafas_time_to_utc_iso` for the
     equivalent real conversion on the ÖBB side of the LIVE journey
     comparison, as opposed to the coverage sweep's intentionally-naive
     persistence this module reads). This means `_v_leg(dep=X)` and

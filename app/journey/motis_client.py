@@ -43,8 +43,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from .trip_normalize import clean_operator_name
-from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
+from .canonical import CanonicalJourney
+from .canonical_adapters import motis_adapter
+from .canonical_adapters._common import source_rank
+from .canonical_adapters.trip_dict import to_trip_dict
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +102,7 @@ def _base_url_for(session_id: str, base_url: str | None) -> str:
     return f"{_INTERNAL_SCHEME}://motis-{session_id}:8080"
 
 
-async def fetch_plan(
+async def fetch_journeys(
     *,
     session_id: str,
     from_lat: float,
@@ -115,7 +117,7 @@ async def fetch_plan(
     to_stop_id: str | None = None,
     session_timezone: str | None = None,
     base_url: str | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[CanonicalJourney]]:
     """Call MOTIS's `/api/v6/plan`. Returns `(raw_response, trips_for_recorder)`.
 
     Mirrors `otp_client.fetch_plan` argument-for-argument so the dispatcher
@@ -206,160 +208,30 @@ async def fetch_plan(
     r.raise_for_status()
     raw: dict[str, Any] = r.json()
 
-    return raw, _itineraries_to_trips(raw)
+    return raw, motis_adapter.journeys_from_plan(raw, session_id=session_id)
+
+
+async def fetch_plan(**kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """`fetch_journeys`, as today's trip dicts with MOTIS's own itinerary under
+    `_raw_itinerary`: for the callers not on canonical journeys yet (coverage and replay,
+    #303 PR 4). Same arguments as `fetch_journeys`."""
+    raw, journeys = await fetch_journeys(**kwargs)
+    return raw, _with_raw_itineraries(raw, journeys)
+
+
+def _with_raw_itineraries(
+    raw: dict[str, Any], journeys: list[CanonicalJourney]
+) -> list[dict[str, Any]]:
+    """Today's trip dicts of `journeys` (the temporary `trip_dict` bridge, #303), each with
+    MOTIS's own itinerary under `_raw_itinerary` for the journey page's JSON inspector."""
+    itineraries = raw.get("itineraries") or []
+    return [
+        {**to_trip_dict(journey), "_raw_itinerary": itineraries[source_rank(journey)]}
+        for journey in journeys
+    ]
 
 
 def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Translate MOTIS's `/api/v6/plan` response into the canonical trip dicts
-    the recorder + federated planner consume.
-
-    Schema mapping:
-        MOTIS Itinerary.startTime  ->  trip['departure_at']
-        MOTIS Itinerary.endTime    ->  trip['arrival_at']
-        MOTIS Itinerary.duration   ->  trip['duration_seconds']
-        MOTIS Itinerary.transfers  ->  trip['num_transfers']
-        legs[].mode (filtered)     ->  trip['modes']  (comma-joined, no WALK)
-        legs[]                     ->  trip['legs']   (one canonical leg per)
-
-    Best-effort fields (None until we capture a live response to confirm
-    MOTIS's exact field names — see the inline notes in `_leg_to_canonical`):
-        leg distance, route_id, agency_id, feed_id.
-
-    PR-3: each trip carries an extra `first_transit_leg_departure_utc`
-    (UTC-ISO string or None when the itinerary is walk-only). The
-    coverage runner uses this — NOT `departure_at` — to decide whether
-    a trip's BOARDING falls inside the run's day window. `departure_at`
-    is the itinerary START (which on a walk-then-train trip is the
-    walking step) so it would silently let "leaves the door at 23:50,
-    boards 00:15 train" trips slip into the previous day's window.
-    """
-    itineraries = raw.get("itineraries") or []
-    out: list[dict[str, Any]] = []
-    for it in itineraries:
-        legs_norm = [_leg_to_canonical(leg) for leg in (it.get("legs") or [])]
-        # Same convention as OTP: only non-WALK modes count toward the
-        # itinerary's mode summary.
-        modes = sorted({lg["mode"] for lg in legs_norm if lg.get("mode") and lg["mode"] != "WALK"})
-        out.append(
-            {
-                "duration_seconds": int(it.get("duration") or 0),
-                # MOTIS gives transfers explicitly; fall back to the OTP-style
-                # count if the field is missing on some response variant.
-                "num_transfers": int(
-                    it.get("transfers")
-                    if it.get("transfers") is not None
-                    else max(0, sum(1 for lg in legs_norm if lg.get("mode") != "WALK") - 1)
-                ),
-                "departure_at": str(it.get("startTime") or ""),
-                "arrival_at": str(it.get("endTime") or ""),
-                "modes": ",".join(modes),
-                "legs": legs_norm,
-                # PR-3 — first transit-leg boarding time in UTC ISO. See
-                # the module-level note in _first_transit_leg_departure_utc
-                # for why this is separate from `departure_at`.
-                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
-                # Same convention as OTP — underscore-prefixed keys are
-                # presentation-layer-only and stripped by recorder.persist_trip.
-                "_raw_itinerary": it,
-            }
-        )
-    return out
-
-
-def _feed_id_from_motis_id(motis_id: str | None) -> str | None:
-    """Extract the feed id from a MOTIS-formatted stop or trip id.
-
-    MOTIS encodes both feed and local id into one string with `_` as the
-    separator (e.g. `renfe-ld_60000`). OTP uses `:` (e.g. `renfe-ld:60000`).
-    Phase-1 federated planner dedup keys on feed_id, so we surface it here
-    rather than make the dispatcher engine-aware.
-
-    Returns None on inputs that don't carry the `<feed>_<local>` shape —
-    the federated planner already tolerates missing feed_id by falling
-    back to coordinate-based stitching.
-    """
-    if not motis_id or "_" not in motis_id:
-        return None
-    # A NeTEx local id carries `:` (`DE::ScheduledStopPoint:8700014_DBDB`)
-    # and may itself contain `_`; a feed tag never contains `:`. So split
-    # within the part before the first `:` — `db_DE::…` gives `db`.
-    head = motis_id.split(":", 1)[0] if ":" in motis_id else motis_id
-    if "_" not in head:
-        return None
-    return head.rsplit("_", 1)[0] or None
-
-
-def _leg_to_canonical(leg: dict[str, Any]) -> dict[str, Any]:
-    """One MOTIS leg -> one canonical leg dict (matching otp_client's shape).
-
-    Field names verified against a real Renfe AVE response in the Phase-0.5
-    spike (Madrid Atocha → Barcelona Sants, 2026-06-19). Key MOTIS-isms vs
-    OTP that surfaced there:
-      * Place coords are `lat` / `lon`, not `latitude` / `longitude`.
-      * Route + agency fields are TOP-LEVEL on the leg (e.g. `routeShortName`,
-        `agencyName`) — there is no nested `route: {}` / `agency: {}` object.
-      * `routeId` carries the GTFS route id; we surface it verbatim.
-      * No `distance` field; if downstream consumers care about leg distance
-        they'll need to derive it from `legGeometry` (out of scope for P1).
-      * `stopId` uses underscore: `<feed>_<local>` not OTP's `<feed>:<local>`.
-        Feed id is extracted via _feed_id_from_motis_id so the federated
-        planner's dedup keys still work.
-      * `stopCode` and `parentId` are ALSO present and were previously dropped.
-        See below — `stopCode` is the only place a NAP feed hands us a real UIC.
-
-    **`stopCode` — the station code, when the feed publishes one.** Measured
-    against the live eu19 session 2026-09-07: of 30 GTFS feeds, only `eurostar`
-    puts a UIC there (`8400058` for Amsterdam Centraal, matching ÖBB HAFAS's
-    `extId` exactly). `nl-nap` populates it with a local short code (`1101`),
-    and IDFM/OURA/transilien with platform ordinals (`1`, `2`). So it is
-    surfaced, not trusted: a consumer must decide per feed whether the value is
-    a UIC. `signature.transit_fingerprint` only uses it when it is UIC-shaped.
-
-    **`parentId` — station-level grouping.** MOTIS returns platform-level stops,
-    so Amsterdam Centraal arrives as three distinct `stopId`s
-    (`nl-nap_2992170` / `_2992179` / `_2992182`) that all share
-    `parentId = nl-nap_stoparea:18188`. Without it, the same station produces
-    different fingerprints depending on which platform a trip used.
-
-    `stopId` itself is left UNCHANGED — it is the key for
-    `_feed_id_from_motis_id` and for `stations_xref (session_id, stop_id)`.
-    """
-    f = leg.get("from") or {}
-    t = leg.get("to") or {}
-    duration = leg.get("duration")
-    from_stop_id = f.get("stopId")
-    to_stop_id = t.get("stopId")
-    return {
-        "mode": leg.get("mode"),
-        "departure": str(leg.get("startTime") or ""),
-        "arrival": str(leg.get("endTime") or ""),
-        "duration_seconds": int(duration) if duration is not None else 0,
-        # MOTIS doesn't expose a leg distance field. Recorded as 0.0 to keep
-        # the canonical shape stable; consumers that need distance can
-        # derive it from `legGeometry` on _raw_itinerary.
-        "distance_meters": 0.0,
-        "from_name": f.get("name"),
-        "from_lat": f.get("lat"),
-        "from_lon": f.get("lon"),
-        "from_stop_id": from_stop_id,
-        "from_stop_code": f.get("stopCode"),
-        "from_parent_id": f.get("parentId"),
-        "to_name": t.get("name"),
-        "to_lat": t.get("lat"),
-        "to_lon": t.get("lon"),
-        "to_stop_id": to_stop_id,
-        "to_stop_code": t.get("stopCode"),
-        "to_parent_id": t.get("parentId"),
-        "route_short_name": leg.get("routeShortName"),
-        "route_long_name": leg.get("routeLongName"),
-        "route_id": leg.get("routeId"),
-        "agency_name": clean_operator_name(leg.get("agencyName")),
-        "agency_id": leg.get("agencyId"),
-        "agency_url": leg.get("agencyUrl"),
-        # Both stops should share a feed id (transit legs don't cross feeds);
-        # prefer the origin's so the value is stable when MOTIS adds the
-        # trailing-stop entry to multi-stop intermediate hops.
-        "feed_id": _feed_id_from_motis_id(from_stop_id),
-        "trip_id": leg.get("tripId"),
-        "trip_headsign": leg.get("headsign"),
-    }
+    """Today's trip dicts for a `/api/v6/plan` answer (field mapping and what was measured
+    on MOTIS in `canonical_adapters.motis_adapter`)."""
+    return _with_raw_itineraries(raw, motis_adapter.journeys_from_plan(raw))

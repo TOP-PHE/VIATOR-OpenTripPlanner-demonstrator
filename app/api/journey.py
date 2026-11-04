@@ -27,6 +27,7 @@ from ..journey import (
     timetable_window,
     trip_normalize,
 )
+from ..journey.canonical_adapters.trip_dict import to_trip_dicts
 from ..models import GraphSnapshot, JourneySearch
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -269,7 +270,8 @@ async def _query_ojp_reference(
         )
         result: dict[str, Any] = {
             "status": "ok" if trips else "no_route",
-            "trips": trips,
+            # Today's trip dicts until the page reads canonical journeys (#303).
+            "trips": to_trip_dicts(trips),
             "response_ms": _ms(),
         }
         # Surface page count so the UI / operator can see whether
@@ -366,7 +368,8 @@ async def _query_hafas_reference(
         status = str(raw.get("status") or ("ok" if trips else "no_route"))
         result: dict[str, Any] = {
             "status": status,
-            "trips": trips,
+            # Today's trip dicts until the page reads canonical journeys (#303).
+            "trips": to_trip_dicts(trips),
             "response_ms": _ms(),
         }
         if raw.get("error"):

@@ -19,6 +19,8 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from .canonical import CanonicalJourney
+
 # DB's NeTEx (DELFI) names operators with their numeric code in front:
 # `80___ DB Fernverkehr AG`, `87___ SNCF`, `3018___ EUROSTAR`.
 _OPERATOR_CODE_PREFIX_RE = re.compile(r"^\d+_+\s*")
@@ -66,8 +68,8 @@ def first_transit_leg_departure_utc(legs: list[dict[str, Any]] | None) -> str | 
         if mode in _NON_TRANSIT_MODES:
             continue
         # First transit leg found. The clients all emit `departure` as
-        # a UTC-ISO string already (see `otp_client._ms_to_iso`,
-        # `motis_client._leg_to_canonical`, `ojp_client._iso_to_utc_iso`),
+        # a UTC-ISO string already (the canonical adapters convert every time
+        # once, `canonical_adapters/trip_dict.py` writes them),
         # but we re-normalise defensively so a future client that
         # forgets the UTC conversion doesn't poison the day-window
         # comparison.
@@ -119,31 +121,35 @@ def max_dep_ts(current: float | None, dep_str: str | None) -> float | None:
 
 
 def dedup_batch_and_track_latest_dep(
-    batch: list[dict[str, Any]], seen_fps: set[str]
-) -> tuple[list[dict[str, Any]], float | None]:
+    batch: list[CanonicalJourney], seen_fps: set[str]
+) -> tuple[list[CanonicalJourney], float | None]:
     """One page's bookkeeping: dedupe by transit_fingerprint, track the
-    latest departure across ALL trips (duplicates included — a boundary
+    latest departure across ALL journeys (duplicates included — a boundary
     dup still proves the engine advanced to that anchor).
 
-    Walk-only trips (empty fingerprint) are never deduplicated; they're
-    rare for any OD pair where pagination would even fire.
+    The key is `transit_fingerprint` of the journey's legs as today's dicts
+    (the `trip_dict` bridge), so pages dedupe exactly as before #303; the
+    switch to `JourneyFingerprint` is #304's. Walk-only journeys (empty
+    fingerprint) are never deduplicated; they're rare for any OD pair where
+    pagination would even fire.
     """
-    # Lazy import: signature.py pulls SQLAlchemy for trip_signature even
-    # though transit_fingerprint itself is DB-free. Importing at call
-    # time keeps this module (and its callers) importable in lightweight
-    # environments that don't have SQLAlchemy on the path.
+    # Lazy imports: signature.py pulls SQLAlchemy for trip_signature even
+    # though transit_fingerprint itself is DB-free, and the bridge imports
+    # this module. Importing at call time keeps both out of import cycles.
+    from .canonical_adapters.trip_dict import to_trip_dict
     from .signature import transit_fingerprint
 
-    new_trips: list[dict[str, Any]] = []
+    new_journeys: list[CanonicalJourney] = []
     latest_dep_ts: float | None = None
-    for t in batch:
-        fp = transit_fingerprint(t.get("legs") or [])
+    for journey in batch:
+        fp = transit_fingerprint(to_trip_dict(journey)["legs"])
         if not (fp and fp in seen_fps):
             if fp:
                 seen_fps.add(fp)
-            new_trips.append(t)
-        latest_dep_ts = max_dep_ts(latest_dep_ts, t.get("departure_at"))
-    return new_trips, latest_dep_ts
+            new_journeys.append(journey)
+        departure = journey.departure.timetabled.isoformat() if journey.departure else None
+        latest_dep_ts = max_dep_ts(latest_dep_ts, departure)
+    return new_journeys, latest_dep_ts
 
 
 def next_anchor_or_none(latest_dep_ts: float | None, target_end_ts: float) -> datetime | None:
