@@ -416,9 +416,10 @@
    legs_omitted: large DOWNLOADED export — trip summaries embedded but
    leg detail dropped to keep the file openable. Defaults keep old
    renders (and the small-run download) on the full-embed path. #}
-{# #303: the journey display model, embedded (this page must work offline); its text is the
-   static file app/static/js/canonical_view.js, read by _build_export_context. #}
-<script>{{ canonical_view_js|safe }}</script>
+{# #303: the journey display model, embedded (this page must work offline): the <script>
+   element of the static file app/static/js/canonical_view.js, built by
+   network_coverage.canonical_view_script() as markup, so it is printed as it is. #}
+{{ canonical_view_script }}
 <script id="cov-flags" type="application/json">{{ {"lazy_trips": lazy_trips|default(false), "legs_omitted": legs_omitted|default(false)}|tojson }}</script>
 
 <script>

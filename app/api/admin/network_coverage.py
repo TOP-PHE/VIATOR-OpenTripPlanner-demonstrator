@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from markupsafe import Markup
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -2856,21 +2857,29 @@ def _build_export_context(
         "cells": cells,
         "lazy_trips": lazy_trips,
         "legs_omitted": legs_omitted,
-        "canonical_view_js": canonical_view_js(),
+        "canonical_view_script": canonical_view_script(),
     }
 
 
 # The journey display model the coverage pages share (#303). The live modal loads it from
-# /static/app; the downloaded report and the share page embed its text, since the report must
-# work offline (no external asset). Read at import, so no request reads a file.
+# /static/app; the downloaded report and the share page embed it, since the report must work
+# offline (no external asset). Read at import, so no request reads a file.
 _CANONICAL_VIEW_JS = (
     Path(__file__).resolve().parents[2] / "static" / "js" / "canonical_view.js"
 ).read_text(encoding="utf-8")
+# The whole <script> element, built here from that file (our own code, never request data), so
+# the template prints it as it is: no `|safe` there, and no template expression inside a script.
+_CANONICAL_VIEW_SCRIPT = Markup(f"<script>{_CANONICAL_VIEW_JS}</script>")  # noqa: S704
 
 
 def canonical_view_js() -> str:
     """The text of `app/static/js/canonical_view.js`, as embedded in the report."""
     return _CANONICAL_VIEW_JS
+
+
+def canonical_view_script() -> Markup:
+    """The `<script>` element the report embeds: `canonical_view_js()` in a script tag."""
+    return _CANONICAL_VIEW_SCRIPT
 
 
 def _export_filename(run: Any) -> str:

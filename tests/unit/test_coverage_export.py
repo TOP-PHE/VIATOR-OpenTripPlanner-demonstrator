@@ -1417,7 +1417,7 @@ def test_export_run_html_renders_with_content_disposition(monkeypatch) -> None:
         "country_col_runs",
         "lazy_trips",
         "legs_omitted",
-        "canonical_view_js",
+        "canonical_view_script",
     }
     assert captured["context"]["cells"] == {}  # no results passed
     # A tiny run keeps the historical full-embed behaviour: nothing lazy,
@@ -1536,12 +1536,22 @@ def test_export_run_html_keeps_legs_at_exactly_the_pair_threshold(monkeypatch) -
 def test_the_report_embeds_the_view_module_and_reads_canonical_journeys() -> None:
     """#303 PR 4b: the report must work offline, so it embeds the view module's text; every
     journey it draws goes through `CanonicalView.journey`, never an engine's own fields."""
-    from app.api.admin.network_coverage import canonical_view_js
+    from app.api.admin.network_coverage import canonical_view_js, canonical_view_script
 
     view = canonical_view_js()
     assert "root.CanonicalView = {" in view
-    html = _render(canonical_view_js=view)
-    assert view in html
+    html = _render(canonical_view_script=canonical_view_script())
+    # Printed as it is, inside its own script element (no escaping, no `|safe` in the template).
+    assert f"<script>{view}</script>" in html
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "app"
+        / "templates"
+        / "admin"
+        / "network_coverage_export.html"
+    ).read_text(encoding="utf-8")
+    assert "{{ canonical_view_script }}" in template
+    assert "|safe" not in template
     assert html.index(view) < html.index("function renderTrip(")
     assert "CanonicalView.journey(trip.journey)" in html
     assert "const view = CanonicalView.journey(journey);" in html
