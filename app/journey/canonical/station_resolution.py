@@ -37,16 +37,6 @@ class StationResolver(Protocol):
         ...
 
 
-class NoStationResolver:
-    """Places nothing: every `station_id` stays None (the matching engine then falls back to
-    codes, design #304 §6)."""
-
-    async def resolve(
-        self, stops: Sequence[CanonicalStopPlace]
-    ) -> Mapping[StopKey, ResolvedStation]:
-        return {}
-
-
 def stop_places(journeys: Sequence[CanonicalJourney]) -> list[CanonicalStopPlace]:
     """Every distinct stop place of the journeys, in order of first appearance."""
     seen: dict[StopKey, CanonicalStopPlace] = {}
@@ -86,9 +76,13 @@ def _leg_with_stations(
 
 
 async def with_resolved_stations(
-    journeys: Sequence[CanonicalJourney], resolver: StationResolver
+    journeys: Sequence[CanonicalJourney], resolver: StationResolver | None
 ) -> list[CanonicalJourney]:
-    """The journeys with `station_id` / `station_parent_id` filled where the resolver can."""
+    """The journeys with `station_id` / `station_parent_id` filled where the resolver can.
+    Without a resolver, nothing is placed: every `station_id` stays None and the matching
+    engine falls back to codes (design #304 §6)."""
+    if resolver is None:
+        return list(journeys)
     stations = await resolver.resolve(stop_places(journeys))
     if not stations:
         return list(journeys)

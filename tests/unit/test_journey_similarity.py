@@ -15,7 +15,6 @@ from app.journey.canonical import (
     MatchReason,
 )
 from app.journey.canonical.station_resolution import (
-    NoStationResolver,
     ResolvedStation,
     StopKey,
     stop_places,
@@ -27,7 +26,8 @@ from tests.unit import canonical_fixtures as fx
 
 def test_features_default_to_no_evidence_and_bound_their_shares() -> None:
     features = JourneyMatchFeatures()
-    assert features.station_overlap is None and features.departure_delta is None
+    assert features.station_overlap is None
+    assert features.departure_delta is None
     for name in ("station_overlap", "operator_overlap", "service_overlap", "route_overlap"):
         with pytest.raises(ValidationError):
             JourneyMatchFeatures(**{name: 1.5})
@@ -46,13 +46,14 @@ def test_a_similarity_result_and_its_reasons() -> None:
         reasons=[reason],
     )
     assert result.reasons[0].severity == "warning"
+    no_evidence = JourneyMatchFeatures()
     with pytest.raises(ValidationError):
         JourneySimilarityResult(
             left_id="a",
             right_id="b",
-            verdict="maybe",
+            verdict="maybe",  # type: ignore[arg-type]
             score=0.5,
-            features=JourneyMatchFeatures(),  # type: ignore[arg-type]
+            features=no_evidence,
         )
     with pytest.raises(ValidationError):
         MatchReason(code="", severity="info")
@@ -99,9 +100,9 @@ async def test_with_resolved_stations_fills_station_ids_and_only_those() -> None
     assert resolved[0].fingerprint() == journeys[0].fingerprint()
 
 
-async def test_no_station_resolver_changes_nothing() -> None:
+async def test_without_a_resolver_nothing_changes() -> None:
     journeys = motis_adapter.journeys_from_plan(fx.MOTIS_PLAN)
-    assert await with_resolved_stations(journeys, NoStationResolver()) == journeys
+    assert await with_resolved_stations(journeys, None) == journeys
 
 
 def test_stop_places_are_listed_once_in_order() -> None:

@@ -127,7 +127,8 @@ def test_motis_service_and_operator() -> None:
     s7 = _motis()[0].legs[1].service
     assert s7 is not None
     assert (s7.line, s7.published_name, s7.feed) == ("S7", "S7", "styria")
-    assert s7.operator is not None and s7.operator.name == "GKB"
+    assert s7.operator is not None
+    assert s7.operator.name == "GKB"
     eurostar = _motis()[1].legs[0].service
     assert eurostar.operator.name == "EUROSTAR"  # the DELFI code prefix is removed
     assert eurostar.train_number is None  # MOTIS gives none the client reads

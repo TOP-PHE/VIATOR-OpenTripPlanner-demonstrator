@@ -57,25 +57,19 @@ def test_models_are_frozen_and_refuse_unknown_fields() -> None:
 
 def test_a_timed_leg_has_a_service_and_a_walk_has_none() -> None:
     service = CanonicalService(mode=TransportMode.RAIL)
+    ends = {"origin": _stop(), "destination": _stop(), "duration_seconds": 60}
     with pytest.raises(ValidationError, match="timed leg has a service"):
-        CanonicalLeg(kind="timed", origin=_stop(), destination=_stop(), duration_seconds=60)
+        CanonicalLeg(kind="timed", **ends)
     with pytest.raises(ValidationError, match="timed leg has a service"):
-        CanonicalLeg(
-            kind="continuous",
-            origin=_stop(),
-            destination=_stop(),
-            duration_seconds=60,
-            service=service,
-        )
+        CanonicalLeg(kind="continuous", service=service, **ends)
 
 
 def test_a_stop_location_has_a_stop_place_and_a_coordinate_one_has_none() -> None:
     with pytest.raises(ValidationError):
         CanonicalLocation(kind="stop", name="Bern")
+    stop_place = CanonicalStopPlace(ref="x", source="otp:SBB")
     with pytest.raises(ValidationError):
-        CanonicalLocation(
-            kind="coordinate", stop_place=CanonicalStopPlace(ref="x", source="otp:SBB")
-        )
+        CanonicalLocation(kind="coordinate", stop_place=stop_place)
 
 
 def test_times_are_aware_and_stored_in_utc() -> None:
@@ -83,8 +77,9 @@ def test_times_are_aware_and_stored_in_utc() -> None:
     timing = CanonicalTiming(timetabled=datetime(2026, 5, 18, 10, 31, tzinfo=cest))
     assert timing.timetabled == datetime(2026, 5, 18, 8, 31, tzinfo=UTC)
     assert timing.timetabled.utcoffset() == timedelta(0)
+    naive = datetime(2026, 5, 18, 10, 31)
     with pytest.raises(ValidationError):
-        CanonicalTiming(timetabled=datetime(2026, 5, 18, 10, 31))  # naive: refused
+        CanonicalTiming(timetabled=naive)  # naive: refused
 
 
 @pytest.mark.parametrize("uic", ["850700", "85070000", "UIC:8507000", "abcdefg"])
@@ -146,7 +141,8 @@ def test_every_fixture_journey_reads_back_from_its_json() -> None:
     derived values are computed again rather than stored."""
     for journey in _all_fixture_journeys():
         text = journey.model_dump_json()
-        assert "first_boarding" not in text and "fingerprint" not in text
+        assert "first_boarding" not in text
+        assert "fingerprint" not in text
         again = CanonicalJourney.model_validate_json(text)
         assert again == journey
         assert again.fingerprint() == journey.fingerprint()
