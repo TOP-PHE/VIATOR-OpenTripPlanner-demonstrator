@@ -52,7 +52,7 @@ Everything above them (federation, recording, coverage, alignment, comparison, A
 | D5 | Does #303 change any comparison result? | **Decided 2026-11-04: no, with one exception.** #303 keeps `transit_fingerprint` and the alignment scorer's rules, ported to canonical input and golden-tested. The new `JourneyFingerprint` is introduced alongside; consumers switch to it in #304, where verdicts are meant to change. The exception: PR 4 fixes the coverage dedup key (§11 item 2), so a cell no longer merges trips of two stations that share a platform number, minute and route names (rare); such a cell then keeps one more trip than before. |
 | D6 | Fingerprint and train numbers | Per #303, **`JourneyFingerprint` ignores train numbers and route names** (today's `transit_fingerprint` hashes `route_short_name`). Train identity becomes a matching feature in #304, not part of identity. |
 | D7 | OJP/OSDM mappers | **Proof of concept in PR 2** (AC5): CanonicalJourney → OJP 2.0 `Trip` XML and JSON, → OSDM `Trip` JSON, for the fixture journeys, validated against the OJP XSD in a test. The full export layers stay #306 / #307. |
-| D8 | Station identity | **No new runtime station resolution in #303.** The adapters move today's token rules (`UIC:` / `OEBB:` / coordinates) into `CanonicalStopPlace` unchanged. Resolution through the station module (CLAUDE.md §7 item 7) stays its own work; the model has the fields it needs (`codes`, `parent`). |
+| D8 | Station identity | **Decided direction 2026-11-04: the station module (MSMM) is the mapping.** Journeys are compared by MSMM station (`station_id` = `station_module.current_id`). MSMM already links each feed's stops to stations (VIATOR sends it the stop extracts) and answers `POST /internal/v1/stops/resolve` with `{feed, stop}` or, for an ÖBB number, `{series: DELFI_stop_key, code}`. In #303: the adapters keep today's token rules for `uic`, and PR 2 adds `CanonicalStopPlace.station_id` and a `StationResolver` interface (no I/O). The resolver itself is a PR of its own before #304's wiring (§8): `stops/resolve` answers one stop per call within 60 calls a minute and 2 000 a day per person, enough for `/journey` with a cache, not for a coverage sweep, which needs a bulk form on the MSMM side. |
 
 ---
 
@@ -244,6 +244,8 @@ journey. OJP 2.0 / Transmodel names are given where the concept exists.
 | `codes` | `dict[str, str]` | Codes by series, e.g. `{"UIC": "8100173", "OEBB_EXT": "8100173", "GTFS_STOP_CODE": "1101", "SLOID": "ch:1:sloid:7000"}`. Keeps the evidence a later resolution (station module, D8) needs. |
 | `parent_ref` | `str \| None` | MOTIS `parentId`, OJP parent StopPlace, OTP parent station. |
 | `unresolved_token` | `str \| None` | `OEBB:<payload>` when ÖBB names a station outside the UIC namespace (Wien Hbf's bus terminal `904050`). Kept so it can never re-parse as a UIC (trip-wire `test_oebb_token_can_never_reparse_as_a_uic`). |
+| `station_id` | `str \| None` | The MSMM station (`station_module.current_id`: `replaced_by`, else the VIATOR id `ZZ-99999`), set by the `StationResolver`, never by an adapter (D8). An identity key, never a code: it never goes into `uic`, `codes` or a fingerprint hash. |
+| `station_parent_id` | `str \| None` | MSMM's `parent_viator_id` (a station complex: Bruxelles-Midi and Midi Eurostar), set by the resolver. |
 | `position` | `GeoPosition \| None` | `lat`, `lon`. Display and the legacy 3-dp fallback only (CLAUDE.md §7 item 2(c): proximity is never identity). |
 | `country` | `str \| None` | ISO-2 when the source says so. |
 
@@ -586,6 +588,7 @@ Each PR leaves `main` working; AC1 (no regression, all tests green) is checked a
 | **2** | `app/journey/canonical/` (models, `JourneyFingerprint`, `JourneyMatchFeatures` structure), `canonical_adapters/` (the 4 providers), JSON Schema + sync test, OJP/OSDM mapper PoC + XSD/schema tests, provider-neutrality test | none (nothing calls it yet) | characterisation tests (§5): every old dict value present in the adapter's journey; same comparison results on both |
 | **3** | journey layer on canonical: clients return raw, adapters convert, `planner_dispatch` returns `list[CanonicalJourney]`, `federated_planner`, `/fanout` + `/plan` return canonical JSON, `journey.html` + `compare_grid.js` read it (one JS view helper module, so templates stop reading engine fields), `{}` shows the canonical journey (D3); old normalisers deleted. The recorder still writes `journey_trips.legs` in today's format through a temporary `to_legs(journey)`, because coverage reads them back until PR 4 | display identical; `{}` content changes | template tests updated; `test_journey_api_canonical.py`; manual check on `/journey` (OTP, MOTIS, OJP, HAFAS, federated) |
 | **4** | storage + coverage on canonical: the migration of §5.5 (**deletes all recorded searches and coverage runs**), `journey_trips.journey` and `external_journeys`, `to_legs` and `VerifyLeg`/`VerifyItinerary` deleted; runner, `_coverage_dedup_key` → `strict_key` (fixes the `SBB:…:0:7` → `7` bug), ÖBB through `hafas_adapter`, `compute_alignment(list[CanonicalJourney], list[CanonicalJourney])` with **the same rules**, cell / export / share JSON canonical (projected to what the share page renders), modal on the JS helper | data deleted (D1); scorer unchanged (characterisation test on the `test_oebb_alignment` fixtures); the dedup fix can keep an extra trip in a cell (D5); share payload re-checked against the "reveals only what the page renders" invariant | integration tests (`test_coverage_executor`, `test_coverage_pair_write`) green; a fresh coverage run on a small hub set before the eu19 one |
+| **5** | station resolution (D8): `StationResolver` backed by MSMM, cache per (feed version, stop) and per (series, code), the person's limits respected, a stop MSMM cannot place left `station_id = None`; the bulk form for coverage once MSMM offers it (MSMM-side PR first) | none on its own (nothing compares `station_id` before #304) | resolver tests with a fake module; one live `/journey` check |
 | then #304 | matching engine, then its wiring | intended | see #304 design |
 
 Rollback: PR 2 and PR 3 are one squash commit each with no migration, so a revert is enough. PR 4's
@@ -701,4 +704,6 @@ Risks:
 
 - 2026-11-04 — first version, for review (#303 phase 1).
 - 2026-11-04 — owner decisions: D1 no backward compatibility (canonical JSON storage, recorded
-  searches and coverage runs deleted in PR 4, legacy adapters dropped); D5 approved.
+  searches and coverage runs deleted in PR 4, legacy adapters dropped); D5 approved; D8 stations
+  compared by MSMM station (`station_id`, resolver PR 5); go for PR 2 with the other
+  recommendations as written.

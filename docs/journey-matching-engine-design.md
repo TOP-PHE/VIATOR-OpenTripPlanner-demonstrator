@@ -31,7 +31,7 @@ the tolerances, weights and policies; their main knobs are platform settings.
 | M1 | Time tolerance | **±120 s** on first boarding and on last alighting (#303's "±2 minutes"), for every profile, as a setting. Coverage's fuzzy tier uses ±300 s today on departure only. |
 | M2 | Different train numbers on both sides | **Veto** (no pair), as today's coverage guard does: on Paris–Lyon (a TGV every 30 min) only the train number tells two trains apart. Setting: `veto` \| `penalty`. |
 | M3 | Different line labels (after normalisation) | **Penalty, never a veto** (#304 comment, expectation 4: "a label difference alone should not present a time-matched pair as two different trains"). The pair is kept as *probably the same service* and the difference is shown. |
-| M4 | First/last station not comparable (no shared code: MOTIS `<feed>_<local>` vs ÖBB `extId`) | **Coverage: reject, and record why** (keeps the endpoint guard, CLAUDE.md §7 item 2: never trade visible false negatives for invisible false positives). **`/journey`: allow, with the note "stations could not be compared"**, because the page pairs on times alone today and would otherwise pair nothing on eu19. |
+| M4 | How stations are compared | **Decided direction 2026-11-04: by MSMM station** (`station_id`, resolved through the station module, #303 D8 and PR 5). Open: the fallback when MSMM has no link for a stop (MOTIS `<feed>_<local>` vs ÖBB `extId` with nothing to join them). Recommendation, same on `/journey` and coverage: **pair only when both times are within tolerance and the train number or the line agrees**, and say "stations could not be compared". Alternatives: times alone with a note (more pairs, two trains in the same minute can pair), or never pair (today's coverage guard). |
 | M5 | Station names as evidence when codes are missing | **Off in V1.** Names drift ("Graz Hbf" / "Graz Hauptbahnhof"); proximity is already rejected as identity. Revisit once the station module resolves codes (CLAUDE.md §7 item 7). |
 | M6 | Coverage scores after the switch | Scores change (tolerant pairing, folded modes, normalised labels), so coverage runs are run again. Runs scored before the switch can be deleted like the others (#303 D1, no backward compatibility). One new nullable column holds the scorer version and the reason counts per cell. |
 | M7 | Where the knobs live | Tolerances, thresholds and the three policies (M2–M4) as `JOURNEY_MATCH_*` / `COVERAGE_MATCH_*` platform settings; weights in code per profile (documented, unit-tested); coverage freezes its knobs in the run's `execution_snapshot` like every other `COVERAGE_*` knob. |
@@ -184,10 +184,14 @@ through `route_aliases`, honouring `applies_from` / `applies_until` / `scope_*` 
 
 ## 6. Station agreement
 
-From `CanonicalStopPlace` (canonical-journey-design.md §3.1):
+From `CanonicalStopPlace` (canonical-journey-design.md §3.1). The MSMM station decides first
+(M4); codes and positions are only the fallback for a stop MSMM has not placed.
 
 | Left key | Right key | Agreement |
 |---|---|---|
+| `station_id` x | `station_id` x | AGREE |
+| `station_id` x | `station_id` y, same `station_parent_id` | AGREE, marked `same_complex` (info): Bruxelles-Midi / Midi Eurostar |
+| `station_id` x | `station_id` y, no common parent | CONFLICT |
 | `UIC:x` | `UIC:x` | AGREE |
 | `UIC:x` | `UIC:y`, x ≠ y | CONFLICT — unless the two share `parent_ref` evidence from the station data (Bruxelles-Midi / Midi Eurostar), which V1 does not have: CONFLICT |
 | `GEO:p` | `GEO:p` (same 3-dp cell) | AGREE, marked `location_only` (info). Kept so OTP-vs-MOTIS on the same feed still pairs; never used for the coverage endpoint gate |
@@ -195,7 +199,8 @@ From `CanonicalStopPlace` (canonical-journey-design.md §3.1):
 | `UIC:x` | `GEO:p` | UNKNOWN |
 
 No distance threshold and no name matching (M5): St Pancras ↔ King's Cross (247 m) must stay apart
-while Bruxelles-Midi ↔ Midi Eurostar (53 m) should merge, and only station data can say so.
+while Bruxelles-Midi ↔ Midi Eurostar (53 m) should merge, and only station data can say so — which
+is what MSMM's stations and parents are.
 
 ---
 
@@ -377,3 +382,6 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
 ## Changelog
 
 - 2026-11-04 — first version, for review together with the #303 design.
+- 2026-11-04 — owner: stations compared by MSMM station (M4); the fallback for stops MSMM has not
+  placed is still open; M6 follows #303 D1 (no backward compatibility); M1–M3, M5, M7 as
+  recommended.
