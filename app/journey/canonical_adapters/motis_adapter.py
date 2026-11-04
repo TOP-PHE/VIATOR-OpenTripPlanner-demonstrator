@@ -1,9 +1,17 @@
 """MOTIS `/api/v6/plan` → CanonicalJourney.
 
-Field names as `motis_client._leg_to_canonical` documents them (Renfe AVE spike, eu19
-measurements): `lat`/`lon`, top-level `routeShortName` / `agencyName`, `<feed>_<local>` stop ids
-at platform level with the station in `parentId`, a UIC in `stopCode` on some feeds only.
-MOTIS gives no leg distance and no train number field the client reads.
+Field names verified against a real Renfe AVE answer (Phase-0.5 spike, Madrid Atocha →
+Barcelona Sants, 2026-06-19) and the live eu19 session:
+- place coordinates are `lat` / `lon`; route and agency fields are top-level on the leg
+  (`routeShortName`, `agencyName`), no nested `route` / `agency` object;
+- `stopId` is `<feed>_<local>` (underscore, OTP uses `:`), at platform level: Amsterdam
+  Centraal comes as three `stopId`s sharing `parentId = nl-nap_stoparea:18188`;
+- `stopCode` is the station code when the feed publishes one, measured 2026-09-07 on 30 GTFS
+  feeds: only `eurostar` puts a UIC there (`8400058` = ÖBB HAFAS's `extId`), `nl-nap` a local
+  short code (`1101`), IDFM/OURA/transilien platform ordinals. So it is kept as a code and
+  trusted as a UIC only when UIC-shaped (`signature.stop_token`);
+- no leg distance, and no train number field: MOTIS reads only `trainNumbers` / a `TripNr`
+  key from NeTEx, and NMBS gives none.
 """
 
 from __future__ import annotations
@@ -20,7 +28,6 @@ from ..canonical import (
     JourneySource,
     mode_family,
 )
-from ..motis_client import _feed_id_from_motis_id
 from ..trip_normalize import clean_operator_name
 from ._common import (
     ADAPTER_VERSION,
@@ -34,6 +41,21 @@ from ._common import (
     timing,
     viator_stop_place,
 )
+
+
+def feed_id_from_motis_id(motis_id: str | None) -> str | None:
+    """The feed of a MOTIS stop or trip id: `renfe-ld` of `renfe-ld_60000`.
+
+    A NeTEx local id carries `:` (`DE::ScheduledStopPoint:8700014_DBDB`) and may itself contain
+    `_`, while a feed tag never contains `:`: so the split is made within the part before the
+    first `:` (`db_DE::…` gives `db`). None for an id without the `<feed>_<local>` shape; the
+    federated planner then stitches by coordinates."""
+    if not motis_id or "_" not in motis_id:
+        return None
+    head = motis_id.split(":", 1)[0] if ":" in motis_id else motis_id
+    if "_" not in head:
+        return None
+    return head.rsplit("_", 1)[0] or None
 
 
 def journeys_from_plan(
@@ -74,7 +96,7 @@ def _end(place: Mapping[str, Any]) -> CanonicalLocation:
     if not ref:
         return location(None, name, at)
     stop = viator_stop_place(
-        source=f"motis:{_feed_id_from_motis_id(str(ref)) or '-'}",
+        source=f"motis:{feed_id_from_motis_id(str(ref)) or '-'}",
         ref=str(ref),
         name=name,
         at=at,
@@ -110,7 +132,7 @@ def _leg(leg: Mapping[str, Any]) -> CanonicalLeg:
             journey_ref=text_or_none(leg.get("tripId")),
             destination_text=text_or_none(leg.get("headsign")),
             operator=_operator(leg),
-            feed=_feed_id_from_motis_id(text_or_none(origin_place.get("stopId"))),
+            feed=feed_id_from_motis_id(text_or_none(origin_place.get("stopId"))),
         )
     return CanonicalLeg(
         kind="timed" if timed else "continuous",

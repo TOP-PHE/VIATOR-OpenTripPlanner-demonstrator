@@ -8,6 +8,8 @@ the 4-digit Swiss number with `850` dropped) or bare numbers; places carry the c
 
 from __future__ import annotations
 
+import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -24,19 +26,28 @@ from ..canonical import (
     ProductCategory,
     mode_family,
 )
-from ..ojp_client import (
-    _NS,
-    _OJP,
-    _STOP_POINT_REF,
-    _float_or_none,
-    _index_places,
-    _int_or_zero,
-    _iso_duration_to_seconds,
-    _leg_endpoint,
-    _place_coords,
-    _place_name,
-)
 from ._common import ADAPTER_VERSION, location, parse_instant, position, timing, viator_stop_place
+
+# `xml.etree.ElementTree` is imported only for the `Element` *type* and
+# for navigating already-parsed trees (`.find` / `.iter` — safe). The
+# one place untrusted bytes are *parsed* uses `defusedxml`'s hardened
+# `fromstring` (see `journeys_from_trip_delivery`) — stdlib parsing is XXE-vulnerable.
+_NS_SCHEME = "http:"  # spec-mandated namespace scheme — not a fetched URL
+_OJP = f"{_NS_SCHEME}//www.vdv.de/ojp"
+_SIRI = f"{_NS_SCHEME}//www.siri.org.uk/siri"
+_NS = {"ojp": _OJP, "siri": _SIRI}
+
+# `siri:StopPointRef` is pulled from several leg sub-elements; the
+# literal lives here once (SonarCloud S1192).
+_STOP_POINT_REF = "siri:StopPointRef"
+
+_ISO_DURATION = re.compile(
+    r"^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?"
+    r"(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$"
+)
+
+# The client's logger, which logged this before: log filters and dashboards keep matching.
+log = logging.getLogger("app.journey.ojp_client")
 
 STOP_SOURCE = "ojp:ch"
 _SLOID_PREFIX = "ch:1:sloid:"
@@ -47,6 +58,9 @@ def journeys_from_trip_delivery(xml_text: str) -> list[CanonicalJourney]:
     try:
         root = _xml_fromstring(xml_text)
     except (ET.ParseError, ValueError):
+        # ET.ParseError: malformed XML; defusedxml raises ValueError subclasses
+        # (EntitiesForbidden…) on an XML attack. Either way there is no usable trip.
+        log.warning("OJP response did not parse as safe XML (%d bytes)", len(xml_text))
         return []
     places = _index_places(root)
     source = JourneySource(provider="ojp", role="reference", adapter_version=ADAPTER_VERSION)
@@ -186,3 +200,106 @@ def _leg(element: ET.Element, places: dict[str, dict[str, Any]]) -> CanonicalLeg
     if transfer is not None:
         return _walk_leg(transfer, "transfer", duration, places)
     return None  # an unknown leg variant: skipped, as ojp_client does
+
+
+# ── parsing helpers (moved from ojp_client, #303 PR 3a) ─────────────────────────────
+
+
+def _index_places(root: ET.Element) -> dict[str, dict[str, Any]]:
+    """Build `{stopRef: {name, lat, lon}}` from `TripResponseContext/Places`.
+
+    Legs reference stops by `siri:StopPointRef` / `StopPlaceRef`; the
+    coordinates live once, here, in the place dictionary.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for place in root.iter(f"{{{_OJP}}}Place"):
+        name = place.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
+        geo = place.find("ojp:GeoPosition", _NS)
+        lat = (
+            _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS))
+            if geo is not None
+            else None
+        )
+        lon = (
+            _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS))
+            if geo is not None
+            else None
+        )
+        # A Place is one of StopPlace / StopPoint / TopographicPlace; the
+        # first two carry the refs the legs use.
+        for ref in (
+            place.findtext("ojp:StopPlace/ojp:StopPlaceRef", namespaces=_NS),
+            place.findtext("ojp:StopPoint/siri:StopPointRef", namespaces=_NS),
+        ):
+            if ref:
+                index[ref] = {"name": name, "lat": lat, "lon": lon}
+    return index
+
+
+def _leg_endpoint(
+    el: ET.Element, places: dict[str, dict[str, Any]]
+) -> tuple[str | None, float | None, float | None, str | None]:
+    """A LegStart/LegEnd is either an inline GeoPosition or a StopPointRef
+    resolved via the Places dictionary. Returns (name, lat, lon, stop_ref)."""
+    name = el.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
+    ref = el.findtext(_STOP_POINT_REF, default=None, namespaces=_NS)
+    geo = el.find("ojp:GeoPosition", _NS)
+    if geo is not None:
+        return (
+            name,
+            _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS)),
+            _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS)),
+            ref,
+        )
+    if ref:
+        lat, lon = _place_coords(places, ref)
+        return (name or _place_name(places, ref), lat, lon, ref)
+    return (name, None, None, ref)
+
+
+def _place_name(places: dict[str, dict[str, Any]], ref: str | None) -> str | None:
+    return places.get(ref or "", {}).get("name")
+
+
+def _place_coords(
+    places: dict[str, dict[str, Any]], ref: str | None
+) -> tuple[float | None, float | None]:
+    p = places.get(ref or "", {})
+    return p.get("lat"), p.get("lon")
+
+
+def _iso_duration_to_seconds(value: str | None) -> int:
+    """Parse an ISO-8601 duration (`PT1H9M`, `PT4M`, `PT0S`, …) to whole
+    seconds. OJP trip/leg durations are always the `PT…` time form, but
+    the regex tolerates the date components too. Unparseable → 0."""
+    if not value:
+        return 0
+    m = _ISO_DURATION.match(value.strip())
+    if not m:
+        return 0
+    # Years / months (groups 1-2) are calendar-ambiguous and never
+    # appear in a trip/leg duration - ignored rather than guessed.
+    _, _, weeks, days, hours, minutes, seconds = m.groups()
+    total = 0.0
+    total += int(days or 0) * 86400
+    total += int(weeks or 0) * 604800
+    total += int(hours or 0) * 3600
+    total += int(minutes or 0) * 60
+    total += float(seconds or 0)
+    return int(total)
+
+
+def _int_or_zero(value: str | None) -> int:
+    try:
+        return int((value or "").strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_or_none(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value.strip())
+    except (TypeError, ValueError):
+        return None

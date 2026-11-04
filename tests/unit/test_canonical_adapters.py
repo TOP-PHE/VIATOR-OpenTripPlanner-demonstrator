@@ -1,98 +1,24 @@
-"""#303 PR 2 — the four adapters: they lose nothing, and they fill the new fields right.
+"""#303 — the four adapters fill the canonical fields right.
 
-Characterisation (design §5): `to_trip_dict(adapter(raw))` equals each client's own normaliser
-on the same answer, key for key; times are compared as instants (MOTIS's client copied its time
-strings, `Z`, the bridge writes `+00:00`). The comparison functions then give the same result on
-both (design D5).
+PR 2 proved, on these fixtures, that `to_trip_dict(adapter(raw))` equalled each client's own
+normaliser key for key. Since PR 3a the clients' normalisers ARE the adapter plus that bridge,
+so that comparison would only compare the bridge with itself: the clients' own tests
+(`test_motis_client.py`, `test_hafas_client.py`, `test_ojp_client.py`,
+`test_journey_stop_id_routing.py`) pin the dict values, and these tests pin the new fields.
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.journey import hafas_client, motis_client, ojp_client, otp_client
 from app.journey.canonical import CanonicalJourney, TransportMode, mode_family
 from app.journey.canonical_adapters import hafas_adapter, motis_adapter, ojp_adapter, otp_adapter
-from app.journey.canonical_adapters.trip_dict import to_trip_dicts
-from app.journey.signature import transit_fingerprint
 from app.network_coverage import external_verify
-from app.network_coverage.alignment import compute_alignment
 from tests.unit import canonical_fixtures as fx
-
-_TRIP_TIMES = ("departure_at", "arrival_at", "first_transit_leg_departure_utc")
-_LEG_TIMES = ("departure", "arrival")
-
-
-def _instant(value: Any) -> Any:
-    return datetime.fromisoformat(value) if isinstance(value, str) and value else value
-
-
-def _comparable(trip: dict[str, Any]) -> dict[str, Any]:
-    out = {key: value for key, value in trip.items() if not key.startswith("_")}
-    for key in _TRIP_TIMES:
-        out[key] = _instant(out.get(key))
-    out["legs"] = [
-        {key: _instant(value) if key in _LEG_TIMES else value for key, value in leg.items()}
-        for leg in trip["legs"]
-    ]
-    return out
-
-
-Old = Callable[[], list[dict[str, Any]]]
-New = Callable[[], list[CanonicalJourney]]
-
-CASES: list[tuple[str, Old, New]] = [
-    (
-        "motis",
-        lambda: motis_client._itineraries_to_trips(fx.MOTIS_PLAN),
-        lambda: motis_adapter.journeys_from_plan(fx.MOTIS_PLAN, session_id="eu19"),
-    ),
-    (
-        "otp",
-        lambda: otp_client._normalise(fx.OTP_PLAN),
-        lambda: otp_adapter.journeys_from_plan(fx.OTP_PLAN, session_id="nap-ch-rail"),
-    ),
-    (
-        "hafas",
-        lambda: hafas_client._normalise_payload(fx.HAFAS_TRIP_SEARCH),
-        lambda: hafas_adapter.journeys_from_trip_search(fx.HAFAS_TRIP_SEARCH),
-    ),
-    (
-        "ojp",
-        lambda: ojp_client._normalise(fx.OJP_TRIP_DELIVERY),
-        lambda: ojp_adapter.journeys_from_trip_delivery(fx.OJP_TRIP_DELIVERY),
-    ),
-]
-
-
-@pytest.mark.parametrize(("provider", "old", "new"), CASES, ids=[case[0] for case in CASES])
-def test_the_adapter_carries_every_value_of_the_old_normaliser(
-    provider: str, old: Old, new: New
-) -> None:
-    old_trips = old()
-    new_trips = to_trip_dicts(new())
-    assert old_trips, "the fixture must give trips"
-    assert [_comparable(t) for t in new_trips] == [_comparable(t) for t in old_trips]
-
-
-@pytest.mark.parametrize(("provider", "old", "new"), CASES, ids=[case[0] for case in CASES])
-def test_the_transit_fingerprint_is_the_same_on_both(provider: str, old: Old, new: New) -> None:
-    old_fps = [transit_fingerprint(t["legs"]) for t in old()]
-    new_fps = [transit_fingerprint(t["legs"]) for t in to_trip_dicts(new())]
-    assert new_fps == old_fps
-
-
-def test_the_coverage_alignment_scores_the_same_on_both() -> None:
-    oebb = external_verify._parse_hafas_response(fx.HAFAS_TRIP_SEARCH).itineraries
-    for old, new in (CASES[0][1:], CASES[1][1:]):
-        assert compute_alignment(to_trip_dicts(new()), oebb) == compute_alignment(old(), oebb)
-
 
 # ── MOTIS ──────────────────────────────────────────────────────────────────────────────
 

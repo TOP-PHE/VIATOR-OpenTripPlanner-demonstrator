@@ -12,6 +12,19 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.journey.canonical import (
+    CanonicalJourney,
+    CanonicalLeg,
+    CanonicalLocation,
+    CanonicalService,
+    CanonicalStopPlace,
+    CanonicalTiming,
+    GeoPosition,
+    JourneySource,
+    TransportMode,
+)
+from app.journey.canonical.canonical_journey import Provider
+
 
 def epoch_ms(iso: str) -> int:
     return int(datetime.fromisoformat(iso).timestamp() * 1000)
@@ -488,3 +501,38 @@ OJP_TRIP_DELIVERY = """<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www
   </TimedLeg></Leg>
 </Trip></TripResult>
 </OJPTripDelivery></siri:ServiceDelivery></OJPResponse></OJP>"""
+
+
+def reference_journey(
+    provider: Provider, *, dep_iso: str, route: str, from_uic: str, to_uic: str
+) -> CanonicalJourney:
+    """A one-ride journey whose `transit_fingerprint` (on the bridge's legs) is set by
+    (route, from_uic, to_uic, departure minute): for the reference pagination tests, which
+    craft pages unique or duplicate by these inputs."""
+    at = CanonicalTiming(timetabled=datetime.fromisoformat(dep_iso))
+
+    def stop(uic: str) -> CanonicalLocation:
+        place = CanonicalStopPlace(ref=f"SBB:{uic}", source=f"{provider}:test", uic=uic)
+        return CanonicalLocation(
+            kind="stop", stop_place=place, position=GeoPosition(lat=46.948, lon=7.437)
+        )
+
+    leg = CanonicalLeg(
+        kind="timed",
+        origin=stop(from_uic),
+        destination=stop(to_uic),
+        departure=at,
+        arrival=at,
+        duration_seconds=1800,
+        service=CanonicalService(mode=TransportMode.RAIL, line=route, published_name=route),
+        source_mode="RAIL",
+    )
+    return CanonicalJourney(
+        id=f"{provider}:test:0",
+        source=JourneySource(provider=provider, role="reference", adapter_version=1),
+        legs=[leg],
+        departure=at,
+        arrival=at,
+        duration_seconds=1800,
+        source_transfer_count=0,
+    )

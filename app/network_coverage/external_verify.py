@@ -580,7 +580,7 @@ def _hafas_time_to_utc_iso(date: str | None, time_hhmm: str | None) -> str | Non
 def _hafas_cat_to_mode(cat: str | int | None) -> str:
     """PR-196a — map HAFAS product category ("ICE", "RJ", "S", "Bus")
     to the same RAIL/BUS/TRAM/SUBWAY/FERRY vocabulary VIATOR's OTP /
-    MOTIS clients emit. Matches `app.journey.hafas_client._map_cat_to_mode`
+    MOTIS clients emit. Matches `app.journey.canonical_adapters.hafas_adapter.map_category_to_mode`
     intentionally — the alignment scorer's fingerprint includes the
     mode in its hash, so any divergence here would silently break the
     exact-match path on every RAIL pair.

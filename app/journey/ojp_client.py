@@ -27,18 +27,17 @@ comparison live only; persistence is Phase 2 (design doc §5.4 / §9).
 from __future__ import annotations
 
 import logging
-import re
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from typing import Any
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+from .canonical import CanonicalJourney
+from .canonical_adapters import ojp_adapter
+from .canonical_adapters.trip_dict import to_trip_dicts
 from .trip_normalize import dedup_batch_and_track_latest_dep as _dedup_batch_and_track_latest_dep
-from .trip_normalize import first_transit_leg_departure_utc as _first_transit_leg_departure_utc
 from .trip_normalize import next_anchor_or_none as _next_anchor_or_none
 
 log = logging.getLogger(__name__)
@@ -56,18 +55,6 @@ log = logging.getLogger(__name__)
 # scheme constant so a security scanner doesn't misclassify a constant
 # namespace identifier as an insecure URL (SonarCloud encrypt-data).
 #
-# `xml.etree.ElementTree` is imported only for the `Element` *type* and
-# for navigating already-parsed trees (`.find` / `.iter` — safe). The
-# one place untrusted bytes are *parsed* uses `defusedxml`'s hardened
-# `fromstring` (see `_normalise`) — stdlib parsing is XXE-vulnerable.
-_NS_SCHEME = "http:"  # spec-mandated namespace scheme — not a fetched URL
-_OJP = f"{_NS_SCHEME}//www.vdv.de/ojp"
-_SIRI = f"{_NS_SCHEME}//www.siri.org.uk/siri"
-_NS = {"ojp": _OJP, "siri": _SIRI}
-
-# `siri:StopPointRef` is pulled from several leg sub-elements; the
-# literal lives here once (SonarCloud S1192).
-_STOP_POINT_REF = "siri:StopPointRef"
 
 # The Swiss OJP endpoint interprets a bare DepArrTime as local Swiss
 # time. The journey UI's datetime-local input is naive (no offset), so a
@@ -119,11 +106,6 @@ _TRIP_REQUEST = """<?xml version="1.0" encoding="utf-8"?>
     </siri:ServiceRequest>
   </OJPRequest>
 </OJP>"""
-
-_ISO_DURATION = re.compile(
-    r"^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?"
-    r"(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$"
-)
 
 
 # ─────────────────────────── request building ───────────────────────────
@@ -191,7 +173,7 @@ async def fetch_reference(
     from_name: str | None = None,
     to_name: str | None = None,
     num_results: int = 5,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[CanonicalJourney]]:
     """Call the external OJP endpoint. Returns (raw, trips_for_ui).
 
     Raises `httpx.HTTPError` on transport / non-2xx failure (the caller
@@ -219,7 +201,7 @@ async def fetch_reference(
     r.raise_for_status()
     text = r.text
     raw: dict[str, Any] = {"format": "ojp-xml", "body": text}
-    return raw, _normalise(text)
+    return raw, ojp_adapter.journeys_from_trip_delivery(text)
 
 
 # ─────────────────────── anchor-time pagination ─────────────────────────
@@ -240,7 +222,7 @@ async def fetch_reference_paginated(
     num_results: int = 5,
     target_window_seconds: int = 21600,
     max_pages: int = 4,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[CanonicalJourney], int, int]:
     """Call OJP `TripRequest` repeatedly with successively later anchor
     times until time-window coverage matches OTP's, OJP runs out of
     trips, or `max_pages` is reached. Returns `(trips, total_ms, pages)`.
@@ -283,7 +265,7 @@ async def fetch_reference_paginated(
     """
     target_end_ts = when.timestamp() + target_window_seconds
     anchor = when
-    all_trips: list[dict[str, Any]] = []
+    all_trips: list[CanonicalJourney] = []
     seen_fps: set[str] = set()
     total_ms = 0
     pages = 0
@@ -328,9 +310,9 @@ async def fetch_reference_paginated(
 async def _fetch_one_page(
     anchor: datetime,
     fetch_kwargs: dict[str, Any],
-    partial: list[dict[str, Any]],
+    partial: list[CanonicalJourney],
     page_num: int,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[CanonicalJourney], bool]:
     """Call fetch_reference once. Returns (batch, stop).
 
     `stop=True` signals the paginator to return immediately with the
@@ -361,313 +343,11 @@ async def _fetch_one_page(
 # ───────────────────────────── response parse ───────────────────────────
 
 
-def _normalise(xml_text: str) -> list[dict[str, Any]]:
-    """Parse an OJP `OJPTripDelivery` XML body into VIATOR's trip-dict shape.
-
-    Output matches `otp_client._normalise` so the journey UI renders OJP
-    reference trips with the same code path: `duration_seconds`,
-    `num_transfers`, `departure_at`/`arrival_at` (UTC ISO), `modes`,
-    `legs[]` (each leg carrying the same keys OTP legs do).
-
-    Defensive throughout — a malformed body, a missing element, or an
-    OJP error payload (which has no `<TripResult>`) all degrade to `[]`
-    rather than raising.
-    """
-    try:
-        root = _xml_fromstring(xml_text)
-    except (ET.ParseError, ValueError):
-        # ET.ParseError → malformed XML. defusedxml raises ValueError
-        # subclasses (EntitiesForbidden, …) if the payload attempts an
-        # XML attack — either way there are no usable trips.
-        log.warning("OJP response did not parse as safe XML (%d bytes)", len(xml_text))
-        return []
-
-    places = _index_places(root)
-    out: list[dict[str, Any]] = []
-    for trip in root.iter(f"{{{_OJP}}}Trip"):
-        legs_norm: list[dict[str, Any]] = []
-        modes_set: list[str] = []
-        for leg in trip.findall("ojp:Leg", _NS):
-            norm = _normalise_leg(leg, places)
-            if norm is None:
-                continue
-            legs_norm.append(norm)
-            if norm.get("mode"):
-                modes_set.append(norm["mode"])
-        out.append(
-            {
-                "duration_seconds": _iso_duration_to_seconds(
-                    trip.findtext("ojp:Duration", default="", namespaces=_NS)
-                ),
-                "num_transfers": _int_or_zero(
-                    trip.findtext("ojp:Transfers", default="", namespaces=_NS)
-                ),
-                "departure_at": _iso_to_utc_iso(
-                    trip.findtext("ojp:StartTime", default="", namespaces=_NS)
-                )
-                or "",
-                "arrival_at": _iso_to_utc_iso(
-                    trip.findtext("ojp:EndTime", default="", namespaces=_NS)
-                )
-                or "",
-                "modes": ",".join(sorted(set(modes_set))),
-                "legs": legs_norm,
-                # PR-3 — first transit-leg boarding time in UTC ISO.
-                # Same contract as OTP / MOTIS — the coverage runner
-                # filters trips on this field, not on `departure_at`
-                # (which is the itinerary START, often a walking
-                # ContinuousLeg). See app/journey/trip_normalize.py.
-                "first_transit_leg_departure_utc": _first_transit_leg_departure_utc(legs_norm),
-            }
-        )
-    return out
-
-
-def _index_places(root: ET.Element) -> dict[str, dict[str, Any]]:
-    """Build `{stopRef: {name, lat, lon}}` from `TripResponseContext/Places`.
-
-    Legs reference stops by `siri:StopPointRef` / `StopPlaceRef`; the
-    coordinates live once, here, in the place dictionary.
-    """
-    index: dict[str, dict[str, Any]] = {}
-    for place in root.iter(f"{{{_OJP}}}Place"):
-        name = place.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
-        geo = place.find("ojp:GeoPosition", _NS)
-        lat = (
-            _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS))
-            if geo is not None
-            else None
-        )
-        lon = (
-            _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS))
-            if geo is not None
-            else None
-        )
-        # A Place is one of StopPlace / StopPoint / TopographicPlace; the
-        # first two carry the refs the legs use.
-        for ref in (
-            place.findtext("ojp:StopPlace/ojp:StopPlaceRef", namespaces=_NS),
-            place.findtext("ojp:StopPoint/siri:StopPointRef", namespaces=_NS),
-        ):
-            if ref:
-                index[ref] = {"name": name, "lat": lat, "lon": lon}
-    return index
-
-
-def _normalise_leg(leg: ET.Element, places: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    """Normalise one `<Leg>` — a Leg wraps exactly one of ContinuousLeg /
-    TimedLeg / TransferLeg."""
-    leg_duration = _iso_duration_to_seconds(
-        leg.findtext("ojp:Duration", default="", namespaces=_NS)
-    )
-
-    timed = leg.find("ojp:TimedLeg", _NS)
-    if timed is not None:
-        return _normalise_timed_leg(timed, leg_duration, places)
-
-    cont = leg.find("ojp:ContinuousLeg", _NS)
-    if cont is not None:
-        return _normalise_walk_leg(cont, leg_duration, places, mode="WALK")
-
-    transfer = leg.find("ojp:TransferLeg", _NS)
-    if transfer is not None:
-        return _normalise_walk_leg(transfer, leg_duration, places, mode="WALK")
-
-    return None  # unknown leg variant — skip rather than guess
-
-
-def _blank_leg() -> dict[str, Any]:
-    """A leg dict with every key the journey UI expects, defaulted."""
-    return {
-        "mode": None,
-        "departure": None,
-        "arrival": None,
-        "duration_seconds": 0,
-        "distance_meters": 0.0,
-        "from_name": None,
-        "from_lat": None,
-        "from_lon": None,
-        "from_stop_id": None,
-        "to_name": None,
-        "to_lat": None,
-        "to_lon": None,
-        "to_stop_id": None,
-        "route_short_name": None,
-        "route_long_name": None,
-        "route_id": None,
-        "agency_name": None,
-        "agency_id": None,
-        "agency_url": None,
-        # feed_id drives the operator badge in the journey UI; tagging
-        # every OJP leg "OJP" makes the reference panel visually distinct.
-        "feed_id": "OJP",
-        "trip_id": None,
-        "trip_headsign": None,
-    }
-
-
-def _normalise_timed_leg(
-    timed: ET.Element, leg_duration: int, places: dict[str, dict[str, Any]]
-) -> dict[str, Any]:
-    out = _blank_leg()
-    out["duration_seconds"] = leg_duration
-
-    board = timed.find("ojp:LegBoard", _NS)
-    alight = timed.find("ojp:LegAlight", _NS)
-    svc = timed.find("ojp:Service", _NS)
-
-    if board is not None:
-        ref = board.findtext(_STOP_POINT_REF, namespaces=_NS)
-        out["from_stop_id"] = ref
-        out["from_name"] = board.findtext(
-            "ojp:StopPointName/ojp:Text", default=None, namespaces=_NS
-        ) or _place_name(places, ref)
-        out["from_lat"], out["from_lon"] = _place_coords(places, ref)
-        out["departure"] = _iso_to_utc_iso(
-            board.findtext("ojp:ServiceDeparture/ojp:TimetabledTime", default="", namespaces=_NS)
-        )
-    if alight is not None:
-        ref = alight.findtext(_STOP_POINT_REF, namespaces=_NS)
-        out["to_stop_id"] = ref
-        out["to_name"] = alight.findtext(
-            "ojp:StopPointName/ojp:Text", default=None, namespaces=_NS
-        ) or _place_name(places, ref)
-        out["to_lat"], out["to_lon"] = _place_coords(places, ref)
-        out["arrival"] = _iso_to_utc_iso(
-            alight.findtext("ojp:ServiceArrival/ojp:TimetabledTime", default="", namespaces=_NS)
-        )
-    if svc is not None:
-        # PtMode is the canonical mode ("rail" / "bus" / "tram" …) — upper
-        # it to match VIATOR's "RAIL" / "BUS" / "WALK" vocabulary.
-        ptmode = svc.findtext("ojp:Mode/ojp:PtMode", default="", namespaces=_NS)
-        out["mode"] = ptmode.upper() if ptmode else "TRANSIT"
-        out["route_short_name"] = svc.findtext(
-            "ojp:PublishedServiceName/ojp:Text", default=None, namespaces=_NS
-        ) or svc.findtext("ojp:PublicCode", default=None, namespaces=_NS)
-        out["route_long_name"] = svc.findtext(
-            "ojp:ProductCategory/ojp:Name/ojp:Text", default=None, namespaces=_NS
-        )
-        out["route_id"] = svc.findtext("siri:LineRef", default=None, namespaces=_NS)
-        out["agency_id"] = svc.findtext("siri:OperatorRef", default=None, namespaces=_NS)
-        out["trip_id"] = svc.findtext("ojp:JourneyRef", default=None, namespaces=_NS)
-        out["trip_headsign"] = svc.findtext(
-            "ojp:DestinationText/ojp:Text", default=None, namespaces=_NS
-        )
-    return out
-
-
-def _normalise_walk_leg(
-    leg: ET.Element, leg_duration: int, places: dict[str, dict[str, Any]], *, mode: str
-) -> dict[str, Any]:
-    """ContinuousLeg / TransferLeg — both are walk-class with LegStart/LegEnd
-    that may be a GeoPosition or a StopPointRef."""
-    out = _blank_leg()
-    out["mode"] = mode
-    out["duration_seconds"] = leg_duration
-    out["distance_meters"] = _float_or_none(leg.findtext("ojp:Length", namespaces=_NS)) or 0.0
-
-    start = leg.find("ojp:LegStart", _NS)
-    end = leg.find("ojp:LegEnd", _NS)
-    if start is not None:
-        name, lat, lon, ref = _leg_endpoint(start, places)
-        out["from_name"], out["from_lat"], out["from_lon"], out["from_stop_id"] = (
-            name,
-            lat,
-            lon,
-            ref,
-        )
-    if end is not None:
-        name, lat, lon, ref = _leg_endpoint(end, places)
-        out["to_name"], out["to_lat"], out["to_lon"], out["to_stop_id"] = (
-            name,
-            lat,
-            lon,
-            ref,
-        )
-    return out
-
-
-def _leg_endpoint(
-    el: ET.Element, places: dict[str, dict[str, Any]]
-) -> tuple[str | None, float | None, float | None, str | None]:
-    """A LegStart/LegEnd is either an inline GeoPosition or a StopPointRef
-    resolved via the Places dictionary. Returns (name, lat, lon, stop_ref)."""
-    name = el.findtext("ojp:Name/ojp:Text", default=None, namespaces=_NS)
-    ref = el.findtext(_STOP_POINT_REF, default=None, namespaces=_NS)
-    geo = el.find("ojp:GeoPosition", _NS)
-    if geo is not None:
-        return (
-            name,
-            _float_or_none(geo.findtext("siri:Latitude", namespaces=_NS)),
-            _float_or_none(geo.findtext("siri:Longitude", namespaces=_NS)),
-            ref,
-        )
-    if ref:
-        lat, lon = _place_coords(places, ref)
-        return (name or _place_name(places, ref), lat, lon, ref)
-    return (name, None, None, ref)
-
-
 # ───────────────────────────── small helpers ────────────────────────────
 
 
-def _place_name(places: dict[str, dict[str, Any]], ref: str | None) -> str | None:
-    return places.get(ref or "", {}).get("name")
-
-
-def _place_coords(
-    places: dict[str, dict[str, Any]], ref: str | None
-) -> tuple[float | None, float | None]:
-    p = places.get(ref or "", {})
-    return p.get("lat"), p.get("lon")
-
-
-def _iso_duration_to_seconds(value: str | None) -> int:
-    """Parse an ISO-8601 duration (`PT1H9M`, `PT4M`, `PT0S`, …) to whole
-    seconds. OJP trip/leg durations are always the `PT…` time form, but
-    the regex tolerates the date components too. Unparseable → 0."""
-    if not value:
-        return 0
-    m = _ISO_DURATION.match(value.strip())
-    if not m:
-        return 0
-    # Years / months (groups 1-2) are calendar-ambiguous and never
-    # appear in a trip/leg duration - ignored rather than guessed.
-    _, _, weeks, days, hours, minutes, seconds = m.groups()
-    total = 0.0
-    total += int(days or 0) * 86400
-    total += int(weeks or 0) * 604800
-    total += int(hours or 0) * 3600
-    total += int(minutes or 0) * 60
-    total += float(seconds or 0)
-    return int(total)
-
-
-def _iso_to_utc_iso(value: str | None) -> str | None:
-    """OJP times (`2026-05-18T08:26:00Z`, or with an offset) → UTC ISO,
-    the same shape `otp_client` produces. Naive input is assumed UTC."""
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(value.strip())
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-
-
-def _int_or_zero(value: str | None) -> int:
-    try:
-        return int((value or "").strip())
-    except (TypeError, ValueError):
-        return 0
-
-
-def _float_or_none(value: str | None) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value.strip())
-    except (TypeError, ValueError):
-        return None
+def _normalise(xml_text: str) -> list[dict[str, Any]]:
+    """Today's trip dicts for an `OJPTripDelivery` body, built through the canonical adapter
+    (`canonical_adapters.ojp_adapter` parses it, with `defusedxml`) and the temporary
+    `trip_dict` bridge (#303 PR 3a). A malformed or unsafe body gives `[]`."""
+    return to_trip_dicts(ojp_adapter.journeys_from_trip_delivery(xml_text))

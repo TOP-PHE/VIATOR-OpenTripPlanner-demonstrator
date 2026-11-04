@@ -20,15 +20,18 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
-from app.journey.ojp_client import (
-    _build_trip_request,
+from app.journey.canonical_adapters._common import parse_instant
+from app.journey.canonical_adapters.ojp_adapter import (
     _float_or_none,
     _int_or_zero,
     _iso_duration_to_seconds,
-    _iso_to_utc_iso,
+)
+from app.journey.ojp_client import (
+    _build_trip_request,
     _normalise,
     _reference_departure,
 )
+from tests.unit.canonical_fixtures import reference_journey
 
 # ─────────────────── _iso_duration_to_seconds ───────────────────
 
@@ -58,23 +61,26 @@ class TestIsoDurationToSeconds:
         assert _iso_duration_to_seconds("1H9M") == 0  # missing leading P
 
 
-# ─────────────────── _iso_to_utc_iso ───────────────────
+# ─────────────────── OJP times (parse_instant) ───────────────────
+# The parsing moved to the canonical adapter (#303 PR 3a); OJP times read as UTC instants.
 
 
-class TestIsoToUtcIso:
-    def test_zulu_passthrough(self):
-        assert _iso_to_utc_iso("2026-05-18T08:26:00Z") == "2026-05-18T08:26:00+00:00"
+class TestParseInstant:
+    def test_zulu(self):
+        assert parse_instant("2026-05-18T08:26:00Z") == datetime(2026, 5, 18, 8, 26, tzinfo=UTC)
 
     def test_offset_converted_to_utc(self):
-        assert _iso_to_utc_iso("2026-05-18T10:26:00+02:00") == "2026-05-18T08:26:00+00:00"
+        assert parse_instant("2026-05-18T10:26:00+02:00") == datetime(
+            2026, 5, 18, 8, 26, tzinfo=UTC
+        )
 
     def test_naive_assumed_utc(self):
-        assert _iso_to_utc_iso("2026-05-18T08:26:00") == "2026-05-18T08:26:00+00:00"
+        assert parse_instant("2026-05-18T08:26:00") == datetime(2026, 5, 18, 8, 26, tzinfo=UTC)
 
     def test_none_and_garbage(self):
-        assert _iso_to_utc_iso(None) is None
-        assert _iso_to_utc_iso("") is None
-        assert _iso_to_utc_iso("not-a-time") is None
+        assert parse_instant(None) is None
+        assert parse_instant("") is None
+        assert parse_instant("not-a-time") is None
 
 
 # ─────────────────── small helpers ───────────────────
@@ -287,33 +293,10 @@ class TestNormalise:
 # ─────────────────── fetch_reference_paginated ───────────────────
 
 
-def _make_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str) -> dict:
-    """A minimal trip dict whose transit_fingerprint is determined by
-    (route, from_uic, to_uic, dep_minute). Lets us craft batches that
-    are unique by these inputs without building real XML."""
-    return {
-        "duration_seconds": 1800,
-        "num_transfers": 0,
-        "departure_at": dep_iso,
-        "arrival_at": dep_iso,  # not used by fingerprint
-        "modes": "RAIL",
-        "legs": [
-            {
-                "mode": "RAIL",
-                "from_lat": 46.948,
-                "from_lon": 7.437,
-                "to_lat": 47.378,
-                "to_lon": 8.537,
-                "from_stop_id": f"SBB:{from_uic}",
-                "to_stop_id": f"SBB:{to_uic}",
-                "departure": dep_iso,
-                "arrival": dep_iso,
-                "route_short_name": route,
-                "feed_id": "OJP",
-            }
-        ],
-        "feed_id": "OJP",
-    }
+def _make_trip(*, dep_iso: str, route: str, from_uic: str, to_uic: str):
+    """A one-ride ojp journey whose `transit_fingerprint` is set by
+    (route, from_uic, to_uic, dep_minute), for the pagination tests."""
+    return reference_journey("ojp", dep_iso=dep_iso, route=route, from_uic=from_uic, to_uic=to_uic)
 
 
 class TestFetchReferencePaginated:
@@ -580,7 +563,7 @@ class TestFetchReferencePaginated:
         # would be 07:01, still well inside 6h window), which returns
         # the same response as page 2 → all dups → stop.
         assert len(trips) == 2  # A + B, no duplicate A
-        routes = sorted(t["legs"][0]["route_short_name"] for t in trips)
+        routes = sorted(t.legs[0].service.line for t in trips)
         assert routes == ["IC1", "IR15"]
         assert pages >= 2  # at least the dedup-tested pages happened
 

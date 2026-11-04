@@ -16,8 +16,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..canonical import CanonicalJourney, CanonicalLeg, CanonicalLocation, CanonicalTiming
-from ..motis_client import _feed_id_from_motis_id
 from ..trip_normalize import first_transit_leg_departure_utc
+from .motis_adapter import feed_id_from_motis_id
 
 _SOURCE_FEED = {"hafas": "fahrplan.oebb.at", "ojp": "OJP"}
 
@@ -61,7 +61,7 @@ def _feed_id(leg: CanonicalLeg, provider: str) -> str | None:
         return _SOURCE_FEED[provider]
     if provider == "motis":
         stop = leg.origin.stop_place
-        return _feed_id_from_motis_id(stop.ref if stop is not None else None)
+        return feed_id_from_motis_id(stop.ref if stop is not None else None)
     return leg.service.feed if leg.service is not None else None
 
 
