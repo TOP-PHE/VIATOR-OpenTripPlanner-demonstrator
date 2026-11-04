@@ -30,6 +30,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.network_coverage import oebb_journeys
+from tests.unit import canonical_fixtures as fx
+
 # ─────────────────────── DB stubs ───────────────────────
 
 
@@ -63,7 +66,7 @@ def _result_row(origin, dest, status="ok", journey_search_id=None, **extra):
     # Pydantic validators on CellTripsDirection reject the auto-mocked
     # child MagicMock; explicit None matches the legacy / un-swept row
     # shape.
-    r.external_itineraries = extra.get("external_itineraries")
+    r.external_journeys = extra.get("external_journeys")
     r.external_alignment_score = extra.get("external_alignment_score")
     r.external_alignment_tier = extra.get("external_alignment_tier")
     return r
@@ -292,27 +295,28 @@ def test_get_cell_trips_round_trips_alignment_fields_into_response(monkeypatch):
     from app.api.admin import network_coverage as api
 
     run = _run_row(direction="single")
-    fake_itinerary = {
-        "legs": [
-            {
-                "mode": "RAIL",
-                "from_uic": "UIC:8014441",
-                "to_uic": "UIC:8503000",
-                "dep_utc": "2026-06-28T08:00",
-                "arr_utc": "2026-06-28T12:30",
-                "route_name": "ICE 24",
-            }
-        ],
-        "departure_at": "2026-06-28T08:00",
-        "arrival_at": "2026-06-28T12:30",
-        "duration_seconds": 4 * 3600 + 30 * 60,
-        "num_transfers": 0,
-    }
+    # ÖBB's answer as the sweep stores it since #303 PR 4a: canonical journeys.
+    stored = [
+        journey.model_dump(mode="json")
+        for journey in fx.oebb_journeys(
+            [
+                {
+                    "mode": "RAIL",
+                    "cat": "ICE",
+                    "from_uic": "UIC:8014441",
+                    "to_uic": "UIC:8503000",
+                    "dep": "2026-06-28T08:00",
+                    "arr": "2026-06-28T12:30",
+                    "route": "ICE 24",
+                }
+            ]
+        )
+    ]
     out_row = _result_row(
         "bxl-mid",
         "gva-c",
         status="ok",
-        external_itineraries=[fake_itinerary],
+        external_journeys=stored,
         external_alignment_score=0.7,
         external_alignment_tier="mostly_agree",
     )
@@ -331,7 +335,17 @@ def test_get_cell_trips_round_trips_alignment_fields_into_response(monkeypatch):
     assert resp.outbound is not None
     assert resp.outbound.external_alignment_score == 0.7
     assert resp.outbound.external_alignment_tier == "mostly_agree"
-    assert resp.outbound.external_itineraries == [fake_itinerary]
+    # Served in the itinerary shape the modal reads (until PR 4b), times as Vienna wall clock.
+    assert resp.outbound.external_itineraries == oebb_journeys.stored_itineraries(stored)
+    (itinerary,) = resp.outbound.external_itineraries
+    assert (itinerary["departure_at"], itinerary["arrival_at"]) == (
+        "2026-06-28T08:00",
+        "2026-06-28T12:30",
+    )
+    (leg,) = itinerary["legs"]
+    assert (leg["mode"], leg["route_name"]) == ("RAIL", "ICE 24")
+    assert (leg["from_uic"], leg["to_uic"]) == ("UIC:8014441", "UIC:8503000")
+    assert (leg["dep_utc"], leg["arr_utc"]) == ("2026-06-28T08:00", "2026-06-28T12:30")
 
 
 def test_get_cell_trips_rejects_unknown_alignment_tier(monkeypatch):

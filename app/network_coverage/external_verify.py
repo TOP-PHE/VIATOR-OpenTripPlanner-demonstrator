@@ -85,7 +85,7 @@ _UIC_RE = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
 # Deliberate twin of `app/journey/signature.py::_CANONICAL_TOKEN_RE`. This
 # module deliberately imports nothing from `app.journey` (the dependency
 # direction #242's diagrams document), so the vocabulary is duplicated rather
-# than shared — same pattern as the `_hafas_cat_to_mode` twin. Kept honest by
+# than shared. Kept honest by
 # `test_canonical_token_vocabulary_agrees_across_modules`.
 _SCHEME_UIC = "UIC:"  # normalised into the shared cross-engine UIC namespace
 _SCHEME_OEBB = "OEBB:"  # a real ÖBB station id we could NOT place in that namespace
@@ -157,26 +157,20 @@ _HAFAS_ERROR_MESSAGES: dict[str, str] = {
 
 
 class VerifyLeg(BaseModel):
-    """PR-196a — one transit-leg fragment of an ÖBB-side itinerary.
+    """One leg of ÖBB's answer as the coverage cell modal reads it (until #303 PR 4b).
 
-    Lean enough to be persisted as JSONB on every coverage cell without
-    blowing up row size — only the fields the alignment scorer needs
-    (mode for WALK-strip + leg identity) and the modal renderer wants
-    (route_name for the operator-readable train number). Walk legs
-    carry mode='WALK' so the alignment scorer can drop them with the
-    same predicate that handles VIATOR-side trips.
+    Built from ÖBB's canonical journey by `oebb_journeys.itinerary`, never stored: since #303
+    PR 4a the result row keeps the journeys (`external_journeys`). The fields keep the names the
+    modal reads:
 
-    `from_uic` / `to_uic` keep their names for JSONB compatibility, but the
-    value is a **token** from :func:`oebb_stop_id`, not necessarily a UIC:
-    `UIC:NNNNNNN`, or `OEBB:<payload>` for a real ÖBB id we could not place in
-    the shared namespace, or None for no id at all.
-
-    The `*_id_raw` / `*_name` / `*_id_source` fields are the provenance
-    half of CLAUDE.md §7 item 7, landed here deliberately: they cost ~90 bytes
-    a leg against the ~1.7 KB/trip baseline, and adding them later would mean a
-    second ~14 h re-sweep for zero saving. `_id_raw` is what a future
-    `master_stations` pass joins on to correct a heuristically-labelled token
-    without re-sweeping. All optional so legacy JSONB rows still validate."""
+    - `from_uic` / `to_uic`: a stop **token** from :func:`oebb_stop_id`, not necessarily a UIC:
+      `UIC:NNNNNNN`, or `OEBB:<payload>` for a real ÖBB id we could not place in the shared
+      namespace, or None for no id at all;
+    - `dep_utc` / `arr_utc`: **Europe/Vienna wall clock** to the minute, despite the names (the
+      modal was written for that form);
+    - `*_id_raw` / `*_id_source`: the id the token came from and its field (`extid`, `lid_L`),
+      which the modal sends to the station module to name the stop.
+    """
 
     mode: str
     from_uic: str | None = None
@@ -193,19 +187,8 @@ class VerifyLeg(BaseModel):
 
 
 class VerifyItinerary(BaseModel):
-    """PR-196a — one ÖBB-side itinerary captured during the verify sweep.
-
-    Lives on the coverage cell row (in `external_itineraries` JSONB) so
-    the matrix-cell modal can render the ÖBB side without re-querying
-    HAFAS. Shape kept narrow — just enough for alignment scoring (legs
-    list) and human display (departure / arrival / duration). Anything
-    fancier (fares, stop-list polylines) belongs on the live verify
-    endpoint, not in the persisted matrix.
-
-    `legs` is ordered start→end and includes WALK / TRANSFER entries;
-    the alignment scorer strips those before fingerprinting so a HAFAS
-    response that wraps a transfer in an explicit walk leg still
-    fingerprints identically to a VIATOR trip that doesn't."""
+    """One ÖBB connection as the coverage cell modal reads it (until #303 PR 4b); built by
+    `oebb_journeys.itinerary`. `legs` is ordered start→end and includes the walks."""
 
     legs: list[VerifyLeg] = Field(default_factory=list)
     departure_at: str | None = None
@@ -224,11 +207,8 @@ class VerifyResult(BaseModel):
     `ok=False` with `error` set means we couldn't reach the external
     backend; the verdict is "unknown" not "no route".
 
-    PR-196a — `itineraries` carries the per-trip detail extracted from
-    HAFAS's outConL. Empty on every error branch and on a clean
-    no-route answer (HAFAS H890); populated to the same `num_connections`
-    on ok=True so the alignment scorer + modal renderer have the same
-    data the verdict was summarised from.
+    `itineraries` is filled only by the click-to-verify endpoint, from ÖBB's canonical journeys
+    (`oebb_journeys.itinerary`), for the modal; the verdict itself carries none (#303 PR 4a).
     """
 
     source: str
@@ -240,9 +220,7 @@ class VerifyResult(BaseModel):
     # "external said no". UI renders this as a yellow warning, not a
     # red/green verdict.
     error: str | None = None
-    # PR-196a — per-itinerary breakdown for the alignment heatmap. Empty
-    # on every error / no-route branch; populated to len == num_connections
-    # on ok=True.
+    # ÖBB's connections in the modal's shape (click-to-verify only).
     itineraries: list[VerifyItinerary] = Field(default_factory=list)
 
 
@@ -555,216 +533,19 @@ def _parse_hafas_duration(value: str | None) -> int | None:
         return None
 
 
-def _hafas_time_to_utc_iso(date: str | None, time_hhmm: str | None) -> str | None:
-    """PR-196a — coarse HAFAS time → ISO string for the alignment scorer.
-
-    HAFAS encodes dep/arr times as HHMM strings hung off a YYYYMMDD
-    service-date anchor. The alignment scorer only needs the time-of-day
-    for the ±5min fuzzy fallback, so this returns a naive
-    `YYYY-MM-DDTHH:MM` string rather than threading the
-    Europe/Vienna→UTC conversion the hafas_client does for the journey
-    UI. Returns None on garbage so the alignment scorer treats the leg
-    as unmatchable rather than panic-attributing it to midnight.
-    """
-    if not date or not time_hhmm or len(date) < 8:
-        return None
-    t = time_hhmm.zfill(4)
-    if len(t) < 4:
-        return None
-    try:
-        return f"{date[0:4]}-{date[4:6]}-{date[6:8]}T{t[0:2]}:{t[2:4]}"
-    except (ValueError, IndexError):  # pragma: no cover — guarded above
-        return None
-
-
-def _hafas_cat_to_mode(cat: str | int | None) -> str:
-    """PR-196a — map HAFAS product category ("ICE", "RJ", "S", "Bus")
-    to the same RAIL/BUS/TRAM/SUBWAY/FERRY vocabulary VIATOR's OTP /
-    MOTIS clients emit. Matches `app.journey.canonical_adapters.hafas_adapter.map_category_to_mode`
-    intentionally — the alignment scorer's fingerprint includes the
-    mode in its hash, so any divergence here would silently break the
-    exact-match path on every RAIL pair.
-
-    Mirroring the production mapper rather than importing it keeps the
-    coverage subpackage free of a journey-package import (cyclic risk —
-    journey already imports `external_verify` for the HAFAS adapter).
-    """
-    # HAFAS occasionally returns `cat` as an int (a numeric product code)
-    # rather than a string abbreviation — str() first so `.upper()` never
-    # raises AttributeError on those responses (was crashing every
-    # verify-sweep call for the affected products, silently caught
-    # per-cell as external_error='sweep_exception').
-    cat_upper = str(cat or "").upper()
-    if not cat_upper:
-        return "TRANSIT"
-    if "BUS" in cat_upper:
-        return "BUS"
-    if "TRAM" in cat_upper or cat_upper == "STR":
-        return "TRAM"
-    if "METRO" in cat_upper or "SUBWAY" in cat_upper or cat_upper in ("U", "U-BAHN"):
-        return "SUBWAY"
-    if "FERRY" in cat_upper or cat_upper in ("SHIP", "BOAT"):
-        return "FERRY"
-    # Big rail bucket — anything that looks like a train.
-    return "RAIL"
-
-
-def _lookup_indexed(idx: Any, table: dict[int, dict[str, Any]]) -> dict[str, Any]:
-    """`table[idx]` when `idx` is an int and present, else `{}`. Keeps
-    the HAFAS parsing helpers branchless on the index typing — HAFAS
-    occasionally returns null/missing `locX` / `prodX` indices and we
-    want a uniform empty-dict fallback rather than a sprinkle of
-    isinstance() checks at every call site."""
-    if not isinstance(idx, int):
-        return {}
-    return table.get(idx) or {}
-
-
-def _resolve_section_mode_and_route(
-    sec_type: str,
-    jny: dict[str, Any] | None,
-    products: dict[int, dict[str, Any]],
-) -> tuple[str, str | None]:
-    """`(mode, route_name)` for one HAFAS `secL` section.
-
-    - ``JNY``: mode comes from the product category, route_name is the
-      train number ("RJ 1141") with `line` (short code) as fallback for
-      regional carriers that don't populate `name`.
-    - ``WALK`` / ``TRSF``: ``("WALK", None)`` so the alignment scorer
-      strips it uniformly across HAFAS / MOTIS / VIATOR.
-    - anything else: ``("TRANSIT", None)`` — unknown sections aren't
-      walks (scorer keeps them) but aren't over-claimed as RAIL either.
-    """
-    if sec_type == "JNY":
-        prod = _lookup_indexed((jny or {}).get("prodX"), products)
-        return _hafas_cat_to_mode(prod.get("cat")), prod.get("name") or prod.get("line")
-    if sec_type in ("WALK", "TRSF"):
-        return "WALK", None
-    return "TRANSIT", None
-
-
-def _build_leg_from_section(
-    sec: dict[str, Any],
-    date: str | None,
-    locations: dict[int, dict[str, Any]],
-    products: dict[int, dict[str, Any]],
-) -> VerifyLeg | None:
-    """One HAFAS `secL` entry → one VerifyLeg, or None when the section
-    has no valid dep/arr endpoints (skip rather than emit a half-
-    populated leg the scorer would have to special-case)."""
-    sec_type = (sec.get("type") or "").upper()
-    dep = sec.get("dep") or {}
-    arr = sec.get("arr") or {}
-    if not dep or not arr:
-        return None
-    dep_loc = _lookup_indexed(dep.get("locX"), locations)
-    arr_loc = _lookup_indexed(arr.get("locX"), locations)
-    mode, route_name = _resolve_section_mode_and_route(sec_type, sec.get("jny"), products)
-    # `oebb_stop_id`, NOT `extract_uic` — the latter is a `.search()` over the
-    # whole lid and returns the X longitude. See both docstrings.
-    dep_id = oebb_stop_id(dep_loc.get("ext_id"), lid=dep_loc.get("lid"))
-    arr_id = oebb_stop_id(arr_loc.get("ext_id"), lid=arr_loc.get("lid"))
-    return VerifyLeg(
-        mode=mode,
-        from_uic=dep_id.token,
-        to_uic=arr_id.token,
-        dep_utc=_hafas_time_to_utc_iso(date, dep.get("dTimeS")),
-        arr_utc=_hafas_time_to_utc_iso(date, arr.get("aTimeS")),
-        route_name=route_name,
-        from_id_raw=dep_id.raw,
-        to_id_raw=arr_id.raw,
-        from_name=dep_loc.get("name"),
-        to_name=arr_loc.get("name"),
-        from_id_source=dep_id.source,
-        to_id_source=arr_id.source,
-    )
-
-
-def _build_itinerary_from_connection(
-    conn: dict[str, Any],
-    locations: dict[int, dict[str, Any]],
-    products: dict[int, dict[str, Any]],
-) -> VerifyItinerary:
-    """PR-196a — one HAFAS `outConL` entry → one persisted VerifyItinerary.
-
-    Walks every `secL` section via `_build_leg_from_section`. JNY → transit
-    leg with product line as `route_name` + RAIL/BUS/... mode mapped from
-    the product category, WALK/TRSF → mode='WALK' so the alignment scorer
-    can strip uniformly across HAFAS / MOTIS / VIATOR. Endpoints carry a
-    :func:`oebb_stop_id` token — `UIC:NNNNNNN` when the station's id
-    normalises into the shared namespace (the common case for mainline rail),
-    `OEBB:<payload>` when it is a real ÖBB id that does not (Wien Hbf's bus
-    terminal), or None when there is no id at all.
-    """
-    date = conn.get("date")
-    legs: list[VerifyLeg] = []
-    for sec in conn.get("secL") or []:
-        leg = _build_leg_from_section(sec, date, locations, products)
-        if leg is not None:
-            legs.append(leg)
-    dep_node = conn.get("dep") or {}
-    arr_node = conn.get("arr") or {}
-    chg = conn.get("chg")
-    return VerifyItinerary(
-        legs=legs,
-        departure_at=_hafas_time_to_utc_iso(date, dep_node.get("dTimeS")),
-        arrival_at=_hafas_time_to_utc_iso(date, arr_node.get("aTimeS")),
-        duration_seconds=_parse_hafas_duration(conn.get("dur")),
-        num_transfers=chg if isinstance(chg, int) else None,
-    )
-
-
-def _index_hafas_locations(loc_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    """PR-196a — `{idx: {lid, name, ext_id}}` from `common.locL`.
-
-    `ext_id` is the station id HAFAS supplies as a clean field beside the lid
-    (present on 7/7 entries in the live probe). **Dropping it here was the
-    proximate cause of the endpoint-identity bug**: it was discarded one line
-    before `_build_leg_from_section` — the only caller — had to fall back to
-    scraping the lid, which returned a longitude. Pinned by
-    `test_index_hafas_locations_keeps_ext_id`.
-
-    Still a subset of the hafas_client.py index: the alignment scorer needs
-    identity and a display name, not the coords."""
-    return {
-        i: {"lid": loc.get("lid"), "name": loc.get("name"), "ext_id": loc.get("extId")}
-        for i, loc in enumerate(loc_l)
-    }
-
-
-def _index_hafas_products(prod_l: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    """PR-196a — `{idx: {name, line, cat}}` from `common.prodL`. Subset of
-    the hafas_client.py index — the alignment scorer needs name + line
-    (= the train-number-guarded fuzzy fallback key) plus cat (the
-    operator-product category that drives RAIL/BUS/... mode mapping)."""
-    return {
-        i: {
-            "name": prod.get("name"),
-            "line": prod.get("addName") or prod.get("nameS"),
-            "cat": (prod.get("prodCtx") or {}).get("catOut") or prod.get("cls"),
-        }
-        for i, prod in enumerate(prod_l)
-    }
-
-
-def _summarise_connections(
-    connections: list[dict[str, Any]], common: dict[str, Any] | None = None
-) -> VerifyResult:
+def _summarise_connections(connections: list[dict[str, Any]]) -> VerifyResult:
     """Reduce a HAFAS `outConL` list to a single VerifyResult.
 
     `best_duration_seconds` is the minimum of the returned connections
     (HAFAS doesn't guarantee they're sorted shortest-first; ranking
     differs between profiles).
 
-    PR-196a — when `common` (the HAFAS `res.common` block carrying
-    `locL` + `prodL`) is supplied, each connection is also normalised
-    into a VerifyItinerary so the alignment scorer + the matrix-cell
-    modal renderer have the per-trip detail. `common` is None on legacy
-    callers; the itineraries list stays empty and the cell renders as
-    `no_data` in the heatmap (compatible with PR-E rows).
+    The verdict only: the connections themselves become canonical journeys through the HAFAS
+    adapter (`network_coverage.oebb_journeys.journeys_from_answer`, #303 PR 4a).
     """
     if not connections:
         return VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, num_connections=0)
+
     parsed_durations: list[int] = []
     parsed_transfers: list[int] = []
     for c in connections:
@@ -774,17 +555,12 @@ def _summarise_connections(
         chg = c.get("chg")
         if isinstance(chg, int):
             parsed_transfers.append(chg)
+
     best_idx = (
         min(range(len(parsed_durations)), key=lambda i: parsed_durations[i])
         if parsed_durations
         else None
     )
-    itineraries: list[VerifyItinerary] = []
-    if common is not None:
-        locations = _index_hafas_locations(common.get("locL") or [])
-        products = _index_hafas_products(common.get("prodL") or [])
-        for c in connections:
-            itineraries.append(_build_itinerary_from_connection(c, locations, products))
     return VerifyResult(
         source=_SOURCE_OEBB_HAFAS,
         ok=True,
@@ -795,7 +571,6 @@ def _summarise_connections(
             if best_idx is not None and best_idx < len(parsed_transfers)
             else None
         ),
-        itineraries=itineraries,
     )
 
 
@@ -859,15 +634,14 @@ class HafasTripPayload(BaseModel):
     raw payload so journey-level callers can normalise the connection
     list into trip dicts without re-running the network calls.
 
-    `verdict` carries the same VerifyResult shape coverage uses (so the
-    yes/no façade still works); `payload` is the parsed TripSearch JSON
+    `verdict` carries the VerifyResult coverage stores on a cell; `payload` is the parsed
+    TripSearch JSON
     response (or None when an upstream step failed). `from_lid` /
     `to_lid` carry the LocGeoPos-resolved station identifiers so
     journey clients can quote the snapped station in diagnostics.
 
-    This is the lower-level return shape used by `fetch_oebb_two_step`;
-    the historical `verify_via_oebb_hafas` is a façade that throws
-    `payload` away and returns just the `verdict`."""
+    The return shape of `fetch_oebb_two_step`, for the coverage check and for
+    `/journey`; both turn `payload` into canonical journeys through the HAFAS adapter."""
 
     verdict: VerifyResult
     payload: dict[str, Any] | None = None
@@ -893,11 +667,9 @@ async def fetch_oebb_two_step(
     backend and return both the verdict *and* the raw parsed payload.
 
     This is the building block both the coverage-cell verify path and
-    the journey-search comparison path call. Coverage only needs the
-    summarised verdict (`verify_via_oebb_hafas` is a thin wrapper that
-    returns just `.verdict`); the journey path also needs `payload`
-    so it can normalise the connection list into VIATOR's canonical
-    trip-dict shape.
+    the journey-search comparison path call. Both keep the verdict and turn
+    `payload` into canonical journeys (`hafas_adapter`; coverage through
+    `oebb_journeys.journeys_from_answer`).
 
     Never raises — network / parse failures land in `verdict.error`."""
     resolve_body = _build_locgeopos_body([(from_lat, from_lon), (to_lat, to_lon)])
@@ -976,38 +748,6 @@ async def fetch_oebb_two_step(
         return await _run(c)
 
 
-async def verify_via_oebb_hafas(
-    *,
-    from_lat: float,
-    from_lon: float,
-    to_lat: float,
-    to_lon: float,
-    depart_at: datetime,
-    client: httpx.AsyncClient | None = None,
-) -> VerifyResult:
-    """Ask ÖBB's HAFAS backend whether it can route this pair.
-
-    Two-step internally (LocGeoPos → TripSearch); returns the
-    summarised verdict — the two-POST shape and the raw payload are
-    invisible to the caller. Journey-level callers that *do* need the
-    raw payload should use `fetch_oebb_two_step` directly.
-
-    `client` is injected for tests; production callers pass None and
-    we manage a one-shot AsyncClient internally. Network / parse
-    failures produce a VerifyResult with `ok=False` and `error` set —
-    never raises to the caller, since the UI surface treats "unknown"
-    as a distinct visual state from "external said no"."""
-    out = await fetch_oebb_two_step(
-        from_lat=from_lat,
-        from_lon=from_lon,
-        to_lat=to_lat,
-        to_lon=to_lon,
-        depart_at=depart_at,
-        client=client,
-    )
-    return out.verdict
-
-
 def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
     """HAFAS error reporting is two-layered: the envelope `err` for
     transport errors (`"OK"` on success), and the per-service `err`
@@ -1030,7 +770,4 @@ def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
             source=_SOURCE_OEBB_HAFAS, ok=False, error=_translate_hafas_error(svc["err"])
         )
     res = svc.get("res") or {}
-    connections = res.get("outConL") or []
-    # PR-196a — thread `common` (locL + prodL indices) so the per-
-    # itinerary detail is captured for the alignment heatmap + modal.
-    return _summarise_connections(connections, res.get("common") or {})
+    return _summarise_connections(res.get("outConL") or [])

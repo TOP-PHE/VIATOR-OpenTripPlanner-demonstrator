@@ -26,6 +26,7 @@ from ... import audit, config_service
 from ...db import get_db
 from ...db_steps import db_step
 from ...journey import planner_dispatch, recorder
+from ...journey.canonical import CanonicalJourney
 from ...models import (
     GraphSnapshot,
     JourneySearch,
@@ -162,8 +163,9 @@ async def _replay_one(db: DbSession, plan: _ReplayPlan, knobs: _Knobs, s: _Queue
     counted as an error by the caller."""
     replay_search = await db_step(_begin_replay, db, s)
     t0 = time.monotonic()
+    trips: list[CanonicalJourney] = []
     try:
-        _, trips = await _planner_of(plan).fetch_plan(
+        _, trips = await _planner_of(plan).fetch_journeys(
             session_id=plan.target_session_id,
             from_lat=s.origin_lat,
             from_lon=s.origin_lon,
@@ -343,7 +345,7 @@ def _record_replay(
     replay_search: JourneySearch,
     status: str,
     elapsed: int,
-    trips: list[dict[str, Any]],
+    trips: list[CanonicalJourney],
 ) -> None:
     """One replayed search's execution and its finish (committed by the caller)."""
     recorder.record_execution(
@@ -355,7 +357,7 @@ def _record_replay(
         response_ms=elapsed,
         raw_response=None,
         error_message=None,
-        trips=trips,
+        journeys=trips,
     )
     recorder.finish_search(
         db,

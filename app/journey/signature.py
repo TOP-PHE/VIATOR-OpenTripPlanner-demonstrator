@@ -118,7 +118,7 @@ _SWISS_SLOID_PREFIX = "ch:1:"  # opentransportdata.swiss authority namespace
 #
 # Deliberate twin of `external_verify._SCHEME_UIC` / `_SCHEME_OEBB` — that
 # module intentionally imports nothing from `app.journey`, so the vocabulary is
-# duplicated rather than shared (same pattern as the `_hafas_cat_to_mode` twin).
+# duplicated rather than shared.
 # `test_canonical_token_vocabulary_agrees_across_modules` pins them together.
 #
 # `UIC:` + exactly 7 digits is the only UIC shape any producer in the tree

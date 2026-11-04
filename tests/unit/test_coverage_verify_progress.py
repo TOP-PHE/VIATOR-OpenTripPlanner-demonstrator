@@ -276,20 +276,24 @@ def _run(verify: bool = True) -> MagicMock:
 
 
 _FAST = runner.CoverageConfig(verify_sleep_ms=0)
-_ANSWER = external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+# What `fetch_oebb_two_step` answers for a cell ÖBB found one connection for (no payload: the
+# scorer then sees no ÖBB journey; the sweep still fills every field).
+_ANSWER = external_verify.HafasTripPayload(
+    verdict=external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+)
 
 
 @pytest.mark.asyncio
 async def test_every_field_the_sweep_fills_is_saved() -> None:
     """Guard for a new external_* field: the writer must save it too."""
     rows = [_RecordingRow("zz-a", "zz-b"), _RecordingRow("zz-c", "zz-gone")]
-    with patch.object(external_verify, "verify_via_oebb_hafas", AsyncMock(return_value=_ANSWER)):
+    with patch.object(external_verify, "fetch_oebb_two_step", AsyncMock(return_value=_ANSWER)):
         await runner._run_external_verify_sweep(
             db=_db_with_hubs("zz-a", "zz-b", "zz-c"), run=_run(), rows=rows, cfg=_FAST
         )
     filled = set().union(*(r.set_names for r in rows))
     assert filled <= set(verify_progress.SAVED_FIELDS)
-    assert "external_itineraries" in filled  # the answered row went through the scorer
+    assert "external_journeys" in filled  # the answered row went through the scorer
 
 
 # ─────────────────────────────── the sweep ───────────────────────────────
@@ -326,13 +330,13 @@ async def test_the_sweep_hands_every_cell_to_the_writer_whatever_its_answer() ->
     exploding = _row("zz-c", "zz-d")
     hub_gone = _row("zz-a", "zz-gone")
 
-    async def _verify(**kw: Any) -> external_verify.VerifyResult:
+    async def _verify(**kw: Any) -> external_verify.HafasTripPayload:
         if kw["from_lat"] == 47.99:  # zz-c
             raise RuntimeError("zz adapter explosion")
         return _ANSWER
 
     writer = _FakeWriter()
-    with patch.object(external_verify, "verify_via_oebb_hafas", side_effect=_verify):
+    with patch.object(external_verify, "fetch_oebb_two_step", side_effect=_verify):
         await runner._run_external_verify_sweep(
             db=db, run=_run(), rows=[answered, exploding, hub_gone], cfg=_FAST, writer=writer
         )
@@ -348,7 +352,7 @@ async def test_the_sweep_stops_asking_once_the_writer_has_stopped() -> None:
     fake = AsyncMock(return_value=_ANSWER)
     writer = _FakeWriter(stop_after=2)
     cfg = runner.CoverageConfig(verify_sleep_ms=0, verify_parallelism=1)
-    with patch.object(external_verify, "verify_via_oebb_hafas", fake):
+    with patch.object(external_verify, "fetch_oebb_two_step", fake):
         await runner._run_external_verify_sweep(
             db=db, run=_run(), rows=rows, cfg=cfg, writer=writer
         )
@@ -399,7 +403,7 @@ async def test_no_cell_is_asked_when_the_writer_finds_the_run_gone_at_the_start(
 @pytest.mark.asyncio
 async def test_without_a_writer_the_sweep_is_as_before() -> None:
     row = _row("zz-a", "zz-b")
-    with patch.object(external_verify, "verify_via_oebb_hafas", AsyncMock(return_value=_ANSWER)):
+    with patch.object(external_verify, "fetch_oebb_two_step", AsyncMock(return_value=_ANSWER)):
         counters = await runner._maybe_run_external_verify_sweep(
             db=_db_with_hubs("zz-a", "zz-b"), run=_run(), rows=[row], cfg=_FAST
         )

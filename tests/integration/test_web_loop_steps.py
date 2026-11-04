@@ -114,10 +114,6 @@ class _NoTrips:
     """An engine that finds nothing: the fanout falls back to the federated
     planner."""
 
-    async def fetch_plan(self, **_kw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        await asyncio.sleep(0)
-        return {"itineraries": []}, []
-
     async def fetch_journeys(self, **_kw: Any) -> tuple[dict[str, Any], list[Any]]:
         await asyncio.sleep(0)
         return {"itineraries": []}, []

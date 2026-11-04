@@ -8,8 +8,10 @@ Three layers:
      `_extract_lids_from_locgeopos`, `_build_trip_search_body`,
      `_parse_hafas_response`, `_decode_response_body`) — no network,
      deterministic.
-  2. The `verify_via_oebb_hafas` two-step flow (LocGeoPos → TripSearch)
-     exercised through httpx's `MockTransport`.
+  2. The `fetch_oebb_two_step` flow (LocGeoPos → TripSearch) and its
+     verdict, exercised through httpx's `MockTransport` (since #303 PR 4a
+     the coverage check reads `.verdict` itself; the yes/no façade
+     `verify_via_oebb_hafas` is gone).
   3. The three observable verdict states the UI distinguishes:
      - `ok=True` (external found connections — likely our gap)
      - `ok=False`, `error=None` (external also found 0 — likely real gap)
@@ -24,7 +26,7 @@ from datetime import datetime
 import httpx
 import pytest
 
-from app.network_coverage import external_verify
+from app.network_coverage import external_verify, oebb_journeys
 
 # ─────────────────────── pure helpers ───────────────────────
 
@@ -104,10 +106,8 @@ def test_translate_hafas_error_unknown_falls_through() -> None:
 @pytest.mark.parametrize(
     ("cat", "expected_mode"),
     [
-        ("RJ", "RAIL"),
         ("BUS", "BUS"),
         ("Tram", "TRAM"),
-        (None, "TRANSIT"),
         # HAFAS occasionally sends a numeric product code instead of a
         # string abbreviation — this was crashing every verify-sweep
         # call for the affected products with AttributeError: 'int'
@@ -118,8 +118,10 @@ def test_translate_hafas_error_unknown_falls_through() -> None:
         (0, "TRANSIT"),  # falsy int must not crash
     ],
 )
-def test_hafas_cat_to_mode_handles_non_string_categories(cat, expected_mode: str) -> None:
-    assert external_verify._hafas_cat_to_mode(cat) == expected_mode
+def test_oebb_mode_handles_non_string_categories(cat, expected_mode: str) -> None:
+    """#213's regression lock, on the coverage mode rule (`oebb_journeys.oebb_mode` since
+    #303 PR 4a; the other categories are in test_oebb_journeys.py)."""
+    assert oebb_journeys.oebb_mode(cat) == expected_mode
 
 
 # ─────────────────────── LocGeoPos body shape ───────────────────────
@@ -452,7 +454,12 @@ def test_decode_response_body_invalid_json_raises() -> None:
         external_verify._decode_response_body(b"<html>maintenance</html>")
 
 
-# ─────────────────────── verify_via_oebb_hafas (two-step end-to-end) ───────────────────────
+# ─────────────────────── fetch_oebb_two_step (two-step end-to-end) ───────────────────────
+
+
+async def _verify(**kwargs) -> external_verify.VerifyResult:
+    """The verdict of one two-step ask: what the coverage check stores on a cell."""
+    return (await external_verify.fetch_oebb_two_step(**kwargs)).verdict
 
 
 def _locgeopos_response(stops: list[tuple[str | None, str]]) -> dict:
@@ -499,7 +506,7 @@ def _two_step_handler(
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_happy_two_step() -> None:
+async def test_fetch_oebb_two_step_happy_two_step() -> None:
     """Standard flow: LocGeoPos resolves both endpoints to lids, then
     TripSearch returns 2 connections. Two POSTs to mgate, single
     consolidated VerifyResult back to the caller."""
@@ -519,7 +526,7 @@ async def test_verify_via_oebb_hafas_happy_two_step() -> None:
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=50.9430,
             from_lon=6.9587,  # Köln Hbf
             to_lat=50.1071,
@@ -534,7 +541,7 @@ async def test_verify_via_oebb_hafas_happy_two_step() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_resolve_empty_for_one_endpoint() -> None:
+async def test_fetch_oebb_two_step_resolve_empty_for_one_endpoint() -> None:
     """LocGeoPos returns empty locL for the dest coord (no ÖBB stop
     nearby — Bergen-NO style gap). The trip search MUST be skipped:
     return a "no station found" verdict with the friendly translation,
@@ -556,7 +563,7 @@ async def test_verify_via_oebb_hafas_resolve_empty_for_one_endpoint() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=50.9430,
             from_lon=6.9587,
             to_lat=60.39,
@@ -573,12 +580,12 @@ async def test_verify_via_oebb_hafas_resolve_empty_for_one_endpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_resolve_http_500_is_error() -> None:
+async def test_fetch_oebb_two_step_resolve_http_500_is_error() -> None:
     """HTTP 500 on LocGeoPos → error verdict, trip search not
     attempted."""
     transport = httpx.MockTransport(lambda _r: httpx.Response(500, text="oops"))
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -592,7 +599,7 @@ async def test_verify_via_oebb_hafas_resolve_http_500_is_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_connection_error_does_not_raise() -> None:
+async def test_fetch_oebb_two_step_connection_error_does_not_raise() -> None:
     """Network errors (DNS, refused, timeout) must surface as
     VerifyResult.error rather than propagating to the FastAPI endpoint.
     The endpoint is operator-facing — a 500 from a third-party
@@ -603,7 +610,7 @@ async def test_verify_via_oebb_hafas_connection_error_does_not_raise() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -617,14 +624,14 @@ async def test_verify_via_oebb_hafas_connection_error_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_resolve_envelope_error_propagates() -> None:
+async def test_fetch_oebb_two_step_resolve_envelope_error_propagates() -> None:
     """Envelope-level err (e.g. auth failure) on the LocGeoPos POST →
     yellow error verdict. Trip search not attempted."""
     transport = httpx.MockTransport(
         lambda _r: httpx.Response(200, json={"err": "ERROR", "errTxt": "AID invalid"})
     )
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -638,7 +645,7 @@ async def test_verify_via_oebb_hafas_resolve_envelope_error_propagates() -> None
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_trip_h890_returns_real_no_route() -> None:
+async def test_fetch_oebb_two_step_trip_h890_returns_real_no_route() -> None:
     """End-to-end: resolve OK, TripSearch returns H890 (real "no
     connections"). Verdict is blue ok=False/error=None — distinct from
     "couldn't answer"."""
@@ -656,7 +663,7 @@ async def test_verify_via_oebb_hafas_trip_h890_returns_real_no_route() -> None:
     )
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -670,13 +677,13 @@ async def test_verify_via_oebb_hafas_trip_h890_returns_real_no_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_non_json_response_is_error() -> None:
+async def test_fetch_oebb_two_step_non_json_response_is_error() -> None:
     """HAFAS occasionally returns an HTML interstitial when behind a
     maintenance page. The parser must catch the JSON decode failure
     rather than crashing the endpoint."""
     transport = httpx.MockTransport(lambda _r: httpx.Response(200, text="<html>maintenance</html>"))
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,
@@ -690,7 +697,7 @@ async def test_verify_via_oebb_hafas_non_json_response_is_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verify_via_oebb_hafas_latin1_body_does_not_crash() -> None:
+async def test_fetch_oebb_two_step_latin1_body_does_not_crash() -> None:
     """ÖBB occasionally returns Latin-1-encoded bytes in mgate responses
     (especially in `locL` station names). The adapter must decode
     without raising — the modal can't display a UnicodeDecodeError
@@ -717,7 +724,7 @@ async def test_verify_via_oebb_hafas_latin1_body_does_not_crash() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=48.1402,
             from_lon=11.5586,  # München Hbf
             to_lat=52.5251,
@@ -798,7 +805,7 @@ async def test_a_hafas_timeout_names_its_type() -> None:
         raise httpx.ReadTimeout("", request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(_timeout)) as client:
-        result = await external_verify.verify_via_oebb_hafas(
+        result = await _verify(
             from_lat=0.0,
             from_lon=0.0,
             to_lat=0.0,

@@ -13,7 +13,7 @@ verified against the live opentransportdata.swiss OJP 2.0 endpoint
 before this was written (the Phase 0 spike — design doc Appendix A),
 and the parser is modelled on a real captured `OJPTripDelivery`.
 
-Contract mirrors `otp_client.fetch_plan`: `fetch_reference` returns
+Contract mirrors `otp_client.fetch_journeys`: `fetch_reference` returns
 `(raw, trips)` where `trips` is the same normalised trip-dict shape the
 journey UI already renders. Transport / HTTP failures raise
 `httpx.HTTPError` for the caller to map to an `error` status; a

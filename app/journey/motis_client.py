@@ -1,11 +1,11 @@
 """Thin async client for MOTIS — drop-in alternative to otp_client.
 
-Phase-0 spike (see motis-spike/README.md). Mirrors `otp_client.fetch_plan`'s
+Phase-0 spike (see motis-spike/README.md). Mirrors `otp_client.fetch_journeys`'s
 signature and return shape exactly, so once we validate the spike, the
 session-level dispatcher in Phase 1 is a one-liner:
 
     client = motis_client if session.engine == "motis" else otp_client
-    raw, trips = await client.fetch_plan(session_id=..., ...)
+    raw, journeys = await client.fetch_journeys(session_id=..., ...)
 
 Routing query
 -------------
@@ -45,8 +45,6 @@ import httpx
 
 from .canonical import CanonicalJourney
 from .canonical_adapters import motis_adapter
-from .canonical_adapters._common import source_rank
-from .canonical_adapters.trip_dict import to_trip_dict
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +118,7 @@ async def fetch_journeys(
 ) -> tuple[dict[str, Any], list[CanonicalJourney]]:
     """Call MOTIS's `/api/v6/plan`. Returns `(raw_response, trips_for_recorder)`.
 
-    Mirrors `otp_client.fetch_plan` argument-for-argument so the dispatcher
+    Mirrors `otp_client.fetch_journeys` argument-for-argument so the dispatcher
     (Phase 1) can pick the client by `session.engine` without touching the
     callsite. The `base_url` override is a spike-only convenience for pointing
     the comparison harness at `http://localhost:8081`; production sessions
@@ -150,7 +148,7 @@ async def fetch_journeys(
     # A Phase-2 follow-up could add a session-level feed_id map so we CAN
     # pass MOTIS-shaped stop ids when the caller knows them; for now
     # `from_stop_id` / `to_stop_id` are accepted for signature parity with
-    # `otp_client.fetch_plan` but deliberately unused.
+    # `otp_client.fetch_journeys` but deliberately unused.
     _ = from_stop_id, to_stop_id  # signature-parity; see comment above
     from_place = f"{from_lat},{from_lon}"
     to_place = f"{to_lat},{to_lon}"
@@ -209,29 +207,3 @@ async def fetch_journeys(
     raw: dict[str, Any] = r.json()
 
     return raw, motis_adapter.journeys_from_plan(raw, session_id=session_id)
-
-
-async def fetch_plan(**kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """`fetch_journeys`, as today's trip dicts with MOTIS's own itinerary under
-    `_raw_itinerary`: for the callers not on canonical journeys yet (coverage and replay,
-    #303 PR 4). Same arguments as `fetch_journeys`."""
-    raw, journeys = await fetch_journeys(**kwargs)
-    return raw, _with_raw_itineraries(raw, journeys)
-
-
-def _with_raw_itineraries(
-    raw: dict[str, Any], journeys: list[CanonicalJourney]
-) -> list[dict[str, Any]]:
-    """Today's trip dicts of `journeys` (the temporary `trip_dict` bridge, #303), each with
-    MOTIS's own itinerary under `_raw_itinerary` for the journey page's JSON inspector."""
-    itineraries = raw.get("itineraries") or []
-    return [
-        {**to_trip_dict(journey), "_raw_itinerary": itineraries[source_rank(journey)]}
-        for journey in journeys
-    ]
-
-
-def _itineraries_to_trips(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Today's trip dicts for a `/api/v6/plan` answer (field mapping and what was measured
-    on MOTIS in `canonical_adapters.motis_adapter`)."""
-    return _with_raw_itineraries(raw, motis_adapter.journeys_from_plan(raw))

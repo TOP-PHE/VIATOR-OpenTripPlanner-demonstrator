@@ -21,6 +21,10 @@ Two tests carry the history and should be read together:
 - `test_extract_uic_must_never_be_called_on_a_hafas_lid` is **permanent** and
   does NOT flip: `extract_uic` is deliberately unchanged and still correct for
   VIATOR-side ids. It is the trip-wire against a new call site on a lid.
+
+Since #303 PR 4a the coverage check reads ÖBB's answer through the HAFAS adapter
+(`canonical_adapters.hafas_adapter`) and the scorer's legs through `oebb_journeys`;
+the tests below follow that path, with the same probe fixtures and expectations.
 """
 
 from __future__ import annotations
@@ -32,7 +36,9 @@ from typing import Any
 import pytest
 
 from app.journey import signature
-from app.network_coverage import alignment, external_verify
+from app.journey.canonical import CanonicalJourney
+from app.journey.canonical_adapters import hafas_adapter
+from app.network_coverage import alignment, external_verify, oebb_journeys
 
 # ─────────────────────── live-probe fixtures ───────────────────────
 #
@@ -91,6 +97,11 @@ def _hafas_payload() -> dict[str, Any]:
     }
 
 
+def _journeys() -> list[CanonicalJourney]:
+    """The probe answer as the coverage check stores it: canonical journeys."""
+    return hafas_adapter.journeys_from_trip_search(_hafas_payload())
+
+
 # ─────────────────── characterization: the bug, pinned ───────────────────
 
 
@@ -105,14 +116,19 @@ def test_leg_endpoints_are_station_ids_not_longitudes() -> None:
     itself, because that function is deliberately unchanged — what changed is
     that nothing calls it on a lid any more.
     """
-    result = external_verify._parse_hafas_response(_hafas_payload())
+    assert external_verify._parse_hafas_response(_hafas_payload()).ok is True
+    (journey,) = _journeys()
 
-    assert result.ok is True
-    leg = result.itineraries[0].legs[0]
-
-    assert leg.from_uic == "UIC:8400058", "Amsterdam Centraal, from extId"
-    assert leg.to_uic == "UIC:8800004", "Bruxelles Midi, from extId"
-    # Provenance survives to the persisted row.
+    (scored,) = oebb_journeys.scoring_legs(journey)
+    assert scored["from_stop_id"] == "UIC:8400058", "Amsterdam Centraal, from extId"
+    assert scored["to_stop_id"] == "UIC:8800004", "Bruxelles Midi, from extId"
+    # Provenance survives to the stored journey, and to the modal's itinerary.
+    stop = journey.legs[0].origin.stop_place
+    assert stop is not None
+    assert stop.codes == {"OEBB_EXT": "8400058"}
+    (leg,) = oebb_journeys.itinerary(journey).legs
+    assert leg.from_uic == "UIC:8400058"
+    assert leg.to_uic == "UIC:8800004"
     assert leg.from_id_raw == "8400058"
     assert leg.from_name == "Amsterdam Centraal"
     assert leg.from_id_source == "extid"
@@ -202,7 +218,7 @@ def test_oebb_stop_id_non_uic_is_labelled_not_dropped() -> None:
     `904050` must become `OEBB:904050` — explicitly NOT None and NOT
     `UIC:904050`.
 
-    - `None` is unsafe: VerifyLeg has no coordinates, so a None endpoint
+    - `None` is unsafe: the scorer's ÖBB legs carry no coordinates, so a None endpoint
       degenerates to the shared `"?,?"` token and opens an exact-tier
       collision channel. It also collapses "no id" and "foreign id" into one
       bucket, destroying the signal §7 item 2's measurement step needs.
@@ -307,34 +323,49 @@ def test_oebb_stop_id_does_not_merge_brussels_midi_variants() -> None:
 
 
 def test_index_hafas_locations_keeps_ext_id() -> None:
-    """The single-line omission that was the proximate cause. Nothing pinned
-    it before."""
-    idx = external_verify._index_hafas_locations(
+    """The single-line omission that was the proximate cause (the old check
+    parser dropped `extId` while indexing `locL`). Since #303 PR 4a the HAFAS
+    adapter indexes `locL` for coverage too: it must keep `extId`, and the stored
+    journey must carry it to the scorer."""
+    idx = hafas_adapter._index_locations(
         [{"lid": AMS_LID, "extId": AMS_EXTID, "name": "Amsterdam Centraal"}]
     )
     assert idx[0]["ext_id"] == "8400058"
     assert idx[0]["lid"] == AMS_LID
     assert idx[0]["name"] == "Amsterdam Centraal"
 
+    (journey,) = _journeys()
+    stop = journey.legs[0].origin.stop_place
+    assert stop is not None
+    assert stop.ref == AMS_LID
+    assert stop.codes["OEBB_EXT"] == "8400058"
 
-def test_parse_hafas_response_emits_no_token_derivable_from_a_coordinate() -> None:
-    """Generalisable trip-wire: no emitted token's digits may equal any `X=` or
-    `Y=` value appearing anywhere in the payload."""
+
+def test_no_token_reaching_the_scorer_is_derivable_from_a_coordinate() -> None:
+    """Generalisable trip-wire: no token the scorer or the modal reads may have
+    digits equal to any `X=` or `Y=` value appearing anywhere in the payload."""
     payload = _hafas_payload()
     coords = set(re.findall(r"[XY]=(\d+)", json.dumps(payload)))
     assert coords, "fixture must actually contain coordinate fields"
 
-    result = external_verify._parse_hafas_response(payload)
-    for it in result.itineraries:
-        for leg in it.legs:
-            for token in (leg.from_uic, leg.to_uic):
-                if not token:
-                    continue
-                digits = token.split(":", 1)[1]
-                assert digits not in coords, f"{token} is a coordinate, not a station id"
-                assert not any(c.startswith(digits) for c in coords), (
-                    f"{token} looks like a truncated coordinate"
-                )
+    journeys = hafas_adapter.journeys_from_trip_search(payload)
+    assert journeys, "fixture must give at least one journey"
+    tokens: list[str | None] = []
+    for journey in journeys:
+        scored = oebb_journeys.scoring_legs(journey)
+        tokens += [t for leg in scored for t in (leg["from_stop_id"], leg["to_stop_id"])]
+        tokens += [
+            t for leg in oebb_journeys.itinerary(journey).legs for t in (leg.from_uic, leg.to_uic)
+        ]
+    assert tokens
+    for token in tokens:
+        if not token:
+            continue
+        digits = token.split(":", 1)[1]
+        assert digits not in coords, f"{token} is a coordinate, not a station id"
+        assert not any(c.startswith(digits) for c in coords), (
+            f"{token} looks like a truncated coordinate"
+        )
 
 
 def test_canonical_token_vocabulary_agrees_across_modules() -> None:

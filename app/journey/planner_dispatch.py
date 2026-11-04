@@ -1,11 +1,11 @@
 """Pick the journey-planner backend for a given session.
 
-Both `otp_client` and `motis_client` expose a `fetch_plan(...)` coroutine
-with the same signature and return shape — the dispatcher just returns
+Both `otp_client` and `motis_client` expose a `fetch_journeys(...)` coroutine
+with the same signature and return shape (the raw answer and its canonical journeys) — the dispatcher just returns
 the right module so callers can write:
 
     planner = get_planner(session)
-    raw, trips = await planner.fetch_plan(session_id=session.id, ...)
+    raw, journeys = await planner.fetch_journeys(session_id=session.id, ...)
 
 The single source of truth for which backend a session uses is the
 `sessions.engine` column (added in alembic
@@ -27,37 +27,10 @@ from . import motis_client, otp_client
 from .canonical import CanonicalJourney
 
 
-class _FetchPlan(Protocol):
-    """The fetch_plan signature `otp_client` and `motis_client` both expose.
-
-    Declared on the dispatcher so mypy knows the precise return type at
-    every callsite — without this, the dispatched call decays to `Any`
-    (ModuleType.fetch_plan is untyped) and breaks `--strict` callers
-    that return the unpacked `trips` with a concrete annotation.
-    """
-
-    async def __call__(
-        self,
-        *,
-        session_id: str,
-        from_lat: float,
-        from_lon: float,
-        to_lat: float,
-        to_lon: float,
-        when: datetime,
-        timeout_ms: int,
-        num_itineraries: int = ...,
-        search_window_seconds: int = ...,
-        from_stop_id: str | None = ...,
-        to_stop_id: str | None = ...,
-        session_timezone: str | None = ...,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]: ...
-
-
 class _FetchJourneys(Protocol):
-    """`fetch_journeys`: the same arguments as `fetch_plan`, the answer as canonical journeys
-    (#303). `fetch_plan` gives the same answer as today's trip dicts, for the callers not on
-    canonical journeys yet (coverage and replay, #303 PR 4)."""
+    """The `fetch_journeys` signature `otp_client` and `motis_client` both expose: the raw
+    answer and its canonical journeys (#303). Declared on the dispatcher so mypy knows the
+    precise return type at every callsite (ModuleType attributes are untyped)."""
 
     async def __call__(
         self,
@@ -80,7 +53,6 @@ class _FetchJourneys(Protocol):
 class _Planner(Protocol):
     """Either `otp_client` or `motis_client`, narrowed to what we use."""
 
-    fetch_plan: _FetchPlan
     fetch_journeys: _FetchJourneys
 
 
@@ -98,7 +70,7 @@ def planner_for_engine(engine: str) -> _Planner:
 
     Used by code paths that snapshot the engine once (e.g. the coverage
     runner reads `{sid: engine}` upfront and passes it down per pair to
-    avoid a DB round-trip per fetch_plan call).
+    avoid a DB round-trip per fetch call).
     """
     if engine == "otp":
         return cast(_Planner, otp_client)

@@ -285,7 +285,7 @@ def test_coverage_slot_timeout_ms_bounds() -> None:
 
 def test_coverage_within_pair_parallelism_bounds() -> None:
     # Default 3 — combined with COVERAGE_PAIR_PARALLELISM (3 in the
-    # PR-3 plan) gives an effective ceiling of 9 simultaneous fetch_plan
+    # PR-3 plan) gives an effective ceiling of 9 simultaneous fetch_journeys
     # calls. PR-2 ran 5 single calls; PR-3 ran 9 distributed calls.
     assert default_for("COVERAGE_WITHIN_PAIR_PARALLELISM") == 3
     assert coerce("COVERAGE_WITHIN_PAIR_PARALLELISM", 1) == 1

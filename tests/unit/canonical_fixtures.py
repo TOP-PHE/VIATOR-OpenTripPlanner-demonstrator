@@ -609,3 +609,88 @@ def journey_from_legs(
         duration_seconds=max(0, duration_seconds),
         source_transfer_count=transfers,
     )
+
+
+_OEBB_CATEGORY = {"RAIL": "RJ", "BUS": "Bus", "TRAM": "Tram", "SUBWAY": "U", "FERRY": "Ship"}
+
+
+def oebb_payload(*connections: list[dict[str, Any]]) -> dict[str, Any]:
+    """An ÖBB HAFAS `TripSearch` answer, one connection per list of simple legs:
+
+    - `mode`: RAIL, BUS, TRAM, SUBWAY or FERRY (a ride, its category `RJ`, `Bus`…), or WALK;
+      `cat` overrides the category;
+    - `from_uic` / `to_uic`: the stop token ÖBB's id gives (`UIC:8503000` → `extId` 8503000,
+      `OEBB:904050` → `extId` 904050, None → no id at all);
+    - `dep` / `arr`: Europe/Vienna wall clock `YYYY-MM-DDTHH:MM` (ÖBB's form), None → no time;
+    - `route`: the label HAFAS shows (`RJ 1141`), `line` its line.
+    """
+    locations: list[dict[str, Any]] = []
+    location_index: dict[str | None, int] = {}
+    products: list[dict[str, Any]] = []
+
+    def loc(token: str | None) -> int:
+        if token not in location_index:
+            ext_id = token.split(":", 1)[1] if token else None
+            name = f"Stop {ext_id}" if ext_id else "Somewhere"
+            entry: dict[str, Any] = {
+                "name": name,
+                "lid": f"A=1@O={name}@" + (f"L={ext_id}@" if ext_id else ""),
+            }
+            if ext_id:
+                entry["extId"] = ext_id
+            location_index[token] = len(locations)
+            locations.append(entry)
+        return location_index[token]
+
+    def hafas_time(day: datetime, value: str | None) -> str | None:
+        if value is None:
+            return None
+        at = datetime.fromisoformat(value)
+        days = (at.date() - day.date()).days
+        return f"{days:02d}{at:%H%M%S}" if days else f"{at:%H%M%S}"
+
+    out: list[dict[str, Any]] = []
+    for legs in connections:
+        first = next((leg["dep"] for leg in legs if leg.get("dep")), "2026-06-30T00:00")
+        day = datetime.fromisoformat(first)
+        sections = []
+        for leg in legs:
+            dep: dict[str, Any] = {"locX": loc(leg.get("from_uic"))}
+            arr: dict[str, Any] = {"locX": loc(leg.get("to_uic"))}
+            if (dep_time := hafas_time(day, leg.get("dep"))) is not None:
+                dep["dTimeS"] = dep_time
+            if (arr_time := hafas_time(day, leg.get("arr"))) is not None:
+                arr["aTimeS"] = arr_time
+            mode = leg.get("mode", "RAIL")
+            section: dict[str, Any] = {"dep": dep, "arr": arr}
+            if mode == "WALK":
+                section["type"] = "WALK"
+            else:
+                products.append(
+                    {
+                        "name": leg.get("route"),
+                        "addName": leg.get("line"),
+                        "prodCtx": {"catOut": leg.get("cat", _OEBB_CATEGORY.get(mode, mode))},
+                    }
+                )
+                section.update(type="JNY", jny={"prodX": len(products) - 1})
+            sections.append(section)
+        rides = sum(1 for leg in legs if leg.get("mode", "RAIL") != "WALK")
+        out.append(
+            {
+                "date": f"{day:%Y%m%d}",
+                "dur": "010000",
+                "chg": max(0, rides - 1),
+                "dep": sections[0]["dep"] if sections else {},
+                "arr": sections[-1]["arr"] if sections else {},
+                "secL": sections,
+            }
+        )
+    return _hafas_payload(out, {"locL": locations, "prodL": products})
+
+
+def oebb_journeys(*connections: list[dict[str, Any]]) -> list[CanonicalJourney]:
+    """`oebb_payload` through the real HAFAS adapter: ÖBB's answer as coverage stores it."""
+    from app.journey.canonical_adapters import hafas_adapter
+
+    return hafas_adapter.journeys_from_trip_search(oebb_payload(*connections))

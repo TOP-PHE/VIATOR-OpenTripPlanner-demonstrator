@@ -194,7 +194,7 @@ async def _fetch_motis_geocode(
     httpx via MockTransport — see tests/unit/test_geocode_api.py.
     """
     # In-cluster docker-network URL — MOTIS doesn't terminate TLS, so http is
-    # both correct and the only option. Same pattern as motis_client.fetch_plan.
+    # both correct and the only option. Same pattern as motis_client.fetch_journeys.
     url = f"http://motis-{session_id}:8080/api/v1/geocode"  # NOSONAR python:S5332
     try:
         async with httpx.AsyncClient(timeout=_GEOCODE_TIMEOUT_S) as c:

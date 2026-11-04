@@ -241,16 +241,9 @@ def _trips(session_id: str, when: datetime) -> dict[str, Any]:
 class _FakeMotis:
     calls = 0
 
-    async def fetch_plan(self, **kw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        self.calls += 1
-        await asyncio.sleep(ENGINE_LATENCY_S)
-        from app.journey import motis_client
-
-        answer = _trips(kw["session_id"], kw["when"])
-        return {"itineraries": []}, motis_client._itineraries_to_trips(answer)
-
     async def fetch_journeys(self, **kw: Any) -> tuple[dict[str, Any], list[Any]]:
-        """The fanout's call since #303: the same answer as canonical journeys."""
+        """The engine call of the fanout, `/plan` and the replay since #303: the
+        answer as canonical journeys."""
         self.calls += 1
         await asyncio.sleep(ENGINE_LATENCY_S)
         from app.journey.canonical_adapters import motis_adapter
@@ -305,11 +298,12 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:
 
     async def _verify(**_kw: Any) -> Any:
         await asyncio.sleep(ENGINE_LATENCY_S)
-        return external_verify.VerifyResult(
+        verdict = external_verify.VerifyResult(
             ok=False, num_connections=0, source="oebb_hafas", error=None
         )
+        return external_verify.HafasTripPayload(verdict=verdict)
 
-    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", _verify)
+    monkeypatch.setattr(external_verify, "fetch_oebb_two_step", _verify)
     return fake
 
 

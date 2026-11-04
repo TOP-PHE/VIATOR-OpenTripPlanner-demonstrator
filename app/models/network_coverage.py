@@ -332,8 +332,8 @@ class NetworkCoverageResult(Base):
     external_source: Mapped[str | None] = mapped_column(String, nullable=True)
     external_error: Mapped[str | None] = mapped_column(String, nullable=True)
 
-    # PR-196a — per-cell ÖBB itinerary capture + alignment heatmap. The
-    # sweep persists the full normalised itinerary list so the cell-
+    # PR-196a — per-cell ÖBB answer + alignment heatmap. The
+    # sweep persists ÖBB's journeys so the cell-
     # trips modal can render the ÖBB side-by-side against VIATOR
     # without re-querying HAFAS. `external_alignment_score` is 0.0-1.0
     # (NULL when not computable: one or both sides empty in the no_data
@@ -342,7 +342,9 @@ class NetworkCoverageResult(Base):
     # disagree / no_overlap / one_sided_viator / one_sided_oebb /
     # no_service / no_data. See app/network_coverage/alignment.py for
     # the scoring rules.
-    external_itineraries: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    # ÖBB's answer as canonical journeys (`CanonicalJourney.model_dump(mode="json")` each,
+    # #303 PR 4a); NULL until the check has asked ÖBB about this cell.
+    external_journeys: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     external_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     external_alignment_tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

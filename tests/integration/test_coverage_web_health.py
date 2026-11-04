@@ -218,18 +218,19 @@ def _motis_raw(from_lat: float, from_lon: float, when: datetime) -> dict[str, An
 
 class _FakeMotis:
     """Stands in for `motis_client`: waits like an engine call, then answers
-    through the real MOTIS normalisation. Counts calls per thread."""
+    through the real MOTIS adapter, as canonical journeys (#303). Counts calls
+    per thread."""
 
     def __init__(self) -> None:
         self.calls = 0
 
-    async def fetch_plan(self, **kw: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        from app.journey import motis_client
+    async def fetch_journeys(self, **kw: Any) -> tuple[dict[str, Any], list[Any]]:
+        from app.journey.canonical_adapters import motis_adapter
 
         self.calls += 1
         await asyncio.sleep(SLOT_LATENCY_S)
         raw = _motis_raw(kw["from_lat"], kw["from_lon"], kw["when"])
-        return raw, motis_client._itineraries_to_trips(raw)
+        return raw, motis_adapter.journeys_from_plan(raw, session_id=kw["session_id"])
 
 
 # ───────────────────────────── the measurement ─────────────────────────────
@@ -350,13 +351,17 @@ async def _run_and_measure(run_id: uuid.UUID) -> _Probe:
 def _expected_pair(origin_lat: float, origin_lon: float, slots: list[datetime]) -> dict[str, Any]:
     """The pair's result as the runner computed it before #392, from the fake
     engine alone: every slot's itineraries are distinct, all board inside the
-    day window, so the pair keeps them all; the best is the shortest."""
-    from app.journey import motis_client
+    day window, so the pair keeps them all; the best is the shortest. Read as
+    today's trip dicts (the MOTIS adapter, then the bridge)."""
+    from app.journey.canonical_adapters import motis_adapter
+    from app.journey.canonical_adapters.trip_dict import to_trip_dicts
 
     trips = [
         t
         for s in slots
-        for t in motis_client._itineraries_to_trips(_motis_raw(origin_lat, origin_lon, s))
+        for t in to_trip_dicts(
+            motis_adapter.journeys_from_plan(_motis_raw(origin_lat, origin_lon, s))
+        )
     ]
     best = min(trips, key=lambda t: t["duration_seconds"])
     return {
@@ -368,6 +373,7 @@ def _expected_pair(origin_lat: float, origin_lon: float, slots: list[datetime]) 
 
 def _assert_results_unchanged(run_id: uuid.UUID, fake: _FakeMotis) -> None:
     from app.db import SessionLocal
+    from app.journey.canonical import CanonicalJourney
     from app.models import (
         JourneyTrip,
         NetworkCoverageHub,
@@ -412,6 +418,10 @@ def _assert_results_unchanged(run_id: uuid.UUID, fake: _FakeMotis) -> None:
             assert row.error_message is None
         trips = db.execute(select(JourneyTrip)).scalars().all()
         assert len(trips) == pairs * cfg.slot_count * ITINERARIES_PER_SLOT
+        # Each trip row stores its canonical journey (#303 PR 4a), which reads back whole.
+        for trip in trips:
+            journey = CanonicalJourney.model_validate(trip.journey)
+            assert journey.duration_seconds == trip.duration_seconds
     assert fake.calls == pairs * cfg.slot_count
 
 

@@ -37,6 +37,7 @@ from tests.integration.test_coverage_web_health import (
     _FakeMotis,
     fresh_db,  # noqa: F401  (pytest fixture)
 )
+from tests.unit import canonical_fixtures as fx
 
 PAIRS = HUB_COUNT * (HUB_COUNT - 1)
 EXEC_A = "zz-host:99:aaaa"
@@ -46,6 +47,19 @@ SAVE_EVERY = 4
 # Calls from this one on are held: 20 answers (5 writes of 4) are saved by then.
 HOLD_AT = 21
 SAVED_AT_HOLD = HOLD_AT - 1
+# ÖBB's answer for every cell: one connection (saved as one journey in `external_journeys`).
+_OEBB_ANSWER = fx.oebb_payload(
+    [
+        {
+            "mode": "RAIL",
+            "from_uic": "UIC:9999901",
+            "to_uic": "UIC:9999902",
+            "dep": "2099-09-09T09:09",
+            "arr": "2099-09-09T10:39",
+            "route": "ZZ 99",
+        }
+    ]
+)
 
 
 @pytest.fixture
@@ -68,9 +82,10 @@ def engine(fresh_db: str, monkeypatch: pytest.MonkeyPatch) -> _FakeMotis:  # noq
 
 
 class _FakeOebb:
-    """ÖBB HAFAS stand-in: one connection for every cell. From call
-    `hold_at` on, each call waits for `release`; `held` is set once every
-    verify slot waits, so every answer before them is saved by then."""
+    """ÖBB HAFAS stand-in (`external_verify.fetch_oebb_two_step`): one
+    connection for every cell, which the sweep stores as a canonical journey.
+    From call `hold_at` on, each call waits for `release`; `held` is set once
+    every verify slot waits, so every answer before them is saved by then."""
 
     def __init__(self, hold_at: int | None = None) -> None:
         self.calls = 0
@@ -92,7 +107,10 @@ class _FakeOebb:
                     self.held.set()
         if hold:
             assert await asyncio.to_thread(self.release.wait, 60)
-        return external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+        verdict = external_verify.VerifyResult(
+            source="fahrplan.oebb.at", ok=True, num_connections=1
+        )
+        return external_verify.HafasTripPayload(verdict=verdict, payload=_OEBB_ANSWER)
 
 
 def _session() -> Any:
@@ -110,7 +128,7 @@ def _sql(statement: str, **params: Any) -> None:
 def _verifying_run(monkeypatch: pytest.MonkeyPatch, oebb: _FakeOebb) -> uuid.UUID:
     from app.network_coverage import external_verify
 
-    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", oebb)
+    monkeypatch.setattr(external_verify, "fetch_oebb_two_step", oebb)
     run_id = _create_run()
     _sql("UPDATE network_coverage_runs SET verify_externally = true WHERE id = :r", r=run_id)
     return run_id
@@ -130,7 +148,8 @@ def _progress(run_id: uuid.UUID) -> dict[str, Any]:
             text(
                 "SELECT count(*) FROM network_coverage_results "
                 "WHERE run_id = :r AND external_verified_at IS NOT NULL "
-                "AND external_ok AND external_alignment_tier IS NOT NULL"
+                "AND external_ok AND external_alignment_tier IS NOT NULL "
+                "AND jsonb_array_length(external_journeys) = 1"
             ),
             {"r": run_id},
         ).scalar_one()

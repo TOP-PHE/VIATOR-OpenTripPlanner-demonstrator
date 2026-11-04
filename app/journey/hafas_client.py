@@ -12,18 +12,15 @@ coverage validation that motivated picking ÖBB HAFAS as the reference.
 This module is the **journey-level** counterpart of the coverage-cell
 verify path. The HTTP plumbing (LocGeoPos → TripSearch two-step,
 header set, error-code translation) lives in `external_verify` and is
-shared verbatim — this file is the trip-dict normaliser layer that
-turns HAFAS's `outConL[].secL[]` shape into VIATOR's canonical trip
-dict (the same shape `otp_client._normalise` / `motis_client.
-_itineraries_to_trips` / `ojp_client._normalise` emit). Once a HAFAS
-connection has been normalised this way, the comparison panel renders
-it through the same code path as the other engines.
+shared verbatim — this file asks ÖBB for `/journey` (with pagination) and
+turns its answer into canonical journeys through `canonical_adapters.hafas_adapter`,
+the same adapter coverage uses (#303). The comparison panel then renders them
+through the same code path as the other engines.
 
 Why a journey-level adapter on top of a coverage adapter
 --------------------------------------------------------
-`external_verify.verify_via_oebb_hafas` was built for the click-to-
-verify modal on `no_route` cells: it asks "does ÖBB find anything?"
-and returns a single yes/no `VerifyResult`. Journey-search reuses the
+The coverage check was built for the click-to-verify modal on `no_route`
+cells: it asks "does ÖBB find anything?" and keeps a yes/no `VerifyResult`. Journey-search reuses the
 same backend but needs the full itinerary list (durations, transfers,
 legs with operator badges, intermediate-station detail). PR refactor
 extracted `external_verify.fetch_oebb_two_step` which returns both the

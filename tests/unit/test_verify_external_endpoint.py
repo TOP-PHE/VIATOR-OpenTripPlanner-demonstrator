@@ -10,8 +10,9 @@ Coverage:
   - 404 on (run_id, origin, dest) tuple that doesn't exist in this run
   - 404 when one of the hubs was soft-deleted between run and verify
   - Happy path forwards (origin.lat/lon, dest.lat/lon, run.depart_at)
-    to the adapter
-  - Adapter result is returned verbatim (no shape mutation)
+    to the adapter (`external_verify.fetch_oebb_two_step` since #303 PR 4a)
+  - The adapter's verdict is returned verbatim (no shape mutation), with
+    ÖBB's connections as the modal's itineraries (`oebb_journeys.itinerary`)
 """
 
 from __future__ import annotations
@@ -187,15 +188,17 @@ async def test_verify_external_forwards_coords_and_depart_at_to_adapter(monkeypa
 
     async def fake_verify(**kwargs):
         captured.update(kwargs)
-        return external_verify.VerifyResult(
-            source="fahrplan.oebb.at",
-            ok=True,
-            num_connections=3,
-            best_duration_seconds=4 * 3600 + 15 * 60,
-            best_transfers=1,
+        return external_verify.HafasTripPayload(
+            verdict=external_verify.VerifyResult(
+                source="fahrplan.oebb.at",
+                ok=True,
+                num_connections=3,
+                best_duration_seconds=4 * 3600 + 15 * 60,
+                best_transfers=1,
+            )
         )
 
-    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", fake_verify)
+    monkeypatch.setattr(external_verify, "fetch_oebb_two_step", fake_verify)
 
     result = await api.verify_cell_external(
         run_id=run.id,
@@ -240,9 +243,9 @@ async def test_verify_external_returns_adapter_result_verbatim(monkeypatch):
     )
 
     async def fake_verify(**_kwargs):
-        return expected
+        return external_verify.HafasTripPayload(verdict=expected)
 
-    monkeypatch.setattr(external_verify, "verify_via_oebb_hafas", fake_verify)
+    monkeypatch.setattr(external_verify, "fetch_oebb_two_step", fake_verify)
 
     result = await api.verify_cell_external(
         run_id=run.id,
@@ -253,3 +256,50 @@ async def test_verify_external_returns_adapter_result_verbatim(monkeypatch):
     )
 
     assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_verify_external_answers_oebbs_connections_in_the_modal_shape(monkeypatch):
+    """The modal's ÖBB column is refreshed from `itineraries`: ÖBB's answer goes through the
+    HAFAS adapter (#303 PR 4a) and comes back in the shape the column reads — stop tokens,
+    Vienna wall clock to the minute, the label HAFAS shows."""
+    from app.api.admin import network_coverage as api
+    from app.network_coverage import external_verify
+    from tests.unit import canonical_fixtures as fx
+
+    run = _run_row()
+    db = _db_for(
+        run=run,
+        cell=_cell_row("bxl-mid", "gva-c"),
+        origin_hub=_hub_row("bxl-mid", 50.0, 4.0),
+        dest_hub=_hub_row("gva-c", 46.0, 6.0),
+    )
+    leg = {
+        "mode": "RAIL",
+        "from_uic": "UIC:8814001",
+        "to_uic": "OEBB:904050",
+        "dep": "2026-06-28T10:02",
+        "arr": "2026-06-28T14:30",
+        "route": "EC 41",
+    }
+    verdict = external_verify.VerifyResult(source="fahrplan.oebb.at", ok=True, num_connections=1)
+
+    async def fake_verify(**_kwargs):
+        return external_verify.HafasTripPayload(verdict=verdict, payload=fx.oebb_payload([leg]))
+
+    monkeypatch.setattr(external_verify, "fetch_oebb_two_step", fake_verify)
+
+    result = await api.verify_cell_external(
+        run_id=run.id,
+        origin_id="bxl-mid",
+        dest_id="gva-c",
+        db=db,
+        _=_fake_actor(),
+    )
+
+    assert (result.ok, result.num_connections) == (True, 1)
+    (itinerary,) = result.itineraries
+    (shown,) = itinerary.legs
+    assert (shown.from_uic, shown.to_uic) == ("UIC:8814001", "OEBB:904050")
+    assert (shown.dep_utc, shown.arr_utc) == ("2026-06-28T10:02", "2026-06-28T14:30")
+    assert shown.route_name == "EC 41"

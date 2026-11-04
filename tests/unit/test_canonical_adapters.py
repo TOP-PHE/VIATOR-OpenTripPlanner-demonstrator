@@ -17,7 +17,7 @@ import pytest
 
 from app.journey.canonical import CanonicalJourney, TransportMode, mode_family
 from app.journey.canonical_adapters import hafas_adapter, motis_adapter, ojp_adapter, otp_adapter
-from app.network_coverage import external_verify
+from app.network_coverage import oebb_journeys
 from tests.unit import canonical_fixtures as fx
 
 # ── MOTIS ──────────────────────────────────────────────────────────────────────────────
@@ -156,26 +156,56 @@ def test_hafas_numeric_product_category_does_not_break_the_adapter() -> None:
     assert leg.service.mode is TransportMode.OTHER
 
 
-def test_hafas_adapter_agrees_with_coverages_verify_itinerary() -> None:
-    """One HAFAS adapter for /journey and coverage (design §5.3): what coverage's
-    `VerifyLeg` says, the canonical leg says too, its naive Vienna time included."""
+def test_hafas_adapter_gives_coverage_what_its_own_parser_gave() -> None:
+    """One HAFAS adapter for /journey and coverage (design §5.3). Since #303 PR 4a the coverage
+    check reads ÖBB's answer through it (`oebb_journeys`); the values below are what the
+    check's own parser (deleted) gave for this answer, read off it before it went, with its two
+    differences: a connection without a date is dropped (it was kept as an empty itinerary),
+    and a time past midnight is the next day's (`01020000` was read as 01:02 on the same day).
+    """
     vienna = ZoneInfo("Europe/Vienna")
-    verified = external_verify._parse_hafas_response(fx.HAFAS_TRIP_SEARCH).itineraries
-    # Coverage keeps a connection without a date as an empty itinerary; the adapter drops it,
-    # like the /journey client. A difference PR 4 settles (HAFAS always sends a date).
-    assert [len(it.legs) for it in verified] == [1, 3, 3, 0]
-    for journey, itinerary in zip(_hafas(), verified[:3], strict=True):
-        for leg, verify_leg in zip(journey.legs, itinerary.legs, strict=True):
-            # Coverage calls an unknown section TRANSIT; the canonical leg has no mode.
-            assert (leg.source_mode or "TRANSIT") == verify_leg.mode
-            ends = ((leg.origin, verify_leg.from_uic), (leg.destination, verify_leg.to_uic))
-            for end, token in ends:
-                stop = end.stop_place
-                assert (f"UIC:{stop.uic}" if stop.uic else stop.unresolved_token) == token
-            local = leg.departure.timetabled.astimezone(vienna).replace(tzinfo=None)
-            assert local == datetime.fromisoformat(verify_leg.dep_utc)
-            if leg.service is not None:
-                assert verify_leg.route_name == (leg.service.published_name or leg.service.line)
+    journeys = _hafas()
+    shown = [oebb_journeys.itinerary(journey) for journey in journeys]
+    assert [
+        [
+            (leg.mode, leg.from_uic, leg.to_uic, leg.dep_utc, leg.arr_utc, leg.route_name)
+            for leg in it.legs
+        ]
+        for it in shown
+    ] == [
+        [("RAIL", "UIC:8103000", "UIC:8100002", "2026-06-28T08:00", "2026-06-28T10:45", "RJ 1141")],
+        [
+            ("WALK", "UIC:8100174", "UIC:8100173", "2026-11-03T09:10", "2026-11-03T09:14", None),
+            ("RAIL", "UIC:8100173", "UIC:8101134", "2026-11-03T09:14", "2026-11-03T10:11", "S 7"),
+            # Coverage calls an unknown section TRANSIT (the canonical leg has no mode).
+            ("TRANSIT", "UIC:8101134", "UIC:8101134", "2026-11-03T10:11", "2026-11-03T10:11", None),
+        ],
+        [
+            (
+                "BUS",
+                "OEBB:904050",
+                "UIC:8103000",
+                "2026-11-03T23:30",
+                "2026-11-03T23:45",
+                "Bus 34E",
+            ),
+            ("WALK", "UIC:8103000", "UIC:8103000", "2026-11-03T23:45", "2026-11-03T23:50", None),
+            # The old parser: arrival "2026-11-03T01:02".
+            (
+                "RAIL",
+                "UIC:8103000",
+                "UIC:8100002",
+                "2026-11-03T23:50",
+                "2026-11-04T02:00",
+                "RJ 1141",
+            ),
+        ],
+    ]
+    # The modal's Vienna wall clock is the canonical leg's instant, localised.
+    for journey, itinerary in zip(journeys, shown, strict=True):
+        for leg, shown_leg in zip(journey.legs, itinerary.legs, strict=True):
+            local = leg.departure.timetabled.astimezone(vienna).strftime("%Y-%m-%dT%H:%M")
+            assert local == shown_leg.dep_utc
 
 
 def test_hafas_empty_or_malformed_payloads_give_no_journey() -> None:

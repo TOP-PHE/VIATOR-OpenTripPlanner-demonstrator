@@ -41,8 +41,6 @@ import httpx
 
 from .canonical import CanonicalJourney
 from .canonical_adapters import otp_adapter
-from .canonical_adapters._common import source_rank
-from .canonical_adapters.trip_dict import to_trip_dict
 
 log = logging.getLogger(__name__)
 
@@ -295,14 +293,6 @@ async def fetch_journeys(
     return raw, otp_adapter.journeys_from_plan(raw, session_id=session_id)
 
 
-async def fetch_plan(**kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """`fetch_journeys`, as today's trip dicts with OTP's own itinerary under
-    `_raw_itinerary`: for the callers not on canonical journeys yet (coverage and replay,
-    #303 PR 4). Same arguments as `fetch_journeys`."""
-    raw, journeys = await fetch_journeys(**kwargs)
-    return raw, _with_raw_itineraries(raw, journeys)
-
-
 # Phase budgets other than the read (#388 review), as in `motis_client`.
 # OTP is a session-internal hop: a connection it does not accept within
 # 5 s is not coming, and before this the connect budget was the whole
@@ -319,25 +309,3 @@ def _plan_timeout(timeout_ms: int) -> httpx.Timeout:
     read_s = max(timeout_ms / 1000.0, 1.0)
     short_s = min(_CONNECT_WRITE_POOL_TIMEOUT_S, read_s)
     return httpx.Timeout(connect=short_s, read=read_s, write=short_s, pool=short_s)
-
-
-def _with_raw_itineraries(
-    raw: dict[str, Any], journeys: list[CanonicalJourney]
-) -> list[dict[str, Any]]:
-    """Today's trip dicts of `journeys` (the temporary `trip_dict` bridge, #303), each with
-    OTP's own itinerary node under `_raw_itinerary` for the journey page's JSON inspector; the
-    recorder stores only the named keys."""
-    edges = (((raw or {}).get("data") or {}).get("planConnection") or {}).get("edges") or []
-    return [
-        {
-            **to_trip_dict(journey),
-            "_raw_itinerary": (edges[source_rank(journey)] or {}).get("node") or {},
-        }
-        for journey in journeys
-    ]
-
-
-def _normalise(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Today's trip dicts for a `planConnection` answer (field mapping in
-    `canonical_adapters.otp_adapter`); stored verbatim in `journey_trips.legs`."""
-    return _with_raw_itineraries(raw, otp_adapter.journeys_from_plan(raw))
