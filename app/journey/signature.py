@@ -242,6 +242,17 @@ def _fingerprint_stop_token(
     return _round_latlon_coarse(lat, lon)
 
 
+def stop_token(
+    stop_id: str | None,
+    lat: float | None,
+    lon: float | None,
+    stop_code: str | None = None,
+) -> str:
+    """The stop token of `_fingerprint_stop_token`, for the canonical adapters: they read a
+    stop's UIC with exactly these rules, so the canonical model and the fingerprint agree."""
+    return _fingerprint_stop_token(stop_id, lat, lon, stop_code)
+
+
 def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
     """16-hex stable fingerprint of an itinerary's *transit* leg spine.
 
