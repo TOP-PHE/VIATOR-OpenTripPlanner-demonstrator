@@ -8,8 +8,8 @@ On a real PostgreSQL:
   `network_coverage_results.external_itineraries` → `external_journeys`);
 - a journey written by the recorder comes back equal from `journey_trips.journey`, through the
   coverage scorer's read (`runner._fetch_viator_journeys_for_search`) and the modal's read
-  (`_fetch_trips_by_search`, today's leg dicts through the bridge);
-- ÖBB's journeys stored on a result row come back as the modal's itineraries.
+  (`_fetch_trips_by_search`, the canonical JSON with its summary columns, #303 PR 4b);
+- ÖBB's journeys stored on a result row come back as canonical journeys.
 
 Invented values only (ZZ hubs, numbers with 99). Fresh-DB harness like the other integration
 tests; skips when Postgres is down.
@@ -185,6 +185,7 @@ def test_a_recorded_journey_comes_back_equal_through_both_reads() -> None:
     from app.api.admin.network_coverage import _fetch_trips_by_search
     from app.db import SessionLocal
     from app.journey import recorder
+    from app.journey.canonical import CanonicalJourney
     from app.journey.canonical_adapters.trip_dict import to_trip_dict
     from app.network_coverage import runner
 
@@ -225,7 +226,7 @@ def test_a_recorded_journey_comes_back_equal_through_both_reads() -> None:
     assert back == journey
     (trip,) = trips[str(search_id)]
     expected = to_trip_dict(journey)
-    assert trip["legs"] == expected["legs"]
+    assert CanonicalJourney.model_validate(trip["journey"]) == journey
     assert (trip["duration_seconds"], trip["num_transfers"], trip["modes"]) == (
         expected["duration_seconds"],
         expected["num_transfers"],
@@ -233,7 +234,7 @@ def test_a_recorded_journey_comes_back_equal_through_both_reads() -> None:
     )
 
 
-def test_oebb_journeys_stored_on_a_result_row_come_back_as_itineraries() -> None:
+def test_oebb_journeys_stored_on_a_result_row_come_back_as_journeys() -> None:
     url = _postgres_or_skip()
     _fresh_db(url, "head")
     engine = create_engine(url)
@@ -242,6 +243,7 @@ def test_oebb_journeys_stored_on_a_result_row_come_back_as_itineraries() -> None
     engine.dispose()
 
     from app.db import SessionLocal
+    from app.journey.canonical import CanonicalJourney
     from app.models import NetworkCoverageResult
     from app.network_coverage import oebb_journeys, runner
 
@@ -274,10 +276,13 @@ def test_oebb_journeys_stored_on_a_result_row_come_back_as_itineraries() -> None
         stored = db.get(NetworkCoverageResult, row_id)
         assert stored is not None
         assert stored.external_alignment_tier == "one_sided_oebb"
-        itineraries = oebb_journeys.stored_itineraries(stored.external_journeys)
-    assert itineraries is not None
-    (leg,) = itineraries[0]["legs"]
-    assert (leg["from_uic"], leg["to_uic"]) == ("UIC:8103000", "OEBB:904050")
-    assert (leg["dep_utc"], leg["arr_utc"]) == ("2099-09-09T11:09", "2099-09-09T12:39")
+        stored_journeys = stored.external_journeys
+    assert stored_journeys is not None
+    (back,) = [CanonicalJourney.model_validate(item) for item in stored_journeys]
+    assert back == oebb[0]
+    (leg,) = oebb_journeys.scoring_legs(back)
+    assert (leg["from_stop_id"], leg["to_stop_id"]) == ("UIC:8103000", "OEBB:904050")
+    # 11:09 Vienna (CEST) is 09:09 UTC.
+    assert leg["departure"] == "2099-09-09T09:09:00+00:00"
     # A uuid primary key came back: the row was really written and read.
     assert isinstance(row_id, uuid.UUID)

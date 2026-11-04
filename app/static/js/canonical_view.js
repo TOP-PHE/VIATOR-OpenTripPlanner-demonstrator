@@ -1,11 +1,12 @@
 /*
- * CanonicalView — the journey page's display model, built from CanonicalJourney JSON (#303).
+ * CanonicalView — the display model of a journey, built from CanonicalJourney JSON (#303).
  *
- * The fanout API sends canonical journeys (docs/schemas/canonical-journey-v1.schema.json).
- * The page's rendering code reads a flat display model; this file is the one place that turns
- * the first into the second, so no rendering code reads an engine's own fields. The display
- * fields keep the names the rendering code already uses, each with one meaning for every
- * engine:
+ * The fanout API and the coverage pages (cell modal, downloaded report, share page) send
+ * canonical journeys (docs/schemas/canonical-journey-v1.schema.json). Their rendering code reads
+ * a flat display model; this file is the one place that turns the first into the second, so no
+ * rendering code reads an engine's own fields. The downloaded report embeds this file's text (it
+ * must work offline). The display fields keep the names the rendering code already uses, each
+ * with one meaning for every engine:
  *
  *   mode                 a ride's mode family (RAIL, BUS, TRAM…); WALK (or BIKE, CAR) otherwise
  *   departure, arrival   UTC instants as the API writes them (…Z), the same form for every engine
@@ -15,6 +16,12 @@
  *   agency_name / _id    the operator's name / reference
  *   feed_id              the VIATOR feed of a ride; for a reference engine, its name
  *   first_transit_leg_departure_utc   the first ride's boarding time
+ *   rides_departure, rides_arrival, rides_duration_seconds
+ *                        the first ride's departure, the last ride's arrival, the time between:
+ *                        the journey without its walks at either end (instants, so time zones,
+ *                        daylight saving and midnight change nothing; null without a ride)
+ *   published_name       a ride's label as the source shows it (ÖBB `RJ 1141`)
+ *   from_stop, to_stop   the stop place of a leg end as received (its codes), or null
  *
  * `_canonical` keeps the journey as received: the JSON inspector shows it (design D3: the
  * engines' raw answers are no longer sent to the page).
@@ -78,6 +85,17 @@
     return out;
   }
 
+  function stopOf(place) {
+    return place && place.stop_place ? place.stop_place : null;
+  }
+
+  // Seconds between two instants as the API writes them (…Z), or null.
+  function secondsBetween(from, to) {
+    const start = Date.parse(from);
+    const end = Date.parse(to);
+    return Number.isFinite(start) && Number.isFinite(end) ? Math.round((end - start) / 1000) : null;
+  }
+
   function leg(canonicalLeg, journey) {
     const service = canonicalLeg.service || null;
     const operator = service && service.operator ? service.operator : null;
@@ -99,6 +117,9 @@
         agency_id: operator ? operator.ref || null : null,
         feed_id: feedOf(service, journey),
         trip_headsign: service ? service.destination_text || null : null,
+        published_name: service ? service.published_name || null : null,
+        from_stop: stopOf(canonicalLeg.origin),
+        to_stop: stopOf(canonicalLeg.destination),
       }
     );
   }
@@ -108,6 +129,8 @@
     const rides = (canonical.legs || []).filter((l) => l.kind === 'timed');
     const families = rides.map((l) => l.service && l.service.mode).filter(Boolean);
     const source = canonical.source || {};
+    const ridesDeparture = rides.length ? instant(rides[0].departure) : null;
+    const ridesArrival = rides.length ? instant(rides[rides.length - 1].arrival) : null;
     return {
       id: canonical.id,
       provider: source.provider || null,
@@ -121,6 +144,10 @@
       modes: Array.from(new Set(families)).sort().join(','),
       legs: (canonical.legs || []).map((l) => leg(l, canonical)),
       first_transit_leg_departure_utc: rides.length ? instant(rides[0].departure) : null,
+      rides_departure: ridesDeparture,
+      rides_arrival: ridesArrival,
+      rides_duration_seconds:
+        ridesDeparture && ridesArrival ? secondsBetween(ridesDeparture, ridesArrival) : null,
       via_hubs: source.via_hubs || [],
       stitched_from_sessions: source.stitched_from_sessions || [],
       _canonical: canonical,

@@ -102,6 +102,24 @@ def _sample_run() -> dict:
     }
 
 
+def _sample_journey() -> dict:
+    from tests.unit import canonical_fixtures as fx
+
+    return fx.journey_from_legs(
+        [
+            {
+                "mode": "RAIL",
+                "departure": "2026-06-29T06:25:00+02:00",
+                "arrival": "2026-06-29T07:48:00+02:00",
+                "duration_seconds": 4980,
+                "from_name": "Paris Nord",
+                "to_name": "Bruxelles-Midi",
+                "route_short_name": "EST 9201",
+            }
+        ]
+    ).model_dump(mode="json")
+
+
 def _sample_cells() -> dict[str, dict]:
     """Three cells covering ok / no_route / timeout so the template's
     status-specific branches all execute. The ok cell has a real trip
@@ -128,20 +146,8 @@ def _sample_cells() -> dict[str, dict]:
                     "departure_at": "2026-06-29T06:25:00+02:00",
                     "arrival_at": "2026-06-29T07:48:00+02:00",
                     "modes": "RAIL",
-                    "legs": [
-                        {
-                            "mode": "RAIL",
-                            "departure": "2026-06-29T06:25:00+02:00",
-                            "arrival": "2026-06-29T07:48:00+02:00",
-                            "duration_seconds": 4980,
-                            "from_name": "Paris Nord",
-                            "to_name": "Bruxelles-Midi",
-                            "route_short_name": "EST 9201",
-                            "agency_name": "Eurostar",
-                            "feed_id": "EUROSTAR",
-                            "trip_headsign": "Bruxelles-Midi",
-                        }
-                    ],
+                    # The trip's canonical journey (#303), as `_fetch_trips_by_search` sends it.
+                    "journey": _sample_journey(),
                 }
             ],
         },
@@ -354,11 +360,13 @@ def test_cells_embedded_as_valid_json_blob() -> None:
     parsed = json.loads(match.group(1))
     assert "p-nord:bxl-mid" in parsed
     assert parsed["p-nord:bxl-mid"]["status"] == "ok"
-    # Trip leg detail must be embedded so the modal can render it offline.
-    leg0 = parsed["p-nord:bxl-mid"]["trips"][0]["legs"][0]
-    assert leg0["mode"] == "RAIL"
-    assert leg0["from_name"] == "Paris Nord"
-    assert leg0["route_short_name"] == "EST 9201"
+    # Trip leg detail must be embedded so the modal can render it offline: the trip's
+    # canonical journey (#303), which the embedded view module reads.
+    leg0 = parsed["p-nord:bxl-mid"]["trips"][0]["journey"]["legs"][0]
+    assert leg0["kind"] == "timed"
+    assert leg0["origin"]["name"] == "Paris Nord"
+    assert leg0["service"]["mode"] == "RAIL"
+    assert leg0["service"]["line"] == "EST 9201"
 
 
 def test_hubs_embedded_as_valid_json_blob() -> None:
@@ -640,7 +648,7 @@ def test_build_export_context_attaches_trips_by_journey_search_id() -> None:
     ]
     trips = {
         exec_uuid: [
-            {"rank": 0, "duration_seconds": 4980, "num_transfers": 0, "legs": []},
+            {"rank": 0, "duration_seconds": 4980, "num_transfers": 0, "journey": None},
         ],
     }
     ctx = _build_export_context(
@@ -736,19 +744,16 @@ def _stored_oebb_journeys() -> list[dict]:
     return [journey.model_dump(mode="json") for journey in fx.oebb_journeys([leg])]
 
 
-def test_build_export_context_embeds_external_itineraries_only_when_opted_in() -> None:
+def test_build_export_context_embeds_external_journeys_only_when_opted_in() -> None:
     """The ÖBB side-by-side data rides the small-run download tier: the
     key is ALWAYS present (stable raw-JSON schema) but carries the
-    persisted itineraries only when the caller opts in — the share page
+    persisted journeys only when the caller opts in — the share page
     leaves it off and lazy-fetches per cell instead. The stored journeys
-    are served in the modal's itinerary shape (`oebb_journeys`, until PR 4b)."""
+    go out as they are: canonical JSON, read by canonical_view.js (#303)."""
     from app.api.admin.network_coverage import _build_export_context
-    from app.network_coverage import oebb_journeys
 
     stored = _stored_oebb_journeys()
-    oebb = oebb_journeys.stored_itineraries(stored)
-    assert oebb is not None
-    assert oebb[0]["legs"][0]["route_name"] == "EST 9317"
+    assert stored[0]["legs"][0]["service"]["published_name"] == "EST 9317"
     results = [
         _StubResult(
             origin_hub_id="p-nord",
@@ -766,23 +771,22 @@ def test_build_export_context_embeds_external_itineraries_only_when_opted_in() -
         ),
     ]
     common = {"run": _stub_run(), "results": results, "hubs": [_stub_hub_info()]}
-    on = _build_export_context(**common, trips_by_search={}, include_external_itineraries=True)
+    on = _build_export_context(**common, trips_by_search={}, include_external_journeys=True)
     off = _build_export_context(**common, trips_by_search={})
-    assert on["cells"]["p-nord:bxl-mid"]["external_itineraries"] == oebb
-    assert off["cells"]["p-nord:bxl-mid"]["external_itineraries"] is None
+    assert on["cells"]["p-nord:bxl-mid"]["external_journeys"] == stored
+    assert off["cells"]["p-nord:bxl-mid"]["external_journeys"] is None
 
 
-def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypatch) -> None:
+def test_export_run_html_embeds_external_journeys_on_small_runs_only(monkeypatch) -> None:
     """The download endpoint ties the ÖBB embed to the same threshold as
     leg detail: small runs get the offline side-by-side, large runs stay
     slim (their side-by-side lives on the share link)."""
     from fastapi.responses import HTMLResponse
 
     from app.api.admin import network_coverage as mod
-    from app.network_coverage import oebb_journeys
 
     stored = _stored_oebb_journeys()
-    oebb = oebb_journeys.stored_itineraries(stored)
+    oebb = stored
     captured: dict = {}
     monkeypatch.setattr(
         mod, "_fetch_trips_by_search", lambda _db, _ids, _depart_at=None, *, include_legs=True: {}
@@ -815,7 +819,7 @@ def test_export_run_html_embeds_external_itineraries_on_small_runs_only(monkeypa
             db=_MockDb(rows=[]),
             _=None,
         )
-        assert captured["context"]["cells"]["hub0:hub1"]["external_itineraries"] == expect
+        assert captured["context"]["cells"]["hub0:hub1"]["external_journeys"] == expect
 
 
 def test_side_by_side_wiring_present() -> None:
@@ -825,7 +829,7 @@ def test_side_by_side_wiring_present() -> None:
     cell modal."""
     html = _render()
     assert "renderComparison" in html
-    assert "renderExternalItinerary" in html
+    assert "renderExternalJourney" in html
     assert "ÖBB HAFAS" in html
     assert "VIATOR · MOTIS / OTP" in html
     assert 'class="sbs"' in html or ".sbs {" in html
@@ -1054,7 +1058,12 @@ def _trip_stub(execution_id, rank=0, legs=None, **overrides):
 
 
 def _modes_of(trip: dict) -> list[str]:
-    return [leg["mode"] for leg in trip["legs"]]
+    """The modes of a trip's legs, read from its stored canonical journey (#303)."""
+    from app.journey.canonical import CanonicalJourney
+    from app.journey.canonical_adapters.trip_dict import to_trip_dict
+
+    journey = CanonicalJourney.model_validate(trip["journey"])
+    return [leg["mode"] for leg in to_trip_dict(journey)["legs"]]
 
 
 def test_fetch_trips_by_search_returns_empty_when_no_search_ids() -> None:
@@ -1099,7 +1108,7 @@ def test_fetch_trips_by_search_groups_rows_by_search_id() -> None:
     assert len(out[str(search_a)]) == 2
     assert len(out[str(search_b)]) == 1
     assert out[str(search_a)][0]["rank"] == 0
-    # The stored journey's legs, as today's leg dicts (the modal reads them until PR 4b).
+    # The stored journey's legs.
     assert _modes_of(out[str(search_a)][0]) == ["RAIL"]
     assert _modes_of(out[str(search_a)][1]) == ["RAIL", "WALK"]
     assert out[str(search_a)][1]["num_transfers"] == 1
@@ -1222,9 +1231,9 @@ def test_fetch_trips_by_search_without_legs_returns_summaries_with_empty_legs() 
         "departure_at": "2026-06-29T06:25:00",
         "arrival_at": "2026-06-29T07:48:00",
         "modes": "RAIL",
-        "legs": [],
+        "journey": None,
     }
-    assert trips[1]["legs"] == []
+    assert trips[1]["journey"] is None
     assert trips[1]["departure_at"] is None
 
 
@@ -1408,6 +1417,7 @@ def test_export_run_html_renders_with_content_disposition(monkeypatch) -> None:
         "country_col_runs",
         "lazy_trips",
         "legs_omitted",
+        "canonical_view_script",
     }
     assert captured["context"]["cells"] == {}  # no results passed
     # A tiny run keeps the historical full-embed behaviour: nothing lazy,
@@ -1521,3 +1531,38 @@ def test_export_run_html_keeps_legs_at_exactly_the_pair_threshold(monkeypatch) -
     )
     assert captured["include_legs"] is True
     assert captured["context"]["legs_omitted"] is False
+
+
+def test_the_report_embeds_the_view_module_and_reads_canonical_journeys() -> None:
+    """#303 PR 4b: the report must work offline, so it embeds the view module's text; every
+    journey it draws goes through `CanonicalView.journey`, never an engine's own fields."""
+    from app.api.admin.network_coverage import canonical_view_js, canonical_view_script
+
+    view = canonical_view_js()
+    assert "root.CanonicalView = {" in view
+    html = _render(canonical_view_script=canonical_view_script())
+    # Printed as it is, inside its own script element (no escaping, no `|safe` in the template).
+    assert f"<script>{view}</script>" in html
+    template = (
+        Path(__file__).resolve().parents[2]
+        / "app"
+        / "templates"
+        / "admin"
+        / "network_coverage_export.html"
+    ).read_text(encoding="utf-8")
+    assert "{{ canonical_view_script }}" in template
+    assert "|safe" not in template
+    assert html.index(view) < html.index("function renderTrip(")
+    assert "CanonicalView.journey(trip.journey)" in html
+    assert "const view = CanonicalView.journey(journey);" in html
+    assert "cell.external_journeys" in html
+    assert "data.outbound.external_journeys" in html
+    for gone in ("external_itineraries", "dep_utc", "route_name", "from_uic"):
+        assert gone not in html, gone
+
+
+def test_a_trip_without_journey_keeps_its_summary() -> None:
+    """A large report carries no journey (`journey: None`): the card shows its summary only."""
+    html = _render()
+    assert "const view = trip.journey ? CanonicalView.journey(trip.journey) : null;" in html
+    assert "const legs = view ? view.legs.map(renderLeg).join('') : '';" in html

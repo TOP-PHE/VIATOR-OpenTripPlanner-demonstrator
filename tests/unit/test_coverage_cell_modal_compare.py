@@ -67,8 +67,8 @@ MODAL_HELPERS = [
     # Per-column body renderers — one each for VIATOR and ÖBB.
     "renderModalViatorColumn",
     "renderModalOebbColumn",
-    # Per-trip-card renderers — split by data shape (VIATOR's leg uses
-    # `mode`/`route_short_name`, ÖBB's VerifyLeg uses `mode`/`route_name`).
+    # Per-trip-card renderers — one per column (both read `CanonicalView`;
+    # ÖBB's leg shows ÖBB's label and names its stops through the module).
     "renderModalViatorTripCard",
     "renderModalOebbTripCard",
     "renderModalLeg",
@@ -78,6 +78,10 @@ MODAL_HELPERS = [
     "applyModalShowWalks",
     # Re-verify button's in-place ÖBB column refresh.
     "refreshModalOebbColumn",
+    # The leg predicate and the walk-free header (#303 PR 4b).
+    "isModalTransitLeg",
+    "modalRideBounds",
+    "modalTripHeadTimes",
 ]
 
 
@@ -126,25 +130,50 @@ def test_viator_trip_card_rank_badge_uses_array_position(template_text: str):
     take a 2nd `idx` param (trips.map(renderModalViatorTripCard) already
     passes it) and badge by array position instead.
 
-    No "old pattern is gone" negative check here — the dead (never
-    called) legacy `renderTripCard` function still has the old
-    `trip.rank`-based badge and isn't in this fix's scope, so a blanket
-    file-wide absence check would be a false positive against it."""
+    The dead legacy `renderTripCard` (and its `trip.rank` badge) is gone
+    since #303 PR 4b, so the old pattern is checked absent too."""
     assert re.search(
         r"function\s+renderModalViatorTripCard\s*\(\s*trip\s*,\s*idx\s*\)", template_text
     ), "renderModalViatorTripCard must accept an idx param to badge by array position"
     assert 'cov-trip-rank">#${idx + 1}' in template_text
+    assert "trip.rank || 0" not in template_text
+    assert "function renderTripCard(" not in template_text
 
 
-def test_oebb_column_reads_external_itineraries(template_text: str):
+def test_oebb_column_reads_external_journeys(template_text: str):
     """The ÖBB column body MUST read from CellTripsDirection.
-    external_itineraries (populated by PR-196a's sweep) — anything
-    else would mean we're re-querying HAFAS at modal-open time, which
-    defeats the persistence point of PR-196a."""
-    assert "external_itineraries" in template_text, (
-        "The ÖBB column body must source from dir.external_itineraries "
-        "(persisted by PR-196a) — no live ÖBB calls at modal-open time."
+    external_journeys (ÖBB's canonical journeys, persisted by the sweep)
+    — anything else would mean we're re-querying HAFAS at modal-open
+    time, which defeats the persistence point of PR-196a."""
+    assert "renderModalOebbColumn(dir.external_journeys || [])" in template_text, (
+        "The ÖBB column body must source from dir.external_journeys "
+        "(persisted by the sweep) — no live ÖBB calls at modal-open time."
     )
+    assert "external_itineraries" not in template_text
+
+
+def test_both_columns_read_canonical_journeys_through_the_view_module(template_text: str):
+    """#303 PR 4b: the modal reads canonical journey JSON through the one view module, never an
+    engine's own fields or a server-made display shape."""
+    assert '<script src="/static/app/js/canonical_view.js"></script>' in template_text
+    assert template_text.index("/static/app/js/canonical_view.js") < template_text.index(
+        "function renderModalViatorTripCard("
+    )
+    assert "CanonicalView.journey(trip.journey)" in template_text
+    assert "renderModalOebbTripCard(CanonicalView.journey(journey))" in template_text
+    for gone in ("dep_utc", "arr_utc", "route_name", "_id_raw", "'_uic'"):
+        assert gone not in template_text, gone
+
+
+def test_oebb_stop_numbers_come_from_the_stop_place(template_text: str):
+    """The station module is asked about ÖBB's stop number: HAFAS's extId (`codes.OEBB_EXT`),
+    else the number of its token (`uic`, an `OEBB:` payload)."""
+    start = template_text.find("function oebbStopNumber(")
+    body = template_text[start : template_text.find("\n}\n", start)]
+    assert "leg[end + '_stop']" in body
+    assert "codes.OEBB_EXT" in body
+    assert "stop.uic" in body
+    assert "stop.unresolved_token.replace(/^OEBB:/, '')" in body
 
 
 def test_no_itineraries_placeholder_present(shared_js_text: str):
@@ -197,10 +226,10 @@ def test_show_walks_toggle_is_wired(template_text: str):
     variable + localStorage key exist; (3) the change handler flips
     state AND calls applyModalShowWalks() — not a re-render, since the
     score must stay canonical from the sweep."""
-    # (1) Toggle DOM contract — both the visible id and the delegated
-    # data-action attribute (the delegated handler uses data-action so
-    # it survives modal re-opens).
-    assert 'id="modal-show-walks"' in template_text
+    # (1) Toggle DOM contract — the delegated data-action attribute (it
+    # survives modal re-opens). No id: a run in both directions renders
+    # two toggles, and two equal ids were #227's review finding 5.
+    assert 'id="modal-show-walks"' not in template_text
     assert 'data-action="modal-show-walks"' in template_text
     # (2) State variable + localStorage key.
     assert "MODAL_SHOW_WALKS" in template_text
@@ -250,12 +279,13 @@ def test_modal_layout_dispatches_through_compare_grid(template_text: str):
 def test_reverify_refreshes_modal_in_place(template_text: str):
     """The PR-196b Re-verify UX improvement: clicking Re-verify must
     update the ÖBB column body in place with the live-query results
-    (verifyResult.itineraries), not just render the verdict string.
-    The handler in question is handleVerifyExternal → refreshModalOebbColumn."""
+    (VerifyResult.journeys, canonical JSON), not just render the verdict
+    string. The handler in question is handleVerifyExternal →
+    refreshModalOebbColumn."""
     assert "refreshModalOebbColumn" in template_text
     # And the call site is inside the verify-external success branch:
-    assert "payload.itineraries" in template_text, (
-        "handleVerifyExternal must hand the VerifyResult.itineraries "
+    assert "refreshModalOebbColumn(block, payload.journeys || [])" in template_text, (
+        "handleVerifyExternal must hand the VerifyResult.journeys "
         "to refreshModalOebbColumn — otherwise the ÖBB column doesn't "
         "actually refresh on re-verify."
     )
@@ -424,14 +454,15 @@ def test_no_operator_facing_copy_still_promises_tomorrow(template_text: str):
 # describe the remaining legs: first train's departure -> last train's arrival.
 
 
-def test_modal_non_transit_modes_matches_the_backend_set(template_text: str):
-    """A bare `mode !== 'WALK'` would keep a MOTIS TRANSFER leg (and a HAFAS
-    section with mode: null) visible while excluding it from the recomputed
-    header — the exact divergence `_NON_TRANSIT_MODES` exists to prevent, and
-    the bug PR #222 fixed once already in journey.html."""
-    assert "const MODAL_NON_TRANSIT_MODES = new Set(['WALK', 'TRANSFER', ''])" in template_text
-    assert "function isModalTransitLeg(leg)" in template_text
-    assert ".toUpperCase()" in template_text
+def test_a_ride_is_a_timed_leg(template_text: str):
+    """The toggle hides every leg that is not a ride; the row's chip comes from the same leg
+    (`CanonicalView.leg`), so a row never prints a mode and hides as a walk (#227's review,
+    finding 6). This replaced a mode set copied by hand, whose test checked nothing real."""
+    start = template_text.find("function isModalTransitLeg(leg)")
+    assert start != -1, "isModalTransitLeg missing"
+    body = template_text[start : template_text.find("\n}\n", start)]
+    assert "leg.kind === 'timed'" in body
+    assert "MODAL_NON_TRANSIT_MODES" not in template_text
 
 
 def test_both_leg_renderers_hide_via_the_canonical_predicate(template_text: str):
@@ -446,17 +477,20 @@ def test_both_leg_renderers_hide_via_the_canonical_predicate(template_text: str)
         )
 
 
-def test_transit_bounds_helper_and_overnight_guard(template_text: str):
-    start = template_text.find("function modalTransitBounds(")
-    assert start != -1, "modalTransitBounds missing"
+def test_the_walk_free_header_comes_from_the_view_not_from_clock_arithmetic(template_text: str):
+    """#227's review: subtracting two parsed wall-clock strings broke across midnight, daylight
+    saving time and the viewer's zone (a NightJet 5h45 became 4h02). The header now takes the
+    first ride's departure, the last ride's arrival and the time between from the view module,
+    which reads UTC instants."""
+    start = template_text.find("function modalRideBounds(view)")
+    assert start != -1, "modalRideBounds missing"
     body = template_text[start : template_text.find("\n}\n", start)]
-    assert "filter(isModalTransitLeg)" in body
-    # HAFAS anchors every leg to the connection's single `date` and
-    # `_hafas_time_to_utc_iso` drops the day-roll prefix, so an arrival after
-    # midnight parses EARLIER than its departure. Without the roll-forward the
-    # header would show a negative duration on every NightJet.
-    assert "seconds += 86400" in body, "overnight roll-forward guard missing"
-    assert "Number.isFinite(seconds)" in body
+    assert "view.rides_duration_seconds" in body
+    assert "view.rides_departure" in body
+    assert "view.rides_arrival" in body
+    assert "modalTransitBounds" not in template_text
+    assert "seconds += 86400" not in template_text
+    assert "new Date(arr) - new Date(dep)" not in template_text
 
 
 def test_header_emits_both_variants_and_toggle_swaps_them(template_text: str):
@@ -466,6 +500,9 @@ def test_header_emits_both_variants_and_toggle_swaps_them(template_text: str):
     body = template_text[start : template_text.find("\n}\n", start)]
     assert "[data-walks]" in body, "applyModalShowWalks must swap the header variants"
     assert "MODAL_SHOW_WALKS" in body
+    # Every section's toggle follows the one flipped (#227's review, finding 5).
+    assert '[data-action="modal-show-walks"]' in body
+    assert "box.checked = MODAL_SHOW_WALKS" in body
 
 
 def test_initial_render_bakes_in_the_persisted_preference(template_text: str):
@@ -481,8 +518,13 @@ def test_initial_render_bakes_in_the_persisted_preference(template_text: str):
     assert "MODAL_SHOW_WALKS ? ' hidden' : ''" in body
 
 
-def test_both_cards_recompute_with_their_own_leg_field_names(template_text: str):
-    """VIATOR legs carry `departure`/`arrival`; OeBB VerifyLegs carry
-    `dep_utc`/`arr_utc`. One missing call would silently fix a single column."""
-    assert "modalTransitBounds(trip.legs, 'departure', 'arrival')" in template_text
-    assert "modalTransitBounds(it.legs, 'dep_utc', 'arr_utc')" in template_text
+def test_both_cards_take_their_header_from_the_same_helper(template_text: str):
+    """One column computing its header differently would fix one column only."""
+    assert template_text.count("modalRideBounds(view)") == 3  # definition + two cards
+
+
+def test_the_summary_says_its_best_is_door_to_door(template_text: str):
+    """#227's review, finding 4: with walks hidden by default the cards show the walk-free
+    header, so a bare "best 2h38" above "08:10 → 10:06 · 1h56" read as a contradiction. The
+    persisted best is door to door, and says so."""
+    assert "fmtDuration(dir.best_duration_seconds) + ' door to door'" in template_text
