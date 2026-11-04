@@ -118,6 +118,10 @@ class _NoTrips:
         await asyncio.sleep(0)
         return {"itineraries": []}, []
 
+    async def fetch_journeys(self, **_kw: Any) -> tuple[dict[str, Any], list[Any]]:
+        await asyncio.sleep(0)
+        return {"itineraries": []}, []
+
 
 # ─────────────────────── the moved steps, one test each ───────────────────────
 

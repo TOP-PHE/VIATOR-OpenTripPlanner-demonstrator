@@ -343,16 +343,19 @@ each step is worth reading in the source, but the shape is:
 | `compare_ojp` / `compare_hafas` | bool | per-search opt-in, both default false |
 | `engine` | `"otp"` \| `"motis"` \| null | null = no filter |
 
-Fanout response:
+Fanout response — every journey in it is a **CanonicalJourney** as JSON (#303;
+`docs/schemas/canonical-journey-v1.schema.json`, times in UTC `…Z`). The page turns them into its
+display model in one place, `app/static/js/canonical_view.js`; no engine payload is sent
+(`_raw_itinerary` is gone, the `{}` button shows the canonical journey):
 
 | Key | Present when | Shape |
 |---|---|---|
 | `search_id`, `status` | always | `ok` \| `partial` \| `no_route` \| `error` |
-| `trips[]` | always | `{signature, found_in_sessions[], by_session{}, best, origin_flag, comparison?}` |
+| `trips[]` | always | `{signature, found_in_sessions[], by_session{}, best, origin_flag, comparison?}`; `best` is the slot's shortest canonical journey |
 | `executions[]` | always | `{session_id, engine, graph_snapshot_id?, status, num_itineraries, response_ms, reason?, detail?, timetable_window?}`; the last three only when the engine refused the date (#338): `reason` = `outside_timetable`, `timetable_window` = `{from, until}` (UTC, end excluded) when MOTIS named it |
-| `ojp_reference` / `hafas_reference` | opt-in + configured | `{status, trips[], response_ms, error?, pages?}` |
+| `ojp_reference` / `hafas_reference` | opt-in + configured | `{status, trips[], response_ms, error?, pages?}`; `trips[]` canonical journeys, ids unique across pages; OJP also `comparison{journey id: tag}` |
 | `comparison_summary` | OJP returned `ok` | `{common, otp_only, ojp_only}` |
-| `federated_trips[]` | nothing merged + both UICs | hub-stitched itineraries, rendered separately |
+| `federated_trips[]` | nothing merged + both UICs | hub-stitched canonical journeys (`source.via_hubs`, `source.stitched_from_sessions`), rendered separately |
 
 ### Invariants & traps
 

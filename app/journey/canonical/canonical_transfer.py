@@ -55,3 +55,19 @@ def derive_transfers(legs: Sequence[CanonicalLeg]) -> list[CanonicalTransfer]:
         previous = index
         walk = 0
     return out
+
+
+def mark_transfers(legs: Sequence[CanonicalLeg]) -> list[CanonicalLeg]:
+    """A non-timed leg between two timed legs is a `transfer`, any other one `continuous`
+    (OJP's `TransferLeg` vs `ContinuousLeg`), for sources that do not say which, and for a
+    federated stitch, whose legs come from several journeys."""
+    timed = [index for index, leg in enumerate(legs) if leg.is_timed]
+    if len(timed) < 2:
+        return list(legs)
+    first, last = timed[0], timed[-1]
+    return [
+        leg.model_copy(update={"kind": "transfer"})
+        if not leg.is_timed and first < index < last
+        else leg
+        for index, leg in enumerate(legs)
+    ]

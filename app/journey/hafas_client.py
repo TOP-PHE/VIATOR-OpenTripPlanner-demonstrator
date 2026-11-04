@@ -57,6 +57,7 @@ from .canonical_adapters import hafas_adapter
 from .canonical_adapters.trip_dict import to_trip_dicts
 from .trip_normalize import dedup_batch_and_track_latest_dep as _dedup_batch_and_track_latest_dep
 from .trip_normalize import next_anchor_or_none as _next_anchor_or_none
+from .trip_normalize import renumbered
 
 log = logging.getLogger(__name__)
 
@@ -261,7 +262,7 @@ async def fetch_plan_paginated(
             stopped_reason=stopped_reason,
             has_trips=bool(all_trips),
         ),
-        all_trips,
+        renumbered(all_trips),
     )
 
 

@@ -536,3 +536,76 @@ def reference_journey(
         duration_seconds=1800,
         source_transfer_count=0,
     )
+
+
+_NOT_RIDES = ("", "WALK", "TRANSFER")
+
+
+def journey_from_legs(
+    legs: list[dict[str, Any]],
+    *,
+    provider: Provider = "otp",
+    role: str = "viator",
+    rank: int = 0,
+    departure_at: str | None = None,
+    arrival_at: str | None = None,
+    duration_seconds: int | None = None,
+    transfers: int | None = None,
+) -> CanonicalJourney:
+    """A canonical journey from the simple leg dicts older tests write (`mode`,
+    `from_stop_id` / `to_stop_id`, `from_lat`…, `departure` / `arrival` ISO, `route_short_name`):
+    the bridge gives those legs back, so `transit_fingerprint` and every rule written on the
+    old dicts see the same values."""
+    from app.journey.canonical import mode_family
+    from app.journey.canonical_adapters._common import location, position, viator_stop_place
+
+    def at(value: str | None) -> CanonicalTiming | None:
+        return CanonicalTiming(timetabled=datetime.fromisoformat(value)) if value else None
+
+    def end(leg: dict[str, Any], prefix: str) -> CanonicalLocation:
+        place = position(leg.get(f"{prefix}_lat"), leg.get(f"{prefix}_lon"))
+        ref = leg.get(f"{prefix}_stop_id")
+        name = leg.get(f"{prefix}_name")
+        if not ref:
+            return location(None, name, place)
+        stop = viator_stop_place(source=f"{provider}:test", ref=ref, name=name, at=place)
+        return location(stop, name, place)
+
+    canonical_legs = []
+    for leg in legs:
+        mode = leg.get("mode")
+        ride = str(mode or "").upper() not in _NOT_RIDES
+        route = leg.get("route_short_name")
+        canonical_legs.append(
+            CanonicalLeg(
+                kind="timed" if ride else "continuous",
+                origin=end(leg, "from"),
+                destination=end(leg, "to"),
+                departure=at(leg.get("departure")),
+                arrival=at(leg.get("arrival")),
+                duration_seconds=int(leg.get("duration_seconds") or 0),
+                service=CanonicalService(mode=mode_family(mode), line=route, published_name=route)
+                if ride
+                else None,
+                continuous_mode=None if ride else "WALK",
+                source_mode=mode,
+            )
+        )
+    first = departure_at or next((lg.get("departure") for lg in legs if lg.get("departure")), None)
+    last = arrival_at or next(
+        (lg.get("arrival") for lg in reversed(legs) if lg.get("arrival")), None
+    )
+    start, stop = at(first), at(last)
+    if duration_seconds is None:
+        duration_seconds = (
+            int((stop.timetabled - start.timetabled).total_seconds()) if start and stop else 0
+        )
+    return CanonicalJourney(
+        id=f"{provider}:test:{rank}",
+        source=JourneySource(provider=provider, role=role, adapter_version=1),  # type: ignore[arg-type]
+        legs=canonical_legs,
+        departure=start,
+        arrival=stop,
+        duration_seconds=max(0, duration_seconds),
+        source_transfer_count=transfers,
+    )

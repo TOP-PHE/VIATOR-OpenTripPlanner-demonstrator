@@ -25,9 +25,10 @@ from ..journey import (
     planner_dispatch,
     recorder,
     timetable_window,
-    trip_normalize,
 )
-from ..journey.canonical_adapters.trip_dict import to_trip_dicts
+from ..journey.canonical import CanonicalJourney, CanonicalTiming
+from ..journey.canonical_adapters.trip_dict import to_trip_dict, to_trip_dicts
+from ..journey.federated_planner import journey_transit_fingerprint
 from ..models import GraphSnapshot, JourneySearch
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
@@ -173,10 +174,8 @@ async def _query_session(
     *,
     num_itineraries: int,
     search_window_seconds: int,
-) -> tuple[
-    str, dict[str, Any], list[dict[str, Any]], int, timetable_window.OutsideTimetable | None
-]:
-    """Returns (status, raw, trips, response_ms, outside_timetable).
+) -> _QueryResult:
+    """Returns (status, raw, journeys, response_ms, outside_timetable).
 
     `outside_timetable` is set when the engine refused the date because its
     loaded timetable does not cover it (#338): MOTIS with an HTTP 400 (status
@@ -192,7 +191,7 @@ async def _query_session(
     start = time.monotonic()
     try:
         _when_kind, when = _resolve_when(body)
-        raw, trips = await planner_dispatch.get_planner(session).fetch_plan(
+        raw, trips = await planner_dispatch.get_planner(session).fetch_journeys(
             session_id=session.id,
             from_lat=body.from_.lat,
             from_lon=body.from_.lon,
@@ -270,8 +269,7 @@ async def _query_ojp_reference(
         )
         result: dict[str, Any] = {
             "status": "ok" if trips else "no_route",
-            # Today's trip dicts until the page reads canonical journeys (#303).
-            "trips": to_trip_dicts(trips),
+            "trips": trips,
             "response_ms": _ms(),
         }
         # Surface page count so the UI / operator can see whether
@@ -368,8 +366,7 @@ async def _query_hafas_reference(
         status = str(raw.get("status") or ("ok" if trips else "no_route"))
         result: dict[str, Any] = {
             "status": status,
-            # Today's trip dicts until the page reads canonical journeys (#303).
-            "trips": to_trip_dicts(trips),
+            "trips": trips,
             "response_ms": _ms(),
         }
         if raw.get("error"):
@@ -427,10 +424,11 @@ def _build_comparison(
 
     Returns a `{common, otp_only, ojp_only}` count summary, or None when
     there's nothing to compare (no OJP reference at all, or the OJP call
-    didn't succeed). **Mutates `merged_trips` and the trip dicts inside
-    `ojp_reference["trips"]`** by attaching a `comparison` key with one
+    didn't succeed). **Mutates `merged_trips`** (a `comparison` key on each
+    slot) **and `ojp_reference`** (`comparison`: OJP journey id → tag), with one
     of `'common' | 'otp_only' | 'ojp_only' | 'uncomparable'` — the
-    journey UI renders that as a per-card badge.
+    journey UI renders that as a per-card badge. The key is still
+    `transit_fingerprint` of each journey's legs as today's dicts (#303 D5).
 
     Why the per-itinerary tag *plus* the summary: the summary tells the
     operator "the engines agree on N journeys" at a glance; the per-
@@ -445,16 +443,10 @@ def _build_comparison(
     """
     if ojp_reference is None or ojp_reference.get("status") != "ok":
         return None
-    # Imported here rather than at module scope so the journey.py
-    # import graph doesn't pull signature.py until a request actually
-    # exercises this path. Same pattern as the existing trip_signature
-    # import in the fanout body above.
-    from ..journey.signature import transit_fingerprint
+    ojp_trips: list[CanonicalJourney] = ojp_reference.get("trips") or []
 
-    ojp_trips: list[dict[str, Any]] = ojp_reference.get("trips") or []
-
-    otp_fps = [transit_fingerprint(mt["best"].get("legs") or []) for mt in merged_trips]
-    ojp_fps = [transit_fingerprint(ot.get("legs") or []) for ot in ojp_trips]
+    otp_fps = [journey_transit_fingerprint(mt["best"]) for mt in merged_trips]
+    ojp_fps = [journey_transit_fingerprint(ot) for ot in ojp_trips]
 
     otp_set = {fp for fp in otp_fps if fp}
     ojp_set = {fp for fp in ojp_fps if fp}
@@ -467,14 +459,32 @@ def _build_comparison(
 
     for mt, fp in zip(merged_trips, otp_fps, strict=True):
         mt["comparison"] = _tag(fp, "otp_only")
-    for ot, fp in zip(ojp_trips, ojp_fps, strict=True):
-        ot["comparison"] = _tag(fp, "ojp_only")
+    # A canonical journey carries no comparison: the reference says it per journey id.
+    ojp_reference["comparison"] = {
+        ot.id: _tag(fp, "ojp_only") for ot, fp in zip(ojp_trips, ojp_fps, strict=True)
+    }
 
     return {
         "common": len(common_set),
         "otp_only": len(otp_set - common_set),
         "ojp_only": len(ojp_set - common_set),
     }
+
+
+def _journey_json(journey: CanonicalJourney) -> dict[str, Any]:
+    """A canonical journey as the API sends it: its own fields only (design D3: no engine
+    payload; the derived values are the page's to compute)."""
+    return journey.model_dump(mode="json")
+
+
+def _instant_json(timing: CanonicalTiming | None) -> str | None:
+    """A time as the journey JSON writes it (UTC, `…Z`)."""
+    return timing.model_dump(mode="json")["timetabled"] if timing is not None else None
+
+
+def _reference_json(reference: dict[str, Any]) -> dict[str, Any]:
+    """A reference engine's answer with its journeys as JSON."""
+    return {**reference, "trips": [_journey_json(j) for j in reference.get("trips") or []]}
 
 
 def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
@@ -487,7 +497,7 @@ def _origin_flag(found_in: list[str], all_fanout: list[str]) -> str:
     return "SUBSET"
 
 
-def _boarding_ts(trip: dict[str, Any]) -> float | None:
+def _boarding_ts(trip: CanonicalJourney) -> float | None:
     """The trip's BOARDING instant as an epoch float, or None.
 
     Prefers `first_transit_leg_departure_utc` — the repo's canonical
@@ -499,14 +509,13 @@ def _boarding_ts(trip: dict[str, Any]) -> float | None:
     trip — usually a walk leg — and comparing one engine's walk start
     against another's would shift the boundary by the access-walk length.
     """
-    return trip_normalize.max_dep_ts(
-        None, trip.get("first_transit_leg_departure_utc") or trip.get("departure_at")
-    )
+    boarding = trip.first_boarding or trip.departure
+    return boarding.timetabled.timestamp() if boarding is not None else None
 
 
 def _truncate_hafas_to_viator_window(
     hafas_reference: dict[str, Any] | None, viator_trips: list[dict[str, Any]]
-) -> None:
+) -> None:  # viator_trips: the merged slots, each with its `best` CanonicalJourney
     """Mutate `hafas_reference['trips']` in place, dropping any ÖBB trip
     boarding after VIATOR's own latest boarding.
 
@@ -530,7 +539,7 @@ def _truncate_hafas_to_viator_window(
     """
     if not hafas_reference or not viator_trips:
         return
-    latest_viator_ts = _latest_boarding_ts(t.get("best") or {} for t in viator_trips)
+    latest_viator_ts = _latest_boarding_ts(t["best"] for t in viator_trips if t.get("best"))
     if latest_viator_ts is None:
         return
     trips = hafas_reference.get("trips") or []
@@ -542,7 +551,7 @@ def _truncate_hafas_to_viator_window(
         hafas_reference["trimmed_to_viator_window"] = True
 
 
-def _latest_boarding_ts(trips: Iterable[dict[str, Any]]) -> float | None:
+def _latest_boarding_ts(trips: Iterable[CanonicalJourney]) -> float | None:
     """Max `_boarding_ts` across `trips`, or None if none are parseable."""
     stamps = [ts for t in trips if (ts := _boarding_ts(t)) is not None]
     return max(stamps) if stamps else None
@@ -684,7 +693,7 @@ async def fanout(
     # Only when the form sent UIC endpoints — the planner queries stations by
     # UIC. Best-effort: a failure here never 500s the whole search.
     # See docs/federated-planner-design.md.
-    federated_trips: list[dict[str, Any]] = []
+    federated_trips: list[CanonicalJourney] = []
     if not merged_trips and federate:
         federated_trips = await _federated_fallback(db, body, when, sessions, timeout_ms)
         if federated_trips and status != "error":
@@ -706,7 +715,7 @@ async def fanout(
     response: dict[str, Any] = {
         "search_id": str(recorded.search_id),
         "status": status,
-        "trips": merged_trips,
+        "trips": [{**slot, "best": _journey_json(slot["best"])} for slot in merged_trips],
         "executions": recorded.executions,
     }
     # Present only when the operator opted into the OJP comparison and the
@@ -714,19 +723,19 @@ async def fanout(
     # "Reference (Swiss OJP)" panel. Never merged into `trips`/`executions`
     # and never persisted (Phase 1 — live display only).
     if ojp_reference is not None:
-        response["ojp_reference"] = ojp_reference
+        response["ojp_reference"] = _reference_json(ojp_reference)
     # Same shape, separate panel — ÖBB HAFAS as a second comparison
     # engine alongside OJP. Operators can toggle either or both per
     # search; the UI renders one panel per reference.
     if hafas_reference is not None:
-        response["hafas_reference"] = hafas_reference
+        response["hafas_reference"] = _reference_json(hafas_reference)
     if comparison_summary is not None:
         response["comparison_summary"] = comparison_summary
     # Stitched cross-session itineraries (hub-and-spoke fallback). Rendered as a
     # separate "Federated (via hub)" group in the journey UI — never merged into
     # `trips`, since each spans 2+ sessions and a hub.
     if federated_trips:
-        response["federated_trips"] = federated_trips
+        response["federated_trips"] = [_journey_json(j) for j in federated_trips]
     return response
 
 
@@ -766,8 +775,8 @@ async def _federated_fallback(
     when: datetime,
     sessions: list[SessionRow],
     timeout_ms: int,
-) -> list[dict[str, Any]]:
-    """The federated planner's stitched trips; `[]` when it fails (logged,
+) -> list[CanonicalJourney]:
+    """The federated planner's stitched journeys; `[]` when it fails (logged,
     never a 500)."""
     import logging
 
@@ -800,8 +809,9 @@ def _reload_sessions(db: DbSession, sessions: list[SessionRow]) -> None:
         db.refresh(session)
 
 
+# (status, raw engine answer, canonical journeys, response ms, outside-timetable refusal)
 _QueryResult = tuple[
-    str, dict[str, Any], list[dict[str, Any]], int, timetable_window.OutsideTimetable | None
+    str, dict[str, Any], list[CanonicalJourney], int, timetable_window.OutsideTimetable | None
 ]
 
 
@@ -912,7 +922,8 @@ def _record_session_execution(
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
         error_message=refusal.detail() if refusal else None,
-        trips=trips,
+        # Stored as today's trip dicts until storage holds canonical journeys (#303 PR 4).
+        trips=to_trip_dicts(trips),
     )
     summary: dict[str, Any] = {
         "session_id": session.id,
@@ -934,30 +945,32 @@ def _merge_by_signature(
     db: DbSession,
     by_signature: dict[str, dict[str, Any]],
     session_id: str,
-    trips: list[dict[str, Any]],
+    journeys: list[CanonicalJourney],
 ) -> None:
-    """Merge one session's trips by signature for the response payload."""
+    """Merge one session's journeys by signature for the response payload: the signature
+    keeps its rules (on the journey's legs as today's dicts), `best` is the shortest
+    journey of the slot."""
     from ..journey.signature import trip_signature
 
-    for trip in trips:
-        sig = trip_signature(db, session_id=session_id, legs=trip.get("legs", []))
+    for journey in journeys:
+        sig = trip_signature(db, session_id=session_id, legs=to_trip_dict(journey)["legs"])
         slot = by_signature.setdefault(
             sig,
             {
                 "signature": sig,
                 "found_in_sessions": [],
                 "by_session": {},
-                "best": trip,
+                "best": journey,
             },
         )
         slot["found_in_sessions"].append(session_id)
         slot["by_session"][session_id] = {
-            "duration_seconds": trip["duration_seconds"],
-            "departure_at": trip["departure_at"],
-            "arrival_at": trip["arrival_at"],
+            "duration_seconds": journey.duration_seconds,
+            "departure_at": _instant_json(journey.departure),
+            "arrival_at": _instant_json(journey.arrival),
         }
-        if trip["duration_seconds"] < slot["best"]["duration_seconds"]:
-            slot["best"] = trip
+        if journey.duration_seconds < slot["best"].duration_seconds:
+            slot["best"] = journey
 
 
 def _fanout_status(statuses: list[str], any_trip: bool) -> str:
@@ -1002,7 +1015,8 @@ def _record_plan(
         response_ms=response_ms,
         raw_response=raw if cfg.get("STORE_RAW_RESPONSE", True) else None,
         error_message=refusal.detail() if refusal else None,
-        trips=trips,
+        # Stored as today's trip dicts until storage holds canonical journeys (#303 PR 4).
+        trips=to_trip_dicts(trips),
     )
     recorder.finish_search(
         db,
@@ -1047,7 +1061,7 @@ async def plan(
     return {
         "search_id": str(search_id),
         "status": status,
-        "trips": trips,
+        "trips": [_journey_json(journey) for journey in trips],
         **_refusal_fields(refusal),
     }
 

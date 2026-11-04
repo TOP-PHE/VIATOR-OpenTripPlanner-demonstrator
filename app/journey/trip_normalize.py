@@ -169,3 +169,13 @@ def next_anchor_or_none(latest_dep_ts: float | None, target_end_ts: float) -> da
     if latest_dep_ts >= target_end_ts:
         return None
     return datetime.fromtimestamp(latest_dep_ts + 60.0, tz=UTC)
+
+
+def renumbered(journeys: list[CanonicalJourney]) -> list[CanonicalJourney]:
+    """The journeys of several pages with ids unique in their union: an adapter numbers
+    the journeys of one answer (`<provider>:<scope>:<rank>`), so two pages both have a
+    rank 0. The rank becomes the position in the union."""
+    return [
+        journey.model_copy(update={"id": f"{journey.id.rsplit(':', 1)[0]}:{index}"})
+        for index, journey in enumerate(journeys)
+    ]

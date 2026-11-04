@@ -39,6 +39,7 @@ from .canonical_adapters import ojp_adapter
 from .canonical_adapters.trip_dict import to_trip_dicts
 from .trip_normalize import dedup_batch_and_track_latest_dep as _dedup_batch_and_track_latest_dep
 from .trip_normalize import next_anchor_or_none as _next_anchor_or_none
+from .trip_normalize import renumbered
 
 log = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ async def fetch_reference_paginated(
         # ojp_reference which uses its own monotonic clock).
         total_ms += max(1, timeout_ms // 12)
         if stop:
-            return all_trips, total_ms, pages
+            return renumbered(all_trips), total_ms, pages
         if not batch:
             break  # OJP exhausted at this anchor
 
@@ -304,7 +305,7 @@ async def fetch_reference_paginated(
             break  # caught up to OTP's window, or unparseable times
         anchor = next_anchor
 
-    return all_trips, total_ms, pages
+    return renumbered(all_trips), total_ms, pages
 
 
 async def _fetch_one_page(
