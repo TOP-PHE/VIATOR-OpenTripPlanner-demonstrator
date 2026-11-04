@@ -250,8 +250,9 @@ journey. OJP 2.0 / Transmodel names are given where the concept exists.
 | `country` | `str \| None` | ISO-2 when the source says so. |
 
 **`CanonicalQuay`** (`canonical_quay.py`) — OJP `PlannedQuay`, NeTEx `Quay`: `ref`, `name`,
-`public_code` (platform "7"), `position`. MOTIS and OTP return platform-level stops; the adapter
-puts the platform here and the station in `CanonicalStopPlace` when `parent_ref` says so.
+`public_code` (platform "7"), `position`. As built, no V1 adapter fills it: MOTIS and OTP return
+platform-level stops but no platform field, and parsing a platform out of an id (`SBB:8507000:0:7`)
+would be provider-specific guessing; the stop is a `CanonicalStopPlace` with `parent_ref`.
 
 **`CanonicalLocation`** (`canonical_location.py`) — a leg end: `kind: "stop" | "address" | "coordinate"`,
 `stop_place`, `quay`, `position`, `name`. An access walk from typed coordinates is a `coordinate`
@@ -267,7 +268,7 @@ field split that fixes §1.3.**
 | Field | Type | OJP | Filled from |
 |---|---|---|---|
 | `mode` | `TransportMode` enum: `RAIL, BUS, COACH, TRAM, SUBWAY, FERRY, CABLEWAY, FUNICULAR, AIR, TAXI, OTHER` | `Mode/PtMode` | MOTIS sub-types folded (`*_RAIL`, `LONG_DISTANCE`, `NIGHT_RAIL` → `RAIL`), OTP as is, HAFAS category table (one copy, in the adapter), OJP `PtMode` |
-| `submode` | `str \| None` | `RailSubmode`… | MOTIS's detail (`HIGHSPEED_RAIL`), OJP submode; kept, never compared by default |
+| *(on the leg)* `source_mode` | `str \| None` | — | the mode string as the source path gave it (MOTIS `HIGHSPEED_RAIL`, HAFAS's mapped category, OJP's upper-cased `PtMode`): provenance and display, never compared (as built, PR 2) |
 | `product_category` | `ProductCategory \| None`: `code` (`RJ`, `ICE`, `S`), `name` | `ProductCategory` | HAFAS `prodCtx.catOut`/`cls`, OJP `ProductCategory`, parsed prefix of a train label |
 | `line` | `str \| None` | `PublicCode` | the line as published: MOTIS/OTP `routeShortName`, HAFAS `addName`/`nameS` when it is a line, OJP `PublicCode` |
 | `train_number` | `str \| None` | `TrainNumber` | MOTIS `tripShortName`/train numbers when present, HAFAS digits of `prod.name` (`RJ 1141` → `1141`), OJP `TrainNumber` or digits of `PublishedServiceName` |
@@ -293,7 +294,7 @@ for comparison ("S 7" → "s7", dropping "Tram") is #304's job, on these fields.
 | `distance_meters` | `float \| None` | `None` when unknown (MOTIS), not `0.0` |
 | `service` | `CanonicalService \| None` | timed legs only |
 | `continuous_mode` | `"WALK" \| "BIKE" \| "CAR" \| None` | transfer/continuous legs |
-| `intermediate_stops` | `list[CanonicalCall]` | empty in V1 (no client asks for them); kept for OJP `LegIntermediate` |
+| `source_mode` | `str \| None` | the source's mode string (see `CanonicalService`). Intermediate stops are not in V1: no client asks for them (OJP `LegIntermediate` can be added as an optional field) |
 
 **`CanonicalTransfer`** (`canonical_transfer.py`) — derived between two consecutive timed legs:
 `at` (`CanonicalStopPlace` of the alighting), `to` (boarding, may differ: a walk between
@@ -308,7 +309,7 @@ stations), `from_leg`, `to_leg` (indexes), `connection_seconds` (arrival → nex
 | `schema_version` | `"1"` | |
 | `id` | `str` | stable within one answer: `<source>:<rank>` |
 | `source` | `JourneySource` | `provider` (`motis`, `otp`, `hafas`, `ojp`), `role` (`viator` \| `reference`), `session_id`, `engine`, `adapter_version`, `stitched_from_sessions`, `via_hubs` (federated) |
-| `legs` | `list[CanonicalLeg]` | non-empty |
+| `legs` | `list[CanonicalLeg]` | in the source's order; may be empty (a source can send a connection without sections) |
 | `departure`, `arrival` | `CanonicalTiming` | first leg start, last leg end (door to door) |
 | `duration_seconds` | `int` | source value |
 | *computed* `first_boarding` | `CanonicalTiming \| None` | first timed leg's departure — today's `first_transit_leg_departure_utc`, now one implementation |
@@ -396,7 +397,7 @@ what hid the `extract_uic` bug).
 | journey `departure`/`arrival`/`duration_seconds` | `startTime`, `endTime`, `duration` | ISO → aware UTC |
 | `source_transfer_count` | `transfers` | |
 | leg `kind` | `mode` ∈ {WALK, BIKE, CAR…} → `continuous` (`transfer` between two transit legs), else `timed` | |
-| `service.mode` / `submode` | `mode` folded / raw | fixes §1.3 |
+| `service.mode` / leg `source_mode` | `mode` folded / raw | fixes §1.3 |
 | `service.line`, `published_name` | `routeShortName` | |
 | `service.train_number` | `tripShortName` when numeric (MOTIS reads NeTEx `TrainNumber`; NMBS gives 0 → `None`) | to confirm on a captured eu19 answer |
 | `route_long_name`, `line_ref`, `journey_ref`, `destination_text` | `routeLongName`, `routeId`, `tripId`, `headsign` | |
@@ -491,8 +492,9 @@ PR 4, since there are none.
 | continuous leg | `Leg/ContinuousLeg` (`Service/PersonalMode` foot) |
 | stop identity | `StopPointRef` = UIC-based ref when `uic` is set, else the source ref; places listed once in `TripResponseContext/Places` |
 
-The XML form is validated against the OJP 2.0 XSD in a unit test (ch. 12 plans the same check in
-CI). The JSON form is the same tree serialised with OJP's element names. Ch. 12 trap honoured:
+As built (PR 2, #433), the XML is checked for shape and by a round trip through VIATOR's own OJP
+adapter; validation against the OJP 2.0 XSD waits for #306, which brings the schema files into the
+repository (ch. 12 plans the same check in CI). The JSON form is the same tree serialised with OJP's element names. Ch. 12 trap honoured:
 nothing VIATOR-specific is added to `TripResult`, which has no extension point.
 
 `CanonicalJourneyToOsdmMapper` (`mappers/osdm.py`), OSDM 3.x `Trip` (offer side):
@@ -585,8 +587,9 @@ Each PR leaves `main` working; AC1 (no regression, all tests green) is checked a
 | PR | Content | Behaviour change | Gate |
 |---|---|---|---|
 | **1** (this) | the two design documents | none | owner review of §0.2 and #304 §0.2 |
-| **2** | `app/journey/canonical/` (models, `JourneyFingerprint`, `JourneyMatchFeatures` structure), `canonical_adapters/` (the 4 providers), JSON Schema + sync test, OJP/OSDM mapper PoC + XSD/schema tests, provider-neutrality test | none (nothing calls it yet) | characterisation tests (§5): every old dict value present in the adapter's journey; same comparison results on both |
-| **3** | journey layer on canonical: clients return raw, adapters convert, `planner_dispatch` returns `list[CanonicalJourney]`, `federated_planner`, `/fanout` + `/plan` return canonical JSON, `journey.html` + `compare_grid.js` read it (one JS view helper module, so templates stop reading engine fields), `{}` shows the canonical journey (D3); old normalisers deleted. The recorder still writes `journey_trips.legs` in today's format through a temporary `to_legs(journey)`, because coverage reads them back until PR 4 | display identical; `{}` content changes | template tests updated; `test_journey_api_canonical.py`; manual check on `/journey` (OTP, MOTIS, OJP, HAFAS, federated) |
+| **2** (#433, merged) | `app/journey/canonical/` (models, `JourneyFingerprint`, `JourneyMatchFeatures` structure), `canonical_adapters/` (the 4 providers), JSON Schema + sync test, OJP/OSDM mapper PoC + XSD/schema tests, provider-neutrality test | none (nothing calls it yet) | characterisation tests (§5): every old dict value present in the adapter's journey; same comparison results on both |
+| **3** (#434) | the engine clients answer in canonical journeys: their normalisers deleted (adapters only), OTP/MOTIS `fetch_journeys` + `fetch_plan` as the bridge, Swiss OJP and ÖBB HAFAS (and their pagination) return canonical journeys; `/fanout` converts at its edge | none | client tests through the adapters |
+| **3b** | callers on canonical: `federated_planner`, `/fanout` + `/plan` return canonical JSON, `journey.html` + `compare_grid.js` read it (one JS view helper module, so templates stop reading engine fields), `{}` shows the canonical journey (D3); old normalisers deleted. The recorder still writes `journey_trips.legs` in today's format through a temporary `to_legs(journey)`, because coverage reads them back until PR 4 | display identical; `{}` content changes | template tests updated; `test_journey_api_canonical.py`; manual check on `/journey` (OTP, MOTIS, OJP, HAFAS, federated) |
 | **4** | storage + coverage on canonical: the migration of §5.5 (**deletes all recorded searches and coverage runs**), `journey_trips.journey` and `external_journeys`, `to_legs` and `VerifyLeg`/`VerifyItinerary` deleted; runner, `_coverage_dedup_key` → `strict_key` (fixes the `SBB:…:0:7` → `7` bug), ÖBB through `hafas_adapter`, `compute_alignment(list[CanonicalJourney], list[CanonicalJourney])` with **the same rules**, cell / export / share JSON canonical (projected to what the share page renders), modal on the JS helper | data deleted (D1); scorer unchanged (characterisation test on the `test_oebb_alignment` fixtures); the dedup fix can keep an extra trip in a cell (D5); share payload re-checked against the "reveals only what the page renders" invariant | integration tests (`test_coverage_executor`, `test_coverage_pair_write`) green; a fresh coverage run on a small hub set before the eu19 one |
 | **5** | station resolution (D8): `StationResolver` backed by MSMM, cache per (feed version, stop) and per (series, code), the person's limits respected, a stop MSMM cannot place left `station_id = None`; the bulk form for coverage once MSMM offers it (MSMM-side PR first) | none on its own (nothing compares `station_id` before #304) | resolver tests with a fake module; one live `/journey` check |
 | then #304 | matching engine, then its wiring | intended | see #304 design |
@@ -707,3 +710,8 @@ Risks:
   searches and coverage runs deleted in PR 4, legacy adapters dropped); D5 approved; D8 stations
   compared by MSMM station (`station_id`, resolver PR 5); go for PR 2 with the other
   recommendations as written.
+- 2026-11-04 — as built in PR 2 (#433) and PR 3 (#434): the source's mode string is
+  `CanonicalLeg.source_mode` (no `submode`); no quay and no intermediate stops in V1; legs may be
+  empty; `with_resolved_stations(journeys, None)` places nothing (no stub resolver); OJP XSD and
+  OSDM schema validation wait for #306 / #307; PR 3 split into 3 (clients) and 3b (callers, API,
+  page).
