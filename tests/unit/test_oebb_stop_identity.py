@@ -38,7 +38,7 @@ import pytest
 from app.journey import signature
 from app.journey.canonical import CanonicalJourney
 from app.journey.canonical_adapters import hafas_adapter
-from app.network_coverage import alignment, external_verify, oebb_journeys
+from app.network_coverage import external_verify, oebb_journeys
 
 # ─────────────────────── live-probe fixtures ───────────────────────
 #
@@ -251,7 +251,8 @@ def test_oebb_token_can_never_reparse_as_a_uic(ext_id: str) -> None:
     assert token is not None
     assert token.startswith("OEBB:"), f"{ext_id!r} should not normalise into the UIC namespace"
     assert signature._fingerprint_stop_token(token, None, None) == token
-    assert alignment._endpoint_token(token) == token
+    # Since #304 the matching engine compares the stops: an `OEBB:` token is an unknown
+    # station (test_oebb_alignment.py::test_an_oebb_token_compares_as_an_unknown_station).
 
 
 def test_oebb_stop_id_zero_padded_degenerate_does_not_become_a_uic() -> None:

@@ -56,6 +56,7 @@ SAVED_FIELDS: tuple[str, ...] = (
     "external_journeys",
     "external_alignment_score",
     "external_alignment_tier",
+    "external_alignment_detail",
 )
 
 # One write every 5 s or every 25 answers, whichever comes first: at about
