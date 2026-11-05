@@ -57,7 +57,7 @@ exports.svg = () => {
   s.box('flag',    60, 736, 330, 54, '_origin_flag', { kind: 'module', sub: 'ALL / SUBSET / <SID>_ONLY' });
   // "vs OJP", not "OJP only": transit_fingerprint is also the hash the coverage
   // alignment scorer and the federated planner use.
-  s.box('cmp',    410, 736, 330, 54, '_compare_with_references', { kind: 'module', sub: 'matching engine · vs ÖBB, OJP' });
+  s.box('cmp',    410, 736, 330, 54, '_compare_journeys', { kind: 'module', sub: 'matching engine · refs, OTP/MOTIS' });
   s.box('resp',   250, 818, 300, 44, 'response JSON', { kind: 'actor', size: 12.5 });
 
   s.step(4, 152, 592); s.step(5, 182, 666); s.step(6, 72, 750); s.step(7, 422, 750);

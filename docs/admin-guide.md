@@ -2759,9 +2759,14 @@ design `docs/journey-matching-engine-design.md`), on the server:
   page receives carry no station id. OJP's stops are not asked. The module gets at most 4 s per
   search (`_STATION_BUDGET_S`); past it, or on any failure, the search compares codes and positions
   (`journey.stations_unresolved` in the web log, at WARNING).
-- **Unchanged**: the OTP-vs-MOTIS grid still pairs on its own (the engine's `journey_engines`
-  profile is not wired yet), and the three-column layout with OJP and ÖBB together stays
-  unaligned.
+- **OTP vs MOTIS**: when both engines answered, the two-column OTP-vs-MOTIS grid's rows are the
+  engine's pairs too (`comparisons.engines`, the built-in `journey_engines` profile: the same feeds,
+  60 s at both ends; the `JOURNEY_MATCH_*` settings do not apply to it). Each merged result names
+  the journey it stands for on each side (`engine_journey_ids`, the shortest of that engine's
+  sessions); a pair shares a row, with a note when something still differs, and a journey left
+  alone has its own row with why. "Compare excluding walk legs" now only changes the durations
+  shown (transit time beside the total): walks never count in a pair.
+- **Unchanged**: the three-column layout with OJP and ÖBB together stays unaligned.
 
 ## 7. Rollback
 

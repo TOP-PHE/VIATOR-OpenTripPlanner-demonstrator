@@ -703,3 +703,20 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
     cards have no per-card renderer to pair yet, and the three-column layout stays unaligned.
   - Not wired yet: the OTP-vs-MOTIS grid (`journey_engines`). Not checked in a browser before
     merging (owner, 5 Nov: to test after deploying).
+- 2026-11-05 — as built, the OTP-vs-MOTIS grid (#304, the last consumer of §11): when an execution
+  of each engine answered, `/fanout` compares OTP's journeys with MOTIS's under the built-in
+  `journey_engines` (60 s; the `JOURNEY_MATCH_*` settings are left out, their defaults being the
+  references' 120 s) and sends `comparisons.engines` (sides named "OTP" and "MOTIS"). Choices:
+  - The sides: the merge by `trip_signature` stays (it is what the flat list shows); each merged
+    slot keeps its sessions' journeys (`_journeys`, never sent) and stands, on each engine's side,
+    for the shortest journey of that engine's sessions, the one the grid's cell shows. Its id is
+    sent per slot (`engine_journey_ids`), how the page finds a pair's rows. A slot both engines
+    found is normally paired with itself (`exact_fingerprint`).
+  - The stations: placed once for all of VIATOR's journeys of the search (each slot's `best` and
+    the engines' sides), by their session's resolver.
+  - The page: rows from the pairs and unpaired journeys, the notes row and the counts strip shared
+    with ÖBB's grid (the strip names the sides as the server does). The page's own pairing
+    (`_pairKey`, `_bucketsForGrid`, `_trainOnlySignature`, `_normalizeMode`) is gone;
+    "Compare excluding walk legs" changes the durations shown only.
+  - `_compare_with_references` became `_compare_journeys`. Still not aligned: the three-column
+    layout with OJP and ÖBB together. Not checked in a browser before merging.

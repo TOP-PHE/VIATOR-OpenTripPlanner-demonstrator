@@ -117,8 +117,8 @@ Three details in that picture are easy to get backwards and expensive to debug:
 6. `asyncio.gather` of `_query_session(...)` per session. Each calls `planner_dispatch.get_planner(session).fetch_journeys(...)` → `otp_client.fetch_journeys` or `motis_client.fetch_journeys` (the raw answer and its canonical journeys). When the form supplied a UIC, `_stop_id_for()` builds `<feedId>:<uic>` and routes by stop rather than coordinate — this bypasses the lat/lon→walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering.
 7. Per session: `_current_snapshot()`, then `recorder.record_execution()` writes `journey_search_executions` + `journey_trips` (each trip row stores the canonical journey in `journey`, #303 PR 4a). Trips are merged into `by_signature` keyed on `signature.trip_signature`, and `_origin_flag()` labels each merged trip `ALL` / `<SESSION>_ONLY` / `SUBSET`.
 8. If **nothing** merged and both endpoints carried UICs, `federated_planner.plan_federated()` attempts a hub-stitch: find a UIC both sessions serve, route origin→hub in one and hub→dest in the other. Fallback only — wrapped in try/except, never 500s the search.
-9. `_compare_with_references(...)` (#304) compares VIATOR's journeys (each slot's `best`) with each reference that answered by the matching engine (`compare(viator, reference, journey_reference)`, the `JOURNEY_MATCH_*` settings, in a thread), stations placed by the station module for the comparison only; `_tag_ojp_comparison` then **mutates the trip dicts** to attach OJP's per-card `comparison` tag (`common` / `otp_only` / `uncomparable`).
-10. `recorder.finish_search()`, `db.commit()`, response: `{search_id, status, trips, executions, ojp_reference?, hafas_reference?, comparison_summary?, comparisons?, federated_trips?}` (`comparisons.hafas` / `.ojp`: the engine's pairs, one-side journeys and reasons as sentences; ÖBB's paired grid is built from it).
+9. `_compare_journeys(...)` (#304) compares VIATOR's journeys (each slot's `best`) with each reference that answered by the matching engine (`compare(viator, reference, journey_reference)`, the `JOURNEY_MATCH_*` settings, in a thread) and, when both engines answered, OTP's journeys with MOTIS's (`_engine_sides`: one per slot and engine from the slot's `_journeys`, never sent; `journey_engines`, 60 s), stations placed by the station module for the comparison only; `_tag_ojp_comparison` then **mutates the trip dicts** to attach OJP's per-card `comparison` tag (`common` / `otp_only` / `uncomparable`).
+10. `recorder.finish_search()`, `db.commit()`, response: `{search_id, status, trips, executions, ojp_reference?, hafas_reference?, comparison_summary?, comparisons?, federated_trips?}` (`comparisons.hafas` / `.ojp` / `.engines`: the engine's pairs, one-side journeys and reasons as sentences; ÖBB's paired grid and the OTP-vs-MOTIS grid are built from it).
 
 #### (b) A network-coverage run executes
 
@@ -327,7 +327,7 @@ each step is worth reading in the source, but the shape is:
    `federated_planner.plan_federated` stitches origin→hub→dest across two sessions. Wrapped in
    try/except — "a failure here never 500s the whole search."
 8. **Structured diff.** Since #304 the matching engine pairs VIATOR's journeys with each
-   reference's one to one (`_compare_with_references`); `_tag_ojp_comparison` returns OJP's
+   reference's one to one, and OTP's with MOTIS's (`_compare_journeys`); `_tag_ojp_comparison` returns OJP's
    `{common, otp_only, ojp_only}` counts *of journeys paired*, while **mutating** the trip dicts to
    carry a per-card `comparison` tag. A journey without a ride (walk-only) → `uncomparable`, so the
    UI greys it rather than mis-classifying it. Until #304 `_build_comparison` bucketed distinct
@@ -2439,7 +2439,8 @@ routed to the previous station's coordinates.
 Submit POSTs `/api/journey/fanout` and hands the response to `render(payload)`, which forks three
 ways: a flat card list; a two-column OTP-vs-MOTIS `renderComparisonGrid` (only when
 `payload.executions` proves *both* engine types actually ran without erroring — engine identity
-comes from the server, never guessed from session-id naming); or, when the localStorage-persisted
+comes from the server, never guessed from session-id naming — and the server sent
+`comparisons.engines`, whose pairs are its rows since #304); or, when the localStorage-persisted
 "Side-by-side comparison" toggle is on and at least one reference engine has a status entry, an
 N-column `CompareGrid` with VIATOR first and OJP/HAFAS as further columns. When side-by-side owns
 the layout slot the stacked panels are suppressed so nothing renders twice.
@@ -2447,10 +2448,11 @@ the layout slot the stacked panels are suppressed so nothing renders twice.
 Two client-side toggles re-render from `_LAST_PAYLOAD` **without re-firing the search**:
 "Side-by-side comparison" and "Compare excluding walk legs". The latter was renamed in PR-194 from
 "trains only" because the filter only ever tested `mode !== 'WALK'` — bus/tram/coach were always
-kept. Its pairing key (`_trainOnlySignature`) exists because OTP and MOTIS use different OSM walking
-profiles and disagree on access/egress walk time even when the train is identical; it pins times to
-the minute, rounds coordinates to 3 decimals (~110 m) rather than trusting stop IDs, and normalises
-MOTIS's `HIGHSPEED_RAIL`/`REGIONAL_RAIL` down to OTP's flat `RAIL` via `_normalizeMode`.
+kept. Since #304 it only changes the durations the OTP-vs-MOTIS grid shows: the rows are the
+matching engine's pairs, which never count walks (OTP and MOTIS use different OSM walking profiles
+and disagree on access/egress walk time even when the train is identical). Before, it switched the
+grid's pairing key to a walk-free signature (`_trainOnlySignature`: minutes, coordinates rounded to
+~110 m, `_normalizeMode`), gone with the client-side pairing.
 
 Each card carries a `{}` JSON-inspector button exposing the raw itinerary (OJP cards have their own
 `show-ojp-json` action so both engines' raw dicts can be pasted side by side to diagnose fingerprint

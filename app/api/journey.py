@@ -423,16 +423,23 @@ def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
     ).scalar_one_or_none()
 
 
-# ─────────────── #304 — VIATOR's journeys against each reference engine's ───────────────
+# ──────── #304 — VIATOR's journeys against each reference's, OTP's against MOTIS's ────────
 #
-# The matching engine (`app/journey/matching/`, profile `journey_reference` with the
-# `JOURNEY_MATCH_*` settings) pairs VIATOR's journeys (each merged slot's `best`) with each
-# reference's one to one. Its pairs replace the page's own ÖBB pairing (same first boarding
-# instant) and the OJP fingerprint sets; the reasons go to the page as sentences.
+# The matching engine (`app/journey/matching/`) pairs VIATOR's journeys (each merged slot's
+# `best`) with each reference's one to one (profile `journey_reference` with the
+# `JOURNEY_MATCH_*` settings) and, when both engines answered, OTP's journeys with MOTIS's
+# (profile `journey_engines`). Its pairs replace the page's own pairings (ÖBB on the same first
+# boarding instant, OTP-vs-MOTIS on a signature, OJP on fingerprint sets); the reasons go to the
+# page as sentences.
 
-# How the sentences name the two sides.
-_VIATOR_LABEL = "VIATOR"
-_REFERENCE_LABELS: dict[str, str] = {"ojp": "OJP", "hafas": "ÖBB"}
+# Each comparison by its key in `comparisons`, and how its sentences name the two sides.
+_COMPARISON_SIDES: dict[str, tuple[str, str]] = {
+    "ojp": ("VIATOR", "OJP"),
+    "hafas": ("VIATOR", "ÖBB"),
+    "engines": ("OTP", "MOTIS"),
+}
+# The engines of the OTP-vs-MOTIS grid, its left side first.
+_ENGINES = ("otp", "motis")
 # The station module's answers for one search's comparison, at most this long: past it the
 # journeys are compared by their codes and positions (the answers already in are kept for
 # the next search).
@@ -520,60 +527,119 @@ async def _with_stations(
         return viator, references
 
 
-def _compare_all(
-    viator: list[CanonicalJourney],
-    references: dict[str, list[CanonicalJourney]],
-    profile: matching.MatchProfile,
-) -> dict[str, matching.JourneyComparison]:
-    """VIATOR's journeys against each reference's (pure; run in a thread: CPU)."""
-    return {key: matching.compare(viator, found, profile) for key, found in references.items()}
+def _engine_sides(
+    merged_trips: list[dict[str, Any]], executions: list[dict[str, Any]]
+) -> dict[str, list[CanonicalJourney]] | None:
+    """OTP's journeys and MOTIS's for the OTP-vs-MOTIS grid, when an execution of each engine
+    answered (one not in error, as the page's `_shouldRenderComparison` asks); None otherwise.
+    One journey per slot and engine: of the sessions of that engine that found it, the shortest
+    (the one the grid's cell shows). **Mutates each slot**: `engine_journey_ids` (engine → that
+    journey's id) is how the page finds a pair's rows."""
+    engine_of = {e.get("session_id"): e.get("engine") or "otp" for e in executions}
+    answering = {e.get("engine") or "otp" for e in executions if e.get("status") != "error"}
+    if not answering.issuperset(_ENGINES):
+        return None
+    sides: dict[str, list[CanonicalJourney]] = {engine: [] for engine in _ENGINES}
+    for slot in merged_trips:
+        ids: dict[str, str] = {}
+        for engine in _ENGINES:
+            found = [
+                journey
+                for sid, journey in slot.get("_journeys", {}).items()
+                if engine_of.get(sid) == engine
+            ]
+            if found:
+                pick = min(found, key=lambda journey: (journey.duration_seconds, journey.id))
+                sides[engine].append(pick)
+                ids[engine] = pick.id
+        slot["engine_journey_ids"] = ids
+    return sides
 
 
-async def _compare_with_references(
+def _distinct(journeys: Iterable[CanonicalJourney]) -> list[CanonicalJourney]:
+    """The journeys, each id once (the first kept), in order."""
+    seen: dict[str, CanonicalJourney] = {}
+    for journey in journeys:
+        seen.setdefault(journey.id, journey)
+    return list(seen.values())
+
+
+_Task = tuple[list[CanonicalJourney], list[CanonicalJourney], matching.MatchProfile]
+
+
+def _compare_all(tasks: dict[str, _Task]) -> dict[str, matching.JourneyComparison]:
+    """Each comparison: (left, right, profile) by key (pure; run in a thread: CPU)."""
+    return {
+        key: matching.compare(left, right, profile) for key, (left, right, profile) in tasks.items()
+    }
+
+
+async def _compare_journeys(
     db: DbSession,
     cfg: dict[str, Any],
     sessions: list[SessionRow],
     merged_trips: list[dict[str, Any]],
     references: dict[str, dict[str, Any] | None],
+    engines: dict[str, list[CanonicalJourney]] | None = None,
 ) -> dict[str, matching.JourneyComparison]:
-    """The comparison of VIATOR's journeys with each reference that answered, by reference
-    key (`ojp`, `hafas`); `{}` when none did. Each slot's `best` is VIATOR's journey."""
+    """The search's comparisons by key: `ojp` / `hafas`, VIATOR's journeys (each slot's
+    `best`) against each reference that answered (`journey_reference` with the
+    `JOURNEY_MATCH_*` settings); `engines`, OTP's journeys against MOTIS's (`_engine_sides`;
+    the built-in `journey_engines`: the same feeds, so 60 s, the settings left out: their
+    defaults are the references' 120 s). `{}` when there is nothing to compare. The stations
+    are placed once for all of VIATOR's journeys (`_with_stations`)."""
     asked = {
         key: found
         for key, reference in references.items()
         if (found := _answered(reference)) is not None
     }
-    if not asked:
+    if not asked and engines is None:
         return {}
-    viator = [slot["best"] for slot in merged_trips]
-    viator, asked = await _with_stations(db, cfg, sessions, viator, asked)
-    profile = matching.profile_from_config(cfg, matching.JOURNEY_REFERENCE.name)
-    return await asyncio.to_thread(_compare_all, viator, asked, profile)
+    best = [slot["best"] for slot in merged_trips]
+    sides = engines or {}
+    own = _distinct([*best, *(journey for side in sides.values() for journey in side)])
+    placed_own, placed_refs = await _with_stations(db, cfg, sessions, own, asked)
+    by_id = {journey.id: journey for journey in placed_own}
+    reference = matching.profile_from_config(cfg, matching.JOURNEY_REFERENCE.name)
+    tasks: dict[str, _Task] = {
+        key: ([by_id[j.id] for j in best], found, reference) for key, found in placed_refs.items()
+    }
+    if engines is not None:
+        tasks["engines"] = (
+            [by_id[j.id] for j in engines["otp"]],
+            [by_id[j.id] for j in engines["motis"]],
+            matching.JOURNEY_ENGINES,
+        )
+    return await asyncio.to_thread(_compare_all, tasks)
 
 
-def _notes(found: Iterable[MatchReason], reference: str, *, unpaired: bool = False) -> list[str]:
+def _notes(
+    found: Iterable[MatchReason], left: str, right: str, *, unpaired: bool = False
+) -> list[str]:
     """The sentences of reasons, most important first, each once; a hidden one left out, and
     for an unpaired journey `no_candidate` too (its row already says the other side has none)."""
     out: list[str] = []
     for item in found:
         if unpaired and item.code == match_reasons.NO_CANDIDATE:
             continue
-        text = match_reasons.sentence(item, _VIATOR_LABEL, reference)
+        text = match_reasons.sentence(item, left, right)
         if text and text not in out:
             out.append(text)
     return out
 
 
-def _comparison_json(comparison: matching.JourneyComparison, reference: str) -> dict[str, Any]:
-    """A comparison as the page reads it: VIATOR's journeys on the left, the reference's on
-    the right, by journey id; each pair's verdict and score, and for a pair or an unpaired
-    journey the codes of its reasons and their sentences (`notes`, plain text the page
-    escapes). No station id, code or feature value."""
+def _comparison_json(
+    comparison: matching.JourneyComparison, left: str, right: str
+) -> dict[str, Any]:
+    """A comparison as the page reads it, the sides named `left` and `right` (VIATOR and a
+    reference, or OTP and MOTIS), their journeys by id; each pair's verdict and score, and for a
+    pair or an unpaired journey the codes of its reasons and their sentences (`notes`, plain
+    text the page escapes). No station id, code or feature value."""
     return {
         "engine_version": comparison.engine_version,
         "profile": comparison.profile,
-        "left": _VIATOR_LABEL,
-        "right": reference,
+        "left": left,
+        "right": right,
         "summary": comparison.summary.model_dump(),
         "pairs": [
             {
@@ -582,7 +648,7 @@ def _comparison_json(comparison: matching.JourneyComparison, reference: str) -> 
                 "verdict": pair.verdict,
                 "score": round(pair.score, 2),
                 "reasons": [item.code for item in pair.reasons],
-                "notes": _notes(pair.reasons, reference),
+                "notes": _notes(pair.reasons, left, right),
             }
             for pair in comparison.pairs
         ],
@@ -591,7 +657,7 @@ def _comparison_json(comparison: matching.JourneyComparison, reference: str) -> 
                 {
                     "journey_id": item.journey_id,
                     "reasons": [found.code for found in item.reasons],
-                    "notes": _notes(item.reasons, reference, unpaired=True),
+                    "notes": _notes(item.reasons, left, right, unpaired=True),
                 }
                 for item in unpaired
             ]
@@ -633,6 +699,14 @@ def _tag_ojp_comparison(
         "otp_only": summary.left_only,
         "ojp_only": summary.right_only,
     }
+
+
+def _slot_json(slot: dict[str, Any]) -> dict[str, Any]:
+    """A merged slot as the API sends it: its best journey as JSON; the sessions' journeys it
+    keeps for the comparisons (`_journeys`) are not sent."""
+    sent = {key: value for key, value in slot.items() if key != "_journeys"}
+    sent["best"] = _journey_json(slot["best"])
+    return sent
 
 
 def _journey_json(journey: CanonicalJourney) -> dict[str, Any]:
@@ -863,19 +937,25 @@ async def fanout(
         if federated_trips and status != "error":
             status = "ok"
 
-    # #304 — VIATOR's journeys against each reference that answered, by the matching engine
-    # (`journey_reference`). OJP's per-card tags and its one-line strip keep their shapes
-    # (v0.1.36's Phase 2); ÖBB's paired grid reads the pairs (`comparisons.hafas`), the page
+    # #304 — VIATOR's journeys against each reference that answered, and OTP's against
+    # MOTIS's when both engines answered, by the matching engine. OJP's per-card tags and its
+    # one-line strip keep their shapes (v0.1.36's Phase 2); ÖBB's paired grid and the
+    # OTP-vs-MOTIS grid read the pairs (`comparisons.hafas`, `comparisons.engines`): the page
     # no longer pairs anything itself.
-    comparisons = await _compare_with_references(
-        db, cfg, sessions, merged_trips, {"ojp": ojp_reference, "hafas": hafas_reference}
+    comparisons = await _compare_journeys(
+        db,
+        cfg,
+        sessions,
+        merged_trips,
+        {"ojp": ojp_reference, "hafas": hafas_reference},
+        _engine_sides(merged_trips, recorded.executions),
     )
     comparison_summary = _tag_ojp_comparison(merged_trips, ojp_reference, comparisons.get("ojp"))
 
     response: dict[str, Any] = {
         "search_id": str(recorded.search_id),
         "status": status,
-        "trips": [{**slot, "best": _journey_json(slot["best"])} for slot in merged_trips],
+        "trips": [_slot_json(slot) for slot in merged_trips],
         "executions": recorded.executions,
     }
     # Present only when the operator opted into the OJP comparison and the
@@ -891,11 +971,11 @@ async def fanout(
         response["hafas_reference"] = _reference_json(hafas_reference)
     if comparison_summary is not None:
         response["comparison_summary"] = comparison_summary
-    # #304 — per reference that answered: the engine's pairs, the journeys on one side only
-    # and the sentences of why.
+    # #304 — per comparison (each reference that answered, `engines`): the engine's pairs,
+    # the journeys on one side only and the sentences of why.
     if comparisons:
         response["comparisons"] = {
-            key: _comparison_json(found, _REFERENCE_LABELS[key])
+            key: _comparison_json(found, *_COMPARISON_SIDES[key])
             for key, found in comparisons.items()
         }
     # Stitched cross-session itineraries (hub-and-spoke fallback). Rendered as a
@@ -1127,9 +1207,13 @@ def _merge_by_signature(
                 "found_in_sessions": [],
                 "by_session": {},
                 "best": journey,
+                # Each session's journey of the slot, for the OTP-vs-MOTIS comparison
+                # (`_engine_sides`); never sent (`_slot_json`).
+                "_journeys": {},
             },
         )
         slot["found_in_sessions"].append(session_id)
+        slot["_journeys"][session_id] = journey
         slot["by_session"][session_id] = {
             "duration_seconds": journey.duration_seconds,
             "departure_at": _instant_json(journey.departure),
