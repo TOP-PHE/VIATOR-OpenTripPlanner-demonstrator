@@ -7,7 +7,12 @@ ENV OTP_VERSION=${OTP_VERSION}
 # (eclipse-temurin:25-jre-noble) is rebuilt on Temurin's cadence, not Ubuntu's,
 # so it can lag behind ubuntu-security-announce. `apt-get upgrade` here closes
 # that gap and keeps Trivy's OS scan green between base-image refreshes.
-RUN apt-get update \
+#
+# The `echo` changes this layer's cache key so BuildKit runs the upgrade again
+# instead of reusing a stale layer (as in docker/web/Dockerfile): bump its date
+# whenever Trivy reports new HIGH/CRITICAL fixed-upstream Ubuntu CVEs.
+RUN echo "apt cache bust 2026-11-05 — refresh for apt CVE-2026-109518 (fixed in 2.8.4ubuntu0.1)" \
+    && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         curl \
