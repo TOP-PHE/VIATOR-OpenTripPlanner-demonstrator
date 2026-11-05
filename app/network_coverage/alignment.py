@@ -195,12 +195,12 @@ def compute_alignment(
     )
     for code, count in comparison.reason_counts().items():
         reasons[code] = reasons.get(code, 0) + count
-    credits = (
+    credit = (
         summary.same_service * SAME_SERVICE_CREDIT + summary.probably_same * PROBABLY_SAME_CREDIT
     )
     denominator = max(min(v_n, _SCORE_CAP_PER_SIDE), min(o_n, _SCORE_CAP_PER_SIDE))
     # Saturate at 1.0: the question is "do we agree?", not "how many?".
-    score = min(round(credits / denominator, 2), 1.0)
+    score = min(round(credit / denominator, 2), 1.0)
     return CellAlignment(score, _classify_score(score, v_n, o_n), _detail(profile, counts, reasons))
 
 
