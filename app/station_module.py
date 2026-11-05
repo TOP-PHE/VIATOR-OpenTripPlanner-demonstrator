@@ -331,6 +331,9 @@ _QUIET_REASONS = frozenset({"off", "paused", "busy", "status_429"})
 # follows it, and no pause.
 TEXT_REFUSED = "status_422"
 
+# The word a refusal of a code, a series or a stop key gives for a control character.
+_CONTROL_CHARACTER = "control character"
+
 # The clock of the pause and of the attribution cache; tests replace it.
 clock: Callable[[], float] = time.monotonic
 
@@ -434,7 +437,7 @@ def code_refused(code: str) -> str | None:
     if any(unicodedata.category(character) == "Cs" for character in code):
         return "surrogate"
     if any(unicodedata.category(character) == "Cc" for character in code):
-        return "control character"
+        return _CONTROL_CHARACTER
     if any(character.isspace() for character in code):
         return "white space"
     if not CODE_MIN <= len(code) <= CODE_MAX:
@@ -1097,7 +1100,7 @@ def resolve_text_refused(value: str) -> str | None:
     if any(unicodedata.category(character) == "Cs" for character in value):
         return "surrogate"
     if "\x00" in value:
-        return "control character"
+        return _CONTROL_CHARACTER
     if not 1 <= len(value) <= RESOLVE_TEXT_MAX:
         return "length"
     return None
@@ -1193,7 +1196,7 @@ def stop_key_refused(value: Any) -> str | None:
     if any(unicodedata.category(character) == "Cs" for character in value):
         return "surrogate"
     if _STOP_KEY_CONTROL.search(value) is not None:
-        return "control character"
+        return _CONTROL_CHARACTER
     if not 1 <= len(value) <= STOP_KEY_MAX:
         return "length"
     return None
@@ -1212,18 +1215,9 @@ def stop_stations_body(
     key not of the module's forms, a key or series it refuses, more than its
     4096 bytes): a caller packs its keys with `STOP_STATIONS_MAX` and this."""
     if feed is not None and stops is not None and series is None and codes is None:
-        if FEED_KEY.fullmatch(feed) is None:
-            raise ValueError("a feed key the module refuses")
-        if any(stop_key_refused(stop) is not None for stop in stops):
-            raise ValueError("a stop key the module refuses")
-        payload: dict[str, Any] = {"feed": feed, "stops": stops}
-        keys: list[str] = stops
+        payload, keys = _stops_form(feed, stops), stops
     elif series is not None and codes is not None and feed is None and stops is None:
-        for value in (series, *codes):
-            if not isinstance(value, str) or resolve_text_refused(value) is not None:
-                raise ValueError("a series or a code the module refuses")
-        payload = {"series": series, "codes": codes}
-        keys = codes
+        payload, keys = _codes_form(series, codes), codes
     else:
         raise ValueError("one of feed and stops, or series and codes")
     if not 1 <= len(keys) <= STOP_STATIONS_MAX or len(set(keys)) != len(keys):
@@ -1232,6 +1226,23 @@ def stop_stations_body(
     if len(body) > STOP_STATIONS_BODY_MAX:
         raise ValueError("a body larger than the module takes")
     return body
+
+
+def _stops_form(feed: str, stops: list[str]) -> dict[str, Any]:
+    """`{"feed", "stops"}`, or ValueError for a feed key or a stop key the module refuses."""
+    if FEED_KEY.fullmatch(feed) is None:
+        raise ValueError("a feed key the module refuses")
+    if any(stop_key_refused(stop) is not None for stop in stops):
+        raise ValueError("a stop key the module refuses")
+    return {"feed": feed, "stops": stops}
+
+
+def _codes_form(series: str, codes: list[str]) -> dict[str, Any]:
+    """`{"series", "codes"}`, or ValueError for a series or a code the module refuses."""
+    for value in (series, *codes):
+        if not isinstance(value, str) or resolve_text_refused(value) is not None:
+            raise ValueError("a series or a code the module refuses")
+    return {"series": series, "codes": codes}
 
 
 def _stop_station_row(item: Any, asked: frozenset[str]) -> dict[str, Any] | None:

@@ -287,7 +287,8 @@ async def test_journeys_get_their_station_ids_through_the_resolver(module: Modul
 
     origin = journey.legs[0].origin.stop_place
     destination = journey.legs[0].destination.stop_place
-    assert origin is not None and destination is not None
+    assert origin is not None
+    assert destination is not None
     assert (origin.station_id, origin.station_parent_id) == ("ZZ-99001", "ZZ-99009")
     assert destination.station_id is None
 
