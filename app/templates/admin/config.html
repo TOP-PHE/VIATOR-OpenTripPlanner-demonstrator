@@ -69,6 +69,15 @@ const SECTIONS = [
     'COVERAGE_VERIFY_PARALLELISM','COVERAGE_VERIFY_TIMEOUT_S','COVERAGE_VERIFY_SLEEP_MS',
     'COVERAGE_OEBB_STOP_SERIES',
   ] },
+  // How the ÖBB check pairs a cell's VIATOR journeys with ÖBB's (#304, the
+  // matching engine's `coverage_alignment` profile): read at a run's first
+  // execution and frozen with its other knobs.
+  { title: 'Coverage matching', keys: [
+    'COVERAGE_MATCH_DEPARTURE_TOLERANCE_S','COVERAGE_MATCH_ARRIVAL_TOLERANCE_S',
+    'COVERAGE_MATCH_SAME_SERVICE_MIN_PCT','COVERAGE_MATCH_PROBABLE_MIN_PCT',
+    'COVERAGE_MATCH_TRAIN_NUMBER_CONFLICT','COVERAGE_MATCH_UNRESOLVED_ENDPOINTS',
+    'COVERAGE_MATCH_POSITION_FALLBACK_M','COVERAGE_MATCH_TRANSFER_DIFFERENCE_S',
+  ] },
   { title: 'Master data refresh', keys: ['MASTER_STATIONS_REFRESH_DAYS','MASTER_CARRIERS_REFRESH_DAYS'] },
   // v0.1.11: previously hardcoded / .env-only.
   // REBUILD_DEBOUNCE_SECONDS=0 means "rebuild starts on click" (demo).
@@ -83,6 +92,8 @@ const BOOLS   = new Set(['FANOUT_PARTIAL_OK','STORE_RAW_RESPONSE','REGISTRATION_
 const CHOICES = {
   SMTP_SECURE: ['none','starttls','tls'],
   REGISTRATION_DEFAULT_ROLE: ['end_user','content_manager'],
+  COVERAGE_MATCH_TRAIN_NUMBER_CONFLICT: ['veto','veto_unless_same_minutes','penalty'],
+  COVERAGE_MATCH_UNRESOLVED_ENDPOINTS: ['allow','reject'],
   // Mirror CONFIG_SCHEMA['COVERAGE_DEFAULT_TIMEZONE'].choices — kept in
   // sync via the drift-guard in tests/unit/test_admin_config_template.py
   // so adding a zone in the schema without updating this list fails CI.

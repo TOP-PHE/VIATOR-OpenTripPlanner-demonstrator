@@ -5,10 +5,11 @@ Three concern groups:
   1. `extract_uic` — canonical UIC extraction from every observed
      stop_id shape (MOTIS ScheduledStopPoint, HAFAS lid, SNCF
      8-digit, junk, None).
-  2. `compute_alignment` — the (VIATOR, ÖBB) → (score, tier)
-     pipeline: exact-fingerprint match, train-number-guarded fuzzy
-     fallback, the high-frequency-corridor-false-positive guard,
-     one-sided / no-service edge cases.
+  2. `compute_alignment` — the (VIATOR, ÖBB) → (score, tier, detail)
+     pipeline, scored by the matching engine since #304: pairs by verdict,
+     the high-frequency-corridor guard (M2), ÖBB's window (M9),
+     one-sided / no-service edge cases. The cases whose result #304
+     changed say so, with the decision behind it.
   3. Tier mapping — boundary checks (1.00, 0.99, 0.70, 0.69, 0.40,
      0.39, 0.0) so a future refactor that nudges a threshold breaks
      a single test rather than silently shifting cell colours.
@@ -34,7 +35,7 @@ import pytest
 
 from app.journey.canonical import CanonicalJourney
 from app.journey.canonical_adapters import hafas_adapter
-from app.network_coverage import alignment, oebb_journeys
+from app.network_coverage import oebb_journeys
 from app.network_coverage.alignment import compute_alignment, journeys_from_depart_at
 from app.network_coverage.external_verify import extract_uic
 from tests.unit import canonical_fixtures as fx
@@ -159,6 +160,14 @@ def _o_leg(
     }
 
 
+def _scored(
+    viator: list[CanonicalJourney], oebb: list[CanonicalJourney]
+) -> tuple[float | None, str]:
+    """The cell's score and tier (`compute_alignment`'s detail read where a test needs it)."""
+    found = compute_alignment(viator, oebb)
+    return found.score, found.tier
+
+
 # ───────────────── endpoint identity: tokens, not coordinates ─────────────────
 #
 # These four are the assertions that separate this design from PR #226. #226
@@ -195,7 +204,7 @@ def test_two_id_less_itineraries_do_not_exact_match() -> None:
     }
     o_it = _o_itin(legs=[_o_leg(from_uic=None, to_uic=None)])
 
-    score, tier = compute_alignment([_viator_trip([v_leg])], [o_it])
+    score, tier = _scored([_viator_trip([v_leg])], [o_it])
 
     assert score != 1.0, "two id-less itineraries must not be credited as identical"
     assert tier != "agree"
@@ -208,7 +217,7 @@ def test_guard_rejects_cross_namespace_endpoints() -> None:
     v = [_viator_trip([_v_leg(from_uic="8100002", to_uic="8103000")])]
     o = [_o_itin(legs=[_o_leg(from_uic="OEBB:904050", to_uic="OEBB:904062")])]
 
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
 
     assert score == 0.0
     assert tier == "no_overlap"
@@ -241,26 +250,28 @@ def test_guard_accepts_when_both_sides_reduce_to_the_same_uic() -> None:
     assert o_leg["from_stop_id"] == "UIC:8103000", "zero padding absorbed"
 
     v = [_viator_trip([_v_leg(from_uic="8103000", to_uic="8503000")])]
-    _score, tier = compute_alignment(v, [o_journey])
+    _score, tier = _scored(v, [o_journey])
 
     assert tier == "agree"
 
 
-def test_endpoint_token_passes_canonical_through_and_still_parses_viator_ids() -> None:
-    """`_endpoint_token` must not regress the VIATOR side while gaining the
-    ÖBB passthrough."""
-    assert alignment._endpoint_token("OEBB:904050") == "OEBB:904050"
-    assert alignment._endpoint_token("OEBB:?") == "OEBB:?"
-    assert alignment._endpoint_token("UIC:8400058") == "UIC:8400058"
-    assert alignment._endpoint_token("SBB:8507000:0:5") == "UIC:8507000"
-    assert alignment._endpoint_token(None) is None
+def test_an_oebb_token_compares_as_an_unknown_station() -> None:
+    """Since #304 the engine compares the stops: an `OEBB:` token is UNKNOWN (design §6), and
+    the coverage profile refuses an unknown endpoint (M4), so it can never stand for a UIC."""
+    v = [_viator_trip([_v_leg(from_uic="8100002", to_uic="8503000")])]
+    o = [_o_itin(legs=[_o_leg(from_uic="OEBB:904050", to_uic="UIC:8503000")])]
+
+    found = compute_alignment(v, o)
+
+    assert (found.score, found.tier) == (0.0, "no_overlap")
+    assert found.detail["reasons"].get("endpoint_unresolved") == 1
 
 
 def test_compute_alignment_both_empty_is_no_service() -> None:
     """Neither planner found anything → 'no_service' with NULL score.
     The matrix UI renders this as informational grey, not red — a real
     'no Sunday service' answer isn't a data gap."""
-    score, tier = compute_alignment([], [])
+    score, tier = _scored([], [])
     assert score is None
     assert tier == "no_service"
 
@@ -270,7 +281,7 @@ def test_compute_alignment_viator_only_is_one_sided_viator() -> None:
     with score=0.0. Operator now knows VIATOR's confident, ÖBB doesn't
     even have the corridor."""
     v = [_viator_trip([_v_leg()])]
-    score, tier = compute_alignment(v, [])
+    score, tier = _scored(v, [])
     assert score == 0.0
     assert tier == "one_sided_viator"
 
@@ -279,7 +290,7 @@ def test_compute_alignment_oebb_only_is_one_sided_oebb() -> None:
     """ÖBB has the route, VIATOR doesn't — the classic 'likely VIATOR
     data gap' case the operator wants surfaced."""
     o = [_o_itin(legs=[_o_leg()])]
-    score, tier = compute_alignment([], o)
+    score, tier = _scored([], o)
     assert score == 0.0
     assert tier == "one_sided_oebb"
 
@@ -294,24 +305,23 @@ def test_compute_alignment_exact_match_scores_one() -> None:
     every same-train comparison to a fuzzy 0.7."""
     v = [_viator_trip([_v_leg()])]
     o = [_o_itin(legs=[_o_leg()])]
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
     assert score == 1.0
     assert tier == "agree"
 
 
-def test_compute_alignment_no_train_and_different_minute_is_no_overlap() -> None:
-    """Same endpoints + DIFFERENT minute + no train number on either
-    side → exact fingerprint differs (timestamps differ) AND the fuzzy
-    fallback can't fire (no train identity to confirm) → no_overlap.
-
-    This is the path the high-frequency-corridor guard relies on once
-    train numbers are missing — without train identity, schedule skew
-    is meaningless evidence in either direction."""
+def test_a_viator_journey_half_an_hour_before_oebb_s_is_outside_its_window() -> None:
+    """M9 (#304): ÖBB's span is its first boardings, ±2 min. A VIATOR journey half an hour
+    before is outside it: counted, never compared, so the cell is ÖBB's alone. (Before #304:
+    `no_overlap`, the two journeys compared and found different.)"""
     v = [_viator_trip([_v_leg(route="", dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
     o = [_o_itin(legs=[_o_leg(route="", dep="2026-06-30T08:30", arr="2026-06-30T13:00")])]
-    score, tier = compute_alignment(v, o)
-    assert score == 0.0
-    assert tier == "no_overlap"
+
+    found = compute_alignment(v, o)
+
+    assert (found.score, found.tier) == (0.0, "one_sided_oebb")
+    assert found.detail["counts"]["outside_reference_window"] == 1
+    assert found.detail["reasons"] == {"outside_reference_window": 1}
 
 
 def test_compute_alignment_empty_route_same_minute_still_exact_matches() -> None:
@@ -329,68 +339,121 @@ def test_compute_alignment_empty_route_same_minute_still_exact_matches() -> None
     guard at the wrong layer."""
     v = [_viator_trip([_v_leg(route="")])]
     o = [_o_itin(legs=[_o_leg(route="")])]
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
     assert score == 1.0
     assert tier == "agree"
 
 
-def test_compute_alignment_fuzzy_match_with_train_scores_partial() -> None:
-    """Same endpoints + same train number + ±5min departure → fuzzy
-    match → 0.70 credit → 'mostly_agree' (≥ 0.70 threshold). Operator
-    sees this as 'almost certainly the same train, schedule jitter'
-    rather than 'no overlap'."""
+def test_a_minute_of_jitter_with_the_same_train_is_probably_the_same() -> None:
+    """One minute later at both ends, the same train number: `probably_same`, credit 0.7 →
+    'mostly_agree'. (The ±5 min fuzzy tier of before is gone, M1: ±2 min.)"""
     v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
-    # Same train number ("RJ 1141"), 3 min later departure — within ±5min.
+    o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:01", arr="2026-06-30T13:31")])]
+
+    found = compute_alignment(v, o)
+
+    assert (found.score, found.tier) == (0.7, "mostly_agree")
+    assert found.detail["counts"]["probably_same"] == 1
+
+
+def test_three_minutes_of_jitter_is_outside_the_tolerance() -> None:
+    """M1 (#304): ±2 min. Three minutes later is outside ÖBB's window (M9) too: the cell is
+    ÖBB's alone. (Before #304 the ±5 min fuzzy tier credited it 0.7.)"""
+    v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
     o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:03", arr="2026-06-30T13:33")])]
-    score, tier = compute_alignment(v, o)
-    assert score == 0.7
-    assert tier == "mostly_agree"
+
+    assert _scored(v, o) == (0.0, "one_sided_oebb")
 
 
-def test_compute_alignment_fuzzy_blocked_by_train_number_mismatch() -> None:
-    """Same endpoints + same departure but different train numbers →
-    fuzzy match DECLINES. This is the high-frequency-corridor guard:
-    'TGV 9582' and 'TGV 9586' run the same corridor 30 min apart but
-    are unrelated services."""
+def test_different_numbers_two_minutes_apart_never_pair() -> None:
+    """The high-frequency corridor guard (M2): two trains with different numbers that are not
+    the same minute at both ends are vetoed."""
+    v = [_viator_trip([_v_leg(route="TGV 9582", dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
+    o = [_o_itin(legs=[_o_leg(route="TGV 9586", dep="2026-06-30T08:02", arr="2026-06-30T13:32")])]
+
+    found = compute_alignment(v, o)
+
+    assert (found.score, found.tier) == (0.0, "no_overlap")
+    assert found.detail["reasons"].get("train_number_differs") == 1
+
+
+def test_different_numbers_at_the_same_minutes_are_probably_the_same() -> None:
+    """M2 as amended and accepted (owner, 2026-11-05): a different number on a leg that is the
+    same minute at both ends on both sides is a warning, not a veto (Eurostar's 94xx / 93xx,
+    renumbered TGVs). (Before #304: `no_overlap`.)"""
     v = [_viator_trip([_v_leg(route="TGV 9582", dep="2026-06-30T08:00")])]
-    # Same endpoints + minute, different train.
     o = [_o_itin(legs=[_o_leg(route="TGV 9586", dep="2026-06-30T08:00")])]
-    score, tier = compute_alignment(v, o)
-    assert score == 0.0
-    assert tier == "no_overlap"
+
+    found = compute_alignment(v, o)
+
+    assert (found.score, found.tier) == (0.7, "mostly_agree")
+    assert found.detail["reasons"].get("train_number_differs_same_minutes") == 1
+
+
+def _elsewhere(dep: str, arr: str) -> CanonicalJourney:
+    """An ÖBB connection between two other stations: it widens ÖBB's span, pairs with nothing."""
+    return _o_itin(
+        legs=[
+            _o_leg(route="RJ 1199", from_uic="UIC:8100013", to_uic="UIC:8100173", dep=dep, arr=arr)
+        ]
+    )
 
 
 def test_compute_alignment_partial_score_below_mostly_threshold() -> None:
-    """3 VIATOR trips, 1 ÖBB exact match → 1/3 = 0.33 → below the
-    0.40 'partial' threshold → 'disagree'. Pinned so a denominator
-    refactor doesn't shift this cell into a more positive tier."""
+    """3 VIATOR journeys within ÖBB's span, 1 pair → 1/3 = 0.33 → 'disagree'."""
+    v = [
+        _viator_trip([_v_leg(route="RJ 1141", dep="2026-06-30T08:00", arr="2026-06-30T13:30")]),
+        _viator_trip([_v_leg(route="RJ 1143", dep="2026-06-30T08:30", arr="2026-06-30T14:00")]),
+        _viator_trip([_v_leg(route="RJ 1145", dep="2026-06-30T09:00", arr="2026-06-30T14:30")]),
+    ]
+    o = [
+        _o_itin(legs=[_o_leg(route="RJ 1141", dep="2026-06-30T08:00", arr="2026-06-30T13:30")]),
+        _elsewhere("2026-06-30T09:00", "2026-06-30T11:00"),
+    ]
+
+    assert _scored(v, o) == (0.33, "disagree")
+
+
+def test_compute_alignment_partial_tier_at_two_of_three() -> None:
+    """2 pairs over three journeys a side → 2/3 = 0.67 → 'partial'."""
+    v = [
+        _viator_trip([_v_leg(route="RJ 1141", dep="2026-06-30T08:00", arr="2026-06-30T13:30")]),
+        _viator_trip([_v_leg(route="RJ 1143", dep="2026-06-30T08:30", arr="2026-06-30T14:00")]),
+        _viator_trip([_v_leg(route="RJ 1145", dep="2026-06-30T09:00", arr="2026-06-30T14:30")]),
+    ]
+    o = [
+        _o_itin(legs=[_o_leg(route="RJ 1141", dep="2026-06-30T08:00", arr="2026-06-30T13:30")]),
+        _o_itin(legs=[_o_leg(route="RJ 1143", dep="2026-06-30T08:30", arr="2026-06-30T14:00")]),
+        _elsewhere("2026-06-30T09:00", "2026-06-30T11:00"),
+    ]
+
+    assert _scored(v, o) == (0.67, "partial")
+
+
+def test_viator_journeys_after_oebb_s_last_connection_are_not_counted() -> None:
+    """M9 (#304): ÖBB answers 5 connections from the run's departure time, VIATOR covers the
+    day. The two VIATOR journeys after ÖBB's last one say nothing either way: the cell is the
+    one pair, 'agree', and the detail counts the two. (Before #304: 1/3 = 0.33, 'disagree'.)"""
     v = [
         _viator_trip([_v_leg(route="RJ 1141", dep="2026-06-30T08:00")]),
         _viator_trip([_v_leg(route="RJ 1143", dep="2026-06-30T09:00")]),
         _viator_trip([_v_leg(route="RJ 1145", dep="2026-06-30T10:00")]),
     ]
     o = [_o_itin(legs=[_o_leg(route="RJ 1141", dep="2026-06-30T08:00")])]
-    score, tier = compute_alignment(v, o)
-    # denominator = max(min(3,3), min(1,3)) = max(3,1) = 3 → 1/3 = 0.33
-    assert score == 0.33
-    assert tier == "disagree"
 
+    found = compute_alignment(v, o)
 
-def test_compute_alignment_partial_tier_at_two_of_three() -> None:
-    """2 of 3 exact matches → 2/3 = 0.67 → 'partial' (≥ 0.40 and < 0.70).
-    Boundary check on the partial bucket."""
-    v = [
-        _viator_trip([_v_leg(route="RJ 1141", dep="2026-06-30T08:00")]),
-        _viator_trip([_v_leg(route="RJ 1143", dep="2026-06-30T09:00")]),
-        _viator_trip([_v_leg(route="RJ 1145", dep="2026-06-30T10:00")]),
-    ]
-    o = [
-        _o_itin(legs=[_o_leg(route="RJ 1141", dep="2026-06-30T08:00")]),
-        _o_itin(legs=[_o_leg(route="RJ 1143", dep="2026-06-30T09:00")]),
-    ]
-    score, tier = compute_alignment(v, o)
-    assert score == 0.67
-    assert tier == "partial"
+    assert (found.score, found.tier) == (1.0, "agree")
+    assert found.detail["counts"] == {
+        "same_service": 1,
+        "probably_same": 0,
+        "viator_only": 0,
+        "oebb_only": 0,
+        "uncomparable": 0,
+        "outside_reference_window": 2,
+    }
+    assert found.detail["engine_version"] == 1
+    assert found.detail["profile"] == "coverage_alignment"
 
 
 def test_compute_alignment_strips_walk_legs_before_match() -> None:
@@ -450,7 +513,7 @@ def test_compute_alignment_strips_walk_legs_before_match() -> None:
             ]
         )
     ]
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
     assert score == 1.0
     assert tier == "agree"
 
@@ -463,7 +526,7 @@ def test_compute_alignment_caps_score_at_one_when_overcounting() -> None:
     leg = _v_leg(route="RJ 1141", dep="2026-06-30T08:00")
     v = [_viator_trip([leg]), _viator_trip([leg]), _viator_trip([leg])]
     o = [_o_itin(legs=[_o_leg(route="RJ 1141", dep="2026-06-30T08:00")])]
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
     # Exact match consumes the single ÖBB row once; remaining 2 VIATOR
     # trips fuzzy-match against an already-matched ÖBB row → no further
     # credit. denominator = max(min(3,3), min(1,3)) = 3 → 1/3 = 0.33.
@@ -502,22 +565,19 @@ def test_compute_alignment_exact_match_across_summer_dst_boundary() -> None:
     ÖBB's times UTC once."""
     v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
     o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
-    score, tier = compute_alignment(v, o)
+    score, tier = _scored(v, o)
     assert score == 1.0
     assert tier == "agree"
 
 
-def test_compute_alignment_fuzzy_match_survives_cest_offset() -> None:
-    """Same regression, fuzzy-fallback path: a genuine ±3min schedule
-    jitter on the SAME real train must still fuzzy-match once both
-    sides are on the same clock basis — pre-fix, the ~2h CEST skew
-    would have blown well past the ±5min tolerance regardless of the
-    real jitter being tiny."""
+def test_a_minute_of_jitter_survives_the_cest_offset() -> None:
+    """Same regression, with jitter: a minute later on the SAME real train still pairs once both
+    sides are on the same clock basis; before #220 the ~2 h CEST skew put it far outside any
+    tolerance."""
     v = [_viator_trip([_v_leg(dep="2026-06-30T08:00", arr="2026-06-30T13:30")])]
-    o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:03", arr="2026-06-30T13:33")])]
-    score, tier = compute_alignment(v, o)
-    assert score == 0.7
-    assert tier == "mostly_agree"
+    o = [_o_itin(legs=[_o_leg(dep="2026-06-30T08:01", arr="2026-06-30T13:31")])]
+
+    assert _scored(v, o) == (0.7, "mostly_agree")
 
 
 # ─────────── journeys_from_depart_at (VIATOR/ÖBB search-scope fix) ───────────

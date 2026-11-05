@@ -653,6 +653,21 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
     carry the pair (0.57 < 0.75, `different`); 2 min at one end, or 1 min at both, pairs as
     `probably_same`. On the coverage run a ride both sides take had the same minutes on both
     (§1.1), so this should be rare; the coverage wiring's reason counts will show it.
+- 2026-11-05 — as built, coverage wiring, scoring (#304, step 3a; the cell modal and report show
+  the reasons in step 3b): `network_coverage/alignment.py` scores a cell with `compare(...,
+  coverage_alignment)` (credits 1.0 / 0.7, the same normalisation and nine tiers, §11);
+  `reference_window` is M9 (ÖBB's span from its first to its last first boarding, ± the departure
+  tolerance; a VIATOR journey outside is counted, never `left_only`); the cell's detail (M6) in
+  `network_coverage_results.external_alignment_detail` (revision `20261105_1200_alignment_detail`,
+  saved by the sweep's writer too); the eight `COVERAGE_MATCH_*` settings, frozen in the run's
+  `execution_snapshot` (`runner.CoverageConfig`, `match_profile`); the sweep places stations with a
+  resolver per session (`runner._SweepStations`, a journey by its own session in a fanout run) for
+  the scoring only: ÖBB's journeys are stored as answered, no station id reaches a page. The old
+  exact-fingerprint and fuzzy tiers are gone. `test_oebb_alignment.py` rerun on the engine: every
+  case that was `agree` stays `agree`; six changed, each by a decision: two by M1 (3 min is outside
+  ±2 min; the ±5 min fuzzy credit is gone), one by M2's amendment (different numbers at the same
+  minutes: `probably_same`), three by M9 (VIATOR journeys before or after ÖBB's span no longer
+  count).
 - 2026-11-05 — as built, `/journey` wiring (#304, step 2): `/fanout` compares VIATOR's journeys
   (each merged slot's `best`) with each reference that answered, `compare(viator, reference,
   journey_reference)` with the `JOURNEY_MATCH_*` settings (§10; declared in `config_schema`, a

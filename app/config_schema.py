@@ -154,6 +154,40 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # evidence. A series is the module's data (its links file), never guessed:
     # change it here when the module files them under another one.
     "COVERAGE_OEBB_STOP_SERIES": {"type": "str", "default": "DELFI_stop_key"},
+    # ── Coverage matching (#304, docs/journey-matching-engine-design.md §10) ──
+    # How the ÖBB check pairs a cell's VIATOR journeys with ÖBB's: the profile
+    # `coverage_alignment` of `app/journey/matching/profiles.py` with these laid
+    # over it. Read at a run's first execution and frozen with its other knobs
+    # (`execution_snapshot`), so a resumed run scores as it started.
+    # M1: first boarding and last alighting within these seconds.
+    "COVERAGE_MATCH_DEPARTURE_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},
+    "COVERAGE_MATCH_ARRIVAL_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},
+    # The verdicts' thresholds, in percent of the score.
+    "COVERAGE_MATCH_SAME_SERVICE_MIN_PCT": {"type": "int", "default": 90, "min": 0, "max": 100},
+    "COVERAGE_MATCH_PROBABLE_MIN_PCT": {"type": "int", "default": 75, "min": 0, "max": 100},
+    # M2 (owner, 2026-11-05): two different train numbers veto a pair, unless the
+    # leg is the same minute at both ends on both sides (Eurostar's 94xx / 93xx).
+    "COVERAGE_MATCH_TRAIN_NUMBER_CONFLICT": {
+        "type": "str",
+        "default": "veto_unless_same_minutes",
+        "choices": ["veto", "veto_unless_same_minutes", "penalty"],
+    },
+    # M4: an endpoint the station data cannot compare refuses the pair on coverage.
+    "COVERAGE_MATCH_UNRESOLVED_ENDPOINTS": {
+        "type": "str",
+        "default": "reject",
+        "choices": ["allow", "reject"],
+    },
+    # M4's fallback (owner, 2026-11-05): a time-matched leg's stops within this many
+    # metres of each other agree; 0 turns it off.
+    "COVERAGE_MATCH_POSITION_FALLBACK_M": {"type": "int", "default": 1000, "min": 0, "max": 5000},
+    # M8: "shorter transfer" when one side's change is shorter by this many seconds.
+    "COVERAGE_MATCH_TRANSFER_DIFFERENCE_S": {
+        "type": "int",
+        "default": 300,
+        "min": 60,
+        "max": 3600,
+    },
     # ── Coverage K-slot time-slicing (PR-3) ───────────────────────────
     # The legacy per-pair coverage call was one numItineraries=50,
     # window=4h request. That worked for the 08:00 "morning peak"

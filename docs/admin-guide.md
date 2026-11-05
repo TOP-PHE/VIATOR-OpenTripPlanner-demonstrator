@@ -2703,6 +2703,31 @@ Before deploying:
 After deploying, start the coverage runs again. A rollback (§7) brings back the code and the old
 columns, not the deleted rows.
 
+### 6.28 Coverage scores since #304: the matching engine, and why a cell scored what it did
+
+Since #304 the ÖBB check scores a cell with the journey matching engine
+(`docs/journey-matching-engine-design.md`). The tiers and their colours are the same; what makes
+a pair changed, so **scores of runs before and after are not comparable**: run again.
+
+- **A pair** is the same train at both ends within ±2 min (`COVERAGE_MATCH_DEPARTURE_TOLERANCE_S`,
+  `..._ARRIVAL_...`), with no station that conflicts and none the station data cannot compare
+  (`COVERAGE_MATCH_UNRESOLVED_ENDPOINTS` = `reject`), and no different train number unless the
+  leg is the same minute at both ends (`COVERAGE_MATCH_TRAIN_NUMBER_CONFLICT`). A line label
+  that differs (`17` / `Tram 1`) lowers the score only. "Same service" earns 1.0, "probably the
+  same" 0.7.
+- **Stations** are compared by the station module's station id when the module places both stops
+  (VIATOR's stops through its stop extracts, ÖBB's numbers in `COVERAGE_OEBB_STOP_SERIES`), else
+  by their codes, else, for a leg whose times agree, by position: each stop within
+  `COVERAGE_MATCH_POSITION_FALLBACK_M` (1 000 m) of the other's. **Deploy the station module's
+  version with `POST /internal/v1/stops/stations` (MSMM #83) first**: before it the check finds no
+  station id, and only codes and positions are compared.
+- **ÖBB's window**: only VIATOR journeys whose first boarding lies within ÖBB's span (its first to
+  its last connection, ±2 min) are compared; the others are counted as "after ÖBB's last
+  connection", never as VIATOR-only.
+- **Why**: each cell keeps `external_alignment_detail` (counts by verdict, journeys outside ÖBB's
+  window, and how often each reason was met: `shorter_transfer`, `line_label_differs`,
+  `stations_by_position`, ...). The settings are on Admin → Configuration → "Coverage matching";
+  a run uses those of its first execution (frozen with its other knobs).
 ### 6.29 How a journey search pairs VIATOR's journeys with ÖBB's and OJP's (#304)
 
 Since #304 a search with a reference planner ticked compares VIATOR's journeys with each
