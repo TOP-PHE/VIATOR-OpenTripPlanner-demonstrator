@@ -399,7 +399,7 @@ what hid the `extract_uic` bug).
 | leg `kind` | `mode` ∈ {WALK, BIKE, CAR…} → `continuous` (`transfer` between two transit legs), else `timed` | |
 | `service.mode` / leg `source_mode` | `mode` folded / raw | fixes §1.3 |
 | `service.line`, `published_name` | `routeShortName` | |
-| `service.train_number` | `tripShortName` when numeric (MOTIS reads NeTEx `TrainNumber`; NMBS gives 0 → `None`) | to confirm on a captured eu19 answer |
+| `service.train_number` | `tripShortName` when numeric (MOTIS reads NeTEx `TrainNumber`; NMBS gives 0 → `None`) | to confirm on a captured eu19 answer. Not filled yet. Measured 2026-11-05 on a coverage run: on eu19 the number sits in `headsign` (SNCF feeds) or `tripId` (SNCF, Eurostar, SBB, Renfe, Vy), and in no field for DB, ÖBB, NS, Trenord, Styria, PKP: per-feed rules in journey-matching-engine-design.md §5.1 |
 | `route_long_name`, `line_ref`, `journey_ref`, `destination_text` | `routeLongName`, `routeId`, `tripId`, `headsign` | |
 | operator | `agencyName` (cleaned), `agencyId`, `agencyUrl` | |
 | stop place / quay | `stopId` (quay ref), `parentId` (stop place ref), `name`, `lat`/`lon`, `stopCode` → `codes.GTFS_STOP_CODE`, `uic` only when UIC-shaped | step 0b of today's rules |
@@ -731,3 +731,5 @@ Risks:
   empty; `with_resolved_stations(journeys, None)` places nothing (no stub resolver); OJP XSD and
   OSDM schema validation wait for #306 / #307; PR 3 split into 3 (clients) and 3b (callers, API,
   page).
+- 2026-11-05 — §5.1 MOTIS `service.train_number`: where eu19 carries the number, measured on a
+  coverage run (journey-matching-engine-design.md §1.1 c, §5.1); the adapter still fills none.
