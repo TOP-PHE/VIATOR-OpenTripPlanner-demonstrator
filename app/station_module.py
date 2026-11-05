@@ -29,6 +29,14 @@ inside the network like VIATOR's calls to MOTIS):
   starts the pause. Used by the coverage cell modal to name the station an
   ÖBB HAFAS stop number is linked to
   (`POST /api/admin/network-coverage/oebb-stops/resolve`).
+- `stop_stations_outcome(feed=, stops=)` / `(series=, codes=)` — `POST
+  /internal/v1/stops/stations` (its design 22.18, decision 68), the VIATOR
+  ids of the stations of up to 50 stops of one of VIATOR's feeds, or codes of
+  one series, each with its parent's: ids only. **A service call**: the
+  token and no user id, counted on no person's limits but on the module's
+  own daily ceiling (429 `stops_day`). Used by the station resolver of
+  journeys (app/journey/station_resolver.py, #303 PR 5), for VIATOR's own
+  matching only; a failure never starts the pause.
 - `countries()` — `GET /internal/v1/countries`, the countries of the
   module's served stations, kept 60 s; None on any failure. Read by the
   country gate of a session's providers (app/api/admin/sessions.py), only
@@ -143,8 +151,30 @@ SEARCH_PATH = "/internal/v1/stations/search"
 LOOKUP_PATH = "/internal/v1/stations/lookup"
 NEAR_PATH = "/internal/v1/stations/near"
 RESOLVE_PATH = "/internal/v1/stops/resolve"
+STOP_STATIONS_PATH = "/internal/v1/stops/stations"
 ATTRIBUTION_PATH = "/internal/v1/attribution"
 USER_HEADER = "X-Viator-User-Id"
+
+# The stations of many stops (the module's design 22.18): 1 to 50 distinct
+# keys a call, in a JSON body of at most 4096 bytes (every internal call's
+# cap, its design 20.5 i6); a stop key of its extract's rule (1 to 200
+# characters, no control character); a feed key of its forms (22.2 point 6,
+# the same as `station_extract.FEED_KEY`, copied here so that this client
+# never imports the extractor).
+STOP_STATIONS_MAX = 50
+STOP_STATIONS_BODY_MAX = 4096
+STOP_KEY_MAX = 200
+_STOP_KEY_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+FEED_KEY = re.compile(
+    r"(?:nap:tdg:[1-9][0-9]{0,17}"
+    r"|nap:(?:udata|permalink|dated|json_api):[0-9a-f]{16}"
+    r"|url:[0-9a-f]{16}|upload:[0-9a-f]{64})",
+    re.ASCII,
+)
+# A server-side call, off the keystroke path: up to three statements of 0.8 s
+# each in the module, so three seconds for the whole call.
+STOP_STATIONS_DEADLINE = 3.0
+STOP_STATIONS_TIMEOUT = httpx.Timeout(STOP_STATIONS_DEADLINE, connect=0.3)
 
 # A lookup: 1 to 20 distinct codes, each 3 to 20 characters (the module's
 # rule, its design 21.5 and 18.28 entry 256).
@@ -209,6 +239,8 @@ LIMIT_CODES = frozenset(
         "near_user_minute",
         "near_user_day",
         "near_all_day",
+        # The daily ceiling of the stations of many stops (its design 22.18).
+        "stops_day",
     }
 )
 
@@ -1147,6 +1179,143 @@ async def resolve_code_outcome(series: str | None, code: str, user_id: uuid.UUID
         return _resolve_rows(_json_body(await _post(RESOLVE_PATH, body, user_id)))
 
     return await _without_pause("station_module.resolve_failed", call)
+
+
+# ── The stations of many stops (the module's design 22.18, decision 68) ──
+
+
+def stop_key_refused(value: Any) -> str | None:
+    """Why the module would refuse `value` as a stop key of a feed, as one
+    word, or None: its extract's text rule (1 to 200 characters, no control
+    character: C0, DEL, C1) and no surrogate."""
+    if not isinstance(value, str):
+        return "type"
+    if any(unicodedata.category(character) == "Cs" for character in value):
+        return "surrogate"
+    if _STOP_KEY_CONTROL.search(value) is not None:
+        return "control character"
+    if not 1 <= len(value) <= STOP_KEY_MAX:
+        return "length"
+    return None
+
+
+def stop_stations_body(
+    *,
+    feed: str | None = None,
+    stops: list[str] | None = None,
+    series: str | None = None,
+    codes: list[str] | None = None,
+) -> bytes:
+    """The JSON body of one call of the stations of many stops, as it is sent:
+    `{"feed", "stops"}` or `{"series", "codes"}`. ValueError when the module
+    would refuse it (another form, 0 or more than 50 keys, a key twice, a feed
+    key not of the module's forms, a key or series it refuses, more than its
+    4096 bytes): a caller packs its keys with `STOP_STATIONS_MAX` and this."""
+    if feed is not None and stops is not None and series is None and codes is None:
+        if FEED_KEY.fullmatch(feed) is None:
+            raise ValueError("a feed key the module refuses")
+        if any(stop_key_refused(stop) is not None for stop in stops):
+            raise ValueError("a stop key the module refuses")
+        payload: dict[str, Any] = {"feed": feed, "stops": stops}
+        keys: list[str] = stops
+    elif series is not None and codes is not None and feed is None and stops is None:
+        for value in (series, *codes):
+            if not isinstance(value, str) or resolve_text_refused(value) is not None:
+                raise ValueError("a series or a code the module refuses")
+        payload = {"series": series, "codes": codes}
+        keys = codes
+    else:
+        raise ValueError("one of feed and stops, or series and codes")
+    if not 1 <= len(keys) <= STOP_STATIONS_MAX or len(set(keys)) != len(keys):
+        raise ValueError("1 to 50 distinct keys")
+    body = json.dumps(payload).encode("utf-8")
+    if len(body) > STOP_STATIONS_BODY_MAX:
+        raise ValueError("a body larger than the module takes")
+    return body
+
+
+def _stop_station_row(item: Any, asked: frozenset[str]) -> dict[str, Any] | None:
+    """One row of the answer, or None when it is not usable: a key that was
+    asked, the station's VIATOR id, and its parent's (None when absent or
+    malformed)."""
+    if not isinstance(item, dict):
+        return None
+    key = item.get("key")
+    vid = item.get("viator_id")
+    if not isinstance(key, str) or key not in asked or not is_viator_id(vid):
+        return None
+    return {
+        "key": key,
+        "viator_id": vid,
+        "parent_viator_id": _viator_id_or_none(item.get("parent_viator_id")),
+    }
+
+
+def _stop_station_rows(payload: Any, asked: frozenset[str]) -> list[dict[str, Any]]:
+    """The usable rows of an answer (`{"stations": [...]}`), at most ten a key;
+    a wrong top-level shape refuses the whole answer."""
+    stations = payload.get("stations") if isinstance(payload, dict) else None
+    if not isinstance(stations, list):
+        raise _Failure("shape", pause=False)
+    rows: list[dict[str, Any]] = []
+    per_key: dict[str, int] = {}
+    for item in stations:
+        row = _stop_station_row(item, asked)
+        if row is None or per_key.get(row["key"], 0) >= MAX_ROWS:
+            continue
+        per_key[row["key"]] = per_key.get(row["key"], 0) + 1
+        rows.append(row)
+    return rows
+
+
+async def _service_post(path: str, body: bytes) -> _Answer:
+    """One service call (no person: the token and no `X-Viator-User-Id`): a
+    POST of the JSON `body`, within the deadline and size cap of the stations
+    of many stops."""
+    headers = {**_headers(), "Content-Type": "application/json"}
+    try:
+        async with (
+            asyncio.timeout(STOP_STATIONS_DEADLINE),
+            httpx.AsyncClient(timeout=STOP_STATIONS_TIMEOUT, trust_env=False) as client,
+            client.stream("POST", _url(path), content=body, headers=headers) as response,
+        ):
+            return await _read(response, SEARCH_MAX_BYTES)
+    except (TimeoutError, httpx.TimeoutException):
+        raise _Failure("timeout", pause=True) from None
+    except httpx.HTTPError:
+        raise _Failure("network", pause=True) from None
+
+
+async def stop_stations_outcome(
+    *,
+    feed: str | None = None,
+    stops: list[str] | None = None,
+    series: str | None = None,
+    codes: list[str] | None = None,
+) -> Outcome:
+    """The stations of up to 50 stops of one of VIATOR's feeds (`feed` its MSMM
+    feed key, `stops` the stop keys of its extract), or of up to 50 codes of
+    one series, as an `Outcome`: `POST /internal/v1/stops/stations` (the
+    module's design 22.18). Each row is `{"key", "viator_id",
+    "parent_viator_id"}`: the current VIATOR id of a station the key belongs
+    to and its parent's; a key the module places nowhere has no row, a code
+    may have several.
+
+    **A service call** (the module's decision 68): VIATOR's server for its own
+    matching of journeys, with stops its engines or ÖBB answered, never a code
+    a person typed; no `X-Viator-User-Id`, so no person's limits are used, and
+    the module's own daily ceiling instead (a 429 with the code `stops_day`).
+    A body the module would refuse raises ValueError before any call
+    (`stop_stations_body`). **A failure never starts the pause** (the
+    typeahead's), as for the lookup; it is logged as
+    `station_module.stop_stations_failed reason=<word>`, never a key."""
+    body = stop_stations_body(feed=feed, stops=stops, series=series, codes=codes)
+    asked = frozenset(stops if stops is not None else codes or ())
+
+    async def call() -> list[dict[str, Any]]:
+        return _stop_station_rows(_json_body(await _service_post(STOP_STATIONS_PATH, body)), asked)
+
+    return await _without_pause("station_module.stop_stations_failed", call)
 
 
 def _short_text(value: Any) -> str:

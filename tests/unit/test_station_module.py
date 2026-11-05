@@ -2435,3 +2435,157 @@ def test_countries_blocking_runs_outside_the_event_loop(module: Module) -> None:
     module.answer(200, {"countries": ["ZZ"]})
 
     assert station_module.countries_blocking() == frozenset({"ZZ"})
+
+
+# ───────────────── the stations of many stops (#303 PR 5) ─────────────────
+
+FEED_KEY = "upload:" + "9" * 64
+
+
+def _stop_row(key: str, vid: str = "ZZ-99001", parent: Any = None) -> dict[str, Any]:
+    return {"key": key, "viator_id": vid, "parent_viator_id": parent}
+
+
+async def test_stop_stations_is_a_service_call_with_the_keys_in_its_body(
+    module: Module, token: str
+) -> None:
+    module.answer(200, {"stations": [_stop_row("zz:1")]})
+
+    outcome = await station_module.stop_stations_outcome(feed=FEED_KEY, stops=["zz:1", "zz:2"])
+
+    assert outcome == station_module.Outcome(
+        [{"key": "zz:1", "viator_id": "ZZ-99001", "parent_viator_id": None}], "ok"
+    )
+    (request,) = module.requests
+    assert request.method == "POST"
+    assert str(request.url) == MODULE_URL + station_module.STOP_STATIONS_PATH
+    assert json.loads(request.content) == {"feed": FEED_KEY, "stops": ["zz:1", "zz:2"]}
+    assert request.headers["authorization"] == f"Bearer {token}"
+    assert request.headers["content-type"] == "application/json"
+    # No person: the module counts it on no one's limits (its decision 68).
+    assert station_module.USER_HEADER.lower() not in request.headers
+    assert set(request.headers) - _HTTPX_DEFAULTS == {
+        "authorization",
+        "content-type",
+        "content-length",
+    }
+
+
+async def test_stop_stations_by_codes(module: Module) -> None:
+    module.answer(
+        200,
+        {"stations": [_stop_row("9900001", "ZZ-99002"), _stop_row("9900001", "ZZ-99003")]},
+    )
+
+    outcome = await station_module.stop_stations_outcome(series="DELFI_stop_key", codes=["9900001"])
+
+    assert json.loads(module.requests[0].content) == {
+        "series": "DELFI_stop_key",
+        "codes": ["9900001"],
+    }
+    assert [row["viator_id"] for row in outcome.rows or []] == ["ZZ-99002", "ZZ-99003"]
+
+
+async def test_stop_stations_keeps_only_usable_rows_of_keys_asked(module: Module) -> None:
+    module.answer(
+        200,
+        {
+            "stations": [
+                _stop_row("zz:1", parent="ZZ-99009"),
+                _stop_row("zz:other"),  # never asked
+                _stop_row("zz:1", "99001"),  # not a VIATOR id
+                _stop_row("zz:2", parent="not-an-id"),  # a malformed parent reads as none
+                "zz",
+                {"key": 7, "viator_id": "ZZ-99001"},
+                *[_stop_row("zz:3", f"ZZ-990{n:02d}") for n in range(12)],
+            ]
+        },
+    )
+
+    outcome = await station_module.stop_stations_outcome(
+        feed=FEED_KEY, stops=["zz:1", "zz:2", "zz:3"]
+    )
+
+    rows = outcome.rows or []
+    assert rows[:2] == [
+        {"key": "zz:1", "viator_id": "ZZ-99001", "parent_viator_id": "ZZ-99009"},
+        {"key": "zz:2", "viator_id": "ZZ-99001", "parent_viator_id": None},
+    ]
+    # At most ten stations a key, as the module answers.
+    assert len([row for row in rows if row["key"] == "zz:3"]) == station_module.MAX_ROWS
+
+
+@pytest.mark.parametrize("body", [{"stations": "zz"}, {"matches": []}, [], "zz"])
+async def test_stop_stations_refuses_an_answer_of_another_shape(module: Module, body: Any) -> None:
+    module.answer(200, body)
+
+    outcome = await station_module.stop_stations_outcome(feed=FEED_KEY, stops=["zz:1"])
+
+    assert (outcome.rows, outcome.reason) == (None, "shape")
+
+
+async def test_stop_stations_at_the_module_s_ceiling_never_starts_the_pause(
+    module: Module,
+) -> None:
+    module.handler = lambda _r: httpx.Response(
+        429, json={"detail": "zz", "code": "stops_day"}, headers={"Retry-After": "120"}
+    )
+
+    outcome = await station_module.stop_stations_outcome(feed=FEED_KEY, stops=["zz:1"])
+
+    assert outcome == station_module.Outcome(None, "status_429", 120, "stops_day")
+    assert not station_module.paused()
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ReadTimeout])
+async def test_stop_stations_failing_never_starts_the_pause(
+    module: Module, error: type[httpx.HTTPError]
+) -> None:
+    module.fail(error)
+
+    outcome = await station_module.stop_stations_outcome(series="zz", codes=["9900001"])
+
+    assert outcome.rows is None
+    assert outcome.reason in ("network", "timeout")
+    assert not station_module.paused()
+
+
+async def test_stop_stations_makes_no_call_when_off(
+    module: Module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "station_module_token", SecretStr(""))
+
+    outcome = await station_module.stop_stations_outcome(feed=FEED_KEY, stops=["zz:1"])
+
+    assert (outcome.rows, outcome.reason) == (None, "off")
+    assert module.requests == []
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        pytest.param({}, id="nothing"),
+        pytest.param({"feed": FEED_KEY}, id="a-feed-without-stops"),
+        pytest.param(
+            {"feed": FEED_KEY, "stops": ["zz"], "series": "zz", "codes": ["9"]}, id="both"
+        ),
+        pytest.param({"feed": FEED_KEY, "stops": []}, id="no-stop"),
+        pytest.param({"feed": FEED_KEY, "stops": [f"zz:{n}" for n in range(51)]}, id="51"),
+        pytest.param({"feed": FEED_KEY, "stops": ["zz", "zz"]}, id="twice"),
+        pytest.param({"feed": "db", "stops": ["zz"]}, id="not-a-feed-key"),
+        pytest.param({"feed": FEED_KEY, "stops": ["zz\t1"]}, id="a-tab"),
+        pytest.param({"feed": FEED_KEY, "stops": ["z" * 201]}, id="a-stop-of-201"),
+        pytest.param(
+            {"feed": FEED_KEY, "stops": [f"{n:0200d}" for n in range(21)]}, id="over-4096-bytes"
+        ),
+        pytest.param({"series": "zz", "codes": ["99\x00"]}, id="a-nul-code"),
+        pytest.param({"series": "", "codes": ["99"]}, id="an-empty-series"),
+    ],
+)
+async def test_stop_stations_refuses_a_body_the_module_would_refuse(
+    module: Module, form: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError):
+        await station_module.stop_stations_outcome(**form)
+
+    assert module.requests == []
