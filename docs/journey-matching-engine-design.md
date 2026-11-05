@@ -4,7 +4,9 @@
 before" it is complete; this design is reviewed now so that both epics are agreed together, and
 its implementation follows #303's PRs (canonical-journey-design.md §8). **Revised 2026-11-05**
 with measurements from a full eu19 coverage run (§1.1): M1 and M5 confirmed, an amendment to M2
-and a new fallback for M4 proposed, three new questions M8–M10.
+and a new fallback for M4 proposed, three new questions M8–M10. **Owner, 2026-11-05**: M2's
+amendment, M4's position fallback, M8, M9 and M10 accepted (M4's fallback and M8 after the
+worked example in §0.2).
 **Audience**: the owner (review), implementers.
 **Builds on**: [canonical-journey-design.md](canonical-journey-design.md) — the engine reads only
 `CanonicalJourney` (#304: "No matching logic may be implemented on provider-specific DTOs").
@@ -31,15 +33,70 @@ the tolerances, weights and policies; their main knobs are platform settings.
 | # | Question | Recommendation |
 |---|---|---|
 | M1 | Time tolerance | **±120 s** on first boarding and on last alighting (#303's "±2 minutes"), for every profile, as a setting. Coverage's fuzzy tier uses ±300 s today on departure only. *Measured (§1.1): a ride both sides take has the same minutes on both; 11 of 1 124 ÖBB connections had a first ride 3–10 min away; those checked were different trains or another timetable version. Confirmed.* |
-| M2 | Different train numbers on both sides | **Veto** (no pair), as today's coverage guard does: on Paris–Lyon (a TGV every 30 min) only the train number tells two trains apart. Setting: `veto` \| `penalty`. **Proposed amendment after measurement, for the owner** (§1.1 c): `veto_unless_same_minutes` — when a leg's departure and arrival are the same minute on both sides, a different number is a warning (`train_number_differs_same_minutes`), not a veto. Of the 31 distinct legs measured with different numbers, 30 were such legs: Eurostar's feed numbers a train 94xx where ÖBB says 93xx (EUR 9341 / 9441), TGVs carrying another number on part of their run (8619 / 8719); the 31st compared a Styria course id with a train number. Two TGVs 2 min apart stay a veto. |
+| M2 | Different train numbers on both sides | **Veto** (no pair), as today's coverage guard does: on Paris–Lyon (a TGV every 30 min) only the train number tells two trains apart. Setting: `veto` \| `veto_unless_same_minutes` \| `penalty`. **Amended after measurement, accepted by the owner 2026-11-05** (§1.1 c): `veto_unless_same_minutes`, the default — when a leg's departure and arrival are the same minute on both sides, a different number is a warning (`train_number_differs_same_minutes`), not a veto. Of the 31 distinct legs measured with different numbers, 30 were such legs: Eurostar's feed numbers a train 94xx where ÖBB says 93xx (EUR 9341 / 9441), TGVs carrying another number on part of their run (8619 / 8719); the 31st compared a Styria course id with a train number. Two TGVs 2 min apart stay a veto. |
 | M3 | Different line labels (after normalisation) | **Penalty, never a veto** (#304 comment, expectation 4: "a label difference alone should not present a time-matched pair as two different trains"). The pair is kept as *probably the same service* and the difference is shown. |
-| M4 | How stations are compared | **Decided direction 2026-11-04: by MSMM station** (`station_id`, resolved through the station module, #303 D8 and PR 5). Open: the fallback when MSMM has no link for a stop (MOTIS `<feed>_<local>` vs ÖBB `extId` with nothing to join them). First recommendation: pair only when both times are within tolerance and the train number or the line agrees. **Revised recommendation after measurement** (§1.1 c, d): that rule drops most true pairs — a train number is found on only 40 % of the legs both sides take, and MOTIS's line code (`671A`, `83`) never equals ÖBB's name (`TGV 9583`). Instead: a leg whose departure and arrival are both within tolerance, and whose two stops are each within `position_fallback_m` (1 000 m) of the other side's, counts its stations as agreeing, marked `stations_by_position` (info, shown). Only inside a time-matched leg, never as station identity (St Pancras / King's Cross stay two stations); the residual risk, two trains between the same two station areas in the same two minutes, is shown on the page. Alternatives as before: times alone with a note, or never pair (today's coverage guard). |
+| M4 | How stations are compared | **Decided direction 2026-11-04: by MSMM station** (`station_id`, resolved through the station module, #303 D8 and PR 5). The fallback when MSMM has no link for a stop (MOTIS `<feed>_<local>` vs ÖBB `extId` with nothing to join them). First recommendation: pair only when both times are within tolerance and the train number or the line agrees. **Revised after measurement** (§1.1 c, d): that rule drops most true pairs — a train number is found on only 40 % of the legs both sides take, and MOTIS's line code (`671A`, `83`) never equals ÖBB's name (`TGV 9583`). **Accepted by the owner 2026-11-05:** a leg whose departure and arrival are both within tolerance, and whose two stops are each within `position_fallback_m` (1 000 m) of the other side's, counts its stations as agreeing, marked `stations_by_position` (info, shown). Only inside a time-matched leg, never as station identity (St Pancras / King's Cross stay two stations); the residual risk, two trains between the same two station areas in the same two minutes, is shown on the page. Alternatives considered: times alone with a note, or never pair (today's coverage guard). Worked example: §0.2. *Owner 2026-11-05: accepted.* |
 | M5 | Station names as evidence when codes are missing | **Off in V1.** Names drift ("Graz Hbf" / "Graz Hauptbahnhof"); proximity is already rejected as identity. Revisit once the station module resolves codes (CLAUDE.md §7 item 7). *Measured (§1.1 d): names differ on the same ride in many ways (DB's bare "Hauptbahnhof" for Stuttgart Hbf, "Brussel-Zuid" / "Bruxelles Midi", "Plzeň hlavní nádraží" / "Plzen hl.n."). Confirmed.* |
 | M6 | Coverage scores after the switch | Scores change (tolerant pairing, folded modes, normalised labels), so coverage runs are run again. Runs scored before the switch can be deleted like the others (#303 D1, no backward compatibility). One new nullable column holds the scorer version and the reason counts per cell. |
 | M7 | Where the knobs live | Tolerances, thresholds and the three policies (M2–M4) as `JOURNEY_MATCH_*` / `COVERAGE_MATCH_*` platform settings; weights in code per profile (documented, unit-tested); coverage freezes its knobs in the run's `execution_snapshot` like every other `COVERAGE_*` knob. |
-| M8 | Journeys that share some rides, not all (§1.1 a, b) | **No pair** (the gates are unchanged), but the unpaired journey's reason says how it relates to its closest counterpart and where: `splits_after_shared_ride` "same train to München Hbf, then different trains", and `shorter_transfer` "VIATOR changes at München Hbf in 5 min, ÖBB in 19 min" when one side's change is at least `transfer_difference_s` (300 s) shorter; `rejoins_after_split`; `other_first_or_last_ride`. Coverage counts them per cell (M6's column), so "VIATOR's connections are shorter than ÖBB's" reads apart from "no overlap". Measured: 44 % of ÖBB connections share rides with a VIATOR journey, then split (32 %) or split and rejoin (12 %). |
-| M9 | Which VIATOR journeys a coverage cell compares (§1.1 e) | **Only those whose first boarding lies within ÖBB's span**: from ÖBB's first to its last first boarding, plus the departure tolerance. ÖBB answers 5 connections from the run's departure time (about 4 h); VIATOR's 10 cover the day. The others are `outside_reference_window` (info): neither `left_only` nor counted. Measured: 52 % of VIATOR's journeys are outside. |
-| M10 | A local ride only one side has (§1.1 a) | **Compared like an access walk**: a leading or trailing TRAM, BUS, SUBWAY, FERRY, CABLE_CAR or FUNICULAR leg that aligns with nothing on the other side, while the other side has no leg there, is left out of the gates, marked `local_access_ride` (info). MOTIS starts some journeys with a tram from the hub's point to the station; ÖBB starts at the station. Measured: 3 % of ÖBB connections. `SUBURBAN` and rail are never trimmed (Graz's S7 is the main ride). |
+| M8 | Journeys that share some rides, not all (§1.1 a, b) | **No pair** (the gates are unchanged), but the unpaired journey's reason says how it relates to its closest counterpart and where: `splits_after_shared_ride` "same train to München Hbf, then different trains", and `shorter_transfer` "VIATOR changes at München Hbf in 5 min, ÖBB in 19 min" when one side's change is at least `transfer_difference_s` (300 s) shorter; `rejoins_after_split`; `other_first_or_last_ride`. Coverage counts them per cell (M6's column), so "VIATOR's connections are shorter than ÖBB's" reads apart from "no overlap". Measured: 44 % of ÖBB connections share rides with a VIATOR journey, then split (32 %) or split and rejoin (12 %). Worked example: §0.2. *Owner 2026-11-05: accepted.* |
+| M9 | Which VIATOR journeys a coverage cell compares (§1.1 e) | **Only those whose first boarding lies within ÖBB's span**: from ÖBB's first to its last first boarding, plus the departure tolerance. ÖBB answers 5 connections from the run's departure time (about 4 h); VIATOR's 10 cover the day. The others are `outside_reference_window` (info): neither `left_only` nor counted. Measured: 52 % of VIATOR's journeys are outside. *Owner 2026-11-05: accepted.* |
+| M10 | A local ride only one side has (§1.1 a) | **Compared like an access walk**: a leading or trailing TRAM, BUS, SUBWAY, FERRY, CABLE_CAR or FUNICULAR leg that aligns with nothing on the other side, while the other side has no leg there, is left out of the gates, marked `local_access_ride` (info). MOTIS starts some journeys with a tram from the hub's point to the station; ÖBB starts at the station. Measured: 3 % of ÖBB connections. `SUBURBAN` and rail are never trimmed (Graz's S7 is the main ride). *Owner 2026-11-05: accepted.* |
+
+### 0.2 M4's fallback and M8 by example
+
+One cell of the run in §1.1: Salzburg Hbf → Basel SBB, Monday 9 November 2026, local times.
+
+**M8, same train then a split.**
+
+| | VIATOR (MOTIS) | ÖBB |
+|---|---|---|
+| first train | Salzburg Hbf 09:00 → München Hbf 10:43, the RJX 260 (MOTIS shows its line code `90`) | the same RJX 260 |
+| change at München Hbf | **5 min** | **19 min** |
+| then | 10:48 → Zürich HB 14:28 (ÖBB's EC 194; MOTIS: `88`), 14:34 → Basel SBB 15:26 | ICE 566 11:02 → Karlsruhe Hbf 13:52, ICE 371 14:01 → Basel SBB 15:48 |
+
+ÖBB knows the EC 194: its connections leaving Salzburg at 08:05 and 08:39 take it, with 27 and
+15 min at München. It does not offer it 5 min after the RJX 260 (which arrives at "München Hbf
+Gl.5-10"; the EC 194 leaves from "Gl.27-36").
+
+- Today, and without M8: no pair (the trains after München differ, the arrivals are 22 min
+  apart). The page shows a VIATOR journey and an ÖBB connection as if unrelated.
+- With M8: still no pair, and no score changes. The unpaired journey's reason reads "same train
+  to München Hbf, then different trains" (`splits_after_shared_ride`, info) and "VIATOR changes
+  at München Hbf in 5 min, ÖBB in 19 min" (`shorter_transfer`, warning, since the two changes
+  differ by 5 min or more). The cell counts one `shorter_transfer`, so a cell that differs by
+  transfer times reads apart from one that differs by trains (§13 questions 4 and 5).
+
+**M4's fallback, on the München → Zürich train of the same example.**
+
+| | VIATOR (MOTIS, DB data) | ÖBB |
+|---|---|---|
+| from | München Hbf, stop `db_de:09162:100` (feed `db`, a German stop id, no UIC), 10:48 | München Hbf Gl.27-36, `8098261`, 10:48 |
+| to | Zürich HB, `8503000`, 14:28 | Zürich HB, `8503000`, 14:28 |
+| train | line `88`, no number (DB data carries none, §5.1) | EC 194 |
+
+1. Decided (D8): the station module says which station each code belongs to. When it places both
+   München codes at München Hbf, the stations agree and the fallback is not used.
+2. The fallback is only for a stop the module cannot place, say ÖBB's code for platforms 27–36.
+   The engine then cannot tell from codes whether the stations agree.
+3. First recommendation: pair only if the train number or the line agrees as well. Here VIATOR
+   has no number and `88` is not `EC 194`, so this pair, the same train, would be lost; so would
+   most pairs whose VIATOR side has no number (58 % of the legs both sides take, §1.1 c).
+4. The fallback (accepted 2026-11-05): the leg leaves at 10:48 and arrives at 14:28 on both sides; if each stop
+   also lies within 1 km of the other side's (München with München, Zürich with Zürich: two points
+   of one station), the stations of this leg count as agreeing, and the pair carries the note
+   "stations compared by position (no shared station code)" (`stations_by_position`, info).
+
+"Never station identity" means: the engine records nothing like "`db_de:09162:100` is `8098261`",
+sends nothing to the station module and reuses nothing for another leg; a leg whose times do not
+agree never gets the fallback; when the module names two different stations, positions never
+overrule it. St Pancras and King's Cross (247 m apart) stay two stations. The fallback can only go
+wrong for two different trains that leave within 2 min from stops less than 1 km apart, arrive
+within 2 min at stops less than 1 km apart, and carry no train numbers to tell them apart (M2);
+the note lets the reader check those pairs. 1 000 m is a starting value
+(`JOURNEY_MATCH_POSITION_FALLBACK_M`, 0 = off): ÖBB's stop positions are stored since #303 PR 4a,
+so the first run after PR 5 measures how far apart the two sides place a station, and M6's reason
+counts how often the fallback is used.
 
 ---
 
@@ -160,7 +217,7 @@ label spelling, walk differences and provider ids; strict where identity is actu
 numbers, station codes); configurable; deterministic (same input → same pairs).
 
 Non-goals (V1): machine-learned scoring (the features are ready for it); station resolution by
-name or distance (M5; M4's proposed position fallback only confirms the stations of a leg whose
+name or distance (M5; M4's position fallback only confirms the stations of a leg whose
 times already agree, it never says two stations are one); fares; real-time; matching inside one
 source (dedup stays on `JourneyFingerprint.strict_key`).
 
@@ -252,7 +309,7 @@ Comparison of two legs (first match wins):
 
 | Both sides have… | Result |
 |---|---|
-| `train_number` | equal → AGREE (`train_number_equal`); different → CONFLICT (`train_number_differs`; under M2's proposed amendment a warning `train_number_differs_same_minutes` when the leg's departure and arrival are the same minute on both sides) |
+| `train_number` | equal → AGREE (`train_number_equal`); different → CONFLICT (`train_number_differs`; under M2's amendment, the default, a warning `train_number_differs_same_minutes` when the leg's departure and arrival are the same minute on both sides) |
 | `line` (normalised) | equal → AGREE, with `label_spacing_only` / `mode_word_only` as *info* when the raw strings differed; different → CONFLICT (`line_label_differs`) |
 | a train number on one side, a line on the other | UNKNOWN (`identifier_kinds_differ`) |
 | a `published_name` only | parsed as `<category> <digits>` → treat as a train number; else as a line; then the rows above |
@@ -315,7 +372,7 @@ From `CanonicalStopPlace` (canonical-journey-design.md §3.1). The MSMM station 
 | `GEO:p` | `GEO:p` (same 3-dp cell) | AGREE, marked `location_only` (info). Kept so OTP-vs-MOTIS on the same feed still pairs; never used for the coverage endpoint gate |
 | anything | `UNRESOLVED:…` / `OEBB:` token / no id | UNKNOWN (`station_unresolved`) |
 | `UIC:x` | `GEO:p` | UNKNOWN |
-| a stop of a leg MSMM has not placed, the leg's departure and arrival within tolerance on both sides | the other side's stop within `position_fallback_m` | AGREE, marked `stations_by_position` (info, shown) — M4's proposed fallback, only for that leg; it never turns a code CONFLICT into AGREE |
+| a stop of a leg MSMM has not placed, the leg's departure and arrival within tolerance on both sides | the other side's stop within `position_fallback_m` | AGREE, marked `stations_by_position` (info, shown) — M4's fallback, only for that leg; it never turns a code CONFLICT into AGREE |
 
 No distance threshold for station identity and no name matching (M5): St Pancras ↔ King's Cross
 (247 m) must stay apart while Bruxelles-Midi ↔ Midi Eurostar (53 m) should merge, and only station
@@ -457,7 +514,7 @@ Platform settings (`app/config_schema.py`, editable on `/admin/config`):
 |---|---|---|---|
 | `JOURNEY_MATCH_DEPARTURE_TOLERANCE_S`, `JOURNEY_MATCH_ARRIVAL_TOLERANCE_S` | int | 120 | 0–1800 |
 | `JOURNEY_MATCH_SAME_SERVICE_MIN_PCT`, `JOURNEY_MATCH_PROBABLE_MIN_PCT` | int | 90, 75 | 0–100 |
-| `JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT` | str | `veto` (`veto_unless_same_minutes` if M2's amendment is taken) | `veto`, `veto_unless_same_minutes`, `penalty` |
+| `JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT` | str | `veto_unless_same_minutes` (M2's amendment) | `veto`, `veto_unless_same_minutes`, `penalty` |
 | `JOURNEY_MATCH_UNRESOLVED_ENDPOINTS` | str | `allow` | `allow`, `reject` |
 | `JOURNEY_MATCH_POSITION_FALLBACK_M` | int | 1000 | 0–5000 |
 | `JOURNEY_MATCH_TRANSFER_DIFFERENCE_S` | int | 300 | 60–3600 |
@@ -536,7 +593,8 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
    boundaries were tuned on it.
 3. `one_sided_oebb` → `one_sided_reference` (ch. 12's multi-oracle prerequisite): rename in the same
    PR as M6's column, or separately?
-4. Should a journey that shares rides and then splits (M8) earn any coverage credit? Recommendation:
+4. Should a journey that shares rides and then splits (M8) earn any coverage credit? *Settled by
+   M8 (owner 2026-11-05): no pair, so no credit.* Recommendation, now the rule:
    none — the credit stays for pairs; the cell shows the `shorter_transfer` count beside its tier,
    so a cell that differs only by transfer times is told apart from one that differs by trains.
 5. Not the engine's question, but raised by §1.1 b: MOTIS connects in 2–5 min where ÖBB requires
@@ -557,3 +615,10 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
   M8 (journeys that share some rides; `shorter_transfer`), M9 (coverage compares only within
   ÖBB's span), M10 (a local ride only one side has); §5.1 where MOTIS carries the train number,
   per feed; reasons, settings and tests to match; open questions 4 and 5.
+- 2026-11-05 — owner: M2's amendment (`veto_unless_same_minutes`, now the default), M9 and M10
+  accepted. M4's position fallback and M8 still open; §0.2 explains both on one cell of the run
+  (Salzburg Hbf → Basel SBB).
+- 2026-11-05 — owner, after §0.2's example: M4's position fallback (`stations_by_position`,
+  1 000 m, time-matched legs only, never station identity) and M8 (`splits_after_shared_ride`,
+  `shorter_transfer`; no pair, so no coverage credit, §13 question 4) accepted. Every decision
+  of §0.1 is now taken.
