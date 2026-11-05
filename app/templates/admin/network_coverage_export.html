@@ -221,6 +221,9 @@
     .leg .agency { font-size: 0.78rem; color: var(--muted); }
     .empty-trips { color: var(--muted); font-style: italic; padding: 1rem 0; }
     .truncated-note { color: var(--muted); font-style: italic; font-size: 0.85rem; margin: 0 0 0.75rem; }
+    /* #304: why a cell scored so (M6); a VIATOR trip after ÖBB’s last connection (M9). */
+    .align-why { color: var(--muted); font-size: 0.85rem; margin: 0 0 0.75rem; padding-left: 1.2rem; }
+    .late { color: var(--muted); font-style: italic; }
 
     /* VIATOR vs ÖBB side-by-side — mirrors the live matrix modal's
        compare grid (PR-196b) with the export template's own styling.
@@ -506,6 +509,7 @@
           <span class="duration">${fmtDuration(trip.duration_seconds)}</span>
           <span class="transfers">${trip.num_transfers} transfer${trip.num_transfers === 1 ? '' : 's'}</span>
           <span class="rank">${escapeHTML(trip.modes || '')}</span>
+          ${trip.outside_reference_window ? TRIP_LATE_HTML : ''}
         </div>
         <div class="legs">${legs || '<div class="empty-trips">No legs recorded for this trip.</div>'}</div>
       </div>
@@ -584,6 +588,20 @@
   // {loading, error, loaded, trips}.
   const tripState = new Map();
 
+  // #304 (M9) — a VIATOR trip after ÖBB's last connection is not compared: said on its card.
+  const TRIP_LATE_HTML = '<span class="late" title="ÖBB answers its next 5 connections only:'
+    + ' this journey leaves after the last one, so it is not compared (#304, M9).">'
+    + 'after ÖBB’s last connection: not compared</span>';
+
+  // #304 (M6) — why the cell scored so: the lines the server wrote from the cell's detail
+  // (pairs by verdict, then each reason with how often it was met), escaped. None for a cell
+  // scored before #304 or not asked yet.
+  function alignmentWhy(cell) {
+    const lines = Array.isArray(cell.alignment_lines) ? cell.alignment_lines : [];
+    if (!lines.length) return '';
+    return '<ul class="align-why">' + lines.map((line) => `<li>${escapeHTML(line)}</li>`).join('') + '</ul>';
+  }
+
   function renderModalBody(pairKey, cell) {
     let trips = cell.trips || [];
     let ext = cell.external_journeys || [];
@@ -597,7 +615,7 @@
       trips = st.trips;
       ext = st.externalJourneys;
     }
-    const notes = [];
+    const notes = [alignmentWhy(cell)];
     if (cell.num_itineraries != null && cell.num_itineraries > trips.length) {
       // The old wording described the cap as picking VIATOR's top
       // quality-ranked trips (rank_in_response order). Since

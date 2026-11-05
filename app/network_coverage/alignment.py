@@ -202,3 +202,50 @@ def compute_alignment(
     # Saturate at 1.0: the question is "do we agree?", not "how many?".
     score = min(round(credits / denominator, 2), 1.0)
     return CellAlignment(score, _classify_score(score, v_n, o_n), _detail(profile, counts, reasons))
+
+
+# The order a cell's reasons are listed in: what stops a pair first, then what qualifies one.
+_EXPLAINED_FIRST = (
+    match_reasons.OUTSIDE_REFERENCE_WINDOW,
+    match_reasons.ENDPOINT_STATION_DIFFERS,
+    match_reasons.TRAIN_NUMBER_DIFFERS,
+    match_reasons.DEPARTURE_OUTSIDE_TOLERANCE,
+    match_reasons.ARRIVAL_OUTSIDE_TOLERANCE,
+    match_reasons.ENDPOINT_UNRESOLVED,
+    match_reasons.SPLITS_AFTER_SHARED_RIDE,
+    match_reasons.SHORTER_TRANSFER,
+)
+
+
+def explain_cell(
+    detail: dict[str, Any] | None, left: str = "VIATOR", right: str = "ÖBB"
+) -> list[str]:
+    """The lines a page prints under a cell's tier (M6): the pairs by verdict and the journeys
+    on one side only, then each reason with the number of pairs or journeys it was met for.
+    Plain text, no id or code of a stop: the share page prints them as they are. None for a
+    cell scored before #304 (no detail)."""
+    if not isinstance(detail, dict):
+        return []
+    raw_counts, raw_reasons = detail.get("counts"), detail.get("reasons")
+    counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+    reasons: dict[str, Any] = raw_reasons if isinstance(raw_reasons, dict) else {}
+
+    def count(key: str) -> int:
+        value = counts.get(key)
+        return value if isinstance(value, int) and value > 0 else 0
+
+    parts = [
+        f"{count('same_service')} same service",
+        f"{count('probably_same')} probably the same",
+        f"{count('viator_only')} {left} only",
+        f"{count('oebb_only')} {right} only",
+    ]
+    lines = [f"{left} vs {right}: " + ", ".join(parts)]
+    order = [*_EXPLAINED_FIRST, *sorted(set(reasons) - set(_EXPLAINED_FIRST))]
+    for code in order:
+        value = reasons.get(code)
+        if isinstance(value, int):
+            line = match_reasons.summary_sentence(code, value, left, right)
+            if line:
+                lines.append(line)
+    return lines

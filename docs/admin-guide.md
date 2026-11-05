@@ -2726,8 +2726,12 @@ a pair changed, so **scores of runs before and after are not comparable**: run a
   connection", never as VIATOR-only.
 - **Why**: each cell keeps `external_alignment_detail` (counts by verdict, journeys outside ÖBB's
   window, and how often each reason was met: `shorter_transfer`, `line_label_differs`,
-  `stations_by_position`, ...). The settings are on Admin → Configuration → "Coverage matching";
-  a run uses those of its first execution (frozen with its other knobs).
+  `stations_by_position`, ...). The cell modal, the downloaded report and the share page list it
+  under the cell's tier ("VIATOR vs ÖBB: 1 same service, 0 probably the same, 2 VIATOR only, 1 ÖBB
+  only", then "the same train first, then different trains", "line labels differ (2 times)"...),
+  and a VIATOR trip after ÖBB's last connection says so on its card. The settings are on Admin →
+  Configuration → "Coverage matching"; a run uses those of its first execution (frozen with its
+  other knobs).
 
 ## 7. Rollback
 

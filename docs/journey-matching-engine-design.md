@@ -668,3 +668,12 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
   ±2 min; the ±5 min fuzzy credit is gone), one by M2's amendment (different numbers at the same
   minutes: `probably_same`), three by M9 (VIATOR journeys before or after ÖBB's span no longer
   count).
+- 2026-11-05 — as built, coverage wiring, pages (#304, step 3b): the cell modal, the downloaded
+  report and the share page print, under a cell's tier, the lines `alignment.explain_cell` writes
+  from its detail: the pairs by verdict and the journeys on one side only, then each reason with
+  the number of pairs or journeys it was met for, in `reasons.SUMMARIES`' words (a count, not the
+  values of §9's sentences, which the cell does not keep); a VIATOR trip after ÖBB's last
+  connection carries `outside_reference_window` and its card says "after ÖBB's last connection:
+  not compared" (the window the run was scored with, its frozen tolerance). Plain text, escaped;
+  no stop id or code, so the share page's projection is unchanged. Not checked in a browser
+  before merging (owner, 5 Nov: to test after deploying).
