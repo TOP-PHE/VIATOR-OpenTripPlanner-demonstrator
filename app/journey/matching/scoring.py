@@ -19,6 +19,7 @@ shared ride (`rejoins_after_split`). No pair and no score change: only the expla
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ..canonical import MatchReason, MatchVerdict
@@ -33,8 +34,7 @@ SEVERITY_RANK = {"veto": 0, "gate": 1, "warning": 2, "info": 3}
 
 def ordered(found: list[MatchReason]) -> list[MatchReason]:
     """Most important first (veto, gate, warning, info), each once, otherwise in order."""
-    unique = list(dict.fromkeys(found))
-    return sorted(unique, key=lambda item: SEVERITY_RANK[item.severity])
+    return sorted(dict.fromkeys(found), key=lambda item: SEVERITY_RANK[item.severity])
 
 
 @dataclass(frozen=True)
@@ -127,9 +127,18 @@ def _components(analysis: PairAnalysis, profile: MatchProfile) -> dict[str, floa
         "station": features.station_overlap,
         "route": features.route_overlap,
         "service": features.service_overlap,
-        "transfers": 1.0 if delta == 0 else 0.5 if delta == 1 else 0.0,
+        "transfers": _transfers_component(delta),
         "operator": features.operator_overlap,
     }
+
+
+def _transfers_component(delta: int) -> float:
+    """1 for the same number of changes, 0.5 for one more or fewer, else 0 (§7)."""
+    if delta == 0:
+        return 1.0
+    if delta == 1:
+        return 0.5
+    return 0.0
 
 
 def score(analysis: PairAnalysis, profile: MatchProfile, penalties: int) -> float:
@@ -187,7 +196,8 @@ def _context_reasons(analysis: PairAnalysis) -> list[MatchReason]:
                 right_value=str(len(analysis.right) - 1),
             )
         )
-    if analysis.features.operator_overlap == 0.0:
+    overlap = analysis.features.operator_overlap
+    if overlap is not None and math.isclose(overlap, 0.0):
         found.append(r.reason(r.OPERATOR_DIFFERS, "info"))
     return found
 

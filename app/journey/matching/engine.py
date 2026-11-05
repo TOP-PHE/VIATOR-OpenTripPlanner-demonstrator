@@ -68,11 +68,29 @@ class JourneyComparison(BaseModel):
     summary: ComparisonSummary = ComparisonSummary()
 
     def reason_counts(self) -> dict[str, int]:
-        """How many times each reason code occurs, over the pairs and the unpaired journeys
-        (one count per journey or pair for a code): what a coverage cell records (M6)."""
+        """How many times each reason code occurs, one count per code over each pair made and
+        each pair weighed and refused: what a coverage cell records (M6). Two unpaired journeys
+        that are each other's closest candidate are one refused pair, counted once."""
         counts: dict[str, int] = {}
         groups = [pair.reasons for pair in self.pairs]
-        groups += [item.reasons for item in (*self.left_only, *self.right_only)]
+        seen: set[tuple[str, str]] = set()
+        for item, left_side in (
+            *((item, True) for item in self.left_only),
+            *((item, False) for item in self.right_only),
+        ):
+            if item.closest_id is not None:
+                key = (
+                    (item.journey_id, item.closest_id)
+                    if left_side
+                    else (
+                        item.closest_id,
+                        item.journey_id,
+                    )
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+            groups.append(item.reasons)
         for found in groups:
             for code in dict.fromkeys(item.code for item in found):
                 counts[code] = counts.get(code, 0) + 1

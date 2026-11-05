@@ -46,8 +46,11 @@ MODE_WORDS: dict[TransportMode, tuple[str, ...]] = {
 _SEPARATORS = re.compile(r"[\s\-._]+")
 # `<category> <3 to 6 digits>[letter] [name]`: `RJ 1141`, `TGV INOUI 6107`, `IC 801 MECSEK`,
 # `601A`. The category is what comes before the digits.
+# Linear: the category holds no digit, so it ends where the number starts (its trailing spaces
+# are stripped by the caller), and a name after the number starts with neither a digit nor a
+# space.
 _NUMBERED = re.compile(
-    r"^(?P<category>\D*?)\s*(?P<number>\d{3,6}[a-z]?)(?:\s+\D.*)?$", re.IGNORECASE
+    r"^(?P<category>\D*)(?P<number>\d{3,6}[a-z]?)(?:\s+[^\d\s].*)?$", re.IGNORECASE
 )
 
 
@@ -224,18 +227,12 @@ def compare_services(
 
 def _label_reasons(a: Identity, b: Identity, leg: int | None) -> tuple[MatchReason, ...]:
     """The info reasons of two lines that agree although written differently."""
-    if a.raw_line == b.raw_line:
-        return ()
-    code = r.MODE_WORD_ONLY if a.line_dropped_mode_word or b.line_dropped_mode_word else None
-    return (
-        r.reason(
-            code or r.LABEL_SPACING_ONLY,
-            "info",
-            leg=leg,
-            left_value=a.raw_line,
-            right_value=b.raw_line,
-        ),
-    )
+    found: list[MatchReason] = []
+    if a.raw_line != b.raw_line:
+        dropped = a.line_dropped_mode_word or b.line_dropped_mode_word
+        code = r.MODE_WORD_ONLY if dropped else r.LABEL_SPACING_ONLY
+        found.append(r.reason(code, "info", leg=leg, left_value=a.raw_line, right_value=b.raw_line))
+    return tuple(found)
 
 
 def _category_label(service: CanonicalService, identity: Identity) -> str | None:

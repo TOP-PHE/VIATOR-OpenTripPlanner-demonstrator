@@ -609,3 +609,17 @@ def test_every_reason_code_has_a_sentence_entry() -> None:
         r.reason("zz_unknown", "info")
     for code in r.SENTENCES:
         assert r.reason(code, "info").code == code
+
+
+def test_a_refused_pair_is_counted_once_not_once_a_side() -> None:
+    viator = journey("motis:0", ride("Wien Hbf", "Linz Hbf", "08:00", "09:15", published="RJ 540"))
+    oebb = journey(
+        "hafas:0",
+        ride("Wien Hbf", "Linz Hbf", "08:00", "09:45", published="RJ 540"),
+        provider="hafas",
+    )
+
+    comparison = compare([viator], [oebb], JOURNEY_REFERENCE)
+
+    assert (len(comparison.left_only), len(comparison.right_only)) == (1, 1)
+    assert comparison.reason_counts()[r.ARRIVAL_OUTSIDE_TOLERANCE] == 1
