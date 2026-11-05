@@ -340,6 +340,9 @@ main {
 .cov-leg-stops .oebb-stop.msmm { text-decoration: underline dotted #57606a; cursor: help; }
 .cov-leg-stops .oebb-stop.unmapped { color: #9a6700; cursor: help; }
 .cov-oebb-legend { font-size: 0.75rem; margin: 0.2rem 0 0.4rem; }
+/* #304 (M6): why the cell scored so, under its tier; M9: a VIATOR trip after ÖBB's last connection. */
+.cov-align-why { font-size: 0.8rem; margin: 0.2rem 0 0.4rem; padding-left: 1.2rem; }
+.cov-trip-late { font-style: italic; }
 .cov-leg-service { color: #57606a; font-style: italic; }
 .cov-leg-agency { color: #8a939d; font-size: 0.72rem; }
 /* Filter-badge pill colour — distinct from the run-status pills so the
@@ -2068,8 +2071,24 @@ function renderModalControls(dir) {
       Show walk legs
     </label>
   </div>
+  ${renderAlignmentWhy(dir)}
   ${OEBB_STOPS_LEGEND}`;
 }
+
+// #304 (M6) — why the cell scored so: the lines the server wrote from the cell's
+// detail (pairs by verdict, then each reason with how often it was met). Plain
+// text, escaped; none for a cell scored before #304 or not asked yet.
+function renderAlignmentWhy(dir) {
+  const lines = Array.isArray(dir.alignment_lines) ? dir.alignment_lines : [];
+  if (!lines.length) return '';
+  const items = lines.map((line) => '<li>' + escHTML(line) + '</li>').join('');
+  return '<ul class="hint cov-align-why">' + items + '</ul>';
+}
+
+// #304 (M9) — a VIATOR trip after ÖBB's last connection is not compared: say so on its card.
+const TRIP_LATE_HTML = '<span class="hint cov-trip-late"'
+  + ' title="ÖBB answers its next 5 connections only: this journey leaves after the last one,'
+  + ' so it is not compared (#304, M9).">after ÖBB’s last connection: not compared</span>';
 
 // What the ÖBB column's stop names are, under the modal's controls.
 const OEBB_STOPS_LEGEND = '<p class="hint cov-oebb-legend">ÖBB stops: the station module\'s station'
@@ -2148,6 +2167,7 @@ function renderModalViatorTripCard(trip, idx) {
       <span class="cov-trip-rank">#${idx + 1}</span>
       ${modalTripHeadTimes(trip.departure_at, trip.arrival_at, trip.duration_seconds, bounds)}
       <span class="hint">${escHTML(transfers)}</span>
+      ${trip.outside_reference_window ? TRIP_LATE_HTML : ''}
     </div>
     <div class="cov-trip-legs">${legs || '<span class="hint">No legs recorded.</span>'}</div>
   </div>`;
