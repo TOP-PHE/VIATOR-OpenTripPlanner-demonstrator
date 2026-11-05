@@ -677,3 +677,29 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
   not compared" (the window the run was scored with, its frozen tolerance). Plain text, escaped;
   no stop id or code, so the share page's projection is unchanged. Not checked in a browser
   before merging (owner, 5 Nov: to test after deploying).
+- 2026-11-05 — as built, `/journey` wiring (#304, step 2): `/fanout` compares VIATOR's journeys
+  (each merged slot's `best`) with each reference that answered, `compare(viator, reference,
+  journey_reference)` with the `JOURNEY_MATCH_*` settings (§10; declared in `config_schema`, a
+  "Journey matching" section on the config page), in a thread (CPU, the event loop stays free).
+  The answer carries `comparisons: {"hafas"|"ojp": …}` (§11): pairs (ids, verdict, score, reason
+  codes, `notes` = §9's sentences, the hidden ones left out, each once), `left_only` /
+  `right_only` with their closest candidate's reasons (`no_candidate`'s sentence left out: the
+  row already says it), the uncomparable ids, the summary; no feature value, no station id.
+  Choices made where the text left room:
+  - Stations (D8): when the station module is configured, the stops of VIATOR's journeys are
+    placed by their session's resolver (`station_resolver.resolver_for_session`, built in one
+    `db_step`) and ÖBB's by its numbers (`COVERAGE_OEBB_STOP_SERIES`), **for the comparison
+    only**: the journeys sent keep no station id (MSMM decision 68). OJP's stops are not asked.
+    The module's calls get 4 s a search; past that or on a failure, codes and positions decide.
+  - OJP keeps its page shapes (`comparison` tag per card, `comparison_summary {common, otp_only,
+    ojp_only}`): `common` is a pair of either verdict, the counts are of journeys paired one to
+    one (no longer of distinct fingerprints). The strip and the pill say "VIATOR only", no longer
+    "OTP only".
+  - ÖBB's paired grid builds its rows from `comparisons.hafas` (the JS pairing on the exact first
+    boarding instant and `_trainIdMismatchNote` are gone): a pair on one row, a note row under it
+    (verdict + sentences; none for a same-service pair with nothing to say), an unpaired journey on
+    its own row with "Not paired" and why; a strip above with the counts. Still only when ÖBB is
+    the sole reference: §11's "each reference its own comparison" holds on the server, but OJP's
+    cards have no per-card renderer to pair yet, and the three-column layout stays unaligned.
+  - Not wired yet: the OTP-vs-MOTIS grid (`journey_engines`). Not checked in a browser before
+    merging (owner, 5 Nov: to test after deploying).

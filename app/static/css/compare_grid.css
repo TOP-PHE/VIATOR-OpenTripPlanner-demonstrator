@@ -114,26 +114,26 @@
   z-index: 1;
 }
 
-/* v0.1.44 — VIATOR-vs-ÖBB paired row (renderViatorOebbPairedGrid in
-   journey.html): a matched row's departure/arrival agree but the two
-   sources can still label the train differently (VIATOR's GTFS feed
-   vs HAFAS's own product/line name) — this note spans both columns
-   directly under that row via inline `grid-column: 1 / -1`.
+/* #304 — the notes row of the VIATOR-vs-ÖBB paired grid
+   (renderViatorOebbPairedGrid in journey.html): under a row, the matching
+   engine's verdict and the sentences of its reasons ("Probably the same
+   service · line labels differ: RJX 540 / RJ 540"), spanning both columns
+   via inline `grid-column: 1 / -1`. Replaces v0.1.44's train-label warning.
 
-   The note div also carries `.compare-cell` (so it lines up inside the
-   grid), which pulls in `.compare-grid.compare-grid-refs > .compare-cell
+   The row also carries `.compare-cell` (so it lines up inside the grid),
+   which pulls in `.compare-grid.compare-grid-refs > .compare-cell
    { padding: 0 }` (3 classes) and `.compare-grid .compare-cell
    { min-height: 4.6rem }` — both higher-or-equal specificity than a
-   plain `.train-mismatch-row` rule, so they'd silently win and leave
-   the note flush with no padding plus a large dead min-height gap.
-   Match the exact `.compare-grid.compare-grid-refs > .compare-cell`
-   selector shape (4 classes, strictly higher specificity) so this rule
-   always wins regardless of source order. */
-.compare-grid.compare-grid-refs > .compare-cell.train-mismatch-row {
+   plain `.pair-notes-row` rule, so they'd silently win and leave the
+   note flush with no padding plus a large dead min-height gap. Match the
+   exact `.compare-grid.compare-grid-refs > .compare-cell` selector shape
+   (4 classes, strictly higher specificity) so this rule always wins
+   regardless of source order. */
+.compare-grid.compare-grid-refs > .compare-cell.pair-notes-row {
   padding: 0.3rem 0 0.6rem;
   min-height: auto;
 }
-.train-mismatch-note {
+.pair-notes {
   display: block;
   background: #fff8e6;
   border: 1px solid #f0c674;
@@ -141,6 +141,13 @@
   padding: 0.5rem 0.7rem;
   font-size: 0.82rem;
   color: #6b5416;
+}
+/* A same-service pair with a note, and a journey left unpaired: quieter. */
+.pair-notes.same,
+.pair-notes.unpaired {
+  background: #f6f8fa;
+  border-color: #d0d7de;
+  color: #3d4650;
 }
 
 @media (max-width: 720px) {

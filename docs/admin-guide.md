@@ -2733,6 +2733,36 @@ a pair changed, so **scores of runs before and after are not comparable**: run a
   Configuration → "Coverage matching"; a run uses those of its first execution (frozen with its
   other knobs).
 
+### 6.29 How a journey search pairs VIATOR's journeys with ÖBB's and OJP's (#304)
+
+Since #304 a search with a reference planner ticked compares VIATOR's journeys with each
+reference's by the matching engine (`app/journey/matching/`, profile `journey_reference`;
+design `docs/journey-matching-engine-design.md`), on the server:
+
+- **What pairs**: first boarding and last alighting within `JOURNEY_MATCH_DEPARTURE_TOLERANCE_S` /
+  `JOURNEY_MATCH_ARRIVAL_TOLERANCE_S` (120 s), the same first and last stations (by the station
+  module's station when it places both, else codes, else positions within
+  `JOURNEY_MATCH_POSITION_FALLBACK_M` of a leg whose times agree), no conflicting train number
+  (`JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT`), a score of at least `JOURNEY_MATCH_PROBABLE_MIN_PCT`
+  (75); `JOURNEY_MATCH_SAME_SERVICE_MIN_PCT` (90) for "same service". One to one, best first.
+  Admin → Configuration → "Journey matching"; read at each search.
+- **The page**: the answer carries `comparisons.hafas` / `comparisons.ojp` (pairs, the journeys on
+  one side only, the reasons' codes and their sentences). ÖBB's side-by-side grid (ÖBB the only
+  reference) puts a pair on one row with a note of what still differs, and an unpaired itinerary on
+  its own row with why; it no longer pairs on the exact first boarding minute, and the old "same
+  departure and arrival, different train identifiers" warning is one of those notes now. OJP's
+  cards keep their tags (`common`, "VIATOR only", "OJP only") and the strip its counts, now of
+  journeys paired one to one by the engine, no longer of distinct fingerprints.
+- **The station module**: when it is configured, the stops of VIATOR's journeys (by their
+  session's feeds) and of ÖBB's (by ÖBB's number in `COVERAGE_OEBB_STOP_SERIES`) are placed with
+  the module's server-only bulk call (MSMM decision 68) for the comparison only: the journeys the
+  page receives carry no station id. OJP's stops are not asked. The module gets at most 4 s per
+  search (`_STATION_BUDGET_S`); past it, or on any failure, the search compares codes and positions
+  (`journey.stations_unresolved` in the web log, at WARNING).
+- **Unchanged**: the OTP-vs-MOTIS grid still pairs on its own (the engine's `journey_engines`
+  profile is not wired yet), and the three-column layout with OJP and ÖBB together stays
+  unaligned.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:
