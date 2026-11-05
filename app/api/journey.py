@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Iterable
@@ -21,18 +22,23 @@ from ..db import get_db
 from ..db_steps import db_step
 from ..journey import (
     hafas_client,
+    matching,
     ojp_client,
     planner_dispatch,
     recorder,
+    station_resolver,
     timetable_window,
 )
-from ..journey.canonical import CanonicalJourney, CanonicalTiming
+from ..journey.canonical import CanonicalJourney, CanonicalTiming, MatchReason
+from ..journey.canonical.station_resolution import StationResolver, with_resolved_stations
 from ..journey.canonical_adapters.trip_dict import to_trip_dict
-from ..journey.federated_planner import journey_transit_fingerprint
+from ..journey.matching import reasons as match_reasons
 from ..models import GraphSnapshot, JourneySearch
 from ..models import Session as SessionRow
 from ..models.sessions import SessionState
 from ..security import CurrentUser, client_ip, require_logged_in
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/journey", tags=["journey"])
 
@@ -417,57 +423,215 @@ def _current_snapshot(db: DbSession, sid: str) -> GraphSnapshot | None:
     ).scalar_one_or_none()
 
 
-def _build_comparison(
-    merged_trips: list[dict[str, Any]], ojp_reference: dict[str, Any] | None
-) -> dict[str, int] | None:
-    """Bucket OTP and OJP itineraries into common / OTP-only / OJP-only.
+# ─────────────── #304 — VIATOR's journeys against each reference engine's ───────────────
+#
+# The matching engine (`app/journey/matching/`, profile `journey_reference` with the
+# `JOURNEY_MATCH_*` settings) pairs VIATOR's journeys (each merged slot's `best`) with each
+# reference's one to one. Its pairs replace the page's own ÖBB pairing (same first boarding
+# instant) and the OJP fingerprint sets; the reasons go to the page as sentences.
 
-    Returns a `{common, otp_only, ojp_only}` count summary, or None when
-    there's nothing to compare (no OJP reference at all, or the OJP call
-    didn't succeed). **Mutates `merged_trips`** (a `comparison` key on each
-    slot) **and `ojp_reference`** (`comparison`: OJP journey id → tag), with one
-    of `'common' | 'otp_only' | 'ojp_only' | 'uncomparable'` — the
-    journey UI renders that as a per-card badge. The key is still
-    `transit_fingerprint` of each journey's legs as today's dicts (#303 D5).
+# How the sentences name the two sides.
+_VIATOR_LABEL = "VIATOR"
+_REFERENCE_LABELS: dict[str, str] = {"ojp": "OJP", "hafas": "ÖBB"}
+# The station module's answers for one search's comparison, at most this long: past it the
+# journeys are compared by their codes and positions (the answers already in are kept for
+# the next search).
+_STATION_BUDGET_S = 4.0
+# OJP's per-card tags (today's shapes) by the engine's bucket.
+_OJP_TAG_LEFT = {"common": "common", "left_only": "otp_only", "uncomparable": "uncomparable"}
+_OJP_TAG_RIGHT = {"common": "common", "right_only": "ojp_only", "uncomparable": "uncomparable"}
 
-    Why the per-itinerary tag *plus* the summary: the summary tells the
-    operator "the engines agree on N journeys" at a glance; the per-
-    itinerary tag answers "is THIS specific card one of those?". An
-    `'uncomparable'` tag is attached to any itinerary whose transit
-    fingerprint is empty (walk-only or no transit legs) so the UI can
-    grey it out instead of mis-classifying it.
 
-    Counts in the summary are of distinct fingerprints, not raw card
-    counts — within-engine duplicates collapse so "Common: 2" really
-    means "2 distinct trains both engines agree on".
-    """
-    if ojp_reference is None or ojp_reference.get("status") != "ok":
+def _answered(reference: dict[str, Any] | None) -> list[CanonicalJourney] | None:
+    """A reference's journeys when it answered (`status` ok), else None: nothing to compare."""
+    if reference is None or reference.get("status") != "ok":
         return None
-    ojp_trips: list[CanonicalJourney] = ojp_reference.get("trips") or []
+    return list(reference.get("trips") or [])
 
-    otp_fps = [journey_transit_fingerprint(mt["best"]) for mt in merged_trips]
-    ojp_fps = [journey_transit_fingerprint(ot) for ot in ojp_trips]
 
-    otp_set = {fp for fp in otp_fps if fp}
-    ojp_set = {fp for fp in ojp_fps if fp}
-    common_set = otp_set & ojp_set
+def _station_resolvers(
+    db: DbSession, sessions: list[SessionRow], cfg: dict[str, Any]
+) -> tuple[dict[str, StationResolver], StationResolver]:
+    """(DB step) The station resolver of each fanout session (its feeds and uploads) and the
+    one of ÖBB's numbers (`COVERAGE_OEBB_STOP_SERIES`, the series the coverage check uses)."""
+    # The upload sender's module imports the extractor, which needs `fcntl`: imported here.
+    from ..station_extract_upload import latest_upload_sha256
 
-    def _tag(fp: str, only_label: str) -> str:
-        if not fp:
-            return "uncomparable"
-        return "common" if fp in common_set else only_label
+    series_value = cfg.get("COVERAGE_OEBB_STOP_SERIES")
+    series = str(series_value) if series_value else None
+    resolvers: dict[str, StationResolver] = {}
+    for session in sessions:
+        sid = session.id
+        resolvers[sid] = station_resolver.resolver_for_session(
+            session.config or {}, latest_upload_sha256(db, sid), series
+        )
+    return resolvers, station_resolver.ModuleStationResolver(
+        station_resolver.SessionFeeds({}, {}), series
+    )
 
-    for mt, fp in zip(merged_trips, otp_fps, strict=True):
-        mt["comparison"] = _tag(fp, "otp_only")
-    # A canonical journey carries no comparison: the reference says it per journey id.
-    ojp_reference["comparison"] = {
-        ot.id: _tag(fp, "ojp_only") for ot, fp in zip(ojp_trips, ojp_fps, strict=True)
+
+async def _placed_by_session(
+    journeys: list[CanonicalJourney], resolvers: dict[str, StationResolver]
+) -> list[CanonicalJourney]:
+    """VIATOR's journeys, each placed by the resolver of the session that found it."""
+    groups: dict[str, list[int]] = {}
+    for index, journey in enumerate(journeys):
+        sid = journey.source.session_id
+        if sid in resolvers:
+            groups.setdefault(sid, []).append(index)
+    placed = list(journeys)
+    for sid, indices in groups.items():
+        done = await with_resolved_stations([journeys[i] for i in indices], resolvers[sid])
+        for index, journey in zip(indices, done, strict=True):
+            placed[index] = journey
+    return placed
+
+
+async def _with_stations(
+    db: DbSession,
+    cfg: dict[str, Any],
+    sessions: list[SessionRow],
+    viator: list[CanonicalJourney],
+    references: dict[str, list[CanonicalJourney]],
+) -> tuple[list[CanonicalJourney], dict[str, list[CanonicalJourney]]]:
+    """The journeys with the station module's stations placed where it can (design D8, §6),
+    **for the comparison only**: the journeys sent to the page keep none (the module's
+    decision 68: its answers serve VIATOR's own matching). ÖBB's stops by their numbers; OJP's
+    are never asked. Unchanged when the module is not configured, and on any failure or past
+    `_STATION_BUDGET_S` (logged, never a 500): the engine then compares codes and positions."""
+    if not station_module.enabled():
+        return viator, references
+    # The database step runs whole, outside the time limit: a cancelled step would leave its
+    # thread on the request's session.
+    try:
+        resolvers, oebb = await db_step(_station_resolvers, db, sessions, cfg)
+    except Exception as exc:
+        log.warning("journey.stations_unresolved step=resolvers error=%s", type(exc).__name__)
+        return viator, references
+    try:
+        async with asyncio.timeout(_STATION_BUDGET_S):
+            placed_viator = await _placed_by_session(viator, resolvers)
+            placed = dict(references)
+            if "hafas" in placed:
+                placed["hafas"] = await with_resolved_stations(placed["hafas"], oebb)
+            return placed_viator, placed
+    except Exception as exc:  # TimeoutError included
+        log.warning("journey.stations_unresolved step=module error=%s", type(exc).__name__)
+        return viator, references
+
+
+def _compare_all(
+    viator: list[CanonicalJourney],
+    references: dict[str, list[CanonicalJourney]],
+    profile: matching.MatchProfile,
+) -> dict[str, matching.JourneyComparison]:
+    """VIATOR's journeys against each reference's (pure; run in a thread: CPU)."""
+    return {key: matching.compare(viator, found, profile) for key, found in references.items()}
+
+
+async def _compare_with_references(
+    db: DbSession,
+    cfg: dict[str, Any],
+    sessions: list[SessionRow],
+    merged_trips: list[dict[str, Any]],
+    references: dict[str, dict[str, Any] | None],
+) -> dict[str, matching.JourneyComparison]:
+    """The comparison of VIATOR's journeys with each reference that answered, by reference
+    key (`ojp`, `hafas`); `{}` when none did. Each slot's `best` is VIATOR's journey."""
+    asked = {
+        key: found
+        for key, reference in references.items()
+        if (found := _answered(reference)) is not None
+    }
+    if not asked:
+        return {}
+    viator = [slot["best"] for slot in merged_trips]
+    viator, asked = await _with_stations(db, cfg, sessions, viator, asked)
+    profile = matching.profile_from_config(cfg, matching.JOURNEY_REFERENCE.name)
+    return await asyncio.to_thread(_compare_all, viator, asked, profile)
+
+
+def _notes(found: Iterable[MatchReason], reference: str, *, unpaired: bool = False) -> list[str]:
+    """The sentences of reasons, most important first, each once; a hidden one left out, and
+    for an unpaired journey `no_candidate` too (its row already says the other side has none)."""
+    out: list[str] = []
+    for item in found:
+        if unpaired and item.code == match_reasons.NO_CANDIDATE:
+            continue
+        text = match_reasons.sentence(item, _VIATOR_LABEL, reference)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _comparison_json(comparison: matching.JourneyComparison, reference: str) -> dict[str, Any]:
+    """A comparison as the page reads it: VIATOR's journeys on the left, the reference's on
+    the right, by journey id; each pair's verdict and score, and for a pair or an unpaired
+    journey the codes of its reasons and their sentences (`notes`, plain text the page
+    escapes). No station id, code or feature value."""
+    return {
+        "engine_version": comparison.engine_version,
+        "profile": comparison.profile,
+        "left": _VIATOR_LABEL,
+        "right": reference,
+        "summary": comparison.summary.model_dump(),
+        "pairs": [
+            {
+                "left_id": pair.left_id,
+                "right_id": pair.right_id,
+                "verdict": pair.verdict,
+                "score": round(pair.score, 2),
+                "reasons": [item.code for item in pair.reasons],
+                "notes": _notes(pair.reasons, reference),
+            }
+            for pair in comparison.pairs
+        ],
+        **{
+            side: [
+                {
+                    "journey_id": item.journey_id,
+                    "reasons": [found.code for found in item.reasons],
+                    "notes": _notes(item.reasons, reference, unpaired=True),
+                }
+                for item in unpaired
+            ]
+            for side, unpaired in (
+                ("left_only", comparison.left_only),
+                ("right_only", comparison.right_only),
+            )
+        },
+        "uncomparable_left": list(comparison.uncomparable_left),
+        "uncomparable_right": list(comparison.uncomparable_right),
     }
 
+
+def _tag_ojp_comparison(
+    merged_trips: list[dict[str, Any]],
+    ojp_reference: dict[str, Any] | None,
+    comparison: matching.JourneyComparison | None,
+) -> dict[str, int] | None:
+    """The OJP comparison in its page shapes: a `comparison` tag on each slot (`common`,
+    `otp_only`, `uncomparable`), the reference's `comparison` (OJP journey id → `common`,
+    `ojp_only`, `uncomparable`) and the summary `{common, otp_only, ojp_only}` it returns;
+    None when OJP was not compared. **Mutates `merged_trips` and `ojp_reference`.**
+
+    Since #304 the engine decides (`journey_reference`): a pair is `common`, whatever its
+    verdict; the counts are of journeys paired one to one, no longer of distinct fingerprints."""
+    if comparison is None or ojp_reference is None:
+        return None
+    left, right = comparison.metadata()
+    for slot in merged_trips:
+        found = left.get(slot["best"].id)
+        if found is not None:
+            slot["comparison"] = _OJP_TAG_LEFT[found.bucket]
+    ojp_reference["comparison"] = {
+        journey_id: _OJP_TAG_RIGHT[found.bucket] for journey_id, found in right.items()
+    }
+    summary = comparison.summary
     return {
-        "common": len(common_set),
-        "otp_only": len(otp_set - common_set),
-        "ojp_only": len(ojp_set - common_set),
+        "common": summary.same_service + summary.probably_same,
+        "otp_only": summary.left_only,
+        "ojp_only": summary.right_only,
     }
 
 
@@ -699,18 +863,14 @@ async def fanout(
         if federated_trips and status != "error":
             status = "ok"
 
-    # v0.1.36 — Phase 2 structured comparison. When the OJP reference
-    # returned itineraries, fingerprint each itinerary's *transit* leg
-    # spine on both sides (walks stripped — coords rounded to ~11 m so
-    # OTP's `SBB:…` and OJP's `ch:1:sloid:…` stop references match by
-    # location). Bucket into common / OTP-only / OJP-only and attach
-    # both a per-trip tag and a summary count. The journey UI renders a
-    # one-line strip + a small badge on each card so the operator can
-    # see at a glance "VIATOR and the reference agree on N journeys,
-    # disagree on M+K". Phase 1 was the side-by-side display; Phase 2
-    # is the structured diff. Design: docs/ojp-reference-comparison-
-    # design.md §9.
-    comparison_summary = _build_comparison(merged_trips, ojp_reference)
+    # #304 — VIATOR's journeys against each reference that answered, by the matching engine
+    # (`journey_reference`). OJP's per-card tags and its one-line strip keep their shapes
+    # (v0.1.36's Phase 2); ÖBB's paired grid reads the pairs (`comparisons.hafas`), the page
+    # no longer pairs anything itself.
+    comparisons = await _compare_with_references(
+        db, cfg, sessions, merged_trips, {"ojp": ojp_reference, "hafas": hafas_reference}
+    )
+    comparison_summary = _tag_ojp_comparison(merged_trips, ojp_reference, comparisons.get("ojp"))
 
     response: dict[str, Any] = {
         "search_id": str(recorded.search_id),
@@ -731,6 +891,13 @@ async def fanout(
         response["hafas_reference"] = _reference_json(hafas_reference)
     if comparison_summary is not None:
         response["comparison_summary"] = comparison_summary
+    # #304 — per reference that answered: the engine's pairs, the journeys on one side only
+    # and the sentences of why.
+    if comparisons:
+        response["comparisons"] = {
+            key: _comparison_json(found, _REFERENCE_LABELS[key])
+            for key, found in comparisons.items()
+        }
     # Stitched cross-session itineraries (hub-and-spoke fallback). Rendered as a
     # separate "Federated (via hub)" group in the journey UI — never merged into
     # `trips`, since each spans 2+ sessions and a hub.

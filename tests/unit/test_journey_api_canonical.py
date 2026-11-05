@@ -11,14 +11,15 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from app.api.journey import (
-    _build_comparison,
     _instant_json,
     _journey_json,
     _merge_by_signature,
     _reference_json,
+    _tag_ojp_comparison,
 )
 from app.journey.canonical import CanonicalJourney
 from app.journey.canonical_adapters import hafas_adapter, motis_adapter, ojp_adapter
+from app.journey.matching import JOURNEY_REFERENCE, compare
 from app.journey.trip_normalize import renumbered
 from tests.unit import canonical_fixtures as fx
 
@@ -95,7 +96,8 @@ def test_the_ojp_comparison_tags_reference_journeys_by_id() -> None:
     ojp = ojp_adapter.journeys_from_trip_delivery(fx.OJP_TRIP_DELIVERY)
     merged = [{"best": ojp[0].model_copy(update={"id": "otp:ch:0"})}]
     reference: dict[str, Any] = {"status": "ok", "trips": ojp}
-    summary = _build_comparison(merged, reference)
+    comparison = compare([merged[0]["best"]], ojp, JOURNEY_REFERENCE)
+    summary = _tag_ojp_comparison(merged, reference, comparison)
     assert merged[0]["comparison"] == "common"
     assert reference["comparison"][ojp[0].id] == "common"
     assert summary is not None

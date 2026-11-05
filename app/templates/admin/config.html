@@ -46,6 +46,14 @@ const SECTIONS = [
   // ÖBB HAFAS reference comparison (public endpoint, no token).
   // HAFAS_TIMEOUT_MS is per request; the paginated search may take twice it.
   { title: 'ÖBB HAFAS comparison', keys: ['HAFAS_COMPARISON_ENABLED','HAFAS_TIMEOUT_MS'] },
+  // How a search pairs VIATOR's journeys with ÖBB's and OJP's (#304, the
+  // matching engine's `journey_reference` profile): read at each search.
+  { title: 'Journey matching', keys: [
+    'JOURNEY_MATCH_DEPARTURE_TOLERANCE_S','JOURNEY_MATCH_ARRIVAL_TOLERANCE_S',
+    'JOURNEY_MATCH_SAME_SERVICE_MIN_PCT','JOURNEY_MATCH_PROBABLE_MIN_PCT',
+    'JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT','JOURNEY_MATCH_UNRESOLVED_ENDPOINTS',
+    'JOURNEY_MATCH_POSITION_FALLBACK_M','JOURNEY_MATCH_TRANSFER_DIFFERENCE_S',
+  ] },
   // Network coverage matrix — knobs for the background coverage runner
   // (app/network_coverage/runner.py). Order matches CONFIG_SCHEMA's
   // grouping (query depth → cross-pair parallelism → K-slot slicing →
@@ -85,6 +93,8 @@ const CHOICES = {
     'Europe/Helsinki','Europe/Athens','Europe/Brussels','Europe/Amsterdam',
     'Europe/Lisbon','Europe/Rome',
   ],
+  JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT: ['veto','veto_unless_same_minutes','penalty'],
+  JOURNEY_MATCH_UNRESOLVED_ENDPOINTS: ['allow','reject'],
 };
 
 const toast = document.getElementById('toast');

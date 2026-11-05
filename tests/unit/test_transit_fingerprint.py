@@ -7,9 +7,10 @@ Covers:
     string. Walks/transfers stripped; coordinates rounded to ~11 m so
     OTP's `SBB:…` stop ids and OJP's `ch:1:sloid:…` stop ids match by
     location.
-  - `app.api.journey._build_comparison` — bucketing of merged_trips +
-    ojp_reference into common / OTP-only / OJP-only with both per-trip
-    tags and a summary count.
+
+(Until #304 `app.api.journey._build_comparison` bucketed VIATOR's and OJP's
+journeys by this fingerprint; the matching engine does it since, tested in
+test_journey_reference_matching.py.)
 
 The cross-engine match test is the centrepiece: an OJP-shape itinerary
 with an Origin→Bern walk + Bern→Zürich transit must fingerprint
@@ -24,9 +25,7 @@ from typing import Any
 
 import pytest
 
-from app.api.journey import _build_comparison
 from app.journey.signature import _fingerprint_stop_token, transit_fingerprint
-from tests.unit.canonical_fixtures import journey_from_legs
 
 # ─────────────────── canonical-token passthrough ───────────────────
 
@@ -562,91 +561,6 @@ class TestCrossEngineMatching:
         ]
         assert transit_fingerprint(otp_itin) == transit_fingerprint(ojp_itin)
         assert transit_fingerprint(otp_itin) != ""
-
-
-# ─────────────────── _build_comparison ───────────────────
-
-
-def _merged_trip(legs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the merged_trip shape `journey.fanout` produces — only
-    `best` (a canonical journey since #303) is read by `_build_comparison`,
-    the rest is irrelevant here."""
-    return {"best": journey_from_legs(legs, provider="otp")}
-
-
-def _ojp_ref(*trips: list[dict[str, Any]]) -> dict[str, Any]:
-    journeys = [journey_from_legs(legs, provider="ojp", rank=i) for i, legs in enumerate(trips)]
-    return {"status": "ok", "trips": journeys}
-
-
-def _ojp_tags(ref: dict[str, Any]) -> list[str]:
-    """The reference's tags, in journey order (they are keyed by journey id)."""
-    return [ref["comparison"][journey.id] for journey in ref["trips"]]
-
-
-class TestBuildComparison:
-    def test_none_when_no_ojp_reference(self):
-        assert _build_comparison([_merged_trip([_rail_leg()])], None) is None
-
-    def test_none_when_ojp_status_not_ok(self):
-        ref = {"status": "rate_limited", "trips": []}
-        assert _build_comparison([_merged_trip([_rail_leg()])], ref) is None
-
-    def test_all_three_buckets(self):
-        # OTP found IC1 and IR99 (the latter not in OJP).
-        # OJP found IC1 and R3 (the latter not in OTP).
-        # → 1 common, 1 OTP-only, 1 OJP-only.
-        otp = [
-            _merged_trip([_rail_leg(route_short_name="IC1")]),
-            _merged_trip([_rail_leg(route_short_name="IR99")]),
-        ]
-        ref = _ojp_ref(
-            [_rail_leg(route_short_name="IC1")],
-            [_rail_leg(route_short_name="R3")],
-        )
-        summary = _build_comparison(otp, ref)
-        assert summary == {"common": 1, "otp_only": 1, "ojp_only": 1}
-        # Per-trip tags attached for the UI badge.
-        tags_otp = [t["comparison"] for t in otp]
-        assert tags_otp == ["common", "otp_only"]
-        assert _ojp_tags(ref) == ["common", "ojp_only"]
-
-    def test_walk_only_otp_trip_tagged_uncomparable(self):
-        # Degenerate case: an OTP itinerary that's all walking (very
-        # short stop-to-stop in walking distance). Its fingerprint is
-        # the empty string, which would create false matches without
-        # the special-case in _build_comparison.
-        otp = [_merged_trip([_walk_leg()])]
-        ref = _ojp_ref([_rail_leg()])
-        summary = _build_comparison(otp, ref)
-        # Walk-only OTP trip is uncomparable; not counted as common
-        # despite both fingerprints being "" in the naive read.
-        assert summary == {"common": 0, "otp_only": 0, "ojp_only": 1}
-        assert otp[0]["comparison"] == "uncomparable"
-
-    def test_cross_engine_match_via_uic(self):
-        # The integration test: OJP renders end-walks and uses opaque
-        # stop ids; OTP (stop-id routing) doesn't. _build_comparison
-        # should still bucket them as common because the parser
-        # reconstructs OJP's 4-digit Swiss DSN (DiDok-Nummer) into the
-        # full 7-digit UIC by prepending `850`, so OJP "ch:1:sloid:7000"
-        # matches OTP "SBB:8507000" — both yield UIC:8507000. This is
-        # the v0.1.35.03 fix that closes the v0.1.35.02 regression.
-        otp = [_merged_trip([_rail_leg(from_stop_id="SBB:8507000", to_stop_id="SBB:8503000")])]
-        ref = _ojp_ref(
-            [
-                _walk_leg(),
-                _rail_leg(
-                    from_stop_id="ch:1:sloid:7000:0:8",  # Bern DSN → 8507000
-                    to_stop_id="ch:1:sloid:3000:0:33",  # Zürich HB DSN → 8503000
-                ),
-                _walk_leg(),
-            ]
-        )
-        summary = _build_comparison(otp, ref)
-        assert summary == {"common": 1, "otp_only": 0, "ojp_only": 0}
-        assert otp[0]["comparison"] == "common"
-        assert _ojp_tags(ref) == ["common"]
 
 
 # ─────────────────── module wiring sanity ───────────────────

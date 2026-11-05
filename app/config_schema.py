@@ -82,6 +82,39 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # on `external_verify.py` for the 43-pair validation note.
     "HAFAS_COMPARISON_ENABLED": {"type": "bool", "default": True},
     "HAFAS_TIMEOUT_MS": {"type": "int", "default": 10000, "min": 1000, "max": 60000},
+    # ── Journey matching (#304, docs/journey-matching-engine-design.md §10) ──
+    # How a search pairs VIATOR's journeys with ÖBB's and with Swiss OJP's: the
+    # profile `journey_reference` of `app/journey/matching/profiles.py` with these
+    # laid over it, read at each search. (The engine's `journey_engines` profile,
+    # OTP vs MOTIS, reads the same keys; nothing calls it yet.)
+    # M1: first boarding and last alighting within these seconds.
+    "JOURNEY_MATCH_DEPARTURE_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},
+    "JOURNEY_MATCH_ARRIVAL_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},
+    # The verdicts' thresholds, in percent of the score.
+    "JOURNEY_MATCH_SAME_SERVICE_MIN_PCT": {"type": "int", "default": 90, "min": 0, "max": 100},
+    "JOURNEY_MATCH_PROBABLE_MIN_PCT": {"type": "int", "default": 75, "min": 0, "max": 100},
+    # M2 (owner, 2026-11-05): two different train numbers veto a pair, unless the
+    # leg is the same minute at both ends on both sides.
+    "JOURNEY_MATCH_TRAIN_NUMBER_CONFLICT": {
+        "type": "str",
+        "default": "veto_unless_same_minutes",
+        "choices": ["veto", "veto_unless_same_minutes", "penalty"],
+    },
+    # M4: an endpoint the station data cannot compare is allowed on a search.
+    "JOURNEY_MATCH_UNRESOLVED_ENDPOINTS": {
+        "type": "str",
+        "default": "allow",
+        "choices": ["allow", "reject"],
+    },
+    # M4's fallback: a time-matched leg's stops within this many metres agree; 0 = off.
+    "JOURNEY_MATCH_POSITION_FALLBACK_M": {"type": "int", "default": 1000, "min": 0, "max": 5000},
+    # M8: "shorter transfer" when one side's change is shorter by this many seconds.
+    "JOURNEY_MATCH_TRANSFER_DIFFERENCE_S": {
+        "type": "int",
+        "default": 300,
+        "min": 60,
+        "max": 3600,
+    },
     # ── Network coverage matrix ───────────────────────────────────────
     # Tunables for the background coverage runner (app/network_coverage/
     # runner.py). Defaults are bit-identical to the prior hardcoded

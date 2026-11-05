@@ -96,10 +96,16 @@ exist to feed them.
 - Each itinerary is a **card**; click it to expand the individual legs (train, walk, transfer).
 - The **flag** on each card (`ALL`, `SUBSET`, `<session>_ONLY`) shows which data sources found
   that journey — useful when several countries' feeds are loaded at once.
-- With side-by-side on, VIATOR and ÖBB itineraries that depart at the same instant are **aligned
-  on the same row**. Where the two sources label the same train differently (VIATOR reads its
-  GTFS feed, ÖBB reports its own product name), an amber note says so rather than letting you
-  misread it as two different trains.
+- With side-by-side on and ÖBB as the only reference, VIATOR and ÖBB itineraries that VIATOR
+  judges to be **the same journey are aligned on the same row**: the same times within two minutes
+  at the start and the end, the same stations, no conflicting train number. A line above the grid
+  counts them ("VIATOR vs ÖBB: 3 same service, 1 probably the same, 2 VIATOR only, 1 ÖBB only").
+  Under a row, a note says what still differs ("Probably the same service · line labels differ:
+  RJX 540 / RJ 540", "same train to Salzburg Hbf, then different trains"), and under an itinerary
+  left alone, why it found no partner ("Not paired · departures 9 min apart"). An administrator
+  sets the tolerances on the configuration page ("Journey matching").
+- With the Swiss OJP reference, each card says **common**, **VIATOR only** or **OJP only** by
+  the same judgement.
 - A **"possible duplicate"** badge marks a second itinerary with identical departure *and*
   arrival — usually one physical train split into two portions (e.g. SNCF `601` and `601A`),
   which the data reports as two services.

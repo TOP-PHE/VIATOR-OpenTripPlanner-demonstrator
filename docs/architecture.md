@@ -117,8 +117,8 @@ Three details in that picture are easy to get backwards and expensive to debug:
 6. `asyncio.gather` of `_query_session(...)` per session. Each calls `planner_dispatch.get_planner(session).fetch_journeys(...)` → `otp_client.fetch_journeys` or `motis_client.fetch_journeys` (the raw answer and its canonical journeys). When the form supplied a UIC, `_stop_id_for()` builds `<feedId>:<uic>` and routes by stop rather than coordinate — this bypasses the lat/lon→walk-graph snap that fails at border stations whose footpaths were stripped by rail-focused OSM filtering.
 7. Per session: `_current_snapshot()`, then `recorder.record_execution()` writes `journey_search_executions` + `journey_trips` (each trip row stores the canonical journey in `journey`, #303 PR 4a). Trips are merged into `by_signature` keyed on `signature.trip_signature`, and `_origin_flag()` labels each merged trip `ALL` / `<SESSION>_ONLY` / `SUBSET`.
 8. If **nothing** merged and both endpoints carried UICs, `federated_planner.plan_federated()` attempts a hub-stitch: find a UIC both sessions serve, route origin→hub in one and hub→dest in the other. Fallback only — wrapped in try/except, never 500s the search.
-9. `_build_comparison(merged_trips, ojp_reference)` fingerprints the transit-leg spine on both sides, buckets into `common / otp_only / ojp_only`, and **mutates the trip dicts** to attach a per-card `comparison` tag (`uncomparable` when the fingerprint is empty).
-10. `recorder.finish_search()`, `db.commit()`, response: `{search_id, status, trips, executions, ojp_reference?, hafas_reference?, comparison_summary?, federated_trips?}`.
+9. `_compare_with_references(...)` (#304) compares VIATOR's journeys (each slot's `best`) with each reference that answered by the matching engine (`compare(viator, reference, journey_reference)`, the `JOURNEY_MATCH_*` settings, in a thread), stations placed by the station module for the comparison only; `_tag_ojp_comparison` then **mutates the trip dicts** to attach OJP's per-card `comparison` tag (`common` / `otp_only` / `uncomparable`).
+10. `recorder.finish_search()`, `db.commit()`, response: `{search_id, status, trips, executions, ojp_reference?, hafas_reference?, comparison_summary?, comparisons?, federated_trips?}` (`comparisons.hafas` / `.ojp`: the engine's pairs, one-side journeys and reasons as sentences; ÖBB's paired grid is built from it).
 
 #### (b) A network-coverage run executes
 
@@ -326,10 +326,12 @@ each step is worth reading in the source, but the shape is:
 7. **Federated fallback.** Only when *nothing* merged and both ends carried UICs:
    `federated_planner.plan_federated` stitches origin→hub→dest across two sessions. Wrapped in
    try/except — "a failure here never 500s the whole search."
-8. **Structured diff.** `_build_comparison` fingerprints the transit-leg spine on both sides and
-   returns `{common, otp_only, ojp_only}` counts *of distinct fingerprints*, while **mutating** the
-   trip dicts to carry a per-card `comparison` tag. Empty fingerprint (walk-only) → `uncomparable`,
-   so the UI greys it rather than mis-classifying it.
+8. **Structured diff.** Since #304 the matching engine pairs VIATOR's journeys with each
+   reference's one to one (`_compare_with_references`); `_tag_ojp_comparison` returns OJP's
+   `{common, otp_only, ojp_only}` counts *of journeys paired*, while **mutating** the trip dicts to
+   carry a per-card `comparison` tag. A journey without a ride (walk-only) → `uncomparable`, so the
+   UI greys it rather than mis-classifying it. Until #304 `_build_comparison` bucketed distinct
+   `transit_fingerprint`s.
 
 ### Data shapes
 
@@ -370,8 +372,13 @@ display model in one place, `app/static/js/canonical_view.js`; no engine payload
 - **Reference clients must never raise.** If you add a third reference engine, mirror the
   `{status, trips, response_ms, error?}` contract; an exception escaping there takes the whole search
   down with it.
-- **`_build_comparison` mutates its arguments.** It attaches `comparison` in place to both
-  `merged_trips` and `ojp_reference["trips"]`. Copying the lists defensively silently drops the badges.
+- **`_tag_ojp_comparison` mutates its arguments.** It attaches `comparison` in place to each
+  slot of `merged_trips` and to `ojp_reference` (journey id → tag). Copying them defensively
+  silently drops the badges.
+- **Station ids are for the comparison only.** `_with_stations` places the station module's
+  stations on copies of the journeys; the journeys sent keep none (MSMM decision 68). Never send
+  the placed copies, and never run its `db_step` under the time limit (a cancelled step leaves
+  its thread on the request's session).
 - **A missing `graph_snapshots` row is not an error.** An earlier version forced `status="error"`
   when no snapshot existed, making every search render "(error)" with perfect itineraries. Also gone:
   `_placeholder_snapshot_id()` returning the all-zero UUID — an FK-violation footgun that crashed
@@ -482,8 +489,8 @@ Every one of the four clients returns `(raw, trips)`, where `trips` is a list of
 | `fare` | absent | Emitted by no client; the recorder writes the reserved `journey_trips.fare` column as NULL. |
 
 Federated stitches add `via_hubs: list[str]`, `stitched_from_sessions: list[str]`, `federated: True`.
-`app/api/journey.py::_build_comparison` later *mutates* trips to add `comparison`
-(`common` / `otp_only` / `ojp_only` / `uncomparable`).
+`app/api/journey.py::_tag_ojp_comparison` later *mutates* trips to add `comparison`
+(`common` / `otp_only` / `ojp_only` / `uncomparable`), from the matching engine's pairs (#304).
 
 ### Data shapes — the canonical leg dict
 
@@ -526,8 +533,7 @@ explains exactly why: OTP's platform-precise coordinates mean "Lausanne platform
 differ at 4 dp *within one itinerary*, while OJP returns one centroid; at 110 m platforms collapse
 but Zürich HB and Stadelhofen (700 m apart) still don't.
 
-Consumers: `api/journey.py::_build_comparison` (the common/only bucketing that IS the product),
-`ojp_client._dedup_batch_and_track_latest_dep` (page dedup), `federated_planner.dedup_and_rank`,
+Consumers: `ojp_client._dedup_batch_and_track_latest_dep` (page dedup), `federated_planner.dedup_and_rank`,
 and `network_coverage/alignment.py`.
 
 ### `first_transit_leg_departure_utc` — why it exists
