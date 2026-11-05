@@ -78,6 +78,7 @@ from ... import config_service, osm_geo, station_module
 from ...config_schema import CONFIG_SCHEMA
 from ...db import get_db
 from ...db_steps import db_step
+from ...journey.canonical import CanonicalJourney
 from ...models import (
     JourneySearchExecution,
     JourneyTrip,
@@ -87,8 +88,15 @@ from ...models import (
 )
 from ...models import Session as SessionRow
 from ...models.sessions import SessionState
+from ...network_coverage import (
+    alignment,
+    external_verify,
+    hub_derive,
+    oebb_journeys,
+    runner,
+    translit,
+)
 from ...network_coverage import executor as coverage_executor
-from ...network_coverage import external_verify, hub_derive, oebb_journeys, runner, translit
 from ...network_coverage.hubs import HUBS as STATIC_HUBS
 from ...security import CurrentUser, require_platform_admin
 from ...templating import templates
@@ -733,6 +741,11 @@ class CellTripsDirection(BaseModel):
     external_journeys: list[dict[str, Any]] | None = None
     external_alignment_score: float | None = None
     external_alignment_tier: AlignmentTier | None = None
+    # #304 (M6): why the cell scored so, as the lines the modal prints under its tier
+    # (`alignment.explain_cell`): plain text, no stop id or code. Empty for a cell scored
+    # before #304 or not asked yet. A trip of `trips` after ÖBB's last connection (M9) carries
+    # `outside_reference_window: true`.
+    alignment_lines: list[str] = []
 
 
 class CellTripsResponse(BaseModel):
@@ -2790,6 +2803,7 @@ def _build_export_context(
     shrank); the share page leaves it off and fetches per cell instead.
     """
     cells: dict[str, dict[str, Any]] = {}
+    tolerance = _run_match_tolerance(run)
     for r in results:
         key = f"{r.origin_hub_id}:{r.dest_hub_id}"
         cells[key] = {
@@ -2801,9 +2815,11 @@ def _build_export_context(
             "best_operators": r.best_operators,
             "error_message": r.error_message,
             "session_ids": getattr(r, "session_ids", None),
-            "trips": trips_by_search.get(str(r.journey_search_id), [])
-            if r.journey_search_id
-            else [],
+            "trips": _with_window_marks(
+                trips_by_search.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+                getattr(r, "external_journeys", None) if include_external_journeys else None,
+                tolerance,
+            ),
             # PR-E — persisted external-verify verdict so offline HTML
             # exports show the same per-cell dot the live matrix renders.
             "external_ok": getattr(r, "external_ok", None),
@@ -2823,6 +2839,10 @@ def _build_export_context(
             # PR-E green/blue/yellow verdict dot.
             "external_alignment_tier": getattr(r, "external_alignment_tier", None),
             "external_alignment_score": getattr(r, "external_alignment_score", None),
+            # #304 (M6): why the cell scored so, the lines the report prints under its tier.
+            "alignment_lines": alignment.explain_cell(
+                getattr(r, "external_alignment_detail", None)
+            ),
             # Persisted ÖBB journeys for the offline side-by-side —
             # None (key always present, for a stable raw-JSON schema)
             # unless the caller opted in; see the docstring.
@@ -3241,6 +3261,44 @@ def get_cell_trips(
     return _build_cell_trips_response(db, run, origin_id, dest_id)
 
 
+def _run_match_tolerance(run: Any) -> int:
+    """The departure tolerance the run's cells were scored with (its frozen
+    `COVERAGE_MATCH_DEPARTURE_TOLERANCE_S`, #304), the default for a run from before."""
+    snapshot = getattr(run, "execution_snapshot", None)
+    frozen = (
+        runner._config_from_snapshot(snapshot.get("config")) if isinstance(snapshot, dict) else None
+    )
+    return (frozen or runner.CoverageConfig()).match_departure_tolerance_s
+
+
+def _with_window_marks(
+    trips: list[dict[str, Any]],
+    external_journeys: list[dict[str, Any]] | None,
+    tolerance_s: int,
+) -> list[dict[str, Any]]:
+    """M9 (#304): the cell's VIATOR trips, each after ÖBB's last connection (outside ÖBB's span,
+    as the scorer saw it: `alignment.reference_window`) marked `outside_reference_window: true`.
+    Unchanged when ÖBB has no journey or a trip carries no journey (a large report's summary
+    only), or when a stored journey no longer reads."""
+    if not trips or not external_journeys:
+        return trips
+    try:
+        oebb = [CanonicalJourney.model_validate(item) for item in external_journeys]
+        viator = [
+            (trip, CanonicalJourney.model_validate(trip["journey"]))
+            for trip in trips
+            if trip.get("journey")
+        ]
+    except ValidationError:
+        return trips
+    _, outside = alignment.reference_window([j for _, j in viator], oebb, tolerance_s)
+    late = {id(journey) for journey in outside}
+    marked = {id(trip) for trip, journey in viator if id(journey) in late}
+    return [
+        {**trip, "outside_reference_window": True} if id(trip) in marked else trip for trip in trips
+    ]
+
+
 def _build_cell_trips_response(
     db: DbSession, run: NetworkCoverageRun, origin_id: str, dest_id: str
 ) -> CellTripsResponse:
@@ -3286,6 +3344,7 @@ def _build_cell_trips_response(
         if r is not None and r.journey_search_id is not None
     ]
     trips_by_search = _fetch_trips_by_search(db, search_ids, _comparable_depart_at(db, run))
+    tolerance = _run_match_tolerance(run)
 
     def _row_to_direction(r: NetworkCoverageResult | None) -> CellTripsDirection | None:
         if r is None:
@@ -3300,7 +3359,11 @@ def _build_cell_trips_response(
             best_num_transfers=r.best_num_transfers,
             best_operators=r.best_operators,
             error_message=r.error_message,
-            trips=trips_by_search.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+            trips=_with_window_marks(
+                trips_by_search.get(str(r.journey_search_id), []) if r.journey_search_id else [],
+                r.external_journeys,
+                tolerance,
+            ),
             # PR-E — pre-rendered external-verify verdict so the modal
             # opens with ÖBB's answer already populated.
             external_ok=r.external_ok,
@@ -3315,6 +3378,7 @@ def _build_cell_trips_response(
             external_journeys=r.external_journeys,
             external_alignment_score=r.external_alignment_score,
             external_alignment_tier=r.external_alignment_tier,
+            alignment_lines=alignment.explain_cell(r.external_alignment_detail),
         )
 
     # direction='single' runs intentionally have no return row — collapse

@@ -117,3 +117,38 @@ def sentence(item: MatchReason, left: str, right: str) -> str:
         left_min=_minutes(item.left_value),
         right_min=_minutes(item.right_value),
     )
+
+
+# What a page says of a reason it counts rather than shows one by one (a coverage cell keeps
+# the number of pairs and journeys each reason was met for, not their values). `{left}` /
+# `{right}`: the sides' labels. An empty summary: not listed.
+SUMMARIES: dict[str, str] = {
+    CATEGORY_DIFFERS: "product names differ",
+    ENDPOINT_UNRESOLVED: "stations could not be compared (no shared station code)",
+    LINE_LABEL_DIFFERS: "line labels differ",
+    OPERATOR_DIFFERS: "operators differ",
+    TRANSFER_COUNT_DIFFERS: "a different number of changes",
+    TRAIN_NUMBER_DIFFERS: "different train numbers",
+    TRAIN_NUMBER_DIFFERS_SAME_MINUTES: "same times, the sources number the train differently",
+    STATIONS_BY_POSITION: "stations compared by position (no shared station code)",
+    LOCAL_ACCESS_RIDE: "a local ride to the station on one side, left out",
+    SPLITS_AFTER_SHARED_RIDE: "the same train first, then different trains",
+    SHORTER_TRANSFER: "after a shared train, one side changes much faster",
+    REJOINS_AFTER_SPLIT: "different trains, then the same again",
+    OUTSIDE_REFERENCE_WINDOW: "{left} journeys after {right}'s last connection, not compared",
+    ENDPOINT_STATION_DIFFERS: "different first or last station",
+    DEPARTURE_OUTSIDE_TOLERANCE: "departures too far apart",
+    ARRIVAL_OUTSIDE_TOLERANCE: "arrivals too far apart",
+    NO_TRANSIT_LEG: "walk only",
+    SCORE_TOO_LOW: "too different to be the same journey",
+}
+
+
+def summary_sentence(code: str, count: int, left: str, right: str) -> str:
+    """The line a page lists for a reason met `count` times ("line labels differ (2 times)"); "" for a
+    reason not listed."""
+    template = SUMMARIES.get(code, "")
+    if not template or count <= 0:
+        return ""
+    text = template.format(left=left, right=right)
+    return f"{text} ({count} times)" if count > 1 else text
