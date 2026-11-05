@@ -1,10 +1,10 @@
 """Station resolution: giving each stop its station of the station module (MSMM).
 
-The interface only (design D8). The MSMM-backed resolver is a PR of its own: the module's
-`POST /internal/v1/stops/resolve` answers `{feed, stop}` (a stop of a feed VIATOR sent it) or
-`{series, code}` (an ÖBB number, series `DELFI_stop_key`), one stop per call within the
-person's limits, so it needs a cache, and a bulk form for coverage. Adapters never resolve:
-they stay pure functions of a provider's answer.
+The interface only (design D8). The MSMM-backed resolver is `app/journey/station_resolver.py`
+(#303 PR 5): it asks the module's server-only bulk call (`POST /internal/v1/stops/stations`, MSMM
+design 22.18) for up to 50 stops of one feed (a stop of a feed VIATOR sent it) or codes of one
+series (an ÖBB number, series `DELFI_stop_key`) at once, and keeps the answers. Adapters never
+resolve: they stay pure functions of a provider's answer.
 """
 
 from __future__ import annotations
