@@ -2,7 +2,7 @@
 
 `app/journey/canonical/` imports no engine client, no adapter and no coverage module: only the
 adapters (`app/journey/canonical_adapters/`) know a provider's format. Business modules join
-this test as they move onto CanonicalJourney (#303 PR 3, PR 4).
+this test as they move onto CanonicalJourney (#303 PR 3, PR 4); the matching engine (#304) too.
 """
 
 from __future__ import annotations
@@ -51,3 +51,22 @@ def test_the_canonical_package_imports_no_provider_code(path: Path) -> None:
     imported = _imports(path)
     leaks = sorted(m for m in imported for bad in FORBIDDEN if m == bad or m.startswith(bad + "."))
     assert not leaks, f"{path.name} imports provider code: {leaks}"
+
+
+# #304: "No matching logic may be implemented on provider-specific DTOs". The matching engine
+# reads canonical journeys only, and does no I/O (no station module, no database).
+MATCHING = sorted((APP / "journey" / "matching").rglob("*.py"))
+MATCHING_FORBIDDEN = (*FORBIDDEN, "app.station_module", "app.journey.station_resolver", "app.db")
+
+
+def test_the_matching_package_is_found() -> None:
+    assert len(MATCHING) >= 9
+
+
+@pytest.mark.parametrize("path", MATCHING, ids=lambda p: str(p.relative_to(APP)))
+def test_the_matching_engine_imports_no_provider_code_and_no_io(path: Path) -> None:
+    imported = _imports(path)
+    leaks = sorted(
+        m for m in imported for bad in MATCHING_FORBIDDEN if m == bad or m.startswith(bad + ".")
+    )
+    assert not leaks, f"{path.name} imports provider code or I/O: {leaks}"
