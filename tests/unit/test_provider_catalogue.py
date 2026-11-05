@@ -36,6 +36,19 @@ def test_the_label_says_when_a_feed_is_not_from_a_nap() -> None:
         assert e["nap_reference"], e["id"]
 
 
+def test_a_recorded_licence_says_whom_to_credit_and_on_what_terms() -> None:
+    """A `licence` gives every field, never reaches a session (checked above), and its
+    credit is in NOTICE, the product's list of third-party data."""
+    notice = (provider_catalogue.CATALOGUE_PATH.parents[2] / "NOTICE").read_text(encoding="utf-8")
+    licensed = {i: e["licence"] for i, e in provider_catalogue.load().items() if "licence" in e}
+    assert "ELRON" in licensed
+    for provider_id, licence in licensed.items():
+        assert set(licence) == set(provider_catalogue.LICENCE_FIELDS), provider_id
+        assert all(licence[field] for field in provider_catalogue.LICENCE_FIELDS), provider_id
+        assert licence["reference"].startswith("https://"), provider_id
+        assert licence["attribution"] in notice, provider_id
+
+
 def test_ids_do_not_clash_with_the_switch_map() -> None:
     assert not set(provider_catalogue.load()) & set(nap_source_map.load_map())
 

@@ -39,6 +39,19 @@ run; `--apply` saves), then **Refresh providers**.
 | MK | MZT | community | not probed |
 | XK | TRAINKOS | community | not probed |
 
+## Licences
+
+Where a feed's terms are known, its catalogue entry carries a `licence` (name,
+publisher, the credit to give, conditions, where they were read and when; never
+copied into a session) and the credit is in `NOTICE`.
+
+| Id | Terms | Conditions | Read |
+|---|---|---|---|
+| ELRON | Estonian public transport register open data, equivalent to CC BY 4.0. Publisher: Regionaal- ja Põllumajandusministeerium (the file, hosted by Remix, names it in `feed_info.txt`) | Credit "Eesti ühistranspordiregister, Regionaal- ja Põllumajandusministeerium" in any public use (the coverage share page included); a public application shows data no older than 7 days from its download, so refresh ELRON at least weekly | 2026-11-05, the register's record on the national geoportal (`metadata.geoportaal.ee`, record `fb06b0b6-4512-4885-9613-aaab2b96f467`); peatus.ee has no current licence page, and a 2019 mirror listed Open Data Commons Attribution 3.0: an attribution licence either way |
+
+The feed's calendar ends on 2026-12-31 (`feed_info.txt`, 5 Nov 2026): a coverage run dated in 2027
+finds no Elron train until the file is renewed.
+
 ## Not in the catalogue yet
 
 | Country | Why | Next step |
