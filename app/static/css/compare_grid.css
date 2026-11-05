@@ -115,7 +115,10 @@
 }
 
 /* #304 — the notes row of the VIATOR-vs-ÖBB paired grid
-   (renderViatorOebbPairedGrid in journey.html): under a row, the matching
+   (renderViatorOebbPairedGrid in journey.html) and of the OTP-vs-MOTIS
+   grid (renderComparisonGrid; the plain grid's `.compare-grid
+   .compare-cell` min-height is beaten by the second selector, 3 classes
+   against 2): under a row, the matching
    engine's verdict and the sentences of its reasons ("Probably the same
    service · line labels differ: RJX 540 / RJ 540"), spanning both columns
    via inline `grid-column: 1 / -1`. Replaces v0.1.44's train-label warning.
@@ -129,7 +132,8 @@
    exact `.compare-grid.compare-grid-refs > .compare-cell` selector shape
    (4 classes, strictly higher specificity) so this rule always wins
    regardless of source order. */
-.compare-grid.compare-grid-refs > .compare-cell.pair-notes-row {
+.compare-grid.compare-grid-refs > .compare-cell.pair-notes-row,
+.compare-grid > .compare-cell.pair-notes-row {
   padding: 0.3rem 0 0.6rem;
   min-height: auto;
 }

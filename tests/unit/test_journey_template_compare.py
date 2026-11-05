@@ -51,27 +51,21 @@ def shared_js_text() -> str:
 COMPARISON_HELPERS = [
     "_engineForSession",
     "_shouldRenderComparison",
-    "_enginesForTrip",
     "_renderComparisonCell",
     "renderComparisonGrid",
-    # P2 follow-up: "Compare trains only" toggle helpers. Same trip-wire
-    # rule — if any of these is undefined, the toggle silently breaks.
-    "_trainOnlySignature",
+    # The "Compare excluding walk legs" toggle's duration (since #304 it
+    # changes only the durations shown).
     "_railOnlyDurationSec",
-    # P2 follow-up #2 (2026-06-21): mode normaliser. OTP says `RAIL`,
-    # MOTIS says `REGIONAL_RAIL`/`HIGHSPEED_RAIL` — same train, different
-    # GTFS route_type. The pairing key MUST collapse these together or
-    # the toggle does nothing visible.
-    "_normalizeMode",
-    # Sonar refactor: cognitive-complexity split of renderComparisonGrid
-    # into pure helpers (S3776). Each one is named here so a future
-    # refactor that inlines them back into a monolithic function will
-    # at least notice the test breaking.
-    "_usableTrips",
-    "_pairKey",
-    "_assignBestToBucket",
-    "_bucketsForGrid",
-    "_cellForBucket",
+    # #304: the rows from the server's pairs (`comparisons.engines`), split
+    # into small helpers (SonarJS S3776) — named here so a refactor that
+    # drops one notices.
+    "_slotIndexByEngine",
+    "_engineRowSortKey",
+    "_engineRows",
+    "_cellForRow",
+    "_notesById",
+    "_pairNotesRow",
+    "_pairedGridSummary",
     "_renderToggleControls",
 ]
 
@@ -87,6 +81,47 @@ def test_comparison_helper_is_defined(name: str, template_text: str):
         f"in app/templates/journey.html — the browser will throw a ReferenceError "
         f"the first time a fanout with both engines lands."
     )
+
+
+def _body(template_text: str, name: str, span: int = 3000) -> str:
+    start = template_text.find(f"function {name}(")
+    assert start != -1, f"{name} function missing"
+    next_fn = template_text.find("\nfunction ", start + len(f"function {name}("))
+    return template_text[start : next_fn if next_fn != -1 else start + span]
+
+
+def test_the_engines_grid_reads_the_server_s_pairs(template_text: str):
+    """#304: the OTP-vs-MOTIS grid's rows are the matching engine's pairs
+    (`payload.comparisons.engines`), found through each slot's
+    `engine_journey_ids`; without the comparison it renders nothing and the
+    flat list shows instead. The page's own pairing keys are gone."""
+    grid = _body(template_text, "renderComparisonGrid")
+    assert "payload.comparisons && payload.comparisons.engines" in grid
+    assert "_engineRows(trips, comparison)" in grid
+    assert "_pairNotesRow(row)" in grid
+    assert "_pairedGridSummary(comparison)" in grid
+    rows = _body(template_text, "_engineRows")
+    for needle in ("comparison.pairs", "pair.left_id", "pair.right_id", "left_only", "right_only"):
+        assert needle in rows, f"_engineRows no longer reads {needle}"
+    assert "rows.sort(" in rows
+    assert "engine_journey_ids" in _body(template_text, "_slotIndexByEngine")
+    for gone in ("_trainOnlySignature", "_pairKey", "_bucketsForGrid", "_normalizeMode"):
+        assert f"function {gone}(" not in template_text, f"{gone} is back"
+
+
+def test_the_summary_names_the_comparison_s_sides(template_text: str):
+    """One strip for both grids: the sides as the server names them
+    (VIATOR / ÖBB, OTP / MOTIS), escaped."""
+    strip = _body(template_text, "_pairedGridSummary", 1500)
+    assert "escHTML(comparison.left" in strip
+    assert "escHTML(comparison.right" in strip
+
+
+def test_the_notes_row_fits_the_plain_grid_too(shared_css_text: str):
+    """The OTP-vs-MOTIS grid is the plain `.compare-grid` (no `-refs`): its
+    notes row needs a selector beating `.compare-grid .compare-cell`'s
+    min-height (3 classes against 2)."""
+    assert ".compare-grid > .compare-cell.pair-notes-row" in shared_css_text
 
 
 def test_render_branches_on_should_render_comparison(template_text: str):
@@ -134,9 +169,10 @@ def test_engine_dropdown_is_present_in_form(template_text: str):
 
 
 def test_compare_trains_only_toggle_is_wired(template_text: str):
-    """The 'Compare trains only' toggle and its state variable must
+    """The 'Compare excluding walk legs' toggle and its state variable must
     both exist, and the change handler must call render() so the grid
-    rebuilds on flip without a fresh fetch."""
+    rebuilds on flip without a fresh fetch. Since #304 it changes the
+    durations shown, never the rows."""
     # State variable that the cell + grid helpers read:
     assert "_COMPARE_TRAINS_ONLY" in template_text
     # Toggle HTML id (rendered inside the comparison grid):

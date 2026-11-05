@@ -1100,73 +1100,14 @@ function _shouldRenderComparison(payload) {
   return engines.has('otp') && engines.has('motis');
 }
 
-function _enginesForTrip(trip, engineMap) {
-  const present = new Set();
-  for (const sid of trip.found_in_sessions || []) {
-    const eng = engineMap.get(sid);
-    if (eng) present.add(eng);
-  }
-  return present;
-}
-
 // P2 MOTIS — "Compare excluding walk legs" toggle state (PR-194 renamed
-// from the original misleading "trains-only" label). When ON, the comparison
-// grid pairs rows by a fingerprint that ignores WALK legs so same-train
-// trips collapse into one row regardless of access/egress walk-time
-// differences (a real-world finding: OTP and MOTIS often disagree on
-// the walking-routing distance from origin coord to the station and
-// from the destination station to dest coord — they're using different
-// OSM walking profiles. The TRAIN portion is identical and that's the
-// useful comparison). Default OFF preserves the existing per-trip-
-// signature pairing.
+// from the original misleading "trains-only" label). Since #304 it only
+// changes the durations the OTP-vs-MOTIS grid shows (transit time beside
+// the total); the rows are the matching engine's pairs, which never count
+// walks (the access and egress walks are where OTP and MOTIS differ: two
+// OSM walking profiles). Before #304 it switched the grid's pairing key to
+// a walk-free signature of minutes and rounded positions.
 let _COMPARE_TRAINS_ONLY = false;
-
-function _normalizeMode(mode) {
-  // Engines bucket "train" differently — OTP collapses every passenger
-  // rail service into a single `RAIL`, while MOTIS surfaces GTFS
-  // route_type sub-categories (`HIGHSPEED_RAIL`, `REGIONAL_RAIL`,
-  // `LONG_DISTANCE_RAIL`, `COMMUTER_RAIL`, `RAILWAY_SERVICE`...). For
-  // train-only pairing the operator cares about "is it the same train",
-  // not "what GTFS route_type does each feed pick", so the suffix is
-  // noise. Same for the other common transit families. Anything we
-  // don't recognise (CABLE_CAR, FUNICULAR, AERIAL_LIFT, GONDOLA) passes
-  // through as-is; their categories are stable enough already.
-  const m = String(mode || '').toUpperCase();
-  if (m === 'RAIL' || m.endsWith('_RAIL')) return 'RAIL';
-  if (m === 'BUS' || m.endsWith('_BUS')) return 'BUS';
-  if (m === 'FERRY' || m.endsWith('_FERRY') || m === 'WATERWAY') return 'FERRY';
-  if (m === 'TRAM' || m.endsWith('_TRAM') || m === 'STREETCAR') return 'TRAM';
-  if (m === 'SUBWAY' || m === 'METRO' || m.endsWith('_SUBWAY')) return 'SUBWAY';
-  return m;
-}
-
-function _trainOnlySignature(trip) {
-  // Stable, deterministic key built from the rail-only legs. Departure +
-  // arrival times are pinned to the minute (no seconds) because OTP and
-  // MOTIS sometimes differ by a few seconds even on the same trip.
-  // stopId differences between engines (OTP's `feed:UIC` vs MOTIS's
-  // `feed_local`) make stop-id-based keys brittle, so we use lat/lon
-  // rounded to ~110 m (3 decimal places) — tight enough to distinguish
-  // neighbouring stations but tolerant of per-feed coordinate variance
-  // (platform vs. station-centre vs. main entrance). Mode normalised via
-  // `_normalizeMode` so OTP's `RAIL` and MOTIS's `HIGHSPEED_RAIL` /
-  // `REGIONAL_RAIL` end up in the same bucket (real-world finding from
-  // sp-rail-motis, 2026-06-21).
-  const legs = (trip.best && trip.best.legs) || [];
-  const parts = [];
-  for (const lg of legs) {
-    if (!lg || lg.mode === 'WALK') continue;
-    const mode = _normalizeMode(lg.mode);
-    const dep = String(lg.departure || '').slice(0, 16);  // YYYY-MM-DDTHH:MM
-    const arr = String(lg.arrival || '').slice(0, 16);
-    const flat = Number(lg.from_lat || 0).toFixed(3);
-    const flon = Number(lg.from_lon || 0).toFixed(3);
-    const tlat = Number(lg.to_lat || 0).toFixed(3);
-    const tlon = Number(lg.to_lon || 0).toFixed(3);
-    parts.push(`${mode}|${flat},${flon}@${dep}|${tlat},${tlon}@${arr}`);
-  }
-  return parts.join('||');
-}
 
 function _railOnlyDurationSec(legs) {
   // Sum of non-WALK leg durations. Used when the toggle is ON to
@@ -1243,64 +1184,58 @@ function _renderComparisonCell(trip, engine, tripIndex) {
   </div>`;
 }
 
-// P2 MOTIS — comparison-grid helpers. Each one is pure (no DOM, no
-// global state read except `_COMPARE_TRAINS_ONLY`), so they're trivial
-// to reason about in isolation and keep `renderComparisonGrid` under
-// SonarJS's S3776 cognitive-complexity limit (15).
-
-function _usableTrips(payload, engineMap) {
-  return payload.trips
-    .map((t, originalIndex) => ({
-      t,
-      originalIndex,
-      engines: _enginesForTrip(t, engineMap),
-    }))
-    .filter(({ engines }) => engines.has('otp') || engines.has('motis'));
+// #304 — the OTP-vs-MOTIS rows come from the server's comparison
+// (`payload.comparisons.engines`: the matching engine, profile
+// `journey_engines`, the same feeds within 60 s). Each merged slot names
+// the journey it stands for on each engine's side (`engine_journey_ids`);
+// a pair is one row, with a note under it when something still differs; a
+// journey left unpaired gets its own row with "— not found by …" on the
+// other side and why. The page pairs nothing itself any more (it keyed
+// rows on the merge signature, or with the toggle on a walk-free one).
+function _slotIndexByEngine(trips) {
+  const at = { otp: new Map(), motis: new Map() };
+  trips.forEach((t, i) => {
+    const ids = t.engine_journey_ids || {};
+    if (ids.otp) at.otp.set(ids.otp, i);
+    if (ids.motis) at.motis.set(ids.motis, i);
+  });
+  return at;
 }
 
-function _pairKey(trip) {
-  // The toggle's whole job is to change the pairing key. OFF (default):
-  // each trip is its own row, pairing happens only when the server-side
-  // `transit_fingerprint` matched both engines into the same `by_session`
-  // entry. ON: we re-pair on the client by a rail-only signature so the
-  // same train collapses into one row even when walks differ.
-  return _COMPARE_TRAINS_ONLY ? _trainOnlySignature(trip) : trip.signature;
+function _engineRowSortKey(trips, row) {
+  const i = row.otp === null ? row.motis : row.otp;
+  return String((trips[i] && trips[i].best.departure_at) || '');
 }
 
-function _assignBestToBucket(bucket, engine, item) {
-  // Within a pair-key bucket, the same engine could appear from two
-  // sessions (e.g. nap-fr-rail + nap-eu-corridors both found the
-  // train); pick whichever has the shorter best-trip duration as the
-  // representative — matches what _renderComparisonCell does anyway.
-  const slot = engine === 'otp' ? 'otpItem' : 'motisItem';
-  const prev = bucket[slot];
-  if (!prev || item.t.best.duration_seconds < prev.t.best.duration_seconds) {
-    bucket[slot] = item;
+function _engineRows(trips, comparison) {
+  const at = _slotIndexByEngine(trips);
+  const used = { otp: new Set(), motis: new Set() };
+  const rows = [];
+  for (const pair of (comparison.pairs || [])) {
+    const otp = at.otp.get(pair.left_id);
+    const motis = at.motis.get(pair.right_id);
+    if (otp === undefined || motis === undefined) continue;
+    used.otp.add(pair.left_id);
+    used.motis.add(pair.right_id);
+    rows.push({ otp, motis, verdict: pair.verdict, notes: pair.notes || [] });
   }
+  // Every journey the engine left unpaired keeps a row, with the
+  // sentences of why (its closest candidate's reasons).
+  const otpNotes = _notesById(comparison.left_only);
+  const motisNotes = _notesById(comparison.right_only);
+  for (const [id, i] of at.otp) {
+    if (!used.otp.has(id)) rows.push({ otp: i, motis: null, verdict: null, notes: otpNotes.get(id) || [] });
+  }
+  for (const [id, i] of at.motis) {
+    if (!used.motis.has(id)) rows.push({ otp: null, motis: i, verdict: null, notes: motisNotes.get(id) || [] });
+  }
+  // Chronological, whichever side has the journey.
+  rows.sort((a, b) => _engineRowSortKey(trips, a).localeCompare(_engineRowSortKey(trips, b)));
+  return rows;
 }
 
-function _bucketsForGrid(usable) {
-  const grouped = new Map();  // pairKey → {otpItem?, motisItem?, sortKey}
-  for (const item of usable) {
-    const key = _pairKey(item.t);
-    let bucket = grouped.get(key);
-    if (!bucket) {
-      bucket = { otpItem: null, motisItem: null, sortKey: String(item.t.best.departure_at) };
-      grouped.set(key, bucket);
-    }
-    if (item.engines.has('otp')) _assignBestToBucket(bucket, 'otp', item);
-    if (item.engines.has('motis')) _assignBestToBucket(bucket, 'motis', item);
-    // Track earliest departure across either engine for the sort.
-    const dep = String(item.t.best.departure_at);
-    if (dep < bucket.sortKey) bucket.sortKey = dep;
-  }
-  return Array.from(grouped.values()).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-}
-
-function _cellForBucket(bucketItem, engine) {
-  if (bucketItem) {
-    return _renderComparisonCell(bucketItem.t, engine, bucketItem.originalIndex);
-  }
+function _cellForRow(trips, index, engine) {
+  if (index !== null) return _renderComparisonCell(trips[index], engine, index);
   return `<div class="compare-cell missing">— not found by ${engine.toUpperCase()}</div>`;
 }
 
@@ -1311,8 +1246,8 @@ function _renderToggleControls() {
   // and calls render(_LAST_PAYLOAD) to rebuild.
   const checked = _COMPARE_TRAINS_ONLY ? 'checked' : '';
   const hint = _COMPARE_TRAINS_ONLY
-    ? 'pairing by transit-only signature (walk legs ignored, bus/tram/coach kept)'
-    : 'pairing by full-trip signature (today\'s default)';
+    ? 'transit time shown beside the total (walk legs left out, bus/tram/coach kept)'
+    : 'door-to-door time shown';
   // PR-194: the toggle skips WALK legs only; bus/tram/coach are kept.
   // Label corrected from the original misleading "trains only" — the
   // underlying filter never inspected mode beyond `mode !== 'WALK'`.
@@ -1326,14 +1261,18 @@ function _renderToggleControls() {
 }
 
 function renderComparisonGrid(payload) {
-  const usable = _usableTrips(payload, _engineForSession(payload));
-  const buckets = _bucketsForGrid(usable);
-  const cells = buckets.flatMap((b) => [
-    _cellForBucket(b.otpItem, 'otp'),
-    _cellForBucket(b.motisItem, 'motis'),
+  // No comparison from the server (an older answer): the flat list instead.
+  const comparison = payload.comparisons && payload.comparisons.engines;
+  if (!comparison) return '';
+  const trips = payload.trips || [];
+  const rows = _engineRows(trips, comparison);
+  if (!rows.length) return '';
+  const cells = rows.flatMap((row) => [
+    _cellForRow(trips, row.otp, 'otp'),
+    _cellForRow(trips, row.motis, 'motis'),
+    _pairNotesRow(row),
   ]);
-  if (!cells.length) return '';
-  return `${_renderToggleControls()}
+  return `${_renderToggleControls()}${_pairedGridSummary(comparison)}
   <div class="compare-grid">
     <div class="compare-header"><span class="engine-pill">OTP</span> sessions</div>
     <div class="compare-header"><span class="engine-pill motis">MOTIS</span> sessions</div>
@@ -1543,9 +1482,9 @@ function _pairViatorAndOebbTrips(viatorTrips, oebbTrips, comparison) {
     if (oebbUsed.has(i)) return;
     rows.push({ viator: null, viatorIndex: null, oebb: t, verdict: null, notes: oebbNotes.get(t.id) || [] });
   });
-  // Chronological, whichever side has a departure time (mirrors the
-  // sortKey approach `_bucketsForGrid` uses for the OTP-vs-MOTIS grid), so
-  // an early ÖBB-only journey is not buried under VIATOR's later ones.
+  // Chronological, whichever side has a departure time (as the
+  // OTP-vs-MOTIS grid's rows), so an early ÖBB-only journey is not buried
+  // under VIATOR's later ones.
   rows.sort((a, b) => _pairedGridRowSortKey(a).localeCompare(_pairedGridRowSortKey(b)));
   return rows;
 }
@@ -1571,15 +1510,18 @@ function _pairNotesRow(row) {
 }
 
 function _pairedGridSummary(comparison) {
-  // One line above the grid: the engine's counts (integers from the server).
+  // One line above a grid: the engine's counts (integers from the server),
+  // the sides named as the server names them (VIATOR / ÖBB, OTP / MOTIS).
   const s = comparison.summary || {};
   const n = (value) => Math.trunc(value || 0);
+  const left = escHTML(comparison.left || 'VIATOR');
+  const right = escHTML(comparison.right || 'ÖBB');
   return `<div class="comparison-strip">
-    <span class="cmp-label">VIATOR vs ÖBB:</span>
+    <span class="cmp-label">${left} vs ${right}:</span>
     <span class="cmp-count common">${n(s.same_service)} same service</span>
     <span class="cmp-count common">${n(s.probably_same)} probably the same</span>
-    <span class="cmp-count otp-only">${n(s.left_only)} VIATOR only</span>
-    <span class="cmp-count ojp-only">${n(s.right_only)} ÖBB only</span>
+    <span class="cmp-count otp-only">${n(s.left_only)} ${left} only</span>
+    <span class="cmp-count ojp-only">${n(s.right_only)} ${right} only</span>
   </div>`;
 }
 
@@ -1637,7 +1579,7 @@ function renderSideBySideGrid(payload, viatorCardsHtml) {
   //
   // Deliberately does NOT render `_renderToggleControls()` here: that
   // toggle flips `_COMPARE_TRAINS_ONLY`, which only the OTP-vs-MOTIS
-  // `renderComparisonGrid` pairing reads. The engine compares rides
+  // `renderComparisonGrid`'s durations read. The engine compares rides
   // (walks are never part of a match), so showing the checkbox here
   // would be an inert control that looks broken to an operator who
   // flips it and sees nothing change.

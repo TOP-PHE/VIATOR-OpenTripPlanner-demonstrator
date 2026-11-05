@@ -106,6 +106,11 @@ exist to feed them.
   sets the tolerances on the configuration page ("Journey matching").
 - With the Swiss OJP reference, each card says **common**, **VIATOR only** or **OJP only** by
   the same judgement.
+- With **All engines**, when both OTP and MOTIS answer, the results show in two columns, OTP and
+  MOTIS, with the same train on the same row (the same times within a minute: both engines read the
+  same timetables) and a note under a row when they still differ; a line above counts them. Tick
+  **Compare excluding walk legs** to see each journey's time on trains, buses and trams beside its
+  door-to-door time (the two engines often walk differently to and from the station).
 - A **"possible duplicate"** badge marks a second itinerary with identical departure *and*
   arrival — usually one physical train split into two portions (e.g. SNCF `601` and `601A`),
   which the data reports as two services.

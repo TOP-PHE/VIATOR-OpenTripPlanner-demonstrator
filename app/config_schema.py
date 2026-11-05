@@ -85,8 +85,9 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     # ── Journey matching (#304, docs/journey-matching-engine-design.md §10) ──
     # How a search pairs VIATOR's journeys with ÖBB's and with Swiss OJP's: the
     # profile `journey_reference` of `app/journey/matching/profiles.py` with these
-    # laid over it, read at each search. (The engine's `journey_engines` profile,
-    # OTP vs MOTIS, reads the same keys; nothing calls it yet.)
+    # laid over it, read at each search. (The OTP-vs-MOTIS grid uses the built-in
+    # `journey_engines` profile instead: the same feeds, 60 s; these keys' defaults
+    # would widen it to the references' 120 s.)
     # M1: first boarding and last alighting within these seconds.
     "JOURNEY_MATCH_DEPARTURE_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},
     "JOURNEY_MATCH_ARRIVAL_TOLERANCE_S": {"type": "int", "default": 120, "min": 0, "max": 1800},

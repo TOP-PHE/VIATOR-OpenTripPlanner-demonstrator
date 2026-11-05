@@ -70,7 +70,7 @@ def test_only_references_that_answered_are_compared() -> None:
         "hafas": {"status": "error", "trips": []},
     }
 
-    assert _run(api._compare_with_references(MagicMock(), {}, [], slots, refs)) == {}
+    assert _run(api._compare_journeys(MagicMock(), {}, [], slots, refs)) == {}
 
 
 def test_each_reference_gets_its_own_comparison() -> None:
@@ -78,9 +78,7 @@ def test_each_reference_gets_its_own_comparison() -> None:
     oebb = _answer(_oebb("hafas:oebb:0", "08:00", "09:15", number="540"))
     ojp = _answer(journey("ojp:ch:0", ride(WIEN, LINZ, "10:00", "11:15"), provider="ojp"))
 
-    found = _run(
-        api._compare_with_references(MagicMock(), {}, [], slots, {"ojp": ojp, "hafas": oebb})
-    )
+    found = _run(api._compare_journeys(MagicMock(), {}, [], slots, {"ojp": ojp, "hafas": oebb}))
 
     assert set(found) == {"ojp", "hafas"}
     assert [(p.left_id, p.right_id) for p in found["hafas"].pairs] == [
@@ -97,9 +95,9 @@ def test_the_journey_match_settings_are_read() -> None:
     oebb = _answer(_oebb("hafas:oebb:0", "08:08", "09:23", number="540"))
     refs: dict[str, dict[str, Any] | None] = {"hafas": oebb}
 
-    default = _run(api._compare_with_references(MagicMock(), {}, [], slots, refs))
+    default = _run(api._compare_journeys(MagicMock(), {}, [], slots, refs))
     wider = _run(
-        api._compare_with_references(
+        api._compare_journeys(
             MagicMock(),
             {
                 "JOURNEY_MATCH_DEPARTURE_TOLERANCE_S": 600,
@@ -178,7 +176,7 @@ def _module_on(
 def test_without_the_module_the_codeless_journeys_pair() -> None:
     slots, refs = _codeless()
 
-    found = _run(api._compare_with_references(MagicMock(), {}, [], slots, refs))
+    found = _run(api._compare_journeys(MagicMock(), {}, [], slots, refs))
 
     assert len(found["hafas"].pairs) == 1
 
@@ -188,7 +186,7 @@ def test_the_module_s_stations_decide_and_are_never_sent(monkeypatch: pytest.Mon
     steps = _module_on(monkeypatch, viator, oebb)
     slots, refs = _codeless()
 
-    found = _run(api._compare_with_references(MagicMock(), {}, [], slots, refs))
+    found = _run(api._compare_journeys(MagicMock(), {}, [], slots, refs))
 
     assert found["hafas"].pairs == []
     codes = {item.code for item in found["hafas"].left_only[0].reasons}
@@ -208,7 +206,7 @@ def test_ojp_s_stops_are_never_asked(monkeypatch: pytest.MonkeyPatch) -> None:
     slots, _ = _codeless()
     ojp = _answer(journey("ojp:ch:0", ride(WEST, ST_POELTEN, "08:00", "08:30"), provider="ojp"))
 
-    _run(api._compare_with_references(MagicMock(), {}, [], slots, {"ojp": ojp}))
+    _run(api._compare_journeys(MagicMock(), {}, [], slots, {"ojp": ojp}))
 
     assert oebb.asked == []
 
@@ -219,7 +217,7 @@ def test_a_slow_module_is_given_up_and_the_codes_decide(monkeypatch: pytest.Monk
     monkeypatch.setattr(api, "_STATION_BUDGET_S", 0.05)
     slots, refs = _codeless()
 
-    found = _run(api._compare_with_references(MagicMock(), {}, [], slots, refs))
+    found = _run(api._compare_journeys(MagicMock(), {}, [], slots, refs))
 
     assert len(found["hafas"].pairs) == 1
 
@@ -232,7 +230,7 @@ def test_a_failed_resolver_step_is_given_up(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(api, "db_step", failing)
     slots, refs = _codeless()
 
-    found = _run(api._compare_with_references(MagicMock(), {}, [], slots, refs))
+    found = _run(api._compare_journeys(MagicMock(), {}, [], slots, refs))
 
     assert len(found["hafas"].pairs) == 1
 
@@ -284,7 +282,7 @@ def test_the_page_gets_pairs_unpaired_journeys_and_sentences() -> None:
         JOURNEY_REFERENCE,
     )
 
-    sent = api._comparison_json(comparison, "ÖBB")
+    sent = api._comparison_json(comparison, "VIATOR", "ÖBB")
 
     assert (sent["left"], sent["right"], sent["profile"]) == ("VIATOR", "ÖBB", "journey_reference")
     assert [(p["left_id"], p["right_id"]) for p in sent["pairs"]] == [
@@ -303,7 +301,7 @@ def test_the_page_gets_pairs_unpaired_journeys_and_sentences() -> None:
 def test_a_journey_with_nothing_opposite_has_no_note() -> None:
     comparison = compare([_viator("motis:s1:0", "08:00", "09:15")], [], JOURNEY_REFERENCE)
 
-    sent = api._comparison_json(comparison, "ÖBB")
+    sent = api._comparison_json(comparison, "VIATOR", "ÖBB")
 
     assert sent["left_only"][0]["reasons"] == [r.NO_CANDIDATE]
     assert sent["left_only"][0]["notes"] == []
@@ -313,7 +311,7 @@ def test_hidden_reasons_are_codes_only_and_sentences_appear_once() -> None:
     same = r.reason(r.LINE_LABEL_DIFFERS, "warning", left_value="RJX", right_value="RJ")
     hidden = r.reason(r.LABEL_SPACING_ONLY, "info")
 
-    assert api._notes([same, hidden, same], "ÖBB") == ["line labels differ: RJX / RJ"]
+    assert api._notes([same, hidden, same], "VIATOR", "ÖBB") == ["line labels differ: RJX / RJ"]
 
 
 def test_no_station_id_reaches_the_page() -> None:
@@ -324,7 +322,7 @@ def test_no_station_id_reaches_the_page() -> None:
         JOURNEY_REFERENCE,
     )
 
-    assert "ZZ-00001" not in json.dumps(api._comparison_json(comparison, "ÖBB"))
+    assert "ZZ-00001" not in json.dumps(api._comparison_json(comparison, "VIATOR", "ÖBB"))
 
 
 # ── OJP's tags, in their shapes ───────────────────────────────────────────────────────────
