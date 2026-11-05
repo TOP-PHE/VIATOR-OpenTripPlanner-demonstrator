@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.network_coverage import external_verify, runner
+from app.network_coverage.alignment import CellAlignment
 from tests.unit import canonical_fixtures as fx
 
 # ─────────────────────── RunCreate.verify_externally validator ───────────────────────
@@ -377,12 +378,18 @@ async def test_sweep_writes_alignment_fields_on_successful_verify():
     with (
         patch.object(external_verify, "fetch_oebb_two_step", fake_verify),
         patch.object(runner, "_fetch_viator_journeys_for_search", return_value=[]),
-        patch.object(runner, "compute_alignment", return_value=(0.7, "mostly_agree")),
+        patch.object(
+            runner,
+            "compute_alignment",
+            return_value=CellAlignment(0.7, "mostly_agree", {"counts": {"probably_same": 1}}),
+        ),
     ):
         await runner._run_external_verify_sweep(db=db, run=run, rows=rows, cfg=fast_cfg)
 
     assert row.external_alignment_score == 0.7
     assert row.external_alignment_tier == "mostly_agree"
+    # #304 (M6): why the cell scored so is kept beside the score.
+    assert row.external_alignment_detail == {"counts": {"probably_same": 1}}
     # JSONB column was populated with ÖBB's journey as canonical JSON — pin
     # the length and the identity, not the exact shape, so a future field
     # addition doesn't break the test.

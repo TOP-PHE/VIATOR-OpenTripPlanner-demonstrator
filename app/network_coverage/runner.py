@@ -54,7 +54,9 @@ from ..db import SessionLocal
 from ..journey import planner_dispatch, recorder
 from ..journey.canonical import CanonicalJourney
 from ..journey.canonical.journey_fingerprint import fingerprint_of
+from ..journey.canonical.station_resolution import with_resolved_stations
 from ..journey.canonical_adapters.trip_dict import to_trip_dict
+from ..journey.matching import COVERAGE_ALIGNMENT, MatchProfile, profile_from_config
 from ..models import (
     JourneySearch,
     JourneySearchExecution,
@@ -71,7 +73,7 @@ from . import (
     verify_progress,  # the sweep's per-cell saving and progress
 )
 from .alignment import (
-    compute_alignment,  # PR-196a — graduated heatmap scorer
+    compute_alignment,  # #304 — the matching engine's cell score
     journeys_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
 )
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
@@ -261,6 +263,36 @@ class CoverageConfig:
     default_window_start: str = _DEFAULT_WINDOW_START_LOCAL
     default_window_end: str = _DEFAULT_WINDOW_END_LOCAL
     default_timezone: str = _DEFAULT_WINDOW_TIMEZONE
+    # #304 — the matching engine's `COVERAGE_MATCH_*` settings (design §10). A run frozen before
+    # #304 has none of them in its snapshot: it takes these defaults, the built-in profile's.
+    match_departure_tolerance_s: int = COVERAGE_ALIGNMENT.departure_tolerance_s
+    match_arrival_tolerance_s: int = COVERAGE_ALIGNMENT.arrival_tolerance_s
+    match_same_service_min_pct: int = round(COVERAGE_ALIGNMENT.same_service_min * 100)
+    match_probable_min_pct: int = round(COVERAGE_ALIGNMENT.probable_min * 100)
+    match_train_number_conflict: str = COVERAGE_ALIGNMENT.train_number_conflict
+    match_unresolved_endpoints: str = COVERAGE_ALIGNMENT.unresolved_endpoints
+    match_position_fallback_m: int = COVERAGE_ALIGNMENT.position_fallback_m
+    match_transfer_difference_s: int = COVERAGE_ALIGNMENT.transfer_difference_s
+
+
+# The `COVERAGE_MATCH_*` settings and the `CoverageConfig` field each one fills.
+_MATCH_SETTINGS = {
+    "COVERAGE_MATCH_DEPARTURE_TOLERANCE_S": "match_departure_tolerance_s",
+    "COVERAGE_MATCH_ARRIVAL_TOLERANCE_S": "match_arrival_tolerance_s",
+    "COVERAGE_MATCH_SAME_SERVICE_MIN_PCT": "match_same_service_min_pct",
+    "COVERAGE_MATCH_PROBABLE_MIN_PCT": "match_probable_min_pct",
+    "COVERAGE_MATCH_TRAIN_NUMBER_CONFLICT": "match_train_number_conflict",
+    "COVERAGE_MATCH_UNRESOLVED_ENDPOINTS": "match_unresolved_endpoints",
+    "COVERAGE_MATCH_POSITION_FALLBACK_M": "match_position_fallback_m",
+    "COVERAGE_MATCH_TRANSFER_DIFFERENCE_S": "match_transfer_difference_s",
+}
+
+
+def match_profile(cfg: CoverageConfig) -> MatchProfile:
+    """The matching engine's `coverage_alignment` profile with the run's frozen settings laid
+    over it (a value out of the profile's bounds keeps the built-in one)."""
+    values = {key: getattr(cfg, name) for key, name in _MATCH_SETTINGS.items()}
+    return profile_from_config(values, COVERAGE_ALIGNMENT.name)
 
 
 def _load_coverage_config(db: DbSession) -> CoverageConfig:
@@ -297,7 +329,14 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
         ),
         default_window_end=str(cfg.get("COVERAGE_DEFAULT_WINDOW_END", _DEFAULT_WINDOW_END_LOCAL)),
         default_timezone=str(cfg.get("COVERAGE_DEFAULT_TIMEZONE", _DEFAULT_WINDOW_TIMEZONE)),
+        **_match_settings_of(cfg),
     )
+
+
+def _match_settings_of(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The `COVERAGE_MATCH_*` settings present in the platform config, by `CoverageConfig`
+    field; a missing one keeps the field's default."""
+    return {name: cfg[key] for key, name in _MATCH_SETTINGS.items() if cfg.get(key) is not None}
 
 
 # ─────────────────────── cooperative-cancel registry ───────────────────────
@@ -1953,14 +1992,81 @@ def _persist_alignment_on_row(
     row: NetworkCoverageResult,
     viator_journeys: list[CanonicalJourney],
     oebb: list[CanonicalJourney],
+    *,
+    profile: MatchProfile | None = None,
+    resolved: tuple[list[CanonicalJourney], list[CanonicalJourney]] | None = None,
 ) -> None:
-    """PR-196a — score the (VIATOR, ÖBB) pair, persist ÖBB's journeys + score + tier onto the
-    row in-place. Extracted from the per-cell coroutine so the sweep stays under Sonar's
-    cognitive-complexity ceiling."""
-    score, tier = compute_alignment(viator_journeys, oebb)
+    """Score the (VIATOR, ÖBB) pair with the matching engine (#304) and put ÖBB's journeys, the
+    score, the tier and why (M6) onto the row in place. `resolved` are the same journeys with
+    their stations placed by the station module, for the scoring only: ÖBB's journeys are kept
+    as ÖBB answered them, no station id ever reaches the pages or the share link."""
+    scored_viator, scored_oebb = resolved if resolved is not None else (viator_journeys, oebb)
+    found = compute_alignment(scored_viator, scored_oebb, profile or COVERAGE_ALIGNMENT)
     row.external_journeys = [journey.model_dump(mode="json") for journey in oebb]
-    row.external_alignment_score = score
-    row.external_alignment_tier = tier
+    row.external_alignment_score = found.score
+    row.external_alignment_tier = found.tier
+    row.external_alignment_detail = found.detail
+
+
+class _SweepStations:
+    """The stations of a check's journeys (#304, design D8): a station resolver per VIATOR
+    session (`station_resolver.resolver_for_session`, built once, from the session's providers
+    and uploads) and ÖBB's numbers in `COVERAGE_OEBB_STOP_SERIES`. A journey is resolved by the
+    resolver of its own session (a fanout run mixes them), else the run's. Off when the station
+    module is not configured. Never fails a cell: a failure leaves the stops unplaced, and the
+    matching then falls back to codes and positions."""
+
+    def __init__(self, db: DbSession, run: NetworkCoverageRun) -> None:
+        from .. import station_module
+
+        self._db = db
+        self._run_session = run.session_id
+        self._enabled = station_module.enabled()
+        self._series: str | None = None
+        self._resolvers: dict[str | None, Any] = {}
+        if self._enabled:
+            series = config_service.get_all(db).get("COVERAGE_OEBB_STOP_SERIES")
+            self._series = str(series) if series else None
+
+    def _resolver(self, session_id: str | None) -> Any:
+        from ..journey.station_resolver import (
+            ModuleStationResolver,
+            SessionFeeds,
+            resolver_for_session,
+        )
+
+        if session_id not in self._resolvers:
+            row = self._db.get(SessionRow, session_id) if session_id else None
+            if row is None or not session_id:
+                resolver = ModuleStationResolver(SessionFeeds({}, {}), self._series)
+            else:
+                # The upload sender's module: it imports the extractor, which needs `fcntl`.
+                from ..station_extract_upload import latest_upload_sha256
+
+                resolver = resolver_for_session(
+                    row.config or {}, latest_upload_sha256(self._db, session_id), self._series
+                )
+            self._resolvers[session_id] = resolver
+        return self._resolvers[session_id]
+
+    async def resolve(self, journeys: list[CanonicalJourney]) -> list[CanonicalJourney]:
+        """The journeys with their stations placed where the module can, in their order."""
+        if not self._enabled or not journeys:
+            return journeys
+        try:
+            groups: dict[str | None, list[int]] = {}
+            for index, journey in enumerate(journeys):
+                groups.setdefault(journey.source.session_id or self._run_session, []).append(index)
+            placed = list(journeys)
+            for session_id, indices in groups.items():
+                resolver = self._resolver(session_id)
+                done = await with_resolved_stations([journeys[i] for i in indices], resolver)
+                for index, journey in zip(indices, done, strict=True):
+                    placed[index] = journey
+            return placed
+        except Exception as exc:  # a resolution never fails a cell
+            log.warning("coverage.stations_unresolved error=%s", type(exc).__name__)
+            return journeys
 
 
 async def _run_external_verify_sweep(
@@ -1998,6 +2104,7 @@ async def _run_external_verify_sweep(
     Returns rollup counters for run.summary."""
     cfg = cfg or CoverageConfig()
     counters: dict[str, int] = {"verified": 0, "ok": 0, "no_route": 0, "error": 0}
+    scoring = _CellScoring(match_profile(cfg), _SweepStations(db, run))
     semaphore = asyncio.Semaphore(cfg.verify_parallelism)
     sleep_seconds = cfg.verify_sleep_ms / 1000.0
 
@@ -2008,7 +2115,7 @@ async def _run_external_verify_sweep(
                 if writer is not None and writer.stopped:
                     return
                 asked = await _verify_cell(
-                    db=db, run=run, row=row, client=client, counters=counters
+                    db=db, run=run, row=row, client=client, counters=counters, scoring=scoring
                 )
                 if writer is not None:
                     writer.cell_checked(row)
@@ -2031,6 +2138,15 @@ async def _run_external_verify_sweep(
     return counters
 
 
+@dataclass(frozen=True)
+class _CellScoring:
+    """What every cell of a check is scored with: the run's matching profile and the stations
+    of its journeys."""
+
+    profile: MatchProfile
+    stations: _SweepStations | None = None
+
+
 async def _verify_cell(
     *,
     db: DbSession,
@@ -2038,6 +2154,7 @@ async def _verify_cell(
     row: NetworkCoverageResult,
     client: httpx.AsyncClient,
     counters: dict[str, int],
+    scoring: _CellScoring | None = None,
 ) -> bool:
     """One cell of the sweep: ask ÖBB, put the answer (or the error) on
     the row, count it. False when ÖBB was not asked (a hub is gone), so
@@ -2079,7 +2196,20 @@ async def _verify_cell(
         # which the scorer maps to no_service / one_sided
         # based on whether VIATOR returned anything.
         viator = _fetch_viator_journeys_for_search(db, row.journey_search_id, run.depart_at)
-        _persist_alignment_on_row(row, viator, oebb_journeys.journeys_from_answer(answer))
+        oebb = oebb_journeys.journeys_from_answer(answer)
+        resolved = None
+        if scoring is not None and scoring.stations is not None:
+            resolved = (
+                await scoring.stations.resolve(viator),
+                await scoring.stations.resolve(oebb),
+            )
+        _persist_alignment_on_row(
+            row,
+            viator,
+            oebb,
+            profile=scoring.profile if scoring is not None else None,
+            resolved=resolved,
+        )
         counters["verified"] += 1
         if verdict.error is not None:
             counters["error"] += 1

@@ -347,6 +347,10 @@ class NetworkCoverageResult(Base):
     external_journeys: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     external_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     external_alignment_tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #304 (M6): why the cell scored so, written with the score by the matching engine:
+    # `{engine_version, profile, counts: {...}, reasons: {code: n}}`
+    # (`alignment.CellAlignment.detail`); NULL before #304 and until the check asks ÖBB.
+    external_alignment_detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 # The CHECK of `network_coverage_hubs.uic_origin` (alembic 20261009_1200_hub_uic).
