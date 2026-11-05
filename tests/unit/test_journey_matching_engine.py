@@ -463,7 +463,7 @@ def test_the_same_train_to_munich_then_a_split_says_where_and_compares_the_waits
     rjx = {"published": "RJX 260"}
     viator = journey(
         "motis:0",
-        ride("Salzburg Hbf", "München Hbf", "08:00", "09:43", line="90", **{"published": "90"}),
+        ride("Salzburg Hbf", "München Hbf", "08:00", "09:43", line="90", published="90"),
         ride("München Hbf", "Zürich HB", "09:48", "13:28", line="88", published="88"),
         ride("Zürich HB", "Basel SBB", "13:34", "14:26", line="IR36", published="IR36"),
     )
