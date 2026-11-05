@@ -75,7 +75,8 @@ def test_a_snapshot_from_before_304_keeps_the_defaults() -> None:
     frozen = runner._config_from_snapshot(
         asdict(runner.CoverageConfig(match_position_fallback_m=0))
     )
-    assert frozen is not None and frozen.match_position_fallback_m == 0
+    assert frozen is not None
+    assert frozen.match_position_fallback_m == 0
 
 
 # ── A cell's score, tier and detail ───────────────────────────────────────────────────────
