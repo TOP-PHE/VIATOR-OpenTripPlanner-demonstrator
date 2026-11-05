@@ -2247,12 +2247,17 @@ def test_the_export_and_its_share_page_carry_no_code() -> None:
     assert "uic_origin" not in rows[0]
 
 
-def test_coverage_runs_never_import_the_station_module_client() -> None:
-    """A coverage run routes by the positions stored on the hubs; the
-    module's limits apply only to the administrator's clicks."""
+def test_coverage_runs_never_spend_a_person_s_module_limits() -> None:
+    """A coverage run routes by the positions stored on the hubs; a person's
+    module limits (search, lookup, near, resolve) apply only to the
+    administrator's clicks. Since #304 the ÖBB check places the stations of
+    its journeys through the station resolver, whose bulk call is a service
+    call counted on no person (MSMM decision 68): the one name of the client
+    a coverage file may use is `enabled`, nothing that calls the module."""
     for path in (REPO / "app" / "network_coverage").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        assert not re.search(r"\bstation_module\b", text), path.name
+        used = set(re.findall(r"\bstation_module\.(\w+)", text))
+        assert used <= {"enabled"}, (path.name, sorted(used))
 
 
 # ───────────────────────── the manage-hubs panel ─────────────────────────
