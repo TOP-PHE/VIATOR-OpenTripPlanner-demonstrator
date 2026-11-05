@@ -622,3 +622,34 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
   1 000 m, time-matched legs only, never station identity) and M8 (`splits_after_shared_ride`,
   `shorter_transfer`; no pair, so no coverage credit, §13 question 4) accepted. Every decision
   of §0.1 is now taken.
+- 2026-11-05 — as built, engine PR (#304, step 1 of 3: the engine; then the wiring of `/journey`,
+  then of coverage): `app/journey/matching/` as in §3, plus `spines.py` (rides, M10, the two
+  alignments) and `reasons.py` (codes, severities, the sentences of §9); the models of §3 live in
+  `engine.py`. Nothing calls it yet; the `JOURNEY_MATCH_*` / `COVERAGE_MATCH_*` settings are
+  declared by the wiring (`profile_from_config` already reads them from a mapping). Choices made
+  where the text left room:
+  - §5: a number is read from a published name only on a rail leg and only with 3 to 6 digits
+    (`S 7`, `RE 5` and a bus's `123` stay lines); a line also matches the other side's category
+    and line written together (ÖBB's `S` + `7` against MOTIS's `S7`); a line that is only the
+    train's label (HAFAS's `RJ 1141` with number 1141) counts as a number, not a line, so it
+    never conflicts with MOTIS's line code.
+  - §6: an end the module has placed on one side only falls back to the codes; a `location_only`
+    agreement counts as UNKNOWN for G3; M4's fallback applies to an end ride whose mode and
+    times agree, and to every end of an aligned ride.
+  - §4 alignment: two longest common subsequences, `route` (mode, no station CONFLICT, an
+    unknown station matching any) for the score's `route`, and `ride` (the same and both ends'
+    times within tolerance: the same vehicle) for the service comparison, G4, M4 and M8.
+  - §7: an exact pair scores 1.0 but is `probably_same`, not `same_service`, when a warning
+    stands (a line label or a same-minute number difference). A train-number CONFLICT counts 0 in
+    `service`; under `penalty` it also costs `line_conflict_penalty`.
+  - §8: ties are broken by journey id, never by input position, so the pairs do not depend on
+    the order of the input. Three reasons added to §9's vocabulary for unpaired journeys:
+    `no_candidate` (nothing on the other side), `score_too_low` (the verdict `different`, with
+    the score) and `paired_elsewhere` (the closest candidate went to a better match); and
+    `same_complex` (§6's second row).
+  - Measured on the worked examples: every row of §7 holds to the second decimal. **One
+    consequence of the weights to know**: at the tolerance on both ends (2 min early or late at
+    departure and arrival) the time component is 0, and even an equal train number does not
+    carry the pair (0.57 < 0.75, `different`); 2 min at one end, or 1 min at both, pairs as
+    `probably_same`. On the coverage run a ride both sides take had the same minutes on both
+    (§1.1), so this should be rare; the coverage wiring's reason counts will show it.
