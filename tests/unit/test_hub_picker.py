@@ -1097,3 +1097,16 @@ def test_the_picker_script_searches_holds_drops_and_stores(template_text: str) -
     assert out["afterFallbackRequests"] == 2
     assert out["staleCountry"] == ""
     assert (out["disabled"], out["enabled"]) == (True, True)
+
+
+def test_a_picked_station_s_name_is_readable() -> None:
+    """The result rows are buttons: the site-wide `button` rule (_base.html) makes their
+    text white and pushes them 1rem down. The picker's rule must undo both, or the
+    station's name is white on the light row (Tallinn-Balti, 6 Nov)."""
+    rule = next(
+        line
+        for line in TEMPLATE.read_text(encoding="utf-8").splitlines()
+        if line.startswith(".hub-pick-list button {")
+    )
+    assert "color: inherit" in rule
+    assert "margin-top: 0" in rule
