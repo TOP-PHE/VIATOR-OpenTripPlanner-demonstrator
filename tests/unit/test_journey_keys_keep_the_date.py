@@ -57,16 +57,20 @@ def test_a_time_is_rounded_to_the_minute_with_its_date(iso: str | None, rounded:
 
 
 def test_the_fingerprint_tells_two_days_apart() -> None:
-    assert transit_fingerprint([_leg("2026-11-08")]) == transit_fingerprint([_leg("2026-11-08")])
-    assert transit_fingerprint([_leg("2026-11-08")]) != transit_fingerprint([_leg("2026-11-10")])
+    saturday, again, monday = _leg("2026-11-08"), _leg("2026-11-08"), _leg("2026-11-10")
+
+    assert transit_fingerprint([saturday]) == transit_fingerprint([again])
+    assert transit_fingerprint([saturday]) != transit_fingerprint([monday])
 
 
 def test_the_merge_signature_tells_two_days_apart() -> None:
-    def sig(day: str) -> str:
-        return trip_signature(_db(), session_id="eu19", legs=[_leg(day)])
+    saturday, again, monday = _leg("2026-11-08"), _leg("2026-11-08"), _leg("2026-11-10")
+    signatures = [
+        trip_signature(_db(), session_id="eu19", legs=[leg]) for leg in (saturday, again, monday)
+    ]
 
-    assert sig("2026-11-08") == sig("2026-11-08")
-    assert sig("2026-11-08") != sig("2026-11-10")
+    assert signatures[0] == signatures[1]
+    assert signatures[0] != signatures[2]
 
 
 def test_a_session_is_listed_once_per_result_with_its_shorter_journey(
