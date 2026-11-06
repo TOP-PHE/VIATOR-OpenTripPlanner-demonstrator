@@ -22,6 +22,12 @@ This product includes software developed by third parties:
   * SNCF open data feeds (transport.data.gouv.fr)
     Licensed under the Open Database License (ODbL).
 
+  * Elron timetables (provider ELRON, Estonia): open data of the Estonian
+    public transport register. Source: Eesti ühistranspordiregister, Regionaal- ja Põllumajandusministeerium
+    (https://metadata.geoportaal.ee/geonetwork/inspire/api/records/fb06b0b6-4512-4885-9613-aaab2b96f467).
+    Terms equivalent to CC BY 4.0: credit the source in any public use; a
+    public application shows data no older than 7 days from its download.
+
   * Natural Earth 1:50m Admin-0 country boundaries
     (https://www.naturalearthdata.com, version 5.1.2) — bundled as
     app/data/country_borders.geojson for the OSM geographic-scope feature

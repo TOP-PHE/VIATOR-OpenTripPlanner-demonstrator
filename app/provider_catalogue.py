@@ -11,7 +11,9 @@ Operator workflow problem we solve:
     feed from a community one.
 
 `app/data/europe_extension_providers.json` holds them as provider objects
-plus three catalogue-only fields (`provenance`, `nap_reference`, `probe`).
+plus catalogue-only fields (`provenance`, `nap_reference`, `probe`, and
+`licence` where the data's terms are known: name, publisher, the credit to
+give, conditions, reference, date read).
 `plan_add()` says which would be added to a session; `session_provider()`
 strips the catalogue-only fields so the result passes
 `ingestion.normalize_providers`. Every entry is URL- or NAP-sourced, so
@@ -30,7 +32,9 @@ CATALOGUE_PATH = Path(__file__).parent / "data" / "europe_extension_providers.js
 
 PROVENANCES = ("nap", "official", "community")
 # Fields that describe the catalogue entry and never go into a session.
-CATALOGUE_ONLY_FIELDS = ("provenance", "nap_reference", "probe")
+CATALOGUE_ONLY_FIELDS = ("provenance", "nap_reference", "probe", "licence")
+# What a recorded licence must say.
+LICENCE_FIELDS = ("name", "publisher", "attribution", "conditions", "reference", "checked")
 # What a non-NAP label must carry so the standing shows wherever the
 # provider is listed (admin page, rebuild log, scripts).
 LABEL_MARKERS = {"official": "[official, ", "community": "[COMMUNITY - not NAP"}
