@@ -1195,7 +1195,8 @@ def _merge_by_signature(
 ) -> None:
     """Merge one session's journeys by signature for the response payload: the signature
     keeps its rules (on the journey's legs as today's dicts), `best` is the shortest
-    journey of the slot."""
+    journey of the slot. A session that gives the slot two journeys (same stops, minutes
+    and lines) is listed once, with the shorter."""
     from ..journey.signature import trip_signature
 
     for journey in journeys:
@@ -1212,13 +1213,16 @@ def _merge_by_signature(
                 "_journeys": {},
             },
         )
-        slot["found_in_sessions"].append(session_id)
-        slot["_journeys"][session_id] = journey
-        slot["by_session"][session_id] = {
-            "duration_seconds": journey.duration_seconds,
-            "departure_at": _instant_json(journey.departure),
-            "arrival_at": _instant_json(journey.arrival),
-        }
+        kept = slot["_journeys"].get(session_id)
+        if kept is None:
+            slot["found_in_sessions"].append(session_id)
+        if kept is None or journey.duration_seconds < kept.duration_seconds:
+            slot["_journeys"][session_id] = journey
+            slot["by_session"][session_id] = {
+                "duration_seconds": journey.duration_seconds,
+                "departure_at": _instant_json(journey.departure),
+                "arrival_at": _instant_json(journey.arrival),
+            }
         if journey.duration_seconds < slot["best"].duration_seconds:
             slot["best"] = journey
 

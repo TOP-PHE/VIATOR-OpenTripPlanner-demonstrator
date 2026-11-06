@@ -517,10 +517,16 @@ Same 22 keys from all four clients. Since #303 PR 3a every client builds them th
 
 - **`trip_signature(db, session_id, legs)`** — 16 hex chars, needs the database. Resolves stop ids
   to UIC via `stations_xref`, canonicalises route names via `route_aliases`, rounds coords to 4 dp
-  (~11 m). Written to `journey_trips.trip_signature` by `recorder`. Within-feed identity.
+  (~11 m). Written to `journey_trips.trip_signature` by `recorder`. Within-feed identity; the
+  fanout merges the sessions' journeys by it (`api/journey._merge_by_signature`).
 - **`transit_fingerprint(legs)`** — 16 hex chars, **DB-free by design** so it runs in unit tests and
   in the browser-facing request path alike. Strips every `WALK` / `TRANSFER` leg, then hashes
-  `MODE:STOP-STOP@HH:MM-HH:MM#ROUTE` per remaining leg.
+  `MODE:STOP-STOP@YYYY-MM-DDTHH:MM-YYYY-MM-DDTHH:MM#ROUTE` per remaining leg.
+
+Both keep each time's **date** (since 2026-11-06, `_round_minute`): the same train on another day
+is another journey. With HH:MM alone, a search answering over several days (Tallinn-Riga: four
+journeys over 8-10 November) had its days merged into one result showing one of them, and a
+reference engine's next page dropped a later day's train as a duplicate. Never drop the date again.
 
 The fingerprint is what makes VIATOR's core claim testable. Walks are stripped so an OJP itinerary
 with an explicit "walk to Pontarlier" access leg still matches an OTP itinerary that *started at*
