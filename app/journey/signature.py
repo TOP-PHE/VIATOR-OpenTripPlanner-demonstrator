@@ -4,7 +4,7 @@ Rules of the canonical form:
   - Stops resolved to UIC via stations_xref → master_stations.uic; missing UIC
     falls back to (lat,lon) rounded to 4 decimals (~11 m).
   - Route names canonicalised via route_aliases (alias → canonical_name).
-  - Times rounded to the minute.
+  - Times rounded to the minute, their date kept (another day is another trip).
   - Hash = sha256[:16] of '|'.join(per-leg fragments).
 """
 
@@ -46,15 +46,18 @@ def _route_canonical(db: DbSession, name: str | None) -> str:
 
 
 def _round_minute(iso: str | None) -> str:
+    """The time to the minute, its date kept: `2026-11-08T10:25` from `2026-11-08T10:25:00Z`.
+
+    The date is part of the key: the same train on another day is another trip. Without it, a
+    search answering over several days (a sparse line such as Tallinn-Riga, a night train) had
+    its days merged into one result showing one of them, and a reference engine's next page
+    dropped a later day's train as a duplicate."""
     if not iso:
         return "?"
     # Accept "YYYY-MM-DDTHH:MM:SS+TZ" or epoch-ish; just trim seconds.
     if "T" in iso:
-        # take HH:MM
-        try:
-            return iso.split("T", 1)[1][:5]
-        except IndexError:  # pragma: no cover
-            return "?"
+        day, _, clock = iso.partition("T")
+        return f"{day}T{clock[:5]}"
     return iso[:5]
 
 
@@ -264,7 +267,9 @@ def transit_fingerprint(legs: list[dict[str, Any]]) -> str:
 
     Per-transit-leg fragment::
 
-        MODE:STOP-STOP@HH:MM-HH:MM#ROUTE
+        MODE:STOP-STOP@YYYY-MM-DDTHH:MM-YYYY-MM-DDTHH:MM#ROUTE
+
+    (the date kept since 2026-11-06: the same train on another day is another journey)
 
     where each STOP is either ``UIC:NNNNNNN`` (parsed from the stop_id)
     or ``lat,lon`` rounded to 3 decimals (~110 m) when no UIC is

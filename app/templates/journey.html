@@ -1126,6 +1126,20 @@ function _railOnlyDurationSec(legs) {
   return total;
 }
 
+function _engineSessionRow(trip, engine) {
+  // The session row of `engine` a cell shows ({sid, row}, or null): of that
+  // engine's sessions that found the trip, the shortest. The server picks the
+  // engine's journey the same way (`_engine_sides`), and the grid's rows sort
+  // on it: never on `best`, which may be the other engine's.
+  const engineMap = _engineForSession(_LAST_PAYLOAD);
+  let shown = null;
+  for (const [sid, row] of Object.entries(trip.by_session || {})) {
+    if (engineMap.get(sid) !== engine) continue;
+    if (!shown || row.duration_seconds < shown.row.duration_seconds) shown = { sid, row };
+  }
+  return shown;
+}
+
 function _renderComparisonCell(trip, engine, tripIndex) {
   // Pick the per-session row for this engine — when multiple sessions of
   // the same engine found the trip, pick the one with the shortest
@@ -1133,16 +1147,9 @@ function _renderComparisonCell(trip, engine, tripIndex) {
   // side that's typically one session; for OTP it could be a national
   // session plus a corridor session both finding the same train.
   // No session of this engine → render the "missing" placeholder.
-  const engineMap = _engineForSession(_LAST_PAYLOAD);
-  let bestSid = null;
-  let bestRow = null;
-  for (const [sid, row] of Object.entries(trip.by_session || {})) {
-    if (engineMap.get(sid) !== engine) continue;
-    if (!bestRow || row.duration_seconds < bestRow.duration_seconds) {
-      bestSid = sid;
-      bestRow = row;
-    }
-  }
+  const shown = _engineSessionRow(trip, engine);
+  const bestSid = shown ? shown.sid : null;
+  const bestRow = shown ? shown.row : null;
   if (!bestRow) {
     return `<div class="compare-cell missing">— not found by ${engine.toUpperCase()}</div>`;
   }
@@ -1203,8 +1210,12 @@ function _slotIndexByEngine(trips) {
 }
 
 function _engineRowSortKey(trips, row) {
-  const i = row.otp === null ? row.motis : row.otp;
-  return String((trips[i] && trips[i].best.departure_at) || '');
+  // The departure the row's first cell shows (its OTP side, else its MOTIS side).
+  const engine = row.otp === null ? 'motis' : 'otp';
+  const trip = trips[row.otp === null ? row.motis : row.otp];
+  if (!trip) return '';
+  const shown = _engineSessionRow(trip, engine);
+  return String((shown && shown.row.departure_at) || trip.best.departure_at || '');
 }
 
 function _engineRows(trips, comparison) {

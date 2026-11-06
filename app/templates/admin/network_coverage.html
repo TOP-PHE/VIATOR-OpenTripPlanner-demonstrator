@@ -559,7 +559,9 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
 .hub-pick-list { list-style: none; margin: 0.3rem 0 0; padding: 0; max-height: 14rem; overflow-y: auto; }
 .hub-pick-list li { border-bottom: 1px dotted #eaeef2; }
 .hub-pick-list li:last-child { border-bottom: none; }
-.hub-pick-list button { display: block; width: 100%; text-align: left; padding: 0.3rem 0.4rem; font-size: 0.8rem; background: none; border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
+/* `color` and `margin-top` undo the site-wide `button` rule (_base.html: white text, 1rem above):
+   without them the station's name was white on this light row, unreadable. */
+.hub-pick-list button { display: block; width: 100%; text-align: left; padding: 0.3rem 0.4rem; margin-top: 0; font-size: 0.8rem; color: inherit; background: none; border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
 .hub-pick-list button:hover, .hub-pick-list button:focus-visible { border-color: var(--brand-blue); background: #f6f8fa; }
 .hub-pick-list button[aria-pressed="true"] { border-color: var(--brand-blue); background: #ddf4ff; }
 .hub-pick-list .hub-pick-meta { display: block; color: #5b6470; font-family: ui-monospace, monospace; font-size: 0.72rem; }

@@ -63,6 +63,7 @@ COMPARISON_HELPERS = [
     "_engineRowSortKey",
     "_engineRows",
     "_cellForRow",
+    "_engineSessionRow",
     "_notesById",
     "_pairNotesRow",
     "_pairedGridSummary",
@@ -107,6 +108,15 @@ def test_the_engines_grid_reads_the_server_s_pairs(template_text: str):
     assert "engine_journey_ids" in _body(template_text, "_slotIndexByEngine")
     for gone in ("_trainOnlySignature", "_pairKey", "_bucketsForGrid", "_normalizeMode"):
         assert f"function {gone}(" not in template_text, f"{gone} is back"
+
+
+def test_the_engines_grid_sorts_on_the_time_its_cells_show(template_text: str):
+    """A row sorts on the departure its first cell shows: that engine's session
+    row (`_engineSessionRow`, the same pick as the cell and as the server's
+    `_engine_sides`), never on the slot's `best`, which may be the other engine's
+    (Tallinn-Riga, 6 Nov: rows out of order)."""
+    assert "_engineSessionRow(trip, engine)" in _body(template_text, "_engineRowSortKey")
+    assert "_engineSessionRow(trip, engine)" in _body(template_text, "_renderComparisonCell")
 
 
 def test_the_summary_names_the_comparison_s_sides(template_text: str):
