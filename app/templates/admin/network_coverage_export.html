@@ -589,8 +589,9 @@
   const tripState = new Map();
 
   // #304 (M9) — a VIATOR trip after ÖBB's last connection is not compared: said on its card.
-  const TRIP_LATE_HTML = '<span class="late" title="ÖBB answers its next 5 connections only:'
-    + ' this journey leaves after the last one, so it is not compared (#304, M9).">'
+  const TRIP_LATE_HTML = '<span class="late" title="ÖBB answers 5 connections a page, and the'
+    + ' check asks a few pages at most: this journey leaves after the last one ÖBB gave, so it is'
+    + ' not compared (#304, M9).">'
     + 'after ÖBB’s last connection: not compared</span>';
 
   // #304 (M6) — why the cell scored so: the lines the server wrote from the cell's detail
