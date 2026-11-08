@@ -261,7 +261,8 @@ async def test_a_failed_later_page_keeps_the_earlier_pages_and_is_reported_as_pa
     assert (answer.pages, answer.stopped) == (3, oebb_journeys.STOP_ERROR)
     assert answer.page_error == "http: ReadTimeout"
     # The cell keeps ÖBB's answer: the verdict is no error, its connections are counted.
-    assert answer.verdict.error is None and answer.verdict.ok is True
+    assert answer.verdict.error is None
+    assert answer.verdict.ok is True
     assert answer.verdict.num_connections == 10
     assert len(answer.journeys) == 10
     assert answer.pages_detail() == {"asked": 3, "stopped": "error", "error": "http: ReadTimeout"}
@@ -316,7 +317,8 @@ async def test_journeys_of_several_pages_get_ids_unique_in_their_union() -> None
 
     ids = [j.id for j in answer.journeys]
     assert len(set(ids)) == len(ids) == 12
-    assert ids[0] == "hafas:oebb:0" and ids[-1] == "hafas:oebb:11"
+    assert ids[0] == "hafas:oebb:0"
+    assert ids[-1] == "hafas:oebb:11"
 
 
 @pytest.mark.asyncio
@@ -457,7 +459,8 @@ def test_a_run_frozen_before_the_setting_keeps_one_page_on_a_resume() -> None:
 
     frozen = runner._config_from_snapshot(before)
 
-    assert frozen is not None and frozen.verify_max_pages == 1
+    assert frozen is not None
+    assert frozen.verify_max_pages == 1
 
 
 def _hub(slug: str, lat: float, lon: float) -> MagicMock:
