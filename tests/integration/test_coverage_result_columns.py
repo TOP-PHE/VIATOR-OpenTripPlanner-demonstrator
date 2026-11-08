@@ -183,7 +183,8 @@ def test_the_polled_run_view_reads_no_cell_json(
     client: TestClient, sql: list[str], monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID
 ) -> None:
     now, before = _both_ways(client, sql, monkeypatch, f"/api/admin/network-coverage/runs/{run_id}")
-    assert _names(before, _JOURNEYS) and _names(before, _DETAIL)
+    assert _names(before, _JOURNEYS)
+    assert _names(before, _DETAIL)
     assert not _names(now, _JOURNEYS)
     assert not _names(now, _DETAIL)
     cells = client.get(f"/api/admin/network-coverage/runs/{run_id}").json()["results"]
