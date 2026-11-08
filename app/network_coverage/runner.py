@@ -44,10 +44,11 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from sqlalchemy import func, literal, select, update
+from sqlalchemy import Select, func, literal, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session as DbSession
+from sqlalchemy.orm import defer
 
 from .. import config_service
 from ..db import SessionLocal
@@ -3036,18 +3037,60 @@ def _percentile(values: list[int], p: float) -> int | None:
 
 
 def get_run_with_results(
-    db: DbSession, run_id: uuid.UUID
+    db: DbSession,
+    run_id: uuid.UUID,
+    *,
+    alignment_detail: bool = False,
+    external_journeys: bool = False,
 ) -> tuple[NetworkCoverageRun | None, list[NetworkCoverageResult]]:
-    """Fetch one run + all its results — used by the GET endpoint."""
+    """One run and every result row, for the pages that list every cell: the admin
+    run view (polled every 5 s), the share page and the downloaded report.
+
+    The rows carry the cell's summary columns only, unless asked (`results_query`):
+    `alignment_detail` adds why each cell scored so (the share page and the report
+    print it), `external_journeys` ÖBB's journeys (only the small-run download embeds
+    them; a cell's own detail is read by the cell-trips endpoints, one cell at a time).
+    """
     run = db.get(NetworkCoverageRun, run_id)
     if run is None:
         return None, []
-    results = (
-        db.execute(select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id))
-        .scalars()
-        .all()
+    query = results_query(
+        run_id, alignment_detail=alignment_detail, external_journeys=external_journeys
     )
-    return run, list(results)
+    return run, list(db.execute(query).scalars().all())
+
+
+def results_query(
+    run_id: uuid.UUID, *, alignment_detail: bool = False, external_journeys: bool = False
+) -> Select[NetworkCoverageResult]:
+    """The SELECT of a run's result rows, without the JSON columns not asked for.
+
+    `external_journeys` holds ÖBB's answer as canonical journeys (about five a cell,
+    each with its stops), so on a large run it is most of the bytes: loading it for
+    a 123-hub run (~7,500 cells) timed the share page out. A column left out is
+    deferred with `raiseload`: reading it raises instead of querying each row in turn.
+    """
+    left_out = [
+        column
+        for column, wanted in (
+            (NetworkCoverageResult.external_journeys, external_journeys),
+            (NetworkCoverageResult.external_alignment_detail, alignment_detail),
+        )
+        if not wanted
+    ]
+    query = select(NetworkCoverageResult).where(NetworkCoverageResult.run_id == run_id)
+    if left_out:
+        query = query.options(*(defer(column, raiseload=True) for column in left_out))
+    return query
+
+
+def count_results(db: DbSession, run_id: uuid.UUID) -> int:
+    """How many result rows a run has (the download decides its tier from it)."""
+    return db.execute(
+        select(func.count())
+        .select_from(NetworkCoverageResult)
+        .where(NetworkCoverageResult.run_id == run_id)
+    ).scalar_one()
 
 
 def list_recent_runs(db: DbSession, *, limit: int = 20) -> list[NetworkCoverageRun]:

@@ -147,7 +147,7 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
         ),
     ]
     monkeypatch.setattr(
-        coverage_share.runner, "get_run_with_results", lambda db, run_id: (run, results)
+        coverage_share.runner, "get_run_with_results", lambda db, run_id, **_kw: (run, results)
     )
     monkeypatch.setattr(coverage_share, "_resolve_hubs", lambda db: [_stub_hub_info()])
 
@@ -164,9 +164,28 @@ def test_share_link_succeeds_with_no_auth_headers(monkeypatch):
     assert '"trips": []' in resp.text
 
 
+def test_share_link_loads_the_rows_without_oebb_journeys(monkeypatch):
+    """The page embeds no journeys (each cell's come on click), so its rows are loaded
+    without ÖBB's `external_journeys` (loading them timed out a 123-hub run's page), but
+    with why each cell scored so, printed under the tier. The SELECT's columns are pinned
+    in test_coverage_result_columns.py."""
+    asked: dict = {}
+
+    def load(_db, _run_id, **flags):
+        asked.update(flags)
+        return None, []
+
+    monkeypatch.setattr(coverage_share.runner, "get_run_with_results", load)
+
+    resp = TestClient(_make_app()).get(f"/share/coverage/{uuid.uuid4()}")
+
+    assert resp.status_code == 404
+    assert asked == {"alignment_detail": True}
+
+
 def test_share_link_404_for_unknown_run(monkeypatch):
     monkeypatch.setattr(
-        coverage_share.runner, "get_run_with_results", lambda db, run_id: (None, [])
+        coverage_share.runner, "get_run_with_results", lambda db, run_id, **_kw: (None, [])
     )
 
     client = TestClient(_make_app())
@@ -180,7 +199,9 @@ def test_share_link_has_no_content_disposition_header(monkeypatch):
     inline — a Content-Disposition: attachment would force a download
     instead of opening in the recipient's browser."""
     run = _stub_run()
-    monkeypatch.setattr(coverage_share.runner, "get_run_with_results", lambda db, run_id: (run, []))
+    monkeypatch.setattr(
+        coverage_share.runner, "get_run_with_results", lambda db, run_id, **_kw: (run, [])
+    )
     monkeypatch.setattr(coverage_share, "_resolve_hubs", lambda db: [_stub_hub_info()])
 
     client = TestClient(_make_app())

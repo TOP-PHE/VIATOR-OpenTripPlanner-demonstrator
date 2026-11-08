@@ -2768,6 +2768,31 @@ design `docs/journey-matching-engine-design.md`), on the server:
   shown (transit time beside the total): walks never count in a pair.
 - **Unchanged**: the three-column layout with OJP and ÖBB together stays unaligned.
 
+### 6.30 A large coverage run's share link times out (502), or its page is slow
+
+**Symptom** (8 Nov 2026, a run of 123 hubs, ~7,500 cells, checked by ÖBB): the share link
+`/share/coverage/<run id>` never opens (120 s without an answer, then `502 Bad Gateway` from the
+proxy after ~460 s), while a click on one cell answers at once. The coverage page polls the
+same run every 5 s and also loads the database while it is open.
+
+**Cause**: the share page, the run view and the download loaded every column of every cell,
+ÖBB's journeys (`external_journeys`, about five a cell) included, although none of the three
+draws them for every cell: a cell's journeys are read when it is clicked.
+
+**Since the fix** each page reads only what it draws:
+
+| Page | Reads for every cell |
+|---|---|
+| Coverage page, run view (`GET /api/admin/network-coverage/runs/<id>`, every 5 s) | the summary: status, times, counts, ÖBB's verdict, the tier and score |
+| Share link (`/share/coverage/<id>`) | the summary + why the cell scored so (the lines under its tier) |
+| Download HTML report, run of ≤ 500 cells | everything: the summary, why, ÖBB's journeys (the offline side-by-side) |
+| Download HTML report, run of > 500 cells | the summary + why (no legs, no ÖBB journeys, as before) |
+
+The pages show the same as before. If a page of a large run is still slow, look at the web
+log's request time for `/share/coverage/` and the rows of the run
+(`SELECT count(*) FROM network_coverage_results WHERE run_id = '<id>'`): the page grows with
+the number of cells, not with their journeys.
+
 ## 7. Rollback
 
 If a deploy breaks production, roll back in under a minute:

@@ -261,9 +261,9 @@ and is off unless both are set.
 | GET | `.../hubs/countries` | The picker's countries: `station_module.countries()` (`source: module`), else `osm_geo.COUNTRY_NAMES` (`source: viator`); names from `osm_geo.BUNDLED_COUNTRY_NAMES` (every bundled country, #411; also the hubs list's country headers) | platform_admin |
 | POST | `.../hubs/check` | Re-read ≤20 hubs a click with one lookup, by `station_id` when set, else by code (an unanswered id with a code: the code in a second lookup, `id_not_answered`; that lookup failing gives `no_answer` with `retry_after`, never `not_served`); shows every hub with the code origin and licence read live (D-R11 A), unserved stations and differing names; writes only `station_id` (an alias moved to its survivor, a missing id filled), guarded (`changed_meanwhile`), never a code | platform_admin |
 | GET/POST | `.../runs` | List runs / start a run (creates it `pending`; the worker's coverage executor runs it, #392) | platform_admin |
-| GET | `.../runs/{id}` | Run summary + every cell — the matrix poll (5 s) | platform_admin |
+| GET | `.../runs/{id}` | Run summary + every cell's summary columns — the matrix poll (5 s); no cell's JSON (ÖBB's journeys, why it scored so: the drilldown reads them) | platform_admin |
 | POST | `.../runs/{id}/stop` | Cooperative cancel; 409 if not `running` | platform_admin |
-| GET | `.../runs/{id}/export.html` | Self-contained offline HTML report | platform_admin |
+| GET | `.../runs/{id}/export.html` | Self-contained offline HTML report; up to `_EXPORT_LEG_DETAIL_MAX_PAIRS` (500) cells it embeds legs and ÖBB's journeys, above it neither (and reads no ÖBB journey) | platform_admin |
 | GET | `.../runs/{id}/cells/{o}/{d}/trips` | Cell drilldown (outbound + `return`) | platform_admin |
 | GET | `.../runs/{id}/cells/{o}/{d}/verify-external` | Live ÖBB check, **not persisted** | platform_admin |
 | GET/PATCH | `/api/admin/config` | Read (masked) / patch `platform_config` | platform_admin |
@@ -773,6 +773,14 @@ columns) and ÖBB's `external_journeys`, and the pages turn them into their disp
 `app/static/js/canonical_view.js` (the report embeds its text). The share endpoint sends every
 journey through `coverage_share.shared_journey`, a projection to what the page draws.
 
+The pages that list every cell of a run load its rows through `runner.get_run_with_results`,
+which reads the summary columns only unless asked (`runner.results_query`): the admin run view
+(polled every 5 s) reads no JSON column, the share page (`/share/coverage/{run_id}`) adds
+`external_alignment_detail`, the download adds it too and `external_journeys` only when the run
+has at most `_EXPORT_LEG_DETAIL_MAX_PAIRS` rows (counted first, `runner.count_results`). One cell's
+journeys, VIATOR's and ÖBB's, are read by the cell-trips endpoints, admin and share, when the
+cell is clicked.
+
 ### Invariants & traps
 
 - **Coverage runs execute in the `worker` container, not `web` (#392).** The executor claims a
@@ -868,6 +876,16 @@ journey through `coverage_share.shared_journey`, a projection to what the page d
 - **Hub slugs are not FK-constrained** on `network_coverage_results`, so retiring a hub
   does not orphan history — but a soft-deleted hub makes the verify sweep write
   `external_error='hub_missing'` for that cell.
+- **A page listing every cell never loads every cell's journeys.** `external_journeys`
+  (ÖBB's canonical journeys, about five a cell, each with its stops) is most of a result
+  row's bytes: loading it with the rows of a 123-hub run (~7,500 cells) made the share page
+  time out (8 Nov 2026: 120 s, then a 502 from the proxy after 459 s), and the admin run view
+  loaded the same every 5 s. `runner.get_run_with_results` reads a JSON column only when the
+  caller asks for it; one left out is deferred with `raiseload`, so reading it raises instead
+  of querying the rows one by one. A new column of `network_coverage_results` fails
+  `tests/unit/test_coverage_result_columns.py` until it is sorted into the summary columns or
+  left out of those pages' SELECT; `tests/integration/test_coverage_result_columns.py` checks
+  that the three pages answer byte for byte what a load of every column gives.
 - **A known open bug:** `completed_pairs` is incremented per-pair with a bare `UPDATE ...
   SET completed_pairs = completed_pairs + 1` and *also* recomputed wholesale in
   `_persist_cancelled_run` / `_finalise_completed_run`. A cancelled run has been observed
