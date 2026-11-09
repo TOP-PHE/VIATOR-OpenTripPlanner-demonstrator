@@ -3004,17 +3004,24 @@ def export_run_html(
     leg-by-leg detail from embedded trips — the full-detail file for a
     94-hub run is ~150MB, which downloads fine but no browser will open.
     Trip summaries (times, duration, transfers, modes) stay, and the
-    modal points at the online share link for full depth.
+    modal points at the online share link for full depth. ÖBB's journeys
+    (`external_journeys`) follow the same tier: the rows of a large run are
+    loaded without them, so they never leave Postgres.
 
     Implementation: data-shaping lives in `_build_export_context` so it's
     unit-testable without DB. This function is thin orchestration:
     query → marshal → render → set download header.
     """
-    run, results = runner.get_run_with_results(db, run_id)
+    # Counted first, so ÖBB's journeys are read only for a run small enough to embed them.
+    small = runner.count_results(db, run_id) <= _EXPORT_LEG_DETAIL_MAX_PAIRS
+    run, results = runner.get_run_with_results(
+        db, run_id, alignment_detail=True, external_journeys=small
+    )
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
     search_ids = [r.journey_search_id for r in results if r.journey_search_id is not None]
-    include_legs = len(results) <= _EXPORT_LEG_DETAIL_MAX_PAIRS
+    # A running run may have gained rows since the count: the rows loaded decide.
+    include_legs = small and len(results) <= _EXPORT_LEG_DETAIL_MAX_PAIRS
     cfg = runner._load_coverage_config(db)
     context = _build_export_context(
         run=run,
@@ -3140,7 +3147,10 @@ def get_run(
     _: Annotated[CurrentUser, Depends(require_platform_admin)],
 ) -> RunDetail:
     """Fetch one run + every result row. Polled by the UI every 5s while
-    the run is in 'running' status; static once 'completed'."""
+    the run is in 'running' status; static once 'completed'.
+
+    Summary columns only: the cell's JSON (ÖBB's journeys, why it scored so)
+    is read by `get_cell_trips` when a cell is clicked."""
     run, results = runner.get_run_with_results(db, run_id)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
