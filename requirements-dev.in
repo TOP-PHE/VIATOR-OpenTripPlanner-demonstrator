@@ -20,7 +20,7 @@
 # `asyncio_mode = "auto"` in pyproject.toml so test code doesn't need
 # to be re-decorated with @pytest.mark.asyncio.
 pytest==9.2.0
-pytest-asyncio==1.4.1
+pytest-asyncio==1.4.1.post1
 pytest-cov==7.1.0
 httpx==0.28.1               # FastAPI async test client
 
