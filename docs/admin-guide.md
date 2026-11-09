@@ -2412,7 +2412,11 @@ score every cell. It asks two cells at a time with a half-second pause, about
 **one cell a second**: roughly 1–2 h more per 3 600 pairs, so a full eu19
 matrix of 12 882 pairs takes 4 to 7 hours after its last pair. (The checkbox
 used to promise "~1–5 min": that was true only of the failed cells of a small
-run.)
+run.) **Since `COVERAGE_VERIFY_MAX_PAGES` (§6.30)** a cell whose VIATOR
+journeys run later than ÖBB's first 5 connections asks ÖBB up to 3 pages, each
+one request more and the same half-second pause: these figures are those of one
+page a cell, and the check now takes longer (an estimate from run 4700065d's
+figures, not yet measured: about half as long again with the default of 3).
 
 What the page shows meanwhile:
 
@@ -2444,16 +2448,18 @@ early, cancel the run by SQL: `UPDATE network_coverage_runs SET status =
 'cancelled' WHERE id = '<run id>';`. The worker stops asking ÖBB within
 about 5 s, keeps the cancel, and the answers already saved stay on the cells.
 
-Following it in the worker log: one `hafas.trip_search.request` line per cell
-asked, and every 500 saved answers `external-verify progress run=… done=…
-total=…`:
+Following it in the worker log: one `hafas.trip_search.request` line per page
+asked (one to `COVERAGE_VERIFY_MAX_PAGES` per cell, §6.30), and every 500
+saved answers `external-verify progress run=… done=… total=…`, which counts
+cells:
 
 ```bash
 docker compose -p viator logs worker --since 10m | grep -c hafas.trip_search.request
 docker compose -p viator logs worker | grep "external-verify"
 ```
 
-About 300–600 cells in 10 minutes is the normal pace. A *progress write
+About 300–600 requests in 10 minutes is the normal pace (one page a cell gave
+as many cells; with later pages, fewer cells for the same count). A *progress write
 failed* warning (the database briefly away) loses nothing: those answers go
 with the next write, and the final commit writes every answer anyway.
 
@@ -2723,7 +2729,8 @@ a pair changed, so **scores of runs before and after are not comparable**: run a
   station id, and only codes and positions are compared.
 - **ÖBB's window**: only VIATOR journeys whose first boarding lies within ÖBB's span (its first to
   its last connection, ±2 min) are compared; the others are counted as "after ÖBB's last
-  connection", never as VIATOR-only.
+  connection", never as VIATOR-only. The span runs over every page of connections the check
+  asked (§6.30).
 - **Why**: each cell keeps `external_alignment_detail` (counts by verdict, journeys outside ÖBB's
   window, and how often each reason was met: `shorter_transfer`, `line_label_differs`,
   `stations_by_position`, ...). The cell modal, the downloaded report and the share page list it
@@ -2768,7 +2775,51 @@ design `docs/journey-matching-engine-design.md`), on the server:
   shown (transit time beside the total): walks never count in a pair.
 - **Unchanged**: the three-column layout with OJP and ÖBB together stays unaligned.
 
-### 6.30 A large coverage run's share link times out (502), or its page is slow
+### 6.30 The ÖBB check asks more than one page of connections (`COVERAGE_VERIFY_MAX_PAGES`)
+
+One ÖBB `TripSearch` answers its **next 5 connections** from the run's departure time. On run
+4700065d (123 hubs, ~7 500 cells) that covered a median of 3.8 h, while VIATOR's journeys in the
+same cell covered 6.3 h: in 61 % of the directions VIATOR had journeys after ÖBB's last
+connection, and those are not compared (§6.28, "after ÖBB's last connection"), the biggest single
+reason for poor agreement.
+
+So the check now asks again: after page 1 it sends one more `TripSearch` between the same two
+stations from one minute after ÖBB's last departure, and so on, **until ÖBB's last departure
+reaches VIATOR's last first boarding in that cell** (less the 2 min tolerance), or one of these
+stops it:
+
+| Stops the paging | Kept in the cell's detail as `oebb_pages.stopped` |
+|---|---|
+| ÖBB's last departure reached VIATOR's last one (or page 1 already did) | `covered` |
+| `COVERAGE_VERIFY_MAX_PAGES` pages asked, page 1 included | `max_pages` |
+| A page with no connection: ÖBB has none later | `no_more` |
+| A page of connections already seen | `no_progress` |
+| The cell's time budget, twice `COVERAGE_VERIFY_TIMEOUT_S` (60 s) from its first request | `budget` |
+| A later page failed (timeout, HTTP error): the earlier pages are kept and scored | `error` (+ `oebb_pages.error`) |
+
+A connection seen on an earlier page is not counted twice. ÖBB's verdict on the cell (connections
+found, best duration) counts every page, and **the scoring window spans every page** (§6.28). A
+cell where VIATOR found nothing, or ÖBB found nothing or could not be asked, asks one page as
+before.
+
+- **The setting**: Admin → Configuration → "Network coverage matrix" →
+  `COVERAGE_VERIFY_MAX_PAGES`, **3** by default, 1 to 10; **1** asks one page as before. Measured
+  on 2 500 cells of run 4700065d, among the directions where VIATOR ran later than ÖBB's first
+  page: 3 pages cover 72 %, 4 pages 83 % (median need 2.2 pages). A run uses the value of its
+  first execution (frozen with its other knobs); a run frozen before this setting existed keeps
+  one page when it resumes.
+- **ÖBB's load**: the pause `COVERAGE_VERIFY_SLEEP_MS` (500 ms) is waited before each later page
+  too, inside the cell's slot, so `COVERAGE_VERIFY_PARALLELISM` (2) still bounds the requests in
+  flight. A later page costs one request (page 1 costs two: the station lookup, then the search).
+- **Time**: the check runs after the last pair (§6.21), so the extra pages lengthen it. Not yet
+  measured on a full run.
+- **On the pages**: a cell asked over several pages says so under its tier ("ÖBB answered over 3
+  pages", "…, the most a cell asks for" when the cap stopped it, or "ÖBB's page 3 could not be
+  read: its first 2 pages are compared"); the error itself is in the worker log
+  (`coverage.oebb_pages stopped at page …`), not on the share page. A VIATOR trip still after the
+  last page's connections keeps its "after ÖBB's last connection" mark.
+
+### 6.31 A large coverage run's share link times out (502), or its page is slow
 
 **Symptom** (8 Nov 2026, a run of 123 hubs, ~7,500 cells, checked by ÖBB): the share link
 `/share/coverage/<run id>` never opens (120 s without an answer, then `502 Bad Gateway` from the

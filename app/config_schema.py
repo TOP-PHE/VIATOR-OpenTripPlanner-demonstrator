@@ -144,6 +144,15 @@ CONFIG_SCHEMA: dict[str, FieldSpec] = {
     "COVERAGE_VERIFY_PARALLELISM": {"type": "int", "default": 2, "min": 1, "max": 10},
     "COVERAGE_VERIFY_TIMEOUT_S": {"type": "int", "default": 30, "min": 5, "max": 300},
     "COVERAGE_VERIFY_SLEEP_MS": {"type": "int", "default": 500, "min": 0, "max": 10000},
+    # How many pages of ÖBB connections (5 a page, `numF: 5`) the check may ask
+    # per cell, page 1 included: later pages are asked from just after ÖBB's
+    # last departure until it reaches VIATOR's last first boarding in the cell
+    # (`oebb_journeys.fetch_cell_answer`), with COVERAGE_VERIFY_SLEEP_MS between
+    # pages and twice COVERAGE_VERIFY_TIMEOUT_S for all of a cell's pages.
+    # 1 = one page, as before. Measured on run 4700065d: of the directions where
+    # VIATOR had journeys after ÖBB's last connection, 3 pages cover 72 %, 4
+    # pages 83 %.
+    "COVERAGE_VERIFY_MAX_PAGES": {"type": "int", "default": 3, "min": 1, "max": 10},
     # The code series of the station module under which ÖBB HAFAS's own stop
     # numbers (its `extId`, an EVA number such as 8100042 for Bischofshofen)
     # are filed. The cell modal asks the module, by `POST /stops/resolve

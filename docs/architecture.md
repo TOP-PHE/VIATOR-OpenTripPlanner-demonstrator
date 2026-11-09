@@ -710,7 +710,10 @@ event, both before and inside the semaphore.
 *even for Köln Hbf and Frankfurt (Main) Hbf* — its coord-snap is stricter than DB's was.
 So: (1) `LocGeoPos` with a 5 km ring, `getStops=true, getPOIs=false, maxLoc=1`, resolving
 both endpoints in one POST, then (2) `TripSearch` with `type:"S"` and the resolved lids,
-`numF=5`. ÖBB rather than DB because `reiseauskunft.bahn.de/bin/mgate.exe` was retired in
+`numF=5`. The coverage check then asks later pages, one `TripSearch` each between the same
+lids from just after ÖBB's last departure (`fetch_oebb_trip_search`,
+`oebb_journeys.fetch_cell_answer`), until ÖBB reaches the cell's last VIATOR boarding or
+`COVERAGE_VERIFY_MAX_PAGES` (default 3). ÖBB rather than DB because `reiseauskunft.bahn.de/bin/mgate.exe` was retired in
 mid-2026; ÖBB's instance is alive and, verified on 43 corridor pairs, covers DACH +
 cross-border + Eurostar/TGV/AVE/Iberian/Nordic — the one confirmed hole being Norwegian
 domestic. The module identifies itself honestly (`VIATOR-coverage-verify/1.0`) rather than
@@ -833,9 +836,13 @@ cell is clicked.
   **Every alignment score written before this fix was computed from coordinates** and is
   NULLed by migration `20260908_1200_null_pre_extid`; a re-sweep is required.
 - **The sweep compares a full day against a single moment.** VIATOR's side is every trip
-  found across all K slots of the run window; the ÖBB side is one `TripSearch` anchored at
+  found across all K slots of the run window; the ÖBB side was one `TripSearch` anchored at
   `run.depart_at` with `numF=5`. Even with a correct UIC parser, that asymmetry
-  systematically depresses scores on wide windows.
+  systematically depresses scores on wide windows. *Since #304* only VIATOR journeys within
+  ÖBB's span are scored (M9); *since the paging change* the check asks ÖBB's later pages
+  until its span reaches the cell's last VIATOR boarding, at most `COVERAGE_VERIFY_MAX_PAGES`
+  (3 by default: 72 % of the directions that needed more on run 4700065d, 4 pages 83 %).
+  Whatever lies after the last page asked is counted, not scored.
 - **The tier vocabulary is hardcoded to ÖBB.** `one_sided_oebb` is a literal in
   `_classify_score` and a `String(32)` value in the DB. Adding a second reference planner
   (OJP, SNCF) means either a migration or a per-oracle tier namespace.

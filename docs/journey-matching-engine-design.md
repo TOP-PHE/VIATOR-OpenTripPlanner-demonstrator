@@ -40,7 +40,7 @@ the tolerances, weights and policies; their main knobs are platform settings.
 | M6 | Coverage scores after the switch | Scores change (tolerant pairing, folded modes, normalised labels), so coverage runs are run again. Runs scored before the switch can be deleted like the others (#303 D1, no backward compatibility). One new nullable column holds the scorer version and the reason counts per cell. |
 | M7 | Where the knobs live | Tolerances, thresholds and the three policies (M2–M4) as `JOURNEY_MATCH_*` / `COVERAGE_MATCH_*` platform settings; weights in code per profile (documented, unit-tested); coverage freezes its knobs in the run's `execution_snapshot` like every other `COVERAGE_*` knob. |
 | M8 | Journeys that share some rides, not all (§1.1 a, b) | **No pair** (the gates are unchanged), but the unpaired journey's reason says how it relates to its closest counterpart and where: `splits_after_shared_ride` "same train to München Hbf, then different trains", and `shorter_transfer` "VIATOR changes at München Hbf in 5 min, ÖBB in 19 min" when one side's change is at least `transfer_difference_s` (300 s) shorter; `rejoins_after_split`; `other_first_or_last_ride`. Coverage counts them per cell (M6's column), so "VIATOR's connections are shorter than ÖBB's" reads apart from "no overlap". Measured: 44 % of ÖBB connections share rides with a VIATOR journey, then split (32 %) or split and rejoin (12 %). Worked example: §0.2. *Owner 2026-11-05: accepted.* |
-| M9 | Which VIATOR journeys a coverage cell compares (§1.1 e) | **Only those whose first boarding lies within ÖBB's span**: from ÖBB's first to its last first boarding, plus the departure tolerance. ÖBB answers 5 connections from the run's departure time (about 4 h); VIATOR's 10 cover the day. The others are `outside_reference_window` (info): neither `left_only` nor counted. Measured: 52 % of VIATOR's journeys are outside. *Owner 2026-11-05: accepted.* |
+| M9 | Which VIATOR journeys a coverage cell compares (§1.1 e) | **Only those whose first boarding lies within ÖBB's span**: from ÖBB's first to its last first boarding, plus the departure tolerance. ÖBB answers 5 connections from the run's departure time (about 4 h); VIATOR's 10 cover the day. The others are `outside_reference_window` (info): neither `left_only` nor counted. Measured: 52 % of VIATOR's journeys are outside. *Owner 2026-11-05: accepted.* *Since 2026-11-08 the check asks ÖBB's later pages toward VIATOR's last boarding, at most `COVERAGE_VERIFY_MAX_PAGES` (3), and the span runs over every page (changelog).* |
 | M10 | A local ride only one side has (§1.1 a) | **Compared like an access walk**: a leading or trailing TRAM, BUS, SUBWAY, FERRY, CABLE_CAR or FUNICULAR leg that aligns with nothing on the other side, while the other side has no leg there, is left out of the gates, marked `local_access_ride` (info). MOTIS starts some journeys with a tram from the hub's point to the station; ÖBB starts at the station. Measured: 3 % of ÖBB connections. `SUBURBAN` and rail are never trimmed (Graz's S7 is the main ride). *Owner 2026-11-05: accepted.* |
 
 ### 0.2 M4's fallback and M8 by example
@@ -720,3 +720,25 @@ on "renders `comparisons[…].pairs`" and "prints reasons with `textContent`".
     "Compare excluding walk legs" changes the durations shown only.
   - `_compare_with_references` became `_compare_journeys`. Still not aligned: the three-column
     layout with OJP and ÖBB together. Not checked in a browser before merging.
+- 2026-11-08 — as built, ÖBB's later pages on coverage (M9's other half). Measured on run 4700065d
+  (123 hubs, ~7 500 cells): one ÖBB page (`numF: 5`) spans a median of 3.8 h against VIATOR's
+  6.3 h; in 61 % of the directions VIATOR had journeys after ÖBB's last connection, and the
+  41 639 journeys left "not compared" were the biggest single reason for poor agreement. The
+  check (`oebb_journeys.fetch_cell_answer`) now asks ÖBB again, one `TripSearch` a page between
+  the lids page 1 resolved (`external_verify.fetch_oebb_trip_search`), from one minute after
+  ÖBB's last departure, until that reaches VIATOR's last first boarding in the cell less the
+  departure tolerance (`alignment.last_boarding_to_cover`: then `reference_window` holds every
+  VIATOR journey), at most `COVERAGE_VERIFY_MAX_PAGES` pages (default 3, 1 = one page as before;
+  on 2 500 cells of that run 3 pages cover 72 % of the directions that needed more, 4 pages
+  83 %). It mirrors `/journey`'s `hafas_client.fetch_plan_paginated` with the shared
+  `trip_normalize` helpers: a connection of an earlier page is dropped, an empty or all-seen page
+  stops it, one time budget for the cell's pages (twice `COVERAGE_VERIFY_TIMEOUT_S`), and a later
+  page that fails keeps the earlier pages (the cell's verdict stays page 1's, its error is not
+  the cell's). `COVERAGE_VERIFY_SLEEP_MS` is waited before each later page, inside the cell's
+  slot. ÖBB's journeys of every page are stored (`external_journeys`, renumbered) and scored, so
+  M9's span runs over every page; the verdict counts every page's connections and their
+  shortest. The cell's detail keeps `oebb_pages {asked, stopped, error?}`; the pages print "ÖBB
+  answered over N pages" (or that a page could not be read; the error stays off the share page).
+  A run frozen before the setting keeps one page when it resumes. Choices: the target is VIATOR's
+  journeys as the scorer reads them (from the run's departure time); a cell where VIATOR found
+  nothing asks one page.

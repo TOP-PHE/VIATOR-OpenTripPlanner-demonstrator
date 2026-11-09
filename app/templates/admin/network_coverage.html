@@ -662,8 +662,10 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
         {# PR-E — opt-in checkbox: once every pair is done, the worker asks
            ÖBB HAFAS about every cell but the skipped ones (PR-196a; it was
            only no_route / timeout / error cells before) and saves each
-           answer on the cell row as it comes, about one cell a second, so
-           12 882 pairs take hours. The run stays "verifying" meanwhile and
+           answer on the cell row as it comes, about one cell a second with
+           one page of ÖBB connections a cell (later pages,
+           COVERAGE_VERIFY_MAX_PAGES, take longer), so 12 882 pairs take
+           hours. The run stays "verifying" meanwhile and
            the page shows the check's progress. Default off keeps legacy
            behaviour. #}
         <label style="display: flex; gap: 0.4rem; align-items: center; margin-top: 0.6rem; font-size: 0.85rem">
@@ -672,8 +674,9 @@ body.cov-align-mode-mostly .cov-matrix td:not([data-alignment-tier="disagree"]):
             Verify externally on completion
             <span class="hint" id="cov-verify-externally-hint" style="font-weight: normal; display: block; font-size: 0.72rem">
               (once every pair is done, asks ÖBB HAFAS about every cell, about one a second:
-              roughly 1–2&nbsp;h more per 3&nbsp;600 pairs; the run shows the check's progress
-              and fills the cells in as the answers come)
+              roughly 1–2&nbsp;h more per 3&nbsp;600 pairs, longer when cells ask ÖBB for later
+              pages of connections; the run shows the check's progress and fills the cells in
+              as the answers come)
             </span>
           </span>
         </label>
@@ -2089,8 +2092,9 @@ function renderAlignmentWhy(dir) {
 
 // #304 (M9) — a VIATOR trip after ÖBB's last connection is not compared: say so on its card.
 const TRIP_LATE_HTML = '<span class="hint cov-trip-late"'
-  + ' title="ÖBB answers its next 5 connections only: this journey leaves after the last one,'
-  + ' so it is not compared (#304, M9).">after ÖBB’s last connection: not compared</span>';
+  + ' title="ÖBB answers 5 connections a page, and the check asks a few pages at most:'
+  + ' this journey leaves after the last one ÖBB gave, so it is not compared (#304, M9).">'
+  + 'after ÖBB’s last connection: not compared</span>';
 
 // What the ÖBB column's stop names are, under the modal's controls.
 const OEBB_STOPS_LEGEND = '<p class="hint cov-oebb-legend">ÖBB stops: the station module\'s station'

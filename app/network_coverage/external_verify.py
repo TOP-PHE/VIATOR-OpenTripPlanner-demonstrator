@@ -47,7 +47,11 @@ is ~1 request/second per origin IP. We don't enforce that here because
 this surface is operator-driven (click-to-verify on individual cells);
 the cap is implicit in how fast a human clicks. Note that one verify
 now costs 2 HTTP round-trips (LocGeoPos + TripSearch) — still well
-under any sane rate cap.
+under any sane rate cap. The coverage run's check paces itself (two
+cells at a time, `COVERAGE_VERIFY_SLEEP_MS` between requests) and may
+ask a cell's later pages, one `TripSearch` each from a later departure
+time (`fetch_oebb_trip_search`, `oebb_journeys.fetch_cell_answer`,
+`COVERAGE_VERIFY_MAX_PAGES`).
 """
 
 from __future__ import annotations
@@ -561,13 +565,16 @@ _HEADERS = {
 
 
 async def _post_hafas(
-    client: httpx.AsyncClient, body: dict[str, Any]
+    client: httpx.AsyncClient, body: dict[str, Any], timeout_s: float | None = None
 ) -> tuple[dict[str, Any] | None, VerifyResult | None]:
     """POST a HAFAS request envelope. Returns `(payload, None)` on
     success or `(None, error-VerifyResult)` on transport / parse
-    failure — never raises to the caller."""
+    failure — never raises to the caller. `timeout_s` replaces the
+    client's own timeout for this request only (a later page of the
+    coverage check gets what is left of its cell's budget)."""
+    extra: dict[str, Any] = {} if timeout_s is None else {"timeout": timeout_s}
     try:
-        response = await client.post(_OEBB_ENDPOINT, json=body, headers=_HEADERS)
+        response = await client.post(_OEBB_ENDPOINT, json=body, headers=_HEADERS, **extra)
     except httpx.HTTPError as e:
         # Timeouts stringify to "" — name the type, or the UI shows "http: ".
         detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
@@ -672,40 +679,68 @@ async def fetch_oebb_two_step(
             )
 
         # Step 2: trip search using the resolved station lids.
-        trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
-        # The exact anchor sent to HAFAS, to diff against motis_client's
-        # `motis.plan.request` line for the same search (2026-07). That line
-        # is DEBUG since #397: web shows it with LOG_LEVEL=DEBUG; the worker,
-        # where coverage runs execute, logs at INFO and does not show it.
-        # This one, one per verify, stays INFO.
-        req = trip_body["svcReqL"][0]["req"]
-        log.info(
-            "hafas.trip_search.request depart_at=%s (tzinfo=%s) -> outDate=%s outTime=%s",
-            depart_at.isoformat(),
-            depart_at.tzinfo,
-            req["outDate"],
-            req["outTime"],
-        )
-        trip_payload, err2 = await _post_hafas(c, trip_body)
-        if err2 is not None:
-            return HafasTripPayload(verdict=err2, from_lid=from_lid, to_lid=to_lid)
-        if trip_payload is None:  # pragma: no cover — defensive
-            return HafasTripPayload(
-                verdict=VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no trip payload"),
-                from_lid=from_lid,
-                to_lid=to_lid,
-            )
-        return HafasTripPayload(
-            verdict=_parse_hafas_response(trip_payload),
-            payload=trip_payload,
-            from_lid=from_lid,
-            to_lid=to_lid,
-        )
+        return await _trip_search(c, from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
 
     if client is not None:
         return await _run(client)
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as c:
         return await _run(c)
+
+
+async def fetch_oebb_trip_search(
+    *,
+    from_lid: str,
+    to_lid: str,
+    depart_at: datetime,
+    client: httpx.AsyncClient,
+    timeout_s: float | None = None,
+) -> HafasTripPayload:
+    """One `TripSearch` between two stations `fetch_oebb_two_step` has already resolved: the
+    coverage check's later pages, asked from a later departure time (one round-trip a page, not
+    two). `timeout_s` replaces the client's timeout for this request. Never raises."""
+    return await _trip_search(
+        client, from_lid=from_lid, to_lid=to_lid, depart_at=depart_at, timeout_s=timeout_s
+    )
+
+
+async def _trip_search(
+    c: httpx.AsyncClient,
+    *,
+    from_lid: str,
+    to_lid: str,
+    depart_at: datetime,
+    timeout_s: float | None = None,
+) -> HafasTripPayload:
+    """Step 2 of the two-step: the `TripSearch` from `depart_at` between two resolved lids."""
+    trip_body = _build_trip_search_body(from_lid=from_lid, to_lid=to_lid, depart_at=depart_at)
+    # The exact anchor sent to HAFAS, to diff against motis_client's
+    # `motis.plan.request` line for the same search (2026-07). That line
+    # is DEBUG since #397: web shows it with LOG_LEVEL=DEBUG; the worker,
+    # where coverage runs execute, logs at INFO and does not show it.
+    # This one, one per TripSearch (each page of a coverage cell), stays INFO.
+    req = trip_body["svcReqL"][0]["req"]
+    log.info(
+        "hafas.trip_search.request depart_at=%s (tzinfo=%s) -> outDate=%s outTime=%s",
+        depart_at.isoformat(),
+        depart_at.tzinfo,
+        req["outDate"],
+        req["outTime"],
+    )
+    trip_payload, err2 = await _post_hafas(c, trip_body, timeout_s)
+    if err2 is not None:
+        return HafasTripPayload(verdict=err2, from_lid=from_lid, to_lid=to_lid)
+    if trip_payload is None:  # pragma: no cover — defensive
+        return HafasTripPayload(
+            verdict=VerifyResult(source=_SOURCE_OEBB_HAFAS, ok=False, error="no trip payload"),
+            from_lid=from_lid,
+            to_lid=to_lid,
+        )
+    return HafasTripPayload(
+        verdict=_parse_hafas_response(trip_payload),
+        payload=trip_payload,
+        from_lid=from_lid,
+        to_lid=to_lid,
+    )
 
 
 def _parse_hafas_response(payload: dict[str, Any]) -> VerifyResult:
