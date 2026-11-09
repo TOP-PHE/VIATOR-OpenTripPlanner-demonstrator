@@ -85,8 +85,13 @@ def view_shared_run(
     this specific route, not a defence against guessing — the id space
     (2^128) already makes brute-forcing infeasible regardless of any
     rate limit.
+
+    The result rows are loaded without ÖBB's journeys (`external_journeys`),
+    which the page does not embed: on a 123-hub run they made the page time
+    out. Why each cell scored so (`external_alignment_detail`) is loaded: the
+    page prints it under the cell's tier.
     """
-    run, results = runner.get_run_with_results(db, run_id)
+    run, results = runner.get_run_with_results(db, run_id, alignment_detail=True)
     if run is None:
         raise HTTPException(404, _RUN_NOT_FOUND)
     context = _build_export_context(

@@ -805,20 +805,30 @@ def test_export_run_html_embeds_external_journeys_on_small_runs_only(monkeypatch
         r.external_journeys = stored
         return r
 
-    for count, expect in (
-        (1, oebb),
-        (mod._EXPORT_LEG_DETAIL_MAX_PAIRS + 1, None),
+    big = mod._EXPORT_LEG_DETAIL_MAX_PAIRS + 1
+    # (rows counted first, rows then loaded, journeys read from the DB, journeys embedded).
+    # The third case is a running run that gained rows between the two queries.
+    for counted, loaded, read, expect in (
+        (1, 1, True, oebb),
+        (big, big, False, None),
+        (mod._EXPORT_LEG_DETAIL_MAX_PAIRS, big, True, None),
     ):
-        results = [result(i) for i in range(count)]
-        monkeypatch.setattr(
-            mod.runner, "get_run_with_results", lambda _d, _r, res=results: (_stub_run(), res)
-        )
+        results = [result(i) for i in range(loaded)]
+        asked: dict = {}
+
+        def load(_d, _r, res=results, asked=asked, **kw):
+            asked.update(kw)
+            return _stub_run(), res
+
+        monkeypatch.setattr(mod.runner, "count_results", lambda _d, _r, n=counted: n)
+        monkeypatch.setattr(mod.runner, "get_run_with_results", load)
         mod.export_run_html(
             run_id="11111111-1111-1111-1111-111111111111",
             request=None,
             db=_MockDb(rows=[]),
             _=None,
         )
+        assert asked == {"alignment_detail": True, "external_journeys": read}
         assert captured["context"]["cells"]["hub0:hub1"]["external_journeys"] == expect
 
 
@@ -1364,7 +1374,8 @@ def test_export_run_html_404_when_run_missing(monkeypatch) -> None:
 
     from app.api.admin import network_coverage as mod
 
-    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (None, []))
+    monkeypatch.setattr(mod.runner, "count_results", lambda _d, _r: 0)
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r, **_kw: (None, []))
 
     db = _MockDb(rows=[])
     with pytest.raises(HTTPException) as exc_info:
@@ -1388,7 +1399,8 @@ def test_export_run_html_renders_with_content_disposition(monkeypatch) -> None:
     from app.api.admin import network_coverage as mod
 
     run = _stub_run()
-    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (run, []))
+    monkeypatch.setattr(mod.runner, "count_results", lambda _d, _r: 0)
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r, **_kw: (run, []))
 
     captured: dict = {}
 
@@ -1459,7 +1471,8 @@ def test_export_run_html_drops_legs_above_the_pair_threshold(monkeypatch) -> Non
         _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
         for i in range(mod._EXPORT_LEG_DETAIL_MAX_PAIRS + 1)
     ]
-    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (run, results))
+    monkeypatch.setattr(mod.runner, "count_results", lambda _d, _r: len(results))
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r, **_kw: (run, results))
 
     captured: dict = {}
 
@@ -1505,7 +1518,8 @@ def test_export_run_html_keeps_legs_at_exactly_the_pair_threshold(monkeypatch) -
         _minimal_result_stub(f"hub{i}", f"hub{i + 1}")
         for i in range(mod._EXPORT_LEG_DETAIL_MAX_PAIRS)
     ]
-    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r: (run, results))
+    monkeypatch.setattr(mod.runner, "count_results", lambda _d, _r: len(results))
+    monkeypatch.setattr(mod.runner, "get_run_with_results", lambda _d, _r, **_kw: (run, results))
 
     captured: dict = {}
 
