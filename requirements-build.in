@@ -18,5 +18,5 @@
 # the lock is installed.
 --only-binary :all:
 
-pip==26.2.2
+pip==26.3
 setuptools==84.2.1
