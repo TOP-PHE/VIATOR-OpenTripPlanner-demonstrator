@@ -10,10 +10,13 @@ are gone: every pair the engine makes is credited by its verdict.
 
 **Which VIATOR journeys a cell compares** (M9, `reference_window`): those whose first boarding
 lies within ÖBB's span, from ÖBB's earliest to its latest first boarding, widened by the
-departure tolerance. ÖBB answers its next 5 connections from the run's departure time (about
-4 h), VIATOR's journeys cover the whole day: a VIATOR journey after ÖBB's last connection says
-nothing either way. It is counted (`outside_reference_window`), never `left_only` and never in
-the score. The lower bound is still `journeys_from_depart_at` (the run's departure time).
+departure tolerance. One ÖBB page is its next 5 connections from the run's departure time (a
+median of 3.8 h), VIATOR's journeys cover the day: the check asks ÖBB's later pages until its
+span reaches VIATOR's last first boarding (`last_boarding_to_cover`), at most
+`COVERAGE_VERIFY_MAX_PAGES` (`oebb_journeys.fetch_cell_answer`), and the span runs over every page
+asked. A VIATOR journey still after ÖBB's last connection says nothing either way. It is counted
+(`outside_reference_window`), never `left_only` and never in the score. The lower bound is still
+`journeys_from_depart_at` (the run's departure time).
 
 **Score** (unchanged)::
 
@@ -34,7 +37,8 @@ cap of three a side: a 3-of-3 alignment is the same evidence as 10-of-10. **Tier
 
 **Detail** (M6, `external_alignment_detail`): `{engine_version, profile, counts: {same_service,
 probably_same, viator_only, oebb_only, uncomparable, outside_reference_window}, reasons:
-{code: n}}`: why the cell scored so, which nothing recorded before #304.
+{code: n}}`: why the cell scored so, which nothing recorded before #304. The runner adds
+`oebb_pages: {asked, stopped, error?}` when it considered paging (`CellAnswer.pages_detail`).
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ from typing import Any
 from ..journey.canonical import CanonicalJourney
 from ..journey.matching import COVERAGE_ALIGNMENT, ENGINE_VERSION, MatchProfile, compare
 from ..journey.matching import reasons as match_reasons
+from .oebb_journeys import STOP_MAX_PAGES
 
 # Threshold constants — kept at module scope so the test that exercises tier boundaries can
 # import and assert against the same values.
@@ -109,6 +114,17 @@ def reference_window(
         boarding = _boarding(journey)
         (inside if boarding is None or start <= boarding <= end else outside).append(journey)
     return inside, outside
+
+
+def last_boarding_to_cover(viator: Sequence[CanonicalJourney], tolerance_s: int) -> datetime | None:
+    """The first boarding ÖBB's latest connection must reach for every VIATOR journey to lie
+    within ÖBB's span (`reference_window`): VIATOR's last first boarding, less the tolerance the
+    span is widened by. None when no VIATOR journey has a ride: nothing for a later page to
+    cover. `viator` are the journeys the scorer compares (from the run's departure time on)."""
+    boardings = [time for time in (_boarding(j) for j in viator) if time is not None]
+    if not boardings:
+        return None
+    return max(boardings) - timedelta(seconds=tolerance_s)
 
 
 def _classify_score(score: float | None, v_n: int, o_n: int) -> str:
@@ -241,6 +257,9 @@ def explain_cell(
         f"{count('oebb_only')} {right} only",
     ]
     lines = [f"{left} vs {right}: " + ", ".join(parts)]
+    pages_line = _pages_line(detail.get("oebb_pages"), right)
+    if pages_line:
+        lines.append(pages_line)
     order = [*_EXPLAINED_FIRST, *sorted(set(reasons) - set(_EXPLAINED_FIRST))]
     for code in order:
         value = reasons.get(code)
@@ -249,3 +268,21 @@ def explain_cell(
             if line:
                 lines.append(line)
     return lines
+
+
+def _pages_line(pages: Any, right: str) -> str:
+    """The line for a check that asked ÖBB more than one page, or whose later page failed; "" for
+    one page (as before paging). The error itself stays in the detail and the worker log: these
+    lines reach the share page."""
+    if not isinstance(pages, dict):
+        return ""
+    asked = pages.get("asked")
+    if not isinstance(asked, int) or asked < 2:
+        return ""
+    if pages.get("error"):
+        kept = asked - 1
+        noun = "page" if kept == 1 else "pages"
+        return f"{right}'s page {asked} could not be read: its first {kept} {noun} are compared"
+    if pages.get("stopped") == STOP_MAX_PAGES:
+        return f"{right} answered over {asked} pages, the most a cell asks for"
+    return f"{right} answered over {asked} pages"

@@ -75,6 +75,7 @@ from . import (
 from .alignment import (
     compute_alignment,  # #304 — the matching engine's cell score
     journeys_from_depart_at,  # apples-to-apples VIATOR/ÖBB window
+    last_boarding_to_cover,  # how far ÖBB's later pages should reach
 )
 from .hubs import Hub  # static HUBS used as fallback inside _load_active_hubs
 
@@ -192,6 +193,15 @@ _DEFAULT_COVERAGE_SEARCH_WINDOW_SECONDS = 14_400  # 4h
 _DEFAULT_VERIFY_PARALLELISM = 2
 _DEFAULT_VERIFY_TIMEOUT_S = 30.0
 _DEFAULT_VERIFY_SLEEP_BETWEEN_MS = 500
+# How many pages of ÖBB connections (5 each) a cell's check may ask, page 1
+# included (`oebb_journeys.fetch_cell_answer`). Measured on run 4700065d (2 500
+# cells): of the directions where VIATOR had journeys after ÖBB's last
+# connection, 3 pages cover 72 %, 4 pages 83 % (median need 2.2 pages).
+_DEFAULT_VERIFY_MAX_PAGES = 3
+# A cell's pages share this many times COVERAGE_VERIFY_TIMEOUT_S, counted from
+# its first request (the ratio `/journey`'s paging uses: HAFAS_TIMEOUT_MS a
+# page, twice it in all). A slow ÖBB is then asked no further page.
+_VERIFY_PAGES_BUDGET_FACTOR = 2
 
 # PR-3 — K-slot time-slicing defaults. K=6 with a 24h window puts a
 # slot every 4 hours, matching the legacy single-call window size so
@@ -255,6 +265,7 @@ class CoverageConfig:
     verify_parallelism: int = _DEFAULT_VERIFY_PARALLELISM
     verify_timeout_s: float = _DEFAULT_VERIFY_TIMEOUT_S
     verify_sleep_ms: int = _DEFAULT_VERIFY_SLEEP_BETWEEN_MS
+    verify_max_pages: int = _DEFAULT_VERIFY_MAX_PAGES
     # PR-3 — K-slot time-slicing.
     slot_count: int = _DEFAULT_SLOT_COUNT
     num_itineraries_per_slot: int = _DEFAULT_NUM_ITINERARIES_PER_SLOT
@@ -315,6 +326,7 @@ def _load_coverage_config(db: DbSession) -> CoverageConfig:
         verify_parallelism=int(cfg.get("COVERAGE_VERIFY_PARALLELISM", _DEFAULT_VERIFY_PARALLELISM)),
         verify_timeout_s=float(cfg.get("COVERAGE_VERIFY_TIMEOUT_S", _DEFAULT_VERIFY_TIMEOUT_S)),
         verify_sleep_ms=int(cfg.get("COVERAGE_VERIFY_SLEEP_MS", _DEFAULT_VERIFY_SLEEP_BETWEEN_MS)),
+        verify_max_pages=int(cfg.get("COVERAGE_VERIFY_MAX_PAGES", _DEFAULT_VERIFY_MAX_PAGES)),
         # PR-3 — K-slot + day-window + timezone defaults.
         slot_count=int(cfg.get("COVERAGE_SLOT_COUNT", _DEFAULT_SLOT_COUNT)),
         num_itineraries_per_slot=int(
@@ -1311,12 +1323,18 @@ def _resolve_run_mode_targets(
 
 def _config_from_snapshot(data: Any) -> CoverageConfig | None:
     """The `CoverageConfig` frozen in a run's `execution_snapshot`, or None
-    when there is none (or it no longer fits the dataclass)."""
+    when there is none (or it no longer fits the dataclass).
+
+    A run frozen before COVERAGE_VERIFY_MAX_PAGES existed keeps one page on a
+    resume: its ÖBB check started with one page a cell, and every cell of a
+    run is asked the same way."""
     if not isinstance(data, dict):
         return None
     known = {f.name for f in fields(CoverageConfig)}
+    values = {k: v for k, v in data.items() if k in known}
+    values.setdefault("verify_max_pages", 1)
     try:
-        return CoverageConfig(**{k: v for k, v in data.items() if k in known})
+        return CoverageConfig(**values)
     except (TypeError, ValueError):
         return None
 
@@ -1995,17 +2013,21 @@ def _persist_alignment_on_row(
     *,
     profile: MatchProfile | None = None,
     resolved: tuple[list[CanonicalJourney], list[CanonicalJourney]] | None = None,
+    pages: dict[str, Any] | None = None,
 ) -> None:
     """Score the (VIATOR, ÖBB) pair with the matching engine (#304) and put ÖBB's journeys, the
     score, the tier and why (M6) onto the row in place. `resolved` are the same journeys with
     their stations placed by the station module, for the scoring only: ÖBB's journeys are kept
-    as ÖBB answered them, no station id ever reaches the pages or the share link."""
+    as ÖBB answered them, no station id ever reaches the pages or the share link. `pages` is how
+    ÖBB's answer was paged (`CellAnswer.pages_detail`), kept in the detail as `oebb_pages`."""
     scored_viator, scored_oebb = resolved if resolved is not None else (viator_journeys, oebb)
     found = compute_alignment(scored_viator, scored_oebb, profile or COVERAGE_ALIGNMENT)
     row.external_journeys = [journey.model_dump(mode="json") for journey in oebb]
     row.external_alignment_score = found.score
     row.external_alignment_tier = found.tier
-    row.external_alignment_detail = found.detail
+    row.external_alignment_detail = (
+        {**found.detail, "oebb_pages": pages} if pages is not None else found.detail
+    )
 
 
 class _SweepStations:
@@ -2107,6 +2129,14 @@ async def _run_external_verify_sweep(
     scoring = _CellScoring(match_profile(cfg), _SweepStations(db, run))
     semaphore = asyncio.Semaphore(cfg.verify_parallelism)
     sleep_seconds = cfg.verify_sleep_ms / 1000.0
+    # A cell's later pages wait the same pause, inside the cell's slot, so the
+    # parallelism and the pause bound ÖBB's load as they did with one page.
+    pages = oebb_journeys.PagePolicy(
+        max_pages=cfg.verify_max_pages,
+        pause_s=sleep_seconds,
+        page_timeout_s=cfg.verify_timeout_s,
+        budget_s=cfg.verify_timeout_s * _VERIFY_PAGES_BUDGET_FACTOR,
+    )
 
     async with httpx.AsyncClient(timeout=cfg.verify_timeout_s) as client:
 
@@ -2115,7 +2145,13 @@ async def _run_external_verify_sweep(
                 if writer is not None and writer.stopped:
                     return
                 asked = await _verify_cell(
-                    db=db, run=run, row=row, client=client, counters=counters, scoring=scoring
+                    db=db,
+                    run=run,
+                    row=row,
+                    client=client,
+                    counters=counters,
+                    scoring=scoring,
+                    pages=pages,
                 )
                 if writer is not None:
                     writer.cell_checked(row)
@@ -2155,10 +2191,15 @@ async def _verify_cell(
     client: httpx.AsyncClient,
     counters: dict[str, int],
     scoring: _CellScoring | None = None,
+    pages: oebb_journeys.PagePolicy | None = None,
 ) -> bool:
     """One cell of the sweep: ask ÖBB, put the answer (or the error) on
     the row, count it. False when ÖBB was not asked (a hub is gone), so
-    the caller skips the throttle sleep, as before."""
+    the caller skips the throttle sleep, as before.
+
+    `pages`: how far ÖBB's answer may page, toward VIATOR's last first
+    boarding in the cell (`oebb_journeys.fetch_cell_answer`); one page
+    without it."""
     try:
         origin_hub = db.get(NetworkCoverageHub, row.origin_hub_id)
         dest_hub = db.get(NetworkCoverageHub, row.dest_hub_id)
@@ -2174,13 +2215,19 @@ async def _verify_cell(
             counters["error"] += 1
             counters["verified"] += 1
             return False
-        answer = await external_verify.fetch_oebb_two_step(
+        # VIATOR's journeys first: their last first boarding is how far
+        # ÖBB's later pages should reach.
+        viator = _fetch_viator_journeys_for_search(db, row.journey_search_id, run.depart_at)
+        profile = scoring.profile if scoring is not None else COVERAGE_ALIGNMENT
+        answer = await oebb_journeys.fetch_cell_answer(
             from_lat=origin_hub.lat,
             from_lon=origin_hub.lon,
             to_lat=dest_hub.lat,
             to_lon=dest_hub.lon,
             depart_at=run.depart_at,
             client=client,
+            until=last_boarding_to_cover(viator, profile.departure_tolerance_s),
+            policy=pages or oebb_journeys.PagePolicy(),
         )
         verdict = answer.verdict
         row.external_source = verdict.source
@@ -2194,9 +2241,9 @@ async def _verify_cell(
         # ÖBB's journeys / score / tier for the heatmap. Errored
         # verdicts get an empty ÖBB side ("we couldn't ask")
         # which the scorer maps to no_service / one_sided
-        # based on whether VIATOR returned anything.
-        viator = _fetch_viator_journeys_for_search(db, row.journey_search_id, run.depart_at)
-        oebb = oebb_journeys.journeys_from_answer(answer)
+        # based on whether VIATOR returned anything. ÖBB's side is
+        # every page asked, so its window spans them all.
+        oebb = answer.journeys
         resolved = None
         if scoring is not None and scoring.stations is not None:
             resolved = (
@@ -2207,8 +2254,9 @@ async def _verify_cell(
             row,
             viator,
             oebb,
-            profile=scoring.profile if scoring is not None else None,
+            profile=profile,
             resolved=resolved,
+            pages=answer.pages_detail(),
         )
         counters["verified"] += 1
         if verdict.error is not None:

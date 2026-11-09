@@ -57,7 +57,7 @@ const SECTIONS = [
   // Network coverage matrix — knobs for the background coverage runner
   // (app/network_coverage/runner.py). Order matches CONFIG_SCHEMA's
   // grouping (query depth → cross-pair parallelism → K-slot slicing →
-  // day-window defaults → verify sweep → executor → ÖBB stop series). All 17 keys auto-exposed via
+  // day-window defaults → verify sweep → executor → ÖBB stop series). All 18 keys auto-exposed via
   // /api/admin/config; surfacing them here saves operators a psql trip
   // when tuning a coverage run.
   { title: 'Network coverage matrix', keys: [
@@ -67,6 +67,7 @@ const SECTIONS = [
     'COVERAGE_SLOT_COUNT','COVERAGE_NUM_ITINERARIES_PER_SLOT','COVERAGE_SLOT_TIMEOUT_MS',
     'COVERAGE_DEFAULT_WINDOW_START','COVERAGE_DEFAULT_WINDOW_END','COVERAGE_DEFAULT_TIMEZONE',
     'COVERAGE_VERIFY_PARALLELISM','COVERAGE_VERIFY_TIMEOUT_S','COVERAGE_VERIFY_SLEEP_MS',
+    'COVERAGE_VERIFY_MAX_PAGES',
     'COVERAGE_OEBB_STOP_SERIES',
   ] },
   // How the ÖBB check pairs a cell's VIATOR journeys with ÖBB's (#304, the
