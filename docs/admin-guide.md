@@ -2727,6 +2727,16 @@ a pair changed, so **scores of runs before and after are not comparable**: run a
   `COVERAGE_MATCH_POSITION_FALLBACK_M` (1 000 m) of the other's. **Deploy the station module's
   version with `POST /internal/v1/stops/stations` (MSMM #83) first**: before it the check finds no
   station id, and only codes and positions are compared.
+- **ÖBB's stop number is not a UIC code** (since 2026-11-12). ÖBB numbers a stop with its own
+  EVA number (`extId`). It counts as the station's UIC code only where ÖBB states that same
+  number as the UIC in its `gidL` (Zürich HB 8503000); elsewhere it is not one (Paris Gare de
+  Lyon 8700012, SNCF 8768600; Milano Centrale 8300046, UIC 8301700). Before, it was read as a UIC:
+  against the true code of VIATOR's French, Italian or Belgian feed it made two different
+  stations, and the same train at the same minute was refused ("different first or last
+  station"). The same fix reads ÖBB's product class (`cls`) for a category the mode table does not
+  know (FR, OGV, IRY, RB, RER, and S-Bahn trains filed as `DB`): they were mode OTHER and never
+  paired with VIATOR's train. **Scores of runs before 2026-11-12 are not comparable on cells
+  touching France, Italy, Belgium, Spain or Portugal, nor on regional trains**: run again.
 - **ÖBB's window**: only VIATOR journeys whose first boarding lies within ÖBB's span (its first to
   its last connection, ±2 min) are compared; the others are counted as "after ÖBB's last
   connection", never as VIATOR-only. The span runs over every page of connections the check
